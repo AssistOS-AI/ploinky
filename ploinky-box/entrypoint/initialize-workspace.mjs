@@ -10,6 +10,16 @@ import { PloinkyBoxError } from '../errors.mjs';
 const MASTER_KEY_PATTERN = /^[a-f0-9]{64}$/;
 const MASTER_KEY_FILE = 'master-key';
 const PLOINKY_DIRECTORY = '.ploinky';
+// Controller secrets live in the controller-state root that every agent
+// runtime masks (`protectedControllerStateRoots`), never beside it: a broad
+// workspace bind reaches the rest of `.ploinky` read-only, and a file bind
+// cannot hide a file the controller later replaces by rename.
+const CONTROLLER_STATE_DIRECTORY = 'data';
+const RETIRED_CONTROLLER_SECRET_FILES = Object.freeze([
+    MASTER_KEY_FILE,
+    '.secrets',
+    'ploinky_subject_identity_ed25519_v1.enc',
+]);
 
 function initializerError(message, cause) {
     return new PloinkyBoxError(message, {
@@ -44,6 +54,14 @@ function inspectDirectory(target, fsApi) {
     const stat = fsApi.statSync(target);
     if (!stat.isDirectory()) {
         throw initializerError(`Workspace master-key directory is not a real directory: ${target}`);
+    }
+    return fingerprint(stat);
+}
+
+function inspectPhysicalDirectory(target, fsApi) {
+    const stat = fsApi.lstatSync(target);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+        throw initializerError(`Workspace controller-state directory is not a real directory: ${target}`);
     }
     return fingerprint(stat);
 }
@@ -90,10 +108,9 @@ function readExisting(target, fsApi, { normalizeMode = false } = {}) {
     }
 }
 
-function ensurePloinkyDirectory(root, fsApi) {
-    const target = path.join(root, PLOINKY_DIRECTORY);
+function ensureStateDirectory(target, fsApi, inspect) {
     try {
-        return { path: target, fingerprint: inspectDirectory(target, fsApi) };
+        return { path: target, fingerprint: inspect(target, fsApi) };
     } catch (error) {
         if (error.code !== 'ENOENT') throw error;
     }
@@ -104,17 +121,14 @@ function ensurePloinkyDirectory(root, fsApi) {
             throw initializerError(`Unable to create workspace state directory: ${target}`, error);
         }
     }
-    return { path: target, fingerprint: inspectDirectory(target, fsApi) };
+    return { path: target, fingerprint: inspect(target, fsApi) };
 }
 
-function assertStableDirectories(root, rootBefore, ploinkyDirectory, ploinkyBefore, fsApi) {
-    const rootAfter = inspectDirectory(root, fsApi);
-    const ploinkyAfter = inspectDirectory(ploinkyDirectory, fsApi);
-    if (!sameDirectoryFingerprint(rootBefore, rootAfter)) {
-        throw initializerError('Workspace root changed while initializing its master key');
-    }
-    if (!sameDirectoryFingerprint(ploinkyBefore, ploinkyAfter)) {
-        throw initializerError('Workspace state directory changed while initializing its master key');
+function assertStableDirectories(directories, fsApi) {
+    for (const { path: target, fingerprint: before, inspect, label } of directories) {
+        if (!sameDirectoryFingerprint(before, inspect(target, fsApi))) {
+            throw initializerError(`${label} changed while initializing its master key`);
+        }
     }
 }
 
@@ -140,7 +154,53 @@ function selectedWorkspaceRoot(workspaceRoot) {
 }
 
 export function workspaceMasterKeyPath(workspaceRoot) {
-    return path.join(selectedWorkspaceRoot(workspaceRoot), PLOINKY_DIRECTORY, MASTER_KEY_FILE);
+    return path.join(
+        selectedWorkspaceRoot(workspaceRoot), PLOINKY_DIRECTORY, CONTROLLER_STATE_DIRECTORY, MASTER_KEY_FILE,
+    );
+}
+
+// Secrets at the retired `.ploinky/<name>` spelling stay readable through every
+// broad workspace bind. Refuse them rather than silently using, ignoring or
+// replacing them; the operator moves them once, with no agent running.
+export function assertNoRetiredControllerSecrets(workspaceRoot, fsApi = fs) {
+    const directory = path.join(path.resolve(workspaceRoot), PLOINKY_DIRECTORY);
+    const destination = path.join(directory, CONTROLLER_STATE_DIRECTORY);
+    const retired = RETIRED_CONTROLLER_SECRET_FILES.map(name => path.join(directory, name)).filter((target) => {
+        try {
+            fsApi.lstatSync(target);
+            return true;
+        } catch (error) {
+            if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return false;
+            throw error;
+        }
+    });
+    if (!retired.length) return;
+    throw new PloinkyBoxError(
+        `Controller secrets at the retired agent-readable location are refused: ${retired.join(', ')}. `
+        + `Stop the workspace and move each one into ${destination} `
+        + `(mkdir -p -m 700 ${destination} && mv <file> ${destination}/).`,
+        { code: 'PLOINKY_RETIRED_CONTROLLER_SECRETS' },
+    );
+}
+
+function stateDirectories(root, fsApi, { create = false } = {}) {
+    const rootEntry = {
+        path: root, fingerprint: inspectDirectory(root, fsApi), inspect: inspectDirectory, label: 'Workspace root',
+    };
+    const ploinkyPath = path.join(root, PLOINKY_DIRECTORY);
+    const ploinky = create
+        ? ensureStateDirectory(ploinkyPath, fsApi, inspectDirectory)
+        : { path: ploinkyPath, fingerprint: inspectDirectory(ploinkyPath, fsApi) };
+    assertNoRetiredControllerSecrets(root, fsApi);
+    const dataPath = path.join(ploinky.path, CONTROLLER_STATE_DIRECTORY);
+    const data = create
+        ? ensureStateDirectory(dataPath, fsApi, inspectPhysicalDirectory)
+        : { path: dataPath, fingerprint: inspectPhysicalDirectory(dataPath, fsApi) };
+    return [
+        rootEntry,
+        { ...ploinky, inspect: inspectDirectory, label: 'Workspace state directory' },
+        { ...data, inspect: inspectPhysicalDirectory, label: 'Workspace controller-state directory' },
+    ];
 }
 
 export function readWorkspaceMasterKey({
@@ -148,13 +208,11 @@ export function readWorkspaceMasterKey({
     fsApi = fs,
 } = {}) {
     const root = selectedWorkspaceRoot(workspaceRoot);
-    const ploinkyDirectory = path.join(root, PLOINKY_DIRECTORY);
-    const target = path.join(ploinkyDirectory, MASTER_KEY_FILE);
+    const target = workspaceMasterKeyPath(root);
     try {
-        const rootBefore = inspectDirectory(root, fsApi);
-        const ploinkyBefore = inspectDirectory(ploinkyDirectory, fsApi);
+        const directories = stateDirectories(root, fsApi);
         const existing = readExisting(target, fsApi);
-        assertStableDirectories(root, rootBefore, ploinkyDirectory, ploinkyBefore, fsApi);
+        assertStableDirectories(directories, fsApi);
         return Object.freeze({ path: target, key: existing.key });
     } catch (error) {
         if (error instanceof PloinkyBoxError) throw error;
@@ -168,18 +226,11 @@ export function initializeWorkspaceMasterKey({
     randomBytes = crypto.randomBytes,
 } = {}) {
     const root = selectedWorkspaceRoot(workspaceRoot);
-    const rootBefore = inspectDirectory(root, fsApi);
-    const stateDirectory = ensurePloinkyDirectory(root, fsApi);
-    const target = path.join(stateDirectory.path, MASTER_KEY_FILE);
+    const directories = stateDirectories(root, fsApi, { create: true });
+    const target = workspaceMasterKeyPath(root);
     try {
         const existing = readExisting(target, fsApi, { normalizeMode: true });
-        assertStableDirectories(
-            root,
-            rootBefore,
-            stateDirectory.path,
-            stateDirectory.fingerprint,
-            fsApi,
-        );
+        assertStableDirectories(directories, fsApi);
         return Object.freeze({ created: false, path: target, keyPresent: Boolean(existing.key) });
     } catch (error) {
         if (error.code !== 'ENOENT') throw error;
@@ -199,13 +250,7 @@ export function initializeWorkspaceMasterKey({
     } catch (error) {
         if (error.code === 'EEXIST') {
             readExisting(target, fsApi, { normalizeMode: true });
-            assertStableDirectories(
-                root,
-                rootBefore,
-                stateDirectory.path,
-                stateDirectory.fingerprint,
-                fsApi,
-            );
+            assertStableDirectories(directories, fsApi);
             return Object.freeze({ created: false, path: target, keyPresent: true });
         }
         throw initializerError(`Unable to create workspace master-key file: ${target}`, error);
@@ -226,13 +271,7 @@ export function initializeWorkspaceMasterKey({
     } finally {
         if (descriptor !== undefined) fsApi.closeSync(descriptor);
     }
-    assertStableDirectories(
-        root,
-        rootBefore,
-        stateDirectory.path,
-        stateDirectory.fingerprint,
-        fsApi,
-    );
+    assertStableDirectories(directories, fsApi);
     return Object.freeze({ created: true, path: target, keyPresent: true });
 }
 

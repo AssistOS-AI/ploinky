@@ -44,7 +44,7 @@ test('resolveMasterKey creates a persistent fallback when neither process.env no
     console.error = (msg) => { errors.push(String(msg)); };
     try {
         const key = resolveMasterKey();
-        const fallbackSeedPath = path.join(tempDir, '.ploinky', 'master-key');
+        const fallbackSeedPath = path.join(tempDir, '.ploinky', 'data', 'master-key');
         const fallbackSeed = fs.readFileSync(fallbackSeedPath, 'utf8').trim();
         const expected = crypto.createHash('sha256').update(fallbackSeed, 'utf8').digest();
         assert.equal(key.length, 32);
@@ -65,7 +65,7 @@ test('resolveMasterKey fails when a generated fallback cannot be securely persis
     const previousCwd = process.cwd();
     const previousRoot = process.env.PLOINKY_WORKSPACE_ROOT;
     try {
-        const blockedPath = path.join(workspace, '.ploinky', 'master-key');
+        const blockedPath = path.join(workspace, '.ploinky', 'data', 'master-key');
         fs.mkdirSync(blockedPath, { recursive: true });
         process.chdir(workspace);
         process.env.PLOINKY_WORKSPACE_ROOT = workspace;
@@ -98,7 +98,7 @@ test('resolveMasterKey ignores stale explicit workspace roots that are not direc
         const freshModule = await importFreshMasterKeyModule('stale-workspace-root');
         freshModule.resolveMasterKey();
 
-        assert.equal(fs.existsSync(path.join(workspace, '.ploinky', 'master-key')), true);
+        assert.equal(fs.existsSync(path.join(workspace, '.ploinky', 'data', 'master-key')), true);
         assert.equal(fs.existsSync(path.join(workspace, 'missing-root')), false);
     } finally {
         process.chdir(previousCwd);
@@ -116,7 +116,7 @@ test('resolveMasterKey does not overwrite or bypass an empty generated key file'
     const previousCwd = process.cwd();
     const previousRoot = process.env.PLOINKY_WORKSPACE_ROOT;
     try {
-        const keyPath = path.join(workspace, '.ploinky', 'master-key');
+        const keyPath = path.join(workspace, '.ploinky', 'data', 'master-key');
         fs.mkdirSync(path.dirname(keyPath), { recursive: true });
         fs.writeFileSync(keyPath, '');
         process.chdir(workspace);
@@ -138,6 +138,30 @@ test('resolveMasterKey does not overwrite or bypass an empty generated key file'
         fs.rmSync(workspace, { recursive: true, force: true });
     }
 });
+
+// A key or store at the retired `.ploinky/<name>` spelling is agent-readable
+// through every broad workspace bind. It is refused, never used, replaced or
+// silently ignored, and its bytes are left for the operator to move.
+for (const retired of ['master-key', '.secrets', 'ploinky_subject_identity_ed25519_v1.enc']) {
+    test(`resolution refuses a retired .ploinky/${retired} in local and managed workspaces`, (t) => {
+        const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-mkey-retired-'));
+        t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+        initializeWorkspaceMasterKey({ workspaceRoot: workspace });
+        const retiredPath = path.join(workspace, '.ploinky', retired);
+        fs.writeFileSync(retiredPath, `${'e'.repeat(64)}\n`, { mode: 0o600 });
+        const refused = (error) => error?.code === 'PLOINKY_RETIRED_CONTROLLER_SECRETS'
+            && error.message.includes(retiredPath)
+            && error.message.includes(path.join(workspace, '.ploinky', 'data'));
+
+        process.env[MASTER_KEY_VAR] = 'b'.repeat(64);
+        assert.throws(() => resolveMasterKeySeed({ startDir: workspace, managedBox: false }), refused);
+        delete process.env[MASTER_KEY_VAR];
+        assert.throws(() => resolveMasterKeySeed({ startDir: workspace, managedBox: false }), refused);
+        assert.throws(() => resolveMasterKeySeed({ managedBox: true, workspaceRoot: workspace }), refused);
+        assert.throws(() => initializeWorkspaceMasterKey({ workspaceRoot: workspace }), refused);
+        assert.equal(fs.readFileSync(retiredPath, 'utf8'), `${'e'.repeat(64)}\n`);
+    });
+}
 
 test('resolveMasterKey falls back to a .env walked up from the current directory', () => {
     const seed = 'a'.repeat(64);
@@ -165,7 +189,7 @@ test('process.env value takes precedence over .env value when both define the ke
     }
 });
 
-test('managed Box resolution uses only .ploinky/master-key', (t) => {
+test('managed Box resolution uses only .ploinky/data/master-key', (t) => {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-mkey-managed-'));
     t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
     initializeWorkspaceMasterKey({
@@ -177,8 +201,8 @@ test('managed Box resolution uses only .ploinky/master-key', (t) => {
         `${MASTER_KEY_VAR}=${'a'.repeat(64)}\nAPPLICATION_VALUE=untouched\n`,
     );
     const nested = path.join(workspace, 'nested');
-    fs.mkdirSync(path.join(nested, '.ploinky'), { recursive: true });
-    fs.writeFileSync(path.join(nested, '.ploinky', 'master-key'), `${'d'.repeat(64)}\n`, {
+    fs.mkdirSync(path.join(nested, '.ploinky', 'data'), { recursive: true });
+    fs.writeFileSync(path.join(nested, '.ploinky', 'data', 'master-key'), `${'d'.repeat(64)}\n`, {
         mode: 0o600,
     });
     process.env[MASTER_KEY_VAR] = 'b'.repeat(64);

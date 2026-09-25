@@ -122,6 +122,56 @@ test('bwrap keeps a missing state root absent by protecting its existing parent'
     }
 });
 
+// The configured workspace selects the controller secret paths, so build the
+// production arguments in a process whose workspace is the fixture. A per-file
+// read-only overlay would re-expose a secret inside the masked state root.
+test('production bwrap args re-expose no controller secret through the masked state root', () => {
+    const root = fs.realpathSync(tempDir('bwrap-controller-secrets-'));
+    try {
+        const dataDir = path.join(root, '.ploinky', 'data');
+        fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+        const secrets = ['master-key', '.secrets', 'ploinky_subject_identity_ed25519_v1.enc']
+            .map(name => path.join(dataDir, name));
+        for (const file of secrets) fs.writeFileSync(file, 'synthetic\n', { mode: 0o600 });
+        const agentCodePath = path.join(root, '.ploinky', 'repos', 'repo', 'agent');
+        const nodeModulesDir = path.join(root, '.ploinky', 'deps', 'fake', 'node_modules');
+        const sharedDir = path.join(root, '.data', 'shared');
+        const agentHomeDir = path.join(root, '.data', 'demo');
+        const agentLibPath = path.join(root, 'Agent');
+        for (const dir of [agentCodePath, nodeModulesDir, sharedDir, agentHomeDir, path.join(agentLibPath, 'node_modules')]) {
+            fs.mkdirSync(dir, { recursive: true });
+        }
+        const moduleUrl = new URL('../../cli/sandbox/bwrap/bwrapServiceManager.js', import.meta.url).href;
+        const script = `
+            const { buildBwrapArgs } = await import(${JSON.stringify(moduleUrl)});
+            const options = JSON.parse(process.env.BWRAP_TEST_OPTIONS);
+            process.stdout.write(JSON.stringify(buildBwrapArgs(options)));
+        `;
+        const options = {
+            agentCodePath, agentLibGrant: grantFor(root), agentLibPath, nodeModulesDir, sharedDir,
+            cwd: root, workspaceRoot: root, agentHomeDir, skillsPath: null, envMap: {},
+            codeReadOnly: true, skillsReadOnly: true, volumes: {},
+        };
+        const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+            cwd: root,
+            env: { ...process.env, PLOINKY_WORKSPACE_ROOT: root, BWRAP_TEST_OPTIONS: JSON.stringify(options) },
+            encoding: 'utf8',
+        });
+        assert.equal(result.status, 0, result.stderr);
+        const args = JSON.parse(result.stdout);
+        for (const file of secrets) {
+            assert.equal(args.includes(file), false, `${file} must not be bound into the sandbox`);
+        }
+        const guardIndex = args.findIndex((value, index) => value === dataDir && args[index - 2] === '--ro-bind');
+        assert.ok(guardIndex > 0, 'the controller-state root is masked at its workspace path');
+        assert.notEqual(args[guardIndex - 1], dataDir, 'the mask source is the empty guard, not the state root');
+        assert.equal(args.slice(guardIndex + 1).some(value => value.startsWith(`${dataDir}${path.sep}`)), false,
+            'nothing is layered back inside the masked state root');
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
 test('bwrap normalizes guard-parent matching and orders logical parents before children', () => {
     const root = tempDir('bwrap-normalized-parent-');
     try {

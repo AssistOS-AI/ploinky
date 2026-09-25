@@ -125,7 +125,7 @@ test('installed public shims honor only the environment image override through t
         explicitPort: startRoute.hostPort,
         explicitMediaPort: startRoute.mediaHostPort,
     });
-    const masterKeyPath = path.join(harness.identity.workspaceRoot, '.ploinky', 'master-key');
+    const masterKeyPath = path.join(harness.identity.workspaceRoot, '.ploinky', 'data', 'master-key');
     const initialKeyHash = execInBox(harness.runner, prepared.containerId, [
         'sha256sum', masterKeyPath,
     ]).split(/\s/)[0];

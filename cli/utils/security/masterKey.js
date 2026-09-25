@@ -3,7 +3,10 @@ import fs from 'fs';
 import path from 'path';
 
 import { readBoxWorkspaceRoot } from '../../../ploinky-box/contract/workspace-root.mjs';
-import { readWorkspaceMasterKey } from '../../../ploinky-box/entrypoint/initialize-workspace.mjs';
+import {
+    assertNoRetiredControllerSecrets,
+    readWorkspaceMasterKey,
+} from '../../../ploinky-box/entrypoint/initialize-workspace.mjs';
 import { isInsideBox } from '../../../ploinky-box/lib/boxMarker.mjs';
 
 const MASTER_KEY_VAR = 'PLOINKY_MASTER_KEY';
@@ -102,8 +105,9 @@ function resolveGeneratedMasterKeyRoot(startDir = process.cwd()) {
     }
 }
 
+// Inside the agent-masked controller-state root, like the managed Box key.
 function resolveGeneratedMasterKeyPath(startDir = process.cwd()) {
-    return path.join(resolveGeneratedMasterKeyRoot(startDir), '.ploinky', GENERATED_MASTER_KEY_FILE);
+    return path.join(resolveGeneratedMasterKeyRoot(startDir), '.ploinky', 'data', GENERATED_MASTER_KEY_FILE);
 }
 
 function readGeneratedMasterKeySeed(filePath) {
@@ -117,7 +121,7 @@ function readGeneratedMasterKeySeed(filePath) {
 
 function writeGeneratedMasterKeySeed(filePath) {
     const generated = crypto.randomBytes(32).toString('hex');
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
     try {
         fs.writeFileSync(filePath, `${generated}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
         try { fs.chmodSync(filePath, 0o600); } catch (_) { }
@@ -190,6 +194,7 @@ function resolveMasterKeySeed({
         // from cwd: a nested application directory must not shadow this key.
         return readWorkspaceMasterKey({ workspaceRoot: workspaceRoot || readBoxWorkspaceRoot(process.env) }).key;
     }
+    assertNoRetiredControllerSecrets(resolveGeneratedMasterKeyRoot(startDir));
     let raw = String(process.env[MASTER_KEY_VAR] || '').trim();
     if (!raw) {
         // Walk up from cwd looking for a .env that defines the master key.

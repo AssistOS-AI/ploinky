@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 // Each test process gets an isolated workspace so the on-disk keypair store
-// (.ploinky/ploinky_subject_identity_ed25519_v1.enc) never collides with a real
+// (.ploinky/data/ploinky_subject_identity_ed25519_v1.enc) never collides with a real
 // workspace and is torn down afterwards.
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-sgkey-'));
 const originalCwd = process.cwd();
@@ -38,8 +38,9 @@ test('getOrCreateIdentitySigningKeypair persists and never returns the private k
     assert.equal(first.privateKey, undefined);
     assert.equal(first.privateKeyPem, undefined);
     assert.equal(first.secretKey, undefined);
-    // A backing encrypted file is written under .ploinky and is not world readable.
-    const storePath = path.join(tempDir, '.ploinky', 'ploinky_subject_identity_ed25519_v1.enc');
+    // A backing encrypted file is written under the agent-masked .ploinky/data
+    // and is not world readable.
+    const storePath = path.join(tempDir, '.ploinky', 'data', 'ploinky_subject_identity_ed25519_v1.enc');
     assert.ok(fs.existsSync(storePath), 'expected the encrypted keypair store to exist');
     const mode = fs.statSync(storePath).mode & 0o777;
     assert.equal(mode, 0o600);

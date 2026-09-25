@@ -18,10 +18,11 @@ function guardError(message, context = {}) {
     return error;
 }
 
-// Router security, edge routing and edge publication state live under
-// `.ploinky/data`. Agents never see it, even through a broad workspace bind;
-// the rest of the controller root (`.ploinky`, including the dependency store)
-// is pinned read-only by `controllerGuardMounts`.
+// Router security, edge routing and edge publication state, the workspace
+// master key and the stores it encrypts live under `.ploinky/data`. Agents
+// never see it, even through a broad workspace bind; the rest of the controller
+// root (`.ploinky`, including the dependency store) is pinned read-only by
+// `controllerGuardMounts`, which does not make it confidential.
 export function protectedControllerStateRoots(workspaceRoot = PLOINKY_WORKSPACE_ROOT) {
     const root = path.resolve(workspaceRoot);
     return Object.freeze([

@@ -131,7 +131,7 @@ test('host hook does not create or receive a fallback PLOINKY_MASTER_KEY seed', 
         const result = executeHostHook(hookPath, { HOOK_OUT: outPath }, { cwd: dir });
         assert.equal(result.success, true, result.message);
 
-        assert.equal(fs.existsSync(path.join(dir, '.ploinky', 'master-key')), false);
+        assert.equal(fs.existsSync(path.join(dir, '.ploinky', 'data', 'master-key')), false);
         assert.equal(fs.readFileSync(outPath, 'utf8'), 'UNSET');
     }));
 });
@@ -146,7 +146,7 @@ test('host hook strips an explicitly provided PLOINKY_MASTER_KEY', () => {
         );
         assert.equal(result.success, true, result.message);
         assert.equal(fs.readFileSync(outPath, 'utf8'), 'UNSET');
-        assert.equal(fs.existsSync(path.join(dir, '.ploinky', 'master-key')), false);
+        assert.equal(fs.existsSync(path.join(dir, '.ploinky', 'data', 'master-key')), false);
     }));
 });
 

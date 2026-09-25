@@ -9,6 +9,7 @@ import {
     buildSeatbeltProfile,
     collectLiteralPathAccess
 } from '../../cli/sandbox/seatbelt/seatbeltProfile.js';
+import { initializeWorkspaceMasterKey } from '../../ploinky-box/entrypoint/initialize-workspace.mjs';
 import { agentLibFixture } from '../helpers/agentlibFixture.mjs';
 
 // Every seatbelt profile is generated for one selected achillesAgentLib source:
@@ -136,7 +137,11 @@ test('buildSeatbeltProfile protects read-only paths even under writable workspac
     assert.match(profile, /\(subpath "\/Users\/alice\/workspace\/\.ploinky\/repos\/AchillesIDE\/explorer"\)/);
     assert.match(profile, /\(subpath "\/Users\/alice\/workspace\/\.ploinky\/deps\/agents\/AchillesIDE\/explorer\/seatbelt-darwin-arm64-node25"\)/);
     assert.match(profile, /\(subpath "\/Users\/alice\/workspace\/\.ploinky\/seatbelt-runtime\/explorer\/Agent-123"\)/);
-    assert.match(profile, /\(literal ".*\/\.ploinky\/\.secrets"\)/);
+    // Controller secrets live in the controller-state root, which is neither
+    // readable nor writable; no separate per-file literal is needed.
+    assert.match(profile, /\(deny file-write\*[\s\S]*\(subpath ".*\/\.ploinky\/data"\)/);
+    assert.match(profile, /\(deny file-read\*[\s\S]*\(subpath ".*\/\.ploinky\/data"\)/);
+    assert.doesNotMatch(profile, /\.secrets/);
 });
 
 test('collectLiteralPathAccess orders root before scoped parent paths', () => {
@@ -339,7 +344,7 @@ test('generated profile makes both canonical aliases of the controller state roo
     }
 });
 
-test('buildSeatbeltProfile pins the controller root and its ancestors read-only and hides controller secrets', () => {
+test('buildSeatbeltProfile pins the controller root and its ancestors read-only and keeps controller state opaque', () => {
     const profile = buildSeatbeltProfile({
         agentLibGrant: seatbeltGrantFor('/Users/alice/workspace'),
         agentCodePath: '/Users/alice/workspace/.ploinky/repos/repo/agent',
@@ -365,8 +370,7 @@ test('buildSeatbeltProfile pins the controller root and its ancestors read-only 
         > profile.indexOf('; Controller root is read-only'));
     assert.match(profile, /\(deny file-write\*\n    \(literal "\/Users\/alice\/workspace\/\.ploinky\/repos\/repo\/agent"\)\n\)/);
     const readDeny = profile.slice(profile.indexOf('(deny file-read*'));
-    assert.ok(readDeny.includes('(literal "/Users/alice/workspace/.ploinky/master-key")'));
-    assert.ok(readDeny.includes('(literal "/Users/alice/workspace/.ploinky/.secrets")'));
+    assert.ok(readDeny.includes('(subpath "/Users/alice/workspace/.ploinky/data")'));
     assert.doesNotMatch(readDeny, /\(subpath "\/Users\/alice\/workspace\/\.ploinky"\)/,
         'the rest of the controller root stays readable, as it is in containers');
 });
@@ -376,8 +380,8 @@ function seatbeltControllerFixture({ codeWritable = false, symlinkedControllerRo
     const at = (...segments) => path.join(workspace, ...segments);
     const seed = {
         '.ploinky/agents.json': '{"synthetic":true}',
-        '.ploinky/master-key': 'SYNTHETIC-MASTER-KEY\n',
-        '.ploinky/.secrets': 'SYNTHETIC_SECRET=1\n',
+        '.ploinky/data/master-key': 'SYNTHETIC-MASTER-KEY\n',
+        '.ploinky/data/.secrets': 'SYNTHETIC_SECRET=1\n',
         '.ploinky/running/router.pid': '1',
         '.ploinky/run/lease': 'L',
         '.ploinky/repos/repo/agent/README': 'CODE',
@@ -447,22 +451,23 @@ for (const symlinkedControllerRoot of [false, true]) {
             const registryRead = run('cat "$1"', at('.ploinky', 'agents.json'));
             assert.equal(registryRead.status, 0, registryRead.stderr);
 
-            const controllerPaths = ['agents.json', 'master-key', '.secrets', 'running/router.pid', 'run/lease', 'repos/repo/agent/README']
+            const controllerPaths = ['agents.json', 'data/master-key', 'data/.secrets', 'running/router.pid', 'run/lease', 'repos/repo/agent/README']
                 .map(relative => at('.ploinky', relative));
             if (symlinkedControllerRoot) controllerPaths.push(at('controller-real', 'agents.json'));
             const before = new Map(controllerPaths.map(target => [target, fs.readFileSync(target, 'utf8')]));
             for (const target of controllerPaths) {
                 assertSandboxDenied(run('printf TAMPER >> "$1"', target), `write ${target}`);
             }
-            for (const target of [at('.ploinky', 'master-key'), at('.ploinky', '.secrets')]) {
+            for (const target of [at('.ploinky', 'data', 'master-key'), at('.ploinky', 'data', '.secrets')]) {
                 assertSandboxDenied(run('cat "$1"', target), `read ${target}`);
             }
             assertSandboxDenied(run('printf X > "$1"', at('.ploinky', 'forged')), 'create a controller entry');
             assertSandboxDenied(run('mkdir "$1"', at('.ploinky', 'running', 'forged')), 'create a running entry');
-            assertSandboxDenied(run('rm "$1"', at('.ploinky', 'master-key')), 'unlink master-key');
+            assertSandboxDenied(run('rm "$1"', at('.ploinky', 'data', 'master-key')), 'unlink master-key');
             assertSandboxDenied(run('ln "$1" "$2"', at('.ploinky', 'agents.json'), at('registry-link')), 'hard-link the registry');
             assertSandboxDenied(run(RENAME_SCRIPT, at('.ploinky'), at('moved')), 'rename the controller root');
             assertSandboxDenied(run(RENAME_SCRIPT, at('.ploinky', 'running'), at('moved')), 'rename running state');
+            assertSandboxDenied(run(RENAME_SCRIPT, at('.ploinky', 'data'), at('moved')), 'rename controller-state root');
             assertSandboxDenied(run(RENAME_SCRIPT, workspace, renameTarget), 'rename the workspace root');
             if (symlinkedControllerRoot) {
                 assertSandboxDenied(run(RENAME_SCRIPT, at('controller-real'), at('moved')), 'rename the canonical controller root');
@@ -530,6 +535,62 @@ test('buildSeatbeltProfile keeps a dangling protected link lexical and overrides
         // first and then overridden by the controller root denial.
         assert.ok(profile.indexOf(`(allow file-write* (subpath ${JSON.stringify(logsDir)}))`)
             < profile.indexOf('; Controller root is read-only'));
+    } finally {
+        fs.rmSync(workspace, { recursive: true, force: true });
+    }
+});
+
+// Seatbelt has no mount namespace: controller secrets are unreadable only
+// because they live inside the read-denied controller-state root. The retired
+// spelling beside it is readable through the broad workspace grant.
+test('generated profile denies reads of the master key and encrypted stores but not of their retired spelling', { skip: process.platform !== 'darwin' }, () => {
+    const sandboxProbe = spawnSync('sandbox-exec', ['-p', '(version 1) (allow default)', '/bin/echo', 'ok'], {
+        encoding: 'utf8',
+    });
+    if (sandboxProbe.status !== 0) {
+        assert.fail(`sandbox-exec is unavailable: ${sandboxProbe.stderr || sandboxProbe.stdout}`);
+    }
+
+    const workspace = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'seatbelt-controller-secrets-')));
+    const agentWorkDir = path.join(workspace, '.data', 'agent');
+    const sharedDir = path.join(workspace, '.data', 'shared');
+    try {
+        const { path: keyPath } = initializeWorkspaceMasterKey({ workspaceRoot: workspace });
+        const names = ['master-key', '.secrets', 'ploinky_subject_identity_ed25519_v1.enc'];
+        for (const name of names.slice(1)) {
+            fs.writeFileSync(path.join(path.dirname(keyPath), name), 'synthetic\n', { mode: 0o600 });
+        }
+        for (const name of names) {
+            fs.writeFileSync(path.join(workspace, '.ploinky', name), 'synthetic retired\n', { mode: 0o600 });
+        }
+        fs.mkdirSync(agentWorkDir, { recursive: true });
+        fs.mkdirSync(sharedDir, { recursive: true });
+        fs.writeFileSync(path.join(workspace, 'project-file'), 'PROJECT');
+        const agentLibSourceGrant = seatbeltGrantFor(workspace, { create: true });
+        const profilePath = path.join(workspace, 'profile.sb');
+        fs.writeFileSync(profilePath, buildSeatbeltProfile({
+            agentLibGrant: agentLibSourceGrant,
+            agentCodePath: workspace,
+            agentLibPath: agentLibSourceGrant.sourceDir,
+            nodeModulesDir: path.join(workspace, 'node_modules'),
+            agentWorkDir,
+            sharedDir,
+            cwd: workspace,
+            skillsPath: null,
+            codeReadOnly: false,
+            skillsReadOnly: true,
+            volumes: {},
+            workspaceRoot: workspace,
+        }), 'utf8');
+        const readable = target => spawnSync('sandbox-exec', [
+            '-f', profilePath, '/bin/sh', '-c', 'test -r "$1" && /bin/cat "$1" >/dev/null', 'probe', target,
+        ], { cwd: workspace, encoding: 'utf8' }).status === 0;
+
+        assert.equal(readable(path.join(workspace, 'project-file')), true);
+        for (const name of names) {
+            assert.equal(readable(path.join(path.dirname(keyPath), name)), false, `${name} is readable`);
+            assert.equal(readable(path.join(workspace, '.ploinky', name)), true, `retired ${name} control`);
+        }
     } finally {
         fs.rmSync(workspace, { recursive: true, force: true });
     }

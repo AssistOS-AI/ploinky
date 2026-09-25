@@ -219,7 +219,7 @@ function createAppendLogStdio(logFile) {
 
 // Resolve the env handed to the Watchdog (and, by inheritance, to the
 // RoutingServer it spawns and respawns). Merge order mirrors
-// secretInjector.getSecret(): walked-up `.env` -> `.ploinky/.secrets` ->
+// secretInjector.getSecret(): walked-up `.env` -> `.ploinky/data/.secrets` ->
 // `process.env`, with operator-exported values winning. This way the router
 // stays able to forward LLM/auth secrets to handlers across crash-restart
 // cycles without depending on the operator having `export`'d each one. Managed

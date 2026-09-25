@@ -43,14 +43,14 @@ test('encrypted .secrets round-trips and enforces the master key', async (t) => 
         TEST_SIGNING_SECRET: 'office-secret',
     });
 
-    let encryptedText = readFileSync(path.join(ploinkyDir, '.secrets'), 'utf8');
+    let encryptedText = readFileSync(path.join(ploinkyDir, 'data', '.secrets'), 'utf8');
     // Packed-base64 envelope: a single line of base64 + trailing newline, no JSON braces.
     assert.match(encryptedText, /^[A-Za-z0-9+/]+={0,2}\n?$/);
     assert.doesNotMatch(encryptedText, /token-value|office-secret|TEST_SECRET_TOKEN|TEST_SIGNING_SECRET/);
 
     store.setSecretValue('DPU_MASTER_KEY', 'dpu-secret');
     assert.equal(store.readSecretsFile().DPU_MASTER_KEY, 'dpu-secret');
-    encryptedText = readFileSync(path.join(ploinkyDir, '.secrets'), 'utf8');
+    encryptedText = readFileSync(path.join(ploinkyDir, 'data', '.secrets'), 'utf8');
     assert.doesNotMatch(encryptedText, /dpu-secret|DPU_MASTER_KEY/);
 
     store.deleteSecretValue('TEST_SECRET_TOKEN');
@@ -62,7 +62,7 @@ test('encrypted .secrets round-trips and enforces the master key', async (t) => 
     delete process.env.PLOINKY_MASTER_KEY;
     assert.throws(
         () => store.readSecretsFile(),
-        /Unable to decrypt .ploinky\/.secrets: .*Check PLOINKY_MASTER_KEY.*\.env.*\.ploinky\/master-key/s,
+        /Unable to decrypt .ploinky\/data\/.secrets: .*Check PLOINKY_MASTER_KEY.*\.env.*\.ploinky\/data\/master-key/s,
         '.env uses a different key, so process env must have taken precedence while writing',
     );
 
@@ -74,7 +74,7 @@ test('encrypted .secrets round-trips and enforces the master key', async (t) => 
     writeFileSync(path.join(workspace, '.env'), '');
     assert.throws(
         () => store.readSecretsFile(),
-        /Unable to decrypt \.ploinky\/\.secrets: .*Check PLOINKY_MASTER_KEY.*\.env.*\.ploinky\/master-key/s,
+        /Unable to decrypt \.ploinky\/data\/\.secrets: .*Check PLOINKY_MASTER_KEY.*\.env.*\.ploinky\/data\/master-key/s,
     );
 
     // Arbitrary strings are now accepted as seeds, so the wrong seed produces
@@ -82,6 +82,6 @@ test('encrypted .secrets round-trips and enforces the master key', async (t) => 
     process.env.PLOINKY_MASTER_KEY = 'abc';
     assert.throws(
         () => store.readSecretsFile(),
-        /Unable to decrypt .ploinky\/.secrets: .*Check PLOINKY_MASTER_KEY.*\.env.*\.ploinky\/master-key/s,
+        /Unable to decrypt .ploinky\/data\/.secrets: .*Check PLOINKY_MASTER_KEY.*\.env.*\.ploinky\/data\/master-key/s,
     );
 });

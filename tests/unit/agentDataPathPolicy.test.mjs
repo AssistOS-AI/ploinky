@@ -137,6 +137,8 @@ test('manifest policy rejects every lexical, absolute, normalized, and symlinked
             '.ploinky/deps/store',
             '.ploinky/deps/store/objects',
             '.ploinky/.secrets',
+            '.ploinky/data/.secrets',
+            '.ploinky/data/master-key',
             '.ploinky/agents',
             '.ploinky/repos',
             '.ploinky/running',

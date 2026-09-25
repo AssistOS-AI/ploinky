@@ -6,7 +6,6 @@ import {
     PLOINKY_DIR,
     PROFILE_FILE,
     ROUTING_FILE,
-    SECRETS_FILE,
     SERVERS_CONFIG_FILE,
     PLOINKY_WORKSPACE_ROOT,
 } from '../../utils/config.js';
@@ -87,10 +86,6 @@ function buildSeatbeltProfile(options) {
     ].filter(Boolean).flatMap(pathAliases).filter(grantPath => controllerRoots.some(root => (
         grantPath !== root && isPathWithin(grantPath, root)
     )));
-    const controllerSecretFiles = Array.from(new Set(controllerRoots.flatMap(root => [
-        ...pathAliases(path.join(root, 'master-key')),
-        ...pathAliases(path.join(root, '.secrets')),
-    ])));
     const protectedWritePaths = [
         ...collectProtectedWritePaths({
         agentCodePath,
@@ -277,9 +272,6 @@ function buildSeatbeltProfile(options) {
     for (const protectedRoot of protectedControllerRoots) {
         lines.push(`    (subpath ${sbplQuote(protectedRoot)})`);
     }
-    for (const secretFile of controllerSecretFiles) {
-        lines.push(`    (literal ${sbplQuote(secretFile)})`);
-    }
     lines.push(')');
     lines.push('');
 
@@ -350,7 +342,6 @@ function collectProtectedWritePaths({
         addSubpath(skillsPath);
     }
 
-    addLiteral(SECRETS_FILE);
     addLiteral(PROFILE_FILE);
     addLiteral(ROUTING_FILE);
     addLiteral(SERVERS_CONFIG_FILE);

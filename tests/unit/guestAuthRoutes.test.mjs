@@ -67,7 +67,8 @@ function makeRequest({
 }
 
 function writeWorkspaceConfig(ploinkyDir, { staticAuthMode = 'sso' } = {}) {
-    writeFileSync(path.join(ploinkyDir, '.secrets'), '# test secrets\n');
+    mkdirSync(path.join(ploinkyDir, 'data'), { recursive: true });
+    writeFileSync(path.join(ploinkyDir, 'data', '.secrets'), '# test secrets\n');
     const webAdminManifestDir = path.join(ploinkyDir, 'repos', 'webassist', 'webAdmin');
     const serviceManifestDir = path.join(ploinkyDir, 'repos', 'services', 'guestAgent');
     mkdirSync(webAdminManifestDir, { recursive: true });

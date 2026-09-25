@@ -431,7 +431,7 @@ public `--name`, `--engine`, or `PLOINKY_BOX_ENGINE` override. Ordinary
 workspace, the nested image cache, and the Ploinky dependency cache for
 recreation. The explicit `destroy --delete-cache` form deletes exactly
 `.ploinky/box/dependencies` and `.ploinky/box/images` after the outer container
-is gone; it never removes the workspace, `.ploinky/master-key`, repositories,
+is gone; it never removes the workspace, `.ploinky/data/master-key`, repositories,
 agents, routing state, or secrets.
 
 Every managed box has exactly two engine publications, independent of graph or
@@ -447,10 +447,14 @@ host TCP `9090` to in-Box TCP `8080` and host UDP `12345` to in-Box UDP `7882`.
 `--publish`, `--expose`, and `--listen-lan` are rejected. Agent `openPorts`,
 HTTP-service targets, readiness, profiles, manifests, labels, and retained state
 remain private and cannot add a third mapping. A managed Box creates its sole
-core master key at `.ploinky/master-key` with mode `0600`. Host environment and
+core master key at `.ploinky/data/master-key` with mode `0600`. Host environment and
 `.env` values cannot override that key; `.env` remains application-owned and is
 never created, changed, or consulted for managed-key resolution. Missing,
 malformed, or unsafe managed-key state fails closed before core readiness.
+The key and the stores it encrypts (`.ploinky/data/.secrets` and the subject
+identity keypair) live in `.ploinky/data`, which agent runtimes mask even through
+a broad workspace bind. A key or store left at the retired `.ploinky/<name>`
+spelling is refused; stop the workspace and move it into `.ploinky/data`.
 
 The box image includes pinned multi-architecture `cloudflared`, supervised by
 Ploinky core. No Cloudflare credentials selects explicit `local-only` mode: the
