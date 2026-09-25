@@ -86,7 +86,7 @@ export async function runUpdateCommand(normalizedOptions = [], {
         try {
             const options = { interactiveSession, agentLibBranchPolicy, command,
                 delegatedWorkspacePloinkyPath: reportRequest?.context?.source?.workspacePloinky?.delegatedBoxRepoPath || null };
-            // Pin refresh and restarts inside the update reuse this lease.
+            // Git pin refresh inside the update reuses this lease.
             result = await runWithWorkspaceMutationLease(lease, () => withUpdateSkillScopes(
                 reportRequest?.context?.source?.skillScopes,
                 async () => {

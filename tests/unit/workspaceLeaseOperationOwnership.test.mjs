@@ -28,6 +28,8 @@ const { NETWORK_SCHEMA_VERSION } = await import('../../cli/sandbox/networkContra
 const locks = await import('../../cli/utils/runtime/maintenanceLocks.js');
 const { resolveDependencyLease } = await import('../../cli/utils/dependencies/store/runtimeDependencies.mjs');
 const { startCloudflarePublicationRuntime } = await import('../../ploinky-box/cloudflared/runtime.mjs');
+const { createContainerMonitor, performContainerRestart, stopContainerMonitor } = await import('../../cli/server/containerMonitor.js');
+const { runUpdateCommand } = await import('../../cli/commands/updateCommand.js');
 
 const { WORKSPACE_START_LOCK_PATH } = locks;
 const LOCKS_URL = new URL('../../cli/utils/runtime/maintenanceLocks.js', import.meta.url).href;
@@ -360,5 +362,106 @@ test('a disable nested in its owning operation reuses that lease and leaves it h
     }
     assert.equal(readJson(paths.agentsFile)[TARGET], undefined);
     assert.notEqual(edge.loadActiveEdgeRoutingGeneration().selector.generation, f.generation);
+    assertLocksReleased();
+});
+
+// What nested code in an owner sees, and what an operation started beside the
+// owner in the same process sees while the owner is suspended.
+function nestedObservation() {
+    const dependency = resolveDependencyLease();
+    const observed = { held: locks.heldWorkspaceMutationLease(), dependency: dependency.lease, disk: readLease() };
+    dependency.release();
+    return observed;
+}
+
+async function besideTheOwner() {
+    const observed = { held: locks.heldWorkspaceMutationLease() };
+    try { resolveDependencyLease(); observed.dependency = 'REUSED'; } catch (error) { observed.dependency = error.code; }
+    return observed;
+}
+
+function barrier() {
+    let open;
+    const opened = new Promise((resolve) => { open = resolve; });
+    return { open, opened };
+}
+
+test('a watchdog restart binds its lease: its dependency preparation reuses it, a concurrent Router operation does not', { timeout: 30_000 }, async (t) => {
+    fixture();
+    const entered = barrier();
+    const leave = barrier();
+    const failure = Object.assign(new Error('fixture launch stops here'), { code: 'FIXTURE_LAUNCH_STOP' });
+    let inside;
+    const monitor = createContainerMonitor({
+        config: {},
+        terminalLedgerFile: path.join(workspace, 'watchdog-terminal.json'),
+        log: () => {},
+    });
+    t.after(() => stopContainerMonitor(monitor));
+    monitor.resolveManifestRuntimeProfile = () => ({ resolvedProfileName: 'default', profileConfig: {}, network: { mode: 'none' } });
+    monitor.resolveRouterEndpoint = () => null;
+    monitor.ensureAgentService = async () => {
+        inside = nestedObservation();
+        entered.open();
+        await leave.opened;
+        throw failure;
+    };
+    const target = {
+        type: 'agent',
+        containerName: TARGET,
+        agentName: 'probe',
+        repoName: 'fixtures',
+        manifestPath: path.join(paths.ploinkyDir, 'repos', 'fixtures', 'probe', 'manifest.json'),
+        isRestarting: true,
+    };
+
+    const restart = performContainerRestart(monitor, target, 'not_running');
+    await entered.opened;
+    const owner = readLease();
+    assert.equal(owner?.operation, `watchdog-restart:${TARGET}`);
+    assert.equal(inside.held?.token, owner.token);
+    assert.equal(inside.dependency?.token, owner.token, 'dependency preparation reuses the watchdog lease');
+    assert.equal(inside.disk?.token, owner.token);
+    assert.deepEqual(await besideTheOwner(), { held: null, dependency: 'PLOINKY_DEPS_WORKSPACE_LEASE_BUSY' });
+    assert.equal(readLease()?.token, owner.token);
+
+    leave.open();
+    await assert.rejects(restart, { code: 'FIXTURE_LAUNCH_STOP' });
+    assertLocksReleased();
+});
+
+test('an update binds its lease: nested pin refresh reuses it, a concurrent operation does not', { timeout: 30_000 }, async () => {
+    fixture();
+    const entered = barrier();
+    const leave = barrier();
+    let inside;
+    const quiet = () => {};
+    const update = runUpdateCommand([], {
+        env: {},
+        insideBox: false,
+        leaseWaitMs: 0,
+        log: quiet,
+        error: quiet,
+        handlers: {
+            updateAllRepos: async () => {
+                inside = nestedObservation();
+                inside.nested = await locks.withHeldOrAcquiredWorkspaceMutationLease({ operation: 'nested', waitTimeoutMs: 0 }, async (lease) => lease);
+                entered.open();
+                await leave.opened;
+                throw new Error('fixture update stops here');
+            },
+        },
+    });
+    await entered.opened;
+    const owner = readLease();
+    assert.equal(owner?.operation, 'update');
+    assert.equal(inside.held?.token, owner.token);
+    assert.equal(inside.dependency?.token, owner.token);
+    assert.equal(inside.nested?.token, owner.token, 'the pin-refresh helper reuses the update lease');
+    assert.deepEqual(await besideTheOwner(), { held: null, dependency: 'PLOINKY_DEPS_WORKSPACE_LEASE_BUSY' });
+
+    leave.open();
+    const result = await update;
+    assert.ok(result.records.some((record) => record.code === 'update-threw'));
     assertLocksReleased();
 });
