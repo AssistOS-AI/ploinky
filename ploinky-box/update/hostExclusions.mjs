@@ -132,6 +132,16 @@ export function refreshDeferredHostExclusions({
                 details: { folder: scope.canonicalFolder, status: exclusions?.status || null },
             }));
         } catch (error) {
+            // A lock release failure carries the completed result; one that
+            // still needs recovery stays uncertain, as it would on success.
+            const completedProblem = error?.code === 'SKILL_EXPORT_LOCK_RELEASE_FAILED' ? skillExportRecoveryProblem(error.skillExportResult) : null;
+            if (completedProblem) {
+                records.push(exclusionRecord(id, 'uncertain', {
+                    code: completedProblem.code, reason: `${completedProblem.reason} ${error.message}`,
+                    details: { folder: scope.canonicalFolder, transaction: completedProblem.transaction, recovery: completedProblem.recovery, errorCode: error.code },
+                }));
+                continue;
+            }
             records.push(exclusionRecord(id, error?.code === 'SKILL_EXPORT_HOST_BOUNDARY' ? 'deferred' : error?.code === 'SKILL_EXPORT_RECOVERY_REQUIRED' ? 'uncertain' : 'failed', {
                 code: String(error?.exclusionCode || error?.code || 'exclusions-refresh-failed'),
                 reason: error?.message || String(error),
