@@ -591,11 +591,13 @@ function finishUpdateResult({ command, records, prior, agentLib = null, extra = 
 /**
  * `update repo <name>` as an update result (never throws for an outcome).
  */
-async function updateRepoResult(repoName, { command = ['update', 'repo', repoName] } = {}) {
+async function updateRepoResult(repoName, { command = ['update', 'repo', repoName], cancellation = null } = {}) {
     if (!repoName) throw new Error('Usage: update repo <name>');
     const prior = readGraphSafely();
     const records = [];
+    const checkpoint = stage => cancellation?.checkpoint(stage, records);
     let record;
+    await checkpoint(`repository ${repoName}`);
     try {
         record = reposSvc.updateRegisteredRepository(repoName);
     } catch (err) {
@@ -614,10 +616,12 @@ async function updateRepoResult(repoName, { command = ['update', 'repo', repoNam
         console.log(`✓ Repo '${repoName}' updated.`);
     }
     records.push(record);
+    await checkpoint('the dependency pin refresh');
     records.push(...(await refreshUpdateGitPins({ repositoryNames: [repoName], sourceOutcomes: records })).records);
     const sourceOutcomes = [record];
     let defaultSkills = null;
     if (record.outcome === 'changed' || record.outcome === 'unchanged') {
+        await checkpoint('the default skills refresh');
         // achillesAgentLib is not a per-repository npm package any more: it is
         // the one workspace-selected source, advanced by `ploinky update`.
         defaultSkills = refreshDefaultSkillsInPloinkyRepos([repoName], { sourceOutcomes });
@@ -630,6 +634,7 @@ async function updateRepoResult(repoName, { command = ['update', 'repo', repoNam
     let skillConsumers = null;
     const checkout = record.details?.checkout?.path;
     if (checkout) {
+        await checkpoint('the skills manifest refresh');
         skillConsumers = skillsSvc.refreshSkillConsumersForSource({
             folders: skillsSvc.findWorkspaceFoldersWithSkillsManifest(PLOINKY_WORKSPACE_ROOT),
             sourcePath: checkout,
@@ -672,6 +677,8 @@ async function updatePloinkyRepos(options = {}) {
     const ploinkyRepos = getGitRepoNames();
     const operations = buildRegisteredOperations(ploinkyRepos);
     const records = [];
+    const checkpoint = stage => options.cancellation?.checkpoint(stage, records);
+    await checkpoint('the achillesAgentLib refresh');
     const agentLib = await refreshAgentLibSourceForUpdate({
         branchPolicy: options.agentLibBranchPolicy || null,
         interactiveSession: options.interactiveSession === true,
@@ -681,14 +688,19 @@ async function updatePloinkyRepos(options = {}) {
 
     if (operations.length) {
         console.log('Updating ploinky repositories...');
-        for (const operation of operations) executeGitOperation(operation, records);
+        for (const operation of operations) {
+            await checkpoint(`repository ${recordLabel(operation)}`);
+            executeGitOperation(operation, records);
+        }
     } else {
         console.log('No ploinky repositories installed.');
     }
 
+    await checkpoint('the dependency pin refresh');
     records.push(...(await refreshUpdateGitPins({ repositoryNames: ploinkyRepos, sourceOutcomes: records })).records);
 
     // The skills phase consumes the operation records; it never pulls again.
+    await checkpoint('the default skills refresh');
     const defaultSkills = refreshDefaultSkillsInPloinkyRepos(ploinkyRepos, { sourceOutcomes: [...records] });
     logDefaultSkillSummary(defaultSkills);
     records.push(...defaultSkills.records);
@@ -755,7 +767,9 @@ async function updateAllRepos(folderPath, options = {}) {
         }
     }
     const records = [];
+    const checkpoint = stage => options.cancellation?.checkpoint(stage, records);
 
+    await checkpoint('the Ploinky self-update');
     console.log('Updating Ploinky...');
     let selfUpdate = null;
     try {
@@ -782,6 +796,7 @@ async function updateAllRepos(folderPath, options = {}) {
         console.error(`  ✗ Ploinky: ${message}`);
     }
 
+    await checkpoint('the achillesAgentLib refresh');
     const agentLib = await refreshAgentLibSourceForUpdate({
         branchPolicy: options.agentLibBranchPolicy || null,
         interactiveSession: options.interactiveSession === true,
@@ -800,17 +815,25 @@ async function updateAllRepos(folderPath, options = {}) {
 
     if (registeredOperations.length) {
         console.log('Updating ploinky repositories...');
-        for (const operation of registeredOperations) executeGitOperation(operation, records);
+        for (const operation of registeredOperations) {
+            await checkpoint(`repository ${recordLabel(operation)}`);
+            executeGitOperation(operation, records);
+        }
     }
 
     if (workspaceOperations.length) {
         console.log(`Updating workspace repositories in ${projectsRoot}...`);
-        for (const operation of workspaceOperations) executeGitOperation(operation, records);
+        for (const operation of workspaceOperations) {
+            await checkpoint(`repository ${recordLabel(operation)}`);
+            executeGitOperation(operation, records);
+        }
     }
 
+    await checkpoint('the dependency pin refresh');
     records.push(...(await refreshUpdateGitPins({ repositoryNames: ploinkyRepos, sourceOutcomes: records })).records);
 
     // The skills phases consume the operation records; they never pull again.
+    await checkpoint('the default skills refresh');
     const sourceOutcomes = [...records];
     const defaultSkills = refreshDefaultSkillsInPloinkyRepos(ploinkyRepos, { sourceOutcomes });
     logDefaultSkillSummary(defaultSkills);
@@ -823,6 +846,7 @@ async function updateAllRepos(folderPath, options = {}) {
         for (const manifestFolder of workspaceManifestFolders) {
             const manifestPath = skillsSvc.findSkillsManifestPath(manifestFolder);
             const folderLabel = path.relative(projectsRoot, manifestFolder) || path.basename(manifestFolder);
+            await checkpoint(`the skills manifest in ${folderLabel}`);
             try {
                 const result = skillsSvc.installSkillsFromManifest(manifestPath, {
                     targetRoot: manifestFolder,

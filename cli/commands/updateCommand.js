@@ -12,6 +12,7 @@ import { appendUpdateRecords, buildCoreUpdateResult, commandErrorRecord } from '
 import { printUpdateSummary } from './updateSummary.js';
 import { withUpdateSkillScopes } from './updateGraph.js';
 import { updateAllRepos, updatePloinkyRepos, updateRepoResult } from './repoAgentCommands.js';
+import { UpdateCancelledError, createUpdateCancellation } from './updateCancellation.js';
 
 // The core `ploinky update` command boundary.
 //
@@ -24,6 +25,12 @@ import { updateAllRepos, updatePloinkyRepos, updateRepoResult } from './repoAgen
 // then repository/common-Git locks. A lease capability already held by the
 // caller is validated and reused, never re-acquired. The wait is bounded well
 // below the host's in-Box command timeout.
+//
+// Cancellation: from the moment it holds the lease until its report is
+// published the update owns SIGINT/SIGTERM. A signal stops it at the next
+// checkpoint, after the step in progress released its locks, and ends it with
+// a failed `cancelled` record; a signal after the last checkpoint still blocks
+// activation.
 
 export const UPDATE_LEASE_WAIT_MS = 5 * 60 * 1000;
 export const IN_BOX_ACTIVATION_NOTICE = 'This update ran inside the Box: activate it from the host with `ploinky update` or `ploinky restart`.';
@@ -44,7 +51,12 @@ export function readReportRequest(env = process.env) {
     return { nonce, context };
 }
 
+function cancelledRecord(error) {
+    return commandErrorRecord(error, { code: 'cancelled' });
+}
+
 function thrownRecord(error) {
+    if (error instanceof UpdateCancelledError) return cancelledRecord(error);
     if (LOCK_BUSY_CODES.has(error?.code)) {
         return commandErrorRecord(error, { outcome: 'uncertain', code: 'lock-busy' });
     }
@@ -56,7 +68,16 @@ function thrownRecord(error) {
     return commandErrorRecord(error, { outcome: 'uncertain', attempted: true, code: String(error?.code || 'update-threw') });
 }
 
-export async function runUpdateCommand(normalizedOptions = [], {
+export async function runUpdateCommand(normalizedOptions = [], options = {}) {
+    const cancellation = createUpdateCancellation();
+    try {
+        return await runUpdate(normalizedOptions, { ...options, cancellation });
+    } finally {
+        cancellation.dispose();
+    }
+}
+
+async function runUpdate(normalizedOptions, {
     agentLibBranchPolicy = null,
     interactiveSession = false,
     env = process.env,
@@ -67,7 +88,8 @@ export async function runUpdateCommand(normalizedOptions = [], {
     handlers = { updateAllRepos, updatePloinkyRepos, updateRepoResult },
     log = console.log,
     error: logError = console.error,
-} = {}) {
+    cancellation,
+}) {
     const args = normalizedOptions.map(value => String(value ?? ''));
     const command = ['update', ...args];
     const reportRequest = readReportRequest(env);
@@ -83,15 +105,16 @@ export async function runUpdateCommand(normalizedOptions = [], {
             lease = await acquireWorkspaceMutationLease({ operation: 'update', waitTimeoutMs: leaseWaitMs });
             ownsLease = true;
         }
+        cancellation.arm();
         try {
-            const options = { interactiveSession, agentLibBranchPolicy, command,
+            const options = { interactiveSession, agentLibBranchPolicy, command, cancellation,
                 delegatedWorkspacePloinkyPath: reportRequest?.context?.source?.workspacePloinky?.delegatedBoxRepoPath || null };
             // Git pin refresh inside the update reuses this lease.
             result = await runWithWorkspaceMutationLease(lease, () => withUpdateSkillScopes(
                 reportRequest?.context?.source?.skillScopes,
                 async () => {
                     if (request.kind === 'repos') return handlers.updatePloinkyRepos(options);
-                    if (request.kind === 'repo') return handlers.updateRepoResult(request.repoName, { command });
+                    if (request.kind === 'repo') return handlers.updateRepoResult(request.repoName, { command, cancellation });
                     return handlers.updateAllRepos(request.folderPath || undefined, options);
                 },
             ));
@@ -107,6 +130,9 @@ export async function runUpdateCommand(normalizedOptions = [], {
     } catch (error) {
         const records = [...(Array.isArray(error?.records) ? error.records : []), thrownRecord(error)];
         result = buildCoreUpdateResult({ command, records });
+    }
+    if (cancellation.received() && !result.records.some(record => record.phase === 'command' && record.code === 'cancelled')) {
+        result = appendUpdateRecords(result, [cancelledRecord(new UpdateCancelledError(cancellation.received(), 'activation'))]);
     }
     result.command = command;
     if (insideBox && !reportRequest) log(IN_BOX_ACTIVATION_NOTICE);
