@@ -1053,33 +1053,40 @@ test('the creating checkout still rejects a foreign seccomp profile path', (t) =
 });
 
 test('reconciliation from another checkout mutates no container, image or data', async (t) => {
-    const state = fixture(t);
-    const creator = otherCheckout(state);
-    const current = containerHandle({
-        identity: state.identity,
-        agentLib: state.agentLib,
-        repositoryRoot: creator,
-        imageId: 'd'.repeat(64),
-        imageRef: BOX_IMAGE_REFERENCE,
-        hostPort: 8080,
-        id: 'e'.repeat(64),
-    });
-    const h = harness(state, { initial: current });
-    await assert.rejects(() => reconcileBoxContainer({
-        identity: state.identity,
-        agentLib: state.agentLib,
-        ownership: { state: 'owned', handles: { container: current } },
-        engine: { name: 'podman', identity: 'engine' },
-        runner: h.runner,
-        lock: state.lock,
-        repositoryRoot: state.root,
-    }, h.seams), (error) => error.code === BOX_SOURCE_MISMATCH);
-    assert.equal(current.runtime.running, true);
-    for (const verb of ['container stop', 'container rm', 'container create', 'container start']) {
-        assert.equal(h.calls.some((call) => call.join(' ').includes(verb)), false, verb);
+    // Running or stopped, and with a candidate image ('c') that differs from
+    // the Box's ('d'), the source check refuses before any reuse or
+    // replacement decision, so an update preflight refusal changes no outcome.
+    for (const running of [true, false]) {
+        const state = fixture(t);
+        const creator = otherCheckout(state);
+        const current = containerHandle({
+            identity: state.identity,
+            agentLib: state.agentLib,
+            repositoryRoot: creator,
+            imageId: 'd'.repeat(64),
+            imageRef: BOX_IMAGE_REFERENCE,
+            hostPort: 8080,
+            id: 'e'.repeat(64),
+            running,
+        });
+        const h = harness(state, { initial: current });
+        await assert.rejects(() => reconcileBoxContainer({
+            identity: state.identity,
+            agentLib: state.agentLib,
+            ownership: { state: 'owned', handles: { container: current } },
+            engine: { name: 'podman', identity: 'engine' },
+            runner: h.runner,
+            lock: state.lock,
+            repositoryRoot: state.root,
+            imageRef: BOX_IMAGE_REFERENCE,
+        }, h.seams), (error) => error.code === BOX_SOURCE_MISMATCH);
+        assert.equal(current.runtime.running, running);
+        for (const verb of ['container stop', 'container rm', 'container create', 'container start']) {
+            assert.equal(h.calls.some((call) => call.join(' ').includes(verb)), false, `${running}: ${verb}`);
+        }
+        assert.equal(h.calls.some((call) => call.includes('pull')), false);
+        assert.equal(h.calls.some((call) => call.join(' ').includes('stop-ploinky-local')), false);
     }
-    assert.equal(h.calls.some((call) => call.includes('pull')), false);
-    assert.equal(h.calls.some((call) => call.join(' ').includes('stop-ploinky-local')), false);
 });
 
 test('stopped reuse baseline failure mutates no container or image state', async (t) => {
