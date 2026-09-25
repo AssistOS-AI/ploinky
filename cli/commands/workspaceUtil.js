@@ -24,7 +24,7 @@ import {
   manifestUsesHealthProbeBroker,
   resolvePublishedPortMappings,
 } from '../sandbox/docker/agentServiceManager.js';
-import { removeExactRegisteredContainer } from '../sandbox/docker/containerFleet.js';
+import { inspectExactContainer, removeExactRegisteredContainer } from '../sandbox/docker/containerFleet.js';
 import { isBwrapProcessRunning } from '../sandbox/bwrap/bwrapFleet.js';
 import * as inputState from './inputState.js';
 import { MAX_NO_WAIT_BARRIER_ENTRIES, MAX_NO_WAIT_WAVE_INDEX } from './noWaitWorker.js';
@@ -999,6 +999,7 @@ function removeGraphContainerForRecreate(containerName, label, predecessorRecord
   removeExactRegisteredContainerImpl = removeExactRegisteredContainer,
   readRuntimeCandidateImpl = readRuntimeCandidate,
   retireRuntimeCandidateImpl = retireRuntimeCandidate,
+  inspectExactContainerImpl = inspectExactContainer,
 } = {}) {
   // A staged predecessor whose launcher never published it (a no-wait worker
   // that stopped or was superseded) has no registered container ID. Its launch
@@ -1007,12 +1008,16 @@ function removeGraphContainerForRecreate(containerName, label, predecessorRecord
   // launcher died before persisting the ID.
   const unpublished = !/^[a-f0-9]{64}$/.test(String(predecessorRecord?.containerId || ''));
   if (!containerExistsImpl(containerName)) {
-    // Nothing to remove. The exact launch receipt of a runtime that is also
-    // absent by its recorded ID is retired; anything unproven stays as it is.
+    // Nothing to remove by name. The launch receipt is the only recovery
+    // evidence, so it is retired only when its own engine positively reports
+    // the exact recorded ID missing. An unavailable engine, a timeout or any
+    // other inspection failure is unknown and leaves the receipt in place.
     if (unpublished) {
       try {
         const receipt = readRuntimeCandidateImpl(containerName, predecessorRecord);
-        if (receipt && !containerExistsImpl(receipt.containerId)) retireRuntimeCandidateImpl(receipt);
+        if (receipt && inspectExactContainerImpl(receipt.runtime, receipt.containerId) === null) {
+          retireRuntimeCandidateImpl(receipt);
+        }
       } catch (_) {}
     }
     return { removed: false, state: 'absent' };

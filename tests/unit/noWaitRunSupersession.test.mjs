@@ -49,9 +49,9 @@ function workspace(t) {
         PLOINKY_NO_WAIT_EDGE_TIMEOUT_MS: '20000',
         PLOINKY_NO_WAIT_LIFECYCLE_LEASE_TIMEOUT_MS: '20000',
     };
-    const drive = (phase, argument) => {
+    const drive = (phase, argument, extraEnv = {}) => {
         const run = spawnSync(process.execPath, [DRIVER, phase, ...(argument ? [JSON.stringify(argument)] : [])], {
-            cwd: ws, env, encoding: 'utf8', timeout: 120_000,
+            cwd: ws, env: { ...env, ...extraEnv }, encoding: 'utf8', timeout: 120_000,
         });
         assert.equal(run.status, 0, `${phase}: ${run.stdout}\n${run.stderr}`);
         return JSON.parse(run.stdout.trim().split('\n').at(-1));
@@ -253,6 +253,46 @@ test('an unpublished predecessor that is already gone leaves no launch receipt b
     const result = w.drive('remove-predecessor', { record: staged });
     assert.deepEqual(result.removed, { removed: false, state: 'absent' });
     assert.deepEqual(receiptInstances(w), [], 'the receipt of the provably absent runtime is retired');
+});
+
+// A `podman` whose control plane fails the way a real engine does when it is
+// unreachable, or whose exact-ID inspection hangs past the control timeout.
+function scriptedEnginePath(w, mode) {
+    const dir = path.join(w.root, `scripted-engine-${mode}`);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'podman'), `#!${process.execPath}
+const [command, sub] = process.argv.slice(2);
+if (${JSON.stringify(mode)} === 'hang' && command === 'container' && sub === 'inspect') setTimeout(() => {}, 60000);
+else { process.stderr.write('Error: unable to connect to Podman socket: connection refused\\n'); process.exit(125); }
+`, { mode: 0o755 });
+    return [dir, w.env.PATH].join(path.delimiter);
+}
+
+test('an unknown engine answer never retires a launch receipt; only an exact missing ID does', async (t) => {
+    const w = workspace(t);
+    w.drive('setup');
+    const ensured = w.drive('worker-ensure');
+    const staged = JSON.parse(fs.readFileSync(path.join(w.ws, '.ploinky', 'agents.json'), 'utf8'))[CONTAINER];
+    const withoutEngine = w.env.PATH.split(path.delimiter)
+        .filter((dir) => dir && !fs.existsSync(path.join(dir, 'podman')) && !fs.existsSync(path.join(dir, 'docker')))
+        .join(path.delimiter);
+    // The name probe reports every failure as "no container", so the receipt
+    // branch is reached while the runtime still exists.
+    for (const [label, PATH] of [
+        ['no container engine on PATH', withoutEngine],
+        ['engine control plane unreachable', scriptedEnginePath(w, 'unavailable')],
+        ['exact-ID inspection timed out', scriptedEnginePath(w, 'hang')],
+    ]) {
+        w.drive('remove-predecessor', { record: staged }, { PATH });
+        assert.deepEqual(receiptInstances(w), ['demo-instance'], `${label}: the launch receipt is preserved`);
+        assert.deepEqual(containers(w), { [ensured.containerId]: 'running' }, `${label}: the runtime still exists`);
+    }
+    // The real engine, asked by exact ID after the runtime is gone, answers
+    // "no such container": only that retires the receipt.
+    const removed = spawnSync('podman', ['rm', '-f', ensured.containerId], { env: w.env, encoding: 'utf8' });
+    assert.equal(removed.status, 0, removed.stderr);
+    w.drive('remove-predecessor', { record: staged });
+    assert.deepEqual(receiptInstances(w), []);
 });
 
 test('without a stalled earlier worker the same next start keeps the staged identity', async (t) => {
