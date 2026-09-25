@@ -155,34 +155,38 @@ test('generated profile can launch a basic macOS command', { skip: process.platf
     }
 
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'seatbelt-profile-'));
-    const profile = buildSeatbeltProfile({
-        agentLibGrant: seatbeltGrantFor(workspace),
-        agentCodePath: workspace,
-        agentLibPath: workspace,
-        nodeModulesDir: workspace,
-        agentWorkDir: workspace,
-        sharedDir: workspace,
-        cwd: workspace,
-        skillsPath: null,
-        codeReadOnly: false,
-        skillsReadOnly: true,
-        volumes: {},
-        extraReadPaths: ['/opt/homebrew'],
-    });
-    const profilePath = path.join(workspace, 'profile.sb');
-    fs.writeFileSync(profilePath, profile, 'utf8');
+    try {
+        const profile = buildSeatbeltProfile({
+            agentLibGrant: seatbeltGrantFor(workspace),
+            agentCodePath: workspace,
+            agentLibPath: workspace,
+            nodeModulesDir: workspace,
+            agentWorkDir: workspace,
+            sharedDir: workspace,
+            cwd: workspace,
+            skillsPath: null,
+            codeReadOnly: false,
+            skillsReadOnly: true,
+            volumes: {},
+            extraReadPaths: ['/opt/homebrew'],
+        });
+        const profilePath = path.join(workspace, 'profile.sb');
+        fs.writeFileSync(profilePath, profile, 'utf8');
 
-    const result = spawnSync('sandbox-exec', ['-f', profilePath, '/bin/echo', 'ok'], {
-        encoding: 'utf8',
-    });
-    assert.equal(result.status, 0, result.stderr || result.stdout);
-    assert.equal(result.stdout.trim(), 'ok');
+        const result = spawnSync('sandbox-exec', ['-f', profilePath, '/bin/echo', 'ok'], {
+            encoding: 'utf8',
+        });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        assert.equal(result.stdout.trim(), 'ok');
 
-    const devNullResult = spawnSync('sandbox-exec', ['-f', profilePath, '/bin/sh', '-lc', 'echo ok >/dev/null && echo ok'], {
-        encoding: 'utf8',
-    });
-    assert.equal(devNullResult.status, 0, devNullResult.stderr || devNullResult.stdout);
-    assert.equal(devNullResult.stdout.trim(), 'ok');
+        const devNullResult = spawnSync('sandbox-exec', ['-f', profilePath, '/bin/sh', '-lc', 'echo ok >/dev/null && echo ok'], {
+            encoding: 'utf8',
+        });
+        assert.equal(devNullResult.status, 0, devNullResult.stderr || devNullResult.stdout);
+        assert.equal(devNullResult.stdout.trim(), 'ok');
+    } finally {
+        fs.rmSync(workspace, { recursive: true, force: true });
+    }
 });
 
 test('generated profile denies writes to read-only code, cache, and staged lib', { skip: process.platform !== 'darwin' }, () => {
