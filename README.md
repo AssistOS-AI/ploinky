@@ -483,26 +483,6 @@ configuration generation, and a monotonic readiness/publication generation.
 The authenticated browser projection returns only one active `no-store` locator
 plus configuration/publication ids, never the authorization id or inventory.
 
-Before updating a legacy direct/core installation, run the
-old checkout's core entry directly:
-
-```sh
-node cli/index.js destroy
-node cli/index.js network prune
-```
-
-Do not use the public `ploinky` wrapper for this step: outside a box it controls
-the outer runtime rather than the old core workspace. Inspect or resolve any
-foreign resources reported by the core prune. After confirming no container
-still references them, one-time cleanup may remove the exact stale
-`.ploinky/run/router.sock` and `.ploinky/run/managed-hosts` paths and the now
-unreferenced cached image
-`docker.io/assistos/ploinky-network-gateway:1@sha256:68c47ce93d16ea1a2d03944f7b50ce82e6f2f9a26b183d2c9c7fbabcc828fb7e`.
-Before activation, revoke the retired publication connector/API tokens and
-delete its plaintext retained state; the current runtime contains no migration or cleanup
-reader. Do not use a broad container, image, volume, or network prune for this
-cutover.
-
 For local core development without entering the managed runtime, run the CLI
 entry directly from your checkout:
 
@@ -651,7 +631,7 @@ URLs registered with an SSO provider.
 ## Core commands (in p-cli)
 
 - `enable agent <name> [as <alias>]`: register an agent in `.ploinky/agents.json` (creates a minimal manifest if missing). Use `as <alias>` to spin up additional instances with unique container names.
-- `update [folderPath]`: use the current directory as the update folder, or `folderPath` (which must be inside the workspace) when supplied. A Ploinky checkout is updated only when it is inside that folder or contains the launch folder. Each checkout is fetched once and fast-forwarded only when it is clean, on its configured branch and upstream, and not diverged; otherwise it is preserved and reported with a named reason (for example `dirty-worktree`, `diverged`, `detached-head`, `upstream-mismatch`, `legacy-ignore-block-preserved`). Every phase (Ploinky, AgentLib, repositories, default skills, skills manifests) produces a record; the command exits nonzero when any record failed or when a required input (a repository, skills source or AgentLib that the configured graph uses) was not verified, and activation happens only when every required input verified. Update never prepares dependency caches. AchillesAgentLib is revalidated from the local checkout or the pinned Box bundle; update never pulls a local library checkout or clones a host fallback.
+- `update [folderPath]`: use the current directory as the update folder, or `folderPath` (which must be inside the workspace) when supplied. A Ploinky checkout is updated only when it is inside that folder or contains the launch folder. Each checkout is fetched once and fast-forwarded only when it is clean, on its configured branch and upstream, and not diverged; otherwise it is preserved and reported with a named reason (for example `dirty-worktree`, `diverged`, `detached-head`, `upstream-mismatch`, `unverified-ignore-block-preserved`). Every phase (Ploinky, AgentLib, repositories, default skills, skills manifests) produces a record; the command exits nonzero when any record failed or when a required input (a repository, skills source or AgentLib that the configured graph uses) was not verified, and activation happens only when every required input verified. Update never prepares dependency caches. AchillesAgentLib is revalidated from the local checkout or the pinned Box bundle; update never pulls a local library checkout or clones a host fallback.
 - `start <staticAgent> 8080`: first core start requires a static agent; subsequent runs can just use `start`.
   - Ensures all enabled agents are running and launches the fixed inner Router on `8080`. On the host-facing public wrapper, `ploinky start <agent> <port>` treats that positional port only as the physical-host port selection (loopback unless `ploinky bind` saved another address) and still forwards inner `8080` to core.
   - Serves static files from the repository of `<staticAgent>`; non `/<agent>/...` paths are static.
@@ -670,7 +650,6 @@ Log completion offers one reference per enabled record and every offered referen
 - `shutdown`: stop and remove containers recorded in `.ploinky/agents.json`.
 - `destroy`: stop the router, remove workspace containers, and clear `.ploinky/deps` while preserving isolated agent data in `.data/<agent-or-alias>`.
 - `reinstall <agent>`: recreate one exact enabled agent registration and rebuild its dependency tree from empty npm state. Other aliases and shared seeds are untouched.
-- `deps`: retired. Dependency caches are managed automatically; the command prints that hint, exits nonzero, and does no cache or engine work.
 
 The `/status` TCP control surface requires a real router-authenticated
 local-admin session on an exact local-control Host. A
@@ -687,9 +666,7 @@ Node-based agents consume an immutable, content-verified dependency tree. The li
 - Runtimes mount the tree read-only. A runtime is reused only when its admitted tree equals the desired one; a changed package, provider, image, pin or rebuild token creates a replacement runtime instead of mutating a mounted tree, and the predecessor keeps its tree until it retires.
 - A corrupt tree is marked unusable for new consumers and rebuilt automatically; it is never repaired in place.
 - `ploinky reinstall <agent>` issues a new rebuild token for that registration and rebuilds from empty npm state.
-- Legacy `.ploinky/deps/global/` and `.ploinky/deps/agents/` caches are ignored for new preparations.
-- After a successful start or reinstall, Ploinky collects only trees it can prove unreferenced: every admitted, desired, candidate and build/reader-receipt root, and every mount of every workspace container (including stopped ones), is retained, and collection is skipped entirely when the engine or any registry record cannot be read. Age or disk pressure never removes a live or unknown tree. Recognized legacy caches are removed only when nothing mounts them.
-- Downgrading: stop every runtime, build and interactive session first; leave `.ploinky/deps/store/` in place (older releases rebuild their own legacy layout and never adopt it); never run an older `ploinky deps clean` while any runtime still mounts a `store` tree. Exact rollback of earlier dependency bytes needs the retained earlier tree or runtime; `destroy` is not a cache rollback.
+- After a successful start or reinstall, Ploinky collects only trees it can prove unreferenced: every admitted, desired, candidate and build/reader-receipt root, and every mount of every workspace container (including stopped ones), is retained, and collection is skipped entirely when the engine or any registry record cannot be read. Age or disk pressure never removes a live or unknown tree.
 - Container trees are installed in a short-lived container started from the target image ID; `bwrap` and `seatbelt` trees are installed on the host. Seatbelt refuses to switch a tree while another consumer of the same source is live.
 
 ## Notes

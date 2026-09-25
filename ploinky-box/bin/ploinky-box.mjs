@@ -244,10 +244,6 @@ async function runRoutedOuterCli(argv, parsed, route, launchDirectory, dispatch,
     handoffNow,
     onUpdateResult,
 } = {}) {
-    if (route.kind === 'retired') {
-        errorOutput.write(`${route.message}\n`);
-        return 1;
-    }
     const selectedSupervisor = supervisor || createBoxSupervisor({ env, launchCwd: launchDirectory });
     const engineEnv = buildEngineProcessEnvironment(env);
     outerDebug(parsed, route, output);
@@ -713,20 +709,22 @@ async function runHostUpdate({
     for (const warning of result?.warnings || []) output.write(`Warning: ${warning}.\n`);
     // Transactions that predate structured records report only the host side.
     const records = result?.records || hostRecords;
-    const final = buildUpdateResult({
-        command: argv,
-        records,
-        context: result?.reportContext || null,
-        agentLib: result?.agentLib
-            ? {
-                changed: Boolean(result.changed),
-                mode: result.agentLib.mode || null,
-                fingerprint: result.agentLib.contentFingerprint || result.agentLib.fingerprint || null,
-                previousFingerprint: result.previous?.contentFingerprint || result.previous?.fingerprint || null,
-            }
-            : null,
-        legacy: { activation: result?.activation ? { ...result.activation } : null },
-    });
+    const final = {
+        activation: result?.activation ? { ...result.activation } : null,
+        ...buildUpdateResult({
+            command: argv,
+            records,
+            context: result?.reportContext || null,
+            agentLib: result?.agentLib
+                ? {
+                    changed: Boolean(result.changed),
+                    mode: result.agentLib.mode || null,
+                    fingerprint: result.agentLib.contentFingerprint || result.agentLib.fingerprint || null,
+                    previousFingerprint: result.previous?.contentFingerprint || result.previous?.fingerprint || null,
+                }
+                : null,
+        }),
+    };
     const outcome = result?.activation?.outcome;
     summary.activation = result?.activation || null;
     output.write(`${formatUpdateStatusLine(final)}\n`);

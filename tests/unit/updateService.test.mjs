@@ -1,12 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFile, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
     INTERACTIVE_PLOINKY_UPDATE_MESSAGE,
     PLOINKY_BOX_MARKER_PATH,
+    checkGitUpstreamUpdate,
     updatePloinkySelf,
 } from '../../cli/commands/updateService.js';
 import { createOperationRecord } from '../../cli/commands/updateOutcome.js';
@@ -251,6 +254,107 @@ test('Ploinky box self-update skips the read-only source before running git oper
             `Skipping Ploinky self-update inside ploinky-box: ${root} is mounted read-only.`,
         ]);
     } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+const GIT_ENV = {
+    ...process.env,
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_AUTHOR_NAME: 'Unit Test',
+    GIT_AUTHOR_EMAIL: 'unit@example.invalid',
+    GIT_COMMITTER_NAME: 'Unit Test',
+    GIT_COMMITTER_EMAIL: 'unit@example.invalid',
+};
+
+function git(cwd, ...args) {
+    return String(execFileSync('git', ['-C', cwd, ...args], { env: GIT_ENV, stdio: ['ignore', 'pipe', 'pipe'] })).trim();
+}
+
+function commitFile(checkout, name, content) {
+    fs.writeFileSync(path.join(checkout, name), content);
+    git(checkout, 'add', name);
+    git(checkout, 'commit', '-q', '-m', name);
+    return git(checkout, 'rev-parse', 'HEAD');
+}
+
+test('interactive upstream check reads the remote without writing a ref', () => {
+    const root = tempDir('ploinky-upstream-check-');
+    try {
+        const remote = path.join(root, 'remote.git');
+        const checkout = path.join(root, 'checkout');
+        const other = path.join(root, 'other');
+        execFileSync('git', ['init', '-q', '--bare', '-b', 'main', remote], { env: GIT_ENV });
+        execFileSync('git', ['clone', '-q', remote, other], { env: GIT_ENV, stdio: 'ignore' });
+        git(other, 'checkout', '-q', '-b', 'main');
+        commitFile(other, 'a.txt', 'one\n');
+        git(other, 'push', '-q', 'origin', 'main');
+        execFileSync('git', ['clone', '-q', '-b', 'main', remote, checkout], { env: GIT_ENV, stdio: 'ignore' });
+
+        const current = checkGitUpstreamUpdate(checkout);
+        assert.equal(current.available, false);
+        assert.equal(current.head, current.upstream);
+        assert.equal(current.upstreamRef, 'origin/main');
+
+        const tracking = git(checkout, 'rev-parse', 'refs/remotes/origin/main');
+        const newer = commitFile(other, 'b.txt', 'two\n');
+        git(other, 'push', '-q', 'origin', 'main');
+        const ahead = checkGitUpstreamUpdate(checkout);
+        assert.equal(ahead.available, true, 'a missing upstream commit is a newer version');
+        assert.equal(ahead.upstream, newer);
+        assert.equal(git(checkout, 'rev-parse', 'refs/remotes/origin/main'), tracking, 'the remote-tracking ref was not written');
+        assert.throws(() => git(checkout, 'cat-file', '-e', newer), undefined, 'no object was fetched');
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('interactive upstream check is bounded when the remote transport hangs', async () => {
+    const root = tempDir('ploinky-upstream-hang-');
+    const pidFile = path.join(root, 'transport.pid');
+    try {
+        const checkout = path.join(root, 'checkout');
+        execFileSync('git', ['init', '-q', '-b', 'main', checkout], { env: GIT_ENV });
+        commitFile(checkout, 'a.txt', 'one\n');
+        git(checkout, 'remote', 'add', 'origin', 'ssh://ploinky-hang.invalid/repo.git');
+        git(checkout, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
+        git(checkout, 'branch', '--set-upstream-to=origin/main', 'main');
+        // The transport records its PID, detaches from Git's stderr and never answers.
+        const transport = path.join(root, 'hanging-ssh');
+        fs.writeFileSync(transport, `#!/bin/sh\necho $$ > "${pidFile}"\nexec 2>/dev/null\nexec sleep 60\n`);
+        fs.chmodSync(transport, 0o755);
+
+        const moduleUrl = pathToFileURL(path.join(path.dirname(fileURLToPath(import.meta.url)), '../../cli/commands/updateService.js')).href;
+        const started = Date.now();
+        const outcome = await new Promise(resolve => {
+            execFile(process.execPath, ['--input-type=module', '-e', `
+                const { checkGitUpstreamUpdate } = await import(${JSON.stringify(moduleUrl)});
+                try {
+                    checkGitUpstreamUpdate(${JSON.stringify(checkout)}, { timeoutMs: 1500 });
+                    process.stdout.write('RETURNED');
+                } catch (error) {
+                    process.stdout.write('THREW:' + error.message);
+                }
+            `], {
+                env: { ...GIT_ENV, GIT_SSH_COMMAND: transport, GIT_SSH_VARIANT: 'simple' },
+                encoding: 'utf8',
+                timeout: 20_000,
+                killSignal: 'SIGKILL',
+            }, (error, stdout) => resolve({ error, stdout: String(stdout || '') }));
+        });
+        const elapsed = Date.now() - started;
+
+        assert.equal(outcome.error, null, `the probe process finished on its own: ${outcome.error?.message}`);
+        assert.match(outcome.stdout, /^THREW:Ploinky upstream check failed: .*ls-remote.*: timed out/s);
+        assert.ok(elapsed < 15_000, `the hanging remote was bounded (${elapsed} ms)`);
+        assert.ok(fs.existsSync(pidFile), 'the probe reached the hanging transport');
+    } finally {
+        if (fs.existsSync(pidFile)) {
+            const pid = Number(fs.readFileSync(pidFile, 'utf8').trim());
+            if (Number.isInteger(pid) && pid > 0) {
+                try { process.kill(pid, 'SIGKILL'); } catch (_) {}
+            }
+        }
         fs.rmSync(root, { recursive: true, force: true });
     }
 });

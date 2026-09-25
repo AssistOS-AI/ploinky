@@ -7,8 +7,8 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 // Behavioral regressions for `ploinky update` Git safety. These scenarios use
-// only entry points that also exist at the baseline (registered `updateRepo`,
-// `updateWorkspacePloinkySource`, `updateAllRepos`) and assert the resulting
+// the registered-repository writer (`updateRegisteredRepository`),
+// `updateWorkspacePloinkySource` and `updateAllRepos`, and assert the resulting
 // repository state: HEAD, the index/worktree split, worktree bytes, stash
 // object IDs and operation metadata. Outcomes are captured with try/catch so a
 // thrown or returned result is judged by state, not by call shape.
@@ -177,7 +177,7 @@ test('a registered update never autostashes a dirty edit that conflicts with ups
         commitPush(seed, 'a.txt', 'upstream a\\n');
         writeFile(path.join(checkout, 'a.txt'), 'local a\\n');
         const before = snapshot(checkout);
-        const outcome = await capture(() => repos.updateRepo('UnitGitSafety', { stdio: 'ignore' }));
+        const outcome = await capture(() => repos.updateRegisteredRepository('UnitGitSafety', { stdio: 'ignore' }));
         done({ before, after: snapshot(checkout), outcome });
     `);
     assert.equal(result.after.head, result.before.head, 'HEAD did not move');
@@ -185,7 +185,7 @@ test('a registered update never autostashes a dirty edit that conflicts with ups
     assert.equal(result.after.unmerged, '', 'no conflict entries were created');
     assert.equal(result.after.stashes, result.before.stashes, 'no autostash was left behind');
     assert.deepEqual(result.after, result.before);
-    assert.ok(result.outcome.error, 'the preserved update is reported, not silently successful');
+    assert.equal(result.outcome.value?.outcome, 'skipped', 'the preserved update is reported, not silently successful');
 });
 
 test('a registered update keeps the staged/unstaged split instead of rewriting it', () => {
@@ -195,7 +195,7 @@ test('a registered update keeps the staged/unstaged split instead of rewriting i
         git(checkout, 'add', 'b.txt');
         writeFile(path.join(checkout, 'c.txt'), 'unstaged c\\n');
         const before = snapshot(checkout);
-        const outcome = await capture(() => repos.updateRepo('UnitGitSafety', { stdio: 'ignore' }));
+        const outcome = await capture(() => repos.updateRegisteredRepository('UnitGitSafety', { stdio: 'ignore' }));
         done({ before, after: snapshot(checkout), outcome });
     `);
     assert.notEqual(result.before.staged, '');
@@ -211,7 +211,7 @@ test('a registered update never rebases diverged local history', () => {
         git(checkout, 'add', 'c.txt');
         git(checkout, 'commit', '-q', '-m', 'local');
         const before = snapshot(checkout);
-        const outcome = await capture(() => repos.updateRepo('UnitGitSafety', { stdio: 'ignore' }));
+        const outcome = await capture(() => repos.updateRegisteredRepository('UnitGitSafety', { stdio: 'ignore' }));
         done({ before, after: snapshot(checkout), outcome });
     `);
     assert.equal(result.after.head, result.before.head, 'the local commit was not rewritten');
@@ -226,13 +226,13 @@ test('a registered update preserves a rebase whose autostash lives only in rebas
         writeFile(path.join(checkout, 'c.txt'), 'dirty c\\n');
         const pulled = gitRaw(checkout, 'pull', '--rebase', '--autostash');
         const before = snapshot(checkout);
-        const outcome = await capture(() => repos.updateRepo('UnitGitSafety', { stdio: 'ignore' }));
+        const outcome = await capture(() => repos.updateRegisteredRepository('UnitGitSafety', { stdio: 'ignore' }));
         done({ pulledStatus: pulled.status, before, after: snapshot(checkout), outcome });
     `);
     assert.notEqual(result.pulledStatus, 0);
     assert.ok(result.before.rebaseMerge && 'autostash' in result.before.rebaseMerge, 'fixture holds an autostash in rebase metadata');
     assert.deepEqual(result.after, result.before);
-    assert.ok(result.outcome.error);
+    assert.ok(!['changed', 'unchanged'].includes(result.outcome.value?.outcome), 'the preserved update is not verified');
 });
 
 test('a registered update keeps existing stash object IDs', () => {
@@ -241,13 +241,13 @@ test('a registered update keeps existing stash object IDs', () => {
         git(checkout, 'stash', 'push', '-q', '-m', 'user stash');
         const upstream = commitPush(seed, 'b.txt', 'upstream b\\n');
         const before = snapshot(checkout);
-        const outcome = await capture(() => repos.updateRepo('UnitGitSafety', { stdio: 'ignore' }));
+        const outcome = await capture(() => repos.updateRegisteredRepository('UnitGitSafety', { stdio: 'ignore' }));
         done({ upstream, before, after: snapshot(checkout), outcome });
     `);
     assert.notEqual(result.before.stashes, '');
     assert.equal(result.after.stashes, result.before.stashes);
     assert.equal(result.after.head, result.upstream, 'a clean checkout still advances');
-    assert.equal(result.outcome.error, undefined);
+    assert.equal(result.outcome.value?.outcome, 'changed');
 });
 
 test('a non-empty managed directory without .git is preserved, not deleted and recloned', () => {
@@ -258,7 +258,7 @@ test('a non-empty managed directory without .git is preserved, not deleted and r
         writeFile(path.join(REPOS_DIR, 'Provider', 'agent', 'manifest.json'), JSON.stringify({ repos: { UnitNonGit: remote } }));
         const target = path.join(REPOS_DIR, 'UnitNonGit');
         writeFile(path.join(target, 'notes.txt'), 'user data\n');
-        const outcome = await capture(() => repos.updateRepo('UnitNonGit', { stdio: 'ignore' }));
+        const outcome = await capture(() => repos.updateRegisteredRepository('UnitNonGit', { stdio: 'ignore' }));
         done({
             outcome,
             notes: fs.existsSync(path.join(target, 'notes.txt')) ? fs.readFileSync(path.join(target, 'notes.txt'), 'utf8') : null,
@@ -267,7 +267,7 @@ test('a non-empty managed directory without .git is preserved, not deleted and r
     `);
     assert.equal(result.notes, 'user data\n', 'user content survives');
     assert.equal(result.git, false, 'the directory was not replaced by a clone');
-    assert.ok(result.outcome.error);
+    assert.ok(!['changed', 'unchanged'].includes(result.outcome.value?.outcome), 'the preserved update is not verified');
 });
 
 test('a dirty workspace Ploinky checkout is preserved instead of autostashed', () => {

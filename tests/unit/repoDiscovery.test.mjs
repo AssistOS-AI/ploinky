@@ -20,7 +20,7 @@ const [{
     isGitRepository,
     resolveRepoSource,
     resolveRepoSourceUrl,
-    updateRepo,
+    updateRegisteredRepository,
 }, { REPOS_DIR }, { resolveUpdateProjectsRoot }] = await Promise.all([
     import('../../cli/utils/repos.js'),
     import('../../cli/utils/config.js'),
@@ -150,7 +150,7 @@ test('checkGitRemoteReachable reports missing or unreachable origin remotes with
     }
 });
 
-test('updateRepo preserves a non-empty non-git repo and clones into an empty one when a manifest source URL is known', () => {
+test('updateRegisteredRepository preserves a non-empty non-git repo and clones into an empty one when a manifest source URL is known', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-reclone-source-'));
     const repoName = `unit-non-git-${process.pid}-${Date.now()}`;
     const providerName = `unit-provider-${process.pid}-${Date.now()}`;
@@ -186,21 +186,18 @@ test('updateRepo preserves a non-empty non-git repo and clones into an empty one
         fs.writeFileSync(path.join(repoPath, 'stale.txt'), 'stale\n');
 
         assert.equal(resolveRepoSourceUrl(repoName), source);
-        assert.throws(() => updateRepo(repoName, { stdio: 'ignore' }), (error) => {
-            assert.equal(error.record.outcome, 'skipped');
-            assert.equal(error.record.code, 'non-git-directory-preserved');
-            return true;
-        });
+        const preserved = updateRegisteredRepository(repoName, { stdio: 'ignore' });
+        assert.equal(preserved.outcome, 'skipped');
+        assert.equal(preserved.code, 'non-git-directory-preserved');
         assert.equal(fs.readFileSync(path.join(repoPath, 'stale.txt'), 'utf8'), 'stale\n');
         assert.equal(isGitRepository(repoPath), false);
 
         fs.rmSync(path.join(repoPath, 'stale.txt'));
-        const result = updateRepo(repoName, { stdio: 'ignore' });
+        const record = updateRegisteredRepository(repoName, { stdio: 'ignore' });
 
-        assert.equal(result.recloned, true);
-        assert.equal(result.replaced, true);
-        assert.equal(result.record.code, 'recloned-empty-directory');
-        assert.equal(Object.prototype.hasOwnProperty.call(result, 'backupPath'), false);
+        assert.equal(record.outcome, 'changed');
+        assert.equal(record.details.recloned, true);
+        assert.equal(record.code, 'recloned-empty-directory');
         assert.equal(isGitRepository(repoPath), true);
         assert.equal(fs.existsSync(path.join(repoPath, 'README.md')), true);
     } finally {
@@ -216,7 +213,7 @@ test('updateRepo preserves a non-empty non-git repo and clones into an empty one
     }
 });
 
-test('updateRepo preserves recorded branch when repairing a non-git repo', () => {
+test('updateRegisteredRepository preserves recorded branch when repairing a non-git repo', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-reclone-branch-'));
     const repoName = `unit-branch-${process.pid}-${Date.now()}`;
     const repoPath = path.join(REPOS_DIR, repoName);
@@ -260,11 +257,10 @@ test('updateRepo preserves recorded branch when repairing a non-git repo', () =>
         fs.rmSync(repoPath, { recursive: true, force: true });
         mkdir(repoPath);
 
-        const result = updateRepo(repoName, { stdio: 'ignore' });
+        const record = updateRegisteredRepository(repoName, { stdio: 'ignore' });
 
-        assert.equal(result.recloned, true);
-        assert.equal(result.replaced, true);
-        assert.equal(Object.prototype.hasOwnProperty.call(result, 'backupPath'), false);
+        assert.equal(record.outcome, 'changed');
+        assert.equal(record.details.recloned, true);
         assert.equal(fs.existsSync(path.join(repoPath, 'BRANCH.txt')), true);
         assert.equal(String(execFileSync('git', ['-C', repoPath, 'branch', '--show-current'])).trim(), 'feature/test-branch');
     } finally {

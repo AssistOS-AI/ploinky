@@ -119,10 +119,9 @@ export function decideUpdateStatus(records = []) {
     };
 }
 
-export function buildUpdateResult({ command = [], records = [], context = null, agentLib = null, legacy = {} } = {}) {
+export function buildUpdateResult({ command = [], records = [], context = null, agentLib = null } = {}) {
     const decision = decideUpdateStatus(records);
     return {
-        ...legacy,
         schema: UPDATE_RESULT_SCHEMA,
         version: UPDATE_RESULT_VERSION,
         command: [...command].map(String),

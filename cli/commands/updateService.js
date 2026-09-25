@@ -1,6 +1,5 @@
 import fs from 'fs';
 import path from 'path';
-import { execFileSync, spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 
 import { resolvePloinkyUpdateEligibility } from './ploinkyUpdateScope.js';
@@ -11,6 +10,7 @@ import {
 } from '../utils/git/verifiedUpdate.js';
 import { acquireSourceLock, createDefaultSourceLockManager, ploinkySourceLockIdentity } from '../utils/git/sourceLock.js';
 import { assessGeneratedCheckoutState } from '../utils/git/generatedState.js';
+import { DEFAULT_NETWORK_TIMEOUT_MS, describeGitFailure, runGit } from '../utils/git/gitExec.js';
 
 export const PLOINKY_BOX_MARKER_PATH = '/etc/ploinky-box';
 export const INTERACTIVE_PLOINKY_UPDATE_MESSAGE = [
@@ -41,66 +41,58 @@ export function isGitRepo(repoPath) {
         || fs.existsSync(path.join(repoPath, '.git'));
 }
 
-function gitOutput(repoPath, args, { execFile = execFileSync } = {}) {
-    return String(execFile('git', ['-C', repoPath, ...args], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-    }) || '').trim();
-}
-
-export function getGitRef(repoPath, ref = 'HEAD', options = {}) {
-    return gitOutput(repoPath, ['rev-parse', ref], options);
-}
-
-function runGit(repoPath, args, { spawn = spawnSync, stdio = 'inherit' } = {}) {
-    const result = spawn('git', ['-C', repoPath, ...args], { stdio });
-    if (result.error) {
-        throw new Error(`git ${args.join(' ')} failed: ${result.error.message}`);
-    }
-    if (result.status !== 0) {
-        throw new Error(`git ${args.join(' ')} exited with code ${result.status}`);
-    }
-    return result;
-}
-
+/**
+ * Read-only upstream probe for an interactive session. It asks the branch's
+ * configured remote for the upstream commit with `ls-remote` through the
+ * bounded, noninteractive Git runner, so it never writes a ref and needs no
+ * lock. A remote that fails or does not answer in time throws.
+ */
 export function checkGitUpstreamUpdate(repoPath, {
-    execFile = execFileSync,
-    spawn = spawnSync,
+    exec = runGit,
+    env = process.env,
+    timeoutMs = DEFAULT_NETWORK_TIMEOUT_MS,
 } = {}) {
     if (!isGitRepo(repoPath)) {
         return { available: false, skipped: true, reason: 'not a git repository' };
     }
+    const value = (args) => {
+        const result = exec(repoPath, args, { env });
+        return result.ok ? result.stdout.trim() : '';
+    };
 
-    let upstreamRef;
-    try {
-        upstreamRef = gitOutput(repoPath, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], { execFile });
-    } catch (_) {
+    const branch = value(['symbolic-ref', '-q', '--short', 'HEAD']);
+    const remote = branch ? value(['config', '--get', `branch.${branch}.remote`]) : '';
+    const mergeRef = branch ? value(['config', '--get', `branch.${branch}.merge`]) : '';
+    const upstreamRef = value(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}']);
+    if (!remote || !mergeRef || !upstreamRef) {
         return { available: false, skipped: true, reason: 'no upstream branch' };
     }
 
-    runGit(repoPath, ['fetch', '--quiet'], { spawn, stdio: 'ignore' });
-
-    const head = getGitRef(repoPath, 'HEAD', { execFile });
-    const upstream = getGitRef(repoPath, '@{u}', { execFile });
+    const head = value(['rev-parse', 'HEAD']);
+    const sshConfigured = Boolean(value(['config', '--get', 'core.sshCommand']));
+    const probe = exec(repoPath, ['ls-remote', '--quiet', '--exit-code', remote, mergeRef], { env, timeoutMs, sshConfigured });
+    if (!probe.ok) {
+        throw new Error(`Ploinky upstream check failed: ${describeGitFailure(probe)}`);
+    }
+    const upstream = probe.stdout.trim().split(/\s+/)[0] || '';
     if (!head || !upstream || head === upstream) {
         return { available: false, head, upstream, upstreamRef };
     }
 
-    const contains = spawn('git', ['-C', repoPath, 'merge-base', '--is-ancestor', upstream, 'HEAD'], {
-        stdio: 'ignore',
-    });
-    if (contains.error) {
-        throw new Error(`git merge-base failed: ${contains.error.message}`);
-    }
-
+    // An upstream commit that is missing locally or not already contained in
+    // HEAD is a newer version.
+    const contains = exec(repoPath, ['merge-base', '--is-ancestor', upstream, 'HEAD'], { env });
     return {
-        available: contains.status !== 0,
+        available: !contains.ok,
         head,
         upstream,
         upstreamRef,
     };
 }
 
-function legacySelfUpdateResult(record, repoPath) {
+// The host writer (`ploinky-box/command/hostUpdate.mjs`) and its relaunch
+// handoff read `updated`, `skipped`, `before` and `after` next to the record.
+function selfUpdateResult(record, repoPath) {
     const before = record.before?.head || null;
     const after = record.after?.head || before;
     if (record.outcome === 'changed' || record.outcome === 'unchanged') {
@@ -238,5 +230,5 @@ export async function updatePloinkySelf({
     } finally {
         if (owned) lock.release();
     }
-    return legacySelfUpdateResult(record, source.canonicalRoot);
+    return selfUpdateResult(record, source.canonicalRoot);
 }

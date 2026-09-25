@@ -4,7 +4,6 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { showHelp } from './commands/help.js';
-import { retiredCommandMessage } from './retiredCommands.js';
 import { parseStatusOptions } from './statusOptions.js';
 import { bootstrapAgentLibRuntime } from '../agentlib/bootstrap.mjs';
 import { parseBranchPolicy, stripBranchPolicyArgs } from '../agentlib/branchPolicy.mjs';
@@ -162,12 +161,6 @@ export async function launchCli(args = process.argv.slice(2), {
         return 0;
     }
     const { commandArgs, debug } = extractGlobalDebugFlag(args);
-    // Retired commands answer before any AgentLib bootstrap or core import.
-    const retired = retiredCommandMessage(commandArgs[0]);
-    if (retired) {
-        errorOutput.write(`${retired}\n`);
-        return 1;
-    }
     if (commandArgs[0] === 'status') {
         const statusOptions = parseStatusOptions(commandArgs.slice(1), { debug });
         // Status reports the selected AgentLib source, so it needs the runtime

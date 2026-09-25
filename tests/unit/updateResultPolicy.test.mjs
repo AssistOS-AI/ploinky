@@ -229,7 +229,7 @@ test('a dirty required repository alone blocks activation and exits nonzero with
         done({
             code: run.code, thrown: run.thrown, result: {
                 status: run.result.status, exitCode: run.result.exitCode, activationAllowed: run.result.activationAllowed,
-                blockedBy: run.result.blockedBy, errors: run.result.errors, failed: run.result.failed.length,
+                blockedBy: run.result.blockedBy, errors: run.result.errors,
             },
             spawned: run.spawned, staged: run.staged, stderr: run.stderr,
             headKept: git(requiredPath, 'rev-parse', 'HEAD') === head,
@@ -242,7 +242,6 @@ test('a dirty required repository alone blocks activation and exits nonzero with
     assert.equal(result.result.activationAllowed, false);
     assert.equal(result.result.status, 'failed');
     assert.deepEqual(result.result.errors, [], 'no operation failed');
-    assert.equal(result.result.failed, 0);
     assert.deepEqual(result.result.blockedBy, [
         { phase: 'registered-repository', id: 'RequiredRepo', outcome: 'skipped', code: 'dirty-worktree' },
         { phase: 'git-pin', id: 'ploinky_required_demo', outcome: 'skipped', code: 'git-pin-source-not-verified' },
@@ -260,7 +259,7 @@ test('a required repository failure through CLI dispatch: nonzero exit, records 
         const { requiredPath } = await standardWorkspace();
         git(requiredPath, 'remote', 'set-url', 'origin', path.join(scratch, 'missing-remote'));
         const run = await launchUpdate(['update', workspaceRoot]);
-        done({ code: run.code, status: run.result.status, records: brief(run.result), spawned: run.spawned, stderr: run.stderr, failed: run.result.failed.map(entry => entry.repoName) });
+        done({ code: run.code, status: run.result.status, records: brief(run.result), spawned: run.spawned, stderr: run.stderr, failed: run.result.errors.map(entry => entry.id) });
     `);
     assert.equal(result.code, 1);
     assert.equal(result.status, 'failed');
@@ -269,6 +268,7 @@ test('a required repository failure through CLI dispatch: nonzero exit, records 
     assert.deepEqual(result.failed, ['RequiredRepo']);
     assert.deepEqual(result.spawned, []);
     assert.match(result.stderr, /Update completed with 1 error\(s\):/);
+    assert.match(result.stderr, /  ✗ RequiredRepo: /);
     assert.match(result.stderr, /Update failed: required inputs are not verified/);
     assert.match(result.stderr, /registered-repository RequiredRepo: failed \(fetch-failed, required\)/);
     assert.doesNotMatch(result.stderr + result.stdout, /Update complete:/);
@@ -471,15 +471,20 @@ test('phase records: thrown self-update, skipped self-update count, skipped work
         }]));
         const partial = await quiet(() => commands.updateAllRepos(workspaceRoot));
         const pick = (run, phase) => brief(run.value).filter(record => record[0] === phase);
+        const line = (run, prefix) => run.out.find(entry => entry.startsWith(prefix)) || null;
+        const counts = run => {
+            const match = /^Update summary: (\d+)\/(\d+) /.exec(line(run, 'Update summary:') || '');
+            return match ? { updated: Number(match[1]), total: Number(match[2]) } : null;
+        };
         done({
-            thrown: { self: pick(thrown, 'host-ploinky'), failed: thrown.value.failed.map(entry => entry.repoName), exitCode: thrown.value.exitCode,
-                total: thrown.value.total, updated: thrown.value.updated },
+            thrown: { self: pick(thrown, 'host-ploinky'), errors: thrown.value.errors.map(entry => entry.phase), exitCode: thrown.value.exitCode,
+                failure: thrown.out.find(entry => entry.includes('✗ ploinky: ')) || null, counts: counts(thrown) },
             dirtySelf: { self: pick(dirtySelf, 'host-ploinky'), exitCode: dirtySelf.value.exitCode, activationAllowed: dirtySelf.value.activationAllowed,
-                status: dirtySelf.value.status, skipped: dirtySelf.value.skipped.map(entry => [entry.repoName, entry.code]) },
-            skippedSelf: { self: pick(skippedSelf, 'host-ploinky'), total: skippedSelf.value.total, updated: skippedSelf.value.updated,
-                line: skippedSelf.out.find(line => line.startsWith('Update summary:')), exitCode: skippedSelf.value.exitCode, status: skippedSelf.value.status },
+                status: dirtySelf.value.status, skippedLine: line(dirtySelf, 'Update skipped:') },
+            skippedSelf: { self: pick(skippedSelf, 'host-ploinky'), counts: counts(skippedSelf),
+                line: line(skippedSelf, 'Update summary:'), exitCode: skippedSelf.value.exitCode, status: skippedSelf.value.status },
             skippedWorkspace: { records: pick(skippedWorkspace, 'workspace-repository'), exitCode: skippedWorkspace.value.exitCode, status: skippedWorkspace.value.status,
-                legacy: skippedWorkspace.value.skipped.map(entry => [entry.repoName, entry.code]) },
+                skippedLine: line(skippedWorkspace, 'Update skipped:') },
             interactive: { agentlib: pick(interactive, 'agentlib'), exitCode: interactive.value.exitCode, blockedBy: interactive.value.blockedBy },
             partial: { manifests: pick(partial, 'skills-manifest').map(record => [path.basename(record[1]), record[2], record[4]]),
                 status: partial.value.status, exitCode: partial.value.exitCode, activationAllowed: partial.value.activationAllowed },
@@ -492,21 +497,22 @@ test('phase records: thrown self-update, skipped self-update count, skipped work
     assert.equal(result.dirtySelf.exitCode, 0);
     assert.equal(result.dirtySelf.activationAllowed, true);
     assert.equal(result.dirtySelf.status, 'complete-with-skips');
-    assert.deepEqual(result.dirtySelf.skipped, [['ploinky', 'dirty-worktree']]);
-    assert.ok(result.thrown.failed.includes('ploinky'));
+    assert.equal(result.dirtySelf.skippedLine, 'Update skipped: ploinky (dirty-worktree)');
+    assert.ok(result.thrown.errors.includes('host-ploinky'));
+    assert.match(result.thrown.failure, /✗ ploinky: self-update exploded/);
     assert.equal(result.thrown.exitCode, 1);
-    assert.equal(result.thrown.total - result.thrown.updated, 1, 'a thrown self-update is a failed attempt');
+    assert.equal(result.thrown.counts.total - result.thrown.counts.updated, 1, 'a thrown self-update is a failed attempt');
 
     // The fixture's running Ploinky checkout is outside the workspace folder.
     assert.deepEqual(result.skippedSelf.self.map(record => [record[2], record[3], record[4]]), [['skipped', 'scope-excluded', false]]);
-    assert.equal(result.skippedSelf.updated, result.skippedSelf.total, 'a skipped self-update is not counted as failed');
+    assert.equal(result.skippedSelf.counts.updated, result.skippedSelf.counts.total, 'a skipped self-update is not counted as failed');
     assert.equal(result.skippedSelf.line,
-        `Update summary: ${result.skippedSelf.updated}/${result.skippedSelf.total} update operations succeeded (Ploinky self-update skipped).`);
+        `Update summary: ${result.skippedSelf.counts.updated}/${result.skippedSelf.counts.total} update operations succeeded (Ploinky self-update skipped).`);
     assert.equal(result.skippedSelf.exitCode, 0);
     assert.equal(result.skippedSelf.status, 'complete-with-skips');
 
     assert.deepEqual(result.skippedWorkspace.records.map(record => [record[2], record[3], record[4]]), [['skipped', 'remote-unreachable', false]]);
-    assert.deepEqual(result.skippedWorkspace.legacy, [['unreachable', 'remote-unreachable']]);
+    assert.equal(result.skippedWorkspace.skippedLine, 'Update skipped: unreachable (remote-unreachable)');
     assert.equal(result.skippedWorkspace.exitCode, 0, 'an optional named skip is not a failure');
     assert.equal(result.skippedWorkspace.status, 'complete-with-skips');
 

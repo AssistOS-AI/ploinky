@@ -556,18 +556,9 @@ function gitCommandErrorMessage(err) {
     return sanitizeGitDiagnostic(err?.message || String(err));
 }
 
-function legacyRepoResult(record) {
-    return {
-        pulled: record.outcome === 'changed' || record.outcome === 'unchanged',
-        recloned: record.details?.recloned === true,
-        replaced: record.details?.recloned === true,
-        record,
-    };
-}
-
 /**
  * Update one registered repository and return its operation record.
- * Never throws for a Git outcome; see `updateRepo` for the throwing form.
+ * Never throws for a Git outcome.
  *
  * Policy: without an explicit branch, the checkout must track the same branch
  * on origin. With an explicit branch, the checkout must already be on that
@@ -600,15 +591,14 @@ export function updateRegisteredRepository(name, {
 }
 
 /**
- * Throwing compatibility form used by `update repo` and skills manifests.
- * Returns `{ pulled, recloned, replaced, record }` for a verified outcome and
- * throws a GitUpdateError carrying `.record` for any skipped, failed or
- * uncertain outcome.
+ * Skills-manifest source refresh: returns the verified record and throws a
+ * GitUpdateError carrying `.record` for any skipped, failed or uncertain
+ * outcome.
  */
 export function updateRepo(name, { stdio = 'inherit', branch = null, assessGeneratedState = assessGeneratedCheckoutState, checkoutOptions = {} } = {}) {
     const record = updateRegisteredRepository(name, { branch, stdio, assessGeneratedState, checkoutOptions });
     throwUnlessVerified(record);
-    return legacyRepoResult(record);
+    return record;
 }
 
 export function isGitRepository(repoPath) {
@@ -719,12 +709,6 @@ export function updateWorkspaceRepository(repoPath, {
         probeRemote: true,
         assessGeneratedState,
     });
-}
-
-// Throwing compatibility form of `updateWorkspaceRepository`.
-export function pullGitRepo(repoPath, options = {}) {
-    throwUnlessVerified(updateWorkspaceRepository(repoPath, options));
-    return true;
 }
 
 // ---------------------------------------------------------------------------

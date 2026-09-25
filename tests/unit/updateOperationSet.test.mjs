@@ -200,7 +200,7 @@ test('a nested or relative folder limits generic pulls to that folder and return
             topBefore,
             nestedHead: git(nestedCheckout, 'rev-parse', 'HEAD'),
             nestedUpstream,
-            nestedCheckout,
+            nestedCheckout: fs.realpathSync(nestedCheckout),
             records: (value.records || []).map(record => ({ phase: record.phase, id: record.id, outcome: record.outcome, code: record.code })),
             mutations: mutations(),
         });
@@ -260,7 +260,7 @@ test('repositories-only and targeted updates return operation records for regist
         }
         const upstream = advance(seed);
         const repos = await quiet(() => commands.updatePloinkyRepos({ interactiveSession: true }));
-        const targeted = await quiet(() => commands.updateRepo('UnitRegistered'));
+        const targeted = await quiet(() => commands.updateRepoResult('UnitRegistered'));
         done({
             upstream,
             head: git(path.join(REPOS_DIR, 'UnitRegistered'), 'rev-parse', 'HEAD'),
@@ -303,7 +303,7 @@ for (const dirty of [false, true]) {
             const outcome = await quiet(() => commands.updateAllRepos(nested, {
                 interactiveSession: true, delegatedWorkspacePloinkyPath: checkout,
             }));
-            done({ outcome, checkout, before, target, after: git(checkout, 'rev-parse', 'HEAD'),
+            done({ outcome, checkout: fs.realpathSync(checkout), before, target, after: git(checkout, 'rev-parse', 'HEAD'),
                 local: fs.readFileSync(path.join(checkout, 'local.txt'), 'utf8'), mutations: mutations() });
         `);
         assert.equal(result.outcome.error, undefined);

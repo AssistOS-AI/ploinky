@@ -19,7 +19,15 @@ import { PLOINKY_UPDATED_WORKSPACE_CHECKOUT_ENV } from './ploinkyUpdateScope.js'
 import { sanitizeGitDiagnostic } from '../utils/gitCommand.js';
 import { createOperationRecord } from './updateOutcome.js';
 import { applyGraphRequirements, readUpdateGraph } from './updateGraph.js';
-import { buildCoreUpdateResult, defaultSkillsRecord, skillsManifestRecord } from './updateRecords.js';
+import {
+    buildCoreUpdateResult,
+    countUpdateOperations,
+    defaultSkillsRecord,
+    isErrorRecord,
+    isReportedSkip,
+    recordDisplayName,
+    skillsManifestRecord,
+} from './updateRecords.js';
 import { UpdateRequestError, resolveUpdateFolderScope } from './updateRequest.js';
 import { refreshUpdateGitPins } from '../utils/dependencies/store/updatePins.mjs';
 
@@ -260,8 +268,7 @@ function recordLabel(operation) {
 }
 
 /**
- * Execute one operation, classify its record into the legacy counters and
- * log it. Returns the record.
+ * Execute one operation, append its record and log it. Returns the record.
  */
 function executeGitOperation(operation, records, indent = '  ') {
     let record;
@@ -304,9 +311,10 @@ function executeGitOperation(operation, records, indent = '  ') {
     return record;
 }
 
-function logSkippedSummary(skipped) {
+function logSkippedSummary(records) {
+    const skipped = records.filter(isReportedSkip);
     if (!skipped.length) return;
-    console.log(`Update skipped: ${skipped.map(entry => `${entry.repoName} (${entry.code || 'skipped'})`).join(', ')}`);
+    console.log(`Update skipped: ${skipped.map(record => `${recordDisplayName(record)} (${record.code || 'skipped'})`).join(', ')}`);
 }
 
 // The running Ploinky checkout is reported but is not one of the graph's
@@ -455,13 +463,16 @@ function logDefaultSkillSummary(summary, indent = '') {
     }
 }
 
-function logUpdateFailures(failed) {
+function logUpdateFailures(records) {
+    const failed = records.filter(isErrorRecord);
     if (!failed.length) return;
     console.error(`Update completed with ${failed.length} error(s):`);
-    for (const entry of failed) {
-        const source = entry.defaultSkillsRepoName ? ` (source: ${entry.defaultSkillsRepoName})` : '';
-        console.error(sanitizeGitDiagnostic(`  ✗ ${entry.repoName}${source}: ${entry.message}`));
-        if (entry.manifestPath) console.error(`    Manifest: ${entry.manifestPath}`);
+    for (const record of failed) {
+        const sourceName = record.phase === 'default-skills' ? record.details?.source : null;
+        const manifestPath = record.phase === 'skills-manifest' ? record.details?.manifestPath : null;
+        const source = sourceName ? ` (source: ${sourceName})` : '';
+        console.error(sanitizeGitDiagnostic(`  ✗ ${recordDisplayName(record)}${source}: ${record.reason}`));
+        if (manifestPath) console.error(`    Manifest: ${manifestPath}`);
     }
 }
 
@@ -574,21 +585,21 @@ async function updateRepoResult(repoName, { command = ['update', 'repo', repoNam
     const records = [];
     let record;
     try {
-        const result = reposSvc.updateRepo(repoName);
-        record = result?.record;
-        if (result?.recloned) {
-            console.log(`✓ Repo '${repoName}' cloned into its empty managed directory.`);
-        } else if (record?.outcome === 'unchanged') {
-            console.log(`✓ Repo '${repoName}' is up to date.`);
-        } else {
-            console.log(`✓ Repo '${repoName}' updated.`);
-        }
+        record = reposSvc.updateRegisteredRepository(repoName);
     } catch (err) {
         record = err?.record || createOperationRecord({
             phase: 'registered-repository', id: String(repoName), outcome: 'failed',
             code: String(err?.code || 'update-error'), reason: err?.message || String(err),
         });
+    }
+    if (record.outcome !== 'changed' && record.outcome !== 'unchanged') {
         console.error(`✗ Repo '${repoName}': ${record.reason}`);
+    } else if (record.details?.recloned === true) {
+        console.log(`✓ Repo '${repoName}' cloned into its empty managed directory.`);
+    } else if (record.outcome === 'unchanged') {
+        console.log(`✓ Repo '${repoName}' is up to date.`);
+    } else {
+        console.log(`✓ Repo '${repoName}' updated.`);
     }
     records.push(record);
     records.push(...(await refreshUpdateGitPins({ repositoryNames: [repoName], sourceOutcomes: records })).records);
@@ -644,28 +655,6 @@ async function updateRepoResult(repoName, { command = ['update', 'repo', repoNam
     });
 }
 
-// Throwing form kept for existing callers: rejects with the records attached
-// when the update is not complete.
-async function updateRepo(repoName) {
-    const result = await updateRepoResult(repoName);
-    if (result.exitCode === 0) return result;
-    const repoRecord = result.record;
-    let message;
-    if (repoRecord && !['changed', 'unchanged'].includes(repoRecord.outcome)) {
-        message = repoRecord.reason;
-    } else if (result.defaultSkills?.failed?.length) {
-        message = `Failed to refresh default skills in ${result.defaultSkills.failed.map(entry => entry.repoName).join(', ')}`;
-    } else {
-        message = result.blockedBy.map(entry => `${entry.phase} ${entry.id} ${entry.outcome}`).join(', ') || result.status;
-    }
-    const error = new Error(`update repo failed: ${message}`);
-    error.code = 'PLOINKY_UPDATE_INCOMPLETE';
-    error.record = repoRecord;
-    error.records = result.records;
-    error.result = result;
-    throw error;
-}
-
 async function updatePloinkyRepos(options = {}) {
     const prior = readGraphSafely();
     const ploinkyRepos = getGitRepoNames();
@@ -702,9 +691,9 @@ async function updatePloinkyRepos(options = {}) {
     const repositoryRecords = result.records.filter(record => record.phase === 'registered-repository');
     const verified = repositoryRecords.filter(record => record.outcome === 'changed' || record.outcome === 'unchanged').length;
     console.log(`Ploinky repository update summary: ${verified}/${operations.length} repositories updated.`);
-    logSkippedSummary(result.skipped);
-    logUpdateFailures(result.failed);
-    return { ...result, total: operations.length, updated: verified };
+    logSkippedSummary(result.records);
+    logUpdateFailures(result.records);
+    return result;
 }
 
 async function updateAllRepos(folderPath, options = {}) {
@@ -872,9 +861,10 @@ async function updateAllRepos(folderPath, options = {}) {
     const selfUpdateNote = selfUpdateNotAttempted
         ? ` (Ploinky self-update ${selfUpdate.deferred ? 'deferred' : 'skipped'})`
         : '';
-    console.log(`Update summary: ${result.updated}/${result.total} update operations succeeded${selfUpdateNote}.`);
-    logSkippedSummary(result.skipped);
-    logUpdateFailures(result.failed);
+    const counts = countUpdateOperations(result.records);
+    console.log(`Update summary: ${counts.updated}/${counts.total} update operations succeeded${selfUpdateNote}.`);
+    logSkippedSummary(result.records);
+    logUpdateFailures(result.records);
     return result;
 }
 
@@ -918,7 +908,6 @@ export {
     enableRepo,
     disableRepo,
     uninstallRepo,
-    updateRepo,
     updateRepoResult,
     updatePloinkyRepos,
     updateAllRepos,

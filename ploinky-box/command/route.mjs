@@ -1,6 +1,5 @@
 import { PloinkyBoxError } from '../errors.mjs';
 import { stripBranchPolicyArgs } from '../../agentlib/branchPolicy.mjs';
-import { retiredCommandMessage } from '../../cli/retiredCommands.js';
 import { parseUpdateRequest, UpdateRequestError } from '../../cli/commands/updateRequest.js';
 
 function routeError(message) {
@@ -145,9 +144,6 @@ function routeRepair(parsed) {
 }
 
 export function routeOuterCommand(parsed, options = {}) {
-    // Retired commands answer on the host without preparing or creating a Box.
-    const retired = retiredCommandMessage(parsed.command);
-    if (retired) return Object.freeze({ kind: 'retired', command: parsed.command, message: retired });
     if (parsed.help || parsed.command === 'help') {
         return Object.freeze({ kind: 'help', topic: parsed.commandArgs });
     }

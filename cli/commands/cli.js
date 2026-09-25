@@ -75,7 +75,6 @@ import {
     shutdownSession,
 } from './sessionControl.js';
 import { handleSsoCommand } from './ssoCommands.js';
-import { retiredCommandError } from '../retiredCommands.js';
 import { disableHostSandbox, enableHostSandbox, handleSandboxCommand } from './sandboxCommands.js';
 import ClientCommands from './client.js';
 import {
@@ -242,7 +241,6 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
             break;
         case 'cli':
             return handleCliCommand(options);
-        // 'agent' command removed; use 'enable agent <agentName>' then 'start'
         case 'add':
             {
                 const parsed = parseInstallRepoArgs(options);
@@ -371,7 +369,6 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
             }
             break;
         }
-        // 'run' legacy commands removed; use 'start', 'cli', 'shell', 'console'.
         case 'start': {
             const startParsed = parseStartArgs(options);
             if (startParsed.profile) {
@@ -391,16 +388,12 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
             });
             break;
         }
-        // 'route' and 'probe' commands removed (replaced by start/status and client commands)
         case 'sso':
             await handleSsoCommand(options);
             break;
         case 'sandbox':
             handleSandboxCommand(options);
             break;
-        case 'deps':
-            // Retired: caches are managed by lifecycle commands. No cache or engine work.
-            throw retiredCommandError('deps');
         case 'list':
             if (options[0] === 'agents') listAgents();
             else if (options[0] === 'repos') listRepos();
@@ -789,10 +782,6 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
         }
         case 'settings': {
             await runSettingsMenu({ onEnvChange: resetLlmInvokerCache });
-            break;
-        }
-        case 'set': {
-            console.log("Command renamed to '/settings'.");
             break;
         }
         case 'profile': {

@@ -87,9 +87,7 @@ function runUpdateWithRuntimeStub(invocation) {
                 JSON.stringify({ name: 'demo', dependencies: { 'left-pad': '^1.3.0', 'is-odd': '^3.0.1' } }));
 
             const result = await (${invocation});
-            if (result && typeof result === 'object' && Array.isArray(result.failed)) {
-                assert.deepEqual(result.failed, [], 'update recorded no failure');
-            }
+            assert.deepEqual(result.errors, [], 'update recorded no failure');
             assert.equal(git(installed, 'rev-parse', 'HEAD'), advanced, 'the source update still happened');
             assert.equal(fs.existsSync(path.join(PLOINKY_DIR, 'deps')), false, 'update wrote no dependency cache');
             process.stdout.write('UPDATE_OK\\n');
@@ -112,7 +110,7 @@ function runUpdateWithRuntimeStub(invocation) {
 }
 
 for (const [label, invocation] of [
-    ['targeted update repo', "commands.updateRepo('UnitDepsRepo')"],
+    ['targeted update repo', "commands.updateRepoResult('UnitDepsRepo')"],
     ['repositories-only update', 'commands.updatePloinkyRepos({ interactiveSession: true })'],
     ['bulk folder update', 'commands.updateAllRepos(workspaceRoot, { interactiveSession: true })'],
 ]) {

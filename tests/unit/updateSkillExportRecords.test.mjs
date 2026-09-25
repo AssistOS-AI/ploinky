@@ -36,7 +36,7 @@ for (const [label, exported] of [
         assert.equal(result.exitCode, 1);
         assert.equal(result.activationAllowed, false);
         assert.equal(result.totals.uncertain, 2);
-        assert.equal(result.failed.length, 2);
+        assert.equal(result.errors.length, 2);
     });
 }
 
@@ -53,7 +53,7 @@ for (const [label, exported, outcome] of [
         const result = buildCoreUpdateResult({ command: ['update'], records });
         assert.equal(result.exitCode, 0);
         assert.equal(result.activationAllowed, true);
-        assert.deepEqual(result.failed, []);
+        assert.deepEqual(result.errors, []);
     });
 }
 
@@ -71,4 +71,13 @@ test('manifest records retain canonical source states from the actual sources fi
     assert.deepEqual(record.details.sources, ['workspace-only', 'prior-owner', 'missing', 'registered']);
     sources[0].path = '/changed-after-record';
     assert.equal(record.details.sourceStates[0].path, '/workspace/skills', 'the record retains its evidence snapshot');
+});
+
+test('a thrown export that leaves its journal pending is uncertain, any other throw is failed', () => {
+    const pending = Object.assign(new Error('Skill export recovery is required'), { code: 'SKILL_EXPORT_RECOVERY_REQUIRED' });
+    const broken = Object.assign(new Error('source missing'), { code: 'SKILL_SOURCE_MISSING' });
+    assert.equal(defaultSkillsRecord({ repoName: 'Target', defaultSkillsRepoName: 'Source', error: pending }).outcome, 'uncertain');
+    assert.equal(defaultSkillsRecord({ repoName: 'Target', defaultSkillsRepoName: 'Source', error: broken }).outcome, 'failed');
+    assert.equal(skillsManifestRecord({ folder: '/w/a', manifestPath: '/w/a/m.json', label: 'a', error: pending }).outcome, 'uncertain');
+    assert.equal(skillsManifestRecord({ folder: '/w/a', manifestPath: '/w/a/m.json', label: 'a', error: broken }).outcome, 'failed');
 });

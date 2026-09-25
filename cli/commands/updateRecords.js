@@ -3,10 +3,9 @@ import path from 'path';
 import { buildUpdateResult, createOperationRecord } from './updateOutcome.js';
 import { skillExportRecoveryProblem } from '../utils/skills/exportTransaction.mjs';
 
-// Record helpers shared by the core `ploinky update` entry points. The legacy
-// result fields (`total`, `updated`, `failed`, `skipped`) are derived from the
-// operation records so existing consumers keep working while totals, exit
-// status and activation come from one source.
+// Record helpers shared by the core `ploinky update` entry points. Totals,
+// exit status and activation come from the operation records alone; the
+// helpers below only name records for the printed summary.
 
 const VERIFIED = new Set(['changed', 'unchanged']);
 const ERRORS = new Set(['failed', 'uncertain']);
@@ -17,7 +16,11 @@ export function isVerified(record) {
     return VERIFIED.has(record?.outcome);
 }
 
-function legacyName(record) {
+export function isErrorRecord(record) {
+    return ERRORS.has(record?.outcome);
+}
+
+export function recordDisplayName(record) {
     switch (record.phase) {
         case 'host-ploinky': return 'ploinky';
         case 'agentlib': return 'achillesAgentLib';
@@ -29,38 +32,23 @@ function legacyName(record) {
     }
 }
 
-function legacyFailure(record) {
-    const entry = { repoName: legacyName(record), message: record.reason, code: record.code, record };
-    if (record.phase === 'default-skills' && record.details?.source) entry.defaultSkillsRepoName = record.details.source;
-    if (record.phase === 'skills-manifest' && record.details?.manifestPath) entry.manifestPath = record.details.manifestPath;
-    return entry;
-}
-
-function legacySkip(record) {
-    if (!['skipped', 'deferred'].includes(record.outcome)) return null;
-    if (record.phase === 'registered-repository' || record.phase === 'workspace-repository') {
-        return { repoName: legacyName(record), code: record.code, reason: record.reason, path: record.details?.checkout?.path, record };
-    }
-    if (record.phase === 'host-ploinky' && !NOT_APPLICABLE_SELF_CODES.has(record.code)) {
-        return { repoName: 'ploinky', code: record.code, reason: record.reason, record };
-    }
-    return null;
+// A preserved repository, or a self-update skipped for a reason the user can
+// act on, is listed in the summary; a not-applicable self-update is not.
+export function isReportedSkip(record) {
+    if (!['skipped', 'deferred'].includes(record.outcome)) return false;
+    if (record.phase === 'registered-repository' || record.phase === 'workspace-repository') return true;
+    return record.phase === 'host-ploinky' && !NOT_APPLICABLE_SELF_CODES.has(record.code);
 }
 
 /**
- * Legacy counters over the update operations (self-update, repositories and
- * skills manifests). Only attempted operations enter the denominator, so a
- * skipped or deferred self-update is neither a success nor a failure, while a
+ * Counters over the update operations (self-update, repositories and skills
+ * manifests). Only attempted operations enter the denominator, so a skipped
+ * or deferred self-update is neither a success nor a failure, while a
  * self-update that threw is a failed attempt.
  */
-export function legacyFromRecords(records) {
+export function countUpdateOperations(records) {
     const counted = records.filter(record => COUNTED_PHASES.has(record.phase) && record.attempted);
-    return {
-        total: counted.length,
-        updated: counted.filter(isVerified).length,
-        failed: records.filter(record => ERRORS.has(record.outcome)).map(legacyFailure),
-        skipped: records.map(legacySkip).filter(Boolean),
-    };
+    return { total: counted.length, updated: counted.filter(isVerified).length };
 }
 
 // A failure outside any phase (request rejection, lock, unexpected throw).
@@ -76,14 +64,10 @@ export function commandErrorRecord(error, { outcome = 'failed', attempted = fals
     });
 }
 
+// Command-specific fields (for example `deferredExclusionFolders`) never
+// override the record-derived fields.
 export function buildCoreUpdateResult({ command, records, agentLib = null, context = null, extra = {} }) {
-    return buildUpdateResult({
-        command,
-        records,
-        context,
-        agentLib,
-        legacy: { ...legacyFromRecords(records), ...extra },
-    });
+    return { ...extra, ...buildUpdateResult({ command, records, context, agentLib }) };
 }
 
 /**
@@ -94,13 +78,18 @@ export function appendUpdateRecords(result, additional) {
     const records = [...(result.records || []), ...additional];
     const { schema, version, records: _records, totals, status, exitCode, activationAllowed, blockedBy, errors,
         command, context, agentLib, ...rest } = result;
-    const rebuilt = buildUpdateResult({ command: command || [], records, context: context ?? null, agentLib: agentLib ?? null, legacy: rest });
-    return { ...rebuilt, ...legacyFromRecords(records) };
+    return { ...rest, ...buildUpdateResult({ command: command || [], records, context: context ?? null, agentLib: agentLib ?? null }) };
 }
 
 function exclusionSummary(outcome) {
     if (!outcome || typeof outcome !== 'object') return null;
     return { status: outcome.status || null, mode: outcome.mode || null, code: outcome.code || null };
+}
+
+// A thrown export whose journal stays pending has not failed: its outputs are
+// between two states until recovery completes, so the record is uncertain.
+function thrownExportOutcome(error) {
+    return error?.code === 'SKILL_EXPORT_RECOVERY_REQUIRED' ? 'uncertain' : 'failed';
 }
 
 export function defaultSkillsRecord(entry) {
@@ -111,7 +100,7 @@ export function defaultSkillsRecord(entry) {
     if (entry.error) {
         return createOperationRecord({
             ...base,
-            outcome: 'failed',
+            outcome: thrownExportOutcome(entry.error),
             code: String(entry.error?.code || 'default-skills-failed'),
             reason: String(entry.error?.message || entry.error),
             details: { target, source, targetPath: entry.repoPath || null },
@@ -177,7 +166,7 @@ export function skillsManifestRecord({ folder, manifestPath, label, result = nul
     if (error) {
         return createOperationRecord({
             ...base,
-            outcome: 'failed',
+            outcome: thrownExportOutcome(error),
             code: String(error?.code || 'skills-manifest-failed'),
             reason: String(error?.message || error),
             details: { folder, manifestPath, label },
