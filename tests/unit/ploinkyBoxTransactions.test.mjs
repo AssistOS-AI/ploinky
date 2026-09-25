@@ -15,6 +15,7 @@ import {
     BOX_USERNS,
 } from '../../ploinky-box/constants.mjs';
 import {
+    BOX_SOURCE_MISMATCH,
     normalizeContainerRuntime,
     validateContainerConfiguration,
 } from '../../ploinky-box/contract/container.mjs';
@@ -976,6 +977,109 @@ test('a stale seccomp fingerprint is rejected before stopped Box reuse or start'
     }), /label set is incompatible/);
     assert.equal(current.runtime.running, false);
     assert.equal(current.runtime.status, 'exited');
+});
+
+function otherCheckout(state) {
+    const root = path.join(state.root, 'other-checkout');
+    const profile = nestedPodmanSeccompProfilePath(root);
+    fs.mkdirSync(path.dirname(profile), { recursive: true });
+    fs.copyFileSync(
+        new URL('../../ploinky-box/seccomp/podman-nested-pid-fallback.json', import.meta.url),
+        profile,
+    );
+    return root;
+}
+
+test('a Box created by another Ploinky checkout is named before any other contract comparison', (t) => {
+    const state = fixture(t);
+    const creator = otherCheckout(state);
+    const handle = containerHandle({
+        identity: state.identity,
+        agentLib: state.agentLib,
+        repositoryRoot: creator,
+        imageId: 'd'.repeat(64),
+        imageRef: BOX_IMAGE_REFERENCE,
+        hostPort: 8080,
+        id: 'e'.repeat(64),
+    });
+    const desired = {
+        identity: state.identity,
+        agentLib: state.agentLib,
+        repositoryRoot: state.root,
+        imageId: 'd'.repeat(64),
+        imageRef: BOX_IMAGE_REFERENCE,
+        hostPort: 8080,
+    };
+    assert.throws(() => validateContainerConfiguration(handle, desired), (error) => {
+        assert.equal(error.code, BOX_SOURCE_MISMATCH);
+        assert.ok(error.message.includes(`runs Ploinky from ${creator},`), error.message);
+        assert.ok(error.message.includes(`this command runs Ploinky from ${state.root}.`), error.message);
+        assert.ok(error.message.includes(path.join(creator, 'bin', 'ploinky')), error.message);
+        assert.match(error.message, /'ploinky stop' and 'ploinky destroy' here/);
+        assert.doesNotMatch(error.message, /security options|mount set/);
+        return true;
+    });
+    // The creating checkout still admits its own Box unchanged.
+    assert.doesNotThrow(() => validateContainerConfiguration(handle, { ...desired, repositoryRoot: creator }));
+});
+
+test('the creating checkout still rejects a foreign seccomp profile path', (t) => {
+    const state = fixture(t);
+    const foreign = otherCheckout(state);
+    const handle = containerHandle({
+        identity: state.identity,
+        agentLib: state.agentLib,
+        repositoryRoot: state.root,
+        imageId: 'd'.repeat(64),
+        imageRef: BOX_IMAGE_REFERENCE,
+        hostPort: 8080,
+        id: 'e'.repeat(64),
+    });
+    handle.runtime.securityOptions = handle.runtime.securityOptions.map((option) => (
+        option.startsWith('seccomp=') ? `seccomp=${nestedPodmanSeccompProfilePath(foreign)}` : option
+    ));
+    assert.throws(() => validateContainerConfiguration(handle, {
+        identity: state.identity,
+        agentLib: state.agentLib,
+        repositoryRoot: state.root,
+        imageId: 'd'.repeat(64),
+        imageRef: BOX_IMAGE_REFERENCE,
+        hostPort: 8080,
+    }), (error) => {
+        assert.equal(error.code, 'PLOINKY_BOX_PUBLICATION_INCOMPATIBLE');
+        assert.match(error.message, /security options are incompatible; back up any Box-only data/);
+        return true;
+    });
+});
+
+test('reconciliation from another checkout mutates no container, image or data', async (t) => {
+    const state = fixture(t);
+    const creator = otherCheckout(state);
+    const current = containerHandle({
+        identity: state.identity,
+        agentLib: state.agentLib,
+        repositoryRoot: creator,
+        imageId: 'd'.repeat(64),
+        imageRef: BOX_IMAGE_REFERENCE,
+        hostPort: 8080,
+        id: 'e'.repeat(64),
+    });
+    const h = harness(state, { initial: current });
+    await assert.rejects(() => reconcileBoxContainer({
+        identity: state.identity,
+        agentLib: state.agentLib,
+        ownership: { state: 'owned', handles: { container: current } },
+        engine: { name: 'podman', identity: 'engine' },
+        runner: h.runner,
+        lock: state.lock,
+        repositoryRoot: state.root,
+    }, h.seams), (error) => error.code === BOX_SOURCE_MISMATCH);
+    assert.equal(current.runtime.running, true);
+    for (const verb of ['container stop', 'container rm', 'container create', 'container start']) {
+        assert.equal(h.calls.some((call) => call.join(' ').includes(verb)), false, verb);
+    }
+    assert.equal(h.calls.some((call) => call.includes('pull')), false);
+    assert.equal(h.calls.some((call) => call.join(' ').includes('stop-ploinky-local')), false);
 });
 
 test('stopped reuse baseline failure mutates no container or image state', async (t) => {

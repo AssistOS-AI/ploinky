@@ -1,3 +1,5 @@
+import path from 'node:path';
+
 import {
     BOX_AGENTLIB_LABELS,
     BOX_DATA_FINGERPRINT_LABELS,
@@ -42,6 +44,7 @@ import {
 const BOX_OWNERSHIP_LABEL_PREFIX = 'io.assistos.ploinky-box.';
 const INCOMPATIBLE_BOX_GUIDANCE = "; back up any Box-only data, then run 'ploinky stop'"
     + " and 'ploinky destroy' before retrying";
+export const BOX_SOURCE_MISMATCH = 'PLOINKY_BOX_SOURCE_MISMATCH';
 
 function envMap(entries) {
     if (!Array.isArray(entries)) {
@@ -182,6 +185,25 @@ function publicationError(message) {
     });
 }
 
+// A Box runs Ploinky from the checkout that created it: its seccomp profile
+// path, labels and read-only source mount all derive from that checkout. A
+// command from another checkout never adopts it; it names both checkouts
+// before any other comparison so the mismatch is not reported as an opaque
+// security-option or mount difference.
+function assertBoxPloinkySource(runtime, repositoryRoot) {
+    const sources = Array.isArray(runtime?.mounts)
+        ? runtime.mounts.filter((mount) => mount?.destination === '/opt/ploinky').map((mount) => mount.source)
+        : [];
+    if (sources.length !== 1 || sources[0] === repositoryRoot) return;
+    throw new PloinkyBoxError(
+        `This workspace's Box runs Ploinky from ${sources[0]}, but this command runs Ploinky from `
+        + `${repositoryRoot}. Use ${path.join(sources[0], 'bin', 'ploinky')} for this workspace, or replace `
+        + 'the Box from this checkout: back up any Box-only data, then run \'ploinky stop\' and '
+        + '\'ploinky destroy\' here before retrying',
+        { code: BOX_SOURCE_MISMATCH },
+    );
+}
+
 /**
  * Reconstruct the public Router binding an owned Box records.
  *
@@ -317,6 +339,7 @@ export function validateContainerConfiguration(containerHandle, {
 }) {
     assertRouterBindingStateConfined(identity);
     const workspaceRoot = assertBoxWorkspaceRoot(identity?.workspaceRoot);
+    assertBoxPloinkySource(containerHandle?.runtime, repositoryRoot);
     const publication = validateContainerPublications(containerHandle, hostPort, mediaHostPort, routerBinding);
     const runtime = containerHandle.runtime;
     assertBoxNetworkMode(runtime, networkMode);
@@ -325,7 +348,7 @@ export function validateContainerConfiguration(containerHandle, {
         throw publicationError('Owned Box image ID does not match the validated immutable image');
     }
     if (runtime.user !== 'podman' || runtime.privileged || runtime.init !== true) {
-        throw publicationError('Owned Box user, privilege, or init state is incompatible');
+        throw publicationError(`Owned Box user, privilege, or init state is incompatible${INCOMPATIBLE_BOX_GUIDANCE}`);
     }
     const recordedUserNamespaces = repeatedOptionValues(runtime.createCommand, '--userns');
     if (runtime.usernsMode !== 'private'
@@ -352,7 +375,7 @@ export function validateContainerConfiguration(containerHandle, {
     const fingerprintValues = BOX_DATA_KEYS.map((key) => String(selectedFingerprints?.[key] || ''));
     const hasFingerprints = fingerprintValues.some(Boolean);
     if (hasFingerprints && !fingerprintValues.every((value) => /^[a-f0-9]{64}$/.test(value))) {
-        throw publicationError('Owned Box directory fingerprint set is incompatible');
+        throw publicationError(`Owned Box directory fingerprint set is incompatible${INCOMPATIBLE_BOX_GUIDANCE}`);
     }
     if (hasFingerprints) {
         for (const key of BOX_DATA_KEYS) {
@@ -378,7 +401,7 @@ export function validateContainerConfiguration(containerHandle, {
         .sort());
     if (JSON.stringify(ownershipLabels)
         !== JSON.stringify(Object.fromEntries(Object.entries(expectedLabels).sort()))) {
-        throw publicationError('Owned Box label set is incompatible');
+        throw publicationError(`Owned Box label set is incompatible${INCOMPATIBLE_BOX_GUIDANCE}`);
     }
     const expectedEnvironment = {
         ...IMAGE_CONTRACT.environment,
@@ -401,7 +424,7 @@ export function validateContainerConfiguration(containerHandle, {
     if (runtimeHostname !== containerHandle.id.slice(0, 12)
         || JSON.stringify(Object.fromEntries(Object.entries(observedEnvironment).sort()))
         !== JSON.stringify(Object.fromEntries(Object.entries(expectedEnvironment).sort()))) {
-        throw publicationError('Owned Box environment allowlist is incompatible');
+        throw publicationError(`Owned Box environment allowlist is incompatible${INCOMPATIBLE_BOX_GUIDANCE}`);
     }
     if (runtime.workingDir !== workspaceRoot) {
         throw publicationError(
@@ -426,7 +449,7 @@ export function validateContainerConfiguration(containerHandle, {
         : null;
     if (!Array.isArray(runtime.securityOptions)
         || JSON.stringify(observedSecurityOptions) !== JSON.stringify(expectedSecurityOptions)) {
-        throw publicationError('Owned Box security options are incompatible');
+        throw publicationError(`Owned Box security options are incompatible${INCOMPATIBLE_BOX_GUIDANCE}`);
     }
     const expectedDevices = ['/dev/fuse', '/dev/net/tun'];
     const recordedDevices = repeatedOptionValues(runtime.createCommand, '--device');
@@ -485,7 +508,7 @@ export function validateContainerConfiguration(containerHandle, {
         ...expectedAgentLibMounts(agentLibContract, workspaceRoot),
     };
     if (!Array.isArray(runtime.mounts)) {
-        throw publicationError('Owned Box mount set is incompatible');
+        throw publicationError(`Owned Box mount set is incompatible${INCOMPATIBLE_BOX_GUIDANCE}`);
     }
     const transientMounts = runtime.mounts.filter((mount) => mount.destination === BOX_TMPFS.destination);
     if (transientMounts.length > 1
@@ -496,7 +519,7 @@ export function validateContainerConfiguration(containerHandle, {
             || transientMounts[0].rw !== true
         ))
         || runtime.mounts.length !== Object.keys(expectedMounts).length + transientMounts.length) {
-        throw publicationError('Owned Box mount set is incompatible');
+        throw publicationError(`Owned Box mount set is incompatible${INCOMPATIBLE_BOX_GUIDANCE}`);
     }
     for (const [destination, expected] of Object.entries(expectedMounts)) {
         const observed = runtime.mounts.find((mount) => mount.destination === destination);
