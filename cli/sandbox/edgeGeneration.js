@@ -1631,6 +1631,39 @@ export function inactivateEdgeRoutingGeneration(reason = 'candidate-change', opt
     }
 }
 
+/**
+ * `stop`'s inactivation. A killed start's graph preparation can be retired
+ * only while its exact inactive selector is still selected; when stop could
+ * not retire it itself (for example while a live Watchdog held the workspace
+ * lease), that selector is the next start's only proof. Routing is already
+ * fail-closed under it and every apply is denied while the lease exists, so
+ * it is kept instead of replaced. Any other selector is inactivated as usual.
+ */
+export function inactivateEdgeRoutingGenerationForStop(reason, options = {}) {
+    const paths = resolveEdgeGenerationPaths(options);
+    const { capability, release } = acquireApplyLockCapability(paths, options);
+    try {
+        let lease = null;
+        try { lease = readPreparationLease(paths); } catch (_) {}
+        if (lease && lease.pid !== process.pid
+            && lease.mode === 'replacement' && lease.reason === 'workspace-graph-enable-prelaunch'
+            && preparationOwnerStopped(lease.pid)) {
+            try {
+                assertPreparedSelectorStillSelected(paths, lease);
+                return deepFreeze({ preserved: true, pid: lease.pid, selector: readSelector(paths) });
+            } catch (_) {
+                // No longer the exact prepared selector: nothing to preserve.
+            }
+        }
+        return deepFreeze({
+            preserved: false,
+            selector: inactivateEdgeRoutingGeneration(reason, { ...options, applyLockCapability: capability }),
+        });
+    } finally {
+        release();
+    }
+}
+
 function sourceDigests(captured) {
     return {
         routing: sourceDigest(captured.bytes.routingBytes),

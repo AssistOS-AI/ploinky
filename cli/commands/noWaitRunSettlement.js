@@ -158,12 +158,7 @@ function workerCanProgress(worker, active) {
     }
 }
 
-/**
- * The detached no-wait workers of earlier starts that are still live and can
- * still change a runtime, route or registry record. Workers that already
- * published a terminal status, stopped, or can no longer progress are omitted.
- */
-export function inspectInFlightNoWaitWorkers({
+function classifyLiveNoWaitWorkers({
     runningDir = RUNNING_DIR,
     workspaceRoot,
     fsApi = fsDefault,
@@ -183,11 +178,40 @@ export function inspectInFlightNoWaitWorkers({
     try { active = loadActiveGeneration(); } catch (_) {}
     let preparationOwnerPid = 0;
     try { preparationOwnerPid = Number(readPreparationOwner()?.pid || 0); } catch (_) {}
-    return live
+    return live.map((worker) => Object.freeze({
+        containerName: worker.containerName,
+        runId: worker.runId,
+        pid: worker.pid,
+        reason: worker.reason,
+        identity: worker.marker,
         // A worker that owns the outstanding preparation keeps the selector
         // inactive only until its own readiness and commit finish.
-        .filter((worker) => (worker.pid && worker.pid === preparationOwnerPid) || workerCanProgress(worker, active))
+        canProgress: Boolean(worker.pid && worker.pid === preparationOwnerPid) || workerCanProgress(worker, active),
+    }));
+}
+
+/**
+ * The detached no-wait workers of earlier starts that are still live and can
+ * still change a runtime, route or registry record. Workers that already
+ * published a terminal status, stopped, or can no longer progress are omitted.
+ */
+export function inspectInFlightNoWaitWorkers(options = {}) {
+    return classifyLiveNoWaitWorkers(options)
+        .filter((worker) => worker.canProgress)
         .map(({ containerName, runId, pid, reason }) => Object.freeze({ containerName, runId, pid, reason }));
+}
+
+/**
+ * Live workers of earlier starts that cannot progress now, for example after a
+ * stop or a source change. They are not waited for, but they are not gone: if
+ * the next generation carried their staged identity again they would resume
+ * beside the next start's own launch. The next start supersedes them by
+ * rotating that identity; each entry carries the worker's exact identity.
+ */
+export function inspectStalledNoWaitWorkers(options = {}) {
+    return classifyLiveNoWaitWorkers(options)
+        .filter((worker) => !worker.canProgress)
+        .map(({ containerName, runId, pid, identity }) => Object.freeze({ containerName, runId, pid, identity }));
 }
 
 function describeWorkers(workers) {

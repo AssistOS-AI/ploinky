@@ -88,7 +88,7 @@ import {
 import { resolvePersistedRouterPort, resolveRouterEndpoint } from '../sandbox/routerPort.js';
 import { runOuterRuntimeShell } from '../sandbox/runtimeShell.js';
 import { createNetworkLifecycleAdapter, withNetworkLifecycleLock } from '../sandbox/networkLifecycle.js';
-import { inactivateEdgeRoutingGeneration } from '../sandbox/edgeGeneration.js';
+import { inactivateEdgeRoutingGeneration, inactivateEdgeRoutingGenerationForStop } from '../sandbox/edgeGeneration.js';
 
 // Restart acquires the workspace mutation lease before the per-runtime
 // maintenance lock (the same order as reinstall), so dependency preparation
@@ -742,7 +742,10 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
             // Stop is the documented recovery, so this retirement never
             // refuses it; it only runs before the selector rewrite below.
             retireAbandonedStartPreparationBeforeStop();
-            inactivateEdgeRoutingGeneration('cli-workspace-stop');
+            const stopSelection = inactivateEdgeRoutingGenerationForStop('cli-workspace-stop');
+            if (stopSelection.preserved) {
+                console.log(`[stop] Kept the inactive routing selector of stopped workspace start pid ${stopSelection.pid}; the next start retires its preparation.`);
+            }
             console.log('[stop] Stopping RoutingServer...');
             killRouterIfRunning();
             console.log('[stop] Stopping configured agent containers...');

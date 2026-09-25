@@ -385,6 +385,27 @@ export function withNetworkLifecycleLock(callback, options = {}) {
     return result;
 }
 
+/**
+ * withNetworkLifecycleLock for a lifecycle step that may follow a killed
+ * owner (an update rollback's stop or start). A lock whose owner no longer
+ * exists is reclaimable only after its stale-owner grace, so only then is the
+ * grace waited out; a live owner still fails fast. The callback runs once.
+ */
+export function withNetworkLifecycleLockReclaimingStoppedOwner(callback, options = {}) {
+    let entered = false;
+    const run = (capability) => {
+        entered = true;
+        return callback(capability);
+    };
+    try {
+        return withNetworkLifecycleLock(run, options);
+    } catch (error) {
+        if (entered || error?.code !== 'PLOINKY_NETWORK_LIFECYCLE_BUSY'
+            || !networkLifecycleLockOwnerStopped({ lockPath: options.lockPath })) throw error;
+        return withNetworkLifecycleLock(run, { ...options, waitMs: NETWORK_LOCK_STALE_GRACE_MS + 1_000 });
+    }
+}
+
 // CLI startup can wait behind another agent's asynchronous readiness work.
 // Yield between acquisition attempts so an owner in this process can finish;
 // synchronous lifecycle callers retain the existing fail-fast/wait contract.

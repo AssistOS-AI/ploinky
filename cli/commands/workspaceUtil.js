@@ -37,7 +37,7 @@ import {
   exactNoWaitImmutableIdentity,
 } from './noWaitWorkerArgs.js';
 import { retireNoWaitRunMarkers } from './noWaitMarkerLifecycle.js';
-import { acquireSettledWorkspaceMutationLease } from './noWaitRunSettlement.js';
+import { acquireSettledWorkspaceMutationLease, inspectStalledNoWaitWorkers } from './noWaitRunSettlement.js';
 import { prepareDefaultBootRepositories } from './ploinkyboot.js';
 import { prepareManifestRepositories, resolveWorkspaceGraphSsoConfig } from '../utils/runtime/bootstrapManifest.js';
 import { buildLifecycleHookEnv, executeHostHook, markPreinstallRunInProcess, resetPreinstallRunInProcess, isInlineCommand } from '../utils/runtime/lifecycleHooks.js';
@@ -106,7 +106,7 @@ import {
   withEdgeGenerationApplyLock,
 } from '../sandbox/edgeGeneration.js';
 import { applyEdgeRoutingGeneration } from '../sandbox/coordinatedEdgeApply.js';
-import { retireRuntimeCandidate } from '../sandbox/runtimeCandidateStore.js';
+import { readRuntimeCandidate, retireRuntimeCandidate } from '../sandbox/runtimeCandidateStore.js';
 import {
   finalizeStartupRoutes,
   partitionAdditionalStartupAgents,
@@ -118,11 +118,10 @@ import {
 } from '../server/utils/agentReadiness.js';
 import {
   createNetworkLifecycleAdapter,
-  NETWORK_LOCK_STALE_GRACE_MS,
   NETWORK_LOCK_WAIT_MS,
-  networkLifecycleLockOwnerStopped,
   withNetworkLifecycleLock,
   withNetworkLifecycleLockAsync,
+  withNetworkLifecycleLockReclaimingStoppedOwner,
 } from '../sandbox/networkLifecycle.js';
 import { networkContractHash } from '../sandbox/networkContract.js';
 import {
@@ -997,15 +996,30 @@ function removeGraphContainerForRecreate(containerName, label, predecessorRecord
   containerExistsImpl = dockerSvc.containerExists,
   getRuntimeImpl = dockerSvc.getRuntime,
   removeExactRegisteredContainerImpl = removeExactRegisteredContainer,
+  readRuntimeCandidateImpl = readRuntimeCandidate,
+  retireRuntimeCandidateImpl = retireRuntimeCandidate,
 } = {}) {
   if (!containerExistsImpl(containerName)) return { removed: false, state: 'absent' };
   try {
-    const result = removeExactRegisteredContainerImpl(containerName, predecessorRecord, {
-      runtime: getRuntimeImpl(),
-    });
+    // A staged predecessor whose launcher never published it (a no-wait
+    // worker that stopped or was superseded) has no registered container ID.
+    // Its launch receipt, or else the container's exact workspace, instance,
+    // generation and launch identity, proves ownership instead, exactly as for
+    // a reinstall whose launcher died before persisting the ID.
+    const unpublished = !/^[a-f0-9]{64}$/.test(String(predecessorRecord?.containerId || ''));
+    const receipt = unpublished ? readRuntimeCandidateImpl(containerName, predecessorRecord) : null;
+    const result = removeExactRegisteredContainerImpl(
+      containerName,
+      receipt ? { ...predecessorRecord, ...receipt.registryRecord } : predecessorRecord,
+      {
+        runtime: getRuntimeImpl(),
+        ...(unpublished && !receipt ? { recoverIncompleteIdentity: true } : {}),
+      },
+    );
     if (result?.removed !== true) {
       throw new Error(`exact predecessor removal returned '${result?.state || 'unknown'}'`);
     }
+    if (receipt) retireRuntimeCandidateImpl(receipt);
     clearLivenessStateImpl(containerName);
     return result;
   } catch (cause) {
@@ -1270,6 +1284,20 @@ export function assertWorkspaceGraphAdmissionsCurrent(admissions) {
   return admissions;
 }
 
+// Match on every immutable field, never on the container name alone: only the
+// exact staged tuple the worker was launched with can let it resume.
+function supersededNoWaitRunFor(runs, containerName, record) {
+  const alias = record?.alias === undefined || record?.alias === null ? '' : record.alias;
+  return (Array.isArray(runs) ? runs : []).find(({ identity } = {}) => (
+    identity?.containerName === containerName
+      && identity.instanceId === record?.instanceId
+      && identity.enableGeneration === record?.enableGeneration
+      && identity.repoName === record?.repoName
+      && identity.shortAgent === record?.agentName
+      && identity.alias === alias
+  )) || null;
+}
+
 function ensureGraphNodesEnabled(graph, reg, {
   prepareAgentEnableBatch = agentsSvc.prepareAgentEnableBatch,
   removeAgentContainerForRecreate = removeGraphContainerForRecreate,
@@ -1285,6 +1313,7 @@ function ensureGraphNodesEnabled(graph, reg, {
   runtimeReplacementOptions,
   executionRecordOptions,
   additionalNodes = [],
+  supersededNoWaitRuns = [],
 } = {}) {
   const nodes = [
     ...Array.from(graph?.nodes?.values?.() || []),
@@ -1316,9 +1345,16 @@ function ensureGraphNodesEnabled(graph, reg, {
     const executionChanged = executionRecordDiffers(existing.rec, expectedExecution);
     const profileChanged = Boolean(node.profile && existing.rec.profile !== node.profile);
     const preliminary = { node, existing, expectedExecution, executionChanged, profileChanged };
-    const runtimeReason = executionChanged || profileChanged
-      ? ''
-      : String(runtimeReplacementReason(preliminary, runtimeReplacementOptions) || '');
+    // A stalled worker of an earlier start still holds this exact staged
+    // identity and would resume under any generation that carries it again, so
+    // the identity always rotates and its unpublished runtime is removed.
+    const superseded = supersededNoWaitRunFor(supersededNoWaitRuns, existing.key, existing.rec);
+    let runtimeReason = '';
+    if (!executionChanged && !profileChanged) {
+      runtimeReason = superseded
+        ? 'noWaitRunSuperseded'
+        : String(runtimeReplacementReason(preliminary, runtimeReplacementOptions) || '');
+    }
     existingPlans.push({
       ...preliminary,
       runtimeReason,
@@ -2011,9 +2047,19 @@ async function startWorkspace(staticAgentArg, portArg, {
   let workspacePreparationLease = null;
   const workspaceRuntimeCandidates = [];
   try {
-  return await withNetworkLifecycleLock(async (networkLifecycleCapability) => {
+  // A rollback start can follow a killed start at once: wait out only that
+  // dead owner's stale network-lock grace, never a live owner.
+  return await withNetworkLifecycleLockReclaimingStoppedOwner(async (networkLifecycleCapability) => {
   try {
   assertWorkspaceGraphAdmissionsCurrent(admittedStart.admissions);
+  // Earlier no-wait workers still alive here cannot progress (a stop or a
+  // source change stalled them), and cannot while this start holds the
+  // workspace lease and network lock. Staging rotates their identities.
+  const supersededNoWaitRuns = inspectStalledNoWaitWorkers();
+  if (supersededNoWaitRuns.length) {
+    console.log(`[start] Superseding ${supersededNoWaitRuns.length} stalled no-wait worker(s) of an earlier start: ${supersededNoWaitRuns
+      .map(({ containerName, pid }) => `${containerName} (${pid ? `pid ${pid}` : 'pid not yet published'})`).join(', ')}`);
+  }
   const lockedStart = preflightWorkspaceStartRuntimeCapabilities(staticAgentArg);
   const workspaceConfigForAuth = workspaceSvc.getConfig() || {};
   const graphSsoConfig = resolveWorkspaceGraphSsoConfig(lockedStart.graph, workspaceConfigForAuth.sso);
@@ -2179,6 +2225,7 @@ async function startWorkspace(staticAgentArg, portArg, {
     let preparedGraph = ensureGraphNodesEnabled(dependencyGraph, reg, {
       deferredNodeIds: waitClassification.noWait,
       additionalNodes: extraRuntimeNodes,
+      supersededNoWaitRuns,
     });
     workspacePreparationLease = preparedGraph?.preparedGeneration?.preparationLease || null;
     if (preparedGraph?.preparedGeneration?.selector?.state !== 'inactive') {
@@ -2253,6 +2300,7 @@ async function startWorkspace(staticAgentArg, portArg, {
       {
         deferredNodeIds: waitClassification.noWait,
         additionalNodes: extraRuntimeNodes,
+        graphEnableOptions: { supersededNoWaitRuns },
       },
     );
     preparedGraph = postProviderPreparation.preparedGraph;
@@ -2677,7 +2725,7 @@ async function settleWorkspaceBeforeRestart() {
   const workspaceMutationLease = await acquireSettledWorkspaceMutationLease({ operation: 'workspace-restart' });
   let callbackError = null;
   try {
-    return withNetworkLifecycleLock((networkLifecycleCapability) => {
+    return withNetworkLifecycleLockReclaimingStoppedOwner((networkLifecycleCapability) => {
       const result = retireAbandonedWorkspaceStartPreparation({
         workspaceRoot: PLOINKY_WORKSPACE_ROOT,
         workspaceMutationLease,
@@ -2733,15 +2781,9 @@ function retireAbandonedStartPreparationBeforeStop({ log = (message) => console.
       workspaceMutationLease,
       networkLifecycleCapability,
     });
-    let result;
-    try {
-      result = withNetworkLifecycleLock(retire);
-    } catch (error) {
-      // A killed start leaves its network lock behind, reclaimable once the
-      // stale-owner grace has passed. Wait out that grace, never a live owner.
-      if (error?.code !== 'PLOINKY_NETWORK_LIFECYCLE_BUSY' || !networkLifecycleLockOwnerStopped()) throw error;
-      result = withNetworkLifecycleLock(retire, { waitMs: NETWORK_LOCK_STALE_GRACE_MS + 1_000 });
-    }
+    // A killed start leaves its network lock behind, reclaimable once the
+    // stale-owner grace has passed. Wait out that grace, never a live owner.
+    const result = withNetworkLifecycleLockReclaimingStoppedOwner(retire);
     if (result.retired) {
       log(`[stop] Retired the routing preparation of stopped workspace start pid ${result.pid}.`);
     }

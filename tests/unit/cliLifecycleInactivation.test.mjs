@@ -39,7 +39,7 @@ test('whole-workspace and Router lifecycle commands inactivate edge authorizatio
     ]);
     assertOrdered(cliSource, [
         'retireAbandonedStartPreparationBeforeStop();',
-        "inactivateEdgeRoutingGeneration('cli-workspace-stop')",
+        "inactivateEdgeRoutingGenerationForStop('cli-workspace-stop')",
         'killRouterIfRunning();',
         'const list = stopConfiguredAgents();',
     ]);
@@ -69,7 +69,7 @@ test('restarts settle earlier no-wait workers and a stopped start preparation be
     ]);
     assertOrdered(sliceBetween(workspaceSource, 'async function settleWorkspaceBeforeRestart(', '\n}\n'), [
         "await acquireSettledWorkspaceMutationLease({ operation: 'workspace-restart' })",
-        'withNetworkLifecycleLock(',
+        'withNetworkLifecycleLockReclaimingStoppedOwner(',
         'retireAbandonedWorkspaceStartPreparation({',
         'releaseWorkspaceMutationLease(workspaceMutationLease)',
     ]);
@@ -79,16 +79,14 @@ test('stop retires a stopped start preparation only before its own selector rewr
     const stopBlock = sliceBetween(cliSource, "case 'stop': {", "case 'destroy':");
     assertOrdered(stopBlock, [
         'retireAbandonedStartPreparationBeforeStop();',
-        "inactivateEdgeRoutingGeneration('cli-workspace-stop')",
+        "inactivateEdgeRoutingGenerationForStop('cli-workspace-stop')",
     ]);
     assert.doesNotMatch(stopBlock, /await retireAbandonedStartPreparationBeforeStop/,
         'the stop retirement is synchronous and has no outcome that can refuse the stop');
     const helper = sliceBetween(workspaceSource, 'function retireAbandonedStartPreparationBeforeStop(', '\n}\n');
     assertOrdered(helper, [
         "createWorkspaceMutationLease({ operation: 'workspace-stop' })",
-        'withNetworkLifecycleLock(retire)',
-        '!networkLifecycleLockOwnerStopped()',
-        'withNetworkLifecycleLock(retire, { waitMs: NETWORK_LOCK_STALE_GRACE_MS',
+        'withNetworkLifecycleLockReclaimingStoppedOwner(retire)',
     ]);
     assert.doesNotMatch(helper, /acquireWorkspaceMutationLease|withWorkspaceMutationLease/,
         'stop never waits for the workspace lease');

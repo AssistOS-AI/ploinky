@@ -24,7 +24,7 @@ const moduleUrl = (relative) => new URL(`../../cli/${relative}`, import.meta.url
 const edge = await import(moduleUrl('sandbox/edgeGeneration.js'));
 const locks = await import(moduleUrl('utils/runtime/maintenanceLocks.js'));
 const network = await import(moduleUrl('sandbox/networkLifecycle.js'));
-const { retireAbandonedStartPreparationBeforeStop } = await import(moduleUrl('commands/workspaceUtil.js'));
+const { retireAbandonedStartPreparationBeforeStop, settleWorkspaceBeforeRestart } = await import(moduleUrl('commands/workspaceUtil.js'));
 
 const CLI_ENTRY = path.resolve(import.meta.dirname, '../../cli/index.js');
 const START_REASON = 'workspace-graph-enable-prelaunch';
@@ -47,6 +47,8 @@ const edge = await import(edgeUrl);
 const locks = await import(locksUrl);
 const network = await import(networkUrl);
 if (holds.includes('lease')) await locks.acquireWorkspaceMutationLease({ operation: 'workspace-start', waitTimeoutMs: 0 });
+// The Watchdog's container monitor restart takes the workspace lease this way.
+if (holds.includes('watchdog')) locks.createWorkspaceMutationLease({ operation: 'watchdog-restart:ploinky_repo_demo' });
 if (holds.includes('network')) network.acquireNetworkLifecycleLock();
 if (holds.includes('prepare')) {
     edge.prepareEdgeRoutingGeneration({ workspaceRoot: process.env.PLOINKY_WORKSPACE_ROOT, reason: '${START_REASON}' });
@@ -275,4 +277,61 @@ test('`ploinky stop` completes when the preparation lease cannot even be read', 
     assert.equal(fs.readFileSync(paths.preparationLeaseFile, 'utf8'), 'not a preparation lease', 'stop never repairs what it cannot prove');
     assert.equal(readJson(paths.activeSelectorFile).reason, 'cli-workspace-stop');
     assert.equal(fs.existsSync(locks.WORKSPACE_START_LOCK_PATH), false);
+});
+
+test('a Watchdog restart holding the workspace lease during the rollback stop cannot make the rollback start refuse', async () => {
+    const owner = await killedStart();
+    const preparedSelector = fs.readFileSync(paths.activeSelectorFile);
+    // Simulates cli/server/containerMonitor.js performContainerRestart, which
+    // takes the workspace lease try-once as 'watchdog-restart:<container>'
+    // once a killed start's lease is reclaimable.
+    const watchdog = await startChild('watchdog');
+    assert.equal(readJson(locks.WORKSPACE_START_LOCK_PATH).operation, 'watchdog-restart:ploinky_repo_demo');
+    const stopped = runPloinkyStop();
+    const output = `${stopped.stdout}\n${stopped.stderr}`;
+    assert.equal(stopped.status, 0, output);
+    assert.match(output, new RegExp(`Left the routing preparation of pid ${owner.pid} \\(${START_REASON}\\) in place: workspace mutation 'watchdog-restart:ploinky_repo_demo' is already active`));
+    assert.match(output, new RegExp(`\\[stop\\] Kept the inactive routing selector of stopped workspace start pid ${owner.pid}`));
+    assert.match(output, /Stopped 0 configured agent containers\./);
+    assert.deepEqual(fs.readFileSync(paths.activeSelectorFile), preparedSelector, 'the proof the rollback start needs survives the stop');
+    assert.equal(readJson(paths.activeSelectorFile).state, 'inactive', 'routing stays fail-closed');
+    assertApplyDenied();
+
+    // The Watchdog releases (the stop killed it) and the rollback follows at
+    // once, while the killed start's network lock is still inside its
+    // stale-owner grace. settleWorkspaceBeforeRestart is the production
+    // sequence startWorkspace also runs: settled lease, reclaiming network
+    // lock, retirement.
+    await stopChild(watchdog);
+    const lockAgeMs = Date.now() - Date.parse(readJson(networkLockPath).createdAt);
+    assert.ok(lockAgeMs < network.NETWORK_LOCK_STALE_GRACE_MS, `the killed start's network lock is ${lockAgeMs}ms old`);
+    const result = await settleWorkspaceBeforeRestart();
+    assert.equal(result.retired, true);
+    assert.equal(result.pid, owner.pid);
+    edge.withEdgeGenerationApplyLock(() => {}, { workspaceRoot: workspace });
+});
+
+test('the reclaiming network lock waits out only a dead owner\'s grace and runs its callback once', async () => {
+    resetWorkspace();
+    let calls = 0;
+    const busy = Object.assign(new Error('the callback itself reported busy'), { code: 'PLOINKY_NETWORK_LIFECYCLE_BUSY' });
+    assert.throws(() => network.withNetworkLifecycleLockReclaimingStoppedOwner(() => { calls += 1; throw busy; }),
+        (error) => error === busy);
+    assert.equal(calls, 1, 'a failure inside the callback is never retried');
+
+    const dead = await startChild('network');
+    await stopChild(dead);
+    assert.throws(() => network.withNetworkLifecycleLock(() => {}), { code: 'PLOINKY_NETWORK_LIFECYCLE_BUSY' },
+        'a fail-fast acquisition refuses the dead owner inside its grace');
+    assert.equal(network.withNetworkLifecycleLockReclaimingStoppedOwner(() => { calls += 1; return 'ran'; }), 'ran');
+    assert.equal(calls, 2);
+    assert.equal(fs.existsSync(networkLockPath), false);
+
+    const live = await startChild('network');
+    const startedAt = Date.now();
+    assert.throws(() => network.withNetworkLifecycleLockReclaimingStoppedOwner(() => { calls += 1; }),
+        { code: 'PLOINKY_NETWORK_LIFECYCLE_BUSY' });
+    assert.ok(Date.now() - startedAt < 1_000, 'a live owner is never waited for');
+    assert.equal(calls, 2);
+    await stopChild(live);
 });
