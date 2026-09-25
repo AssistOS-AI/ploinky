@@ -358,10 +358,6 @@ export function buildRuntimeRouterOriginsResponse(plan) {
         || lease?.snapshot !== plan.snapshot || plan.snapshot?.generation !== generation) {
         throw runtimeOriginsError(503, 'RUNTIME_ORIGINS_LEASE_INVALID', 'runtime origins require one exact active lease');
     }
-    if (!Array.isArray(plan.snapshot.routerOrigins)) {
-        // Captured before public Router hosts were a generation source.
-        throw runtimeOriginsError(503, 'RUNTIME_ORIGINS_UNSUPPORTED_GENERATION', 'active generation carries no Router origins');
-    }
     let routerOrigins;
     try {
         routerOrigins = parseRouterOriginList(plan.snapshot.routerOrigins);

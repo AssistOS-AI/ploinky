@@ -26,15 +26,12 @@ function validateTopology(document) {
         throw new Error('edgeTopology: invalid publicationGeneration');
     }
     if (!TOPOLOGY_STATES.has(document.state)) throw new Error('edgeTopology: invalid state');
-    // Optional: absent on runtimes without Router-origin support. When present
-    // it advertises that capability, but the advisory list never authorizes by
-    // itself; a present malformed field is invalid rather than ignored.
-    if (Object.hasOwn(document, 'routerOrigins')) {
-        try {
-            parseRouterOriginList(document.routerOrigins);
-        } catch (_) {
-            throw new Error('edgeTopology: invalid routerOrigins');
-        }
+    // The advisory list never authorizes by itself; a missing or malformed
+    // list is invalid rather than ignored.
+    try {
+        parseRouterOriginList(document.routerOrigins);
+    } catch (_) {
+        throw new Error('edgeTopology: invalid routerOrigins');
     }
     return document;
 }

@@ -3177,12 +3177,10 @@ export function readCurrentEdgeTopology(options = {}) {
         || !/^sha256:[a-f0-9]{64}$/.test(String(document.authorizationGeneration || ''))) {
         throw edgeError('edge topology has an unsupported or invalid schema', 'EDGE_TOPOLOGY_INVALID');
     }
-    if (Object.hasOwn(document, 'routerOrigins')) {
-        try {
-            parseRouterOriginList(document.routerOrigins);
-        } catch (_) {
-            throw edgeError('edge topology Router origins are invalid', 'EDGE_TOPOLOGY_INVALID');
-        }
+    try {
+        parseRouterOriginList(document.routerOrigins);
+    } catch (_) {
+        throw edgeError('edge topology Router origins are invalid', 'EDGE_TOPOLOGY_INVALID');
     }
     return deepFreeze(document);
 }

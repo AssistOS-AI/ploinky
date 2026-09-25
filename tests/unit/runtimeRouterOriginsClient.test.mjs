@@ -150,7 +150,7 @@ test('redirects, unsupported statuses, and advertised-but-missing endpoints are 
 
 test('transitional and transport failures are temporary, with one retry only for an explicit race', async (t) => {
     createRouterOriginsWorkspace(t, { hosts: ['pgx'] });
-    for (const [status, code] of [[503, 'EDGE_GENERATION_INACTIVE'], [503, 'EDGE_GENERATION_RUNTIME_MISMATCH'], [503, 'RUNTIME_ORIGINS_UNSUPPORTED_GENERATION'], [500, 'internal_error']]) {
+    for (const [status, code] of [[503, 'EDGE_GENERATION_INACTIVE'], [503, 'EDGE_GENERATION_RUNTIME_MISMATCH'], [500, 'internal_error']]) {
         const listener = await fakeListener(t, (_req, res) => json(res, status, { ok: false, error: code }));
         await rejectsWith(fetchRuntimeRouterOrigins({ env: agentEnvironment(t, listener.url) }), RUNTIME_ROUTER_ORIGINS_UNAVAILABLE, { status });
         assert.equal(listener.requests.length, 1, code);

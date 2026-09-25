@@ -15,6 +15,7 @@ function topology(publicationGeneration) {
         authorizationGeneration: AUTHORIZATION,
         publicationGeneration,
         state: 'ready',
+        routerOrigins: [],
     };
 }
 

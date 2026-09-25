@@ -61,12 +61,7 @@ function sameScope(left, right) {
 }
 
 function journalManagedIngressHostnames(journal) {
-    if (Array.isArray(journal?.managedIngressHostnames)) {
-        return journal.managedIngressHostnames.map(String);
-    }
-    return Array.isArray(journal?.managedDnsRecords)
-        ? journal.managedDnsRecords.map((entry) => String(entry.hostname || '')).filter(Boolean)
-        : [];
+    return journal ? journal.managedIngressHostnames.map(String) : [];
 }
 
 function connectionId(connection) {
