@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
-import { assertWorkspaceMutationLease, withWorkspaceMutationLease } from '../../utils/runtime/maintenanceLocks.js';
+import { withWorkspaceMutationLease } from '../../utils/runtime/maintenanceLocks.js';
+import { uninstallRepositoryUnderLease } from '../../utils/repositoryUninstall.mjs';
 import { installRepositoryLinks, removeRepositoryLinks } from '../../utils/repositoryInstall.mjs';
 
 import { PLOINKY_DIR } from '../../utils/config.js';
@@ -227,40 +228,18 @@ export async function enableMarketplaceAgent(body, {
     return { ref, mode, result };
 }
 
-async function disableMarketplaceAgentsForRepo(repoName, dependencies = {}) {
-    const targetRepo = String(repoName || '').trim();
-    if (!targetRepo) return [];
-    const containerNames = Object.entries(workspaceSvc.loadAgents())
-        .filter(([, record]) => record && record.type === 'agent' && record.repoName === targetRepo && record.agentName)
-        .map(([containerName]) => containerName);
-    return agentsSvc.disableAgentContainers(containerNames, dependencies);
-}
-
-// A repository uninstall is one workspace mutation. Target resolution, agent
-// selection, their disable and the source removal all run under one lease, so
-// no enable, publication or repository change interleaves with them, and a
-// repository with no enabled agent is serialized too. The nested disable runs
-// under exactly this lease and fails closed if it is no longer live.
+// A repository uninstall is one workspace mutation under a lease this request
+// acquires itself; see uninstallRepositoryUnderLease for the ordering.
 export async function uninstallMarketplaceRepository(body, {
     workspaceLeaseWaitMs,
     agentDisableDependencies = {},
 } = {}) {
     const target = String(body?.target || body?.name || '').trim();
-    const leaseOptions = workspaceLeaseWaitMs === undefined
-        ? { operation: 'repositories-uninstall' }
-        : { operation: 'repositories-uninstall', waitTimeoutMs: workspaceLeaseWaitMs };
-    return withWorkspaceMutationLease(leaseOptions, async (lease) => {
-        const repoName = reposSvc.resolveInstalledRepoTarget(target);
-        assertWorkspaceMutationLease(lease);
-        const disabledAgents = await disableMarketplaceAgentsForRepo(repoName, {
-            ...agentDisableDependencies,
-            withWorkspaceLeaseImpl: (_options, fn) => fn(assertWorkspaceMutationLease(lease)),
-        });
-        assertWorkspaceMutationLease(lease);
-        return {
-            ...reposSvc.uninstallRepo(repoName, { stdio: 'pipe' }),
-            disabledAgents
-        };
+    return uninstallRepositoryUnderLease(target, {
+        withLease: withWorkspaceMutationLease,
+        workspaceLeaseWaitMs,
+        agentDisableDependencies,
+        stdio: 'pipe',
     });
 }
 

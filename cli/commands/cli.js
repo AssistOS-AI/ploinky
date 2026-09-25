@@ -245,13 +245,13 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
         case 'add':
             {
                 const parsed = parseInstallRepoArgs(options);
-                addRepo(parsed.url, parsed.name, parsed.branch);
+                await addRepo(parsed.url, parsed.name, parsed.branch);
             }
             break;
         case 'install':
             {
                 const parsed = parseInstallRepoArgs(options);
-                installRepo(parsed.url, parsed.name, parsed.branch);
+                await installRepo(parsed.url, parsed.name, parsed.branch);
             }
             break;
         case 'remove':
@@ -292,7 +292,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
         case 'enable':
             if (String(options[0] || '').toLowerCase() === 'repo' || String(options[0] || '').toLowerCase() === 'repository') {
                 const parsed = parseRepoToggleArgs(options);
-                enableRepo(parsed.repoName, parsed.branch);
+                await enableRepo(parsed.repoName, parsed.branch);
             }
             else if (options[0] === 'agent') {
                 const parsed = parseEnableAgentArgs(options.slice(1));
@@ -324,7 +324,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
 
             if (String(options[0] || '').toLowerCase() === 'repo' || String(options[0] || '').toLowerCase() === 'repository') {
                 const parsed = parseRepoToggleArgs(options);
-                disableRepo(parsed.repoName);
+                await disableRepo(parsed.repoName);
                 break;
             }
 

@@ -5,7 +5,6 @@ import { showHelp } from './help.js';
 import * as reposSvc from '../utils/repos.js';
 import * as agentsSvc from '../utils/agents.js';
 import * as skillsSvc from './skills.js';
-import * as workspaceSvc from '../utils/workspace.js';
 import {
     resolvePloinkyRoot,
     updatePloinkySelf,
@@ -32,6 +31,8 @@ import { UpdateRequestError, resolveUpdateFolderScope } from './updateRequest.js
 import { refreshUpdateGitPins } from '../utils/dependencies/store/updatePins.mjs';
 
 import { listAgentRepositoryNames, resolveAgentRepositoryPath } from '../utils/agentRepositorySource.mjs';
+import { withHeldOrAcquiredWorkspaceMutationLease } from '../utils/runtime/maintenanceLocks.js';
+import { uninstallRepositoryUnderLease } from '../utils/repositoryUninstall.mjs';
 const REPOS_DIR = path.join(PLOINKY_DIR, 'repos');
 const DEFAULT_SKILLS_REPO_NAMES = [
     'AchillesCopilotBasicSkills',
@@ -512,32 +513,45 @@ function getAgentNames() {
     return Array.from(suggestions).sort();
 }
 
-function installRepo(repoUrl, repoName = null, branch = null) {
+// Repository commands are workspace mutations like their Router counterparts:
+// each runs under the workspace mutation lease, reusing one its operation
+// already holds and otherwise acquiring it with the bounded wait, so none
+// interleaves with an enable, update, restart or another repository change.
+function withRepositoryLease(operation, { workspaceLeaseWaitMs } = {}, fn) {
+    const options = workspaceLeaseWaitMs === undefined ? { operation } : { operation, waitTimeoutMs: workspaceLeaseWaitMs };
+    return withHeldOrAcquiredWorkspaceMutationLease(options, fn);
+}
+
+async function installRepo(repoUrl, repoName = null, branch = null, leaseOptions = {}) {
     if (!repoUrl) { showHelp(); throw new Error('Missing repository URL or known repository name.'); }
-    const res = reposSvc.installRepo(repoUrl, repoName, branch);
+    const res = await withRepositoryLease('repositories-prepare', leaseOptions,
+        () => reposSvc.installRepo(repoUrl, repoName, branch));
     const name = res.name || repoName || reposSvc.deriveRepoNameFromUrl(repoUrl);
     if (res.status === 'exists') console.log(`✓ Repository '${name}' already installed.`);
     else {
         const branchNote = branch ? ` (branch: ${branch})` : '';
         console.log(`✓ Repository '${name}' installed successfully${branchNote}.`);
     }
+    return res;
 }
 
-function addRepo(repoUrl, repoName = null, branch = null) {
-    return installRepo(repoUrl, repoName, branch);
+function addRepo(repoUrl, repoName = null, branch = null, leaseOptions = {}) {
+    return installRepo(repoUrl, repoName, branch, leaseOptions);
 }
 
-function enableRepo(repoName, branch = null) {
+async function enableRepo(repoName, branch = null, leaseOptions = {}) {
     if (!repoName) throw new Error('Usage: enable repo <name> [--branch <branch>]');
-    const result = reposSvc.enableRepo(repoName, { branch });
+    const result = await withRepositoryLease('repositories-enable', leaseOptions,
+        () => reposSvc.enableRepo(repoName, { branch }));
     const branchNote = result.branch && result.branch !== 'default' ? ` (branch: ${result.branch})` : '';
     console.log(`✓ Repository '${result.name}' enabled${branchNote}.`);
     return result;
 }
 
-function disableRepo(repoName) {
+async function disableRepo(repoName, leaseOptions = {}) {
     if (!repoName) throw new Error('Usage: disable repo <name>');
-    const result = reposSvc.disableRepo(repoName);
+    const result = await withRepositoryLease('repositories-disable', leaseOptions,
+        () => reposSvc.disableRepo(repoName));
     if (result.status === 'disabled') {
         console.log(`✓ Repository '${result.name}' disabled.`);
     } else {
@@ -546,17 +560,15 @@ function disableRepo(repoName) {
     return result;
 }
 
-async function uninstallRepo(target) {
+async function uninstallRepo(target, { workspaceLeaseWaitMs, agentDisableDependencies } = {}) {
     if (!target) throw new Error('Usage: uninstall repo <name|url>');
-    const repoName = reposSvc.resolveInstalledRepoTarget(target);
-    const agents = workspaceSvc.loadAgents();
-    const containerNames = Object.entries(agents || {})
-        .filter(([, record]) => record && record.type === 'agent' && record.repoName === repoName && record.agentName)
-        .map(([containerName]) => containerName);
-    const disabledAgents = await agentsSvc.disableAgentContainers(containerNames);
-    const result = reposSvc.uninstallRepo(repoName);
-    console.log(`✓ Repository '${repoName}' uninstalled.`);
-    return { ...result, disabledAgents };
+    const result = await uninstallRepositoryUnderLease(target, {
+        withLease: withHeldOrAcquiredWorkspaceMutationLease,
+        workspaceLeaseWaitMs,
+        agentDisableDependencies,
+    });
+    console.log(`✓ Repository '${result.name}' uninstalled.`);
+    return result;
 }
 
 // Graph closure for the records of one command. The prior graph is read
