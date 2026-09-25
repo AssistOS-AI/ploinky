@@ -375,13 +375,18 @@ test('a host-requested report is published once with the echoed context and keep
         const { handleCommand } = await import(${JSON.stringify(moduleUrl('cli/commands/cli.js'))});
         const { readUpdateReport } = await import(${JSON.stringify(moduleUrl('cli/commands/updateOutcome.js'))});
         const out = [];
+        const errors = [];
         const write = process.stdout.write.bind(process.stdout);
         const log = console.log;
+        const logError = console.error;
         console.log = (...values) => out.push(values.map(String).join(' '));
+        console.error = (...values) => errors.push(values.map(String).join(' '));
         process.stdout.write = chunk => { out.push(String(chunk)); return true; };
         const result = await handleCommand(['update', workspaceRoot]);
         console.log = log;
+        console.error = logError;
         process.stdout.write = write;
+        const summaryHead = [...out, ...errors].map(entry => entry.split('\n')[0]).filter(entry => /^(Update (complete|partially failed|failed)|In-Box update phase)/.test(entry));
         const report = readUpdateReport(PLOINKY_DIR, process.env.PLOINKY_UPDATE_REPORT_NONCE, { expectedContext: ${JSON.stringify(context)} });
         const reports = fs.readdirSync(path.join(PLOINKY_DIR, 'running', 'update-reports'));
         const reportBytes = fs.readFileSync(path.join(PLOINKY_DIR, 'running', 'update-reports', reports[0]), 'utf8');
@@ -390,6 +395,7 @@ test('a host-requested report is published once with the echoed context and keep
             reportContext: report.result?.context, exitCode: result.exitCode, reports,
             userinfo: /[a-z][a-z0-9+.-]*:\/\/[^\s\/@"]+@/i.test(reportBytes), reportSize: reportBytes.length,
             leaked: out.some(line => line.includes(process.env.PLOINKY_UPDATE_REPORT_NONCE) || line.includes('ploinky-update-report')),
+            summaryHead,
         });
     `, { PLOINKY_UPDATE_REPORT_NONCE: nonce, PLOINKY_UPDATE_REPORT_CONTEXT: JSON.stringify(context) });
     assert.equal(result.ok, true);
@@ -398,6 +404,8 @@ test('a host-requested report is published once with the echoed context and keep
     assert.equal(result.reportActivation, false);
     assert.deepEqual(result.reportContext, context);
     assert.deepEqual(result.reports, [`${nonce}.json`]);
+    assert.deepEqual(result.summaryHead, ['In-Box update phase: required inputs are not verified. The host reports the update result.'],
+        'the host-driven phase names itself and leaves the update result to the host');
     assert.equal(result.leaked, false, 'the control report never goes to stdout');
     assert.equal(result.userinfo, false, 'the persisted report carries no URL credentials');
     assert.ok(result.reportSize < 512 * 1024, `report size ${result.reportSize} stays far below the 4 MB cap`);
@@ -604,5 +612,17 @@ test('a failed activation after verified inputs is recorded, restores the prior 
         assert.match(stderr.join(''), /achillesAgentLib activation: failed; final update status: failed \(exit 1\)/);
     } finally {
         fs.rmSync(workspace, { recursive: true, force: true });
+    }
+});
+
+test('the host-driven in-Box phase never prints an update result of its own', async () => {
+    const { formatUpdateSummary } = await import('../../cli/commands/updateSummary.js');
+    for (const status of ['complete', 'complete-with-skips', 'partial', 'failed']) {
+        const result = { status, totals: {}, records: [] };
+        const phase = formatUpdateSummary(result, { hostPhase: true }).split('\n')[0];
+        assert.match(phase, /^In-Box update phase: .*The host (activates it and )?reports the update result\.$/);
+        assert.doesNotMatch(phase, /Update (complete|failed|partially failed)/);
+        assert.match(formatUpdateSummary(result).split('\n')[0], /^Update (complete|partially failed|failed)/,
+            'a direct run still states its own result');
     }
 });

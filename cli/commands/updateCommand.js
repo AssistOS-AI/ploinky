@@ -116,6 +116,6 @@ export async function runUpdateCommand(normalizedOptions = [], {
             })]);
         }
     }
-    printUpdateSummary(result, { log, error: logError });
+    printUpdateSummary(result, { log, error: logError, hostPhase: Boolean(reportRequest) });
     return result;
 }
