@@ -148,7 +148,7 @@ async function stalledEarlierWorker(t) {
 test('the next start supersedes a stalled earlier worker: its runtime is removed by exact ID and it can never resume', async (t) => {
     const { w, worker, firstContainerId } = await stalledEarlierWorker(t);
     const callsBefore = w.engine.calls().length;
-    const next = w.drive('next-start');
+    const next = w.drive('next-start', { runtimeCurrent: true });
     assert.equal(next.staged, true, JSON.stringify(next));
     assert.deepEqual(next.superseded, [{ containerName: CONTAINER, pid: worker.child.pid }]);
     assert.deepEqual(next.changedContainers, [CONTAINER]);
@@ -170,6 +170,20 @@ test('the next start supersedes a stalled earlier worker: its runtime is removed
     const workerCalls = w.engine.calls().slice(released).filter(([command]) => DESTRUCTIVE.has(command));
     assert.deepEqual(workerCalls, [], `the superseded worker issued no runtime mutation: ${JSON.stringify(workerCalls)}`);
     assert.deepEqual(containers(w), { [next.launchedContainerId]: 'running' }, 'the next start\'s runtime survives');
+});
+
+test('without a stalled earlier worker the same next start keeps the staged identity', async (t) => {
+    const w = workspace(t);
+    w.drive('setup');
+    w.drive('worker-ensure');
+    changeOtherManifest(w);
+    assert.deepEqual(w.drive('inspect'), { inFlight: [], stalled: [] }, 'no earlier worker is alive');
+    const next = w.drive('next-start', { runtimeCurrent: true });
+    assert.equal(next.staged, true, JSON.stringify(next));
+    assert.deepEqual(next.superseded, []);
+    assert.deepEqual(next.changedContainers, [], 'nothing forces a replacement');
+    assert.equal(next.record.instanceId, 'demo-instance', 'so only supersession rotates the identity');
+    assert.equal(next.record.enableGeneration, 'demo-generation');
 });
 
 test('an unpublished predecessor is removed only on its exact launch identity, with or without its receipt', async (t) => {

@@ -42,17 +42,29 @@ async function run() {
         // The generation an earlier start committed: both agents staged
         // target-less, no runtime published yet.
         const edge = await cli('sandbox/edgeGeneration.js');
+        const { DEFAULT_ENABLE_AGENT_MODE } = await cli('utils/agents.js');
+        const { getAgentDataDir } = await cli('utils/workspaceStructure.js');
         edge.initializeFreshEdgeRoutingSources({ workspaceRoot: root });
         const agents = {};
         const routes = {};
         for (const name of ['demo', 'other']) {
             const container = `ploinky_repo_${name}`;
+            // The exact execution record a start stages, so nothing but a
+            // superseded worker can make the next start rotate this identity.
             agents[container] = {
-                type: 'agent', repoName: 'repo', agentName: name, runMode: 'isolated', profile: 'default',
+                type: 'agent', repoName: 'repo', agentName: name,
+                runMode: DEFAULT_ENABLE_AGENT_MODE, projectPath: getAgentDataDir(name), profile: 'default',
                 instanceId: `${name}-instance`, enableGeneration: `${name}-generation`, auth: { mode: 'sso' },
             };
             routes[name] = { container, hostPath: agentPath(name), repo: 'repo', agent: name };
         }
+        // The static demo node runs in the workspace root; take the exact
+        // retained execution record from the production resolver.
+        const { resolveRetainedGraphNodeExecutionRecord } = await cli('commands/workspaceUtil.js');
+        const { resolveWorkspaceDependencyGraph } = await cli('utils/workspaceDependencyGraph.js');
+        const graph = resolveWorkspaceDependencyGraph({ staticAgentRef: 'repo/demo', registry: agents });
+        const demoNode = [...graph.nodes.values()].find((node) => node.shortAgentName === 'demo');
+        agents[CONTAINER].projectPath = resolveRetainedGraphNodeExecutionRecord(demoNode, agents[CONTAINER]).projectPath;
         fs.writeFileSync(agentsFile, JSON.stringify(agents, null, 2));
         fs.writeFileSync(routingFile, JSON.stringify({ port: 8080, routes }, null, 2));
         return { selector: edge.applyEdgeRoutingGeneration({ reason: 'earlier-start-committed' }).selector.state };
@@ -91,7 +103,13 @@ async function run() {
             const graph = resolveWorkspaceDependencyGraph({ staticAgentRef: 'repo/demo', registry });
             let staged;
             try {
-                staged = ensureGraphNodesEnabled(graph, registry, { supersededNoWaitRuns: superseded });
+                staged = ensureGraphNodesEnabled(graph, registry, {
+                    supersededNoWaitRuns: superseded,
+                    // Stands in for the production runtime check finding the
+                    // runtime current (running, same env hash), which the fake
+                    // engine does not model: then only supersession rotates.
+                    ...(argument.runtimeCurrent ? { runtimeReplacementReason: () => '' } : {}),
+                });
             } catch (error) {
                 return { staged: false, message: error.message, cause: error.cause?.message || null };
             }
