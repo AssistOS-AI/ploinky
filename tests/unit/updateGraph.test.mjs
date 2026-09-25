@@ -197,7 +197,7 @@ test('prior and proposed launch manifests outside agent repos are required but u
             record('workspace-repository', priorSource, { outcome: 'failed', details: { checkout: { path: priorSource } } }),
         ], { prior: graph, proposed: graph });
         assert.deepEqual(records.map(value => value.required), [true, true, false, true]);
-        assert.ok(graph.skillSourcePaths.has(priorSource), 'prior source closure does not depend on a current export record');
+        assert.ok(graph.skillSourcePaths.has(fs.realpathSync(priorSource)), 'prior source closure does not depend on a current export record');
     } finally { fs.rmSync(fx.root, { recursive: true, force: true }); }
 });
 
@@ -232,6 +232,6 @@ test('concurrent update commands keep their host skill-scope contexts separate',
             const graph = readUpdateGraph({ workspaceRoot: fx.workspace, readRegistry: () => ({}), repositoryPath: fx.repositoryPath });
             return [...graph.skillScopePaths];
         })));
-        assert.deepEqual(results, [[fx.workspace], [nested]]);
+        assert.deepEqual(results, [[fs.realpathSync(fx.workspace)], [fs.realpathSync(nested)]]);
     } finally { fs.rmSync(fx.root, { recursive: true, force: true }); }
 });

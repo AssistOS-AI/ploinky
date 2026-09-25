@@ -99,11 +99,17 @@ function addSkillScopes(graph, workspaceRoot, registry, context, resolveSkillSou
     }
 }
 
+// A missing leaf keeps the canonical spelling of its nearest existing
+// ancestor, so a required path below a symlinked workspace still matches the
+// canonical paths recorded for that workspace.
 function canonical(target) {
-    try {
-        return fs.realpathSync(target);
-    } catch (_) {
-        return path.resolve(target);
+    const resolved = path.resolve(target);
+    for (let existing = resolved; ; existing = path.dirname(existing)) {
+        try {
+            return path.join(fs.realpathSync(existing), path.relative(existing, resolved));
+        } catch (_) {
+            if (path.dirname(existing) === existing) return resolved;
+        }
     }
 }
 
