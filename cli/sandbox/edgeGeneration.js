@@ -1895,6 +1895,17 @@ function removePreparationLease(paths, expected) {
     fsyncDirectory(paths.edgeDir);
 }
 
+// ESRCH is the only proof that a preparation owner stopped. EPERM or success
+// leaves the owner live, including when an unrelated process reused its PID.
+function preparationOwnerStopped(pid) {
+    try {
+        process.kill(pid, 0);
+        return false;
+    } catch (error) {
+        return error?.code === 'ESRCH';
+    }
+}
+
 /** Retire a failed inactive preparation while a serialized reinstall owns the workspace. */
 export function retireAbandonedAgentPreparation(containerName, options = {}) {
     const paths = resolveEdgeGenerationPaths(options);
@@ -1912,12 +1923,8 @@ export function retireAbandonedAgentPreparation(containerName, options = {}) {
             throw edgeError('reinstall cannot retire an additive routing preparation', 'EDGE_PREPARATION_BUSY');
         }
         assertPreparedSelectorStillSelected(paths, lease);
-        if (lease.pid !== process.pid) {
-            let dead = false;
-            try { process.kill(lease.pid, 0); } catch (error) { dead = error?.code === 'ESRCH'; }
-            if (!dead) {
-                throw edgeError(`routing preparation is still owned by pid ${lease.pid}`, 'EDGE_PREPARATION_BUSY');
-            }
+        if (lease.pid !== process.pid && !preparationOwnerStopped(lease.pid)) {
+            throw edgeError(`routing preparation is still owned by pid ${lease.pid}`, 'EDGE_PREPARATION_BUSY');
         }
         const prepared = loadCapturedGeneration(paths, lease.preparedGeneration).generation;
         if (lifecycleBindingDigest(prepared) !== lease.lifecycleBindingDigest) {
@@ -1945,6 +1952,75 @@ export function retireAbandonedAgentPreparation(containerName, options = {}) {
         assertPreparedSelectorStillSelected(paths, lease);
         removePreparationLease(paths, lease);
         return { retired: true, transactionId: lease.transactionId };
+    } finally {
+        release();
+    }
+}
+
+/**
+ * Retire the graph preparation of a workspace start whose process stopped
+ * before committing or aborting it. Start and restart call this before their
+ * first selector rewrite: only the exact inactive selector captured in the
+ * lease still binds it. Anything that cannot be proven abandoned is refused
+ * with the host recovery, which retires the lease while the Box is stopped.
+ */
+export function retireAbandonedWorkspaceStartPreparation(options = {}) {
+    const paths = resolveEdgeGenerationPaths(options);
+    assertWorkspaceMutationLease(options.workspaceMutationLease, {
+        runningDir: path.join(paths.root, '.ploinky', 'running'),
+    });
+    assertNetworkLifecycleCapability(options.networkLifecycleCapability, {
+        lockPath: path.join(paths.root, '.ploinky', 'run', 'network.lock'),
+    });
+    const { release } = acquireApplyLockCapability(paths, options);
+    try {
+        const lease = readPreparationLease(paths);
+        if (!lease) return { retired: false };
+        const owner = `edge lifecycle preparation ${JSON.stringify(lease.reason)} (pid ${lease.pid})`;
+        const hostRecovery = 'stop the exact Box from its host workspace with `ploinky stop`, '
+            + 'then run `ploinky start`, which retires the preparation while the Box is stopped';
+        const refuse = (why) => edgeError(
+            `${owner} cannot be retired automatically: ${why}; ${hostRecovery}`,
+            'EDGE_PREPARATION_BUSY',
+        );
+        if (lease.pid === process.pid) throw refuse('it is owned by this process');
+        if (!preparationOwnerStopped(lease.pid)) {
+            throw edgeError(
+                `${owner} is still owned by a running process; wait for that operation to finish, or ${hostRecovery}`,
+                'EDGE_PREPARATION_BUSY',
+            );
+        }
+        if (lease.mode !== 'replacement' || lease.reason !== 'workspace-graph-enable-prelaunch') {
+            throw refuse('it belongs to another lifecycle operation');
+        }
+        try {
+            assertPreparedSelectorStillSelected(paths, lease);
+        } catch (_) {
+            throw refuse('its exact inactive selector was replaced');
+        }
+        let prepared;
+        try {
+            prepared = loadCapturedGeneration(paths, lease.preparedGeneration).generation;
+        } catch (_) {
+            throw refuse('its captured generation cannot be loaded');
+        }
+        if (lifecycleBindingDigest(prepared) !== lease.lifecycleBindingDigest) {
+            throw refuse('its captured generation no longer matches its lifecycle binding');
+        }
+        let agents;
+        try {
+            agents = JSON.parse(fs.readFileSync(paths.agentsFile, 'utf8'));
+        } catch (_) {
+            throw refuse('the agent registry cannot be read');
+        }
+        if (stableStringify(lifecycleAgentProjection(agents))
+            !== stableStringify(lifecycleAgentProjection(prepared.agents))) {
+            throw refuse('enabled agent identities changed after it was captured');
+        }
+        assertPreparationLeaseForApply(paths, lease);
+        assertPreparedSelectorStillSelected(paths, lease);
+        removePreparationLease(paths, lease);
+        return { retired: true, transactionId: lease.transactionId, pid: lease.pid };
     } finally {
         release();
     }

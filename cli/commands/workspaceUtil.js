@@ -94,6 +94,7 @@ import {
   prepareHostModeCapabilityForInactiveGeneration,
   readEdgeRoutingSelection,
   retireAbandonedAgentPreparation,
+  retireAbandonedWorkspaceStartPreparation,
   withEdgeGenerationApplyLock,
 } from '../sandbox/edgeGeneration.js';
 import { applyEdgeRoutingGeneration } from '../sandbox/coordinatedEdgeApply.js';
@@ -2006,6 +2007,16 @@ async function startWorkspace(staticAgentArg, portArg, {
   const workspaceConfigForAuth = workspaceSvc.getConfig() || {};
   const graphSsoConfig = resolveWorkspaceGraphSsoConfig(lockedStart.graph, workspaceConfigForAuth.sso);
   initializeFreshEdgeRoutingSources({ workspaceRoot: PLOINKY_WORKSPACE_ROOT });
+  // The inactivation below replaces the selector that binds a stopped start's
+  // graph preparation, so retire or refuse that lease first.
+  const abandonedPreparation = retireAbandonedWorkspaceStartPreparation({
+    workspaceRoot: PLOINKY_WORKSPACE_ROOT,
+    workspaceMutationLease: workspaceStartLock,
+    networkLifecycleCapability,
+  });
+  if (abandonedPreparation.retired) {
+    console.log(`[start] Retired the routing preparation of stopped workspace start pid ${abandonedPreparation.pid}.`);
+  }
   inactivateEdgeRoutingGeneration('workspace-start-prepare', { workspaceRoot: PLOINKY_WORKSPACE_ROOT });
   if (graphSsoConfig) {
     workspaceSvc.setConfig({ ...workspaceConfigForAuth, sso: graphSsoConfig });
@@ -2642,6 +2653,27 @@ async function startWorkspace(staticAgentArg, portArg, {
   } finally {
     releaseWorkspaceStartLock(workspaceStartLock);
   }
+}
+
+/**
+ * Restarts replace the selector and stop the Router and agents before
+ * startWorkspace runs. Settle a stopped start's graph preparation first, so an
+ * unretirable lease is refused while the running graph is still untouched.
+ */
+async function retireAbandonedStartPreparationBeforeRestart() {
+  return withWorkspaceMutationLease({ operation: 'workspace-restart' }, (workspaceMutationLease) => (
+    withNetworkLifecycleLock((networkLifecycleCapability) => {
+      const result = retireAbandonedWorkspaceStartPreparation({
+        workspaceRoot: PLOINKY_WORKSPACE_ROOT,
+        workspaceMutationLease,
+        networkLifecycleCapability,
+      });
+      if (result.retired) {
+        console.log(`[restart] Retired the routing preparation of stopped workspace start pid ${result.pid}.`);
+      }
+      return result;
+    })
+  ));
 }
 
 export function admitDirectAgentRuntimeManifest(manifest, {
@@ -3323,6 +3355,7 @@ export {
   resolveAndPersistStartRouterPort,
   resolveGraphNodeExecutionRecord,
   resolveRetainedGraphNodeExecutionRecord,
+  retireAbandonedStartPreparationBeforeRestart,
   waitForRouterReady,
   waitForManifestReadiness,
   waitForReadinessEntries,

@@ -91,7 +91,8 @@ function startFixture(t) {
         assertWorkspaceGraphAdmissionsCurrent: () => {},
         resolveWorkspaceGraphSsoConfig: () => null,
         initializeFreshEdgeRoutingSources: () => {},
-        inactivateEdgeRoutingGeneration: () => {},
+        retireAbandonedWorkspaceStartPreparation: (options) => { calls.push(['retirePreparation', options]); return { retired: false }; },
+        inactivateEdgeRoutingGeneration: (reason) => calls.push(['inactivate', reason]),
         resolveAndPersistStartRouterPort: async () => 8080,
         parseRouterPort: (value) => Number(value),
         readRoutingConfig: () => structuredClone(routing),
@@ -101,7 +102,10 @@ function startFixture(t) {
         resolveStaticRouterContainerName: () => CONTAINER,
         deduplicateAgentRegistry: (value) => ({ ...value }),
         classifyDependencyGraphWaitMode: () => ({ noWait: new Set() }),
-        ensureGraphNodesEnabled: () => ({ preparedGeneration: { preparationLease: earlyLease, selector: { state: 'inactive' } } }),
+        ensureGraphNodesEnabled: () => {
+            calls.push(['ensureGraphNodesEnabled']);
+            return { preparedGeneration: { preparationLease: earlyLease, selector: { state: 'inactive' } } };
+        },
         applyStartupConfigProvidersForGraph: async () => ({ providers: [], applied: [], warnings: [] }),
         reprepareGraphAfterStartupProviders: (dependencyGraph, reg, prepared) => {
             calls.push(['reprepare', prepared.preparedGeneration.preparationLease === earlyLease]);
@@ -136,8 +140,41 @@ function startFixture(t) {
         reportDependencyCollection: (value) => value,
         abortEdgeRoutingPreparation: (lease, options) => calls.push(['abortPreparation', lease, options]),
     };
-    return { collaborators, calls, earlyLease, postProviderLease, networkCapability, preparedRecord, ensureResult, registry: () => registry };
+    return { collaborators, calls, earlyLease, postProviderLease, workspaceLease, networkCapability, preparedRecord, ensureResult, registry: () => registry };
 }
+
+test('workspace start settles an abandoned graph preparation under its leases before replacing the selector', async (t) => {
+    const fixture = startFixture(t);
+    await sandbox(fixture.collaborators)('repo/demo', '8080', {});
+    const retireIndex = fixture.calls.findIndex(([name]) => name === 'retirePreparation');
+    const inactivateIndex = fixture.calls.findIndex(([name, reason]) => name === 'inactivate' && reason === 'workspace-start-prepare');
+    assert.ok(retireIndex >= 0, 'start inspects an outstanding preparation');
+    assert.ok(inactivateIndex > retireIndex, 'the selector that binds a stopped start preparation is replaced only afterwards');
+    const [, options] = fixture.calls[retireIndex];
+    assert.equal(options.workspaceMutationLease, fixture.workspaceLease, 'the exact held workspace start lease authorizes retirement');
+    assert.equal(options.networkLifecycleCapability, fixture.networkCapability);
+});
+
+test('a refused abandoned preparation stops workspace start before any selector, routing or graph mutation', async (t) => {
+    const fixture = startFixture(t);
+    const refusal = new Error('edge lifecycle preparation "workspace-graph-enable-prelaunch" (pid 686420) cannot be retired automatically: '
+        + 'its exact inactive selector was replaced; stop the exact Box from its host workspace with `ploinky stop`, then run `ploinky start`, '
+        + 'which retires the preparation while the Box is stopped');
+    refusal.code = 'EDGE_PREPARATION_BUSY';
+    fixture.collaborators.retireAbandonedWorkspaceStartPreparation = (options) => {
+        fixture.calls.push(['retirePreparation', options]);
+        throw refusal;
+    };
+    await assert.rejects(sandbox(fixture.collaborators)('repo/demo', '8080', {}), {
+        message: /^start \(workspace\) failed: edge lifecycle preparation .*`ploinky stop`, then run `ploinky start`/,
+    });
+    const names = fixture.calls.map(([name]) => name);
+    assert.ok(names.includes('retirePreparation'));
+    for (const forbidden of ['inactivate', 'ensureGraphNodesEnabled', 'ensureAgentService', 'mergeRoutingConfig', 'abortPreparation']) {
+        assert.equal(names.includes(forbidden), false, `${forbidden} must not run after the refusal`);
+    }
+    assert.deepEqual(fixture.calls.filter(([name]) => name === 'releaseLease'), [['releaseLease', true]]);
+});
 
 test('workspace start launches each graph runtime with its prepared registry record and the post-provider preparation lease', async (t) => {
     const fixture = startFixture(t);

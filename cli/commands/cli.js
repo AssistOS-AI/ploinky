@@ -14,6 +14,7 @@ import { runLogCommand } from './logCommands.js';
 import { activeForegroundSignal } from './foregroundCommand.js';
 import {
     startWorkspace,
+    retireAbandonedStartPreparationBeforeRestart,
     runCli,
     runShell,
     reinstallAgent,
@@ -435,6 +436,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                 if (!cfg || !cfg.static || !cfg.static.agent || !cfg.static.port) {
                     throw new Error('restart router: start is not configured. Run: start <staticAgent> <port> first.');
                 }
+                await retireAbandonedStartPreparationBeforeRestart();
                 inactivateEdgeRoutingGeneration('cli-router-restart');
                 console.log('[restart] Restarting RoutingServer (containers untouched)...');
                 resolvePersistedRouterPort();
@@ -701,6 +703,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                     throw new Error('restart: start is not configured. Run: start <staticAgent> <port>');
                 }
                 resolvePersistedRouterPort();
+                await retireAbandonedStartPreparationBeforeRestart();
                 inactivateEdgeRoutingGeneration('cli-workspace-restart');
                 console.log('[restart] Stopping Router and configured agents...');
                 killRouterIfRunning();
