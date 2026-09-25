@@ -13,6 +13,7 @@ import {
     inspectMaintenanceLock,
     inspectWorkspaceStartLock,
     releaseWorkspaceMutationLease,
+    runWithWorkspaceMutationLease,
 } from '../utils/runtime/maintenanceLocks.js';
 import {
     cleanupExactAgentRuntimeCandidate,
@@ -1690,7 +1691,9 @@ export async function performContainerRestart(monitor, target, reason, attempt =
 
     const runNetworkLifecycle = monitor.withNetworkLifecycleLock || withNetworkLifecycleLock;
     try {
-        await runNetworkLifecycle(async (networkLifecycleCapability) => {
+        // Dependency preparation inside this restart reuses its lease. A
+        // concurrent Router operation (a disable, a publication) cannot.
+        await runWithWorkspaceMutationLease(workspaceLease, () => runNetworkLifecycle(async (networkLifecycleCapability) => {
         let result = null;
         let activationCommitted = false;
         let registryCandidateCommitted = false;
@@ -1989,7 +1992,7 @@ export async function performContainerRestart(monitor, target, reason, attempt =
         target.isRestarting = false;
         throw surfacedError;
         }
-        });
+        }));
     } finally {
         releaseWorkspaceLease(workspaceLease);
     }

@@ -263,12 +263,12 @@ test('restart settles a killed start preparation under its own serialized leases
     const state = snapshot(paths);
     assert.equal((await retireAbandonedStartPreparationBeforeRestart()).retired, true);
     state.assertOnlyLeaseRemoved();
-    assert.equal(locks.heldWorkspaceMutationLease(), null, 'restart releases its workspace lease before starting');
+    assert.equal(fs.existsSync(locks.WORKSPACE_START_LOCK_PATH), false, 'restart releases its workspace lease before starting');
 
     const drifted = await deadOwnerPreparation();
     edge.inactivateEdgeRoutingGeneration('workspace-start-prepare', { workspaceRoot: workspace });
     const driftedState = snapshot(drifted.paths);
     await assert.rejects(retireAbandonedStartPreparationBeforeRestart(), { code: 'EDGE_PREPARATION_BUSY', message: HOST_RECOVERY });
     driftedState.assertUnchanged();
-    assert.equal(locks.heldWorkspaceMutationLease(), null, 'a refused restart releases its workspace lease');
+    assert.equal(fs.existsSync(locks.WORKSPACE_START_LOCK_PATH), false, 'a refused restart releases its workspace lease');
 });
