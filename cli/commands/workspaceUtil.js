@@ -1000,14 +1000,24 @@ function removeGraphContainerForRecreate(containerName, label, predecessorRecord
   readRuntimeCandidateImpl = readRuntimeCandidate,
   retireRuntimeCandidateImpl = retireRuntimeCandidate,
 } = {}) {
-  if (!containerExistsImpl(containerName)) return { removed: false, state: 'absent' };
+  // A staged predecessor whose launcher never published it (a no-wait worker
+  // that stopped or was superseded) has no registered container ID. Its launch
+  // receipt, or else the container's exact workspace, instance, generation and
+  // launch identity, proves ownership instead, exactly as for a reinstall whose
+  // launcher died before persisting the ID.
+  const unpublished = !/^[a-f0-9]{64}$/.test(String(predecessorRecord?.containerId || ''));
+  if (!containerExistsImpl(containerName)) {
+    // Nothing to remove. The exact launch receipt of a runtime that is also
+    // absent by its recorded ID is retired; anything unproven stays as it is.
+    if (unpublished) {
+      try {
+        const receipt = readRuntimeCandidateImpl(containerName, predecessorRecord);
+        if (receipt && !containerExistsImpl(receipt.containerId)) retireRuntimeCandidateImpl(receipt);
+      } catch (_) {}
+    }
+    return { removed: false, state: 'absent' };
+  }
   try {
-    // A staged predecessor whose launcher never published it (a no-wait
-    // worker that stopped or was superseded) has no registered container ID.
-    // Its launch receipt, or else the container's exact workspace, instance,
-    // generation and launch identity, proves ownership instead, exactly as for
-    // a reinstall whose launcher died before persisting the ID.
-    const unpublished = !/^[a-f0-9]{64}$/.test(String(predecessorRecord?.containerId || ''));
     const receipt = unpublished ? readRuntimeCandidateImpl(containerName, predecessorRecord) : null;
     const result = removeExactRegisteredContainerImpl(
       containerName,

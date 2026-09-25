@@ -94,7 +94,7 @@ async function run() {
         // its leases, with the stalled workers it found there. It then commits
         // the generation and launches the rotated identity like its own worker.
         const settlement = await cli('commands/noWaitRunSettlement.js');
-        const { ensureGraphNodesEnabled } = await cli('commands/workspaceUtil.js');
+        const { ensureGraphNodesEnabled, resolveExtraEnabledRuntimeNodes } = await cli('commands/workspaceUtil.js');
         const { resolveWorkspaceDependencyGraph } = await cli('utils/workspaceDependencyGraph.js');
         const { mergeRoutingConfig } = await cli('server/routingFile.js');
         return underStartLocks('workspace-start', async (networkLifecycleCapability) => {
@@ -105,6 +105,8 @@ async function run() {
             try {
                 staged = ensureGraphNodesEnabled(graph, registry, {
                     supersededNoWaitRuns: superseded,
+                    // Enabled agents outside the graph, exactly as startWorkspace stages them.
+                    additionalNodes: resolveExtraEnabledRuntimeNodes(graph, registry),
                     // Stands in for the production runtime check finding the
                     // runtime current (running, same env hash), which the fake
                     // engine does not model: then only supersession rotates.
@@ -126,6 +128,7 @@ async function run() {
                 superseded: superseded.map(({ containerName, pid }) => ({ containerName, pid })),
                 changedContainers: staged.changedContainers,
                 record,
+                otherRecord: readJson(agentsFile).ploinky_repo_other,
                 launchedContainerId: launched.containerId,
             };
         });

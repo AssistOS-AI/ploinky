@@ -31,6 +31,7 @@ import { NO_WAIT_DIR_NAME } from './noWaitPaths.js';
 import { NO_WAIT_STATE_BYTE_LIMIT, readNoWaitRunMarker } from './noWaitLogObserver.js';
 import {
     boundedNoWaitTimeoutInput,
+    noWaitQueuedStatusDeadline,
     resolveNoWaitBarrierTimeouts,
     resolveRunScopedObservation,
 } from './noWaitProtocol.js';
@@ -136,8 +137,23 @@ function observeMarkedWorker(containerName, {
             return { ...base, live: false, pid, reason: 'stopped without a terminal status' };
         }
         if (error?.foreign) return { ...base, live: false, pid, reason: 'its pid now belongs to another process' };
-        // Alive, but its identity cannot be read: it cannot be proven stopped.
-        return { ...base, live: true, pid, agentPath: String(status.agentPath || ''), reason: 'running (unproven)' };
+        // Alive, but not provably this worker (its arguments are unreadable, or
+        // it runs under another executable path): it cannot be proven stopped.
+        // Its run-scoped deadline bounds how long it is plausibly still the
+        // worker: by then a worker has published a terminal status or timed
+        // out, so it is no longer waited for, though it is still superseded.
+        const deadlineMs = observation.queued
+            ? noWaitQueuedStatusDeadline(marker.runStartedAtMs, marker.waveIndex, timeouts)
+            : observation.deadline;
+        const pastDeadline = Number.isSafeInteger(deadlineMs) && nowMs > deadlineMs;
+        return {
+            ...base,
+            live: true,
+            pid,
+            agentPath: String(status.agentPath || ''),
+            pastDeadline,
+            reason: pastDeadline ? 'running (unproven) past its run-scoped deadline' : 'running (unproven)',
+        };
     }
 }
 
@@ -186,7 +202,8 @@ function classifyLiveNoWaitWorkers({
         identity: worker.marker,
         // A worker that owns the outstanding preparation keeps the selector
         // inactive only until its own readiness and commit finish.
-        canProgress: Boolean(worker.pid && worker.pid === preparationOwnerPid) || workerCanProgress(worker, active),
+        canProgress: !worker.pastDeadline
+            && (Boolean(worker.pid && worker.pid === preparationOwnerPid) || workerCanProgress(worker, active)),
     }));
 }
 

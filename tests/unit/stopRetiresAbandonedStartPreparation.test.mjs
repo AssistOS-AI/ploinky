@@ -46,11 +46,23 @@ const [edgeUrl, locksUrl, networkUrl, holds] = process.argv.slice(1);
 const edge = await import(edgeUrl);
 const locks = await import(locksUrl);
 const network = await import(networkUrl);
-if (holds.includes('lease')) await locks.acquireWorkspaceMutationLease({ operation: 'workspace-start', waitTimeoutMs: 0 });
+const holding = new Set(holds.split(','));
+if (holding.has('lease')) await locks.acquireWorkspaceMutationLease({ operation: 'workspace-start', waitTimeoutMs: 0 });
 // The Watchdog's container monitor restart takes the workspace lease this way.
-if (holds.includes('watchdog')) locks.createWorkspaceMutationLease({ operation: 'watchdog-restart:ploinky_repo_demo' });
-if (holds.includes('network')) network.acquireNetworkLifecycleLock();
-if (holds.includes('prepare')) {
+if (holding.has('watchdog')) locks.createWorkspaceMutationLease({ operation: 'watchdog-restart:ploinky_repo_demo' });
+// A live owner that reaps a dead owner's network lock and takes it later on.
+// It retries while another acquirer briefly holds the stale-owner reaper.
+if (holding.has('late-network')) setTimeout(function take(attempt = 0) {
+    try {
+        network.acquireNetworkLifecycleLock({ staleGraceMs: 0 });
+        process.stdout.write('took ' + Date.now() + '\\n');
+    } catch (error) {
+        if (attempt >= 250) throw error;
+        setTimeout(() => take(attempt + 1), 20);
+    }
+}, 1500);
+if (holding.has('network')) network.acquireNetworkLifecycleLock();
+if (holding.has('prepare')) {
     edge.prepareEdgeRoutingGeneration({ workspaceRoot: process.env.PLOINKY_WORKSPACE_ROOT, reason: '${START_REASON}' });
 }
 process.stdout.write('ready\\n');
@@ -326,6 +338,29 @@ test('the reclaiming network lock waits out only a dead owner\'s grace and runs 
     assert.equal(network.withNetworkLifecycleLockReclaimingStoppedOwner(() => { calls += 1; return 'ran'; }), 'ran');
     assert.equal(calls, 2);
     assert.equal(fs.existsSync(networkLockPath), false);
+
+    const late = await startChild('late-network');
+    const lateTookAt = Promise.race([
+        new Promise((resolve) => late.stdout.on('data', (chunk) => {
+            const match = /took (\d+)/.exec(String(chunk));
+            if (match) resolve(Number(match[1]));
+        })),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('the late owner never took the lock')), 15_000).unref()),
+    ]);
+    const dead2 = await startChild('network');
+    await stopChild(dead2);
+    const waitedFrom = Date.now();
+    assert.throws(() => network.withNetworkLifecycleLockReclaimingStoppedOwner(() => { calls += 1; }),
+        { code: 'PLOINKY_NETWORK_LIFECYCLE_BUSY' });
+    const refusedAt = Date.now();
+    const tookAt = await lateTookAt;
+    assert.ok(tookAt >= waitedFrom, 'the wait began on the dead owner');
+    assert.ok(refusedAt - tookAt < 1_000,
+        `once a live owner took the lock the wait stopped (refused ${refusedAt - tookAt}ms after, not at the grace end)`);
+    assert.equal(readJson(networkLockPath).pid, late.pid);
+    assert.equal(calls, 2);
+    await stopChild(late);
+    fs.rmSync(networkLockPath, { force: true });
 
     const live = await startChild('network');
     const startedAt = Date.now();

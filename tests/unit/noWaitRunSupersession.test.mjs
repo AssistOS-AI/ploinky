@@ -61,7 +61,8 @@ function workspace(t) {
 
 // The earlier start's worker for the staged demo identity, parked in its wave
 // barrier until the test settles its producer.
-async function earlierStartWorker(t, w) {
+async function earlierStartWorker(t, w, { agent = 'demo', executable = process.execPath } = {}) {
+    const container = `ploinky_repo_${agent}`;
     const runId = randomUUID();
     const runStartedAtMs = Date.now();
     const noWaitDir = path.join(w.ws, '.ploinky', 'running', 'no-wait');
@@ -72,19 +73,19 @@ async function earlierStartWorker(t, w) {
     }), { mode: 0o600 });
     settleProducer('starting');
     const identity = {
-        containerName: CONTAINER, instanceId: 'demo-instance', enableGeneration: 'demo-generation',
-        repoName: 'repo', shortAgent: 'demo', alias: '', routeKey: 'demo',
-        runId, runStartedAtMs, waveIndex: 1, statusFile: `${CONTAINER}.${runId}.json`,
+        containerName: container, instanceId: `${agent}-instance`, enableGeneration: `${agent}-generation`,
+        repoName: 'repo', shortAgent: agent, alias: '', routeKey: agent,
+        runId, runStartedAtMs, waveIndex: 1, statusFile: `${container}.${runId}.json`,
     };
-    fs.writeFileSync(path.join(noWaitDir, `${CONTAINER}.current.json`),
+    fs.writeFileSync(path.join(noWaitDir, `${container}.current.json`),
         JSON.stringify({ createdAt: new Date().toISOString(), ...identity }), { mode: 0o600 });
     const statusPath = path.join(noWaitDir, identity.statusFile);
-    const agentPath = path.join(w.ws, '.ploinky', 'repos', 'repo', 'demo');
-    const child = spawn(process.execPath, [
+    const agentPath = path.join(w.ws, '.ploinky', 'repos', 'repo', agent);
+    const child = spawn(executable, [
         WORKER,
-        '--container', CONTAINER, '--instance-id', identity.instanceId, '--enable-generation', identity.enableGeneration,
-        '--short-agent', 'demo', '--repo', 'repo', '--alias', '', '--manifest-path', path.join(agentPath, 'manifest.json'),
-        '--agent-path', agentPath, '--route-key', 'demo', '--run-id', runId, '--run-started-at-ms', String(runStartedAtMs),
+        '--container', container, '--instance-id', identity.instanceId, '--enable-generation', identity.enableGeneration,
+        '--short-agent', agent, '--repo', 'repo', '--alias', '', '--manifest-path', path.join(agentPath, 'manifest.json'),
+        '--agent-path', agentPath, '--route-key', agent, '--run-id', runId, '--run-started-at-ms', String(runStartedAtMs),
         '--wave-index', '1', '--status-file', statusPath, '--profile', 'default',
         '--wait-for-statuses', JSON.stringify([{ path: barrier, runId, waveIndex: 0, directDependency: true }]),
     ], { cwd: w.ws, env: w.env, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -197,6 +198,61 @@ test('a live earlier worker that became able to progress after the settle is sup
     assert.match(worker.status().error.message, /requires the exact staged registry identity/);
     assert.deepEqual(w.engine.calls().slice(released).filter(([command]) => DESTRUCTIVE.has(command)), []);
     assert.deepEqual(containers(w), { [next.launchedContainerId]: 'running' });
+});
+
+test('a genuine earlier worker launched through another Node executable path is superseded too', async (t) => {
+    const w = workspace(t);
+    w.drive('setup');
+    const ensured = w.drive('worker-ensure');
+    const alternateNode = path.join(w.root, 'node-alternate');
+    fs.symlinkSync(process.execPath, alternateNode);
+    const worker = await earlierStartWorker(t, w, { executable: alternateNode });
+    assert.deepEqual(w.drive('inspect').live.map(({ pid }) => pid), [worker.child.pid],
+        'the same run identity under another executable is still a live earlier worker');
+    const callsBefore = w.engine.calls().length;
+    const next = w.drive('next-start', { runtimeCurrent: true });
+    assert.equal(next.staged, true, JSON.stringify(next));
+    assert.deepEqual(next.superseded, [{ containerName: CONTAINER, pid: worker.child.pid }]);
+    assert.notEqual(next.record.instanceId, 'demo-instance');
+    assert.deepEqual(w.engine.calls().slice(callsBefore).filter(([command]) => command === 'rm'),
+        [['rm', '-f', ensured.containerId]]);
+    const released = w.engine.calls().length;
+    worker.release();
+    assert.equal(await worker.exited, 1, worker.output());
+    assert.match(worker.status().error.message, /requires the exact staged registry identity/);
+    assert.deepEqual(w.engine.calls().slice(released).filter(([command]) => DESTRUCTIVE.has(command)), []);
+    assert.deepEqual(containers(w), { [next.launchedContainerId]: 'running' });
+});
+
+test('an earlier worker of an enabled agent outside the start\'s graph is superseded too', async (t) => {
+    // `other` is enabled but not a dependency of the static `demo` graph: the
+    // start stages it as an additional node, so its worker is matched as well.
+    const w = workspace(t);
+    w.drive('setup');
+    const worker = await earlierStartWorker(t, w, { agent: 'other' });
+    const next = w.drive('next-start', { runtimeCurrent: true });
+    assert.equal(next.staged, true, JSON.stringify(next));
+    assert.deepEqual(next.superseded, [{ containerName: 'ploinky_repo_other', pid: worker.child.pid }]);
+    assert.deepEqual(next.changedContainers, ['ploinky_repo_other']);
+    assert.notEqual(next.otherRecord.instanceId, 'other-instance', 'the out-of-graph identity rotated');
+    assert.equal(next.record.instanceId, 'demo-instance', 'the unrelated in-graph identity is kept');
+    worker.release();
+    assert.equal(await worker.exited, 1, worker.output());
+    assert.match(worker.status().error.message, /requires the exact staged registry identity/);
+});
+
+test('an unpublished predecessor that is already gone leaves no launch receipt behind', async (t) => {
+    const w = workspace(t);
+    w.drive('setup');
+    const ensured = w.drive('worker-ensure');
+    const staged = JSON.parse(fs.readFileSync(path.join(w.ws, '.ploinky', 'agents.json'), 'utf8'))[CONTAINER];
+    assert.deepEqual(receiptInstances(w), ['demo-instance']);
+    const removed = spawnSync('podman', ['rm', '-f', ensured.containerId], { env: w.env, encoding: 'utf8' });
+    assert.equal(removed.status, 0, removed.stderr);
+    assert.deepEqual(containers(w), {});
+    const result = w.drive('remove-predecessor', { record: staged });
+    assert.deepEqual(result.removed, { removed: false, state: 'absent' });
+    assert.deepEqual(receiptInstances(w), [], 'the receipt of the provably absent runtime is retired');
 });
 
 test('without a stalled earlier worker the same next start keeps the staged identity', async (t) => {

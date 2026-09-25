@@ -26,6 +26,8 @@ const { resolveNoWaitBarrierTimeouts } = await import('../../cli/commands/noWait
 const { settleWorkspaceBeforeRestart } = await import('../../cli/commands/workspaceUtil.js');
 
 const WORKER = path.resolve(import.meta.dirname, '../../cli/commands/noWaitWorker.js');
+// launchd: alive (EPERM) and its arguments are unreadable to this user.
+const UNREADABLE_PID = 1;
 const CONTAINER = 'ploinky_fixtures_probe';
 const PRODUCER = 'ploinky_fixtures_producer';
 const paths = edge.resolveEdgeGenerationPaths();
@@ -96,7 +98,7 @@ function writeMarker(identity) {
 
 // A wave-1 worker blocked on its wave-0 producer: live, provably this worker,
 // and able to progress, until the producer's status settles its barrier.
-async function parkedWorker() {
+async function parkedWorker({ executable = process.execPath } = {}) {
     const identity = runIdentity();
     const barrierPath = path.join(noWaitDir, `${PRODUCER}.${identity.runId}.json`);
     const writeBarrier = (state) => writeJson(barrierPath, {
@@ -106,7 +108,7 @@ async function parkedWorker() {
     writeBarrier('starting');
     writeMarker(identity);
     const statusPath = path.join(noWaitDir, identity.statusFile);
-    const child = spawn(process.execPath, [
+    const child = spawn(executable, [
         WORKER,
         '--container', CONTAINER,
         '--instance-id', identity.instanceId,
@@ -288,6 +290,83 @@ test('a worker that owns the outstanding preparation is waited for while the sel
     fs.rmSync(paths.preparationLeaseFile);
     worker.release();
     assert.equal(await worker.exited, 1);
+});
+
+test('a genuine earlier worker launched through another Node executable path is still waited for', async () => {
+    fixture();
+    // A Node upgrade or version switch changes the executable path of workers
+    // an earlier start already spawned. The worker is still exactly this run.
+    const alternateNode = path.join(workspace, 'node-alternate');
+    fs.symlinkSync(process.execPath, alternateNode);
+    const worker = await parkedWorker({ executable: alternateNode });
+    const inFlight = settlement.inspectInFlightNoWaitWorkers();
+    assert.deepEqual(inFlight.map(({ pid, reason }) => ({ pid, reason })), [{ pid: worker.child.pid, reason: 'running (unproven)' }],
+        'the same run identity under another executable is unproven, never foreign');
+    const state = snapshot();
+    let settled = false;
+    const restart = settleWorkspaceBeforeRestart().finally(() => { settled = true; });
+    await sleep(1_500);
+    assert.equal(settled, false, 'the restart waits for it like any live worker');
+    state.assertUnchanged();
+    worker.release();
+    assert.equal(await worker.exited, 1, worker.output());
+    assert.deepEqual(await restart, { retired: false });
+});
+
+// A dead worker's non-terminal status whose pid now belongs to a live process
+// this user cannot inspect (its arguments are unreadable).
+function unreadableReusedPid(worker, { phaseStartedAtMs }) {
+    writeJson(worker.statusPath, { ...readJson(worker.statusPath), pid: UNREADABLE_PID,
+        sequencePhase: 'active', sequencePhaseStartedAtMs: phaseStartedAtMs });
+}
+
+const unreadableArgv = ({ pid }) => {
+    const error = new Error(`worker process ${pid} exposes no structured argument vector`);
+    error.code = 'PROCESS_IDENTITY_UNPROVEN';
+    throw error;
+};
+
+test('an unproven live pid is waited for only until its run-scoped deadline, and is superseded either way', async () => {
+    fixture();
+    const worker = await parkedWorker();
+    await killChild(worker.child);
+    const timeouts = resolveNoWaitBarrierTimeouts();
+    const nowMs = Date.now();
+    const inspect = (fn) => fn({ proveWorkerProcess: unreadableArgv, timeouts, nowMs });
+
+    // Inside its active phase deadline this could still be the worker.
+    unreadableReusedPid(worker, { phaseStartedAtMs: nowMs });
+    assert.deepEqual(inspect(settlement.inspectInFlightNoWaitWorkers).map(({ pid, reason }) => ({ pid, reason })),
+        [{ pid: UNREADABLE_PID, reason: 'running (unproven)' }]);
+
+    // Past it, a legitimate worker would have published a terminal status or
+    // timed out: it is not waited for, but its identity is still superseded.
+    const expiredStart = nowMs - (timeouts.activeTimeoutMs + timeouts.terminalPublicationGraceMs + 60_000);
+    unreadableReusedPid(worker, { phaseStartedAtMs: expiredStart });
+    assert.deepEqual(inspect(settlement.inspectInFlightNoWaitWorkers), []);
+    assert.deepEqual(inspect(settlement.inspectLiveNoWaitWorkers).map(({ pid, canProgress }) => ({ pid, canProgress })),
+        [{ pid: UNREADABLE_PID, canProgress: false }]);
+});
+
+test('a reused pid whose arguments cannot be read holds restart only until the run-scoped deadline', {
+    skip: process.platform !== 'darwin' && 'needs a live pid whose arguments this user cannot read (launchd, pid 1, on macOS)',
+}, async () => {
+    fixture();
+    const worker = await parkedWorker();
+    await killChild(worker.child);
+    const state = snapshot();
+    process.env.PLOINKY_NO_WAIT_SETTLE_TIMEOUT_MS = '1200';
+    unreadableReusedPid(worker, { phaseStartedAtMs: Date.now() });
+    await assert.rejects(settleWorkspaceBeforeRestart(), { code: 'PLOINKY_NO_WAIT_RUN_IN_FLIGHT', message: /pid 1,/ });
+    state.assertUnchanged();
+
+    const timeouts = resolveNoWaitBarrierTimeouts();
+    unreadableReusedPid(worker, {
+        phaseStartedAtMs: Date.now() - (timeouts.activeTimeoutMs + timeouts.terminalPublicationGraceMs + 60_000),
+    });
+    const startedAt = Date.now();
+    assert.deepEqual(await settleWorkspaceBeforeRestart(), { retired: false });
+    assert.ok(Date.now() - startedAt < 1_000, 'past its deadline the dead run no longer holds restart');
 });
 
 test('the settled lease re-inspects under the lease and waits again for a worker that resumed', async () => {

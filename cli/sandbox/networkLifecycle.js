@@ -389,7 +389,9 @@ export function withNetworkLifecycleLock(callback, options = {}) {
  * withNetworkLifecycleLock for a lifecycle step that may follow a killed
  * owner (an update rollback's stop or start). A lock whose owner no longer
  * exists is reclaimable only after its stale-owner grace, so only then is the
- * grace waited out; a live owner still fails fast. The callback runs once.
+ * grace waited out. The owner is re-checked before every retry: a live owner,
+ * including one that took the lock during that wait, fails fast. The callback
+ * runs once.
  */
 export function withNetworkLifecycleLockReclaimingStoppedOwner(callback, options = {}) {
     let entered = false;
@@ -397,12 +399,17 @@ export function withNetworkLifecycleLockReclaimingStoppedOwner(callback, options
         entered = true;
         return callback(capability);
     };
-    try {
-        return withNetworkLifecycleLock(run, options);
-    } catch (error) {
-        if (entered || error?.code !== 'PLOINKY_NETWORK_LIFECYCLE_BUSY'
-            || !networkLifecycleLockOwnerStopped({ lockPath: options.lockPath })) throw error;
-        return withNetworkLifecycleLock(run, { ...options, waitMs: NETWORK_LOCK_STALE_GRACE_MS + 1_000 });
+    const deadline = Date.now() + NETWORK_LOCK_STALE_GRACE_MS + 1_000;
+    const pollMs = Math.max(10, Number(options.pollMs || 50));
+    while (true) {
+        try {
+            return withNetworkLifecycleLock(run, { ...options, waitMs: 0 });
+        } catch (error) {
+            if (entered || error?.code !== 'PLOINKY_NETWORK_LIFECYCLE_BUSY'
+                || !networkLifecycleLockOwnerStopped({ lockPath: options.lockPath })
+                || Date.now() >= deadline) throw error;
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(pollMs, Math.max(1, deadline - Date.now())));
+        }
     }
 }
 
