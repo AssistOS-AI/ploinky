@@ -451,8 +451,8 @@ test('entrypoint retires only an exact stopped managed container without touchin
     assert.equal(calls.some((call) => call.includes('-f') || call.includes('--volumes')), false);
 });
 
-test('entrypoint retires a stopped pre-lifecycle-label container with exact legacy ownership', (t) => {
-    const legacy = retainedContainerFixture(t, {
+test('entrypoint refuses and preserves a registered container without lifecycle labels', (t) => {
+    const unlabeled = retainedContainerFixture(t, {
         mutateLabels(labels) {
             const copy = { ...labels };
             delete copy['io.assistos.ploinky.instance-id'];
@@ -461,14 +461,11 @@ test('entrypoint retires a stopped pre-lifecycle-label container with exact lega
         },
     });
 
-    assert.deepEqual(
-        retireStoppedManagedContainers(legacy.paths, { runner: legacy.runner }),
-        [legacy.containerId],
+    assert.throws(
+        () => retireStoppedManagedContainers(unlabeled.paths, { runner: unlabeled.runner }),
+        /exact registry ownership \(lifecycle-ownership-labels\)/,
     );
-    assert.deepEqual(
-        legacy.calls.at(-1),
-        ['run', 'podman', 'container', 'rm', legacy.containerId],
-    );
+    assert.equal(unlabeled.calls.some((call) => call[0] === 'run'), false);
 });
 
 test('entrypoint retires a stopped predecessor with a complete stale lifecycle pair', (t) => {
@@ -523,7 +520,7 @@ test('entrypoint retires only a fully superseded staged predecessor', (t) => {
     assert.equal(duplicateIdentity.calls.some((call) => call[0] === 'run'), false);
 });
 
-test('entrypoint retires only a stopped legacy helper with the exact historical label', (t) => {
+test('entrypoint retires only a stopped interrupted helper with the exact managed label', (t) => {
     const helper = retainedContainerFixture(t, {
         includeRegistry: false,
         mutateLabels() {

@@ -82,8 +82,7 @@ export async function selectWorkspaceAgentLibSource({
     if (!bundle) {
         throw agentLibError(AGENTLIB_ERROR_CODES.imageRequired,
             'No local achillesAgentLib checkout exists. Start this workspace with \u0060ploinky start\u0060 '
-            + 'to use the pinned Box image bundle, or add <workspace>/achillesAgentLib for ploinky-local. '
-            + 'Host-managed Git fallback is no longer supported.');
+            + 'to use the pinned Box image bundle, or add <workspace>/achillesAgentLib for ploinky-local.');
     }
     const selection = buildImageSelection({
         workspaceRoot,

@@ -163,33 +163,26 @@ test('listWorkspaceSuggestions filters results by leaf query', () => {
     }
 });
 
-test('resolveWebchatWorkspaceBase supports confined legacy dir parameter', () => {
-    const root = makeWorkspace('compat-dir');
+test('resolveWebchatWorkspaceBase ignores a dir parameter; only workspace-dir selects a base', () => {
+    const root = makeWorkspace('dir-ignored');
+    const outside = makeWorkspace('dir-ignored-outside');
     try {
         fs.mkdirSync(path.join(root, 'project'));
-        const parsed = new URL(
-            `/webchat?agent=achilles-cli&dir=${encodeURIComponent(path.join(root, 'project'))}`,
-            'http://127.0.0.1'
+        for (const dir of [path.join(root, 'project'), 'project', outside]) {
+            const parsed = new URL(
+                `/webchat?agent=achilles-cli&dir=${encodeURIComponent(dir)}`,
+                'http://127.0.0.1'
+            );
+            const base = resolveWebchatWorkspaceBase(parsed, { workspaceRoot: root });
+            assert.equal(base.base, fs.realpathSync(root), dir);
+            assert.equal(base.relativeBase, '', dir);
+        }
+        const selected = resolveWebchatWorkspaceBase(
+            new URL('/webchat?agent=achilles-cli&workspace-dir=project&dir=elsewhere', 'http://127.0.0.1'),
+            { workspaceRoot: root },
         );
-        const base = resolveWebchatWorkspaceBase(parsed, { workspaceRoot: root });
-        assert.equal(base.base, fs.realpathSync(path.join(root, 'project')));
-        assert.equal(base.relativeBase, 'project');
-    } finally {
-        fs.rmSync(root, { recursive: true, force: true });
-    }
-});
-
-test('resolveWebchatWorkspaceBase rejects legacy dir outside the workspace', () => {
-    const root = makeWorkspace('compat-dir-reject');
-    const outside = makeWorkspace('compat-dir-outside');
-    try {
-        const parsed = new URL(
-            `/webchat?agent=achilles-cli&dir=${encodeURIComponent(outside)}`,
-            'http://127.0.0.1'
-        );
-        const base = resolveWebchatWorkspaceBase(parsed, { workspaceRoot: root });
-        assert.equal(base.base, fs.realpathSync(root));
-        assert.equal(base.relativeBase, '');
+        assert.equal(selected.base, fs.realpathSync(path.join(root, 'project')));
+        assert.equal(selected.relativeBase, 'project');
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
         fs.rmSync(outside, { recursive: true, force: true });
@@ -219,7 +212,7 @@ test('workspace path provider preserves launch query and drills into folders usi
     };
     try {
         const toEndpoint = (suffix) => `/webchat/${suffix}${String(suffix).includes('?') ? '&' : '?'}`
-            + `agent=generic-agent&dir=${encodeURIComponent('/workspace/project')}`;
+            + 'agent=generic-agent&workspace-dir=project';
         const provider = createWorkspacePathsProvider({
             toEndpoint,
             state: {
@@ -255,7 +248,7 @@ test('workspace path provider preserves launch query and drills into folders usi
             metadata: { token: '@docs/notes.md' }
         }]);
         assert.equal(new URL(calls[1], 'http://127.0.0.1').searchParams.get('query'), 'docs/');
-        assert.equal(new URL(calls[1], 'http://127.0.0.1').searchParams.get('dir'), '/workspace/project');
+        assert.equal(new URL(calls[1], 'http://127.0.0.1').searchParams.get('workspace-dir'), 'project');
         assert.equal(new URL(calls[1], 'http://127.0.0.1').searchParams.get('agent'), 'generic-agent');
     } finally {
         globalThis.fetch = originalFetch;
@@ -365,7 +358,7 @@ test('folder selection keeps the caret and slash in sync through backspace and r
     assert.equal(afterRetypingSlash, '@docs/');
 });
 
-test('handleSuggestionsFiles scopes results to dir and emits cwd-relative paths', () => {
+test('handleSuggestionsFiles scopes results to workspace-dir and emits cwd-relative paths', () => {
     const root = makeWorkspace('handler');
     try {
         const project = path.join(root, 'project');
@@ -373,7 +366,7 @@ test('handleSuggestionsFiles scopes results to dir and emits cwd-relative paths'
         fs.writeFileSync(path.join(project, 'README.md'), 'readme');
         fs.writeFileSync(path.join(root, 'outside.txt'), 'outside');
         const parsed = new URL(
-            `/webchat/suggestions/files?dir=${encodeURIComponent(project)}&query=`,
+            '/webchat/suggestions/files?workspace-dir=project&query=',
             'http://127.0.0.1'
         );
         const response = {

@@ -162,19 +162,6 @@ export function resolveWebchatWorkspaceBase(parsedUrl, { workspaceRoot: configur
             return { root: workspaceRoot, base: workspaceRoot, relativeBase: '' };
         }
     }
-    const rawCompatDir = parsedUrl.searchParams.get('dir') || '';
-    if (rawCompatDir) {
-        try {
-            const resolved = resolveWorkspacePath(rawCompatDir, {
-                workspaceRoot,
-                leadingSlashIsWorkspaceRelative: false
-            });
-            const relativeBase = path.relative(workspaceRoot, resolved).replace(/\\+/g, '/');
-            return { root: workspaceRoot, base: resolved, relativeBase };
-        } catch (_) {
-            return { root: workspaceRoot, base: workspaceRoot, relativeBase: '' };
-        }
-    }
     return { root: workspaceRoot, base: workspaceRoot, relativeBase: '' };
 }
 

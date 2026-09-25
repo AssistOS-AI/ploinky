@@ -134,6 +134,7 @@ test('journal is atomic, mode 0600, and contains only non-secret reconciliation 
         phase: 'dns-reconciled',
         scope: { accountId: 'account', zoneId: 'zone', tunnelId: 'tunnel' },
         ingressDigest: `sha256:${'c'.repeat(64)}`,
+        managedIngressHostnames: ['office.example.test'],
         managedDnsRecords: [{
             hostname: 'office.example.test',
             recordId: 'record-1',
@@ -174,6 +175,7 @@ test('journal rejects numeric schema markers, extra fields, and symlinked parent
         phase: 'local-only',
         scope: null,
         ingressDigest: '',
+        managedIngressHostnames: [],
         managedDnsRecords: [],
         lastError: null,
         updatedAt: new Date().toISOString(),
@@ -190,7 +192,8 @@ test('journal rejects numeric schema markers, extra fields, and symlinked parent
     fs.symlinkSync(outside, directory);
     assert.throws(
         () => journal.write(base),
-        (error) => error.code === 'CLOUDFLARE_JOURNAL_CORRUPT',
+        (error) => error.code === 'CLOUDFLARE_JOURNAL_CORRUPT'
+            && /parent is not a real directory/.test(error.message),
     );
     assert.deepEqual(fs.readdirSync(outside), []);
 });
@@ -205,6 +208,7 @@ test('journal rejects malformed integrity fields and inconsistent nested ownersh
         phase: 'ready',
         scope: { accountId: 'account_123', zoneId: 'zone_123', tunnelId: 'tunnel_123' },
         ingressDigest: `sha256:${'c'.repeat(64)}`,
+        managedIngressHostnames: ['office.example.test'],
         managedDnsRecords: [{
             hostname: 'office.example.test',
             recordId: 'record-1',
@@ -244,6 +248,8 @@ test('journal rejects malformed integrity fields and inconsistent nested ownersh
             },
         },
     ];
+    assert.equal(journal.write(base).managedIngressHostnames[0], 'office.example.test');
+    fs.rmSync(path.join(root, '.ploinky'), { recursive: true });
     for (const value of invalidValues) {
         assert.throws(
             () => journal.write(value),
@@ -251,6 +257,39 @@ test('journal rejects malformed integrity fields and inconsistent nested ownersh
         );
     }
     assert.deepEqual(fs.readdirSync(root), []);
+});
+
+test('a journal without managed ingress hostnames is rejected and never removed', (t) => {
+    const root = temporaryDirectory(t);
+    const journal = createCloudflarePublicationJournal({ workspaceRoot: root });
+    fs.mkdirSync(path.dirname(journal.path), { recursive: true });
+    const unsupported = JSON.stringify({
+        mode: 'cloudflare',
+        configurationGeneration: `sha256:${'a'.repeat(64)}`,
+        desiredDigest: `sha256:${'b'.repeat(64)}`,
+        phase: 'ready',
+        scope: { accountId: 'account_123', zoneId: 'zone_123', tunnelId: 'tunnel_123' },
+        ingressDigest: `sha256:${'c'.repeat(64)}`,
+        managedDnsRecords: [{
+            hostname: 'office.example.test',
+            recordId: 'record-1',
+            zoneId: 'zone_123',
+            content: 'tunnel_123.cfargotunnel.com',
+        }],
+        lastError: null,
+        updatedAt: '2026-07-28T18:30:00.000Z',
+    });
+    fs.writeFileSync(journal.path, unsupported, { mode: 0o600 });
+    assert.throws(
+        () => journal.read(),
+        (error) => error.code === 'CLOUDFLARE_JOURNAL_CORRUPT' && /invalid contract/.test(error.message),
+    );
+    assert.equal(fs.readFileSync(journal.path, 'utf8'), unsupported);
+    assert.throws(
+        () => journal.write(JSON.parse(unsupported)),
+        (error) => error.code === 'CLOUDFLARE_JOURNAL_CORRUPT' && /invalid contract/.test(error.message),
+    );
+    assert.equal(fs.readFileSync(journal.path, 'utf8'), unsupported);
 });
 
 test('managed tunnel registry persists ownership intent atomically before a tunnel id exists', (t) => {
@@ -661,7 +700,7 @@ for (const writer of ['status', 'journal', 'registry']) {
                 const written = journal.write({
                     mode: 'local-only', configurationGeneration: `sha256:${'a'.repeat(64)}`,
                     desiredDigest: `sha256:${'b'.repeat(64)}`, phase: 'local-only', scope: null,
-                    ingressDigest: '', managedDnsRecords: [], lastError: null,
+                    ingressDigest: '', managedIngressHostnames: [], managedDnsRecords: [], lastError: null,
                 });
                 assert.deepEqual(createCloudflarePublicationJournal({ workspaceRoot: workspace }).read(), written);
                 assert.equal(fs.realpathSync(file), path.join(fs.realpathSync(state), 'data', 'edge-publication', path.basename(file)));

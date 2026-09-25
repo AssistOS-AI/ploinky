@@ -102,12 +102,13 @@ function taskFinalOutputRanges(task) {
     const declared = Array.isArray(task?.finalOutputRanges)
         ? task.finalOutputRanges
         : [];
-    const legacy = {
+    // Task producers also report the current turn's range as single fields.
+    const currentTurn = {
         turn: task?.turn,
         offset: task?.finalOutputOffset,
         length: task?.finalOutputLength,
     };
-    return [...declared, legacy].filter((range) => {
+    return [...declared, currentTurn].filter((range) => {
         return Number.isSafeInteger(range?.offset)
             && range.offset >= 0
             && Number.isSafeInteger(range?.length)

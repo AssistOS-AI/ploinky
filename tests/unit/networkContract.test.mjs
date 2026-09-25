@@ -72,6 +72,22 @@ test('network contract canonicalizes only the four exact modes', () => {
     }
 });
 
+test('network name and aliases are rejected as unknown fields in every mode', () => {
+    for (const field of [{ name: 'front' }, { aliases: ['front'] }]) {
+        for (const base of [
+            { mode: 'default' },
+            { mode: 'bridge', attachments: [{ name: 'front', primary: true }] },
+        ]) {
+            const key = Object.keys(field)[0];
+            assert.throws(
+                () => canonicalizeNetwork({ ...base, ...field }),
+                (error) => error?.code === 'PLOINKY_NETWORK_CONTRACT_INVALID'
+                    && error.message === `manifest.network.${key}: unsupported field '${key}'`,
+            );
+        }
+    }
+});
+
 test('profile network omission inherits root and a profile block replaces it atomically', () => {
     const manifest = {
         network: { mode: 'bridge', attachments: [{ name: 'root-net', primary: true }] },

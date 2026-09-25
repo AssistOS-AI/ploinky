@@ -16,7 +16,7 @@ const { buildFullEnvMap } = await import(`../../cli/sandbox/bwrap/bwrapServiceMa
 const { buildRouterEndpoint } = await import(`../../cli/sandbox/routerPort.js${moduleSuffix}`);
 const { deriveAgentRequestSecret, deriveDerivedMasterKey } = await import(`../../cli/utils/security/masterKey.js${moduleSuffix}`);
 const { deriveAgentPrincipalId } = await import(`../../cli/utils/security/agentIdentity.js${moduleSuffix}`);
-const { buildAgentIdentityEnv, buildAgentPrincipalEnv, stripReservedAgentEnv } = await import(`../../cli/utils/security/agentIdentityEnv.js${moduleSuffix}`);
+const { buildAgentCredentialEnv, buildAgentPrincipalEnv, stripReservedAgentEnv } = await import(`../../cli/utils/security/agentIdentityEnv.js${moduleSuffix}`);
 const { verifySubjectIdentityKey, getSubjectIdentityPublicKey } = await import(`../../cli/utils/security/subjectIdentityKey.js${moduleSuffix}`);
 const routerEndpoint = buildRouterEndpoint('host', 8080);
 
@@ -80,9 +80,14 @@ test('the workspace master key is NEVER injected into an agent', () => {
     assert.equal(env.PLOINKY_MASTER_KEY, undefined);
 });
 
-test('buildAgentIdentityEnv remains the explicit aggregate credential injector', () => {
+// The two lifecycle phases, composed exactly as a certified launch applies them.
+function buildBothIdentityPhases(principal) {
+    return { ...buildAgentPrincipalEnv(principal), ...buildAgentCredentialEnv(principal) };
+}
+
+test('the principal and credential phases together inject exactly the identity key set', () => {
     const principal = deriveAgentPrincipalId('AssistOSExplorer', 'dpuAgent');
-    const idEnv = buildAgentIdentityEnv(principal);
+    const idEnv = buildBothIdentityPhases(principal);
     // Exactly this key set — no master / derived-master / private material ever
     // leaks, and no unexpected key sneaks in. Updated for the signed identity
     // material (signed key + public verification key + provenance).
@@ -111,7 +116,7 @@ test('buildAgentIdentityEnv remains the explicit aggregate credential injector',
 
 test('the signed identity key is minted from the canonical subject and verifies', () => {
     const principal = deriveAgentPrincipalId('AssistOSExplorer', 'dpuAgent');
-    const idEnv = buildAgentIdentityEnv(principal);
+    const idEnv = buildBothIdentityPhases(principal);
     // It starts with the canonical subject id followed by the `|` delimiter.
     assert.ok(idEnv.PLOINKY_AGENT_API_KEY.startsWith(`${principal}|`));
     // The public verification key is present and non-empty.
@@ -132,9 +137,11 @@ test('the signed identity key is minted from the canonical subject and verifies'
     }
 });
 
-test('buildAgentIdentityEnv fails closed without a principal id', () => {
-    assert.throws(() => buildAgentIdentityEnv(''), /principalId is required/);
-    assert.throws(() => buildAgentIdentityEnv(null), /principalId is required/);
+test('both identity phases fail closed without a principal id', () => {
+    for (const build of [buildAgentPrincipalEnv, buildAgentCredentialEnv]) {
+        assert.throws(() => build(''), /principalId is required/);
+        assert.throws(() => build(null), /principalId is required/);
+    }
 });
 
 test('stripReservedAgentEnv drops master + identity names, keeps the rest', () => {

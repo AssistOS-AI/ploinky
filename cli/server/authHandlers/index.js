@@ -7,7 +7,6 @@ export {
 } from './shared.js';
 export {
     buildIdentityHeaders,
-    ensureAgentAuthenticated,
     ensureAuthenticated,
     ensureHttpRouteAccess,
     resolveRouteDefaultHttpAccess,

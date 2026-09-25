@@ -30,9 +30,6 @@ export function canonicalizeNetwork(value, { path = 'manifest.network' } = {}) {
     if (value === undefined) return Object.freeze({ mode: 'default' });
     const network = objectAt(value, path);
     rejectUnknownFields(network, NETWORK_FIELDS, path);
-    if (Object.hasOwn(network, 'name') || Object.hasOwn(network, 'aliases')) {
-        fail(path, "legacy 'name'/'aliases' network fields are unsupported");
-    }
     const mode = typeof network.mode === 'string' ? network.mode.trim() : '';
     if (!NETWORK_MODES.includes(mode)) {
         fail(`${path}.mode`, `expected exactly one of ${NETWORK_MODES.join(', ')}`);

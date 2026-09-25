@@ -64,10 +64,19 @@ function readWorkspaceOwnerIdentity(pid) {
     return { scope, startIdentity: readProcessStartIdentity(Number(pid)) };
 }
 
+// Every workspace lease writer records a positive PID and its birth identity
+// (scope and start identity may be empty when unavailable). Anything else is
+// malformed state: it is never reclaimed automatically, because nothing proves
+// its owner stopped. Only exact Box stop/destroy cleanup retires it.
+function workspaceLeaseOwnerIsMalformed(lock) {
+    const identity = lock?.ownerIdentity;
+    return !Number.isSafeInteger(lock?.ownerPid) || lock.ownerPid <= 0
+        || !identity || typeof identity !== 'object' || Array.isArray(identity)
+        || typeof identity.scope !== 'string' || typeof identity.startIdentity !== 'string';
+}
+
 function workspaceOwnerIsActive(lock) {
-    // Old leases have no birth identity. A live legacy PID remains protected;
-    // only exact Box destruction can safely retire it across Box generations.
-    if (!lock?.ownerIdentity) return isProcessAlive(lock?.ownerPid);
+    if (workspaceLeaseOwnerIsMalformed(lock)) return true;
     const expected = lock.ownerIdentity;
     const current = readWorkspaceOwnerIdentity(lock.ownerPid);
     if (!expected.scope || !current.scope || expected.scope !== current.scope) {
@@ -136,7 +145,9 @@ function inspectWorkspaceStartLock(attempt = 0) {
     if (!lock && Date.now() - snapshot.mtimeMs < LOCK_STALE_GRACE_MS) {
         return { active: true, stale: false, recoveryPending: true, lock: null };
     }
-    if (!lock) return { active: true, stale: false, recoveryPending: true, recoveryRequired: true, lock: null };
+    if (!lock || workspaceLeaseOwnerIsMalformed(lock)) {
+        return { active: true, stale: false, recoveryPending: true, recoveryRequired: true, malformed: true, lock };
+    }
     const expiresAtMs = Date.parse(lock?.expiresAt || '');
     const expired = Number.isFinite(expiresAtMs) ? expiresAtMs <= Date.now() : true;
     const ownerAlive = workspaceOwnerIsActive(lock);
@@ -167,9 +178,13 @@ function createWorkspaceMutationLease({
 } = {}) {
     const existing = inspectWorkspaceStartLock();
     if (existing.recoveryRequired) {
-        const error = new Error('Workspace mutation recovery is required: stop the exact Box from its host workspace, '
-            + 'then start it again. A worker stopped without proof that its child processes and installer runtimes stopped.');
+        const error = new Error(existing.malformed
+            ? `Workspace mutation lease ${WORKSPACE_START_LOCK_PATH} is unreadable or lacks a valid owner identity. `
+                + 'Stop the exact Box from its host workspace, then start it again; stopping retires this lease.'
+            : 'Workspace mutation recovery is required: stop the exact Box from its host workspace, '
+                + 'then start it again. A worker stopped without proof that its child processes and installer runtimes stopped.');
         error.code = 'PLOINKY_WORKSPACE_MUTATION_RECOVERY_REQUIRED';
+        error.leasePath = WORKSPACE_START_LOCK_PATH;
         throw error;
     }
     if (existing.active) throw workspaceMutationBusy(existing.lock);
@@ -307,6 +322,7 @@ function releaseWorkspaceStartLock(lock) {
     if (!lock?.token) return false;
     const snapshot = lockSnapshot(WORKSPACE_START_LOCK_PATH);
     if (snapshot?.lock?.recoveryRequired
+        || (snapshot?.lock && workspaceLeaseOwnerIsMalformed(snapshot.lock))
         || (snapshot?.lock?.requireQuiescenceOnOwnerDeath && !workspaceOwnerIsActive(snapshot.lock))) return false;
     const removed = removeSnapshot(snapshot, lock.token);
     if (removed) OWNED_WORKSPACE_LEASES.delete(lock);

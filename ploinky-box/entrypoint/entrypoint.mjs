@@ -212,7 +212,10 @@ export function retireStoppedManagedContainers(paths, {
         const labels = record.Config?.Labels || record.Labels || {};
         const ploinkyLabelKeys = Object.keys(labels)
             .filter((key) => key.startsWith('io.assistos.ploinky.'));
-        const legacyHelperOwnership = !registered
+        // One-shot helpers (shell detection, dependency probes and installers)
+        // run with `--rm` and only the managed label. A Box stopped while one
+        // runs leaves it behind unregistered; retire exactly that shape.
+        const interruptedHelperOwnership = !registered
             && observedId === containerId
             && labels[MANAGED_CONTAINER_LABELS.managed] === '1'
             && ploinkyLabelKeys.length === 1;
@@ -229,12 +232,9 @@ export function retireStoppedManagedContainers(paths, {
         const exactLifecycleOwnership = hasRegisteredLifecycleOwnership
             && observedInstanceId === registeredInstanceId
             && observedEnableGeneration === registeredEnableGeneration;
-        // A stopped predecessor can have no lifecycle labels (older runtime)
-        // or a complete stale pair after the registry staged its successor.
-        // Partial or mixed pairs remain ownership drift and fail closed.
-        const absentLifecycleOwnership = hasRegisteredLifecycleOwnership
-            && observedInstanceId === ''
-            && observedEnableGeneration === '';
+        // A stopped predecessor can carry a complete stale pair after the
+        // registry staged its successor. Absent, partial or mixed pairs remain
+        // ownership drift and fail closed.
         const staleLifecycleOwnership = hasRegisteredLifecycleOwnership
             && observedInstanceId !== ''
             && observedEnableGeneration !== ''
@@ -252,11 +252,7 @@ export function retireStoppedManagedContainers(paths, {
             labels[MANAGED_CONTAINER_LABELS.workspace] === workspaceHash || 'workspace-label',
             /^[a-f0-9]{64}$/.test(String(labels[MANAGED_CONTAINER_LABELS.contract] || ''))
                 || 'contract-label',
-            (
-                exactLifecycleOwnership
-                || absentLifecycleOwnership
-                || staleLifecycleOwnership
-            )
+            (exactLifecycleOwnership || staleLifecycleOwnership)
                 || 'lifecycle-ownership-labels',
         ].filter((value) => value !== true);
         const stagedPredecessorOwnership = staleLifecycleOwnership
@@ -265,7 +261,7 @@ export function retireStoppedManagedContainers(paths, {
             && ownershipMismatches[0] === 'registry-container-id';
         if (
             ownershipMismatches.length > 0
-            && !legacyHelperOwnership
+            && !interruptedHelperOwnership
             && !stagedPredecessorOwnership
         ) {
             throw entrypointError(

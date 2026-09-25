@@ -35,12 +35,13 @@ function normalizeFinalOutputRanges(raw) {
     const declared = Array.isArray(raw?.finalOutputRanges)
         ? raw.finalOutputRanges.slice(-MAX_TASK_FINAL_OUTPUT_RANGES)
         : [];
-    const legacy = {
+    // Task producers also report the current turn's range as single fields.
+    const currentTurn = {
         turn: raw?.turn,
         offset: raw?.finalOutputOffset,
         length: raw?.finalOutputLength,
     };
-    for (const candidate of [...declared, legacy]) {
+    for (const candidate of [...declared, currentTurn]) {
         if (!Number.isSafeInteger(candidate?.turn) || candidate.turn < 1) continue;
         if (!Number.isSafeInteger(candidate.offset) || candidate.offset < 0) continue;
         if (!Number.isSafeInteger(candidate.length) || candidate.length < 1) continue;

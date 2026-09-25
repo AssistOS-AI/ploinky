@@ -24,7 +24,6 @@ import {
 } from '../utils/publicRouterHosts.mjs';
 import { parseRouterOriginList } from '../../Agent/lib/routerOrigins.mjs';
 import {
-    INITIAL_MEDIA_HOST_PORT,
     parseMediaHostPort,
     parseRouterHostPort,
     selectedMediaHostPort,
@@ -1628,12 +1627,8 @@ function sourceDigests(captured) {
         desired: sourceDigest(captured.bytes.desiredBytes),
         agents: sourceDigest(captured.bytes.agentsBytes),
         routerHostPort: sourceDigest(captured.bytes.routerHostPortBytes),
-        ...(captured.bytes.mediaHostPortBytes
-            ? { mediaHostPort: sourceDigest(captured.bytes.mediaHostPortBytes) }
-            : {}),
-        ...(captured.bytes.routerPublicHostsBytes
-            ? { routerPublicHosts: sourceDigest(captured.bytes.routerPublicHostsBytes) }
-            : {}),
+        mediaHostPort: sourceDigest(captured.bytes.mediaHostPortBytes),
+        routerPublicHosts: sourceDigest(captured.bytes.routerPublicHostsBytes),
         manifests: Object.fromEntries(
             Object.entries(captured.bytes.manifestBytes).sort(([left], [right]) => left.localeCompare(right))
                 .map(([key, bytes]) => [key, sourceDigest(bytes)]),
@@ -2038,10 +2033,12 @@ function decodeGenerationSources(document) {
         'routerPublicHosts',
         'manifests',
     ]), 'generation sources');
-    // Optional sources are additive: every writer that captured public Router
-    // hosts also captured the media port, so the reverse shape was never valid.
-    if (sources.routerPublicHosts !== undefined && sources.mediaHostPort === undefined) {
-        throw edgeError('generation public Router hosts source requires its media host-port source', 'EDGE_GENERATION_CORRUPT');
+    // Every generation binds its physical publication inputs. A document
+    // without one of them is unsupported, never completed from the environment.
+    for (const source of ['routerHostPort', 'mediaHostPort', 'routerPublicHosts']) {
+        if (sources[source] === undefined) {
+            throw edgeError(`generation is missing its required ${source} source`, 'EDGE_GENERATION_CORRUPT');
+        }
     }
     const manifestSources = assertObject(sources.manifests, 'generation manifest sources');
     const manifestBytes = Object.fromEntries(Object.entries(manifestSources).sort(([left], [right]) => left.localeCompare(right)).map(([routeKey, value]) => {
@@ -2054,12 +2051,8 @@ function decodeGenerationSources(document) {
         desiredBytes: decodeCanonicalBase64(sources.desired, 'generation desired source'),
         agentsBytes: decodeCanonicalBase64(sources.agents, 'generation agents source'),
         routerHostPortBytes: decodeCanonicalBase64(sources.routerHostPort, 'generation Router host-port source'),
-        ...(sources.mediaHostPort === undefined
-            ? {}
-            : { mediaHostPortBytes: decodeCanonicalBase64(sources.mediaHostPort, 'generation media host-port source') }),
-        ...(sources.routerPublicHosts === undefined
-            ? {}
-            : { routerPublicHostsBytes: decodeCanonicalBase64(sources.routerPublicHosts, 'generation public Router hosts source') }),
+        mediaHostPortBytes: decodeCanonicalBase64(sources.mediaHostPort, 'generation media host-port source'),
+        routerPublicHostsBytes: decodeCanonicalBase64(sources.routerPublicHosts, 'generation public Router hosts source'),
         manifestBytes,
     };
 }
@@ -2081,27 +2074,22 @@ function reconstructGeneration(document, selector) {
     } catch (error) {
         throw edgeError(`captured Router host port is invalid: ${error?.message || error}`, 'EDGE_GENERATION_CORRUPT');
     }
-    let mediaHostPort = INITIAL_MEDIA_HOST_PORT;
-    if (bytes.mediaHostPortBytes) {
-        try {
-            mediaHostPort = parseMediaHostPort(bytes.mediaHostPortBytes.toString('utf8'), {
-                source: 'captured media host port',
-            });
-        } catch (error) {
-            throw edgeError(`captured media host port is invalid: ${error?.message || error}`, 'EDGE_GENERATION_CORRUPT');
-        }
+    let mediaHostPort;
+    try {
+        mediaHostPort = parseMediaHostPort(bytes.mediaHostPortBytes.toString('utf8'), {
+            source: 'captured media host port',
+        });
+    } catch (error) {
+        throw edgeError(`captured media host port is invalid: ${error?.message || error}`, 'EDGE_GENERATION_CORRUPT');
     }
-    // A generation captured before public Router hosts were a source has no
-    // origin capability. Never derive one for it from today's environment.
-    let routerPublicHosts = null;
-    let routerOrigins = null;
-    if (bytes.routerPublicHostsBytes) {
-        try {
-            routerPublicHosts = parsePublicRouterHosts(bytes.routerPublicHostsBytes.toString('utf8'));
-            routerOrigins = deriveRouterOrigins(routerPublicHosts, routerHostPort);
-        } catch (error) {
-            throw edgeError(`captured public Router hosts are invalid: ${error?.message || error}`, 'EDGE_GENERATION_CORRUPT');
-        }
+    // Origins derive only from the captured hosts, never from today's environment.
+    let routerPublicHosts;
+    let routerOrigins;
+    try {
+        routerPublicHosts = parsePublicRouterHosts(bytes.routerPublicHostsBytes.toString('utf8'));
+        routerOrigins = deriveRouterOrigins(routerPublicHosts, routerHostPort);
+    } catch (error) {
+        throw edgeError(`captured public Router hosts are invalid: ${error?.message || error}`, 'EDGE_GENERATION_CORRUPT');
     }
     const manifests = Object.fromEntries(Object.entries(bytes.manifestBytes).map(([routeKey, value]) => (
         [routeKey, parseJsonBytes(value, `captured manifest(${routeKey})`)]
@@ -2132,8 +2120,8 @@ function reconstructGeneration(document, selector) {
         ['edge-desired.json', bytes.desiredBytes],
         ['agents.json', bytes.agentsBytes],
         ['router-host-port', bytes.routerHostPortBytes],
-        ...(bytes.mediaHostPortBytes ? [['media-host-port', bytes.mediaHostPortBytes]] : []),
-        ...(bytes.routerPublicHostsBytes ? [['router-public-hosts', bytes.routerPublicHostsBytes]] : []),
+        ['media-host-port', bytes.mediaHostPortBytes],
+        ['router-public-hosts', bytes.routerPublicHostsBytes],
         ...Object.entries(bytes.manifestBytes).sort(([left], [right]) => left.localeCompare(right)).map(([routeKey, value]) => [`manifest:${routeKey}`, value]),
     ];
     if (digestParts(parts) !== selector.generation) {
@@ -2141,32 +2129,11 @@ function reconstructGeneration(document, selector) {
     }
     const expectedDigests = sourceDigests({ bytes });
     const storedCompiled = assertObject(document.compiled, 'generation compiled state');
-    // Generations written before a derived allowlist was introduced do not
-    // contain that field. Accept only these exact additive omissions so a
-    // running workspace can load its previous generation long enough to commit
-    // a newly compiled one. Runtime behavior remains unchanged (and therefore
-    // fail-closed for a missing capability) until replacement is committed.
-    let legacyCompiledShape = false;
-    let semanticForStoredShape = semantic.compiled;
-    if (!Object.hasOwn(storedCompiled, 'dependencyHttpRoutes')) {
-        legacyCompiledShape = true;
-        semanticForStoredShape = Object.fromEntries(
-            Object.entries(semanticForStoredShape).filter(([key]) => key !== 'dependencyHttpRoutes'),
-        );
-    }
-    const storedSecurity = assertObject(storedCompiled.security, 'generation compiled security state');
-    if (!Object.hasOwn(storedSecurity, 'workspaceLogConsumers')) {
-        legacyCompiledShape = true;
-        semanticForStoredShape = {
-            ...semanticForStoredShape,
-            security: Object.fromEntries(
-                Object.entries(semanticForStoredShape.security).filter(([key]) => key !== 'workspaceLogConsumers'),
-            ),
-        };
-    }
+    // The stored compiled state must equal today's compilation exactly; a
+    // generation missing a derived field is unsupported and fails closed.
     if (stableStringify(document.sourceDigests) !== stableStringify(expectedDigests)
-        || document.compiledDigest !== compiledDigest(semanticForStoredShape)
-        || stableStringify(storedCompiled) !== stableStringify(semanticForStoredShape)) {
+        || document.compiledDigest !== compiledDigest(semantic.compiled)
+        || stableStringify(storedCompiled) !== stableStringify(semantic.compiled)) {
         throw edgeError('active edge routing generation semantic verification failed', 'EDGE_GENERATION_CORRUPT');
     }
     return {
@@ -2183,7 +2150,7 @@ function reconstructGeneration(document, selector) {
         mediaHostPort,
         routerPublicHosts,
         routerOrigins,
-        compiled: legacyCompiledShape ? storedCompiled : semantic.compiled,
+        compiled: semantic.compiled,
     };
 }
 
@@ -2247,10 +2214,8 @@ function topologyMedia(desired, mediaHostPort) {
     return media;
 }
 
-// A generation without the captured source has no origin capability, and its
-// topology omits the field so consumers can tell legacy from an empty list.
 function topologyRouterOrigins(generation) {
-    return Array.isArray(generation.routerOrigins) ? [...generation.routerOrigins] : undefined;
+    return [...generation.routerOrigins];
 }
 
 function topologyConfigurationGeneration(generation) {
@@ -2259,10 +2224,9 @@ function topologyConfigurationGeneration(generation) {
     // are intentionally represented by the separate authorization/publication
     // generations below.
     const media = topologyMedia(generation.desired, generation.mediaHostPort);
-    const routerOrigins = topologyRouterOrigins(generation);
     const configuration = {
         ...(media ? { media } : {}),
-        ...(routerOrigins ? { routerOrigins } : {}),
+        routerOrigins: topologyRouterOrigins(generation),
     };
     return sourceDigest(Buffer.from(stableStringify(configuration)));
 }
@@ -2285,7 +2249,7 @@ function writeTopologyForGeneration(paths, generation, publicationState, options
         // Advisory discovery only. This file is published before the selector
         // commit, so consumers confirm active origins through the private
         // runtime-origins operation before relying on them.
-        ...(routerOrigins ? { routerOrigins } : {}),
+        routerOrigins,
     };
     fs.mkdirSync(paths.topologyGenerationsDir, { recursive: true });
     const topologyName = `${generation.generation.replace(/^sha256:/, '')}-${topology.publicationGeneration}.json`;
@@ -2793,10 +2757,9 @@ export function applyEdgeDesiredStateFile(candidateFile, options = {}) {
     });
 }
 
-// A generation binds the public hosts the Box was created with. Legacy
-// generations carry none and remain loadable without gaining a capability.
+// A generation binds the public hosts the Box was created with.
 function routerPublicHostsMatchRuntime(generation) {
-    if (!Array.isArray(generation?.routerPublicHosts)) return true;
+    if (!Array.isArray(generation?.routerPublicHosts)) return false;
     try {
         return serializePublicRouterHosts(capturePublicRouterHosts())
             === serializePublicRouterHosts(generation.routerPublicHosts);

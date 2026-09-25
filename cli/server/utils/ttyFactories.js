@@ -32,22 +32,11 @@ function resolveSafeHostWorkdir(preferred = '') {
 }
 
 /**
- * Load TTY module with fallback support
+ * Load a TTY module relative to this file
  */
-async function loadTTYModule(primaryRelative, legacyRelative) {
-    const currentUrl = import.meta.url;
-    try {
-        const mod = await import(new URL(primaryRelative, currentUrl));
-        return mod.default || mod;
-    } catch (primaryError) {
-        if (legacyRelative) {
-            try {
-                const legacy = await import(new URL(legacyRelative, currentUrl));
-                return legacy.default || legacy;
-            } catch (_) { }
-        }
-        throw primaryError;
-    }
+async function loadTTYModule(relativePath) {
+    const mod = await import(new URL(relativePath, import.meta.url));
+    return mod.default || mod;
 }
 
 /**
@@ -56,7 +45,7 @@ async function loadTTYModule(primaryRelative, legacyRelative) {
 async function loadTTYModules() {
     let webchatTTYModule = {};
     try {
-        webchatTTYModule = await loadTTYModule('../webchat/tty.js', '../webchat/webchat-ttyFactory.js');
+        webchatTTYModule = await loadTTYModule('../webchat/tty.js');
     } catch (_) {
         console.warn('WebChat TTY factory unavailable.');
     }

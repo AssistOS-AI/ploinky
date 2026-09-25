@@ -68,7 +68,7 @@ function retireStartLock(workspaceRoot, before) {
         throw cleanupError('The destroyed Box workspace mutation lock changed during cleanup');
     }
     // The exact Box is stopped or absent: its workers are gone. Never probe or signal
-    // a recorded PID in the host namespace, including legacy bare-PID locks.
+    // a recorded PID in the host namespace, whatever owner record the lease carries.
     if (after) fs.unlinkSync(path.join(workspaceRoot, '.ploinky', 'running', 'workspace-start.json'));
 }
 

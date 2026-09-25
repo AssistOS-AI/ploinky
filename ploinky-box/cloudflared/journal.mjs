@@ -146,9 +146,7 @@ function normalizeError(value) {
 }
 
 export function normalizeCloudflareJournal(value) {
-    const legacyKeys = JOURNAL_KEYS.filter((key) => key !== 'managedIngressHostnames');
-    const legacy = hasExactKeys(value, legacyKeys);
-    if (!legacy && !hasExactKeys(value, JOURNAL_KEYS)) {
+    if (!hasExactKeys(value, JOURNAL_KEYS)) {
         fail('Cloudflare reconciliation journal has an invalid contract');
     }
     const mode = safeString(value.mode, 'mode', { maximum: 32 });
@@ -166,9 +164,7 @@ export function normalizeCloudflareJournal(value) {
         ingressDigest: mode === 'cloudflare'
             ? normalizeDigest(value.ingressDigest, 'ingress digest')
             : safeString(value.ingressDigest, 'ingress digest', { maximum: 71, optional: true }),
-        managedIngressHostnames: legacy
-            ? managedDnsRecords.map((entry) => entry.hostname)
-            : normalizeManagedIngressHostnames(value.managedIngressHostnames),
+        managedIngressHostnames: normalizeManagedIngressHostnames(value.managedIngressHostnames),
         managedDnsRecords,
         lastError: normalizeError(value.lastError),
         updatedAt: normalizeTimestamp(value.updatedAt),

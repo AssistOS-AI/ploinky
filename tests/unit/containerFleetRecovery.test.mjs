@@ -133,14 +133,14 @@ test('reinstall recovers an exited installation container with a missing ID and 
     assert.equal(state.recovered[0].record.runtime, 'podman');
 });
 
-test('reinstall resolves a matching legacy name or 12-hex prefix but preserves a conflicting prefix', () => {
-    for (const containerId of [NAME, ID.slice(0, 12)]) {
-        assert.equal(engine().remove(registry({ containerId })).removed, true);
+test('reinstall rejects a registry container ID that is a name or short prefix and never controls it', () => {
+    for (const containerId of [NAME, ID.slice(0, 12), OTHER_ID.slice(0, 12), 'damaged-record']) {
+        const state = engine();
+        assert.throws(() => state.remove(registry({ containerId })), /malformed registry container ID/, containerId);
+        assert.deepEqual(state.inspections, [], containerId);
+        assert.deepEqual(state.controls, [], containerId);
+        assert.deepEqual(state.recovered, [], containerId);
     }
-    const state = engine();
-    assert.throws(() => state.remove(registry({ containerId: OTHER_ID.slice(0, 12) })), /container ID prefix/);
-    assert.deepEqual(state.controls, []);
-    assert.throws(() => state.remove(registry({ containerId: 'damaged-record' })), /malformed registry container ID/);
 });
 
 test('reinstall never replaces a conflicting full registry ID with the current named container', () => {
@@ -151,7 +151,7 @@ test('reinstall never replaces a conflicting full registry ID with the current n
     assert.deepEqual(state.recovered, []);
 });
 
-test('legacy recovery requires exact workspace, instance, generation, principal and runtime ownership', () => {
+test('missing-ID recovery requires exact workspace, instance, generation, principal and runtime ownership', () => {
     const mutations = [
         (current) => { current.Name = '/foreign-agent'; },
         (current) => { current.Config.Labels[NETWORK_LABELS.workspace] = 'foreign-workspace'; },

@@ -25,7 +25,7 @@ export const BOX_LABELS = Object.freeze({
     routerHostPort: 'io.assistos.ploinky-box.router-host-port',
     mediaHostPort: 'io.assistos.ploinky-box.media-host-port',
     // Present only for an explicit non-loopback `ploinky bind`; its absence
-    // keeps the legacy loopback meaning of existing Boxes.
+    // means the default loopback publication.
     routerBindAddress: 'io.assistos.ploinky-box.router-bind-address',
     seccompFingerprint: 'io.assistos.ploinky-box.seccomp-fingerprint',
     dependenciesFingerprint: 'io.assistos.ploinky-box.dependencies-fingerprint',

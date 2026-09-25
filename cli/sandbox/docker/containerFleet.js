@@ -223,7 +223,10 @@ function removeExactContainerAndDescriptor(name, record, runtime, {
     if (recoverIncompleteIdentity && !remove) {
         throw new Error(`reinstall recovery for '${name}' requires an explicit removal operation`);
     }
-    if (incompleteId && expectedId && expectedId !== name && !/^[a-f0-9]{12,63}$/.test(expectedId)) {
+    // Only an absent ID is a recoverable current state: `create` can succeed
+    // and the launcher die before persisting its output. Any other non-full
+    // value is malformed and never resolved by name or prefix.
+    if (incompleteId && expectedId) {
         throw new Error(`reinstall recovery for '${name}' found a malformed registry container ID; restore the exact launch record`);
     }
     const completeRegistryIdentity = !(record?.type !== 'agent'
@@ -242,8 +245,9 @@ function removeExactContainerAndDescriptor(name, record, runtime, {
         if (!workspaceHash) {
             throw new Error(`fleet lifecycle for '${name}' could not resolve the workspace identity`);
         }
-        // A name is only a discovery key for an incomplete legacy record. It
-        // never authorizes control, and cannot replace a recorded immutable ID.
+        // A name is only a discovery key for a record whose launcher died
+        // between `create` and persisting the ID. It never authorizes control,
+        // and cannot replace a recorded immutable ID.
         let inspected = inspect(runtime, incompleteId ? name : expectedId);
         if (!inspected) {
             if (recoverIncompleteIdentity) {
@@ -263,9 +267,8 @@ function removeExactContainerAndDescriptor(name, record, runtime, {
         }
         if (incompleteId) {
             const actualId = String(inspected?.Id || inspected?.ID || '');
-            if (!IMMUTABLE_CONTAINER_ID.test(actualId)
-                || (expectedId && expectedId !== name && !actualId.startsWith(expectedId))) {
-                throw new Error(`reinstall recovery for '${name}' could not resolve its recorded container ID prefix to one exact immutable ID`);
+            if (!IMMUTABLE_CONTAINER_ID.test(actualId)) {
+                throw new Error(`reinstall recovery for '${name}' could not resolve its named container to one exact immutable ID`);
             }
             expectedId = actualId;
         }
