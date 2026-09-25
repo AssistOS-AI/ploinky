@@ -358,7 +358,7 @@ export class CloudflarePublicationController {
             'remove',
         ]);
         requireMethods(secretStore, 'Cloudflare secret store', ['readAll']);
-        requireMethods(routeCoordinator, 'Cloudflare route coordinator', ['inactivate', 'commit']);
+        requireMethods(routeCoordinator, 'Cloudflare route coordinator', ['inactivate', 'inactivateForStop', 'commit']);
         if (typeof probeConnector !== 'function') throw new TypeError('Cloudflare publication requires probeConnector()');
         if (typeof probeHostname !== 'function') throw new TypeError('Cloudflare publication requires probeHostname()');
         this.api = api || null;
@@ -1529,7 +1529,16 @@ export class CloudflarePublicationController {
         clearTimeout(this.restartTimer);
         this.restartTimer = null;
         await this.connector.stop('controller-stop');
-        try { await this.inactivate(this.lastInput || {}, 'cloudflare-controller-stop'); } catch (_) {}
+        // A stop withdraws only the exact active generation this controller
+        // serves. An already inactive selector keeps the failure or lifecycle
+        // reason that inactivated it; the coordinator records a restart
+        // handoff only for the withdrawal it performed here.
+        try {
+            await this.routeCoordinator.inactivateForStop({
+                configurationGeneration: String(this.lastInput?.configurationGeneration || ''),
+                reason: 'cloudflare-controller-stop',
+            });
+        } catch (_) {}
         await this.transition({
             state: 'stopped',
             connectorState: this.state.mode === 'local-only' ? 'absent' : 'stopped',

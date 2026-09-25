@@ -10,6 +10,7 @@ import { LOGS_DIR, PLOINKY_DIR } from '../utils/config.js';
 import { inspectWorkspaceStartLock } from '../utils/runtime/maintenanceLocks.js';
 import { parseRouterPort } from '../sandbox/routerPort.js';
 import { isInsideBox } from '../../ploinky-box/lib/boxMarker.mjs';
+import { createRouterSupervisorId, routerSupervisorEnvironment } from './routerSupervisorIdentity.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -28,6 +29,18 @@ export function resolveContainerSnapshotIntervalMs({
 }
 
 const insideBox = isInsideBox();
+// Shared by every Router child of this Watchdog process; see
+// routerSupervisorIdentity.js.
+const ROUTER_SUPERVISOR_ID = createRouterSupervisorId();
+
+// Supervision timing overrides exist so a real Watchdog/Router pair can be
+// exercised in tests; production keeps the defaults.
+function boundedMillisecondsFromEnv(name, fallback, { minimum = 100, maximum = 10 * 60 * 1000 } = {}) {
+    const raw = process.env[name];
+    if (raw === undefined || raw === '') return fallback;
+    const parsed = Number(raw);
+    return Number.isSafeInteger(parsed) && parsed >= minimum && parsed <= maximum ? parsed : fallback;
+}
 
 // Configuration
 const CONFIG = {
@@ -45,7 +58,8 @@ const CONFIG = {
 
     // Health check configuration
     HEALTH_CHECK_ENABLED: process.env.HEALTH_CHECK_ENABLED !== 'false',
-    HEALTH_CHECK_INTERVAL_MS: 30000,   // Check every 30 seconds
+    HEALTH_CHECK_INTERVAL_MS: boundedMillisecondsFromEnv('PLOINKY_WATCHDOG_HEALTH_CHECK_INTERVAL_MS', 30000), // Check every 30 seconds
+    HEALTH_CHECK_START_DELAY_MS: boundedMillisecondsFromEnv('PLOINKY_WATCHDOG_HEALTH_CHECK_START_DELAY_MS', 10000), // Wait 10 seconds for server to start
     HEALTH_CHECK_TIMEOUT_MS: 5000,     // 5 second timeout
     HEALTH_CHECK_FAILURES_THRESHOLD: 3, // Restart after 3 consecutive failures
     HEALTH_SOCKET: process.env.PLOINKY_ROUTER_HEALTH_SOCKET
@@ -472,7 +486,7 @@ function spawnServer() {
     const nodeExecutable = getRouterNodeExecutable();
     const child = spawn(nodeExecutable, [CONFIG.SERVER_SCRIPT], {
         stdio: ['ignore', 'pipe', 'pipe'],
-        env,
+        env: routerSupervisorEnvironment(env, ROUTER_SUPERVISOR_ID),
         detached: false
     });
     
@@ -481,7 +495,8 @@ function spawnServer() {
     log('info', 'server_spawned', {
         pid: child.pid,
         nodeExecutable,
-        totalRestarts: state.totalRestarts
+        totalRestarts: state.totalRestarts,
+        routerSupervisorId: ROUTER_SUPERVISOR_ID,
     });
 
     child.stdout?.on('data', chunk => appendRouterProcessOutput('stdout', chunk));
@@ -508,7 +523,7 @@ function spawnServer() {
                 startContainerMonitor(state.containerMonitor);
             }
         }
-    }, 10000); // Wait 10 seconds for server to start
+    }, CONFIG.HEALTH_CHECK_START_DELAY_MS);
 }
 
 // Handle process exit

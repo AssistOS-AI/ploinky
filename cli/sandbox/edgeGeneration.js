@@ -1600,6 +1600,17 @@ export function inactivateEdgeRoutingGeneration(reason = 'candidate-change', opt
     const { release } = acquireApplyLockCapability(paths, options);
     try {
         const previous = readSelector(paths);
+        // An exact-selector inactivation withdraws only the named active
+        // activation. Any other selector already reflects a newer decision
+        // (or already fails closed) and is left untouched.
+        if (options.expectedActiveSelector !== undefined) {
+            const expected = options.expectedActiveSelector;
+            if (previous?.state !== 'active'
+                || previous.generation !== expected?.generation
+                || previous.activationId !== expected?.activationId) {
+                return null;
+            }
+        }
         const selector = sealSelector({
             schemaVersion: EDGE_GENERATION_SCHEMA_VERSION,
             state: 'inactive',

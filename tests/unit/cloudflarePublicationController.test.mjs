@@ -316,6 +316,13 @@ function createHarness({
             routes.active = false;
             routes.hosts = {};
         },
+        async inactivateForStop(input) {
+            events.push({ event: 'routes.inactivateForStop', input: structuredClone(input) });
+            if (!routes.active) return null;
+            routes.active = false;
+            routes.hosts = {};
+            return { generation: input.configurationGeneration };
+        },
         async commit(input) {
             events.push({ event: 'routes.commit', input: structuredClone(input) });
             if (routes.failCommitOnce) {
