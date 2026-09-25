@@ -1,14 +1,14 @@
+// The Box image supplies the one MCP SDK. Declarations, bundles and the
+// store build path must reject every tampered, mismatched or overriding SDK
+// before an immutable dependency object can be published.
+
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import childProcess from 'node:child_process';
-import { syncBuiltinESMExports } from 'node:module';
-import { withDependencyRefresh } from '../../cli/utils/dependencies/dependencyRefresh.mjs';
-import { BOX_MARKER_CONTENT, BOX_MARKER_PATH } from '../../ploinky-box/constants.mjs';
 import {
-    MCP_SDK_BUNDLE_PATH,
     MCP_SDK_BUNDLE_METADATA_NAME,
     createMcpSdkBundleMetadata,
     readMcpSdkRepositoryFromLock,
@@ -23,34 +23,22 @@ import {
     needsNpmInstall,
     withoutBoxMcpSdk,
 } from '../../ploinky-box/agent-dependencies/mcp-sdk.mjs';
+import { mergePackageJson } from '../../cli/utils/dependencies/dependencyInstaller.js';
+import { createCacheStore } from '../../cli/utils/dependencies/store/objectStore.mjs';
+import { buildAgentInstallPlan } from '../../cli/utils/dependencies/store/installContract.mjs';
+import { containerProvider, fakeLease, makeAgentLib } from './dependencyStoreFixtures.mjs';
 
 const workspace = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'box-sdk-cache-test-'));
-const previousWorkspace = process.env.PLOINKY_WORKSPACE_ROOT;
-process.env.PLOINKY_WORKSPACE_ROOT = workspace;
-const cache = await import('../../cli/utils/dependencies/dependencyCache.js');
-const installer = await import('../../cli/utils/dependencies/dependencyInstaller.js');
 const lockPath = new URL('../../ploinky-box/dependencies.lock.json', import.meta.url);
 const repository = readMcpSdkRepositoryFromLock({ lockPath });
-const runtimeKey = 'container-linux-x64-glibc-node24';
-const selection = {
-    sourceDir: '/selected/achillesAgentLib',
-    mode: 'managed',
-    fingerprint: 'a'.repeat(64),
-    commit: 'b'.repeat(40),
-    sourceIdHash: 'c'.repeat(64),
-};
-const prepareOptions = {
-    runtimeKey,
-    image: 'example/node:24',
-    runtime: 'podman',
-    agentLib: selection,
-    log() {},
-};
+const IMAGE = `sha256:${'a'.repeat(64)}`;
+const AGENTLIB_LINK = '/opt/ploinky-agentlib';
+const SDK_DECLARATION = 'git+https://github.com/AssistOS-AI/MCPSDK.git#main';
+const GLOBAL = Object.freeze({ name: 'ploinky-global-deps', version: '1.0.0', dependencies: { 'mcp-sdk': SDK_DECLARATION } });
+const CONSUMER = Object.freeze({ kind: 'test-consumer', process: { pid: 1, processStart: 'x', bootScope: 'y' } });
 
 test.after(() => {
     fs.rmSync(workspace, { recursive: true, force: true });
-    if (previousWorkspace === undefined) delete process.env.PLOINKY_WORKSPACE_ROOT;
-    else process.env.PLOINKY_WORKSPACE_ROOT = previousWorkspace;
 });
 
 function fixture(t) {
@@ -68,107 +56,73 @@ function fixture(t) {
     return { root, sourceRoot, bundle };
 }
 
-/** Exercise actual prepare/inspect code with a temporary immutable-image fixture. */
-function boxEnvironment(t, { globalPackage = null, insideBox = true, onInstall = null } = {}) {
+/** A Box workspace whose dependency store builds with the validated image SDK. */
+function boxStore(t) {
     const f = fixture(t);
-    const marker = path.join(f.root, 'box-marker');
-    fs.writeFileSync(marker, BOX_MARKER_CONTENT);
-    const alternateGlobal = path.join(f.root, 'global-package.json');
-    if (globalPackage) fs.writeFileSync(alternateGlobal, JSON.stringify(globalPackage));
-    const remap = (filename) => {
-        if (filename === BOX_MARKER_PATH) return insideBox ? marker : path.join(f.root, 'no-marker');
-        if (typeof filename === 'string' && (filename === MCP_SDK_BUNDLE_PATH || filename.startsWith(`${MCP_SDK_BUNDLE_PATH}/`))) {
-            return `${f.sourceRoot}${filename.slice(MCP_SDK_BUNDLE_PATH.length)}`;
-        }
-        if (globalPackage && filename === cache.getGlobalPackagePath()) return alternateGlobal;
-        return filename;
-    };
-    const mocks = [];
-    for (const method of ['lstatSync', 'readFileSync', 'readdirSync']) {
-        const original = fs[method];
-        mocks.push(t.mock.method(fs, method, (filename, ...args) => original(remap(filename), ...args)));
-    }
-    const actualSpawn = childProcess.spawnSync;
-    const installs = [];
+    const agentLib = makeAgentLib(f.root);
+    const provider = containerProvider({ imageId: IMAGE, sdkBundle: f.bundle, agentLib });
+    const { lease, assertLease } = fakeLease();
+    fs.mkdirSync(path.join(f.root, 'ws'));
+    const store = createCacheStore({
+        depsDir: path.join(f.root, 'ws', '.ploinky', 'deps'),
+        workspaceRoot: path.join(f.root, 'ws'),
+        assertLease,
+        checkDiskSpace: () => ({ ok: true, availableBytes: 1e12 }),
+    });
+    const plan = (manifest, registration = 'repo/agent') => buildAgentInstallPlan({
+        provider,
+        globalPackage: GLOBAL,
+        agentPackage: manifest ? { selection: 'code', relativePath: `${registration}/code/package.json`, sha256: 'f'.repeat(64), manifest } : null,
+        registration,
+        sdkBundle: f.bundle,
+        agentLibSelection: agentLib,
+    });
+    return { ...f, agentLib, provider, lease, store, plan };
+}
+
+/**
+ * npm as the container installer runs it inside a Box: the SDK arrives only as
+ * the prepared local link, and npm prunes it (it is not a real dependency of
+ * the restored manifest). `during` runs after the install, before finalization.
+ */
+function boxNpm({ during = null, extra = null } = {}) {
     const calls = [];
-    mocks.push(t.mock.method(childProcess, 'spawnSync', (command, args, options) => {
-        calls.push({ command, args });
-        if (command === 'podman') {
-            if (args[0] === 'image') return { status: 1, stdout: '', stderr: '' };
-            if (args.includes('test')) return { status: 0, stdout: '', stderr: '' };
-            const volume = args[args.indexOf('-v') + 1];
-            assert.ok(volume.endsWith(':/install:z'));
-            const installPath = volume.slice(0, -':/install:z'.length);
-            const pkg = JSON.parse(fs.readFileSync(path.join(installPath, 'package.json'), 'utf8'));
-            if (insideBox) {
-                assert.equal(pkg.dependencies['mcp-sdk'], 'file:.ploinky-provided/node_modules/mcp-sdk');
-                assert.equal(pkg.overrides['mcp-sdk'], '$mcp-sdk');
-                assert.ok(args.at(-1).includes('--install-links=false'));
-                for (const field of ['devDependencies', 'optionalDependencies', 'peerDependencies']) {
-                    assert.equal(Object.hasOwn(pkg[field] || {}, 'mcp-sdk'), false, `npm input still contains SDK in ${field}`);
-                }
+    return {
+        kind: 'box-npm',
+        calls,
+        describe() { return { kind: 'box-npm' }; },
+        install({ payloadDir, options }) {
+            const pkg = JSON.parse(fs.readFileSync(path.join(payloadDir, 'package.json'), 'utf8'));
+            calls.push({ pkg, options });
+            assert.equal(pkg.dependencies['mcp-sdk'], 'file:.ploinky-provided/node_modules/mcp-sdk');
+            assert.equal(pkg.overrides['mcp-sdk'], '$mcp-sdk');
+            assert.equal(options.linkBoxMcpSdk, true);
+            for (const field of ['devDependencies', 'optionalDependencies', 'peerDependencies']) {
+                assert.equal(Object.hasOwn(pkg[field] || {}, 'mcp-sdk'), false, `npm input still contains SDK in ${field}`);
             }
-            assert.doesNotMatch(args.at(-1), /npm 'update'/);
-            installs.push({ installPath, pkg, operation: 'install' });
-            // npm prunes extraneous entries; the production finalizer must
-            // restore the validated image bundle after this operation.
-            fs.rmSync(path.join(installPath, 'node_modules', 'mcp-sdk'), { recursive: true, force: true });
-            fs.rmSync(path.join(installPath, 'node_modules', 'achillesAgentLib'), { recursive: true, force: true });
-            fs.rmSync(path.join(installPath, 'node_modules', 'ploinky-agent-lib'), { recursive: true, force: true });
-            if (onInstall) onInstall(installPath, pkg);
-            return { status: 0, stdout: '', stderr: '' };
-        }
-        assert.notEqual(command, 'npm', 'unexpected host npm install');
-        assert.notEqual(command, 'git', 'SDK preparation must not fetch Git');
-        return actualSpawn(command, args.map(remap), options);
-    }));
-    syncBuiltinESMExports();
-    t.after(() => {
-        for (const mock of mocks) mock.mock.restore();
-        syncBuiltinESMExports();
-    });
-    return { ...f, installs, calls, alternateGlobal };
+            const nodeModules = path.join(payloadDir, 'node_modules');
+            const lock = { name: pkg.name || 'x', lockfileVersion: 3, requires: true, packages: {} };
+            for (const [name] of Object.entries(pkg.dependencies)) {
+                if (['mcp-sdk', 'achillesAgentLib', 'ploinky-agent-lib'].includes(name)) continue;
+                fs.mkdirSync(path.join(nodeModules, name), { recursive: true });
+                fs.writeFileSync(path.join(nodeModules, name, 'package.json'), JSON.stringify({ name, version: '1.0.0' }));
+                lock.packages[`node_modules/${name}`] = { version: '1.0.0', resolved: `https://registry.example/${name}/-/${name}-1.0.0.tgz` };
+            }
+            fs.writeFileSync(path.join(nodeModules, '.package-lock.json'), JSON.stringify(lock, null, 2));
+            fs.rmSync(path.join(nodeModules, 'mcp-sdk'), { recursive: true, force: true });
+            if (extra) extra(payloadDir);
+            if (during) during(payloadDir);
+        },
+    };
 }
 
-function agentPackage(root, pkg) {
-    const filename = path.join(root, 'agent-package.json');
-    fs.writeFileSync(filename, JSON.stringify(pkg));
-    return filename;
+function publishedObjects(store) {
+    let names = [];
+    try { names = fs.readdirSync(store.paths.objects); } catch { return []; }
+    return names.filter((name) => fs.existsSync(path.join(store.paths.objects, name, 'complete.json')));
 }
 
-test('lifecycle commands reuse unchanged manifests and install changed manifests', (t) => {
-    let fail = false;
-    const f = boxEnvironment(t, { onInstall() { if (fail) throw new Error('fixture npm failed'); } });
-    const options = { ...prepareOptions, repoName: 'refresh', agentName: 'agent',
-        agentPackagePath: agentPackage(f.root, { dependencies: { example: '^1.0.0' } }) };
-    withDependencyRefresh('start', () => {
-        assert.equal(cache.prepareAgentCache(options).operation, 'install');
-        assert.equal(cache.prepareAgentCache(options).operation, 'install');
-        assert.equal(f.installs.length, 1, 'first install must not be followed by update');
-    });
-    const installed = cache.getAgentCachePath('refresh', 'agent', runtimeKey);
-    const sentinel = path.join(installed, 'node_modules', 'retained.txt');
-    fs.writeFileSync(sentinel, 'existing installed tree');
-    for (const command of ['enable', 'reinstall', 'start']) {
-        withDependencyRefresh(command, () => {
-            assert.equal(cache.prepareAgentCache(options).reused, true);
-            assert.equal(fs.readFileSync(sentinel, 'utf8'), 'existing installed tree');
-        });
-    }
-    assert.deepEqual(f.installs.map(entry => entry.operation), ['install']);
-    assert.equal(cache.inspectAgentCache(options).valid, true);
-    fs.writeFileSync(options.agentPackagePath, JSON.stringify({ dependencies: { example: '^2.0.0' } }));
-    fail = true;
-    withDependencyRefresh('start', () => {
-        assert.throws(() => cache.prepareAgentCache(options), /fixture npm failed/);
-        assert.equal(cache.readStamp(installed), null);
-        fail = false;
-        assert.equal(cache.prepareAgentCache(options).operation, 'install');
-    });
-    assert.equal(cache.inspectAgentCache(options).valid, true);
-});
-
-test('canonical legacy and immutable SDK declarations are excluded from every npm dependency field', (t) => {
+test('canonical #main and exact-commit SDK declarations are excluded from every npm dependency field', (t) => {
     const { bundle } = fixture(t);
     for (const spec of [
         'git+https://github.com/AssistOS-AI/MCPSDK.git#main',
@@ -215,113 +169,6 @@ test('missing, mismatched and tampered image bundles cannot become an SDK source
     assert.throws(() => activeBoxMcpSdkBundle({ insideBox: true, sourceRoot: f.sourceRoot, lockPath: otherLock }), /does not match.*lock/);
     fs.writeFileSync(path.join(f.sourceRoot, 'index.js'), 'tampered\n');
     assert.throws(() => activeBoxMcpSdkBundle({ insideBox: true, sourceRoot: f.sourceRoot, lockPath }), /fingerprint/);
-});
-
-test('SDK-only and test-script-only Box agents prepare without an npm or Git invocation', (t) => {
-    const f = boxEnvironment(t);
-    for (const [agentName, pkg] of [
-        ['plain', null],
-        ['test-script', { scripts: { test: 'node --test' } }],
-        ['sdk-declaration', { dependencies: { 'mcp-sdk': 'github:AssistOS-AI/MCPSDK#main' } }],
-    ]) {
-        const agentPackagePath = pkg ? agentPackage(f.root, pkg) : null;
-        const options = { ...prepareOptions, repoName: 'core-only', agentName, agentPackagePath, force: true };
-        const prepared = cache.prepareAgentCache(options);
-        assert.equal(prepared.reused, false);
-        assert.equal(cache.inspectAgentCache(options).valid, true);
-        assert.equal(cache.verifyAgentCache(options), path.join(prepared.cachePath, 'node_modules'));
-        assert.deepEqual(prepared.stamp.mcpSdk, boxMcpSdkStampSection(f.bundle));
-    }
-    assert.equal(f.installs.length, 0);
-    assert.equal(f.calls.some(({ command }) => ['podman', 'git', 'npm'].includes(command)), false);
-    assert.equal(installer.readGlobalDepsPackage().dependencies['mcp-sdk'], undefined, 'moving-Git updater sees no Box-provided dependency');
-});
-
-test('other dependencies still install and the image SDK is restored after npm pruning', (t) => {
-    const f = boxEnvironment(t);
-    const options = {
-        ...prepareOptions, repoName: 'with-deps', agentName: 'agent', force: true,
-        agentPackagePath: agentPackage(f.root, {
-            dependencies: { 'mcp-sdk': 'github:AssistOS-AI/MCPSDK#main', example: '1.0.0' },
-            scripts: { postinstall: 'node setup.js' },
-        }),
-    };
-    const prepared = cache.prepareAgentCache(options);
-    assert.equal(f.installs.length, 1);
-    assert.deepEqual(f.installs[0].pkg.dependencies, {
-        example: '1.0.0', 'mcp-sdk': 'file:.ploinky-provided/node_modules/mcp-sdk',
-        achillesAgentLib: 'file:/opt/ploinky-agentlib',
-        'ploinky-agent-lib': 'file:/opt/ploinky-agentlib',
-    });
-    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(prepared.cachePath, 'package.json'), 'utf8')).dependencies, { example: '1.0.0' });
-    assert.equal(f.installs[0].pkg.scripts.postinstall, 'node setup.js');
-    assert.equal(cache.inspectAgentCache(options).valid, true);
-    assert.equal(boxMcpSdkCacheProblem(prepared.cachePath, prepared.stamp, f.bundle), '');
-    assert.equal(validateMcpSdkBundle({ sourceRoot: f.sourceRoot }).contentSha256, f.bundle.contentSha256);
-});
-
-test('a nested AgentLib produced during npm uses the selected source before receiving a cache stamp', (t) => {
-    const f = boxEnvironment(t, {
-        onInstall(installPath) {
-            const duplicate = path.join(installPath, 'node_modules', 'consumer', 'node_modules', 'ploinky-agent-lib');
-            fs.mkdirSync(duplicate, { recursive: true });
-            fs.writeFileSync(path.join(duplicate, 'package.json'), JSON.stringify({ name: 'ploinky-agent-lib' }));
-        },
-    });
-    const options = {
-        ...prepareOptions, repoName: 'duplicate-agentlib', agentName: 'agent', force: true,
-        agentPackagePath: agentPackage(f.root, { dependencies: { consumer: '1.0.0' } }),
-    };
-    const prepared = cache.prepareAgentCache(options);
-    const duplicate = path.join(prepared.cachePath, 'node_modules', 'consumer', 'node_modules', 'ploinky-agent-lib');
-    assert.equal(fs.lstatSync(duplicate).isSymbolicLink(), true);
-    assert.equal(fs.readlinkSync(duplicate), '/opt/ploinky-agentlib');
-    assert.equal(cache.inspectAgentCache(options).valid, true);
-    assert.ok(cache.readStamp(prepared.cachePath));
-});
-
-test('cache admission rejects an inserted nested AgentLib until link refresh repairs it', (t) => {
-    const f = boxEnvironment(t);
-    const options = { ...prepareOptions, repoName: 'tampered-agentlib', agentName: 'agent' };
-    const prepared = cache.prepareAgentCache(options);
-    const originalStamp = fs.readFileSync(cache.stampPath(prepared.cachePath));
-    const duplicate = path.join(prepared.cachePath, 'node_modules', 'consumer', 'node_modules', 'private-alias');
-    fs.mkdirSync(duplicate, { recursive: true });
-    fs.writeFileSync(path.join(duplicate, 'package.json'), JSON.stringify({ name: 'ploinky-agent-lib' }));
-    assert.equal(cache.inspectAgentCache(options).valid, false);
-    assert.throws(() => cache.verifyAgentCache(options), /copied package/);
-    assert.equal(fs.lstatSync(duplicate).isDirectory(), true);
-    assert.deepEqual(fs.readFileSync(cache.stampPath(prepared.cachePath)), originalStamp);
-    assert.equal(cache.prepareAgentCache(options).reused, true);
-    assert.equal(fs.readlinkSync(duplicate), '/opt/ploinky-agentlib');
-    assert.equal(cache.inspectAgentCache(options).valid, true);
-    assert.equal(f.installs.length, 0);
-});
-
-test('npm lifecycle scripts run even when no npm dependencies remain', (t) => {
-    const f = boxEnvironment(t);
-    assert.equal(needsNpmInstall({ scripts: { test: 'node --test' } }), false);
-    const prepared = cache.prepareAgentCache({
-        ...prepareOptions, repoName: 'lifecycle', agentName: 'agent', force: true,
-        agentPackagePath: agentPackage(f.root, { scripts: { prepare: 'node build.js' } }),
-    });
-    assert.equal(f.installs.length, 1);
-    assert.equal(f.installs[0].pkg.scripts.prepare, 'node build.js');
-    assert.equal(boxMcpSdkCacheProblem(prepared.cachePath, prepared.stamp, f.bundle), '');
-});
-
-test('adding an npm lifecycle script invalidates a previously skipped SDK-only cache', (t) => {
-    const f = boxEnvironment(t);
-    const agentPackagePath = agentPackage(f.root, { scripts: { test: 'node --test' } });
-    const options = { ...prepareOptions, repoName: 'script-change', agentName: 'agent', agentPackagePath };
-    cache.prepareAgentCache(options);
-    assert.equal(f.installs.length, 0);
-    agentPackage(f.root, { scripts: { test: 'node --test', prepare: 'node build.js' } });
-    assert.equal(cache.inspectAgentCache(options).valid, false);
-    const refreshed = cache.prepareAgentCache(options);
-    assert.equal(refreshed.reused, false);
-    assert.equal(f.installs.length, 1);
-    assert.equal(cache.inspectAgentCache(options).valid, true);
 });
 
 test('offline npm lifecycle imports use the image SDK even through a transitive Git dependency', (t) => {
@@ -376,86 +223,6 @@ test('offline npm lifecycle imports use the image SDK even through a transitive 
     assert.equal(boxMcpSdkCacheProblem(cachePath, { mcpSdk: boxMcpSdkStampSection(bundle) }, bundle), '');
 });
 
-test('a global dependency removed before an SDK-only rebuild is pruned without running npm', (t) => {
-    const f = boxEnvironment(t, {
-        globalPackage: { dependencies: { example: '1.0.0' } },
-        onInstall(installPath) {
-            const installed = path.join(installPath, 'node_modules', 'example');
-            fs.mkdirSync(installed, { recursive: true });
-            fs.writeFileSync(path.join(installed, 'package.json'), '{"name":"example","version":"1.0.0"}');
-        },
-    });
-    const first = cache.prepareGlobalCache(runtimeKey, { ...prepareOptions, force: true });
-    assert.equal(f.installs.length, 1);
-    assert.equal(fs.existsSync(path.join(first.cachePath, 'node_modules', 'example')), true);
-    fs.writeFileSync(f.alternateGlobal, JSON.stringify({ dependencies: { 'mcp-sdk': 'github:AssistOS-AI/MCPSDK#main' } }));
-    const rebuilt = cache.prepareGlobalCache(runtimeKey, prepareOptions);
-    assert.equal(rebuilt.reused, false);
-    assert.equal(f.installs.length, 1, 'SDK-only rebuild must not invoke npm');
-    assert.equal(fs.existsSync(path.join(first.cachePath, 'node_modules', 'example')), false);
-    assert.equal(boxMcpSdkCacheProblem(rebuilt.cachePath, rebuilt.stamp, f.bundle), '');
-});
-
-test('agent override and invalid image reject before any global npm install', (t) => {
-    const f = boxEnvironment(t, { globalPackage: { dependencies: { example: '1.0.0' } } });
-    const options = {
-        ...prepareOptions, repoName: 'rejected', agentName: 'agent', force: true,
-        agentPackagePath: agentPackage(f.root, { optionalDependencies: { 'mcp-sdk': 'github:AssistOS-AI/MCPSDK#other' } }),
-    };
-    assert.throws(() => cache.prepareAgentCache(options), /overrides 'mcp-sdk'/);
-    assert.equal(f.installs.length, 0);
-    fs.writeFileSync(path.join(f.sourceRoot, 'index.js'), 'tampered\n');
-    assert.throws(() => cache.prepareAgentCache({ ...options, agentPackagePath: null }), /fingerprint/);
-    assert.equal(f.installs.length, 0);
-});
-
-test('cache admission rejects stale stamps and altered bytes without repairing or restamping', (t) => {
-    boxEnvironment(t);
-    const options = { ...prepareOptions, repoName: 'admission', agentName: 'agent', force: true };
-    const prepared = cache.prepareAgentCache(options);
-    const originalStamp = fs.readFileSync(cache.stampPath(prepared.cachePath), 'utf8');
-    const copiedFile = path.join(prepared.cachePath, 'node_modules', 'mcp-sdk', 'index.js');
-    fs.writeFileSync(copiedFile, 'altered\n');
-    assert.equal(cache.inspectAgentCache(options).valid, false);
-    assert.throws(() => cache.verifyAgentCache(options), /fingerprint/);
-    assert.equal(fs.readFileSync(copiedFile, 'utf8'), 'altered\n');
-    assert.equal(fs.readFileSync(cache.stampPath(prepared.cachePath), 'utf8'), originalStamp);
-    const repaired = cache.prepareAgentCache(options);
-    const staleStamp = { ...repaired.stamp };
-    delete staleStamp.mcpSdk;
-    cache.writeStamp(prepared.cachePath, staleStamp);
-    assert.match(cache.inspectAgentCache(options).reason, /stamp identity/);
-    staleStamp.mcpSdk = { ...repaired.stamp.mcpSdk, repository: { ...repository, commit: 'a'.repeat(40) } };
-    cache.writeStamp(prepared.cachePath, staleStamp);
-    assert.match(cache.inspectAgentCache(options).reason, /stamp identity/);
-});
-
-test('tampering during npm fails before a fresh cache stamp can be written', (t) => {
-    let sourceRoot;
-    const f = boxEnvironment(t, {
-        onInstall() { fs.writeFileSync(path.join(sourceRoot, 'index.js'), 'changed during npm\n'); },
-    });
-    sourceRoot = f.sourceRoot;
-    const options = {
-        ...prepareOptions, repoName: 'race', agentName: 'agent', force: true,
-        agentPackagePath: agentPackage(f.root, { dependencies: { example: '1.0.0' } }),
-    };
-    assert.throws(() => cache.prepareAgentCache(options), /fingerprint/);
-    assert.equal(cache.readStamp(cache.getAgentCachePath(options.repoName, options.agentName, runtimeKey)), null);
-});
-
-test('non-Box manifests and installers retain their Git SDK dependency behavior', (t) => {
-    const f = boxEnvironment(t, { insideBox: false });
-    const pkg = { dependencies: { 'mcp-sdk': 'github:someone/alternate-sdk#branch' } };
-    assert.equal(withoutBoxMcpSdk(pkg, { bundle: null }), pkg);
-    assert.equal(installer.mergePackageJson({}, pkg).dependencies['mcp-sdk'], pkg.dependencies['mcp-sdk']);
-    const prepared = cache.prepareGlobalCache(runtimeKey, { ...prepareOptions, force: true });
-    assert.equal(f.installs.length, 1);
-    assert.equal(f.installs[0].pkg.dependencies['mcp-sdk'], 'git+https://github.com/AssistOS-AI/MCPSDK.git#main');
-    assert.equal(prepared.stamp.mcpSdk, undefined);
-    assert.equal(activeBoxMcpSdkBundle({ insideBox: false, sourceRoot: '/missing', lockPath: '/missing' }), null);
-});
-
 test('finalization rejects a different self-consistent package pretending to be the image SDK', (t) => {
     const { root, sourceRoot, bundle } = fixture(t);
     const cachePath = path.join(root, 'cache');
@@ -471,75 +238,150 @@ test('finalization rejects a different self-consistent package pretending to be 
     assert.equal(validateMcpSdkBundle({ sourceRoot }).contentSha256, bundle.contentSha256);
 });
 
-test('managed npm caches replace hoisted and nested AgentLib copies before admission', (t) => {
+test('Box SDK store build: an SDK-only agent publishes the validated image SDK without an installer run', (t) => {
+    const w = boxStore(t);
+    const installer = boxNpm();
+    for (const [registration, manifest] of [
+        ['plain', null],
+        ['test-script', { scripts: { test: 'node --test' } }],
+        ['sdk-declaration', { dependencies: { 'mcp-sdk': 'github:AssistOS-AI/MCPSDK#main' } }],
+    ]) {
+        const plan = w.plan(manifest, registration);
+        assert.equal(plan.npmRequired, false);
+        assert.equal(plan.installManifest.dependencies?.['mcp-sdk'], undefined, 'the bundled SDK never reaches npm or pins');
+        const built = w.store.ensureGeneration(w.lease, plan, { installer, consumer: CONSUMER });
+        assert.equal(built.status, 'built');
+        assert.equal(boxMcpSdkCacheProblem(built.payloadPath, { mcpSdk: boxMcpSdkStampSection(w.bundle) }, w.bundle), '');
+        assert.equal(w.store.validateObject(built.objectId, { inputKey: plan.inputKey }).valid, true);
+    }
+    assert.equal(installer.calls.length, 0);
+});
+
+test('Box SDK store build: other dependencies install through the provided SDK link and the image SDK is restored after npm pruning', (t) => {
+    const w = boxStore(t);
+    const installer = boxNpm();
+    const plan = w.plan({
+        dependencies: { 'mcp-sdk': 'github:AssistOS-AI/MCPSDK#main', example: '1.0.0' },
+        scripts: { postinstall: 'node setup.js' },
+    });
+    assert.equal(plan.npmRequired, true);
+    const built = w.store.ensureGeneration(w.lease, plan, { installer, consumer: CONSUMER });
+    assert.equal(installer.calls.length, 1);
+    assert.deepEqual(installer.calls[0].pkg.dependencies, {
+        example: '1.0.0', 'mcp-sdk': 'file:.ploinky-provided/node_modules/mcp-sdk',
+        achillesAgentLib: `file:${AGENTLIB_LINK}`,
+        'ploinky-agent-lib': `file:${AGENTLIB_LINK}`,
+    });
+    assert.equal(installer.calls[0].pkg.scripts.postinstall, 'node setup.js');
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(built.payloadPath, 'package.json'), 'utf8')).dependencies, { example: '1.0.0' });
+    assert.equal(fs.existsSync(path.join(built.payloadPath, '.ploinky-provided')), false);
+    assert.equal(fs.lstatSync(path.join(built.nodeModulesPath, 'mcp-sdk')).isDirectory(), true, 'a self-contained copy, not a link');
+    assert.equal(boxMcpSdkCacheProblem(built.payloadPath, { mcpSdk: boxMcpSdkStampSection(w.bundle) }, w.bundle), '');
+    assert.equal(validateMcpSdkBundle({ sourceRoot: w.sourceRoot }).contentSha256, w.bundle.contentSha256, 'the image bundle is never changed');
+});
+
+test('Box SDK store build: npm lifecycle scripts run even when no npm dependencies remain', (t) => {
+    const w = boxStore(t);
+    const installer = boxNpm();
+    const plan = w.plan({ scripts: { prepare: 'node build.js' } });
+    assert.equal(plan.npmRequired, true);
+    const built = w.store.ensureGeneration(w.lease, plan, { installer, consumer: CONSUMER });
+    assert.equal(installer.calls.length, 1);
+    assert.equal(installer.calls[0].pkg.scripts.prepare, 'node build.js');
+    assert.equal(boxMcpSdkCacheProblem(built.payloadPath, { mcpSdk: boxMcpSdkStampSection(w.bundle) }, w.bundle), '');
+});
+
+test('Box SDK store build: an agent override of the image SDK is rejected before any install', (t) => {
+    const w = boxStore(t);
+    for (const field of ['dependencies', 'optionalDependencies']) {
+        assert.throws(() => w.plan({ [field]: { 'mcp-sdk': 'github:AssistOS-AI/MCPSDK#other' } }), /overrides 'mcp-sdk'/);
+    }
+    assert.throws(() => w.plan({ overrides: { 'mcp-sdk': repository.url } }), /remove the override/);
+    assert.deepEqual(publishedObjects(w.store), []);
+});
+
+test('Box SDK store build: an image bundle tampered after planning never reaches npm or publication', (t) => {
+    const w = boxStore(t);
+    const installer = boxNpm();
+    const withNpm = w.plan({ dependencies: { example: '1.0.0' } });
+    const sdkOnly = w.plan(null, 'repo/sdk-only');
+    fs.writeFileSync(path.join(w.sourceRoot, 'index.js'), 'tampered\n');
+    assert.throws(() => activeBoxMcpSdkBundle({ insideBox: true, sourceRoot: w.sourceRoot, lockPath }), /fingerprint/,
+        'planning a new command rejects the tampered image bundle');
+    for (const plan of [withNpm, sdkOnly]) {
+        assert.throws(() => w.store.ensureGeneration(w.lease, plan, { installer, consumer: CONSUMER }),
+            (error) => error.code === 'PLOINKY_DEPS_BUILD_FAILED' && /fingerprint/.test(error.message));
+        assert.equal(w.store.readIndex(plan.inputKey), null);
+    }
+    assert.equal(installer.calls.length, 0);
+    assert.deepEqual(publishedObjects(w.store), []);
+});
+
+test('Box SDK store build: an image bundle changed while npm runs fails before a completion marker', (t) => {
+    const w = boxStore(t);
+    const installer = boxNpm({ during: () => fs.writeFileSync(path.join(w.sourceRoot, 'index.js'), 'changed during npm\n') });
+    const plan = w.plan({ dependencies: { example: '1.0.0' } });
+    assert.throws(() => w.store.ensureGeneration(w.lease, plan, { installer, consumer: CONSUMER }),
+        (error) => error.code === 'PLOINKY_DEPS_BUILD_FAILED' && /MCP SDK image bundle changed|fingerprint/.test(error.message));
+    assert.equal(installer.calls.length, 1, 'the retry rejects the changed bundle before npm');
+    assert.equal(w.store.readIndex(plan.inputKey), null);
+    assert.deepEqual(publishedObjects(w.store), []);
+});
+
+test('Box SDK store admission: altered SDK bytes in a published payload are rejected and rebuilt beside the untouched object', (t) => {
+    const w = boxStore(t);
+    const installer = boxNpm();
+    const plan = w.plan({ dependencies: { example: '1.0.0' } });
+    const first = w.store.ensureGeneration(w.lease, plan, { installer, consumer: CONSUMER });
+    const copied = path.join(first.nodeModulesPath, 'mcp-sdk', 'index.js');
+    fs.chmodSync(copied, 0o644);
+    fs.writeFileSync(copied, 'altered\n');
+    assert.deepEqual(w.store.validateObject(first.objectId, { inputKey: plan.inputKey }),
+        { valid: false, reason: 'installed tree hash mismatch' });
+    assert.match(boxMcpSdkCacheProblem(first.payloadPath, { mcpSdk: boxMcpSdkStampSection(w.bundle) }, w.bundle), /fingerprint|does not match/);
+    const second = w.store.ensureGeneration(w.lease, plan, { installer, consumer: CONSUMER });
+    assert.equal(second.status, 'repaired');
+    assert.notEqual(second.objectId, first.objectId);
+    assert.deepEqual(second.corruption, { objectId: first.objectId, reason: 'installed tree hash mismatch' });
+    assert.equal(fs.readFileSync(copied, 'utf8'), 'altered\n', 'the rejected object is never repaired in place');
+    assert.equal(boxMcpSdkCacheProblem(second.payloadPath, { mcpSdk: boxMcpSdkStampSection(w.bundle) }, w.bundle), '');
+});
+
+test('Box SDK store build: hoisted and nested AgentLib copies become the selected link; an escaping link publishes nothing', (t) => {
+    const w = boxStore(t);
     const relativeCopies = ['ploinky-agent-lib', '@vendor/consumer/node_modules/ploinky-agent-lib'];
-    const f = boxEnvironment(t, {
-        onInstall(installPath) {
+    const installer = boxNpm({
+        extra(payloadDir) {
             for (const relative of relativeCopies) {
-                const directory = path.join(installPath, 'node_modules', relative);
+                const directory = path.join(payloadDir, 'node_modules', relative);
                 fs.mkdirSync(directory, { recursive: true });
                 fs.writeFileSync(path.join(directory, 'package.json'), '{"name":"ploinky-agent-lib"}');
                 fs.writeFileSync(path.join(directory, 'private-copy'), 'must be removed');
             }
         },
     });
-    const options = { ...prepareOptions, repoName: 'agentlib-aliases', agentName: 'agent',
-        agentPackagePath: agentPackage(f.root, { dependencies: { consumer: '1.0.0' } }) };
-    const prepared = cache.prepareAgentCache({ ...options, force: true });
-    assert.equal(f.installs.length, 1);
+    const plan = w.plan({ dependencies: { consumer: '1.0.0' } });
+    const built = w.store.ensureGeneration(w.lease, plan, { installer, consumer: CONSUMER });
     for (const relative of relativeCopies) {
-        const directory = path.join(prepared.cachePath, 'node_modules', relative);
+        const directory = path.join(built.nodeModulesPath, relative);
         assert.equal(fs.lstatSync(directory).isSymbolicLink(), true);
-        assert.equal(fs.readlinkSync(directory), '/opt/ploinky-agentlib');
+        assert.equal(fs.readlinkSync(directory), AGENTLIB_LINK);
     }
-    assert.equal(cache.inspectAgentCache(options).valid, true);
-
-    const nested = path.join(prepared.cachePath, 'node_modules', relativeCopies[1]);
-    fs.unlinkSync(nested);
-    fs.mkdirSync(nested);
-    const stampBefore = fs.readFileSync(cache.stampPath(prepared.cachePath), 'utf8');
-    assert.equal(cache.inspectAgentCache(options).valid, false);
-    assert.throws(() => cache.verifyAgentCache(options), /copied package/);
-    assert.equal(fs.lstatSync(nested).isDirectory(), true, 'admission does not repair');
-    assert.equal(fs.readFileSync(cache.stampPath(prepared.cachePath), 'utf8'), stampBefore);
-    const repaired = cache.prepareAgentCache(options);
-    assert.equal(repaired.reused, true);
-    assert.equal(f.installs.length, 1, 'link repair does not rerun npm');
-    assert.equal(fs.readlinkSync(nested), '/opt/ploinky-agentlib');
-    assert.equal(cache.inspectAgentCache(options).valid, true);
+    const outside = path.join(w.root, 'external-package');
+    fs.mkdirSync(path.join(outside, 'node_modules', 'ploinky-agent-lib'), { recursive: true });
+    const escaping = boxNpm({ extra: (payloadDir) => fs.symlinkSync(outside, path.join(payloadDir, 'node_modules', 'external-package')) });
+    const unsafe = w.plan({ dependencies: { other: '1.0.0' } }, 'repo/unsafe');
+    assert.throws(() => w.store.ensureGeneration(w.lease, unsafe, { installer: escaping, consumer: CONSUMER }),
+        (error) => error.code === 'PLOINKY_DEPS_BUILD_FAILED');
+    assert.equal(w.store.readIndex(unsafe.inputKey), null);
+    assert.deepEqual(publishedObjects(w.store), [built.objectId]);
 });
 
-test('legacy AgentLib adapters refresh both cache stamps without reinstalling npm', (t) => {
-    const f = boxEnvironment(t);
-    const options = { ...prepareOptions, repoName: 'legacy-agentlib', agentName: 'agent' };
-    const prepared = cache.prepareAgentCache({ ...options, force: true });
-    for (const directory of [cache.getGlobalCachePath(runtimeKey), prepared.cachePath]) {
-        const stamp = cache.readStamp(directory);
-        delete stamp.agentLib.adapterSchema;
-        cache.writeStamp(directory, stamp);
-        fs.unlinkSync(path.join(directory, 'node_modules', 'ploinky-agent-lib'));
-    }
-    assert.match(cache.inspectAgentCache(options).reason, /adapterSchema changed/);
-    const repaired = cache.prepareAgentCache(options);
-    assert.equal(repaired.reused, true);
-    assert.equal(f.installs.length, 0);
-    for (const directory of [cache.getGlobalCachePath(runtimeKey), prepared.cachePath]) {
-        assert.equal(cache.readStamp(directory).agentLib.adapterSchema, 1);
-        assert.equal(fs.readlinkSync(path.join(directory, 'node_modules', 'ploinky-agent-lib')), '/opt/ploinky-agentlib');
-    }
-    assert.equal(cache.inspectAgentCache(options).valid, true);
-});
-
-test('an unsafe nested dependency link cannot retain a valid cache stamp after failed repair', (t) => {
-    const f = boxEnvironment(t);
-    const options = { ...prepareOptions, repoName: 'unsafe-agentlib', agentName: 'agent' };
-    const prepared = cache.prepareAgentCache({ ...options, force: true });
-    const outside = path.join(f.root, 'external-package');
-    const privateLibrary = path.join(outside, 'node_modules', 'ploinky-agent-lib');
-    fs.mkdirSync(privateLibrary, { recursive: true });
-    fs.symlinkSync(outside, path.join(prepared.cachePath, 'node_modules', 'external-package'));
-    assert.equal(cache.inspectAgentCache(options).valid, false);
-    assert.throws(() => cache.prepareAgentCache(options), /AgentLib outside the owned cache/);
-    assert.equal(cache.readStamp(prepared.cachePath), null);
-    assert.equal(fs.lstatSync(privateLibrary).isDirectory(), true);
+test('non-Box manifests keep their Git SDK dependency and no image bundle is selected', () => {
+    const pkg = { dependencies: { 'mcp-sdk': 'github:someone/alternate-sdk#branch' } };
+    assert.equal(withoutBoxMcpSdk(pkg, { bundle: null }), pkg);
+    assert.equal(mergePackageJson({}, pkg).dependencies['mcp-sdk'], pkg.dependencies['mcp-sdk']);
+    assert.equal(activeBoxMcpSdkBundle({ insideBox: false, sourceRoot: '/missing', lockPath: '/missing' }), null);
+    assert.equal(needsNpmInstall({ scripts: { test: 'node --test' } }), false);
+    assert.equal(needsNpmInstall({ scripts: { prepare: 'node build.js' } }), true, 'npm lifecycle scripts still require npm');
 });

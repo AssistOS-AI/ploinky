@@ -113,16 +113,13 @@ import {
     isNoNodeRuntimeKey,
     NO_NODE_RUNTIME_KEY,
 } from '../../utils/dependencies/dependencyRuntimeKey.js';
-import { getAgentCachePath } from '../../utils/dependencies/dependencyCache.js';
 import {
     admittedDependencyRecord,
     noCacheDependencyRecord,
     prepareRuntimeDependencies,
     runtimeDependencyReuseProblem,
 } from '../../utils/dependencies/store/runtimeDependencies.mjs';
-import { DEPENDENCY_STORE_DIRNAME } from '../../utils/dependencies/store/objectStore.mjs';
 import { containerToolchainIdentity } from '../../utils/dependencies/store/installContract.mjs';
-import { DEPS_DIR } from '../../utils/config.js';
 import {
     agentLibCacheLinkProblem,
     ensureAgentLibCacheLink,
@@ -1298,48 +1295,6 @@ function managedAdoptionLlmPaths(llmStartup) {
         throw managedAdoptionMismatch(`LLM selected architecture state is unavailable: ${error?.message || error}`);
     }
     return Object.freeze({ ...llmStartup, modelDir, stateDir });
-}
-
-function resolveManagedAdoptionAgentCacheMount(record, repoName, agentName) {
-    const matches = new Map();
-    const storeObjects = path.join(path.resolve(DEPS_DIR), DEPENDENCY_STORE_DIRNAME, 'objects');
-    for (const bind of record?.config?.binds || []) {
-        const source = String(bind?.source || '').trim();
-        if (!source || path.basename(source) !== 'node_modules') continue;
-        const nodeModulesDir = path.resolve(source);
-        const payloadPath = path.dirname(nodeModulesDir);
-        // Immutable store layout: objects/<objectId>/payload/node_modules.
-        if (path.basename(payloadPath) === 'payload' && path.dirname(path.dirname(payloadPath)) === storeObjects) {
-            matches.set(payloadPath, Object.freeze({
-                layout: 'store',
-                objectId: path.basename(path.dirname(payloadPath)),
-                payloadPath,
-                nodeModulesDir,
-            }));
-            continue;
-        }
-        const cachePath = path.dirname(nodeModulesDir);
-        const runtimeKey = path.basename(cachePath);
-        let expectedCachePath;
-        try {
-            expectedCachePath = path.resolve(getAgentCachePath(repoName, agentName, runtimeKey));
-        } catch (_) {
-            continue;
-        }
-        if (cachePath !== expectedCachePath) continue;
-        // A legacy mount is a different generation: callers replace the
-        // runtime instead of adopting it.
-        matches.set(cachePath, Object.freeze({
-            layout: 'legacy',
-            cachePath,
-            nodeModulesDir,
-            runtimeKey,
-        }));
-    }
-    if (matches.size > 1) {
-        throw managedAdoptionMismatch('registered dependency mounts name more than one agent cache');
-    }
-    return matches.values().next().value || null;
 }
 
 /**
@@ -3872,7 +3827,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     }
 
     // Dependency trees are immutable store generations. A changed, missing,
-    // legacy or corrupt admitted generation (or a new rebuild token) replaces
+    // unrecorded or corrupt admitted generation (or a new rebuild token) replaces
     // the runtime; the mounted tree is never mutated. This precedes every
     // reuse path below: host/none early return, validation-only managed
     // adoption and prepared-lease reuse.
@@ -4745,7 +4700,6 @@ export {
     resolveHostPortFromRuntime,
     resolveImplicitAgentServerPort,
     resolvePublishedPortMappings,
-    resolveManagedAdoptionAgentCacheMount,
     containerDependencyReuseProblem,
     hasAdmittedDependencyMount,
     admittedRuntimeDependencyProblem,

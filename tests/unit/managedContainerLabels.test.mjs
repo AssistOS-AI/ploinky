@@ -20,7 +20,7 @@ import {
     buildInteractiveCommandCreateCommand,
 } from '../../cli/sandbox/docker/interactive.js';
 import { buildShellDetectionRunArgs } from '../../cli/sandbox/docker/shellDetection.js';
-import { buildContainerInstallRunArgs } from '../../cli/utils/dependencies/dependencyCache.js';
+import { buildContainerInstallRunArgs } from '../../cli/utils/dependencies/store/installers.mjs';
 import { buildContainerRuntimeKeyProbeRunArgs } from '../../cli/utils/dependencies/dependencyRuntimeKey.js';
 
 const managed = 'io.assistos.ploinky.managed=1';

@@ -3,7 +3,13 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { createContainerNpmInstaller, createHostNpmInstaller, containerInstallName } from '../../cli/utils/dependencies/store/installers.mjs';
+import {
+    buildContainerInstallRunArgs,
+    buildContainerInstallScript,
+    containerInstallName,
+    createContainerNpmInstaller,
+    createHostNpmInstaller,
+} from '../../cli/utils/dependencies/store/installers.mjs';
 import { buildHostNpmEnv, resolveHostNpmPolicy } from '../../cli/utils/dependencies/store/npmPolicy.mjs';
 import { hashInstalledTree } from '../../cli/utils/dependencies/store/treeHash.mjs';
 import {
@@ -97,6 +103,45 @@ test('dependency store installers: the container adapter runs the immutable imag
     assert.throws(() => createContainerNpmInstaller({ engine: 'podman', imageId: 'node:20' }), { code: 'PLOINKY_DEPS_IMAGE_IDENTITY_REQUIRED' });
 });
 
+test('dependency store installers: the container script disables audit/fund and emits a heartbeat', () => {
+    const script = buildContainerInstallScript({ installDir: '/install', heartbeatSeconds: 7 });
+    assert.match(script, /DEBIAN_FRONTEND/);
+    assert.match(script, /npm 'install' '--no-package-lock' '--no-audit' '--no-fund';/);
+    assert.match(script, /still running/);
+    assert.match(script, /sleep 7/);
+    assert.doesNotMatch(script, /--install-links/, 'plain installs copy local packages');
+});
+
+test('dependency store installers: the container install runs as root for non-root runtime images', () => {
+    const args = buildContainerInstallRunArgs({
+        cwd: '/tmp/payload',
+        image: IMAGE,
+        runtime: 'podman',
+        shellPath: '/bin/sh',
+        installScript: 'echo ok',
+    });
+
+    const userIndex = args.indexOf('--user');
+    const volumeIndex = args.indexOf('-v');
+    assert.notEqual(userIndex, -1);
+    assert.equal(args[userIndex + 1], '0:0');
+    assert.ok(userIndex < volumeIndex, 'user override should apply to the container run');
+    assert.deepEqual(args.slice(-3), [IMAGE, '-lc', 'echo ok']);
+    assert.equal(args.includes('--network'), false, 'installer must use the managed Podman network default');
+    assert.equal(args.some((arg) => String(arg).includes('slirp4netns')), false);
+});
+
+test('dependency store installers: the container install mounts the selected AgentLib read-only and preserves local package links', () => {
+    const args = buildContainerInstallRunArgs({
+        cwd: '/tmp/payload', image: IMAGE, runtime: 'podman', shellPath: '/bin/sh',
+        agentLibSourceDir: '/selected/source',
+        installScript: buildContainerInstallScript({ linkAgentLib: true }),
+    });
+    assert.ok(args.includes('/selected/source:/opt/ploinky-agentlib:ro'));
+    assert.equal(args.filter(arg => String(arg).includes(':/opt/ploinky-agentlib:')).length, 1);
+    assert.match(args.at(-1), /--install-links=false/);
+});
+
 test('dependency store tree: hashes paths, bytes, exec bit and symlink text without following links', (t) => {
     const root = tempRoot(t);
     const payload = path.join(root, 'payload');
@@ -118,6 +163,14 @@ test('dependency store tree: hashes paths, bytes, exec bit and symlink text with
     assert.equal(hash(), exec, 'timestamps are not identity');
     fs.mkdirSync(path.join(payload, 'node_modules', 'empty'));
     assert.notEqual(hash(), exec, 'empty directories are part of the tree');
+    const withEmpty = hash();
+    fs.writeFileSync(path.join(payload, 'node_modules', 'a', 'index.js'), 'two');
+    assert.notEqual(hash(), withEmpty, 'same-length byte changes change the tree hash');
+    fs.writeFileSync(path.join(payload, 'node_modules', 'a', 'index.js'), 'one');
+    assert.equal(hash(), withEmpty);
+    fs.rmSync(path.join(payload, 'node_modules', 'a', 'link'));
+    fs.symlinkSync('../a/index.js', path.join(payload, 'node_modules', 'a', 'link'));
+    assert.notEqual(hash(), withEmpty, 'symlink text is part of the tree hash');
     assert.throws(() => hashInstalledTree(payload, { approvedExternalTargets: [] }), { code: 'PLOINKY_DEPS_TREE_UNSAFE' });
     fs.symlinkSync('../../../outside', path.join(payload, 'node_modules', 'escape'));
     assert.throws(() => hashInstalledTree(payload, { approvedExternalTargets: [external] }), /escapes the payload/);

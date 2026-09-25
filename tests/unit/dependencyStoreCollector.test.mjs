@@ -26,8 +26,7 @@ function deadProcessIdentity() {
     return { pid: Number(child.stdout), processStart: 'gone', bootScope: readBootScope() };
 }
 
-function world(t) {
-    const root = tempRoot(t, 'depstore-gc-');
+function world(t, { root = tempRoot(t, 'depstore-gc-') } = {}) {
     const agentLib = makeAgentLib(root);
     const provider = hostProvider({ agentLib });
     const { lease, assertLease } = fakeLease();
@@ -155,14 +154,12 @@ test('dependency store collection retains precreation reservations even if the f
 
 test('dependency store collection does not infer absent containers from an empty registry and unavailable engine', (t) => {
     const w = world(t);
-    const legacy = path.join(w.root, '.ploinky', 'deps', 'agents', 'repo', 'agent', 'container-linux-x64-node20');
-    fs.mkdirSync(path.join(legacy, 'node_modules'), { recursive: true });
-    fs.writeFileSync(path.join(legacy, 'stamp.json'), '{"version":3}');
+    const orphan = w.build('reg-orphan', { kind: 'container', containerName: 'gone', engine: 'podman', key: 'o', containerId: 'd'.repeat(64) });
     w.state.engine = false;
     const report = w.collect();
     assert.match(report.skipped, /engine unavailable/);
-    assert.ok(fs.existsSync(legacy));
-    assert.deepEqual(report.legacyRemoved, []);
+    assert.deepEqual(report.removed, []);
+    assert.ok(fs.existsSync(orphan.payloadPath));
 });
 
 test('dependency store attachment pinning requires the lease and a new pin prevents any object rename', (t) => {
@@ -190,39 +187,40 @@ test('dependency store attachment pinning requires the lease and a new pin preve
     }
 });
 
-test('dependency store collection handles legacy and new coexistence conservatively', (t) => {
-    const w = world(t);
-    const deps = path.join(w.root, '.ploinky', 'deps');
-    const legacy = (relative, { stamp = true } = {}) => {
-        const dir = path.join(deps, relative);
-        fs.mkdirSync(path.join(dir, 'node_modules', 'x'), { recursive: true });
-        if (stamp) fs.writeFileSync(path.join(dir, 'stamp.json'), '{"version":3}');
-        return dir;
-    };
-    const unreferenced = legacy('global/container-linux-x64-glibc-node20');
-    const mounted = legacy('agents/repo/a/container-linux-x64-glibc-node20');
-    const orphanAgent = legacy('agents/repo/b/container-linux-x64-glibc-node20');
-    const unknown = legacy('agents/repo/c/weird', { stamp: false });
-    fs.writeFileSync(path.join(deps, 'agents', 'repo', 'user-notes.txt'), 'keep');
-    w.state.mounts.push(path.join(mounted, 'node_modules'));
-    w.state.agents.legacy_a = { type: 'agent', runtime: 'podman', config: { binds: [{ source: path.join(mounted, 'node_modules'), target: '/code/node_modules' }] } };
-    const current = w.build('reg-current', { kind: 'container', containerName: 'legacy_a', engine: 'podman', key: 'c' });
-    w.state.agents.current = admittedRecord(current);
+test('dependency store collection touches only the exact store objects, even when the workspace path contains a store segment', (t) => {
+    const outer = tempRoot(t, 'depstore-gc-segment-');
+    const root = path.join(outer, 'x', 'store', 'ws');
+    fs.mkdirSync(root, { recursive: true });
+    const w = world(t, { root });
+    const deps = path.join(root, '.ploinky', 'deps');
+    assert.equal(w.store.paths.objects, path.join(deps, 'store', 'objects'));
+    // Directories and files that are not store objects are unknown to Ploinky.
+    const foreign = [
+        path.join(deps, 'global', 'container-linux-x64-glibc-node20', 'node_modules', 'x', 'index.js'),
+        path.join(deps, 'agents', 'repo', 'a', 'container-linux-x64-glibc-node20', 'stamp.json'),
+        path.join(deps, 'store-old', 'objects', '12345678-1234-4234-8234-123456789abc', 'payload', 'kept.txt'),
+        path.join(deps, 'user-notes.txt'),
+        path.join(outer, 'x', 'store', 'objects', '12345678-1234-4234-8234-123456789abd', 'payload', 'kept.txt'),
+        path.join(outer, 'x', 'store', 'sibling.txt'),
+    ];
+    for (const file of foreign) {
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(file, 'keep');
+    }
+    const bound = w.build('reg-bound', { kind: 'container', containerName: 'bound', engine: 'podman', key: 'b', containerId: 'b'.repeat(64) });
+    w.state.agents.bound = { type: 'agent', runtime: 'podman', config: { binds: [{ source: bound.nodeModulesPath, target: '/code/node_modules', ro: true }] } };
+    const mounted = w.build('reg-mounted', { kind: 'container', containerName: 'mounted', engine: 'podman', key: 'm', containerId: 'c'.repeat(64) });
+    w.state.mounts.push(mounted.nodeModulesPath);
+    const orphan = w.build('reg-orphan', { kind: 'container', containerName: 'gone', engine: 'podman', key: 'o', containerId: 'd'.repeat(64) });
     const report = w.collect();
-    assert.equal(report.skipped, null);
-    assert.deepEqual(report.legacyRemoved.sort(), [unreferenced, orphanAgent].sort());
-    assert.ok(fs.existsSync(mounted), 'a legacy cache with an actual reader is retained');
-    assert.ok(fs.existsSync(unknown), 'unrecognized directories are preserved');
-    assert.ok(fs.existsSync(path.join(deps, 'agents', 'repo', 'user-notes.txt')), 'unknown files are preserved');
-    assert.equal(fs.existsSync(path.join(deps, 'agents', 'repo', 'b')), false, 'only now-empty parents are removed');
-    assert.ok(fs.existsSync(path.join(deps, 'agents', 'repo')), 'an ancestor with retained content stays');
-    assert.ok(fs.existsSync(current.payloadPath), 'the new namespace is untouched by legacy collection');
-    // A legacy host-sandbox runtime may still resolve through a source link: retain all legacy caches.
-    const again = legacy('global/bwrap-linux-x64-node20');
-    w.state.agents.legacy_host = { type: 'agent', runtime: 'seatbelt', config: { binds: [] } };
-    const second = w.collect();
-    assert.deepEqual(second.legacyRemoved, []);
-    assert.ok(fs.existsSync(again));
+    assert.equal(report.skipped, null, JSON.stringify(report));
+    assert.deepEqual(report.removed, [orphan.objectId], 'collection ran and removed only the unreferenced store object');
+    const retained = new Map(report.retained.map((item) => [item.objectId, item.reasons]));
+    assert.deepEqual(retained.get(bound.objectId), ['registry-bind']);
+    assert.deepEqual(retained.get(mounted.objectId), ['container-mount']);
+    assert.ok(fs.existsSync(bound.payloadPath) && fs.existsSync(mounted.payloadPath));
+    for (const file of foreign) assert.equal(fs.readFileSync(file, 'utf8'), 'keep', `${file} is preserved`);
+    assert.deepEqual(Object.keys(report).sort(), ['removed', 'retained', 'retainedBytesByReason', 'skipped']);
 });
 
 test('dependency store collection restores an object an attachment adopted just before deletion', (t) => {
@@ -278,7 +276,7 @@ test('dependency store collection inspects every engine container, including sto
     const depsDir = path.join(root, 'ws', '.ploinky', 'deps');
     fs.writeFileSync(engine.stateFile, JSON.stringify({ installs: [], containers: {
         running: { Id: 'a'.repeat(64), Name: 'running', Labels: { managed: '1' }, State: { Running: true }, Mounts: [{ Source: path.join(depsDir, 'store', 'objects', 'x', 'payload', 'node_modules') }] },
-        stopped: { Id: 'b'.repeat(64), Name: 'stopped', Labels: {}, State: { Running: false }, Mounts: [{ Source: path.join(depsDir, 'agents', 'r', 'a', 'k', 'node_modules') }, { Source: '/elsewhere' }] },
+        stopped: { Id: 'b'.repeat(64), Name: 'stopped', Labels: {}, State: { Running: false }, Mounts: [{ Source: path.join(depsDir, 'store', 'objects', 'y', 'payload', 'node_modules') }, { Source: '/elsewhere' }] },
     } }));
     const spawn = (command, args, options) => spawnSync(command, args, { ...options, env: { ...process.env, ...engine.env } });
     const inspect = engineMountInspector({ getRuntime: () => path.join(engine.binDir, 'podman'), depsDir, spawn });
@@ -286,8 +284,8 @@ test('dependency store collection inspects every engine container, including sto
     assert.equal(result.available, true);
     assert.equal(result.containers, 2);
     assert.deepEqual(result.mounts.sort(), [
-        path.join(depsDir, 'agents', 'r', 'a', 'k', 'node_modules'),
         path.join(depsDir, 'store', 'objects', 'x', 'payload', 'node_modules'),
+        path.join(depsDir, 'store', 'objects', 'y', 'payload', 'node_modules'),
     ].sort());
     const failingList = engineMountInspector({ getRuntime: () => 'podman', depsDir, spawn: () => ({ status: 125 }) })();
     assert.equal(failingList.available, false);

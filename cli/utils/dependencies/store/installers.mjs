@@ -13,10 +13,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-import { buildContainerInstallRunArgs, buildContainerInstallScript } from '../dependencyCache.js';
+import { AGENTLIB_STABLE_MOUNT_PATH } from '../../../../agentlib/contract.mjs';
+import { getRuntime, managedContainerLabelArgs } from '../../../sandbox/docker/common.js';
 import { detectShellForImage, SHELL_FALLBACK_DIRECT } from '../../../sandbox/docker/shellDetection.js';
 import { dependencyStoreError } from './canonical.mjs';
-import { buildHostNpmEnv, renderNpmrc } from './npmPolicy.mjs';
+import { CONTAINER_NPM_INSTALL_ARGS, buildHostNpmEnv, renderNpmrc } from './npmPolicy.mjs';
 
 export const DEFAULT_INSTALL_TIMEOUT_MS = 10 * 60 * 1000;
 export const DEFAULT_OUTPUT_LIMIT_BYTES = 64 * 1024;
@@ -125,6 +126,72 @@ export function createHostNpmInstaller({
             }
         },
     });
+}
+
+function shellQuote(value) {
+    return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Shell script the container installer runs in the payload directory: the
+ * image's npm with CONTAINER_NPM_INSTALL_ARGS (plus `--install-links=false`
+ * when provider packages are linked), a progress heartbeat, and GitHub SSH
+ * specs rewritten to HTTPS inside the disposable container.
+ */
+export function buildContainerInstallScript({ installDir = '/install', heartbeatSeconds = 30, linkBoxMcpSdk = false, linkAgentLib = false } = {}) {
+    const installLabel = shellQuote(installDir);
+    const npmArgs = [...CONTAINER_NPM_INSTALL_ARGS, ...(linkBoxMcpSdk || linkAgentLib ? ['--install-links=false'] : [])]
+        .map(shellQuote).join(' ');
+    const interval = Number.isFinite(Number(heartbeatSeconds)) && Number(heartbeatSeconds) > 0
+        ? String(Number(heartbeatSeconds))
+        : '30';
+    return [
+        'export DEBIAN_FRONTEND="${DEBIAN_FRONTEND:-noninteractive}"',
+        '&& (',
+        '  command -v git >/dev/null 2>&1 ||',
+        '  (command -v apk >/dev/null 2>&1 && apk update && apk add --no-cache git python3 make g++) ||',
+        '  (command -v apt-get >/dev/null 2>&1 && (apt-get update || true) && apt-get install -y git python3 make g++)',
+        ') 2>/dev/null',
+        '&& git config --global url.https://github.com/.insteadOf ssh://git@github.com/',
+        '&& git config --global --add url.https://github.com/.insteadOf git@github.com:',
+        '&& (',
+        `  printf '[deps-cache] npm install started in %s; native dependencies can take several minutes.\\n' ${installLabel};`,
+        `  (while true; do sleep ${interval}; printf '[deps-cache] npm install still running in %s at %s\\n' ${installLabel} "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; done) &`,
+        '  heartbeat_pid=$!;',
+        '  trap \'kill "$heartbeat_pid" 2>/dev/null || true\' EXIT INT TERM;',
+        `  GIT_CEILING_DIRECTORIES=${installLabel} npm ${npmArgs};`,
+        '  install_status=$?;',
+        '  kill "$heartbeat_pid" 2>/dev/null || true;',
+        '  wait "$heartbeat_pid" 2>/dev/null || true;',
+        '  exit "$install_status"',
+        ')',
+    ].join(' ');
+}
+
+/** Engine argv (after the engine binary) for one container install run. */
+export function buildContainerInstallRunArgs({
+    cwd,
+    image,
+    runtime,
+    shellPath,
+    installScript = buildContainerInstallScript(),
+    agentLibSourceDir = null,
+} = {}) {
+    const resolvedRuntime = runtime || getRuntime();
+    const volumeSuffix = resolvedRuntime === 'podman' ? ':z' : '';
+    return [
+        'run', '--rm', ...managedContainerLabelArgs(),
+        // Installation writes the object payload, so it must not inherit a
+        // non-root USER default from the runtime image.
+        '--user', '0:0',
+        '-v', `${cwd}:/install${volumeSuffix}`,
+        ...(agentLibSourceDir ? ['-v', `${agentLibSourceDir}:${AGENTLIB_STABLE_MOUNT_PATH}:ro`] : []),
+        '-w', '/install',
+        '--entrypoint', shellPath,
+        image,
+        '-lc',
+        installScript,
+    ];
 }
 
 export function containerInstallName(objectId) {

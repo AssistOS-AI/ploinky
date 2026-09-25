@@ -1,4 +1,4 @@
-// Explicit npm install policy for the immutable dependency cache.
+// Explicit npm install policy for the immutable dependency store.
 //
 // Host installs must not inherit ambient npm behavior silently. Inherited npm
 // configuration (environment `npm_config_*`, user and global npmrc) is split
@@ -23,8 +23,8 @@ import { dependencyStoreError } from './canonical.mjs';
 
 export const NPM_POLICY_SCHEMA = 1;
 export const NPM_BASE_INSTALL_ARGS = Object.freeze(['install', '--no-package-lock', '--no-audit', '--no-fund', '--update-notifier=false']);
-// The container installer runs the legacy install script, whose npm argv is
-// exactly this list (asserted against the script text in tests).
+// The container install script (buildContainerInstallScript in installers.mjs)
+// runs npm with exactly this argv (asserted against the script text in tests).
 export const CONTAINER_NPM_INSTALL_ARGS = Object.freeze(['install', '--no-package-lock', '--no-audit', '--no-fund']);
 const DEFAULT_REGISTRY = 'https://registry.npmjs.org/';
 

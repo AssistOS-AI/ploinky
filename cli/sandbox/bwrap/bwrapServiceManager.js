@@ -216,8 +216,8 @@ function bwrapNeedsDependencies(agentCodePath, manifest) {
 }
 
 /**
- * Obtain the sandbox dependency tree from the immutable store (never a
- * legacy cache) and publish this service's reader receipt before launch.
+ * Obtain the sandbox dependency tree from the immutable store and publish
+ * this service's reader receipt before launch.
  */
 function resolveBwrapAgentNodeModules({
     agentCodePath,
@@ -546,7 +546,7 @@ function buildBwrapArgs(options) {
         args.push('--bind', agentCodePath, '/code');
     }
 
-    // node_modules — read-only prepared cache (see ploinky/cli/utils/dependencies/dependencyCache.js).
+    // node_modules — read-only immutable store generation (cli/utils/dependencies/store).
     // Mounted at both paths so AgentServer.mjs (/Agent/server/) can resolve modules.
     args.push('--ro-bind', nodeModulesDir, '/code/node_modules');
     args.push('--ro-bind', nodeModulesDir, '/Agent/node_modules');
@@ -756,8 +756,8 @@ function buildFullEnvMap(agentName, manifest, profileConfig, workspacePath, repo
 /**
  * Build the shell command that runs inside the bwrap sandbox.
  *
- * No runtime `npm install` — dependencies are prepared on the host
- * via `prepareAgentCache` and mounted read-only at /code/node_modules.
+ * No runtime `npm install` — dependencies come from an immutable store
+ * generation (`prepareRuntimeDependencies`) mounted read-only at /code/node_modules.
  * Only manifest-declared install hooks run here.
  */
 function buildBwrapEntryCommand(agentName, manifest, profileConfig) {
@@ -877,7 +877,7 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     ensureAgentDataDirectory(agentHomeDir);
     syncAgentMcpConfig(containerName, path.resolve(agentPath), instanceName, { workDir: agentHomeDir });
 
-    // Prepare node dependencies via prepared cache (see dependencyCache.js).
+    // Resolve node dependencies from the immutable dependency store.
     // Non-Node agents (start-only, no package.json) still get an empty
     // node_modules so the mount resolves.
     const agentHasPackageJson = fs.existsSync(path.join(agentCodePath, 'package.json'));

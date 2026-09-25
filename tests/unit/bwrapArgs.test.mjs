@@ -151,7 +151,7 @@ test('global bwrap preserves writable project source and protects code and depen
     const root = tempDir();
     try {
         const agentCodePath = path.join(root, '.ploinky', 'repos', 'repo', 'agent');
-        const cacheRoot = path.join(root, '.ploinky', 'deps', 'agents', 'repo', 'agent', 'bwrap-linux-x64-node25');
+        const cacheRoot = path.join(root, '.ploinky', 'deps', 'store', 'objects', '11111111-2222-4333-8444-555555555555', 'payload');
         const nodeModulesDir = path.join(cacheRoot, 'node_modules');
         const sharedDir = path.join(root, '.data', 'shared');
         const agentLibPath = path.join(root, 'Agent');
@@ -292,7 +292,7 @@ test('buildBwrapArgs allows manifest volumes outside .ploinky', () => {
     const root = tempDir();
     try {
         const agentCodePath = path.join(root, '.ploinky', 'repos', 'repo', 'agent');
-        const nodeModulesDir = path.join(root, '.ploinky', 'deps', 'agents', 'repo', 'agent', 'bwrap-linux-x64-node25', 'node_modules');
+        const nodeModulesDir = path.join(root, '.ploinky', 'deps', 'store', 'objects', '11111111-2222-4333-8444-555555555555', 'payload', 'node_modules');
         const sharedDir = path.join(root, '.data', 'shared');
         const agentLibPath = path.join(root, 'Agent');
         const agentHomeDir = path.join(root, '.data', 'demo');
@@ -328,7 +328,7 @@ test('buildBwrapArgs enforces read-only manifest volume options', () => {
     const root = tempDir();
     try {
         const agentCodePath = path.join(root, '.ploinky', 'repos', 'repo', 'agent');
-        const nodeModulesDir = path.join(root, '.ploinky', 'deps', 'agents', 'repo', 'agent', 'bwrap-linux-x64-node25', 'node_modules');
+        const nodeModulesDir = path.join(root, '.ploinky', 'deps', 'store', 'objects', '11111111-2222-4333-8444-555555555555', 'payload', 'node_modules');
         const sharedDir = path.join(root, '.data', 'shared');
         const agentLibPath = path.join(root, 'Agent');
         const secretDir = path.join(root, '.data', 'secret');
@@ -449,7 +449,7 @@ test('buildBwrapArgs grants the selected AgentLib source read-only and shadows i
     const root = tempDir('bwrap-agentlib-');
     try {
         const agentCodePath = path.join(root, '.ploinky', 'repos', 'repo', 'agent');
-        const nodeModulesDir = path.join(root, '.ploinky', 'deps', 'agents', 'repo', 'agent', 'bwrap-linux-x64-node25', 'node_modules');
+        const nodeModulesDir = path.join(root, '.ploinky', 'deps', 'store', 'objects', '11111111-2222-4333-8444-555555555555', 'payload', 'node_modules');
         const sharedDir = path.join(root, '.data', 'shared');
         const agentLibPath = path.join(root, 'Agent');
         const agentHomeDir = path.join(root, '.data', 'demo');

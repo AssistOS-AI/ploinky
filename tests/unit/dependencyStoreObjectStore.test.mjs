@@ -201,6 +201,32 @@ test('dependency store: tree corruption with an unchanged hidden lock is detecte
     assert.equal(store.readIndex(plan.inputKey).previousObjectId, first.objectId);
 });
 
+test('dependency store: an object whose tree changed only in a symlink target is not admitted', (t) => {
+    const { store, lease, seedPlan } = setup(t);
+    const installer = fakeInstaller({
+        extra: ({ payloadDir }) => {
+            fs.mkdirSync(path.join(payloadDir, 'node_modules', '.bin'), { recursive: true });
+            fs.symlinkSync('../left-pad/index.js', path.join(payloadDir, 'node_modules', '.bin', 'left-pad'));
+        },
+    });
+    const plan = seedPlan();
+    const first = store.ensureGeneration(lease, plan, { installer, consumer: CONSUMER });
+    assert.equal(store.validateObject(first.objectId, { inputKey: plan.inputKey }).valid, true);
+    const link = path.join(first.nodeModulesPath, '.bin', 'left-pad');
+    const filesBefore = listFiles(first.payloadPath).filter((entry) => entry.stat.isFile()).map((entry) => entry.rel);
+    fs.rmSync(link);
+    // Still inside the payload, so only the recorded tree hash can notice.
+    fs.symlinkSync('../left-pad/package.json', link);
+    assert.deepEqual(listFiles(first.payloadPath).filter((entry) => entry.stat.isFile()).map((entry) => entry.rel), filesBefore);
+    assert.deepEqual(store.validateObject(first.objectId, { inputKey: plan.inputKey }),
+        { valid: false, reason: 'installed tree hash mismatch' });
+    const next = store.ensureGeneration(lease, plan, { installer, consumer: CONSUMER });
+    assert.equal(next.status, 'repaired');
+    assert.notEqual(next.objectId, first.objectId, 'the retargeted object is never handed out again');
+    assert.equal(fs.readlinkSync(path.join(next.nodeModulesPath, '.bin', 'left-pad')), '../left-pad/index.js');
+    assert.equal(fs.readlinkSync(link), '../left-pad/package.json', 'the rejected object is left untouched');
+});
+
 test('dependency store: a failed rebuild is bounded and leaves the index untouched', (t) => {
     const { store, lease, seedPlan } = setup(t);
     const plan = seedPlan();

@@ -12,9 +12,9 @@ import {
     readAgentPackageSource,
     seedCopyEligibility,
 } from '../../cli/utils/dependencies/store/installContract.mjs';
-import { NPM_BASE_INSTALL_ARGS, containerNpmPolicy, resolveHostNpmPolicy } from '../../cli/utils/dependencies/store/npmPolicy.mjs';
+import { CONTAINER_NPM_INSTALL_ARGS, NPM_BASE_INSTALL_ARGS, containerNpmPolicy, resolveHostNpmPolicy } from '../../cli/utils/dependencies/store/npmPolicy.mjs';
 import { buildPin, collectGitInputs, PIN_VERIFICATION } from '../../cli/utils/dependencies/store/gitPins.mjs';
-import { NPM_INSTALL_ARGS, buildContainerInstallScript } from '../../cli/utils/dependencies/dependencyCache.js';
+import { buildContainerInstallScript } from '../../cli/utils/dependencies/store/installers.mjs';
 import * as dependencyStore from '../../cli/utils/dependencies/store/index.mjs';
 import {
     containerProvider,
@@ -223,10 +223,11 @@ test('dependency store keys: host toolchain and explicit npm policy are keyed; c
 test('dependency store keys: container npm policy records the argv the container script actually runs', () => {
     const policy = containerNpmPolicy();
     assert.equal(policy.source, 'image');
-    assert.deepEqual(policy.args, NPM_INSTALL_ARGS);
+    assert.deepEqual(CONTAINER_NPM_INSTALL_ARGS, ['install', '--no-package-lock', '--no-audit', '--no-fund']);
+    assert.deepEqual(policy.args, CONTAINER_NPM_INSTALL_ARGS);
     const script = buildContainerInstallScript();
     assert.ok(script.includes(`npm ${policy.args.map((arg) => `'${arg}'`).join(' ')};`), script);
-    assert.deepEqual(NPM_BASE_INSTALL_ARGS, [...NPM_INSTALL_ARGS, '--update-notifier=false'], 'host argv = legacy argv + disabled notifier');
+    assert.deepEqual(NPM_BASE_INSTALL_ARGS, [...CONTAINER_NPM_INSTALL_ARGS, '--update-notifier=false'], 'host argv = container argv + disabled notifier');
 });
 
 test('dependency store keys: remote-verified pins change keys; observed-at-install and changed specs do not', (t) => {

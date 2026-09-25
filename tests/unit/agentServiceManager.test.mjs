@@ -17,12 +17,9 @@ import {
     isGenerationCapabilityRuntimeEffective,
     restartGenerationCapabilityRuntime,
     replaceRuntimeRouterEnvFlags,
-    resolveManagedAdoptionAgentCacheMount,
     stripReservedAndRestoreRuntimeRouterEnvFlags,
 } from '../../cli/sandbox/docker/agentServiceManager.js';
 import { PROBE_CONTROL_CONTAINER_ROOT } from '../../cli/sandbox/docker/healthProbes.js';
-import { getAgentCachePath } from '../../cli/utils/dependencies/dependencyCache.js';
-import { DEPS_DIR } from '../../cli/utils/config.js';
 import { buildRouterEndpoint } from '../../cli/sandbox/routerPort.js';
 import { BOX_MARKER_CONTENT } from '../../ploinky-box/constants.mjs';
 
@@ -606,57 +603,6 @@ test('service startup passes its platform adapter through a private lock-bound h
     assert.equal((service.match(/createNetworkLifecycleAdapter\(\{ runtime \}\)/g) || []).length, 1);
 });
 
-test('managed adoption derives one exact dependency runtime key from registered cache mounts', () => {
-    const repoName = 'repo';
-    const agentName = 'agent';
-    const runtimeKey = 'container-linux-arm64-glibc-node22';
-    const cachePath = getAgentCachePath(repoName, agentName, runtimeKey);
-    const mountedNodeModules = path.join(cachePath, 'node_modules');
-    const record = {
-        config: {
-            binds: [
-                { source: mountedNodeModules, target: '/code/node_modules', ro: true },
-                { source: mountedNodeModules, target: '/Agent/node_modules', ro: true },
-                { source: '/tmp/unrelated/node_modules', target: '/unrelated', ro: true },
-            ],
-        },
-    };
-
-    assert.deepEqual(resolveManagedAdoptionAgentCacheMount(record, repoName, agentName), {
-        layout: 'legacy',
-        cachePath,
-        nodeModulesDir: mountedNodeModules,
-        runtimeKey,
-    });
-    // Immutable store payloads are recognized as their own layout; a legacy
-    // mount is reported as legacy so callers replace instead of adopting.
-    const objectId = '11111111-2222-4333-8444-555555555555';
-    const payloadPath = path.join(DEPS_DIR, 'store', 'objects', objectId, 'payload');
-    assert.deepEqual(resolveManagedAdoptionAgentCacheMount({
-        config: { binds: [{ source: path.join(payloadPath, 'node_modules'), target: '/code/node_modules', ro: true }] },
-    }, repoName, agentName), {
-        layout: 'store',
-        objectId,
-        payloadPath,
-        nodeModulesDir: path.join(payloadPath, 'node_modules'),
-    });
-    assert.equal(resolveManagedAdoptionAgentCacheMount({ config: { binds: [] } }, repoName, agentName), null);
-
-    const secondRuntimeKey = 'container-linux-arm64-musl-node22';
-    assert.throws(() => resolveManagedAdoptionAgentCacheMount({
-        config: {
-            binds: [
-                { source: mountedNodeModules, target: mountedNodeModules, ro: true },
-                {
-                    source: path.join(getAgentCachePath(repoName, agentName, secondRuntimeKey), 'node_modules'),
-                    target: '/duplicate',
-                    ro: true,
-                },
-            ],
-        },
-    }, repoName, agentName), /more than one agent cache/);
-});
-
 test('healthy managed reuse is validation-only while replacement remains an explicit transaction', () => {
     const source = fs.readFileSync(new URL('../../cli/sandbox/docker/agentServiceManager.js', import.meta.url), 'utf8');
     assert.match(source, /adoptManagedRuntimeOnly = !managedReconciliationPreparationLease/);
@@ -672,7 +618,6 @@ test('healthy managed reuse is validation-only while replacement remains an expl
     // Adoption validates the admitted immutable generation read-only; only a
     // non-adopting launch resolves (or builds) a generation from the store.
     assert.match(source, /if \(adoptManagedRuntimeOnly\) \{\s*const problem = containerDependencyReuseProblem\([\s\S]*\} else if \(dependencyPlan\.prepare\) \{\s*preparedDependencies = prepareRuntimeDependencies\(/);
-    assert.doesNotMatch(source, /prepareAgentCache\(|inspectAgentCache\(/, 'legacy caches are never prepared for runtimes');
     assert.match(source, /if \(adoptManagedRuntimeOnly\) \{\s*requireManagedAdoptionDirectory\(agentHomeDir[\s\S]*assertManagedAdoptionMcpConfig[\s\S]*\} else \{[\s\S]*syncAgentMcpConfig/);
     assert.match(source, /if \(adoptManagedRuntimeOnly\) \{[\s\S]*imageExists\(ROUTER_AUTHORITY_HELPER_IMAGE[\s\S]*imageExists\(image[\s\S]*\} else \{\s*ensureImagePresent\(ROUTER_AUTHORITY_HELPER_IMAGE/);
     const adoptionReturnStart = source.indexOf('if (adoptManagedRuntimeOnly) {', source.indexOf('started = startAgentContainer'));

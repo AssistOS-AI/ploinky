@@ -8,9 +8,8 @@
 //   { schema: 1, mode: 'store', family, runtimeKey, imageId, inputKey,
 //     generationId, objectId, payloadPath, nodeModulesPath }
 //   { schema: 1, mode: 'none', reason, family, runtimeKey?, imageId? }
-// Records without it are legacy: a legacy cache mount is a different
-// generation (replacement, never adoption), and legacy caches are never
-// prepared, repaired or deleted here.
+// A runtime record without a current dependency record is 'unknown': when the
+// runtime needs dependencies it is replaced, never adopted or attached to.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -42,7 +41,7 @@ import {
 } from './installContract.mjs';
 import { containerNpmPolicy, defaultNpmConfigSources, resolveHostNpmPolicy } from './npmPolicy.mjs';
 import { createContainerNpmInstaller, createHostNpmInstaller } from './installers.mjs';
-import { createCacheStore, DEPENDENCY_STORE_DIRNAME } from './objectStore.mjs';
+import { createCacheStore } from './objectStore.mjs';
 import { readBootScope } from './receipts.mjs';
 
 export const DEPENDENCY_RECORD_SCHEMA = 1;
@@ -339,25 +338,10 @@ export function settleDependencyRebuildRequest(registration, token, { lease = nu
     }
 }
 
-function legacyCacheMount(record) {
-    for (const bind of record?.config?.binds || []) {
-        const source = String(bind?.source || '');
-        if (path.basename(source) !== 'node_modules') continue;
-        const resolved = path.resolve(source);
-        const deps = path.resolve(DEPS_DIR);
-        if (resolved.startsWith(`${deps}${path.sep}`) && !resolved.startsWith(`${path.join(deps, DEPENDENCY_STORE_DIRNAME)}${path.sep}`)) {
-            return resolved;
-        }
-    }
-    return null;
-}
-
 /** The dependency state an admitted runtime actually uses. */
 export function admittedDependencyRecord(record) {
     const dependencies = record?.dependencies;
     if (dependencies?.schema === DEPENDENCY_RECORD_SCHEMA && ['store', 'none'].includes(dependencies.mode)) return dependencies;
-    const legacy = legacyCacheMount(record);
-    if (legacy) return { mode: 'legacy', nodeModulesPath: legacy };
     return { mode: 'unknown' };
 }
 
@@ -390,10 +374,9 @@ export function storeGenerationReuseProblem(admitted, desiredInputKey, deps = {}
 export function runtimeDependencyReuseProblem(input, deps = {}) {
     const s = seams(deps);
     const admitted = admittedDependencyRecord(input.record);
-    if (!input.needsDependencies) {
-        return admitted.mode === 'store' || admitted.mode === 'legacy' ? 'runtime no longer needs its dependency cache' : '';
-    }
-    if (admitted.mode === 'legacy') return 'admitted runtime mounts a legacy dependency cache';
+    // A runtime that needs no dependencies mounts no store generation; only a
+    // store generation it no longer needs forces replacement.
+    if (!input.needsDependencies) return admitted.mode === 'store' ? 'runtime no longer needs its dependency cache' : '';
     if (admitted.mode === 'unknown') return 'admitted runtime has no dependency generation record';
     let runtimeKey = admitted.runtimeKey;
     let imageId = null;
@@ -452,7 +435,8 @@ export function attachAdmittedDependencies(record, { consumer, lease = null }, d
             held.release();
         }
     }
-    if (admitted.mode === 'legacy') return { nodeModulesPath: admitted.nodeModulesPath, release() { return false; }, receipt: null };
+    // No store generation: the caller uses its no-dependency path or asks for
+    // a restart; nothing unrecorded is ever attached.
     return null;
 }
 

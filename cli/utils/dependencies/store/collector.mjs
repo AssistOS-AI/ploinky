@@ -1,10 +1,12 @@
-// Conservative collection of immutable dependency objects and recognized
-// legacy caches. Runs only after a successful admission, under the held
-// workspace mutation lease, and never on TTL, age or disk pressure.
+// Conservative collection of immutable dependency objects under
+// `.ploinky/deps/store/objects`. Runs only after a successful admission, under
+// the held workspace mutation lease, and never on TTL, age or disk pressure.
+// Nothing outside the store's objects directory is ever removed: other files
+// under `.ploinky/deps` are unknown to Ploinky and preserved.
 //
 // Root set (anything here is retained):
 //   - admitted selections: every registry record's `dependencies` and every
-//     registry bind into an object (running, stopped or legacy runtimes);
+//     registry bind into an object (running or stopped runtimes);
 //   - desired selections: objects built for a pending/failed rebuild request;
 //   - needed seeds: every seed object that is the current index target;
 //   - durable runtime candidates (`.ploinky/run/runtime-candidates`);
@@ -23,10 +25,10 @@ import { spawnSync } from 'node:child_process';
 
 import { AGENTS_FILE, DEPS_DIR, PLOINKY_WORKSPACE_ROOT } from '../../config.js';
 import { assertWorkspaceMutationLease } from '../../runtime/maintenanceLocks.js';
-import { getRuntime } from '../../../sandbox/docker/common.js';
+import { probeContainerRuntime } from '../../../sandbox/docker/common.js';
 import { readEdgeRoutingSelection } from '../../../sandbox/edgeGeneration.js';
 import { dependencyStoreError } from './canonical.mjs';
-import { DEPENDENCY_STORE_DIRNAME, OBJECT_OWNER, createCacheStore } from './objectStore.mjs';
+import { OBJECT_OWNER, createCacheStore } from './objectStore.mjs';
 
 const OBJECT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -132,13 +134,13 @@ function edgeSettled({ readEdgeState }) {
 }
 
 /**
- * Collect proven-unreferenced objects and recognized legacy caches.
+ * Collect proven-unreferenced store objects.
  *
  * @param {{ lease: object, store?: object, workspaceRoot?: string, depsDir?: string,
  *   loadAgents?: Function, inspectMounts?: Function, readEdgeState?: Function,
- *   assertLease?: Function, collectLegacy?: boolean }} options
+ *   assertLease?: Function }} options
  * @returns {{ skipped: string|null, removed: string[], retained: Array<{objectId, reasons, bytes}>,
- *   retainedBytesByReason: object, legacyRemoved: string[], legacyRetained: Array<{path, reason}> }}
+ *   retainedBytesByReason: object }}
  */
 export function collectDependencyObjects({
     lease,
@@ -150,15 +152,16 @@ export function collectDependencyObjects({
         if (parsed.corrupt) throw dependencyStoreError('PLOINKY_DEPS_REGISTRY_UNREADABLE', parsed.corrupt);
         return parsed.value || {};
     },
-    inspectMounts = engineMountInspector({ getRuntime, depsDir }),
+    // probeContainerRuntime returns null without an engine; getRuntime would
+    // exit the process from this best-effort post-admission step.
+    inspectMounts = engineMountInspector({ getRuntime: () => probeContainerRuntime(), depsDir }),
     hooks = {},
     readEdgeState = defaultReadEdgeState,
     assertLease = assertWorkspaceMutationLease,
-    collectLegacy = true,
 } = {}) {
     assertLease(lease);
     const activeStore = store || createCacheStore({ depsDir, workspaceRoot, assertLease });
-    const report = { skipped: null, removed: [], retained: [], retainedBytesByReason: {}, legacyRemoved: [], legacyRetained: [] };
+    const report = { skipped: null, removed: [], retained: [], retainedBytesByReason: {} };
     const objectsDir = activeStore.paths.objects;
     const skip = (reason) => ({ ...report, skipped: reason });
 
@@ -240,7 +243,6 @@ export function collectDependencyObjects({
         if (removeObject(activeStore, lease, item, { objectsDir, manifests, assertLease, hooks })) report.removed.push(item.objectId);
     }
 
-    if (collectLegacy) collectLegacyCaches({ depsDir, records, actualMounts, report, enginesAvailable: Boolean(mounts?.available) });
     return report;
 }
 
@@ -313,66 +315,6 @@ function removeObject(store, lease, item, { objectsDir, manifests, assertLease, 
     return true;
 }
 
-function legacyReferenced(target, { records, actualMounts }) {
-    const within = (source) => {
-        const resolved = path.resolve(String(source || ''));
-        return resolved === target || resolved.startsWith(`${target}${path.sep}`);
-    };
-    return actualMounts.some(within)
-        || records.some((record) => (record.config?.binds || []).some((bind) => within(bind?.source)));
-}
-
-/**
- * Recognized legacy payloads (`global/<runtimeKey>` and
- * `agents/<repo>/<agent>/<runtimeKey>` with stamp.json + node_modules) are
- * removed only when no actual mount or registry bind references them and no
- * legacy host-sandbox runtime could still resolve through a source link.
- * Unknown files and ancestors are never removed.
- */
-function collectLegacyCaches({ depsDir, records, actualMounts, report, enginesAvailable }) {
-    if (!enginesAvailable) {
-        report.legacyRetained.push({ path: depsDir, reason: 'container engine unavailable' });
-        return;
-    }
-    const legacyHostRuntime = records.some((record) => ['seatbelt', 'bwrap'].includes(String(record.runtime || ''))
-        && record.dependencies?.mode !== 'store' && record.dependencies?.mode !== 'none');
-    const candidates = [];
-    const globalDir = path.join(depsDir, 'global');
-    for (const name of safeList(globalDir)) candidates.push(path.join(globalDir, name));
-    const agentsDir = path.join(depsDir, 'agents');
-    for (const repo of safeList(agentsDir)) {
-        for (const agent of safeList(path.join(agentsDir, repo))) {
-            for (const key of safeList(path.join(agentsDir, repo, agent))) candidates.push(path.join(agentsDir, repo, agent, key));
-        }
-    }
-    const storeRoot = path.join(path.resolve(depsDir), DEPENDENCY_STORE_DIRNAME);
-    for (const candidate of candidates) {
-        const resolved = path.resolve(candidate);
-        if (resolved === storeRoot || resolved.startsWith(`${storeRoot}${path.sep}`)) continue;
-        let stat;
-        try { stat = fs.lstatSync(resolved); } catch { continue; }
-        const recognized = stat.isDirectory() && !stat.isSymbolicLink()
-            && fs.existsSync(path.join(resolved, 'stamp.json'))
-            && fs.existsSync(path.join(resolved, 'node_modules'));
-        if (!recognized) { report.legacyRetained.push({ path: resolved, reason: 'unrecognized' }); continue; }
-        if (legacyHostRuntime) { report.legacyRetained.push({ path: resolved, reason: 'legacy host-sandbox runtime may resolve through a source link' }); continue; }
-        if (legacyReferenced(resolved, { records, actualMounts })) { report.legacyRetained.push({ path: resolved, reason: 'referenced' }); continue; }
-        if (fs.existsSync(path.join(resolved, '.lock'))) { report.legacyRetained.push({ path: resolved, reason: 'legacy lock present' }); continue; }
-        fs.rmSync(resolved, { recursive: true, force: true });
-        report.legacyRemoved.push(resolved);
-        // Remove now-empty parents only (never recursively).
-        let parent = path.dirname(resolved);
-        while (parent.startsWith(path.resolve(depsDir)) && parent !== path.resolve(depsDir)) {
-            try { fs.rmdirSync(parent); } catch { break; }
-            parent = path.dirname(parent);
-        }
-    }
-}
-
-function safeList(directory) {
-    try { return fs.readdirSync(directory).sort(); } catch { return []; }
-}
-
 /**
  * Best-effort post-admission hook for lifecycle commands: never throws and
  * never blocks the successful command on collection problems.
@@ -381,7 +323,7 @@ export function collectDependencyObjectsAfterAdmission({ lease, reason = 'admiss
     try {
         return collectDependencyObjects({ lease, ...options });
     } catch (error) {
-        return { skipped: `collection failed (${reason}): ${error?.message || error}`, removed: [], retained: [], retainedBytesByReason: {}, legacyRemoved: [], legacyRetained: [] };
+        return { skipped: `collection failed (${reason}): ${error?.message || error}`, removed: [], retained: [], retainedBytesByReason: {} };
     }
 }
 
@@ -392,7 +334,7 @@ export function reportDependencyCollection(result, log = (message) => {
     if (!result) return result;
     const summary = result.skipped
         ? `skipped (${result.skipped})`
-        : `removed ${result.removed.length} object(s), ${result.legacyRemoved.length} legacy cache(s); retained bytes by reason ${JSON.stringify(result.retainedBytesByReason)}`;
+        : `removed ${result.removed.length} object(s); retained bytes by reason ${JSON.stringify(result.retainedBytesByReason)}`;
     log(`[deps-gc] ${summary}`);
     return result;
 }

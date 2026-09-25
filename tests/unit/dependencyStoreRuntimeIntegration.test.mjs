@@ -141,14 +141,21 @@ for (const family of Object.keys(FAMILIES)) {
         assert.deepEqual(treeSnapshot(first.record), before);
     });
 
-    test(`dependency store runtime ${family}: legacy, missing and corrupt admitted generations require replacement`, (t) => {
+    test(`dependency store runtime ${family}: unrecorded, missing and corrupt admitted generations require replacement`, (t) => {
         const w = world(t);
-        const legacySource = path.join(w.root, '.ploinky', 'deps', 'agents', 'repo', 'agent', FAMILIES[family].runtimeKey, 'node_modules');
-        const legacy = { runtime: family, config: { binds: [{ source: legacySource, target: '/code/node_modules', ro: true }] } };
-        const legacyProblem = runtimeDependencyReuseProblem({
-            record: legacy, family, needsDependencies: true, agentCodePath: w.agentCodePath, registration: 'x', engine: 'podman', image: 'node:20',
-        }, { ...w.deps, store: w.store });
-        assert.match(legacyProblem, /legacy dependency cache|no dependency generation record/);
+        // A node_modules bind outside the store with no dependency record (for
+        // example one an older release left) is unknown, never a generation.
+        const unrecordedSource = path.join(w.root, '.ploinky', 'deps', 'agents', 'repo', 'agent', FAMILIES[family].runtimeKey, 'node_modules');
+        fs.mkdirSync(unrecordedSource, { recursive: true });
+        const unrecorded = { runtime: family, config: { binds: [{ source: unrecordedSource, target: '/code/node_modules', ro: true }] } };
+        assert.deepEqual(admittedDependencyRecord(unrecorded), { mode: 'unknown' });
+        assert.equal(reuseProblem(family, w, unrecorded), 'admitted runtime has no dependency generation record');
+        assert.equal(reuseProblem(family, w, unrecorded, { needsDependencies: false }), '',
+            'a runtime that needs no dependencies mounts no store generation and is reused');
+        assert.equal(attachAdmittedDependencies(unrecorded, { consumer: { kind: `${family}-attachment`, process: { pid: process.pid } } }, w.deps), null,
+            'an unrecorded tree is never attached');
+        assert.equal(fs.existsSync(w.store.paths.readerReceipts) ? fs.readdirSync(w.store.paths.readerReceipts).length : 0, 0);
+        assert.equal(w.state.installer.calls.length, 0, 'the decision is read-only');
         assert.equal(reuseProblem(family, w, { runtime: family }), 'admitted runtime has no dependency generation record');
         const first = prepareRuntimeDependencies(input(family, w), { consumer: consumer(family) }, w.deps);
         fs.appendFileSync(path.join(first.nodeModulesPath, 'left-pad', 'index.js'), '// tampered');
@@ -171,7 +178,7 @@ test('dependency store runtime: no-cache agents and no-node images keep their ex
     const w = world(t);
     const noCache = { runtime: 'podman', dependencies: noCacheDependencyRecord('no-core-deps', { family: 'container' }) };
     assert.equal(reuseProblem('container', w, noCache, { needsDependencies: false }), '');
-    assert.equal(reuseProblem('container', w, { runtime: 'podman' }, { needsDependencies: false }), '', 'legacy start-only records reuse');
+    assert.equal(reuseProblem('container', w, { runtime: 'podman' }, { needsDependencies: false }), '', 'start-only records without a dependency record reuse');
     const noNode = { runtime: 'podman', dependencies: noCacheDependencyRecord('no-node-image', { family: 'container', runtimeKey: 'container-no-node', imageId: IMAGE_A }) };
     assert.equal(reuseProblem('container', w, noNode, { noNodeAllowed: true }), '');
     assert.match(reuseProblem('container', w, noNode, { noNodeAllowed: false }), /dependency mode changed/);
@@ -334,7 +341,6 @@ test('dependency store runtime wiring: every container reuse path consults the g
     const sandbox = slice(service, "if (agentRuntime === 'bwrap' || agentRuntime === 'seatbelt') {\n        let sandboxRuntimeIdentity", 'const runtimeIdentity = resolveReplacementRuntimeIdentity({');
     assert.match(sandbox, /bwrapDependencyReuseProblem : seatbeltDependencyReuseProblem/);
     const start = slice(text, 'function startAgentContainer(', '\nfunction ');
-    assert.doesNotMatch(start, /prepareAgentCache|inspectAgentCache/);
     const storeBranch = start.indexOf("if (dependencyRecord?.mode === 'store') {");
     assert.ok(storeBranch > 0 && storeBranch < start.indexOf('ensureAgentLibCacheLink('), 'store trees are never relinked in place');
     assert.match(start, /resolveReusablePodmanStagedMounts\(existingRecord, podmanRuntimeRoot, preparedNodeModulesDir\)/);

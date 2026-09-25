@@ -1,7 +1,7 @@
 // Stable immutable dependency objects under `.ploinky/deps/store/`.
 //
-// Layout (private format version FORMAT_VERSION, disjoint from legacy
-// `global/<runtimeKey>` and `agents/<repo>/<agent>/<runtimeKey>`):
+// Layout (private format version FORMAT_VERSION; nothing else under
+// `.ploinky/deps` belongs to the store):
 //   format.json
 //   objects/<buildUUID>/payload/        stable physical payload, never renamed
 //   objects/<buildUUID>/manifest.json   immutable, written after verification
@@ -779,8 +779,8 @@ function finalizeProviders(payloadPath, plan) {
 
 /**
  * Copy (never hardlink) a validated seed tree, preserving symlink text exactly.
- * Inside a Box, GNU `cp -a` is used as in the legacy cache: fs.cpSync cannot
- * create some directories on macOS Podman Machine bind mounts.
+ * Inside a Box, GNU `cp -a` is used: fs.cpSync cannot create some directories
+ * on macOS Podman Machine bind mounts.
  */
 export function defaultCopySeed(source, destination, { fsApi = fs, insideBox = isInsideBox(), spawn = spawnSync } = {}) {
     fsApi.rmSync(destination, { recursive: true, force: true });

@@ -137,10 +137,10 @@ for (const runtime of ['podman', 'docker']) {
     });
 }
 
-test('dependency store start path: a legacy-cache runtime is replaced once, never adopted', (t) => {
+test('dependency store start path: a runtime without a dependency record is replaced once, never adopted', (t) => {
     const w = workspace(t);
-    const legacy = path.join(w.ws, '.ploinky', 'deps', 'agents', 'repo', 'demo', 'container-linux-x64-glibc-node20', 'node_modules');
-    fs.mkdirSync(legacy, { recursive: true });
+    const unrecorded = path.join(w.ws, '.ploinky', 'deps', 'agents', 'repo', 'demo', 'container-linux-x64-glibc-node20', 'node_modules');
+    fs.mkdirSync(unrecorded, { recursive: true });
     const steps = byStep(drive(w, [
         { action: 'init-edge' },
         { action: 'register', containerName: CONTAINER, record: { ...registration(), projectPath: path.join(w.ws, '.data', 'demo') } },
@@ -148,23 +148,23 @@ test('dependency store start path: a legacy-cache runtime is replaced once, neve
         { label: 'first', action: 'ensure-with-lease', containerName: CONTAINER, startPath: true, activate: true },
     ]));
     const first = assertOk(steps, 'first');
-    // Rewrite the admitted record to the legacy layout (as an older release left it).
+    // Drop the dependency record and point the bind outside the store.
     const agentsFile = path.join(w.ws, '.ploinky', 'agents.json');
     const agents = JSON.parse(fs.readFileSync(agentsFile, 'utf8'));
     delete agents[CONTAINER].dependencies;
     agents[CONTAINER].config.binds = agents[CONTAINER].config.binds.map((bind) => (
-        bind.source === first.dependencies.nodeModulesPath ? { ...bind, source: legacy } : bind));
+        bind.source === first.dependencies.nodeModulesPath ? { ...bind, source: unrecorded } : bind));
     fs.writeFileSync(agentsFile, JSON.stringify(agents, null, 2));
     const after = byStep(drive(w, [
         { label: 'adoption', action: 'no-wait-adoption', containerName: CONTAINER },
         { label: 'restart', action: 'ensure-with-lease', containerName: CONTAINER, activate: true },
     ]));
-    assert.match(assertOk(after, 'adoption').problem, /legacy dependency cache/);
+    assert.equal(assertOk(after, 'adoption').problem, 'admitted runtime has no dependency generation record');
     const restarted = assertOk(after, 'restart');
     assert.equal(restarted.createdByThisLaunch, true);
     assert.equal(restarted.dependencies.objectId, first.dependencies.objectId, 'the valid store object is reused for the new runtime');
     assert.equal(w.engine.state().installs.length, 1);
-    assert.ok(fs.existsSync(legacy), 'the legacy cache is ignored, never deleted here');
+    assert.ok(fs.existsSync(unrecorded), 'an unrecorded tree is ignored, never deleted');
 });
 
 test('dependency store start path: a start-only agent without package.json keeps its no-cache path', (t) => {

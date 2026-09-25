@@ -177,7 +177,8 @@ test('no executable path installs, pulls, or refreshes a second achillesAgentLib
         'cli/commands/updateService.js',
         'cli/commands/repoAgentCommands.js',
         'cli/utils/dependencies/dependencyInstaller.js',
-        'cli/utils/dependencies/dependencyCache.js',
+        'cli/utils/dependencies/store/installers.mjs',
+        'cli/utils/dependencies/store/objectStore.mjs',
         'cli/commands/help.js',
         'globalDeps/package.json',
     ];

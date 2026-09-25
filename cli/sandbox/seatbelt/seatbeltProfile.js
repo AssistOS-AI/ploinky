@@ -1,7 +1,6 @@
 import fs from 'fs';
 import path from 'path';
 import {
-    AGENTS_DEPS_CACHE_DIR,
     CODE_DIR,
     DEPS_DIR,
     PLOINKY_DIR,
@@ -173,8 +172,9 @@ function buildSeatbeltProfile(options) {
     }
     lines.push('');
 
-    // node_modules — read-only prepared cache (see dependencyCache.js)
-    lines.push('; node_modules (read-only prepared cache)');
+    // node_modules — the admitted immutable dependency store generation
+    // (cli/utils/dependencies/store), read-only for the agent.
+    lines.push('; node_modules (read-only dependency store generation)');
     lines.push(`; covered by read access block: ${nodeModulesDir}`);
     lines.push('');
 
@@ -269,7 +269,6 @@ function collectProtectedWritePaths({
         addSubpath(nodeModulesParent);
     }
     addSubpath(DEPS_DIR);
-    addSubpath(AGENTS_DEPS_CACHE_DIR);
     addSubpath(path.join(agentCodePath || '', 'node_modules'));
     addSubpath(agentLibPath);
     addSubpath(path.join(PLOINKY_DIR, 'seatbelt-runtime'));
