@@ -1,4 +1,5 @@
 import * as skillsSvc from './skills.js';
+import { withHeldOrAcquiredWorkspaceMutationLease } from '../utils/runtime/maintenanceLocks.js';
 
 const USAGE = 'Usage: default-skills <repoName>';
 
@@ -24,17 +25,24 @@ function parseOptions(options = []) {
     return { positional, flags };
 }
 
-export function handleDefaultSkillsCommand(options = []) {
+// Resolving, cloning and recording an absent source repository, then exporting
+// from its checkout, is one workspace mutation. An update that already holds
+// the lease reuses it; otherwise the command waits for its own lease.
+export async function handleDefaultSkillsCommand(options = [], { workspaceLeaseWaitMs } = {}) {
     const { positional, flags } = parseOptions(options);
     const repoName = positional[0];
     if (!repoName) {
         throw new Error(USAGE);
     }
 
-    const result = skillsSvc.installDefaultSkills(repoName, {
-        only: flags.only,
-        skip: flags.skip,
-    });
+    const leaseOptions = workspaceLeaseWaitMs === undefined
+        ? { operation: 'repositories-prepare' }
+        : { operation: 'repositories-prepare', waitTimeoutMs: workspaceLeaseWaitMs };
+    const result = await withHeldOrAcquiredWorkspaceMutationLease(leaseOptions,
+        () => skillsSvc.installDefaultSkills(repoName, {
+            only: flags.only,
+            skip: flags.skip,
+        }));
 
     console.log(`✓ Installed ${result.skills.length} skill(s) from '${result.repoName}' into ${result.destRoot}:`);
     console.log(`    - .agents/skills/  (${result.skills.join(', ')})`);

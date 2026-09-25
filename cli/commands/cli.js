@@ -314,7 +314,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
             handleExposeCommand(options);
             break;
         case 'default-skills':
-            handleDefaultSkillsCommand(options);
+            await handleDefaultSkillsCommand(options);
             break;
         case 'disable': {
             if (!options.length) {
