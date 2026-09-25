@@ -9,13 +9,13 @@ import { spawnSync } from 'node:child_process';
 import {
     buildProviderContract,
     hostToolchainIdentity,
-} from '../../cli/utils/dependencies/cacheV4/installContract.mjs';
-import { containerNpmPolicy, resolveHostNpmPolicy } from '../../cli/utils/dependencies/cacheV4/npmPolicy.mjs';
+} from '../../cli/utils/dependencies/store/installContract.mjs';
+import { containerNpmPolicy, resolveHostNpmPolicy } from '../../cli/utils/dependencies/store/npmPolicy.mjs';
 
 export const HOST_RUNTIME_KEY = 'seatbelt-darwin-arm64-node25';
 export const CONTAINER_RUNTIME_KEY = 'container-linux-x64-glibc-node20';
 
-export function tempRoot(t, prefix = 'cachev4-') {
+export function tempRoot(t, prefix = 'depstore-') {
     const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
     t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
     return dir;

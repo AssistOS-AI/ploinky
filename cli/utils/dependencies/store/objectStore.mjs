@@ -1,4 +1,4 @@
-// Stable immutable dependency objects under `.ploinky/deps/cache-v4/`.
+// Stable immutable dependency objects under `.ploinky/deps/store/`.
 //
 // Layout (private format version FORMAT_VERSION, disjoint from legacy
 // `global/<runtimeKey>` and `agents/<repo>/<agent>/<runtimeKey>`):
@@ -25,7 +25,7 @@ import { assertWorkspaceMutationLease } from '../../runtime/maintenanceLocks.js'
 import { agentLibCacheLinkProblem, ensureAgentLibCacheLink, installWithAgentLib } from '../agentLibLink.js';
 import { finalizeBoxMcpSdkCache, installWithBoxMcpSdk } from '../../../../ploinky-box/agent-dependencies/mcp-sdk.mjs';
 import { isInsideBox } from '../../../../ploinky-box/lib/boxMarker.mjs';
-import { cacheV4Error, canonicalDigest, FULL_SHA256_PATTERN, assertFullSha256, sha256Hex } from './canonical.mjs';
+import { dependencyStoreError, canonicalDigest, FULL_SHA256_PATTERN, assertFullSha256, sha256Hex } from './canonical.mjs';
 import { commitPinState, fsyncDirectory, readPinState, writeFileAtomic } from './gitPins.mjs';
 import { seedCopyEligibility } from './installContract.mjs';
 import {
@@ -36,10 +36,10 @@ import {
 import { buildResolutionManifest, readHiddenLock, verifyDirectGitProvenance } from './resolution.mjs';
 import { hashInstalledTree } from './treeHash.mjs';
 
-export const CACHE_V4_DIRNAME = 'cache-v4';
+export const DEPENDENCY_STORE_DIRNAME = 'store';
 export const FORMAT_NAME = 'ploinky-deps-cache';
 export const FORMAT_VERSION = 1;
-export const OBJECT_OWNER = 'ploinky-deps-cache-v4';
+export const OBJECT_OWNER = 'ploinky-deps-store';
 const DEFAULT_MIN_FREE_BYTES = 256 * 1024 * 1024;
 const DEFAULT_MAX_BUILD_ATTEMPTS = 2;
 const BUILD_RECEIPT_TTL_MS = 60 * 60 * 1000;
@@ -102,7 +102,7 @@ export function createCacheStore({
     proveReaderQuiescent = defaultProveReaderQuiescent,
 } = {}) {
     if (!depsDir || !workspaceRoot) throw new Error('createCacheStore requires depsDir and workspaceRoot');
-    const root = path.join(path.resolve(depsDir), CACHE_V4_DIRNAME);
+    const root = path.join(path.resolve(depsDir), DEPENDENCY_STORE_DIRNAME);
     const workspaceId = sha256Hex(fsApi.realpathSync(path.resolve(workspaceRoot)));
     const paths = {
         root,
@@ -123,7 +123,7 @@ export function createCacheStore({
     function ensureLayout() {
         const existing = readJson(paths.format, fsApi);
         if (existing.corrupt || (existing.value && (existing.value.format !== FORMAT_NAME || existing.value.version !== FORMAT_VERSION))) {
-            throw cacheV4Error('PLOINKY_DEPS_STORE_FORMAT_UNKNOWN',
+            throw dependencyStoreError('PLOINKY_DEPS_STORE_FORMAT_UNKNOWN',
                 `dependency cache format at ${paths.format} is not ${FORMAT_NAME} v${FORMAT_VERSION}; refusing to touch it`);
         }
         for (const directory of [paths.objects, paths.index, paths.buildReceipts, paths.readerReceipts, paths.unusable]) {
@@ -133,7 +133,7 @@ export function createCacheStore({
     }
 
     const objectDir = (objectId) => {
-        if (!UUID_PATTERN.test(String(objectId || ''))) throw cacheV4Error('PLOINKY_DEPS_OBJECT_ID_INVALID', `invalid object id ${objectId}`);
+        if (!UUID_PATTERN.test(String(objectId || ''))) throw dependencyStoreError('PLOINKY_DEPS_OBJECT_ID_INVALID', `invalid object id ${objectId}`);
         return path.join(paths.objects, objectId);
     };
     const payloadPathOf = (objectId) => path.join(objectDir(objectId), 'payload');
@@ -226,7 +226,7 @@ export function createCacheStore({
     }
 
     function writeReaderReceipt(generation, consumer) {
-        if (!consumer?.kind) throw cacheV4Error('PLOINKY_DEPS_RECEIPT_INVALID', 'reader receipts require a consumer kind');
+        if (!consumer?.kind) throw dependencyStoreError('PLOINKY_DEPS_RECEIPT_INVALID', 'reader receipts require a consumer kind');
         // A stable consumer key makes re-acquisition by the same consumer of
         // the same object idempotent (warm starts do not accumulate receipts).
         const receiptId = consumer.key
@@ -270,7 +270,7 @@ export function createCacheStore({
         const validation = validateObject(generation.objectId, { inputKey: generation.inputKey });
         if (!validation.valid) {
             releaseReaderReceipt(handle);
-            throw cacheV4Error('PLOINKY_DEPS_GENERATION_INVALID',
+            throw dependencyStoreError('PLOINKY_DEPS_GENERATION_INVALID',
                 `admitted dependency generation ${String(generation.generationId || '').slice(0, 12)} is not usable: ${validation.reason}`);
         }
         return handle;
@@ -312,7 +312,7 @@ export function createCacheStore({
         const next = mutate(structuredClone(current));
         const again = readRebuildState(registration);
         if (again.revision !== current.revision) {
-            throw cacheV4Error('PLOINKY_DEPS_REBUILD_CONFLICT', `rebuild state for ${registration} changed concurrently`);
+            throw dependencyStoreError('PLOINKY_DEPS_REBUILD_CONFLICT', `rebuild state for ${registration} changed concurrently`);
         }
         const written = { ...next, schema: 1, registration: current.registration, revision: current.revision + 1, updatedAt: now() };
         writeJsonAtomic(rebuildFile(registration), written, fsApi);
@@ -330,7 +330,7 @@ export function createCacheStore({
         requireLease(lease);
         const current = readJson(handle.path, fsApi).value;
         if (!current || current.token !== handle.token) {
-            throw cacheV4Error('PLOINKY_DEPS_RECEIPT_LOST', `reader receipt ${handle.receiptId} is no longer owned`);
+            throw dependencyStoreError('PLOINKY_DEPS_RECEIPT_LOST', `reader receipt ${handle.receiptId} is no longer owned`);
         }
         const next = { ...current, consumer: { ...current.consumer, ...consumerPatch }, updatedAt: now() };
         writeJsonAtomic(handle.path, next, fsApi);
@@ -355,7 +355,7 @@ export function createCacheStore({
         const resolved = path.resolve(receiptPath);
         const isBuild = path.dirname(resolved) === paths.buildReceipts;
         if (!isBuild && path.dirname(resolved) !== paths.readerReceipts) {
-            throw cacheV4Error('PLOINKY_DEPS_RECEIPT_INVALID', `${receiptPath} is not a cache receipt`);
+            throw dependencyStoreError('PLOINKY_DEPS_RECEIPT_INVALID', `${receiptPath} is not a cache receipt`);
         }
         const before = readJson(resolved, fsApi);
         if (before.missing) return { removed: false, reason: 'already absent' };
@@ -407,7 +407,7 @@ export function createCacheStore({
         requireLease(lease);
         const space = checkDiskSpace({ directory: paths.objects, requiredBytes: minFreeBytes, fsApi });
         if (!space?.ok) {
-            throw cacheV4Error('PLOINKY_DEPS_DISK_SPACE',
+            throw dependencyStoreError('PLOINKY_DEPS_DISK_SPACE',
                 `insufficient free space for a dependency build (${space?.availableBytes ?? 'unknown'} < ${minFreeBytes} bytes)`);
         }
         const objectId = uuid();
@@ -446,7 +446,7 @@ export function createCacheStore({
                 if (seedSource) {
                     copySeed(path.join(seedSource.payloadPath, 'node_modules'), path.join(payloadPath, 'node_modules'), { fsApi });
                 } else if (plan.npmRequired) {
-                    if (!installer) throw cacheV4Error('PLOINKY_DEPS_INSTALLER_REQUIRED', 'an installer is required for this build');
+                    if (!installer) throw dependencyStoreError('PLOINKY_DEPS_INSTALLER_REQUIRED', 'an installer is required for this build');
                     updateBuildReceipt(receipt, { installerStarted: true });
                     runProviderInstall(payloadPath, plan, (installPath, options) => installer.install({
                         payloadDir: installPath, workDir, objectId, options, ...installOptions,
@@ -556,7 +556,7 @@ export function createCacheStore({
             }
         }
         if (!built) {
-            const failure = cacheV4Error('PLOINKY_DEPS_BUILD_FAILED',
+            const failure = dependencyStoreError('PLOINKY_DEPS_BUILD_FAILED',
                 `dependency build for ${plan.kind} ${plan.inputKey.slice(0, 12)} failed: ${lastError?.message || 'unknown error'}`,
                 { cause: lastError?.code || null, corruption: found.corruption });
             failure.cause = lastError;
@@ -710,7 +710,7 @@ export function createCacheStore({
                 const parsed = readJson(path.join(paths.readerReceipts, name), fsApi);
                 if (parsed.missing) return null; // An owner may release its receipt.
                 if (!parsed.value || parsed.value.workspaceId !== workspaceId || !parsed.value.objectId) {
-                    throw cacheV4Error('PLOINKY_DEPS_RECEIPT_INVALID', `reader receipt ${name} is unreadable or belongs to another workspace`);
+                    throw dependencyStoreError('PLOINKY_DEPS_RECEIPT_INVALID', `reader receipt ${name} is unreadable or belongs to another workspace`);
                 }
                 return parsed.value;
             })
@@ -750,7 +750,7 @@ export function createCacheStore({
 
 export function generationIdFor(inputKey, resolutionHash, treeHash) {
     for (const [label, value] of [['inputKey', inputKey], ['resolutionHash', resolutionHash], ['treeHash', treeHash]]) {
-        if (!FULL_SHA256_PATTERN.test(String(value || ''))) throw cacheV4Error('PLOINKY_DEPS_KEY_INVALID', `${label} must be a full SHA-256`);
+        if (!FULL_SHA256_PATTERN.test(String(value || ''))) throw dependencyStoreError('PLOINKY_DEPS_KEY_INVALID', `${label} must be a full SHA-256`);
     }
     return sha256Hex(`${inputKey}\n${resolutionHash}\n${treeHash}`);
 }
@@ -774,7 +774,7 @@ function finalizeProviders(payloadPath, plan) {
     const target = plan.providers.agentLib.linkTarget;
     ensureAgentLibCacheLink(payloadPath, target);
     const problem = agentLibCacheLinkProblem(payloadPath, target);
-    if (problem) throw cacheV4Error('PLOINKY_DEPS_AGENTLIB_LINK_INVALID', problem);
+    if (problem) throw dependencyStoreError('PLOINKY_DEPS_AGENTLIB_LINK_INVALID', problem);
 }
 
 /**
@@ -787,7 +787,7 @@ export function defaultCopySeed(source, destination, { fsApi = fs, insideBox = i
     if (insideBox) {
         const copied = spawn('cp', ['-a', source, destination], { stdio: 'ignore' });
         if (copied.error || copied.status !== 0) {
-            throw cacheV4Error('PLOINKY_DEPS_SEED_COPY_FAILED', `seed copy failed (${copied.status ?? copied.error?.code ?? 'unknown'})`);
+            throw dependencyStoreError('PLOINKY_DEPS_SEED_COPY_FAILED', `seed copy failed (${copied.status ?? copied.error?.code ?? 'unknown'})`);
         }
         return;
     }

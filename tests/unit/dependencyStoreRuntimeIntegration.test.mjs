@@ -8,10 +8,10 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-import { createCacheStore } from '../../cli/utils/dependencies/cacheV4/objectStore.mjs';
-import { sha256Hex } from '../../cli/utils/dependencies/cacheV4/canonical.mjs';
-import { hashInstalledTree } from '../../cli/utils/dependencies/cacheV4/treeHash.mjs';
-import { buildPin } from '../../cli/utils/dependencies/cacheV4/gitPins.mjs';
+import { createCacheStore } from '../../cli/utils/dependencies/store/objectStore.mjs';
+import { sha256Hex } from '../../cli/utils/dependencies/store/canonical.mjs';
+import { hashInstalledTree } from '../../cli/utils/dependencies/store/treeHash.mjs';
+import { buildPin } from '../../cli/utils/dependencies/store/gitPins.mjs';
 import {
     admittedDependencyRecord,
     attachAdmittedDependencies,
@@ -23,11 +23,11 @@ import {
     settleDependencyRebuildRequest,
     registrationIdFor,
     runtimeDependencyReuseProblem,
-} from '../../cli/utils/dependencies/cacheV4/runtimeDependencies.mjs';
+} from '../../cli/utils/dependencies/store/runtimeDependencies.mjs';
 import { ensureSeatbeltCodeNodeModules, liveSeatbeltSourceConsumers } from '../../cli/sandbox/seatbelt/seatbeltServiceManager.js';
 import { hasAdmittedDependencyMount, selectPredecessorRemovalRecord } from '../../cli/sandbox/docker/agentServiceManager.js';
 import { withDependencyRefresh } from '../../cli/utils/dependencies/dependencyRefresh.mjs';
-import { fakeInstaller, fakeLease, hostProbe, makeAgentLib, tempRoot } from './cacheV4Fixtures.mjs';
+import { fakeInstaller, fakeLease, hostProbe, makeAgentLib, tempRoot } from './dependencyStoreFixtures.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '../..');
@@ -41,7 +41,7 @@ const FAMILIES = Object.freeze({
 });
 
 function world(t) {
-    const root = tempRoot(t, 'cachev4-runtime-');
+    const root = tempRoot(t, 'depstore-runtime-');
     const { lease, assertLease } = fakeLease();
     const store = createCacheStore({ depsDir: path.join(root, '.ploinky', 'deps'), workspaceRoot: root, assertLease, checkDiskSpace: () => ({ ok: true }) });
     const agentCodePath = path.join(root, 'repo', 'agent', 'code');
@@ -101,7 +101,7 @@ function treeSnapshot(record) {
 }
 
 for (const family of Object.keys(FAMILIES)) {
-    test(`cache-v4 runtime ${family}: an unchanged generation is reused with zero installer calls`, (t) => {
+    test(`dependency store runtime ${family}: an unchanged generation is reused with zero installer calls`, (t) => {
         const w = world(t);
         const first = prepareRuntimeDependencies(input(family, w), { consumer: consumer(family) }, w.deps);
         assert.equal(first.status, 'built');
@@ -116,7 +116,7 @@ for (const family of Object.keys(FAMILIES)) {
         assert.equal(fs.readdirSync(w.store.paths.readerReceipts).length, 1, 'the same consumer re-acquires one idempotent receipt');
     });
 
-    test(`cache-v4 runtime ${family}: package, AgentLib and rebuild-token changes require replacement without touching the predecessor`, (t) => {
+    test(`dependency store runtime ${family}: package, AgentLib and rebuild-token changes require replacement without touching the predecessor`, (t) => {
         const w = world(t);
         const first = prepareRuntimeDependencies(input(family, w), { consumer: consumer(family) }, w.deps);
         const admitted = { runtime: family, dependencies: first.record };
@@ -141,7 +141,7 @@ for (const family of Object.keys(FAMILIES)) {
         assert.deepEqual(treeSnapshot(first.record), before);
     });
 
-    test(`cache-v4 runtime ${family}: legacy, missing and corrupt admitted generations require replacement`, (t) => {
+    test(`dependency store runtime ${family}: legacy, missing and corrupt admitted generations require replacement`, (t) => {
         const w = world(t);
         const legacySource = path.join(w.root, '.ploinky', 'deps', 'agents', 'repo', 'agent', FAMILIES[family].runtimeKey, 'node_modules');
         const legacy = { runtime: family, config: { binds: [{ source: legacySource, target: '/code/node_modules', ro: true }] } };
@@ -156,7 +156,7 @@ for (const family of Object.keys(FAMILIES)) {
     });
 }
 
-test('cache-v4 runtime container: a new image ID under the same tag requires replacement', (t) => {
+test('dependency store runtime container: a new image ID under the same tag requires replacement', (t) => {
     const w = world(t);
     const first = prepareRuntimeDependencies(input('container', w), { consumer: consumer('container') }, w.deps);
     const admitted = { runtime: 'podman', dependencies: first.record };
@@ -167,7 +167,7 @@ test('cache-v4 runtime container: a new image ID under the same tag requires rep
     assert.match(reuseProblem('container', w, admitted), /desired dependency identity unavailable/);
 });
 
-test('cache-v4 runtime: no-cache agents and no-node images keep their existing paths', (t) => {
+test('dependency store runtime: no-cache agents and no-node images keep their existing paths', (t) => {
     const w = world(t);
     const noCache = { runtime: 'podman', dependencies: noCacheDependencyRecord('no-core-deps', { family: 'container' }) };
     assert.equal(reuseProblem('container', w, noCache, { needsDependencies: false }), '');
@@ -181,7 +181,7 @@ test('cache-v4 runtime: no-cache agents and no-node images keep their existing p
     assert.equal(w.state.installer.calls.length, 1);
 });
 
-test('cache-v4 runtime: candidates share their registration and preparation always uses the caller lease', (t) => {
+test('dependency store runtime: candidates share their registration and preparation always uses the caller lease', (t) => {
     const w = world(t);
     assert.equal(registrationIdFor('ploinky_repo_agent__candidate_0123456789ab'), 'ploinky_repo_agent');
     const tokenFile = path.join(w.store.root, 'state', 'rebuild', `${sha256Hex('ploinky_repo_agent')}.json`);
@@ -197,7 +197,7 @@ test('cache-v4 runtime: candidates share their registration and preparation alwa
     assert.equal(receipt.consumer.phase, 'created');
 });
 
-test('cache-v4 runtime: one command computes one desired plan for graph preparation and runtime reuse', (t) => {
+test('dependency store runtime: one command computes one desired plan for graph preparation and runtime reuse', (t) => {
     const w = world(t);
     const memo = new Map();
     const deps = { ...w.deps, memo };
@@ -209,7 +209,7 @@ test('cache-v4 runtime: one command computes one desired plan for graph preparat
         'changed package bytes are never served from the memo');
 });
 
-test('cache-v4 runtime: attachments reuse the admitted generation read-only with their own receipt', (t) => {
+test('dependency store runtime: attachments reuse the admitted generation read-only with their own receipt', (t) => {
     const w = world(t);
     const first = prepareRuntimeDependencies(input('bwrap', w), { consumer: consumer('bwrap') }, w.deps);
     const calls = w.state.installer.calls.length;
@@ -227,7 +227,7 @@ test('cache-v4 runtime: attachments reuse the admitted generation read-only with
     assert.equal(attachAdmittedDependencies({ runtime: 'bwrap' }, { consumer: { kind: 'bwrap-attachment' } }, w.deps), null);
 });
 
-test('cache-v4 runtime: an activated rebuild survives failure to settle its metadata', (t) => {
+test('dependency store runtime: an activated rebuild survives failure to settle its metadata', (t) => {
     const w = world(t);
     const command = { ...w.deps, memo: new Map() };
     const old = prepareRuntimeDependencies(input('container', w), { consumer: consumer('container') }, command);
@@ -246,7 +246,7 @@ test('cache-v4 runtime: an activated rebuild survives failure to settle its meta
     assert.equal(runtimeCarriesRebuildToken({}, request.token), false);
 });
 
-test('cache-v4 runtime: a command memo cannot hide a pin or provider change', (t) => {
+test('dependency store runtime: a command memo cannot hide a pin or provider change', (t) => {
     const w = world(t);
     fs.writeFileSync(path.join(w.agentCodePath, 'package.json'), JSON.stringify({ dependencies: { example: 'git+https://github.com/example/package.git#main' } }));
     const deps = { ...w.deps, memo: new Map() };
@@ -260,7 +260,7 @@ test('cache-v4 runtime: a command memo cannot hide a pin or provider change', (t
     assert.notEqual(planRuntimeDependencies(input('container', w), deps).agentPlan.inputKey, pinned.agentPlan.inputKey);
 });
 
-test('cache-v4 runtime: actual container mounts must name the admitted payload read-only', (t) => {
+test('dependency store runtime: actual container mounts must name the admitted payload read-only', (t) => {
     const w = world(t);
     const first = prepareRuntimeDependencies(input('container', w), { consumer: consumer('container') }, w.deps);
     const record = { dependencies: first.record };
@@ -277,7 +277,7 @@ test('cache-v4 runtime: actual container mounts must name the admitted payload r
     assert.equal(admittedDependencyRecord({}).mode, 'unknown');
 });
 
-test('cache-v4 runtime seatbelt: the shared source link never switches under a live consumer', (t) => {
+test('dependency store runtime seatbelt: the shared source link never switches under a live consumer', (t) => {
     const w = world(t);
     const first = prepareRuntimeDependencies(input('seatbelt', w), { consumer: consumer('seatbelt') }, w.deps);
     fs.writeFileSync(path.join(w.agentCodePath, 'package.json'), JSON.stringify({ name: 'agent', dependencies: { chalk: '5.1.0' } }));
@@ -316,7 +316,7 @@ function slice(text, startMarker, endMarker) {
     return text.slice(start, end);
 }
 
-test('cache-v4 runtime wiring: every container reuse path consults the generation decision first', () => {
+test('dependency store runtime wiring: every container reuse path consults the generation decision first', () => {
     const text = source('cli/sandbox/docker/agentServiceManager.js');
     const service = slice(text, 'function ensureAgentService(', '\nexport function ');
     const check = service.indexOf('const dependencyProblem = containerDependencyReuseProblem(');
@@ -342,7 +342,7 @@ test('cache-v4 runtime wiring: every container reuse path consults the generatio
     assert.match(start, /\.\.\.\(dependencyRecord \? \{ dependencies: dependencyRecord \} : \{\}\),/);
 });
 
-test('cache-v4 runtime wiring: sandboxes, attachments and no-wait adoption use the shared decision', () => {
+test('dependency store runtime wiring: sandboxes, attachments and no-wait adoption use the shared decision', () => {
     const bwrap = source('cli/sandbox/bwrap/bwrapServiceManager.js');
     const ensure = slice(bwrap, 'function ensureBwrapService(', '\nfunction attachBwrapInteractive(');
     assert.match(ensure, /bwrapDependencyReuseProblem\(\{ agentName, manifest, record: existingRecord, containerName \}\)/);
@@ -367,10 +367,10 @@ test('cache-v4 runtime wiring: sandboxes, attachments and no-wait adoption use t
     assert.doesNotMatch(capture, /hasAgentPackageJson/);
 });
 
-test('cache-v4 runtime lease: a held lease is reused, a free workspace gets a transient one, a busy one fails closed', { timeout: 60_000 }, (t) => {
-    const root = tempRoot(t, 'cachev4-lease-');
+test('dependency store runtime lease: a held lease is reused, a free workspace gets a transient one, a busy one fails closed', { timeout: 60_000 }, (t) => {
+    const root = tempRoot(t, 'depstore-lease-');
     const script = `
-        const { resolveDependencyLease } = await import(${JSON.stringify(path.join(ROOT, 'cli/utils/dependencies/cacheV4/runtimeDependencies.mjs'))});
+        const { resolveDependencyLease } = await import(${JSON.stringify(path.join(ROOT, 'cli/utils/dependencies/store/runtimeDependencies.mjs'))});
         const locks = await import(${JSON.stringify(path.join(ROOT, 'cli/utils/runtime/maintenanceLocks.js'))});
         const out = {};
         const transient = resolveDependencyLease();
@@ -402,7 +402,7 @@ test('cache-v4 runtime lease: a held lease is reused, a free workspace gets a tr
     return new Promise((resolve, reject) => {
         child.stdout.once('data', () => {
             const busy = `
-                const { resolveDependencyLease } = await import(${JSON.stringify(path.join(ROOT, 'cli/utils/dependencies/cacheV4/runtimeDependencies.mjs'))});
+                const { resolveDependencyLease } = await import(${JSON.stringify(path.join(ROOT, 'cli/utils/dependencies/store/runtimeDependencies.mjs'))});
                 const started = Date.now();
                 try { resolveDependencyLease(); process.stdout.write('acquired'); }
                 catch (error) { process.stdout.write(JSON.stringify({ code: error.code, ms: Date.now() - started })); }
@@ -418,7 +418,7 @@ test('cache-v4 runtime lease: a held lease is reused, a free workspace gets a tr
     });
 });
 
-test('cache-v4 reinstall: one desired request per registration, empty-state build, admitted only on success', (t) => {
+test('dependency store reinstall: one desired request per registration, empty-state build, admitted only on success', (t) => {
     const w = world(t);
     // No agent package: ordinary starts copy the exact seed.
     fs.rmSync(path.join(w.agentCodePath, 'package.json'));
@@ -473,7 +473,7 @@ test('cache-v4 reinstall: one desired request per registration, empty-state buil
     assert.equal(w.store.readRebuildState('ploinky_repo_agent_b').admittedToken, null, 'the alias has no rebuild state');
 });
 
-test('cache-v4 reinstall: the desired token reaches planning through the command scope and is recorded', async (t) => {
+test('dependency store reinstall: the desired token reaches planning through the command scope and is recorded', async (t) => {
     const w = world(t);
     const { memo, ...ambient } = w.deps;
     void memo;
@@ -491,7 +491,7 @@ test('cache-v4 reinstall: the desired token reaches planning through the command
     });
 });
 
-test('cache-v4 runtime: predecessor removal proves ownership with the pre-rotation record for the same container only', () => {
+test('dependency store runtime: predecessor removal proves ownership with the pre-rotation record for the same container only', () => {
     const registered = { containerId: 'c'.repeat(64), instanceId: 'rotated', enableGeneration: 'rotated' };
     const predecessor = { containerId: 'c'.repeat(64), instanceId: 'old', enableGeneration: 'old' };
     assert.equal(selectPredecessorRemovalRecord(registered, predecessor), predecessor);

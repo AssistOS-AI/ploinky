@@ -1,5 +1,5 @@
 // Child-process driver for behavioral start-path tests (not a test file).
-// Usage: node cacheV4StartDriver.mjs <config.json>
+// Usage: node dependencyStoreStartDriver.mjs <config.json>
 // Runs lifecycle steps against a temporary workspace and a fake engine, then
 // writes a JSON transcript of every step result.
 
@@ -55,8 +55,8 @@ async function runStep(step) {
         // workspace start) performs before launching with a preparation lease.
         const edge = await import('../../cli/sandbox/edgeGeneration.js');
         const prepared = edge.withEdgeGenerationApplyLock((applyLockCapability) => {
-            edge.inactivateEdgeRoutingGeneration('cache-v4-test:source-stage', { applyLockCapability });
-            return edge.prepareEdgeRoutingGeneration({ reason: 'cache-v4-test', applyLockCapability });
+            edge.inactivateEdgeRoutingGeneration('dependency-store-test:source-stage', { applyLockCapability });
+            return edge.prepareEdgeRoutingGeneration({ reason: 'dependency-store-test', applyLockCapability });
         });
         preparedLease = prepared.preparationLease;
         return { ok: Boolean(preparedLease), mode: preparedLease?.mode || null };
@@ -97,7 +97,7 @@ async function runStep(step) {
                 // all runtimes are ready, including reused ones.
                 const { mergeRoutingConfig } = await import('../../cli/server/routingFile.js');
                 await mergeRoutingConfig((current) => current, {
-                    reason: 'cache-v4-test-graph-ready',
+                    reason: 'dependency-store-test-graph-ready',
                     preparationLease: preparedLease,
                 });
                 preparedLease = null;

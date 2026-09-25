@@ -10,14 +10,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { cacheV4Error, canonicalDigest, canonicalValue, isFullGitSha } from './canonical.mjs';
+import { dependencyStoreError, canonicalDigest, canonicalValue, isFullGitSha } from './canonical.mjs';
 import { parseResolvedGitSource } from './gitSpec.mjs';
 
 export const RESOLUTION_SCHEMA = 1;
 export const HIDDEN_LOCK_RELATIVE = path.join('node_modules', '.package-lock.json');
 
 function provenanceError(message, details) {
-    return cacheV4Error('PLOINKY_DEPS_PROVENANCE_MISMATCH', message, details);
+    return dependencyStoreError('PLOINKY_DEPS_PROVENANCE_MISMATCH', message, details);
 }
 
 export function readHiddenLock(payloadDir, { fsApi = fs } = {}) {

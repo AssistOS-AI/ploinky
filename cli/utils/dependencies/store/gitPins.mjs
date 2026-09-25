@@ -16,7 +16,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 
-import { cacheV4Error, canonicalDigest, canonicalJson, isFullGitSha } from './canonical.mjs';
+import { dependencyStoreError, canonicalDigest, canonicalJson, isFullGitSha } from './canonical.mjs';
 import { lsRemoteQuery, parseGitDependencySpec, parseLsRemoteOutput, resolveRefFromLsRemote } from './gitSpec.mjs';
 
 export const PIN_SCHEMA = 1;
@@ -32,10 +32,10 @@ export function normalizePinBinding(binding) {
     if (scope === 'global') return { scope: 'global' };
     if (scope === 'registration') {
         const registration = String(binding.registration || '').trim();
-        if (!registration) throw cacheV4Error('PLOINKY_DEPS_PIN_BINDING_INVALID', 'registration pin binding requires a registration id');
+        if (!registration) throw dependencyStoreError('PLOINKY_DEPS_PIN_BINDING_INVALID', 'registration pin binding requires a registration id');
         return { scope, registration, packageSource: String(binding.packageSource || '') };
     }
-    throw cacheV4Error('PLOINKY_DEPS_PIN_BINDING_INVALID', `unknown pin binding scope '${scope}'`);
+    throw dependencyStoreError('PLOINKY_DEPS_PIN_BINDING_INVALID', `unknown pin binding scope '${scope}'`);
 }
 
 export function pinIdFor(binding, section, name) {
@@ -73,9 +73,9 @@ function specRecord(parsed) {
 }
 
 export function buildPin(entry, { commit, verification, resolvedRef = null, peeled = false, recordedAt = new Date().toISOString() }) {
-    if (!isFullGitSha(commit)) throw cacheV4Error('PLOINKY_DEPS_PIN_INVALID', 'a pin commit must be a full 40-character SHA');
+    if (!isFullGitSha(commit)) throw dependencyStoreError('PLOINKY_DEPS_PIN_INVALID', 'a pin commit must be a full 40-character SHA');
     if (!Object.values(PIN_VERIFICATION).includes(verification)) {
-        throw cacheV4Error('PLOINKY_DEPS_PIN_INVALID', `unknown pin verification '${verification}'`);
+        throw dependencyStoreError('PLOINKY_DEPS_PIN_INVALID', `unknown pin verification '${verification}'`);
     }
     return {
         schema: PIN_SCHEMA,
@@ -307,11 +307,11 @@ export function readPinState(filePath, { fsApi = fs } = {}) {
     }
     let parsed;
     try { parsed = JSON.parse(raw); } catch {
-        throw cacheV4Error('PLOINKY_DEPS_PIN_STATE_CORRUPT', `pin state at ${filePath} is not valid JSON`);
+        throw dependencyStoreError('PLOINKY_DEPS_PIN_STATE_CORRUPT', `pin state at ${filePath} is not valid JSON`);
     }
     if (parsed?.format !== PIN_STATE_FORMAT || parsed.schema !== PIN_SCHEMA
         || !Number.isSafeInteger(parsed.revision) || !parsed.pins || typeof parsed.pins !== 'object') {
-        throw cacheV4Error('PLOINKY_DEPS_PIN_STATE_CORRUPT', `pin state at ${filePath} has an unknown format`);
+        throw dependencyStoreError('PLOINKY_DEPS_PIN_STATE_CORRUPT', `pin state at ${filePath} has an unknown format`);
     }
     return { revision: parsed.revision, pins: parsed.pins };
 }
@@ -347,12 +347,12 @@ export function fsyncDirectory(directory, fsApi = fs) {
 export function commitPinState(filePath, { expectedRevision, pins }, { fsApi = fs } = {}) {
     const current = readPinState(filePath, { fsApi });
     if (current.revision !== expectedRevision) {
-        throw cacheV4Error('PLOINKY_DEPS_PIN_CONFLICT',
+        throw dependencyStoreError('PLOINKY_DEPS_PIN_CONFLICT',
             `pin state changed concurrently (revision ${current.revision} != expected ${expectedRevision})`);
     }
     for (const [pinId, pin] of Object.entries(pins || {})) {
         if (pin?.pinId !== pinId || !isFullGitSha(pin.commit)) {
-            throw cacheV4Error('PLOINKY_DEPS_PIN_INVALID', `refusing to store malformed pin ${pinId}`);
+            throw dependencyStoreError('PLOINKY_DEPS_PIN_INVALID', `refusing to store malformed pin ${pinId}`);
         }
     }
     const next = { format: PIN_STATE_FORMAT, schema: PIN_SCHEMA, revision: expectedRevision + 1, pins: pins || {} };

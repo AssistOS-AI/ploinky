@@ -25,8 +25,8 @@ import { AGENTS_FILE, DEPS_DIR, PLOINKY_WORKSPACE_ROOT } from '../../config.js';
 import { assertWorkspaceMutationLease } from '../../runtime/maintenanceLocks.js';
 import { getRuntime } from '../../../sandbox/docker/common.js';
 import { readEdgeRoutingSelection } from '../../../sandbox/edgeGeneration.js';
-import { cacheV4Error } from './canonical.mjs';
-import { CACHE_V4_DIRNAME, OBJECT_OWNER, createCacheStore } from './objectStore.mjs';
+import { dependencyStoreError } from './canonical.mjs';
+import { DEPENDENCY_STORE_DIRNAME, OBJECT_OWNER, createCacheStore } from './objectStore.mjs';
 
 const OBJECT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -147,7 +147,7 @@ export function collectDependencyObjects({
     depsDir = DEPS_DIR,
     loadAgents = () => {
         const parsed = readJson(AGENTS_FILE);
-        if (parsed.corrupt) throw cacheV4Error('PLOINKY_DEPS_REGISTRY_UNREADABLE', parsed.corrupt);
+        if (parsed.corrupt) throw dependencyStoreError('PLOINKY_DEPS_REGISTRY_UNREADABLE', parsed.corrupt);
         return parsed.value || {};
     },
     inspectMounts = engineMountInspector({ getRuntime, depsDir }),
@@ -345,9 +345,10 @@ function collectLegacyCaches({ depsDir, records, actualMounts, report, enginesAv
             for (const key of safeList(path.join(agentsDir, repo, agent))) candidates.push(path.join(agentsDir, repo, agent, key));
         }
     }
+    const storeRoot = path.join(path.resolve(depsDir), DEPENDENCY_STORE_DIRNAME);
     for (const candidate of candidates) {
         const resolved = path.resolve(candidate);
-        if (resolved.includes(`${path.sep}${CACHE_V4_DIRNAME}`)) continue;
+        if (resolved === storeRoot || resolved.startsWith(`${storeRoot}${path.sep}`)) continue;
         let stat;
         try { stat = fs.lstatSync(resolved); } catch { continue; }
         const recognized = stat.isDirectory() && !stat.isSymbolicLink()

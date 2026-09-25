@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { canonicalDigest, canonicalJson } from '../../cli/utils/dependencies/cacheV4/canonical.mjs';
+import { canonicalDigest, canonicalJson } from '../../cli/utils/dependencies/store/canonical.mjs';
 import {
     buildAgentInstallPlan,
     buildSeedInstallPlan,
@@ -11,18 +11,18 @@ import {
     normalizeImageId,
     readAgentPackageSource,
     seedCopyEligibility,
-} from '../../cli/utils/dependencies/cacheV4/installContract.mjs';
-import { NPM_BASE_INSTALL_ARGS, containerNpmPolicy, resolveHostNpmPolicy } from '../../cli/utils/dependencies/cacheV4/npmPolicy.mjs';
-import { buildPin, collectGitInputs, PIN_VERIFICATION } from '../../cli/utils/dependencies/cacheV4/gitPins.mjs';
+} from '../../cli/utils/dependencies/store/installContract.mjs';
+import { NPM_BASE_INSTALL_ARGS, containerNpmPolicy, resolveHostNpmPolicy } from '../../cli/utils/dependencies/store/npmPolicy.mjs';
+import { buildPin, collectGitInputs, PIN_VERIFICATION } from '../../cli/utils/dependencies/store/gitPins.mjs';
 import { NPM_INSTALL_ARGS, buildContainerInstallScript } from '../../cli/utils/dependencies/dependencyCache.js';
-import * as cacheV4 from '../../cli/utils/dependencies/cacheV4/index.mjs';
+import * as dependencyStore from '../../cli/utils/dependencies/store/index.mjs';
 import {
     containerProvider,
     hostProbe,
     hostProvider,
     makeAgentLib,
     tempRoot,
-} from './cacheV4Fixtures.mjs';
+} from './dependencyStoreFixtures.mjs';
 
 const IMAGE_A = `sha256:${'a'.repeat(64)}`;
 const IMAGE_B = `sha256:${'b'.repeat(64)}`;
@@ -61,14 +61,14 @@ function plans(t, overrides = {}) {
     return { seed, agent, agentLib, root };
 }
 
-test('cache-v4 keys: canonical JSON sorts nested keys and never drops nested fields', () => {
+test('dependency store keys: canonical JSON sorts nested keys and never drops nested fields', () => {
     assert.equal(canonicalJson({ b: 1, a: { d: 2, c: [3, { f: 1, e: 0 }] } }), '{"a":{"c":[3,{"e":0,"f":1}],"d":2},"b":1}');
     assert.notEqual(canonicalDigest({ a: { b: 1 } }), canonicalDigest({ a: { b: 2 } }));
     assert.throws(() => canonicalJson({ a: Number.NaN }), /non-finite/);
     assert.throws(() => canonicalJson({ a: new Date(0) }), /non-plain/);
 });
 
-test('cache-v4 keys: unchanged inputs give identical full-length seed and agent keys', (t) => {
+test('dependency store keys: unchanged inputs give identical full-length seed and agent keys', (t) => {
     const root = tempRoot(t);
     const agentLib = makeAgentLib(root);
     const first = plans(t, { agentLib });
@@ -81,7 +81,7 @@ test('cache-v4 keys: unchanged inputs give identical full-length seed and agent 
     assert.equal(first.seed.contract.agent, undefined, 'seed contract carries no agent package or rebuild token');
 });
 
-test('cache-v4 keys: a nested-only manifest change changes the key', (t) => {
+test('dependency store keys: a nested-only manifest change changes the key', (t) => {
     const root = tempRoot(t);
     const agentLib = makeAgentLib(root);
     const a = plans(t, { agentLib, globalPackage: { ...GLOBAL, overrides: { foo: { bar: '1.0.0' } } } });
@@ -90,7 +90,7 @@ test('cache-v4 keys: a nested-only manifest change changes the key', (t) => {
     assert.notEqual(a.agent.inputKey, b.agent.inputKey);
 });
 
-test('cache-v4 keys: the immutable image ID, not the tag, identifies container inputs', (t) => {
+test('dependency store keys: the immutable image ID, not the tag, identifies container inputs', (t) => {
     const root = tempRoot(t);
     const agentLib = makeAgentLib(root);
     const ids = { 'node:20': IMAGE_A };
@@ -118,7 +118,7 @@ test('cache-v4 keys: the immutable image ID, not the tag, identifies container i
     assert.throws(() => containerProvider({ imageId: 'node:20', agentLib }), { code: 'PLOINKY_DEPS_IMAGE_IDENTITY_REQUIRED' });
 });
 
-test('cache-v4 keys: the engine is part of the container identity', (t) => {
+test('dependency store keys: the engine is part of the container identity', (t) => {
     const root = tempRoot(t);
     const agentLib = makeAgentLib(root);
     const podman = buildSeedInstallPlan({ provider: containerProvider({ imageId: IMAGE_A, agentLib }), globalPackage: GLOBAL, agentLibSelection: agentLib });
@@ -126,7 +126,7 @@ test('cache-v4 keys: the engine is part of the container identity', (t) => {
     assert.notEqual(podman.inputKey, docker.inputKey);
 });
 
-test('cache-v4 keys: agent package bytes and scripts change the agent key only', (t) => {
+test('dependency store keys: agent package bytes and scripts change the agent key only', (t) => {
     const root = tempRoot(t);
     const agentLib = makeAgentLib(root);
     const base = plans(t, { agentLib });
@@ -140,7 +140,7 @@ test('cache-v4 keys: agent package bytes and scripts change the agent key only',
     assert.notEqual(base.agent.inputKey, moved.agent.inputKey, 'package source/code selection is keyed');
 });
 
-test('cache-v4 keys: current merge semantics are preserved (agent optional/peer fields stay dropped)', (t) => {
+test('dependency store keys: current merge semantics are preserved (agent optional/peer fields stay dropped)', (t) => {
     const root = tempRoot(t);
     const agentLib = makeAgentLib(root);
     const { agent } = plans(t, {
@@ -154,12 +154,12 @@ test('cache-v4 keys: current merge semantics are preserved (agent optional/peer 
     assert.equal(agent.installManifest.name, 'agent');
 });
 
-test('cache-v4 keys: reserved AgentLib declarations are rejected before keying', (t) => {
+test('dependency store keys: reserved AgentLib declarations are rejected before keying', (t) => {
     assert.throws(() => plans(t, { agentPackage: agentPackage({ name: 'agent', dependencies: { achillesAgentLib: '1.0.0' } }) }),
         { code: 'PLOINKY_AGENTLIB_RESERVED_DEPENDENCY' });
 });
 
-test('cache-v4 keys: SDK bundle identity is keyed and in-Box SDK declarations are removed', (t) => {
+test('dependency store keys: SDK bundle identity is keyed and in-Box SDK declarations are removed', (t) => {
     const root = tempRoot(t);
     const agentLib = makeAgentLib(root);
     const none = plans(t, { agentLib });
@@ -175,7 +175,7 @@ test('cache-v4 keys: SDK bundle identity is keyed and in-Box SDK declarations ar
         { code: 'PLOINKY_DEPS_PROVIDER_MISMATCH' });
 });
 
-test('cache-v4 keys: AgentLib fingerprint and actual link target are keyed', (t) => {
+test('dependency store keys: AgentLib fingerprint and actual link target are keyed', (t) => {
     const root = tempRoot(t);
     const base = makeAgentLib(root, { name: 'lib-a' });
     const refingerprinted = { ...base, fingerprint: 'fp-2' };
@@ -195,7 +195,7 @@ test('cache-v4 keys: AgentLib fingerprint and actual link target are keyed', (t)
     assert.throws(() => hostProvider({ agentLib: { ...base, fingerprint: '' } }), { code: 'PLOINKY_DEPS_AGENTLIB_IDENTITY_MISSING' });
 });
 
-test('cache-v4 keys: host toolchain and explicit npm policy are keyed; credentials are not', (t) => {
+test('dependency store keys: host toolchain and explicit npm policy are keyed; credentials are not', (t) => {
     const root = tempRoot(t);
     const agentLib = makeAgentLib(root);
     const key = (options) => plans(t, { agentLib, providerOptions: options }).seed.inputKey;
@@ -220,7 +220,7 @@ test('cache-v4 keys: host toolchain and explicit npm policy are keyed; credentia
     assert.throws(() => hostProvider({ agentLib, probe: hostProbe({ arch: 'x64' }) }), { code: 'PLOINKY_DEPS_RUNTIME_KEY_MISMATCH' });
 });
 
-test('cache-v4 keys: container npm policy records the argv the container script actually runs', () => {
+test('dependency store keys: container npm policy records the argv the container script actually runs', () => {
     const policy = containerNpmPolicy();
     assert.equal(policy.source, 'image');
     assert.deepEqual(policy.args, NPM_INSTALL_ARGS);
@@ -229,7 +229,7 @@ test('cache-v4 keys: container npm policy records the argv the container script 
     assert.deepEqual(NPM_BASE_INSTALL_ARGS, [...NPM_INSTALL_ARGS, '--update-notifier=false'], 'host argv = legacy argv + disabled notifier');
 });
 
-test('cache-v4 keys: remote-verified pins change keys; observed-at-install and changed specs do not', (t) => {
+test('dependency store keys: remote-verified pins change keys; observed-at-install and changed specs do not', (t) => {
     const root = tempRoot(t);
     const agentLib = makeAgentLib(root);
     const url = 'git+file:///srv/remote.git';
@@ -252,7 +252,7 @@ test('cache-v4 keys: remote-verified pins change keys; observed-at-install and c
     assert.equal(inherited.seed.contract.global.pins.length, 0);
 });
 
-test('cache-v4 keys: the rebuild token changes only the agent key', (t) => {
+test('dependency store keys: the rebuild token changes only the agent key', (t) => {
     const root = tempRoot(t);
     const agentLib = makeAgentLib(root);
     const before = plans(t, { agentLib });
@@ -261,7 +261,7 @@ test('cache-v4 keys: the rebuild token changes only the agent key', (t) => {
     assert.equal(before.seed.inputKey, after.seed.inputKey);
 });
 
-test('cache-v4 keys: seed copies are allowed only for exact contracts without an npm run', (t) => {
+test('dependency store keys: seed copies are allowed only for exact contracts without an npm run', (t) => {
     const root = tempRoot(t);
     const agentLib = makeAgentLib(root);
     const withoutPackage = plans(t, { agentLib, agentPackage: null });
@@ -274,7 +274,7 @@ test('cache-v4 keys: seed copies are allowed only for exact contracts without an
     assert.equal(seedCopyEligibility(withoutPackage.agent, otherSeed).reason, 'provider contract differs');
 });
 
-test('cache-v4 keys: agent package source follows code/ precedence', (t) => {
+test('dependency store keys: agent package source follows code/ precedence', (t) => {
     const root = tempRoot(t);
     const agent = path.join(root, 'repo', 'agent');
     fs.mkdirSync(agent, { recursive: true });
@@ -290,9 +290,9 @@ test('cache-v4 keys: agent package source follows code/ precedence', (t) => {
     assert.match(code.sha256, /^[0-9a-f]{64}$/);
 });
 
-test('cache-v4 keys: the cache-v4 entry module exposes the integration API', () => {
+test('dependency store keys: the dependency store entry module exposes the integration API', () => {
     for (const name of ['buildSeedInstallPlan', 'buildAgentInstallPlan', 'createCacheStore', 'createHostNpmInstaller',
         'createContainerNpmInstaller', 'discoverGitPins', 'mergeDiscoveredPins', 'resolveHostNpmPolicy', 'containerToolchainIdentity']) {
-        assert.equal(typeof cacheV4[name], 'function', name);
+        assert.equal(typeof dependencyStore[name], 'function', name);
     }
 });

@@ -444,7 +444,7 @@ Agent cache behavior:
 | Manifest has only `start` and no agent package | Container startup may skip core dependency preparation. |
 | LLM runtime manifest | Forces dependency preparation. |
 
-The retired `deps` command no longer exposes this machinery. Runtimes resolve an immutable tree from `.ploinky/deps/cache-v4/` keyed by every install input; `reinstall <agent>` is the explicit rebuild.
+The retired `deps` command no longer exposes this machinery. Runtimes resolve an immutable tree from `.ploinky/deps/store/` keyed by every install input; `reinstall <agent>` is the explicit rebuild.
 
 There is also a legacy `dependencyInstaller.js` path used by lifecycle code only when profile lifecycle is run without `skipInstallHooks`; the main container creation path uses `dependencyCache.js`.
 

@@ -29,7 +29,7 @@ import {
     assertWorkspaceMutationLease,
 } from '../../runtime/maintenanceLocks.js';
 import { readProcessStartIdentity } from '../../../sandbox/processIdentity.js';
-import { cacheV4Error, canonicalDigest, sha256Hex } from './canonical.mjs';
+import { dependencyStoreError, canonicalDigest, sha256Hex } from './canonical.mjs';
 import {
     buildAgentInstallPlan,
     buildProviderContract,
@@ -42,7 +42,7 @@ import {
 } from './installContract.mjs';
 import { containerNpmPolicy, defaultNpmConfigSources, resolveHostNpmPolicy } from './npmPolicy.mjs';
 import { createContainerNpmInstaller, createHostNpmInstaller } from './installers.mjs';
-import { createCacheStore, CACHE_V4_DIRNAME } from './objectStore.mjs';
+import { createCacheStore, DEPENDENCY_STORE_DIRNAME } from './objectStore.mjs';
 import { readBootScope } from './receipts.mjs';
 
 export const DEPENDENCY_RECORD_SCHEMA = 1;
@@ -104,7 +104,7 @@ export function agentPackageSourceAt(agentCodePath, { workspaceRoot = PLOINKY_WO
 
 function memoized(memo, key, compute) {
     if (!memo || typeof memo.get !== 'function') return compute();
-    const full = `cache-v4:${key}`;
+    const full = `dependency-store:${key}`;
     if (memo.has(full)) return memo.get(full);
     const value = compute();
     memo.set(full, value);
@@ -124,7 +124,7 @@ export function planRuntimeDependencies(input, deps = {}) {
     const { family, runtimeKey, engine = '', image = '', agentCodePath, registration } = input;
     const parsed = parseRuntimeKey(runtimeKey);
     if (!parsed || parsed.family !== family) {
-        throw cacheV4Error('PLOINKY_DEPS_RUNTIME_KEY_INVALID', `runtime key ${runtimeKey} does not match runtime family ${family}`);
+        throw dependencyStoreError('PLOINKY_DEPS_RUNTIME_KEY_INVALID', `runtime key ${runtimeKey} does not match runtime family ${family}`);
     }
     const registrationId = registrationIdFor(registration);
     // A reinstall issued in this command acts on its DESIRED token (and builds
@@ -197,7 +197,7 @@ export function resolveDependencyLease(lease = null) {
         transient = createWorkspaceMutationLease({ operation: 'dependency-preparation' });
     } catch (error) {
         if (error?.code !== 'PLOINKY_WORKSPACE_MUTATION_BUSY') throw error;
-        throw cacheV4Error('PLOINKY_DEPS_WORKSPACE_LEASE_BUSY',
+        throw dependencyStoreError('PLOINKY_DEPS_WORKSPACE_LEASE_BUSY',
             `dependency preparation needs the workspace mutation lease, which is held by another operation (${error.message}); retry after it completes`);
     }
     return { lease: transient, release() { releaseWorkspaceMutationLease(transient); } };
@@ -272,7 +272,7 @@ export function prepareRuntimeDependencies(input, { lease = null, consumer, rein
     }
 }
 
-const REBUILD_MEMO_PREFIX = 'cache-v4:rebuild-request:';
+const REBUILD_MEMO_PREFIX = 'dependency-store:rebuild-request:';
 
 function requestedRebuildToken(memo, registration) {
     if (!memo || typeof memo.get !== 'function') return null;
@@ -290,7 +290,7 @@ function requestedRebuildToken(memo, registration) {
 export function issueDependencyRebuildRequest(registration, { lease = null } = {}, deps = {}) {
     const s = seams(deps);
     const registrationId = registrationIdFor(registration);
-    if (!registrationId) throw cacheV4Error('PLOINKY_DEPS_REGISTRATION_REQUIRED', 'a rebuild request needs one exact registration');
+    if (!registrationId) throw dependencyStoreError('PLOINKY_DEPS_REGISTRATION_REQUIRED', 'a rebuild request needs one exact registration');
     const held = s.resolveLease(lease);
     try {
         let issued = null;
@@ -345,7 +345,7 @@ function legacyCacheMount(record) {
         if (path.basename(source) !== 'node_modules') continue;
         const resolved = path.resolve(source);
         const deps = path.resolve(DEPS_DIR);
-        if (resolved.startsWith(`${deps}${path.sep}`) && !resolved.startsWith(`${path.join(deps, CACHE_V4_DIRNAME)}${path.sep}`)) {
+        if (resolved.startsWith(`${deps}${path.sep}`) && !resolved.startsWith(`${path.join(deps, DEPENDENCY_STORE_DIRNAME)}${path.sep}`)) {
             return resolved;
         }
     }

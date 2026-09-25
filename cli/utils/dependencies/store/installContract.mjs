@@ -23,7 +23,7 @@ import { AGENTLIB_ADAPTER_SCHEMA } from '../agentLibPackages.mjs';
 import { parseRuntimeKey } from '../dependencyRuntimeKey.js';
 import { AGENTLIB_STABLE_MOUNT_PATH } from '../../../../agentlib/contract.mjs';
 import { boxMcpSdkStampSection, needsNpmInstall, withoutBoxMcpSdk } from '../../../../ploinky-box/agent-dependencies/mcp-sdk.mjs';
-import { cacheV4Error, canonicalDigest, canonicalValue, sha256Hex } from './canonical.mjs';
+import { dependencyStoreError, canonicalDigest, canonicalValue, sha256Hex } from './canonical.mjs';
 import { collectGitInputs, desiredPinsFor, PIN_SECTIONS } from './gitPins.mjs';
 import { parseGitDependencySpec, rewriteSpecToCommit } from './gitSpec.mjs';
 import { containerNpmPolicy } from './npmPolicy.mjs';
@@ -41,7 +41,7 @@ const INSTALL_SECTIONS = Object.freeze([
 export function normalizeImageId(raw) {
     const match = IMAGE_ID_PATTERN.exec(String(raw || '').trim().toLowerCase());
     if (!match) {
-        throw cacheV4Error('PLOINKY_DEPS_IMAGE_IDENTITY_REQUIRED',
+        throw dependencyStoreError('PLOINKY_DEPS_IMAGE_IDENTITY_REQUIRED',
             `container dependency caches require an immutable image ID; '${String(raw || '').slice(0, 80)}' is not one`);
     }
     return `sha256:${match[1]}`;
@@ -52,7 +52,7 @@ export function defaultInspectImage({ runtime, image }) {
         encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000,
     });
     if (result.error || result.status !== 0) {
-        throw cacheV4Error('PLOINKY_DEPS_IMAGE_IDENTITY_REQUIRED',
+        throw dependencyStoreError('PLOINKY_DEPS_IMAGE_IDENTITY_REQUIRED',
             `could not inspect the immutable ID of image '${image}' (${result.error?.code || `exit ${result.status}`})`);
     }
     return String(result.stdout || '').trim().split('\n')[0];
@@ -62,10 +62,10 @@ export function defaultInspectImage({ runtime, image }) {
 export function containerToolchainIdentity({ runtime, image, inspectImage = defaultInspectImage }) {
     const engine = String(runtime || '').trim();
     if (!['podman', 'docker'].includes(engine)) {
-        throw cacheV4Error('PLOINKY_DEPS_ENGINE_UNSUPPORTED', `unsupported container engine '${engine}'`);
+        throw dependencyStoreError('PLOINKY_DEPS_ENGINE_UNSUPPORTED', `unsupported container engine '${engine}'`);
     }
     const reference = String(image || '').trim();
-    if (!reference) throw cacheV4Error('PLOINKY_DEPS_IMAGE_IDENTITY_REQUIRED', 'container dependency caches require an image');
+    if (!reference) throw dependencyStoreError('PLOINKY_DEPS_IMAGE_IDENTITY_REQUIRED', 'container dependency caches require an image');
     const imageId = normalizeImageId(inspectImage({ runtime: engine, image: reference }));
     return { identity: { kind: 'container', engine, imageId }, diagnostics: { imageReference: reference } };
 }
@@ -112,12 +112,12 @@ export function defaultProbeHostToolchain({ env = process.env, fsApi = fs, spawn
     const npmPath = findOnPath('npm', env, fsApi);
     const nodePath = findOnPath('node', env, fsApi);
     if (!npmPath || !nodePath) {
-        throw cacheV4Error('PLOINKY_DEPS_HOST_TOOLCHAIN_MISSING', 'host dependency caches require node and npm on PATH');
+        throw dependencyStoreError('PLOINKY_DEPS_HOST_TOOLCHAIN_MISSING', 'host dependency caches require node and npm on PATH');
     }
     const node = spawn(nodePath, ['-e', NODE_PROBE], { encoding: 'utf8', timeout: 15_000, env: { PATH: env.PATH || '' } });
     const npm = spawn(npmPath, ['--version'], { encoding: 'utf8', timeout: 30_000, env: { PATH: env.PATH || '', HOME: env.HOME || '' } });
     if (node.status !== 0 || npm.status !== 0) {
-        throw cacheV4Error('PLOINKY_DEPS_HOST_TOOLCHAIN_MISSING', 'could not probe the host node/npm toolchain');
+        throw dependencyStoreError('PLOINKY_DEPS_HOST_TOOLCHAIN_MISSING', 'could not probe the host node/npm toolchain');
     }
     const nodeInfo = JSON.parse(node.stdout);
     const npmRealpath = fsApi.realpathSync(npmPath);
@@ -145,11 +145,11 @@ export function defaultProbeHostToolchain({ env = process.env, fsApi = fs, spawn
 export function hostToolchainIdentity({ runtimeKey, probe }) {
     const parsed = parseRuntimeKey(runtimeKey);
     if (!parsed || !['bwrap', 'seatbelt'].includes(parsed.family)) {
-        throw cacheV4Error('PLOINKY_DEPS_RUNTIME_KEY_INVALID', `host dependency caches require a bwrap/seatbelt runtime key (got ${runtimeKey})`);
+        throw dependencyStoreError('PLOINKY_DEPS_RUNTIME_KEY_INVALID', `host dependency caches require a bwrap/seatbelt runtime key (got ${runtimeKey})`);
     }
     const nodeMajor = Number.parseInt(String(probe?.node?.version || '').split('.')[0], 10);
     if (probe?.platform !== parsed.platform || probe?.arch !== parsed.arch || nodeMajor !== parsed.nodeMajor) {
-        throw cacheV4Error('PLOINKY_DEPS_RUNTIME_KEY_MISMATCH',
+        throw dependencyStoreError('PLOINKY_DEPS_RUNTIME_KEY_MISMATCH',
             `host toolchain ${probe?.platform}-${probe?.arch}-node${nodeMajor} does not match runtime key ${runtimeKey}`);
     }
     return { kind: 'host', ...canonicalValue(probe) };
@@ -160,7 +160,7 @@ export function agentLibInstallIdentity(runtimeFamily, selection) {
     const fingerprint = String(selection?.fingerprint || '').trim();
     const sourceDir = String(selection?.sourceDir || '').trim();
     if (!fingerprint || !sourceDir) {
-        throw cacheV4Error('PLOINKY_DEPS_AGENTLIB_IDENTITY_MISSING',
+        throw dependencyStoreError('PLOINKY_DEPS_AGENTLIB_IDENTITY_MISSING',
             'dependency caches require the selected AgentLib source directory and content fingerprint');
     }
     const container = runtimeFamily === 'container';
@@ -185,14 +185,14 @@ export function agentLibInstallIdentity(runtimeFamily, selection) {
  */
 export function buildProviderContract({ runtimeKey, toolchain, npmPolicy, sdkBundle = null, agentLib }) {
     const parsed = parseRuntimeKey(runtimeKey);
-    if (!parsed) throw cacheV4Error('PLOINKY_DEPS_RUNTIME_KEY_INVALID', `invalid runtime key ${runtimeKey}`);
+    if (!parsed) throw dependencyStoreError('PLOINKY_DEPS_RUNTIME_KEY_INVALID', `invalid runtime key ${runtimeKey}`);
     if (!toolchain || (toolchain.kind === 'container') !== (parsed.family === 'container')) {
-        throw cacheV4Error('PLOINKY_DEPS_TOOLCHAIN_INVALID', `toolchain identity does not match runtime family ${parsed.family}`);
+        throw dependencyStoreError('PLOINKY_DEPS_TOOLCHAIN_INVALID', `toolchain identity does not match runtime family ${parsed.family}`);
     }
     if (toolchain.kind === 'container') normalizeImageId(toolchain.imageId);
     if (!npmPolicy || (toolchain.kind === 'container' && npmPolicy.source !== 'image')
         || (toolchain.kind === 'host' && npmPolicy.source !== 'host-explicit')) {
-        throw cacheV4Error('PLOINKY_DEPS_NPM_POLICY_INVALID', 'npm policy does not match the installer kind');
+        throw dependencyStoreError('PLOINKY_DEPS_NPM_POLICY_INVALID', 'npm policy does not match the installer kind');
     }
     return canonicalValue({
         schema: CONTRACT_SCHEMA,
@@ -268,11 +268,11 @@ function installSections(manifest) {
 function assertProviderInputs(provider, sdkBundle, agentLibSelection) {
     const expectedSdk = sdkBundle ? boxMcpSdkStampSection(sdkBundle) : null;
     if (canonicalDigest({ sdk: expectedSdk }) !== canonicalDigest({ sdk: provider?.providers?.mcpSdk ?? null })) {
-        throw cacheV4Error('PLOINKY_DEPS_PROVIDER_MISMATCH', 'the SDK bundle differs from the provider contract');
+        throw dependencyStoreError('PLOINKY_DEPS_PROVIDER_MISMATCH', 'the SDK bundle differs from the provider contract');
     }
     const agentLib = agentLibInstallIdentity(provider?.runtime?.family, agentLibSelection);
     if (canonicalDigest(agentLib) !== canonicalDigest(provider?.providers?.agentLib || {})) {
-        throw cacheV4Error('PLOINKY_DEPS_PROVIDER_MISMATCH', 'the AgentLib selection differs from the provider contract');
+        throw dependencyStoreError('PLOINKY_DEPS_PROVIDER_MISMATCH', 'the AgentLib selection differs from the provider contract');
     }
 }
 
@@ -360,7 +360,7 @@ export function buildAgentInstallPlan({
     merge = mergePackageJson,
 }) {
     const registrationId = String(registration || '').trim();
-    if (!registrationId) throw cacheV4Error('PLOINKY_DEPS_REGISTRATION_REQUIRED', 'agent dependency plans require a registration id');
+    if (!registrationId) throw dependencyStoreError('PLOINKY_DEPS_REGISTRATION_REQUIRED', 'agent dependency plans require a registration id');
     const globalEffective = filterProviders(globalPackage, sdkBundle, 'globalDeps/package.json');
     const agentEffective = agentPackage?.manifest ? filterProviders(agentPackage.manifest, sdkBundle, 'agent package.json') : null;
     // Current merge semantics: fields the merge drops stay dropped.

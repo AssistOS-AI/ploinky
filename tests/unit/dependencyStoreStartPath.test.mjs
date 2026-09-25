@@ -11,16 +11,16 @@ import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-import { installFakeEngine } from './cacheV4FakeEngine.mjs';
-import { tempRoot } from './cacheV4Fixtures.mjs';
-import { hashInstalledTree } from '../../cli/utils/dependencies/cacheV4/treeHash.mjs';
+import { installFakeEngine } from './dependencyStoreFakeEngine.mjs';
+import { tempRoot } from './dependencyStoreFixtures.mjs';
+import { hashInstalledTree } from '../../cli/utils/dependencies/store/treeHash.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const DRIVER = path.join(HERE, 'cacheV4StartDriver.mjs');
+const DRIVER = path.join(HERE, 'dependencyStoreStartDriver.mjs');
 const CONTAINER = 'ploinky_repo_demo';
 
 function workspace(t, { runtime = 'podman', manifest = null, packageJson = { name: 'demo', dependencies: { 'left-pad': '1.3.0' } } } = {}) {
-    const root = tempRoot(t, 'cachev4-start-');
+    const root = tempRoot(t, 'depstore-start-');
     const ws = path.join(root, 'ws');
     const agentDir = path.join(ws, '.ploinky', 'repos', 'repo', 'demo');
     fs.mkdirSync(path.join(agentDir, 'code'), { recursive: true });
@@ -50,8 +50,8 @@ function drive(w, steps) {
     const out = path.join(w.root, `out-${crypto.randomUUID()}.json`);
     const config = path.join(w.root, `config-${crypto.randomUUID()}.json`);
     fs.writeFileSync(config, JSON.stringify({ steps, out }));
-    const run = spawnSync(process.execPath, [DRIVER, config], { cwd: w.ws, env: { ...w.env, ...(process.env.CACHEV4_DEBUG ? { PLOINKY_DEBUG: '1' } : {}) }, encoding: 'utf8', timeout: 120_000 });
-    if (process.env.CACHEV4_DEBUG) console.log(run.stdout);
+    const run = spawnSync(process.execPath, [DRIVER, config], { cwd: w.ws, env: { ...w.env, ...(process.env.DEPENDENCY_STORE_DEBUG ? { PLOINKY_DEBUG: '1' } : {}) }, encoding: 'utf8', timeout: 120_000 });
+    if (process.env.DEPENDENCY_STORE_DEBUG) console.log(run.stdout);
     assert.equal(run.status, 0, `${run.stdout}\n${run.stderr}`);
     return JSON.parse(fs.readFileSync(out, 'utf8'));
 }
@@ -80,7 +80,7 @@ function assertOk(steps, name) {
 
 for (const runtime of ['podman', 'docker']) {
     const layout = runtime === 'podman' ? 'staged Podman' : 'non-staged Docker';
-    test(`cache-v4 start path (${layout}): first start builds, warm restart reuses, a package change replaces`, (t) => {
+    test(`dependency store start path (${layout}): first start builds, warm restart reuses, a package change replaces`, (t) => {
         const w = workspace(t, { runtime });
         const steps = byStep(drive(w, [
             { action: 'init-edge' },
@@ -137,7 +137,7 @@ for (const runtime of ['podman', 'docker']) {
     });
 }
 
-test('cache-v4 start path: a legacy-cache runtime is replaced once, never adopted', (t) => {
+test('dependency store start path: a legacy-cache runtime is replaced once, never adopted', (t) => {
     const w = workspace(t);
     const legacy = path.join(w.ws, '.ploinky', 'deps', 'agents', 'repo', 'demo', 'container-linux-x64-glibc-node20', 'node_modules');
     fs.mkdirSync(legacy, { recursive: true });
@@ -167,7 +167,7 @@ test('cache-v4 start path: a legacy-cache runtime is replaced once, never adopte
     assert.ok(fs.existsSync(legacy), 'the legacy cache is ignored, never deleted here');
 });
 
-test('cache-v4 start path: a start-only agent without package.json keeps its no-cache path', (t) => {
+test('dependency store start path: a start-only agent without package.json keeps its no-cache path', (t) => {
     const w = workspace(t, { packageJson: null });
     const steps = byStep(drive(w, [
         { action: 'init-edge' },
@@ -180,10 +180,10 @@ test('cache-v4 start path: a start-only agent without package.json keeps its no-
     assert.equal(first.dependencies.mode, 'none');
     assert.equal(assertOk(steps, 'warm').createdByThisLaunch, false);
     assert.equal(w.engine.state().installs.length, 0, 'no dependency build for no-cache agents');
-    assert.equal(fs.existsSync(path.join(w.ws, '.ploinky', 'deps', 'cache-v4', 'objects')), false);
+    assert.equal(fs.existsSync(path.join(w.ws, '.ploinky', 'deps', 'store', 'objects')), false);
 });
 
-test('cache-v4 start path: a coordinated same-name host/none replacement removes its exact predecessor', (t) => {
+test('dependency store start path: a coordinated same-name host/none replacement removes its exact predecessor', (t) => {
     // Regression: the coordinator rotates the registered tuple before launch,
     // so predecessor ownership must be proven with the pre-rotation record.
     const w = workspace(t);
@@ -207,7 +207,7 @@ test('cache-v4 start path: a coordinated same-name host/none replacement removes
     assert.equal(w.engine.state().installs.length, 1);
 });
 
-test('cache-v4 start path (seatbelt): first start builds, warm reuses, a package change replaces behind the fail-closed link', { skip: process.platform !== 'darwin' && 'seatbelt runs on macOS only' }, (t) => {
+test('dependency store start path (seatbelt): first start builds, warm reuses, a package change replaces behind the fail-closed link', { skip: process.platform !== 'darwin' && 'seatbelt runs on macOS only' }, (t) => {
     const w = workspace(t, {
         manifest: { 'lite-sandbox': true, start: 'node index.js', network: { mode: 'host' }, readiness: { protocol: 'none' } },
     });
@@ -232,8 +232,8 @@ test('cache-v4 start path (seatbelt): first start builds, warm reuses, a package
     const warm = assertOk(steps, 'warm');
     assert.equal(warm.createdByThisLaunch, false);
     assert.equal(w.engine.state().installs.length, 1, 'warm start performs no installer calls');
-    const receipts = fs.readdirSync(path.join(w.ws, '.ploinky', 'deps', 'cache-v4', 'receipts', 'readers'))
-        .map((name) => JSON.parse(fs.readFileSync(path.join(w.ws, '.ploinky', 'deps', 'cache-v4', 'receipts', 'readers', name), 'utf8')));
+    const receipts = fs.readdirSync(path.join(w.ws, '.ploinky', 'deps', 'store', 'receipts', 'readers'))
+        .map((name) => JSON.parse(fs.readFileSync(path.join(w.ws, '.ploinky', 'deps', 'store', 'receipts', 'readers', name), 'utf8')));
     assert.ok(receipts.some((receipt) => receipt.consumer.kind === 'seatbelt-service' && receipt.consumer.phase === 'running' && receipt.consumer.process?.pid),
         'the service receipt records its sandbox process');
 

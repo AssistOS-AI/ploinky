@@ -6,11 +6,11 @@ import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { refreshUpdateGitPins } from '../../cli/utils/dependencies/cacheV4/updatePins.mjs';
-import { createCacheStore } from '../../cli/utils/dependencies/cacheV4/objectStore.mjs';
-import { collectGitInputs, desiredPinsFor } from '../../cli/utils/dependencies/cacheV4/gitPins.mjs';
-import { buildAgentInstallPlan } from '../../cli/utils/dependencies/cacheV4/installContract.mjs';
-import { fakeLease, gitEnv, git, hostProvider, makeAgentLib, markerRemote, tempRoot } from './cacheV4Fixtures.mjs';
+import { refreshUpdateGitPins } from '../../cli/utils/dependencies/store/updatePins.mjs';
+import { createCacheStore } from '../../cli/utils/dependencies/store/objectStore.mjs';
+import { collectGitInputs, desiredPinsFor } from '../../cli/utils/dependencies/store/gitPins.mjs';
+import { buildAgentInstallPlan } from '../../cli/utils/dependencies/store/installContract.mjs';
+import { fakeLease, gitEnv, git, hostProvider, makeAgentLib, markerRemote, tempRoot } from './dependencyStoreFixtures.mjs';
 
 const PROJECT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
@@ -152,7 +152,7 @@ for (const form of ['repo', 'repos', 'all']) {
         const moduleUrl = relative => pathToFileURL(path.join(PROJECT, relative)).href;
         const script = `
             import fs from 'node:fs'; import path from 'node:path'; import assert from 'node:assert/strict';
-            import {gitEnv,git,markerRemote} from ${JSON.stringify(moduleUrl('tests/unit/cacheV4Fixtures.mjs'))};
+            import {gitEnv,git,markerRemote} from ${JSON.stringify(moduleUrl('tests/unit/dependencyStoreFixtures.mjs'))};
             const root=${JSON.stringify(root)},workspace=${JSON.stringify(workspace)}, env=gitEnv(root);
             const remote=markerRemote(root,env), source=path.join(root,'agent-source');
             function init(dir,files){fs.mkdirSync(dir,{recursive:true});git(dir,['init','-q','-b','main'],env);for(const [name,bytes] of Object.entries(files)){const f=path.join(dir,name);fs.mkdirSync(path.dirname(f),{recursive:true});fs.writeFileSync(f,bytes);}git(dir,['add','.'],env);git(dir,['commit','-qm','fixture'],env);}
@@ -162,10 +162,10 @@ for (const form of ['repo', 'repos', 'all']) {
             fs.writeFileSync(path.join(workspace,'.ploinky/agents.json'),JSON.stringify({first_alias:{type:'agent',repoName:'UnitPinRepo',agentName:'agent',alias:'first'},second_alias:{type:'agent',repoName:'UnitPinRepo',agentName:'agent',alias:'second'}}));
             const commands=await import(${JSON.stringify(moduleUrl('cli/commands/repoAgentCommands.js'))});
             const result=await (${form === 'repo' ? "commands.updateRepoResult('UnitPinRepo')" : form === 'repos' ? 'commands.updatePloinkyRepos({interactiveSession:true})' : 'commands.updateAllRepos(workspace,{interactiveSession:true})'});
-            const pins=JSON.parse(fs.readFileSync(path.join(workspace,'.ploinky/deps/cache-v4/state/pins.json'))).pins;
+            const pins=JSON.parse(fs.readFileSync(path.join(workspace,'.ploinky/deps/store/state/pins.json'))).pins;
             assert.equal(Object.values(pins).filter(p=>p.name==='markerpkg'&&p.commit===remote.first).length,2);
             assert.ok(result.records.some(r=>r.phase==='git-pin'&&r.outcome==='changed'));
-            assert.deepEqual(fs.readdirSync(path.join(workspace,'.ploinky/deps/cache-v4/objects')),[]);
+            assert.deepEqual(fs.readdirSync(path.join(workspace,'.ploinky/deps/store/objects')),[]);
             console.log('PINS_API_OK');
         `;
         try {

@@ -1,5 +1,5 @@
-// Child process used by cacheV4Crash tests (not a test file).
-// Usage: node cacheV4ChildWorker.mjs <config.json>
+// Child process used by dependencyStoreCrash tests (not a test file).
+// Usage: node dependencyStoreChildWorker.mjs <config.json>
 // The config names the workspace, a serialized plan and an optional stage at
 // which the child exits abruptly (no finally/catch runs) or blocks until killed.
 
@@ -7,9 +7,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const config = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
-const { createCacheStore } = await import('../../cli/utils/dependencies/cacheV4/objectStore.mjs');
-const { currentWriterIdentity } = await import('../../cli/utils/dependencies/cacheV4/receipts.mjs');
-const { fakeInstaller } = await import('./cacheV4Fixtures.mjs');
+const { createCacheStore } = await import('../../cli/utils/dependencies/store/objectStore.mjs');
+const { currentWriterIdentity } = await import('../../cli/utils/dependencies/store/receipts.mjs');
+const { fakeInstaller } = await import('./dependencyStoreFixtures.mjs');
 
 const block = () => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
 const hooks = {

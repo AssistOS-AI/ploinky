@@ -6,24 +6,24 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { createCacheStore } from '../../cli/utils/dependencies/cacheV4/objectStore.mjs';
+import { createCacheStore } from '../../cli/utils/dependencies/store/objectStore.mjs';
 import {
     buildProviderContract,
     buildSeedInstallPlan,
     defaultProbeHostToolchain,
     hostToolchainIdentity,
-} from '../../cli/utils/dependencies/cacheV4/installContract.mjs';
-import { resolveHostNpmPolicy } from '../../cli/utils/dependencies/cacheV4/npmPolicy.mjs';
-import { createHostNpmInstaller } from '../../cli/utils/dependencies/cacheV4/installers.mjs';
-import { collectGitInputs, discoverGitPins, mergeDiscoveredPins } from '../../cli/utils/dependencies/cacheV4/gitPins.mjs';
-import { readHiddenLock, verifyDirectGitProvenance } from '../../cli/utils/dependencies/cacheV4/resolution.mjs';
-import { fakeLease, git, gitEnv, hasCommand, makeAgentLib, markerRemote, tempRoot } from './cacheV4Fixtures.mjs';
+} from '../../cli/utils/dependencies/store/installContract.mjs';
+import { resolveHostNpmPolicy } from '../../cli/utils/dependencies/store/npmPolicy.mjs';
+import { createHostNpmInstaller } from '../../cli/utils/dependencies/store/installers.mjs';
+import { collectGitInputs, discoverGitPins, mergeDiscoveredPins } from '../../cli/utils/dependencies/store/gitPins.mjs';
+import { readHiddenLock, verifyDirectGitProvenance } from '../../cli/utils/dependencies/store/resolution.mjs';
+import { fakeLease, git, gitEnv, hasCommand, makeAgentLib, markerRemote, tempRoot } from './dependencyStoreFixtures.mjs';
 
 const AVAILABLE = hasCommand('npm') && hasCommand('git');
 const CONSUMER = Object.freeze({ kind: 'test-consumer', process: { pid: process.pid } });
 
 function realSetup(t) {
-    const root = tempRoot(t, 'cachev4-npm-');
+    const root = tempRoot(t, 'depstore-npm-');
     const home = path.join(root, 'home');
     fs.mkdirSync(home);
     const env = { PATH: process.env.PATH, HOME: home, TMPDIR: process.env.TMPDIR || root };
@@ -54,7 +54,7 @@ function realSetup(t) {
 const marker = (generation) => fs.readFileSync(path.join(generation.nodeModulesPath, 'markerpkg', 'index.js'), 'utf8').trim();
 const manifestOf = (store, generation) => JSON.parse(fs.readFileSync(path.join(store.paths.objects, generation.objectId, 'manifest.json'), 'utf8'));
 
-test('cache-v4 npm: exact equal-version commits install distinguishable bytes with matching provenance', { skip: !AVAILABLE && 'npm or git unavailable', timeout: 300_000 }, (t) => {
+test('dependency store npm: exact equal-version commits install distinguishable bytes with matching provenance', { skip: !AVAILABLE && 'npm or git unavailable', timeout: 300_000 }, (t) => {
     const { remote, gEnv, installer, calls, lease, storeAt, planFor } = realSetup(t);
     const store = storeAt('deps');
     const spec = { markerpkg: `${remote.url}#main` };
@@ -101,7 +101,7 @@ test('cache-v4 npm: exact equal-version commits install distinguishable bytes wi
     assert.equal(store.validateObject(second.objectId, { inputKey: pinnedPlan.inputKey }).reason, 'installed tree hash mismatch');
 });
 
-test('cache-v4 npm: stale npm state, missing metadata and resolution failure prevent publication', { skip: !AVAILABLE && 'npm or git unavailable', timeout: 300_000 }, (t) => {
+test('dependency store npm: stale npm state, missing metadata and resolution failure prevent publication', { skip: !AVAILABLE && 'npm or git unavailable', timeout: 300_000 }, (t) => {
     const { root, remote, installer, realInstaller, calls, lease, storeAt, planFor } = realSetup(t);
     const store = storeAt('deps');
     const firstPlan = planFor({ markerpkg: `${remote.url}#${remote.first}` });

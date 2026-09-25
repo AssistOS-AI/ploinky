@@ -631,7 +631,7 @@ test('managed adoption derives one exact dependency runtime key from registered 
     // Immutable store payloads are recognized as their own layout; a legacy
     // mount is reported as legacy so callers replace instead of adopting.
     const objectId = '11111111-2222-4333-8444-555555555555';
-    const payloadPath = path.join(DEPS_DIR, 'cache-v4', 'objects', objectId, 'payload');
+    const payloadPath = path.join(DEPS_DIR, 'store', 'objects', objectId, 'payload');
     assert.deepEqual(resolveManagedAdoptionAgentCacheMount({
         config: { binds: [{ source: path.join(payloadPath, 'node_modules'), target: '/code/node_modules', ro: true }] },
     }, repoName, agentName), {

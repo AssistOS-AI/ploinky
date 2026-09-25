@@ -119,9 +119,9 @@ import {
     noCacheDependencyRecord,
     prepareRuntimeDependencies,
     runtimeDependencyReuseProblem,
-} from '../../utils/dependencies/cacheV4/runtimeDependencies.mjs';
-import { CACHE_V4_DIRNAME } from '../../utils/dependencies/cacheV4/objectStore.mjs';
-import { containerToolchainIdentity } from '../../utils/dependencies/cacheV4/installContract.mjs';
+} from '../../utils/dependencies/store/runtimeDependencies.mjs';
+import { DEPENDENCY_STORE_DIRNAME } from '../../utils/dependencies/store/objectStore.mjs';
+import { containerToolchainIdentity } from '../../utils/dependencies/store/installContract.mjs';
 import { DEPS_DIR } from '../../utils/config.js';
 import {
     agentLibCacheLinkProblem,
@@ -1302,7 +1302,7 @@ function managedAdoptionLlmPaths(llmStartup) {
 
 function resolveManagedAdoptionAgentCacheMount(record, repoName, agentName) {
     const matches = new Map();
-    const storeObjects = path.join(path.resolve(DEPS_DIR), CACHE_V4_DIRNAME, 'objects');
+    const storeObjects = path.join(path.resolve(DEPS_DIR), DEPENDENCY_STORE_DIRNAME, 'objects');
     for (const bind of record?.config?.binds || []) {
         const source = String(bind?.source || '').trim();
         if (!source || path.basename(source) !== 'node_modules') continue;

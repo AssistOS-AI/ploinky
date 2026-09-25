@@ -1,4 +1,4 @@
-// Public surface of the immutable dependency cache (cache-v4) for lifecycle
+// Public surface of the immutable dependency store for lifecycle
 // integration. Runtime callers use installContract to build plans, the object
 // store to resolve generations under their held workspace lease, and the
 // installers for real npm runs. Only the update flow calls discoverGitPins.
@@ -26,7 +26,7 @@ export {
     recordObservedPins,
 } from './gitPins.mjs';
 export { parseGitDependencySpec } from './gitSpec.mjs';
-export { CACHE_V4_DIRNAME, createCacheStore, generationIdFor } from './objectStore.mjs';
+export { DEPENDENCY_STORE_DIRNAME, createCacheStore, generationIdFor } from './objectStore.mjs';
 export { createContainerNpmInstaller, createHostNpmInstaller } from './installers.mjs';
 export {
     currentWriterIdentity,

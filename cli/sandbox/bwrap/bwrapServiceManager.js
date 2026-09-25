@@ -90,7 +90,7 @@ import {
     prepareRuntimeDependencies,
     runtimeDependencyReuseProblem,
     sandboxProcessIdentity,
-} from '../../utils/dependencies/cacheV4/runtimeDependencies.mjs';
+} from '../../utils/dependencies/store/runtimeDependencies.mjs';
 import {
     assertBwrapPidSlotAvailable,
     isBwrapProcessRunning,

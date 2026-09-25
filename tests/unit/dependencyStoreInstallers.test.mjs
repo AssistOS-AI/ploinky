@@ -3,20 +3,20 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { createContainerNpmInstaller, createHostNpmInstaller, containerInstallName } from '../../cli/utils/dependencies/cacheV4/installers.mjs';
-import { buildHostNpmEnv, resolveHostNpmPolicy } from '../../cli/utils/dependencies/cacheV4/npmPolicy.mjs';
-import { hashInstalledTree } from '../../cli/utils/dependencies/cacheV4/treeHash.mjs';
+import { createContainerNpmInstaller, createHostNpmInstaller, containerInstallName } from '../../cli/utils/dependencies/store/installers.mjs';
+import { buildHostNpmEnv, resolveHostNpmPolicy } from '../../cli/utils/dependencies/store/npmPolicy.mjs';
+import { hashInstalledTree } from '../../cli/utils/dependencies/store/treeHash.mjs';
 import {
     defaultProveBuildQuiescent,
     defaultProveReaderQuiescent,
     processIdentityEnded,
-} from '../../cli/utils/dependencies/cacheV4/receipts.mjs';
-import { hostProbe, tempRoot } from './cacheV4Fixtures.mjs';
+} from '../../cli/utils/dependencies/store/receipts.mjs';
+import { hostProbe, tempRoot } from './dependencyStoreFixtures.mjs';
 
 const IMAGE = `sha256:${'a'.repeat(64)}`;
 const OBJECT_ID = '11111111-2222-4333-8444-555555555555';
 
-test('cache-v4 installers: the host adapter runs the probed node/npm with an isolated, allowlisted environment', (t) => {
+test('dependency store installers: the host adapter runs the probed node/npm with an isolated, allowlisted environment', (t) => {
     const root = tempRoot(t);
     const payloadDir = path.join(root, 'payload');
     const workDir = path.join(root, 'work');
@@ -64,7 +64,7 @@ test('cache-v4 installers: the host adapter runs the probed node/npm with an iso
     assert.equal(result.outputTail.includes('super-secret-token'), false, 'credential values are redacted from output');
 });
 
-test('cache-v4 installers: host install failures and deadlines are named', (t) => {
+test('dependency store installers: host install failures and deadlines are named', (t) => {
     const root = tempRoot(t);
     fs.mkdirSync(path.join(root, 'work'));
     const { policy } = resolveHostNpmPolicy({ env: {}, files: [] });
@@ -74,7 +74,7 @@ test('cache-v4 installers: host install failures and deadlines are named', (t) =
     assert.throws(() => slow.install({ payloadDir: root, workDir: path.join(root, 'work') }), { code: 'PLOINKY_DEPS_INSTALL_TIMEOUT' });
 });
 
-test('cache-v4 installers: the container adapter runs the immutable image ID under a unique name', (t) => {
+test('dependency store installers: the container adapter runs the immutable image ID under a unique name', (t) => {
     const root = tempRoot(t);
     fs.mkdirSync(path.join(root, 'work'));
     const calls = [];
@@ -97,7 +97,7 @@ test('cache-v4 installers: the container adapter runs the immutable image ID und
     assert.throws(() => createContainerNpmInstaller({ engine: 'podman', imageId: 'node:20' }), { code: 'PLOINKY_DEPS_IMAGE_IDENTITY_REQUIRED' });
 });
 
-test('cache-v4 tree: hashes paths, bytes, exec bit and symlink text without following links', (t) => {
+test('dependency store tree: hashes paths, bytes, exec bit and symlink text without following links', (t) => {
     const root = tempRoot(t);
     const payload = path.join(root, 'payload');
     const external = path.join(root, 'agentlib');
@@ -128,7 +128,7 @@ test('cache-v4 tree: hashes paths, bytes, exec bit and symlink text without foll
     }
 });
 
-test('cache-v4 receipts: PID absence proves quiescence only in the same boot scope', () => {
+test('dependency store receipts: PID absence proves quiescence only in the same boot scope', () => {
     const identity = { pid: 4242, processStart: 'start-a', bootScope: 'scope-1' };
     assert.equal(processIdentityEnded(identity, { bootScope: 'scope-1', isAlive: () => false }).ended, true);
     assert.equal(processIdentityEnded(identity, { bootScope: 'scope-2', isAlive: () => false }).ended, false, 'another boot/namespace is unknown');
@@ -147,7 +147,7 @@ test('cache-v4 receipts: PID absence proves quiescence only in the same boot sco
     assert.equal(defaultProveReaderQuiescent({ consumer: { kind: 'container', engine: 'podman', containerId: 'abc' } }, { inspectContainer: () => 'absent' }).quiescent, true);
 });
 
-test('cache-v4 npm env: explicit isolated config paths override any inherited value', () => {
+test('dependency store npm env: explicit isolated config paths override any inherited value', () => {
     const { policy, transport } = resolveHostNpmPolicy({ env: {}, files: [] });
     const env = buildHostNpmEnv({
         env: { PATH: '/a:/fake/bin:/b', HOME: '/h', npm_config_cache: '/ambient', NODE_ENV: 'development' },

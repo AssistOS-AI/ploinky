@@ -5,11 +5,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync as spawnSyncReal } from 'node:child_process';
 
-import { createCacheStore, defaultCopySeed, generationIdFor } from '../../cli/utils/dependencies/cacheV4/objectStore.mjs';
-import { buildAgentInstallPlan, buildSeedInstallPlan } from '../../cli/utils/dependencies/cacheV4/installContract.mjs';
-import { PIN_VERIFICATION, buildPin, recordObservedPins } from '../../cli/utils/dependencies/cacheV4/gitPins.mjs';
-import { hashInstalledTree } from '../../cli/utils/dependencies/cacheV4/treeHash.mjs';
-import { fakeInstaller, fakeLease, hostProvider, makeAgentLib, tempRoot } from './cacheV4Fixtures.mjs';
+import { createCacheStore, defaultCopySeed, generationIdFor } from '../../cli/utils/dependencies/store/objectStore.mjs';
+import { buildAgentInstallPlan, buildSeedInstallPlan } from '../../cli/utils/dependencies/store/installContract.mjs';
+import { PIN_VERIFICATION, buildPin, recordObservedPins } from '../../cli/utils/dependencies/store/gitPins.mjs';
+import { hashInstalledTree } from '../../cli/utils/dependencies/store/treeHash.mjs';
+import { fakeInstaller, fakeLease, hostProvider, makeAgentLib, tempRoot } from './dependencyStoreFixtures.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const GLOBAL = Object.freeze({ name: 'ploinky-global-deps', version: '1.0.0', dependencies: { 'left-pad': '1.3.0' } });
@@ -57,7 +57,7 @@ function listFiles(dir) {
     return out;
 }
 
-test('cache-v4 store: a build publishes a verified immutable object and a second call is a hit', (t) => {
+test('dependency store: a build publishes a verified immutable object and a second call is a hit', (t) => {
     const { store, lease, seedPlan } = setup(t);
     const installer = fakeInstaller();
     const plan = seedPlan();
@@ -87,7 +87,7 @@ test('cache-v4 store: a build publishes a verified immutable object and a second
     assert.equal(store.releaseReaderReceipt(hit.readerReceipt), false);
 });
 
-test('cache-v4 store: every npm run starts from an empty payload node_modules', (t) => {
+test('dependency store: every npm run starts from an empty payload node_modules', (t) => {
     const { store, lease, seedPlan } = setup(t);
     const observed = [];
     const installer = fakeInstaller({
@@ -105,7 +105,7 @@ test('cache-v4 store: every npm run starts from an empty payload node_modules', 
     assert.deepEqual(observed, [[], []]);
 });
 
-test('cache-v4 store: first and second starts share a key; only an update-verified pin changes it', (t) => {
+test('dependency store: first and second starts share a key; only an update-verified pin changes it', (t) => {
     const url = 'git+file:///srv/tool.git';
     const globalPackage = { name: 'g', version: '1.0.0', dependencies: { tool: `${url}#main` } };
     const { store, lease, seedPlan } = setup(t, { globalPackage });
@@ -133,7 +133,7 @@ test('cache-v4 store: first and second starts share a key; only an update-verifi
     assert.deepEqual(updatedManifest.provenance.map((item) => [item.commit, item.verification]), [[SHA_B, 'remote-verified']]);
 });
 
-test('cache-v4 store: a cwd-embedding installer stays valid because payloads are never relocated', (t) => {
+test('dependency store: a cwd-embedding installer stays valid because payloads are never relocated', (t) => {
     const { store, lease, seedPlan } = setup(t);
     const installer = fakeInstaller({
         extra: ({ payloadDir }) => {
@@ -151,7 +151,7 @@ test('cache-v4 store: a cwd-embedding installer stays valid because payloads are
     assert.equal(hit.payloadPath, embedded, 'the published path equals the install-time cwd');
 });
 
-test('cache-v4 store: a build script reading AgentLib bytes changes output only through the key', (t) => {
+test('dependency store: a build script reading AgentLib bytes changes output only through the key', (t) => {
     const root = tempRoot(t);
     const libA = makeAgentLib(root, { name: 'lib', fingerprint: 'fp-1', content: 'BYTES-ONE' });
     const provider = (lib) => hostProvider({ agentLib: lib });
@@ -179,7 +179,7 @@ test('cache-v4 store: a build script reading AgentLib bytes changes output only 
     assert.equal(installer.calls.length, 2);
 });
 
-test('cache-v4 store: tree corruption with an unchanged hidden lock is detected and rebuilt without touching the old object', (t) => {
+test('dependency store: tree corruption with an unchanged hidden lock is detected and rebuilt without touching the old object', (t) => {
     const { store, lease, seedPlan } = setup(t);
     const installer = fakeInstaller();
     const plan = seedPlan();
@@ -201,7 +201,7 @@ test('cache-v4 store: tree corruption with an unchanged hidden lock is detected 
     assert.equal(store.readIndex(plan.inputKey).previousObjectId, first.objectId);
 });
 
-test('cache-v4 store: a failed rebuild is bounded and leaves the index untouched', (t) => {
+test('dependency store: a failed rebuild is bounded and leaves the index untouched', (t) => {
     const { store, lease, seedPlan } = setup(t);
     const plan = seedPlan();
     const first = store.ensureGeneration(lease, plan, { installer: fakeInstaller(), consumer: CONSUMER });
@@ -220,7 +220,7 @@ test('cache-v4 store: a failed rebuild is bounded and leaves the index untouched
     assert.ok(store.describeObjects().filter((item) => item.buildReceipt?.state === 'failed').every((item) => item.retain));
 });
 
-test('cache-v4 store: a competing index entry is accepted only after full validation', (t) => {
+test('dependency store: a competing index entry is accepted only after full validation', (t) => {
     const { store, lease, seedPlan, root } = setup(t);
     const plan = seedPlan();
     const installer = fakeInstaller();
@@ -260,7 +260,7 @@ test('cache-v4 store: a competing index entry is accepted only after full valida
     assert.ok(fs.existsSync(path.join(store.paths.unusable, `${bogusId}.json`)));
 });
 
-test('cache-v4 store: an index entry whose object was built for another key is a miss', (t) => {
+test('dependency store: an index entry whose object was built for another key is a miss', (t) => {
     const { store, lease, seedPlan } = setup(t);
     const installer = fakeInstaller();
     const planA = seedPlan();
@@ -273,7 +273,7 @@ test('cache-v4 store: an index entry whose object was built for another key is a
     assert.notEqual(b.objectId, a.objectId);
 });
 
-test('cache-v4 store: agents without npm copy an exact seed; a valid agent hit does no seed work', (t) => {
+test('dependency store: agents without npm copy an exact seed; a valid agent hit does no seed work', (t) => {
     const { store, lease, seedPlan, agentPlan } = setup(t);
     const installer = fakeInstaller({
         extra: ({ payloadDir }) => {
@@ -309,7 +309,7 @@ test('cache-v4 store: agents without npm copy an exact seed; a valid agent hit d
     assert.ok(fs.existsSync(path.join(store.paths.unusable, `${seedObject}.json`)));
 });
 
-test('cache-v4 store: reinstall builds the target from empty state without seeds and leaves other aliases intact', (t) => {
+test('dependency store: reinstall builds the target from empty state without seeds and leaves other aliases intact', (t) => {
     const { store, lease, seedPlan, agentPlan } = setup(t);
     const installer = fakeInstaller();
     const alias = store.ensureAgentGeneration(lease, { agentPlan: agentPlan({ registration: 'repo/agent#b' }), seedPlan: seedPlan(), installer, consumer: CONSUMER });
@@ -331,7 +331,7 @@ test('cache-v4 store: reinstall builds the target from empty state without seeds
     assert.equal(store.validateObject(target.objectId, { inputKey: agentPlan().inputKey }).valid, true, 'previous admitted object kept');
 });
 
-test('cache-v4 store: provenance mismatches, missing metadata and unsafe trees prevent publication without retries', (t) => {
+test('dependency store: provenance mismatches, missing metadata and unsafe trees prevent publication without retries', (t) => {
     const url = 'git+file:///srv/tool.git';
     const globalPackage = { name: 'g', version: '1.0.0', dependencies: { tool: `${url}#${SHA_A}` } };
     const { store, lease, seedPlan } = setup(t, { globalPackage });
@@ -352,7 +352,7 @@ test('cache-v4 store: provenance mismatches, missing metadata and unsafe trees p
     assert.ok(store.describeObjects().every((item) => !item.complete));
 });
 
-test('cache-v4 store: disk space, lease capability and unknown formats fail before any object is created', (t) => {
+test('dependency store: disk space, lease capability and unknown formats fail before any object is created', (t) => {
     const { store, lease, seedPlan, root } = setup(t, { storeOptions: { checkDiskSpace: () => ({ ok: false, availableBytes: 10 }) } });
     const installer = fakeInstaller();
     assert.throws(() => store.ensureGeneration(lease, seedPlan(), { installer, consumer: CONSUMER }),
@@ -366,7 +366,7 @@ test('cache-v4 store: disk space, lease capability and unknown formats fail befo
     assert.throws(() => ok.ensureGeneration(lease, seedPlan(), { installer, consumer: CONSUMER }), { code: 'PLOINKY_DEPS_STORE_FORMAT_UNKNOWN' });
 });
 
-test('cache-v4 store: objects from another workspace are never adopted', (t) => {
+test('dependency store: objects from another workspace are never adopted', (t) => {
     const { store, lease, seedPlan, root } = setup(t);
     const installer = fakeInstaller();
     const built = store.ensureGeneration(lease, seedPlan(), { installer, consumer: CONSUMER });
@@ -375,7 +375,7 @@ test('cache-v4 store: objects from another workspace are never adopted', (t) => 
     assert.equal(foreign.validateObject(built.objectId, { inputKey: seedPlan().inputKey }).reason, 'object belongs to another workspace');
 });
 
-test('cache-v4 store: stale receipts are removed only with positive quiescence proof', (t) => {
+test('dependency store: stale receipts are removed only with positive quiescence proof', (t) => {
     const { store, lease, seedPlan } = setup(t);
     const built = store.ensureGeneration(lease, seedPlan(), { installer: fakeInstaller(), consumer: { kind: 'container', engine: 'podman', containerName: 'agent_x' } });
     const retained = store.removeStaleReceipt(lease, built.readerReceipt.path, { proof: () => ({ quiescent: false, reason: 'container present' }) });
@@ -388,14 +388,14 @@ test('cache-v4 store: stale receipts are removed only with positive quiescence p
     assert.throws(() => store.removeStaleReceipt(lease, path.join(store.paths.objects, 'x.json')), { code: 'PLOINKY_DEPS_RECEIPT_INVALID' });
 });
 
-test('cache-v4 store: build and lookup paths never perform moving-ref discovery', () => {
-    const source = fs.readFileSync(path.join(HERE, '../../cli/utils/dependencies/cacheV4/objectStore.mjs'), 'utf8');
+test('dependency store: build and lookup paths never perform moving-ref discovery', () => {
+    const source = fs.readFileSync(path.join(HERE, '../../cli/utils/dependencies/store/objectStore.mjs'), 'utf8');
     assert.equal(/discoverGitPins|defaultRunGit|ls-remote/.test(source), false);
-    const contract = fs.readFileSync(path.join(HERE, '../../cli/utils/dependencies/cacheV4/installContract.mjs'), 'utf8');
+    const contract = fs.readFileSync(path.join(HERE, '../../cli/utils/dependencies/store/installContract.mjs'), 'utf8');
     assert.equal(/discoverGitPins|defaultRunGit/.test(contract), false);
 });
 
-test('cache-v4 store: a retried reinstall with the same token reuses its object instead of duplicating it', (t) => {
+test('dependency store: a retried reinstall with the same token reuses its object instead of duplicating it', (t) => {
     const { store, lease, seedPlan, agentPlan } = setup(t);
     const installer = fakeInstaller();
     const request = { agentPlan: agentPlan({ rebuildToken: 'rebuild-7' }), seedPlan: seedPlan(), installer, consumer: CONSUMER, reinstall: true };
@@ -409,7 +409,7 @@ test('cache-v4 store: a retried reinstall with the same token reuses its object 
     assert.equal(store.describeObjects().some((item) => item.buildReceipt?.state === 'superseded'), false);
 });
 
-test('cache-v4 store: the in-Box seed copy uses cp -a, preserving symlink text without hardlinks', { skip: process.platform === 'win32' }, (t) => {
+test('dependency store: the in-Box seed copy uses cp -a, preserving symlink text without hardlinks', { skip: process.platform === 'win32' }, (t) => {
     const root = tempRoot(t);
     const source = path.join(root, 'seed');
     fs.mkdirSync(path.join(source, 'pkg', '.bin'), { recursive: true });

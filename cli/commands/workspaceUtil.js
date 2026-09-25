@@ -65,11 +65,11 @@ import {
   issueDependencyRebuildRequest,
   runtimeCarriesRebuildToken,
   settleDependencyRebuildRequest,
-} from '../utils/dependencies/cacheV4/runtimeDependencies.mjs';
+} from '../utils/dependencies/store/runtimeDependencies.mjs';
 import {
   collectDependencyObjectsAfterAdmission,
   reportDependencyCollection,
-} from '../utils/dependencies/cacheV4/collector.mjs';
+} from '../utils/dependencies/store/collector.mjs';
 import {
   AGENTS_DATA_DIR,
   LOGS_DIR,

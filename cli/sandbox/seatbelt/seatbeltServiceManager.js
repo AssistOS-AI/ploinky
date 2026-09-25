@@ -66,8 +66,8 @@ import {
     runtimeDependencyReuseProblem,
     runtimeDependencyStore,
     sandboxProcessIdentity,
-} from '../../utils/dependencies/cacheV4/runtimeDependencies.mjs';
-import { processIdentityEnded } from '../../utils/dependencies/cacheV4/receipts.mjs';
+} from '../../utils/dependencies/store/runtimeDependencies.mjs';
+import { processIdentityEnded } from '../../utils/dependencies/store/receipts.mjs';
 import {
     assertManifestEnvProfileCompleteness,
     getExposedNames,

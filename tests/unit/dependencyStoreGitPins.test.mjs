@@ -10,7 +10,7 @@ import {
     parseResolvedGitSource,
     resolveRefFromLsRemote,
     rewriteSpecToCommit,
-} from '../../cli/utils/dependencies/cacheV4/gitSpec.mjs';
+} from '../../cli/utils/dependencies/store/gitSpec.mjs';
 import {
     PIN_VERIFICATION,
     buildPin,
@@ -23,13 +23,13 @@ import {
     mergeDiscoveredPins,
     readPinState,
     recordObservedPins,
-} from '../../cli/utils/dependencies/cacheV4/gitPins.mjs';
-import { git, gitEnv, hasCommand, markerRemote, tempRoot } from './cacheV4Fixtures.mjs';
+} from '../../cli/utils/dependencies/store/gitPins.mjs';
+import { git, gitEnv, hasCommand, markerRemote, tempRoot } from './dependencyStoreFixtures.mjs';
 
 const SHA_A = 'a'.repeat(40);
 const SHA_B = 'b'.repeat(40);
 
-test('cache-v4 git: supported URL forms normalize to one canonical source', () => {
+test('dependency store git: supported URL forms normalize to one canonical source', () => {
     const forms = [
         'git+https://github.com/AssistOS-AI/MCPSDK.git#main',
         'github:AssistOS-AI/MCPSDK#main',
@@ -59,7 +59,7 @@ test('cache-v4 git: supported URL forms normalize to one canonical source', () =
     assert.throws(() => rewriteSpecToCommit(parseGitDependencySpec('github:o/r#main'), 'abc1234'), /full 40-character/);
 });
 
-test('cache-v4 git: non-Git specs are ignored and unsupported Git syntax is named, not guessed', () => {
+test('dependency store git: non-Git specs are ignored and unsupported Git syntax is named, not guessed', () => {
     for (const spec of ['^1.2.3', 'latest', 'file:../x', 'npm:other@1', 'https://example.com/x.tgz', '']) {
         assert.equal(parseGitDependencySpec(spec), null, spec);
     }
@@ -81,7 +81,7 @@ test('cache-v4 git: non-Git specs are ignored and unsupported Git syntax is name
     }
 });
 
-test('cache-v4 git: ls-remote rows resolve HEAD, branches, peeled tags and reject ambiguous names', () => {
+test('dependency store git: ls-remote rows resolve HEAD, branches, peeled tags and reject ambiguous names', () => {
     const refs = parseLsRemoteOutput([
         `${SHA_A}\tHEAD`,
         `${SHA_A}\trefs/heads/main`,
@@ -104,7 +104,7 @@ test('cache-v4 git: ls-remote rows resolve HEAD, branches, peeled tags and rejec
     assert.equal(lsRemoteQuery(parseGitDependencySpec(`github:o/r#${SHA_A}`)), null, 'a full SHA bypasses lookup');
 });
 
-test('cache-v4 git: discovery against a real local remote peels annotated tags and rejects ambiguity', { skip: !hasCommand('git') && 'git not installed' }, (t) => {
+test('dependency store git: discovery against a real local remote peels annotated tags and rejects ambiguity', { skip: !hasCommand('git') && 'git not installed' }, (t) => {
     const root = tempRoot(t);
     const env = gitEnv(root);
     const remote = markerRemote(root, env);
@@ -147,7 +147,7 @@ test('cache-v4 git: discovery against a real local remote peels annotated tags a
     assert.equal(queriesRun, 5, 'identical (URL, patterns) queries are deduplicated: HEAD, main, refs/heads/main, v1, dup');
 });
 
-test('cache-v4 git: identical queries are deduplicated and the deadline bounds lookups', () => {
+test('dependency store git: identical queries are deduplicated and the deadline bounds lookups', () => {
     const manifest = { dependencies: { a: 'github:o/r#main', b: 'git+https://github.com/o/r.git#main' }, devDependencies: { c: 'github:o/r#other' } };
     const { entries } = collectGitInputs(manifest, { scope: 'global' });
     let calls = 0;
@@ -164,7 +164,7 @@ test('cache-v4 git: identical queries are deduplicated and the deadline bounds l
     assert.equal(gitLookupEnv({}).GIT_TERMINAL_PROMPT, '0');
 });
 
-test('cache-v4 git: pin merge keeps same-spec pins after failures and never inherits across specs', () => {
+test('dependency store git: pin merge keeps same-spec pins after failures and never inherits across specs', () => {
     const binding = { scope: 'registration', registration: 'repo/agent', packageSource: 'repo/agent/package.json' };
     const oldManifest = { dependencies: { a: 'github:o/r#main', b: 'github:o/r#dev', gone: 'github:o/r#x' } };
     const old = collectGitInputs(oldManifest, binding).entries;
@@ -194,7 +194,7 @@ test('cache-v4 git: pin merge keeps same-spec pins after failures and never inhe
     assert.deepEqual(desiredPinsFor(resolved.pins, entries).map((pin) => [pin.name, pin.commit]), [['a', SHA_B]]);
 });
 
-test('cache-v4 git: first start records observed-at-install; update records remote-verified', () => {
+test('dependency store git: first start records observed-at-install; update records remote-verified', () => {
     const binding = { scope: 'global' };
     const { entries } = collectGitInputs({ dependencies: { tool: 'git+file:///srv/r.git#main' } }, binding);
     const observed = recordObservedPins({}, entries, [{ pinId: entries[0].pinId, source: 'file:///srv/r.git', commit: SHA_A }]);
@@ -210,7 +210,7 @@ test('cache-v4 git: first start records observed-at-install; update records remo
     assert.equal(kept[entries[0].pinId].commit, SHA_A, 'a remote-verified pin is not overwritten by observation');
 });
 
-test('cache-v4 git: pin state commits atomically with compare-and-replace', (t) => {
+test('dependency store git: pin state commits atomically with compare-and-replace', (t) => {
     const root = tempRoot(t);
     const file = path.join(root, 'state', 'pins.json');
     assert.deepEqual(readPinState(file), { revision: 0, pins: {} });

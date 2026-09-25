@@ -21,7 +21,7 @@ import { createOperationRecord } from './updateOutcome.js';
 import { applyGraphRequirements, readUpdateGraph } from './updateGraph.js';
 import { buildCoreUpdateResult, defaultSkillsRecord, skillsManifestRecord } from './updateRecords.js';
 import { UpdateRequestError, resolveUpdateFolderScope } from './updateRequest.js';
-import { refreshUpdateGitPins } from '../utils/dependencies/cacheV4/updatePins.mjs';
+import { refreshUpdateGitPins } from '../utils/dependencies/store/updatePins.mjs';
 
 import { listAgentRepositoryNames, resolveAgentRepositoryPath } from '../utils/agentRepositorySource.mjs';
 const REPOS_DIR = path.join(PLOINKY_DIR, 'repos');

@@ -14,12 +14,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-import { cacheV4Error } from './canonical.mjs';
+import { dependencyStoreError } from './canonical.mjs';
 
 export const TREE_HASH_SCHEMA = 1;
 
 function unsafe(message) {
-    return cacheV4Error('PLOINKY_DEPS_TREE_UNSAFE', message);
+    return dependencyStoreError('PLOINKY_DEPS_TREE_UNSAFE', message);
 }
 
 function withinOrEqual(candidate, root) {

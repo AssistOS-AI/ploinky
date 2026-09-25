@@ -7,17 +7,17 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-import { createCacheStore } from '../../cli/utils/dependencies/cacheV4/objectStore.mjs';
-import { buildAgentInstallPlan, buildSeedInstallPlan } from '../../cli/utils/dependencies/cacheV4/installContract.mjs';
-import { collectDependencyObjects, engineMountInspector } from '../../cli/utils/dependencies/cacheV4/collector.mjs';
-import { installFakeEngine } from './cacheV4FakeEngine.mjs';
+import { createCacheStore } from '../../cli/utils/dependencies/store/objectStore.mjs';
+import { buildAgentInstallPlan, buildSeedInstallPlan } from '../../cli/utils/dependencies/store/installContract.mjs';
+import { collectDependencyObjects, engineMountInspector } from '../../cli/utils/dependencies/store/collector.mjs';
+import { installFakeEngine } from './dependencyStoreFakeEngine.mjs';
 import {
     currentWriterIdentity,
     defaultProveBuildQuiescent,
     defaultProveReaderQuiescent,
     readBootScope,
-} from '../../cli/utils/dependencies/cacheV4/receipts.mjs';
-import { fakeInstaller, fakeLease, hostProvider, makeAgentLib, tempRoot } from './cacheV4Fixtures.mjs';
+} from '../../cli/utils/dependencies/store/receipts.mjs';
+import { fakeInstaller, fakeLease, hostProvider, makeAgentLib, tempRoot } from './dependencyStoreFixtures.mjs';
 
 const GLOBAL = Object.freeze({ name: 'g', version: '1.0.0', dependencies: { 'left-pad': '1.3.0' } });
 
@@ -27,7 +27,7 @@ function deadProcessIdentity() {
 }
 
 function world(t) {
-    const root = tempRoot(t, 'cachev4-gc-');
+    const root = tempRoot(t, 'depstore-gc-');
     const agentLib = makeAgentLib(root);
     const provider = hostProvider({ agentLib });
     const { lease, assertLease } = fakeLease();
@@ -71,7 +71,7 @@ const admittedRecord = (generation, runtime = 'podman') => ({
     config: { binds: [{ source: generation.nodeModulesPath, target: '/code/node_modules', ro: true }] },
 });
 
-test('cache-v4 collection retains every required root and removes only proven-unreferenced objects', (t) => {
+test('dependency store collection retains every required root and removes only proven-unreferenced objects', (t) => {
     const w = world(t);
     const liveProcess = currentWriterIdentity();
     const admitted = w.build('reg-admitted', { kind: 'container', containerName: 'agent_a', engine: 'podman', key: 'a' });
@@ -111,7 +111,7 @@ test('cache-v4 collection retains every required root and removes only proven-un
     assert.equal(w.store.listReaderReceipts().some((receipt) => receipt.consumer?.process?.processStart === 'another-process'), false);
 });
 
-test('cache-v4 collection skips entirely on unavailable or unresolved evidence', (t) => {
+test('dependency store collection skips entirely on unavailable or unresolved evidence', (t) => {
     const w = world(t);
     const orphan = w.build('reg-orphan', { kind: 'container', containerName: 'gone', engine: 'podman', key: 'o' });
     w.state.agents.other = { type: 'agent', runtime: 'podman', config: { binds: [] } };
@@ -136,12 +136,12 @@ test('cache-v4 collection skips entirely on unavailable or unresolved evidence',
     assert.ok(report.retained.find((item) => item.objectId === orphan.objectId).reasons.includes('admitted-record'));
 });
 
-test('cache-v4 collection requires the workspace lease', (t) => {
+test('dependency store collection requires the workspace lease', (t) => {
     const w = world(t);
     assert.throws(() => w.collect({ lease: { forged: true } }), { code: 'PLOINKY_WORKSPACE_MUTATION_CAPABILITY_REQUIRED' });
 });
 
-test('cache-v4 collection retains precreation reservations even if the future container is absent', (t) => {
+test('dependency store collection retains precreation reservations even if the future container is absent', (t) => {
     const w = world(t);
     const pending = w.build('pending', { kind: 'container', engine: 'podman', containerName: 'not-created', phase: 'creating' });
     const receipt = w.store.listReaderReceipts().find(item => item.objectId === pending.objectId);
@@ -153,7 +153,7 @@ test('cache-v4 collection retains precreation reservations even if the future co
     assert.ok(fs.existsSync(pending.payloadPath));
 });
 
-test('cache-v4 collection does not infer absent containers from an empty registry and unavailable engine', (t) => {
+test('dependency store collection does not infer absent containers from an empty registry and unavailable engine', (t) => {
     const w = world(t);
     const legacy = path.join(w.root, '.ploinky', 'deps', 'agents', 'repo', 'agent', 'container-linux-x64-node20');
     fs.mkdirSync(path.join(legacy, 'node_modules'), { recursive: true });
@@ -165,7 +165,7 @@ test('cache-v4 collection does not infer absent containers from an empty registr
     assert.deepEqual(report.legacyRemoved, []);
 });
 
-test('cache-v4 attachment pinning requires the lease and a new pin prevents any object rename', (t) => {
+test('dependency store attachment pinning requires the lease and a new pin prevents any object rename', (t) => {
     const w = world(t);
     const orphan = w.build('orphan', { kind: 'container', engine: 'podman', containerName: 'gone' });
     assert.throws(() => w.store.acquireAttachmentReceipt({}, orphan, { kind: 'bwrap-attachment' }),
@@ -190,7 +190,7 @@ test('cache-v4 attachment pinning requires the lease and a new pin prevents any 
     }
 });
 
-test('cache-v4 collection handles legacy and new coexistence conservatively', (t) => {
+test('dependency store collection handles legacy and new coexistence conservatively', (t) => {
     const w = world(t);
     const deps = path.join(w.root, '.ploinky', 'deps');
     const legacy = (relative, { stamp = true } = {}) => {
@@ -225,7 +225,7 @@ test('cache-v4 collection handles legacy and new coexistence conservatively', (t
     assert.ok(fs.existsSync(again));
 });
 
-test('cache-v4 collection restores an object an attachment adopted just before deletion', (t) => {
+test('dependency store collection restores an object an attachment adopted just before deletion', (t) => {
     const w = world(t);
     const orphan = w.build('reg-orphan', { kind: 'container', containerName: 'gone', engine: 'podman', key: 'o' });
     let attached = null;
@@ -259,7 +259,7 @@ test('cache-v4 collection restores an object an attachment adopted just before d
     assert.equal(w.store.listReaderReceipts().length, 0);
 });
 
-test('cache-v4 collection finishes or restores leftover tombstones from a crash', (t) => {
+test('dependency store collection finishes or restores leftover tombstones from a crash', (t) => {
     const w = world(t);
     const kept = w.build('reg-kept', { kind: 'bwrap-attachment', process: currentWriterIdentity() });
     const gone = w.build('reg-gone', { kind: 'bwrap-attachment', process: deadProcessIdentity() });
@@ -272,12 +272,12 @@ test('cache-v4 collection finishes or restores leftover tombstones from a crash'
     assert.equal(fs.readdirSync(w.store.paths.objects).some((name) => name.startsWith('.tombstone-')), false);
 });
 
-test('cache-v4 collection inspects every engine container, including stopped and unlabeled ones', (t) => {
-    const root = tempRoot(t, 'cachev4-inspector-');
+test('dependency store collection inspects every engine container, including stopped and unlabeled ones', (t) => {
+    const root = tempRoot(t, 'depstore-inspector-');
     const engine = installFakeEngine(root, { engines: ['podman'] });
     const depsDir = path.join(root, 'ws', '.ploinky', 'deps');
     fs.writeFileSync(engine.stateFile, JSON.stringify({ installs: [], containers: {
-        running: { Id: 'a'.repeat(64), Name: 'running', Labels: { managed: '1' }, State: { Running: true }, Mounts: [{ Source: path.join(depsDir, 'cache-v4', 'objects', 'x', 'payload', 'node_modules') }] },
+        running: { Id: 'a'.repeat(64), Name: 'running', Labels: { managed: '1' }, State: { Running: true }, Mounts: [{ Source: path.join(depsDir, 'store', 'objects', 'x', 'payload', 'node_modules') }] },
         stopped: { Id: 'b'.repeat(64), Name: 'stopped', Labels: {}, State: { Running: false }, Mounts: [{ Source: path.join(depsDir, 'agents', 'r', 'a', 'k', 'node_modules') }, { Source: '/elsewhere' }] },
     } }));
     const spawn = (command, args, options) => spawnSync(command, args, { ...options, env: { ...process.env, ...engine.env } });
@@ -287,7 +287,7 @@ test('cache-v4 collection inspects every engine container, including stopped and
     assert.equal(result.containers, 2);
     assert.deepEqual(result.mounts.sort(), [
         path.join(depsDir, 'agents', 'r', 'a', 'k', 'node_modules'),
-        path.join(depsDir, 'cache-v4', 'objects', 'x', 'payload', 'node_modules'),
+        path.join(depsDir, 'store', 'objects', 'x', 'payload', 'node_modules'),
     ].sort());
     const failingList = engineMountInspector({ getRuntime: () => 'podman', depsDir, spawn: () => ({ status: 125 }) })();
     assert.equal(failingList.available, false);
@@ -297,7 +297,7 @@ test('cache-v4 collection inspects every engine container, including stopped and
     assert.equal(engineMountInspector({ getRuntime: () => { throw new Error('none'); }, depsDir })().available, false);
 });
 
-test('cache-v4 collection retains a superseded seed while a live seed copy reads it', (t) => {
+test('dependency store collection retains a superseded seed while a live seed copy reads it', (t) => {
     const w = world(t);
     const superseded = w.store.ensureGeneration(w.lease, w.seedPlan, { installer: w.installer, consumer: { kind: 'seed-copy', process: currentWriterIdentity() } });
     // Supersede the index entry (as a changed seed key would).

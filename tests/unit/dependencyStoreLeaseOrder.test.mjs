@@ -9,7 +9,7 @@ import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-import { tempRoot } from './cacheV4Fixtures.mjs';
+import { tempRoot } from './dependencyStoreFixtures.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '../..');
@@ -19,8 +19,8 @@ function env(root) {
     return { ...process.env, PLOINKY_WORKSPACE_ROOT: root, PLOINKY_ROOT: root };
 }
 
-test('cache-v4 lease order: a restart-style operation waits for a briefly held lease and never holds its maintenance lock while waiting', { timeout: 60_000 }, async (t) => {
-    const root = tempRoot(t, 'cachev4-lease-order-');
+test('dependency store lease order: a restart-style operation waits for a briefly held lease and never holds its maintenance lock while waiting', { timeout: 60_000 }, async (t) => {
+    const root = tempRoot(t, 'depstore-lease-order-');
     fs.mkdirSync(path.join(root, '.ploinky'), { recursive: true });
     const holder = spawn(process.execPath, ['--input-type=module', '-e', `
         const locks = await import(${JSON.stringify(LOCKS)});
@@ -60,8 +60,8 @@ test('cache-v4 lease order: a restart-style operation waits for a briefly held l
     assert.equal(result.held, true, 'dependency preparation inside finds the held lease');
 });
 
-test('cache-v4 lease order: a nested lifecycle call reuses the held lease without waiting', { timeout: 30_000 }, (t) => {
-    const root = tempRoot(t, 'cachev4-lease-reuse-');
+test('dependency store lease order: a nested lifecycle call reuses the held lease without waiting', { timeout: 30_000 }, (t) => {
+    const root = tempRoot(t, 'depstore-lease-reuse-');
     const run = spawnSync(process.execPath, ['--input-type=module', '-e', `
         const locks = await import(${JSON.stringify(LOCKS)});
         const out = await locks.withWorkspaceMutationLease({ operation: 'workspace-start' }, async (outer) => {
@@ -78,7 +78,7 @@ test('cache-v4 lease order: a nested lifecycle call reuses the held lease withou
     assert.ok(out.ms < 1000);
 });
 
-test('cache-v4 lease order: restart, enable and reinstall take the workspace lease before any maintenance lock', () => {
+test('dependency store lease order: restart, enable and reinstall take the workspace lease before any maintenance lock', () => {
     const cli = fs.readFileSync(path.join(ROOT, 'cli/commands/cli.js'), 'utf8');
     assert.match(cli, /function withRestartLocks\(containerName, lockOptions, fn\) \{\s*return withHeldOrAcquiredWorkspaceMutationLease\([\s\S]*?\(\) => withMaintenanceLock\(containerName, lockOptions, fn\)/);
     assert.equal((cli.match(/await withRestartLocks\(containerName, \{/g) || []).length, 3, 'every restart dispatch path');

@@ -10,7 +10,7 @@ import crypto from 'node:crypto';
 export const FULL_SHA256_PATTERN = /^[0-9a-f]{64}$/;
 export const FULL_GIT_SHA_PATTERN = /^[0-9a-f]{40}$/;
 
-export function cacheV4Error(code, message, details = undefined) {
+export function dependencyStoreError(code, message, details = undefined) {
     const error = new Error(message);
     error.code = code;
     if (details !== undefined) error.details = details;
@@ -26,13 +26,13 @@ export function canonicalValue(value, trail = '$') {
         return value;
     case 'number':
         if (!Number.isFinite(value)) {
-            throw cacheV4Error('PLOINKY_DEPS_CANONICAL_INVALID', `non-finite number at ${trail}`);
+            throw dependencyStoreError('PLOINKY_DEPS_CANONICAL_INVALID', `non-finite number at ${trail}`);
         }
         return value;
     case 'object': {
         const proto = Object.getPrototypeOf(value);
         if (proto !== Object.prototype && proto !== null) {
-            throw cacheV4Error('PLOINKY_DEPS_CANONICAL_INVALID', `non-plain object at ${trail}`);
+            throw dependencyStoreError('PLOINKY_DEPS_CANONICAL_INVALID', `non-plain object at ${trail}`);
         }
         const result = {};
         for (const key of Object.keys(value).sort()) {
@@ -42,7 +42,7 @@ export function canonicalValue(value, trail = '$') {
         return result;
     }
     default:
-        throw cacheV4Error('PLOINKY_DEPS_CANONICAL_INVALID', `unsupported ${typeof value} at ${trail}`);
+        throw dependencyStoreError('PLOINKY_DEPS_CANONICAL_INVALID', `unsupported ${typeof value} at ${trail}`);
     }
 }
 
@@ -60,7 +60,7 @@ export function canonicalDigest(value) {
 
 export function assertFullSha256(value, label = 'digest') {
     if (!FULL_SHA256_PATTERN.test(String(value || ''))) {
-        throw cacheV4Error('PLOINKY_DEPS_KEY_INVALID', `${label} must be a full lowercase SHA-256 hex digest`);
+        throw dependencyStoreError('PLOINKY_DEPS_KEY_INVALID', `${label} must be a full lowercase SHA-256 hex digest`);
     }
     return value;
 }

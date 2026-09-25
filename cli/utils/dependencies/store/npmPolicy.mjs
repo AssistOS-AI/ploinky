@@ -19,7 +19,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { cacheV4Error } from './canonical.mjs';
+import { dependencyStoreError } from './canonical.mjs';
 
 export const NPM_POLICY_SCHEMA = 1;
 export const NPM_BASE_INSTALL_ARGS = Object.freeze(['install', '--no-package-lock', '--no-audit', '--no-fund', '--update-notifier=false']);
@@ -56,7 +56,7 @@ const TRANSPORT_ENV = Object.freeze([
 const BASE_ENV = Object.freeze(['HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TMPDIR', 'TERM']);
 
 function unrepresentable(key, source) {
-    return cacheV4Error('PLOINKY_DEPS_NPM_POLICY_UNREPRESENTABLE',
+    return dependencyStoreError('PLOINKY_DEPS_NPM_POLICY_UNREPRESENTABLE',
         `npm setting '${key}' from ${source} can change installed dependencies but cannot be represented in the dependency cache key; `
         + 'remove it or run the agent in a container runtime');
 }
@@ -82,7 +82,7 @@ export function parseNpmrc(text, { source = 'npmrc', env = process.env } = {}) {
         const line = rawLine.trim();
         if (!line || line.startsWith(';') || line.startsWith('#')) continue;
         if (line.startsWith('[')) {
-            throw cacheV4Error('PLOINKY_DEPS_NPM_POLICY_UNREPRESENTABLE', `ini sections in ${source} are not supported`);
+            throw dependencyStoreError('PLOINKY_DEPS_NPM_POLICY_UNREPRESENTABLE', `ini sections in ${source} are not supported`);
         }
         const index = line.indexOf('=');
         const rawKey = (index < 0 ? line : line.slice(0, index)).trim();
@@ -223,7 +223,7 @@ function normalizeRegistry(value) {
     let url;
     try { url = new URL(text); } catch { throw unrepresentable(`registry=${text}`, 'npm configuration'); }
     if (url.username || url.password) {
-        throw cacheV4Error('PLOINKY_DEPS_NPM_POLICY_UNREPRESENTABLE', 'registry URLs must not embed credentials; use an npmrc auth token');
+        throw dependencyStoreError('PLOINKY_DEPS_NPM_POLICY_UNREPRESENTABLE', 'registry URLs must not embed credentials; use an npmrc auth token');
     }
     return url.href.endsWith('/') ? url.href : `${url.href}/`;
 }

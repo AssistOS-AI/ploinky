@@ -5,17 +5,17 @@ import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-import { createCacheStore } from '../../cli/utils/dependencies/cacheV4/objectStore.mjs';
-import { buildSeedInstallPlan } from '../../cli/utils/dependencies/cacheV4/installContract.mjs';
-import { fakeInstaller, fakeLease, hostProvider, makeAgentLib, tempRoot } from './cacheV4Fixtures.mjs';
+import { createCacheStore } from '../../cli/utils/dependencies/store/objectStore.mjs';
+import { buildSeedInstallPlan } from '../../cli/utils/dependencies/store/installContract.mjs';
+import { fakeInstaller, fakeLease, hostProvider, makeAgentLib, tempRoot } from './dependencyStoreFixtures.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const WORKER = path.join(HERE, 'cacheV4ChildWorker.mjs');
+const WORKER = path.join(HERE, 'dependencyStoreChildWorker.mjs');
 const GLOBAL = Object.freeze({ name: 'g', version: '1.0.0', dependencies: { 'left-pad': '1.3.0' } });
 const CONSUMER = Object.freeze({ kind: 'test-parent', process: { pid: process.pid } });
 
 function fixture(t) {
-    const root = tempRoot(t, 'cachev4-crash-');
+    const root = tempRoot(t, 'depstore-crash-');
     const agentLib = makeAgentLib(root);
     const plan = buildSeedInstallPlan({ provider: hostProvider({ agentLib }), globalPackage: GLOBAL, agentLibSelection: agentLib });
     const depsDir = path.join(root, '.ploinky', 'deps');
@@ -47,7 +47,7 @@ const CRASH_EXPECTATIONS = [
 ];
 
 for (const [stage, expected] of CRASH_EXPECTATIONS) {
-    test(`cache-v4 crash: a builder killed at ${stage} never yields an incomplete hit`, (t) => {
+    test(`dependency store crash: a builder killed at ${stage} never yields an incomplete hit`, (t) => {
         const { root, plan, depsDir, lease, store } = fixture(t);
         const config = writeConfig(root, 'crash', {
             depsDir, workspaceRoot: root, plan, crashAt: stage, out: path.join(root, 'out.json'),
@@ -97,7 +97,7 @@ async function pausedChild(t, stage) {
     return { ...ctx, child, exited };
 }
 
-test('cache-v4 crash: a live paused writer retains its object; death before any installer proves quiescence', async (t) => {
+test('dependency store crash: a live paused writer retains its object; death before any installer proves quiescence', async (t) => {
     const { store, child, exited } = await pausedChild(t, 'object-allocated');
     const live = store.describeObjects();
     assert.equal(live.length, 1);
@@ -111,7 +111,7 @@ test('cache-v4 crash: a live paused writer retains its object; death before any 
     assert.ok(fs.existsSync(dead[0].path), 'describing never deletes');
 });
 
-test('cache-v4 crash: a dead writer whose installer started stays retained without installer quiescence proof', async (t) => {
+test('dependency store crash: a dead writer whose installer started stays retained without installer quiescence proof', async (t) => {
     const { store, child, exited } = await pausedChild(t, 'payload-installed');
     child.kill('SIGKILL');
     await exited;
@@ -120,7 +120,7 @@ test('cache-v4 crash: a dead writer whose installer started stays retained witho
     assert.match(entry.buildReceipt.quiescence.reason, /cannot be proven stopped/);
 });
 
-test('cache-v4 crash: two processes serialized by the real workspace lease build once', async (t) => {
+test('dependency store crash: two processes serialized by the real workspace lease build once', async (t) => {
     const ctx = fixture(t);
     const counter = path.join(ctx.root, 'installs.log');
     const run = (name) => {

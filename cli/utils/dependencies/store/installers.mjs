@@ -15,7 +15,7 @@ import { spawnSync } from 'node:child_process';
 
 import { buildContainerInstallRunArgs, buildContainerInstallScript } from '../dependencyCache.js';
 import { detectShellForImage, SHELL_FALLBACK_DIRECT } from '../../../sandbox/docker/shellDetection.js';
-import { cacheV4Error } from './canonical.mjs';
+import { dependencyStoreError } from './canonical.mjs';
 import { buildHostNpmEnv, renderNpmrc } from './npmPolicy.mjs';
 
 export const DEFAULT_INSTALL_TIMEOUT_MS = 10 * 60 * 1000;
@@ -61,10 +61,10 @@ function runBounded(command, args, { cwd, env, timeoutMs, outputLimitBytes, logF
 
 function installFailure(kind, { result, outputTail, durationMs }, timeoutMs) {
     if (result?.error?.code === 'ETIMEDOUT' || result?.signal === 'SIGKILL' && durationMs >= timeoutMs) {
-        return cacheV4Error('PLOINKY_DEPS_INSTALL_TIMEOUT', `${kind} exceeded its ${Math.round(timeoutMs / 1000)}s deadline`, { outputTail });
+        return dependencyStoreError('PLOINKY_DEPS_INSTALL_TIMEOUT', `${kind} exceeded its ${Math.round(timeoutMs / 1000)}s deadline`, { outputTail });
     }
-    if (result?.error) return cacheV4Error('PLOINKY_DEPS_INSTALL_FAILED', `${kind} failed: ${result.error.code || result.error.message}`, { outputTail });
-    return cacheV4Error('PLOINKY_DEPS_INSTALL_FAILED', `${kind} exited with ${result?.status ?? result?.signal}`, { outputTail });
+    if (result?.error) return dependencyStoreError('PLOINKY_DEPS_INSTALL_FAILED', `${kind} failed: ${result.error.code || result.error.message}`, { outputTail });
+    return dependencyStoreError('PLOINKY_DEPS_INSTALL_FAILED', `${kind} exited with ${result?.status ?? result?.signal}`, { outputTail });
 }
 
 /**
@@ -83,7 +83,7 @@ export function createHostNpmInstaller({
     ceilingDirectories = [],
 }) {
     if (!toolchain?.node?.realpath || !toolchain?.npm?.realpath) {
-        throw cacheV4Error('PLOINKY_DEPS_HOST_TOOLCHAIN_MISSING', 'host installer requires probed node and npm identities');
+        throw dependencyStoreError('PLOINKY_DEPS_HOST_TOOLCHAIN_MISSING', 'host installer requires probed node and npm identities');
     }
     return Object.freeze({
         kind: 'host-npm',
@@ -144,7 +144,7 @@ export function createContainerNpmInstaller({
     detectShell = detectShellForImage,
 }) {
     if (!/^sha256:[0-9a-f]{64}$/.test(String(imageId || ''))) {
-        throw cacheV4Error('PLOINKY_DEPS_IMAGE_IDENTITY_REQUIRED', 'container installer requires an immutable image ID');
+        throw dependencyStoreError('PLOINKY_DEPS_IMAGE_IDENTITY_REQUIRED', 'container installer requires an immutable image ID');
     }
     return Object.freeze({
         kind: 'container-npm',
@@ -169,7 +169,7 @@ export function createContainerNpmInstaller({
         install({ payloadDir, workDir, objectId, options = {} }) {
             const shellPath = detectShell('deps-cache', imageId, engine);
             if (!shellPath || shellPath === SHELL_FALLBACK_DIRECT) {
-                throw cacheV4Error('PLOINKY_DEPS_INSTALL_FAILED', `could not determine a shell for image ${imageId}`);
+                throw dependencyStoreError('PLOINKY_DEPS_INSTALL_FAILED', `could not determine a shell for image ${imageId}`);
             }
             const privateDir = fs.mkdtempSync(path.join(tmpRoot(process.env), 'ploinky-npm-'));
             let run;
