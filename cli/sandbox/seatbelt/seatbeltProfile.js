@@ -15,7 +15,7 @@ import {
     resolveManifestVolumeHostPath,
 } from '../../utils/runtime/manifestVolumePolicy.js';
 import { protectedControllerStateRoots } from '../../utils/runtime/controllerStateGuards.js';
-import { projectedCanonicalPath } from '../../utils/runtime/agentDataPathPolicy.js';
+import { isPathWithin, projectedCanonicalPath } from '../../utils/runtime/agentDataPathPolicy.js';
 
 const SEATBELT_PROFILES_DIR = path.join(PLOINKY_DIR, 'seatbelt-profiles');
 
@@ -70,6 +70,23 @@ function buildSeatbeltProfile(options) {
             projectedCanonicalPath(entry.hostPath),
         ]),
     ));
+    // Seatbelt creates no mount namespace, so the controller root cannot be
+    // pinned read-only by a bind as bwrap and containers do. Deny writes to it
+    // and to each ancestor entry through which it could be renamed away and
+    // recreated. Only the agent's own writable code or skills inside it are
+    // re-granted; their roots stay pinned.
+    const controllerRoots = pathAliases(path.join(path.resolve(workspaceRoot), '.ploinky'));
+    const controllerRootAncestors = Array.from(new Set(controllerRoots.flatMap(pathAncestors)));
+    const controllerWritableGrants = [
+        ...(!codeReadOnly ? [agentCodePath] : []),
+        ...(!skillsReadOnly && skillsPath && fs.existsSync(skillsPath) ? [skillsPath] : []),
+    ].filter(Boolean).flatMap(pathAliases).filter(grantPath => controllerRoots.some(root => (
+        grantPath !== root && isPathWithin(grantPath, root)
+    )));
+    const controllerSecretFiles = Array.from(new Set(controllerRoots.flatMap(root => [
+        ...pathAliases(path.join(root, 'master-key')),
+        ...pathAliases(path.join(root, '.secrets')),
+    ])));
     const protectedWritePaths = [
         ...collectProtectedWritePaths({
         agentCodePath,
@@ -88,6 +105,9 @@ function buildSeatbeltProfile(options) {
         { kind: 'subpath', path: grant.sourceDir },
         ...protectedControllerRoots.map(value => ({ kind: 'subpath', path: value })),
     ];
+    const protectedWriteRules = dedupePathRules(protectedWritePaths.flatMap(entry => (
+        pathAliases(entry.path).map(value => ({ kind: entry.kind, path: value }))
+    )));
     const lines = [];
     lines.push('(version 1)');
     lines.push('(deny default)');
@@ -217,10 +237,31 @@ function buildSeatbeltProfile(options) {
         }
     }
 
-    if (protectedWritePaths.length) {
+    lines.push('; Controller root is read-only, including through every writable ancestor');
+    lines.push('(deny file-write*');
+    for (const controllerRoot of controllerRoots) {
+        lines.push(`    (subpath ${sbplQuote(controllerRoot)})`);
+    }
+    for (const ancestor of controllerRootAncestors) {
+        lines.push(`    (literal ${sbplQuote(ancestor)})`);
+    }
+    lines.push(')');
+    if (controllerWritableGrants.length) {
+        for (const grantPath of controllerWritableGrants) {
+            lines.push(`(allow file-write* (subpath ${sbplQuote(grantPath)}))`);
+        }
+        lines.push('(deny file-write*');
+        for (const grantPath of controllerWritableGrants) {
+            lines.push(`    (literal ${sbplQuote(grantPath)})`);
+        }
+        lines.push(')');
+    }
+    lines.push('');
+
+    if (protectedWriteRules.length) {
         lines.push('; Protected runtime paths');
         lines.push('(deny file-write*');
-        for (const protectedPath of protectedWritePaths) {
+        for (const protectedPath of protectedWriteRules) {
             lines.push(`    (${protectedPath.kind} ${sbplQuote(protectedPath.path)})`);
         }
         lines.push(')');
@@ -231,6 +272,9 @@ function buildSeatbeltProfile(options) {
     lines.push('(deny file-read*');
     for (const protectedRoot of protectedControllerRoots) {
         lines.push(`    (subpath ${sbplQuote(protectedRoot)})`);
+    }
+    for (const secretFile of controllerSecretFiles) {
+        lines.push(`    (literal ${sbplQuote(secretFile)})`);
     }
     lines.push(')');
     lines.push('');
@@ -243,6 +287,19 @@ function normalizePathList(paths) {
     return Array.from(new Set(paths
         .filter((value) => typeof value === 'string' && value.trim())
         .map((value) => path.resolve(value))));
+}
+
+// Seatbelt matches the path it resolves, so a rule must name both spellings.
+function pathAliases(value) {
+    return Array.from(new Set([path.resolve(value), projectedCanonicalPath(value)]));
+}
+
+function pathAncestors(value) {
+    const ancestors = [];
+    for (let current = path.dirname(value); current !== path.dirname(current); current = path.dirname(current)) {
+        ancestors.push(current);
+    }
+    return ancestors;
 }
 
 function collectProtectedWritePaths({
