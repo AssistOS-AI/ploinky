@@ -6,7 +6,6 @@ import {
     PLOINKY_DIR,
     PROFILE_FILE,
     ROUTING_FILE,
-    SECRETS_FILE,
     SERVERS_CONFIG_FILE,
     PLOINKY_WORKSPACE_ROOT,
 } from '../../utils/config.js';
@@ -281,7 +280,6 @@ function collectProtectedWritePaths({
         addSubpath(skillsPath);
     }
 
-    addLiteral(SECRETS_FILE);
     addLiteral(PROFILE_FILE);
     addLiteral(ROUTING_FILE);
     addLiteral(SERVERS_CONFIG_FILE);

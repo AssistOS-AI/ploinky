@@ -258,13 +258,13 @@ test('entrypoint validates its marker and mounts before its first persistent wri
         installDependencies() { throw new Error('must not install'); },
     }), /marker has invalid content/i);
     assert.equal(initialized, false);
-    assert.equal(fs.existsSync(path.join(paths.workspace, '.ploinky', 'master-key')), false);
+    assert.equal(fs.existsSync(path.join(paths.workspace, '.ploinky', 'data', 'master-key')), false);
 
     fs.writeFileSync(paths.marker, BOX_MARKER_CONTENT);
     fs.rmSync(paths.dependencies, { recursive: true });
     fs.symlinkSync(paths.workspace, paths.dependencies);
     assert.throws(() => prepareEntrypoint({ ...box }), /mount target|mount is missing/);
-    assert.equal(fs.existsSync(path.join(paths.workspace, '.ploinky', 'master-key')), false);
+    assert.equal(fs.existsSync(path.join(paths.workspace, '.ploinky', 'data', 'master-key')), false);
 });
 
 test('transient cleanup removes only UID-keyed children and retains the tmpfs parent', (t) => {
@@ -320,7 +320,7 @@ test('full preparation creates one stable key, resets only transient runtime, an
     fs.writeFileSync(envPath, 'APPLICATION_SETTING=preserve-me\n', { mode: 0o640 });
     const envBytes = fs.readFileSync(envPath);
     prepareEntrypoint(options);
-    const keyPath = path.join(paths.workspace, '.ploinky', 'master-key');
+    const keyPath = path.join(paths.workspace, '.ploinky', 'data', 'master-key');
     const keyBytes = fs.readFileSync(keyPath);
     assert.match(keyBytes.toString('utf8'), /^[a-f0-9]{64}\n$/);
     assert.equal(mode(keyPath), 0o600);

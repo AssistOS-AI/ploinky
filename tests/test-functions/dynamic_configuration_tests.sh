@@ -15,7 +15,7 @@ fast_test_dynamic_app_name() {
   load_state
   require_var "TEST_RUN_DIR" || return 1
   
-  local secrets_file="$TEST_RUN_DIR/.ploinky/.secrets"
+  local secrets_file="$TEST_RUN_DIR/.ploinky/data/.secrets"
   
   # Save original APP_NAME if exists
   local original_app_name=""
@@ -78,7 +78,7 @@ fast_test_sso_client_secret_propagation() {
   load_state
   require_var "TEST_RUN_DIR" || return 1
   
-  local secrets_file="$TEST_RUN_DIR/.ploinky/.secrets"
+  local secrets_file="$TEST_RUN_DIR/.ploinky/data/.secrets"
   
   # Save all original SSO values
   local original_base_url=""

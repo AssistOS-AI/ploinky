@@ -9,6 +9,7 @@ import {
     buildSeatbeltProfile,
     collectLiteralPathAccess
 } from '../../cli/sandbox/seatbelt/seatbeltProfile.js';
+import { initializeWorkspaceMasterKey } from '../../ploinky-box/entrypoint/initialize-workspace.mjs';
 import { agentLibFixture } from '../helpers/agentlibFixture.mjs';
 
 // Every seatbelt profile is generated for one selected achillesAgentLib source:
@@ -136,7 +137,11 @@ test('buildSeatbeltProfile protects read-only paths even under writable workspac
     assert.match(profile, /\(subpath "\/Users\/alice\/workspace\/\.ploinky\/repos\/AchillesIDE\/explorer"\)/);
     assert.match(profile, /\(subpath "\/Users\/alice\/workspace\/\.ploinky\/deps\/agents\/AchillesIDE\/explorer\/seatbelt-darwin-arm64-node25"\)/);
     assert.match(profile, /\(subpath "\/Users\/alice\/workspace\/\.ploinky\/seatbelt-runtime\/explorer\/Agent-123"\)/);
-    assert.match(profile, /\(literal ".*\/\.ploinky\/\.secrets"\)/);
+    // Controller secrets live in the controller-state root, which is neither
+    // readable nor writable; no separate per-file literal is needed.
+    assert.match(profile, /\(deny file-write\*[\s\S]*\(subpath ".*\/\.ploinky\/data"\)/);
+    assert.match(profile, /\(deny file-read\*[\s\S]*\(subpath ".*\/\.ploinky\/data"\)/);
+    assert.doesNotMatch(profile, /\.secrets/);
 });
 
 test('collectLiteralPathAccess orders root before scoped parent paths', () => {
@@ -330,6 +335,62 @@ test('generated profile makes both canonical aliases of the controller state roo
         }
         assert.equal(fs.existsSync(path.join(canonicalStateData, 'created')), false);
         assert.equal(fs.existsSync(path.join(canonicalStateData, 'created-dir')), false);
+    } finally {
+        fs.rmSync(workspace, { recursive: true, force: true });
+    }
+});
+
+// Seatbelt has no mount namespace: controller secrets are unreadable only
+// because they live inside the read-denied controller-state root. The retired
+// spelling beside it is readable through the broad workspace grant.
+test('generated profile denies reads of the master key and encrypted stores but not of their retired spelling', { skip: process.platform !== 'darwin' }, () => {
+    const sandboxProbe = spawnSync('sandbox-exec', ['-p', '(version 1) (allow default)', '/bin/echo', 'ok'], {
+        encoding: 'utf8',
+    });
+    if (sandboxProbe.status !== 0) {
+        assert.fail(`sandbox-exec is unavailable: ${sandboxProbe.stderr || sandboxProbe.stdout}`);
+    }
+
+    const workspace = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'seatbelt-controller-secrets-')));
+    const agentWorkDir = path.join(workspace, '.data', 'agent');
+    const sharedDir = path.join(workspace, '.data', 'shared');
+    try {
+        const { path: keyPath } = initializeWorkspaceMasterKey({ workspaceRoot: workspace });
+        const names = ['master-key', '.secrets', 'ploinky_subject_identity_ed25519_v1.enc'];
+        for (const name of names.slice(1)) {
+            fs.writeFileSync(path.join(path.dirname(keyPath), name), 'synthetic\n', { mode: 0o600 });
+        }
+        for (const name of names) {
+            fs.writeFileSync(path.join(workspace, '.ploinky', name), 'synthetic retired\n', { mode: 0o600 });
+        }
+        fs.mkdirSync(agentWorkDir, { recursive: true });
+        fs.mkdirSync(sharedDir, { recursive: true });
+        fs.writeFileSync(path.join(workspace, 'project-file'), 'PROJECT');
+        const agentLibSourceGrant = seatbeltGrantFor(workspace, { create: true });
+        const profilePath = path.join(workspace, 'profile.sb');
+        fs.writeFileSync(profilePath, buildSeatbeltProfile({
+            agentLibGrant: agentLibSourceGrant,
+            agentCodePath: workspace,
+            agentLibPath: agentLibSourceGrant.sourceDir,
+            nodeModulesDir: path.join(workspace, 'node_modules'),
+            agentWorkDir,
+            sharedDir,
+            cwd: workspace,
+            skillsPath: null,
+            codeReadOnly: false,
+            skillsReadOnly: true,
+            volumes: {},
+            workspaceRoot: workspace,
+        }), 'utf8');
+        const readable = target => spawnSync('sandbox-exec', [
+            '-f', profilePath, '/bin/sh', '-c', 'test -r "$1" && /bin/cat "$1" >/dev/null', 'probe', target,
+        ], { cwd: workspace, encoding: 'utf8' }).status === 0;
+
+        assert.equal(readable(path.join(workspace, 'project-file')), true);
+        for (const name of names) {
+            assert.equal(readable(path.join(path.dirname(keyPath), name)), false, `${name} is readable`);
+            assert.equal(readable(path.join(workspace, '.ploinky', name)), true, `retired ${name} control`);
+        }
     } finally {
         fs.rmSync(workspace, { recursive: true, force: true });
     }

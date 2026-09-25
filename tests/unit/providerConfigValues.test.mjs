@@ -71,7 +71,7 @@ test('Router and service resolve the same generated secret without stored or exp
     const bridge = createGenericAuthBridge();
     const result = await bridge.beginLogin({ baseUrl: 'http://127.0.0.1:8080' });
     assert.match(result.redirectUrl, /^https:\/\/identity\.test\/login/);
-    assert.equal(fs.existsSync(path.join(workspace, '.ploinky', '.secrets')), false);
+    assert.equal(fs.existsSync(path.join(workspace, '.ploinky', 'data', '.secrets')), false);
 });
 
 test('shared secret resolution follows persisted profile and explicit-override policy', () => {

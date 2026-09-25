@@ -132,7 +132,7 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
             notes: 'The optional `repo` token is accepted but not required.'
         },
         'var': {
-            description: 'Set a workspace variable (stored encrypted in .ploinky/.secrets)',
+            description: 'Set a workspace variable (stored encrypted in .ploinky/data/.secrets)',
             syntax: 'var <VAR> <value>',
             examples: [
                 'var API_KEY sk-123456'
@@ -140,7 +140,7 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
             notes: "Use 'vars' to list variables. Router control surfaces use authenticated workspace sessions."
         },
         'vars': {
-            description: 'List workspace variables (from encrypted .ploinky/.secrets)',
+            description: 'List workspace variables (from encrypted .ploinky/data/.secrets)',
             syntax: 'vars',
             examples: [ 'vars' ]
         },
@@ -716,7 +716,7 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
                 description: 'Stop nested agents and remove the outer runtime, retaining the host workspace and its .ploinky/box dependency and image cache directories by default.',
                 syntax: 'destroy [--delete-cache]',
                 examples: ['destroy', 'destroy --delete-cache'],
-                notes: 'Nested agents are stopped through the in-box helper before the outer runtime is removed; if that stop fails, the outer runtime is halted but nothing is removed. Both forms run without prompting. Without the flag, this host-level command retains the host workspace plus .ploinky/box/dependencies and .ploinky/box/images, so pinned dependencies and reusable nested image content survive destroy and recreate. With --delete-cache, it removes the outer runtime and then deletes exactly those two directories; the workspace, .ploinky/master-key, repositories, agents, routing state, and secrets are never deleted. Nested container records, writable layers, and inner named volumes are not retained by either form: they live on the outer runtime writable layer and are discarded with it, so persistent agent data must use workspace binds.',
+                notes: 'Nested agents are stopped through the in-box helper before the outer runtime is removed; if that stop fails, the outer runtime is halted but nothing is removed. Both forms run without prompting. Without the flag, this host-level command retains the host workspace plus .ploinky/box/dependencies and .ploinky/box/images, so pinned dependencies and reusable nested image content survive destroy and recreate. With --delete-cache, it removes the outer runtime and then deletes exactly those two directories; the workspace, .ploinky/data/master-key, repositories, agents, routing state, and secrets are never deleted. Nested container records, writable layers, and inner named volumes are not retained by either form: they live on the outer runtime writable layer and are discarded with it, so persistent agent data must use workspace binds.',
             },
         }
         : {
