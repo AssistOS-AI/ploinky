@@ -700,6 +700,64 @@ export const scenarios = [
         },
     },
     {
+        name: 'a rollback that stops with an unobservable journal is recovery-required with every cause, never a clean failure',
+        run({ mod, tmp }) {
+            const fixture = crashFixture(mod, tmp);
+            const agents = path.join(fixture.folder, '.agents');
+            const aside = path.join(fixture.base, 'agents-aside');
+            // The whole export root becomes unobservable after the move: the
+            // rollback, the journal check and the lock release all stop.
+            const afterMove = () => {
+                fs.renameSync(agents, aside);
+                write(agents, 'not a directory\n');
+                throw Object.assign(new Error('injected failure after move'), { code: 'INJECTED' });
+            };
+            let transaction = null;
+            assert.throws(() => fixture.run(200, { hooks: { afterMove } }), error => {
+                assert.equal(error.code, 'SKILL_EXPORT_RECOVERY_REQUIRED');
+                assert.equal(error.skillExportRecovery.status, 'unknown');
+                assert.equal(error.cause.code, 'INJECTED', 'the original failure is kept');
+                assert.equal(error.rollbackError.code, 'ENOTDIR');
+                assert.equal(error.journalError.code, 'ENOTDIR');
+                assert.equal(error.lockReleaseError.code, 'ENOTDIR', 'the release failure travels with the outcome');
+                assert.match(error.message, /injected failure after move.*journal state could not be read.*may remain pending/s);
+                transaction = error.transaction;
+                return true;
+            });
+            fs.rmSync(agents);
+            fs.renameSync(aside, agents);
+            const state = mod.readSkillExportTransactionState(fixture.folder, { liveness: liveness(300) });
+            assert.equal(state.pending?.transaction, transaction);
+            assert.ok(lstat(path.join(agents, '.ploinky-export-staging', `tx-${transaction}`)), 'staging is kept while the journal was unobservable');
+            assertUserFiles(fixture.folder);
+            const next = fixture.run(300, { dead: [200] });
+            assert.equal(next.recovery.status, 'rolled-back');
+            assert.equal(next.transaction.status, 'committed');
+            assertAfterState(mod, fixture);
+        },
+    },
+    {
+        name: 'a lock release failure after a committed export reports the settled result and keeps later exports blocked',
+        run({ mod, tmp }) {
+            const fixture = crashFixture(mod, tmp);
+            const lock = path.join(fixture.folder, '.agents', '.ploinky-skill-exports.lock');
+            const crash = point => { if (point === 'after-commit') write(path.join(lock, 'stray'), 'stray\n'); };
+            assert.throws(() => fixture.run(200, { hooks: { crash } }), error => {
+                assert.equal(error.code, 'SKILL_EXPORT_LOCK_RELEASE_FAILED');
+                assert.equal(error.cause.code, 'ENOTEMPTY');
+                assert.equal(error.skillExportResult.transaction.status, 'committed');
+                assert.deepEqual([...error.skillExportResult.installed].sort(), ['fresh', 'replace']);
+                return true;
+            });
+            assertAfterState(mod, fixture);
+            assert.equal(mod.readSkillExportTransactionState(fixture.folder, { liveness: liveness(300) }).pending, null);
+            assert.throws(() => fixture.run(300, { dead: [200] }), error => error.code === 'SKILL_EXPORT_LOCK_OWNERLESS');
+            fs.rmSync(lock, { recursive: true });
+            assert.equal(fixture.run(300).transaction.status, 'unchanged');
+            assertAfterState(mod, fixture);
+        },
+    },
+    {
         name: 'marketplace install owns only links it creates and removal touches only owned output',
         run({ mod, tmp }) {
             const base = tmp('market');

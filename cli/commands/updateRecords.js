@@ -86,17 +86,27 @@ function exclusionSummary(outcome) {
     return { status: outcome.status || null, mode: outcome.mode || null, code: outcome.code || null };
 }
 
-// A thrown export whose journal stays pending, or whose rollback quarantined
-// output it could not restore, has not failed: its outputs need recovery, so
-// the record is uncertain. Only a throw that rolled back cleanly, or that
-// never started a transaction, is failed. The thrown code stays in details.
+// A thrown export whose journal stays pending or cannot be observed, or whose
+// rollback quarantined output it could not restore, has not failed: its
+// outputs need recovery, so the record is uncertain. So is a lock-release
+// failure whose completed result still needs recovery. A throw that rolled
+// back cleanly, never started a transaction, or settled its outputs before
+// the release failed is failed. The thrown code stays in details.
 function thrownExportFields(error, fallbackCode) {
     const code = String(error?.code || fallbackCode);
-    const reason = String(error?.message || error);
+    const releaseError = error?.lockReleaseError || null;
+    const reason = String(error?.message || error)
+        + (releaseError ? `; its export lock could not be released either (${releaseError.message})` : '');
     const recovery = error?.skillExportRecovery || null;
     const status = recovery?.status || null;
-    const details = { errorCode: code, recovery: status ? { status, transaction: recovery.transaction || null } : null };
-    if (code === 'SKILL_EXPORT_RECOVERY_REQUIRED' || status === 'pending') {
+    const completed = code === 'SKILL_EXPORT_LOCK_RELEASE_FAILED' ? error?.skillExportResult || null : null;
+    const details = {
+        errorCode: code,
+        recovery: status ? { status, transaction: recovery.transaction || null } : null,
+        ...(releaseError ? { lockReleaseCode: String(releaseError.code || 'lock-release-failed') } : {}),
+        ...(completed ? { transaction: completed.transaction || null } : {}),
+    };
+    if (code === 'SKILL_EXPORT_RECOVERY_REQUIRED' || status === 'pending' || status === 'unknown') {
         return { outcome: 'uncertain', code: 'SKILL_EXPORT_RECOVERY_REQUIRED', reason, details };
     }
     if (status === 'quarantined') {
@@ -106,6 +116,12 @@ function thrownExportFields(error, fallbackCode) {
             reason: `${reason}; skill export transaction ${recovery.transaction} was quarantined with output it could not restore. Existing state is preserved for recovery.`,
             details,
         };
+    }
+    if (completed) {
+        const problem = skillExportRecoveryProblem(completed);
+        if (problem) return { outcome: 'uncertain', code: problem.code, reason: `${problem.reason} ${reason}`, details };
+        const settled = completed.transaction?.status ? ` Its outputs are settled (transaction ${completed.transaction.status}).` : '';
+        return { outcome: 'failed', code, reason: `${reason}${settled}`, details };
     }
     return { outcome: 'failed', code, reason, details };
 }

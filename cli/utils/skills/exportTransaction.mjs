@@ -478,6 +478,9 @@ export function withSkillExportLocks(folders, callback, options = {}) {
     const held = [];
     const handles = [];
     const heldGit = [];
+    let result;
+    let failed = false;
+    let failure = null;
     try {
         for (const key of gitLocks) {
             try {
@@ -504,7 +507,12 @@ export function withSkillExportLocks(folders, callback, options = {}) {
             }
             handle.recovery = recoverSkillExportTransaction(handle, options);
         }
-        return callback(handles);
+        result = callback(handles);
+        return result;
+    } catch (error) {
+        failed = true;
+        failure = error;
+        throw error;
     } finally {
         // A simulated crash abandons every lock of the batch, as a dead process would.
         if (handles.some(handle => handle.abandoned)) held.length = 0;
@@ -512,7 +520,16 @@ export function withSkillExportLocks(folders, callback, options = {}) {
         for (const lock of held.reverse()) {
             try { lock.release(); } catch (error) { releaseError ||= error; }
         }
-        if (releaseError) throw releaseError;
+        // A failure already in flight keeps its own outcome and carries the
+        // release problem; a completed callback reports the release problem
+        // with its result, whose outputs are settled.
+        if (releaseError && failed) {
+            if (failure && typeof failure === 'object') failure.lockReleaseError = releaseError;
+        } else if (releaseError) {
+            throw skillExportError('SKILL_EXPORT_LOCK_RELEASE_FAILED',
+                `Skill export finished, but its lock could not be released (${releaseError.message}); later exports of this folder may stay blocked until the lock is released or reclaimed.`,
+                { outcome: 'lock-release-failed', cause: releaseError, skillExportResult: result });
+        }
     }
 }
 
@@ -1318,6 +1335,7 @@ export function publishSkillExports(handle, spec) {
     fs.writeFileSync(path.join(staging, LOCK_OWNER), `${JSON.stringify(handle.owner)}\n`, { flag: 'wx', mode: 0o600 });
     let journalWritten = false;
     let exclusionPlan = null;
+    let failure = null;
     try {
         const linker = spec.linker || relativeSkillLink;
         const ops = policy === 'exclusions-only' ? []
@@ -1528,12 +1546,20 @@ export function publishSkillExports(handle, spec) {
                 if (handle.abandoned) throw stopped;
                 rollbackError = stopped;
             }
-            // A rollback that stopped with the journal still present leaves
-            // the transaction pending: it needs recovery; it has not failed.
-            if (rollbackError && exists(journalPath(handle))) {
-                throw skillExportError('SKILL_EXPORT_RECOVERY_REQUIRED',
-                    `Skill export transaction ${transaction} failed before its commit point (${error.message}) and its rollback stopped (${rollbackError.message}); it remains pending for recovery.`,
-                    { outcome: 'recovery-required', transaction, cause: error, rollbackError, skillExportRecovery: { status: 'pending', transaction, unexpected } });
+            // A rollback that stopped with the journal still present, or with
+            // a journal that cannot be observed, leaves the transaction
+            // pending or unknown: it needs recovery; it has not failed.
+            if (rollbackError) {
+                let status = null;
+                let journalError = null;
+                try { if (exists(journalPath(handle))) status = 'pending'; } catch (unreadable) { status = 'unknown'; journalError = unreadable; }
+                if (status) {
+                    const state = status === 'pending' ? 'it remains pending for recovery'
+                        : `its journal state could not be read (${journalError.message}); it may remain pending for recovery`;
+                    throw skillExportError('SKILL_EXPORT_RECOVERY_REQUIRED',
+                        `Skill export transaction ${transaction} failed before its commit point (${error.message}) and its rollback stopped (${rollbackError.message}); ${state}.`,
+                        { outcome: 'recovery-required', transaction, cause: error, rollbackError, ...(journalError ? { journalError } : {}), skillExportRecovery: { status, transaction, unexpected } });
+                }
             }
             error.skillExportRecovery = { status: unexpected.length ? 'quarantined' : 'rolled-back', transaction, unexpected, ...(rollbackError ? { rollbackError } : {}) };
             throw error;
@@ -1569,11 +1595,21 @@ export function publishSkillExports(handle, spec) {
             gitignore: Boolean(gitignorePlan) && published('gitignore'),
         };
         return result;
+    } catch (error) {
+        failure = error;
+        throw error;
     } finally {
         if (!handle.abandoned) {
-            const quarantined = fs.existsSync(path.join(handle.agents, EXPORT_QUARANTINE, `${transaction}.json`));
-            const pending = journalWritten && fs.existsSync(journalPath(handle));
-            if (!quarantined && !pending) fs.rmSync(staging, { recursive: true, force: true });
+            // Staging is removed only when no journal or quarantine record can
+            // reference it. A failed or unprovable check keeps it (retention
+            // reports it), and cleanup never replaces the in-flight outcome.
+            try {
+                const quarantined = exists(path.join(handle.agents, EXPORT_QUARANTINE, `${transaction}.json`));
+                const pending = journalWritten && exists(journalPath(handle));
+                if (!quarantined && !pending) fs.rmSync(staging, { recursive: true, force: true });
+            } catch (cleanupError) {
+                if (failure && typeof failure === 'object') failure.stagingCleanupError = cleanupError;
+            }
             handle.activeTransaction = null;
             if (!result.retention) {
                 try { result.retention = inspectSkillExportRetention(handle, spec.lock || {}); } catch (_) {}

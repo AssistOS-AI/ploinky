@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { readSkillExportTransactionState, skillExportRecoveryProblem } from '../../cli/utils/skills/exportTransaction.mjs';
+import { currentSkillExportIdentity, readSkillExportTransactionState, skillExportRecoveryProblem } from '../../cli/utils/skills/exportTransaction.mjs';
 import { syncManagedSkillExports } from '../../cli/utils/skills/managedExports.js';
 import { buildCoreUpdateResult, defaultSkillsRecord, skillsManifestRecord } from '../../cli/commands/updateRecords.js';
 
@@ -102,13 +102,13 @@ function exportFixture(t, label) {
     }
     fs.mkdirSync(folder);
     fs.writeFileSync(path.join(folder, 'notes.txt'), 'user notes\n');
-    const sync = (version, afterMove = null) => syncManagedSkillExports({
-        folder, owner: 'defaults:skills', afterMove,
+    const sync = (version, afterMove = null, lock = {}) => syncManagedSkillExports({
+        folder, owner: 'defaults:skills', afterMove, lock: { waitMs: 0, ...lock },
         sources: [{ name: 'demo', path: path.join(root, version, 'demo'), source: { name: 'skills' } }],
     });
     sync('v1');
-    const thrown = afterMove => {
-        try { sync('v2', afterMove); } catch (error) { return error; }
+    const thrown = (afterMove, lock = {}) => {
+        try { sync('v2', afterMove, lock); } catch (error) { return error; }
         assert.fail('the export was expected to throw');
     };
     const records = error => [
@@ -116,7 +116,14 @@ function exportFixture(t, label) {
         skillsManifestRecord({ folder, manifestPath: path.join(folder, 'ploinky-skills-manifest.json'), label: 'consumer', error }),
     ];
     const state = () => readSkillExportTransactionState(folder);
-    return { root, folder, skills, sync, thrown, records, state };
+    const lockPath = path.join(folder, '.agents', '.ploinky-skill-exports.lock');
+    // A stray file in the freshly created lock directory makes its release
+    // fail (ENOTEMPTY) whatever the export itself does.
+    const strayLock = { liveness: { current: () => {
+        if (fs.existsSync(lockPath)) fs.writeFileSync(path.join(lockPath, 'stray'), 'stray\n');
+        return currentSkillExportIdentity();
+    } } };
+    return { root, folder, skills, sync, thrown, records, state, lockPath, strayLock };
 }
 
 const injected = () => Object.assign(new Error('injected failure after move'), { code: 'INJECTED' });
@@ -190,4 +197,133 @@ test('a pre-commit export failure that rolls back cleanly stays failed with its 
         assert.deepEqual(record.details.recovery, { status: 'rolled-back', transaction: error.skillExportRecovery.transaction });
     }
     assert.equal(f.sync('v2').installed[0], 'demo');
+});
+
+// A lock release failure never replaces the outcome already in flight, and a
+// release failure after settled outputs is failed, not a recovery.
+function stopRollback(f) {
+    const backups = path.join(f.folder, '.agents', '.ploinky-export-backups');
+    const aside = path.join(f.root, 'backups-aside');
+    return {
+        afterMove: () => {
+            fs.renameSync(backups, aside);
+            fs.writeFileSync(backups, 'not a directory\n');
+            throw injected();
+        },
+        restore: () => { fs.rmSync(backups); fs.renameSync(aside, backups); },
+    };
+}
+
+test('a pending export whose lock release also fails stays uncertain with both problems', t => {
+    const f = exportFixture(t, 'pending-release');
+    const stop = stopRollback(f);
+    const error = f.thrown(stop.afterMove, f.strayLock);
+    stop.restore();
+    assert.equal(error.code, 'SKILL_EXPORT_RECOVERY_REQUIRED');
+    assert.equal(error.skillExportRecovery.status, 'pending');
+    assert.equal(error.cause.code, 'INJECTED');
+    assert.equal(error.lockReleaseError.code, 'ENOTEMPTY');
+    for (const record of f.records(error)) {
+        assert.equal(record.outcome, 'uncertain');
+        assert.equal(record.code, 'SKILL_EXPORT_RECOVERY_REQUIRED');
+        assert.equal(record.details.lockReleaseCode, 'ENOTEMPTY');
+        assert.match(record.reason, /remains pending for recovery.*export lock could not be released either/s);
+    }
+    assert.equal(f.state().pending?.transaction, error.transaction);
+    fs.rmSync(f.lockPath, { recursive: true });
+    assert.equal(f.sync('v2').recovery.status, 'rolled-back');
+    assert.equal(fs.readFileSync(path.join(f.folder, 'notes.txt'), 'utf8'), 'user notes\n');
+});
+
+test('an export whose journal cannot be observed after its rollback stopped is uncertain, never failed', t => {
+    const f = exportFixture(t, 'unknown');
+    const agents = path.join(f.folder, '.agents');
+    const aside = path.join(f.root, 'agents-aside');
+    const error = f.thrown(() => {
+        fs.renameSync(agents, aside);
+        fs.writeFileSync(agents, 'not a directory\n');
+        throw injected();
+    });
+    fs.rmSync(agents);
+    fs.renameSync(aside, agents);
+    assert.equal(error.skillExportRecovery.status, 'unknown');
+    for (const record of f.records(error)) {
+        assert.equal(record.outcome, 'uncertain');
+        assert.equal(record.code, 'SKILL_EXPORT_RECOVERY_REQUIRED');
+        assert.deepEqual(record.details.recovery, { status: 'unknown', transaction: error.transaction });
+        assert.equal(record.details.lockReleaseCode, 'ENOTDIR');
+        assert.match(record.reason, /injected failure after move.*journal state could not be read/s);
+    }
+    assert.equal(f.state().pending?.transaction, error.transaction);
+    fs.rmSync(f.lockPath, { recursive: true });
+    assert.equal(f.sync('v2').recovery.status, 'rolled-back');
+});
+
+test('a quarantined export whose lock release also fails stays uncertain and keeps the user bytes', t => {
+    const f = exportFixture(t, 'quarantine-release');
+    const error = f.thrown(({ destination }) => {
+        fs.mkdirSync(destination);
+        fs.writeFileSync(path.join(destination, 'user.txt'), 'user bytes\n');
+        throw injected();
+    }, f.strayLock);
+    assert.equal(error.code, 'INJECTED');
+    assert.equal(error.lockReleaseError.code, 'ENOTEMPTY');
+    for (const record of f.records(error)) {
+        assert.equal(record.outcome, 'uncertain');
+        assert.deepEqual([record.details.errorCode, record.details.lockReleaseCode], ['INJECTED', 'ENOTEMPTY']);
+    }
+    assert.equal(f.state().quarantined.length, 1);
+    assert.equal(fs.readFileSync(path.join(f.skills, 'demo', 'user.txt'), 'utf8'), 'user bytes\n');
+});
+
+test('a clean rollback whose lock release fails stays failed with its own error first', t => {
+    const f = exportFixture(t, 'clean-release');
+    const error = f.thrown(() => { throw injected(); }, f.strayLock);
+    assert.equal(error.code, 'INJECTED');
+    assert.equal(error.skillExportRecovery.status, 'rolled-back');
+    for (const record of f.records(error)) {
+        assert.equal(record.outcome, 'failed');
+        assert.equal(record.code, 'INJECTED');
+        assert.equal(record.details.lockReleaseCode, 'ENOTEMPTY');
+        assert.match(record.reason, /^injected failure after move; its export lock could not be released either/);
+    }
+    assert.deepEqual(f.state().quarantined, []);
+    assert.equal(f.state().pending, null);
+    assert.equal(fs.realpathSync(path.join(f.skills, 'demo')), path.join(f.root, 'v1', 'demo'));
+});
+
+test('a committed export whose lock release fails is failed with its settled transaction, not uncertain', t => {
+    const f = exportFixture(t, 'committed-release');
+    const error = f.thrown(null, f.strayLock);
+    assert.equal(error.code, 'SKILL_EXPORT_LOCK_RELEASE_FAILED');
+    assert.equal(error.cause.code, 'ENOTEMPTY');
+    for (const record of f.records(error)) {
+        assert.equal(record.outcome, 'failed');
+        assert.equal(record.code, 'SKILL_EXPORT_LOCK_RELEASE_FAILED');
+        assert.equal(record.details.transaction.status, 'committed');
+        assert.match(record.reason, /stay blocked.*outputs are settled \(transaction committed\)/s);
+    }
+    assert.equal(fs.realpathSync(path.join(f.skills, 'demo')), path.join(f.root, 'v2', 'demo'));
+    assert.throws(() => f.sync('v2'), { code: 'SKILL_EXPORT_LOCK_OWNERLESS' });
+});
+
+test('a lock release failure after a recovery that quarantined output stays uncertain', t => {
+    const f = exportFixture(t, 'recovery-release');
+    const stop = stopRollback(f);
+    f.thrown(stop.afterMove);
+    stop.restore();
+    // The user fills the vacated destination before recovery runs.
+    fs.mkdirSync(path.join(f.skills, 'demo'));
+    fs.writeFileSync(path.join(f.skills, 'demo', 'user.txt'), 'user bytes\n');
+    let error = null;
+    try { f.sync('v2', null, f.strayLock); } catch (thrown) { error = thrown; }
+    assert.equal(error?.code, 'SKILL_EXPORT_LOCK_RELEASE_FAILED');
+    assert.equal(error.skillExportResult.recovery.status, 'quarantined');
+    for (const record of f.records(error)) {
+        assert.equal(record.outcome, 'uncertain');
+        assert.equal(record.code, 'SKILL_EXPORT_RECOVERY_REQUIRED');
+        assert.equal(record.details.errorCode, 'SKILL_EXPORT_LOCK_RELEASE_FAILED');
+        assert.match(record.reason, /incomplete: .*recovery quarantined.*lock could not be released/s);
+    }
+    assert.equal(fs.readFileSync(path.join(f.skills, 'demo', 'user.txt'), 'utf8'), 'user bytes\n');
 });
