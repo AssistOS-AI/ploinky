@@ -139,9 +139,10 @@ function observeMarkedWorker(containerName, {
         if (error?.foreign) return { ...base, live: false, pid, reason: 'its pid now belongs to another process' };
         // Alive, but not provably this worker (its arguments are unreadable, or
         // it runs under another executable path): it cannot be proven stopped.
-        // Its run-scoped deadline bounds how long it is plausibly still the
-        // worker: by then a worker has published a terminal status or timed
-        // out, so it is no longer waited for, though it is still superseded.
+        // Past its run-scoped deadline the worker protocol already treats the
+        // run as stale, so it is no longer waited for. That does not prove the
+        // worker exited: it stays in the live set, so the start supersedes it
+        // and it can neither resume nor keep its unpublished runtime.
         const deadlineMs = observation.queued
             ? noWaitQueuedStatusDeadline(marker.runStartedAtMs, marker.waveIndex, timeouts)
             : observation.deadline;
