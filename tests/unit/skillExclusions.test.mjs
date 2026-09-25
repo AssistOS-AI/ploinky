@@ -27,6 +27,9 @@ Object.assign(process.env, {
     GIT_AUTHOR_NAME: 'Test', GIT_AUTHOR_EMAIL: 'test@example.invalid',
     GIT_COMMITTER_NAME: 'Test', GIT_COMMITTER_EMAIL: 'test@example.invalid',
 });
+// Composition consent comes only from each test, never from the ambient shell.
+delete process.env.PLOINKY_SKILL_EXCLUDES_COMPOSE;
+delete process.env.GIT_CONFIG_SYSTEM;
 test.after(() => fs.rmSync(isolation, { recursive: true, force: true }));
 
 const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
@@ -62,7 +65,7 @@ function skill(root, name) {
 
 function exporter(root, options = {}) {
     return (folder, names, extra = {}) => tx.syncManagedSkillExports({
-        folder, owner: 'manifest', mode: 'symlink', claude: 'root-or-skills',
+        folder, owner: 'manifest', claude: 'root-or-skills',
         sources: names.map(name => ({ name, path: path.join(root, 'sources', name) })),
         exclusions: createSkillExclusionPlanner(options), ...extra,
     });
@@ -475,7 +478,7 @@ test('non-git folders keep a receipt-backed block and migrate it after git init'
     sync(other, ['demo']);
     fs.writeFileSync(path.join(other, '.gitignore'), read(path.join(other, '.gitignore')).replace(IGNORE_MARKER_END, `/mine\n${IGNORE_MARKER_END}`));
     const preserved = sync(other, ['demo', 'second']);
-    assert.equal(preserved.exclusions.code, 'legacy-ignore-block-preserved');
+    assert.equal(preserved.exclusions.code, 'unverified-ignore-block-preserved');
     assert.match(read(path.join(other, '.gitignore')), /\/mine/);
 });
 
@@ -530,7 +533,7 @@ test('marketplace install and removal refresh private exclusions', t => {
 // ---------------------------------------------------------------------------
 // Pre-pull assessment.
 
-const LEGACY_BLOCK = `${IGNORE_MARKER_START}\n.claude\n.agents/skills/demo/\n${IGNORE_MARKER_END}\n`;
+const RECEIPTLESS_BLOCK = `${IGNORE_MARKER_START}\n.claude\n.agents/skills/demo/\n${IGNORE_MARKER_END}\n`;
 
 function trackedIgnore(root, committed) {
     const project = repo(path.join(root, `project-${crypto.randomUUID()}`));
@@ -549,19 +552,19 @@ test('assessment reports none for clean repositories and unrelated changes', t =
 });
 
 for (const [label, content] of [
-    ['a legacy block', `node_modules\n${LEGACY_BLOCK}`],
-    ['a legacy block with CRLF line endings', `node_modules\r\n${LEGACY_BLOCK.replace(/\n/g, '\r\n')}`],
-    ['a legacy block without a final newline', `node_modules\n${LEGACY_BLOCK.trimEnd()}`],
-    ['multiple legacy blocks', `node_modules\n${LEGACY_BLOCK}${LEGACY_BLOCK}`],
-    ['a user edit inside the block', `node_modules\n${LEGACY_BLOCK.replace('.claude\n', '.claude\n/mine\n')}`],
-    ['a user edit outside the block', `node_modules\ndist\n${LEGACY_BLOCK}`],
+    ['a receipt-less block', `node_modules\n${RECEIPTLESS_BLOCK}`],
+    ['a receipt-less block with CRLF line endings', `node_modules\r\n${RECEIPTLESS_BLOCK.replace(/\n/g, '\r\n')}`],
+    ['a receipt-less block without a final newline', `node_modules\n${RECEIPTLESS_BLOCK.trimEnd()}`],
+    ['multiple receipt-less blocks', `node_modules\n${RECEIPTLESS_BLOCK}${RECEIPTLESS_BLOCK}`],
+    ['a user edit inside the block', `node_modules\n${RECEIPTLESS_BLOCK.replace('.claude\n', '.claude\n/mine\n')}`],
+    ['a user edit outside the block', `node_modules\ndist\n${RECEIPTLESS_BLOCK}`],
 ]) {
     test(`assessment preserves ${label} without a write receipt`, t => {
         const project = trackedIgnore(base(t), 'node_modules\n');
         fs.writeFileSync(path.join(project, '.gitignore'), content);
         const result = assessGeneratedIgnoreState({ repoPath: project });
         assert.equal(result.status, 'preserve');
-        assert.equal(result.code, 'legacy-ignore-block-preserved');
+        assert.equal(result.code, 'unverified-ignore-block-preserved');
         assert.match(result.reason, /git restore -- \.gitignore/);
         assert.equal(read(path.join(project, '.gitignore')), content);
     });
@@ -600,7 +603,7 @@ test('assessment restores a receipt-proven block only when bytes and index match
         const file = path.join(edited, '.gitignore');
         fs.writeFileSync(file, edit(read(file)));
         const bytes = read(file);
-        assert.equal(assessGeneratedIgnoreState({ repoPath: edited }).code, 'legacy-ignore-block-preserved');
+        assert.equal(assessGeneratedIgnoreState({ repoPath: edited }).code, 'unverified-ignore-block-preserved');
         assert.equal(read(file), bytes);
     }
 });
@@ -619,7 +622,7 @@ test('assessment preserves staged and conflicted ignore files and restores unbor
     fs.writeFileSync(path.join(conflicted, '.gitignore'), 'main\n');
     git(conflicted, 'commit', '-q', '-am', 'main');
     assert.throws(() => git(conflicted, 'merge', '-q', 'side'));
-    fs.appendFileSync(path.join(conflicted, '.gitignore'), LEGACY_BLOCK);
+    fs.appendFileSync(path.join(conflicted, '.gitignore'), RECEIPTLESS_BLOCK);
     assert.equal(assessGeneratedIgnoreState({ repoPath: conflicted }).code, 'ignore-file-conflicted');
 
     const unborn = path.join(root, 'unborn');
@@ -639,19 +642,19 @@ test('a Git failure inside a repository defers instead of writing a non-git bloc
     const refusing = (args, options) => args[0] === 'rev-parse'
         ? { status: 128, stdout: Buffer.alloc(0), stderr: "fatal: detected dubious ownership in repository at '/x'" }
         : { status: 1, stdout: Buffer.alloc(0), stderr: '' };
-    const result = tx.syncManagedSkillExports({ folder: nested, owner: 'manifest', mode: 'symlink', sources: [{ name: 'demo', path: path.join(root, 'sources', 'demo') }],
+    const result = tx.syncManagedSkillExports({ folder: nested, owner: 'manifest', sources: [{ name: 'demo', path: path.join(root, 'sources', 'demo') }],
         exclusions: createSkillExclusionPlanner({ nonGitBlock: true, git: refusing }) });
     assert.equal(result.exclusions.code, 'git-identity-unavailable');
     assert.equal(fs.existsSync(path.join(nested, '.gitignore')), false);
     assert.deepEqual(result.installed, ['demo'], 'the export itself still publishes');
 
     const notRepository = () => ({ status: 128, stdout: Buffer.alloc(0), stderr: 'fatal: not a git repository (or any of the parent directories): .git' });
-    const ceiling = tx.syncManagedSkillExports({ folder: nested, owner: 'manifest', mode: 'symlink', sources: [],
+    const ceiling = tx.syncManagedSkillExports({ folder: nested, owner: 'manifest', sources: [],
         exclusions: createSkillExclusionPlanner({ nonGitBlock: true, git: notRepository }) });
     assert.equal(ceiling.exclusions.code, 'git-identity-unavailable', 'a .git above the target overrides a negative discovery');
 
     const missing = () => { throw Object.assign(new Error('spawn git ENOENT'), { code: 'ENOENT' }); };
-    const noGit = tx.syncManagedSkillExports({ folder: nested, owner: 'manifest', mode: 'symlink', sources: [],
+    const noGit = tx.syncManagedSkillExports({ folder: nested, owner: 'manifest', sources: [],
         exclusions: createSkillExclusionPlanner({ nonGitBlock: true, git: missing }) });
     assert.equal(noGit.exclusions.code, 'git-identity-unavailable');
 });
@@ -694,7 +697,7 @@ test('recovery of Git config changes takes the common Git lock, or stays pending
         error => error.code === 'SKILL_EXPORT_RECOVERY_REQUIRED');
     fs.chmodSync(gitDir, 0o755);
     // A plain export without an exclusions planner still orders the Git lock first.
-    const plain = tx.syncManagedSkillExports({ folder: project, owner: 'manifest', mode: 'symlink', sources: [{ name: 'demo', path: path.join(root, 'sources', 'demo') }], lock: { liveness: liveness(300, [200]) } });
+    const plain = tx.syncManagedSkillExports({ folder: project, owner: 'manifest', sources: [{ name: 'demo', path: path.join(root, 'sources', 'demo') }], lock: { liveness: liveness(300, [200]) } });
     assert.equal(plain.recovery.status, 'rolled-forward');
     assert.equal(status(project), '');
 });

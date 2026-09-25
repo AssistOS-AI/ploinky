@@ -60,7 +60,7 @@ function workspace(t) {
     fs.mkdirSync(source, { recursive: true });
     fs.writeFileSync(path.join(source, 'SKILL.md'), '# demo\n');
     const inBox = tx.syncManagedSkillExports({
-        folder: project, owner: 'manifest', mode: 'symlink', claude: 'root-or-skills',
+        folder: project, owner: 'manifest', claude: 'root-or-skills',
         sources: [{ name: 'demo', path: source }],
         exclusions: createSkillExclusionPlanner({ containerExecutor: true }),
     });

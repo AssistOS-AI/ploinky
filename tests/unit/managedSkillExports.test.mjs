@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { syncManagedSkillExports, skillTreeDigest } from '../../cli/utils/skills/managedExports.js';
+import { syncManagedSkillExports } from '../../cli/utils/skills/managedExports.js';
 
 function fixture(t) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'managed-skills-'));
@@ -20,35 +20,41 @@ function fixture(t) {
     return { root, source, folder, sources, sync, output };
 }
 
-test('owned export detects helper bytes, modes and membership, is idempotent, and removes final output', t => {
+test('owned exports are relative links that expose source edits, stay idempotent and remove only the link', t => {
     const { source, output, sync } = fixture(t);
     assert.deepEqual(sync().installed, ['demo']);
+    assert.ok(fs.lstatSync(output).isSymbolicLink());
+    assert.equal(path.isAbsolute(fs.readlinkSync(output)), false);
+    assert.equal(fs.realpathSync(output), fs.realpathSync(source));
+    fs.writeFileSync(path.join(source, 'helper.sh'), 'changed source');
+    assert.equal(fs.readFileSync(path.join(output, 'helper.sh'), 'utf8'), 'changed source');
     assert.deepEqual(sync().unchanged, ['demo']);
-    const helper = path.join(source, 'helper.sh');
-    const before = fs.statSync(helper);
-    fs.writeFileSync(helper, 'echo two\n');
-    fs.utimesSync(helper, before.atime, before.mtime);
-    assert.deepEqual(sync().installed, ['demo']);
-    assert.equal(fs.readFileSync(path.join(output, 'helper.sh'), 'utf8'), 'echo two\n');
-    fs.chmodSync(helper, 0o644);
-    sync();
-    assert.equal(fs.statSync(path.join(output, 'helper.sh')).mode & 0o777, 0o644);
-    fs.unlinkSync(helper);
-    sync();
-    assert.equal(fs.existsSync(path.join(output, 'helper.sh')), false);
     assert.deepEqual(sync({ sources: [] }).removed, ['demo']);
-    assert.equal(fs.existsSync(output), false);
+    assert.throws(() => fs.lstatSync(output), { code: 'ENOENT' });
+    assert.equal(fs.readFileSync(path.join(source, 'helper.sh'), 'utf8'), 'changed source', 'removal never follows the link');
 });
 
-test('edited files, added files and executable mode edits preserve managed output and ownership proof', t => {
+test('a dangling owned link is removed once its source is gone', t => {
     const { source, output, sync } = fixture(t);
     sync();
-    fs.writeFileSync(path.join(output, 'helper.sh'), 'my edits\n');
-    fs.writeFileSync(path.join(source, 'SKILL.md'), '# two\n');
+    fs.rmSync(source, { recursive: true });
+    assert.deepEqual(sync({ sources: [] }).removed, ['demo']);
+    assert.throws(() => fs.lstatSync(output), { code: 'ENOENT' });
+});
+
+test('a user-retargeted owned link is preserved on refresh and removal', t => {
+    const { root, source, output, sync } = fixture(t);
+    sync();
+    const replacement = path.join(root, 'replacement');
+    fs.mkdirSync(replacement);
+    fs.writeFileSync(path.join(replacement, 'SKILL.md'), '# mine\n');
+    fs.unlinkSync(output);
+    fs.symlinkSync(replacement, output);
     assert.equal(sync().diagnostics[0].reason, 'edited-output-preserved');
     assert.equal(sync({ sources: [] }).diagnostics[0].reason, 'edited-output-preserved');
-    assert.equal(fs.readFileSync(path.join(output, 'helper.sh'), 'utf8'), 'my edits\n');
-    assert.equal(fs.readFileSync(path.join(output, 'SKILL.md'), 'utf8'), '# one\n');
+    assert.equal(fs.readlinkSync(output), replacement);
+    assert.equal(fs.readFileSync(path.join(replacement, 'SKILL.md'), 'utf8'), '# mine\n');
+    assert.ok(fs.existsSync(path.join(source, 'SKILL.md')));
 });
 
 test('unrecorded same-name output is never adopted and explicit deletion is not undone', t => {
@@ -63,25 +69,20 @@ test('unrecorded same-name output is never adopted and explicit deletion is not 
     assert.equal(fs.existsSync(output), false);
 });
 
-test('concurrent edits before and after moving ownership output are preserved', t => {
-    const { source, output, sync } = fixture(t);
+test('a link retargeted while it is being replaced is preserved', t => {
+    const { root, sources, output, sync } = fixture(t);
     sync();
-    fs.writeFileSync(path.join(source, 'SKILL.md'), '# two\n');
-    const result = sync({ beforeMove: ({ destination }) => fs.writeFileSync(path.join(destination, 'helper.sh'), 'racing edit') });
+    const next = path.join(root, 'source-v2');
+    fs.mkdirSync(next);
+    fs.writeFileSync(path.join(next, 'SKILL.md'), '# two\n');
+    const racing = path.join(root, 'racing');
+    fs.mkdirSync(racing);
+    const result = sync({
+        sources: [{ ...sources[0], path: next }],
+        beforeMove: ({ destination }) => { fs.unlinkSync(destination); fs.symlinkSync(racing, destination); },
+    });
     assert.equal(result.diagnostics[0].reason, 'concurrent-edit-preserved');
-    assert.equal(fs.readFileSync(path.join(output, 'helper.sh'), 'utf8'), 'racing edit');
-});
-
-test('an open file descriptor continues to reference retained output after replacement', t => {
-    const { source, output, sync } = fixture(t);
-    sync();
-    const fd = fs.openSync(path.join(output, 'helper.sh'), 'r+');
-    t.after(() => fs.closeSync(fd));
-    fs.writeFileSync(path.join(source, 'SKILL.md'), '# two\n');
-    const result = sync();
-    fs.writeSync(fd, 'late edit');
-    assert.equal(fs.readFileSync(path.join(result.backups[0], 'helper.sh'), 'utf8'), 'late edit');
-    assert.equal(skillTreeDigest(source), skillTreeDigest(output));
+    assert.equal(fs.readlinkSync(output), racing);
 });
 
 test('duplicate names and symlinked output roots fail without changing unrelated paths', t => {
@@ -102,39 +103,6 @@ test('prototype-shaped names remain data and another exporter cannot replace own
     assert.equal(fs.existsSync(output), false);
 });
 
-test('symlink exports migrate owned copies, expose source edits and remove dangling links', t => {
-    const { source, output, sync } = fixture(t);
-    sync();
-    assert.ok(fs.lstatSync(output).isDirectory());
-    const migrated = sync({ mode: 'symlink' });
-    assert.deepEqual(migrated.installed, ['demo']);
-    assert.ok(fs.lstatSync(output).isSymbolicLink());
-    assert.equal(path.isAbsolute(fs.readlinkSync(output)), false);
-    assert.equal(fs.realpathSync(output), fs.realpathSync(source));
-    fs.writeFileSync(path.join(source, 'helper.sh'), 'changed source');
-    assert.equal(fs.readFileSync(path.join(output, 'helper.sh'), 'utf8'), 'changed source');
-    assert.deepEqual(sync({ mode: 'symlink' }).unchanged, ['demo']);
-    fs.rmSync(source, { recursive: true });
-    assert.deepEqual(sync({ sources: [], mode: 'symlink' }).removed, ['demo']);
-    assert.throws(() => fs.lstatSync(output), { code: 'ENOENT' });
-});
-
-test('symlink migration preserves edited copies and user-retargeted links', t => {
-    const { root, source, output, sync } = fixture(t);
-    sync();
-    fs.writeFileSync(path.join(output, 'helper.sh'), 'my copy');
-    assert.equal(sync({ mode: 'symlink' }).diagnostics[0].reason, 'edited-output-preserved');
-    fs.writeFileSync(path.join(output, 'helper.sh'), fs.readFileSync(path.join(source, 'helper.sh')));
-    sync({ mode: 'symlink' });
-    const replacement = path.join(root, 'replacement');
-    fs.mkdirSync(replacement);
-    fs.unlinkSync(output);
-    fs.symlinkSync(replacement, output);
-    assert.equal(sync({ sources: [], mode: 'symlink' }).diagnostics[0].reason, 'edited-output-preserved');
-    assert.equal(fs.realpathSync(output), fs.realpathSync(replacement));
-    assert.ok(fs.existsSync(path.join(source, 'SKILL.md')));
-});
-
 test('symlink exports through an unequal-depth folder alias resolve after install and idempotent refresh', t => {
     const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'managed-skills-alias-')));
     t.after(() => fs.rmSync(base, { recursive: true, force: true }));
@@ -145,7 +113,7 @@ test('symlink exports through an unequal-depth folder alias resolve after instal
     fs.mkdirSync(real, { recursive: true });
     const alias = path.join(base, 'alias');
     fs.symlinkSync(real, alias, 'dir');
-    const sync = () => syncManagedSkillExports({ folder: alias, owner: 'manifest', mode: 'symlink',
+    const sync = () => syncManagedSkillExports({ folder: alias, owner: 'manifest',
         sources: [{ name: 'demo', path: source, source: { name: 'fixture' } }] });
     assert.deepEqual(sync().installed, ['demo']);
     for (const root of [alias, real]) {

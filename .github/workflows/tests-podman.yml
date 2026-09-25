@@ -39,6 +39,19 @@ jobs:
       - name: Add Ploinky CLI to PATH
         run: echo "PATH=$PATH:${GITHUB_WORKSPACE}/bin" >> $GITHUB_ENV
 
+      # The skill export protocol is shared byte-for-byte with Explorer; its
+      # paired tests fail rather than skip without that checkout.
+      - name: Check out the paired Explorer
+        run: |
+          explorer="${RUNNER_TEMP}/AssistOSExplorer"
+          url=https://github.com/AssistOS-AI/AssistOSExplorer.git
+          if git ls-remote --exit-code --heads "$url" "$GITHUB_REF_NAME" >/dev/null; then
+            git clone --depth 1 --branch "$GITHUB_REF_NAME" "$url" "$explorer"
+          else
+            git clone --depth 1 "$url" "$explorer"
+          fi
+          echo "PLOINKY_TEST_EXPLORER_CHECKOUT=$explorer" >> "$GITHUB_ENV"
+
       - name: Run test suite (Podman runtime)
         run: |
           set -o pipefail

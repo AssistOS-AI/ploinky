@@ -7,7 +7,7 @@ import path from 'node:path';
 
 // Isolated workspace, Git policy and a Git trace for the whole file.
 const originalCwd = process.cwd();
-const saved = Object.fromEntries(['PLOINKY_WORKSPACE_ROOT', 'PATH', 'XDG_CONFIG_HOME', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM']
+const saved = Object.fromEntries(['PLOINKY_WORKSPACE_ROOT', 'PATH', 'XDG_CONFIG_HOME', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_SYSTEM', 'PLOINKY_SKILL_EXCLUDES_COMPOSE']
     .map(key => [key, process.env[key]]));
 const suite = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'skill-source-authority-')));
 const workspace = path.join(suite, 'workspace');
@@ -25,6 +25,9 @@ Object.assign(process.env, {
     GIT_CONFIG_GLOBAL: path.join(suite, 'gitconfig'),
     GIT_CONFIG_NOSYSTEM: '1',
 });
+// An ambient consent would compose the real user's excludes policy.
+delete process.env.PLOINKY_SKILL_EXCLUDES_COMPOSE;
+delete process.env.GIT_CONFIG_SYSTEM;
 process.chdir(workspace);
 
 const [skills, { REPOS_DIR }, tx, exclusionsModule] = await Promise.all([
@@ -237,7 +240,7 @@ test('output tracked by the target repository is classified with its own index',
     assert.ok(unproven.managedExport.diagnostics.some(item => item.reason === 'unrecorded-output-preserved'));
 });
 
-test('default-skill consumers keep their recorded selection and legacy consumers are never broadened', t => {
+test('default-skill consumers take every available default skill and record that selection', t => {
     const name = `Defaults${process.hrtime.bigint()}`;
     const source = path.join(REPOS_DIR, name);
     t.after(() => fs.rmSync(source, { recursive: true, force: true }));
@@ -245,25 +248,19 @@ test('default-skill consumers keep their recorded selection and legacy consumers
     const consumer = path.join(suite, `consumer-${process.hrtime.bigint()}`);
     fs.mkdirSync(consumer);
     const first = skills.installDefaultSkills(name, { targetRoot: consumer, pruneMissing: true });
-    assert.equal(first.selection.mode, 'all');
+    assert.deepEqual(first.skills, ['s1']);
     const ledgerFile = path.join(consumer, '.agents', '.ploinky-skill-exports.json');
-    assert.deepEqual(JSON.parse(fs.readFileSync(ledgerFile, 'utf8')).consumers[`defaults:${name}`], { selection: 'all', source: name });
+    const recorded = () => JSON.parse(fs.readFileSync(ledgerFile, 'utf8')).consumers[`defaults:${name}`];
+    assert.deepEqual(recorded(), { selection: 'all', source: name });
     fs.mkdirSync(path.join(source, 'skills', 's2'));
     fs.writeFileSync(path.join(source, 'skills', 's2', 'SKILL.md'), '# s2\n');
     assert.deepEqual(skills.installDefaultSkills(name, { targetRoot: consumer, pruneMissing: true }).managedExport.installed, ['s2']);
-
-    // A legacy ledger has owned entries but no recorded selection.
-    const ledger = JSON.parse(fs.readFileSync(ledgerFile, 'utf8'));
-    delete ledger.consumers;
-    fs.writeFileSync(ledgerFile, `${JSON.stringify(ledger, null, 2)}\n`);
     fs.mkdirSync(path.join(source, 'skills', 's3'));
     fs.writeFileSync(path.join(source, 'skills', 's3', 'SKILL.md'), '# s3\n');
-    const legacy = skills.installDefaultSkills(name, { targetRoot: consumer, pruneMissing: true });
-    assert.deepEqual(legacy.selection, { mode: 'legacy-unknown', notBroadened: ['s3'] });
-    assert.equal(fs.existsSync(path.join(consumer, '.agents', 'skills', 's3')), false);
-    assert.ok(fs.existsSync(path.join(consumer, '.agents', 'skills', 's2')), 'legacy owned output is kept');
-    const explicit = skills.installDefaultSkills(name, { targetRoot: consumer, consumerSelection: 'all' });
-    assert.deepEqual(explicit.managedExport.installed, ['s3']);
+    const refreshed = skills.installDefaultSkills(name, { targetRoot: consumer, pruneMissing: true });
+    assert.deepEqual(refreshed.managedExport.installed, ['s3']);
+    assert.deepEqual(refreshed.skills, ['s1', 's2', 's3']);
+    assert.deepEqual(recorded(), { selection: 'all', source: name });
 
     // A refused source record leaves the consumer untouched.
     fs.rmSync(path.join(source, 'skills', 's3'), { recursive: true });
@@ -286,7 +283,7 @@ test('the host refreshes only exclusions after a container run deferred them', t
     git(project, 'add', 'README.md');
     git(project, 'commit', '-q', '-m', 'initial');
     const inBox = tx.syncManagedSkillExports({
-        folder: project, owner: 'manifest', mode: 'symlink', claude: 'root-or-skills',
+        folder: project, owner: 'manifest', claude: 'root-or-skills',
         sources: [{ name: 'a1', path: path.join(f.cacheA, 'skills', 'a1') }],
         exclusions: exclusionsModule.createSkillExclusionPlanner({ containerExecutor: true }),
     });

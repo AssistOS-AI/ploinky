@@ -112,7 +112,7 @@ function runScenario(body) {
             PLOINKY_TEST_GIT_TRACE: path.join(scratch, 'git-trace.log'),
         };
         for (const name of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'PLOINKY_UPDATED_WORKSPACE_CHECKOUT',
-            'PLOINKY_UPDATE_REPORT_NONCE', 'PLOINKY_UPDATE_REPORT_CONTEXT']) delete env[name];
+            'PLOINKY_UPDATE_REPORT_NONCE', 'PLOINKY_UPDATE_REPORT_CONTEXT', 'PLOINKY_SKILL_EXCLUDES_COMPOSE']) delete env[name];
         const output = execFileSync(process.execPath, ['--input-type=module', '-e', `${PRELUDE}\n${body}`], {
             cwd: workspaceRoot, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
         });

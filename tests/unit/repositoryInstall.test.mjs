@@ -133,7 +133,7 @@ test('ensureRepositoryLink canonicalizes an aliased root and keeps explicit runt
 test('marketplace removal preserves skill links owned by another exporter', t => {
     const { root, source, options } = fixture(t);
     const destination = path.join(root, 'robot');
-    syncManagedSkillExports({ folder: destination, owner: 'manifest', mode: 'symlink',
+    syncManagedSkillExports({ folder: destination, owner: 'manifest',
         sources: [{ name: 'example', path: path.join(source, 'skills/example') }] });
     const link = path.join(destination, '.agents/skills/example');
     const removed = removeRepositoryLinks([link], options);

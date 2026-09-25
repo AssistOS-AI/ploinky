@@ -7,9 +7,9 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 // Every verified Git update caller runs the P4 generated-state assessment
-// before dirty classification: an unproven legacy `.gitignore` block is a
-// named skip with its bytes untouched; a receipt-proven block is restored and
-// the update proceeds.
+// before dirty classification: a `.gitignore` block without a matching write
+// receipt is a named skip with its bytes untouched; a receipt-proven block is
+// restored and the update proceeds.
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const moduleUrl = rel => pathToFileURL(path.join(projectRoot, rel)).href;
@@ -24,12 +24,15 @@ function runScenario(body) {
         const env = {
             ...process.env,
             HOME: scratch,
+            XDG_CONFIG_HOME: path.join(scratch, 'xdg'),
             GIT_CONFIG_GLOBAL: globalConfig,
             GIT_CONFIG_NOSYSTEM: '1',
             PLOINKY_WORKSPACE_ROOT: workspaceRoot,
             PLOINKY_ROOT: path.join(scratch, 'runtime-root'),
             PLOINKY_TEST_SCRATCH: scratch,
         };
+        delete env.PLOINKY_SKILL_EXCLUDES_COMPOSE;
+        delete env.GIT_CONFIG_SYSTEM;
         const script = String.raw`
             import crypto from 'node:crypto';
             import fs from 'node:fs';
@@ -64,7 +67,7 @@ function runScenario(body) {
                 git(seed, 'push', '-q');
                 return git(seed, 'rev-parse', 'HEAD');
             }
-            function legacy(repo) {
+            function unverified(repo) {
                 fs.writeFileSync(path.join(repo, '.gitignore'), BASE + BLOCK);
             }
             function receiptProven(repo) {
@@ -83,7 +86,7 @@ function runScenario(body) {
             });
             const out = {};
             const lockManager = { async acquire() { return { assertHeld() {}, release() {} }; } };
-            for (const [label, prepare] of [['legacy', legacy], ['receipt', receiptProven]]) {
+            for (const [label, prepare] of [['unverified', unverified], ['receipt', receiptProven]]) {
                 const registered = path.join(REPOS_DIR, 'Reg-' + label);
                 const upstream = checkout('reg-' + label, registered);
                 prepare(registered);
@@ -126,10 +129,10 @@ function runScenario(body) {
 test('registered, workspace and Ploinky writers all run the generated-state assessment before dirty classification', () => {
     const result = runScenario();
     for (const caller of ['registered', 'workspace', 'ploinky']) {
-        const legacy = result[`${caller}-legacy`];
-        assert.equal(legacy.outcome, 'skipped', caller);
-        assert.equal(legacy.code, 'legacy-ignore-block-preserved', `${caller}: named skip from the assessor, not dirty-worktree`);
-        assert.deepEqual(legacy.after, legacy.before, `${caller}: HEAD and .gitignore bytes untouched`);
+        const unverified = result[`${caller}-unverified`];
+        assert.equal(unverified.outcome, 'skipped', caller);
+        assert.equal(unverified.code, 'unverified-ignore-block-preserved', `${caller}: named skip from the assessor, not dirty-worktree`);
+        assert.deepEqual(unverified.after, unverified.before, `${caller}: HEAD and .gitignore bytes untouched`);
 
         const receipt = result[`${caller}-receipt`];
         assert.equal(receipt.outcome, 'changed', `${caller}: a receipt-proven block is restored and the update proceeds`);

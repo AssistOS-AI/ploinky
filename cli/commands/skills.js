@@ -20,9 +20,6 @@ const CLAUDE_SYMLINK = '.claude';
 const CANONICAL_SKILLS_DIR = AGENT_SKILL_TARGETS['agents'];
 const SKILLS_DISCOVERY_IGNORED_DIRS = new Set(['.git', 'node_modules', 'globalDeps', '.ploinky']);
 
-const GITIGNORE_MARKER_START = '# >>> ploinky default-skills >>>';
-const GITIGNORE_MARKER_END = '# <<< ploinky default-skills <<<';
-
 function skillRepositoryPath(name, url = '') {
     const preferred = resolveSkillRepositorySource(name, url);
     return preferred.origin === 'workspace' ? preferred.source : resolveAgentRepositoryPath(name);
@@ -295,42 +292,6 @@ function listExistingSkillDirectories(skillsDir) {
     }
 }
 
-export function ensureGitignoreEntries(workspaceRoot, relPaths) {
-    const gitignorePath = path.join(workspaceRoot, '.gitignore');
-    let content = '';
-    try {
-        content = fs.readFileSync(gitignorePath, 'utf8');
-    } catch (_) {
-        content = '';
-    }
-    const next = gitignoreWithManagedBlock(content, relPaths);
-    if (next === content) return false;
-    fs.writeFileSync(gitignorePath, next);
-    return true;
-}
-
-// Pure form of the managed block update; the skill export transaction
-// publishes its result with compare-before-write.
-export function gitignoreWithManagedBlock(content, relPaths) {
-    const desired = relPaths.map(p => {
-        if (p.includes('/')) return p.endsWith('/') ? p : `${p}/`;
-        return p;
-    });
-    const startIdx = content.indexOf(GITIGNORE_MARKER_START);
-    const endIdx = content.indexOf(GITIGNORE_MARKER_END);
-
-    if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
-        const before = content.slice(0, startIdx);
-        const after = content.slice(endIdx + GITIGNORE_MARKER_END.length);
-        const newBlock = `${GITIGNORE_MARKER_START}\n${desired.join('\n')}\n${GITIGNORE_MARKER_END}`;
-        return `${before}${newBlock}${after}`;
-    }
-
-    const needsLeadingNewline = content.length > 0 && !content.endsWith('\n');
-    const block = `${needsLeadingNewline ? '\n' : ''}${GITIGNORE_MARKER_START}\n${desired.join('\n')}\n${GITIGNORE_MARKER_END}\n`;
-    return content + block;
-}
-
 export function readSkillsManifest(manifestPath) {
     return parseSkillsManifest(manifestPath);
 }
@@ -440,7 +401,6 @@ export function installSkillsFromManifest(manifestPath, { targetRoot, pruneMissi
     const managedExport = syncManagedSkillExports({
         folder: destRoot,
         owner: 'manifest',
-        mode: 'symlink',
         sources: [...skillSource.entries()].map(([name, source]) => ({
             name, path: path.join(source.repoPath, 'skills', name),
             source: { name: source.source, url: sanitizeGitDiagnostic(source.entry.url), branch: source.entry.branch },
@@ -490,7 +450,6 @@ export function installSkillsFromManifest(manifestPath, { targetRoot, pruneMissi
         duplicateSkills: skillConflicts,
         prunedSkills,
         managedExport,
-        legacyMigration: { migratedSkills: [], skippedExistingSkills: [] },
     };
 }
 
@@ -600,26 +559,21 @@ function reportClaudeLink(destRoot, managedExport) {
 // Recorded in the export lock owner record; not a credential.
 const skillExportAuthority = { kind: 'ploinky-cli', operation: 'skills-export' };
 
-function defaultsConsumer(destRoot, owner) {
+function ownedDefaultSkills(destRoot, owner) {
     try {
         const { ledger } = readExportLedger(path.join(fs.realpathSync(destRoot), CANONICAL_AGENT_DIR));
-        return {
-            recorded: ledger.consumers?.[owner] || null,
-            owned: Object.keys(ledger.entries).filter(name => ledger.entries[name]?.owner === owner),
-        };
+        return Object.keys(ledger.entries).filter(name => ledger.entries[name]?.owner === owner);
     } catch (_) {
-        return { recorded: null, owned: [] };
+        return [];
     }
 }
 
-/** Export a source repository's default skills into a consumer folder.
- * `consumerSelection: 'all'` (the explicit `default-skills` command) records
- * that the consumer takes every default skill. Automatic refreshes follow the
- * recorded policy; a legacy consumer without a record keeps its current set
- * and is never broadened. `sourceOutcomes` makes an update consume the
- * source's single operation record instead of touching the source.
+/** Export a source repository's default skills into a consumer folder. The
+ * consumer takes every available default skill; its ledger records that
+ * selection. `sourceOutcomes` makes an update consume the source's single
+ * operation record instead of touching the source.
  */
-export function installDefaultSkills(repoName, { only, skip, targetRoot, pruneMissing = false, sourceOutcomes = null, consumerSelection = 'auto' } = {}) {
+export function installDefaultSkills(repoName, { only, skip, targetRoot, pruneMissing = false, sourceOutcomes = null } = {}) {
     if (!repoName || typeof repoName !== 'string') {
         throw new Error('Missing repository name.');
     }
@@ -659,7 +613,7 @@ export function installDefaultSkills(repoName, { only, skip, targetRoot, pruneMi
         console.warn(`[skills] Default skills from '${repoName}' were not refreshed in ${destRoot} (${record.code || record.outcome}).`);
         return {
             repoName, repoPath, skills: [], targets: [], destRoot, gitignoreUpdated: false, exclusions: null,
-            symlinkCreated: false, claudeLink: { changed: false, mode: 'unchanged' }, legacyMigration: { migratedSkills: [], skippedExistingSkills: [] },
+            symlinkCreated: false, claudeLink: { changed: false, mode: 'unchanged' },
             managedExport: null, sourceSkipped: { code: record.code || record.outcome, reason: record.reason || '', record },
         };
     }
@@ -667,33 +621,25 @@ export function installDefaultSkills(repoName, { only, skip, targetRoot, pruneMi
     const skillsRoot = path.join(repoPath, 'skills');
     const available = availableRepoSkills(repoPath, { allowMissing: pruneMissing || stale });
     const owner = `defaults:${repoName}`;
-    const consumer = defaultsConsumer(destRoot, owner);
     // A skipped or failed source update left the checkout as it was: use it,
     // but never prune owned output that it no longer offers.
-    const retain = stale ? consumer.owned.filter(name => !available.includes(name)) : [];
-    const all = consumerSelection === 'all' || consumer.recorded?.selection === 'all' || !consumer.owned.length;
-    const skills = all ? available : available.filter(name => consumer.owned.includes(name));
-    const notBroadened = all ? [] : available.filter(name => !consumer.owned.includes(name));
-    if (notBroadened.length) {
-        console.warn(`[skills] ${destRoot} has no recorded default-skills selection for '${repoName}'; ${notBroadened.length} new skill(s) were not added. Run 'ploinky default-skills ${repoName}' there to take every default skill.`);
-    }
+    const retain = stale ? ownedDefaultSkills(destRoot, owner).filter(name => !available.includes(name)) : [];
+    const skills = available;
 
     // Git targets get private worktree exclusions; a non-git folder keeps a
     // receipt-backed managed block in its own .gitignore.
     const managedExport = syncManagedSkillExports({
         folder: destRoot,
         owner,
-        mode: 'symlink',
         sources: skills.map(name => ({ name, path: path.join(skillsRoot, name), source: { name: repoName } })),
         claude: 'root-or-skills',
         exclusions: skillExclusions({ nonGitBlock: true }),
-        consumer: all ? { selection: 'all', source: repoName } : undefined,
+        consumer: { selection: 'all', source: repoName },
         retain,
         authority: skillExportAuthority,
     });
     const repositoryOwned = classifyRepositoryOwnedOutput(destRoot, managedExport);
     reportExportDiagnostics(managedExport);
-    const legacyMigration = { migratedSkills: [], skippedExistingSkills: [] };
     const claudeLink = reportClaudeLink(destRoot, managedExport);
     const targets = [{ agent: 'agents', relDir: CANONICAL_SKILLS_DIR, skills }];
     const gitignoreUpdated = nonGitBlockWritten(managedExport);
@@ -708,10 +654,8 @@ export function installDefaultSkills(repoName, { only, skip, targetRoot, pruneMi
         exclusions: managedExport.exclusions,
         symlinkCreated: claudeLink.changed,
         claudeLink,
-        legacyMigration,
         managedExport,
         repositoryOwned,
-        selection: { mode: all ? 'all' : 'legacy-unknown', notBroadened },
         sourceState: stale ? 'stale' : record ? (record.outcome === 'changed' ? 'updated' : 'current') : (outcomeFor ? 'not-updated' : 'local'),
         retainedSkills: managedExport.retained,
     };

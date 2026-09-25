@@ -23,10 +23,13 @@ export function liveness(self, dead = [], starts = {}) {
     };
 }
 
-export function simulatedCrash(mod, point) {
+// Crash at the `occurrence`-th time `point` is reached (points such as
+// after-git-config fire once per artifact).
+export function simulatedCrash(mod, point, occurrence = 1) {
+    let seen = 0;
     return {
         crash(current) {
-            if (current === point) throw Object.assign(new Error(`simulated crash at ${point}`), { [mod.SIMULATED_CRASH]: true });
+            if (current === point && ++seen === occurrence) throw Object.assign(new Error(`simulated crash at ${point} #${occurrence}`), { [mod.SIMULATED_CRASH]: true });
         },
     };
 }
@@ -53,68 +56,197 @@ function ledgerOf(folder) {
     return text === null ? null : JSON.parse(text);
 }
 
+// User-authored bytes placed in every fixture; no run, crash or recovery may
+// change them.
+const USER_FILES = { 'notes.txt': 'user notes\n', [path.join('.agents', 'skills', 'mine', 'SKILL.md')]: '# mine, not exported\n' };
+
+function writeUserFiles(folder) {
+    for (const [relative, content] of Object.entries(USER_FILES)) write(path.join(folder, relative), content);
+}
+
+function assertUserFiles(folder) {
+    for (const [relative, content] of Object.entries(USER_FILES)) assert.equal(read(path.join(folder, relative)), content, `user file ${relative}`);
+}
+
+// Exports are links, so a new version is a new source directory.
 function crashFixture(mod, tmp) {
     const base = tmp('crash');
     const folder = path.join(base, 'target');
     fs.mkdirSync(folder);
+    writeUserFiles(folder);
     const sources = {
         keep: skillSource(base, 'keep', 'keep'),
         replace: skillSource(base, 'replace', 'replace v1'),
         drop: skillSource(base, 'drop', 'drop'),
         fresh: skillSource(base, 'fresh', 'fresh'),
+        replaceV2: skillSource(base, 'replace-v2', 'replace v2'),
     };
-    const entry = name => ({ name, path: sources[name], source: { name: 'fixture' } });
+    const next = { keep: sources.keep, replace: sources.replaceV2, fresh: sources.fresh };
     const manifest = path.join(folder, 'manifest.json');
     write(manifest, 'v1\n');
     const run = (self, extra = {}) => mod.syncManagedSkillExports({
         folder, owner: 'manifest', lock: { liveness: liveness(self, extra.dead || []), waitMs: 0 },
-        sources: (extra.names || ['keep', 'replace', 'fresh']).map(entry),
+        sources: Object.entries(extra.sources || next).map(([name, directory]) => ({ name, path: directory, source: { name: 'fixture' } })),
         manifest: extra.manifest === undefined ? { path: manifest, expected: read(manifest), next: 'v2\n' } : extra.manifest,
         claude: extra.claude === undefined ? 'root-or-skills' : extra.claude,
         gitignore: extra.gitignore === undefined ? { update: addGenerated } : extra.gitignore,
         hooks: extra.hooks || {},
     });
     // Establish the prior committed state without the later artifacts.
-    run(100, { names: ['keep', 'replace', 'drop'], manifest: null, claude: null, gitignore: null });
-    write(path.join(sources.replace, 'SKILL.md'), '# replace v2\n');
+    run(100, { sources: { keep: sources.keep, replace: sources.replace, drop: sources.drop }, manifest: null, claude: null, gitignore: null });
     const skills = path.join(folder, '.agents', 'skills');
     const before = {
         ledger: read(path.join(folder, '.agents', '.ploinky-skill-exports.json')),
-        replace: mod.skillTreeDigest(path.join(skills, 'replace')),
+        replace: fs.readlinkSync(path.join(skills, 'replace')),
     };
     return { base, folder, sources, manifest, run, skills, before };
 }
 
+const resolvesTo = (link, directory) => fs.lstatSync(link).isSymbolicLink() && fs.realpathSync(link) === fs.realpathSync(directory);
+
+function assertSourcesUntouched(fixture) {
+    for (const [name, content] of [['keep', 'keep'], ['replace', 'replace v1'], ['drop', 'drop'], ['fresh', 'fresh'], ['replace-v2', 'replace v2']]) {
+        assert.equal(read(path.join(fixture.base, 'sources', name, 'SKILL.md')), `# ${content}\n`, `source ${name}`);
+    }
+}
+
 function assertBeforeState(mod, fixture) {
-    const { folder, skills, manifest, before } = fixture;
+    const { folder, skills, manifest, before, sources } = fixture;
     assert.equal(read(path.join(folder, '.agents', '.ploinky-skill-exports.json')), before.ledger);
-    assert.equal(mod.skillTreeDigest(path.join(skills, 'replace')), before.replace);
-    assert.equal(read(path.join(skills, 'replace', 'SKILL.md')), '# replace v1\n');
-    assert.ok(lstat(path.join(skills, 'drop')));
+    assert.equal(fs.readlinkSync(path.join(skills, 'replace')), before.replace);
+    assert.ok(resolvesTo(path.join(skills, 'replace'), sources.replace));
+    assert.ok(resolvesTo(path.join(skills, 'drop'), sources.drop));
+    assert.ok(resolvesTo(path.join(skills, 'keep'), sources.keep));
     assert.equal(lstat(path.join(skills, 'fresh')), undefined);
     assert.equal(read(manifest), 'v1\n');
     assert.equal(lstat(path.join(folder, '.claude')), undefined);
     assert.equal(lstat(path.join(folder, '.gitignore')), undefined);
+    assertUserFiles(folder);
+    assertSourcesUntouched(fixture);
 }
 
 function assertAfterState(mod, fixture) {
-    const { folder, skills, manifest } = fixture;
+    const { folder, skills, manifest, sources } = fixture;
     const ledger = ledgerOf(folder);
     assert.deepEqual(Object.keys(ledger.entries).sort(), ['fresh', 'keep', 'replace']);
-    assert.equal(read(path.join(skills, 'replace', 'SKILL.md')), '# replace v2\n');
-    assert.equal(ledger.entries.replace.digest, mod.skillTreeDigest(path.join(skills, 'replace')));
-    assert.equal(read(path.join(skills, 'fresh', 'SKILL.md')), '# fresh\n');
+    for (const [name, directory] of [['keep', sources.keep], ['replace', sources.replaceV2], ['fresh', sources.fresh]]) {
+        assert.ok(resolvesTo(path.join(skills, name), directory), name);
+        assert.equal(ledger.entries[name].kind, 'symlink');
+        assert.equal(ledger.entries[name].digest, mod.skillTreeDigest(path.join(skills, name)));
+    }
     assert.equal(lstat(path.join(skills, 'drop')), undefined);
     assert.equal(read(manifest), 'v2\n');
     assert.equal(fs.readlinkSync(path.join(folder, '.claude')), '.agents');
     assert.equal(read(path.join(folder, '.gitignore')), 'generated\n');
+    assertUserFiles(folder);
+    assertSourcesUntouched(fixture);
 }
 
-const recoverWith = (mod, folder, self, dead) => mod.withSkillExportLocks([folder], ([handle]) => handle.recovery, { liveness: liveness(self, dead), waitMs: 0 });
+const recoverWith = (mod, folder, self, dead, extra = {}) => mod.withSkillExportLocks([folder], ([handle]) => handle.recovery, { liveness: liveness(self, dead), waitMs: 0, ...extra });
 
-const GIT_ISOLATION = ['XDG_CONFIG_HOME', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL'];
+const GIT_ISOLATION = ['HOME', 'XDG_CONFIG_HOME', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_SYSTEM', 'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL'];
+
+// Run `body` with Git reading no global, system or XDG policy of this machine.
+function withIsolatedGit(base, body) {
+    const saved = Object.fromEntries(GIT_ISOLATION.map(key => [key, process.env[key]]));
+    fs.writeFileSync(path.join(base, 'gitconfig'), '');
+    delete process.env.GIT_CONFIG_SYSTEM;
+    Object.assign(process.env, {
+        HOME: base, XDG_CONFIG_HOME: path.join(base, 'xdg'), GIT_CONFIG_GLOBAL: path.join(base, 'gitconfig'), GIT_CONFIG_NOSYSTEM: '1',
+        GIT_AUTHOR_NAME: 'Test', GIT_AUTHOR_EMAIL: 'test@example.invalid', GIT_COMMITTER_NAME: 'Test', GIT_COMMITTER_EMAIL: 'test@example.invalid',
+    });
+    try {
+        return body();
+    } finally {
+        for (const [key, value] of Object.entries(saved)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+    }
+}
+
+// A committed Git project exported with private exclusions. Enabling
+// extensions.worktreeConfig must also move a shared core.worktree
+// (variant 'core.worktree') or core.bare=true (variant 'bare': the project is
+// a linked worktree of a bare repository) to the main config.worktree, so one
+// export writes several Git config artifacts.
+function gitFixture(mod, exclusions, base, { variant = 'plain' } = {}) {
+    const project = path.join(base, 'project');
+    const git = (...args) => execFileSync('git', args, { cwd: project, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    const config = (file, key) => { try { return git('config', '--file', file, '--get-all', key).trim(); } catch (_) { return null; } };
+    let repository = project;
+    if (variant === 'bare') {
+        const seed = path.join(base, 'seed');
+        fs.mkdirSync(seed);
+        const seedGit = (...args) => execFileSync('git', args, { cwd: seed, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+        seedGit('init', '-q', '-b', 'main');
+        writeUserFiles(seed);
+        seedGit('add', '.');
+        seedGit('commit', '-q', '-m', 'initial');
+        repository = path.join(base, 'repository.git');
+        execFileSync('git', ['clone', '-q', '--bare', seed, repository], { stdio: 'ignore' });
+        execFileSync('git', ['worktree', 'add', '-q', project, 'main'], { cwd: repository, stdio: 'ignore' });
+    } else {
+        fs.mkdirSync(project);
+        git('init', '-q');
+        writeUserFiles(project);
+        git('add', '.');
+        git('commit', '-q', '-m', 'initial');
+    }
+    git('config', 'user.marker', 'kept');
+    if (variant === 'core.worktree') git('config', 'core.worktree', project);
+    const gitDir = fs.realpathSync(git('rev-parse', '--absolute-git-dir').trim());
+    const commonDir = fs.realpathSync(path.resolve(project, git('rev-parse', '--git-common-dir').trim()));
+    const common = path.join(commonDir, 'config');
+    const mainWorktreeConfig = path.join(commonDir, 'config.worktree');
+    const worktreeConfig = path.join(gitDir, 'config.worktree');
+    const userExclude = path.join(commonDir, 'info', 'exclude');
+    const excludeBytes = read(userExclude);
+    const source = skillSource(base, 'demo', 'demo');
+    const planner = () => exclusions.createSkillExclusionPlanner({ containerExecutor: false });
+    const sync = (self, extra = {}) => mod.syncManagedSkillExports({
+        folder: project, owner: 'manifest', claude: 'root-or-skills', sources: [{ name: 'demo', path: source }],
+        exclusions: planner(), lock: { liveness: liveness(self, extra.dead || []), waitMs: 0 }, hooks: extra.hooks || {},
+    });
+    const recover = (self, dead, extra = {}) => mod.withSkillExportLocks([project], ([handle]) => handle.recovery,
+        { liveness: liveness(self, dead), waitMs: 0, exclusions: planner(), ...extra });
+    const assertUser = () => {
+        assertUserFiles(project);
+        assert.equal(read(userExclude), excludeBytes, 'the shared info/exclude is never written');
+        assert.equal(config(common, 'user.marker'), 'kept');
+        assert.equal(read(path.join(source, 'SKILL.md')), '# demo\n');
+    };
+    const assertPublished = () => {
+        assert.equal(git('status', '--porcelain', '--untracked-files=all'), '');
+        assert.equal(config(common, 'extensions.worktreeConfig'), 'true');
+        if (variant === 'core.worktree') {
+            assert.equal(config(common, 'core.worktree'), null, 'core.worktree left the shared config');
+            assert.equal(config(mainWorktreeConfig, 'core.worktree'), project);
+        }
+        if (variant === 'bare') {
+            assert.equal(config(common, 'core.bare'), null, 'core.bare left the shared config');
+            assert.equal(config(mainWorktreeConfig, 'core.bare'), 'true');
+            assert.equal(execFileSync('git', ['rev-parse', '--is-bare-repository'], { cwd: repository, encoding: 'utf8' }).trim(), 'true');
+        }
+        assert.equal(config(worktreeConfig, 'core.excludesFile'), path.join(gitDir, 'ploinky-skill-exports.exclude'));
+        assert.equal(git('rev-parse', '--is-inside-work-tree').trim(), 'true');
+        assert.equal(git('rev-parse', '--show-toplevel').trim(), project);
+        assert.ok(resolvesTo(path.join(project, '.agents', 'skills', 'demo'), source));
+        assertUser();
+    };
+    return { project, git, common, sync, recover, assertUser, assertPublished };
+}
 
 const ROLLED_BACK = new Set(['before-journal', 'after-journal', 'after-backup', 'after-link', 'before-metadata']);
+// Points reached by a publication without exclusions; the exclusion points
+// run against a non-git folder (after-receipt) and Git projects below.
+const CRASH_MATRIX = ['before-journal', 'after-journal', 'after-backup', 'after-link', 'before-metadata',
+    'after-metadata-journal', 'after-ledger', 'after-manifest', 'after-claude', 'after-gitignore', 'before-commit', 'after-commit'];
+// [point, occurrence, gitFixture variant]. With a shared core.worktree or
+// core.bare=true the artifacts are: the key into the main config.worktree,
+// extensions.worktreeConfig, unset the shared key, the two private files,
+// then core.excludesFile.
+const GIT_CRASHES = [
+    ['after-git-config', 1, 'plain'], ['after-private-file', 1, 'plain'], ['after-private-file', 2, 'plain'],
+    ...['core.worktree', 'bare'].flatMap(variant => [1, 2, 3, 4].map(occurrence => ['after-git-config', occurrence, variant])),
+];
 
 // Every entry below the folder: type plus bytes or link text.
 function snapshot(root) {
@@ -139,7 +271,7 @@ function craftedJournalFixture(mod, tmp) {
     fs.mkdirSync(outside);
     write(path.join(folder, 'README.md'), 'readme\n');
     const demo = skillSource(base, 'demo', 'demo');
-    mod.syncManagedSkillExports({ folder, owner: 'manifest', mode: 'symlink', sources: [{ name: 'demo', path: demo }], lock: { liveness: liveness(10) } });
+    mod.syncManagedSkillExports({ folder, owner: 'manifest', sources: [{ name: 'demo', path: demo }], lock: { liveness: liveness(10) } });
     const transaction = crypto.randomUUID();
     const staging = path.join('.agents', '.ploinky-export-staging', `tx-${transaction}`);
     const link = { type: 'symlink', target: fs.readlinkSync(path.join(folder, '.agents', 'skills', 'demo')), digest: mod.skillTreeDigest(path.join(folder, '.agents', 'skills', 'demo')) };
@@ -167,6 +299,7 @@ const CRAFTED_JOURNALS = [
         return f.journal({ paths: [f.install(path.join('.agents', 'skills', 'demo'), { action: 'replace', before: f.link, after: { type: 'absent' }, backup: path.join('.agents', '.ploinky-export-backups', `demo-prior-tx-${f.transaction}`) })] });
     }],
     ['an unknown phase', f => f.journal({ phase: 'committed' })],
+    ['a published directory, which this protocol never writes', f => f.journal({ paths: [f.install(path.join('.agents', 'skills', 'demo'), { after: { type: 'directory', digest: f.link.digest } })] })],
 ];
 
 export const scenarios = [
@@ -186,7 +319,7 @@ export const scenarios = [
             assert.deepEqual([owner.pid, owner.start, owner.boot, owner.namespace], [10, 'start-10', 'boot-a', 'pidns-a']);
             assert.deepEqual(owner.executor, { box: 'box-1' });
             assert.deepEqual(owner.authority, { kind: 'test' });
-            // The pre-transaction exporter used a bare mkdir on the same path.
+            // A writer that only creates the directory is excluded as well.
             assert.throws(() => fs.mkdirSync(lockPath), { code: 'EEXIST' });
             handle.release();
             assert.equal(lstat(lockPath), undefined);
@@ -206,14 +339,15 @@ export const scenarios = [
         },
     },
     {
-        name: 'ownerless legacy locks and other-namespace owners are preserved, never reclaimed',
+        name: 'ownerless locks and other-namespace owners are preserved, never reclaimed',
         run({ mod, tmp }) {
-            const folder = tmp('legacy');
+            const folder = tmp('ownerless');
             const lockPath = path.join(fs.realpathSync(folder), '.agents', '.ploinky-skill-exports.lock');
+            // An exporter stopped between creating the lock and recording its owner.
             fs.mkdirSync(lockPath, { recursive: true });
             fs.utimesSync(lockPath, new Date(0), new Date(0));
             assert.throws(() => mod.acquireSkillExportLock(folder, { liveness: liveness(10), waitMs: 20, pollMs: 5 }),
-                error => error.code === 'SKILL_EXPORT_LOCK_OWNERLESS' && error.outcome === 'blocked-legacy-lock');
+                error => error.code === 'SKILL_EXPORT_LOCK_OWNERLESS' && error.outcome === 'blocked-ownerless-lock');
             assert.ok(fs.lstatSync(lockPath).isDirectory(), 'an old ownerless lock is not reclaimed by age');
             fs.rmdirSync(lockPath);
 
@@ -295,40 +429,146 @@ export const scenarios = [
             assert.deepEqual(snapshot(f.base), before);
         },
     })),
-    {
-        name: 'private exclusion artifacts roll forward after a crash and leave a clean worktree',
+    ...GIT_CRASHES.map(([point, occurrence, variant]) => ({
+        name: `crash at ${point} #${occurrence}${{ plain: '', 'core.worktree': ' while core.worktree moves to config.worktree', bare: ' while core.bare of a bare repository moves to config.worktree' }[variant]} rolls forward to private exclusions and a clean worktree`,
         run({ mod, tmp, exclusions }) {
             assert.ok(exclusions, 'the paired exclusions module is required');
-            const base = tmp('exclusions');
-            const saved = Object.fromEntries(GIT_ISOLATION.map(key => [key, process.env[key]]));
-            fs.writeFileSync(path.join(base, 'gitconfig'), '');
-            Object.assign(process.env, {
-                XDG_CONFIG_HOME: path.join(base, 'xdg'), GIT_CONFIG_GLOBAL: path.join(base, 'gitconfig'), GIT_CONFIG_NOSYSTEM: '1',
-                GIT_AUTHOR_NAME: 'Test', GIT_AUTHOR_EMAIL: 'test@example.invalid', GIT_COMMITTER_NAME: 'Test', GIT_COMMITTER_EMAIL: 'test@example.invalid',
+            const base = tmp('git-crash');
+            withIsolatedGit(base, () => {
+                const f = gitFixture(mod, exclusions, base, { variant });
+                assert.throws(() => f.sync(200, { hooks: simulatedCrash(mod, point, occurrence) }), new RegExp(`simulated crash at ${point} #${occurrence}`));
+                assert.equal(mod.readSkillExportTransactionState(f.project, { liveness: liveness(300) }).pending.phase, 'metadata', 'publication stopped part-way');
+                f.assertUser();
+                assert.equal(f.recover(300, [200]).status, 'rolled-forward');
+                assert.equal(mod.readSkillExportTransactionState(f.project, { liveness: liveness(300) }).pending, null);
+                f.assertPublished();
+                assert.equal(f.sync(300, { dead: [200] }).transaction.status, 'unchanged');
+                f.assertPublished();
             });
-            try {
-                const project = path.join(base, 'project');
-                fs.mkdirSync(project);
-                const git = (...args) => execFileSync('git', args, { cwd: project, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-                git('init', '-q');
-                write(path.join(project, 'README.md'), 'x\n');
-                git('add', 'README.md');
-                git('commit', '-q', '-m', 'initial');
+        },
+    })),
+    {
+        name: 'a crash during recovery is itself recovered to the complete new state',
+        run({ mod, tmp }) {
+            const fixture = crashFixture(mod, tmp);
+            assert.throws(() => fixture.run(200, { hooks: simulatedCrash(mod, 'after-ledger') }), /simulated crash/);
+            assert.throws(() => recoverWith(mod, fixture.folder, 300, [200], { recoveryHooks: simulatedCrash(mod, 'after-manifest') }), /simulated crash at after-manifest/);
+            assert.equal(mod.readSkillExportTransactionState(fixture.folder, { liveness: liveness(400, [200, 300]) }).pending.phase, 'metadata');
+            assert.equal(mod.inspectSkillExportLock(fixture.folder, { liveness: liveness(400, [200, 300]) }).state, 'dead', 'the crashed recovery left its lock');
+            assert.equal(recoverWith(mod, fixture.folder, 400, [200, 300]).status, 'rolled-forward');
+            assertAfterState(mod, fixture);
+            assert.equal(fixture.run(400, { dead: [200, 300] }).transaction.status, 'unchanged');
+            assertAfterState(mod, fixture);
+        },
+    },
+    {
+        name: 'a crash during recovery between Git config artifacts is itself recovered',
+        run({ mod, tmp, exclusions }) {
+            const base = tmp('git-recovery-crash');
+            withIsolatedGit(base, () => {
+                const f = gitFixture(mod, exclusions, base, { variant: 'core.worktree' });
+                assert.throws(() => f.sync(200, { hooks: simulatedCrash(mod, 'after-ledger') }), /simulated crash/);
+                assert.throws(() => f.recover(300, [200], { recoveryHooks: simulatedCrash(mod, 'after-git-config', 2) }), /simulated crash at after-git-config #2/);
+                f.assertUser();
+                assert.equal(f.recover(400, [200, 300]).status, 'rolled-forward');
+                f.assertPublished();
+            });
+        },
+    },
+    {
+        name: 'recovery never removes or overwrites a native Git config lock and stays pending',
+        run({ mod, tmp, exclusions }) {
+            const base = tmp('git-native-lock');
+            withIsolatedGit(base, () => {
+                const f = gitFixture(mod, exclusions, base);
+                assert.throws(() => f.sync(200, { hooks: simulatedCrash(mod, 'after-ledger') }), /simulated crash/);
+                const lock = `${f.common}.lock`;
+                fs.writeFileSync(lock, '[foreign]\n\twriter = in-progress\n');
+                const inode = fs.statSync(lock).ino;
+                const configBefore = read(f.common);
+                assert.throws(() => f.recover(300, [200]), error => error.code === 'SKILL_EXPORT_RECOVERY_REQUIRED'
+                    && error.outcome === 'recovery-required' && error.cause?.code === 'SKILL_EXPORT_GIT_CONFIG_BUSY');
+                assert.equal(fs.statSync(lock).ino, inode, 'the foreign lock keeps its inode');
+                assert.equal(read(lock), '[foreign]\n\twriter = in-progress\n', 'the foreign lock keeps its bytes');
+                assert.equal(read(f.common), configBefore, 'the locked config is not written');
+                assert.equal(mod.readSkillExportTransactionState(f.project, { liveness: liveness(300) }).pending.phase, 'metadata');
+                f.assertUser();
+                // The native writer finishes; the next participant completes recovery.
+                fs.unlinkSync(lock);
+                assert.equal(f.recover(300, [200]).status, 'rolled-forward');
+                f.assertPublished();
+            });
+        },
+    },
+    {
+        name: 'crash after-receipt in a non-git folder rolls forward the managed block and keeps user rules',
+        run({ mod, tmp, exclusions }) {
+            const base = tmp('receipt');
+            withIsolatedGit(base, () => {
+                const folder = path.join(base, 'target');
+                writeUserFiles(folder);
+                write(path.join(folder, '.gitignore'), 'node_modules\n');
                 const source = skillSource(base, 'demo', 'demo');
                 const sync = (self, extra = {}) => mod.syncManagedSkillExports({
-                    folder: project, owner: 'manifest', mode: 'symlink', claude: 'root-or-skills', sources: [{ name: 'demo', path: source }],
-                    exclusions: exclusions.createSkillExclusionPlanner(), lock: { liveness: liveness(self, extra.dead || []) }, hooks: extra.hooks || {},
+                    folder, owner: 'manifest', claude: 'root-or-skills', sources: [{ name: 'demo', path: source }],
+                    exclusions: exclusions.createSkillExclusionPlanner({ nonGitBlock: true, containerExecutor: false }),
+                    lock: { liveness: liveness(self, extra.dead || []), waitMs: 0 }, hooks: extra.hooks || {},
                 });
-                assert.throws(() => sync(200, { hooks: simulatedCrash(mod, 'after-git-config') }), /simulated crash/);
-                assert.match(git('status', '--porcelain'), /\?\? /, 'publication stopped part-way');
-                const recovered = mod.withSkillExportLocks([project], ([handle]) => handle.recovery,
-                    { liveness: liveness(300, [200]), exclusions: exclusions.createSkillExclusionPlanner() });
-                assert.equal(recovered.status, 'rolled-forward');
-                assert.equal(git('status', '--porcelain'), '');
-                assert.equal(sync(300).transaction.status, 'unchanged');
-            } finally {
-                for (const [key, value] of Object.entries(saved)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+                assert.throws(() => sync(200, { hooks: simulatedCrash(mod, 'after-receipt') }), /simulated crash at after-receipt/);
+                assert.equal(recoverWith(mod, folder, 300, [200]).status, 'rolled-forward');
+                const gitignore = read(path.join(folder, '.gitignore'));
+                assert.ok(gitignore.startsWith(`node_modules\n${exclusions.IGNORE_MARKER_START}\n`), gitignore);
+                assert.match(gitignore, /^\/\.agents\/skills\/demo$/m);
+                const receipt = JSON.parse(read(path.join(folder, '.agents', '.ploinky-ignore-receipt.json')));
+                assert.equal(receipt.after, crypto.createHash('sha256').update(gitignore).digest('hex'));
+                assert.equal(receipt.beforeAbsent, false);
+                assert.ok(resolvesTo(path.join(folder, '.agents', 'skills', 'demo'), source));
+                assertUserFiles(folder);
+                assert.equal(sync(300, { dead: [200] }).transaction.status, 'unchanged');
+                assert.equal(read(path.join(folder, '.gitignore')), gitignore);
+            });
+        },
+    },
+    {
+        name: 'every crash point is exercised in link mode',
+        run({ mod }) {
+            const covered = [...CRASH_MATRIX, 'after-receipt', ...GIT_CRASHES.map(([point]) => point)];
+            assert.deepEqual([...new Set(covered)].sort(), [...mod.CRASH_POINTS].sort());
+        },
+    },
+    {
+        name: 'a ledger entry of an unsupported kind is preserved, reported and never adopted',
+        run({ mod, tmp }) {
+            const base = tmp('unsupported');
+            const folder = path.join(base, 'target');
+            const copied = skillSource(base, 'copied', 'copied');
+            const skills = path.join(folder, '.agents', 'skills');
+            // A directory export and a record whose output is gone.
+            fs.mkdirSync(skills, { recursive: true });
+            write(path.join(skills, 'copied', 'SKILL.md'), '# copied\n');
+            write(path.join(skills, 'copied', 'helper.sh'), 'user bytes\n', 0o755);
+            const ledgerFile = path.join(folder, '.agents', '.ploinky-skill-exports.json');
+            const entries = {
+                copied: { owner: 'manifest', digest: mod.skillTreeDigest(path.join(skills, 'copied')), kind: 'directory', source: null },
+                gone: { owner: 'manifest', digest: 'x', kind: 'directory', source: null },
+            };
+            write(ledgerFile, `${JSON.stringify({ version: 1, entries }, null, 2)}\n`);
+            const tree = snapshot(skills);
+            const unsupported = diagnostics => diagnostics.filter(item => item.reason === 'unsupported-ledger-entry-preserved').map(item => item.name).sort();
+            const sync = sources => mod.syncManagedSkillExports({ folder, owner: 'manifest', sources, lock: { liveness: liveness(10) } });
+            assert.deepEqual(unsupported(sync([]).diagnostics), ['copied', 'gone']);
+            assert.deepEqual(unsupported(sync([{ name: 'copied', path: copied }, { name: 'gone', path: copied }]).diagnostics), ['copied', 'gone']);
+            const market = policy => mod.withSkillExportLocks([folder], ([handle]) => mod.publishSkillExports(handle, {
+                owner: 'manifest', policy, removeNames: ['copied', 'gone'], sources: [{ name: 'copied', path: copied }, { name: 'gone', path: copied }],
+            }), { liveness: liveness(10) });
+            for (const policy of ['remove', 'additive']) {
+                assert.deepEqual(market(policy).statuses.map(item => [item.name, item.status, item.reason]),
+                    [['copied', 'conflict', 'unsupported-ledger-entry-preserved'], ['gone', 'conflict', 'unsupported-ledger-entry-preserved']]);
             }
+            assert.deepEqual(snapshot(skills), tree, 'unsupported output is untouched');
+            assert.equal((fs.statSync(path.join(skills, 'copied', 'helper.sh')).mode & 0o777), 0o755);
+            assert.deepEqual(ledgerOf(folder).entries, entries, 'unsupported records are never forgotten or rewritten');
+            assert.equal(mod.listOwnedExportPaths(folder).filter(item => item.startsWith('.agents/skills/')).length, 0, 'unsupported output is not owned');
         },
     },
     {
@@ -353,12 +593,17 @@ export const scenarios = [
         run({ mod, tmp }) {
             const fixture = crashFixture(mod, tmp);
             assert.throws(() => fixture.run(200, { hooks: simulatedCrash(mod, 'after-link') }), /simulated crash/);
+            // The user points the published link at their own skill.
             const replace = path.join(fixture.skills, 'replace');
-            write(path.join(replace, 'human.txt'), 'human bytes');
+            const human = path.join(fixture.base, 'human');
+            write(path.join(human, 'SKILL.md'), 'human bytes\n');
+            fs.unlinkSync(replace);
+            fs.symlinkSync(human, replace);
             const recovery = recoverWith(mod, fixture.folder, 300, [200]);
             assert.equal(recovery.status, 'quarantined');
             assert.equal(recovery.direction, 'back');
-            assert.equal(read(path.join(replace, 'human.txt')), 'human bytes');
+            assert.equal(fs.readlinkSync(replace), human);
+            assert.equal(read(path.join(human, 'SKILL.md')), 'human bytes\n');
             const state = mod.readSkillExportTransactionState(fixture.folder, { liveness: liveness(300) });
             assert.equal(state.pending, null);
             assert.equal(state.quarantined.length, 1);
@@ -367,7 +612,9 @@ export const scenarios = [
             assert.equal(ledgerOf(fixture.folder).entries.replace.digest, fixture.before.ledger && JSON.parse(fixture.before.ledger).entries.replace.digest);
             const next = fixture.run(300, { manifest: null, claude: null, gitignore: null });
             assert.ok(next.diagnostics.some(item => item.name === 'replace' && item.reason === 'edited-output-preserved'));
-            assert.equal(read(path.join(replace, 'human.txt')), 'human bytes');
+            assert.equal(fs.readlinkSync(replace), human);
+            assert.equal(read(path.join(human, 'SKILL.md')), 'human bytes\n');
+            assertUserFiles(fixture.folder);
             assert.ok(next.retention.staging.retained.some(item => item.reason === 'journal-referenced'), 'quarantined staging stays referenced');
         },
     },
@@ -411,9 +658,9 @@ export const scenarios = [
             const real = fs.realpathSync(skills);
             // An identical pre-existing user link and a manifest-owned link.
             fs.symlinkSync(path.relative(real, fs.realpathSync(beta)), path.join(skills, 'beta'));
-            mod.syncManagedSkillExports({ folder, owner: 'manifest', mode: 'symlink', sources: [{ name: 'gamma', path: gamma }], lock: { liveness: liveness(10) } });
+            mod.syncManagedSkillExports({ folder, owner: 'manifest', sources: [{ name: 'gamma', path: gamma }], lock: { liveness: liveness(10) } });
             const install = () => mod.withSkillExportLocks([folder], ([handle]) => mod.publishSkillExports(handle, {
-                owner: mod.MARKETPLACE_OWNER, policy: 'additive', mode: 'symlink', claude: 'root-strict',
+                owner: mod.MARKETPLACE_OWNER, policy: 'additive', claude: 'root-strict',
                 sources: ['alpha', 'beta', 'gamma'].map(name => ({ name, path: path.join(base, 'sources', name), source: { name: 'market' } })),
                 lock: { liveness: liveness(10) },
             }), { liveness: liveness(10) });
@@ -456,11 +703,10 @@ export const scenarios = [
         run({ mod, tmp }) {
             const base = tmp('retention');
             const folder = path.join(base, 'target');
-            const source = skillSource(base, 'one', 'one');
-            const sync = self => mod.syncManagedSkillExports({ folder, owner: 'manifest', sources: [{ name: 'one', path: source }], lock: { liveness: liveness(self, [66]) } });
-            sync(10);
-            write(path.join(source, 'SKILL.md'), '# one v2\n');
-            sync(10);
+            const versions = ['one-v1', 'one-v2', 'one-v3'].map(name => skillSource(base, name, name));
+            const sync = (self, version) => mod.syncManagedSkillExports({ folder, owner: 'manifest', sources: [{ name: 'one', path: versions[version] }], lock: { liveness: liveness(self, [66]) } });
+            sync(10, 0);
+            sync(10, 1);
             const agents = path.join(fs.realpathSync(folder), '.agents');
             const staging = path.join(agents, '.ploinky-export-staging');
             const owner = (pid, extra = {}) => JSON.stringify({ protocol: mod.EXPORT_PROTOCOL, version: mod.EXPORT_PROTOCOL_VERSION, token: crypto.randomUUID(), ...identity(pid), ...extra });
@@ -472,19 +718,23 @@ export const scenarios = [
             write(path.join(staging, foreign, 'owner.json'), owner(67, { boot: 'boot-b' }));
             write(path.join(staging, `tx-${referenced}`, 'owner.json'), owner(66));
             write(path.join(agents, '.ploinky-export-quarantine', `${referenced}.json`), '{}');
-            write(path.join(staging, 'export-legacy', 'one', 'SKILL.md'), 'legacy staging');
-            write(path.join(agents, '.ploinky-export-backups', `one-${crypto.randomUUID()}`, 'SKILL.md'), 'legacy backup');
-            write(path.join(source, 'SKILL.md'), '# one v3\n');
-            const result = sync(10);
+            // Names this protocol never writes are reported as unknown and kept.
+            write(path.join(staging, 'export-unknown', 'one', 'SKILL.md'), 'unknown staging');
+            const unknownBackup = path.join(agents, '.ploinky-export-backups', `one-${crypto.randomUUID()}`);
+            write(path.join(unknownBackup, 'SKILL.md'), 'unknown backup');
+            const result = sync(10, 2);
             assert.deepEqual(result.retention.staging.collected, [dead]);
             const retained = Object.fromEntries(result.retention.staging.retained.map(item => [item.name, item.reason]));
             assert.equal(retained[foreign], 'owner-not-proven-dead');
             assert.equal(retained[`tx-${referenced}`], 'journal-referenced');
-            assert.equal(retained['export-legacy'], 'unknown-legacy');
+            assert.equal(retained['export-unknown'], 'unknown-name');
             assert.equal(result.retention.backups.prior.count, 2);
             assert.ok(result.retention.backups.prior.bytes > 0);
-            assert.equal(result.retention.backups.legacy.count, 1);
-            assert.ok(result.retention.retainedBytes >= result.retention.backups.prior.bytes + result.retention.backups.legacy.bytes);
+            assert.deepEqual(Object.keys(result.retention.backups).sort(), ['concurrent', 'prior', 'unknown']);
+            assert.equal(result.retention.backups.unknown.count, 1);
+            assert.ok(result.retention.retainedBytes >= result.retention.backups.prior.bytes + result.retention.backups.unknown.bytes);
+            assert.equal(read(path.join(unknownBackup, 'SKILL.md')), 'unknown backup');
+            assert.equal(read(path.join(staging, 'export-unknown', 'one', 'SKILL.md')), 'unknown staging');
             assert.ok(fs.existsSync(path.join(agents, '.ploinky-export-backups')), 'backups are never pruned by age');
         },
     },
@@ -511,7 +761,7 @@ export const scenarios = [
             const folder = path.join(base, 'target');
             const one = skillSource(base, 'one', 'one');
             const two = skillSource(base, 'two', 'two');
-            const sync = extra => mod.syncManagedSkillExports({ folder, owner: 'manifest', mode: 'symlink', lock: { liveness: liveness(10) }, ...extra });
+            const sync = extra => mod.syncManagedSkillExports({ folder, owner: 'manifest', lock: { liveness: liveness(10) }, ...extra });
             sync({ sources: [{ name: 'one', path: one }, { name: 'two', path: two }], consumer: { selection: 'explicit', policy: 'manifest' } });
             const result = sync({ sources: [{ name: 'two', path: two }], retain: ['one'], consumer: { selection: 'explicit', policy: 'manifest' } });
             assert.deepEqual(result.removed, []);
@@ -532,7 +782,7 @@ export const scenarios = [
             const base = tmp('idempotent');
             const folder = path.join(base, 'target');
             const source = skillSource(base, 'one', 'one');
-            const sync = () => mod.syncManagedSkillExports({ folder, owner: 'manifest', mode: 'symlink', sources: [{ name: 'one', path: source }], claude: 'root-or-skills', lock: { liveness: liveness(10) } });
+            const sync = () => mod.syncManagedSkillExports({ folder, owner: 'manifest', sources: [{ name: 'one', path: source }], claude: 'root-or-skills', lock: { liveness: liveness(10) } });
             assert.equal(sync().transaction.status, 'committed');
             const ledger = path.join(fs.realpathSync(folder), '.agents', '.ploinky-skill-exports.json');
             const before = fs.statSync(ledger);
@@ -545,43 +795,26 @@ export const scenarios = [
 ];
 
 function mapCrashPoints() {
-    return ['copy', 'symlink'].flatMap(mode => ['before-journal', 'after-journal', 'after-backup', 'after-link', 'before-metadata',
-        'after-metadata-journal', 'after-ledger', 'after-manifest', 'after-claude', 'after-gitignore', 'before-commit', 'after-commit']
-        .filter(point => mode === 'copy' || ['after-link', 'after-ledger'].includes(point))
-        .map(point => ({
-            name: `crash ${point} (${mode}) recovers to the complete ${ROLLED_BACK.has(point) ? 'prior' : 'new'} state`,
-            run({ mod, tmp }) {
-                assert.ok(mod.CRASH_POINTS.includes(point));
-                const fixture = crashFixture(mod, tmp);
-                // Symlink mode also migrates the prior copies to links.
-                const run = (self, extra = {}) => mode === 'symlink'
-                    ? mod.syncManagedSkillExports({
-                        folder: fixture.folder, owner: 'manifest', mode: 'symlink', lock: { liveness: liveness(self, extra.dead || []), waitMs: 0 },
-                        sources: ['keep', 'replace', 'fresh'].map(name => ({ name, path: fixture.sources[name] })),
-                        manifest: { path: fixture.manifest, expected: read(fixture.manifest), next: 'v2\n' },
-                        claude: 'root-or-skills', gitignore: { update: addGenerated }, hooks: extra.hooks || {},
-                    })
-                    : fixture.run(self, extra);
-                assert.throws(() => run(200, { hooks: simulatedCrash(mod, point) }), /simulated crash/);
-                assert.equal(mod.inspectSkillExportLock(fixture.folder, { liveness: liveness(300, [200]) }).state, 'dead');
-                const recovery = recoverWith(mod, fixture.folder, 300, [200]);
-                if (mode === 'copy') {
-                    if (ROLLED_BACK.has(point)) assertBeforeState(mod, fixture);
-                    else assertAfterState(mod, fixture);
-                } else {
-                    assert.equal(read(fixture.manifest), ROLLED_BACK.has(point) ? 'v1\n' : 'v2\n');
-                    assert.equal(lstat(path.join(fixture.skills, 'fresh'))?.isSymbolicLink() ?? false, !ROLLED_BACK.has(point));
-                }
-                const expected = point === 'before-journal' || point === 'after-commit' ? 'none' : ROLLED_BACK.has(point) ? 'rolled-back' : 'rolled-forward';
-                assert.equal(recovery.status, expected);
-                assert.equal(mod.readSkillExportTransactionState(fixture.folder, { liveness: liveness(300) }).pending, null);
-                // A later run converges on the new state and collects abandoned staging.
-                const next = run(300, { dead: [200] });
-                assert.equal(next.retention.staging.retained.length, 0, JSON.stringify(next.retention.staging));
-                if (mode === 'copy') assertAfterState(mod, fixture);
-                else assert.equal(fs.realpathSync(path.join(fixture.skills, 'fresh')), fs.realpathSync(fixture.sources.fresh));
-            },
-        })));
+    return CRASH_MATRIX.map(point => ({
+        name: `crash ${point} recovers to the complete ${ROLLED_BACK.has(point) ? 'prior' : 'new'} state`,
+        run({ mod, tmp }) {
+            assert.ok(mod.CRASH_POINTS.includes(point));
+            const fixture = crashFixture(mod, tmp);
+            assert.throws(() => fixture.run(200, { hooks: simulatedCrash(mod, point) }), new RegExp(`simulated crash at ${point}`));
+            assertUserFiles(fixture.folder);
+            assert.equal(mod.inspectSkillExportLock(fixture.folder, { liveness: liveness(300, [200]) }).state, 'dead');
+            const recovery = recoverWith(mod, fixture.folder, 300, [200]);
+            if (ROLLED_BACK.has(point)) assertBeforeState(mod, fixture);
+            else assertAfterState(mod, fixture);
+            const expected = point === 'before-journal' || point === 'after-commit' ? 'none' : ROLLED_BACK.has(point) ? 'rolled-back' : 'rolled-forward';
+            assert.equal(recovery.status, expected);
+            assert.equal(mod.readSkillExportTransactionState(fixture.folder, { liveness: liveness(300) }).pending, null);
+            // A later run converges on the new state and collects abandoned staging.
+            const next = fixture.run(300, { dead: [200] });
+            assert.equal(next.retention.staging.retained.length, 0, JSON.stringify(next.retention.staging));
+            assertAfterState(mod, fixture);
+        },
+    }));
 }
 
 // Run one protocol copy against another in the same folder.

@@ -181,7 +181,7 @@ async function main(rawOptions) {
     const copiedSkill = (folder, name = sharedSkill) => path.join(folder, '.agents', 'skills', name, 'SKILL.md');
     const mainContent = '# Shared skill on main\n';
     const updatedContent = '# Shared skill advanced on main\n';
-    const seed = (folder, skillName, source) => syncManagedSkillExports({ folder, owner: 'manifest', mode: 'copy',
+    const seed = (folder, skillName, source) => syncManagedSkillExports({ folder, owner: 'manifest',
         sources: [{ name: skillName, path: source }], claude: 'root-or-skills' });
     const recordFor = (records, phase, id) => {
         const record = records.find(item => item.phase === phase && item.id === id);

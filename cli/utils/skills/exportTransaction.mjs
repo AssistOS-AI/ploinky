@@ -81,7 +81,10 @@ const CONTENT_KINDS = new Set(['ledger', 'manifest', 'gitignore', 'receipt', 'pr
 const RECLAIM = '.reclaim';
 const SKILL_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 const TRANSACTION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-const BACKUP_NAME = /^(.+)-(prior|concurrent|rollback)-tx-([0-9a-f-]{36})(?:-\d+)?$/;
+const BACKUP_NAME = /^(.+)-(prior|concurrent)-tx-([0-9a-f-]{36})(?:-\d+)?$/;
+// Ledger entries record exported skills as links; an entry of any other kind
+// is unsupported state that is preserved and reported, never adopted.
+const ENTRY_KIND = 'symlink';
 const DEFAULT_WAIT_MS = 2_000;
 const MAX_WAIT_MS = 60_000;
 const DEFAULT_POLL_MS = 25;
@@ -110,22 +113,6 @@ export function skillTreeDigest(root) {
     };
     visit(root, '');
     return hash.digest('hex');
-}
-
-export function copyFreshSkillTree(source, destination) {
-    const stat = fs.lstatSync(source);
-    if (stat.isDirectory()) {
-        fs.mkdirSync(destination, { mode: 0o700 });
-        for (const name of fs.readdirSync(source).sort()) copyFreshSkillTree(path.join(source, name), path.join(destination, name));
-        fs.chmodSync(destination, stat.mode & 0o777);
-    } else if (stat.isFile()) {
-        // Create with owner access first; recursive native cp has exposed
-        // transient unreadable modes on macOS virtiofs-backed Box mounts.
-        fs.closeSync(fs.openSync(destination, 'wx', 0o600));
-        fs.copyFileSync(source, destination);
-        fs.chmodSync(destination, stat.mode & 0o777);
-    } else if (stat.isSymbolicLink()) fs.symlinkSync(fs.readlinkSync(source), destination);
-    else throw new Error(`Unsupported skill entry: ${source}`);
 }
 
 // Default link factory: relative to the final skills directory.
@@ -314,8 +301,8 @@ function blockedError(state, lockPath, owner) {
     const who = owner?.pid ? ` held by pid ${owner.pid}${owner.hostname ? ` on ${owner.hostname}` : ''}` : '';
     if (state === 'ownerless') {
         return skillExportError('SKILL_EXPORT_LOCK_OWNERLESS',
-            `Skill export lock has no owner record (legacy or interrupted exporter); it is preserved and never reclaimed by age. Stop every exporter for this folder, verify none is running, then remove the lock directory: ${lockPath}`,
-            { outcome: 'blocked-legacy-lock', lockPath });
+            `Skill export lock has no owner record (an exporter is starting or stopped before recording itself); it is preserved and never reclaimed by age. Stop every exporter for this folder, verify none is running, then remove the lock directory: ${lockPath}`,
+            { outcome: 'blocked-ownerless-lock', lockPath });
     }
     if (state === 'unknown') {
         return skillExportError('SKILL_EXPORT_LOCK_UNKNOWN_OWNER',
@@ -731,7 +718,7 @@ function validateJournalLayout(handle, journal, filename) {
     realDirectoryIfPresent(path.join(handle.agents, EXPORT_STAGING), 'staging root');
     realDirectoryIfPresent(path.join(handle.root, staging), 'staging');
     realDirectoryIfPresent(path.join(handle.agents, EXPORT_BACKUPS), 'backups root');
-    const backupPattern = name => new RegExp(`^${name.replace(/[.]/g, '\\.')}-(prior|concurrent|rollback)-tx-${journal.transaction}(-\\d+)?$`);
+    const backupPattern = name => new RegExp(`^${name.replace(/[.]/g, '\\.')}-(prior|concurrent)-tx-${journal.transaction}(-\\d+)?$`);
     const names = new Set();
     for (const entry of journal.paths) {
         if (!entry || typeof entry !== 'object' || !SKILL_NAME.test(entry.name || '') || names.has(entry.name)) reject('path name');
@@ -741,6 +728,7 @@ function validateJournalLayout(handle, journal, filename) {
             || !backupPattern(entry.name).test(path.basename(entry.backup)))) reject(`backup of ${entry.name}`);
         if (entry.staged !== null && entry.staged !== path.join(staging, entry.name)) reject(`staging of ${entry.name}`);
         if (!evidence(entry.before) || !evidence(entry.after)) reject(`evidence of ${entry.name}`);
+        if (entry.after.type !== 'absent' && entry.after.type !== ENTRY_KIND) reject(`published kind of ${entry.name}`);
     }
     const seen = new Set();
     let identity;
@@ -835,9 +823,9 @@ function undoPaths(handle, journal, context) {
         const destination = resolveInside(handle.root, entry.destination);
         const backup = entry.backup ? resolveInside(handle.root, entry.backup) : null;
         let current = pathEvidence(destination);
-        if (entry.after.type !== 'absent' && evidenceMatches(current, entry.after)) {
-            if (current.type === 'symlink') fs.unlinkSync(destination);
-            else fs.renameSync(destination, backupName(handle, entry.name, 'rollback', journal.transaction));
+        // Only the exact link this transaction published is removed.
+        if (entry.after.type === ENTRY_KIND && evidenceMatches(current, entry.after)) {
+            fs.unlinkSync(destination);
             current = { type: 'absent' };
         }
         if (evidenceMatches(current, entry.before)) continue;
@@ -851,9 +839,9 @@ function undoPaths(handle, journal, context) {
     return unexpected;
 }
 
-// Before the commit point this transaction never wrote the ledger. A changed
-// ledger means another writer (for example a pre-transaction exporter)
-// committed meanwhile; it is left untouched and reported.
+// Before the commit point this transaction never wrote the ledger. A ledger
+// that no longer matches the journal was changed outside this lock (for
+// example by hand); it is left untouched and reported.
 function ledgerNotes(handle, journal) {
     if (!journal.ledger?.before) return [];
     const current = currentContent(path.join(handle.agents, EXPORT_LEDGER));
@@ -971,8 +959,18 @@ export function recoverSkillExportTransaction(handle, options = {}) {
     }
     const context = { handle, hooks: options.recoveryHooks || null, recovering: true };
     const forward = journal.phase === 'metadata';
-    const unexpected = forward ? redoArtifacts(handle, journal, context) : undoPaths(handle, journal, context);
-    if (forward && !unexpected.length) unexpected.push(...verifyJournal(handle, journal));
+    let unexpected;
+    try {
+        unexpected = forward ? redoArtifacts(handle, journal, context) : undoPaths(handle, journal, context);
+        if (forward && !unexpected.length) unexpected.push(...verifyJournal(handle, journal));
+    } catch (error) {
+        if (handle.abandoned) throw error;
+        // A busy native Git lock, or any other stop, leaves the journal
+        // pending: the transaction still needs recovery; it has not failed.
+        throw skillExportError('SKILL_EXPORT_RECOVERY_REQUIRED',
+            `Skill export transaction ${journal.transaction} could not be recovered yet and remains pending: ${error.message}`,
+            { outcome: 'recovery-required', transaction: journal.transaction, cause: error });
+    }
     const notes = forward ? [] : ledgerNotes(handle, journal);
     if (unexpected.length) {
         quarantine(handle, journal, unexpected);
@@ -985,29 +983,21 @@ export function recoverSkillExportTransaction(handle, options = {}) {
 // ---------------------------------------------------------------------------
 // Planning.
 
-function stageWanted(handle, staging, wanted, mode, linker, name) {
+function stageWanted(handle, staging, wanted, linker, name) {
     const staged = path.join(staging, name);
-    if (mode === 'symlink') {
-        const target = fs.realpathSync(wanted.path);
-        if (!fs.statSync(path.join(target, 'SKILL.md')).isFile()) throw new Error('Skill descriptor is missing');
-        linker(staged, target, handle.root, handle.skills);
-        return { staged, digest: skillTreeDigest(staged), sourceTarget: target, kind: 'symlink' };
-    }
-    for (let attempt = 0; attempt < 3; attempt++) {
-        const before = skillTreeDigest(wanted.path);
-        copyFreshSkillTree(wanted.path, staged);
-        const digest = skillTreeDigest(staged);
-        if (digest === before && digest === skillTreeDigest(wanted.path)) return { staged, digest, sourceTarget: null, kind: 'directory' };
-        fs.rmSync(staged, { recursive: true, force: true });
-    }
-    return null;
+    const target = fs.realpathSync(wanted.path);
+    if (!fs.statSync(path.join(target, 'SKILL.md')).isFile()) throw new Error('Skill descriptor is missing');
+    linker(staged, target, handle.root, handle.skills);
+    return { staged, digest: skillTreeDigest(staged), sourceTarget: target };
 }
+
+const unsupportedEntry = record => Boolean(record) && record.kind !== ENTRY_KIND;
 
 // Refresh: the owner's complete desired set replaces its previous set.
 // `retain` names belong to sources that could not be verified this time:
 // their output is neither refreshed nor pruned.
 function planSync(handle, ledger, spec, staging, result) {
-    const { owner, incoming, mode, linker, retain } = spec;
+    const { owner, incoming, linker, retain } = spec;
     const diagnose = (name, reason, extra = {}) => result.diagnostics.push({ name, reason, ...extra });
     const names = new Set([...incoming.keys(), ...Object.keys(ledger.entries).filter(name => ledger.entries[name].owner === owner)]);
     const ops = [];
@@ -1018,20 +1008,21 @@ function planSync(handle, ledger, spec, staging, result) {
         const record = ledger.entries[name];
         const destination = path.join(handle.skills, name);
         const present = exists(destination);
+        // Neither its output nor its ledger record is changed or forgotten.
+        if (unsupportedEntry(record)) { diagnose(name, 'unsupported-ledger-entry-preserved'); continue; }
         if (record && record.owner !== owner) { diagnose(name, 'owned-by-other-export'); continue; }
         if (present && !record) { diagnose(name, 'unrecorded-output-preserved'); continue; }
         if (!present && record && wanted) { diagnose(name, 'removed-output-preserved'); continue; }
-        if (present && (!(record.kind === 'symlink' ? fs.lstatSync(destination).isSymbolicLink() : fs.lstatSync(destination).isDirectory()) || skillTreeDigest(destination) !== record.digest)) { diagnose(name, 'edited-output-preserved'); continue; }
+        if (present && (!fs.lstatSync(destination).isSymbolicLink() || skillTreeDigest(destination) !== record.digest)) { diagnose(name, 'edited-output-preserved'); continue; }
         let prepared = null;
         if (wanted) {
-            prepared = stageWanted(handle, staging, wanted, mode, linker, name);
-            if (!prepared) { diagnose(name, 'source-changing-during-export'); continue; }
+            prepared = stageWanted(handle, staging, wanted, linker, name);
             if (record?.digest === prepared.digest) { result.unchanged.push(name); continue; }
         }
         ops.push({
             name, record, wanted, prepared,
             action: present ? (wanted ? 'replace' : 'remove') : wanted ? 'install' : 'forget',
-            entry: wanted ? { owner, digest: prepared.digest, kind: prepared.kind, source: wanted.source ?? null } : null,
+            entry: wanted ? { owner, digest: prepared.digest, kind: ENTRY_KIND, source: wanted.source ?? null } : null,
         });
     }
     return ops;
@@ -1053,6 +1044,7 @@ function planAdditive(handle, ledger, spec, staging, result) {
         const present = exists(destination);
         const source = fs.realpathSync(wanted.path);
         const status = (value, reason) => result.statuses.push({ name, destination, source, status: value, ...(reason ? { reason } : {}), owned: Boolean(record && record.owner === owner) });
+        if (unsupportedEntry(record)) { status('conflict', 'unsupported-ledger-entry-preserved'); continue; }
         if (record && record.owner !== owner) {
             if (present && resolvesTo(destination, source)) status('present', 'owned-by-other-export');
             else status('conflict', 'owned-by-other-export');
@@ -1064,8 +1056,8 @@ function planAdditive(handle, ledger, spec, staging, result) {
             status('present', record ? null : 'unrecorded-output-preserved');
             continue;
         }
-        const prepared = stageWanted(handle, staging, wanted, 'symlink', linker, name);
-        ops.push({ name, record, wanted, prepared, action: 'install', entry: { owner, digest: prepared.digest, kind: 'symlink', source: wanted.source ?? null } });
+        const prepared = stageWanted(handle, staging, wanted, linker, name);
+        ops.push({ name, record, wanted, prepared, action: 'install', entry: { owner, digest: prepared.digest, kind: ENTRY_KIND, source: wanted.source ?? null } });
     }
     return ops;
 }
@@ -1080,6 +1072,7 @@ function planRemove(handle, ledger, spec, result) {
         const record = ledger.entries[name];
         const present = exists(destination);
         const status = (value, reason) => result.statuses.push({ name, destination, status: value, ...(reason ? { reason } : {}) });
+        if (unsupportedEntry(record)) { status('conflict', 'unsupported-ledger-entry-preserved'); continue; }
         if (!present) {
             if (record?.owner === owner) ops.push({ name, record, action: 'forget', entry: null });
             status('absent');
@@ -1088,7 +1081,7 @@ function planRemove(handle, ledger, spec, result) {
         if (!record) { status('conflict', 'unrecorded-output-preserved'); continue; }
         if (record.owner !== owner) { status('conflict', 'owned-by-other-export'); continue; }
         const stat = fs.lstatSync(destination);
-        if (!(record.kind === 'symlink' ? stat.isSymbolicLink() : stat.isDirectory()) || skillTreeDigest(destination) !== record.digest) { status('conflict', 'edited-output-preserved'); continue; }
+        if (!stat.isSymbolicLink() || skillTreeDigest(destination) !== record.digest) { status('conflict', 'edited-output-preserved'); continue; }
         ops.push({ name, record, action: 'remove', entry: null, removal: true });
     }
     return ops;
@@ -1146,17 +1139,18 @@ function referencedTransactions(handle) {
 }
 
 // Only provably unpublished generated staging with dead-owner proof and no
-// journal reference is collected. Backups are classified and retained: old
-// descriptors may still write into prior output after replacement.
+// journal reference is collected. Backups are classified and retained, never
+// pruned by age. Entries whose names this protocol does not write are
+// reported as unknown and kept.
 export function inspectSkillExportRetention(handle, { collect = true, ...options } = {}) {
     const report = {
-        backups: { prior: { count: 0, bytes: 0 }, concurrent: { count: 0, bytes: 0 }, rollback: { count: 0, bytes: 0 }, legacy: { count: 0, bytes: 0 } },
+        backups: { prior: { count: 0, bytes: 0 }, concurrent: { count: 0, bytes: 0 }, unknown: { count: 0, bytes: 0 } },
         staging: { collected: [], retained: [] },
         retainedBytes: 0,
     };
     const backups = path.join(handle.agents, EXPORT_BACKUPS);
     for (const name of fs.existsSync(backups) ? fs.readdirSync(backups) : []) {
-        const kind = BACKUP_NAME.exec(name)?.[2] || 'legacy';
+        const kind = BACKUP_NAME.exec(name)?.[2] || 'unknown';
         const bytes = storageBytes(path.join(backups, name));
         report.backups[kind].count += 1;
         report.backups[kind].bytes += bytes;
@@ -1168,7 +1162,7 @@ export function inspectSkillExportRetention(handle, { collect = true, ...options
         const target = path.join(stagingRoot, name);
         const transaction = /^tx-(.+)$/.exec(name)?.[1];
         if (transaction && transaction === handle.activeTransaction) continue;
-        let reason = 'unknown-legacy';
+        let reason = 'unknown-name';
         if (transaction && TRANSACTION_ID.test(transaction)) {
             if (referenced.has(transaction) || referenced.has('*')) reason = 'journal-referenced';
             else {
@@ -1205,7 +1199,7 @@ function ownedExportPaths(handle, ledger, pendingLinks = []) {
         if (!SKILL_NAME.test(name) || !record || typeof record !== 'object') continue;
         const destination = path.join(handle.skills, name);
         const stat = fs.lstatSync(destination, { throwIfNoEntry: false });
-        if (!stat || !(record.kind === 'symlink' ? stat.isSymbolicLink() : stat.isDirectory())) continue;
+        if (unsupportedEntry(record) || !stat?.isSymbolicLink()) continue;
         try { if (skillTreeDigest(destination) !== record.digest) continue; } catch (_) { continue; }
         owned.push(`.agents/skills/${name}`);
     }
@@ -1329,7 +1323,7 @@ export function publishSkillExports(handle, spec) {
         const ops = policy === 'exclusions-only' ? []
             : policy === 'remove' ? planRemove(handle, ledger, { owner, removeNames: spec.removeNames || [] }, result)
                 : policy === 'additive' ? planAdditive(handle, ledger, { owner, incoming, linker }, staging, result)
-                    : planSync(handle, ledger, { owner, incoming, mode: spec.mode || 'copy', linker, retain: new Set(spec.retain || []) }, staging, result);
+                    : planSync(handle, ledger, { owner, incoming, linker, retain: new Set(spec.retain || []) }, staging, result);
 
         const claude = planClaude(handle, spec.claude);
         let gitignorePlan = null;
@@ -1398,9 +1392,7 @@ export function publishSkillExports(handle, spec) {
                 let after = { type: 'absent' };
                 if (op.prepared) {
                     const staged = pathEvidence(op.prepared.staged);
-                    after = op.prepared.kind === 'symlink'
-                        ? { type: 'symlink', target: staged.target, digest: staged.digest }
-                        : { type: 'directory', digest: staged.digest, inode: staged.inode };
+                    after = { type: ENTRY_KIND, target: staged.target, digest: staged.digest };
                 }
                 return {
                     name: op.name, action: op.action, destination: rel(destination), before, after,
@@ -1437,7 +1429,7 @@ export function publishSkillExports(handle, spec) {
                     writeJournal(handle, journal);
                     continue;
                 }
-                if (op.prepared?.sourceTarget) {
+                if (op.prepared) {
                     let target = null;
                     try { target = fs.realpathSync(op.wanted.path); } catch (_) {}
                     if (target !== op.prepared.sourceTarget) {
@@ -1475,19 +1467,15 @@ export function publishSkillExports(handle, spec) {
                 }
                 if (op.prepared) {
                     if (exists(destination)) { diagnose(op.name, 'concurrent-output-preserved', { backup }); entry.outcome = 'preserved'; writeJournal(handle, journal); continue; }
-                    if (op.prepared.kind === 'symlink') {
-                        // Exclusive create never replaces concurrently created output.
-                        try { fs.symlinkSync(entry.after.target, destination, 'dir'); } catch (error) {
-                            if (error.code !== 'EEXIST') throw error;
-                            diagnose(op.name, 'concurrent-output-preserved', { backup });
-                            entry.outcome = 'preserved';
-                            writeJournal(handle, journal);
-                            continue;
-                        }
-                        entry.after.inode = fileId(fs.lstatSync(destination));
-                    } else {
-                        fs.renameSync(op.prepared.staged, destination);
+                    // Exclusive create never replaces concurrently created output.
+                    try { fs.symlinkSync(entry.after.target, destination, 'dir'); } catch (error) {
+                        if (error.code !== 'EEXIST') throw error;
+                        diagnose(op.name, 'concurrent-output-preserved', { backup });
+                        entry.outcome = 'preserved';
+                        writeJournal(handle, journal);
+                        continue;
                     }
+                    entry.after.inode = fileId(fs.lstatSync(destination));
                     result.installed.push(op.name);
                 } else if (op.action !== 'forget' || policy !== 'remove') {
                     result.removed.push(op.name);
@@ -1580,14 +1568,14 @@ export function publishSkillExports(handle, spec) {
     }
 }
 
-/** Compatibility entry point: lock, recover, publish and release one folder. */
-export function syncManagedSkillExports({ folder, owner, sources, mode = 'copy', beforeMove = null, afterMove = null, linker, manifest, claude, gitignore, exclusions, config, policy, removeNames, retain, consumer, authority, executor, hooks = {}, lock: lockOptions = {} }) {
+/** Single-folder entry point: lock, recover, publish and release one folder. */
+export function syncManagedSkillExports({ folder, owner, sources, beforeMove = null, afterMove = null, linker, manifest, claude, gitignore, exclusions, config, policy, removeNames, retain, consumer, authority, executor, hooks = {}, lock: lockOptions = {} }) {
     if (!owner || (policy !== 'remove' && !Array.isArray(sources))) throw new Error('Skill exports require an owner and sources array');
     if (policy !== 'remove') normalizeSources(sources);
     const lock = { ...lockOptions, authority: lockOptions.authority ?? authority ?? null, executor: lockOptions.executor ?? executor ?? null };
     return withSkillExportLocks([folder], ([handle]) => {
         const result = publishSkillExports(handle, {
-            owner, sources, mode, linker, manifest, claude, gitignore, exclusions, config, policy, removeNames, retain, consumer, lock,
+            owner, sources, linker, manifest, claude, gitignore, exclusions, config, policy, removeNames, retain, consumer, lock,
             hooks: { ...hooks, beforeMove: beforeMove || hooks.beforeMove, afterMove: afterMove || hooks.afterMove },
         });
         if (handle.recovery?.status && handle.recovery.status !== 'none') {

@@ -12,6 +12,16 @@ const suiteWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-skills-man
 fs.mkdirSync(path.join(suiteWorkspace, '.ploinky'), { recursive: true });
 process.chdir(suiteWorkspace);
 process.env.PLOINKY_WORKSPACE_ROOT = suiteWorkspace;
+// Never read or compose the global, system or XDG Git policy of this machine.
+const gitIsolation = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-skills-manifest-git-')));
+fs.writeFileSync(path.join(gitIsolation, 'gitconfig'), '');
+delete process.env.PLOINKY_SKILL_EXCLUDES_COMPOSE;
+delete process.env.GIT_CONFIG_SYSTEM;
+Object.assign(process.env, {
+    XDG_CONFIG_HOME: path.join(gitIsolation, 'xdg'), GIT_CONFIG_GLOBAL: path.join(gitIsolation, 'gitconfig'), GIT_CONFIG_NOSYSTEM: '1',
+    GIT_AUTHOR_NAME: 'Test', GIT_AUTHOR_EMAIL: 'test@example.invalid', GIT_COMMITTER_NAME: 'Test', GIT_COMMITTER_EMAIL: 'test@example.invalid',
+});
+test.after(() => fs.rmSync(gitIsolation, { recursive: true, force: true }));
 
 const [{
     SKILLS_MANIFEST_FILE,

@@ -31,11 +31,9 @@ export function handleDefaultSkillsCommand(options = []) {
         throw new Error(USAGE);
     }
 
-    // An explicit request takes every default skill of the repository.
     const result = skillsSvc.installDefaultSkills(repoName, {
         only: flags.only,
         skip: flags.skip,
-        consumerSelection: 'all',
     });
 
     console.log(`✓ Installed ${result.skills.length} skill(s) from '${result.repoName}' into ${result.destRoot}:`);

@@ -139,7 +139,7 @@ export function installRepositoryLinks(input, { workspaceRoot = PLOINKY_WORKSPAC
     withSkillExportLocks([...targets.keys()], handles => {
         for (const handle of handles) {
             const published = publishSkillExports(handle, {
-                owner: MARKETPLACE_OWNER, policy: 'additive', mode: 'symlink', linker: exportLink,
+                owner: MARKETPLACE_OWNER, policy: 'additive', linker: exportLink,
                 sources: [...targets.get(handle.root).values()], claude: 'root-strict', exclusions, lock,
             });
             for (const status of published.statuses) statuses.set(status.destination, status);

@@ -7,6 +7,14 @@ import { spawnSync } from 'node:child_process';
 import { syncManagedSkillExports } from '../../cli/utils/skills/exportTransaction.mjs';
 import { createSkillExclusionPlanner } from '../../cli/utils/skills/exportExclusions.mjs';
 
+// The exporter's own Git calls use process.env: never read the global, system
+// or XDG Git policy of this machine.
+const isolation = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'skill-native-lock-env-')));
+delete process.env.PLOINKY_SKILL_EXCLUDES_COMPOSE;
+Object.assign(process.env, { HOME: isolation, XDG_CONFIG_HOME: path.join(isolation, 'xdg'),
+    GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' });
+test.after(() => fs.rmSync(isolation, { recursive: true, force: true }));
+
 function fixture(t) {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'skill-native-lock-')));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -20,7 +28,7 @@ function fixture(t) {
     const initialized = git(['init', '-q']);
     assert.equal(initialized.status, 0, initialized.stderr);
     const config = path.join(repo, '.git', 'config');
-    const sync = () => syncManagedSkillExports({ folder: repo, owner: 'fixture', mode: 'symlink',
+    const sync = () => syncManagedSkillExports({ folder: repo, owner: 'fixture',
         sources: [{ name: 'fixture', path: source }], exclusions: createSkillExclusionPlanner({
             env, containerExecutor: false, gitDirBoundary: root, capability: () => ({ supported: true }),
         }) });

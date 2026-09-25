@@ -257,10 +257,10 @@ function planNonGit(root, patterns, options) {
     let base;
     if (hasMarkers) {
         if (!receipt || sha256(current) !== receipt.after) {
-            return { outcome: { status: 'preserved', mode: 'non-git', code: 'legacy-ignore-block-preserved', reason: `${gitignore} has a Ploinky marker block without a matching write receipt; it is left unchanged. Remove the block by hand to let Ploinky manage it again.` }, artifacts: [] };
+            return { outcome: { status: 'preserved', mode: 'non-git', code: 'unverified-ignore-block-preserved', reason: `${gitignore} has a Ploinky marker block without a matching write receipt; it is left unchanged. Remove the block by hand to let Ploinky manage it again.` }, artifacts: [] };
         }
         base = withoutReceiptBlock(current, receipt);
-        if (base === null) return { outcome: { status: 'preserved', mode: 'non-git', code: 'legacy-ignore-block-preserved', reason: `${gitignore} no longer contains the recorded block exactly once.` }, artifacts: [] };
+        if (base === null) return { outcome: { status: 'preserved', mode: 'non-git', code: 'unverified-ignore-block-preserved', reason: `${gitignore} no longer contains the recorded block exactly once.` }, artifacts: [] };
     } else {
         if (!options.nonGitBlock) return { outcome: { status: 'unchanged', mode: 'non-git' }, artifacts: [] };
         base = current ?? Buffer.alloc(0);
@@ -327,7 +327,7 @@ function planGitInitMigration(identity, git) {
     if (!current || sha256(current) !== receipt.after) return { artifacts: [], warnings: [] };
     const tracked = git(['ls-files', '--error-unmatch', '--', '.gitignore'], { cwd: identity.root }).status === 0;
     if (tracked) {
-        return { artifacts: [], warnings: [{ code: 'legacy-ignore-block-preserved', reason: `${gitignore} is tracked with a Ploinky block; it is repository policy now and is left unchanged.` }] };
+        return { artifacts: [], warnings: [{ code: 'unverified-ignore-block-preserved', reason: `${gitignore} is tracked with a Ploinky block; it is repository policy now and is left unchanged.` }] };
     }
     const base = withoutReceiptBlock(current, receipt);
     if (base === null || (receipt.before !== null && sha256(base) !== receipt.before)) return { artifacts: [], warnings: [] };
@@ -608,18 +608,18 @@ export function assessGeneratedIgnoreState({ repoPath, git = runGit } = {}) {
         if (entry.code !== '??' && staged !== ' ') { preserve('staged-ignore-change-preserved', `${entry.path} has staged changes; commit or unstage them before updating.`); continue; }
         const receipt = readReceipt(path.dirname(file));
         if (!receipt || sha256(current) !== receipt.after) {
-            preserve('legacy-ignore-block-preserved', `${entry.path} contains a Ploinky marker block with no matching write receipt, so it may hold your edits. Inspect it, then commit it or restore it with 'git restore -- ${entry.path}' before updating.`);
+            preserve('unverified-ignore-block-preserved', `${entry.path} contains a Ploinky marker block with no matching write receipt, so it may hold your edits. Inspect it, then commit it or restore it with 'git restore -- ${entry.path}' before updating.`);
             continue;
         }
         const base = withoutReceiptBlock(current, receipt);
-        if (base === null || (receipt.before !== null && sha256(base) !== receipt.before)) { preserve('legacy-ignore-block-preserved', `${entry.path} no longer matches its write receipt.`); continue; }
+        if (base === null || (receipt.before !== null && sha256(base) !== receipt.before)) { preserve('unverified-ignore-block-preserved', `${entry.path} no longer matches its write receipt.`); continue; }
         let target;
         if (entry.code === '??') {
-            if (!receipt.beforeAbsent || base.length) { preserve('legacy-ignore-block-preserved', `${entry.path} is untracked and holds content Ploinky did not write.`); continue; }
+            if (!receipt.beforeAbsent || base.length) { preserve('unverified-ignore-block-preserved', `${entry.path} is untracked and holds content Ploinky did not write.`); continue; }
             target = null;
         } else {
             const index = git(['show', `:0:${entry.path}`], { cwd: top });
-            if (index.status !== 0 || !index.stdout.equals(base)) { preserve('legacy-ignore-block-preserved', `${entry.path} differs from the index beyond the recorded Ploinky block.`); continue; }
+            if (index.status !== 0 || !index.stdout.equals(base)) { preserve('unverified-ignore-block-preserved', `${entry.path} differs from the index beyond the recorded Ploinky block.`); continue; }
             target = index.stdout;
         }
         // Compare before write: the bytes must still be the receipt's bytes.
@@ -627,7 +627,7 @@ export function assessGeneratedIgnoreState({ repoPath, git = runGit } = {}) {
         try {
             if (target !== null) fs.writeFileSync(temporary, target, { flag: 'wx', mode: fs.statSync(file).mode & 0o777 });
             const again = readRegular(file);
-            if (!again || !again.equals(current)) { preserve('legacy-ignore-block-preserved', `${entry.path} changed during assessment.`); continue; }
+            if (!again || !again.equals(current)) { preserve('unverified-ignore-block-preserved', `${entry.path} changed during assessment.`); continue; }
             if (target === null) fs.unlinkSync(file); else fs.renameSync(temporary, file);
         } finally {
             fs.rmSync(temporary, { force: true });
