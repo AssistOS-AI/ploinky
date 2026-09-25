@@ -35,7 +35,6 @@ import {
     PLOINKY_DIR,
     PROFILE_FILE,
     ROUTING_FILE,
-    SECRETS_FILE,
     SERVERS_CONFIG_FILE,
     PLOINKY_WORKSPACE_ROOT,
     PLOINKY_SKILL_SCOPE_ENV
@@ -355,7 +354,6 @@ function addProtectedWorkspaceOverlays(args, options) {
     addReadOnlyOverlay(args, path.join(agentCodePath || '', 'node_modules'), cwd, seen);
     addReadOnlyOverlay(args, CODE_DIR, cwd, seen);
     addReadOnlyOverlay(args, path.join(PLOINKY_DIR, 'seatbelt-runtime'), cwd, seen);
-    addReadOnlyOverlay(args, SECRETS_FILE, cwd, seen);
     addReadOnlyOverlay(args, PROFILE_FILE, cwd, seen);
     addReadOnlyOverlay(args, ROUTING_FILE, cwd, seen);
     addReadOnlyOverlay(args, SERVERS_CONFIG_FILE, cwd, seen);

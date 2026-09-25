@@ -449,8 +449,8 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     assert.match(candidateImageId, /^(?:sha256:)?[a-f0-9]{64}$/);
     assert.equal(fs.existsSync(path.join(harness.workspace, '.ploinky')), true);
     assert.deepEqual(fs.readdirSync(path.join(harness.workspace, '.ploinky')).sort(),
-        ['box', 'master-key'],
-        'image-backed AgentLib creates no source state beside the Box master key and cache root');
+        ['box', 'data'],
+        'image-backed AgentLib creates no source state beside the Box controller-state and cache roots');
     assert.equal(fs.existsSync(path.join(harness.child, '.ploinky')), false);
     // Workspace-backed persistence: both cache directories exist on the real
     // host, back the Box through exact bind mounts, and no named volume exists.
@@ -546,7 +546,7 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     assert.equal(directExternal.ok, true, directExternal.stderr);
     assert.match(directExternal.stdout, /host-visible\.txt/);
 
-    const masterKeyPath = path.join(harness.identity.workspaceRoot, '.ploinky', 'master-key');
+    const masterKeyPath = path.join(harness.identity.workspaceRoot, '.ploinky', 'data', 'master-key');
     const keyEvidence = execInBox(harness.runner, prepared.containerId, [
         'bash', '-c', 'stat -c %a "$1"; sha256sum "$1"', 'bash', masterKeyPath,
     ]).split(/\n/);
@@ -784,7 +784,8 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     // listing: `box` is gone and every other named entry survives.
     const anchorEntries = fs.readdirSync(path.join(harness.workspace, '.ploinky'));
     assert.equal(anchorEntries.includes('box'), false);
-    for (const kept of ['master-key', 'unrelated.json', 'from-agent.txt']) {
+    assert.equal(fs.existsSync(path.join(harness.workspace, '.ploinky', 'data', 'master-key')), true);
+    for (const kept of ['data', 'unrelated.json', 'from-agent.txt']) {
         assert.equal(anchorEntries.includes(kept), true, `.ploinky/${kept} must survive`);
     }
     assert.equal(fs.readFileSync(

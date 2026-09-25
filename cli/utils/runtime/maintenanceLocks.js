@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'crypto';
 import os from 'os';
 import { execFileSync } from 'child_process';
@@ -18,9 +19,11 @@ const WORKSPACE_START_LOCK_PATH = path.join(RUNNING_DIR, 'workspace-start.json')
 const WORKSPACE_START_TTL_MS = 24 * 60 * 60 * 1000;
 const LOCK_STALE_GRACE_MS = 5_000;
 const OWNED_WORKSPACE_LEASES = new WeakSet();
-// Leases this process created and has not released, so nested lifecycle code
-// can reuse the exact held lease instead of blindly reacquiring it.
-const LIVE_OWNED_WORKSPACE_LEASES = new Set();
+// The lease of the operation this asynchronous call chain belongs to. Nested
+// lifecycle code reuses only that exact lease. A lease held by an unrelated
+// concurrent operation in the same process (a Router publication, a watchdog
+// restart, a policy write) is not this operation's, so it is never reused.
+const WORKSPACE_LEASE_CONTEXT = new AsyncLocalStorage();
 
 function lockPathFor(containerName) {
     // Direct replacement candidates use an immutable physical name so the
@@ -209,7 +212,6 @@ function createWorkspaceMutationLease({
         throw error;
     }
     OWNED_WORKSPACE_LEASES.add(lock);
-    LIVE_OWNED_WORKSPACE_LEASES.add(lock);
     return lock;
 }
 
@@ -267,7 +269,7 @@ async function withWorkspaceMutationLease(options, fn) {
     const lease = await acquireWorkspaceMutationLease(options);
     let callbackError = null;
     try {
-        return await fn(lease);
+        return await runWithWorkspaceMutationLease(lease, () => fn(lease));
     } catch (error) {
         callbackError = error;
         throw error;
@@ -326,7 +328,6 @@ function releaseWorkspaceStartLock(lock) {
         || (snapshot?.lock?.requireQuiescenceOnOwnerDeath && !workspaceOwnerIsActive(snapshot.lock))) return false;
     const removed = removeSnapshot(snapshot, lock.token);
     if (removed) OWNED_WORKSPACE_LEASES.delete(lock);
-    if (removed) LIVE_OWNED_WORKSPACE_LEASES.delete(lock);
     return removed;
 }
 
@@ -356,9 +357,10 @@ function retainWorkspaceMutationLeaseForRecovery({ token, operation }, reason = 
 }
 
 /**
- * Run under this process's held workspace mutation lease, or acquire one with
- * the bounded wait. Callers acquire it before any maintenance lock, so a
- * command never holds a maintenance lock while waiting for the workspace.
+ * Run under the workspace mutation lease this operation already holds, or
+ * acquire one with the bounded wait. Callers acquire it before any
+ * maintenance lock, so a command never holds a maintenance lock while waiting
+ * for the workspace.
  */
 async function withHeldOrAcquiredWorkspaceMutationLease(options, fn) {
     const held = heldWorkspaceMutationLease();
@@ -367,18 +369,30 @@ async function withHeldOrAcquiredWorkspaceMutationLease(options, fn) {
 }
 
 /**
- * The workspace mutation lease this process currently holds, validated
- * against the live lock file, or null. Never acquires anything.
+ * The workspace mutation lease the current operation holds, validated against
+ * the live lock file, or null. Never acquires anything.
  */
 function heldWorkspaceMutationLease() {
-    for (const lease of LIVE_OWNED_WORKSPACE_LEASES) {
-        try {
-            return assertWorkspaceMutationLease(lease);
-        } catch (_) {
-            // Released out of band or replaced: not held any more.
-        }
+    const lease = WORKSPACE_LEASE_CONTEXT.getStore();
+    if (!lease) return null;
+    try {
+        return assertWorkspaceMutationLease(lease);
+    } catch (_) {
+        // Released or replaced: not held any more. A released lease never
+        // becomes valid again, so work that outlives its operation (a timer
+        // created inside it) cannot reuse it.
+        return null;
     }
-    return null;
+}
+
+/**
+ * Run `fn` as part of the operation that owns `lease`, so nested lifecycle
+ * code reuses it. Owners that acquire without `withWorkspaceMutationLease`
+ * bind their own lease here. Validity is checked at each reuse, not here.
+ */
+function runWithWorkspaceMutationLease(lease, fn) {
+    if (typeof fn !== 'function') throw new TypeError('workspace mutation lease requires a callback');
+    return WORKSPACE_LEASE_CONTEXT.run(lease, fn);
 }
 
 const releaseWorkspaceMutationLease = releaseWorkspaceStartLock;
@@ -497,6 +511,7 @@ export {
     releaseWorkspaceMutationLease,
     retainWorkspaceMutationLeaseForRecovery,
     renewWorkspaceMutationLease,
+    runWithWorkspaceMutationLease,
     removeMaintenanceLock,
     withMaintenanceLock,
     withWorkspaceMutationLease,

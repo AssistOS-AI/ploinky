@@ -69,6 +69,7 @@ test('restarts settle earlier no-wait workers and a stopped start preparation be
     ]);
     assertOrdered(sliceBetween(workspaceSource, 'async function settleWorkspaceBeforeRestart(', '\n}\n'), [
         "await acquireSettledWorkspaceMutationLease({ operation: 'workspace-restart' })",
+        'runWithWorkspaceMutationLease(workspaceMutationLease',
         'withNetworkLifecycleLockReclaimingStoppedOwner(',
         'retireAbandonedWorkspaceStartPreparation({',
         'releaseWorkspaceMutationLease(workspaceMutationLease)',
@@ -86,6 +87,7 @@ test('stop retires a stopped start preparation only before its own selector rewr
     const helper = sliceBetween(workspaceSource, 'function retireAbandonedStartPreparationBeforeStop(', '\n}\n');
     assertOrdered(helper, [
         "createWorkspaceMutationLease({ operation: 'workspace-stop' })",
+        'runWithWorkspaceMutationLease(workspaceMutationLease',
         'withNetworkLifecycleLockReclaimingStoppedOwner(retire)',
     ]);
     assert.doesNotMatch(helper, /acquireWorkspaceMutationLease|withWorkspaceMutationLease/,

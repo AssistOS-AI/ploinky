@@ -69,7 +69,9 @@ if (!process.env.PLOINKY_CWD) {
 export const PLOINKY_DIR = path.join(PLOINKY_WORKSPACE_ROOT, '.ploinky');
 export const REPOS_DIR = path.join(PLOINKY_DIR, 'repos');
 export const AGENTS_FILE = path.join(PLOINKY_DIR, 'agents.json');
-export const SECRETS_FILE = path.join(PLOINKY_DIR, '.secrets');
+// Controller-only state: agent runtimes mask `.ploinky/data` entirely.
+export const CONTROLLER_STATE_DIR = path.join(PLOINKY_DIR, 'data');
+export const SECRETS_FILE = path.join(CONTROLLER_STATE_DIR, '.secrets');
 export const PROFILE_FILE = path.join(PLOINKY_DIR, 'profile');
 export const AGENTS_DATA_DIR = path.join(PLOINKY_WORKSPACE_ROOT, '.data');
 

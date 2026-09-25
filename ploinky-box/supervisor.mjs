@@ -45,6 +45,7 @@ import {
     normalizeBoxAgentLib,
 } from './contract/agentlib.mjs';
 import {
+    assertBoxPloinkySource,
     observeContainerRouterBinding,
     validateContainerConfiguration,
     validateContainerPublications,
@@ -2424,9 +2425,28 @@ export function createBoxSupervisor({
         });
     }
 
+    /**
+     * Read-only preflight for a full update, before the host self-update pulls
+     * this command's checkout: an owned Box that runs Ploinky from another
+     * checkout refuses here, so a command that will be refused changes no
+     * source. Anything short of that positive evidence is left to the locked
+     * reconciliation, which remains the authoritative check.
+     */
+    function assertUpdateSourceMatchesBox(identity = resolveIdentity()) {
+        let ownership;
+        try {
+            ownership = inspect(identity);
+        } catch (_) {
+            return;
+        }
+        if (ownership?.state !== 'owned') return;
+        assertBoxPloinkySource(ownership.handles?.container?.runtime, repositoryRoot);
+    }
+
     return Object.freeze({
         resolveWorkspaceIdentity: () => resolveIdentity(),
         inspectUpdateState,
+        assertUpdateSourceMatchesBox,
         prepareBoxForCommand,
         runStartTransaction,
         runRestartTransaction,

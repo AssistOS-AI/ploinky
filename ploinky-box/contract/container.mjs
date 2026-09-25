@@ -190,7 +190,7 @@ function publicationError(message) {
 // command from another checkout never adopts it; it names both checkouts
 // before any other comparison so the mismatch is not reported as an opaque
 // security-option or mount difference.
-function assertBoxPloinkySource(runtime, repositoryRoot) {
+export function assertBoxPloinkySource(runtime, repositoryRoot) {
     const sources = Array.isArray(runtime?.mounts)
         ? runtime.mounts.filter((mount) => mount?.destination === '/opt/ploinky').map((mount) => mount.source)
         : [];

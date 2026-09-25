@@ -39,6 +39,8 @@ function startFixture(t) {
     const earlyLease = Object.freeze({ mode: 'replace', tag: 'early-prelaunch-lease' });
     const postProviderLease = Object.freeze({ mode: 'replace', preparedGeneration: 'g2', tag: 'post-provider-lease' });
     const workspaceLease = Object.freeze({ tag: 'workspace-mutation-lease' });
+    // The lease start binds as its operation's own, for nested reuse.
+    let boundLease = null;
     const networkCapability = Object.freeze({ tag: 'network-capability' });
     const stalledNoWaitRuns = [];
     const preparedRecord = Object.freeze({ ...registration(), instanceId: 'prepared-instance', enableGeneration: 'prepared-generation' });
@@ -76,6 +78,7 @@ function startFixture(t) {
             getAgentContainerName: () => CONTAINER,
             ensureAgentService(agentName, manifest, suppliedAgentPath, options) {
                 calls.push(['ensureAgentService', agentName, suppliedAgentPath, options]);
+                calls.push(['ensureBoundLease', boundLease === workspaceLease]);
                 return ensureResult;
             },
             cleanupExactAgentRuntimeCandidate: (candidate) => calls.push(['cleanupCandidate', candidate]),
@@ -89,6 +92,10 @@ function startFixture(t) {
         acquireSettledWorkspaceMutationLease: async (options) => { calls.push(['acquireLease', options.operation]); return workspaceLease; },
         inspectStalledNoWaitWorkers: () => { calls.push(['inspectStalled']); return stalledNoWaitRuns; },
         releaseWorkspaceStartLock: (lease) => calls.push(['releaseLease', lease === workspaceLease]),
+        runWithWorkspaceMutationLease: async (lease, fn) => {
+            boundLease = lease;
+            try { return await fn(); } finally { boundLease = null; }
+        },
         withNetworkLifecycleLockReclaimingStoppedOwner: async (callback) => callback(networkCapability),
         assertWorkspaceGraphAdmissionsCurrent: () => {},
         resolveWorkspaceGraphSsoConfig: () => null,
@@ -210,6 +217,8 @@ test('workspace start launches each graph runtime with its prepared registry rec
     assert.equal(options.enableGeneration, fixture.preparedRecord.enableGeneration);
     assert.equal(options.networkLifecycleCapability, fixture.networkCapability);
     assert.equal(options.forceRecreate, false);
+    assert.deepEqual(fixture.calls.filter(([name]) => name === 'ensureBoundLease'), [['ensureBoundLease', true]],
+        'the runtime is ensured inside the start operation that owns the workspace lease');
 
     // The same lease commits the graph, with the runtime's exact record.
     const commits = fixture.calls.filter(([name, opts]) => name === 'mergeRoutingConfig' && opts?.reason === 'workspace-runtime-graph-ready');

@@ -64,7 +64,7 @@ test('detailed lifecycle help preserves the selected host or core scope', () => 
     assert.match(hostDestroy, /destroy --delete-cache/i);
     assert.match(hostDestroy, /both forms run without prompting/i);
     assert.match(hostDestroy, /\.ploinky\/box\/dependencies and \.ploinky\/box\/images/i);
-    assert.match(hostDestroy, /\.ploinky\/master-key.*are never deleted/i);
+    assert.match(hostDestroy, /\.ploinky\/data\/master-key.*are never deleted/i);
     // Nested state is disposable now; help must not promise it is retained.
     assert.match(hostDestroy, /nested agents are stopped through the in-box helper/i);
     assert.match(hostDestroy, /persistent agent data must use workspace binds/i);

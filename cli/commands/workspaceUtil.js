@@ -65,6 +65,7 @@ import {
   createWorkspaceMutationLease,
   releaseWorkspaceMutationLease,
   releaseWorkspaceStartLock,
+  runWithWorkspaceMutationLease,
   withMaintenanceLock,
   withWorkspaceMutationLease,
 } from '../utils/runtime/maintenanceLocks.js';
@@ -228,7 +229,7 @@ function createAppendLogStdio(logFile) {
 
 // Resolve the env handed to the Watchdog (and, by inheritance, to the
 // RoutingServer it spawns and respawns). Merge order mirrors
-// secretInjector.getSecret(): walked-up `.env` -> `.ploinky/.secrets` ->
+// secretInjector.getSecret(): walked-up `.env` -> `.ploinky/data/.secrets` ->
 // `process.env`, with operator-exported values winning. This way the router
 // stays able to forward LLM/auth secrets to handlers across crash-restart
 // cycles without depending on the operator having `export`'d each one. Managed
@@ -2047,9 +2048,11 @@ async function startWorkspace(staticAgentArg, portArg, {
   let workspacePreparationLease = null;
   const workspaceRuntimeCandidates = [];
   try {
-  // A rollback start can follow a killed start at once: wait out only that
-  // dead owner's stale network-lock grace, never a live owner.
-  return await withNetworkLifecycleLockReclaimingStoppedOwner(async (networkLifecycleCapability) => {
+  // Everything below is this start's own work: nested lifecycle code reuses
+  // this lease, and nothing else in the process can. A rollback start can
+  // follow a killed start at once: wait out only that dead owner's stale
+  // network-lock grace, never a live owner.
+  return await runWithWorkspaceMutationLease(workspaceStartLock, () => withNetworkLifecycleLockReclaimingStoppedOwner(async (networkLifecycleCapability) => {
   try {
   assertWorkspaceGraphAdmissionsCurrent(admittedStart.admissions);
   // Earlier no-wait workers still alive here cannot progress (a stop or a
@@ -2708,7 +2711,7 @@ async function startWorkspace(staticAgentArg, portArg, {
     }
     throw new Error(`start (workspace) failed: ${message}`);
   }
-  });
+  }));
   } finally {
     releaseWorkspaceStartLock(workspaceStartLock);
   }
@@ -2725,17 +2728,20 @@ async function settleWorkspaceBeforeRestart() {
   const workspaceMutationLease = await acquireSettledWorkspaceMutationLease({ operation: 'workspace-restart' });
   let callbackError = null;
   try {
-    return withNetworkLifecycleLockReclaimingStoppedOwner((networkLifecycleCapability) => {
-      const result = retireAbandonedWorkspaceStartPreparation({
-        workspaceRoot: PLOINKY_WORKSPACE_ROOT,
-        workspaceMutationLease,
-        networkLifecycleCapability,
-      });
-      if (result.retired) {
-        console.log(`[restart] Retired the routing preparation of stopped workspace start pid ${result.pid}.`);
-      }
-      return result;
-    });
+    // Bound as this restart's own lease, like every lease owner without a callback.
+    return runWithWorkspaceMutationLease(workspaceMutationLease, () => (
+      withNetworkLifecycleLockReclaimingStoppedOwner((networkLifecycleCapability) => {
+        const result = retireAbandonedWorkspaceStartPreparation({
+          workspaceRoot: PLOINKY_WORKSPACE_ROOT,
+          workspaceMutationLease,
+          networkLifecycleCapability,
+        });
+        if (result.retired) {
+          console.log(`[restart] Retired the routing preparation of stopped workspace start pid ${result.pid}.`);
+        }
+        return result;
+      })
+    ));
   } catch (error) {
     callbackError = error;
     throw error;
@@ -2783,7 +2789,9 @@ function retireAbandonedStartPreparationBeforeStop({ log = (message) => console.
     });
     // A killed start leaves its network lock behind, reclaimable once the
     // stale-owner grace has passed. Wait out that grace, never a live owner.
-    const result = withNetworkLifecycleLockReclaimingStoppedOwner(retire);
+    const result = runWithWorkspaceMutationLease(workspaceMutationLease, () => (
+      withNetworkLifecycleLockReclaimingStoppedOwner(retire)
+    ));
     if (result.retired) {
       log(`[stop] Retired the routing preparation of stopped workspace start pid ${result.pid}.`);
     }

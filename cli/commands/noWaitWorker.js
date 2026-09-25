@@ -4,7 +4,7 @@ import { retireRuntimeCandidate } from '../sandbox/runtimeCandidateStore.js';
 //
 // The script is invoked via `node noWaitWorker.js --container <name> ...` from
 // `startWorkspace` and inherits the workspace cwd and environment. In a managed
-// Box, cryptographic operations resolve the key from `.ploinky/master-key`; the
+// Box, cryptographic operations resolve the key from `.ploinky/data/master-key`; the
 // key is not inherited as an environment variable. The worker writes:
 //   - one run-scoped log stream at
 //     .ploinky/logs/no-wait/<container>.<runId>.log (stdout+stderr), created

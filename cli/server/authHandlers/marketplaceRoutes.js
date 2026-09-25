@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { withWorkspaceMutationLease } from '../../utils/runtime/maintenanceLocks.js';
+import { assertWorkspaceMutationLease, withWorkspaceMutationLease } from '../../utils/runtime/maintenanceLocks.js';
 import { installRepositoryLinks, removeRepositoryLinks } from '../../utils/repositoryInstall.mjs';
 
 import { PLOINKY_DIR } from '../../utils/config.js';
@@ -227,13 +227,41 @@ export async function enableMarketplaceAgent(body, {
     return { ref, mode, result };
 }
 
-async function disableMarketplaceAgentsForRepo(repoName) {
+async function disableMarketplaceAgentsForRepo(repoName, dependencies = {}) {
     const targetRepo = String(repoName || '').trim();
     if (!targetRepo) return [];
     const containerNames = Object.entries(workspaceSvc.loadAgents())
         .filter(([, record]) => record && record.type === 'agent' && record.repoName === targetRepo && record.agentName)
         .map(([containerName]) => containerName);
-    return agentsSvc.disableAgentContainers(containerNames);
+    return agentsSvc.disableAgentContainers(containerNames, dependencies);
+}
+
+// A repository uninstall is one workspace mutation. Target resolution, agent
+// selection, their disable and the source removal all run under one lease, so
+// no enable, publication or repository change interleaves with them, and a
+// repository with no enabled agent is serialized too. The nested disable runs
+// under exactly this lease and fails closed if it is no longer live.
+export async function uninstallMarketplaceRepository(body, {
+    workspaceLeaseWaitMs,
+    agentDisableDependencies = {},
+} = {}) {
+    const target = String(body?.target || body?.name || '').trim();
+    const leaseOptions = workspaceLeaseWaitMs === undefined
+        ? { operation: 'repositories-uninstall' }
+        : { operation: 'repositories-uninstall', waitTimeoutMs: workspaceLeaseWaitMs };
+    return withWorkspaceMutationLease(leaseOptions, async (lease) => {
+        const repoName = reposSvc.resolveInstalledRepoTarget(target);
+        assertWorkspaceMutationLease(lease);
+        const disabledAgents = await disableMarketplaceAgentsForRepo(repoName, {
+            ...agentDisableDependencies,
+            withWorkspaceLeaseImpl: (_options, fn) => fn(assertWorkspaceMutationLease(lease)),
+        });
+        assertWorkspaceMutationLease(lease);
+        return {
+            ...reposSvc.uninstallRepo(repoName, { stdio: 'pipe' }),
+            disabledAgents
+        };
+    });
 }
 
 function normalizeMarketplaceContainerSegment(value) {
@@ -524,6 +552,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
             }
         },
     }),
+    uninstallRepositoryAction = (body) => uninstallMarketplaceRepository(body),
 } = {}) {
     const route = parseMarketplacePath(parsedUrl.pathname || '/');
     if (!route) return false;
@@ -635,13 +664,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
             }
 
             if (action === 'uninstall_repo') {
-                const target = String(body?.target || body?.name || '').trim();
-                const repoName = reposSvc.resolveInstalledRepoTarget(target);
-                const disabledAgents = await disableMarketplaceAgentsForRepo(repoName);
-                const result = {
-                    ...reposSvc.uninstallRepo(repoName, { stdio: 'pipe' }),
-                    disabledAgents
-                };
+                const result = await uninstallRepositoryAction(body);
                 sendJson(res, 200, {
                     ok: true,
                     action,

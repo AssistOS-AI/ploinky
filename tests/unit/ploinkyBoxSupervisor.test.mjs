@@ -84,7 +84,8 @@ function seedBoxCache(identity) {
     fs.mkdirSync(identity.dataPaths.dependencies, { recursive: true });
     fs.mkdirSync(identity.dataPaths.images, { recursive: true });
     fs.writeFileSync(path.join(identity.dataPaths.images, 'layer'), 'image data');
-    fs.writeFileSync(path.join(identity.anchorPath, 'master-key'), 'secret');
+    fs.mkdirSync(path.join(identity.anchorPath, 'data'), { recursive: true });
+    fs.writeFileSync(path.join(identity.anchorPath, 'data', 'master-key'), 'secret');
     return identity.dataPaths;
 }
 
@@ -692,7 +693,7 @@ test('explicit cache deletion happens only after the outer container is removed'
     assert.equal(boxCacheExists(identity), false);
     assert.equal(fs.existsSync(identity.boxDataRoot), false);
     // Unrelated workspace state is never touched.
-    assert.equal(fs.readFileSync(path.join(identity.anchorPath, 'master-key'), 'utf8'), 'secret');
+    assert.equal(fs.readFileSync(path.join(identity.anchorPath, 'data', 'master-key'), 'utf8'), 'secret');
     assert.equal(events.some((value) => value.includes('volume')), false);
 });
 
