@@ -365,6 +365,30 @@ test('deployment lifecycle failures suggest explicit diagnosis once without swal
     }
 });
 
+test('a busy workspace lock does not suggest diagnosis; other lock failures still do', async () => {
+    for (const [failure, hint] of [
+        [{ message: 'Timed out waiting for mutation lock', workspaceTransactionStarted: false, lockBusy: true }, ''],
+        [{ message: 'Lock path component is not owned by the current user', workspaceTransactionStarted: false },
+            'Run ploinky diagnose from this workspace for prerequisite, storage, and security-profile diagnostics.\n'],
+    ]) {
+        const thrown = Object.assign(new Error(failure.message), failure);
+        const errorOutput = bufferStream();
+        const supervisor = fakeSupervisor([]);
+        supervisor.runUpdateTransaction = async () => { throw thrown; };
+        await assert.rejects(runOuterCli(['update'], {
+            cwd: () => supervisor.resolveWorkspaceIdentity().workspaceRoot,
+            env: {},
+            input: {},
+            output: bufferStream(),
+            errorOutput,
+            supervisor,
+            detectInsideBox: () => false,
+            updateHostSource: async () => ({ updated: false }),
+        }), error => error === thrown);
+        assert.equal(errorOutput.value(), hint, failure.message);
+    }
+});
+
 test('nonzero prepared execution keeps its exit code and suggests diagnosis only on failure', async () => {
     for (const status of [0, 17]) {
         for (const argv of [['cli'], ['cli', 'Agent'], ['list', 'agents']]) {
@@ -1005,14 +1029,17 @@ test('update failure wording follows the transaction activation outcome', async 
     for (const [activation, wording] of [
         [{ outcome: 'preserved' }, /left as it was/],
         [{ outcome: 'restored' }, /reconstruction of the previous Box and graph configuration was attempted and passed/],
-        [{ outcome: 'recovery-required' }, /manual recovery is required/],
+        [{ outcome: 'recovery-required' }, /recover it from this workspace with `ploinky stop`, then `ploinky start`/],
         [undefined, /activation outcome could not be determined/],
+        // The workspace lock was never acquired: nothing in the workspace started.
+        ['lock-not-acquired', /Update did not start in this workspace: its mutation lock could not be acquired/],
     ]) {
         const events = [];
         const supervisor = fakeSupervisor(events, { statusState: 'absent' });
         supervisor.runUpdateTransaction = async () => {
             events.push('update-failed');
-            throw Object.assign(new Error('candidate update failed'), activation ? { activation } : {});
+            throw Object.assign(new Error('candidate update failed'), activation === 'lock-not-acquired'
+                ? { workspaceTransactionStarted: false } : activation ? { activation } : {});
         };
         const output = bufferStream();
         await assert.rejects(

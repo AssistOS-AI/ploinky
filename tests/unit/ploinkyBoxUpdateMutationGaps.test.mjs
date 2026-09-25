@@ -348,6 +348,9 @@ test('an overlapping update that cannot get the real mutation lock in time is re
         await assert.rejects(second.supervisor.runUpdateTransaction(['update']), (error) => {
             assert.equal(error.code, 'PLOINKY_BOX_LOCK_FAILED');
             assert.match(error.message, /Timed out waiting for mutation lock/);
+            assert.match(error.message, new RegExp(`Another Ploinky command \\(pid ${process.pid} on `), 'the holder is named');
+            assert.equal(error.workspaceTransactionStarted, false, 'the refusal says the transaction never started');
+            assert.equal(error.lockBusy, true, 'the refusal names a busy lock');
             return true;
         });
         assert.deepEqual(timeline, ['first:start'], 'the refused update never started its in-Box update');

@@ -91,6 +91,19 @@ function parseOwner(ownerPath, fsApi) {
     };
 }
 
+// Names the holder when its owner record can be read.
+function lockBusyError(lockPath, ownerPath, fsApi) {
+    let holder = '';
+    try {
+        const { owner } = parseOwner(ownerPath, fsApi);
+        holder = ` (pid ${owner.pid} on ${owner.hostname}, since ${owner.startedAt})`;
+    } catch {}
+    const error = lockError(`Timed out waiting for mutation lock: ${lockPath}. Another Ploinky command${holder} `
+        + 'holds it. Run the command again after that command finishes.');
+    error.lockBusy = true;
+    return error;
+}
+
 function ownerUnchanged(ownerPath, fingerprint, fsApi) {
     const stat = fsApi.lstatSync(ownerPath);
     if (stat.isSymbolicLink() || !stat.isFile()) {
@@ -237,7 +250,7 @@ export function createMutationLockManager({
                     continue;
                 }
                 if (Date.now() >= deadline) {
-                    throw lockError(`Timed out waiting for mutation lock: ${lockPath}`);
+                    throw lockBusyError(lockPath, ownerPath, fsApi);
                 }
                 await delay(retryMs);
             }
@@ -270,7 +283,14 @@ export async function withWorkspaceMutationLock({
             throw lockError(`Workspace identity lock handoff cycle detected at ${identity.instance}`);
         }
         visited.add(identity.instance);
-        const lock = await lockManager.acquire(identity.instance);
+        let lock;
+        try {
+            lock = await lockManager.acquire(identity.instance);
+        } catch (error) {
+            // Nothing runs before this lock is held: the transaction never started.
+            error.workspaceTransactionStarted = false;
+            throw error;
+        }
         let released = false;
         try {
             const resolvedUnderLock = resolveIdentity();

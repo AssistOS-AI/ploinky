@@ -219,7 +219,8 @@ export async function runOuterCli(argv, options = {}) {
         }
         return exitCode;
     } catch (error) {
-        if (DEPLOYMENT_ROUTES.has(route.kind)) {
+        // Another command holding the lock is not a deployment problem to diagnose.
+        if (DEPLOYMENT_ROUTES.has(route.kind) && error?.lockBusy !== true) {
             errorOutput.write(`${DEPLOYMENT_DIAGNOSTIC_HINT}\n`);
         }
         throw error;
@@ -437,7 +438,7 @@ const UPDATE_ACTIVATION_WORDING = Object.freeze({
     restored: 'Activation blocked; reconstruction of the previous Box and graph configuration was attempted and '
         + 'passed its checks. It runs from the current checkouts: sources that were already pulled are not rolled back.',
     'recovery-required': 'Activation blocked and the previous workspace graph could not be fully reconstructed; '
-        + 'manual recovery is required.',
+        + 'recover it from this workspace with `ploinky stop`, then `ploinky start`.',
 });
 
 const UPDATE_FAILURE_WORDING = Object.freeze({
@@ -446,7 +447,9 @@ const UPDATE_FAILURE_WORDING = Object.freeze({
     restored: 'Update failed; reconstruction of the previous Box and graph configuration was attempted and '
         + 'passed its checks. It runs from the current checkouts: sources that were already pulled are not rolled back.',
     'recovery-required': 'Update failed and the previous workspace state could not be fully reconstructed; '
-        + 'manual recovery is required.',
+        + 'recover it from this workspace with `ploinky stop`, then `ploinky start`.',
+    'not-started': 'Update did not start in this workspace: its mutation lock could not be acquired, '
+        + 'so the workspace graph and its registered repositories were left as they were.',
 });
 
 function describeRecord(record) {
@@ -670,7 +673,7 @@ async function runHostUpdate({
             hostRecords,
         });
     } catch (error) {
-        const outcome = error?.activation?.outcome;
+        const outcome = error?.workspaceTransactionStarted === false ? 'not-started' : error?.activation?.outcome;
         // A thrown transaction is never reported as complete, whatever
         // verified records preceded it.
         const failed = buildUpdateResult({
