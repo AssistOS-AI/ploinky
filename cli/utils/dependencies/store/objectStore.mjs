@@ -73,6 +73,37 @@ function writeJsonAtomic(file, value, fsApi, mode = 0o644) {
     writeFileAtomic(file, `${JSON.stringify(value, null, 2)}\n`, { fsApi, mode });
 }
 
+/**
+ * Why a build receipt does not prove that this workspace's store owns the
+ * object it names, or ''. Only an owned receipt may authorize reclaiming an
+ * incomplete object or removing the receipt itself.
+ */
+export function buildReceiptOwnershipProblem(receipt, { objectId, workspaceId, objectsDir }) {
+    if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt)) return 'build receipt is unreadable';
+    if (receipt.kind !== 'build') return `build receipt kind is ${JSON.stringify(receipt.kind ?? null)}`;
+    if (receipt.workspaceId !== workspaceId) return 'build receipt belongs to another workspace';
+    if (receipt.receiptId !== objectId) return 'build receipt id does not name this object';
+    if (receipt.objectPath !== path.join(objectsDir, String(objectId))) return 'build receipt names another object path';
+    return '';
+}
+
+const REBUILD_DESIRED_STATUSES = new Set(['pending', 'failed']);
+
+/** Why a rebuild state record is not exactly what updateRebuildState writes, or ''. */
+function rebuildStateProblem(value, registration) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return 'not a JSON object';
+    if (value.schema !== 1) return `schema ${JSON.stringify(value.schema ?? null)} is not 1`;
+    if (value.registration !== registration) return 'registration does not match its file';
+    if (!Number.isSafeInteger(value.revision) || value.revision < 1) return 'revision is not a positive integer';
+    if (value.admittedToken !== null && typeof value.admittedToken !== 'string') return 'admitted token is invalid';
+    const desired = value.desired;
+    if (desired !== null && (!desired || typeof desired !== 'object' || Array.isArray(desired)
+        || typeof desired.token !== 'string' || !REBUILD_DESIRED_STATUSES.has(desired.status))) {
+        return 'desired request is invalid';
+    }
+    return '';
+}
+
 function stageError(error, stage) {
     if (error && typeof error === 'object' && !error.stage) error.stage = stage;
     return error;
@@ -204,6 +235,24 @@ export function createCacheStore({
         return true;
     }
 
+    const buildReceiptOwnership = (receipt, objectId) => buildReceiptOwnershipProblem(receipt, { objectId, workspaceId, objectsDir: paths.objects });
+
+    /** A present build receipt file: its parsed value, whether it is ours, and its quiescence. */
+    function inspectBuildReceipt(objectId) {
+        const parsed = readJson(path.join(paths.buildReceipts, `${objectId}.json`), fsApi);
+        if (parsed.missing) return null;
+        const receipt = parsed.value ?? null;
+        const ownership = buildReceiptOwnership(receipt, objectId);
+        const quiescence = ownership
+            ? { quiescent: false, reason: `ownership unproven: ${ownership}` }
+            : proveBuildQuiescent(receipt);
+        return {
+            receipt,
+            ownership,
+            summary: { state: receipt?.state ?? null, installer: receipt?.installer ?? null, quiescence, owned: !ownership },
+        };
+    }
+
     function writeBuildReceipt(receipt) {
         writeJsonAtomic(path.join(paths.buildReceipts, `${receipt.receiptId}.json`), receipt, fsApi);
     }
@@ -268,10 +317,18 @@ export function createCacheStore({
         requireLease(lease);
         const handle = writeReaderReceipt(generation, { ...consumer, phase: consumer?.phase || 'attached' });
         const validation = validateObject(generation.objectId, { inputKey: generation.inputKey });
-        if (!validation.valid) {
+        // The caller's recorded paths and generation must be exactly the
+        // validated object's; a record naming anything else is never exposed.
+        let problem = validation.valid ? '' : validation.reason;
+        if (!problem && validation.generationId !== generation.generationId) problem = 'generation id differs from the validated object';
+        if (!problem && path.resolve(String(generation.payloadPath || '')) !== validation.payloadPath) problem = 'payload path differs from the validated object';
+        if (!problem && path.resolve(String(generation.nodeModulesPath || '')) !== path.join(validation.payloadPath, 'node_modules')) {
+            problem = 'node_modules path differs from the validated object';
+        }
+        if (problem) {
             releaseReaderReceipt(handle);
             throw dependencyStoreError('PLOINKY_DEPS_GENERATION_INVALID',
-                `admitted dependency generation ${String(generation.generationId || '').slice(0, 12)} is not usable: ${validation.reason}`);
+                `admitted dependency generation ${String(generation.generationId || '').slice(0, 12)} is not usable: ${problem}; restart the service first`);
         }
         return handle;
     }
@@ -285,18 +342,25 @@ export function createCacheStore({
      * The ADMITTED token feeds ordinary lifecycle keys; the DESIRED request is
      * retryable and only a reinstall acts on it.
      */
-    function readRebuildState(registration) {
-        const value = readJson(rebuildFile(registration), fsApi).value;
-        if (!value || value.registration !== String(registration || '')) {
-            return { schema: 1, registration: String(registration || ''), revision: 0, admittedToken: null, desired: null };
+    // A missing file is "no state"; anything present must be exactly what
+    // updateRebuildState writes, or it is refused (never defaulted and then
+    // overwritten, and never dropped from the collector's root set).
+    function readRebuildStateFile(file, registration) {
+        const parsed = readJson(file, fsApi);
+        if (parsed.missing) return null;
+        const problem = parsed.corrupt ? `unreadable: ${parsed.corrupt}` : rebuildStateProblem(parsed.value, registration);
+        if (problem) {
+            throw dependencyStoreError('PLOINKY_DEPS_REBUILD_STATE_CORRUPT',
+                `dependency rebuild state ${file} is unusable (${problem}); refusing to use or overwrite it`);
         }
-        return {
-            schema: 1,
-            registration: value.registration,
-            revision: Number.isSafeInteger(value.revision) ? value.revision : 0,
-            admittedToken: typeof value.admittedToken === 'string' ? value.admittedToken : null,
-            desired: value.desired && typeof value.desired.token === 'string' ? value.desired : null,
-        };
+        const value = parsed.value;
+        return { schema: 1, registration, revision: value.revision, admittedToken: value.admittedToken, desired: value.desired };
+    }
+
+    function readRebuildState(registration) {
+        const name = String(registration || '');
+        return readRebuildStateFile(rebuildFile(name), name)
+            || { schema: 1, registration: name, revision: 0, admittedToken: null, desired: null };
     }
 
     /** The admitted rebuild token of one logical registration. */
@@ -321,9 +385,16 @@ export function createCacheStore({
 
     /** Every registration with a pending or failed desired rebuild request. */
     function listRebuildStates() {
-        return safeReaddir(path.join(root, 'state', 'rebuild'))
-            .map((name) => readJson(path.join(root, 'state', 'rebuild', name), fsApi).value)
-            .filter((value) => value && typeof value.registration === 'string');
+        const directory = path.join(root, 'state', 'rebuild');
+        return safeReaddir(directory)
+            .map((name) => {
+                const file = path.join(directory, name);
+                const registration = readJson(file, fsApi).value?.registration;
+                // The file name binds the record to its registration.
+                const expected = typeof registration === 'string' && `${sha256Hex(registration)}.json` === name ? registration : null;
+                return readRebuildStateFile(file, expected);
+            })
+            .filter(Boolean);
     }
 
     function updateReaderReceipt(lease, handle, consumerPatch) {
@@ -360,10 +431,13 @@ export function createCacheStore({
         const before = readJson(resolved, fsApi);
         if (before.missing) return { removed: false, reason: 'already absent' };
         if (!before.value) return { removed: false, reason: 'receipt unreadable; retained' };
+        const ownership = isBuild ? buildReceiptOwnership(before.value, path.basename(resolved, '.json')) : '';
+        if (ownership) return { removed: false, reason: `${ownership}; retained` };
         const verdict = (proof || (isBuild ? proveBuildQuiescent : proveReaderQuiescent))(before.value);
         if (!verdict?.quiescent) return { removed: false, reason: verdict?.reason || 'quiescence not proven' };
         const again = readJson(resolved, fsApi).value;
-        if (!again || again.token !== before.value.token || again.updatedAt !== before.value.updatedAt) {
+        if (!again || again.token !== before.value.token || again.updatedAt !== before.value.updatedAt
+            || (isBuild && buildReceiptOwnership(again, path.basename(resolved, '.json')))) {
             return { removed: false, reason: 'receipt changed during proof' };
         }
         fsApi.rmSync(resolved, { force: true });
@@ -653,8 +727,9 @@ export function createCacheStore({
         for (const name of safeReaddir(paths.buildReceipts)) {
             const objectId = name.replace(/\.json$/, '');
             if (objectIds.has(objectId)) continue;
-            const receipt = readJson(path.join(paths.buildReceipts, name), fsApi).value || null;
-            const quiescence = receipt ? proveBuildQuiescent(receipt) : null;
+            const inspected = inspectBuildReceipt(objectId);
+            if (!inspected) continue; // Released by its owner meanwhile.
+            const quiescence = inspected.summary.quiescence;
             inventory.push({
                 objectId,
                 path: null,
@@ -662,10 +737,11 @@ export function createCacheStore({
                 indexedBy: [],
                 readerReceipts: 0,
                 unusable: false,
-                buildReceipt: receipt ? { state: receipt.state, installer: receipt.installer, quiescence } : null,
-                classification: quiescence?.quiescent ? 'receipt-only-reclaimable' : 'receipt-only-retained',
-                retain: !quiescence?.quiescent,
-                reasons: [quiescence?.quiescent ? 'object never allocated' : `build-writer-unproven: ${quiescence?.reason || 'unreadable receipt'}`],
+                buildReceipt: inspected.summary,
+                classification: quiescence.quiescent ? 'receipt-only-reclaimable' : 'receipt-only-retained',
+                retain: !quiescence.quiescent,
+                reasons: [quiescence.quiescent ? 'object never allocated'
+                    : (inspected.ownership ? `build-receipt-unowned: ${inspected.ownership}` : `build-writer-unproven: ${quiescence.reason}`)],
             });
         }
         for (const objectId of objectIds) {
@@ -675,16 +751,19 @@ export function createCacheStore({
             }
             const dir = path.join(paths.objects, objectId);
             const complete = fsApi.existsSync(path.join(dir, 'complete.json'));
-            const buildReceipt = readJson(path.join(paths.buildReceipts, `${objectId}.json`), fsApi).value || null;
-            const quiescence = buildReceipt ? proveBuildQuiescent(buildReceipt) : null;
+            // Only a receipt proven to be this store's own build of exactly
+            // this object may make an incomplete object reclaimable.
+            const inspected = inspectBuildReceipt(objectId);
+            const quiescence = inspected?.summary.quiescence || null;
             const reasons = [];
             if (indexed.has(objectId)) reasons.push('indexed');
             if (readers.get(objectId)) reasons.push('reader-receipts');
-            if (buildReceipt && !quiescence?.quiescent) reasons.push(`build-writer-unproven: ${quiescence?.reason}`);
-            if (!complete && !buildReceipt) reasons.push('incomplete-without-receipt');
+            if (inspected?.ownership) reasons.push(`build-receipt-unowned: ${inspected.ownership}`);
+            else if (inspected && !quiescence.quiescent) reasons.push(`build-writer-unproven: ${quiescence.reason}`);
+            if (!complete && !inspected) reasons.push('incomplete-without-receipt');
             let classification;
             if (indexed.has(objectId) || readers.get(objectId)) classification = 'rooted';
-            else if (!complete && buildReceipt && quiescence?.quiescent) classification = 'unpublished-reclaimable';
+            else if (!complete && inspected && !inspected.ownership && quiescence.quiescent) classification = 'unpublished-reclaimable';
             else if (!complete) classification = 'unpublished-retained';
             else classification = 'complete-unindexed';
             inventory.push({
@@ -694,7 +773,7 @@ export function createCacheStore({
                 indexedBy: indexed.get(objectId) || [],
                 readerReceipts: readers.get(objectId) || 0,
                 unusable: isUnusable(objectId),
-                buildReceipt: buildReceipt ? { state: buildReceipt.state, installer: buildReceipt.installer, quiescence } : null,
+                buildReceipt: inspected ? inspected.summary : null,
                 classification,
                 retain: classification !== 'unpublished-reclaimable',
                 reasons,

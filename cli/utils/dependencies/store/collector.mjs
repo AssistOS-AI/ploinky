@@ -28,7 +28,7 @@ import { assertWorkspaceMutationLease } from '../../runtime/maintenanceLocks.js'
 import { probeContainerRuntime } from '../../../sandbox/docker/common.js';
 import { readEdgeRoutingSelection } from '../../../sandbox/edgeGeneration.js';
 import { dependencyStoreError } from './canonical.mjs';
-import { OBJECT_OWNER, createCacheStore } from './objectStore.mjs';
+import { OBJECT_OWNER, buildReceiptOwnershipProblem, createCacheStore } from './objectStore.mjs';
 
 const OBJECT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -149,8 +149,9 @@ export function collectDependencyObjects({
     depsDir = DEPS_DIR,
     loadAgents = () => {
         const parsed = readJson(AGENTS_FILE);
+        if (parsed.missing) return {}; // A fresh workspace has no registry yet.
         if (parsed.corrupt) throw dependencyStoreError('PLOINKY_DEPS_REGISTRY_UNREADABLE', parsed.corrupt);
-        return parsed.value || {};
+        return parsed.value;
     },
     // probeContainerRuntime returns null without an engine; getRuntime would
     // exit the process from this best-effort post-admission step.
@@ -169,13 +170,29 @@ export function collectDependencyObjects({
     if (unsettled) return skip(unsettled);
     let agents;
     try { agents = loadAgents(); } catch (error) { return skip(`registry unreadable: ${error?.message || error}`); }
+    // A present registry that is not an object (for example `null`) is corrupt,
+    // not an empty workspace: its admitted roots are unknown.
+    if (!agents || typeof agents !== 'object' || Array.isArray(agents)) {
+        return skip(`registry unreadable: agents registry is ${Array.isArray(agents) ? 'an array' : JSON.stringify(agents ?? null)}, not an object`);
+    }
     const candidates = candidateRecords(workspaceRoot);
     if (candidates.unreadable) return skip(candidates.unreadable);
-    const records = [...Object.values(agents || {}), ...candidates.records].filter((record) => record && typeof record === 'object');
+    const records = [...Object.values(agents), ...candidates.records].filter((record) => record && typeof record === 'object');
     const mounts = inspectMounts();
     // Missing registry records cannot prove there are no older/unrecorded
     // containers. An unavailable engine leaves the actual mount set unknown.
     if (!mounts?.available) return skip(`container engine unavailable: ${mounts?.reason || 'unknown'}`);
+    // Desired rebuild tokens root objects; an unusable rebuild state leaves
+    // them unknown, so collection is skipped before anything is mutated.
+    const desiredTokens = new Set();
+    try {
+        for (const state of activeStore.listRebuildStates()) {
+            if (state.desired?.token) desiredTokens.add(state.desired.token);
+            if (state.admittedToken) desiredTokens.add(state.admittedToken);
+        }
+    } catch (error) {
+        return skip(`rebuild state unreadable: ${error?.message || error}`);
+    }
     recoverTombstones(activeStore);
     const actualMounts = mounts?.available ? mounts.mounts : [];
 
@@ -199,12 +216,6 @@ export function collectDependencyObjects({
         if (!outcome.removed) root(receipt.objectId, `reader:${receipt.consumer?.kind || 'unknown'}`);
     }
 
-    const desiredTokens = new Set();
-    for (const state of activeStore.listRebuildStates()) {
-        if (state.desired?.token) desiredTokens.add(state.desired.token);
-        if (state.admittedToken) desiredTokens.add(state.admittedToken);
-    }
-
     const inventory = activeStore.describeObjects();
     const manifests = new Map();
     for (const item of inventory) {
@@ -226,6 +237,7 @@ export function collectDependencyObjects({
     for (const item of inventory) {
         const reasons = new Set(roots.get(item.objectId) || []);
         if (item.buildReceipt && !item.buildReceipt.quiescence?.quiescent) reasons.add('build-writer-unproven');
+        if (item.buildReceipt && item.buildReceipt.owned !== true) reasons.add('build-receipt-unowned');
         if (item.classification === 'unknown-entry') reasons.add('unknown-entry');
         if (item.classification === 'unpublished-retained') reasons.add('unpublished-unproven');
         if (item.classification === 'receipt-only-retained') reasons.add('receipt-writer-unproven');
@@ -290,9 +302,15 @@ function removeObject(store, lease, item, { objectsDir, manifests, assertLease, 
     if (!stat.isDirectory() || stat.isSymbolicLink()) return false;
     const manifest = manifests.get(item.objectId);
     if (manifest && (manifest.workspaceId !== store.workspaceId || manifest.objectId !== item.objectId)) return false;
+    // A build receipt that is present but not provably ours is never deleted
+    // with the object. Re-read it: it may have changed since the inventory.
+    const buildReceipt = readJson(path.join(store.paths.buildReceipts, `${item.objectId}.json`));
+    const receiptOwnership = buildReceipt.missing ? 'no build receipt'
+        : buildReceiptOwnershipProblem(buildReceipt.value, { objectId: item.objectId, workspaceId: store.workspaceId, objectsDir });
+    if (!buildReceipt.missing && receiptOwnership) return false;
     // Incomplete object: only an own unpublished build whose writer tree is
-    // proven quiescent (its receipt says so) is reclaimable.
-    if (!manifest && item.classification !== 'unpublished-reclaimable') return false;
+    // proven quiescent (its owned receipt says so) is reclaimable.
+    if (!manifest && (item.classification !== 'unpublished-reclaimable' || receiptOwnership)) return false;
     if (typeof hooks.beforeTombstone === 'function') hooks.beforeTombstone(item.objectId);
     // Attachment acquisition uses this same lease. Recheck after callbacks as
     // well: a newly pinned path must never temporarily disappear.

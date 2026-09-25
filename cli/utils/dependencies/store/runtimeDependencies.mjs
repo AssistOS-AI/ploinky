@@ -429,6 +429,9 @@ export function attachAdmittedDependencies(record, { consumer, lease = null }, d
                 generationId: admitted.generationId,
                 inputKey: admitted.inputKey,
                 payloadPath: admitted.payloadPath,
+                // Bound to the validated object: a record naming another
+                // generation or path is refused, never exposed.
+                nodeModulesPath: admitted.nodeModulesPath,
             }, consumer);
             return { nodeModulesPath: admitted.nodeModulesPath, release: () => s.store.releaseReaderReceipt(handle), receipt: handle };
         } finally {

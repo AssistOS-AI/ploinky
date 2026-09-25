@@ -21,7 +21,7 @@ import {
     canonicalAgentLibRemote,
 } from '../../../agentlib/contract.mjs';
 import { parseRuntimeKey, SUPPORTED_FAMILIES } from './dependencyRuntimeKey.js';
-import { AGENTLIB_ADAPTER_SCHEMA, agentLibPackagePaths } from './agentLibPackages.mjs';
+import { agentLibPackagePaths } from './agentLibPackages.mjs';
 
 /** Runtime families that get their own mount namespace. */
 const MOUNT_NAMESPACE_FAMILIES = new Set(['container', 'bwrap']);
@@ -242,38 +242,6 @@ export function installWithAgentLib(cachePath, pkg, { sourceDir, installTarget }
     } finally {
         fs.writeFileSync(packagePath, JSON.stringify(pkg, null, 2));
     }
-}
-
-/** The AgentLib section recorded in a cache stamp. */
-export function agentLibStampSection(runtimeKey, selection) {
-    return {
-        adapterSchema: AGENTLIB_ADAPTER_SCHEMA,
-        mode: selection.mode,
-        fingerprint: selection.fingerprint,
-        commit: selection.commit || '',
-        sourceIdHash: selection.sourceIdHash,
-        linkTarget: agentLibLinkTarget(runtimeKey, selection),
-    };
-}
-
-/**
- * Why a stamped AgentLib section no longer matches, or an empty string.
- *
- * Reported separately from npm validity so a changed local fingerprint refreshes
- * the link and stamp without reinstalling unrelated npm packages.
- */
-export function agentLibStampProblem(stamp, expected) {
-    const actual = stamp?.agentLib;
-    if (!actual) return 'agentLib stamp section missing';
-    if (actual.adapterSchema !== expected.adapterSchema) {
-        return `agentLib adapterSchema changed (${actual.adapterSchema ?? 'null'} != ${expected.adapterSchema})`;
-    }
-    for (const key of ['mode', 'fingerprint', 'sourceIdHash', 'linkTarget']) {
-        if (String(actual[key] ?? '') !== String(expected[key] ?? '')) {
-            return `agentLib ${key} changed (${actual[key] ?? 'null'} != ${expected[key] ?? 'null'})`;
-        }
-    }
-    return '';
 }
 
 export { AGENTLIB_CACHE_LINK_NAME, AGENTLIB_STABLE_MOUNT_PATH };

@@ -59,18 +59,6 @@ test('container and bwrap link into the stable mount path; seatbelt links to the
     );
 });
 
-test('the stamp section separates a family whose link target differs', () => {
-    const containerStamp = link.agentLibStampSection('container-linux-x64-node25', SELECTION);
-    const seatbeltStamp = link.agentLibStampSection('seatbelt-darwin-arm64-node25', SELECTION);
-    assert.notEqual(containerStamp.linkTarget, seatbeltStamp.linkTarget);
-    // A cache prepared for one family cannot be silently adopted by the other.
-    assert.match(
-        link.agentLibStampProblem({ agentLib: containerStamp }, seatbeltStamp),
-        /linkTarget changed/,
-    );
-    assert.equal(link.agentLibStampProblem({ agentLib: containerStamp }, containerStamp), '');
-});
-
 // --- link creation and npm pruning ----------------------------------------
 
 test('an npm prune between install and stamp is repaired by the final link step', () => {

@@ -136,7 +136,7 @@ for (const family of Object.keys(FAMILIES)) {
 
         const tokenFile = path.join(w.store.root, 'state', 'rebuild', `${sha256Hex('ploinky_repo_agent')}.json`);
         fs.mkdirSync(path.dirname(tokenFile), { recursive: true });
-        fs.writeFileSync(tokenFile, JSON.stringify({ registration: 'ploinky_repo_agent', admittedToken: 'rebuild-1' }));
+        fs.writeFileSync(tokenFile, JSON.stringify({ schema: 1, registration: 'ploinky_repo_agent', revision: 1, admittedToken: 'rebuild-1', desired: null }));
         assert.equal(reuseProblem(family, w, admitted), 'dependency inputs changed');
         assert.deepEqual(treeSnapshot(first.record), before);
     });
@@ -193,7 +193,7 @@ test('dependency store runtime: candidates share their registration and preparat
     assert.equal(registrationIdFor('ploinky_repo_agent__candidate_0123456789ab'), 'ploinky_repo_agent');
     const tokenFile = path.join(w.store.root, 'state', 'rebuild', `${sha256Hex('ploinky_repo_agent')}.json`);
     fs.mkdirSync(path.dirname(tokenFile), { recursive: true });
-    fs.writeFileSync(tokenFile, JSON.stringify({ registration: 'ploinky_repo_agent', admittedToken: 'rebuild-7' }));
+    fs.writeFileSync(tokenFile, JSON.stringify({ schema: 1, registration: 'ploinky_repo_agent', revision: 1, admittedToken: 'rebuild-7', desired: null }));
     const candidate = prepareRuntimeDependencies(input('container', w, 'ploinky_repo_agent__candidate_0123456789ab'),
         { consumer: consumer('container', 'ploinky_repo_agent__candidate_0123456789ab'), lease: w.lease }, w.deps);
     assert.equal(candidate.plan.rebuildToken, 'rebuild-7', 'the candidate sees its logical registration token');
