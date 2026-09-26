@@ -705,6 +705,16 @@ export function listDeclaredSkillSources(folders = []) {
     return sources;
 }
 
+// A consumer's failed export keeps its classification (code, outcome and
+// recovery state) under a sanitized message, so an update records it as it
+// records the same failure of a manifest folder.
+const EXPORT_ERROR_FIELDS = ['code', 'outcome', 'skillExportRecovery', 'lockReleaseError', 'skillExportResult'];
+function consumerExportError(error) {
+    const failure = new Error(sanitizeGitDiagnostic(error?.message || String(error)));
+    for (const field of EXPORT_ERROR_FIELDS) if (error?.[field] !== undefined) failure[field] = error[field];
+    return failure;
+}
+
 /** Targeted refresh: re-evaluate every consumer folder whose manifest
  * declares `sourcePath`, with its complete owner set. Nothing is pulled here;
  * other sources are used as they are. */
@@ -721,7 +731,8 @@ export function refreshSkillConsumersForSource({ folders = [], sourcePath, sourc
                 targetRoot: consumer.folder, pruneMissing, sourceOutcomes: sourceOutcomes || new Map(), boxRun,
             }));
         } catch (error) {
-            failed.push({ folder: consumer.folder, manifestPath: consumer.manifestPath, message: sanitizeGitDiagnostic(error.message) });
+            const failure = consumerExportError(error);
+            failed.push({ folder: consumer.folder, manifestPath: consumer.manifestPath, message: failure.message, error: failure });
         }
     }
     return { sourcePath: target, refreshed, failed };

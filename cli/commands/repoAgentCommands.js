@@ -662,7 +662,7 @@ async function updateRepoResult(repoName, { command = ['update', 'repo', repoNam
             records.push(skillsManifestRecord({
                 folder: failure.folder, manifestPath: failure.manifestPath,
                 label: path.relative(PLOINKY_WORKSPACE_ROOT, failure.folder) || path.basename(failure.folder),
-                error: new Error(failure.message),
+                error: failure.error,
             }));
             console.error(`  ✗ skills consumer ${failure.folder}: ${failure.message}`);
         }

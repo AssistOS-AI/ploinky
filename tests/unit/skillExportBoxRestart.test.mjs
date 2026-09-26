@@ -333,7 +333,16 @@ for (const [form, args] of [['update all (skills manifest folders)', []], ['upda
     test(`${form}: export locks a SIGKILLed writer left in a consumer are recovered by the next attested Box run`, async (t) => {
         const ws = createWorkspace(t);
         const killed = await killInsideExport(t, ws, { args, folder: ws.consumer });
-        const attested = startUpdate(t, ws, { args, run: 'box-run-2', context: hostContext(ws, { containerId: FIRST_CONTAINER }) });
+        // Without the attestation both forms name the unproven owner.
+        const unattested = startUpdate(t, ws, {
+            args, run: 'box-run-2', context: { schema: 'ploinky-update-context', version: 1, workspace: { instance: WORKSPACE_INSTANCE } },
+        });
+        await settle(unattested);
+        assert.deepEqual(consumerRecords(unattested, ws).map(record => [record.outcome, record.code]),
+            [['failed', 'SKILL_EXPORT_LOCK_UNKNOWN_OWNER']]);
+        assert.deepEqual(leftovers(ws.consumer), killed.state);
+
+        const attested = startUpdate(t, ws, { args, run: 'box-run-3', context: hostContext(ws, { containerId: FIRST_CONTAINER }) });
         await settle(attested);
         const records = consumerRecords(attested, ws);
         assert.deepEqual(records.map(record => [record.outcome, record.code]), [['changed', 'exported']],
@@ -345,6 +354,25 @@ for (const [form, args] of [['update all (skills manifest folders)', []], ['upda
         for (const owner of killed.owners) assert.deepEqual(owner.box, BINDING);
     });
 }
+
+// A reclaimed lock can still leave a transaction that cannot be recovered.
+// Both forms that export into a manifest consumer report it as incomplete
+// recovery, not as an ordinary failure, and preserve it.
+test('update repo and update all report a consumer export whose pending journal cannot be recovered as recovery-required', async (t) => {
+    const ws = createWorkspace(t);
+    const journal = path.join(ws.consumer, '.agents', JOURNAL);
+    fs.writeFileSync(journal, `${JSON.stringify({ protocol: 'ploinky-skill-exports', version: 1 })}\n`);
+    for (const [run, args] of [['box-run-1', ['repo', 'PloinkySkills']], ['box-run-2', []]]) {
+        const writer = startUpdate(t, ws, { args, run, context: hostContext(ws, { containerId: FIRST_CONTAINER }) });
+        await settle(writer);
+        const records = consumerRecords(writer, ws);
+        assert.deepEqual(records.map(record => [record.outcome, record.code, record.details.errorCode]),
+            [['uncertain', 'SKILL_EXPORT_RECOVERY_REQUIRED', 'SKILL_EXPORT_RECOVERY_REQUIRED']], `${JSON.stringify(args)}\n${writer.output()}`);
+        assert.match(records[0].reason, /journal is unreadable or from an unsupported protocol/);
+        assert.ok(fs.existsSync(journal), 'the pending journal is preserved');
+        assert.deepEqual([leftovers(ws.consumer).configLock, leftovers(ws.consumer).exportLock], [false, false], 'both locks were released');
+    }
+});
 
 // Every export of the update binds both of its locks: default skills, skills
 // manifest folders and the manifest consumers of an updated source.
