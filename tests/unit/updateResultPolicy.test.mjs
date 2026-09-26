@@ -161,6 +161,8 @@ function scenarioEnv(scratch, extra = {}) {
             `if [ "$1" = ls-remote ] && [ "$2" = -- ] && [ "$3" = https://github.com/AssistOS-AI/MCPSDK.git ] && [ -n "$PLOINKY_TEST_SDK_REMOTE" ]; then shift 3; exec "${realGit}" ls-remote -- "$PLOINKY_TEST_SDK_REMOTE" "$@"; fi`,
             'for arg in "$@"; do case "$arg" in http://*|https://*|ssh://*|git@*) echo "network Git access is not allowed in this test: $arg" >&2; exit 97;; esac; done',
             'if [ -n "$PLOINKY_TEST_SLOW_FETCH" ]; then for arg in "$@"; do if [ "$arg" = fetch ]; then sleep "$PLOINKY_TEST_SLOW_FETCH"; fi; done; fi',
+            // Signal the invoking update process once, from inside its first matching Git command.
+            'if [ -n "$PLOINKY_TEST_SIGNAL_PARENT_ON" ] && [ ! -e "$PLOINKY_TEST_SCRATCH/signalled" ]; then for arg in "$@"; do if [ "$arg" = "$PLOINKY_TEST_SIGNAL_PARENT_ON" ]; then : > "$PLOINKY_TEST_SCRATCH/signalled"; kill -INT "$PPID"; fi; done; fi',
             `exec "${realGit}" "$@"`,
             '',
         ].join('\n'));
@@ -217,6 +219,29 @@ test('a complete verified update exits 0 and activates the AgentLib selection', 
     assert.deepEqual(result.spawned, [['--agentlib-activate-transaction', 'commit']]);
     assert.match(result.stdout, /Update complete with named skips/);
     assert.match(result.stdout, /achillesAgentLib activation: commit completed; final update status: complete-with-skips \(exit 0\)/);
+});
+
+test('Ctrl+C during the last update step blocks activation instead of being dropped', () => {
+    // The default-skills exclusion probe runs after the update's last checkpoint.
+    const result = runScenario(String.raw`
+        const { required } = await standardWorkspace();
+        advance(required.seed);
+        const run = await launchUpdate(['update', workspaceRoot]);
+        done({ code: run.code, thrown: run.thrown, records: brief(run.result), activationAllowed: run.result.activationAllowed,
+            reasons: run.result.records.filter(record => record.code === 'cancelled').map(record => record.reason),
+            spawned: run.spawned, staged: run.staged,
+            signalled: fs.existsSync(path.join(scratch, 'signalled')) });
+    `, { PLOINKY_TEST_SIGNAL_PARENT_ON: 'check-ignore' });
+    assert.equal(result.signalled, true, 'the signal was delivered during the update');
+    assert.equal(result.thrown, null);
+    assert.equal(result.code, 1);
+    assert.equal(result.activationAllowed, false);
+    assert.deepEqual(result.records.find(record => record[0] === 'registered-repository' && record[1] === 'RequiredRepo'),
+        ['registered-repository', 'RequiredRepo', 'changed', 'fast-forward', true], 'the steps before the signal completed');
+    assert.equal(result.reasons.length, 1);
+    assert.match(result.reasons[0], /^Update cancelled by SIGINT before activation/);
+    assert.deepEqual(result.spawned, [], 'activation is never spawned after an operator signal');
+    assert.deepEqual(result.staged, []);
 });
 
 test('a dirty required repository alone blocks activation and exits nonzero without spawning activation', () => {

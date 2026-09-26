@@ -30,7 +30,8 @@ import { UpdateCancelledError, createUpdateCancellation } from './updateCancella
 // published the update owns SIGINT/SIGTERM. A signal stops it at the next
 // checkpoint, after the step in progress released its locks, and ends it with
 // a failed `cancelled` record; a signal after the last checkpoint still blocks
-// activation.
+// activation, and one that arrives after the result was decided ends the
+// process by its default action.
 
 export const UPDATE_LEASE_WAIT_MS = 5 * 60 * 1000;
 export const IN_BOX_ACTIVATION_NOTICE = 'This update ran inside the Box: activate it from the host with `ploinky update` or `ploinky restart`.';
@@ -55,6 +56,8 @@ function cancelledRecord(error) {
     return commandErrorRecord(error, { code: 'cancelled' });
 }
 
+const isCancelledResult = result => Boolean(result?.records?.some(record => record.phase === 'command' && record.code === 'cancelled'));
+
 function thrownRecord(error) {
     if (error instanceof UpdateCancelledError) return cancelledRecord(error);
     if (LOCK_BUSY_CODES.has(error?.code)) {
@@ -70,10 +73,12 @@ function thrownRecord(error) {
 
 export async function runUpdateCommand(normalizedOptions = [], options = {}) {
     const cancellation = createUpdateCancellation();
+    let result = null;
     try {
-        return await runUpdate(normalizedOptions, { ...options, cancellation });
+        result = await runUpdate(normalizedOptions, { ...options, cancellation });
+        return result;
     } finally {
-        cancellation.dispose();
+        await cancellation.dispose({ reported: isCancelledResult(result) });
     }
 }
 
@@ -131,8 +136,9 @@ async function runUpdate(normalizedOptions, {
         const records = [...(Array.isArray(error?.records) ? error.records : []), thrownRecord(error)];
         result = buildCoreUpdateResult({ command, records });
     }
-    if (cancellation.received() && !result.records.some(record => record.phase === 'command' && record.code === 'cancelled')) {
-        result = appendUpdateRecords(result, [cancelledRecord(new UpdateCancelledError(cancellation.received(), 'activation'))]);
+    const lateSignal = await cancellation.signalReceived();
+    if (lateSignal && !isCancelledResult(result)) {
+        result = appendUpdateRecords(result, [cancelledRecord(new UpdateCancelledError(lateSignal, 'activation'))]);
     }
     result.command = command;
     if (insideBox && !reportRequest) log(IN_BOX_ACTIVATION_NOTICE);

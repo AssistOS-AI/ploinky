@@ -260,23 +260,42 @@ test('a SIGKILLed writer leaves its checkout lock to the next same-scope update'
     assert.deepEqual(checkoutState(ws, started).lockEntries, []);
 });
 
+// A handler that finished every step: nothing after its last checkpoint turns
+// the event loop.
+const finishedHandler = body => `async (_folder, { command }) => {
+    ${body}
+    return buildCoreUpdateResult({ command, records: [createOperationRecord({
+        phase: 'registered-repository', id: 'Alpha', outcome: 'unchanged', required: true,
+    })] });
+}`;
+const stubPrelude = () => `
+    const fs = await import('node:fs');
+    const { runUpdateCommand } = await import(${JSON.stringify(moduleUrl('cli/commands/updateCommand.js'))});
+    const { buildCoreUpdateResult } = await import(${JSON.stringify(moduleUrl('cli/commands/updateRecords.js'))});
+    const { createOperationRecord } = await import(${JSON.stringify(moduleUrl('cli/commands/updateOutcome.js'))});
+`;
+
+function assertCancelledBeforeActivation(ws, writer) {
+    const report = readUpdateReport(path.join(ws.workspace, '.ploinky'), writer.nonce, { expectedContext: REPORT_CONTEXT });
+    assert.equal(report.ok, true, `${report.code} ${report.reason}\n${writer.output()}`);
+    assert.deepEqual(report.result.records.map(record => [record.phase, record.id, record.outcome, record.code]), [
+        ['registered-repository', 'Alpha', 'unchanged', ''],
+        ['command', 'update', 'failed', 'cancelled'],
+    ]);
+    assert.match(report.result.records[1].reason, /SIGTERM before activation/);
+    assert.equal(report.result.activationAllowed, false, 'every step finished, yet a cancelled update never activates');
+}
+
 test('a signal after the last update step still blocks activation, and the update returns its signals', async (t) => {
     const ws = createWorkspace(t);
-    const writer = startWriter(t, ws, { script: `
-        const { runUpdateCommand } = await import(${JSON.stringify(moduleUrl('cli/commands/updateCommand.js'))});
-        const { buildCoreUpdateResult } = await import(${JSON.stringify(moduleUrl('cli/commands/updateRecords.js'))});
-        const { createOperationRecord } = await import(${JSON.stringify(moduleUrl('cli/commands/updateOutcome.js'))});
+    const writer = startWriter(t, ws, { script: `${stubPrelude()}
         const listeners = () => ['SIGINT', 'SIGTERM'].map(name => process.listenerCount(name));
         const before = listeners();
         let during = null;
-        const result = await runUpdateCommand([], { handlers: { updateAllRepos: async (_folder, { command }) => {
+        const result = await runUpdateCommand([], { handlers: { updateAllRepos: ${finishedHandler(`
             during = listeners();
             process.kill(process.pid, 'SIGTERM');
-            await new Promise(resolve => setTimeout(resolve, 100));
-            return buildCoreUpdateResult({ command, records: [createOperationRecord({
-                phase: 'registered-repository', id: 'Alpha', outcome: 'unchanged', required: true,
-            })] });
-        } } });
+        `)} } });
         console.log('LISTENERS ' + JSON.stringify({ before, during, after: listeners() }));
         process.exitCode = result.exitCode;
     ` });
@@ -285,14 +304,72 @@ test('a signal after the last update step still blocks activation, and the updat
     const { before, during, after } = JSON.parse(/LISTENERS (.*)/.exec(writer.output())[1]);
     assert.deepEqual(during, before.map(count => count + 1), 'the update owns SIGINT and SIGTERM while it runs');
     assert.deepEqual(after, before, 'and hands them back when it returns');
+    assertCancelledBeforeActivation(ws, writer);
+});
+
+test('an external signal during synchronous work after the last checkpoint still blocks activation', async (t) => {
+    const ws = createWorkspace(t);
+    const marker = path.join(ws.root, 'tail-started');
+    const writer = startWriter(t, ws, { script: `${stubPrelude()}
+        const result = await runUpdateCommand([], { handlers: { updateAllRepos: ${finishedHandler(`
+            fs.writeFileSync(${JSON.stringify(marker)}, 'tail');
+            const until = Date.now() + 1_500;
+            while (Date.now() < until) {}
+        `)} } });
+        process.exitCode = result.exitCode;
+    ` });
+    await waitFor('the synchronous tail to start', () => fs.existsSync(marker));
+    process.kill(writer.child.pid, 'SIGTERM');
+    const exit = await settle(writer);
+    assert.deepEqual(exit, { code: 1, signal: null }, writer.output());
+    assertCancelledBeforeActivation(ws, writer);
+});
+
+test('a signal after the update decided its result still ends the process by its default action', async (t) => {
+    const ws = createWorkspace(t);
+    const writer = startWriter(t, ws, { script: `${stubPrelude()}
+        let signalled = false;
+        // The summary is printed after the result was decided and published.
+        const log = (...values) => {
+            if (!signalled) {
+                signalled = true;
+                process.kill(process.pid, 'SIGTERM');
+            }
+            console.log(...values);
+        };
+        const result = await runUpdateCommand([], { log, handlers: { updateAllRepos: ${finishedHandler('')} } });
+        console.log('UPDATE_RETURNED ' + result.exitCode);
+    ` });
+    const exit = await settle(writer);
+    assert.deepEqual(exit, { code: null, signal: 'SIGTERM' }, writer.output());
+    assert.doesNotMatch(writer.output(), /UPDATE_RETURNED/, 'nothing after the update, such as activation, runs');
     const report = readUpdateReport(path.join(ws.workspace, '.ploinky'), writer.nonce, { expectedContext: REPORT_CONTEXT });
-    assert.equal(report.ok, true, `${report.code} ${report.reason}`);
-    assert.deepEqual(report.result.records.map(record => [record.phase, record.id, record.outcome, record.code]), [
-        ['registered-repository', 'Alpha', 'unchanged', ''],
-        ['command', 'update', 'failed', 'cancelled'],
-    ]);
-    assert.match(report.result.records[1].reason, /SIGTERM before activation/);
-    assert.equal(report.result.activationAllowed, false, 'every step finished, yet a cancelled update never activates');
+    assert.equal(report.ok, true, 'the report published before the signal stays valid');
+    assert.equal(report.result.exitCode, 0);
+});
+
+// A checkpoint reached from an I/O callback runs inside the poll phase, where
+// one setImmediate would resume before the pending signal is delivered.
+test('a checkpoint reached from an I/O callback still sees a signal received during that callback', async (t) => {
+    const ws = createWorkspace(t);
+    const writer = startWriter(t, ws, { script: `
+        const fs = await import('node:fs');
+        const { createUpdateCancellation } = await import(${JSON.stringify(moduleUrl('cli/commands/updateCancellation.js'))});
+        const outcomes = [];
+        for (let trial = 0; trial < 5; trial += 1) {
+            const cancellation = createUpdateCancellation();
+            cancellation.arm();
+            outcomes.push(await new Promise(resolve => fs.readFile(${JSON.stringify(fileURLToPath(import.meta.url))}, () => {
+                process.kill(process.pid, 'SIGTERM');
+                cancellation.checkpoint('the next step').then(() => resolve('missed'), error => resolve(error.code));
+            })));
+            await cancellation.dispose({ reported: true });
+        }
+        console.log('OUTCOMES ' + JSON.stringify(outcomes));
+    ` });
+    const exit = await settle(writer);
+    assert.deepEqual(exit, { code: 0, signal: null }, writer.output());
+    assert.deepEqual(JSON.parse(/OUTCOMES (.*)/.exec(writer.output())[1]), Array(5).fill('PLOINKY_UPDATE_CANCELLED'));
 });
 
 // Before it holds the workspace lease the update has nothing to release, so
