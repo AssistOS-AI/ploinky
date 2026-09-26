@@ -1154,58 +1154,68 @@ export function createBoxSupervisor({
      * Restart the graph inside the update transaction with the same bounded
      * discipline as the in-Box update: finite TERM -> KILL escalation, an
      * engine proof that the restart writer stopped, and a durable recovery
-     * barrier (with no rollback) when that proof is missing.
+     * barrier (with no rollback) when that proof is missing. Signals are held
+     * as for the in-Box update; the failure of a restart that did not end
+     * normally reports one, and after a normal end one keeps its default action.
      */
     async function executeUpdateRestart({ identity, engine, containerId, prepared, selection, skillScopeEnv,
         hostReachableIpv4 }) {
         const operationId = createReportNonce();
         const marker = `${UPDATE_OPERATION_ENV}=${operationId}`;
-        const run = await runRestartCore(
-            engine,
-            containerId,
-            ['restart'],
-            prepared.hostPort,
-            prepared.mediaHostPort,
-            runner,
-            {
-                workspaceRoot: identity.workspaceRoot,
-                stdout,
-                stderr,
-                hostReachableIpv4,
-                agentLib: selection,
-                skillScopeEnv,
-                operationId,
-            },
-        );
-        const cause = run?.cause || 'unknown';
-        if (run?.quiescence?.state !== 'confirmed') {
-            const detail = String(run?.quiescence?.detail || 'in-Box quiescence was not confirmed');
-            const barrierProblem = recordRecoveryBarrier(identity, {
-                operation: 'restart', containerId, nonce: operationId, marker, cause, detail,
-            });
-            const error = new PloinkyBoxError(
-                `The in-Box graph restart ended abnormally (${cause}) and the engine could not confirm that it `
-                + `stopped (${detail}). `
-                + (barrierProblem
-                    ? `No durable recovery record could be written (${barrierProblem}); run \`ploinky stop\` `
-                        + 'before any other mutation. '
-                    : 'A recovery record now blocks new mutations until it is confirmed stopped. ')
-                + 'The workspace graph state is unknown.',
-                { code: 'PLOINKY_BOX_UPDATE_QUIESCENCE_UNCERTAIN' },
+        const signals = createCancellation();
+        let reported = true;
+        signals.arm();
+        try {
+            const run = await runRestartCore(
+                engine,
+                containerId,
+                ['restart'],
+                prepared.hostPort,
+                prepared.mediaHostPort,
+                runner,
+                {
+                    workspaceRoot: identity.workspaceRoot,
+                    stdout,
+                    stderr,
+                    hostReachableIpv4,
+                    agentLib: selection,
+                    skillScopeEnv,
+                    operationId,
+                },
             );
-            error.activation = Object.freeze({ outcome: 'recovery-required', graphMutated: true, boxRollback: null });
-            error.skipRollback = true;
-            throw error;
+            const cause = run?.cause || 'unknown';
+            if (run?.quiescence?.state !== 'confirmed') {
+                const detail = String(run?.quiescence?.detail || 'in-Box quiescence was not confirmed');
+                const barrierProblem = recordRecoveryBarrier(identity, {
+                    operation: 'restart', containerId, nonce: operationId, marker, cause, detail,
+                });
+                const error = new PloinkyBoxError(
+                    `The in-Box graph restart ended abnormally (${cause}) and the engine could not confirm that it `
+                    + `stopped (${detail}). `
+                    + (barrierProblem
+                        ? `No durable recovery record could be written (${barrierProblem}); run \`ploinky stop\` `
+                            + 'before any other mutation. '
+                        : 'A recovery record now blocks new mutations until it is confirmed stopped. ')
+                    + 'The workspace graph state is unknown.',
+                    { code: 'PLOINKY_BOX_UPDATE_QUIESCENCE_UNCERTAIN' },
+                );
+                error.activation = Object.freeze({ outcome: 'recovery-required', graphMutated: true, boxRollback: null });
+                error.skipRollback = true;
+                throw error;
+            }
+            if (cause !== 'exited' || run.signal || run.status !== 0) {
+                const tail = String(run?.tails?.stderr || run?.tails?.stdout || '').trim().split('\n').slice(-3).join(' | ');
+                throw supervisorError(
+                    `In-box restart failed (${cause}${run?.signal ? `, ${run.signal}` : ''}`
+                    + `${Number.isInteger(run?.status) ? `, status ${run.status}` : ''})${tail ? `: ${tail}` : ''}`,
+                    'PLOINKY_BOX_UPDATE_RESTART_FAILED',
+                );
+            }
+            reported = false;
+            return run;
+        } finally {
+            await signals.dispose({ reported });
         }
-        if (cause !== 'exited' || run.signal || run.status !== 0) {
-            const tail = String(run?.tails?.stderr || run?.tails?.stdout || '').trim().split('\n').slice(-3).join(' | ');
-            throw supervisorError(
-                `In-box restart failed (${cause}${run?.signal ? `, ${run.signal}` : ''}`
-                + `${Number.isInteger(run?.status) ? `, status ${run.status}` : ''})${tail ? `: ${tail}` : ''}`,
-                'PLOINKY_BOX_UPDATE_RESTART_FAILED',
-            );
-        }
-        return run;
     }
 
     async function assertNoUpdateRecoveryBarrier(identity, ownership) {
@@ -1302,78 +1312,97 @@ export function createBoxSupervisor({
      * limit or an exit status that disagrees with the report is uncertain.
      * An in-Box writer that cannot be proven stopped leaves a durable
      * recovery barrier and ends the transaction without further mutation.
+     *
+     * The exec client ending does not end the in-Box writer, and a dead host
+     * leaves the next mutation nothing to wait for. So the host holds
+     * SIGINT/SIGTERM from the in-Box start until the engine proved the writer
+     * stopped or the barrier is durable; the proof is bounded. A signal held
+     * there is reported by the run's cause when it cancelled the exec client,
+     * by the recovery error, or else by a `cancelled` record that blocks
+     * activation.
      */
     async function executeCoreUpdate({ identity, prepared, engine, containerId, coreArgv, selection, skillScopeEnv,
         updateExcludedRepoPath = '', context }) {
         const nonce = createReportNonce();
         const reportContext = JSON.parse(JSON.stringify(context));
         const ploinkyDir = path.join(identity.workspaceRoot, '.ploinky');
-        const run = await runUpdateCore(
-            engine,
-            containerId,
-            coreArgv,
-            prepared.hostPort,
-            prepared.mediaHostPort,
-            runner,
-            {
-                workspaceRoot: identity.workspaceRoot,
-                stdout,
-                stderr,
-                agentLib: selection,
-                skillScopeEnv,
-                updateExcludedRepoPath,
-                reportNonce: nonce,
-                reportContext,
-            },
-        );
-        const diagnostics = {
-            cause: run?.cause || 'unknown',
-            status: Number.isInteger(run?.status) ? run.status : null,
-            signal: run?.signal || null,
-            escalation: run?.escalation || null,
-            tails: run?.tails || null,
-        };
-        const report = readReport(ploinkyDir, nonce, { expectedContext: reportContext });
-        let quiescence = run?.quiescence;
-        // An invalid completion report cannot use a client exit as evidence
-        // that its writers stopped, including with injected runner adapters.
-        if (!report.ok && quiescence?.state === 'confirmed') {
-            let observed;
-            try {
-                observed = await probeUpdateQuiescence({ engine, containerId, nonce,
-                    marker: `${UPDATE_REPORT_NONCE_ENV}=${nonce}`, runner });
-            } catch (error) { observed = { ok: false, detail: error.message }; }
-            quiescence = observed?.ok === true && Array.isArray(observed.pids) && !observed.pids.length
-                ? { state: 'confirmed', method: 'engine-probe' }
-                : { state: 'uncertain', detail: observed?.detail || 'the update report is invalid and writers may still run' };
-        }
-        if (quiescence?.state !== 'confirmed') {
-            const barrierProblem = recordRecoveryBarrier(identity, {
-                operation: 'update',
+        const signals = createCancellation();
+        let diagnostics;
+        let report;
+        let cancelledBy = '';
+        signals.arm();
+        try {
+            const run = await runUpdateCore(
+                engine,
                 containerId,
-                nonce,
-                marker: `${UPDATE_REPORT_NONCE_ENV}=${nonce}`,
-                cause: diagnostics.cause,
-                detail: String(quiescence?.detail || 'in-Box quiescence was not confirmed'),
-                reportPath: path.join(ploinkyDir, 'running', 'update-reports', `${nonce}.json`),
-            });
-            const error = new PloinkyBoxError(
-                `The in-Box update ended abnormally (${diagnostics.cause}) and the engine could not confirm that it `
-                + `stopped (${quiescence?.detail || 'no proof'}). `
-                + (barrierProblem
-                    ? `No durable recovery record could be written (${barrierProblem}); do not start another update `
-                        + 'until the Box is stopped with `ploinky stop`. '
-                    : 'A recovery record now blocks new mutations. ')
-                + 'Its report and artifacts were retained.',
-                { code: 'PLOINKY_BOX_UPDATE_QUIESCENCE_UNCERTAIN' },
+                coreArgv,
+                prepared.hostPort,
+                prepared.mediaHostPort,
+                runner,
+                {
+                    workspaceRoot: identity.workspaceRoot,
+                    stdout,
+                    stderr,
+                    agentLib: selection,
+                    skillScopeEnv,
+                    updateExcludedRepoPath,
+                    reportNonce: nonce,
+                    reportContext,
+                },
             );
-            error.activation = Object.freeze({ outcome: 'recovery-required', graphMutated: false, boxRollback: null });
-            error.updateRecords = Object.freeze([
-                uncertainCoreRecord('in-box-update-runner', 'quiescence-unconfirmed', error.message, diagnostics),
-            ]);
-            // Nothing may touch a Box whose writer may still be running.
-            error.skipRollback = true;
-            throw error;
+            diagnostics = {
+                cause: run?.cause || 'unknown',
+                status: Number.isInteger(run?.status) ? run.status : null,
+                signal: run?.signal || null,
+                escalation: run?.escalation || null,
+                tails: run?.tails || null,
+            };
+            report = readReport(ploinkyDir, nonce, { expectedContext: reportContext });
+            let quiescence = run?.quiescence;
+            // An invalid completion report cannot use a client exit as evidence
+            // that its writers stopped, including with injected runner adapters.
+            if (!report.ok && quiescence?.state === 'confirmed') {
+                let observed;
+                try {
+                    observed = await probeUpdateQuiescence({ engine, containerId, nonce,
+                        marker: `${UPDATE_REPORT_NONCE_ENV}=${nonce}`, runner });
+                } catch (error) { observed = { ok: false, detail: error.message }; }
+                quiescence = observed?.ok === true && Array.isArray(observed.pids) && !observed.pids.length
+                    ? { state: 'confirmed', method: 'engine-probe' }
+                    : { state: 'uncertain', detail: observed?.detail || 'the update report is invalid and writers may still run' };
+            }
+            if (quiescence?.state !== 'confirmed') {
+                const barrierProblem = recordRecoveryBarrier(identity, {
+                    operation: 'update',
+                    containerId,
+                    nonce,
+                    marker: `${UPDATE_REPORT_NONCE_ENV}=${nonce}`,
+                    cause: diagnostics.cause,
+                    detail: String(quiescence?.detail || 'in-Box quiescence was not confirmed'),
+                    reportPath: path.join(ploinkyDir, 'running', 'update-reports', `${nonce}.json`),
+                });
+                const error = new PloinkyBoxError(
+                    `The in-Box update ended abnormally (${diagnostics.cause}) and the engine could not confirm that it `
+                    + `stopped (${quiescence?.detail || 'no proof'}). `
+                    + (barrierProblem
+                        ? `No durable recovery record could be written (${barrierProblem}); do not start another update `
+                            + 'until the Box is stopped with `ploinky stop`. '
+                        : 'A recovery record now blocks new mutations. ')
+                    + 'Its report and artifacts were retained.',
+                    { code: 'PLOINKY_BOX_UPDATE_QUIESCENCE_UNCERTAIN' },
+                );
+                error.activation = Object.freeze({ outcome: 'recovery-required', graphMutated: false, boxRollback: null });
+                error.updateRecords = Object.freeze([
+                    uncertainCoreRecord('in-box-update-runner', 'quiescence-unconfirmed', error.message, diagnostics),
+                ]);
+                // Nothing may touch a Box whose writer may still be running.
+                error.skipRollback = true;
+                throw error;
+            }
+            const signal = await signals.signalReceived();
+            if (signal && diagnostics.cause !== `signal:${signal}`) cancelledBy = signal;
+        } finally {
+            await signals.dispose({ reported: true });
         }
         const records = [];
         if (report.ok) {
@@ -1398,6 +1427,9 @@ export function createBoxSupervisor({
                 `the in-Box update exited ${diagnostics.status} but reported ${report.result.exitCode}`,
                 diagnostics,
             ));
+        }
+        if (cancelledBy) {
+            records.push(commandErrorRecord(new UpdateCancelledError(cancelledBy, 'activation'), { code: 'cancelled' }));
         }
         try {
             removeReport(ploinkyDir, nonce);
