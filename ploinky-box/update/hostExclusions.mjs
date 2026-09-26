@@ -31,9 +31,10 @@ import { relativeBoxWorkspacePath } from '../contract/workspace-root.mjs';
 // earlier update kept stay recorded. That record only says where to look: the
 // next update, under the workspace lock and before its in-Box step, releases
 // such a lock only when its owner record proves, in this boot and PID
-// namespace, that the host refresh which took it has ended, and keeps every
-// folder it cannot prove released. A pending journal stays for the confined
-// executor and Git's own lock files are never touched.
+// namespace, that the host refresh which took it has ended, and only while
+// that exact lock is still in place. It keeps every folder it cannot prove
+// released, and a record it cannot read. A pending journal stays for the
+// confined executor and Git's own lock files are never touched.
 
 export const MAX_DEFERRED_EXCLUSION_FOLDERS = 64;
 export const HOST_EXCLUSIONS_AUTHORITY = Object.freeze({
@@ -73,6 +74,9 @@ function outcomeOf(exclusions) {
 function intentRecord(identity, folders) {
     return { schema: INTENT_SCHEMA, version: 1, instance: identity.instance, folders: [...folders] };
 }
+
+// A store error names the record; its cause names the I/O failure.
+const describeFailure = error => `${error?.message || error}${error?.cause ? ` (${error.cause.code || error.cause.message})` : ''}`;
 
 // The folders a well-formed record of this workspace names, else null.
 function recordedFolders(stored, identity) {
@@ -168,8 +172,23 @@ export async function refreshDeferredHostExclusions({
     // released stay recorded; this refresh only adds and removes its own.
     let kept = [];
     if (intent) {
+        let stored;
         try {
-            try { kept = recordedFolders(intent.read?.(), identity) || []; } catch (_) { kept = []; }
+            stored = intent.read?.();
+        } catch (error) {
+            // A record that cannot be read may still name folders whose locks
+            // wait for recovery; replacing it could lose them, so no lock is taken.
+            records.push(createOperationRecord({
+                phase: 'skills-manifest', id: 'exclusions:intent', outcome: 'uncertain', required: false,
+                code: 'exclusions-intent-unreadable',
+                reason: 'No host exclusions were refreshed: the private record of earlier folders could not be read '
+                    + `(${describeFailure(error)}), and replacing it could lose them.`,
+                details: { folders: targets.map(target => target.folder) },
+            }));
+            return records;
+        }
+        kept = recordedFolders(stored, identity) || [];
+        try {
             const recorded = [...new Set([...kept, ...targets.map(target => target.folder)])];
             if (recorded.length > MAX_RECORDED_FOLDERS) {
                 throw new Error(`the record would name ${recorded.length} folders, more than ${MAX_RECORDED_FOLDERS}`);
@@ -259,33 +278,50 @@ const isHostRefreshAuthority = authority => authority?.kind === HOST_EXCLUSIONS_
     && authority?.operation === HOST_EXCLUSIONS_AUTHORITY.operation
     && authority?.executor === HOST_EXCLUSIONS_AUTHORITY.executor;
 
-// The owner of one lock directory, read without following a link.
+// The owner of one lock directory, read without following a link, and the
+// exact identity of that lock: directory and owner-file inodes and bytes.
 function observeLock(lockPath) {
     const directory = fs.lstatSync(lockPath, { throwIfNoEntry: false });
-    if (!directory) return { state: 'free', owner: null };
-    if (!directory.isDirectory()) return { state: 'foreign', owner: null };
+    if (!directory) return { state: 'free', owner: null, identity: null };
+    if (!directory.isDirectory()) return { state: 'foreign', owner: null, identity: null };
     const ownerPath = path.join(lockPath, 'owner.json');
+    const file = fs.lstatSync(ownerPath, { throwIfNoEntry: false });
+    let bytes = null;
     let owner = null;
-    if (fs.lstatSync(ownerPath, { throwIfNoEntry: false })?.isFile()) {
-        try { owner = JSON.parse(fs.readFileSync(ownerPath, 'utf8')); } catch (_) {}
+    if (file?.isFile()) {
+        try { bytes = fs.readFileSync(ownerPath); owner = JSON.parse(bytes.toString('utf8')); } catch (_) {}
     }
     if (!owner || typeof owner !== 'object' || Array.isArray(owner)) owner = null;
-    return { state: classifyLockOwner(owner), owner };
+    const identity = bytes && `${directory.dev}:${directory.ino}:${file.dev}:${file.ino}:${bytes.toString('base64')}`;
+    return { state: classifyLockOwner(owner), owner, identity };
 }
 
-// Only a lock that the host exclusion refresh took in this boot and PID
-// namespace, whose process no longer runs, is released. The protocol's own
-// acquisition reclaims it (one reclaimer, exact owner comparison) without
-// waiting, and the lock it then holds is released at once.
+// Only the exact lock observed here, which the host exclusion refresh took
+// in this boot and PID namespace and whose process no longer runs, is
+// released. The protocol's own acquisition reclaims the lock it reads itself
+// (one reclaimer, exact owner comparison), so just before it reclaims, the
+// lock must still be that observed lock; a lock put there in between by any
+// other writer is left alone. The lock the acquisition then holds is released at once.
 function reclaimRefreshLock(lockPath, acquire) {
     const observed = observeLock(lockPath);
     if (observed.state === 'free') return observed;
     if (observed.state !== 'dead' || !isHostRefreshAuthority(observed.owner?.authority)) {
         return { ...observed, state: observed.state === 'dead' ? 'dead-other-writer' : observed.state };
     }
+    let reclaiming = false;
+    const hooks = {
+        beforeReclaim() {
+            if (observeLock(lockPath).identity !== observed.identity) {
+                throw Object.assign(new Error('the lock changed after recovery observed it, so it is not proven to be that refresh\'s'),
+                    { outcome: 'changed-after-observation' });
+            }
+            reclaiming = true;
+        },
+    };
     try {
-        acquire().release();
-        return { ...observed, state: 'reclaimed' };
+        acquire(hooks).release();
+        // Without a reclaim the observed lock was already gone.
+        return { ...observed, state: reclaiming ? 'reclaimed' : 'free' };
     } catch (error) {
         return { ...observed, state: String(error?.outcome || error?.code || 'reclaim-failed'), reason: error?.message || String(error) };
     }
@@ -318,8 +354,8 @@ function recoverFolder(folder, { identity, planner }) {
             unproven.push(`its Git metadata resolves outside the workspace (${repository.commonDir})`);
         } else {
             const lockPath = path.join(repository.commonDir, GIT_CONFIG_LOCK);
-            locks.push({ kind: 'Git configuration', lockPath, result: reclaimRefreshLock(lockPath, () => acquireGitConfigLock(
-                repository.commonDir, { waitMs: 0, exclusions: planner, authority: HOST_EXCLUSIONS_AUTHORITY },
+            locks.push({ kind: 'Git configuration', lockPath, result: reclaimRefreshLock(lockPath, hooks => acquireGitConfigLock(
+                repository.commonDir, { waitMs: 0, exclusions: planner, authority: HOST_EXCLUSIONS_AUTHORITY, hooks },
             )) });
         }
     }
@@ -330,12 +366,12 @@ function recoverFolder(folder, { identity, planner }) {
     } else if (agentsEntry) {
         const exportLock = path.join(agents, EXPORT_LOCK);
         const skills = path.join(agents, 'skills');
-        locks.push({ kind: 'export', lockPath: exportLock, result: reclaimRefreshLock(exportLock, () => {
+        locks.push({ kind: 'export', lockPath: exportLock, result: reclaimRefreshLock(exportLock, (hooks) => {
             // Acquisition creates a missing skills directory; this recovery creates nothing.
             if (!fs.lstatSync(skills, { throwIfNoEntry: false })?.isDirectory()) {
                 throw Object.assign(new Error(`${skills} is not a directory`), { outcome: 'skills-directory-missing' });
             }
-            return acquireSkillExportLock(folder, { waitMs: 0, authority: HOST_EXCLUSIONS_AUTHORITY });
+            return acquireSkillExportLock(folder, { waitMs: 0, authority: HOST_EXCLUSIONS_AUTHORITY, hooks });
         }) });
     }
     for (const { kind, lockPath, result } of locks) {
@@ -370,11 +406,20 @@ export function recoverInterruptedHostExclusions({
 } = {}) {
     const records = [];
     const warnings = [];
+    const note = (code, reason) => {
+        records.push(createOperationRecord({
+            phase: 'skills-manifest', id: 'exclusions-recovery:record', outcome: 'uncertain', required: false, code, reason,
+        }));
+        warnings.push(reason);
+    };
     let stored;
     try {
         stored = intent.read();
     } catch (error) {
-        stored = { unreadable: error?.message || String(error) };
+        // A failed read says nothing about the folders the record names.
+        note('exclusions-intent-unreadable', `The record of an earlier host exclusion refresh could not be read `
+            + `(${describeFailure(error)}); it is kept, and a later update revisits its folders`);
+        return { records, warnings };
     }
     if (stored === null || stored === undefined) return { records, warnings };
     const folders = recordedFolders(stored, identity);
@@ -388,17 +433,13 @@ export function recoverInterruptedHostExclusions({
         }
     }
     if (!folders || !planner) {
-        const detail = stored?.unreadable || plannerError?.message || '';
-        const reason = folders
-            ? `The folders of an interrupted host exclusion refresh could not be inspected${detail ? ` (${detail})` : ''}; they are revisited by the next update`
-            : 'The record of an earlier host exclusion refresh is unreadable, so its folders cannot be revisited; '
-                + `a lock it left is reported by the next export that meets it${detail ? ` (${detail})` : ''}`;
-        records.push(createOperationRecord({
-            phase: 'skills-manifest', id: 'exclusions-recovery:record', outcome: 'uncertain', required: false,
-            code: folders ? 'interrupted-refresh-locks-unproven' : 'exclusions-intent-invalid', reason,
-        }));
-        warnings.push(reason);
-        if (!folders) {
+        const detail = plannerError?.message || '';
+        if (folders) {
+            note('interrupted-refresh-locks-unproven', 'The folders of an interrupted host exclusion refresh could not be '
+                + `inspected${detail ? ` (${detail})` : ''}; they are revisited by the next update`);
+        } else {
+            note('exclusions-intent-invalid', 'The record of an earlier host exclusion refresh does not have the expected form, '
+                + 'so its folders cannot be revisited; a lock it left is reported by the next export that meets it');
             try { intent.remove(); } catch (_) {}
         }
         return { records, warnings };

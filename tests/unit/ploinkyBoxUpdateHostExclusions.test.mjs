@@ -16,7 +16,7 @@ import {
     recoverInterruptedHostExclusions,
     refreshDeferredHostExclusions,
 } from '../../ploinky-box/update/hostExclusions.mjs';
-import { createMemoryUpdateHostState } from '../../ploinky-box/update/hostState.mjs';
+import { createMemoryUpdateHostState, createUpdateHostState } from '../../ploinky-box/update/hostState.mjs';
 import { agentLibFixture } from '../helpers/agentlibFixture.mjs';
 import { fakeRestartCore, fakeUpdateCore, verifiedRecord } from '../helpers/fakeUpdateCore.mjs';
 
@@ -530,7 +530,7 @@ test('recovery never follows a linked .agents directory to an export lock', t =>
     assert.deepEqual(intent.record.folders, [w.project]);
 });
 
-test('an unreadable refresh record is reported once and forgotten', t => {
+test('a malformed refresh record is reported once and forgotten; one that cannot be read is reported and kept', t => {
     const w = workspace(t);
     for (const stored of [
         { schema: 'another-record' },
@@ -545,8 +545,10 @@ test('an unreadable refresh record is reported once and forgotten', t => {
     }
     const unreadable = { removed: false, read() { throw new Error('record is not private'); }, write() { assert.fail('nothing is written'); }, remove() { unreadable.removed = true; } };
     const { records } = recoverInterruptedHostExclusions({ intent: unreadable, identity: w.identity });
-    assert.match(records[0].reason, /record is not private/);
-    assert.equal(unreadable.removed, true);
+    assert.deepEqual(records.map(record => [record.id, record.outcome, record.code]),
+        [['exclusions-recovery:record', 'uncertain', 'exclusions-intent-unreadable']]);
+    assert.match(records[0].reason, /record is not private.*it is kept/);
+    assert.equal(unreadable.removed, false, 'a record that could not be read is never removed');
     assert.deepEqual(recoverInterruptedHostExclusions({ intent: memoryIntent(), identity: w.identity }), { records: [], warnings: [] });
 });
 
@@ -626,4 +628,98 @@ test('an update keeps a folder whose locks it could not prove released recorded,
         'the unproven folder is still recorded after the refresh of another folder');
     assert.deepEqual([fs.existsSync(path.join(other, '.git', 'ploinky-skill-exports-config.lock')),
         fs.existsSync(path.join(other, '.agents', tx.EXPORT_LOCK))], [true, true]);
+});
+
+test('recovery releases only the exact lock it observed, never one another writer put there before the reclaim', t => {
+    const w = workspace(t);
+    holdLocks(w, { pid: endedPid() });
+    const lock = configLockPath(w);
+    const ownerFile = path.join(lock, 'owner.json');
+    const readFileSync = fs.readFileSync;
+    t.after(() => { fs.readFileSync = readFileSync; });
+    let replacement = null;
+    // Right after recovery reads the dead host refresh's owner, another host
+    // writer reclaims that lock, takes it and dies before the reclaim follows.
+    fs.readFileSync = function (file, ...rest) {
+        const result = readFileSync.call(this, file, ...rest);
+        if (replacement === null && file === ownerFile) {
+            replacement = 'pending';
+            fs.unlinkSync(ownerFile);
+            fs.rmdirSync(lock);
+            const self = { ...tx.currentSkillExportIdentity(), pid: endedPid(), start: '' };
+            tx.acquireGitConfigLock(path.join(w.project, '.git'), {
+                liveness: { current: () => self }, authority: { kind: 'ploinky-cli', operation: 'skills-export' }, waitMs: 0,
+            });
+            replacement = readFileSync.call(fs, ownerFile, 'utf8');
+        }
+        return result;
+    };
+    const intent = memoryIntent(intentFor(w, [w.project]));
+    const { records } = recoverInterruptedHostExclusions({ intent, identity: w.identity });
+    fs.readFileSync = readFileSync;
+    assert.equal(JSON.parse(replacement).authority.operation, 'skills-export', "the race put another writer's dead lock there");
+    assert.equal(fs.existsSync(ownerFile) && fs.readFileSync(ownerFile, 'utf8'), replacement, 'that lock is preserved');
+    assert.deepEqual(records.map(record => [record.outcome, record.code]),
+        [['changed', 'interrupted-refresh-locks-released'], ['uncertain', 'interrupted-refresh-locks-unproven']]);
+    assert.deepEqual(records[0].details.released, [exportLockPath(w)], 'only the unchanged export lock was released');
+    assert.match(records[1].reason, /Git configuration lock .* is changed-after-observation/);
+    assert.deepEqual(intent.record.folders, [w.project]);
+});
+
+// A durable record whose file cannot be opened once (EMFILE), then can.
+function flakyStore(w) {
+    const stateRoot = path.join(w.root, 'host-state');
+    const record = path.join(stateRoot, HOST_EXCLUSIONS_INTENT_KIND, `${w.identity.instance}.json`);
+    const control = { failures: 0 };
+    const fsApi = { ...fs, constants: fs.constants, openSync(file, ...rest) {
+        if (control.failures > 0 && file === record) {
+            control.failures -= 1;
+            throw Object.assign(new Error(`EMFILE: too many open files, open '${file}'`), { code: 'EMFILE' });
+        }
+        return fs.openSync(file, ...rest);
+    } };
+    const store = createUpdateHostState({ stateRoot, fsApi });
+    const intent = {
+        read: () => store.read(HOST_EXCLUSIONS_INTENT_KIND, w.identity.instance),
+        write: value => store.write(HOST_EXCLUSIONS_INTENT_KIND, w.identity.instance, value),
+        remove: () => store.remove(HOST_EXCLUSIONS_INTENT_KIND, w.identity.instance),
+    };
+    return { control, intent, recorded: () => store.read(HOST_EXCLUSIONS_INTENT_KIND, w.identity.instance)?.folders ?? null };
+}
+
+test('a record that cannot be read now is kept and reported, never discarded, and a later update recovers from it', t => {
+    const w = workspace(t);
+    const pid = endedPid();
+    holdLocks(w, { pid });
+    const flaky = flakyStore(w);
+    flaky.intent.write(intentFor(w, [w.project]));
+    flaky.control.failures = 1;
+    const first = recoverInterruptedHostExclusions({ intent: flaky.intent, identity: w.identity });
+    assert.deepEqual(first.records.map(record => [record.id, record.outcome, record.code]),
+        [['exclusions-recovery:record', 'uncertain', 'exclusions-intent-unreadable']]);
+    assert.match(first.records[0].reason, /EMFILE/);
+    assert.deepEqual(flaky.recorded(), [w.project], 'the record is kept');
+    assert.deepEqual([fs.existsSync(configLockPath(w)), fs.existsSync(exportLockPath(w))], [true, true], 'nothing was touched');
+    const second = recoverInterruptedHostExclusions({ intent: flaky.intent, identity: w.identity });
+    assert.deepEqual(second.records.map(record => [record.outcome, record.code]), [['changed', 'interrupted-refresh-locks-released']]);
+    assert.match(second.warnings.join('\n'), new RegExp(`\\(pid ${pid}\\) ended`));
+    assert.equal(flaky.recorded(), null);
+});
+
+test('the refresh takes no lock and leaves the record alone when the record of earlier folders cannot be read', async t => {
+    const w = workspace(t);
+    const flaky = flakyStore(w);
+    const kept = path.join(w.real, 'kept');
+    flaky.intent.write(intentFor(w, [kept]));
+    flaky.control.failures = 1;
+    const calls = [];
+    const records = await refreshDeferredHostExclusions({
+        folders: [w.boxProject], identity: w.identity, intent: flaky.intent,
+        refresh: () => { calls.push('refresh'); return { exclusions: { status: 'published' } }; },
+    });
+    assert.deepEqual(calls, []);
+    assert.deepEqual(records.map(record => [record.id, record.outcome, record.code, record.required]),
+        [['exclusions:intent', 'uncertain', 'exclusions-intent-unreadable', false]]);
+    assert.match(records[0].reason, /EMFILE/);
+    assert.deepEqual(flaky.recorded(), [kept], 'the earlier folders are still recorded');
 });
