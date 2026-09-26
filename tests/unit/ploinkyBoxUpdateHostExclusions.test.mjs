@@ -684,7 +684,7 @@ function flakyStore(w) {
         write: value => store.write(HOST_EXCLUSIONS_INTENT_KIND, w.identity.instance, value),
         remove: () => store.remove(HOST_EXCLUSIONS_INTENT_KIND, w.identity.instance),
     };
-    return { control, intent, recorded: () => store.read(HOST_EXCLUSIONS_INTENT_KIND, w.identity.instance)?.folders ?? null };
+    return { control, intent, file: record, recorded: () => store.read(HOST_EXCLUSIONS_INTENT_KIND, w.identity.instance)?.folders ?? null };
 }
 
 test('a record that cannot be read now is kept and reported, never discarded, and a later update recovers from it', t => {
@@ -722,4 +722,27 @@ test('the refresh takes no lock and leaves the record alone when the record of e
         [['exclusions:intent', 'uncertain', 'exclusions-intent-unreadable', false]]);
     assert.match(records[0].reason, /EMFILE/);
     assert.deepEqual(flaky.recorded(), [kept], 'the earlier folders are still recorded');
+});
+
+test('a record file that is not JSON is corrupt: reported once and removed, and a refresh that meets it records its own folders', async t => {
+    const w = workspace(t);
+    const flaky = flakyStore(w);
+    flaky.intent.write(intentFor(w, [w.project]));
+    fs.writeFileSync(flaky.file, '{ not json');
+    const { records } = recoverInterruptedHostExclusions({ intent: flaky.intent, identity: w.identity });
+    assert.deepEqual(records.map(record => [record.id, record.outcome, record.code]),
+        [['exclusions-recovery:record', 'uncertain', 'exclusions-intent-invalid']]);
+    assert.match(records[0].reason, /not valid JSON/);
+    assert.equal(fs.existsSync(flaky.file), false, 'the corrupt record is removed');
+
+    flaky.intent.write(intentFor(w, [w.project]));
+    fs.writeFileSync(flaky.file, '{ not json');
+    const seen = [];
+    const [record] = await refreshDeferredHostExclusions({
+        folders: [w.boxProject], identity: w.identity, intent: flaky.intent,
+        refresh: (folder, options) => { seen.push(flaky.recorded()); return tx.refreshSkillExportExclusions(folder, options); },
+    });
+    assert.equal(record.outcome, 'changed');
+    assert.deepEqual(seen, [[w.project]], 'the refresh replaced the corrupt record with its own folders');
+    assert.equal(flaky.recorded(), null);
 });

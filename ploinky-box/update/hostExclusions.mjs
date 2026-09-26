@@ -33,8 +33,9 @@ import { relativeBoxWorkspacePath } from '../contract/workspace-root.mjs';
 // such a lock only when its owner record proves, in this boot and PID
 // namespace, that the host refresh which took it has ended, and only while
 // that exact lock is still in place. It keeps every folder it cannot prove
-// released, and a record it cannot read. A pending journal stays for the
-// confined executor and Git's own lock files are never touched.
+// released, and a record it cannot read; only a corrupt or malformed record
+// is dropped. A pending journal stays for the confined executor and Git's own
+// lock files are never touched.
 
 export const MAX_DEFERRED_EXCLUSION_FOLDERS = 64;
 export const HOST_EXCLUSIONS_AUTHORITY = Object.freeze({
@@ -77,6 +78,11 @@ function intentRecord(identity, folders) {
 
 // A store error names the record; its cause names the I/O failure.
 const describeFailure = error => `${error?.message || error}${error?.cause ? ` (${error.cause.code || error.cause.message})` : ''}`;
+// A record the store read but could not parse is corrupt, like one of the
+// wrong form. Any other read failure (I/O such as EMFILE, EIO, EACCES or
+// ELOOP, or the store's refusal of a file that is not private) says nothing
+// about the folders it names.
+const isCorruptRecord = error => error?.cause instanceof SyntaxError;
 
 // The folders a well-formed record of this workspace names, else null.
 function recordedFolders(stored, identity) {
@@ -177,15 +183,19 @@ export async function refreshDeferredHostExclusions({
             stored = intent.read?.();
         } catch (error) {
             // A record that cannot be read may still name folders whose locks
-            // wait for recovery; replacing it could lose them, so no lock is taken.
-            records.push(createOperationRecord({
-                phase: 'skills-manifest', id: 'exclusions:intent', outcome: 'uncertain', required: false,
-                code: 'exclusions-intent-unreadable',
-                reason: 'No host exclusions were refreshed: the private record of earlier folders could not be read '
-                    + `(${describeFailure(error)}), and replacing it could lose them.`,
-                details: { folders: targets.map(target => target.folder) },
-            }));
-            return records;
+            // wait for recovery; replacing it could lose them, so no lock is
+            // taken. A corrupt record names no folder anyone could revisit.
+            if (!isCorruptRecord(error)) {
+                records.push(createOperationRecord({
+                    phase: 'skills-manifest', id: 'exclusions:intent', outcome: 'uncertain', required: false,
+                    code: 'exclusions-intent-unreadable',
+                    reason: 'No host exclusions were refreshed: the private record of earlier folders could not be read '
+                        + `(${describeFailure(error)}), and replacing it could lose them.`,
+                    details: { folders: targets.map(target => target.folder) },
+                }));
+                return records;
+            }
+            stored = null;
         }
         kept = recordedFolders(stored, identity) || [];
         try {
@@ -413,13 +423,18 @@ export function recoverInterruptedHostExclusions({
         warnings.push(reason);
     };
     let stored;
+    let corrupt = '';
     try {
         stored = intent.read();
     } catch (error) {
-        // A failed read says nothing about the folders the record names.
-        note('exclusions-intent-unreadable', `The record of an earlier host exclusion refresh could not be read `
-            + `(${describeFailure(error)}); it is kept, and a later update revisits its folders`);
-        return { records, warnings };
+        if (!isCorruptRecord(error)) {
+            // A failed read says nothing about the folders the record names.
+            note('exclusions-intent-unreadable', `The record of an earlier host exclusion refresh could not be read `
+                + `(${describeFailure(error)}); it is kept, and a later update revisits its folders`);
+            return { records, warnings };
+        }
+        corrupt = describeFailure(error);
+        stored = { corrupt };
     }
     if (stored === null || stored === undefined) return { records, warnings };
     const folders = recordedFolders(stored, identity);
@@ -438,7 +453,7 @@ export function recoverInterruptedHostExclusions({
             note('interrupted-refresh-locks-unproven', 'The folders of an interrupted host exclusion refresh could not be '
                 + `inspected${detail ? ` (${detail})` : ''}; they are revisited by the next update`);
         } else {
-            note('exclusions-intent-invalid', 'The record of an earlier host exclusion refresh does not have the expected form, '
+            note('exclusions-intent-invalid', `The record of an earlier host exclusion refresh ${corrupt ? `is corrupt (${corrupt})` : 'does not have the expected form'}, `
                 + 'so its folders cannot be revisited; a lock it left is reported by the next export that meets it');
             try { intent.remove(); } catch (_) {}
         }
