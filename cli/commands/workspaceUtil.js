@@ -109,6 +109,12 @@ import {
 import { applyEdgeRoutingGeneration } from '../sandbox/coordinatedEdgeApply.js';
 import { readRuntimeCandidate, retireRuntimeCandidate } from '../sandbox/runtimeCandidateStore.js';
 import {
+  hasCompleteRuntimeTuple,
+  readRuntimePredecessor,
+  retireRuntimePredecessor,
+  writeRuntimePredecessor,
+} from '../sandbox/runtimePredecessorStore.js';
+import {
   finalizeStartupRoutes,
   partitionAdditionalStartupAgents,
   resolveManifestStartup,
@@ -993,12 +999,14 @@ function computeRetainedManagedEnvHash(node, record, profileConfig, runtimeNetwo
 }
 
 function removeGraphContainerForRecreate(containerName, label, predecessorRecord, {
+  predecessorReceipt = null,
   clearLivenessStateImpl = dockerSvc.clearLivenessState,
   containerExistsImpl = dockerSvc.containerExists,
   getRuntimeImpl = dockerSvc.getRuntime,
   removeExactRegisteredContainerImpl = removeExactRegisteredContainer,
   readRuntimeCandidateImpl = readRuntimeCandidate,
   retireRuntimeCandidateImpl = retireRuntimeCandidate,
+  retireRuntimePredecessorImpl = retireRuntimePredecessor,
   inspectExactContainerImpl = inspectExactContainer,
 } = {}) {
   // A staged predecessor whose launcher never published it (a no-wait worker
@@ -1020,11 +1028,43 @@ function removeGraphContainerForRecreate(containerName, label, predecessorRecord
         }
       } catch (_) {}
     }
+    if (predecessorReceipt) {
+      // The predecessor receipt is the only proof of the tuple a predecessor
+      // still present here carries. A name miss can be an unavailable engine,
+      // so retire it, and continue toward a launch, only once the engine
+      // positively reports the exact predecessor missing.
+      let absent = false;
+      try {
+        absent = inspectExactContainerImpl(
+          predecessorRecord?.runtime || getRuntimeImpl(),
+          unpublished ? containerName : predecessorRecord.containerId,
+        ) === null;
+      } catch (_) {}
+      if (!absent) {
+        const error = new Error(
+          `[${label}] preserved the predecessor receipt of '${containerName}' because the exact predecessor's absence was not proven`,
+        );
+        error.code = 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS';
+        throw error;
+      }
+      retireRuntimePredecessorImpl(predecessorReceipt);
+    }
     return { removed: false, state: 'absent' };
   }
+  let result;
   try {
-    const receipt = unpublished ? readRuntimeCandidateImpl(containerName, predecessorRecord) : null;
-    const result = removeExactRegisteredContainerImpl(
+    // A launch for this exact tuple that stopped before publishing keeps the
+    // replaced predecessor's ID in the registry; its receipt names the runtime
+    // it created in that predecessor's place, exactly as for a direct recreate.
+    const receipt = unpublished || hasCompleteRuntimeTuple(predecessorRecord)
+      ? readRuntimeCandidateImpl(containerName, predecessorRecord)
+      : null;
+    if (receipt && !unpublished
+        && receipt.containerId !== predecessorRecord.containerId
+        && receipt.predecessorContainerId !== predecessorRecord.containerId) {
+      throw new Error('registered container ID conflicts with the persisted launch receipt');
+    }
+    result = removeExactRegisteredContainerImpl(
       containerName,
       receipt ? { ...predecessorRecord, ...receipt.registryRecord } : predecessorRecord,
       {
@@ -1037,7 +1077,6 @@ function removeGraphContainerForRecreate(containerName, label, predecessorRecord
     }
     if (receipt) retireRuntimeCandidateImpl(receipt);
     clearLivenessStateImpl(containerName);
-    return result;
   } catch (cause) {
     const error = new Error(
       `[${label}] preserved container '${containerName}' because exact immutable ownership/removal was not proven`,
@@ -1046,6 +1085,9 @@ function removeGraphContainerForRecreate(containerName, label, predecessorRecord
     error.code = 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS';
     throw error;
   }
+  // Removed: this exact predecessor no longer needs its proof.
+  if (predecessorReceipt) retireRuntimePredecessorImpl(predecessorReceipt);
+  return result;
 }
 
 function graphNodeRuntimeReplacementReason(plan, {
@@ -1330,6 +1372,9 @@ function ensureGraphNodesEnabled(graph, reg, {
   executionRecordOptions,
   additionalNodes = [],
   supersededNoWaitRuns = [],
+  readRuntimePredecessorImpl = readRuntimePredecessor,
+  writeRuntimePredecessorImpl = writeRuntimePredecessor,
+  retireRuntimePredecessorImpl = retireRuntimePredecessor,
 } = {}) {
   const nodes = [
     ...Array.from(graph?.nodes?.values?.() || []),
@@ -1371,13 +1416,23 @@ function ensureGraphNodesEnabled(graph, reg, {
         ? 'noWaitRunSuperseded'
         : String(runtimeReplacementReason(preliminary, runtimeReplacementOptions) || '');
     }
+    // A start that stopped after persisting this record's rotated tuple but
+    // before removing its predecessor left that predecessor's own tuple in a
+    // receipt keyed by the rotated one. Only that tuple proves the container.
+    const priorPredecessorReceipt = executionChanged || profileChanged || runtimeReason
+      ? readRuntimePredecessorImpl(existing.key, existing.rec)
+      : null;
     existingPlans.push({
       ...preliminary,
       runtimeReason,
+      registryRecord: structuredClone(existing.rec),
+      priorPredecessorReceipt,
       // The desired registry receives a fresh candidate tuple before removal
       // so the inactive generation can be compiled. Keep a detached snapshot
       // as the only ownership proof authorized to remove the predecessor.
-      predecessorRecord: structuredClone(existing.rec),
+      predecessorRecord: priorPredecessorReceipt
+        ? { ...structuredClone(existing.rec), ...structuredClone(priorPredecessorReceipt.predecessor) }
+        : structuredClone(existing.rec),
     });
   }
 
@@ -1448,11 +1503,27 @@ function ensureGraphNodesEnabled(graph, reg, {
     retireNoWaitMarkers([
       ...stagedPlans.map((plan) => ({
         containerName: plan.existing.key,
-        record: plan.predecessorRecord,
+        record: plan.registryRecord,
       })),
       ...missingContainerNames,
     ]);
+    // The rotated registry below keeps each predecessor's container ID under
+    // the fresh tuple. Make every predecessor's own tuple durable first, so a
+    // start stopped before the removal loop completes stays recoverable.
+    for (const plan of changedPlans) {
+      if (!hasCompleteRuntimeTuple(plan.predecessorRecord)) continue;
+      plan.predecessorReceipt = writeRuntimePredecessorImpl({
+        containerName: plan.existing.key,
+        successor: reg[plan.existing.key],
+        predecessor: plan.predecessorRecord,
+      });
+    }
     if (changedPlans.length) saveAgents(reg, { coordinate: false });
+    // The receipts just written now carry every earlier receipt's predecessor.
+    for (const plan of changedPlans) {
+      if (!plan.priorPredecessorReceipt) continue;
+      try { retireRuntimePredecessorImpl(plan.priorPredecessorReceipt); } catch (_) {}
+    }
     saveRouting(routing);
   } else if (missingContainerNames.length) {
     // prepareAgentEnableBatch persists the new registry tuple, so stale marker
@@ -1487,6 +1558,7 @@ function ensureGraphNodesEnabled(graph, reg, {
         plan.existing.key,
         `workspaceGraph:${plan.node.id}:${reasons.join('+')}`,
         plan.predecessorRecord,
+        { predecessorReceipt: plan.predecessorReceipt || null },
       );
     }
   } catch (error) {
