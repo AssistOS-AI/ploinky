@@ -67,13 +67,19 @@ function createWorkspace(t) {
         repos[name] = { checkout, before: git(checkout, 'rev-parse', 'HEAD'), upstream: git(bare, 'rev-parse', 'main') };
     }
     // Simple-variant SSH: the last argument is the remote command. It records
-    // which repository's fetch started, holds it, then serves it locally.
+    // which repository's fetch started, holds it, then serves it locally. The
+    // marker naming its PID is renamed into place complete, so a reader sees
+    // either no marker or the whole PID, even when the transport is killed
+    // while publishing it; FIXTURE_PUBLISH_PAUSE holds that window open.
     const ssh = path.join(root, 'fake-ssh');
     fs.writeFileSync(ssh, [
         '#!/bin/sh',
         'for last; do :; done',
         'repo=$(printf \'%s\\n\' "$last" | cut -d"\'" -f2)',
-        'echo $$ > "$FIXTURE_MARKERS/$(basename "$repo" .git).started"',
+        'name=$(basename "$repo" .git)',
+        'echo $$ > "$FIXTURE_MARKERS/.$name.$$.tmp"',
+        'sleep "${FIXTURE_PUBLISH_PAUSE:-0}"',
+        'mv -f "$FIXTURE_MARKERS/.$name.$$.tmp" "$FIXTURE_MARKERS/$name.started"',
         'sleep "$FIXTURE_FETCH_DELAY"',
         'exec git upload-pack "$repo"',
         '',
@@ -155,7 +161,10 @@ function startedFetches(ws) {
     return fs.readdirSync(ws.markers).filter(name => name.endsWith('.started')).map(name => name.slice(0, -'.started'.length)).sort();
 }
 
+// 0 or a negative number would address a whole process group, whose
+// liveness probe never reports ESRCH.
 function processGone(pid) {
+    if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error(`not a process ID: ${pid}`);
     try {
         process.kill(pid, 0);
         return false;
@@ -164,13 +173,70 @@ function processGone(pid) {
     }
 }
 
+// A published marker holds one positive PID; anything else is a harness
+// fault, never a process to wait for or signal.
+function markerPid(ws, name) {
+    const text = fs.readFileSync(path.join(ws.markers, `${name}.started`), 'utf8');
+    const pid = /^[1-9][0-9]{0,9}\n?$/.test(text) ? Number(text) : 0;
+    if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error(`marker ${name}.started holds no PID: ${JSON.stringify(text)}`);
+    return pid;
+}
+
 // Nothing the fixture started may still write when the checkouts are judged.
 async function fixtureQuiet(ws) {
     for (const name of startedFetches(ws)) {
-        const pid = Number(fs.readFileSync(path.join(ws.markers, `${name}.started`), 'utf8'));
+        const pid = markerPid(ws, name);
         await waitFor(`fetch transport ${pid} to end`, () => processGone(pid), 15_000);
     }
 }
+
+// A marker written in place exists empty between its creation and its write,
+// and stays empty if its writer is killed there. Read unvalidated, that is
+// PID 0 (I014 saw `timed out waiting for fetch transport 0 to end`).
+test('an in-place PID marker is visible empty during its write window and is never read as a process', async (t) => {
+    const ws = createWorkspace(t);
+    const inPlace = path.join(ws.root, 'in-place-writer');
+    fs.writeFileSync(inPlace, ['#!/bin/sh', ': > "$FIXTURE_MARKERS/Alpha.started"', 'sleep 30', 'echo $$ > "$FIXTURE_MARKERS/Alpha.started"', ''].join('\n'),
+        { mode: 0o755 });
+    const writer = spawn(inPlace, [], { env: { PATH: process.env.PATH, FIXTURE_MARKERS: ws.markers }, stdio: 'ignore', detached: true });
+    t.after(() => {
+        try { process.kill(-writer.pid, 'SIGKILL'); } catch (_) {}
+    });
+    await waitFor('the in-place marker to appear', () => startedFetches(ws).length > 0, 10_000);
+    const marker = path.join(ws.markers, 'Alpha.started');
+    assert.equal(fs.readFileSync(marker, 'utf8'), '', 'the fetch looks started while its PID is still missing');
+    assert.equal(Number(fs.readFileSync(marker, 'utf8')), 0, 'an unvalidated read turns it into PID 0');
+    const startedAt = Date.now();
+    await assert.rejects(fixtureQuiet(ws), /marker Alpha\.started holds no PID: ""/);
+    assert.ok(Date.now() - startedAt < 5_000, 'the harness fails at once instead of waiting on PID 0');
+    for (const text of ['0\n', '-1\n', `${process.pid}x\n`, '\n', ` ${process.pid}\n`, '12345678901\n']) {
+        fs.writeFileSync(marker, text);
+        assert.throws(() => markerPid(ws, 'Alpha'), /holds no PID/, JSON.stringify(text));
+    }
+    for (const pid of [0, -1, -process.pid, Number.NaN, 1.5]) {
+        assert.throws(() => processGone(pid), /not a process ID/, String(pid));
+    }
+});
+
+test('the fake SSH transport publishes its PID marker only complete, even when killed while publishing', async (t) => {
+    const ws = createWorkspace(t);
+    const transport = spawn(ws.ssh, ['fixture.invalid', `git-upload-pack '${path.join(ws.root, 'Alpha.git')}'`], {
+        env: { PATH: process.env.PATH, FIXTURE_MARKERS: ws.markers, FIXTURE_PUBLISH_PAUSE: '30', FIXTURE_FETCH_DELAY: '0' },
+        stdio: 'ignore', detached: true,
+    });
+    t.after(() => {
+        try { process.kill(-transport.pid, 'SIGKILL'); } catch (_) {}
+    });
+    const staged = await waitFor('the transport to stage its complete PID', () => fs.readdirSync(ws.markers).find(name => (
+        name.endsWith('.tmp') && fs.readFileSync(path.join(ws.markers, name), 'utf8') === `${transport.pid}\n`
+    )), 10_000);
+    assert.deepEqual(startedFetches(ws), [], 'while the window is open, no fetch looks started');
+    const exited = new Promise(resolve => transport.once('exit', (code, signal) => resolve({ code, signal })));
+    process.kill(-transport.pid, 'SIGKILL');
+    assert.deepEqual(await exited, { code: null, signal: 'SIGKILL' });
+    assert.deepEqual(startedFetches(ws), [], 'a transport killed while publishing never publishes a marker');
+    assert.deepEqual(fs.readdirSync(ws.markers), [staged], 'only its private staging file remains');
+});
 
 function checkoutState(ws, name) {
     const { checkout } = ws.repos[name];
