@@ -576,6 +576,69 @@ test('the checkout lock is reclaimed only from an affirmatively dead same-scope 
     }
 });
 
+test('a foreign-scope owner is reclaimed only when the host attests that its Box run ended', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-checkout-lock-box-'));
+    try {
+        const workspace = `ploinky-box-demo-${'d'.repeat(16)}`;
+        const box = 'b'.repeat(64);
+        const replaced = 'c'.repeat(64);
+        const engine = 'engine-store';
+        const lockPath = path.join(root, CHECKOUT_LOCK_NAME);
+        const ownerFile = path.join(lockPath, 'owner.json');
+        // The acquirer runs in a later run of the Box: another PID namespace.
+        const processApi = {
+            pid: process.pid,
+            hostname: 'box',
+            scope: () => ({ bootId: 'boot', pidNamespace: 'pid:[2]', scope: 'box-run-2' }),
+            processStart: () => '',
+            kill: () => { throw new Error('a foreign-scope owner is never signalled'); },
+        };
+        const writeOwner = (recorded, scope = 'box-run-1') => {
+            fs.rmSync(lockPath, { recursive: true, force: true });
+            fs.mkdirSync(lockPath);
+            fs.writeFileSync(ownerFile, JSON.stringify({
+                schema: 'ploinky-update-checkout-lock', version: 1, token: 'old-token', pid: 4242, scope, hostname: 'box', box: recorded,
+            }));
+        };
+        const acquire = (boxRun, api = processApi) => acquireCheckoutLock({ commonDir: root, waitMs: 60, retryMs: 20, processApi: api, boxRun });
+        const run = { workspace, containerId: box, engine, soleRunning: false };
+        const staysBusy = (recorded, boxRun, why, api) => {
+            writeOwner(recorded, api ? 'box-run-2' : 'box-run-1');
+            assert.equal(acquire(boxRun, api).code, 'lock-busy', why);
+            assert.equal(JSON.parse(fs.readFileSync(ownerFile, 'utf8')).token, 'old-token', why);
+        };
+
+        staysBusy({ workspace, containerId: box }, null, 'no attestation: a direct in-Box or a host writer');
+        staysBusy(null, run, 'an owner that recorded no Box');
+        staysBusy({ workspace: `ploinky-box-other-${'e'.repeat(16)}`, containerId: box }, run, 'another workspace');
+        staysBusy({ workspace, containerId: replaced, engine }, run, 'another container that the host did not see stopped');
+        staysBusy({ workspace, containerId: replaced, engine: 'another-engine' }, { ...run, soleRunning: true },
+            'a container of another engine, which the listing cannot see');
+        staysBusy({ workspace, containerId: replaced }, { ...run, soleRunning: true }, 'a binding without its engine');
+        staysBusy({ workspace, containerId: 'not-a-container' }, { ...run, soleRunning: true }, 'a malformed binding');
+        staysBusy({ workspace, containerId: box }, { workspace, containerId: 'short', soleRunning: true }, 'a malformed attestation');
+        staysBusy({ workspace, containerId: box }, { ...run, soleRunning: true }, 'a live owner in this scope stays live',
+            { ...processApi, kill: () => {} });
+
+        // An earlier run of this same container: the Box was stopped and started, or the host rebooted.
+        writeOwner({ workspace, containerId: box });
+        assert.equal(ownerIsProvenDead(JSON.parse(fs.readFileSync(ownerFile, 'utf8')), processApi, run), true);
+        const restarted = acquire(run);
+        assert.equal(restarted.ok, true, restarted.reason);
+        assert.deepEqual(JSON.parse(fs.readFileSync(ownerFile, 'utf8')).box, { workspace, containerId: box, engine },
+            'the new owner binds to its own Box run');
+        assert.equal(restarted.lock.release(), true);
+
+        // A replaced Box: the host saw the current container as the workspace's only running one in this engine.
+        writeOwner({ workspace, containerId: replaced, engine });
+        const replacedBox = acquire({ ...run, soleRunning: true });
+        assert.equal(replacedBox.ok, true, replacedBox.reason);
+        assert.equal(replacedBox.lock.release(), true);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
 test('throwUnlessVerified raises a typed error that carries the record', () => {
     const fx = createFixture();
     try {

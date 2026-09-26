@@ -38,6 +38,22 @@ export const IN_BOX_ACTIVATION_NOTICE = 'This update ran inside the Box: activat
 
 const LOCK_BUSY_CODES = new Set(['workspace_mutation_lock_timeout', 'PLOINKY_WORKSPACE_MUTATION_BUSY']);
 
+// The host exec's this update into the exact Box container named by the
+// report context, after listing the workspace's running Box containers under
+// its workspace lock. Checkout locks bind to that Box run.
+export function boxRunFromReportContext(context, { insideBox }) {
+    const workspace = context?.workspace?.instance;
+    const containerId = context?.box?.containerId;
+    if (!insideBox || typeof workspace !== 'string' || !workspace || typeof containerId !== 'string') return null;
+    const running = context.box.runningContainers;
+    return Object.freeze({
+        workspace,
+        containerId,
+        engine: typeof context.box.engine === 'string' ? context.box.engine : '',
+        soleRunning: Array.isArray(running) && running.length === 1 && running[0] === containerId,
+    });
+}
+
 export function readReportRequest(env = process.env) {
     const nonce = String(env[UPDATE_REPORT_NONCE_ENV] || '').trim();
     if (!nonce) return null;
@@ -112,14 +128,15 @@ async function runUpdate(normalizedOptions, {
         }
         cancellation.arm();
         try {
-            const options = { interactiveSession, agentLibBranchPolicy, command, cancellation,
+            const boxRun = boxRunFromReportContext(reportRequest?.context, { insideBox });
+            const options = { interactiveSession, agentLibBranchPolicy, command, cancellation, boxRun,
                 delegatedWorkspacePloinkyPath: reportRequest?.context?.source?.workspacePloinky?.delegatedBoxRepoPath || null };
             // Git pin refresh inside the update reuses this lease.
             result = await runWithWorkspaceMutationLease(lease, () => withUpdateSkillScopes(
                 reportRequest?.context?.source?.skillScopes,
                 async () => {
                     if (request.kind === 'repos') return handlers.updatePloinkyRepos(options);
-                    if (request.kind === 'repo') return handlers.updateRepoResult(request.repoName, { command, cancellation });
+                    if (request.kind === 'repo') return handlers.updateRepoResult(request.repoName, { command, cancellation, boxRun });
                     return handlers.updateAllRepos(request.folderPath || undefined, options);
                 },
             ));

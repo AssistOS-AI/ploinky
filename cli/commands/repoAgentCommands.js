@@ -268,19 +268,25 @@ function recordLabel(operation) {
         : operation.name;
 }
 
+// Checkout locks of a host-driven in-Box update bind to its Box run.
+function checkoutOptionsFor(boxRun) {
+    return boxRun ? { lockOptions: { boxRun } } : {};
+}
+
 /**
  * Execute one operation, append its record and log it. Returns the record.
  */
-function executeGitOperation(operation, records, indent = '  ') {
+function executeGitOperation(operation, records, indent = '  ', checkoutOptions = {}) {
     let record;
     let result = null;
     try {
         if (operation.kind === 'registered') {
-            record = reposSvc.updateRegisteredRepository(operation.name);
+            record = reposSvc.updateRegisteredRepository(operation.name, { checkoutOptions });
         } else {
             record = reposSvc.updateWorkspaceRepository(operation.path, {
                 id: operation.path,
                 aliases: operation.aliases.map(String),
+                checkoutOptions,
             });
         }
         result = { recloned: record?.details?.recloned === true };
@@ -591,7 +597,7 @@ function finishUpdateResult({ command, records, prior, agentLib = null, extra = 
 /**
  * `update repo <name>` as an update result (never throws for an outcome).
  */
-async function updateRepoResult(repoName, { command = ['update', 'repo', repoName], cancellation = null } = {}) {
+async function updateRepoResult(repoName, { command = ['update', 'repo', repoName], cancellation = null, boxRun = null } = {}) {
     if (!repoName) throw new Error('Usage: update repo <name>');
     const prior = readGraphSafely();
     const records = [];
@@ -599,7 +605,7 @@ async function updateRepoResult(repoName, { command = ['update', 'repo', repoNam
     let record;
     await checkpoint(`repository ${repoName}`);
     try {
-        record = reposSvc.updateRegisteredRepository(repoName);
+        record = reposSvc.updateRegisteredRepository(repoName, { checkoutOptions: checkoutOptionsFor(boxRun) });
     } catch (err) {
         record = err?.record || createOperationRecord({
             phase: 'registered-repository', id: String(repoName), outcome: 'failed',
@@ -690,7 +696,7 @@ async function updatePloinkyRepos(options = {}) {
         console.log('Updating ploinky repositories...');
         for (const operation of operations) {
             await checkpoint(`repository ${recordLabel(operation)}`);
-            executeGitOperation(operation, records);
+            executeGitOperation(operation, records, '  ', checkoutOptionsFor(options.boxRun));
         }
     } else {
         console.log('No ploinky repositories installed.');
@@ -817,7 +823,7 @@ async function updateAllRepos(folderPath, options = {}) {
         console.log('Updating ploinky repositories...');
         for (const operation of registeredOperations) {
             await checkpoint(`repository ${recordLabel(operation)}`);
-            executeGitOperation(operation, records);
+            executeGitOperation(operation, records, '  ', checkoutOptionsFor(options.boxRun));
         }
     }
 
@@ -825,7 +831,7 @@ async function updateAllRepos(folderPath, options = {}) {
         console.log(`Updating workspace repositories in ${projectsRoot}...`);
         for (const operation of workspaceOperations) {
             await checkpoint(`repository ${recordLabel(operation)}`);
-            executeGitOperation(operation, records);
+            executeGitOperation(operation, records, '  ', checkoutOptionsFor(options.boxRun));
         }
     }
 

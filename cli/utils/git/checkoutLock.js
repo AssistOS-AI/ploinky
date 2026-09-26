@@ -14,10 +14,12 @@ import path from 'node:path';
 //
 // Acquisition publishes a complete owner record atomically by renaming a
 // private staging directory onto the lock name. A lock is never stolen because
-// of its age. It is reclaimed only when the owner is affirmatively dead in the
-// same boot and PID namespace (ESRCH, or a different process start identity
-// for the recorded PID), and only by one reclaimer at a time. Anything else is
-// a bounded wait followed by a named busy/recovery-required result.
+// of its age. It is reclaimed only when the owner is affirmatively dead, and
+// only by one reclaimer at a time: in the same boot and PID namespace (ESRCH,
+// or a different process start identity for the recorded PID), or, across
+// scopes, when the host's attestation of this workspace's Box proves that the
+// Box run the owner recorded has ended. Anything else is a bounded wait
+// followed by a named busy/recovery-required result.
 
 export const CHECKOUT_LOCK_NAME = 'ploinky-update.lock';
 const OWNER_FILE = 'owner.json';
@@ -25,6 +27,7 @@ const OWNER_SCHEMA = 'ploinky-update-checkout-lock';
 const OWNER_VERSION = 1;
 const DEFAULT_WAIT_MS = 60_000;
 const DEFAULT_RETRY_MS = 100;
+const CONTAINER_ID_PATTERN = /^[0-9a-f]{64}$/;
 
 function sleepSync(ms) {
     if (ms > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
@@ -97,12 +100,48 @@ function readOwner(lockPath, fsApi) {
 }
 
 /**
- * Affirmative proof that the recorded owner no longer runs. Uncertainty
- * (another boot/namespace, an unreadable identity, EPERM) is never proof.
+ * The Box run of a host-driven in-Box update, as the host attests it: this
+ * workspace's Box instance, the exact container the update was exec'd into,
+ * the engine that runs it, and whether that container was the workspace's
+ * only running Box container in that engine when the host started the update
+ * under its workspace lock. Anything incomplete is no attestation.
  */
-export function ownerIsProvenDead(owner, processApi = defaultProcessApi()) {
+function normalizeBoxRun(boxRun) {
+    if (!boxRun || typeof boxRun.workspace !== 'string' || !boxRun.workspace
+        || !CONTAINER_ID_PATTERN.test(String(boxRun.containerId || ''))) {
+        return null;
+    }
+    return {
+        workspace: boxRun.workspace,
+        containerId: boxRun.containerId,
+        engine: typeof boxRun.engine === 'string' ? boxRun.engine : '',
+        soleRunning: boxRun.soleRunning === true,
+    };
+}
+
+// Only a host-driven in-Box update records a Box binding, and it runs directly
+// in its container's PID namespace, as does an acquirer holding an attestation.
+// A bound owner in another scope therefore ran in an earlier run of the
+// acquirer's container, or in another Box container of this workspace that
+// the host saw not running in the same engine while it held the workspace lock.
+function boxRunEnded(recorded, run) {
+    if (!run || !recorded || recorded.workspace !== run.workspace
+        || !CONTAINER_ID_PATTERN.test(String(recorded.containerId || ''))) {
+        return false;
+    }
+    if (recorded.containerId === run.containerId) return true;
+    return run.soleRunning && Boolean(run.engine) && recorded.engine === run.engine;
+}
+
+/**
+ * Affirmative proof that the recorded owner no longer runs. Uncertainty
+ * (another boot/namespace, an unreadable identity, EPERM) is never proof,
+ * unless `boxRun`, the host's attestation, proves the owner's Box run ended.
+ */
+export function ownerIsProvenDead(owner, processApi = defaultProcessApi(), boxRun = null) {
     const current = processApi.scope();
-    if (!owner?.scope || !current?.scope || owner.scope !== current.scope) return false;
+    if (!owner?.scope || !current?.scope) return false;
+    if (owner.scope !== current.scope) return boxRunEnded(owner.box, normalizeBoxRun(boxRun));
     try {
         processApi.kill(owner.pid, 0);
     } catch (error) {
@@ -143,6 +182,10 @@ function tryReclaim(commonDir, lockPath, captured, fsApi) {
 /**
  * Acquire the checkout-family lock synchronously with a bounded wait.
  *
+ * `boxRun` is the host's attestation of the Box run of a host-driven in-Box
+ * update (see normalizeBoxRun). The owner record binds to it, and it proves
+ * owners of ended runs of this workspace's Box dead.
+ *
  * @returns {{ ok: true, lock: object } | { ok: false, code: string, reason: string, owner?: object }}
  *   `code` is `lock-busy` (live or unprovable owner), `lock-recovery-required`
  *   (malformed state or a stale reclaim marker) or `lock-unavailable`
@@ -156,12 +199,14 @@ export function acquireCheckoutLock({
     retryMs = DEFAULT_RETRY_MS,
     fsApi = fs,
     processApi = defaultProcessApi(),
+    boxRun = null,
     now = () => Date.now(),
     sleep = sleepSync,
 } = {}) {
     const lockPath = path.join(commonDir, CHECKOUT_LOCK_NAME);
     const token = crypto.randomUUID();
     const scope = processApi.scope();
+    const run = normalizeBoxRun(boxRun);
     const owner = {
         schema: OWNER_SCHEMA,
         version: OWNER_VERSION,
@@ -173,6 +218,7 @@ export function acquireCheckoutLock({
         pidNamespace: scope?.pidNamespace || '',
         scope: scope?.scope || '',
         hostname: processApi.hostname,
+        box: run ? { workspace: run.workspace, containerId: run.containerId, engine: run.engine } : null,
         checkout,
         createdAt: new Date(now()).toISOString(),
     };
@@ -200,7 +246,7 @@ export function acquireCheckoutLock({
             }
             const captured = readOwner(lockPath, fsApi);
             lastObservation = captured;
-            if (captured.owner && ownerIsProvenDead(captured.owner, processApi)) {
+            if (captured.owner && ownerIsProvenDead(captured.owner, processApi, run)) {
                 const outcome = tryReclaim(commonDir, lockPath, captured, fsApi);
                 if (outcome.reclaimed) continue;
                 if (outcome.reclaimBusy) lastObservation = { ...captured, reclaimBusy: true };

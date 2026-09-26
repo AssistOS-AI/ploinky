@@ -44,6 +44,7 @@ function scenario(t, {
     updateWorkspacePloinky = async () => null,
     action = 'reused',
     restartCore = null,
+    query = null,
 } = {}) {
     const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-update-protocol-')));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -89,7 +90,7 @@ function scenario(t, {
         updateHostState: store,
         runner: {
             run() {},
-            query: () => ({ ok: true, stdout: JSON.stringify({ initialized: true, routingConfigured: graph.configured }) }),
+            query: query || (() => ({ ok: true, stdout: JSON.stringify({ initialized: true, routingConfigured: graph.configured }) })),
         },
         captureCoreStartArgv: () => ['start', 'agent', '8080'],
         updateWorkspacePloinky,
@@ -140,6 +141,35 @@ test('a complete report is read from the host spelling, merged, and removed', as
     assert.deepEqual(context.request, { kind: 'all', folder: null, folderPath: null });
     assert.deepEqual(result.reportContext, context);
     assert.deepEqual(reportFiles(fixture.identity), []);
+});
+
+test('the in-Box update context lists the running Box containers that carry this workspace label, or nothing inexact', async (t) => {
+    const other = 'b'.repeat(64);
+    for (const [answer, expected] of [
+        [{ ok: true, stdout: `${CONTAINER_ID}\n` }, [CONTAINER_ID]],
+        [{ ok: true, stdout: `${CONTAINER_ID}\n${other}\n` }, [CONTAINER_ID, other]],
+        [{ ok: true, stdout: '' }, []],
+        [{ ok: true, stdout: `${CONTAINER_ID.slice(0, 12)}\n` }, null],
+        [{ ok: false, stdout: '', stderr: 'engine unavailable' }, null],
+    ]) {
+        const listings = [];
+        const fixture = scenario(t, {
+            query: (_engine, args) => {
+                if (args[0] === 'ps') {
+                    listings.push(args);
+                    return answer;
+                }
+                return { ok: true, stdout: JSON.stringify({ initialized: true, routingConfigured: true }) };
+            },
+        });
+        await fixture.supervisor.runUpdateTransaction(['update']);
+        assert.deepEqual(listings, [[
+            'ps', '--no-trunc', '--filter', `label=io.assistos.ploinky-box.path-hash=${fixture.identity.pathHash}`, '--format', '{{.ID}}',
+        ]], 'one listing, by the immutable workspace label, while the update holds the workspace lock');
+        assert.deepEqual(fixture.contexts[0].box.runningContainers, expected);
+        assert.equal(fixture.contexts[0].box.containerId, CONTAINER_ID);
+        assert.equal(fixture.contexts[0].box.engine, 'engine', 'the listing is exact only within the engine it names');
+    }
 });
 
 for (const [variant, code] of [

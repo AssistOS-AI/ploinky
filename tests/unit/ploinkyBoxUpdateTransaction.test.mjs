@@ -115,7 +115,9 @@ function harness(t, {
         updateHostState: store,
         runner: {
             run(_command, args) { events.push(`run:${args.at(-1)}`); },
-            query() {
+            query(_command, args) {
+                // The host's own listing of the workspace's running Box containers.
+                if (args?.[0] === 'ps') return { ok: true, stdout: `${CONTAINER_ID}\n` };
                 events.push('inbox');
                 if (!inboxReadable) return { ok: false, stdout: '', stderr: 'exec failed' };
                 return { ok: true, stdout: JSON.stringify({ initialized: true, routingConfigured: graph.configured }) };

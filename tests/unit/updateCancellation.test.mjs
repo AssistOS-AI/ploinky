@@ -89,7 +89,18 @@ const updateScript = args => `
     process.exitCode = result.exitCode;
 `;
 
-function startWriter(t, ws, { script, fetchDelaySeconds = 30 }) {
+// A host-driven in-Box writer: the Box marker is simulated for
+// isInsideBoxRuntime() only.
+const inBoxUpdateScript = args => `
+    const fs = (await import('node:fs')).default;
+    const statSync = fs.statSync;
+    fs.statSync = (target, options) => (target === '/etc/ploinky-box'
+        ? { isFile: () => true, isDirectory: () => false }
+        : statSync(target, options));
+    ${updateScript(args)}
+`;
+
+function startWriter(t, ws, { script, fetchDelaySeconds = 30, context = REPORT_CONTEXT }) {
     const nonce = createUpdateReportNonce();
     const env = {
         ...process.env,
@@ -104,7 +115,7 @@ function startWriter(t, ws, { script, fetchDelaySeconds = 30 }) {
         PLOINKY_WORKSPACE_ROOT: ws.workspace,
         PLOINKY_ROOT: ws.runtimeRoot,
         PLOINKY_UPDATE_REPORT_NONCE: nonce,
-        PLOINKY_UPDATE_REPORT_CONTEXT: JSON.stringify(REPORT_CONTEXT),
+        PLOINKY_UPDATE_REPORT_CONTEXT: JSON.stringify(context),
     };
     delete env.GIT_SSH;
     delete env.NODE_TEST_CONTEXT;
@@ -238,10 +249,17 @@ test('SIGTERM to the writer alone lets the started checkout finish and starts no
 });
 
 // SIGKILL cannot be handled: the lock stays behind, bound to its dead owner,
-// and the next update in the same process scope reclaims it.
+// and the next update in the same process scope reclaims it. Outside the Box
+// no writer binds a lock to a Box run, whatever context it was handed.
 test('a SIGKILLed writer leaves its checkout lock to the next same-scope update', async (t) => {
     const ws = createWorkspace(t);
-    const writer = startWriter(t, ws, { script: updateScript(['repos']) });
+    const writer = startWriter(t, ws, {
+        script: updateScript(['repos']),
+        context: {
+            workspace: { instance: `ploinky-box-fixture-${'f'.repeat(16)}` },
+            box: { containerId: 'b'.repeat(64), runningContainers: ['b'.repeat(64)] },
+        },
+    });
     const [started] = await waitFor('a repository fetch to start', () => {
         const names = startedFetches(ws);
         return names.length ? names : null;
@@ -252,7 +270,9 @@ test('a SIGKILLed writer leaves its checkout lock to the next same-scope update'
     assert.equal(exit.signal, 'SIGKILL');
     const { checkout } = ws.repos[started];
     const lockPath = path.join(checkout, '.git', CHECKOUT_LOCK_NAME);
-    assert.equal(JSON.parse(fs.readFileSync(path.join(lockPath, 'owner.json'), 'utf8')).pid, writer.child.pid);
+    const owner = JSON.parse(fs.readFileSync(path.join(lockPath, 'owner.json'), 'utf8'));
+    assert.equal(owner.pid, writer.child.pid);
+    assert.equal(owner.box, null, 'a writer outside the Box never records a Box binding');
     assert.equal(readUpdateReport(path.join(ws.workspace, '.ploinky'), writer.nonce).code, 'report-missing');
     const next = acquireCheckoutLock({ commonDir: path.join(checkout, '.git'), checkout, waitMs: 2_000 });
     assert.equal(next.ok, true, next.reason);
@@ -285,6 +305,57 @@ function assertCancelledBeforeActivation(ws, writer) {
     assert.match(report.result.records[1].reason, /SIGTERM before activation/);
     assert.equal(report.result.activationAllowed, false, 'every step finished, yet a cancelled update never activates');
 }
+
+// The host's TERM batch can miss a Git child the writer spawns right after it,
+// and the host then SIGKILLs the writer when its TERM grace (shortened here)
+// ends. The lock outlives that Box run; after the Box restarts, only the
+// host's attestation can prove its owner dead.
+test('a lock left by a SIGKILLed host-driven writer is reclaimed in the next Box run only with the host attestation', async (t) => {
+    const ws = createWorkspace(t);
+    const workspace = `ploinky-box-fixture-${'f'.repeat(16)}`;
+    const containerId = 'b'.repeat(64);
+    const context = {
+        schema: 'ploinky-update-context', version: 1,
+        workspace: { instance: workspace, workspaceRoot: ws.workspace },
+        box: { containerId, engine: 'engine-store', action: 'reused', imageId: null, runningContainers: [containerId] },
+    };
+    const writer = startWriter(t, ws, { script: inBoxUpdateScript(['repos']), context });
+    const [started] = await waitFor('a repository fetch to start', () => {
+        const names = startedFetches(ws);
+        return names.length ? names : null;
+    });
+    process.kill(writer.child.pid, 'SIGTERM');
+    await delay(1_500);
+    assert.equal(processGone(writer.child.pid), false, 'the writer is still inside the Git command when the grace ends');
+    process.kill(-writer.child.pid, 'SIGKILL');
+    const exit = await settle(writer);
+    await fixtureQuiet(ws);
+    assert.equal(exit.signal, 'SIGKILL');
+
+    const { checkout } = ws.repos[started];
+    const commonDir = path.join(checkout, '.git');
+    const owner = JSON.parse(fs.readFileSync(path.join(commonDir, CHECKOUT_LOCK_NAME, 'owner.json'), 'utf8'));
+    assert.equal(owner.pid, writer.child.pid);
+    // The next Box run has another PID namespace.
+    const nextRun = {
+        pid: process.pid,
+        hostname: os.hostname(),
+        scope: () => ({ bootId: 'boot', pidNamespace: 'pid:[next-run]', scope: JSON.stringify(['linux', 'boot', 'pid:[next-run]']) }),
+        processStart: () => '',
+        kill: (pid, signal) => process.kill(pid, signal),
+    };
+    const unattested = acquireCheckoutLock({ commonDir, checkout, waitMs: 200, retryMs: 20, processApi: nextRun });
+    assert.equal(unattested.code, 'lock-busy', 'without the host attestation a foreign-scope owner is never proven dead');
+    const reclaimed = acquireCheckoutLock({
+        commonDir, checkout, waitMs: 2_000, processApi: nextRun, boxRun: { workspace, containerId, engine: 'engine-store', soleRunning: true },
+    });
+    assert.equal(reclaimed.ok, true, `the next run of the same Box container reclaims it: ${reclaimed.reason}`);
+    assert.deepEqual(owner.box, { workspace, containerId, engine: 'engine-store' }, 'the killed owner had recorded the exact Box run it ran in');
+    assert.equal(reclaimed.lock.release(), true);
+    assert.deepEqual(checkoutState(ws, started), {
+        head: ws.repos[started].before, lockEntries: [], gitLocks: [], privateRefs: [],
+    }, 'the reclaimed checkout is untouched');
+});
 
 test('a signal after the last update step still blocks activation, and the update returns its signals', async (t) => {
     const ws = createWorkspace(t);

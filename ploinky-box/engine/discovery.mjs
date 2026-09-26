@@ -199,6 +199,26 @@ function inspectExactContainer(engine, name, runner) {
     }
 }
 
+/**
+ * Immutable IDs of the running containers that carry this workspace's
+ * path-hash label, or null when the engine does not answer exactly. Labels
+ * never change after creation, so every Box container this workspace created
+ * is listed while it runs.
+ */
+export function listRunningWorkspaceContainers(engine, identity, runner) {
+    let result;
+    try {
+        result = query(runner, engine.name, [
+            'ps', '--no-trunc', '--filter', `label=${BOX_LABELS.pathHash}=${identity.pathHash}`, '--format', '{{.ID}}',
+        ]);
+    } catch {
+        return null;
+    }
+    if (!result?.ok) return null;
+    const ids = String(result.stdout || '').split('\n').map(line => line.trim()).filter(Boolean);
+    return ids.every(id => /^[0-9a-f]{64}$/.test(id)) ? ids : null;
+}
+
 function hasWorkspaceOwnership(labels, pathHash, role) {
     return String(labels?.[BOX_LABELS.pathHash] || '') === pathHash
         && String(labels?.[BOX_LABELS.role] || '') === role;

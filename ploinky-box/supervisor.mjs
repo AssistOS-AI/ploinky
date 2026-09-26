@@ -56,7 +56,7 @@ import {
     boxWorkspaceExecOptions,
     relativeBoxWorkspacePath,
 } from './contract/workspace-root.mjs';
-import { discoverBoxOwnership } from './engine/discovery.mjs';
+import { discoverBoxOwnership, listRunningWorkspaceContainers } from './engine/discovery.mjs';
 import {
     readWorkspaceEdgeDesired,
     stageWorkspaceEdgeDesired,
@@ -1456,7 +1456,10 @@ export function createBoxSupervisor({
         });
     }
 
-    function updateContext({ identity, plan, scope, coreArgv, prepared, containerId, source }) {
+    // `box.runningContainers`, read under the workspace lock just before the
+    // in-Box update starts, lets its checkout locks prove that an owner from
+    // another Box container of this workspace no longer runs.
+    function updateContext({ identity, plan, scope, coreArgv, prepared, containerId, engine, source }) {
         return {
             schema: 'ploinky-update-context',
             version: 1,
@@ -1464,7 +1467,13 @@ export function createBoxSupervisor({
             request: plan.request,
             coreArgv: [...coreArgv],
             scope: scope ? { relative: scope.relative, boxPath: scope.boxPath } : null,
-            box: { containerId, action: prepared.action || null, imageId: prepared.imageId || null },
+            box: {
+                containerId,
+                engine: engine.identity,
+                action: prepared.action || null,
+                imageId: prepared.imageId || null,
+                runningContainers: listRunningWorkspaceContainers(engine, identity, runner),
+            },
             source,
         };
     }
@@ -1598,7 +1607,9 @@ export function createBoxSupervisor({
                 selection,
                 skillScopeEnv,
                 updateExcludedRepoPath: workspacePloinky?.boxRepoPath || '',
-                context: updateContext({ identity, plan, scope, coreArgv, prepared, containerId, source: sourceSnapshot }),
+                context: updateContext({
+                    identity, plan, scope, coreArgv, prepared, containerId, engine: ownership.engine, source: sourceSnapshot,
+                }),
             });
             if (workspacePloinky?.deferredToCore) {
                 const delegatedPath = path.resolve(workspacePloinky.delegatedBoxRepoPath);
@@ -1803,7 +1814,7 @@ export function createBoxSupervisor({
                 selection,
                 skillScopeEnv,
                 context: updateContext({
-                    identity, plan, scope, coreArgv, prepared, containerId,
+                    identity, plan, scope, coreArgv, prepared, containerId, engine: ownership.engine,
                     source: { skillScopes: {
                         prior: priorSkillScopeEnv?.PLOINKY_SKILL_SCOPE || null,
                         proposed: skillScopeEnv.PLOINKY_SKILL_SCOPE,
