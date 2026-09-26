@@ -200,16 +200,16 @@ function inspectExactContainer(engine, name, runner) {
 }
 
 /**
- * Immutable IDs of the running containers that carry this workspace's
- * path-hash label, or null when the engine does not answer exactly. Labels
- * never change after creation, so every Box container this workspace created
- * is listed while it runs.
+ * Immutable IDs of every container, in any state, that carries this
+ * workspace's path-hash label, or null when the engine does not answer
+ * exactly. Labels never change after creation, so every Box container this
+ * workspace created is listed until it is removed.
  */
-export function listRunningWorkspaceContainers(engine, identity, runner) {
+export function listWorkspaceContainers(engine, identity, runner) {
     let result;
     try {
         result = query(runner, engine.name, [
-            'ps', '--no-trunc', '--filter', `label=${BOX_LABELS.pathHash}=${identity.pathHash}`, '--format', '{{.ID}}',
+            'ps', '--all', '--no-trunc', '--filter', `label=${BOX_LABELS.pathHash}=${identity.pathHash}`, '--format', '{{.ID}}',
         ]);
     } catch {
         return null;

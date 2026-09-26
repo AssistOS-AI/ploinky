@@ -102,9 +102,9 @@ function readOwner(lockPath, fsApi) {
 /**
  * The Box run of a host-driven in-Box update, as the host attests it: this
  * workspace's Box instance, the exact container the update was exec'd into,
- * the engine that runs it, and whether that container was the workspace's
- * only running Box container in that engine when the host started the update
- * under its workspace lock. Anything incomplete is no attestation.
+ * the engine that runs it, and whether that container was the only container
+ * of this workspace, in any state, in that engine when the host started the
+ * update under its workspace lock. Anything incomplete is no attestation.
  */
 function normalizeBoxRun(boxRun) {
     if (!boxRun || typeof boxRun.workspace !== 'string' || !boxRun.workspace
@@ -115,22 +115,22 @@ function normalizeBoxRun(boxRun) {
         workspace: boxRun.workspace,
         containerId: boxRun.containerId,
         engine: typeof boxRun.engine === 'string' ? boxRun.engine : '',
-        soleRunning: boxRun.soleRunning === true,
+        soleContainer: boxRun.soleContainer === true,
     };
 }
 
 // Only a host-driven in-Box update records a Box binding, and it runs directly
 // in its container's PID namespace, as does an acquirer holding an attestation.
 // A bound owner in another scope therefore ran in an earlier run of the
-// acquirer's container, or in another Box container of this workspace that
-// the host saw not running in the same engine while it held the workspace lock.
+// acquirer's container, or in another Box container of this workspace that no
+// longer existed in the same engine while the host held the workspace lock.
 function boxRunEnded(recorded, run) {
     if (!run || !recorded || recorded.workspace !== run.workspace
         || !CONTAINER_ID_PATTERN.test(String(recorded.containerId || ''))) {
         return false;
     }
     if (recorded.containerId === run.containerId) return true;
-    return run.soleRunning && Boolean(run.engine) && recorded.engine === run.engine;
+    return run.soleContainer && Boolean(run.engine) && recorded.engine === run.engine;
 }
 
 /**

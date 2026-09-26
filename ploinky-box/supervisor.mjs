@@ -56,7 +56,7 @@ import {
     boxWorkspaceExecOptions,
     relativeBoxWorkspacePath,
 } from './contract/workspace-root.mjs';
-import { discoverBoxOwnership, listRunningWorkspaceContainers } from './engine/discovery.mjs';
+import { discoverBoxOwnership, listWorkspaceContainers } from './engine/discovery.mjs';
 import {
     readWorkspaceEdgeDesired,
     stageWorkspaceEdgeDesired,
@@ -1456,7 +1456,7 @@ export function createBoxSupervisor({
         });
     }
 
-    // `box.runningContainers`, read under the workspace lock just before the
+    // `box.workspaceContainers`, read under the workspace lock just before the
     // in-Box update starts, lets its checkout locks prove that an owner from
     // another Box container of this workspace no longer runs.
     function updateContext({ identity, plan, scope, coreArgv, prepared, containerId, engine, source }) {
@@ -1472,7 +1472,7 @@ export function createBoxSupervisor({
                 engine: engine.identity,
                 action: prepared.action || null,
                 imageId: prepared.imageId || null,
-                runningContainers: listRunningWorkspaceContainers(engine, identity, runner),
+                workspaceContainers: listWorkspaceContainers(engine, identity, runner),
             },
             source,
         };

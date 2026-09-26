@@ -143,7 +143,7 @@ test('a complete report is read from the host spelling, merged, and removed', as
     assert.deepEqual(reportFiles(fixture.identity), []);
 });
 
-test('the in-Box update context lists the running Box containers that carry this workspace label, or nothing inexact', async (t) => {
+test('the in-Box update context lists every container that carries this workspace label, or nothing inexact', async (t) => {
     const other = 'b'.repeat(64);
     for (const [answer, expected] of [
         [{ ok: true, stdout: `${CONTAINER_ID}\n` }, [CONTAINER_ID]],
@@ -164,9 +164,9 @@ test('the in-Box update context lists the running Box containers that carry this
         });
         await fixture.supervisor.runUpdateTransaction(['update']);
         assert.deepEqual(listings, [[
-            'ps', '--no-trunc', '--filter', `label=io.assistos.ploinky-box.path-hash=${fixture.identity.pathHash}`, '--format', '{{.ID}}',
+            'ps', '--all', '--no-trunc', '--filter', `label=io.assistos.ploinky-box.path-hash=${fixture.identity.pathHash}`, '--format', '{{.ID}}',
         ]], 'one listing, by the immutable workspace label, while the update holds the workspace lock');
-        assert.deepEqual(fixture.contexts[0].box.runningContainers, expected);
+        assert.deepEqual(fixture.contexts[0].box.workspaceContainers, expected);
         assert.equal(fixture.contexts[0].box.containerId, CONTAINER_ID);
         assert.equal(fixture.contexts[0].box.engine, 'engine', 'the listing is exact only within the engine it names');
     }

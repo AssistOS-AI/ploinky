@@ -257,7 +257,7 @@ test('a SIGKILLed writer leaves its checkout lock to the next same-scope update'
         script: updateScript(['repos']),
         context: {
             workspace: { instance: `ploinky-box-fixture-${'f'.repeat(16)}` },
-            box: { containerId: 'b'.repeat(64), runningContainers: ['b'.repeat(64)] },
+            box: { containerId: 'b'.repeat(64), workspaceContainers: ['b'.repeat(64)] },
         },
     });
     const [started] = await waitFor('a repository fetch to start', () => {
@@ -317,7 +317,7 @@ test('a lock left by a SIGKILLed host-driven writer is reclaimed in the next Box
     const context = {
         schema: 'ploinky-update-context', version: 1,
         workspace: { instance: workspace, workspaceRoot: ws.workspace },
-        box: { containerId, engine: 'engine-store', action: 'reused', imageId: null, runningContainers: [containerId] },
+        box: { containerId, engine: 'engine-store', action: 'reused', imageId: null, workspaceContainers: [containerId] },
     };
     const writer = startWriter(t, ws, { script: inBoxUpdateScript(['repos']), context });
     const [started] = await waitFor('a repository fetch to start', () => {
@@ -347,7 +347,7 @@ test('a lock left by a SIGKILLed host-driven writer is reclaimed in the next Box
     const unattested = acquireCheckoutLock({ commonDir, checkout, waitMs: 200, retryMs: 20, processApi: nextRun });
     assert.equal(unattested.code, 'lock-busy', 'without the host attestation a foreign-scope owner is never proven dead');
     const reclaimed = acquireCheckoutLock({
-        commonDir, checkout, waitMs: 2_000, processApi: nextRun, boxRun: { workspace, containerId, engine: 'engine-store', soleRunning: true },
+        commonDir, checkout, waitMs: 2_000, processApi: nextRun, boxRun: { workspace, containerId, engine: 'engine-store', soleContainer: true },
     });
     assert.equal(reclaimed.ok, true, `the next run of the same Box container reclaims it: ${reclaimed.reason}`);
     assert.deepEqual(owner.box, { workspace, containerId, engine: 'engine-store' }, 'the killed owner had recorded the exact Box run it ran in');

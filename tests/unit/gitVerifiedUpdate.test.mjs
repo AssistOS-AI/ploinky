@@ -601,7 +601,7 @@ test('a foreign-scope owner is reclaimed only when the host attests that its Box
             }));
         };
         const acquire = (boxRun, api = processApi) => acquireCheckoutLock({ commonDir: root, waitMs: 60, retryMs: 20, processApi: api, boxRun });
-        const run = { workspace, containerId: box, engine, soleRunning: false };
+        const run = { workspace, containerId: box, engine, soleContainer: false };
         const staysBusy = (recorded, boxRun, why, api) => {
             writeOwner(recorded, api ? 'box-run-2' : 'box-run-1');
             assert.equal(acquire(boxRun, api).code, 'lock-busy', why);
@@ -611,13 +611,13 @@ test('a foreign-scope owner is reclaimed only when the host attests that its Box
         staysBusy({ workspace, containerId: box }, null, 'no attestation: a direct in-Box or a host writer');
         staysBusy(null, run, 'an owner that recorded no Box');
         staysBusy({ workspace: `ploinky-box-other-${'e'.repeat(16)}`, containerId: box }, run, 'another workspace');
-        staysBusy({ workspace, containerId: replaced, engine }, run, 'another container that the host did not see stopped');
-        staysBusy({ workspace, containerId: replaced, engine: 'another-engine' }, { ...run, soleRunning: true },
+        staysBusy({ workspace, containerId: replaced, engine }, run, 'another container that may still exist');
+        staysBusy({ workspace, containerId: replaced, engine: 'another-engine' }, { ...run, soleContainer: true },
             'a container of another engine, which the listing cannot see');
-        staysBusy({ workspace, containerId: replaced }, { ...run, soleRunning: true }, 'a binding without its engine');
-        staysBusy({ workspace, containerId: 'not-a-container' }, { ...run, soleRunning: true }, 'a malformed binding');
-        staysBusy({ workspace, containerId: box }, { workspace, containerId: 'short', soleRunning: true }, 'a malformed attestation');
-        staysBusy({ workspace, containerId: box }, { ...run, soleRunning: true }, 'a live owner in this scope stays live',
+        staysBusy({ workspace, containerId: replaced }, { ...run, soleContainer: true }, 'a binding without its engine');
+        staysBusy({ workspace, containerId: 'not-a-container' }, { ...run, soleContainer: true }, 'a malformed binding');
+        staysBusy({ workspace, containerId: box }, { workspace, containerId: 'short', soleContainer: true }, 'a malformed attestation');
+        staysBusy({ workspace, containerId: box }, { ...run, soleContainer: true }, 'a live owner in this scope stays live',
             { ...processApi, kill: () => {} });
 
         // An earlier run of this same container: the Box was stopped and started, or the host rebooted.
@@ -629,9 +629,9 @@ test('a foreign-scope owner is reclaimed only when the host attests that its Box
             'the new owner binds to its own Box run');
         assert.equal(restarted.lock.release(), true);
 
-        // A replaced Box: the host saw the current container as the workspace's only running one in this engine.
+        // A replaced Box: the host saw the current container as the workspace's only container in this engine.
         writeOwner({ workspace, containerId: replaced, engine });
-        const replacedBox = acquire({ ...run, soleRunning: true });
+        const replacedBox = acquire({ ...run, soleContainer: true });
         assert.equal(replacedBox.ok, true, replacedBox.reason);
         assert.equal(replacedBox.lock.release(), true);
     } finally {

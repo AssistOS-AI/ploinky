@@ -39,18 +39,18 @@ export const IN_BOX_ACTIVATION_NOTICE = 'This update ran inside the Box: activat
 const LOCK_BUSY_CODES = new Set(['workspace_mutation_lock_timeout', 'PLOINKY_WORKSPACE_MUTATION_BUSY']);
 
 // The host exec's this update into the exact Box container named by the
-// report context, after listing the workspace's running Box containers under
-// its workspace lock. Checkout locks bind to that Box run.
+// report context, after listing every container of this workspace under its
+// workspace lock. Checkout locks bind to that Box run.
 export function boxRunFromReportContext(context, { insideBox }) {
     const workspace = context?.workspace?.instance;
     const containerId = context?.box?.containerId;
     if (!insideBox || typeof workspace !== 'string' || !workspace || typeof containerId !== 'string') return null;
-    const running = context.box.runningContainers;
+    const listed = context.box.workspaceContainers;
     return Object.freeze({
         workspace,
         containerId,
         engine: typeof context.box.engine === 'string' ? context.box.engine : '',
-        soleRunning: Array.isArray(running) && running.length === 1 && running[0] === containerId,
+        soleContainer: Array.isArray(listed) && listed.length === 1 && listed[0] === containerId,
     });
 }
 
