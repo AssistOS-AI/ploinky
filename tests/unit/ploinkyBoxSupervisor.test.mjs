@@ -23,7 +23,7 @@ import {
     agentLibFixtureLabels,
     agentLibFixtureMounts,
 } from '../helpers/agentlibFixture.mjs';
-import { fakeUpdateCore } from '../helpers/fakeUpdateCore.mjs';
+import { fakeRestartCore, fakeUpdateCore } from '../helpers/fakeUpdateCore.mjs';
 
 function fixture(t) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-supervisor-'));
@@ -1080,6 +1080,14 @@ test('a failed replacement restores and health-checks the prior Box graph before
     const events = [];
     let coreCalls = 0;
     let committed = false;
+    const coreCommand = async (_engine, containerId, args, _host, _media, _runner, options) => {
+        coreCalls += 1;
+        events.push(`core:${containerId}:${args.join(' ')}:${options.agentLib.fingerprint}`);
+        if (coreCalls === 1) throw new Error('candidate restart failed');
+        assert.equal(containerId, oldOwnership.handles.container.id);
+        assert.equal(options.agentLib, priorAgentLib);
+        assert.deepEqual(options.skillScopeEnv, priorScope);
+    };
     const supervisor = createBoxSupervisor({
         env: {},
         resolveIdentity: () => identity,
@@ -1111,14 +1119,8 @@ test('a failed replacement restores and health-checks the prior Box graph before
         }),
         readEdgeDesired: () => null,
         resolveHostReachableIpv4: async () => '192.168.1.12',
-        runCoreCommand: async (_engine, containerId, args, _host, _media, _runner, options) => {
-            coreCalls += 1;
-            events.push(`core:${containerId}:${args.join(' ')}:${options.agentLib.fingerprint}`);
-            if (coreCalls === 1) throw new Error('candidate restart failed');
-            assert.equal(containerId, oldOwnership.handles.container.id);
-            assert.equal(options.agentLib, priorAgentLib);
-            assert.deepEqual(options.skillScopeEnv, priorScope);
-        },
+        runCoreCommand: coreCommand,
+        runRestartCore: fakeRestartCore(coreCommand),
         healthCheck: async () => { events.push('prior-health'); },
         commitAgentLibSelection: () => { committed = true; },
     });

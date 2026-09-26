@@ -870,19 +870,18 @@ export function createBoxSupervisor({
                     : coreArgs;
                 const hostReachableIpv4 = await resolveHostReachableIpv4({ platform });
                 graphMutated = true;
-                await runCoreCommand(
-                    ownership.engine,
-                    containerId,
-                    effectiveArgs,
-                    prepared.hostPort,
-                    prepared.mediaHostPort,
-                    runner,
-                    { workspaceRoot: identity.workspaceRoot, stdout, stderr, hostReachableIpv4, agentLib: selection, skillScopeEnv },
-                );
+                // The exec client ending never ends the in-Box restart, so it
+                // runs under the bounded restart discipline an update uses.
+                await executeBoundedRestart({
+                    identity, engine: ownership.engine, containerId, prepared, selection, skillScopeEnv, hostReachableIpv4,
+                    coreArgv: effectiveArgs,
+                });
                 admission = await completeGraphAdmission({
                     identity, lock, prepared, selection, skillScopeEnv, operation: 'restart',
                 });
             } catch (error) {
+                // A Box whose restart writer may still run is never rolled back.
+                if (error?.skipRollback) throw error;
                 await rollbackPreparedGraph({
                     identity,
                     prepared,
@@ -1151,15 +1150,16 @@ export function createBoxSupervisor({
     }
 
     /**
-     * Restart the graph inside the update transaction with the same bounded
-     * discipline as the in-Box update: finite TERM -> KILL escalation, an
-     * engine proof that the restart writer stopped, and a durable recovery
-     * barrier (with no rollback) when that proof is missing. Signals are held
-     * as for the in-Box update; the failure of a restart that did not end
-     * normally reports one, and after a normal end one keeps its default action.
+     * Restart the graph (a workspace `restart` or an update's activation) with
+     * the same bounded discipline as the in-Box update: finite TERM -> KILL
+     * escalation, an engine proof that the restart writer stopped, and a
+     * durable recovery barrier (with no rollback) when that proof is missing.
+     * Signals are held as for the in-Box update; the failure of a restart that
+     * did not end normally reports one, and after a normal end one keeps its
+     * default action.
      */
-    async function executeUpdateRestart({ identity, engine, containerId, prepared, selection, skillScopeEnv,
-        hostReachableIpv4 }) {
+    async function executeBoundedRestart({ identity, engine, containerId, prepared, selection, skillScopeEnv,
+        hostReachableIpv4, coreArgv = ['restart'] }) {
         const operationId = createReportNonce();
         const marker = `${UPDATE_OPERATION_ENV}=${operationId}`;
         const signals = createCancellation();
@@ -1169,7 +1169,7 @@ export function createBoxSupervisor({
             const run = await runRestartCore(
                 engine,
                 containerId,
-                ['restart'],
+                coreArgv,
                 prepared.hostPort,
                 prepared.mediaHostPort,
                 runner,
@@ -1249,13 +1249,14 @@ export function createBoxSupervisor({
         } catch (error) {
             observed = { ok: false, detail: error.message };
         }
+        const earlier = barrier.operation === 'restart' ? 'graph restart' : 'update';
         if (observed?.ok === true && !(observed.pids || []).length) {
             updateHostState.remove('update-recovery', identity.instance);
-            return [`an earlier update (${String(barrier.nonce).slice(0, 8)}) that could not be proven stopped `
+            return [`an earlier ${earlier} (${String(barrier.nonce).slice(0, 8)}) that could not be proven stopped `
                 + 'is now confirmed stopped by the engine; its recovery record was cleared'];
         }
         const error = new PloinkyBoxError(
-            'An earlier update in this workspace may still be running inside the Box '
+            `An earlier ${earlier} in this workspace may still be running inside the Box `
             + `(${barrier.cause}${barrier.detail ? `: ${barrier.detail}` : ''}); no new mutation was started. `
             + 'Wait for it to finish or run `ploinky stop`, then run the command again.',
             { code: 'PLOINKY_BOX_UPDATE_RECOVERY_REQUIRED' },
@@ -1760,7 +1761,7 @@ export function createBoxSupervisor({
                     prepared.validate?.();
                     const hostReachableIpv4 = await resolveHostReachableIpv4({ platform });
                     graphMutated = true;
-                    await executeUpdateRestart({
+                    await executeBoundedRestart({
                         identity, engine: ownership.engine, containerId, prepared, selection, skillScopeEnv, hostReachableIpv4,
                     });
                 }
