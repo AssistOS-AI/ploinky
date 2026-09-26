@@ -5,6 +5,7 @@ import { resolveSkillRepositorySource } from '../utils/skillRepositorySource.js'
 import { resolveAgentRepositoryPath } from '../utils/agentRepositorySource.mjs';
 import * as reposSvc from '../utils/repos.js';
 import { runGitCommand, sanitizeGitDiagnostic } from '../utils/gitCommand.js';
+import { boxRunLockEvidence } from '../utils/git/checkoutLock.js';
 import { syncManagedSkillExports } from '../utils/skills/managedExports.js';
 import { createSkillExclusionPlanner } from '../utils/skills/exportExclusions.mjs';
 import { readExportLedger, refreshSkillExportExclusions } from '../utils/skills/exportTransaction.mjs';
@@ -302,8 +303,9 @@ export function readSkillsManifest(manifestPath) {
  * consuming the single operation set: no source is pulled here, and a source
  * whose record is skipped, failed or uncertain, or whose identity cannot be
  * verified, is retained: its selected output is neither refreshed nor pruned.
+ * `boxRun` is the host's attestation of a host-driven in-Box update.
  */
-export function installSkillsFromManifest(manifestPath, { targetRoot, pruneMissing = false, sourceOutcomes = null } = {}) {
+export function installSkillsFromManifest(manifestPath, { targetRoot, pruneMissing = false, sourceOutcomes = null, boxRun = null } = {}) {
     if (!manifestPath || typeof manifestPath !== 'string') {
         throw new Error('Missing skills manifest path.');
     }
@@ -418,6 +420,7 @@ export function installSkillsFromManifest(manifestPath, { targetRoot, pruneMissi
         retain: retainedSkills,
         consumer: { selection: 'explicit', policy: 'manifest' },
         authority: skillExportAuthority,
+        lock: exportLockOptions(boxRun),
     });
     const repositoryOwned = classifyRepositoryOwnedOutput(destRoot, managedExport);
     reportExportDiagnostics(managedExport);
@@ -559,6 +562,13 @@ function reportClaudeLink(destRoot, managedExport) {
 // Recorded in the export lock owner record; not a credential.
 const skillExportAuthority = { kind: 'ploinky-cli', operation: 'skills-export' };
 
+// Export locks of a host-driven in-Box update bind to its Box run, as its
+// checkout locks do, so the next attested Box run can prove them released.
+function exportLockOptions(boxRun) {
+    const runEvidence = boxRunLockEvidence(boxRun);
+    return runEvidence ? { runEvidence } : {};
+}
+
 function ownedDefaultSkills(destRoot, owner) {
     try {
         const { ledger } = readExportLedger(path.join(fs.realpathSync(destRoot), CANONICAL_AGENT_DIR));
@@ -571,9 +581,10 @@ function ownedDefaultSkills(destRoot, owner) {
 /** Export a source repository's default skills into a consumer folder. The
  * consumer takes every available default skill; its ledger records that
  * selection. `sourceOutcomes` makes an update consume the source's single
- * operation record instead of touching the source.
+ * operation record instead of touching the source. `boxRun` is the host's
+ * attestation of a host-driven in-Box update.
  */
-export function installDefaultSkills(repoName, { only, skip, targetRoot, pruneMissing = false, sourceOutcomes = null } = {}) {
+export function installDefaultSkills(repoName, { only, skip, targetRoot, pruneMissing = false, sourceOutcomes = null, boxRun = null } = {}) {
     if (!repoName || typeof repoName !== 'string') {
         throw new Error('Missing repository name.');
     }
@@ -637,6 +648,7 @@ export function installDefaultSkills(repoName, { only, skip, targetRoot, pruneMi
         consumer: { selection: 'all', source: repoName },
         retain,
         authority: skillExportAuthority,
+        lock: exportLockOptions(boxRun),
     });
     const repositoryOwned = classifyRepositoryOwnedOutput(destRoot, managedExport);
     reportExportDiagnostics(managedExport);
@@ -696,7 +708,7 @@ export function listDeclaredSkillSources(folders = []) {
 /** Targeted refresh: re-evaluate every consumer folder whose manifest
  * declares `sourcePath`, with its complete owner set. Nothing is pulled here;
  * other sources are used as they are. */
-export function refreshSkillConsumersForSource({ folders = [], sourcePath, sourceOutcomes = null, pruneMissing = true } = {}) {
+export function refreshSkillConsumersForSource({ folders = [], sourcePath, sourceOutcomes = null, pruneMissing = true, boxRun = null } = {}) {
     const target = canonicalPath(sourcePath);
     const consumers = [...new Map(listDeclaredSkillSources(folders)
         .filter(item => item.checkoutPath === target)
@@ -705,7 +717,9 @@ export function refreshSkillConsumersForSource({ folders = [], sourcePath, sourc
     const failed = [];
     for (const consumer of consumers) {
         try {
-            refreshed.push(installSkillsFromManifest(consumer.manifestPath, { targetRoot: consumer.folder, pruneMissing, sourceOutcomes: sourceOutcomes || new Map() }));
+            refreshed.push(installSkillsFromManifest(consumer.manifestPath, {
+                targetRoot: consumer.folder, pruneMissing, sourceOutcomes: sourceOutcomes || new Map(), boxRun,
+            }));
         } catch (error) {
             failed.push({ folder: consumer.folder, manifestPath: consumer.manifestPath, message: sanitizeGitDiagnostic(error.message) });
         }

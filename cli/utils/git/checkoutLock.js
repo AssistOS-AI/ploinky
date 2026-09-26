@@ -134,6 +134,21 @@ function boxRunEnded(recorded, run) {
 }
 
 /**
+ * The same Box-run proof for a lock protocol that records its owner's Box run
+ * as `box` (skill exports): the binding a lock taken in this run records, and
+ * whether the run a recorded binding names has ended. Null without a complete
+ * attestation.
+ */
+export function boxRunLockEvidence(boxRun) {
+    const run = normalizeBoxRun(boxRun);
+    if (!run) return null;
+    return Object.freeze({
+        binding: Object.freeze({ workspace: run.workspace, containerId: run.containerId, engine: run.engine }),
+        ended: recorded => boxRunEnded(recorded, run),
+    });
+}
+
+/**
  * Affirmative proof that the recorded owner no longer runs. Uncertainty
  * (another boot/namespace, an unreadable identity, EPERM) is never proof,
  * unless `boxRun`, the host's attestation, proves the owner's Box run ended.

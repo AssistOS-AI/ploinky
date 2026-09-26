@@ -40,7 +40,7 @@ const LOCK_BUSY_CODES = new Set(['workspace_mutation_lock_timeout', 'PLOINKY_WOR
 
 // The host exec's this update into the exact Box container named by the
 // report context, after listing every container of this workspace under its
-// workspace lock. Checkout locks bind to that Box run.
+// workspace lock. Its checkout and skill-export locks bind to that Box run.
 export function boxRunFromReportContext(context, { insideBox }) {
     const workspace = context?.workspace?.instance;
     const containerId = context?.box?.containerId;

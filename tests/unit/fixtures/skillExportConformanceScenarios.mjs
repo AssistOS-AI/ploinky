@@ -374,6 +374,70 @@ export const scenarios = [
         },
     },
     {
+        name: 'injected run evidence binds owners and proves only a bound owner of another scope dead',
+        run({ mod, tmp }) {
+            const folder = tmp('run-evidence');
+            const lockPath = path.join(fs.realpathSync(folder), '.agents', '.ploinky-skill-exports.lock');
+            const ownerRecord = () => JSON.parse(fs.readFileSync(path.join(lockPath, 'owner.json'), 'utf8'));
+            const consulted = [];
+            // The evidence of one run: its binding and the runs it proves ended.
+            const evidence = (run, ended = []) => ({
+                binding: { run },
+                ended: recorded => { consulted.push(recorded); return ended.includes(recorded.run); },
+            });
+            // The next run of an exporter has another PID namespace.
+            const nextRun = (pid, fields = {}) => ({ ...liveness(pid, [10]), current: () => ({ ...identity(pid), namespace: 'pidns-b', ...fields }) });
+            const unknown = error => error.code === 'SKILL_EXPORT_LOCK_UNKNOWN_OWNER' && error.outcome === 'blocked-unknown-owner';
+
+            // An exporter without evidence records no binding, and no evidence
+            // proves such an owner of another scope dead.
+            mod.acquireSkillExportLock(folder, { liveness: liveness(10) });
+            assert.equal(ownerRecord().box, null);
+            assert.equal(mod.inspectSkillExportLock(folder, { liveness: nextRun(11), runEvidence: { binding: { run: 'run-2' }, ended: () => true } }).state, 'unknown');
+            fs.unlinkSync(path.join(lockPath, 'owner.json'));
+            fs.rmdirSync(lockPath);
+
+            // A same-scope owner is judged by its PID alone.
+            mod.acquireSkillExportLock(folder, { liveness: liveness(10), runEvidence: evidence('run-1') });
+            const bound = ownerRecord();
+            assert.deepEqual(bound.box, { run: 'run-1' });
+            assert.throws(() => mod.acquireSkillExportLock(folder, { liveness: liveness(11), runEvidence: evidence('run-1', ['run-1']), waitMs: 0 }),
+                error => error.code === 'SKILL_EXPORT_LOCK_BUSY');
+            assert.deepEqual(consulted, [], 'a same-scope owner never reaches the evidence');
+
+            // Another scope stays unknown without evidence, while the recorded run
+            // has not ended, with an unread scope, or with unusable evidence.
+            for (const options of [
+                { liveness: nextRun(11) },
+                { liveness: nextRun(11), runEvidence: evidence('run-2') },
+                { liveness: nextRun(11, { namespace: '' }), runEvidence: evidence('run-2', ['run-1']) },
+                { liveness: nextRun(11), runEvidence: { binding: { run: 'run-2' }, ended: true } },
+                { liveness: nextRun(11), runEvidence: { ended: () => true } },
+                { liveness: nextRun(11), runEvidence: { binding: { run: 'run-2' }, ended: () => { throw new Error('no answer'); } } },
+            ]) {
+                assert.equal(mod.inspectSkillExportLock(folder, options).state, 'unknown');
+                assert.throws(() => mod.acquireSkillExportLock(folder, { ...options, waitMs: 0 }), unknown);
+            }
+            // A bound owner record without its scope or PID is never proven dead.
+            for (const damaged of [{ boot: '' }, { namespace: 0 }, { pid: 0 }, { pid: '10' }, { box: [] }]) {
+                fs.writeFileSync(path.join(lockPath, 'owner.json'), `${JSON.stringify({ ...bound, ...damaged })}\n`);
+                assert.equal(mod.inspectSkillExportLock(folder, { liveness: nextRun(11), runEvidence: evidence('run-2', ['run-1']) }).state,
+                    'unknown', JSON.stringify(damaged));
+            }
+            fs.writeFileSync(path.join(lockPath, 'owner.json'), `${JSON.stringify(bound, null, 2)}\n`);
+
+            // Evidence that the recorded run ended proves the owner dead.
+            consulted.length = 0;
+            const proven = { liveness: nextRun(11), runEvidence: evidence('run-2', ['run-1']) };
+            assert.equal(mod.readSkillExportTransactionState(folder, proven).lock, 'dead');
+            const next = mod.acquireSkillExportLock(folder, { ...proven, waitMs: 0 });
+            assert.ok(consulted.length && consulted.every(recorded => recorded.run === 'run-1'), 'the evidence judged the recorded binding');
+            assert.deepEqual(ownerRecord().box, { run: 'run-2' });
+            next.release();
+            assert.equal(lstat(lockPath), undefined);
+        },
+    },
+    {
         name: 'a pending reclaim or a fresh lock appearing mid-reclaim is never removed',
         run({ mod, tmp }) {
             const folder = tmp('reclaim');

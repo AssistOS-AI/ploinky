@@ -4,7 +4,8 @@
 // cli/utils/skills/exportTransaction.mjs and Explorer keeps a byte-identical
 // copy at explorer/utils/server/skill-export-transaction.mjs. It may only
 // import Node built-ins so that both copies stay identical; each repository
-// injects its own link factory. Conformance tests compare the two files.
+// injects its own link factory, and Ploinky's in-Box update its Box-run
+// evidence (`runEvidence`). Conformance tests compare the two files.
 //
 // Layout below `<folder>/.agents`:
 //   .ploinky-skill-exports.json          committed ownership ledger (v1)
@@ -252,15 +253,41 @@ function livenessOf(options = {}) {
     };
 }
 
+const isRecord = value => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+const readScope = identity => typeof identity?.boot === 'string' && identity.boot !== ''
+    && typeof identity.namespace === 'string' && identity.namespace !== '';
+
+// A host-driven update inside a Box passes `options.runEvidence`: `binding`,
+// the Box run the host attests it runs in, which every owner record it writes
+// carries as `box`, and `ended(box)`, the host's proof that the run a recorded
+// binding names has ended. No other exporter passes it, so its owners stay
+// unbound. Anything else is no evidence.
+function runEvidenceOf(options = {}) {
+    const evidence = options.runEvidence;
+    return evidence && typeof evidence.ended === 'function' && isRecord(evidence.binding) ? evidence : null;
+}
+
+// In another boot or PID namespace only run evidence can prove an owner dead:
+// a well-formed owner that recorded its run, when both scopes were read.
+function ownerRunEnded(owner, self, options) {
+    const evidence = runEvidenceOf(options);
+    if (!evidence || !readScope(self) || !readScope(owner) || !Number.isSafeInteger(owner.pid) || owner.pid <= 0
+        || !isRecord(owner.box)) return false;
+    try { return evidence.ended(owner.box) === true; } catch (_) { return false; }
+}
+
 // live: the owner provably runs. dead: affirmative same-namespace evidence of
-// termination or PID reuse. unknown: another boot/namespace/host, where local
-// PID absence proves nothing. ownerless/foreign: never reclaimed here.
+// termination or PID reuse, or run evidence that the owner's recorded Box run
+// ended. unknown: another boot/namespace/host without that evidence, where
+// local PID absence proves nothing. ownerless/foreign: never reclaimed here.
 export function classifyLockOwner(owner, options = {}) {
     if (!owner) return 'ownerless';
     if (owner.protocol !== EXPORT_PROTOCOL || owner.version !== EXPORT_PROTOCOL_VERSION || typeof owner.token !== 'string') return 'foreign';
     const liveness = livenessOf(options);
     const self = liveness.current();
-    if (!self.boot || !self.namespace || owner.boot !== self.boot || owner.namespace !== self.namespace) return 'unknown';
+    if (!self.boot || !self.namespace || owner.boot !== self.boot || owner.namespace !== self.namespace) {
+        return ownerRunEnded(owner, self, options) ? 'dead' : 'unknown';
+    }
     if (!Number.isSafeInteger(owner.pid) || owner.pid <= 0) return 'foreign';
     if (!liveness.alive(owner.pid)) return 'dead';
     const start = owner.start ? liveness.start(owner.pid) : '';
@@ -416,6 +443,7 @@ function acquireLockDirectory(lockPath, target, options) {
             namespace: self.namespace || '',
             pid: self.pid,
             start: self.start || '',
+            box: runEvidenceOf(options)?.binding || null,
             acquiredAt: new Date().toISOString(),
         };
         try {

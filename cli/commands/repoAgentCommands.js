@@ -77,6 +77,7 @@ function normalizeManagedRepoName(repoName) {
 function refreshDefaultSkillsInPloinkyRepo(repoName, {
     defaultSkillsRepoName = DEFAULT_SKILLS_REPO_NAMES[0],
     sourceOutcomes = null,
+    boxRun = null,
 } = {}) {
     const repoNameLabel = String(repoName || '').trim();
     if (!repoNameLabel) {
@@ -102,6 +103,7 @@ function refreshDefaultSkillsInPloinkyRepo(repoName, {
         targetRoot: repoPath,
         pruneMissing: true,
         sourceOutcomes,
+        boxRun,
     });
     if (result.sourceSkipped) {
         return {
@@ -129,6 +131,7 @@ function refreshDefaultSkillsInPloinkyRepo(repoName, {
 function refreshDefaultSkillsInPloinkyRepos(repoNames = getGitRepoNames(), {
     defaultSkillsRepoName,
     sourceOutcomes = null,
+    boxRun = null,
 } = {}) {
     const defaultSkillsRepoNames = defaultSkillsRepoName
         ? [String(defaultSkillsRepoName).trim()]
@@ -145,6 +148,7 @@ function refreshDefaultSkillsInPloinkyRepos(repoNames = getGitRepoNames(), {
                 const result = refreshDefaultSkillsInPloinkyRepo(repoNameLabel, {
                     defaultSkillsRepoName: sourceRepoName,
                     sourceOutcomes,
+                    boxRun,
                 });
                 if (result.refreshed) {
                     refreshed.push(result);
@@ -630,7 +634,7 @@ async function updateRepoResult(repoName, { command = ['update', 'repo', repoNam
         await checkpoint('the default skills refresh');
         // achillesAgentLib is not a per-repository npm package any more: it is
         // the one workspace-selected source, advanced by `ploinky update`.
-        defaultSkills = refreshDefaultSkillsInPloinkyRepos([repoName], { sourceOutcomes });
+        defaultSkills = refreshDefaultSkillsInPloinkyRepos([repoName], { sourceOutcomes, boxRun });
         logDefaultSkillSummary(defaultSkills, '  ');
         records.push(...defaultSkills.records);
     }
@@ -645,6 +649,7 @@ async function updateRepoResult(repoName, { command = ['update', 'repo', repoNam
             folders: skillsSvc.findWorkspaceFoldersWithSkillsManifest(PLOINKY_WORKSPACE_ROOT),
             sourcePath: checkout,
             sourceOutcomes,
+            boxRun,
         });
         for (const result of skillConsumers.refreshed) {
             records.push(skillsManifestRecord({
@@ -707,7 +712,7 @@ async function updatePloinkyRepos(options = {}) {
 
     // The skills phase consumes the operation records; it never pulls again.
     await checkpoint('the default skills refresh');
-    const defaultSkills = refreshDefaultSkillsInPloinkyRepos(ploinkyRepos, { sourceOutcomes: [...records] });
+    const defaultSkills = refreshDefaultSkillsInPloinkyRepos(ploinkyRepos, { sourceOutcomes: [...records], boxRun: options.boxRun });
     logDefaultSkillSummary(defaultSkills);
     records.push(...defaultSkills.records);
 
@@ -841,7 +846,7 @@ async function updateAllRepos(folderPath, options = {}) {
     // The skills phases consume the operation records; they never pull again.
     await checkpoint('the default skills refresh');
     const sourceOutcomes = [...records];
-    const defaultSkills = refreshDefaultSkillsInPloinkyRepos(ploinkyRepos, { sourceOutcomes });
+    const defaultSkills = refreshDefaultSkillsInPloinkyRepos(ploinkyRepos, { sourceOutcomes, boxRun: options.boxRun });
     logDefaultSkillSummary(defaultSkills);
     records.push(...defaultSkills.records);
     const manifestResults = [];
@@ -858,6 +863,7 @@ async function updateAllRepos(folderPath, options = {}) {
                     targetRoot: manifestFolder,
                     pruneMissing: true,
                     sourceOutcomes,
+                    boxRun: options.boxRun,
                 });
                 manifestResults.push(result);
                 for (const entry of result.prunedSkills || []) {
