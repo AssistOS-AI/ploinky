@@ -1319,7 +1319,8 @@ export function createBoxSupervisor({
      * stopped or the barrier is durable; the proof is bounded. A signal held
      * there is reported by the run's cause when it cancelled the exec client,
      * by the recovery error, or else by a `cancelled` record that blocks
-     * activation.
+     * activation. One that arrives after a confirmed proof keeps its default
+     * action.
      */
     async function executeCoreUpdate({ identity, prepared, engine, containerId, coreArgv, selection, skillScopeEnv,
         updateExcludedRepoPath = '', context }) {
@@ -1330,6 +1331,7 @@ export function createBoxSupervisor({
         let diagnostics;
         let report;
         let cancelledBy = '';
+        let reported = true;
         signals.arm();
         try {
             const run = await runUpdateCore(
@@ -1401,8 +1403,9 @@ export function createBoxSupervisor({
             }
             const signal = await signals.signalReceived();
             if (signal && diagnostics.cause !== `signal:${signal}`) cancelledBy = signal;
+            reported = Boolean(signal);
         } finally {
-            await signals.dispose({ reported: true });
+            await signals.dispose({ reported });
         }
         const records = [];
         if (report.ok) {

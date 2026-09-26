@@ -27,10 +27,12 @@ function sink() {
 }
 
 function signalProcess() {
+    const events = [];
     return Object.assign(new EventEmitter(), {
         pid: 4242,
         kills: [],
-        kill(pid, name) { this.kills.push([pid, name]); },
+        events,
+        kill(pid, name) { this.kills.push([pid, name]); events.push(['kill', name]); },
     });
 }
 
@@ -78,6 +80,7 @@ function scenario(t, {
     processRef,
     report = 'valid',
     probeUpdateQuiescence = () => ({ ok: true, pids: [] }),
+    holdRelease = null,
 }) {
     const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-proof-signals-')));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -85,7 +88,7 @@ function scenario(t, {
     const identity = buildWorkspaceIdentity(root, { markerFound: true });
     const selection = agentLibFixture(identity.workspaceRoot);
     const store = createMemoryUpdateHostState();
-    const events = [];
+    const events = processRef.events;
     const ownership = () => ({
         state: 'owned',
         engine: { name: 'podman', identity: 'engine' },
@@ -105,6 +108,22 @@ function scenario(t, {
         },
     };
     const writeReport = fakeUpdateCore({ report });
+    // A full update's first signal hold is the in-Box update's. `holdRelease`
+    // runs as that hold starts handing its signals back, while it still
+    // delivers the pending ones.
+    let holds = 0;
+    const createCancellation = () => {
+        const cancellation = createUpdateCancellation({ processRef });
+        holds += 1;
+        if (!holdRelease || holds !== 1) return cancellation;
+        return {
+            ...cancellation,
+            async dispose(options) {
+                holdRelease({ store, identity });
+                return cancellation.dispose(options);
+            },
+        };
+    };
     const supervisor = createBoxSupervisor({
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
@@ -138,7 +157,7 @@ function scenario(t, {
         runRestartCore: runRestartCore
             ? async (...args) => { events.push(['core', [...args[2]]]); return runRestartCore(args[6].operationId); }
             : fakeRestartCore(async (_engine, _id, argv) => { events.push(['core', [...argv]]); }),
-        createCancellation: () => createUpdateCancellation({ processRef }),
+        createCancellation,
         probeUpdateQuiescence,
         resolveHostReachableIpv4: async () => '',
         healthCheck: async () => {},
@@ -230,6 +249,66 @@ test('a signal that cancels the exec client stays the run cause and is reported 
     assert.deepEqual(processRef.kills, []);
     assert.deepEqual(listeners(processRef), [0, 0]);
 });
+
+test('a first signal while the host hands back its signals after a confirmed proof keeps its default action', async (t) => {
+    const processRef = signalProcess();
+    const fixture = scenario(t, {
+        processRef,
+        runUpdateCore: realRunner(processRef, { probe: () => ({ ok: true, pids: [] }) }),
+        holdRelease: () => processRef.emit('SIGINT'),
+    });
+    await fixture.supervisor.runUpdateTransaction(['update']);
+    assert.deepEqual(processRef.kills, [[4242, 'SIGINT']], 'raised again once nothing listens for it');
+    const kill = fixture.events.findIndex(event => event[0] === 'kill');
+    const restart = fixture.events.findIndex(event => event[0] === 'core' && event[1][0] === 'restart');
+    assert.ok(restart < 0 || kill < restart, 'the default action comes before any activation');
+    assert.equal(fixture.store.read('update-recovery', fixture.identity.instance), null, 'the writer was proven stopped');
+    assert.deepEqual(listeners(processRef), [0, 0]);
+});
+
+test('a signal while the host hands back its signals after writing the barrier is reported by the recovery error', async (t) => {
+    const processRef = signalProcess();
+    let barrierAtRelease = null;
+    const fixture = scenario(t, {
+        processRef,
+        runUpdateCore: realRunner(processRef, { probe: () => ({ ok: false, detail: 'engine unavailable' }) }),
+        holdRelease: ({ store, identity }) => {
+            barrierAtRelease = store.read('update-recovery', identity.instance);
+            processRef.emit('SIGINT');
+        },
+    });
+    await assert.rejects(fixture.supervisor.runUpdateTransaction(['update']), { code: 'PLOINKY_BOX_UPDATE_QUIESCENCE_UNCERTAIN' });
+    assert.equal(barrierAtRelease?.operation, 'update', 'the barrier was durable before the signals were handed back');
+    assert.deepEqual(processRef.kills, [], 'not raised again before the recovery error is reported');
+    assert.deepEqual(listeners(processRef), [0, 0]);
+});
+
+for (const [reportedBy, proofSignal] of [['the run cause', false], ['a cancelled record', true]]) {
+    test(`a later signal while the host hands back its signals is held with one already reported by ${reportedBy}`, async (t) => {
+        const processRef = signalProcess();
+        const proof = probeWithSignal(processRef, { ok: true, pids: [] });
+        const fixture = scenario(t, {
+            processRef,
+            runUpdateCore: realRunner(processRef, proofSignal
+                ? { probe: proof.probe }
+                : {
+                    script: 'setInterval(() => {}, 1000)',
+                    probe: () => ({ ok: true, pids: [] }),
+                    afterStart: () => setTimeout(() => processRef.emit('SIGINT'), 50),
+                }),
+            holdRelease: () => processRef.emit('SIGTERM'),
+        });
+        const result = await fixture.supervisor.runUpdateTransaction(['update']);
+        const reported = result.records.filter(record => record.code === 'signal:SIGINT'
+            || (record.code === 'cancelled' && /by SIGINT/.test(record.reason)));
+        assert.equal(reported.length, 1);
+        assert.equal(result.records.some(record => record.code === 'cancelled' && /SIGTERM/.test(record.reason)), false);
+        assert.equal(result.decision.activationAllowed, false);
+        assert.deepEqual(coreCalls(fixture.events), [['update']]);
+        assert.deepEqual(processRef.kills, []);
+        assert.deepEqual(listeners(processRef), [0, 0]);
+    });
+}
 
 test('a signal while the host proves the update restart stopped cannot end it before the restart barrier', async (t) => {
     const processRef = signalProcess();
