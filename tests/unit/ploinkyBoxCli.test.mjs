@@ -661,6 +661,40 @@ test('restart is a supervisor transaction and branch policy is consumed at the o
     }
 });
 
+test('a failed workspace restart names only a rollback that restored the prior graph and passed its checks', async () => {
+    // The accurate reconstruction wording an update's activation already uses.
+    const restored = 'Activation blocked; reconstruction of the previous Box and graph configuration was attempted and '
+        + 'passed its checks. It runs from the current checkouts: sources that were already pulled are not rolled back.\n';
+    const hint = 'Run ploinky diagnose from this workspace for prerequisite, storage, and security-profile diagnostics.\n';
+    for (const [name, argv, method, activation, expected] of [
+        ['restored', ['restart'], 'runRestartTransaction', { outcome: 'restored', graphMutated: true, boxRollback: 'reused-preserved' }, restored],
+        ['recovery-required', ['restart'], 'runRestartTransaction', { outcome: 'recovery-required', graphMutated: true, boxRollback: null }, ''],
+        ['preserved', ['restart'], 'runRestartTransaction', { outcome: 'preserved', graphMutated: false, boxRollback: null }, ''],
+        ['unknown', ['restart'], 'runRestartTransaction', { outcome: 'unknown' }, ''],
+        ['not attempted', ['restart'], 'runRestartTransaction', null, ''],
+        ['targeted restart unchanged', ['restart', 'Agent'], 'runTargetedRestartTransaction', { outcome: 'restored' }, ''],
+    ]) {
+        const failure = Object.assign(new Error('In-box restart failed (signal:SIGINT, SIGTERM)'), {
+            code: 'PLOINKY_BOX_UPDATE_RESTART_FAILED',
+        });
+        if (activation) failure.activation = Object.freeze(activation);
+        const output = bufferStream();
+        const errorOutput = bufferStream();
+        const supervisor = fakeSupervisor([]);
+        supervisor[method] = async () => { throw failure; };
+        await assert.rejects(runOuterCli(argv, {
+            env: {}, input: { isTTY: false }, output, errorOutput, supervisor, detectInsideBox: () => false,
+        }), error => error === failure, `${name}: the original error still fails the restart`);
+        assert.equal(output.value(), expected, name);
+        assert.equal(errorOutput.value(), hint, name);
+    }
+    const output = bufferStream();
+    assert.equal(await runOuterCli(['restart'], {
+        env: {}, input: { isTTY: false }, output, errorOutput: bufferStream(), supervisor: fakeSupervisor([]),
+    }), 0);
+    assert.equal(output.value(), '', 'a restart that succeeds claims no reconstruction');
+});
+
 test('targeted restart preserves the existing Box generation and exact core argv', async () => {
     const events = [];
     const code = await runOuterCli([

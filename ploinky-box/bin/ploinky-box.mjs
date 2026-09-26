@@ -350,9 +350,18 @@ async function runRoutedOuterCli(argv, parsed, route, launchDirectory, dispatch,
         if (targeted) {
             await selectedSupervisor.runTargetedRestartTransaction(coreArgv);
         } else {
-            await selectedSupervisor.runRestartTransaction(coreArgv, {
-                branchPolicy: parseBranchPolicy(route.coreArgv),
-            });
+            try {
+                await selectedSupervisor.runRestartTransaction(coreArgv, {
+                    branchPolicy: parseBranchPolicy(route.coreArgv),
+                });
+            } catch (error) {
+                // A failed restart whose rollback rebuilt the prior graph and
+                // passed its checks says so; the error itself still fails.
+                if (error?.activation?.outcome === 'restored') {
+                    output.write(`${UPDATE_ACTIVATION_WORDING.restored}\n`);
+                }
+                throw error;
+            }
         }
         return 0;
     }
