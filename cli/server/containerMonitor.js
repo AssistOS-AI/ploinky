@@ -42,6 +42,7 @@ import {
 } from './utils/agentReadiness.js';
 import { applyEdgeRoutingGeneration } from '../sandbox/coordinatedEdgeApply.js';
 import { withNetworkLifecycleLock } from '../sandbox/networkLifecycle.js';
+import { readRuntimePredecessor } from '../sandbox/runtimePredecessorStore.js';
 import {
     abortEdgeRoutingPreparation,
     commitAdditiveEdgeRoutingGeneration,
@@ -731,6 +732,46 @@ function deferMonitorWorkForMaintenance(monitor, target) {
     // A worker may have started immediately before the maintenance lock was
     // acquired. Terminate it and discard any earlier success timestamp so the
     // first post-maintenance tick performs a fresh semantic probe.
+    stopProbeWorker(target);
+    target.probeState = 'pending';
+    target.probeLastSuccessAt = null;
+    return true;
+}
+
+// A workspace start that stopped after persisting this record's rotated tuple,
+// but before removing the predecessor that tuple replaces, left the
+// predecessor's own tuple in a receipt keyed by the rotated one. Only the next
+// start can consume it. A restart here would rotate the record again, so the
+// receipt would no longer bind and no later start could prove, and remove, the
+// predecessor. The record stays with the next start. A receipt that exists but
+// does not bind is refused by that start too, so it also defers, and it is
+// never erased here.
+function shouldDeferForStartPredecessor(monitor, target, record) {
+    const readPredecessor = monitor?.readRuntimePredecessor || readRuntimePredecessor;
+    let code = null;
+    try {
+        if (!readPredecessor(target?.containerName || '', record)) {
+            target.startPredecessorDeferred = false;
+            return false;
+        }
+    } catch (error) {
+        code = String(error?.code || 'PLOINKY_RUNTIME_PREDECESSOR_INVALID');
+    }
+    if (!target.startPredecessorDeferred) {
+        target.startPredecessorDeferred = true;
+        logEvent(monitor, 'info', 'container_restart_deferred_start_predecessor', {
+            container: target.containerName,
+            agent: target.agentName,
+            repo: target.repoName,
+            ...(code ? { code } : {}),
+        });
+    }
+    return true;
+}
+
+function deferMonitorWorkForStartPredecessor(monitor, target) {
+    if (!shouldDeferForStartPredecessor(monitor, target, target?.restartSnapshot?.registryRecord)) return false;
+    // A probe failure could only schedule a restart that must be deferred.
     stopProbeWorker(target);
     target.probeState = 'pending';
     target.probeLastSuccessAt = null;
@@ -1691,6 +1732,17 @@ export async function performContainerRestart(monitor, target, reason, attempt =
 
     const runNetworkLifecycle = monitor.withNetworkLifecycleLock || withNetworkLifecycleLock;
     try {
+        // Only a workspace start writes or consumes a predecessor receipt, and
+        // it holds this lease to do so. The pre-physical-ensure check below
+        // proves the live record still equals the attempt's snapshot.
+        const loadAgents = monitor.loadAgents || workspaceSvc.loadAgents;
+        const restartRecord = attempt
+            ? attempt.snapshot.registryRecord
+            : loadAgents()?.[target.containerName];
+        if (shouldDeferForStartPredecessor(monitor, target, restartRecord)) {
+            target.isRestarting = false;
+            return;
+        }
         // Dependency preparation inside this restart reuses its lease. A
         // concurrent Router operation (a disable, a publication) cannot.
         await runWithWorkspaceMutationLease(workspaceLease, () => runNetworkLifecycle(async (networkLifecycleCapability) => {
@@ -2099,9 +2151,12 @@ export function monitorTick(monitor) {
     // saturating it can interrupt otherwise healthy agent traffic. The next
     // five-second monitor tick resumes snapshots as soon as the worker exits.
     // Maintenance owns the stronger lifecycle contract and must still be able
-    // to cancel a worker before snapshot serialization takes effect.
+    // to cancel a worker before snapshot serialization takes effect, and so
+    // does a stopped start for a record it left to the next start.
     for (const target of monitor.targets.values()) {
-        if (target?.probeWorker) deferMonitorWorkForMaintenance(monitor, target);
+        if (target?.probeWorker && !deferMonitorWorkForMaintenance(monitor, target)) {
+            deferMonitorWorkForStartPredecessor(monitor, target);
+        }
     }
     const activeWorkers = activeProbeWorkerCount(monitor);
     if (activeWorkers > 0) {
@@ -2120,6 +2175,7 @@ export function monitorTick(monitor) {
     for (const target of monitor.targets.values()) {
         if (!target || target.circuitBreakerTripped) continue;
         if (deferMonitorWorkForMaintenance(monitor, target)) continue;
+        if (deferMonitorWorkForStartPredecessor(monitor, target)) continue;
         if (target.isRestarting || target.pendingRestartTimer) continue;
 
         let running = false;

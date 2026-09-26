@@ -158,6 +158,57 @@ async function run() {
             }
         });
     }
+
+    if (phase === 'monitor') {
+        // The container monitor of a Watchdog that outlived the stopped start,
+        // built as Watchdog.js builds it, ticking now that no start lock is
+        // held. Short restart backoffs let each scheduled restart run here.
+        const { createContainerMonitor, monitorTick, stopContainerMonitor } = await cli('server/containerMonitor.js');
+        const events = [];
+        const monitor = createContainerMonitor({
+            config: { INITIAL_BACKOFF_MS: 10, MAX_BACKOFF_MS: 50, CONTAINER_SNAPSHOT_INTERVAL_MS: 0 },
+            log: (level, event, data = {}) => events.push({
+                event, container: data.container || null, code: data.code || null, error: data.error ? String(data.error) : null,
+            }),
+        });
+        const deadline = Date.now() + 60_000;
+        for (let tick = 0; tick < 3; tick += 1) {
+            monitorTick(monitor);
+            while ([...monitor.targets.values()].some((target) => target.isRestarting || target.pendingRestartTimer)) {
+                if (Date.now() > deadline) throw new Error('monitor restarts did not settle');
+                await new Promise((resolve) => setTimeout(resolve, 25));
+            }
+        }
+        stopContainerMonitor(monitor);
+        return { events };
+    }
+
+    if (phase === 'orphan-receipts') {
+        // What a start killed before its rotated registry write leaves: one
+        // receipt per record, keyed by a tuple no record carries.
+        const { writeRuntimePredecessor } = await cli('sandbox/runtimePredecessorStore.js');
+        const records = readJson(agentsFile);
+        for (const name of AGENTS) {
+            writeRuntimePredecessor({
+                containerName: containerOf(name),
+                successor: { instanceId: `${name}-orphan-instance`, enableGeneration: `${name}-orphan-generation` },
+                predecessor: records[containerOf(name)],
+            });
+        }
+        return { written: AGENTS.length };
+    }
+
+    if (phase === 'stop') {
+        // `ploinky stop` without its Router kill: retire a stopped start's
+        // preparation, inactivate the selector and stop every configured agent
+        // by exact ownership. No Router runs here, and the kill's port scan
+        // would signal whatever listens on the persisted port of this host.
+        const { retireAbandonedStartPreparationBeforeStop } = await cli('commands/workspaceUtil.js');
+        const { stopConfiguredAgents } = await cli('sandbox/docker/index.js');
+        retireAbandonedStartPreparationBeforeStop({ log() {} });
+        edge.inactivateEdgeRoutingGenerationForStop('cli-workspace-stop');
+        return { stopped: stopConfiguredAgents() };
+    }
     throw new Error(`unknown phase ${phase}`);
 }
 

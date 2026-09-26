@@ -24,10 +24,17 @@ const INSTANCE_LABEL = 'io.assistos.ploinky.instance-id';
 const GENERATION_LABEL = 'io.assistos.ploinky.enable-generation';
 
 // Fails the named engine command once for one exact container ID, then
-// behaves as the fake engine again.
+// behaves as the fake engine again. With FAKE_SHIM_RUNNING_PS it also lists
+// only running containers for `ps`, as the real engines do: the fake engine
+// lists every container, so a monitor would never see a stopped runtime.
 const SHIM_SOURCE = String.raw`#!/usr/bin/env node
 const fs = require('fs'); const { spawnSync } = require('child_process');
 const argv = process.argv.slice(2);
+if (process.env.FAKE_SHIM_RUNNING_PS === '1' && argv[0] === 'ps' && !argv.includes('-a') && !argv.includes('--all')) {
+  const state = JSON.parse(fs.readFileSync(process.env.FAKE_ENGINE_STATE, 'utf8'));
+  for (const entry of Object.values(state.containers)) if (entry.State.Running) process.stdout.write(entry.Name + '\n');
+  process.exit(0);
+}
 const rule = process.env.FAKE_SHIM_RULE ? JSON.parse(process.env.FAKE_SHIM_RULE) : null;
 if (rule && argv.includes(rule.id) && argv.slice(0, rule.command.length).join(' ') === rule.command.join(' ')
     && (!rule.once || !fs.existsSync(rule.once))) {
@@ -67,13 +74,15 @@ function workspace(t) {
         PLOINKY_MEDIA_HOST_PORT: '17891',
     };
     const drive = (phase, argument, { killed = false, rule = null } = {}) => {
+        const monitor = phase === 'monitor';
         const run = spawnSync(process.execPath, [DRIVER, phase, ...(argument ? [JSON.stringify(argument)] : [])], {
             cwd: ws,
-            env: rule ? {
+            env: rule || monitor ? {
                 ...env,
                 PATH: [shimDir, env.PATH].join(path.delimiter),
                 FAKE_SHIM_ENGINE: path.join(engine.binDir, 'podman'),
-                FAKE_SHIM_RULE: JSON.stringify(rule),
+                ...(rule ? { FAKE_SHIM_RULE: JSON.stringify(rule) } : {}),
+                ...(monitor ? { FAKE_SHIM_RUNNING_PS: '1' } : {}),
             } : env,
             encoding: 'utf8',
             timeout: 120_000,
@@ -343,4 +352,113 @@ test('an absent predecessor keeps its receipt until the engine positively report
     assert.equal(restored.staged, true, JSON.stringify(restored));
     assertEveryPredecessorRemoved(w, setup);
     assert.deepEqual(predecessorReceipts(w), []);
+});
+
+// A failed start may itself have launched the Watchdog, which outlives it.
+// Its container monitor restarts every runtime it finds stopped. For a record
+// with a predecessor receipt, that restart rotated the tuple again before it
+// failed to remove the predecessor. The receipt then no longer bound, and every
+// later start refused the predecessor for good.
+function monitorEvents(monitored, name) {
+    return monitored.events.filter((entry) => entry.container === container(name)).map((entry) => entry.event);
+}
+
+function terminalEntries(w) {
+    const file = path.join(w.ws, '.ploinky', 'running', 'container-monitor-terminal.json');
+    return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')).entries : {};
+}
+
+function failedStart(w, setup, name) {
+    const failed = w.drive('stage', null, {
+        rule: {
+            command: ['rm'], id: setup.containerIds[name], status: 1,
+            stderr: 'Error: transient storage failure', once: path.join(w.root, 'rm-failed-once'),
+        },
+    });
+    assert.equal(failed.staged, false);
+    return failed;
+}
+
+test('a Watchdog that outlives a failed start leaves the predecessors it could not remove to the next start', (t) => {
+    const w = workspace(t);
+    const setup = w.drive('setup');
+    failedStart(w, setup, 'beta');
+    const agentsFile = path.join(w.ws, '.ploinky', 'agents.json');
+    const registryBytes = fs.readFileSync(agentsFile);
+    const receipts = predecessorReceipts(w);
+    const containers = engineContainers(w);
+    assert.equal(receipts.length, 3);
+
+    const monitored = w.drive('monitor');
+    const monitoredState = {
+        registry: fs.readFileSync(agentsFile),
+        receipts: predecessorReceipts(w),
+        containers: engineContainers(w),
+        terminal: terminalEntries(w),
+    };
+
+    w.drive('stop');
+    const restored = w.drive('stage');
+    assert.equal(restored.staged, true, JSON.stringify(restored));
+    assertEveryPredecessorRemoved(w, setup);
+    assert.deepEqual(predecessorReceipts(w), []);
+
+    // The Watchdog left the stopped start's state exactly as it found it.
+    for (const name of AGENTS) {
+        assert.deepEqual(monitorEvents(monitored, name), [
+            'container_watch_added',
+            'container_restart_deferred_start_predecessor',
+        ], JSON.stringify(monitored.events));
+    }
+    assert.deepEqual(monitoredState, { registry: registryBytes, receipts, containers, terminal: {} });
+});
+
+test('that Watchdog still relaunches a runtime whose predecessor the failed start had already removed', (t) => {
+    const w = workspace(t);
+    const setup = w.drive('setup');
+    // Removal runs beta, gamma, alpha: beta is gone and gamma fails.
+    assert.deepEqual(failedStart(w, setup, 'gamma').removals, [container('beta'), container('gamma')]);
+    const before = registry(w);
+
+    const monitored = w.drive('monitor');
+    const after = registry(w);
+    const relaunched = engineContainers(w)[container('beta')];
+    const terminal = terminalEntries(w);
+
+    w.drive('stop');
+    const restored = w.drive('stage');
+    assert.equal(restored.staged, true, JSON.stringify(restored));
+    assertEveryPredecessorRemoved(w, setup);
+    assert.deepEqual(engineContainers(w), {}, 'the relaunched runtime was replaced by exact ownership too');
+    assert.deepEqual(predecessorReceipts(w), []);
+
+    assert.ok(monitorEvents(monitored, 'beta').includes('container_restart_success'), JSON.stringify(monitored.events));
+    assert.equal(relaunched.status, 'running');
+    assert.equal(relaunched.id, after[container('beta')].containerId);
+    assert.equal(relaunched.instanceId, after[container('beta')].instanceId);
+    for (const name of ['alpha', 'gamma']) {
+        assert.deepEqual(monitorEvents(monitored, name), [
+            'container_watch_added',
+            'container_restart_deferred_start_predecessor',
+        ], JSON.stringify(monitored.events));
+        assert.deepEqual(after[container(name)], before[container(name)]);
+    }
+    assert.deepEqual(terminal, {});
+});
+
+test('receipts that no registered record carries never hold that Watchdog back', (t) => {
+    const w = workspace(t);
+    const setup = w.drive('setup');
+    w.drive('orphan-receipts');
+    const orphans = predecessorReceipts(w);
+    assert.equal(orphans.length, 3);
+
+    const monitored = w.drive('monitor');
+    for (const name of AGENTS) {
+        const events = monitorEvents(monitored, name);
+        assert.ok(events.includes('container_restart_success'), `${name}: ${JSON.stringify(monitored.events)}`);
+        assert.equal(events.includes('container_restart_deferred_start_predecessor'), false);
+    }
+    assertEveryPredecessorRemoved(w, setup);
+    assert.deepEqual(predecessorReceipts(w), orphans);
 });
