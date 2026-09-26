@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -10,7 +10,12 @@ import { createSkillExclusionPlanner } from '../../cli/utils/skills/exportExclus
 import * as tx from '../../cli/utils/skills/exportTransaction.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { createBoxSupervisor } from '../../ploinky-box/supervisor.mjs';
-import { refreshDeferredHostExclusions } from '../../ploinky-box/update/hostExclusions.mjs';
+import {
+    HOST_EXCLUSIONS_AUTHORITY,
+    HOST_EXCLUSIONS_INTENT_KIND,
+    recoverInterruptedHostExclusions,
+    refreshDeferredHostExclusions,
+} from '../../ploinky-box/update/hostExclusions.mjs';
 import { createMemoryUpdateHostState } from '../../ploinky-box/update/hostState.mjs';
 import { agentLibFixture } from '../helpers/agentlibFixture.mjs';
 import { fakeRestartCore, fakeUpdateCore, verifiedRecord } from '../helpers/fakeUpdateCore.mjs';
@@ -73,14 +78,14 @@ function workspace(t) {
 test('a deferred Git export folder becomes privately excluded on the host through the Box spelling', async (t) => {
     const w = workspace(t);
     const ledger = fs.readFileSync(path.join(w.project, '.agents', '.ploinky-skill-exports.json'), 'utf8');
-    const [record] = refreshDeferredHostExclusions({ folders: [w.boxProject], identity: w.identity });
+    const [record] = await refreshDeferredHostExclusions({ folders: [w.boxProject], identity: w.identity });
     assert.deepEqual([record.phase, record.id, record.outcome, record.required], ['skills-manifest', 'exclusions:project', 'changed', false]);
     assert.equal(record.details.folder, w.project, 'the refresh ran on the canonical host folder');
     assert.equal(status(w.project), '', 'the private worktree exclusion is effective on the host');
     assert.equal(fs.existsSync(path.join(w.project, '.gitignore')), false);
     assert.equal(fs.readFileSync(path.join(w.project, '.agents', '.ploinky-skill-exports.json'), 'utf8'), ledger,
         'exclusions only: no skill publication');
-    const [again] = refreshDeferredHostExclusions({ folders: [w.boxProject], identity: w.identity });
+    const [again] = await refreshDeferredHostExclusions({ folders: [w.boxProject], identity: w.identity });
     assert.equal(again.outcome, 'unchanged');
 });
 
@@ -88,7 +93,7 @@ test('a live external excludes policy stays deferred with its code', async (t) =
     const w = workspace(t);
     fs.mkdirSync(path.dirname(xdgIgnore), { recursive: true });
     fs.writeFileSync(xdgIgnore, '*.log\n');
-    const [record] = refreshDeferredHostExclusions({ folders: [w.boxProject], identity: w.identity });
+    const [record] = await refreshDeferredHostExclusions({ folders: [w.boxProject], identity: w.identity });
     assert.deepEqual([record.outcome, record.code], ['deferred', 'exclusions-deferred']);
     assert.match(status(w.project), /\?\? \.agents\//, 'nothing was written');
 });
@@ -99,7 +104,7 @@ test('escaping, unclean, missing and linked-out folders are refused before any r
     fs.mkdirSync(outside);
     fs.symlinkSync(outside, path.join(w.real, 'link-out'), 'dir');
     const calls = [];
-    const records = refreshDeferredHostExclusions({
+    const records = await refreshDeferredHostExclusions({
         folders: [
             outside,
             `${w.identity.workspaceRoot}/project/../../outside`,
@@ -128,7 +133,7 @@ test('duplicate folders are refreshed once and an oversized list is bounded with
     const calls = [];
     const refresh = (folder) => { calls.push(folder); return { exclusions: { status: 'unchanged' } }; };
     const root = w.identity.workspaceRoot;
-    const records = refreshDeferredHostExclusions({
+    const records = await refreshDeferredHostExclusions({
         folders: [`${root}/project`, `${root}/project`, `${root}/a`, `${root}/b`],
         identity: w.identity,
         refresh,
@@ -137,17 +142,17 @@ test('duplicate folders are refreshed once and an oversized list is bounded with
     assert.deepEqual(calls, [path.join(w.real, 'a'), path.join(w.real, 'b')], 'sorted, unique, bounded');
     const overflow = records.find(record => record.id === 'exclusions:overflow');
     assert.deepEqual([overflow.outcome, overflow.code, overflow.required], ['uncertain', 'deferred-exclusion-folders-exceeded', false]);
-    assert.deepEqual(refreshDeferredHostExclusions({ folders: 'not-a-list', identity: w.identity }).map(record => record.code),
+    assert.deepEqual((await refreshDeferredHostExclusions({ folders: 'not-a-list', identity: w.identity })).map(record => record.code),
         ['deferred-exclusion-folders-invalid']);
-    assert.deepEqual(refreshDeferredHostExclusions({ identity: w.identity }), []);
-    const thrown = refreshDeferredHostExclusions({
+    assert.deepEqual(await refreshDeferredHostExclusions({ identity: w.identity }), []);
+    const thrown = await refreshDeferredHostExclusions({
         folders: [`${root}/a`], identity: w.identity,
         refresh: () => { throw Object.assign(new Error('export lock is held'), { code: 'EXPORT_LOCK_BLOCKED' }); },
     });
     assert.deepEqual([thrown[0].outcome, thrown[0].code], ['failed', 'EXPORT_LOCK_BLOCKED']);
 });
 
-function supervisorFor(t, w, { folders, refresh = undefined }) {
+function supervisorFor(t, w, { folders, refresh = undefined, store = createMemoryUpdateHostState(), onCore = null }) {
     const events = [];
     const selection = agentLibFixture(w.identity.workspaceRoot);
     const ownership = () => ({
@@ -169,7 +174,7 @@ function supervisorFor(t, w, { folders, refresh = undefined }) {
         env: process.env,
         stdout: { write() {} },
         stderr: { write() {} },
-        updateHostState: createMemoryUpdateHostState(),
+        updateHostState: store,
         runner: {
             run() {},
             query: () => ({ ok: true, stdout: JSON.stringify({ initialized: true, routingConfigured: true }) }),
@@ -181,7 +186,7 @@ function supervisorFor(t, w, { folders, refresh = undefined }) {
             action: 'reused', ownership: ownership(), hostPort: 8080, mediaHostPort: 7882, finalize() {},
         }),
         runUpdateCore: fakeUpdateCore({
-            onCall() { events.push('core-update'); },
+            onCall() { events.push('core-update'); onCore?.(); },
             records: () => [verifiedRecord()],
             resultExtra: { deferredExclusionFolders: folders },
         }),
@@ -243,13 +248,13 @@ test('a planted .git file redirecting outside the workspace is never followed by
     // Replace the project's Git directory with a Box-writable redirect.
     fs.rmSync(path.join(w.project, '.git'), { recursive: true, force: true });
     fs.writeFileSync(path.join(w.project, '.git'), `gitdir: ${path.join(victim, '.git')}\n`);
-    const [record] = refreshDeferredHostExclusions({ folders: [w.boxProject], identity: w.identity });
+    const [record] = await refreshDeferredHostExclusions({ folders: [w.boxProject], identity: w.identity });
     assert.deepEqual([record.outcome, record.code], ['deferred', 'git-directory-outside-boundary']);
     assert.equal(fs.readFileSync(path.join(victim, '.git', 'config'), 'utf8'), victimConfig, 'victim config untouched');
     assert.deepEqual(fs.readdirSync(path.join(victim, '.git')).filter(name => name.startsWith('ploinky') || name === 'config.worktree'), []);
 });
 
-test('host refresh preserves a symlinked Git configuration without writing its target', t => {
+test('host refresh preserves a symlinked Git configuration without writing its target', async t => {
     const w = workspace(t);
     const config = path.join(w.project, '.git', 'config');
     const outside = path.join(w.root, 'outside-config');
@@ -257,33 +262,33 @@ test('host refresh preserves a symlinked Git configuration without writing its t
     fs.writeFileSync(outside, before);
     fs.unlinkSync(config);
     fs.symlinkSync(outside, config);
-    const [record] = refreshDeferredHostExclusions({ folders: [w.boxProject], identity: w.identity });
+    const [record] = await refreshDeferredHostExclusions({ folders: [w.boxProject], identity: w.identity });
     assert.deepEqual([record.outcome, record.code], ['deferred', 'git-metadata-not-private-regular']);
     assert.deepEqual(fs.readFileSync(outside), before);
     assert.equal(fs.lstatSync(config).isSymbolicLink(), true);
     assert.equal(fs.existsSync(path.join(w.project, '.git', tx.GIT_CONFIG_LOCK || 'ploinky-skill-exports-config.lock')), false);
 });
 
-test('host refresh refuses pending recovery before inspecting journal-selected lock locations', t => {
+test('host refresh refuses pending recovery before inspecting journal-selected lock locations', async t => {
     const w = workspace(t);
     const outside = path.join(w.root, 'outside-metadata');
     fs.mkdirSync(outside);
     const journal = path.join(w.project, '.agents', tx.EXPORT_JOURNAL);
     const bytes = JSON.stringify({ protocol: tx.EXPORT_PROTOCOL, config: { identity: { commonDir: outside } } });
     fs.writeFileSync(journal, bytes);
-    const [record] = refreshDeferredHostExclusions({ folders: [w.boxProject], identity: w.identity });
+    const [record] = await refreshDeferredHostExclusions({ folders: [w.boxProject], identity: w.identity });
     assert.deepEqual([record.outcome, record.code], ['uncertain', 'SKILL_EXPORT_RECOVERY_REQUIRED']);
     assert.deepEqual(fs.readdirSync(outside), []);
     assert.equal(fs.readFileSync(journal, 'utf8'), bytes);
     assert.equal(fs.existsSync(path.join(w.project, '.agents', tx.EXPORT_LOCK)), false);
 });
 
-test('host refresh defers repository Git includes before loading their policy', t => {
+test('host refresh defers repository Git includes before loading their policy', async t => {
     const w = workspace(t);
     const config = path.join(w.project, '.git', 'config');
     fs.appendFileSync(config, '\n[include]\n    path = ../absent-policy\n');
     const before = fs.readFileSync(config);
-    const [record] = refreshDeferredHostExclusions({ folders: [w.boxProject], identity: w.identity });
+    const [record] = await refreshDeferredHostExclusions({ folders: [w.boxProject], identity: w.identity });
     assert.deepEqual([record.outcome, record.code], ['deferred', 'git-config-include-unverified']);
     assert.deepEqual(fs.readFileSync(config), before);
 });
@@ -298,12 +303,12 @@ function strayLockLiveness(folder) {
     } };
 }
 
-test('a host refresh whose lock release fails is failed when settled and uncertain when its result needs recovery', t => {
+test('a host refresh whose lock release fails is failed when settled and uncertain when its result needs recovery', async t => {
     const w = workspace(t);
     const liveness = strayLockLiveness(w.project);
     const lock = path.join(w.project, '.agents', tx.EXPORT_LOCK);
     // The real refresh publishes and settles its exclusions, then the release fails.
-    const [settled] = refreshDeferredHostExclusions({
+    const [settled] = await refreshDeferredHostExclusions({
         folders: [w.boxProject], identity: w.identity,
         refresh: (folder, options) => tx.refreshSkillExportExclusions(folder, { ...options, lock: { liveness } }),
     });
@@ -313,7 +318,7 @@ test('a host refresh whose lock release fails is failed when settled and uncerta
     // The same release failure after a completed result that still needs
     // recovery keeps that result's uncertain outcome.
     const quarantined = { id: '00000000-0000-4000-8000-000000000000', status: 'quarantined', unexpected: [{ name: 'receipt' }] };
-    const [uncertain] = refreshDeferredHostExclusions({
+    const [uncertain] = await refreshDeferredHostExclusions({
         folders: [w.boxProject], identity: w.identity,
         refresh: folder => tx.withSkillExportLocks([folder], ([handle]) => ({ folder: handle.root, exclusions: { status: 'preserved' }, transaction: quarantined, recovery: handle.recovery }), { liveness }),
     });
@@ -322,4 +327,266 @@ test('a host refresh whose lock release fails is failed when settled and uncerta
     assert.deepEqual(uncertain.details.transaction, quarantined);
     assert.match(uncertain.reason, /transaction quarantined.*lock could not be released/s);
     fs.rmSync(lock, { recursive: true });
+});
+
+// ---------------------------------------------------------------------------
+// Cancellation and recovery. The host refresh holds each folder's export lock
+// and common Git configuration lock as this host process, an owner that no
+// in-Box exporter can prove dead.
+
+const intentFor = (w, folders) => ({ schema: 'ploinky-host-exclusions-refresh', version: 1, instance: w.identity.instance, folders });
+
+// A private record adapter that logs its writes and removals.
+function memoryIntent(record = null) {
+    const intent = {
+        calls: [],
+        record,
+        read: () => intent.record,
+        write(next) { intent.calls.push('write'); intent.record = JSON.parse(JSON.stringify(next)); },
+        remove() { intent.calls.push('remove'); intent.record = null; },
+    };
+    return intent;
+}
+
+const exportLockPath = w => path.join(w.project, '.agents', tx.EXPORT_LOCK);
+const configLockPath = w => path.join(w.project, '.git', 'ploinky-skill-exports-config.lock');
+const lockContents = lock => fs.readdirSync(lock).sort().map(name => [name, fs.readFileSync(path.join(lock, name), 'utf8')]);
+
+// A process of this boot and PID namespace that has ended.
+const endedPid = () => spawnSync(process.execPath, ['-e', '']).pid;
+
+// Take both locks of the project as the described owner and never release
+// them, as a host refresh killed while holding them would.
+function holdLocks(w, { pid, authority = HOST_EXCLUSIONS_AUTHORITY, namespace = null }) {
+    const self = { ...tx.currentSkillExportIdentity(), pid, start: '', ...(namespace ? { namespace } : {}) };
+    const options = { liveness: { current: () => self }, authority, waitMs: 0 };
+    tx.acquireGitConfigLock(path.join(w.project, '.git'), options);
+    tx.acquireSkillExportLock(w.project, options);
+}
+
+test('the refresh records its folders before taking any lock and forgets them once every lock is released', async t => {
+    const w = workspace(t);
+    const intent = memoryIntent();
+    const seen = [];
+    const [record] = await refreshDeferredHostExclusions({
+        folders: [w.boxProject], identity: w.identity, intent,
+        refresh: (folder, options) => {
+            seen.push({ recorded: intent.record?.folders, locked: fs.existsSync(exportLockPath(w)) || fs.existsSync(configLockPath(w)) });
+            return tx.refreshSkillExportExclusions(folder, options);
+        },
+    });
+    assert.equal(record.outcome, 'changed');
+    assert.deepEqual(seen, [{ recorded: [w.project], locked: false }]);
+    assert.deepEqual([intent.calls, intent.record], [['write', 'remove'], null]);
+});
+
+test('a lock the refresh could not release keeps its folder recorded for the next update', async t => {
+    const w = workspace(t);
+    const intent = memoryIntent();
+    const liveness = strayLockLiveness(w.project);
+    const [record] = await refreshDeferredHostExclusions({
+        folders: [w.boxProject], identity: w.identity, intent,
+        refresh: (folder, options) => tx.refreshSkillExportExclusions(folder, { ...options, lock: { liveness } }),
+    });
+    assert.equal(record.code, 'SKILL_EXPORT_LOCK_RELEASE_FAILED');
+    assert.deepEqual([intent.calls, intent.record.folders], [['write', 'write'], [w.project]]);
+    fs.rmSync(exportLockPath(w), { recursive: true });
+});
+
+test('no folder is refreshed when its record cannot be written first', async t => {
+    const w = workspace(t);
+    const calls = [];
+    const records = await refreshDeferredHostExclusions({
+        folders: [w.boxProject], identity: w.identity,
+        intent: { write() { throw new Error('host state is read-only'); }, remove() { calls.push('remove'); } },
+        refresh: (...args) => { calls.push(args); return { exclusions: { status: 'published' } }; },
+    });
+    assert.deepEqual(calls, []);
+    assert.deepEqual(records.map(record => [record.id, record.outcome, record.code, record.required]),
+        [['exclusions:intent', 'uncertain', 'exclusions-intent-unwritable', false]]);
+    assert.match(records[0].reason, /host state is read-only/);
+});
+
+test('a received signal stops the refresh before its next folder and names every folder it skipped', async t => {
+    const w = workspace(t);
+    fs.mkdirSync(path.join(w.real, 'a'));
+    fs.mkdirSync(path.join(w.real, 'b'));
+    const root = w.identity.workspaceRoot;
+    const calls = [];
+    const intent = memoryIntent();
+    const records = await refreshDeferredHostExclusions({
+        folders: [`${root}/project`, `${root}/b`, `${root}/a`], identity: w.identity, intent,
+        cancellation: { signalReceived: async () => (calls.length ? 'SIGTERM' : '') },
+        refresh: (folder) => { calls.push(folder); return { exclusions: { status: 'unchanged' } }; },
+    });
+    assert.deepEqual(calls, [path.join(w.real, 'a')], 'the folder in progress finished; no later folder started');
+    assert.deepEqual(records.map(record => [record.id, record.outcome, record.code, record.required]), [
+        ['exclusions:a', 'unchanged', '', false],
+        ['exclusions:b', 'skipped', 'cancelled', false],
+        ['exclusions:project', 'skipped', 'cancelled', false],
+    ]);
+    assert.match(records[1].reason, /cancelled by SIGTERM before the host refreshed these exclusions/);
+    assert.deepEqual([intent.calls, intent.record], [['write', 'remove'], null]);
+    const early = await refreshDeferredHostExclusions({
+        folders: [`${root}/a`], identity: w.identity,
+        cancellation: { signalReceived: async () => 'SIGINT' },
+        refresh: () => assert.fail('no folder starts after a signal'),
+    });
+    assert.deepEqual(early.map(record => [record.outcome, record.code]), [['skipped', 'cancelled']]);
+});
+
+test('recovery releases the locks a killed host refresh left, with same-scope proof, and leaves its journal and Git lock', t => {
+    const w = workspace(t);
+    const pid = endedPid();
+    holdLocks(w, { pid });
+    const journal = path.join(w.project, '.agents', tx.EXPORT_JOURNAL);
+    fs.writeFileSync(journal, '{"pending":"host exclusions-only transaction"}\n');
+    const gitLock = path.join(w.project, '.git', 'config.lock');
+    fs.writeFileSync(gitLock, '[core]\n');
+    const intent = memoryIntent(intentFor(w, [w.project]));
+    const { records, warnings } = recoverInterruptedHostExclusions({ intent, identity: w.identity });
+    assert.deepEqual(records.map(record => [record.id, record.outcome, record.code, record.required]),
+        [['exclusions-recovery:project', 'changed', 'interrupted-refresh-locks-released', false]]);
+    assert.deepEqual(records[0].details.released, [configLockPath(w), exportLockPath(w)]);
+    assert.deepEqual([fs.existsSync(configLockPath(w)), fs.existsSync(exportLockPath(w))], [false, false]);
+    assert.equal(fs.readFileSync(journal, 'utf8'), '{"pending":"host exclusions-only transaction"}\n', 'the journal is left for the confined executor');
+    assert.equal(fs.readFileSync(gitLock, 'utf8'), '[core]\n', "Git's own lock is never touched");
+    assert.match(warnings.join('\n'), new RegExp(`\\(pid ${pid}\\) ended and released them; its pending export journal is left`));
+    assert.deepEqual([intent.calls, intent.record], [['remove'], null]);
+});
+
+for (const [label, state, hold] of [
+    ['still runs', 'live', w => holdLocks(w, { pid: process.pid })],
+    ['ran in another PID namespace', 'unknown', w => holdLocks(w, { pid: endedPid(), namespace: 'pid:[another-namespace]' })],
+    ['is another writer', 'dead-other-writer', w => holdLocks(w, { pid: endedPid(), authority: { kind: 'ploinky-cli', operation: 'skills-export' } })],
+    ['left no owner record', 'ownerless', w => { fs.mkdirSync(configLockPath(w)); fs.mkdirSync(exportLockPath(w)); }],
+]) {
+    test(`recovery preserves and reports a lock whose owner ${label}, and keeps the record`, t => {
+        const w = workspace(t);
+        hold(w);
+        const before = [configLockPath(w), exportLockPath(w)].map(lockContents);
+        const intent = memoryIntent(intentFor(w, [w.project]));
+        const { records, warnings } = recoverInterruptedHostExclusions({ intent, identity: w.identity });
+        assert.deepEqual(records.map(record => [record.id, record.outcome, record.code]),
+            [['exclusions-recovery:project', 'uncertain', 'interrupted-refresh-locks-unproven']]);
+        // Observed and preserved, never handed to an acquisition attempt.
+        for (const lock of [configLockPath(w), exportLockPath(w)]) {
+            assert.match(records[0].reason, new RegExp(`${lock.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?: \\(owner pid \\d+\\))? is ${state}[;.]`));
+        }
+        assert.deepEqual([configLockPath(w), exportLockPath(w)].map(lockContents), before, 'both locks are untouched');
+        assert.deepEqual(intent.record.folders, [w.project]);
+        assert.match(warnings.join('\n'), /could not be proven released.*remove them by hand/s);
+    });
+}
+
+test('recovery never creates a missing skills directory to release an export lock', t => {
+    const w = workspace(t);
+    holdLocks(w, { pid: endedPid() });
+    const skills = path.join(w.project, '.agents', 'skills');
+    fs.renameSync(skills, path.join(w.root, 'skills-moved'));
+    const intent = memoryIntent(intentFor(w, [w.project]));
+    const { records } = recoverInterruptedHostExclusions({ intent, identity: w.identity });
+    assert.deepEqual(records.map(record => [record.outcome, record.code]),
+        [['changed', 'interrupted-refresh-locks-released'], ['uncertain', 'interrupted-refresh-locks-unproven']]);
+    assert.match(records[1].reason, /skills-directory-missing/);
+    assert.deepEqual([fs.existsSync(configLockPath(w)), fs.existsSync(exportLockPath(w)), fs.existsSync(skills)], [false, true, false]);
+    assert.deepEqual(intent.record.folders, [w.project]);
+});
+
+test('recovery drops a recorded folder that no longer is that workspace folder without inspecting it', t => {
+    const w = workspace(t);
+    const outside = path.join(w.root, 'outside');
+    fs.mkdirSync(path.join(outside, '.agents', tx.EXPORT_LOCK), { recursive: true });
+    const swapped = path.join(w.real, 'swapped');
+    fs.symlinkSync(outside, swapped, 'dir');
+    // A recorded path that is now a link to another workspace folder.
+    holdLocks(w, { pid: endedPid() });
+    const alias = path.join(w.real, 'alias');
+    fs.symlinkSync(w.project, alias, 'dir');
+    const intent = memoryIntent(intentFor(w, [path.join(w.real, 'gone'), swapped, alias]));
+    const { records, warnings } = recoverInterruptedHostExclusions({ intent, identity: w.identity });
+    assert.deepEqual(records, []);
+    assert.equal(warnings.length, 3);
+    assert.match(warnings.join('\n'), /no longer a folder of this workspace/);
+    assert.deepEqual(fs.readdirSync(path.join(outside, '.agents', tx.EXPORT_LOCK)), [], 'nothing outside was touched');
+    assert.deepEqual([fs.existsSync(configLockPath(w)), fs.existsSync(exportLockPath(w))], [true, true], 'nothing was inspected through the link');
+    assert.deepEqual([intent.calls, intent.record], [['remove'], null]);
+});
+
+test('recovery never follows a linked .agents directory to an export lock', t => {
+    const w = workspace(t);
+    holdLocks(w, { pid: endedPid() });
+    const outsideAgents = path.join(w.root, 'outside-agents');
+    fs.renameSync(path.join(w.project, '.agents'), outsideAgents);
+    fs.symlinkSync(outsideAgents, path.join(w.project, '.agents'), 'dir');
+    const outsideLock = lockContents(path.join(outsideAgents, tx.EXPORT_LOCK));
+    const intent = memoryIntent(intentFor(w, [w.project]));
+    const { records } = recoverInterruptedHostExclusions({ intent, identity: w.identity });
+    assert.deepEqual(records.map(record => [record.outcome, record.code]),
+        [['changed', 'interrupted-refresh-locks-released'], ['uncertain', 'interrupted-refresh-locks-unproven']]);
+    assert.match(records[1].reason, /\.agents is not a real directory/);
+    assert.equal(fs.existsSync(configLockPath(w)), false, 'the configuration lock inside the workspace was released');
+    assert.deepEqual(lockContents(path.join(outsideAgents, tx.EXPORT_LOCK)), outsideLock, 'the linked lock is untouched');
+    assert.deepEqual(intent.record.folders, [w.project]);
+});
+
+test('an unreadable refresh record is reported once and forgotten', t => {
+    const w = workspace(t);
+    for (const stored of [
+        { schema: 'another-record' },
+        intentFor(w, ['relative/path']),
+        { ...intentFor(w, [w.project]), instance: 'ploinky-box-other-000000000000' },
+    ]) {
+        const intent = memoryIntent(stored);
+        const { records } = recoverInterruptedHostExclusions({ intent, identity: w.identity });
+        assert.deepEqual(records.map(record => [record.id, record.outcome, record.code]),
+            [['exclusions-recovery:record', 'uncertain', 'exclusions-intent-invalid']]);
+        assert.deepEqual(intent.calls, ['remove']);
+    }
+    const unreadable = { removed: false, read() { throw new Error('record is not private'); }, write() { assert.fail('nothing is written'); }, remove() { unreadable.removed = true; } };
+    const { records } = recoverInterruptedHostExclusions({ intent: unreadable, identity: w.identity });
+    assert.match(records[0].reason, /record is not private/);
+    assert.equal(unreadable.removed, true);
+    assert.deepEqual(recoverInterruptedHostExclusions({ intent: memoryIntent(), identity: w.identity }), { records: [], warnings: [] });
+});
+
+test('an update releases the locks an interrupted host refresh left before its in-Box step meets them', async t => {
+    const w = workspace(t);
+    const pid = endedPid();
+    holdLocks(w, { pid });
+    const store = createMemoryUpdateHostState();
+    store.write(HOST_EXCLUSIONS_INTENT_KIND, w.identity.instance, intentFor(w, [w.project]));
+    const atCore = [];
+    const { supervisor } = supervisorFor(t, w, {
+        folders: [w.boxProject], store,
+        onCore: () => atCore.push([fs.existsSync(configLockPath(w)), fs.existsSync(exportLockPath(w))]),
+    });
+    const result = await supervisor.runUpdateTransaction(['update']);
+    assert.deepEqual(atCore, [[false, false]], 'both locks were released before the in-Box step');
+    const released = result.records.find(record => record.id === 'exclusions-recovery:project');
+    assert.deepEqual([released.outcome, released.code], ['changed', 'interrupted-refresh-locks-released']);
+    assert.ok(result.warnings.some(warning => warning.includes(`(pid ${pid}) ended`)));
+    assert.equal(result.records.find(record => record.id === 'exclusions:project').outcome, 'changed', 'the refresh then ran again');
+    assert.equal(store.read(HOST_EXCLUSIONS_INTENT_KIND, w.identity.instance), null);
+    assert.equal(result.decision.exitCode, 0);
+});
+
+test('the host refresh owns the update signals and runs with its folders recorded in private host state', async t => {
+    const w = workspace(t);
+    const store = createMemoryUpdateHostState();
+    const seen = [];
+    const { supervisor } = supervisorFor(t, w, {
+        folders: [w.boxProject], store,
+        refresh: options => refreshDeferredHostExclusions({
+            ...options,
+            refresh: (folder, refreshOptions) => {
+                seen.push([typeof options.cancellation?.signalReceived, store.read(HOST_EXCLUSIONS_INTENT_KIND, w.identity.instance)?.folders]);
+                return tx.refreshSkillExportExclusions(folder, refreshOptions);
+            },
+        }),
+    });
+    const result = await supervisor.runUpdateTransaction(['update']);
+    assert.deepEqual(seen, [['function', [w.project]]]);
+    assert.equal(store.read(HOST_EXCLUSIONS_INTENT_KIND, w.identity.instance), null);
+    assert.equal(result.records.find(record => record.id === 'exclusions:project').outcome, 'changed');
 });

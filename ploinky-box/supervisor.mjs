@@ -84,7 +84,11 @@ import { reconcileBoxContainer } from './lifecycle/transactions.mjs';
 import { listUnresolvedAdmissions, runJournaledAdmission } from './update/admission.mjs';
 import { updateHostStateForLockManager } from './update/hostState.mjs';
 import { IN_BOX_NONCE_PROBE_SCRIPT, IN_BOX_OPERATION_WRITERS_PROBE_SCRIPT, runUpdateExec } from './update/coreRunner.mjs';
-import { refreshDeferredHostExclusions } from './update/hostExclusions.mjs';
+import {
+    HOST_EXCLUSIONS_INTENT_KIND,
+    recoverInterruptedHostExclusions,
+    refreshDeferredHostExclusions,
+} from './update/hostExclusions.mjs';
 import {
     UPDATE_REPORT_CONTEXT_ENV,
     UPDATE_REPORT_NONCE_ENV,
@@ -94,6 +98,8 @@ import {
     readUpdateReport,
     removeUpdateReport,
 } from '../cli/commands/updateOutcome.js';
+import { commandErrorRecord } from '../cli/commands/updateRecords.js';
+import { UpdateCancelledError, createUpdateCancellation } from '../cli/commands/updateCancellation.js';
 import {
     ROUTER_BIND_WILDCARD,
     assertRouterBindingAssignable,
@@ -277,6 +283,8 @@ export function createBoxSupervisor({
     runUpdateCore = runBoundedUpdateCommand,
     runRestartCore = runBoundedRestartCommand,
     refreshHostExclusions = refreshDeferredHostExclusions,
+    recoverHostExclusions = recoverInterruptedHostExclusions,
+    createCancellation = () => createUpdateCancellation(),
     readReport = readUpdateReport,
     removeReport = removeUpdateReport,
     createReportNonce = createUpdateReportNonce,
@@ -1252,6 +1260,41 @@ export function createBoxSupervisor({
         });
     }
 
+    // Private host record of the folders whose locks a host exclusion refresh
+    // of this workspace may hold.
+    function exclusionsIntent(identity) {
+        return {
+            read: () => updateHostState.read(HOST_EXCLUSIONS_INTENT_KIND, identity.instance),
+            write: record => updateHostState.write(HOST_EXCLUSIONS_INTENT_KIND, identity.instance, record),
+            remove: () => updateHostState.remove(HOST_EXCLUSIONS_INTENT_KIND, identity.instance),
+        };
+    }
+
+    /**
+     * The host refresh holds folder locks that only this host can prove
+     * released, so it owns SIGINT/SIGTERM instead of dying with them: a signal
+     * stops it before its next folder, and the update ends with a `cancelled`
+     * record that blocks activation. A signal after that decision keeps its
+     * default action.
+     */
+    async function refreshExclusionsOwningSignals(identity, folders) {
+        const cancellation = createCancellation();
+        cancellation.arm();
+        let signal = '';
+        try {
+            const records = [...await refreshHostExclusions({
+                folders, identity, env, cancellation, intent: exclusionsIntent(identity),
+            })];
+            signal = await cancellation.signalReceived();
+            if (signal) {
+                records.push(commandErrorRecord(new UpdateCancelledError(signal, 'the host finished this update'), { code: 'cancelled' }));
+            }
+            return records;
+        } finally {
+            await cancellation.dispose({ reported: Boolean(signal) });
+        }
+    }
+
     /**
      * Run the in-Box update with a fresh nonce and expected context, then
      * judge its one structured report. A nonzero exit keeps a complete
@@ -1337,11 +1380,7 @@ export function createBoxSupervisor({
             records.push(...report.result.records);
             // The in-Box core cannot see the host user's Git excludes view;
             // refresh the exclusions it deferred here, still under the lock.
-            records.push(...refreshHostExclusions({
-                folders: report.result.deferredExclusionFolders,
-                identity,
-                env,
-            }));
+            records.push(...await refreshExclusionsOwningSignals(identity, report.result.deferredExclusionFolders));
         } else {
             records.push(uncertainCoreRecord('in-box-update-report', report.code, report.reason));
         }
@@ -1496,15 +1535,26 @@ export function createBoxSupervisor({
             const activity = sampleGraphActivity(identity, ownership);
             const unresolvedAdmissions = listUnresolvedAdmissions(updateHostState, identity);
             const context = { identity, lock, ownership, plan, scope, coreArgv, priorCoreStartArgv, activity };
-            const result = plan.request.kind === 'all'
-                ? await runFullUpdate(context)
-                : await runTargetedUpdate(context);
-            const records = Object.freeze([...result.records]);
+            // Locks that an interrupted host exclusion refresh left are
+            // released, when provably its own, before the in-Box step meets them.
+            const exclusionRecovery = recoverHostExclusions({ intent: exclusionsIntent(identity), identity, env });
+            let result;
+            try {
+                result = plan.request.kind === 'all'
+                    ? await runFullUpdate(context)
+                    : await runTargetedUpdate(context);
+            } catch (error) {
+                if (exclusionRecovery.records.length && error && typeof error === 'object') {
+                    error.updateRecords = Object.freeze([...exclusionRecovery.records, ...(error.updateRecords || [])]);
+                }
+                throw error;
+            }
+            const records = Object.freeze([...exclusionRecovery.records, ...result.records]);
             return Object.freeze({
                 ...result,
                 records,
                 decision: decideUpdateStatus(records),
-                warnings: Object.freeze([...barrierWarnings, ...result.warnings]),
+                warnings: Object.freeze([...barrierWarnings, ...exclusionRecovery.warnings, ...result.warnings]),
                 request: plan.request,
                 coreArgv,
                 unresolvedAdmissions,

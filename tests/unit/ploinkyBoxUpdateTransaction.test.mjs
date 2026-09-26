@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -15,6 +16,7 @@ import { createMemoryUpdateHostState } from '../../ploinky-box/update/hostState.
 import { agentLibFixture } from '../helpers/agentlibFixture.mjs';
 import { fakeRestartCore, fakeUpdateCore, verifiedRecord } from '../helpers/fakeUpdateCore.mjs';
 import { createOperationRecord } from '../../cli/commands/updateOutcome.js';
+import { createUpdateCancellation } from '../../cli/commands/updateCancellation.js';
 
 const CONTAINER_ID = 'a'.repeat(64);
 
@@ -32,6 +34,7 @@ function harness(t, {
     core = {},
     restartCore = null,
     launchRelative = '',
+    supervisorOptions = {},
 } = {}) {
     const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-update-transaction-')));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -171,6 +174,7 @@ function harness(t, {
             events.push(['restore-active', value]);
             metadata.active = value;
         },
+        ...supervisorOptions,
     });
     return { supervisor, identity, workspace, root, events, graph, metadata, store, selection };
 }
@@ -580,6 +584,64 @@ test('a blocked activation of a replaced Box reconstructs the prior Box and grap
     assert.equal(result.activation.outcome, 'restored');
     assert.deepEqual(coreCalls(fixture.events), [['update'], ['start', 'agent', '8080']]);
     assert.equal(fixture.metadata.active, 'old-active');
+});
+
+// The host exclusion refresh owns SIGINT/SIGTERM. A signal delivered while it
+// runs ends the update as cancelled, which blocks activation exactly as an
+// in-Box cancellation does.
+function signalDuringHostRefresh(signal) {
+    const processRef = Object.assign(new EventEmitter(), {
+        pid: 4242,
+        kills: [],
+        kill(pid, name) { this.kills.push([pid, name]); },
+    });
+    return {
+        processRef,
+        supervisorOptions: {
+            createCancellation: () => createUpdateCancellation({ processRef }),
+            async refreshHostExclusions({ cancellation }) {
+                assert.equal(typeof cancellation?.signalReceived, 'function');
+                processRef.emit(signal);
+                return [];
+            },
+        },
+    };
+}
+
+test('a signal during the host exclusion refresh cancels a full update of a reused Box without any restart', async (t) => {
+    const signal = signalDuringHostRefresh('SIGINT');
+    const fixture = harness(t, { graph: { running: true, configured: true }, supervisorOptions: signal.supervisorOptions });
+    const result = await fixture.supervisor.runUpdateTransaction(['update']);
+    const cancelled = result.records.filter(record => record.phase === 'command' && record.code === 'cancelled');
+    assert.deepEqual(cancelled.map(record => [record.outcome, record.required]), [['failed', null]]);
+    assert.match(cancelled[0].reason, /cancelled by SIGINT before the host finished this update/);
+    assert.deepEqual([result.decision.exitCode, result.decision.activationAllowed, result.activation.outcome], [1, false, 'deferred']);
+    assert.deepEqual(coreCalls(fixture.events), [['update']], 'no restart after the cancellation');
+    assert.equal(fixture.events.includes('commit-agentlib'), false);
+    assert.equal(fixture.metadata.active, 'old-active');
+    assert.notEqual(fixture.store.read('update-pending', fixture.identity.instance), null);
+    assert.deepEqual([signal.processRef.listenerCount('SIGINT'), signal.processRef.listenerCount('SIGTERM')], [0, 0], 'the signals were handed back');
+    assert.deepEqual(signal.processRef.kills, [], 'a reported cancellation is not raised again');
+});
+
+test('a signal during the host exclusion refresh of a replaced Box reconstructs the prior Box and graph', async (t) => {
+    const signal = signalDuringHostRefresh('SIGTERM');
+    const fixture = harness(t, {
+        graph: { running: true, configured: true },
+        reconcileAction: 'replaced',
+        supervisorOptions: signal.supervisorOptions,
+    });
+    writeGraphSkillScope(fixture.identity, buildHostSkillScope(fixture.identity.workspaceRoot, fixture.identity.workspaceRoot), {
+        assertHeld() {},
+    });
+    const result = await fixture.supervisor.runUpdateTransaction(['update']);
+    assert.ok(result.records.some(record => record.phase === 'command' && record.code === 'cancelled'
+        && /cancelled by SIGTERM/.test(record.reason)));
+    assert.equal(result.activation.outcome, 'restored');
+    assert.equal(result.decision.exitCode, 1);
+    assert.deepEqual(coreCalls(fixture.events), [['update'], ['start', 'agent', '8080']]);
+    assert.equal(fixture.metadata.active, 'old-active');
+    assert.deepEqual(signal.processRef.kills, []);
 });
 
 test('a full update that did not restart keeps a pending targeted activation', async (t) => {

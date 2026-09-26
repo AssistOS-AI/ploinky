@@ -6,11 +6,12 @@ import path from 'node:path';
 import { PloinkyBoxError } from '../errors.mjs';
 
 // Private host-side state for update transactions: admission journals,
-// pending-activation records and self-update relaunch handoffs. It lives in
-// the host-owned state root (`~/.ploinky-box`), never in the workspace that the
-// Box mounts read-write, so in-Box processes cannot author these records.
+// pending-activation records, self-update relaunch handoffs and the folders
+// of a host exclusion refresh in progress. It lives in the host-owned state
+// root (`~/.ploinky-box`), never in the workspace that the Box mounts
+// read-write, so in-Box processes cannot author these records.
 
-export const UPDATE_STATE_KINDS = Object.freeze(['update-journals', 'update-pending', 'update-handoffs', 'update-recovery']);
+export const UPDATE_STATE_KINDS = Object.freeze(['update-journals', 'update-pending', 'update-handoffs', 'update-recovery', 'update-exclusions']);
 const KIND_SET = new Set(UPDATE_STATE_KINDS);
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,200}$/;
 export const UPDATE_STATE_MAX_BYTES = 256 * 1024;
