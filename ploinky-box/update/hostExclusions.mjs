@@ -27,12 +27,13 @@ import { relativeBoxWorkspacePath } from '../contract/workspace-root.mjs';
 // prove dead. The caller therefore owns SIGINT/SIGTERM across the refresh,
 // which stops before its next folder once one arrives. Before any lock is
 // taken the refresh records its folders in private host state, and it keeps
-// a folder there only while a lock it took there may remain. That record only
-// says where to look: the next update, under the workspace lock and before
-// its in-Box step, releases such a lock only when its owner record proves, in
-// this boot and PID namespace, that the host refresh which took it has ended.
-// A pending journal stays for the confined executor and Git's own lock files
-// are never touched.
+// a folder there only while a lock it took there may remain; folders an
+// earlier update kept stay recorded. That record only says where to look: the
+// next update, under the workspace lock and before its in-Box step, releases
+// such a lock only when its owner record proves, in this boot and PID
+// namespace, that the host refresh which took it has ended, and keeps every
+// folder it cannot prove released. A pending journal stays for the confined
+// executor and Git's own lock files are never touched.
 
 export const MAX_DEFERRED_EXCLUSION_FOLDERS = 64;
 export const HOST_EXCLUSIONS_AUTHORITY = Object.freeze({
@@ -42,6 +43,8 @@ export const HOST_EXCLUSIONS_AUTHORITY = Object.freeze({
 });
 export const HOST_EXCLUSIONS_INTENT_KIND = 'update-exclusions';
 const INTENT_SCHEMA = 'ploinky-host-exclusions-refresh';
+// Folders kept by earlier updates plus one refresh's own folders.
+const MAX_RECORDED_FOLDERS = 4 * MAX_DEFERRED_EXCLUSION_FOLDERS;
 
 function exclusionRecord(id, outcome, { code = '', reason = '', details = null } = {}) {
     return createOperationRecord({
@@ -69,6 +72,14 @@ function outcomeOf(exclusions) {
 
 function intentRecord(identity, folders) {
     return { schema: INTENT_SCHEMA, version: 1, instance: identity.instance, folders: [...folders] };
+}
+
+// The folders a well-formed record of this workspace names, else null.
+function recordedFolders(stored, identity) {
+    return stored?.schema === INTENT_SCHEMA && stored.version === 1 && stored.instance === identity.instance
+        && Array.isArray(stored.folders) && stored.folders.length <= MAX_RECORDED_FOLDERS
+        && stored.folders.every(folder => typeof folder === 'string' && path.isAbsolute(folder))
+        ? [...new Set(stored.folders)] : null;
 }
 
 /**
@@ -153,9 +164,17 @@ export async function refreshDeferredHostExclusions({
         targets.push({ id, folder: scope.canonicalFolder });
     }
     if (!targets.length) return records;
+    // Folders an earlier update kept because it could not prove their locks
+    // released stay recorded; this refresh only adds and removes its own.
+    let kept = [];
     if (intent) {
         try {
-            intent.write(intentRecord(identity, targets.map(target => target.folder)));
+            try { kept = recordedFolders(intent.read?.(), identity) || []; } catch (_) { kept = []; }
+            const recorded = [...new Set([...kept, ...targets.map(target => target.folder)])];
+            if (recorded.length > MAX_RECORDED_FOLDERS) {
+                throw new Error(`the record would name ${recorded.length} folders, more than ${MAX_RECORDED_FOLDERS}`);
+            }
+            intent.write(intentRecord(identity, recorded));
         } catch (error) {
             // Without the record, a host that died holding a folder's locks
             // would strand them there, so no lock is taken.
@@ -225,7 +244,8 @@ export async function refreshDeferredHostExclusions({
         // Every other lock was released before its refresh returned. A record
         // left behind costs the next update one inspection of free locks.
         try {
-            if (intent && unreleased.length) intent.write(intentRecord(identity, unreleased));
+            const remaining = [...new Set([...kept, ...unreleased])];
+            if (intent && remaining.length) intent.write(intentRecord(identity, remaining));
             else intent?.remove();
         } catch (_) {}
     }
@@ -357,10 +377,7 @@ export function recoverInterruptedHostExclusions({
         stored = { unreadable: error?.message || String(error) };
     }
     if (stored === null || stored === undefined) return { records, warnings };
-    const folders = stored?.schema === INTENT_SCHEMA && stored.version === 1 && stored.instance === identity.instance
-        && Array.isArray(stored.folders) && stored.folders.length <= MAX_DEFERRED_EXCLUSION_FOLDERS
-        && stored.folders.every(folder => typeof folder === 'string' && path.isAbsolute(folder))
-        ? [...new Set(stored.folders)] : null;
+    const folders = recordedFolders(stored, identity);
     let planner = null;
     let plannerError = null;
     if (folders) {

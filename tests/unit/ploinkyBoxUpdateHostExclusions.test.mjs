@@ -355,13 +355,13 @@ const lockContents = lock => fs.readdirSync(lock).sort().map(name => [name, fs.r
 // A process of this boot and PID namespace that has ended.
 const endedPid = () => spawnSync(process.execPath, ['-e', '']).pid;
 
-// Take both locks of the project as the described owner and never release
-// them, as a host refresh killed while holding them would.
-function holdLocks(w, { pid, authority = HOST_EXCLUSIONS_AUTHORITY, namespace = null }) {
+// Take both locks of a folder (the project by default) as the described
+// owner and never release them, as a host refresh killed while holding them would.
+function holdLocks(w, { pid, authority = HOST_EXCLUSIONS_AUTHORITY, namespace = null, folder = w.project }) {
     const self = { ...tx.currentSkillExportIdentity(), pid, start: '', ...(namespace ? { namespace } : {}) };
     const options = { liveness: { current: () => self }, authority, waitMs: 0 };
-    tx.acquireGitConfigLock(path.join(w.project, '.git'), options);
-    tx.acquireSkillExportLock(w.project, options);
+    tx.acquireGitConfigLock(path.join(folder, '.git'), options);
+    tx.acquireSkillExportLock(folder, options);
 }
 
 test('the refresh records its folders before taking any lock and forgets them once every lock is released', async t => {
@@ -589,4 +589,41 @@ test('the host refresh owns the update signals and runs with its folders recorde
     assert.deepEqual(seen, [['function', [w.project]]]);
     assert.equal(store.read(HOST_EXCLUSIONS_INTENT_KIND, w.identity.instance), null);
     assert.equal(result.records.find(record => record.id === 'exclusions:project').outcome, 'changed');
+});
+
+test('the refresh keeps the folders an earlier update could not settle, while it runs and after it', async t => {
+    const w = workspace(t);
+    const kept = path.join(w.real, 'kept');
+    const intent = memoryIntent(intentFor(w, [kept]));
+    const seen = [];
+    const [record] = await refreshDeferredHostExclusions({
+        folders: [w.boxProject], identity: w.identity, intent,
+        refresh: (folder, options) => {
+            seen.push(intent.record?.folders);
+            return tx.refreshSkillExportExclusions(folder, options);
+        },
+    });
+    assert.equal(record.outcome, 'changed');
+    assert.deepEqual(seen, [[kept, w.project]]);
+    assert.deepEqual(intent.record?.folders, [kept], 'the folder whose locks were not proven released stays recorded');
+});
+
+test('an update keeps a folder whose locks it could not prove released recorded, whatever else it refreshes', async t => {
+    const w = workspace(t);
+    const other = path.join(w.real, 'other');
+    fs.mkdirSync(path.join(other, '.agents', 'skills'), { recursive: true });
+    git(other, 'init', '-q', '-b', 'main');
+    holdLocks(w, { pid: endedPid(), namespace: 'pid:[another-namespace]', folder: other });
+    const store = createMemoryUpdateHostState();
+    store.write(HOST_EXCLUSIONS_INTENT_KIND, w.identity.instance, intentFor(w, [other]));
+    const { supervisor } = supervisorFor(t, w, { folders: [w.boxProject], store });
+    const result = await supervisor.runUpdateTransaction(['update']);
+    assert.deepEqual(result.records.filter(record => record.id.startsWith('exclusions')).map(record => [record.id, record.outcome, record.code]), [
+        ['exclusions-recovery:other', 'uncertain', 'interrupted-refresh-locks-unproven'],
+        ['exclusions:project', 'changed', ''],
+    ]);
+    assert.deepEqual(store.read(HOST_EXCLUSIONS_INTENT_KIND, w.identity.instance)?.folders, [other],
+        'the unproven folder is still recorded after the refresh of another folder');
+    assert.deepEqual([fs.existsSync(path.join(other, '.git', 'ploinky-skill-exports-config.lock')),
+        fs.existsSync(path.join(other, '.agents', tx.EXPORT_LOCK))], [true, true]);
 });
