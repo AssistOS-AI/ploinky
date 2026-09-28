@@ -100,12 +100,16 @@ function fakeHost({
     mtimeMs = 1_786_317_226_000,
     flags = (flag) => `libc6,${flag}`,
     leadingLines = [],
+    // Real file names that differ from the default `<name>.so.<library>`.
+    realNames = {},
+    nvvm70 = null,
 } = {}) {
     const { lib, flag, machine } = HOST_ARCHES[arch];
     const files = new Map();
     const links = new Map();
     const lines = [...leadingLines];
-    const addLibrary = (soname, real) => {
+    const addLibrary = (soname, defaultReal) => {
+        const real = realNames[soname] ? `${lib}/${realNames[soname]}` : defaultReal;
         files.set(real, { size: real.length * 1000, mtimeMs });
         const linkPath = `${lib}/${soname}`;
         if (linkPath !== real) links.set(linkPath, real);
@@ -116,6 +120,7 @@ function fakeHost({
     addLibrary('libnvidia-ml.so.1', `${lib}/libnvidia-ml.so.${library}`);
     addLibrary('libnvidia-nvvm.so.4', `${lib}/libnvidia-nvvm.so.${library}`);
     addLibrary(`libnvidia-gpucomp.so.${library}`, `${lib}/libnvidia-gpucomp.so.${library}`);
+    if (nvvm70) addLibrary('libnvidia-nvvm70.so.4', `${lib}/${nvvm70}`);
     lines.push(arch === 'x64'
         ? '\tlibcuda.so.1 (libc6) => /usr/lib/i386-linux-gnu/libcuda.so.1'
         : '\tlibcuda.so.1 (libc6,hard-float) => /usr/lib/arm-linux-gnueabihf/libcuda.so.1');
@@ -484,6 +489,42 @@ test('discovery defaults to the architecture of the host it runs on', { skip: !O
         smiCandidates: ['/usr/bin/nvidia-smi'],
     });
     assert.deepEqual(discovery, host.discover());
+});
+
+test('NVVM 7.0 is bound when present, under its unversioned real name only', (t) => {
+    const state = workspaceFixture(t);
+    for (const arch of ['x64', 'arm64']) {
+        const { lib } = HOST_ARCHES[arch];
+        const discovery = fakeHost({ arch, nvvm70: 'libnvidia-nvvm70.so.4' }).discover();
+        assert.deepEqual(discovery.libraries.map((library) => library.soname), [
+            'libcuda.so.1',
+            'libnvidia-ptxjitcompiler.so.1',
+            'libnvidia-ml.so.1',
+            'libnvidia-nvvm.so.4',
+            'libnvidia-nvvm70.so.4',
+            `libnvidia-gpucomp.so.${DRIVER}`,
+        ]);
+        const wiring = buildGpuWiring({ identity: state.identity, grant: GRANT, discovery, homeDirectory: state.home });
+        assert.deepEqual(
+            wiring.mounts.filter((mount) => mount.destination.endsWith('/libnvidia-nvvm70.so.4')),
+            [{ source: `${lib}/libnvidia-nvvm70.so.4`, destination: '/usr/local/nvidia/lib64/libnvidia-nvvm70.so.4' }],
+        );
+        const spec = JSON.parse(wiring.files.find((file) => file.path.endsWith('box.json')).content);
+        assert.equal(spec.containerEdits.mounts.some((mount) => mount.hostPath === '/usr/local/nvidia/lib64/libnvidia-nvvm70.so.4'), true);
+        // Named by the driver version, it passes the ordinary check too.
+        assert.equal(fakeHost({ arch, nvvm70: `libnvidia-nvvm70.so.${DRIVER}` }).discover().libraries.length, 6);
+    }
+    const refuses = (host, pattern) => assert.throws(
+        () => host.discover(),
+        (error) => error.code === 'PLOINKY_BOX_GPU_DISCOVERY_FAILED' && pattern.test(error.message),
+    );
+    // Any other name is a version mismatch, as for every driver library.
+    refuses(fakeHost({ nvvm70: 'libnvidia-nvvm70.so.4.600.10' }),
+        /the kernel module is 595\.91\.07 but libnvidia-nvvm70\.so\.4 is libnvidia-nvvm70\.so\.4\.600\.10/);
+    refuses(fakeHost({ nvvm70: 'libnvidia-nvvm70.so.600.10' }), /libnvidia-nvvm70\.so\.4 is libnvidia-nvvm70\.so\.600\.10/);
+    // The exception names one soname: an unversioned libnvidia-nvvm.so.4 is still refused.
+    refuses(fakeHost({ realNames: { 'libnvidia-nvvm.so.4': 'libnvidia-nvvm.so.4' } }),
+        /the kernel module is 595\.91\.07 but libnvidia-nvvm\.so\.4 is libnvidia-nvvm\.so\.4;/);
 });
 
 test('a failed discovery wires only a stale-grant marker (D12)', (t) => {

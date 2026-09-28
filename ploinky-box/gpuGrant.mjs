@@ -48,14 +48,18 @@ export const GPU_GRANT_VENDORS = Object.freeze(['nvidia']);
 const BOX_BASE_DEVICES = Object.freeze(['/dev/fuse', '/dev/net/tun']);
 const NVIDIA_DEVICE_NODES = Object.freeze(['/dev/nvidia0', '/dev/nvidiactl', '/dev/nvidia-uvm']);
 // Measured on CUDA workloads: the driver API library, the PTX JIT that some
-// runtimes load, and NVML for nvidia-smi are required. NVVM and gpucomp are
-// bound when present.
+// runtimes load, and NVML for nvidia-smi are required. NVVM (both the current
+// one and the NVVM 7.0 one libcuda names) and gpucomp are bound when present.
 const NVIDIA_REQUIRED_LIBRARIES = Object.freeze([
     'libcuda.so.1',
     'libnvidia-ptxjitcompiler.so.1',
     'libnvidia-ml.so.1',
 ]);
-const NVIDIA_OPTIONAL_LIBRARIES = Object.freeze(['libnvidia-nvvm.so.4']);
+const NVIDIA_OPTIONAL_LIBRARIES = Object.freeze(['libnvidia-nvvm.so.4', 'libnvidia-nvvm70.so.4']);
+// The driver ships these as a real file named by the soname itself, not by
+// the driver version, so for them only that exact name also passes the
+// version check.
+const NVIDIA_UNVERSIONED_LIBRARIES = Object.freeze(['libnvidia-nvvm70.so.4']);
 const NVIDIA_SMI_CANDIDATES = Object.freeze([
     '/usr/bin/nvidia-smi',
     '/usr/local/bin/nvidia-smi',
@@ -359,7 +363,8 @@ export function discoverNvidiaGpu({
         const target = cache.get(soname);
         if (!target) continue;
         const file = describeFile(fsApi, target, `NVIDIA driver library ${soname}`);
-        if (!versionedName(file.source)) {
+        const unversioned = NVIDIA_UNVERSIONED_LIBRARIES.includes(soname) && path.basename(file.source) === soname;
+        if (!versionedName(file.source) && !unversioned) {
             throw discoveryError(
                 `NVIDIA driver version mismatch: the kernel module is ${driverVersion} but ${soname} is `
                 + `${path.basename(file.source)}; reboot after a driver update`,
