@@ -17,9 +17,15 @@ pair('health', 'GET', '/health', { jsonEquals: { status: 'healthy' } });
 pair('users-list', 'GET', '/api/agents/explorer/users?pageSize=1', { jsonEquals: { ok: true }, jsonArrayKeys: ['users', 'availableRoles'] });
 pair('status', 'GET', '/status/data', { inventoryId: 'status.*', jsonKeys: ['workspace', 'servers', 'static', 'runtimes'] });
 pair('webtty-ui', 'GET', '/webtty/', { contentType: 'text/html', textIncludes: ['<html'], availabilityFailure: 'Do not accept 503 as denial; terminal manager/backend may be unavailable.' });
-pair('marketplace-read', 'GET', '/api/marketplace', {
+pair('marketplace-repos', 'GET', '/api/marketplace/repos', {
+  inventoryId: 'marketplace-repos-read.get',
   allowed: ['selfRegistered', 'user', 'admin'], jsonEquals: { ok: true }, jsonKeys: ['marketplace'],
-  assertions: ['marketplace.user.id equals verified current principal', 'marketplace.permissions.canManage is true only for admin', 'unprivileged skillSource.source contains no absolute local path'],
+  assertions: ['unprivileged skillSource.source contains no absolute local path'],
+});
+pair('marketplace-agents', 'GET', '/api/marketplace/agents', {
+  inventoryId: 'marketplace-agents-read.get',
+  allowed: ['selfRegistered', 'user', 'admin'], jsonEquals: { ok: true }, jsonKeys: ['marketplace'],
+  assertions: ['marketplace.user.id equals verified current principal', 'marketplace.permissions.canManage is true only for admin'],
 });
 pair('auth-token', 'GET', '/auth/token?agent=explorer', {
   allowed: ['selfRegistered', 'user', 'admin'], jsonEquals: { ok: true }, jsonKeys: ['user', 'browserMutation'],
@@ -128,11 +134,15 @@ export function inspectMarketplaceAuthorization(json, principal) {
   const issues = [];
   const marketplace = json?.marketplace;
   if (!marketplace || json?.ok !== true) return ['marketplace response missing'];
-  if (!principal?.id || marketplace.user?.id !== principal.id) issues.push('marketplace returned an incorrect principal');
-  const admin = principal?.roles?.includes('admin') === true;
-  if (marketplace.permissions?.canManage !== admin) issues.push('management permission does not match verified role');
-  if (!Array.isArray(marketplace.repositories) || !Array.isArray(marketplace.agents)) issues.push('marketplace inventory arrays missing');
-  if (!admin) {
+  const hasAgents = Array.isArray(marketplace.agents);
+  const hasRepositories = Array.isArray(marketplace.repositories);
+  if (!hasAgents && !hasRepositories) issues.push('marketplace inventory arrays missing');
+  if (hasAgents) {
+    if (!principal?.id || marketplace.user?.id !== principal.id) issues.push('marketplace returned an incorrect principal');
+    const admin = principal?.roles?.includes('admin') === true;
+    if (marketplace.permissions?.canManage !== admin) issues.push('management permission does not match verified role');
+  }
+  if (hasRepositories && principal?.roles?.includes('admin') !== true) {
     for (const repository of marketplace.repositories ?? []) {
       const source = repository?.skillSource?.source;
       if (typeof source === 'string' && (/^\//.test(source) || /^[A-Za-z]:[\\/]/.test(source))) {
@@ -181,7 +191,7 @@ export async function runRouterProbes(ctx, { probes: selectedProbes = routerProb
       const validation = validateRouterAllowedResponse(probe, response);
       assert.ok(validation.ok, validation.errors.join('; '));
       if (probe.id.startsWith('auth-token.')) assert.ok(validateRouterPrincipal(response.json, ctx.principals[actor]), 'Router token identity/role must match independently verified principal');
-      if (probe.id === 'marketplace-read.allow') {
+      if (probe.id === 'marketplace-agents.allow') {
         assert.ok(response.json?.marketplace?.user?.id === ctx.principals[actor]?.id, 'Marketplace must bind the current principal');
         assert.equal(response.json?.marketplace?.permissions?.canManage, actor === 'admin', 'Marketplace administration flag must match verified principal');
       }
@@ -191,24 +201,26 @@ export async function runRouterProbes(ctx, { probes: selectedProbes = routerProb
       passed = true;
     });
     record(probe, actor, passed ? 'AUTHORIZED_CONTROL_PASSED' : 'AUTHORIZED_CONTROL_FAILED');
-    if (passed && probe.id === 'marketplace-read.allow') {
+    const marketplaceRead = probe.id === 'marketplace-repos.allow' || probe.id === 'marketplace-agents.allow';
+    if (passed && marketplaceRead) {
       await ctx.check(`router:marketplace-sensitive-path-metadata:${actor}`, async () => {
         assert.deepEqual(inspectMarketplaceAuthorization(response.json, ctx.principals[actor]), [], 'Marketplace returned unauthorized metadata (see sanitized issue names)');
       });
       const issues = inspectMarketplaceAuthorization(response.json, ctx.principals[actor]);
       if (issues.length) {
         ctx.report.routerFindings ||= [];
+        const repositories = probe.id === 'marketplace-repos.allow';
         ctx.report.routerFindings.push({
-          id: 'marketplace-local-source-path-disclosure', actor, issues,
-          source: ['cli/server/authHandlers/marketplaceRoutes.js:342', 'cli/utils/skillRepositorySource.js:16'],
-          reproduction: 'GET /api/marketplace with a verified selfRegistered or user session; inspect repositories[].skillSource.source.',
-          expected: 'Unprivileged catalog consumers receive a remote source or opaque repository identity.',
-          actual: 'An absolute local filesystem path is returned to an unprivileged session.',
+          id: repositories ? 'marketplace-local-source-path-disclosure' : 'marketplace-principal-metadata', actor, resource: probe.id, issues,
+          source: ['cli/server/authHandlers/marketplaceRoutes.js:369', 'cli/utils/skillRepositorySource.js:16'],
+          reproduction: `GET ${probe.path} with a verified selfRegistered or user session; inspect the resource-specific catalog metadata.`,
+          expected: 'Unprivileged catalog consumers receive only resource-appropriate, non-disclosing metadata.',
+          actual: 'A resource catalog returned metadata that mismatches the verified principal or discloses a local path.',
         });
       }
       if (actor !== 'admin' && (response.json?.marketplace?.agents ?? []).some(agent => agent.manifestPath || agent.pid || agent.containerName)) {
         ctx.report.routerObservations ||= [];
-        ctx.report.routerObservations.push({ actor, id: 'marketplace-runtime-metadata', source: 'cli/server/authHandlers/marketplaceRoutes.js:393', note: 'Unprivileged catalog also includes manifestPath/containerName/pid; no values copied to report. Review product necessity separately.' });
+        ctx.report.routerObservations.push({ actor, id: 'marketplace-runtime-metadata', source: 'cli/server/authHandlers/marketplaceRoutes.js:562', note: 'Unprivileged agent catalog includes manifestPath/containerName/pid; no values copied to report. Review product necessity separately.' });
       }
     }
     if (passed && probe.id === 'agent-card.allow' && response.json.errors.length) {

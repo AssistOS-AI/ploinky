@@ -308,7 +308,7 @@ test('MCP browser client forwards only a caller-selected enable mode', async () 
     const requests = [];
     let running = false;
     const server = http.createServer((req, res) => {
-        if (req.url !== '/api/marketplace') {
+        if (req.url !== '/api/marketplace/agents') {
             res.writeHead(404);
             res.end();
             return;

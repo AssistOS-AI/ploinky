@@ -38,9 +38,15 @@ add('users-create', 'POST', '/api/agents/:agent/users', 'cli/server/authHandlers
 add('users-update', 'PATCH', '/api/agents/:agent/users/:userId', 'cli/server/authHandlers/userAdminRoutes.js:327', 'admin', 'Can change username/name/displayName/email/roles as supported by provider. Non-admin role spoof and horizontal target must fail before mutation.', { gap: 'Requires valid disposable existing user, positive control and persisted after-check.' });
 add('users-delete', 'DELETE', '/api/agents/:agent/users/:userId', 'cli/server/authHandlers/userAdminRoutes.js:352', 'admin', 'Provider delete; admin.users.manage, CSRF, lease. Never delete a non-fixture account.', { gap: 'Fixture cleanup only; no broad deletion.' });
 add('removed-settings', '*', '/api/agents/:agent/settings', 'cli/server/authHandlers/userAdminRoutes.js:173', 'private', 'Reserved removed route returns 404 before session resolution; provider settings live in UserPersisto.');
-add('marketplace-read', 'GET', '/api/marketplace', 'cli/server/authHandlers/marketplaceRoutes.js:510', 'session', 'All authenticated roles can discover catalog; canManage derives from real administrator. Assertion callers require bound marketplace-read authority. Audit skillSource.source/origin, manifestPath, pid and containerName separately from catalog access.');
-for (const action of ['install_repo', 'uninstall_repo', 'enable_agent', 'disable_agent']) {
-  add(`marketplace-${action}`, 'POST', '/api/marketplace', 'cli/server/authHandlers/marketplaceRoutes.js:534', 'admin', `Body action=${action}. Browser admin + Origin/CSRF. A verified agent may only enable installed agents with dedicated assertion.`, { body: { action }, gap: 'Lifecycle/global repository operations require valid disposable ownership and positive control; never run against a business runtime.' });
+add('marketplace-repos-read', 'GET', '/api/marketplace/repos', 'cli/server/authHandlers/marketplaceRoutes.js:587', 'session', 'All authenticated roles can discover the repository catalog. Assertion callers require bound marketplace-read authority. Audit skillSource.source/origin separately from catalog access.');
+add('marketplace-agents-read', 'GET', '/api/marketplace/agents', 'cli/server/authHandlers/marketplaceRoutes.js:562', 'session', 'All authenticated roles can read agent runtime state and their own identity; canManage derives from real administrator. Audit manifestPath, pid and containerName separately from agent access.');
+for (const [action, path, line] of [
+  ['install_repo', '/api/marketplace/repos', 656],
+  ['uninstall_repo', '/api/marketplace/repos', 661],
+  ['enable_agent', '/api/marketplace/agents', 668],
+  ['disable_agent', '/api/marketplace/agents', 670],
+]) {
+  add(`marketplace-${action}`, 'POST', path, `cli/server/authHandlers/marketplaceRoutes.js:${line}`, 'admin', `Body action=${action}. Browser admin + Origin/CSRF. A verified agent may only mutate installed repositories or enable installed agents with dedicated assertion.`, { body: { action }, gap: 'Lifecycle/global repository operations require valid disposable ownership and positive control; never run against a business runtime.' });
 }
 for (const command of ['http.route.list', 'http.route.check', 'http.route.set', 'http.route.remove', 'mcp.policy.list', 'mcp.policy.get', 'mcp.policy.set']) {
   const mutates = ['http.route.set', 'http.route.remove', 'mcp.policy.set'].includes(command);

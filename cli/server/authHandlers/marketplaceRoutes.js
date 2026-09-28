@@ -3,7 +3,6 @@ import path from 'path';
 import { withWorkspaceMutationLease } from '../../utils/runtime/maintenanceLocks.js';
 import { installRepositoryLinks, removeRepositoryLinks } from '../../utils/repositoryInstall.mjs';
 
-import { PLOINKY_DIR } from '../../utils/config.js';
 import * as reposSvc from '../../utils/repos.js';
 import { resolveSkillRepositorySource } from '../../utils/skillRepositorySource.js';
 import { listAgentRepositoryNames, workspaceAgentRepositoryPath } from '../../utils/agentRepositorySource.mjs';
@@ -322,13 +321,8 @@ function readMarketplaceEnableModes(manifestPath) {
     }
 }
 
-function buildMarketplaceState(user = null, options = {}) {
-    const reposDir = path.join(PLOINKY_DIR, 'repos');
-    const predefined = reposSvc.getPredefinedRepos();
-    const sources = reposSvc.getRepoSources();
-    const installed = new Set(listAgentRepositoryNames());
-    const agentsRegistry = options.registry || workspaceSvc.loadAgents();
-    const enabledAgents = Object.entries(agentsRegistry)
+function enabledMarketplaceAgents(agentsRegistry) {
+    return Object.entries(agentsRegistry)
         .filter(([, record]) => record && record.type === 'agent')
         .map(([containerName, record]) => ({
             repoName: String(record.repoName || ''),
@@ -338,8 +332,15 @@ function buildMarketplaceState(user = null, options = {}) {
             runMode: String(record.runMode || agentsSvc.DEFAULT_ENABLE_AGENT_MODE),
             runtime: String(record.runtime || 'container')
         }));
+}
+
+function buildMarketplaceRepositories({ registry } = {}) {
+    const predefined = reposSvc.getPredefinedRepos();
+    const sources = reposSvc.getRepoSources();
+    const installed = new Set(listAgentRepositoryNames());
+    const agentsRegistry = registry || workspaceSvc.loadAgents();
     const activeAgentsByRepo = new Map();
-    for (const record of enabledAgents) {
+    for (const record of enabledMarketplaceAgents(agentsRegistry)) {
         const repoName = record.repoName;
         if (!repoName) continue;
         activeAgentsByRepo.set(repoName, (activeAgentsByRepo.get(repoName) || 0) + 1);
@@ -372,6 +373,12 @@ function buildMarketplaceState(user = null, options = {}) {
             activeAgentsCount: activeAgentsByRepo.get(name) || 0
         };
     });
+    return { repositories };
+}
+
+function buildMarketplaceAgents(user = null, options = {}) {
+    const agentsRegistry = options.registry || workspaceSvc.loadAgents();
+    const enabledAgents = enabledMarketplaceAgents(agentsRegistry);
     const enabledKeys = new Set(enabledAgents.map(record => `${record.repoName}/${record.agentName}`));
     const enabledByContainer = new Map(enabledAgents.map(record => [record.containerName, record]));
     const enabledByRef = new Map(enabledAgents.map(record => [`${record.repoName}/${record.agentName}`, record]));
@@ -429,7 +436,6 @@ function buildMarketplaceState(user = null, options = {}) {
             });
         }
     }
-
     return {
         user: user ? {
             id: String(user.id || ''),
@@ -439,10 +445,15 @@ function buildMarketplaceState(user = null, options = {}) {
         permissions: {
             canManage: isAdminUser(user)
         },
-        repositories,
         agents: agents.sort((left, right) => left.ref.localeCompare(right.ref)),
         enabledAgents
     };
+}
+
+// Combined view retained for internal tests; no HTTP route exposes it.
+function buildMarketplaceState(user = null, options = {}) {
+    const registry = options.registry || workspaceSvc.loadAgents();
+    return { ...buildMarketplaceAgents(user, { ...options, registry }), ...buildMarketplaceRepositories({ registry }) };
 }
 
 function publicMarketplaceAuthContext(routePlan) {
@@ -534,36 +545,54 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
     }
 
     const method = (req.method || 'GET').toUpperCase();
-    if (method === 'GET' && (!route.resource || route.resource === 'list-repos')) {
+
+    const authorizeRead = async () => {
         if (readAuthorizationBearer(req)) {
-            if (!ensureMarketplaceAgentRequest(req, res, {
+            return ensureMarketplaceAgentRequest(req, res, {
                 method: 'GET',
                 query: parsedUrl.search ? parsedUrl.search.slice(1) : '',
                 tool: MARKETPLACE_READ_TOOL,
                 requestPath: parsedUrl.pathname,
-            })) return true;
-        } else {
-            const authResult = await ensureMarketplaceUser(req, res, { routePlan });
-            if (!authResult.ok) return true;
+            });
         }
-        if (route.resource === 'list-repos') {
-            sendJson(res, 200, { ok: true, repositories: reposSvc.listRepositorySources() });
+        const authResult = await ensureMarketplaceUser(req, res, { routePlan });
+        return authResult.ok;
+    };
+    const agentsMarketplace = () => ({
+        ...buildMarketplaceAgents(req.user),
+        permissions: {
+            canManage: isAdminUser(req.user)
+                && Boolean(publicMarketplaceAuthContext(routePlan) || canonicalControlOrigin(req)),
+        },
+    });
+
+    // Raw repository source listing for the repository client.
+    if (route.resource === 'list-repos') {
+        if (method !== 'GET') {
+            res.writeHead(405, { 'Content-Type': 'application/json', Allow: 'GET' });
+            res.end(JSON.stringify({ ok: false, error: 'method_not_allowed' }));
             return true;
         }
-        sendJson(res, 200, {
-            ok: true,
-            marketplace: {
-                ...buildMarketplaceState(req.user),
-                permissions: {
-                    canManage: isAdminUser(req.user)
-                        && Boolean(publicMarketplaceAuthContext(routePlan) || canonicalControlOrigin(req)),
-                },
-            }
-        });
+        if (!await authorizeRead()) return true;
+        sendJson(res, 200, { ok: true, repositories: reposSvc.listRepositorySources() });
         return true;
     }
 
-    if (method === 'POST' && (!route.resource || ['install', 'remove'].includes(route.resource))) {
+    if (route.resource !== 'repos' && route.resource !== 'agents') {
+        sendMarketplaceError(res, 404, 'not_found', 'Marketplace resource not found.');
+        return true;
+    }
+
+    const isRepos = route.resource === 'repos';
+    const marketplacePayload = () => (isRepos ? buildMarketplaceRepositories() : agentsMarketplace());
+
+    if (method === 'GET') {
+        if (!await authorizeRead()) return true;
+        sendJson(res, 200, { ok: true, marketplace: marketplacePayload() });
+        return true;
+    }
+
+    if (method === 'POST') {
         const agentRequest = Boolean(readAuthorizationBearer(req));
         if (!agentRequest) {
             if (!(await ensureAdmin(req, res, parsedUrl, { routePlan }))) {
@@ -592,9 +621,17 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
             return true;
         }
 
-        const action = route.resource || String(body?.action || '').trim();
+        const action = String(body?.action || '').trim();
+        const repoActions = ['install', 'remove', 'install_repo', 'uninstall_repo'];
+        const agentActions = ['enable_agent', 'disable_agent'];
+        const allowedActions = isRepos ? repoActions : agentActions;
+        if (!allowedActions.includes(action)) {
+            sendMarketplaceError(res, 400, 'unknown_action', 'Unsupported marketplace action.');
+            return true;
+        }
         if (agentRequest) {
-            if (!['enable_agent', 'install', 'remove', 'install_repo'].includes(action)) {
+            const agentAllowed = isRepos ? ['install', 'remove', 'install_repo'] : ['enable_agent'];
+            if (!agentAllowed.includes(action)) {
                 sendMarketplaceError(res, 403, 'agent_action_forbidden', 'Unsupported agent repository action.');
                 return true;
             }
@@ -608,75 +645,37 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
         }
 
         try {
-            if (action === 'install' || action === 'remove') {
-                const result = await withWorkspaceMutationLease({ operation: `repositories-${action}` }, () => {
-                    const repositories = action === 'install' ? new Map(reposSvc.listRepositorySources().filter(repo => repo.origin !== 'remote').map(repo => [repo.name, repo])) : null;
-                    return action === 'install'
-                        ? installRepositoryLinks(body, { resolveRepository: name => repositories.get(name) })
-                        : removeRepositoryLinks(body);
+            let result;
+            if (action === 'install') {
+                result = await withWorkspaceMutationLease({ operation: 'repositories-install' }, () => {
+                    const repositories = new Map(reposSvc.listRepositorySources().filter(repo => repo.origin !== 'remote').map(repo => [repo.name, repo]));
+                    return installRepositoryLinks(body, { resolveRepository: name => repositories.get(name) });
                 });
-                sendJson(res, 200, { ok: true, ...result });
-                return true;
-            }
-            if (action === 'install_repo') {
+            } else if (action === 'remove') {
+                result = await withWorkspaceMutationLease({ operation: 'repositories-remove' }, () => removeRepositoryLinks(body?.paths));
+            } else if (action === 'install_repo') {
                 const url = normalizeMarketplaceUrl(body?.url);
                 const name = normalizeOptionalMarketplaceRepoName(body?.name);
                 const branch = String(body?.branch || '').trim() || null;
-                const result = await withWorkspaceMutationLease({ operation: 'repositories-prepare' }, () => reposSvc.installRepo(url, name, branch, { stdio: 'pipe' }));
-                sendJson(res, 200, {
-                    ok: true,
-                    action,
-                    result,
-                    marketplace: buildMarketplaceState(req.user)
-                });
-                return true;
-            }
-
-            if (action === 'uninstall_repo') {
+                result = await withWorkspaceMutationLease({ operation: 'repositories-prepare' }, () => reposSvc.installRepo(url, name, branch, { stdio: 'pipe' }));
+            } else if (action === 'uninstall_repo') {
                 const target = String(body?.target || body?.name || '').trim();
                 const repoName = reposSvc.resolveInstalledRepoTarget(target);
-                const disabledAgents = disableMarketplaceAgentsForRepo(repoName);
-                const result = {
+                result = {
                     ...reposSvc.uninstallRepo(repoName, { stdio: 'pipe' }),
-                    disabledAgents
+                    disabledAgents: disableMarketplaceAgentsForRepo(repoName)
                 };
-                sendJson(res, 200, {
-                    ok: true,
-                    action,
-                    result,
-                    marketplace: buildMarketplaceState(req.user)
-                });
-                return true;
-            }
-
-            if (action === 'enable_agent') {
-                const { result } = await enableAgentAction(body);
-                sendJson(res, 200, {
-                    ok: true,
-                    action,
-                    result,
-                    marketplace: buildMarketplaceState(req.user)
-                });
-                return true;
-            }
-
-            if (action === 'disable_agent') {
+            } else if (action === 'enable_agent') {
+                ({ result } = await enableAgentAction(body));
+            } else if (action === 'disable_agent') {
                 const ref = normalizeMarketplaceAgentRef(body?.agentRef);
-                const result = agentsSvc.disableAgent(ref);
+                result = agentsSvc.disableAgent(ref);
                 if (result?.status && result.status !== 'removed' && result.status !== 'static-removed') {
                     sendMarketplaceError(res, 409, 'agent_disable_blocked', result.status);
                     return true;
                 }
-                sendJson(res, 200, {
-                    ok: true,
-                    action,
-                    result,
-                    marketplace: buildMarketplaceState(req.user)
-                });
-                return true;
             }
-
-            sendMarketplaceError(res, 400, 'unknown_action', 'Unsupported marketplace action.');
+            sendJson(res, 200, { ok: true, action, result, marketplace: marketplacePayload() });
             return true;
         } catch (error) {
             if (sendLifecycleError(res, error)) return true;
@@ -685,12 +684,10 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
         }
     }
 
-    const status = route.resource ? 404 : 405;
-    res.writeHead(status, { 'Content-Type': 'application/json', Allow: 'GET, POST' });
-    res.end(JSON.stringify({ ok: false, error: route.resource ? 'not_found' : 'method_not_allowed' }));
+    res.writeHead(405, { 'Content-Type': 'application/json', Allow: 'GET, POST' });
+    res.end(JSON.stringify({ ok: false, error: 'method_not_allowed' }));
     return true;
 }
-
 export const __testables = {
     buildMarketplaceState,
     collectMarketplaceNoWaitStates,

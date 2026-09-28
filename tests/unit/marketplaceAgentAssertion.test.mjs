@@ -122,7 +122,7 @@ test('Marketplace rejects agent mutation actions other than enable_agent', async
     const handled = await marketplaceModule.handleMarketplaceRoutes(
         req,
         response,
-        new URL('http://localhost/api/marketplace')
+        new URL('http://localhost/api/marketplace/agents')
     );
 
     assert.equal(handled, true);
@@ -132,9 +132,9 @@ test('Marketplace rejects agent mutation actions other than enable_agent', async
 
 for (const resource of ['install', 'remove']) {
     test(`Repository ${resource} assertion is bound to its path and operation`, () => {
-        const requestPath = `${marketplaceModule.MARKETPLACE_PATH}/${resource}`;
+        const requestPath = `${marketplaceModule.MARKETPLACE_PATH}/repos`;
         const tool = `repositories.${resource}`;
-        const rawBody = Buffer.from(resource === 'remove' ? '[]' : '{"repos":[]}');
+        const rawBody = Buffer.from(JSON.stringify({ action: resource }));
         const token = signAgentHttpAssertion({ method: 'POST', path: requestPath, body: rawBody,
             targetAgent: marketplaceModule.MARKETPLACE_AGENT_TARGET, tool, env: agentEnv });
         const options = { req: { headers: { authorization: `Bearer ${token}` } },
@@ -142,7 +142,7 @@ for (const resource of ['install', 'remove']) {
         assert.equal(marketplaceModule.__testables.verifyMarketplaceAgentRequest({ ...options,
             replayCache: createMemoryReplayCache() }).callerPrincipal, caller);
         assert.throws(() => marketplaceModule.__testables.verifyMarketplaceAgentRequest({ ...options,
-            requestPath: marketplaceModule.MARKETPLACE_PATH, replayCache: createMemoryReplayCache() }));
+            requestPath: `${marketplaceModule.MARKETPLACE_PATH}/agents`, replayCache: createMemoryReplayCache() }));
         assert.throws(() => marketplaceModule.__testables.verifyMarketplaceAgentRequest({ ...options,
             tool: 'repositories.other', replayCache: createMemoryReplayCache() }));
     });

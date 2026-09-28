@@ -53,8 +53,10 @@
                 <div class="doc-section" id="management">
                     <h2>Management APIs</h2>
                     <table class="command-table"><thead><tr><th>API route</th><th>Purpose and access boundary</th></tr></thead><tbody>
-                        <tr><td><code>GET /api/marketplace</code></td><td>Lists the caller's marketplace view, installed repositories, discovered agents, enabled records, and runtime state.</td></tr>
-                        <tr><td><code>POST /api/marketplace</code></td><td>Handles admitted repository and agent lifecycle actions. Browser mutations require a local administrator.</td></tr>
+                        <tr><td><code>GET /api/marketplace/repos</code></td><td>Lists the caller's repository inventory: installed repositories, checkout labels, source metadata, and kind.</td></tr>
+                        <tr><td><code>GET /api/marketplace/agents</code></td><td>Lists the caller's discovered agents, enabled records, permissions, and runtime state.</td></tr>
+                        <tr><td><code>POST /api/marketplace/repos</code></td><td>Performs <code>install_repo</code> or <code>uninstall_repo</code> repository lifecycle actions. Browser mutations require a local administrator.</td></tr>
+                        <tr><td><code>POST /api/marketplace/agents</code></td><td>Performs <code>enable_agent</code> or <code>disable_agent</code>. Browser mutations require a local administrator.</td></tr>
                         <tr><td><code>/policy/command</code></td><td>Runs the Router-owned policy command surface for an authorized administrator or explicitly admitted agent request.</td></tr>
                         <tr><td><code>/agent-card</code></td><td>Aggregates metadata from active agents without requiring a fixed card schema.</td></tr>
                     </tbody></table>

@@ -28,7 +28,7 @@ authService.validateSession = async id => [admin, user].find(session => session.
 const snapshot = { generation: 'generation-a', agents: { shell: { type: 'agent', agentName: 'shell', repoName: 'repo', auth: policy } }, routing: { static: { agent: 'shell' }, routes: { shell: { agent: 'shell', repo: 'repo' } } }, manifests: {} };
 const plan = () => ({ ok: true, kind: 'router-surface', surface: 'marketplace-ui', listener: 'public', hostSelection: { kind: 'agent-root', record: { routeKey: 'shell' } }, forwarding: { protocol: 'https', authority: 'explorer.example.test' }, snapshot, lease: { id: snapshot.generation, snapshot, commit: () => true } });
 let enabled = 0;
-async function request({ resource = '', who = admin, routePlan = plan(), origin = 'https://explorer.example.test', csrf = 'valid', method = 'POST', body = { action: 'enable_agent', agentRef: 'repo/worker', mode: 'global' }, mutate } = {}) {
+async function request({ resource = 'agents', who = admin, routePlan = plan(), origin = 'https://explorer.example.test', csrf = 'valid', method = 'POST', body = { action: 'enable_agent', agentRef: 'repo/worker', mode: 'global' }, mutate } = {}) {
     const req = Readable.from(method === 'GET' ? [] : [Buffer.from(JSON.stringify(body))]);
     req.method = method;
     req.headers = { host: 'explorer.example.test', origin, cookie: `${who === cli ? 'ploinky_jwt' : SSO_AUTH_COOKIE_NAME}=${who.sessionId}` };
@@ -136,7 +136,7 @@ test('queued activations revalidate immediately before starting the worker', asy
 test('Marketplace skill recommendations prefer the workspace checkout over installed copies', async () => {
     fs.mkdirSync(path.join(workspace, '.ploinky/repos/DocumentationSkills/.git'), { recursive: true });
     fs.mkdirSync(path.join(workspace, 'DocumentationSkills/.git'), { recursive: true });
-    const res = await request({ method: 'GET' });
+    const res = await request({ method: 'GET', resource: 'repos' });
     assert.equal(res.status, 200);
     const repo = res.body.marketplace.repositories.find(item => item.name === 'DocumentationSkills');
     assert.equal(repo.kind, 'skills');
@@ -149,7 +149,7 @@ test('Marketplace includes valid unregistered workspace skills without a remote 
     fs.mkdirSync(path.join(root, 'skills/local-example'), { recursive: true });
     fs.mkdirSync(path.join(root, 'skills/incomplete'));
     fs.writeFileSync(path.join(root, 'skills/local-example/SKILL.md'), '---\nname: local-example\ndescription: Local example\n---\n');
-    const res = await request({ method: 'GET' });
+    const res = await request({ method: 'GET', resource: 'repos' });
     assert.equal(res.status, 200);
     const repo = res.body.marketplace.repositories.find(item => item.name === 'LocalOnlySkills');
     assert.equal(repo.kind, 'skills');
@@ -168,13 +168,13 @@ test('repository endpoints list sources and install/remove links through authent
     assert.equal(listed.status, 200);
     assert.equal(listed.body.repositories.find(repo => repo.name === 'EndpointSkills').source, root);
     const destination = path.join(workspace, 'endpoint-target');
-    const installed = await request({ resource: 'install', body: { skillRepos: [{ destination, repoName: 'EndpointSkills', skills: ['example'] }] } });
+    const installed = await request({ resource: 'repos', body: { action: 'install', skillRepos: [{ destination, repoName: 'EndpointSkills', skills: ['example'] }] } });
     assert.equal(installed.status, 200, JSON.stringify(installed.body));
-    assert.deepEqual(installed.body.conflicts, []);
+    assert.deepEqual(installed.body.result.conflicts, []);
     const link = path.join(destination, '.agents/skills/example');
     assert.ok(fs.lstatSync(link).isSymbolicLink());
-    assert.equal((await request({ who: user, resource: 'remove', body: [link] })).status, 403);
-    assert.equal((await request({ resource: 'remove', body: [link] })).status, 200);
+    assert.equal((await request({ who: user, resource: 'repos', body: { action: 'remove', paths: [link] } })).status, 403);
+    assert.equal((await request({ resource: 'repos', body: { action: 'remove', paths: [link] } })).status, 200);
     assert.ok(fs.existsSync(path.join(root, 'skills/example/SKILL.md')));
 });
 
@@ -182,7 +182,7 @@ test('Marketplace labels a workspace agent checkout relative to the workspace', 
     const checkout = path.join(workspace, 'LocalAgentsCheckout');
     fs.mkdirSync(path.join(checkout, 'worker'), { recursive: true });
     fs.writeFileSync(path.join(checkout, 'worker', 'manifest.json'), JSON.stringify({ container: 'node:22' }));
-    const res = await request({ method: 'GET' });
+    const res = await request({ method: 'GET', resource: 'repos' });
     assert.equal(res.status, 200);
     const repo = res.body.marketplace.repositories.find(item => item.name === 'LocalAgentsCheckout');
     assert.equal(repo.workspacePath, './LocalAgentsCheckout');
@@ -201,7 +201,7 @@ test('Marketplace advertises each agent manifest enable modes and default', asyn
         fs.mkdirSync(path.join(checkout, name), { recursive: true });
         fs.writeFileSync(path.join(checkout, name, 'manifest.json'), JSON.stringify(manifest));
     }
-    const res = await request({ method: 'GET' });
+    const res = await request({ method: 'GET', resource: 'agents' });
     assert.equal(res.status, 200);
     const agent = name => res.body.marketplace.agents.find(item => item.ref === `ModeAgents/${name}`);
     assert.deepEqual([agent('restricted').enableModes, agent('restricted').enableMode], [['global'], 'global']);
