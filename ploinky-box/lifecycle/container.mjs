@@ -39,6 +39,7 @@ import {
     normalizeRouterPublication,
     routerBindingPublicAuthority,
 } from '../routerBinding.mjs';
+import { gpuWiringCreateArgs } from '../gpuGrant.mjs';
 import { nestedPodmanSeccompProfileContract } from '../seccomp.mjs';
 import {
     revalidateWorkspaceDataPaths,
@@ -103,10 +104,14 @@ export function containerCreateArgs({
     cidfile,
     hostKind = 'native-linux',
     networkMode = null,
+    gpu = null,
 }) {
     assertRouterBindingStateConfined(identity);
     const workspaceRoot = assertBoxWorkspaceRoot(identity?.workspaceRoot);
     const source = path.resolve(repositoryRoot);
+    // The grant adds only explicit device nodes, read-only binds and one label;
+    // never privileged mode, capabilities, a CDI spec directory, or Box env.
+    const gpuArgs = gpuWiringCreateArgs(gpu);
     const seccompProfile = nestedPodmanSeccompProfileContract(source);
     if (networkMode !== null && networkMode !== PASTA_IPV4_NETWORK) {
         throw lifecycleError('Container creation requires a supported outer network mode');
@@ -137,6 +142,7 @@ export function containerCreateArgs({
             ? { [BOX_LABELS.routerBindAddress]: publication.address }
             : {}),
         [BOX_LABELS.seccompFingerprint]: seccompProfile.fingerprint,
+        ...gpuArgs.labels,
     };
     for (const key of BOX_DATA_KEYS) {
         const value = String(dataFingerprints?.[key] || '');
@@ -154,6 +160,7 @@ export function containerCreateArgs({
         '--userns', BOX_USERNS,
         '--device', '/dev/fuse',
         '--device', '/dev/net/tun',
+        ...gpuArgs.devices,
         '--security-opt', 'unmask=ALL',
         '--security-opt', 'label=disable',
         '--security-opt', `seccomp=${seccompProfile.path}`,
@@ -166,6 +173,7 @@ export function containerCreateArgs({
         // also the Box working directory and its reserved workspace root.
         '--volume', boxWorkspaceVolume(workspaceRoot),
         ...workspaceDataMountArgs(identity),
+        ...gpuArgs.volumes,
         // The AgentLib binds come last so the read-only alias shadow lands on
         // top of the writable workspace bind that also exposes that path.
         ...agentLibMountArgs(agentLibContract, workspaceRoot),

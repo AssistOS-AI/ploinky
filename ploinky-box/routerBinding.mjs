@@ -16,7 +16,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { BOX_ROUTER_CONTAINER_PORT } from './constants.mjs';
+import { BOX_ROUTER_CONTAINER_PORT, GPU_GRANT_STATE_DIRECTORY } from './constants.mjs';
 import { PloinkyBoxError } from './errors.mjs';
 import { isContainerInterface, isUsableHostIpv4 } from './hostNetwork.mjs';
 import {
@@ -373,7 +373,7 @@ function ancestorDirectoryIdentities(target, fsApi) {
 /**
  * Keep host control state outside every writable Box mount, including cache
  * directory symlinks and bind-mount aliases that realpath cannot distinguish.
- * Check the reserved path even before the first binding record exists.
+ * Check the reserved paths even before the first binding or GPU grant exists.
  */
 export function assertRouterBindingStateConfined(identity, {
     homeDirectory = os.homedir(),
@@ -381,8 +381,11 @@ export function assertRouterBindingStateConfined(identity, {
 } = {}) {
     exactIdentity(identity);
     const stateRoot = path.join(path.resolve(homeDirectory), '.ploinky-box');
-    const protectedPaths = [stateRoot, path.join(stateRoot, ROUTER_BINDING_STATE_DIRECTORY)]
-        .map((target) => realpathOfNearestExisting(target, fsApi));
+    const protectedPaths = [
+        stateRoot,
+        path.join(stateRoot, ROUTER_BINDING_STATE_DIRECTORY),
+        path.join(stateRoot, GPU_GRANT_STATE_DIRECTORY),
+    ].map((target) => realpathOfNearestExisting(target, fsApi));
     const protectedAncestors = protectedPaths.map((target) => ancestorDirectoryIdentities(target, fsApi));
     const protectedIdentities = protectedPaths.map((target) => directoryIdentity(target, fsApi)).filter(Boolean);
     for (const source of [identity.workspaceRoot, ...Object.values(identity.dataPaths || {})]) {

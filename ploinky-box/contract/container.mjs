@@ -24,6 +24,7 @@ import {
     normalizeRouterPublication,
     routerBindingPublicAuthority,
 } from '../routerBinding.mjs';
+import { observeContainerGpuWiring } from '../gpuGrant.mjs';
 import { nestedPodmanSeccompProfileContract } from '../seccomp.mjs';
 import {
     agentLibBoxEnv,
@@ -314,10 +315,16 @@ export function validateContainerConfiguration(containerHandle, {
     repositoryRoot,
     hostKind = 'native-linux',
     networkMode,
+    // undefined: trust the wiring the Box records (status, diagnose, reuse
+    // of an observed Box); null: no GPU grant; otherwise the exact wiring.
+    gpu = undefined,
 }) {
     assertRouterBindingStateConfined(identity);
     const workspaceRoot = assertBoxWorkspaceRoot(identity?.workspaceRoot);
     const publication = validateContainerPublications(containerHandle, hostPort, mediaHostPort, routerBinding);
+    const gpuWiring = gpu === undefined
+        ? observeContainerGpuWiring(containerHandle, { identity })
+        : gpu;
     const runtime = containerHandle.runtime;
     assertBoxNetworkMode(runtime, networkMode);
     const seccompProfile = nestedPodmanSeccompProfileContract(repositoryRoot);
@@ -344,6 +351,9 @@ export function validateContainerConfiguration(containerHandle, {
     };
     if (publication.address !== ROUTER_BIND_LOOPBACK) {
         expectedLabels[BOX_LABELS.routerBindAddress] = publication.address;
+    }
+    if (gpuWiring) {
+        expectedLabels[BOX_LABELS.gpuGrant] = gpuWiring.fingerprint;
     }
     const selectedFingerprints = dataFingerprints || Object.fromEntries(BOX_DATA_KEYS.map((key) => [
         key,
@@ -428,19 +438,19 @@ export function validateContainerConfiguration(containerHandle, {
         || JSON.stringify(observedSecurityOptions) !== JSON.stringify(expectedSecurityOptions)) {
         throw publicationError('Owned Box security options are incompatible');
     }
-    const expectedDevices = ['/dev/fuse', '/dev/net/tun'];
+    // The recorded create order is the Box's two base devices followed by the
+    // GPU grant's nodes. Inspected devices are compared as the same sorted set.
+    const expectedDevices = ['/dev/fuse', '/dev/net/tun', ...(gpuWiring?.devices || [])];
+    const expectedInspectedDevices = expectedDevices
+        .map((device) => ({ hostPath: device, containerPath: device, permissions: 'rwm' }))
+        .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
     const recordedDevices = repeatedOptionValues(runtime.createCommand, '--device');
     const omittedDeviceInspectionIsProven = Array.isArray(runtime.devices)
         && runtime.devices.length === 0
         && JSON.stringify(recordedDevices) === JSON.stringify(expectedDevices);
     if (!omittedDeviceInspectionIsProven && (
         !Array.isArray(runtime.devices)
-        || runtime.devices.length !== 2
-        || runtime.devices.some((device, index) => (
-            device.hostPath !== expectedDevices[index]
-            || device.containerPath !== expectedDevices[index]
-            || device.permissions !== 'rwm'
-        ))
+        || JSON.stringify(runtime.devices) !== JSON.stringify(expectedInspectedDevices)
     )) {
         throw publicationError(
             'Owned Box device set is incompatible: '
@@ -483,6 +493,11 @@ export function validateContainerConfiguration(containerHandle, {
         [BOX_DATA_MOUNTS.dependencies]: { source: identity.dataPaths.dependencies, rw: true },
         [BOX_DATA_MOUNTS.images]: { source: identity.dataPaths.images, rw: true },
         ...expectedAgentLibMounts(agentLibContract, workspaceRoot),
+        // GPU grant driver, tool, CDI spec and marker binds: read-only and exact.
+        ...Object.fromEntries((gpuWiring?.mounts || []).map((mount) => [
+            mount.destination,
+            { source: mount.source, rw: false },
+        ])),
     };
     if (!Array.isArray(runtime.mounts)) {
         throw publicationError('Owned Box mount set is incompatible');

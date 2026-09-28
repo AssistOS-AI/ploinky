@@ -707,6 +707,9 @@ console.log(JSON.stringify({ record, mcpTools: policyState.mcpTools }));`,
         assert.equal(record.projectPath, workspaceDir);
         assert.deepEqual(record.config.ports, []);
         assert.match(fs.readFileSync(argsFile, 'utf8'), /(?:^|\n)--init(?:\n|$)/);
+        // Every agent gets its own IPC namespace, never the Box's (runners plan I6).
+        assert.match(fs.readFileSync(argsFile, 'utf8'), /(?:^|\n)--ipc\nprivate(?:\n|$)/);
+        assert.doesNotMatch(fs.readFileSync(argsFile, 'utf8'), /(?:^|\n)--ipc\nhost(?:\n|$)/);
         assert.doesNotMatch(fs.readFileSync(argsFile, 'utf8'), /(?:^|:)7000(?:$|\s)/);
         assert.ok(record.config.binds.some((bind) => (
             bind.source === workspaceDir && bind.target === workspaceDir

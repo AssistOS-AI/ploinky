@@ -18,7 +18,7 @@ const ALLOWED_ACCELERATORS = ['cpu', 'nvidia-cuda', 'amd-rocm', 'vulkan', 'intel
 const ALLOWED_CONTAINER_RUNTIMES = ['docker', 'podman'];
 const ALLOWED_DEVICE_TYPES = ['cdi', 'hostDevice'];
 const ALLOWED_SECURITY_OPT = new Set(['label=disable']);
-const ALLOWED_IPC = new Set(['default', 'host']);
+const ALLOWED_IPC = new Set(['default', 'private', 'host']);
 const HOST_DEVICE_PATH_RE = /^\/dev\/[A-Za-z0-9._/-]+$/;
 const ARCHITECTURE_PATH_RE = /^architectures\/[A-Za-z0-9._-]+\.json$/;
 const IMAGE_PATH_RE = /^images\/[A-Za-z0-9._-]+\.json$/;
