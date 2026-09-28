@@ -1790,9 +1790,10 @@ body {
 }
 
 .wa-typing-heading {
-    display: inline-flex;
+    display: flex;
     align-items: baseline;
-    gap: 3px;
+    gap: 4px;
+    min-width: 0;
 }
 
 .wa-typing-label,
@@ -1804,7 +1805,15 @@ body {
     letter-spacing: 0.01em;
 }
 
+.wa-typing-label {
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
 .wa-typing-dots {
+    flex: 0 0 auto;
     display: inline-flex;
     gap: 2px;
     align-items: baseline;
@@ -1844,74 +1853,6 @@ body {
         transform: translateY(-3px);
         opacity: 1;
     }
-}
-
-.wa-typing-progress {
-    display: flex;
-    flex-direction: column;
-    gap: 3px;
-}
-
-.wa-typing-progress:empty {
-    display: none;
-}
-
-.wa-typing-progress-line {
-    color: color-mix(in srgb, var(--wa-text-secondary) 70%, white);
-    font-size: 12px;
-    line-height: 1.35;
-    overflow-wrap: anywhere;
-}
-
-.wa-progress-panel {
-    display: block;
-    margin: 0 0 8px;
-    padding: 0 0 8px;
-    border-radius: 0;
-    background: color-mix(in srgb, var(--wa-bg-panel) 58%, transparent);
-    border-bottom: 1px solid color-mix(in srgb, var(--wa-border) 58%, transparent);
-}
-
-.wa-progress-toggle {
-    appearance: none;
-    border: 0;
-    background: transparent;
-    color: var(--wa-text-secondary);
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 0;
-    font: inherit;
-    font-size: 12px;
-    line-height: 1.35;
-    cursor: pointer;
-}
-
-.wa-progress-arrow {
-    width: 12px;
-    color: var(--wa-text-secondary);
-}
-
-.wa-progress-title {
-    color: var(--wa-text-secondary);
-}
-
-.wa-progress-list {
-    margin-top: 6px;
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-}
-
-.wa-progress-panel.is-collapsed .wa-progress-list {
-    display: none;
-}
-
-.wa-progress-line {
-    color: color-mix(in srgb, var(--wa-text-secondary) 72%, white);
-    font-size: 12px;
-    line-height: 1.4;
-    overflow-wrap: anywhere;
 }
 
 .wa-message-time {

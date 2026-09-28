@@ -147,35 +147,38 @@ test('pending bubble visibility overrides the ordinary bubble display rule', () 
     assert.match(css, /\.wa-message-bubble\[hidden\]\s*\{\s*display:\s*none;/);
 });
 
-test('activity is unnumbered and expanded for pending messages', (t) => {
+test('the typing indicator shows one auto-replacing status line and no activity list', () => {
     const oldDocument = globalThis.document;
     const oldWindow = globalThis.window;
-    const makeElement = () => {
-        const node = makeMessageElement();
-        const classes = new Set();
-        return Object.assign(node, {
-            classList: { toggle(name, enabled) { if (enabled) classes.add(name); else classes.delete(name); },
-                contains: (name) => classes.has(name) },
-            attributes: {},
-            setAttribute(name, value) { this.attributes[name] = value; },
-            prepend(child) { this.insertBefore(child, this.children[0] || null); },
-            replaceChildren() { this.children = []; },
-        });
-    };
-    globalThis.document = { createElement: makeElement };
+    globalThis.document = { createElement: makeMessageElement };
     globalThis.window = { requestAnimationFrame: (callback) => callback() };
-    t.after(() => { globalThis.document = oldDocument; globalThis.window = oldWindow; });
-    const chatList = makeElement();
-    const messages = createMessages({ chatList }, { sidePanel: { isActive: () => false } });
-    const assistant = { id: 'reply', role: 'assistant', text: '', status: 'pending', progress: ['Checking files.'] };
-    messages.renderHistory([assistant]);
-    let panel = chatList.children[0].children[0].children[0];
-    assert.equal(panel.children[0].children[1].textContent, 'Activity');
-    assert.equal(panel.children[0].attributes['aria-expanded'], 'true');
-    assert.equal(panel.children[1].children[0].textContent, 'Checking files.');
-    messages.renderHistory([{ ...assistant, status: 'completed', text: 'Done.' }]);
-    panel = chatList.children[0].children[0].children[0];
-    assert.equal(panel.children[0].attributes['aria-expanded'], 'false');
+    try {
+        const chatList = makeMessageElement();
+        const label = { textContent: 'Thinking', title: '' };
+        const list = { children: [], replaceChildren() { this.children = []; } };
+        const classes = new Set();
+        const typingIndicator = { ...makeMessageElement(),
+            classList: { add: (name) => classes.add(name), remove: (name) => classes.delete(name) },
+            setAttribute() {},
+            querySelector(selector) {
+                if (selector === '.wa-typing-label') return label;
+                if (selector === '.wa-typing-progress') return list;
+                return null;
+            },
+        };
+        chatList.appendChild(typingIndicator);
+        const messages = createMessages({ chatList, typingIndicator }, { sidePanel: { isActive: () => false } });
+        messages.addProgressEvent({ reason: 'Connecting to robot "default"' });
+        assert.equal(label.textContent, 'Connecting to robot "default"');
+        messages.addProgressEvent({ reason: 'Starting ALA' });
+        assert.equal(label.textContent, 'Starting ALA');
+        assert.equal(list.children.length, 0);
+        messages.markUserInputSent();
+        assert.equal(label.textContent, 'Thinking');
+    } finally {
+        globalThis.document = oldDocument;
+        globalThis.window = oldWindow;
+    }
 });
 
 test('overlapping live tasks follow stable assistant anchors across session switch and restore', (t) => {

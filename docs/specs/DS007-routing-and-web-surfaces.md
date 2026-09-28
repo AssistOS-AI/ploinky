@@ -98,7 +98,9 @@ WebChat is a Router-owned browser application for one selected enabled agent. Th
 
 WebChat must remain generic and must not hardcode optional agent ids, provider tags, downstream tool names, or domain-specific dispatch. State-changing browser requests must carry the Router mutation proof and remain bound to the active user session, selected workspace runtime, and current edge generation.
 
-CLI control output must use one complete newline-delimited JSON record with a recognized versioned WebChat marker. The Router must validate accepted session, task, runtime-state, workspace-file, skills, and interaction records before converting them into named SSE events or reconnect snapshots; unaccepted records must not mutate browser state.
+CLI control output must use one complete newline-delimited JSON record with a recognized versioned WebChat marker. The Router must validate accepted session, task, runtime-state, workspace-file, skills, interaction, and progress records before converting them into named SSE events or reconnect snapshots; unaccepted records must not mutate browser state.
+
+The typing indicator shows one transient status line from the latest progress record, next to the always-animating dots, and replaces it as newer records arrive. Intermediate progress is never persisted in the conversation: the assistant bubble keeps only the final text, and stored message progress is ignored.
 
 Slash-command suggestions must remain agent-defined. During page initialization, WebChat must call the selected agent's Router-mediated `/<agentName>/mcp` endpoint, complete MCP initialization, request `tools/list`, and call the optional `list_achilles_cli_commands` tool. The browser caches the returned command catalog for local completion and sends it only when initialization or an explicit post-skills-change refresh requires it. When that structured tool is absent, WebChat may derive a fallback catalog only from the selected agent's admitted `execute_*` MCP tools.
 
