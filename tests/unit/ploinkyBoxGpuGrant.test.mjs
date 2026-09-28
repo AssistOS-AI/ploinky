@@ -59,7 +59,13 @@ import {
 } from '../helpers/agentlibFixture.mjs';
 
 const DRIVER = '595.91.07';
-const LIB = '/usr/lib/x86_64-linux-gnu';
+// Each fixture host names its architecture, so discovery never depends on the
+// machine running the tests.
+const HOST_ARCHES = Object.freeze({
+    x64: Object.freeze({ lib: '/usr/lib/x86_64-linux-gnu', flag: 'x86-64', machine: 'x86_64' }),
+    arm64: Object.freeze({ lib: '/usr/lib/aarch64-linux-gnu', flag: 'AArch64', machine: 'aarch64' }),
+});
+const LIB = HOST_ARCHES.x64.lib;
 const AGENT = 'local-llms/local-llm';
 const GRANT = Object.freeze({ vendor: 'nvidia', agents: [AGENT] });
 const DATA_FINGERPRINTS = Object.freeze({ dependencies: 'd'.repeat(64), images: 'f'.repeat(64) });
@@ -85,32 +91,39 @@ function errno(code) {
  * module version and the driver files, all behind the fs seam.
  */
 function fakeHost({
+    arch = 'x64',
+    discoverArch = arch,
     kernel = DRIVER,
     library = DRIVER,
     missing = [],
     inaccessible = [],
     mtimeMs = 1_786_317_226_000,
+    flags = (flag) => `libc6,${flag}`,
+    leadingLines = [],
 } = {}) {
+    const { lib, flag, machine } = HOST_ARCHES[arch];
     const files = new Map();
     const links = new Map();
-    const lines = [];
+    const lines = [...leadingLines];
     const addLibrary = (soname, real) => {
         files.set(real, { size: real.length * 1000, mtimeMs });
-        const linkPath = `${LIB}/${soname}`;
+        const linkPath = `${lib}/${soname}`;
         if (linkPath !== real) links.set(linkPath, real);
-        if (!missing.includes(soname)) lines.push(`\t${soname} (libc6,x86-64) => ${linkPath}`);
+        if (!missing.includes(soname)) lines.push(`\t${soname} (${flags(flag)}) => ${linkPath}`);
     };
-    addLibrary('libcuda.so.1', `${LIB}/libcuda.so.${library}`);
-    addLibrary('libnvidia-ptxjitcompiler.so.1', `${LIB}/libnvidia-ptxjitcompiler.so.${library}`);
-    addLibrary('libnvidia-ml.so.1', `${LIB}/libnvidia-ml.so.${library}`);
-    addLibrary('libnvidia-nvvm.so.4', `${LIB}/libnvidia-nvvm.so.${library}`);
-    addLibrary(`libnvidia-gpucomp.so.${library}`, `${LIB}/libnvidia-gpucomp.so.${library}`);
-    lines.push(`\tlibcuda.so.1 (libc6) => /usr/lib/i386-linux-gnu/libcuda.so.1`);
+    addLibrary('libcuda.so.1', `${lib}/libcuda.so.${library}`);
+    addLibrary('libnvidia-ptxjitcompiler.so.1', `${lib}/libnvidia-ptxjitcompiler.so.${library}`);
+    addLibrary('libnvidia-ml.so.1', `${lib}/libnvidia-ml.so.${library}`);
+    addLibrary('libnvidia-nvvm.so.4', `${lib}/libnvidia-nvvm.so.${library}`);
+    addLibrary(`libnvidia-gpucomp.so.${library}`, `${lib}/libnvidia-gpucomp.so.${library}`);
+    lines.push(arch === 'x64'
+        ? '\tlibcuda.so.1 (libc6) => /usr/lib/i386-linux-gnu/libcuda.so.1'
+        : '\tlibcuda.so.1 (libc6,hard-float) => /usr/lib/arm-linux-gnueabihf/libcuda.so.1');
     files.set('/usr/bin/nvidia-smi', { size: 1_259_616, mtimeMs });
     const fsApi = {
         readFileSync(target) {
             if (target === '/proc/driver/nvidia/version') {
-                return `NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  ${kernel}  Release Build\n`;
+                return `NVRM version: NVIDIA UNIX Open Kernel Module for ${machine}  ${kernel}  Release Build\n`;
             }
             throw errno('ENOENT');
         },
@@ -133,11 +146,15 @@ function fakeHost({
             throw errno('ENOENT');
         },
     };
+    const readLdconfig = () => `${lines.length} libs found in cache\n${lines.join('\n')}\n`;
     return {
         fsApi,
+        lib,
+        readLdconfig,
         discover: () => discoverNvidiaGpu({
+            arch: discoverArch,
             fsApi,
-            readLdconfig: () => `${lines.length} libs found in cache\n${lines.join('\n')}\n`,
+            readLdconfig,
             smiCandidates: ['/usr/bin/nvidia-smi'],
         }),
     };
@@ -150,7 +167,7 @@ function useFakeHostFiles(t, host) {
     const realStat = fs.statSync;
     const realAccess = fs.accessSync;
     const isHostPath = (target) => typeof target === 'string'
-        && (target.startsWith(`${LIB}/`) || target.startsWith('/dev/nvidia') || target === '/usr/bin/nvidia-smi');
+        && (target.startsWith(`${host.lib}/`) || target.startsWith('/dev/nvidia') || target === '/usr/bin/nvidia-smi');
     t.mock.method(fs, 'statSync', (target, ...rest) => (
         isHostPath(target) ? host.fsApi.statSync(target) : realStat.call(fs, target, ...rest)));
     t.mock.method(fs, 'accessSync', (target, ...rest) => (
@@ -293,7 +310,180 @@ test('discovery refuses missing or inaccessible nodes, missing libraries, and an
         /version mismatch: the kernel module is 595\.91\.07 but libcuda\.so\.1 is libcuda\.so\.600\.10; reboot/,
     );
     assert.equal(parseNvidiaDriverVersion('NVRM version: NVIDIA UNIX x86_64 Kernel Module  550.54.14  Thu Feb 22'), '550.54.14');
-    assert.deepEqual([...parseLdconfigCache('\tlibcuda.so.1 (libc6) => /usr/lib32/libcuda.so.1\n').keys()], []);
+    assert.deepEqual([...parseLdconfigCache('\tlibcuda.so.1 (libc6) => /usr/lib32/libcuda.so.1\n', 'x64').keys()], []);
+});
+
+test('arm64 discovery binds the AArch64 driver libraries and wires the Box exactly as on x64', (t) => {
+    const state = boxFixture(t);
+    const arm = fakeHost({ arch: 'arm64' }).discover();
+    const x64 = fakeHost().discover();
+    const armLib = HOST_ARCHES.arm64.lib;
+    assert.equal(arm.driverVersion, DRIVER);
+    assert.deepEqual(arm.devices, x64.devices);
+    assert.deepEqual(arm.tools, x64.tools);
+    assert.deepEqual(arm.libraries.map((library) => [library.soname, library.source]), [
+        ['libcuda.so.1', `${armLib}/libcuda.so.${DRIVER}`],
+        ['libnvidia-ptxjitcompiler.so.1', `${armLib}/libnvidia-ptxjitcompiler.so.${DRIVER}`],
+        ['libnvidia-ml.so.1', `${armLib}/libnvidia-ml.so.${DRIVER}`],
+        ['libnvidia-nvvm.so.4', `${armLib}/libnvidia-nvvm.so.${DRIVER}`],
+        [`libnvidia-gpucomp.so.${DRIVER}`, `${armLib}/libnvidia-gpucomp.so.${DRIVER}`],
+    ]);
+
+    const armWiring = buildGpuWiring({ identity: state.identity, grant: GRANT, discovery: arm, homeDirectory: state.home });
+    const x64Wiring = buildGpuWiring({ identity: state.identity, grant: GRANT, discovery: x64, homeDirectory: state.home });
+    // The host sources differ, so the fingerprint does; nothing inside the Box does.
+    assert.notEqual(armWiring.fingerprint, x64Wiring.fingerprint);
+    assert.equal(armWiring.state, 'active');
+    assert.deepEqual(armWiring.devices, x64Wiring.devices);
+    assert.deepEqual(
+        armWiring.mounts.filter((mount) => mount.destination.startsWith('/usr/local/nvidia/')),
+        x64Wiring.mounts.filter((mount) => mount.destination.startsWith('/usr/local/nvidia/'))
+            .map((mount) => ({ ...mount, source: mount.source.replace(`${LIB}/`, `${armLib}/`) })),
+    );
+    assert.deepEqual(armWiring.mounts.map((mount) => mount.destination), x64Wiring.mounts.map((mount) => mount.destination));
+    const content = (wiring, name) => wiring.files.find((file) => file.path.endsWith(name)).content;
+    assert.equal(content(armWiring, 'box.json'), content(x64Wiring, 'box.json'));
+    const withoutFingerprint = (wiring) => {
+        const { fingerprint, ...rest } = JSON.parse(content(wiring, 'marker.json'));
+        assert.equal(fingerprint, wiring.fingerprint);
+        return rest;
+    };
+    assert.deepEqual(withoutFingerprint(armWiring), withoutFingerprint(x64Wiring));
+
+    // Create arguments add only the grant devices, read-only binds and label.
+    const base = {
+        identity: state.identity,
+        dataFingerprints: DATA_FINGERPRINTS,
+        agentLib: agentLibFixture(state.identity.workspaceRoot),
+        imageId: 'a'.repeat(64),
+        imageRef: BOX_IMAGE_REFERENCE,
+        hostPort: 8090,
+        repositoryRoot: state.root,
+        cidfile: path.join(state.root, 'cid'),
+    };
+    const plain = containerCreateArgs(base);
+    const granted = containerCreateArgs({ ...base, gpu: armWiring });
+    const values = (args, flag) => args.flatMap((value, index) => (value === flag ? [args[index + 1]] : []));
+    assert.deepEqual(values(granted, '--device'), ['/dev/fuse', '/dev/net/tun', ...armWiring.devices]);
+    for (const flag of ['--env', '--security-opt', '--cap-add', '--publish']) {
+        assert.deepEqual(values(granted, flag), values(plain, flag), flag);
+    }
+    assert.deepEqual(
+        values(granted, '--volume').filter((value) => !values(plain, '--volume').includes(value)),
+        armWiring.mounts.map((mount) => `${mount.source}:${mount.destination}:ro`),
+    );
+    assert.deepEqual(
+        values(granted, '--label').filter((value) => !values(plain, '--label').includes(value)),
+        [`${BOX_LABELS.gpuGrant}=${armWiring.fingerprint}`],
+    );
+    assert.equal(granted.some((value) => /^--(privileged|cdi-spec-dir|gpus)/.test(value)), false);
+
+    // A Box created with the arm64 wiring reads back as that same wiring.
+    const observed = observeContainerGpuWiring(containerHandle(state, { gpu: armWiring }),
+        { identity: state.identity, homeDirectory: state.home });
+    assert.equal(observed.state, 'active');
+    assert.equal(observed.fingerprint, armWiring.fingerprint);
+});
+
+test('discovery binds only libraries built for its architecture, whatever else the cache lists first', () => {
+    const armLib = HOST_ARCHES.arm64.lib;
+    // Foreign x86-64 and 32-bit ARM copies listed ahead of the host's own.
+    const host = fakeHost({
+        arch: 'arm64',
+        leadingLines: [
+            `\tlibcuda.so.1 (libc6,x86-64) => ${LIB}/libcuda.so.1`,
+            '\tlibnvidia-ml.so.1 (libc6,hard-float) => /usr/lib/arm-linux-gnueabihf/libnvidia-ml.so.1',
+            '\tlibnvidia-ml.so.1 (libc6,soft-float) => /usr/lib/arm-linux-gnueabi/libnvidia-ml.so.1',
+            '\tlibnvidia-ptxjitcompiler.so.1 (libc6) => /usr/lib32/libnvidia-ptxjitcompiler.so.1',
+        ],
+    });
+    const discovery = host.discover();
+    assert.deepEqual(discovery.libraries.map((library) => path.dirname(library.source)), Array(5).fill(armLib));
+
+    const cache = host.readLdconfig();
+    assert.equal(parseLdconfigCache(cache, 'arm64').get('libcuda.so.1'), `${armLib}/libcuda.so.1`);
+    assert.equal(parseLdconfigCache(cache, 'x64').get('libcuda.so.1'), `${LIB}/libcuda.so.1`);
+    assert.equal(parseLdconfigCache(cache, 'x64').has('libnvidia-ml.so.1'), false);
+
+    // A cache holding only the other architecture's libraries has none to bind.
+    const refusesMissingCuda = (options) => assert.throws(
+        () => fakeHost(options).discover(),
+        (error) => error.code === 'PLOINKY_BOX_GPU_DISCOVERY_FAILED'
+            && /libcuda\.so\.1 is not in the ldconfig cache/.test(error.message),
+    );
+    refusesMissingCuda({ arch: 'arm64', discoverArch: 'x64' });
+    refusesMissingCuda({ arch: 'x64', discoverArch: 'arm64' });
+});
+
+test('discovery reads the architecture flag whatever whitespace or extra flags surround it', () => {
+    for (const arch of ['x64', 'arm64']) {
+        for (const flags of [
+            (flag) => `libc6, ${flag}`,
+            (flag) => `libc6 , ${flag} , OS ABI: Linux 3.7.0`,
+            (flag) => `libc6,${flag}, hwcap: 0x0000000000000400`,
+        ]) {
+            const discovery = fakeHost({ arch, flags }).discover();
+            assert.equal(discovery.libraries.length, 5, `${arch} ${flags('FLAG')}`);
+            assert.equal(discovery.libraries.every((library) => library.source.startsWith(`${HOST_ARCHES[arch].lib}/`)), true);
+        }
+    }
+    // A flag that only contains the architecture name is not the flag.
+    assert.equal(parseLdconfigCache('\tlibcuda.so.1 (libc6,AArch64x) => /opt/libcuda.so.1\n', 'arm64').size, 0);
+    assert.equal(parseLdconfigCache('\tlibcuda.so.1 (libc6,aarch64) => /opt/libcuda.so.1\n', 'arm64').size, 0);
+});
+
+test('arm64 discovery refuses missing libraries and an updated but not rebooted driver', () => {
+    const refuses = (host, pattern) => assert.throws(
+        () => host.discover(),
+        (error) => error.code === 'PLOINKY_BOX_GPU_DISCOVERY_FAILED' && pattern.test(error.message),
+    );
+    refuses(fakeHost({ arch: 'arm64', missing: ['libcuda.so.1'] }), /libcuda\.so\.1 is not in the ldconfig cache/);
+    refuses(fakeHost({ arch: 'arm64', missing: ['libnvidia-ptxjitcompiler.so.1'] }),
+        /libnvidia-ptxjitcompiler\.so\.1 is not in the ldconfig cache/);
+    refuses(
+        fakeHost({ arch: 'arm64', kernel: '580.159.03', library: '580.173.02' }),
+        /version mismatch: the kernel module is 580\.159\.03 but libcuda\.so\.1 is libcuda\.so\.580\.173\.02; reboot/,
+    );
+    assert.equal(
+        parseNvidiaDriverVersion('NVRM version: NVIDIA UNIX Open Kernel Module for aarch64  580.159.03  Release Build  (dvs-builder@U22-I3-AK02-23-4)'),
+        '580.159.03',
+    );
+});
+
+test('discovery refuses an unsupported host architecture, which leaves only a stale-grant marker', (t) => {
+    const state = workspaceFixture(t);
+    for (const arch of ['ia32', 'ppc64', 'riscv64', 's390x', '', undefined, null, 'constructor', 'toString']) {
+        assert.throws(
+            () => parseLdconfigCache(fakeHost().readLdconfig(), arch),
+            (error) => error.code === 'PLOINKY_BOX_GPU_DISCOVERY_FAILED'
+                && /does not support the ".*" host architecture; supported: x64, arm64/.test(error.message),
+            String(arch),
+        );
+    }
+    const host = fakeHost();
+    assert.throws(
+        () => discoverNvidiaGpu({ arch: 'ppc64', fsApi: host.fsApi, readLdconfig: host.readLdconfig }),
+        (error) => error.code === 'PLOINKY_BOX_GPU_DISCOVERY_FAILED'
+            && error.message === 'GPU discovery does not support the "ppc64" host architecture; supported: x64, arm64',
+    );
+    const stale = resolveGpuWiring(state.identity, GRANT, {
+        discover: () => discoverNvidiaGpu({ arch: 'ppc64', fsApi: host.fsApi, readLdconfig: host.readLdconfig }),
+        homeDirectory: state.home,
+    });
+    assert.equal(stale.state, 'stale');
+    assert.match(stale.reason, /does not support the "ppc64" host architecture/);
+    assert.deepEqual(stale.devices, []);
+    assert.deepEqual(stale.mounts.map((mount) => mount.destination), [BOX_GPU_MARKER_PATH]);
+});
+
+test('discovery defaults to the architecture of the host it runs on', { skip: !Object.hasOwn(HOST_ARCHES, process.arch) }, () => {
+    const host = fakeHost({ arch: process.arch });
+    const discovery = discoverNvidiaGpu({
+        fsApi: host.fsApi,
+        readLdconfig: host.readLdconfig,
+        smiCandidates: ['/usr/bin/nvidia-smi'],
+    });
+    assert.deepEqual(discovery, host.discover());
 });
 
 test('a failed discovery wires only a stale-grant marker (D12)', (t) => {
