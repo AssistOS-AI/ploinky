@@ -22,6 +22,14 @@ const PODMAN_MACHINE_MARKER_FILES = Object.freeze([
     '/etc/containers/podman-machine',
 ]);
 
+// Podman trims the marker with Go's strings.TrimSpace and exempts only an exact
+// `wsl` type. Only `wsl` surrounded by the ASCII whitespace TrimSpace removes is
+// admitted: a strict subset of Podman's rule, so a marker Podman treats as
+// gvproxy-based, such as one with a byte-order mark that JavaScript's trim()
+// would strip, is never admitted. Unicode whitespace around `wsl` is refused,
+// which can only fail closed.
+const MARKER_EDGE_ASCII_SPACE = /^[\t\n\v\f\r ]+|[\t\n\v\f\r ]+$/g;
+
 function readMarkerFile(file) {
     return fs.readFileSync(file, 'utf8');
 }
@@ -37,7 +45,7 @@ function podmanMachineGuestRefusal(readMachineMarkerFile) {
                 + 'it will not treat this Linux host as native, because inside a gvproxy-based Podman Machine guest '
                 + 'Podman would listen on all guest addresses for the loopback Router publication';
         }
-        const type = String(content).trim();
+        const type = String(content).replace(MARKER_EDGE_ASCII_SPACE, '');
         if (type === 'wsl') return null;
         return `Ploinky Box does not run inside a gvproxy-based Podman Machine guest (${file}: ${type || 'empty'}): `
             + 'Podman there listens on all guest addresses for every publication and applies the requested '

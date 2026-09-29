@@ -247,6 +247,14 @@ test('discovery refuses a gvproxy-based Podman Machine guest before querying Pod
         ['/etc/podman-machine', 'unknown-provider'],
         // Podman compares the type exactly, so only lowercase `wsl` is exempt.
         ['/etc/podman-machine', 'WSL'],
+        // Go's TrimSpace keeps a byte-order mark, so Podman treats these as
+        // gvproxy-based; JavaScript's trim() would strip it and admit them.
+        ['/etc/podman-machine', '﻿wsl'],
+        ['/etc/podman-machine', 'wsl﻿\n'],
+        // Only ASCII whitespace is trimmed. Podman also trims these, but
+        // refusing them can only fail closed.
+        ['/etc/podman-machine', '\u0085wsl'],
+        ['/etc/podman-machine', ' wsl'],
         ['/etc/containers/podman-machine', 'applehv'],
     ]) {
         const runner = fakeRunner(identity);
@@ -281,6 +289,8 @@ test('discovery keeps native Linux without a gvproxy marker and ignores markers 
         {},
         { '/etc/podman-machine': 'wsl\n' },
         { '/etc/podman-machine': ' wsl \n' },
+        // Every ASCII whitespace character Go's TrimSpace removes.
+        { '/etc/podman-machine': '\t\v\f\r wsl\r\n' },
         { '/etc/containers/podman-machine': 'wsl' },
     ]) {
         const runner = fakeRunner(identity);
