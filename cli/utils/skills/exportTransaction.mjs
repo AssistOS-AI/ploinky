@@ -1,11 +1,7 @@
 // Recoverable skill export publication protocol.
 //
-// This module is shared by value: Ploinky keeps it at
-// cli/utils/skills/exportTransaction.mjs and Explorer keeps a byte-identical
-// copy at explorer/utils/server/skill-export-transaction.mjs. It may only
-// import Node built-ins so that both copies stay identical; each repository
-// injects its own link factory, and Ploinky's in-Box update its Box-run
-// evidence (`runEvidence`). Conformance tests compare the two files.
+// It may only import Node built-ins; callers inject their own link factory,
+// and Ploinky's in-Box update its Box-run evidence (`runEvidence`).
 //
 // Layout below `<folder>/.agents`:
 //   .ploinky-skill-exports.json          committed ownership ledger (v1)

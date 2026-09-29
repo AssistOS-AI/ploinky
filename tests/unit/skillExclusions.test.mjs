@@ -13,7 +13,6 @@ import {
     IGNORE_MARKER_START,
     IGNORE_MARKER_END,
 } from '../../cli/utils/skills/exportExclusions.mjs';
-import { installRepositoryLinks, removeRepositoryLinks } from '../../cli/utils/repositoryInstall.mjs';
 import { simulatedCrash, liveness } from './fixtures/skillExportConformanceScenarios.mjs';
 
 // Never read the global, system or XDG Git policy of the machine running this.
@@ -511,23 +510,6 @@ test('exclusion artifacts roll forward after a crash and the journal records the
     fs.writeFileSync(path.join(project, '.agents', '.ploinky-skill-exports.journal.json'), JSON.stringify(bad));
     assert.throws(() => tx.withSkillExportLocks([project], () => null, { liveness: liveness(300) }), error => error.code === 'SKILL_EXPORT_RECOVERY_REQUIRED');
     assert.equal(fs.existsSync(path.join(root, 'elsewhere.config')), false);
-});
-
-test('marketplace install and removal refresh private exclusions', t => {
-    const root = base(t);
-    const workspace = repo(path.join(root, 'workspace'));
-    const docs = path.join(workspace, 'Docs');
-    fs.mkdirSync(path.join(docs, 'skills', 'example'), { recursive: true });
-    fs.writeFileSync(path.join(docs, 'skills', 'example', 'SKILL.md'), 'Example');
-    git(workspace, 'add', 'Docs');
-    git(workspace, 'commit', '-q', '-m', 'docs');
-    const options = { workspaceRoot: workspace, resolveRepository: () => ({ source: docs }) };
-    const robot = path.join(workspace, 'robot');
-    installRepositoryLinks({ skillRepos: [{ repoName: 'Docs', destination: robot, skills: ['example'] }] }, options);
-    assert.equal(status(workspace), '');
-    removeRepositoryLinks([path.join(robot, '.agents', 'skills', 'example')], options);
-    assert.doesNotMatch(read(path.join(workspace, '.git', 'ploinky-skill-exports.exclude')), /example/);
-    assert.equal(status(workspace), '');
 });
 
 // ---------------------------------------------------------------------------

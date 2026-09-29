@@ -1,9 +1,6 @@
 // Local exclusion policy for skill exports.
 //
-// Shared by value like the export transaction protocol: Ploinky keeps this
-// file at cli/utils/skills/exportExclusions.mjs and Explorer a byte-identical
-// copy at explorer/utils/server/skill-export-exclusions.mjs. Only Node
-// built-ins may be imported.
+// Only Node built-ins may be imported.
 //
 // Git targets never receive tracked `.gitignore` writes or rules in the shared
 // `info/exclude`. The worktree's private config points `core.excludesFile` at

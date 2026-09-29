@@ -654,14 +654,13 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
 
         try {
             let result;
-            if (action === 'install' || action === 'remove') {
-                result = await withWorkspaceMutationLease({ operation: `repositories-${action}` }, () => {
-                    // Skill export locks nest inside the workspace mutation lease.
-                    const authority = { kind: 'workspace-mutation-lease', operation: `repositories-${action}` };
-                    if (action === 'remove') return removeRepositoryLinks(body?.paths, { authority });
+            if (action === 'install') {
+                result = await withWorkspaceMutationLease({ operation: 'repositories-install' }, () => {
                     const repositories = new Map(reposSvc.listRepositorySources().filter(repo => repo.origin !== 'remote').map(repo => [repo.name, repo]));
-                    return installRepositoryLinks(body, { resolveRepository: name => repositories.get(name), authority });
+                    return installRepositoryLinks(body, { resolveRepository: name => repositories.get(name) });
                 });
+            } else if (action === 'remove') {
+                result = await withWorkspaceMutationLease({ operation: 'repositories-remove' }, () => removeRepositoryLinks(body?.paths));
             } else if (action === 'install_repo') {
                 const url = normalizeMarketplaceUrl(body?.url);
                 const name = normalizeOptionalMarketplaceRepoName(body?.name);

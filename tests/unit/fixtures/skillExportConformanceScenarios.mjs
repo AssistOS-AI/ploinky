@@ -1,8 +1,5 @@
-// Shared conformance scenarios for the skill export transaction protocol.
-// Ploinky keeps this file at tests/unit/fixtures/skillExportConformanceScenarios.mjs
-// and Explorer a byte-identical copy at
-// explorer/tests/unit/skillExportConformanceScenarios.mjs. Each scenario
-// receives one copy of the protocol module; both repositories run the table.
+// Conformance scenarios for the skill export transaction protocol. Each
+// scenario receives the protocol module under test.
 
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
