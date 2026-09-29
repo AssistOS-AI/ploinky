@@ -536,6 +536,7 @@ function normalizeSessionMessage(raw) {
     if (role === 'assistant' && ['pending', 'completed', 'failed', 'interrupted'].includes(raw.status)) {
         message.status = raw.status;
     }
+    if (role === 'assistant' && Number.isSafeInteger(raw.durationMs) && raw.durationMs >= 0) message.durationMs = raw.durationMs;
     if (raw.context === false) message.context = false;
     return message;
 }
@@ -580,7 +581,9 @@ export function parseWebchatSessionState(envelope) {
     const summary = normalizeSessionSummary(envelope.summary);
     if (!session || !summary || session.sessionId !== summary.sessionId) return undefined;
     const settingsAction = normalizeSessionSettingsAction(envelope.settingsAction, 'https://webchat.invalid');
-    return { event: envelope.event, ...target, session, summary, ...(settingsAction ? { settingsAction } : {}) };
+    const summaryAction = normalizeSessionSettingsAction(envelope.summaryAction, 'https://webchat.invalid');
+    return { event: envelope.event, ...target, session, summary, ...(settingsAction ? { settingsAction } : {}),
+        ...(summaryAction ? { summaryAction } : {}) };
 }
 
 export function serializeSessionStateSseEvent(state) {

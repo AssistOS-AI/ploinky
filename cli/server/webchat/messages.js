@@ -58,6 +58,14 @@ function formatTime(timestamp = null) {
     return `${hours}:${minutes}`;
 }
 
+function formatResponseDuration(durationMs) {
+    if (!Number.isSafeInteger(durationMs) || durationMs < 0) return '';
+    const seconds = Math.max(1, Math.round(durationMs / 1000));
+    if (seconds < 60) return `Thought for ${seconds} ${seconds === 1 ? 'second' : 'seconds'}`;
+    const minutes = Math.round(seconds / 6) / 10;
+    return `Thought for ${minutes} ${minutes === 1 ? 'minute' : 'minutes'}`;
+}
+
 export function createMessages({
     chatList,
     typingIndicator,
@@ -1411,6 +1419,20 @@ export function createMessages({
             appendMessageEl(wrapper, messageIndex);
         }
 
+        const durationLabel = options.pending ? '' : formatResponseDuration(options.durationMs);
+        if (durationLabel) {
+            const timeNode = lastServerMsg.bubble?.querySelector('.wa-message-time');
+            if (timeNode) {
+                let duration = timeNode.querySelector('.wa-response-duration');
+                if (!duration) {
+                    duration = document.createElement('span');
+                    duration.className = 'wa-response-duration';
+                    timeNode.appendChild(duration);
+                }
+                duration.textContent = ` · ${durationLabel}`;
+            }
+        }
+
         flushPendingUnindexedTasks();
         reconcileAssociatedTasks();
         scrollToBottomIfLocked();
@@ -1477,6 +1499,7 @@ export function createMessages({
                     messageIndex,
                     messageId: message.id,
                     pending: message.status === 'pending',
+                    durationMs: message.durationMs,
                 });
             }
         }
