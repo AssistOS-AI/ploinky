@@ -42,7 +42,8 @@ test.after(() => {
 
 // The owner takes what a workspace start holds when it prepares its graph.
 const OWNER_SOURCE = `
-const [edgeUrl, locksUrl, networkUrl, holds] = process.argv.slice(1);
+const [edgeUrl, locksUrl, networkUrl, holds, goPath] = process.argv.slice(1);
+const { existsSync } = await import('node:fs');
 const edge = await import(edgeUrl);
 const locks = await import(locksUrl);
 const network = await import(networkUrl);
@@ -50,17 +51,20 @@ const holding = new Set(holds.split(','));
 if (holding.has('lease')) await locks.acquireWorkspaceMutationLease({ operation: 'workspace-start', waitTimeoutMs: 0 });
 // The Watchdog's container monitor restart takes the workspace lease this way.
 if (holding.has('watchdog')) locks.createWorkspaceMutationLease({ operation: 'watchdog-restart:ploinky_repo_demo' });
-// A live owner that reaps a dead owner's network lock and takes it later on.
-// It retries while another acquirer briefly holds the stale-owner reaper.
-if (holding.has('late-network')) setTimeout(function take(attempt = 0) {
-    try {
-        network.acquireNetworkLifecycleLock({ staleGraceMs: 0 });
-        process.stdout.write('took ' + Date.now() + '\\n');
-    } catch (error) {
-        if (attempt >= 250) throw error;
-        setTimeout(() => take(attempt + 1), 20);
-    }
-}, 1500);
+// A live owner that reaps a dead owner's network lock and takes it later on:
+// exactly once, when the test's waiting acquirer writes the go file.
+if (holding.has('late-network')) {
+    const deadline = Date.now() + 30_000;
+    (function takeWhenTold() {
+        if (existsSync(goPath)) {
+            network.acquireNetworkLifecycleLock({ staleGraceMs: 0 });
+            process.stdout.write('took ' + Date.now() + '\\n');
+            return;
+        }
+        if (Date.now() >= deadline) throw new Error('the late owner was never told to take the lock');
+        setTimeout(takeWhenTold, 5);
+    })();
+}
 if (holding.has('network')) network.acquireNetworkLifecycleLock();
 if (holding.has('prepare')) {
     edge.prepareEdgeRoutingGeneration({ workspaceRoot: process.env.PLOINKY_WORKSPACE_ROOT, reason: '${START_REASON}' });
@@ -69,10 +73,10 @@ process.stdout.write('ready\\n');
 setInterval(() => {}, 60000);
 `;
 
-async function startChild(holds) {
+async function startChild(holds, extraArgs = []) {
     const child = spawn(process.execPath, ['--input-type=module', '-e', OWNER_SOURCE,
         moduleUrl('sandbox/edgeGeneration.js'), moduleUrl('utils/runtime/maintenanceLocks.js'),
-        moduleUrl('sandbox/networkLifecycle.js'), holds], { stdio: ['ignore', 'pipe', 'pipe'] });
+        moduleUrl('sandbox/networkLifecycle.js'), holds, ...extraArgs], { stdio: ['ignore', 'pipe', 'pipe'] });
     children.add(child);
     let stdout = '';
     let stderr = '';
@@ -339,7 +343,14 @@ test('the reclaiming network lock waits out only a dead owner\'s grace and runs 
     assert.equal(calls, 2);
     assert.equal(fs.existsSync(networkLockPath), false);
 
-    const late = await startChild('late-network');
+    // The late owner's takeover unlinks the dead owner's lock before creating
+    // its own, so an acquisition attempt landing between the two would simply
+    // take the free lock. The waiting acquirer therefore hands over at the start
+    // of its second attempt, after one refusal on the dead owner and one poll:
+    // its injected clock writes the go file and blocks until the takeover is on
+    // disk, so no attempt of its own overlaps it.
+    const goPath = path.join(workspace, 'late-network.go');
+    const late = await startChild('late-network', [goPath]);
     const lateTookAt = Promise.race([
         new Promise((resolve) => late.stdout.on('data', (chunk) => {
             const match = /took (\d+)/.exec(String(chunk));
@@ -349,11 +360,34 @@ test('the reclaiming network lock waits out only a dead owner\'s grace and runs 
     ]);
     const dead2 = await startChild('network');
     await stopChild(dead2);
+    const reaperPath = `${networkLockPath}.reaper`;
+    const lockPid = () => {
+        try { return JSON.parse(fs.readFileSync(networkLockPath, 'utf8')).pid; } catch (_) { return null; }
+    };
+    let attemptStarts = 0;
+    let handedOver = false;
+    const handOverOnSecondAttempt = () => {
+        // Each attempt reads the clock first for the reaper snapshot, before it
+        // creates the reaper itself; later reads find its own reaper present.
+        if (!handedOver && !fs.existsSync(reaperPath) && ++attemptStarts === 2) {
+            assert.equal(lockPid(), dead2.pid, 'the first attempt was refused on the dead owner');
+            fs.writeFileSync(goPath, '');
+            const deadline = Date.now() + 15_000;
+            while (lockPid() !== late.pid || fs.existsSync(reaperPath)) {
+                if (Date.now() >= deadline) throw new Error('the late owner never took the lock');
+                Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+            }
+            handedOver = true;
+        }
+        return Date.now();
+    };
     const waitedFrom = Date.now();
-    assert.throws(() => network.withNetworkLifecycleLockReclaimingStoppedOwner(() => { calls += 1; }),
-        { code: 'PLOINKY_NETWORK_LIFECYCLE_BUSY' });
+    assert.throws(() => network.withNetworkLifecycleLockReclaimingStoppedOwner(() => { calls += 1; },
+        { now: handOverOnSecondAttempt }), { code: 'PLOINKY_NETWORK_LIFECYCLE_BUSY' });
     const refusedAt = Date.now();
     const tookAt = await lateTookAt;
+    assert.equal(handedOver, true, 'the takeover happened while the acquirer waited');
+    assert.equal(attemptStarts, 2, 'one refusal on the dead owner, then one attempt that met the live owner');
     assert.ok(tookAt >= waitedFrom, 'the wait began on the dead owner');
     assert.ok(refusedAt - tookAt < 1_000,
         `once a live owner took the lock the wait stopped (refused ${refusedAt - tookAt}ms after, not at the grace end)`);
@@ -361,6 +395,7 @@ test('the reclaiming network lock waits out only a dead owner\'s grace and runs 
     assert.equal(calls, 2);
     await stopChild(late);
     fs.rmSync(networkLockPath, { force: true });
+    fs.rmSync(goPath, { force: true });
 
     const live = await startChild('network');
     const startedAt = Date.now();
