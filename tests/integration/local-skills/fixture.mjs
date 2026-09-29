@@ -17,9 +17,9 @@ export const source = (repo, file) => import(pathToFileURL(path.join(roots[repo]
 export const { RobotStore } = await source('achilles', 'roboTeamAgent/server/robot-store.mjs');
 export const { RobotSkillsets } = await source('achilles', 'roboTeamAgent/server/robot-skillsets.mjs');
 export const { RuntimeManager } = await source('achilles', 'roboTeamAgent/server/runtime-manager.mjs');
-export const { ConversationSessionStore } = await source('achilles', 'roboTeamAgent/copilot/src/lib/conversationSessionStore.mjs');
-export const { createRobotSkillCatalog } = await source('achilles', 'roboTeamAgent/copilot/src/lib/robotSkillCatalog.mjs');
-export const { createAlaEngine } = await source('achilles', 'roboTeamAgent/copilot/src/lib/alaEngine.mjs');
+export const { ConversationSessionStore } = await source('achilles', 'roboTeamAgent/copilot/src/lib/storage/conversationSessionStore.mjs');
+export const { createRobotSkillCatalog } = await source('achilles', 'roboTeamAgent/copilot/src/lib/skills/robotSkillCatalog.mjs');
+export const { createAlaEngine } = await source('achilles', 'roboTeamAgent/copilot/src/lib/execution/alaEngine.mjs');
 export const { skillCatalogRequest } = await source('achilles', 'roboTeamAgent/server/skill-catalog-api.mjs');
 export const { buildHostSkillScope, buildLocalSkillScope } = await source('ploinky', 'ploinky-box/skillScope.mjs');
 export const { syncManagedSkillExports: exportPloinky } = await source('ploinky', 'cli/utils/skills/managedExports.js');

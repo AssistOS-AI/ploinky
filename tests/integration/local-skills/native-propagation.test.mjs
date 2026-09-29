@@ -29,7 +29,7 @@ test('real native conversation uses live source edits, additions, explicit empty
     const unselectedHomeSkill = path.join(f.home, '.codex/skills/home-only');
     await writeSkill(unselectedHomeSkill, 'home-only');
     const homeDescriptor = await fs.readFile(path.join(unselectedHomeSkill, 'SKILL.md'), 'utf8');
-    const { resolveAlaInstallation } = await source('achilles', 'roboTeamAgent/copilot/src/lib/alaInstallation.mjs');
+    const { resolveAlaInstallation } = await source('achilles', 'roboTeamAgent/copilot/src/lib/execution/alaInstallation.mjs');
     const installation = await resolveAlaInstallation({ env: { ...process.env, ACHILLES_ALA_COMMAND: path.join(roots.ala, 'bin/ala.mjs') } });
     const engine = createAlaEngine({ workingDir: f.scopeRoot, sessionStore: f.sessionStore, skillCatalog: f.catalog,
         installation, settings: { readAchillesSettings: () => ({}), getCodingAgentModels: () => ({}),

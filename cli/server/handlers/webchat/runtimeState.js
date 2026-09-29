@@ -6,6 +6,7 @@ import { normalizeSessionSettingsAction } from '../../webchat/sessionSettings.js
 const STREAM_RECONNECT_GRACE_MS = 120000;
 const MAX_PENDING_SSE_EVENTS = 200;
 const MAX_RUNTIME_MODEL_LENGTH = 256;
+const WEBCHAT_DIAGNOSTIC_FLAG = '__webchatDiagnostic';
 const WEBCHAT_RUNTIME_STATE_FLAG = '__webchatRuntimeState';
 const WEBCHAT_SESSION_FLAG = '__webchatSession';
 const WEBCHAT_WORKSPACE_FILES_FLAG = '__webchatWorkspaceFiles';
@@ -139,6 +140,9 @@ function normalizeTask(raw, { includeFinalOutputRanges = true } = {}) {
         createdAt: normalizeTimestamp(raw.createdAt),
         updatedAt: normalizeTimestamp(raw.updatedAt),
         executionStartedAt: normalizeTimestamp(raw.executionStartedAt),
+        ...(Number.isFinite(raw.elapsedMs) && raw.elapsedMs >= 0 ? {
+            elapsedMs: raw.elapsedMs, activeSince: normalizeTimestamp(raw.activeSince),
+        } : {}),
         turn: Number.isSafeInteger(raw.turn) && raw.turn > 0 ? raw.turn : 1,
         error: String(raw.error || '').slice(0, 1000),
         finalOutputOffset: Number.isSafeInteger(raw.finalOutputOffset) && raw.finalOutputOffset >= 0
@@ -774,6 +778,19 @@ export function broadcastWorkspaceTaskEvent(appState, workspaceDirectory, payloa
 function routeCompleteOutputLine(appState, tab, line) {
     const normalized = stripCtrlAndAnsi(String(line || '')).trim();
     if (PLOINKY_WORKSPACE_BANNER_RE.test(normalized)) return;
+    if (normalized.startsWith('{') && normalized.includes(`"${WEBCHAT_DIAGNOSTIC_FLAG}"`)) {
+        try {
+            const raw = JSON.parse(normalized);
+            if (raw[WEBCHAT_DIAGNOSTIC_FLAG] === 1 && raw.version === 1) {
+                const clean = (value, limit) => typeof value === 'string' ? value.replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, limit) : '';
+                const diagnostic = { level: raw.level === 'info' ? 'info' : 'warn', source: clean(raw.source, 80),
+                    message: clean(raw.message, 600), code: clean(raw.code, 80), detail: clean(raw.detail, 600), taskId: clean(raw.taskId, 80) };
+                console[diagnostic.level]('[webchat-diagnostic]', diagnostic);
+                writeOrBufferSseEvent(tab, `event: diagnostic\ndata: ${JSON.stringify(diagnostic)}\n\n`);
+            }
+        } catch { /* Malformed diagnostic records are never conversation text. */ }
+        return;
+    }
     if (normalized.includes(`"${WEBCHAT_SESSION_FLAG}"`)) {
         try {
             const sessionState = parseWebchatSessionState(JSON.parse(normalized));
@@ -936,6 +953,8 @@ export function routeWorkspaceRuntimeOutput(appState, tab, data) {
     }
 
     const trimmed = stripCtrlAndAnsi(pending).trimStart();
+    const isDiagnosticProtocol = `{"${WEBCHAT_DIAGNOSTIC_FLAG}"`.startsWith(trimmed)
+        || trimmed.includes(`"${WEBCHAT_DIAGNOSTIC_FLAG}"`);
     const isTaskProtocol = '{"__webchatTask"'.startsWith(trimmed) || trimmed.includes('"__webchatTask"');
     const isRuntimeStateProtocol = `{"${WEBCHAT_RUNTIME_STATE_FLAG}"`.startsWith(trimmed)
         || trimmed.includes(`"${WEBCHAT_RUNTIME_STATE_FLAG}"`);
@@ -949,7 +968,7 @@ export function routeWorkspaceRuntimeOutput(appState, tab, data) {
         || trimmed.includes(`"${WEBCHAT_INTERACTION_FLAG}"`)
         || `{"${WEBCHAT_INTERACTION_RESOLVED_FLAG}"`.startsWith(trimmed)
         || trimmed.includes(`"${WEBCHAT_INTERACTION_RESOLVED_FLAG}"`);
-    if (trimmed.startsWith('{') && (isTaskProtocol || isRuntimeStateProtocol || isSessionProtocol
+    if (trimmed.startsWith('{') && (isDiagnosticProtocol || isTaskProtocol || isRuntimeStateProtocol || isSessionProtocol
         || isWorkspaceFilesProtocol || isSkillsProtocol || isInteractionProtocol)) {
         tab.taskProtocolBuffer = pending;
         return;

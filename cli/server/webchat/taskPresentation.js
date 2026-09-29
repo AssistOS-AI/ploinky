@@ -85,6 +85,11 @@ export function taskStatusPresentation(task) {
 }
 
 export function taskDurationSeconds(task, now = Date.now()) {
+    if (Number.isFinite(task?.elapsedMs) && task.elapsedMs >= 0) {
+        const since = Date.parse(task.activeSince || '');
+        const current = task.status === 'ongoing' && Number.isFinite(since) ? Math.max(0, now - since) : 0;
+        return Math.floor((task.elapsedMs + current) / 1000);
+    }
     const start = Date.parse(task?.executionStartedAt || task?.createdAt || '');
     if (!Number.isFinite(start)) return null;
     const terminal = TERMINAL_STATUSES.has(task?.status);
