@@ -14,7 +14,7 @@ import {
     selectWorkspaceAgentLibSource,
     updateWorkspaceAgentLibSource,
 } from './agentlib-source.mjs';
-import { AGENTLIB_ERROR_CODES, agentLibError } from '../agentlib/contract.mjs';
+import { AGENTLIB_ERROR_CODES, agentLibError, agentLibIdentity } from '../agentlib/contract.mjs';
 import { PLOINKY_UPDATED_WORKSPACE_CHECKOUT_ENV } from '../cli/commands/ploinkyUpdateScope.js';
 import {
     fingerprintSource,
@@ -79,7 +79,6 @@ import {
     resolveGpuWiring,
     sameGpuWiring,
 } from './gpuGrant.mjs';
-import { agentLibPinPolicy } from './agentlib-pin.mjs';
 import { loadBoxAgentLibImage, revalidateContainerAgentLib } from './image-agentlib.mjs';
 import {
     HOST_REACHABLE_IPV4_ENV,
@@ -223,6 +222,12 @@ function removeManagedAgentLibState(workspaceRoot, fsApi = fsPromisesFree) {
     return Object.freeze([target]);
 }
 
+/** The one comparable value of a selection's identity: a local fingerprint or the supplying image ID. */
+function agentLibIdentityToken(selection) {
+    const identity = agentLibIdentity(selection, { provenance: false });
+    return identity ? (identity.fingerprint ?? identity.supplyingImageId ?? null) : null;
+}
+
 /**
  * Prove the selected source is still exactly the one the graph was admitted for.
  *
@@ -351,18 +356,16 @@ export function createBoxSupervisor({
         return discover(identity, runner, platform, env);
     }
 
-    // Creating a missing Box pulls its reference, so select the bundle from
-    // that pull rather than from whatever local tag an earlier pull left.
+    // Creating a missing Box pulls its reference, so select the supplying image
+    // from that pull rather than from whatever local tag an earlier pull left.
     // An existing Box is reused or replaced without a selection-time pull.
-    // The bundled commit is compared with this checkout's lock inside the loader.
     function imageBundleLoader(ownership, imageRef = resolveBoxImageReference(env)) {
         return () => loadAgentLibImage({
             engine: ownership.engine, imageRef, runner, stdout, stderr, refresh: ownership.state === 'absent',
-            pinPolicy: agentLibPinPolicy(env), repositoryRoot,
         });
     }
 
-    // Bind never pulls: an image bundle may come only from a local image.
+    // Bind never pulls: the supplying image may come only from a local image.
     function localImageBundleLoader(ownership, imageRef) {
         return () => {
             const inspected = runner.query(ownership.engine.name, ['image', 'inspect', imageRef]);
@@ -375,7 +378,6 @@ export function createBoxSupervisor({
             }
             return loadAgentLibImage({
                 engine: ownership.engine, imageRef, runner, stdout, stderr, allowPull: false,
-                pinPolicy: agentLibPinPolicy(env), repositoryRoot,
             });
         };
     }
@@ -792,9 +794,8 @@ export function createBoxSupervisor({
             source: {
                 containerId: prepared.ownership.handles.container.id,
                 boxAction: prepared.action || null,
-                previousAgentLib: prepared.previousAgentLib?.sourceIdHash
-                    || prepared.previousAgentLib?.fingerprint || null,
-                candidateAgentLib: selection?.contentFingerprint || selection?.fingerprint || null,
+                previousAgentLib: prepared.previousAgentLib?.sourceIdHash || null,
+                candidateAgentLib: agentLibIdentityToken(selection),
                 ...(source || {}),
             },
             items,
@@ -1620,16 +1621,13 @@ export function createBoxSupervisor({
     }
 
     function agentLibRecord({ selection, changed, previous }) {
-        const describe = value => (value
-            ? { mode: value.mode || null, fingerprint: value.contentFingerprint || value.fingerprint || null }
-            : null);
         return createOperationRecord({
             phase: 'agentlib',
             id: 'achillesAgentLib',
             outcome: changed ? 'changed' : 'unchanged',
             required: true,
-            before: describe(previous),
-            after: describe(selection),
+            before: agentLibIdentity(previous, { provenance: false }),
+            after: agentLibIdentity(selection, { provenance: false }),
         });
     }
 
@@ -1789,8 +1787,7 @@ export function createBoxSupervisor({
                 : null,
             agentLib: {
                 changed: Boolean(changed),
-                mode: selection?.mode || null,
-                fingerprint: selection?.contentFingerprint || selection?.fingerprint || null,
+                ...agentLibIdentity(selection, { provenance: false }),
             },
         };
         const inputRecords = [
@@ -2036,8 +2033,7 @@ export function createBoxSupervisor({
                         prior: priorSkillScopeEnv?.PLOINKY_SKILL_SCOPE || null,
                         proposed: skillScopeEnv.PLOINKY_SKILL_SCOPE,
                         priorRequired: activity.active || activity.undetermined,
-                    }, agentLib: { changed: false, mode: selection?.mode || null,
-                        fingerprint: selection?.contentFingerprint || selection?.fingerprint || null } },
+                    }, agentLib: { changed: false, ...agentLibIdentity(selection, { provenance: false }) } },
                 }),
             });
         } catch (error) {

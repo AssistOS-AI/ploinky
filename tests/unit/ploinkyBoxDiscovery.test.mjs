@@ -376,8 +376,16 @@ test('discovery checks workspace provenance but leaves configuration to reconcil
     delete incompleteConfiguration.Labels[BOX_LABELS.imagesFingerprint];
     delete incompleteConfiguration.Labels[BOX_AGENTLIB_LABELS.fingerprint];
     incompleteConfiguration.Labels[BOX_AGENTLIB_LABELS.mode] = 'legacy';
+    // An image-supplied library carries only the mode, source identity and relative
+    // path: it has no content fingerprint or commit label, and the supplying image is
+    // the container's own immutable image, so discovery reads none of them for ownership.
+    const imageSupplied = ownedContainer(identity);
+    delete imageSupplied.Labels[BOX_AGENTLIB_LABELS.fingerprint];
+    delete imageSupplied.Labels[BOX_AGENTLIB_LABELS.commit];
+    imageSupplied.Labels[BOX_AGENTLIB_LABELS.mode] = 'image';
+    imageSupplied.Labels[BOX_AGENTLIB_LABELS.sourceRelativePath] = 'image';
 
-    for (const container of [minimal, extraLabel, incompleteConfiguration]) {
+    for (const container of [minimal, extraLabel, incompleteConfiguration, imageSupplied]) {
         const result = discoverBoxOwnership(identity, {
             platform: 'linux',
             env: {},

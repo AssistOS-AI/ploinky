@@ -7,6 +7,7 @@ import { showHelp } from './commands/help.js';
 import { parseStatusOptions } from './statusOptions.js';
 import { bootstrapAgentLibRuntime } from '../agentlib/bootstrap.mjs';
 import { parseBranchPolicy, stripBranchPolicyArgs } from '../agentlib/branchPolicy.mjs';
+import { agentLibIdentityEquals } from '../agentlib/contract.mjs';
 import { fingerprintSource, sourceIdEquals } from '../agentlib/fingerprint.mjs';
 import {
     clearTransactionDescriptor,
@@ -43,6 +44,8 @@ function safeBranchPolicy(args) {
     }
 }
 
+// Native `ploinky-local` owns only local selections: it has no Box image to
+// supply a source, so revalidation is the local checkout's content fingerprint.
 function revalidateSelection(selection) {
     const observed = fingerprintSource(selection.sourceDir);
     if (!sourceIdEquals(observed.sourceId, selection.sourceId)
@@ -70,10 +73,7 @@ function commandFailed(code) {
 }
 
 function selectionsDiffer(first, second) {
-    return !first || !second
-        || first.mode !== second.mode
-        || first.contentFingerprint !== second.contentFingerprint
-        || !sourceIdEquals(first.sourceId, second.sourceId);
+    return !first || !second || !agentLibIdentityEquals(first, second);
 }
 
 export async function launchCli(args = process.argv.slice(2), {
@@ -211,9 +211,8 @@ export async function launchCli(args = process.argv.slice(2), {
         }
     }
     // Establish the achillesAgentLib runtime contract before importing any core
-    // module. Outside the Box this selects (and, for a managed source, stages)
-    // the one workspace source; inside the Box it only validates the mount the
-    // host supervisor established. Help, logs, and single-word status returned
+    // module. Outside the Box this selects the one local workspace source;
+    // inside the Box it only validates the source the host supervisor selected. Help, logs, and single-word status returned
     // above, so they stay free of any clone or fetch side effect.
     const branchPolicy = ['restart', 'update'].includes(commandArgs[0])
         ? parseBranchPolicy(args)
@@ -323,8 +322,8 @@ export async function launchCli(args = process.argv.slice(2), {
             return result;
         } catch (error) {
             try { await runCoreCli(['stop']); } catch (_) {}
-            // A different prior managed/local source can be restored only when
-            // its exact old identity and fingerprint still exist.
+            // A different prior source can be restored only when its exact old
+            // identity and content still exist.
             restorePreviousDeployment(error, previous, bootstrap.selection);
             throw error;
         }

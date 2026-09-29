@@ -27,7 +27,7 @@ import {
 import { ensureSeatbeltCodeNodeModules, liveSeatbeltSourceConsumers } from '../../cli/sandbox/seatbelt/seatbeltServiceManager.js';
 import { hasAdmittedDependencyMount, selectPredecessorRemovalRecord } from '../../cli/sandbox/docker/agentServiceManager.js';
 import { withDependencyRefresh } from '../../cli/utils/dependencies/dependencyRefresh.mjs';
-import { fakeInstaller, fakeLease, hostProbe, makeAgentLib, tempRoot } from './dependencyStoreFixtures.mjs';
+import { fakeInstaller, fakeLease, hostProbe, makeAgentLib, makeImageSdk, tempRoot } from './dependencyStoreFixtures.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '../..');
@@ -265,6 +265,48 @@ test('dependency store runtime: a command memo cannot hide a pin or provider cha
     assert.match(pinned.agentPlan.installManifest.dependencies.example, /#a{40}$/);
     w.state.agentLib = { ...w.state.agentLib, fingerprint: 'changed-source' };
     assert.notEqual(planRuntimeDependencies(input('container', w), deps).agentPlan.inputKey, pinned.agentPlan.inputKey);
+});
+
+test('dependency store runtime: the outer supplier identity reaches plans and reuse, separately from the nested toolchain, with local Achilles', (t) => {
+    const w = world(t);
+    const bundles = new Map();
+    const bundleFor = (supplyingImageId) => {
+        if (!bundles.has(supplyingImageId)) {
+            bundles.set(supplyingImageId, makeImageSdk(w.root, { name: `sdk-${bundles.size}`, supplyingImageId }));
+        }
+        return bundles.get(supplyingImageId);
+    };
+    let outer = IMAGE_B;
+    const deps = { ...w.deps, memo: new Map(), sdkBundle: () => bundleFor(outer) };
+    const first = planRuntimeDependencies(input('container', w), deps);
+    assert.deepEqual(first.provider.providers.mcpSdk, { kind: 'image', library: 'mcp-sdk', supplyingImageId: IMAGE_B });
+    assert.equal(first.provider.toolchain.imageId, IMAGE_A, 'the nested agent toolchain image is a separate identity');
+    assert.equal(first.provider.providers.agentLib.mode, 'local', 'local Achilles keeps its own identity alongside the image SDK');
+    assert.equal(first.provider.providers.agentLib.fingerprint, w.state.agentLib.fingerprint);
+
+    const admitted = prepareRuntimeDependencies(input('container', w), { consumer: consumer('container') }, deps);
+    const record = { dependencies: admitted.record };
+    const same = { ...w.deps, memo: new Map(), sdkBundle: () => bundleFor(outer) };
+    assert.equal(runtimeDependencyReuseProblem({ ...input('container', w), record, needsDependencies: true }, same), '');
+
+    // A changed outer image with the same local Achilles and the same nested image
+    // is a different SDK provider, even inside one command memo.
+    outer = IMAGE_A;
+    const memoized = planRuntimeDependencies(input('container', w), deps);
+    assert.notEqual(memoized.agentPlan.inputKey, first.agentPlan.inputKey, 'a command memo cannot hide a supplier change');
+    assert.deepEqual(memoized.provider.providers.mcpSdk.supplyingImageId, IMAGE_A);
+    assert.equal(memoized.provider.toolchain.imageId, IMAGE_A);
+    assert.equal(runtimeDependencyReuseProblem({ ...input('container', w), record, needsDependencies: true },
+        { ...w.deps, memo: new Map(), sdkBundle: () => bundleFor(outer) }), 'dependency inputs changed');
+
+    // A changed nested image leaves the supplier identity alone and changes only the toolchain.
+    outer = IMAGE_B;
+    w.state.images['node:20'] = `sha256:${'c'.repeat(64)}`;
+    const nested = planRuntimeDependencies(input('container', w), { ...w.deps, memo: new Map(), sdkBundle: () => bundleFor(outer) });
+    assert.deepEqual(nested.provider.providers.mcpSdk, first.provider.providers.mcpSdk);
+    assert.notEqual(nested.provider.toolchain.imageId, first.provider.toolchain.imageId);
+    assert.equal(runtimeDependencyReuseProblem({ ...input('container', w), record, needsDependencies: true },
+        { ...w.deps, memo: new Map(), sdkBundle: () => bundleFor(outer) }), 'runtime image changed');
 });
 
 test('dependency store runtime: actual container mounts must name the admitted payload read-only', (t) => {

@@ -7,26 +7,32 @@ import { fileURLToPath } from 'node:url';
 import {
     AGENTLIB_ENV,
     AGENTLIB_PACKAGE_NAME,
+    AGENTLIB_REQUIRED_ENTRYPOINTS,
     AGENTLIB_STABLE_MOUNT_PATH,
+    BOX_IMAGE_ID_ENV,
     FORBIDDEN_BOX_AGENTLIB_PATH,
+    assertSupplyingImageId,
+    imageSourceIdHash,
+    imageSourceIdentity,
 } from '../../agentlib/contract.mjs';
-import { verifyImageBundle } from '../../agentlib/image-bundle.mjs';
 import { BOX_MARKER_CONTENT } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 import { createProcessRunner } from '../process.mjs';
 import {
     MCP_SDK_BUNDLE_PATH,
-    validateMcpSdkBundle,
+    MCP_SDK_LIBRARY_NAME,
+    assertMcpSdkTree,
+    mcpSdkIdentity,
+    readMcpSdkPackage,
 } from '../mcp-sdk-bundle.mjs';
 
-const LOCK_PATH = path.resolve(import.meta.dirname, '../dependencies.lock.json');
 export const DEPENDENCY_MARKER_NAME = '.ploinky-box-dependencies.json';
-const PIN_PATTERN = /^[a-f0-9]{40}$/;
+export const DEPENDENCY_MARKER_SCHEMA = 'ploinky.box.dependencies/v2';
 
-// AchillesAgentLib comes from a selected local mount or the immutable Box bundle. The
-// only dependency materialized into the workspace-backed Box cache is mcp-sdk,
-// copied from the immutable image bundle rather than fetched during startup.
-export const BOX_INSTALLED_DEPENDENCIES = Object.freeze(['mcp-sdk']);
+// AchillesAgentLib comes from a selected local mount or the Box image. The only
+// library materialized into the workspace-backed Box cache is mcp-sdk, copied
+// from the package the Box image supplies rather than fetched during startup.
+export const BOX_INSTALLED_DEPENDENCIES = Object.freeze([MCP_SDK_LIBRARY_NAME]);
 
 function dependencyError(message, cause) {
     return new PloinkyBoxError(message, {
@@ -45,57 +51,6 @@ function canonicalize(value) {
         )));
     }
     return value;
-}
-
-export function canonicalLockJson(lock) {
-    return JSON.stringify(canonicalize(lock));
-}
-
-export function validateDependencyLock(lock) {
-    if (!lock
-        || JSON.stringify(Object.keys(lock).sort()) !== JSON.stringify(['repositories'])
-        || !lock.repositories
-        || typeof lock.repositories !== 'object'
-        || Array.isArray(lock.repositories)) {
-        throw dependencyError('Dependency lock must declare pinned repositories');
-    }
-    const expectedNames = ['achillesAgentLib', 'mcp-sdk'];
-    const names = Object.keys(lock.repositories).sort();
-    if (JSON.stringify(names) !== JSON.stringify(expectedNames)) {
-        throw dependencyError('Dependency lock must contain exactly mcp-sdk and achillesAgentLib');
-    }
-    for (const name of expectedNames) {
-        const repository = lock.repositories[name];
-        if (!repository
-            || JSON.stringify(Object.keys(repository).sort()) !== JSON.stringify(['commit', 'url'])
-            || typeof repository.url !== 'string'
-            || !repository.url.startsWith('https://github.com/')
-            || !PIN_PATTERN.test(repository.commit)) {
-            throw dependencyError(`Dependency lock has an invalid immutable pin for ${name}`);
-        }
-    }
-    return lock;
-}
-
-/**
- * The subset of the lock the Box actually installs.
- *
- * Keeping achillesAgentLib in the lock file but out of the install set is
- * deliberate: the lock remains the one canonical remote/commit policy that the
- * host-side source selector reads.
- */
-export function boxInstallableRepositories(lock) {
-    return Object.fromEntries(BOX_INSTALLED_DEPENDENCIES.map((name) => [name, lock.repositories[name]]));
-}
-
-export function readDependencyLock({ fsApi = fs, lockPath = LOCK_PATH } = {}) {
-    let lock;
-    try {
-        lock = JSON.parse(fsApi.readFileSync(lockPath, 'utf8'));
-    } catch (error) {
-        throw dependencyError(`Unable to read dependency lock ${lockPath}`, error);
-    }
-    return validateDependencyLock(lock);
 }
 
 function assertRealDirectory(directory, fsApi) {
@@ -125,15 +80,26 @@ function assertBoxMarker(markerPath, fsApi) {
     }
 }
 
-function markerFor(lock) {
-    const installable = boxInstallableRepositories(lock);
+/**
+ * The outer Box image ID every process in this Box inherits from the host's
+ * container creation. It must be the canonical immutable spelling.
+ */
+function boxSupplyingImageId(env) {
+    try {
+        return assertSupplyingImageId(env?.[BOX_IMAGE_ID_ENV], `${BOX_IMAGE_ID_ENV} value`);
+    } catch (error) {
+        throw dependencyError(
+            `${BOX_IMAGE_ID_ENV} must carry the immutable Box image ID set when the host created this Box`,
+            error,
+        );
+    }
+}
+
+/** The completion marker of the Box dependency cache: which supplied libraries it holds. */
+function markerFor(supplyingImageId) {
     return {
-        fingerprint: crypto.createHash('sha256')
-            .update(canonicalLockJson({ repositories: installable }))
-            .digest('hex'),
-        repositories: Object.fromEntries(Object.entries(installable).map(([name, value]) => (
-            [name, value.commit]
-        ))),
+        schema: DEPENDENCY_MARKER_SCHEMA,
+        providedLibraries: { [MCP_SDK_LIBRARY_NAME]: mcpSdkIdentity(supplyingImageId) },
     };
 }
 
@@ -141,50 +107,38 @@ function markerMatches(actual, expected) {
     return JSON.stringify(canonicalize(actual)) === JSON.stringify(canonicalize(expected));
 }
 
-function defaultReadInstalledHead(directory, _runner, {
-    expectedRepository,
-    expectedBundle,
-    fsApi = fs,
-} = {}) {
+/**
+ * Whether an installed or staged copy is a usable SDK package with a plain
+ * file tree. A matching marker never bypasses the structural checks; no file
+ * body is hashed.
+ */
+function defaultInstalledPackageUsable(directory, { fsApi = fs } = {}) {
     try {
-        const installed = validateMcpSdkBundle({
-            sourceRoot: directory,
-            expectedRepository,
-            fsApi,
-        });
-        return installed.contentSha256 === expectedBundle?.contentSha256
-            ? installed.repository.commit
-            : '';
+        readMcpSdkPackage({ sourceRoot: directory, fsApi });
+        assertMcpSdkTree(directory, fsApi);
+        return true;
     } catch {
-        return '';
+        return false;
     }
 }
 
-function defaultInstallRepository({
+function defaultInstallLibrary({
     name,
-    repository,
     destination,
     sourcePath,
-    expectedBundle,
     runner = createProcessRunner(),
     fsApi = fs,
 }) {
-    if (name !== 'mcp-sdk') {
-        throw dependencyError(`The Box image has no bundled source for ${name}`);
+    if (name !== MCP_SDK_LIBRARY_NAME) {
+        throw dependencyError(`The Box image has no supplied source for ${name}`);
     }
-    const source = validateMcpSdkBundle({
-        sourceRoot: sourcePath,
-        expectedRepository: repository,
-        fsApi,
-    });
-    if (source.contentSha256 !== expectedBundle?.contentSha256) {
-        throw dependencyError('The MCP SDK image bundle changed during dependency preparation');
-    }
+    const source = readMcpSdkPackage({ sourceRoot: sourcePath, fsApi });
+    assertMcpSdkTree(source.sourceRoot, fsApi);
     // GNU cp is intentional. Node's recursive copy is unreliable when the
     // destination is a macOS Podman Machine bind mount.
     try {
         runner.run('cp', ['-a', source.sourceRoot, destination]);
-        // The image bundle is root-owned and read-only. Its cache copy belongs
+        // The image package is root-owned and read-only. Its cache copy belongs
         // to the Box user and must be movable/reparable across VirtioFS.
         runner.run('chmod', ['-R', 'u+w', destination]);
     } catch (error) {
@@ -194,11 +148,13 @@ function defaultInstallRepository({
 }
 
 /**
- * Prove the direct AgentLib mount before installing anything.
+ * Prove the selected AgentLib before installing anything.
  *
  * The Box is a consumer, never an owner: it validates the source the supervisor
- * mounted and fails if that contract is missing, rather than obtaining a copy
- * of its own.
+ * selected and fails if that contract is missing, rather than obtaining a copy
+ * of its own. A local source is the mounted checkout; an image source is the
+ * copy the Box image supplies, identified by the Box image ID and checked as a
+ * package (no content is hashed and no revision is compared).
  */
 export function validateMountedAgentLib({
     fsApi = fs,
@@ -232,17 +188,30 @@ export function validateMountedAgentLib({
             `The achillesAgentLib direct mount at ${sourcePath} declares package name '${String(pkg?.name)}'`,
         );
     }
+    const mode = String(env?.[AGENTLIB_ENV.mode] || '');
+    if (mode === 'image') {
+        const supplyingImageId = boxSupplyingImageId(env);
+        if (String(env?.[AGENTLIB_ENV.sourceId] || '') !== imageSourceIdHash(imageSourceIdentity(supplyingImageId))) {
+            throw dependencyError('The image AgentLib source identity does not match the Box image that supplies it');
+        }
+        for (const entry of AGENTLIB_REQUIRED_ENTRYPOINTS) {
+            let entryStat;
+            try {
+                entryStat = fsApi.statSync(path.join(sourcePath, entry));
+            } catch (error) {
+                throw dependencyError(`The Box image achillesAgentLib is missing required entry point ${entry}`, error);
+            }
+            if (!entryStat.isFile()) {
+                throw dependencyError(`The Box image achillesAgentLib entry point ${entry} is not a regular file`);
+            }
+        }
+        return Object.freeze({ sourcePath, mode, supplyingImageId });
+    }
     const fingerprint = String(env?.[AGENTLIB_ENV.fingerprint] || '');
     if (!/^[a-f0-9]{64}$/.test(fingerprint)) {
         throw dependencyError(`${AGENTLIB_ENV.fingerprint} must carry the selected content fingerprint`);
     }
-    if (env?.[AGENTLIB_ENV.mode] === 'image') {
-        const commit = String(env[AGENTLIB_ENV.commit] || '');
-        if (!PIN_PATTERN.test(commit)) throw dependencyError('Image AgentLib requires its pinned commit');
-        const bundle = verifyImageBundle({ sourceDir: sourcePath, expectedCommit: commit, fsApi });
-        if (bundle.fingerprint !== fingerprint) throw dependencyError('Image AgentLib fingerprint differs from its selected contract');
-    }
-    return Object.freeze({ sourcePath, fingerprint, mode: String(env?.[AGENTLIB_ENV.mode] || '') });
+    return Object.freeze({ sourcePath, fingerprint, mode });
 }
 
 /**
@@ -296,16 +265,15 @@ function readMarker(markerPath, fsApi) {
 function installationMatches({
     targetRoot,
     expected,
-    lock,
     fsApi,
-    runner,
-    readInstalledHead,
-    bundle,
+    installedPackageUsable,
 }) {
+    // Any other marker content, including absence or an earlier shape, is a
+    // miss: the copy is replaced through the normal transaction below.
     if (!markerMatches(readMarker(path.join(targetRoot, DEPENDENCY_MARKER_NAME), fsApi), expected)) {
         return false;
     }
-    for (const [name, repository] of Object.entries(boxInstallableRepositories(lock))) {
+    for (const name of BOX_INSTALLED_DEPENDENCIES) {
         const directory = path.join(targetRoot, name);
         try {
             const stat = fsApi.lstatSync(directory);
@@ -313,13 +281,7 @@ function installationMatches({
         } catch {
             return false;
         }
-        if (readInstalledHead(directory, runner, {
-            expectedRepository: repository,
-            expectedBundle: bundle,
-            fsApi,
-        }) !== repository.commit) {
-            return false;
-        }
+        if (!installedPackageUsable(directory, { fsApi })) return false;
     }
     return true;
 }
@@ -343,41 +305,43 @@ function prepareDirectoryForBackup(directory, stat, fsApi) {
     return originalMode;
 }
 
-export function installPinnedDependencies({
+/**
+ * Prepare the Box dependency cache from what the Box image supplies.
+ *
+ * The cache is fresh when its marker names the outer Box image that supplies
+ * the libraries and the copy is a usable package. Otherwise the copy is
+ * replaced transactionally and the marker is written last, so a partial copy is
+ * never reusable.
+ */
+export function prepareImageDependencies({
     targetRoot = '/opt/ploinky/node_modules',
     markerPath = '/etc/ploinky-box',
     fsApi = fs,
     runner = createProcessRunner(),
-    lock = readDependencyLock({ fsApi }),
-    installRepository = defaultInstallRepository,
-    readInstalledHead = defaultReadInstalledHead,
-    validateBundle = validateMcpSdkBundle,
+    installLibrary = defaultInstallLibrary,
+    installedPackageUsable = defaultInstalledPackageUsable,
+    readBundle = readMcpSdkPackage,
     bundledMcpSdkPath = MCP_SDK_BUNDLE_PATH,
     token = crypto.randomBytes(12).toString('hex'),
-    agentLibEnv = process.env,
+    env = process.env,
     agentLibPath = AGENTLIB_STABLE_MOUNT_PATH,
 } = {}) {
-    validateDependencyLock(lock);
     assertBoxMarker(markerPath, fsApi);
     const root = path.resolve(targetRoot);
     assertRealDirectory(root, fsApi);
-    validateMountedAgentLib({ fsApi, env: agentLibEnv, sourcePath: agentLibPath });
-    removeForbiddenBoxAgentLib({ root, fsApi });
-    const installable = boxInstallableRepositories(lock);
+    validateMountedAgentLib({ fsApi, env, sourcePath: agentLibPath });
+    // Validate the supplier identity and the supplied package before anything
+    // is cleaned up or replaced: a Box without a valid identity mutates nothing.
+    const supplyingImageId = boxSupplyingImageId(env);
     let bundle;
     try {
-        bundle = validateBundle({
-            sourceRoot: bundledMcpSdkPath,
-            expectedRepository: lock.repositories['mcp-sdk'],
-            fsApi,
-        });
+        bundle = readBundle({ sourceRoot: bundledMcpSdkPath, fsApi });
     } catch (error) {
-        throw dependencyError('The ploinky-box image has no valid bundled MCP SDK', error);
+        throw dependencyError('The ploinky-box image has no usable bundled MCP SDK', error);
     }
-    const expected = markerFor(lock);
-    if (installationMatches({
-        targetRoot: root, expected, lock, fsApi, runner, readInstalledHead, bundle,
-    })) {
+    removeForbiddenBoxAgentLib({ root, fsApi });
+    const expected = markerFor(supplyingImageId);
+    if (installationMatches({ targetRoot: root, expected, fsApi, installedPackageUsable })) {
         return Object.freeze({ changed: false, marker: expected });
     }
 
@@ -390,30 +354,37 @@ export function installPinnedDependencies({
     const staged = new Map();
     const backups = new Map();
     const movedNames = new Set();
+    const markerFile = path.join(root, DEPENDENCY_MARKER_NAME);
+    const markerBackup = path.join(transactionRoot, `.backup-${DEPENDENCY_MARKER_NAME}`);
+    let markerMoved = false;
     let committed = false;
     try {
-        for (const [name, repository] of Object.entries(installable)) {
+        for (const name of BOX_INSTALLED_DEPENDENCIES) {
             const destination = path.join(transactionRoot, name);
-            installRepository({
+            installLibrary({
                 name,
-                repository,
                 destination,
                 runner,
                 fsApi,
                 sourcePath: bundle.sourceRoot,
-                expectedBundle: bundle,
             });
-            if (readInstalledHead(destination, runner, {
-                expectedRepository: repository,
-                expectedBundle: bundle,
-                fsApi,
-            }) !== repository.commit) {
-                throw dependencyError(`Staged ${name} does not match its immutable image bundle`);
+            if (!installedPackageUsable(destination, { fsApi })) {
+                throw dependencyError(`Staged ${name} is not a usable package copied from the Box image`);
             }
             staged.set(name, destination);
         }
 
-        for (const name of Object.keys(installable)) {
+        // The previous marker leaves before any copy is swapped in. No bytes are
+        // compared any more, so from here until the new marker is written an
+        // interrupted preparation must read as a miss, never as a finished copy
+        // for the image the old marker names.
+        try {
+            fsApi.renameSync(markerFile, markerBackup);
+            markerMoved = true;
+        } catch (error) {
+            if (error.code !== 'ENOENT') throw error;
+        }
+        for (const name of BOX_INSTALLED_DEPENDENCIES) {
             const destination = path.join(root, name);
             const backup = path.join(transactionRoot, `.backup-${name}`);
             try {
@@ -439,7 +410,7 @@ export function installPinnedDependencies({
             flag: 'wx',
             mode: 0o600,
         });
-        fsApi.renameSync(markerTemp, path.join(root, DEPENDENCY_MARKER_NAME));
+        fsApi.renameSync(markerTemp, markerFile);
         committed = true;
         for (const backup of backups.values()) {
             try { safeRemoveWithin(root, backup.path, fsApi); } catch {}
@@ -447,7 +418,7 @@ export function installPinnedDependencies({
         return Object.freeze({ changed: true, marker: expected });
     } catch (error) {
         if (!committed) {
-            for (const name of [...Object.keys(installable)].reverse()) {
+            for (const name of [...BOX_INSTALLED_DEPENDENCIES].reverse()) {
                 const destination = path.join(root, name);
                 const backup = backups.get(name);
                 if (movedNames.has(name)) {
@@ -462,9 +433,13 @@ export function installPinnedDependencies({
                     } catch {}
                 }
             }
+            // The previous copy is back, so its marker may name it again.
+            if (markerMoved) {
+                try { fsApi.renameSync(markerBackup, markerFile); } catch {}
+            }
         }
         if (error instanceof PloinkyBoxError) throw error;
-        throw dependencyError('Pinned dependency installation failed', error);
+        throw dependencyError('Box dependency preparation failed', error);
     } finally {
         if (!committed || fsApi.existsSync(transactionRoot)) {
             try { safeRemoveWithin(root, transactionRoot, fsApi); } catch {}
@@ -475,7 +450,7 @@ export function installPinnedDependencies({
 const invokedPath = process.argv[1] ? path.resolve(process.argv[1]) : '';
 if (invokedPath === fileURLToPath(import.meta.url)) {
     try {
-        installPinnedDependencies();
+        prepareImageDependencies();
     } catch (error) {
         process.stderr.write(`ploinky-box dependency installation failed: ${error.message}\n`);
         process.exitCode = 1;

@@ -54,6 +54,7 @@ import {
 import {
     agentLibFixture,
     agentLibFixtureEnv,
+    boxImageIdFixtureEnv,
     agentLibFixtureLabels,
     agentLibFixtureMounts,
 } from '../helpers/agentlibFixture.mjs';
@@ -670,6 +671,7 @@ function containerHandle(state, { id = OLD_ID, imageId = OLD_IMAGE, hostPort = 8
                 ...IMAGE_CONTRACT.environment,
                 PLOINKY_WORKSPACE_ROOT: state.identity.workspaceRoot,
                 ...agentLibFixtureEnv(state.agentLib),
+                ...boxImageIdFixtureEnv(imageId),
                 PLOINKY_PRIVATE_BIND: '0.0.0.0',
                 PLOINKY_PUBLIC_BIND: '0.0.0.0',
                 PLOINKY_PUBLIC_AUTHORITY: `127.0.0.1:${hostPort}`,

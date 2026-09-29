@@ -1,7 +1,7 @@
 // Establish the achillesAgentLib runtime contract before any framework import.
 //
 // Outside the Box this resolves the local workspace source. Inside the Box it
-// validates the selected local mount or pinned image bundle before imports.
+// validates the selected local mount or the image-supplied copy before imports.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -11,12 +11,16 @@ import {
     AGENTLIB_ERROR_CODES,
     AGENTLIB_PACKAGE_NAME,
     AGENTLIB_STABLE_MOUNT_PATH,
+    BOX_IMAGE_ID_ENV,
     agentLibError,
     agentLibRuntimeEnv,
     assertNoRemovedAgentLibSettings,
+    assertSupplyingImageId,
+    imageSourceIdHash,
+    imageSourceIdentity,
 } from './contract.mjs';
 import { resolveWorkspaceRoot } from './source.mjs';
-import { verifyImageBundle } from './image-bundle.mjs';
+import { verifyImageAgentLibPackage } from './image-bundle.mjs';
 
 let bootstrapped = null;
 
@@ -76,33 +80,40 @@ function validateProvidedContract({ env, fsApi, expectedDir }) {
             `The achillesAgentLib direct mount at ${root} declares package name '${String(pkg?.name)}'.`,
         );
     }
+    if (!/^[a-f0-9]{64}$/.test(String(env[AGENTLIB_ENV.sourceId] || ''))) {
+        throw agentLibError(
+            AGENTLIB_ERROR_CODES.contractMissing,
+            `${AGENTLIB_ENV.sourceId} must carry the selected source identity.`,
+        );
+    }
+    const mode = String(env[AGENTLIB_ENV.mode] || '');
+    if (!['local', 'image'].includes(mode)) {
+        throw agentLibError(AGENTLIB_ERROR_CODES.contractMissing, 'The Box AgentLib source mode is missing or invalid.');
+    }
+    if (mode === 'image') {
+        // The image copy is identified by the outer Box image the host created
+        // this container from, never by its content or a Git revision.
+        const supplyingImageId = assertSupplyingImageId(env[BOX_IMAGE_ID_ENV], `${BOX_IMAGE_ID_ENV} value`);
+        if (env[AGENTLIB_ENV.sourceId] !== imageSourceIdHash(imageSourceIdentity(supplyingImageId))) {
+            throw agentLibError(AGENTLIB_ERROR_CODES.contractMissing,
+                'The image AgentLib source identity does not match the Box image that supplies it.');
+        }
+        const image = verifyImageAgentLibPackage({ sourceDir: declared, fsApi });
+        return {
+            sourceDir: root,
+            mode,
+            fingerprint: '',
+            commit: image.provenance.commit || '',
+            sourceIdHash: String(env[AGENTLIB_ENV.sourceId]),
+            supplyingImageId,
+            owned: false,
+        };
+    }
     if (!/^[a-f0-9]{64}$/.test(String(env[AGENTLIB_ENV.fingerprint] || ''))) {
         throw agentLibError(
             AGENTLIB_ERROR_CODES.contractMissing,
             `${AGENTLIB_ENV.fingerprint} must carry the selected content fingerprint.`,
         );
-    }
-    if (!/^[a-f0-9]{64}$/.test(String(env[AGENTLIB_ENV.sourceId] || ''))) {
-        throw agentLibError(
-            AGENTLIB_ERROR_CODES.contractMissing,
-            `${AGENTLIB_ENV.sourceId} must carry the selected physical source identity.`,
-        );
-    }
-    const mode = String(env[AGENTLIB_ENV.mode] || '');
-    if (!['local', 'image', 'managed'].includes(mode)) {
-        throw agentLibError(AGENTLIB_ERROR_CODES.contractMissing, 'The Box AgentLib source mode is missing or invalid.');
-    }
-    if (mode === 'image') {
-        const expectedCommit = String(env[AGENTLIB_ENV.commit] || '');
-        if (!/^[0-9a-f]{40}$/.test(expectedCommit)) {
-            throw agentLibError(AGENTLIB_ERROR_CODES.contractMissing,
-                'The image AgentLib runtime contract requires the selected pinned commit.');
-        }
-        const bundle = verifyImageBundle({ sourceDir: declared, expectedCommit, fsApi });
-        if (bundle.fingerprint !== env[AGENTLIB_ENV.fingerprint]) {
-            throw agentLibError(AGENTLIB_ERROR_CODES.imageInvalid,
-                'The image AgentLib fingerprint does not match the host-selected runtime contract.');
-        }
     }
     return {
         sourceDir: root,
@@ -161,7 +172,7 @@ export async function bootstrapAgentLibRuntime({
     bootstrapped = {
         sourceDir: selection.sourceDir,
         mode: selection.mode,
-        fingerprint: selection.contentFingerprint,
+        fingerprint: selection.contentFingerprint || '',
         commit: selection.resolvedCommit || '',
         sourceIdHash: env[AGENTLIB_ENV.sourceId],
         owned: true,

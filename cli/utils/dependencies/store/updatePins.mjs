@@ -60,7 +60,7 @@ function pinInputs(record, registration, repoPath, workspaceRoot, globalPackage,
         binding,
         global,
         needsDependencies,
-        ...collectGitInputs(needsDependencies ? mergePackageJson(global, agent) : {}, binding),
+        ...collectGitInputs(needsDependencies ? mergePackageJson(global, agent, { bundle: sdkBundle }) : {}, binding),
     };
 }
 
@@ -119,7 +119,7 @@ export async function refreshUpdateGitPins({
         if (!selected.length) return { records, queriesRun: 0, changed: false };
         const store = suppliedStore || createCacheStore({ depsDir: path.join(workspaceRoot, '.ploinky', 'deps'), workspaceRoot, assertLease });
         let globalPackage, sdkBundle;
-        try { globalPackage = readGlobalPackage(); sdkBundle = readSdkBundle(); }
+        try { sdkBundle = readSdkBundle(); globalPackage = readGlobalPackage({ bundle: sdkBundle }); }
         catch (error) {
             records.push(recordFor('providers', 'failed', 'git-pin-provider-input-invalid', error.message));
             return { records, queriesRun: 0, changed: false };

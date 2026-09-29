@@ -261,9 +261,10 @@ async function restoreOldContainer({
     stderr,
 }) {
     if (old.agentLib.mode === 'image') {
-        const bundle = dependencies.probeAgentLib(engine.name, old.imageId, runner, { expectedCommit: old.agentLib.commit });
-        if (bundle.fingerprint !== old.agentLib.fingerprint) {
-            throw transactionError('Refusing to restore the old Box because its AchillesAgentLib image bundle changed');
+        // The old image is immutable; its supplied package must still be usable.
+        const bundle = dependencies.probeAgentLib(engine.name, old.imageId, runner);
+        if (bundle.supplyingImageId !== old.agentLib.supplyingImageId) {
+            throw transactionError('Refusing to restore the old Box because its AchillesAgentLib image changed');
         }
     } else {
         const observedSource = fingerprintSource(old.agentLib.sourceDir, { fsApi: dependencies.fsApi });
@@ -393,9 +394,9 @@ export async function reconcileBoxContainer({
     if (old) {
         oldImage = dependencies.validateExistingImage(engine.name, old.imageId, old.imageRef, runner);
         if (old.agentLib.mode === 'image') {
-            const bundle = dependencies.probeAgentLib(engine.name, old.imageId, runner, { expectedCommit: old.agentLib.commit });
-            if (bundle.fingerprint !== old.agentLib.fingerprint) {
-                throw transactionError('Owned Box AchillesAgentLib bundle does not match its admitted fingerprint');
+            const bundle = dependencies.probeAgentLib(engine.name, old.imageId, runner);
+            if (bundle.supplyingImageId !== old.agentLib.supplyingImageId) {
+                throw transactionError('Owned Box AchillesAgentLib image does not match its admitted supplying image');
             }
         }
     }
@@ -551,13 +552,11 @@ export async function reconcileBoxContainer({
         image = dependencies.validateImage(engine.name, imageRef, runner);
     }
     if (desiredAgentLib.mode === 'image') {
-        if (desiredAgentLib.imageId !== normalizeImageId(image.immutableId)) {
+        if (desiredAgentLib.supplyingImageId !== normalizeImageId(image.immutableId)) {
             throw transactionError('Box image changed after AchillesAgentLib selection; run the command again');
         }
-        const bundle = dependencies.probeAgentLib(engine.name, image.immutableId, runner, { expectedCommit: desiredAgentLib.commit });
-        if (bundle.fingerprint !== desiredAgentLib.fingerprint) {
-            throw transactionError('Selected AchillesAgentLib image bundle fingerprint changed before Box creation');
-        }
+        // Package availability only: the supplying image ID just verified is the identity.
+        dependencies.probeAgentLib(engine.name, image.immutableId, runner);
     }
     try {
         dependencies.ensureDataPaths({ identity, lock, fsApi: dependencies.fsApi });

@@ -598,12 +598,11 @@ test('a failed activation after verified inputs is recorded, restores the prior 
     try {
         fs.mkdirSync(path.join(workspace, '.ploinky'), { recursive: true });
         writeAgentLibCheckout(path.join(workspace, contract.AGENTLIB_LOCAL_DIR_NAME));
-        const prior = buildSelection({ workspaceRoot: workspace, sourceDir: path.join(workspace, contract.AGENTLIB_LOCAL_DIR_NAME), mode: 'local' });
-        const candidateDir = path.join(workspace, '.ploinky', 'agentlib', 'generations', 'candidate');
+        const prior = buildSelection({ workspaceRoot: workspace, sourceDir: path.join(workspace, contract.AGENTLIB_LOCAL_DIR_NAME) });
+        const candidateDir = path.join(workspace, '.ploinky', 'agentlib', 'candidate');
         writeAgentLibCheckout(candidateDir);
         const candidate = buildSelection({
-            workspaceRoot: workspace, sourceDir: candidateDir, mode: 'managed',
-            remoteUrl: 'https://example.invalid/achillesAgentLib.git', resolvedCommit: '3'.repeat(40),
+            workspaceRoot: workspace, sourceDir: candidateDir, resolvedCommit: '3'.repeat(40),
         });
         const verified = buildCoreUpdateResult({
             command: ['update'],

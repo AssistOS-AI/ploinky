@@ -10,7 +10,6 @@ const MAX_MANIFEST_BYTES = 64 * 1024;
 const MAX_GIT_OUTPUT_BYTES = 64 * 1024;
 const GIT_TIMEOUT_MS = 5_000;
 const LOCKED_ROOT_POSTINSTALL = 'node ./ploinky-box/entrypoint/install-dependencies.mjs';
-const ROOT_DEPENDENCY_LOCK_PATH = path.join('ploinky-box', 'dependencies.lock.json');
 
 const REPOSITORY_COMPONENTS = Object.freeze([
     ['achillesAgentLib', 'agentlibSha'],
@@ -201,14 +200,14 @@ function parseExactGitCommitSpec(value, label = 'dependency spec') {
 /**
  * achillesAgentLib delivery policy for a release bundle.
  *
- * The Box dependency lock is now the one canonical source policy: the library is
- * direct-mounted from the selected workspace source, so `globalDeps` must NOT
- * declare it as an npm dependency any more. A bundle that still does would ship
- * a second, independently installed copy.
+ * The library is direct-mounted from the selected workspace source or supplied
+ * by the Box image, so `globalDeps` must NOT declare it as an npm dependency. A
+ * bundle that still does would ship a second, independently installed copy. The
+ * manifest's AgentLib commit is release evidence about the deployed checkout
+ * (verified against that checkout below); it is not a Ploinky runtime pin.
  */
 function validateAgentlibDeliveryMetadata({
     globalPackage,
-    dependencyLock,
     expectedCommit,
 }) {
     assertExactSha(expectedCommit, 'expected AgentLib commit');
@@ -217,56 +216,23 @@ function validateAgentlibDeliveryMetadata({
     if (Object.hasOwn(globalPackage.dependencies, 'achillesAgentLib')) {
         throw bundleError(
             'globalDeps must not declare achillesAgentLib: it is direct-mounted from the '
-            + 'selected workspace source, not installed by npm',
+            + 'selected workspace source or supplied by the Box image, not installed by npm',
         );
     }
-
-    assertPlainObject(dependencyLock, 'Box dependency lock');
-    assertPlainObject(dependencyLock.repositories, 'Box dependency lock repositories');
-    const locked = dependencyLock.repositories.achillesAgentLib;
-    assertPlainObject(locked, 'Box dependency lock achillesAgentLib');
-    const lockedCommit = assertExactSha(
-        locked.commit,
-        'Box dependency lock achillesAgentLib commit',
-    );
-    const lockedUrl = canonicalGitUrl(
-        locked.url,
-        'Box dependency lock achillesAgentLib',
-    );
-
-    if (lockedCommit !== expectedCommit) {
-        throw bundleError('manifest and Box lock must name the same AgentLib commit');
-    }
-    return Object.freeze({ commit: expectedCommit, repositoryUrl: lockedUrl });
+    return Object.freeze({ commit: expectedCommit });
 }
 
-function validateRootPackageInstaller({
-    rootPackage,
-    rootPackagePath,
-    dependencyLockPath,
-}) {
+function validateRootPackageInstaller({ rootPackage }) {
     assertPlainObject(rootPackage, 'root package');
     assertPlainObject(rootPackage.scripts, 'root package scripts');
     const postinstall = rootPackage.scripts.postinstall;
     if (postinstall !== LOCKED_ROOT_POSTINSTALL) {
         throw bundleError(
-            'root package postinstall must use the immutable Box dependency-lock installer; '
+            'root package postinstall must use the Box dependency installer; '
             + 'clone, move, branch, and arbitrary dependency specs are forbidden',
         );
     }
-    const expectedLockPath = path.resolve(
-        path.dirname(rootPackagePath),
-        ROOT_DEPENDENCY_LOCK_PATH,
-    );
-    if (path.resolve(dependencyLockPath) !== expectedLockPath) {
-        throw bundleError(
-            `root package installer must be tied to ${ROOT_DEPENDENCY_LOCK_PATH}`,
-        );
-    }
-    return Object.freeze({
-        postinstall,
-        dependencyLockPath: expectedLockPath,
-    });
+    return Object.freeze({ postinstall });
 }
 
 function runGit(repositoryPath, args) {
@@ -358,7 +324,6 @@ function defaultPaths(root = repositoryRoot, { env = process.env } = {}) {
         ),
         rootPackage: path.join(root, 'package.json'),
         globalPackage: path.join(root, 'globalDeps', 'package.json'),
-        dependencyLock: path.join(root, 'ploinky-box', 'dependencies.lock.json'),
     });
 }
 
@@ -370,15 +335,9 @@ function verifyReleaseBundle(manifest, {
     const validated = validateReleaseManifest(manifest);
     const rootPackage = readJson(paths.rootPackage, { label: 'root package' });
     const globalPackage = readJson(paths.globalPackage, { label: 'globalDeps package' });
-    const dependencyLock = readJson(paths.dependencyLock, { label: 'Box dependency lock' });
-    validateRootPackageInstaller({
-        rootPackage,
-        rootPackagePath: paths.rootPackage,
-        dependencyLockPath: paths.dependencyLock,
-    });
+    validateRootPackageInstaller({ rootPackage });
     validateAgentlibDeliveryMetadata({
         globalPackage,
-        dependencyLock,
         expectedCommit: validated.commits.achillesAgentLib,
     });
 

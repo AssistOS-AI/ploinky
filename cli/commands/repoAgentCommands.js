@@ -386,9 +386,9 @@ function validateUpdateFolder(projectsRoot) {
  * here; the lifecycle command that admits a runtime prepares its cache.
  *
  * A local workspace checkout is never pulled or reset — Ploinky reports what it
- * finds there and the developer owns it. A managed source advances only by
- * staging a new immutable generation. Either way the fingerprint change is what
- * forces a coherent restart, not an in-place package refresh.
+ * finds there and the developer owns it. The copy a Box image supplies changes
+ * only with a new image. Either way the identity change is what forces a
+ * coherent restart, not an in-place package refresh.
  */
 async function refreshAgentLibSourceForUpdate({
     branchPolicy = null,
@@ -427,9 +427,9 @@ async function refreshAgentLibSourceForUpdate({
             workspaceRoot: PLOINKY_WORKSPACE_ROOT,
             branchPolicy,
         });
-        const where = result.mode === 'local'
-            ? `local checkout ${result.selection.sourceRelativePath}`
-            : `managed generation ${result.selection.resolvedCommit?.slice(0, 12) || 'unknown'}`;
+        // Native `ploinky-local` has no Box image loader, so only a local checkout
+        // can be selected here; the host owns image-supplied selection.
+        const where = `local checkout ${result.selection.sourceRelativePath}`;
         console.log(`  ✓ ${where} (${result.selection.contentFingerprint.slice(0, 12)})`);
         if (result.changed) {
             console.log('  ✓ achillesAgentLib content changed; activation follows only when every required input is verified.');
@@ -438,7 +438,7 @@ async function refreshAgentLibSourceForUpdate({
             result,
             record: createOperationRecord({
                 phase: 'agentlib', id, outcome: result.changed ? 'changed' : 'unchanged', attempted: true, required: true,
-                code: result.mode === 'local' ? 'local-checkout' : 'managed-generation',
+                code: 'local-checkout',
                 reason: where,
                 before: { fingerprint: result.previous?.contentFingerprint || null },
                 after: { fingerprint: result.selection.contentFingerprint, commit: result.selection.resolvedCommit || null },

@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { canonicalAgentLibRemote, imageSourceId } from '../../agentlib/contract.mjs';
+import { imageSourceIdentity } from '../../agentlib/contract.mjs';
 import { normalizeBoxAgentLib } from '../../ploinky-box/contract/agentlib.mjs';
 
 import {
@@ -40,6 +40,7 @@ import { reconcileBoxContainer } from '../../ploinky-box/lifecycle/transactions.
 import {
     agentLibFixture,
     agentLibFixtureEnv,
+    boxImageIdFixtureEnv,
     agentLibFixtureLabels,
     agentLibFixtureMounts,
 } from '../helpers/agentlibFixture.mjs';
@@ -131,6 +132,7 @@ function containerHandle({
                 ...IMAGE_CONTRACT.environment,
                 PLOINKY_WORKSPACE_ROOT: identity.workspaceRoot,
                 ...agentLibFixtureEnv(agentLib),
+                ...boxImageIdFixtureEnv(imageId),
                 PLOINKY_PRIVATE_BIND: '0.0.0.0',
                 PLOINKY_PUBLIC_BIND: '0.0.0.0',
                 PLOINKY_PUBLIC_AUTHORITY: `127.0.0.1:${hostPort}`,
@@ -482,13 +484,10 @@ function assertNoEngineVolumeCommand(calls) {
     assert.equal(calls.some((call) => call.includes('volume')), false);
 }
 
-function imageAgentLibFixture(commit = canonicalAgentLibRemote().commit) {
-    const imageId = `sha256:${'f'.repeat(64)}`;
-    const fingerprint = 'e'.repeat(64);
+function imageAgentLibFixture(supplyingImageId = `sha256:${'f'.repeat(64)}`) {
     return normalizeBoxAgentLib({
-        sourceDir: '/opt/ploinky-agentlib', sourceRelativePath: 'image', mode: 'image', imageId,
-        fingerprint, commit,
-        sourceId: imageSourceId(imageId, fingerprint),
+        sourceDir: '/opt/ploinky-agentlib', sourceRelativePath: 'image', mode: 'image', supplyingImageId,
+        sourceId: imageSourceIdentity(supplyingImageId),
     });
 }
 
@@ -497,18 +496,23 @@ for (const imageIdPrefix of ['', 'sha256:']) {
         const state = fixture(t);
         fs.rmSync(state.agentLib.sourceDir, { recursive: true });
         state.agentLib = imageAgentLibFixture();
-        const candidateImage = state.agentLib.imageId.replace(/^sha256:/, imageIdPrefix);
+        const candidateImage = state.agentLib.supplyingImageId.replace(/^sha256:/, imageIdPrefix);
         const h = harness(state, { candidateImage });
-        h.seams.probeAgentLib = (_engine, id, _runner, options) => {
+        h.seams.probeAgentLib = (_engine, id, _runner, ...rest) => {
             assert.equal(id, candidateImage);
-            assert.equal(options.expectedCommit, state.agentLib.commit);
-            return { fingerprint: state.agentLib.fingerprint };
+            assert.deepEqual(rest, [], 'the probe takes no expected commit or fingerprint');
+            return { supplyingImageId: state.agentLib.supplyingImageId };
         };
         const result = await reconcileBoxContainer(reconciliationArguments(state, h, null), h.seams);
         assert.equal(result.action, 'created');
         const created = h.current();
         assert.equal(created.runtime.mounts.length, 4);
         assert.equal(created.runtime.environment.PLOINKY_AGENTLIB_MODE, 'image');
+        assert.equal(created.runtime.environment.PLOINKY_BOX_IMAGE_ID, state.agentLib.supplyingImageId,
+            'the outer image ID is set once at creation, in canonical form');
+        assert.equal(Object.hasOwn(created.runtime.environment, 'PLOINKY_AGENTLIB_FINGERPRINT'), false);
+        assert.equal(Object.hasOwn(created.runtime.environment, 'PLOINKY_AGENTLIB_COMMIT'), false);
+        assert.equal(Object.hasOwn(created.labels, 'io.assistos.ploinky-box.agentlib-fingerprint'), false);
         const callsBefore = h.calls.length;
         const reused = await reconcileBoxContainer(reconciliationArguments(state, h, created), h.seams);
         assert.equal(reused.action, 'reused');
@@ -522,26 +526,24 @@ for (const imageIdPrefix of ['', 'sha256:']) {
     });
 }
 
-test('X1 an image commit that differs from the lock creates the Box once and is then reused', async t => {
-    const other = '9'.repeat(40);
+test('X1 an image source creates the Box once and is then reused; no revision reaches its labels or environment', async t => {
     const state = fixture(t);
     fs.rmSync(state.agentLib.sourceDir, { recursive: true });
-    state.agentLib = imageAgentLibFixture(other);
-    const h = harness(state, { candidateImage: state.agentLib.imageId });
+    state.agentLib = imageAgentLibFixture();
+    const h = harness(state, { candidateImage: state.agentLib.supplyingImageId });
     const probed = [];
-    h.seams.probeAgentLib = (_engine, _id, _runner, options) => {
-        probed.push(options.expectedCommit);
-        return { fingerprint: state.agentLib.fingerprint };
+    h.seams.probeAgentLib = (_engine, id) => {
+        probed.push(id);
+        return { supplyingImageId: state.agentLib.supplyingImageId };
     };
     const result = await reconcileBoxContainer(reconciliationArguments(state, h, null), h.seams);
     assert.equal(result.action, 'created');
-    assert.deepEqual(probed, [other]);
+    assert.deepEqual(probed, [state.agentLib.supplyingImageId]);
     const create = h.calls.find(call => call[0] === 'run' && call[2] === 'container' && call[3] === 'create');
-    assert.ok(create.includes(`io.assistos.ploinky-box.agentlib-commit=${other}`));
-    assert.ok(create.includes(`PLOINKY_AGENTLIB_COMMIT=${other}`));
+    assert.equal(create.some(value => /agentlib-commit|PLOINKY_AGENTLIB_COMMIT|agentlib-fingerprint|PLOINKY_AGENTLIB_FINGERPRINT/.test(value)), false);
+    assert.ok(create.includes(`PLOINKY_BOX_IMAGE_ID=${state.agentLib.supplyingImageId}`));
     const created = h.current();
-    assert.equal(created.labels['io.assistos.ploinky-box.agentlib-commit'], other);
-    assert.equal(created.runtime.environment.PLOINKY_AGENTLIB_COMMIT, other);
+    assert.equal(created.runtime.environment.PLOINKY_BOX_IMAGE_ID, state.agentLib.supplyingImageId);
     const callsBefore = h.calls.length;
     const reused = await reconcileBoxContainer(reconciliationArguments(state, h, created), h.seams);
     assert.equal(reused.action, 'reused');
@@ -566,12 +568,12 @@ test('failed image-bundle replacement restores the old image without host source
     state.agentLib = imageAgentLibFixture();
     const initial = containerHandle({
         identity: state.identity, agentLib: state.agentLib, repositoryRoot: state.root,
-        imageId: state.agentLib.imageId, imageRef: BOX_IMAGE_REFERENCE, hostPort: 8080,
+        imageId: state.agentLib.supplyingImageId, imageRef: BOX_IMAGE_REFERENCE, hostPort: 8080,
         id: 'e'.repeat(64),
     });
-    const h = harness(state, { initial, candidateImage: state.agentLib.imageId, failCandidateReady: true });
+    const h = harness(state, { initial, candidateImage: state.agentLib.supplyingImageId, failCandidateReady: true });
     let probes = 0;
-    h.seams.probeAgentLib = () => { probes += 1; return { fingerprint: state.agentLib.fingerprint }; };
+    h.seams.probeAgentLib = () => { probes += 1; return { supplyingImageId: state.agentLib.supplyingImageId }; };
     await assert.rejects(reconcileBoxContainer(reconciliationArguments(state, h, initial, true), h.seams), /ready timeout/);
     assert.equal(h.current().runtime.imageId, initial.runtime.imageId);
     assert.equal(h.current().labels[BOX_LABELS.routerHostPort], '8080');
@@ -650,6 +652,9 @@ test('container argv is exact, unprivileged, and ends with immutable image ID', 
     assert.equal(args.includes(`PLOINKY_AGENTLIB_DIR=/opt/ploinky-agentlib`), true);
     assert.equal(args.includes(`PLOINKY_AGENTLIB_MODE=local`), true);
     assert.equal(args.includes(`PLOINKY_AGENTLIB_FINGERPRINT=${state.agentLib.fingerprint}`), true);
+    // The engine-observed outer image ID is set once, independent of the Achilles mode.
+    assert.equal(args.filter((value) => value.startsWith('PLOINKY_BOX_IMAGE_ID=')).length, 1);
+    assert.equal(args.includes(`PLOINKY_BOX_IMAGE_ID=sha256:${'a'.repeat(64)}`), true);
     for (const mount of mountArgs) {
         assert.equal(path.isAbsolute(mount.split(':')[0]), true);
         assert.equal(mount.includes(state.identity.instance), false);

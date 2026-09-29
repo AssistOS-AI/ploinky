@@ -1,7 +1,6 @@
 import path from 'node:path';
 
 import {
-    BOX_AGENTLIB_LABELS,
     BOX_DATA_FINGERPRINT_LABELS,
     BOX_DATA_KEYS,
     BOX_DATA_MOUNTS,
@@ -11,6 +10,7 @@ import {
     BOX_ROUTER_HEALTH_SOCKET,
     BOX_TMPFS,
     BOX_USERNS,
+    INCOMPATIBLE_BOX_GUIDANCE,
 } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 import {
@@ -30,6 +30,8 @@ import { observeContainerGpuWiring } from '../gpuGrant.mjs';
 import { nestedPodmanSeccompProfileContract } from '../seccomp.mjs';
 import {
     agentLibBoxEnv,
+    agentLibLabels,
+    boxImageIdEnv,
     expectedAgentLibMounts,
     normalizeBoxAgentLib,
 } from './agentlib.mjs';
@@ -43,8 +45,6 @@ import {
 } from './workspace-root.mjs';
 
 const BOX_OWNERSHIP_LABEL_PREFIX = 'io.assistos.ploinky-box.';
-const INCOMPATIBLE_BOX_GUIDANCE = "; back up any Box-only data, then run 'ploinky stop'"
-    + " and 'ploinky destroy' before retrying";
 export const BOX_SOURCE_MISMATCH = 'PLOINKY_BOX_SOURCE_MISMATCH';
 
 function envMap(entries) {
@@ -398,14 +398,10 @@ export function validateContainerConfiguration(containerHandle, {
         );
     }
     const agentLibContract = normalizeBoxAgentLib(agentLib);
-    if (agentLibContract.mode === 'image' && agentLibContract.imageId !== normalizeImageId(imageId)) {
-        throw publicationError('Owned Box does not match the selected AgentLib bundle image');
+    if (agentLibContract.mode === 'image' && agentLibContract.supplyingImageId !== normalizeImageId(imageId)) {
+        throw publicationError('Owned Box does not match the image that supplies the selected AgentLib');
     }
-    expectedLabels[BOX_AGENTLIB_LABELS.mode] = agentLibContract.mode;
-    expectedLabels[BOX_AGENTLIB_LABELS.sourceIdHash] = agentLibContract.sourceIdHash;
-    expectedLabels[BOX_AGENTLIB_LABELS.fingerprint] = agentLibContract.fingerprint;
-    expectedLabels[BOX_AGENTLIB_LABELS.sourceRelativePath] = agentLibContract.sourceRelativePath;
-    expectedLabels[BOX_AGENTLIB_LABELS.commit] = agentLibContract.commit;
+    Object.assign(expectedLabels, agentLibLabels(agentLibContract));
     const ownershipLabels = Object.fromEntries(Object.entries(containerHandle.labels)
         .filter(([key]) => key.startsWith(BOX_OWNERSHIP_LABEL_PREFIX))
         .sort());
@@ -417,6 +413,8 @@ export function validateContainerConfiguration(containerHandle, {
         ...IMAGE_CONTRACT.environment,
         ...boxWorkspaceEnvironment(workspaceRoot),
         ...agentLibBoxEnv(agentLibContract),
+        // The environment's outer image ID must be the image the engine runs.
+        ...boxImageIdEnv(runtime.imageId),
         PLOINKY_PUBLIC_BIND: '0.0.0.0',
         PLOINKY_PUBLIC_AUTHORITY: routerBindingPublicAuthority({
             address: publication.address,

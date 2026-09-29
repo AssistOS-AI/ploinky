@@ -123,7 +123,11 @@ test('empty or registry-only dependency inputs do not create pin/cache state', a
 test('Box SDK declarations are removed before either seed or registration Git discovery', async t => {
     const w = fixture(t);
     w.deps.readGlobalPackage = () => ({ name: 'global', dependencies: { 'mcp-sdk': 'git+https://github.com/AssistOS-AI/MCPSDK.git#main' } });
-    w.deps.readSdkBundle = () => ({ schema: 1, repository: { url: 'https://github.com/AssistOS-AI/MCPSDK.git', commit: 'a'.repeat(40) }, contentSha256: 'b'.repeat(64) });
+    w.deps.readSdkBundle = () => ({
+        sourceRoot: '/usr/local/lib/ploinky/mcp-sdk', packageName: '@modelcontextprotocol/sdk', packageVersion: '1.19.1', entry: 'index.mjs',
+        identity: { kind: 'image', library: 'mcp-sdk', supplyingImageId: `sha256:${'a'.repeat(64)}` },
+        provenance: { repository: null, branch: null, commit: null, packageVersion: null },
+    });
     const result = await w.refresh();
     assert.equal(result.queriesRun, 1, 'only the local agent dependency is queried');
     assert.equal(Object.values(w.store.readPins().pins).some(pin => pin.name === 'mcp-sdk'), false);

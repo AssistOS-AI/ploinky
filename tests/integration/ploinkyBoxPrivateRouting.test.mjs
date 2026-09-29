@@ -128,11 +128,17 @@ test('one nested rootless-Podman container reaches the unpublished private liste
         };
 
         assert.equal(evidence.outerBox.role, 'box');
+        // A local source carries its fingerprint and commit labels; an image
+        // source only its mode, identity and path (no content or revision).
+        const observedLabels = outerInspection?.Config?.Labels || {};
+        const agentLibLabelNames = observedLabels[BOX_AGENTLIB_LABELS.mode] === 'image'
+            ? [BOX_AGENTLIB_LABELS.mode, BOX_AGENTLIB_LABELS.sourceIdHash, BOX_AGENTLIB_LABELS.sourceRelativePath]
+            : Object.values(BOX_AGENTLIB_LABELS);
         assert.deepEqual(
-            Object.keys(outerInspection?.Config?.Labels || {})
+            Object.keys(observedLabels)
                 .filter((key) => key.startsWith('io.assistos.ploinky-box.'))
                 .sort(),
-            [...Object.values(BOX_LABELS), ...Object.values(BOX_AGENTLIB_LABELS)].sort(),
+            [...Object.values(BOX_LABELS), ...agentLibLabelNames].sort(),
         );
         assert.deepEqual(evidence.outerBox.exposedPorts, {
             [`${BOX_MEDIA_PORT}/udp`]: {},

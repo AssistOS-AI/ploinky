@@ -16,10 +16,10 @@ import {
 import {
     AGENTLIB_ENV,
     AGENTLIB_STABLE_MOUNT_PATH,
-    canonicalAgentLibRemote,
-    imageSourceId,
+    BOX_IMAGE_ID_ENV,
+    imageSourceIdHash,
+    imageSourceIdentity,
 } from '../../agentlib/contract.mjs';
-import { sourceIdHash } from '../../agentlib/fingerprint.mjs';
 import { normalizeImageId } from '../../ploinky-box/contract/image-id.mjs';
 import { resolveWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import {
@@ -146,10 +146,15 @@ function assertExactOuterStorage(harness, containerId, repositoryRoot) {
     );
     assert.equal(agentLibSourceRelativePath, hasLocalAgentLib ? 'achillesAgentLib' : 'image');
     const fingerprint = labels[BOX_AGENTLIB_LABELS.fingerprint];
-    assert.match(fingerprint, /^[a-f0-9]{64}$/);
     assert.match(labels[BOX_AGENTLIB_LABELS.sourceIdHash], /^[a-f0-9]{64}$/);
     const expectedAgentLibMounts = [];
+    // The engine-observed outer image ID identifies the libraries the image
+    // supplies in both Achilles modes and is inherited by every process in the Box.
+    const outerImageId = normalizeImageId(record.Image);
+    assert.deepEqual(record.Config.Env.filter((entry) => entry.startsWith(`${BOX_IMAGE_ID_ENV}=`)),
+        [`${BOX_IMAGE_ID_ENV}=${outerImageId}`]);
     if (hasLocalAgentLib) {
+        assert.match(fingerprint, /^[a-f0-9]{64}$/);
         const source = fs.realpathSync(localAgentLib);
         assert.equal(source, localAgentLib, 'the fixture selects one real workspace-local AgentLib directory');
         expectedAgentLibMounts.push(
@@ -157,9 +162,12 @@ function assertExactOuterStorage(harness, containerId, repositoryRoot) {
             { type: 'bind', source, destination: localAgentLib, rw: false },
         );
     } else {
-        assert.equal(labels[BOX_AGENTLIB_LABELS.commit], canonicalAgentLibRemote().commit);
+        // An image source is identified by the supplying outer image and carries
+        // no content fingerprint or commit label.
+        assert.equal(fingerprint, undefined);
+        assert.equal(labels[BOX_AGENTLIB_LABELS.commit], undefined);
         assert.equal(labels[BOX_AGENTLIB_LABELS.sourceIdHash],
-            sourceIdHash(imageSourceId(normalizeImageId(record.Image), fingerprint)));
+            imageSourceIdHash(imageSourceIdentity(outerImageId)));
         // Image selection never materializes managed AgentLib sources; graph
         // admission only records the selected image in `active.json`.
         const managedRoot = path.join(workspaceRoot, '.ploinky', 'agentlib');
@@ -173,11 +181,18 @@ function assertExactOuterStorage(harness, containerId, repositoryRoot) {
     for (const [name, value] of Object.entries({
         [AGENTLIB_ENV.dir]: AGENTLIB_STABLE_MOUNT_PATH,
         [AGENTLIB_ENV.mode]: hasLocalAgentLib ? 'local' : 'image',
-        [AGENTLIB_ENV.fingerprint]: fingerprint,
-        [AGENTLIB_ENV.commit]: labels[BOX_AGENTLIB_LABELS.commit],
+        ...(hasLocalAgentLib ? {
+            [AGENTLIB_ENV.fingerprint]: fingerprint,
+            [AGENTLIB_ENV.commit]: labels[BOX_AGENTLIB_LABELS.commit],
+        } : {}),
         [AGENTLIB_ENV.sourceId]: labels[BOX_AGENTLIB_LABELS.sourceIdHash],
     })) {
         assert.deepEqual(record.Config.Env.filter((entry) => entry.startsWith(`${name}=`)), [`${name}=${value}`]);
+    }
+    if (!hasLocalAgentLib) {
+        for (const name of [AGENTLIB_ENV.fingerprint, AGENTLIB_ENV.commit]) {
+            assert.deepEqual(record.Config.Env.filter((entry) => entry.startsWith(`${name}=`)), []);
+        }
     }
     // The selected workspace is its own Box path: bind destination, working
     // directory, reserved environment, and physical shell cwd all agree.
@@ -590,12 +605,16 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
         ].join(''),
     ]);
     assert.equal(protectedLibraryWrite.ok, true, protectedLibraryWrite.stderr);
-    const verifiedBundle = JSON.parse(execInBox(harness.runner, prepared.containerId, [
-        'node', '/opt/ploinky/agentlib/image-bundle.mjs', 'verify',
-        '--expected-commit', canonicalAgentLibRemote().commit,
+    // The image's own probe confirms a usable package; no revision or content
+    // digest is compared, and the supplying image is the Box image itself.
+    const inspectedLibrary = JSON.parse(execInBox(harness.runner, prepared.containerId, [
+        'node', '/usr/local/share/ploinky/smoke-libraries.mjs', 'inspect', 'achillesAgentLib',
     ]));
-    assert.equal(verifiedBundle.fingerprint,
-        boxInspection(harness, prepared.containerId).Config.Labels[BOX_AGENTLIB_LABELS.fingerprint]);
+    assert.equal(inspectedLibrary.packageName, 'ploinky-agent-lib');
+    assert.equal(Object.hasOwn(inspectedLibrary, 'fingerprint'), false);
+    assert.equal(execInBox(harness.runner, prepared.containerId, ['printenv', BOX_IMAGE_ID_ENV]),
+        normalizeImageId(boxInspection(harness, prepared.containerId).Image),
+        'every exec inherits the outer image ID set when the Box was created');
     const innerInfo = JSON.parse(execInBox(harness.runner, prepared.containerId, [
         'podman', 'info', '--format', 'json',
     ]));

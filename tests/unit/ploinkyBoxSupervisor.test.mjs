@@ -19,9 +19,11 @@ import {
     runBoundedCoreStart,
 } from '../../ploinky-box/supervisor.mjs';
 import {
+    OUTER_IMAGE_ID_FIXTURE,
     agentLibFixture,
     agentLibFixtureLabels,
     agentLibFixtureMounts,
+    imageAgentLibFixture,
 } from '../helpers/agentlibFixture.mjs';
 import { fakeRestartCore, fakeUpdateCore } from '../helpers/fakeUpdateCore.mjs';
 
@@ -1097,7 +1099,7 @@ test('a failed replacement restores and health-checks the prior Box graph before
         runner: {
             run(_command, args) { events.push(`run:${args.join(' ')}`); },
         },
-        selectAgentLib: async () => ({ selection: candidateAgentLib, mode: 'managed' }),
+        selectAgentLib: async () => ({ selection: candidateAgentLib, mode: 'local' }),
         captureCoreStartArgv: () => Object.freeze(['start', 'explorer', '8080']),
         reconcile: async () => ({
             action: 'replaced',
@@ -1192,6 +1194,35 @@ test('bounded start requires the external Router URL and preserves normalized ar
     assert.equal(calls[0][2].stdout, output);
     assert.equal(calls[0][2].stderr, output);
     assert.equal(output.value.match(/Debug mode enabled/g)?.length, 1);
+
+    // An image source carries neither a fingerprint nor a commit. The outer image
+    // ID is deliberately NOT injected per exec: every exec inherits the value set
+    // when the Box was created, which the container validation checked against the
+    // observed image.
+    const imageAgentLib = imageAgentLibFixture();
+    const imageCalls = [];
+    await runBoundedCoreStart(
+        { name: 'podman' }, 'a'.repeat(64), ['start', 'Agent', '8080'], 19090, 17891,
+        {
+            async stream(command, args, options) {
+                imageCalls.push([command, args, options]);
+                options.stdout.write('[start] Router: http://127.0.0.1:19090\n');
+                return { ok: true, status: 0, stdout: '[start] Router: http://127.0.0.1:19090\n', stderr: '' };
+            },
+        },
+        { workspaceRoot: boundedRoot, stdout: output, stderr: output, timeoutMs: 1000, hostReachableIpv4: '192.168.1.12', agentLib: imageAgentLib },
+    );
+    const imageArgs = imageCalls[0][1];
+    const imageEnv = imageArgs.flatMap((value, index) => (value === '--env' ? [imageArgs[index + 1]] : []));
+    assert.deepEqual(imageEnv, [
+        'PLOINKY_ROUTER_HOST_PORT=19090',
+        'PLOINKY_MEDIA_HOST_PORT=17891',
+        'PLOINKY_HOST_REACHABLE_IPV4=192.168.1.12',
+        'PLOINKY_AGENTLIB_DIR=/opt/ploinky-agentlib',
+        'PLOINKY_AGENTLIB_MODE=image',
+        `PLOINKY_AGENTLIB_SOURCE_ID=${imageAgentLib.sourceIdHash}`,
+    ]);
+    assert.equal(imageArgs.some((value) => value.includes(OUTER_IMAGE_ID_FIXTURE) || value.includes('BOX_IMAGE_ID')), false);
 
     const defaultTimeoutCalls = [];
     await runBoundedCoreStart(

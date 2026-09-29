@@ -16,9 +16,13 @@ import {
     AGENTLIB_PACKAGE_NAME,
     AGENTLIB_ENV,
     AGENTLIB_ERROR_CODES,
+    AGENTLIB_REPOSITORY_URL,
     AGENTLIB_STABLE_MOUNT_PATH,
+    BOX_IMAGE_ID_ENV,
     agentLibError,
-    canonicalAgentLibRemote,
+    assertSupplyingImageId,
+    imageSourceIdHash,
+    imageSourceIdentity,
 } from '../../../agentlib/contract.mjs';
 import { parseRuntimeKey, SUPPORTED_FAMILIES } from './dependencyRuntimeKey.js';
 import { agentLibPackagePaths } from './agentLibPackages.mjs';
@@ -34,8 +38,12 @@ export const AGENTLIB_CACHE_LINK_NAMES = Object.freeze([AGENTLIB_CACHE_LINK_NAME
  * never rediscovered from the ambient working directory: cache preparation must
  * not be able to pick a different source than the core loaded.
  *
+ * A local selection carries its content fingerprint and Git commit. An image
+ * selection carries the outer Box image ID that supplies it, which every
+ * process in the Box inherits from the host's container creation.
+ *
  * @param {NodeJS.ProcessEnv} [env]
- * @returns {{ sourceDir: string, mode: string, fingerprint: string, commit: string, sourceIdHash: string }}
+ * @returns {{ sourceDir: string, mode: string, sourceIdHash: string, fingerprint?: string, commit?: string, supplyingImageId?: string }}
  */
 export function activeAgentLibSelection(env = process.env) {
     const sourceDir = String(env?.[AGENTLIB_ENV.dir] || '').trim();
@@ -46,12 +54,24 @@ export function activeAgentLibSelection(env = process.env) {
             + 'achillesAgentLib source to link. Start this workspace through `ploinky` or `ploinky-local`.',
         );
     }
+    const mode = String(env[AGENTLIB_ENV.mode] || '');
+    const sourceIdHash = String(env[AGENTLIB_ENV.sourceId] || '');
+    if (mode === 'image') {
+        const supplyingImageId = assertSupplyingImageId(env[BOX_IMAGE_ID_ENV], `${BOX_IMAGE_ID_ENV} value`);
+        if (sourceIdHash !== imageSourceIdHash(imageSourceIdentity(supplyingImageId))) {
+            throw agentLibError(
+                AGENTLIB_ERROR_CODES.contractMissing,
+                'The image AgentLib source identity does not match the Box image that supplies it.',
+            );
+        }
+        return { sourceDir, mode, sourceIdHash, supplyingImageId };
+    }
     return {
         sourceDir,
-        mode: String(env[AGENTLIB_ENV.mode] || ''),
+        mode,
         fingerprint: String(env[AGENTLIB_ENV.fingerprint] || ''),
         commit: String(env[AGENTLIB_ENV.commit] || ''),
-        sourceIdHash: String(env[AGENTLIB_ENV.sourceId] || ''),
+        sourceIdHash,
     };
 }
 
@@ -208,7 +228,7 @@ function githubRepository(spec) {
 function isAgentLibReference(spec) {
     if (/^npm:(?:achillesAgentLib|ploinky-agent-lib)(?:@|$)/.test(String(spec))) return true;
     const repository = githubRepository(spec);
-    return repository !== null && repository === githubRepository(canonicalAgentLibRemote().url);
+    return repository !== null && repository === githubRepository(AGENTLIB_REPOSITORY_URL);
 }
 
 function assertNoAgentLibOverrides(overrides, source) {

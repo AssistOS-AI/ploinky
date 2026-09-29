@@ -2,19 +2,29 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
 import { isInsideBox } from '../lib/boxMarker.mjs';
+import { BOX_IMAGE_ID_ENV } from '../../agentlib/contract.mjs';
 import {
     MCP_SDK_BUNDLE_PATH,
-    readMcpSdkRepositoryFromLock,
-    validateMcpSdkBundle,
+    MCP_SDK_REPOSITORY_URL,
+    assertMcpSdkTree,
+    mcpSdkIdentity,
+    readMcpSdkPackage,
+    readMcpSdkProvenance,
 } from '../mcp-sdk-bundle.mjs';
 
 const SDK_NAME = 'mcp-sdk';
-const LOCK_PATH = fileURLToPath(new URL('../dependencies.lock.json', import.meta.url));
 const DEPENDENCY_FIELDS = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'];
 const INSTALL_SCRIPTS = ['preinstall', 'install', 'postinstall', 'prepublish', 'preprepare', 'prepare', 'postprepare'];
 const PROVIDED_PACKAGES_DIR = '.ploinky-provided';
+
+/**
+ * Runtime-owned completion record of a prepared cache: which supplied library
+ * copies it holds, written only after a copy was staged and validated. It sits
+ * at the cache root, outside the package the image produced.
+ */
+export const PROVIDED_LIBRARIES_RECORD_NAME = '.ploinky-provided-libraries.json';
+export const PROVIDED_LIBRARIES_SCHEMA = 'ploinky.provided-libraries/v1';
 
 function sdkError(message) {
     const error = new Error(message);
@@ -22,16 +32,24 @@ function sdkError(message) {
     return error;
 }
 
-/** Only the immutable image bundle supplies the SDK inside a Box. */
+/**
+ * Only the Box image supplies the SDK inside a Box. It is identified by the
+ * outer Box image ID every process in the Box inherits; the package is checked,
+ * never hashed, and no revision is compared.
+ */
 export function activeBoxMcpSdkBundle({
     insideBox = isInsideBox(),
     sourceRoot = MCP_SDK_BUNDLE_PATH,
-    lockPath = LOCK_PATH,
+    env = process.env,
+    fsApi = fs,
 } = {}) {
     if (!insideBox) return null;
-    return validateMcpSdkBundle({
-        sourceRoot,
-        expectedRepository: readMcpSdkRepositoryFromLock({ lockPath }),
+    const identity = mcpSdkIdentity(env?.[BOX_IMAGE_ID_ENV]);
+    const pkg = readMcpSdkPackage({ sourceRoot, fsApi });
+    return Object.freeze({
+        ...pkg,
+        identity,
+        provenance: readMcpSdkProvenance({ sourceRoot, fsApi }),
     });
 }
 
@@ -53,39 +71,35 @@ function githubDependency(spec) {
     }
 }
 
-function isSdkReference(spec, bundle) {
+const SDK_REPOSITORY = githubDependency(MCP_SDK_REPOSITORY_URL)?.repository;
+
+// A spec that would make the `mcp-sdk` import resolve to another source: the
+// MCPSDK repository itself or an `npm:mcp-sdk` alias. The upstream registry
+// package `@modelcontextprotocol/sdk` is a different package and is unaffected.
+function isSdkReference(spec) {
     const declared = githubDependency(spec);
-    return (declared && declared.repository === githubDependency(bundle.repository.url)?.repository)
+    return (declared && declared.repository === SDK_REPOSITORY)
         || /^npm:mcp-sdk(?:@|$)/.test(String(spec));
 }
 
-function assertCompatibleSdkDeclaration(spec, bundle, source, field) {
-    const declared = githubDependency(spec);
-    const selected = githubDependency(bundle.repository.url);
-    // #main is the historical global/agent declaration. It now selects the
-    // image's locked revision, never a fresh moving Git checkout.
-    if (!declared || declared.repository !== selected?.repository
-        || !['main', bundle.repository.commit].includes(declared.ref)) {
-        throw sdkError(`${source} overrides '${SDK_NAME}' in ${field}; the Box image supplies its locked MCP SDK. Remove the conflicting entry.`);
-    }
-}
-
-function assertNoSdkOverrides(overrides, bundle, source) {
+function assertNoSdkOverrides(overrides, source) {
     if (!overrides || typeof overrides !== 'object') return;
     for (const [name, value] of Object.entries(overrides)) {
         if (/^mcp-sdk(?:@|$)/.test(name)
             || value === '$mcp-sdk'
-            || (typeof value === 'string' && isSdkReference(value, bundle))) {
+            || (typeof value === 'string' && isSdkReference(value))) {
             throw sdkError(`${source} overrides the Box-provided '${SDK_NAME}'; remove the override.`);
         }
-        assertNoSdkOverrides(value, bundle, source);
+        assertNoSdkOverrides(value, source);
     }
 }
 
 /**
- * The npm input excludes the Box-provided package. Validate the unmerged
- * agent manifest too: dev/optional/peer declarations or aliases must not
- * silently shadow the one SDK selected by the Box image.
+ * The npm input excludes the Box-provided package. A direct `mcp-sdk`
+ * declaration is removed whatever ref it names: the package name selects the
+ * image's copy, and no competing SDK is fetched. Validate the unmerged agent
+ * manifest too: dev/optional/peer declarations, aliases and overrides must not
+ * silently shadow the one SDK the Box image supplies.
  */
 export function withoutBoxMcpSdk(pkg, {
     bundle = activeBoxMcpSdkBundle(),
@@ -98,15 +112,14 @@ export function withoutBoxMcpSdk(pkg, {
         const dependencies = { ...pkg[field] };
         for (const [name, spec] of Object.entries(dependencies)) {
             if (name === SDK_NAME) {
-                assertCompatibleSdkDeclaration(spec, bundle, source, field);
                 delete dependencies[name];
-            } else if (isSdkReference(spec, bundle)) {
+            } else if (isSdkReference(spec)) {
                 throw sdkError(`${source} aliases the Box-provided '${SDK_NAME}' as '${name}' in ${field}; remove the duplicate dependency.`);
             }
         }
         normalized[field] = dependencies;
     }
-    assertNoSdkOverrides(pkg.overrides, bundle, source);
+    assertNoSdkOverrides(pkg.overrides, source);
     for (const field of ['bundledDependencies', 'bundleDependencies']) {
         if (Array.isArray(pkg[field]) && pkg[field].includes(SDK_NAME)) {
             normalized[field] = pkg[field].filter((name) => name !== SDK_NAME);
@@ -124,56 +137,120 @@ export function needsNpmInstall(pkg) {
         || INSTALL_SCRIPTS.some((name) => typeof pkg?.scripts?.[name] === 'string');
 }
 
+/** The SDK provider identity of a dependency plan: the supplying image and the library. */
 export function boxMcpSdkStampSection(bundle) {
     if (!bundle) return null;
+    return { ...bundle.identity };
+}
+
+function completionRecordFor(bundle) {
+    return { schema: PROVIDED_LIBRARIES_SCHEMA, providedLibraries: { [SDK_NAME]: { ...bundle.identity } } };
+}
+
+function readCompletionRecord(cachePath) {
+    const file = path.join(cachePath, PROVIDED_LIBRARIES_RECORD_NAME);
+    try {
+        const stat = fs.lstatSync(file);
+        if (stat.isSymbolicLink() || !stat.isFile()) return null;
+        return JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Carry a seed's completion record next to the SDK copy that was copied with
+ * it. The record is a claim, not proof: admission still requires it to name the
+ * supplying image the contract names, and the copy to be a usable package.
+ */
+export function carryBoxMcpSdkRecord(fromCacheRoot, toCacheRoot) {
+    const source = path.join(fromCacheRoot, PROVIDED_LIBRARIES_RECORD_NAME);
+    try {
+        const stat = fs.lstatSync(source);
+        if (stat.isSymbolicLink() || !stat.isFile()) return false;
+        fs.copyFileSync(source, path.join(toCacheRoot, PROVIDED_LIBRARIES_RECORD_NAME));
+        return true;
+    } catch (error) {
+        if (error?.code === 'ENOENT') return false;
+        throw error;
+    }
+}
+
+function sameCompletion(actual, bundle) {
+    return JSON.stringify(canonicalRecord(actual)) === JSON.stringify(canonicalRecord(completionRecordFor(bundle)));
+}
+
+function canonicalRecord(record) {
+    if (!record || typeof record !== 'object') return null;
+    const sdk = record.providedLibraries?.[SDK_NAME];
     return {
-        schema: bundle.schema,
-        repository: { ...bundle.repository },
-        contentSha256: bundle.contentSha256,
+        schema: record.schema,
+        providedLibraries: { [SDK_NAME]: sdk && typeof sdk === 'object'
+            ? { kind: sdk.kind, library: sdk.library, supplyingImageId: sdk.supplyingImageId }
+            : null },
     };
 }
 
-function sameSdkIdentity(actual, expected) {
-    return actual?.schema === expected.schema
-        && actual?.repository?.url === expected.repository.url
-        && actual?.repository?.commit === expected.repository.commit
-        && actual?.contentSha256 === expected.contentSha256;
-}
-
-/** Read-only admission checks validate bytes, not just a marker directory. */
-export function boxMcpSdkCacheProblem(cachePath, stamp, bundle) {
+/**
+ * Read-only admission check of a prepared cache: its completion record names
+ * this supplying image, and the copy is a usable package with a plain file
+ * tree (no symlinks, Git metadata, hard links or special files). The record
+ * proves a copy finished; it is not a digest and no bytes are compared.
+ */
+export function boxMcpSdkCacheProblem(cachePath, bundle) {
     if (!bundle) return '';
-    if (!sameSdkIdentity(stamp?.mcpSdk, bundle)) return 'Box MCP SDK stamp identity is missing or changed';
+    if (!sameCompletion(readCompletionRecord(cachePath), bundle)) {
+        return 'Box MCP SDK completion record is missing or names another supplying image';
+    }
     try {
-        const installed = validateMcpSdkBundle({
-            sourceRoot: path.join(cachePath, 'node_modules', SDK_NAME),
-            expectedRepository: bundle.repository,
-        });
-        if (!sameSdkIdentity(installed, bundle)) return 'Box MCP SDK cache does not match the image bundle';
+        const installed = path.join(cachePath, 'node_modules', SDK_NAME);
+        readMcpSdkPackage({ sourceRoot: installed });
+        assertMcpSdkTree(installed);
     } catch (error) {
         return `Box MCP SDK cache is invalid: ${error.message}`;
     }
     return '';
 }
 
-/** Restore the image package after npm has pruned unlisted node_modules. */
+function writeCompletionRecord(cachePath, bundle) {
+    const file = path.join(cachePath, PROVIDED_LIBRARIES_RECORD_NAME);
+    const staging = `${file}.${crypto.randomUUID()}.tmp`;
+    try {
+        fs.writeFileSync(staging, `${JSON.stringify(completionRecordFor(bundle))}\n`, { flag: 'wx', mode: 0o644 });
+        fs.renameSync(staging, file);
+    } finally {
+        fs.rmSync(staging, { force: true });
+    }
+}
+
+/**
+ * Restore the image package after npm has pruned unlisted node_modules. A copy
+ * is fresh when its completion record names this supplying image; anything else
+ * is recopied through owned staging, and the record is written last.
+ */
 export function finalizeBoxMcpSdkCache(cachePath, bundle) {
     if (!bundle) return;
-    const source = validateMcpSdkBundle({
-        sourceRoot: bundle.sourceRoot,
-        expectedRepository: bundle.repository,
-    });
-    if (!sameSdkIdentity(source, bundle)) throw sdkError('The MCP SDK image bundle changed during cache preparation');
-    const expectedStamp = { mcpSdk: boxMcpSdkStampSection(bundle) };
-    if (!boxMcpSdkCacheProblem(cachePath, expectedStamp, bundle)) return;
+    let source;
+    try {
+        source = readMcpSdkPackage({ sourceRoot: bundle.sourceRoot });
+    } catch (error) {
+        throw sdkError(`The MCP SDK supplied by the Box image is unusable: ${error.message}`);
+    }
+    if (!boxMcpSdkCacheProblem(cachePath, bundle)) return;
 
     const destination = path.join(cachePath, 'node_modules', SDK_NAME);
+    const recordPath = path.join(cachePath, PROVIDED_LIBRARIES_RECORD_NAME);
     fs.mkdirSync(path.dirname(destination), { recursive: true });
-    const staging = `${destination}.${crypto.randomUUID()}.tmp`;
+    const token = crypto.randomUUID();
+    const staging = `${destination}.${token}.tmp`;
+    const backup = `${destination}.${token}.bak`;
+    let backedUp = false;
+    let priorRecord = null;
+    let swapped = false;
     try {
         // GNU cp preserves readable copies on macOS Podman bind mounts, where
         // fs.cpSync is not reliable. The writable cache remains mounted read-
-        // only by agents; the immutable source bundle is never changed.
+        // only by agents; the immutable source package is never changed.
         for (const [command, args] of [
             ['cp', ['-a', source.sourceRoot, staging]],
             ['chmod', ['-R', 'u+w', staging]],
@@ -183,15 +260,46 @@ export function finalizeBoxMcpSdkCache(cachePath, bundle) {
                 throw sdkError(`MCP SDK cache ${command} failed (${result.status ?? result.error?.code ?? 'unknown'})`);
             }
         }
-        const copied = validateMcpSdkBundle({ sourceRoot: staging, expectedRepository: bundle.repository });
-        if (!sameSdkIdentity(copied, bundle)) throw sdkError('Copied MCP SDK does not match the immutable image bundle');
-        fs.rmSync(destination, { recursive: true, force: true });
+        try {
+            readMcpSdkPackage({ sourceRoot: staging });
+            assertMcpSdkTree(staging);
+        } catch (error) {
+            throw sdkError(`Copied MCP SDK is not a usable package: ${error.message}`);
+        }
+        // The prior state stays available until the new copy is complete. A
+        // copy in progress must never read as complete, so the record goes
+        // first, and it is written back only after the swap succeeded.
+        try { priorRecord = fs.readFileSync(recordPath); } catch { priorRecord = null; }
+        if (fs.existsSync(destination) || isLink(destination)) {
+            fs.renameSync(destination, backup);
+            backedUp = true;
+        }
+        fs.rmSync(recordPath, { force: true });
         fs.renameSync(staging, destination);
-        const problem = boxMcpSdkCacheProblem(cachePath, expectedStamp, bundle);
+        swapped = true;
+        writeCompletionRecord(cachePath, bundle);
+        const problem = boxMcpSdkCacheProblem(cachePath, bundle);
         if (problem) throw sdkError(problem);
+    } catch (error) {
+        // Bounded rollback: put back the previous copy and its record.
+        if (swapped || backedUp) {
+            try {
+                if (swapped) fs.rmSync(destination, { recursive: true, force: true });
+                if (backedUp) fs.renameSync(backup, destination);
+                backedUp = false;
+                if (priorRecord !== null) fs.writeFileSync(recordPath, priorRecord);
+                else fs.rmSync(recordPath, { force: true });
+            } catch { /* the next call sees a miss and recopies */ }
+        }
+        throw error;
     } finally {
         fs.rmSync(staging, { recursive: true, force: true });
+        if (backedUp) fs.rmSync(backup, { recursive: true, force: true });
     }
+}
+
+function isLink(target) {
+    try { return fs.lstatSync(target).isSymbolicLink(); } catch { return false; }
 }
 
 /**
@@ -217,10 +325,17 @@ export function installWithBoxMcpSdk(cachePath, pkg, bundle, install) {
         finalizeBoxMcpSdkCache(providedRoot, bundle);
         fs.writeFileSync(packagePath, JSON.stringify(localPackage, null, 2));
         install(cachePath, { linkBoxMcpSdk: true });
-        const provided = validateMcpSdkBundle({ sourceRoot: providedSdk, expectedRepository: bundle.repository });
-        if (!sameSdkIdentity(provided, bundle)) throw sdkError('npm changed the provided MCP SDK image copy');
+        try {
+            readMcpSdkPackage({ sourceRoot: providedSdk });
+        } catch (error) {
+            throw sdkError(`npm removed or damaged the provided MCP SDK copy: ${error.message}`);
+        }
         // Runtime caches must be self-contained; no link to a temporary npm
-        // input may survive outside their mounted node_modules directory.
+        // input may survive outside their mounted node_modules directory. This
+        // preparation wrote no completion record at the cache root, so one found
+        // there came from npm or a lifecycle script: it never lets the copy that
+        // is published skip the fresh copy from the image.
+        fs.rmSync(path.join(cachePath, PROVIDED_LIBRARIES_RECORD_NAME), { force: true });
         finalizeBoxMcpSdkCache(cachePath, bundle);
         assertNoProvidedSdkLinks(path.join(cachePath, 'node_modules'), providedRoot);
     } finally {

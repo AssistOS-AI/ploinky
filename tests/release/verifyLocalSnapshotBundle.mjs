@@ -112,11 +112,9 @@ export function verifyLocalSnapshotBundle(manifest, {
     const validated = validateReleaseManifest(manifest.release);
     validateRootPackageInstaller({
         rootPackage: readJson(paths.rootPackage, { label: 'root package' }),
-        rootPackagePath: paths.rootPackage, dependencyLockPath: paths.dependencyLock,
     });
     validateAgentlibDeliveryMetadata({
         globalPackage: readJson(paths.globalPackage, { label: 'globalDeps package' }),
-        dependencyLock: readJson(paths.dependencyLock, { label: 'Box dependency lock' }),
         expectedCommit: validated.commits.achillesAgentLib,
     });
     const repositories = {};

@@ -204,9 +204,16 @@ test('native Box, WebTTY, and nested Podman preserve the literal host workspace 
         ]), 'AGENTLIB_READ_ONLY_OK');
     } else {
         assert.equal(record.Mounts.some((mount) => mount.Destination === AGENTLIB_STABLE_MOUNT_PATH), false);
-        assert.match(record.Config.Labels[BOX_AGENTLIB_LABELS.commit], /^[a-f0-9]{40}$/);
-        assert.match(record.Config.Labels[BOX_AGENTLIB_LABELS.fingerprint], /^[a-f0-9]{64}$/);
+        // An image source has no content fingerprint or commit label; the outer
+        // image ID every process in the Box inherits identifies it.
+        assert.equal(record.Config.Labels[BOX_AGENTLIB_LABELS.commit], undefined);
+        assert.equal(record.Config.Labels[BOX_AGENTLIB_LABELS.fingerprint], undefined);
+        assert.match(record.Config.Labels[BOX_AGENTLIB_LABELS.sourceIdHash], /^[a-f0-9]{64}$/);
     }
+    assert.equal(
+        execInBox(harness.runner, containerId, ['printenv', 'PLOINKY_BOX_IMAGE_ID']),
+        `sha256:${String(record.Image).replace(/^sha256:/, '')}`,
+    );
 
     const probeImage = String(process.env.PLOINKY_BOX_NESTED_PROBE_IMAGE || 'docker.io/library/alpine:latest');
     execInBox(harness.runner, containerId, ['podman', 'pull', probeImage], { timeoutMs: 600_000 });

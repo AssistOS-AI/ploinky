@@ -16,7 +16,6 @@ const repoRoot = path.resolve(here, '../..');
 const contract = await import(path.join(repoRoot, 'agentlib/contract.mjs'));
 const fingerprintMod = await import(path.join(repoRoot, 'agentlib/fingerprint.mjs'));
 const source = await import(path.join(repoRoot, 'agentlib/source.mjs'));
-const materialize = await import(path.join(repoRoot, 'agentlib/materialize.mjs'));
 const runtime = await import(path.join(repoRoot, 'agentlib/runtime.mjs'));
 const branchPolicy = await import(path.join(repoRoot, 'agentlib/branchPolicy.mjs'));
 
@@ -50,6 +49,8 @@ function writeAgentLibTree(dir, { name = contract.AGENTLIB_PACKAGE_NAME, marker 
     }, null, 2));
     fs.writeFileSync(path.join(dir, 'index.mjs'), `export const marker = ${JSON.stringify(marker)};\n`);
     fs.writeFileSync(path.join(dir, 'LLMAgents/index.mjs'), `export const marker = ${JSON.stringify(marker)};\n`);
+    fs.writeFileSync(path.join(dir, 'LLMAgents/openAiAgenticResponder.mjs'),
+        'export function isOptOutModel() { return false; }\nexport function runOpenAiAgenticResponse() { return {}; }\n');
     fs.writeFileSync(path.join(dir, 'utils/LLMClient.mjs'), 'export function getPrioritizedModels() { return []; }\n');
     fs.writeFileSync(path.join(dir, 'jwt/jwtSign.mjs'), 'export function signHmacJwt() { return ""; }\n');
     fs.writeFileSync(path.join(dir, 'jwt/jwtVerify.mjs'), 'export function verifyJws() { return null; }\n');
@@ -86,7 +87,7 @@ test('local candidate wins without invoking any Git or network seam', () => {
     assert.deepEqual(gitCalls, ['git']);
 });
 
-test('absent local candidate requires the image bundle without host materialization', () => {
+test('absent local candidate requires the image-supplied library without host materialization', () => {
     const workspace = makeWorkspace();
     const result = source.selectAgentLibSource({ workspaceRoot: workspace });
     assert.equal(result.requiresMaterialization, false);
@@ -126,7 +127,7 @@ test('explicit PLOINKY_WORKSPACE_ROOT wins over ancestor discovery', () => {
 
 // --- fail-closed validation -----------------------------------------------
 
-test('present but invalid local checkout is a hard error, never a managed fallback', () => {
+test('present but invalid local checkout is a hard error, never an image fallback', () => {
     const workspace = makeWorkspace();
     const dir = source.localCandidatePath(workspace);
     fs.mkdirSync(dir, { recursive: true });
@@ -234,7 +235,7 @@ test('drift detection compares content, not the commit', () => {
 test('descriptors round-trip and reject a foreign workspace', () => {
     const workspace = makeWorkspace();
     const dir = localCheckout(workspace);
-    const selection = source.buildSelection({ workspaceRoot: workspace, sourceDir: dir, mode: 'local' });
+    const selection = source.buildSelection({ workspaceRoot: workspace, sourceDir: dir });
     source.writeActiveDescriptor(workspace, selection);
     const read = source.readActiveDescriptor(workspace);
     assert.equal(read.contentFingerprint, selection.contentFingerprint);
@@ -283,213 +284,6 @@ test('descriptor schema validation rejects escaping relative paths and bad diges
     assert.throws(() => contract.validateSelectionDescriptor({ ...base, contentFingerprint: 'nope' }));
     assert.throws(() => contract.validateSelectionDescriptor({ ...base, mode: 'managed' }));
     assert.throws(() => contract.validateSelectionDescriptor({ ...base, schemaVersion: 2 }));
-});
-
-// --- managed materialization ----------------------------------------------
-
-/**
- * A Git stub that materializes the fixture tree instead of talking to a remote,
- * and records every invocation so "no network" can be asserted directly.
- */
-function stubGit({ commits, calls }) {
-    return {
-        run(args, { cwd } = {}) {
-            calls.push(args.join(' '));
-            const [command] = args;
-            if (command === 'ls-remote') {
-                const ref = args[2];
-                const commit = commits.refs?.[ref];
-                return { status: 0, stdout: commit ? `${commit}\trefs/heads/${ref}\n` : '', stderr: '' };
-            }
-            if (command === 'clone' && args.includes('--mirror')) {
-                fs.mkdirSync(args[args.length - 1], { recursive: true });
-                fs.writeFileSync(path.join(args[args.length - 1], 'HEAD'), 'ref: refs/heads/main\n');
-                return { status: 0, stdout: '', stderr: '' };
-            }
-            if (command === 'config') return { status: 0, stdout: `${commits.url}\n`, stderr: '' };
-            if (command === 'cat-file') {
-                const commit = String(args[2]).replace('^{commit}', '');
-                return { status: commits.known.has(commit) ? 0 : 1, stdout: '', stderr: '' };
-            }
-            if (command === 'fetch') {
-                for (const c of commits.fetchable) commits.known.add(c);
-                return { status: 0, stdout: '', stderr: '' };
-            }
-            if (command === 'clone') {
-                const target = args[args.length - 1];
-                fs.mkdirSync(target, { recursive: true });
-                return { status: 0, stdout: '', stderr: '' };
-            }
-            if (command === 'checkout') {
-                writeAgentLibTree(cwd, { marker: args[args.length - 1].slice(0, 7) });
-                return { status: 0, stdout: '', stderr: '' };
-            }
-            if (command === 'rev-parse') {
-                const generationCommit = path.basename(cwd || '').slice(0, 40);
-                return { status: 0, stdout: `${generationCommit}\n`, stderr: '' };
-            }
-            if (command === 'status') return { status: 0, stdout: '', stderr: '' };
-            return { status: 0, stdout: '', stderr: '' };
-        },
-    };
-}
-
-const LOCK_COMMIT = 'a'.repeat(40);
-const BRANCH_COMMIT = 'b'.repeat(40);
-const REMOTE = { url: 'https://example.invalid/AchillesAgentLib.git', commit: LOCK_COMMIT };
-
-function gitFixture(extra = {}) {
-    return {
-        url: REMOTE.url,
-        refs: { 'feature-x': BRANCH_COMMIT },
-        known: new Set(),
-        fetchable: [LOCK_COMMIT, BRANCH_COMMIT],
-        ...extra,
-    };
-}
-
-test('managed first start materializes exactly one generation at the lock commit', () => {
-    const workspace = makeWorkspace();
-    const calls = [];
-    const { selection, viaNetwork } = materialize.selectManagedSource({
-        workspaceRoot: workspace,
-        remote: REMOTE,
-        runner: stubGit({ commits: gitFixture(), calls }),
-    });
-    assert.equal(selection.mode, 'managed');
-    assert.equal(selection.resolvedCommit, LOCK_COMMIT);
-    assert.equal(viaNetwork, false, 'the lock commit is immutable; no ref lookup is needed');
-    assert.ok(selection.sourceRelativePath.startsWith('.ploinky/agentlib/generations/'));
-    assert.equal(fs.readdirSync(source.managedGenerationsDir(workspace)).length, 1);
-});
-
-test('managed offline restart revalidates the generation without any network Git call', () => {
-    const workspace = makeWorkspace();
-    const first = materialize.selectManagedSource({
-        workspaceRoot: workspace,
-        remote: REMOTE,
-        runner: stubGit({ commits: gitFixture(), calls: [] }),
-    });
-    source.writeActiveDescriptor(workspace, first.selection);
-
-    const calls = [];
-    const second = materialize.selectManagedSource({
-        workspaceRoot: workspace,
-        activeDescriptor: source.readActiveDescriptor(workspace),
-        remote: REMOTE,
-        runner: stubGit({ commits: gitFixture(), calls }),
-    });
-    assert.equal(second.reused, true);
-    assert.deepEqual(calls, [
-        'rev-parse HEAD',
-        'status --porcelain --untracked-files=all',
-    ], 'reuse may inspect the local generation but must not consult a mirror or remote');
-    assert.equal(second.selection.contentFingerprint, first.selection.contentFingerprint);
-});
-
-test('a mutated managed generation is never relabelled or reused in place', () => {
-    const workspace = makeWorkspace();
-    const commits = gitFixture();
-    const first = materialize.selectManagedSource({
-        workspaceRoot: workspace,
-        remote: REMOTE,
-        runner: stubGit({ commits, calls: [] }),
-    });
-    fs.writeFileSync(path.join(first.selection.sourceDir, 'index.mjs'), 'export const marker = "tampered";\n');
-
-    assert.throws(
-        () => materialize.selectManagedSource({
-            workspaceRoot: workspace,
-            activeDescriptor: source.readActiveDescriptor(workspace),
-            remote: REMOTE,
-            runner: stubGit({ commits, calls: [] }),
-        }),
-        (error) => error.code === contract.AGENTLIB_ERROR_CODES.materializeFailed
-            && /refusing to reuse or overwrite/.test(error.message),
-    );
-    assert.equal(
-        fs.readFileSync(path.join(first.selection.sourceDir, 'index.mjs'), 'utf8'),
-        'export const marker = "tampered";\n',
-        'Ploinky must not mutate the compromised generation while failing closed',
-    );
-});
-
-test('an explicit branch stages a new immutable generation and keeps the old one', () => {
-    const workspace = makeWorkspace();
-    const base = materialize.selectManagedSource({
-        workspaceRoot: workspace,
-        remote: REMOTE,
-        runner: stubGit({ commits: gitFixture(), calls: [] }),
-    });
-    const updated = materialize.selectManagedSource({
-        workspaceRoot: workspace,
-        activeDescriptor: base.selection,
-        branchPolicy: { branch: 'feature-x', fallback: 'default' },
-        remote: REMOTE,
-        runner: stubGit({ commits: gitFixture(), calls: [] }),
-    });
-    assert.equal(updated.selection.resolvedCommit, BRANCH_COMMIT);
-    assert.equal(updated.selection.requestedRef, 'feature-x');
-    assert.equal(fs.readdirSync(source.managedGenerationsDir(workspace)).length, 2,
-        'the previous generation stays available for rollback');
-});
-
-test('an absent branch honors --branch-fallback default and fail', () => {
-    const workspace = makeWorkspace();
-    const withDefault = materialize.selectManagedSource({
-        workspaceRoot: workspace,
-        branchPolicy: { branch: 'missing', fallback: 'default' },
-        remote: REMOTE,
-        runner: stubGit({ commits: gitFixture(), calls: [] }),
-    });
-    assert.equal(withDefault.selection.resolvedCommit, LOCK_COMMIT);
-
-    assert.throws(
-        () => materialize.selectManagedSource({
-            workspaceRoot: makeWorkspace(),
-            branchPolicy: { branch: 'missing', fallback: 'fail' },
-            remote: REMOTE,
-            runner: stubGit({ commits: gitFixture(), calls: [] }),
-        }),
-        (error) => error.code === contract.AGENTLIB_ERROR_CODES.branchMissing,
-    );
-});
-
-test('interrupted materialization leaves no generation and never touches active.json', () => {
-    const workspace = makeWorkspace();
-    const working = stubGit({ commits: gitFixture(), calls: [] });
-    const failing = {
-        run(args, opts) {
-            if (args[0] === 'checkout') return { status: 1, stdout: '', stderr: 'simulated checkout failure' };
-            return working.run(args, opts);
-        },
-    };
-    assert.throws(
-        () => materialize.selectManagedSource({ workspaceRoot: workspace, remote: REMOTE, runner: failing }),
-        (error) => error.code === contract.AGENTLIB_ERROR_CODES.materializeFailed,
-    );
-    assert.equal(source.readActiveDescriptor(workspace), null);
-    assert.deepEqual(
-        fs.readdirSync(source.managedGenerationsDir(workspace)),
-        [],
-        'the aborted staging directory must be cleaned up',
-    );
-});
-
-test('pruning preserves every referenced generation', () => {
-    const workspace = makeWorkspace();
-    const first = materialize.selectManagedSource({
-        workspaceRoot: workspace, remote: REMOTE, runner: stubGit({ commits: gitFixture(), calls: [] }),
-    });
-    const second = materialize.selectManagedSource({
-        workspaceRoot: workspace,
-        branchPolicy: { branch: 'feature-x', fallback: 'default' },
-        remote: REMOTE,
-        runner: stubGit({ commits: gitFixture(), calls: [] }),
-    });
-    const referenced = [path.join(workspace, first.selection.sourceRelativePath)];
-    const prunable = materialize.prunableGenerations(workspace, referenced);
-    assert.deepEqual(prunable, [path.join(workspace, second.selection.sourceRelativePath)]);
 });
 
 // --- source lock ----------------------------------------------------------
@@ -570,7 +364,7 @@ test('a subpath escaping the selected root is refused', () => {
 test('imports resolve from the selected source', async () => {
     const workspace = makeWorkspace();
     const dir = fs.realpathSync(localCheckout(workspace, { marker: 'attested' }));
-    const selection = source.buildSelection({ workspaceRoot: workspace, sourceDir: dir, mode: 'local' });
+    const selection = source.buildSelection({ workspaceRoot: workspace, sourceDir: dir });
     const env = contract.agentLibRuntimeEnv(selection, dir);
 
     const namespace = await runtime.importAgentLib('LLMAgents', { env });
@@ -587,12 +381,6 @@ test('the branch policy parser is shared and validates its fallback', () => {
     );
     assert.throws(() => branchPolicy.parseBranchPolicy(['--branch-fallback', 'maybe']), /Invalid --branch-fallback/);
     assert.equal(repos.parseBranchPolicy, branchPolicy.parseBranchPolicy, 'core must use the shared parser');
-});
-
-test('the canonical remote comes from the Box dependency lock', () => {
-    const remote = contract.canonicalAgentLibRemote();
-    assert.match(remote.commit, /^[0-9a-f]{40}$/);
-    assert.match(remote.url, /AchillesAgentLib/i);
 });
 
 // --- workspace canonicalization -------------------------------------------
@@ -672,4 +460,189 @@ test('a branch mismatch on a local checkout is fail-closed under --branch-fallba
         }),
         /detached or unknown revision/,
     );
+});
+
+// --- required entry points ------------------------------------------------------
+
+test('a checkout without the responder module AgentServer imports is rejected', () => {
+    const workspace = makeWorkspace();
+    const dir = localCheckout(workspace);
+    fs.rmSync(path.join(dir, 'LLMAgents/openAiAgenticResponder.mjs'));
+    assert.throws(
+        () => source.validateAgentLibSource(dir),
+        (error) => error.code === contract.AGENTLIB_ERROR_CODES.sourceInvalid
+            && /openAiAgenticResponder\.mjs/.test(error.message),
+    );
+});
+
+// --- image-supplied selection ---------------------------------------------------
+
+const OUTER_IMAGE = `sha256:${'b2'.repeat(32)}`;
+const OTHER_OUTER_IMAGE = `sha256:${'d4'.repeat(32)}`;
+const PROVENANCE = {
+    repository: 'https://github.com/AssistOS-AI/AchillesAgentLib.git',
+    branch: 'master',
+    commit: 'e'.repeat(40),
+    packageVersion: '1.2.3',
+};
+
+function imageDescriptor(overrides = {}) {
+    return {
+        schemaVersion: 1,
+        workspacePathHash: 'h',
+        mode: 'image',
+        sourceRelativePath: 'image',
+        sourceId: { library: contract.AGENTLIB_LIBRARY_NAME, supplyingImageId: OUTER_IMAGE },
+        supplyingImageId: OUTER_IMAGE,
+        selectedAt: '2026-01-01T00:00:00.000Z',
+        ...overrides,
+    };
+}
+
+test('an image selection is identified by the supplying image and library, never by content', () => {
+    const workspace = makeWorkspace();
+    const selection = source.buildImageSelection({
+        workspaceRoot: workspace, supplyingImageId: OUTER_IMAGE, provenance: PROVENANCE,
+    });
+    assert.equal(selection.mode, 'image');
+    assert.equal(selection.sourceDir, contract.AGENTLIB_STABLE_MOUNT_PATH);
+    assert.deepEqual(selection.sourceId, { library: 'achillesAgentLib', supplyingImageId: OUTER_IMAGE });
+    assert.equal(selection.supplyingImageId, OUTER_IMAGE);
+    for (const absent of ['contentFingerprint', 'resolvedCommit', 'remoteUrl', 'requestedRef', 'dirty', 'imageId']) {
+        assert.equal(Object.hasOwn(selection, absent), false, `an image selection must not carry ${absent}`);
+    }
+    assert.deepEqual(selection.provenance, PROVENANCE);
+
+    const env = contract.agentLibRuntimeEnv(selection, selection.sourceDir);
+    assert.deepEqual(Object.keys(env).sort(), [
+        contract.AGENTLIB_ENV.dir, contract.AGENTLIB_ENV.mode, contract.AGENTLIB_ENV.sourceId,
+    ].sort(), 'the image environment carries no fingerprint and no commit');
+    assert.equal(env[contract.AGENTLIB_ENV.mode], 'image');
+    assert.equal(env[contract.AGENTLIB_ENV.sourceId], contract.imageSourceIdHash(selection.sourceId));
+});
+
+test('image identity follows the supplying image only; provenance never changes it', () => {
+    const workspace = makeWorkspace();
+    const withProvenance = source.buildImageSelection({
+        workspaceRoot: workspace, supplyingImageId: OUTER_IMAGE, provenance: PROVENANCE,
+    });
+    const withoutProvenance = source.buildImageSelection({ workspaceRoot: workspace, supplyingImageId: OUTER_IMAGE });
+    const otherProvenance = source.buildImageSelection({
+        workspaceRoot: workspace, supplyingImageId: OUTER_IMAGE, provenance: { ...PROVENANCE, commit: 'f'.repeat(40) },
+    });
+    const otherImage = source.buildImageSelection({ workspaceRoot: workspace, supplyingImageId: OTHER_OUTER_IMAGE });
+    assert.deepEqual(withoutProvenance.provenance, {
+        repository: null, branch: null, commit: null, packageVersion: null,
+    }, 'absent provenance reads as unavailable');
+    assert.equal(contract.agentLibIdentityEquals(withProvenance, withoutProvenance), true);
+    assert.equal(contract.agentLibIdentityEquals(withProvenance, otherProvenance), true);
+    assert.equal(contract.agentLibIdentityEquals(withProvenance, otherImage), false);
+    assert.notEqual(
+        contract.agentLibRuntimeEnv(withProvenance, withProvenance.sourceDir)[contract.AGENTLIB_ENV.sourceId],
+        contract.agentLibRuntimeEnv(otherImage, otherImage.sourceDir)[contract.AGENTLIB_ENV.sourceId],
+    );
+});
+
+test('a mutable or noncanonical image reference is never a supplier identity', () => {
+    const workspace = makeWorkspace();
+    for (const bad of ['docker.io/assistos/ploinky-box:latest', 'b2'.repeat(32), `SHA256:${'b2'.repeat(32)}`, '', undefined]) {
+        assert.throws(
+            () => source.buildImageSelection({ workspaceRoot: workspace, supplyingImageId: bad }),
+            (error) => error.code === contract.AGENTLIB_ERROR_CODES.imageInvalid,
+            `${String(bad)} must be rejected`,
+        );
+    }
+});
+
+test('image descriptor validation rejects every shape this version does not write', () => {
+    assert.doesNotThrow(() => contract.validateSelectionDescriptor(imageDescriptor()));
+    const rejected = {
+        'a content fingerprint': { contentFingerprint: 'a'.repeat(64) },
+        'a device/inode source id': { sourceId: { device: '1', inode: '2' } },
+        'a source id naming another image': {
+            sourceId: { library: 'achillesAgentLib', supplyingImageId: OTHER_OUTER_IMAGE },
+        },
+        'a source id naming another library': { sourceId: { library: 'mcp-sdk', supplyingImageId: OUTER_IMAGE } },
+        'a legacy imageId field': { imageId: OUTER_IMAGE },
+        'a resolved commit as identity': { resolvedCommit: 'a'.repeat(40) },
+        'a dirty flag': { dirty: true },
+        'a workspace source path': { sourceRelativePath: 'achillesAgentLib' },
+        'a non-canonical supplying image': { supplyingImageId: 'b2'.repeat(32) },
+        'the removed managed mode': { mode: 'managed' },
+        'a malformed provenance commit': { provenance: { commit: 'not-a-commit' } },
+    };
+    for (const [label, overrides] of Object.entries(rejected)) {
+        assert.throws(
+            () => contract.validateSelectionDescriptor(imageDescriptor(overrides)),
+            (error) => error.code === contract.AGENTLIB_ERROR_CODES.descriptorInvalid,
+            `${label} must be rejected`,
+        );
+    }
+});
+
+test('an image descriptor round-trips, and an unsupported one is reported with its file name', () => {
+    const workspace = makeWorkspace();
+    const selection = source.buildImageSelection({
+        workspaceRoot: workspace, supplyingImageId: OUTER_IMAGE, provenance: PROVENANCE,
+    });
+    source.writeActiveDescriptor(workspace, selection);
+    const read = source.readActiveDescriptor(workspace);
+    assert.equal(read.mode, 'image');
+    assert.equal(read.supplyingImageId, OUTER_IMAGE);
+    assert.deepEqual(read.provenance, PROVENANCE);
+    assert.equal(contract.agentLibIdentityEquals(read, selection), true);
+    assert.equal(source.resolveDescriptorSource(read, workspace).sourceDir, contract.AGENTLIB_STABLE_MOUNT_PATH);
+
+    for (const unsupported of [
+        // The shape earlier versions wrote for an image selection.
+        {
+            ...imageDescriptor(), imageId: OUTER_IMAGE, contentFingerprint: 'a'.repeat(64), resolvedCommit: 'a'.repeat(40),
+            sourceId: { device: `image:${OUTER_IMAGE}`, inode: 'a'.repeat(64) }, remoteUrl: null, requestedRef: null, dirty: false,
+        },
+        { ...imageDescriptor(), mode: 'managed', sourceRelativePath: '.ploinky/agentlib/generations/x' },
+    ]) {
+        fs.writeFileSync(source.activeDescriptorPath(workspace), JSON.stringify(unsupported));
+        assert.throws(
+            () => source.readActiveDescriptor(workspace),
+            (error) => error.code === contract.AGENTLIB_ERROR_CODES.descriptorInvalid
+                && error.message.includes(source.activeDescriptorPath(workspace)),
+        );
+        fs.writeFileSync(source.transactionDescriptorPath(workspace), JSON.stringify(unsupported));
+        assert.throws(
+            () => source.readTransactionDescriptor(workspace),
+            (error) => error.code === contract.AGENTLIB_ERROR_CODES.descriptorInvalid
+                && error.message.includes(source.transactionDescriptorPath(workspace)),
+        );
+    }
+    assert.equal(fs.existsSync(source.activeDescriptorPath(workspace)), true, 'an unsupported descriptor is reported, not deleted');
+});
+
+test('a local descriptor keeps its shape and semantics unchanged', () => {
+    const local = {
+        schemaVersion: 1,
+        workspacePathHash: 'h',
+        mode: 'local',
+        sourceRelativePath: 'achillesAgentLib',
+        sourceId: { device: '1', inode: '2' },
+        remoteUrl: null,
+        requestedRef: null,
+        resolvedCommit: 'a'.repeat(40),
+        dirty: true,
+        contentFingerprint: 'c'.repeat(64),
+        selectedAt: '2026-01-01T00:00:00.000Z',
+    };
+    assert.deepEqual(contract.validateSelectionDescriptor(local), local);
+    const env = contract.agentLibRuntimeEnv({ ...local, sourceDir: '/x' }, '/opt/ploinky-agentlib');
+    assert.equal(env[contract.AGENTLIB_ENV.fingerprint], local.contentFingerprint);
+    assert.equal(env[contract.AGENTLIB_ENV.commit], local.resolvedCommit);
+    assert.equal(env[contract.AGENTLIB_ENV.sourceId], contract.localSourceIdHash(local.sourceId));
+});
+
+test('local and image identities never compare equal', () => {
+    const workspace = makeWorkspace();
+    const dir = localCheckout(workspace);
+    const local = source.buildSelection({ workspaceRoot: workspace, sourceDir: dir });
+    const image = source.buildImageSelection({ workspaceRoot: workspace, supplyingImageId: OUTER_IMAGE });
+    assert.equal(contract.agentLibIdentityEquals(local, image), false);
+    assert.notEqual(contract.agentLibSourceIdHash(local), contract.agentLibSourceIdHash(image));
 });

@@ -3,10 +3,12 @@
 // seedInputKey  = SHA-256(canonical seed contract): schema/installer policy,
 //                 runtime family/key/engine, immutable image ID or host
 //                 toolchain identity, explicit npm policy, effective global
-//                 manifest + remote-verified pins, SDK bundle identity and the
-//                 full AgentLib install identity (fingerprint, adapter schema,
-//                 actual link and install targets). No agent package or
-//                 rebuild token.
+//                 manifest + remote-verified pins, the SDK provider identity
+//                 (the supplying outer Box image ID and the library) and the
+//                 full AgentLib install identity (a local source's fingerprint,
+//                 or an image source's supplying Box image ID, plus adapter
+//                 schema and the actual link and install targets). No agent
+//                 package or rebuild token.
 // agentInputKey = the same provider fields plus the canonical effective merged
 //                 manifest actually passed to npm (after reserved-provider
 //                 validation and in-Box SDK removal, with current merge
@@ -21,7 +23,11 @@ import { mergePackageJson } from '../dependencyInstaller.js';
 import { assertNoReservedAgentLibDependency, agentLibLinkTarget } from '../agentLibLink.js';
 import { AGENTLIB_ADAPTER_SCHEMA } from '../agentLibPackages.mjs';
 import { parseRuntimeKey } from '../dependencyRuntimeKey.js';
-import { AGENTLIB_STABLE_MOUNT_PATH } from '../../../../agentlib/contract.mjs';
+import {
+    AGENTLIB_LIBRARY_NAME,
+    AGENTLIB_STABLE_MOUNT_PATH,
+    assertSupplyingImageId,
+} from '../../../../agentlib/contract.mjs';
 import { boxMcpSdkStampSection, needsNpmInstall, withoutBoxMcpSdk } from '../../../../ploinky-box/agent-dependencies/mcp-sdk.mjs';
 import { dependencyStoreError, canonicalDigest, canonicalValue, sha256Hex } from './canonical.mjs';
 import { collectGitInputs, desiredPinsFor, PIN_SECTIONS } from './gitPins.mjs';
@@ -157,21 +163,47 @@ export function hostToolchainIdentity({ runtimeKey, probe }) {
 
 /** The AgentLib identity an install can observe: npm links it before lifecycle scripts run. */
 export function agentLibInstallIdentity(runtimeFamily, selection) {
-    const fingerprint = String(selection?.fingerprint || '').trim();
     const sourceDir = String(selection?.sourceDir || '').trim();
+    const container = runtimeFamily === 'container';
+    const targets = () => ({
+        linkTarget: agentLibLinkTarget(runtimeFamily, selection),
+        installTarget: container ? AGENTLIB_STABLE_MOUNT_PATH : path.resolve(sourceDir),
+    });
+    if (String(selection?.mode || '') === 'image') {
+        // An image source is identified by the outer Box image that supplies it,
+        // never by content or by the revision that image was built from.
+        let supplyingImageId;
+        try {
+            supplyingImageId = assertSupplyingImageId(selection?.supplyingImageId);
+        } catch (error) {
+            throw dependencyStoreError('PLOINKY_DEPS_AGENTLIB_IDENTITY_MISSING',
+                `dependency caches require the immutable outer image ID that supplies the AgentLib source: ${error.message}`);
+        }
+        if (!sourceDir) {
+            throw dependencyStoreError('PLOINKY_DEPS_AGENTLIB_IDENTITY_MISSING',
+                'dependency caches require the selected AgentLib source directory');
+        }
+        return {
+            adapterSchema: AGENTLIB_ADAPTER_SCHEMA,
+            mode: 'image',
+            library: AGENTLIB_LIBRARY_NAME,
+            supplyingImageId,
+            sourceIdHash: String(selection.sourceIdHash || ''),
+            ...targets(),
+        };
+    }
+    const fingerprint = String(selection?.fingerprint || '').trim();
     if (!fingerprint || !sourceDir) {
         throw dependencyStoreError('PLOINKY_DEPS_AGENTLIB_IDENTITY_MISSING',
             'dependency caches require the selected AgentLib source directory and content fingerprint');
     }
-    const container = runtimeFamily === 'container';
     return {
         adapterSchema: AGENTLIB_ADAPTER_SCHEMA,
         mode: String(selection.mode || ''),
         fingerprint,
         commit: String(selection.commit || ''),
         sourceIdHash: String(selection.sourceIdHash || ''),
-        linkTarget: agentLibLinkTarget(runtimeFamily, selection),
-        installTarget: container ? AGENTLIB_STABLE_MOUNT_PATH : path.resolve(sourceDir),
+        ...targets(),
     };
 }
 
@@ -364,7 +396,7 @@ export function buildAgentInstallPlan({
     const globalEffective = filterProviders(globalPackage, sdkBundle, 'globalDeps/package.json');
     const agentEffective = agentPackage?.manifest ? filterProviders(agentPackage.manifest, sdkBundle, 'agent package.json') : null;
     // Current merge semantics: fields the merge drops stay dropped.
-    const effective = canonicalValue(merge(globalEffective, agentEffective));
+    const effective = canonicalValue(merge(globalEffective, agentEffective, { bundle: sdkBundle }));
     const packageSource = {
         selection: agentPackage?.selection || 'none',
         relativePath: agentPackage?.relativePath || '',

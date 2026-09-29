@@ -7,18 +7,22 @@ existing rootless Podman runtime and a locally rebuilt Box image; no image
 publication or shared deployment is required. The companion image patch keeps
 the image's existing pinned dependencies and licenses unchanged.
 
-AchillesAgentLib source selection and Box bundle verification use Node.js built-ins
-and add no third-party packages. The existing library is pinned in
-`ploinky-box/dependencies.lock.json` and bundled by the `container-image-builds`
-Box workflow, including its declared runtime dependencies and license files.
-The bundle contains the existing `ploinky-agent-lib` package (MIT, with its
-upstream LICENSE retained); its source URL and immutable revision are recorded
-in that lock. To update it, update the pin and rebuild the Box image. A valid
-workspace checkout remains the development override. Host Git and network
-access are no longer needed to acquire a fallback library; other repository
-operations retain their own Git requirements. Startup rejects absent, changed,
-or incompatible bundles before admitting the graph. Focused verification uses
-the existing Node test runner and fake container engine, without installations.
+AchillesAgentLib source selection and Box package checks use Node.js built-ins
+and add no third-party packages. The `container-image-builds` Box workflow
+selects the AchillesAgentLib and MCP SDK sources, resolving each repository's
+remote default branch once (or taking an exact commit input), and packages them
+into the image with their declared runtime dependencies and license files. The
+image carries the existing `ploinky-agent-lib` package (MIT, with its upstream
+LICENSE retained) and the MCP SDK, each with build-generated provenance
+(repository, branch, commit and package version). Ploinky keeps no lock or
+expected revision: it identifies the supplied libraries by the outer Box image
+that carries them, and checks them only as packages. To update a library,
+rebuild the Box image. A valid workspace checkout remains the development
+override. Host Git and network access are not needed to acquire a fallback
+library; other repository operations retain their own Git requirements. Startup
+rejects an absent or unusable supplied package before admitting the graph.
+Focused verification uses the existing Node test runner and fake container
+engine, without installations.
 
 The graph scope state implementation and its regression tests add no third-party dependencies. They use Node.js built-ins (`node:crypto`, `node:fs`, `node:path`, `node:os`, `node:test`, and `node:assert/strict`) and repository-owned modules. Node.js is a runtime prerequisite, not a bundled library; the focused tests were verified with Node.js 25.8.0 and the portable acceptance runner targets Node.js 22 or newer.
 

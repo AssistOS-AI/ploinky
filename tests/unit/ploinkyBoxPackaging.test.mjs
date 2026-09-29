@@ -65,7 +65,9 @@ test('package metadata preserves the exact bin map, immutable postinstall and lo
 // The only intended change to the renamed launcher is the removal of the
 // install-tree dependency gate: achillesAgentLib is now selected from the
 // workspace and validated by the Node bootstrap, not required next to the
-// checkout. Asserting the exact substitution keeps every other byte pinned.
+// checkout. Asserting the exact substitution keeps every other byte pinned. The
+// replacement comment is the one normalized wording: it no longer mentions the
+// removed managed workspace generation.
 const REMOVED_AGENTLIB_GATE = [
     'if [[ ! -d "$PLOINKY_ROOT/node_modules/achillesAgentLib" ]]; then',
     '    echo "Ploinky dependency missing: $PLOINKY_ROOT/node_modules/achillesAgentLib" >&2',
@@ -76,9 +78,9 @@ const REMOVED_AGENTLIB_GATE = [
 ].join('\n');
 
 const AGENTLIB_GATE_REPLACEMENT = [
-    '# achillesAgentLib is not an installed dependency of this checkout: it is',
-    '# selected from the workspace (or a managed workspace generation) and validated',
-    '# by the Node bootstrap in cli/index.js before any framework import.',
+    '# achillesAgentLib is not an installed dependency of this checkout: outside a',
+    '# Box it is selected from <workspace>/achillesAgentLib and validated by the Node',
+    '# bootstrap in cli/index.js before any framework import.',
     '',
 ].join('\n');
 

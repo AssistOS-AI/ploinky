@@ -567,6 +567,26 @@ test('reserved env filtering restores only the runtime-owned Router authority', 
     }
 });
 
+test('the outer Box image ID name is reserved: extra env flags cannot introduce it into a nested agent', () => {
+    const supplied = [
+        '-e SAFE="kept"',
+        '-e PLOINKY_BOX_IMAGE_ID="sha256:forged"',
+        '-e PLOINKY_BOX_IMAGE_ID_SUFFIXED="kept-because-it-is-a-different-name"',
+    ];
+    const runtimeRouterEnv = buildRuntimeRouterEnv('podman', {
+        networkMode: 'bridge',
+        routerEndpoint: buildRouterEndpoint('bridge', 8080),
+        routerPort: 8080,
+    });
+
+    stripReservedAndRestoreRuntimeRouterEnvFlags(supplied, runtimeRouterEnv);
+
+    assert.equal(supplied.some((entry) => entry.startsWith('-e PLOINKY_BOX_IMAGE_ID=')), false);
+    assert.equal(supplied.includes('-e SAFE="kept"'), true);
+    assert.equal(supplied.includes('-e PLOINKY_BOX_IMAGE_ID_SUFFIXED="kept-because-it-is-a-different-name"'), true);
+    assert.equal(Object.keys(runtimeRouterEnv).includes('PLOINKY_BOX_IMAGE_ID'), false);
+});
+
 test('existing-container ownership inspection is unconditional across network modes', () => {
     const source = fs.readFileSync(new URL('../../cli/sandbox/docker/agentServiceManager.js', import.meta.url), 'utf8');
     assert.doesNotMatch(source, /\bresolveRouterEndpoint\s*\(/, 'service manager must not reread persisted routing state');

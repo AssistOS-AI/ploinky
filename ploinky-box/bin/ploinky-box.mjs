@@ -10,6 +10,7 @@ import { updateHostPloinkySource } from '../command/hostUpdate.mjs';
 import { resolvePloinkyUpdateScope } from '../../cli/commands/ploinkyUpdateScope.js';
 import { resolveUpdateFolderScope, withDefaultUpdateFolder } from '../../cli/commands/updateRequest.js';
 import { buildUpdateResult, createOperationRecord } from '../../cli/commands/updateOutcome.js';
+import { agentLibIdentity } from '../../agentlib/contract.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 import { createUpdateHostState } from '../update/hostState.mjs';
 import {
@@ -568,6 +569,21 @@ function shortRevision(value) {
     return String(value || 'unknown').slice(0, 12);
 }
 
+/**
+ * The AgentLib part of the public update result: whether the source changed and
+ * the current and previous mode-aware identities. A local source reports its
+ * fingerprint and source ID hash; an image source reports the supplying image
+ * ID, its source ID hash and any available provenance.
+ */
+export function projectUpdateAgentLib(result) {
+    if (!result?.agentLib) return null;
+    return {
+        changed: Boolean(result.changed),
+        current: agentLibIdentity(result.agentLib),
+        previous: agentLibIdentity(result.previous ?? null),
+    };
+}
+
 function scopeError(error) {
     return new PloinkyBoxError(error.message, {
         code: error?.code || 'PLOINKY_UPDATE_SCOPE_UNMAPPABLE',
@@ -789,14 +805,7 @@ async function runHostUpdate({
             command: argv,
             records,
             context: result?.reportContext || null,
-            agentLib: result?.agentLib
-                ? {
-                    changed: Boolean(result.changed),
-                    mode: result.agentLib.mode || null,
-                    fingerprint: result.agentLib.contentFingerprint || result.agentLib.fingerprint || null,
-                    previousFingerprint: result.previous?.contentFingerprint || result.previous?.fingerprint || null,
-                }
-                : null,
+            agentLib: projectUpdateAgentLib(result),
         }),
     };
     const outcome = result?.activation?.outcome;

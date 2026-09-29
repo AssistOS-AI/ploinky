@@ -14,7 +14,7 @@ import { assertBoxWorkspaceRoot, readBoxWorkspaceRoot } from '../contract/worksp
 import { PloinkyBoxError } from '../errors.mjs';
 import { createProcessRunner } from '../process.mjs';
 import { initializeWorkspaceMasterKey } from './initialize-workspace.mjs';
-import { installPinnedDependencies } from './install-dependencies.mjs';
+import { prepareImageDependencies } from './install-dependencies.mjs';
 import { configureBoxStorage } from './storage.mjs';
 import { configureBoxTransport } from './transport.mjs';
 
@@ -324,7 +324,7 @@ export function prepareEntrypoint({
     configureStorage = configureBoxStorage,
     resetRuntime = resetTransientNestedRuntime,
     retireContainers = retireStoppedManagedContainers,
-    installDependencies = installPinnedDependencies,
+    installDependencies = prepareImageDependencies,
     transportOptions = {},
     storageOptions = {},
 } = {}) {
@@ -354,11 +354,13 @@ export function prepareEntrypoint({
         ...transportOptions,
     });
     retireContainers(paths, { fsApi, runner });
+    // The Box image ID in `env` identifies the libraries this Box supplies.
     installDependencies({
         targetRoot: paths.dependencies,
         markerPath: paths.marker,
         fsApi,
         runner,
+        env,
     });
     return Object.freeze({ paths, storage, transport });
 }

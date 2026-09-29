@@ -11,6 +11,9 @@ import {
     hostToolchainIdentity,
 } from '../../cli/utils/dependencies/store/installContract.mjs';
 import { containerNpmPolicy, resolveHostNpmPolicy } from '../../cli/utils/dependencies/store/npmPolicy.mjs';
+import { imageSourceIdHash, imageSourceIdentity } from '../../agentlib/contract.mjs';
+import { mcpSdkIdentity } from '../../ploinky-box/mcp-sdk-bundle.mjs';
+import { NESTED_IMAGE_ID_FIXTURE, OUTER_IMAGE_ID_FIXTURE } from '../helpers/agentlibFixture.mjs';
 
 export const HOST_RUNTIME_KEY = 'seatbelt-darwin-arm64-node25';
 export const CONTAINER_RUNTIME_KEY = 'container-linux-x64-glibc-node20';
@@ -21,12 +24,55 @@ export function tempRoot(t, prefix = 'depstore-') {
     return dir;
 }
 
+/** The outer Box image that supplies image-mode libraries in these fixtures. */
+export const OUTER_IMAGE_ID = OUTER_IMAGE_ID_FIXTURE;
+/** A nested agent toolchain image, deliberately unlike the outer one. */
+export const NESTED_IMAGE_ID = NESTED_IMAGE_ID_FIXTURE;
+
 export function makeAgentLib(root, { name = 'agentlib', fingerprint = 'fp-1', content = 'agentlib-v1' } = {}) {
     const sourceDir = path.join(root, name);
     fs.mkdirSync(sourceDir, { recursive: true });
     fs.writeFileSync(path.join(sourceDir, 'package.json'), JSON.stringify({ name: 'ploinky-agent-lib', version: '1.0.0' }));
     fs.writeFileSync(path.join(sourceDir, 'data.txt'), content);
     return { sourceDir, mode: 'local', fingerprint, commit: '', sourceIdHash: 'source-1' };
+}
+
+/**
+ * The AgentLib source the Box image supplies: identified by the outer image, with
+ * no content fingerprint and no revision.
+ */
+export function makeImageAgentLib(root, { name = 'image-agentlib', supplyingImageId = OUTER_IMAGE_ID } = {}) {
+    const sourceDir = path.join(root, name);
+    fs.mkdirSync(sourceDir, { recursive: true });
+    fs.writeFileSync(path.join(sourceDir, 'package.json'), JSON.stringify({ name: 'ploinky-agent-lib', version: '1.0.0' }));
+    return {
+        sourceDir,
+        mode: 'image',
+        sourceIdHash: imageSourceIdHash(imageSourceIdentity(supplyingImageId)),
+        supplyingImageId,
+    };
+}
+
+/**
+ * The MCP SDK package a Box supplies, as `activeBoxMcpSdkBundle` returns it: a
+ * package directory plus the supplying outer Box image identity. No digest, no
+ * lock and no expected revision.
+ */
+export function makeImageSdk(root, { name = 'image-sdk', supplyingImageId = OUTER_IMAGE_ID, content = 'export const bundled = true;\n' } = {}) {
+    const sourceRoot = path.join(root, name);
+    fs.mkdirSync(sourceRoot, { recursive: true });
+    fs.writeFileSync(path.join(sourceRoot, 'package.json'), JSON.stringify({
+        name: '@modelcontextprotocol/sdk', version: '1.19.1', type: 'module', exports: { '.': './index.js' },
+    }));
+    fs.writeFileSync(path.join(sourceRoot, 'index.js'), content);
+    return Object.freeze({
+        sourceRoot,
+        packageName: '@modelcontextprotocol/sdk',
+        packageVersion: '1.19.1',
+        entry: 'index.js',
+        identity: mcpSdkIdentity(supplyingImageId),
+        provenance: { repository: null, branch: null, commit: null, packageVersion: null },
+    });
 }
 
 export function hostProbe(overrides = {}) {

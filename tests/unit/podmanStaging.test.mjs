@@ -919,15 +919,47 @@ test('persistent runtime production wiring appends guards after all writable mou
     );
 });
 
+// A rootless engine maps the container user (10001) to a subordinate host ID, so the `:U` volume ends up
+// owned by an ID the host user cannot enter: the fixture is inspected and removed from inside the same user
+// namespace. A remote client or a rootful engine has no usable `podman unshare`; there the host user reaches
+// the fixture directly.
+function hasPodmanNamespace() {
+    return spawnSync('podman', ['unshare', 'true'], { stdio: 'ignore' }).status === 0;
+}
+
+function existsInFixtureNamespace(target, viaNamespace) {
+    if (!viaNamespace) return fs.existsSync(target);
+    return spawnSync('podman', ['unshare', 'sh', '-c', 'test -e "$1"', 'sh', target], { stdio: 'ignore' }).status === 0;
+}
+
+function removeStorageFixture(root, viaNamespace) {
+    if (viaNamespace) {
+        const removed = spawnSync('podman', ['unshare', 'rm', '-rf', '--', root], { encoding: 'utf8' });
+        if (removed.status !== 0) throw new Error(`Unable to remove the storage fixture ${root}: ${removed.stderr || removed.status}`);
+    } else {
+        try { fs.chmodSync(root, 0o700); } catch (_) {}
+        for (const directory of ['manifest', 'resource', 'readonly']) {
+            try { fs.chmodSync(path.join(root, directory), 0o700); } catch (_) {}
+        }
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+}
+
 test('real podman numeric user writes manifest :U and plain resource :z but not read-only storage', { skip: !hasLocalPodmanBusybox() }, () => {
     const root = tempDir('podman-storage-owner-');
+    const viaNamespace = hasPodmanNamespace();
+    let failure = null;
     try {
         const manifestDir = path.join(root, 'manifest');
         const resourceDir = path.join(root, 'resource');
         const readOnlyDir = path.join(root, 'readonly');
         fs.mkdirSync(manifestDir, { mode: 0o700 });
-        fs.mkdirSync(resourceDir, { mode: 0o777 });
-        fs.mkdirSync(readOnlyDir, { mode: 0o777 });
+        fs.mkdirSync(resourceDir);
+        fs.mkdirSync(readOnlyDir);
+        // Deliberately writable for the numeric user whatever the umask; the read-only mount, not the
+        // mode, must be what stops the write to `readonly`.
+        fs.chmodSync(resourceDir, 0o777);
+        fs.chmodSync(readOnlyDir, 0o777);
         const result = spawnSync('podman', [
             'run', '--rm', '--user', '10001:10001',
             '-v', `${manifestDir}:/manifest:z,U`,
@@ -935,6 +967,7 @@ test('real podman numeric user writes manifest :U and plain resource :z but not 
             '-v', `${readOnlyDir}:/readonly:z,ro`,
             'docker.io/library/busybox:1.36',
             'sh', '-lc', [
+                'set -eu',
                 'touch /manifest/owned',
                 'touch /resource/plain',
                 'if touch /readonly/blocked 2>/dev/null; then exit 41; fi',
@@ -943,14 +976,18 @@ test('real podman numeric user writes manifest :U and plain resource :z but not 
         ], { encoding: 'utf8' });
         assert.equal(result.status, 0, result.stderr || result.stdout);
         assert.match(result.stdout, /STORAGE_OK/);
-        assert.equal(fs.existsSync(path.join(manifestDir, 'owned')), true);
-        assert.equal(fs.existsSync(path.join(resourceDir, 'plain')), true);
-        assert.equal(fs.existsSync(path.join(readOnlyDir, 'blocked')), false);
+        assert.equal(existsInFixtureNamespace(path.join(manifestDir, 'owned'), viaNamespace), true);
+        assert.equal(existsInFixtureNamespace(path.join(resourceDir, 'plain'), viaNamespace), true);
+        assert.equal(existsInFixtureNamespace(path.join(readOnlyDir, 'blocked'), viaNamespace), false);
+    } catch (error) {
+        failure = error;
+        throw error;
     } finally {
-        try { fs.chmodSync(root, 0o700); } catch (_) {}
-        for (const directory of ['manifest', 'resource', 'readonly']) {
-            try { fs.chmodSync(path.join(root, directory), 0o700); } catch (_) {}
+        try {
+            removeStorageFixture(root, viaNamespace);
+        } catch (cleanupError) {
+            // A cleanup problem never hides the assertion that failed first.
+            if (failure === null) throw cleanupError;
         }
-        fs.rmSync(root, { recursive: true, force: true });
     }
 });

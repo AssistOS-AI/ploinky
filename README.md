@@ -246,10 +246,13 @@ macOS Podman Machine.
 Dependency-cache seeding inside the Box likewise uses `cp -a` copies instead
 of hard links or Node's recursive copy because shared macOS bind mounts cannot
 preserve those operations reliably across the outer and nested containers.
-The lock-pinned MCP SDK source is sealed into `ploinky-box` at image-build time.
-On startup the Box verifies that immutable bundle and copies it into
-`/opt/ploinky/node_modules`; a fresh workspace therefore performs no MCP SDK
-Git or npm operation and needs no GitHub credentials.
+The image build (`container-image-builds`) selects the MCP SDK and packages it
+into `ploinky-box`. On startup the Box checks that supplied package (its name,
+its entry point and a plain file tree) and copies it into
+`/opt/ploinky/node_modules`, keyed by the Box image that carries it; a fresh
+workspace therefore performs no MCP SDK Git or npm operation and needs no
+GitHub credentials. Ploinky compares the SDK with no expected revision and
+hashes none of its files.
 
 Automatic repository bootstrap prepares `AchillesIDE`, `AchillesCLI`, and `copilot-agents`, reusing matching workspace checkouts before cloning missing repositories into `.ploinky/repos`. Explorer's manifest declares its additional repositories and uses `AchillesIDE/liveKitServerAgent` for LiveKit. The `basic` repository is optional: install it explicitly with `ploinky install repo basic` when needed.
 
@@ -309,13 +312,16 @@ recreate the Box. Ordinary destroy retains `.ploinky/box`;
 `--delete-cache` performs an explicit storage reset of exactly those two cache
 directories without deleting any other workspace file.
 
-Cross-repository release candidates must align the AgentLib commit in
-`ploinky-box/dependencies.lock.json` with the selected AgentLib source and the
-release manifest. Run the offline release-bundle verifier before recreating a
-test workspace. AgentLib is direct-mounted, not bundled into the Box image;
-an AgentLib-only policy-pin change does not change the bundled MCP SDK or its
-dependency-cache fingerprint. Changes to actual image inputs still require
-image-contract verification and a matching immutable image.
+Cross-repository release candidates record the AgentLib commit of the deployed
+checkout in the release manifest. Run the offline release-bundle verifier
+before recreating a test workspace; it checks that the recorded checkouts are
+clean and at their exact commits and that `globalDeps` does not install a second
+AgentLib. Ploinky itself pins no library revision: the Box image supplies
+AchillesAgentLib and the MCP SDK, and a valid `<workspace>/achillesAgentLib`
+checkout takes precedence. A different outer Box image changes the identity of
+the supplied libraries and their dependency caches; a change of only the
+recorded build provenance does not. Changes to actual image inputs still
+require image-contract verification and a matching immutable image.
 
 Prepared dependency caches bind both `achillesAgentLib` and `ploinky-agent-lib`
 to that same admitted source. After npm completes, Ploinky replaces hoisted,
@@ -333,7 +339,7 @@ State follows these stop/start and destroy boundaries:
 | State | Where it lives | Survives stop/start? | Survives destroy? |
 | --- | --- | --- | --- |
 | Workspace data | Host bind at the workspace's own absolute path | Yes | Yes; no destroy path deletes it |
-| Pinned dependency cache | Host bind from `.ploinky/box/dependencies` at `/opt/ploinky/node_modules` | Yes | Yes, unless `--delete-cache` |
+| Box dependency cache (the MCP SDK copied from the Box image) | Host bind from `.ploinky/box/dependencies` at `/opt/ploinky/node_modules` | Yes | Yes, unless `--delete-cache` |
 | Nested image cache | Host bind from `.ploinky/box/images` at `/home/podman/.local/share/ploinky-images` | Yes | Yes, unless `--delete-cache` |
 | Nested container records and writable layers | Box writable layer under `/home/podman/.local/share/containers/storage` | Yes | No |
 | Inner Podman named volumes | Under the same disposable graphroot | Yes | No |
@@ -500,32 +506,32 @@ node cli/index.js <args>
 Ploinky uses `<workspace>/achillesAgentLib` when that directory is present and
 valid. It mounts the source read-only for the Box and all consumers, and never
 pulls or rewrites the local checkout. An invalid local directory is an error.
-When the directory is absent, the Box uses its bundled AchillesAgentLib copy at
-`/opt/ploinky-agentlib`; the host does not clone a fallback repository. The bundle
-must pass content verification (metadata, root ownership, and content
-fingerprint). Its AchillesAgentLib commit should match
-`ploinky-box/dependencies.lock.json`. When it does not, Ploinky prints a warning
-on stderr that names both commits and says whether this Ploinky checkout or the
-image is most likely out of date, based on the checkout's Git metadata as of the
-last fetch. It prints a fix command and continues with the image's bundled
-commit. Set `PLOINKY_AGENTLIB_STRICT_PIN=1` to make the difference fatal, for
-example in CI or release gates; any value other than `0` or `1` is rejected
-whenever Ploinky selects the Box image's bundle.
-`ploinky diagnose` reports the difference as a warning, or as a failure in
-strict mode.
+When the directory is absent, the Box uses the AchillesAgentLib copy its image
+supplies at `/opt/ploinky-agentlib`; the host does not clone a fallback
+repository. The image chooses and packages that copy. Ploinky checks it as a
+package (its name, the entry points Ploinky loads, root ownership and
+containment; the version is reported, not checked) and identifies it by the
+immutable outer Box image that carries it, exposed to the outer Box container's
+own processes as `PLOINKY_BOX_IMAGE_ID` and never to nested agents. It compares
+the copy with no expected revision, prints no revision warning, has no strict
+mode and hashes none of the image's library files. The image's build provenance
+(repository, branch, commit and package version, when it records them) is
+informational and appears in `ploinky status`, `ploinky diagnose` and the
+`update` result. A local checkout keeps its own content fingerprint, so an edit
+of its files, including uncommitted ones, is detected.
 Creating a missing Box pulls the configured image before this selection, so the
-bundle always comes from the image that Box is created from; with an existing
-Box, selection uses the local image and pulls only when it is absent.
-An image without a valid bundle must be rebuilt or replaced, or a
-valid local checkout supplied. Direct host `ploinky-local` development requires
-a local checkout because the image bundle is available only inside the Box.
+supplied copy always comes from the image that Box is created from; with an
+existing Box, selection uses the local image and pulls only when it is absent.
+An image without a usable package must be rebuilt or replaced, or a valid local
+checkout supplied. Direct host `ploinky-local` development requires a local
+checkout because the image's copy is available only inside the Box.
 
-Start, full restart, and update select the source again. Adding or removing a
-local checkout replaces the Box when the source changes. A targeted agent
-restart keeps the admitted source. Bundled library updates require a new Box
-image; until one matching the pin is available, lifecycle commands warn and use
-the image's bundled revision; general repository branch options do not change
-the bundled revision.
+Start, full restart, and update select the source again. Adding, removing or
+editing a local checkout needs a full workspace restart: the Box is replaced
+when the source changes, a targeted operation that would require replacing it
+is refused before anything is changed, and there is no automatic reload. A
+targeted agent restart keeps the admitted source. A library update means a new
+Box image; general repository branch options do not change the image's copy.
 
 ## Publishing the Router on a host network interface
 
@@ -752,7 +758,7 @@ edge generation is compiled.
 ## Core commands (in p-cli)
 
 - `enable agent <name> [as <alias>]`: register an agent in `.ploinky/agents.json` (creates a minimal manifest if missing). Use `as <alias>` to spin up additional instances with unique container names.
-- `update [folderPath]`: use the current directory as the update folder, or `folderPath` (which must be inside the workspace) when supplied. A Ploinky checkout is updated only when it is inside that folder or contains the launch folder. Each checkout is fetched once and fast-forwarded only when it is clean, on its configured branch and upstream, and not diverged; otherwise it is preserved and reported with a named reason (for example `dirty-worktree`, `diverged`, `detached-head`, `upstream-mismatch`, `unverified-ignore-block-preserved`). Every phase (Ploinky, AgentLib, repositories, default skills, skills manifests) produces a record; the command exits nonzero when any record failed or when a required input (a repository, skills source or AgentLib that the configured graph uses) was not verified, and activation happens only when every required input verified. Update never prepares dependency caches. AchillesAgentLib is revalidated from the local checkout or the pinned Box bundle; update never pulls a local library checkout or clones a host fallback.
+- `update [folderPath]`: use the current directory as the update folder, or `folderPath` (which must be inside the workspace) when supplied. A Ploinky checkout is updated only when it is inside that folder or contains the launch folder. Each checkout is fetched once and fast-forwarded only when it is clean, on its configured branch and upstream, and not diverged; otherwise it is preserved and reported with a named reason (for example `dirty-worktree`, `diverged`, `detached-head`, `upstream-mismatch`, `unverified-ignore-block-preserved`). Every phase (Ploinky, AgentLib, repositories, default skills, skills manifests) produces a record; the command exits nonzero when any record failed or when a required input (a repository, skills source or AgentLib that the configured graph uses) was not verified, and activation happens only when every required input verified. Update never prepares dependency caches. AchillesAgentLib is revalidated from the local checkout or the copy the Box image supplies; update never pulls a local library checkout or clones a host fallback.
 - `start <staticAgent> 8080`: first core start requires a static agent; subsequent runs can just use `start`.
   - Ensures all enabled agents are running and launches the fixed inner Router on `8080`. On the host-facing public wrapper, `ploinky start <agent> <port>` treats that positional port only as the physical-host port selection (loopback unless `ploinky bind` saved another address) and still forwards inner `8080` to core.
   - Serves static files from the repository of `<staticAgent>`; non `/<agent>/...` paths are static.
@@ -783,7 +789,7 @@ session-bound CSRF proof.
 Node-based agents consume an immutable, content-verified dependency tree. The lifecycle command that admits a runtime (`start`, `enable`, `restart`, `reinstall`) resolves the desired tree; `update` never prepares caches.
 
 - New trees live under `.ploinky/deps/store/`. Each build gets a stable `objects/<build-id>/payload/` directory that is never renamed or modified after publication. A tree is keyed by every install input: runtime family and key, the immutable image ID (not the tag) or host toolchain identity, an explicit npm policy, the effective merged package manifest, the SDK bundle and full AgentLib identity, supported Git pins, and the registration's rebuild token.
-- Every npm run starts from an empty `node_modules`. Before publication Ploinky verifies installed Git provenance against the requested full commit and hashes the actual installed tree; hidden lockfile metadata alone is not accepted as integrity.
+- Every npm run starts from an empty `node_modules`. Before publication Ploinky verifies installed Git provenance against the requested full commit and hashes the actual installed tree; hidden lockfile metadata alone is not accepted as integrity. Inside a Box, the one exception is `node_modules/mcp-sdk` when the tree's contract names the image-supplied SDK: that subtree is identified by the supplying Box image and a completion record written after a fresh copy from the image, and it is still walked for file types, modes, symlink containment and plain-tree structure, but its file bytes are not hashed. The installed-tree digest covers every other dependency.
 - Runtimes mount the tree read-only. A runtime is reused only when its admitted tree equals the desired one; a changed package, provider, image, pin or rebuild token creates a replacement runtime instead of mutating a mounted tree, and the predecessor keeps its tree until it retires.
 - A corrupt tree is marked unusable for new consumers and rebuilt automatically; it is never repaired in place.
 - `ploinky reinstall <agent>` issues a new rebuild token for that registration and rebuilds from empty npm state.

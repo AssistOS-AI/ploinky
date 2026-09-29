@@ -57,6 +57,10 @@ function defaultStore() {
     return defaultStoreInstance;
 }
 
+function memoOf(deps) {
+    return deps.memo === undefined ? dependencyRefreshOperation() : deps.memo;
+}
+
 function seams(deps = {}) {
     return {
         store: deps.store || defaultStore(),
@@ -65,7 +69,8 @@ function seams(deps = {}) {
         npmConfigSources: deps.npmConfigSources || (() => defaultNpmConfigSources({ env: process.env })),
         readGlobalPackage: deps.readGlobalPackage || readGlobalDepsPackage,
         agentLibSelection: deps.agentLibSelection || (() => activeAgentLibSelection()),
-        sdkBundle: deps.sdkBundle || (() => activeBoxMcpSdkBundle()),
+        // Select the supplied SDK once per lifecycle command and pass it on.
+        sdkBundle: deps.sdkBundle || (() => memoized(memoOf(deps), 'box-mcp-sdk', () => activeBoxMcpSdkBundle())),
         workspaceRoot: deps.workspaceRoot || PLOINKY_WORKSPACE_ROOT,
         createInstaller: deps.createInstaller || null,
         resolveLease: deps.resolveLease || resolveDependencyLease,
@@ -160,7 +165,7 @@ export function planRuntimeDependencies(input, deps = {}) {
     const agentLibSelection = s.agentLibSelection();
     const sdkBundle = s.sdkBundle();
     const provider = buildProviderContract({ runtimeKey, toolchain: toolchainIdentity, npmPolicy, sdkBundle, agentLib: agentLibSelection });
-    const globalPackage = s.readGlobalPackage();
+    const globalPackage = s.readGlobalPackage({ bundle: sdkBundle });
     const pinState = s.store.readPins().pins;
     const sourceIdentity = canonicalDigest({ provider, globalPackage, pinState });
     const memoKey = `plan:${family}:${runtimeKey}:${engine}:${imageId || ''}:${registrationId}:${rebuildToken || ''}:${agentPackage.relativePath}:${agentPackage.sha256 || ''}:${sourceIdentity}`;

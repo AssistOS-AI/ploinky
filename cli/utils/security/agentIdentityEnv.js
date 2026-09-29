@@ -1,5 +1,5 @@
 import { SKILL_SCOPE_ENV_NAMES } from '../../../ploinky-box/skillScope.mjs';
-import { AGENTLIB_RESERVED_ENV_NAMES } from '../../../agentlib/contract.mjs';
+import { AGENTLIB_RESERVED_ENV_NAMES, BOX_IMAGE_ID_ENV } from '../../../agentlib/contract.mjs';
 import { PUBLIC_ROUTER_HOSTS_ENV } from '../publicRouterHosts.mjs';
 import { deriveAgentRequestSecret, derivePrivateAgentRequestSecret } from './masterKey.js';
 import { buildSubjectIdentityKey, getSubjectIdentityPublicKey } from './subjectIdentityKey.js';
@@ -138,6 +138,10 @@ export const RESERVED_AGENT_ENV_NAMES = Object.freeze([
     // layer must not be able to point an agent at a different source than the
     // one the workspace selected.
     ...AGENTLIB_RESERVED_ENV_NAMES,
+    // The outer Box image ID that identifies the libraries the image supplies.
+    // Only the host-created Box environment carries it; no runtime layer may
+    // introduce it, and nothing emits it into a nested agent.
+    BOX_IMAGE_ID_ENV,
     ...SKILL_SCOPE_ENV_NAMES,
 ]);
 

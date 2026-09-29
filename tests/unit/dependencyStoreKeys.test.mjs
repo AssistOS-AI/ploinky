@@ -21,6 +21,7 @@ import {
     hostProbe,
     hostProvider,
     makeAgentLib,
+    makeImageAgentLib,
     tempRoot,
 } from './dependencyStoreFixtures.mjs';
 
@@ -33,8 +34,15 @@ const GLOBAL = Object.freeze({
     dependencies: { 'mcp-sdk': `git+${SDK_URL}#main`, 'left-pad': '1.3.0' },
 });
 
-function sdkBundle(contentSha256 = 'c'.repeat(64)) {
-    return { schema: 'ploinky.box.mcp-sdk/v1', repository: { url: SDK_URL, commit: 'd'.repeat(40) }, contentSha256, sourceRoot: '/nonexistent' };
+function sdkBundle(supplyingImageId = IMAGE_A) {
+    return {
+        sourceRoot: '/nonexistent',
+        packageName: '@modelcontextprotocol/sdk',
+        packageVersion: '1.19.1',
+        entry: 'index.mjs',
+        identity: { kind: 'image', library: 'mcp-sdk', supplyingImageId },
+        provenance: { repository: SDK_URL, branch: 'main', commit: 'd'.repeat(40), packageVersion: '1.19.1' },
+    };
 }
 
 function agentPackage(manifest, relativePath = 'repo/agent/code/package.json') {
@@ -163,8 +171,8 @@ test('dependency store keys: SDK bundle identity is keyed and in-Box SDK declara
     const root = tempRoot(t);
     const agentLib = makeAgentLib(root);
     const none = plans(t, { agentLib });
-    const one = plans(t, { agentLib, sdkBundle: sdkBundle('c'.repeat(64)) });
-    const two = plans(t, { agentLib, sdkBundle: sdkBundle('e'.repeat(64)) });
+    const one = plans(t, { agentLib, sdkBundle: sdkBundle(IMAGE_A) });
+    const two = plans(t, { agentLib, sdkBundle: sdkBundle(IMAGE_B) });
     assert.notEqual(one.seed.inputKey, two.seed.inputKey);
     assert.notEqual(one.agent.inputKey, two.agent.inputKey);
     assert.notEqual(none.seed.inputKey, one.seed.inputKey);
@@ -296,4 +304,55 @@ test('dependency store keys: the dependency store entry module exposes the integ
         'createContainerNpmInstaller', 'discoverGitPins', 'mergeDiscoveredPins', 'resolveHostNpmPolicy', 'containerToolchainIdentity']) {
         assert.equal(typeof dependencyStore[name], 'function', name);
     }
+});
+
+test('dependency store keys: an image AgentLib is keyed by the supplying outer image and library, never by content or revision', (t) => {
+    const root = tempRoot(t);
+    const image = makeImageAgentLib(root, { supplyingImageId: IMAGE_A });
+    const plan = (agentLib, extra = {}) => buildSeedInstallPlan({
+        provider: containerProvider({ imageId: IMAGE_B, agentLib, ...extra }), globalPackage: GLOBAL, agentLibSelection: agentLib,
+    });
+    const base = plan(image);
+    const identity = base.contract.providers.agentLib;
+    assert.deepEqual(Object.keys(identity).sort(),
+        ['adapterSchema', 'installTarget', 'library', 'linkTarget', 'mode', 'sourceIdHash', 'supplyingImageId']);
+    assert.equal(identity.mode, 'image');
+    assert.equal(identity.library, 'achillesAgentLib');
+    assert.equal(identity.supplyingImageId, IMAGE_A);
+    assert.equal(identity.linkTarget, '/opt/ploinky-agentlib');
+    assert.equal(base.contract.toolchain.imageId, IMAGE_B, 'the nested toolchain identity stays separate');
+
+    // Only the supplying image (and library) changes the image identity.
+    const otherOuter = makeImageAgentLib(root, { supplyingImageId: IMAGE_B });
+    assert.notEqual(plan(otherOuter).inputKey, base.inputKey, 'a changed outer image changes the key even with a fixed nested image');
+    assert.equal(plan(image, { imageId: IMAGE_A }).contract.providers.agentLib.supplyingImageId, IMAGE_A);
+    assert.notEqual(plan(image, { imageId: IMAGE_A }).inputKey, base.inputKey, 'a changed nested image changes the toolchain part independently');
+    // Informational provenance is not part of the selection identity.
+    assert.equal(plan({ ...image, commit: 'a'.repeat(40), provenance: { commit: 'b'.repeat(40) } }).inputKey, base.inputKey);
+    assert.throws(() => plan({ ...image, supplyingImageId: 'node:20' }), { code: 'PLOINKY_DEPS_AGENTLIB_IDENTITY_MISSING' });
+    assert.throws(() => plan({ ...image, supplyingImageId: undefined }), { code: 'PLOINKY_DEPS_AGENTLIB_IDENTITY_MISSING' });
+});
+
+test('dependency store keys: the local AgentLib identity keeps exactly today\'s shape, so native keys are unchanged', (t) => {
+    const root = tempRoot(t);
+    const local = makeAgentLib(root);
+    for (const provider of [hostProvider({ agentLib: local }), containerProvider({ imageId: IMAGE_A, agentLib: local })]) {
+        assert.deepEqual(Object.keys(provider.providers.agentLib).sort(),
+            ['adapterSchema', 'commit', 'fingerprint', 'installTarget', 'linkTarget', 'mode', 'sourceIdHash']);
+        assert.equal(provider.providers.mcpSdk, null, 'native and host providers carry no image SDK identity');
+    }
+    // A native (no SDK provider) key does not depend on any outer image.
+    const native = plans(t, { agentLib: local });
+    assert.equal(native.seed.contract.providers.mcpSdk, null);
+    assert.equal(native.seed.contract.providers.agentLib.fingerprint, local.fingerprint);
+});
+
+test('dependency store keys: the SDK provider identity is exactly the supplying image plus the library', (t) => {
+    const root = tempRoot(t);
+    const agentLib = makeAgentLib(root);
+    const withSdk = plans(t, { agentLib, sdkBundle: sdkBundle(IMAGE_A) });
+    assert.deepEqual(withSdk.seed.contract.providers.mcpSdk, { kind: 'image', library: 'mcp-sdk', supplyingImageId: IMAGE_A });
+    // Provenance and package version are informational and never key.
+    const otherProvenance = { ...sdkBundle(IMAGE_A), provenance: { repository: null, branch: null, commit: 'f'.repeat(40), packageVersion: '9.9.9' }, packageVersion: '9.9.9' };
+    assert.equal(plans(t, { agentLib, sdkBundle: otherProvenance }).seed.inputKey, withSdk.seed.inputKey);
 });

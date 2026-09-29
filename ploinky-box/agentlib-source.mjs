@@ -9,7 +9,12 @@
 import fs from 'node:fs';
 import { spawnSync } from 'node:child_process';
 
-import { AGENTLIB_ERROR_CODES, AGENTLIB_LOCAL_DIR_NAME, agentLibError } from '../agentlib/contract.mjs';
+import {
+    AGENTLIB_ERROR_CODES,
+    AGENTLIB_LOCAL_DIR_NAME,
+    agentLibError,
+    agentLibIdentityEquals,
+} from '../agentlib/contract.mjs';
 import { isInsideBoxRuntime } from '../agentlib/bootstrap.mjs';
 import { fingerprintSource } from '../agentlib/fingerprint.mjs';
 import {
@@ -45,24 +50,30 @@ export function readLocalGitState(sourceDir, { spawn = spawnSync } = {}) {
 }
 
 /**
- * Prefer the exact local checkout, otherwise use the verified image bundle.
- * Neither path clones, fetches, creates source state, or changes a checkout.
- * Global branch policy applies to local sources. Image bytes are selected at
- * the commit the verified bundle reports; the image loader compares it with the
- * dependency lock. An explicit `expectedCommit` or `remote.commit` still has to
- * match exactly. A local validation failure never probes the image.
+ * Prefer the exact local checkout, otherwise use the library the Box image
+ * supplies. Neither path clones, fetches, creates source state, or changes a
+ * checkout. Global branch policy applies to local sources. An image source is
+ * identified by the outer image that supplies it, whatever revision that image
+ * was built from. A local validation failure never probes the image.
+ *
+ * A present `active.json` is authority state, so it is validated by the
+ * current descriptor validator before any local probe, image load or mutation:
+ * a descriptor this Ploinky does not support fails with its file named, and an
+ * absent one is simply an uninitialized workspace. Nothing here converts it.
+ * A read-only caller (native `status`) selects without that gate so it can
+ * report the unsupported descriptor, naming its file, instead of refusing.
  */
 export async function selectWorkspaceAgentLibSource({
     workspaceRoot,
     branchPolicy = null,
     imageBundle = null,
     loadImageBundle = null,
-    remote = null,
-    expectedCommit = null,
     fsApi = fs,
     gitState = readLocalGitState,
     now,
+    readOnly = false,
 }) {
+    if (!readOnly) readActiveDescriptor(workspaceRoot, fsApi);
     const selectLocal = () => selectAgentLibSource({
         workspaceRoot,
         fsApi,
@@ -82,12 +93,12 @@ export async function selectWorkspaceAgentLibSource({
     if (!bundle) {
         throw agentLibError(AGENTLIB_ERROR_CODES.imageRequired,
             'No local achillesAgentLib checkout exists. Start this workspace with \u0060ploinky start\u0060 '
-            + 'to use the pinned Box image bundle, or add <workspace>/achillesAgentLib for ploinky-local.');
+            + 'to use the copy supplied by the Box image, or add <workspace>/achillesAgentLib for ploinky-local.');
     }
     const selection = buildImageSelection({
         workspaceRoot,
-        imageBundle: bundle,
-        expectedCommit: expectedCommit || remote?.commit || null,
+        supplyingImageId: bundle.supplyingImageId,
+        provenance: bundle.provenance,
         fsApi,
         ...(now ? { now } : {}),
     });
@@ -110,14 +121,17 @@ export function assertNotInBoxSourceOwner(insideBox) {
     }
 }
 
-/** Revalidate local bytes or select the current pinned image without host Git. */
+/**
+ * Revalidate local bytes or select the image-supplied library again without
+ * host Git. `changed` follows the mode-aware identity: a local selection by its
+ * physical source and content fingerprint, an image selection by the outer
+ * image ID that supplies it.
+ */
 export async function updateWorkspaceAgentLibSource({
     workspaceRoot,
     branchPolicy = null,
     imageBundle = null,
     loadImageBundle = null,
-    remote = null,
-    expectedCommit = null,
     fsApi = fs,
     gitState = readLocalGitState,
     insideBox = isInsideBoxRuntime({ fsApi }),
@@ -126,15 +140,12 @@ export async function updateWorkspaceAgentLibSource({
     assertNotInBoxSourceOwner(insideBox);
     const previous = readActiveDescriptor(workspaceRoot, fsApi);
     const { selection, mode } = await selectWorkspaceAgentLibSource({
-        workspaceRoot, branchPolicy, imageBundle, loadImageBundle, remote, expectedCommit, fsApi, gitState, now,
+        workspaceRoot, branchPolicy, imageBundle, loadImageBundle, fsApi, gitState, now,
     });
     return {
         mode,
         selection,
-        changed: previous?.contentFingerprint !== selection.contentFingerprint
-            || previous?.mode !== selection.mode || previous?.imageId !== selection.imageId
-            || previous?.sourceId.device !== selection.sourceId.device
-            || previous?.sourceId.inode !== selection.sourceId.inode,
+        changed: !agentLibIdentityEquals(previous, selection),
         previous,
     };
 }
@@ -169,7 +180,7 @@ export function inspectWorkspaceAgentLibSource({
             drifted: missingLocal,
             present: Boolean(active) && !missingLocal,
             detail: detail || (missingLocal
-                ? 'The selected local achillesAgentLib checkout is missing; the next lifecycle command requires the pinned Box image bundle.'
+                ? 'The selected local achillesAgentLib checkout is missing; the next lifecycle command uses the copy supplied by the Box image.'
                 : active ? '' : 'no achillesAgentLib source has been selected yet'),
         };
     }

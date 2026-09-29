@@ -380,9 +380,8 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                 }
             }
             // The global --branch is applied to achillesAgentLib by the source
-            // selector that runs before this command, which resolves the branch
-            // to one exact managed generation or validates a local checkout
-            // against it. Nothing here reconfigures an AgentLib dependency.
+            // selector that runs before this command, which validates the local
+            // checkout against it. Nothing here reconfigures an AgentLib dependency.
             await startWorkspace(startParsed.staticAgent, startParsed.port ?? undefined, {
                 enableAgent,
                 killRouterIfRunning,

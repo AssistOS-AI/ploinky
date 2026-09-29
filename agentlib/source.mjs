@@ -1,7 +1,8 @@
 // Pure achillesAgentLib source selection and validation.
 //
 // Importing this module never clones, fetches, or creates workspace state.
-// An absent local checkout requires the pinned Box image bundle.
+// An absent local checkout requires the achillesAgentLib copy supplied by the
+// Box image.
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -16,16 +17,14 @@ import {
     AGENTLIB_SELECTION_SCHEMA_VERSION,
     AGENTLIB_STABLE_MOUNT_PATH,
     agentLibError,
-    imageSourceId,
-    validateImageBundleMetadata,
+    imageSourceIdentity,
+    normalizeLibraryProvenance,
     validateSelectionDescriptor,
 } from './contract.mjs';
 import { fingerprintSource, sha256Hex, sourceIdEquals, sourceIdOf } from './fingerprint.mjs';
 
 export const ACTIVE_DESCRIPTOR_FILENAME = 'active.json';
 export const TRANSACTION_DESCRIPTOR_FILENAME = 'transaction.json';
-export const MIRROR_DIRNAME = 'mirror.git';
-export const GENERATIONS_DIRNAME = 'generations';
 export const SOURCE_LOCK_FILENAME = '.source.lock';
 
 /**
@@ -100,24 +99,12 @@ export function managedRootPath(workspaceRoot, fsApi = fs) {
     return path.join(canonicalWorkspaceRoot(workspaceRoot, fsApi), AGENTLIB_MANAGED_RELATIVE_DIR);
 }
 
-export function managedGenerationsDir(workspaceRoot) {
-    return path.join(managedRootPath(workspaceRoot), GENERATIONS_DIRNAME);
-}
-
-export function managedMirrorPath(workspaceRoot) {
-    return path.join(managedRootPath(workspaceRoot), MIRROR_DIRNAME);
-}
-
 export function activeDescriptorPath(workspaceRoot) {
     return path.join(managedRootPath(workspaceRoot), ACTIVE_DESCRIPTOR_FILENAME);
 }
 
 export function transactionDescriptorPath(workspaceRoot) {
     return path.join(managedRootPath(workspaceRoot), TRANSACTION_DESCRIPTOR_FILENAME);
-}
-
-export function generationDirName(commit, fingerprint) {
-    return `${commit}-${String(fingerprint).slice(0, 12)}`;
 }
 
 /**
@@ -186,7 +173,7 @@ function walkForEscapingSymlinks(sourceDir, fsApi) {
  * @param {object} [opts]
  * @param {typeof fs} [opts.fsApi]
  * @param {boolean} [opts.deepSymlinkScan=true]
- * @returns {{ sourceDir: string, sourceId: {device:string,inode:string}, packageName: string }}
+ * @returns {{ sourceDir: string, sourceId: {device:string,inode:string}, packageName: string, packageVersion: string|null }}
  */
 export function validateAgentLibSource(candidate, { fsApi = fs, deepSymlinkScan = true } = {}) {
     const stat = (() => {
@@ -260,7 +247,12 @@ export function validateAgentLibSource(candidate, { fsApi = fs, deepSymlinkScan 
     }
     if (deepSymlinkScan) walkForEscapingSymlinks(sourceDir, fsApi);
 
-    return { sourceDir, sourceId: afterId, packageName: pkg.name };
+    return {
+        sourceDir,
+        sourceId: afterId,
+        packageName: pkg.name,
+        packageVersion: typeof pkg.version === 'string' ? pkg.version : null,
+    };
 }
 
 /**
@@ -269,9 +261,6 @@ export function validateAgentLibSource(candidate, { fsApi = fs, deepSymlinkScan 
  * @param {object} params
  * @param {string} params.workspaceRoot
  * @param {string} params.sourceDir - canonical absolute source path
- * @param {'local'|'managed'} params.mode
- * @param {string|null} [params.remoteUrl]
- * @param {string|null} [params.requestedRef]
  * @param {string|null} [params.resolvedCommit]
  * @param {boolean} [params.dirty]
  * @param {typeof fs} [params.fsApi]
@@ -280,9 +269,6 @@ export function validateAgentLibSource(candidate, { fsApi = fs, deepSymlinkScan 
 export function buildSelection({
     workspaceRoot,
     sourceDir,
-    mode,
-    remoteUrl = null,
-    requestedRef = null,
     resolvedCommit = null,
     dirty = false,
     fsApi = fs,
@@ -301,11 +287,11 @@ export function buildSelection({
     const descriptor = validateSelectionDescriptor({
         schemaVersion: AGENTLIB_SELECTION_SCHEMA_VERSION,
         workspacePathHash: workspacePathHash(root, fsApi),
-        mode,
+        mode: 'local',
         sourceRelativePath: relative.split(path.sep).join('/'),
         sourceId,
-        remoteUrl,
-        requestedRef,
+        remoteUrl: null,
+        requestedRef: null,
         resolvedCommit,
         dirty,
         contentFingerprint: fingerprint,
@@ -316,23 +302,28 @@ export function buildSelection({
     return { ...descriptor, sourceDir: canonicalSource, workspaceRoot: root };
 }
 
-/** Select verified immutable image bytes without resolving a host filesystem path. */
-export function buildImageSelection({ workspaceRoot, imageBundle, expectedCommit = null, fsApi = fs,
+/**
+ * Select the library copy the Box image supplies, without resolving a host
+ * filesystem path. Its identity is the immutable outer image ID plus the
+ * library; the optional provenance is informational and never identity.
+ *
+ * @param {object} params
+ * @param {string} params.workspaceRoot
+ * @param {string} params.supplyingImageId - engine-observed immutable outer Box image ID
+ * @param {object|null} [params.provenance] - optional `{repository, branch, commit, packageVersion}`
+ */
+export function buildImageSelection({ workspaceRoot, supplyingImageId, provenance = null, fsApi = fs,
     now = () => new Date().toISOString() }) {
-    const bundle = validateImageBundleMetadata({ schemaVersion: 1, ...imageBundle }, { expectedCommit });
+    const identity = imageSourceIdentity(supplyingImageId);
     const root = canonicalWorkspaceRoot(workspaceRoot, fsApi);
     const descriptor = validateSelectionDescriptor({
         schemaVersion: AGENTLIB_SELECTION_SCHEMA_VERSION,
         workspacePathHash: workspacePathHash(root, fsApi),
         mode: 'image',
         sourceRelativePath: 'image',
-        sourceId: imageSourceId(imageBundle.imageId, bundle.fingerprint),
-        imageId: imageBundle.imageId,
-        remoteUrl: null,
-        requestedRef: null,
-        resolvedCommit: bundle.commit,
-        dirty: false,
-        contentFingerprint: bundle.fingerprint,
+        sourceId: identity,
+        supplyingImageId: identity.supplyingImageId,
+        provenance: normalizeLibraryProvenance(provenance),
         selectedAt: now(),
     });
     return { ...descriptor, sourceDir: AGENTLIB_STABLE_MOUNT_PATH, workspaceRoot: root };
@@ -403,6 +394,27 @@ export function clearTransactionDescriptor(workspaceRoot, fsApi = fs) {
 }
 
 /**
+ * Validate a persisted descriptor and name its file on failure. A descriptor of
+ * a shape this version does not write (an image or removed `managed` selection
+ * from an earlier contract) is unsupported authority state: it is reported, not
+ * converted.
+ */
+function validateDescriptorFile(file, parsed) {
+    try {
+        return validateSelectionDescriptor(parsed);
+    } catch (error) {
+        if (error?.code !== AGENTLIB_ERROR_CODES.descriptorInvalid) throw error;
+        throw agentLibError(
+            AGENTLIB_ERROR_CODES.descriptorInvalid,
+            `The AgentLib selection at ${file} is not valid for this Ploinky: ${error.message} `
+            + 'Selection state written by another Ploinky version is not converted: remove this file '
+            + 'and run the command again (a Box that version created must also be stopped and destroyed).',
+            { cause: error },
+        );
+    }
+}
+
+/**
  * Read `active.json` if present. Returns null when absent; throws when present
  * and malformed, because a corrupt descriptor must not read as "no selection".
  */
@@ -428,7 +440,7 @@ export function readActiveDescriptor(workspaceRoot, fsApi = fs) {
             { cause: error },
         );
     }
-    return validateSelectionDescriptor(parsed);
+    return validateDescriptorFile(activeDescriptorPath(workspaceRoot), parsed);
 }
 
 /**
@@ -463,12 +475,25 @@ export function restoreActiveDescriptorText(workspaceRoot, text, fsApi = fs) {
 }
 
 export function readTransactionDescriptor(workspaceRoot, fsApi = fs) {
+    const file = transactionDescriptorPath(workspaceRoot);
+    let raw;
     try {
-        return validateSelectionDescriptor(JSON.parse(fsApi.readFileSync(transactionDescriptorPath(workspaceRoot), 'utf8')));
+        raw = fsApi.readFileSync(file, 'utf8');
     } catch (error) {
         if (error?.code === 'ENOENT') return null;
         throw error;
     }
+    let parsed;
+    try {
+        parsed = JSON.parse(raw);
+    } catch (error) {
+        throw agentLibError(
+            AGENTLIB_ERROR_CODES.descriptorInvalid,
+            `The AgentLib transaction descriptor at ${file} is not valid JSON.`,
+            { cause: error },
+        );
+    }
+    return validateDescriptorFile(file, parsed);
 }
 
 /**
@@ -544,9 +569,6 @@ export function selectAgentLibSource({
     const selection = buildSelection({
         workspaceRoot: root,
         sourceDir,
-        mode: 'local',
-        remoteUrl: null,
-        requestedRef: null,
         resolvedCommit: git?.commit || null,
         dirty: Boolean(git?.dirty),
         fsApi,

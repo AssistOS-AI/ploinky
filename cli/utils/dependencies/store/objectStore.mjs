@@ -23,7 +23,12 @@ import { spawnSync } from 'node:child_process';
 
 import { assertWorkspaceMutationLease } from '../../runtime/maintenanceLocks.js';
 import { agentLibCacheLinkProblem, ensureAgentLibCacheLink, installWithAgentLib } from '../agentLibLink.js';
-import { finalizeBoxMcpSdkCache, installWithBoxMcpSdk } from '../../../../ploinky-box/agent-dependencies/mcp-sdk.mjs';
+import {
+    boxMcpSdkCacheProblem,
+    carryBoxMcpSdkRecord,
+    finalizeBoxMcpSdkCache,
+    installWithBoxMcpSdk,
+} from '../../../../ploinky-box/agent-dependencies/mcp-sdk.mjs';
 import { isInsideBox } from '../../../../ploinky-box/lib/boxMarker.mjs';
 import { dependencyStoreError, canonicalDigest, FULL_SHA256_PATTERN, assertFullSha256, sha256Hex } from './canonical.mjs';
 import { commitPinState, fsyncDirectory, readPinState, writeFileAtomic } from './gitPins.mjs';
@@ -210,11 +215,22 @@ export function createCacheStore({
         }
         const payloadPath = payloadPathOf(objectId);
         if (manifest.payloadPath !== payloadPath) return { valid: false, reason: 'payload path moved' };
+        // The provider rule comes from the contract the input key is bound to,
+        // never from anything else the manifest says.
+        const sdkProvider = imageSdkProviderOf(manifest.contract);
         let tree;
         try {
-            tree = hashInstalledTree(payloadPath, { approvedExternalTargets: manifest.approvedExternalTargets || [], fsApi });
+            tree = hashInstalledTree(payloadPath, {
+                approvedExternalTargets: manifest.approvedExternalTargets || [],
+                imageSdkProvider: Boolean(sdkProvider),
+                fsApi,
+            });
         } catch (error) {
             return { valid: false, reason: `installed tree invalid: ${error.message}` };
+        }
+        if (sdkProvider) {
+            const problem = boxMcpSdkCacheProblem(payloadPath, { identity: sdkProvider });
+            if (problem) return { valid: false, reason: problem };
         }
         if (tree.hash !== manifest.tree?.hash) return { valid: false, reason: 'installed tree hash mismatch' };
         const resolution = buildResolutionManifest(readHiddenLock(payloadPath, { fsApi }), { installer: manifest.resolution?.installer || null });
@@ -519,6 +535,9 @@ export function createCacheStore({
             try {
                 if (seedSource) {
                     copySeed(path.join(seedSource.payloadPath, 'node_modules'), path.join(payloadPath, 'node_modules'), { fsApi });
+                    // The seed's SDK copy arrives with its completion record; the
+                    // provider check below still requires it to name this image.
+                    carryBoxMcpSdkRecord(seedSource.payloadPath, payloadPath);
                 } else if (plan.npmRequired) {
                     if (!installer) throw dependencyStoreError('PLOINKY_DEPS_INSTALLER_REQUIRED', 'an installer is required for this build');
                     updateBuildReceipt(receipt, { installerStarted: true });
@@ -537,7 +556,11 @@ export function createCacheStore({
             const resolution = buildResolutionManifest(hiddenLock, { installer: installerDescription });
             const provenance = verifyDirectGitProvenance(payloadPath, plan.expectedGit, { hiddenLock, pinVerification, fsApi });
             const approvedExternalTargets = approvedTargets(plan);
-            const tree = hashInstalledTree(payloadPath, { approvedExternalTargets, fsApi });
+            const tree = hashInstalledTree(payloadPath, {
+                approvedExternalTargets,
+                imageSdkProvider: Boolean(imageSdkProviderOf(plan.contract)),
+                fsApi,
+            });
             const generationId = generationIdFor(plan.inputKey, resolution.hash, tree.hash);
             at('verified', { objectId, generationId });
 
@@ -832,6 +855,15 @@ export function generationIdFor(inputKey, resolutionHash, treeHash) {
         if (!FULL_SHA256_PATTERN.test(String(value || ''))) throw dependencyStoreError('PLOINKY_DEPS_KEY_INVALID', `${label} must be a full SHA-256`);
     }
     return sha256Hex(`${inputKey}\n${resolutionHash}\n${treeHash}`);
+}
+
+/**
+ * The image SDK provider a contract names, or null. This is the only thing that
+ * excludes the supplied SDK from byte hashing.
+ */
+function imageSdkProviderOf(contract) {
+    const provider = contract?.providers?.mcpSdk;
+    return provider && provider.kind === 'image' && provider.library === 'mcp-sdk' ? provider : null;
 }
 
 function approvedTargets(plan) {

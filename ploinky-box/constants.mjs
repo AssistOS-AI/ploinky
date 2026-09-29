@@ -58,6 +58,10 @@ export const BOX_AGENTLIB_LABELS = Object.freeze({
     commit: 'io.assistos.ploinky-box.agentlib-commit',
 });
 
+/** The recovery an owned Box created under an incompatible contract needs; no adapter exists. */
+export const INCOMPATIBLE_BOX_GUIDANCE = "; back up any Box-only data, then run 'ploinky stop'"
+    + " and 'ploinky destroy' before retrying";
+
 export const BOX_ROLES = Object.freeze({
     container: 'box',
 });
