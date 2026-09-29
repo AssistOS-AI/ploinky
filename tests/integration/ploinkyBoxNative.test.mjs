@@ -335,6 +335,37 @@ function readDependencyCacheFile(harness, relativePath) {
     ).trim();
 }
 
+// Runs from /opt/ploinky, so `mcp-sdk` resolves the way Ploinky's own modules
+// import it. Arguments: the Box copy and the image bundle it was copied from.
+const MCP_SDK_EVIDENCE_SCRIPT = [
+    "import fs from 'node:fs';",
+    'const [copy, bundle] = process.argv.slice(1);',
+    "const read = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));",
+    "const pkg = read(copy + '/package.json');",
+    "const sdk = await import('mcp-sdk');",
+    'const { z } = sdk.zod;',
+    'const schema = z.object({ text: z.string() });',
+    "schema.parse({ text: 'probe' });",
+    'let rejected = false;',
+    'try { schema.parse({ text: 1 }); } catch { rejected = true; }',
+    "new sdk.mcp.McpServer({ name: 'ploinky-box-native-probe', version: '1.0.0' });",
+    'process.stdout.write(JSON.stringify({',
+    'packageName: pkg.name,',
+    'packageVersion: pkg.version,',
+    "copyProvenance: read(copy + '/.ploinky-box-mcp-sdk.json'),",
+    "bundleProvenance: read(bundle + '/.ploinky-box-mcp-sdk.json'),",
+    'rejected,',
+    'members: {',
+    "'types.isInitializeRequest': typeof sdk.types?.isInitializeRequest,",
+    "'types.McpError': typeof sdk.types?.McpError,",
+    "'streamHttp.StreamableHTTPServerTransport': typeof sdk.streamHttp?.StreamableHTTPServerTransport,",
+    "'mcp.McpServer': typeof sdk.mcp?.McpServer,",
+    "'client.Client': typeof sdk.client?.Client,",
+    "StreamableHTTPClientTransport: typeof sdk.StreamableHTTPClientTransport,",
+    '},',
+    '}));',
+].join('\n');
+
 // Core bootstrap also runs for stop. These graphless fixtures contain empty
 // installed repositories so the real stop/replacement path has no optional
 // application sources to fetch. The full smoke graph uses its own staging.
@@ -574,18 +605,54 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     ]).split(/\n/);
     assert.equal(keyEvidence[0], '600');
     assert.match(keyEvidence[1], /^[a-f0-9]{64}\s/);
-    // The Box materializes mcp-sdk from the immutable image bundle only.
+    // The Box materializes mcp-sdk from the immutable image bundle only. Its
+    // identity is the observed outer Box image that supplies it; the image
+    // build owns the revision, so none is pinned here.
+    assert.deepEqual(JSON.parse(readDependencyCacheFile(harness, '.ploinky-box-dependencies.json')), {
+        schema: 'ploinky.box.dependencies/v2',
+        providedLibraries: {
+            'mcp-sdk': {
+                kind: 'image',
+                library: 'mcp-sdk',
+                supplyingImageId: normalizeImageId(candidateImageId),
+            },
+        },
+    });
+    const sdkProbe = harness.runner.query('podman', [
+        'container', 'exec', '--user', 'podman', '--workdir', '/opt/ploinky',
+        prepared.containerId,
+        'node', '--input-type=module', '-e', MCP_SDK_EVIDENCE_SCRIPT,
+        '/opt/ploinky/node_modules/mcp-sdk', '/usr/local/lib/ploinky/mcp-sdk',
+    ], { timeoutMs: 120_000 });
+    assert.equal(sdkProbe.ok, true, sdkProbe.stderr);
+    const sdkEvidence = JSON.parse(sdkProbe.stdout);
+    assert.equal(sdkEvidence.packageName, '@modelcontextprotocol/sdk');
+    // The copy carries the supplying image's own flat provenance record.
+    const sdkProvenance = sdkEvidence.copyProvenance;
+    assert.deepEqual(sdkProvenance, {
+        schema: 'ploinky.box.library/v1',
+        library: 'mcp-sdk',
+        packageName: '@modelcontextprotocol/sdk',
+        packageVersion: sdkEvidence.packageVersion,
+        repository: 'https://github.com/AssistOS-AI/MCPSDK.git',
+        branch: sdkProvenance.branch,
+        commit: sdkProvenance.commit,
+    });
+    assert.match(sdkProvenance.commit, /^[a-f0-9]{40}$/);
+    assert.ok(sdkProvenance.branch === null
+        || (typeof sdkProvenance.branch === 'string' && sdkProvenance.branch !== ''));
+    assert.deepEqual(sdkEvidence.bundleProvenance, sdkProvenance);
+    // The package works through Ploinky's own import path.
+    assert.equal(sdkEvidence.rejected, true);
+    assert.deepEqual(sdkEvidence.members, {
+        'types.isInitializeRequest': 'function',
+        'types.McpError': 'function',
+        'streamHttp.StreamableHTTPServerTransport': 'function',
+        'mcp.McpServer': 'function',
+        'client.Client': 'function',
+        StreamableHTTPClientTransport: 'function',
+    });
     // With no local checkout, achillesAgentLib stays in its protected image tree.
-    for (const [repository, revision] of [
-        ['mcp-sdk', '7efe9d17f52a625743e411089d3a6879f6f89156'],
-    ]) {
-        assert.equal(execInBox(harness.runner, prepared.containerId, [
-            'node', '-e', [
-                `const metadata=require('/opt/ploinky/node_modules/${repository}/.ploinky-box-mcp-sdk.json');`,
-                'process.stdout.write(metadata.repository.commit);',
-            ].join(''),
-        ]), revision);
-    }
     // The selected bundle is present at the stable path, and no writable
     // dependency-cache copy can shadow it.
     assert.match(
@@ -823,8 +890,8 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     ), 'workspace-retained');
     assertNoOwnedNamedVolume(harness);
 
-    // A clean rebuild recreates both cache directories and reinstalls the
-    // pinned dependencies from scratch.
+    // A clean rebuild recreates both cache directories and copies the
+    // image-supplied mcp-sdk from scratch.
     const rebuilt = await harness.supervisor.prepareBoxForCommand(
         isolatedBoxOptions(candidateReference, lifecyclePorts),
     );
