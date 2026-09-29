@@ -52,6 +52,17 @@ async function request(appState, url, options = {}) {
 
 test.after(() => fs.rmSync(root, { recursive: true, force: true }));
 
+test('invalid launch folders return an error without allocating a root conversation', async () => {
+    const appState = { sessions: new Map(), runtimes: new Map() };
+    for (const route of ['/', '/stream', '/directories']) {
+        const response = await request(appState, `/webchat${route}?workspace-dir=../outside`);
+        assert.equal(response.statusCode, 400);
+        assert.match(response.body, /Invalid WebChat workspace directory/);
+    }
+    assert.equal(appState.runtimes.size, 0);
+    assert.equal(appState.sessions.size, 0);
+});
+
 test('WebChat page exposes the workspace-relative base used by file preview links', async () => {
     const appState = { sessions: new Map(), runtimes: new Map() };
     const response = await request(appState, '/webchat/?workspace-dir=project');

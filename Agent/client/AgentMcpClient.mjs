@@ -149,19 +149,20 @@ function sleep(ms) {
 }
 
 function marketplaceToolForRequest(method, body) {
+    if (method === 'POST' && ['install', 'remove'].includes(body?.action)) return `repositories.${body.action}`;
     if (method === 'POST' && body?.action === 'install_repo') return 'repositories.prepare';
     return method === 'POST' && body?.action === 'enable_agent'
         ? MARKETPLACE_ENABLE_TOOL
         : MARKETPLACE_READ_TOOL;
 }
 
-export function requestMarketplace(method = 'GET', body = null, descriptor, resource = '') {
+export function requestMarketplace(method = 'GET', body = null, descriptor, resource = '', { raw = false } = {}) {
     const verified = trustedDescriptor(descriptor);
     const requestPath = MARKETPLACE_PATH + (resource ? `/${resource}` : '');
     const url = resolveGeneratedRouterOperation(verified, requestPath);
     const httpModule = url.protocol === 'https:' ? https : http;
     const payload = body ? Buffer.from(JSON.stringify(body), 'utf8') : Buffer.alloc(0);
-    const tool = ['install', 'remove'].includes(resource) ? `repositories.${resource}` : marketplaceToolForRequest(method, body);
+    const tool = marketplaceToolForRequest(method, body);
     const assertion = signAgentHttpAssertion({
         method,
         path: requestPath,
@@ -206,7 +207,7 @@ export function requestMarketplace(method = 'GET', body = null, descriptor, reso
                     reject(error);
                     return;
                 }
-                resolve(json.marketplace || json);
+                resolve(raw ? json : (json.marketplace || json));
             });
         });
         req.setTimeout(30000, () => req.destroy(new Error('Repository request timed out')));
@@ -236,7 +237,7 @@ function findMarketplaceAgent(marketplace, agentRef) {
 
 export async function getAgentStatus(agentRef, descriptor) {
     const verified = trustedDescriptor(descriptor);
-    const marketplace = await requestMarketplace('GET', null, verified);
+    const marketplace = await requestMarketplace('GET', null, verified, 'agents');
     return findMarketplaceAgent(marketplace, agentRef);
 }
 
@@ -253,7 +254,7 @@ export async function ensureAgentRunning(agentRef, options = {}, descriptor) {
         action: 'enable_agent',
         agentRef: initial.ref,
         ...(mode ? { mode } : {}),
-    }, verified);
+    }, verified, 'agents');
     const enabled = findMarketplaceAgent(marketplace, initial.ref);
     if (enabled?.running === true) return enabled;
 

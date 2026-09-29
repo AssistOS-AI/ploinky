@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { once } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -19,6 +19,21 @@ const {
 } = await import('../../cli/sandbox/networkLifecycle.js');
 const { ensureAgentService } = await import('../../cli/sandbox/docker/agentServiceManager.js');
 const lockPath = path.join(workspace, '.ploinky', 'run', 'network.lock');
+
+test('CLI attachment preserves folder arguments through the container shell', async () => {
+    const { dependencies } = cliHarness();
+    const args = ["--dir=/workspace/My folder & team's notes", '--literal=$(printf changed)', 'line\nbreak'];
+    dependencies.readManifest = () => ({
+        cli: "node -e 'console.log(JSON.stringify(process.argv.slice(1)))' --",
+        readiness: { protocol: 'mcp' },
+    });
+    let received;
+    dependencies.attachInteractive = (_name, _workdir, command) => {
+        received = JSON.parse(execFileSync('/bin/sh', ['-c', command], { encoding: 'utf8' }));
+    };
+    await runCliWithDependencies('alpha', args, dependencies);
+    assert.deepEqual(received, args);
+});
 
 function deferred() {
     let resolve;

@@ -263,3 +263,45 @@ test('nested Podman is Box-only and mutually exclusive with privileged mode', ()
             && error.context.unsupported.includes('nested-podman-outside-box'),
     );
 });
+
+test('an agent may ask for a bounded /dev/shm; it gets it in its own IPC namespace', () => {
+    const manifest = { containerSecurity: { shmSize: '2g' } };
+    const admission = admitManifestRuntimeCapabilities(manifest, {
+        manifestBytes: Buffer.from(JSON.stringify(manifest)),
+        insideBox: false,
+    });
+    assert.equal(admission.descriptor.containerSecurity.shmSize, '2g');
+    const args = renderRuntimePolicyArgs(admission.descriptor, { runtime: 'podman' });
+    assert.deepEqual(args.slice(args.indexOf('--shm-size'), args.indexOf('--shm-size') + 2), ['--shm-size', '2g']);
+    assert.deepEqual(args.slice(args.indexOf('--ipc'), args.indexOf('--ipc') + 2), ['--ipc', 'private']);
+    assert.deepEqual(renderContainerSecurityArgs(admission.descriptor), []);
+    // An agent that asks for nothing keeps its descriptor unchanged and still gets private IPC.
+    const plain = resolveEffectiveRuntimeCapabilities({ containerSecurity: {} });
+    assert.deepEqual(plain.containerSecurity, { privileged: false, nestedPodman: false });
+    assert.equal(plain.capabilities.hostIpc, false);
+    for (const shmSize of ['17g', '0m', 2048, '2 g', '../x', true]) {
+        assert.throws(
+            () => validateManifestRuntimeCapabilities({ containerSecurity: { shmSize } }),
+            (error) => error.code === 'PLOINKY_MANIFEST_SECURITY_INVALID' && /shmSize/.test(error.message),
+            String(shmSize),
+        );
+    }
+    // The operator's runtime policy, when it sets a size, wins over the manifest's request.
+    const both = resolveEffectiveRuntimeCapabilities({
+        containerSecurity: { shmSize: '2g' },
+        llmRuntime: { runtimePolicy: { resources: { shmSize: '4g' } } },
+    });
+    assert.equal(both.runtimePolicy.resources.shmSize, '4g');
+    // An operator's profile or override wins too, for the size and for host IPC,
+    // where a manifest's size request is dropped rather than failing the start.
+    const overridden = resolveEffectiveRuntimeCapabilities({ containerSecurity: { shmSize: '2g' } }, {
+        runtime: 'podman', overridePolicy: { resources: { shmSize: '8g' } },
+    });
+    assert.equal(overridden.runtimePolicy.resources.shmSize, '8g');
+    const hostIpc = resolveEffectiveRuntimeCapabilities({ containerSecurity: { shmSize: '2g' } }, {
+        runtime: 'podman', profileConfig: { llmRuntime: { runtimePolicy: { ipc: 'host' } } },
+    });
+    assert.equal(hostIpc.runtimePolicy.ipc, 'host');
+    assert.equal(hostIpc.runtimePolicy.resources?.shmSize, undefined);
+    assert.equal(hostIpc.capabilities.hostIpc, true);
+});

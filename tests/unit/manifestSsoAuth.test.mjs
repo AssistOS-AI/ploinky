@@ -133,7 +133,7 @@ test('login delegates to SSO and old local login/account requests fail over HTTP
         const account = await fetch(`${base}/auth/account`, { method, headers });
         assert.equal(account.status, 404);
         assert.deepEqual(await account.json(), { ok: false, error: 'local_auth_disabled' });
-        const marketplace = await fetch(`${base}/api/marketplace?agent=localApp`, { method, headers });
+        const marketplace = await fetch(`${base}/api/marketplace/agents?agent=localApp`, { method, headers });
         assert.equal(marketplace.status, 401, await marketplace.text());
     }
     const users = await fetch(`${base}/api/agents/app/users`, { headers });

@@ -23,6 +23,11 @@ import {
 } from '../contract/image.mjs';
 import { discoverBoxOwnership } from '../engine/discovery.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
+import {
+    createGpuGrantStore,
+    observeContainerGpuWiring,
+    sameGpuWiring,
+} from '../gpuGrant.mjs';
 import { probeImageAgentLib } from '../image-agentlib.mjs';
 import { normalizeImageId } from '../contract/image-id.mjs';
 import { observedBoxNetworkMode, selectedBoxNetworkMode } from '../contract/network.mjs';
@@ -93,11 +98,16 @@ function oldDesired(identity, ownership, repositoryRoot, engine) {
     const agentLib = agentLibContractFromContainer(container);
     // A Box without bind metadata is the loopback publication.
     const routerBinding = observeContainerRouterBinding(container);
+    // The GPU wiring comes from the Box's own label, create command and
+    // mounts, never from a fresh discovery, so a driver change can replace
+    // (and a failure can restore) exactly the Box that exists.
+    const gpu = observeContainerGpuWiring(container, { identity });
     const desired = {
         identity,
         hostPort,
         mediaHostPort,
         routerBinding,
+        gpu,
         imageRef,
         imageId,
         repositoryRoot,
@@ -153,6 +163,7 @@ async function createAndStart({
     hostPort,
     mediaHostPort,
     routerBinding,
+    gpu = null,
     repositoryRoot,
     agentLib,
     runner,
@@ -199,6 +210,7 @@ async function createAndStart({
         cidfile,
         hostKind: engine.hostKind,
         networkMode,
+        gpu,
     }));
     let containerId;
     try {
@@ -223,6 +235,7 @@ async function createAndStart({
         hostPort,
         mediaHostPort,
         routerBinding,
+        gpu,
         imageId: image.immutableId,
         imageRef,
         repositoryRoot,
@@ -270,6 +283,7 @@ async function restoreOldContainer({
         hostPort: old.hostPort,
         mediaHostPort: old.mediaHostPort,
         routerBinding: old.routerBinding,
+        gpu: old.gpu,
         repositoryRoot: old.repositoryRoot,
         agentLib: old.agentLib,
         restoring: true,
@@ -279,6 +293,7 @@ async function restoreOldContainer({
         startAndWaitReady: dependencies.startAndWaitReady,
         retireStartLock: dependencies.retireStartLock,
         retireEdgePreparation: dependencies.retireEdgePreparation,
+        // The old generation files were never pruned while the old Box existed.
         revalidateDataPaths: dependencies.revalidateDataPaths,
         readCidfile: dependencies.readCidfile,
         fsApi: dependencies.fsApi,
@@ -299,6 +314,9 @@ export async function reconcileBoxContainer({
     explicitPort,
     explicitMediaPort,
     routerBinding = null,
+    // undefined keeps an existing Box's own GPU wiring (a new Box gets none);
+    // null or a wiring from `resolveGpuWiring` selects it exactly.
+    gpu = undefined,
     imageRef = BOX_IMAGE_REFERENCE,
     imagePolicy = 'pull',
     allowReplacement = true,
@@ -336,6 +354,9 @@ export async function reconcileBoxContainer({
         readCidfile: seams.readCidfile || readContainerIdFromCidfile,
         retireStartLock: seams.retireStartLock || retireQuiescentBoxWorkspaceStartLock,
         retireEdgePreparation: seams.retireEdgePreparation || retireQuiescentBoxEdgePreparation,
+        materializeGpu: seams.materializeGpu || ((selectedIdentity, wiring, selectedLock) => {
+            if (wiring) createGpuGrantStore().materialize(selectedIdentity, wiring, selectedLock);
+        }),
         fsApi: seams.fsApi || fs,
         token: seams.token || (() => crypto.randomBytes(12).toString('hex')),
     };
@@ -367,6 +388,7 @@ export async function reconcileBoxContainer({
     const desiredBinding = routerBindingResult(portPlan, portPlan.hostPort);
     const currentContainer = ownership.handles?.container || null;
     const old = currentContainer ? oldDesired(identity, ownership, repositoryRoot, engine) : null;
+    const desiredGpu = gpu === undefined ? (old?.gpu ?? null) : gpu;
     let oldImage = null;
     if (old) {
         oldImage = dependencies.validateExistingImage(engine.name, old.imageId, old.imageRef, runner);
@@ -402,6 +424,9 @@ export async function reconcileBoxContainer({
         // Podman cannot change the published address or the Box environment in
         // place, so an address-only or trusted-host change is a replacement.
         || !samePublication(old.routerBinding, portPlan)
+        // A new or revoked grant, changed agents, or a driver update changes
+        // the devices and binds, which Podman cannot change in place.
+        || !sameGpuWiring(old.gpu, desiredGpu)
         || old.imageRef !== imageRef
         || dataPathsChanged
         // A changed source directory, mode, identity, or fingerprint must never
@@ -461,6 +486,7 @@ export async function reconcileBoxContainer({
                 hostPort: old.hostPort,
                 mediaHostPort: old.mediaHostPort,
                 routerBinding: routerBindingResult(old.routerBinding, old.hostPort),
+                gpu: old.gpu,
                 agentLib: old.agentLib,
             });
             throw failure;
@@ -472,8 +498,10 @@ export async function reconcileBoxContainer({
             hostPort: old.hostPort,
             mediaHostPort: old.mediaHostPort,
             routerBinding: reusedBinding,
+            gpu: old.gpu,
             previousAgentLib: old.agentLib,
             previousRouterBinding: reusedBinding,
+            previousGpu: old.gpu,
             // Non-settling proof of the exact reused Box, for use immediately
             // before a graph mutation or admission write.
             validate() { validateFinalOwnership(currentContainer.id, old); },
@@ -488,6 +516,7 @@ export async function reconcileBoxContainer({
                     hostPort: old.hostPort,
                     mediaHostPort: old.mediaHostPort,
                     routerBinding: reusedBinding,
+                    gpu: old.gpu,
                     agentLib: old.agentLib,
                 });
             },
@@ -535,6 +564,15 @@ export async function reconcileBoxContainer({
     } catch (error) {
         throw transactionError('Workspace Box data preparation failed', error);
     }
+    // The spec and marker the GPU binds name must exist before the old Box is
+    // touched: a new wiring is written, and a kept (observed) wiring is proven
+    // present. Generation files are content addressed and pruned only after a
+    // commit, so a restored old Box also finds its own generation unchanged.
+    try {
+        dependencies.materializeGpu(identity, desiredGpu, lock);
+    } catch (error) {
+        throw transactionError('Box GPU grant wiring preparation failed', error);
+    }
 
     let candidateId = '';
     let candidateAttempted = false;
@@ -567,6 +605,7 @@ export async function reconcileBoxContainer({
             hostPort: portPlan.hostPort,
             mediaHostPort: portPlan.mediaHostPort,
             routerBinding: desiredBinding,
+            gpu: desiredGpu,
             repositoryRoot,
             agentLib: desiredAgentLib,
             runner,
@@ -641,6 +680,7 @@ export async function reconcileBoxContainer({
                 hostPort: old.hostPort,
                 mediaHostPort: old.mediaHostPort,
                 routerBinding: routerBindingResult(old.routerBinding, old.hostPort),
+                gpu: old.gpu,
                 agentLib: old.agentLib,
             } : { action: 'candidate-removed' });
         };
@@ -650,9 +690,11 @@ export async function reconcileBoxContainer({
             hostPort: portPlan.hostPort,
             mediaHostPort: portPlan.mediaHostPort,
             routerBinding: desiredBinding,
+            gpu: desiredGpu,
             imageId: image.immutableId,
             previousAgentLib: old?.agentLib || null,
             previousRouterBinding: old ? routerBindingResult(old.routerBinding, old.hostPort) : null,
+            previousGpu: old ? old.gpu : null,
             validate,
             finalize,
             rollback,
@@ -712,6 +754,7 @@ export async function reconcileBoxContainer({
                 hostPort: old.hostPort,
                 mediaHostPort: old.mediaHostPort,
                 routerBinding: routerBindingResult(old.routerBinding, old.hostPort),
+                gpu: old.gpu,
                 agentLib: old.agentLib,
             } : {}),
         });

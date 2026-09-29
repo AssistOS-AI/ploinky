@@ -4,7 +4,13 @@ import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 
 import { isInsideBox } from '../../ploinky-box/lib/boxMarker.mjs';
-import { BOX_MARKER_PATH } from '../../ploinky-box/constants.mjs';
+import { readBoxGpuGrant } from '../../ploinky-box/lib/gpuGrantMarker.mjs';
+import {
+    BOX_GPU_CDI_DEVICE,
+    BOX_GPU_CDI_SPEC_PATH,
+    BOX_GPU_MARKER_PATH,
+    BOX_MARKER_PATH,
+} from '../../ploinky-box/constants.mjs';
 import { NESTED_PODMAN_SECCOMP_BOX_PATH } from '../../ploinky-box/seccomp.mjs';
 import { PLOINKY_WORKSPACE_ROOT } from '../utils/config.js';
 import {
@@ -17,7 +23,15 @@ import {
 export const RUNTIME_CAPABILITY_POLICY_VERSION = 'ploinky-runtime-capabilities-v1';
 const ADMITTED_DESCRIPTORS = new WeakSet();
 
-const CONTAINER_SECURITY_KEYS = new Set(['nestedPodman', 'privileged']);
+const CONTAINER_SECURITY_KEYS = new Set(['gpu', 'nestedPodman', 'privileged', 'shmSize']);
+// An agent's own /dev/shm size (every agent has its own IPC namespace): whole
+// MiB or GiB, from 1m to 16g.
+const SHM_SIZE_RE = /^[1-9][0-9]{0,5}[mg]$/;
+const MAX_SHM_MIB = 16 * 1024;
+
+function shmSizeMiB(value) {
+    return Number(value.slice(0, -1)) * (value.endsWith('g') ? 1024 : 1);
+}
 const DIRECT_CAPABILITY_FIELDS = new Set([
     'nestedPodman',
     'privileged',
@@ -111,6 +125,69 @@ function captureBoxContext({ boxMarkerOptions, insideBox } = {}) {
     });
 }
 
+// The host GPU grant as seen from inside the Box: the read-only marker plus
+// the CDI spec it names. Captured only inside a Box; paths are recorded so the
+// pre-launch revalidation reads exactly the same files.
+function captureGpuGrantContext({ insideBox, workspaceRoot, gpuGrantOptions } = {}) {
+    if (!insideBox) return null;
+    const markerPath = String(gpuGrantOptions?.markerPath || BOX_GPU_MARKER_PATH);
+    const specPath = String(gpuGrantOptions?.specPath || BOX_GPU_CDI_SPEC_PATH);
+    const grant = readBoxGpuGrant({
+        workspaceRoot,
+        markerPath,
+        specPath,
+        ...(gpuGrantOptions?.fsApi ? { fsApi: gpuGrantOptions.fsApi } : {}),
+    });
+    return deepFreeze({ ...grant, markerPath, specPath, workspaceRoot: String(workspaceRoot || '') });
+}
+
+// A CDI request is admitted inside a Box only as the one granted device, for
+// an agent the Box's GPU wiring names (by the operator's grant or its own
+// manifest declaration, D14), while that wiring is active. Each refusal says
+// what to run on the host.
+function evaluateGpuGrant(context, runtimePolicy, agentId, { declared = false } = {}) {
+    if (!context) return null;
+    const devices = Array.isArray(runtimePolicy?.devices) ? runtimePolicy.devices : [];
+    const cdi = devices.filter((entry) => entry?.type === 'cdi');
+    if (cdi.length === 0) return null;
+    const agent = agentId || 'REPO/AGENT';
+    const grantCommand = `\`ploinky gpu grant --agent ${agent}\``;
+    const notApplied = 'GPU not applied to this Box yet; on the host run `ploinky start` '
+        + '(`ploinky gpu status` shows whether the host has a usable GPU)';
+    let refusal = null;
+    if (!context.present) {
+        refusal = declared
+            ? notApplied
+            : `this workspace has no GPU grant for ${agent}; on the host run ${grantCommand}`;
+    } else if (!context.valid) {
+        refusal = `the Box GPU grant marker is invalid (${context.problem})`;
+    } else if (devices.length !== 1 || cdi[0].value !== BOX_GPU_CDI_DEVICE) {
+        refusal = `a GPU grant admits only the single device ${BOX_GPU_CDI_DEVICE}`;
+    } else if (context.denied?.includes(agentId)) {
+        refusal = `GPU access for ${agent} was revoked by the operator; on the host run ${grantCommand}`;
+    } else if (context.workspaceDenied === true && !context.agents.includes(agentId)) {
+        refusal = 'GPU access was revoked for this workspace by the operator; on the host run '
+            + `\`ploinky gpu grant\` to restore manifest defaults, or ${grantCommand}`;
+    } else if (context.state === 'stale') {
+        refusal = `GPU grant stale: ${context.reason}; fix the host GPU driver, then run \`ploinky restart\` on the host`;
+    } else if (!context.agents.includes(agentId)) {
+        refusal = declared
+            ? notApplied
+            : `the Box GPU grant does not name ${agent}; on the host run ${grantCommand}`;
+    }
+    return {
+        markerPath: context.markerPath,
+        specPath: context.specPath,
+        workspaceRoot: context.workspaceRoot,
+        present: context.present === true,
+        digest: context.digest || null,
+        fingerprint: context.fingerprint || null,
+        state: context.state || null,
+        admitted: refusal === null,
+        refusal,
+    };
+}
+
 export function manifestBytesDigest(bytes) {
     const source = Buffer.isBuffer(bytes) ? bytes : Buffer.from(String(bytes ?? ''), 'utf8');
     return `sha256:${crypto.createHash('sha256').update(source).digest('hex')}`;
@@ -159,6 +236,13 @@ function validateContainerSecurityBlock(value, context) {
     if (value.nestedPodman !== undefined && typeof value.nestedPodman !== 'boolean') {
         throw securityError('manifest.containerSecurity.nestedPodman must be boolean', context);
     }
+    if (value.gpu !== undefined && typeof value.gpu !== 'boolean') {
+        throw securityError('manifest.containerSecurity.gpu must be boolean', context);
+    }
+    if (value.shmSize !== undefined && (typeof value.shmSize !== 'string' || !SHM_SIZE_RE.test(value.shmSize)
+        || shmSizeMiB(value.shmSize) > MAX_SHM_MIB)) {
+        throw securityError('manifest.containerSecurity.shmSize must be a size such as 512m or 2g, from 1m to 16g', context);
+    }
     if (value.privileged === true && value.nestedPodman === true) {
         throw securityError(
             'manifest.containerSecurity.privileged and nestedPodman are mutually exclusive',
@@ -168,6 +252,9 @@ function validateContainerSecurityBlock(value, context) {
     return Object.freeze({
         privileged: value.privileged === true,
         nestedPodman: value.nestedPodman === true,
+        // Only when declared, so every other agent's descriptor is unchanged.
+        ...(value.gpu === true ? { gpu: true } : {}),
+        ...(value.shmSize !== undefined ? { shmSize: value.shmSize } : {}),
     });
 }
 
@@ -318,17 +405,51 @@ export function resolveEffectiveRuntimeCapabilities(manifest, {
     manifestDigest = '',
     workspaceRoot = PLOINKY_WORKSPACE_ROOT,
     boxContext = null,
+    gpuGrantContext = null,
 } = {}) {
     const validated = validateManifestRuntimeCapabilities(manifest, {
         agentId,
         path: agentId ? `manifest(${agentId})` : 'manifest',
     });
-    const runtimePolicy = buildEffectivePolicy({
+    let runtimePolicy = buildEffectivePolicy({
         manifestPolicy: manifest?.llmRuntime?.runtimePolicy || null,
         catalogPolicy,
         profilePolicy: profileConfig?.llmRuntime?.runtimePolicy || null,
         overridePolicy,
     }, { runtime });
+    // `containerSecurity.shmSize` sizes the agent's own /dev/shm. The
+    // operator's runtime policy wins: a size it sets, and host IPC, where a
+    // size cannot apply (outside a Box; a Box refuses host IPC).
+    if (validated.containerSecurity.shmSize && runtimePolicy.resources?.shmSize === undefined
+        && runtimePolicy.ipc !== 'host') {
+        runtimePolicy = validatePolicyShape({
+            ...runtimePolicy,
+            resources: { ...(runtimePolicy.resources || {}), shmSize: validated.containerSecurity.shmSize },
+        }, 'effective.runtimePolicy', { runtime }) || {};
+    }
+    // `containerSecurity.gpu` (D14, amended) attaches the one GPU device when
+    // this Box's wiring names the agent; otherwise the agent starts without
+    // it and is told why. An explicit CDI request in the runtime policy stays
+    // on the strict operator path below.
+    const declaresGpu = validated.containerSecurity.gpu === true;
+    const requestsCdi = Array.isArray(runtimePolicy.devices)
+        && runtimePolicy.devices.some((entry) => entry?.type === 'cdi');
+    let gpuAttach = null;
+    if (declaresGpu && !requestsCdi) {
+        const probe = evaluateGpuGrant(gpuGrantContext, { devices: [{ type: 'cdi', value: BOX_GPU_CDI_DEVICE }] },
+            String(agentId || ''), { declared: true });
+        const attached = probe?.admitted === true;
+        gpuAttach = {
+            attached,
+            reason: attached ? null : (probe?.refusal || 'this agent is not running in a Ploinky Box, so no GPU is attached'),
+        };
+        if (attached) {
+            runtimePolicy = validatePolicyShape({
+                ...runtimePolicy,
+                devices: [...(runtimePolicy.devices || []), { type: 'cdi', value: BOX_GPU_CDI_DEVICE }],
+            }, 'effective.runtimePolicy', { runtime }) || {};
+        }
+    }
     const networkMode = String(network?.mode || profileConfig?.network?.mode || manifest?.network?.mode || 'managed')
         .trim().toLowerCase() || 'managed';
     const volumes = normalizeVolumes({
@@ -363,17 +484,25 @@ export function resolveEffectiveRuntimeCapabilities(manifest, {
         volumes,
         capabilities,
     };
+    // Present only for a CDI request made inside a Box, so the descriptors of
+    // every other agent are unchanged.
+    const gpuGrant = evaluateGpuGrant(gpuGrantContext, runtimePolicy, descriptor.agentId, { declared: declaresGpu });
+    if (gpuGrant) descriptor.gpuGrant = canonicalize(gpuGrant);
+    if (gpuAttach) descriptor.gpuAttach = canonicalize(gpuAttach);
     return deepFreeze(descriptor);
 }
 
-function unsupportedDimensions(descriptor, runtimeKind) {
+function unsupportedDimensions(descriptor, runtimeKind, box = false) {
     const unsupported = [];
+    // The operator's Box GPU grant admits exactly one CDI device and nothing
+    // else: host devices, --gpus, host IPC and security options stay refused.
+    const gpuGranted = box === true && runtimeKind === 'container' && descriptor.gpuGrant?.admitted === true;
     if (descriptor.capabilities.privileged) unsupported.push('privileged');
     if (runtimeKind !== 'container' && descriptor.capabilities.nestedPodman) {
         unsupported.push('nested-podman');
     }
-    if (descriptor.capabilities.devices) unsupported.push('devices');
-    if (descriptor.capabilities.cdi) unsupported.push('cdi');
+    if (descriptor.capabilities.devices && !gpuGranted) unsupported.push('devices');
+    if (descriptor.capabilities.cdi && !gpuGranted) unsupported.push('cdi');
     if (descriptor.capabilities.gpu) unsupported.push('gpu');
     if (descriptor.capabilities.hostIpc) unsupported.push('host-ipc');
     if (descriptor.capabilities.securityOptions) unsupported.push('security-options');
@@ -399,7 +528,7 @@ export function assertRuntimeCapabilitiesAllowed(descriptor, {
     }
     let box = insideBox;
     if (box === undefined) box = isInsideBox(boxMarkerOptions);
-    const unsupported = unsupportedDimensions(descriptor, runtimeKind);
+    const unsupported = unsupportedDimensions(descriptor, runtimeKind, box);
     if (!box && descriptor.capabilities.nestedPodman) unsupported.push('nested-podman-outside-box');
     // Host networking is not an ordinary Box capability: the runtime boundary
     // separately requires an exact prepared or active generation grant before
@@ -413,8 +542,11 @@ export function assertRuntimeCapabilitiesAllowed(descriptor, {
         unsupported.push('isolated-network-host-sandbox');
     }
     if ((box || runtimeKind !== 'container' || descriptor.capabilities.nestedPodman) && unsupported.length) {
+        const gpuRefusal = unsupported.includes('cdi') && descriptor.gpuGrant?.refusal
+            ? `; ${descriptor.gpuGrant.refusal}`
+            : '';
         throw new RuntimeCapabilityError(
-            `runtime capabilities are unsupported for ${box ? 'Ploinky Box' : runtimeKind}: ${unsupported.join(', ')}`,
+            `runtime capabilities are unsupported for ${box ? 'Ploinky Box' : runtimeKind}: ${unsupported.join(', ')}${gpuRefusal}`,
             {
                 context: {
                     agentId: descriptor.agentId,
@@ -442,6 +574,7 @@ export function admitManifestRuntimeCapabilities(manifest, {
     overridePolicy = null,
     boxMarkerOptions,
     insideBox,
+    gpuGrantOptions,
     workspaceRoot = PLOINKY_WORKSPACE_ROOT,
 } = {}) {
     let exactManifest = manifest;
@@ -478,6 +611,11 @@ export function admitManifestRuntimeCapabilities(manifest, {
         manifestDigest: exactDigest,
         workspaceRoot,
         boxContext,
+        gpuGrantContext: captureGpuGrantContext({
+            insideBox: boxContext.insideBox,
+            workspaceRoot,
+            gpuGrantOptions,
+        }),
     });
     assertRuntimeCapabilitiesAllowed(descriptor, {
         runtimeKind,
@@ -501,6 +639,7 @@ export function assertRuntimeAdmissionCurrent(admission, {
     runtimeKind,
     descriptor,
     boxMarkerOptions,
+    gpuGrantOptions,
 } = {}) {
     if (!admission || admission.schemaVersion !== 1 || !admission.descriptor) {
         throw new RuntimeCapabilityError('runtime admission is missing or invalid', {
@@ -544,6 +683,26 @@ export function assertRuntimeAdmissionCurrent(admission, {
             });
         }
     }
+    // A GPU-admitted launch rereads the grant marker and CDI spec immediately
+    // before it runs: a revoked, stale, or replaced grant stops it here.
+    const admittedGpuGrant = admission.descriptor.gpuGrant;
+    if (admittedGpuGrant) {
+        const current = evaluateGpuGrant(captureGpuGrantContext({
+            insideBox: true,
+            workspaceRoot: admittedGpuGrant.workspaceRoot,
+            gpuGrantOptions: {
+                markerPath: admittedGpuGrant.markerPath,
+                specPath: admittedGpuGrant.specPath,
+                ...(gpuGrantOptions?.fsApi ? { fsApi: gpuGrantOptions.fsApi } : {}),
+            },
+        }), admission.descriptor.runtimePolicy, admission.descriptor.agentId);
+        if (stableDigest(current) !== stableDigest(admittedGpuGrant)) {
+            throw new RuntimeCapabilityError('Ploinky Box GPU grant changed after admission', {
+                code: 'PLOINKY_RUNTIME_INPUT_CHANGED',
+                context: { agentId: admission.agentId },
+            });
+        }
+    }
     return admission;
 }
 
@@ -573,7 +732,14 @@ export function renderRuntimePolicyArgs(descriptor, { runtime } = {}) {
             code: 'PLOINKY_RUNTIME_INPUT_CHANGED',
         });
     }
-    return emitRunArgs(descriptor.runtimePolicy, { runtime });
+    const args = emitRunArgs(descriptor.runtimePolicy, { runtime });
+    // A manifest-declared GPU agent learns whether it got the device and, if
+    // not, what to run on the host (D14).
+    if (descriptor.gpuAttach) {
+        args.push('--env', `PLOINKY_GPU_STATUS=${descriptor.gpuAttach.attached ? 'attached' : 'unavailable'}`);
+        if (!descriptor.gpuAttach.attached) args.push('--env', `PLOINKY_GPU_REASON=${descriptor.gpuAttach.reason}`);
+    }
+    return args;
 }
 
 export function runtimeCapabilityDigest(descriptor) {

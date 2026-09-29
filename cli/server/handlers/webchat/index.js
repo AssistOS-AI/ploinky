@@ -60,7 +60,15 @@ export async function handleWebChat(req, res, appConfig, appState) {
     const pathname = parsedUrl.pathname.substring(`/${appName}`.length) || '/';
     const agentOverrideRaw = parsedUrl.searchParams.get('agent') || '';
     const agentOverride = agentOverrideRaw.trim();
-    const launchOptions = resolveWebchatLaunchOptions(parsedUrl);
+    let launchOptions, workspaceBase;
+    try {
+        workspaceBase = resolveWebchatWorkspaceBase(parsedUrl);
+        launchOptions = resolveWebchatLaunchOptions(parsedUrl);
+    } catch (_) {
+        res.writeHead(400, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
+        res.end('Invalid WebChat workspace directory.');
+        return;
+    }
     let effectiveConfig = appConfig;
     let agentQuery = buildWebchatQuery(parsedUrl);
 
@@ -112,7 +120,6 @@ export async function handleWebChat(req, res, appConfig, appState) {
         return redirectToRouterLogin(req, res, parsedUrl, agentOverride);
     }
 
-    const workspaceBase = resolveWebchatWorkspaceBase(parsedUrl);
     const workspaceDirectory = workspaceBase.base;
 
     if (await handleTaskRoute({

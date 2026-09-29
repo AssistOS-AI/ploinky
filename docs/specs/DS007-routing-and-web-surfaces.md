@@ -58,8 +58,10 @@ The following table is the active Router-owned HTTP surface. Endpoint families w
 | `POST /api/agents/<agentName>/users` | Delegates user creation to the selected SSO provider after administrator and mutation-proof checks. |
 | `PATCH /api/agents/<agentName>/users/<userId>` | Delegates identity, password, and role changes to the SSO provider, which re-authorizes the persisted actor. |
 | `DELETE /api/agents/<agentName>/users/<userId>` | Delegates deactivation or deletion to the provider, which preserves its own account and last-administrator invariants. |
-| `GET /api/marketplace` | Returns the authenticated caller's repository, agent, enabled-instance, and runtime inventory. A running agent may use an assertion limited to `marketplace.read`. |
-| `POST /api/marketplace` | Performs `install_repo`, `uninstall_repo`, `enable_agent`, or `disable_agent` for a provider administrator or signed CLI operator with mutation proof. An asserted agent is restricted to `enable_agent` for an already available agent. |
+| `GET /api/marketplace/repos` | Returns the authenticated caller's repository inventory, checkout labels, source metadata, and kind. A running agent may use an assertion limited to `marketplace.read`. |
+| `GET /api/marketplace/agents` | Returns the authenticated caller's agent, enabled-instance, permission, and runtime inventory. A running agent may use an assertion limited to `marketplace.read`. |
+| `POST /api/marketplace/repos` | Performs `install_repo` or `uninstall_repo` for a provider administrator or signed CLI operator with mutation proof. An asserted agent is restricted to repository install. |
+| `POST /api/marketplace/agents` | Performs `enable_agent` or `disable_agent` for a provider administrator or signed CLI operator with mutation proof. An asserted agent is restricted to `enable_agent` for an already available agent. |
 | `POST /policy/command` | Invokes the Router policy command registry for a currently validated provider administrator or signed CLI operator. It supports HTTP-route inspection/mutation and MCP-policy inspection/mutation; mutating commands require exact control Origin and CSRF proof. |
 | `GET /api/router/openai-agent-discovery` | Returns Router paths and OpenAI-compatible metadata for enabled agents to an asserted agent caller. Browser session authentication is neither sufficient nor required. |
 | `POST /api/router/identity/user-api-key` | Mints a Router-signed identity key for the authenticated non-guest user. An administrator may request another valid user subject; ordinary users can mint only their own identity. |
@@ -98,7 +100,9 @@ WebChat is a Router-owned browser application for one selected enabled agent. Th
 
 WebChat must remain generic and must not hardcode optional agent ids, provider tags, downstream tool names, or domain-specific dispatch. State-changing browser requests must carry the Router mutation proof and remain bound to the active user session, selected workspace runtime, and current edge generation.
 
-CLI control output must use one complete newline-delimited JSON record with a recognized versioned WebChat marker. The Router must validate accepted session, task, runtime-state, workspace-file, skills, and interaction records before converting them into named SSE events or reconnect snapshots; unaccepted records must not mutate browser state.
+CLI control output must use one complete newline-delimited JSON record with a recognized versioned WebChat marker. The Router must validate accepted session, task, runtime-state, workspace-file, skills, interaction, and progress records before converting them into named SSE events or reconnect snapshots; unaccepted records must not mutate browser state.
+
+The typing indicator shows one transient status line from the latest progress record, next to the always-animating dots, and replaces it as newer records arrive. Intermediate progress is never persisted in the conversation: the assistant bubble keeps only the final text, and stored message progress is ignored.
 
 Slash-command suggestions must remain agent-defined. During page initialization, WebChat must call the selected agent's Router-mediated `/<agentName>/mcp` endpoint, complete MCP initialization, request `tools/list`, and call the optional `list_achilles_cli_commands` tool. The browser caches the returned command catalog for local completion and sends it only when initialization or an explicit post-skills-change refresh requires it. When that structured tool is absent, WebChat may derive a fallback catalog only from the selected agent's admitted `execute_*` MCP tools.
 

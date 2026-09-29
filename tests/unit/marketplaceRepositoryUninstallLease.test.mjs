@@ -176,7 +176,7 @@ async function uninstallRequest({ target = 'fixtures', uninstallRepositoryAction
     const res = { status: 200, setHeader() {}, writeHead(code) { this.status = code; }, end(body) { this.body = JSON.parse(body); } };
     const options = { routePlan: null };
     if (uninstallRepositoryAction) options.uninstallRepositoryAction = uninstallRepositoryAction;
-    await routes.handleMarketplaceRoutes(req, res, new URL('http://localhost/api/marketplace'), options);
+    await routes.handleMarketplaceRoutes(req, res, new URL('http://localhost/api/marketplace/repos'), options);
     return res;
 }
 

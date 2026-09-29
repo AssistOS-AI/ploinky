@@ -3063,7 +3063,7 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
     return `${envName}=${shellQuote(match[2])}`;
   }).filter(Boolean);
   const ssoPrefix = ssoExports.length ? 'export ' + ssoExports.join(' ') + '; ' : '';
-  const rawCmd = ssoPrefix + cliBase + (regularArgs.length ? (' ' + regularArgs.join(' ')) : '');
+  const rawCmd = ssoPrefix + cliBase + (regularArgs.length ? (' ' + regularArgs.map(shellQuote).join(' ')) : '');
   const cmd = wrapCliWithWebchat(rawCmd, env);
   const agentDir = path.dirname(manifestPath);
   const repoName = resolveAgentRepositoryName(agentDir);

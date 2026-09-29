@@ -184,19 +184,15 @@ export function createMessages({
         }
         const label = typingIndicator.querySelector('.wa-typing-label');
         const list = typingIndicator.querySelector('.wa-typing-progress');
+        const latest = pendingProgressItems.length ? pendingProgressItems[pendingProgressItems.length - 1].reason : '';
+        // One live status line replaces "Thinking"; the dots keep animating next to it.
         if (label) {
-            label.textContent = 'Thinking';
+            label.textContent = latest || 'Thinking';
+            label.title = latest || '';
         }
-        if (!list) {
-            return;
+        if (list) {
+            list.replaceChildren();
         }
-        list.replaceChildren();
-        pendingProgressItems.slice(-5).forEach((item) => {
-            const line = document.createElement('div');
-            line.className = 'wa-typing-progress-line';
-            line.textContent = item.reason;
-            list.appendChild(line);
-        });
     }
 
     function showTypingIndicator() {
@@ -1037,63 +1033,6 @@ export function createMessages({
         updateShortcutActions(bubble, safeText);
     }
 
-    function attachProgressPanel(bubble, progressItems, { expanded = false } = {}) {
-        if (!bubble || !Array.isArray(progressItems) || !progressItems.length) {
-            return;
-        }
-        let panel = bubble.querySelector(':scope > .wa-progress-panel');
-        if (!panel) {
-            panel = document.createElement('div');
-            panel.className = 'wa-progress-panel is-collapsed';
-            const textContainer = bubble.querySelector('.wa-message-text');
-            if (textContainer) {
-                bubble.insertBefore(panel, textContainer);
-            } else {
-                bubble.prepend(panel);
-            }
-        }
-
-        panel.replaceChildren();
-        panel.classList.toggle('is-collapsed', !expanded);
-        panel.classList.toggle('is-expanded', expanded);
-
-        const toggle = document.createElement('button');
-        toggle.type = 'button';
-        toggle.className = 'wa-progress-toggle';
-        toggle.setAttribute('aria-expanded', String(expanded));
-
-        const arrow = document.createElement('span');
-        arrow.className = 'wa-progress-arrow';
-        arrow.textContent = expanded ? '▾' : '▸';
-
-        const title = document.createElement('span');
-        title.className = 'wa-progress-title';
-        title.textContent = 'Activity';
-
-        toggle.appendChild(arrow);
-        toggle.appendChild(title);
-
-        const list = document.createElement('div');
-        list.className = 'wa-progress-list';
-
-        progressItems.forEach((item) => {
-            const line = document.createElement('div');
-            line.className = 'wa-progress-line';
-            line.textContent = item.reason;
-            list.appendChild(line);
-        });
-
-        toggle.onclick = () => {
-            const expanded = panel.classList.toggle('is-expanded');
-            panel.classList.toggle('is-collapsed', !expanded);
-            toggle.setAttribute('aria-expanded', expanded ? 'true' : 'false');
-            arrow.textContent = expanded ? '▾' : '▸';
-        };
-
-        panel.appendChild(toggle);
-        panel.appendChild(list);
-    }
-
     function attachTaskPanel(bubble, taskId) {
         if (!bubble || !taskId || !taskController) return;
         const existing = bubble.querySelector(':scope > .wa-task-summary');
@@ -1420,10 +1359,6 @@ export function createMessages({
 
     function addServerMsg(text, options = {}) {
         let normalized = typeof text === 'string' ? text : '';
-        const explicitProgressItems = Array.isArray(options.progressItems)
-            ? options.progressItems.map(normalizeProgressItem).filter(Boolean)
-            : null;
-        const progressItems = explicitProgressItems || pendingProgressItems;
 
         // Filter out raw envelope JSON to prevent it from appearing in chat
         const trimmedNormalized = normalized.trim();
@@ -1437,7 +1372,7 @@ export function createMessages({
         }
 
         const messageIndex = Number.isInteger(options.messageIndex) ? options.messageIndex : null;
-        if (!normalized.trim() && progressItems.length === 0 && !options.messageId) {
+        if (!normalized.trim() && !options.messageId) {
             lastServerMsg.bubble = null;
             lastServerMsg.fullText = '';
             userInputSent = false;
@@ -1451,21 +1386,15 @@ export function createMessages({
         if (appendToExisting) {
             const combined = previousFullText ? `${previousFullText}\n${normalized}` : normalized;
             lastServerMsg.fullText = combined;
-            lastServerMsg.bubble.hidden = options.pending === true && !combined.trim() && !progressItems.length;
+            lastServerMsg.bubble.hidden = options.pending === true && !combined.trim();
             updateBubbleContent(lastServerMsg.bubble, combined);
-            if (progressItems.length) {
-                attachProgressPanel(lastServerMsg.bubble, progressItems, { expanded: options.pending === true });
-            }
-            if (explicitProgressItems === null && pendingProgressItems.length) {
-                resetProgressEvents();
-            }
         } else {
             const wrapper = document.createElement('div');
             wrapper.className = 'wa-message in';
             const bubble = document.createElement('div');
             bubble.className = 'wa-message-bubble';
             // Keep the stable assistant anchor for tasks, without an empty visible bubble.
-            bubble.hidden = options.pending === true && !normalized.trim() && !progressItems.length;
+            bubble.hidden = options.pending === true && !normalized.trim();
             bubble.innerHTML = '<div class="wa-message-text"></div><span class="wa-message-time"></span>';
             wrapper.appendChild(bubble);
 
@@ -1474,12 +1403,6 @@ export function createMessages({
             userInputSent = false;
 
             updateBubbleContent(bubble, normalized);
-            if (progressItems.length) {
-                attachProgressPanel(bubble, progressItems, { expanded: options.pending === true });
-            }
-            if (explicitProgressItems === null && pendingProgressItems.length) {
-                resetProgressEvents();
-            }
             const timeNode = bubble.querySelector('.wa-message-time');
             if (timeNode) {
                 timeNode.textContent = formatTime(options.timestamp);
@@ -1551,7 +1474,6 @@ export function createMessages({
                 addServerMsg(text, {
                     forceNew: true,
                     timestamp: message.timestamp,
-                    progressItems: Array.isArray(message.progress) ? message.progress : [],
                     messageIndex,
                     messageId: message.id,
                     pending: message.status === 'pending',

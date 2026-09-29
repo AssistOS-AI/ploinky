@@ -1,5 +1,6 @@
 import { BOX_ROUTER_CONTAINER_PORT } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
+import { defaultGpuVendor, normalizeGpuVendor } from '../gpuGrant.mjs';
 import { parseHostPort } from '../ports.mjs';
 import { parseRouterBindingMapping } from '../routerBinding.mjs';
 
@@ -79,6 +80,64 @@ function analyzeBind(tokens, commandToken) {
     } catch (error) {
         throw argumentError(error.message);
     }
+}
+
+const GPU_USAGE = 'use: ploinky gpu status | ploinky gpu grant [--agent REPO/AGENT...] [--vendor VENDOR] '
+    + '| ploinky gpu revoke [--agent REPO/AGENT...]';
+
+// GPU grants are host-owned Box wiring, so the verb and its operands are
+// parsed here and never forwarded to the in-Box core.
+function analyzeGpu(tokens, commandToken) {
+    const tail = tokens.filter((token) => token.rawIndex > commandToken.rawIndex).map((token) => token.text);
+    const [action = 'status', ...rest] = tail;
+    if (action === 'status') {
+        if (rest.length) throw argumentError(`gpu status accepts no arguments; ${GPU_USAGE}`);
+        return Object.freeze({ action: 'status', vendor: null, agents: Object.freeze([]) });
+    }
+    if (action !== 'grant' && action !== 'revoke') {
+        throw argumentError(`Unknown gpu action '${action}'; ${GPU_USAGE}`);
+    }
+    let vendor = null;
+    const agents = [];
+    const setVendor = (value) => {
+        if (vendor !== null) throw argumentError(`--vendor was supplied more than once; ${GPU_USAGE}`);
+        vendor = value;
+    };
+    for (let index = 0; index < rest.length; index += 1) {
+        const text = rest[index];
+        if (text === '--agent') {
+            const value = rest[index + 1];
+            if (!value || value.startsWith('-')) throw argumentError('--agent requires REPO/AGENT');
+            agents.push(value);
+            index += 1;
+        } else if (text.startsWith('--agent=')) {
+            agents.push(text.slice('--agent='.length));
+        } else if (action === 'grant' && text === '--vendor') {
+            const value = rest[index + 1];
+            if (!value || value.startsWith('-')) throw argumentError(`--vendor requires VENDOR; ${GPU_USAGE}`);
+            setVendor(value);
+            index += 1;
+        } else if (action === 'grant' && text.startsWith('--vendor=')) {
+            setVendor(text.slice('--vendor='.length));
+        } else if (text.startsWith('-')) {
+            throw argumentError(`gpu ${action} does not accept option ${text}; ${GPU_USAGE}`);
+        } else if (action === 'grant') {
+            throw argumentError(`gpu grant takes no VENDOR argument ('${text}'); name agents with --agent and, `
+                + `when needed, the vendor with --vendor; ${GPU_USAGE}`);
+        } else {
+            throw argumentError(`gpu ${action}: unexpected argument '${text}'; ${GPU_USAGE}`);
+        }
+    }
+    if (action === 'grant') {
+        // Without --agent, grant lifts the workspace-wide revoke so manifest
+        // defaults apply again (D14).
+        try {
+            vendor = vendor === null ? defaultGpuVendor() : normalizeGpuVendor(vendor);
+        } catch (error) {
+            throw argumentError(`${error.message}; ${GPU_USAGE}`);
+        }
+    }
+    return Object.freeze({ action, vendor, agents: Object.freeze(agents) });
 }
 
 export function parseOuterArguments(argv) {
@@ -185,6 +244,7 @@ export function parseOuterArguments(argv) {
         });
     }
     const bind = command === 'bind' && !help ? analyzeBind(tokens, commandToken) : null;
+    const gpu = command === 'gpu' && !help ? analyzeGpu(tokens, commandToken) : null;
     return Object.freeze({
         rawArgv: Object.freeze(raw),
         classificationArgv: Object.freeze(classificationArgv),
@@ -203,5 +263,6 @@ export function parseOuterArguments(argv) {
         explicitMediaPort,
         start,
         bind,
+        gpu,
     });
 }

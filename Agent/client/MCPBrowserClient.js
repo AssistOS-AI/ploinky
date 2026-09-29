@@ -82,7 +82,7 @@ function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function resolveMarketplaceUrl(baseUrl) {
+function resolveMarketplaceUrl(baseUrl, resource = '') {
     const fallback = typeof window !== 'undefined' && window.location
         ? window.location.href
         : '';
@@ -90,11 +90,11 @@ function resolveMarketplaceUrl(baseUrl) {
     if (!resolvedBase) {
         throw new Error('MCPBrowserClient: marketplace base URL is required');
     }
-    return new URL(MARKETPLACE_PATH, resolvedBase).toString();
+    return new URL(`${MARKETPLACE_PATH}${resource ? `/${resource}` : ''}`, resolvedBase).toString();
 }
 
-async function requestMarketplace(baseUrl, body = null) {
-    const response = await fetch(resolveMarketplaceUrl(baseUrl), {
+async function requestMarketplace(baseUrl, body = null, resource = '') {
+    const response = await fetch(resolveMarketplaceUrl(baseUrl, resource), {
         method: body ? 'POST' : 'GET',
         credentials: 'include',
         headers: {
@@ -130,7 +130,7 @@ function findMarketplaceAgent(marketplace, agentRef) {
 }
 
 export async function getAgentStatus(agentRef, options = {}) {
-    const marketplace = await requestMarketplace(options.baseUrl, null);
+    const marketplace = await requestMarketplace(options.baseUrl, null, 'agents');
     return findMarketplaceAgent(marketplace, agentRef);
 }
 
@@ -146,7 +146,7 @@ export async function ensureAgentRunning(agentRef, options = {}) {
         action: 'enable_agent',
         agentRef: initial.ref,
         ...(mode ? { mode } : {}),
-    });
+    }, 'agents');
     const enabled = findMarketplaceAgent(marketplace, initial.ref);
     if (enabled?.running === true) return enabled;
 
