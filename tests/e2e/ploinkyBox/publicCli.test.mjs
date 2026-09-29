@@ -207,7 +207,18 @@ test('installed public shims honor only the environment image override through t
     const statusBefore = publicCommand(['status']);
     assert.notEqual(statusBefore.status, 0);
     assert.match(statusBefore.stdout, /Ploinky Box: incompatible/);
-    assert.match(statusBefore.stdout, /Owned Box mount \/opt\/ploinky is incompatible/);
+    // The staging Box runs Ploinky from this source checkout; the packed CLI
+    // runs from its installed tree. The exact /opt/ploinky source check names
+    // both checkouts and the owning binary before any other comparison.
+    const sourceCheckout = fs.realpathSync(repositoryRoot);
+    const installedCheckout = fs.realpathSync(packageRoot);
+    assert.notEqual(installedCheckout, sourceCheckout);
+    assert.ok(statusBefore.stdout.includes(
+        `Detail: This workspace's Box runs Ploinky from ${sourceCheckout}, `
+        + `but this command runs Ploinky from ${installedCheckout}. `
+        + `Use ${path.join(sourceCheckout, 'bin', 'ploinky')} for this workspace`,
+    ), statusBefore.stdout);
+    assert.doesNotMatch(statusBefore.stdout, /security options|mount set|Owned Box mount/);
     assert.equal(treeHash(harness.workspace), beforeStatus);
     assert.equal(inBoxStateHash(prepared.containerId, harness), beforeBoxStatus);
     assert.equal(statusBefore.stdout.includes('HOST_MASTER_KEY_CANARY'), false);
