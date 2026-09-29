@@ -245,6 +245,8 @@ test('discovery refuses a gvproxy-based Podman Machine guest before querying Pod
         ['/etc/podman-machine', ''],
         ['/etc/podman-machine', ' \n'],
         ['/etc/podman-machine', 'unknown-provider'],
+        // Podman compares the type exactly, so only lowercase `wsl` is exempt.
+        ['/etc/podman-machine', 'WSL'],
         ['/etc/containers/podman-machine', 'applehv'],
     ]) {
         const runner = fakeRunner(identity);
@@ -278,6 +280,7 @@ test('discovery keeps native Linux without a gvproxy marker and ignores markers 
     for (const entries of [
         {},
         { '/etc/podman-machine': 'wsl\n' },
+        { '/etc/podman-machine': ' wsl \n' },
         { '/etc/containers/podman-machine': 'wsl' },
     ]) {
         const runner = fakeRunner(identity);
