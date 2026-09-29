@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+
 import {
     BOX_LABELS,
     BOX_ROLES,
@@ -8,6 +10,42 @@ import { createProcessRunner } from '../process.mjs';
 import { normalizeContainerRuntime } from '../contract/container.mjs';
 
 const ABSENT_PATTERN = /(?:no such|not found|does not exist)/i;
+
+// Podman marks its own Podman Machine guests with these files (the second is
+// the pre-Podman-6 path, consulted only when the first is absent). In every
+// guest type except WSL, Podman forwards publications through gvproxy: inside
+// the VM it drops each requested host IP and listens on all guest addresses,
+// applying that IP only on the machine host. A loopback-only Router
+// publication cannot hold there, so such a guest is not a native Linux engine.
+const PODMAN_MACHINE_MARKER_FILES = Object.freeze([
+    '/etc/podman-machine',
+    '/etc/containers/podman-machine',
+]);
+
+function readMarkerFile(file) {
+    return fs.readFileSync(file, 'utf8');
+}
+
+function podmanMachineGuestRefusal(readMachineMarkerFile) {
+    for (const file of PODMAN_MACHINE_MARKER_FILES) {
+        let content;
+        try {
+            content = readMachineMarkerFile(file);
+        } catch (error) {
+            if (error?.code === 'ENOENT') continue;
+            return `Ploinky Box cannot read the Podman Machine marker ${file} (${error?.code || error?.message || 'unknown error'}); `
+                + 'it will not treat this Linux host as native, because inside a gvproxy-based Podman Machine guest '
+                + 'Podman would listen on all guest addresses for the loopback Router publication';
+        }
+        const type = String(content).trim();
+        if (type === 'wsl') return null;
+        return `Ploinky Box does not run inside a gvproxy-based Podman Machine guest (${file}: ${type || 'empty'}): `
+            + 'Podman there listens on all guest addresses for every publication and applies the requested '
+            + 'host address only on the machine host, so the loopback-only Router boundary cannot hold. '
+            + 'Run Ploinky on the machine host or on native Linux.';
+    }
+    return null;
+}
 
 function discoveryError(message, code = 'PLOINKY_BOX_DISCOVERY_FAILED') {
     return new PloinkyBoxError(message, { code });
@@ -296,6 +334,7 @@ export function discoverBoxOwnership(identity, {
     platform = process.platform,
     env = process.env,
     runner = createProcessRunner(),
+    readMachineMarkerFile = readMarkerFile,
 } = {}) {
     if (!['darwin', 'linux'].includes(platform)) {
         return {
@@ -311,6 +350,13 @@ export function discoverBoxOwnership(identity, {
             message: 'Ploinky Box does not support a remote Podman engine',
             engines: {},
         };
+    }
+
+    if (platform === 'linux') {
+        const machineGuest = podmanMachineGuestRefusal(readMachineMarkerFile);
+        if (machineGuest) {
+            return { state: 'unsupported', message: machineGuest, engines: {} };
+        }
     }
 
     const podman = probePodman(runner);
