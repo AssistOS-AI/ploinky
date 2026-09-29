@@ -1,6 +1,7 @@
 import path from 'path';
 
-import { getWorkspaceRoot } from '../../utils/workspacePaths.js';
+import { resolveWorkspacePath } from '../../utils/workspacePaths.js';
+import { resolveWebchatWorkspaceBase } from './workspaceSuggestions.js';
 
 export function buildWebchatQuery(parsedUrl, agentName = '') {
     const params = new URLSearchParams(parsedUrl.searchParams);
@@ -17,29 +18,26 @@ export function resolveWorkspaceScopedQueryPath(value) {
     if (!raw || raw.includes('\0') || path.isAbsolute(raw)) {
         return '';
     }
-    const root = getWorkspaceRoot();
-    const resolved = path.resolve(root, raw);
-    const relative = path.relative(root, resolved);
-    if (relative.startsWith('..') || path.isAbsolute(relative)) {
+    try {
+        return resolveWorkspacePath(raw);
+    } catch {
         return '';
     }
-    return resolved;
 }
 
 export function resolveWebchatLaunchOptions(parsedUrl) {
     const cliArgs = [];
+    const directoryKeys = ['workspace-dir', 'workspaceDir', 'dir'];
+    const directoryKey = directoryKeys.find(key => parsedUrl.searchParams.has(key));
+    if (directoryKey) {
+        cliArgs.push(`--dir=${resolveWebchatWorkspaceBase(parsedUrl).base}`);
+    }
     for (const [rawKey, rawValue] of parsedUrl.searchParams.entries()) {
         const key = String(rawKey || '').trim();
         if (!key || key === 'agent' || key === 'tabId' || key === 'sessionId') {
             continue;
         }
-        if (key === 'workspace-dir' || key === 'workspaceDir') {
-            const resolved = resolveWorkspaceScopedQueryPath(rawValue);
-            if (resolved) {
-                cliArgs.push(`--dir=${resolved}`);
-            }
-            continue;
-        }
+        if (directoryKeys.includes(key)) continue;
         if (key === 'workspace-skill-root' || key === 'workspaceSkillRoot') {
             const resolved = resolveWorkspaceScopedQueryPath(rawValue);
             if (resolved) {

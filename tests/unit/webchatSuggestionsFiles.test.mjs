@@ -187,9 +187,7 @@ test('resolveWebchatWorkspaceBase rejects legacy dir outside the workspace', () 
             `/webchat?agent=achilles-cli&dir=${encodeURIComponent(outside)}`,
             'http://127.0.0.1'
         );
-        const base = resolveWebchatWorkspaceBase(parsed, { workspaceRoot: root });
-        assert.equal(base.base, fs.realpathSync(root));
-        assert.equal(base.relativeBase, '');
+        assert.throws(() => resolveWebchatWorkspaceBase(parsed, { workspaceRoot: root }), /Invalid WebChat workspace directory/);
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
         fs.rmSync(outside, { recursive: true, force: true });

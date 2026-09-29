@@ -149,6 +149,7 @@ function sleep(ms) {
 }
 
 function marketplaceToolForRequest(method, body) {
+    if (method === 'POST' && ['install', 'remove'].includes(body?.action)) return `repositories.${body.action}`;
     if (method === 'POST' && body?.action === 'install_repo') return 'repositories.prepare';
     return method === 'POST' && body?.action === 'enable_agent'
         ? MARKETPLACE_ENABLE_TOOL
@@ -161,7 +162,7 @@ export function requestMarketplace(method = 'GET', body = null, descriptor, reso
     const url = resolveGeneratedRouterOperation(verified, requestPath);
     const httpModule = url.protocol === 'https:' ? https : http;
     const payload = body ? Buffer.from(JSON.stringify(body), 'utf8') : Buffer.alloc(0);
-    const tool = ['install', 'remove'].includes(resource) ? `repositories.${resource}` : marketplaceToolForRequest(method, body);
+    const tool = marketplaceToolForRequest(method, body);
     const assertion = signAgentHttpAssertion({
         method,
         path: requestPath,

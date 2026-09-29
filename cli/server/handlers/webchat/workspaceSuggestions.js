@@ -151,19 +151,18 @@ export function resolveWebchatWorkspaceBase(parsedUrl, { workspaceRoot: configur
         workspaceRoot = path.resolve(configuredRoot);
     }
     const rawWorkspaceDir = parsedUrl.searchParams.get('workspace-dir')
-        || parsedUrl.searchParams.get('workspaceDir')
-        || '';
-    if (rawWorkspaceDir) {
+        ?? parsedUrl.searchParams.get('workspaceDir');
+    if (rawWorkspaceDir !== null) {
         try {
             const resolved = resolveWorkspacePath(rawWorkspaceDir, { workspaceRoot });
             const relativeBase = path.relative(workspaceRoot, resolved).replace(/\\+/g, '/');
             return { root: workspaceRoot, base: resolved, relativeBase };
         } catch (_) {
-            return { root: workspaceRoot, base: workspaceRoot, relativeBase: '' };
+            throw new Error('Invalid WebChat workspace directory.');
         }
     }
-    const rawCompatDir = parsedUrl.searchParams.get('dir') || '';
-    if (rawCompatDir) {
+    const rawCompatDir = parsedUrl.searchParams.get('dir');
+    if (rawCompatDir !== null) {
         try {
             const resolved = resolveWorkspacePath(rawCompatDir, {
                 workspaceRoot,
@@ -172,7 +171,7 @@ export function resolveWebchatWorkspaceBase(parsedUrl, { workspaceRoot: configur
             const relativeBase = path.relative(workspaceRoot, resolved).replace(/\\+/g, '/');
             return { root: workspaceRoot, base: resolved, relativeBase };
         } catch (_) {
-            return { root: workspaceRoot, base: workspaceRoot, relativeBase: '' };
+            throw new Error('Invalid WebChat workspace directory.');
         }
     }
     return { root: workspaceRoot, base: workspaceRoot, relativeBase: '' };

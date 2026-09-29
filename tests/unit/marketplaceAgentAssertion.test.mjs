@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
+import http from 'node:http';
 
 import { signAgentHttpAssertion } from '../../Agent/lib/agentAssertion.mjs';
 import { createMemoryReplayCache } from '../../Agent/lib/jwtVerify.mjs';
@@ -23,6 +24,56 @@ const agentEnv = {
     PLOINKY_AGENT_ID: caller,
     PLOINKY_AGENT_SECRET: deriveAgentRequestSecret(caller),
 };
+
+test('RepositoryClient signs each repository action for the current Marketplace routes', async (t) => {
+    const originalEnvironment = { ...process.env };
+    const { installGeneratedRouterRuntime } = await import('../helpers/generatedRouterRuntime.mjs');
+    const { createRepositoryClient } = await import('../../Agent/client/RepositoryClient.mjs');
+    const requests = [];
+    const replayCache = createMemoryReplayCache();
+    const server = http.createServer(async (req, res) => {
+        const chunks = [];
+        for await (const chunk of req) chunks.push(chunk);
+        const rawBody = Buffer.concat(chunks);
+        const body = rawBody.length ? JSON.parse(rawBody.toString('utf8')) : null;
+        const tool = req.method === 'GET' ? 'marketplace.read'
+            : body.action === 'install_repo' ? 'repositories.prepare' : `repositories.${body.action}`;
+        try {
+            const verified = marketplaceModule.__testables.verifyMarketplaceAgentRequest({
+                req, method: req.method, requestPath: req.url, tool, rawBody, replayCache,
+            });
+            assert.equal(verified.callerPrincipal, caller);
+            requests.push({ method: req.method, path: req.url, tool });
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, repositories: [], result: { conflicts: [] } }));
+        } catch {
+            res.writeHead(401, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'agent_assertion_rejected' }));
+        }
+    });
+    t.after(async () => {
+        await new Promise(resolve => server.close(resolve));
+        for (const key of Object.keys(process.env)) {
+            if (!Object.hasOwn(originalEnvironment, key)) delete process.env[key];
+        }
+        Object.assign(process.env, originalEnvironment);
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    installGeneratedRouterRuntime({ origin: `http://127.0.0.1:${server.address().port}`, tempDir, agentPrincipal: caller });
+    Object.assign(process.env, agentEnv);
+    const client = createRepositoryClient();
+    await client.listRepositories();
+    await client.install({ repos: [], skillRepos: [] });
+    await client.remove([]);
+    await client.prepareRepository({ url: 'https://example.test/skills.git', name: 'skills' });
+    assert.deepEqual(requests, [
+        { method: 'GET', path: '/api/marketplace/list-repos', tool: 'marketplace.read' },
+        { method: 'POST', path: '/api/marketplace/repos', tool: 'repositories.install' },
+        { method: 'POST', path: '/api/marketplace/repos', tool: 'repositories.remove' },
+        { method: 'POST', path: '/api/marketplace/repos', tool: 'repositories.prepare' },
+        { method: 'GET', path: '/api/marketplace/list-repos', tool: 'marketplace.read' },
+    ]);
+});
 
 test.after(() => {
     process.chdir(originalCwd);
