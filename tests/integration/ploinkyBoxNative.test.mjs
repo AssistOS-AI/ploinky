@@ -160,8 +160,15 @@ function assertExactOuterStorage(harness, containerId, repositoryRoot) {
         assert.equal(labels[BOX_AGENTLIB_LABELS.commit], canonicalAgentLibRemote().commit);
         assert.equal(labels[BOX_AGENTLIB_LABELS.sourceIdHash],
             sourceIdHash(imageSourceId(normalizeImageId(record.Image), fingerprint)));
-        assert.equal(fs.existsSync(path.join(workspaceRoot, '.ploinky', 'agentlib')), false,
+        // Image selection never materializes managed AgentLib sources; graph
+        // admission only records the selected image in `active.json`.
+        const managedRoot = path.join(workspaceRoot, '.ploinky', 'agentlib');
+        const managedEntries = fs.existsSync(managedRoot) ? fs.readdirSync(managedRoot) : [];
+        assert.deepEqual(managedEntries.filter((entry) => entry !== 'active.json'), [],
             'image selection must not materialize managed AgentLib state');
+        if (managedEntries.includes('active.json')) {
+            assert.equal(JSON.parse(fs.readFileSync(path.join(managedRoot, 'active.json'), 'utf8')).mode, 'image');
+        }
     }
     for (const [name, value] of Object.entries({
         [AGENTLIB_ENV.dir]: AGENTLIB_STABLE_MOUNT_PATH,
@@ -664,7 +671,6 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
             'printf agent-created > "$1/agent-created-folder/from-agent.txt"',
             'mkdir -p "$2/agent-created-nested"',
             'printf nested-agent-created > "$2/agent-created-nested/from-agent.txt"',
-            'printf persisted > "$1/.ploinky/from-agent.txt"',
         ].join('; '),
         'sh', harness.identity.workspaceRoot, harness.child,
     ]);
@@ -676,16 +682,21 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
         path.join(harness.child, 'agent-created-nested', 'from-agent.txt'),
         'utf8',
     ), 'nested-agent-created');
-    assert.equal(fs.readFileSync(
-        path.join(harness.workspace, '.ploinky', 'from-agent.txt'),
-        'utf8',
-    ), 'persisted');
+    // The controller root stays read-only to agents: they write the workspace,
+    // never Ploinky's own state under `.ploinky`.
+    const agentControllerWrite = queryInBox(harness, started.containerId, [
+        'podman', 'container', 'exec', agent.id,
+        '/bin/sh', '-c', 'printf refused > "$1/.ploinky/from-agent.txt"',
+        'sh', harness.identity.workspaceRoot,
+    ]);
+    assert.equal(agentControllerWrite.ok, false);
+    assert.match(agentControllerWrite.stderr, /Read-only file system/);
+    assert.equal(fs.existsSync(path.join(harness.workspace, '.ploinky', 'from-agent.txt')), false);
     for (const createdPath of [
         path.join(harness.workspace, 'agent-created-folder'),
         path.join(harness.workspace, 'agent-created-folder', 'from-agent.txt'),
         path.join(harness.child, 'agent-created-nested'),
         path.join(harness.child, 'agent-created-nested', 'from-agent.txt'),
-        path.join(harness.workspace, '.ploinky', 'from-agent.txt'),
     ]) {
         assert.equal(fs.statSync(createdPath).uid, process.getuid());
     }
@@ -785,7 +796,7 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     const anchorEntries = fs.readdirSync(path.join(harness.workspace, '.ploinky'));
     assert.equal(anchorEntries.includes('box'), false);
     assert.equal(fs.existsSync(path.join(harness.workspace, '.ploinky', 'data', 'master-key')), true);
-    for (const kept of ['data', 'unrelated.json', 'from-agent.txt']) {
+    for (const kept of ['data', 'unrelated.json']) {
         assert.equal(anchorEntries.includes(kept), true, `.ploinky/${kept} must survive`);
     }
     assert.equal(fs.readFileSync(
