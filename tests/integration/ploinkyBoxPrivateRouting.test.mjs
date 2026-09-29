@@ -14,6 +14,9 @@ import {
     BOX_MEDIA_PORT,
     BOX_ROUTER_CONTAINER_PORT,
 } from '../../ploinky-box/constants.mjs';
+import { imageSourceIdHash, imageSourceIdentity } from '../../agentlib/contract.mjs';
+import { normalizeImageId } from '../../ploinky-box/contract/image-id.mjs';
+import { PUBLIC_ROUTER_HOSTS_ENV } from '../../cli/utils/publicRouterHosts.mjs';
 
 const MINIMAL_NODE_IMAGE = 'docker.io/library/node:24-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d';
 const REPOSITORY_ROOT = path.resolve(import.meta.dirname, '../..');
@@ -128,18 +131,30 @@ test('one nested rootless-Podman container reaches the unpublished private liste
         };
 
         assert.equal(evidence.outerBox.role, 'box');
-        // A local source carries its fingerprint and commit labels; an image
-        // source only its mode, identity and path (no content or revision).
+        // The fixture workspace has no local AgentLib, so the Box image supplies
+        // it: only its mode, identity and path labels (no content or revision).
         const observedLabels = outerInspection?.Config?.Labels || {};
-        const agentLibLabelNames = observedLabels[BOX_AGENTLIB_LABELS.mode] === 'image'
-            ? [BOX_AGENTLIB_LABELS.mode, BOX_AGENTLIB_LABELS.sourceIdHash, BOX_AGENTLIB_LABELS.sourceRelativePath]
-            : Object.values(BOX_AGENTLIB_LABELS);
+        assert.equal(fs.existsSync(path.join(harness.identity.workspaceRoot, 'achillesAgentLib')), false);
+        assert.equal(observedLabels[BOX_AGENTLIB_LABELS.mode], 'image');
+        assert.equal(observedLabels[BOX_AGENTLIB_LABELS.sourceRelativePath], 'image');
+        assert.equal(observedLabels[BOX_AGENTLIB_LABELS.sourceIdHash],
+            imageSourceIdHash(imageSourceIdentity(normalizeImageId(outerInspection?.Image))));
+        // This default Box has the loopback publication and no GPU grant, so it
+        // carries neither conditional label and trusts no outer Router hosts.
+        const conditionalLabels = [BOX_LABELS.routerBindAddress, BOX_LABELS.gpuGrant];
         assert.deepEqual(
             Object.keys(observedLabels)
                 .filter((key) => key.startsWith('io.assistos.ploinky-box.'))
                 .sort(),
-            [...Object.values(BOX_LABELS), ...agentLibLabelNames].sort(),
+            [
+                ...Object.values(BOX_LABELS).filter((name) => !conditionalLabels.includes(name)),
+                BOX_AGENTLIB_LABELS.mode,
+                BOX_AGENTLIB_LABELS.sourceIdHash,
+                BOX_AGENTLIB_LABELS.sourceRelativePath,
+            ].sort(),
         );
+        assert.deepEqual((outerInspection?.Config?.Env || [])
+            .filter((entry) => entry.startsWith(`${PUBLIC_ROUTER_HOSTS_ENV}=`)), []);
         assert.deepEqual(evidence.outerBox.exposedPorts, {
             [`${BOX_MEDIA_PORT}/udp`]: {},
             [`${BOX_ROUTER_CONTAINER_PORT}/tcp`]: {},
