@@ -1,3 +1,4 @@
+import { renderLogMarkdown } from './logMarkdown.js';
 import { normalizeTaskLiveSession } from './taskLiveSession.js';
 import { normalizeTaskDetails } from './taskDetails.js';
 
@@ -5,70 +6,6 @@ const TERMINAL_STATUSES = new Set(['finished', 'stopped', 'error']);
 const ANSI_RE = /[\u001b\u009b][[\]()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g;
 const STREAM_PREFIX_RE = /^\[([^\]]+)\s+(stdout|stderr)\]\s?/i;
 const RUNNER_PREFIX_RE = /^\[[^\]]+\/[^\]]+\]\s?/;
-const TASK_LOG_INLINE_CODE_RE = /`[^`\r\n]+`/gu;
-const TASK_LOG_PATH_RE = /(?:[A-Za-z]:[\\/][^\s"'`<>|]+|(?:\/|~\/|\.{1,2}\/)[^\s"'`<>|]+|[\p{L}\p{N}_+.-]+(?:[\\/][\p{L}\p{N}_+.@-]+)+(?::\d+(?::\d+)?)?)/gu;
-const TASK_LOG_FILE_RE = /(?:^|[\s([{<"'`])([\p{L}\p{N}_+-]+\.(?:c|cc|cpp|cs|css|csv|go|h|hpp|htm|html|java|jpeg|jpg|js|json|jsx|log|md|mdx|mjs|pdf|php|png|py|rb|rs|scss|sh|sql|svg|toml|ts|tsx|txt|webp|xml|yaml|yml)(?::\d+(?::\d+)?)?)(?=$|[\s)\]}>.,'";!?`])/giu;
-const TASK_LOG_TRAILING_PATH_PUNCTUATION_RE = /[),.;!?}\]]+$/u;
-const TASK_LOG_MARKDOWN_LINK_RE = /\[([^\]\r\n]+)\]\(([^)\s]+)\)/gu;
-
-function addTaskLogHighlight(matches, start, end, kind) {
-    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || end <= start) return;
-    if (matches.some((match) => start < match.end && end > match.start)) return;
-    matches.push({ start, end, kind });
-}
-
-function addTaskLogRegexHighlights(text, regex, matches, kind) {
-    regex.lastIndex = 0;
-    let match;
-    while ((match = regex.exec(text)) !== null) {
-        addTaskLogHighlight(matches, match.index, match.index + match[0].length, kind);
-    }
-}
-
-function taskLogPathLength(value) {
-    const trimmed = value.replace(TASK_LOG_TRAILING_PATH_PUNCTUATION_RE, '');
-    if (!trimmed) return 0;
-    if (trimmed.startsWith('/') && !trimmed.slice(1).includes('/')
-        && !/\.[\p{L}\p{N}]{1,10}(?::\d+(?::\d+)?)?$/u.test(trimmed)) {
-        return 0;
-    }
-    return trimmed.length;
-}
-
-export function tokenizeTaskLogText(value) {
-    const text = String(value || '');
-    if (!text) return [{ text, kind: null }];
-    const matches = [];
-    addTaskLogRegexHighlights(text, TASK_LOG_INLINE_CODE_RE, matches, 'code');
-
-    TASK_LOG_PATH_RE.lastIndex = 0;
-    let pathMatch;
-    while ((pathMatch = TASK_LOG_PATH_RE.exec(text)) !== null) {
-        const length = taskLogPathLength(pathMatch[0]);
-        addTaskLogHighlight(matches, pathMatch.index, pathMatch.index + length, 'path');
-    }
-
-    TASK_LOG_FILE_RE.lastIndex = 0;
-    let fileMatch;
-    while ((fileMatch = TASK_LOG_FILE_RE.exec(text)) !== null) {
-        const start = fileMatch.index + fileMatch[0].indexOf(fileMatch[1]);
-        addTaskLogHighlight(matches, start, start + fileMatch[1].length, 'path');
-    }
-
-    matches.sort((left, right) => left.start - right.start);
-    const tokens = [];
-    let cursor = 0;
-    for (const match of matches) {
-        if (match.start > cursor) {
-            tokens.push({ text: text.slice(cursor, match.start), kind: null });
-        }
-        tokens.push({ text: text.slice(match.start, match.end), kind: match.kind });
-        cursor = match.end;
-    }
-    if (cursor < text.length) tokens.push({ text: text.slice(cursor), kind: null });
-    return tokens.length ? tokens : [{ text, kind: null }];
-}
-
 export function taskStatusPresentation(task) {
     if (!task) return { label: 'UNAVAILABLE', className: 'unavailable' };
     if (task.status === 'finished') return { label: 'COMPLETED', className: 'finished' };
@@ -85,6 +22,11 @@ export function taskStatusPresentation(task) {
 }
 
 export function taskDurationSeconds(task, now = Date.now()) {
+    if (Number.isFinite(task?.elapsedMs) && task.elapsedMs >= 0) {
+        const since = Date.parse(task.activeSince || '');
+        const current = task.status === 'ongoing' && Number.isFinite(since) ? Math.max(0, now - since) : 0;
+        return Math.floor((task.elapsedMs + current) / 1000);
+    }
     const start = Date.parse(task?.executionStartedAt || task?.createdAt || '');
     if (!Number.isFinite(start)) return null;
     const terminal = TERMINAL_STATUSES.has(task?.status);
@@ -187,56 +129,6 @@ export function taskDetailsLink(value) {
     return normalizeTaskDetails(value);
 }
 
-function safeTaskLogUrl(rawUrl) {
-    try {
-        const origin = globalThis.window?.location?.origin || 'http://localhost';
-        const url = new URL(rawUrl, origin);
-        return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : '';
-    } catch {
-        return '';
-    }
-}
-
-function highlightedTaskLogFragments(text) {
-    return tokenizeTaskLogText(text).map((token) => {
-        const fragment = document.createElement('span');
-        fragment.className = token.kind
-            ? `wa-task-log-token is-${token.kind}`
-            : 'wa-task-log-fragment';
-        fragment.textContent = token.text;
-        return fragment;
-    });
-}
-
-function linkedTaskLogFragments(text) {
-    // Service paths in runtime logs resolve against the browser's actual Router origin.
-    text = text.replace(/(^|\s)(\/base-agent-additional-server\/[A-Za-z0-9/_-]+)(?=\s|$)/gu,
-        (_match, prefix, path) => `${prefix}[${path}](${path})`);
-    const fragments = [];
-    let cursor = 0;
-    let found = false;
-    TASK_LOG_MARKDOWN_LINK_RE.lastIndex = 0;
-    let match;
-    while ((match = TASK_LOG_MARKDOWN_LINK_RE.exec(text)) !== null) {
-        const href = safeTaskLogUrl(match[2]);
-        if (!href) continue;
-        fragments.push(...highlightedTaskLogFragments(text.slice(cursor, match.index)));
-        const link = document.createElement('a');
-        link.className = 'wa-task-log-inline-link';
-        link.href = href;
-        link.target = '_blank';
-        link.rel = 'noopener noreferrer';
-        link.dataset.wcLink = 'true';
-        link.textContent = match[1] === match[2] ? href : match[1];
-        fragments.push(link);
-        cursor = match.index + match[0].length;
-        found = true;
-    }
-    if (!found) return null;
-    fragments.push(...highlightedTaskLogFragments(text.slice(cursor)));
-    return fragments;
-}
-
 export function renderTaskLog(container, text, emptyText = 'No log output yet.', task = null) {
     if (!container) return;
     container.replaceChildren();
@@ -248,18 +140,20 @@ export function renderTaskLog(container, text, emptyText = 'No log output yet.',
         container.appendChild(empty);
         return;
     }
+    // Parse whole consecutive blocks so lists, tables and code fences span lines.
+    const blocks = [];
     for (const entry of lines) {
-        const line = document.createElement('span');
-        line.className = `wa-task-log-line is-${entry.stream} is-${entry.tone} is-${entry.kind || 'output'}`;
-        const text = entry.text || '\u00a0';
-        line.textContent = text;
-        const tokens = tokenizeTaskLogText(text);
-        const linkedFragments = linkedTaskLogFragments(text);
-        if (typeof line.replaceChildren === 'function' && (linkedFragments || tokens.some((token) => token.kind))) {
-            const fragments = linkedFragments || highlightedTaskLogFragments(text);
-            line.replaceChildren(...fragments);
-        }
-        container.appendChild(line);
+        const className = `wa-log-block wa-log-markdown is-${entry.stream} is-${entry.tone} is-${entry.kind || 'output'}`;
+        const previous = blocks.at(-1);
+        if (previous?.className === className) previous.text += '\n' + entry.text;
+        else blocks.push({ className, text: entry.text });
+    }
+    for (const block of blocks) {
+        if (!block.text.trim()) continue;
+        const node = document.createElement('div');
+        node.className = block.className;
+        renderLogMarkdown(node, block.text);
+        container.appendChild(node);
     }
 }
 

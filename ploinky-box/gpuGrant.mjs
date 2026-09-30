@@ -48,14 +48,18 @@ export const GPU_GRANT_VENDORS = Object.freeze(['nvidia']);
 const BOX_BASE_DEVICES = Object.freeze(['/dev/fuse', '/dev/net/tun']);
 const NVIDIA_DEVICE_NODES = Object.freeze(['/dev/nvidia0', '/dev/nvidiactl', '/dev/nvidia-uvm']);
 // Measured on CUDA workloads: the driver API library, the PTX JIT that some
-// runtimes load, and NVML for nvidia-smi are required. NVVM and gpucomp are
-// bound when present.
+// runtimes load, and NVML for nvidia-smi are required. NVVM (both the current
+// one and the NVVM 7.0 one libcuda names) and gpucomp are bound when present.
 const NVIDIA_REQUIRED_LIBRARIES = Object.freeze([
     'libcuda.so.1',
     'libnvidia-ptxjitcompiler.so.1',
     'libnvidia-ml.so.1',
 ]);
-const NVIDIA_OPTIONAL_LIBRARIES = Object.freeze(['libnvidia-nvvm.so.4']);
+const NVIDIA_OPTIONAL_LIBRARIES = Object.freeze(['libnvidia-nvvm.so.4', 'libnvidia-nvvm70.so.4']);
+// The driver ships these as a real file named by the soname itself, not by
+// the driver version, so for them only that exact name also passes the
+// version check.
+const NVIDIA_UNVERSIONED_LIBRARIES = Object.freeze(['libnvidia-nvvm70.so.4']);
 const NVIDIA_SMI_CANDIDATES = Object.freeze([
     '/usr/bin/nvidia-smi',
     '/usr/local/bin/nvidia-smi',
@@ -63,6 +67,10 @@ const NVIDIA_SMI_CANDIDATES = Object.freeze([
     '/usr/sbin/nvidia-smi',
 ]);
 const LDCONFIG_CANDIDATES = Object.freeze(['/usr/sbin/ldconfig', '/sbin/ldconfig']);
+// The ldconfig cache flag that marks a library built for each supported host
+// architecture (Node.js `process.arch` names). Other entries in the cache, such
+// as 32-bit or foreign-architecture copies, are never bound.
+const LDCONFIG_ARCH_FLAGS = Object.freeze({ x64: 'x86-64', arm64: 'AArch64' });
 const SONAME_RE = /^lib[A-Za-z0-9._+-]+\.so(?:\.[0-9]+)+$/;
 const FINGERPRINT_RE = /^[a-f0-9]{64}$/;
 const RECORD_KEYS = Object.freeze([
@@ -229,14 +237,27 @@ function defaultReadLdconfig() {
     throw discoveryError('ldconfig was not found, so the NVIDIA driver libraries cannot be located');
 }
 
-/** Map each x86-64 soname to its first (highest-priority) ldconfig entry. */
-export function parseLdconfigCache(output) {
+/** The ldconfig cache flag of libraries built for `arch`; refuses an unsupported one. */
+export function ldconfigArchFlag(arch) {
+    const flag = Object.hasOwn(LDCONFIG_ARCH_FLAGS, String(arch)) ? LDCONFIG_ARCH_FLAGS[arch] : null;
+    if (!flag) {
+        throw discoveryError(
+            `GPU discovery does not support the ${JSON.stringify(String(arch))} host architecture; `
+            + `supported: ${Object.keys(LDCONFIG_ARCH_FLAGS).join(', ')}`,
+        );
+    }
+    return flag;
+}
+
+/** Map each soname built for `arch` to its first (highest-priority) ldconfig entry. */
+export function parseLdconfigCache(output, arch) {
+    const archFlag = ldconfigArchFlag(arch);
     const entries = new Map();
     for (const line of String(output || '').split('\n')) {
         const match = /^\s*(\S+)\s+\(([^)]*)\)\s+=>\s+(\S+)\s*$/.exec(line);
         if (!match) continue;
         const [, soname, flags, target] = match;
-        if (!flags.split(',').includes('x86-64') || !path.isAbsolute(target)) continue;
+        if (!flags.split(',').map((flag) => flag.trim()).includes(archFlag) || !path.isAbsolute(target)) continue;
         if (!entries.has(soname)) entries.set(soname, target);
     }
     return entries;
@@ -276,14 +297,18 @@ function describeFile(fsApi, source, label) {
  * Discover the NVIDIA device nodes, driver libraries and nvidia-smi on this
  * host. Refuses, naming the item, when anything is missing, inaccessible to
  * this rootless user, or when the loaded kernel module and the userspace
- * libraries disagree (a driver updated but not yet rebooted).
+ * libraries disagree (a driver updated but not yet rebooted). Only libraries
+ * built for `arch` (x64 or arm64, the host's own by default) are bound; any
+ * other architecture is refused.
  */
 export function discoverNvidiaGpu({
+    arch = process.arch,
     fsApi = fs,
     procVersionPath = '/proc/driver/nvidia/version',
     readLdconfig = defaultReadLdconfig,
     smiCandidates = NVIDIA_SMI_CANDIDATES,
 } = {}) {
+    ldconfigArchFlag(arch);
     let versionText;
     try {
         versionText = fsApi.readFileSync(procVersionPath, 'utf8');
@@ -319,7 +344,7 @@ export function discoverNvidiaGpu({
         return { path: devicePath, ...deviceNumbers(stat.rdev) };
     });
 
-    const cache = parseLdconfigCache(readLdconfig());
+    const cache = parseLdconfigCache(readLdconfig(), arch);
     const versionedName = (source) => path.basename(source).endsWith(`.so.${driverVersion}`);
     const libraries = [];
     for (const soname of NVIDIA_REQUIRED_LIBRARIES) {
@@ -338,7 +363,8 @@ export function discoverNvidiaGpu({
         const target = cache.get(soname);
         if (!target) continue;
         const file = describeFile(fsApi, target, `NVIDIA driver library ${soname}`);
-        if (!versionedName(file.source)) {
+        const unversioned = NVIDIA_UNVERSIONED_LIBRARIES.includes(soname) && path.basename(file.source) === soname;
+        if (!versionedName(file.source) && !unversioned) {
             throw discoveryError(
                 `NVIDIA driver version mismatch: the kernel module is ${driverVersion} but ${soname} is `
                 + `${path.basename(file.source)}; reboot after a driver update`,

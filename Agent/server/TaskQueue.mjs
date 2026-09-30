@@ -50,6 +50,7 @@ function commandResult(stdout) {
             return {
                 text: parsed.outputText || '(no output)',
                 continuation: normalizeContinuation(parsed.continuation),
+                taskStatus: parsed.taskStatus === 'cancelled' ? 'cancelled' : 'completed',
             };
         }
     } catch {
@@ -624,7 +625,8 @@ export class TaskQueue {
                     : null;
             } else if (success) {
                 const content = [{ type: 'text', text: parsedResult.text }];
-                task.status = 'completed';
+                // A successful wrapper can report that its underlying work was stopped.
+                task.status = parsedResult.taskStatus === 'cancelled' ? 'cancelled' : 'completed';
                 task.result = {
                     content,
                     metadata: {

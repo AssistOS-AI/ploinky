@@ -1,0 +1,47 @@
+/* Shared by WebChat task logs and RoboTeam request, phase and report views. */
+.wa-log-markdown {
+    --log-text: var(--wa-text-primary, var(--text, #202124));
+    --log-muted: var(--wa-text-muted, var(--muted, #687082));
+    --log-border: var(--wa-border, var(--border, #d5d9e0));
+    --log-link: var(--wa-accent, var(--accent, #3367d6));
+    min-width: 0;
+    color: var(--log-text);
+    font-size: 14px;
+    line-height: 1.6;
+    font-weight: 400;
+    white-space: normal;
+    overflow-wrap: anywhere;
+}
+.wa-log-block + .wa-log-block { margin-top: 12px; }
+.wa-log-block.is-user-prompt { padding-left: 10px; border-left: 3px solid var(--log-link); }
+.wa-log-block.is-final {
+    --log-final: var(--wa-online, var(--ok, #27834a));
+    margin: 16px 0;
+    padding: 14px 16px;
+    border: 1px solid var(--log-final);
+    border-left-width: 4px;
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--log-final) 8%, transparent);
+    font-weight: 600;
+}
+.wa-log-markdown > :first-child { margin-top: 0; }
+.wa-log-markdown > :last-child { margin-bottom: 0; }
+.wa-log-markdown p { margin: 0 0 0.75em; }
+.wa-log-markdown h1, .wa-log-markdown h2, .wa-log-markdown h3, .wa-log-markdown h4 { line-height: 1.3; margin: 1em 0 0.5em; }
+.wa-log-markdown h1 { font-size: 1.6em; }
+.wa-log-markdown h2 { font-size: 1.4em; }
+.wa-log-markdown h3 { font-size: 1.2em; }
+.wa-log-markdown h4 { font-size: 1.1em; }
+.wa-log-markdown ul, .wa-log-markdown ol { padding-left: 1.6em; margin: 0.5em 0 1em; }
+.wa-log-markdown li { margin: 0.2em 0; }
+.wa-log-markdown a { color: var(--log-link); text-decoration: underline; text-underline-offset: 2px; }
+.wa-log-markdown code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.9em; background: color-mix(in srgb, var(--log-muted) 12%, transparent); padding: 0.1em 0.3em; border-radius: 3px; }
+.wa-log-markdown pre { max-width: 100%; overflow-x: auto; white-space: pre; padding: 12px; border: 1px solid var(--log-border); border-radius: 6px; }
+.wa-log-markdown pre code { background: none; padding: 0; white-space: pre; overflow-wrap: normal; }
+.wa-log-markdown blockquote { margin: 0.75em 0; padding-left: 12px; border-left: 3px solid var(--log-border); color: var(--log-muted); }
+.wa-log-markdown .wa-md-table-wrap { max-width: 100%; overflow-x: auto; margin: 0.75em 0; }
+.wa-log-markdown table { border-collapse: collapse; min-width: 100%; }
+.wa-log-markdown th, .wa-log-markdown td { border: 1px solid var(--log-border); padding: 6px 10px; text-align: left; }
+.wa-log-markdown th { background: color-mix(in srgb, var(--log-muted) 10%, transparent); }
+.wa-log-markdown hr { border: 0; border-top: 1px solid var(--log-border); }
+.wa-task-log-empty { color: var(--wa-text-muted, var(--muted, #687082)); }

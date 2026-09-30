@@ -10,7 +10,6 @@ import {
     renderTaskLog,
     taskDurationSeconds,
     taskStatusPresentation,
-    tokenizeTaskLogText,
 } from '../../cli/server/webchat/taskPresentation.js';
 import { createTaskController } from '../../cli/server/webchat/tasks.js';
 
@@ -178,150 +177,63 @@ test('task log presentation preserves final results from every continuation turn
     );
 });
 
-test('task log styling mutes intermediate output and emphasizes the final result', () => {
-    assert.match(
-        WEBCHAT_CSS,
-        /\.wa-task-log-line\.is-intermediate\s*\{[^}]*color:\s*var\(--wa-text-muted\)/s,
-    );
-    assert.match(
-        WEBCHAT_CSS,
-        /\.wa-task-log-line\.is-final\s*\{[^}]*color:\s*var\(--wa-text-primary\)[^}]*font-weight:\s*600/s,
-    );
-});
-
-test('task log highlighting preserves text while classifying paths and backticks', () => {
-    const text = 'warning: updated src/index.js:12 and `/workspace/output.log`; tests passed';
-    const tokens = tokenizeTaskLogText(text);
-    assert.equal(tokens.map((token) => token.text).join(''), text);
-    assert.deepEqual(
-        tokens.filter((token) => token.kind),
-        [
-            { text: 'src/index.js:12', kind: 'path' },
-            { text: '`/workspace/output.log`', kind: 'code' },
-        ],
-    );
-});
-
-test('task log highlighting recognizes absolute paths without treating slash commands as paths', () => {
-    const text = 'failed in /home/runner/project/main.py:44; retry with /task view';
-    const tokens = tokenizeTaskLogText(text);
-    assert.equal(tokens.map((token) => token.text).join(''), text);
-    assert.deepEqual(
-        tokens.filter((token) => token.kind),
-        [
-            { text: '/home/runner/project/main.py:44', kind: 'path' },
-        ],
-    );
-});
-
-test('task log token styles remain visual-only spans with no link behavior', () => {
-    assert.match(
-        WEBCHAT_CSS,
-        /\.wa-task-log-token\.is-path\s*\{[^}]*color:\s*#5fbf72[^}]*font-weight:\s*400/s,
-    );
-    assert.match(
-        WEBCHAT_CSS,
-        /\.wa-task-log-token\.is-code\s*\{[^}]*color:\s*var\(--wa-accent\)[^}]*\}/s,
-    );
-    assert.doesNotMatch(WEBCHAT_CSS, /\.wa-task-log-token[^}]*text-decoration:\s*underline/);
-    assert.doesNotMatch(WEBCHAT_CSS, /\.wa-task-log-token[^}]*cursor:\s*pointer/);
-});
-
-test('task log renderer creates styled spans without anchors or text changes', (t) => {
+function logFixture(t) {
     const originalDocument = globalThis.document;
-    const makeElement = (tagName = 'div') => ({
-        tagName: tagName.toUpperCase(),
-        children: [],
-        className: '',
-        textContent: '',
-        appendChild(child) {
-            this.children.push(child);
-            return child;
-        },
-        replaceChildren(...children) {
-            this.children = children;
-        },
-    });
-    globalThis.document = { createElement: (tagName) => makeElement(tagName) };
-    t.after(() => { globalThis.document = originalDocument; });
+    const originalWindow = globalThis.window;
+    const makeElement = () => ({ children: [], className: '', innerHTML: '', textContent: '',
+        appendChild(child) { this.children.push(child); },
+        replaceChildren(...children) { this.children = children; } });
+    globalThis.document = { createElement: makeElement };
+    globalThis.window = { location: { origin: 'https://workspace.example' } };
+    t.after(() => { globalThis.document = originalDocument; globalThis.window = originalWindow; });
+    return makeElement();
+}
 
-    const container = makeElement();
-    const text = 'warning in src/index.js';
+test('task logs render multiline Markdown using the final-message renderer', t => {
+    const container = logFixture(t);
+    const text = '# Work\n\n**Done** in src/app.js with `code`.\n\n- first\n- second\n\n| Item | State |\n| --- | --- |\n| Test | Passed |\n\n```js\nconst x = 1;\nconsole.log(x);\n```';
     renderTaskLog(container, text);
-
-    const [line] = container.children;
-    assert.equal(line.textContent, text);
-    assert.equal(line.children.map((child) => child.textContent).join(''), text);
-    assert.deepEqual(
-        line.children.filter((child) => child.className.includes('wa-task-log-token'))
-            .map((child) => [child.textContent, child.className]),
-        [
-            ['src/index.js', 'wa-task-log-token is-path'],
-        ],
-    );
-    assert.equal(line.children.some((child) => child.tagName === 'A'), false);
+    assert.equal(container.children.length, 1);
+    const html = container.children[0].innerHTML;
+    assert.match(html, /<h1>Work<\/h1>/);
+    assert.match(html, /<strong>Done<\/strong> in src\/app.js/);
+    assert.match(html, /<code>code<\/code>/);
+    assert.match(html, /<ul><li>first<\/li><li>second<\/li><\/ul>/);
+    assert.match(html, /<table/);
+    assert.match(html, /<pre><code data-lang="js">const x = 1;\nconsole.log\(x\);<\/code><\/pre>/);
+    assert.doesNotMatch(html, /log-token|is-path/);
+    assert.equal(html, globalThis.webchatMarkdown.render(text));
 });
 
-test('task log renderer turns a safe live-session Markdown link into a side-panel link', (t) => {
-    const originalDocument = globalThis.document;
-    const originalWindow = globalThis.window;
-    const makeElement = (tagName = 'div') => ({
-        tagName: tagName.toUpperCase(),
-        children: [],
-        className: '',
-        dataset: {},
-        textContent: '',
-        appendChild(child) { this.children.push(child); return child; },
-        replaceChildren(...children) { this.children = children; },
-    });
-    globalThis.document = { createElement: (tagName) => makeElement(tagName) };
-    globalThis.window = { location: { origin: 'http://localhost:8080' } };
-    t.after(() => {
-        globalThis.document = originalDocument;
-        globalThis.window = originalWindow;
-    });
-
-    const container = makeElement();
-    renderTaskLog(container, 'Robot started. [Open live desktop](/robot/session/)');
-
-    const link = container.children[0].children.find((child) => child.tagName === 'A');
-    assert.equal(link.textContent, 'Open live desktop');
-    assert.equal(link.href, 'http://localhost:8080/robot/session/');
-    assert.equal(link.dataset.wcLink, 'true');
-    const sessionPath = '/base-agent-additional-server/example/3001/api/robots/analyst/session/';
-    for (const origin of ['http://localhost:8080', 'https://workspace.example']) {
-        globalThis.window.location.origin = origin;
-        renderTaskLog(container, `RoboTeam live session: ${sessionPath}`);
-        const live = container.children[0].children.find((child) => child.tagName === 'A');
-        assert.equal(live.textContent, origin + sessionPath);
-        assert.equal(live.href, origin + sessionPath);
-        assert.equal(live.dataset.wcLink, 'true');
-    }
+test('stream updates reparse a complete code block while retaining final-output boundaries', t => {
+    const container = logFixture(t);
+    const start = '[worker stdout] # Progress\n[worker stdout] ```js\n[worker stdout] const value = 1;';
+    renderTaskLog(container, start);
+    const text = start + '\n[worker stdout] ```\n**Finished**';
+    renderTaskLog(container, text, '', { finalOutputOffset: text.indexOf('**Finished**'), finalOutputLength: 12 });
+    assert.equal(container.children.length, 2);
+    assert.match(container.children[0].innerHTML, /<pre><code data-lang="js">const value = 1;<\/code><\/pre>/);
+    assert.match(container.children[1].innerHTML, /<strong>Finished<\/strong>/);
+    assert.match(container.children[1].className, /is-final/);
+    assert.doesNotMatch(container.children[0].innerHTML, /worker stdout/);
 });
 
-test('task log renderer leaves unsafe Markdown URLs inert', (t) => {
-    const originalDocument = globalThis.document;
-    const originalWindow = globalThis.window;
-    const makeElement = (tagName = 'div') => ({
-        tagName: tagName.toUpperCase(),
-        children: [],
-        className: '',
-        dataset: {},
-        textContent: '',
-        appendChild(child) { this.children.push(child); return child; },
-        replaceChildren(...children) { this.children = children; },
-    });
-    globalThis.document = { createElement: (tagName) => makeElement(tagName) };
-    globalThis.window = { location: { origin: 'http://localhost:8080' } };
-    t.after(() => {
-        globalThis.document = originalDocument;
-        globalThis.window = originalWindow;
-    });
+test('Markdown logs escape HTML, reject executable links and preserve code literally', t => {
+    const container = logFixture(t);
+    renderTaskLog(container, '<script>alert(1)</script>\n<img src=x onerror=alert(1)>\n[unsafe](javascript:alert(1))\n\n```html\n<img src=x>\n**literal**\n```');
+    const html = container.children[0].innerHTML;
+    assert.doesNotMatch(html, /<script|<img|href="javascript:/);
+    assert.match(html, /&lt;script&gt;/);
+    assert.match(html, /&lt;img src=x&gt;\n\*\*literal\*\*/);
+});
 
-    const container = makeElement();
-    renderTaskLog(container, '[Open session](javascript:alert(1))');
-
-    assert.equal(container.children[0].children.some((child) => child.tagName === 'A'), false);
+test('Markdown task links retain Router origin and side-panel metadata', t => {
+    const container = logFixture(t);
+    renderTaskLog(container, '[Open live desktop](/robot/session/)');
+    const html = container.children[0].innerHTML;
+    assert.match(html, /href="https:\/\/workspace.example\/robot\/session\/"/);
+    assert.match(html, /data-wc-link="true"/);
+    assert.match(html, /rel="noopener noreferrer"/);
 });
 
 test('chat task summary streams inline logs and collapses to its metadata header', async (t) => {
