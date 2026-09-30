@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 
 import {
@@ -35,8 +38,75 @@ function optionsFor(state) {
 test('status keeps ordinary foreground runtime state when no no-wait marker exists', () => {
     const result = applyCurrentNoWaitReadiness(LIVE, REGISTRY, {
         readMarker: () => null,
+        readStatus: () => null,
     });
     assert.equal(result, LIVE);
+});
+
+test('status fails closed when a no-wait status names the current runtime but no current marker binds it', () => {
+    for (const state of ['running', 'starting']) {
+        const result = applyCurrentNoWaitReadiness(LIVE, REGISTRY, {
+            readMarker: () => null,
+            readStatus: (containerName) => {
+                assert.equal(containerName, CONTAINER);
+                return { containerName: CONTAINER, instanceId: 'instance-1', enableGeneration: 'generation-1', state };
+            },
+        });
+        assert.equal(result.state.status, 'unknown');
+        assert.equal(result.state.running, true, 'the process remains live');
+        assert.equal(result.state.ready, false);
+        assert.equal(result.state.noWaitState, 'unreadable');
+    }
+});
+
+// A start retires a marker and rotates the tuple, an enable mints a new
+// generation, and a staged replacement moves the runtime to a new name that a
+// later candidate can cycle back to. Each leaves a no-wait status that names a
+// tuple which no longer runs: it says nothing about the current runtime.
+test('status keeps the runtime state when the only no-wait status names another runtime tuple', () => {
+    const stale = [
+        ['no-wait agent restarted as blocking (rotated tuple)', { instanceId: 'instance-0', enableGeneration: 'generation-0' }],
+        ['disabled then re-enabled (new generation)', { instanceId: 'instance-1', enableGeneration: 'generation-0' }],
+        ['staged name cycled back to a new tuple', { instanceId: 'instance-0', enableGeneration: 'generation-1' }],
+        ['status of another container', { containerName: 'other_runtime', instanceId: 'instance-1', enableGeneration: 'generation-1' }],
+    ];
+    for (const [label, fields] of stale) {
+        const result = applyCurrentNoWaitReadiness(LIVE, REGISTRY, {
+            readMarker: () => null,
+            readStatus: () => ({ containerName: CONTAINER, state: 'running', ...fields }),
+        });
+        assert.equal(result, LIVE, label);
+    }
+});
+
+test('status reads the real canonical no-wait status when no marker binds the runtime', () => {
+    const runningDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'status-no-wait-')));
+    try {
+        const directory = path.join(runningDir, 'no-wait');
+        fs.mkdirSync(directory, { mode: 0o700 });
+        fs.chmodSync(directory, 0o700);
+        const write = (status) => fs.writeFileSync(path.join(directory, `${CONTAINER}.json`),
+            JSON.stringify({ containerName: CONTAINER, state: 'running', ...status }), { mode: 0o600 });
+
+        assert.equal(applyCurrentNoWaitReadiness(LIVE, REGISTRY, { runningDir }), LIVE, 'no status');
+        write({ instanceId: 'instance-0', enableGeneration: 'generation-0' });
+        assert.equal(applyCurrentNoWaitReadiness(LIVE, REGISTRY, { runningDir }), LIVE, 'stale status');
+        write({ instanceId: 'instance-1', enableGeneration: 'generation-1' });
+        const unbound = applyCurrentNoWaitReadiness(LIVE, REGISTRY, { runningDir });
+        assert.equal(unbound.state.ready, false, 'current-tuple status without a marker');
+        assert.equal(unbound.state.noWaitState, 'unreadable');
+    } finally {
+        fs.rmSync(runningDir, { recursive: true, force: true });
+    }
+});
+
+test('status fails closed when the no-wait status of an unbound agent cannot be read', () => {
+    const result = applyCurrentNoWaitReadiness(LIVE, REGISTRY, {
+        readMarker: () => null,
+        readStatus: () => { throw new Error('malformed status'); },
+    });
+    assert.equal(result.state.ready, false);
+    assert.equal(result.state.noWaitState, 'unreadable');
 });
 
 test('runtime readiness projection applies one registry snapshot to every runtime', () => {

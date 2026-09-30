@@ -50,6 +50,19 @@ import {
     readEdgeRoutingSelection,
     withEdgeGenerationApplyLock,
 } from '../sandbox/edgeGeneration.js';
+import {
+    NO_WAIT_STATE_BYTE_LIMIT,
+    createNoWaitRunBinding,
+    readNoWaitRunMarker,
+} from '../commands/noWaitLogObserver.js';
+import { publishNoWaitRunMarker, retireNoWaitRunMarker } from '../commands/noWaitMarkerLifecycle.js';
+import {
+    exactNoWaitImmutableIdentity,
+    sameNoWaitImmutableIdentity,
+} from '../commands/noWaitWorkerArgs.js';
+import { writeNoWaitWorkerStatus } from '../commands/noWaitWorker.js';
+import { isProcessAlive, proveWorkerProcessIdentity } from '../sandbox/processIdentity.js';
+import { readVerifiedJsonObject } from '../utils/verifiedReadOnlyFile.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -695,6 +708,297 @@ function shouldDeferNoWaitRestart(monitor, target) {
         });
     }
     return true;
+}
+
+const NO_WAIT_WORKER_SCRIPT_PATH = fileURLToPath(new URL('../commands/noWaitWorker.js', import.meta.url));
+const DEFAULT_NO_WAIT_WORKER_EXIT_WAIT_MS = 5000;
+const NO_WAIT_WORKER_EXIT_POLL_MS = 100;
+
+function readNoWaitRunDocument(fileName) {
+    return readVerifiedJsonObject({
+        trustedRoot: RUNNING_DIR,
+        relativeSegments: ['no-wait', fileName],
+        byteLimit: NO_WAIT_STATE_BYTE_LIMIT,
+        absent: null,
+    });
+}
+
+// True only for a terminal `running` document of exactly this run identity.
+function namesRunningNoWaitRun(document, identity) {
+    if (!document || document.state !== 'running') return false;
+    try {
+        return sameNoWaitImmutableIdentity(exactNoWaitImmutableIdentity(document), identity);
+    } catch (_) {
+        return false;
+    }
+}
+
+// A run retained from a failed attempt spans two lock holds: in between, a
+// start, enable or disable may have launched, retired or replaced it. Reuse it
+// only while the registry still holds exactly the tuple that attempt left, no
+// marker binds either name, and the predecessor's canonical status still names
+// the retained run.
+function retainedNoWaitLineageCurrent(monitor, target, pending, record) {
+    if (!pending?.lineage || !target.restartInputDigest
+        || pending.restartInputDigest !== target.restartInputDigest) {
+        return false;
+    }
+    const loadAgents = monitor.loadAgents || workspaceSvc.loadAgents;
+    const live = loadAgents()?.[target.containerName];
+    if (!live || digestValue(live) !== pending.registryDigest
+        || digestValue(record) !== pending.registryDigest) {
+        return false;
+    }
+    const { lineage } = pending;
+    const readMarker = monitor.readNoWaitRunMarker || readNoWaitRunMarker;
+    if (lineage.containerName !== target.containerName
+        && readMarker(lineage.containerName, { runningDir: RUNNING_DIR })) {
+        return false;
+    }
+    return namesRunningNoWaitRun(readNoWaitRunDocument(`${lineage.containerName}.json`), lineage.identity);
+}
+
+// A replacement of a no-wait runtime retires the current-run marker of the
+// tuple it replaces: the replacement coordinator does it before a non-additive
+// registry write, and the staged branch leaves it for the rebind below.
+// Capture that exact run before the replacement, under the workspace mutation
+// lease and network lifecycle lock that every marker writer holds, so the
+// replacement can be bound back to the same deployment run. A run retained
+// from a failed attempt is consumed here and reused only if still current.
+// It lives in this process only: a Router restart forgets it, and the
+// replacement then stays unbound (fail-closed).
+function captureNoWaitRebindLineage(monitor, target, record) {
+    const pending = target.pendingNoWaitRebind || null;
+    target.pendingNoWaitRebind = null;
+    const readMarker = monitor.readNoWaitRunMarker || readNoWaitRunMarker;
+    try {
+        const marker = readMarker(target.containerName, { runningDir: RUNNING_DIR });
+        if (!marker) {
+            return retainedNoWaitLineageCurrent(monitor, target, pending, record) ? pending.lineage : null;
+        }
+        createNoWaitRunBinding(target.containerName, record, marker);
+        return Object.freeze({
+            containerName: target.containerName,
+            record: deepFreezeSnapshot(structuredClone(record)),
+            identity: exactNoWaitImmutableIdentity(marker),
+        });
+    } catch (_) {
+        // A malformed or foreign marker has no run this Watchdog may rebind;
+        // the replacement coordinator refuses to retire it on its own.
+        return null;
+    }
+}
+
+// The predecessor's worker could still publish over the rebound run. Rebind
+// only once its own terminal status is on disk and its process is provably
+// gone (dead, or its pid reused by a foreign process). The structured proof
+// runs once; the bounded wait after it polls only liveness and yields to the
+// event loop, because this runs in the Router process. Returns the reason to
+// refuse, or null.
+async function waitForPredecessorNoWaitWorkerExit(monitor, lineage) {
+    let status;
+    try {
+        status = readNoWaitRunDocument(lineage.identity.statusFile);
+    } catch (error) {
+        return `the predecessor run status is unreadable: ${error?.message || error}`;
+    }
+    if (!status) return 'the predecessor run published no status';
+    if (!namesRunningNoWaitRun(status, lineage.identity)) {
+        return 'the predecessor run status is not the terminal running status of the captured run';
+    }
+    // A status this Watchdog published for an earlier replacement names no
+    // worker: none exists.
+    if (!Object.hasOwn(status, 'pid')) return null;
+    const prove = monitor.proveNoWaitWorkerProcess || proveWorkerProcessIdentity;
+    try {
+        prove({
+            pid: status.pid,
+            executablePath: process.execPath,
+            workerScriptPath: NO_WAIT_WORKER_SCRIPT_PATH,
+            runningDir: RUNNING_DIR,
+            identity: lineage.identity,
+        });
+    } catch (error) {
+        if (error?.code === 'PROCESS_IDENTITY_STALE' || error?.foreign === true) return null;
+        return `the predecessor worker could not be proven gone: ${error?.message || error}`;
+    }
+    // A pid reused during the wait keeps it alive and ends in refusal.
+    const isAlive = monitor.isNoWaitWorkerAlive || isProcessAlive;
+    const waitMs = Number.isSafeInteger(monitor.noWaitWorkerExitWaitMs) && monitor.noWaitWorkerExitWaitMs >= 0
+        ? monitor.noWaitWorkerExitWaitMs
+        : DEFAULT_NO_WAIT_WORKER_EXIT_WAIT_MS;
+    const deadline = Date.now() + waitMs;
+    for (;;) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) return `the predecessor worker ${status.pid} is still running`;
+        await new Promise((resolve) => setTimeout(resolve, Math.min(NO_WAIT_WORKER_EXIT_POLL_MS, remaining)));
+        if (!isAlive(status.pid)) return null;
+    }
+}
+
+// After a rebind under a new name, the retired run's documents stay behind
+// under the predecessor name, which a later candidate can cycle back to.
+// Remove each only while it still names exactly that run; the run's worker is
+// proven gone and every other writer holds this restart's locks.
+function removeSupersededNoWaitRunDocuments(lineage) {
+    for (const fileName of [lineage.identity.statusFile, `${lineage.containerName}.json`]) {
+        if (!namesRunningNoWaitRun(readNoWaitRunDocument(fileName), lineage.identity)) continue;
+        fs.unlinkSync(path.join(RUNNING_DIR, 'no-wait', fileName));
+    }
+}
+
+/**
+ * Bind a committed replacement back to the deployment run its predecessor
+ * belonged to: the same run id, run start and wave, under the replacement's
+ * own container name, instance and enable generation. The terminal `running`
+ * status follows this Watchdog's own readiness and route activation. The
+ * statuses are written first and the marker last, so an interruption leaves
+ * the runtime unbound (fail-closed) and never defers the Watchdog. Nothing is
+ * published if the registry moved or a newer marker appeared, and no failure
+ * here may undo the committed replacement.
+ */
+async function rebindNoWaitRunAfterReplacement(monitor, target, lineage, {
+    committedName,
+    committedRecord,
+    hostPort,
+    agentDir,
+}) {
+    const event = {
+        container: committedName,
+        agent: target.agentName,
+        repo: target.repoName,
+        runId: lineage.identity.runId,
+    };
+    const refuse = (reason) => {
+        logEvent(monitor, 'warn', 'container_no_wait_rebind_refused', { ...event, reason });
+        return false;
+    };
+    try {
+        const loadAgents = monitor.loadAgents || workspaceSvc.loadAgents;
+        const readMarker = monitor.readNoWaitRunMarker || readNoWaitRunMarker;
+        const registryCurrent = () => {
+            const current = loadAgents()?.[committedName];
+            return Boolean(current) && digestValue(current) === digestValue(committedRecord);
+        };
+        if (!registryCurrent()) return refuse('the registry moved after activation');
+        const predecessorMarker = readMarker(lineage.containerName, { runningDir: RUNNING_DIR });
+        if (predecessorMarker && !sameNoWaitImmutableIdentity(predecessorMarker, lineage.identity)) {
+            return refuse('a newer marker names the predecessor runtime');
+        }
+        if (committedName !== lineage.containerName
+            && readMarker(committedName, { runningDir: RUNNING_DIR })) {
+            return refuse('a newer marker already binds the replacement');
+        }
+        const workerProblem = await waitForPredecessorNoWaitWorkerExit(monitor, lineage);
+        if (workerProblem) return refuse(workerProblem);
+
+        const alias = committedRecord.alias === undefined || committedRecord.alias === null
+            ? ''
+            : committedRecord.alias;
+        const identity = exactNoWaitImmutableIdentity({
+            containerName: committedName,
+            instanceId: committedRecord.instanceId,
+            enableGeneration: committedRecord.enableGeneration,
+            repoName: committedRecord.repoName,
+            shortAgent: committedRecord.agentName,
+            alias,
+            routeKey: alias || committedRecord.agentName,
+            runId: lineage.identity.runId,
+            runStartedAtMs: lineage.identity.runStartedAtMs,
+            waveIndex: lineage.identity.waveIndex,
+            statusFile: `${committedName}.${lineage.identity.runId}.json`,
+        });
+        if (['repoName', 'shortAgent', 'alias', 'routeKey']
+            .some((field) => identity[field] !== lineage.identity[field])) {
+            return refuse('the replacement is a different logical agent');
+        }
+
+        // Revalidate everything immediately before the first write.
+        if (!registryCurrent()) return refuse('the registry moved before publication');
+        const currentPredecessorMarker = readMarker(lineage.containerName, { runningDir: RUNNING_DIR });
+        if (currentPredecessorMarker && !sameNoWaitImmutableIdentity(currentPredecessorMarker, lineage.identity)) {
+            return refuse('a newer marker names the predecessor runtime');
+        }
+        if (committedName !== lineage.containerName
+            && readMarker(committedName, { runningDir: RUNNING_DIR })) {
+            return refuse('a newer marker already binds the replacement');
+        }
+        if (!namesRunningNoWaitRun(readNoWaitRunDocument(`${lineage.containerName}.json`), lineage.identity)) {
+            return refuse('the canonical status no longer names the captured run');
+        }
+        if (currentPredecessorMarker) {
+            const retire = monitor.retireNoWaitRunMarker || retireNoWaitRunMarker;
+            const retired = retire(lineage.containerName, {
+                runningDir: RUNNING_DIR,
+                expectedRecord: lineage.record,
+            });
+            if (!retired?.retired || !sameNoWaitImmutableIdentity(retired.identity, lineage.identity)) {
+                throw new Error('the predecessor marker retirement did not retire the captured run');
+            }
+        }
+        if (readMarker(committedName, { runningDir: RUNNING_DIR })) {
+            return refuse('a newer marker already binds the replacement');
+        }
+        const nowMs = Date.now();
+        const now = new Date(nowMs).toISOString();
+        const writeStatus = monitor.writeNoWaitWorkerStatus || writeNoWaitWorkerStatus;
+        writeStatus(committedName, {
+            containerName: committedName,
+            shortAgent: identity.shortAgent,
+            repoName: identity.repoName,
+            alias: identity.alias,
+            routeKey: identity.routeKey,
+            manifestPath: target.manifestPath,
+            agentPath: agentDir,
+            startedAt: now,
+            startedAtMs: nowMs,
+            sequencePhase: 'active',
+            sequencePhaseStartedAt: now,
+            sequencePhaseStartedAtMs: nowMs,
+            state: 'running',
+            finishedAt: now,
+            finishedAtMs: nowMs,
+            container: committedName,
+            hostPort: hostPort || null,
+        }, {
+            identity,
+            runId: identity.runId,
+            runStartedAtMs: identity.runStartedAtMs,
+            waveIndex: identity.waveIndex,
+            statusFile: path.join(RUNNING_DIR, 'no-wait', identity.statusFile),
+            runningDir: RUNNING_DIR,
+        });
+        const publishMarker = monitor.publishNoWaitRunMarker || publishNoWaitRunMarker;
+        publishMarker(identity, { runningDir: RUNNING_DIR });
+        if (committedName !== lineage.containerName) {
+            try {
+                removeSupersededNoWaitRunDocuments(lineage);
+            } catch (error) {
+                logEvent(monitor, 'warn', 'container_no_wait_superseded_status_retained', {
+                    ...event,
+                    predecessorContainer: lineage.containerName,
+                    error: error?.message || String(error),
+                    code: error?.code || null,
+                });
+            }
+        }
+        logEvent(monitor, 'info', 'container_no_wait_run_rebound', {
+            ...event,
+            predecessorContainer: lineage.containerName,
+            predecessorInstanceId: lineage.identity.instanceId,
+            predecessorEnableGeneration: lineage.identity.enableGeneration,
+            instanceId: identity.instanceId,
+            enableGeneration: identity.enableGeneration,
+        });
+        return true;
+    } catch (error) {
+        logEvent(monitor, 'error', 'container_no_wait_rebind_failed', {
+            ...event,
+            error: error?.message || String(error),
+            code: error?.code || null,
+        });
+        return false;
+    }
 }
 
 function shouldDeferMaintenanceRestart(monitor, target) {
@@ -1751,6 +2055,7 @@ export async function performContainerRestart(monitor, target, reason, attempt =
         let registryCandidateCommitted = false;
         let ownedCandidate = false;
         let retryingPreparation = false;
+        let noWaitLineage = null;
         try {
         assertRestartAttemptCurrent(monitor, target, attempt, 'pre-physical-ensure');
         retryingPreparation = true;
@@ -1824,6 +2129,7 @@ export async function performContainerRestart(monitor, target, reason, attempt =
                     : 'container',
             });
         }
+        noWaitLineage = captureNoWaitRebindLineage(monitor, target, restartRecord);
         result = await Promise.resolve(ensureAgentServiceImpl(target.agentName, manifest, agentDir, {
             containerName: target.containerName,
             commandHint: `ploinky restart ${target.alias || target.agentName}`,
@@ -1885,6 +2191,7 @@ export async function performContainerRestart(monitor, target, reason, attempt =
                 ? target.containerName
                 : result?.containerName,
         });
+        try {
         await activateRestartedContainerRoute(
             monitor,
             target,
@@ -1930,6 +2237,18 @@ export async function performContainerRestart(monitor, target, reason, attempt =
                 },
             },
         );
+        } finally {
+            // Once committed, the replacement serves the deployment run its
+            // predecessor belonged to, even if predecessor cleanup failed.
+            if (activationCommitted && noWaitLineage) {
+                await rebindNoWaitRunAfterReplacement(monitor, target, noWaitLineage, {
+                    committedName: prepared.containerName,
+                    committedRecord: prepared.record,
+                    hostPort: profileResolution.network.mode === 'none' ? null : result?.hostPort,
+                    agentDir,
+                });
+            }
+        }
 
         logEvent(monitor, 'info', 'container_restart_success', {
             container: target.containerName,
@@ -2023,6 +2342,20 @@ export async function performContainerRestart(monitor, target, reason, attempt =
                     restartInputDigest: target.restartInputDigest,
                 });
             }
+            // Retain the run this attempt captured (its coordinator may have
+            // retired the marker) for the retry, bound to exactly the registry
+            // tuple the failed attempt left.
+            const retainedLineage = noWaitLineage
+                || (attempt && target.pendingNoWaitRebind?.restartInputDigest === attempt.digest
+                    ? target.pendingNoWaitRebind.lineage
+                    : null);
+            target.pendingNoWaitRebind = !activationCommitted && retainedLineage
+                ? Object.freeze({
+                    lineage: retainedLineage,
+                    restartInputDigest: target.restartInputDigest,
+                    registryDigest: digestValue(expectedRegistryRecord),
+                })
+                : null;
         }
         if (publishedCleanupRequired) {
             // Persist the sanitized immutable predecessor evidence while the

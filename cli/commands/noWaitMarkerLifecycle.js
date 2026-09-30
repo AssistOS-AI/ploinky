@@ -1,4 +1,5 @@
-// Cycle-free retirement for the public no-wait "current run" marker.
+// Cycle-free retirement and Watchdog republication for the public no-wait
+// "current run" marker.
 //
 // Registry writers call this before publishing an identity transition. A
 // malformed, foreign, or ambiguously owned marker must stop that transition:
@@ -10,7 +11,10 @@ import pathDefault from 'node:path';
 import { randomUUID as randomUUIDDefault } from 'node:crypto';
 
 import { RUNNING_DIR } from '../utils/config.js';
-import { readVerifiedJsonObject } from '../utils/verifiedReadOnlyFile.js';
+import {
+  ensureVerifiedProducerDirectory,
+  readVerifiedJsonObject,
+} from '../utils/verifiedReadOnlyFile.js';
 import { noWaitCurrentMarkerPath } from './noWaitPaths.js';
 import {
   exactNoWaitImmutableIdentity,
@@ -209,7 +213,71 @@ export function retireNoWaitRunMarker(containerName, {
   } catch (error) {
     throw retirementError(`retired no-wait marker '${retiredPath}' could not be removed`, error);
   }
-  return Object.freeze({ retired: true, containerName: exactContainer, markerPath });
+  return Object.freeze({ retired: true, containerName: exactContainer, markerPath, identity });
+}
+
+function publicationError(message, cause) {
+  const error = new Error(message);
+  if (cause) error.cause = cause;
+  error.code = 'NO_WAIT_MARKER_PUBLICATION_FAILED';
+  return error;
+}
+
+/**
+ * Publish one exact current-run marker where none exists. Only the Watchdog
+ * uses this, to bind a replaced runtime tuple back to the deployment run its
+ * predecessor belonged to. It runs under the workspace mutation lease and the
+ * network lifecycle lock, the same locks under which a start writes markers,
+ * so an existing marker is always a newer owner's and is never replaced.
+ */
+export function publishNoWaitRunMarker(identity, {
+  runningDir = RUNNING_DIR,
+  fsApi = fsDefault,
+  pathApi = pathDefault,
+  randomUUID = randomUUIDDefault,
+  uid = typeof process.getuid === 'function' ? process.getuid() : undefined,
+  now = () => new Date(),
+} = {}) {
+  let exactIdentity;
+  try {
+    exactIdentity = exactNoWaitImmutableIdentity(identity, { pathApi });
+  } catch (error) {
+    throw publicationError('no-wait marker publication requires one exact immutable identity', error);
+  }
+  const markerDirectory = ensureVerifiedProducerDirectory({
+    trustedRoot: runningDir,
+    relativeSegments: ['no-wait'],
+    mode: 0o700,
+    fsApi,
+    pathApi,
+  });
+  const markerPath = noWaitCurrentMarkerPath(exactIdentity.containerName, { runningDir });
+  if (pathApi.resolve(pathApi.dirname(markerPath)) !== pathApi.resolve(markerDirectory)) {
+    throw publicationError(`no-wait marker '${markerPath}' is outside the verified no-wait directory`);
+  }
+  if (statOrAbsent(fsApi, markerPath)) {
+    throw publicationError(`a current no-wait marker already exists at '${markerPath}'`);
+  }
+  const temporary = `${markerPath}.${process.pid}.${String(randomUUID()).toLowerCase()}.tmp`;
+  try {
+    fsApi.writeFileSync(temporary, JSON.stringify({
+      createdAt: now().toISOString(),
+      ...exactIdentity,
+    }, null, 2), { flag: 'wx', mode: 0o600 });
+    fsApi.renameSync(temporary, markerPath);
+  } catch (error) {
+    throw publicationError(`no-wait marker '${markerPath}' could not be published atomically`, error);
+  } finally {
+    try { fsApi.unlinkSync(temporary); } catch (error) {
+      if (error?.code !== 'ENOENT') throw publicationError(`temporary no-wait marker '${temporary}' could not be removed`, error);
+    }
+  }
+  try {
+    assertOwnedMarker(markerPath, statOrAbsent(fsApi, markerPath), uid);
+  } catch (error) {
+    throw publicationError(`published no-wait marker '${markerPath}' is not exactly owned`, error);
+  }
+  return Object.freeze({ containerName: exactIdentity.containerName, markerPath, identity: exactIdentity });
 }
 
 /**
