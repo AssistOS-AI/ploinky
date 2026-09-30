@@ -304,3 +304,85 @@ test('dependency store collection retains a superseded seed while a live seed co
     assert.ok(report.retained.find((item) => item.objectId === superseded.objectId)?.reasons.includes('reader:seed-copy'));
     assert.ok(fs.existsSync(superseded.payloadPath));
 });
+
+// A plain agent (no package.json of its own) is built by copying the seed.
+function seededAgent(w, { provider = w.provider, agentLib = w.agentLib, globalPackage = GLOBAL, registration = 'reg-plain', key }) {
+    const seedPlan = buildSeedInstallPlan({ provider, globalPackage, agentLibSelection: agentLib });
+    const agentPlan = buildAgentInstallPlan({ provider, globalPackage, registration, agentLibSelection: agentLib });
+    const generation = w.store.ensureAgentGeneration(w.lease, {
+        agentPlan, seedPlan, installer: w.installer,
+        consumer: { kind: 'container', containerName: `agent_${key}`, engine: 'podman', key, phase: 'created' },
+    });
+    assert.equal(generation.seedDecision, 'exact seed contract', 'the agent object was copied from the seed');
+    return { generation, seedPlan };
+}
+
+const GLOBAL_NEXT = Object.freeze({ ...GLOBAL, dependencies: { ...GLOBAL.dependencies, 'is-odd': '3.0.1' } });
+
+test('dependency store collection removes a seed superseded by a provider change, with its index entry', (t) => {
+    const w = world(t);
+    const before = seededAgent(w, { key: 'p1' });
+    w.state.agents.agent_plain = admittedRecord(before.generation);
+    // A new Box image changes the AgentLib identity and so the whole provider contract.
+    const nextAgentLib = makeAgentLib(w.root, { name: 'agentlib-next', fingerprint: 'fp-2' });
+    const after = seededAgent(w, { provider: hostProvider({ agentLib: nextAgentLib }), agentLib: nextAgentLib, key: 'p2' });
+    assert.notEqual(after.seedPlan.inputKey, before.seedPlan.inputKey);
+    w.state.agents.agent_plain = admittedRecord(after.generation);
+
+    const report = w.collect();
+    assert.equal(report.skipped, null, JSON.stringify(report));
+    const retained = new Map(report.retained.map((item) => [item.objectId, item.reasons]));
+    assert.ok(retained.get(after.generation.objectId)?.includes('admitted-record'));
+    assert.ok(retained.get(after.generation.seed.objectId)?.includes('seed-index'), 'the seed the admitted provider uses is retained');
+    assert.deepEqual(report.removed.sort(), [before.generation.objectId, before.generation.seed.objectId].sort());
+    assert.equal(w.store.readIndex(before.seedPlan.inputKey), null, 'the superseded seed index entry is removed with it');
+    assert.equal(fs.existsSync(path.join(w.store.paths.objects, before.generation.seed.objectId)), false);
+    assert.equal(w.store.readIndex(after.seedPlan.inputKey)?.objectId, after.generation.seed.objectId);
+});
+
+test('dependency store collection retains an indexed seed only while a retained agent object shares its provider', (t) => {
+    const w = world(t);
+    const seed = w.store.ensureGeneration(w.lease, w.seedPlan, { installer: w.installer, consumer: { kind: 'seed-copy', process: deadProcessIdentity() } });
+    // No retained agent object uses this provider: the seed is not needed.
+    let report = w.collect();
+    assert.ok(report.removed.includes(seed.objectId), JSON.stringify(report));
+    // Rebuilt, then an admitted agent object with the same provider keeps it.
+    const rebuilt = w.store.ensureGeneration(w.lease, w.seedPlan, { installer: w.installer, consumer: { kind: 'seed-copy', process: deadProcessIdentity() } });
+    const admitted = w.build('reg-admitted', { kind: 'container', containerName: 'agent_a', engine: 'podman', key: 'a' });
+    w.state.agents.agent_a = admittedRecord(admitted);
+    report = w.collect();
+    assert.ok(report.retained.find((item) => item.objectId === rebuilt.objectId)?.reasons.includes('seed-index'), JSON.stringify(report));
+    assert.ok(fs.existsSync(rebuilt.payloadPath));
+});
+
+test('dependency store collection removes a seed superseded by a global package change under the same provider', (t) => {
+    const w = world(t);
+    const before = seededAgent(w, { key: 'g1' });
+    w.state.agents.agent_plain = admittedRecord(before.generation);
+    const after = seededAgent(w, { globalPackage: GLOBAL_NEXT, key: 'g2' });
+    assert.notEqual(after.seedPlan.inputKey, before.seedPlan.inputKey);
+    w.state.agents.agent_plain = admittedRecord(after.generation);
+
+    const report = w.collect();
+    assert.equal(report.skipped, null, JSON.stringify(report));
+    assert.ok(report.retained.find((item) => item.objectId === after.generation.seed.objectId)?.reasons.includes('seed-index'));
+    assert.deepEqual(report.removed.sort(), [before.generation.objectId, before.generation.seed.objectId].sort());
+    assert.equal(w.store.readIndex(before.seedPlan.inputKey), null);
+});
+
+test('dependency store collection keeps every seed a retained agent object was copied from', (t) => {
+    const w = world(t);
+    const older = seededAgent(w, { key: 'old' });
+    const newer = seededAgent(w, { globalPackage: GLOBAL_NEXT, key: 'new' });
+    // The older agent object is still mounted by a stopped container; the newer one is admitted.
+    w.state.mounts.push(older.generation.nodeModulesPath);
+    w.state.agents.agent_plain = admittedRecord(newer.generation);
+
+    const report = w.collect();
+    assert.equal(report.skipped, null, JSON.stringify(report));
+    const retained = new Map(report.retained.map((item) => [item.objectId, item.reasons]));
+    assert.ok(retained.get(older.generation.objectId)?.includes('container-mount'));
+    assert.ok(retained.get(older.generation.seed.objectId)?.includes('seed-index'), 'its source seed stays with the mounted agent object');
+    assert.ok(retained.get(newer.generation.seed.objectId)?.includes('seed-index'));
+    assert.deepEqual(report.removed, []);
+});

@@ -8,7 +8,14 @@
 //   - admitted selections: every registry record's `dependencies` and every
 //     registry bind into an object (running or stopped runtimes);
 //   - desired selections: objects built for a pending/failed rebuild request;
-//   - needed seeds: every seed object that is the current index target;
+//   - needed seeds: a seed object that is the current index target of its key
+//     while a retained agent object was copied from it, or while it is the
+//     newest indexed seed (by manifest `createdAt`) of a provider contract a
+//     retained agent object uses. Other seeds (a changed Box image, global
+//     package or pin) are removed together with their index entry. The
+//     "newest" choice is a heuristic: after reverting to an older global
+//     package, or a clock step, it may keep one stale seed per provider and
+//     let the current one be rebuilt; copies never depend on their seed;
 //   - durable runtime candidates (`.ploinky/run/runtime-candidates`);
 //   - build receipts whose writer tree is not proven quiescent;
 //   - reader receipts (service, attachment, seed-copy, candidate) whose
@@ -28,6 +35,7 @@ import { assertWorkspaceMutationLease } from '../../runtime/maintenanceLocks.js'
 import { probeContainerRuntime } from '../../../sandbox/docker/common.js';
 import { readEdgeRoutingSelection } from '../../../sandbox/edgeGeneration.js';
 import { dependencyStoreError } from './canonical.mjs';
+import { providerContractDigest } from './installContract.mjs';
 import { OBJECT_OWNER, buildReceiptOwnershipProblem, createCacheStore } from './objectStore.mjs';
 
 const OBJECT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -38,6 +46,11 @@ function readJson(file) {
         if (error?.code === 'ENOENT') return { missing: true };
         return { corrupt: error.message };
     }
+}
+
+/** Provider digest of an object manifest, or null when its contract is unusable. */
+function providerDigestOf(manifest) {
+    try { return manifest?.contract ? providerContractDigest(manifest.contract) : null; } catch { return null; }
 }
 
 function directorySize(target) {
@@ -231,9 +244,9 @@ export function collectDependencyObjects({
             const indexed = inventory.find((item) => item.objectId === objectId)?.indexedBy?.length;
             if (indexed) root(objectId, 'rebuild-request');
         }
-        if (manifest.kind === 'seed' && activeStore.readIndex(manifest.inputKey)?.objectId === objectId) root(objectId, 'seed-index');
     }
 
+    const reasonsByObject = new Map();
     for (const item of inventory) {
         const reasons = new Set(roots.get(item.objectId) || []);
         if (item.buildReceipt && !item.buildReceipt.quiescence?.quiescent) reasons.add('build-writer-unproven');
@@ -241,6 +254,41 @@ export function collectDependencyObjects({
         if (item.classification === 'unknown-entry') reasons.add('unknown-entry');
         if (item.classification === 'unpublished-retained') reasons.add('unpublished-unproven');
         if (item.classification === 'receipt-only-retained') reasons.add('receipt-writer-unproven');
+        reasonsByObject.set(item.objectId, reasons);
+    }
+    // Superseded seeds keep their own index entry forever, so the index alone
+    // never proves a seed is still needed. An indexed seed is kept while a
+    // retained agent object was copied from it, or while it is the newest
+    // indexed seed of a provider that a retained agent object uses (the seed
+    // the next copy for that provider most likely needs). Older seeds of the
+    // same provider (a changed global package or pin) and seeds of providers no
+    // retained agent uses (a changed Box image) are removed with their index.
+    const retainedProviders = new Set();
+    const copiedSeeds = new Set();
+    for (const [objectId, manifest] of manifests) {
+        if (manifest.kind !== 'agent' || !reasonsByObject.get(objectId)?.size) continue;
+        const provider = providerDigestOf(manifest);
+        if (provider) retainedProviders.add(provider);
+        if (manifest.seededFrom?.objectId) copiedSeeds.add(manifest.seededFrom.objectId);
+    }
+    const newestSeedByProvider = new Map();
+    const indexedSeeds = [];
+    for (const [objectId, manifest] of manifests) {
+        if (manifest.kind !== 'seed' || activeStore.readIndex(manifest.inputKey)?.objectId !== objectId) continue;
+        const provider = providerDigestOf(manifest);
+        indexedSeeds.push(objectId);
+        if (!provider || !retainedProviders.has(provider)) continue;
+        const newest = newestSeedByProvider.get(provider);
+        const order = `${manifest.createdAt || ''}\u0000${objectId}`;
+        if (!newest || order > newest.order) newestSeedByProvider.set(provider, { objectId, order });
+    }
+    const neededSeeds = new Set([...newestSeedByProvider.values()].map((seed) => seed.objectId));
+    for (const objectId of indexedSeeds) {
+        if (copiedSeeds.has(objectId) || neededSeeds.has(objectId)) reasonsByObject.get(objectId)?.add('seed-index');
+    }
+
+    for (const item of inventory) {
+        const reasons = reasonsByObject.get(item.objectId);
         if (!item.path && item.classification === 'receipt-only-reclaimable') {
             const receiptFile = path.join(activeStore.paths.buildReceipts, `${item.objectId}.json`);
             activeStore.removeStaleReceipt(lease, receiptFile);

@@ -420,17 +420,27 @@ export function buildAgentInstallPlan({
 }
 
 /**
+ * Digest of the provider part of a seed or agent contract: everything except
+ * the kind-specific install section. A seed can serve only agents whose
+ * provider digest equals its own.
+ */
+export function providerContractDigest(contract) {
+    return canonicalDigest({
+        schema: contract.schema, installerPolicy: contract.installerPolicy, runtime: contract.runtime,
+        toolchain: contract.toolchain, npm: contract.npm, providers: contract.providers,
+    });
+}
+
+/**
  * A seed payload may be copied into an agent object only when no npm run
  * follows and every provider and install-relevant manifest field matches.
  */
 export function seedCopyEligibility(agentPlan, seedPlan, { reinstall = false } = {}) {
     if (reinstall) return { eligible: false, reason: 'target reinstall bypasses seeds' };
     if (agentPlan.hasAgentPackage && agentPlan.npmRequired) return { eligible: false, reason: 'agent package requires npm' };
-    const providerOf = (contract) => canonicalDigest({
-        schema: contract.schema, installerPolicy: contract.installerPolicy, runtime: contract.runtime,
-        toolchain: contract.toolchain, npm: contract.npm, providers: contract.providers,
-    });
-    if (providerOf(agentPlan.contract) !== providerOf(seedPlan.contract)) return { eligible: false, reason: 'provider contract differs' };
+    if (providerContractDigest(agentPlan.contract) !== providerContractDigest(seedPlan.contract)) {
+        return { eligible: false, reason: 'provider contract differs' };
+    }
     if (canonicalDigest(agentPlan.installSections) !== canonicalDigest(seedPlan.installSections)) {
         return { eligible: false, reason: 'install manifest differs from the seed' };
     }
