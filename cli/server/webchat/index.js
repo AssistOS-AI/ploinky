@@ -1,4 +1,3 @@
-import { createSummaryController } from './sessionSummary.js';
 import { initDom } from './domSetup.js';
 import { createSidePanel } from './sidePanel.js';
 import { createMessages } from './messages.js';
@@ -114,9 +113,6 @@ const sidePanelApi = createSidePanel({
         : network?.sendInteractionResponse(interactionId, optionId, response),
 });
 
-const summaryBtn = document.getElementById('summaryBtn');
-const summaryController = createSummaryController({ button: summaryBtn, sidePanel: sidePanelApi });
-
 let sessionController = null;
 let modelCatalogSessionKey = '';
 let taskController = null;
@@ -183,7 +179,6 @@ network = createNetwork({
     onSessionState: (payload) => {
         sessionController?.handleSessionState(payload);
         const selected = sessionController?.getCurrentSession()?.sessionId;
-        summaryController.handleSessionState(payload, selected);
         if (selected && selected === payload.summary?.sessionId) {
             const key = `${selected}:${payload.session?.engine?.backend || ''}`;
             if (key !== modelCatalogSessionKey) {
@@ -643,7 +638,7 @@ refocusComposerAfterIcon(attachmentBtn);
 initMessageToolbar();
 createHeaderMenu({ button: settingsBtn, panel: settingsPanel });
 createResponsiveHeaderActions({
-    actions: [tasksBtn, sessionsBtn, summaryBtn, logoutBtn],
+    actions: [tasksBtn, sessionsBtn, logoutBtn],
     desktopContainer: headerActions,
     mobileContainer: settingsActionSlot,
     mobileSection: settingsMobileActions,

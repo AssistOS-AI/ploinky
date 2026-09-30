@@ -4076,6 +4076,4 @@ button.wa-upload-directory-entry.folder:hover {
     animation: none;
 }
 
-#summaryBtn[hidden] { display: none; }
-
 .wa-response-duration { font-size: inherit; color: var(--wa-text-muted); font-weight: 400; }
