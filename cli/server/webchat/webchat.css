@@ -1,3 +1,4 @@
+@import url("./logMarkdown.css");
 /* WhatsApp-inspired theme colors and variables */
 :root,
 body[data-theme="dark"] {
@@ -3535,8 +3536,8 @@ button.wa-upload-directory-entry.folder:hover {
     border-radius: 9px;
     background: var(--wa-bg-chat);
     color: var(--wa-text-primary);
-    font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    white-space: pre-wrap;
+    font: 14px/1.6 var(--wa-font-family, sans-serif);
+    white-space: normal;
     overflow-wrap: anywhere;
 }
 
@@ -3558,54 +3559,6 @@ button.wa-upload-directory-entry.folder:hover {
 
 .wa-task-log::-webkit-scrollbar-thumb:hover {
     background: var(--wa-accent-hover);
-}
-
-.wa-task-log-line {
-    display: block;
-    min-height: 1.55em;
-}
-
-.wa-task-log-line.is-stderr,
-.wa-task-log-empty {
-    color: color-mix(in srgb, var(--wa-text-secondary) 62%, white);
-}
-
-.wa-task-log-line.is-intermediate {
-    color: var(--wa-text-muted);
-}
-
-.wa-task-log-line.is-final {
-    color: var(--wa-text-primary);
-    font-weight: 600;
-}
-
-.wa-task-log-token.is-path {
-    color: #5fbf72;
-    font-weight: 400;
-}
-
-.wa-task-log-token.is-code {
-    color: var(--wa-accent);
-}
-
-.wa-task-log-inline-link {
-    color: var(--wa-accent);
-    font-weight: 600;
-    text-decoration: underline;
-    text-underline-offset: 2px;
-}
-
-.wa-task-log-inline-link:hover {
-    color: var(--wa-accent-hover);
-}
-
-.wa-task-log-line.is-user-prompt {
-    margin: 5px 0;
-    padding: 3px 7px;
-    border-left: 3px solid var(--wa-accent);
-    background: color-mix(in srgb, var(--wa-accent) 9%, transparent);
-    color: var(--wa-text-primary);
-    font-weight: 700;
 }
 
 .wa-task-summary {

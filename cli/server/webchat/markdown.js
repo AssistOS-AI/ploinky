@@ -19,13 +19,13 @@
   }
 
   function resolveBaseUrl(url) {
-    return url.replace(/PLACEHOLDER_BASE_URL/g, window.location.origin);
+    return url.replace(/PLACEHOLDER_BASE_URL/g, (globalThis.window?.location?.origin || 'http://localhost'));
   }
 
   function sanitizeUrl(rawUrl) {
     try {
       const resolved = resolveBaseUrl(rawUrl);
-      const url = new URL(resolved, window.location.origin);
+      const url = new URL(resolved, (globalThis.window?.location?.origin || 'http://localhost'));
       if (url.protocol === 'http:' || url.protocol === 'https:') return url.href;
     } catch (_) {
       return null;
@@ -409,7 +409,8 @@
     return html;
   }
 
-  window.webchatMarkdown = {
+  const target = typeof window === 'undefined' ? globalThis : window;
+  target.webchatMarkdown = {
     render: renderMarkdown
   };
 })();

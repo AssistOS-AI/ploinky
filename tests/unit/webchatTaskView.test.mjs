@@ -456,10 +456,10 @@ test('task view renders a complete terminal log snapshot without waiting for ano
     assert.equal(elements.get('taskModel').textContent, 'default');
     assert.equal(elements.get('taskDescription').textContent, 'Finished task');
     assert.deepEqual(
-        elements.get('taskLog').children.map((child) => child.textContent),
-        ['historical line', 'final answer', '\u00a0'],
+        elements.get('taskLog').children.map((child) => child.innerHTML),
+        ['<p>historical line<br/>final answer</p>'],
     );
-    assert.match(elements.get('taskLog').children[1].className, /is-intermediate/);
+    assert.match(elements.get('taskLog').children[0].className, /is-intermediate/);
 
     listeners.get('message')?.({
         origin: 'http://localhost:8080',
@@ -514,15 +514,15 @@ test('task view renders a complete terminal log snapshot without waiting for ano
         task: chunkedTask,
         logChunk: { phase: 'chunk', index: 0, count: 2, text: 'chunked historical\n', nextOffset: 24 },
     });
-    assert.notEqual(elements.get('taskLog').children[0].textContent, 'chunked historical');
+    assert.notEqual(elements.get('taskLog').children[0].innerHTML, '<p>chunked historical</p>');
     sendTaskPayload({
         event: 'view-log-chunk',
         task: chunkedTask,
         logChunk: { phase: 'chunk', index: 1, count: 2, text: 'done\n', nextOffset: 24 },
     });
     assert.deepEqual(
-        elements.get('taskLog').children.map((child) => child.textContent),
-        ['chunked historical', 'done', '\u00a0'],
+        elements.get('taskLog').children.map((child) => child.innerHTML),
+        ['<p>chunked historical<br/>done</p>'],
     );
     await Promise.resolve();
     assert.deepEqual(commands, ['/task view task_1234567890abcdef12345678']);
