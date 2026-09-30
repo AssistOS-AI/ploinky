@@ -24,7 +24,7 @@ Ploinky design specifications must not contain a `Conclusion` section. New DS fi
 6. Serialize workspace mutations with the workspace lock. Revalidate immutable identity immediately before mutation, bound rollback, and declare readiness only when the complete manifest graph is ready or has reached its declared no-wait terminal state and every required external health check passes.
 7. Routing fails closed. Apply the same authenticated route policy, caller ACL, exact active generation/lease checks, and replay protection to HTTP, SSE, and WebSocket traffic.
 8. Confine credentials. Never inject reusable agent credentials into host or `none` runtimes. Relay/channel credentials must be fresh, generation-bound, delivered only through the private confined channel, and absent from logs, persisted state, and test artifacts.
-9. A release-candidate deployment must use the exact pushed commit of Ploinky's current branch. Every other deployed repository must use its recorded remote default branch and exact commit. Falling back to a non-default dependency branch is forbidden.
+9. A release-candidate deployment must use the exact pushed commit of Ploinky's current branch. Every other deployed repository must use its recorded remote default branch or, when the deployment selects a candidate branch with `--branch <branch>`, that same-named branch where the repository has it, each at its recorded exact pushed commit. A repository without the selected branch stays on its default branch; falling back to any other non-default branch is forbidden.
 10. Preserve the versionless semantic Box identity. Do not turn schema or runtime revisions into incrementing public Box names.
 
 ## On-demand cross-repository release gate
@@ -35,7 +35,7 @@ When the user requests this gate, all steps below are mandatory against the exac
 
 ### 1. Pin the candidate
 
-Commit and push the Ploinky candidate first. Record its current branch, exact pushed commit, and configured upstream. For every other participating or deployed repository, resolve and record the remote symbolic `HEAD`, its default branch, that branch's exact commit, and the configured upstream used by the fixture. Also record the expected immutable Box image identity and the release manifest used by the Copilot gate. Do not test uncommitted source and do not silently mix branch heads from different candidate generations.
+Commit and push the Ploinky candidate first. Record its current branch, exact pushed commit, and configured upstream. For every other participating or deployed repository, resolve and record the remote symbolic `HEAD`, its default branch, the branch the deployment will use (its default branch, or the `--branch` candidate branch where that repository has it), that branch's exact pushed commit, and the configured upstream used by the fixture. When the candidate spans several repositories, push the same-named candidate branch in each of them before deploying. Also record the expected immutable Box image identity and the release manifest used by the Copilot gate. Do not test uncommitted source and do not silently mix branch heads from different candidate generations.
 
 ### 2. Recreate the dedicated local fixture
 
@@ -45,23 +45,30 @@ Do not reuse a prior Box, generation, repository checkout, volume, release manif
 
 ### 3. Deploy Explorer with the canonical command
 
-The deployment command is literal:
+The deployment command is literal, in one of two forms:
 
 ```sh
 cd ~/work/testExplorerFresh
 ploinky start explorer
 ```
 
-Do not add arguments or flags to this deployment command, including `--branch`, `--branch-fallback`, `--repo-branch`, or `--reset-repos`. Branch selection, checkout updates, and candidate pinning are separate preparation steps and must not be encoded as `ploinky start explorer` arguments. Do not substitute a manual compose/podman launch or an already-running deployment.
+or, when the candidate uses a same-named branch across repositories:
+
+```sh
+cd ~/work/testExplorerFresh
+ploinky start explorer --branch <candidate-branch>
+```
+
+`--branch <candidate-branch>` is the only permitted option, and it must name the pushed candidate branch recorded in step 1. Repositories that do not have that branch stay on their default branch through the default fallback, which Ploinky logs. Do not add any other arguments or flags, including `--branch-fallback`, `--repo-branch`, or `--reset-repos`. Checkout updates and candidate pinning remain separate preparation steps. Do not substitute a manual compose/podman launch or an already-running deployment.
 
 Before testing, prove all of the following:
 
 1. The entire declared Explorer graph is ready, including required external health checks.
-2. Ploinky is clean, tracks the pushed current branch, and is at its recorded candidate commit. Every other deployed repository is clean, tracks its recorded `origin/<default-branch>`, and is at the recorded default-branch commit.
+2. Ploinky is clean, tracks the pushed current branch, and is at its recorded candidate commit. Every other deployed repository is clean, tracks its recorded upstream (`origin/<default-branch>`, or `origin/<candidate-branch>` for a repository on the `--branch` candidate branch), and is at its recorded commit.
 3. The running Box has the expected immutable image identity and fresh generation.
 4. The network publications and runtime privileges still satisfy the invariants above.
 
-Any fallback, detached/mixed revision, stale generation, unclean checkout, missing agent, or readiness exception invalidates the deployment.
+Any fallback other than a repository without the `--branch` candidate branch staying on its default branch, and any detached/mixed revision, stale generation, unclean checkout, missing agent, or readiness exception, invalidates the deployment.
 
 ### 4. Run the three separate headless Playwright gates
 
