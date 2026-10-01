@@ -13,7 +13,14 @@
     overflow-wrap: anywhere;
 }
 .wa-log-block + .wa-log-block { margin-top: 12px; }
-.wa-log-block.is-user-prompt { padding-left: 10px; border-left: 3px solid var(--log-link); }
+.wa-log-block.is-user-prompt {
+    display: block;
+    margin: 12px 0;
+    padding: 10px 14px;
+    border-left: 3px solid #27834a;
+    border-radius: 6px;
+    background: color-mix(in srgb, #27834a 16%, transparent);
+}
 .wa-log-block.is-final {
     --log-final: var(--wa-online, var(--ok, #27834a));
     margin: 16px 0;

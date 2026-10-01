@@ -779,16 +779,7 @@ function routeCompleteOutputLine(appState, tab, line) {
     const normalized = stripCtrlAndAnsi(String(line || '')).trim();
     if (PLOINKY_WORKSPACE_BANNER_RE.test(normalized)) return;
     if (normalized.startsWith('{') && normalized.includes(`"${WEBCHAT_DIAGNOSTIC_FLAG}"`)) {
-        try {
-            const raw = JSON.parse(normalized);
-            if (raw[WEBCHAT_DIAGNOSTIC_FLAG] === 1 && raw.version === 1) {
-                const clean = (value, limit) => typeof value === 'string' ? value.replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, limit) : '';
-                const diagnostic = { level: raw.level === 'info' ? 'info' : 'warn', source: clean(raw.source, 80),
-                    message: clean(raw.message, 600), code: clean(raw.code, 80), detail: clean(raw.detail, 600), taskId: clean(raw.taskId, 80) };
-                console[diagnostic.level]('[webchat-diagnostic]', diagnostic);
-                writeOrBufferSseEvent(tab, `event: diagnostic\ndata: ${JSON.stringify(diagnostic)}\n\n`);
-            }
-        } catch { /* Malformed diagnostic records are never conversation text. */ }
+        // Consume internal diagnostics without logging or displaying them as chat.
         return;
     }
     if (normalized.includes(`"${WEBCHAT_SESSION_FLAG}"`)) {

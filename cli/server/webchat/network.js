@@ -669,13 +669,6 @@ export function createNetwork({
             }
         });
 
-        es.addEventListener('diagnostic', (event) => {
-            try {
-                const diagnostic = JSON.parse(event.data);
-                console[diagnostic.level === 'info' ? 'info' : 'warn']('[webchat-diagnostic]', diagnostic);
-            } catch { /* Diagnostics do not alter messages or session state. */ }
-        });
-
         es.addEventListener('task-update', (event) => {
             try {
                 const payload = JSON.parse(event.data);
