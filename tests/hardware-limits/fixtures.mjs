@@ -295,7 +295,7 @@ export function buildRequiredCaseManifest() {
             'G.generic-saved-on-inspect', 'G.generic-initialized-empty-inspect', 'G.generic-nonempty-inspect',
             'G.generic-unknown-refuses', 'G.off-byte-identical', 'G.bind-contract', 'G.store-directory-replaced',
             'G.targeted-gate-change', 'G.every-final-generation', 'G.status-on', 'G.status-off', 'G.status-absent',
-            'G.status-unprepared', 'G.status-transition', 'G.status-refused-blocked',
+            'G.status-unprepared', 'G.status-transition', 'G.status-refused-blocked', 'G.status-production-observed',
         ]),
         ...leaves(P, 'p1', unit('ploinkyBoxHardwareLimitsTransitions.test.mjs'), [
             'T.first-on-no-barrier', 'T.on-on-no-barrier', 'T.policy-write-before-barrier',
@@ -321,6 +321,8 @@ export function buildRequiredCaseManifest() {
         ...leaves(P, 'p1', unit('hardwareLimitsDelegation.test.mjs'), [
             'DG.no-aggregate-write', 'DG.nonroot-parents', 'DG.runtime-contexts', 'DG.outer-inspect-runtime',
             'DG.helper-complete-flags', 'DG.helper-proof', 'DG.helper-peak-after-probe-before-cleanup',
+            'DG.host-kind-podman-machine-macos-fix', 'DG.host-kind-native-linux-fix', 'DG.unprepared-kind-cgroup',
+            'DG.unprepared-kind-runtime', 'DG.unprepared-kind-parents',
             ...CONTROLLER_SUBSETS.map((subset) => `DG.controllers.${subset}`),
         ]),
         ...leaves(P, 'p1', unit('hardwareLimitsDrift.test.mjs'), [

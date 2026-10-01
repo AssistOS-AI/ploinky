@@ -243,6 +243,36 @@ export function readLimitsStatus({
     });
 }
 
+const NOT_OBSERVED = 'in-Box facts are not observed from the host';
+
+function known(value, reason) {
+    return value === undefined || value === null || value === '' ? `unknown (${reason})` : String(value);
+}
+
+function hostDelegationLine(host) {
+    if (!host || host.problem) {
+        return `Host delegation: unknown (${host?.problem || 'the host engine was not queried'})`;
+    }
+    const runtime = host.boxRuntime
+        ? `${known(host.ociRuntime, 'not reported by the engine')}; Box OCI runtime ${host.boxRuntime.verified
+            ? `${host.boxRuntime.runtime} (verified)`
+            : `unverified (${host.boxRuntime.reason})`}`
+        : known(host.ociRuntime, 'not reported by the engine');
+    return `Host delegation: cgroup ${known(host.cgroupVersion, 'not reported by the engine')}; outer OCI runtime ${runtime}; `
+        + `controllers ${host.controllers?.length ? host.controllers.join(' ') : 'unknown (not reported by the engine)'}`;
+}
+
+function preparedText(box) {
+    if (box?.prepared === true) return 'yes';
+    if (box?.prepared === false) return `no: ${box.preparedReason}`;
+    return `unknown (${box?.preparedReason || 'preparation is not observed from the host'})`;
+}
+
+/**
+ * Deterministic host status (§5.5). The host never invents facts: anything
+ * it did not observe prints unknown with its reason, and per-instance lines
+ * appear only for observed instances.
+ */
 export function formatLimitsStatus(status) {
     const lines = [];
     lines.push(`Workspace identity: ${status.identity}`);
@@ -252,16 +282,17 @@ export function formatLimitsStatus(status) {
     if (status.envNote) lines.push(`Note: ${status.envNote}`);
     lines.push(`Hardware state: ${status.hardwareState}`);
     lines.push(`Transition: ${transitionLine(status.transition)}`);
-    const host = status.hostFacts;
-    lines.push(`Host delegation: cgroup ${host?.cgroupVersion || 'unknown'}; outer OCI runtime ${host?.ociRuntime || 'unknown'}; controllers ${host?.controllers?.length ? host.controllers.join(' ') : 'unknown'}`);
+    lines.push(hostDelegationLine(status.hostFacts));
     const box = status.box;
-    const boxState = box?.state || 'absent';
-    lines.push(`Box: ${boxState}; wiring ${box?.wiring ? String(box.wiring).slice(0, 12) : 'none'}; prepared ${box?.prepared === true ? 'yes' : `no: ${box?.preparedReason || (boxState === 'running' ? 'not observed from the host' : 'the Box is not running')}`}`);
-    // A host invocation cannot invent in-Box mount or controller facts.
-    lines.push(`Box mount: cgroup2 ${box?.mount?.cgroup2 ?? 'unknown'}; rw ${box?.mount?.rw ?? 'unknown'}; nsdelegate ${box?.mount?.nsdelegate ?? 'unknown'}`);
-    lines.push(`Nested backend: ${box?.nested?.runtime || 'unknown'}; manager ${box?.nested?.manager || 'unknown'}; controllers ${box?.nested?.controllers?.length ? box.nested.controllers.join(' ') : 'unknown'}`);
-    lines.push(`Internal helpers: ${box?.helpers || 'not observed'}`);
-    lines.push(`GPU sharing: best-effort, not a security boundary; daemon ${box?.mps?.daemon || 'not started'}`);
+    lines.push(box
+        ? `Box: ${box.state}; wiring ${box.wiring ? String(box.wiring).slice(0, 12) : 'none'}; prepared ${preparedText(box)}`
+        : 'Box: unknown (the Box was not inspected)');
+    // A host invocation cannot invent in-Box mount, backend or helper facts.
+    lines.push(`Box mount: cgroup2 ${known(box?.mount?.cgroup2, NOT_OBSERVED)}; rw ${known(box?.mount?.rw, NOT_OBSERVED)}; nsdelegate ${known(box?.mount?.nsdelegate, NOT_OBSERVED)}`);
+    lines.push(`Nested backend: ${known(box?.nested?.runtime, NOT_OBSERVED)}; manager ${known(box?.nested?.manager, NOT_OBSERVED)}; `
+        + `controllers ${box?.nested?.controllers?.length ? box.nested.controllers.join(' ') : `unknown (${NOT_OBSERVED})`}`);
+    lines.push(`Internal helpers: ${known(box?.helpers, NOT_OBSERVED)}`);
+    lines.push(`GPU sharing: best-effort, not a security boundary; daemon ${known(box?.mps?.daemon, 'GPU sharing is not available in this release')}`);
     lines.push(`MPS defaults: ${box?.mps?.defaults || 'none'}`);
     if (status.storeLock) {
         lines.push(`Store lock: held by ${status.storeLock.malformed ? `an unrecognized owner (${status.storeLock.reason})` : `${status.storeLock.owner.operation} since ${status.storeLock.owner.acquiredAt}`}`);
@@ -269,15 +300,61 @@ export function formatLimitsStatus(status) {
     for (const agent of status.agents) {
         const entry = agent.entry;
         const gpu = entry.gpu ? `${entry.gpu.smPercent}/${entry.gpu.vramPercent} percent` : 'none';
-        const instances = agent.instances.length ? agent.instances : [{ key: 'not enabled', alias: null }];
-        for (const instance of instances) {
-            lines.push(`Agent: ${agent.ref} [${instance.key}] alias ${instance.alias || 'none'}; cpu ${percentOrNone(entry.cpus)}; RAM ${entry.memoryPercent !== undefined ? `${entry.memoryPercent}%` : 'declared'} (${instance.memoryBytes ?? 'none'}); GPU ${gpu}`);
-            lines.push(`  Availability: ${instance.availability || 'stopped'}`);
-            lines.push(`  Limits: ${instance.limitsState || 'pending'}`);
+        const ram = entry.memoryPercent !== undefined ? `${entry.memoryPercent}%` : 'declared';
+        if (!agent.instances.length) {
+            // Stored policy only: no instance was observed, so no key,
+            // availability or applied state is claimed.
+            lines.push(`Agent: ${agent.ref} (stored policy; instances not observed from the host); cpu ${percentOrNone(entry.cpus)}; RAM ${ram}; GPU ${gpu}`);
+            continue;
+        }
+        for (const instance of agent.instances) {
+            lines.push(`Agent: ${agent.ref} [${instance.key}] alias ${instance.alias || 'none'}; cpu ${percentOrNone(entry.cpus)}; RAM ${ram} (${known(instance.memoryBytes, 'not observed')}); GPU ${gpu}`);
+            lines.push(`  Availability: ${known(instance.availability, 'not observed')}`);
+            lines.push(`  Limits: ${known(instance.limitsState, 'not observed')}`);
             if (instance.fix) lines.push(`  Fix: ${instance.fix}`);
         }
     }
     return `${lines.join('\n')}\n`;
+}
+
+/**
+ * Read-only host facts for status: the engine's cgroup version, configured
+ * OCI runtime and controllers (podman info), and the exact Box's recorded OCI
+ * runtime (container inspect). No mutation, no preparation.
+ */
+export function observeHostLimitsFacts({ engine, containerId = null, query, verifyRuntime }) {
+    if (!engine?.name || typeof query !== 'function') return Object.freeze({ problem: 'the host engine is unavailable' });
+    let info;
+    try {
+        const result = query(engine.name, ['info', '--format', 'json'], { timeoutMs: 10_000 });
+        if (!result?.ok) return Object.freeze({ problem: 'podman info failed' });
+        info = JSON.parse(String(result.stdout || ''));
+    } catch (error) {
+        return Object.freeze({ problem: `podman info is unreadable (${String(error?.message || error).slice(0, 128)})` });
+    }
+    const host = info?.host || {};
+    const facts = {
+        cgroupVersion: typeof host.cgroupVersion === 'string' ? host.cgroupVersion : null,
+        ociRuntime: typeof host.ociRuntime?.name === 'string' ? host.ociRuntime.name : null,
+        controllers: Array.isArray(host.cgroupControllers) ? host.cgroupControllers.map(String).slice(0, 16) : null,
+        boxRuntime: null,
+    };
+    if (containerId) {
+        let inspected = '';
+        try {
+            const result = query(engine.name, ['container', 'inspect', '--format', '{{.OCIRuntime}}', containerId], { timeoutMs: 10_000 });
+            inspected = result?.ok ? String(result.stdout || '').trim() : '';
+        } catch (_) {
+            inspected = '';
+        }
+        const verdict = verifyRuntime({ configuredRuntime: facts.ociRuntime, inspectedRuntime: inspected });
+        facts.boxRuntime = Object.freeze({
+            verified: verdict.verified,
+            runtime: inspected ? path.basename(inspected) : null,
+            reason: verdict.reason,
+        });
+    }
+    return Object.freeze(facts);
 }
 
 /**

@@ -280,7 +280,7 @@ A matching folder named after the registered repository takes priority; otherwis
 | `ploinky gpu status` | Show the saved grant, host GPU discovery, and the Box's GPU wiring without mutation |
 | `PLOINKY_BOX_HARDWARE_LIMITS=on ploinky start` (or `restart`, `update`) | Turn hardware limits on for this workspace and save the gate; the Box is recreated with the hardware wiring and prepared before graph work |
 | `PLOINKY_BOX_HARDWARE_LIMITS=off ploinky restart` (or `start`, `update`) | Turn hardware limits off and save the gate; refused while agents still have stored limits |
-| `ploinky limits status` | Show the saved gate, hardware state, transition, Box preparation and per-agent limits without mutation |
+| `ploinky limits status` | Show the saved gate, hardware state, transition, Box state, host engine facts and stored per-agent limits without mutation; unobserved in-Box facts print as `unknown` |
 | `ploinky limits clear --agent REPO/AGENT` / `ploinky limits clear --all` | Remove one agent's stored limits, or reset the whole policy store, on the host without a running Router |
 | `ploinky status` | Inspect outer configuration/publishes/health and running core status without mutation |
 | `ploinky diagnose [--json]` | Run host prerequisite/settings checks and isolated deployment command probes; report failures, commands, and actions labelled by privilege and automation eligibility |
@@ -677,9 +677,13 @@ Turning the gate off while agents still have stored limits is refused with:
 
     N agents have stored hardware limits. Turn the gate on with PLOINKY_BOX_HARDWARE_LIMITS=on ploinky restart, or run ploinky limits clear --agent REPO/AGENT or ploinky limits clear --all on the host. No Box mutation was performed.
 
-`ploinky limits status` shows the saved gate, the hardware state, any
-interrupted gate-off transition, the Box's preparation and the per-agent limits
-without changing anything. `ploinky limits clear --agent REPO/AGENT` and
+`ploinky limits status` shows, without changing anything, the saved gate, the
+hardware state, any interrupted gate-off transition, the Box's state and
+wiring, the host engine's cgroup version, OCI runtime and controllers, the
+running Box's recorded OCI runtime, and each agent's stored limits. Facts the
+host cannot observe, such as the Box's in-Box preparation, cgroup mount and
+nested backend, are printed as `unknown` with the reason; it lists no
+per-instance availability it has not observed. `ploinky limits clear --agent REPO/AGENT` and
 `ploinky limits clear --all` remove stored limits on the host and work without a
 running Router.
 
@@ -704,8 +708,8 @@ An unenforceable limit refuses that agent. Blocking dependencies and consumers
 explicitly waiting on a no-wait result propagate BLOCKED with the originating
 reason; an optional no-wait child does not block its parent. Unrelated agents
 continue starting. Refused and blocked agents are never ready. If a required
-dependency blocks Explorer itself, host status/clear and Router administration
-remain recovery paths.
+dependency blocks Explorer itself, `ploinky limits status` and
+`ploinky limits clear` on the host remain the recovery path.
 
 Store files are outside agent-visible workspace mounts, but administrator
 authority is not protected from every workspace-capable agent: eligible agents

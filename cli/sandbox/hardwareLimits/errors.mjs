@@ -17,6 +17,7 @@ export const HARDWARE_REASON_CODES = Object.freeze([
     'controller_unavailable',
     'cgroup_unsupported',
     'runtime_unverified',
+    'backend_unavailable',
     'store_unreadable',
     'gpu_grant_missing',
     'gpu_sharing_unavailable',

@@ -88,8 +88,11 @@ export function readBoxHardwareContext({
         prepared: delegation.structurallyPrepared === true,
         backendReady: delegation.backendReady === true,
         controllers: delegation.controllers || [],
-        hostKind: marker.marker.hostKind === 'macos' ? 'macos' : 'linux',
-        unpreparedKind: delegation.structurallyPrepared && !delegation.backendReady ? 'runtime' : '',
+        // The host discovery produces 'native-linux' or 'podman-machine';
+        // a Podman machine is the macOS host (its delegation fix differs).
+        hostKind: marker.marker.hostKind === 'podman-machine' ? 'macos' : 'linux',
+        // cgroup (Box mount), placement, runtime (nested backend) or parents.
+        unpreparedKind: delegation.backendReady ? '' : String(delegation.kind || ''),
         unpreparedDetail: delegation.reason || '',
         runtimeObserved,
         storeState: snapshot.status === 'valid' ? 'valid' : 'unreadable',

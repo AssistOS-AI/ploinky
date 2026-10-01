@@ -70,6 +70,7 @@ import {
     GENERIC_INSPECT_ONLY_MESSAGE,
     createHardwareGateStore,
     observeContainerHardwareWiring,
+    observeHostLimitsFacts,
     parseHardwareGateValue,
     readHardwareStateClass,
     readLimitsStatus,
@@ -96,7 +97,7 @@ import {
     stopPloinkyLocalByContainerId,
 } from './lifecycle/container.mjs';
 import { observeBoxConfiguration, reconcileBoxContainer } from './lifecycle/transactions.mjs';
-import { prepareBoxGeneration } from './hardwareLimits/status.mjs';
+import { prepareBoxGeneration, verifyBoxRuntime } from './hardwareLimits/status.mjs';
 import {
     abortHardwareDowngradesForDestroy,
     createTransitionStore,
@@ -2125,11 +2126,20 @@ export function createBoxSupervisor({
             identity,
             gateStore: hardwareGateStore,
             env,
+            // The host's own read-only engine and exact-Box runtime checks.
+            hostFacts: observeHostLimitsFacts({
+                engine: ownership?.engine,
+                containerId: container?.id || null,
+                query: typeof runner?.query === 'function' ? runner.query.bind(runner) : null,
+                verifyRuntime: verifyBoxRuntime,
+            }),
             observedBox: container
                 ? {
                     state: container.runtime?.running ? 'running' : 'stopped',
                     wiring: container.labels?.[BOX_LABELS.hardwareLimits] || null,
-                    prepared: null,
+                    // A stopped Box has no prepared generation; a running
+                    // one's in-Box preparation is not observable from here.
+                    prepared: container.runtime?.running ? null : false,
                     preparedReason: container.runtime?.running
                         ? 'in-Box preparation is not observed from the host'
                         : 'the Box is not running',

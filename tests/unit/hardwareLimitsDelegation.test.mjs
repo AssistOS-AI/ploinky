@@ -79,7 +79,8 @@ test('DG.nonroot-parents', () => {
     const state = readDelegationState({ fsApi: denied, query: readyQuery() });
     assert.equal(state.structurallyPrepared, true);
     assert.equal(state.backendReady, false);
-    assert.match(state.reason, /agent cgroup parents are unavailable/);
+    assert.match(state.reason, /^the agent cgroup parents could not be created \(EACCES\)$/);
+    assert.equal(state.kind, 'parents', 'a distinct kind, not the runtime check');
     assert.deepEqual(state.helperControllers, []);
 });
 
@@ -379,4 +380,111 @@ test('hardware prerequisite diagnostics list exact fixes for each missing prereq
     assert.match(missing[2].next, /Delegate=cpu memory pids.*daemon-reload alone does not change an existing session/s);
     const mac = hardwarePrerequisiteChecks({ host: { cgroupVersion: 'v2', ociRuntime: { name: 'crun' }, cgroupControllers: [] } }, { platform: 'darwin' });
     assert.match(mac[2].next, /inside podman machine ssh/);
+});
+
+// ---------------------------------------------------------------------------
+// F3/F6: the in-Box context end to end, from the host-written wiring marker
+// through readBoxHardwareContext to the admission refusal.
+
+const { buildWorkspaceIdentity } = await import('../../ploinky-box/identity.mjs');
+const { resolveDesiredHardwareWiring } = await import('../../ploinky-box/hardwareLimitsGate.mjs');
+const { initializeStore } = await import('../../cli/sandbox/hardwareLimits/store.mjs');
+const { readBoxHardwareContext, resetHardwareContextCacheForTests } = await import('../../cli/sandbox/hardwareLimits/context.mjs');
+const { mountinfoLine } = await import('../hardware-limits/fakeCgroupFs.mjs');
+
+// Real files for the marker and the bound store; the fake for cgroup/proc.
+function compositeFs(fake) {
+    const routed = new Set(['readFileSync', 'lstatSync', 'mkdirSync', 'writeFileSync', 'readdirSync', 'rmdirSync']);
+    return new Proxy(fs, {
+        get(target, property) {
+            if (!routed.has(property)) return target[property];
+            return (first, ...rest) => {
+                const value = typeof first === 'string' ? first : '';
+                if (value === ROOT || value.startsWith(`${ROOT}/`) || value.startsWith('/proc/')) return fake[property](first, ...rest);
+                return target[property](first, ...rest);
+            };
+        },
+    });
+}
+
+function boxContext(t, { hostKind = 'native-linux', fake = preparedCgroupFs({ controllers: ['cpu', 'pids'] }), query = readyQuery() } = {}) {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-context-')));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const workspace = path.join(root, 'workspace');
+    const home = path.join(root, 'home');
+    fs.mkdirSync(path.join(workspace, '.ploinky'), { recursive: true });
+    fs.mkdirSync(home);
+    const identity = buildWorkspaceIdentity(workspace, { markerFound: true });
+    // The host writes the marker exactly as for a gate-on Box of this host kind.
+    const wiring = resolveDesiredHardwareWiring({ identity, enabled: true, hostKind, homeDirectory: home, initializeStore });
+    resetHardwareContextCacheForTests();
+    t.after(() => resetHardwareContextCacheForTests());
+    const context = readBoxHardwareContext({
+        fsApi: compositeFs(fake), markerPath: wiring.markerPath, storeRoot: wiring.storeRoot, query,
+    });
+    const boxMarker = path.join(root, 'ploinky-box');
+    fs.writeFileSync(boxMarker, BOX_MARKER_CONTENT);
+    const refusal = (resources = { memory: '512m' }) => {
+        const admission = admitManifestRuntimeCapabilities({ container: 'node:20-alpine', llmRuntime: { runtimePolicy: { resources } } }, {
+            boxMarkerOptions: { markerPath: boxMarker }, workspaceRoot: workspace, agentId: 'demo/worker',
+            instanceKey: 'ploinky_demo_worker', runtime: 'podman', hardwareContext: context, hardwareAdmission: 'metadata',
+        });
+        return admission.hardwareEligibility.refusal;
+    };
+    return { context, refusal };
+}
+
+test('DG.host-kind-podman-machine-macos-fix', (t) => {
+    // memory is not delegated; a Podman machine host gets the macOS fix.
+    const { context, refusal } = boxContext(t, { hostKind: 'podman-machine' });
+    assert.equal(context.hostKind, 'macos');
+    const outcome = refusal();
+    assert.equal(outcome.reasonCode, 'controller_unavailable');
+    assert.match(outcome.fix, /^Apply the delegation commands inside podman machine ssh, then restart that Podman machine and run ploinky restart on macOS\./);
+});
+
+test('DG.host-kind-native-linux-fix', (t) => {
+    const { context, refusal } = boxContext(t, { hostKind: 'native-linux' });
+    assert.equal(context.hostKind, 'linux');
+    const outcome = refusal();
+    assert.equal(outcome.reasonCode, 'controller_unavailable');
+    assert.match(outcome.fix, /^Apply the delegation commands below on the Linux host, log out and back in, then run ploinky restart\./);
+});
+
+test('DG.unprepared-kind-cgroup', (t) => {
+    for (const [mount, detail] of [
+        [{ fstype: 'tmpfs' }, /not cgroup2/],
+        [{ mountRw: false }, /read-only/],
+        [{ nsdelegate: false }, /lacks nsdelegate/],
+    ]) {
+        const fake = preparedCgroupFs();
+        fake.mountinfo = mountinfoLine({ ...mount, mountPoint: ROOT });
+        const { context, refusal } = boxContext(t, { fake });
+        assert.equal(context.unpreparedKind, 'cgroup');
+        assert.match(context.unpreparedDetail, detail);
+        const outcome = refusal();
+        assert.equal(outcome.reasonCode, 'cgroup_unsupported');
+        assert.equal(outcome.reason, 'The Box needs writable cgroup v2 with nsdelegate.');
+        assert.match(outcome.fix, /^Configure the host's unified delegated hierarchy and restart the Box; Ploinky will not change host mounts or boot settings\.$/);
+    }
+});
+
+test('DG.unprepared-kind-runtime', (t) => {
+    const runc = () => ({ ok: true, stdout: JSON.stringify({ host: { ociRuntime: { name: 'runc' }, cgroupManager: 'systemd' } }) });
+    const { context, refusal } = boxContext(t, { fake: preparedCgroupFs(), query: runc });
+    assert.equal(context.unpreparedKind, 'runtime');
+    const outcome = refusal();
+    assert.equal(outcome.reasonCode, 'runtime_unverified');
+    assert.match(outcome.reason, /^Hardware limits require verified crun and nested cgroupfs\. Observed: unknown\/unknown\/runc\/systemd\.$/);
+});
+
+test('DG.unprepared-kind-parents', (t) => {
+    const fake = preparedCgroupFs();
+    fake.hooks.beforeMkdir = (rel) => (rel === '/ploinky/agents' ? Object.assign(new Error('EACCES: denied'), { code: 'EACCES' }) : null);
+    const { context, refusal } = boxContext(t, { fake });
+    assert.equal(context.unpreparedKind, 'parents');
+    const outcome = refusal();
+    assert.equal(outcome.reasonCode, 'backend_unavailable');
+    assert.match(outcome.reason, /^This Box is not prepared for hardware limits: the agent cgroup parents could not be created \(EACCES: denied\)\.$/);
+    assert.doesNotMatch(outcome.reason, /crun|cgroupfs/);
 });

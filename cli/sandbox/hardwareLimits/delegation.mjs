@@ -7,6 +7,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { parseCgroupMount } from '../../../ploinky-box/entrypoint/cgroupDelegation.mjs';
 import {
     AGENTS_CGROUP_PARENT,
     SYSTEM_CGROUP_PARENT,
@@ -43,7 +44,28 @@ function relative(root, cgroup) {
  * is delegated to uid 1000. Controllers are the ones actually enabled in
  * /ploinky's subtree.
  */
+/**
+ * The Box's own cgroup mount, read from its mountinfo: cgroup v2, writable and
+ * delegated with nsdelegate (plan §7.1). null when mountinfo is unreadable,
+ * so an unknown mount is never reported as a known cgroup problem.
+ */
+export function readCgroupMountProblem({ fsApi = fs, cgroupRoot = CGROUP_ROOT, procRoot = '/proc' } = {}) {
+    let mountinfo;
+    try {
+        mountinfo = read(fsApi, `${procRoot}/self/mountinfo`);
+    } catch (_) {
+        return null;
+    }
+    const mount = parseCgroupMount(mountinfo, cgroupRoot);
+    if (!mount || mount.fstype !== 'cgroup2') return `${cgroupRoot} is ${mount ? mount.fstype : 'not mounted'} (cgroup v1 or no unified hierarchy), not cgroup2`;
+    if (!mount.mountOptions.includes('rw') || !mount.superOptions.includes('rw')) return `the cgroup2 mount at ${cgroupRoot} is read-only`;
+    if (!mount.superOptions.includes('nsdelegate')) return `the cgroup2 mount at ${cgroupRoot} lacks nsdelegate`;
+    return '';
+}
+
 export function readStructuralDelegation({ fsApi = fs, cgroupRoot = CGROUP_ROOT, procRoot = '/proc' } = {}) {
+    const mountProblem = readCgroupMountProblem({ fsApi, cgroupRoot, procRoot });
+    if (mountProblem) return { structurallyPrepared: false, controllers: [], kind: 'cgroup', reason: mountProblem };
     try {
         const self = cgroupPath(read(fsApi, `${procRoot}/self/cgroup`));
         const pid1 = cgroupPath(read(fsApi, `${procRoot}/1/cgroup`));
@@ -139,15 +161,21 @@ export function readDelegationState({
     }
     const structural = readStructuralDelegation({ fsApi, cgroupRoot, procRoot });
     if (!structural.structurallyPrepared) {
+        // kind 'cgroup': the Box's own mount is v1, read-only or lacks
+        // nsdelegate; 'placement': preparation was not observed.
         return Object.freeze({
             gate, structurallyPrepared: false, backendReady: false, controllers: [], helperControllers: [],
+            kind: structural.kind || 'placement',
             reason: structural.reason, fix: 'On the host run ploinky limits status, repair the reported prerequisite, then ploinky restart.',
         });
     }
-    const backend = typeof query === 'function' ? verifyNestedBackend({ query }) : { ready: false, reason: 'nested backend not verified' };
+    const backend = typeof query === 'function' ? verifyNestedBackend({ query }) : { ready: false, runtime: 'unknown', manager: 'unknown', reason: 'nested backend not verified' };
     if (!backend.ready) {
+        // kind 'runtime': the nested runtime/manager is not the verified
+        // crun + cgroupfs pair (or could not be observed).
         return Object.freeze({
             gate, structurallyPrepared: true, backendReady: false, controllers: structural.controllers, helperControllers: [],
+            kind: 'runtime',
             backend, reason: backend.reason, fix: 'Hardware limits require verified crun and nested cgroupfs; inspect ploinky diagnose before retrying.',
         });
     }
@@ -155,9 +183,13 @@ export function readDelegationState({
         try {
             ensureAgentCgroupParents({ fsApi, cgroupRoot, controllers: structural.controllers });
         } catch (error) {
+            // kind 'parents': the backend is verified but uid 1000 could not
+            // create /ploinky/agents or /ploinky/system (backend unavailable).
             return Object.freeze({
                 gate, structurallyPrepared: true, backendReady: false, controllers: structural.controllers, helperControllers: [],
-                backend, reason: `agent cgroup parents are unavailable (${error.message})`, fix: 'On the host run ploinky restart.',
+                kind: 'parents',
+                backend, reason: `the agent cgroup parents could not be created (${error.message})`,
+                fix: 'On the host run ploinky limits status, repair the reported prerequisite, then ploinky restart.',
             });
         }
     }
@@ -165,6 +197,7 @@ export function readDelegationState({
         gate,
         structurallyPrepared: true,
         backendReady: true,
+        kind: null,
         controllers: structural.controllers,
         helperControllers: structural.controllers,
         backend,

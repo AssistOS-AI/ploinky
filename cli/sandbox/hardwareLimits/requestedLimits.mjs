@@ -147,6 +147,13 @@ function unpreparedRefusal(context) {
                 + 'invocation; inspect ploinky diagnose before retrying.',
         };
     }
+    if (context.unpreparedKind === 'parents') {
+        return {
+            reasonCode: 'backend_unavailable',
+            reason: `This Box is not prepared for hardware limits: ${context.unpreparedDetail || 'the agent cgroup parents could not be created'}.`,
+            fix: 'On the host run ploinky limits status, repair the reported prerequisite, then ploinky restart.',
+        };
+    }
     return {
         reasonCode: 'unprepared',
         reason: `This Box is not prepared for hardware limits: ${context.unpreparedDetail || 'preparation was not proved'}.`,

@@ -203,9 +203,13 @@ test('G.status-on', (t) => {
     assert.match(text, /\nHardware limits: on \(saved 2026-10-01T12:00:00\.000Z\)\n/);
     assert.match(text, /\nHardware state: initialized\n/);
     assert.match(text, /\nBox: running; wiring ffffffffffff; prepared yes\n/);
-    assert.match(text, /\nBox mount: cgroup2 unknown; rw unknown; nsdelegate unknown\n/, 'the host never invents in-Box facts');
-    assert.match(text, /\nGPU sharing: best-effort, not a security boundary; daemon not started\n/);
-    assert.match(text, /\nAgent: demo\/agent \[not enabled\] alias none; cpu 2; RAM declared \(none\); GPU none\n/);
+    const notObserved = '\\(in-Box facts are not observed from the host\\)';
+    assert.match(text, new RegExp(`\\nBox mount: cgroup2 unknown ${notObserved}; rw unknown ${notObserved}; nsdelegate unknown ${notObserved}\\n`), 'the host never invents in-Box facts');
+    assert.match(text, /\nHost delegation: unknown \(the host engine was not queried\)\n/);
+    assert.match(text, /\nGPU sharing: best-effort, not a security boundary; daemon unknown \(GPU sharing is not available in this release\)\n/);
+    // No instance was observed: the stored policy only, no invented key/availability.
+    assert.match(text, /\nAgent: demo\/agent \(stored policy; instances not observed from the host\); cpu 2; RAM declared; GPU none\n/);
+    assert.doesNotMatch(text, /not enabled|Availability: stopped|Limits: pending/);
 });
 
 test('G.status-off', (t) => {
@@ -219,9 +223,10 @@ test('G.status-off', (t) => {
 
 test('G.status-absent', (t) => {
     const state = fixture(t);
-    const text = status(state);
+    const text = status(state, { observedBox: { state: 'absent', wiring: null, prepared: false, preparedReason: 'no Box exists' } });
     assert.match(text, /\nHardware limits: off \(never set\)\n/);
-    assert.match(text, /\nBox: absent; wiring none; prepared no: the Box is not running\n/);
+    assert.match(text, /\nBox: absent; wiring none; prepared no: no Box exists\n/);
+    assert.match(status(state), /\nBox: unknown \(the Box was not inspected\)\n/);
     assert.equal(fs.existsSync(storePaths(state).storeRoot), false, 'status never initializes the store');
     assert.equal(text.includes('Note:'), false);
 });
@@ -255,8 +260,52 @@ test('G.status-refused-blocked', (t) => {
             { ref: 'demo/agent', key: 'ploinky_demo_agent_blue_ws', alias: 'blue', availability: 'blocked by ploinky_root_ws: memory controller unavailable', limitsState: 'pending' },
         ],
     });
-    assert.match(text, /\nAgent: demo\/agent \[ploinky_demo_agent_ws\] alias none; cpu 2; RAM declared \(none\); GPU none\n  Availability: refused: The host does not delegate cpu to rootless Podman\.\n  Limits: unavailable\n  Fix: Apply the delegation commands, then run ploinky restart\.\n/);
+    assert.match(text, /\nAgent: demo\/agent \[ploinky_demo_agent_ws\] alias none; cpu 2; RAM declared \(unknown \(not observed\)\); GPU none\n  Availability: refused: The host does not delegate cpu to rootless Podman\.\n  Limits: unavailable\n  Fix: Apply the delegation commands, then run ploinky restart\.\n/);
     assert.match(text, /\nAgent: demo\/agent \[ploinky_demo_agent_blue_ws\] alias blue; .*\n  Availability: blocked by ploinky_root_ws: memory controller unavailable\n  Limits: pending\n/);
+});
+
+test('G.status-production-observed', (t) => {
+    // F2: the production inspectLimitsStatus path, a running gate-on Box and
+    // one stored entry. Only observed facts are printed; the host's own
+    // read-only engine and exact-Box runtime checks are included.
+    const state = fixture(t);
+    state.gateStore.write(state.identity, true, lockFor(state.identity), { now: () => new Date('2026-10-01T12:00:00.000Z') });
+    storeWithEntry(state);
+    const ownership = owned(state.identity, { labels: { [BOX_LABELS.hardwareLimits]: 'e'.repeat(64) } });
+    const queries = [];
+    const runs = [];
+    const supervisor = (boxRuntime) => createBoxSupervisor({
+        env: {},
+        resolveIdentity: () => state.identity,
+        launchCwd: state.identity.workspaceRoot,
+        discover: () => ownership,
+        runner: {
+            run(_command, args) { runs.push(args.join(' ')); },
+            query(_command, args) {
+                queries.push(args.join(' '));
+                if (args[0] === 'info') {
+                    return { ok: true, stdout: JSON.stringify({ host: { cgroupVersion: 'v2', ociRuntime: { name: 'crun' }, cgroupControllers: ['cpu', 'memory', 'pids'] } }) };
+                }
+                if (args[0] === 'container' && args[1] === 'inspect') return { ok: true, stdout: `${boxRuntime}\n` };
+                return { ok: false, stdout: '' };
+            },
+        },
+        hardwareGateStore: state.gateStore,
+    });
+    const text = formatLimitsStatus(supervisor('/usr/bin/crun').inspectLimitsStatus());
+    assert.match(text, /\nHardware limits: on \(saved 2026-10-01T12:00:00\.000Z\)\n/);
+    assert.match(text, /\nHost delegation: cgroup v2; outer OCI runtime crun; Box OCI runtime crun \(verified\); controllers cpu memory pids\n/);
+    assert.match(text, /\nBox: running; wiring eeeeeeeeeeee; prepared unknown \(in-Box preparation is not observed from the host\)\n/);
+    assert.match(text, /\nNested backend: unknown \(in-Box facts are not observed from the host\); manager unknown/);
+    assert.match(text, /\nInternal helpers: unknown \(in-Box facts are not observed from the host\)\n/);
+    assert.match(text, /\nAgent: demo\/agent \(stored policy; instances not observed from the host\); cpu 2; RAM declared; GPU none\n$/);
+    assert.doesNotMatch(text, /not enabled|Availability|Limits: pending|daemon not started|prepared yes|prepared no/);
+    // A Box recorded with another runtime is reported as unverified.
+    assert.match(formatLimitsStatus(supervisor('/usr/bin/runc').inspectLimitsStatus()),
+        /\nHost delegation: cgroup v2; outer OCI runtime crun; Box OCI runtime unverified \(the Box runs \/usr\/bin\/runc, not crun\); controllers cpu memory pids\n/);
+    // Read-only: only engine queries ran; nothing was created, started or prepared.
+    assert.deepEqual(runs, []);
+    assert.ok(queries.every((query) => query.startsWith('info ') || query.startsWith('container inspect --format {{.OCIRuntime}} ')), queries.join('\n'));
 });
 
 // ---------------------------------------------------------------------------
