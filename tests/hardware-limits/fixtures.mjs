@@ -336,13 +336,17 @@ export function buildRequiredCaseManifest() {
         ]),
         ...leaves(P, 'p1', unit('hardwareLimitsDrift.test.mjs'), [
             'D.memory-swap-equal', 'D.cgroupfs-prefix', 'D.exempt-prefix-absent', 'D.readback-mismatch',
-            'D.readback-page-rounding', 'D.readback-swap-accounting', 'D.precreate-change', 'D.prepublish-change',
+            'D.readback-page-rounding', 'D.readback-swap-accounting', 'D.readback-private-namespace', 'D.readback-namespace-process-exit', 'D.precreate-change', 'D.prepublish-change',
             'D.managed-reuse', 'D.host-none-reuse', 'D.graph-reuse',
             'D.llm-admitted-policy-reuse', 'D.one-replace-then-reuse', 'D.unrelated-token-no-replace',
             'D.unprepared-empty-hash', 'D.private-mount-boundaries', 'D.interactive-reuse-refused',
             'D.interactive-create-refused', 'D.memory-only-change-replaces-one', 'D.pids-only-change-replaces-one',
             'D.start-container-launch-order', 'D.service-llm-reuse', 'D.readback-process-exit',
             'D.interactive-stored-gpu-refused', 'D.interactive-stored-replaces-declared', 'D.lite-sandbox-runs-as-container-in-box',
+        ]),
+        ...leaves(P, 'p1', unit('hardwareLimitsServiceReuse.test.mjs'), [
+            'D.service-host-none-readback-before-reuse', 'D.service-host-none-readback-failure-removes-exact-reuse',
+            'D.service-reuse-cleanup-failure-is-loud',
         ]),
         ...leaves(L, 'p1-ram', 'local-llm/tests/ploinky-budget.test.mjs', [
             'LL.raw-cpu-fractions', 'LL.cpu-warning-provenance', 'LL.cap-once', 'LL.known-zero', 'LL.unknown-distinct',

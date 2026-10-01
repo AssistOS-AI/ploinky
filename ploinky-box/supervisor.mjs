@@ -490,7 +490,7 @@ export function createBoxSupervisor({
         const status = String(runtime.status || '').trim().toLowerCase();
         if (runtime.running === true || status === 'running') return Object.freeze({ state: 'running', id: container.id });
         if (status === 'paused') return Object.freeze({ state: 'paused', id: container.id });
-        if (!status || STOPPED_BOX_STATUSES.has(status)) return Object.freeze({ state: 'stopped', id: container.id });
+        if (STOPPED_BOX_STATUSES.has(status)) return Object.freeze({ state: 'stopped', id: container.id });
         return Object.freeze({ state: 'unknown', id: container.id });
     }
 

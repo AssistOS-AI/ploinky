@@ -76,7 +76,7 @@ function owned(identity, { running = true, id = 'a'.repeat(64), labels = {} } = 
             container: {
                 id,
                 labels: { ...agentLibFixtureLabels(agentLib), [BOX_LABELS.imageRef]: BOX_IMAGE_REFERENCE, ...labels },
-                runtime: { running, imageId: 'b'.repeat(64), mounts: agentLibFixtureMounts(agentLib, identity.workspaceRoot) },
+                runtime: { running, status: running ? 'running' : 'exited', imageId: 'b'.repeat(64), mounts: agentLibFixtureMounts(agentLib, identity.workspaceRoot) },
             },
         },
     };
@@ -1270,6 +1270,13 @@ test('G.stale-lock-never-stolen-messages', async (t) => {
             box.handles.container.runtime.status = 'paused';
             return box;
         }, /and this workspace's Box is paused, so a writer inside it may still hold the lock\. Resume the Box, or stop this workspace on the host, then retry\. No policy was changed\.$/],
+        ...['', undefined, 'unrecognized'].map((status) => [
+            `unknown Box status ${String(status)}`, { domain: 'box', pid: deadPid, hostname: os.hostname() }, (state) => {
+                const box = owned(state.identity, { running: false });
+                box.handles.container.runtime.status = status;
+                return box;
+            }, /Hardware policy store is locked\. Stop this workspace on the host, then run ploinky limits clear --all or retry the lifecycle command\. No policy was changed\.$/,
+        ]),
     ]) {
         const state = fixture(t);
         initializeStore({ paths: storePaths(state), identity: state.identity });

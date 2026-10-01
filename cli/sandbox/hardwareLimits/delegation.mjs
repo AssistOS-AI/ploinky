@@ -405,6 +405,22 @@ export function verifyLaunchedHardwareLimits({
     if (!leaf.startsWith(`${placement.cgroupParent}/`)) {
         throw refuse(`the applied limits disagree with the admitted ones (the agent runs in ${leaf}, not under ${placement.cgroupParent})`);
     }
+    let coreNamespace;
+    let agentNamespace;
+    try {
+        coreNamespace = fsApi.readlinkSync(`${procRoot}/self/ns/cgroup`);
+        agentNamespace = fsApi.readlinkSync(`${procRoot}/${pid}/ns/cgroup`);
+        if (!/^cgroup:\[\d+\]$/.test(coreNamespace) || !/^cgroup:\[\d+\]$/.test(agentNamespace)) {
+            throw new Error('invalid cgroup namespace identity');
+        }
+    } catch (error) {
+        const vanished = launchedProcessVanished({ runtime, query, containerId, pid, leaf, fsApi, procRoot });
+        if (vanished) throw notObserved(vanished);
+        throw refuse(`the agent's private cgroup namespace could not be verified (${error?.code || 'unreadable namespace identity'})`);
+    }
+    if (agentNamespace === coreNamespace) {
+        throw refuse('the applied limits disagree with the admitted ones (the agent shares the Box core cgroup namespace instead of a private namespace)');
+    }
     const readback = verifyLeafLimits({ fsApi, cgroupRoot, leaf, expected: placement.expected || {} });
     if (!readback.ok && (!readback.leafPresent || readback.readFailures.length)) {
         // A failed leaf read can mean the process exited mid-readback: that is
@@ -418,5 +434,17 @@ export function verifyLaunchedHardwareLimits({
         if (readback.refusal && readback.problems.length === 1) throw refuse(readback.refusal.reason, readback.refusal);
         throw refuse(`the applied limits disagree with the admitted ones (${readback.problems.join('; ')})`);
     }
-    return Object.freeze({ leaf, verified: true });
+    const vanished = launchedProcessVanished({ runtime, query, containerId, pid, leaf, fsApi, procRoot });
+    if (vanished) throw notObserved(vanished);
+    let finalNamespace;
+    try { finalNamespace = fsApi.readlinkSync(`${procRoot}/${pid}/ns/cgroup`); } catch (_) {
+        const disappeared = launchedProcessVanished({ runtime, query, containerId, pid, leaf, fsApi, procRoot });
+        if (disappeared) throw notObserved(disappeared);
+    }
+    if (finalNamespace !== agentNamespace) {
+        const disappeared = launchedProcessVanished({ runtime, query, containerId, pid, leaf, fsApi, procRoot });
+        if (disappeared) throw notObserved(disappeared);
+        throw refuse('the agent cgroup namespace changed during limits readback');
+    }
+    return Object.freeze({ leaf, cgroupNamespace: agentNamespace, verified: true });
 }

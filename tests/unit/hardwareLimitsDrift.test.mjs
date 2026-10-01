@@ -148,6 +148,13 @@ function launchedFixture(values) {
     for (const [name, value] of Object.entries(values)) fake.groups.get('/ploinky/agents/libpod-abc').values.set(name, value);
     fake.placePid(321, '/ploinky/agents/libpod-abc');
     fake.placePid(654, '/ploinky/system/libpod-def');
+    fake.readlinkSync = (target) => {
+        if (target === '/proc/self/ns/cgroup') return 'cgroup:[1000]';
+        if (target === '/proc/321/ns/cgroup' && fake.pidGroup.has(321)) return 'cgroup:[2000]';
+        const error = new Error('namespace is absent');
+        error.code = 'ENOENT';
+        throw error;
+    };
     return fake;
 }
 
@@ -202,6 +209,44 @@ test('D.readback-mismatch', (t) => {
             return true;
         }, label));
     }
+});
+
+test('D.readback-private-namespace', (t) => {
+    const box = inBox(t);
+    for (const [label, readlink] of [
+        ['shared namespace', () => 'cgroup:[1000]'],
+        ['malformed namespace', () => 'unknown'],
+        ['unreadable namespace', () => { const error = new Error('denied'); error.code = 'EACCES'; throw error; }],
+    ]) {
+        const fake = launchedFixture(EXACT_LEAF);
+        fake.readlinkSync = readlink;
+        assert.throws(() => launchGuard(box, LIMITED, { fake }).afterLaunch({ containerId: 'f'.repeat(64) }), (error) => {
+            assert.equal(findHardwareOutcome(error)?.code, HARDWARE_UNENFORCEABLE, label);
+            assert.match(error.message, /namespace/, label);
+            return true;
+        });
+    }
+    const fake = launchedFixture(EXACT_LEAF);
+    const readlink = fake.readlinkSync;
+    let reads = 0;
+    fake.readlinkSync = (target) => target === '/proc/321/ns/cgroup' && ++reads > 1 ? 'cgroup:[3000]' : readlink(target);
+    assert.throws(() => launchGuard(box, LIMITED, { fake }).afterLaunch({ containerId: 'f'.repeat(64) }), /namespace changed/);
+});
+
+test('D.readback-namespace-process-exit', (t) => {
+    const box = inBox(t);
+    const fake = launchedFixture(EXACT_LEAF);
+    const readlink = fake.readlinkSync;
+    let agentReads = 0;
+    fake.readlinkSync = (target) => {
+        if (target === '/proc/321/ns/cgroup' && ++agentReads === 2) fake.pidGroup.delete(321);
+        return readlink(target);
+    };
+    assert.throws(() => launchGuard(box, LIMITED, { fake }).afterLaunch({ containerId: 'f'.repeat(64) }), (error) => {
+        assert.equal(error.code, 'PLOINKY_AGENT_NOT_RUNNING');
+        assert.equal(findHardwareOutcome(error), null);
+        return true;
+    });
 });
 
 test('D.readback-page-rounding', (t) => {
@@ -581,7 +626,7 @@ test('D.start-container-launch-order', (t) => {
     // createArgs prefix -> create -> afterLaunch readback -> currentness recheck.
     const ok = run();
     assert.equal(ok.error, null);
-    assert.deepEqual(ok.events, ['build:host', 'remove-stale-leaves', 'create:--cgroup-manager=cgroupfs create --name ploinky_demo_worker node:20-alpine', 'readback:ffff']);
+    assert.deepEqual(ok.events, ['build:host', 'remove-stale-leaves', 'create:--cgroup-manager=cgroupfs create --name ploinky_demo_worker node:20-alpine', 'readback:ffff', 'readback:ffff']);
     // The inputs are rechecked before create: a changed controller set
     // refuses with no create at all.
     const stale = run({ context: prepared(new Map(), { controllers: ['cpu', 'pids'] }) });

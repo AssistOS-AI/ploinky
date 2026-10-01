@@ -1364,6 +1364,41 @@ export function runHardwareGuardedLaunch(hardwareLaunch, {
     return launched;
 }
 
+export function verifyReusableHardwareRuntime(runtimeAdmission, {
+    containerName, containerId, runtime, network, record, key, ref, alias = null,
+}, {
+    createGuard = createHardwareLaunchGuard,
+    inactivate = inactivateEdgeRoutingGeneration,
+    removeExact = removeExactGenerationCandidate,
+    query = (command, args) => {
+        const result = spawnSync(command, args, { encoding: 'utf8', timeout: 10_000 });
+        return { ok: result.status === 0 && !result.error, stdout: String(result.stdout || '') };
+    },
+} = {}) {
+    try {
+        createGuard(runtimeAdmission, { key, ref, alias, runtime, query }).afterLaunch({ containerId, adopted: true });
+    } catch (error) {
+        // A reused runtime is still an affected runtime. Revoke authorization
+        // before removing only its captured immutable identity.
+        try { inactivate('hardware-reuse-readback-failed', { preserveSelectedGeneration: true }); } catch (cleanupError) {
+            appendExactCleanupFailure(error, `routing inactivation: ${cleanupError.message}`);
+            throw error;
+        }
+        let exactCleanupPerformed = false;
+        try {
+            const cleanup = removeExact({ containerName, containerId, network, record });
+            exactCleanupPerformed = cleanup?.removed === true || cleanup?.state === 'absent';
+            if (!exactCleanupPerformed) throw new Error('exact reused-runtime removal was not proven');
+        } catch (cleanupError) {
+            appendExactCleanupFailure(error, cleanupError.message);
+        }
+        throw attachRestartCandidate(error, {
+            containerName, containerId, runtimeNetwork: structuredClone(network),
+            registryRecord: structuredClone(record), exactCleanupPerformed,
+        });
+    }
+}
+
 // This private handoff is created only by ensureAgentService and is usable
 // under its still-live lock. Independent service calls get a fresh adapter.
 const SERVICE_NETWORK_LIFECYCLE = Symbol('serviceNetworkLifecycle');
@@ -4045,6 +4080,12 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             }
         }
         if (canReuseExisting) {
+            verifyReusableHardwareRuntime(serviceAdmission, {
+                containerName, containerId: reuseInspection.id, runtime,
+                network: manifestNetwork,
+                record: { ...existingRecord, containerId: reuseInspection.id },
+                key: hardwareInstanceKey, ref: `${repoName}/${agentName}`, alias: aliasOverride || null,
+            });
             debugLog(`[ensureAgentService] ${agentName}: returning early (container exists)`);
             if (runtimeNetworkPlan.mode === 'host') {
                 assertHostModeGenerationCapability({

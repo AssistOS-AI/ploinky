@@ -240,7 +240,7 @@ export function recoverStaleStoreLock({
         );
     }
     if (box?.state !== 'absent' && box?.state !== 'stopped') {
-        throw new StoreLockError(STORE_BUSY_MESSAGE, 'store_busy', 409);
+        throw new StoreLockError(`Hardware policy store lock ${directory} is held by ${holder}; this workspace's Box is not proven stopped or absent. ${STORE_BUSY_MESSAGE}`, 'store_busy', 409);
     }
     // The owner must still be the one that was judged dead.
     const again = readStoreLockOwner(storeRoot, { fsApi });
