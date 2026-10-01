@@ -2698,100 +2698,100 @@ async function startWorkspace(staticAgentArg, portArg, {
       cfg.routes = cfg.routes || {};
       return launchRouteTargets(targetNames, {
         launchTarget: async (name) => {
-        const rec = reg[name];
-        if (!rec || !rec.agentName) return null;
-        const shortAgentName = rec.agentName;
-        const manifestRef = rec.repoName ? `${rec.repoName}/${shortAgentName}` : shortAgentName;
-        try {
-          const manifestPath0 = findAgentManifest(manifestRef);
-          const manifest = JSON.parse(fs.readFileSync(manifestPath0, 'utf8'));
-          const agentPath = path.dirname(manifestPath0);
-          const repoName = rec.repoName || resolveAgentRepositoryName(agentPath);
-          const routeKey = rec.alias || shortAgentName;
-          const routerEndpoint = resolveManifestRouterEndpoint(manifest, {
-            explicitPort: staticPort,
-            persistedProfileName: rec.profile,
-            path: `manifest(${repoName}/${shortAgentName})`,
-          });
-          const launchProfile = resolveManifestRuntimeProfile(manifest, {
-            agentName: `${repoName}/${shortAgentName}`,
-            profileName: rec.profile || undefined,
-            path: `manifest(${repoName}/${shortAgentName})`,
-          });
-          const preparedHostModeCapability = launchProfile.network.mode === 'host'
-            ? prepareHostModeCapabilityForInactiveGeneration({
-                agentId: `agent:${repoName}/${shortAgentName}`,
-                instanceId: rec.instanceId,
-                enableGeneration: rec.enableGeneration,
-                routeKey,
-                containerName: name,
-              })
-            : undefined;
-          const runtimeResult = ensureAgentService(shortAgentName, manifest, agentPath, {
-            containerName: name,
-            alias: rec.alias,
-            routerEndpoint,
-            profileName: rec.profile || undefined,
-            instanceId: rec.instanceId,
-            enableGeneration: rec.enableGeneration,
-            forceRecreate: newlyPreparedContainers.has(name),
-            preservePreparedRegistryRecord: true,
-            preparationLease: workspacePreparationLease,
-            preparedHostModeCapability,
-            networkLifecycleCapability,
-          });
-          if (runtimeResult?.requiresEdgeActivation === true
-              && runtimeResult?.preparationLease
-              && runtimeResult?.containerId) {
-            workspaceRuntimeCandidates.push(runtimeResult);
+          const rec = reg[name];
+          if (!rec || !rec.agentName) return null;
+          const shortAgentName = rec.agentName;
+          const manifestRef = rec.repoName ? `${rec.repoName}/${shortAgentName}` : shortAgentName;
+          try {
+            const manifestPath0 = findAgentManifest(manifestRef);
+            const manifest = JSON.parse(fs.readFileSync(manifestPath0, 'utf8'));
+            const agentPath = path.dirname(manifestPath0);
+            const repoName = rec.repoName || resolveAgentRepositoryName(agentPath);
+            const routeKey = rec.alias || shortAgentName;
+            const routerEndpoint = resolveManifestRouterEndpoint(manifest, {
+              explicitPort: staticPort,
+              persistedProfileName: rec.profile,
+              path: `manifest(${repoName}/${shortAgentName})`,
+            });
+            const launchProfile = resolveManifestRuntimeProfile(manifest, {
+              agentName: `${repoName}/${shortAgentName}`,
+              profileName: rec.profile || undefined,
+              path: `manifest(${repoName}/${shortAgentName})`,
+            });
+            const preparedHostModeCapability = launchProfile.network.mode === 'host'
+              ? prepareHostModeCapabilityForInactiveGeneration({
+                  agentId: `agent:${repoName}/${shortAgentName}`,
+                  instanceId: rec.instanceId,
+                  enableGeneration: rec.enableGeneration,
+                  routeKey,
+                  containerName: name,
+                })
+              : undefined;
+            const runtimeResult = ensureAgentService(shortAgentName, manifest, agentPath, {
+              containerName: name,
+              alias: rec.alias,
+              routerEndpoint,
+              profileName: rec.profile || undefined,
+              instanceId: rec.instanceId,
+              enableGeneration: rec.enableGeneration,
+              forceRecreate: newlyPreparedContainers.has(name),
+              preservePreparedRegistryRecord: true,
+              preparationLease: workspacePreparationLease,
+              preparedHostModeCapability,
+              networkLifecycleCapability,
+            });
+            if (runtimeResult?.requiresEdgeActivation === true
+                && runtimeResult?.preparationLease
+                && runtimeResult?.containerId) {
+              workspaceRuntimeCandidates.push(runtimeResult);
+            }
+            const {
+              containerName,
+              hostPort,
+              registryRecord,
+            } = runtimeResult;
+            if (!registryRecord) {
+              throw new Error(`runtime '${containerName}' returned no exact registry record`);
+            }
+            const executionMode = resolveAgentExecutionMode(manifest);
+            const resolvedHostPort = hostPort || (
+              executionMode.type === 'start_only' ? 0 : cfg.routes[routeKey]?.hostPort
+            );
+            const nextRoute = {
+              ...(cfg.routes[routeKey] || {}),
+              container: containerName,
+              hostPath: agentPath,
+              repo: repoName,
+              agent: shortAgentName,
+              ...(rec.alias ? { alias: rec.alias } : {}),
+              ...(resolvedHostPort ? { hostPort: resolvedHostPort } : {}),
+            };
+            if (!resolvedHostPort) delete nextRoute.hostPort;
+            // A freshly admitted launch supersedes any earlier unavailable state.
+            delete nextRoute.hardwareAvailability;
+            const readinessRoute = buildRelayReadinessRoute({
+              route: nextRoute,
+              manifest,
+              runtimeResult,
+              networkMode: launchProfile.network.mode,
+              generationDigest: workspacePreparationLease?.preparedGeneration || '',
+            });
+            return {
+              ok: true,
+              containerName,
+              registryRecord,
+              shortAgentName,
+              routeKey,
+              route: nextRoute,
+              readinessRoute,
+              manifest,
+            };
+          } catch (agentErr) {
+            // launchRouteTargets reports it: a typed hardware outcome is a
+            // contained refusal, anything else an ordinary failure.
+            try { agentErr.shortAgentName = shortAgentName; } catch (_) { /* reported by registry name */ }
+            throw agentErr;
           }
-          const {
-            containerName,
-            hostPort,
-            registryRecord,
-          } = runtimeResult;
-          if (!registryRecord) {
-            throw new Error(`runtime '${containerName}' returned no exact registry record`);
-          }
-          const executionMode = resolveAgentExecutionMode(manifest);
-          const resolvedHostPort = hostPort || (
-            executionMode.type === 'start_only' ? 0 : cfg.routes[routeKey]?.hostPort
-          );
-          const nextRoute = {
-            ...(cfg.routes[routeKey] || {}),
-            container: containerName,
-            hostPath: agentPath,
-            repo: repoName,
-            agent: shortAgentName,
-            ...(rec.alias ? { alias: rec.alias } : {}),
-            ...(resolvedHostPort ? { hostPort: resolvedHostPort } : {}),
-          };
-          if (!resolvedHostPort) delete nextRoute.hostPort;
-          // A freshly admitted launch supersedes any earlier unavailable state.
-          delete nextRoute.hardwareAvailability;
-          const readinessRoute = buildRelayReadinessRoute({
-            route: nextRoute,
-            manifest,
-            runtimeResult,
-            networkMode: launchProfile.network.mode,
-            generationDigest: workspacePreparationLease?.preparedGeneration || '',
-          });
-          return {
-            ok: true,
-            containerName,
-            registryRecord,
-            shortAgentName,
-            routeKey,
-            route: nextRoute,
-            readinessRoute,
-            manifest,
-          };
-        } catch (agentErr) {
-          // launchRouteTargets reports it: a typed hardware outcome is a
-          // contained refusal, anything else an ordinary failure.
-          try { agentErr.shortAgentName = shortAgentName; } catch (_) { /* reported by registry name */ }
-          throw agentErr;
-        }
         },
         allowFailures,
         commitResults: async (routeResults) => {

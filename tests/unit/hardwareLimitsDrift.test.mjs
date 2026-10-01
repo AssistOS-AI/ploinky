@@ -189,10 +189,10 @@ test('D.readback-mismatch', (t) => {
     assert.throws(() => launched(outside), (error) => /not under \/ploinky\/agents/.test(error.message) && findHardwareOutcome(error)?.code === HARDWARE_UNENFORCEABLE);
     // R1: a process that is not running, or whose PID is not visible, is an
     // ordinary start failure: no hardware outcome, no "not prepared" text.
-    for (const [label, inspect, pid] of [
-        ['exited (pid 0)', { ok: true, stdout: '0\n' }, null],
-        ['inspect failed', { ok: false, stdout: '' }, null],
-        ['pid not visible', { ok: true, stdout: '999\n' }, null],
+    for (const [label, inspect] of [
+        ['exited (pid 0)', { ok: true, stdout: '0\n' }],
+        ['inspect failed', { ok: false, stdout: '' }],
+        ['pid not visible', { ok: true, stdout: '999\n' }],
     ]) {
         withInspect(inspect, () => assert.throws(() => launched(launchedFixture(EXACT_LEAF)), (error) => {
             assert.equal(findHardwareOutcome(error), null, label);
@@ -200,7 +200,6 @@ test('D.readback-mismatch', (t) => {
             assert.doesNotMatch(error.message, /not prepared/, label);
             return true;
         }, label));
-        void pid;
     }
 });
 
