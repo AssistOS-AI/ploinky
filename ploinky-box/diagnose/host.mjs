@@ -7,6 +7,7 @@ import {
 } from '../hostPrerequisites.mjs';
 import { buildEngineProcessEnvironment, createProcessRunner } from '../process.mjs';
 import { sanitizeAuthorityDiagnostic } from '../../cli/sandbox/authorityCommandDiagnostics.mjs';
+import { DELEGATION_COMMANDS } from '../../cli/sandbox/hardwareLimits/requestedLimits.mjs';
 
 const TIMEOUT_MS = 5_000;
 const ROOTLESS_DOCS = 'https://github.com/containers/podman/blob/main/docs/tutorials/rootless_tutorial.md';
@@ -80,6 +81,41 @@ function inspectAppArmor({ add, fsApi, host }) {
 }
 
 /** Collect bounded host facts and probes without installing or changing policy. */
+/**
+ * Hardware-limit prerequisites, reported only when the workspace's gate is on
+ * (gate-off diagnostics are unchanged). Each requested resource needs its own
+ * delegated controller; a missing controller refuses only affected agents.
+ */
+export function hardwarePrerequisiteChecks(engineInfo, { platform = process.platform } = {}) {
+    const host = engineInfo?.host;
+    const checks = [];
+    const add = (id, label, status, detail, next) => checks.push({ id, label, status, detail, ...(next ? { next } : {}) });
+    if (!host) {
+        add('host.hardware', 'Hardware-limit prerequisites', 'skip', 'Requires successful podman info; repair that command first.');
+        return checks;
+    }
+    const cgroupV2 = host.cgroupVersion === 'v2';
+    add('host.hardware.cgroup', 'Hardware limits: writable cgroup v2', cgroupV2 ? 'pass' : 'fail',
+        `Engine cgroup version: ${host.cgroupVersion ?? 'not reported'}. The Box's nsdelegate mount is proven during preparation.`,
+        cgroupV2 ? undefined : "The Box needs writable cgroup v2 with nsdelegate. Configure the host's unified delegated hierarchy and restart the Box; Ploinky will not change host mounts or boot settings.");
+    const runtime = String(host.ociRuntime?.name || '');
+    add('host.hardware.runtime', 'Hardware limits: outer OCI runtime', runtime === 'crun' ? 'pass' : 'fail',
+        `Configured outer runtime: ${runtime || 'not reported'}. The exact Box runtime is verified from its inspect when it is prepared.`,
+        runtime === 'crun' ? undefined : 'Hardware limits require verified crun and nested cgroupfs. For the outer engine, set runtime="crun" in the [engine] section of that engine user\'s ~/.config/containers/containers.conf, then run ploinky restart.'
+            + (platform === 'darwin' ? ' On macOS do this inside the Podman machine.' : ''));
+    const controllers = Array.isArray(host.cgroupControllers) ? host.cgroupControllers : [];
+    const missing = ['cpu', 'memory', 'pids'].filter((controller) => !controllers.includes(controller));
+    add('host.hardware.controllers', 'Hardware limits: delegated controllers', missing.length ? 'warn' : 'pass',
+        `Delegated: ${controllers.join(',') || '(none)'}. ${missing.length ? `Agents requesting ${missing.join(', ')} limits will be refused; unrelated agents still start.` : 'cpu, memory and pids are delegated.'}`,
+        missing.length
+            ? (platform === 'darwin'
+                ? 'Apply the delegation commands inside podman machine ssh, then restart that Podman machine and run ploinky restart on macOS: '
+                : 'Apply these delegation commands on the Linux host, log out and back in, then run ploinky restart: ')
+                + `${DELEGATION_COMMANDS.join(' ; ')} (daemon-reload alone does not change an existing session)`
+            : undefined);
+    return checks;
+}
+
 export function collectHostDiagnostics({
     runner, env = process.env, platform = process.platform, fsApi = fs,
     uid = process.getuid?.(), execPath = process.execPath, nodeVersion = process.version,

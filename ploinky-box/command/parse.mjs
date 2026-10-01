@@ -82,6 +82,38 @@ function analyzeBind(tokens, commandToken) {
     }
 }
 
+const LIMITS_USAGE = 'use: ploinky limits status | ploinky limits clear --agent REPO/AGENT | ploinky limits clear --all';
+
+// Hardware-limits status and recovery are host-owned and never forwarded.
+function analyzeLimits(tokens, commandToken) {
+    const tail = tokens.filter((token) => token.rawIndex > commandToken.rawIndex).map((token) => token.text);
+    const [action = 'status', ...rest] = tail;
+    if (action === 'status') {
+        if (rest.length) throw argumentError(`limits status accepts no arguments; ${LIMITS_USAGE}`);
+        return Object.freeze({ action: 'status', agentRef: null, all: false });
+    }
+    if (action !== 'clear') throw argumentError(`Unknown limits action '${action}'; ${LIMITS_USAGE}`);
+    let agentRef = null;
+    let all = false;
+    for (let index = 0; index < rest.length; index += 1) {
+        const text = rest[index];
+        if (text === '--all') {
+            if (all) throw argumentError(`--all was supplied more than once; ${LIMITS_USAGE}`);
+            all = true;
+        } else if (text === '--agent' || text.startsWith('--agent=')) {
+            const value = text === '--agent' ? rest[index + 1] : text.slice('--agent='.length);
+            if (!value || value.startsWith('-')) throw argumentError(`--agent requires REPO/AGENT; ${LIMITS_USAGE}`);
+            if (agentRef !== null) throw argumentError(`--agent was supplied more than once; ${LIMITS_USAGE}`);
+            agentRef = value;
+            if (text === '--agent') index += 1;
+        } else {
+            throw argumentError(`limits clear: unexpected argument '${text}'; ${LIMITS_USAGE}`);
+        }
+    }
+    if (all === (agentRef !== null)) throw argumentError(`limits clear needs exactly one of --agent REPO/AGENT or --all; ${LIMITS_USAGE}`);
+    return Object.freeze({ action: 'clear', agentRef, all });
+}
+
 const GPU_USAGE = 'use: ploinky gpu status | ploinky gpu grant [--agent REPO/AGENT...] [--vendor VENDOR] '
     + '| ploinky gpu revoke [--agent REPO/AGENT...]';
 
@@ -245,6 +277,7 @@ export function parseOuterArguments(argv) {
     }
     const bind = command === 'bind' && !help ? analyzeBind(tokens, commandToken) : null;
     const gpu = command === 'gpu' && !help ? analyzeGpu(tokens, commandToken) : null;
+    const limits = command === 'limits' && !help ? analyzeLimits(tokens, commandToken) : null;
     return Object.freeze({
         rawArgv: Object.freeze(raw),
         classificationArgv: Object.freeze(classificationArgv),
@@ -264,5 +297,6 @@ export function parseOuterArguments(argv) {
         start,
         bind,
         gpu,
+        limits,
     });
 }

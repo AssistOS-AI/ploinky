@@ -24,7 +24,8 @@ import { createMutationLockManager } from './locks.mjs';
 import { preflightPublications, parseHostPort } from './ports.mjs';
 import { buildEngineProcessEnvironment, createProcessRunner } from './process.mjs';
 import { createRouterBindingStore, assertRouterBindingAssignable } from './routerBinding.mjs';
-import { collectHostDiagnostics } from './diagnose/host.mjs';
+import { collectHostDiagnostics, hardwarePrerequisiteChecks } from './diagnose/host.mjs';
+import { createHardwareGateStore, selectHardwareGate } from './hardwareLimitsGate.mjs';
 import { collectCurrentWorkspaceDiagnostics } from './diagnose/current.mjs';
 import { findExternalGitMetadata } from './diagnose/gitMetadata.mjs';
 import { inspectWorkspaceDataPaths } from './workspace-data.mjs';
@@ -479,6 +480,7 @@ export async function diagnoseWorkspace({
     bindingStore = createRouterBindingStore(), admitCurrentBox = validateCurrentBox,
     inspectionOnly = false, repairAssessments = collectRepairAssessments,
     homeDirectory, fsApi = fs, uid = process.getuid?.(),
+    hardwareGateStore = createHardwareGateStore(homeDirectory ? { homeDirectory } : {}),
 } = {}) {
     const checks = [], commands = [];
     const runner = createDiagnosticRunner(suppliedRunner || createProcessRunner({ env: buildEngineProcessEnvironment(env) }), commands, { progress });
@@ -513,6 +515,15 @@ export async function diagnoseWorkspace({
             return 'The workspace bind, Box working directory, and workspace root all use this exact path.';
         });
         if (mountable) checks.push(gitMetadataCheck(identity.workspaceRoot, fsApi));
+        // Hardware prerequisites are reported only for a gate-on workspace;
+        // a gate-off report is unchanged.
+        try {
+            const gate = selectHardwareGate({ identity, gateStore: hardwareGateStore, env, operation: 'diagnose' });
+            if (gate.enabled) checks.push(...hardwarePrerequisiteChecks(host?.engineInfo, { platform }));
+        } catch (error) {
+            checks.push({ id: 'workspace.hardware', label: 'Saved hardware-limits gate', status: 'fail', detail: clean(error.message),
+                next: 'Repair or remove the invalid saved hardware state, then run ploinky limits status.' });
+        }
     }
     let ownership;
     if (identity && (host?.engineUsable || host?.engineInfo?.host?.security?.rootless === true)) {

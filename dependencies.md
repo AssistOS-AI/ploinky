@@ -50,8 +50,15 @@ system prerequisites, with the effective paths read from `podman info`.
 Rootless UID/GID helpers, namespace mappings, seccomp, and FUSE/TUN device access
 are surveyed by the explicit `ploinky diagnose` and `ploinky repair` commands. Normal deployment
 does not run this general host preflight. Host cgroup versions and controller
-delegation are not prerequisites for the current Box runtime, which disables
-nested cgroups and sets no outer CPU quota. Installation and
+delegation are not prerequisites for the default Box runtime, which disables
+nested cgroups and sets no outer CPU quota. Hardware-enabled execution requires
+the verified cgroup-v2/runtime setup and each requested resource's delegated
+controller. `ploinky diagnose` reports missing prerequisites and their manual
+fixes. Unenforceable CPU, memory or process requests refuse the affected agent
+rather than silently dropping the limit. Hardware limits add no native `flock`,
+npm or production Python dependency: the store lock, preparation program and
+cgroup readers use Node.js built-ins, and the nested runtime uses the existing
+Podman and crun. Installation and
 configuration guidance is in [README.md](README.md#prerequisites) and in each
 failure message. These checks neither install packages nor alter host settings.
 The host's configured packages retain their distribution/upstream licensing;

@@ -149,6 +149,15 @@ export function createMutationLockManager({
         if (!ownerUnchanged(ownerPath, captured.fingerprint, fsApi)) {
             throw lockError(`Mutation lock owner changed during stale-lock recovery: ${lockPath}`);
         }
+        // Inspect the whole lock before deleting anything: residue such as an
+        // interrupted create receipt must be preserved for exact recovery, so
+        // the owner record is never removed only to find the directory busy.
+        const residue = fsApi.readdirSync(lockPath).filter((entry) => entry !== 'owner.json');
+        if (residue.length) {
+            throw lockError(
+                `Stale mutation lock contains unexpected entries (${residue.slice(0, 8).join(', ')}); it was left in place: ${lockPath}`,
+            );
+        }
         fsApi.unlinkSync(ownerPath);
         try {
             fsApi.rmdirSync(lockPath);

@@ -26,9 +26,14 @@ Run `ploinky diagnose` from the workspace to check the host environment:
 | Networking | The configured `pasta` (provided by `passt`) or `slirp4netns` executable, and the selected Netavark executable when applicable |
 | Storage | The configured overlay mount helper, if one is selected; native overlay does not require host `fuse-overlayfs` |
 
-The current Box runs nested Podman with cgroups disabled and sets no outer CPU
-quota. Startup therefore does not require a particular host cgroup version or
-delegated `cpu`, `memory`, or `pids` controllers.
+By default, the Box runs nested Podman with cgroups disabled and sets no outer
+CPU quota. An agent requesting CPU, memory or process limits is refused when
+those limits cannot be enforced. With `PLOINKY_BOX_HARDWARE_LIMITS=on`,
+nested-agent limits require writable delegated cgroup v2 with `nsdelegate`, the
+verified runtime configuration, and the controller needed by each requested
+resource. A missing controller refuses the affected agent; it does not prevent
+unrelated agents from starting. See
+[Hardware limits for agents](#hardware-limits-for-agents).
 
 The general host prerequisite survey runs when `ploinky diagnose` or
 `ploinky repair` is requested. Commands such as `ploinky start explorer` attempt their deployment
@@ -273,6 +278,10 @@ A matching folder named after the registered repository takes priority; otherwis
 | `ploinky gpu grant [--agent REPO/AGENT] [--vendor VENDOR]` | Let the named agents use the host NVIDIA GPU and lift their denies; without `--agent`, lift a workspace-wide revoke so manifest-declared agents get the GPU again; recreate the Box with the device nodes and read-only driver libraries and restart the configured graph when the wiring changes |
 | `ploinky gpu revoke [--agent REPO/AGENT]` | Deny the named agents, overriding their manifests; without `--agent`, withdraw every grant and turn manifest-declared GPU access off for the whole workspace |
 | `ploinky gpu status` | Show the saved grant, host GPU discovery, and the Box's GPU wiring without mutation |
+| `PLOINKY_BOX_HARDWARE_LIMITS=on ploinky start` (or `restart`, `update`) | Turn hardware limits on for this workspace and save the gate; the Box is recreated with the hardware wiring and prepared before graph work |
+| `PLOINKY_BOX_HARDWARE_LIMITS=off ploinky restart` (or `start`, `update`) | Turn hardware limits off and save the gate; refused while agents still have stored limits |
+| `ploinky limits status` | Show the saved gate, hardware state, transition, Box preparation and per-agent limits without mutation |
+| `ploinky limits clear --agent REPO/AGENT` / `ploinky limits clear --all` | Remove one agent's stored limits, or reset the whole policy store, on the host without a running Router |
 | `ploinky status` | Inspect outer configuration/publishes/health and running core status without mutation |
 | `ploinky diagnose [--json]` | Run host prerequisite/settings checks and isolated deployment command probes; report failures, commands, and actions labelled by privilege and automation eligibility |
 | `ploinky repair [--dry-run] [--json]` | Apply supported normal-user fixes, verify with diagnostics, and list remaining manual and sudo-required actions; `--dry-run` only inspects and previews |
@@ -281,6 +290,15 @@ A matching folder named after the registered repository takes priority; otherwis
 | `ploinky destroy` | Without prompting, stop nested agents and remove the outer container; retain the host workspace and `.ploinky/box` |
 | `ploinky destroy --delete-cache` | Remove the outer container without prompting, then delete only `.ploinky/box/dependencies` and `.ploinky/box/images` |
 | REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |
+
+Workspaces that have never enabled hardware limits retain the existing
+generic-command behavior, including creating or starting the Box. A saved off
+record alone, with no initialized store and no stored entries, retains that
+behavior. A saved on gate, an initialized hardware store, or proven stored
+entries restrict generic commands to an already-running compatible Box;
+otherwise run `ploinky start` first. Invalid or unreadable hardware metadata is
+not treated as a never-enabled workspace: repair it before an operation that
+would create or replace the Box.
 
 When REPL input is not a Ploinky command, Ploinky attempts that executable
 directly using the runtime `PATH`; it does not depend on a separate `which`
@@ -648,6 +666,64 @@ rule: Router traffic is plain HTTP without TLS, so restrict who can reach the
 port with the host firewall or a trusted network. Bind does not change firewall
 rules, DNS, tunnels, or authentication settings, and it does not rewrite callback
 URLs registered with an SSO provider.
+
+## Hardware limits for agents
+
+Hardware limits are off by default. Turn them on for a workspace with
+`PLOINKY_BOX_HARDWARE_LIMITS=on ploinky start` (or `restart`, `update`); the
+choice is saved on the host in `~/.ploinky-box/hardware-limits` and later
+commands reuse it. Only `start`, `restart` and `update` apply the variable.
+Turning the gate off while agents still have stored limits is refused with:
+
+    N agents have stored hardware limits. Turn the gate on with PLOINKY_BOX_HARDWARE_LIMITS=on ploinky restart, or run ploinky limits clear --agent REPO/AGENT or ploinky limits clear --all on the host. No Box mutation was performed.
+
+`ploinky limits status` shows the saved gate, the hardware state, any
+interrupted gate-off transition, the Box's preparation and the per-agent limits
+without changing anything. `ploinky limits clear --agent REPO/AGENT` and
+`ploinky limits clear --all` remove stored limits on the host and work without a
+running Router.
+
+When the gate is on, every created, restarted or restored Box generation is
+prepared before graph work: a fixed program running as the Box's
+user-namespace root moves the Box's own tasks into `/ploinky/core`, enables the
+available delegated `cpu`, `memory` and `pids` controllers and delegates only
+`/ploinky` to the Box user. Agents with limits then run under
+`/ploinky/agents` in a private cgroup namespace, and their applied values are
+read back from the kernel before they are declared ready. `ploinky diagnose`
+lists missing prerequisites and their manual fixes; Ploinky never changes host
+mounts, boot settings or systemd delegation itself.
+
+CPU quotas and memory limits use the kernel's cgroup controllers. A rendered
+agent memory limit also sets an equal memory-and-swap limit, preventing swap
+from extending the cap. Existing declared process-count limits remain
+supported. Internal authority helpers are never refused because a resource
+controller is absent: they retain their recorded flags and receive enforced
+placement only when all required controllers are available.
+
+An unenforceable limit refuses that agent. Blocking dependencies and consumers
+explicitly waiting on a no-wait result propagate BLOCKED with the originating
+reason; an optional no-wait child does not block its parent. Unrelated agents
+continue starting. Refused and blocked agents are never ready. If a required
+dependency blocks Explorer itself, host status/clear and Router administration
+remain recovery paths.
+
+Store files are outside agent-visible workspace mounts, but administrator
+authority is not protected from every workspace-capable agent: eligible agents
+may read the workspace master key and forge administrator cookie/CSRF requests.
+This exposure is accepted for v1. Bearer rejection and direct store isolation do
+not remove it.
+
+A host-network agent that also requests nested Podman is refused for this
+unsupported combination only when it requests or stores a hardware limit. An
+unlimited instance retains existing behavior. Ordinary host-network agents
+remain eligible for CPU/RAM limits when their backend is verified. Such an
+unlimited capable instance keeps the baseline cgroup behavior: the private
+namespace proof does not cover it, so other agents' limits do not isolate them
+from it.
+
+CPU/RAM maxima are not reservations: host or ancestor memory pressure can still
+kill a process below its own cap. Dependency installation, diagnose and
+image-verification work is maintenance outside agent budgets.
 
 ## GPU access for agents
 

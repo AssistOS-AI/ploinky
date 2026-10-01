@@ -21,6 +21,15 @@ import {
 } from '../supervisor.mjs';
 import { isInsideBox } from '../lib/boxMarker.mjs';
 import { parseBranchPolicy, stripBranchPolicyArgs } from '../../agentlib/branchPolicy.mjs';
+import { formatLimitsStatus } from '../hardwareLimitsGate.mjs';
+
+function formatLimitsClearResult(result) {
+    if (result.absent) return 'No hardware limits are stored for this workspace; nothing was changed.\n';
+    const scope = result.all ? 'every stored hardware limit' : `the stored hardware limits of ${result.agentRef}`;
+    const reset = result.reset ? ' The unreadable policy was reset to a new policy epoch.' : '';
+    const pending = result.cleared === false ? ' No entry was stored for that agent.' : '';
+    return `Cleared ${scope}.${reset}${pending} Running agents keep their applied limits until the next start, restart or Apply.\n`;
+}
 
 export function publicUsageText() {
     return `ploinky - run Ploinky through its managed outer Box
@@ -112,7 +121,7 @@ If .ploinky/edge-desired.json exists, start stages it as the host-owned routing/
 function outerDebug(parsed, route, stdout) {
     if (!parsed.debug.enabled) return;
     if (['help', 'status', 'stop', 'destroy', 'bash', 'dry-run', 'bind', 'bind-dry-run',
-        'gpu-status', 'gpu-grant', 'gpu-revoke'].includes(route.kind)) {
+        'gpu-status', 'gpu-grant', 'gpu-revoke', 'limits-status', 'limits-clear'].includes(route.kind)) {
         stdout.write('[INFO] Debug mode enabled.\n');
     }
 }
@@ -329,6 +338,15 @@ async function runRoutedOuterCli(argv, parsed, route, launchDirectory, dispatch,
     if (route.kind === 'gpu-revoke') {
         const result = await selectedSupervisor.runGpuRevokeTransaction({ agents: route.agents });
         output.write(formatGpuGrantResult(result));
+        return 0;
+    }
+    if (route.kind === 'limits-status') {
+        output.write(formatLimitsStatus(selectedSupervisor.inspectLimitsStatus()));
+        return 0;
+    }
+    if (route.kind === 'limits-clear') {
+        const result = await selectedSupervisor.runLimitsClearTransaction({ agentRef: route.agentRef, all: route.all });
+        output.write(formatLimitsClearResult(result));
         return 0;
     }
     if (route.kind === 'dry-run') {

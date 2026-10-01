@@ -25,6 +25,7 @@ import {
     routerBindingPublicAuthority,
 } from '../routerBinding.mjs';
 import { observeContainerGpuWiring } from '../gpuGrant.mjs';
+import { observeContainerHardwareWiring } from '../hardwareLimitsGate.mjs';
 import { nestedPodmanSeccompProfileContract } from '../seccomp.mjs';
 import {
     agentLibBoxEnv,
@@ -318,6 +319,9 @@ export function validateContainerConfiguration(containerHandle, {
     // undefined: trust the wiring the Box records (status, diagnose, reuse
     // of an observed Box); null: no GPU grant; otherwise the exact wiring.
     gpu = undefined,
+    // Same contract for the hardware-limits wiring: null means gate off and
+    // rejects the label, marker and store bind.
+    hardware = undefined,
 }) {
     assertRouterBindingStateConfined(identity);
     const workspaceRoot = assertBoxWorkspaceRoot(identity?.workspaceRoot);
@@ -325,6 +329,9 @@ export function validateContainerConfiguration(containerHandle, {
     const gpuWiring = gpu === undefined
         ? observeContainerGpuWiring(containerHandle, { identity })
         : gpu;
+    const hardwareWiring = hardware === undefined
+        ? observeContainerHardwareWiring(containerHandle, { identity })
+        : hardware;
     const runtime = containerHandle.runtime;
     assertBoxNetworkMode(runtime, networkMode);
     const seccompProfile = nestedPodmanSeccompProfileContract(repositoryRoot);
@@ -354,6 +361,9 @@ export function validateContainerConfiguration(containerHandle, {
     }
     if (gpuWiring) {
         expectedLabels[BOX_LABELS.gpuGrant] = gpuWiring.fingerprint;
+    }
+    if (hardwareWiring) {
+        expectedLabels[BOX_LABELS.hardwareLimits] = hardwareWiring.fingerprint;
     }
     const selectedFingerprints = dataFingerprints || Object.fromEntries(BOX_DATA_KEYS.map((key) => [
         key,
@@ -497,6 +507,12 @@ export function validateContainerConfiguration(containerHandle, {
         ...Object.fromEntries((gpuWiring?.mounts || []).map((mount) => [
             mount.destination,
             { source: mount.source, rw: false },
+        ])),
+        // Hardware-limits marker (read-only) and private store (read-write):
+        // accepted only with the matching wiring label.
+        ...Object.fromEntries((hardwareWiring?.mounts || []).map((mount) => [
+            mount.destination,
+            { source: mount.source, rw: mount.rw === true },
         ])),
     };
     if (!Array.isArray(runtime.mounts)) {

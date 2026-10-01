@@ -50,6 +50,7 @@ import {
     readContainerLogs,
     renderContainerLogs,
 } from './container-logs.mjs';
+import { hardwareWiringCreateArgs } from '../hardwareLimitsGate.mjs';
 
 function lifecycleError(message, code = 'PLOINKY_BOX_LIFECYCLE_FAILED', cause) {
     return new PloinkyBoxError(message, { code, cause });
@@ -105,6 +106,7 @@ export function containerCreateArgs({
     hostKind = 'native-linux',
     networkMode = null,
     gpu = null,
+    hardware = null,
 }) {
     assertRouterBindingStateConfined(identity);
     const workspaceRoot = assertBoxWorkspaceRoot(identity?.workspaceRoot);
@@ -112,6 +114,9 @@ export function containerCreateArgs({
     // The grant adds only explicit device nodes, read-only binds and one label;
     // never privileged mode, capabilities, a CDI spec directory, or Box env.
     const gpuArgs = gpuWiringCreateArgs(gpu);
+    // Gate-on wiring adds one label, a read-only marker and the read-write
+    // private store bind; a gate-off Box receives none of them.
+    const hardwareArgs = hardwareWiringCreateArgs(hardware);
     const seccompProfile = nestedPodmanSeccompProfileContract(source);
     if (networkMode !== null && networkMode !== PASTA_IPV4_NETWORK) {
         throw lifecycleError('Container creation requires a supported outer network mode');
@@ -143,6 +148,7 @@ export function containerCreateArgs({
             : {}),
         [BOX_LABELS.seccompFingerprint]: seccompProfile.fingerprint,
         ...gpuArgs.labels,
+        ...hardwareArgs.labels,
     };
     for (const key of BOX_DATA_KEYS) {
         const value = String(dataFingerprints?.[key] || '');
@@ -174,6 +180,7 @@ export function containerCreateArgs({
         '--volume', boxWorkspaceVolume(workspaceRoot),
         ...workspaceDataMountArgs(identity),
         ...gpuArgs.volumes,
+        ...hardwareArgs.volumes,
         // The AgentLib binds come last so the read-only alias shadow lands on
         // top of the writable workspace bind that also exposes that path.
         ...agentLibMountArgs(agentLibContract, workspaceRoot),

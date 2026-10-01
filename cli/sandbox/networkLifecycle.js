@@ -18,6 +18,7 @@ import {
     physicalNetworkName,
     workspaceNetworkIdentity,
 } from './networkIdentity.js';
+import { engineCommandArgs } from './hardwareLimits/runtimeCommand.mjs';
 
 export { NETWORK_LABELS, physicalNetworkName, workspaceNetworkIdentity } from './networkIdentity.js';
 
@@ -939,6 +940,9 @@ export function createNetworkLifecycleAdapter({
         beforeStart = null,
         afterStart = null,
         onCreated = null,
+        // Engine-level prefix for a hardware-placed agent's start; empty for
+        // every other container so its command form is unchanged.
+        commandPrefix = [],
     } = {}) {
         const exactLabels = expectedLabels || (network && runtimeIdentity
             ? expectedAgentLabels(identity.hash, networkContractHash(network), runtimeIdentity)
@@ -978,7 +982,7 @@ export function createNetworkLifecycleAdapter({
             if (beforeStart) beforeStart({ plan, containerId: ownedContainerId, record: configured });
             let started;
             try {
-                started = execute(['start', ownedContainerId], { inherit: true });
+                started = run(runtime, engineCommandArgs(commandPrefix, ['start', ownedContainerId]), { inherit: true });
             } finally {
                 if (afterStart) afterStart({ plan, containerId: ownedContainerId, record: configured });
             }
@@ -1024,6 +1028,7 @@ export function createNetworkLifecycleAdapter({
         onContainerCreated = null,
         networkLockWaitMs = NETWORK_LOCK_WAIT_MS,
         networkLifecycleCapability,
+        commandPrefix = [],
     }) {
         if (typeof createContainer !== 'function') throw new Error('managed container transaction requires createContainer');
         if (inspectAdoption !== null && typeof inspectAdoption !== 'function') {
@@ -1162,6 +1167,7 @@ export function createNetworkLifecycleAdapter({
                 const containerId = finalizeContainer(containerName, plan, {
                     expectedContainerId: candidateId,
                     expectedLabels: agentLabels,
+                    commandPrefix,
                     beforeStart: preStartLaunch
                         ? (context) => preStartLaunch({ ...context, launch })
                         : null,

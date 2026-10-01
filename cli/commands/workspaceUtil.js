@@ -107,8 +107,10 @@ import { networkContractHash } from '../sandbox/networkContract.js';
 import {
   admitManifestRuntimeCapabilities,
   assertRuntimeAdmissionCurrent,
+  limitsHashReuseReason,
   hardwareRefusalOf,
 } from '../sandbox/runtimeCapabilities.js';
+import { LIMITS_HASH_LABEL } from '../sandbox/hardwareLimits/resolve.mjs';
 import {
   blockingEdgesFromGraph,
   classifyAvailability,
@@ -1050,6 +1052,7 @@ function graphNodeRuntimeReplacementReason(plan, {
   getExposedNamesImpl = getExposedNames,
   computeRetainedManagedEnvHashImpl = computeRetainedManagedEnvHash,
   retainedManagedEnvHashOptions,
+  admitRuntimeImpl = admitGraphNodeHardwareDescriptor,
 } = {}) {
   const { node, existing } = plan;
   const record = existing.rec;
@@ -1113,6 +1116,14 @@ function graphNodeRuntimeReplacementReason(plan, {
   if (desiredEnvHash && desiredEnvHash !== getContainerLabelImpl(existing.key, 'ploinky.envhash')) {
     return 'envHashChanged';
   }
+  // The same admitted descriptor drives creation, adoption and reuse: its
+  // limits hash (empty without hardware placement) must match the runtime.
+  const admitted = admitRuntimeImpl(node, profileResolution, { runtime, recordAlias: record.alias || '', key: existing.key });
+  const admittedDescriptor = admitted?.descriptor || null;
+  const limitsReason = admittedDescriptor
+    ? limitsHashReuseReason(admittedDescriptor, getContainerLabelImpl(existing.key, LIMITS_HASH_LABEL))
+    : null;
+  if (limitsReason) return limitsReason;
   if (isLlmRuntimeManifestImpl(node.manifest, profileResolution.profileConfig)) {
     const probe = prepareLlmStartupImpl({
       runtime,
@@ -1129,6 +1140,13 @@ function graphNodeRuntimeReplacementReason(plan, {
       envHash: baseEnvHash,
       effectiveNetwork: profileResolution.profileConfig?.network ?? node.manifest?.network ?? null,
       writeState: false,
+      // Reuse uses the same admitted policy as creation (stored overrides
+      // included); otherwise a limited LLM agent would restart on every start.
+      ...(admittedDescriptor ? { admittedRuntimePolicy: admittedDescriptor.runtimePolicy } : {}),
+      ...(admitted?.llmStartup ? {
+        resolvedSelection: admitted.llmStartup.selection,
+        resolvedHardware: admitted.llmStartup.hardware,
+      } : {}),
     });
     if (probe.enabled
         && probe.reuseHash
@@ -1158,6 +1176,44 @@ function graphNodeRuntimeReplacementReason(plan, {
       : 'networkContractDrift';
   }
   return '';
+}
+
+// A metadata admission of a graph node's current inputs, used only to compare
+// reuse against creation; it never authorizes rendering.
+function admitGraphNodeHardwareDescriptor(node, profileResolution, { runtime, recordAlias, key }) {
+  try {
+    const manifestPath = node.manifestPath || (node.agentPath ? path.join(node.agentPath, 'manifest.json') : '');
+    if (!manifestPath || !fs.existsSync(manifestPath)) return null;
+    const manifestBytes = fs.readFileSync(manifestPath);
+    const manifest = JSON.parse(manifestBytes.toString('utf8'));
+    const llmAdmissionContext = resolveLlmRuntimeAdmissionContext({
+      runtime,
+      manifest,
+      profileConfig: profileResolution.profileConfig,
+      agentName: node.shortAgentName,
+      alias: node.alias || recordAlias,
+      env: process.env,
+    });
+    const { descriptor } = admitManifestRuntimeCapabilities(manifest, {
+      manifestBytes,
+      manifestPath,
+      agentId: `${node.repoName}/${node.shortAgentName}`,
+      profileName: profileResolution.resolvedProfileName,
+      profileConfig: profileResolution.profileConfig,
+      network: profileResolution.network,
+      runtime,
+      runtimeKind: 'container',
+      catalogPolicy: llmAdmissionContext.catalogPolicy,
+      catalogIdentity: llmAdmissionContext.catalogIdentity,
+      hardwareAdmission: 'metadata',
+      instanceKey: key,
+      alias: node.alias || recordAlias || '',
+    });
+    return { descriptor, llmStartup: llmAdmissionContext.startup || null };
+  } catch (_) {
+    // Admission errors surface on the launch path itself.
+    return null;
+  }
 }
 
 function resolveExtraEnabledRuntimeNodes(graph, reg, getAgentContainerName = dockerSvc.getAgentContainerName) {

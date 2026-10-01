@@ -14,6 +14,7 @@ import {
     HARDWARE_UNENFORCEABLE,
     validateHardwareOutcome,
 } from './errors.mjs';
+import { readBoxHardwareContext } from './context.mjs';
 
 export const HARDWARE_RESOURCE_FIELDS = Object.freeze(['memory', 'cpus', 'pidsLimit']);
 const LAYERS = Object.freeze([
@@ -74,7 +75,7 @@ export function hex64(value) {
 // hardware-prepared Box; the default inside a Box is gate off, which makes
 // every declared limit unenforceable (nested cgroups are disabled).
 const DEFAULT_CONTEXT_PROVIDER = ({ insideBox }) => (insideBox
-    ? { gate: 'off', prepared: false, backendReady: false, controllers: [], storeState: 'none' }
+    ? readBoxHardwareContext()
     : { gate: 'none', prepared: false, backendReady: false, controllers: [], storeState: 'none' });
 let contextProvider = DEFAULT_CONTEXT_PROVIDER;
 
@@ -103,6 +104,10 @@ export function normalizeHardwareContext(raw, { insideBox, runtimeKind }) {
         storeToken: value.storeToken && typeof value.storeToken === 'object'
             ? Object.freeze({ epoch: String(value.storeToken.epoch || ''), revision: Number(value.storeToken.revision) || 0 })
             : null,
+        // Per-agent stored overrides and the visible envelope; consulted for
+        // resolution, never part of another agent's fingerprint.
+        overrides: value.overrides instanceof Map ? value.overrides : new Map(),
+        envelope: value.envelope && typeof value.envelope === 'object' ? value.envelope : null,
     });
 }
 
@@ -177,7 +182,7 @@ function storeRefusal(context) {
 // Decide hardware eligibility for one admitted descriptor. Returns
 // {applicable:false} outside the hardware boundary, otherwise
 // {applicable:true, state:'eligible'|'refused', refusalParts, inputFingerprint}.
-export function evaluateHardwareEligibility(descriptor, context, { helper = false } = {}) {
+export function evaluateHardwareEligibility(descriptor, context, { helper = false, overrideProblem = null } = {}) {
     const requested = Array.isArray(descriptor?.hardwareRequest) ? descriptor.hardwareRequest : [];
     const runtimeKind = context.runtimeKind;
     // Internal helpers are never refused by hardware admission.
@@ -193,6 +198,7 @@ export function evaluateHardwareEligibility(descriptor, context, { helper = fals
         requested,
         hostNetwork,
         nestedPodman,
+        overrideProblem,
         context: {
             insideBox: context.insideBox,
             gate: context.gate,
@@ -212,6 +218,12 @@ export function evaluateHardwareEligibility(descriptor, context, { helper = fals
     } else if (context.storeState === 'unreadable') {
         // No non-helper agent can prove the absence of stored limits.
         refusal = storeRefusal(context);
+    } else if (overrideProblem) {
+        refusal = {
+            reasonCode: 'exceeds_envelope',
+            reason: `The stored hardware limit cannot be resolved against this Box: ${overrideProblem}.`,
+            fix: 'Change or clear the stored limit in Settings, or run ploinky limits clear --agent REPO/AGENT on the host.',
+        };
     } else if (hasHardwareRequest(requested)) {
         if (context.gate !== 'on') {
             refusal = {
@@ -277,5 +289,36 @@ export function buildDirectRefusal({ key, ref, alias = null, refusalParts, input
         causalPath: [key],
         omittedPathCount: 0,
         additionalCauseCount: 0,
+    });
+}
+
+/**
+ * Interactive create/reuse (plan §8.2): before either reusing or creating an
+ * interactive container, any requested or stored memory/cpus/pidsLimit is
+ * refused with the fix to use the managed lifecycle. Returns the validated
+ * refusal outcome or null.
+ */
+export function interactiveHardwareRefusal({ manifest, profileConfig = null, ref, key, alias = null, context = null }) {
+    const stored = context?.gate === 'on' && context.overrides instanceof Map ? context.overrides.get(ref) || null : null;
+    const storedPolicy = stored
+        ? { resources: { ...(stored.cpus !== undefined ? { cpus: String(stored.cpus) } : {}), ...(stored.memoryPercent !== undefined ? { memory: `${stored.memoryPercent}%` } : {}) } }
+        : null;
+    const requested = requestedHardwareLimits({
+        manifestPolicy: manifest?.llmRuntime?.runtimePolicy || null,
+        profilePolicy: profileConfig?.llmRuntime?.runtimePolicy || null,
+        overridePolicy: storedPolicy,
+    });
+    if (!hasHardwareRequest(requested)) return null;
+    return buildDirectRefusal({
+        key,
+        ref,
+        alias,
+        refusalParts: {
+            reasonCode: 'interactive_runtime',
+            reason: `This runtime cannot apply ${requested.map((entry) => entry.field).join(', ')}.`,
+            fix: 'Use the managed container lifecycle, or remove the limit. For host lite sandboxes, disable the lite sandbox before starting the container runtime.',
+            requested,
+        },
+        inputFingerprint: hex64({ schema: 1, interactive: true, ref, requested }),
     });
 }

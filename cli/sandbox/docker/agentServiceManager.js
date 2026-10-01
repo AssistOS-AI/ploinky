@@ -79,6 +79,9 @@ import {
 import {
     admitManifestRuntimeCapabilities,
     assertRuntimeAdmissionCurrent,
+    assertHardwareAdmissionCurrent,
+    hardwareCommandPrefix,
+    limitsHashReuseReason,
     renderContainerSecurityArgs,
     renderRuntimePolicyArgs,
 } from '../runtimeCapabilities.js';
@@ -104,6 +107,15 @@ import {
 } from '../../utils/runtime/legacyAgentDataGuards.js';
 import { deriveAgentPrincipalId } from '../../utils/security/agentIdentity.js';
 import { ensureSharedHostDir, runPostinstallHook } from './agentHooks.js';
+import { engineCommandArgs } from '../hardwareLimits/runtimeCommand.mjs';
+import {
+    authorityHelperPlacementFromContext,
+    cleanupStaleLeaves,
+    verifyLaunchedHardwareLimits,
+} from '../hardwareLimits/delegation.mjs';
+import { HardwareLimitsError } from '../hardwareLimits/errors.mjs';
+import { buildDirectRefusal, captureHardwareContext } from '../hardwareLimits/requestedLimits.mjs';
+import { LIMITS_HASH_LABEL } from '../hardwareLimits/resolve.mjs';
 import { ensureBwrapService } from '../bwrap/bwrapServiceManager.js';
 import { isBwrapProcessRunning, stopBwrapProcess } from '../bwrap/bwrapFleet.js';
 import { ensureSeatbeltService } from '../seatbelt/seatbeltServiceManager.js';
@@ -751,6 +763,24 @@ function buildDefaultPodmanNetworkArgs(platform = process.platform) {
         '--network', platform === 'darwin' ? 'pasta' : 'pasta:--map-gw',
         ...(platform === 'darwin' ? ['--no-hosts'] : []),
     ];
+}
+
+// Remove only empty libpod-ID leaves under the two owned cgroup parents whose
+// full IDs the engine no longer lists. Without a complete live-ID listing
+// nothing is removed; nonempty or foreign leftovers are reported, never killed.
+function removeStaleHardwareLeaves(runtime) {
+    const listed = spawnSync(runtime, ['ps', '-a', '--no-trunc', '--format', '{{.ID}}'], { encoding: 'utf8', timeout: 10_000 });
+    if (listed.status !== 0 || listed.error) {
+        debugLog('[hardware-limits] stale leaf cleanup skipped: the engine container list is unavailable');
+        return;
+    }
+    try {
+        const liveIds = new Set(String(listed.stdout || '').split(/\s+/).filter((id) => /^[a-f0-9]{64}$/.test(id)));
+        const { retained } = cleanupStaleLeaves({ liveIds });
+        for (const entry of retained) debugLog(`[hardware-limits] stale leaf ${entry.leaf} retained: ${entry.reason}`);
+    } catch (error) {
+        debugLog(`[hardware-limits] stale leaf cleanup failed: ${error?.message || error}`);
+    }
 }
 
 function buildBoxPodmanHostArgs({
@@ -2087,6 +2117,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 nonce,
                 registerObservation,
                 consumeObservation,
+                placement: authorityHelperPlacementFromContext(
+                    captureHardwareContext({ insideBox: isInsideBox(), runtimeKind: 'container' }),
+                ),
             }),
         });
         // The first commit is owned by attestRouterAuthority immediately after
@@ -2344,6 +2377,16 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             state: 'preserved-ambiguous',
             inspectionComplete: false,
         });
+        // A hardware-placed agent selects the nested cgroupfs manager with an
+        // engine option before the subcommand; every other launch keeps the
+        // existing argv (empty prefix).
+        createArgs.splice(0, createArgs.length,
+            ...engineCommandArgs(hardwareCommandPrefix(runtimeAdmission.descriptor), createArgs));
+        // Hardware inputs are rechecked immediately before create: a changed
+        // gate, preparation, controller set or this agent's stored entry
+        // returns PLOINKY_RUNTIME_INPUT_CHANGED instead of an older policy.
+        assertHardwareAdmissionCurrent(runtimeAdmission);
+        if (runtimeAdmission.descriptor.hardwarePlacement) removeStaleHardwareLeaves(runtime);
         // Creation is reached only after the exact predecessor is gone (or was
         // proved absent). Retire its two fixed control-plane artifacts here so
         // shared-filesystem socket projection cannot leak across generations.
@@ -2486,6 +2529,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 postStartLaunch: cleanupLegacyGuardMountpointCleanupAfterStart,
                 finalizeLaunch: finalizeGeneratedRouterLaunch,
                 onContainerCreated: recordCreatedIdentity,
+                commandPrefix: hardwareCommandPrefix(runtimeAdmission.descriptor),
             });
         if (adoptManagedRuntimeOnly && launched?.adopted !== true) {
             const mismatch = new Error(
@@ -2526,12 +2570,41 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 onCreated: recordCreatedIdentity,
                 beforeStart: prepareLegacyGuardMountpointCleanupBeforeStart,
                 afterStart: cleanupLegacyGuardMountpointCleanupAfterStart,
+                commandPrefix: hardwareCommandPrefix(runtimeAdmission.descriptor),
             }) || '');
         }, { waitMs: 15 * 60 * 1000 });
     }
     if (!launchedContainerId) {
         throw new Error(`startAgentContainer(${agentName}) did not capture an immutable container ID`);
     }
+    // A hardware-placed agent is not ready until its actual leaf carries the
+    // admitted limits; a disagreement removes this candidate (catch below).
+    if (runtimeAdmission.descriptor.hardwarePlacement && !adoptedExistingRuntime) {
+        verifyLaunchedHardwareLimits({
+            descriptor: runtimeAdmission.descriptor,
+            containerId: launchedContainerId,
+            runtime,
+            query: (command, queryArgs) => {
+                const result = spawnSync(command, queryArgs, { encoding: 'utf8', timeout: 10_000 });
+                return { ok: result.status === 0 && !result.error, stdout: String(result.stdout || '') };
+            },
+            refuse: (reason) => new HardwareLimitsError(buildDirectRefusal({
+                key: containerName,
+                ref: `${repoName}/${agentName}`,
+                alias: options.alias || null,
+                refusalParts: {
+                    reasonCode: 'unprepared',
+                    reason: `This Box is not prepared for hardware limits: ${reason}.`,
+                    fix: 'On the host run ploinky limits status, repair the reported prerequisite, then ploinky restart.',
+                    requested: runtimeAdmission.descriptor.hardwareRequest || [],
+                },
+                inputFingerprint: runtimeAdmission.hardwareEligibility?.inputFingerprint || '0'.repeat(64),
+            })),
+        });
+    }
+    // And again before the candidate can be returned for route publication;
+    // a stale admission removes the candidate through the cleanup below.
+    assertHardwareAdmissionCurrent(runtimeAdmission);
     } catch (error) {
         let exactCleanupPerformed = error?.ploinkyContainerTransaction?.exactCleanupPerformed === true;
         launchedContainerId ||= String(error?.ploinkyContainerTransaction?.containerId || '');
@@ -3419,6 +3492,8 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         runtimeKind: 'container',
         catalogPolicy: serviceLlmAdmissionContext.catalogPolicy,
         catalogIdentity: serviceLlmAdmissionContext.catalogIdentity,
+        instanceKey: getAgentContainerName(aliasOverride || agentName, repoName),
+        alias: aliasOverride || '',
     });
     if (options.runtimeAdmission && preflightRuntimeKind === 'container') {
         assertRuntimeAdmissionCurrent(options.runtimeAdmission, {
@@ -3726,6 +3801,16 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         }
     }
 
+    // Hardware limits: creation, adoption and reuse compare one admitted
+    // descriptor's limits hash (empty without hardware placement).
+    if (existingRuntimeAtEntry) {
+        const limitsReason = limitsHashReuseReason(serviceAdmission.descriptor, getContainerLabel(containerName, LIMITS_HASH_LABEL));
+        if (limitsReason) {
+            debugLog(`[ensureAgentService] ${agentName}: hardware limits changed, recreating container`);
+            recreateReason ||= limitsReason;
+        }
+    }
+
     // LLM runtime: include architecture/catalog/digest/policy in reuse comparison.
     if (existingRuntimeAtEntry && isLlmRuntimeManifest(manifest, profileConfig)) {
         try {
@@ -3747,6 +3832,11 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 effectiveNetwork: effectiveNetworkForLlm,
                 writeState: false,
                 createDirectories: false,
+                // Same admitted policy and resolved selection/hardware as
+                // creation, so reuse agrees with it.
+                resolvedSelection: serviceLlmAdmissionContext.startup?.selection,
+                resolvedHardware: serviceLlmAdmissionContext.startup?.hardware,
+                admittedRuntimePolicy: serviceAdmission.descriptor.runtimePolicy,
             });
             if (probe.enabled) {
                 const currentReuse = getContainerLabel(containerName, 'ploinky.reusehash');

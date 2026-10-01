@@ -43,6 +43,9 @@ import {
     agentLibGrant,
     agentLibGrantEnv,
 } from '../agentLibGrant.js';
+import { isInsideBox } from '../../../ploinky-box/lib/boxMarker.mjs';
+import { HardwareLimitsError } from '../hardwareLimits/errors.mjs';
+import { captureHardwareContext, interactiveHardwareRefusal } from '../hardwareLimits/requestedLimits.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -175,9 +178,25 @@ function buildInteractiveAgentCreateCommand({
     ]);
 }
 
+// Refuse requested or stored hardware limits before reuse or create: an
+// interactive container is outside the managed, hardware-placed lifecycle.
+export function assertInteractiveHardwareLimitsAbsent(manifest, {
+    agentName, repoName, containerName, profileConfig = null, insideBox = isInsideBox(), hardwareContext,
+}) {
+    const refusal = interactiveHardwareRefusal({
+        manifest,
+        profileConfig,
+        ref: `${repoName}/${agentName}`,
+        key: containerName,
+        context: captureHardwareContext({ insideBox, runtimeKind: 'container', hardwareContext }),
+    });
+    if (refusal) throw new HardwareLimitsError(refusal);
+}
+
 function runCommandInContainer(agentName, repoName, manifest, command, interactive = false) {
     const runtime = getRuntime();
     const containerName = getAgentContainerName(agentName, repoName);
+    assertInteractiveHardwareLimitsAbsent(manifest, { agentName, repoName, containerName });
     let agents = loadAgentsMap();
     const projectDir = getConfiguredProjectPath(agentName, repoName);
     const homeDir = getAgentWorkDir(agentName);
@@ -402,6 +421,7 @@ function ensureAgentContainer(agentName, repoName, manifest) {
     const profileConfig = hasProfileConfig
         ? getProfileConfig(`${repoName}/${agentName}`, activeProfile)
         : null;
+    assertInteractiveHardwareLimitsAbsent(manifest, { agentName, repoName, containerName, profileConfig });
 
     if (containerExists(containerName)) {
         const desired = computeEnvHash(manifest, profileConfig, {}, { agentName, repoName });

@@ -16,7 +16,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { BOX_ROUTER_CONTAINER_PORT, GPU_GRANT_STATE_DIRECTORY } from './constants.mjs';
+import { BOX_ROUTER_CONTAINER_PORT, GPU_GRANT_STATE_DIRECTORY, HARDWARE_LIMITS_STATE_DIRECTORY } from './constants.mjs';
 import { PloinkyBoxError } from './errors.mjs';
 import { isContainerInterface, isUsableHostIpv4 } from './hostNetwork.mjs';
 import {
@@ -385,6 +385,7 @@ export function assertRouterBindingStateConfined(identity, {
         stateRoot,
         path.join(stateRoot, ROUTER_BINDING_STATE_DIRECTORY),
         path.join(stateRoot, GPU_GRANT_STATE_DIRECTORY),
+        path.join(stateRoot, HARDWARE_LIMITS_STATE_DIRECTORY),
     ].map((target) => realpathOfNearestExisting(target, fsApi));
     const protectedAncestors = protectedPaths.map((target) => ancestorDirectoryIdentities(target, fsApi));
     const protectedIdentities = protectedPaths.map((target) => directoryIdentity(target, fsApi)).filter(Boolean);

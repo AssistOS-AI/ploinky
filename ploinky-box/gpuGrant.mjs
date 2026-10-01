@@ -39,6 +39,12 @@ import {
     GPU_GRANT_MARKER_VERSION,
     normalizeGpuAgentSelector,
 } from './lib/gpuGrantMarker.mjs';
+import {
+    assertPrivateDirectoryIfPresent as assertSharedPrivateDirectoryIfPresent,
+    ensurePrivateDirectory as ensureSharedPrivateDirectory,
+    readPrivateFile as readSharedPrivateFile,
+    writePrivateFileAtomically as writeSharedPrivateFileAtomically,
+} from './privateStateFiles.mjs';
 
 export { GPU_GRANT_STATE_DIRECTORY };
 export const GPU_GRANT_STATE_VERSION = 1;
@@ -855,105 +861,22 @@ function assertLock(identity, lock) {
     lock.assertHeld(identity.instance);
 }
 
+const GPU_STATE_FILES = Object.freeze({ subject: 'GPU grant state', stateError });
+
 function ensurePrivateDirectory(fsApi, target) {
-    try {
-        fsApi.mkdirSync(target, { mode: 0o700 });
-    } catch (error) {
-        if (error?.code !== 'EEXIST') throw stateError(`Unable to create GPU grant state directory: ${target}`, error);
-    }
-    const stat = fsApi.lstatSync(target);
-    if (stat.isSymbolicLink() || !stat.isDirectory()) {
-        throw stateError(`GPU grant state path is not a real directory: ${target}`);
-    }
-    const uid = currentUid();
-    if (uid !== null && stat.uid !== uid) {
-        throw stateError(`GPU grant state directory is not owned by the current user: ${target}`);
-    }
-    fsApi.chmodSync(target, 0o700);
+    return ensureSharedPrivateDirectory(fsApi, target, GPU_STATE_FILES);
 }
 
 function assertPrivateDirectoryIfPresent(fsApi, target) {
-    let stat;
-    try {
-        stat = fsApi.lstatSync(target);
-    } catch (error) {
-        if (error?.code === 'ENOENT') return false;
-        throw stateError(`Unable to inspect GPU grant state directory: ${target}`, error);
-    }
-    if (stat.isSymbolicLink() || !stat.isDirectory()) {
-        throw stateError(`GPU grant state path is not a real directory: ${target}`);
-    }
-    const uid = currentUid();
-    if (uid !== null && stat.uid !== uid) {
-        throw stateError(`GPU grant state directory is not owned by the current user: ${target}`);
-    }
-    if ((stat.mode & 0o022) !== 0) {
-        throw stateError(`GPU grant state directory must not be group- or world-writable: ${target}`);
-    }
-    return true;
+    return assertSharedPrivateDirectoryIfPresent(fsApi, target, GPU_STATE_FILES);
 }
 
 function readPrivateFile(fsApi, target, maxBytes, label) {
-    let descriptor;
-    try {
-        descriptor = fsApi.openSync(
-            target,
-            fsApi.constants.O_RDONLY | fsApi.constants.O_NOFOLLOW | fsApi.constants.O_NONBLOCK,
-        );
-    } catch (error) {
-        if (error?.code === 'ENOENT') return null;
-        throw stateError(`${label} must be a readable non-symlink file: ${target}`, error);
-    }
-    try {
-        const before = fsApi.fstatSync(descriptor);
-        if (!before.isFile() || before.nlink !== 1) {
-            throw stateError(`${label} must be one non-linked regular file: ${target}`);
-        }
-        const uid = currentUid();
-        if (uid !== null && before.uid !== uid) throw stateError(`${label} must be owned by the current user: ${target}`);
-        if ((before.mode & 0o077) !== 0) throw stateError(`${label} must be private to the current user (mode 0600): ${target}`);
-        if (before.size > maxBytes) throw stateError(`${label} exceeds ${maxBytes} bytes: ${target}`);
-        const bytes = fsApi.readFileSync(descriptor);
-        const after = fsApi.fstatSync(descriptor);
-        if (bytes.length !== before.size || after.size !== before.size
-            || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) {
-            throw stateError(`${label} changed while being read: ${target}`);
-        }
-        return bytes;
-    } finally {
-        fsApi.closeSync(descriptor);
-    }
+    return readSharedPrivateFile(fsApi, target, maxBytes, label, GPU_STATE_FILES);
 }
 
 function writePrivateFileAtomically(fsApi, directory, target, content, beforeRename) {
-    try {
-        const existing = fsApi.lstatSync(target);
-        if (!existing.isFile() || existing.isSymbolicLink()) {
-            throw stateError(`Refusing to replace a non-regular GPU grant state path: ${target}`);
-        }
-    } catch (error) {
-        if (error?.code !== 'ENOENT') throw error;
-    }
-    const temporary = path.join(directory, `.${path.basename(target)}.${crypto.randomUUID()}.tmp`);
-    let descriptor;
-    try {
-        descriptor = fsApi.openSync(
-            temporary,
-            fsApi.constants.O_WRONLY | fsApi.constants.O_CREAT | fsApi.constants.O_EXCL | fsApi.constants.O_NOFOLLOW,
-            0o600,
-        );
-        fsApi.writeFileSync(descriptor, content);
-        fsApi.fsyncSync(descriptor);
-        fsApi.closeSync(descriptor);
-        descriptor = undefined;
-        beforeRename();
-        fsApi.renameSync(temporary, target);
-    } finally {
-        if (descriptor !== undefined) fsApi.closeSync(descriptor);
-        try { fsApi.unlinkSync(temporary); } catch (error) {
-            if (error?.code !== 'ENOENT') throw error;
-        }
-    }
+    return writeSharedPrivateFileAtomically(fsApi, directory, target, content, beforeRename, GPU_STATE_FILES);
 }
 
 /**
