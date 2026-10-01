@@ -182,6 +182,17 @@ export function overridePolicyFromStored(entry, envelope) {
     return Object.keys(resources).length ? { resources } : null;
 }
 
+/** The stored entry's fields as refusal request entries (source: settings). */
+export function storedRequestedLimits(entry) {
+    const requested = [];
+    if (entry?.memoryPercent !== undefined) requested.push({ field: 'memory', value: `${entry.memoryPercent}%`, source: 'settings' });
+    if (entry?.cpus !== undefined) requested.push({ field: 'cpus', value: String(entry.cpus), source: 'settings' });
+    if (entry?.gpu !== undefined) {
+        requested.push({ field: 'gpu', value: `${entry.gpu?.smPercent ?? '?'}/${entry.gpu?.vramPercent ?? '?'} percent`, source: 'settings' });
+    }
+    return requested;
+}
+
 /**
  * Resolve one stored entry for admission: either the override policy or the
  * exact typed problem (reason code, reason, fix and the stored request) that
@@ -194,14 +205,9 @@ export function resolveStoredOverride(entry, envelope, { ref = 'REPO/AGENT' } = 
         return Object.freeze({ policy: overridePolicyFromStored(entry, envelope), problem: null });
     } catch (error) {
         if (!(error instanceof LimitResolutionError)) throw error;
-        const requested = [];
-        if (error.field === 'gpu') {
-            requested.push({ field: 'gpu', value: `${entry.gpu?.smPercent ?? '?'}/${entry.gpu?.vramPercent ?? '?'} percent`, source: 'settings' });
-        } else if (error.field === 'cpus') {
-            requested.push({ field: 'cpus', value: String(entry.cpus), source: 'settings' });
-        } else if (error.field === 'memoryPercent') {
-            requested.push({ field: 'memory', value: `${entry.memoryPercent}%`, source: 'settings' });
-        }
+        // Every stored field replaces its declared value, so the refusal lists
+        // the stored values (never a manifest value the entry overrides).
+        const requested = storedRequestedLimits(entry);
         if (error.code === 'gpu_sharing_unavailable') {
             return Object.freeze({
                 policy: null,
@@ -210,6 +216,19 @@ export function resolveStoredOverride(entry, envelope, { ref = 'REPO/AGENT' } = 
                     reason: 'GPU sharing is not available in this release, so the stored GPU share cannot be enforced.',
                     fix: `Clear the GPU share in Settings, or run ploinky limits clear --agent ${ref} on the host `
                         + '(this also clears its CPU/RAM override). CPU/RAM controls remain separately available.',
+                    requested,
+                }),
+            });
+        }
+        if (error.code === 'controller_unavailable') {
+            // An unknown envelope is not an exceeded one.
+            return Object.freeze({
+                policy: null,
+                problem: Object.freeze({
+                    reasonCode: 'envelope_unknown',
+                    reason: `The Box resource envelope is unknown, so the stored hardware limit cannot be resolved: ${String(error.message).slice(0, 512)}.`,
+                    fix: 'On the host run ploinky limits status, repair the reported prerequisite, then ploinky restart; '
+                        + `or clear the stored limit in Settings or with ploinky limits clear --agent ${ref} on the host.`,
                     requested,
                 }),
             });

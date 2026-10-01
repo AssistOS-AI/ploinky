@@ -15,6 +15,7 @@ import {
     validateHardwareOutcome,
 } from './errors.mjs';
 import { readBoxHardwareContext } from './context.mjs';
+import { resolveStoredOverride, storedRequestedLimits } from './resolve.mjs';
 
 export const HARDWARE_RESOURCE_FIELDS = Object.freeze(['memory', 'cpus', 'pidsLimit']);
 const LAYERS = Object.freeze([
@@ -322,25 +323,33 @@ export function buildDirectRefusal({ key, ref, alias = null, refusalParts, input
  */
 export function interactiveHardwareRefusal({ manifest, profileConfig = null, ref, key, alias = null, context = null }) {
     const stored = context?.gate === 'on' && context.overrides instanceof Map ? context.overrides.get(ref) || null : null;
-    const storedPolicy = stored
-        ? { resources: { ...(stored.cpus !== undefined ? { cpus: String(stored.cpus) } : {}), ...(stored.memoryPercent !== undefined ? { memory: `${stored.memoryPercent}%` } : {}) } }
-        : null;
-    const requested = requestedHardwareLimits({
+    const declared = requestedHardwareLimits({
         manifestPolicy: manifest?.llmRuntime?.runtimePolicy || null,
         profilePolicy: profileConfig?.llmRuntime?.runtimePolicy || null,
-        overridePolicy: storedPolicy,
     });
-    if (!hasHardwareRequest(requested)) return null;
+    // Every stored field (a GPU share included) replaces its declared value.
+    const storedRequested = stored ? storedRequestedLimits(stored) : [];
+    const requested = [
+        ...declared.filter((entry) => !storedRequested.some((storedEntry) => storedEntry.field === entry.field)),
+        ...storedRequested,
+    ];
+    if (!requested.length) return null;
+    // A stored GPU share is refused with the same reason and fix as managed
+    // admission gives it; any other limit cannot be applied by this runtime.
+    const storedProblem = stored ? resolveStoredOverride(stored, context?.envelope, { ref }).problem : null;
+    const refusalParts = storedProblem?.reasonCode === 'gpu_sharing_unavailable'
+        ? { reasonCode: storedProblem.reasonCode, reason: storedProblem.reason, fix: storedProblem.fix, requested }
+        : {
+            reasonCode: 'interactive_runtime',
+            reason: `This runtime cannot apply ${orderedRequested(requested).map((entry) => entry.field).join(', ')}.`,
+            fix: 'Use the managed container lifecycle, or remove the limit. For host lite sandboxes, disable the lite sandbox before starting the container runtime.',
+            requested,
+        };
     return buildDirectRefusal({
         key,
         ref,
         alias,
-        refusalParts: {
-            reasonCode: 'interactive_runtime',
-            reason: `This runtime cannot apply ${requested.map((entry) => entry.field).join(', ')}.`,
-            fix: 'Use the managed container lifecycle, or remove the limit. For host lite sandboxes, disable the lite sandbox before starting the container runtime.',
-            requested,
-        },
+        refusalParts,
         inputFingerprint: hex64({ schema: 1, interactive: true, ref, requested }),
     });
 }
