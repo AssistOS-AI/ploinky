@@ -344,6 +344,7 @@ export function buildRequiredCaseManifest() {
         ]),
         ...leaves(L, 'p1-ram', 'local-llm/tests/ploinky-budget-admission.test.mjs', [
             'LL.controller-zero-no-launch', 'LL.controller-unknown-no-launch', 'LL.controller-release-retry',
+            'LL.controller-limit-absent-admitted', 'LL.controller-limit-unreadable-no-launch',
             ...llRamIds(),
         ]),
         ...leaves(P, 'p2', unit('hardwareLimitsRoutes.test.mjs'), [
