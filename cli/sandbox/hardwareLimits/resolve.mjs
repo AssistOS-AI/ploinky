@@ -152,12 +152,78 @@ export function resolveEffectiveLimits({ declared = {}, override = null, envelop
 }
 
 // The operator override as a runtime-policy layer (the final policy layer).
+// CPU must lie within the CURRENT envelope (plan §3 Bounds): a stored value
+// above it is refused at admission, never rendered. GPU shares are not part
+// of this release (P1), so a stored GPU entry is refused, never ignored (U4).
 export function overridePolicyFromStored(entry, envelope) {
     if (!entry) return null;
+    if (entry.gpu !== undefined) {
+        throw new LimitResolutionError('GPU shares cannot be enforced in this release', {
+            code: 'gpu_sharing_unavailable', field: 'gpu', status: 409,
+        });
+    }
     const resources = {};
-    if (entry.cpus !== undefined) resources.cpus = String(entry.cpus);
+    if (entry.cpus !== undefined) {
+        const cpus = Number(entry.cpus);
+        if (!Number.isFinite(cpus) || cpus < MIN_CPUS) {
+            throw new LimitResolutionError(`cpus ${entry.cpus} is below the ${MIN_CPUS} minimum`, { field: 'cpus' });
+        }
+        if (!Number.isFinite(Number(envelope?.cpus)) || Number(envelope.cpus) <= 0) {
+            throw new LimitResolutionError('the Box CPU envelope is unknown', { code: 'controller_unavailable', field: 'cpus', status: 409 });
+        }
+        if (cpus > Number(envelope.cpus)) {
+            throw new LimitResolutionError(`cpus ${entry.cpus} exceeds the Box CPU envelope of ${envelope.cpus}`, {
+                code: 'exceeds_envelope', field: 'cpus',
+            });
+        }
+        resources.cpus = String(entry.cpus);
+    }
     if (entry.memoryPercent !== undefined) resources.memory = String(resolveMemoryPercent(entry.memoryPercent, envelope?.memoryBytes));
     return Object.keys(resources).length ? { resources } : null;
+}
+
+/**
+ * Resolve one stored entry for admission: either the override policy or the
+ * exact typed problem (reason code, reason, fix and the stored request) that
+ * refuses the agent. Deterministic for identical inputs, so a refused record
+ * stays current while nothing changed.
+ */
+export function resolveStoredOverride(entry, envelope, { ref = 'REPO/AGENT' } = {}) {
+    if (!entry) return Object.freeze({ policy: null, problem: null });
+    try {
+        return Object.freeze({ policy: overridePolicyFromStored(entry, envelope), problem: null });
+    } catch (error) {
+        if (!(error instanceof LimitResolutionError)) throw error;
+        const requested = [];
+        if (error.field === 'gpu') {
+            requested.push({ field: 'gpu', value: `${entry.gpu?.smPercent ?? '?'}/${entry.gpu?.vramPercent ?? '?'} percent`, source: 'settings' });
+        } else if (error.field === 'cpus') {
+            requested.push({ field: 'cpus', value: String(entry.cpus), source: 'settings' });
+        } else if (error.field === 'memoryPercent') {
+            requested.push({ field: 'memory', value: `${entry.memoryPercent}%`, source: 'settings' });
+        }
+        if (error.code === 'gpu_sharing_unavailable') {
+            return Object.freeze({
+                policy: null,
+                problem: Object.freeze({
+                    reasonCode: 'gpu_sharing_unavailable',
+                    reason: 'GPU sharing is not available in this release, so the stored GPU share cannot be enforced.',
+                    fix: `Clear the GPU share in Settings, or run ploinky limits clear --agent ${ref} on the host `
+                        + '(this also clears its CPU/RAM override). CPU/RAM controls remain separately available.',
+                    requested,
+                }),
+            });
+        }
+        return Object.freeze({
+            policy: null,
+            problem: Object.freeze({
+                reasonCode: 'exceeds_envelope',
+                reason: `The stored hardware limit cannot be resolved against this Box: ${String(error.message).slice(0, 512)}.`,
+                fix: `Change or clear the stored limit in Settings, or run ploinky limits clear --agent ${ref} on the host.`,
+                requested,
+            }),
+        });
+    }
 }
 
 function canonical(value) {

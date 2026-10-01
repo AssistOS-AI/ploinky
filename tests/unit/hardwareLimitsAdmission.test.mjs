@@ -189,3 +189,47 @@ test('A.d4-unlimited-baseline', (t) => {
     );
     assert.equal(runtimeCapabilityDigest(prepared.descriptor), runtimeCapabilityDigest(gateOff.descriptor));
 });
+
+function storedContext(entry, envelope = { cpus: 4, memoryBytes: 8 * 1024 * 1024 * 1024 }) {
+    return { ...PREPARED_ALL, overrides: new Map([['demo/worker', entry]]), envelope };
+}
+
+test('A.stored-gpu-refused', (t) => {
+    const box = inBox(t);
+    // U4 fail-closed: a stored GPU share (any source) cannot be enforced in P1.
+    for (const entry of [{ gpu: { smPercent: 50, vramPercent: 50 } }, { cpus: 1, gpu: { smPercent: 25, vramPercent: 30 } }]) {
+        const outcome = refusalOf(() => admitManifestRuntimeCapabilities({ container: 'node:20-alpine' }, {
+            ...box, agentId: 'demo/worker', instanceKey: 'ploinky_demo_worker_ws', runtime: 'podman', hardwareContext: storedContext(entry),
+        }));
+        assert.equal(outcome.reasonCode, 'gpu_sharing_unavailable');
+        assert.match(outcome.reason, /^GPU sharing is not available in this release, so the stored GPU share cannot be enforced\.$/);
+        assert.match(outcome.fix, /ploinky limits clear --agent demo\/worker on the host/);
+        assert.deepEqual(outcome.requested.map((requested) => [requested.field, requested.source]), [['gpu', 'settings']]);
+        // Metadata admission records the same refusal; nothing is rendered.
+        const metadata = admitManifestRuntimeCapabilities({ container: 'node:20-alpine' }, {
+            ...box, agentId: 'demo/worker', instanceKey: 'ploinky_demo_worker_ws', runtime: 'podman', hardwareContext: storedContext(entry), hardwareAdmission: 'metadata',
+        });
+        assert.equal(hardwareRefusalOf(metadata).reasonCode, 'gpu_sharing_unavailable');
+        assert.equal(metadata.descriptor.hardwarePlacement, undefined);
+    }
+});
+
+test('A.stored-cpus-above-envelope-refused', (t) => {
+    const box = inBox(t);
+    const admit = (envelope, hardwareAdmission = 'strict') => admitManifestRuntimeCapabilities({ container: 'node:20-alpine' }, {
+        ...box, agentId: 'demo/worker', instanceKey: 'ploinky_demo_worker_ws', runtime: 'podman',
+        hardwareContext: storedContext({ cpus: 3.5 }, envelope), hardwareAdmission,
+    });
+    // Within the current envelope the stored quota is rendered.
+    const within = admit({ cpus: 4, memoryBytes: 8 * 1024 ** 3 });
+    assert.deepEqual(renderRuntimePolicyArgs(within.descriptor, { runtime: 'podman' }).slice(0, 2), ['--cpus', '3.5']);
+    // The envelope shrinks below the stored value: refused with a fix, never rendered.
+    for (const envelope of [{ cpus: 2, memoryBytes: 8 * 1024 ** 3 }, null]) {
+        const outcome = refusalOf(() => admit(envelope));
+        assert.equal(outcome.reasonCode, 'exceeds_envelope');
+        assert.match(outcome.reason, envelope ? /cpus 3\.5 exceeds the Box CPU envelope of 2/ : /the Box CPU envelope is unknown/);
+        assert.match(outcome.fix, /ploinky limits clear --agent demo\/worker on the host\.$/);
+        assert.deepEqual(outcome.requested, [{ field: 'cpus', value: '3.5', source: 'settings' }]);
+        assert.equal(admit(envelope, 'metadata').descriptor.hardwarePlacement, undefined);
+    }
+});

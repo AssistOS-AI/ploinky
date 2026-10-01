@@ -259,7 +259,7 @@ export function buildRequiredCaseManifest() {
         ...leaves(P, 'p0', unit('hardwareLimitsAdmission.test.mjs'), [
             'A.manifest-memory', 'A.catalog-cpu', 'A.profile-pids', 'A.lite-enabled-absent', 'A.lite-enabled-false',
             'A.outside-box-unchanged', 'A.unlimited-unchanged', 'A.helper-exempt', 'A.d4-limited-refused',
-            'A.d4-unlimited-baseline',
+            'A.d4-unlimited-baseline', 'A.stored-gpu-refused', 'A.stored-cpus-above-envelope-refused',
         ]),
         ...leaves(P, 'p0', unit('hardwareLimitsOutcomes.test.mjs'), [
             'O.prelock-preflight-refusal', 'O.locked-preflight-refusal', 'O.defensive-preflight-refusal',
@@ -268,7 +268,8 @@ export function buildRequiredCaseManifest() {
             'O.enabled-extra', 'O.alias-identity', 'O.optional-no-wait-parent-ready',
             'O.optional-eligibility-asynchronous', 'O.optional-child-blocking-grandchild',
             'O.explicit-status-wait-blocked', 'O.no-synthetic-optional-wait', 'O.cycle-wait-kind',
-            'O.store-unknown-no-create',
+            'O.store-unknown-no-create', 'O.launch-refusal-blocks-dependants', 'O.launch-refusal-extra-contained',
+            'O.launch-nonhardware-still-throws',
         ]),
         ...leaves(P, 'p0', unit('hardwareLimitsAvailability.test.mjs'), [
             'AV.http', 'AV.sse', 'AV.websocket', 'AV.mcp', 'AV.private-caller', 'AV.private-target',
@@ -324,10 +325,11 @@ export function buildRequiredCaseManifest() {
         ]),
         ...leaves(P, 'p1', unit('hardwareLimitsDrift.test.mjs'), [
             'D.memory-swap-equal', 'D.cgroupfs-prefix', 'D.exempt-prefix-absent', 'D.readback-mismatch',
-            'D.precreate-change', 'D.prepublish-change', 'D.managed-reuse', 'D.host-none-reuse', 'D.graph-reuse',
+            'D.readback-page-rounding', 'D.readback-swap-accounting', 'D.precreate-change', 'D.prepublish-change',
+            'D.managed-reuse', 'D.host-none-reuse', 'D.graph-reuse',
             'D.llm-admitted-policy-reuse', 'D.one-replace-then-reuse', 'D.unrelated-token-no-replace',
             'D.unprepared-empty-hash', 'D.private-mount-boundaries', 'D.interactive-reuse-refused',
-            'D.interactive-create-refused',
+            'D.interactive-create-refused', 'D.memory-only-change-replaces-one', 'D.pids-only-change-replaces-one',
         ]),
         ...leaves(L, 'p1-ram', 'local-llm/tests/ploinky-budget.test.mjs', [
             'LL.raw-cpu-fractions', 'LL.cpu-warning-provenance', 'LL.cap-once', 'LL.known-zero', 'LL.unknown-distinct',

@@ -233,21 +233,55 @@ export function cleanupStaleLeaves({ fsApi = fs, cgroupRoot = CGROUP_ROOT, liveI
     return Object.freeze({ removed, retained });
 }
 
+// The kernel stores memory.max rounded down to its page size, so a declared
+// byte count such as 100000000 reads back as 99999744. Accept exactly that
+// rounding (never a larger value or a different limit).
+const PAGE_BYTES = 4096;
+const MAX_PAGE_ROUNDING = 65536;
+
+export function memoryLimitMatches(observed, expectedBytes) {
+    if (!/^\d+$/.test(String(observed ?? ''))) return false;
+    const actual = Number(observed);
+    const expected = Number(expectedBytes);
+    if (!Number.isSafeInteger(actual) || !Number.isSafeInteger(expected)) return false;
+    if (actual === expected) return true;
+    return actual < expected && expected - actual < MAX_PAGE_ROUNDING && actual % PAGE_BYTES === 0;
+}
+
+const SWAP_ACCOUNTING_REFUSAL = Object.freeze({
+    reasonCode: 'controller_unavailable',
+    reason: 'Swap accounting is unavailable: the agent cgroup has no memory.swap.max, so its memory limit cannot be '
+        + 'paired with an equal memory-and-swap limit and swap could extend the cap.',
+    fix: 'Enable cgroup v2 swap accounting for the memory controller on the host (on macOS inside the Podman machine), '
+        + 'then run ploinky restart. Ploinky will not change host boot settings.',
+});
+
 /**
  * Exact leaf readback after create/start (plan §8.1): memory.max equals the
- * rendered limit, memory.swap.max is 0 with a memory limit, cpu.max matches
- * the quota and pids.max the limit. An inspect field alone is never proof.
+ * rendered limit (allowing only the kernel's page rounding), memory.swap.max
+ * is 0 with a memory limit, cpu.max matches the quota and pids.max the limit.
+ * An inspect field alone is never proof. A missing memory.swap.max means swap
+ * accounting is unavailable and is reported as such.
  */
 export function verifyLeafLimits({ fsApi = fs, cgroupRoot = CGROUP_ROOT, leaf, expected }) {
     const directory = path.join(cgroupRoot, leaf);
     const problems = [];
-    const value = (name) => {
-        try { return String(fsApi.readFileSync(`${directory}/${name}`, 'utf8')).trim(); } catch (_) { return null; }
+    let refusal = null;
+    const read = (name) => {
+        try { return { value: String(fsApi.readFileSync(`${directory}/${name}`, 'utf8')).trim() }; } catch (error) { return { value: null, code: error?.code || 'EIO' }; }
     };
+    const value = (name) => read(name).value;
     if (!leaf.startsWith(`${AGENTS_CGROUP_PARENT}/`)) problems.push(`leaf ${leaf} is not under ${AGENTS_CGROUP_PARENT}`);
     if (expected.memoryBytes) {
-        if (value('memory.max') !== String(expected.memoryBytes)) problems.push(`memory.max is ${value('memory.max')}`);
-        if (value('memory.swap.max') !== '0') problems.push(`memory.swap.max is ${value('memory.swap.max')}`);
+        const memoryMax = value('memory.max');
+        if (!memoryLimitMatches(memoryMax, expected.memoryBytes)) problems.push(`memory.max is ${memoryMax}`);
+        const swap = read('memory.swap.max');
+        if (swap.value === null && swap.code === 'ENOENT') {
+            problems.push('memory.swap.max is absent (swap accounting unavailable)');
+            refusal = SWAP_ACCOUNTING_REFUSAL;
+        } else if (swap.value !== '0') {
+            problems.push(`memory.swap.max is ${swap.value}`);
+        }
     }
     if (expected.cpus) {
         const cpuMax = value('cpu.max');
@@ -259,14 +293,16 @@ export function verifyLeafLimits({ fsApi = fs, cgroupRoot = CGROUP_ROOT, leaf, e
     if (expected.pidsLimit) {
         if (value('pids.max') !== String(expected.pidsLimit)) problems.push(`pids.max is ${value('pids.max')}`);
     }
-    return Object.freeze({ ok: problems.length === 0, problems });
+    return Object.freeze({ ok: problems.length === 0, problems, refusal });
 }
 
 /**
  * After create/start of a hardware-placed agent: find its actual leaf from the
- * running process's cgroup and compare the applied values. Any disagreement
- * is a hardware refusal; the caller removes the candidate through its exact
- * ownership checks. The engine's own inspect fields are never the proof.
+ * running process's cgroup and compare the applied values. A process that is
+ * not running or whose cgroup cannot be observed is an ordinary start failure
+ * (no hardware refusal). Only an observed disagreement with the admitted
+ * limits is a hardware refusal; the caller removes the candidate through its
+ * exact ownership checks. The engine's own inspect fields are never the proof.
  */
 export function verifyLaunchedHardwareLimits({
     descriptor,
@@ -280,25 +316,31 @@ export function verifyLaunchedHardwareLimits({
 }) {
     const placement = descriptor?.hardwarePlacement;
     if (!placement) return null;
+    const notObserved = (detail) => {
+        const error = new Error(`the launched agent ${String(containerId).slice(0, 12)} is not running, so its limits could not be read back (${detail})`);
+        error.code = 'PLOINKY_AGENT_NOT_RUNNING';
+        return error;
+    };
     const inspected = query(runtime, ['container', 'inspect', '--format', '{{.State.Pid}}', containerId], { timeoutMs: 10_000 });
+    if (!inspected?.ok) throw notObserved('the container could not be inspected');
     const pid = Number(String(inspected?.stdout || '').trim());
-    let leaf = null;
-    if (inspected?.ok && Number.isSafeInteger(pid) && pid > 0) {
-        try {
-            leaf = cgroupPath(read(fsApi, `${procRoot}/${pid}/cgroup`));
-        } catch (_) {
-            leaf = null;
-        }
+    if (!Number.isSafeInteger(pid) || pid <= 0) throw notObserved('it has no running process');
+    let leaf;
+    try {
+        leaf = cgroupPath(read(fsApi, `${procRoot}/${pid}/cgroup`));
+    } catch (error) {
+        throw notObserved(`PID ${pid} is not visible (${error?.code || 'unreadable'})`);
     }
-    const readback = leaf
-        ? verifyLeafLimits({ fsApi, cgroupRoot, leaf, expected: placement.expected || {} })
-        : { ok: false, problems: ['the agent leaf cgroup could not be observed'] };
-    const problems = [...readback.problems];
-    if (!leaf || !leaf.startsWith(`${placement.cgroupParent}/`)) {
-        problems.push(`the agent runs in ${leaf || 'an unknown cgroup'}, not under ${placement.cgroupParent}`);
+    if (!leaf) throw notObserved(`PID ${pid} has no unified cgroup entry`);
+    if (!leaf.startsWith(`${placement.cgroupParent}/`)) {
+        throw refuse(`the applied limits disagree with the admitted ones (the agent runs in ${leaf}, not under ${placement.cgroupParent})`);
     }
-    if (!readback.ok || problems.length) {
-        throw refuse(`the applied limits disagree with the admitted ones (${problems.join('; ')})`);
+    const readback = verifyLeafLimits({ fsApi, cgroupRoot, leaf, expected: placement.expected || {} });
+    if (!readback.ok) {
+        // Missing swap accounting has its own reason and fix when it is the
+        // only disagreement.
+        if (readback.refusal && readback.problems.length === 1) throw refuse(readback.refusal.reason, readback.refusal);
+        throw refuse(`the applied limits disagree with the admitted ones (${readback.problems.join('; ')})`);
     }
     return Object.freeze({ leaf, verified: true });
 }

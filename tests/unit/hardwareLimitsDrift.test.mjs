@@ -3,11 +3,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 import { BOX_MARKER_CONTENT } from '../../ploinky-box/constants.mjs';
 import {
     admitManifestRuntimeCapabilities,
     assertHardwareAdmissionCurrent,
+    createHardwareLaunchGuard,
     hardwareCommandPrefix,
     hardwareLimitsHashOf,
     limitsHashReuseReason,
@@ -46,7 +49,8 @@ function inBox(t) {
 function prepared(overrides = new Map(), extra = {}) {
     return {
         gate: 'on', prepared: true, backendReady: true, controllers: [...ALL], storeState: 'valid',
-        storeToken: { epoch: 'epoch-1', revision: 1 }, overrides, ...extra,
+        storeToken: { epoch: 'epoch-1', revision: 1 }, overrides,
+        envelope: { cpus: 8, memoryBytes: 16 * 1024 * 1024 * 1024 }, ...extra,
     };
 }
 
@@ -103,8 +107,15 @@ test('D.cgroupfs-prefix', (t) => {
     const calls = [];
     withEnginePrefix((runtime, args) => calls.push([runtime, args]), CGROUPFS_ENGINE_PREFIX)('podman', ['start', 'id']);
     assert.deepEqual(calls, [['podman', ['--cgroup-manager=cgroupfs', 'start', 'id']]]);
-    // Agent create and start both go through the adapter.
-    assert.match(source('cli/sandbox/docker/agentServiceManager.js'), /engineCommandArgs\(hardwareCommandPrefix\(runtimeAdmission\.descriptor\), createArgs\)/);
+    // Agent create goes through the launch guard: the recheck passes, then the
+    // engine prefix precedes the create subcommand.
+    const guard = createHardwareLaunchGuard(admit(box, LIMITED), { key: 'ploinky_demo_worker', ref: 'demo/worker', hardwareContext: prepared() });
+    assert.deepEqual(guard.createArgs(['create', '--name', 'x', 'image']), ['--cgroup-manager=cgroupfs', 'create', '--name', 'x', 'image']);
+    assert.deepEqual(guard.commandPrefix(), ['--cgroup-manager=cgroupfs']);
+    const unlimited = createHardwareLaunchGuard(admit(box, UNLIMITED, { hardwareContext: { gate: 'off', storeState: 'none' } }), {
+        key: 'ploinky_demo_worker', ref: 'demo/worker', hardwareContext: { gate: 'off', storeState: 'none' },
+    });
+    assert.deepEqual(unlimited.createArgs(['create', 'x']), ['create', 'x']);
     assert.match(source('cli/sandbox/networkLifecycle.js'), /engineCommandArgs\(commandPrefix, \['start', /);
 });
 
@@ -139,74 +150,133 @@ function launchedFixture(values) {
     return fake;
 }
 
+function launchGuard(box, manifest = LIMITED, { hardwareContext = prepared(), fake } = {}) {
+    const admission = admit(box, manifest);
+    return createHardwareLaunchGuard(admission, {
+        key: 'ploinky_demo_worker', ref: 'demo/worker', hardwareContext, fsApi: fake,
+        query: (_command, args) => (args.includes('{{.State.Pid}}') ? launchGuard.inspect : { ok: false, stdout: '' }),
+    });
+}
+launchGuard.inspect = { ok: true, stdout: '321\n' };
+
+function withInspect(result, fn) {
+    const previous = launchGuard.inspect;
+    launchGuard.inspect = result;
+    try { return fn(); } finally { launchGuard.inspect = previous; }
+}
+
+const EXACT_LEAF = Object.freeze({
+    'memory.max': String(512 * 1024 * 1024), 'memory.swap.max': '0', 'cpu.max': '50000 100000', 'pids.max': '128',
+});
+
 test('D.readback-mismatch', (t) => {
     const box = inBox(t);
-    const descriptor = admit(box, LIMITED).descriptor;
-    const exact = {
-        'memory.max': String(512 * 1024 * 1024), 'memory.swap.max': '0', 'cpu.max': '50000 100000', 'pids.max': '128',
-    };
-    // The same refusal construction the launch path uses.
-    const refuse = (reason) => new HardwareLimitsError(buildDirectRefusal({
-        key: 'ploinky_demo_worker',
-        ref: 'demo/worker',
-        refusalParts: {
-            reasonCode: 'unprepared',
-            reason: `This Box is not prepared for hardware limits: ${reason}.`,
-            fix: 'On the host run ploinky limits status, repair the reported prerequisite, then ploinky restart.',
-            requested: descriptor.hardwareRequest,
-        },
-        inputFingerprint: '0'.repeat(64),
-    }));
-    const run = (fake, pid = 321) => verifyLaunchedHardwareLimits({
-        descriptor, containerId: 'f'.repeat(64), fsApi: fake, refuse,
-        query: () => ({ ok: true, stdout: `${pid}\n` }),
-    });
-    assert.equal(run(launchedFixture(exact)).verified, true);
-    for (const [name, value] of [['memory.max', 'max'], ['memory.swap.max', 'max'], ['cpu.max', 'max 100000'], ['pids.max', '4096']]) {
-        assert.throws(() => run(launchedFixture({ ...exact, [name]: value })), (error) => {
-            assert.equal(findHardwareOutcome(error)?.code, HARDWARE_UNENFORCEABLE);
+    const launched = (fake) => launchGuard(box, LIMITED, { fake }).afterLaunch({ containerId: 'f'.repeat(64) });
+    assert.equal(launched(launchedFixture(EXACT_LEAF)), undefined, 'the exact leaf is accepted');
+    // An observed mismatch is a typed hardware refusal for this exact instance.
+    for (const [name, value] of [['memory.max', 'max'], ['memory.max', String(256 * 1024 * 1024)], ['memory.swap.max', 'max'], ['cpu.max', 'max 100000'], ['pids.max', '4096']]) {
+        assert.throws(() => launched(launchedFixture({ ...EXACT_LEAF, [name]: value })), (error) => {
+            const outcome = findHardwareOutcome(error);
+            assert.equal(outcome?.code, HARDWARE_UNENFORCEABLE);
+            assert.equal(outcome.key, 'ploinky_demo_worker');
             assert.match(error.message, new RegExp(name.replace('.', '\\.')));
             return true;
-        }, name);
+        }, `${name}=${value}`);
     }
-    // A process outside /ploinky/agents (inspect success alone is not proof).
-    assert.throws(() => run(launchedFixture(exact), 654), /not under \/ploinky\/agents/);
-    assert.throws(() => run(launchedFixture(exact), 999), /could not be observed/);
-    // A disagreement removes the candidate through the existing exact cleanup.
-    const manager = source('cli/sandbox/docker/agentServiceManager.js');
-    const verify = manager.indexOf('verifyLaunchedHardwareLimits({');
-    const cleanup = manager.indexOf('removeExactGenerationCandidate({', verify);
-    assert.ok(verify > 0 && cleanup > verify);
-    assert.ok(manager.slice(verify, cleanup).includes('} catch (error) {'));
+    // A process outside /ploinky/agents is a refusal too (inspect success alone is not proof).
+    const outside = launchedFixture(EXACT_LEAF);
+    outside.placePid(321, '/ploinky/system/libpod-def');
+    assert.throws(() => launched(outside), (error) => /not under \/ploinky\/agents/.test(error.message) && findHardwareOutcome(error)?.code === HARDWARE_UNENFORCEABLE);
+    // R1: a process that is not running, or whose PID is not visible, is an
+    // ordinary start failure: no hardware outcome, no "not prepared" text.
+    for (const [label, inspect, pid] of [
+        ['exited (pid 0)', { ok: true, stdout: '0\n' }, null],
+        ['inspect failed', { ok: false, stdout: '' }, null],
+        ['pid not visible', { ok: true, stdout: '999\n' }, null],
+    ]) {
+        withInspect(inspect, () => assert.throws(() => launched(launchedFixture(EXACT_LEAF)), (error) => {
+            assert.equal(findHardwareOutcome(error), null, label);
+            assert.equal(error.code, 'PLOINKY_AGENT_NOT_RUNNING', label);
+            assert.doesNotMatch(error.message, /not prepared/, label);
+            return true;
+        }, label));
+        void pid;
+    }
+});
+
+test('D.readback-page-rounding', (t) => {
+    const box = inBox(t);
+    // R2: the kernel rounds memory.max down to its page size.
+    for (const [declared, expectedBytes, readback] of [
+        ['100000000', 100000000, '99999744'],
+        ['1000k', 1024000, '1024000'],
+    ]) {
+        const manifest = { container: 'node:20-alpine', llmRuntime: { runtimePolicy: { resources: { memory: declared } } } };
+        const admission = admit(box, manifest);
+        assert.equal(admission.descriptor.hardwarePlacement.expected.memoryBytes, expectedBytes);
+        const fake = launchedFixture({ 'memory.max': readback, 'memory.swap.max': '0' });
+        assert.equal(launchGuard(box, manifest, { fake }).afterLaunch({ containerId: 'f'.repeat(64) }), undefined, declared);
+        // The limits hash stays the same across restarts (declared bytes, not the readback).
+        assert.equal(hardwareLimitsHashOf(admit(box, manifest).descriptor), hardwareLimitsHashOf(admission.descriptor));
+    }
+    // A genuinely different value is refused: larger, more than the page rounding below, or not page aligned.
+    const manifest = { container: 'node:20-alpine', llmRuntime: { runtimePolicy: { resources: { memory: '100000000' } } } };
+    for (const readback of ['100000256', '99934208', '99999745', String(64 * 1024 * 1024)]) {
+        const fake = launchedFixture({ 'memory.max': readback, 'memory.swap.max': '0' });
+        assert.throws(() => launchGuard(box, manifest, { fake }).afterLaunch({ containerId: 'f'.repeat(64) }),
+            (error) => findHardwareOutcome(error)?.code === HARDWARE_UNENFORCEABLE, readback);
+    }
+});
+
+test('D.readback-swap-accounting', (t) => {
+    const box = inBox(t);
+    // R3: no memory.swap.max at all means swap accounting is unavailable.
+    const fake = launchedFixture({ 'memory.max': String(512 * 1024 * 1024), 'cpu.max': '50000 100000', 'pids.max': '128' });
+    assert.throws(() => launchGuard(box, LIMITED, { fake }).afterLaunch({ containerId: 'f'.repeat(64) }), (error) => {
+        const outcome = findHardwareOutcome(error);
+        assert.equal(outcome.code, HARDWARE_UNENFORCEABLE);
+        assert.equal(outcome.reasonCode, 'controller_unavailable');
+        assert.match(outcome.reason, /^Swap accounting is unavailable: the agent cgroup has no memory\.swap\.max/);
+        assert.match(outcome.fix, /swap accounting .* then run ploinky restart/);
+        assert.doesNotMatch(error.message, /memory\.swap\.max is null/);
+        return true;
+    });
 });
 
 test('D.precreate-change', (t) => {
     const box = inBox(t);
     const admission = admit(box, LIMITED);
-    assert.doesNotThrow(() => assertHardwareAdmissionCurrent(admission, { hardwareContext: prepared() }));
-    inputChanged(() => assertHardwareAdmissionCurrent(admission, { hardwareContext: prepared(new Map(), { controllers: ['cpu', 'pids'] }) }));
-    inputChanged(() => assertHardwareAdmissionCurrent(admission, { hardwareContext: prepared(new Map([['demo/worker', { cpus: '0.25' }]])) }));
-    inputChanged(() => assertHardwareAdmissionCurrent(admission, { hardwareContext: prepared(new Map(), { backendReady: false }) }));
-    // The recheck sits immediately before the create spawn.
-    const manager = source('cli/sandbox/docker/agentServiceManager.js');
-    const check = manager.indexOf('assertHardwareAdmissionCurrent(runtimeAdmission);');
-    const create = manager.indexOf('const res = spawnSync(runtime, createArgs', check);
-    assert.ok(check > 0 && create > check);
-    assert.equal(manager.slice(check, create).includes('spawnSync('), false);
+    const guard = (hardwareContext) => createHardwareLaunchGuard(admission, { key: 'ploinky_demo_worker', ref: 'demo/worker', hardwareContext });
+    // Unchanged inputs yield the prefixed create argv.
+    assert.deepEqual(guard(prepared()).createArgs(['create', 'x']), ['--cgroup-manager=cgroupfs', 'create', 'x']);
+    // Any changed hardware input refuses before a create argv exists.
+    for (const changed of [
+        prepared(new Map(), { controllers: ['cpu', 'pids'] }),
+        prepared(new Map([['demo/worker', { cpus: '0.25' }]])),
+        prepared(new Map(), { backendReady: false }),
+    ]) {
+        let argv = null;
+        inputChanged(() => { argv = guard(changed).createArgs(['create', 'x']); });
+        assert.equal(argv, null, 'no create argv for a stale admission');
+    }
 });
 
 test('D.prepublish-change', (t) => {
     const box = inBox(t);
     const admission = admit(box, LIMITED);
-    inputChanged(() => assertHardwareAdmissionCurrent(admission, { hardwareContext: { gate: 'off', storeState: 'none' } }));
-    inputChanged(() => assertHardwareAdmissionCurrent(admission, { hardwareContext: prepared(new Map(), { storeState: 'unreadable' }) }));
-    // A second recheck follows the launched-limit readback and precedes the
-    // candidate's return for route publication (failures reach exact cleanup).
-    const manager = source('cli/sandbox/docker/agentServiceManager.js');
-    const verify = manager.indexOf('verifyLaunchedHardwareLimits({');
-    const recheck = manager.indexOf('assertHardwareAdmissionCurrent(runtimeAdmission);', verify);
-    const cleanup = manager.indexOf('} catch (error) {', verify);
-    assert.ok(verify > 0 && recheck > verify && cleanup > recheck);
+    const guard = (hardwareContext, fake) => createHardwareLaunchGuard(admission, {
+        key: 'ploinky_demo_worker', ref: 'demo/worker', hardwareContext, fsApi: fake,
+        query: () => ({ ok: true, stdout: '321\n' }),
+    });
+    assert.equal(guard(prepared(), launchedFixture(EXACT_LEAF)).afterLaunch({ containerId: 'f'.repeat(64) }), undefined);
+    // The leaf is correct, but the inputs changed before publication.
+    inputChanged(() => guard({ gate: 'off', storeState: 'none' }, launchedFixture(EXACT_LEAF)).afterLaunch({ containerId: 'f'.repeat(64) }));
+    inputChanged(() => guard(prepared(new Map(), { storeState: 'unreadable' }), launchedFixture(EXACT_LEAF)).afterLaunch({ containerId: 'f'.repeat(64) }));
+    // The readback runs first: a mismatched leaf is reported as the refusal.
+    assert.throws(() => guard({ gate: 'off', storeState: 'none' }, launchedFixture({ ...EXACT_LEAF, 'pids.max': '7' })).afterLaunch({ containerId: 'f'.repeat(64) }),
+        (error) => findHardwareOutcome(error)?.code === HARDWARE_UNENFORCEABLE);
+    // An adopted runtime is not read back again, but is still rechecked.
+    inputChanged(() => guard({ gate: 'off', storeState: 'none' }, launchedFixture({})).afterLaunch({ containerId: 'f'.repeat(64), adopted: true }));
 });
 
 test('D.managed-reuse', (t) => {
@@ -290,13 +360,76 @@ test('D.llm-admitted-policy-reuse', (t) => {
     assert.equal(reuse.policyHash, creation.policyHash);
     // Without the admitted policy the probe would hash a different policy and restart every start.
     assert.notEqual(probe({}).reuseHash, creation.reuseHash);
-    // Both reuse callers pass the admitted policy and the creation's resolved selection/hardware.
-    const manager = source('cli/sandbox/docker/agentServiceManager.js');
-    assert.match(manager, /resolvedSelection: serviceLlmAdmissionContext\.startup\?\.selection,\s+resolvedHardware: serviceLlmAdmissionContext\.startup\?\.hardware,\s+admittedRuntimePolicy: serviceAdmission\.descriptor\.runtimePolicy/);
-    const util = source('cli/commands/workspaceUtil.js');
-    assert.match(util, /admittedRuntimePolicy: admittedDescriptor\.runtimePolicy/);
-    assert.match(util, /resolvedSelection: admitted\.llmStartup\.selection,\s+resolvedHardware: admitted\.llmStartup\.hardware/);
+    // The production graph reuse caller passes the admitted policy and the
+    // creation's resolved selection/hardware, so a stored override does not
+    // restart the LLM agent; a runtime created without them is replaced.
+    const graph = graphReuse(t, box, {
+        hardwareContext: serializable(prepared(new Map([['demo/llm', { cpus: '1.5' }]]))),
+        llmEnv: env,
+        agents: [
+            { key: 'ploinky_demo_llm', ref: 'demo/llm', manifest },
+            { key: 'ploinky_demo_llm_legacy', ref: 'demo/llm', manifest, running: { admitted: false } },
+        ],
+    });
+    assert.deepEqual(graph.probes.ploinky_demo_llm, ['admittedRuntimePolicy', 'resolvedHardware', 'resolvedSelection']);
+    assert.equal(graph.results.ploinky_demo_llm, '', 'creation and graph reuse agree');
+    assert.equal(graph.results.ploinky_demo_llm_legacy, 'llmReuseHashChanged');
 });
+
+// Run the production graph reuse decision in a fresh process bound to a
+// temporary workspace (persisted Router port, data paths).
+function graphReuse(t, box, spec) {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-graph-reuse-'));
+    t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+    fs.mkdirSync(path.join(workspace, '.ploinky'), { recursive: true });
+    fs.writeFileSync(path.join(workspace, '.ploinky', 'routing.json'), JSON.stringify({ port: 8080, routes: {} }));
+    const specPath = path.join(workspace, 'spec.json');
+    fs.writeFileSync(specPath, JSON.stringify({ markerPath: box.boxMarkerOptions.markerPath, ...spec }));
+    const probe = fileURLToPath(new URL('../hardware-limits/graphReuseProbe.mjs', import.meta.url));
+    const result = spawnSync(process.execPath, [probe, specPath], {
+        cwd: workspace,
+        encoding: 'utf8',
+        env: { ...process.env, PLOINKY_WORKSPACE_ROOT: workspace },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    return JSON.parse(result.stdout.trim().split('\n').pop());
+}
+
+function serializable(context) {
+    return { ...context, overrides: Object.fromEntries(context.overrides) };
+}
+
+const EDITED = Object.freeze({
+    memory: { container: 'node:20-alpine', llmRuntime: { runtimePolicy: { resources: { memory: '768m', cpus: 0.5, pidsLimit: 128 } } } },
+    pids: { container: 'node:20-alpine', llmRuntime: { runtimePolicy: { resources: { memory: '512m', cpus: 0.5, pidsLimit: 256 } } } },
+});
+
+for (const field of ['memory', 'pids']) {
+    test(`D.${field}-only-change-replaces-one`, (t) => {
+        const box = inBox(t);
+        // Two running non-LLM limited agents; only the first agent's declared
+        // ${field} changes. Exactly that agent is replaced; the other is reused.
+        const graph = graphReuse(t, box, {
+            hardwareContext: serializable(prepared()),
+            agents: [
+                { key: 'ploinky_demo_changed', ref: 'demo/changed', manifest: EDITED[field], running: { manifest: LIMITED } },
+                { key: 'ploinky_demo_same', ref: 'demo/same', manifest: LIMITED },
+            ],
+        });
+        assert.deepEqual(graph.results, { ploinky_demo_changed: 'limitsHashChanged', ploinky_demo_same: '' });
+        // The same change as a stored policy (memory) is covered as well.
+        if (field === 'memory') {
+            const stored = graphReuse(t, box, {
+                hardwareContext: serializable(prepared(new Map([['demo/changed', { memoryPercent: 10 }]]))),
+                agents: [
+                    { key: 'ploinky_demo_changed', ref: 'demo/changed', manifest: LIMITED, running: { hardwareContext: serializable(prepared()) } },
+                    { key: 'ploinky_demo_same', ref: 'demo/same', manifest: LIMITED, running: { hardwareContext: serializable(prepared()) } },
+                ],
+            });
+            assert.deepEqual(stored.results, { ploinky_demo_changed: 'limitsHashChanged', ploinky_demo_same: '' });
+        }
+    });
+}
 
 test('D.one-replace-then-reuse', (t) => {
     const box = inBox(t);

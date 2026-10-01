@@ -120,6 +120,7 @@ import {
   HardwareLimitsError,
   findHardwareOutcome,
   formatHardwareOutcome,
+  validateHardwareOutcome,
 } from '../sandbox/hardwareLimits/errors.mjs';
 import {
   buildAvailabilityProjection,
@@ -1036,7 +1037,7 @@ function removeGraphContainerForRecreate(containerName, label, predecessorRecord
   }
 }
 
-function graphNodeRuntimeReplacementReason(plan, {
+export function graphNodeRuntimeReplacementReason(plan, {
   containerExistsImpl = dockerSvc.containerExists,
   isContainerRunningImpl = dockerSvc.isContainerRunning,
   isSandboxRunningImpl = isBwrapProcessRunning,
@@ -1380,6 +1381,218 @@ export function classifyWorkspaceGraphAvailability(graph, admissions, { explicit
   const byNodeId = new Map();
   for (const record of admissions || []) byNodeId.set(record.nodeId, classified.get(record.key));
   return Object.freeze({ byKey: classified, byNodeId, edges });
+}
+
+/**
+ * The start's current availability: graph metadata outcomes plus hardware
+ * refusals raised at launch (a readback refusal or the strict admission
+ * recheck). A launch refusal is contained like a metadata one (U10/U14/U15,
+ * §9.4): it is recorded, and its blocking and explicit-status-wait consumers
+ * are reclassified as blocked so they are never launched.
+ */
+export function createGraphAvailabilityTracker(graph, admissions, { explicitWaits = [] } = {}) {
+  const launchRefusals = new Map();
+  let current = classifyWorkspaceGraphAvailability(graph, admissions, { explicitWaits });
+  const admittedKeys = new Set((admissions || []).map((record) => record.key));
+  const unavailable = (entry) => Boolean(entry && entry.state !== 'eligible');
+  const unavailableEntries = () => [...current.byNodeId]
+    .filter(([, entry]) => unavailable(entry))
+    .map(([nodeId, entry]) => ({ nodeId, key: entry.outcome.key, outcome: entry.outcome }));
+  return Object.freeze({
+    outcomeForNode(nodeId) {
+      const entry = current.byNodeId.get(nodeId);
+      return unavailable(entry) ? entry.outcome : null;
+    },
+    outcomeForKey(key) {
+      if (!admittedKeys.has(key)) return launchRefusals.get(key) || null;
+      const entry = current.byKey.get(key);
+      return unavailable(entry) ? entry.outcome : null;
+    },
+    unavailableEntries,
+    // Record one launch-time refusal; returns every exact instance that
+    // became unavailable because of it (the refused one first).
+    recordLaunchRefusal(outcome) {
+      const refusal = validateHardwareOutcome(outcome);
+      if (!admittedKeys.has(refusal.key)) {
+        // An enabled extra outside the admitted graph: contained by itself.
+        const known = launchRefusals.has(refusal.key);
+        launchRefusals.set(refusal.key, refusal);
+        return known ? [] : [{ nodeId: null, key: refusal.key, outcome: refusal }];
+      }
+      const before = new Set(unavailableEntries().map((entry) => entry.key));
+      launchRefusals.set(refusal.key, refusal);
+      const amended = (admissions || []).map((record) => (launchRefusals.has(record.key)
+        ? { ...record, hardwareRefusal: launchRefusals.get(record.key) }
+        : record));
+      current = classifyWorkspaceGraphAvailability(graph, amended, { explicitWaits });
+      return unavailableEntries()
+        .filter((entry) => !before.has(entry.key))
+        .sort((left, right) => {
+          if (left.key === refusal.key) return -1;
+          if (right.key === refusal.key) return 1;
+          return left.key.localeCompare(right.key);
+        });
+    },
+  });
+}
+
+/**
+ * The availability projection for each unavailable exact instance that has a
+ * registry record: its logical route key and the validated projection that
+ * removes every runtime target (§9.2, §9.4).
+ */
+export function unavailableRouteProjections(entries, { registry = {}, registryNameByNodeId = new Map() } = {}) {
+  const projections = [];
+  for (const { nodeId, key: outcomeKey, outcome } of entries || []) {
+    const key = (nodeId && registryNameByNodeId.get(nodeId))
+      || (nodeId?.startsWith('extra:') ? nodeId.slice('extra:'.length) : '')
+      || (nodeId ? '' : outcomeKey);
+    const record = key ? registry[key] : null;
+    if (!record) continue;
+    if (key !== outcome.key) {
+      throw new Error(`start: hardware outcome for '${nodeId || outcomeKey}' does not match its staged registry identity`);
+    }
+    projections.push({
+      routeKey: record.alias || record.agentName,
+      projection: buildAvailabilityProjection({
+        outcome,
+        instanceId: record.instanceId,
+        enableGeneration: record.enableGeneration,
+      }),
+    });
+  }
+  return projections;
+}
+
+/**
+ * Launch one batch of route targets. A typed hardware outcome raised by the
+ * launch is a contained refusal: it is handed to onHardwareRefusal and never
+ * counted as an ordinary failure. Every other failure keeps the baseline
+ * semantics: it throws "N agent(s) failed to start", or with allowFailures is
+ * returned in failedAgents.
+ */
+export async function launchRouteTargets(targetNames, {
+  launchTarget,
+  commitResults = async () => {},
+  onHardwareRefusal = async () => {},
+  allowFailures = false,
+  log = console,
+} = {}) {
+  if (!Array.isArray(targetNames) || !targetNames.length) {
+    return { failedAgents: [], routeResults: [], hardwareRefusals: [] };
+  }
+  const settled = await Promise.all(targetNames.map(async (name) => {
+    try {
+      return await launchTarget(name);
+    } catch (agentErr) {
+      const outcome = findHardwareOutcome(agentErr);
+      const shortAgentName = agentErr?.shortAgentName || name;
+      if (!outcome) log.error(`[start] Failed to start agent '${shortAgentName}': ${agentErr?.message}`);
+      return { ok: false, name, shortAgentName, hardwareOutcome: outcome };
+    }
+  }));
+  const routeResults = settled.filter((result) => result?.ok);
+  const failedAgents = settled.filter((result) => result && !result.ok && !result.hardwareOutcome)
+    .map((result) => result.shortAgentName);
+  const hardwareRefusals = settled.filter((result) => result && !result.ok && result.hardwareOutcome);
+  await commitResults(settled);
+  for (const refused of hardwareRefusals) await onHardwareRefusal(refused.hardwareOutcome, refused.name);
+  if (failedAgents.length > 0) {
+    const message = `${failedAgents.length} agent(s) failed to start: ${failedAgents.join(', ')}`;
+    if (allowFailures) {
+      log.warn(`[start] ${message}`);
+      return { failedAgents, routeResults, hardwareRefusals };
+    }
+    throw new Error(message);
+  }
+  return { failedAgents, routeResults, hardwareRefusals };
+}
+
+/**
+ * Launch the blocking members of every dependency wave, as startWorkspace
+ * does. Refused or blocked instances (from graph metadata or refused at
+ * launch) get no runtime create, readiness probe or start hook; unrelated
+ * agents continue. Ordinary failures stay fatal exactly as before.
+ */
+export async function launchWorkspaceGraphWaves({
+  graphWaves = [],
+  nodes = new Map(),
+  noWaitNodeIds = new Set(),
+  registryNameByNodeId = new Map(),
+  availability,
+  launch,
+  readinessEntryFor,
+  waitForReadiness,
+  reportOutcome,
+  formatLabel = (node) => node.id,
+  log = console.log,
+}) {
+  const readyAgentKeys = [];
+  const deferredNoWaitWaves = [];
+  for (let waveIndex = 0; waveIndex < graphWaves.length; waveIndex += 1) {
+    const waveNodes = graphWaves[waveIndex].map((nodeId) => nodes.get(nodeId)).filter(Boolean);
+    if (!waveNodes.length) continue;
+    // Blocking nodes follow the wave-by-wave start/readiness path. Defer
+    // detached no-wait workers until every coordinated blocking launch is
+    // complete so their independent route applies cannot transiently
+    // inactivate an exact host-generation capability during process create.
+    const blockingNodes = [];
+    const noWaitWaveNodes = [];
+    for (const node of waveNodes) {
+      if (noWaitNodeIds.has(node.id)) {
+        noWaitWaveNodes.push({ node, registryName: registryNameByNodeId.get(node.id) });
+      } else if (availability.outcomeForNode(node.id)) {
+        // Refused or blocked: no runtime create, readiness probe or start
+        // hook; the route stays target-less and unavailable.
+        reportOutcome(availability.outcomeForNode(node.id));
+      } else {
+        blockingNodes.push(node);
+      }
+    }
+    const blockingLabel = blockingNodes.length ? blockingNodes.map(formatLabel).join(', ') : '<none>';
+    const noWaitLabel = noWaitWaveNodes.map(({ node }) => formatLabel(node)).join(', ');
+    log(`[start] Dependency wave ${waveIndex + 1}/${graphWaves.length}: ${noWaitLabel ? `${blockingLabel} (no-wait: ${noWaitLabel})` : blockingLabel}`);
+    if (noWaitWaveNodes.length) deferredNoWaitWaves.push(noWaitWaveNodes);
+    const blockingNames = blockingNodes.map((node) => registryNameByNodeId.get(node.id)).filter(Boolean);
+    const blockingLaunch = blockingNames.length ? await launch(blockingNames) : { routeResults: [] };
+    // A member refused at launch is excluded from readiness waits.
+    const launchedNodes = blockingNodes.filter((node) => !availability.outcomeForNode(node.id));
+    if (!launchedNodes.length) continue;
+    await waitForReadiness(launchedNodes.map((node) => readinessEntryFor(node, blockingLaunch)));
+    readyAgentKeys.push(...launchedNodes.map((node) => registryNameByNodeId.get(node.id)).filter(Boolean));
+  }
+  return { readyAgentKeys, deferredNoWaitWaves };
+}
+
+/**
+ * Launch the enabled agents outside the dependency graph. A hardware refusal
+ * (known from metadata or raised at launch) is contained; any other failure
+ * keeps the baseline error that leaves edge selectors inactive.
+ */
+export async function launchAdditionalRuntimes({
+  additionalNames = [],
+  availability,
+  launch,
+  readinessEntryFor,
+  waitForReadiness,
+  reportOutcome,
+}) {
+  const readyAgentKeys = [];
+  for (const name of additionalNames) {
+    const outcome = availability.outcomeForKey(name);
+    if (outcome) reportOutcome(outcome);
+  }
+  const launchable = additionalNames.filter((name) => !availability.outcomeForKey(name));
+  if (launchable.length) {
+    const extra = await launch(launchable, { allowFailures: true });
+    if (extra.failedAgents.length !== 0) {
+      throw new Error('additional runtime failure left edge selectors inactive; repair and run start again');
+    }
+    const launched = extra.routeResults.filter((result) => !availability.outcomeForKey(result.containerName));
+    await waitForReadiness(launched.map((result) => readinessEntryFor(result)));
+    readyAgentKeys.push(...launched.map((result) => result.containerName));
+  }
+  return { readyAgentKeys };
 }
 
 function ensureGraphNodesEnabled(graph, reg, {
@@ -2167,10 +2380,9 @@ async function startWorkspace(staticAgentArg, portArg, {
   const lockedStart = preflightWorkspaceStartRuntimeCapabilities(staticAgentArg);
   // Hardware refusals are recorded per exact instance; blocking and explicit
   // waiting consumers become blocked, unrelated agents start (plan §9.1).
-  const graphAvailability = classifyWorkspaceGraphAvailability(lockedStart.graph, lockedStart.admissions);
-  const unavailableNodeIds = new Set([...graphAvailability.byNodeId]
-    .filter(([, entry]) => entry && entry.state !== 'eligible')
-    .map(([nodeId]) => nodeId));
+  // A refusal raised later at launch is recorded in the same tracker.
+  const graphAvailability = createGraphAvailabilityTracker(lockedStart.graph, lockedStart.admissions);
+  const unavailableNodeIds = new Set(graphAvailability.unavailableEntries().map((entry) => entry.nodeId));
   const workspaceConfigForAuth = workspaceSvc.getConfig() || {};
   const graphSsoConfig = resolveWorkspaceGraphSsoConfig(lockedStart.graph, workspaceConfigForAuth.sso);
   initializeFreshEdgeRoutingSources({ workspaceRoot: PLOINKY_WORKSPACE_ROOT });
@@ -2435,10 +2647,7 @@ async function startWorkspace(staticAgentArg, portArg, {
     }
     const hardwareOutcomes = { refused: [], blocked: [] };
     const recordedOutcomeKeys = new Set();
-    const unavailableOutcome = (nodeId) => {
-      const entry = graphAvailability.byNodeId.get(nodeId);
-      return entry && entry.state !== 'eligible' ? entry.outcome : null;
-    };
+    const unavailableOutcome = (nodeId) => graphAvailability.outcomeForNode(nodeId);
     const reportHardwareOutcome = (outcome) => {
       if (!outcome || recordedOutcomeKeys.has(outcome.key)) return;
       recordedOutcomeKeys.add(outcome.key);
@@ -2464,41 +2673,31 @@ async function startWorkspace(staticAgentArg, portArg, {
     }
     // Refused/blocked instances keep their logical routes but lose every
     // runtime target; the unavailable state is compiled into the generation.
-    const unavailableRoutes = [];
-    for (const [nodeId, entry] of graphAvailability.byNodeId) {
-      if (!entry || entry.state === 'eligible') continue;
-      const key = registryNameByNodeId.get(nodeId)
-        || (nodeId.startsWith('extra:') ? nodeId.slice('extra:'.length) : '');
-      const record = key ? reg[key] : null;
-      if (!record) continue;
-      if (key !== entry.outcome.key) {
-        throw new Error(`start: hardware outcome for '${nodeId}' does not match its staged registry identity`);
-      }
-      unavailableRoutes.push({
-        routeKey: record.alias || record.agentName,
-        projection: buildAvailabilityProjection({
-          outcome: entry.outcome,
-          instanceId: record.instanceId,
-          enableGeneration: record.enableGeneration,
-        }),
-      });
-    }
-    if (unavailableRoutes.length) {
+    const markHardwareUnavailable = async (entries) => {
+      const unavailableRoutes = unavailableRouteProjections(entries, { registry: reg, registryNameByNodeId });
+      if (!unavailableRoutes.length) return;
       cfg = await mergeRoutingConfig((current) => {
         current.routes = current.routes || {};
         for (const { routeKey, projection } of unavailableRoutes) {
           current.routes[routeKey] = markRouteHardwareUnavailable(current.routes[routeKey], projection);
+          if (cfg.routes?.[routeKey]) cfg.routes[routeKey] = current.routes[routeKey];
         }
         return current;
       }, { coordinate: false });
-    }
+    };
+    await markHardwareUnavailable(graphAvailability.unavailableEntries());
+    // A typed hardware outcome raised at launch is a contained refusal: it is
+    // recorded, projected, and its blocking/explicit-wait consumers become
+    // blocked and are skipped; unrelated agents continue (U10/U14, §9.4).
+    const containLaunchRefusal = async (outcome) => {
+      const affected = graphAvailability.recordLaunchRefusal(outcome);
+      await markHardwareUnavailable(affected);
+      for (const entry of affected) reportHardwareOutcome(entry.outcome);
+    };
     const updateRoutes = async (targetNames = [], { allowFailures = false } = {}) => {
-      if (!Array.isArray(targetNames) || !targetNames.length) {
-        return { failedAgents: [], routeResults: [] };
-      }
       cfg.routes = cfg.routes || {};
-      const failedAgents = [];
-      const routeResults = await Promise.all(targetNames.map(async (name) => {
+      return launchRouteTargets(targetNames, {
+        launchTarget: async (name) => {
         const rec = reg[name];
         if (!rec || !rec.agentName) return null;
         const shortAgentName = rec.agentName;
@@ -2588,113 +2787,62 @@ async function startWorkspace(staticAgentArg, portArg, {
             manifest,
           };
         } catch (agentErr) {
-          console.error(`[start] Failed to start agent '${shortAgentName}': ${agentErr.message}`);
-          return {
-            ok: false,
-            shortAgentName
-          };
+          // launchRouteTargets reports it: a typed hardware outcome is a
+          // contained refusal, anything else an ordinary failure.
+          try { agentErr.shortAgentName = shortAgentName; } catch (_) { /* reported by registry name */ }
+          throw agentErr;
         }
-      }));
-      for (const result of routeResults) {
-        if (!result) continue;
-        if (!result.ok) {
-          failedAgents.push(result.shortAgentName);
-          continue;
-        }
-        cfg.routes[result.routeKey] = result.route;
-      }
-      cfg = await mergeRoutingConfig((current) => {
-        for (const result of routeResults) {
-          if (!result?.ok) continue;
-          reg[result.containerName] = result.registryRecord;
-        }
-        const next = {
-          ...current,
-          ...cfg,
-          routes: {
-            ...(cfg.routes || {}),
-            ...(current.routes || {})
+        },
+        allowFailures,
+        commitResults: async (routeResults) => {
+          for (const result of routeResults) {
+            if (!result?.ok) continue;
+            cfg.routes[result.routeKey] = result.route;
           }
-        };
-        for (const result of routeResults) {
-          if (!result?.ok) continue;
-          next.routes[result.routeKey] = result.route;
-        }
-        return next;
-      }, { coordinate: false });
-      if (failedAgents.length > 0) {
-        const message = `${failedAgents.length} agent(s) failed to start: ${failedAgents.join(', ')}`;
-        if (allowFailures) {
-          console.warn(`[start] ${message}`);
-          return { failedAgents, routeResults: routeResults.filter((result) => result?.ok) };
-        }
-        throw new Error(message);
-      }
-      return { failedAgents, routeResults: routeResults.filter((result) => result?.ok) };
+          cfg = await mergeRoutingConfig((current) => {
+            for (const result of routeResults) {
+              if (!result?.ok) continue;
+              reg[result.containerName] = result.registryRecord;
+            }
+            const next = {
+              ...current,
+              ...cfg,
+              routes: {
+                ...(cfg.routes || {}),
+                ...(current.routes || {})
+              }
+            };
+            for (const result of routeResults) {
+              if (!result?.ok) continue;
+              next.routes[result.routeKey] = result.route;
+            }
+            return next;
+          }, { coordinate: false });
+        },
+        onHardwareRefusal: containLaunchRefusal,
+      });
     };
 
-    const deferredNoWaitWaves = [];
-    for (let waveIndex = 0; waveIndex < graphWaves.length; waveIndex += 1) {
-      const waveNodeIds = graphWaves[waveIndex];
-      const waveNodes = waveNodeIds
-        .map((nodeId) => dependencyGraph.nodes.get(nodeId))
-        .filter(Boolean);
-      if (!waveNodes.length) continue;
-
-      // Blocking nodes follow the wave-by-wave start/readiness path. Defer
-      // detached no-wait workers until every coordinated blocking launch is
-      // complete so their independent route applies cannot transiently
-      // inactivate an exact host-generation capability during process create.
-      const blockingNodes = [];
-      const blockingNames = [];
-      const noWaitWaveNodes = [];
-      for (const node of waveNodes) {
-        const registryName = registryNameByNodeId.get(node.id);
-        if (noWaitNodeIds.has(node.id)) {
-          noWaitWaveNodes.push({ node, registryName });
-        } else if (unavailableOutcome(node.id)) {
-          // Refused or blocked: no runtime create, readiness probe or start
-          // hook; the route stays target-less and unavailable.
-          reportHardwareOutcome(unavailableOutcome(node.id));
-        } else {
-          blockingNodes.push(node);
-          if (registryName) blockingNames.push(registryName);
-        }
-      }
-
-      const blockingLabel = blockingNodes.length
-        ? blockingNodes.map((node) => formatGraphNodeLabel(node, staticAgent)).join(', ')
-        : '<none>';
-      const noWaitLabel = noWaitWaveNodes.length
-        ? noWaitWaveNodes.map(({ node }) => formatGraphNodeLabel(node, staticAgent)).join(', ')
-        : '';
-      const waveSummary = noWaitLabel
-        ? `${blockingLabel}${noWaitLabel ? ` (no-wait: ${noWaitLabel})` : ''}`
-        : blockingLabel;
-      console.log(`[start] Dependency wave ${waveIndex + 1}/${graphWaves.length}: ${waveSummary}`);
-
-      if (noWaitWaveNodes.length) {
-        deferredNoWaitWaves.push(noWaitWaveNodes);
-      }
-
-      const blockingLaunch = blockingNames.length
-        ? await updateRoutes(blockingNames)
-        : { routeResults: [] };
-
-      if (!blockingNodes.length) continue;
-
-      const readinessEntries = blockingNodes.map((node) => {
+    const { readyAgentKeys: graphReadyKeys, deferredNoWaitWaves } = await launchWorkspaceGraphWaves({
+      graphWaves,
+      nodes: dependencyGraph.nodes,
+      noWaitNodeIds,
+      registryNameByNodeId,
+      availability: graphAvailability,
+      launch: (names) => updateRoutes(names),
+      readinessEntryFor: (node, blockingLaunch) => {
         const registryName = registryNameByNodeId.get(node.id);
         const registryRecord = registryName ? reg[registryName] : null;
         const routeKey = registryRecord?.alias || node.alias || node.shortAgentName;
         const launchResult = blockingLaunch.routeResults.find((result) => result.routeKey === routeKey);
         const route = launchResult?.readinessRoute || cfg.routes?.[routeKey] || null;
         return buildBlockingReadinessEntryFromNode(node, route, staticAgent);
-      });
-
-      await waitForReadinessEntries(readinessEntries);
-      readyAgentKeys.push(...blockingNames);
-    }
+      },
+      waitForReadiness: waitForReadinessEntries,
+      reportOutcome: reportHardwareOutcome,
+      formatLabel: (node) => formatGraphNodeLabel(node, staticAgent),
+    });
+    readyAgentKeys.push(...graphReadyKeys);
 
     const additionalStartup = partitionAdditionalStartupAgents({
       registry: reg,
@@ -2726,27 +2874,20 @@ async function startWorkspace(staticAgentArg, portArg, {
     if (activeManualNames.length) {
       console.log(`[start] Retaining ${activeManualNames.length} explicitly active manual agent(s): ${activeManualNames.join(', ')}`);
     }
-    const extraOutcomeByKey = new Map((extraRuntimeNodes || [])
-      .map((node) => [node.id.slice('extra:'.length), unavailableOutcome(node.id)])
-      .filter(([, outcome]) => outcome));
-    for (const outcome of extraOutcomeByKey.values()) reportHardwareOutcome(outcome);
-    const additionalNames = [...additionalStartup.automatic, ...activeManualNames]
-      .filter((name) => !extraOutcomeByKey.has(name));
-    if (additionalNames.length) {
-      const extra = await updateRoutes(additionalNames, { allowFailures: true });
-      if (extra.failedAgents.length === 0) {
-        const extraReadiness = extra.routeResults.map((result) => buildBlockingReadinessEntryFromNode({
-          id: `extra:${result.routeKey}`,
-          shortAgentName: result.shortAgentName,
-          isStatic: false,
-          manifest: result.manifest,
-        }, result.readinessRoute || result.route, result.shortAgentName));
-        await waitForReadinessEntries(extraReadiness);
-        readyAgentKeys.push(...additionalNames);
-      } else {
-        throw new Error('additional runtime failure left edge selectors inactive; repair and run start again');
-      }
-    }
+    const additional = await launchAdditionalRuntimes({
+      additionalNames: [...additionalStartup.automatic, ...activeManualNames],
+      availability: graphAvailability,
+      launch: (names, options) => updateRoutes(names, options),
+      readinessEntryFor: (result) => buildBlockingReadinessEntryFromNode({
+        id: `extra:${result.routeKey}`,
+        shortAgentName: result.shortAgentName,
+        isStatic: false,
+        manifest: result.manifest,
+      }, result.readinessRoute || result.route, result.shortAgentName),
+      waitForReadiness: waitForReadinessEntries,
+      reportOutcome: reportHardwareOutcome,
+    });
+    readyAgentKeys.push(...additional.readyAgentKeys);
 
     // Runtime-only registry metadata may change while the lifecycle binding
     // remains exact. Persist it once, after all capability-sensitive launches

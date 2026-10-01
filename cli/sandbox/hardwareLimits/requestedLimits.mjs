@@ -219,10 +219,14 @@ export function evaluateHardwareEligibility(descriptor, context, { helper = fals
         // No non-helper agent can prove the absence of stored limits.
         refusal = storeRefusal(context);
     } else if (overrideProblem) {
+        // The stored entry itself cannot be enforced (outside the current
+        // envelope, or a GPU share this release cannot apply): refused with
+        // its own reason and fix, never ignored or clamped.
         refusal = {
-            reasonCode: 'exceeds_envelope',
-            reason: `The stored hardware limit cannot be resolved against this Box: ${overrideProblem}.`,
-            fix: 'Change or clear the stored limit in Settings, or run ploinky limits clear --agent REPO/AGENT on the host.',
+            reasonCode: overrideProblem.reasonCode,
+            reason: overrideProblem.reason,
+            fix: overrideProblem.fix,
+            extraRequested: overrideProblem.requested || [],
         };
     } else if (hasHardwareRequest(requested)) {
         if (context.gate !== 'on') {
@@ -251,10 +255,21 @@ export function evaluateHardwareEligibility(descriptor, context, { helper = fals
             }
         }
     }
+    let refusalParts = null;
+    if (refusal) {
+        // A refused stored entry replaces the declared value of the same field
+        // (the stored layer wins), so each field is listed once.
+        const { extraRequested = [], ...parts } = refusal;
+        const merged = [
+            ...requested.filter((entry) => !extraRequested.some((extra) => extra.field === entry.field)),
+            ...extraRequested,
+        ];
+        refusalParts = Object.freeze({ ...parts, requested: merged });
+    }
     return Object.freeze({
         applicable: true,
         state: refusal ? 'refused' : 'eligible',
-        refusalParts: refusal ? Object.freeze({ ...refusal, requested }) : null,
+        refusalParts,
         inputFingerprint,
     });
 }

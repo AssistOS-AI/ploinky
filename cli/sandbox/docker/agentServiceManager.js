@@ -79,8 +79,7 @@ import {
 import {
     admitManifestRuntimeCapabilities,
     assertRuntimeAdmissionCurrent,
-    assertHardwareAdmissionCurrent,
-    hardwareCommandPrefix,
+    createHardwareLaunchGuard,
     limitsHashReuseReason,
     renderContainerSecurityArgs,
     renderRuntimePolicyArgs,
@@ -107,14 +106,11 @@ import {
 } from '../../utils/runtime/legacyAgentDataGuards.js';
 import { deriveAgentPrincipalId } from '../../utils/security/agentIdentity.js';
 import { ensureSharedHostDir, runPostinstallHook } from './agentHooks.js';
-import { engineCommandArgs } from '../hardwareLimits/runtimeCommand.mjs';
 import {
     authorityHelperPlacementFromContext,
     cleanupStaleLeaves,
-    verifyLaunchedHardwareLimits,
 } from '../hardwareLimits/delegation.mjs';
-import { HardwareLimitsError } from '../hardwareLimits/errors.mjs';
-import { buildDirectRefusal, captureHardwareContext } from '../hardwareLimits/requestedLimits.mjs';
+import { captureHardwareContext } from '../hardwareLimits/requestedLimits.mjs';
 import { LIMITS_HASH_LABEL } from '../hardwareLimits/resolve.mjs';
 import { ensureBwrapService } from '../bwrap/bwrapServiceManager.js';
 import { isBwrapProcessRunning, stopBwrapProcess } from '../bwrap/bwrapFleet.js';
@@ -1434,6 +1430,16 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             descriptor: runtimeAdmission.descriptor,
         });
     }
+    const hardwareLaunch = createHardwareLaunchGuard(runtimeAdmission, {
+        key: containerName,
+        ref: `${repoName}/${agentName}`,
+        alias: options.alias || null,
+        runtime,
+        query: (command, queryArgs) => {
+            const result = spawnSync(command, queryArgs, { encoding: 'utf8', timeout: 10_000 });
+            return { ok: result.status === 0 && !result.error, stdout: String(result.stdout || '') };
+        },
+    });
     const instanceName = options.alias || launchRecord.alias || agentName;
     const { raw: explicitAgentCmd } = readManifestAgentCommand(manifest);
     const startCmd = readManifestStartCommand(manifest);
@@ -2377,15 +2383,13 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             state: 'preserved-ambiguous',
             inspectionComplete: false,
         });
-        // A hardware-placed agent selects the nested cgroupfs manager with an
-        // engine option before the subcommand; every other launch keeps the
-        // existing argv (empty prefix).
-        createArgs.splice(0, createArgs.length,
-            ...engineCommandArgs(hardwareCommandPrefix(runtimeAdmission.descriptor), createArgs));
-        // Hardware inputs are rechecked immediately before create: a changed
+        // Hardware inputs are rechecked immediately before create (a changed
         // gate, preparation, controller set or this agent's stored entry
-        // returns PLOINKY_RUNTIME_INPUT_CHANGED instead of an older policy.
-        assertHardwareAdmissionCurrent(runtimeAdmission);
+        // returns PLOINKY_RUNTIME_INPUT_CHANGED instead of an older policy),
+        // and a hardware-placed agent selects the nested cgroupfs manager with
+        // an engine option before the subcommand; every other launch keeps
+        // the existing argv (empty prefix).
+        createArgs.splice(0, createArgs.length, ...hardwareLaunch.createArgs(createArgs));
         if (runtimeAdmission.descriptor.hardwarePlacement) removeStaleHardwareLeaves(runtime);
         // Creation is reached only after the exact predecessor is gone (or was
         // proved absent). Retire its two fixed control-plane artifacts here so
@@ -2529,7 +2533,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 postStartLaunch: cleanupLegacyGuardMountpointCleanupAfterStart,
                 finalizeLaunch: finalizeGeneratedRouterLaunch,
                 onContainerCreated: recordCreatedIdentity,
-                commandPrefix: hardwareCommandPrefix(runtimeAdmission.descriptor),
+                commandPrefix: hardwareLaunch.commandPrefix(),
             });
         if (adoptManagedRuntimeOnly && launched?.adopted !== true) {
             const mismatch = new Error(
@@ -2570,7 +2574,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 onCreated: recordCreatedIdentity,
                 beforeStart: prepareLegacyGuardMountpointCleanupBeforeStart,
                 afterStart: cleanupLegacyGuardMountpointCleanupAfterStart,
-                commandPrefix: hardwareCommandPrefix(runtimeAdmission.descriptor),
+                commandPrefix: hardwareLaunch.commandPrefix(),
             }) || '');
         }, { waitMs: 15 * 60 * 1000 });
     }
@@ -2578,33 +2582,10 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         throw new Error(`startAgentContainer(${agentName}) did not capture an immutable container ID`);
     }
     // A hardware-placed agent is not ready until its actual leaf carries the
-    // admitted limits; a disagreement removes this candidate (catch below).
-    if (runtimeAdmission.descriptor.hardwarePlacement && !adoptedExistingRuntime) {
-        verifyLaunchedHardwareLimits({
-            descriptor: runtimeAdmission.descriptor,
-            containerId: launchedContainerId,
-            runtime,
-            query: (command, queryArgs) => {
-                const result = spawnSync(command, queryArgs, { encoding: 'utf8', timeout: 10_000 });
-                return { ok: result.status === 0 && !result.error, stdout: String(result.stdout || '') };
-            },
-            refuse: (reason) => new HardwareLimitsError(buildDirectRefusal({
-                key: containerName,
-                ref: `${repoName}/${agentName}`,
-                alias: options.alias || null,
-                refusalParts: {
-                    reasonCode: 'unprepared',
-                    reason: `This Box is not prepared for hardware limits: ${reason}.`,
-                    fix: 'On the host run ploinky limits status, repair the reported prerequisite, then ploinky restart.',
-                    requested: runtimeAdmission.descriptor.hardwareRequest || [],
-                },
-                inputFingerprint: runtimeAdmission.hardwareEligibility?.inputFingerprint || '0'.repeat(64),
-            })),
-        });
-    }
-    // And again before the candidate can be returned for route publication;
-    // a stale admission removes the candidate through the cleanup below.
-    assertHardwareAdmissionCurrent(runtimeAdmission);
+    // admitted limits, and the inputs are rechecked before the candidate can
+    // be returned for route publication; a refusal or a stale admission
+    // removes this candidate through the cleanup below.
+    hardwareLaunch.afterLaunch({ containerId: launchedContainerId, adopted: adoptedExistingRuntime });
     } catch (error) {
         let exactCleanupPerformed = error?.ploinkyContainerTransaction?.exactCleanupPerformed === true;
         launchedContainerId ||= String(error?.ploinkyContainerTransaction?.containerId || '');

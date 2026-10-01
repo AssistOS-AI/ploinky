@@ -389,3 +389,169 @@ test('O.store-unknown-no-create', () => {
         agentId: 'demo/plain', runtime: 'podman', boxMarkerOptions, hardwareContext: unreadable, helper: true,
     }));
 });
+
+// ---------------------------------------------------------------------------
+// F1: a typed hardware outcome raised at launch (readback refusal or strict
+// admission recheck) is contained exactly like a metadata refusal.
+
+const availabilityModule = await import(new URL('../../cli/server/hardwareAvailability.mjs', import.meta.url).href);
+
+function launchGraph() {
+    // a --blocking--> b; c is unrelated; d waits explicitly on b's status.
+    const node = (id, dependencies = []) => ({
+        id,
+        dependencies: new Set(dependencies),
+        dependencyEdges: new Map(dependencies.map((child) => [child, { noWait: false }])),
+    });
+    const nodes = new Map([['demo/a', node('demo/a', ['demo/b'])], ['demo/b', node('demo/b')], ['demo/c', node('demo/c')], ['demo/d', node('demo/d')]]);
+    const keys = { 'demo/a': 'ploinky_demo_a', 'demo/b': 'ploinky_demo_b', 'demo/c': 'ploinky_demo_c', 'demo/d': 'ploinky_demo_d', 'extra:ploinky_demo_x': 'ploinky_demo_x', 'extra:ploinky_demo_y': 'ploinky_demo_y' };
+    const admissions = Object.entries(keys).map(([nodeId, key]) => ({
+        nodeId, key, alias: '', admission: { agentId: `demo/${key.split('_').pop()}` }, hardwareRefusal: null,
+    }));
+    const registry = Object.fromEntries(Object.values(keys).map((key) => [key, {
+        agentName: key.split('_').pop(), repoName: 'demo', instanceId: `${key}-instance`, enableGeneration: `${key}-generation`,
+    }]));
+    return {
+        graph: { nodes },
+        waves: [['demo/b', 'demo/c'], ['demo/a', 'demo/d']],
+        admissions,
+        registry,
+        registryNameByNodeId: new Map(Object.entries(keys).filter(([nodeId]) => !nodeId.startsWith('extra:'))),
+        explicitWaits: [{ fromKey: 'ploinky_demo_d', toKey: 'ploinky_demo_b' }],
+    };
+}
+
+function launchRefusal(key) {
+    return new errors.HardwareLimitsError(requestedLimits.buildDirectRefusal({
+        key,
+        ref: `demo/${key.split('_').pop()}`,
+        refusalParts: {
+            reasonCode: 'unprepared',
+            reason: 'This Box is not prepared for hardware limits: the applied limits disagree with the admitted ones (memory.max is max).',
+            fix: 'On the host run ploinky limits status, repair the reported prerequisite, then ploinky restart.',
+            requested: [{ field: 'memory', value: '512m', source: 'manifest' }],
+        },
+        inputFingerprint: 'c'.repeat(64),
+    }));
+}
+
+// The startWorkspace launch composition with a stubbed ensureAgentService.
+async function startLaunch({ failures = {}, additionalNames = [] } = {}) {
+    const fixture = launchGraph();
+    const { graph, waves, admissions, registry, registryNameByNodeId, explicitWaits } = fixture;
+    const availability = workspaceUtil.createGraphAvailabilityTracker(graph, admissions, { explicitWaits });
+    const routes = Object.fromEntries(Object.entries(registry).map(([key, record]) => [record.agentName, { container: key, hostPort: 40000 }]));
+    const outcomesSeen = { refused: [], blocked: [] };
+    const reported = new Set();
+    const reportOutcome = (outcome) => {
+        if (!outcome || reported.has(outcome.key)) return;
+        reported.add(outcome.key);
+        outcomesSeen[outcome.state === 'refused' ? 'refused' : 'blocked'].push(outcome);
+    };
+    const mark = (entries) => {
+        for (const { routeKey, projection } of workspaceUtil.unavailableRouteProjections(entries, { registry, registryNameByNodeId })) {
+            routes[routeKey] = availabilityModule.markRouteHardwareUnavailable(routes[routeKey], projection);
+        }
+    };
+    mark(availability.unavailableEntries());
+    const ensureCalls = [];
+    const readiness = [];
+    const ensureAgentService = (name) => {
+        ensureCalls.push(name);
+        if (failures[name]) throw failures[name]();
+        return { containerName: name, hostPort: 41000 };
+    };
+    const launch = (names, { allowFailures = false } = {}) => workspaceUtil.launchRouteTargets(names, {
+        allowFailures,
+        log: { error() {}, warn() {} },
+        launchTarget: async (name) => {
+            try {
+                const result = ensureAgentService(name);
+                return { ok: true, containerName: result.containerName, routeKey: registry[name].agentName, shortAgentName: registry[name].agentName, route: { container: name, hostPort: result.hostPort } };
+            } catch (error) {
+                // ensureAgentService wraps launch errors, keeping the typed
+                // cause; startWorkspace labels them with the agent's name.
+                const wrapped = errors.wrapPreservingHardwareCause(`managed launch failed: ${error.message}`, error);
+                wrapped.shortAgentName = registry[name].agentName;
+                throw wrapped;
+            }
+        },
+        commitResults: async (results) => { for (const result of results) if (result?.ok) routes[result.routeKey] = result.route; },
+        onHardwareRefusal: async (outcome) => {
+            const affected = availability.recordLaunchRefusal(outcome);
+            mark(affected);
+            for (const entry of affected) reportOutcome(entry.outcome);
+        },
+    });
+    const waveResult = await workspaceUtil.launchWorkspaceGraphWaves({
+        graphWaves: waves, nodes: graph.nodes, registryNameByNodeId, availability, launch,
+        readinessEntryFor: (node) => registryNameByNodeId.get(node.id),
+        waitForReadiness: async (entries) => { readiness.push(...entries); },
+        reportOutcome, log() {},
+    });
+    const extra = await workspaceUtil.launchAdditionalRuntimes({
+        additionalNames, availability, launch,
+        readinessEntryFor: (result) => result.containerName,
+        waitForReadiness: async (entries) => { readiness.push(...entries); },
+        reportOutcome,
+    });
+    const summary = outcomes.summarizeStartResult({
+        readyAgents: [...waveResult.readyAgentKeys, ...extra.readyAgentKeys].map((key) => ({ key })),
+        refusedAgents: outcomesSeen.refused,
+        blockedAgents: outcomesSeen.blocked,
+    });
+    return { routes, ensureCalls, readiness, summary, availability };
+}
+
+test('O.launch-refusal-blocks-dependants', async () => {
+    const result = await startLaunch({ failures: { ploinky_demo_b: () => launchRefusal('ploinky_demo_b') } });
+    // No throw. b was attempted; its blocking consumer a and explicit waiter d
+    // were never launched; unrelated c started and was waited for.
+    assert.deepEqual(result.ensureCalls.sort(), ['ploinky_demo_b', 'ploinky_demo_c']);
+    assert.deepEqual(result.readiness, ['ploinky_demo_c']);
+    assert.equal(result.summary.state, 'degraded');
+    assert.deepEqual(result.summary.readyAgents.entries.map((entry) => entry.key), ['ploinky_demo_c']);
+    assert.deepEqual(result.summary.refusedAgents.entries.map((entry) => entry.key), ['ploinky_demo_b']);
+    assert.deepEqual(result.summary.blockedAgents.entries.map((entry) => entry.key).sort(), ['ploinky_demo_a', 'ploinky_demo_d']);
+    const blocked = result.availability.outcomeForKey('ploinky_demo_a');
+    assert.equal(blocked.code, errors.HARDWARE_DEPENDENCY_BLOCKED);
+    assert.equal(blocked.rootCause.key, 'ploinky_demo_b');
+    // The availability projection is written: refused/blocked routes lose
+    // their targets; the unrelated route keeps its target.
+    const compiled = availabilityModule.compileHardwareAvailability({ routes: result.routes });
+    assert.deepEqual(Object.keys(compiled).sort(), ['a', 'b', 'd']);
+    assert.equal(compiled.b.state, 'refused');
+    assert.equal(compiled.a.state, 'blocked');
+    assert.equal(result.routes.b.hostPort, undefined);
+    assert.equal(result.routes.c.hostPort, 41000);
+});
+
+test('O.launch-refusal-extra-contained', async () => {
+    const result = await startLaunch({
+        additionalNames: ['ploinky_demo_x', 'ploinky_demo_y'],
+        failures: { ploinky_demo_x: () => launchRefusal('ploinky_demo_x') },
+    });
+    // No 'additional runtime failure' throw; the other extra is active and ready.
+    assert.ok(result.ensureCalls.includes('ploinky_demo_y'));
+    assert.ok(result.readiness.includes('ploinky_demo_y'));
+    assert.equal(result.routes.y.hostPort, 41000);
+    assert.equal(result.routes.x.hostPort, undefined);
+    assert.equal(result.routes.x.hardwareAvailability.state, 'refused');
+    assert.deepEqual(result.summary.refusedAgents.entries.map((entry) => entry.key), ['ploinky_demo_x']);
+    assert.equal(result.summary.blockedAgents.count, 0);
+    const compiled = availabilityModule.compileHardwareAvailability({ routes: result.routes });
+    assert.deepEqual(Object.keys(compiled), ['x']);
+});
+
+test('O.launch-nonhardware-still-throws', async () => {
+    // An ordinary graph launch failure keeps the baseline fatal error.
+    await assert.rejects(
+        startLaunch({ failures: { ploinky_demo_b: () => new Error('podman create failed') } }),
+        /^Error: 1 agent\(s\) failed to start: b$/,
+    );
+    // An ordinary extra failure keeps the baseline selector error.
+    await assert.rejects(
+        startLaunch({ additionalNames: ['ploinky_demo_x'], failures: { ploinky_demo_x: () => new Error('podman create failed') } }),
+        /additional runtime failure left edge selectors inactive; repair and run start again/,
+    );
+});

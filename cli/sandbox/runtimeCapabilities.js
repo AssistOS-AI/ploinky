@@ -32,8 +32,10 @@ import {
     LIMITS_HASH_LABEL,
     declaredMemoryBytes,
     limitsHash,
-    overridePolicyFromStored,
+    resolveStoredOverride,
 } from './hardwareLimits/resolve.mjs';
+import { verifyLaunchedHardwareLimits } from './hardwareLimits/delegation.mjs';
+import { engineCommandArgs } from './hardwareLimits/runtimeCommand.mjs';
 
 export const RUNTIME_CAPABILITY_POLICY_VERSION = 'ploinky-runtime-capabilities-v1';
 const ADMITTED_DESCRIPTORS = new WeakSet();
@@ -677,11 +679,9 @@ export function admitManifestRuntimeCapabilities(manifest, {
         ? hardwareFacts.overrides.get(String(agentId || '')) || null
         : null;
     if (storedOverride) {
-        try {
-            effectiveOverride = overridePolicyFromStored(storedOverride, hardwareFacts.envelope);
-        } catch (error) {
-            overrideProblem = String(error?.message || error).slice(0, 512);
-        }
+        const resolved = resolveStoredOverride(storedOverride, hardwareFacts.envelope, { ref: String(agentId || 'REPO/AGENT') });
+        if (resolved.problem) overrideProblem = resolved.problem;
+        else effectiveOverride = resolved.policy;
     }
     let descriptor = resolveEffectiveRuntimeCapabilities(exactManifest, {
         agentId,
@@ -791,6 +791,65 @@ export function hardwareRefusalOf(admission) {
     return admission?.hardwareEligibility?.state === 'refused' ? admission.hardwareEligibility.refusal : null;
 }
 
+/**
+ * The hardware steps of one managed agent launch, in their required order
+ * (plan §8.1, §8.3): immediately before create, recheck the admission's
+ * hardware inputs and add the engine prefix; after create/start, read the
+ * actual leaf back (an observed mismatch is a typed refusal; a process that
+ * is not running is an ordinary failure) and recheck the inputs again before
+ * the candidate can be returned for route publication. The caller's existing
+ * catch removes the candidate through its exact ownership checks.
+ */
+export function createHardwareLaunchGuard(runtimeAdmission, {
+    key,
+    ref,
+    alias = null,
+    runtime = 'podman',
+    query,
+    hardwareContext,
+    fsApi,
+    cgroupRoot,
+    procRoot,
+} = {}) {
+    const descriptor = runtimeAdmission.descriptor;
+    const recheck = () => assertHardwareAdmissionCurrent(runtimeAdmission, { hardwareContext });
+    return Object.freeze({
+        createArgs(args) {
+            recheck();
+            return engineCommandArgs(hardwareCommandPrefix(descriptor), args);
+        },
+        commandPrefix() {
+            return hardwareCommandPrefix(descriptor);
+        },
+        afterLaunch({ containerId, adopted = false }) {
+            if (descriptor.hardwarePlacement && !adopted) {
+                verifyLaunchedHardwareLimits({
+                    descriptor,
+                    containerId,
+                    runtime,
+                    query,
+                    ...(fsApi ? { fsApi } : {}),
+                    ...(cgroupRoot ? { cgroupRoot } : {}),
+                    ...(procRoot ? { procRoot } : {}),
+                    refuse: (detail, parts = null) => new HardwareLimitsError(buildDirectRefusal({
+                        key,
+                        ref,
+                        alias,
+                        refusalParts: {
+                            reasonCode: parts?.reasonCode || 'unprepared',
+                            reason: parts?.reason || `This Box is not prepared for hardware limits: ${detail}.`,
+                            fix: parts?.fix || 'On the host run ploinky limits status, repair the reported prerequisite, then ploinky restart.',
+                            requested: descriptor.hardwareRequest || [],
+                        },
+                        inputFingerprint: runtimeAdmission.hardwareEligibility?.inputFingerprint || '0'.repeat(64),
+                    })),
+                });
+            }
+            recheck();
+        },
+    });
+}
+
 export function assertRuntimeAdmissionCurrent(admission, {
     manifestBytes,
     profileName,
@@ -884,14 +943,9 @@ export function assertHardwareAdmissionCurrent(admission, { hardwareContext } = 
         const freshOverride = freshContext.gate === 'on' ? freshContext.overrides.get(admission.descriptor.agentId) || null : null;
         // Recompute the admission's override problem from the same inputs so a
         // refused over-envelope entry stays current while nothing changed.
-        let overrideProblem = null;
-        if (freshOverride) {
-            try {
-                overridePolicyFromStored(freshOverride, freshContext.envelope);
-            } catch (error) {
-                overrideProblem = String(error?.message || error).slice(0, 512);
-            }
-        }
+        const overrideProblem = freshOverride
+            ? resolveStoredOverride(freshOverride, freshContext.envelope, { ref: String(admission.descriptor.agentId || 'REPO/AGENT') }).problem
+            : null;
         const current = evaluateHardwareEligibility(admission.descriptor, freshContext, { overrideProblem });
         const admittedOverride = admission.descriptor.hardwareOverride || null;
         if (stableDigest(freshOverride ? canonicalize({ ...freshOverride }) : null) !== stableDigest(admittedOverride)) {
