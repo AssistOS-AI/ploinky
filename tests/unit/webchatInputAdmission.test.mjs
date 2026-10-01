@@ -140,7 +140,7 @@ function fixture(t, { inputResponse, uploadResponse, proofResponse } = {}) {
     };
 }
 
-test('delayed runtime readiness blocks every input path and retains the draft until one HTTP acceptance', async (t) => {
+test('delayed runtime readiness blocks input and submitting clears the draft before HTTP acceptance', async (t) => {
     const response = deferred();
     const f = fixture(t, { inputResponse: () => response.promise });
     const references = [{ kind: 'workspace-path', path: 'note.txt' }];
@@ -173,7 +173,7 @@ test('delayed runtime readiness blocks every input path and retains the draft un
     assert.equal(f.inputs.length, 1);
     assert.equal(f.bubbles.length, 1);
     assert.equal(f.bubbles[0].pending, true);
-    assert.equal(f.composer.getValue(), 'read @note.txt');
+    assert.equal(f.composer.getValue(), '');
     assert.equal(references.length, 1);
     assert.equal(f.cmdInput.disabled, true);
     assert.equal(await f.composer.submit(), false);
@@ -334,6 +334,21 @@ test('HTTP acceptance clears only the acknowledged draft revision, not a replace
     assert.equal(f.bubbles[0].text, 'first draft');
 });
 
+test('rejected delivery restores the submitted text only when no replacement draft exists', async (t) => {
+    const response = deferred();
+    const f = fixture(t, { inputResponse: () => response.promise });
+    f.ready();
+    f.composer.setValue('first draft');
+    const submitted = f.composer.submit();
+    await flush();
+    assert.equal(f.composer.getValue(), '');
+    f.composer.setValue('replacement draft');
+    response.resolve(new Response('unavailable', { status: 503 }));
+    assert.equal(await submitted, false);
+    assert.equal(f.composer.getValue(), 'replacement draft');
+    assert.equal(f.bubbles.length, 0);
+});
+
 test('attachment admission retains uploaded selections after rejection and acknowledges them without reuploading', async (t) => {
     let status = 409;
     const response = deferred();
@@ -404,7 +419,7 @@ test('fast streamed replies stay after pending user text and attachments before 
     assert.equal(f.timeline[0], f.bubbles[0]);
     assert.equal(f.timeline[0].pending, true);
     assert.equal(f.timeline[1].text, 'fast answer');
-    assert.equal(f.composer.getValue(), 'fast question');
+    assert.equal(f.composer.getValue(), '');
     response.resolve(new Response(null, { status: 204 }));
     assert.equal(await submitted, true);
     assert.equal(f.timeline[0].pending, false);
