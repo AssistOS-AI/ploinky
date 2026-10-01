@@ -4,6 +4,7 @@ import {
     BOX_RUNTIME_UID,
 } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
+import { isImmutableLocalImageId, normalizeImageId } from './image-id.mjs';
 import {
     WEBTTY_NATIVE_PROBE_PATH,
     parseAndValidateNativeProbeOutput,
@@ -161,6 +162,9 @@ export function validateImageContract(image, imageRef, {
     if (!image.id) {
         throw contractError(imageRef, 'image ID', 'a nonempty immutable ID', image.id);
     }
+    if (isImmutableLocalImageId(imageRef) && normalizeImageId(image.id) !== normalizeImageId(imageRef)) {
+        throw contractError(imageRef, 'image ID', JSON.stringify(normalizeImageId(imageRef)), image.id);
+    }
     if (!isRecord(image.labels) || !sameRecord(image.labels, {})) {
         throw contractError(
             imageRef,
@@ -230,6 +234,7 @@ export function probeImageBinaries(engine, imageId, runner) {
         'run',
         '--rm',
         '--network=none',
+        '--pull=never',
         '--entrypoint=/bin/bash',
         imageId,
         '-c',
@@ -314,7 +319,7 @@ function inspectImmutableImage(engine, imageId, imageRef, runner, operation) {
         throw observationError(imageId, operation, result);
     }
     const image = validateImageContract(normalizeImageInspect(result.stdout), imageRef);
-    if (image.immutableId !== imageId) {
+    if (normalizeImageId(image.immutableId) !== normalizeImageId(imageId)) {
         throw contractError(
             imageRef,
             'image ID',

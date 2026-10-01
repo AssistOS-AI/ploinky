@@ -20,7 +20,7 @@ import {
     normalizeBoxAgentLib,
 } from '../contract/agentlib.mjs';
 import { validateContainerConfiguration } from '../contract/container.mjs';
-import { normalizeImageId } from '../contract/image-id.mjs';
+import { isImmutableLocalImageId, normalizeImageId } from '../contract/image-id.mjs';
 import { PASTA_IPV4_NETWORK } from '../contract/network.mjs';
 import {
     assertBoxWorkspaceRoot,
@@ -155,6 +155,7 @@ export function containerCreateArgs({
     return [
         'container', 'create',
         '--init',
+        ...(isImmutableLocalImageId(imageRef) ? ['--pull=never'] : []),
         '--name', identity.instance,
         '--user', 'podman',
         '--userns', BOX_USERNS,
