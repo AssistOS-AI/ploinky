@@ -431,8 +431,15 @@ function createArgsFor(state, extra = {}) {
     });
 }
 
-test('G.off-byte-identical', (t) => {
+test('G.off-byte-identical', async (t) => {
     const state = fixture(t);
+    // The gate-off create argv equals the golden captured from the baseline
+    // 8d8c4b77 export (tests/hardware-limits/gateOffCreateArgs.mjs), not the
+    // candidate compared with itself.
+    const golden = JSON.parse(fs.readFileSync(new URL('../fixtures/hardware-limits/gate-off-create-args-8d8c4b77.json', import.meta.url), 'utf8'));
+    const repository = path.resolve(import.meta.dirname, '../..');
+    assert.deepEqual(await normalizedGateOffCreateArgs(repository), golden, 'default (no hardware argument) matches the baseline bytes');
+    assert.deepEqual(await normalizedGateOffCreateArgs(repository, { extra: { hardware: null } }), golden, 'gate off matches the baseline bytes');
     const baseline = createArgsFor(state);
     assert.deepEqual(createArgsFor(state, { hardware: null }), baseline, 'gate off adds nothing');
     assert.equal(baseline.some((arg) => String(arg).startsWith(`${BOX_LABELS.hardwareLimits}=`)
@@ -627,40 +634,117 @@ test('G.targeted-gate-change', async (t) => {
 });
 
 test('G.every-final-generation', async (t) => {
+    // Every gate-on generation a host operation creates, replaces, restarts
+    // or restores is prepared before its graph work. GPU grant, revoke and
+    // the internal GPU reapply are covered by G.every-final-generation-gpu.
     const state = fixture(t);
+    const previousHome = process.env.HOME;
+    process.env.HOME = state.home;
+    t.after(() => { process.env.HOME = previousHome; });
+    writeGraphSkillScope(state.identity, buildHostSkillScope(state.identity.workspaceRoot, state.identity.workspaceRoot), lockFor(state.identity));
+    const graphEvents = new Set(['graph', 'start-core']);
+    const supervisorFor = (events, { ownership = owned(state.identity), env = { PLOINKY_BOX_HARDWARE_LIMITS: 'on' }, reconcile } = {}) => createBoxSupervisor({
+        env,
+        resolveIdentity: () => state.identity,
+        launchCwd: state.identity.workspaceRoot,
+        lockManager: fakeLockManager(state.root, events),
+        discover: () => ownership,
+        runner: {
+            run(_c, args) { events.push(`run:${args[0]}`); },
+            query() { return { ok: true, status: 0, stdout: INBOX_READY }; },
+        },
+        selectAgentLib: async () => ({ selection: agentLibFixture(state.identity.workspaceRoot), mode: 'local' }),
+        updateAgentLib: async () => ({ selection: agentLibFixture(state.identity.workspaceRoot), changed: false, previous: null }),
+        updateWorkspacePloinky: async () => ({ found: false }),
+        reconcile: reconcile || (async (options) => ({ action: 'replaced', ownership: owned(state.identity, { id: 'f'.repeat(64) }), hostPort: 8080, mediaHostPort: 7882, hardware: options.hardware })),
+        captureCoreStartArgv: () => ['start', 'explorer', '8080'],
+        readEdgeDesired: () => null,
+        startCore: async () => { events.push('start-core'); },
+        runCoreCommand: async (_engine, _id, argv) => { events.push(argv[0] === 'start' && argv.length > 1 ? 'graph' : `core:${argv[0]}`); },
+        resolveHostReachableIpv4: async () => '127.0.0.1',
+        healthCheck: async () => {},
+        revalidateAgentLibSource: () => {},
+        commitAgentLibSelection: () => {},
+        validateExistingImage: () => ({ immutableId: `sha256:${'b'.repeat(64)}` }),
+        validateContainer: () => {},
+        hardwareGateStore: state.gateStore,
+        prepareHardwareGeneration: async ({ containerId, hardware }) => {
+            events.push(`prepare:${containerId.slice(0, 4)}:${hardware.fingerprint.slice(0, 8)}`);
+            return { structurallyPrepared: true };
+        },
+        stdout: { write() { return true; } },
+        stderr: { write() { return true; } },
+    });
+    const preparedBeforeGraph = (events, label, graphMarkers = [...graphEvents, 'core:start', 'core:restart', 'core:update']) => {
+        const prepare = events.findIndex((event) => event.startsWith('prepare:'));
+        const graph = events.findIndex((event) => graphMarkers.includes(event));
+        assert.ok(prepare >= 0, `${label} prepares its gate-on generation: ${events.join(' ')}`);
+        assert.ok(graph < 0 || prepare < graph, `${label} prepares before graph work: ${events.join(' ')}`);
+    };
     for (const [operation, invoke] of [
         ['start', (supervisor) => supervisor.runStartTransaction(['start', 'explorer'])],
         ['restart', (supervisor) => supervisor.runRestartTransaction(['restart'])],
+        ['update', (supervisor) => supervisor.runUpdateTransaction(['update'], { restartAfterUpdate: true })],
     ]) {
         const events = [];
-        const ownership = owned(state.identity);
-        const supervisor = createBoxSupervisor({
-            env: { PLOINKY_BOX_HARDWARE_LIMITS: 'on' },
-            resolveIdentity: () => state.identity,
-            launchCwd: state.identity.workspaceRoot,
-            lockManager: fakeLockManager(state.root, events),
-            discover: () => ownership,
-            runner: { run(_c, args) { events.push(`run:${args[0]}`); } },
-            selectAgentLib: async () => ({ selection: agentLibFixture(state.identity.workspaceRoot), mode: 'local' }),
-            reconcile: async (options) => ({ action: 'replaced', ownership, hostPort: 8080, mediaHostPort: 7882, hardware: options.hardware }),
-            readEdgeDesired: () => null,
-            startCore: async () => { events.push('graph'); },
-            runCoreCommand: async () => { events.push('graph'); },
-            resolveHostReachableIpv4: async () => '127.0.0.1',
-            healthCheck: async () => {},
-            revalidateAgentLibSource: () => {},
-            commitAgentLibSelection: () => {},
-            hardwareGateStore: state.gateStore,
-            prepareHardwareGeneration: async ({ containerId, hardware }) => {
-                events.push(`prepare:${containerId}:${hardware.fingerprint.slice(0, 8)}`);
-                return { structurallyPrepared: true };
-            },
-        });
-        await invoke(supervisor);
-        const prepare = events.findIndex((event) => event.startsWith('prepare:'));
-        assert.ok(prepare >= 0, `${operation} prepares its gate-on generation`);
-        assert.ok(prepare < events.indexOf('graph'), `${operation} prepares before graph work`);
+        await invoke(supervisorFor(events));
+        preparedBeforeGraph(events, operation);
     }
+    // bind creating a Box follows the saved gate (on) and prepares it.
+    state.gateStore.write(state.identity, true, lockFor(state.identity));
+    const bindEvents = [];
+    await supervisorFor(bindEvents, { env: {}, ownership: { state: 'absent', engine: { name: 'podman', identity: 'engine' }, handles: {} } })
+        .runBindTransaction({ address: '127.0.0.1', hostPort: 8080 });
+    preparedBeforeGraph(bindEvents, 'bind');
+    // Rollback restoration: the replacement's graph fails, the previous
+    // gate-on Box is restored, and that restored generation is prepared
+    // before its graph is restored.
+    const rollbackEvents = [];
+    const failing = createBoxSupervisor({
+        env: { PLOINKY_BOX_HARDWARE_LIMITS: 'on' },
+        resolveIdentity: () => state.identity,
+        launchCwd: state.identity.workspaceRoot,
+        lockManager: fakeLockManager(state.root, rollbackEvents),
+        discover: () => owned(state.identity),
+        runner: { run(_c, args) { rollbackEvents.push(`run:${args[0]}`); }, query() { return { ok: true, status: 0, stdout: INBOX_READY }; } },
+        selectAgentLib: async () => ({ selection: agentLibFixture(state.identity.workspaceRoot), mode: 'local' }),
+        reconcile: async (options) => ({
+            action: 'replaced', ownership: owned(state.identity, { id: '1'.repeat(64) }), hostPort: 8080, mediaHostPort: 7882,
+            hardware: options.hardware, gpu: null, routerBinding: options.routerBinding, previousAgentLib: options.agentLib,
+            async rollback() {
+                rollbackEvents.push('outer-rollback');
+                return {
+                    action: 'restored', containerId: '2'.repeat(64), hostPort: 8080, mediaHostPort: 7882,
+                    agentLib: options.agentLib, routerBinding: options.routerBinding, gpu: null, hardware: options.hardware,
+                };
+            },
+        }),
+        captureCoreStartArgv: () => ['start', 'explorer', '8080'],
+        readEdgeDesired: () => null,
+        runCoreCommand: async (_engine, id, argv) => {
+            rollbackEvents.push(`core:${id.slice(0, 4)}:${argv.join(' ')}`);
+            if (id.startsWith('1111')) throw new Error('candidate graph failed');
+        },
+        resolveHostReachableIpv4: async () => '127.0.0.1',
+        healthCheck: async () => {},
+        revalidateAgentLibSource: () => {},
+        commitAgentLibSelection: () => {},
+        validateExistingImage: () => ({ immutableId: `sha256:${'b'.repeat(64)}` }),
+        validateContainer: () => {},
+        hardwareGateStore: state.gateStore,
+        prepareHardwareGeneration: async ({ containerId }) => {
+            rollbackEvents.push(`prepare:${containerId.slice(0, 4)}`);
+            return { structurallyPrepared: true };
+        },
+        stdout: { write() { return true; } },
+        stderr: { write() { return true; } },
+    });
+    await assert.rejects(failing.runRestartTransaction(['restart']), /candidate graph failed/);
+    const order = (marker) => rollbackEvents.findIndex((event) => event.startsWith(marker));
+    assert.ok(order('prepare:1111') >= 0 && order('prepare:1111') < order('core:1111'), rollbackEvents.join(' '));
+    assert.ok(order('outer-rollback') >= 0, rollbackEvents.join(' '));
+    assert.ok(order('prepare:2222') > order('outer-rollback'), `the restored generation is prepared: ${rollbackEvents.join(' ')}`);
+    assert.ok(order('prepare:2222') < order('core:2222:start explorer 8080'), `prepared before its graph: ${rollbackEvents.join(' ')}`);
 });
 
 // ---------------------------------------------------------------------------
@@ -668,6 +752,7 @@ test('G.every-final-generation', async (t) => {
 // locks on the U9 path (F4) and the real downgrade effects (R7).
 
 const { runOuterCli } = await import('../../ploinky-box/bin/ploinky-box.mjs');
+const { normalizedGateOffCreateArgs } = await import('../hardware-limits/gateOffCreateArgs.mjs');
 const {
     SimulatedProcessDeath,
     createTransitionStore,

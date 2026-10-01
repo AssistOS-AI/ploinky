@@ -926,6 +926,9 @@ export function createBoxSupervisor({
         }
         if (restoreGraph && outerRollback?.agentLib && failures.length === 0) {
             try {
+                // A restored gate-on generation is prepared before its graph
+                // is restored (§6.5 Rollback restoration, U11).
+                await prepareGateOnGeneration(identity, ownership.engine, outerRollback.containerId, outerRollback.hardware ?? null);
                 await restorePriorGraph({
                     identity,
                     engine: ownership.engine,

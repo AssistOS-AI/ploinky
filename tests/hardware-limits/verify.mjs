@@ -377,9 +377,13 @@ export async function runSuite({
     const temp = createOwnedShortTemp(tempParent, { name: `hwl-${childId.replace(/[^A-Za-z0-9-]/g, '-')}-${randomRunId().slice(0, 8)}` });
     let run;
     try {
+        // Test children never see the real HOME (~/.ploinky-box host
+        // records, locks): it is a fresh directory inside the owned temp tree.
+        const home = path.join(temp.path, 'home');
+        fs.mkdirSync(home, { mode: 0o700 });
         const env = {
             PATH: process.env.PATH || '/usr/bin:/bin',
-            HOME: process.env.HOME || temp.path,
+            HOME: home,
             TMPDIR: temp.path,
             PLOINKY_ROOT: root,
             PLOINKY_HWL_RUN_ID: runId,

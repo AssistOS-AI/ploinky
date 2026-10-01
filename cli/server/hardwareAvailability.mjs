@@ -176,29 +176,3 @@ export function hardwareStartupResultFromCompiled(entry) {
         fix: safeText(entry.fix, 2048),
     });
 }
-
-// After a repair, the instances to re-admit: those previously refused or
-// blocked that are now eligible, in dependency order (prerequisites first).
-// Unrelated eligible instances are never part of the closure.
-export function repairClosurePlan({ before, after, edges = [] }) {
-    const recovered = [...after.keys()].filter((key) => (
-        before.get(key)?.state && before.get(key).state !== 'eligible' && after.get(key)?.state === 'eligible'
-    ));
-    const set = new Set(recovered);
-    const prerequisites = new Map(recovered.map((key) => [key, []]));
-    for (const edge of edges) {
-        if (set.has(edge.fromKey) && set.has(edge.toKey)) prerequisites.get(edge.fromKey).push(edge.toKey);
-    }
-    const ordered = [];
-    const state = new Map();
-    const visit = (key) => {
-        if (state.get(key) === 'done') return;
-        if (state.get(key) === 'visiting') return;
-        state.set(key, 'visiting');
-        for (const prerequisite of [...prerequisites.get(key)].sort()) visit(prerequisite);
-        state.set(key, 'done');
-        ordered.push(key);
-    };
-    for (const key of [...recovered].sort()) visit(key);
-    return Object.freeze(ordered);
-}

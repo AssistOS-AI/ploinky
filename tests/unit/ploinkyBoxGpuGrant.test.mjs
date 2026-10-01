@@ -2379,3 +2379,74 @@ test('D14 first start: no-wait launches that outlast the bound, or cannot be cou
         assert.deepEqual(events.filter((event) => event.startsWith('grant-')), []);
     }
 });
+
+// ---------------------------------------------------------------------------
+// Hardware limits: every gate-on generation a GPU grant, revoke or internal
+// GPU reapply creates or replaces is prepared before its graph (U11, §6.5).
+
+test('G.every-final-generation-gpu', async (t) => {
+    const probe = boxFixture(t);
+    const home = useTempHome(t, probe.root);
+    useFakeHostFiles(t, fakeHost());
+    const { createHardwareGateStore, resolveDesiredHardwareWiring } = await import('../../ploinky-box/hardwareLimitsGate.mjs');
+    const { initializeStore } = await import('../../cli/sandbox/hardwareLimits/store.mjs');
+    const scenario = async (label, { gpu = null, overrides = {}, invoke, generations }) => {
+        const box = graphBox(t, { gpu });
+        const gateStore = createHardwareGateStore({ homeDirectory: home });
+        gateStore.write(box.identity, true, box.lock);
+        const wiring = resolveDesiredHardwareWiring({ identity: box.identity, enabled: true, homeDirectory: home, initializeStore });
+        const events = [];
+        let replacements = 0;
+        const supervisor = gpuSupervisor(box, events, {
+            gpuGrantStore: memoryGpuStore(events),
+            hardwareGateStore: gateStore,
+            async reconcile(options) {
+                events.push('reconcile');
+                replacements += 1;
+                // An existing Box keeps its observed hardware wiring.
+                return { ...prepared(box, replacements === 1 && label === 'reapply' ? 'reused' : 'replaced', options.gpu, events), hardware: options.hardware ?? wiring };
+            },
+            async startCore() { events.push('start-core'); },
+            async healthCheck() { events.push('health'); },
+            prepareHardwareGeneration: async ({ hardware }) => {
+                events.push(`prepare:${hardware.fingerprint.slice(0, 8)}`);
+                return { structurallyPrepared: true };
+            },
+            ...overrides,
+        });
+        await invoke(supervisor);
+        const prepares = events.filter((event) => event.startsWith('prepare:'));
+        const starts = events.filter((event) => event === 'start-core');
+        assert.equal(prepares.length, generations, `${label}: ${events.join(' ')}`);
+        assert.equal(starts.length, generations, `${label}: ${events.join(' ')}`);
+        // Each start of graph work follows its own generation's preparation.
+        let pending = 0;
+        for (const event of events) {
+            if (event.startsWith('prepare:')) pending += 1;
+            if (event === 'start-core') {
+                assert.ok(pending > 0, `${label}: graph work before preparation: ${events.join(' ')}`);
+                pending -= 1;
+            }
+        }
+    };
+    await scenario('grant', { invoke: (supervisor) => supervisor.runGpuGrantTransaction({ vendor: 'nvidia', agents: [AGENT] }), generations: 1 });
+    await scenario('revoke', {
+        gpu: (state) => activeWiring(state.identity),
+        invoke: (supervisor) => supervisor.runGpuRevokeTransaction({}),
+        generations: 1,
+    });
+    // The start's own generation, then one internal GPU reapply replacement.
+    let scans = 0;
+    await scenario('reapply', {
+        overrides: {
+            scanGpuAgents: () => (scans++ === 0 ? [] : [AGENT]),
+            selectAgentLib: async () => ({ selection: probe.agentLib }),
+            commitAgentLibSelection: () => {},
+            revalidateAgentLibSource: () => {},
+            countNoWaitWorkers: () => 0,
+            waitDelay: async () => {},
+        },
+        invoke: (supervisor) => supervisor.runStartTransaction(['start', 'explorer', '8080']),
+        generations: 2,
+    });
+});

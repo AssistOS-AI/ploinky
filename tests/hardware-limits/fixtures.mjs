@@ -254,7 +254,7 @@ export function buildRequiredCaseManifest() {
             'H.truncated-stream', 'H.missing-required', 'H.required-skip', 'H.required-todo', 'H.removed-baseline',
             'H.complete-pass', 'H.cleanup-destroy-failure', 'H.cleanup-identity-failure',
             'H.cleanup-original-and-cleanup-errors', 'H.pid-12-34-not-123-934', 'H.pid-reuse', 'H.query-error',
-            'H.malformed-pids', 'H.initial-busy', 'H.graphics-unknown-blocked',
+            'H.malformed-pids', 'H.initial-busy', 'H.graphics-unknown-blocked', 'H.scratch-home',
         ]),
         ...leaves(P, 'p0', unit('hardwareLimitsAdmission.test.mjs'), [
             'A.manifest-memory', 'A.catalog-cpu', 'A.profile-pids', 'A.lite-enabled-absent', 'A.lite-enabled-false',
@@ -299,6 +299,7 @@ export function buildRequiredCaseManifest() {
             'G.update-gate-before-host-source', 'G.pending-downgrade-blocks-bind-grant-revoke', 'G.u9-stale-store-lock',
             'G.downgrade-running-graph-restored', 'G.downgrade-stopped-graph-not-started',
         ]),
+        ...leaves(P, 'p1', unit('ploinkyBoxGpuGrant.test.mjs'), ['G.every-final-generation-gpu']),
         ...leaves(P, 'p1', unit('ploinkyBoxHardwareLimitsTransitions.test.mjs'), [
             'T.first-on-no-barrier', 'T.on-on-no-barrier', 'T.policy-write-before-barrier',
             'T.policy-write-after-barrier', 'T.reads-and-watchdog-during-barrier', 'T.apply-blocked',

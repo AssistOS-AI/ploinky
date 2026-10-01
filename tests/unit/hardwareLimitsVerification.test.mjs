@@ -141,6 +141,26 @@ test('H.complete-pass', async (t) => {
     assert.equal(result.discovered, 2);
 });
 
+test('H.scratch-home', async (t) => {
+    // R9: a test child gets a scratch HOME inside the runner's owned temp
+    // tree, never the invoking user's real one.
+    const probe = `import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+test('leaf.home', () => {
+    const tmp = fs.realpathSync(process.env.TMPDIR);
+    assert.notEqual(process.env.HOME, ${JSON.stringify(os.homedir())});
+    assert.equal(path.dirname(fs.realpathSync(process.env.HOME)), tmp);
+    assert.deepEqual(fs.readdirSync(process.env.HOME), []);
+    fs.writeFileSync(path.join(process.env.HOME, 'written-by-test'), 'x');
+});
+`;
+    const { result } = await run(t, { 'a.test.mjs': probe }, { required: [requiredCase('a.test.mjs', 'leaf.home')] });
+    assert.equal(result.verdict, 'PASS', result.problems.join('\n'));
+    assert.equal(fs.existsSync(path.join(os.homedir(), 'written-by-test')), false, 'nothing reached the real HOME');
+});
+
 function cleanupOperations(calls, failures = {}) {
     const operation = (name) => async () => {
         calls.push(name);

@@ -13,7 +13,6 @@ import {
     buildAvailabilityProjection,
     identityHardwareUnavailable,
     markRouteHardwareUnavailable,
-    repairClosurePlan,
 } from '../../cli/server/hardwareAvailability.mjs';
 import { mergeRuntimeRoute } from '../../cli/server/routingFile.js';
 import {
@@ -28,7 +27,13 @@ import {
     wrapPreservingHardwareCause,
     HardwareLimitsError,
 } from '../../cli/sandbox/hardwareLimits/errors.mjs';
-import { printStartResultSummary } from '../../cli/commands/workspaceUtil.js';
+import {
+    createGraphAvailabilityTracker,
+    launchWorkspaceGraphWaves,
+    printStartResultSummary,
+} from '../../cli/commands/workspaceUtil.js';
+import { spawnSync } from 'node:child_process';
+import { writeAgentLibCheckout } from '../helpers/agentlibFixture.mjs';
 
 const REPO_ROOT = path.resolve(fileURLToPath(new URL('../..', import.meta.url)));
 
@@ -299,15 +304,31 @@ test('AV.unrelated-ready', (t) => {
     assert.equal(plan.hardwareAvailability, undefined);
 });
 
-test('AV.router-controls', (t) => {
+test('AV.router-controls', async (t) => {
+    // The static agent (alpha) is refused. Router-owned controls still resolve
+    // to router surfaces and the agent-startup dispatcher leaves them alone,
+    // while the application route answers terminally with the fix.
     createFixture(t);
-    const webtty = resolveEdgeRoutePlan({ req: { method: 'GET', url: '/webtty', headers: { host: '127.0.0.1:18080' } }, listener: 'public' });
-    assert.equal(webtty.ok, true);
-    assert.notEqual(webtty.code, 'AGENT_HARDWARE_UNAVAILABLE');
-    const routing = fs.readFileSync(path.join(REPO_ROOT, 'cli/server/RoutingServer.js'), 'utf8');
-    const marketplace = routing.indexOf("if (pathname === '/api/marketplace'");
-    const startup = routing.indexOf('dispatchAgentStartupAfterRouterSurfaces({');
-    assert.ok(marketplace > 0 && marketplace < startup, 'Router-owned controls precede the agent availability answer');
+    for (const pathname of ['/webtty', '/api/marketplace', '/auth/login']) {
+        const req = { method: 'GET', url: pathname, headers: { host: '127.0.0.1:18080', accept: 'application/json' } };
+        const plan = resolveEdgeRoutePlan({ req, listener: 'public' });
+        // Either a resolved plan or a control-host miss, which the Router
+        // serves from its own surfaces; never an unavailable-agent denial.
+        const controlMiss = !plan.ok && plan.code === 'ROUTE_NOT_FOUND' && plan.hostSelection?.kind === 'control';
+        assert.ok(plan.ok || controlMiss, `${pathname}: ${plan.code}`);
+        assert.notEqual(plan.code, 'AGENT_HARDWARE_UNAVAILABLE', pathname);
+        assert.equal(plan.hardwareAvailability, undefined, pathname);
+        assert.notEqual(plan.kind, 'agent-root-pending', pathname);
+        const { handled, res } = await dispatch(req, plan);
+        assert.equal(handled, false, `${pathname} is not answered as an unavailable agent`);
+        assert.equal(res.statusCode, 0);
+    }
+    const app = request({ routeKey: 'alpha', pathname: '/index.html', accept: 'text/html', extra: { 'sec-fetch-dest': 'document', 'sec-fetch-mode': 'navigate' } });
+    const { handled, res, lifecycleReads } = await dispatch(app, resolveEdgeRoutePlan({ req: app, listener: 'public' }));
+    assert.equal(handled, true);
+    assert.equal(lifecycleReads, 0, 'terminal: no startup observation or reload loop');
+    assert.equal(res.statusCode, 503);
+    assert.match(res.body, /data-ploinky-agent-startup-page="unavailable"/);
 });
 
 test('AV.explorer-optional-child-ready', () => {
@@ -357,37 +378,89 @@ test('AV.background-result-projection', () => {
     assert.equal(marketplace.hardwareOutcome.key, 'alpha-container');
 });
 
-test('AV.individual-nonzero', () => {
+test('AV.individual-nonzero', (t) => {
+    // An individual restart of a refused target exits nonzero with the typed
+    // refusal (here a lite-sandbox agent declaring a memory limit), whatever
+    // the whole-workspace state; it never reports success.
+    const workspace = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-individual-')));
+    t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+    writeAgentLibCheckout(path.join(workspace, 'achillesAgentLib'));
+    const ploinky = path.join(workspace, '.ploinky');
+    for (const repoName of ['AchillesIDE', 'AchillesCLI', 'copilot-agents']) fs.mkdirSync(path.join(ploinky, 'repos', repoName), { recursive: true });
+    const agentDir = path.join(ploinky, 'repos', 'demo', 'limited');
+    fs.mkdirSync(agentDir, { recursive: true });
+    writeJson(path.join(agentDir, 'manifest.json'), {
+        'lite-sandbox': true, agent: 'node server.js', network: { mode: 'host' },
+        llmRuntime: { runtimePolicy: { resources: { memory: '64m' } } },
+    });
+    writeJson(path.join(ploinky, 'routing.json'), { routes: {} });
+    writeJson(path.join(ploinky, 'agents.json'), {
+        _config: { sandbox: { disableHostRuntimes: false } },
+        ploinky_demo_limited: {
+            type: 'agent', repoName: 'demo', agentName: 'limited', containerName: 'ploinky_demo_limited',
+            instanceId: 'limited-instance', enableGeneration: 'limited-generation', profile: 'default', auth: { mode: 'none' },
+        },
+    });
+    fs.mkdirSync(path.join(ploinky, 'data', 'router-security'), { recursive: true });
+    writeJson(path.join(ploinky, 'data', 'router-security', 'policy-state.json'), { schema: 'router-policy', httpRoutes: [], mcpTools: [] });
+    fs.mkdirSync(path.join(ploinky, 'data', 'edge-routing'), { recursive: true });
+    writeJson(path.join(ploinky, 'data', 'edge-routing', 'desired.json'), { hosts: {} });
+    const result = spawnSync(process.execPath, [path.join(REPO_ROOT, 'cli', 'index.js'), 'restart', 'limited'], {
+        cwd: workspace,
+        encoding: 'utf8',
+        env: { ...process.env, PLOINKY_WORKSPACE_ROOT: workspace, PLOINKY_MASTER_KEY: '5'.repeat(64) },
+    });
+    const output = `${result.stdout}\n${result.stderr}`;
+    assert.notEqual(result.status, 0, output);
+    const tool = process.platform === 'darwin' ? 'sandbox-exec' : 'bwrap';
+    const sandboxAvailable = spawnSync('sh', ['-c', `command -v ${tool}`]).status === 0;
+    if (sandboxAvailable) {
+        assert.match(output, /Refused \(hardware limits\): demo\/limited \[[^\]]+\] requests memory 64m \(manifest\)\. This runtime cannot apply memory\./);
+    } else {
+        // Without a host sandbox tool the CLI refuses earlier, still nonzero.
+        assert.match(output, /sandbox/i);
+    }
+    assert.doesNotMatch(output, /Agent restarted/);
+    // The cause-preserving wrapper keeps the typed outcome for callers that
+    // wrap the individual failure (Marketplace worker, HTTP mapping).
     const individual = wrapPreservingHardwareCause('Failed to restart container alpha-container: refused',
         new HardwareLimitsError(refusal('alpha-container')));
-    assert.ok(individual instanceof Error);
     assert.equal(individual.code, HARDWARE_UNENFORCEABLE);
     assert.equal(findHardwareOutcome(individual).key, 'alpha-container');
-    // The CLI restart wrappers keep the typed cause (the process exits 1 on a
-    // thrown error); a degraded whole-start never converts it to success.
-    const cli = fs.readFileSync(path.join(REPO_ROOT, 'cli/commands/cli.js'), 'utf8');
-    assert.ok(cli.includes('throw wrapPreservingHardwareCause(\n                                    `managed restart failed'));
-    assert.equal(cli.includes("throw new Error(`managed restart failed:"), false);
 });
 
-test('AV.repair-closure', () => {
-    const edges = [
-        availabilityEdge({ fromKey: 'a', toKey: 'b', kind: 'blocking', source: 'manifest' }),
-        availabilityEdge({ fromKey: 'b', toKey: 'c', kind: 'blocking', source: 'manifest' }),
-    ];
-    const before = classifyAvailability({
-        nodes: [
-            { key: 'a', ref: 'demo/a', alias: null, refusal: null },
-            { key: 'b', ref: 'demo/b', alias: null, refusal: null },
-            { key: 'c', ref: 'demo/c', alias: null, refusal: refusal('c', 'demo/c') },
-            { key: 'u', ref: 'demo/u', alias: null, refusal: null },
-        ],
-        edges,
+test('AV.repair-closure', async () => {
+    // After the refused root is repaired, a new start re-admits it and its
+    // previously blocked closure in dependency order (root first), and the
+    // unrelated agent is launched as before.
+    const node = (id, dependencies = []) => ({
+        id, dependencies: new Set(dependencies), dependencyEdges: new Map(dependencies.map((child) => [child, { noWait: false }])),
     });
-    const after = classifyAvailability({
-        nodes: ['a', 'b', 'c', 'u'].map((key) => ({ key, ref: `demo/${key}`, alias: null, refusal: null })),
-        edges,
-    });
-    assert.deepEqual(repairClosurePlan({ before, after, edges }), ['c', 'b', 'a'],
-        'the repaired root first, then its newly eligible closure; unrelated u untouched');
+    const graph = { nodes: new Map([['a', node('a', ['b'])], ['b', node('b', ['c'])], ['c', node('c')], ['u', node('u')]]) };
+    const admissions = (refusedC) => ['a', 'b', 'c', 'u'].map((key) => ({
+        nodeId: key, key, alias: '', admission: { agentId: `demo/${key}` }, hardwareRefusal: refusedC && key === 'c' ? refusal('c', 'demo/c') : null,
+    }));
+    const run = async (refusedC) => {
+        const launched = [];
+        const availability = createGraphAvailabilityTracker(graph, admissions(refusedC));
+        const outcomes = [];
+        await launchWorkspaceGraphWaves({
+            graphWaves: [['c', 'u'], ['b'], ['a']],
+            nodes: graph.nodes,
+            registryNameByNodeId: new Map(['a', 'b', 'c', 'u'].map((key) => [key, key])),
+            availability,
+            launch: async (names) => { launched.push(...names); return { routeResults: [], failedAgents: [] }; },
+            readinessEntryFor: (entry) => entry.id,
+            waitForReadiness: async () => {},
+            reportOutcome: (outcome) => outcomes.push(`${outcome.state}:${outcome.key}`),
+            log() {},
+        });
+        return { launched, outcomes };
+    };
+    const before = await run(true);
+    assert.deepEqual(before.launched, ['u'], 'refused c and its blocked closure b, a are not launched');
+    assert.deepEqual(before.outcomes.sort(), ['blocked:a', 'blocked:b', 'refused:c']);
+    const after = await run(false);
+    assert.deepEqual(after.launched, ['c', 'u', 'b', 'a'], 'the repaired root first, then its closure in dependency order');
+    assert.deepEqual(after.outcomes, []);
 });
