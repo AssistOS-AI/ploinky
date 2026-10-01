@@ -734,6 +734,53 @@ test('G.every-final-generation', async (t) => {
     assert.ok(order('outer-rollback') >= 0, rollbackEvents.join(' '));
     assert.ok(order('prepare:2222') > order('outer-rollback'), `the restored generation is prepared: ${rollbackEvents.join(' ')}`);
     assert.ok(order('prepare:2222') < order('core:2222:start explorer 8080'), `prepared before its graph: ${rollbackEvents.join(' ')}`);
+    // The restored branch: the failed replacement itself restored the old
+    // gate-on Box (boxRollback action 'restored'); that generation is
+    // prepared before its graph is restored, through start, restart and update.
+    const wiring = resolveDesiredHardwareWiring({ identity: state.identity, enabled: true, homeDirectory: state.home, initializeStore });
+    for (const [operation, invoke] of [
+        ['start', (supervisor) => supervisor.runStartTransaction(['start', 'explorer'])],
+        ['restart', (supervisor) => supervisor.runRestartTransaction(['restart'])],
+        ['update', (supervisor) => supervisor.runUpdateTransaction(['update'], { restartAfterUpdate: true })],
+    ]) {
+        const events = [];
+        const supervisor = createBoxSupervisor({
+            env: { PLOINKY_BOX_HARDWARE_LIMITS: 'on' },
+            resolveIdentity: () => state.identity,
+            launchCwd: state.identity.workspaceRoot,
+            lockManager: fakeLockManager(state.root, events),
+            discover: () => owned(state.identity),
+            runner: { run() {}, query() { return { ok: true, status: 0, stdout: INBOX_READY }; } },
+            selectAgentLib: async () => ({ selection: agentLibFixture(state.identity.workspaceRoot), mode: 'local' }),
+            updateAgentLib: async () => ({ selection: agentLibFixture(state.identity.workspaceRoot), changed: false, previous: null }),
+            updateWorkspacePloinky: async () => ({ found: false }),
+            reconcile: async (options) => {
+                const error = new Error('candidate start failed; the old Box was restored');
+                error.boxRollback = Object.freeze({
+                    action: 'restored', containerId: '3'.repeat(64), oldStopAttempted: true, previouslyRunning: true,
+                    hostPort: 8080, mediaHostPort: 7882, routerBinding: options.routerBinding, gpu: null,
+                    hardware: wiring, agentLib: options.agentLib,
+                });
+                throw error;
+            },
+            captureCoreStartArgv: () => ['start', 'explorer', '8080'],
+            readEdgeDesired: () => null,
+            runCoreCommand: async (_engine, id, argv) => { events.push(`core:${id.slice(0, 4)}:${argv.join(' ')}`); },
+            resolveHostReachableIpv4: async () => '127.0.0.1',
+            healthCheck: async () => {},
+            revalidateAgentLibSource: () => {},
+            commitAgentLibSelection: () => {},
+            hardwareGateStore: state.gateStore,
+            prepareHardwareGeneration: async ({ containerId }) => { events.push(`prepare:${containerId.slice(0, 4)}`); return { structurallyPrepared: true }; },
+            stdout: { write() { return true; } },
+            stderr: { write() { return true; } },
+        });
+        await assert.rejects(invoke(supervisor), /the old Box was restored/, operation);
+        const prepare = events.indexOf('prepare:3333');
+        const graph = events.indexOf('core:3333:start explorer 8080');
+        assert.ok(prepare >= 0, `${operation}: the restored generation is prepared: ${events.join(' ')}`);
+        assert.ok(graph > prepare, `${operation}: prepared before its graph: ${events.join(' ')}`);
+    }
 });
 
 // ---------------------------------------------------------------------------
@@ -1155,60 +1202,6 @@ test('G.preserved-recovery-keeps-gate-on', async (t) => {
         const prepare = world.events.findIndex((event) => event.startsWith('prepare:'));
         const graph = world.events.indexOf('core:start explorer 8090');
         assert.ok(prepare >= 0 && graph > prepare, `${operation}: ${world.events.join(' ')}`);
-    }
-});
-
-test('G.restored-generation-prepared', async (t) => {
-    // K5: when the failed replacement restored the old gate-on Box (the
-    // restored branch), that generation is prepared before its graph.
-    const state = fixture(t);
-    const previousHome = process.env.HOME;
-    process.env.HOME = state.home;
-    t.after(() => { process.env.HOME = previousHome; });
-    writeGraphSkillScope(state.identity, buildHostSkillScope(state.identity.workspaceRoot, state.identity.workspaceRoot), lockFor(state.identity));
-    const wiring = resolveDesiredHardwareWiring({ identity: state.identity, enabled: true, homeDirectory: state.home, initializeStore });
-    for (const [operation, invoke] of [
-        ['start', (supervisor) => supervisor.runStartTransaction(['start', 'explorer'])],
-        ['restart', (supervisor) => supervisor.runRestartTransaction(['restart'])],
-        ['update', (supervisor) => supervisor.runUpdateTransaction(['update'], { restartAfterUpdate: true })],
-    ]) {
-        const events = [];
-        const supervisor = createBoxSupervisor({
-            env: { PLOINKY_BOX_HARDWARE_LIMITS: 'on' },
-            resolveIdentity: () => state.identity,
-            launchCwd: state.identity.workspaceRoot,
-            lockManager: fakeLockManager(state.root, events),
-            discover: () => owned(state.identity),
-            runner: { run() {}, query() { return { ok: true, status: 0, stdout: INBOX_READY }; } },
-            selectAgentLib: async () => ({ selection: agentLibFixture(state.identity.workspaceRoot), mode: 'local' }),
-            updateAgentLib: async () => ({ selection: agentLibFixture(state.identity.workspaceRoot), changed: false, previous: null }),
-            updateWorkspacePloinky: async () => ({ found: false }),
-            reconcile: async (options) => {
-                const error = new Error('candidate start failed; the old Box was restored');
-                error.boxRollback = Object.freeze({
-                    action: 'restored', containerId: '3'.repeat(64), oldStopAttempted: true, previouslyRunning: true,
-                    hostPort: 8080, mediaHostPort: 7882, routerBinding: options.routerBinding, gpu: null,
-                    hardware: wiring, agentLib: options.agentLib,
-                });
-                throw error;
-            },
-            captureCoreStartArgv: () => ['start', 'explorer', '8080'],
-            readEdgeDesired: () => null,
-            runCoreCommand: async (_engine, id, argv) => { events.push(`core:${id.slice(0, 4)}:${argv.join(' ')}`); },
-            resolveHostReachableIpv4: async () => '127.0.0.1',
-            healthCheck: async () => {},
-            revalidateAgentLibSource: () => {},
-            commitAgentLibSelection: () => {},
-            hardwareGateStore: state.gateStore,
-            prepareHardwareGeneration: async ({ containerId }) => { events.push(`prepare:${containerId.slice(0, 4)}`); return { structurallyPrepared: true }; },
-            stdout: { write() { return true; } },
-            stderr: { write() { return true; } },
-        });
-        await assert.rejects(invoke(supervisor), /the old Box was restored/, operation);
-        const prepare = events.indexOf('prepare:3333');
-        const graph = events.indexOf('core:3333:start explorer 8080');
-        assert.ok(prepare >= 0, `${operation}: the restored generation is prepared: ${events.join(' ')}`);
-        assert.ok(graph > prepare, `${operation}: prepared before its graph: ${events.join(' ')}`);
     }
 });
 

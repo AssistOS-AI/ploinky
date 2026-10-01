@@ -300,7 +300,7 @@ export function buildRequiredCaseManifest() {
             'G.status-unprepared', 'G.status-transition', 'G.status-refused-blocked', 'G.status-production-observed',
             'G.update-gate-before-host-source', 'G.pending-downgrade-blocks-bind-grant-revoke', 'G.u9-stale-store-lock',
             'G.downgrade-running-graph-restored', 'G.downgrade-stopped-graph-not-started',
-            'G.preserved-recovery-keeps-gate-on', 'G.restored-generation-prepared', 'G.recovery-blocked-advice',
+            'G.preserved-recovery-keeps-gate-on', 'G.recovery-blocked-advice',
             'G.stale-lock-never-stolen-messages', 'G.update-recovers-stale-lock',
         ]),
         ...leaves(P, 'p1', unit('ploinkyBoxGpuGrant.test.mjs'), ['G.every-final-generation-gpu']),
