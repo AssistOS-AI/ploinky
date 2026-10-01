@@ -260,6 +260,7 @@ export function buildRequiredCaseManifest() {
             'A.manifest-memory', 'A.catalog-cpu', 'A.profile-pids', 'A.lite-enabled-absent', 'A.lite-enabled-false',
             'A.outside-box-unchanged', 'A.unlimited-unchanged', 'A.helper-exempt', 'A.d4-limited-refused',
             'A.d4-unlimited-baseline', 'A.stored-gpu-refused', 'A.stored-cpus-above-envelope-refused',
+            'A.stored-envelope-unknown', 'A.stored-combined-lists-stored-values',
         ]),
         ...leaves(P, 'p0', unit('hardwareLimitsOutcomes.test.mjs'), [
             'O.prelock-preflight-refusal', 'O.locked-preflight-refusal', 'O.defensive-preflight-refusal',
@@ -269,7 +270,8 @@ export function buildRequiredCaseManifest() {
             'O.optional-eligibility-asynchronous', 'O.optional-child-blocking-grandchild',
             'O.explicit-status-wait-blocked', 'O.no-synthetic-optional-wait', 'O.cycle-wait-kind',
             'O.store-unknown-no-create', 'O.launch-refusal-blocks-dependants', 'O.launch-refusal-extra-contained',
-            'O.launch-nonhardware-still-throws',
+            'O.launch-nonhardware-still-throws', 'O.service-preflight-refusal-contained', 'O.launch-refusal-ref-mapping',
+            'O.launch-refusal-cleanup-failure-fails', 'O.managed-refusal-candidate-removed',
         ]),
         ...leaves(P, 'p0', unit('hardwareLimitsAvailability.test.mjs'), [
             'AV.http', 'AV.sse', 'AV.websocket', 'AV.mcp', 'AV.private-caller', 'AV.private-target',
@@ -298,6 +300,8 @@ export function buildRequiredCaseManifest() {
             'G.status-unprepared', 'G.status-transition', 'G.status-refused-blocked', 'G.status-production-observed',
             'G.update-gate-before-host-source', 'G.pending-downgrade-blocks-bind-grant-revoke', 'G.u9-stale-store-lock',
             'G.downgrade-running-graph-restored', 'G.downgrade-stopped-graph-not-started',
+            'G.preserved-recovery-keeps-gate-on', 'G.restored-generation-prepared', 'G.recovery-blocked-advice',
+            'G.stale-lock-never-stolen-messages', 'G.update-recovers-stale-lock',
         ]),
         ...leaves(P, 'p1', unit('ploinkyBoxGpuGrant.test.mjs'), ['G.every-final-generation-gpu']),
         ...leaves(P, 'p1', unit('ploinkyBoxHardwareLimitsTransitions.test.mjs'), [
@@ -337,6 +341,8 @@ export function buildRequiredCaseManifest() {
             'D.llm-admitted-policy-reuse', 'D.one-replace-then-reuse', 'D.unrelated-token-no-replace',
             'D.unprepared-empty-hash', 'D.private-mount-boundaries', 'D.interactive-reuse-refused',
             'D.interactive-create-refused', 'D.memory-only-change-replaces-one', 'D.pids-only-change-replaces-one',
+            'D.start-container-launch-order', 'D.service-llm-reuse', 'D.readback-process-exit',
+            'D.interactive-stored-gpu-refused', 'D.interactive-stored-replaces-declared', 'D.lite-sandbox-runs-as-container-in-box',
         ]),
         ...leaves(L, 'p1-ram', 'local-llm/tests/ploinky-budget.test.mjs', [
             'LL.raw-cpu-fractions', 'LL.cpu-warning-provenance', 'LL.cap-once', 'LL.known-zero', 'LL.unknown-distinct',
