@@ -28,6 +28,7 @@ import { assertHardwareStateConfined } from '../../cli/sandbox/hardwareLimits/st
 import { buildDirectRefusal } from '../../cli/sandbox/hardwareLimits/requestedLimits.mjs';
 import { prepareLlmStartup, resolveLlmRuntimeAdmissionContext } from '../../cli/sandbox/docker/llmRuntimeIntegration.js';
 import { assertInteractiveHardwareLimitsAbsent } from '../../cli/sandbox/docker/interactive.js';
+import { getRuntimeForAgent } from '../../cli/sandbox/docker/common.js';
 import { preparedCgroupFs } from '../hardware-limits/fakeCgroupFs.mjs';
 
 const ALL = Object.freeze(['cpu', 'memory', 'pids']);
@@ -274,8 +275,12 @@ test('D.prepublish-change', (t) => {
     // The readback runs first: a mismatched leaf is reported as the refusal.
     assert.throws(() => guard({ gate: 'off', storeState: 'none' }, launchedFixture({ ...EXACT_LEAF, 'pids.max': '7' })).afterLaunch({ containerId: 'f'.repeat(64) }),
         (error) => findHardwareOutcome(error)?.code === HARDWARE_UNENFORCEABLE);
-    // An adopted runtime is not read back again, but is still rechecked.
-    inputChanged(() => guard({ gate: 'off', storeState: 'none' }, launchedFixture({})).afterLaunch({ containerId: 'f'.repeat(64), adopted: true }));
+    // K4: an adopted runtime is read back too (a leftover container with a
+    // matching limits-hash label is never proof), then rechecked.
+    assert.equal(guard(prepared(), launchedFixture(EXACT_LEAF)).afterLaunch({ containerId: 'f'.repeat(64), adopted: true }), undefined);
+    assert.throws(() => guard(prepared(), launchedFixture({ ...EXACT_LEAF, 'memory.max': 'max' })).afterLaunch({ containerId: 'f'.repeat(64), adopted: true }),
+        (error) => findHardwareOutcome(error)?.code === HARDWARE_UNENFORCEABLE && /memory\.max is max/.test(error.message));
+    inputChanged(() => guard({ gate: 'off', storeState: 'none' }, launchedFixture(EXACT_LEAF)).afterLaunch({ containerId: 'f'.repeat(64), adopted: true }));
 });
 
 test('D.managed-reuse', (t) => {
@@ -537,4 +542,188 @@ test('D.interactive-create-refused', () => {
         profileConfig: { llmRuntime: { runtimePolicy: { resources: { pidsLimit: 64 } } } },
     }));
     assert.deepEqual(profile.requested.map((entry) => entry.field), ['pidsLimit']);
+});
+
+// ---------------------------------------------------------------------------
+// Fix round 2: the startAgentContainer launch order (K3, K4), the
+// ensureAgentService LLM reuse caller (K3), readback liveness (K9) and
+// interactive and lite-sandbox refusals (K8).
+
+const serviceManager = await import('../../cli/sandbox/docker/agentServiceManager.js');
+
+test('D.start-container-launch-order', (t) => {
+    const box = inBox(t);
+    const admission = admit(box, LIMITED);
+    const run = ({ context = prepared(), fake = launchedFixture(EXACT_LEAF), adopted = false, afterCreate = () => {} } = {}) => {
+        const events = [];
+        const guard = createHardwareLaunchGuard(admission, {
+            key: 'ploinky_demo_worker', ref: 'demo/worker', hardwareContext: context, fsApi: fake,
+            query: (_command, args) => { events.push(`readback:${String(args.at(-1)).slice(0, 4)}`); return { ok: true, stdout: '321\n' }; },
+        });
+        let error = null;
+        try {
+            // The exact seam startAgentContainer launches through.
+            serviceManager.runHardwareGuardedLaunch(guard, {
+                placed: true,
+                removeStaleLeaves: () => events.push('remove-stale-leaves'),
+                buildCreateArgs: (plan) => { events.push(`build:${plan.mode}`); return ['create', '--name', 'ploinky_demo_worker', 'node:20-alpine']; },
+                spawnCreate: (args) => { events.push(`create:${args.join(' ')}`); afterCreate(); return 'f'.repeat(64); },
+                launch: (createContainer) => {
+                    if (adopted) return { containerId: 'f'.repeat(64), adopted: true };
+                    return { containerId: createContainer({ mode: 'host' }), adopted: false };
+                },
+            });
+        } catch (caught) {
+            error = caught;
+        }
+        return { events, error };
+    };
+    // createArgs prefix -> create -> afterLaunch readback -> currentness recheck.
+    const ok = run();
+    assert.equal(ok.error, null);
+    assert.deepEqual(ok.events, ['build:host', 'remove-stale-leaves', 'create:--cgroup-manager=cgroupfs create --name ploinky_demo_worker node:20-alpine', 'readback:ffff']);
+    // The inputs are rechecked before create: a changed controller set
+    // refuses with no create at all.
+    const stale = run({ context: prepared(new Map(), { controllers: ['cpu', 'pids'] }) });
+    assert.equal(stale.error?.code, 'PLOINKY_RUNTIME_INPUT_CHANGED');
+    assert.deepEqual(stale.events, ['build:host']);
+    // The leaf is read back after the create: a disagreement is a refusal.
+    const mismatch = run({ fake: launchedFixture({ ...EXACT_LEAF, 'pids.max': '7' }) });
+    assert.equal(findHardwareOutcome(mismatch.error)?.code, HARDWARE_UNENFORCEABLE);
+    assert.deepEqual(mismatch.events.slice(-2), ['create:--cgroup-manager=cgroupfs create --name ploinky_demo_worker node:20-alpine', 'readback:ffff']);
+    // The inputs are rechecked again after the readback, before return.
+    const context = prepared();
+    const changedAfter = run({ context, afterCreate: () => { context.controllers = ['cpu', 'pids']; } });
+    assert.equal(changedAfter.error?.code, 'PLOINKY_RUNTIME_INPUT_CHANGED');
+    assert.ok(changedAfter.events.includes('readback:ffff'), 'the readback ran before the recheck');
+    // K4: an adopted runtime is read back too; a disagreeing leaf is refused.
+    const adopted = run({ adopted: true, fake: launchedFixture({ ...EXACT_LEAF, 'memory.max': 'max' }) });
+    assert.equal(findHardwareOutcome(adopted.error)?.code, HARDWARE_UNENFORCEABLE);
+    assert.deepEqual(adopted.events, ['readback:ffff']);
+    // Source pin (no engine-free seam exists for the rest of
+    // startAgentContainer): it launches only through this seam, its engine
+    // create runs only inside spawnCreate, and the guard is used nowhere else.
+    const manager = source('cli/sandbox/docker/agentServiceManager.js');
+    const start = manager.indexOf('function startAgentContainer(');
+    const end = manager.indexOf('\nfunction ', start + 10);
+    const body = manager.slice(start, end);
+    assert.equal(body.match(/runHardwareGuardedLaunch\(hardwareLaunch, \{/g)?.length, 1);
+    assert.equal(body.match(/spawnSync\(runtime, createArgs/g)?.length, 1);
+    assert.ok(body.indexOf('spawnSync(runtime, createArgs') > body.indexOf('const spawnCreate = '));
+    assert.equal(manager.match(/hardwareLaunch\.(createArgs|afterLaunch)\(/g)?.length, 2, 'only the seam calls the guard');
+});
+
+test('D.service-llm-reuse', (t) => {
+    const box = inBox(t);
+    const { root, env } = llmCatalog(t);
+    const manifest = { container: 'node:20-alpine', llmRuntime: { enabled: true } };
+    const llm = resolveLlmRuntimeAdmissionContext({ runtime: 'podman', manifest, profileConfig: null, agentName: 'llm', env });
+    const admission = admit(box, manifest, {
+        agentId: 'demo/llm', catalogPolicy: llm.catalogPolicy, catalogIdentity: llm.catalogIdentity,
+        hardwareContext: prepared(new Map([['demo/llm', { cpus: '1.5' }]])),
+    });
+    const creation = (extra) => prepareLlmStartup({
+        runtime: 'podman', manifest, profileConfig: null, agentName: 'llm', env, agentWorkDirRoot: root,
+        manifestEnvNames: [], envHash: 'envhash', effectiveNetwork: null, writeState: false, createDirectories: false,
+        resolvedSelection: llm.startup.selection, resolvedHardware: llm.startup.hardware, ...extra,
+    });
+    // ensureAgentService's own reuse caller, against a runtime's labels.
+    const reuse = (labels) => serviceManager.serviceLlmReuseReason({
+        runtime: 'podman', manifest, profileConfig: null, agentName: 'llm', containerName: 'ploinky_demo_llm',
+        envHash: 'envhash', serviceAdmission: admission, serviceLlmAdmissionContext: llm, env, agentWorkDirRoot: root,
+        getContainerLabelImpl: (_name, label) => labels[label] ?? '',
+    });
+    // A runtime created with the admitted policy (stored override included)
+    // is reused; one created without it is replaced.
+    assert.equal(reuse({ 'ploinky.reusehash': creation({ admittedRuntimePolicy: admission.descriptor.runtimePolicy }).reuseHash }), '');
+    assert.equal(reuse({ 'ploinky.reusehash': creation({}).reuseHash }), 'llmReuseHashChanged');
+});
+
+test('D.readback-process-exit', (t) => {
+    const box = inBox(t);
+    const admission = admit(box, LIMITED);
+    const verify = (fake, inspects) => createHardwareLaunchGuard(admission, {
+        key: 'ploinky_demo_worker', ref: 'demo/worker', hardwareContext: prepared(), fsApi: fake,
+        query: () => ({ ok: true, stdout: `${inspects.shift() ?? '0'}\n` }),
+    }).afterLaunch({ containerId: 'f'.repeat(64) });
+    // K9: the process exits mid-readback (its leaf disappears after
+    // /proc/PID/cgroup was read): the ordinary not-running failure.
+    const midRead = launchedFixture(EXACT_LEAF);
+    midRead.hooks.beforeRead = (rel) => {
+        if (rel === '/ploinky/agents/libpod-abc') {
+            midRead.groups.delete(rel);
+            midRead.pidGroup.delete(321);
+        }
+    };
+    assert.throws(() => verify(midRead, ['321', '0']), (error) => {
+        assert.equal(error.code, 'PLOINKY_AGENT_NOT_RUNNING');
+        assert.equal(findHardwareOutcome(error), null);
+        assert.match(error.message, /PID 321 exited during the readback/);
+        return true;
+    });
+    // The leaf is already gone when the readback starts.
+    const gone = launchedFixture(EXACT_LEAF);
+    gone.groups.delete('/ploinky/agents/libpod-abc');
+    assert.throws(() => verify(gone, ['321', '0']), (error) => error.code === 'PLOINKY_AGENT_NOT_RUNNING'
+        && findHardwareOutcome(error) === null && !/swap accounting/i.test(error.message));
+    // A live process whose leaf is missing is a refusal, never reported as
+    // missing swap accounting.
+    const missing = launchedFixture(EXACT_LEAF);
+    missing.groups.delete('/ploinky/agents/libpod-abc');
+    assert.throws(() => verify(missing, ['321', '321']), (error) => {
+        const outcome = findHardwareOutcome(error);
+        assert.equal(outcome?.code, HARDWARE_UNENFORCEABLE);
+        assert.notEqual(outcome.reasonCode, 'controller_unavailable');
+        assert.doesNotMatch(error.message, /swap accounting/i);
+        assert.match(error.message, /the agent cgroup \/ploinky\/agents\/libpod-abc is absent/);
+        return true;
+    });
+    // The leaf is present without memory.swap.max: swap accounting reason.
+    const noSwap = launchedFixture({ 'memory.max': String(512 * 1024 * 1024), 'cpu.max': '50000 100000', 'pids.max': '128' });
+    assert.throws(() => verify(noSwap, ['321', '321']), (error) => findHardwareOutcome(error)?.reasonCode === 'controller_unavailable'
+        && /^Swap accounting is unavailable/.test(findHardwareOutcome(error).reason));
+});
+
+test('D.interactive-stored-gpu-refused', () => {
+    // K8: interactive create/reuse refuses a stored GPU-only entry with the
+    // same reason and fix as admission.
+    const context = { gate: 'on', prepared: true, backendReady: true, controllers: [...ALL], storeState: 'valid', overrides: new Map([['demo/shell', { gpu: { smPercent: 40, vramPercent: 30 } }]]) };
+    const outcome = refusalFrom(() => assertInteractiveHardwareLimitsAbsent(UNLIMITED, {
+        agentName: 'shell', repoName: 'demo', containerName: 'ploinky_demo_shell', insideBox: true, hardwareContext: context,
+    }));
+    assert.equal(outcome.reasonCode, 'gpu_sharing_unavailable');
+    assert.equal(outcome.reason, 'GPU sharing is not available in this release, so the stored GPU share cannot be enforced.');
+    assert.match(outcome.fix, /^Clear the GPU share in Settings, or run ploinky limits clear --agent demo\/shell on the host/);
+    assert.deepEqual(outcome.requested, [{ field: 'gpu', value: '40/30 percent', source: 'settings' }]);
+});
+
+test('D.interactive-stored-replaces-declared', () => {
+    // K8: a stored cpus value replaces the manifest's in the refusal.
+    const context = { gate: 'on', storeState: 'valid', overrides: new Map([['demo/shell', { cpus: 3 }]]) };
+    const outcome = refusalFrom(() => assertInteractiveHardwareLimitsAbsent(LIMITED, {
+        agentName: 'shell', repoName: 'demo', containerName: 'ploinky_demo_shell', insideBox: true, hardwareContext: context,
+    }));
+    assert.equal(outcome.reasonCode, 'interactive_runtime');
+    assert.deepEqual(outcome.requested.map((entry) => [entry.field, entry.value, entry.source]),
+        [['memory', '512m', 'manifest'], ['cpus', '3', 'settings'], ['pidsLimit', '128', 'manifest']]);
+});
+
+test('D.lite-sandbox-runs-as-container-in-box', (t) => {
+    // K8 evidence: inside a Box every agent, lite-sandbox ones included, runs
+    // in the nested container runtime (getRuntimeForAgent), so a declared or
+    // stored limit gets container admission, never a bwrap/seatbelt bypass.
+    const box = inBox(t);
+    let runtime;
+    try {
+        runtime = getRuntimeForAgent({ container: 'node:20-alpine', 'lite-sandbox': true }, { boxMarkerPath: box.boxMarkerOptions.markerPath });
+    } catch (error) {
+        // A Box without nested Podman fails closed; it never falls back to a sandbox.
+        assert.equal(error.code, 'PLOINKY_BOX_PODMAN_REQUIRED');
+        runtime = 'podman';
+    }
+    assert.equal(runtime, 'podman', 'inside a Box a lite-sandbox agent runs in the nested container runtime');
+    const outcome = refusalFrom(() => admit(box, { container: 'node:20-alpine', 'lite-sandbox': true }, {
+        runtimeKind: 'container', hardwareContext: prepared(new Map([['demo/worker', { cpus: '9' }]])),
+    }));
+    assert.equal(outcome.reasonCode, 'exceeds_envelope', 'a stored limit is admitted as a container limit');
 });

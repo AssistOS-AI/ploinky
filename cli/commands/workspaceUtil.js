@@ -21,6 +21,7 @@ import {
 import {
   buildRuntimeNetworkPlan,
   buildRuntimeRouterEnv,
+  exactCleanupFailureOf,
   resolvePublishedPortMappings,
 } from '../sandbox/docker/agentServiceManager.js';
 import { removeExactRegisteredContainer } from '../sandbox/docker/containerFleet.js';
@@ -1383,6 +1384,17 @@ export function classifyWorkspaceGraphAvailability(graph, admissions, { explicit
   return Object.freeze({ byKey: classified, byNodeId, edges });
 }
 
+// A direct refusal re-keyed to the exact admitted instance it belongs to (its
+// own key and root cause are that instance).
+function rekeyHardwareRefusal(refusal, key) {
+  return validateHardwareOutcome({
+    ...refusal,
+    key,
+    rootCause: { ...refusal.rootCause, key },
+    causalPath: [key],
+  });
+}
+
 /**
  * The start's current availability: graph metadata outcomes plus hardware
  * refusals raised at launch (a readback refusal or the strict admission
@@ -1410,9 +1422,24 @@ export function createGraphAvailabilityTracker(graph, admissions, { explicitWait
     },
     unavailableEntries,
     // Record one launch-time refusal; returns every exact instance that
-    // became unavailable because of it (the refused one first).
+    // became unavailable because of it (the refused one first). A refusal
+    // whose key is not an admitted key but whose ref matches an admitted
+    // instance is mapped to that instance by ref and alias, or fails
+    // loudly; it is never treated as an unrelated extra.
     recordLaunchRefusal(outcome) {
-      const refusal = validateHardwareOutcome(outcome);
+      let refusal = validateHardwareOutcome(outcome);
+      if (!admittedKeys.has(refusal.key)) {
+        const sameRef = (admissions || []).filter((record) => record.admission?.agentId === refusal.ref);
+        if (sameRef.length) {
+          const sameAlias = sameRef.filter((record) => (record.alias || null) === (refusal.alias || null));
+          if (sameAlias.length !== 1) {
+            throw new Error(`start: hardware refusal for '${refusal.key}' (${refusal.ref}, alias ${refusal.alias || 'none'}) `
+              + `matches the admitted instances ${sameRef.map((record) => record.key).join(', ')} but not exactly one by alias; `
+              + 'it cannot be contained as an unrelated agent');
+          }
+          refusal = rekeyHardwareRefusal(refusal, sameAlias[0].key);
+        }
+      }
       if (!admittedKeys.has(refusal.key)) {
         // An enabled extra outside the admitted graph: contained by itself.
         const known = launchRefusals.has(refusal.key);
@@ -1487,8 +1514,17 @@ export async function launchRouteTargets(targetNames, {
     } catch (agentErr) {
       const outcome = findHardwareOutcome(agentErr);
       const shortAgentName = agentErr?.shortAgentName || name;
-      if (!outcome) log.error(`[start] Failed to start agent '${shortAgentName}': ${agentErr?.message}`);
-      return { ok: false, name, shortAgentName, hardwareOutcome: outcome };
+      // A refusal never hides a refused candidate that could not be removed:
+      // that is an ordinary, fatal failure naming the leftover container.
+      const leftover = outcome ? exactCleanupFailureOf(agentErr) : null;
+      if (!outcome) {
+        log.error(`[start] Failed to start agent '${shortAgentName}': ${agentErr?.message}`);
+      } else if (leftover) {
+        const container = `${leftover.containerName || name}${leftover.containerId ? ` (${leftover.containerId.slice(0, 12)})` : ''}`;
+        log.error(`[start] Failed to start agent '${shortAgentName}': ${agentErr?.message}; the refused candidate container `
+          + `${container} was not removed; remove it, then run start again`);
+      }
+      return { ok: false, name, shortAgentName, hardwareOutcome: leftover ? null : outcome };
     }
   }));
   const routeResults = settled.filter((result) => result?.ok);
@@ -1506,6 +1542,62 @@ export async function launchRouteTargets(targetNames, {
     throw new Error(message);
   }
   return { failedAgents, routeResults, hardwareRefusals };
+}
+
+/**
+ * The start's hardware containment, shared by startWorkspace and its tests
+ * (U10/U14/U15, §9.4). It reports each refused or blocked exact instance once,
+ * projects unavailable instances onto their logical routes (no runtime
+ * target), and launches route targets so that a typed hardware outcome raised
+ * at launch is recorded in `availability`, projected, and its blocking and
+ * explicit-status-wait consumers become blocked; unrelated agents continue.
+ * `registry` is a getter for the live registry; `applyUnavailableRoutes`
+ * writes [{routeKey, projection}] to the routing configuration.
+ */
+export function createStartLaunchContainment({
+  availability,
+  registry,
+  registryNameByNodeId = new Map(),
+  applyUnavailableRoutes,
+  log = console,
+}) {
+  const hardwareOutcomes = { refused: [], blocked: [] };
+  const recordedOutcomeKeys = new Set();
+  const reportOutcome = (outcome) => {
+    if (!outcome || recordedOutcomeKeys.has(outcome.key)) return;
+    recordedOutcomeKeys.add(outcome.key);
+    hardwareOutcomes[outcome.state === 'refused' ? 'refused' : 'blocked'].push(outcome);
+    log.warn(`[start] ${formatHardwareOutcome(outcome)}`);
+  };
+  // Refused/blocked instances keep their logical routes but lose every
+  // runtime target; the unavailable state is compiled into the generation.
+  const markUnavailable = async (entries) => {
+    const unavailableRoutes = unavailableRouteProjections(entries, { registry: registry(), registryNameByNodeId });
+    if (!unavailableRoutes.length) return;
+    await applyUnavailableRoutes(unavailableRoutes);
+  };
+  const containLaunchRefusal = async (outcome) => {
+    const affected = availability.recordLaunchRefusal(outcome);
+    await markUnavailable(affected);
+    for (const entry of affected) reportOutcome(entry.outcome);
+  };
+  const launchTargets = (targetNames, { launchOne, commitResults, allowFailures = false }) => launchRouteTargets(targetNames, {
+    launchTarget: async (name) => {
+      try {
+        return await launchOne(name);
+      } catch (agentErr) {
+        // launchRouteTargets reports it: a typed hardware outcome is a
+        // contained refusal, anything else an ordinary failure.
+        try { agentErr.shortAgentName = registry()?.[name]?.agentName || name; } catch (_) { /* reported by registry name */ }
+        throw agentErr;
+      }
+    },
+    allowFailures,
+    commitResults,
+    onHardwareRefusal: containLaunchRefusal,
+    log,
+  });
+  return Object.freeze({ hardwareOutcomes, reportOutcome, markUnavailable, containLaunchRefusal, launchTargets });
 }
 
 /**
@@ -2645,15 +2737,7 @@ async function startWorkspace(staticAgentArg, portArg, {
       });
       console.log(`[start] No-wait dependencies (background launch): ${labels.join(', ')}`);
     }
-    const hardwareOutcomes = { refused: [], blocked: [] };
-    const recordedOutcomeKeys = new Set();
     const unavailableOutcome = (nodeId) => graphAvailability.outcomeForNode(nodeId);
-    const reportHardwareOutcome = (outcome) => {
-      if (!outcome || recordedOutcomeKeys.has(outcome.key)) return;
-      recordedOutcomeKeys.add(outcome.key);
-      hardwareOutcomes[outcome.state === 'refused' ? 'refused' : 'blocked'].push(outcome);
-      console.warn(`[start] ${formatHardwareOutcome(outcome)}`);
-    };
     const readyAgentKeys = [];
     const asynchronousAgentKeys = [];
 
@@ -2671,127 +2755,119 @@ async function startWorkspace(staticAgentArg, portArg, {
         || cfg.static?.container !== staticContainer) {
       throw new Error('start: prepared routing generation does not contain the exact static Router identity');
     }
-    // Refused/blocked instances keep their logical routes but lose every
-    // runtime target; the unavailable state is compiled into the generation.
-    const markHardwareUnavailable = async (entries) => {
-      const unavailableRoutes = unavailableRouteProjections(entries, { registry: reg, registryNameByNodeId });
-      if (!unavailableRoutes.length) return;
-      cfg = await mergeRoutingConfig((current) => {
-        current.routes = current.routes || {};
-        for (const { routeKey, projection } of unavailableRoutes) {
-          current.routes[routeKey] = markRouteHardwareUnavailable(current.routes[routeKey], projection);
-          if (cfg.routes?.[routeKey]) cfg.routes[routeKey] = current.routes[routeKey];
-        }
-        return current;
-      }, { coordinate: false });
-    };
-    await markHardwareUnavailable(graphAvailability.unavailableEntries());
-    // A typed hardware outcome raised at launch is a contained refusal: it is
-    // recorded, projected, and its blocking/explicit-wait consumers become
-    // blocked and are skipped; unrelated agents continue (U10/U14, §9.4).
-    const containLaunchRefusal = async (outcome) => {
-      const affected = graphAvailability.recordLaunchRefusal(outcome);
-      await markHardwareUnavailable(affected);
-      for (const entry of affected) reportHardwareOutcome(entry.outcome);
-    };
+    // The shared hardware containment: refused/blocked instances keep their
+    // logical routes but lose every runtime target, and a typed hardware
+    // outcome raised at launch is recorded, projected, and its blocking and
+    // explicit-wait consumers become blocked and are skipped; unrelated
+    // agents continue (U10/U14, §9.4).
+    const hardwareContainment = createStartLaunchContainment({
+      availability: graphAvailability,
+      registry: () => reg,
+      registryNameByNodeId,
+      applyUnavailableRoutes: async (unavailableRoutes) => {
+        cfg = await mergeRoutingConfig((current) => {
+          current.routes = current.routes || {};
+          for (const { routeKey, projection } of unavailableRoutes) {
+            current.routes[routeKey] = markRouteHardwareUnavailable(current.routes[routeKey], projection);
+            if (cfg.routes?.[routeKey]) cfg.routes[routeKey] = current.routes[routeKey];
+          }
+          return current;
+        }, { coordinate: false });
+      },
+    });
+    const { hardwareOutcomes, reportOutcome: reportHardwareOutcome } = hardwareContainment;
+    await hardwareContainment.markUnavailable(graphAvailability.unavailableEntries());
     const updateRoutes = async (targetNames = [], { allowFailures = false } = {}) => {
       cfg.routes = cfg.routes || {};
-      return launchRouteTargets(targetNames, {
-        launchTarget: async (name) => {
+      return hardwareContainment.launchTargets(targetNames, {
+        launchOne: async (name) => {
           const rec = reg[name];
           if (!rec || !rec.agentName) return null;
           const shortAgentName = rec.agentName;
           const manifestRef = rec.repoName ? `${rec.repoName}/${shortAgentName}` : shortAgentName;
-          try {
-            const manifestPath0 = findAgentManifest(manifestRef);
-            const manifest = JSON.parse(fs.readFileSync(manifestPath0, 'utf8'));
-            const agentPath = path.dirname(manifestPath0);
-            const repoName = rec.repoName || resolveAgentRepositoryName(agentPath);
-            const routeKey = rec.alias || shortAgentName;
-            const routerEndpoint = resolveManifestRouterEndpoint(manifest, {
-              explicitPort: staticPort,
-              persistedProfileName: rec.profile,
-              path: `manifest(${repoName}/${shortAgentName})`,
-            });
-            const launchProfile = resolveManifestRuntimeProfile(manifest, {
-              agentName: `${repoName}/${shortAgentName}`,
-              profileName: rec.profile || undefined,
-              path: `manifest(${repoName}/${shortAgentName})`,
-            });
-            const preparedHostModeCapability = launchProfile.network.mode === 'host'
-              ? prepareHostModeCapabilityForInactiveGeneration({
-                  agentId: `agent:${repoName}/${shortAgentName}`,
-                  instanceId: rec.instanceId,
-                  enableGeneration: rec.enableGeneration,
-                  routeKey,
-                  containerName: name,
-                })
-              : undefined;
-            const runtimeResult = ensureAgentService(shortAgentName, manifest, agentPath, {
-              containerName: name,
-              alias: rec.alias,
-              routerEndpoint,
-              profileName: rec.profile || undefined,
-              instanceId: rec.instanceId,
-              enableGeneration: rec.enableGeneration,
-              forceRecreate: newlyPreparedContainers.has(name),
-              preservePreparedRegistryRecord: true,
-              preparationLease: workspacePreparationLease,
-              preparedHostModeCapability,
-              networkLifecycleCapability,
-            });
-            if (runtimeResult?.requiresEdgeActivation === true
-                && runtimeResult?.preparationLease
-                && runtimeResult?.containerId) {
-              workspaceRuntimeCandidates.push(runtimeResult);
-            }
-            const {
-              containerName,
-              hostPort,
-              registryRecord,
-            } = runtimeResult;
-            if (!registryRecord) {
-              throw new Error(`runtime '${containerName}' returned no exact registry record`);
-            }
-            const executionMode = resolveAgentExecutionMode(manifest);
-            const resolvedHostPort = hostPort || (
-              executionMode.type === 'start_only' ? 0 : cfg.routes[routeKey]?.hostPort
-            );
-            const nextRoute = {
-              ...(cfg.routes[routeKey] || {}),
-              container: containerName,
-              hostPath: agentPath,
-              repo: repoName,
-              agent: shortAgentName,
-              ...(rec.alias ? { alias: rec.alias } : {}),
-              ...(resolvedHostPort ? { hostPort: resolvedHostPort } : {}),
-            };
-            if (!resolvedHostPort) delete nextRoute.hostPort;
-            // A freshly admitted launch supersedes any earlier unavailable state.
-            delete nextRoute.hardwareAvailability;
-            const readinessRoute = buildRelayReadinessRoute({
-              route: nextRoute,
-              manifest,
-              runtimeResult,
-              networkMode: launchProfile.network.mode,
-              generationDigest: workspacePreparationLease?.preparedGeneration || '',
-            });
-            return {
-              ok: true,
-              containerName,
-              registryRecord,
-              shortAgentName,
-              routeKey,
-              route: nextRoute,
-              readinessRoute,
-              manifest,
-            };
-          } catch (agentErr) {
-            // launchRouteTargets reports it: a typed hardware outcome is a
-            // contained refusal, anything else an ordinary failure.
-            try { agentErr.shortAgentName = shortAgentName; } catch (_) { /* reported by registry name */ }
-            throw agentErr;
+          const manifestPath0 = findAgentManifest(manifestRef);
+          const manifest = JSON.parse(fs.readFileSync(manifestPath0, 'utf8'));
+          const agentPath = path.dirname(manifestPath0);
+          const repoName = rec.repoName || resolveAgentRepositoryName(agentPath);
+          const routeKey = rec.alias || shortAgentName;
+          const routerEndpoint = resolveManifestRouterEndpoint(manifest, {
+            explicitPort: staticPort,
+            persistedProfileName: rec.profile,
+            path: `manifest(${repoName}/${shortAgentName})`,
+          });
+          const launchProfile = resolveManifestRuntimeProfile(manifest, {
+            agentName: `${repoName}/${shortAgentName}`,
+            profileName: rec.profile || undefined,
+            path: `manifest(${repoName}/${shortAgentName})`,
+          });
+          const preparedHostModeCapability = launchProfile.network.mode === 'host'
+            ? prepareHostModeCapabilityForInactiveGeneration({
+                agentId: `agent:${repoName}/${shortAgentName}`,
+                instanceId: rec.instanceId,
+                enableGeneration: rec.enableGeneration,
+                routeKey,
+                containerName: name,
+              })
+            : undefined;
+          const runtimeResult = ensureAgentService(shortAgentName, manifest, agentPath, {
+            containerName: name,
+            alias: rec.alias,
+            routerEndpoint,
+            profileName: rec.profile || undefined,
+            instanceId: rec.instanceId,
+            enableGeneration: rec.enableGeneration,
+            forceRecreate: newlyPreparedContainers.has(name),
+            preservePreparedRegistryRecord: true,
+            preparationLease: workspacePreparationLease,
+            preparedHostModeCapability,
+            networkLifecycleCapability,
+          });
+          if (runtimeResult?.requiresEdgeActivation === true
+              && runtimeResult?.preparationLease
+              && runtimeResult?.containerId) {
+            workspaceRuntimeCandidates.push(runtimeResult);
           }
+          const {
+            containerName,
+            hostPort,
+            registryRecord,
+          } = runtimeResult;
+          if (!registryRecord) {
+            throw new Error(`runtime '${containerName}' returned no exact registry record`);
+          }
+          const executionMode = resolveAgentExecutionMode(manifest);
+          const resolvedHostPort = hostPort || (
+            executionMode.type === 'start_only' ? 0 : cfg.routes[routeKey]?.hostPort
+          );
+          const nextRoute = {
+            ...(cfg.routes[routeKey] || {}),
+            container: containerName,
+            hostPath: agentPath,
+            repo: repoName,
+            agent: shortAgentName,
+            ...(rec.alias ? { alias: rec.alias } : {}),
+            ...(resolvedHostPort ? { hostPort: resolvedHostPort } : {}),
+          };
+          if (!resolvedHostPort) delete nextRoute.hostPort;
+          // A freshly admitted launch supersedes any earlier unavailable state.
+          delete nextRoute.hardwareAvailability;
+          const readinessRoute = buildRelayReadinessRoute({
+            route: nextRoute,
+            manifest,
+            runtimeResult,
+            networkMode: launchProfile.network.mode,
+            generationDigest: workspacePreparationLease?.preparedGeneration || '',
+          });
+          return {
+            ok: true,
+            containerName,
+            registryRecord,
+            shortAgentName,
+            routeKey,
+            route: nextRoute,
+            readinessRoute,
+            manifest,
+          };
         },
         allowFailures,
         commitResults: async (routeResults) => {
@@ -2819,7 +2895,6 @@ async function startWorkspace(staticAgentArg, portArg, {
             return next;
           }, { coordinate: false });
         },
-        onHardwareRefusal: containLaunchRefusal,
       });
     };
 

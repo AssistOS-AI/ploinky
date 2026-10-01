@@ -294,14 +294,32 @@ const SWAP_ACCOUNTING_REFUSAL = Object.freeze({
  * rendered limit (allowing only the kernel's page rounding), memory.swap.max
  * is 0 with a memory limit, cpu.max matches the quota and pids.max the limit.
  * An inspect field alone is never proof. A missing memory.swap.max means swap
- * accounting is unavailable and is reported as such.
+ * accounting is unavailable only while the leaf directory itself exists; a
+ * leaf that is gone (its process exited) is reported as missing, and every
+ * file that could not be read is listed so the caller can re-check liveness.
  */
 export function verifyLeafLimits({ fsApi = fs, cgroupRoot = CGROUP_ROOT, leaf, expected }) {
     const directory = path.join(cgroupRoot, leaf);
     const problems = [];
+    const readFailures = [];
     let refusal = null;
+    let leafPresent = false;
+    try {
+        const stat = fsApi.lstatSync(directory);
+        leafPresent = stat.isDirectory() && !stat.isSymbolicLink();
+    } catch (_) {
+        leafPresent = false;
+    }
+    if (!leafPresent) {
+        return Object.freeze({ ok: false, problems: [`the agent cgroup ${leaf} is absent`], refusal: null, leafPresent, readFailures });
+    }
     const read = (name) => {
-        try { return { value: String(fsApi.readFileSync(`${directory}/${name}`, 'utf8')).trim() }; } catch (error) { return { value: null, code: error?.code || 'EIO' }; }
+        try {
+            return { value: String(fsApi.readFileSync(`${directory}/${name}`, 'utf8')).trim() };
+        } catch (error) {
+            readFailures.push(name);
+            return { value: null, code: error?.code || 'EIO' };
+        }
     };
     const value = (name) => read(name).value;
     if (!leaf.startsWith(`${AGENTS_CGROUP_PARENT}/`)) problems.push(`leaf ${leaf} is not under ${AGENTS_CGROUP_PARENT}`);
@@ -324,9 +342,28 @@ export function verifyLeafLimits({ fsApi = fs, cgroupRoot = CGROUP_ROOT, leaf, e
         if (!(quota > 0 && period > 0) || Math.abs(quota / period - Number(expected.cpus)) > 1e-9) problems.push(`cpu.max is ${cpuMax}`);
     }
     if (expected.pidsLimit) {
-        if (value('pids.max') !== String(expected.pidsLimit)) problems.push(`pids.max is ${value('pids.max')}`);
+        const pidsMax = value('pids.max');
+        if (pidsMax !== String(expected.pidsLimit)) problems.push(`pids.max is ${pidsMax}`);
     }
-    return Object.freeze({ ok: problems.length === 0, problems, refusal });
+    return Object.freeze({ ok: problems.length === 0, problems, refusal, leafPresent, readFailures });
+}
+
+// Re-check that the launched process is still the one in `leaf`: returns the
+// reason it vanished, or null when it is still running there.
+function launchedProcessVanished({ runtime, query, containerId, pid, leaf, fsApi, procRoot }) {
+    const again = query(runtime, ['container', 'inspect', '--format', '{{.State.Pid}}', containerId], { timeoutMs: 10_000 });
+    if (!again?.ok) return 'the container could not be inspected after a failed leaf read';
+    const pidAgain = Number(String(again?.stdout || '').trim());
+    if (!Number.isSafeInteger(pidAgain) || pidAgain <= 0) return `PID ${pid} exited during the readback`;
+    if (pidAgain !== pid) return `its process changed during the readback (PID ${pid}, now ${pidAgain})`;
+    let leafAgain;
+    try {
+        leafAgain = cgroupPath(read(fsApi, `${procRoot}/${pid}/cgroup`));
+    } catch (error) {
+        return `PID ${pid} exited during the readback (${error?.code || 'unreadable'})`;
+    }
+    if (leafAgain !== leaf) return `PID ${pid} left ${leaf} during the readback`;
+    return null;
 }
 
 /**
@@ -369,6 +406,12 @@ export function verifyLaunchedHardwareLimits({
         throw refuse(`the applied limits disagree with the admitted ones (the agent runs in ${leaf}, not under ${placement.cgroupParent})`);
     }
     const readback = verifyLeafLimits({ fsApi, cgroupRoot, leaf, expected: placement.expected || {} });
+    if (!readback.ok && (!readback.leafPresent || readback.readFailures.length)) {
+        // A failed leaf read can mean the process exited mid-readback: that is
+        // the ordinary not-running failure, never a hardware refusal.
+        const vanished = launchedProcessVanished({ runtime, query, containerId, pid, leaf, fsApi, procRoot });
+        if (vanished) throw notObserved(vanished);
+    }
     if (!readback.ok) {
         // Missing swap accounting has its own reason and fix when it is the
         // only disagreement.

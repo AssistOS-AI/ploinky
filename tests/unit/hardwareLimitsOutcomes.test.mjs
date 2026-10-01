@@ -397,13 +397,15 @@ test('O.store-unknown-no-create', () => {
 const availabilityModule = await import(new URL('../../cli/server/hardwareAvailability.mjs', import.meta.url).href);
 
 function launchGraph() {
-    // a --blocking--> b; c is unrelated; d waits explicitly on b's status.
+    // a --blocking--> b, d --blocking--> a (transitively blocked by b); c is
+    // unrelated. The tracker is built exactly as startWorkspace builds it:
+    // from the graph and its admissions, with no explicitWaits argument.
     const node = (id, dependencies = []) => ({
         id,
         dependencies: new Set(dependencies),
         dependencyEdges: new Map(dependencies.map((child) => [child, { noWait: false }])),
     });
-    const nodes = new Map([['demo/a', node('demo/a', ['demo/b'])], ['demo/b', node('demo/b')], ['demo/c', node('demo/c')], ['demo/d', node('demo/d')]]);
+    const nodes = new Map([['demo/a', node('demo/a', ['demo/b'])], ['demo/b', node('demo/b')], ['demo/c', node('demo/c')], ['demo/d', node('demo/d', ['demo/a'])]]);
     const keys = { 'demo/a': 'ploinky_demo_a', 'demo/b': 'ploinky_demo_b', 'demo/c': 'ploinky_demo_c', 'demo/d': 'ploinky_demo_d', 'extra:ploinky_demo_x': 'ploinky_demo_x', 'extra:ploinky_demo_y': 'ploinky_demo_y' };
     const admissions = Object.entries(keys).map(([nodeId, key]) => ({
         nodeId, key, alias: '', admission: { agentId: `demo/${key.split('_').pop()}` }, hardwareRefusal: null,
@@ -413,11 +415,10 @@ function launchGraph() {
     }]));
     return {
         graph: { nodes },
-        waves: [['demo/b', 'demo/c'], ['demo/a', 'demo/d']],
+        waves: [['demo/b', 'demo/c'], ['demo/a'], ['demo/d']],
         admissions,
         registry,
         registryNameByNodeId: new Map(Object.entries(keys).filter(([nodeId]) => !nodeId.startsWith('extra:'))),
-        explicitWaits: [{ fromKey: 'ploinky_demo_d', toKey: 'ploinky_demo_b' }],
     };
 }
 
@@ -435,78 +436,70 @@ function launchRefusal(key) {
     }));
 }
 
-// The startWorkspace launch composition with a stubbed ensureAgentService.
-async function startLaunch({ failures = {}, additionalNames = [] } = {}) {
-    const fixture = launchGraph();
-    const { graph, waves, admissions, registry, registryNameByNodeId, explicitWaits } = fixture;
-    const availability = workspaceUtil.createGraphAvailabilityTracker(graph, admissions, { explicitWaits });
-    const routes = Object.fromEntries(Object.entries(registry).map(([key, record]) => [record.agentName, { container: key, hostPort: 40000 }]));
-    const outcomesSeen = { refused: [], blocked: [] };
-    const reported = new Set();
-    const reportOutcome = (outcome) => {
-        if (!outcome || reported.has(outcome.key)) return;
-        reported.add(outcome.key);
-        outcomesSeen[outcome.state === 'refused' ? 'refused' : 'blocked'].push(outcome);
-    };
-    const mark = (entries) => {
-        for (const { routeKey, projection } of workspaceUtil.unavailableRouteProjections(entries, { registry, registryNameByNodeId })) {
-            routes[routeKey] = availabilityModule.markRouteHardwareUnavailable(routes[routeKey], projection);
-        }
-    };
-    mark(availability.unavailableEntries());
+// The startWorkspace launch composition: the shared hardware containment
+// (createStartLaunchContainment, which startWorkspace itself uses) over a
+// stubbed per-agent launch.
+async function startLaunch({ failures = {}, additionalNames = [], fixture = launchGraph(), launchOne = null, logs = [] } = {}) {
+    const { graph, waves, admissions, registry, registryNameByNodeId } = fixture;
+    const availability = workspaceUtil.createGraphAvailabilityTracker(graph, admissions);
+    const routes = Object.fromEntries(Object.entries(registry).map(([key, record]) => [record.alias || record.agentName, { container: key, hostPort: 40000 }]));
+    const log = { error: (line) => logs.push(line), warn: (line) => logs.push(line) };
+    const containment = workspaceUtil.createStartLaunchContainment({
+        availability,
+        registry: () => registry,
+        registryNameByNodeId,
+        applyUnavailableRoutes: async (unavailableRoutes) => {
+            for (const { routeKey, projection } of unavailableRoutes) {
+                routes[routeKey] = availabilityModule.markRouteHardwareUnavailable(routes[routeKey], projection);
+            }
+        },
+        log,
+    });
+    await containment.markUnavailable(availability.unavailableEntries());
     const ensureCalls = [];
     const readiness = [];
     const ensureAgentService = (name) => {
         ensureCalls.push(name);
-        if (failures[name]) throw failures[name]();
+        if (failures[name]) {
+            // A launch error may arrive wrapped, keeping its typed cause.
+            const error = failures[name]();
+            throw errors.wrapPreservingHardwareCause(`managed launch failed: ${error.message}`, error);
+        }
         return { containerName: name, hostPort: 41000 };
     };
-    const launch = (names, { allowFailures = false } = {}) => workspaceUtil.launchRouteTargets(names, {
+    const launch = (names, { allowFailures = false } = {}) => containment.launchTargets(names, {
         allowFailures,
-        log: { error() {}, warn() {} },
-        launchTarget: async (name) => {
-            try {
-                const result = ensureAgentService(name);
-                return { ok: true, containerName: result.containerName, routeKey: registry[name].agentName, shortAgentName: registry[name].agentName, route: { container: name, hostPort: result.hostPort } };
-            } catch (error) {
-                // ensureAgentService wraps launch errors, keeping the typed
-                // cause; startWorkspace labels them with the agent's name.
-                const wrapped = errors.wrapPreservingHardwareCause(`managed launch failed: ${error.message}`, error);
-                wrapped.shortAgentName = registry[name].agentName;
-                throw wrapped;
-            }
+        launchOne: launchOne ? (name) => { ensureCalls.push(name); return launchOne(name, registry[name]); } : async (name) => {
+            const result = ensureAgentService(name);
+            const routeKey = registry[name].alias || registry[name].agentName;
+            return { ok: true, containerName: result.containerName, routeKey, shortAgentName: registry[name].agentName, route: { container: name, hostPort: result.hostPort } };
         },
         commitResults: async (results) => { for (const result of results) if (result?.ok) routes[result.routeKey] = result.route; },
-        onHardwareRefusal: async (outcome) => {
-            const affected = availability.recordLaunchRefusal(outcome);
-            mark(affected);
-            for (const entry of affected) reportOutcome(entry.outcome);
-        },
     });
     const waveResult = await workspaceUtil.launchWorkspaceGraphWaves({
         graphWaves: waves, nodes: graph.nodes, registryNameByNodeId, availability, launch,
         readinessEntryFor: (node) => registryNameByNodeId.get(node.id),
         waitForReadiness: async (entries) => { readiness.push(...entries); },
-        reportOutcome, log() {},
+        reportOutcome: containment.reportOutcome, log() {},
     });
     const extra = await workspaceUtil.launchAdditionalRuntimes({
         additionalNames, availability, launch,
         readinessEntryFor: (result) => result.containerName,
         waitForReadiness: async (entries) => { readiness.push(...entries); },
-        reportOutcome,
+        reportOutcome: containment.reportOutcome,
     });
     const summary = outcomes.summarizeStartResult({
         readyAgents: [...waveResult.readyAgentKeys, ...extra.readyAgentKeys].map((key) => ({ key })),
-        refusedAgents: outcomesSeen.refused,
-        blockedAgents: outcomesSeen.blocked,
+        refusedAgents: containment.hardwareOutcomes.refused,
+        blockedAgents: containment.hardwareOutcomes.blocked,
     });
-    return { routes, ensureCalls, readiness, summary, availability };
+    return { routes, ensureCalls, readiness, summary, availability, logs };
 }
 
 test('O.launch-refusal-blocks-dependants', async () => {
     const result = await startLaunch({ failures: { ploinky_demo_b: () => launchRefusal('ploinky_demo_b') } });
-    // No throw. b was attempted; its blocking consumer a and explicit waiter d
-    // were never launched; unrelated c started and was waited for.
+    // No throw. b was attempted; its blocking consumer a and a's blocking
+    // consumer d were never launched; unrelated c started and was waited for.
     assert.deepEqual(result.ensureCalls.sort(), ['ploinky_demo_b', 'ploinky_demo_c']);
     assert.deepEqual(result.readiness, ['ploinky_demo_c']);
     assert.equal(result.summary.state, 'degraded');
@@ -554,4 +547,185 @@ test('O.launch-nonhardware-still-throws', async () => {
         startLaunch({ additionalNames: ['ploinky_demo_x'], failures: { ploinky_demo_x: () => new Error('podman create failed') } }),
         /additional runtime failure left edge selectors inactive; repair and run start again/,
     );
+});
+
+// ---------------------------------------------------------------------------
+// Fix round 2: refusals raised by ensureAgentService's strict preflight carry
+// the exact admitted instance key (K2); a refused candidate that could not be
+// removed fails the start (K4).
+
+const serviceManager = await import(new URL('../../cli/sandbox/docker/agentServiceManager.js', import.meta.url).href);
+
+const PREPARED_CONTEXT = Object.freeze({
+    gate: 'on', prepared: true, backendReady: true, controllers: ['cpu', 'memory', 'pids'], storeState: 'valid',
+    storeToken: { epoch: 'e'.repeat(32), revision: 1 }, overrides: new Map(), envelope: { cpus: 8, memoryBytes: 16 * 1024 ** 3 },
+});
+// The memory controller disappeared after graph admission.
+const REFUSING_CONTEXT = Object.freeze({ ...PREPARED_CONTEXT, controllers: ['cpu', 'pids'] });
+
+// A real graph admitted (eligible) at preflight, with a registry shaped like
+// staging's: one record per exact registry key.
+function admittedGraph(staticRef) {
+    const preflight = preflightWorkspaceStartRuntimeCapabilities(staticRef, { boxMarkerOptions });
+    const admissions = admitWorkspaceGraphRuntimeCapabilities(preflight.graph, { boxMarkerOptions, hardwareContext: PREPARED_CONTEXT });
+    assert.ok(admissions.every((record) => record.hardwareRefusal === null), 'every node is eligible at graph admission');
+    const registry = {};
+    const registryNameByNodeId = new Map();
+    for (const record of admissions) {
+        const node = preflight.graph.nodes.get(record.nodeId);
+        registry[record.key] = {
+            type: 'agent', agentName: node.shortAgentName, repoName: node.repoName, ...(node.alias ? { alias: node.alias } : {}),
+            instanceId: `${record.key}-instance`, enableGeneration: `${record.key}-generation`,
+        };
+        registryNameByNodeId.set(record.nodeId, record.key);
+    }
+    return {
+        graph: preflight.graph,
+        waves: graphModule.topologicallyGroupDependencyGraph(preflight.graph),
+        admissions,
+        registry,
+        registryNameByNodeId,
+    };
+}
+
+// The options startWorkspace passes ensureAgentService for one registry record.
+function startWorkspaceServiceOptions(name, rec, { containerName = name } = {}) {
+    return {
+        containerName,
+        alias: rec.alias,
+        routerEndpoint: null,
+        profileName: rec.profile || undefined,
+        instanceId: rec.instanceId,
+        enableGeneration: rec.enableGeneration,
+        forceRecreate: false,
+        preservePreparedRegistryRecord: true,
+        preparationLease: null,
+        preparedHostModeCapability: undefined,
+        networkLifecycleCapability: {},
+    };
+}
+
+test('O.service-preflight-refusal-contained', async () => {
+    for (const [label, staticRef, refusedNodeId, consumerNodeId, unrelatedNodeId, staged] of [
+        ['canonical', 'demo/root', 'demo/needy', 'demo/root', 'demo/plain', false],
+        ['aliased', 'demo/aliasroot', 'demo/needy as n1', 'demo/aliasroot', 'demo/plain as p2', false],
+        ['staged replacement', 'demo/aliasroot', 'demo/needy as n1', 'demo/aliasroot', 'demo/plain as p2', true],
+    ]) {
+        const fixture = admittedGraph(staticRef);
+        const refusedKey = fixture.registryNameByNodeId.get(refusedNodeId);
+        const seen = [];
+        const result = await startLaunch({
+            fixture,
+            launchOne: async (name, rec) => {
+                const manifestPath = path.join(workspace, '.ploinky', 'repos', rec.repoName, rec.agentName, 'manifest.json');
+                const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+                const containerName = staged && name === refusedKey
+                    ? serviceManager.replacementCandidateContainerName(name, 'replacement-instance')
+                    : name;
+                try {
+                    // ensureAgentService's own strict preflight, with its real options.
+                    serviceManager.admitAgentServicePreflight(rec.agentName, manifest, path.dirname(manifestPath),
+                        startWorkspaceServiceOptions(name, rec, { containerName }),
+                        { boxMarkerOptions, hardwareContext: name === refusedKey ? REFUSING_CONTEXT : PREPARED_CONTEXT });
+                } catch (error) {
+                    const outcome = errors.findHardwareOutcome(error);
+                    if (outcome) seen.push(outcome);
+                    throw error;
+                }
+                return { ok: true, containerName: name, routeKey: rec.alias || rec.agentName, shortAgentName: rec.agentName, route: { container: name, hostPort: 41000 } };
+            },
+        });
+        // The refusal names the admitted instance: its registry key and alias.
+        assert.equal(seen.length, 1, label);
+        assert.equal(seen[0].key, refusedKey, `${label}: keyed by the admitted registry key, never REPO/AGENT`);
+        assert.equal(seen[0].ref, 'demo/needy', label);
+        assert.equal(seen[0].alias, refusedNodeId.includes(' as ') ? 'n1' : null, label);
+        assert.equal(seen[0].reasonCode, 'controller_unavailable', label);
+        // Contained: the blocking consumer is BLOCKED and never launched, the
+        // refused node is not waited on, and the unrelated agent starts.
+        const consumerKey = fixture.registryNameByNodeId.get(consumerNodeId);
+        const unrelatedKey = fixture.registryNameByNodeId.get(unrelatedNodeId);
+        assert.equal(result.availability.outcomeForKey(refusedKey)?.state, 'refused', label);
+        assert.equal(result.availability.outcomeForKey(consumerKey)?.state, 'blocked', label);
+        assert.equal(result.availability.outcomeForKey(consumerKey).rootCause.key, refusedKey, label);
+        assert.equal(result.ensureCalls.includes(consumerKey), false, `${label}: the blocked consumer was never launched`);
+        assert.equal(result.readiness.includes(refusedKey), false, `${label}: the refused node is not waited on`);
+        assert.ok(result.readiness.includes(unrelatedKey), `${label}: the unrelated agent started`);
+        assert.equal(result.summary.state, 'degraded', label);
+    }
+});
+
+test('O.launch-refusal-ref-mapping', () => {
+    // A refusal keyed outside the admitted keys whose ref matches an admitted
+    // instance is mapped by ref and alias, or fails loudly; never an extra.
+    const fixture = launchGraph();
+    const tracker = workspaceUtil.createGraphAvailabilityTracker(fixture.graph, fixture.admissions);
+    const keyedByRef = requestedLimits.buildDirectRefusal({
+        key: 'demo/b', ref: 'demo/b',
+        refusalParts: { reasonCode: 'unprepared', reason: 'r', fix: 'f', requested: [{ field: 'memory', value: '512m', source: 'manifest' }] },
+        inputFingerprint: 'c'.repeat(64),
+    });
+    const affected = tracker.recordLaunchRefusal(keyedByRef);
+    assert.equal(affected[0].key, 'ploinky_demo_b', 'mapped to the admitted instance');
+    assert.equal(tracker.outcomeForKey('ploinky_demo_a').state, 'blocked');
+    const ambiguous = launchGraph();
+    ambiguous.admissions.push({ nodeId: 'demo/b as two', key: 'ploinky_demo_b_two', alias: 'two', admission: { agentId: 'demo/b' }, hardwareRefusal: null });
+    const second = workspaceUtil.createGraphAvailabilityTracker(ambiguous.graph, ambiguous.admissions);
+    const unmatched = requestedLimits.buildDirectRefusal({
+        key: 'ploinky_demo_b_three', ref: 'demo/b', alias: 'three',
+        refusalParts: { reasonCode: 'unprepared', reason: 'r', fix: 'f', requested: [{ field: 'memory', value: '512m', source: 'manifest' }] },
+        inputFingerprint: 'c'.repeat(64),
+    });
+    assert.throws(() => second.recordLaunchRefusal(unmatched), /matches the admitted instances ploinky_demo_b, ploinky_demo_b_two but not exactly one by alias/);
+});
+
+test('O.launch-refusal-cleanup-failure-fails', async () => {
+    // K4: a refusal whose candidate could not be removed is not contained:
+    // the start fails loudly and names the leftover container.
+    const failedCleanup = () => {
+        const error = launchRefusal('ploinky_demo_b');
+        Object.defineProperty(error, 'ploinkyRestartCandidate', {
+            value: { containerName: 'ploinky_demo_b', containerId: 'a'.repeat(64), exactCleanupPerformed: false },
+        });
+        serviceManager.cleanupFailedServiceCandidate(error, {
+            containerName: 'ploinky_demo_b',
+            network: { mode: 'default' },
+            fallbackRecord: { type: 'agent', agentName: 'b', repoName: 'demo' },
+            removeCandidate: () => { throw new Error('ownership mismatch'); },
+        });
+        return error;
+    };
+    const logs = [];
+    await assert.rejects(startLaunch({ failures: { ploinky_demo_b: failedCleanup }, logs }), /^Error: 1 agent\(s\) failed to start: b$/);
+    assert.ok(logs.some((line) => /exact candidate cleanup failed: ownership mismatch; the refused candidate container ploinky_demo_b \(aaaaaaaaaaaa\) was not removed; remove it, then run start again$/.test(line)), logs.join('\n'));
+    // An extra with the same failure keeps the baseline selector error.
+    await assert.rejects(startLaunch({ additionalNames: ['ploinky_demo_x'], failures: { ploinky_demo_x: failedCleanup } }),
+        /additional runtime failure left edge selectors inactive; repair and run start again/);
+});
+
+test('O.managed-refusal-candidate-removed', () => {
+    // K4: startAgentContainer leaves a refused managed-network candidate to
+    // its caller; ensureAgentService's cleanup removes that exact candidate
+    // and retires its durable record.
+    const error = launchRefusal('ploinky_demo_b');
+    Object.defineProperty(error, 'ploinkyRestartCandidate', {
+        value: { containerName: 'ploinky_demo_b', containerId: 'b'.repeat(64), exactCleanupPerformed: false, durableCandidate: { operationId: 'op-1' } },
+    });
+    const removed = [];
+    const retired = [];
+    const result = serviceManager.cleanupFailedServiceCandidate(error, {
+        containerName: 'ploinky_demo_b',
+        network: { mode: 'bridge' },
+        fallbackRecord: { type: 'agent', agentName: 'b', repoName: 'demo' },
+        removeCandidate: (candidate) => { removed.push(candidate); return { removed: true, state: 'removed' }; },
+        retireCandidate: (candidate) => { retired.push(candidate); },
+    });
+    assert.deepEqual(removed.map((candidate) => [candidate.containerName, candidate.containerId, candidate.network.mode]), [['ploinky_demo_b', 'b'.repeat(64), 'bridge']]);
+    assert.equal(result.exactCleanupPerformed, true);
+    assert.deepEqual(retired, [{ operationId: 'op-1' }]);
+    assert.equal(serviceManager.exactCleanupFailureOf(error), null, 'nothing was left behind');
+    // An already removed candidate is not removed twice.
+    const done = launchRefusal('ploinky_demo_b');
+    Object.defineProperty(done, 'ploinkyRestartCandidate', { value: { containerId: 'b'.repeat(64), exactCleanupPerformed: true } });
+    serviceManager.cleanupFailedServiceCandidate(done, { containerName: 'ploinky_demo_b', network: {}, removeCandidate: () => assert.fail('removed twice') });
 });

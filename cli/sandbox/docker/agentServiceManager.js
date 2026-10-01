@@ -1337,6 +1337,33 @@ function resolveManagedAdoptionAgentCacheMount(record, repoName, agentName) {
     return matches.values().next().value || null;
 }
 
+/**
+ * The hardware order of one managed agent launch (plan §8.1, §8.3), shared by
+ * every startAgentContainer path: each create argv goes through the launch
+ * guard (hardware input recheck, then the engine prefix) immediately before
+ * the engine create, stale leaves are removed for a hardware-placed agent,
+ * and once `launch` returns the launched (or adopted) runtime, its actual
+ * leaf is read back and the inputs are rechecked before the candidate can be
+ * returned. `launch` receives the guarded create for the managed transaction
+ * or the host/none create.
+ */
+export function runHardwareGuardedLaunch(hardwareLaunch, {
+    placed = false,
+    removeStaleLeaves = () => {},
+    buildCreateArgs,
+    spawnCreate,
+    launch,
+}) {
+    const createContainer = (plan, launchState, createOptions) => {
+        const guarded = hardwareLaunch.createArgs(buildCreateArgs(plan, launchState));
+        if (placed) removeStaleLeaves();
+        return spawnCreate(guarded, launchState, createOptions);
+    };
+    const launched = launch(createContainer);
+    hardwareLaunch.afterLaunch({ containerId: launched.containerId, adopted: launched.adopted === true });
+    return launched;
+}
+
 // This private handoff is created only by ensureAgentService and is usable
 // under its still-live lock. Independent service calls get a fresh adapter.
 const SERVICE_NETWORK_LIFECYCLE = Symbol('serviceNetworkLifecycle');
@@ -1363,6 +1390,10 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         throw new Error(`startAgentContainer(${agentName}) requires an exact instanceId and enableGeneration`);
     }
     const adoptManagedRuntimeOnly = options.adoptManagedRuntimeOnly === true;
+    // Hardware refusals name the exact admitted instance (the registry key a
+    // staged candidate belongs to) and its alias, as graph admission does.
+    const hardwareInstanceKey = String(options.hardwareInstanceKey || '') || admittedInstanceKeyFor(containerName);
+    const hardwareAlias = String(options.alias || launchRecord.alias || '');
     // Resolve profile and network as one selection. Explicit CLI and persisted
     // profile names fail closed; only a missing global profile falls back to
     // this manifest's default profile.
@@ -1396,8 +1427,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         profileConfig,
         network: manifestNetwork,
         runtimeKind: 'container',
-        instanceKey: containerName,
-        alias: options.alias || '',
+        instanceKey: hardwareInstanceKey,
+        alias: hardwareAlias,
     });
     const runtime = getRuntime();
     const llmAdmissionContext = resolveLlmRuntimeAdmissionContext({
@@ -1419,8 +1450,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         runtimeKind: 'container',
         catalogPolicy: llmAdmissionContext.catalogPolicy,
         catalogIdentity: llmAdmissionContext.catalogIdentity,
-        instanceKey: containerName,
-        alias: options.alias || '',
+        instanceKey: hardwareInstanceKey,
+        alias: hardwareAlias,
     });
     if (options.runtimeAdmission) {
         assertRuntimeAdmissionCurrent(options.runtimeAdmission, {
@@ -1431,9 +1462,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         });
     }
     const hardwareLaunch = createHardwareLaunchGuard(runtimeAdmission, {
-        key: containerName,
+        key: hardwareInstanceKey,
         ref: `${repoName}/${agentName}`,
-        alias: options.alias || null,
+        alias: hardwareAlias || null,
         runtime,
         query: (command, queryArgs) => {
             const result = spawnSync(command, queryArgs, { encoding: 'utf8', timeout: 10_000 });
@@ -2354,7 +2385,10 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     if (!adoptManagedRuntimeOnly) {
         console.log(`[start] ${agentName}: ${runtime} create (cwd='${cwd}') -> ${entrySummary}`);
     }
-    const createContainer = (plan, launch, { recordCreatedId = () => {} } = {}) => {
+    // The create argv of one candidate (managed launch state included) and its
+    // create-attempted receipt. runHardwareGuardedLaunch passes it through the
+    // hardware guard before spawnCreate runs the engine create.
+    const buildCreateArgs = (plan, launch) => {
         const createArgs = [...args];
         if (plan?.args?.length) createArgs.splice(1, 0, ...plan.args);
         if (launch) {
@@ -2383,14 +2417,10 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             state: 'preserved-ambiguous',
             inspectionComplete: false,
         });
-        // Hardware inputs are rechecked immediately before create (a changed
-        // gate, preparation, controller set or this agent's stored entry
-        // returns PLOINKY_RUNTIME_INPUT_CHANGED instead of an older policy),
-        // and a hardware-placed agent selects the nested cgroupfs manager with
-        // an engine option before the subcommand; every other launch keeps
-        // the existing argv (empty prefix).
-        createArgs.splice(0, createArgs.length, ...hardwareLaunch.createArgs(createArgs));
-        if (runtimeAdmission.descriptor.hardwarePlacement) removeStaleHardwareLeaves(runtime);
+        return createArgs;
+    };
+    // The engine create of an argv the hardware guard already produced.
+    const spawnCreate = (createArgs, launch, { recordCreatedId = () => {} } = {}) => {
         // Creation is reached only after the exact predecessor is gone (or was
         // proved absent). Retire its two fixed control-plane artifacts here so
         // shared-filesystem socket projection cannot leak across generations.
@@ -2508,84 +2538,94 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         ensureImagePresent(ROUTER_AUTHORITY_HELPER_IMAGE, { runtime });
     }
     try {
-    if (runtimeNetworkPlan.requiresManagedNetwork) {
-        // Resolve both the target and fixed probe images before the network
-        // transaction. The helper never pulls and never executes target-image
-        // entrypoints, including start-only images without Node.js.
-        if (!adoptManagedRuntimeOnly) ensureImagePresent(image, { runtime });
-        const transaction = {
-            network: manifestNetwork,
-            canonicalAgentId: agentName,
-            instanceKey: effectiveInstanceKey(repoName, agentName, options.alias || ''),
-            containerName,
-            runtimeIdentity,
-            inspectAdoption: inspectGeneratedRouterAdoption,
-            networkLockWaitMs: options.networkLockWaitMs,
-            networkLifecycleCapability: options.networkLifecycleCapability,
-        };
-        const launched = adoptManagedRuntimeOnly
-            ? networkLifecycle.adoptManagedContainerTransaction(transaction)
-            : networkLifecycle.runManagedContainerTransaction({
-                ...transaction,
-                createContainer,
-                prepareLaunch: prepareGeneratedRouterLaunch,
-                preStartLaunch: preStartGeneratedRouterLaunch,
-                postStartLaunch: cleanupLegacyGuardMountpointCleanupAfterStart,
-                finalizeLaunch: finalizeGeneratedRouterLaunch,
-                onContainerCreated: recordCreatedIdentity,
-                commandPrefix: hardwareLaunch.commandPrefix(),
-            });
-        if (adoptManagedRuntimeOnly && launched?.adopted !== true) {
-            const mismatch = new Error(
-                `managed candidate '${containerName}' failed exact active-generation adoption: ${String(launched?.reason || 'mismatch')}`,
-            );
-            mismatch.code = 'PLOINKY_SEMANTIC_ADOPTION_MISMATCH';
-            throw mismatch;
-        }
-        launchedContainerId = String(launched?.containerId || '');
-        generatedLaunch = launched?.launch || launched?.adoption?.launch || null;
-        adoptedExistingRuntime = launched?.adopted === true;
-        if (!adoptManagedRuntimeOnly) clearLivenessState(containerName);
-    } else {
-        // All manifest/profile/port/image/mount validation above is complete.
-        // Only now is the old host/none container deliberately replaced.
-        cleanupReceipt = advanceCandidateLifecycle(cleanupReceipt, {
-            phase: 'predecessor-inspected',
-            inspectionComplete: true,
-            ownershipProof: { predecessorRegistryIdentity: true },
-        });
-        const predecessorRemoval = removeContainerForRecreate(
-            runtime,
-            containerName,
-            `startAgentContainer:${agentName}`,
-            existingRecord,
-        );
-        cleanupReceipt = advanceCandidateLifecycle(cleanupReceipt, {
-            phase: 'predecessor-removed',
-            predecessorId: String(existingRecord.containerId || ''),
-            ownershipProof: { predecessorRegistryIdentity: true, predecessorRemoved: predecessorRemoval.state },
-        });
-        launchedContainerId = withNetworkLifecycleLock(() => {
-            const createdId = createContainer(unmanagedNetworkLifecyclePlan);
-            return String(networkLifecycle.finalizeContainer(containerName, unmanagedNetworkLifecyclePlan, {
-                network: manifestNetwork,
-                runtimeIdentity,
-                expectedContainerId: createdId,
-                onCreated: recordCreatedIdentity,
-                beforeStart: prepareLegacyGuardMountpointCleanupBeforeStart,
-                afterStart: cleanupLegacyGuardMountpointCleanupAfterStart,
-                commandPrefix: hardwareLaunch.commandPrefix(),
-            }) || '');
-        }, { waitMs: 15 * 60 * 1000 });
-    }
-    if (!launchedContainerId) {
-        throw new Error(`startAgentContainer(${agentName}) did not capture an immutable container ID`);
-    }
-    // A hardware-placed agent is not ready until its actual leaf carries the
-    // admitted limits, and the inputs are rechecked before the candidate can
-    // be returned for route publication; a refusal or a stale admission
-    // removes this candidate through the cleanup below.
-    hardwareLaunch.afterLaunch({ containerId: launchedContainerId, adopted: adoptedExistingRuntime });
+    // Every create passes through the hardware guard (input recheck, then the
+    // engine prefix) immediately before the engine create; afterwards the
+    // actual leaf is read back (an adopted runtime too) and the inputs are
+    // rechecked before the candidate can be returned for route publication.
+    // A refusal or a stale admission removes this candidate in the cleanup
+    // below.
+    runHardwareGuardedLaunch(hardwareLaunch, {
+        placed: Boolean(runtimeAdmission.descriptor.hardwarePlacement),
+        removeStaleLeaves: () => removeStaleHardwareLeaves(runtime),
+        buildCreateArgs,
+        spawnCreate,
+        launch: (createContainer) => {
+            if (runtimeNetworkPlan.requiresManagedNetwork) {
+                // Resolve both the target and fixed probe images before the network
+                // transaction. The helper never pulls and never executes target-image
+                // entrypoints, including start-only images without Node.js.
+                if (!adoptManagedRuntimeOnly) ensureImagePresent(image, { runtime });
+                const transaction = {
+                    network: manifestNetwork,
+                    canonicalAgentId: agentName,
+                    instanceKey: effectiveInstanceKey(repoName, agentName, options.alias || ''),
+                    containerName,
+                    runtimeIdentity,
+                    inspectAdoption: inspectGeneratedRouterAdoption,
+                    networkLockWaitMs: options.networkLockWaitMs,
+                    networkLifecycleCapability: options.networkLifecycleCapability,
+                };
+                const launched = adoptManagedRuntimeOnly
+                    ? networkLifecycle.adoptManagedContainerTransaction(transaction)
+                    : networkLifecycle.runManagedContainerTransaction({
+                        ...transaction,
+                        createContainer,
+                        prepareLaunch: prepareGeneratedRouterLaunch,
+                        preStartLaunch: preStartGeneratedRouterLaunch,
+                        postStartLaunch: cleanupLegacyGuardMountpointCleanupAfterStart,
+                        finalizeLaunch: finalizeGeneratedRouterLaunch,
+                        onContainerCreated: recordCreatedIdentity,
+                        commandPrefix: hardwareLaunch.commandPrefix(),
+                    });
+                if (adoptManagedRuntimeOnly && launched?.adopted !== true) {
+                    const mismatch = new Error(
+                        `managed candidate '${containerName}' failed exact active-generation adoption: ${String(launched?.reason || 'mismatch')}`,
+                    );
+                    mismatch.code = 'PLOINKY_SEMANTIC_ADOPTION_MISMATCH';
+                    throw mismatch;
+                }
+                launchedContainerId = String(launched?.containerId || '');
+                generatedLaunch = launched?.launch || launched?.adoption?.launch || null;
+                adoptedExistingRuntime = launched?.adopted === true;
+                if (!adoptManagedRuntimeOnly) clearLivenessState(containerName);
+            } else {
+                // All manifest/profile/port/image/mount validation above is complete.
+                // Only now is the old host/none container deliberately replaced.
+                cleanupReceipt = advanceCandidateLifecycle(cleanupReceipt, {
+                    phase: 'predecessor-inspected',
+                    inspectionComplete: true,
+                    ownershipProof: { predecessorRegistryIdentity: true },
+                });
+                const predecessorRemoval = removeContainerForRecreate(
+                    runtime,
+                    containerName,
+                    `startAgentContainer:${agentName}`,
+                    existingRecord,
+                );
+                cleanupReceipt = advanceCandidateLifecycle(cleanupReceipt, {
+                    phase: 'predecessor-removed',
+                    predecessorId: String(existingRecord.containerId || ''),
+                    ownershipProof: { predecessorRegistryIdentity: true, predecessorRemoved: predecessorRemoval.state },
+                });
+                launchedContainerId = withNetworkLifecycleLock(() => {
+                    const createdId = createContainer(unmanagedNetworkLifecyclePlan);
+                    return String(networkLifecycle.finalizeContainer(containerName, unmanagedNetworkLifecyclePlan, {
+                        network: manifestNetwork,
+                        runtimeIdentity,
+                        expectedContainerId: createdId,
+                        onCreated: recordCreatedIdentity,
+                        beforeStart: prepareLegacyGuardMountpointCleanupBeforeStart,
+                        afterStart: cleanupLegacyGuardMountpointCleanupAfterStart,
+                        commandPrefix: hardwareLaunch.commandPrefix(),
+                    }) || '');
+                }, { waitMs: 15 * 60 * 1000 });
+            }
+            if (!launchedContainerId) {
+                throw new Error(`startAgentContainer(${agentName}) did not capture an immutable container ID`);
+            }
+            return { containerId: launchedContainerId, adopted: adoptedExistingRuntime };
+        },
+    });
     } catch (error) {
         let exactCleanupPerformed = error?.ploinkyContainerTransaction?.exactCleanupPerformed === true;
         launchedContainerId ||= String(error?.ploinkyContainerTransaction?.containerId || '');
@@ -3049,13 +3089,20 @@ function mintReplacementRuntimeIdentity(existingRecord, uuid = randomUUID) {
     return Object.freeze({ instanceId, enableGeneration });
 }
 
+// The exact admitted instance key behind a runtime container name: a staged
+// replacement candidate (NAME__candidate_<12 hex>) belongs to NAME, the
+// registry key graph admission recorded.
+export function admittedInstanceKeyFor(containerName) {
+    return String(containerName || '').trim().replace(/__candidate_[a-f0-9]{12}$/i, '');
+}
+
 export function replacementCandidateContainerName(containerName, instanceId) {
     const exactContainerName = String(containerName || '').trim();
     const exactInstanceId = String(instanceId || '').trim();
     if (!exactContainerName || !exactInstanceId) {
         throw new Error('replacement candidate naming requires an exact predecessor name and instanceId');
     }
-    const stableBase = exactContainerName.replace(/__candidate_[a-f0-9]{12}$/i, '');
+    const stableBase = admittedInstanceKeyFor(exactContainerName);
     const suffix = createHash('sha256').update(exactInstanceId).digest('hex').slice(0, 12);
     return `${stableBase}__candidate_${suffix}`;
 }
@@ -3309,14 +3356,63 @@ export function assertAgentServiceNotDraining(containerName, {
     }
 }
 
-function ensureAgentService(agentName, manifest, agentPath, options = {}) {
-    if (!options || typeof options !== 'object'
-        || !Object.prototype.hasOwnProperty.call(options, 'routerEndpoint')
-        || options.routerEndpoint === undefined) {
-        const error = new Error('ensureAgentService requires a validated routerEndpoint; pass explicit null for network mode none');
-        error.code = 'PLOINKY_ROUTER_ENDPOINT_REQUIRED';
-        throw error;
-    }
+/**
+ * ensureAgentService's LLM runtime reuse decision (plan §8.3): the reuse probe
+ * receives the same admitted policy (stored overrides included) and the same
+ * resolved selection/hardware as creation, so a limited LLM agent is not
+ * replaced on every start. Returns 'llmReuseHashChanged' or ''.
+ */
+export function serviceLlmReuseReason({
+    runtime,
+    manifest,
+    profileConfig,
+    agentName,
+    alias,
+    containerName,
+    envHash,
+    serviceAdmission,
+    serviceLlmAdmissionContext,
+    env = process.env,
+    agentWorkDirRoot = AGENTS_DATA_DIR,
+    prepareLlmStartupImpl = prepareLlmStartup,
+    getContainerLabelImpl = getContainerLabel,
+}) {
+    const probe = prepareLlmStartupImpl({
+        runtime,
+        manifest,
+        profileConfig,
+        agentName,
+        alias,
+        env,
+        agentWorkDirRoot,
+        manifestEnvNames: [
+            ...getManifestEnvNames(manifest, profileConfig, { forRuntime: true }),
+            ...getExposedNames(manifest, profileConfig, { forRuntime: true }),
+        ],
+        envHash,
+        effectiveNetwork: profileConfig?.network ?? manifest?.network ?? null,
+        writeState: false,
+        createDirectories: false,
+        // Same admitted policy and resolved selection/hardware as creation,
+        // so reuse agrees with it.
+        resolvedSelection: serviceLlmAdmissionContext?.startup?.selection,
+        resolvedHardware: serviceLlmAdmissionContext?.startup?.hardware,
+        admittedRuntimePolicy: serviceAdmission.descriptor.runtimePolicy,
+    });
+    if (!probe.enabled) return '';
+    const currentReuse = getContainerLabelImpl(containerName, 'ploinky.reusehash');
+    return probe.reuseHash && probe.reuseHash !== currentReuse ? 'llmReuseHashChanged' : '';
+}
+
+/**
+ * ensureAgentService's strict admission before any backend selection, lock or
+ * runtime mutation. It takes the exact options ensureAgentService receives;
+ * `admissionContext` (Box marker and hardware context) is supplied only where
+ * the caller already captured them, as graph admission does. A hardware
+ * refusal raised here carries the exact admitted instance key and alias, so
+ * the start contains it like a metadata refusal.
+ */
+export function admitAgentServicePreflight(agentName, manifest, agentPath, options = {}, admissionContext = {}) {
     const preflightRepoName = resolveAgentRepositoryName(agentPath);
     const preflightManifestPath = path.join(agentPath, 'manifest.json');
     const preflightManifestBytes = fs.existsSync(preflightManifestPath)
@@ -3340,6 +3436,11 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         && options.preparedRegistryRecord
         ? options.preparedRegistryRecord
         : mutablePreflightRecord;
+    // Every refusal this admission raises names the exact admitted instance:
+    // the registry key (a staged replacement candidate belongs to it) and
+    // the instance alias, as graph admission records them.
+    const hardwareInstanceKey = String(options.hardwareInstanceKey || '') || admittedInstanceKeyFor(preflightContainerName);
+    const hardwareAlias = String(options.alias || preflightRecord.alias || '');
     const preflightProfile = resolveManifestRuntimeProfile(manifest, {
         agentName: `${preflightRepoName}/${agentName}`,
         profileName: options.profileName,
@@ -3357,6 +3458,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         profileConfig: preflightProfile.profileConfig,
         network: preflightProfile.network,
         runtimeKind: 'container',
+        instanceKey: hardwareInstanceKey,
+        alias: hardwareAlias,
+        ...admissionContext,
     });
     const preflightAgentRuntime = getRuntimeForAgent(manifest);
     const preflightRuntimeKind = isSandboxRuntime(preflightAgentRuntime)
@@ -3383,6 +3487,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         runtimeKind: preflightRuntimeKind,
         catalogPolicy: preflightLlmAdmissionContext.catalogPolicy,
         catalogIdentity: preflightLlmAdmissionContext.catalogIdentity,
+        instanceKey: hardwareInstanceKey,
+        alias: hardwareAlias,
+        ...admissionContext,
     });
     if (options.runtimeAdmission) {
         assertRuntimeAdmissionCurrent(options.runtimeAdmission, {
@@ -3392,6 +3499,36 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             descriptor: preflightAdmission.descriptor,
         });
     }
+    return Object.freeze({
+        preflightRepoName,
+        preflightManifestPath,
+        preflightManifestBytes,
+        preflightProfile,
+        preflightAgentRuntime,
+        preflightRuntimeKind,
+        preflightAdmission,
+        hardwareInstanceKey,
+        hardwareAlias,
+    });
+}
+
+function ensureAgentService(agentName, manifest, agentPath, options = {}) {
+    if (!options || typeof options !== 'object'
+        || !Object.prototype.hasOwnProperty.call(options, 'routerEndpoint')
+        || options.routerEndpoint === undefined) {
+        const error = new Error('ensureAgentService requires a validated routerEndpoint; pass explicit null for network mode none');
+        error.code = 'PLOINKY_ROUTER_ENDPOINT_REQUIRED';
+        throw error;
+    }
+    const {
+        preflightRepoName,
+        preflightManifestPath,
+        preflightManifestBytes,
+        preflightAgentRuntime,
+        preflightRuntimeKind,
+        preflightAdmission,
+        hardwareInstanceKey,
+    } = admitAgentServicePreflight(agentName, manifest, agentPath, options);
     const targetedRestart = normalizeTargetedRestart(options.targetedRestart);
     if (!options.networkLifecycleCapability) {
         return withNetworkLifecycleLock(
@@ -3473,7 +3610,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         runtimeKind: 'container',
         catalogPolicy: serviceLlmAdmissionContext.catalogPolicy,
         catalogIdentity: serviceLlmAdmissionContext.catalogIdentity,
-        instanceKey: getAgentContainerName(aliasOverride || agentName, repoName),
+        instanceKey: hardwareInstanceKey,
         alias: aliasOverride || '',
     });
     if (options.runtimeAdmission && preflightRuntimeKind === 'container') {
@@ -3509,6 +3646,8 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             profileConfig,
             network: manifestNetwork,
             runtimeKind: agentRuntime,
+            instanceKey: hardwareInstanceKey,
+            alias: aliasOverride || '',
         });
     }
     if (agentRuntime === 'bwrap' || agentRuntime === 'seatbelt') {
@@ -3795,36 +3934,20 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     // LLM runtime: include architecture/catalog/digest/policy in reuse comparison.
     if (existingRuntimeAtEntry && isLlmRuntimeManifest(manifest, profileConfig)) {
         try {
-            const desiredEnvHash = computeEnvHash(manifest, profileConfig, envHashExtra, { agentName, repoName });
-            const effectiveNetworkForLlm = profileConfig?.network ?? manifest?.network ?? null;
-            const probe = prepareLlmStartup({
+            const llmReuseReason = serviceLlmReuseReason({
                 runtime,
                 manifest,
                 profileConfig,
                 agentName,
                 alias: aliasOverride,
-                env: process.env,
-                agentWorkDirRoot: AGENTS_DATA_DIR,
-                manifestEnvNames: [
-                    ...getManifestEnvNames(manifest, profileConfig, { forRuntime: true }),
-                    ...getExposedNames(manifest, profileConfig, { forRuntime: true }),
-                ],
-                envHash: desiredEnvHash,
-                effectiveNetwork: effectiveNetworkForLlm,
-                writeState: false,
-                createDirectories: false,
-                // Same admitted policy and resolved selection/hardware as
-                // creation, so reuse agrees with it.
-                resolvedSelection: serviceLlmAdmissionContext.startup?.selection,
-                resolvedHardware: serviceLlmAdmissionContext.startup?.hardware,
-                admittedRuntimePolicy: serviceAdmission.descriptor.runtimePolicy,
+                containerName,
+                envHash: computeEnvHash(manifest, profileConfig, envHashExtra, { agentName, repoName }),
+                serviceAdmission,
+                serviceLlmAdmissionContext,
             });
-            if (probe.enabled) {
-                const currentReuse = getContainerLabel(containerName, 'ploinky.reusehash');
-                if (probe.reuseHash && probe.reuseHash !== currentReuse) {
-                    debugLog(`[ensureAgentService] ${agentName}: LLM reuse hash changed (current=${currentReuse || '<none>'}, desired=${probe.reuseHash.slice(0, 12)}…), recreating container`);
-                    recreateReason ||= 'llmReuseHashChanged';
-                }
+            if (llmReuseReason) {
+                debugLog(`[ensureAgentService] ${agentName}: LLM reuse hash changed, recreating container`);
+                recreateReason ||= llmReuseReason;
             }
         } catch (err) {
             debugLog(`[ensureAgentService] ${agentName}: LLM reuse-hash check skipped: ${err?.message || err}`);
@@ -4094,6 +4217,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             publish: additionalPorts,
             publishMappings: additionalPortMappings,
             containerName,
+            hardwareInstanceKey,
             alias: aliasOverride,
             profileName: activeProfile,
             profileResolution,
@@ -4289,37 +4413,25 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 semanticAdoptionRetry: true,
             });
         }
-        let exactCleanupPerformed = error?.ploinkyRestartCandidate?.exactCleanupPerformed === true;
-        const cleanupReceipt = started?.cleanupReceipt
-            || error?.ploinkyRestartCandidate?.cleanupReceipt;
-        const candidateId = String(started?.containerId || error?.ploinkyRestartCandidate?.containerId || '');
-        const candidateRecord = started?.registryRecord || error?.ploinkyRestartCandidate?.registryRecord || {
-            type: 'agent',
-            agentName,
-            repoName,
-            ...(aliasOverride ? { alias: aliasOverride } : {}),
-            instanceId: runtimeIdentity.instanceId,
-            enableGeneration: runtimeIdentity.enableGeneration,
-        };
-        if (!exactCleanupPerformed && candidateId) {
-            try {
-                const cleanup = removeExactGenerationCandidate({
-                    containerName,
-                    containerId: candidateId,
-                    network: manifestNetwork,
-                    record: candidateRecord,
-                });
-                exactCleanupPerformed = cleanup.removed === true || cleanup.state === 'absent';
-            } catch (cleanupError) {
-                appendExactCleanupFailure(error, cleanupError?.message || cleanupError);
-            }
-        }
-        const durableCandidate = started?.durableCandidate || error?.ploinkyRestartCandidate?.durableCandidate;
-        if (exactCleanupPerformed && durableCandidate) {
-            try { retireRuntimeCandidate(durableCandidate); } catch (cleanupError) {
-                appendExactCleanupFailure(error, cleanupError.message);
-            }
-        }
+        const {
+            exactCleanupPerformed,
+            cleanupReceipt,
+            candidateId,
+            candidateRecord,
+            durableCandidate,
+        } = cleanupFailedServiceCandidate(error, {
+            started,
+            containerName,
+            network: manifestNetwork,
+            fallbackRecord: {
+                type: 'agent',
+                agentName,
+                repoName,
+                ...(aliasOverride ? { alias: aliasOverride } : {}),
+                instanceId: runtimeIdentity.instanceId,
+                enableGeneration: runtimeIdentity.enableGeneration,
+            },
+        });
         throw attachRestartCandidate(error, {
             containerName,
             durableCandidate,
@@ -4448,7 +4560,78 @@ export function cleanupExactAgentRuntimeCandidate(candidate) {
 function appendExactCleanupFailure(error, detail) {
     if (error && typeof error === 'object') {
         error.message = `${error.message}; exact candidate cleanup failed: ${detail}`;
+        // Also recorded structurally, so a contained hardware refusal can
+        // never hide a candidate that was left behind.
+        const prior = Array.isArray(error.exactCleanupFailures) ? error.exactCleanupFailures : [];
+        Object.defineProperty(error, 'exactCleanupFailures', {
+            configurable: true,
+            enumerable: false,
+            writable: true,
+            value: [...prior, String(detail)],
+        });
     }
+}
+
+/**
+ * A failed exact-candidate cleanup recorded on a launch error (or its cause
+ * chain): the details and the candidate left behind, or null.
+ */
+export function exactCleanupFailureOf(error) {
+    let current = error;
+    for (let depth = 0; current && typeof current === 'object' && depth < 8; depth += 1) {
+        if (Array.isArray(current.exactCleanupFailures) && current.exactCleanupFailures.length) {
+            const candidate = current.ploinkyRestartCandidate || {};
+            return Object.freeze({
+                details: [...current.exactCleanupFailures],
+                containerName: String(candidate.containerName || ''),
+                containerId: String(candidate.containerId || ''),
+            });
+        }
+        current = current.cause;
+    }
+    return null;
+}
+
+/**
+ * ensureAgentService's cleanup of a failed launch: any candidate the launch
+ * created and did not remove itself (a post-launch refusal of a managed
+ * network candidate, which startAgentContainer leaves to this caller) is
+ * removed through its exact ownership checks, and its durable record is
+ * retired. A failed removal is appended to the error, never dropped.
+ */
+export function cleanupFailedServiceCandidate(error, {
+    started = null,
+    containerName,
+    network,
+    fallbackRecord,
+    removeCandidate = removeExactGenerationCandidate,
+    retireCandidate = retireRuntimeCandidate,
+} = {}) {
+    let exactCleanupPerformed = error?.ploinkyRestartCandidate?.exactCleanupPerformed === true;
+    const cleanupReceipt = started?.cleanupReceipt
+        || error?.ploinkyRestartCandidate?.cleanupReceipt;
+    const candidateId = String(started?.containerId || error?.ploinkyRestartCandidate?.containerId || '');
+    const candidateRecord = started?.registryRecord || error?.ploinkyRestartCandidate?.registryRecord || fallbackRecord;
+    if (!exactCleanupPerformed && candidateId) {
+        try {
+            const cleanup = removeCandidate({
+                containerName,
+                containerId: candidateId,
+                network,
+                record: candidateRecord,
+            });
+            exactCleanupPerformed = cleanup.removed === true || cleanup.state === 'absent';
+        } catch (cleanupError) {
+            appendExactCleanupFailure(error, cleanupError?.message || cleanupError);
+        }
+    }
+    const durableCandidate = started?.durableCandidate || error?.ploinkyRestartCandidate?.durableCandidate;
+    if (exactCleanupPerformed && durableCandidate) {
+        try { retireCandidate(durableCandidate); } catch (cleanupError) {
+            appendExactCleanupFailure(error, cleanupError.message);
+        }
+    }
+    return { exactCleanupPerformed, cleanupReceipt, candidateId, candidateRecord, durableCandidate };
 }
 
 function restartGenerationCapabilityRuntime({

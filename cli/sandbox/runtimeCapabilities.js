@@ -821,8 +821,11 @@ export function createHardwareLaunchGuard(runtimeAdmission, {
         commandPrefix() {
             return hardwareCommandPrefix(descriptor);
         },
-        afterLaunch({ containerId, adopted = false }) {
-            if (descriptor.hardwarePlacement && !adopted) {
+        // An adopted runtime is read back too: a leftover container carrying
+        // a matching limits-hash label is never proof that its leaf holds the
+        // admitted limits (plan §8.1: an inspect field alone is not proof).
+        afterLaunch({ containerId }) {
+            if (descriptor.hardwarePlacement) {
                 verifyLaunchedHardwareLimits({
                     descriptor,
                     containerId,
