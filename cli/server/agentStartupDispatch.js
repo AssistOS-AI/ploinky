@@ -1,3 +1,4 @@
+import { hardwareStartupResultFromCompiled } from './hardwareAvailability.mjs';
 import {
     buildAgentStartupDocumentResponse,
     buildAgentStartupProbeResponse,
@@ -33,8 +34,15 @@ function writeGenerationChanged(req, res, requestKind) {
     writeJson(res, 503, { error: 'edge_generation_changed' });
 }
 
+const HARDWARE_CODES = new Set(['hardware_refused', 'hardware_blocked']);
+
+function isHardwareState(result) {
+    return result?.state === 'unavailable' && HARDWARE_CODES.has(result?.code);
+}
+
 function isRenderableDocumentState(result) {
     return result?.state === 'starting'
+        || isHardwareState(result)
         || (result?.state === 'failed'
             && (result?.code === 'startup_failed' || result?.code === 'startup_timed_out'));
 }
@@ -52,6 +60,7 @@ function writeObservedState(req, res, routePlan, requestKind, result) {
             state: result.state,
             code: result.code || '',
             routeLabel: routePlan.routeKey,
+            ...(isHardwareState(result) ? { reason: result.reason, fix: result.fix } : {}),
         }), { method: req?.method });
         return true;
     }
@@ -65,8 +74,22 @@ function writeObservedState(req, res, routePlan, requestKind, result) {
         state: result.state,
         code: result.code || '',
         generation: result.state === 'starting' ? routePlan.lease?.id : '',
+        ...(isHardwareState(result) ? { reason: result.reason, fix: result.fix } : {}),
     }), { method: req?.method });
     return true;
+}
+
+// Terminal answer for a refused/blocked instance on a request that is not a
+// startup navigation or probe (API, SSE, MCP over HTTP).
+function writeHardwareUnavailable(res, entry) {
+    const result = hardwareStartupResultFromCompiled(entry);
+    writeJson(res, 503, {
+        error: 'AGENT_HARDWARE_UNAVAILABLE',
+        state: entry.state,
+        code: result.code,
+        reason: result.reason,
+        fix: result.fix,
+    });
 }
 
 /**
@@ -108,9 +131,11 @@ export async function dispatchAgentStartupRequest({
         canPublishHttp: publication?.ok === true && publication?.canPublishHttp === true,
     });
 
+    const hardwareEntry = pending ? routePlan.hardwareAvailability || null : null;
     if (!requestKind) {
         if (!pending) return false;
-        writeInactive(res);
+        if (hardwareEntry) writeHardwareUnavailable(res, hardwareEntry);
+        else writeInactive(res);
         return true;
     }
 
@@ -131,6 +156,14 @@ export async function dispatchAgentStartupRequest({
             state: 'ready',
             generation: routePlan.lease?.id,
         }), { method: req?.method });
+        return true;
+    }
+
+    if (hardwareEntry) {
+        // Terminal: no startup observation, no reload loop.
+        if (!writeObservedState(req, res, routePlan, requestKind, hardwareStartupResultFromCompiled(hardwareEntry))) {
+            writeHardwareUnavailable(res, hardwareEntry);
+        }
         return true;
     }
 

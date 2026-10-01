@@ -160,8 +160,14 @@ function mergeRuntimeRoute(existingRoute, route, {
 } = {}) {
     const next = { ...(existingRoute || {}), ...(route || {}) };
     delete next.serviceTargets;
-    if (hostPort) next.hostPort = hostPort;
-    else delete next.hostPort;
+    if (hostPort) {
+        // A concrete target is published only for a freshly admitted, ready
+        // runtime; it supersedes a prior hardware-unavailable state.
+        next.hostPort = hostPort;
+        delete next.hardwareAvailability;
+    } else {
+        delete next.hostPort;
+    }
     return next;
 }
 

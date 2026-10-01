@@ -14,6 +14,9 @@ import {
 } from '../commands/noWaitLogObserver.js';
 import { readAgentRegistrySnapshot } from '../utils/agentRegistrySnapshot.js';
 import { resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
+import { noWaitTerminalHardwareOutcome } from '../commands/noWaitProtocol.js';
+import { hardwareStartupResult } from './hardwareAvailability.mjs';
+import { validateHardwareOutcome } from '../sandbox/hardwareLimits/errors.mjs';
 
 const UNVERIFIED_RESULT = Object.freeze({ state: 'unverified' });
 const GENERATION_CHANGED_RESULT = Object.freeze({ state: 'generation_changed' });
@@ -180,6 +183,19 @@ export function mapNoWaitObservationForMarketplace(observation, {
         };
     }
     if (observation.state === 'failed') {
+        let hardwareOutcome = null;
+        try {
+            hardwareOutcome = noWaitTerminalHardwareOutcome(observation.status, validateHardwareOutcome);
+        } catch (_) {
+            hardwareOutcome = null;
+        }
+        if (hardwareOutcome) {
+            return {
+                status: 'failed',
+                detail: summarizeFailure(observation.status),
+                hardwareOutcome,
+            };
+        }
         return {
             status: 'failed',
             detail: summarizeFailure(observation.status),
@@ -264,7 +280,17 @@ export function resolveNoWaitAgentStartupState(plan, {
     if (observation.state === 'starting') {
         return Object.freeze({ state: 'starting', queued: observation.queued === true });
     }
-    if (observation.state === 'failed') return STARTUP_FAILED_RESULT;
+    if (observation.state === 'failed') {
+        // A refused or blocked background result is terminal and carries its
+        // non-secret reason and fix; any other failure stays opaque.
+        let hardwareOutcome = null;
+        try {
+            hardwareOutcome = noWaitTerminalHardwareOutcome(observation.status, validateHardwareOutcome);
+        } catch (_) {
+            return UNVERIFIED_RESULT;
+        }
+        return hardwareOutcome ? hardwareStartupResult(hardwareOutcome) : STARTUP_FAILED_RESULT;
+    }
     if (observation.state === 'running') {
         return publication.canPublishHttp
             ? GENERATION_CHANGED_RESULT

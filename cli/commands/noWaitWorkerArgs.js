@@ -208,15 +208,31 @@ export function exactNoWaitBarrierEntry(entry, {
         || typeof entry.directDependency !== 'boolean') {
         throw new Error(`${label} is invalid`);
     }
+    // A waiting relation is either a blocking manifest edge or an
+    // independently explicit status wait (plan §9.1, U15); optional no-wait
+    // edges never produce a barrier entry.
+    if (entry.relation !== undefined
+        && !['blocking', 'explicit-status-wait'].includes(entry.relation)) {
+        throw new Error(`${label} has an unsupported relation`);
+    }
+    if (entry.relation !== undefined && entry.directDependency !== true) {
+        throw new Error(`${label} relation requires a direct dependency`);
+    }
     const entryRunId = exactRunId(entry.runId, `${label} run id`);
     if (expectedRunId && entryRunId !== exactRunId(expectedRunId)) {
         throw new Error(`${label} belongs to a different run`);
     }
+    const statusPath = exactNoWaitStatusPath(entry.path, { runningDir, label, pathApi });
+    const producerKey = pathApi.basename(statusPath).slice(0, -`.${entryRunId}.json`.length);
+    if (entry.producerKey !== undefined && entry.producerKey !== producerKey) {
+        throw new Error(`${label} producer identity does not match its status file`);
+    }
     return Object.freeze({
-        path: exactNoWaitStatusPath(entry.path, { runningDir, label, pathApi }),
+        path: statusPath,
         runId: entryRunId,
         waveIndex: exactWaveIndex(entry.waveIndex, `${label} wave index`),
         directDependency: entry.directDependency,
+        ...(entry.relation !== undefined ? { relation: entry.relation, producerKey } : {}),
     });
 }
 

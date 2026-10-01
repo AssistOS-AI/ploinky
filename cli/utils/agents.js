@@ -346,8 +346,13 @@ function resolveAgentEnableInput({
     agentName,
     mode,
     repoNameParam,
+    aliasParam,
     authOptions = {},
-}) {
+}, {
+    hardwareAdmission = 'strict',
+    hardwareContext,
+    boxMarkerOptions,
+} = {}) {
     const normalized = normalizeEnableArgs(agentName, mode, repoNameParam);
     const { manifestPath, repo: repoName, shortAgentName } = findAgent(normalized.agentName);
     const manifestBytes = fs.readFileSync(manifestPath);
@@ -362,6 +367,9 @@ function resolveAgentEnableInput({
         profileName: profile || undefined,
         path: `manifest(${repoName}/${shortAgentName})`,
     });
+    // Graph staging admits hardware eligibility as metadata so a refused
+    // agent is recorded rather than aborting unrelated staging (plan §9.1).
+    const instanceAlias = normalizeAlias(aliasParam);
     const admissionOptions = {
         manifestBytes,
         manifestPath,
@@ -369,6 +377,11 @@ function resolveAgentEnableInput({
         profileName: profileResolution.resolvedProfileName,
         profileConfig: profileResolution.profileConfig,
         network: profileResolution.network,
+        hardwareAdmission,
+        ...(hardwareContext !== undefined ? { hardwareContext } : {}),
+        ...(boxMarkerOptions !== undefined ? { boxMarkerOptions } : {}),
+        instanceKey: getAgentContainerName(instanceAlias || shortAgentName, repoName),
+        alias: instanceAlias || '',
     };
     admitManifestRuntimeCapabilities(manifest, admissionOptions);
     const selectedRuntime = getRuntimeForAgent(manifest);
@@ -616,6 +629,9 @@ export function prepareAgentEnableBatch(requests, {
     reason = 'agent-enable-batch-prelaunch',
     availabilityMode = 'additive',
     retireNoWaitMarkers = retireNoWaitRunMarkers,
+    hardwareAdmission = 'strict',
+    hardwareContext,
+    boxMarkerOptions,
 } = {}) {
     if (!Array.isArray(requests)) {
         throw new Error('prepare agent enable batch: requests must be an array');
@@ -625,7 +641,7 @@ export function prepareAgentEnableBatch(requests, {
         if (!request || typeof request !== 'object' || Array.isArray(request)) {
             throw new Error('prepare agent enable batch: each enable batch request must be an object');
         }
-        return { request, input: resolveAgentEnableInput(request) };
+        return { request, input: resolveAgentEnableInput(request, { hardwareAdmission, hardwareContext, boxMarkerOptions }) };
     });
 
     for (const { input } of resolvedRequests) {
@@ -633,6 +649,8 @@ export function prepareAgentEnableBatch(requests, {
         assertRuntimeAdmissionCurrent(input.runtimeAdmission, {
             manifestBytes: currentBytes,
             profileName: input.profileResolution.resolvedProfileName,
+            ...(hardwareContext !== undefined ? { hardwareContext } : {}),
+            ...(boxMarkerOptions !== undefined ? { boxMarkerOptions } : {}),
         });
     }
     const initialized = initializeFreshEdgeRoutingSources({ workspaceRoot: PLOINKY_WORKSPACE_ROOT });
@@ -681,6 +699,8 @@ export function prepareAgentEnableBatch(requests, {
                 assertRuntimeAdmissionCurrent(input.runtimeAdmission, {
                     manifestBytes: currentBytes,
                     profileName: input.profileResolution.resolvedProfileName,
+                    ...(hardwareContext !== undefined ? { hardwareContext } : {}),
+                    ...(boxMarkerOptions !== undefined ? { boxMarkerOptions } : {}),
                 });
             }
             const policy = bootstrapPreparedMcpToolPolicy(routing.routes);

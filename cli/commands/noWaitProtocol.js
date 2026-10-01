@@ -22,6 +22,24 @@ const SANCTIONED_IMAGE_BUILDS_PER_LAUNCH = 1;
 export const NO_WAIT_STATUS_STATES = Object.freeze(['starting', 'running', 'failed']);
 export const NO_WAIT_SEQUENCE_PHASES = Object.freeze(['waiting-barrier', 'active']);
 
+// The terminal failed state keeps its wire name; a hardware refusal or block
+// travels as a validated subtype inside `error`. A present but invalid
+// subtype makes the whole status invalid rather than a generic failure. The
+// shared outcome validator is injected so this module stays pure.
+export function noWaitTerminalHardwareOutcome(status, validateOutcome) {
+    const error = status?.error;
+    if (!error || typeof error !== 'object' || Array.isArray(error)) return null;
+    if (!Object.prototype.hasOwnProperty.call(error, 'hardwareOutcome')) return null;
+    if (typeof validateOutcome !== 'function') {
+        throw new Error('no-wait terminal hardware outcome cannot be validated by this observer');
+    }
+    const outcome = validateOutcome(error.hardwareOutcome);
+    if (error.code !== undefined && error.code !== outcome.code) {
+        throw new Error('no-wait terminal status code does not match its hardware outcome');
+    }
+    return outcome;
+}
+
 export function boundedNoWaitTimeoutInput(value, { fallback, minimum, maximum }) {
     const parsed = Number.parseInt(String(value ?? ''), 10);
     return Number.isSafeInteger(parsed)
@@ -114,6 +132,7 @@ export function resolveRunScopedObservation(status, {
     targetWaveIndex,
     timeouts,
     nowMs,
+    validateTerminalOutcome,
 } = {}) {
     if (!status || typeof status !== 'object' || Array.isArray(status)) {
         throw new Error('no-wait barrier status must be one JSON object');
@@ -136,7 +155,10 @@ export function resolveRunScopedObservation(status, {
     if (!NO_WAIT_SEQUENCE_PHASES.includes(sequencePhase)) {
         throw new Error('no-wait barrier status has invalid sequence phase');
     }
-    if (state === 'failed') return { terminal: 'failed' };
+    if (state === 'failed') {
+        const hardwareOutcome = noWaitTerminalHardwareOutcome(status, validateTerminalOutcome);
+        return hardwareOutcome ? { terminal: 'failed', hardwareOutcome } : { terminal: 'failed' };
+    }
     if (state === 'running') {
         if (sequencePhase !== 'active') {
             throw new Error("no-wait barrier status reports 'running' outside its active phase");

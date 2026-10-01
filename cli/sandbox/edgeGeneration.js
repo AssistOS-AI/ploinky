@@ -33,6 +33,7 @@ import {
     selectedMediaHostPort,
     selectedRouterHostPort,
 } from './routerPort.js';
+import { compileHardwareAvailability, validateAvailabilityProjection } from '../server/hardwareAvailability.mjs';
 
 export const EDGE_GENERATION_SCHEMA_VERSION = 1;
 export const EDGE_TOPOLOGY_CONTAINER_DIR = '/run/ploinky-edge-topology';
@@ -771,6 +772,13 @@ function validateRoutingShape(routing, manifests) {
         if (!routeKey || RESERVED_OBJECT_KEYS.has(routeKey)) throw edgeError(`routing route key '${routeKey}' is invalid`);
         assertObject(route, `routing route '${routeKey}'`);
         if (route.hostPort !== undefined) normalizeServicePort(route.hostPort, `routing.routes.${routeKey}.hostPort`);
+        if (route.hardwareAvailability !== undefined) {
+            try {
+                validateAvailabilityProjection(route.hardwareAvailability);
+            } catch (error) {
+                throw edgeError(`routing.routes.${routeKey}.hardwareAvailability is invalid: ${error.message}`);
+            }
+        }
         if (route.draining !== undefined && typeof route.draining !== 'boolean') {
             throw edgeError(`routing.routes.${routeKey}.draining must be a boolean`);
         }
@@ -1107,6 +1115,15 @@ function compileGeneration({ routing, policy, desired, agents, manifests }) {
             ));
     }
 
+    // Refused/blocked instances keep their logical routes; the generation
+    // records their unavailable state so every transport denies them. The key
+    // is present only when an instance is unavailable.
+    let hardwareAvailability;
+    try {
+        hardwareAvailability = compileHardwareAvailability(routing);
+    } catch (error) {
+        throw edgeError(error.message);
+    }
     return {
         desired: normalizedDesired,
         compiled: {
@@ -1121,6 +1138,7 @@ function compileGeneration({ routing, policy, desired, agents, manifests }) {
                 turnCredentialConsumers,
             },
             publication: publicationDisposition(normalizedDesired),
+            ...(hardwareAvailability ? { hardwareAvailability } : {}),
         },
     };
 }
@@ -1694,6 +1712,9 @@ function lifecycleRoutingProjection(routing) {
     for (const route of Object.values(projected?.routes || {})) {
         if (!isPlainObject(route)) continue;
         delete route.hostPort;
+        // Like a runtime target, availability is runtime state of a staged
+        // identity, not part of its lifecycle binding.
+        delete route.hardwareAvailability;
     }
     return projected;
 }

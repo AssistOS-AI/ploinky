@@ -73,6 +73,12 @@ import { effectiveInstanceKey } from '../utils/workspaceDependencyGraph.js';
 import { withWorkspaceMutationLease } from '../utils/runtime/maintenanceLocks.js';
 import { sanitizeDiagnosticText } from '../utils/diagnosticText.js';
 import {
+    HardwareLimitsError,
+    findHardwareOutcome,
+    validateHardwareOutcome,
+} from '../sandbox/hardwareLimits/errors.mjs';
+import { blockedByProducerOutcome } from '../sandbox/hardwareLimits/outcomes.mjs';
+import {
     assertSafeRelativeSegment,
     ensureVerifiedProducerDirectory,
 } from '../utils/verifiedReadOnlyFile.js';
@@ -109,6 +115,21 @@ export {
     resolveNoWaitBarrierTimeouts,
     resolveRunScopedObservation,
 } from './noWaitProtocol.js';
+
+// A failed terminal status keeps the bounded typed hardware outcome (and its
+// code) beside the redacted message, so observers never parse text.
+export function noWaitFailureError(failure, error, consumerIdentity = null) {
+    let outcome = findHardwareOutcome(failure);
+    if (!outcome && failure?.producerHardwareOutcome && consumerIdentity?.key && consumerIdentity?.ref) {
+        outcome = blockedByProducerOutcome({
+            key: consumerIdentity.key,
+            ref: consumerIdentity.ref,
+            alias: consumerIdentity.alias || null,
+            producer: failure.producerHardwareOutcome,
+        });
+    }
+    return outcome ? { ...error, code: outcome.code, hardwareOutcome: outcome } : error;
+}
 
 function statusPathFor(containerName, { runningDir = RUNNING_DIR } = {}) {
     return path.join(runningDir, 'no-wait', `${containerName}.json`);
@@ -346,6 +367,7 @@ export async function waitForRunScopedStatus(entry, {
                     targetWaveIndex: target.waveIndex,
                     timeouts,
                     nowMs,
+                    validateTerminalOutcome: validateHardwareOutcome,
                 });
             } catch (error) {
                 throw new Error(
@@ -353,7 +375,9 @@ export async function waitForRunScopedStatus(entry, {
                 );
             }
             if (observation.terminal) {
-                return Object.freeze({ state: observation.terminal });
+                return Object.freeze(observation.hardwareOutcome
+                    ? { state: observation.terminal, hardwareOutcome: observation.hardwareOutcome }
+                    : { state: observation.terminal });
             }
             deadline = observation.queued ? queuedDeadline : observation.deadline;
             if (!Number.isSafeInteger(observation.workerPid) || observation.workerPid <= 0) {
@@ -404,6 +428,7 @@ export async function waitForNoWaitStatusBarrier(entries, {
     runningDir = RUNNING_DIR,
     waitFn = waitForRunScopedStatus,
     waitOptions = {},
+    consumerIdentity = null,
 } = {}) {
     const barrier = Array.isArray(entries) ? entries : [];
     if (!barrier.length) return Object.freeze([]);
@@ -443,14 +468,37 @@ export async function waitForNoWaitStatusBarrier(entries, {
         error.cause = firstInvalid.error;
         throw error;
     }
-    const failedDependency = settled.find(({ entry, status }) => (
+    const failedDependencies = settled.filter(({ entry, status }) => (
         entry.directDependency && status?.state === 'failed'
     ));
+    // A waited-on producer's terminal hardware refusal or block makes this
+    // consumer blocked with the producer's root cause (plan §9.1, U14/U15).
+    const hardwareFailure = failedDependencies
+        .filter(({ status }) => status?.hardwareOutcome)
+        .sort((left, right) => statusIdentity(left.entry).localeCompare(statusIdentity(right.entry)))[0];
+    if (hardwareFailure && consumerIdentity?.key && consumerIdentity?.ref) {
+        const outcome = blockedByProducerOutcome({
+            key: consumerIdentity.key,
+            ref: consumerIdentity.ref,
+            alias: consumerIdentity.alias || null,
+            producer: hardwareFailure.status.hardwareOutcome,
+        });
+        throw new HardwareLimitsError({
+            ...outcome,
+            additionalCauseCount: outcome.additionalCauseCount + failedDependencies.length - 1,
+        });
+    }
+    const failedDependency = failedDependencies[0];
     if (failedDependency) {
         const error = new Error(
             `no-wait direct dependency '${statusIdentity(failedDependency.entry)}' failed in this run`,
         );
         error.code = 'PLOINKY_NO_WAIT_DIRECT_DEPENDENCY_FAILED';
+        // The producer's own outcome is kept separately: it describes the
+        // producer, and the publishing consumer converts it to its own block.
+        if (failedDependency.status?.hardwareOutcome) {
+            error.producerHardwareOutcome = failedDependency.status.hardwareOutcome;
+        }
         throw error;
     }
     return Object.freeze(settled.map(({ entry, status }) => Object.freeze({ entry, status })));
@@ -1611,7 +1659,7 @@ async function main() {
                 sequencePhaseStartedAtMs: finishedAtMs,
                 finishedAt,
                 finishedAtMs,
-                error: { message: sanitizeDiagnosticText(failure) },
+                error: noWaitFailureError(failure, { message: sanitizeDiagnosticText(failure) }),
             });
         } catch (publishFailure) {
             console.error(sanitizeDiagnosticText(
@@ -1656,6 +1704,8 @@ async function main() {
             runtimeKind: admittedRuntimeKind,
             catalogPolicy: llmAdmissionContext.catalogPolicy,
             catalogIdentity: llmAdmissionContext.catalogIdentity,
+            instanceKey: containerName,
+            alias: alias || '',
         });
         assertRuntimeAdmissionCurrent(runtimeAdmission, {
             manifestBytes: fs.readFileSync(manifestPath),
@@ -1966,12 +2016,12 @@ async function main() {
         // Carry the readiness probe's own output and the runtime log tail into
         // the terminal status. Cleanup has already removed the container by
         // now, so this is the only surviving explanation of the failure.
-        const error = {
+        const error = noWaitFailureError(failure, {
             message: redactFailure(failure.message),
             stack: failure.stack ? redactFailure(failure.stack) : null,
             ...(failure.readinessDetail ? { readinessDetail: failure.readinessDetail } : {}),
             ...(failure.runtimeLogTail ? { runtimeLogTail: failure.runtimeLogTail } : {}),
-        };
+        }, { key: containerName, ref: `${repoName}/${shortAgent}`, alias: alias || null });
         publishStatus({
             ...baseStatus,
             state: 'failed',

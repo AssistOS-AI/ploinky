@@ -156,7 +156,10 @@ function resolveWorkspaceDependencyGraph({
         const requestedProfile = normalizeProfileOverride(profile);
 
         if (stack.includes(nodeId)) {
-            throw new Error(`Dependency cycle detected: ${[...stack, nodeId].join(' -> ')}`);
+            throw Object.assign(
+                new Error(`Dependency cycle detected: ${[...stack, nodeId].join(' -> ')}`),
+                { cycleNodeId: nodeId },
+            );
         }
 
         let node = nodes.get(nodeId);
@@ -210,6 +213,9 @@ function resolveWorkspaceDependencyGraph({
                 // blocking child of another, so the modifier must live on the
                 // edge rather than on the child node itself.
                 dependencyEdges: new Map(),
+                // A declared edge that topology truncates as a cycle backedge
+                // keeps its original wait kind for availability propagation.
+                cycleBackedges: new Map(),
                 isStatic: Boolean(isStatic),
                 selectionPath: selectionPath.length ? [...selectionPath] : [nodeId],
             };
@@ -236,7 +242,10 @@ function resolveWorkspaceDependencyGraph({
 
         const status = state.get(nodeId);
         if (status === 'visiting') {
-            throw new Error(`Dependency cycle detected: ${[...stack, nodeId].join(' -> ')}`);
+            throw Object.assign(
+                new Error(`Dependency cycle detected: ${[...stack, nodeId].join(' -> ')}`),
+                { cycleNodeId: nodeId },
+            );
         }
         if (status === 'visited') {
             return nodeId;
@@ -283,6 +292,13 @@ function resolveWorkspaceDependencyGraph({
                 // Cycles are an existing intentional truncation case: log and continue so the parent build can still proceed.
                 // All other resolution failures (missing agents, malformed enable specs, manifest parse errors) fail-closed.
                 if (message.startsWith('Dependency cycle detected:')) {
+                    if (dependencyError.cycleNodeId) {
+                        const noWait = Boolean(parseEnableDirective(rawDependency)?.noWait);
+                        const existingBackedge = node.cycleBackedges.get(dependencyError.cycleNodeId);
+                        if (!existingBackedge || (existingBackedge.noWait && !noWait)) {
+                            node.cycleBackedges.set(dependencyError.cycleNodeId, { noWait });
+                        }
+                    }
                     const warning = `[manifest enable] Failed to resolve dependency '${rawDependency}' for '${node.agentRef}': ${message}`;
                     if (typeof onCycle === 'function') onCycle(warning);
                     else console.error(warning);

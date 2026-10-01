@@ -31,6 +31,7 @@ import { createTokenReplayCache } from '../security/tokens/JwsCodec.js';
 import { runMarketplaceEnableWorker } from '../marketplaceEnableWorker.js';
 import { authService, LOCAL_AUTH_COOKIE_NAME, parseCookies, sendJson, sessionTokenService, SSO_AUTH_COOKIE_NAME } from './shared.js';
 import { localSessionAllowedForRoutePlan } from './authContext.js';
+import { findHardwareOutcome, formatHardwareOutcome } from '../../sandbox/hardwareLimits/errors.mjs';
 
 export const MARKETPLACE_PATH = '/api/marketplace';
 export const MARKETPLACE_AGENT_TARGET = 'ploinky-router';
@@ -80,6 +81,18 @@ function safeLifecycleCause(error) {
 }
 
 function sendLifecycleError(res, error) {
+    // A hardware refusal (422) or dependency block (424) carries its bounded
+    // typed outcome; no stack, body or environment is returned.
+    const hardwareOutcome = findHardwareOutcome(error);
+    if (hardwareOutcome) {
+        sendJson(res, hardwareOutcome.state === 'blocked' ? 424 : 422, {
+            ok: false,
+            error: hardwareOutcome.code,
+            message: formatHardwareOutcome(hardwareOutcome),
+            hardwareOutcome,
+        });
+        return true;
+    }
     const code = String(error?.code || '');
     const contract = SAFE_LIFECYCLE_ERRORS.get(code);
     if (!contract) return false;

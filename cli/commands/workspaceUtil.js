@@ -107,7 +107,22 @@ import { networkContractHash } from '../sandbox/networkContract.js';
 import {
   admitManifestRuntimeCapabilities,
   assertRuntimeAdmissionCurrent,
+  hardwareRefusalOf,
 } from '../sandbox/runtimeCapabilities.js';
+import {
+  blockingEdgesFromGraph,
+  classifyAvailability,
+  summarizeStartResult,
+} from '../sandbox/hardwareLimits/outcomes.mjs';
+import {
+  HardwareLimitsError,
+  findHardwareOutcome,
+  formatHardwareOutcome,
+} from '../sandbox/hardwareLimits/errors.mjs';
+import {
+  buildAvailabilityProjection,
+  markRouteHardwareUnavailable,
+} from '../server/hardwareAvailability.mjs';
 import { getAgentDataDir } from '../utils/workspaceStructure.js';
 import {
   formatAgentAttachmentBanner,
@@ -400,6 +415,7 @@ export function buildNoWaitLaunchSchedule(deferredNoWaitWaves, {
       // the observed status and to size its cumulative queued budget.
       statusByNodeId.set(entry.node.id, Object.freeze({
         nodeId: entry.node.id,
+        producerKey: entry.registryName,
         path: statusPath,
         runId,
         waveIndex,
@@ -416,7 +432,7 @@ export function buildNoWaitLaunchSchedule(deferredNoWaitWaves, {
     const scheduled = entries.map((entry) => {
       const directDependencyIds = new Set(entry.node?.dependencies || []);
       const references = new Map();
-      const addReference = (reference, directDependency) => {
+      const addReference = (reference, directDependency, relation = 'blocking') => {
         if (!reference) return;
         // The worker rejects a barrier entry that does not name a strictly
         // earlier wave, exiting before it can publish a status while the parent
@@ -437,10 +453,19 @@ export function buildNoWaitLaunchSchedule(deferredNoWaitWaves, {
         references.set(reference.path, {
           ...reference,
           directDependency: Boolean(directDependency || existing?.directDependency),
+          relation: existing?.relation === 'blocking' ? 'blocking' : relation,
         });
       };
+      // Only blocking edges synthesize a waiting relation (plan §9.1, U15).
+      // An optional no-wait edge neither delays nor blocks its consumer; a
+      // duplicate blocking declaration already won in the graph's edge map.
       for (const dependencyId of directDependencyIds) {
-        addReference(statusByNodeId.get(dependencyId), true);
+        if (entry.node?.dependencyEdges?.get?.(dependencyId)?.noWait === true) continue;
+        addReference(statusByNodeId.get(dependencyId), true, 'blocking');
+      }
+      // Independently explicit status waits supplied by the scheduler.
+      for (const dependencyId of entry.explicitStatusWaitNodeIds || []) {
+        addReference(statusByNodeId.get(dependencyId), true, 'explicit-status-wait');
       }
       // The worker rejects a barrier larger than this, and would exit during
       // argument parsing without publishing a terminal status while the parent
@@ -554,7 +579,17 @@ function writeNoWaitRunMarker(entry) {
   });
 }
 
-export function writeNoWaitSpawnFailure(entry, error) {
+// Publish a terminal hardware outcome for a no-wait instance whose refusal or
+// block is already known from graph metadata. No worker or runtime is created;
+// consumers that wait on this producer observe the typed subtype.
+export function writeNoWaitHardwareOutcome(entry, outcome) {
+  // The run marker binds observers (status, startup page, Marketplace) to
+  // this exact run before the terminal status is published.
+  writeNoWaitRunMarker({ identity: entry?.identity, statusFile: entry?.statusFile });
+  writeNoWaitSpawnFailure(entry, new HardwareLimitsError(outcome), { phase: 'admission' });
+}
+
+export function writeNoWaitSpawnFailure(entry, error, { phase = 'spawn' } = {}) {
   const finishedAtMs = Date.now();
   // This runs inside the spawn loop's catch. Without an exact coordination
   // path there is nothing to publish, and throwing here would replace the
@@ -571,17 +606,20 @@ export function writeNoWaitSpawnFailure(entry, error) {
   // A spawn failure has to be a valid terminal member of a wave barrier so a
   // dependent worker can make a deterministic dependency decision instead of
   // stalling on a status that never arrives.
+  const hardwareOutcome = findHardwareOutcome(error);
   const payload = {
     state: 'failed',
     sequencePhase: 'active',
-    phase: 'spawn',
+    phase,
     startedAt: new Date(finishedAtMs).toISOString(),
     startedAtMs: finishedAtMs,
     sequencePhaseStartedAt: new Date(finishedAtMs).toISOString(),
     sequencePhaseStartedAtMs: finishedAtMs,
     finishedAt: new Date(finishedAtMs).toISOString(),
     finishedAtMs,
-    error: { message: sanitizeDiagnosticText(error) },
+    error: hardwareOutcome
+      ? { message: sanitizeDiagnosticText(error), code: hardwareOutcome.code, hardwareOutcome }
+      : { message: sanitizeDiagnosticText(error) },
     ...identity,
   };
   const canonical = path.join(RUNNING_DIR, 'no-wait', `${identity.containerName}.json`);
@@ -1168,8 +1206,24 @@ function isRegistryRuntimeRunning(containerName, record) {
   return dockerSvc.isContainerRunning(containerName);
 }
 
+// The exact registry containerName a graph node will use: its retained record
+// or the conventional name staging will create.
+function graphNodeRegistryKey(node, registry, getAgentContainerName = dockerSvc.getAgentContainerName) {
+  if (String(node?.id || '').startsWith('extra:')) return node.id.slice('extra:'.length);
+  const existing = findRegistryEntryForGraphNode(registry || {}, node, getAgentContainerName);
+  return existing?.key || getAgentContainerName(node.alias || node.shortAgentName, node.repoName);
+}
+
+// Graph-wide admission is metadata-only for hardware eligibility (plan §9.1):
+// a hardware refusal is recorded in the admission record, every other
+// capability error stays strict, and no record can authorize argument
+// rendering.
 export function admitWorkspaceGraphRuntimeCapabilities(graph, {
   additionalNodes = [],
+  registry = null,
+  hardwareContext,
+  boxMarkerOptions,
+  getAgentContainerName = dockerSvc.getAgentContainerName,
 } = {}) {
   const nodes = [
     ...Array.from(graph?.nodes?.values?.() || []),
@@ -1206,6 +1260,7 @@ export function admitWorkspaceGraphRuntimeCapabilities(graph, {
         env: process.env,
       })
       : { catalogPolicy: null, catalogIdentity: null };
+    const key = graphNodeRegistryKey(node, registry, getAgentContainerName);
     const admission = admitManifestRuntimeCapabilities(manifest, {
       manifestBytes,
       manifestPath: manifestPath || `manifest(${node.repoName}/${node.shortAgentName})`,
@@ -1217,20 +1272,28 @@ export function admitWorkspaceGraphRuntimeCapabilities(graph, {
       runtimeKind,
       catalogPolicy: llmAdmissionContext.catalogPolicy,
       catalogIdentity: llmAdmissionContext.catalogIdentity,
+      hardwareAdmission: 'metadata',
+      ...(hardwareContext !== undefined ? { hardwareContext } : {}),
+      ...(boxMarkerOptions !== undefined ? { boxMarkerOptions } : {}),
+      instanceKey: key,
+      alias: node.alias || '',
     });
     admissions.push(Object.freeze({
       nodeId: node.id,
+      key,
+      alias: node.alias || '',
       manifestPath: hasExactManifestFile ? manifestPath : '',
       manifestBytesBase64: Buffer.from(manifestBytes).toString('base64'),
       profileName: profileResolution.resolvedProfileName,
       runtimeKind,
       admission,
+      hardwareRefusal: hardwareRefusalOf(admission),
     }));
   }
   return Object.freeze(admissions);
 }
 
-export function assertWorkspaceGraphAdmissionsCurrent(admissions) {
+export function assertWorkspaceGraphAdmissionsCurrent(admissions, { hardwareContext, boxMarkerOptions } = {}) {
   for (const record of admissions || []) {
     const manifestBytes = record.manifestPath
       ? fs.readFileSync(record.manifestPath)
@@ -1239,9 +1302,28 @@ export function assertWorkspaceGraphAdmissionsCurrent(admissions) {
       manifestBytes,
       profileName: record.profileName,
       runtimeKind: record.runtimeKind,
+      ...(hardwareContext !== undefined ? { hardwareContext } : {}),
+      ...(boxMarkerOptions !== undefined ? { boxMarkerOptions } : {}),
     });
   }
   return admissions;
+}
+
+// Classify every admitted graph node as eligible, refused or blocked through
+// the U15 blocking relation. Keys are exact registry containerNames.
+export function classifyWorkspaceGraphAvailability(graph, admissions, { explicitWaits = [] } = {}) {
+  const keyByNodeId = new Map((admissions || []).map((record) => [record.nodeId, record.key]));
+  const nodes = (admissions || []).map((record) => ({
+    key: record.key,
+    ref: record.admission.agentId,
+    alias: record.alias || null,
+    refusal: record.hardwareRefusal || null,
+  }));
+  const edges = blockingEdgesFromGraph(graph, (nodeId) => keyByNodeId.get(nodeId), { explicitWaits });
+  const classified = classifyAvailability({ nodes, edges });
+  const byNodeId = new Map();
+  for (const record of admissions || []) byNodeId.set(record.nodeId, classified.get(record.key));
+  return Object.freeze({ byKey: classified, byNodeId, edges });
 }
 
 function ensureGraphNodesEnabled(graph, reg, {
@@ -1259,6 +1341,9 @@ function ensureGraphNodesEnabled(graph, reg, {
   runtimeReplacementOptions,
   executionRecordOptions,
   additionalNodes = [],
+  hardwareContext,
+  boxMarkerOptions,
+  unavailableNodeIds = new Set(),
 } = {}) {
   const nodes = [
     ...Array.from(graph?.nodes?.values?.() || []),
@@ -1273,7 +1358,13 @@ function ensureGraphNodesEnabled(graph, reg, {
 
   // Keep the physical preparation boundary independently fail-closed even
   // though startWorkspace performs the same complete-graph gate before locks.
-  admitWorkspaceGraphRuntimeCapabilities(graph, { additionalNodes });
+  // Hardware eligibility is metadata here: a refusal is staged, not thrown.
+  admitWorkspaceGraphRuntimeCapabilities(graph, {
+    additionalNodes,
+    registry: reg,
+    ...(hardwareContext !== undefined ? { hardwareContext } : {}),
+    ...(boxMarkerOptions !== undefined ? { boxMarkerOptions } : {}),
+  });
 
   for (const node of nodes) {
     const existing = findRegistryEntryForGraphNode(reg, node, dockerSvc.getAgentContainerName);
@@ -1290,9 +1381,15 @@ function ensureGraphNodesEnabled(graph, reg, {
     const executionChanged = executionRecordDiffers(existing.rec, expectedExecution);
     const profileChanged = Boolean(node.profile && existing.rec.profile !== node.profile);
     const preliminary = { node, existing, expectedExecution, executionChanged, profileChanged };
+    // A refused or blocked instance keeps no authority: an existing runtime is
+    // revoked by identity rotation and removed through exact ownership checks.
+    const hardwareUnavailable = unavailableNodeIds.has(node.id)
+      && (runtimeReplacementOptions?.containerExistsImpl || dockerSvc.containerExists)(existing.key);
     const runtimeReason = executionChanged || profileChanged
       ? ''
-      : String(runtimeReplacementReason(preliminary, runtimeReplacementOptions) || '');
+      : hardwareUnavailable
+        ? 'hardwareUnavailable'
+        : String(runtimeReplacementReason(preliminary, runtimeReplacementOptions) || '');
     existingPlans.push({
       ...preliminary,
       runtimeReason,
@@ -1392,6 +1489,9 @@ function ensureGraphNodesEnabled(graph, reg, {
   })), {
     reason: 'workspace-graph-enable-prelaunch',
     availabilityMode: 'replacement',
+    hardwareAdmission: 'metadata',
+    ...(hardwareContext !== undefined ? { hardwareContext } : {}),
+    ...(boxMarkerOptions !== undefined ? { boxMarkerOptions } : {}),
   });
   if (prepared?.preparedGeneration?.selector
       && prepared.preparedGeneration.selector.state !== 'inactive') {
@@ -1913,7 +2013,7 @@ function buildRouterUrl(staticPort, env = process.env) {
     : `http://127.0.0.1:${staticPort}`;
 }
 
-export function preflightWorkspaceStartRuntimeCapabilities(staticAgentArg) {
+export function preflightWorkspaceStartRuntimeCapabilities(staticAgentArg, { hardwareContext, boxMarkerOptions } = {}) {
   const configured = workspaceSvc.getConfig()?.static?.agent || '';
   let staticAgent = String(staticAgentArg || configured || '').trim();
   if (!staticAgent) {
@@ -1940,8 +2040,29 @@ export function preflightWorkspaceStartRuntimeCapabilities(staticAgentArg) {
     registry,
     dockerSvc.getAgentContainerName,
   );
-  const admissions = admitWorkspaceGraphRuntimeCapabilities(graph, { additionalNodes });
+  const admissions = admitWorkspaceGraphRuntimeCapabilities(graph, {
+    additionalNodes,
+    registry,
+    ...(hardwareContext !== undefined ? { hardwareContext } : {}),
+    ...(boxMarkerOptions !== undefined ? { boxMarkerOptions } : {}),
+  });
   return Object.freeze({ graph, registry, additionalNodes, admissions });
+}
+
+// Exact refusal/block counts and the overall state; never "all ready" while
+// optional work is pending or the graph is degraded (plan §9.4).
+export function printStartResultSummary(result, { log = console.log } = {}) {
+  const refused = result.refusedAgents.count;
+  const blocked = result.blockedAgents.count;
+  const pending = result.asynchronousAgents.count;
+  if (result.state === 'degraded') {
+    log(`[start] Workspace started degraded: ${refused} agent(s) refused and ${blocked} blocked by hardware limits; `
+      + `${pending} no-wait agent(s) still starting in the background. See the reasons and fixes above, or run ploinky limits status on the host.`);
+  } else if (result.state === 'starting') {
+    log(`[start] Required agents are ready; ${pending} no-wait agent(s) are still starting in the background.`);
+  } else {
+    log('[start] All selected agents are ready.');
+  }
 }
 
 async function startWorkspace(staticAgentArg, portArg, {
@@ -1988,6 +2109,12 @@ async function startWorkspace(staticAgentArg, portArg, {
   try {
   assertWorkspaceGraphAdmissionsCurrent(admittedStart.admissions);
   const lockedStart = preflightWorkspaceStartRuntimeCapabilities(staticAgentArg);
+  // Hardware refusals are recorded per exact instance; blocking and explicit
+  // waiting consumers become blocked, unrelated agents start (plan §9.1).
+  const graphAvailability = classifyWorkspaceGraphAvailability(lockedStart.graph, lockedStart.admissions);
+  const unavailableNodeIds = new Set([...graphAvailability.byNodeId]
+    .filter(([, entry]) => entry && entry.state !== 'eligible')
+    .map(([nodeId]) => nodeId));
   const workspaceConfigForAuth = workspaceSvc.getConfig() || {};
   const graphSsoConfig = resolveWorkspaceGraphSsoConfig(lockedStart.graph, workspaceConfigForAuth.sso);
   initializeFreshEdgeRoutingSources({ workspaceRoot: PLOINKY_WORKSPACE_ROOT });
@@ -2142,6 +2269,7 @@ async function startWorkspace(staticAgentArg, portArg, {
     let preparedGraph = ensureGraphNodesEnabled(dependencyGraph, reg, {
       deferredNodeIds: waitClassification.noWait,
       additionalNodes: extraRuntimeNodes,
+      unavailableNodeIds,
     });
     workspacePreparationLease = preparedGraph?.preparedGeneration?.preparationLease || null;
     if (preparedGraph?.preparedGeneration?.selector?.state !== 'inactive') {
@@ -2216,6 +2344,7 @@ async function startWorkspace(staticAgentArg, portArg, {
       {
         deferredNodeIds: waitClassification.noWait,
         additionalNodes: extraRuntimeNodes,
+        graphEnableOptions: { unavailableNodeIds },
       },
     );
     preparedGraph = postProviderPreparation.preparedGraph;
@@ -2248,6 +2377,20 @@ async function startWorkspace(staticAgentArg, portArg, {
       });
       console.log(`[start] No-wait dependencies (background launch): ${labels.join(', ')}`);
     }
+    const hardwareOutcomes = { refused: [], blocked: [] };
+    const recordedOutcomeKeys = new Set();
+    const unavailableOutcome = (nodeId) => {
+      const entry = graphAvailability.byNodeId.get(nodeId);
+      return entry && entry.state !== 'eligible' ? entry.outcome : null;
+    };
+    const reportHardwareOutcome = (outcome) => {
+      if (!outcome || recordedOutcomeKeys.has(outcome.key)) return;
+      recordedOutcomeKeys.add(outcome.key);
+      hardwareOutcomes[outcome.state === 'refused' ? 'refused' : 'blocked'].push(outcome);
+      console.warn(`[start] ${formatHardwareOutcome(outcome)}`);
+    };
+    const readyAgentKeys = [];
+    const asynchronousAgentKeys = [];
 
     const staticNode = dependencyGraph.nodes.get(dependencyGraph.staticNodeId);
     const staticContainer = resolveStaticRouterContainerName({
@@ -2262,6 +2405,36 @@ async function startWorkspace(staticAgentArg, portArg, {
         || cfg.static?.agent !== staticAgent
         || cfg.static?.container !== staticContainer) {
       throw new Error('start: prepared routing generation does not contain the exact static Router identity');
+    }
+    // Refused/blocked instances keep their logical routes but lose every
+    // runtime target; the unavailable state is compiled into the generation.
+    const unavailableRoutes = [];
+    for (const [nodeId, entry] of graphAvailability.byNodeId) {
+      if (!entry || entry.state === 'eligible') continue;
+      const key = registryNameByNodeId.get(nodeId)
+        || (nodeId.startsWith('extra:') ? nodeId.slice('extra:'.length) : '');
+      const record = key ? reg[key] : null;
+      if (!record) continue;
+      if (key !== entry.outcome.key) {
+        throw new Error(`start: hardware outcome for '${nodeId}' does not match its staged registry identity`);
+      }
+      unavailableRoutes.push({
+        routeKey: record.alias || record.agentName,
+        projection: buildAvailabilityProjection({
+          outcome: entry.outcome,
+          instanceId: record.instanceId,
+          enableGeneration: record.enableGeneration,
+        }),
+      });
+    }
+    if (unavailableRoutes.length) {
+      cfg = await mergeRoutingConfig((current) => {
+        current.routes = current.routes || {};
+        for (const { routeKey, projection } of unavailableRoutes) {
+          current.routes[routeKey] = markRouteHardwareUnavailable(current.routes[routeKey], projection);
+        }
+        return current;
+      }, { coordinate: false });
     }
     const updateRoutes = async (targetNames = [], { allowFailures = false } = {}) => {
       if (!Array.isArray(targetNames) || !targetNames.length) {
@@ -2339,6 +2512,8 @@ async function startWorkspace(staticAgentArg, portArg, {
             ...(resolvedHostPort ? { hostPort: resolvedHostPort } : {}),
           };
           if (!resolvedHostPort) delete nextRoute.hostPort;
+          // A freshly admitted launch supersedes any earlier unavailable state.
+          delete nextRoute.hardwareAvailability;
           const readinessRoute = buildRelayReadinessRoute({
             route: nextRoute,
             manifest,
@@ -2421,6 +2596,10 @@ async function startWorkspace(staticAgentArg, portArg, {
         const registryName = registryNameByNodeId.get(node.id);
         if (noWaitNodeIds.has(node.id)) {
           noWaitWaveNodes.push({ node, registryName });
+        } else if (unavailableOutcome(node.id)) {
+          // Refused or blocked: no runtime create, readiness probe or start
+          // hook; the route stays target-less and unavailable.
+          reportHardwareOutcome(unavailableOutcome(node.id));
         } else {
           blockingNodes.push(node);
           if (registryName) blockingNames.push(registryName);
@@ -2458,6 +2637,7 @@ async function startWorkspace(staticAgentArg, portArg, {
       });
 
       await waitForReadinessEntries(readinessEntries);
+      readyAgentKeys.push(...blockingNames);
     }
 
     const additionalStartup = partitionAdditionalStartupAgents({
@@ -2490,7 +2670,12 @@ async function startWorkspace(staticAgentArg, portArg, {
     if (activeManualNames.length) {
       console.log(`[start] Retaining ${activeManualNames.length} explicitly active manual agent(s): ${activeManualNames.join(', ')}`);
     }
-    const additionalNames = [...additionalStartup.automatic, ...activeManualNames];
+    const extraOutcomeByKey = new Map((extraRuntimeNodes || [])
+      .map((node) => [node.id.slice('extra:'.length), unavailableOutcome(node.id)])
+      .filter(([, outcome]) => outcome));
+    for (const outcome of extraOutcomeByKey.values()) reportHardwareOutcome(outcome);
+    const additionalNames = [...additionalStartup.automatic, ...activeManualNames]
+      .filter((name) => !extraOutcomeByKey.has(name));
     if (additionalNames.length) {
       const extra = await updateRoutes(additionalNames, { allowFailures: true });
       if (extra.failedAgents.length === 0) {
@@ -2501,6 +2686,7 @@ async function startWorkspace(staticAgentArg, portArg, {
           manifest: result.manifest,
         }, result.readinessRoute || result.route, result.shortAgentName));
         await waitForReadinessEntries(extraReadiness);
+        readyAgentKeys.push(...additionalNames);
       } else {
         throw new Error('additional runtime failure left edge selectors inactive; repair and run start again');
       }
@@ -2561,6 +2747,21 @@ async function startWorkspace(staticAgentArg, portArg, {
           console.warn(`[start] no-wait node '${formatGraphNodeLabel(node, staticAgent)}' missing registry entry; skipping background launch.`);
           continue;
         }
+        const knownOutcome = unavailableOutcome(node.id);
+        if (knownOutcome) {
+          // Cheap metadata already settled this optional instance: publish
+          // its terminal typed outcome without creating a worker or runtime.
+          try {
+            writeNoWaitHardwareOutcome(entry, knownOutcome);
+          } catch (publishErr) {
+            console.error(sanitizeDiagnosticText(
+              `[start] no-wait hardware outcome for '${formatGraphNodeLabel(node, staticAgent)}' could not be published: ${sanitizeDiagnosticText(publishErr)}`,
+              { singleLine: true },
+            ));
+          }
+          reportHardwareOutcome(knownOutcome);
+          continue;
+        }
         try {
           const { pid, logFile, statusFile } = await spawnNoWaitWorker({
             node,
@@ -2571,6 +2772,7 @@ async function startWorkspace(staticAgentArg, portArg, {
             waitForStatuses: entry.waitForStatuses,
           });
           console.log(`[start] ${formatGraphNodeLabel(node, staticAgent)}: no-wait wave ${entry.waveIndex + 1}/${noWaitSchedule.length} launch started (pid ${pid}). log=${logFile} status=${statusFile}`);
+          asynchronousAgentKeys.push(registryName);
         } catch (spawnErr) {
           // Publishing the terminal status is best-effort here. Letting it
           // throw would replace the real spawn failure with a publication
@@ -2595,6 +2797,14 @@ async function startWorkspace(staticAgentArg, portArg, {
     console.log(`[start] Server logs: ${path.join(LOGS_DIR, 'router.log')}`);
     console.log(`[start] Watchdog logs: ${path.join(LOGS_DIR, 'watchdog.log')}`);
     console.log(`[start] Router: ${buildRouterUrl(staticPort)}`);
+    const startResult = summarizeStartResult({
+      readyAgents: readyAgentKeys.map((key) => ({ key })),
+      asynchronousAgents: asynchronousAgentKeys.map((key) => ({ key })),
+      refusedAgents: hardwareOutcomes.refused,
+      blockedAgents: hardwareOutcomes.blocked,
+    });
+    printStartResultSummary(startResult);
+    return startResult;
   } catch (e) {
     const cleanedCandidateIds = new Set();
     for (const candidate of workspaceRuntimeCandidates.reverse()) {

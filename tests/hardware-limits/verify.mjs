@@ -13,6 +13,7 @@
 // spawned with argument arrays, explicit cwd/environment and deadlines.
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -368,14 +369,17 @@ export async function runSuite({
     baseline = null,
     knownBaselineFailures = new Set(),
 }) {
-    const temp = createOwnedShortTemp(root);
+    // The owned temp directory lives outside the candidate root: a worktree
+    // nested in another Ploinky workspace would otherwise let test
+    // workspaces discover the parent `.ploinky` (see S0 evidence), and a
+    // relative TMPDIR breaks suites that change directory.
+    const tempParent = fs.realpathSync(process.env.PLOINKY_HWL_TEMP_PARENT || os.tmpdir());
+    const temp = createOwnedShortTemp(tempParent, { name: `hwl-${childId.replace(/[^A-Za-z0-9-]/g, '-')}-${randomRunId().slice(0, 8)}` });
     let run;
     try {
         const env = {
             PATH: process.env.PATH || '/usr/bin:/bin',
             HOME: process.env.HOME || temp.path,
-            // Absolute owned short temp directory: a relative TMPDIR breaks
-            // suites that change directory (see S0 evidence).
             TMPDIR: temp.path,
             PLOINKY_ROOT: root,
             PLOINKY_HWL_RUN_ID: runId,

@@ -410,3 +410,99 @@ test('watchdog keeps an additive predecessor live through readiness and atomical
     assert.equal(monitor.targets.get(candidateName), target);
     assert.equal(target.isRestarting, false);
 });
+
+// ---------------------------------------------------------------------------
+// Hardware-limit terminal outcomes (plan §9.4)
+
+// Imported lazily inside the tests: a top-level await here would let the
+// file's cleanup hook run before these tests are registered.
+async function hardwareModules() {
+    const [constants, hardwareErrors, hardwareOutcomes, hardwareRequests, monitorModule] = await Promise.all([
+        import('../../ploinky-box/constants.mjs'),
+        import('../../cli/sandbox/hardwareLimits/errors.mjs'),
+        import('../../cli/sandbox/hardwareLimits/outcomes.mjs'),
+        import('../../cli/sandbox/hardwareLimits/requestedLimits.mjs'),
+        import('../../cli/server/containerMonitor.js'),
+    ]);
+    const boxMarkerPath = path.join(workspace, 'box-marker');
+    fs.writeFileSync(boxMarkerPath, constants.BOX_MARKER_CONTENT);
+    return { boxMarkerPath, hardwareErrors, hardwareOutcomes, hardwareRequests, monitorTestables: monitorModule.__testables };
+}
+const PREPARED = Object.freeze({ gate: 'on', prepared: true, backendReady: true, controllers: ['cpu', 'memory', 'pids'] });
+
+function limitedMonitor(ledgerName, hardwareContext, boxMarkerPath) {
+    fs.writeFileSync(path.join(ploinkyDir, 'agents.json'), JSON.stringify({
+        unsafe_runtime: {
+            type: 'agent', repoName: 'demo', agentName: 'unsafe',
+            instanceId: 'instance-one', enableGeneration: 'enable-one', runtime: 'container',
+        },
+    }, null, 2));
+    fs.writeFileSync(manifestFile, JSON.stringify({
+        container: 'node:20-alpine',
+        llmRuntime: { runtimePolicy: { resources: { memory: '256m' } } },
+    }));
+    const events = [];
+    const monitor = createContainerMonitor({
+        terminalLedgerFile: path.join(ploinkyDir, 'running', ledgerName),
+        log: (level, event, data) => events.push({ level, event, data }),
+    });
+    monitor.boxMarkerOptions = { markerPath: boxMarkerPath };
+    if (hardwareContext !== undefined) monitor.hardwareContext = hardwareContext;
+    return { monitor, events };
+}
+
+test('MON.refused-terminal', async () => {
+    const { boxMarkerPath, hardwareErrors } = await hardwareModules();
+    const { monitor, events } = limitedMonitor('hw-refused-ledger.json', undefined, boxMarkerPath);
+    syncManagedContainers(monitor);
+    assert.equal(monitor.targets.size, 0, 'no restart target or timer for a refused agent');
+    const entry = monitor.terminalLedger.get('unsafe_runtime');
+    assert.equal(entry?.code, hardwareErrors.HARDWARE_UNENFORCEABLE);
+    assert.equal(entry?.classification, 'policy');
+    assert.equal(events.filter(({ event }) => event === 'container_runtime_policy_terminal').length, 1);
+});
+
+test('MON.blocked-terminal', async () => {
+    const { hardwareErrors, hardwareOutcomes, hardwareRequests, monitorTestables } = await hardwareModules();
+    const root = hardwareRequests.buildDirectRefusal({
+        key: 'root_runtime',
+        ref: 'demo/root',
+        refusalParts: {
+            reasonCode: 'gate_off', reason: 'Hardware limits are off for this workspace.', fix: 'Turn the gate on.',
+            requested: [{ field: 'memory', value: '64m', source: 'manifest' }],
+        },
+        inputFingerprint: 'd'.repeat(64),
+    });
+    const blocked = hardwareOutcomes.blockedByProducerOutcome({ key: 'unsafe_runtime', ref: 'demo/unsafe', producer: root });
+    const error = new hardwareErrors.HardwareLimitsError(blocked);
+    assert.equal(error.code, hardwareErrors.HARDWARE_DEPENDENCY_BLOCKED);
+    assert.equal(monitorTestables.classifyTerminalFailure(error), 'policy');
+    assert.equal(monitorTestables.classifyTerminalFailure(
+        hardwareErrors.wrapPreservingHardwareCause('restart failed', error),
+    ), 'policy', 'a wrapped block keeps its terminal code');
+});
+
+test('MON.unchanged-no-retry', async () => {
+    const { boxMarkerPath } = await hardwareModules();
+    const { monitor, events } = limitedMonitor('hw-unchanged-ledger.json', undefined, boxMarkerPath);
+    syncManagedContainers(monitor);
+    const first = monitor.terminalLedger.get('unsafe_runtime');
+    syncManagedContainers(monitor);
+    syncManagedContainers(monitor);
+    assert.equal(monitor.targets.size, 0);
+    assert.deepEqual(monitor.terminalLedger.get('unsafe_runtime'), first, 'unchanged inputs keep the same terminal record');
+    assert.equal(events.filter(({ event }) => event === 'container_runtime_policy_terminal').length, 3,
+        'each inventory pass only re-observes; it never schedules a retry');
+});
+
+test('MON.repair-fingerprint', async () => {
+    const { boxMarkerPath } = await hardwareModules();
+    const { monitor } = limitedMonitor('hw-repair-ledger.json', undefined, boxMarkerPath);
+    syncManagedContainers(monitor);
+    assert.ok(monitor.terminalLedger.has('unsafe_runtime'));
+    // Repair: the Box is now prepared with every controller.
+    monitor.hardwareContext = PREPARED;
+    syncManagedContainers(monitor);
+    assert.equal(monitor.terminalLedger.has('unsafe_runtime'), false, 'changed hardware inputs clear the terminal record');
+    assert.equal(monitor.targets.has('unsafe_runtime'), true, 'the repaired agent is re-armed');
+});

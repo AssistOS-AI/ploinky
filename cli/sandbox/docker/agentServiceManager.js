@@ -1370,6 +1370,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         profileConfig,
         network: manifestNetwork,
         runtimeKind: 'container',
+        instanceKey: containerName,
+        alias: options.alias || '',
     });
     const runtime = getRuntime();
     const llmAdmissionContext = resolveLlmRuntimeAdmissionContext({
@@ -1391,6 +1393,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         runtimeKind: 'container',
         catalogPolicy: llmAdmissionContext.catalogPolicy,
         catalogIdentity: llmAdmissionContext.catalogIdentity,
+        instanceKey: containerName,
+        alias: options.alias || '',
     });
     if (options.runtimeAdmission) {
         assertRuntimeAdmissionCurrent(options.runtimeAdmission, {

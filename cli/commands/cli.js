@@ -28,6 +28,7 @@ import {
     prepareTargetedAgentRestart,
 } from './targetedAgentRestart.js';
 import { withMaintenanceLock } from '../utils/runtime/maintenanceLocks.js';
+import { wrapPreservingHardwareCause } from '../sandbox/hardwareLimits/errors.mjs';
 import { printComponentAccess } from '../server/utils/routerEnv.js';
 import {
     getAgentContainerName,
@@ -620,9 +621,9 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
 
                         console.log(`✓ Agent restarted (${agentRuntime}).`);
                     } catch (e) {
-                        throw new Error(
+                        throw wrapPreservingHardwareCause(
                             `Failed to restart agent '${agentName}' via ${agentRuntime}: ${e.message}`,
-                            { cause: e },
+                            e,
                         );
                     }
                 } else {
@@ -693,14 +694,19 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                                     throw error;
                                 }
                             } catch (routeError) {
-                                throw new Error(`managed restart failed: ${routeError?.message || routeError}`);
+                                // Keep the typed cause (hardware refusal/block,
+                                // code, status) instead of replacing the error.
+                                throw wrapPreservingHardwareCause(
+                                    `managed restart failed: ${routeError?.message || routeError}`,
+                                    routeError,
+                                );
                             }
                         }));
                         console.log('✓ Agent restarted.');
                     } catch (e) {
-                        throw new Error(
+                        throw wrapPreservingHardwareCause(
                             `Failed to ${runtimeAction} container ${containerName}: ${e.message}`,
-                            { cause: e },
+                            e,
                         );
                     }
                 }

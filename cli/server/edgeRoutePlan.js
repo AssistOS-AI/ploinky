@@ -23,6 +23,7 @@ import { HttpRouteAccessPath } from './policy/HttpRouteAccessPath.js';
 import { normalizeManifestHttpRouteAccess } from './policy/HttpRouteProviders.js';
 import { compileProxyLimits } from './proxy/limits.js';
 import { createRoutePlan } from './proxy/RoutePlan.js';
+import { routeHardwareAvailability } from './hardwareAvailability.mjs';
 
 const LOCAL_CONTROL_HOSTS = new Set(['localhost', '127.0.0.1', '::1', 'router.localhost']);
 const MANAGED_ROUTER_HOST = 'host.containers.internal';
@@ -224,6 +225,18 @@ function agentPortPlan({
             listener,
             lease,
             hostSelection,
+        });
+    }
+    // A refused or blocked instance is unavailable on every transport,
+    // including the private relay target path (plan §9.4).
+    const hardwareAvailability = routeHardwareAvailability(snapshot, selected.routeKey);
+    if (hardwareAvailability) {
+        return deny(503, 'AGENT_HARDWARE_UNAVAILABLE', {
+            matched: true,
+            listener,
+            lease,
+            hostSelection,
+            hardwareAvailability,
         });
     }
     const runtime = exactAgentRuntime(snapshot, selected.routeKey, selected.route);
@@ -639,6 +652,27 @@ function agentRootPlan({
         snapshot,
         transport,
     };
+    const hardwareAvailability = routeHardwareAvailability(snapshot, agent.routeKey);
+    if (hardwareAvailability) {
+        // The logical route stays resolvable; only a terminal unavailable
+        // answer is possible. Non-HTTP transports are denied outright.
+        if (transport !== 'http') {
+            return deny(503, 'AGENT_HARDWARE_UNAVAILABLE', {
+                matched: true,
+                lease,
+                hostSelection,
+                decision,
+                hardwareAvailability,
+            });
+        }
+        return {
+            ...common,
+            kind: 'agent-root-pending',
+            target: null,
+            diagnosticCategory: 'AGENT_HARDWARE_UNAVAILABLE',
+            hardwareAvailability,
+        };
+    }
     const hostPort = Number(agent.route?.hostPort || 0);
     if (!Number.isSafeInteger(hostPort) || hostPort < 1 || hostPort > 65535) {
         if (transport !== 'http') {

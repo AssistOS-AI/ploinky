@@ -3382,3 +3382,132 @@ test('image-operation environment timeouts are exact and bounded', () => {
         else process.env.PLOINKY_IMAGE_BUILD_TIMEOUT_MS = previousBuild;
     }
 });
+
+// ---------------------------------------------------------------------------
+// Hardware-limit terminal subtypes (plan §9.2, §9.4)
+
+const HWL_RUN_ID = '12345678-1234-4234-8234-1234567890ab';
+const HWL_RUN_STARTED_AT_MS = 1_700_000_000_000;
+
+async function hardwareLimitsModules() {
+    const errors = await import('../../cli/sandbox/hardwareLimits/errors.mjs');
+    const limits = await import('../../cli/sandbox/hardwareLimits/requestedLimits.mjs');
+    const worker = await import('../../cli/commands/noWaitWorker.js');
+    return { errors, limits, worker };
+}
+
+function hardwareRefusal(limits, key, ref = 'demo/producer') {
+    return limits.buildDirectRefusal({
+        key,
+        ref,
+        refusalParts: {
+            reasonCode: 'controller_unavailable',
+            reason: 'The host does not delegate memory to rootless Podman.',
+            fix: 'Apply the delegation commands, then run ploinky restart.',
+            requested: [{ field: 'memory', value: '64m', source: 'settings' }],
+        },
+        inputFingerprint: 'c'.repeat(64),
+    });
+}
+
+function terminalStatus(error) {
+    const finishedAtMs = HWL_RUN_STARTED_AT_MS + 1000;
+    return {
+        state: 'failed',
+        sequencePhase: 'active',
+        runId: HWL_RUN_ID,
+        runStartedAtMs: HWL_RUN_STARTED_AT_MS,
+        waveIndex: 0,
+        sequencePhaseStartedAtMs: finishedAtMs,
+        error,
+    };
+}
+
+test('NW.refused-subtype', async () => {
+    const { errors, limits, worker } = await hardwareLimitsModules();
+    const refusal = hardwareRefusal(limits, 'ploinky_demo_producer');
+    const published = worker.noWaitFailureError(new errors.HardwareLimitsError(refusal), { message: 'refused' });
+    assert.equal(published.code, errors.HARDWARE_UNENFORCEABLE);
+    const observation = resolveRunScopedObservation(terminalStatus(published), {
+        expectedRunId: HWL_RUN_ID,
+        runStartedAtMs: HWL_RUN_STARTED_AT_MS,
+        targetWaveIndex: 0,
+        timeouts: resolveNoWaitBarrierTimeouts(),
+        nowMs: HWL_RUN_STARTED_AT_MS + 2000,
+        validateTerminalOutcome: errors.validateHardwareOutcome,
+    });
+    assert.equal(observation.terminal, 'failed', 'the wire state stays failed');
+    assert.equal(observation.hardwareOutcome.state, 'refused');
+    assert.deepEqual(observation.hardwareOutcome, refusal);
+});
+
+test('NW.blocked-subtype', async () => {
+    const { errors, limits, worker } = await hardwareLimitsModules();
+    const producer = hardwareRefusal(limits, 'ploinky_demo_producer');
+    const entry = {
+        path: '/w/.ploinky/running/no-wait/ploinky_demo_producer.r.json', runId: HWL_RUN_ID, waveIndex: 0,
+        directDependency: true, relation: 'blocking',
+    };
+    let barrierError;
+    await assert.rejects(waitForNoWaitStatusBarrier([entry], {
+        runId: HWL_RUN_ID,
+        runStartedAtMs: HWL_RUN_STARTED_AT_MS,
+        waveIndex: 1,
+        waitFn: async () => ({ state: 'failed', hardwareOutcome: producer }),
+    }), (error) => {
+        barrierError = error;
+        return error.code === 'PLOINKY_NO_WAIT_DIRECT_DEPENDENCY_FAILED';
+    });
+    // The consumer publishes its own blocked outcome, not the producer's.
+    const published = worker.noWaitFailureError(barrierError, { message: barrierError.message }, {
+        key: 'ploinky_demo_consumer', ref: 'demo/consumer', alias: null,
+    });
+    assert.equal(published.code, errors.HARDWARE_DEPENDENCY_BLOCKED);
+    assert.equal(published.hardwareOutcome.key, 'ploinky_demo_consumer');
+    assert.deepEqual(published.hardwareOutcome.blockedBy, { key: 'ploinky_demo_producer', ref: 'demo/producer' });
+    assert.equal(published.hardwareOutcome.rootCause.key, 'ploinky_demo_producer');
+    assert.deepEqual(published.hardwareOutcome.causalPath, ['ploinky_demo_consumer', 'ploinky_demo_producer']);
+});
+
+test('NW.explicit-wait-cause', async (t) => {
+    const { limits } = await hardwareLimitsModules();
+    const { runningDir } = fixture(t);
+    const statusPath = path.join(runningDir, 'no-wait', `ploinky_demo_producer.${HWL_RUN_ID}.json`);
+    const parsed = parseNoWaitStatusBarrier(JSON.stringify([{
+        path: statusPath, runId: HWL_RUN_ID, waveIndex: 0, directDependency: true,
+        relation: 'explicit-status-wait', producerKey: 'ploinky_demo_producer',
+    }]), { runId: HWL_RUN_ID, waveIndex: 1, runningDir });
+    assert.equal(parsed[0].relation, 'explicit-status-wait');
+    assert.equal(parsed[0].producerKey, 'ploinky_demo_producer');
+    assert.throws(() => parseNoWaitStatusBarrier(JSON.stringify([{
+        path: statusPath, runId: HWL_RUN_ID, waveIndex: 0, directDependency: true,
+        relation: 'explicit-status-wait', producerKey: 'someone_else',
+    }]), { runId: HWL_RUN_ID, waveIndex: 1, runningDir }), /producer identity/);
+    const producer = hardwareRefusal(limits, 'ploinky_demo_producer');
+    await assert.rejects(waitForNoWaitStatusBarrier(parsed, {
+        runId: HWL_RUN_ID,
+        runStartedAtMs: HWL_RUN_STARTED_AT_MS,
+        waveIndex: 1,
+        waitFn: async () => ({ state: 'failed', hardwareOutcome: producer }),
+        consumerIdentity: { key: 'ploinky_demo_waiter', ref: 'demo/waiter' },
+    }), (error) => error.hardwareOutcome?.state === 'blocked'
+        && error.hardwareOutcome.key === 'ploinky_demo_waiter'
+        && error.hardwareOutcome.rootCause.reason === producer.reason);
+});
+
+test('NW.optional-no-wait-contained', async () => {
+    const { limits } = await hardwareLimitsModules();
+    const producer = hardwareRefusal(limits, 'ploinky_demo_optional');
+    const settled = await waitForNoWaitStatusBarrier([{
+        path: '/w/.ploinky/running/no-wait/ploinky_demo_optional.r.json', runId: HWL_RUN_ID, waveIndex: 0,
+        directDependency: false,
+    }], {
+        runId: HWL_RUN_ID,
+        runStartedAtMs: HWL_RUN_STARTED_AT_MS,
+        waveIndex: 1,
+        waitFn: async () => ({ state: 'failed', hardwareOutcome: producer }),
+        consumerIdentity: { key: 'ploinky_demo_parent', ref: 'demo/parent' },
+    });
+    assert.equal(settled.length, 1, 'an optional producer refusal settles without blocking the parent');
+    assert.equal(settled[0].status.hardwareOutcome.state, 'refused');
+});

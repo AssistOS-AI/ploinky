@@ -48,6 +48,11 @@ import {
     readEdgeRoutingSelection,
     withEdgeGenerationApplyLock,
 } from '../sandbox/edgeGeneration.js';
+import {
+    HARDWARE_DEPENDENCY_BLOCKED,
+    HARDWARE_UNENFORCEABLE,
+    findHardwareOutcome,
+} from '../sandbox/hardwareLimits/errors.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -72,6 +77,10 @@ const TERMINAL_POLICY_CODES = new Set([
     'PLOINKY_BOX_MARKER_INVALID',
     'PLOINKY_BWRAP_CAPABILITY_UNAVAILABLE',
     'PLOINKY_OPEN_INTERPRETER_BOX_UNAVAILABLE',
+    // Hardware refusal and dependency block are terminal policy outcomes:
+    // no retry or readiness probe until their relevant inputs change.
+    HARDWARE_UNENFORCEABLE,
+    HARDWARE_DEPENDENCY_BLOCKED,
 ]);
 const TERMINAL_LEDGER_SCHEMA_VERSION = 1;
 // Terminal blockers survive monitor restarts while their registry entry is
@@ -338,6 +347,10 @@ function resolveWatchdogRestartInput(record, info, monitor) {
         runtimeKind,
         catalogPolicy: llmAdmissionContext.catalogPolicy,
         catalogIdentity: llmAdmissionContext.catalogIdentity,
+        instanceKey: info.containerName,
+        alias: info.alias || '',
+        ...(monitor.hardwareContext !== undefined ? { hardwareContext: monitor.hardwareContext } : {}),
+        ...(monitor.boxMarkerOptions !== undefined ? { boxMarkerOptions: monitor.boxMarkerOptions } : {}),
     });
     const stat = fs.statSync(info.manifestPath, { bigint: true });
     const restartInputDigest = digestValue({
@@ -812,6 +825,9 @@ export function syncManagedContainers(monitor) {
                 runtime: record.runtime || 'container',
                 instanceId: String(record.instanceId || ''),
                 enableGeneration: String(record.enableGeneration || ''),
+                // Only this agent's own hardware inputs re-arm it; unrelated
+                // policy writes leave the fingerprint unchanged.
+                hardwareFingerprint: findHardwareOutcome(error)?.inputFingerprint || '',
             });
             if (terminal) {
                 const info = {
@@ -2269,3 +2285,7 @@ export function clearContainerTargets(monitor) {
     monitor.runtimeSnapshotTakenAt = 0;
     monitor.runtimeSnapshotFreshForTick = false;
 }
+
+export const __testables = Object.freeze({
+    classifyTerminalFailure,
+});

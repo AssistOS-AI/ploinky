@@ -1018,3 +1018,46 @@ for (const additive of [false, true]) {
         )), true);
     });
 }
+
+test('MON.unrelated-write-no-rearm', async () => {
+    const { BOX_MARKER_CONTENT } = await import('../../ploinky-box/constants.mjs');
+    const { HARDWARE_UNENFORCEABLE } = await import('../../cli/sandbox/hardwareLimits/errors.mjs');
+    const ploinkyDir = path.join(workspace, '.ploinky');
+    const markerPath = path.join(workspace, 'hw-box-marker');
+    fs.writeFileSync(markerPath, BOX_MARKER_CONTENT);
+    const writeAgent = (agentName, manifest) => {
+        const agentDir = path.join(ploinkyDir, 'repos', 'demo', agentName);
+        fs.mkdirSync(agentDir, { recursive: true });
+        fs.writeFileSync(path.join(agentDir, 'manifest.json'), JSON.stringify(manifest));
+    };
+    writeAgent('hwNeedy', { container: 'node:20-alpine', llmRuntime: { runtimePolicy: { resources: { memory: '256m' } } } });
+    writeAgent('hwOther', { container: 'node:20-alpine' });
+    const record = (agentName) => ({
+        type: 'agent', repoName: 'demo', agentName, runtime: 'container',
+        instanceId: `${agentName}-instance`, enableGeneration: `${agentName}-generation`,
+    });
+    fs.mkdirSync(path.join(ploinkyDir, 'running'), { recursive: true });
+    fs.writeFileSync(path.join(ploinkyDir, 'agents.json'), JSON.stringify({
+        hwNeedy_runtime: record('hwNeedy'),
+        hwOther_runtime: record('hwOther'),
+    }, null, 2));
+    fs.writeFileSync(path.join(ploinkyDir, 'routing.json'), JSON.stringify({ routes: {
+        hwNeedy: { repo: 'demo', agent: 'hwNeedy', container: 'hwNeedy_runtime' },
+        hwOther: { repo: 'demo', agent: 'hwOther', container: 'hwOther_runtime' },
+    } }, null, 2));
+    const monitor = createContainerMonitor({ terminalLedgerFile: path.join(ploinkyDir, 'running', 'hw-unrelated-ledger.json') });
+    monitor.boxMarkerOptions = { markerPath };
+    syncManagedContainers(monitor);
+    const terminal = monitor.terminalLedger.get('hwNeedy_runtime');
+    assert.equal(terminal?.code, HARDWARE_UNENFORCEABLE);
+    // An unrelated agent's declaration and registry change.
+    writeAgent('hwOther', { container: 'node:22-alpine', env: { UNRELATED: '1' } });
+    fs.writeFileSync(path.join(ploinkyDir, 'agents.json'), JSON.stringify({
+        hwNeedy_runtime: record('hwNeedy'),
+        hwOther_runtime: { ...record('hwOther'), enableGeneration: 'hwOther-generation-2' },
+    }, null, 2));
+    syncManagedContainers(monitor);
+    assert.deepEqual(monitor.terminalLedger.get('hwNeedy_runtime'), terminal, 'an unrelated write does not re-arm the refused agent');
+    assert.equal(monitor.targets.has('hwNeedy_runtime'), false);
+    stopContainerMonitor(monitor);
+});

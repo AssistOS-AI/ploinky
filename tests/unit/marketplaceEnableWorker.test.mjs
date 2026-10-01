@@ -180,3 +180,107 @@ test('Marketplace enable worker preserves safe nested lifecycle codes', async ()
             && error.cause?.code === 'PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED',
     );
 });
+
+// ---------------------------------------------------------------------------
+// Typed hardware outcomes across CLI causes and the Marketplace worker
+
+async function hardwareTransport() {
+    const errors = await import('../../cli/sandbox/hardwareLimits/errors.mjs');
+    const limits = await import('../../cli/sandbox/hardwareLimits/requestedLimits.mjs');
+    const thread = await import('../../cli/server/marketplaceEnableWorkerThread.js');
+    const parent = await import('../../cli/server/marketplaceEnableWorker.js');
+    const refusal = (key, ref = 'demo/agent') => limits.buildDirectRefusal({
+        key,
+        ref,
+        refusalParts: {
+            reasonCode: 'controller_unavailable',
+            reason: 'The host does not delegate memory to rootless Podman.',
+            fix: 'Apply the delegation commands, then run ploinky restart.',
+            requested: [{ field: 'memory', value: '64m', source: 'settings' }],
+        },
+        inputFingerprint: 'e'.repeat(64),
+    });
+    return { errors, limits, thread, parent, refusal };
+}
+
+test('E.cli-cause', async () => {
+    const { errors, refusal } = await hardwareTransport();
+    const root = new errors.HardwareLimitsError(refusal('ploinky_demo_agent'));
+    const managed = errors.wrapPreservingHardwareCause(`managed restart failed: ${root.message}`, root);
+    const outer = errors.wrapPreservingHardwareCause('Failed to restart container ploinky_demo_agent', managed);
+    assert.equal(outer.code, errors.HARDWARE_UNENFORCEABLE);
+    assert.equal(outer.status, 422);
+    assert.deepEqual(errors.findHardwareOutcome(outer), root.hardwareOutcome);
+    const roundtrip = errors.deserializeHardwareAwareError(JSON.parse(JSON.stringify(errors.serializeHardwareAwareError(outer))));
+    assert.deepEqual(roundtrip.hardwareOutcome, root.hardwareOutcome);
+});
+
+test('E.marketplace-outbound', async () => {
+    const { errors, thread, refusal } = await hardwareTransport();
+    const wrapped = errors.wrapPreservingHardwareCause('activation failed', new errors.HardwareLimitsError(refusal('ploinky_demo_agent')));
+    const serialized = thread.serializeError(wrapped);
+    assert.equal(serialized.code, errors.HARDWARE_UNENFORCEABLE);
+    assert.deepEqual(serialized.hardwareOutcome, refusal('ploinky_demo_agent'));
+    assert.deepEqual(errors.validateHardwareOutcome(JSON.parse(JSON.stringify(serialized.hardwareOutcome))), serialized.hardwareOutcome);
+});
+
+test('E.marketplace-inbound', async () => {
+    const { errors, parent, refusal } = await hardwareTransport();
+    const { EventEmitter } = await import('node:events');
+    let worker;
+    class TypedWorker extends EventEmitter {
+        constructor() { super(); worker = this; }
+        terminate() { return Promise.resolve(0); }
+    }
+    const pending = parent.runMarketplaceEnableWorker({ agentRef: 'demo/agent', mode: 'global' }, { WorkerClass: TypedWorker, timeoutMs: 5_000 });
+    worker.emit('message', { ok: false, error: { message: 'refused', code: errors.HARDWARE_UNENFORCEABLE, hardwareOutcome: refusal('ploinky_demo_agent') } });
+    await assert.rejects(pending, (error) => error.code === errors.HARDWARE_UNENFORCEABLE
+        && error.status === 422 && error.hardwareOutcome.key === 'ploinky_demo_agent');
+    const invalid = parent.deserializeWorkerError({ message: 'x', hardwareOutcome: { state: 'refused', extra: 1 } });
+    assert.equal(invalid.code, 'PLOINKY_MARKETPLACE_ENABLE_WORKER_FAILED', 'an invalid typed outcome is rejected, not parsed from text');
+    assert.equal(invalid.hardwareOutcome, undefined);
+});
+
+test('E.bounded-secret-free', async () => {
+    const { errors, thread, refusal } = await hardwareTransport();
+    const cause = Object.assign(new Error(`Cookie: ploinky_session=secret-cookie ${'x'.repeat(5000)}`), {
+        env: { PLOINKY_MASTER_KEY: 'k'.repeat(64) }, body: '{"password":"p"}',
+    });
+    const error = errors.wrapPreservingHardwareCause('activation failed', Object.assign(
+        new errors.HardwareLimitsError(refusal('ploinky_demo_agent')), { cause },
+    ));
+    const serialized = thread.serializeError(error);
+    const text = JSON.stringify(serialized);
+    assert.equal(text.includes('k'.repeat(64)), false);
+    assert.equal(text.includes('password'), false);
+    assert.equal(text.includes('stack'), false);
+    assert.ok(serialized.message.length <= 512);
+    assert.ok(Buffer.byteLength(text) < 32 * 1024, 'the serialized error stays bounded');
+    const shared = JSON.stringify(errors.serializeHardwareAwareError(error));
+    assert.equal(shared.includes('k'.repeat(64)), false);
+    assert.equal(shared.includes('"stack"'), false);
+});
+
+test('E.max-ref-roundtrip', async () => {
+    const { errors, thread, parent, refusal } = await hardwareTransport();
+    const ref = `${'r'.repeat(128)}/${'a'.repeat(128)}`;
+    assert.equal(Buffer.byteLength(ref), 257);
+    const outcome = refusal('ploinky_max_ref', ref);
+    const roundtrip = parent.deserializeWorkerError(JSON.parse(JSON.stringify(thread.serializeError(new errors.HardwareLimitsError(outcome)))));
+    assert.equal(roundtrip.hardwareOutcome.ref, ref);
+    assert.match(errors.formatHardwareOutcome(roundtrip.hardwareOutcome), new RegExp(`^Refused \\(hardware limits\\): ${ref} `));
+    assert.throws(() => refusal('ploinky_max_ref', `${'r'.repeat(129)}/a`), /exact REPO\/AGENT reference/);
+});
+
+test('E.long-key-roundtrip', async () => {
+    const { errors, thread, parent, refusal } = await hardwareTransport();
+    const key = `ploinky_${'k'.repeat(1016)}`;
+    assert.equal(Buffer.byteLength(key), 1024);
+    const roundtrip = parent.deserializeWorkerError(JSON.parse(JSON.stringify(thread.serializeError(new errors.HardwareLimitsError(refusal(key))))));
+    assert.equal(roundtrip.hardwareOutcome.key, key, 'an exact long key is never truncated');
+    const tooLong = `${key}x`;
+    assert.throws(() => refusal(tooLong), /exceeds 1024 bytes/);
+    assert.throws(() => errors.assertRepresentableIdentity({ key: tooLong, ref: 'demo/agent' }), (error) => (
+        error.code === 'identity_unrepresentable' && /^sha256:[0-9a-f]{64}$/.test(error.identityDigest)
+    ));
+});
