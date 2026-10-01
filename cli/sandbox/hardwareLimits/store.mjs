@@ -863,6 +863,26 @@ export function assertGateOffStoreEmpty({ paths, identity, fsApi = fs, lockOptio
     }
 }
 
+/**
+ * The read-only U9 preflight: the same emptiness rule as
+ * assertGateOffStoreEmpty, from one consistent snapshot (each file is
+ * replaced atomically) and without the store lock, so a caller that holds no
+ * host workspace lock never takes the store lock out of the §5.2 order. It is
+ * advisory only: the authoritative check runs under the workspace lock before
+ * any Box mutation.
+ */
+export function peekGateOffStoreEmpty({ paths, identity, fsApi = fs } = {}) {
+    const snapshot = readStoreSnapshot({ paths, identity, fsApi });
+    if (snapshot.status === 'absent-never-initialized') {
+        return Object.freeze({ storeId: null, token: null, count: 0, initialized: false });
+    }
+    if (snapshot.status !== 'valid') {
+        fail(`The hardware policy store cannot be read safely: ${snapshot.diagnostic}. On the host run ploinky limits clear --all to reset it, or restore a valid private store, then ploinky restart. No Box mutation was performed.`, { code: 'store_unreadable' });
+    }
+    if (snapshot.agents.size > 0) fail(U9_MESSAGE(snapshot.agents.size), { code: 'stored_limits_present' });
+    return Object.freeze({ storeId: snapshot.storeId, token: snapshot.token, count: 0, initialized: true });
+}
+
 /** Install the downgrade write barrier after an authoritative empty read. */
 export function beginDowngradeBarrier({
     paths, identity, operationId, expectedEmptyToken, fsApi = fs, lockOptions: lockOverrides,

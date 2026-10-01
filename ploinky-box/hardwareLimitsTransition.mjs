@@ -622,6 +622,23 @@ async function recoverWithoutDecision(ctx, journal) {
     await rollback(ctx, journal);
 }
 
+/**
+ * The operator's next step for one pending downgrade journal, by its real
+ * phase. Every phase short of recovery-blocked is completed by the next host
+ * start/restart/update. A recovery-blocked journal is never retried
+ * automatically (§6.3: preserved with its evidence), so a restart cannot
+ * complete it; the explicit destroy closes it (aborted-by-destroy).
+ */
+export function downgradeRecoveryAdvice(journal) {
+    if (journal?.phase === 'recovery-blocked') {
+        const problem = journal.lastProblem?.message ? ` (${String(journal.lastProblem.message).slice(0, 512)})` : '';
+        return `Recovery is blocked${problem}, and ploinky restart cannot complete it. Run ploinky destroy on the host `
+            + 'to remove this workspace\'s Box and close the transition (the saved gate and stored limits are kept), '
+            + 'then run ploinky start.';
+    }
+    return 'Run ploinky restart on the host to complete recovery.';
+}
+
 /** Explicit destroy: record the aborted operation and remove its barrier. */
 export function abortHardwareDowngradesForDestroy({ identity, homeDirectory = os.homedir(), transitionStore }) {
     const store = transitionStore || createTransitionStore({ identity, homeDirectory });

@@ -496,6 +496,9 @@ export async function reconcileBoxContainer({
                 mediaHostPort: old.mediaHostPort,
                 routerBinding: routerBindingResult(old.routerBinding, old.hostPort),
                 gpu: old.gpu,
+                // The Box's own hardware-limits wiring (null only for a
+                // gate-off Box), so recovery never brings it back gate-off.
+                hardware: old.hardware ?? null,
                 agentLib: old.agentLib,
             });
             throw failure;
@@ -762,6 +765,9 @@ export async function reconcileBoxContainer({
                 mediaHostPort: old.mediaHostPort,
                 routerBinding: routerBindingResult(old.routerBinding, old.hostPort),
                 gpu: old.gpu,
+                // The old Box's own hardware-limits wiring (null only for a
+                // gate-off Box), so recovery never brings it back gate-off.
+                hardware: old.hardware ?? null,
                 agentLib: old.agentLib,
             } : {}),
         });

@@ -84,6 +84,7 @@ import {
     assertHardwareStateConfined,
     hardwareStorePaths,
     initializeStore as initializeHardwareStore,
+    peekGateOffStoreEmpty,
 } from '../cli/sandbox/hardwareLimits/store.mjs';
 import { withStaleStoreLockRecovery } from '../cli/sandbox/hardwareLimits/storeLock.mjs';
 import { retireDestroyedBoxNoWaitMarkers } from './noWaitCleanup.mjs';
@@ -102,6 +103,7 @@ import { prepareBoxGeneration, verifyBoxRuntime } from './hardwareLimits/status.
 import {
     abortHardwareDowngradesForDestroy,
     createTransitionStore,
+    downgradeRecoveryAdvice,
     recoverHardwareDowngrades,
     runHardwareDowngrade,
 } from './hardwareLimitsTransition.mjs';
@@ -279,6 +281,8 @@ function revalidateMountedAgentLibSource(selection, context) {
 const NO_WAIT_WORKER_SCRIPT = '/opt/ploinky/cli/commands/noWaitWorker.js';
 const NO_WAIT_SETTLE_TIMEOUT_MS = 31 * 60 * 1000;
 const NO_WAIT_POLL_MS = 5000;
+// Engine statuses that name a stopped Box container (no process can run).
+const STOPPED_BOX_STATUSES = new Set(['exited', 'stopped', 'created', 'configured', 'initialized', 'dead']);
 
 export function createBoxSupervisor({
     runner = createProcessRunner({ env: buildEngineProcessEnvironment() }),
@@ -473,25 +477,37 @@ export function createBoxSupervisor({
         });
     }
 
-    // The exact Box's observed state for stale-lock recovery: absent, stopped
-    // or running; anything not positively owned is treated as running.
+    // The exact Box's observed state for stale-lock recovery: absent, stopped,
+    // paused or running. A paused Box is not stopped: a writer inside it may
+    // still hold the lock (§5.2). Anything not positively owned, and any
+    // engine status that does not name a stopped container, is unknown.
     function observeBoxState(identity) {
         const observed = inspect(identity);
         if (observed?.state === 'absent') return Object.freeze({ state: 'absent' });
         const container = observed?.state === 'owned' ? observed.handles?.container : null;
         if (!container) return Object.freeze({ state: 'unknown' });
-        return Object.freeze({ state: container.runtime?.running === true ? 'running' : 'stopped', id: container.id });
+        const runtime = container.runtime || {};
+        const status = String(runtime.status || '').trim().toLowerCase();
+        if (runtime.running === true || status === 'running') return Object.freeze({ state: 'running', id: container.id });
+        if (status === 'paused') return Object.freeze({ state: 'paused', id: container.id });
+        if (!status || STOPPED_BOX_STATUSES.has(status)) return Object.freeze({ state: 'stopped', id: container.id });
+        return Object.freeze({ state: 'unknown', id: container.id });
     }
 
     // A pending gate-on to gate-off transition must be recovered (by the next
     // start/restart/update) before any other outer state-changing operation;
     // bind and GPU grant/revoke refuse instead of mutating (§6.3 line 420).
+    // The advice follows the journal's real phase.
     function assertNoPendingHardwareTransition(identity, operation) {
         const pending = createTransitionStore({ identity, homeDirectory: hardwareGateStore.homeDirectory }).listPending();
         if (!pending.length) return;
+        const [journal] = pending;
+        const advice = journal.phase === 'recovery-blocked'
+            ? `${downgradeRecoveryAdvice(journal)} Then retry ploinky ${operation}.`
+            : `Run ploinky restart on the host to complete recovery, then retry ploinky ${operation}.`;
         throw supervisorError(
-            `A gate-on to gate-off hardware transition is pending (operation ${pending[0].operationId}, phase ${pending[0].phase}). `
-            + `Run ploinky restart on the host to complete recovery, then retry ploinky ${operation}. No Box mutation was performed.`,
+            `A gate-on to gate-off hardware transition is pending (operation ${journal.operationId}, phase ${journal.phase}). `
+            + `${advice} No Box mutation was performed.`,
             'PLOINKY_BOX_HARDWARE_TRANSITION_PENDING',
         );
     }
@@ -1448,8 +1464,17 @@ export function createBoxSupervisor({
         const engine = ownership.engine;
         const failures = [];
         let recoveredContainerId = '';
+        // The recovered generation's hardware-limits wiring, and whether that
+        // generation has already been prepared here (§6.5, U11).
+        let recoveredHardware = null;
+        let recoveredPrepared = false;
+        // The outcome carries the previous Box's own wiring: null only for a
+        // gate-off Box. Without the field, undefined keeps the Box's own
+        // wiring; it is never replaced by a gate-off Box here (U9).
+        const previousHardware = outcome && Object.hasOwn(outcome, 'hardware') ? outcome.hardware : undefined;
         if (outcome?.action === 'restored') {
             recoveredContainerId = outcome.containerId;
+            recoveredHardware = previousHardware ?? null;
         } else if (outcome?.action === 'preserved' && (outcome.oldStopAttempted || outcome.oldStartAttempted)) {
             // The graceful stop or removal failed part way. Bring the exact
             // previous Box back through the normal reuse lifecycle.
@@ -1470,6 +1495,7 @@ export function createBoxSupervisor({
                         stopPloinkyLocalByContainerId(engine, handle.id, runner, { workspaceRoot: identity.workspaceRoot });
                     }
                     recoveredContainerId = handle.id;
+                    recoveredHardware = observedHardwareWiring(identity, observed);
                 } else {
                     const restarted = await reconcile({
                         identity,
@@ -1483,7 +1509,7 @@ export function createBoxSupervisor({
                         // Bring the previous Box back with its own GPU and
                         // hardware-limits wiring.
                         gpu: outcome.gpu,
-                        hardware: outcome.hardware ?? null,
+                        hardware: previousHardware,
                         imageRef: String(handle.labels?.[BOX_LABELS.imageRef] || ''),
                         imagePolicy: 'preserve',
                         platform,
@@ -1493,8 +1519,10 @@ export function createBoxSupervisor({
                     });
                     restarted.finalize?.();
                     recoveredContainerId = restarted.ownership.handles.container.id;
+                    recoveredHardware = restarted.hardware ?? null;
                     // A restored gate-on generation is prepared before its graph.
-                    await prepareGateOnGeneration(identity, engine, recoveredContainerId, restarted.hardware);
+                    await prepareGateOnGeneration(identity, engine, recoveredContainerId, recoveredHardware);
+                    recoveredPrepared = true;
                 }
             } catch (recoverError) {
                 failures.push(`previous Box recovery: ${recoverError.message}`);
@@ -1502,6 +1530,9 @@ export function createBoxSupervisor({
         }
         if (recoveredContainerId && priorGraphRunning) {
             try {
+                // A restored or restarted gate-on generation is prepared
+                // before its graph is restored (§6.5 Rollback restoration).
+                if (!recoveredPrepared) await prepareGateOnGeneration(identity, engine, recoveredContainerId, recoveredHardware);
                 await restorePriorGraph({
                     identity,
                     engine,
@@ -2187,13 +2218,31 @@ export function createBoxSupervisor({
     /**
      * Before any outer mutation of `update` (including the host source update
      * and relaunch): parse the gate and run the U9 stored-limits check
-     * (§3 Gate parsing, §6.1). This read-only check takes only the store
-     * lock; the update transaction repeats it under the workspace lock before
-     * any Box mutation, so the verb keeps its single workspace-lock depth.
+     * (§3 Gate parsing, §6.1). This check is lock-free and read-only (one
+     * consistent store snapshot), so it never takes the store lock without
+     * the host workspace lock first (§5.2 host order). The update transaction
+     * repeats the authoritative check under the workspace lock, with the same
+     * stale-lock recovery as start and restart, before any Box mutation.
      */
     function preflightHardwareGate(operation = 'update') {
         const identity = resolveIdentity();
-        const gate = selectHardwareGateForOperation(identity, operation, null);
+        const gate = selectHardwareGate({ identity, gateStore: hardwareGateStore, env, operation });
+        if (!gate.enabled) {
+            const paths = hardwareStorePaths({ identity, homeDirectory: hardwareGateStore.homeDirectory });
+            try {
+                peekGateOffStoreEmpty({ paths, identity });
+            } catch (error) {
+                throw supervisorError(error.message, error.code === 'stored_limits_present'
+                    ? 'PLOINKY_BOX_HARDWARE_LIMITS_STORED'
+                    : 'PLOINKY_BOX_HARDWARE_STATE_INVALID');
+            }
+        } else {
+            assertHardwareStateConfined({
+                workspaceRoot: identity.workspaceRoot,
+                dataPaths: identity.dataPaths,
+                homeDirectory: hardwareGateStore.homeDirectory,
+            });
+        }
         return Object.freeze({ enabled: gate.enabled, source: gate.source });
     }
 
@@ -2268,6 +2317,18 @@ export function createBoxSupervisor({
         });
     }
 
+    // An explicit destroy settles a pending downgrade only after the owned Box
+    // is proven gone (removed here, or already absent): record
+    // aborted-by-destroy and remove its barrier. The saved gate and policy
+    // follow destroy's contract.
+    function closePendingDowngradesAfterDestroy(identity) {
+        try {
+            abortHardwareDowngradesForDestroy({ identity, homeDirectory: hardwareGateStore.homeDirectory });
+        } catch (error) {
+            stderr?.write?.(`[ploinky] A pending hardware transition could not be closed (${error.message}); its journal was kept for recovery.\n`);
+        }
+    }
+
     async function runDestroyTransaction(expectedContainerId, { deleteCache = false } = {}) {
         return lockedMutation(async (identity, lock, ownership) => {
             const container = ownership.handles?.container;
@@ -2276,6 +2337,7 @@ export function createBoxSupervisor({
             }
             if (!container && !deleteCache) {
                 retireDestroyedMarkers({ identity, lock });
+                closePendingDowngradesAfterDestroy(identity);
                 return Object.freeze({ identity, action: 'absent' });
             }
             if (container && (!expectedContainerId || container.id !== expectedContainerId)) {
@@ -2319,14 +2381,7 @@ export function createBoxSupervisor({
                 removeContainerById(ownership.engine, container.id, runner);
             }
             retireDestroyedMarkers({ identity, lock });
-            // An explicit destroy settles a pending downgrade only after the
-            // owned Box is proven gone: record aborted-by-destroy and remove
-            // its barrier. The saved gate and policy follow destroy's contract.
-            try {
-                abortHardwareDowngradesForDestroy({ identity, homeDirectory: hardwareGateStore.homeDirectory });
-            } catch (error) {
-                stderr?.write?.(`[ploinky] A pending hardware transition could not be closed (${error.message}); its journal was kept for recovery.\n`);
-            }
+            closePendingDowngradesAfterDestroy(identity);
             // Cache deletion is explicit and runs only after the outer Box is
             // proven gone, so a failed stop or removal always retains the data.
             const deletedPaths = deleteCache

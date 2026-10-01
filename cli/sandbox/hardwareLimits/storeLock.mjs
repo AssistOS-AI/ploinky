@@ -190,16 +190,57 @@ export function recoverStaleStoreLock({
             409,
         );
     }
-    const box = typeof inspectBox === 'function' ? inspectBox() : null;
-    if (box?.state !== 'absent' && box?.state !== 'stopped') {
-        throw new StoreLockError(STORE_BUSY_MESSAGE, 'store_busy', 409);
-    }
     const owner = current.owner;
+    const holder = `${String(owner.operation || 'an unnamed operation').slice(0, 128)} (pid ${String(owner.pid).slice(0, 32)} `
+        + `on host ${String(owner.hostname || 'unknown').slice(0, 255)})`;
+    // An explicit repair needs operator-established quiescence of every
+    // writer of this store (§6.3 line 441); it is never automatic.
+    const repair = `make sure no Ploinky process on that host uses this store, then remove ${directory} and retry. `
+        + 'No policy was changed.';
     if (owner.domain !== 'box') {
         const pid = Number(owner.pid);
-        if (owner.hostname !== hostname || !Number.isSafeInteger(pid) || pid <= 0 || !processIsProvenDead(pid, kill)) {
-            throw new StoreLockError(STORE_BUSY_MESSAGE, 'store_busy', 409);
+        if (owner.hostname !== hostname) {
+            // Another host's PID cannot be checked from here.
+            throw new StoreLockError(
+                `Hardware policy store lock ${directory} is held by ${holder}, which is not this host (${hostname}), so `
+                + 'its holder cannot be proven dead and the lock is never taken over. Stop this workspace on every host '
+                + `that uses this store, ${repair}`,
+                'store_busy',
+                409,
+            );
         }
+        if (!Number.isSafeInteger(pid) || pid <= 0) {
+            throw new StoreLockError(
+                `Hardware policy store lock ${directory} is held by ${holder}, whose owner record names no valid process, `
+                + `so it is never taken over. Stop this workspace on the host, ${repair}`,
+                'store_busy',
+                409,
+            );
+        }
+        if (!processIsProvenDead(pid, kill)) {
+            throw new StoreLockError(
+                `Hardware policy store lock ${directory} is held by ${holder}, and that process is still running on this `
+                + 'host, so the lock is never taken over. Wait for that operation to finish and retry. If that PID is not a '
+                + `Ploinky process (it was reused), stop this workspace on the host, ${repair}`,
+                'store_busy',
+                409,
+            );
+        }
+    }
+    const box = typeof inspectBox === 'function' ? inspectBox() : null;
+    if (box?.state === 'paused') {
+        // A paused Box is not stopped: a writer inside it may still hold the
+        // lock, and a paused writer never permits a takeover (§5.2).
+        throw new StoreLockError(
+            `Hardware policy store lock ${directory} is held by ${holder}, and this workspace's Box is paused, so a writer `
+            + 'inside it may still hold the lock. Resume the Box, or stop this workspace on the host, then retry. '
+            + 'No policy was changed.',
+            'store_busy',
+            409,
+        );
+    }
+    if (box?.state !== 'absent' && box?.state !== 'stopped') {
+        throw new StoreLockError(STORE_BUSY_MESSAGE, 'store_busy', 409);
     }
     // The owner must still be the one that was judged dead.
     const again = readStoreLockOwner(storeRoot, { fsApi });

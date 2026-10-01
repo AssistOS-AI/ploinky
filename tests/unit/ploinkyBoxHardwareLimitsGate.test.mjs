@@ -240,17 +240,6 @@ test('G.status-unprepared', (t) => {
     assert.match(text, /\nBox: running; wiring none; prepared no: nsdelegate is missing\n/);
 });
 
-test('G.status-transition', (t) => {
-    const state = fixture(t);
-    const paths = storePaths(state);
-    const { token } = initializeStore({ paths, identity: state.identity });
-    const operationId = '9'.repeat(32);
-    beginDowngradeBarrier({ paths, identity: state.identity, operationId, expectedEmptyToken: token });
-    const text = status(state);
-    assert.match(text, new RegExp(`\\nTransition: gate-on to gate-off ${operationId}, barrier-installed; recovery Run ploinky restart on the host to complete recovery\\.\\n`));
-    assert.ok(fs.existsSync(paths.barrierPath), 'status reports the pending downgrade without mutating it');
-});
-
 test('G.status-refused-blocked', (t) => {
     const state = fixture(t);
     state.gateStore.write(state.identity, true, lockFor(state.identity));
@@ -835,7 +824,9 @@ async function pendingDowngrade(state) {
         effects: { engineIdentity: 'engine', hostKind: 'native-linux', inspectBox: () => null, stopGraph() {}, stopBox() {} },
         faults: { 'outer-stop.after': 'process-death' },
     }), SimulatedProcessDeath);
-    assert.equal(createTransitionStore({ identity: state.identity, homeDirectory: state.home }).listPending().length, 1);
+    const pending = createTransitionStore({ identity: state.identity, homeDirectory: state.home }).listPending();
+    assert.equal(pending.length, 1);
+    return pending[0];
 }
 
 test('G.pending-downgrade-blocks-bind-grant-revoke', async (t) => {
@@ -1015,4 +1006,382 @@ test('G.downgrade-stopped-graph-not-started', async (t) => {
     assert.equal(world.events.includes('graph-stop'), false);
     assert.equal(world.events.includes('core:start explorer 8090'), false, 'no graph restored by the downgrade');
     assert.equal(world.state.gateStore.read(world.state.identity).enabled, false);
+});
+
+// ---------------------------------------------------------------------------
+// Fix round 2: preserved-Box recovery keeps its wiring (K1), the restored
+// generation is prepared (K5), phase-accurate recovery advice (K6) and
+// stale-lock messages and recovery on every lifecycle path (K7).
+
+const { reconcileBoxContainer } = await import('../../ploinky-box/lifecycle/transactions.mjs');
+
+// The real Box transaction (reconcileBoxContainer) behind the supervisor,
+// against a stub engine. The old gate-on Box is replaced (a changed data
+// path), its graph and container stop, and the first removal fails, so the
+// transaction preserves the stopped old Box and the supervisor recovers it.
+function preservedRecoveryWorld(t, { removalFailures = 1 } = {}) {
+    const state = fixture(t);
+    const previousHome = process.env.HOME;
+    process.env.HOME = state.home;
+    t.after(() => { process.env.HOME = previousHome; });
+    state.gateStore.write(state.identity, true, lockFor(state.identity));
+    const wiring = resolveDesiredHardwareWiring({ identity: state.identity, enabled: true, homeDirectory: state.home, initializeStore });
+    storeWithEntry(state);
+    writeGraphSkillScope(state.identity, buildHostSkillScope(state.identity.workspaceRoot, state.identity.workspaceRoot), lockFor(state.identity));
+    const box = completeBoxFixture(state);
+    let current = completeHandle(box, wiring);
+    const engine = { name: 'podman', identity: 'engine', hostKind: 'native-linux' };
+    const events = [];
+    const reconciledHardware = [];
+    const DATA = { dependencies: 'd'.repeat(64), images: 'f'.repeat(64) };
+    let removals = 0;
+    let inspections = 0;
+    const ownership = () => (current
+        ? { state: 'owned', engine, handles: { container: current } }
+        : { state: 'absent', engine, handles: {} });
+    const runner = {
+        run(_command, args) {
+            if (args[0] === 'container' && args[1] === 'stop') {
+                current.runtime.running = false;
+                current.runtime.status = 'exited';
+                events.push('box-stop');
+            } else if (args[0] === 'container' && args[1] === 'start') {
+                current.runtime.running = true;
+                current.runtime.status = 'running';
+                events.push('box-start');
+            } else if (args[0] === 'container' && args[1] === 'rm') {
+                current = null;
+                events.push('box-remove');
+            } else if (args[0] === 'container' && args[1] === 'create') {
+                events.push(`box-create:${args.some((arg) => String(arg).startsWith(`${BOX_LABELS.hardwareLimits}=`)) ? 'gate-on' : 'gate-off'}`);
+                throw new Error('stub engine: no Box is created in this scenario');
+            }
+            return { ok: true, status: 0, stdout: '' };
+        },
+        query() { return { ok: true, status: 0, stdout: INBOX_READY }; },
+        async stream() { return { ok: true, status: 0, stdout: '', stderr: '' }; },
+    };
+    const seams = {
+        async preflight(options) {
+            return { hostPort: options.hostPort, mediaHostPort: options.mediaHostPort, address: options.address, recheckAfterRelease: { tcp: false, udp: false } };
+        },
+        async recheckReleased() {},
+        validateImage: () => ({ immutableId: 'd'.repeat(64) }),
+        validateExistingImage: (_engine, imageId) => ({ immutableId: imageId }),
+        removeContainer(selectedEngine, id, selectedRunner) {
+            removals += 1;
+            if (removals <= removalFailures) {
+                events.push('box-remove-failed');
+                throw new Error('stub engine: remove failed');
+            }
+            selectedRunner.run(selectedEngine.name, ['container', 'rm', '-f', id]);
+        },
+        stopPloinkyLocal() { events.push('graph-stop'); },
+        async startAndWaitReady(selectedEngine, id, selectedRunner) { selectedRunner.run(selectedEngine.name, ['container', 'start', id]); },
+        discover: () => ownership(),
+        ensureDataPaths: () => ({ paths: state.identity.dataPaths, fingerprints: DATA, created: [] }),
+        // The first observation differs, so the first transaction replaces the Box.
+        inspectDataPaths: () => {
+            inspections += 1;
+            return { paths: state.identity.dataPaths, fingerprints: inspections === 1 ? { ...DATA, images: 'e'.repeat(64) } : DATA };
+        },
+        revalidateDataPaths: () => ({ paths: state.identity.dataPaths, fingerprints: DATA }),
+        retireStartLock() {},
+        retireEdgePreparation() {},
+        token: (kind) => (kind === 'candidate' ? '1'.repeat(24) : '2'.repeat(24)),
+    };
+    const supervisor = createBoxSupervisor({
+        env: {},
+        resolveIdentity: () => state.identity,
+        launchCwd: state.identity.workspaceRoot,
+        repositoryRoot: box.root,
+        lockManager: fakeLockManager(state.root, events),
+        discover: () => ownership(),
+        runner,
+        selectAgentLib: async () => ({ selection: box.agentLib, mode: 'local' }),
+        updateAgentLib: async () => ({ selection: box.agentLib, changed: false, previous: null }),
+        updateWorkspacePloinky: async () => ({ found: false }),
+        reconcile: async (options) => {
+            reconciledHardware.push(options.hardware);
+            events.push('reconcile');
+            return reconcileBoxContainer(options, seams);
+        },
+        captureCoreStartArgv: () => ['start', 'explorer', '8090'],
+        readEdgeDesired: () => null,
+        startCore: async () => { events.push('start-core'); },
+        runCoreCommand: async (_engine, _id, argv) => { events.push(`core:${argv.join(' ')}`); },
+        resolveHostReachableIpv4: async () => '127.0.0.1',
+        healthCheck: async () => {},
+        revalidateAgentLibSource: () => {},
+        commitAgentLibSelection: () => {},
+        validateExistingImage: () => ({ immutableId: `sha256:${'d'.repeat(64)}` }),
+        validateContainer: () => {},
+        hardwareGateStore: state.gateStore,
+        prepareHardwareGeneration: async ({ containerId }) => { events.push(`prepare:${containerId.slice(0, 4)}`); return { structurallyPrepared: true }; },
+        stdout: { write() { return true; } },
+        stderr: { write() { return true; } },
+    });
+    return { state, wiring, supervisor, events, reconciledHardware, current: () => current };
+}
+
+test('G.preserved-recovery-keeps-gate-on', async (t) => {
+    // K1: a replacement that fails after the old gate-on Box was stopped is
+    // preserved; recovery brings that Box back with its own wiring, while a
+    // stored entry exists. Reconcile never receives null and no gate-off Box
+    // appears, through start, restart and update.
+    for (const [operation, invoke] of [
+        ['start', (supervisor) => supervisor.runStartTransaction(['start', 'explorer'])],
+        ['restart', (supervisor) => supervisor.runRestartTransaction(['restart'])],
+        ['update', (supervisor) => supervisor.runUpdateTransaction(['update'], { restartAfterUpdate: true })],
+    ]) {
+        const world = preservedRecoveryWorld(t);
+        await assert.rejects(invoke(world.supervisor), (error) => {
+            assert.match(error.message, /stub engine: remove failed/, operation);
+            assert.equal(error.boxRollback?.action, 'preserved', operation);
+            assert.equal(error.boxRollback.oldStopAttempted, true, operation);
+            // The transaction carries the old Box's own wiring.
+            assert.equal(error.boxRollback.hardware?.fingerprint, world.wiring.fingerprint, operation);
+            return true;
+        });
+        assert.equal(world.reconciledHardware.length, 2, `${operation}: the replacement and the recovery: ${world.events.join(' ')}`);
+        for (const hardware of world.reconciledHardware) {
+            assert.notEqual(hardware, null, `${operation}: reconcile never receives gate-off wiring`);
+            assert.equal(hardware?.fingerprint, world.wiring.fingerprint, operation);
+        }
+        assert.equal(world.events.some((event) => event.startsWith('box-create:')), false, `${operation}: no Box is created: ${world.events.join(' ')}`);
+        // The preserved gate-on Box is running again, prepared before its graph.
+        assert.equal(world.current().labels[BOX_LABELS.hardwareLimits], world.wiring.fingerprint, operation);
+        assert.equal(world.current().runtime.running, true, operation);
+        const prepare = world.events.findIndex((event) => event.startsWith('prepare:'));
+        const graph = world.events.indexOf('core:start explorer 8090');
+        assert.ok(prepare >= 0 && graph > prepare, `${operation}: ${world.events.join(' ')}`);
+    }
+});
+
+test('G.restored-generation-prepared', async (t) => {
+    // K5: when the failed replacement restored the old gate-on Box (the
+    // restored branch), that generation is prepared before its graph.
+    const state = fixture(t);
+    const previousHome = process.env.HOME;
+    process.env.HOME = state.home;
+    t.after(() => { process.env.HOME = previousHome; });
+    writeGraphSkillScope(state.identity, buildHostSkillScope(state.identity.workspaceRoot, state.identity.workspaceRoot), lockFor(state.identity));
+    const wiring = resolveDesiredHardwareWiring({ identity: state.identity, enabled: true, homeDirectory: state.home, initializeStore });
+    for (const [operation, invoke] of [
+        ['start', (supervisor) => supervisor.runStartTransaction(['start', 'explorer'])],
+        ['restart', (supervisor) => supervisor.runRestartTransaction(['restart'])],
+        ['update', (supervisor) => supervisor.runUpdateTransaction(['update'], { restartAfterUpdate: true })],
+    ]) {
+        const events = [];
+        const supervisor = createBoxSupervisor({
+            env: { PLOINKY_BOX_HARDWARE_LIMITS: 'on' },
+            resolveIdentity: () => state.identity,
+            launchCwd: state.identity.workspaceRoot,
+            lockManager: fakeLockManager(state.root, events),
+            discover: () => owned(state.identity),
+            runner: { run() {}, query() { return { ok: true, status: 0, stdout: INBOX_READY }; } },
+            selectAgentLib: async () => ({ selection: agentLibFixture(state.identity.workspaceRoot), mode: 'local' }),
+            updateAgentLib: async () => ({ selection: agentLibFixture(state.identity.workspaceRoot), changed: false, previous: null }),
+            updateWorkspacePloinky: async () => ({ found: false }),
+            reconcile: async (options) => {
+                const error = new Error('candidate start failed; the old Box was restored');
+                error.boxRollback = Object.freeze({
+                    action: 'restored', containerId: '3'.repeat(64), oldStopAttempted: true, previouslyRunning: true,
+                    hostPort: 8080, mediaHostPort: 7882, routerBinding: options.routerBinding, gpu: null,
+                    hardware: wiring, agentLib: options.agentLib,
+                });
+                throw error;
+            },
+            captureCoreStartArgv: () => ['start', 'explorer', '8080'],
+            readEdgeDesired: () => null,
+            runCoreCommand: async (_engine, id, argv) => { events.push(`core:${id.slice(0, 4)}:${argv.join(' ')}`); },
+            resolveHostReachableIpv4: async () => '127.0.0.1',
+            healthCheck: async () => {},
+            revalidateAgentLibSource: () => {},
+            commitAgentLibSelection: () => {},
+            hardwareGateStore: state.gateStore,
+            prepareHardwareGeneration: async ({ containerId }) => { events.push(`prepare:${containerId.slice(0, 4)}`); return { structurallyPrepared: true }; },
+            stdout: { write() { return true; } },
+            stderr: { write() { return true; } },
+        });
+        await assert.rejects(invoke(supervisor), /the old Box was restored/, operation);
+        const prepare = events.indexOf('prepare:3333');
+        const graph = events.indexOf('core:3333:start explorer 8080');
+        assert.ok(prepare >= 0, `${operation}: the restored generation is prepared: ${events.join(' ')}`);
+        assert.ok(graph > prepare, `${operation}: prepared before its graph: ${events.join(' ')}`);
+    }
+});
+
+test('G.recovery-blocked-advice', async (t) => {
+    // K6: bind, GPU grant and revoke refuse a recovery-blocked journal with
+    // the advice that phase needs (never "run ploinky restart"), and the
+    // advised destroy closes it even when the Box is already absent.
+    for (const [label, invoke] of [
+        ['bind', (supervisor) => supervisor.runBindTransaction({ address: '127.0.0.1', hostPort: 8080 })],
+        ['gpu grant', (supervisor) => supervisor.runGpuGrantTransaction({ agents: ['demo/agent'] })],
+        ['gpu revoke', (supervisor) => supervisor.runGpuRevokeTransaction({})],
+    ]) {
+        const state = fixture(t);
+        state.gateStore.write(state.identity, true, lockFor(state.identity));
+        const pending = await pendingDowngrade(state);
+        createTransitionStore({ identity: state.identity, homeDirectory: state.home }).writeJournal({
+            ...pending, phase: 'recovery-blocked', lastProblem: { code: 'TARGET_MISSING', message: 'the decided gate-off Box is not present', action: 'roll-forward' },
+        });
+        const events = [];
+        await assert.rejects(invoke(realSupervisor(state, { events })), (error) => {
+            assert.equal(error.code, 'PLOINKY_BOX_HARDWARE_TRANSITION_PENDING', label);
+            assert.match(error.message, new RegExp(`phase recovery-blocked\\)\\. Recovery is blocked \\(the decided gate-off Box is not present\\), and ploinky restart cannot complete it\\. Run ploinky destroy on the host`));
+            assert.match(error.message, new RegExp(`Then retry ploinky ${label}\\. No Box mutation was performed\\.$`));
+            assert.doesNotMatch(error.message, /Run ploinky restart on the host to complete recovery/);
+            return true;
+        });
+        assert.equal(events.includes('reconcile'), false, label);
+    }
+    // The advised destroy closes the journal and removes its barrier, also
+    // with the Box already absent.
+    const state = fixture(t);
+    state.gateStore.write(state.identity, true, lockFor(state.identity));
+    const pending = await pendingDowngrade(state);
+    const store = createTransitionStore({ identity: state.identity, homeDirectory: state.home });
+    store.writeJournal({ ...pending, phase: 'recovery-blocked' });
+    const absent = { state: 'absent', engine: { name: 'podman', identity: 'engine' }, handles: {} };
+    await realSupervisor(state, { ownership: absent }).runDestroyTransaction(null);
+    assert.equal(store.readJournal(pending.operationId).phase, 'aborted-by-destroy');
+    assert.deepEqual(store.listPending(), []);
+    assert.equal(fs.existsSync(storePaths(state).barrierPath), false);
+    assert.equal(state.gateStore.read(state.identity).enabled, true, 'destroy keeps the saved gate');
+});
+
+function storeLockOwnedBy(state, owner) {
+    const directory = path.join(storePaths(state).storeRoot, 'write.lock');
+    fs.mkdirSync(directory, { mode: 0o700 });
+    fs.writeFileSync(path.join(directory, 'owner.json'), `${JSON.stringify({
+        token: 'c'.repeat(32), domain: 'host', operation: 'policy-write', acquiredAt: new Date().toISOString(), ...owner,
+    })}\n`, { mode: 0o600 });
+    return directory;
+}
+
+test('G.stale-lock-never-stolen-messages', async (t) => {
+    // K7: a lock owned by another host or by a live PID, or held while the
+    // Box is paused, is never taken over; each refusal names the lock, its
+    // owner and the explicit repair.
+    const deadPid = spawnSync(process.execPath, ['-e', 'process.exit(0)']).pid;
+    const absent = { state: 'absent', engine: { name: 'podman', identity: 'engine' }, handles: {} };
+    for (const [label, owner, ownershipFor, pattern] of [
+        ['foreign host', { pid: deadPid, hostname: 'other-host.example' }, () => absent,
+            /is held by policy-write \(pid \d+ on host other-host\.example\), which is not this host .* so its holder cannot be proven dead and the lock is never taken over\. Stop this workspace on every host that uses this store, make sure no Ploinky process on that host uses this store, then remove .*write\.lock and retry\. No policy was changed\.$/],
+        ['live pid', { pid: process.pid, hostname: os.hostname() }, () => absent,
+            new RegExp(`is held by policy-write \\(pid ${process.pid} on host .*\\), and that process is still running on this host, so the lock is never taken over\\. Wait for that operation to finish and retry\\. If that PID is not a Ploinky process \\(it was reused\\), stop this workspace on the host, make sure no Ploinky process on that host uses this store, then remove .*write\\.lock and retry\\.`)],
+        ['paused Box', { pid: deadPid, hostname: os.hostname() }, (state) => {
+            const box = owned(state.identity, { running: false });
+            box.handles.container.runtime.status = 'paused';
+            return box;
+        }, /and this workspace's Box is paused, so a writer inside it may still hold the lock\. Resume the Box, or stop this workspace on the host, then retry\. No policy was changed\.$/],
+    ]) {
+        const state = fixture(t);
+        initializeStore({ paths: storePaths(state), identity: state.identity });
+        const directory = storeLockOwnedBy(state, owner);
+        const events = [];
+        await assert.rejects(realSupervisor(state, { events, ownership: ownershipFor(state) }).runStartTransaction(['start', 'explorer']), (error) => {
+            assert.equal(error.code, 'PLOINKY_BOX_HARDWARE_STORE_BUSY', label);
+            assert.match(error.message, pattern, label);
+            assert.ok(error.message.includes(directory), `${label}: names the lock path`);
+            return true;
+        });
+        assert.ok(fs.existsSync(path.join(directory, 'owner.json')), `${label}: never stolen`);
+        assert.equal(events.includes('reconcile'), false, label);
+    }
+});
+
+test('G.update-recovers-stale-lock', async (t) => {
+    // K7: the update preflight is lock-free and read-only, and the update
+    // transaction recovers a dead same-host holder's lock with the Box absent
+    // under the workspace lock, then proceeds.
+    const state = fixture(t);
+    initializeStore({ paths: storePaths(state), identity: state.identity });
+    const directory = storeLockOwnedBy(state, { pid: spawnSync(process.execPath, ['-e', 'process.exit(0)']).pid, hostname: os.hostname() });
+    const absent = { state: 'absent', engine: { name: 'podman', identity: 'engine' }, handles: {} };
+    const events = [];
+    const supervisor = createBoxSupervisor({
+        env: {},
+        resolveIdentity: () => state.identity,
+        launchCwd: state.identity.workspaceRoot,
+        lockManager: fakeLockManager(state.root, events),
+        discover: () => absent,
+        runner: { run(_command, args) { events.push(`run:${args.slice(0, 2).join(' ')}`); }, query() { return { ok: true, status: 0, stdout: INBOX_READY }; } },
+        selectAgentLib: async () => ({ selection: agentLibFixture(state.identity.workspaceRoot), mode: 'local' }),
+        updateAgentLib: async () => ({ selection: agentLibFixture(state.identity.workspaceRoot), changed: false, previous: null }),
+        updateWorkspacePloinky: async () => ({ found: false }),
+        reconcile: async (options) => { events.push('reconcile'); return { action: 'created', ownership: owned(state.identity), hostPort: 8080, mediaHostPort: 7882, hardware: options.hardware }; },
+        readEdgeDesired: () => null,
+        runCoreCommand: async () => { events.push('core'); },
+        resolveHostReachableIpv4: async () => '127.0.0.1',
+        healthCheck: async () => {},
+        revalidateAgentLibSource: () => {},
+        commitAgentLibSelection: () => {},
+        hardwareGateStore: state.gateStore,
+        stderr: { write() { return true; } },
+    });
+    // The preflight is read-only: it neither takes nor recovers the lock.
+    assert.deepEqual(supervisor.preflightHardwareGate('update'), { enabled: false, source: 'default' });
+    assert.ok(fs.existsSync(path.join(directory, 'owner.json')), 'the preflight leaves the lock alone');
+    const hostUpdates = [];
+    const code = await runOuterCli(['update'], {
+        env: {}, input: {}, output: sink(), errorOutput: sink(), cwd: () => state.identity.workspaceRoot,
+        supervisor, detectInsideBox: () => false,
+        updateHostSource: async () => { hostUpdates.push('host'); return { updated: false }; },
+        relaunch: () => 0,
+    });
+    assert.equal(code, 0);
+    assert.deepEqual(hostUpdates, ['host']);
+    assert.ok(events.includes('reconcile'), `the update proceeded: ${events.join(' ')}`);
+    assert.equal(fs.existsSync(directory), false, 'the stale lock was quarantined');
+    assert.ok(fs.readdirSync(storePaths(state).storeRoot).some((name) => name.startsWith('write.lock.stale-')));
+});
+
+// Registered after the module-level imports above it uses.
+test('G.status-transition', async (t) => {
+    // K6: status prints every pending downgrade journal read-only with its
+    // operation ID, its real phase (the pre-barrier prepared phase and
+    // recovery-blocked included) and the recovery that phase needs; it never
+    // prints a hard-coded barrier-installed.
+    const RESTART = 'Run ploinky restart on the host to complete recovery.';
+    for (const phase of ['prepared', 'old-stopped', 'old-absent', 'candidate-created', 'recovery-blocked']) {
+        const state = fixture(t);
+        const pending = await pendingDowngrade(state);
+        const store = createTransitionStore({ identity: state.identity, homeDirectory: state.home });
+        store.writeJournal({
+            ...pending,
+            phase,
+            lastProblem: phase === 'recovery-blocked'
+                ? { code: 'FOREIGN_BOX', message: `Box ${'9'.repeat(64)} is not owned by this transition`, action: 'recover' }
+                : null,
+        });
+        const journalPath = path.join(store.directory, `${pending.operationId}.json`);
+        const before = fs.readFileSync(journalPath, 'utf8');
+        const text = status(state);
+        const lines = text.split('\n').filter((line) => line.startsWith('Transition: '));
+        assert.equal(lines.length, 1, `${phase}: ${text}`);
+        if (phase === 'recovery-blocked') {
+            assert.equal(lines[0], `Transition: gate-on to gate-off ${pending.operationId}, recovery-blocked; recovery Recovery is blocked `
+                + `(Box ${'9'.repeat(64)} is not owned by this transition), and ploinky restart cannot complete it. Run ploinky destroy `
+                + "on the host to remove this workspace's Box and close the transition (the saved gate and stored limits are kept), then run ploinky start.");
+            assert.equal(lines[0].includes(RESTART), false, 'recovery-blocked is never told to run ploinky restart');
+        } else {
+            assert.equal(lines[0], `Transition: gate-on to gate-off ${pending.operationId}, ${phase}; recovery ${RESTART}`);
+        }
+        assert.doesNotMatch(text, /barrier-installed/, phase);
+        assert.equal(fs.readFileSync(journalPath, 'utf8'), before, `${phase}: status never mutates the journal`);
+        assert.equal(store.readJournal(pending.operationId).phase, phase);
+    }
+    // A barrier without any pending journal is reported as exactly that.
+    const state = fixture(t);
+    const paths = storePaths(state);
+    const { token } = initializeStore({ paths, identity: state.identity });
+    const operationId = '9'.repeat(32);
+    beginDowngradeBarrier({ paths, identity: state.identity, operationId, expectedEmptyToken: token });
+    const text = status(state);
+    assert.match(text, new RegExp(`\\nTransition: write barrier ${operationId} has no pending journal; policy writes stay blocked and no recovery applies to it automatically\\n`));
+    assert.doesNotMatch(text, /barrier-installed/);
+    assert.ok(fs.existsSync(paths.barrierPath), 'status reports the barrier without mutating it');
 });

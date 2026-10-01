@@ -32,6 +32,7 @@ import {
     readStoreSnapshot,
 } from '../cli/sandbox/hardwareLimits/store.mjs';
 import { readStoreLockOwner, withStaleStoreLockRecovery } from '../cli/sandbox/hardwareLimits/storeLock.mjs';
+import { createTransitionStore, downgradeRecoveryAdvice } from './hardwareLimitsTransition.mjs';
 
 export const HARDWARE_GATE_ENV = 'PLOINKY_BOX_HARDWARE_LIMITS';
 export const GATE_APPLYING_OPERATIONS = Object.freeze(['start', 'restart', 'update']);
@@ -181,10 +182,26 @@ export const GENERIC_INSPECT_ONLY_MESSAGE = 'This workspace has hardware-limit s
 // ---------------------------------------------------------------------------
 // Status (§5.5): read-only, never initializes state or prepares a Box.
 
-function transitionLine(barrier) {
-    if (!barrier) return 'none';
-    if (barrier.malformed) return `unreadable barrier (${barrier.reason}); recovery Run ploinky restart on the host to complete recovery.`;
-    return `gate-on to gate-off ${barrier.barrier.operationId}, barrier-installed; recovery Run ploinky restart on the host to complete recovery.`;
+// One line per pending downgrade journal, with its operation ID, its real
+// phase (pre-barrier phases and recovery-blocked included) and the recovery
+// that phase needs. A barrier is reported on its own only when no pending
+// journal names it.
+function transitionLines(transition) {
+    const lines = [];
+    const journals = transition?.journals || [];
+    for (const journal of journals) {
+        lines.push(`gate-on to gate-off ${journal.operationId}, ${journal.phase}; recovery ${downgradeRecoveryAdvice(journal)}`);
+    }
+    if (transition?.problem) {
+        lines.push(`unknown (the transition journals are unreadable: ${transition.problem}); recovery Run ploinky restart on the host to complete recovery.`);
+    }
+    const barrier = transition?.barrier;
+    if (barrier?.malformed) {
+        lines.push(`unreadable write barrier (${barrier.reason}); policy writes stay blocked until it is repaired`);
+    } else if (barrier && !journals.some((journal) => journal.operationId === barrier.barrier.operationId) && !transition?.problem) {
+        lines.push(`write barrier ${barrier.barrier.operationId} has no pending journal; policy writes stay blocked and no recovery applies to it automatically`);
+    }
+    return lines.length ? lines : ['none'];
 }
 
 function percentOrNone(value) {
@@ -217,6 +234,19 @@ export function readLimitsStatus({
         snapshot = { status: 'unreadable', agents: new Map(), diagnostic: error.message, token: null };
     }
     const barrier = snapshot.status === 'absent-never-initialized' ? null : readBarrier({ paths, fsApi });
+    // Pending downgrade journals, read only: status never recovers them.
+    let journals = [];
+    let journalProblem = null;
+    try {
+        journals = createTransitionStore({ identity, homeDirectory, fsApi }).listPending().map((journal) => Object.freeze({
+            operationId: journal.operationId,
+            operation: journal.operation,
+            phase: journal.phase,
+            lastProblem: journal.lastProblem ? Object.freeze({ message: String(journal.lastProblem.message || '') }) : null,
+        }));
+    } catch (error) {
+        journalProblem = String(error?.message || error).slice(0, 512);
+    }
     const lockOwner = snapshot.status === 'absent-never-initialized' ? null : readStoreLockOwner(paths.storeRoot, { fsApi });
     const envValue = env?.[HARDWARE_GATE_ENV];
     return Object.freeze({
@@ -232,6 +262,8 @@ export function readLimitsStatus({
             : snapshot.status === 'valid' ? 'initialized' : `unreadable: ${snapshot.diagnostic}`,
         token: snapshot.token,
         transition: barrier,
+        // Pending downgrade journals (read only), reported by their real phase.
+        transitionJournals: Object.freeze({ journals, problem: journalProblem }),
         storeLock: lockOwner,
         hostFacts,
         box: observedBox,
@@ -281,7 +313,9 @@ export function formatLimitsStatus(status) {
         : gate.neverSet ? 'off (never set)' : `${gate.state} (saved ${gate.savedAt})`}`);
     if (status.envNote) lines.push(`Note: ${status.envNote}`);
     lines.push(`Hardware state: ${status.hardwareState}`);
-    lines.push(`Transition: ${transitionLine(status.transition)}`);
+    for (const line of transitionLines({ ...status.transitionJournals, barrier: status.transition })) {
+        lines.push(`Transition: ${line}`);
+    }
     lines.push(hostDelegationLine(status.hostFacts));
     const box = status.box;
     lines.push(box
