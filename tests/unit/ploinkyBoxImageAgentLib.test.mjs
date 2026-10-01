@@ -199,7 +199,8 @@ for (const inspectedId of [imageId, imageId.slice(7)]) {
 }
 
 test('a refreshing bundle load pulls a present reference before selecting from it', async () => {
-    for (const streaming of [false, true]) {
+    for (const imageRef of ['pinned-image', 'a'.repeat(12), `sha256:${'a'.repeat(12)}`,
+        `docker.io/example/box@sha256:${'b'.repeat(64)}`]) for (const streaming of [false, true]) {
         const calls = [];
         const runner = {
             query(_command, args) {
@@ -216,9 +217,55 @@ test('a refreshing bundle load pulls a present reference before selecting from i
                 },
             } : {}),
         };
-        assert.deepEqual(await loadBoxAgentLibImage({ engine, runner, imageRef: 'pinned-image', refresh: true }),
+        assert.deepEqual(await loadBoxAgentLibImage({ engine, runner, imageRef, refresh: true }),
             { ...metadata, imageId });
-        assert.deepEqual(calls, ['pull pinned-image', 'image inspect', 'run --rm']);
+        assert.deepEqual(calls, [`pull ${imageRef}`, 'image inspect', 'run --rm']);
+    }
+});
+
+test('refreshing a full local image ID verifies its cached bundle without registry access', async () => {
+    for (const imageRef of [imageId, imageId.slice(7)]) for (const inspectedId of [imageId, imageId.slice(7)])
+        for (const allowPull of [false, true]) {
+        const calls = [];
+        const runner = {
+            query(command, args) {
+                calls.push([command, ...args]);
+                return args[0] === 'image'
+                    ? { ok: true, stdout: contractInspection(inspectedId) }
+                    : { ok: true, stdout: JSON.stringify(metadata) };
+            },
+            run() { assert.fail('a local image ID must never be pulled'); },
+            stream() { assert.fail('a local image ID must never be pulled'); },
+        };
+        assert.deepEqual(await loadBoxAgentLibImage({
+            engine, runner, imageRef, refresh: true, allowPull,
+        }), { ...metadata, imageId });
+        assert.deepEqual(calls[0], ['podman', 'image', 'inspect', imageRef]);
+        assert.equal(calls.length, 2);
+        assert.ok(calls[1].includes('--network=none'));
+        assert.ok(calls[1].includes('--pull=never'));
+        assert.ok(calls[1].includes(inspectedId));
+    }
+});
+
+test('a missing or mismatched full local image ID fails before pulling or bundle probing', async () => {
+    for (const imageRef of [imageId, imageId.slice(7)]) for (const present of [false, true]) {
+        const calls = [];
+        const runner = {
+            query(command, args) {
+                calls.push([command, ...args]);
+                assert.equal(args[0], 'image');
+                return present
+                    ? { ok: true, stdout: contractInspection(`sha256:${'c'.repeat(64)}`) }
+                    : { ok: false, status: 125, stderr: 'image is not present' };
+            },
+            run() { assert.fail('an unavailable local image ID must never be pulled'); },
+            stream() { assert.fail('an unavailable local image ID must never be pulled'); },
+        };
+        await assert.rejects(() => loadBoxAgentLibImage({ engine, runner, imageRef, refresh: true }), {
+            code: present ? 'PLOINKY_BOX_IMAGE_CONTRACT_INVALID' : 'PLOINKY_BOX_AGENTLIB_INCOMPATIBLE',
+        });
+        assert.deepEqual(calls, [['podman', 'image', 'inspect', imageRef]]);
     }
 });
 

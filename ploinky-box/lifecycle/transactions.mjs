@@ -29,7 +29,7 @@ import {
     sameGpuWiring,
 } from '../gpuGrant.mjs';
 import { probeImageAgentLib } from '../image-agentlib.mjs';
-import { normalizeImageId } from '../contract/image-id.mjs';
+import { isImmutableLocalImageId, normalizeImageId } from '../contract/image-id.mjs';
 import { observedBoxNetworkMode, selectedBoxNetworkMode } from '../contract/network.mjs';
 import { assertBoxWorkspaceRoot } from '../contract/workspace-root.mjs';
 import { retireQuiescentBoxWorkspaceStartLock } from '../noWaitCleanup.mjs';
@@ -136,6 +136,7 @@ async function pullBoxImage(engine, imageRef, runner, {
     stderr = process.stderr,
     timeoutMs = 1_800_000,
 } = {}) {
+    if (isImmutableLocalImageId(imageRef)) return;
     writeProgress(stderr, `Pulling Box image ${imageRef}...`);
     if (typeof runner.stream !== 'function') {
         runner.run(engine.name, ['pull', imageRef]);

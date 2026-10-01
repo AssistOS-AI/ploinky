@@ -100,6 +100,45 @@ test('complete semantic image metadata validates to an immutable image handle', 
     assert.equal(result.immutableId, 'sha256:image-id');
 });
 
+test('full local image references bind admission to the exact cached ID across engine prefixes', () => {
+    const imageId = `sha256:${'a'.repeat(64)}`;
+    for (const imageRef of [imageId, imageId.slice(7)]) for (const inspectedId of [imageId, imageId.slice(7)]) {
+        const record = validRecord();
+        record[0].Id = inspectedId;
+        const secondRecord = validRecord();
+        secondRecord[0].Id = imageId;
+        const runner = admissionRunner({ firstRecord: record, secondRecord });
+        const image = inspectAndValidateImage('podman', imageRef, runner);
+        assert.equal(image.immutableId, imageId);
+        assert.deepEqual(runner.calls[0].args, ['image', 'inspect', imageRef]);
+        for (const call of runner.calls.filter(({ args }) => args[0] === 'run')) {
+            assert.ok(call.args.includes(inspectedId));
+            assert.ok(call.args.includes('--network=none'));
+            assert.ok(call.args.includes('--pull=never'));
+        }
+    }
+});
+
+test('a mismatched full local image reference is rejected before runtime probes', () => {
+    const imageId = `sha256:${'a'.repeat(64)}`;
+    const record = validRecord();
+    record[0].Id = `sha256:${'b'.repeat(64)}`;
+    for (const imageRef of [imageId, imageId.slice(7)]) {
+        const runner = admissionRunner({ firstRecord: record });
+        assert.throws(() => inspectAndValidateImage('podman', imageRef, runner), {
+            code: 'PLOINKY_BOX_IMAGE_CONTRACT_INVALID',
+        });
+        assert.deepEqual(runner.calls.map(({ args }) => args), [['image', 'inspect', imageRef]]);
+    }
+});
+
+test('a registry manifest digest is not compared with the local image configuration ID', () => {
+    const imageRef = `docker.io/example/box@sha256:${'b'.repeat(64)}`;
+    const record = validRecord();
+    record[0].Id = `sha256:${'a'.repeat(64)}`;
+    assert.equal(validateImageContract(normalizeImageInspect(record), imageRef).immutableId, record[0].Id);
+});
+
 test('every required image field has a field-specific fail-closed diagnostic', () => {
     const mutations = [
         ['image ID', (record) => { record[0].Id = ''; }],

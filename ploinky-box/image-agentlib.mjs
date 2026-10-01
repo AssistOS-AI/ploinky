@@ -15,7 +15,7 @@ import {
 } from './agentlib-pin.mjs';
 import { PloinkyBoxError } from './errors.mjs';
 import { normalizeImageInspect, validateImageContract } from './contract/image.mjs';
-import { normalizeImageId } from './contract/image-id.mjs';
+import { isImmutableLocalImageId, normalizeImageId } from './contract/image-id.mjs';
 
 export const IMAGE_AGENTLIB_PROBE_PATH = '/usr/local/share/ploinky/agentlib/image-bundle.mjs';
 const RUNTIME_AGENTLIB_PROBE_PATH = '/opt/ploinky/agentlib/image-bundle.mjs';
@@ -80,8 +80,8 @@ export function probeImageAgentLib(engine, imageId, runner, {
 
 /**
  * Called lazily, only when the workspace has no local library. `refresh` pulls
- * even when the reference exists locally: creating a missing Box pulls it
- * anyway, so the bundle must come from those bytes, not an older local tag.
+ * registry references even when present locally, so the bundle comes from
+ * those bytes, not an older local tag. Full local image IDs are always offline.
  *
  * This is the one place where the bundled commit meets the lock of the
  * checkout at `repositoryRoot`. A difference is reported on stderr and the
@@ -91,7 +91,8 @@ export async function loadBoxAgentLibImage({
     engine, imageRef, runner, stdout, stderr, allowPull = true, refresh = false,
     pinPolicy, repositoryRoot = PLOINKY_INSTALL_ROOT, lockCommit, readPinContext = readCheckoutPinContext,
 }) {
-    if (refresh && !allowPull) {
+    const localImageId = isImmutableLocalImageId(imageRef);
+    if (refresh && !allowPull && !localImageId) {
         throw new PloinkyBoxError('A Box image refresh requires an operation that may pull images',
             { code: 'PLOINKY_BOX_AGENTLIB_REFRESH_INVALID' });
     }
@@ -106,8 +107,11 @@ export async function loadBoxAgentLibImage({
         lockPath: path.join(repositoryRoot, 'ploinky-box', 'dependencies.lock.json'),
     }).commit;
     let refreshed = false;
-    let inspection = refresh ? null : runner.query(engine.name, ['image', 'inspect', imageRef]);
+    let inspection = refresh && !localImageId ? null : runner.query(engine.name, ['image', 'inspect', imageRef]);
     if (!inspection?.ok) {
+        if (localImageId) {
+            throw bundleError('The immutable Box image is not available locally and cannot be pulled as an image ID', inspection?.error);
+        }
         if (!allowPull) {
             throw bundleError('The Box image is not available locally and this operation cannot pull images', inspection?.error);
         }

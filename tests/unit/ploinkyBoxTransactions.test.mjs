@@ -18,7 +18,7 @@ import {
     normalizeContainerRuntime,
     validateContainerConfiguration,
 } from '../../ploinky-box/contract/container.mjs';
-import { IMAGE_CONTRACT } from '../../ploinky-box/contract/image.mjs';
+import { IMAGE_CONTRACT, normalizeImageInspect, validateImageContract } from '../../ploinky-box/contract/image.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import {
     nestedPodmanSeccompProfileContract,
@@ -862,6 +862,79 @@ test('initial transaction preflights before pull, workspace data, and container 
     assert.ok(flat.findIndex((value) => value.includes('container start')) < flat.findIndex((value) => value.includes('wait-ready')));
     assert.ok(flat.findIndex((value) => value.includes('wait-ready')) < flat.findLastIndex((value) => value.includes('discover')));
     assertNoEngineVolumeCommand(h.calls);
+});
+
+test('a full local image ID creates a Box after local validation without either pull path', async (t) => {
+    const imageId = `sha256:${'c'.repeat(64)}`;
+    for (const imageRef of [imageId, imageId.slice(7)]) for (const streaming of [false, true]) {
+        const state = fixture(t);
+        const h = harness(state, { candidateImage: imageId });
+        if (!streaming) h.runner.stream = undefined;
+        const validateImage = h.seams.validateImage;
+        h.seams.validateImage = (engine, selectedRef, runner) => {
+            assert.equal(selectedRef, imageRef);
+            return validateImage(engine, selectedRef, runner);
+        };
+        const result = await reconcileBoxContainer({
+            identity: state.identity, agentLib: state.agentLib,
+            ownership: { state: 'absent', handles: null },
+            engine: { name: 'podman', identity: 'engine' }, runner: h.runner,
+            lock: state.lock, repositoryRoot: state.root, imageRef,
+        }, h.seams);
+        assert.equal(result.action, 'created');
+        assert.equal(h.current().runtime.imageId, imageId);
+        assert.equal(h.current().labels[BOX_LABELS.imageRef], imageRef);
+        assert.equal(h.calls.some((call) => call.includes('pull')), false);
+        assert.ok(h.calls.find((call) => call.includes('create')).includes('--pull=never'));
+        const events = h.calls.map((call) => call.join(' '));
+        assert.ok(events.findIndex((value) => value.includes('validate-image'))
+            < events.findIndex((value) => value.includes('ensure-data-paths')));
+    }
+});
+
+test('local ID validation failures preserve an owned Box without pull or transaction mutation', async (t) => {
+    const imageId = `sha256:${'a'.repeat(64)}`;
+    for (const imageRef of [imageId, imageId.slice(7)]) for (const missing of [false, true]) {
+        const state = fixture(t);
+        const initial = containerHandle({
+            identity: state.identity, agentLib: state.agentLib, repositoryRoot: state.root,
+            imageId: 'd'.repeat(64), imageRef: BOX_IMAGE_REFERENCE,
+            hostPort: 8080, id: 'e'.repeat(64),
+        });
+        const h = harness(state, { initial });
+        h.seams.validateImage = (_engine, selectedRef) => {
+            if (missing) throw new Error('local image is missing');
+            return validateImageContract(normalizeImageInspect([{
+                Id: `sha256:${'c'.repeat(64)}`, Config: {},
+            }]), selectedRef);
+        };
+        await assert.rejects(() => reconcileBoxContainer({
+            identity: state.identity, agentLib: state.agentLib,
+            ownership: { state: 'owned', handles: { container: initial } },
+            engine: { name: 'podman', identity: 'engine' }, runner: h.runner,
+            lock: state.lock, repositoryRoot: state.root, imageRef,
+        }, h.seams), missing ? /local image is missing/ : { code: 'PLOINKY_BOX_IMAGE_CONTRACT_INVALID' });
+        assert.equal(h.current(), initial);
+        assert.equal(initial.runtime.running, true);
+        assert.equal(h.calls.some((call) => call.includes('pull') || call.includes('container')
+            || call.includes('stop-ploinky-local') || call.includes('ensure-data-paths')), false);
+    }
+});
+
+test('registry digests and abbreviated IDs retain the replacement pull policy', async (t) => {
+    for (const imageRef of [`docker.io/example/box@sha256:${'b'.repeat(64)}`, 'a'.repeat(12), `sha256:${'a'.repeat(12)}`]) {
+        const state = fixture(t);
+        const h = harness(state);
+        const result = await reconcileBoxContainer({
+            identity: state.identity, agentLib: state.agentLib,
+            ownership: { state: 'absent', handles: null },
+            engine: { name: 'podman', identity: 'engine' }, runner: h.runner,
+            lock: state.lock, repositoryRoot: state.root, imageRef,
+        }, h.seams);
+        assert.equal(result.action, 'created');
+        assert.deepEqual(h.calls.find((call) => call.includes('pull')), ['stream', 'podman', 'pull', imageRef]);
+        assert.equal(h.calls.find((call) => call.includes('create')).includes('--pull=never'), false);
+    }
 });
 
 test('a real create materializes the workspace data directories before the container', async (t) => {
