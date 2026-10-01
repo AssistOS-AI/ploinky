@@ -363,7 +363,7 @@ async function forwardToDecision(ctx, journal) {
             finalAttemptId: journal.attempts[journal.attempts.length - 1].attemptId,
             finalContainerId: candidateId,
             configurationRef,
-            graphResultRef: journal.attempts[journal.attempts.length - 1].graphResultRef,
+            graphResultRef: journal.attempts[journal.attempts.length - 1].graphResultRef ?? null,
             hostRecordsHash: digestOf(journal.hostRecords.map((record) => [record.name, record.next])),
         },
         phase: 'commit-decided',
@@ -394,6 +394,12 @@ async function createVerifiedCandidate(ctx, journal, configurationRef, stage) {
     await intent(ctx, journal, { kind: 'start', attemptId, exactContainerId: id }, stage === 'reapply' ? 'reapply-start' : 'candidate-start',
         async () => effects.startBox(id));
     persist(ctx, journal, { phase: 'candidate-started', nextAction: null });
+    if (!journal.old.graphWasRunning) {
+        // The graph was not running before the downgrade: it is not started,
+        // so there is no graph result for this attempt.
+        persist(ctx, journal, { phase: 'candidate-verified', nextAction: null });
+        return id;
+    }
     const graph = ctx.store.readSnapshot(journal.desired.graphRef);
     const result = await intent(ctx, journal, { kind: 'graph', attemptId, exactContainerId: id }, stage === 'reapply' ? 'reapply-graph' : 'candidate-graph',
         async () => effects.startGraph(id, graph));
@@ -580,8 +586,11 @@ async function rollForward(ctx, journal) {
         persist(ctx, journal, { phase: 'recovery-blocked', lastProblem: { code: 'TARGET_MISSING', message: 'the decided gate-off Box is not present', action: 'roll-forward' } });
         throw transitionError('Recovery is blocked: the decided gate-off Box is not present', 'PLOINKY_BOX_HARDWARE_RECOVERY_BLOCKED');
     }
-    if (!observed.running) {
+    if (!observed.running && journal.old.wasRunning) {
         await intent(ctx, journal, { kind: 'start', exactContainerId: observed.id }, 'recovery-start', async () => effects.startBox(observed.id));
+    }
+    // Restore the graph only when it was running before and is not observed now.
+    if (journal.old.graphWasRunning && !effects.graphRunning?.(observed.id)) {
         const graph = ctx.store.readSnapshot(journal.desired.graphRef);
         await intent(ctx, journal, { kind: 'graph', exactContainerId: observed.id }, 'recovery-graph', async () => effects.startGraph(observed.id, graph));
     }

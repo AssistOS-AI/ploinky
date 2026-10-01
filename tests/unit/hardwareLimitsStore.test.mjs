@@ -104,24 +104,118 @@ test('S.host-clear-race', (t) => {
     assert.equal(readStoreSnapshot({ paths: context.paths, identity: context.identity }).agents.size, 0);
 });
 
+// A lock left by a writer on this host whose process has exited.
+function deadHolderLock(context, { hostname = os.hostname(), domain = 'host' } = {}) {
+    const exited = spawnSync(process.execPath, ['-e', 'process.exit(0)']);
+    const directory = path.join(context.paths.storeRoot, 'write.lock');
+    fs.mkdirSync(directory, { mode: 0o700 });
+    fs.writeFileSync(path.join(directory, 'owner.json'), `${JSON.stringify({
+        token: 'd'.repeat(32), pid: exited.pid, hostname, domain, operation: 'crashed-writer', acquiredAt: new Date().toISOString(),
+    })}\n`, { mode: 0o600 });
+    return directory;
+}
+
+const ABSENT = () => ({ state: 'absent' });
+const RUNNING = () => ({ state: 'running' });
+
+function hostClear(context, extra = {}) {
+    return runLimitsClear({
+        identity: context.identity, lock: lockedHost(context.identity), all: true, homeDirectory: context.home,
+        lockOptions: { deadlineMs: 50 }, ...extra,
+    });
+}
+
 test('S.live-lock-never-stolen', (t) => {
     const context = initialized(t);
+    set(context, context.token, { cpus: 2 });
     const held = acquireStoreLock({ storeRoot: context.paths.storeRoot, operation: 'paused-writer' });
     let clock = Date.now();
     rejectsCode(() => acquireStoreLock({
         storeRoot: context.paths.storeRoot, deadlineMs: 50, now: () => (clock += 3_600_000), sleep: () => {},
     }), 'store_busy');
-    rejectsCode(() => recoverStaleStoreLock({ storeRoot: context.paths.storeRoot, quiescence: { hostWorkspaceLockHeld: true } }), 'store_busy');
+    // A live holder (this process) is never stolen, even with the Box absent.
+    rejectsCode(() => hostClear(context, { inspectBox: ABSENT }), 'store_busy');
+    // Without the host workspace lock nothing is recovered.
+    rejectsCode(() => recoverStaleStoreLock({ storeRoot: context.paths.storeRoot, instance: context.identity.instance, inspectBox: ABSENT }), 'store_busy');
     held.release();
-    // Quiescence proved: a genuinely stale lock is quarantined, not deleted.
-    // A writer that crashed while holding the lock leaves it behind.
-    acquireStoreLock({ storeRoot: context.paths.storeRoot, operation: 'crashed-writer' });
-    const recovered = recoverStaleStoreLock({
-        storeRoot: context.paths.storeRoot, quiescence: { hostWorkspaceLockHeld: true, boxQuiescent: true },
+    assert.equal(readStoreSnapshot({ paths: context.paths, identity: context.identity }).agents.size, 1, 'no policy changed');
+});
+
+test('S.stale-lock-dead-holder-recovered', (t) => {
+    // F4: a dead same-host holder and an absent (or stopped) Box: the lock is
+    // quarantined and clear succeeds; STORE_BUSY_MESSAGE's advice works.
+    for (const inspectBox of [ABSENT, () => ({ state: 'stopped' })]) {
+        const context = initialized(t);
+        set(context, context.token, { cpus: 2 });
+        const directory = deadHolderLock(context);
+        const result = hostClear(context, { inspectBox });
+        assert.equal(result.committed, true);
+        assert.equal(readStoreSnapshot({ paths: context.paths, identity: context.identity }).agents.size, 0);
+        assert.equal(fs.existsSync(directory), false);
+        assert.equal(fs.readdirSync(context.paths.storeRoot).filter((name) => name.startsWith('write.lock.stale-')).length, 1, 'quarantined, not deleted');
+    }
+    // A Box-domain holder died with the stopped Box.
+    const context = initialized(t);
+    deadHolderLock(context, { hostname: 'box-container', domain: 'box' });
+    assert.equal(hostClear(context, { inspectBox: () => ({ state: 'stopped' }) }).committed, true);
+});
+
+test('S.stale-lock-never-stolen-unproven', (t) => {
+    const context = initialized(t);
+    set(context, context.token, { cpus: 2 });
+    // A dead holder while the Box is running: Box writers are not quiescent.
+    const directory = deadHolderLock(context);
+    rejectsCode(() => hostClear(context, { inspectBox: RUNNING }), 'store_busy');
+    // No real Box observation at all: never recovered.
+    rejectsCode(() => hostClear(context), 'store_busy');
+    assert.ok(fs.existsSync(directory));
+    fs.rmSync(directory, { recursive: true });
+    // A holder recorded on another host is not proven dead by this host.
+    const foreign = deadHolderLock(context, { hostname: 'another-host.example' });
+    rejectsCode(() => hostClear(context, { inspectBox: ABSENT }), 'store_busy');
+    assert.ok(fs.existsSync(foreign));
+    fs.rmSync(foreign, { recursive: true });
+    // An ownerless lock is never proof of death: preserved and reported.
+    const ownerless = path.join(context.paths.storeRoot, 'write.lock');
+    fs.mkdirSync(ownerless, { mode: 0o700 });
+    assert.throws(() => hostClear(context, { inspectBox: ABSENT }), (error) => {
+        assert.equal(error.code, 'store_busy');
+        assert.match(error.message, /has no valid owner \(lock has no owner record\); an ownerless lock is never removed automatically/);
+        return true;
     });
-    assert.equal(recovered.recovered, true);
-    assert.ok(fs.existsSync(recovered.quarantine));
-    acquireStoreLock({ storeRoot: context.paths.storeRoot }).release();
+    assert.ok(fs.existsSync(ownerless));
+    assert.equal(readStoreSnapshot({ paths: context.paths, identity: context.identity }).agents.size, 1, 'no policy changed');
+});
+
+test('S.clear-all-keeps-pending-audit', (t) => {
+    // V2: clear --all never overwrites an undelivered audit event.
+    const context = initialized(t);
+    const auditLog = context.paths.auditPath;
+    // Make audit delivery impossible: audit.log is a directory.
+    fs.mkdirSync(auditLog);
+    assert.throws(() => set(context, context.token, { cpus: 2 }), (error) => error.code === 'audit_pending' && error.committed === true);
+    const pending = readStoreSnapshot({ paths: context.paths, identity: context.identity }).document.auditOutbox;
+    assert.ok(pending?.transactionId);
+    assert.throws(() => hostClear(context, { inspectBox: ABSENT }), (error) => {
+        assert.equal(error.code, 'audit_pending');
+        assert.ok(error.message.includes(auditLog), 'the exact audit.log path is named');
+        assert.match(error.message, new RegExp(`transaction ${pending.transactionId}`));
+        assert.match(error.message, /No policy was changed\.$/);
+        return true;
+    });
+    const after = readStoreSnapshot({ paths: context.paths, identity: context.identity });
+    assert.equal(after.document.auditOutbox.transactionId, pending.transactionId, 'the old event is preserved');
+    assert.equal(after.agents.size, 1);
+    // After the documented repair the escape hatch works and both events are
+    // delivered exactly once.
+    fs.rmdirSync(auditLog);
+    const cleared = hostClear(context, { inspectBox: ABSENT });
+    assert.equal(cleared.committed, true);
+    const events = auditEvents(context.paths);
+    assert.equal(events.filter((event) => event.transactionId === pending.transactionId).length, 1);
+    assert.equal(events.filter((event) => event.action === 'clear-all').length, 1);
+    assert.equal(new Set(events.map((event) => event.transactionId)).size, events.length, 'deduplicated by transaction ID');
+    assert.equal(readStoreSnapshot({ paths: context.paths, identity: context.identity }).agents.size, 0);
 });
 
 test('S.absent-never-initialized', (t) => {

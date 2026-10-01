@@ -296,6 +296,8 @@ export function buildRequiredCaseManifest() {
             'G.generic-unknown-refuses', 'G.off-byte-identical', 'G.bind-contract', 'G.store-directory-replaced',
             'G.targeted-gate-change', 'G.every-final-generation', 'G.status-on', 'G.status-off', 'G.status-absent',
             'G.status-unprepared', 'G.status-transition', 'G.status-refused-blocked', 'G.status-production-observed',
+            'G.update-gate-before-host-source', 'G.pending-downgrade-blocks-bind-grant-revoke', 'G.u9-stale-store-lock',
+            'G.downgrade-running-graph-restored', 'G.downgrade-stopped-graph-not-started',
         ]),
         ...leaves(P, 'p1', unit('ploinkyBoxHardwareLimitsTransitions.test.mjs'), [
             'T.first-on-no-barrier', 'T.on-on-no-barrier', 'T.policy-write-before-barrier',
@@ -303,6 +305,7 @@ export function buildRequiredCaseManifest() {
             'T.interrupted-old-graph-stopped', 'T.optional-cold-child-pending-at-commit', 'T.old-stopped-remains-stopped',
             'T.rollforward-desired-records', 'T.rollforward-restored-records', 'T.ownerless-host-lock',
             'T.cid-outside-lock', 'T.foreign-id-blocked', 'T.stop-with-broken-store', 'T.destroy-receipt',
+            'T.stopped-downgrade-graph-not-started',
             ...tFaultIds(),
         ]),
         ...leaves(P, 'p1', unit('hardwareLimitsStore.test.mjs'), [
@@ -310,7 +313,8 @@ export function buildRequiredCaseManifest() {
             'S.initialized-missing', 'S.symlink', 'S.hardlink', 'S.wrong-owner', 'S.nonregular', 'S.oversize',
             'S.unknown-key', 'S.selective-corrupt-refused', 'S.reset-new-epoch', 'S.old-token-rejected',
             'S.outbox-before-rename', 'S.outbox-after-rename', 'S.audit-failure-committed', 'S.audit-dedup',
-            'S.private-path-overlap', 'S.orphan-clear', ...sVectorIds(),
+            'S.private-path-overlap', 'S.orphan-clear', 'S.stale-lock-dead-holder-recovered',
+            'S.stale-lock-never-stolen-unproven', 'S.clear-all-keeps-pending-audit', ...sVectorIds(),
         ]),
         ...leaves(P, 'p1', unit('cgroupDelegation.test.mjs'), [
             'CG.uid', 'CG.cgroup-v1', 'CG.readonly', 'CG.nsdelegate', 'CG.no-subprocess', 'CG.node-imports-only',

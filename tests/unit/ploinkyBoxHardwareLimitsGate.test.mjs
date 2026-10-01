@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -660,4 +661,273 @@ test('G.every-final-generation', async (t) => {
         assert.ok(prepare >= 0, `${operation} prepares its gate-on generation`);
         assert.ok(prepare < events.indexOf('graph'), `${operation} prepares before graph work`);
     }
+});
+
+// ---------------------------------------------------------------------------
+// Fix round 1: outer-path ordering (V1), pending downgrades (F5), stale store
+// locks on the U9 path (F4) and the real downgrade effects (R7).
+
+const { runOuterCli } = await import('../../ploinky-box/bin/ploinky-box.mjs');
+const {
+    SimulatedProcessDeath,
+    createTransitionStore,
+    runHardwareDowngrade,
+} = await import('../../ploinky-box/hardwareLimitsTransition.mjs');
+const { spawnSync } = await import('node:child_process');
+const { writeGraphSkillScope } = await import('../../ploinky-box/graphSkillScope.mjs');
+const { buildHostSkillScope } = await import('../../ploinky-box/skillScope.mjs');
+
+function sink() {
+    let value = '';
+    return { write(chunk) { value += chunk; return true; }, value: () => value };
+}
+
+function realSupervisor(state, { env = {}, events = [], ownership = owned(state.identity), reconciled = owned(state.identity) } = {}) {
+    return createBoxSupervisor({
+        env,
+        resolveIdentity: () => state.identity,
+        launchCwd: state.identity.workspaceRoot,
+        lockManager: fakeLockManager(state.root, events),
+        discover: () => ownership,
+        runner: { run(_command, args) { events.push(`run:${args.slice(0, 2).join(' ')}`); }, query() { return { ok: true, status: 0, stdout: INBOX_READY }; } },
+        selectAgentLib: async () => { events.push('select-agentlib'); return { selection: agentLibFixture(state.identity.workspaceRoot), mode: 'local' }; },
+        reconcile: async (options) => { events.push('reconcile'); return { action: 'reused', ownership: reconciled, hostPort: 8080, mediaHostPort: 7882, hardware: options.hardware }; },
+        readEdgeDesired: () => null,
+        resolveHostReachableIpv4: async () => '127.0.0.1',
+        startCore: async () => { events.push('start-core'); },
+        runCoreCommand: async () => { events.push('core'); },
+        healthCheck: async () => {},
+        revalidateAgentLibSource: () => {},
+        commitAgentLibSelection: () => {},
+        validateExistingImage: () => ({ immutableId: `sha256:${'b'.repeat(64)}` }),
+        validateContainer: () => {},
+        hardwareGateStore: state.gateStore,
+        prepareHardwareGeneration: async () => { events.push('prepare'); return { structurallyPrepared: true }; },
+        stderr: { write: (text) => events.push(`stderr:${text.trim()}`) },
+    });
+}
+
+test('G.update-gate-before-host-source', async (t) => {
+    for (const [label, setup, env, pattern] of [
+        ['invalid gate value', () => {}, { PLOINKY_BOX_HARDWARE_LIMITS: 'maybe' }, /must be on, off, 1, 0, true or false/],
+        ['stored entry with the gate off', (state) => storeWithEntry(state), { PLOINKY_BOX_HARDWARE_LIMITS: 'off' }, /1 agents have stored hardware limits/],
+        ['stored entry with the saved gate off', (state) => {
+            state.gateStore.write(state.identity, false, lockFor(state.identity));
+            storeWithEntry(state);
+        }, {}, /1 agents have stored hardware limits/],
+    ]) {
+        const state = fixture(t);
+        setup(state);
+        const events = [];
+        const hostUpdates = [];
+        await assert.rejects(runOuterCli(['update'], {
+            env, input: {}, output: sink(), errorOutput: sink(), cwd: () => state.identity.workspaceRoot,
+            supervisor: realSupervisor(state, { env, events }), detectInsideBox: () => false,
+            updateHostSource: async (options) => { hostUpdates.push(options); return { updated: true }; },
+            relaunch: () => { hostUpdates.push('relaunch'); return 0; },
+        }), pattern, label);
+        assert.deepEqual(hostUpdates, [], `${label}: the host source was never updated or relaunched`);
+        assert.equal(events.includes('reconcile'), false, `${label}: no Box mutation`);
+    }
+});
+
+// A pending gate-on to gate-off journal left by an interrupted process.
+async function pendingDowngrade(state) {
+    const paths = storePaths(state);
+    initializeStore({ paths, identity: state.identity });
+    const config = { image: 'img@sha256:1', hostPort: 8080, hardware: { fingerprint: 'a'.repeat(64) } };
+    await assert.rejects(runHardwareDowngrade({
+        identity: state.identity,
+        operation: 'restart',
+        oldContainerId: 'c'.repeat(64),
+        oldConfiguration: config,
+        desiredConfiguration: { ...config, hardware: null },
+        graphSnapshot: { schema: 1, coreArgv: ['start', 'explorer', '8080'] },
+        oldWasRunning: true,
+        oldGraphRunning: true,
+        hostRecords: [{ name: 'gate', old: true, next: false }],
+        homeDirectory: state.home,
+        effects: { engineIdentity: 'engine', hostKind: 'native-linux', inspectBox: () => null, stopGraph() {}, stopBox() {} },
+        faults: { 'outer-stop.after': 'process-death' },
+    }), SimulatedProcessDeath);
+    assert.equal(createTransitionStore({ identity: state.identity, homeDirectory: state.home }).listPending().length, 1);
+}
+
+test('G.pending-downgrade-blocks-bind-grant-revoke', async (t) => {
+    for (const [label, invoke] of [
+        ['bind', (supervisor) => supervisor.runBindTransaction({ address: '127.0.0.1', hostPort: 8080 })],
+        ['gpu grant', (supervisor) => supervisor.runGpuGrantTransaction({ agents: ['demo/agent'] })],
+        ['gpu revoke', (supervisor) => supervisor.runGpuRevokeTransaction({})],
+    ]) {
+        const state = fixture(t);
+        state.gateStore.write(state.identity, true, lockFor(state.identity));
+        await pendingDowngrade(state);
+        const events = [];
+        await assert.rejects(invoke(realSupervisor(state, { events })), (error) => {
+            assert.equal(error.code, 'PLOINKY_BOX_HARDWARE_TRANSITION_PENDING', label);
+            assert.match(error.message, new RegExp(`Run ploinky restart on the host to complete recovery, then retry ploinky ${label}\\. No Box mutation was performed\\.$`));
+            return true;
+        });
+        assert.deepEqual(events.filter((event) => event === 'reconcile' || event.startsWith('run:')), [], `${label}: no Box created or changed`);
+        assert.equal(createTransitionStore({ identity: state.identity, homeDirectory: state.home }).listPending().length, 1, 'the journal is kept for recovery');
+    }
+});
+
+test('G.u9-stale-store-lock', async (t) => {
+    // F4: the U9 guard of a gate-off start recovers a lock whose same-host
+    // holder is dead while the Box is absent; a running Box keeps it.
+    const deadLock = (state) => {
+        const directory = path.join(storePaths(state).storeRoot, 'write.lock');
+        fs.mkdirSync(directory, { mode: 0o700 });
+        fs.writeFileSync(path.join(directory, 'owner.json'), `${JSON.stringify({
+            token: 'd'.repeat(32), pid: spawnSync(process.execPath, ['-e', 'process.exit(0)']).pid, hostname: os.hostname(),
+            domain: 'host', operation: 'crashed-writer', acquiredAt: new Date().toISOString(),
+        })}\n`, { mode: 0o600 });
+        return directory;
+    };
+    const absent = (state) => ({ state: 'absent', engine: { name: 'podman', identity: 'engine' }, handles: {} });
+    const state = fixture(t);
+    initializeStore({ paths: storePaths(state), identity: state.identity });
+    const directory = deadLock(state);
+    const events = [];
+    await realSupervisor(state, { events, ownership: absent(state) }).runStartTransaction(['start', 'explorer']);
+    assert.ok(events.includes('reconcile'), 'the gate-off start proceeded after recovery');
+    assert.equal(fs.existsSync(directory), false);
+    // A running Box: never stolen, start refused before any mutation.
+    const running = fixture(t);
+    initializeStore({ paths: storePaths(running), identity: running.identity });
+    const kept = deadLock(running);
+    const runningEvents = [];
+    await assert.rejects(realSupervisor(running, { events: runningEvents }).runStartTransaction(['start', 'explorer']),
+        (error) => error.code === 'PLOINKY_BOX_HARDWARE_STORE_BUSY');
+    assert.ok(fs.existsSync(kept));
+    assert.equal(runningEvents.includes('reconcile'), false);
+});
+
+// A container engine behind a stub runner: the supervisor's real downgrade
+// effects (stop, remove, create with a CID receipt, start and wait for the
+// ready line, dependency install, graph restore and in-Box status) run
+// against it unchanged.
+function downgradeWorld(t, { boxRunning, graphRunning }) {
+    const state = fixture(t);
+    // Box wiring observation resolves host state from the user's home, as in
+    // production; point it at this fixture's home.
+    const previousHome = process.env.HOME;
+    process.env.HOME = state.home;
+    t.after(() => { process.env.HOME = previousHome; });
+    state.gateStore.write(state.identity, true, lockFor(state.identity));
+    const wiring = resolveDesiredHardwareWiring({ identity: state.identity, enabled: true, homeDirectory: state.home, initializeStore });
+    const box = completeBoxFixture(state);
+    // The prior start's saved launch scope, as start records it.
+    writeGraphSkillScope(state.identity, buildHostSkillScope(state.identity.workspaceRoot, state.identity.workspaceRoot), lockFor(state.identity));
+    const engine = { name: 'podman', identity: 'engine', hostKind: 'native-linux' };
+    const containers = new Map();
+    const old = completeHandle(box, wiring);
+    old.runtime.running = boxRunning;
+    containers.set(old.id, { handle: old, graphRunning: boxRunning && graphRunning, logs: '' });
+    const events = [];
+    const current = () => [...containers.values()][0] || null;
+    const ownership = () => (current()
+        ? { state: 'owned', engine, handles: { container: current().handle } }
+        : { state: 'absent', engine, handles: {} });
+    const runner = {
+        run(_command, args) {
+            const id = args[args.length - 1];
+            if (args[0] === 'container' && args[1] === 'stop') {
+                const entry = containers.get(id);
+                entry.handle.runtime.running = false;
+                entry.graphRunning = false;
+                events.push('box-stop');
+            } else if (args[0] === 'container' && args[1] === 'rm') {
+                containers.delete(id);
+                events.push('box-remove');
+            } else if (args[0] === 'container' && args[1] === 'start') {
+                const entry = containers.get(id);
+                entry.handle.runtime.running = true;
+                entry.logs += '2026-10-01T12:00:00.000000000Z PLOINKY_BOX_READY\n';
+                events.push('box-start');
+            } else if (args.includes('/opt/ploinky/bin/ploinky-local') && args.includes('stop')) {
+                containers.get(args[args.indexOf('/opt/ploinky/bin/ploinky-local') - 1]).graphRunning = false;
+                events.push('graph-stop');
+            } else if (args.includes('--cidfile')) {
+                const newId = crypto.randomBytes(32).toString('hex');
+                fs.writeFileSync(args[args.indexOf('--cidfile') + 1], `${newId}\n`);
+                const handle = completeHandle(box, null);
+                handle.id = newId;
+                handle.runtime.running = false;
+                handle.runtime.environment.HOSTNAME = newId.slice(0, 12);
+                containers.set(newId, { handle, graphRunning: false, logs: '' });
+                events.push(`box-create:${args.some((arg) => String(arg).startsWith(`${BOX_LABELS.hardwareLimits}=`)) ? 'gate-on' : 'gate-off'}`);
+            }
+            return { ok: true, status: 0, stdout: '' };
+        },
+        query(_command, args) {
+            const id = args[args.length - 1];
+            if (args[0] === 'container' && args[1] === 'logs') return { ok: true, status: 0, stdout: containers.get(id)?.logs || '', stderr: '' };
+            if (args[0] === 'container' && args[1] === 'inspect' && args.includes('{{.State.Status}}')) {
+                return { ok: true, status: 0, stdout: containers.get(id)?.handle.runtime.running ? 'running\n' : 'exited\n' };
+            }
+            if (args.includes('/opt/ploinky/ploinky-box/inbox/readStatus.mjs')) {
+                const entry = containers.get(args[args.indexOf('/usr/local/bin/node') - 1]);
+                if (!entry?.handle.runtime.running) return { ok: false, status: 1, stdout: '' };
+                return { ok: true, status: 0, stdout: JSON.stringify({ state: 'running', initialized: true, routingConfigured: true, trackedAgents: 1, runningAgents: entry.graphRunning ? 1 : 0, warnings: [] }) };
+            }
+            return { ok: true, status: 0, stdout: '' };
+        },
+    };
+    const supervisor = createBoxSupervisor({
+        env: { PLOINKY_BOX_HARDWARE_LIMITS: 'off' },
+        resolveIdentity: () => state.identity,
+        launchCwd: state.identity.workspaceRoot,
+        repositoryRoot: box.root,
+        lockManager: fakeLockManager(state.root, events),
+        discover: () => ownership(),
+        runner,
+        selectAgentLib: async () => ({ selection: box.agentLib, mode: 'local' }),
+        reconcile: async () => ({ action: 'reused', ownership: ownership(), hostPort: 8090, mediaHostPort: 7882, hardware: null }),
+        captureCoreStartArgv: () => ['start', 'explorer', '8090'],
+        readEdgeDesired: () => null,
+        resolveHostReachableIpv4: async () => '127.0.0.1',
+        runCoreCommand: async (_engine, id, argv) => {
+            const entry = containers.get(id);
+            entry.graphRunning = true;
+            events.push(`core:${argv.join(' ')}`);
+        },
+        startCore: async () => { events.push('start-core'); },
+        healthCheck: async () => {},
+        revalidateAgentLibSource: () => {},
+        commitAgentLibSelection: () => {},
+        validateExistingImage: () => ({ immutableId: `sha256:${'d'.repeat(64)}` }),
+        validateContainer: () => {},
+        hardwareGateStore: state.gateStore,
+        prepareHardwareGeneration: async () => { events.push('prepare'); return { structurallyPrepared: true }; },
+        stdout: { write() { return true; } },
+        stderr: { write: (text) => { events.push(`stderr:${text.trim()}`); return true; } },
+    });
+    return { state, supervisor, events, current };
+}
+
+test('G.downgrade-running-graph-restored', async (t) => {
+    // R7 through the supervisor's real downgrade effects: the graph was
+    // observed running, so it is stopped with the old Box and restored on
+    // the gate-off Box before the restart continues.
+    const world = downgradeWorld(t, { boxRunning: true, graphRunning: true });
+    await world.supervisor.runRestartTransaction(['restart']);
+    const create = world.events.indexOf('box-create:gate-off');
+    const restore = world.events.indexOf('core:start explorer 8090');
+    assert.ok(world.events.indexOf('graph-stop') >= 0 && world.events.indexOf('graph-stop') < create, world.events.join('\n'));
+    assert.ok(restore > create, 'the prior graph is restored on the gate-off Box');
+    assert.equal(world.state.gateStore.read(world.state.identity).enabled, false);
+    const [journal] = createTransitionStore({ identity: world.state.identity, homeDirectory: world.state.home }).listPending();
+    assert.equal(journal, undefined, 'the downgrade committed');
+});
+
+test('G.downgrade-stopped-graph-not-started', async (t) => {
+    // A stopped gate-on Box ran no graph: the downgrade never starts one.
+    const world = downgradeWorld(t, { boxRunning: false, graphRunning: false });
+    await world.supervisor.runRestartTransaction(['restart']);
+    assert.ok(world.events.includes('box-create:gate-off'), world.events.join('\n'));
+    assert.equal(world.events.includes('graph-stop'), false);
+    assert.equal(world.events.includes('core:start explorer 8090'), false, 'no graph restored by the downgrade');
+    assert.equal(world.state.gateStore.read(world.state.identity).enabled, false);
 });

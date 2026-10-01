@@ -31,7 +31,7 @@ import {
     readBarrier,
     readStoreSnapshot,
 } from '../cli/sandbox/hardwareLimits/store.mjs';
-import { readStoreLockOwner } from '../cli/sandbox/hardwareLimits/storeLock.mjs';
+import { readStoreLockOwner, withStaleStoreLockRecovery } from '../cli/sandbox/hardwareLimits/storeLock.mjs';
 
 export const HARDWARE_GATE_ENV = 'PLOINKY_BOX_HARDWARE_LIMITS';
 export const GATE_APPLYING_OPERATIONS = Object.freeze(['start', 'restart', 'update']);
@@ -361,7 +361,9 @@ export function observeHostLimitsFacts({ engine, containerId = null, query, veri
  * Host recovery: clear one agent's override or every entry. Requires the host
  * workspace mutation lock (supplied by the caller) and needs no router.
  */
-export function runLimitsClear({ identity, lock, agentRef = null, all = false, homeDirectory = os.homedir(), fsApi = fs, actor }) {
+export function runLimitsClear({
+    identity, lock, agentRef = null, all = false, homeDirectory = os.homedir(), fsApi = fs, actor, inspectBox = null, lockOptions,
+}) {
     exactIdentity(identity);
     if (typeof lock?.assertHeld !== 'function') {
         throw gateError('Clearing hardware limits requires the workspace mutation lock', 'PLOINKY_BOX_HARDWARE_STATE_INVALID');
@@ -371,7 +373,12 @@ export function runLimitsClear({ identity, lock, agentRef = null, all = false, h
     assertHardwareStateConfined({ workspaceRoot: identity.workspaceRoot, dataPaths: identity.dataPaths, homeDirectory, fsApi });
     const paths = hardwareStorePaths({ identity, homeDirectory });
     const hostActor = actor || { id: 'host', name: os.userInfo().username };
-    if (all) return clearAllLimits({ paths, identity, actor: hostActor, fsApi });
+    // A stale store lock is recovered only with its holder proven dead and
+    // the exact Box observed stopped or absent (§5.2); otherwise store_busy.
+    const recovering = (operation) => withStaleStoreLockRecovery(operation, {
+        storeRoot: paths.storeRoot, hostLock: lock, instance: identity.instance, inspectBox, fsApi,
+    });
+    if (all) return recovering(() => clearAllLimits({ paths, identity, actor: hostActor, fsApi, lockOptions }));
     const snapshot = readStoreSnapshot({ paths, identity, fsApi });
     if (snapshot.status === 'absent-never-initialized') {
         // Clearing a never-initialized store is an already-empty no-op and
@@ -381,7 +388,7 @@ export function runLimitsClear({ identity, lock, agentRef = null, all = false, h
     if (snapshot.status !== 'valid') {
         throw gateError(`The hardware policy store cannot be read safely: ${snapshot.diagnostic}. Selective clear cannot preserve the other entries; run ploinky limits clear --all.`, 'PLOINKY_BOX_HARDWARE_STATE_INVALID');
     }
-    return clearAgentLimits({ paths, identity, agentRef, actor: hostActor, fsApi });
+    return recovering(() => clearAgentLimits({ paths, identity, agentRef, actor: hostActor, fsApi, lockOptions }));
 }
 
 // ---------------------------------------------------------------------------

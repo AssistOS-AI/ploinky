@@ -785,7 +785,18 @@ export function clearAllLimits({
     try {
         const snapshot = readStoreSnapshot({ paths, identity, fsApi });
         if (snapshot.status === 'valid') {
-            if (snapshot.document.auditOutbox) recoverAuditOutbox({ paths, snapshot, fsApi, now });
+            // The outbox holds one event (§5.4): recover it before this write,
+            // and never overwrite an undelivered one (§5.3 line 235).
+            if (snapshot.document.auditOutbox) {
+                const recovered = recoverAuditOutbox({ paths, snapshot, fsApi, now });
+                if (recovered.auditPending) {
+                    fail(`A previous policy change (transaction ${snapshot.document.auditOutbox.transactionId}) has an undelivered `
+                        + `audit record, so clear --all was refused to keep it. Repair ${paths.auditPath} (it must be a regular, `
+                        + `non-symlinked file owned by you with mode 0600, or absent so it is recreated; reason: `
+                        + `${String(recovered.error?.message || 'unknown').slice(0, 256)}), then run ploinky limits clear --all again. `
+                        + 'No policy was changed.', { code: 'audit_pending' });
+                }
+            }
             const current = requireValid(readStoreSnapshot({ paths, identity, fsApi }));
             const event = auditEvent({
                 action: 'clear-all', ref: null, before: Object.fromEntries(current.agents), after: {}, actor, now, result: 'committed',

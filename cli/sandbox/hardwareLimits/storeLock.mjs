@@ -144,24 +144,85 @@ export function withStoreLock(options, callback) {
     return result;
 }
 
+function processIsProvenDead(pid, kill) {
+    try {
+        kill(pid, 0);
+        return false;
+    } catch (error) {
+        return error?.code === 'ESRCH';
+    }
+}
+
 /**
- * Recover a stale lock only with explicit proof that every writer is
- * quiescent: the host workspace lock is held and the exact Box is stopped or
- * absent. The stale lock is quarantined, never deleted blindly.
+ * Recover a stale store lock (plan §5.2, §6.3 line 441) only under the host
+ * workspace lock and only with proof that its holder is dead:
+ *   - the exact Box is observed stopped or absent (never a caller boolean),
+ *     so no Box writer can be running; and
+ *   - a host-domain holder is a complete owner record from this host whose
+ *     PID is proven dead (the baseline same-host rule). A Box-domain holder
+ *     died with the stopped Box.
+ * An ownerless or malformed lock is never proof of death: it is preserved
+ * and reported. The stale lock is quarantined (renamed), never deleted.
  */
 export function recoverStaleStoreLock({
     storeRoot,
-    quiescence,
+    hostLock,
+    instance,
+    inspectBox,
+    hostname = os.hostname(),
+    kill = (pid, signal) => process.kill(pid, signal),
     fsApi = fs,
     now = () => Date.now(),
 } = {}) {
     const current = readStoreLockOwner(storeRoot, { fsApi });
     if (!current) return { recovered: false, reason: 'no lock' };
-    if (quiescence?.hostWorkspaceLockHeld !== true || quiescence?.boxQuiescent !== true) {
+    if (typeof hostLock?.assertHeld !== 'function') {
         throw new StoreLockError(STORE_BUSY_MESSAGE, 'store_busy', 409);
     }
+    hostLock.assertHeld(instance);
     const { directory } = lockPaths(storeRoot);
+    if (current.malformed) {
+        throw new StoreLockError(
+            `Hardware policy store lock ${directory} has no valid owner (${current.reason}); an ownerless lock is never `
+            + 'removed automatically. Stop this workspace on the host, make sure no Ploinky process uses this store, '
+            + 'then remove that directory and retry. No policy was changed.',
+            'store_busy',
+            409,
+        );
+    }
+    const box = typeof inspectBox === 'function' ? inspectBox() : null;
+    if (box?.state !== 'absent' && box?.state !== 'stopped') {
+        throw new StoreLockError(STORE_BUSY_MESSAGE, 'store_busy', 409);
+    }
+    const owner = current.owner;
+    if (owner.domain !== 'box') {
+        const pid = Number(owner.pid);
+        if (owner.hostname !== hostname || !Number.isSafeInteger(pid) || pid <= 0 || !processIsProvenDead(pid, kill)) {
+            throw new StoreLockError(STORE_BUSY_MESSAGE, 'store_busy', 409);
+        }
+    }
+    // The owner must still be the one that was judged dead.
+    const again = readStoreLockOwner(storeRoot, { fsApi });
+    if (!again || again.malformed || again.owner.token !== owner.token || again.dev !== current.dev || again.ino !== current.ino) {
+        throw new StoreLockError(STORE_BUSY_MESSAGE, 'store_busy', 409);
+    }
     const quarantine = path.join(storeRoot, `${STORE_LOCK_DIRECTORY}.stale-${now()}-${crypto.randomBytes(4).toString('hex')}`);
     fsApi.renameSync(directory, quarantine);
-    return { recovered: true, quarantine, owner: current.malformed ? null : current.owner };
+    return { recovered: true, quarantine, owner };
+}
+
+/**
+ * Run a host store operation; when it is refused only because the store lock
+ * is held, try the stale-lock recovery above once and retry. Every other
+ * outcome (live holder, ownerless lock, running Box) stays store_busy.
+ */
+export function withStaleStoreLockRecovery(operation, { storeRoot, hostLock, instance, inspectBox, fsApi = fs, ...rest } = {}) {
+    try {
+        return operation();
+    } catch (error) {
+        if (error?.code !== 'store_busy' || !readStoreLockOwner(storeRoot, { fsApi })) throw error;
+        const recovered = recoverStaleStoreLock({ storeRoot, hostLock, instance, inspectBox, fsApi, ...rest });
+        if (!recovered.recovered) throw error;
+        return operation();
+    }
 }

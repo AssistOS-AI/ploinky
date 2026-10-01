@@ -30,70 +30,22 @@ import {
     T_FAULT_KINDS,
     T_FAULT_SIDES,
 } from '../hardware-limits/fixtures.mjs';
+import {
+    Engine,
+    effectsFor,
+    loadWorldState,
+    worldState,
+} from '../hardware-limits/transitionWorld.mjs';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 const INSTALLED = new Set(['demo/agent']);
 const CAPABILITIES = { gate: 'on', controllers: ['cpu', 'memory', 'pids'] };
 const ENVELOPE = { cpus: 8, memoryBytes: 16 * 1024 ** 3 };
 
-// A simulated container engine shared by the transaction and a later fresh
-// recovery. The fresh recovery receives a new effects object and a new
-// journal store instance: nothing from the first process's closures.
-class Engine {
-    constructor() {
-        this.boxes = new Map();
-        this.creates = 0;
-        this.prepares = new Map();
-        this.removedByName = 0;
-    }
-
-    add(config, { running = true, graphRunning = true } = {}) {
-        const id = crypto.randomBytes(32).toString('hex');
-        this.boxes.set(id, { config: structuredClone(config), running, graphRunning });
-        return id;
-    }
-}
-
-function effectsFor(world) {
-    const { engine } = world;
-    return {
-        engineIdentity: 'engine-1',
-        hostKind: 'native-linux',
-        inspectBox() {
-            const [entry] = [...engine.boxes];
-            return entry ? { id: entry[0], running: entry[1].running } : null;
-        },
-        stopGraph(id) { engine.boxes.get(id).graphRunning = false; },
-        stopBox(id) {
-            const box = engine.boxes.get(id);
-            box.running = false;
-            box.graphRunning = false;
-        },
-        removeBox(id) {
-            if (!/^[a-f0-9]{64}$/.test(id)) throw new Error('removal requires an exact ID');
-            engine.boxes.delete(id);
-        },
-        createBox(config, { receiptPath }) {
-            engine.creates += 1;
-            const id = engine.add(config, { running: false, graphRunning: false });
-            fs.writeFileSync(receiptPath, `${id}\n`, { mode: 0o600 });
-            return id;
-        },
-        startBox(id) {
-            engine.boxes.get(id).running = true;
-            engine.prepares.set(id, 0);
-        },
-        prepareBox(id) { engine.prepares.set(id, (engine.prepares.get(id) || 0) + 1); },
-        startGraph(id) {
-            engine.boxes.get(id).graphRunning = true;
-            return world.graphResult;
-        },
-        graphRunning(id) { return engine.boxes.get(id)?.graphRunning === true; },
-        verifyBox(id, config) { return digestOf(engine.boxes.get(id)?.config) === digestOf(config); },
-        readHostRecord(name) { return world.records.get(name); },
-        writeHostRecord(name, value) { world.records.set(name, value); },
-    };
-}
-
+// The simulated engine and effects live in a test module that also runs as a
+// fresh recovery process (V6, §6.4): the recovery reloads only the durable
+// engine/record state and the on-disk journal, never this process's objects.
 const OLD_CONFIG = Object.freeze({ image: 'img@sha256:1', hostPort: 8080, hardware: { fingerprint: 'a'.repeat(64) } });
 const DESIRED_CONFIG = Object.freeze({ image: 'img@sha256:1', hostPort: 8080, hardware: null });
 const REAPPLY_CONFIG = Object.freeze({ image: 'img@sha256:1', hostPort: 8080, hardware: null, gpu: { fingerprint: 'b'.repeat(64) } });
@@ -145,6 +97,23 @@ function downgradeArgs(w, faults = {}) {
     };
 }
 
+const RECOVERY_CHILD = fileURLToPath(new URL('../hardware-limits/transitionWorld.mjs', import.meta.url));
+
+// Recover in a FRESH node process that reads only durable records: the
+// engine/record state file, the journal, snapshots, receipts and barrier.
+function recoverInFreshProcess(w) {
+    const statePath = path.join(w.home, `recovery-${crypto.randomBytes(4).toString('hex')}.json`);
+    fs.writeFileSync(statePath, JSON.stringify(worldState(w)), { mode: 0o600 });
+    const child = spawnSync(process.execPath, [RECOVERY_CHILD, 'recover', statePath], { encoding: 'utf8' });
+    assert.equal(child.status, 0, child.stderr);
+    const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    fs.rmSync(statePath, { force: true });
+    assert.notEqual(state.pid, process.pid, 'recovery ran in another process');
+    loadWorldState(w, state);
+    if (state.failure) throw Object.assign(new Error(state.failure.message), { code: state.failure.code });
+    return state.results;
+}
+
 async function runThenRecover(w, faults) {
     let failure = null;
     try {
@@ -152,13 +121,8 @@ async function runThenRecover(w, faults) {
     } catch (error) {
         failure = error;
     }
-    // A fresh recovery process: new effects and a new journal store.
-    const recovered = await recoverHardwareDowngrades({
-        identity: w.identity,
-        homeDirectory: w.home,
-        transitionStore: createTransitionStore({ identity: w.identity, homeDirectory: w.home }),
-        effects: effectsFor(w),
-    });
+    // The interrupted process is gone: its closures and objects are discarded.
+    const recovered = recoverInFreshProcess(w);
     return { failure, recovered };
 }
 
@@ -281,10 +245,22 @@ test('T.optional-cold-child-pending-at-commit', async (t) => {
 
 test('T.old-stopped-remains-stopped', async (t) => {
     const w = world(t, { oldRunning: false });
-    await runThenRecover(w, { 'candidate-graph.after': 'io-error' });
+    await runThenRecover(w, { 'candidate-start.after': 'io-error' });
     assertRolledBack(w);
     const [[, box]] = [...w.engine.boxes];
     assert.equal(box.running, false);
+    assert.equal(box.graphRunning, false);
+});
+
+test('T.stopped-downgrade-graph-not-started', async (t) => {
+    // R7: a stopped gate-on Box had no running graph; the committed gate-off
+    // Box does not start one, and the decision records no graph result.
+    const w = world(t, { oldRunning: false });
+    await runHardwareDowngrade(downgradeArgs(w));
+    const [[, box]] = [...w.engine.boxes];
+    assert.equal(digestOf(box.config), digestOf(DESIRED_CONFIG));
+    assert.equal(box.graphRunning, false, 'the graph was not running before, so it is not started');
+    assert.equal(journals(w)[0].commitIntent.graphResultRef, null);
 });
 
 test('T.rollforward-desired-records', async (t) => {

@@ -416,6 +416,11 @@ async function runRoutedOuterCli(argv, parsed, route, launchDirectory, dispatch,
             ? normalizedUpdateArgs[1]
             : updateScopeArg || undefined;
         const updateScopeRoot = resolvePloinkyUpdateScope(updateFolderPath, { cwd });
+        // The hardware gate is parsed and the stored-limits (U9) check runs
+        // before any mutation, including the host source update and relaunch.
+        if (typeof selectedSupervisor.preflightHardwareGate === 'function') {
+            await selectedSupervisor.preflightHardwareGate('update');
+        }
         output.write(`Using Ploinky update folder ${updateScopeRoot}.\n`);
         const hostUpdate = await updateHostSource({ repositoryRoot, updateScopeRoot });
         if (hostUpdate.updated) {
