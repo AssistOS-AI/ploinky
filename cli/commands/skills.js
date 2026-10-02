@@ -343,9 +343,22 @@ export function installSkillsFromManifest(manifestPath, { targetRoot, pruneMissi
                 availableSkills = availableRepoSkills(cached.repoPath, { allowMissing: pruneMissing || cached.state === 'stale' });
             } catch (error) {
                 if (!outcomeFor) throw error;
-                // Failed or unknown source state never prunes output.
+                // Failed or unknown source state never prunes output, and is
+                // never a success: the structured outcome reaches the manifest
+                // record. A source whose own update is uncertain is unknown;
+                // every other cause (clone failure, origin or branch mismatch,
+                // not a Git checkout, missing skills folder) is a failure.
                 const checkoutPath = canonicalPath(skillRepositoryPath(entry.name, entry.url));
-                sourceStates.push({ name: entry.name, checkoutPath, state: 'retained', code: error.code || 'source-unavailable', reason: sanitizeGitDiagnostic(error.message) });
+                sourceStates.push({
+                    name: entry.name,
+                    checkoutPath,
+                    state: 'retained',
+                    sourceOutcome: error.record?.outcome === 'uncertain' ? 'uncertain' : 'failed',
+                    code: error.code || 'source-unavailable',
+                    reason: sanitizeGitDiagnostic(error.message),
+                    url: sanitizeGitDiagnostic(entry.url),
+                    branch: entry.branch,
+                });
                 retainedSkills.push(...entry.skills);
                 continue;
             }
@@ -355,8 +368,12 @@ export function installSkillsFromManifest(manifestPath, { targetRoot, pruneMissi
             registerManifestCacheBranch(entry, cacheBranches);
             const skillsRoot = path.join(repoPath, 'skills');
             const available = new Set(availableSkills);
-            if (cached.state === 'stale') {
-                // An unrefreshed source proves nothing about removals.
+            // A source that was not refreshed in this run (skipped or failed
+            // update, or outside a targeted update's operation set) proves
+            // nothing about removals: its missing skills are retained, never
+            // pruned from the manifest or the export. A later run that does
+            // refresh it may prune.
+            if (cached.state === 'stale' || (cached.state === 'not-updated' && pruneMissing)) {
                 const missing = entry.skills.filter(skill => !available.has(skill));
                 retainedSkills.push(...missing);
                 sourceStates[sourceStates.length - 1].missingRetained = missing;
@@ -424,8 +441,10 @@ export function installSkillsFromManifest(manifestPath, { targetRoot, pruneMissi
     });
     const repositoryOwned = classifyRepositoryOwnedOutput(destRoot, managedExport);
     reportExportDiagnostics(managedExport);
-    for (const state of sourceStates.filter(item => item.state === 'retained' || item.state === 'stale')) {
-        console.warn(`[skills] Source '${state.name}' was not updated${state.code ? ` (${state.code})` : ''}; nothing is pruned for it.`);
+    for (const state of sourceStates.filter(item => item.state === 'retained' || item.state === 'stale' || item.missingRetained?.length)) {
+        const unusable = state.state !== 'retained' ? ' was not updated'
+            : state.sourceOutcome === 'uncertain' ? ' could not be verified' : ' is unavailable';
+        console.warn(`[skills] Source '${state.name}'${unusable}${state.code ? ` (${state.code})` : ''}; nothing is pruned for it.`);
     }
     const claudeLink = reportClaudeLink(destRoot, managedExport);
     const gitignoreUpdated = nonGitBlockWritten(managedExport);
@@ -634,7 +653,10 @@ export function installDefaultSkills(repoName, { only, skip, targetRoot, pruneMi
     const owner = `defaults:${repoName}`;
     // A skipped or failed source update left the checkout as it was: use it,
     // but never prune owned output that it no longer offers.
-    const retain = stale ? ownedDefaultSkills(destRoot, owner).filter(name => !available.includes(name)) : [];
+    // The same holds for a source outside this update's operation set (a
+    // targeted update): not refreshed, so it proves nothing about removals.
+    const unrefreshed = stale || (Boolean(outcomeFor) && !record && pruneMissing);
+    const retain = unrefreshed ? ownedDefaultSkills(destRoot, owner).filter(name => !available.includes(name)) : [];
     const skills = available;
 
     // Git targets get private worktree exclusions; a non-git folder keeps a

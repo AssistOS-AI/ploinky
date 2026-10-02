@@ -320,6 +320,60 @@ test('an optional workspace repository failure exits nonzero but still allows ac
     assert.match(result.stderr, /final update status: partial \(exit 1\)/);
 });
 
+test('a required skills manifest whose source cannot be cloned exits nonzero and never reaches activation', () => {
+    const result = runScenario(String.raw`
+        await standardWorkspace();
+        writeFile(path.join(workspaceRoot, 'ploinky-skills-manifest.json'),
+            JSON.stringify([{ name: 'MissingSource', url: path.join(scratch, 'missing.git'), skills: ['mandatory'] }]) + '\n');
+        const run = await launchUpdate(['update', workspaceRoot]);
+        done({
+            code: run.code, thrown: run.thrown, result: {
+                status: run.result.status, exitCode: run.result.exitCode, activationAllowed: run.result.activationAllowed,
+                blockedBy: run.result.blockedBy, errors: run.result.errors,
+            },
+            manifest: run.result.records.filter(record => record.phase === 'skills-manifest')
+                .map(record => [record.outcome, record.code, record.required, (record.details.failedSources || []).map(source => source.name)]),
+            spawned: run.spawned, staged: run.staged, stdout: run.stdout, stderr: run.stderr,
+        });
+    `);
+    assert.equal(result.thrown, null);
+    assert.equal(result.code, 1);
+    assert.deepEqual(result.manifest, [['failed', 'skill-source-unavailable', true, ['MissingSource']]]);
+    assert.equal(result.result.exitCode, 1);
+    assert.equal(result.result.activationAllowed, false);
+    assert.equal(result.result.status, 'failed');
+    assert.deepEqual(result.result.blockedBy.filter(entry => entry.phase === 'skills-manifest').map(entry => [entry.outcome, entry.code]),
+        [['failed', 'skill-source-unavailable']]);
+    assert.deepEqual(result.result.errors.map(entry => [entry.phase, entry.outcome]), [['skills-manifest', 'failed']]);
+    assert.deepEqual(result.spawned, [], 'the activation child that restarts the graph was never spawned');
+    assert.deepEqual(result.staged, [], 'no AgentLib transaction was staged');
+    assert.match(result.stderr, /achillesAgentLib activation is pending: blocked by skills-manifest /);
+    assert.match(result.stderr, /Update failed: required inputs are not verified/);
+    assert.match(result.stderr, /✗ workspace skills: .*MissingSource/);
+    assert.doesNotMatch(result.stdout, /✓ workspace: \d+ skill\(s\)/, 'no success line for the failed manifest');
+    assert.doesNotMatch(result.stderr + result.stdout, /Update complete:/);
+});
+
+test('an optional skills manifest with a missing source exits nonzero but still allows activation', () => {
+    const result = runScenario(String.raw`
+        await standardWorkspace();
+        writeFile(path.join(workspaceRoot, 'optional', 'ploinky-skills-manifest.json'),
+            JSON.stringify([{ name: 'MissingSource', url: path.join(scratch, 'missing.git'), skills: ['x'] }]) + '\n');
+        const run = await launchUpdate(['update', workspaceRoot]);
+        done({
+            code: run.code, status: run.result.status, activationAllowed: run.result.activationAllowed,
+            manifest: run.result.records.filter(record => record.phase === 'skills-manifest').map(record => [record.outcome, record.required]),
+            spawned: run.spawned, stderr: run.stderr,
+        });
+    `);
+    assert.equal(result.code, 1);
+    assert.equal(result.status, 'partial');
+    assert.equal(result.activationAllowed, true);
+    assert.deepEqual(result.manifest, [['failed', false]]);
+    assert.deepEqual(result.spawned, [['--agentlib-activate-transaction', 'commit']]);
+    assert.match(result.stderr, /final update status: partial \(exit 1\)/);
+});
+
 test('an in-Box update with no host report defers AgentLib, holds the lease and names host activation', async () => {
     const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-update-lease-'));
     try {

@@ -316,3 +316,43 @@ for (const dirty of [false, true]) {
         assert.equal(result.mutations.filter(line => / fetch /.test(line)).length, dirty ? 0 : 1);
     });
 }
+
+test('a declared source whose checkout is absent joins no Git operation, is cloned once by the skills phase and fails only through its manifest record', () => {
+    const result = runScenario(String.raw`
+        const { REPOS_DIR } = await import(${JSON.stringify(moduleUrl('cli/utils/config.js'))});
+        const commands = await import(${JSON.stringify(moduleUrl('cli/commands/repoAgentCommands.js'))});
+        const present = makeRemote('present', { 'skills/p1/SKILL.md': '# p1\n' });
+        const presentPath = path.join(workspaceRoot, 'projects', 'present');
+        clone(present.remote, presentPath);
+        advance(present.seed, 'skills/p1/SKILL.md', '# p1 v2\n');
+        writeFile(path.join(workspaceRoot, 'ploinky-skills-manifest.json'), JSON.stringify([
+            { name: 'present', url: present.remote, skills: ['p1'] },
+            { name: 'Absent', url: path.join(scratch, 'absent.git'), skills: ['a1'] },
+        ]));
+        fs.writeFileSync(process.env.PLOINKY_TEST_GIT_TRACE, '');
+        const outcome = await quiet(() => commands.updateAllRepos(workspaceRoot, { interactiveSession: true }));
+        const trace = fs.readFileSync(process.env.PLOINKY_TEST_GIT_TRACE, 'utf8').split('\n');
+        const records = outcome.value.records;
+        done({
+            error: outcome.error || null,
+            repositoryRecords: records.filter(record => ['registered-repository', 'workspace-repository'].includes(record.phase))
+                .map(record => [record.phase, path.basename(record.id), record.outcome]),
+            manifest: records.filter(record => record.phase === 'skills-manifest').map(record => [record.outcome, record.code,
+                (record.details.failedSources || []).map(source => source.name)]),
+            decision: { exitCode: outcome.value.exitCode, activationAllowed: outcome.value.activationAllowed },
+            absentClones: trace.filter(line => /(?:^| )clone /.test(line) && line.includes('absent.git')).length,
+            presentFetches: trace.filter(line => / fetch /.test(line) && line.includes('present')).length,
+            presentPulls: trace.filter(line => / pull /.test(line) && line.includes('present')).length,
+            reposAbsent: fs.existsSync(path.join(REPOS_DIR, 'Absent')),
+        });
+    `);
+    assert.equal(result.error, null);
+    assert.deepEqual(result.repositoryRecords.filter(record => record[1] === 'Absent'), [],
+        'no repository record is invented for a source that was never part of the operation set');
+    assert.deepEqual(result.manifest, [['failed', 'skill-source-unavailable', ['Absent']]]);
+    assert.deepEqual(result.decision, { exitCode: 1, activationAllowed: false });
+    assert.equal(result.absentClones, 1);
+    assert.equal(result.presentFetches, 1, 'one Git refresh for the existing checkout');
+    assert.equal(result.presentPulls, 0, 'the skills phase never pulls it again');
+    assert.equal(result.reposAbsent, false);
+});

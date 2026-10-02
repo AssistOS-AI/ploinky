@@ -327,3 +327,122 @@ test('a lock release failure after a recovery that quarantined output stays unce
     }
     assert.equal(fs.readFileSync(path.join(f.skills, 'demo', 'user.txt'), 'utf8'), 'user bytes\n');
 });
+
+// ---------------------------------------------------------------------------
+// Source outcomes of a manifest: a retained source that failed, or whose
+// state is unknown, is never laundered into a changed/unchanged export.
+
+const retainedSource = (name, sourceOutcome, extra = {}) => ({
+    name, checkoutPath: `/workspace/.ploinky/repos/${name}`, url: `https://example.test/${name}.git`, branch: null,
+    state: 'retained', ...(sourceOutcome ? { sourceOutcome } : {}), code: 'source-unavailable', reason: `cannot use ${name}`, ...extra,
+});
+const healthySource = (name, state) => ({ name, checkoutPath: `/workspace/.ploinky/repos/${name}`, state });
+const manifestWith = (sourceStates, managedExport = { transaction: { status: 'unchanged' } }, extra = {}) => skillsManifestRecord({
+    folder: '/workspace/project', manifestPath: '/workspace/project/ploinky-skills-manifest.json', label: 'project',
+    result: { sourceStates, managedExport, skills: ['one'], ...extra },
+});
+const settled = { transaction: { status: 'committed' }, installed: ['one'] };
+const unsettled = { transaction: { id: 'pending', status: 'pending' } };
+
+test('a failed retained source makes the manifest failed with its identity, code and reason, whatever was exported', () => {
+    for (const exported of [{ transaction: { status: 'unchanged' } }, settled]) {
+        const record = manifestWith([healthySource('Good', 'updated'), retainedSource('Bad', 'failed')], exported);
+        assert.equal(record.outcome, 'failed');
+        assert.equal(record.code, 'skill-source-unavailable');
+        assert.match(record.reason, /^Skill source 'Bad' unavailable \(source-unavailable\): cannot use Bad/);
+        assert.deepEqual(record.details.failedSources, [{
+            name: 'Bad', checkoutPath: '/workspace/.ploinky/repos/Bad', url: 'https://example.test/Bad.git', branch: null,
+            code: 'source-unavailable', reason: 'cannot use Bad', sourceOutcome: 'failed',
+        }]);
+        assert.equal(record.details.uncertainSources, undefined);
+        assert.deepEqual(record.details.sources, ['Good', 'Bad'], 'membership evidence is kept');
+        assert.equal(record.details.sourceStates.length, 2);
+        assert.equal(record.details.exportChanged, Boolean(exported.installed), 'what was exported stays visible');
+    }
+});
+
+test('a retained source without a structured outcome counts as failed, never as success', () => {
+    const record = manifestWith([retainedSource('Legacy', null)]);
+    assert.equal(record.outcome, 'failed');
+    assert.equal(record.details.failedSources[0].sourceOutcome, 'failed');
+});
+
+test('an uncertain retained source makes the manifest uncertain, and uncertain wins over failed', () => {
+    const uncertainOnly = manifestWith([retainedSource('Maybe', 'uncertain', { code: 'update-interrupted' })]);
+    assert.equal(uncertainOnly.outcome, 'uncertain');
+    assert.equal(uncertainOnly.code, 'skill-source-uncertain');
+    assert.equal(uncertainOnly.details.uncertainSources[0].code, 'update-interrupted');
+    assert.equal(uncertainOnly.details.failedSources, undefined);
+    const both = manifestWith([retainedSource('Bad', 'failed'), retainedSource('Maybe', 'uncertain')]);
+    assert.equal(both.outcome, 'uncertain');
+    assert.equal(both.code, 'skill-source-uncertain');
+    assert.deepEqual(both.details.uncertainSources.map(source => source.name), ['Maybe']);
+    assert.deepEqual(both.details.failedSources.map(source => source.name), ['Bad'], 'the failure stays visible');
+});
+
+test('an unsettled export transaction stays uncertain even when a source also failed', () => {
+    const record = manifestWith([retainedSource('Bad', 'failed')], unsettled);
+    assert.equal(record.outcome, 'uncertain');
+    assert.equal(record.code, 'SKILL_EXPORT_RECOVERY_REQUIRED', 'recovery precedence');
+    assert.deepEqual(record.details.transaction, unsettled.transaction);
+    assert.equal(record.details.failedSources[0].name, 'Bad');
+    const result = buildCoreUpdateResult({ command: ['update'], records: [record] });
+    assert.deepEqual([result.exitCode, result.activationAllowed], [1, false]);
+});
+
+test('stale, not-updated, updated, current, ensured and workspace sources are not failures', () => {
+    for (const state of ['stale', 'not-updated', 'updated', 'current', 'ensured', 'workspace']) {
+        const record = manifestWith([healthySource('Src', state)]);
+        assert.equal(record.outcome, 'unchanged', state);
+        assert.equal(record.code, 'current');
+        assert.equal(record.details.failedSources, undefined);
+    }
+    assert.equal(manifestWith([healthySource('Src', 'ensured')], settled).outcome, 'changed');
+});
+
+test('a preserved user-edited output with a healthy source is not a source failure', () => {
+    const record = manifestWith([healthySource('Src', 'current')],
+        { transaction: { status: 'unchanged' }, diagnostics: [{ name: 'mine', reason: 'edited-output-preserved' }] });
+    assert.equal(record.outcome, 'unchanged');
+    assert.deepEqual(record.details.preserved, [{ name: 'mine', reason: 'edited-output-preserved' }]);
+});
+
+test('failed source reasons are sanitized, single-line and bounded to an exact form', () => {
+    const long = `fatal: ${'x'.repeat(5000)}`;
+    const record = manifestWith([retainedSource('Bad', 'failed', {
+        reason: `git clone https://user:secret@example.test/Bad.git: exited with status 128\n${long}`,
+    })]);
+    assert.doesNotMatch(JSON.stringify([record.reason, record.details.failedSources]), /secret/);
+    const expected = `git clone https://[redacted]@example.test/Bad.git: exited with status 128; ${long}`.slice(0, 1000);
+    assert.equal(record.details.failedSources[0].reason, `${expected}…`, 'the stored per-source reason is cut at 1000 characters');
+    // The record's own reason is sanitized again, which drops the redaction marker.
+    assert.equal(record.reason, `Skill source 'Bad' unavailable (source-unavailable): ${expected.replace('https://[redacted]@', 'https://')}…`);
+    // Several long sources exceed the record-level bound of 2000 characters.
+    const many = manifestWith(['A', 'B', 'C'].map(name => retainedSource(name, 'failed', { reason: long })));
+    assert.equal(many.reason.length, 2001);
+    assert.ok(many.reason.endsWith('…'));
+    assert.doesNotMatch(many.reason, /\n/);
+});
+
+test('the exclusions summary shape read from the export result is unchanged by a source failure', () => {
+    const exclusions = { status: 'published', mode: 'git-worktree', code: null, extra: 'ignored' };
+    for (const sourceStates of [[healthySource('Src', 'current')], [retainedSource('Bad', 'failed')]]) {
+        const record = manifestWith(sourceStates, { transaction: { status: 'unchanged' } }, { exclusions });
+        assert.deepEqual(record.details.exclusions, { status: 'published', mode: 'git-worktree', code: null });
+    }
+});
+
+test('default skills: an export failure and a source that was not refreshed keep their records', () => {
+    const clone = Object.assign(new Error('git clone: exited with status 128'), { code: 'source-unavailable' });
+    const failed = defaultSkillsRecord({ repoName: 'Target', defaultSkillsRepoName: 'Source', error: clone });
+    assert.deepEqual([failed.outcome, failed.code], ['failed', 'source-unavailable']);
+    const uncertain = defaultSkillsRecord({ repoName: 'Target', defaultSkillsRepoName: 'Source',
+        sourceSkipped: { code: 'update-interrupted' } });
+    assert.deepEqual([uncertain.outcome, uncertain.code], ['skipped', 'source-not-refreshed']);
+    const recovery = defaultSkillsRecord({ repoName: 'Target', defaultSkillsRepoName: 'Source', repoPath: '/w/t',
+        managedExport: unsettled });
+    assert.equal(recovery.outcome, 'uncertain', 'recovery precedence is unchanged');
+    for (const record of [failed, uncertain, recovery]) {
+        assert.equal(buildCoreUpdateResult({ command: ['update'], records: [record] }).exitCode, 1);
+    }
+});

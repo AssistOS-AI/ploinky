@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { createOperationRecord } from '../../cli/commands/updateOutcome.js';
+import { skillsManifestRecord } from '../../cli/commands/updateRecords.js';
 import { runOuterCli } from '../../ploinky-box/bin/ploinky-box.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { createBoxSupervisor } from '../../ploinky-box/supervisor.mjs';
@@ -347,6 +348,43 @@ test('host dispatch: a preserved dirty required repository exits nonzero without
     assert.deepEqual(coreCalls(fixture.events), [['update']]);
     assert.notEqual(fixture.store.read('update-pending', fixture.identity.instance), null);
     assert.equal(errorOutput, '', 'the named phases replace the generic diagnosis hint');
+});
+
+// A manifest record built by the real adapter for a source that could not be
+// cloned. Required failures must never reach the restart (start-time graph
+// replacement); an optional one still lets the verified graph activate.
+const sourceFailedManifest = required => createOperationRecord({
+    ...skillsManifestRecord({
+        folder: '/workspace/project', manifestPath: '/workspace/project/ploinky-skills-manifest.json', label: 'project',
+        result: {
+            skills: [], managedExport: { transaction: { status: 'unchanged' } },
+            sourceStates: [{ name: 'MissingSource', checkoutPath: '/workspace/.ploinky/repos/MissingSource', state: 'retained',
+                sourceOutcome: 'failed', code: 'source-unavailable', reason: 'fatal: repository does not exist' }],
+        },
+    }),
+    required,
+});
+
+test('host dispatch: a required skill source that could not be acquired exits nonzero and never restarts the graph', async (t) => {
+    const fixture = scenario(t, { core: { records: () => [verifiedRecord(), sourceFailedManifest(true)] } });
+    const { code, output, result } = await dispatch(fixture);
+    assert.equal(code, 1);
+    assert.equal(result.status, 'failed');
+    assert.equal(result.activationAllowed, false);
+    assert.match(output, /Update failed \(exit status 1\): .*skills-manifest \/workspace\/project: failed \[skill-source-unavailable\]/);
+    assert.match(output, /Activation deferred/);
+    assert.doesNotMatch(output, /Update complete|restarted and/);
+    assert.deepEqual(coreCalls(fixture.events), [['update']], 'no restart, so no start-time replacement');
+    assert.notEqual(fixture.store.read('update-pending', fixture.identity.instance), null);
+});
+
+test('host dispatch: an optional skill source failure exits nonzero while the verified graph is activated', async (t) => {
+    const fixture = scenario(t, { core: { records: () => [verifiedRecord(), sourceFailedManifest(false)] } });
+    const { code, result } = await dispatch(fixture);
+    assert.equal(code, 1);
+    assert.equal(result.status, 'partial');
+    assert.equal(result.activationAllowed, true);
+    assert.deepEqual(coreCalls(fixture.events), [['update'], ['restart']]);
 });
 
 test('host dispatch: an optional failure exits nonzero while the verified graph is activated', async (t) => {

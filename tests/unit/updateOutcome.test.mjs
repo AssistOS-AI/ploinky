@@ -15,6 +15,7 @@ import {
     updateReportPath,
     writeUpdateReport,
 } from '../../cli/commands/updateOutcome.js';
+import { skillsManifestRecord } from '../../cli/commands/updateRecords.js';
 
 const record = (outcome, required = false, extra = {}) => createOperationRecord({
     phase: 'registered-repository', id: `repo-${outcome}-${String(required)}`, outcome, required, ...extra,
@@ -90,4 +91,66 @@ test('the report round-trips once and every malformed variant is uncertain', t =
     fs.writeFileSync(filename, `${JSON.stringify({ ...envelope, result: { ...envelope.result, exitCode: 0, activationAllowed: true, records: [{ ...envelope.result.records[0], outcome: 'failed' }] } })}\n`);
     assert.equal(readUpdateReport(ploinkyDir, nonce).code, 'report-inconsistent');
     assert.equal(readUpdateReport(ploinkyDir, 'not-a-nonce').code, 'report-nonce-invalid');
+});
+
+// Host aggregation: the host recomputes the decision from the in-Box records
+// (readUpdateReport) and again over its own records plus the core's. Source
+// failures reach it as ordinary failed/uncertain skills-manifest records, so
+// no host code knows about skill sources.
+function sourceFailureRecord({ required, sourceOutcome = 'failed' }) {
+    const base = skillsManifestRecord({
+        folder: '/workspace/project', manifestPath: '/workspace/project/ploinky-skills-manifest.json', label: 'project',
+        result: {
+            skills: [], managedExport: { transaction: { status: 'unchanged' } },
+            sourceStates: [{ name: 'Missing', checkoutPath: '/workspace/.ploinky/repos/Missing', state: 'retained',
+                sourceOutcome, code: 'source-unavailable', reason: 'fatal: repository does not exist' }],
+        },
+    });
+    return createOperationRecord({ ...base, required });
+}
+
+for (const [sourceOutcome, expectedOutcome] of [['failed', 'failed'], ['uncertain', 'uncertain']]) {
+    test(`a ${sourceOutcome} skill source crosses the host report and host aggregation unchanged (required)`, t => {
+        const ploinkyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'update-report-source-'));
+        t.after(() => fs.rmSync(ploinkyDir, { recursive: true, force: true }));
+        const core = [record('changed', true), sourceFailureRecord({ required: true, sourceOutcome })];
+        assert.equal(core[1].outcome, expectedOutcome);
+        const context = { workspace: '/w', scope: 'all', generation: 'g1' };
+        const result = buildUpdateResult({ command: ['update'], records: core, context });
+        assert.deepEqual([result.exitCode, result.activationAllowed, result.status], [1, false, 'failed']);
+        const nonce = createUpdateReportNonce();
+        writeUpdateReport(ploinkyDir, nonce, result);
+        const read = readUpdateReport(ploinkyDir, nonce, { expectedContext: context });
+        assert.equal(read.ok, true, 'the host recomputation matches the core decision');
+        const hostRecords = [
+            createOperationRecord({ phase: 'host-ploinky', id: '/host', outcome: 'unchanged', required: false }),
+            ...read.result.records,
+        ];
+        const aggregated = decideUpdateStatus(hostRecords);
+        assert.equal(aggregated.activationAllowed, false, 'a required source failure never reaches the restart');
+        assert.equal(aggregated.exitCode, 1);
+        assert.deepEqual(aggregated.blockedBy.map(entry => [entry.phase, entry.outcome, entry.code]),
+            [['skills-manifest', expectedOutcome, core[1].code]]);
+        assert.deepEqual(aggregated.errors.map(entry => entry.outcome), [expectedOutcome]);
+        assert.equal(read.result.records[1].details.sourceStates[0].sourceOutcome, sourceOutcome, 'source evidence survives the report');
+    });
+}
+
+test('an optional failed skill source stays nonzero through the host report while activation stays allowed', t => {
+    const ploinkyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'update-report-source-'));
+    t.after(() => fs.rmSync(ploinkyDir, { recursive: true, force: true }));
+    const context = { workspace: '/w', scope: 'all', generation: 'g1' };
+    const result = buildUpdateResult({ command: ['update'], records: [record('changed', true), sourceFailureRecord({ required: false })], context });
+    assert.deepEqual([result.exitCode, result.activationAllowed, result.status], [1, true, 'partial']);
+    const nonce = createUpdateReportNonce();
+    writeUpdateReport(ploinkyDir, nonce, result);
+    const read = readUpdateReport(ploinkyDir, nonce, { expectedContext: context });
+    assert.equal(read.ok, true);
+    const aggregated = decideUpdateStatus(read.result.records);
+    assert.deepEqual([aggregated.exitCode, aggregated.activationAllowed, aggregated.status], [1, true, 'partial']);
+});
+
+test('unknown membership keeps a failed skill source conservative through aggregation', () => {
+    const aggregated = decideUpdateStatus([record('changed', true), sourceFailureRecord({ required: null })]);
+    assert.deepEqual([aggregated.exitCode, aggregated.activationAllowed], [1, false]);
 });
