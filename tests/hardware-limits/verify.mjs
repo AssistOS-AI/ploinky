@@ -116,7 +116,19 @@ const PHASE_REGRESSIONS = Object.freeze({
             'local-llm/tests/dashboard-plugin.test.mjs',
         ],
     },
-    p2: { ploinky: ['tests/unit/agentRegistryResolver.test.mjs', 'tests/unit/marketplaceEnableWorker.test.mjs'] },
+    p2: {
+        ploinky: [
+            'tests/unit/agentRegistryResolver.test.mjs',
+            'tests/unit/marketplaceEnableWorker.test.mjs',
+            // npm run test:authorization:harness: the Router inventory rows
+            // for the hardware-limits and marketplace handlers.
+            'tests/security/authorization/core.test.mjs',
+            'tests/security/authorization/inventory-probes.test.mjs',
+            'tests/security/authorization/resource-probes.test.mjs',
+            'tests/security/authorization/router-probes.test.mjs',
+            'tests/security/authorization/safety.test.mjs',
+        ],
+    },
     p3: { explorer: ['explorer/tests/unit/settingsAccount.test.js', 'workspaceMonitorAgent/tests/currentSnapshot.test.mjs', 'tests/smoke/lib/box-evidence.test.mjs'] },
     p4: { ploinky: ['tests/unit/ploinkyBoxGpuGrant.test.mjs'] },
     p5: { localLlms: ['local-llm/tests/gpu-profiles-unchanged.test.mjs', 'local-llm/tests/vllm.test.mjs'] },
