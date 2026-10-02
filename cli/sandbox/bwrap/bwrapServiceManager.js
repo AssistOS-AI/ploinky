@@ -295,32 +295,35 @@ function ensureBwrapAgentLibDir(instanceName, nodeModulesDir, options = {}) {
 }
 
 /**
- * Guarantee the directories a nested bind will land on inside the source tree.
+ * Guarantee the entries a nested bind will land on inside the source tree.
  *
  * bwrap applies a read-only bind at bind time, so it cannot create
  * `/code/node_modules`, `/code/skills` or a manifest volume target such as
  * `/code/debuglogs` inside an already read-only `/code` ("Can't mkdir
- * /code/node_modules: Read-only file system"). The empty host directories are
- * the mount points, as `ensureBwrapAgentLibDir` provides for
- * /Agent/node_modules. Podman does not need them because it stages a symlink
- * tree for `/code` and mounts into that. They stay empty: the dependency
- * cache, the skills tree and the volumes are mounted over them, never written
- * into them.
+ * /code/node_modules: Read-only file system"). The empty host entries are the
+ * mount points, as `ensureBwrapAgentLibDir` provides for /Agent/node_modules.
+ * Podman does not need them because it stages a symlink tree for `/code` and
+ * mounts into that. They stay empty: the dependency cache, the skills tree and
+ * the volumes are mounted over them, never written into them.
  *
- * `relPath` is a normalized path below /code. Every missing component is
- * created. An existing real directory is left untouched. A symlink (such as
- * the Seatbelt dependency link) or any other non-directory at any component is
- * refused rather than followed, because a bind through it would land on
- * whatever the link resolves to.
+ * `relPath` is a normalized path below /code. The type of the last component
+ * follows the bind source, as bwrap requires: a directory source needs a
+ * directory, a file source needs a regular file (`file: true`). Every other
+ * component is a directory. Missing components are created (the file
+ * exclusively, so an entry that appears meanwhile is never truncated). An
+ * existing entry of the right type is left untouched. A symlink at any
+ * component, or an entry of the wrong type, is refused rather than followed,
+ * because a bind through it would land on whatever the link resolves to.
  */
-function ensureBwrapCodeMountPoint(agentCodePath, relPath) {
+function ensureBwrapCodeMountPoint(agentCodePath, relPath, { file = false } = {}) {
     const segments = String(relPath || '').split('/').filter(Boolean);
     if (!segments.length || segments.some(segment => segment === '..' || segment === '.')) {
         throw new Error(`[bwrap] invalid /code mount point '${relPath}'`);
     }
     let current = agentCodePath;
-    for (const segment of segments) {
+    segments.forEach((segment, index) => {
         current = path.join(current, segment);
+        const wantFile = file && index === segments.length - 1;
         let stat = null;
         try {
             stat = fs.lstatSync(current);
@@ -329,7 +332,8 @@ function ensureBwrapCodeMountPoint(agentCodePath, relPath) {
         }
         if (!stat) {
             try {
-                fs.mkdirSync(current);
+                if (wantFile) fs.closeSync(fs.openSync(current, 'wx', 0o644));
+                else fs.mkdirSync(current);
             } catch (error) {
                 if (error?.code !== 'EEXIST') {
                     throw new Error(`[bwrap] cannot create the /code/${segments.join('/')} mount point ${current}: ${error.message}`);
@@ -337,13 +341,13 @@ function ensureBwrapCodeMountPoint(agentCodePath, relPath) {
             }
             stat = fs.lstatSync(current);
         }
-        if (!stat.isDirectory()) {
+        if (wantFile ? !stat.isFile() : !stat.isDirectory()) {
             throw new Error(
-                `[bwrap] ${current} is not a directory, so /code/${segments.join('/')} cannot be mounted over it. `
-                + 'Remove or move it, then restart.'
+                `[bwrap] ${current} is not a ${wantFile ? 'regular file' : 'directory'}, `
+                + `so /code/${segments.join('/')} cannot be mounted over it. Remove or move it, then restart.`
             );
         }
-    }
+    });
     return current;
 }
 
@@ -710,7 +714,10 @@ function buildBwrapArgs(options) {
                 || {};
             ensureManifestVolumeHostPath(resolvedHostPath, containerPath, mountOptions);
             const codeRelPath = bwrapCodeVolumeRelativePath(containerPath);
-            if (codeRelPath && codeReadOnly) ensureBwrapCodeMountPoint(agentCodePath, codeRelPath);
+            // The mount point must match the source: a file volume needs a file.
+            if (codeRelPath && codeReadOnly) {
+                ensureBwrapCodeMountPoint(agentCodePath, codeRelPath, { file: !fs.statSync(resolvedHostPath).isDirectory() });
+            }
             args.push(mountOptions.readOnly === true ? '--ro-bind' : '--bind', resolvedHostPath, containerPath);
         }
     }

@@ -119,47 +119,63 @@ function bindSources(args, target) {
     return sources;
 }
 
-// The prepared record names the project and is used as is, like containers.
-// (The registry lookup itself is covered above; a prepared start rejects a
-// record whose projectPath changes after preparation.)
-{
-    test('bwrap start of the canonical instance mounts its own home', async (t) => {
-        const w = wiringWorkspace(t, { runtime: 'bwrap', manifest: MANIFEST, packageJson: null, prefix: 'bwrap-alias-first-' });
-        const log = path.join(w.root, 'fake-bwrap-launches.jsonl');
-        const fake = path.join(w.root, 'fake-bwrap');
-        fs.writeFileSync(fake, `#!${process.execPath}
+// Starts the canonical instance, registered after an alias instance of the
+// same agent, from a prepared record carrying `projectPath(workspace)`. (A
+// prepared start rejects a record whose projectPath changes after preparation.)
+async function startCanonical(t, projectPath) {
+    const w = wiringWorkspace(t, { runtime: 'bwrap', manifest: MANIFEST, packageJson: null, prefix: 'bwrap-alias-first-' });
+    const log = path.join(w.root, 'fake-bwrap-launches.jsonl');
+    const fake = path.join(w.root, 'fake-bwrap');
+    fs.writeFileSync(fake, `#!${process.execPath}
 require('fs').appendFileSync(${JSON.stringify(log)}, JSON.stringify({ pid: process.pid, argv: process.argv.slice(2) }) + '\\n');
 setTimeout(() => {}, 60000);
 `, { mode: 0o755 });
-        t.after(() => {
-            for (const entry of readLaunches(log)) {
-                try { process.kill(entry.pid, 'SIGKILL'); } catch { /* gone */ }
-            }
-        });
-        const home = path.join(w.ws, '.data', 'demo');
-        const aliasHome = path.join(w.ws, '.data', 'demo2');
-        const steps = driveWiring(w, [
-            { action: 'init-edge' },
-            // The alias instance was enabled first, then the canonical one.
-            { action: 'register', containerName: 'ploinky_repo_demo2', record: registration({
-                alias: 'demo2', instanceId: 'inst-alias', enableGeneration: 'gen-alias', projectPath: aliasHome,
-            }) },
-            { action: 'register', containerName: CONTAINER, record: registration({ projectPath: home, runtime: 'bwrap' }) },
-            { label: 'start', action: 'bwrap-ensure', containerName: CONTAINER, options: { preservePreparedRegistryRecord: true } },
-        ], { nodeArgs: ['--import', SHIM], env: { FAKE_BWRAP: fake } });
-        const started = stepValue(steps, 'start');
-        // The launcher can prove liveness before the fake process has run its
-        // first line, so wait (bounded) for the launch record of the pid the
-        // start returned instead of reading the log immediately.
-        const launches = await waitForLaunches(log, started.pid);
-        assert.equal(launches.length, 1);
-        const argv = launches[0].argv;
-        assert.deepEqual(bindSources(argv, '/root'), [home], 'the canonical home is the only /root bind');
-        assert.equal(argv.includes(aliasHome), false, 'the alias instance data is never mounted');
-        assert.equal(started.runtime, 'bwrap');
-        const agents = JSON.parse(fs.readFileSync(path.join(w.ws, '.ploinky', 'agents.json'), 'utf8'));
-        assert.equal(agents[CONTAINER].projectPath, home, 'the recorded project is the canonical home');
-        assert.equal(argv[argv.indexOf('HOME') - 1], '--setenv');
-        assert.equal(argv[argv.indexOf('HOME') + 1], '/root');
+    t.after(() => {
+        for (const entry of readLaunches(log)) {
+            try { process.kill(entry.pid, 'SIGKILL'); } catch { /* gone */ }
+        }
     });
+    const home = path.join(w.ws, '.data', 'demo');
+    const aliasHome = path.join(w.ws, '.data', 'demo2');
+    const steps = driveWiring(w, [
+        { action: 'init-edge' },
+        // The alias instance was enabled first, then the canonical one.
+        { action: 'register', containerName: 'ploinky_repo_demo2', record: registration({
+            alias: 'demo2', instanceId: 'inst-alias', enableGeneration: 'gen-alias', projectPath: aliasHome,
+        }) },
+        { action: 'register', containerName: CONTAINER, record: registration({ projectPath: projectPath(w), runtime: 'bwrap' }) },
+        { label: 'start', action: 'bwrap-ensure', containerName: CONTAINER, options: { preservePreparedRegistryRecord: true } },
+    ], { nodeArgs: ['--import', SHIM], env: { FAKE_BWRAP: fake } });
+    const started = stepValue(steps, 'start');
+    // The launcher can prove liveness before the fake process has run its
+    // first line, so wait (bounded) for the launch record of the pid the
+    // start returned instead of reading the log immediately.
+    const launches = await waitForLaunches(log, started.pid);
+    assert.equal(launches.length, 1);
+    const agents = JSON.parse(fs.readFileSync(path.join(w.ws, '.ploinky', 'agents.json'), 'utf8'));
+    return { w, home, aliasHome, started, argv: launches[0].argv, recorded: agents[CONTAINER].projectPath };
 }
+
+function setenv(argv, name) {
+    const index = argv.findIndex((value, at) => value === name && argv[at - 1] === '--setenv');
+    return index < 0 ? undefined : argv[index + 1];
+}
+
+test('bwrap start of the canonical instance mounts its own home', async (t) => {
+    const { home, aliasHome, started, argv, recorded } = await startCanonical(t, (w) => path.join(w.ws, '.data', 'demo'));
+    assert.deepEqual(bindSources(argv, '/root'), [home], 'the canonical home is the only /root bind');
+    assert.equal(argv.includes(aliasHome), false, 'the alias instance data is never mounted');
+    assert.equal(started.runtime, 'bwrap');
+    assert.equal(recorded, home, 'the recorded project is the canonical home');
+    assert.equal(setenv(argv, 'HOME'), '/root');
+});
+
+// The registry lookup alone would answer `.data/demo` here (no static agent is
+// configured), so only honouring the prepared record yields the workspace.
+test('bwrap start uses the prepared record\'s project path over the registry lookup', async (t) => {
+    const { w, home, argv, recorded } = await startCanonical(t, (workspace) => workspace.ws);
+    assert.deepEqual(bindSources(argv, '/root'), [w.ws], 'the prepared project is mounted at /root');
+    assert.deepEqual(bindSources(argv, '/home/agent'), [home], 'the home moves to /home/agent');
+    assert.equal(setenv(argv, 'HOME'), '/home/agent');
+    assert.equal(recorded, w.ws, 'the recorded project is the prepared one');
+});
