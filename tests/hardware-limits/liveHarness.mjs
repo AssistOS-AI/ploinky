@@ -11,7 +11,6 @@ import { runBoundedProcess, requireTransport } from './liveProcess.mjs';
 import { dispatchRemoteRun, assertRemoteArrival } from './liveRemote.mjs';
 import {
     CORE_LAYOUT, MEMBERSHIP as PROCESS_MEMBERSHIP, HELD_ALLOCATION, ALLOCATION_HANDSHAKE, LEAF_OBSERVATION, assertCoreLayout,
-    preparationClaim, preparationReportArgs,
 } from './liveCaseCommands.mjs';
 
 export const LIVE_CASES = Object.freeze({
@@ -277,21 +276,27 @@ export function createLiveAdapter(profile, {
     async function coreCase() {
         const fixture = profile.fixtures?.cpu;
         if (!fixture) throw blocked('LIVE-C1 needs the installed immutable CPU fixture reference');
+        // C1 proves enforcement only through its owned fixture instance, whose
+        // every agent carries memory, cpu and pids limits (inspectAgent).
+        if (!profile.agents.length) throw blocked('LIVE-C1 needs its owned fixture instance with memory, cpu and pids limits');
         const existing = await inspectBox();
         if (!/^[a-f0-9]{64}$/.test(existing.labels?.[BOX_LABELS.hardwareLimits] || '')) throw blocked('LIVE-C1 requires a provisioned gate-on Box receipt before its repeat-start checks');
         await command('repeat-gate-on-start', profile.node.path, [profile.candidate.path, 'start', fixture.ref], { gate: 'on', deadlineMs: 1200000 });
         await inspectBox();
         await command('repeat-saved-gate-start', profile.node.path, [profile.candidate.path, 'start', fixture.ref], { deadlineMs: 1200000 });
         await inspectBox();
-        // The claimed enforceable controllers come from production's own root
-        // preparation report, never from the CORE_LAYOUT observation below:
-        // the host does not record the report it receives at start, and
-        // ploinky limits status does not observe in-Box preparation. This is
-        // the exact fixed command production runs; preparationClaim accepts
-        // only already:true, which production reports only for a layout and
-        // controller state it found settled and did not change.
-        const preparation = preparationClaim((await engine('preparation-report', preparationReportArgs(profile.box.id))).stdout);
-        const layout = assertCoreLayout(checkedJson(await engine('core-layout', [...core, 'node', '-e', CORE_LAYOUT])), preparation);
+        // The proof below only observes; it never runs production's
+        // repairing root preparation. The read-only CORE_LAYOUT observation,
+        // run as the unprivileged Box user, is persisted as evidence before
+        // any assertion, and an unprepared, drifted or wrongly delegated Box
+        // fails C1 with that evidence and is left exactly as observed.
+        const observation = checkedJson(await engine('core-layout', [...core, 'node', '-e', CORE_LAYOUT]));
+        const observationOp = run.operations.at(-1);
+        if (observationOp?.kind !== 'core-layout' || Buffer.byteLength(JSON.stringify(observation)) > 32768) throw new Error('Core layout observation cannot be recorded');
+        observationOp.observation = observation; persist();
+        let delegation;
+        try { delegation = assertCoreLayout(observation, { fixtureControllers: FIXTURE_CONTROLLERS }); }
+        catch (error) { throw Object.assign(error, { evidence: { layout: observation } }); }
         const agents = [];
         for (const agent of profile.agents) {
             const current = await inspectAgent(agent);
@@ -304,7 +309,7 @@ export function createLiveAdapter(profile, {
             const limits = checkedJson(await engine('leaf-observer', [...core, 'node', '-e', LEAF_OBSERVATION, leaf])); requireLeafLimits(limits);
             agents.push({ id: agent.id, workload, conmon, limits });
         }
-        return { preparation, layout, agents, omittedGateRetained: true };
+        return { delegation, layout: observation, agents, omittedGateRetained: true };
     }
     async function swapCase() {
         const agent = profile.agents.find(value => value.role === 'memory');
@@ -412,6 +417,10 @@ export function createLiveAdapter(profile, {
     return { cpuCase, coreCase, swapCase, cleanup, inspectBox };
 }
 
+// Every fixture agent carries memory, cpu and pids limits (inspectAgent), so
+// C1 needs all three controllers from the host.
+const FIXTURE_CONTROLLERS = Object.freeze(['cpu', 'memory', 'pids']);
+
 function blocked(message) { return Object.assign(new Error(message), { code: 'LIVE_PREREQUISITE_MISSING' }); }
 
 export async function executeLiveRun({ run, action = 'live', persist = () => {}, processProvider, signal,
@@ -461,7 +470,7 @@ export async function executeLiveRun({ run, action = 'live', persist = () => {},
         }
     } catch (error) {
         const entry = cases.find(value => value.id === activeCase) || cases.find(value => value.id === selected[0]);
-        if (entry) Object.assign(entry, { result: error.code === 'LIVE_PREREQUISITE_MISSING' ? 'blocked' : 'fail', reason: error.message });
+        if (entry) Object.assign(entry, { result: error.code === 'LIVE_PREREQUISITE_MISSING' ? 'blocked' : 'fail', reason: error.message, ...(error.evidence ? { evidence: error.evidence } : {}) });
         report.limitations.push(error.message);
     } finally {
         clearTimeout(blockTimer);

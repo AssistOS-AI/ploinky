@@ -333,7 +333,11 @@ export function buildRequiredCaseManifest() {
             'C1.layout-root-owned-cgroup-threads-rejected', 'C1.layout-missing-cgroup-threads-rejected',
             'C1.layout-empty-subtree-control-rejected', 'C1.layout-claimed-controller-missing-rejected',
             'C1.layout-mode-without-owner-write-rejected', 'C1.layout-nonroot-root-or-core-procs-rejected',
-            'C1.layout-reviewer-delegated-root-owned-files-rejected', 'C1.preparation-claim-is-production-report',
+            'C1.layout-reviewer-delegated-root-owned-files-rejected', 'C1.layout-mount-must-be-rw-cgroup2-nsdelegate',
+            'C1.proof-unprepared-box-fails-unchanged', 'C1.proof-drifted-box-fails-unchanged',
+            'C1.proof-wrong-delegation-fails-unchanged', 'C1.proof-full-controllers-pass-unchanged',
+            'C1.proof-partial-controllers-pass-unchanged', 'C1.zero-agents-blocked-unchanged',
+            'C1.empty-claim-with-available-controllers-fails-unchanged', 'C1.proof-agrees-with-production-already-check',
         ]),
         ...leaves(P, 'p1', unit('hardwareLimitsDelegation.test.mjs'), [
             'DG.no-aggregate-write', 'DG.nonroot-parents', 'DG.runtime-contexts', 'DG.outer-inspect-runtime',

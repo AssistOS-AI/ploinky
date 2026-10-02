@@ -9,14 +9,13 @@ import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { runBoundedProcess } from '../hardware-limits/liveProcess.mjs';
 import { dispatchRemoteRun, assertRemoteArrival } from '../hardware-limits/liveRemote.mjs';
 import vm from 'node:vm';
-import { fileURLToPath } from 'node:url';
 import {
     CORE_LAYOUT, MEMBERSHIP as PROCESS_MEMBERSHIP, HELD_ALLOCATION, ALLOCATION_HANDSHAKE,
-    assertCoreLayout, preparationClaim, preparationReportArgs,
+    assertCoreLayout,
 } from '../hardware-limits/liveCaseCommands.mjs';
-import { FakeCgroupFs } from '../hardware-limits/fakeCgroupFs.mjs';
+import { FakeCgroupFs, mountinfoLine } from '../hardware-limits/fakeCgroupFs.mjs';
 import { prepareCgroupDelegation } from '../../ploinky-box/entrypoint/cgroupDelegation.mjs';
-import { prepareBoxGeneration } from '../../ploinky-box/hardwareLimits/status.mjs';
+import { PREPARE_SCRIPT_BOX_PATH } from '../../ploinky-box/hardwareLimits/status.mjs';
 import { ensureAgentCgroupParents, readStructuralDelegation } from '../../cli/sandbox/hardwareLimits/delegation.mjs';
 import { parseGpuInventory, requireGpuIdle } from '../hardware-limits/liveGpu.mjs';
 import {
@@ -318,35 +317,41 @@ test('HLIVE.R18-empty-baseline-is-blocked', async t => {
 });
 
 
-async function runC1(t, box) {
+async function runC1(t, box, { agents = null } = {}) {
     const f=fixture(t);f.box.labels[BOX_LABELS.hardwareLimits]='f'.repeat(64);f.profile.box.contractDigest=jsonDigest({labels:f.box.labels,mounts:f.box.mounts});f.profile.cases=['LIVE-C1'];f.profile.fixtures={cpu:{ref:'test/cpu'}};
-    const starts=[];const kinds=[];
+    if(agents)f.profile.agents=agents;
+    const starts=[];const kinds=[];const persisted=[];
+    // With a fake cgroupfs the fixed CORE_LAYOUT program runs against it, so
+    // the proof is observed exactly as it would leave a Box.
     const provider=async(binary,args,options)=>{
         if(binary===f.profile.node.path&&args.includes('start')){starts.push(options.env.PLOINKY_BOX_HARDWARE_LIMITS);return ok('');}
-        if(JSON.stringify(args)===JSON.stringify(preparationReportArgs(f.profile.box.id))){kinds.push('preparation');return ok(box.report);}
-        if(args.includes(CORE_LAYOUT)){kinds.push('layout');return ok(JSON.stringify(box.layout));}
+        if(args.includes(PREPARE_SCRIPT_BOX_PATH)){kinds.push('preparation');throw new Error('the C1 proof must not run root preparation');}
+        if(args.includes(CORE_LAYOUT)){kinds.push('layout');return ok(JSON.stringify(box.fake?observeLayout(observerFs(box.fake)):box.layout));}
         if(args.includes(PROCESS_MEMBERSHIP))return ok(JSON.stringify({pid:Number(args.at(-1)),start:'100',cgroup:args.at(-1)==='456'?'0::/ploinky/core\n':'0::/ploinky/agents/task\n'}));
         const result=await f.provider(binary,args,options);
         if(args.includes('inspect')&&args.includes('--cgroup-manager=cgroupfs')){const value=JSON.parse(result.stdout);value.conmonPid=456;result.stdout=JSON.stringify(value);}
         return result;
     };
-    const report=await executeLiveRun({run:f.run,hostIdentity:f.profile.host,processProvider:provider});
-    return {report,starts,kinds,result:report.cases.find(row=>row.id==='LIVE-C1').result};
+    // Each persisted manifest is captured, so evidence persisted before the
+    // assertion is visible exactly as a crash would leave it.
+    const persist=()=>persisted.push(JSON.parse(JSON.stringify(f.run)));
+    const report=await executeLiveRun({run:f.run,hostIdentity:f.profile.host,processProvider:provider,persist});
+    const row=report.cases.find(entry=>entry.id==='LIVE-C1');
+    return {report,starts,kinds,persisted,row,result:row.result};
 }
 
 test('HLIVE.C1-core-conmon-and-persisted-gate', async t => {
     const c1=await runC1(t,await productionBox());
     assert.equal(c1.result,'pass',JSON.stringify(c1.report));
     assert.deepEqual(c1.starts,['on',undefined]);assert.equal(c1.report.verdict,'BLOCKED');
-    // The production report is read before, and independently of, the layout observation.
-    assert.deepEqual(c1.kinds,['preparation','layout']);
-    // A layout the production claim does not support fails C1.
+    // Only the read-only observation runs; root preparation never does.
+    assert.deepEqual(c1.kinds,['layout']);
+    assert.deepEqual(c1.row.evidence.delegation.required,['cpu','memory','pids']);
+    // A layout that is not settled fails C1, with the observation attached.
     const unsettled=await productionBox();unsettled.layout.paths['/ploinky'].files['cgroup.subtree_control'].value='\n';
-    assert.notEqual((await runC1(t,unsettled)).result,'pass');
-    // A report of a repaired (not already prepared) layout fails C1.
-    const repaired=await productionBox();repaired.report=repaired.firstReport;
-    const failed=await runC1(t,repaired);
-    assert.notEqual(failed.result,'pass');assert.deepEqual(failed.kinds,['preparation']);
+    const failed=await runC1(t,{layout:unsettled.layout});
+    assert.equal(failed.result,'fail');assert.deepEqual(failed.kinds,['layout']);
+    assert.deepEqual(failed.row.evidence.layout,unsettled.layout);
 });
 
 test('HLIVE.A1-held-allocation-swap-before-pressure', async t => {
@@ -419,11 +424,11 @@ test('HLIVE.R18-baseline-import-failure-is-blocked-without-inventory', async t =
     assert.equal(fs.existsSync(path.join(f.evidence,'baseline-inventory-explorer.json')),false);
 });
 
-// --- C1 delegation proof against production's own preparation ------------
+// --- C1 delegation proof over the read-only observation -------------------
 // productionBox() runs the production root preparation and the production
-// uid-1000 parent creation over the in-memory cgroup hierarchy, takes the
-// production report of a repeat preparation as the claim, and runs the fixed
-// CORE_LAYOUT observer program over the same hierarchy.
+// uid-1000 parent creation over the in-memory cgroup hierarchy, then runs the
+// fixed CORE_LAYOUT observer program over it. The proof evaluates only that
+// observation; it never asks production for a claim.
 const INTERFACE_FILES = Object.freeze({ 'cpu.max': ['cpu', 'max 100000'], 'memory.max': ['memory', 'max'], 'pids.max': ['pids', 'max'] });
 function observerFs(fake) {
     // The kernel shows a controller's interface file wherever the controller
@@ -461,15 +466,12 @@ async function productionBox({ available = ['cpu', 'io', 'memory', 'pids'], afte
     assert.equal(structural.structurallyPrepared, true, structural.reason);
     ensureAgentCgroupParents({ fsApi: fake, controllers: structural.controllers });
     afterParents(fake);
-    fake.actorUid = 0;
-    const repeat = await prepare();
-    return { fake, structural, firstReport: `${JSON.stringify(first.result)}\n`, report: `${JSON.stringify(repeat.result)}\n`, layout: observeLayout(observerFs(fake)) };
+    return { fake, structural, firstReport: `${JSON.stringify(first.result)}\n`, layout: observeLayout(observerFs(fake)) };
 }
-const claimOf = (box) => preparationClaim(box.report);
-const rejects = (box, pattern, claim = claimOf(box)) => assert.throws(() => assertCoreLayout(box.layout, claim), pattern);
+const rejects = (box, pattern, options) => assert.throws(() => assertCoreLayout(box.layout, options), pattern);
 // The exact layout of the reviewer's delegatedRootOwnedFiles probe.
 function reviewerRootOwnedLayout() {
-    const layout = { pid1: '0::/ploinky/core\n', self: '0::/ploinky/core\n', paths: {} };
+    const layout = { pid1: '0::/ploinky/core\n', self: '0::/ploinky/core\n', mounts: [mountinfoLine().split('\n')[1]], paths: {} };
     for (const suffix of ['/', '/ploinky/core', '/ploinky', '/ploinky/agents', '/ploinky/system']) {
         layout.paths[suffix] = { uid: suffix === '/' || suffix === '/ploinky/core' ? 0 : 1000, files: { 'memory.max': { uid: 0, value: 'max' }, 'cpu.max': { uid: 0, value: 'max 100000' }, 'pids.max': { uid: 0, value: 'max' }, 'cgroup.procs': { uid: 0, value: '' }, 'cgroup.subtree_control': { uid: 0, value: '' } } };
     }
@@ -478,9 +480,8 @@ function reviewerRootOwnedLayout() {
 
 test('C1.layout-full-controllers-pass', async () => {
     const box = await productionBox();
-    const claim = claimOf(box);
-    assert.deepEqual([...claim.controllers].sort(), ['cpu', 'memory', 'pids']); assert.deepEqual(claim.missing, []);
-    assert.equal(assertCoreLayout(box.layout, claim), box.layout);
+    const delegation = assertCoreLayout(box.layout, { fixtureControllers: ['cpu', 'memory', 'pids'] });
+    assert.deepEqual([...delegation.required], ['cpu', 'memory', 'pids']); assert.deepEqual(delegation.missing, []);
     for (const name of ['cgroup.procs', 'cgroup.subtree_control', 'cgroup.threads']) {
         assert.deepEqual([box.layout.paths['/ploinky'].files[name].uid, box.layout.paths['/ploinky'].files[name].gid], [1000, 1000]);
     }
@@ -488,12 +489,13 @@ test('C1.layout-full-controllers-pass', async () => {
 
 test('C1.layout-partial-controllers-pass', async () => {
     const box = await productionBox({ available: ['io', 'memory', 'pids'] });
-    const claim = claimOf(box);
-    assert.deepEqual([...claim.controllers].sort(), ['memory', 'pids']); assert.deepEqual(claim.missing, ['cpu']);
+    const delegation = assertCoreLayout(box.layout, { fixtureControllers: ['memory', 'pids'] });
+    assert.deepEqual([...delegation.required], ['memory', 'pids']);
+    assert.deepEqual(delegation.missing, [{ controller: 'cpu', reason: 'not offered by the root cgroup.controllers' }]);
     assert.equal(box.layout.paths['/ploinky/agents'].files['cpu.max'].present, false);
-    assert.equal(assertCoreLayout(box.layout, claim), box.layout);
-    // The same layout cannot satisfy a claim that includes cpu.
-    assert.throws(() => assertCoreLayout(box.layout, { controllers: ['cpu', 'memory', 'pids'] }), /cpu is not enabled in \//);
+    // A fixture that needs cpu on this host is BLOCKED, never passed.
+    assert.throws(() => assertCoreLayout(box.layout, { fixtureControllers: ['cpu', 'memory', 'pids'] }),
+        (error) => error.code === 'LIVE_PREREQUISITE_MISSING' && /needs controller cpu/.test(error.message));
 });
 
 test('C1.observer-records-delegation-files-and-absence', async () => {
@@ -506,6 +508,7 @@ test('C1.observer-records-delegation-files-and-absence', async () => {
     assert.ok(Number.isSafeInteger(box.layout.paths['/ploinky'].mode));
     assert.deepEqual(box.layout.paths['/ploinky/system'], { present: false });
     assert.equal(box.layout.paths['/ploinky/core'].files['memory.max'].present, true);
+    assert.equal(box.layout.mounts.length, 1); assert.match(box.layout.mounts[0], / \/sys\/fs\/cgroup .* - cgroup2 cgroup2 rw,nsdelegate/);
     rejects(box, /Missing cgroup evidence for \/ploinky\/system/);
 });
 
@@ -513,9 +516,9 @@ test('C1.layout-root-owned-delegation-files-rejected', async () => {
     const box = await productionBox();
     for (const name of ['cgroup.procs', 'cgroup.subtree_control', 'cgroup.threads']) Object.assign(box.layout.paths['/ploinky'].files[name], { uid: 0, gid: 0 });
     rejects(box, /Delegated cgroup ownership mismatch: \/ploinky\/cgroup\.procs is owned by uid 0/);
-    // Production's own preparation refuses to report that layout as prepared.
+    // The same drift observed on the hierarchy itself fails the same way.
     const actual = await productionBox({ afterParents: (fake) => { fake.groups.get('/ploinky').fileUids['cgroup.procs'] = 0; } });
-    assert.throws(() => claimOf(actual), /did not report an already exact prepared layout/);
+    rejects(actual, /Delegated cgroup ownership mismatch: \/ploinky\/cgroup\.procs is owned by uid 0/);
 });
 
 test('C1.layout-root-owned-cgroup-threads-rejected', async () => {
@@ -536,7 +539,7 @@ test('C1.layout-empty-subtree-control-rejected', async () => {
     for (const suffix of ['/', '/ploinky', '/ploinky/agents', '/ploinky/system']) {
         const box = await productionBox();
         box.layout.paths[suffix].files['cgroup.subtree_control'].value = '\n';
-        rejects(box, new RegExp(`Claimed controller (cpu|memory|pids) is not enabled in ${suffix.replaceAll('/', '\\/')}$`));
+        rejects(box, new RegExp(`Required controller (cpu|memory|pids) is not enabled in ${suffix.replaceAll('/', '\\/')}$`));
     }
     const empty = await productionBox();
     empty.layout.paths['/ploinky'].files['cgroup.subtree_control'] = { present: false };
@@ -549,10 +552,10 @@ test('C1.layout-claimed-controller-missing-rejected', async () => {
             const box = await productionBox();
             const file = box.layout.paths[suffix].files['cgroup.subtree_control'];
             file.value = `${file.value.split(/\s+/).filter((value) => value && value !== controller).join(' ')}\n`;
-            rejects(box, new RegExp(`Claimed controller ${controller} is not enabled in ${suffix.replaceAll('/', '\\/')}$`));
+            rejects(box, new RegExp(`Required controller ${controller} is not enabled in ${suffix.replaceAll('/', '\\/')}$`));
         }
     }
-    // A claimed controller's aggregate interface file is evidence too.
+    // A required controller's aggregate interface file is evidence too.
     const box = await productionBox();
     box.layout.paths['/ploinky/agents'].files['pids.max'] = { present: false };
     rejects(box, /Missing cgroup evidence for \/ploinky\/agents\/pids\.max/);
@@ -582,29 +585,184 @@ test('C1.layout-nonroot-root-or-core-procs-rejected', async () => {
 
 test('C1.layout-reviewer-delegated-root-owned-files-rejected', async () => {
     const layout = reviewerRootOwnedLayout();
-    assert.throws(() => assertCoreLayout(layout), /Missing independent controller claim/);
-    assert.throws(() => assertCoreLayout(layout, { controllers: ['cpu', 'memory', 'pids'] }), /\/ploinky\/cgroup\.procs is owned by uid 0/);
-    assert.throws(() => assertCoreLayout(layout, { controllers: [] }), /\/ploinky\/cgroup\.procs is owned by uid 0/);
+    assert.throws(() => assertCoreLayout(layout), /\/ploinky\/cgroup\.procs is owned by uid 0/);
+    assert.throws(() => assertCoreLayout(layout, { fixtureControllers: ['cpu', 'memory', 'pids'] }), /\/ploinky\/cgroup\.procs is owned by uid 0/);
+    assert.throws(() => assertCoreLayout(layout, { fixtureControllers: ['io'] }), /Invalid fixture controller requirement/);
 });
 
-test('C1.preparation-claim-is-production-report', async (t) => {
-    // The harness runs exactly the root command production runs.
-    const calls = [];
-    const repositoryRoot = fs.realpathSync(fileURLToPath(new URL('../..', import.meta.url)));
-    await prepareBoxGeneration({ engine: { name: 'podman' }, containerId: 'a'.repeat(64), repositoryRoot, writableSources: [],
-        runner: { query: (command, args) => { calls.push(args); return args[1] === 'exec' ? { ok: true, status: 0, stdout: '{}' } : { ok: true, status: 0, stdout: 'crun\n' }; } } });
-    assert.deepEqual(calls.find((args) => args[1] === 'exec'), preparationReportArgs('a'.repeat(64)));
-    assert.throws(() => preparationReportArgs('a'.repeat(12)), /exact immutable Box ID/);
-    // Only an already-settled production report is a claim.
-    const box = await productionBox();
-    assert.equal(JSON.parse(box.firstReport).already, false);
-    assert.throws(() => claimOf({ report: box.firstReport }), /did not report an already exact prepared layout/);
-    const report = JSON.parse(box.report);
-    for (const change of [{ structurallyPrepared: false }, { nsdelegate: false }, { reason: 'x' },
-        { controllers: ['cpu', 'memory'] }, { controllers: ['cpu', 'memory', 'pids', 'io'] },
-        { missing: [{ controller: 'cpu', reason: 'not delegated' }] }, { controllers: ['cpu', 'cpu', 'memory', 'pids'] }]) {
-        assert.throws(() => preparationClaim(JSON.stringify({ ...report, ...change })), /Box preparation/, JSON.stringify(change));
+test('C1.layout-mount-must-be-rw-cgroup2-nsdelegate', async () => {
+    for (const mount of [{ fstype: 'cgroup' }, { mountRw: false }, { superRw: false }, { nsdelegate: false }]) {
+        const box = await productionBox();
+        box.layout.mounts = [mountinfoLine(mount).split('\n')[1]];
+        rejects(box, /not cgroup2 mounted rw with nsdelegate/, { fixtureControllers: ['cpu', 'memory', 'pids'] });
     }
-    assert.throws(() => preparationClaim('not json'), /Box preparation/);
-    assert.throws(() => assertCoreLayout(box.layout, { controllers: ['io'] }), /Missing independent controller claim/);
+    for (const mounts of [[], undefined, [mountinfoLine().split('\n')[1], mountinfoLine().split('\n')[1]]]) {
+        const box = await productionBox(); box.layout.mounts = mounts;
+        rejects(box, /Missing cgroup mount evidence/);
+    }
+});
+
+// Every file's content, owner and mode in the fake hierarchy, PID placement
+// and the fake's own write, chown and mkdir logs, so even a write that leaves
+// the same bytes is visible.
+function cgroupSnapshot(fake) {
+    const groups = {};
+    for (const rel of [...fake.groups.keys()].sort()) {
+        const directory = rel === '/' ? fake.cgroupRoot : `${fake.cgroupRoot}${rel}`;
+        const stat = fake.lstatSync(directory);
+        const group = fake.groups.get(rel);
+        const files = {};
+        for (const name of ['cgroup.procs', 'cgroup.subtree_control', 'cgroup.threads', 'cgroup.controllers', ...[...group.values.keys()].sort()]) {
+            const file = `${directory}/${name}`;
+            const fileStat = fake.lstatSync(file);
+            files[name] = { content: fake.readFileSync(file), uid: fileStat.uid, mode: fileStat.mode };
+        }
+        groups[rel] = { uid: stat.uid, mode: stat.mode, files };
+    }
+    return JSON.stringify({ groups, pids: [...fake.pidGroup.entries()].sort(), writes: fake.writes, chowns: fake.chowns, mkdirs: fake.mkdirs });
+}
+// A write-trapping view: every mutating call is counted and refused.
+const MUTATING = new Set(['writeFileSync', 'mkdirSync', 'chownSync', 'rmdirSync', 'chmodSync', 'renameSync', 'unlinkSync', 'rmSync', 'appendFileSync', 'symlinkSync', 'linkSync', 'openSync']);
+function writeTrap(fake) {
+    const attempts = [];
+    const view = new Proxy(fake, {
+        get(target, property) {
+            if (MUTATING.has(property)) return (...args) => { attempts.push([property, String(args[0])]); throw Object.assign(new Error(`trapped ${property}`), { code: 'EPERM' }); };
+            const value = Reflect.get(target, property, target);
+            return typeof value === 'function' ? value.bind(target) : value;
+        },
+    });
+    return { view, attempts };
+}
+// Runs the C1 proof against the fake through the write trap and proves the
+// fixture byte-identical afterwards.
+async function proveOnFake(t, fake, options) {
+    const before = cgroupSnapshot(fake);
+    const trap = writeTrap(fake);
+    const c1 = await runC1(t, { fake: trap.view }, options);
+    assert.deepEqual(trap.attempts, []);
+    assert.equal(cgroupSnapshot(fake), before, 'the C1 proof changed the cgroup fixture');
+    assert.ok(!c1.kinds.includes('preparation'));
+    return c1;
+}
+// The persisted pre-assertion observation and the report's evidence are the
+// same layout the hierarchy showed.
+function assertEvidencePersisted(c1, fake) {
+    const layout = observeLayout(observerFs(fake));
+    assert.deepEqual(c1.row.evidence.layout, layout);
+    const persisted = c1.persisted.find((run) => run.operations.some((op) => op.kind === 'core-layout' && op.observation));
+    assert.ok(persisted, 'the observation was not persisted');
+    assert.deepEqual(persisted.operations.find((op) => op.kind === 'core-layout').observation, layout);
+    assert.equal(persisted.cleanup.state, 'not-started', 'the observation must be persisted before the assertion and cleanup');
+}
+function unpreparedFake() {
+    return new FakeCgroupFs();
+}
+async function driftedFake() {
+    // A Box task strayed back into the namespace root after preparation.
+    const fake = (await productionBox()).fake;
+    fake.placePid(77, '/');
+    return fake;
+}
+
+test('C1.proof-unprepared-box-fails-unchanged', async t => {
+    const fake = unpreparedFake();
+    const c1 = await proveOnFake(t, fake);
+    assert.equal(c1.result, 'fail'); assert.equal(c1.report.verdict, 'FAIL');
+    assert.match(c1.row.reason, /placement mismatch|Missing cgroup evidence/);
+    assertEvidencePersisted(c1, fake);
+    assert.deepEqual(c1.row.evidence.layout.paths['/ploinky'], { present: false });
+    // Negative control: a repairing call through the same snapshot is seen.
+    const before = cgroupSnapshot(fake);
+    await prepareCgroupDelegation({ argv: ['prepare'], getuid: () => 0, fsApi: fake, sleep: async () => {} });
+    assert.notEqual(cgroupSnapshot(fake), before);
+});
+
+test('C1.proof-drifted-box-fails-unchanged', async t => {
+    const fake = await driftedFake();
+    const c1 = await proveOnFake(t, fake);
+    assert.equal(c1.result, 'fail'); assert.match(c1.row.reason, /^\/ has direct processes$/);
+    assertEvidencePersisted(c1, fake);
+    assert.match(c1.row.evidence.layout.paths['/'].files['cgroup.procs'].value, /^77$/m);
+});
+
+test('C1.proof-wrong-delegation-fails-unchanged', async t => {
+    for (const [corrupt, pattern] of [
+        [(fake) => { for (const name of ['cgroup.procs', 'cgroup.subtree_control', 'cgroup.threads']) fake.groups.get('/ploinky').fileUids[name] = 0; }, /\/ploinky\/cgroup\.procs is owned by uid 0/],
+        [(fake) => { fake.groups.get('/ploinky').subtree.clear(); }, /Required controller cpu is not enabled in \/ploinky$/],
+    ]) {
+        const fake = (await productionBox()).fake; corrupt(fake);
+        const c1 = await proveOnFake(t, fake);
+        assert.equal(c1.result, 'fail'); assert.match(c1.row.reason, pattern);
+        assertEvidencePersisted(c1, fake);
+    }
+});
+
+test('C1.proof-full-controllers-pass-unchanged', async t => {
+    const fake = (await productionBox()).fake;
+    const c1 = await proveOnFake(t, fake);
+    assert.equal(c1.result, 'pass', JSON.stringify(c1.report));
+    assert.deepEqual([...c1.row.evidence.delegation.required], ['cpu', 'memory', 'pids']);
+    assert.equal(c1.row.evidence.agents.length, 3);
+    assertEvidencePersisted(c1, fake);
+});
+
+test('C1.proof-partial-controllers-pass-unchanged', async t => {
+    // cpu is genuinely unavailable at the root: the delegation proof passes
+    // for what the root offers, and the owned C1 fixture, which also limits
+    // cpu, is BLOCKED on this host rather than passed or failed.
+    const fake = (await productionBox({ available: ['io', 'memory', 'pids'] })).fake;
+    const before = cgroupSnapshot(fake);
+    const trap = writeTrap(fake);
+    const delegation = assertCoreLayout(observeLayout(observerFs(trap.view)), { fixtureControllers: ['memory', 'pids'] });
+    assert.deepEqual([...delegation.required], ['memory', 'pids']); assert.deepEqual(trap.attempts, []);
+    assert.equal(cgroupSnapshot(fake), before);
+    const c1 = await proveOnFake(t, fake);
+    assert.equal(c1.result, 'blocked'); assert.match(c1.row.reason, /needs controller cpu/);
+    assertEvidencePersisted(c1, fake);
+});
+
+test('C1.zero-agents-blocked-unchanged', async t => {
+    const fake = (await productionBox()).fake;
+    const c1 = await proveOnFake(t, fake, { agents: [] });
+    assert.equal(c1.result, 'blocked'); assert.match(c1.row.reason, /owned fixture instance/);
+    assert.notEqual(c1.report.verdict, 'PASS'); assert.deepEqual(c1.kinds, []); assert.deepEqual(c1.starts, []);
+});
+
+test('C1.empty-claim-with-available-controllers-fails-unchanged', async t => {
+    // Nothing enabled while the root offers every controller: the required
+    // set is the kernel's, so an empty delegation fails instead of passing.
+    const fake = (await productionBox()).fake;
+    for (const rel of ['/', '/ploinky', '/ploinky/agents', '/ploinky/system']) fake.groups.get(rel).subtree.clear();
+    const c1 = await proveOnFake(t, fake);
+    assert.equal(c1.result, 'fail'); assert.match(c1.row.reason, /Required controller cpu is not enabled in \/$/);
+    assertEvidencePersisted(c1, fake);
+    // A root that offers no wanted controller cannot prove the fixture.
+    const io = (await productionBox({ available: ['io'] })).fake;
+    const ioRun = await proveOnFake(t, io);
+    assert.equal(ioRun.result, 'blocked'); assert.match(ioRun.row.reason, /needs controller cpu, memory, pids/);
+});
+
+test('C1.proof-agrees-with-production-already-check', async () => {
+    // The observation predicates and production's own already-prepared
+    // decision agree on every fixture. Production runs on a copy, because
+    // its prepare verb repairs whatever it does not find settled.
+    const copyOf = (fake) => Object.assign(Object.create(Object.getPrototypeOf(fake)), structuredClone({ ...fake, hooks: {} }));
+    const fixtures = {
+        full: async () => (await productionBox()).fake,
+        partial: async () => (await productionBox({ available: ['io', 'memory', 'pids'] })).fake,
+        unprepared: async () => unpreparedFake(),
+        drifted: driftedFake,
+        rootOwnedDelegation: async () => { const fake = (await productionBox()).fake; fake.groups.get('/ploinky').fileUids['cgroup.procs'] = 0; return fake; },
+        emptySubtree: async () => { const fake = (await productionBox()).fake; fake.groups.get('/ploinky').subtree.clear(); return fake; },
+    };
+    for (const [name, build] of Object.entries(fixtures)) {
+        const fake = await build();
+        let observed = true;
+        try { assertCoreLayout(observeLayout(observerFs(fake))); } catch { observed = false; }
+        const copy = copyOf(fake);
+        const production = await prepareCgroupDelegation({ argv: ['prepare'], getuid: () => 0, fsApi: copy, sleep: async () => {} });
+        assert.equal(observed, production.result.already === true, name);
+        assert.equal(['full', 'partial'].includes(name), observed, name);
+    }
 });

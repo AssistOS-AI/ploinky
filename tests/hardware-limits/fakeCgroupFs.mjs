@@ -180,12 +180,12 @@ export class FakeCgroupFs {
         const group = this.groups.get(located.rel);
         if (!group) throw errno('ENOENT', target);
         if (!located.file) {
-            return { uid: group.uid, isDirectory: () => true, isFile: () => false, isSymbolicLink: () => false };
+            return { uid: group.uid, mode: 0o40755, isDirectory: () => true, isFile: () => false, isSymbolicLink: () => false };
         }
         const known = Object.hasOwn(group.fileUids, located.file) || located.file === 'cgroup.controllers' || group.values.has(located.file);
         if (!known) throw errno('ENOENT', target);
         const uid = Object.hasOwn(group.fileUids, located.file) ? group.fileUids[located.file] : group.uid;
-        return { uid, isDirectory: () => false, isFile: () => true, isSymbolicLink: () => false };
+        return { uid, mode: 0o100644, isDirectory: () => false, isFile: () => true, isSymbolicLink: () => false };
     }
 
     chownSync(target, uid) {
