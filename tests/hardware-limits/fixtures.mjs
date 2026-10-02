@@ -353,6 +353,9 @@ export function buildRequiredCaseManifest() {
             'C1.proof-wrong-delegation-fails-unchanged', 'C1.proof-full-controllers-pass-unchanged',
             'C1.proof-partial-controllers-pass-unchanged', 'C1.zero-agents-blocked-unchanged',
             'C1.empty-claim-with-available-controllers-fails-unchanged', 'C1.proof-agrees-with-production-already-check',
+            'C1.layout-parent-delegation-files-rejected', 'C1.layout-parent-directory-mode-and-group-rejected',
+            'C1.proof-parent-delegation-fails-unchanged', 'C1.proof-broken-delegation-with-missing-controller-fails-unchanged',
+            'C1.proof-valid-partial-host-blocked-unchanged',
         ]),
         ...leaves(P, 'p1', unit('hardwareLimitsLiveProvision.test.mjs'), [
             'L1.provision-mac-c1-c2-success', 'L1.provision-apparatus-a1-staged-success',

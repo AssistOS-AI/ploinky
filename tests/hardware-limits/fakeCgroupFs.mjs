@@ -1,8 +1,11 @@
 // In-memory cgroup v2 hierarchy for the offline preparation and delegation
 // tests. It models only what the production code touches: cgroup.procs moves,
 // per-directory controllers/subtree_control with the no-internal-process rule,
-// ownership of directories and delegation files, /proc/*/cgroup placement and
-// the mountinfo line for the cgroup root. Every mutation is logged.
+// ownership and permission bits of directories and delegation files,
+// /proc/*/cgroup placement and the mountinfo line for the cgroup root. Every
+// mutation is logged. Groups default to mode 0755 and files to 0644, with the
+// group id equal to the owner; tests may set `mode`, `gid`, `fileModes` and
+// `fileGids` to model a host that delegated them differently.
 
 import path from 'node:path';
 
@@ -52,7 +55,11 @@ export class FakeCgroupFs {
         if (rel !== '/' && !parent) throw errno('ENOENT', rel);
         const group = {
             uid,
+            gid: null,
+            mode: 0o755,
             fileUids: Object.fromEntries(DELEGATION_FILES.map((name) => [name, uid])),
+            fileGids: {},
+            fileModes: {},
             available: new Set(available ?? (parent ? [...parent.subtree] : [])),
             subtree: new Set(),
             procs: new Set(),
@@ -70,7 +77,8 @@ export class FakeCgroupFs {
 
     snapshot() {
         return JSON.stringify([...this.groups.entries()].map(([rel, group]) => [rel, {
-            uid: group.uid, fileUids: group.fileUids, available: [...group.available].sort(),
+            uid: group.uid, gid: group.gid, mode: group.mode, fileUids: group.fileUids, fileGids: group.fileGids,
+            fileModes: group.fileModes, available: [...group.available].sort(),
             subtree: [...group.subtree].sort(), procs: [...group.procs].sort(), values: [...group.values.entries()],
         }]));
     }
@@ -180,12 +188,17 @@ export class FakeCgroupFs {
         const group = this.groups.get(located.rel);
         if (!group) throw errno('ENOENT', target);
         if (!located.file) {
-            return { uid: group.uid, mode: 0o40755, isDirectory: () => true, isFile: () => false, isSymbolicLink: () => false };
+            return {
+                uid: group.uid, gid: group.gid ?? group.uid, mode: 0o40000 | group.mode,
+                isDirectory: () => true, isFile: () => false, isSymbolicLink: () => false,
+            };
         }
         const known = Object.hasOwn(group.fileUids, located.file) || located.file === 'cgroup.controllers' || group.values.has(located.file);
         if (!known) throw errno('ENOENT', target);
         const uid = Object.hasOwn(group.fileUids, located.file) ? group.fileUids[located.file] : group.uid;
-        return { uid, mode: 0o100644, isDirectory: () => false, isFile: () => true, isSymbolicLink: () => false };
+        const gid = Object.hasOwn(group.fileGids, located.file) ? group.fileGids[located.file] : uid;
+        const mode = Object.hasOwn(group.fileModes, located.file) ? group.fileModes[located.file] : 0o644;
+        return { uid, gid, mode: 0o100000 | mode, isDirectory: () => false, isFile: () => true, isSymbolicLink: () => false };
     }
 
     chownSync(target, uid) {

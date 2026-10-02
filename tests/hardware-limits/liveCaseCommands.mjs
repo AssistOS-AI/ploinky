@@ -47,6 +47,8 @@ const names=['memory.max','memory.swap.max','memory.current','memory.swap.curren
 process.stdout.write(JSON.stringify({...Object.fromEntries(names.map(n=>[n,fs.readFileSync(p+'/'+n,'utf8')])),identity:{dev:String(st.dev),ino:String(st.ino)}}));`;
 
 const OWNER_WRITE = 0o200;
+const OWNER_SEARCH = 0o100;
+const PARENT_FILES = Object.freeze(['cgroup.subtree_control', 'cgroup.procs']);
 const AGGREGATE = Object.freeze({
     memory: ['memory.max', (value) => value === 'max'],
     pids: ['pids.max', (value) => value === 'max'],
@@ -80,11 +82,16 @@ function prerequisite(message) {
  * cgroup2 mounted rw with nsdelegate, PID 1 and the observer in /ploinky/core,
  * empty root and /ploinky process lists, exact delegated owner, group and
  * mode, and every required controller enabled at /, /ploinky and both parents.
+ * Each parent is what uid 1000 needs for admission: a 1000:1000 directory it
+ * can write and search (to create agent children), and its own
+ * cgroup.subtree_control and cgroup.procs owned by 1000 and owner-writable.
  *
  * The required controllers are a kernel fact, never a production claim: the
  * wanted controllers the root's cgroup.controllers offers. A controller the
- * root does not offer is recorded as missing; when the fixture's limits need
- * it, the proof is BLOCKED rather than passed or failed.
+ * root does not offer is recorded as missing. Delegation of every offered
+ * controller is checked first, so broken delegation fails; only a host whose
+ * offered controllers are correctly delegated but which lacks one the
+ * fixture's limits need is BLOCKED rather than passed or failed.
  */
 export function assertCoreLayout(value, { fixtureControllers = [] } = {}) {
     if (!Array.isArray(fixtureControllers) || fixtureControllers.some((controller) => !WANTED_CONTROLLERS.includes(controller))) {
@@ -113,11 +120,27 @@ export function assertCoreLayout(value, { fixtureControllers = [] } = {}) {
         if (target.uid !== DELEGATED_UID) throw new Error(`Delegated cgroup ownership mismatch: ${label} is owned by uid ${target.uid}`);
         delegated.push([label, target]);
     }
+    const parentFiles = [];
     for (const suffix of ['/ploinky/agents', '/ploinky/system']) {
         if (entries[suffix].uid !== DELEGATED_UID) throw new Error(`Delegated cgroup ownership mismatch: ${suffix} is owned by uid ${entries[suffix].uid}`);
+        for (const name of PARENT_FILES) {
+            const file = observedFile(entries[suffix], suffix, name);
+            if (file.uid !== DELEGATED_UID) throw new Error(`Delegated cgroup ownership mismatch: ${suffix}/${name} is owned by uid ${file.uid}`);
+            parentFiles.push([`${suffix}/${name}`, file]);
+        }
     }
     for (const [label, target] of delegated) {
         if (target.gid !== DELEGATED_GID) throw new Error(`Delegated cgroup group mismatch: ${label} has gid ${target.gid}`);
+        if (!Number.isSafeInteger(target.mode) || (target.mode & OWNER_WRITE) === 0) throw new Error(`Delegated cgroup mode is not owner-writable: ${label}`);
+    }
+    for (const suffix of ['/ploinky/agents', '/ploinky/system']) {
+        const parent = entries[suffix];
+        if (parent.gid !== DELEGATED_GID) throw new Error(`Delegated cgroup group mismatch: ${suffix} has gid ${parent.gid}`);
+        if (!Number.isSafeInteger(parent.mode) || (parent.mode & (OWNER_WRITE | OWNER_SEARCH)) !== (OWNER_WRITE | OWNER_SEARCH)) {
+            throw new Error(`Delegated cgroup parent is not owner-writable and searchable: ${suffix}`);
+        }
+    }
+    for (const [label, target] of parentFiles) {
         if (!Number.isSafeInteger(target.mode) || (target.mode & OWNER_WRITE) === 0) throw new Error(`Delegated cgroup mode is not owner-writable: ${label}`);
     }
     for (const [suffix, entry] of Object.entries(entries)) {
@@ -130,8 +153,6 @@ export function assertCoreLayout(value, { fixtureControllers = [] } = {}) {
     const required = WANTED_CONTROLLERS.filter((controller) => rootAvailable.has(controller));
     const missing = WANTED_CONTROLLERS.filter((controller) => !rootAvailable.has(controller))
         .map((controller) => ({ controller, reason: 'not offered by the root cgroup.controllers' }));
-    const unavailable = fixtureControllers.filter((controller) => !rootAvailable.has(controller));
-    if (unavailable.length) throw prerequisite(`The fixture needs controller ${unavailable.join(', ')}, which the root cgroup does not offer`);
     // Required controllers are enabled at the root and /ploinky (root
     // preparation) and in both parents (ensureAgentCgroupParents).
     for (const suffix of ['/', '/ploinky', '/ploinky/agents', '/ploinky/system']) {
@@ -146,6 +167,10 @@ export function assertCoreLayout(value, { fixtureControllers = [] } = {}) {
             if (!accepted(observedFile(entries[suffix], suffix, name).value.trim())) throw new Error('Unexpected aggregate cgroup cap');
         }
     }
+    // Only now is a missing fixture controller a host limitation: every
+    // controller the root offers is delegated correctly.
+    const unavailable = fixtureControllers.filter((controller) => !rootAvailable.has(controller));
+    if (unavailable.length) throw prerequisite(`The fixture needs controller ${unavailable.join(', ')}, which the root cgroup does not offer`);
     return Object.freeze({ required: Object.freeze(required), missing: Object.freeze(missing) });
 }
 

@@ -445,11 +445,13 @@ function observerFs(fake) {
         const known = group && INTERFACE_FILES[located.file];
         return known && group.available.has(known[0]) ? { group, value: known[1] } : null;
     };
-    const stat = (uid, directory) => ({ uid, gid: uid, mode: directory ? 0o40755 : 0o100644, isDirectory: () => directory, isSymbolicLink: () => false });
+    // Owner, group and mode come from the hierarchy; interface files the
+    // fake does not track get the kernel's default mode.
+    const stat = ({ uid, gid = uid, mode }, directory) => ({ uid, gid, mode: mode ?? (directory ? 0o40755 : 0o100644), isDirectory: () => directory, isSymbolicLink: () => false });
     return {
         lstatSync(target) {
-            try { const value = fake.lstatSync(target); return stat(value.uid, value.isDirectory()); }
-            catch (error) { const file = error.code === 'ENOENT' && interfaceFile(target); if (!file) throw error; return stat(file.group.uid, false); }
+            try { const value = fake.lstatSync(target); return stat(value, value.isDirectory()); }
+            catch (error) { const file = error.code === 'ENOENT' && interfaceFile(target); if (!file) throw error; return stat({ uid: file.group.uid }, false); }
         },
         readFileSync(target) {
             try { return fake.readFileSync(target); }
@@ -627,9 +629,9 @@ function cgroupSnapshot(fake) {
         for (const name of ['cgroup.procs', 'cgroup.subtree_control', 'cgroup.threads', 'cgroup.controllers', ...[...group.values.keys()].sort()]) {
             const file = `${directory}/${name}`;
             const fileStat = fake.lstatSync(file);
-            files[name] = { content: fake.readFileSync(file), uid: fileStat.uid, mode: fileStat.mode };
+            files[name] = { content: fake.readFileSync(file), uid: fileStat.uid, gid: fileStat.gid, mode: fileStat.mode };
         }
-        groups[rel] = { uid: stat.uid, mode: stat.mode, files };
+        groups[rel] = { uid: stat.uid, gid: stat.gid, mode: stat.mode, files };
     }
     return JSON.stringify({ groups, pids: [...fake.pidGroup.entries()].sort(), writes: fake.writes, chowns: fake.chowns, mkdirs: fake.mkdirs });
 }
@@ -779,4 +781,103 @@ test('C1.proof-agrees-with-production-already-check', async () => {
         assert.equal(observed, production.result.already === true, name);
         assert.equal(['full', 'partial'].includes(name), observed, name);
     }
+});
+
+// --- C1 parent delegation (uid 1000 must be able to use both parents) -----
+
+const PARENTS = Object.freeze(['/ploinky/agents', '/ploinky/system']);
+const escape = (text) => text.replaceAll('/', '\\/').replaceAll('.', '\\.');
+
+test('C1.layout-parent-delegation-files-rejected', async () => {
+    for (const parent of PARENTS) {
+        for (const name of ['cgroup.subtree_control', 'cgroup.procs']) {
+            // Owned 0:0 with mode 0644: uid 1000 cannot write it.
+            const rootOwned = await productionBox();
+            Object.assign(rootOwned.layout.paths[parent].files[name], { uid: 0, gid: 0, mode: 0o644 });
+            rejects(rootOwned, new RegExp(`Delegated cgroup ownership mismatch: ${escape(`${parent}/${name}`)} is owned by uid 0$`));
+            // Owned by 1000 but not owner-writable.
+            const readOnly = await productionBox();
+            readOnly.layout.paths[parent].files[name].mode = 0o444;
+            rejects(readOnly, new RegExp(`Delegated cgroup mode is not owner-writable: ${escape(`${parent}/${name}`)}$`));
+            const absent = await productionBox();
+            absent.layout.paths[parent].files[name] = { present: false };
+            rejects(absent, new RegExp(`Missing cgroup evidence for ${escape(`${parent}/${name}`)}$`));
+        }
+    }
+});
+
+test('C1.layout-parent-directory-mode-and-group-rejected', async () => {
+    for (const parent of PARENTS) {
+        // 0555 cannot create children; 0600 cannot be searched.
+        for (const mode of [0o555, 0o600, 0o455]) {
+            const box = await productionBox();
+            box.layout.paths[parent].mode = mode;
+            rejects(box, new RegExp(`Delegated cgroup parent is not owner-writable and searchable: ${escape(parent)}$`));
+        }
+        const group = await productionBox();
+        group.layout.paths[parent].gid = 0;
+        rejects(group, new RegExp(`Delegated cgroup group mismatch: ${escape(parent)} has gid 0$`));
+        const owner = await productionBox();
+        owner.layout.paths[parent].uid = 0;
+        rejects(owner, new RegExp(`Delegated cgroup ownership mismatch: ${escape(parent)} is owned by uid 0$`));
+    }
+    // Production's own parents (created by uid 1000, mode 0755) pass.
+    const box = await productionBox();
+    for (const parent of PARENTS) assert.deepEqual([box.layout.paths[parent].uid, box.layout.paths[parent].gid, box.layout.paths[parent].mode], [1000, 1000, 0o755]);
+    assert.doesNotThrow(() => assertCoreLayout(box.layout, { fixtureControllers: ['cpu', 'memory', 'pids'] }));
+});
+
+test('C1.proof-parent-delegation-fails-unchanged', async t => {
+    for (const [corrupt, pattern] of [
+        // The reviewer's two accepted states.
+        [(fake) => { const group = fake.groups.get('/ploinky/agents'); group.fileUids['cgroup.subtree_control'] = 0; group.fileGids['cgroup.subtree_control'] = 0; group.fileModes['cgroup.subtree_control'] = 0o644; },
+            /^Delegated cgroup ownership mismatch: \/ploinky\/agents\/cgroup\.subtree_control is owned by uid 0$/],
+        [(fake) => { fake.groups.get('/ploinky/agents').mode = 0o555; }, /^Delegated cgroup parent is not owner-writable and searchable: \/ploinky\/agents$/],
+        [(fake) => { fake.groups.get('/ploinky/system').mode = 0o555; }, /^Delegated cgroup parent is not owner-writable and searchable: \/ploinky\/system$/],
+        [(fake) => { fake.groups.get('/ploinky/system').fileUids['cgroup.procs'] = 0; }, /^Delegated cgroup ownership mismatch: \/ploinky\/system\/cgroup\.procs is owned by uid 0$/],
+        [(fake) => { fake.groups.get('/ploinky/system').fileModes['cgroup.subtree_control'] = 0o444; }, /^Delegated cgroup mode is not owner-writable: \/ploinky\/system\/cgroup\.subtree_control$/],
+        [(fake) => { fake.groups.get('/ploinky/agents').gid = 0; }, /^Delegated cgroup group mismatch: \/ploinky\/agents has gid 0$/],
+    ]) {
+        const fake = (await productionBox()).fake; corrupt(fake);
+        const c1 = await proveOnFake(t, fake);
+        assert.equal(c1.result, 'fail', String(pattern)); assert.match(c1.row.reason, pattern);
+        assertEvidencePersisted(c1, fake);
+    }
+});
+
+// --- C1 classification order: delegation before missing controllers -------
+
+test('C1.proof-broken-delegation-with-missing-controller-fails-unchanged', async t => {
+    // The root offers memory and pids only, and /ploinky delegates nothing:
+    // broken delegation of the offered controllers fails C1 even though the
+    // fixture also needs cpu, which this host cannot provide.
+    for (const broken of [['/ploinky'], ['/ploinky/agents'], ['/', '/ploinky', '/ploinky/agents', '/ploinky/system']]) {
+        const fake = (await productionBox({ available: ['io', 'memory', 'pids'] })).fake;
+        for (const rel of broken) fake.groups.get(rel).subtree.clear();
+        const layout = observeLayout(observerFs(fake));
+        assert.throws(() => assertCoreLayout(layout, { fixtureControllers: ['cpu', 'memory', 'pids'] }),
+            (error) => error.code !== 'LIVE_PREREQUISITE_MISSING' && /^Required controller memory is not enabled in /.test(error.message));
+        const c1 = await proveOnFake(t, fake);
+        assert.equal(c1.result, 'fail', broken.join(','));
+        assert.match(c1.row.reason, new RegExp(`^Required controller memory is not enabled in ${escape(broken[0])}$`));
+        assertEvidencePersisted(c1, fake);
+    }
+    // Broken parent ownership on such a host fails too, before the BLOCKED prerequisite.
+    const owned = (await productionBox({ available: ['io', 'memory', 'pids'] })).fake;
+    owned.groups.get('/ploinky/agents').mode = 0o555;
+    const ownedRun = await proveOnFake(t, owned);
+    assert.equal(ownedRun.result, 'fail'); assert.match(ownedRun.row.reason, /not owner-writable and searchable: \/ploinky\/agents$/);
+});
+
+test('C1.proof-valid-partial-host-blocked-unchanged', async t => {
+    // The same host with correct delegation of memory and pids cannot support
+    // a fixture that limits cpu: BLOCKED, with the observation retained.
+    const fake = (await productionBox({ available: ['io', 'memory', 'pids'] })).fake;
+    const layout = observeLayout(observerFs(fake));
+    assert.throws(() => assertCoreLayout(layout, { fixtureControllers: ['cpu', 'memory', 'pids'] }),
+        (error) => error.code === 'LIVE_PREREQUISITE_MISSING' && error.message === 'The fixture needs controller cpu, which the root cgroup does not offer');
+    assert.deepEqual([...assertCoreLayout(layout, { fixtureControllers: ['memory', 'pids'] }).required], ['memory', 'pids']);
+    const c1 = await proveOnFake(t, fake);
+    assert.equal(c1.result, 'blocked'); assert.match(c1.row.reason, /needs controller cpu/);
+    assertEvidencePersisted(c1, fake);
 });
