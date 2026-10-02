@@ -261,7 +261,13 @@ export function buildRequiredCaseManifest() {
         ...leaves(P, 's0', unit('hardwareLimitsEngineGuard.test.mjs'), [
             'EG.shell-option-clusters-and-script-forms-are-refused', 'EG.wrapper-operands-are-analysed-as-invocations',
             'EG.absolute-guarded-paths-are-refused-wherever-they-appear', 'EG.option-forms-shell-string-and-fork-exec-path',
-            'EG.login-shells-are-refused-with-a-guarded-word-and-run-otherwise', 'EG.environment-resets-and-explicit-environments-are-refused',
+            'EG.login-shells-are-refused-outright', 'EG.environment-resets-and-explicit-environments-are-refused',
+            'EG.a-fake-on-the-callers-path-grants-nothing-when-the-invocation-replaces-the-path',
+            'EG.unlisted-wrappers-launchers-and-embedded-shells-are-analysed',
+            'EG.the-seatbelt-and-bwrap-shapes-the-guard-analyses-are-the-production-shapes',
+            'EG.system-binaries-are-not-refused-by-a-number-rounded-inode',
+            'EG.a-node-child-is-guarded-through-the-inherited-environment-and-after-env-i',
+            'EG.an-eval-worker-with-module-syntax-is-guarded',
             'EG.hidden-names-reach-the-path-stubs-through-every-environment-rewrite',
             'EG.descendants-and-worker-threads-are-guarded-through-an-explicit-environment',
             'EG.a-violating-child-killed-by-a-signal-still-fails-the-top-level-suite',
@@ -273,6 +279,9 @@ export function buildRequiredCaseManifest() {
             'A.manifest-memory', 'A.catalog-cpu', 'A.profile-pids', 'A.lite-enabled-absent', 'A.lite-enabled-false',
             'A.outside-box-unchanged', 'A.unlimited-unchanged', 'A.helper-exempt', 'A.d4-limited-refused',
             'A.d4-unlimited-baseline', 'A.stored-gpu-refused', 'A.stored-cpus-above-envelope-refused',
+            'A.declared-cpus-with-an-unknown-envelope-is-refused-as-envelope-unknown',
+            'A.declared-cpus-envelope-decision-is-part-of-that-agents-own-fingerprint',
+            'A.an-envelope-change-across-a-declared-cpus-value-makes-the-admission-stale',
             'A.stored-envelope-unknown', 'A.stored-combined-lists-stored-values',
         ]),
         ...leaves(P, 'p0', unit('hardwareLimitsDeclaration.test.mjs'), [
@@ -314,7 +323,7 @@ export function buildRequiredCaseManifest() {
         ...leaves(P, 'p0', unit('containerMonitorAdmission.test.mjs'), [
             'MON.refused-terminal', 'MON.blocked-terminal', 'MON.unchanged-no-retry', 'MON.repair-fingerprint',
         ]),
-        ...leaves(P, 'p0', unit('containerMonitorRetryIdentity.test.mjs'), ['MON.unrelated-write-no-rearm']),
+        ...leaves(P, 'p0', unit('containerMonitorRetryIdentity.test.mjs'), ['MON.unrelated-write-no-rearm', 'a failed restart releases the launching MPS owner of its result']),
         ...leaves(P, 'p0', unit('marketplaceEnableWorker.test.mjs'), [
             'E.cli-cause', 'E.marketplace-outbound', 'E.marketplace-inbound', 'E.bounded-secret-free',
             'E.max-ref-roundtrip', 'E.long-key-roundtrip',
@@ -371,6 +380,7 @@ export function buildRequiredCaseManifest() {
             'C1.proof-valid-partial-host-blocked-unchanged',
             'C1.layout-root-interface-files-owned-by-the-box-runtime-uid-pass', 'C1.layout-root-delegation-file-owned-by-1000-rejected',
             'C1.layout-root-interface-file-owned-by-another-uid-rejected', 'C1.layout-core-file-owned-by-1000-rejected',
+            'C1.layout-core-interface-files-owned-by-1000-rejected', 'C1.layout-absent-delegation-files-rejected',
             'HLIVE.A1-oom-counter-moving-only-after-the-allocation-exits-passes',
             'HLIVE.A1-oom-counter-never-moving-fails-with-the-same-message',
             'HLIVE.A1-leaf-vanishing-after-exit-is-a-distinct-recorded-failure',
@@ -528,6 +538,7 @@ export function buildRequiredCaseManifest() {
             'MI.unprovable-peer-identity-fails-closed-with-every-outcome',
             'MI.graph-launch-failure-then-lifecycle-retry-recreates-only-the-failed-client',
             'MI.two-refused-peers-keep-the-stopped-peers-outcome-when-the-second-is-unprovable',
+            'MI.a-repeated-apply-keeps-the-stopped-refused-peers-outcome-and-pending-entry',
             'MI.daemon-level-error-while-recreating-a-peer-is-not-the-targets-refusal', 'MI.a-still-refused-peer-is-reported-again-without-a-second-stop',
             'MI.recorded-peer-stop-failure-and-still-running-after-stop-fail-closed-with-outcomes',
             'MI.refused-peer-outcome-survives-a-cancellation-after-its-drain',
@@ -543,6 +554,7 @@ export function buildRequiredCaseManifest() {
             'MC.disabled-journaled-client-absent-completes-present-refuses', 'MC.graph-keeps-candidate-entry-until-its-removal-is-proven',
             'MC.shareless-nowait-target-survives-a-concurrent-apply-watchdog-and-graph', 'MC.shareless-target-owner-is-released-when-the-launch-fails',
             'MC.shareless-crashed-launcher-leftover-is-still-settled', 'MC.owner-in-a-worker-thread-of-this-process-is-live-for-every-thread',
+            'MC.a-released-owner-of-a-worker-thread-is-gone-for-every-thread',
             'MC.owner-with-this-pid-and-another-token-is-gone-only-when-the-start-time-differs', 'MC.owner-whose-pid-was-reused-is-gone-by-start-time',
         ]),
         ...leaves(P, 'p4', unit('containerMonitorMpsGeneration.test.mjs'), [
