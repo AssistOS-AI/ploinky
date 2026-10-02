@@ -1,5 +1,6 @@
 import fs from 'fs';
 import { readMpsStatus } from '../sandbox/hardwareLimits/mpsStatus.mjs';
+import { releaseMpsRuntimeOwner } from '../sandbox/hardwareLimits/mpsLifecycle.mjs';
 import { readAppliedObservation } from '../sandbox/hardwareLimits/runtimeState.mjs';
 import { resolveAgentRepositoryPath } from '../utils/agentRepositorySource.mjs';
 import crypto from 'node:crypto';
@@ -1945,6 +1946,10 @@ export async function performContainerRestart(monitor, target, reason, attempt =
         // A retained transaction has already handled its exact abort/cleanup.
         // Its failure must not be processed again as a newly launched result.
         const failedResult = retryingPreparation ? null : result || error?.ploinkyRestartCandidate || null;
+        // The launching operation is over: a GPU share or share-less readiness
+        // owner must not stay live in this process (the failure counterpart of
+        // acknowledging readiness).
+        releaseMpsRuntimeOwner(failedResult);
         const expectedRegistryRecord = registryCandidateCommitted
             ? failedResult?.registryRecord || null
             : preActivationRegistryRecord(failedResult, attempt);

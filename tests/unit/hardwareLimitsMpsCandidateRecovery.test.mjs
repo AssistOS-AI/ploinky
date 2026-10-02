@@ -7,7 +7,7 @@ import { writeAppliedObservation, readAppliedObservation } from '../../cli/sandb
 import { randomUUID } from 'node:crypto';
 import { Worker } from 'node:worker_threads';
 import { coordinateMpsLifecycle, trackMpsRuntimePending, acknowledgeMpsRuntimeReady, releaseMpsRuntimeOwner } from '../../cli/sandbox/hardwareLimits/mpsLifecycle.mjs';
-import { mpsOwnerState, mpsLaunchOwner, releaseMpsLaunchOwner } from '../../cli/sandbox/hardwareLimits/mpsInventory.mjs';
+import { mpsOwnerState, mpsLaunchOwner, releaseMpsLaunchOwner, settleCreatedMpsCandidate } from '../../cli/sandbox/hardwareLimits/mpsInventory.mjs';
 import { prepareMpsGraph } from '../../cli/sandbox/hardwareLimits/mpsGraph.mjs';
 import { MpsError } from '../../cli/sandbox/hardwareLimits/mpsEligibility.mjs';
 
@@ -373,6 +373,32 @@ test('MC.owner-in-a-worker-thread-of-this-process-is-live-for-every-thread', asy
         assert.equal(message.owner.pid, process.pid, 'same PID as this thread');
         assert.equal(message.selfView, 'live', 'the owning thread sees its operation live');
         assert.equal(mpsOwnerState(message.owner), 'live', 'another thread of the process never judges it gone');
+    } finally { worker.postMessage('done'); await worker.terminate(); }
+});
+
+// The release of a worker thread's operation reaches every other thread of the
+// process: a candidate whose container remains (a failed cleanup) is in flight
+// only while its launching operation runs, not for the process's lifetime.
+test('MC.a-released-owner-of-a-worker-thread-is-gone-for-every-thread', async () => {
+    const worker = new Worker(new URL('../helpers/mpsOwnerReleaseWorker.mjs', import.meta.url));
+    const next = (type) => new Promise((resolve, reject) => {
+        const onMessage = (message) => { if (message.type === type) { worker.off('message', onMessage); resolve(message); } };
+        worker.on('message', onMessage); worker.once('error', reject);
+    });
+    try {
+        const created = await next('created');
+        const owner = created.owner;
+        const candidate = { key: 'z', ref: 'demo/z', alias: '', instanceId: 'i-z', enableGeneration: 'g-z', containerId: 'f'.repeat(64), owner };
+        const settle = () => settleCreatedMpsCandidate(candidate, { inspect: () => ({ state: 'exact', id: candidate.containerId }), remove: () => ({ state: 'removed' }) });
+        assert.equal(created.selfView, 'live');
+        assert.equal(mpsOwnerState(owner), 'live', 'running in the worker: live for this thread');
+        assert.equal(settle(), 'in-flight', 'a coordination here must not settle a candidate that is still launching');
+        const released = next('released');
+        worker.postMessage('release');
+        assert.equal((await released).selfView, 'gone');
+        assert.equal(mpsOwnerState(owner), 'gone', 'released in the worker: gone for this thread too');
+        assert.equal(settle(), 'removed', 'the remaining candidate is settled instead of blocking for the process lifetime');
+        assert.equal(mpsOwnerState({ ...owner, operationId: randomUUID() }), 'live', 'an owner this process never recorded as released proves nothing');
     } finally { worker.postMessage('done'); await worker.terminate(); }
 });
 

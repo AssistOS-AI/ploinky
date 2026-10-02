@@ -1,6 +1,9 @@
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
+import { isMainThread } from 'node:worker_threads';
 import { createNetworkLifecycleAdapter } from '../networkLifecycle.js';
 import { networkContractHash } from '../networkContract.js';
 import { effectiveInstanceKey } from '../../utils/workspaceDependencyGraph.js';
@@ -76,6 +79,31 @@ const PROCESS_TOKEN = randomUUID();
 const liveOperations = new Set();
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
+/*
+ * Every thread of a process has its own module instance (the Router runs Apply
+ * and Marketplace enable in worker threads), so `liveOperations` is invisible
+ * to the other threads. Each operation therefore also records its state in one
+ * private file of a per-process directory, which every thread reads: 'live'
+ * while it runs, 'released' once it ended. A thread that finds no file proves
+ * nothing and treats the owner as live; only an explicit release is gone.
+ */
+const SHARED_OWNER_DIRECTORY = path.join(os.tmpdir(), `ploinky-mps-owners-${process.pid}`);
+function writeSharedOperation(operationId, state, { directory = SHARED_OWNER_DIRECTORY, fsApi = fs } = {}) {
+    try {
+        fsApi.mkdirSync(directory, { recursive: true, mode: 0o700 });
+        fsApi.writeFileSync(path.join(directory, operationId), state, { mode: 0o600 });
+    } catch (_) { /* unwritable: the other threads keep treating the owner as live */ }
+}
+function sharedOperationReleased(operationId, { directory = SHARED_OWNER_DIRECTORY, fsApi = fs } = {}) {
+    try { return String(fsApi.readFileSync(path.join(directory, operationId), 'utf8')) === 'released'; } catch (_) { return false; }
+}
+// One main thread owns the directory: it removes a leftover of an earlier
+// incarnation of this PID at load and its own at exit.
+if (isMainThread) {
+    try { fs.rmSync(SHARED_OWNER_DIRECTORY, { recursive: true, force: true }); } catch (_) {}
+    process.once('exit', () => { try { fs.rmSync(SHARED_OWNER_DIRECTORY, { recursive: true, force: true }); } catch (_) {} });
+}
+
 export function readProcessStartTime(pid, { fsApi = fs } = {}) {
     try {
         const text = String(fsApi.readFileSync(`/proc/${pid}/stat`, 'utf8'));
@@ -88,12 +116,17 @@ export function readProcessStartTime(pid, { fsApi = fs } = {}) {
 export function mpsLaunchOwner({ readStartTime = readProcessStartTime } = {}) {
     const operationId = randomUUID();
     liveOperations.add(operationId);
+    writeSharedOperation(operationId, 'live');
     return { pid: process.pid, startTime: readStartTime(process.pid), processToken: PROCESS_TOKEN, operationId };
 }
 
 /** The launch operation finished (acknowledged, failed or settled). */
 export function releaseMpsLaunchOwner(owner) {
-    if (owner && owner.processToken === PROCESS_TOKEN) liveOperations.delete(owner.operationId);
+    if (owner && owner.processToken === PROCESS_TOKEN) {
+        liveOperations.delete(owner.operationId);
+        // Visible to the other threads of this process.
+        if (UUID.test(String(owner.operationId))) writeSharedOperation(owner.operationId, 'released');
+    }
 }
 
 /**
@@ -111,9 +144,11 @@ export function mpsOwnerState(owner, { kill = (pid) => process.kill(pid, 0), rea
         // enable in worker threads, each with its own module instance and
         // token, so its live operation is unknown here) or an earlier
         // incarnation of the PID. Only a different process start time proves
-        // the latter; anything unprovable is live.
+        // the latter, or the operation's own recorded release (shared through
+        // the per-process directory); anything unprovable is live.
         const own = owner.startTime ? readStartTime(process.pid) : null;
-        return owner.startTime && own && own !== owner.startTime ? 'gone' : 'live';
+        if (owner.startTime && own && own !== owner.startTime) return 'gone';
+        return sharedOperationReleased(owner.operationId) ? 'gone' : 'live';
     }
     try { kill(owner.pid); } catch (error) { if (error?.code === 'ESRCH') return 'gone'; }
     const current = owner.startTime ? readStartTime(owner.pid) : null;

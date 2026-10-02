@@ -318,6 +318,25 @@ test('successive failed replacements reach the circuit breaker instead of resett
     assert.equal(state.physical.size, 0);
 });
 
+// The failure counterpart of acknowledging readiness: a failed restart ends its
+// launching operation, so its GPU share (or share-less readiness) owner must not
+// stay live in the Router process for as long as it runs.
+test('a failed restart releases the launching MPS owner of its result', async t => {
+    const { mpsLaunchOwner, mpsOwnerState } = await import('../../cli/sandbox/hardwareLimits/mpsInventory.mjs');
+    const { state, monitor, target } = fixture(t);
+    const owner = mpsLaunchOwner();
+    const ensure = monitor.ensureAgentService;
+    monitor.ensureAgentService = (...args) => {
+        const result = ensure(...args);
+        result.mpsReadiness = { shareless: true, client: { owner } };
+        return result;
+    };
+    assert.equal(mpsOwnerState(owner), 'live');
+    await assert.rejects(performContainerRestart(monitor, target, 'not_running', attemptFor(target)), /readiness script failed/);
+    assert.ok(state.result.mpsReadiness, 'the launch result carried its owner');
+    assert.equal(mpsOwnerState(owner), 'gone', 'the failed restart released its launching operation');
+});
+
 test('failed additive replacement retains its authorized predecessor without retiring it', async t => {
     const { state, monitor, target, originalName, originalRecord } = fixture(t, { additive: true });
     seedBudget(target);
