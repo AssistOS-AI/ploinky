@@ -202,3 +202,127 @@ for (const deps of [false, true]) {
         }
     });
 }
+
+// A manifest volume whose container target is below /code, as webAssist
+// declares for its debuglogs directory, needs the same mount point.
+test('a webAssist-like /code volume gets a mount point in a read-only /code', () => {
+    const layout = fixture('bwrap-code-volume-', { deps: false });
+    try {
+        const moduleUrl = new URL('../../cli/sandbox/bwrap/bwrapServiceManager.js', import.meta.url).href;
+        const script = `
+            const { buildBwrapArgs } = await import(${JSON.stringify(moduleUrl)});
+            process.stdout.write(JSON.stringify(buildBwrapArgs(JSON.parse(process.env.BWRAP_TEST_OPTIONS))));
+        `;
+        const options = {
+            workspaceRoot: layout.root,
+            agentCodePath: layout.agentCodePath,
+            agentLibGrant: grantFor(layout.root),
+            agentLibPath: layout.agentLibPath,
+            nodeModulesDir: layout.nodeModulesDir,
+            sharedDir: layout.sharedDir,
+            cwd: layout.root,
+            cwdMountTarget: '/root',
+            agentHomeDir: layout.agentHomeDir,
+            skillsPath: null,
+            envMap: {},
+            codeReadOnly: true,
+            skillsReadOnly: true,
+            // Relative to the workspace root, exactly as the manifest writes it.
+            volumes: { '.data/webAssist/debuglogs': '/code/debuglogs', '.data/webAssist/nested': '/code/a/b/c/' },
+        };
+        const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+            cwd: layout.root,
+            env: { ...process.env, PLOINKY_WORKSPACE_ROOT: layout.root, BWRAP_TEST_OPTIONS: JSON.stringify(options) },
+            encoding: 'utf8',
+        });
+        assert.equal(result.status, 0, result.stderr);
+        const all = mounts(JSON.parse(result.stdout));
+        const code = all.find(mount => mount.target === '/code');
+        for (const [rel, host] of [['debuglogs', 'debuglogs'], ['a/b/c', 'nested']]) {
+            const mountPoint = path.join(layout.agentCodePath, rel);
+            assert.deepEqual([fs.lstatSync(mountPoint).isDirectory(), fs.readdirSync(mountPoint)], [true, []], rel);
+            const volume = all.find(mount => mount.target === `/code/${rel}`);
+            assert.deepEqual([volume.readOnly, volume.source], [false, path.join(layout.root, '.data', 'webAssist', host)]);
+            assert.ok(volume.index > code.index, 'the volume bind follows the read-only /code bind');
+        }
+    } finally {
+        fs.rmSync(layout.root, { recursive: true, force: true });
+    }
+});
+
+test('a /code volume refuses a symlink or file at any component and leaves it in place', () => {
+    const layout = fixture('bwrap-code-volume-refuse-');
+    try {
+        const outside = path.join(layout.root, 'outside');
+        fs.mkdirSync(outside);
+        fs.symlinkSync(outside, path.join(layout.agentCodePath, 'linked'), 'dir');
+        fs.writeFileSync(path.join(layout.agentCodePath, 'plain-file'), 'file');
+        const volume = path.join(layout.root, 'volume-data');
+        fs.mkdirSync(volume);
+        for (const target of ['/code/linked/inside', '/code/linked', '/code/plain-file', '/code/plain-file/inside']) {
+            assert.throws(() => argsFor(layout, { volumes: { [volume]: target } }), /is not a directory/, target);
+        }
+        assert.equal(fs.lstatSync(path.join(layout.agentCodePath, 'linked')).isSymbolicLink(), true);
+        assert.deepEqual(fs.readdirSync(outside), [], 'nothing is created through the symlink');
+        assert.equal(fs.readFileSync(path.join(layout.agentCodePath, 'plain-file'), 'utf8'), 'file');
+    } finally {
+        fs.rmSync(layout.root, { recursive: true, force: true });
+    }
+});
+
+test('a /code volume may not target the reserved dependency mount, even through normalization', () => {
+    const layout = fixture('bwrap-code-volume-reserved-');
+    try {
+        const volume = path.join(layout.root, 'volume-data');
+        fs.mkdirSync(volume);
+        for (const target of ['/code/node_modules', '/code/node_modules/', '/code/node_modules/pkg', '/code/a/../node_modules/x']) {
+            for (const codeReadOnly of [true, false]) {
+                assert.throws(() => argsFor(layout, { codeReadOnly, volumes: { [volume]: target } }),
+                    /reserved \/code\/node_modules/, `${target} codeReadOnly=${codeReadOnly}`);
+            }
+        }
+        // Names that merely start with the same letters are ordinary targets.
+        argsFor(layout, { volumes: { [volume]: '/code/node_modules_cache' } });
+        assert.equal(fs.lstatSync(path.join(layout.agentCodePath, 'node_modules_cache')).isDirectory(), true);
+    } finally {
+        fs.rmSync(layout.root, { recursive: true, force: true });
+    }
+});
+
+test('a writable /code leaves the tree alone for /code volumes too', () => {
+    const layout = fixture('bwrap-code-volume-rw-');
+    try {
+        const volume = path.join(layout.root, 'volume-data');
+        fs.mkdirSync(volume);
+        argsFor(layout, { codeReadOnly: false, volumes: { [volume]: '/code/debuglogs' } });
+        assert.equal(fs.existsSync(path.join(layout.agentCodePath, 'debuglogs')), false);
+    } finally {
+        fs.rmSync(layout.root, { recursive: true, force: true });
+    }
+});
+
+test('real bwrap starts with a /code volume whose mount point was absent', { skip: !hasUsableBwrap() }, () => {
+    const layout = fixture('bwrap-code-volume-live-');
+    try {
+        const volume = path.join(layout.root, 'workspace-data', 'debuglogs');
+        fs.mkdirSync(volume, { recursive: true });
+        fs.writeFileSync(path.join(volume, 'volume-sentinel'), 'volume');
+        const args = argsFor(layout, { volumes: { [volume]: '/code/debuglogs' } });
+        const probe = [
+            'set -eu',
+            'test "$(cat /code/debuglogs/volume-sentinel)" = volume',
+            'touch /code/debuglogs/written',
+            'if touch /code/escaped 2>/dev/null; then exit 81; fi',
+            'if touch /code/other-dir 2>/dev/null; then exit 82; fi',
+            'echo BWRAP_CODE_VOLUME_OK',
+        ].join('; ');
+        const result = spawnSync('bwrap', [...args, '/bin/sh', '-c', probe], { encoding: 'utf8' });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        assert.match(result.stdout, /BWRAP_CODE_VOLUME_OK/);
+        assert.equal(fs.existsSync(path.join(volume, 'written')), true);
+        assert.equal(fs.existsSync(path.join(layout.agentCodePath, 'escaped')), false);
+        assert.deepEqual(fs.readdirSync(path.join(layout.agentCodePath, 'debuglogs')), []);
+    } finally {
+        fs.rmSync(layout.root, { recursive: true, force: true });
+    }
+});
