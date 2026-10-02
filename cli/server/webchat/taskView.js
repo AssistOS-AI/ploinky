@@ -23,7 +23,7 @@ const description = document.getElementById('taskDescription');
 const status = document.getElementById('taskStatus');
 const duration = document.getElementById('taskDuration');
 const error = document.getElementById('taskError');
-const stopButton = document.getElementById('taskStop');
+const pauseButton = document.getElementById('taskPause');
 const actionError = document.getElementById('taskActionError');
 const log = document.getElementById('taskLog');
 const continuationForm = document.getElementById('taskContinuation');
@@ -59,14 +59,14 @@ let initialLoadComplete = false;
 let logSync = null;
 let logResyncPending = false;
 let continuationSubmitting = false;
-let stopSubmitting = false;
+let pauseSubmitting = false;
 let loadErrorMessage = '';
 let pendingSelectInteraction = null;
 let loadingTaskCommandName = '';
 let interactionCommandPrefix = '';
 let logSnapshotChunks = null;
 const pendingUpdates = [];
-const TERMINAL_STATUSES = new Set(['finished', 'stopped', 'error']);
+const TERMINAL_STATUSES = new Set(['finished', 'paused', 'error']);
 
 const taskAutocomplete = createComposerAutocomplete({ cmdInput: continuationInput }, {
     positionStrategy: 'viewport',
@@ -234,10 +234,10 @@ function renderTask() {
     error.hidden = !displayedError;
     error.textContent = displayedError;
     const taskOngoing = task?.status === 'ongoing';
-    const taskStopping = String(task?.remoteStatus || '').trim().toLowerCase() === 'cancelling';
-    stopButton.hidden = !taskOngoing;
-    stopButton.disabled = stopSubmitting || taskStopping;
-    stopButton.textContent = stopSubmitting || taskStopping ? 'Stopping…' : 'Stop';
+    const taskPausing = String(task?.remoteStatus || '').trim().toLowerCase() === 'cancelling';
+    pauseButton.hidden = !taskOngoing;
+    pauseButton.disabled = pauseSubmitting || taskPausing;
+    pauseButton.textContent = pauseSubmitting || taskPausing ? 'Pausing…' : 'Pause';
     const canContinue = Boolean(task?.continuation?.handle)
         && (TERMINAL_STATUSES.has(task?.status) || (taskOngoing && Boolean(task.continuation.messageToolName)));
     continuationForm.hidden = !canContinue;
@@ -258,18 +258,18 @@ function renderLog() {
     logFollower.restoreAfterRender(previousScrollTop);
 }
 
-async function stopTask() {
-    if (stopSubmitting || task?.status !== 'ongoing') return;
-    stopSubmitting = true;
+async function pauseTask() {
+    if (pauseSubmitting || task?.status !== 'ongoing') return;
+    pauseSubmitting = true;
     actionError.hidden = true;
     actionError.textContent = '';
     renderTask();
     try {
-        await requestCommand(`/task stop ${taskId}`);
-    } catch (stopError) {
-        stopSubmitting = false;
+        await requestCommand(`/task pause ${taskId}`);
+    } catch (pauseError) {
+        pauseSubmitting = false;
         actionError.hidden = false;
-        actionError.textContent = `Unable to stop task: ${stopError?.message || stopError}`;
+        actionError.textContent = `Unable to pause task: ${pauseError?.message || pauseError}`;
         renderTask();
     }
 }
@@ -350,7 +350,7 @@ function applyUpdate(payload) {
     } else if (payload.event === 'view') {
         logSnapshotChunks = null;
     }
-    if (payload.event === 'action' && payload.action === 'stop') stopSubmitting = false;
+    if (payload.event === 'action' && payload.action === 'pause') pauseSubmitting = false;
     if (payload.event === 'action' && payload.action === 'continue') {
         continuationSubmitting = false;
         if (payload.ok === true) {
@@ -358,7 +358,7 @@ function applyUpdate(payload) {
             autoResizeContinuationInput();
         }
     }
-    if (task.status !== 'ongoing') stopSubmitting = false;
+    if (task.status !== 'ongoing') pauseSubmitting = false;
     if (payload.event === 'action' && payload.ok === false) {
         if (payload.action === 'model' || payload.action === 'login') {
             loadingTaskCommandName = '';
@@ -493,7 +493,7 @@ window.addEventListener('pagehide', () => {
 
 applyTheme();
 continuationForm.addEventListener('submit', submitContinuation);
-stopButton.addEventListener('click', () => void stopTask());
+pauseButton.addEventListener('click', () => void pauseTask());
 continuationInput.addEventListener('input', autoResizeContinuationInput);
 continuationInput.addEventListener('keydown', (event) => {
     if (taskAutocomplete.handleKeydown(event)) return;

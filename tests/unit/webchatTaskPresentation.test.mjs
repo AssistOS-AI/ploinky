@@ -38,7 +38,7 @@ test('task log updates append in order, ignore duplicates, and request gap recov
 test('task status presentation preserves queued work and maps lifecycle labels', () => {
     assert.equal(taskStatusPresentation({ status: 'ongoing', remoteStatus: 'pending' }).label, 'QUEUED');
     assert.equal(taskStatusPresentation({ status: 'ongoing', remoteStatus: 'running' }).label, 'RUNNING');
-    assert.equal(taskStatusPresentation({ status: 'ongoing', remoteStatus: 'cancelling' }).label, 'STOPPING');
+    assert.equal(taskStatusPresentation({ status: 'ongoing', remoteStatus: 'cancelling' }).label, 'PAUSING');
     assert.equal(taskStatusPresentation({ status: 'finished' }).label, 'COMPLETED');
     assert.equal(taskStatusPresentation({ status: 'error' }).label, 'FAILED');
     assert.equal(taskStatusPresentation(null).label, 'UNAVAILABLE');
@@ -312,7 +312,7 @@ test('chat task summary streams inline logs and collapses to its metadata header
                 return () => {};
             },
             async loadLog() { loadRequests += 1; },
-            stopTask(taskId) { actions.push(['stop', taskId]); return true; },
+            pauseTask(taskId) { actions.push(['pause', taskId]); return true; },
             resumeTask(taskId) { actions.push(['resume', taskId]); return true; },
             continueTask(taskId, prompt) { actions.push(['message', taskId, prompt]); return true; },
         },
@@ -422,7 +422,7 @@ test('task controller assembles chunked log snapshots for inline subscribers', (
         action: 'resume',
         ok: false,
         error: 'Resume was denied.',
-        task: { ...task, status: 'stopped', remoteStatus: 'cancelled' },
+        task: { ...task, status: 'paused', remoteStatus: 'cancelled' },
     });
     assert.equal(latest.actionEvent, true);
     assert.equal(latest.action, 'resume');

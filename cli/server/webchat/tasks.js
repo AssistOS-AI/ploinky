@@ -300,7 +300,7 @@ export function createTaskController({ toEndpoint, sendQuickCommand, elements, s
         close,
         subscribe,
         loadLog,
-        stopTask: (taskId) => Boolean(sendQuickCommand?.(`/task stop ${taskId}`)),
+        pauseTask: (taskId) => Boolean(sendQuickCommand?.(`/task pause ${taskId}`)),
         continueTask: (taskId, prompt) => Boolean(sendQuickCommand?.(`/task continue ${taskId} ${prompt}`)),
         resumeTask: (taskId) => Boolean(sendQuickCommand?.(
             `/task continue ${taskId} Continue from the current state.`,
