@@ -4,11 +4,11 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { constants } from 'node:fs';
 import test from 'node:test';
-import { fixture, source, roots, write, writeSkill, createAlaEngine } from './fixture.mjs';
+import { fixture, source, roots, writeSkill, createAlaEngine } from './fixture.mjs';
 
 // Explicit opt-in file: requires a working Linux sandbox, a real backend, and an
 // authenticated donor home. It never falls back to the deterministic consumer.
-test('real native conversation uses live source edits, additions, explicit empty, and final deletion', { timeout: 1200000 }, async (t) => {
+test('real native conversation uses live source edits, additions, deselection, and final deletion', { timeout: 1200000 }, async (t) => {
     const { findBubblewrap, canMountPrivateProc } = await source('ala', 'src/coding-agents/sandbox.mjs');
     const bwrap = findBubblewrap();
     const privateProc = Boolean(bwrap && canMountPrivateProc(bwrap));
@@ -23,6 +23,13 @@ test('real native conversation uses live source edits, additions, explicit empty
     await fs.access(binary, constants.X_OK);
     await fs.access(path.join(donorHome, '.codex/auth.json'), constants.R_OK);
     const f = await fixture(t);
+    // The always-present required skill must be a real instruction document for the model, not the fixture stand-in.
+    await fs.writeFile(path.join(f.documentation, 'skills/human-report/SKILL.md'),
+        '---\nname: human-report\ndescription: Write the final response in plain, accurate language.\n---\nWrite plainly and accurately. Keep the response markers the task asks for.\n');
+    const repo = path.join(f.scopeRoot, 'acceptance-skills');
+    const directory = path.join(repo, 'skills/acceptance-probe');
+    const first = await writeSkill(directory, 'acceptance-probe');
+    await f.useSources({ 'acceptance-skills': repo });
     await fs.mkdir(path.join(f.home, '.codex'), { mode: 0o700, recursive: true });
     await fs.copyFile(path.join(donorHome, '.codex/auth.json'), path.join(f.home, '.codex/auth.json'));
     await fs.chmod(path.join(f.home, '.codex/auth.json'), 0o600);
@@ -33,17 +40,13 @@ test('real native conversation uses live source edits, additions, explicit empty
     const installation = await resolveAlaInstallation({ env: { ...process.env, ACHILLES_ALA_COMMAND: path.join(roots.ala, 'bin/ala.mjs') } });
     const engine = createAlaEngine({ workingDir: f.scopeRoot, sessionStore: f.sessionStore, skillCatalog: f.catalog,
         installation, settings: { readAchillesSettings: () => ({}), getCodingAgentModels: () => ({}),
-            getPermissionMode: () => 'full-access' }, interactions: { cancelTurn() {} }, execution: { backend: 'codex' } });
+            getPermissionMode: () => 'full-access' }, interactions: { cancelTurn() {} }, execution: { backend: 'codex', robotId: f.robot.id } });
     f.cleanup.push(() => engine.close());
     const history = `conversation-${randomUUID()}`;
     const states = [];
     const turn = async (label, prompt, expected, entries, sourceAnswers = expected) => {
         for (const value of sourceAnswers) assert.ok(!prompt.includes(value), 'Expected skill answers must only exist in source files.');
-        const registrations = [];
-        const result = await engine.executeTurn({ sessionId: f.id, prompt, signal: AbortSignal.timeout(150000), onEvent(event) {
-            if (event.type === 'coding-agent-skill-registration') registrations.push({ state: event.state,
-                reconfigurations: event.reconfigurations, attempt: event.attempt, threadId: event.threadId });
-        } });
+        const result = await engine.executeTurn({ sessionId: f.id, prompt, signal: AbortSignal.timeout(150000) });
         for (const value of expected) assert.ok(result.outputText.includes(value), `${label} must use the current source answer or recall history`);
         const metadata = JSON.parse(await fs.readFile(path.join(f.home, '.ala/sessions', `${f.id}.json`), 'utf8'));
         assert.equal(metadata.id, f.id);
@@ -51,20 +54,13 @@ test('real native conversation uses live source edits, additions, explicit empty
         assert.equal(metadata.workspace, f.scopeRoot);
         assert.equal(metadata.agent, 'codex');
         assert.ok(metadata.continuation?.threadId);
-        const verified = registrations.filter((event) => event.state === 'verified');
-        assert.equal(verified.length, 1, 'Every native execution must confirm observed registration before its turn.');
-        assert.equal(verified[0].threadId, metadata.continuation.threadId);
-        assert.ok(Number.isInteger(verified[0].reconfigurations) && verified[0].reconfigurations <= 2);
         if (states.length) assert.equal(metadata.continuation.threadId, states[0].threadId);
         const execution = f.sessionStore.loadSession(f.id).skillExecution;
-        const envelope = JSON.parse(await fs.readFile(path.join(execution.catalogPath, '.catalog.json'), 'utf8'));
-        assert.deepEqual(envelope.entries.map((entry) => entry.name).sort(), entries);
-        states.push({ label, threadId: metadata.continuation.threadId, revision: execution.revision, registrations });
+        assert.deepEqual(execution.entries.filter((entry) => !entry.required).map((entry) => entry.name).sort(), entries);
+        states.push({ label, threadId: metadata.continuation.threadId, revision: execution.revision });
         t.diagnostic(JSON.stringify(states.at(-1)));
         return result.outputText;
     };
-    const directory = path.join(f.scopeRoot, '.agents/skills/acceptance-probe');
-    const first = await writeSkill(directory, 'acceptance-probe');
     await turn('original', `Remember ${history}. Use acceptance-probe. Return DESCRIPTOR=<descriptor value> HELPER=<helper output>.`,
         [first.descriptor, first.helper, first.asset], ['acceptance-probe']);
     const helper = path.join(directory, 'helper.mjs');
@@ -74,7 +70,7 @@ test('real native conversation uses live source edits, additions, explicit empty
     await fs.utimes(helper, before.atime, before.mtime);
     await turn('changed', 'Use acceptance-probe again. Return DESCRIPTOR=<descriptor value> HELPER=<helper output>.',
         [changed.descriptor, changed.helper, changed.asset], ['acceptance-probe']);
-    assert.notEqual(states[1].revision, states[0].revision);
+    assert.equal(states[1].revision, states[0].revision, 'a live link set keeps its revision when only file bytes change');
     const helperBefore = await fs.stat(helper);
     const helperOnly = randomUUID();
     const helperSource = await fs.readFile(helper, 'utf8');
@@ -84,19 +80,20 @@ test('real native conversation uses live source edits, additions, explicit empty
     assert.equal((await fs.stat(helper)).size, helperBefore.size);
     await turn('helper-only', 'Use acceptance-probe again. Return DESCRIPTOR=<descriptor value> HELPER=<helper output>.',
         [changed.descriptor, helperOnly, changed.asset], ['acceptance-probe']);
-    assert.notEqual(states[2].revision, states[1].revision);
-    const addedDirectory = path.join(f.scopeRoot, 'untracked-repo/skills/new-probe');
-    await write(path.join(f.scopeRoot, 'untracked-repo/.git'), 'gitdir: /acceptance-only-marker\n');
+    assert.equal(states[2].revision, states[1].revision);
+    const addedDirectory = path.join(repo, 'skills/new-probe');
     const added = await writeSkill(addedDirectory, 'new-probe');
     await turn('addition', 'Use new-probe. Return DESCRIPTOR=<descriptor value> HELPER=<helper output>.',
         [added.descriptor, added.helper, added.asset], ['acceptance-probe', 'new-probe']);
-    await f.catalog.command(f.id, 'use none');
-    const emptyPrompt = 'If no task skills are selected, respond exactly NO_SKILLS followed by the conversation token I asked you to remember. Otherwise respond HAS_SKILLS.';
-    const empty = await turn('explicit-empty', emptyPrompt, ['NO_SKILLS', history], [], []);
+    assert.notEqual(states[3].revision, states[2].revision, 'adding a linked skill changes the link set revision');
+    await f.settings.load();
+    for (const item of f.settings.items.filter((entry) => entry.enabled && !entry.required)) await f.settings.toggle(item.identity);
+    const emptyPrompt = 'If .agents/skills holds no skill other than human-report, respond exactly NO_SKILLS followed by the conversation token I asked you to remember. Otherwise respond HAS_SKILLS.';
+    const empty = await turn('deselected', emptyPrompt, ['NO_SKILLS', history], [], []);
     assert.ok(!empty.includes('HAS_SKILLS'));
-    await f.catalog.command(f.id, 'use workspace');
-    await fs.rm(directory, { recursive: true });
-    await fs.rm(addedDirectory, { recursive: true });
+    await f.settings.load();
+    await f.settings.toggle('acceptance-skills/acceptance-probe');
+    await fs.rm(path.join(repo, 'skills'), { recursive: true });
     const deleted = await turn('final-deletion', emptyPrompt, ['NO_SKILLS', history], [], []);
     assert.ok(!deleted.includes('HAS_SKILLS'));
     for (const marker of [first.descriptor, changed.descriptor, added.descriptor]) assert.ok(!deleted.includes(marker));
