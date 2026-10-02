@@ -194,3 +194,28 @@ test('R.authorization-after-lock-wait', async (t) => {
     }), { code: 'identity_changed' });
     assert.equal(mutations, 0);
 });
+
+test('R.limits-state-unplaced-instance-matches-apply', (t) => {
+    const f = fixture(t);
+    const context = { ...f.getContext(), prepared: false, backendReady: false, controllers: [] };
+    const metrics = { runtimes: Object.keys(f.registry).map((containerName) => ({ containerName, state: { running: true, ready: true }, metrics: { available: true, cpuPercent: 1, memoryBytes: 1 } })) };
+    const stateFor = (descriptor, readApplied = () => null) => buildHardwareLimitsState({ context, installed: [{ ref: 'demo/worker', manifestPath: '/fixture/manifest.json' }], registry: { canonical: f.registry.canonical }, metrics, admit: () => ({ descriptor }), readApplied }).agents[0].containers[0].limitsState;
+    // Unlimited instance without hardware placement (unprepared Box, D4 or a
+    // sandbox): Apply calls it unchanged, so GET must not invent pending.
+    const unlimited = { runtimePolicy: { resources: {} } };
+    const captured = captureExactHardwareInstances(f.registry, ['canonical'])[0];
+    const exact = { loadRouting: () => ({}), readLabel: () => '', inspect: () => ({ state: 'exact', id: captured.record.containerId, running: true }) };
+    assert.equal(hardwareApplyIsUnchanged(captured, { runtimeAdmission: { descriptor: unlimited } }, exact), true);
+    assert.equal(stateFor(unlimited), 'applied');
+    // A request that cannot be placed, or a recorded refusal, is unavailable.
+    const requested = { runtimePolicy: { resources: { cpus: 1 } }, hardwareRequest: [{ field: 'cpus', value: '1', source: 'settings' }] };
+    assert.equal(hardwareApplyIsUnchanged(captured, { runtimeAdmission: { descriptor: requested } }, exact), false);
+    assert.equal(stateFor(requested), 'unavailable');
+    assert.equal(buildHardwareLimitsState({ context, installed: [{ ref: 'demo/worker', manifestPath: '/x' }], registry: { canonical: f.registry.canonical }, metrics, admit: () => ({ descriptor: unlimited, hardwareEligibility: { state: 'refused', refusal: {} } }) }).agents[0].containers[0].limitsState, 'unavailable');
+    // A runtime that still carries an earlier placement is what Apply changes.
+    const placed = (key, containerId) => ({ key, containerId, instanceId: f.registry.canonical.instanceId, enableGeneration: f.registry.canonical.enableGeneration, limitsHash: 'c'.repeat(64) });
+    assert.equal(hardwareApplyIsUnchanged(captured, { runtimeAdmission: { descriptor: unlimited } }, { ...exact, readLabel: () => 'c'.repeat(64) }), false);
+    assert.equal(stateFor(unlimited, placed), 'pending');
+    // A stopped instance stays unavailable either way.
+    assert.equal(buildHardwareLimitsState({ context, installed: [{ ref: 'demo/worker', manifestPath: '/x' }], registry: { canonical: f.registry.canonical }, metrics: null, admit: () => ({ descriptor: unlimited }) }).agents[0].containers[0].limitsState, 'unavailable');
+});

@@ -10,7 +10,7 @@ import {
     HardwareStoreError, hardwareStorePaths, readStoreSnapshot, setAgentLimits, clearAgentLimits,
     assertPolicyWritesAllowed, parseLimitsRequestBody, validateStoreToken, MAX_REQUEST_BYTES,
 } from '../../sandbox/hardwareLimits/store.mjs';
-import { admitManifestRuntimeCapabilities, hardwareLimitsHashOf } from '../../sandbox/runtimeCapabilities.js';
+import { admitManifestRuntimeCapabilities, hardwareLimitsHashOf, hardwareRefusalOf } from '../../sandbox/runtimeCapabilities.js';
 import { readAgentRegistrySnapshot } from '../../utils/agentRegistrySnapshot.js';
 import { collectAgentsSummary } from '../../utils/status.js';
 import { readRoutingConfig } from '../routingFile.js';
@@ -121,7 +121,17 @@ export function buildHardwareLimitsState({ context, installed, registry, routing
             const availability = problem?.state || (projection || runtime?.state?.status === 'failed' ? 'failed' : ready ? 'ready' : running ? 'starting' : 'stopped');
             const desiredMps = desired?.descriptor?.hardwareGpu;
             const generationMatches = !desiredMps || (context.gpu?.daemonStatus === 'ready' && matchingObservation?.mpsGeneration === context.gpu.mpsGeneration);
-            const limitsState = projection ? 'unavailable' : !running ? 'unavailable' : matchingObservation && generationMatches && matchingObservation.limitsHash === hardwareLimitsHashOf(desired?.descriptor) ? 'applied' : 'pending';
+            const desiredHash = hardwareLimitsHashOf(desired?.descriptor);
+            let limitsState;
+            if (projection || !running) limitsState = 'unavailable';
+            else if (!desiredHash) {
+                // No hardware placement is desired (unprepared Box, unlimited
+                // D4 instance, sandbox runtime). Apply's unchanged predicate
+                // decides: no request or refusal and no placed runtime is
+                // applied; a request that cannot be placed is unavailable.
+                if (!desired || hardwareRefusalOf(desired) || desired.descriptor?.hardwareRequest?.length) limitsState = 'unavailable';
+                else limitsState = matchingObservation?.limitsHash ? 'pending' : 'applied';
+            } else limitsState = matchingObservation && generationMatches && matchingObservation.limitsHash === desiredHash ? 'applied' : 'pending';
             containers.push({
                 key, alias: record.alias || null, instanceId: record.instanceId || null, enableGeneration: record.enableGeneration || null,
                 availability, limitsState, problem, mpsGeneration: matchingObservation?.mpsGeneration || null, ...(runtime?.limits ? { limits: runtime.limits } : {}),
