@@ -254,7 +254,7 @@ export function buildRequiredCaseManifest() {
             'H.truncated-stream', 'H.missing-required', 'H.required-skip', 'H.required-todo', 'H.removed-baseline',
             'H.complete-pass', 'H.cleanup-destroy-failure', 'H.cleanup-identity-failure',
             'H.cleanup-original-and-cleanup-errors', 'H.pid-12-34-not-123-934', 'H.pid-reuse', 'H.query-error',
-            'H.malformed-pids', 'H.initial-busy', 'H.graphics-unknown-blocked', 'H.scratch-home',
+            'H.malformed-pids', 'H.initial-busy', 'H.graphics-unknown-blocked', 'H.scratch-home', 'H.baseline-stage-hashes-without-stdin',
             'H.duplicate-leaf-title-under-two-parents', 'H.p3-explorer-sibling-is-the-configured-ploinky-candidate',
         ]),
         ...leaves(P, 's0', unit('hardwareLimitsFailureSignatures.test.mjs'), ['HS.proc-pid-normalization', 'HS.engine-spawn-guard-fails-a-suite-that-starts-an-engine']),

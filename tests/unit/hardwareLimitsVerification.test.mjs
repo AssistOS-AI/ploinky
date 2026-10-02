@@ -353,3 +353,27 @@ test('H.p3-explorer-sibling-is-the-configured-ploinky-candidate', async (t) => {
     fs.writeFileSync(path.join(layout.root, 'explorer/drift.mjs'), 'changed');
     assert.throws(() => assertExplorerLayoutUnchanged(layout), /candidate source changed/);
 });
+
+// Staging never feeds a child through stdin (spawnSync stdin piping stalls
+// intermittently on macOS): blob ids are computed in process and must equal
+// git's own, and a staged revision is verified file by file.
+test('H.baseline-stage-hashes-without-stdin', async (t) => {
+    const { gitBlobId, createBaselineStage } = await import('../hardware-limits/verify.mjs');
+    const { spawnSync } = await import('node:child_process');
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-stage-')));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const repo = path.join(root, 'repo'); fs.mkdirSync(repo);
+    const run = (args) => { const result = spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8', env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' } }); assert.equal(result.status, 0, result.stderr); return result.stdout.trim(); };
+    run(['init', '-q']);
+    const files = { 'large.bin': Buffer.alloc(109548, 7), 'empty.txt': Buffer.alloc(0), 'nested/text.txt': Buffer.from('line\r\nwith crlf\n') };
+    for (const [name, bytes] of Object.entries(files)) { fs.mkdirSync(path.dirname(path.join(repo, name)), { recursive: true }); fs.writeFileSync(path.join(repo, name), bytes); }
+    for (const [name, bytes] of Object.entries(files)) assert.equal(gitBlobId(bytes), run(['hash-object', '--no-filters', name]), name);
+    run(['add', '-A']); run(['-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-q', '-m', 'fixture']);
+    const revision = run(['rev-parse', 'HEAD']);
+    const stage = path.join(root, 'stage');
+    assert.deepEqual(createBaselineStage(repo, revision, stage), { checked: 3 });
+    assert.equal(fs.existsSync(`${stage}.archive.tar`), false, 'the task-owned archive is removed');
+    assert.deepEqual(fs.readFileSync(path.join(stage, 'large.bin')), files['large.bin']);
+    // A tiny deadline is reported clearly, not as a hang.
+    assert.throws(() => createBaselineStage(repo, revision, path.join(root, 'stage-timeout'), { timeoutMs: 1 }), /timed out after 1 ms|failed/);
+});

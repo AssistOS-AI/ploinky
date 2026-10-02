@@ -18,6 +18,7 @@
 // Exit codes: PASS=0, FAIL=1, BLOCKED=2, SKIPPED=3. Child processes are
 // spawned with argument arrays, explicit cwd/environment and deadlines.
 
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -259,17 +260,38 @@ export function verifyCandidateSources(config) {
     return verified;
 }
 
+// The git object id of a blob, computed in process: the same id `git
+// hash-object` gives (SHA-1, or SHA-256 for a repository using it). Piping
+// bytes into a child's stdin with spawnSync intermittently stalls on macOS,
+// so no staging check feeds a child through stdin.
+export function gitBlobId(bytes, objectId = '') {
+    const algorithm = String(objectId).length === 64 ? 'sha256' : 'sha1';
+    return crypto.createHash(algorithm).update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
+}
+
+function boundedStep(result, description, timeoutMs) {
+    if (result.error?.code === 'ETIMEDOUT' || result.signal) throw new Error(`${description} timed out after ${timeoutMs} ms`);
+    if (result.error || result.status !== 0) throw new Error(`${description} failed: ${String(result.stderr || result.error?.message || '').trim().slice(0, 512)}`);
+    return result;
+}
+
 // Create a task-owned baseline staging copy of `revision` with `git archive`,
 // then verify every extracted regular file against the revision's blob list.
-function createBaselineStage(candidateRoot, revision, stageRoot) {
+// The archive goes through a task-owned file, never a child's stdin.
+export function createBaselineStage(candidateRoot, revision, stageRoot, { timeoutMs = 120000 } = {}) {
     if (fs.existsSync(stageRoot)) throw new Error(`refusing existing baseline stage ${stageRoot}`);
     fs.mkdirSync(stageRoot, { recursive: true, mode: 0o700 });
-    const archive = spawnSync('git', ['-C', candidateRoot, 'archive', '--format=tar', revision], {
-        timeout: 120000, maxBuffer: 1024 * 1024 * 1024,
-    });
-    if (archive.status !== 0) throw new Error(`git archive ${revision} failed`);
-    const extract = spawnSync('tar', ['-x', '-f', '-', '-C', stageRoot], { input: archive.stdout, timeout: 120000 });
-    if (extract.status !== 0) throw new Error(`tar extraction into ${stageRoot} failed`);
+    const archivePath = `${stageRoot}.archive.tar`;
+    if (fs.existsSync(archivePath)) throw new Error(`refusing existing baseline archive ${archivePath}`);
+    try {
+        boundedStep(spawnSync('git', ['-C', candidateRoot, 'archive', '--format=tar', '-o', archivePath, revision], {
+            timeout: timeoutMs, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+        }), `git archive ${revision}`, timeoutMs);
+        boundedStep(spawnSync('tar', ['-x', '-f', archivePath, '-C', stageRoot], { timeout: timeoutMs, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }),
+            `tar extraction into ${stageRoot}`, timeoutMs);
+    } finally {
+        fs.rmSync(archivePath, { force: true });
+    }
     const listing = git(candidateRoot, ['ls-tree', '-r', '-z', '--full-tree', revision]).split('\0').filter(Boolean);
     let checked = 0;
     for (const line of listing) {
@@ -277,8 +299,7 @@ function createBaselineStage(candidateRoot, revision, stageRoot) {
         const [mode, type, object] = meta.split(' ');
         if (type !== 'blob' || mode === '120000') continue;
         const bytes = fs.readFileSync(path.join(stageRoot, file));
-        const hash = spawnSync('git', ['hash-object', '--stdin'], { input: bytes, encoding: 'utf8' }).stdout.trim();
-        if (hash !== object) throw new Error(`baseline stage file ${file} does not match ${revision}`);
+        if (gitBlobId(bytes, object) !== object) throw new Error(`baseline stage file ${file} does not match ${revision}`);
         checked += 1;
     }
     return { checked };
