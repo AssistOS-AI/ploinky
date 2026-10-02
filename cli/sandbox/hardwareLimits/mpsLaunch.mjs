@@ -1,6 +1,6 @@
 import { isDeepStrictEqual } from 'node:util';
 import { MpsError } from './mpsEligibility.mjs';
-import { createMpsDaemonBackend, createMpsStateStore, mpsClientArgs } from './mps.mjs';
+import { createMpsDaemonBackend, createMpsStateStore, mpsClientArgs, verifyDetail } from './mps.mjs';
 
 const launches = new WeakMap();
 export function createMpsLaunch({ key, share = null, state = null, imageId = null }) {
@@ -22,10 +22,20 @@ export function verifyMpsLaunch(capability, key, share, { store = createMpsState
     const launch = readMpsLaunch(capability, key, share);
     if (!share) return launch;
     const current = store.read();
-    if (!current || current.daemonGeneration !== launch.state?.daemonGeneration || current.configurationGeneration !== launch.state?.configurationGeneration
-        || current.pipeDirectory !== launch.state?.pipeDirectory || !isDeepStrictEqual(current.serverDefault, launch.state?.serverDefault)
-        || current.serverDefault?.smPercent < share.smPercent || current.serverDefault?.memoryMiB < share.memoryMiB
-        || current.serverDefault?.deviceUuid !== share.deviceUuid || current.serverDefault?.driverVersion !== share.driverVersion || current.serverDefault?.wiringFingerprint !== share.wiringFingerprint || !backend.verify(current)) throw new MpsError('MPS daemon generation or defaults changed before runtime admission');
+    // The same checks, in the same order, each named: the decision is unchanged, the reason is kept.
+    const problems = [];
+    const expected = launch.state;
+    if (!current) problems.push('the MPS state is gone');
+    else {
+        if (current.daemonGeneration !== expected?.daemonGeneration) problems.push('the daemon generation changed');
+        else if (current.configurationGeneration !== expected?.configurationGeneration) problems.push('the configuration generation changed');
+        else if (current.pipeDirectory !== expected?.pipeDirectory) problems.push('the private pipe directory changed');
+        else if (!isDeepStrictEqual(current.serverDefault, expected?.serverDefault)) problems.push('the server defaults changed');
+        else if (current.serverDefault?.smPercent < share.smPercent || current.serverDefault?.memoryMiB < share.memoryMiB) problems.push('the server defaults are below the share');
+        else if (current.serverDefault?.deviceUuid !== share.deviceUuid || current.serverDefault?.driverVersion !== share.driverVersion || current.serverDefault?.wiringFingerprint !== share.wiringFingerprint) problems.push('the device, driver or wiring differs from the share');
+        else { const verified = verifyDetail(backend, current); if (!verified.ok) problems.push(`the daemon no longer verifies${verified.reason ? `: ${verified.reason}` : ''}`); }
+    }
+    if (problems.length) throw new MpsError(`MPS daemon generation or defaults changed before runtime admission (${problems.join('; ')})`);
     return launch;
 }
 export function mpsLaunchArgs(capability, key, share) {

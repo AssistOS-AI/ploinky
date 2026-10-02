@@ -29,7 +29,7 @@ import { HardwareLimitsError } from './errors.mjs';
 import { inApplyStep, describeApplyCause } from './applyCause.mjs';
 import { buildDirectRefusal, hex64 } from './requestedLimits.mjs';
 import { resolveStoredGpuShare } from './resolve.mjs';
-import { createMpsStateStore, createMpsDaemonBackend, isMpsClientAlias } from './mps.mjs';
+import { createMpsStateStore, createMpsDaemonBackend, isMpsClientAlias, verifyDetail } from './mps.mjs';
 import { MpsError, inspectMpsImage } from './mpsEligibility.mjs';
 import { inspectPreparedMpsImage } from './mpsStatus.mjs';
 import { createMpsLaunch, readMpsLaunchForTracking, verifyMpsLaunch } from './mpsLaunch.mjs';
@@ -386,7 +386,7 @@ export async function ensureMpsGraphAgentService(agentName, manifest, agentPath,
     if (!share && !state?.daemon && state) {
         state = { ...state, status: 'inactive', serverDefault: null, graphPrepared: false, graphNeedsTransition: false, oldClients: [], drainedClients: [] }; store.write(state);
     }
-    if (share && !backend.verify(state)) throw new MpsError('MPS defaults could not be verified for graph launch');
+    if (share) { const verified = verifyDetail(backend, state); if (!verified.ok) throw new MpsError(`MPS defaults could not be verified for graph launch${verified.reason ? ` (${verified.reason})` : ''}`); }
     const mpsLaunch = createMpsLaunch({ key, share, state: share ? { ...state, status: 'ready' } : null, imageId });
     check();
     if (share) {

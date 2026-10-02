@@ -676,6 +676,15 @@ export function buildRequiredCaseManifest() {
             'W4.a-different-image-still-reports-an-installer-change',
             'W4.the-dependency-preparation-sites-use-the-installer-identity-and-the-container-uses-the-launch-image',
         ]),
+        // The MPS verification and ownership proofs keep their reasons.
+        ...leaves(P, 'p4', unit('hardwareLimitsMpsReasons.test.mjs'), [
+            'W5.the-ownership-proof-names-what-differed-for-every-refusal',
+            'W5.an-unsafe-private-directory-names-uid-mode-link-or-realpath',
+            'W5.an-unsafe-state-or-pid-file-names-what-differed',
+            'W5.an-owned-server-check-names-what-differed',
+            'W5.verify-keeps-its-boolean-and-reports-the-failing-step-and-reply',
+            'W5.the-callers-pass-the-reason-into-their-typed-errors',
+        ]),
         ...leaves(P, 'p4', unit('hardwareLimitsMpsCandidateRecovery.test.mjs'), [
             'MC.readiness-failure-then-retry-succeeds', 'MC.readiness-failure-leaving-the-candidate-removes-it-by-id',
             'MC.non-exact-candidate-is-refused-without-daemon-change', 'MC.crash-during-readiness-then-recovery',

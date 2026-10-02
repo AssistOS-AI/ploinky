@@ -20,6 +20,14 @@ export function validateMpsDefault(value) {
     if (!value || !safeInteger(value.smPercent, 1, 100) || !safeInteger(value.memoryMiB, 512, Number.MAX_SAFE_INTEGER / 1048576)) throw new MpsError('Invalid MPS server defaults');
     return value;
 }
+// The backend's verification decision, with the reason when it refuses. The decision is always `verify`'s (a caller may
+// wrap or replace it); the reason is asked only after a refusal and is best effort.
+export function verifyDetail(backend, state) {
+    if (backend.verify(state)) return { ok: true, reason: null };
+    let reason = null;
+    try { const detail = typeof backend.verifyReason === 'function' ? backend.verifyReason(state) : null; reason = detail && detail.ok === false ? detail.reason : null; } catch (_) { /* the reason is optional */ }
+    return { ok: false, reason };
+}
 export function mpsClientEnvironment(share, pipeDirectory) {
     validateMpsDefault(share);
     if (typeof pipeDirectory !== 'string' || !/^\/run\/ploinky\/mps\/pipe-[a-f0-9]{32}$/.test(pipeDirectory)) throw new MpsError('Invalid private MPS pipe');
@@ -63,7 +71,7 @@ export function runMpsControl(command, { env, query = spawnSync, uid = process.g
     return String(result.stdout || '');
 }
 const READBACK_KIND = Object.freeze({ get_default_active_thread_percentage: 'sm', 'get_default_device_pinned_mem_limit 0': 'memory', get_server_list: 'servers' });
-export function configureMpsDefaults(value, { control = runMpsControl, env, uid = process.getuid?.(), query, verifyServer = () => false, onReadback = () => {} } = {}) {
+export function configureMpsDefaults(value, { control = runMpsControl, env, uid = process.getuid?.(), query, verifyServer = () => false, explainServer = () => null, onReadback = () => {} } = {}) {
     validateMpsDefault(value);
     const options = { env, uid, ...(query ? { query } : {}) };
     control(`set_default_active_thread_percentage ${value.smPercent}`, options);
@@ -75,20 +83,30 @@ export function configureMpsDefaults(value, { control = runMpsControl, env, uid 
     const memoryBytes = parseMpsMemoryReply(memoryReply);
     if (sm !== value.smPercent || memoryBytes !== value.memoryMiB * 1048576) throw new MpsError(`MPS default readback does not match configuration (requested ${value.smPercent}% and ${value.memoryMiB}M; read ${sm}% and ${memoryBytes} bytes)`);
     const serverReply = control('get_server_list', options); onReadback('servers', serverReply);
-    for (const pid of parseMpsServerList(serverReply)) if (verifyServer(pid) !== true) throw new MpsError('MPS server process ownership is not proven');
+    for (const pid of parseMpsServerList(serverReply)) if (verifyServer(pid) !== true) throw new MpsError(`MPS server process ownership is not proven (server ${pid}${explainServer(pid) ? `: ${explainServer(pid)}` : ''})`);
     return Object.freeze({ smPercent: sm, memoryMiB: value.memoryMiB });
 }
 
 function privateDirectory(target, { fsApi, uid, create = false }) {
     if (create) { try { fsApi.mkdirSync(target, { mode: 0o700 }); } catch (error) { if (error.code !== 'EEXIST') throw error; } }
     const stat = fsApi.lstatSync(target);
-    if (stat.isSymbolicLink() || !stat.isDirectory() || fsApi.realpathSync(target) !== target || stat.uid !== uid || (stat.mode & 0o777) !== 0o700) throw new MpsError('MPS directory ownership or mode is unsafe');
+    if (stat.isSymbolicLink() || !stat.isDirectory() || fsApi.realpathSync(target) !== target || stat.uid !== uid || (stat.mode & 0o777) !== 0o700) {
+        // The decision is unchanged; the reason names what differed (an lstat failure is its own errno, thrown above).
+        const real = (() => { try { return fsApi.realpathSync(target); } catch (error) { return `unresolvable (${error.code || 'error'})`; } })();
+        const problems = [stat.isSymbolicLink() && 'a symbolic link', !stat.isDirectory() && 'not a directory', real !== target && `realpath ${String(real).slice(0, 80)}`,
+            stat.uid !== uid && `uid ${stat.uid} (expected ${uid})`, (stat.mode & 0o777) !== 0o700 && `mode ${(stat.mode & 0o777).toString(8)} (expected 700)`].filter(Boolean);
+        throw new MpsError(`MPS directory ownership or mode is unsafe (${String(target).slice(-60)}: ${problems.join(', ')})`);
+    }
 }
 function readBounded(target, { fsApi, maxBytes, uid, privateMode = false }) {
     const fd = fsApi.openSync(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
     try {
         const stat = fsApi.fstatSync(fd);
-        if (!stat.isFile() || stat.nlink !== 1 || stat.uid !== uid || stat.size > maxBytes || (privateMode && (stat.mode & 0o777) !== 0o600)) throw new MpsError('MPS state file is unsafe');
+        if (!stat.isFile() || stat.nlink !== 1 || stat.uid !== uid || stat.size > maxBytes || (privateMode && (stat.mode & 0o777) !== 0o600)) {
+            const problems = [!stat.isFile() && 'not a regular file', stat.nlink !== 1 && `${stat.nlink} links`, stat.uid !== uid && `uid ${stat.uid} (expected ${uid})`,
+                stat.size > maxBytes && `size ${stat.size} over ${maxBytes}`, privateMode && (stat.mode & 0o777) !== 0o600 && `mode ${(stat.mode & 0o777).toString(8)} (expected 600)`].filter(Boolean);
+            throw new MpsError(`MPS state file is unsafe (${path.basename(String(target))}: ${problems.join(', ')})`);
+        }
         const buffer = Buffer.alloc(maxBytes + 1);
         const count = fsApi.readSync(fd, buffer, 0, buffer.length, 0);
         if (count > maxBytes) throw new MpsError('MPS file exceeds its bound');
@@ -136,45 +154,70 @@ export function createMpsStateStore({ root = MPS_ROOT, fsApi = fs, uid = process
     };
 }
 
+// What the proof of ownership concluded, and why: `reason` is bounded and secret-free (an errno, an uid, a mode, a
+// path component), never an environment or a command line. The decision is the state, as before.
 export function observeOwnedMpsDaemon(state, { fsApi = fs, procRoot = '/proc', uid = process.getuid?.() } = {}) {
     assertUid(uid);
-    if (!state?.daemon || !safeInteger(state.daemon.pid, 1, 2147483647) || !/^\d+$/.test(String(state.daemon.startTime || ''))) return { state: 'unknown' };
+    if (!state?.daemon || !safeInteger(state.daemon.pid, 1, 2147483647) || !/^\d+$/.test(String(state.daemon.startTime || ''))) return { state: 'unknown', reason: 'the journal names no valid daemon pid and start time' };
     const daemon = state.daemon;
     let processObserved = false;
+    let reading = 'the process';
+    const refuse = (verdict, reason) => ({ state: verdict, reason: String(reason).slice(0, 160) });
     try {
-        const fields = String(fsApi.readFileSync(`${procRoot}/${daemon.pid}/stat`, 'utf8')).replace(/^.*\) /, '').split(' ');
-        if (fields[0] === 'Z' || fields[19] !== daemon.startTime) return { state: 'gone' };
+        reading = `${procRoot}/${daemon.pid}/stat`;
+        const fields = String(fsApi.readFileSync(reading, 'utf8')).replace(/^.*\) /, '').split(' ');
+        if (fields[0] === 'Z') return refuse('gone', 'the process is a zombie');
+        if (fields[19] !== daemon.startTime) return refuse('gone', `the pid now has start time ${String(fields[19]).slice(0, 20)}, not ${daemon.startTime}`);
         processObserved = true;
+        reading = state.pipeDirectory;
         privateDirectory(state.pipeDirectory, { fsApi, uid });
         const pipe = fsApi.lstatSync(state.pipeDirectory);
-        if (!state.pipeIdentity || pipe.dev !== state.pipeIdentity.dev || pipe.ino !== state.pipeIdentity.ino) return { state: 'foreign' };
-        const status = String(fsApi.readFileSync(`${procRoot}/${daemon.pid}/status`, 'utf8'));
-        if (!new RegExp(`^Uid:\\s+${uid}\\s+${uid}\\s+${uid}\\s+${uid}\\s*$`, 'm').test(status)) return { state: 'foreign' };
-        const binary = fsApi.statSync(`${procRoot}/${daemon.pid}/exe`);
-        if (binary.dev !== daemon.executableDev || binary.ino !== daemon.executableIno) return { state: 'foreign' };
-        const cgroup = String(fsApi.readFileSync(`${procRoot}/${daemon.pid}/cgroup`, 'utf8')).trim();
-        if (cgroup !== '0::/ploinky/core') return { state: 'foreign' };
-        const env = fsApi.readFileSync(`${procRoot}/${daemon.pid}/environ`);
-        if (env.length > 8192 || !env.toString().split('\0').includes(`CUDA_MPS_PIPE_DIRECTORY=${state.pipeDirectory}`)) return { state: 'foreign' };
-        const pidText = readBounded(path.join(state.pipeDirectory, 'nvidia-cuda-mps-control.pid'), { fsApi, maxBytes: 64, uid });
-        if (String(daemon.pid) !== pidText.trim()) return { state: 'foreign' };
+        if (!state.pipeIdentity || pipe.dev !== state.pipeIdentity.dev || pipe.ino !== state.pipeIdentity.ino) return refuse('foreign', 'the pipe directory is not the journaled one (device or inode differs)');
+        reading = `${procRoot}/${daemon.pid}/status`;
+        const status = String(fsApi.readFileSync(reading, 'utf8'));
+        if (!new RegExp(`^Uid:\\s+${uid}\\s+${uid}\\s+${uid}\\s+${uid}\\s*$`, 'm').test(status)) return refuse('foreign', `the daemon's Uid line is ${(/^Uid:\s*(.*)$/m.exec(status)?.[1] || 'missing').replace(/\s+/g, ' ').slice(0, 40)}, not ${uid}`);
+        reading = `${procRoot}/${daemon.pid}/exe`;
+        const binary = fsApi.statSync(reading);
+        if (binary.dev !== daemon.executableDev || binary.ino !== daemon.executableIno) return refuse('foreign', 'the executable is not the journaled MPS control binary (device or inode differs)');
+        reading = `${procRoot}/${daemon.pid}/cgroup`;
+        const cgroup = String(fsApi.readFileSync(reading, 'utf8')).trim();
+        if (cgroup !== '0::/ploinky/core') return refuse('foreign', `the daemon's cgroup is ${cgroup.slice(0, 80)}, not 0::/ploinky/core`);
+        reading = `${procRoot}/${daemon.pid}/environ`;
+        const env = fsApi.readFileSync(reading);
+        if (env.length > 8192) return refuse('foreign', `the environment is ${env.length} bytes, over 8192`);
+        if (!env.toString().split('\0').includes(`CUDA_MPS_PIPE_DIRECTORY=${state.pipeDirectory}`)) return refuse('foreign', 'the daemon environment does not name the private pipe directory');
+        reading = `${path.join(state.pipeDirectory, 'nvidia-cuda-mps-control.pid')}`;
+        const pidText = readBounded(reading, { fsApi, maxBytes: 64, uid });
+        if (String(daemon.pid) !== pidText.trim()) return refuse('foreign', `the pid file says ${pidText.trim().slice(0, 20)}, not ${daemon.pid}`);
         return { state: 'owned', daemon };
-    } catch (error) { return { state: error.code === 'ENOENT' && !processObserved ? 'gone' : 'unknown' }; }
+    } catch (error) {
+        return refuse(error.code === 'ENOENT' && !processObserved ? 'gone' : 'unknown', `${error.code || error.name || 'error'} while reading ${String(reading).slice(-70)}${error.code ? '' : `: ${String(error.message).slice(0, 80)}`}`);
+    }
 }
 
-export function observeOwnedMpsServer(state, pid, { fsApi = fs, procRoot = '/proc', uid = process.getuid?.() } = {}) {
+// Whether a pid is an owned MPS server, and why not.
+export function inspectOwnedMpsServer(state, pid, { fsApi = fs, procRoot = '/proc', uid = process.getuid?.() } = {}) {
     assertUid(uid);
-    if (!safeInteger(pid, 1, 2147483647) || !state?.tools?.server) return false;
+    if (!safeInteger(pid, 1, 2147483647) || !state?.tools?.server) return { owned: false, reason: 'no valid pid or no journaled server tool' };
+    let reading = 'the process';
     try {
-        const status = String(fsApi.readFileSync(`${procRoot}/${pid}/status`, 'utf8'));
-        const executable = fsApi.statSync(`${procRoot}/${pid}/exe`);
-        const env = fsApi.readFileSync(`${procRoot}/${pid}/environ`);
-        return new RegExp(`^Uid:\\s+${uid}\\s+${uid}\\s+${uid}\\s+${uid}\\s*$`, 'm').test(status)
-            && executable.dev === state.tools.server.dev && executable.ino === state.tools.server.ino
-            && String(fsApi.readFileSync(`${procRoot}/${pid}/cgroup`, 'utf8')).trim() === '0::/ploinky/core'
-            && env.length <= 8192 && env.toString().split('\0').includes(`CUDA_MPS_PIPE_DIRECTORY=${state.pipeDirectory}`);
-    } catch (_) { return false; }
+        reading = `${procRoot}/${pid}/status`;
+        const status = String(fsApi.readFileSync(reading, 'utf8'));
+        if (!new RegExp(`^Uid:\\s+${uid}\\s+${uid}\\s+${uid}\\s+${uid}\\s*$`, 'm').test(status)) return { owned: false, reason: `the Uid line is ${(/^Uid:\s*(.*)$/m.exec(status)?.[1] || 'missing').replace(/\s+/g, ' ').slice(0, 40)}, not ${uid}` };
+        reading = `${procRoot}/${pid}/exe`;
+        const executable = fsApi.statSync(reading);
+        if (executable.dev !== state.tools.server.dev || executable.ino !== state.tools.server.ino) return { owned: false, reason: 'the executable is not the journaled MPS server tool' };
+        reading = `${procRoot}/${pid}/cgroup`;
+        const cgroup = String(fsApi.readFileSync(reading, 'utf8')).trim();
+        if (cgroup !== '0::/ploinky/core') return { owned: false, reason: `the cgroup is ${cgroup.slice(0, 80)}, not 0::/ploinky/core` };
+        reading = `${procRoot}/${pid}/environ`;
+        const env = fsApi.readFileSync(reading);
+        if (env.length > 8192) return { owned: false, reason: `the environment is ${env.length} bytes, over 8192` };
+        if (!env.toString().split('\0').includes(`CUDA_MPS_PIPE_DIRECTORY=${state.pipeDirectory}`)) return { owned: false, reason: 'the environment does not name the private pipe directory' };
+        return { owned: true, reason: null };
+    } catch (error) { return { owned: false, reason: `${error.code || error.name || 'error'} while reading ${String(reading).slice(-70)}` }; }
 }
+export function observeOwnedMpsServer(state, pid, options) { return inspectOwnedMpsServer(state, pid, options).owned; }
 
 export function recoverMpsDaemonIdentity(state, { fsApi = fs, procRoot = '/proc', uid = process.getuid?.() } = {}) {
     assertUid(uid);
@@ -289,8 +332,8 @@ export function createMpsDaemonBackend({ root = MPS_ROOT, fsApi = fs, query = sp
             return true;
         } catch (_) { return false; }
     };
-    const control = (state, command, { deadline = Infinity } = {}) => { assertUid(uid); if (now() >= deadline) throw new MpsError('MPS operation exceeded its deadline'); checkDirectories(state); if (observe(state, { fsApi, uid }).state !== 'owned') throw new MpsError('The exact MPS daemon is not live and owned'); return runMpsControl(command, { env: envFor(state), query, uid, timeoutMs: Math.max(1, Math.min(5000, deadline - now())) }); };
-    return {
+    const control = (state, command, { deadline = Infinity } = {}) => { assertUid(uid); if (now() >= deadline) throw new MpsError('MPS operation exceeded its deadline'); checkDirectories(state); { const owner = observe(state, { fsApi, uid }); if (owner.state !== 'owned') throw new MpsError(`The exact MPS daemon is not live and owned (${owner.state}${owner.reason ? `: ${owner.reason}` : ''})`); } return runMpsControl(command, { env: envFor(state), query, uid, timeoutMs: Math.max(1, Math.min(5000, deadline - now())) }); };
+    const backend = {
         discover: (tools) => discoverOwnedMpsDaemon({ root, tools, fsApi, uid }),
         cleanup: (state) => cleanupMpsGeneration(state, { root, fsApi, uid }),
         observe: (state) => {
@@ -344,7 +387,7 @@ export function createMpsDaemonBackend({ root = MPS_ROOT, fsApi = fs, query = sp
                     state.daemon = { pid: Number(pidText), startTime: fields[19], executableDev: executable.dev, executableIno: executable.ino };
                     onState(state);
                     phase = 'ownership proof';
-                    if (observe(state, { fsApi, uid }).state !== 'owned') throw new MpsError('MPS daemon ownership is not proven');
+                    { const owner = observe(state, { fsApi, uid }); if (owner.state !== 'owned') throw new MpsError(`MPS daemon ownership is not proven (${owner.state}${owner.reason ? `: ${owner.reason}` : ''})`); }
                     phase = 'set defaults';
                     configureMpsDefaults(defaults, { control: (command) => {
                         try { return control(state, command, { deadline }); } catch (replyError) {
@@ -352,18 +395,31 @@ export function createMpsDaemonBackend({ root = MPS_ROOT, fsApi = fs, query = sp
                             if (typeof replyError?.reply === 'string') record(READBACK_KIND[command] || 'other', replyError.reply);
                             throw replyError;
                         }
-                    }, uid, verifyServer: (pid) => observeOwnedMpsServer(state, pid, { fsApi, uid }), onReadback: record });
+                    }, uid, verifyServer: (pid) => observeOwnedMpsServer(state, pid, { fsApi, uid }), explainServer: (pid) => inspectOwnedMpsServer(state, pid, { fsApi, uid }).reason, onReadback: record });
                     state.status = 'ready'; return state;
                 } catch (error) { last = { error, phase }; if (now() >= deadline) throw readinessFailure(error, phase); wait(100); }
             } while (now() < deadline);
             if (last) throw readinessFailure(last.error, last.phase);
             throw new MpsError('MPS daemon readiness timed out');
         },
-        verify(state) {
-            try { checkDirectories(state); } catch (_) { return false; }
-            if (observe(state, { fsApi, uid }).state !== 'owned') return false;
-            try { const sm = parseMpsSmReply(control(state, 'get_default_active_thread_percentage')); const memory = parseMpsMemoryReply(control(state, 'get_default_device_pinned_mem_limit 0')); const servers = parseMpsServerList(control(state, 'get_server_list')); return sm === state.serverDefault.smPercent && memory === state.serverDefault.memoryMiB * 1048576 && servers.every((pid) => observeOwnedMpsServer(state, pid, { fsApi, uid })); } catch (_) { return false; }
+        // Whether the daemon is the exact owned one with the saved defaults, and, when it is not, the step that failed with
+        // a bounded, sanitized reason. `verify` keeps its boolean decision.
+        verifyReason(state) {
+            try { checkDirectories(state); } catch (error) { return { ok: false, reason: `directories: ${String(error.message).slice(0, 160)}` }; }
+            const owner = observe(state, { fsApi, uid });
+            if (owner.state !== 'owned') return { ok: false, reason: `ownership: ${owner.state}${owner.reason ? ` (${owner.reason})` : ''}` };
+            let step = 'control';
+            try {
+                step = 'sm readback'; const sm = parseMpsSmReply(control(state, 'get_default_active_thread_percentage'));
+                step = 'memory readback'; const memory = parseMpsMemoryReply(control(state, 'get_default_device_pinned_mem_limit 0'));
+                step = 'server list'; const servers = parseMpsServerList(control(state, 'get_server_list'));
+                if (sm !== state.serverDefault.smPercent) return { ok: false, reason: `sm readback ${sm}, not the saved ${state.serverDefault.smPercent}` };
+                if (memory !== state.serverDefault.memoryMiB * 1048576) return { ok: false, reason: `memory readback ${memory} bytes, not the saved ${state.serverDefault.memoryMiB * 1048576}` };
+                for (const pid of servers) { const server = inspectOwnedMpsServer(state, pid, { fsApi, uid }); if (!server.owned) return { ok: false, reason: `server ${pid} is not an owned MPS server (${server.reason})` }; }
+                return { ok: true, reason: null };
+            } catch (error) { return { ok: false, reason: `${step}: ${String(error?.message || error).slice(0, 200)}` }; }
         },
+        verify(state) { return backend.verifyReason(state).ok; },
         stop(state) {
             const observed = observe(state, { fsApi, uid });
             if (observed.state === 'gone') return;
@@ -380,4 +436,5 @@ export function createMpsDaemonBackend({ root = MPS_ROOT, fsApi = fs, query = sp
             throw new MpsError('MPS daemon did not terminate before its deadline');
         },
     };
+    return backend;
 }

@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { MpsError } from './mpsEligibility.mjs';
-import { isMpsClientAlias, validateMpsDefault } from './mps.mjs';
+import { isMpsClientAlias, validateMpsDefault, verifyDetail } from './mps.mjs';
 import { findHardwareOutcome } from './errors.mjs';
 import { inApplyStep, describeApplyCause, formatApplyCause } from './applyCause.mjs';
 
@@ -171,7 +171,7 @@ function* transitionSteps(input, { assertCapability, store, backend, drain, recr
             check();
             const daemon = inApplyStep('daemon-start', () => backend.start(plan.serverDefault, { tools, onState: (next) => { state = { ...state, ...next, status: 'transitioning', oldClients: plan.oldClients, desiredClients: plan.desiredClients, pendingClients: state.pendingClients, drainedClients: state.drainedClients }; save(); } }));
             state = { ...state, ...daemon, status: 'transitioning', oldClients: plan.oldClients, desiredClients: plan.desiredClients, pendingClients: state.pendingClients, drainedClients: state.drainedClients }; save();
-            if (!backend.verify(state)) throw new MpsError('MPS daemon lost its verified defaults before client create');
+            { const verified = verifyDetail(backend, state); if (!verified.ok) throw new MpsError(`MPS daemon lost its verified defaults before client create${verified.reason ? ` (${verified.reason})` : ''}`); }
         }
         for (const client of plan.recreate) {
             check();
@@ -182,7 +182,7 @@ function* transitionSteps(input, { assertCapability, store, backend, drain, recr
                 // created, whatever the cause: only the selected target's own
                 // failure becomes the target's outcome (plan 10.2); a peer's
                 // is that peer's pending result and never the target's refusal.
-                if (client.share && !backend.verify(state)) throw new MpsError('MPS daemon defaults changed before client create');
+                if (client.share) { const verified = verifyDetail(backend, state); if (!verified.ok) throw new MpsError(`MPS daemon defaults changed before client create${verified.reason ? ` (${verified.reason})` : ''}`); }
                 result = yield () => inApplyStep('client-launch', () => recreate(client, readyState, input.capability));
             } catch (error) {
                 // One client's failure is its own terminal outcome; the rest
