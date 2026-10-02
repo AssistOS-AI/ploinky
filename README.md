@@ -810,6 +810,15 @@ grant for the exact agent, and both matching host driver MPS tools. Unified
 GPUs, including GB10, and unknown memory models refuse a configured share.
 SM and VRAM percentages are integers from 1 to 100. VRAM resolves against
 dedicated device memory, rounded down to MiB, with a 512 MiB minimum.
+Each share client keeps its exact share in `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE`
+and `CUDA_MPS_PINNED_DEVICE_MEM_LIMIT`. The daemon-wide default is the largest
+SM share and the largest memory share rounded up to the next whole GiB, because
+the driver reports its memory default in whole GiB (the captured driver 595.91.07
+read back a configured 1044M as `1G`). The configured default is always a whole
+GiB, so the readback is compared exactly, with no tolerance. A client value can
+only tighten the default, and a process that drops its own variables can reach
+the rounded default. The administrator status reports `vramMiB` (the configured
+default) and `shareMemoryMiB` (the largest share it came from).
 
 Prepare the selected image through normal agent startup before saving a GPU
 share. Save inspects the canonical image and registered alias profiles without
