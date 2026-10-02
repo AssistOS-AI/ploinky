@@ -4,6 +4,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { requireTransport } from './liveProcess.mjs';
 
@@ -107,10 +108,18 @@ export function liveSourceDigest(root) {
     walk(root); return digest(rows.join('\n'));
 }
 
-export const INSPECT = '{"id":{{json .Id}},"created":{{json .Created}},"image":{{json .Image}},"labels":{{json .Config.Labels}},"mounts":{{json .Mounts}},"running":{{json .State.Running}},"pid":{{json .State.Pid}},"startedAt":{{json .State.StartedAt}},"conmonPid":{{json .State.ConmonPid}},"memory":{{json .HostConfig.Memory}},"memorySwap":{{json .HostConfig.MemorySwap}},"nanoCpus":{{json .HostConfig.NanoCpus}},"cpuQuota":{{json .HostConfig.CpuQuota}},"cpuPeriod":{{json .HostConfig.CpuPeriod}},"pidsLimit":{{json .HostConfig.PidsLimit}}}';
+// Go-template field names are the engine's Go struct names, not the JSON keys
+// of `inspect`: the identifier is `.ID` (`.Id` fails on Podman 5.7 and 6.0 with
+// "can't evaluate field Id in type interface {}").
+export const INSPECT = '{"id":{{json .ID}},"created":{{json .Created}},"image":{{json .Image}},"labels":{{json .Config.Labels}},"mounts":{{json .Mounts}},"running":{{json .State.Running}},"pid":{{json .State.Pid}},"startedAt":{{json .State.StartedAt}},"conmonPid":{{json .State.ConmonPid}},"memory":{{json .HostConfig.Memory}},"memorySwap":{{json .HostConfig.MemorySwap}},"nanoCpus":{{json .HostConfig.NanoCpus}},"cpuQuota":{{json .HostConfig.CpuQuota}},"cpuPeriod":{{json .HostConfig.CpuPeriod}},"pidsLimit":{{json .HostConfig.PidsLimit}}}';
 // Nested fixture agents additionally report their name and the image
 // reference they were created from.
 export const AGENT_INSPECT = INSPECT.replace('{"id":', '{"name":{{json .Name}},"imageName":{{json .ImageName}},"id":');
+
+// The minimal, version-robust query that finds a container by identity
+// without parsing an inspect document: `{{.ID}} {{.Names}}` per line.
+export const PS_IDENTITY_FORMAT = '{{.ID}} {{.Names}}';
+export const boxPsArgv = pathHash => ['container', 'ps', '--all', '--no-trunc', '--filter', `label=${BOX_LABELS.pathHash}=${pathHash}`, '--format', PS_IDENTITY_FORMAT];
 
 export function checkedJson(result) { requireTransport(result); return JSON.parse(result.stdout); }
 

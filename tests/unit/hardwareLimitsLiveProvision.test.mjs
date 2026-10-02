@@ -10,6 +10,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { writePrivateJson } from '../hardware-limits/fixtures.mjs';
 import { executeCleanupRun, jsonDigest, liveSourceDigest, runLiveCommand, validateExecutionProfile, validateProfile } from '../hardware-limits/liveHarness.mjs';
@@ -18,8 +19,8 @@ import { admitManifestRuntimeCapabilities, validateManifestRuntimeCapabilities }
 import { deprecatedHardwareDeclarations } from '../../cli/sandbox/hardwareLimits/declaredLimits.mjs';
 import { buildConcreteManifest, summaryPathFor } from '../hardware-limits/liveManifest.mjs';
 import { writeUstar } from '../hardware-limits/liveStage.mjs';
-import { engineIdentityDigest, engineIdentityFacts, hostRecordPaths, quarantinePath, workspaceSocketProblem } from '../hardware-limits/liveCommon.mjs';
-import { CRASH_EXIT, FAKE_CONNECTIONS, createFakeSsh, createFakeWorld, fakeEngineInfo, ok, worldState } from '../hardware-limits/fakeLiveEngine.mjs';
+import { AGENT_INSPECT, ENGINE_INFO_ARGV, INSPECT, PS_IDENTITY_FORMAT, boxPsArgv, engineIdentityDigest, engineIdentityFacts, hostRecordPaths, quarantinePath, workspaceSocketProblem } from '../hardware-limits/liveCommon.mjs';
+import { CRASH_EXIT, FAKE_CONNECTIONS, createFakeSsh, createFakeWorld, evaluateTemplate, fakeEngineInfo, ok, unsupportedFormat, worldState } from '../hardware-limits/fakeLiveEngine.mjs';
 
 const hash = value => `sha256:${crypto.createHash('sha256').update(value).digest('hex')}`;
 const REPO = fs.realpathSync(fileURLToPath(new URL('../..', import.meta.url)));
@@ -205,6 +206,117 @@ test('L1.provision-failure-boundaries-clean-up', async t => {
         const state = worldState(w.statePath);
         assert.equal(state.destroyCalls, state.startCalls && !faults.start?.noBox ? 1 : 0, label);
     }
+});
+
+// The fake evaluates `--format` like Podman: Go struct field names only. Real
+// Podman 5.7 and 6.0 reject `{{json .Id}}` (exit 125); the harness once did
+// exactly that and the lenient fake hid it.
+test('L1.fake-engine-templates-are-strict', async t => {
+    const podmanShape = /^Error: template: inspect:1:\d+: executing "inspect" at <\.Id>: can't evaluate field Id in type interface \{\}$/;
+    const model = { ID: 'x'.repeat(64), Config: { Labels: { a: 'b' } }, State: { Running: true } };
+    const rejected = evaluateTemplate('{"id":{{json .Id}}}', 'inspect', model);
+    assert.equal(typeof rejected, 'object'); assert.equal(rejected.status, 125); assert.match(rejected.stderr, podmanShape);
+    assert.equal(evaluateTemplate('{"id":{{json .ID}}}', 'inspect', model), `{"id":"${'x'.repeat(64)}"}`);
+    assert.equal(evaluateTemplate('{{.ID}}', 'inspect', model), 'x'.repeat(64));
+    assert.equal(evaluateTemplate('{{json .Config.Labels}}', 'inspect', model), '{"a":"b"}');
+    // Nested fields, JSON key spellings and unknown fields are refused too.
+    for (const template of ['{{json .Config.Bogus}}', '{{json .State.running}}', '{{json .state}}', '{{json .HostConfig.Memory.Deep}}', '{{.id}}']) {
+        const result = evaluateTemplate(template, 'inspect', model);
+        assert.equal(result.status, 125, template); assert.match(result.stderr, /can't evaluate field \w+ in type interface \{\}/, template);
+    }
+    assert.equal(evaluateTemplate('{{json .}}', 'inspect', model).status, 125);
+    assert.equal(evaluateTemplate('{{bogus .ID}}', 'inspect', model).status, 125);
+    assert.equal(evaluateTemplate('{{.Id}} {{.Names}}', 'ps', {}).status, 125);
+    assert.equal(evaluateTemplate('{{.Host}}', 'info', {}).status, 125);
+    assert.equal(evaluateTemplate('{{json .}}', 'info', { host: 1 }), '{"host":1}');
+    // Every template the harness really sends is supported, argv by argv.
+    for (const args of [['container', 'inspect', '--format', INSPECT, 'id'], ['container', 'exec', 'box', 'podman', 'container', 'inspect', '--format', AGENT_INSPECT, 'name'],
+        [...boxPsArgv('0'.repeat(12))], ['container', 'ps', '--all', '--no-trunc', '--format', '{{.ID}}'], [...ENGINE_INFO_ARGV]]) assert.equal(unsupportedFormat(args), null, args.join(' '));
+    assert.equal(unsupportedFormat(['container', 'inspect', '--format', INSPECT.replace('.ID', '.Id'), 'id']).status, 125);
+    // The same strictness holds through the file-backed engine of the world.
+    const w = await provisioned(t);
+    const [box] = Object.values(worldState(w.statePath).boxes);
+    const run = (...args) => w.engineProvider(w.engine, args, { cwd: w.home, env: { HOME: w.home } });
+    const bad = await run('container', 'inspect', '--format', '{"id":{{json .Id}}}', box.id);
+    assert.equal(bad.status, 125); assert.match(bad.stderr, podmanShape); assert.equal(bad.stdout, '');
+    assert.equal(JSON.parse((await run('container', 'inspect', '--format', INSPECT, box.id)).stdout).id, box.id);
+    const row = (await run(...boxPsArgv(buildWorkspaceIdentity(w.run.target.execution.workspace.path).pathHash))).stdout;
+    assert.equal(row, `${box.id} ${box.name}\n`); assert.equal(PS_IDENTITY_FORMAT, '{{.ID}} {{.Names}}');
+    assert.equal((await run('container', 'ps', '--all', '--no-trunc', '--filter', `label=${BOX_LABELS.pathHash}=${'0'.repeat(12)}`, '--format', '{{.ID}}')).stdout, '');
+    assert.equal((await run('container', 'ps', '--all', '--format', '{{.Id}}')).status, 125);
+    assert.equal((await run('container', 'ps', '--all', '--filter', 'bogus=1', '--format', '{{.ID}}')).status, 125);
+});
+
+// Provision creates the Box, then the post-create inspect fails (as `.Id` did
+// on a real engine). The Box was never receipted, but its deterministic
+// identity was recorded on the fixture-start intent before the process ran,
+// so cleanup still finds and destroys exactly it.
+const INSPECT_FAILS = { ...ok(''), status: 125, stderr: 'Error: template: inspect:1:7: executing "inspect" at <.Id>: can\'t evaluate field Id in type interface {}' };
+// Provision with a failing post-create inspect; `tamper(box)` alters the
+// Box right after production creates it.
+async function provisionWithBrokenInspect(t, tamper = () => {}) {
+    const w = world(t, { faults: { inspect: { at: 2, result: INSPECT_FAILS } } });
+    const writes = [];
+    const processProvider = async (binary, args, options) => {
+        const result = await w.engineProvider(binary, args, options);
+        if (binary === w.node && args.includes('start')) {
+            const state = worldState(w.statePath);
+            for (const box of Object.values(state.boxes)) tamper(box);
+            fs.writeFileSync(w.statePath, JSON.stringify(state));
+        }
+        return result;
+    };
+    const persist = () => {
+        const op = w.run.operations.find(value => value.kind === 'fixture-start');
+        writes.push({ box: op?.box ?? null, state: op?.state ?? null, startCalls: fs.existsSync(w.statePath) ? worldState(w.statePath).startCalls : 0 });
+        w.persist();
+    };
+    const report = await provisionRun({ run: w.run, persist, processProvider, portProbe: free, hostIdentity: w.hostIdentity, validateProfile });
+    return { w, writes, report };
+}
+
+test('L1.provision-box-inspect-failure-still-records-and-cleans-the-box', async t => {
+    const { w, writes, report } = await provisionWithBrokenInspect(t);
+    const identity = { instance: w.run.workspace.instance, pathHash: w.run.workspace.pathHash };
+    assert.equal(report.verdict, 'FAIL'); assert.match(report.limitations[0], /Live command failed/);
+    // No Box receipt, but the identity is on the fixture-start intent, durable before the process could run.
+    assert.deepEqual(w.run.ownedBoxes, []);
+    assert.deepEqual(w.run.operations.find(op => op.kind === 'fixture-start').box, { name: identity.instance, pathHash: identity.pathHash });
+    const first = writes.find(entry => entry.box);
+    assert.equal(first.state, 'intent'); assert.equal(first.startCalls, 0, 'recorded before start ran');
+    // Cleanup found it by the recorded identity (name and label) and destroyed it with the candidate.
+    assert.equal(w.run.cleanup.state, 'complete', JSON.stringify(w.run.cleanup.failures));
+    const state = worldState(w.statePath);
+    const query = state.calls.find(call => call.kind === 'ps-filter');
+    assert.deepEqual(query.args, boxPsArgv(identity.pathHash));
+    assert.equal(state.destroyCalls, 1); assert.equal(state.calls.find(call => call.kind === 'destroy').args.slice(-2).join(' '), 'destroy --delete-cache');
+    assertNothingOwned(w);
+});
+
+test('L1.cleanup-refuses-a-box-that-does-not-match-the-recorded-identity', async t => {
+    const cases = [
+        ['label differs', box => { box.labels[BOX_LABELS.pathHash] = 'f'.repeat(12); }, /Workspace remains mounted/],
+        ['name differs', box => { box.name = 'someone-elses-box'; }, /has another name; preserving everything/],
+        ['role label differs', box => { box.labels[BOX_LABELS.role] = 'agent'; }, /is not a Box of this workspace/],
+        ['workspace is not mounted', box => { box.mounts = [{ Source: '/elsewhere', Destination: '/elsewhere' }]; }, /does not mount the owned workspace/],
+    ];
+    for (const [label, tamper, message] of cases) {
+        const { w, report } = await provisionWithBrokenInspect(t, tamper);
+        assert.equal(report.verdict, 'FAIL', label);
+        assert.equal(w.run.cleanup.state, 'failed', `${label}: ${JSON.stringify(w.run.cleanup)}`);
+        assert.match(w.run.cleanup.failures[0], message, label);
+        const state = worldState(w.statePath);
+        assert.equal(Object.keys(state.boxes).length, 1, `${label}: the Box is preserved`); assert.equal(state.destroyCalls, 0, label);
+        assert.equal(exists(w.run.target.execution.provision.workspace.path), true, `${label}: the workspace is preserved`);
+    }
+    // A manifest whose recorded identity names another workspace is refused before any query.
+    const { w } = await provisionWithBrokenInspect(t, box => { box.name = 'x'; });
+    const op = w.run.operations.find(value => value.kind === 'fixture-start');
+    op.box = { name: 'ploinky-box-other-000000000000', pathHash: '0'.repeat(12) };
+    w.run.cleanup = { state: 'not-started', steps: [], failures: [] };
+    const report = await cleanup(w);
+    assert.equal(report.verdict, 'FAIL'); assert.match(w.run.cleanup.failures[0], /recorded fixture-start Box identity is not this workspace/);
+    assert.equal(worldState(w.statePath).destroyCalls, 0);
 });
 
 test('L1.provision-port-collision-aborts', async t => {
@@ -622,7 +734,7 @@ test('L1.prepare-live-mac-cpu-concrete-manifest-and-summary', async t => {
     assert.ok(run.target.plan.live.some(entry => entry.id === 'C1-core-layout') && run.target.plan.live.some(entry => entry.id === 'C2-pids-pressure'));
     assert.equal(run.target.ssh, null); assert.equal(run.target.remote, undefined);
     const summary = fs.readFileSync(summaryPathFor(runPath), 'utf8');
-    assert.equal(summaryPathFor(runPath), path.join(f.evidence, 'mac-cpu-run_summary_claude.md'));
+    assert.equal(summaryPathFor(runPath), path.join(f.evidence, 'mac-cpu-run_summary.md'));
     for (const text of ['Nothing has run', 'TCP 24680', 'UDP 35791', profile.provision.workspace.path, 'memory 64m, cpus 0.5, pids 64', BOX_IMAGE, IMAGE,
         'destroy --delete-cache', 'LIVE-C3 | not run', f.revision, os.hostname(),
         'PLOINKY_BOX_HARDWARE_LIMITS=on', '$SOURCE/ploinky-box/bin/ploinky-box.mjs --port 24680 --udp-port 35791 start hwlfixture/memory`']) assert.ok(summary.includes(text), text);
@@ -652,6 +764,9 @@ test('L1.prepare-live-apparatus-cpu-concrete-manifest-and-summary', async t => {
     assert.ok(run.target.plan.staging.some(entry => entry.id === 'remove-staging'));
     const summary = fs.readFileSync(summaryPathFor(runPath), 'utf8');
     for (const text of ['skutner@100.76.22.69', 'HostKeyAlias 192.168.1.63', root, 'LIVE-A1 | executed', 'fetched remote cleanup PASS']) assert.ok(summary.includes(text), text);
+    // Nothing is unsupported here: no empty case list, and no agent name in the runtime summary file name.
+    assert.deepEqual(run.target.unsupported, {}); assert.ok(!/Cases\s+stay BLOCKED/.test(summary)); assert.ok(summary.includes('No case is unsupported on this target.'));
+    assert.equal(path.basename(summaryPathFor(runPath)), 'apparatus-cpu-run_summary.md');
 });
 
 test('L1.prepare-live-other-blocks-stay-unsupported', async t => {

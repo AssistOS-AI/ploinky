@@ -362,7 +362,9 @@ export function buildRequiredCaseManifest() {
         ]),
         ...leaves(P, 'p1', unit('hardwareLimitsLiveProvision.test.mjs'), [
             'L1.provision-mac-c1-c2-success', 'L1.provision-apparatus-a1-staged-success',
-            'L1.provision-failure-boundaries-clean-up', 'L1.provision-port-collision-aborts',
+            'L1.provision-failure-boundaries-clean-up', 'L1.fake-engine-templates-are-strict',
+            'L1.provision-box-inspect-failure-still-records-and-cleans-the-box', 'L1.cleanup-refuses-a-box-that-does-not-match-the-recorded-identity',
+            'L1.provision-port-collision-aborts',
             'L1.provision-refuses-preexisting-workspace', 'L1.provision-refuses-existing-host-record',
             'L1.provision-requires-separate-authorization', 'L1.stage-roundtrip-provision-and-cleanup',
             'L1.stage-payload-digest-mismatch-refuses', 'L1.stage-forced-settlement-preserves',

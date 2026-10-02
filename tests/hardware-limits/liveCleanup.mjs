@@ -10,16 +10,18 @@ import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { requireTransport, runBoundedProcess } from './liveProcess.mjs';
 import {
-    ID, INSPECT, OWNER_MARKER, assertOwnedDirectory, assertWorkspace, candidateEnv, checkedJson, hostRecordPaths,
+    ID, INSPECT, OWNER_MARKER, assertOwnedDirectory, assertWorkspace, boxPsArgv, candidateEnv, checkedJson, hostRecordPaths,
     jsonDigest, liveSourceDigest, observeEngineIdentity, quarantinePath,
 } from './liveCommon.mjs';
 
 // One journaled command: the intent is persisted before the process starts and
-// the observed status after it ends. Output is never persisted here.
+// the observed status after it ends. Output is never persisted here. A `box`
+// identity ({ name, pathHash }) is stored on the intent, so it is durable
+// before the command that creates that Box can run.
 export function createJournal({ run, persist, processProvider = runBoundedProcess, signal }) {
-    return async function journaled(kind, binary, args, { cwd, env, deadlineMs = 30000, stress = false, resourceIds = [], stdinPath = null } = {}) {
+    return async function journaled(kind, binary, args, { cwd, env, deadlineMs = 30000, stress = false, resourceIds = [], stdinPath = null, box = null } = {}) {
         if (run.operations.length >= 512 || Buffer.byteLength(JSON.stringify(run)) > 190000) throw new Error('Live journal bound exceeded');
-        const op = { id: `live-${run.operations.length + 1}`, kind, state: 'intent', resourceIds, argvDigest: jsonDigest([binary, ...args]), resultArtifact: null };
+        const op = { id: `live-${run.operations.length + 1}`, kind, state: 'intent', resourceIds, argvDigest: jsonDigest([binary, ...args]), resultArtifact: null, ...(box ? { box } : {}) };
         run.operations.push(op); persist();
         const result = await processProvider(binary, args, { cwd, env, deadlineMs, maxBytes: 65536, signal, ...(stdinPath ? { stdinPath } : {}) });
         op.state = 'observed';
@@ -160,19 +162,28 @@ export async function runOwnedCleanup({ run, profile, persist = () => {}, proces
     }
 
     // The recorded Box; or, when start was attempted but the Box receipt was
-    // never persisted, the one new Box labelled with this workspace's path
-    // hash that mounts exactly this workspace. Ambiguity preserves everything.
+    // never persisted (for example its post-create inspect failed), the one
+    // container found by the identity recorded on the `fixture-start`
+    // operation: the deterministic instance name and the workspace path-hash
+    // label, through a minimal `ps` query that parses no inspect document. It
+    // must carry exactly that name and label, the Box role and a mount of
+    // exactly this workspace. Anything else preserves everything.
     async function findOwnedBox(ids, workspaceState) {
         if (profile.box?.id) return ids.includes(profile.box.id) ? { id: profile.box.id, recorded: true } : null;
-        if (!run.operations.some(op => op.kind === 'fixture-start') || workspaceState.state !== 'present') return null;
+        const started = run.operations.find(op => op.kind === 'fixture-start');
+        if (!started || workspaceState.state !== 'present') return null;
+        if (started.box?.name !== instance || started.box?.pathHash !== pathHash) throw new Error('The recorded fixture-start Box identity is not this workspace\'s; preserving everything');
         const before = new Set((run.preInventory.containers || []).map(value => value.id));
+        const listed = await engine('cleanup-candidate-ps', boxPsArgv(started.box.pathHash));
+        const rows = listed.stdout.split('\n').filter(line => line.trim()).map(line => /^([a-f0-9]{64}) (\S+)$/.exec(line.trim()));
+        if (rows.length > 16 || rows.some(row => !row)) throw new Error('Unsupported Box identity query output');
         const found = [];
-        for (const id of ids.filter(value => !before.has(value))) {
+        for (const [, id, name] of rows.filter(row => !before.has(row[1]))) {
+            if (name !== started.box.name) throw new Error('A container with this workspace\'s path-hash label has another name; preserving everything');
             const value = checkedJson(await engine('cleanup-candidate', ['container', 'inspect', '--format', INSPECT, id]));
-            if (value.labels?.[BOX_LABELS.pathHash] === pathHash && value.labels?.[BOX_LABELS.role] === 'box') {
-                if (!Array.isArray(value.mounts) || !value.mounts.some(mount => mount.Source === profile.workspace.path)) throw new Error('A Box with this path hash does not mount the owned workspace');
-                found.push(value.id);
-            }
+            if (value.id !== id || value.labels?.[BOX_LABELS.pathHash] !== started.box.pathHash || value.labels?.[BOX_LABELS.role] !== 'box') throw new Error('A container with this Box name is not a Box of this workspace; preserving everything');
+            if (!Array.isArray(value.mounts) || !value.mounts.some(mount => mount.Source === profile.workspace.path)) throw new Error('A Box with this path hash does not mount the owned workspace');
+            found.push(value.id);
         }
         if (found.length > 1) throw new Error('More than one Box claims the owned workspace');
         return found.length ? { id: found[0], recorded: false } : null;

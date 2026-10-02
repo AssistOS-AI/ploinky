@@ -19,7 +19,7 @@ import { PREPARE_SCRIPT_BOX_PATH } from '../../ploinky-box/hardwareLimits/status
 import { ensureAgentCgroupParents, readStructuralDelegation } from '../../cli/sandbox/hardwareLimits/delegation.mjs';
 import { parseGpuInventory, requireGpuIdle } from '../hardware-limits/liveGpu.mjs';
 import { engineIdentityDigest } from '../hardware-limits/liveCommon.mjs';
-import { fakeEngineInfo } from '../hardware-limits/fakeLiveEngine.mjs';
+import { fakeEngineInfo, unsupportedFormat } from '../hardware-limits/fakeLiveEngine.mjs';
 import {
     assertWorkspace, executeLiveRun, jsonDigest, readPrivateJson, runLiveCommand,
     validateAuthorization, validateExecutionProfile, liveSourceDigest,
@@ -56,6 +56,8 @@ function fixture(t) {
     const calls = []; let destroyed = false; let active = null; let pressured = false;
     const provider = async (binary, args, options) => {
         calls.push({ binary, args, options });
+        // Like Podman, refuse a `--format` template that names a field the engine does not have.
+        const refused = unsupportedFormat(args); if (refused) return refused;
         if (binary === node) { destroyed = true; return ok(''); }
         if (args[0] === 'info') return ok(JSON.stringify(fakeEngineInfo(host)));
         if (args.includes('ps')) return ok(destroyed ? '' : box.id + '\n');

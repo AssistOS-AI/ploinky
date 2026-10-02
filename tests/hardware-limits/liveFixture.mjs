@@ -215,8 +215,11 @@ export async function provisionRun({
         // record of the instance that exists afterwards is this run's, even
         // when the start itself fails.
         try {
+            // The Box identity is deterministic, so it is recorded on the
+            // intent before the process that creates it can run.
             await journaled('fixture-start', profile.node.path, startArgs(profile, run.ports), {
                 cwd: workspace.path, env: { ...env, PLOINKY_BOX_HARDWARE_LIMITS: 'on' }, deadlineMs: run.deadlines.startMs || 1200000,
+                box: { name: identity.instance, pathHash: identity.pathHash },
             });
         } finally { recordHostRecords(run, profile, instance); persist(); }
         const after = await listIds('box-inventory');

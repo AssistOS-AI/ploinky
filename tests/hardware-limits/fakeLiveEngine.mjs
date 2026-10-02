@@ -16,6 +16,95 @@ const hex = value => crypto.createHash('sha256').update(String(value)).digest('h
 export const ok = (stdout = '', extra = {}) => ({ status: 0, signal: null, stdout, stderr: '', timedOut: false, truncated: false, cancelled: false, errorCode: null, settlementForced: false, ...extra });
 const failed = (stderr, status = 1) => ok('', { status, stderr });
 
+// --- Strict Go-template evaluation -----------------------------------------
+// Real Podman renders `--format` with Go's text/template over its Go structs,
+// so a field is addressed by its Go struct name (`.ID`), not by the JSON key
+// of the same document (`.Id`). The fake evaluates the same way: only the
+// field paths listed here exist, and any other path fails with exit 125 and
+// Podman's message shape, `can't evaluate field X in type interface {}`. The
+// lists are deliberately the fields the harness reads; a template that reaches
+// for another field fails in unit tests until the field is added here on
+// purpose, after it is proved on a real engine.
+const INSPECT_FIELDS = Object.freeze({
+    ID: true, Created: true, Image: true, ImageName: true, Name: true, Mounts: true,
+    Config: { Labels: true },
+    State: { Running: true, Pid: true, StartedAt: true, ConmonPid: true },
+    HostConfig: { Memory: true, MemorySwap: true, NanoCpus: true, CpuQuota: true, CpuPeriod: true, PidsLimit: true },
+});
+const PS_FIELDS = Object.freeze({ ID: true, Names: true, Image: true, ImageID: true, Labels: true, State: true, Status: true, Mounts: true, Created: true, CreatedAt: true, Pid: true });
+// `info` is only ever rendered whole.
+const TEMPLATE_SCHEMAS = Object.freeze({ inspect: INSPECT_FIELDS, ps: PS_FIELDS, info: null });
+const templateFailure = message => failed(`Error: ${message}`, 125);
+const goString = value => (typeof value === 'string' ? value : value === undefined || value === null ? '' : typeof value === 'object' ? JSON.stringify(value) : String(value));
+
+// Render `template` for `kind` over `model` (undefined: validate only). Returns
+// the rendered text, or a failed engine result for an unsupported template.
+export function evaluateTemplate(template, kind, model) {
+    const schema = TEMPLATE_SCHEMAS[kind];
+    if (typeof template !== 'string') return templateFailure('template: no format given');
+    let output = ''; let last = 0;
+    for (const match of template.matchAll(/\{\{(.*?)\}\}/g)) {
+        output += template.slice(last, match.index); last = match.index + match[0].length;
+        const words = match[1].trim().split(/\s+/);
+        const json = words[0] === 'json';
+        const expression = json ? words.slice(1) : words;
+        const column = match.index + match[0].indexOf(expression[0] ?? '');
+        if (words[0] && !json && !expression[0].startsWith('.')) return templateFailure(`template: ${kind}:1: function "${words[0]}" not defined`);
+        if (expression.length !== 1) return templateFailure(`template: ${kind}:1:${match.index + 2}: unexpected number of operands in {{${match[1]}}}`);
+        const reference = expression[0];
+        let value = model; let node = schema;
+        if (reference !== '.') {
+            const names = reference.slice(1).split('.');
+            if (!/^\.[A-Za-z]+(\.[A-Za-z]+)*$/.test(reference)) return templateFailure(`template: ${kind}:1:${column}: bad character in ${reference}`);
+            for (const name of names) {
+                if (!node || typeof node !== 'object' || !Object.hasOwn(node, name)) {
+                    return templateFailure(`template: ${kind}:1:${column}: executing "${kind}" at <${reference}>: can't evaluate field ${name} in type interface {}`);
+                }
+                node = node[name]; value = value === undefined ? undefined : value?.[name];
+            }
+        } else if (node !== null) return templateFailure(`template: ${kind}:1:${column}: executing "${kind}" at <.>: this command does not render the whole document`);
+        output += json ? (value === undefined ? 'null' : JSON.stringify(value)) : goString(value);
+    }
+    return output + template.slice(last);
+}
+
+// The engine's reply to an unsupported `--format` template in a command line,
+// or null when the command has none or the template is supported. For fakes
+// that interpret commands themselves.
+export function unsupportedFormat(args) {
+    const kind = args[0] === 'info' ? 'info' : args.includes('ps') ? 'ps' : args.includes('inspect') ? 'inspect' : null;
+    const at = args.indexOf('--format');
+    if (!kind || at < 0) return null;
+    const rendered = evaluateTemplate(args[at + 1], kind);
+    return typeof rendered === 'string' ? null : rendered;
+}
+const formatOf = args => { const at = args.indexOf('--format'); return at < 0 ? args.find(value => value.startsWith('--format='))?.slice(9) : args[at + 1]; };
+const filtersOf = args => args.flatMap((value, at) => (value === '--filter' ? [args[at + 1]] : value.startsWith('--filter=') ? [value.slice(9)] : []));
+const inspectModel = record => ({
+    ID: record.id, Created: record.created, Image: record.image, ImageName: record.imageName ?? '', Name: record.name ?? '', Mounts: record.mounts ?? [],
+    Config: { Labels: record.labels ?? null },
+    State: { Running: record.running ?? false, Pid: record.pid ?? 1, StartedAt: record.startedAt ?? 'x', ConmonPid: record.conmonPid ?? 2 },
+    HostConfig: { Memory: record.memory ?? 0, MemorySwap: record.memorySwap ?? 0, NanoCpus: record.nanoCpus ?? 0, CpuQuota: record.cpuQuota ?? 0, CpuPeriod: record.cpuPeriod ?? 0, PidsLimit: record.pidsLimit ?? 0 },
+});
+const psModel = record => ({
+    ID: record.id, Names: record.name ?? record.id.slice(0, 12), Image: record.imageName ?? record.image, ImageID: record.image, Labels: record.labels ?? {},
+    State: record.running === false ? 'exited' : 'running', Status: record.running === false ? 'Exited' : 'Up', Mounts: (record.mounts ?? []).map(mount => mount.Destination), Created: record.created, CreatedAt: record.created, Pid: record.pid ?? 1,
+});
+// Podman's ps filters: `label=K[=V]` is exact, `name=` and `id=` match by regular expression.
+function psMatches(record, filters) {
+    for (const filter of filters) {
+        const at = filter.indexOf('='); const key = filter.slice(0, at); const value = filter.slice(at + 1);
+        if (at < 0 || !['label', 'name', 'id'].includes(key)) return null;
+        if (key === 'label') {
+            const split = value.indexOf('=');
+            const [name, expected] = split < 0 ? [value, undefined] : [value.slice(0, split), value.slice(split + 1)];
+            const labels = record.labels ?? {};
+            if (!Object.hasOwn(labels, name) || (expected !== undefined && labels[name] !== expected)) return false;
+        } else if (key === 'name' ? !new RegExp(value).test(psModel(record).Names) : !record.id.startsWith(value)) return false;
+    }
+    return true;
+}
+
 // The `info --format {{json .}}` reply of the fake engine service: the given
 // host facts over stable defaults for every fact the runner's identity uses.
 export function fakeEngineInfo(host = {}) {
@@ -37,12 +126,15 @@ export function createFakeWorld({ statePath, node, engine, host, unrelated = [],
         if (args[0] === 'info') return 'info';
         if (args[0] === 'system' && args[1] === 'connection') return 'connections';
         if (args[0] === 'unshare') return 'unshare';
-        if (args[0] === 'container' && args[1] === 'ps') return 'ps';
+        if (args[0] === 'container' && args[1] === 'ps') return filtersOf(args).length ? 'ps-filter' : 'ps';
         if (args[0] === 'container' && args[1] === 'inspect') return 'inspect';
         if (args[0] === 'container' && args[1] === 'exec' && args.includes('inspect')) return 'agent-inspect';
         return 'exec';
     };
-    const inspectOf = (value) => JSON.stringify({ memory: 0, memorySwap: 0, nanoCpus: 0, cpuQuota: 0, cpuPeriod: 0, pidsLimit: 0, pid: 1, conmonPid: 2, startedAt: 'x', ...value });
+    const render = (args, kind, model) => {
+        const rendered = evaluateTemplate(formatOf(args), kind, model);
+        return typeof rendered === 'string' ? ok(rendered) : rendered;
+    };
     return async function provider(binary, args, options = {}) {
         const state = load();
         const kind = kindOf(binary, args);
@@ -55,19 +147,31 @@ export function createFakeWorld({ statePath, node, engine, host, unrelated = [],
         }
         try {
             switch (kind) {
-            case 'info': return ok(JSON.stringify(fault?.info || fakeEngineInfo(fault?.host || host)));
+            case 'info': return render(args, 'info', fault?.info || fakeEngineInfo(fault?.host || host));
             case 'connections': return ok(JSON.stringify(fault?.connections || FAKE_CONNECTIONS));
-            case 'ps': return ok([...Object.keys(state.boxes), ...state.unrelated.map(value => value.id)].join('\n') + '\n');
+            case 'ps': case 'ps-filter': {
+                const filters = filtersOf(args);
+                const rows = [];
+                for (const record of [...Object.values(state.boxes), ...state.unrelated]) {
+                    const matches = psMatches(record, filters);
+                    if (matches === null) return failed('Error: invalid filter', 125);
+                    if (!matches) continue;
+                    const rendered = evaluateTemplate(formatOf(args), 'ps', psModel(record));
+                    if (typeof rendered !== 'string') return rendered;
+                    rows.push(rendered);
+                }
+                return ok(rows.map(row => `${row}\n`).join(''));
+            }
             case 'inspect': {
                 const id = args.at(-1);
                 const box = state.boxes[id] || state.unrelated.find(value => value.id === id);
-                return box ? ok(inspectOf(box)) : failed('no such container');
+                return box ? render(args, 'inspect', inspectModel(box)) : failed('no such container');
             }
             case 'agent-inspect': {
                 const name = args.at(-1);
                 const agent = state.agents[name];
                 if (!agent || fault?.drop === name) return failed('no such container');
-                return ok(inspectOf({ ...agent, ...(fault?.patch || {}) }));
+                return render(args, 'inspect', inspectModel({ ...agent, ...(fault?.patch || {}) }));
             }
             case 'start': {
                 const workspace = options.cwd;
@@ -76,7 +180,7 @@ export function createFakeWorld({ statePath, node, engine, host, unrelated = [],
                 if (!fault?.noBox && !Object.values(state.boxes).some(box => box.labels[BOX_LABELS.pathHash] === identity.pathHash)) {
                     const id = hex(`box-${workspace}-${++state.counter}`);
                     state.boxes[id] = {
-                        id, created: `2026-10-02T00:00:0${state.counter % 10}Z`, image: hex('box-image'), running: true,
+                        id, name: identity.instance, created: `2026-10-02T00:00:0${state.counter % 10}Z`, image: hex('box-image'), running: true,
                         labels: { [BOX_LABELS.pathHash]: identity.pathHash, [BOX_LABELS.role]: 'box', [BOX_LABELS.hardwareLimits]: hex('gate'), [BOX_LABELS.imageRef]: options.env?.PLOINKY_BOX_IMAGE },
                         mounts: [{ Source: workspace, Destination: workspace }],
                     };

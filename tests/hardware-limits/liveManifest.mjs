@@ -196,7 +196,7 @@ export function plannedCommands(run) {
     );
     const cleanup = [
         { id: 'revalidate-identity', binary: engine, argv: [...ENGINE_INFO_ARGV], action: 'Recheck engine identity (with its default connection when remote), workspace receipt and marker, or the run-derived quarantine' },
-        { id: 'destroy-box', binary: node, argv: [profile.candidate.path, 'destroy', '--delete-cache'], cwd: workspace, deadlineMs: run.deadlines.destroyMs, action: 'Only when the recorded Box (or the one new Box labelled with this workspace) exists; then prove it absent and compare the unrelated inventory' },
+        { id: 'destroy-box', binary: node, argv: [profile.candidate.path, 'destroy', '--delete-cache'], cwd: workspace, deadlineMs: run.deadlines.destroyMs, action: 'Only when the recorded Box exists, or, when its receipt was never persisted, the one container found by the name and path-hash label recorded at fixture-start (`container ps --all --filter label=<path-hash label>=<hash> --format "{{.ID}} {{.Names}}"`) that also proves the Box role and a mount of exactly this workspace; then prove it absent and compare the unrelated inventory' },
         { id: 'host-records', action: `Remove only recorded ~/.ploinky-box/{${HOST_RECORD_DIRECTORIES.join(',')}}/${run.workspace.instance}[.json]; any unrecorded one refuses the step` },
         { id: 'workspace-removal', action: `Prove no container mounts ${workspace}; rename it to ${path.join(path.dirname(workspace), `.hwl-removing-${run.runId}`)}; reprove uid/dev/ino and marker; remove (marker last)` },
         ...(plan.workspace.parentMode === 'create' ? [{ id: 'workspace-parent-removal', action: `Remove ${plan.workspace.parent} only while it holds nothing but its marker` }] : []),
@@ -294,12 +294,12 @@ export function renderSummary(run, manifestPath) {
         '',
         '## Not covered',
         '',
-        `Cases ${list(Object.keys(run.target.unsupported))} stay BLOCKED. ${plan.workspace.parentMode === 'create' ? 'Production start may pull the pinned images and fetch the default agent repositories; that network use is part of the live run.' : 'The remote start may pull the pinned images and fetch the default agent repositories; that network use is part of the live run.'}`,
+        `${Object.keys(run.target.unsupported).length ? `Cases ${list(Object.keys(run.target.unsupported))} stay BLOCKED. ` : 'No case is unsupported on this target. '}${plan.workspace.parentMode === 'create' ? 'Production start may pull the pinned images and fetch the default agent repositories; that network use is part of the live run.' : 'The remote start may pull the pinned images and fetch the default agent repositories; that network use is part of the live run.'}`,
         '',
     ];
     return lines.filter(value => value !== null).join('\n');
 }
 
 export function summaryPathFor(runPath) {
-    return runPath.replace(/(?:_claude|_codex)?\.json$/, '') + '_summary_claude.md';
+    return runPath.replace(/(?:_claude|_codex)?\.json$/, '') + '_summary.md';
 }
