@@ -1147,3 +1147,43 @@ test('LLM1.the-analysis-needs-the-minimum-in-flight-samples-of-each-kind-and-cou
     const breach = analyzeSamples([leafAt('before-send', 0, 0), leafAt('in-flight', 1_000_000, 100_000_000), leafAt('after-response', 2_000_000, 100_000_100)], gpuRun(min.gpu));
     assert.ok(breach.violations.length >= 1 && breach.blockers.length === 1);
 });
+
+// --- LLM2: the swap CAP is part of the budget ---------------------------------------------------------------------
+test('LLM2.the-swap-cap-must-be-exactly-zero-after-apply-and-in-every-sample', async t => {
+    // Readback after Apply (shared by L1 and L2): unlimited, nonzero and missing are refused; zero is the control.
+    for (const [label, value, pattern] of [['unlimited', 'max', /memory\.swap\.max is max, not 0/], ['nonzero', '4096', /memory\.swap\.max is 4096, not 0/], ['missing', null, /memory\.swap\.max is \(missing\), not 0/]]) {
+        for (const id of ['LIVE-L1', 'LIVE-L2']) {
+            const w = await provisioned(t, { faults: { swapMaxAfterApply: value } });
+            const entry = caseOf(await liveCases(w, [id]), id);
+            assert.equal(entry.result, 'fail', `${label} ${id}: ${JSON.stringify(entry).slice(0, 400)}`); assert.match(entry.reason, pattern, `${label} ${id}`);
+            nothingOwned(w);
+        }
+    }
+    // During inference: unlimited and nonzero fail with the evidence written; a missing file is a measurement that cannot be made.
+    for (const [label, value, result, pattern] of [['unlimited', 'max', 'fail', /memory\.swap\.max is max, not 0 \(/], ['nonzero', '4096', 'fail', /memory\.swap\.max is 4096, not 0 \(/], ['missing', null, 'blocked', /memory\.swap\.max could not be read \(/]]) {
+        const w = await provisioned(t, { faults: { swapMaxInSamples: value } });
+        const entry = caseOf(await liveCases(w, ['LIVE-L1']), 'LIVE-L1');
+        assert.equal(entry.result, result, `${label}: ${JSON.stringify(entry).slice(0, 400)}`); assert.match(entry.reason, pattern, label);
+        const inference = w.artifacts.get('gpu-live-l1').inference;
+        assert.ok([...inference.violations, ...inference.blockers].some(text => pattern.test(text)), `${label}: the evidence was written first`);
+        nothingOwned(w);
+    }
+    // Zero is valid in the readback and in every sample (the existing L1 and L2 passes are the controls).
+    const control = await provisioned(t, { faults: { swapMaxAfterApply: '0', swapMaxInSamples: '0' } });
+    assert.equal(caseOf(await liveCases(control, ['LIVE-L1']), 'LIVE-L1').result, 'pass');
+    nothingOwned(control);
+});
+
+test('LLM2.the-analysis-refuses-an-unlimited-nonzero-or-missing-swap-cap-in-any-sample', () => {
+    const base = cgroupRun(3); const gpu = gpuRun(2);
+    assert.deepEqual([analyzeSamples(base, gpu).violations, analyzeSamples(base, gpu).blockers], [[], []]);
+    for (const [value, pattern] of [['max', /memory\.swap\.max is max, not 0 \(in-flight\)/], ['1', /memory\.swap\.max is 1, not 0/], ['', /memory\.swap\.max is , not 0/]]) {
+        const samples = base.map((sample, index) => (index === 2 ? { ...sample, swapMax: value } : sample));
+        assert.match(analyzeSamples(samples, gpu).violations.join(), pattern, `value '${value}'`);
+    }
+    const missing = base.map((sample, index) => (index === 2 ? { ...sample, swapMax: null } : sample));
+    const result = analyzeSamples(missing, gpu);
+    assert.deepEqual(result.violations, []); assert.match(result.blockers.join(), /memory\.swap\.max could not be read \(in-flight\)/);
+    assert.deepEqual(parseLeafSample({ atNs: '1', 'cpu.stat': 'usage_usec 1\n', 'memory.swap.max': 'max\n' }).swapMax, 'max');
+    assert.equal(parseLeafSample({ atNs: '1', 'cpu.stat': 'usage_usec 1\n' }).swapMax, null);
+});

@@ -164,6 +164,8 @@ export function createLlmCases(ctx) {
         const { values, inBox } = await leafValues(agent);
         evidence.put(`cgroup:${label}`, { leaf: inBox, 'memory.max': trim(values['memory.max']), 'memory.swap.max': trim(values['memory.swap.max']), 'cpu.max': trim(values['cpu.max']), 'pids.max': trim(values['pids.max']), expectedMemoryBytes: memoryBytes, expectedCpus: limits.cpus });
         expects(trim(values['memory.max']) === String(memoryBytes), `${label}: memory.max is ${trim(values['memory.max'])}, not the saved ${limits.memoryPercent}% of the envelope (${memoryBytes})`);
+        // The swap CAP, not only the swap in use: an unlimited, nonzero or missing allowance is not the hardware limit.
+        expects(trim(values['memory.swap.max']) === '0', `${label}: memory.swap.max is ${trim(values['memory.swap.max']) || '(missing)'}, not 0`);
         expects(cpuMaxMatches(values['cpu.max'], String(limits.cpus)), `${label}: cpu.max is ${trim(values['cpu.max'])}, not ${limits.cpus} CPUs`);
         return { memoryBytes, values };
     }

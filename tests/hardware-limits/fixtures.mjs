@@ -687,6 +687,9 @@ export function buildRequiredCaseManifest() {
             // The L1 measurement needs real in-flight observations.
             'LLM1.L1-with-an-instant-generation-is-blocked-and-never-passes-while-a-long-enough-one-passes',
             'LLM1.the-analysis-needs-the-minimum-in-flight-samples-of-each-kind-and-counts-neither-before-nor-after',
+            // The swap cap is part of the budget.
+            'LLM2.the-swap-cap-must-be-exactly-zero-after-apply-and-in-every-sample',
+            'LLM2.the-analysis-refuses-an-unlimited-nonzero-or-missing-swap-cap-in-any-sample',
             'G2.provision-copies-the-local-llm-tree-pins-its-image-and-grants-the-gpu-before-the-start',
             'G2.provision-blocks-a-changed-tree-or-manifest-and-an-image-the-agent-was-not-created-from',
             'G2.L1-passes-budget-cgroup-runner-environment-uid-generation-text-and-digests',

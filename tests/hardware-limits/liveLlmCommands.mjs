@@ -262,9 +262,11 @@ export function analyzeInference({ cgroup, gpu, cpus, memoryCapBytes, shareMiB, 
         }
         summary.cpu.peakIntervalCpus = Math.round(worst * 1000) / 1000;
     }
-    // Memory: peak at or below memory.max, no swap, no OOM kill.
+    // Memory: peak at or below memory.max, the swap CAP exactly 0 in every sample, no swap in use, no OOM kill.
     for (const sample of cgroup) {
         if (sample.memoryMax !== String(memoryCapBytes)) violations.push(`memory.max is ${sample.memoryMax}, not ${memoryCapBytes} (${sample.label})`);
+        if (sample.swapMax === null) blockers.push(`memory.swap.max could not be read (${sample.label}), so the swap cap cannot be verified`);
+        else if (sample.swapMax !== '0') violations.push(`memory.swap.max is ${sample.swapMax}, not 0 (${sample.label})`);
         if (sample.memoryCurrent === null || sample.swapCurrent === null || sample.oomKill === null) blockers.push(`memory.current, memory.swap.current or memory.events could not be read (${sample.label})`);
     }
     const peaks = cgroup.flatMap(sample => [sample.memoryCurrent, sample.memoryPeak]).filter(Number.isFinite);

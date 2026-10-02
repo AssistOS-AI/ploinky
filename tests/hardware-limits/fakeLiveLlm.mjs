@@ -228,6 +228,8 @@ export function createLlmWorld({ statePath, node, engine, host, gpu, faults = {}
     }
 
     // --- In-Box and in-agent programs ---------------------------------------------------------------------
+    // The swap cap the leaf reports: `0` unless a test sets another value (`max`, a number) or `null` (the file is absent).
+    const swapCap = value => (value === null ? null : `${value ?? '0'}\n`);
     const leafPath = a => `/sys/fs/cgroup/ploinky/agents/libpod-${a.id}`;
     function leafValues(target) {
         const a = [...model().agents.values()].find(value => leafPath(value) === target);
@@ -237,7 +239,7 @@ export function createLlmWorld({ statePath, node, engine, host, gpu, faults = {}
         const memory = capBytes(a);
         const memoryMax = faults.memoryMaxWrong ? String(memory - MIB) : memory === null ? 'max' : String(memory);
         const cpuMax = limits.cpus === undefined ? 'max 100000' : `${Math.round((faults.cpuMaxWrong ? limits.cpus * 2 : limits.cpus) * 100000)} 100000`;
-        return ok(JSON.stringify({ 'memory.max': `${memoryMax}\n`, 'memory.swap.max': '0\n', 'memory.current': `${300 * MIB}\n`, 'memory.swap.current': '0\n', 'memory.events': 'low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n', 'cpu.max': `${cpuMax}\n`, 'cpu.stat': 'nr_throttled 0\n', 'pids.max': 'max\n', 'pids.events': 'max 0\n', identity: { dev: '1', ino: '2' } }));
+        return ok(JSON.stringify({ 'memory.max': `${memoryMax}\n`, 'memory.swap.max': swapCap(faults.swapMaxAfterApply), 'memory.current': `${300 * MIB}\n`, 'memory.swap.current': '0\n', 'memory.events': 'low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n', 'cpu.max': `${cpuMax}\n`, 'cpu.stat': 'nr_throttled 0\n', 'pids.max': 'max\n', 'pids.events': 'max 0\n', identity: { dev: '1', ino: '2' } }));
     }
     // One sample of the leaf's counters. Each read advances the leaf's clock by a step and its CPU time by the rate
     // of what is running (low when idle, a share of the quota while a request generates), so usage / wall time is that rate.
@@ -257,7 +259,7 @@ export function createLlmWorld({ statePath, node, engine, host, gpu, faults = {}
         const kills = L.oomKills ?? 0;
         const cpuMax = limits.cpus === undefined ? 'max 100000' : `${Math.round((faults.cpuMaxWrong ? limits.cpus * 2 : limits.cpus) * 100000)} 100000`;
         const raw = { atNs: String(BigInt(L.clockUs) * 1000n), 'cpu.stat': `usage_usec ${L.cpuUsageUsec}\nuser_usec ${L.cpuUsageUsec}\nsystem_usec 0\nnr_periods ${Math.floor(L.clockUs / 100000)}\nnr_throttled 0\nthrottled_usec 0\n`,
-            'cpu.max': `${cpuMax}\n`, 'memory.max': `${faults.memoryMaxWrong ? String(cap - MIB) : cap === null ? 'max' : String(cap)}\n`, 'memory.swap.max': '0\n', 'memory.current': `${current}\n`, 'memory.swap.current': `${swap}\n`,
+            'cpu.max': `${cpuMax}\n`, 'memory.max': `${faults.memoryMaxWrong ? String(cap - MIB) : cap === null ? 'max' : String(cap)}\n`, 'memory.swap.max': swapCap(faults.swapMaxInSamples), 'memory.current': `${current}\n`, 'memory.swap.current': `${swap}\n`,
             'memory.peak': faults.noMemoryPeak ? null : `${L.memoryPeak}\n`, 'memory.events': `low 0\nhigh 0\nmax 0\noom ${kills}\noom_kill ${kills}\n` };
         L.samples.push({ generating: L.generating });
         return ok(JSON.stringify(raw));
