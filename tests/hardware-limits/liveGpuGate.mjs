@@ -43,7 +43,7 @@ function classify(message) {
 }
 
 export function createGpuGate({
-    query, uuid, host, boxPrefix, expectedMemoryMiB = null, intervalMs = 2000,
+    query, uuid, host, boxPrefix, expectedMemoryMiB = null, intervalMs = 2000, retryMs = 100,
     sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), now = Date.now,
 } = {}) {
     if (typeof query !== 'function' || !/^GPU-[a-fA-F0-9-]{8,64}$/.test(String(uuid)) || !host || typeof boxPrefix !== 'string' || !boxPrefix.startsWith('/')) {
@@ -119,7 +119,16 @@ export function createGpuGate({
         // freshly verified PIDs.
         async check(label, { minFreeMiB = 0 } = {}) {
             if (tripped) throw tripped;
-            const { result, inventory, memory } = await guarded(label);
+            // A process the inventory listed may exit before the host can be asked
+            // about it (the MPS server leaves a moment after its last client). Such
+            // a vanished PID is not evidence of foreign activity: the inventory is
+            // read again, a few times at most; a PID that stays listed is judged.
+            let query_ = await guarded(label);
+            for (let attempt = 0; attempt < 3 && query_.inventory.processes.some(({ pid }) => { try { return host.observe(pid) === null; } catch { return false; } }); attempt += 1) {
+                await sleep(retryMs);
+                query_ = await guarded(label);
+            }
+            const { result, inventory, memory } = query_;
             const owned = [];
             for (const { pid } of inventory.processes) {
                 const record = registry.get(pid) || discover(pid);

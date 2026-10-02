@@ -245,6 +245,23 @@ test('G1.gate-an-owned-pid-without-its-provenance-tuple-blocks', async () => {
     assert.throws(() => scriptedGate({ replies: [] }).gate.registerLeaf('/box'), /beneath the exact Box/);
 });
 
+test('G1.gate-a-listed-process-that-vanished-is-re-queried-not-blamed', async () => {
+    const procs = new Map([[900, proc('/box/ploinky/core', { startIdentity: '90' })], [901, proc('/box/ploinky/core', { startIdentity: '91', ppid: 900 })]]);
+    const listed = smiOk(smiXml({ rows: row(901, 'M+C') }));
+    // The MPS server leaves between the inventory and the host lookup: the next inventory is empty and the gate passes.
+    const { gate } = scriptedGate({ replies: [smiOk(smiXml()), listed, listed, smiOk(smiXml())], procs });
+    await gate.initial(); gate.registerDaemon(900);
+    await gate.check('server listed');
+    procs.delete(901);
+    const calm = await gate.check('server gone before the lookup');
+    assert.deepEqual(calm.owned, []);
+    // A listed PID that stays listed but is not on the host at all is judged, after the bounded re-reads.
+    const ghost = scriptedGate({ replies: [smiOk(smiXml()), smiOk(smiXml({ rows: row(4242) }))], procs: new Map() });
+    await ghost.gate.initial();
+    await assert.rejects(ghost.gate.check('ghost'), blockedWith('gpu_busy'));
+    assert.equal(ghost.calls(), 5, 'one initial query, then the check and three re-reads');
+});
+
 test('G1.gate-free-memory-and-real-nvidia-smi-grammar', async () => {
     const real = smiXml({ rows: row(901, 'M+C').replace('>x<', '>nvidia-cuda-mps-server &amp; co<') });
     assert.deepEqual(parseGpuInventory(smiOk(real), UUID).processes, [{ pid: 901, type: 'M+C' }]);
@@ -522,6 +539,8 @@ test('G1.P1-is-blocked-when-a-prerequisite-is-missing-and-never-passes', async t
         ['the administrator route is missing', { adminStatus: 404 }, /answered 404/],
         ['MPS sharing is not eligible', { gpuIneligible: true }, /not eligible/],
         ['the memory default reply has an unsupported wire format', { memoryReplyForm: mib => `${mib} MiB\n` }, /unsupported wire format/],
+        ['the fixture image user is not a numeric non-root UID:GID', { imageUser: 'node' }, /not a non-root numeric UID:GID/],
+        ['the fixture image runs as root', { imageUser: '0:0' }, /not a non-root numeric UID:GID/],
     ];
     for (const [label, fault, message] of faults) {
         const w = await provisioned(t, { faults: fault });
@@ -569,6 +588,11 @@ test('G1.P2-passes-share-tighter-values-and-bypass-with-recorded-rounding', asyn
     assert.deepEqual([measurements.bypass.smCount, measurements.bypass.allocatedMiB, measurements.bypass.termination], [30, 1408, 'bound']);
     assert.ok(Object.values(measurements.bypass.mpsEnv).every(value => value === null), 'the bypass really dropped the MPS environment');
     assert.deepEqual([rounding.overheadMiB, rounding.stepMiB, rounding.fullSmCount, rounding.expectedSmShare, rounding.planEvidence.matchesFull], [148, 128, 30, 8, true]);
+    // After every probe settled, the GPU and the MPS state are recorded (the A1 pattern), before any assertion.
+    const afterSteps = p2.evidence.steps.filter(step => step.name.startsWith('probe-after:'));
+    assert.deepEqual(afterSteps.map(step => step.name), ['probe-after:share', 'probe-after:tighter-sm', 'probe-after:tighter-memory', 'probe-after:bypass']);
+    for (const step of afterSteps) { assert.equal(step.value.mpsAfter.daemonAlive, true); assert.equal(step.value.after.length, 2); assert.ok(step.value.after.every(sample => sample.freeMiB > 5000)); }
+    assert.ok(afterSteps[0].value.mpsAfter.servers.length === 1, 'the MPS server the probe started is listed');
     // The exact probe commands, each after a gate query, the bypass through `env -u`.
     const argvs = probeCalls(w).map(call => call.args.slice(call.args.indexOf('container', 5)));
     assert.equal(argvs.length, 4);
@@ -954,4 +978,38 @@ test('G1.administrator-request-program-authenticates-against-the-products-own-ve
     // An oversized or invalid request is refused by the program before any connection.
     assert.notEqual((await runProgram(program, ['DELETE', ''], { PLOINKY_MASTER_KEY: key })).status, 0);
     assert.notEqual((await runProgram(program, ['POST', 'x'.repeat(20000)], { PLOINKY_MASTER_KEY: key })).status, 0);
+});
+
+// --- Plan and profile validation -------------------------------------------------------------------
+test('G1.gpu-plan-and-profile-validation-refuse-inconsistent-fixtures-and-pins', async t => {
+    const { validateProvisionPlan } = await import('../hardware-limits/liveFixture.mjs');
+    const w = gpuWorld(t);
+    const plan = () => structuredClone(w.run.target.execution.provision);
+    assert.doesNotThrow(() => validateProvisionPlan(plan(), w.run));
+    const mutate = (label, change) => { const value = plan(); change(value); assert.throws(() => validateProvisionPlan(value, w.run), label); };
+    mutate('GPU agents without a GPU plan', value => { delete value.gpu; });
+    mutate('a GPU plan over CPU agents', value => { value.agents = value.agents.filter(agent => agent.name === 'cpu'); });
+    mutate('missing the cpu agent', value => { value.agents = value.agents.filter(agent => agent.name !== 'cpu'); });
+    mutate('another agent order', value => { value.agents.reverse(); });
+    mutate('limits that are not the GPU fixture limits', value => { value.agents[0].hardwareLimits.memory = '64m'; });
+    mutate('a cpu agent with GPU limits', value => { value.agents[2].hardwareLimits = { memory: '2g', cpus: '1', pidsLimit: 128 }; });
+    mutate('a grant that names the cpu agent', value => { value.gpu.grantAgents = ['hwlfixture/probe', 'hwlfixture/peer', 'hwlfixture/cpu']; });
+    mutate('a short device UUID', value => { value.gpu.uuid = 'GPU-1'; });
+    mutate('another probe target', value => { value.gpu.probe.target = '../escape.py'; });
+    mutate('an unknown field', value => { value.gpu.extra = 1; });
+    // The profile: the cases need the pins, and the pins must agree with the plan.
+    const clone = () => structuredClone(w.run);
+    for (const [label, change] of [
+        ['no GPU pins', run => { delete run.target.execution.gpu; }],
+        ['a pin of another device than the plan', run => { run.target.execution.gpu.uuid = 'GPU-87654321-4321-4321-8321-123456789abc'; }],
+        ['a relative tool path', run => { run.target.execution.gpu.smi.path = 'nvidia-smi'; }],
+        ['a probe pin outside the candidate source', run => { run.target.execution.gpu.probe.sourcePath = '/tmp/mpsprobe.py'; }],
+        ['a probe digest that differs from the plan', run => { run.target.execution.gpu.probe.digest = hash('other'); }],
+        ['no GPU fixture reference', run => { delete run.target.execution.fixtures.gpu; run.target.execution.fixtures.cpu = { ref: 'hwlfixture/probe' }; }],
+        ['an extra pin field', run => { run.target.execution.gpu.extra = 1; }],
+    ]) {
+        const run = clone(); change(run);
+        assert.throws(() => validateProfile(run, { partial: true }), label);
+    }
+    assert.doesNotThrow(() => validateProfile(clone(), { partial: true }));
 });

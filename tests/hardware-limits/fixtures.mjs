@@ -535,6 +535,7 @@ export function buildRequiredCaseManifest() {
             'G1.gate-foreign-process-blocks-and-is-named',
             'G1.gate-owned-mps-processes-are-excluded-only-with-full-provenance',
             'G1.gate-an-owned-pid-without-its-provenance-tuple-blocks',
+            'G1.gate-a-listed-process-that-vanished-is-re-queried-not-blamed',
             'G1.gate-free-memory-and-real-nvidia-smi-grammar',
             'G1.gate-a-foreign-process-appearing-mid-probe-aborts-the-probe-and-trips-the-gate',
             'G1.gate-only-reads-nvidia-smi-and-never-signals',
@@ -569,6 +570,7 @@ export function buildRequiredCaseManifest() {
             'G1.mps-observe-program-reads-the-state-the-daemon-facts-and-the-three-control-replies',
             'G1.mps-kill-program-refuses-everything-it-cannot-prove-and-signals-only-the-proven-daemon',
             'G1.administrator-request-program-authenticates-against-the-products-own-verifiers',
+            'G1.gpu-plan-and-profile-validation-refuse-inconsistent-fixtures-and-pins',
         ]),
         ...leaves(P, 'p4', unit('hardwareLimitsLiveProvision.test.mjs'), ['G1.prepare-live-apparatus-mps-concrete-manifest-and-summary']),
         ...leaves(P, 'p4', unit('hardwareLimitsMps.test.mjs'), [

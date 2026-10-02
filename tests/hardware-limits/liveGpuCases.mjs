@@ -21,7 +21,7 @@ import { parseGpuInventory } from './liveGpu.mjs';
 import { createGpuGate, gpuQueryArgv } from './liveGpuGate.mjs';
 import {
     ADMIN_REQUEST, GPU_AGENT_INSPECT, GPU_SHARES, MIB, MPS_CLIENT_PIPE, MPS_KILL_OWNED_DAEMON, MPS_OBSERVE, NESTED_NAME_LIST_FORMAT, PROBE_DEADLINE_MS,
-    TIGHTER_CLIENT, assertMpsControlCommand, classifyMpsReply, controlHelperExecArgv, controlHelperRunArgv, parseProbeResult, probeBoundMiB, probeExecArgv, shareMemoryMiB,
+    MPS_CLIENT_USER, TIGHTER_CLIENT, assertMpsControlCommand, classifyMpsReply, controlHelperExecArgv, controlHelperRunArgv, parseProbeResult, probeBoundMiB, probeExecArgv, shareMemoryMiB,
 } from './liveGpuCommands.mjs';
 
 const REPOSITORY = 'hwlfixture';
@@ -40,10 +40,11 @@ const canon = value => (Array.isArray(value) ? `[${value.map(canon).join(',')}]`
     : value && typeof value === 'object' ? `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canon(value[key])}`).join(',')}}` : JSON.stringify(value ?? null));
 const same = (left, right) => canon(left) === canon(right);
 
-// The evidence a case returns in the report is bounded: the run's report is
-// one JSON document of at most one MiB over the remote transport, and the full
-// evidence stays in the private artifact file of the case.
-export function compactEvidence(value, limit = 150000) {
+// The evidence a case returns in the report is bounded (120000 bytes, four
+// cases, printed with indentation): the run's report is one JSON document of
+// at most one MiB over the remote transport, and the full evidence stays in
+// the private artifact file of the case.
+export function compactEvidence(value, limit = 120000) {
     const size = candidate => Buffer.byteLength(JSON.stringify(candidate));
     if (size(value) <= limit) return value;
     const shrink = (node, maxString, maxArray) => {
@@ -271,7 +272,9 @@ export function createGpuCases(ctx) {
         prepared = { box, prefix, gate, agents: {} };
         for (const role of ['probe', 'peer', 'cpu']) {
             const agent = await agentNow(role);
-            prepared.agents[role] = { id: agent.id, created: agent.created, startedAt: agent.startedAt, pid: agent.pid };
+            // MPS eligibility: the share clients run as a non-root numeric UID:GID.
+            if (role !== 'cpu') needs(MPS_CLIENT_USER.test(agent.user), `The fixture image of ${role} runs as '${agent.user}', not a non-root numeric UID:GID, which MPS eligibility requires`);
+            prepared.agents[role] = { id: agent.id, created: agent.created, startedAt: agent.startedAt, pid: agent.pid, user: agent.user };
         }
         prepared.cpuBaseline = { ...prepared.agents.cpu };
         return prepared;
@@ -291,7 +294,7 @@ export function createGpuCases(ctx) {
     function assertClientShare(agent, share, state, daemon, { totalMiB, label }) {
         const memoryMiB = shareMemoryMiB(share.vramPercent, totalMiB);
         const generation = `${state.gpu.mpsGeneration}`;
-        expects(agent.user === '1000:1000', `${label}: the client image user is ${agent.user}, not the non-root numeric 1000:1000`);
+        expects(MPS_CLIENT_USER.test(agent.user), `${label}: the client image user is ${agent.user}, not a non-root numeric UID:GID`);
         const mpsLabels = Object.keys(agent.labels || {}).filter(key => key.startsWith('ploinky.mps'));
         expects(same(mpsLabels, [MPS_GENERATION_LABEL]) && agent.labels[MPS_GENERATION_LABEL] === generation, `${label}: the MPS labels are not exactly ${MPS_GENERATION_LABEL}=${generation} (${mpsLabels.join(',')}=${agent.labels?.[MPS_GENERATION_LABEL]})`);
         expects(/^[a-f0-9]{64}$/.test(agent.labels?.[LIMITS_HASH_LABEL] || ''), `${label}: the limits hash label is missing`);
@@ -335,8 +338,17 @@ export function createGpuCases(ctx) {
             const checked = await gate.check(`after-probe:${label}`);
             after.push({ usedMiB: checked.memory.usedMiB, freeMiB: checked.memory.freeMiB, owned: checked.owned });
         }
+        // The MPS state afterwards (read-only): is the daemon still the owned one,
+        // and which servers does it list.
+        let mpsAfter = null;
+        try {
+            const obs = await observeMps();
+            mpsAfter = { status: obs.state?.status ?? null, generation: obs.state ? `${obs.state.daemonGeneration}:${obs.state.configurationGeneration}` : null, daemonAlive: obs.daemon?.alive ?? false,
+                servers: String((obs.control || []).find(reply => reply.command === 'get_server_list')?.stdout || '').split('\n').filter(Boolean) };
+        } catch (error) { mpsAfter = { error: String(error?.message || error).slice(0, 200) }; }
+        evidence.step(`probe-after:${label}`, { after, mpsAfter });
         const report = parseProbeResult(result, { maxMiB });
-        return { ...entry, report, after };
+        return { ...entry, report, after, mpsAfter };
     }
 
     // =====================================================================
@@ -716,7 +728,7 @@ export function createGpuCases(ctx) {
     async function createHelper(evidence, { writable, pipe }) {
         needs(image, 'The pinned fixture image is not recorded');
         const name = `hwl-${run.runId.slice(0, 12)}-ctl-${writable ? 'rw' : 'ro'}`;
-        const result = await command(`gpu-helper-create-${writable ? 'rw' : 'ro'}`, profile.engine.path, [...nested, ...controlHelperRunArgv({ name, image, pipeDirectory: pipe, writable, runId: run.runId })],
+        const result = await command(`gpu-helper-create-${writable ? 'rw' : 'ro'}`, profile.engine.path, [...nested, ...controlHelperRunArgv({ name, image, pipeDirectory: pipe, writable, runId: run.runId, user: prepared.agents.probe.user })],
             { deadlineMs: 60000, tolerate: true, capture: `gpu-helper-${writable ? 'rw' : 'ro'}-${++captureCounter}` });
         const id = result.stdout.trim();
         if (!/^[a-f0-9]{64}$/.test(id)) throw blocked(`The control helper container could not be created (exit ${result.status}): ${boundedTail(result.stderr, 400).text}`);

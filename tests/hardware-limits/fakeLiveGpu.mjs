@@ -74,7 +74,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
         const id = recorded?.id ?? hex(`${role}-${++model.agentCounter}-${model.boxId}`);
         const agent = {
             role, id, name: fixtureContainerName(model.workspace, role), created: recorded?.created ?? `2026-10-02T12:00:${String(model.agentCounter % 60).padStart(2, '0')}Z`,
-            image: recorded?.image ?? hex('agent-image'), imageName: model.image, user: '1000:1000', running: true, startedAt: `2026-10-02T12:01:${String(model.agentCounter % 60).padStart(2, '0')}Z`,
+            image: recorded?.image ?? hex('agent-image'), imageName: model.image, user: faults.imageUser ?? '1000:1000', running: true, startedAt: `2026-10-02T12:01:${String(model.agentCounter % 60).padStart(2, '0')}Z`,
             labels: { 'ploinky.limitshash': hex(`limits-${role}-${JSON.stringify(share)}`) }, env: [...baseEnv], mounts: [], boxPid: model.nextBox++, share,
         };
         if (share) {

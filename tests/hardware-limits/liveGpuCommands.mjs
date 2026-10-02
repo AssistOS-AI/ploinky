@@ -104,10 +104,14 @@ export function classifyMpsReply(text) {
 // image and keep-id mapping as a client, the control binary bound read-only
 // at /x, the verified read-only driver libraries, and the pipe bind either
 // writable or read-only. It is a recorded, owned nested container.
-export function controlHelperRunArgv({ name, image, pipeDirectory, writable, runId }) {
-    if (!/^hwl-[a-f0-9]{12}-ctl-(?:rw|ro)$/.test(name) || !/^[a-z0-9][a-z0-9.-]*(?::[0-9]+)?\/[a-z0-9._/-]+@sha256:[a-f0-9]{64}$/.test(image)
+// MPS eligibility needs a non-root numeric UID:GID image user; the helper takes the
+// same one for its keep-id mapping.
+export const MPS_CLIENT_USER = /^([1-9][0-9]{0,9}):([1-9][0-9]{0,9})$/;
+export function controlHelperRunArgv({ name, image, pipeDirectory, writable, runId, user = '1000:1000' }) {
+    const owner = MPS_CLIENT_USER.exec(user);
+    if (!owner || !/^hwl-[a-f0-9]{12}-ctl-(?:rw|ro)$/.test(name) || !/^[a-z0-9][a-z0-9.-]*(?::[0-9]+)?\/[a-z0-9._/-]+@sha256:[a-f0-9]{64}$/.test(image)
         || !/^\/run\/ploinky\/mps\/pipe-[a-f0-9]{32}$/.test(pipeDirectory) || !/^[a-f0-9]{32}$/.test(runId)) throw new Error('Invalid control helper invocation');
-    return ['run', '--detach', '--name', name, '--pull=never', '--userns=keep-id:uid=1000,gid=1000', '--network', 'none', '--pids-limit', '64', '--memory', '256m',
+    return ['run', '--detach', '--name', name, '--pull=never', `--userns=keep-id:uid=${owner[1]},gid=${owner[2]}`, '--network', 'none', '--pids-limit', '64', '--memory', '256m',
         '--cgroups=enabled', '--cgroupns=private', '--cgroup-parent=/ploinky/system',
         '--label', `io.assistos.ploinky.hwl-run=${runId}`,
         '--volume', `${MPS_TOOL_DIRECTORY}/nvidia-cuda-mps-control:/x:ro`,
