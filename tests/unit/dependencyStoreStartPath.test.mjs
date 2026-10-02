@@ -239,10 +239,76 @@ test('dependency store start path (seatbelt): first start builds, warm reuses, a
 
     const before = snapshotObject(first.dependencies);
     fs.writeFileSync(path.join(w.agentDir, 'code', 'package.json'), JSON.stringify({ name: 'demo', dependencies: { 'left-pad': '1.3.1' } }));
-    const changed = byStep(drive(w, [{ label: 'replace', action: 'ensure-with-lease', hostRouter: true, containerName: CONTAINER, activate: true }]));
+    // A replacement stops only the runtime its caller names (as the Watchdog,
+    // reinstall and restart callers name the registered tuple). With no
+    // predecessor named, the live runtime is refused untouched.
+    const pidFile = path.join(w.ws, '.ploinky', 'bwrap-pids', `${CONTAINER}.pid`);
+    const pidBefore = fs.readFileSync(pidFile, 'utf8');
+    const registryBefore = fs.readFileSync(path.join(w.ws, '.ploinky', 'agents.json'), 'utf8');
+    const refused = byStep(drive(w, [{ label: 'unnamed', action: 'ensure-with-lease', hostRouter: true, containerName: CONTAINER, activate: true, allowFailure: true }])).unnamed;
+    assert.equal(refused.ok, false, JSON.stringify(refused));
+    assert.equal(refused.code, 'PLOINKY_HOST_SANDBOX_START_FAILED');
+    assert.match(refused.message, /neither the requested successor nor the expected predecessor; no signal was sent/);
+    assert.equal(fs.readFileSync(pidFile, 'utf8'), pidBefore, 'the live runtime and its PID record are intact');
+    assert.doesNotThrow(() => process.kill(JSON.parse(pidBefore).pid, 0), 'the live runtime was not signalled');
+    assert.equal(fs.readFileSync(path.join(w.ws, '.ploinky', 'agents.json'), 'utf8'), registryBefore, 'the registry was not rotated');
+    assert.equal(fs.readlinkSync(link), first.dependencies.nodeModulesPath, 'the link still names the live runtime\'s payload');
+
+    // Test shape: this step used to pass no predecessor, which stopped whatever held the
+    // runtime key. It now names the registered tuple, as every production caller does.
+    const changed = byStep(drive(w, [{
+        label: 'replace', action: 'ensure-with-lease', hostRouter: true, containerName: CONTAINER, activate: true,
+        options: { expectedPredecessor: { instanceId: 'inst-1', enableGeneration: 'gen-1' } },
+    }]));
     const replaced = assertOk(changed, 'replace');
     assert.equal(replaced.createdByThisLaunch, true);
     assert.notEqual(replaced.dependencies.objectId, first.dependencies.objectId);
     assert.equal(fs.readlinkSync(link), replaced.dependencies.nodeModulesPath, 'switched after the only consumer was replaced');
+    assert.deepEqual(snapshotObject(first.dependencies), before, 'predecessor payload unchanged');
+});
+
+// The path `ploinky start` takes after a package.json edit on a running Seatbelt
+// agent: a prepared record (the registry already names the successor tuple),
+// `expectedPredecessor` omitted (null), startPath. The old process is replaced
+// only because the dispatcher accepts an occupant equal to the requested
+// successor; if that match changed, every Seatbelt package update through
+// `ploinky start` would be refused as SLOT_BUSY.
+test('dependency store start path (seatbelt): a package change through the workspace-start shape replaces the live runtime behind the fail-closed link', { skip: process.platform !== 'darwin' && 'seatbelt runs on macOS only' }, (t) => {
+    const w = workspace(t, {
+        manifest: { 'lite-sandbox': true, start: 'node index.js', network: { mode: 'host' }, readiness: { protocol: 'none' } },
+    });
+    t.after(() => w.engine.killSandboxes());
+    const steps = byStep(drive(w, [
+        { action: 'init-edge' },
+        { action: 'enable-sandbox' },
+        { action: 'register', containerName: CONTAINER, record: { ...registration(), runtime: 'seatbelt', projectPath: path.join(w.ws, '.data', 'demo') } },
+        { action: 'prepare-lease' },
+        { label: 'first', action: 'ensure-with-lease', hostRouter: true, containerName: CONTAINER, startPath: true, activate: true },
+    ]));
+    const first = assertOk(steps, 'first');
+    const link = path.join(w.agentDir, 'code', 'node_modules');
+    const pidFile = path.join(w.ws, '.ploinky', 'bwrap-pids', `${CONTAINER}.pid`);
+    const oldRecord = JSON.parse(fs.readFileSync(pidFile, 'utf8'));
+    assert.doesNotThrow(() => process.kill(oldRecord.pid, 0), 'the first runtime is live');
+    const before = snapshotObject(first.dependencies);
+
+    fs.writeFileSync(path.join(w.agentDir, 'code', 'package.json'), JSON.stringify({ name: 'demo', dependencies: { 'left-pad': '1.3.1' } }));
+    const changed = byStep(drive(w, [
+        { action: 'prepare-lease' },
+        { label: 'start', action: 'ensure-with-lease', hostRouter: true, containerName: CONTAINER, startPath: true, activate: true },
+    ]));
+    const replaced = assertOk(changed, 'start');
+    assert.equal(replaced.createdByThisLaunch, true);
+    assert.notEqual(replaced.dependencies.objectId, first.dependencies.objectId, 'a new dependency generation was admitted');
+    const newRecord = JSON.parse(fs.readFileSync(pidFile, 'utf8'));
+    assert.notEqual(newRecord.pid, oldRecord.pid, 'the PID record names the new sandbox process');
+    assert.throws(() => process.kill(oldRecord.pid, 0), { code: 'ESRCH' }, 'the old sandbox process is gone');
+    assert.doesNotThrow(() => process.kill(newRecord.pid, 0), 'the new sandbox process is alive');
+    assert.equal(newRecord.instanceId, 'inst-1', 'the prepared tuple is kept');
+    assert.equal(newRecord.enableGeneration, 'gen-1');
+    const registry = JSON.parse(fs.readFileSync(path.join(w.ws, '.ploinky', 'agents.json'), 'utf8'))[CONTAINER];
+    assert.equal(registry.instanceId, 'inst-1');
+    assert.equal(registry.enableGeneration, 'gen-1');
+    assert.equal(fs.readlinkSync(link), replaced.dependencies.nodeModulesPath, 'the shared link switched to the new payload');
     assert.deepEqual(snapshotObject(first.dependencies), before, 'predecessor payload unchanged');
 });

@@ -92,7 +92,11 @@ import {
     assertBwrapPidSlotAvailable,
     isBwrapProcessRunning,
     normalizeSandboxRuntimeIdentity,
+    normalizeExpectedPredecessor,
+    observeSandboxRuntime,
+    resolveSandboxSlotForStart,
     stopBwrapProcess,
+    stopExactSandboxOrThrow,
     saveBwrapPid,
     clearBwrapPid,
     getBwrapPid
@@ -304,7 +308,13 @@ function seatbeltSwitchError(agentName, linkPath, consumers) {
  * other running seatbelt services of the same source and live interactive
  * attachments. Unprovable liveness counts as live.
  */
-function liveSeatbeltSourceConsumers(linkPath, { excludeContainer = '', loadAgents = loadAgentsMap, store = null, isRunning = isBwrapProcessRunning } = {}) {
+// A consumer counts as live unless its absence is verified: an unverifiable
+// runtime, or a live process under another tuple, may still be reading the link.
+function seatbeltConsumerMayBeLive(runtimeKey, identity) {
+    return observeSandboxRuntime(runtimeKey, { expectedIdentity: identity }).state !== 'absent';
+}
+
+function liveSeatbeltSourceConsumers(linkPath, { excludeContainer = '', loadAgents = loadAgentsMap, store = null, isRunning = seatbeltConsumerMayBeLive } = {}) {
     const sourceDir = path.dirname(linkPath);
     const live = [];
     for (const [name, record] of Object.entries(loadAgents() || {})) {
@@ -865,6 +875,7 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
         const stopped = stopBwrapProcess(containerName, { expectedIdentity: runtimeIdentity });
         if (!stopped && isBwrapProcessRunning(containerName, runtimeIdentity)) {
             error.message = `${error.message}; exact sandbox candidate cleanup failed`;
+            error.exactCleanupFailed = true;
         }
         throw error;
     }
@@ -879,6 +890,7 @@ function ensureSeatbeltService(agentName, manifest, agentPath, options = {}) {
     let aliasOverride;
     let forceRecreate = false;
     let profileNameOverride;
+    let expectedPredecessor = null;
 
     if (typeof options === 'number') {
         preferredHostPort = options;
@@ -888,6 +900,7 @@ function ensureSeatbeltService(agentName, manifest, agentPath, options = {}) {
         aliasOverride = options.alias;
         forceRecreate = options.forceRecreate === true;
         profileNameOverride = options.profileName;
+        expectedPredecessor = normalizeExpectedPredecessor(options.expectedPredecessor);
     }
 
     const repoName = resolveAgentRepositoryName(agentPath);
@@ -937,17 +950,23 @@ function ensureSeatbeltService(agentName, manifest, agentPath, options = {}) {
         allPortMappings = [{ containerPort: hostPort, hostPort }];
     }
 
-    let exactRuntimeRunning = isBwrapProcessRunning(containerName, runtimeIdentity);
+    // What holds the runtime key decides what may be stopped. Only the exact
+    // requested successor or the caller's expected predecessor is ever
+    // signalled; any other live tuple, or a slot that cannot be verified,
+    // throws before a signal is sent or a PID record is touched.
+    const slot = resolveSandboxSlotForStart(containerName, {
+        successor: runtimeIdentity,
+        expectedPredecessor,
+    });
+    let exactRuntimeRunning = slot.kind === 'successor';
 
-    // Force recreate
-    if (forceRecreate) {
+    if (slot.kind === 'predecessor') {
+        console.log(`[seatbelt] ${agentName}: runtime generation changed, replacing the expected predecessor sandbox...`);
+        stopExactSandboxOrThrow(containerName, expectedPredecessor);
+    } else if (forceRecreate && exactRuntimeRunning) {
         console.log(`[seatbelt] ${agentName}: force recreating...`);
-        stopBwrapProcess(containerName);
+        stopExactSandboxOrThrow(containerName, runtimeIdentity);
         exactRuntimeRunning = false;
-    }
-
-    if (!forceRecreate && !exactRuntimeRunning && stopBwrapProcess(containerName)) {
-        console.log(`[seatbelt] ${agentName}: runtime generation changed, replacing stale sandbox...`);
     }
 
     // Check if already running
@@ -966,13 +985,13 @@ function ensureSeatbeltService(agentName, manifest, agentPath, options = {}) {
             : seatbeltDependencyReuseProblem({ agentName, manifest, record: existingRecord, containerName });
         if (desired && desired !== current) {
             console.log(`[seatbelt] ${agentName}: env hash changed, restarting...`);
-            stopBwrapProcess(containerName);
+            stopExactSandboxOrThrow(containerName, runtimeIdentity);
         } else if (agentLibProblem) {
             console.log(`[seatbelt] ${agentName}: achillesAgentLib selection changed (${agentLibProblem}), restarting...`);
-            stopBwrapProcess(containerName);
+            stopExactSandboxOrThrow(containerName, runtimeIdentity);
         } else if (dependencyProblem) {
             console.log(`[seatbelt] ${agentName}: dependency generation changed (${dependencyProblem}), restarting...`);
-            stopBwrapProcess(containerName);
+            stopExactSandboxOrThrow(containerName, runtimeIdentity);
         } else {
             debugLog(`[seatbelt] ${agentName}: already running (PID ${getBwrapPid(containerName, runtimeIdentity)})`);
             const hostPort = allPortMappings[0]?.hostPort || 0;

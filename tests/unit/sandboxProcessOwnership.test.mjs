@@ -124,10 +124,162 @@ test('sandbox lifecycle call sites use the exact container runtime key', () => {
         assert.match(source, /assertBwrapPidSlotAvailable\(containerName\)/);
         assert.match(source, /isBwrapProcessRunning\(containerName, runtimeIdentity\)/);
         assert.match(source, /getBwrapPid\(containerName, runtimeIdentity\)/);
-        assert.match(source, /stopBwrapProcess\(containerName\)/);
         assert.doesNotMatch(source, /(?:saveBwrapPid|isBwrapProcessRunning|stopBwrapProcess)\(agentName/);
+        // What the replacement stops do is asserted by running them (the slot
+        // and stop tests below, and nativeGraphPredecessor.test.mjs). This only
+        // guards that the unqualified, runtime-key-only stop is gone and that
+        // every launch resolves its slot first.
+        assert.doesNotMatch(source, /stopBwrapProcess\(containerName\)/);
+        assert.match(source, /resolveSandboxSlotForStart\(containerName, \{/);
     }
-    assert.match(serviceManager, /isBwrapProcessRunning\(containerName\)/);
-    assert.match(containerFleet, /isBwrapProcessRunning\(name\)/);
-    assert.match(containerFleet, /stopBwrapProcesses\(bwrapEntries\.map\(\(entry\) => entry\.runtimeKey\)/);
+    // The dispatcher and the operator stops observe the exact runtime key.
+    assert.match(serviceManager, /observeSandboxRuntime\(containerName\)/);
+    assert.match(containerFleet, /observeSandboxRuntime\(name\)/);
+    assert.match(containerFleet, /stopSandboxRuntimes\(bwrapEntries\.map\(\(entry\) => entry\.runtimeKey\)/);
+});
+
+// Runs `script` against the fleet module in a child process bound to its own
+// workspace. `child()` spawns a short-lived process this script owns; every
+// one is killed on the way out.
+function runFleet(script) {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-sandbox-slot-'));
+    try {
+        const source = [
+            "import assert from 'node:assert/strict';",
+            "import fs from 'node:fs';",
+            "import cp from 'node:child_process';",
+            "import { syncBuiltinESMExports } from 'node:module';",
+            `const fleet = await import(${JSON.stringify(fleetModuleUrl)});`,
+            'const children = [];',
+            'const realKill = process.kill.bind(process);',
+            'const child = () => {',
+            "  const c = cp.spawn(process.execPath, ['-e', 'setTimeout(() => {}, 20000)'], { detached: true, stdio: 'ignore' });",
+            '  c.unref(); children.push(c.pid); return c.pid;',
+            '};',
+            'try {',
+            script,
+            '} finally {',
+            "  for (const pid of children) { try { realKill(-pid, 'SIGKILL'); } catch (_) {} try { realKill(pid, 'SIGKILL'); } catch (_) {} }",
+            '}',
+            "console.log('DONE');",
+        ].join('\n');
+        const result = spawnSync(process.execPath, ['--input-type=module', '--eval', source], {
+            cwd: workspace,
+            env: { ...process.env, PLOINKY_WORKSPACE_ROOT: workspace, PLOINKY_CWD: workspace },
+            encoding: 'utf8',
+        });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        assert.match(result.stdout, /DONE/);
+    } finally {
+        fs.rmSync(workspace, { recursive: true, force: true });
+    }
+}
+
+test('the slot of a runtime key resolves to empty, successor or named predecessor, and refuses everything else before any signal', () => {
+    runFleet(`
+        const key = 'ploinky_repo_agent_slot_workspace_deadbeef';
+        const predecessor = { instanceId: 'pred-i', enableGeneration: 'pred-g' };
+        const successor = { instanceId: 'succ-i', enableGeneration: 'succ-g' };
+        const slot = (expected, wanted = successor) => fleet.resolveSandboxSlotForStart(key, { successor: wanted, expectedPredecessor: expected });
+        const file = () => fleet.BWRAP_PIDS_DIR + '/' + key + '.pid';
+
+        assert.equal(slot(null).kind, 'empty', 'no record at all');
+        const pid = child();
+        fleet.saveBwrapPid(key, pid, predecessor);
+        assert.equal(slot(predecessor).kind, 'predecessor');
+        assert.equal(slot(predecessor, predecessor).kind, 'successor', 'the exact requested tuple is reuse, not replacement');
+        for (const expected of [null, undefined, { instanceId: 'other-i', enableGeneration: 'other-g' }]) {
+            assert.throws(() => slot(expected), (error) => error.code === 'PLOINKY_SANDBOX_PID_SLOT_BUSY', 'an unexpected occupant is refused');
+        }
+        assert.equal(fleet.isBwrapProcessRunning(key, predecessor), true, 'the refusals never signalled it');
+        assert.throws(() => slot({ instanceId: 'x' }), /exact instanceId and enableGeneration/);
+
+        // An unverifiable slot throws without a signal and without touching the record.
+        const before = fs.readFileSync(file(), 'utf8');
+        fs.writeFileSync(file(), '{"pid": 1}');
+        assert.throws(() => slot(predecessor), (error) => error.code === 'PLOINKY_SANDBOX_PID_RECORD_INVALID');
+        assert.equal(fs.readFileSync(file(), 'utf8'), '{"pid": 1}');
+        fs.writeFileSync(file(), before);
+        realKill(pid, 0);
+    `);
+});
+
+test('a manager stop is complete only once the exact process is observed gone', () => {
+    runFleet(`
+        const key = 'ploinky_repo_agent_stop_workspace_deadbeef';
+        const identity = { instanceId: 'i', enableGeneration: 'g' };
+        const pid = child();
+        fleet.saveBwrapPid(key, pid, identity);
+
+        // A different tuple is refused and nothing is signalled.
+        assert.throws(
+            () => fleet.stopExactSandboxOrThrow(key, { instanceId: 'x', enableGeneration: 'y' }, { timeout: 100 }),
+            (error) => error.code === 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS' && error.stopResult.state === 'refused',
+        );
+        assert.equal(fleet.isBwrapProcessRunning(key, identity), true);
+
+        // Denied signals are a failure that keeps the record.
+        process.kill = (target, signal) => {
+            if (signal === 0) return realKill(target, 0);
+            throw Object.assign(new Error('denied'), { code: 'EPERM' });
+        };
+        try {
+            assert.throws(
+                () => fleet.stopExactSandboxOrThrow(key, identity, { timeout: 100 }),
+                (error) => error.code === 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS' && error.stopResult.state === 'failed',
+            );
+        } finally {
+            process.kill = realKill;
+        }
+        assert.equal(fleet.getBwrapPid(key, identity), pid, 'the record survived the failed stop');
+        assert.equal(fleet.stopBwrapProcess(key, { expectedIdentity: identity, timeout: 100 }), true);
+        assert.equal(fleet.getBwrapPid(key, identity), 0, 'the record went only after the exit was observed');
+        assert.equal(fleet.stopExactSandboxOrThrow(key, identity).state, 'absent', 'an absent runtime is a completed stop');
+        assert.equal(fleet.stopBwrapProcess(key, { expectedIdentity: identity }), false, 'nothing left to stop');
+    `);
+});
+
+test('a PID slot that cannot be verified is never cleared or replaced, while a stale one is available again', () => {
+    runFleet(`
+        const key = 'ploinky_repo_agent_unverified_workspace_deadbeef';
+        const identity = { instanceId: 'i', enableGeneration: 'g' };
+        const pid = child();
+        fleet.saveBwrapPid(key, pid, identity);
+        const file = fleet.BWRAP_PIDS_DIR + '/' + key + '.pid';
+        const before = fs.readFileSync(file, 'utf8');
+
+        // Identity probing breaks after the record was written.
+        const realExec = cp.execFileSync;
+        const realRead = fs.readFileSync;
+        cp.execFileSync = (command, ...rest) => { if (command === 'ps') throw new Error('ps unavailable'); return realExec(command, ...rest); };
+        fs.readFileSync = (target, ...rest) => {
+            if (typeof target === 'string' && target.startsWith('/proc/') && target.endsWith('/stat')) {
+                throw Object.assign(new Error('denied'), { code: 'EACCES' });
+            }
+            return realRead(target, ...rest);
+        };
+        syncBuiltinESMExports();
+        try {
+            assert.throws(() => fleet.assertBwrapPidSlotAvailable(key), (error) => error.code === 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS');
+            assert.equal(fleet.isBwrapProcessRunning(key, identity), false);
+            assert.equal(fleet.stopBwrapProcesses([key], { timeout: 100 }).length, 0);
+        } finally {
+            cp.execFileSync = realExec;
+            fs.readFileSync = realRead;
+            syncBuiltinESMExports();
+        }
+        assert.equal(fs.readFileSync(file, 'utf8'), before, 'the record is byte-identical');
+        realKill(pid, 0);
+
+        // The process is now really gone (killed, and an unreaped zombie): the record is stale.
+        realKill(-pid, 'SIGKILL');
+        const deadline = Date.now() + 3000;
+        for (;;) {
+            const state = cp.spawnSync('ps', ['-p', String(pid), '-o', 'stat='], { encoding: 'utf8' }).stdout.trim();
+            if (!state || state.startsWith('Z') || Date.now() > deadline) break;
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+        }
+        fleet.assertBwrapPidSlotAvailable(key);
+        assert.equal(fs.existsSync(file), false, 'the stale record was removed by compare-and-delete');
+    `);
 });

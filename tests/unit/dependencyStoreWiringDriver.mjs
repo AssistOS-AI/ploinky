@@ -27,6 +27,7 @@ const summary = (value) => value && ({
     stored: (() => {
         try { return readAgents()[value.containerName]?.dependencies || null; } catch { return null; }
     })(),
+    cleanup: value.cleanup || null,
 });
 
 async function runStep(step) {
@@ -66,6 +67,12 @@ async function runStep(step) {
         });
         preparedLease = prepared.preparationLease;
         return { ok: Boolean(preparedLease), mode: preparedLease?.mode || null };
+    }
+    if (step.action === 'inactivate-edge') {
+        // Revokes the active generation, as a failed workspace start leaves it.
+        const edge = await import('../../cli/sandbox/edgeGeneration.js');
+        edge.inactivateEdgeRoutingGeneration('wiring-test-inactivate', { workspaceRoot: root });
+        return { ok: true };
     }
     if (step.action === 'enable-sandbox') {
         const { setHostSandboxDisabled } = await import('../../cli/utils/runtime/sandboxRuntime.js');
@@ -108,6 +115,29 @@ async function runStep(step) {
                 } : {}),
                 ...(step.options || {}),
             });
+            if (step.cleanupCandidate) {
+                // The failed-readiness path: clean up the exact candidate this
+                // launch returned with its own cleanup receipt. `tamper`
+                // first changes what holds the PID slot, as a concurrent
+                // owner or a corrupted record would.
+                const { cleanupExactAgentRuntimeCandidate } = await import('../../cli/sandbox/docker/agentServiceManager.js');
+                const pidFile = path.join(root, '.ploinky', 'bwrap-pids', `${step.containerName}.pid`);
+                if (step.cleanupCandidate.tamper === 'foreign') {
+                    const current = JSON.parse(fs.readFileSync(pidFile, 'utf8'));
+                    fs.writeFileSync(pidFile, JSON.stringify({ ...current, instanceId: 'foreign-instance' }) + '\n');
+                } else if (step.cleanupCandidate.tamper === 'invalid') {
+                    fs.writeFileSync(pidFile, '{"pid": 1}\n');
+                }
+                try {
+                    result.cleanup = { ok: true, value: cleanupExactAgentRuntimeCandidate({
+                        containerName: result.containerName,
+                        registryRecord: result.registryRecord,
+                        cleanupReceipt: result.cleanupReceipt,
+                    }) };
+                } catch (error) {
+                    result.cleanup = { ok: false, code: error?.code || null, message: String(error?.message || error) };
+                }
+            }
             if (step.startPath && !result?.requiresEdgeActivation && preparedLease) {
                 const { mergeRoutingConfig } = await import('../../cli/server/routingFile.js');
                 await mergeRoutingConfig((current) => current, {

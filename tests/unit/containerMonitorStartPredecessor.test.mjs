@@ -208,3 +208,260 @@ test('a receipt for that record that does not bind defers the Watchdog and is ne
     assert.deepEqual(fs.readFileSync(f.receiptFile), receiptBytes);
     assert.equal(fs.existsSync(f.ledgerFile), false);
 });
+
+// ------------------------------------------------------------------
+// Native (Seatbelt and bwrap) runtimes: the same deferral, and a liveness
+// check that is an observation, never a boolean that conflates "unknown" or
+// "someone else's process" with "stopped".
+
+const NATIVE_MANIFEST = { 'lite-sandbox': true, start: 'node index.js', network: { mode: 'host' }, readiness: { protocol: 'none' } };
+
+function nativeFixture(t, runtime, { receipt = true } = {}) {
+    fixtures += 1;
+    const agentName = `native${fixtures}`;
+    const containerName = `ploinky_demo_${agentName}`;
+    const agentDir = path.join(ploinkyDir, 'repos', 'demo', agentName);
+    fs.mkdirSync(agentDir, { recursive: true });
+    fs.writeFileSync(path.join(agentDir, 'manifest.json'), JSON.stringify(NATIVE_MANIFEST));
+    const record = {
+        type: 'agent', repoName: 'demo', agentName, runtime,
+        instanceId: `${agentName}-rotated-instance`,
+        enableGeneration: `${agentName}-rotated-generation`,
+    };
+    fs.writeFileSync(agentsFile, JSON.stringify({ [containerName]: record }, null, 2));
+    fs.writeFileSync(path.join(ploinkyDir, 'routing.json'), JSON.stringify({
+        routes: { [agentName]: { container: containerName, repo: 'demo', agent: agentName, hostPath: agentDir } },
+    }, null, 2));
+    fs.rmSync(receiptsDir, { recursive: true, force: true });
+    let written = null;
+    let receiptFile = null;
+    if (receipt) {
+        written = writeRuntimePredecessor({
+            containerName,
+            successor: record,
+            predecessor: {
+                ...record,
+                instanceId: `${agentName}-instance`,
+                enableGeneration: `${agentName}-generation`,
+                process: { pid: 4242, processIdentity: 'ps-lstart:Thu Jan  1 00:00:00 1970' },
+            },
+        });
+        receiptFile = path.join(receiptsDir, fs.readdirSync(receiptsDir)[0]);
+    }
+
+    const calls = { leases: 0, ensure: [], observed: [] };
+    const events = [];
+    const monitor = createContainerMonitor({
+        config: { INITIAL_BACKOFF_MS: 1, MAX_BACKOFF_MS: 1, CONTAINER_SNAPSHOT_INTERVAL_MS: 0 },
+        terminalLedgerFile: path.join(ploinkyDir, 'running', `${agentName}-terminal.json`),
+        log: (level, event, data = {}) => events.push({ event, container: data.container || null, state: data.state || null, reason: data.reason || null }),
+    });
+    t.after(() => stopContainerMonitor(monitor));
+    monitor.inspectWorkspaceStartLock = () => ({ active: false, stale: false });
+    monitor.listRunningContainerNames = () => [];
+    monitor.createWorkspaceMutationLease = () => {
+        calls.leases += 1;
+        return Object.freeze({ fixture: agentName });
+    };
+    monitor.releaseWorkspaceMutationLease = () => {};
+    monitor.withNetworkLifecycleLock = async (callback) => callback(Object.freeze({ fixture: 'network' }));
+    monitor.readEdgeRoutingSelection = () => ({ selector: { state: 'inactive' } });
+    monitor.resolveRouterEndpoint = () => null;
+    monitor.ensureAgentService = (_agent, _manifest, _dir, options) => {
+        calls.ensure.push({
+            containerName: options.containerName,
+            expectedPredecessor: options.expectedPredecessor,
+            forceRecreate: options.forceRecreate,
+        });
+        const current = JSON.parse(fs.readFileSync(agentsFile, 'utf8'))[options.containerName];
+        return { containerName: options.containerName, requiresEdgeActivation: false, registryRecord: current };
+    };
+    monitor.observeSandboxRuntime = (name, options) => {
+        calls.observed.push({ name, expectedIdentity: options.expectedIdentity });
+        return monitor.observation;
+    };
+    monitor.observation = { state: 'absent', record: null, reason: 'no-record' };
+    return {
+        containerName, record, receipt: written, receiptFile, monitor, calls,
+        eventsFor: () => events.filter((entry) => entry.container === containerName),
+    };
+}
+
+for (const runtime of ['seatbelt', 'bwrap']) {
+    test(`a Watchdog outlives a failed ${runtime} staging: it defers while the native predecessor proof is pending, then restarts from the exact snapshot tuple`, async (t) => {
+        const f = nativeFixture(t, runtime);
+        const registryBytes = fs.readFileSync(agentsFile);
+        const receiptBytes = fs.readFileSync(f.receiptFile);
+        syncManagedContainers(f.monitor);
+        const target = f.monitor.targets.get(f.containerName);
+        assert.ok(target, 'the native runtime is watched');
+
+        await performContainerRestart(f.monitor, target, 'not_running');
+        for (let tick = 0; tick < 3; tick += 1) monitorTick(f.monitor);
+        assert.equal(target.pendingRestartTimer, null);
+        assert.deepEqual(target.restartHistory, []);
+        assert.deepEqual(f.calls.ensure, [], 'no restart, so the recovery authority is never rotated away');
+        assert.deepEqual(f.calls.observed, [], 'a deferred record is not even observed');
+        assert.deepEqual(f.eventsFor().map((entry) => entry.event), [
+            'container_watch_added',
+            'container_restart_deferred_start_predecessor',
+        ]);
+        assert.deepEqual(fs.readFileSync(agentsFile), registryBytes);
+        assert.deepEqual(fs.readFileSync(f.receiptFile), receiptBytes, 'the native receipt is never erased by the Watchdog');
+
+        retireRuntimePredecessor(f.receipt);
+        monitorTick(f.monitor);
+        await settled(target);
+        assert.deepEqual(f.calls.observed[0], {
+            name: f.containerName,
+            expectedIdentity: { instanceId: f.record.instanceId, enableGeneration: f.record.enableGeneration },
+        }, 'liveness is the observation of the exact key and tuple');
+        assert.equal(f.calls.ensure.length, 1);
+        assert.deepEqual(f.calls.ensure[0].expectedPredecessor, {
+            instanceId: f.record.instanceId,
+            enableGeneration: f.record.enableGeneration,
+        }, 'a Watchdog restart replaces exactly the registry record it captured');
+    });
+
+    test(`a native receipt for ${runtime} that does not bind defers the Watchdog and is never erased`, async (t) => {
+        const f = nativeFixture(t, runtime);
+        const document = JSON.parse(fs.readFileSync(f.receiptFile, 'utf8'));
+        fs.writeFileSync(f.receiptFile, JSON.stringify({
+            ...document, predecessor: { ...document.predecessor, runtime: runtime === 'bwrap' ? 'seatbelt' : 'bwrap' },
+        }));
+        const receiptBytes = fs.readFileSync(f.receiptFile);
+        syncManagedContainers(f.monitor);
+        const target = f.monitor.targets.get(f.containerName);
+        await performContainerRestart(f.monitor, target, 'not_running');
+        monitorTick(f.monitor);
+        assert.deepEqual(f.calls.ensure, []);
+        assert.deepEqual(f.eventsFor().filter((entry) => entry.event !== 'container_watch_added').map((entry) => entry.event),
+            ['container_restart_deferred_start_predecessor']);
+        assert.deepEqual(fs.readFileSync(f.receiptFile), receiptBytes);
+    });
+
+    for (const observation of [
+        { state: 'unknown', reason: 'identity-probe-failed' },
+        { state: 'live-foreign', reason: 'foreign-tuple' },
+    ]) {
+        test(`${runtime} liveness: an observation that is ${observation.state} never schedules a restart`, (t) => {
+            const f = nativeFixture(t, runtime, { receipt: false });
+            f.monitor.observation = { ...observation, record: null };
+            syncManagedContainers(f.monitor);
+            const target = f.monitor.targets.get(f.containerName);
+            for (let tick = 0; tick < 4; tick += 1) monitorTick(f.monitor);
+            assert.equal(target.pendingRestartTimer, null, 'a restart that would stop or collide with the real owner is not scheduled');
+            assert.equal(target.isRestarting, false);
+            assert.deepEqual(target.restartHistory, []);
+            assert.deepEqual(f.calls.ensure, []);
+            const deferred = f.eventsFor().filter((entry) => entry.event === 'container_restart_deferred_sandbox_observation');
+            assert.equal(deferred.length, 1, 'the deferral is logged once per distinct observation, not every tick');
+            assert.equal(deferred[0].state, observation.state);
+            assert.equal(deferred[0].reason, observation.reason);
+        });
+    }
+
+    test(`${runtime} liveness: a verified absence schedules the restart and an exact live owner does not`, async (t) => {
+        const f = nativeFixture(t, runtime, { receipt: false });
+        f.monitor.startProbeWorker = () => {};
+        f.monitor.observation = { state: 'live-exact', record: null, reason: 'live' };
+        syncManagedContainers(f.monitor);
+        const target = f.monitor.targets.get(f.containerName);
+        monitorTick(f.monitor);
+        assert.equal(target.pendingRestartTimer, null);
+        assert.deepEqual(f.calls.ensure, []);
+
+        f.monitor.observation = { state: 'absent', record: null, reason: 'stale-record-zombie' };
+        monitorTick(f.monitor);
+        await settled(target);
+        assert.equal(f.calls.ensure.length, 1);
+        assert.equal(f.calls.ensure[0].containerName, f.containerName);
+        assert.deepEqual(f.calls.ensure[0].expectedPredecessor, {
+            instanceId: f.record.instanceId,
+            enableGeneration: f.record.enableGeneration,
+        });
+    });
+}
+
+// ------------------------------------------------------------------
+// A target whose record names no runtime ('container' is only the Watchdog's
+// default for that) is checked for a native owner of its exact tuple first.
+
+function unnamedFixture(t) {
+    fixtures += 1;
+    const agentName = `unnamed${fixtures}`;
+    const containerName = `ploinky_demo_${agentName}`;
+    const agentDir = path.join(ploinkyDir, 'repos', 'demo', agentName);
+    fs.mkdirSync(agentDir, { recursive: true });
+    fs.writeFileSync(path.join(agentDir, 'manifest.json'), JSON.stringify({
+        container: 'node:20-alpine', start: 'node index.js', network: { mode: 'none' },
+    }));
+    const record = {
+        type: 'agent', repoName: 'demo', agentName,
+        instanceId: `${agentName}-instance`, enableGeneration: `${agentName}-generation`,
+    };
+    fs.writeFileSync(agentsFile, JSON.stringify({ [containerName]: record }, null, 2));
+    fs.writeFileSync(path.join(ploinkyDir, 'routing.json'), JSON.stringify({
+        routes: { [agentName]: { container: containerName, repo: 'demo', agent: agentName, hostPath: agentDir } },
+    }, null, 2));
+    fs.rmSync(receiptsDir, { recursive: true, force: true });
+    const calls = { ensure: [], observed: [], probes: 0 };
+    const events = [];
+    const monitor = createContainerMonitor({
+        config: { INITIAL_BACKOFF_MS: 1, MAX_BACKOFF_MS: 1, CONTAINER_SNAPSHOT_INTERVAL_MS: 0 },
+        terminalLedgerFile: path.join(ploinkyDir, 'running', `${agentName}-terminal.json`),
+        log: (level, event, data = {}) => events.push({ event, container: data.container || null, state: data.state || null }),
+    });
+    t.after(() => stopContainerMonitor(monitor));
+    monitor.inspectWorkspaceStartLock = () => ({ active: false, stale: false });
+    monitor.listRunningContainerNames = () => [];
+    monitor.startProbeWorker = () => { calls.probes += 1; };
+    monitor.createWorkspaceMutationLease = () => Object.freeze({ fixture: agentName });
+    monitor.releaseWorkspaceMutationLease = () => {};
+    monitor.withNetworkLifecycleLock = async (callback) => callback(Object.freeze({ fixture: 'network' }));
+    monitor.readEdgeRoutingSelection = () => ({ selector: { state: 'inactive' } });
+    monitor.resolveRouterEndpoint = () => null;
+    monitor.ensureAgentService = (_agent, _manifest, _dir, options) => {
+        calls.ensure.push(options.containerName);
+        const current = JSON.parse(fs.readFileSync(agentsFile, 'utf8'))[options.containerName];
+        return { containerName: options.containerName, requiresEdgeActivation: false, registryRecord: current };
+    };
+    monitor.observeSandboxRuntime = (name, options) => {
+        calls.observed.push({ name, expectedIdentity: options.expectedIdentity });
+        return monitor.observation;
+    };
+    return {
+        containerName, record, monitor, calls,
+        eventsFor: () => events.filter((entry) => entry.container === containerName),
+    };
+}
+
+for (const [state, reason] of [['live-exact', 'live'], ['absent', 'no-record'], ['unknown', 'identity-probe-failed'], ['live-foreign', 'foreign-tuple']]) {
+    test(`an unnamed Watchdog target whose exact tuple observes ${state}`, async (t) => {
+        const f = unnamedFixture(t);
+        f.monitor.observation = { state, reason, record: null };
+        syncManagedContainers(f.monitor);
+        const target = f.monitor.targets.get(f.containerName);
+        assert.equal(target.runtime, 'container', 'the Watchdog defaults a record that names no runtime to container');
+        for (let tick = 0; tick < 3; tick += 1) monitorTick(f.monitor);
+        await settled(target);
+        assert.deepEqual(f.calls.observed[0], {
+            name: f.containerName,
+            expectedIdentity: { instanceId: f.record.instanceId, enableGeneration: f.record.enableGeneration },
+        }, 'observed by its exact key and tuple');
+        const deferred = f.eventsFor().filter((entry) => entry.event === 'container_restart_deferred_sandbox_observation');
+        if (state === 'live-exact') {
+            assert.deepEqual(f.calls.ensure, [], 'a live native owner is running: no container restart');
+            assert.ok(f.calls.probes > 0, 'it is probed like any running runtime');
+            assert.equal(deferred.length, 0);
+        } else if (state === 'absent') {
+            assert.deepEqual(f.calls.ensure, [f.containerName], 'verified absence leaves it a container: the container path restarts it');
+            assert.equal(deferred.length, 0);
+        } else {
+            assert.deepEqual(f.calls.ensure, [], 'an unverifiable or foreign owner defers, never restarts');
+            assert.equal(deferred.length, 1);
+            assert.equal(deferred[0].state, state);
+            assert.equal(target.pendingRestartTimer, null);
+        }
+    });
+}

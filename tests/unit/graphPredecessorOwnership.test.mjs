@@ -462,3 +462,123 @@ test('receipts that no registered record carries never hold that Watchdog back',
     assertEveryPredecessorRemoved(w, setup);
     assert.deepEqual(predecessorReceipts(w), orphans);
 });
+
+// ------------------------------------------------------------------
+// The receipt's native (Seatbelt and bwrap) variant. Container receipts keep
+// their schema; a native one has no container ID and may carry the pid and
+// start identity of the predecessor process as it was observed live.
+
+// Loaded lazily: the production config module sets PLOINKY_WORKSPACE_ROOT for
+// this process, which the driver-based tests above must not inherit.
+const store = () => import('../../cli/sandbox/runtimePredecessorStore.js');
+
+function receiptFixture(t) {
+    const root = fs.realpathSync(tempRoot(t, 'predecessor-receipt-'));
+    const successor = { instanceId: 'rotated-instance', enableGeneration: 'rotated-generation' };
+    const predecessor = (extra = {}) => ({
+        type: 'agent', agentName: 'agent', repoName: 'repo',
+        instanceId: 'old-instance', enableGeneration: 'old-generation',
+        ...extra,
+    });
+    const registered = (extra = {}) => ({
+        type: 'agent', agentName: 'agent', repoName: 'repo', ...successor, ...extra,
+    });
+    return { root, successor, predecessor, registered, options: { workspaceRoot: root } };
+}
+
+const PROCESS = { pid: 4242, processIdentity: 'linux-proc:123456' };
+
+for (const runtime of ['seatbelt', 'bwrap']) {
+    test(`a ${runtime} predecessor receipt round-trips with and without its captured process and binds the rotated record`, async (t) => {
+        const { writeRuntimePredecessor, readRuntimePredecessor, retireRuntimePredecessor } = await store();
+        const f = receiptFixture(t);
+        for (const process of [undefined, PROCESS]) {
+            const written = writeRuntimePredecessor({
+                containerName: 'ploinky_repo_agent',
+                successor: f.successor,
+                predecessor: f.predecessor({ runtime, ...(process ? { process } : {}) }),
+            }, f.options);
+            assert.equal(written.predecessor.runtime, runtime);
+            assert.equal(written.predecessor.containerId, undefined, 'a native receipt names no container');
+            assert.deepEqual(written.predecessor.process, process, 'the process evidence is exactly what was captured');
+            // The rotated record keeps the predecessor's runtime and spreads its other fields.
+            const read = readRuntimePredecessor('ploinky_repo_agent', f.registered({ runtime }), f.options);
+            assert.deepEqual(read, written);
+            assert.equal(retireRuntimePredecessor(written, f.options), true);
+            assert.equal(readRuntimePredecessor('ploinky_repo_agent', f.registered({ runtime }), f.options), null);
+        }
+    });
+
+    test(`a ${runtime} predecessor receipt refuses a container ID, a malformed process and a record of another runtime`, async (t) => {
+        const { writeRuntimePredecessor, readRuntimePredecessor, retireRuntimePredecessor } = await store();
+        const f = receiptFixture(t);
+        const write = (extra) => writeRuntimePredecessor({
+            containerName: 'ploinky_repo_agent', successor: f.successor, predecessor: f.predecessor({ runtime, ...extra }),
+        }, f.options);
+        for (const bad of [
+            { containerId: 'a'.repeat(64) },
+            { process: { pid: 0, processIdentity: 'x' } },
+            { process: { pid: '4242', processIdentity: 'x' } },
+            { process: { pid: 4242, processIdentity: '' } },
+            { process: { pid: 4242 } },
+            { process: [PROCESS] },
+        ]) {
+            assert.throws(() => write(bad), (error) => error.code === 'PLOINKY_RUNTIME_PREDECESSOR_INVALID', JSON.stringify(bad));
+        }
+        write({ process: PROCESS });
+        assert.throws(
+            () => readRuntimePredecessor('ploinky_repo_agent', f.registered({ runtime: runtime === 'bwrap' ? 'seatbelt' : 'bwrap' }), f.options),
+            (error) => error.code === 'PLOINKY_RUNTIME_PREDECESSOR_INVALID',
+            'a receipt that does not bind to the registered record is refused, never ignored',
+        );
+        // Identical bytes are an idempotent rewrite; different evidence for the same rotated tuple is refused.
+        write({ process: PROCESS });
+        assert.throws(() => write({ process: { ...PROCESS, pid: 4243 } }), /already records a different predecessor/);
+    });
+}
+
+test('container receipts keep their schema: a container ID is allowed, process evidence is not, and unknown runtimes are refused', async (t) => {
+    const { writeRuntimePredecessor, readRuntimePredecessor, retireRuntimePredecessor } = await store();
+    const f = receiptFixture(t);
+    const containerId = 'b'.repeat(64);
+    for (const runtime of ['docker', 'podman', undefined]) {
+        const written = writeRuntimePredecessor({
+            containerName: `ploinky_repo_agent_${runtime || 'none'}`,
+            successor: f.successor,
+            predecessor: f.predecessor({ containerId, ...(runtime ? { runtime } : {}) }),
+        }, f.options);
+        assert.equal(written.predecessor.containerId, containerId);
+        assert.equal(written.predecessor.process, undefined);
+        assert.equal(Object.hasOwn(written.predecessor, 'runtime'), Boolean(runtime));
+    }
+    for (const bad of [{ runtime: 'podman', process: PROCESS }, { process: PROCESS }, { runtime: 'lxc' }]) {
+        assert.throws(() => writeRuntimePredecessor({
+            containerName: 'ploinky_repo_agent_bad',
+            successor: f.successor,
+            predecessor: f.predecessor({ containerId, ...bad }),
+        }, f.options), (error) => error.code === 'PLOINKY_RUNTIME_PREDECESSOR_INVALID', JSON.stringify(bad));
+    }
+});
+
+test('a stored native receipt that was edited is refused as malformed, not trusted', async (t) => {
+    const { writeRuntimePredecessor, readRuntimePredecessor, retireRuntimePredecessor } = await store();
+    const f = receiptFixture(t);
+    const written = writeRuntimePredecessor({
+        containerName: 'ploinky_repo_agent', successor: f.successor, predecessor: f.predecessor({ runtime: 'seatbelt', process: PROCESS }),
+    }, f.options);
+    const dir = path.join(f.root, '.ploinky', 'run', 'runtime-predecessors');
+    const [file] = fs.readdirSync(dir).map((name) => path.join(dir, name));
+    for (const edit of [
+        (document) => { document.predecessor.process.pid = '4242'; },
+        (document) => { document.predecessor.containerId = 'c'.repeat(64); },
+        (document) => { document.predecessor.process.extra = true; },
+    ]) {
+        const document = JSON.parse(JSON.stringify(written));
+        edit(document);
+        fs.writeFileSync(file, JSON.stringify(document));
+        assert.throws(
+            () => readRuntimePredecessor('ploinky_repo_agent', f.registered({ runtime: 'seatbelt' }), f.options),
+            (error) => error.code === 'PLOINKY_RUNTIME_PREDECESSOR_INVALID',
+        );
+    }
+});
