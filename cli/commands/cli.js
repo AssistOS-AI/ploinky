@@ -585,6 +585,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                                 containerName,
                                 alias: registryRecord?.record?.alias,
                                 forceRecreate: true,
+                                forceRecreateReason: 'restart command',
                                 profileName: profileResolution.resolvedProfileName,
                                 profileResolution,
                                 routerEndpoint,

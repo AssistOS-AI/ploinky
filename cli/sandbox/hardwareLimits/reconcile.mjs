@@ -212,7 +212,7 @@ export async function reconcileExactHardwareInstance(captured, {
             // successor before create, while token/barrier checks stay fresh.
             checkPolicy();
             result = await ensure(captured.record.agentName, plan.manifest, plan.agentPath, {
-                containerName: captured.key, alias: captured.record.alias, forceRecreate: true,
+                containerName: captured.key, alias: captured.record.alias, forceRecreate: true, forceRecreateReason: 'hardware limits reconciliation',
                 hardwareInstanceKey: captured.key,
                 profileName: plan.profileResolution.resolvedProfileName, profileResolution: plan.profileResolution,
                 routerEndpoint: plan.routerEndpoint, runtimeAdmission: plan.runtimeAdmission,

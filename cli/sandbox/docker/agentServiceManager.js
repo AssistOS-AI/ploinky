@@ -84,6 +84,13 @@ import {
     renderContainerSecurityArgs,
     renderRuntimePolicyArgs,
 } from '../runtimeCapabilities.js';
+import {
+    formatReplacementReason,
+    hashMismatchDetail,
+    limitsHashDetail,
+    logRuntimeReplacement,
+    shortenHashes,
+} from '../runtimeReplacementLog.js';
 import { DEFAULT_AGENT_ENTRY, launchAgentSidecar, readManifestAgentCommand, readManifestStartCommand, splitCommandArgs } from './agentCommands.js';
 import { hasExactAgentHomeLayout, resolveAgentHomeLayout } from './agentHomeLayout.js';
 import { buildAgentShellArgs } from './agentShell.js';
@@ -3612,6 +3619,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     aliasOverride = options.alias;
     forceRecreate = options.forceRecreate === true
         || (Boolean(dependencyRefreshOperation()) && hasAgentPackageJson(agentPath));
+    const forceRecreateCause = options.forceRecreate === true
+        ? String(options.forceRecreateReason || 'requested by the caller')
+        : (forceRecreate ? 'dependency refresh of an agent with a package.json' : '');
     profileNameOverride = options.profileName;
     routerEndpointOverride = options.routerEndpoint;
     if (Object.prototype.hasOwnProperty.call(options, 'routerHost')) {
@@ -3742,6 +3752,14 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 : (!runningAtEntry
                     ? (anyRuntimeRunning ? 'runtimeIdentityDrift' : 'sandboxRuntimeStopped')
                     : (desiredEnvHash && desiredEnvHash !== currentEnvHash ? 'envHashChanged' : null));
+            if (anyRuntimeRunning && sandboxRecreateReason) {
+                logRuntimeReplacement(`${repoName}/${agentName}`, formatReplacementReason(
+                    sandboxRecreateReason,
+                    sandboxRecreateReason === 'envHashChanged'
+                        ? hashMismatchDetail('envHash', currentEnvHash, desiredEnvHash)
+                        : (sandboxRecreateReason === 'forceRecreate' ? forceRecreateCause : ''),
+                ));
+            }
             const requiresEdgeActivation = Boolean(existingRecord?.type === 'agent' && sandboxRecreateReason);
             const runtimeIdentity = resolveReplacementRuntimeIdentity({
                 containerName,
@@ -3948,6 +3966,8 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     const startCmd = readManifestStartCommand(manifest);
     const withParallelAgent = Boolean(startCmd && explicitAgentCmd);
     let recreateReason = targetedRestart ? 'targetedRestart' : (forceRecreate ? 'forceRecreate' : null);
+    // Secret-free detail for the one replacement line printed below.
+    let recreateDetail = targetedRestart ? '' : forceRecreateCause;
     const requestedEnableGeneration = String(options.enableGeneration || existingRecord.enableGeneration || randomUUID());
     const requestedInstanceId = String(options.instanceId || existingRecord.instanceId || '');
     if (existingRuntimeAtEntry && (!existingRecord.instanceId || !existingRecord.enableGeneration)) {
@@ -3965,6 +3985,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         const current = getContainerLabel(containerName, 'ploinky.envhash');
         if (desired && desired !== current) {
             debugLog(`[ensureAgentService] ${agentName}: env hash changed (current=${current || '<none>'}, desired=${desired.slice(0, 12)}…), recreating container`);
+            if (!recreateReason) recreateDetail = hashMismatchDetail('envHash', current, desired);
             recreateReason ||= 'envHashChanged';
         }
     }
@@ -3976,6 +3997,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         const agentLibProblem = agentLibReuseProblem(existingRecord, agentLibGrant('container'));
         if (agentLibProblem) {
             debugLog(`[ensureAgentService] ${agentName}: ${agentLibProblem}, recreating container`);
+            if (!recreateReason) recreateDetail = shortenHashes(agentLibProblem);
             recreateReason ||= 'agentLibSelectionChanged';
         }
     }
@@ -3986,6 +4008,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         const limitsReason = limitsHashReuseReason(serviceAdmission.descriptor, getContainerLabel(containerName, LIMITS_HASH_LABEL));
         if (limitsReason) {
             debugLog(`[ensureAgentService] ${agentName}: hardware limits changed, recreating container`);
+            if (!recreateReason) {
+                recreateDetail = limitsHashDetail(serviceAdmission.descriptor, getContainerLabel(containerName, LIMITS_HASH_LABEL));
+            }
             recreateReason ||= limitsReason;
         }
     }
@@ -4142,6 +4167,11 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     }
     if (existingRuntimeAtEntry && !containerExists(containerName)) {
         recreateReason ||= 'runtimeDisappearedAfterInspection';
+    }
+    // Every replacement of an existing runtime says why, once, before the
+    // predecessor is touched. A fresh create (nothing to replace) is silent.
+    if (existingRuntimeAtEntry && recreateReason) {
+        logRuntimeReplacement(`${repoName}/${agentName}`, formatReplacementReason(recreateReason, recreateDetail));
     }
 
     let additionalPorts = [];

@@ -851,6 +851,7 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
                 instanceId,
                 enableGeneration,
                 forceRecreate: true,
+                forceRecreateReason: 'agent enable',
                 preservePreparedRegistryRecord: true,
                 preparedRegistryRecord: record,
                 preparationLease: prepared.preparedGeneration?.preparationLease,

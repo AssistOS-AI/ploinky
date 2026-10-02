@@ -1829,6 +1829,7 @@ export async function performContainerRestart(monitor, target, reason, attempt =
             profileResolution,
             routerEndpoint,
             forceRecreate: reason === 'semantic_probe_failed' || reason === 'mps_generation_changed',
+            forceRecreateReason: `monitor restart (${reason})`,
             preserveActiveAuthorization,
             networkLifecycleCapability,
             runtimeAdmission: target.runtimeAdmission,

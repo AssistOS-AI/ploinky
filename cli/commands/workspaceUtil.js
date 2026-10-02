@@ -111,6 +111,12 @@ import {
   limitsHashReuseReason,
   hardwareRefusalOf,
 } from '../sandbox/runtimeCapabilities.js';
+import {
+  formatReplacementReason,
+  formatRuntimeReplacementLine,
+  hashMismatchDetail,
+  limitsHashDetail,
+} from '../sandbox/runtimeReplacementLog.js';
 import { LIMITS_HASH_LABEL } from '../sandbox/hardwareLimits/resolve.mjs';
 import { prepareMpsGraph } from '../sandbox/hardwareLimits/mpsGraph.mjs';
 import { acknowledgeMpsRuntimeReady, finalizeMpsGraph, releaseMpsRuntimeOwner, verifyMpsRuntimeReady } from '../sandbox/hardwareLimits/mpsLifecycle.mjs';
@@ -924,16 +930,46 @@ function resolveRetainedGraphNodeExecutionRecord(node, record, {
   return { runMode, projectPath, develRepo };
 }
 
-function executionRecordDiffers(record, expected) {
+function executionRecordDifferences(record, expected) {
   const currentProjectPath = String(record?.projectPath || '').trim();
   const expectedProjectPath = String(expected.projectPath || '').trim();
   const sameProjectPath = currentProjectPath
     && expectedProjectPath
     && path.resolve(currentProjectPath) === path.resolve(expectedProjectPath);
+  const currentDevelRepo = String(record?.develRepo || '').trim();
   const sameDevelRepo = expected.runMode === 'devel'
-    ? String(record?.develRepo || '').trim() === expected.develRepo
-    : !String(record?.develRepo || '').trim();
-  return record?.runMode !== expected.runMode || !sameProjectPath || !sameDevelRepo;
+    ? currentDevelRepo === expected.develRepo
+    : !currentDevelRepo;
+  const differences = [];
+  if (record?.runMode !== expected.runMode) {
+    differences.push(`runMode ${record?.runMode || 'none'} -> ${expected.runMode || 'none'}`);
+  }
+  if (!sameProjectPath) {
+    differences.push(`projectPath ${currentProjectPath || 'none'} -> ${expectedProjectPath || 'none'}`);
+  }
+  if (!sameDevelRepo) {
+    differences.push(`develRepo ${currentDevelRepo || 'none'} -> ${String(expected.develRepo || '') || 'none'}`);
+  }
+  return differences;
+}
+
+function executionRecordDiffers(record, expected) {
+  return executionRecordDifferences(record, expected).length > 0;
+}
+
+// The one start-graph line for a changed plan: every reason that applies.
+function graphReplacementLine(plan) {
+  const reasons = [];
+  if (plan.executionChanged) {
+    reasons.push(`execution changed: ${(plan.executionDifferences || []).join(', ') || 'unknown'}`);
+  }
+  if (plan.profileChanged) {
+    reasons.push(`profile changed: ${plan.existing.rec.profile || 'none'} -> ${plan.node.profile}`);
+  }
+  if (plan.runtimeReason) {
+    reasons.push(formatReplacementReason(plan.runtimeReason, plan.runtimeReasonDetail));
+  }
+  return formatRuntimeReplacementLine(plan.node.id, reasons.join('; '));
 }
 
 function mintChangedRuntimeIdentityPair(record, uuid) {
@@ -1086,7 +1122,10 @@ export function graphNodeRuntimeReplacementReason(plan, {
       routerEndpoint?.env || {},
       { agentName: node.shortAgentName, repoName: node.repoName },
     );
-    if (desired && desired !== String(record.envHash || '')) return 'envHashChanged';
+    if (desired && desired !== String(record.envHash || '')) {
+      plan.runtimeReasonDetail = hashMismatchDetail('envHash', record.envHash, desired);
+      return 'envHashChanged';
+    }
     return '';
   }
 
@@ -1117,7 +1156,9 @@ export function graphNodeRuntimeReplacementReason(plan, {
   if (runtimeNetworkPlan.requiresManagedNetwork && !desiredEnvHash) {
     return 'managedRouterDescriptorDrift';
   }
-  if (desiredEnvHash && desiredEnvHash !== getContainerLabelImpl(existing.key, 'ploinky.envhash')) {
+  const observedEnvHash = desiredEnvHash ? getContainerLabelImpl(existing.key, 'ploinky.envhash') : '';
+  if (desiredEnvHash && desiredEnvHash !== observedEnvHash) {
+    plan.runtimeReasonDetail = hashMismatchDetail('envHash', observedEnvHash, desiredEnvHash);
     return 'envHashChanged';
   }
   // The same admitted descriptor drives creation, adoption and reuse: its
@@ -1127,7 +1168,10 @@ export function graphNodeRuntimeReplacementReason(plan, {
   const limitsReason = admittedDescriptor
     ? limitsHashReuseReason(admittedDescriptor, getContainerLabelImpl(existing.key, LIMITS_HASH_LABEL))
     : null;
-  if (limitsReason) return limitsReason;
+  if (limitsReason) {
+    plan.runtimeReasonDetail = limitsHashDetail(admittedDescriptor, getContainerLabelImpl(existing.key, LIMITS_HASH_LABEL));
+    return limitsReason;
+  }
   if (isLlmRuntimeManifestImpl(node.manifest, profileResolution.profileConfig)) {
     const probe = prepareLlmStartupImpl({
       runtime,
@@ -1152,9 +1196,13 @@ export function graphNodeRuntimeReplacementReason(plan, {
         resolvedHardware: admitted.llmStartup.hardware,
       } : {}),
     });
+    const observedReuseHash = probe.enabled && probe.reuseHash
+      ? getContainerLabelImpl(existing.key, 'ploinky.reusehash')
+      : '';
     if (probe.enabled
         && probe.reuseHash
-        && probe.reuseHash !== getContainerLabelImpl(existing.key, 'ploinky.reusehash')) {
+        && probe.reuseHash !== observedReuseHash) {
+      plan.runtimeReasonDetail = hashMismatchDetail('reuseHash', observedReuseHash, probe.reuseHash);
       return 'llmReuseHashChanged';
     }
   }
@@ -1719,6 +1767,7 @@ function ensureGraphNodesEnabled(graph, reg, {
   hardwareContext,
   boxMarkerOptions,
   unavailableNodeIds = new Set(),
+  logLine = (line) => console.log(line),
 } = {}) {
   const nodes = [
     ...Array.from(graph?.nodes?.values?.() || []),
@@ -1755,6 +1804,9 @@ function ensureGraphNodesEnabled(graph, reg, {
       : resolveRetainedGraphNodeExecutionRecord(node, existing.rec, executionRecordOptions);
     const executionChanged = executionRecordDiffers(existing.rec, expectedExecution);
     const profileChanged = Boolean(node.profile && existing.rec.profile !== node.profile);
+    const executionDifferences = executionChanged
+      ? executionRecordDifferences(existing.rec, expectedExecution)
+      : [];
     const preliminary = { node, existing, expectedExecution, executionChanged, profileChanged };
     // A refused or blocked instance keeps no authority: an existing runtime is
     // revoked by identity rotation and removed through exact ownership checks.
@@ -1767,6 +1819,7 @@ function ensureGraphNodesEnabled(graph, reg, {
         : String(runtimeReplacementReason(preliminary, runtimeReplacementOptions) || '');
     existingPlans.push({
       ...preliminary,
+      executionDifferences,
       runtimeReason,
       // The desired registry receives a fresh candidate tuple before removal
       // so the inactive generation can be compiled. Keep a detached snapshot
@@ -1779,6 +1832,8 @@ function ensureGraphNodesEnabled(graph, reg, {
     .filter((plan) => plan.executionChanged || plan.profileChanged || plan.runtimeReason)
     .sort((left, right) => left.node.id.localeCompare(right.node.id));
   const changedContainers = changedPlans.map((plan) => plan.existing.key);
+  // Say why each runtime is replaced before anything is revoked or removed.
+  for (const plan of changedPlans) logLine(graphReplacementLine(plan));
   // Every retained route must be target-less in the prelaunch generation,
   // including a healthy blocking runtime that can later be reused. Keeping a
   // predecessor's resolved hostPort here would make the topology
@@ -2860,6 +2915,7 @@ async function startWorkspace(staticAgentArg, portArg, {
             instanceId: rec.instanceId,
             enableGeneration: rec.enableGeneration,
             forceRecreate: newlyPreparedContainers.has(name),
+            forceRecreateReason: 'runtime identity rotated earlier in this start',
             preservePreparedRegistryRecord: true,
             preparationLease: workspacePreparationLease,
             preparedHostModeCapability,
@@ -3739,6 +3795,7 @@ async function reinstallAgent(agentName) {
                 containerName,
                 alias: registryRecord?.record?.alias,
                 forceRecreate: true,
+                forceRecreateReason: 'reinstall command',
                 routerEndpoint,
                 runtimeAdmission: directAdmission.runtimeAdmission,
                 networkLifecycleCapability,

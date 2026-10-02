@@ -1885,6 +1885,7 @@ async function main() {
                     profileResolution: context.profileResolution,
                     routerEndpoint: context.routerEndpoint,
                     forceRecreate: args.forceRecreate === '1',
+                    forceRecreateReason: 'runtime identity rotated earlier in this start',
                     preservePreparedRegistryRecord: true,
                     instanceId: lifecycle.record.instanceId,
                     enableGeneration: lifecycle.record.enableGeneration,
