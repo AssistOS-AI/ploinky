@@ -14,6 +14,7 @@
 // is correct before a reviewed qualification entry exists are BLOCKED, never PASS.
 import fs from 'node:fs';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { cpuMaxMatches } from '../../cli/sandbox/hardwareLimits/cpuQuota.mjs';
 import { resolveMemoryPercent } from '../../cli/sandbox/hardwareLimits/resolve.mjs';
 import { blocked, boundedTail, checkedJson, commandTails } from './liveCommon.mjs';
@@ -21,6 +22,7 @@ import { LEAF_OBSERVATION } from './liveCaseCommands.mjs';
 import { agentLeaf, createHostProc } from './liveGpuHost.mjs';
 import { createGpuCases } from './liveGpuCases.mjs';
 import { MIB, shareMemoryMiB } from './liveGpuCommands.mjs';
+import { LLM_SOURCE_DIRECTORY } from './liveLlmNames.mjs';
 import {
     GIB, INFERENCE_CADENCE, INSUFFICIENT_RAM, L1_MIN_RAM_BYTES, L1_PROMPT, LLM_BUDGET, LLM_FIXTURE, LLM_IMAGE_DIGESTS, LLM_LEAF_SAMPLE, LLM_MODELS, LLM_REF, LLM_RUNNER_PROCESSES, LLM_TOOL_CALL, VLLM_SHARE,
     analyzeInference, insufficientMemoryPercent, llmToolWords, parseLeafSample, summarizeGpuCheck, vllmToolWords,
@@ -30,6 +32,7 @@ const needs = (condition, message) => { if (!condition) throw blocked(message); 
 const expects = (condition, message) => { if (!condition) throw new Error(message); };
 const MPS_ENV_NAMES = Object.freeze(['CUDA_MPS_ACTIVE_THREAD_PERCENTAGE', 'CUDA_MPS_PINNED_DEVICE_MEM_LIMIT', 'CUDA_MPS_PIPE_DIRECTORY']);
 const SECRET_NAME = /(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|COOKIE)/i;
+const TUPLE_FIELDS = Object.freeze(['runnerLockDigest', 'driverVersion', 'gpuPciDeviceId', 'computeCapability', 'deviceTotalBytes']);
 const ACTIVE = Object.freeze(['downloading', 'copying', 'verifying', 'starting', 'loading', 'ready', 'stopping']);
 
 export const LLM_DEFAULT_TIMINGS = Object.freeze({
@@ -490,6 +493,8 @@ export function createLlmCases(ctx) {
             evidence.put('prerequisites', pre);
             if (!pre.ok) throw blocked(`LIVE-L3 step 0: vLLM cannot be installed from the pinned image on this host: ${blockerText(pre)}`);
             expects(pre.facts?.lock?.vllm?.runnerLockDigest === l3.pins.runnerLockDigest && pre.facts.driverVersion === gpu.driverVersion, 'The prerequisite report differs from the pinned lock entry or driver');
+            // Stage 2 runs a model only for the tuple stage 1 calibrated, on the hardware the live pins name, with the evidence production qualifies.
+            if (l3.stage === 'qualified') await bindQualification(evidence, { pre, cal: l3.calibration });
 
             // The share, through Apply. It comes before the install: the runnable copy lives in the container, which Apply replaces.
             const state0 = await admin.state();
@@ -528,6 +533,27 @@ export function createLlmCases(ctx) {
         expects(doc.proposed?.entry && doc.proposed.entry.evidenceDigest === doc.evidence.evidenceDigest && doc.proposed.entry.denominator === 'physical-device', 'The calibration proposed no reviewed entry for its own evidence');
         expects(JSON.stringify(Object.keys(doc.proposed.entry).slice(0, 5)) === JSON.stringify(Object.keys(doc.evidence.tuple)), 'The proposed entry does not carry the tuple fields in production\'s order');
         return { stage: 'calibration', evidenceDigest: doc.evidence.evidenceDigest, proposedEntry: doc.proposed.entry, proposedSource: doc.proposed.source, denominator: verdict.denominator };
+    }
+
+    // The tuple production derives for this host, from the step 0 facts (the agent's own readGpu and its lock entry's digest:
+    // the same inputs vllmMpsTuple reads), and what production's resolver, over the frozen candidate's reviewed data,
+    // says about it. Run follows only when both are exactly what stage 1 pinned and what the live pins say.
+    const qualify = ctx.qualify || (async tuple => {
+        const file = path.join(profile.source.root, LLM_SOURCE_DIRECTORY, 'local-llm', 'src', 'controller', 'vllmMpsQualification.mjs');
+        return (await import(pathToFileURL(file).href)).resolveVllmMpsQualification(tuple);
+    });
+    async function bindQualification(evidence, { pre, cal }) {
+        const facts = pre.facts ?? {};
+        const actual = { runnerLockDigest: facts.lock?.vllm?.runnerLockDigest, driverVersion: facts.driverVersion, gpuPciDeviceId: facts.gpu?.device?.pciDeviceId, computeCapability: facts.gpu?.device?.computeCapability, deviceTotalBytes: facts.gpu?.totalBytes };
+        const differing = TUPLE_FIELDS.filter(field => actual[field] !== cal.tuple[field]);
+        evidence.put('qualificationBinding', { pinned: cal.tuple, actual, evidenceDigest: cal.evidenceDigest, differing });
+        needs(differing.length === 0, `LIVE-L3 stage 2: the tuple this host reports differs from the stage 1 pin in ${differing.join(', ')} (reported ${JSON.stringify(Object.fromEntries(differing.map(field => [field, actual[field]])))}); the calibration does not describe this host, so calibrate it again`);
+        needs(cal.tuple.driverVersion === gpu.driverVersion && cal.tuple.deviceTotalBytes === gpu.memoryMiB * MIB, `LIVE-L3 stage 2: the stage 1 pin (driver ${cal.tuple.driverVersion}, ${cal.tuple.deviceTotalBytes} bytes) differs from the live pins (driver ${gpu.driverVersion}, ${gpu.memoryMiB * MIB} bytes)`);
+        let resolved;
+        try { resolved = await qualify(actual); } catch (error) { throw blocked(`LIVE-L3 stage 2: production's qualification data cannot be read from the frozen candidate (${String(error?.message || error).slice(0, 200)})`); }
+        evidence.put('qualificationResolved', { qualified: resolved?.qualified === true, evidenceDigest: resolved?.evidenceDigest ?? null });
+        if (cal.expectQualified) needs(resolved?.qualified === true && resolved.evidenceDigest === cal.evidenceDigest, `LIVE-L3 stage 2: production qualifies this host's tuple ${resolved?.qualified === true ? `with evidence ${resolved.evidenceDigest}` : 'by no entry'}, not with the stage 1 evidence ${cal.evidenceDigest}`);
+        else needs(resolved?.qualified !== true, `LIVE-L3 stage 2: production already qualifies this host's tuple (evidence ${resolved?.evidenceDigest}) although the stage 2 pin records no reviewed entry for it`);
     }
 
     // STAGE 2: normal public admission and a real model. A missing or mismatched tuple must

@@ -93,7 +93,7 @@ function writeLlmTree(base, { entries = [] } = {}) {
 
 // One fake apparatus for a local-llm block: the candidate source carrying the local-llm tree, pinned NVIDIA tools, a
 // staged remote root and the concrete manifest built by the real builder, over the fake local-llm world.
-function llmWorld(t, { block = 'apparatus-local-llm', faults = {}, vllm = null, qualified = false, suffix = 'claude', envelope, display = null, entries = [] } = {}) {
+function llmWorld(t, { block = 'apparatus-local-llm', faults = {}, vllm = null, qualified = false, suffix = 'claude', envelope, display = null, entries = null } = {}) {
     const root = scratch(t);
     const directory = name => { const target = path.join(root, name); fs.mkdirSync(target, { recursive: true, mode: 0o700 }); return target; };
     const home = directory('home');
@@ -102,7 +102,9 @@ function llmWorld(t, { block = 'apparatus-local-llm', faults = {}, vllm = null, 
     fs.writeFileSync(path.join(source, 'ploinky-box', 'bin', 'ploinky-box.mjs'), '// fixture candidate\n');
     fs.mkdirSync(path.join(source, 'tests', 'hardware-limits'), { recursive: true });
     fs.writeFileSync(path.join(source, 'tests', 'hardware-limits', 'verify.mjs'), '// fixture runner\n');
-    writeLlmTree(source, { entries });
+    // The reviewed data of the frozen candidate: the entry stage 2 expects, unless a test names its own entries.
+    const reviewed = entries ?? (vllm?.stage === 'qualified' && vllm.calibration?.expectQualified ? [{ ...vllm.calibration.tuple, denominator: 'physical-device', evidenceDigest: vllm.calibration.evidenceDigest }] : []);
+    writeLlmTree(source, { entries: reviewed });
     const bin = directory('bin');
     const engine = path.join(bin, 'podman'); fs.writeFileSync(engine, 'fake engine\n');
     const ssh = path.join(bin, 'ssh'); fs.writeFileSync(ssh, 'fake ssh\n');
@@ -1227,4 +1229,55 @@ test('LLM4.stage-one-rejects-every-abnormal-completion-whatever-the-document-say
     assert.match(caseOf(await liveCases(prerequisiteBlocked, ['LIVE-L3']), 'LIVE-L3').reason, /insufficient_disk/);
     const good = await provisioned(t, { block: 'apparatus-vllm' });
     assert.equal(caseOf(await liveCases(good, ['LIVE-L3']), 'LIVE-L3').result, 'pass'); nothingOwned(good);
+});
+
+// --- LLM3: stage 2 runs a model only for the tuple stage 1 pinned and the evidence production qualifies -------------
+test('LLM3.stage-two-binds-the-hosts-tuple-and-the-qualifying-evidence-to-the-stage-one-pin', async t => {
+    const current = { runnerLockDigest: VLLM_PINS.runnerLockDigest, driverVersion: '595.91.07', gpuPciDeviceId: '0x252010DE', computeCapability: '8.6', deviceTotalBytes: 6144 * MIB };
+    const old = { ...current, driverVersion: '595.91.06' };
+    const entry = (tuple, evidence) => ({ ...tuple, denominator: 'physical-device', evidenceDigest: hex(evidence) });
+    // The candidate's data holds BOTH reviewed tuples; public admission qualifies the live (current) one on its own.
+    const both = [entry(old, 'old evidence'), entry(current, 'current evidence')];
+    const pin = (tuple, evidence, expectQualified = true) => ({ stage: 'qualified', calibration: { evidenceDigest: hex(evidence), tuple, expectQualified } });
+    const run = async (vllm, options = {}) => { const w = await provisioned(t, { block: 'apparatus-vllm', vllm, qualified: true, entries: both, ...options }); return { w, l3: caseOf(await liveCases(w, ['LIVE-L3']), 'LIVE-L3') }; };
+    // The stage 1 pin is the OLD tuple although the host and public admission are current: BLOCKED, and no model is launched.
+    const stale = await run(pin(old, 'old evidence'));
+    assert.equal(stale.l3.result, 'blocked', JSON.stringify(stale.l3).slice(0, 600));
+    assert.match(stale.l3.reason, /the tuple this host reports differs from the stage 1 pin in driverVersion \(reported \{"driverVersion":"595\.91\.07"\}\)/);
+    assert.deepEqual(['local_llm_runner_install', 'local_llm_run', 'local_llm_test_prompt'].map(name => toolCalls(stale.w, name).length), [0, 0, 0], 'nothing was installed or run');
+    assert.equal(stale.w.fake.model.applyCalls.length, 0, 'no Apply either');
+    const binding = stale.w.artifacts.get('gpu-live-l3').qualificationBinding;
+    assert.deepEqual([binding.differing, binding.pinned.driverVersion, binding.actual.driverVersion], [['driverVersion'], '595.91.06', '595.91.07']);
+    assert.equal(stale.l3.result === 'pass', false); nothingOwned(stale.w);
+    // The matching pin (the current tuple and its own evidence) qualifies the run, and the report names that tuple.
+    const match = await run(pin(current, 'current evidence'));
+    assert.equal(match.l3.result, 'pass', JSON.stringify(match.l3).slice(0, 600));
+    const report = match.w.artifacts.get('gpu-live-l3');
+    assert.deepEqual([report.digests.qualification.tuple, report.digests.qualification.evidenceDigest], [current, hex('current evidence')]);
+    assert.deepEqual([report.qualificationBinding.differing, report.qualificationResolved], [[], { qualified: true, evidenceDigest: hex('current evidence') }]);
+    nothingOwned(match.w);
+    // The tuple matches but the evidence the pin names is not the evidence production qualifies it with.
+    const wrongEvidence = await run(pin(current, 'some other evidence'));
+    assert.equal(wrongEvidence.l3.result, 'blocked'); assert.match(wrongEvidence.l3.reason, /production qualifies this host's tuple with evidence [0-9a-f]{64}, not with the stage 1 evidence /);
+    assert.equal(toolCalls(wrongEvidence.w, 'local_llm_run').length, 0); nothingOwned(wrongEvidence.w);
+    // A tuple production does not qualify at all.
+    const none = await run(pin(current, 'current evidence'), { entries: [entry(old, 'old evidence')] });
+    assert.equal(none.l3.result, 'blocked'); assert.match(none.l3.reason, /production qualifies this host's tuple by no entry/);
+    assert.equal(toolCalls(none.w, 'local_llm_run').length, 0); nothingOwned(none.w);
+    // The pin records no reviewed entry, yet production already qualifies the host's tuple: the pin is stale.
+    const stalePin = await run(pin(current, 'current evidence', false));
+    assert.equal(stalePin.l3.result, 'blocked'); assert.match(stalePin.l3.reason, /production already qualifies this host's tuple/);
+    assert.equal(toolCalls(stalePin.w, 'local_llm_run').length, 0); nothingOwned(stalePin.w);
+});
+
+test('LLM3.every-tuple-field-the-stage-one-pin-carries-is-bound-to-what-the-host-reports', async t => {
+    const current = { runnerLockDigest: VLLM_PINS.runnerLockDigest, driverVersion: '595.91.07', gpuPciDeviceId: '0x252010DE', computeCapability: '8.6', deviceTotalBytes: 6144 * MIB };
+    // (The lock digest of a pin is refused earlier, by the profile, when it is not the pinned lock entry's.)
+    for (const [field, value] of [['gpuPciDeviceId', '0x252110DE'], ['computeCapability', '8.9'], ['deviceTotalBytes', 8192 * MIB]]) {
+        const tuple = { ...current, [field]: value };
+        const w = await provisioned(t, { block: 'apparatus-vllm', vllm: { stage: 'qualified', calibration: { evidenceDigest: hex('e'), tuple, expectQualified: true } }, qualified: true, entries: [{ ...tuple, denominator: 'physical-device', evidenceDigest: hex('e') }] });
+        const l3 = caseOf(await liveCases(w, ['LIVE-L3']), 'LIVE-L3');
+        assert.equal(l3.result, 'blocked', `${field}: ${JSON.stringify(l3).slice(0, 500)}`); assert.match(l3.reason, new RegExp(`differs from the stage 1 pin in ${field}`), field);
+        assert.equal(toolCalls(w, 'local_llm_run').length, 0, field); nothingOwned(w);
+    }
 });
