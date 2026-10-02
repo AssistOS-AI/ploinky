@@ -98,6 +98,12 @@ function normalizeProfileOverride(profile) {
     return normalized || '';
 }
 
+// The profile service's own test (profileService.js): a manifest declares profiles only with a non-empty plain `profiles` object.
+function declaresProfiles(manifest) {
+    const profiles = manifest?.profiles;
+    return Boolean(profiles) && typeof profiles === 'object' && !Array.isArray(profiles) && Object.keys(profiles).length > 0;
+}
+
 function resolveEffectiveProfile(manifest, requestedProfile, agentRef, { explicit = false } = {}) {
     const requested = normalizeProfileOverride(requestedProfile);
     const profiles = manifest?.profiles && typeof manifest.profiles === 'object'
@@ -108,6 +114,12 @@ function resolveEffectiveProfile(manifest, requestedProfile, agentRef, { explici
     }
     if (Object.prototype.hasOwnProperty.call(profiles, requested)) {
         return requested;
+    }
+    // A manifest that declares no profiles has the implicit 'default' profile, and the product persists exactly that
+    // resolved name on every agent record. An explicit 'default' therefore resolves, as in the profile service
+    // (profileService.js resolveManifestRuntimeProfile); any other explicit name on such a manifest still throws.
+    if (requested === 'default' && !declaresProfiles(manifest)) {
+        return 'default';
     }
     if (explicit) {
         const available = Object.keys(profiles).sort();

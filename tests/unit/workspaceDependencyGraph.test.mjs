@@ -2724,3 +2724,43 @@ fast_graph_cleanup_latched_workspace "$2"
     assert.equal(probe.status, 0, probe.stderr || probe.stdout);
     assert.equal(fs.existsSync(workspace), false);
 });
+
+// The product persists the RESOLVED profile on every agent record, which is 'default' for a manifest that declares no
+// profiles, and hands it back as an explicit root profile (hardware Apply does). The graph must resolve it exactly as
+// the profile service does, and keep refusing every other name it does not know.
+test('resolveWorkspaceDependencyGraph resolves an explicit default profile on a manifest that declares no profiles', () => {
+    writeManifest('implicitDefault', 'plain', { container: 'node:20-alpine' });
+    writeManifest('implicitDefault', 'emptyProfiles', { container: 'node:20-alpine', profiles: {} });
+    for (const agent of ['plain', 'emptyProfiles']) {
+        const ref = `implicitDefault/${agent}`;
+        for (const rootProfile of ['default', 'DEFAULT', ' default ']) {
+            const graph = resolveWorkspaceDependencyGraph({ staticAgentRef: ref, rootProfile });
+            assert.equal(graph.nodes.get(ref).profile, 'default', `${agent} with '${rootProfile}'`);
+        }
+        assert.equal(resolveWorkspaceDependencyGraph({ staticAgentRef: ref }).nodes.get(ref).profile, 'default', `${agent}: no profile asked`);
+        // Any other explicit name on such a manifest is still refused, with the same message.
+        assert.throws(() => resolveWorkspaceDependencyGraph({ staticAgentRef: ref, rootProfile: 'gpu' }), new RegExp(`profile 'gpu' is not defined by ${ref}; available profiles: \\(none\\)`));
+    }
+});
+
+test('resolveWorkspaceDependencyGraph keeps refusing an undeclared explicit profile of a manifest that declares profiles', () => {
+    writeManifest('declaredProfiles', 'app', { container: 'node:20-alpine', profiles: { default: {}, dev: {} } });
+    assert.equal(resolveWorkspaceDependencyGraph({ staticAgentRef: 'declaredProfiles/app', rootProfile: 'dev' }).nodes.get('declaredProfiles/app').profile, 'dev');
+    assert.equal(resolveWorkspaceDependencyGraph({ staticAgentRef: 'declaredProfiles/app', rootProfile: 'default' }).nodes.get('declaredProfiles/app').profile, 'default');
+    assert.throws(() => resolveWorkspaceDependencyGraph({ staticAgentRef: 'declaredProfiles/app', rootProfile: 'gpu' }), /profile 'gpu' is not defined by declaredProfiles\/app; available profiles: default, dev/);
+    // Declared profiles without 'default' do not make 'default' implicit.
+    writeManifest('declaredProfiles', 'noDefault', { container: 'node:20-alpine', profiles: { dev: {} } });
+    assert.throws(() => resolveWorkspaceDependencyGraph({ staticAgentRef: 'declaredProfiles/noDefault', rootProfile: 'default' }), /profile 'default' is not defined by declaredProfiles\/noDefault; available profiles: dev/);
+});
+
+test('resolveWorkspaceDependencyGraph resolves an explicit default on a profile-less dependency and refuses another name', () => {
+    writeManifest('depDefault', 'leaf', { container: 'node:20-alpine' });
+    writeManifest('depDefault', 'app', { container: 'node:20-alpine', enable: [{ agent: 'depDefault/leaf', profile: 'default' }] });
+    const graph = resolveWorkspaceDependencyGraph({ staticAgentRef: 'depDefault/app' });
+    assert.equal(graph.nodes.get('depDefault/leaf').profile, 'default');
+    writeManifest('depDefault', 'strict', { container: 'node:20-alpine', enable: [{ agent: 'depDefault/leaf', profile: 'gpu' }] });
+    assert.throws(() => resolveWorkspaceDependencyGraph({ staticAgentRef: 'depDefault/strict' }), /profile 'gpu' is not defined by depDefault\/leaf; available profiles: \(none\)/);
+    // The same dependency reached again with an explicit default agrees with its first resolution (no profile conflict).
+    writeManifest('depDefault', 'twice', { container: 'node:20-alpine', enable: ['depDefault/leaf', { agent: 'depDefault/leaf', profile: 'default' }] });
+    assert.equal(resolveWorkspaceDependencyGraph({ staticAgentRef: 'depDefault/twice' }).nodes.get('depDefault/leaf').profile, 'default');
+});
