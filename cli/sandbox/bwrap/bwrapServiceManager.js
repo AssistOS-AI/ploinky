@@ -405,12 +405,21 @@ function isSameOrInside(candidate, parent) {
     return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
-function addReadOnlyOverlay(args, hostPath, cwd, seen) {
+function addReadOnlyOverlay(args, hostPath, cwd, seen, projectTarget = cwd) {
     if (!hostPath || !isSameOrInside(hostPath, cwd) || !fs.existsSync(hostPath)) return;
     const resolved = path.resolve(hostPath);
     if (seen.has(resolved)) return;
+    const relative = path.relative(path.resolve(cwd), resolved).split(path.sep).filter(Boolean);
+    // Remapped into the sandbox, an overlay of the project root itself would
+    // turn the whole project mount (an isolated agent's HOME) read-only.
+    if (!relative.length && path.posix.normalize(projectTarget) !== path.resolve(cwd)) return;
     seen.add(resolved);
-    args.push('--ro-bind', resolved, resolved);
+    // The overlay lands where the project is mounted in the sandbox. That is
+    // the host path for global and devel agents, and /root for a static agent,
+    // whose host-absolute path does not exist there and would otherwise be
+    // created as a stray entry (through the writable /root bind when the
+    // workspace itself lives below /root).
+    args.push('--ro-bind', resolved, path.posix.join(projectTarget, ...relative));
 }
 
 function addProtectedWorkspaceOverlays(args, options) {
@@ -418,22 +427,23 @@ function addProtectedWorkspaceOverlays(args, options) {
         agentCodePath,
         nodeModulesDir,
         cwd,
+        projectTarget = cwd,
         protectAgentCodePath,
     } = options;
     const seen = new Set();
     const nodeModulesParent = nodeModulesDir ? path.dirname(nodeModulesDir) : '';
 
-    addReadOnlyOverlay(args, DEPS_DIR, cwd, seen);
-    addReadOnlyOverlay(args, nodeModulesParent, cwd, seen);
-    addReadOnlyOverlay(args, path.join(agentCodePath || '', 'node_modules'), cwd, seen);
-    addReadOnlyOverlay(args, CODE_DIR, cwd, seen);
-    addReadOnlyOverlay(args, path.join(PLOINKY_DIR, 'seatbelt-runtime'), cwd, seen);
-    addReadOnlyOverlay(args, PROFILE_FILE, cwd, seen);
-    addReadOnlyOverlay(args, ROUTING_FILE, cwd, seen);
-    addReadOnlyOverlay(args, SERVERS_CONFIG_FILE, cwd, seen);
+    addReadOnlyOverlay(args, DEPS_DIR, cwd, seen, projectTarget);
+    addReadOnlyOverlay(args, nodeModulesParent, cwd, seen, projectTarget);
+    addReadOnlyOverlay(args, path.join(agentCodePath || '', 'node_modules'), cwd, seen, projectTarget);
+    addReadOnlyOverlay(args, CODE_DIR, cwd, seen, projectTarget);
+    addReadOnlyOverlay(args, path.join(PLOINKY_DIR, 'seatbelt-runtime'), cwd, seen, projectTarget);
+    addReadOnlyOverlay(args, PROFILE_FILE, cwd, seen, projectTarget);
+    addReadOnlyOverlay(args, ROUTING_FILE, cwd, seen, projectTarget);
+    addReadOnlyOverlay(args, SERVERS_CONFIG_FILE, cwd, seen, projectTarget);
 
     if (protectAgentCodePath) {
-        addReadOnlyOverlay(args, agentCodePath, cwd, seen);
+        addReadOnlyOverlay(args, agentCodePath, cwd, seen, projectTarget);
     }
 }
 
@@ -451,6 +461,26 @@ function resolveBwrapHomeLayout({ cwd, cwdMountTarget, agentHomeDir }) {
         cwdMountTarget: cwdMountTarget || cwd || agentHomeDir,
         agentHomeDir: agentHomeDir || cwd,
     });
+}
+
+/**
+ * An isolated agent's project is its own persistent home, or the whole
+ * workspace for the workspace's static agent. Any other directory means the
+ * registry resolved another instance's data (for example an alias registered
+ * before the canonical instance), which would be mounted writable at /root.
+ */
+function assertIsolatedProjectIsOwnHome({ cwd, cwdMountTarget, agentHomeDir, workspaceRoot }) {
+    if (cwdMountTarget !== '/root' || !cwd || !agentHomeDir) return;
+    const canonical = (value) => {
+        const resolved = path.resolve(value);
+        try { return fs.realpathSync(resolved); } catch (_) { return resolved; }
+    };
+    const project = canonical(cwd);
+    if (project === canonical(agentHomeDir) || (workspaceRoot && project === canonical(workspaceRoot))) return;
+    throw new Error(
+        `[bwrap] isolated project '${cwd}' is neither the agent home '${agentHomeDir}' nor the workspace root; `
+        + 'refusing to mount another instance\'s data at /root'
+    );
 }
 
 /**
@@ -647,6 +677,9 @@ function buildBwrapArgs(options) {
     // Isolated agents use the home bind as their project mount; global and
     // devel agents retain the selected project at its host-absolute path.
     const homeLayout = resolveBwrapHomeLayout({ cwd, cwdMountTarget, agentHomeDir });
+    assertIsolatedProjectIsOwnHome({
+        cwd, cwdMountTarget, agentHomeDir, workspaceRoot: options.workspaceRoot || PLOINKY_WORKSPACE_ROOT,
+    });
     const storageWorkspaceRoot = path.dirname(path.dirname(path.resolve(sharedDir)));
     assertCanonicalAgentDataPath(sharedDir, { workspaceRoot: storageWorkspaceRoot });
     if (agentHomeDir) assertCanonicalAgentDataPath(agentHomeDir, { workspaceRoot: storageWorkspaceRoot });
@@ -695,6 +728,7 @@ function buildBwrapArgs(options) {
         agentCodePath,
         nodeModulesDir,
         cwd,
+        projectTarget: homeLayout.binds[0].target,
         protectAgentCodePath: codeReadOnly && !projectSourceWritable,
     });
 
@@ -923,7 +957,11 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     const alias = options.alias || existingRecord.alias;
     const instanceName = alias || agentName;
     const runtimeIdentity = normalizeSandboxRuntimeIdentity(options);
-    const cwd = getConfiguredProjectPath(agentName, repoName, alias);
+    // A prepared registry record already names the exact instance's project, as
+    // it does for containers; otherwise resolve it from the registry.
+    const cwd = options.preservePreparedRegistryRecord === true && existingRecord.projectPath
+        ? existingRecord.projectPath
+        : getConfiguredProjectPath(agentName, repoName, alias);
     const isolatedHome = (existingRecord.runMode || 'isolated') === 'isolated';
     const agentHomeDir = getAgentWorkDir(instanceName);
     const cwdMountTarget = isolatedHome ? '/root' : cwd;

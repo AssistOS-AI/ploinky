@@ -8,6 +8,9 @@ import path from 'node:path';
 import { buildBwrapArgs } from '../../cli/sandbox/bwrap/bwrapServiceManager.js';
 import { AGENTLIB_STABLE_MOUNT_PATH } from '../../agentlib/contract.mjs';
 import { agentLibFixture } from '../helpers/agentlibFixture.mjs';
+import {
+    CODE_DIR, DEPS_DIR, PLOINKY_DIR, PROFILE_FILE, ROUTING_FILE, SERVERS_CONFIG_FILE,
+} from '../../cli/utils/config.js';
 
 function hasUsableBwrap() {
     const probe = spawnSync('bwrap', [
@@ -64,6 +67,7 @@ function fixture(prefix) {
     fs.writeFileSync(path.join(root, '.ploinky', 'controller-sentinel'), 'controller');
     fs.writeFileSync(path.join(root, '.ploinky', 'data', 'sentinel'), 'controller');
     fs.writeFileSync(path.join(root, 'workspace-marker'), 'workspace');
+    fs.writeFileSync(path.join(root, '.ploinky', 'routing.json'), 'routing');
     return { root, agentCodePath, nodeModulesDir, sharedDir, agentLibPath, agentHomeDir };
 }
 
@@ -208,6 +212,9 @@ test('real bwrap static layout shows the workspace at /root and a writable HOME'
             'test -z "$(ls -A /root/.ploinky/data)"',
             'if touch /root/.ploinky/escaped 2>/dev/null; then exit 74; fi',
             'if touch /root/.ploinky/data/escaped 2>/dev/null; then exit 75; fi',
+            'if echo changed > /root/.ploinky/routing.json 2>/dev/null; then exit 76; fi',
+            'if rm -f /root/.ploinky/routing.json 2>/dev/null; then exit 77; fi',
+            'test "$(cat /root/.ploinky/routing.json)" = routing',
             'touch "$HOME/persisted"',
             'test -f /root/.data/lifecycle/persisted',
             'touch /root/project-write',
@@ -219,6 +226,92 @@ test('real bwrap static layout shows the workspace at /root and a writable HOME'
         assert.equal(fs.existsSync(path.join(layout.agentHomeDir, 'persisted')), true);
         assert.equal(fs.existsSync(path.join(layout.root, 'project-write')), true);
         assert.equal(fs.existsSync(path.join(layout.root, '.ploinky', 'escaped')), false);
+    } finally {
+        fs.rmSync(layout.root, { recursive: true, force: true });
+    }
+});
+
+test('an isolated agent whose project is another instance\'s data is refused', () => {
+    const layout = fixture('bwrap-foreign-home-');
+    try {
+        const foreign = path.join(layout.root, '.data', 'lifecycle2');
+        fs.mkdirSync(foreign, { recursive: true });
+        assert.throws(() => argsFor(layout, {
+            cwd: foreign, cwdMountTarget: '/root', agentHomeDir: layout.agentHomeDir,
+        }), /neither the agent home .* nor the workspace root/);
+        // Its own home, and the workspace for the static agent, stay valid.
+        argsFor(layout, { cwd: layout.agentHomeDir, cwdMountTarget: '/root', agentHomeDir: layout.agentHomeDir });
+        argsFor(layout, { cwd: layout.root, cwdMountTarget: '/root', agentHomeDir: layout.agentHomeDir });
+        // Non-isolated agents keep their own project directory at its host path.
+        argsFor(layout, { cwd: foreign, agentHomeDir: layout.agentHomeDir });
+    } finally {
+        fs.rmSync(layout.root, { recursive: true, force: true });
+    }
+});
+
+// The static agent sees the workspace at /root, so a protective overlay must
+// be placed at the in-sandbox path. A host-absolute destination protects
+// nothing there and is created as a stray entry (through the writable /root
+// bind when the host workspace itself lives below /root).
+test('static agent overlays protect the /root paths, never host-absolute destinations', () => {
+    const layout = fixture('bwrap-static-overlays-');
+    try {
+        // Source outside .ploinky: only an in-sandbox overlay can protect it.
+        const localCode = path.join(layout.root, 'agents', 'local', 'code');
+        fs.mkdirSync(localCode, { recursive: true });
+        const args = argsFor(layout, {
+            cwd: layout.root, cwdMountTarget: '/root', agentHomeDir: layout.agentHomeDir, agentCodePath: localCode,
+        });
+        const all = mounts(args);
+        assert.deepEqual(all.filter(mount => mount.target.startsWith(layout.root)), [],
+            'nothing is mounted at a host-absolute workspace path');
+        const overlay = all.find(mount => mount.source === localCode && mount.target !== '/code');
+        assert.deepEqual([overlay.readOnly, overlay.target], [true, '/root/agents/local/code']);
+        assert.ok(overlay.index > all.find(mount => mount.target === '/root').index);
+        // The dependency payload parent is covered the same way.
+        const payload = path.dirname(layout.nodeModulesDir);
+        const dependency = all.find(mount => mount.source === payload);
+        assert.deepEqual([dependency.readOnly, dependency.target],
+            [true, `/root/${path.relative(layout.root, payload).split(path.sep).join('/')}`]);
+    } finally {
+        fs.rmSync(layout.root, { recursive: true, force: true });
+    }
+});
+
+test('global agent overlays keep their host-absolute destinations', () => {
+    const layout = fixture('bwrap-global-overlays-');
+    try {
+        const args = argsFor(layout, { cwd: layout.root, agentHomeDir: layout.agentHomeDir });
+        const payload = path.dirname(layout.nodeModulesDir);
+        const overlay = mounts(args).find(mount => mount.source === payload && mount.target === payload);
+        assert.equal(overlay.readOnly, true);
+    } finally {
+        fs.rmSync(layout.root, { recursive: true, force: true });
+    }
+});
+
+// Every fixed overlay path is controller state below .ploinky, which the
+// static layout already pins read-only at /root/.ploinky.
+test('the fixed protected workspace paths all live under the pinned controller root', () => {
+    for (const protectedPath of [DEPS_DIR, CODE_DIR, PROFILE_FILE, ROUTING_FILE, SERVERS_CONFIG_FILE,
+        path.join(PLOINKY_DIR, 'seatbelt-runtime')]) {
+        assert.ok(protectedPath.startsWith(`${PLOINKY_DIR}${path.sep}`), `${protectedPath} is under ${PLOINKY_DIR}`);
+    }
+});
+
+// For a start-only agent the dependency fallback lives in the home directory,
+// so the "parent of node_modules" overlay is the home itself. Remapped to the
+// project target it must not turn the agent's writable /root read-only.
+test('an isolated start-only agent keeps a writable /root home', () => {
+    const layout = fixture('bwrap-startonly-home-');
+    try {
+        const nodeModulesDir = path.join(layout.agentHomeDir, 'node_modules');
+        fs.mkdirSync(nodeModulesDir, { recursive: true });
+        const args = argsFor(layout, {
+            cwd: layout.agentHomeDir, cwdMountTarget: '/root', agentHomeDir: layout.agentHomeDir, nodeModulesDir,
+        });
+        const atRoot = mounts(args).filter(mount => mount.target === '/root');
+        assert.deepEqual(atRoot.map(({ readOnly, source }) => [readOnly, source]), [[false, layout.agentHomeDir]]);
     } finally {
         fs.rmSync(layout.root, { recursive: true, force: true });
     }
