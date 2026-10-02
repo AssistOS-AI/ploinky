@@ -70,7 +70,7 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
         const registry = loadRegistry();
         // A created candidate whose readiness failed (or whose process died)
         // is settled through its own exact tuple and immutable ID before any
-        // planning; the registry still names its predecessor (fix round 3, M1).
+        // planning; the registry still names its predecessor.
         for (const candidate of createdMpsCandidates(store.read(), registry)) {
             check();
             let plan = null;

@@ -30,7 +30,7 @@ const sameRecord = (client, record) => record?.type === 'agent' && client.instan
 // candidates; the existing graph batch owns removal of predecessors, identity
 // rotation, its preparation lease, readiness and final publication.
 // `progress.mutating` turns true immediately before the first effect: every
-// failure before it is a contained GPU refusal (fix round 3, M2).
+// failure before it is a contained GPU refusal.
 async function prepareMpsGraphImpl({ nodes, networkLifecycleCapability, deadline = Date.now() + 15 * 60_000 } = {}, {
     readContext = readBoxHardwareContext, loadRegistry = readAgentRegistrySnapshot, readApplied = readAppliedObservation,
     store = createMpsStateStore(), backend = createMpsDaemonBackend(), assertCapability = assertNetworkLifecycleCapability,
