@@ -5,7 +5,7 @@ import { sanitizeAuthorityDiagnostic } from '../authorityCommandDiagnostics.mjs'
 // A step is recorded on the error where it is thrown (the first, innermost
 // step wins); the Apply result then reports it with the generic fix hint.
 export const APPLY_STEPS = Object.freeze([
-    'planning', 'image-preparation', 'client-inventory', 'drain', 'daemon-stop', 'daemon-cleanup', 'daemon-start', 'set-defaults',
+    'planning', 'mps-coordination', 'image-preparation', 'client-inventory', 'drain', 'daemon-stop', 'daemon-cleanup', 'daemon-start', 'set-defaults',
     'verify', 'client-launch', 'runtime-launch', 'restart-preparation', 'readiness', 'activation',
 ]);
 const STEP = /^[a-z][a-z-]{1,31}$/;

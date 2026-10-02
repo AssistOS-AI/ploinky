@@ -685,6 +685,11 @@ export function buildRequiredCaseManifest() {
             'W5.verify-keeps-its-boolean-and-reports-the-failing-step-and-reply',
             'W5.the-callers-pass-the-reason-into-their-typed-errors',
         ]),
+        // The step an untyped Apply failure reports, through the real reconcile and the MPS lifecycle.
+        ...leaves(P, 'p4', unit('hardwareLimitsApplyStepLabels.test.mjs'), [
+            'W7.a-failure-inside-the-mps-coordination-is-the-coordination-step-not-planning',
+            'W7.a-check-between-two-steps-is-not-credited-to-the-step-that-just-finished',
+        ]),
         ...leaves(P, 'p4', unit('hardwareLimitsMpsCandidateRecovery.test.mjs'), [
             'MC.readiness-failure-then-retry-succeeds', 'MC.readiness-failure-leaving-the-candidate-removes-it-by-id',
             'MC.non-exact-candidate-is-refused-without-daemon-change', 'MC.crash-during-readiness-then-recovery',

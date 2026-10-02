@@ -196,14 +196,18 @@ export async function reconcileExactHardwareInstance(captured, {
         let result = null;
         let transition = null;
         let plan = null;
-        // The step an untyped failure happened in, recorded on the error where it is caught.
+        // The step an untyped failure happened in, recorded on the error where it is caught. A step names itself while it
+        // runs and hands back to the generic 'apply' when it completes, so a check between two steps is never credited to
+        // the step that just finished, and the coordination of the MPS cohort has its own name.
         let phase = 'planning';
         try {
             plan = loadPlan(captured);
+            phase = 'apply';
             const gpuClient = Boolean(plan.runtimeAdmission?.descriptor?.hardwareGpu);
             if (plan.hardwareOutcome) throw new HardwareLimitsError(plan.hardwareOutcome);
             const priorMps = readAppliedObservation(captured.key, captured.record.containerId);
             if (!hasMpsLaunch(mpsLaunch) && (plan.runtimeAdmission?.descriptor?.hardwareGpu || priorMps?.mpsGeneration)) {
+                phase = 'mps-coordination';
                 return await coordinateMpsLifecycle({ target: captured, options: { origin, expectedToken: capturedToken, deadline, authorize, isCancelled, onMpsPlan, onMpsResult, networkLifecycleCapability: capability },
                     launchTarget: (next) => reconcileExactHardwareInstance(captured, next) });
             }
@@ -213,6 +217,7 @@ export async function reconcileExactHardwareInstance(captured, {
                 check();
                 phase = 'restart-preparation';
                 transition = await prepare({ containerName: captured.key, routeKey, repoName: captured.record.repoName, shortAgentName: captured.record.agentName, record: captured.record, networkLifecycleCapability: capability });
+                phase = 'apply';
             }
             // Preparation can rotate the registry. Revalidate its own exact
             // successor before create, while token/barrier checks stay fresh.
@@ -231,12 +236,14 @@ export async function reconcileExactHardwareInstance(captured, {
             if (mpsLaunch && gpuClient) trackMpsRuntimePending(result, { mpsLaunch, key: captured.key });
             phase = 'readiness';
             await readiness({ key: captured.key, label: captured.record.agentName, kind: 'reinstall', manifest: plan.manifest, route: { container: result.containerName, hostPort: result.hostPort || 0 } }, { deadline, beforeProbe: checkPolicy });
+            phase = 'apply';
             checkPolicy();
             phase = 'verify';
             await verifyMpsRuntimeReady(result);
             phase = 'activation';
             if (transition) await commit({ transition, result, agentPath: plan.agentPath, alias: captured.record.alias || '', networkLifecycleCapability: capability });
             else await activate({ result, routeKey, repoName: captured.record.repoName, shortAgentName: captured.record.agentName, agentPath: plan.agentPath, alias: captured.record.alias || '', networkLifecycleCapability: capability });
+            phase = 'apply';
             await acknowledgeMpsRuntimeReady(result);
             return Object.defineProperty({ key: captured.key, observedKey: result.containerName, instanceId: result.registryRecord?.instanceId, enableGeneration: result.registryRecord?.enableGeneration, containerId: result.containerId, state: 'applied', problem: null }, 'runtimeResult', { value: result });
         } catch (error) {
