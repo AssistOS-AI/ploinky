@@ -258,6 +258,16 @@ export function buildRequiredCaseManifest() {
             'H.duplicate-leaf-title-under-two-parents', 'H.p3-explorer-sibling-is-the-configured-ploinky-candidate',
         ]),
         ...leaves(P, 's0', unit('hardwareLimitsFailureSignatures.test.mjs'), ['HS.proc-pid-normalization', 'HS.engine-spawn-guard-fails-a-suite-that-starts-an-engine']),
+        ...leaves(P, 's0', unit('hardwareLimitsEngineGuard.test.mjs'), [
+            'EG.shell-option-clusters-and-script-forms-are-refused', 'EG.wrapper-operands-are-analysed-as-invocations',
+            'EG.absolute-guarded-paths-are-refused-wherever-they-appear', 'EG.option-forms-shell-string-and-fork-exec-path',
+            'EG.login-shells-are-refused-with-a-guarded-word-and-run-otherwise', 'EG.environment-resets-and-explicit-environments-are-refused',
+            'EG.hidden-names-reach-the-path-stubs-through-every-environment-rewrite',
+            'EG.descendants-and-worker-threads-are-guarded-through-an-explicit-environment',
+            'EG.a-violating-child-killed-by-a-signal-still-fails-the-top-level-suite',
+            'EG.the-top-level-removes-its-temporary-root-on-exit-and-on-sigterm',
+            'EG.a-sigkilled-descendant-with-an-explicit-env-leaves-nothing-behind',
+        ]),
         ...leaves(P, 's0', unit('hardwareLimitsLiveHarness.test.mjs'), ['HLIVE.R16-inherited-pipe-grandchild-deadline']),
         ...leaves(P, 'p0', unit('hardwareLimitsAdmission.test.mjs'), [
             'A.manifest-memory', 'A.catalog-cpu', 'A.profile-pids', 'A.lite-enabled-absent', 'A.lite-enabled-false',
