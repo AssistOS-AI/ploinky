@@ -3,6 +3,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { MpsError } from './mpsEligibility.mjs';
 import { isMpsClientAlias, validateMpsDefault } from './mps.mjs';
 import { findHardwareOutcome } from './errors.mjs';
+import { inApplyStep, describeApplyCause, formatApplyCause } from './applyCause.mjs';
 
 /**
  * The coordination's own target completed or was not the failing client,
@@ -154,21 +155,21 @@ function* transitionSteps(input, { assertCapability, store, backend, drain, recr
         for (const client of drainOrder) {
             if (state.drainedClients.includes(clientIdentity(client))) continue;
             check();
-            yield () => drain(client, input.capability);
+            yield () => inApplyStep('drain', () => drain(client, input.capability));
             state.drainedClients = [...new Set([...state.drainedClients, clientIdentity(client)])]; save();
             settleRefusedPeers();
         }
-        if (plan.stopDaemon) { check(); backend.stop(state); state.daemon = null; state.daemonGeneration = null; state.configurationGeneration = null; save(); }
+        if (plan.stopDaemon) { check(); inApplyStep('daemon-stop', () => backend.stop(state)); state.daemon = null; state.daemonGeneration = null; state.configurationGeneration = null; save(); }
         if (plan.stopDaemon || observation.state === 'gone') {
             // Journal the terminated generation before its directories are
             // removed, so an interruption after cleanup recovers from 'gone'.
             state.daemon = null; state.daemonGeneration = null; state.configurationGeneration = null; save();
-            if (backend.cleanup && state.pipeDirectory) { check(); backend.cleanup(state); }
+            if (backend.cleanup && state.pipeDirectory) { check(); inApplyStep('daemon-cleanup', () => backend.cleanup(state)); }
             state.pipeDirectory = null; state.logDirectory = null; save();
         }
         if (plan.startDaemon) {
             check();
-            const daemon = backend.start(plan.serverDefault, { tools, onState: (next) => { state = { ...state, ...next, status: 'transitioning', oldClients: plan.oldClients, desiredClients: plan.desiredClients, pendingClients: state.pendingClients, drainedClients: state.drainedClients }; save(); } });
+            const daemon = inApplyStep('daemon-start', () => backend.start(plan.serverDefault, { tools, onState: (next) => { state = { ...state, ...next, status: 'transitioning', oldClients: plan.oldClients, desiredClients: plan.desiredClients, pendingClients: state.pendingClients, drainedClients: state.drainedClients }; save(); } }));
             state = { ...state, ...daemon, status: 'transitioning', oldClients: plan.oldClients, desiredClients: plan.desiredClients, pendingClients: state.pendingClients, drainedClients: state.drainedClients }; save();
             if (!backend.verify(state)) throw new MpsError('MPS daemon lost its verified defaults before client create');
         }
@@ -182,7 +183,7 @@ function* transitionSteps(input, { assertCapability, store, backend, drain, recr
                 // failure becomes the target's outcome (plan 10.2); a peer's
                 // is that peer's pending result and never the target's refusal.
                 if (client.share && !backend.verify(state)) throw new MpsError('MPS daemon defaults changed before client create');
-                result = yield () => recreate(client, readyState, input.capability);
+                result = yield () => inApplyStep('client-launch', () => recreate(client, readyState, input.capability));
             } catch (error) {
                 // One client's failure is its own terminal outcome; the rest
                 // of the cohort is still recreated. A cancelled, expired or
@@ -195,7 +196,11 @@ function* transitionSteps(input, { assertCapability, store, backend, drain, recr
                 // recovery; an uncreated client stays a pending intent.
                 if (created.length) state.pendingClients = [...state.pendingClients.filter((entry) => entry.key !== client.key), ...created];
                 failures.push({ client, error });
-                result = { key: client.key, state: 'pending', problem: findHardwareOutcome(error), error: String(error?.code || 'mps_client_failed').slice(0, 64), message: 'This exact GPU share client was not recreated; it stays inactive until retried.' };
+                const problem = findHardwareOutcome(error);
+                // An untyped failure keeps its cause in the client's result.
+                const cause = problem ? null : describeApplyCause(error, 'client-launch');
+                result = { key: client.key, state: 'pending', problem, error: String(error?.code || 'mps_client_failed').slice(0, 64),
+                    message: `This exact GPU share client was not recreated; it stays inactive until retried.${cause ? ` Cause at ${formatApplyCause(cause)}` : ''}`, ...(cause ? { cause } : {}) };
                 results.push(result); onResult(result);
                 save();
                 continue;
@@ -222,7 +227,7 @@ function* transitionSteps(input, { assertCapability, store, backend, drain, recr
         // readiness failed. Retain that newer identity for crash recovery.
         const observedState = store.read();
         if (observedState?.transitionId === state.transitionId && observedState?.daemonGeneration === state.daemonGeneration) state = observedState;
-        state = { ...state, status: 'pending', lastProblem: { code: String(error.code || 'mps_transition_failed').slice(0, 64), message: 'MPS transition is incomplete; inactive clients remain pending. Retry after repairing the reported prerequisite.' } };
+        state = { ...state, status: 'pending', lastProblem: { code: String(error.code || 'mps_transition_failed').slice(0, 64), message: 'MPS transition is incomplete; inactive clients remain pending. Retry after repairing the reported prerequisite.', cause: describeApplyCause(error, 'transition') } };
         save();
         // Every abort carries the outcomes completed so far.
         if (error && typeof error === 'object' && !Object.hasOwn(error, 'mpsTransitionResults')) Object.defineProperty(error, 'mpsTransitionResults', { value: results, configurable: true });

@@ -4,6 +4,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { MPS_TOOL_PATHS, revalidateMpsTools } from '../../../ploinky-box/lib/mpsTools.mjs';
 import { MpsError } from './mpsEligibility.mjs';
+import { commandFailureDetail, markApplyStep } from './applyCause.mjs';
 import { AGENT_ALIAS_PATTERN, RESERVED_AGENT_REGISTRY_KEYS } from '../../utils/agentRegistryResolver.js';
 
 export const MPS_ROOT = '/run/ploinky/mps';
@@ -56,7 +57,7 @@ export function runMpsControl(command, { env, query = spawnSync, uid = process.g
     assertUid(uid);
     if (typeof command !== 'string' || !COMMAND.test(command) || command.length > 200) throw new MpsError('Unsupported MPS control command');
     const result = query(MPS_TOOL_PATHS.control, [], { input: `${command}\n`, encoding: 'utf8', env, timeout: Math.min(timeoutMs, 5000), maxBuffer: OUTPUT_BOUND, stdio: ['pipe', 'pipe', 'pipe'] });
-    if (result.status !== 0 || result.signal || result.error || result.truncated || Buffer.byteLength(String(result.stdout || '')) > OUTPUT_BOUND || Buffer.byteLength(String(result.stderr || '')) > OUTPUT_BOUND) throw new MpsError('MPS control failed, timed out or exceeded its output bound');
+    if (result.status !== 0 || result.signal || result.error || result.truncated || Buffer.byteLength(String(result.stdout || '')) > OUTPUT_BOUND || Buffer.byteLength(String(result.stderr || '')) > OUTPUT_BOUND) throw new MpsError(`MPS control failed, timed out or exceeded its output bound${commandFailureDetail(result)}`);
     if (/[^\x09\x0a\x0d\x20-\x7e]/.test(String(result.stdout || ''))) throw new MpsError('MPS control reply is not ASCII');
     return String(result.stdout || '');
 }
@@ -299,7 +300,11 @@ export function createMpsDaemonBackend({ root = MPS_ROOT, fsApi = fs, query = sp
         },
         control,
         start(defaults, { tools, configurationGeneration = crypto.randomUUID(), onState = () => {} } = {}) {
-            assertUid(uid); validateMpsDefault(defaults); revalidateMpsTools(tools, { fsApi, mounted: true });
+            assertUid(uid); validateMpsDefault(defaults);
+            // The mounted tools are revalidated against the wiring's fingerprint. A drifted or unreadable tool is a typed
+            // sharing refusal with its own reason, like every other prerequisite; the plain errors of the fingerprint helper
+            // carry no code and would otherwise surface as a generic Apply failure.
+            try { revalidateMpsTools(tools, { fsApi, mounted: true }); } catch (error) { throw new MpsError(`The mounted MPS tools no longer match the GPU wiring: ${String(error?.message || error).slice(0, 200)}`); }
             if (String(fsApi.readFileSync('/proc/self/cgroup', 'utf8')).trim() !== '0::/ploinky/core') throw new MpsError('MPS daemon must inherit /ploinky/core');
             privateDirectory(root, { fsApi, uid, create: true });
             if (discoverOwnedMpsDaemon({ root, tools, fsApi, uid })) throw new MpsError('An owned MPS daemon must be drained and stopped before starting another generation');
@@ -311,9 +316,12 @@ export function createMpsDaemonBackend({ root = MPS_ROOT, fsApi = fs, query = sp
             onState(state);
             const deadline = now() + 30_000;
             const launch = query(MPS_TOOL_PATHS.control, ['-d'], { detached: true, stdio: 'ignore', env: envFor(state), timeout: 5000 });
-            if (launch.status !== 0 || launch.error || launch.signal) throw new MpsError('MPS daemon start failed or timed out');
+            if (launch.status !== 0 || launch.error || launch.signal) throw new MpsError(`MPS daemon start failed or timed out${commandFailureDetail(launch)}`);
+            // The attempt's phase names where a failed readiness stopped: the PID receipt, the ownership proof or the defaults.
+            let phase = 'pid receipt';
             do {
                 try {
+                    phase = 'pid receipt';
                     const pidText = readBounded(path.join(state.pipeDirectory, 'nvidia-cuda-mps-control.pid'), { fsApi, maxBytes: 64, uid }).trim();
                     if (!/^[1-9]\d*$/.test(pidText) || !safeInteger(Number(pidText), 1, 2147483647)) throw new MpsError('MPS daemon PID is invalid');
                     const fields = String(fsApi.readFileSync(`/proc/${pidText}/stat`, 'utf8')).replace(/^.*\) /, '').split(' ');
@@ -321,10 +329,12 @@ export function createMpsDaemonBackend({ root = MPS_ROOT, fsApi = fs, query = sp
                     if (executable.dev !== tools.control.dev || executable.ino !== tools.control.ino) throw new MpsError('MPS daemon executable identity changed');
                     state.daemon = { pid: Number(pidText), startTime: fields[19], executableDev: executable.dev, executableIno: executable.ino };
                     onState(state);
+                    phase = 'ownership proof';
                     if (observe(state, { fsApi, uid }).state !== 'owned') throw new MpsError('MPS daemon ownership is not proven');
+                    phase = 'set defaults';
                     configureMpsDefaults(defaults, { control: (command) => control(state, command, { deadline }), uid, verifyServer: (pid) => observeOwnedMpsServer(state, pid, { fsApi, uid }) });
                     state.status = 'ready'; return state;
-                } catch (error) { if (now() >= deadline) throw new MpsError(`MPS daemon readiness failed: ${String(error.message).slice(0, 200)}`); wait(100); }
+                } catch (error) { if (now() >= deadline) throw markApplyStep(new MpsError(`MPS daemon readiness failed at ${phase}: ${String(error.message).slice(0, 200)}`), phase === 'set defaults' ? 'set-defaults' : 'daemon-start'); wait(100); }
             } while (now() < deadline);
             throw new MpsError('MPS daemon readiness timed out');
         },

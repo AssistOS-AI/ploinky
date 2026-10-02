@@ -626,6 +626,19 @@ export function buildRequiredCaseManifest() {
             'MI.refused-peer-outcome-survives-a-cancellation-after-its-drain',
         ]),
         ...leaves(P, 'p4', unit('hardwareLimitsOutcomes.test.mjs'), ['O.mps-graph-refusal-starts-cpu-agents-and-explorer']),
+        // LIVE-P1 attempt 3: an untyped Apply failure keeps its step, class, code and a bounded, secret-free message.
+        ...leaves(P, 'p4', unit('hardwareLimitsApplyCause.test.mjs'), [
+            'AC.the-first-share-names-each-failing-step-with-class-code-message-and-the-generic-fix',
+            'AC.a-failed-transition-journals-its-cause-beside-the-generic-problem',
+            'AC.the-cause-is-bounded-and-never-carries-a-secret',
+            'AC.a-typed-hardware-refusal-keeps-its-own-reason-and-gets-no-cause',
+            'AC.the-product-reconcile-names-launch-readiness-and-activation',
+            'AC.a-failed-runtime-verification-of-a-share-client-is-the-verify-step',
+            'AC.the-innermost-step-is-kept-and-values-that-are-not-errors-are-described',
+            'AC.a-peer-that-was-not-recreated-reports-its-cause-in-the-partial-result',
+            'AC.mps-control-and-daemon-start-failures-say-how-the-tool-failed',
+            'AC.a-drifted-mounted-tool-is-a-typed-sharing-refusal-through-apply-not-a-generic-failure',
+        ]),
         ...leaves(P, 'p4', unit('hardwareLimitsMpsCandidateRecovery.test.mjs'), [
             'MC.readiness-failure-then-retry-succeeds', 'MC.readiness-failure-leaving-the-candidate-removes-it-by-id',
             'MC.non-exact-candidate-is-refused-without-daemon-change', 'MC.crash-during-readiness-then-recovery',

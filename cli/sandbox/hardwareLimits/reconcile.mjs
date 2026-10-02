@@ -32,7 +32,9 @@ import { inspectMpsImage } from './mpsEligibility.mjs';
 import { createMpsStateStore } from './mps.mjs';
 import { verifyMpsRuntimeObservation } from './mpsRuntimeObservation.mjs';
 import { resolveManifestImage } from '../../utils/security/secretVars.js';
+import { inApplyStep, describeApplyCause, formatApplyCause } from './applyCause.mjs';
 
+const APPLY_FAILED_FIX = 'This exact instance was not applied. Reload its state and retry.';
 function failure(code, message, status = 409) { return new HardwareStoreError(message, { code, status }); }
 
 export function captureExactHardwareInstances(registry, keys) {
@@ -195,7 +197,7 @@ export async function reconcileExactHardwareInstance(captured, {
         let transition = null;
         let plan = null;
         try {
-            plan = loadPlan(captured);
+            plan = inApplyStep('planning', () => loadPlan(captured));
             if (plan.hardwareOutcome) throw new HardwareLimitsError(plan.hardwareOutcome);
             const priorMps = readAppliedObservation(captured.key, captured.record.containerId);
             if (!hasMpsLaunch(mpsLaunch) && (plan.runtimeAdmission?.descriptor?.hardwareGpu || priorMps?.mpsGeneration)) {
@@ -206,12 +208,13 @@ export async function reconcileExactHardwareInstance(captured, {
             const route = loadRouting().routes?.[routeKey];
             if (!isSandboxRuntime(plan.runtime) && route && !route.hardwareAvailability) {
                 check();
-                transition = await prepare({ containerName: captured.key, routeKey, repoName: captured.record.repoName, shortAgentName: captured.record.agentName, record: captured.record, networkLifecycleCapability: capability });
+                transition = await inApplyStep('restart-preparation', () => prepare({ containerName: captured.key, routeKey, repoName: captured.record.repoName, shortAgentName: captured.record.agentName, record: captured.record, networkLifecycleCapability: capability }));
             }
             // Preparation can rotate the registry. Revalidate its own exact
             // successor before create, while token/barrier checks stay fresh.
             checkPolicy();
-            result = await ensure(captured.record.agentName, plan.manifest, plan.agentPath, {
+            const gpuClient = Boolean(plan.runtimeAdmission?.descriptor?.hardwareGpu);
+            result = await inApplyStep(gpuClient ? 'client-launch' : 'runtime-launch', () => ensure(captured.record.agentName, plan.manifest, plan.agentPath, {
                 containerName: captured.key, alias: captured.record.alias, forceRecreate: true, forceRecreateReason: 'hardware limits reconciliation',
                 hardwareInstanceKey: captured.key,
                 profileName: plan.profileResolution.resolvedProfileName, profileResolution: plan.profileResolution,
@@ -220,13 +223,14 @@ export async function reconcileExactHardwareInstance(captured, {
                 ...(transition ? { instanceId: transition.identity.instanceId, enableGeneration: transition.identity.enableGeneration, targetedRestart: transition.targetedRestart } : {}),
                 beforeHardwareMutation: checkPolicy,
                 mpsLaunch,
-            });
-            if (mpsLaunch && plan.runtimeAdmission?.descriptor?.hardwareGpu) trackMpsRuntimePending(result, { mpsLaunch, key: captured.key });
-            await readiness({ key: captured.key, label: captured.record.agentName, kind: 'reinstall', manifest: plan.manifest, route: { container: result.containerName, hostPort: result.hostPort || 0 } }, { deadline, beforeProbe: checkPolicy });
+            }));
+            if (mpsLaunch && gpuClient) inApplyStep('client-launch', () => trackMpsRuntimePending(result, { mpsLaunch, key: captured.key }));
+            await inApplyStep('readiness', () => readiness({ key: captured.key, label: captured.record.agentName, kind: 'reinstall', manifest: plan.manifest, route: { container: result.containerName, hostPort: result.hostPort || 0 } }, { deadline, beforeProbe: checkPolicy }));
             checkPolicy();
-            await verifyMpsRuntimeReady(result);
-            if (transition) await commit({ transition, result, agentPath: plan.agentPath, alias: captured.record.alias || '', networkLifecycleCapability: capability });
-            else await activate({ result, routeKey, repoName: captured.record.repoName, shortAgentName: captured.record.agentName, agentPath: plan.agentPath, alias: captured.record.alias || '', networkLifecycleCapability: capability });
+            await inApplyStep('verify', () => verifyMpsRuntimeReady(result));
+            await inApplyStep('activation', () => (transition
+                ? commit({ transition, result, agentPath: plan.agentPath, alias: captured.record.alias || '', networkLifecycleCapability: capability })
+                : activate({ result, routeKey, repoName: captured.record.repoName, shortAgentName: captured.record.agentName, agentPath: plan.agentPath, alias: captured.record.alias || '', networkLifecycleCapability: capability })));
             await acknowledgeMpsRuntimeReady(result);
             return Object.defineProperty({ key: captured.key, observedKey: result.containerName, instanceId: result.registryRecord?.instanceId, enableGeneration: result.registryRecord?.enableGeneration, containerId: result.containerId, state: 'applied', problem: null }, 'runtimeResult', { value: result });
         } catch (error) {
@@ -315,10 +319,14 @@ export async function applyHardwareLimits({ expectedToken, containers }, {
                     continue;
                 }
                 const problem = findHardwareOutcome(error);
-                const result = { key: problem?.key || instance.key, state: problem?.state || 'pending', problem, error: problem?.code || String(error.code || 'apply_failed'), message: problem ? undefined : 'This exact instance was not applied. Reload its state and retry.' };
+                // An untyped failure keeps its cause (step, class, code and a
+                // bounded secret-free message); the generic text stays the fix.
+                const cause = problem ? undefined : describeApplyCause(error, 'apply');
+                const result = { key: problem?.key || instance.key, state: problem?.state || 'pending', problem, error: problem?.code || String(error?.code || 'apply_failed'),
+                    message: cause ? `Apply stopped at ${formatApplyCause(cause)}` : undefined, ...(cause ? { cause, fix: APPLY_FAILED_FIX } : {}) };
                 if (!results.some((entry) => entry.key === result.key && entry.state === 'applied')) recordResult(result);
                 if (problem?.key && problem.key !== instance.key) return { ok: false, status: 207, token, expandedContainers, results, pendingContainers: keys.filter((key) => !results.some((entry) => entry.key === key)) };
-                if (!problem) return { ok: false, status: error.status || 409, error: result.error, token, expandedContainers, results, pendingContainers: keys.filter((key) => !results.some((result) => result.key === key)) };
+                if (!problem) return { ok: false, status: error?.status || 409, error: result.error, message: result.message, cause: result.cause, token, expandedContainers, results, pendingContainers: keys.filter((key) => !results.some((result) => result.key === key)) };
             }
         }
         const problems = results.filter((result) => result.problem);

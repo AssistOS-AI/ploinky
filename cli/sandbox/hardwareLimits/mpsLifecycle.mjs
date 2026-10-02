@@ -26,6 +26,7 @@ import {
 } from './mpsInventory.mjs';
 import { HardwareStoreError } from './store.mjs';
 import { HardwareLimitsError } from './errors.mjs';
+import { inApplyStep, describeApplyCause } from './applyCause.mjs';
 import { buildDirectRefusal, hex64 } from './requestedLimits.mjs';
 import { resolveStoredGpuShare } from './resolve.mjs';
 import { createMpsStateStore, createMpsDaemonBackend, isMpsClientAlias } from './mps.mjs';
@@ -145,8 +146,11 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
                 const plan = loadPlan(ref, key === target.key ? options.desiredRecord || record : record); plans.set(key, plan);
                 share = policy ? resolveShare(policy, context.gpu, ref) : null;
                 if (share) {
-                    check(); prepareImage(plan.image, { runtime: plan.runtime });
-                    const inspected = inspectMpsImage({ image: plan.image, networkMode: plan.profile.network.mode }, { inspectImage: (image) => inspectImage(image, { runtime: plan.runtime }) });
+                    check();
+                    const inspected = inApplyStep('image-preparation', () => {
+                        prepareImage(plan.image, { runtime: plan.runtime });
+                        return inspectMpsImage({ image: plan.image, networkMode: plan.profile.network.mode }, { inspectImage: (image) => inspectImage(image, { runtime: plan.runtime }) });
+                    });
                     images.set(key, inspected.imageId);
                 }
             } catch (error) {
@@ -164,14 +168,14 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
             }
             desiredClients.push({ key, ref, alias: record.alias || '', instanceId: record.instanceId || options.instanceId || randomUUID(), enableGeneration: record.enableGeneration || options.enableGeneration || randomUUID(), containerId: record.containerId || null, share });
         }
-        observeClients({ runtime: plans.get(target.key)?.runtime || 'podman', registry, state: store.read() });
+        inApplyStep('client-inventory', () => observeClients({ runtime: plans.get(target.key)?.runtime || 'podman', registry, state: store.read() }));
         const configuredPolicies = [];
         for (const [ref, policy] of context.overrides || []) {
             if (!policy.gpu) continue;
             try {
                 const share = resolveShare(policy.gpu, context.gpu, ref);
                 const plan = loadPlan(ref);
-                inspectMpsImage({ image: plan.image, networkMode: plan.profile.network.mode }, { inspectImage: (image) => inspectImage(image, { runtime: plan.runtime }) });
+                inApplyStep('image-preparation', () => inspectMpsImage({ image: plan.image, networkMode: plan.profile.network.mode }, { inspectImage: (image) => inspectImage(image, { runtime: plan.runtime }) }));
                 configuredPolicies.push({ share });
             } catch (error) {
                 if (ref === `${target.record.repoName}/${target.record.agentName}`) throw error;
@@ -234,7 +238,7 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
                 if (registry[client.key] && !isDeepStrictEqual(currentRecord, capturedRecord)) throw new HardwareStoreError('MPS exact client identity changed before recreate', { code: 'identity_changed', status: 409 });
                 const mpsLaunch = createMpsLaunch({ key: client.key, share: client.share, state, imageId: images.get(client.key) || null });
                 if (client.key === target.key) {
-                    targetResult = await launchTarget({ ...options, mpsLaunch, mpsTransitionAction: 'clients', networkLifecycleCapability: capability });
+                    targetResult = await inApplyStep('client-launch', () => launchTarget({ ...options, mpsLaunch, mpsTransitionAction: 'clients', networkLifecycleCapability: capability }));
                     if (targetResult?.state === 'applied') return targetResult;
                     if (targetResult?.mpsReady) return { key: client.key, observedKey: targetResult.containerName, state: 'applied', containerId: targetResult.containerId };
                     const launchedClient = { ...client, mpsGeneration: state ? `${state.daemonGeneration}:${state.configurationGeneration}` : '', key: targetResult.containerName, containerId: targetResult.containerId, instanceId: targetResult.registryRecord?.instanceId, enableGeneration: targetResult.registryRecord?.enableGeneration, alias: targetResult.registryRecord ? targetResult.registryRecord.alias || '' : client.alias };
@@ -252,7 +256,7 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
                     return { key: client.key, state: 'starting', containerId: targetResult.containerId, client: launchedClient };
                 }
                 const captured = captureExactHardwareInstances(loadRegistry(), [client.key])[0];
-                return reconcile(captured, { ...options, expectedToken: token, mpsLaunch, networkLifecycleCapability: capability });
+                return inApplyStep('client-launch', () => reconcile(captured, { ...options, expectedToken: token, mpsLaunch, networkLifecycleCapability: capability }));
             },
             onPlan: (plan) => {
                 // Never drain a client whose launch is still starting.
@@ -297,7 +301,7 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
             // verifies admits the target like a ready generation.
             const launchState = result.state?.daemon && result.state.status !== 'ready' && backend.verify(result.state) ? { ...result.state, status: 'ready' } : result.state;
             const mpsLaunch = createMpsLaunch({ key: target.key, share: selected?.share || null, state: launchState, imageId: images.get(target.key) || null });
-            targetResult = await launchTarget({ ...options, mpsLaunch, networkLifecycleCapability: capability });
+            targetResult = await inApplyStep('client-launch', () => launchTarget({ ...options, mpsLaunch, networkLifecycleCapability: capability }));
         }
         // Peers that were not recreated are a partial result; the target's
         // own result travels with it.
@@ -344,11 +348,13 @@ export async function ensureMpsGraphAgentService(agentName, manifest, agentPath,
     const plan = loadPlan(ref, record);
     let imageId = null;
     if (share) {
-        prepareImage(plan.image, { runtime: plan.runtime });
-        imageId = inspectMpsImage({ image: plan.image, networkMode: plan.profile.network.mode }, { inspectImage: (image) => inspectImage(image, { runtime: plan.runtime }) }).imageId;
+        imageId = inApplyStep('image-preparation', () => {
+            prepareImage(plan.image, { runtime: plan.runtime });
+            return inspectMpsImage({ image: plan.image, networkMode: plan.profile.network.mode }, { inspectImage: (image) => inspectImage(image, { runtime: plan.runtime }) }).imageId;
+        });
     }
     let state = store.read();
-    observeClients({ runtime: plan.runtime, registry: loadRegistry(), state });
+    inApplyStep('client-inventory', () => observeClients({ runtime: plan.runtime, registry: loadRegistry(), state }));
     const configured = [...context.overrides || []].filter(([, value]) => value.gpu).flatMap(([agentRef, value]) => {
         try { return [{ share: resolveShare(value.gpu, context.gpu, agentRef) }]; } catch (error) { if (agentRef === ref) throw error; return []; }
     });
@@ -363,17 +369,17 @@ export async function ensureMpsGraphAgentService(agentName, manifest, agentPath,
     const mustRestart = Boolean(state?.graphNeedsTransition || defaultsChanged || (state?.daemon && !backend.verify(state)));
     if (mustRestart && state?.daemon && (!state.graphPrepared || !allDrained)) throw new MpsError('MPS cohort was not completely drained by graph preparation');
     if (mustRestart && state?.daemon) {
-        check(); if (observation.state === 'owned') backend.stop(state);
+        check(); if (observation.state === 'owned') inApplyStep('daemon-stop', () => backend.stop(state));
         state = { ...state, daemon: null, daemonGeneration: null, configurationGeneration: null, status: 'pending' }; store.write(state);
     }
     if (mustRestart && state?.pipeDirectory) {
-        check(); backend.cleanup(state);
+        check(); inApplyStep('daemon-cleanup', () => backend.cleanup(state));
         state = { ...state, pipeDirectory: null, logDirectory: null }; store.write(state);
     }
     if (share && !state?.daemon) {
         check();
         const previous = state || {};
-        const daemon = backend.start(serverDefault, { tools: context.gpu?.grant?.mps, onState: (value) => { state = { ...previous, ...value, pendingClients: previous.pendingClients || [] }; store.write(state); } });
+        const daemon = inApplyStep('daemon-start', () => backend.start(serverDefault, { tools: context.gpu?.grant?.mps, onState: (value) => { state = { ...previous, ...value, pendingClients: previous.pendingClients || [] }; store.write(state); } }));
         state = { ...previous, ...daemon, pendingClients: previous.pendingClients || [], graphPrepared: false, graphNeedsTransition: false, oldClients: [], drainedClients: [] };
         store.write(state);
     }
@@ -389,7 +395,7 @@ export async function ensureMpsGraphAgentService(agentName, manifest, agentPath,
         store.write(state);
     }
     let result;
-    try { result = await ensure(agentName, manifest, agentPath, { ...options, mpsLaunch }); }
+    try { result = await inApplyStep('client-launch', () => ensure(agentName, manifest, agentPath, { ...options, mpsLaunch })); }
     catch (error) {
         if (share) {
             // The daemon was verified just above: this is one client's own
@@ -399,7 +405,7 @@ export async function ensureMpsGraphAgentService(agentName, manifest, agentPath,
             const current = store.read();
             store.write({ ...current, status: 'pending',
                 pendingClients: (current?.pendingClients || []).map((entry) => (entry.key === key && entry.phase === 'launching' ? { ...entry, phase: 'pending' } : entry)),
-                lastProblem: { code: 'mps_client_failed', message: `Graph MPS client launch did not complete (${String(error.code || 'client_launch_failed').slice(0, 64)}); its route remains inactive until it is retried.` } });
+                lastProblem: { code: 'mps_client_failed', message: `Graph MPS client launch did not complete (${String(error.code || 'client_launch_failed').slice(0, 64)}); its route remains inactive until it is retried.`, cause: describeApplyCause(error, 'client-launch') } });
         }
         throw error;
     }
