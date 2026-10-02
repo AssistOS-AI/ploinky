@@ -19,13 +19,17 @@ export function readMpsStatus({ workspaceRoot, readGrant = readBoxGpuGrant, obse
         if (!state || (state.status === 'inactive' && !state.daemon && !state.pipeDirectory)) return finish({ ...result, daemonStatus: 'stopped' });
         const owned = backend.observe(state).state;
         const sameHardware = state.serverDefault?.deviceUuid === gpu.uuid && state.serverDefault?.driverVersion === gpu.driverVersion && state.serverDefault?.wiringFingerprint === grant.fingerprint;
-        const verified = sameHardware && owned === 'owned' && state.status === 'ready' && backend.verify(state);
+        // Daemon health comes from the daemon itself: an owned process whose
+        // defaults read back. A failed or pending client (state.status
+        // 'pending', pendingClients) never makes a healthy daemon look lost.
+        const verified = sameHardware && owned === 'owned' && Boolean(state.daemonGeneration && state.configurationGeneration) && backend.verify(state);
         result.daemonStatus = verified ? 'ready' : owned === 'gone' ? 'lost' : 'pending';
         if (verified) {
             result.serverDefault = { smPercent: state.serverDefault.smPercent, vramMiB: state.serverDefault.memoryMiB };
             result.mpsGeneration = `${state.daemonGeneration}:${state.configurationGeneration}`;
         }
         result.pendingClients = (Array.isArray(state.pendingClients) ? state.pendingClients : []).slice(0, 256).map(({ key, instanceId, enableGeneration }) => ({ key, instanceId, enableGeneration }));
+        result.clientsPending = result.pendingClients.length > 0 || state.status === 'pending';
         if (!verified) result.reason = 'MPS generation requires lifecycle recovery before clients can be ready.';
         return finish(result);
     } catch (error) {

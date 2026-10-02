@@ -90,8 +90,16 @@ test('MI.cohort expansion announced before first drain', async () => {
 test('MI.registry replacement during drain cannot be adopted by cohort recreate', async () => {
     const f = fixture({ nextShare: { ...share, smPercent: 50 }, peer: true });
     f.dependencies.drainClient = async ({ key }) => { if (key === 'b') { await tick(); f.registry.b = { ...f.registry.b, instanceId: 'replacement', enableGeneration: 'replacement' }; } };
-    await assert.rejects(coordinateMpsLifecycle(f.input, f.dependencies), /identity|changed/);
+    // The replaced peer is never adopted; its refusal is its own outcome and
+    // the selected target still completes (fix round 3, M3).
+    const outcomes = [];
+    f.input.options.onMpsResult = (result) => outcomes.push(result);
+    await coordinateMpsLifecycle(f.input, f.dependencies);
     assert.equal(f.events.includes('reconcile:b'), false);
+    const peer = outcomes.find((result) => result.key === 'b');
+    assert.equal(peer.state, 'pending');
+    assert.equal(peer.error, 'identity_changed');
+    assert.ok(f.events.includes('launch:a'));
 });
 test('MI.launch rejects wrong key share and new daemon generation', () => {
     const state = daemon(); const launch = createMpsLaunch({ key: 'a', share, state, imageId });
@@ -150,4 +158,17 @@ test('MI.authorization loss after awaited drain aborts before daemon mutation as
     await assert.rejects(coordinateMpsLifecycle(f.input, f.dependencies), { code: 'identity_changed' });
     assert.equal(f.events.includes('stop-daemon'), false);
     assert.equal(f.events.includes('launch:a'), false);
+});
+
+test('MI.p7-peer-ineligible-image-or-missing-manifest-never-refuses-the-target', async () => {
+    const peerShare = { ...share };
+    for (const [label, change] of [
+        ['peer image runs as root', (f) => { f.dependencies.inspectImage = (image) => image === 'peer:tag' ? { Id: 'd'.repeat(64), Config: { User: '0' } } : { Id: imageId, Config: { User: '1000:1000' } }; f.dependencies.loadPlan = (ref) => ({ runtime: 'podman', manifest: {}, profile: { network: { mode: 'default' } }, image: ref === 'demo/b' ? 'peer:tag' : 'prepared:tag' }); }],
+        ['peer manifest removed', (f) => { f.dependencies.loadPlan = (ref) => { if (ref === 'demo/b') throw new Error('Agent demo/b not found'); return { runtime: 'podman', manifest: {}, profile: { network: { mode: 'default' } }, image: 'prepared:tag' }; }; }],
+    ]) {
+        const f = fixture({ nextShare: peerShare, peer: true });
+        change(f);
+        await coordinateMpsLifecycle(f.input, f.dependencies);
+        assert.ok(f.events.includes('launch:a'), `${label}: ${f.events.join(' ')}`);
+    }
 });

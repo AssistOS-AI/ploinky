@@ -73,12 +73,24 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
             if (old) oldClients.push({ key, ref, alias: record.alias || '', instanceId: record.instanceId, enableGeneration: record.enableGeneration, containerId: record.containerId, share: applied.gpuShare, mpsGeneration: applied.mpsGeneration });
             const policy = context.overrides?.get(ref)?.gpu;
             if (key !== target.key && !old) continue;
-            const plan = loadPlan(ref, key === target.key ? options.desiredRecord || record : record); plans.set(key, plan);
-            const share = policy ? resolveShare(policy, context.gpu, ref) : null;
-            if (share) {
-                check(); prepareImage(plan.image, { runtime: plan.runtime });
-                const inspected = inspectMpsImage({ image: plan.image, networkMode: plan.profile.network.mode }, { inspectImage: (image) => inspectImage(image, { runtime: plan.runtime }) });
-                images.set(key, inspected.imageId);
+            let share = null;
+            try {
+                const plan = loadPlan(ref, key === target.key ? options.desiredRecord || record : record); plans.set(key, plan);
+                share = policy ? resolveShare(policy, context.gpu, ref) : null;
+                if (share) {
+                    check(); prepareImage(plan.image, { runtime: plan.runtime });
+                    const inspected = inspectMpsImage({ image: plan.image, networkMode: plan.profile.network.mode }, { inspectImage: (image) => inspectImage(image, { runtime: plan.runtime }) });
+                    images.set(key, inspected.imageId);
+                }
+            } catch (error) {
+                // A peer's unresolved manifest or ineligible image is that
+                // peer's own refusal, exactly as for configured policies below:
+                // it stays an old client to drain, is not recreated here, and
+                // never refuses the selected target.
+                if (key === target.key) throw error;
+                check();
+                plans.delete(key);
+                continue;
             }
             desiredClients.push({ key, ref, alias: record.alias || '', instanceId: record.instanceId || options.instanceId || randomUUID(), enableGeneration: record.enableGeneration || options.enableGeneration || randomUUID(), containerId: record.containerId || null, share });
         }

@@ -91,3 +91,21 @@ for (const [label, setup, restart] of [
         assert.equal(f.monitor.targets.get(f.plain).pendingRestartTimer, null, 'an ordinary agent is never restarted');
     });
 }
+
+test('MW.p6c-healthy-client-is-not-restarted-after-another-client-failed', async (t) => {
+    const { readMpsStatus } = await import('../../cli/sandbox/hardwareLimits/mpsStatus.mjs');
+    const f = fixture(t);
+    // Another client's failure left the journal pending with its entry, while
+    // the daemon generation daemon:config is owned and verified.
+    const journal = { schema: 1, status: 'pending', daemon: { pid: 9, startTime: '1' }, daemonGeneration: 'daemon', configurationGeneration: 'config',
+        serverDefault: { smPercent: 25, memoryMiB: 2048, deviceUuid: 'GPU-12345678-1234-1234-1234-123456789012', driverVersion: '550.1', wiringFingerprint: 'w' },
+        pendingClients: [{ key: 'other', instanceId: 'io', enableGeneration: 'go', phase: 'failed' }] };
+    const status = readMpsStatus({ workspaceRoot: '/w', readGrant: () => ({ valid: true, state: 'active', mps: {}, fingerprint: 'w' }),
+        observeGpu: () => ({ uuid: 'GPU-12345678-1234-1234-1234-123456789012', driverVersion: '550.1', memoryModel: 'dedicated', name: 'RTX', memoryMiB: 8192 }),
+        readState: () => journal, backend: { observe: () => ({ state: 'owned' }), verify: () => true } });
+    assert.equal(status.daemonStatus, 'ready');
+    f.status(status);
+    syncManagedContainers(f.monitor); monitorTick(f.monitor);
+    assert.equal(f.monitor.targets.get(f.name).mpsPending, false);
+    assert.equal(f.events.some(({ data }) => data?.reason === 'mps_generation_changed'), false);
+});

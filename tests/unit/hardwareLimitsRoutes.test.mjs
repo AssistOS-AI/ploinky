@@ -259,3 +259,20 @@ test('R.apply-demoted-while-waiting-for-lock', async (t) => {
         }
     }
 });
+
+test('R.coordinated-client-pending-is-partial', async (t) => {
+    const f = fixture(t);
+    const result = await applyHardwareLimits({ expectedToken: f.token, containers: ['canonical'] }, {
+        lease: (_options, callback) => callback(), loadRegistry: () => f.registry, loadRouting: () => ({}), readPolicy: () => ({ paths: f.paths, token: f.token }),
+        loadPlan: () => ({}), isUnchanged: () => false,
+        reconcile: async (captured, options) => {
+            options.onMpsPlan({ expandedKeys: ['alias1'] });
+            options.onMpsResult({ key: 'alias1', state: 'pending', problem: null, error: 'mps_client_failed' });
+            return { key: captured.key, state: 'applied', problem: null };
+        },
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.status, 207);
+    assert.deepEqual(result.pendingContainers, ['alias1']);
+    assert.deepEqual(result.results.map((value) => [value.key, value.state]), [['alias1', 'pending'], ['canonical', 'applied']]);
+});

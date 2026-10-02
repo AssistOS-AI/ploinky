@@ -311,6 +311,8 @@ export async function applyHardwareLimits({ expectedToken, containers }, {
             }
         }
         const problems = results.filter((result) => result.problem);
-        return { ok: problems.length === 0, status: problems.length ? (results.length === 1 ? problems[0].problem.state === 'blocked' ? 424 : 422 : 207) : 200, token, expandedContainers, results, pendingContainers: [] };
+        // A coordinated GPU client that was not recreated is a partial result.
+        const pending = results.filter((result) => !result.problem && result.state === 'pending').map((result) => result.key);
+        return { ok: problems.length === 0 && pending.length === 0, status: problems.length ? (results.length === 1 ? problems[0].problem.state === 'blocked' ? 424 : 422 : 207) : pending.length ? 207 : 200, token, expandedContainers, results, pendingContainers: pending };
     });
 }
