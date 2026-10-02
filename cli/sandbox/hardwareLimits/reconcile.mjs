@@ -309,7 +309,7 @@ export async function applyHardwareLimits({ expectedToken, containers }, {
             try {
                 check();
                 assertExactHardwareInstance(instance, loadRegistry());
-                const plan = loadPlan(instance, { hardwareAdmission: 'metadata' });
+                const plan = inApplyStep('planning', () => loadPlan(instance, { hardwareAdmission: 'metadata' }));
                 const result = !plan.hardwareOutcome && isUnchanged(instance, plan)
                     ? { key: instance.key, observedKey: instance.key, state: 'unchanged', problem: null }
                     : await reconcile(instance, { origin: 'apply', expectedToken: token, deadline, authorize, isCancelled, onMpsPlan, onMpsResult: recordResult });

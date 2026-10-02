@@ -143,7 +143,7 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
             if (key !== target.key && !old) continue;
             let share = null;
             try {
-                const plan = loadPlan(ref, key === target.key ? options.desiredRecord || record : record); plans.set(key, plan);
+                const plan = inApplyStep('planning', () => loadPlan(ref, key === target.key ? options.desiredRecord || record : record)); plans.set(key, plan);
                 share = policy ? resolveShare(policy, context.gpu, ref) : null;
                 if (share) {
                     check();
@@ -174,7 +174,7 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
             if (!policy.gpu) continue;
             try {
                 const share = resolveShare(policy.gpu, context.gpu, ref);
-                const plan = loadPlan(ref);
+                const plan = inApplyStep('planning', () => loadPlan(ref));
                 inApplyStep('image-preparation', () => inspectMpsImage({ image: plan.image, networkMode: plan.profile.network.mode }, { inspectImage: (image) => inspectImage(image, { runtime: plan.runtime }) }));
                 configuredPolicies.push({ share });
             } catch (error) {
@@ -216,7 +216,7 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
                     try { stopRecorded(client, record); } catch (error) { throw new MpsPeerNotRetirableError(client, refused.outcome, { state: 'not-stopped', reason: String(error?.message || error).slice(0, 256) }); }
                     return;
                 }
-                const plan = plans.get(client.key) || loadPlan(client.ref, record);
+                const plan = plans.get(client.key) || inApplyStep('planning', () => loadPlan(client.ref, record));
                 const observation = inspectMpsClient(client, { runtime: plan.runtime, network: plan.profile.network, alias, ...(engineRun ? { createAdapter: (adapterOptions) => createNetworkLifecycleAdapter({ ...adapterOptions, run: engineRun }) } : {}) });
                 if (observation.state === 'absent') return;
                 if (observation.state !== 'exact' || observation.id !== client.containerId) throw new HardwareStoreError('MPS cohort runtime ownership changed before drain', { code: 'identity_changed', status: 409 });
@@ -345,7 +345,7 @@ export async function ensureMpsGraphAgentService(agentName, manifest, agentPath,
     const ref = `${repoName}/${agentName}`;
     const policy = context.overrides?.get(ref)?.gpu;
     const share = policy ? resolveShare(policy, context.gpu, ref) : null;
-    const plan = loadPlan(ref, record);
+    const plan = inApplyStep('planning', () => loadPlan(ref, record));
     let imageId = null;
     if (share) {
         imageId = inApplyStep('image-preparation', () => {
