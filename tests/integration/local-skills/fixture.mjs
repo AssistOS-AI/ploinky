@@ -3,7 +3,9 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 export const roots = {};
 for (const name of ['achilles', 'ala', 'ploinky', 'explorer']) {
@@ -22,7 +24,6 @@ export const { createRobotSkillCatalog } = await source('achilles', 'roboTeamAge
 export const { createAlaEngine } = await source('achilles', 'roboTeamAgent/copilot/src/lib/execution/alaEngine.mjs');
 export const { registerProject } = await source('achilles', 'roboTeamAgent/server/project-storage.mjs');
 export const { skillCatalogRequest } = await source('achilles', 'roboTeamAgent/server/skill-catalog-api.mjs');
-export const { createCurrentSessionEnvelope } = await source('achilles', 'roboTeamAgent/copilot/src/lib/webchat/webchatSessionState.mjs');
 export const { buildHostSkillScope, buildLocalSkillScope } = await source('ploinky', 'ploinky-box/skillScope.mjs');
 export const { syncManagedSkillExports: exportPloinky } = await source('ploinky', 'cli/utils/skills/managedExports.js');
 export const { installRepositoryLinks, removeRepositoryLinks } = await source('ploinky', 'cli/utils/repositoryInstall.mjs');
@@ -78,7 +79,9 @@ export async function writeSkill(directory, name, { descriptor = randomUUID(), h
     await write(path.join(directory, 'assets/value.txt'), asset);
     return { descriptor, helper, asset };
 }
-export async function fixture(t) {
+// robotName 'default' gives the robot RoboTeam's non-empty implicit skill selection (the bundled copilot skills), so a
+// test that must prove an explicit or migrated empty selection cannot pass by accident.
+export async function fixture(t, { robotName = 'acceptance' } = {}) {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'skills-acceptance-'));
     const workspaceRoot = path.join(root, 'workspace');
     const scopeRoot = path.join(workspaceRoot, 'launch');
@@ -90,7 +93,7 @@ export async function fixture(t) {
     assert.equal(host.PLOINKY_SKILL_SCOPE, scopeRoot);
     const local = buildLocalSkillScope(workspaceRoot, workspaceRoot, host);
     const store = new RobotStore({ dataDir: path.join(workspaceRoot, '.data/roboTeamAgent') });
-    const robot = await store.create({ name: 'acceptance', codingAgents: ['codex'] });
+    const robot = robotName === 'default' ? await store.ensureDefaultRobot() : await store.create({ name: robotName, codingAgents: ['codex'] });
     const home = path.join(store.robotPath(robot.id), 'home');
     const privateRoot = path.join(store.robotPath(robot.id), 'copilot');
     await fs.mkdir(home, { recursive: true });
@@ -156,17 +159,10 @@ export async function fixture(t) {
         declared.validate(input);
         return skillCatalogRequest({ skillsets: service, robot: await store.get(robot.id), input, mutate: declared.mutate });
     };
-    // The WebChat conversation-settings action carries the robot and saved session identity to the settings surface,
-    // which sends the declared tool inputs with exactly that context.
-    const settingsAction = () => {
-        const action = createCurrentSessionEnvelope(sessionStore.loadSession(id), { robot: robot.name }).settingsAction;
-        assert.equal(action?.label, 'Conversation skills');
-        const url = new URL(action.href, 'https://workspace.invalid');
-        assert.equal(url.pathname, '/explorer/index.html');
-        assert.deepEqual([...url.searchParams.keys()].sort(), ['copilot-robot', 'copilot-session']);
-        return { robot: url.searchParams.get('copilot-robot'), sessionId: url.searchParams.get('copilot-session') };
-    };
-    const settings = { context: settingsAction(), policyVersion: null, items: [], scope: null,
+    // The settings surface sends the declared tool inputs. The robot and conversation are inputs the tools declare, so the
+    // tests pass them explicitly. RoboTeam's WebChat Conversation skills action is not part of this contract: no Explorer
+    // code consumes it at the pinned revision.
+    const settings = { context: { robot: robot.name, sessionId: id }, policyVersion: null, items: [], scope: null,
         async load(extra = {}) {
             return this.apply(await callTool('list_achilles_skills', { ...this.context, ...extra }));
         },
@@ -192,6 +188,53 @@ export async function fixture(t) {
         cleanup.push(result.release);
         return result;
     };
+    // The real RuntimeManager queue and the real RoboTeam ALA engine, with only the robot-task process launch replaced.
+    // The engine spawns the stand-in backend, which parses its command line with the real ALA argument parser and
+    // reads and executes the skills RoboTeam linked for the execution.
+    const bridge = () => {
+        const engine = createAlaEngine({ workingDir: scopeRoot, sessionStore, skillCatalog: catalog,
+            settings: { readAchillesSettings: () => ({}), getCodingAgentModels: () => ({}), getPermissionMode: () => 'ask-for-approval' },
+            installation: { entryPath: fileURLToPath(new URL('./native-skill-consumer.mjs', import.meta.url)),
+                discoverCodingAgents: async () => [{ name: 'codex', available: true, binary: process.execPath }] },
+            interactions: { cancelTurn() {} }, execution: { robotId: robot.id } });
+        cleanup.push(() => engine.close());
+        const ready = deferred();
+        let controls, engineError;
+        const manager = new RuntimeManager({ dataDir: store.dataDir, workspaceRoot, skillsets: service,
+            toolCache: { prepareCodingAgents: async () => ({}) },
+            spawnImpl: (_command, args, spawnOptions) => {
+                assert.ok(!args.includes('--skill-catalog'), 'queue launcher must not forward a skill catalog');
+                assert.ok(args.includes('--resume-session'), 'the pre-existing conversation must use the real bootstrap resume flag');
+                assert.equal(spawnOptions.env.ROBOTEAM_TASK_SKILL_SELECTION, undefined);
+                const get = (flag) => args[args.indexOf(flag) + 1];
+                const child = new EventEmitter();
+                child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.stdin = new PassThrough();
+                child.kill = () => true;
+                child.stdin.on('data', (chunk) => controls(JSON.parse(chunk.toString())));
+                queueMicrotask(() => void fs.readFile(get('--taskFile'), 'utf8').then((prompt) => engine.executeTurn({
+                    sessionId: get('--session-id'), prompt, onControl: (send) => { controls = send; }, onEvent: (event) => {
+                        child.stderr.write(`@@ALA_EVENT@@${JSON.stringify(event)}\n`);
+                        if (event.type === 'session-ready') ready.resolve();
+                    },
+                })).then((result) => { child.stdout.write(result.outputText); child.emit('close', 0, null); })
+                    .catch((error) => { engineError = error; child.emit('error', error); }));
+                return child;
+            } });
+        cleanup.push(() => manager.stopAll());
+        manager.ensureContainer = async () => ({ mcpPort: 18100 });
+        const start = (task) => manager.startTask(robot, 'desktop', { cwd: scopeRoot, task, ca: 'codex',
+            alaSessionId: id, skillPolicyRef: id, resumeSession: true });
+        const completed = async (task) => {
+            const status = await waitFor(() => {
+                const row = manager.taskStatus(robot.id, task.taskId);
+                return ['completed', 'failed'].includes(row.state) && row;
+            }, 'task completion');
+            if (engineError) throw engineError;
+            assert.equal(status.state, 'completed', status.error);
+            return { ...JSON.parse(status.result), task: status };
+        };
+        return { manager, start, completed, ready };
+    };
     return { root, workspaceRoot, scopeRoot, sibling, home, store, robot, id, service, sessionStore, catalog, cleanup, request,
-        capture, settings, register, useSources, installs, required, documentation };
+        capture, settings, register, useSources, installs, required, documentation, bridge };
 }
