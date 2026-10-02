@@ -10,7 +10,7 @@ import {
     randomRunId,
     runCleanup,
 } from '../hardware-limits/fixtures.mjs';
-import { runSuite, prepareExplorerLayout, assertExplorerPloinkySibling } from '../hardware-limits/verify.mjs';
+import { runSuite, prepareExplorerLayout, assertExplorerPloinkySibling, assertExplorerLayoutUnchanged } from '../hardware-limits/verify.mjs';
 
 function synthetic(t, files) {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-h-')));
@@ -348,4 +348,8 @@ test('H.p3-explorer-sibling-is-the-configured-ploinky-candidate', async (t) => {
     // In place when the sibling already is the configured candidate.
     const correct = prepareExplorerLayout({ explorerRoot: explorer, explorerDigest: digest, ploinkyRoot: path.join(root, 'side', 'ploinky'), stageParent: evidence, runId: 'c'.repeat(32) });
     assert.deepEqual(correct, { root: explorer, staged: false, stage: null });
+    // A suite that mutates the staged copy invalidates the run.
+    assert.doesNotThrow(() => assertExplorerLayoutUnchanged(layout));
+    fs.writeFileSync(path.join(layout.root, 'explorer/drift.mjs'), 'changed');
+    assert.throws(() => assertExplorerLayoutUnchanged(layout), /candidate source changed/);
 });

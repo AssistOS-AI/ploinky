@@ -501,7 +501,13 @@ export function prepareExplorerLayout({ explorerRoot, explorerDigest, ploinkyRoo
         fs.rmSync(stage, { recursive: true, force: true });
         throw error;
     }
-    return { root, staged: true, stage };
+    // The staged copy is what the suite runs; a suite that mutates it
+    // invalidates the run exactly like a mutation of the candidate itself.
+    return { root, staged: true, stage, stageDigest: treeDigest(root) };
+}
+
+export function assertExplorerLayoutUnchanged(layout) {
+    if (layout?.staged && treeDigest(layout.root) !== layout.stageDigest) throw new SchemaError('candidate source changed during the suite: explorer (staged layout)');
 }
 
 function phaseFiles(cases, phase, repo) {
@@ -666,7 +672,8 @@ async function offlineCommand(options) {
             : evaluateSuiteRun({ exitCode: 1, eventText: '', files: [], required });
         // The staged Explorer layout is a runner-owned copy; the events file
         // and report are the evidence.
-        if (layout?.staged) fs.rmSync(layout.stage, { recursive: true, force: true });
+        try { assertExplorerLayoutUnchanged(layout); }
+        finally { if (layout?.staged) fs.rmSync(layout.stage, { recursive: true, force: true }); }
         verifiedSources = verifyCandidateSources(config);
         for (const file of missing) result.problems.push(`required test file is missing: ${file}`);
         if (missing.length) result.verdict = 'FAIL';
