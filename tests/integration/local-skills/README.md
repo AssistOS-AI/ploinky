@@ -18,7 +18,7 @@ SKILLS_TEST_EXPLORER=/absolute/path/to/AssistOSExplorer \
 node /absolute/path/to/ploinky/tests/integration/local-skills/run.mjs
 ```
 
-Use Node 22 or later and the four reconciled implementation trees. `SKILLS_TEST_EXPLORER` names the repository containing `explorer/package.json`; `SKILLS_TEST_ACHILLES` names the repository containing `roboTeamAgent/package.json`. The runner validates these manifests. A missing source tree or unsupported Linux capability is an error, not an automatic skip.
+Use Node 22 or later and the four reconciled implementation trees. `SKILLS_TEST_EXPLORER` names the repository containing `explorer/package.json`; `SKILLS_TEST_ACHILLES` names the repository containing the RoboTeam agent manifest `roboTeamAgent/manifest.json` (AchillesCLI no longer ships `roboTeamAgent/package.json`). The runner validates these manifests. A missing source tree or unsupported Linux capability is an error, not an automatic skip.
 
 ## Coverage
 

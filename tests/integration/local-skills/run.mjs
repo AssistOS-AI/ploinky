@@ -10,7 +10,7 @@ const files = args.includes('--native') ? ['native-propagation.test.mjs'] : ['pr
 for (const name of ['ACHILLES', 'ALA', 'PLOINKY', 'EXPLORER']) {
     const value = process.env[`SKILLS_TEST_${name}`];
     if (!value || !path.isAbsolute(value)) throw new Error(`Set SKILLS_TEST_${name} to the candidate source directory. See README.md.`);
-    await fs.access(path.join(value, name === 'ACHILLES' ? 'roboTeamAgent/package.json' : name === 'EXPLORER' ? 'explorer/package.json' : 'package.json'));
+    await fs.access(path.join(value, name === 'ACHILLES' ? 'roboTeamAgent/manifest.json' : name === 'EXPLORER' ? 'explorer/package.json' : 'package.json'));
 }
 const child = spawn(process.execPath, ['--test', '--test-reporter=tap', ...files.map((file) => path.join(here, file))],
     { stdio: 'inherit', env: process.env });
