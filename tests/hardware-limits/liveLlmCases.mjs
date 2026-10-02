@@ -25,13 +25,11 @@ import { MIB, shareMemoryMiB } from './liveGpuCommands.mjs';
 import { LLM_SOURCE_DIRECTORY } from './liveLlmNames.mjs';
 import {
     GIB, INFERENCE_CADENCE, INSUFFICIENT_RAM, L1_MIN_RAM_BYTES, L1_PROMPT, LLM_BUDGET, LLM_FIXTURE, LLM_IMAGE_DIGESTS, LLM_LEAF_SAMPLE, LLM_MODELS, LLM_REF, LLM_RUNNER_PROCESSES, LLM_TOOL_CALL, VLLM_SHARE,
-    analyzeInference, insufficientMemoryPercent, llmToolWords, parseLeafSample, summarizeGpuCheck, vllmToolWords,
+    analyzeInference, insufficientMemoryPercent, llmToolWords, parseLeafSample, runnerEnvironmentProblems, summarizeGpuCheck, vllmToolWords,
 } from './liveLlmCommands.mjs';
 
 const needs = (condition, message) => { if (!condition) throw blocked(message); };
 const expects = (condition, message) => { if (!condition) throw new Error(message); };
-const MPS_ENV_NAMES = Object.freeze(['CUDA_MPS_ACTIVE_THREAD_PERCENTAGE', 'CUDA_MPS_PINNED_DEVICE_MEM_LIMIT', 'CUDA_MPS_PIPE_DIRECTORY']);
-const SECRET_NAME = /(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|COOKIE)/i;
 const TUPLE_FIELDS = Object.freeze(['runnerLockDigest', 'driverVersion', 'gpuPciDeviceId', 'computeCapability', 'deviceTotalBytes']);
 const ACTIVE = Object.freeze(['downloading', 'copying', 'verifying', 'starting', 'loading', 'ready', 'stopping']);
 
@@ -194,19 +192,14 @@ export function createLlmCases(ctx) {
     async function imageDigests(agent) {
         return checkedJson(await observe('llm-image-digests', [...nested, 'container', 'exec', agent.id, 'node', '-e', LLM_IMAGE_DIGESTS], { deadlineMs: 120000 }));
     }
-    // A runner's environment: the CUDA variables are exactly the saved share and nothing secret is passed on.
-    // `allow` names the per-start secret the runner is meant to hold (vLLM reads its API key from its environment).
-    function expectRunnerEnvironment(processes, share, label, { allow = [] } = {}) {
+    // A runner's environment (liveLlmCommands.runnerEnvironmentProblems): exactly the saved share's three MPS variables, the
+    // product's own CUDA cache variable and nothing secret that the product does not itself emit for this runner.
+    function expectRunnerEnvironment(processes, share, label, { runner }) {
         expects(processes.length >= 1, `${label}: no runner process was found in the agent`);
         const memory = `0=${shareMemoryMiB(share.vramPercent, gpu.memoryMiB)}M`;
         for (const process of processes) {
-            const names = Object.keys(process.cuda).sort();
-            expects(JSON.stringify(names) === JSON.stringify([...MPS_ENV_NAMES]), `${label}: the runner ${process.pid} has CUDA variables ${names.join(',')}, not exactly the three MPS variables`);
-            expects(process.cuda.CUDA_MPS_PIPE_DIRECTORY === '/run/ploinky-mps-pipe' && process.cuda.CUDA_MPS_ACTIVE_THREAD_PERCENTAGE === String(share.smPercent) && process.cuda.CUDA_MPS_PINNED_DEVICE_MEM_LIMIT === memory,
-                `${label}: the runner ${process.pid} sees ${JSON.stringify(process.cuda)}, not the saved share ${share.smPercent}% / ${memory}`);
-            const secrets = process.envNames.filter(name => SECRET_NAME.test(name) && !allow.includes(name));
-            expects(secrets.length === 0, `${label}: the runner ${process.pid} inherits secret-looking variables: ${secrets.join(',')}`);
-            expects(process.uid.length >= 2 && process.uid.every(uid => uid === process.uid[0]) && process.uid[0] > 0, `${label}: the runner ${process.pid} does not run as one non-root user`);
+            const problems = runnerEnvironmentProblems(process, { share: { smPercent: share.smPercent, memory }, runnerId: runner, label });
+            expects(problems.length === 0, problems.join('; '));
         }
     }
 
@@ -329,7 +322,7 @@ export function createLlmCases(ctx) {
             // The runner: environment, user, and the generation it runs under.
             const processes = await runnerProcesses(agent, 'llama-server');
             evidence.put('runner', processes.map(value => ({ pid: value.pid, exe: value.exe, uid: value.uid, start: value.start, envNames: value.envNames, cuda: value.cuda })));
-            expectRunnerEnvironment(processes, limits.gpu, 'L1');
+            expectRunnerEnvironment(processes, limits.gpu, 'L1', { runner: 'llama.cpp' });
             const stillThere = await agentNow();
             expects(stillThere.id === agent.id && stillThere.startedAt === agent.startedAt, 'The agent was restarted while the model ran');
             const generation = (await admin.state()).gpu.mpsGeneration;
@@ -587,7 +580,7 @@ export function createLlmCases(ctx) {
         evidence.put('runnerReport', ready.runnerReport);
         const processes = await runnerProcesses(agent, 'vllm');
         evidence.put('runner', processes.map(value => ({ pid: value.pid, uid: value.uid, start: value.start, envNames: value.envNames, cuda: value.cuda })));
-        expectRunnerEnvironment(processes, llm.vllm.share, 'L3', { allow: ['VLLM_API_KEY'] });
+        expectRunnerEnvironment(processes, llm.vllm.share, 'L3', { runner: 'vllm' });
         await gate.check('L3-before-prompt');
         const answer = await gate.monitor(abort => toolOk('prompt-l3', 'local_llm_test_prompt', { prompt: 'Name one colour. /no_think', maxTokens: 256 }, { deadlineMs: timings.promptMs, mutating: true, abort }));
         evidence.put('response', { text: String(answer.text).slice(0, 400), reasoningChars: answer.reasoningChars, finishReason: answer.finishReason, modelId: answer.modelId, runnerId: answer.runnerId });

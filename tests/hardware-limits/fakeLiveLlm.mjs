@@ -19,7 +19,7 @@ import { ok } from './fakeLiveEngine.mjs';
 import { createGpuWorld } from './fakeLiveGpu.mjs';
 import { LEAF_OBSERVATION } from './liveCaseCommands.mjs';
 import { shareMemoryMiB } from './liveGpuCommands.mjs';
-import { LLM_AGENT, LLM_IMAGE_DIGESTS, LLM_LEAF_SAMPLE, LLM_MODELS, LLM_REPOSITORY, LLM_RUNNER_PROCESSES, LLM_TOOL_CALL, VLLM_TOOL_PATH } from './liveLlmCommands.mjs';
+import { LLM_AGENT, LLM_IMAGE_DIGESTS, LLM_LEAF_SAMPLE, LLM_MODELS, LOCAL_LLM_RUNNER_ENV, LLM_REPOSITORY, LLM_RUNNER_PROCESSES, LLM_TOOL_CALL, VLLM_TOOL_PATH } from './liveLlmCommands.mjs';
 
 const MIB = 1024 * 1024;
 const GIB = 1024 * MIB;
@@ -116,11 +116,22 @@ export function createLlmWorld({ statePath, node, engine, host, gpu, faults = {}
         const matcher = L.deployment.runnerId === 'vllm' ? 'vllm' : 'llama-server';
         const pid = 3000 + (L.seq += 1);
         const proc = world.helpers.spawn({ cgroup: leaf, ppid: a.proc.hostPid, ns: [model().nextBox++, pid] });
+        // The runner's environment is what local-llm's own code composes (localLlmRunnerEnv.json, captured from the
+        // controller's runnerEnv and the adapters' buildLaunch): its names, the product's own CUDA_CACHE_PATH, and the share's
+        // MPS values from this agent's container environment. A test fault then changes it.
         const env = Object.fromEntries(a.env.map(entry => { const at = entry.indexOf('='); return [entry.slice(0, at), entry.slice(at + 1)]; }));
-        const cuda = Object.fromEntries(Object.entries(env).filter(([name]) => name.startsWith('CUDA_')));
-        if (faults.runnerExtraCuda) cuda.CUDA_VISIBLE_DEVICES = '0';
-        if (faults.runnerDropsShare) delete cuda.CUDA_MPS_PINNED_DEVICE_MEM_LIMIT;
-        const envNames = ['HOME', 'LD_LIBRARY_PATH', 'PATH', ...Object.keys(cuda), ...(matcher === 'vllm' ? ['VLLM_API_KEY', 'TRITON_CACHE_DIR'] : []), ...(faults.runnerLeaksToken ? ['LOCAL_LLM_CONTROL_TOKEN'] : [])].sort();
+        const product = LOCAL_LLM_RUNNER_ENV.runners[matcher === 'vllm' ? 'vllm' : 'llama.cpp'];
+        const runnerEnv = Object.fromEntries(Object.entries(product).map(([name, entry]) => [name, name.startsWith('CUDA_MPS_') ? env[name] : entry.perStartSecret ? 'per-start-secret' : entry.value]));
+        if (faults.runnerExtraCuda) runnerEnv.CUDA_VISIBLE_DEVICES = '0';
+        if (faults.runnerDropsShare) delete runnerEnv.CUDA_MPS_PINNED_DEVICE_MEM_LIMIT;
+        if (faults.runnerCudaCache) runnerEnv.CUDA_CACHE_PATH = faults.runnerCudaCache;
+        if (faults.runnerNoCudaCache) delete runnerEnv.CUDA_CACHE_PATH;
+        for (const name of faults.runnerExtraEnv ?? []) runnerEnv[name] = 'x';
+        if (faults.runnerLeaksToken) runnerEnv.LOCAL_LLM_CONTROL_TOKEN = 'x';
+        // The CUDA cache variable is not modelled yet (the next change allows it).
+        delete runnerEnv.CUDA_CACHE_PATH;
+        const cuda = Object.fromEntries(Object.entries(runnerEnv).filter(([name]) => name.startsWith('CUDA_')));
+        const envNames = Object.keys(runnerEnv).sort();
         const allocatedMiB = matcher === 'vllm' ? (faults.vllmOverShare ? 5600 : 4400) : (faults.gpuOverShare ? 3600 : 600);
         L.runner = { proc, matcher, pid, envNames, cuda, uid: faults.runnerRoot ? [0, 0, 0, 0] : [1000, 1000, 1000, 1000], exe: matcher === 'vllm' ? '/opt/runners/vllm/0.30.0/venv/bin/python3.13' : '/opt/llama.cpp/llama-server', usage: { active: true, allocatedMiB } };
         model().probes.push(L.runner.usage);

@@ -695,6 +695,8 @@ export function buildRequiredCaseManifest() {
             // Stage 2 binds the host's tuple and the qualifying evidence to the stage 1 pin.
             'LLM3.stage-two-binds-the-hosts-tuple-and-the-qualifying-evidence-to-the-stage-one-pin',
             'LLM3.every-tuple-field-the-stage-one-pin-carries-is-bound-to-what-the-host-reports',
+            // The runner-environment check against local-llm's own launch environment.
+            'R2B.secret-names-match-whole-underscore-words-and-the-products-own-emitted-names-are-allowed',
             'G2.provision-copies-the-local-llm-tree-pins-its-image-and-grants-the-gpu-before-the-start',
             'G2.provision-blocks-a-changed-tree-or-manifest-and-an-image-the-agent-was-not-created-from',
             'G2.L1-passes-budget-cgroup-runner-environment-uid-generation-text-and-digests',

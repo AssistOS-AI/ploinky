@@ -7,6 +7,7 @@
 // path (the hardware-limits store and Apply) for its budgets, and the agent's own
 // MCP tools through the Router, with the same local operator session the CLI's
 // `ploinky client tool` uses, for installs, Runs, Stops and the smoke prompt.
+import fs from 'node:fs';
 import { MIB } from './liveGpuCommands.mjs';
 import { bounded, keys } from './liveCommon.mjs';
 import { resolveMemoryPercent } from '../../cli/sandbox/hardwareLimits/resolve.mjs';
@@ -15,6 +16,46 @@ import { LLM_AGENT, LLM_MODELS, LLM_REF, LLM_REPOSITORY } from './liveLlmNames.m
 
 export { LLM_AGENT, LLM_MODELS, LLM_REF, LLM_REPOSITORY };
 export const GIB = 1024 * MIB;
+
+// ---------------------------------------------------------------------------
+// The environment of a runner process, as local-llm's own code composes it: captured by
+// captureLocalLlmRunnerEnv.mjs from the controller's runnerEnv and the adapters' buildLaunch (never typed here).
+export const LOCAL_LLM_RUNNER_ENV = Object.freeze(JSON.parse(fs.readFileSync(new URL('./localLlmRunnerEnv.json', import.meta.url), 'utf8')));
+// The three MPS names Apply gives the agent and the controller passes on, with exact values.
+export const MPS_RUNNER_NAMES = Object.freeze(['CUDA_MPS_ACTIVE_THREAD_PERCENTAGE', 'CUDA_MPS_PINNED_DEVICE_MEM_LIMIT', 'CUDA_MPS_PIPE_DIRECTORY']);
+// The documented product variable that is a CUDA name: the driver's JIT cache, kept in the container's own
+// filesystem (local-llm DS004; deployments.mjs sets it for every runner). Any other CUDA_* name is not the product's.
+export const RUNNER_PRODUCT_CUDA = Object.freeze([]);
+// A secret-looking name is one with a whole `_`-delimited word that names a credential: API_KEY, TOKEN and HF_TOKEN
+// are, TIKTOKEN_ENCODINGS_BASE (a path to a vocabulary) is not.
+const SECRET_WORDS = new Set(['KEY', 'KEYS', 'APIKEY', 'TOKEN', 'TOKENS', 'SECRET', 'SECRETS', 'PASSWORD', 'PASSWD', 'CREDENTIAL', 'CREDENTIALS', 'COOKIE', 'COOKIES']);
+export const isSecretName = name => String(name).toUpperCase().split(/[^A-Z0-9]+/).some(word => SECRET_WORDS.has(word));
+// The exact names local-llm's launch for this runner emits: these are the product's, whatever they look like
+// (vLLM's per-start VLLM_API_KEY is one; llama.cpp has none).
+export const runnerProductNames = runnerId => new Set(Object.keys(LOCAL_LLM_RUNNER_ENV.runners[runnerId] ?? {}));
+
+// What is wrong with one runner process's environment, or nothing: exactly the three MPS names with the saved
+// share's values, plus only the product's own CUDA variable (a path in the container, not under /data or /shared);
+// no other CUDA_* name; no secret-looking name that the product itself does not emit for this runner; one non-root user.
+export function runnerEnvironmentProblems(process, { share, runnerId, label = 'runner' }) {
+    const problems = [];
+    const cuda = process.cuda ?? {};
+    const names = Object.keys(cuda).sort();
+    const missing = MPS_RUNNER_NAMES.filter(name => !names.includes(name));
+    const foreign = names.filter(name => !MPS_RUNNER_NAMES.includes(name) && !RUNNER_PRODUCT_CUDA.includes(name));
+    if (missing.length || foreign.length) problems.push(`${label}: the runner ${process.pid} has CUDA variables ${names.join(',')}, not exactly the three MPS variables`);
+    if (cuda.CUDA_MPS_PIPE_DIRECTORY !== '/run/ploinky-mps-pipe' || cuda.CUDA_MPS_ACTIVE_THREAD_PERCENTAGE !== String(share.smPercent) || cuda.CUDA_MPS_PINNED_DEVICE_MEM_LIMIT !== share.memory) {
+        problems.push(`${label}: the runner ${process.pid} sees ${JSON.stringify(Object.fromEntries(MPS_RUNNER_NAMES.map(name => [name, cuda[name]])))}, not the saved share ${share.smPercent}% / ${share.memory}`);
+    }
+    if (Object.hasOwn(cuda, 'CUDA_CACHE_PATH') && !(typeof cuda.CUDA_CACHE_PATH === 'string' && /^\/[^\0]*$/.test(cuda.CUDA_CACHE_PATH) && !/^\/(?:data|shared)(?:\/|$)/.test(cuda.CUDA_CACHE_PATH))) {
+        problems.push(`${label}: the runner ${process.pid} keeps its CUDA cache at ${String(cuda.CUDA_CACHE_PATH).slice(0, 120)}, not in the container's own filesystem`);
+    }
+    const product = runnerProductNames(runnerId);
+    const secrets = (process.envNames ?? []).filter(name => isSecretName(name) && !product.has(name));
+    if (secrets.length) problems.push(`${label}: the runner ${process.pid} inherits secret-looking variables: ${secrets.join(',')}`);
+    if (!(process.uid.length >= 2 && process.uid.every(uid => uid === process.uid[0]) && process.uid[0] > 0)) problems.push(`${label}: the runner ${process.pid} does not run as one non-root user`);
+    return problems;
+}
 
 // The owned agents of the local-llm fixture, in the shape the shared GPU case kit takes
 // (liveGpuCases.mjs): one agent, which is a share client, and no unrelated CPU agent.

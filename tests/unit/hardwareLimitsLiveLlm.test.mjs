@@ -24,6 +24,7 @@ import { fakeEngineInfo, worldState } from '../hardware-limits/fakeLiveEngine.mj
 import { createLlmWorld } from '../hardware-limits/fakeLiveLlm.mjs';
 import { LEAF_OBSERVATION } from '../hardware-limits/liveCaseCommands.mjs';
 import {
+    LOCAL_LLM_RUNNER_ENV, isSecretName, runnerEnvironmentProblems, runnerProductNames,
     INFERENCE_MIN_IN_FLIGHT, INFERENCE_TOLERANCE, INSUFFICIENT_RAM, LLM_BUDGET, LLM_IMAGE_DIGESTS, LLM_LEAF_SAMPLE, LLM_MODELS, LLM_RUNNER_PROCESSES, LLM_TOOL_CALL, VLLM_SHARE, VLLM_TOOL_PATH,
     analyzeInference, insufficientMemoryPercent, llmToolWords, parseLeafSample, summarizeGpuCheck, validateLlmModelPins, validateLlmProfile, vllmToolWords,
 } from '../hardware-limits/liveLlmCommands.mjs';
@@ -1280,4 +1281,35 @@ test('LLM3.every-tuple-field-the-stage-one-pin-carries-is-bound-to-what-the-host
         assert.equal(l3.result, 'blocked', `${field}: ${JSON.stringify(l3).slice(0, 500)}`); assert.match(l3.reason, new RegExp(`differs from the stage 1 pin in ${field}`), field);
         assert.equal(toolCalls(w, 'local_llm_run').length, 0, field); nothingOwned(w);
     }
+});
+
+// --- R2B: the runner-environment check against local-llm's own launch environment -------------------------
+// The names come from captureLocalLlmRunnerEnv.mjs, which builds them from local-llm's controller and adapters.
+const SHARE = { smPercent: 50, memory: '0=3072M' };
+const processOf = (runner, change = {}) => {
+    const env = Object.fromEntries(Object.entries(LOCAL_LLM_RUNNER_ENV.runners[runner]).map(([name, entry]) => [name, name.startsWith('CUDA_MPS_') ? { CUDA_MPS_PIPE_DIRECTORY: '/run/ploinky-mps-pipe', CUDA_MPS_ACTIVE_THREAD_PERCENTAGE: '50', CUDA_MPS_PINNED_DEVICE_MEM_LIMIT: '0=3072M' }[name] : entry.perStartSecret ? 'secret' : entry.value]));
+    const cuda = Object.fromEntries(Object.entries(env).filter(([name]) => name.startsWith('CUDA_') && name !== 'CUDA_CACHE_PATH'));
+    return { pid: 7, uid: [1000, 1000, 1000, 1000], envNames: Object.keys(env).sort(), cuda, ...change };
+};
+
+test('R2B.secret-names-match-whole-underscore-words-and-the-products-own-emitted-names-are-allowed', async t => {
+    // vLLM's TIKTOKEN_ENCODINGS_BASE (a vocabulary path, always set by buildLaunch) is not a secret.
+    assert.ok(Object.hasOwn(LOCAL_LLM_RUNNER_ENV.runners.vllm, 'TIKTOKEN_ENCODINGS_BASE'), 'buildLaunch emits it');
+    for (const name of ['TIKTOKEN_ENCODINGS_BASE', 'TRITON_CACHE_DIR', 'VLLM_NO_USAGE_STATS', 'DO_NOT_TRACK', 'HF_HUB_OFFLINE', 'PATH', 'HOME', 'LD_LIBRARY_PATH', 'MONKEY_BUSINESS', 'KEYBOARD', 'TOKENIZERS_PARALLELISM']) assert.equal(isSecretName(name), false, name);
+    for (const name of ['HF_TOKEN', 'FOO_API_KEY', 'API_KEY', 'TOKEN', 'LOCAL_LLM_CONTROL_TOKEN', 'db_password', 'AWS_SECRET_ACCESS_KEY', 'SESSION_COOKIE', 'FOO_APIKEY']) assert.equal(isSecretName(name), true, name);
+    // The names the real vLLM and llama.cpp launches emit pass; VLLM_API_KEY is vLLM's own per-start secret and only vLLM's.
+    for (const runner of ['llama.cpp', 'vllm']) assert.deepEqual(runnerEnvironmentProblems(processOf(runner), { share: SHARE, runnerId: runner }), [], runner);
+    assert.ok(runnerProductNames('vllm').has('VLLM_API_KEY') && !runnerProductNames('llama.cpp').has('VLLM_API_KEY'));
+    assert.match(runnerEnvironmentProblems(processOf('llama.cpp', { envNames: [...processOf('llama.cpp').envNames, 'VLLM_API_KEY'] }), { share: SHARE, runnerId: 'llama.cpp' }).join(), /secret-looking variables: VLLM_API_KEY/);
+    for (const name of ['HF_TOKEN', 'FOO_API_KEY']) assert.match(runnerEnvironmentProblems(processOf('vllm', { envNames: [...processOf('vllm').envNames, name] }), { share: SHARE, runnerId: 'vllm' }).join(), new RegExp(`secret-looking variables: ${name}`), name);
+    // Through the executors: the correct stage 2 run passes with TIKTOKEN_ENCODINGS_BASE in the runner, and a leaked HF_TOKEN fails it.
+    const vllm = stageTwo(true);
+    const good = await provisioned(t, { block: 'apparatus-vllm', vllm, qualified: true });
+    assert.equal(caseOf(await liveCases(good, ['LIVE-L3']), 'LIVE-L3').result, 'pass');
+    assert.ok(good.artifacts.get('gpu-live-l3').runner[0].envNames.includes('TIKTOKEN_ENCODINGS_BASE'));
+    nothingOwned(good);
+    const leaked = await provisioned(t, { block: 'apparatus-vllm', vllm, qualified: true, faults: { runnerExtraEnv: ['HF_TOKEN'] } });
+    const failed = caseOf(await liveCases(leaked, ['LIVE-L3']), 'LIVE-L3');
+    assert.equal(failed.result, 'fail'); assert.match(failed.reason, /secret-looking variables: HF_TOKEN/);
+    nothingOwned(leaked);
 });
