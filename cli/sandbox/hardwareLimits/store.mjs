@@ -239,7 +239,7 @@ function assertPrivateStoreDirectory(fsApi, storeRoot) {
 export function validateStoreToken(token, { code = 'invalid_limits' } = {}) {
     if (!plainObject(token) || Object.keys(token).sort().join(',') !== 'epoch,revision'
         || !HEX32.test(String(token.epoch)) || !Number.isSafeInteger(token.revision) || token.revision < 1) {
-        fail('the policy token must be {epoch:128-bit hex, revision:positive integer}', { code });
+        fail('the policy stamp must be {epoch:128-bit hex, revision:positive integer}', { code });
     }
     return Object.freeze({ epoch: token.epoch, revision: token.revision });
 }

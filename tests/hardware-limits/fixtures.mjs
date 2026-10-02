@@ -694,6 +694,11 @@ export function buildRequiredCaseManifest() {
             'W8.a-plan-failure-of-a-client-being-drained-is-the-drain-step',
             'W8.a-plan-failure-in-the-graph-launch-is-planning',
         ]),
+        // A cause stays readable: no product message trips the credential redactor.
+        ...leaves(P, 'p4', unit('hardwareLimitsCauseReadable.test.mjs'), [
+            'W9.the-reworded-lifecycle-and-store-messages-survive-the-cause-sanitizer-intact',
+            'W9.no-error-text-of-the-hardware-limits-code-trips-the-sanitizer',
+        ]),
         ...leaves(P, 'p4', unit('hardwareLimitsMpsCandidateRecovery.test.mjs'), [
             'MC.readiness-failure-then-retry-succeeds', 'MC.readiness-failure-leaving-the-candidate-removes-it-by-id',
             'MC.non-exact-candidate-is-refused-without-daemon-change', 'MC.crash-during-readiness-then-recovery',

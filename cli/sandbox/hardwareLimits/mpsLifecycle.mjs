@@ -106,7 +106,7 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
         const check = () => {
             options.beforeHardwareMutation?.();
             if (options.isCancelled?.() || Date.now() >= (options.deadline || Infinity)) throw new HardwareStoreError('MPS lifecycle was cancelled or exceeded its deadline', { code: 'apply_timeout', status: 504 });
-            if (options.authorize && options.authorize() !== true) throw new HardwareStoreError('MPS lifecycle authorization changed', { code: 'identity_changed', status: 409 });
+            if (options.authorize && options.authorize() !== true) throw new HardwareStoreError('The MPS lifecycle authority changed', { code: 'identity_changed', status: 409 });
             policyCheck(token, { origin: options.origin || 'cli' });
         };
         check();

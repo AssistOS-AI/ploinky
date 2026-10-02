@@ -64,7 +64,7 @@ export function readStoreLockOwner(storeRoot, { fsApi = fs } = {}) {
         const bytes = fsApi.readFileSync(owner);
         if (bytes.length > MAX_OWNER_BYTES) return { malformed: true, reason: 'lock owner record is oversized' };
         const parsed = JSON.parse(bytes.toString('utf8'));
-        if (!/^[0-9a-f]{32}$/.test(String(parsed?.token || ''))) return { malformed: true, reason: 'lock owner token is invalid' };
+        if (!/^[0-9a-f]{32}$/.test(String(parsed?.token || ''))) return { malformed: true, reason: 'lock owner stamp is invalid' };
         return { malformed: false, owner: parsed, dev: stat.dev, ino: stat.ino };
     } catch (error) {
         return { malformed: true, reason: error?.code === 'ENOENT' ? 'lock has no owner record' : 'lock owner record is unreadable' };
