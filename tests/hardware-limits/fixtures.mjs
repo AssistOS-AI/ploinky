@@ -652,6 +652,12 @@ export function buildRequiredCaseManifest() {
             'AC.mps-control-and-daemon-start-failures-say-how-the-tool-failed',
             'AC.a-drifted-mounted-tool-is-a-typed-sharing-refusal-through-apply-not-a-generic-failure',
         ]),
+        // LIVE-P1 attempt 4: Apply plans a profile-less manifest whose record carries the resolved 'default' profile.
+        ...leaves(P, 'p4', unit('hardwareLimitsApplyPlan.test.mjs'), [
+            'Z3b.apply-plans-a-profile-less-fixture-whose-record-carries-the-resolved-default-profile-and-reaches-the-launch',
+            'Z3b.the-graph-planning-of-that-record-resolves-the-persisted-profile-and-an-unknown-one-is-still-refused',
+            'Z3c.an-untyped-planning-failure-reports-the-planning-step',
+        ]),
         ...leaves(P, 'p4', unit('hardwareLimitsMpsCandidateRecovery.test.mjs'), [
             'MC.readiness-failure-then-retry-succeeds', 'MC.readiness-failure-leaving-the-candidate-removes-it-by-id',
             'MC.non-exact-candidate-is-refused-without-daemon-change', 'MC.crash-during-readiness-then-recovery',
