@@ -58,7 +58,8 @@ const { emitRunArgs, computeRuntimePolicyHash, RuntimePolicyError } = await impo
 const { resolveManifestRuntimeProfile } = await import('../../cli/utils/runtime/profileService.js');
 const declared = await import('../../cli/sandbox/hardwareLimits/declaredLimits.mjs');
 const errors = await import('../../cli/sandbox/hardwareLimits/errors.mjs');
-const { assertInteractiveHardwareLimitsAbsent } = await import('../../cli/sandbox/docker/interactive.js');
+const interactiveModule = await import('../../cli/sandbox/docker/interactive.js');
+const { assertInteractiveHardwareLimitsAbsent } = interactiveModule;
 const { computeEnvHash } = await import('../../cli/sandbox/docker/common.js');
 const { prepareLlmStartup, resolveLlmRuntimeAdmissionContext } = await import('../../cli/sandbox/docker/llmRuntimeIntegration.js');
 const { detectHardware } = await import('../../cli/sandbox/docker/hardwareDetection.js');
@@ -681,4 +682,49 @@ test('HD.identity-llm-reuse-callers', (t) => {
     });
     assert.equal(direct(llmNew).policyHash, direct(llmOld).policyHash);
     assert.equal(direct(llmNew).reuseHash, direct(llmOld).reuseHash);
+});
+
+// The interactive create/reuse path refuses what admission refuses: its real
+// caller passes the profile the production resolver returns, so a limit
+// declared only in a profile (inherited from the default profile here) is
+// refused before any engine or workspace operation.
+test('HD.interactive-caller-resolves-the-profile', () => {
+    const { runCommandInContainer } = interactiveModule;
+    for (const [label, manifest] of [
+        ['neutral', { ...base, profiles: { default: { hardwareLimits: { memory: '256m' } }, dev: {} } }],
+        ['deprecated', { ...base, profiles: { default: { llmRuntime: { runtimePolicy: { resources: { memory: '256m' } } } }, dev: {} } }],
+    ]) {
+        const resolved = resolveManifestRuntimeProfile(manifest, { agentName: 'demo/shell' });
+        const expected = (() => { try { assertInteractiveHardwareLimitsAbsent(manifest, { agentName: 'shell', repoName: 'demo', containerName: 'ploinky_demo_shell', profileConfig: resolved.profileConfig }); } catch (error) { return errors.findHardwareOutcome(error); } return null; })();
+        assert.ok(expected, `${label}: the resolved profile declares a limit`);
+        let outcome = null;
+        guarded(() => { try { runCommandInContainer('shell', 'demo', manifest, 'true'); } catch (error) { outcome = errors.findHardwareOutcome(error); if (!outcome) throw error; } });
+        assert.ok(outcome, `${label}: the real interactive caller refuses`);
+        assert.equal(outcome.reasonCode, 'interactive_runtime');
+        assert.deepEqual(outcome.requested, [{ field: 'memory', value: '256m', source: 'profile' }]);
+        assert.deepEqual(outcome.requested, expected.requested);
+    }
+});
+
+// A declared value longer than the outcome bound is still a typed refusal on
+// either declaration path, carrying a bounded prefix and the value's digest.
+test('HD.long-requested-value-is-a-bounded-refusal', () => {
+    const long = `${'0'.repeat(200)}512m`;
+    const outcomes = [OLD({ memory: long }), NEW({ memory: long })].map((manifest) => refusalOf(manifest, { hardwareContext: { gate: 'off', storeState: 'none' } }));
+    for (const outcome of outcomes) {
+        assert.equal(outcome.code, errors.HARDWARE_UNENFORCEABLE);
+        const [entry] = outcome.requested;
+        assert.equal(entry.field, 'memory');
+        assert.ok(Buffer.byteLength(entry.value) <= errors.OUTCOME_BOUNDS.value, entry.value);
+        assert.ok(entry.value.startsWith('0'.repeat(32)));
+        assert.match(entry.value, /\.\.\.sha256:[0-9a-f]{16}$/);
+    }
+    assert.equal(outcomes[0].requested[0].value, outcomes[1].requested[0].value);
+    // The interactive refusal is bounded the same way.
+    let interactive = null;
+    try { assertInteractiveHardwareLimitsAbsent(NEW({ cpus: `0.${'5'.repeat(200)}` }), { agentName: 'shell', repoName: 'demo', containerName: 'ploinky_demo_shell' }); }
+    catch (error) { interactive = errors.findHardwareOutcome(error); }
+    assert.ok(interactive && Buffer.byteLength(interactive.requested[0].value) <= errors.OUTCOME_BOUNDS.value);
+    // A value within the bound is carried unchanged.
+    assert.equal(refusalOf(NEW({ memory: '512m' }), { hardwareContext: { gate: 'off', storeState: 'none' } }).requested[0].value, '512m');
 });

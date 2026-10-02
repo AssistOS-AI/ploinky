@@ -13,6 +13,7 @@ import crypto from 'node:crypto';
 import {
     HARDWARE_FIELDS,
     HARDWARE_UNENFORCEABLE,
+    OUTCOME_BOUNDS,
     validateHardwareOutcome,
 } from './errors.mjs';
 import { readBoxHardwareContext } from './context.mjs';
@@ -296,6 +297,21 @@ function orderedRequested(requested) {
     return [...requested].sort((left, right) => HARDWARE_FIELDS.indexOf(left.field) - HARDWARE_FIELDS.indexOf(right.field));
 }
 
+// A requested value as an outcome carries it: unchanged within the outcome
+// bound, otherwise a UTF-8-safe prefix plus the digest of the whole value, so
+// an over-long declaration is still a typed refusal and stays identifiable.
+export function boundedRequestedValue(value) {
+    const text = String(value);
+    if (Buffer.byteLength(text) <= OUTCOME_BOUNDS.value) return text;
+    const suffix = `...sha256:${crypto.createHash('sha256').update(text).digest('hex').slice(0, 16)}`;
+    let prefix = '';
+    for (const character of text) {
+        if (Buffer.byteLength(prefix + character + suffix) > OUTCOME_BOUNDS.value) break;
+        prefix += character;
+    }
+    return `${prefix}${suffix}`;
+}
+
 // Build the validated direct-refusal outcome for an exact instance.
 export function buildDirectRefusal({ key, ref, alias = null, refusalParts, inputFingerprint }) {
     return validateHardwareOutcome({
@@ -309,7 +325,7 @@ export function buildDirectRefusal({ key, ref, alias = null, refusalParts, input
         reason: refusalParts.reason,
         fix: refusalParts.fix,
         requested: orderedRequested(refusalParts.requested || []).map((entry) => ({
-            field: entry.field, value: entry.value, source: entry.source,
+            field: entry.field, value: boundedRequestedValue(entry.value), source: entry.source,
         })),
         blockedBy: null,
         rootCause: {
