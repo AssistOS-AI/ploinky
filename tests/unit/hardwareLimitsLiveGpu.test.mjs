@@ -23,7 +23,7 @@ import { writeUstar } from '../hardware-limits/liveStage.mjs';
 import { engineIdentityDigest, hostRecordPaths } from '../hardware-limits/liveCommon.mjs';
 import { fakeEngineInfo, ok, worldState } from '../hardware-limits/fakeLiveEngine.mjs';
 import { createGpuWorld } from '../hardware-limits/fakeLiveGpu.mjs';
-import { createGpuGate, gpuQueryArgv } from '../hardware-limits/liveGpuGate.mjs';
+import { createGpuGate, gpuQueryArgv, isToleratedRecord } from '../hardware-limits/liveGpuGate.mjs';
 import { parseGpuInventory, parseGpuMemory } from '../hardware-limits/liveGpu.mjs';
 import { createHostProc } from '../hardware-limits/liveGpuHost.mjs';
 import { createGpuCases, compactEvidence } from '../hardware-limits/liveGpuCases.mjs';
@@ -1235,4 +1235,204 @@ test('G1.gf1-only-registered-gpu-processes-may-be-recorded-in-the-manifest', asy
     // A CPU block records no process at all.
     const cpu = structuredClone(w.run); cpu.target.execution.gpu = undefined; cpu.ownedProcesses = [record];
     assert.throws(() => validateProfile(cpu, { partial: true }));
+});
+
+// --- Amendment A5: a recorded display process does not make the GPU busy -------------------------
+const displayRow = (pid, type = 'G', mib = 2, name = '/usr/bin/gnome-shell') => `<process_info><gpu_instance_id>N/A</gpu_instance_id><compute_instance_id>N/A</compute_instance_id><pid>${pid}</pid><type>${type}</type><process_name>${name}</process_name><used_memory>${mib} MiB</used_memory></process_info>`;
+const GNOME = 2899;
+const desktop = (extra = {}) => proc('/user.slice/user-1000.slice/session-2.scope', { startIdentity: '777', ...extra });
+// A scripted gate whose first check is, or is not, the run's first (the recording one), over a host with a desktop.
+function displayGate({ replies, procs = new Map([[GNOME, desktop()]]), record = true, tolerated = [] }) {
+    const recorded = [];
+    const scripted = scriptedGate({ replies, procs });
+    void scripted;
+    let call = 0;
+    const host = { bootId: () => 'boot-1', observe: pid => (procs.has(pid) ? { bootId: 'boot-1', hostPid: pid, ...procs.get(pid) } : null) };
+    const query = async () => { const reply = replies[Math.min(call, replies.length - 1)]; call += 1; return typeof reply === 'function' ? reply() : reply; };
+    const gate = createGpuGate({ query, uuid: UUID, host, boxPrefix: '/box', expectedMemoryMiB: 6144, intervalMs: 3, retryMs: 1, recordTolerated: record, tolerated, onTolerate: entry => recorded.push(entry) });
+    return { gate, procs, recorded, calls: () => call };
+}
+const withRows = (...rows) => smiOk(smiXml({ rows: rows.join('') }));
+const GNOME_RECORD = { kind: 'gpu-tolerated', hostPid: GNOME, bootId: 'boot-1', startIdentity: '777', name: '/usr/bin/gnome-shell', type: 'G', memoryMiB: 2 };
+
+test('A5.a-graphics-only-display-process-is-recorded-at-the-first-check-and-tolerated-after', async () => {
+    const { gate, recorded } = displayGate({ replies: [withRows(displayRow(GNOME)), withRows(displayRow(GNOME)), withRows(displayRow(GNOME))] });
+    const baseline = await gate.initial();
+    assert.deepEqual(recorded, [GNOME_RECORD]); assert.ok(isToleratedRecord(recorded[0]));
+    assert.deepEqual(baseline.tolerated, [GNOME_RECORD]);
+    const checked = await gate.check('op');
+    assert.deepEqual(checked.tolerated, [GNOME]); assert.deepEqual(checked.owned, []);
+    await gate.check('op-2');
+    // The tolerated set is in the evidence of every check.
+    assert.ok(gate.history.every(entry => JSON.stringify(entry.tolerated) === `[${GNOME}]`), JSON.stringify(gate.history));
+    assert.deepEqual(gate.summary().tolerated, [GNOME_RECORD]);
+    // Free-memory checks use the actual free memory: the display's MiB is part of what nvidia-smi reports used.
+    const small = displayGate({ replies: [withRows(displayRow(GNOME)), smiOk(smiXml({ rows: displayRow(GNOME), used: 5000 }))] });
+    await small.gate.initial();
+    await assert.rejects(small.gate.check('probe', { minFreeMiB: 2048 }), blockedWith('insufficient_free_memory'));
+    // Exactly 64 MiB is within the limit: the single control.
+    const edge = displayGate({ procs: new Map([[10, desktop()]]), replies: [withRows(displayRow(10, 'G', 64))] });
+    await edge.gate.initial();
+    assert.equal(edge.recorded.length, 1);
+});
+
+test('A5.a-recorded-display-process-is-blocked-when-it-gains-compute-grows-over-the-limit-or-its-pid-is-reused', async () => {
+    const first = withRows(displayRow(GNOME));
+    const cases = [
+        ['it turns into C+G', withRows(displayRow(GNOME, 'C+G')), () => {}, 'type_changed'],
+        ['it turns into C', withRows(displayRow(GNOME, 'C')), () => {}, 'type_changed'],
+        ['it becomes an MPS client', withRows(displayRow(GNOME, 'M+C')), () => {}, 'type_changed'],
+        ['it grows over 64 MiB', withRows(displayRow(GNOME, 'G', 65)), () => {}, 'memory_over_limit'],
+        ['its PID is reused with another start identity', first, procs => procs.set(GNOME, desktop({ startIdentity: '9999' })), 'identity_changed'],
+        ['its PID is reused after a reboot (another boot identity)', first, procs => procs.set(GNOME, { ...desktop(), bootId: 'boot-2' }), 'identity_changed'],
+        ['its memory is no longer printed', smiOk(smiXml({ rows: displayRow(GNOME).replace('<used_memory>2 MiB</used_memory>', '<used_memory>N/A</used_memory>') })), () => {}, 'memory_over_limit'],
+    ];
+    for (const [label, later, mutate, why] of cases) {
+        const { gate, procs } = displayGate({ replies: [first, later] });
+        await gate.initial();
+        mutate(procs);
+        await assert.rejects(gate.check('op'), error => blockedWith('gpu_busy')(error) && error.gate.why === why && JSON.stringify(error.gate.foreign) === `[${GNOME}]`, label);
+    }
+    // Controls: the same process unchanged, and at exactly 64 MiB, still passes.
+    const same = displayGate({ replies: [first, withRows(displayRow(GNOME, 'G', 64))] });
+    await same.gate.initial();
+    assert.deepEqual((await same.gate.check('op')).tolerated, [GNOME]);
+});
+
+test('A5.a-process-that-was-not-recorded-at-the-first-check-is-never-tolerated-later', async () => {
+    const procs = new Map([[GNOME, desktop()], [3000, desktop({ startIdentity: '801' })]]);
+    for (const [label, rows] of [['a new graphics process', [displayRow(GNOME), displayRow(3000)]], ['a new compute process', [displayRow(GNOME), displayRow(3000, 'C', 500)]]]) {
+        const { gate } = displayGate({ procs, replies: [withRows(displayRow(GNOME)), withRows(...rows)] });
+        await gate.initial();
+        await assert.rejects(gate.check('op'), error => blockedWith('gpu_busy')(error) && JSON.stringify(error.gate.foreign) === '[3000]' && error.gate.why === 'not_recorded', label);
+    }
+    // A later action's initial check (no recording) tolerates only what the run recorded.
+    const unrecorded = displayGate({ record: false, replies: [withRows(displayRow(GNOME))] });
+    await assert.rejects(unrecorded.gate.initial(), blockedWith('gpu_busy'));
+    const recordedOnly = displayGate({ record: false, tolerated: [GNOME_RECORD], replies: [withRows(displayRow(GNOME))] });
+    assert.deepEqual((await recordedOnly.gate.initial()).tolerated, [GNOME_RECORD]);
+    const another = displayGate({ record: false, tolerated: [GNOME_RECORD], procs, replies: [withRows(displayRow(GNOME), displayRow(3000))] });
+    await assert.rejects(another.gate.initial(), blockedWith('gpu_busy'));
+    // A gate that never records (the default) tolerates nothing: any listed process blocks, as in G1.
+    const { gate } = scriptedGate({ replies: [smiOk(smiXml({ rows: displayRow(GNOME) }))], procs: new Map([[GNOME, desktop()]]) });
+    await assert.rejects(gate.initial(), blockedWith('gpu_busy'));
+});
+
+test('A5.the-first-check-blocks-compute-an-oversized-or-unmeasured-process-a-second-graphics-process-and-an-unproven-identity', async () => {
+    const two = new Map([[10, desktop({ startIdentity: '700' })], [11, desktop({ startIdentity: '701' })]]);
+    const cases = [
+        ['a compute process', [displayRow(GNOME, 'C')], undefined, 'gpu_busy'],
+        ['an MPS server', [displayRow(GNOME, 'M+C')], undefined, 'gpu_busy'],
+        ['compute and graphics', [displayRow(GNOME, 'C+G')], undefined, 'gpu_busy'],
+        ['a display process over 64 MiB', [displayRow(GNOME, 'G', 65)], undefined, 'gpu_busy'],
+        ['a display process whose memory is not printed', [displayRow(GNOME).replace('2 MiB', 'N/A')], undefined, 'gpu_busy'],
+        ['a tolerable process beside a compute one', [displayRow(GNOME), displayRow(3000, 'C')], new Map([[GNOME, desktop()], [3000, desktop()]]), 'gpu_busy'],
+        ['a second foreign graphics process', [displayRow(10), displayRow(11)], two, 'gpu_busy'],
+        ['a display process whose host identity cannot be proved', [displayRow(GNOME)], new Map(), 'display_identity_unproved'],
+    ];
+    for (const [label, rows, procs, reason] of cases) {
+        const { gate, recorded } = displayGate({ replies: [withRows(...rows)], ...(procs ? { procs } : {}) });
+        await assert.rejects(gate.initial(), blockedWith(reason), label);
+        assert.deepEqual(recorded, [], `${label}: nothing is recorded`);
+        assert.equal(gate.baseline, null, label);
+    }
+    // An unparseable memory element is unsupported output, not a tolerated process.
+    const bad = displayGate({ replies: [smiOk(smiXml({ rows: displayRow(GNOME).replace('2 MiB', '2 GiB') }))] });
+    await assert.rejects(bad.gate.initial(), blockedWith('unsupported_output'));
+});
+
+test('A5.a-recorded-display-process-that-disappears-is-logged-and-never-fails', async () => {
+    const { gate, procs } = displayGate({ replies: [withRows(displayRow(GNOME)), smiOk(smiXml()), withRows(displayRow(GNOME))] });
+    await gate.initial();
+    procs.delete(GNOME);
+    const gone = await gate.check('gone');
+    assert.deepEqual(gone.vanished, [GNOME]); assert.deepEqual(gone.tolerated, []);
+    assert.deepEqual(gate.history.at(-1).vanished, [GNOME]);
+    assert.deepEqual(gate.summary().vanishedTolerated, [GNOME]);
+    // The same process (same identity) coming back is still the recorded one.
+    procs.set(GNOME, desktop());
+    assert.deepEqual((await gate.check('back')).tolerated, [GNOME]);
+    // A different process that reuses the PID after it vanished is not.
+    const reused = displayGate({ replies: [withRows(displayRow(GNOME)), smiOk(smiXml()), withRows(displayRow(GNOME))] });
+    await reused.gate.initial(); reused.procs.delete(GNOME);
+    await reused.gate.check('gone');
+    reused.procs.set(GNOME, desktop({ startIdentity: '31337' }));
+    await assert.rejects(reused.gate.check('reused'), error => blockedWith('gpu_busy')(error) && error.gate.why === 'identity_changed');
+});
+
+test('A5.owned-pid-exclusion-and-foreign-blocking-are-unchanged-beside-a-tolerated-process', async () => {
+    const procs = new Map([
+        [GNOME, desktop()],
+        [900, proc('/box/ploinky/core', { startIdentity: '90' })], [901, proc('/box/ploinky/core', { startIdentity: '91', ppid: 900 })],
+    ]);
+    const mixed = withRows(displayRow(GNOME), displayRow(901, 'M+C', 300, 'nvidia-cuda-mps-server'));
+    const { gate } = displayGate({ procs, replies: [withRows(displayRow(GNOME)), mixed, withRows(displayRow(GNOME), displayRow(901, 'M+C', 300), displayRow(777, 'C', 100))] });
+    await gate.initial(); gate.registerDaemon(900);
+    const both = await gate.check('server and desktop');
+    assert.deepEqual(both.owned, [901]); assert.deepEqual(both.tolerated, [GNOME]);
+    // The desktop never excuses a foreign compute process, and only that one is named.
+    procs.set(777, desktop({ startIdentity: '900' }));
+    await assert.rejects(gate.check('foreign'), error => blockedWith('gpu_busy')(error) && JSON.stringify(error.gate.foreign) === '[777]');
+    // An owned PID without provenance still blocks.
+    const bare = displayGate({ procs, replies: [withRows(displayRow(GNOME)), mixed] });
+    await bare.gate.initial(); bare.gate.registerDaemon(900);
+    procs.set(901, proc('/other-box/ploinky/core', { startIdentity: '91', ppid: 900 }));
+    await assert.rejects(bare.gate.check('op'), blockedWith('gpu_busy'));
+});
+
+test('A5.provision-records-the-tolerated-set-in-the-run-manifest-and-the-live-cases-keep-to-it', async t => {
+    const w = gpuWorld(t);
+    w.fake.addDisplay(GNOME);
+    const report = await w.provision();
+    assert.equal(report.verdict, 'PASS', JSON.stringify(report.limitations));
+    assert.equal(w.run.toleratedProcesses.length, 1);
+    const [record] = w.run.toleratedProcesses;
+    assert.deepEqual([record.kind, record.hostPid, record.name, record.type, record.memoryMiB], ['gpu-tolerated', GNOME, '/usr/bin/gnome-shell', 'G', 2]);
+    assert.match(record.bootId, /^[0-9a-f-]+$/); assert.match(record.startIdentity, /^[0-9]+$/);
+    assert.deepEqual(JSON.parse(fs.readFileSync(w.runPath, 'utf8')).toleratedProcesses, w.run.toleratedProcesses, 'the record is durable');
+    assert.deepEqual(w.artifacts.get('gpu-initial-gate').tolerated, w.run.toleratedProcesses, 'the gate evidence states the recorded set');
+    assert.doesNotThrow(() => validateProfile(w.run));
+    const live = await liveCases(w, ['LIVE-P1', 'LIVE-P2']);
+    assert.deepEqual(live.cases.slice(0, 2).map(entry => entry.result), ['pass', 'pass'], JSON.stringify(live.limitations));
+    assert.deepEqual(w.artifacts.get('gpu-live-p1').gate.tolerated, w.run.toleratedProcesses, 'the case evidence states the tolerated set');
+    assert.ok(w.artifacts.get('gpu-live-p1').gate.last.tolerated.includes(GNOME));
+    // The desktop process is never signalled or touched.
+    assert.equal(w.fake.model.signals.length, 0);
+    assert.ok(w.fake.hostProc.observe(GNOME), 'the tolerated process is still there');
+    assert.equal(live.cleanup.state, 'complete');
+});
+
+test('A5.a-tolerated-process-that-gains-compute-after-provisioning-blocks-the-live-run-and-a-compute-process-blocks-provisioning', async t => {
+    const w = gpuWorld(t);
+    w.fake.addDisplay(GNOME);
+    assert.equal((await w.provision()).verdict, 'PASS');
+    w.fake.model.foreign.find(entry => entry.pid === GNOME).type = 'C+G';
+    const live = await liveCases(w, ['LIVE-P1']);
+    assert.equal(caseOf(live, 'LIVE-P1').result, 'blocked', JSON.stringify(live.limitations));
+    assert.match(live.limitations[0], /GPU idle gate blocked: gpu_busy/);
+    // Provisioning with a foreign compute process, an oversized one or a second display process records nothing and creates nothing.
+    for (const [label, setup] of [['compute', f => f.addDisplay(GNOME, { type: 'C' })], ['oversized', f => f.addDisplay(GNOME, { mib: 65 })], ['two', f => { f.addDisplay(GNOME); f.addDisplay(GNOME + 1); }]]) {
+        const blockedWorld = gpuWorld(t);
+        setup(blockedWorld.fake);
+        const blockedReport = await blockedWorld.provision();
+        assert.equal(blockedReport.verdict, 'BLOCKED', `${label}: ${JSON.stringify(blockedReport.limitations)}`);
+        assert.deepEqual(blockedWorld.run.toleratedProcesses, [], label);
+        assert.equal(exists(path.join(blockedWorld.remoteRoot, 'workspace')), false, label);
+    }
+});
+
+test('A5.the-manifest-validates-the-tolerated-records-and-the-approval-summary-states-the-rule', async t => {
+    const w = await provisioned(t);
+    const withTolerated = entries => { const run = structuredClone(w.run); run.toleratedProcesses = entries; return run; };
+    assert.doesNotThrow(() => validateProfile(withTolerated([GNOME_RECORD])));
+    for (const [label, entries] of [
+        ['a compute type', [{ ...GNOME_RECORD, type: 'C+G' }]], ['over the memory limit', [{ ...GNOME_RECORD, memoryMiB: 65 }]], ['a missing field', [(({ name, ...rest }) => rest)(GNOME_RECORD)]],
+        ['an extra field', [{ ...GNOME_RECORD, extra: 1 }]], ['another kind', [{ ...GNOME_RECORD, kind: 'gpu-process' }]], ['a bare PID', [GNOME]],
+        ['a duplicate PID', [GNOME_RECORD, GNOME_RECORD]], ['a second record', [GNOME_RECORD, { ...GNOME_RECORD, hostPid: GNOME + 1 }]],
+    ]) assert.throws(() => validateProfile(withTolerated(entries)), /tolerated display process|Invalid tolerated|exceeds 1 entries/, label);
+    const cpu = structuredClone(w.run); cpu.target.execution.gpu = undefined; cpu.toleratedProcesses = [GNOME_RECORD];
+    assert.throws(() => validateProfile(cpu, { partial: true }));
+    const summary = renderSummary(w.run, w.runPath);
+    for (const text of ['amendment A5', 'one recorded display process', 'one foreign process', 'toleratedProcesses', 'type exactly `G`', 'at most 64 MiB', 'the only foreign process allowed is the recorded one', 'second foreign graphics process', 'never touches, signals or reprioritises']) assert.ok(summary.includes(text), text);
+    assert.deepEqual(w.run.toleratedProcesses, [], 'the proposal records none: the first check does');
 });

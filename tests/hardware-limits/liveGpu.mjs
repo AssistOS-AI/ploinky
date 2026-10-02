@@ -8,6 +8,12 @@ function textTag(xml, tag) {
     if (matches.length !== 1) throw new Error(`Unsupported GPU ${tag} reply`);
     return matches[0][1].trim();
 }
+// A tag a process row may omit: absent is null, present once is its text.
+function optionalTag(xml, tag) {
+    const matches = [...xml.matchAll(new RegExp(`<${tag}>([^<>]*)</${tag}>`, 'g'))];
+    if (matches.length > 1) throw new Error(`Unsupported GPU ${tag} reply`);
+    return matches.length ? matches[0][1].trim() : null;
+}
 export function parseGpuInventory(result, expectedUuid) {
     requireTransport(result);
     const xml = result.stdout;
@@ -37,13 +43,20 @@ export function parseGpuInventory(result, expectedUuid) {
     const outside = section[1].replace(/<process_info>[\s\S]*?<\/process_info>/g, '').trim();
     if (/N\/A|Not Supported/i.test(outside)) throw new Error('GPU activity inventory unavailable');
     if (outside) throw new Error('Unknown GPU activity grammar');
+    // `details` carries what amendment A5 needs of each row (its name and its device
+    // memory, null when the driver prints none); `processes` stays {pid, type}.
+    const details = [];
     const processes = rows.map(row => {
         const pid = textTag(row[1], 'pid');
         const type = textTag(row[1], 'type');
         if (!/^[1-9][0-9]{0,9}$/.test(pid) || !Number.isSafeInteger(Number(pid)) || !GPU_PROCESS_TYPES.includes(type)) throw new Error('Malformed GPU process');
+        const memory = optionalTag(row[1], 'used_memory');
+        const found = memory === null ? null : /^([0-9]{1,9}) MiB$/.exec(memory);
+        if (memory !== null && memory !== 'N/A' && !found) throw new Error('Malformed GPU process');
+        details.push({ pid: Number(pid), type, name: optionalTag(row[1], 'process_name')?.slice(0, 256) ?? null, memoryMiB: found ? Number(found[1]) : null });
         return { pid: Number(pid), type };
     });
-    return { processes, uuid: expectedUuid };
+    return { processes, details, uuid: expectedUuid };
 }
 
 // nvidia-smi's process types. An MPS server is listed as M+C (compute through
@@ -67,15 +80,18 @@ export function parseGpuMemory(result) {
     return memory;
 }
 
-export async function requireGpuIdle({ query, expectedUuid, initial = false, owned = [], observe, bootId, boxCgroupPrefix }) {
+// `tolerate` ({mode: 'record'|'subset', recorded}) turns amendment A5 on: see
+// evaluateGpuIdleGate. Without it the GPU must show no foreign process at all.
+export async function requireGpuIdle({ query, expectedUuid, initial = false, owned = [], observe, bootId, boxCgroupPrefix, tolerate = null }) {
     const inventory = parseGpuInventory(await query(), expectedUuid);
     const observations = new Map();
     for (const record of owned) observations.set(record.hostPid, await observe(record.hostPid));
+    const lookup = pid => (observations.has(pid) ? observations.get(pid) : (typeof observe === 'function' ? observe(pid) : null));
     const result = evaluateGpuIdleGate({
         query: { ok: true, status: 0, signal: null, stdout: inventory.processes.map(value => String(value.pid)).join('\n') },
         activity: { supported: true, foreign: [] },
-        initial, owned, observe: pid => observations.get(pid), bootId, boxCgroupPrefix,
+        initial, owned, observe: lookup, bootId, boxCgroupPrefix, ...(tolerate ? { processes: inventory.details, tolerate } : {}),
     });
-    if (result.state !== 'idle') throw new Error(`GPU idle gate blocked: ${result.reason}`);
-    return inventory;
+    if (result.state !== 'idle') throw Object.assign(new Error(`GPU idle gate blocked: ${result.reason}`), { detail: result });
+    return { ...inventory, tolerated: result.tolerated || [], vanished: result.vanished || [] };
 }

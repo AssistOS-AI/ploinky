@@ -143,7 +143,7 @@ export async function provisionRun({
     const limitations = [];
     let profile;
     try {
-        if (run.state !== 'proposed' || run.operations.length || run.ownedBoxes.length || run.ownedPaths.length
+        if (run.state !== 'proposed' || run.operations.length || run.ownedBoxes.length || run.ownedPaths.length || run.toleratedProcesses?.length
             || run.cleanup.state !== 'not-started') throw new Error('Provisioning needs a fresh proposed manifest');
         profile = validateProfile(run, { partial: true });
         if (profile.workspace || profile.box || profile.agents.length || !profile.provision) throw new Error('Provisioning needs an unprovisioned execution profile');
@@ -205,12 +205,17 @@ export async function provisionRun({
         // The GPU idle gate runs before anything is created: a busy, foreign,
         // unsupported or wrong-mode GPU is BLOCKED with nothing to clean up.
         if (plan.gpu) {
+            // This is the run's FIRST gate check (amendment A5): a display process it
+            // tolerates is recorded in the run manifest, with its identity, before anything is created.
             const gate = createGpuGate({
                 query: () => processProvider(profile.gpu.smi.path, gpuQueryArgv(profile.gpu.uuid), { cwd: profile.host.home, env: { PATH: '/usr/bin:/bin', HOME: profile.host.home }, deadlineMs: 30000, maxBytes: 1048576, signal }),
                 uuid: profile.gpu.uuid, host: hostProc || createHostProc(), boxPrefix: '/before-the-box', expectedMemoryMiB: profile.gpu.memoryMiB,
+                recordTolerated: true,
+                onTolerate: record => { run.toleratedProcesses ||= []; run.toleratedProcesses.push(record); persist(); },
             });
-            const baseline = await gate.initial();
-            artifacts('gpu-initial-gate', { baseline, history: gate.history });
+            let baseline;
+            try { baseline = await gate.initial(); }
+            finally { artifacts('gpu-initial-gate', { baseline: gate.baseline, tolerated: gate.tolerated, history: gate.history }); }
             observed(intent('gpu-initial-gate'), { result: { uuid: baseline.uuid, computeMode: baseline.computeMode, memory: baseline.memory } });
         }
 

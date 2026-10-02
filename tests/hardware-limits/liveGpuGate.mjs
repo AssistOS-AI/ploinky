@@ -15,18 +15,35 @@
 //     bare PID, UID or name is never enough.
 //   - Once a foreign process has appeared the gate is tripped: no later check
 //     passes, so no new work starts; the only thing left to do is cleanup.
+//   - Amendment A5 (D-A5-01): ONE display process present at the run's FIRST gate
+//     check (type exactly G, at most 64 MiB, a proven host identity, not owned) is
+//     recorded as tolerated; every later check allows only that process, with the
+//     same identity, type G and memory within the limit. A recorded process that
+//     disappears is logged. It is never touched or signalled.
 //   - It never changes the compute mode and never signals any process.
 import { blocked } from './liveCommon.mjs';
 import { parseGpuInventory, parseGpuMemory, requireGpuIdle } from './liveGpu.mjs';
 import { requireTransport } from './liveProcess.mjs';
 import { cgroupWithin, createHostProc } from './liveGpuHost.mjs';
+import { GPU_TOLERATED_MAX, GPU_TOLERATED_MAX_MIB } from './fixtures.mjs';
 
 // `nvidia-smi -q -x -i UUID`: one device, the full XML inventory.
 export const gpuQueryArgv = uuid => ['-q', '-x', '-i', uuid];
 export const GPU_GATE_REASONS = Object.freeze([
     'query_error', 'unsupported_output', 'device_or_mode_mismatch', 'activity_unknown', 'gpu_busy', 'owned_provenance_unproved',
-    'insufficient_free_memory', 'foreign_process_appeared', 'unexpected_device_memory',
+    'insufficient_free_memory', 'foreign_process_appeared', 'unexpected_device_memory', 'display_identity_unproved',
 ]);
+
+// The record of one tolerated display process (amendment A5), as the run
+// manifest keeps it.
+export const GPU_TOLERATED_KEYS = Object.freeze(['kind', 'hostPid', 'bootId', 'startIdentity', 'name', 'type', 'memoryMiB']);
+export function isToleratedRecord(value) {
+    return Boolean(value) && Object.getPrototypeOf(value) === Object.prototype && value.kind === 'gpu-tolerated'
+        && Object.keys(value).length === GPU_TOLERATED_KEYS.length && GPU_TOLERATED_KEYS.every(key => Object.hasOwn(value, key))
+        && Number.isSafeInteger(value.hostPid) && value.hostPid > 0 && typeof value.bootId === 'string' && value.bootId.length > 0 && value.bootId.length <= 64
+        && /^[0-9]+$/.test(String(value.startIdentity)) && (value.name === null || (typeof value.name === 'string' && value.name.length <= 256))
+        && value.type === 'G' && Number.isSafeInteger(value.memoryMiB) && value.memoryMiB >= 0 && value.memoryMiB <= GPU_TOLERATED_MAX_MIB;
+}
 
 export function gpuBlocked(reason, detail = {}) {
     return Object.assign(blocked(`GPU idle gate blocked: ${reason}${detail.message ? ` (${String(detail.message).slice(0, 200)})` : ''}`), { gate: { ...detail, reason } });
@@ -43,13 +60,20 @@ function classify(message) {
     return 'unsupported_output';
 }
 
+// `tolerated` is the set the run recorded at its first check (amendment A5), from the
+// manifest; `recordTolerated` makes THIS gate's initial check that first check, which
+// records what the rule allows and reports each record through `onTolerate`.
 export function createGpuGate({
     query, uuid, host, boxPrefix, expectedMemoryMiB = null, intervalMs = 2000, retryMs = 100, onRegister = () => {},
+    tolerated = [], recordTolerated = false, onTolerate = () => {},
     sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), now = Date.now,
 } = {}) {
     if (typeof query !== 'function' || !/^GPU-[a-fA-F0-9-]{8,64}$/.test(String(uuid)) || !host || typeof boxPrefix !== 'string' || !boxPrefix.startsWith('/')) {
         throw new Error('The GPU gate needs its query, device UUID, host observer and Box cgroup prefix');
     }
+    if (!Array.isArray(tolerated) || tolerated.length > GPU_TOLERATED_MAX || !tolerated.every(isToleratedRecord)) throw new Error('The tolerated display processes of the run are invalid');
+    const toleratedSet = new Map(tolerated.map(record => [record.hostPid, record]));
+    const vanishedEver = new Set();
     const registry = new Map();
     const daemons = new Set();
     const leaves = new Set();
@@ -90,10 +114,17 @@ export function createGpuGate({
         for (const leaf of leaves) if (cgroupWithin(observed.cgroup, leaf)) return register(pid, 'mps-client');
         return null;
     }
-    const remember = (label, inventory, memory, owned) => {
-        history.push({ label, at: now(), listed: inventory.processes.map(value => value.pid), owned: owned.map(value => value.hostPid), freeMiB: memory.freeMiB, usedMiB: memory.usedMiB });
+    // Every check records the tolerated set that was present (A5) and, when a recorded
+    // process is no longer listed, that it vanished: logged, never a failure.
+    const remember = (label, inventory, memory, owned, outcome = null) => {
+        for (const pid of outcome?.vanished || []) vanishedEver.add(pid);
+        history.push({
+            label, at: now(), listed: inventory.processes.map(value => value.pid), owned: owned.map(value => value.hostPid), freeMiB: memory.freeMiB, usedMiB: memory.usedMiB,
+            tolerated: (outcome?.tolerated || []).map(record => record.hostPid), ...(outcome?.vanished?.length ? { vanished: [...outcome.vanished] } : {}),
+        });
         if (history.length > 200) history.shift();
     };
+    const toleration = mode => ({ mode, recorded: [...toleratedSet.values()] });
 
     const gate = {
         get baseline() { return baseline; },
@@ -113,10 +144,19 @@ export function createGpuGate({
         async initial() {
             const { result, inventory, memory } = await guarded('initial');
             if (expectedMemoryMiB !== null && memory.totalMiB !== expectedMemoryMiB) throw gpuBlocked('unexpected_device_memory', { message: `${memory.totalMiB} MiB reported, ${expectedMemoryMiB} MiB pinned` });
-            try { await requireGpuIdle({ query: async () => result, expectedUuid: uuid, initial: true }); }
-            catch (error) { throw gpuBlocked(classify(error.message), { message: error.message, listed: inventory.processes.map(value => value.pid) }); }
-            baseline = Object.freeze({ uuid: inventory.uuid, computeMode: 'Default', memory, at: now(), bootId: host.bootId() });
-            remember('initial', inventory, memory, []);
+            let outcome;
+            try {
+                outcome = await requireGpuIdle({
+                    query: async () => result, expectedUuid: uuid, initial: true, observe: pid => host.observe(pid), bootId: host.bootId(),
+                    tolerate: toleration(recordTolerated ? 'record' : 'subset'),
+                });
+            } catch (error) {
+                throw gpuBlocked(classify(error.message), { message: error.message, listed: inventory.processes.map(value => value.pid), ...(error.detail?.why ? { why: error.detail.why } : {}), ...(error.detail?.foreign ? { foreign: error.detail.foreign } : {}) });
+            }
+            // The first check records what the rule tolerates; the record is durable.
+            if (recordTolerated) for (const record of outcome.tolerated) { toleratedSet.set(record.hostPid, record); onTolerate({ ...record }); }
+            baseline = Object.freeze({ uuid: inventory.uuid, computeMode: 'Default', memory, at: now(), bootId: host.bootId(), tolerated: outcome.tolerated.map(record => ({ ...record })) });
+            remember('initial', inventory, memory, [], outcome);
             return baseline;
         },
         // Before every later GPU operation: query again; exclude only owned,
@@ -139,28 +179,29 @@ export function createGpuGate({
                 if (record) owned.push(record);
             }
             const bootId = host.bootId();
+            let outcome;
             try {
-                await requireGpuIdle({
+                outcome = await requireGpuIdle({
                     query: async () => result, expectedUuid: uuid, initial: false, owned,
                     // `owned` holds only PIDs the inventory lists, so a dead
                     // registered process never blocks, and a listed PID whose
                     // tuple changed (a reused PID) does.
-                    observe: pid => host.observe(pid), bootId, boxCgroupPrefix: boxPrefix,
+                    observe: pid => host.observe(pid), bootId, boxCgroupPrefix: boxPrefix, tolerate: toleration('subset'),
                 });
             } catch (error) {
                 const reason = classify(error.message);
-                const foreign = inventory.processes.map(value => value.pid).filter(pid => !owned.some(record => record.hostPid === pid));
+                const foreign = error.detail?.foreign || inventory.processes.map(value => value.pid).filter(pid => !owned.some(record => record.hostPid === pid) && !toleratedSet.has(pid));
                 remember(label, inventory, memory, owned);
                 // What the host knows of each unexpected PID, so a refusal can be
                 // diagnosed without another query (bounded; observation only).
                 const facts = foreign.slice(0, 8).map(pid => {
                     try { const seen = host.observe(pid); return seen ? { pid, ppid: seen.ppid, cgroup: seen.cgroup, uid: seen.uid?.effective, start: seen.startIdentity } : { pid, gone: true }; } catch { return { pid, unreadable: true }; }
                 });
-                throw gpuBlocked(reason === 'unsupported_output' ? 'owned_provenance_unproved' : reason, { message: error.message, label, listed: inventory.processes.map(value => value.pid), foreign, foreignFacts: facts });
+                throw gpuBlocked(reason === 'unsupported_output' ? 'owned_provenance_unproved' : reason, { message: error.message, label, listed: inventory.processes.map(value => value.pid), foreign, foreignFacts: facts, ...(error.detail?.why ? { why: error.detail.why } : {}) });
             }
-            remember(label, inventory, memory, owned);
+            remember(label, inventory, memory, owned, outcome);
             if (minFreeMiB && memory.freeMiB < minFreeMiB) throw gpuBlocked('insufficient_free_memory', { message: `${memory.freeMiB} MiB free, ${minFreeMiB} MiB needed`, label });
-            return { inventory, memory, owned: owned.map(value => value.hostPid) };
+            return { inventory, memory, owned: owned.map(value => value.hostPid), tolerated: outcome.tolerated.map(record => record.hostPid), vanished: outcome.vanished };
         },
         // Run `task(signal)` while the GPU is re-queried every interval. A
         // foreign user starts no new work: the gate trips, the task's signal
@@ -185,8 +226,10 @@ export function createGpuGate({
             if (failure) throw failure;
             return value;
         },
+        // The tolerated display processes of the run (A5), recorded at its first check.
+        get tolerated() { return [...toleratedSet.values()].map(record => ({ ...record })); },
         summary() {
-            return { baseline, checks: history.length, tripped: tripped ? tripped.gate : null, registered: [...registry.values()].map(value => ({ role: value.role, hostPid: value.hostPid, bootId: value.bootId, startIdentity: value.startIdentity })), last: history.at(-1) || null };
+            return { baseline, tolerated: [...toleratedSet.values()].map(record => ({ ...record })), vanishedTolerated: [...vanishedEver], checks: history.length, tripped: tripped ? tripped.gate : null, registered: [...registry.values()].map(value => ({ role: value.role, hostPid: value.hostPid, bootId: value.bootId, startIdentity: value.startIdentity })), last: history.at(-1) || null };
         },
     };
     return gate;

@@ -260,6 +260,9 @@ export function createGpuCases(ctx) {
         const prefix = boxCgroupPrefix(host, { boxPid: box.pid, boxId: box.id });
         const gate = createGpuGate({
             query: () => smiQuery(), uuid: gpu.uuid, host, boxPrefix: prefix, expectedMemoryMiB: gpu.memoryMiB, intervalMs: timings.monitorMs, sleep,
+            // The display processes the run's first check recorded (amendment A5): this check
+            // tolerates no others.
+            tolerated: run.toleratedProcesses || [],
             // Every registration is written into the run manifest, with its full tuple.
             onRegister: record => {
                 const entry = { kind: 'gpu-process', ...record };

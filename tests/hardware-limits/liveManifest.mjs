@@ -16,7 +16,7 @@ import {
     ADMIN_REQUEST, GPU_SHARES, MPS_CLIENT_PIPE, PROBE_FILE, TIGHTER_CLIENT, controlHelperRunArgv, probeBoundMiB, probeExecArgv, shareMemoryMiB,
 } from './liveGpuCommands.mjs';
 import { remoteRoot, remoteReportName } from './liveStage.mjs';
-import { DOCUMENT_SUFFIXES } from './fixtures.mjs';
+import { DOCUMENT_SUFFIXES, GPU_TOLERATED_MAX, GPU_TOLERATED_MAX_MIB } from './fixtures.mjs';
 import { sshOptions } from './liveRemote.mjs';
 
 export const CONCRETE_BLOCKS = Object.freeze({
@@ -171,6 +171,7 @@ export function buildConcreteManifest({ block, runId, configDigest, casesDigest,
             { role: 'box', ref: pins.boxImage, source: 'operator pins' },
         ],
         ownedBoxes: [], ownedProcesses: [], ownedPaths: [], preInventory: {}, operations: [],
+        ...(spec.gpu ? { toleratedProcesses: [] } : {}),
         cleanup: { state: 'not-started', steps: [], failures: [] },
     };
     target.plan = plannedCommands(run);
@@ -194,7 +195,7 @@ export function plannedCommands(run) {
         { id: 'engine-identity', binary: engine, argv: [...ENGINE_INFO_ARGV], deadlineMs: run.deadlines.coreMs, note: 'Stable facts only: host arch/os/hostname/kernel, engine version, store graphRoot/runRoot and the service socket; a remote client adds its one default connection (name and URI). A missing fact refuses the run.' },
         { id: 'engine-connection', binary: engine, argv: [...ENGINE_CONNECTIONS_ARGV], deadlineMs: run.deadlines.coreMs, note: 'Only when the service is remote.' },
         { id: 'host-records-absent', action: `Refuse unless ${HOST_RECORD_DIRECTORIES.map(name => `~/.ploinky-box/${name}/${run.workspace.instance}{,.json}`).join(', ')} are all absent` },
-        ...(profile.gpu ? [{ id: 'gpu-initial-gate', binary: profile.gpu.smi.path, argv: gpuQueryArgv(profile.gpu.uuid), deadlineMs: run.deadlines.coreMs, note: 'The initial GPU idle gate, before anything is created: success, strict XML, the pinned UUID and memory, compute mode Default, a supported activity inventory and an empty process list. Nothing else runs if it is not met.' }] : []),
+        ...(profile.gpu ? [{ id: 'gpu-initial-gate', binary: profile.gpu.smi.path, argv: gpuQueryArgv(profile.gpu.uuid), deadlineMs: run.deadlines.coreMs, note: 'The initial GPU idle gate, before anything is created: success, strict XML, the pinned UUID and memory, compute mode Default, a supported activity inventory and an empty process list, except for at most 4 graphics-only (type G) display processes of at most 64 MiB each with a proven host identity (amendment A5), which are recorded in toleratedProcesses of the run manifest. Nothing else runs if it is not met.' }] : []),
         ...(plan.workspace.parentMode === 'create'
             ? [{ id: 'workspace-parent-create', action: `mkdir ${plan.workspace.parent} (0700, refuse if it exists) and write ${OWNER_MARKER}=${run.runId}` }]
             : [{ id: 'workspace-parent-staged', action: `Require the staged private root ${plan.workspace.parent} (0700, marker ${run.runId})` }]),
@@ -339,7 +340,9 @@ export function gpuPlan(run) {
         ['the XML parses strictly: one gpu element, no entity, CDATA or ampersand, exactly one uuid and compute_mode, one fb_memory_usage', 'malformed or unsupported output blocks'],
         [`the UUID is \`${uuid}\` and the total memory is ${gpu.memoryMiB} MiB`, 'another device blocks'],
         ['the compute mode is Default', 'any other mode blocks; the runner never changes it'],
-        ['the process list is supported (no N/A) and, for the initial gate, empty: no compute, graphics or MPS process at all', 'an unsupported inventory or any process blocks'],
+        ['the process list is supported (no N/A) and, for the initial gate, empty: no compute or MPS process and no unrecorded graphics process (but for the one display process of amendment A5)', 'an unsupported inventory or any such process blocks'],
+        [`amendment A5, one recorded display process: at the run's FIRST gate check (the provision action) ${GPU_TOLERATED_MAX === 1 ? 'one foreign process' : `up to ${GPU_TOLERATED_MAX} foreign processes`} may be recorded as tolerated, of type exactly \`G\` (graphics only, never C, C+G, M+C or any type with compute), using at most ${GPU_TOLERATED_MAX_MIB} MiB, not owned by the run, with a proven host identity (boot id and /proc start time). It is written to toleratedProcesses of the run manifest with its PID, start identity, name, type and memory; the recorded process is also in the gpu-initial-gate evidence and in every check's history`, 'a process that is not of type G, is over the memory limit, is a second foreign graphics process, or whose identity cannot be proved blocks the first check'],
+        ['at every later check the only foreign process allowed is the recorded one: same PID and start identity, type still exactly G and memory still within the limit (the subset of that record). The runner never touches, signals or reprioritises a tolerated process and never changes the compute mode', 'a process that was not recorded, one that gained compute, one over the limit, a reused PID (another start identity) or an unprovable identity blocks; the recorded process disappearing is logged, not a failure'],
         ['before EVERY later GPU operation the query is repeated; a listed PID is excluded only if it is a registered owned MPS server (a child of the registered owned daemon in the Box\'s /ploinky/core) or client (inside a registered owned agent leaf) and its tuple is freshly verified: host boot ID, host PID, process start time, cgroup beneath the exact Box scope libpod-<BOX_ID>', 'a bare PID, UID or name never excludes; a changed tuple blocks'],
         ['free GPU memory covers the probe bound plus 1 GiB before each CUDA probe', 'less blocks'],
         ['during a probe the gate re-queries every 2 s', 'a foreign process aborts the probe command, trips the gate (no later GPU operation starts) and the case is BLOCKED; owned clients are stopped only by cleanup'],
@@ -440,7 +443,7 @@ function gpuSummary(run) {
     return [
         '## GPU idle gate',
         '',
-        `The device is ${gpu.name} (\`${gpu.uuid}\`, ${gpu.memoryMiB} MiB, driver ${gpu.driverVersion}). Compute mode is never changed; nothing here is a reservation against another operator.`,
+        `The device is ${gpu.name} (\`${gpu.uuid}\`, ${gpu.memoryMiB} MiB, driver ${gpu.driverVersion}). Compute mode is never changed; nothing here is a reservation against another operator. One display process (type G, at most ${GPU_TOLERATED_MAX_MIB} MiB) that is present at the first check is tolerated only under amendment A5, as the rows below state; the process the first check recorded is written to \`toleratedProcesses\` in the run manifest and into the gate evidence once the provision action has run, and is not known before it.`,
         '',
         '| Check | If it fails |',
         '| --- | --- |',

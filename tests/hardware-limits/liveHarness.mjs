@@ -21,7 +21,7 @@ import {
 } from './liveCaseCommands.mjs';
 import { createGpuCases } from './liveGpuCases.mjs';
 import { validateGpuProfile } from './liveGpuCommands.mjs';
-import { gpuCleanupProof, isGpuProcessRecord } from './liveGpuGate.mjs';
+import { gpuCleanupProof, isGpuProcessRecord, isToleratedRecord } from './liveGpuGate.mjs';
 
 export const LIVE_CASES = Object.freeze({
     'mac-cpu': ['LIVE-C1', 'LIVE-C2', 'LIVE-C3', 'LIVE-C4', 'LIVE-C5', 'LIVE-C6', 'LIVE-C7'],
@@ -125,6 +125,11 @@ export function validateProfile(run, { partial = false } = {}) {
     // each with its full tuple; cleanup never signals them and the final GPU observation
     // proves them gone.
     if (run.ownedProcesses.some(entry => !profile.gpu || !isGpuProcessRecord(entry))) throw new Error('This executor cannot clean extra recorded processes or paths');
+    // The tolerated display process (amendment A5): at most one, a graphics-only, small,
+    // identified process; it is recorded only for a GPU block and never signalled.
+    const tolerated = run.toleratedProcesses ?? [];
+    if (tolerated.length && !profile.gpu) throw new Error('Only a GPU block records tolerated display processes');
+    if (tolerated.length > 1 || !tolerated.every(isToleratedRecord) || new Set(tolerated.map(entry => entry.hostPid)).size !== tolerated.length) throw new Error('Invalid tolerated display processes');
     validateOwnedPaths(run, profile);
     return profile;
 }

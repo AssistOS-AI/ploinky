@@ -580,6 +580,16 @@ export function buildRequiredCaseManifest() {
             'G1.gf1-an-owned-process-that-survives-the-destruction-fails-cleanup-and-is-not-signalled',
             'G1.gf1-a-gpu-fixture-whose-provisioning-failed-is-certified-clean-only-by-a-successful-final-observation',
             'G1.gf1-only-registered-gpu-processes-may-be-recorded-in-the-manifest',
+            // Amendment A5: a recorded display process does not make the GPU busy.
+            'A5.a-graphics-only-display-process-is-recorded-at-the-first-check-and-tolerated-after',
+            'A5.a-recorded-display-process-is-blocked-when-it-gains-compute-grows-over-the-limit-or-its-pid-is-reused',
+            'A5.a-process-that-was-not-recorded-at-the-first-check-is-never-tolerated-later',
+            'A5.the-first-check-blocks-compute-an-oversized-or-unmeasured-process-a-second-graphics-process-and-an-unproven-identity',
+            'A5.a-recorded-display-process-that-disappears-is-logged-and-never-fails',
+            'A5.owned-pid-exclusion-and-foreign-blocking-are-unchanged-beside-a-tolerated-process',
+            'A5.provision-records-the-tolerated-set-in-the-run-manifest-and-the-live-cases-keep-to-it',
+            'A5.a-tolerated-process-that-gains-compute-after-provisioning-blocks-the-live-run-and-a-compute-process-blocks-provisioning',
+            'A5.the-manifest-validates-the-tolerated-records-and-the-approval-summary-states-the-rule',
         ]),
         ...leaves(P, 'p4', unit('hardwareLimitsLiveProvision.test.mjs'), ['G1.prepare-live-apparatus-mps-concrete-manifest-and-summary']),
         ...leaves(P, 'p4', unit('hardwareLimitsMps.test.mjs'), [
@@ -920,6 +930,21 @@ export function verifyOwnedGpuProcess(record, observed, { bootId, boxCgroupPrefi
     return true;
 }
 
+// Amendment A5 (decision D-A5-01): a recorded display process does not make the
+// GPU busy. At the run's first gate check at most ONE foreign process (the
+// user's "one recorded display process"), listed with type exactly `G`
+// (graphics only), using at most GPU_TOLERATED_MAX_MIB MiB and with a proven
+// host identity, is recorded as tolerated; a second one blocks. Every later check
+// allows only that recorded process, with its recorded identity, type `G` and
+// memory within the limit. Nothing else is tolerated, and a tolerated process
+// is never touched.
+export const GPU_TOLERATED_MAX = 1;
+export const GPU_TOLERATED_MAX_MIB = 64;
+
+// `processes` are the parsed inventory rows ({pid, type, name, memoryMiB}); with
+// `tolerate` ({mode: 'record'|'subset', recorded}) they decide which foreign
+// processes the rule tolerates. Without `tolerate` (the default) nothing is
+// tolerated and the result is exactly the exact-membership classification.
 export function evaluateGpuIdleGate({
     query,
     activity,
@@ -928,6 +953,8 @@ export function evaluateGpuIdleGate({
     bootId,
     boxCgroupPrefix,
     initial = false,
+    processes = null,
+    tolerate = null,
 } = {}) {
     const parsed = parseComputePidQuery(query);
     if (!parsed.ok) return { state: 'blocked', reason: parsed.reason };
@@ -935,10 +962,28 @@ export function evaluateGpuIdleGate({
     if (Array.isArray(activity.foreign) && activity.foreign.length) {
         return { state: 'blocked', reason: 'gpu_busy', foreign: [...activity.foreign] };
     }
-    if (initial) {
-        return parsed.pids.length
-            ? { state: 'blocked', reason: 'gpu_busy', foreign: parsed.pids }
-            : { state: 'idle' };
+    const tolerating = Boolean(tolerate) && Array.isArray(processes);
+    const withinLimit = (row) => row.type === 'G' && Number.isSafeInteger(row.memoryMiB) && row.memoryMiB >= 0 && row.memoryMiB <= GPU_TOLERATED_MAX_MIB;
+    // The host identity of a listed PID, freshly observed: boot identity and /proc start time.
+    const identityOf = (pid) => {
+        let seen = null;
+        try { seen = observe(pid); } catch { return null; }
+        return seen && bootId && seen.bootId === bootId && seen.hostPid === pid && seen.startIdentity ? { bootId: seen.bootId, startIdentity: String(seen.startIdentity) } : null;
+    };
+    if (initial && !(tolerating && tolerate.mode === 'subset')) {
+        if (!parsed.pids.length) return tolerating ? { state: 'idle', tolerated: [], vanished: [] } : { state: 'idle' };
+        if (!tolerating || tolerate.mode !== 'record') return { state: 'blocked', reason: 'gpu_busy', foreign: parsed.pids };
+        // The run's first check: record what the rule allows, or block naming what it does not.
+        const refused = processes.filter((row) => !withinLimit(row));
+        if (refused.length) return { state: 'blocked', reason: 'gpu_busy', foreign: refused.map((row) => row.pid), why: 'not_tolerable' };
+        if (processes.length > GPU_TOLERATED_MAX) return { state: 'blocked', reason: 'gpu_busy', foreign: processes.map((row) => row.pid), why: 'too_many' };
+        const tolerated = [];
+        for (const row of processes) {
+            const identity = identityOf(row.pid);
+            if (!identity) return { state: 'blocked', reason: 'display_identity_unproved', hostPid: row.pid };
+            tolerated.push({ kind: 'gpu-tolerated', hostPid: row.pid, bootId: identity.bootId, startIdentity: identity.startIdentity, name: row.name ?? null, type: 'G', memoryMiB: row.memoryMiB });
+        }
+        return { state: 'idle', tolerated, vanished: [] };
     }
     const verified = new Set();
     for (const record of owned) {
@@ -948,7 +993,26 @@ export function evaluateGpuIdleGate({
         }
         verified.add(record.hostPid);
     }
-    return classifyGpuPidSet(parsed.pids, verified);
+    if (!tolerating) return classifyGpuPidSet(parsed.pids, verified);
+    const recorded = new Map((tolerate.recorded || []).map((record) => [record.hostPid, record]));
+    const stillTolerated = new Set();
+    const present = [];
+    const changed = [];
+    for (const row of processes) {
+        if (verified.has(row.pid)) continue;
+        const record = recorded.get(row.pid);
+        if (!record) continue; // not recorded: left to the exact-membership classification below
+        const identity = identityOf(row.pid);
+        if (identity && identity.bootId === record.bootId && identity.startIdentity === String(record.startIdentity) && withinLimit(row)) {
+            stillTolerated.add(row.pid); present.push(record);
+        } else changed.push({ pid: row.pid, why: !identity || identity.bootId !== record.bootId || identity.startIdentity !== String(record.startIdentity) ? 'identity_changed' : row.type !== 'G' ? 'type_changed' : 'memory_over_limit' });
+    }
+    if (changed.length) return { state: 'blocked', reason: 'gpu_busy', foreign: changed.map((entry) => entry.pid), why: changed[0].why, changed };
+    const result = classifyGpuPidSet(parsed.pids.filter((pid) => !stillTolerated.has(pid)), verified);
+    if (result.state !== 'idle') return { ...result, why: 'not_recorded' };
+    // A recorded process that is no longer listed is logged, never a failure.
+    const listed = new Set(processes.map((row) => row.pid));
+    return { state: 'idle', tolerated: present, vanished: [...recorded.keys()].filter((pid) => !listed.has(pid)) };
 }
 
 // ---------------------------------------------------------------------------
@@ -1044,10 +1108,13 @@ export function removeOwnedShortTemp(handle) {
 export function validateRunManifest(value) {
     const label = 'run';
     if (jsonBytes(value) > 256 * 1024) fail(label, 'exceeds 256 KiB');
+    // `toleratedProcesses` (amendment A5) records the display processes the idle gate
+    // tolerated at the run's first check; only GPU blocks carry it.
     exactKeys(value, [
         'schema', 'runId', 'configDigest', 'casesDigest', 'block', 'target', 'state', 'workspace', 'ports',
         'deadlines', 'images', 'ownedBoxes', 'ownedProcesses', 'ownedPaths', 'preInventory', 'operations', 'cleanup',
-    ], [], label);
+    ], ['toleratedProcesses'], label);
+    if (Object.prototype.hasOwnProperty.call(value, 'toleratedProcesses')) boundedArray(value.toleratedProcesses, `${label}.toleratedProcesses`, GPU_TOLERATED_MAX);
     if (value.schema !== 1) fail(`${label}.schema`, 'unsupported schema');
     if (!HEX128.test(value.runId)) fail(`${label}.runId`, 'expected 128-bit hex');
     for (const key of ['configDigest', 'casesDigest']) {

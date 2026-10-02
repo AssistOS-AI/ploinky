@@ -168,10 +168,11 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
         const rows = [];
         if (model.daemon && !model.daemon.lost) for (const server of model.daemon.servers) rows.push({ pid: server.hostPid, type: 'M+C', name: 'nvidia-cuda-mps-server' });
         for (const proc of model.bypassProcs) rows.push({ pid: proc.hostPid, type: 'C', name: 'python3' });
-        for (const foreign of model.foreign) rows.push({ pid: foreign.pid, type: foreign.type || 'C', name: foreign.name || 'train.py' });
-        const usedMiB = 13 + (rows.length ? 300 : 0) + model.probes.filter(probe => probe.active).reduce((sum, probe) => sum + probe.allocatedMiB, 0);
+        for (const foreign of model.foreign) rows.push({ pid: foreign.pid, type: foreign.type || 'C', name: foreign.name || 'train.py', mib: foreign.mib });
+        // A row that states its memory (a display process) adds exactly that; the others keep the fixed 300 MiB.
+        const usedMiB = 13 + (rows.some(row => row.mib === undefined) ? 300 : 0) + rows.reduce((sum, row) => sum + (row.mib ?? 0), 0) + model.probes.filter(probe => probe.active).reduce((sum, probe) => sum + probe.allocatedMiB, 0);
         const section = faults.smiProcessesNA ? 'N/A'
-            : rows.map(row => `<process_info><gpu_instance>N/A</gpu_instance><compute_instance>N/A</compute_instance><pid>${row.pid}</pid><type>${row.type}</type><process_name>${row.name}</process_name><used_memory>300 MiB</used_memory></process_info>`).join('\n');
+            : rows.map(row => `<process_info><gpu_instance_id>N/A</gpu_instance_id><compute_instance_id>N/A</compute_instance_id><pid>${row.pid}</pid><type>${row.type}</type><process_name>${row.name}</process_name><used_memory>${row.mib ?? 300} MiB</used_memory></process_info>`).join('\n');
         const xml = `<?xml version="1.0" ?>\n<!DOCTYPE nvidia_smi_log SYSTEM "nvsmi_device_v12.dtd">\n<nvidia_smi_log>\n<timestamp>Fri Oct  2 19:30:00 2026</timestamp>\n<driver_version>${gpu.driverVersion}</driver_version>\n<attached_gpus>1</attached_gpus>\n`
             + `<gpu id="00000000:01:00.0">\n<product_name>${gpu.name}</product_name>\n<uuid>${faults.smiOtherUuid ? 'GPU-00000000-0000-4000-8000-000000000000' : gpu.uuid}</uuid>\n<compute_mode>${faults.smiComputeMode || 'Default'}</compute_mode>\n`
             + `<fb_memory_usage><total>${faults.smiTotalMiB ?? gpu.memoryMiB} MiB</total><reserved>201 MiB</reserved><used>${usedMiB} MiB</used><free>${gpu.memoryMiB - usedMiB} MiB</free></fb_memory_usage>\n`
@@ -463,7 +464,9 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
         if (verbs.includes('destroy')) {
             // `survivorAfterDestroy`: the Box is gone but its MPS daemon process is still there.
             const survivors = faults.survivorAfterDestroy && model.daemon ? [model.daemon.proc] : [];
-            model.procs.clear(); for (const proc of survivors) model.procs.set(proc.hostPid, proc);
+            // The Box's processes go with it; the host's own (a desktop's display process) stay.
+            const outside = [...model.procs.values()].filter(proc => !String(proc.cgroup).startsWith(model.prefix));
+            model.procs.clear(); for (const proc of [...outside, ...survivors]) model.procs.set(proc.hostPid, proc);
             model.dirs.clear(); model.agents.clear(); model.helpers.clear(); model.daemon = null;
         }
         return result;
@@ -508,6 +511,13 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
         provider, hostProc, model, statePath,
         // Test controls.
         addForeign(pid, type = 'C') { model.foreign.push({ pid, type }); },
+        // A logged-in desktop's display process (amendment A5): listed by nvidia-smi with its small
+        // memory, and a real process on the host (outside the Box), so its identity can be proved.
+        addDisplay(pid, { type = 'G', mib = 2, name = '/usr/bin/gnome-shell', cgroup = '/user.slice/user-1000.slice/user@1000.service/session.slice/org.gnome.Shell@wayland.service' } = {}) {
+            model.procs.set(pid, { hostPid: pid, start: String(++model.clock), ppid: 1, cgroup, nspid: [pid], uid: hostUid });
+            model.foreign.push({ pid, type, mib, name });
+        },
+        removeDisplay(pid) { model.foreign = model.foreign.filter(value => value.pid !== pid); model.procs.delete(pid); },
         clearForeign() { model.foreign = []; },
         reusePid(hostPid) { const proc = model.procs.get(hostPid); proc.start = String(++model.clock); },
     };
