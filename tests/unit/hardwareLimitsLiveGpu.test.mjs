@@ -1667,3 +1667,16 @@ test('W3.the-fixture-start-instance-must-still-be-created-from-the-digest-refere
     const entry = caseOf(await liveCases(w, ['LIVE-P1']), 'LIVE-P1');
     assert.notEqual(entry.result, 'pass');
 });
+
+// F2: the immutable-ID half of the identity check. A recreated share client whose name is the digest reference (so the name
+// half passes) but whose image ID is another image's must fail: the name alone never proves the instance.
+test('F2.a-recreated-share-client-from-a-foreign-image-id-fails-even-when-its-name-is-the-digest-reference', async t => {
+    const faults = { recreatedImageId: 'd'.repeat(64) };
+    const w = await provisioned(t, { faults });
+    // The name the engine reports is the pinned digest reference itself; only the ID is foreign.
+    Object.defineProperty(faults, 'recreatedImageName', { get: () => w.fake.model.image, enumerable: true });
+    const entry = caseOf(await liveCases(w, ['LIVE-P1']), 'LIVE-P1');
+    assert.equal(entry.result, 'fail', JSON.stringify(entry).slice(0, 400));
+    assert.match(entry.reason, /Agent probe is not the pinned running instance \(image d{12}, created from docker\.io\/assistos\/ploinky-node@sha256:a+\)/);
+    nothingOwned(w);
+});

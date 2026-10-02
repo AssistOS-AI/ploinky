@@ -613,6 +613,7 @@ export function buildRequiredCaseManifest() {
             'W2.a-p1-pass-copies-the-journaled-readback-into-its-case-artifact',
             'W3.a-share-client-recreated-by-image-id-passes-with-the-id-as-its-image-name',
             'W3.a-recreated-share-client-with-another-image-id-or-a-foreign-image-name-fails',
+            'F2.a-recreated-share-client-from-a-foreign-image-id-fails-even-when-its-name-is-the-digest-reference',
         ]),
         ...leaves(P, 'p4', unit('hardwareLimitsLiveProvision.test.mjs'), ['G1.prepare-live-apparatus-mps-concrete-manifest-and-summary']),
         ...leaves(P, 'p4', unit('hardwareLimitsMps.test.mjs'), [
