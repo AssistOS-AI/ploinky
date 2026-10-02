@@ -233,14 +233,20 @@ test('HLIVE.R13-removal-intent-directory-substitution-is-preserved', async t => 
 
 test('HLIVE.R16-inherited-pipe-grandchild-deadline', async t => {
     const { root } = fixture(t); const pidFile = path.join(root, 'grandchild_codex.json');
-    const script = 'const {spawn}=require("node:child_process");const fs=require("node:fs");const c=spawn(process.execPath,["-e","setTimeout(()=>{},3000)"],{stdio:["ignore","inherit","inherit"]});fs.writeFileSync(process.argv[1],JSON.stringify({pid:c.pid}));setInterval(()=>{},1000);';
+    // The grandchild holds the inherited output pipe far longer than the
+    // deadline plus its bounded settlement, so returning within that bound
+    // proves the runner does not wait for the pipe. The deadline leaves the
+    // two node startups ample time to record the grandchild under CPU load.
+    const grandchildLifetimeMs = 120000; const deadlineMs = 3000; const settlementBoundMs = 4000;
+    const script = `const {spawn}=require("node:child_process");const fs=require("node:fs");const c=spawn(process.execPath,["-e","setTimeout(()=>{},${grandchildLifetimeMs})"],{stdio:["ignore","inherit","inherit"]});fs.writeFileSync(process.argv[1],JSON.stringify({pid:c.pid}));setInterval(()=>{},1000);`;
     let pid = null;
     t.after(() => { if(pid)try{process.kill(pid,'SIGKILL')}catch(e){if(e.code!=='ESRCH')throw e;} });
     const start = Date.now();
-    const result = await runBoundedProcess(process.execPath, ['-e', script, pidFile], { cwd: root, env: { PATH: process.env.PATH }, deadlineMs: 200 });
+    const result = await runBoundedProcess(process.execPath, ['-e', script, pidFile], { cwd: root, env: { PATH: process.env.PATH }, deadlineMs });
     const elapsed = Date.now() - start;
     if (fs.existsSync(pidFile)) pid = JSON.parse(fs.readFileSync(pidFile)).pid;
-    assert.equal(result.timedOut, true); assert.ok(elapsed < 1500, `elapsed ${elapsed} ms`); assert.ok(pid);
+    assert.equal(result.timedOut, true); assert.ok(pid, 'the grandchild started before the deadline');
+    assert.ok(elapsed < deadlineMs + settlementBoundMs && elapsed < grandchildLifetimeMs / 2, `elapsed ${elapsed} ms`);
     let alive = true;
     for(let i=0;i<30;i++){
         try{process.kill(pid,0);if(process.platform==='linux'&&/^\d+ \(.*\) Z /.test(fs.readFileSync('/proc/'+pid+'/stat','utf8')))alive=false;}
