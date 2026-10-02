@@ -2477,3 +2477,50 @@ test('G.every-final-generation-gpu', async (t) => {
         generations: 2,
     });
 });
+
+// A gate requested only through the environment (saved gate off) must wire
+// the MPS tools into the replacement Box for restart and update exactly as
+// start does; the saved gate would build a Box without them.
+for (const [operation, invoke] of [
+    ['restart', (supervisor) => supervisor.runRestartTransaction(['restart'])],
+    ['update', (supervisor) => supervisor.runUpdateTransaction(['update'], { restartAfterUpdate: true })],
+]) {
+    test(`M6.${operation}-wires-mps-from-requested-gate`, async (t) => {
+        const box = graphBox(t);
+        const home = useTempHome(t, box.root);
+        useFakeHostFiles(t, fakeHost());
+        const { createHardwareGateStore } = await import('../../ploinky-box/hardwareLimitsGate.mjs');
+        const gateStore = createHardwareGateStore({ homeDirectory: home });
+        gateStore.write(box.identity, false, box.lock);
+        const toolsRoot = path.join(box.root, 'mps-tools'); fs.mkdirSync(toolsRoot);
+        for (const destination of Object.values(MPS_TOOL_PATHS)) fs.writeFileSync(path.join(toolsRoot, path.basename(destination)), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+        const tools = discoverMpsTools({ directories: [toolsRoot] });
+        const events = [];
+        const requested = [];
+        const supervisor = gpuSupervisor(box, events, {
+            env: { PLOINKY_BOX_HARDWARE_LIMITS: 'on' },
+            gpuGrantStore: memoryGpuStore(events, Object.freeze({ vendor: 'nvidia', agents: [AGENT], admitted: null })),
+            hardwareGateStore: gateStore,
+            discoverGpuMpsTools: () => tools,
+            selectAgentLib: async () => ({ selection: box.agentLib, mode: 'local' }),
+            updateAgentLib: async () => ({ selection: box.agentLib, changed: false, previous: null }),
+            updateWorkspacePloinky: async () => ({ found: false }),
+            commitAgentLibSelection: () => {},
+            revalidateAgentLibSource: () => {},
+            captureCoreStartArgv: () => ['start', 'explorer', '8080'],
+            runCoreCommand: async () => { events.push('core'); },
+            validateExistingImage: () => ({ immutableId: `sha256:${'b'.repeat(64)}` }),
+            validateContainer: () => {},
+            async reconcile(options) {
+                requested.push(options.gpu);
+                return { ...prepared(box, 'replaced', options.gpu, events), hardware: options.hardware };
+            },
+            async startCore() { events.push('start-core'); },
+            async healthCheck() { events.push('health'); },
+            prepareHardwareGeneration: async () => ({ structurallyPrepared: true }),
+        });
+        await invoke(supervisor);
+        assert.ok(requested.length >= 1, `${operation}: ${events.join(' ')}`);
+        for (const gpu of requested) assert.deepEqual(gpu?.mps, tools, `${operation} wires both MPS tools from the requested gate`);
+    });
+}

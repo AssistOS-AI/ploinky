@@ -326,6 +326,8 @@ export function createBoxSupervisor({
         writableSources: [identity.workspaceRoot, ...Object.values(identity.dataPaths || {})],
     }),
     discoverGpuDevices = discoverGpu,
+    // MPS tool discovery for gate-on GPU wiring; the GPU module's default.
+    discoverGpuMpsTools = undefined,
     scanGpuAgents = declaredGpuAgents,
     countNoWaitWorkers = null,
     waitDelay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
@@ -414,6 +416,7 @@ export function createBoxSupervisor({
         const declared = scanGpuAgents(identity.workspaceRoot);
         const desired = resolveDesiredGpuWiring(identity, saved, declared, {
             discover: discoverGpuDevices,
+            ...(discoverGpuMpsTools ? { discoverMps: discoverGpuMpsTools } : {}),
             homeDirectory: gpuGrantStore.homeDirectory,
                 mpsEnabled,
         });
@@ -1178,7 +1181,7 @@ export function createBoxSupervisor({
             const priorCoreStartArgv = captureCoreStartArgv(identity);
             const priorSkillScopeEnv = readGraphSkillScope(identity);
             const { desired: routerBinding } = selectSavedRouterBinding(identity);
-            const { saved: savedGpuGrant, desired: gpu } = selectSavedGpuWiring(identity);
+            const { saved: savedGpuGrant, desired: gpu } = selectSavedGpuWiring(identity, hardwareGate.enabled);
             const { selection } = await selectAgentLib({
                 workspaceRoot: identity.workspaceRoot,
                 branchPolicy: options.branchPolicy || null,
@@ -1360,7 +1363,7 @@ export function createBoxSupervisor({
             const priorCoreStartArgv = captureCoreStartArgv(identity);
             const priorSkillScopeEnv = readGraphSkillScope(identity);
             const { desired: routerBinding } = selectSavedRouterBinding(identity);
-            const { saved: savedGpuGrant, desired: gpu } = selectSavedGpuWiring(identity);
+            const { saved: savedGpuGrant, desired: gpu } = selectSavedGpuWiring(identity, hardwareGate.enabled);
             const workspacePloinky = await updateWorkspacePloinky({
                 identity,
                 lock,
@@ -2124,6 +2127,7 @@ export function createBoxSupervisor({
             const declared = scanGpuAgents(identity.workspaceRoot);
             const gpu = resolveDesiredGpuWiring(identity, next, declared, {
                 discover: discoverGpuDevices,
+                ...(discoverGpuMpsTools ? { discoverMps: discoverGpuMpsTools } : {}),
                 homeDirectory: gpuGrantStore.homeDirectory,
                 mpsEnabled: hardwareGateStore.read(identity)?.enabled === true,
                 strict: true,
@@ -2158,6 +2162,7 @@ export function createBoxSupervisor({
             const declared = scanGpuAgents(identity.workspaceRoot);
             const gpu = resolveDesiredGpuWiring(identity, next, declared, {
                 discover: discoverGpuDevices,
+                ...(discoverGpuMpsTools ? { discoverMps: discoverGpuMpsTools } : {}),
                 homeDirectory: gpuGrantStore.homeDirectory,
                 mpsEnabled: hardwareGateStore.read(identity)?.enabled === true,
             });
@@ -2170,6 +2175,7 @@ export function createBoxSupervisor({
                 try {
                     return resolveDesiredGpuWiring(identity, null, declared, {
                         discover: discoverGpuDevices,
+                        ...(discoverGpuMpsTools ? { discoverMps: discoverGpuMpsTools } : {}),
                         homeDirectory: gpuGrantStore.homeDirectory,
                 mpsEnabled: hardwareGateStore.read(identity)?.enabled === true,
                     });
@@ -2222,6 +2228,7 @@ export function createBoxSupervisor({
         const access = effectiveGpuAccess(saved, declared);
         const desired = resolveDesiredGpuWiring(identity, saved, declared, {
             discover: discoverGpuDevices,
+            ...(discoverGpuMpsTools ? { discoverMps: discoverGpuMpsTools } : {}),
             homeDirectory: gpuGrantStore.homeDirectory,
                 mpsEnabled: hardwareGateStore.read(identity)?.enabled === true,
         });
