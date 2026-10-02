@@ -3483,7 +3483,7 @@ button.wa-upload-directory-entry.folder:hover {
 .wa-task-status.is-running { color: #3486eb; }
 .wa-task-status.is-cancelling { color: #d89b19; }
 .wa-task-status.is-finished { color: var(--wa-online); }
-.wa-task-status.is-stopped { color: var(--wa-text-secondary); }
+.wa-task-status.is-paused { color: var(--wa-text-secondary); }
 .wa-task-status.is-error { color: #f15c6d; }
 .wa-task-status.is-unavailable { color: var(--wa-text-muted); }
 
@@ -3740,7 +3740,7 @@ button.wa-upload-directory-entry.folder:hover {
     font-size: 12px;
 }
 
-.wa-task-stop {
+.wa-task-pause {
     padding: 5px 10px;
     border: 1px solid #f15c6d;
     border-radius: 8px;
@@ -3752,11 +3752,11 @@ button.wa-upload-directory-entry.folder:hover {
     font-weight: 700;
 }
 
-.wa-task-stop:hover:not(:disabled) {
+.wa-task-pause:hover:not(:disabled) {
     background: rgba(241, 92, 109, 0.12);
 }
 
-.wa-task-stop:disabled {
+.wa-task-pause:disabled {
     cursor: progress;
     opacity: 0.6;
 }
