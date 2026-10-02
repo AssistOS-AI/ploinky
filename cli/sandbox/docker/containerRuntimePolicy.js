@@ -73,8 +73,22 @@ function validateResources(resources, label) {
     if (resources.memory !== undefined && !SIZE_RE.test(String(resources.memory))) {
         throw new RuntimePolicyError(`${label}.memory: invalid size value`);
     }
+    // A limit is a representable, non-zero amount: an overflowing or zero
+    // value must never read as "no limit" downstream.
+    if (resources.memory !== undefined) {
+        const bytes = sizeBytes(resources.memory);
+        if (!Number.isSafeInteger(bytes) || bytes < 1) {
+            throw new RuntimePolicyError(`${label}.memory: must be a size from 1 byte to ${Number.MAX_SAFE_INTEGER} bytes`);
+        }
+    }
     if (resources.cpus !== undefined && !CPU_RE.test(String(resources.cpus))) {
         throw new RuntimePolicyError(`${label}.cpus: invalid CPU value`);
+    }
+    if (resources.cpus !== undefined) {
+        const quota = Math.round(Number(resources.cpus) * 100000);
+        if (!Number.isFinite(Number(resources.cpus)) || !Number.isSafeInteger(quota) || quota < 1) {
+            throw new RuntimePolicyError(`${label}.cpus: must be a positive CPU count of at least 0.00001 with a representable quota`);
+        }
     }
     if (resources.shmSize !== undefined) {
         const bytes = sizeBytes(resources.shmSize);

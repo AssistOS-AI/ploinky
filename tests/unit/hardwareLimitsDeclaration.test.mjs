@@ -780,3 +780,51 @@ test('HD.deprecation-warning-sanitizes-the-agent-ref', () => {
     declared.warnDeprecatedHardwareDeclarations(manifest, 'demo/other-agent.v2');
     assert.match(messages[1], /^\[hardware-limits\] demo\/other-agent\.v2: /);
 });
+
+// A declared limit is a representable, non-zero amount on every declaration
+// path: an overflowing or zero value is refused at validation, before any
+// placement, so it can never read as "no limit" in the hash, the readback or
+// the reuse decision.
+test('HD.unrepresentable-or-zero-limits-are-refused-on-every-path', () => {
+    captureWarnings();
+    const invalid = [
+        ['memory', '9007199254740992'], ['memory', '18014398509481984'], ['memory', `${'9'.repeat(70)}t`], ['memory', '0'], ['memory', 0],
+        ['cpus', '0'], ['cpus', 0], ['cpus', '9'.repeat(400)], ['cpus', '0.000001'],
+    ];
+    const paths = {
+        'manifest hardwareLimits': (field, value) => ({ manifest: NEW({ [field]: value }) }),
+        'manifest deprecated path': (field, value) => ({ manifest: OLD({ [field]: value }) }),
+        'selected profile hardwareLimits': (field, value) => ({ manifest: { ...base, profiles: { default: {}, dev: { hardwareLimits: { [field]: value } } } }, profileName: 'dev' }),
+        'default profile deprecated path': (field, value) => ({ manifest: { ...base, profiles: { default: { llmRuntime: { runtimePolicy: { resources: { [field]: value } } } }, dev: {} } }, profileName: 'dev' }),
+    };
+    for (const [field, value] of invalid) {
+        for (const [label, make] of Object.entries(paths)) {
+            const { manifest, profileName } = make(field, value);
+            for (const hardwareAdmission of ['metadata', 'strict']) {
+                assert.throws(() => admit(manifest, { profileName, hardwareAdmission }), (error) => error.name === 'RuntimePolicyError'
+                    && new RegExp(`\\.${field}: must be`).test(error.message), `${label} ${field}=${String(value).slice(0, 24)} (${hardwareAdmission})`);
+            }
+        }
+    }
+    // The largest representable memory and the smallest quota are accepted
+    // and placed with a real readback target.
+    const largest = admit(NEW({ memory: String(Number.MAX_SAFE_INTEGER), cpus: '0.00001' }), { hardwareAdmission: 'strict' }).admission;
+    assert.equal(largest.descriptor.hardwarePlacement.expected.memoryBytes, Number.MAX_SAFE_INTEGER);
+    assert.equal(largest.descriptor.hardwarePlacement.expected.cpus, '0.00001');
+    // Reuse: the graph decision never treats an unrepresentable change as unchanged.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-declaration-unsafe-'));
+    try {
+        fs.mkdirSync(path.join(root, '.ploinky'), { recursive: true });
+        fs.writeFileSync(path.join(root, '.ploinky', 'routing.json'), JSON.stringify({ port: 8080, routes: {} }));
+        const specPath = path.join(root, 'spec.json');
+        fs.writeFileSync(specPath, JSON.stringify({ markerPath, hardwareContext: serializable(prepared()), agents: [
+            { key: 'ploinky_demo_changed', ref: 'demo/changed', manifest: NEW({ memory: '18014398509481984' }), running: { manifest: NEW({ memory: '9007199254740992' }) } },
+        ] }));
+        const probe = fileURLToPath(new URL('../hardware-limits/graphReuseProbe.mjs', import.meta.url));
+        const result = spawnSync(process.execPath, [probe, specPath], { cwd: root, encoding: 'utf8', env: { ...process.env, PLOINKY_WORKSPACE_ROOT: root } });
+        assert.notEqual(result.status, 0, result.stdout);
+        assert.match(result.stderr, /\.memory: must be a size from 1 byte/);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
