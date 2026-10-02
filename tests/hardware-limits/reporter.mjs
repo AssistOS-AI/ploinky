@@ -13,6 +13,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 
 const MAX_TEXT = 2048;
+export const TEST_PATH_SEPARATOR = ' > ';
 
 function bounded(value, limit = MAX_TEXT) {
     const text = String(value ?? '');
@@ -147,9 +148,11 @@ export default async function* hardwareLimitsReporter(source) {
             stack[nesting] = name;
             stacks.set(file, stack);
         }
-        const parentName = nesting > 0 ? stack[nesting - 1] || null : null;
-        const testId = `${file}::${name}`;
-        const parentId = parentName === null ? null : `${file}::${parentName}`;
+        // A test is identified by its full ancestor path, so two leaves that
+        // share a title under different parents never overwrite each other.
+        const ancestors = stack.slice(0, nesting).map((value) => value ?? '');
+        const testId = `${file}::${[...ancestors, name].join(TEST_PATH_SEPARATOR)}`;
+        const parentId = nesting > 0 ? `${file}::${ancestors.join(TEST_PATH_SEPARATOR)}` : null;
         if (type === 'test:start') {
             yield record('start', { file, testId, parentId, payload: { name, nesting } });
             continue;

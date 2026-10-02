@@ -287,3 +287,27 @@ test('H.graphics-unknown-blocked', () => {
         { state: 'blocked', reason: 'gpu_busy', foreign: ['Xorg:777'] },
     );
 });
+
+test('H.duplicate-leaf-title-under-two-parents', async (t) => {
+    const header = "import test, { describe } from 'node:test';\n";
+    // A failing leaf followed by a passing leaf with the same title under
+    // another parent: the failure keeps its own identity and is reported.
+    const unrequired = await run(t, { 'a.test.mjs': `${header}describe('A', () => { test('leaf', () => { throw new Error('real failure'); }); });\ndescribe('B', () => { test('leaf', () => {}); });\n` });
+    assert.equal(unrequired.result.verdict, 'FAIL');
+    assert.deepEqual(unrequired.result.newFailures.map((entry) => entry.testId), ['a.test.mjs::A > leaf']);
+    assert.equal(unrequired.result.inventory.get('a.test.mjs::B > leaf'), 'pass');
+    // A required title shared by a failing and a passing leaf never passes.
+    for (const order of [['throw new Error(\'required broken\')', ''], ['', 'throw new Error(\'required broken\')']]) {
+        const { result } = await run(t, { 'a.test.mjs': `${header}describe('A', () => { test('REQ.x', () => { ${order[0]} }); });\ndescribe('B', () => { test('REQ.x', () => { ${order[1]} }); });\n` },
+            { required: [requiredCase('a.test.mjs', 'REQ.x')] });
+        assert.equal(result.verdict, 'FAIL');
+        assert.equal(result.cases[0].result, 'fail');
+        assert.match(result.cases[0].reason, /ambiguous/);
+        assert.equal(result.newFailures.length, 1);
+    }
+    // A repeated identity (same title under the same parent) is a harness problem.
+    const repeated = await run(t, { 'a.test.mjs': `${header}test('leaf', () => { throw new Error('first'); });\ntest('leaf', () => {});\n` });
+    assert.equal(repeated.result.verdict, 'FAIL');
+    assert.ok(repeated.result.problems.some((problem) => /duplicate test identity: a\.test\.mjs::leaf/.test(problem)), repeated.result.problems.join('\n'));
+    assert.equal(repeated.result.newFailures.length, 1, 'the earlier failure is not replaced by the later pass');
+});

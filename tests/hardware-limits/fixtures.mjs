@@ -583,6 +583,13 @@ export function evaluateSuiteRun({
             fileFailures.push(record);
             continue;
         }
+        // Every result record has a unique full-path identity; a repeated one
+        // cannot be attributed and is a harness problem, never a later pass.
+        if (leafResults.has(record.testId)) {
+            problems.push(`duplicate test identity: ${record.testId}`);
+            const previous = leafResults.get(record.testId);
+            if (previous.result === 'fail') continue;
+        }
         leafResults.set(record.testId, { result: record.event, record });
     }
     for (const record of fileFailures) {
@@ -594,11 +601,16 @@ export function evaluateSuiteRun({
     }
     const cases = [];
     for (const entry of required) {
-        const testId = `${entry.file}::${entry.name}`;
-        const observed = leafResults.get(testId);
+        // A required case names its leaf title. It must resolve to exactly one
+        // result record; the same title under two parents is ambiguous.
+        const matches = [...leafResults.entries()].filter(([, { record }]) => record.file === entry.file && record.payload.name === entry.name);
+        const [testId, observed] = matches.length === 1 ? matches[0] : [null, null];
         let result = 'missing';
         let reason = 'required leaf was not discovered';
-        if (observed) {
+        if (matches.length > 1) {
+            result = 'fail';
+            reason = `required case title is ambiguous: ${matches.length} results share it`;
+        } else if (observed) {
             if (parents.has(testId)) {
                 result = 'fail';
                 reason = 'required case is a parent title, not a leaf';
