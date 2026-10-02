@@ -549,10 +549,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
                 throw error;
             }
         },
-    }),
-    // The agent listing's runtime observation; a test supplies its own live
-    // containers instead of querying the container engine.
-    agentListOptions = {},
+    }), agentListOptions = {}, // a test's listing observes its own live containers
 } = {}) {
     const route = parseMarketplacePath(parsedUrl.pathname || '/');
     if (!route) return false;
