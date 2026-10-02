@@ -124,3 +124,10 @@ test('MPS recovered pending observation can share an exact already-recorded iden
     const plan = planMpsTransition({ oldClients: [same], desiredClients: [same], state: { ...ready(), pendingClients: [{ ...same, phase: 'readiness' }] }, observedDaemon: { state: 'owned' }, defaultsVerified: true });
     assert.equal(plan.action, 'reuse'); assert.equal(plan.oldClients.length, 1);
 });
+
+test('MPS uncreated intent retaining predecessor CID is not a created observation', () => {
+    const applied = client('a');
+    const desired = { ...applied, share: share(50, 2048) }; delete desired.mpsGeneration;
+    const plan = planMpsTransition({oldClients:[applied],desiredClients:[desired],state:{...ready(),status:'pending',pendingClients:[{...desired,phase:'pending'}]},observedDaemon:{state:'owned'},defaultsVerified:true});
+    assert.equal(plan.oldClients.length,1); assert.deepEqual(plan.oldClients[0],applied);
+});

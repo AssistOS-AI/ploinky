@@ -50,7 +50,7 @@ export async function dispatchRemoteRun({ run, action, cwd, signal, manifestDige
         cwd, env: { PATH: '/usr/bin:/bin', HOME: process.env.HOME, SSH_AUTH_SOCK: process.env.SSH_AUTH_SOCK },
         deadlineMs: 1530000, maxBytes: 1048576, signal,
     });
-    if (result.signal || result.errorCode || result.timedOut || result.truncated || result.cancelled || ![0,1,2,3].includes(result.status)) {
+    if (result.signal || result.errorCode || result.timedOut || result.truncated || result.cancelled || result.settlementForced || ![0,1,2,3].includes(result.status)) {
         throw new Error('Remote command incomplete; retain manifest and reconcile the bounded remote runner before retrying');
     }
     let report; try { report = JSON.parse(result.stdout); } catch { throw new Error('Remote report missing or incomplete'); }

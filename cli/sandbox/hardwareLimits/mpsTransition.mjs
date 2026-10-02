@@ -32,8 +32,14 @@ export function resolveMpsServerDefault(configuredPolicies = []) {
 }
 
 export function planMpsTransition({ oldClients = [], desiredClients = [], configuredPolicies = desiredClients, selectedKeys = [], state = null, observedDaemon = { state: 'gone' }, defaultsVerified = false } = {}) {
-    const pendingCreated = (state?.pendingClients || []).filter((client) => client.share && /^[a-f0-9]{64}$/.test(String(client.containerId || '')));
-    const old = uniqueClients([...oldClients, ...(state?.oldClients || []), ...pendingCreated]);
+    const observedOld = uniqueClients([...oldClients, ...(state?.oldClients || [])]);
+    const pendingCreated = (state?.pendingClients || []).filter((client) => client.phase === 'readiness' && client.share && /^[a-f0-9]{64}$/.test(String(client.containerId || ''))).map((client) => {
+        if (client.mpsGeneration) return client;
+        const observed = observedOld.find((value) => clientIdentity(value) === clientIdentity(client) && value.ref === client.ref && isDeepStrictEqual(value.share, client.share));
+        if (!observed?.mpsGeneration) throw new MpsError('A pending created client lacks a verified MPS generation');
+        return { ...client, mpsGeneration: observed.mpsGeneration };
+    });
+    const old = uniqueClients([...observedOld, ...pendingCreated]);
     const desired = uniqueClients(desiredClients);
     const keys = new Set(selectedKeys);
     const targetDefault = resolveMpsServerDefault(configuredPolicies);

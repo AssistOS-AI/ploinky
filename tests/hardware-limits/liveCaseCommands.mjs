@@ -52,7 +52,7 @@ export function assertCoreLayout(value) {
 }
 
 export function validateProbe(result, { maxMiB, uid = 1000 } = {}) {
-    if (result.status!==0 || result.signal || result.errorCode || result.timedOut || result.truncated || result.cancelled) throw new Error('CUDA probe transport failed');
+    if (result.status!==0 || result.signal || result.errorCode || result.timedOut || result.truncated || result.cancelled || result.settlementForced) throw new Error('CUDA probe transport failed');
     let value;try{value=JSON.parse(result.stdout);}catch{throw new Error('CUDA probe JSON invalid');}
     if (!value?.ok || value.status!=='complete' || value.containerUid!==uid || !Number.isSafeInteger(value.containerPid) || value.containerPid<=0
         || !Number.isSafeInteger(value.smCount) || value.smCount<=0 || !Number.isSafeInteger(value.allocatedMiB) || value.allocatedMiB<0
