@@ -34,7 +34,11 @@ test('deployed-settings keeps its preflight before any browser dependency is loa
 
 test('deployed-settings fails before any write unless the user can administer robots, and cleans up what it created', () => {
     assert.match(source, /canAdmin === true/);
-    assert.ok(source.indexOf('canAdmin === true') < source.indexOf("tool: 'write_file'"), 'the admin check must precede every write');
+    const admin = source.indexOf('canAdmin === true');
+    for (const write of ['await createDirectory(', "tool: 'create_directory'", "tool: 'write_file'", "method: 'POST'"]) {
+        assert.ok(source.includes(write), `the check must contain the write ${write}`);
+        assert.ok(admin < source.indexOf(write), `the admin check must precede every write, including ${write}`);
+    }
     assert.match(source, /skillsets\?name=/, 'the run-owned repository must be deleted by name');
     assert.ok(source.indexOf('skillsets?name=') < source.lastIndexOf('deleteDirectoryIfPresent('), 'the repository is deleted before the folder');
     assert.match(source, /registeredRepository/);
@@ -46,6 +50,8 @@ test('deployed-settings asserts the conversation API traffic and the page probes
     assert.match(source, /x-ploinky-browser-csrf-token/);
     assert.match(source, /\['GET', 'PATCH'\]/);
     assert.match(source, /search === ''|search, ''/);
+    assert.match(source, /call\.phase === 'conversation-settings-open'/, 'the first load after the WebChat link must be recorded');
+    assert.ok(!source.includes('skillsPages'), 'requests are classified by frame URL, not by pages registered after the helper returns');
     assert.match(source, /not-a-uuid/);
     assert.match(source, /status, 409/);
     assert.match(source, /The conversation skills link is invalid\. Open Conversation skills from the chat menu again\./);

@@ -65,7 +65,6 @@ const context = await browser.newContext({ baseURL: baseURL.origin, viewport: { 
 context.setDefaultTimeout(30_000);
 context.setDefaultNavigationTimeout(60_000);
 const page = await context.newPage();
-const skillsPages = new Set();
 let dashboard;
 let copilotPage;
 let settingsPage;
@@ -78,9 +77,14 @@ async function receipt() {
 }
 function observeRequest(request) {
     let url;
-    let origin;
-    try { url = new URL(request.url()); origin = request.frame()?.page(); } catch { return; }
-    if (!skillsPages.has(origin)) return;
+    let fromSkillsPage;
+    // Classify by the frame's URL, not by a page registered after the helper returns: the helper returns only after the
+    // page has loaded its catalog, so its first GET would otherwise be missed.
+    try {
+        url = new URL(request.url());
+        fromSkillsPage = new URL(request.frame().url()).pathname.startsWith(`${ROBOTEAM_BASE_PATH}conversation-skills/`);
+    } catch { return; }
+    if (!fromSkillsPage) return;
     if (url.pathname.endsWith('/mcp') && request.method() === 'POST') evidence.roboTeamPageMcpRequests += 1;
     if (!/\/api\/robots\/[^/]+\/conversations\/[^/]+\/skills$/.test(url.pathname)) return;
     let bodyKeys = null;
@@ -157,7 +161,6 @@ try {
 
     phase = 'conversation-settings-open';
     settingsPage = await openConversationSkills(copilotPage);
-    skillsPages.add(settingsPage);
     const target = conversationFromSkillsURL(settingsPage.url(), baseURL.origin, { robotId });
     evidence.conversation = target;
     await copilotPage.screenshot({ path: path.join(output, 'webchat-after-conversation-skills.png') });
@@ -201,7 +204,8 @@ try {
 
     phase = 'api-evidence';
     const calls = evidence.conversationApiRequests;
-    assert.ok(calls.some(call => call.method === 'GET'), 'The page must read the conversation through the conversation API.');
+    assert.ok(calls.some(call => call.method === 'GET' && call.phase === 'conversation-settings-open'),
+        'The first load that follows the WebChat link must read the conversation through the conversation API.');
     const patches = calls.filter(call => call.method === 'PATCH');
     assert.ok(patches.length >= 2, 'Enabling and disabling must each send one PATCH.');
     for (const call of calls) {
