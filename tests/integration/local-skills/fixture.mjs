@@ -161,7 +161,11 @@ export async function fixture(t, { robotName = 'acceptance' } = {}) {
     const callTool = async (name, input) => {
         const declared = declaredToolCall(name);
         declared.validate(input);
-        return skillCatalogRequest({ skillsets: service, robot: await store.get(robot.id), input, mutate: declared.mutate });
+        // The tool process resolves its robot by name (prepareCopilotContext(input.robot || 'default')).
+        const requested = input.robot || 'default';
+        const target = await store.getByName(requested);
+        if (!target) throw new Error(`Robot not found: ${requested}`);
+        return skillCatalogRequest({ skillsets: service, robot: target, input, mutate: declared.mutate });
     };
     // The settings surface sends the declared tool inputs. The robot and conversation are inputs the tools declare, so the
     // tests pass them explicitly. RoboTeam's WebChat Conversation skills action is not part of this contract: no Explorer

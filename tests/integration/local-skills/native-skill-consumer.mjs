@@ -20,7 +20,7 @@ const { ACHILLES_PRIVATE_DIRECTORY_NAME } = await import(pathToFileURL(path.join
 const args = process.argv.slice(2);
 // ALA no longer accepts skill catalog options; the real parser rejects any unknown option RoboTeam might still forward.
 const options = parseArguments(args);
-const { sessionId: id, home, cwd, agent } = options;
+const { sessionId: id, cwd, agent } = options;
 assert.deepEqual(options.ignoredPaths, [path.resolve(cwd, ACHILLES_PRIVATE_DIRECTORY_NAME)], 'the private workspace directory must be masked');
 assert.ok(options.folders.some((folder) => folder.alias === 'ploinky-runtime'), 'the generic runtime mount must be supplied');
 assert.ok(options.controlStdin);
@@ -34,7 +34,10 @@ assert.equal(sessionsRoot, path.join(cwd, ACHILLES_PRIVATE_DIRECTORY_NAME, '.ala
 const sessionState = await openSessionState({ id, sessionsRoot, resume: Boolean(options.resumeSession) });
 const recorder = createTranscriptRecorder(sessionState, options.turnId);
 if (!options.resumeSession) await sessionState.save({ agent, continuation: { threadId: randomUUID() } });
-const session = { id, sessionsRoot, agent: sessionState.record.agent, continuation: sessionState.record.continuation };
+// What RoboTeam passed for this turn, beside the transcript's continuation. The test compares it across turns, so a changed
+// home, folder or backend is detected.
+const session = { id, home: options.home, cwd: options.cwd, backend: agent, sessionsRoot,
+    agent: sessionState.record.agent, continuation: sessionState.record.continuation };
 await recorder.user(userMessage);
 const emit = (event) => process.stderr.write(`@@ALA_EVENT@@${JSON.stringify(event)}\n`);
 async function consume() {
