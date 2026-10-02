@@ -35,7 +35,9 @@
 //   top-level process, which exits non-zero when the ledger is not empty.
 // - One temporary root per top-level guarded process holds every stub
 //   directory of its descendants; the top-level process removes it on exit
-//   and on SIGINT, SIGTERM and SIGHUP before re-raising.
+//   and on SIGINT, SIGTERM and SIGHUP before re-raising; a root whose owner
+//   died without an exit event (a fatal error in the test runner, SIGKILL) is
+//   removed by the next top-level guard in the same temporary directory.
 // A test-owned fake executable at an absolute path under the test temporary
 // directory is not a real engine and is allowed, unless its realpath or inode
 // is a real guarded binary.
@@ -113,7 +115,26 @@ const inheritedLog = process.env[TOP_LOG_ENV] || '';
 const isTop = !(inheritedRoot && inheritedLog && fs.existsSync(inheritedRoot) && fs.existsSync(inheritedLog));
 const guardRoot = isTop ? fs.mkdtempSync(path.join(temporaryRoot, 'engine-guard-')) : inheritedRoot;
 const topLog = isTop ? path.join(guardRoot, 'violations.log') : inheritedLog;
-if (isTop) fs.writeFileSync(topLog, '', { mode: 0o600 });
+if (isTop) {
+    fs.writeFileSync(topLog, '', { mode: 0o600 });
+    fs.writeFileSync(path.join(guardRoot, 'owner.pid'), String(process.pid), { mode: 0o600 });
+    // A process that dies without its exit event (a fatal error inside the test
+    // runner, SIGKILL) cannot remove its root: the next top-level guard in the
+    // same temporary directory removes roots whose recorded owner is gone.
+    // Only roots that name their owner, and only when it is provably dead.
+    try {
+        for (const name of fs.readdirSync(temporaryRoot)) {
+            if (!/^engine-guard-[A-Za-z0-9]+$/.test(name)) continue;
+            const stale = path.join(temporaryRoot, name);
+            if (stale === guardRoot) continue;
+            let owner;
+            try { owner = Number(fs.readFileSync(path.join(stale, 'owner.pid'), 'utf8')); } catch (_) { continue; }
+            if (!Number.isSafeInteger(owner) || owner < 2) continue;
+            try { process.kill(owner, 0); continue; } catch (error) { if (error?.code !== 'ESRCH') continue; }
+            fs.rmSync(stale, { recursive: true, force: true });
+        }
+    } catch (_) {}
+}
 const ownDirectory = isTop ? guardRoot : fs.mkdtempSync(path.join(guardRoot, 'p-'));
 const ownViolations = [];
 

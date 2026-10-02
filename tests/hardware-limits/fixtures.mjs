@@ -266,7 +266,7 @@ export function buildRequiredCaseManifest() {
             'EG.descendants-and-worker-threads-are-guarded-through-an-explicit-environment',
             'EG.a-violating-child-killed-by-a-signal-still-fails-the-top-level-suite',
             'EG.a-bare-name-resolving-first-to-a-test-owned-fake-is-allowed', 'EG.the-top-level-removes-its-temporary-root-on-exit-and-on-sigterm',
-            'EG.a-sigkilled-descendant-with-an-explicit-env-leaves-nothing-behind',
+            'EG.a-sigkilled-descendant-with-an-explicit-env-leaves-nothing-behind', 'EG.a-root-left-by-a-dead-owner-is-removed-by-the-next-top-level-guard',
         ]),
         ...leaves(P, 's0', unit('hardwareLimitsLiveHarness.test.mjs'), ['HLIVE.R16-inherited-pipe-grandchild-deadline']),
         ...leaves(P, 'p0', unit('hardwareLimitsAdmission.test.mjs'), [

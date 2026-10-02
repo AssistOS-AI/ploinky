@@ -348,6 +348,26 @@ test('EG.the-top-level-removes-its-temporary-root-on-exit-and-on-sigterm', async
     assert.deepEqual(guardRoots(killed), [], 'a SIGTERM leaves no root');
 });
 
+// A root whose owner died without its exit event is removed by the next
+// top-level guard in the same temporary directory; a root of a live owner, one
+// that names no owner and any other directory are left alone.
+test('EG.a-root-left-by-a-dead-owner-is-removed-by-the-next-top-level-guard', async (t) => {
+    const w = world(t);
+    const tmp = path.join(w.root, 'sweep-tmp'); fs.mkdirSync(tmp);
+    const dead = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' });
+    const deadPid = String(dead.stdout);
+    const make = (name, owner) => { const dir = path.join(tmp, name); fs.mkdirSync(dir); fs.writeFileSync(path.join(dir, 'violations.log'), 'x\n'); if (owner !== null) fs.writeFileSync(path.join(dir, 'owner.pid'), owner); return dir; };
+    const staleDead = make('engine-guard-deadOwner1', deadPid);
+    const liveOwner = make('engine-guard-liveOwner1', String(process.pid));
+    const noOwner = make('engine-guard-noOwner0001', null);
+    const garbage = make('engine-guard-garbage001', 'not-a-pid');
+    const other = path.join(tmp, 'unrelated-directory'); fs.mkdirSync(other);
+    const result = await runGuardedTop({ tmp, program: 'process.exit(0)' });
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(fs.existsSync(staleDead), false, 'the dead owner\'s root is removed');
+    for (const kept of [liveOwner, noOwner, garbage, other]) assert.equal(fs.existsSync(kept), true, `${path.basename(kept)} is left alone`);
+});
+
 test('EG.a-sigkilled-descendant-with-an-explicit-env-leaves-nothing-behind', async (t) => {
     const w = world(t);
     const tmp = path.join(w.root, 'top-tmp'); fs.mkdirSync(tmp);
