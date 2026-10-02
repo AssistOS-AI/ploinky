@@ -268,6 +268,8 @@ export function buildRequiredCaseManifest() {
             'EG.system-binaries-are-not-refused-by-a-number-rounded-inode',
             'EG.a-node-child-is-guarded-through-the-inherited-environment-and-after-env-i',
             'EG.an-eval-worker-with-module-syntax-is-guarded',
+            'EG.an-opted-in-login-shell-is-judged-by-name-alone',
+            'EG.a-guarded-path-inside-a-longer-argument-is-not-a-command-for-an-unlisted-program',
             'EG.hidden-names-reach-the-path-stubs-through-every-environment-rewrite',
             'EG.descendants-and-worker-threads-are-guarded-through-an-explicit-environment',
             'EG.a-violating-child-killed-by-a-signal-still-fails-the-top-level-suite',

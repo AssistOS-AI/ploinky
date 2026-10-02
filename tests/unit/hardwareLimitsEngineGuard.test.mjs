@@ -277,6 +277,51 @@ test('EG.login-shells-are-refused-outright', async (t) => {
     assert.equal(allowed.canaryRuns, 0);
 });
 
+// A test file that runs a real login shell on purpose opts in; the shell is then
+// judged by name alone.
+test('EG.an-opted-in-login-shell-is-judged-by-name-alone', async (t) => {
+    const w = world(t);
+    const optIn = { PLOINKY_ENGINE_GUARD_ALLOW_LOGIN_SHELLS: '1' };
+    const withFake = (body) => `const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-bin-')); fs.writeFileSync(path.join(dir, CANARY), '#!/bin/sh\\nexit 0\\n', { mode: 0o755 }); const env = { ...process.env, PATH: dir + ':' + SENTINEL_BIN + ':/usr/bin:/bin' }; ${body}`;
+    const allowed = await w.probe('login-opt-in-allowed', [
+        ['login shell with nothing guarded', exec("'/bin/sh'", ['-lc', 'echo ok'])],
+        ['login bash with nothing guarded', exec("'/bin/bash'", ['-lc', 'true'], "{ stdio: 'pipe', env: { PATH: '/usr/bin:/bin' } }")],
+    ], { extraEnv: optIn });
+    for (const id of ['login shell with nothing guarded', 'login bash with nothing guarded']) assert.equal(allowed.marked[id], 'not-refused', `${id}: ${allowed.messages[id]}`);
+    assert.equal(allowed.result.verdict, 'PASS');
+    const forms = [
+        ['guarded name in the script', exec("'/bin/sh'", ['-lc', `${CANARY} ps`])],
+        ['hidden name with a guarded word', exec("'/bin/bash'", ['-lc', `x=${CANARY}; "$x" ps`], "{ stdio: 'pipe', env: { PATH: '/usr/bin:/bin' } }")],
+        ['guarded word in an argument', exec("'/bin/bash'", ['-lc', 'exec "$@"', 'bash', CANARY, 'ps'])],
+        ['a fake first on the caller PATH grants nothing', withFake(`cp.execFileSync('/bin/bash', ['-lc', ${JSON.stringify(`${CANARY} ps`)}], { stdio: 'pipe', env });`)],
+        ['guarded absolute path in the script', exec("'/bin/sh'", ['-lc', `${w.sentinel} ps`])],
+    ];
+    const refused = await w.probe('login-opt-in-refused', forms, { extraEnv: optIn });
+    assertRefused(refused, forms.map(([id]) => id), 'opted-in login shells');
+    // Without the opt-in the same harmless shell is refused.
+    const off = await w.probe('login-opt-out', [['login shell with nothing guarded', exec("'/bin/sh'", ['-lc', 'echo ok'])]]);
+    assertRefused(off, ['login shell with nothing guarded'], 'login shell without the opt-in');
+});
+
+// A guarded path that is only mentioned inside a longer argument (a script given
+// to an interpreter, a JSON document) is data, not a command operand.
+test('EG.a-guarded-path-inside-a-longer-argument-is-not-a-command-for-an-unlisted-program', async (t) => {
+    const w = world(t);
+    const allowed = await w.probe('embedded-data', [
+        ['path inside a node script', exec("process.execPath", ['--input-type=module', '-e', `const descriptor = { source: ${JSON.stringify(w.sentinel)}, destination: '/usr/bin/${CANARY}' }; void descriptor;`])],
+        ['path inside a JSON argument', exec("'/usr/bin/true'", ['--json', `{"tool":"/usr/bin/${CANARY}"}`])],
+    ]);
+    for (const id of ['path inside a node script', 'path inside a JSON argument']) assert.equal(allowed.marked[id], 'not-refused', `${id}: ${allowed.messages[id]}`);
+    assert.equal(allowed.result.verdict, 'PASS');
+    assert.equal(allowed.canaryRuns, 0);
+    // An argument that IS the path is an operand and is refused; so is an embedded path for a launcher.
+    const refused = [
+        ['operand that is the path', exec("'/usr/bin/true'", [w.sentinel, 'ps'])],
+        ['launcher with an embedded path', exec("'/usr/bin/caffeinate'", ['-i', `x ${w.sentinel}`])],
+    ];
+    assertRefused(await w.probe('embedded-operands', refused), refused.map(([id]) => id), 'operands');
+});
+
 // A fake runtime first on the caller's PATH grants nothing once the invocation
 // replaces that PATH: the name is judged by the PATH the command really
 // resolves through, or by name alone when that PATH is not knowable.

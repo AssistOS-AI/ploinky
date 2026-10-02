@@ -27,11 +27,17 @@
 //   `sandbox-exec -p '...' sh -c 'cd /x && podman ps'` is caught. Launchers
 //   (LAUNCHERS: caffeinate, arch, sandbox-exec, bwrap, unshare, su, ...) run a
 //   command named in their argv, so a bare guarded word anywhere in their
-//   argv is refused too.
+//   argv is refused too. A guarded path embedded in a longer argument (a
+//   script given to `node -e`, a JSON document) is data and is not refused for
+//   a program that is not a launcher.
 // - Login shells (-l, --login, a cluster containing l, argv0 starting with
 //   "-", `-o login`, `exec -l` and `exec -a -NAME`) are refused outright: their
 //   profile rebuilds PATH after any injection and can run anything, so neither
-//   a script nor a PATH can be judged.
+//   a script nor a PATH can be judged. A test file that runs a real login
+//   shell on purpose (production `sh -lc` code under test) may set
+//   PLOINKY_ENGINE_GUARD_ALLOW_LOGIN_SHELLS=1: such a shell is then judged by
+//   name alone (a guarded word anywhere in its script or arguments is refused
+//   and no fake on any PATH grants anything).
 // - A bare name is judged against the PATH it would really resolve through. A
 //   test-owned fake first on the caller's PATH is allowed only when nothing
 //   in the invocation replaces that PATH: a PATH assignment in a shell line
@@ -92,6 +98,9 @@ import { fileURLToPath } from 'node:url';
 
 export const GUARDED_PROGRAMS = Object.freeze(['podman', 'podman-remote', 'docker', 'nvidia-smi', 'nvidia-cuda-mps-control', 'nvidia-cuda-mps-server', 'ssh', 'scp']);
 const EXTRA_ENV = 'PLOINKY_ENGINE_GUARD_EXTRA_PROGRAMS';
+// Read at each call: a test file that runs a real login shell on purpose (a
+// production `sh -lc` under test) sets it to 1 before spawning it.
+const LOGIN_OPT_IN = 'PLOINKY_ENGINE_GUARD_ALLOW_LOGIN_SHELLS';
 const TOP_LOG_ENV = 'PLOINKY_ENGINE_GUARD_TOP_LOG';
 const ROOT_ENV = 'PLOINKY_ENGINE_GUARD_ROOT';
 const TEMP_ENV = 'PLOINKY_ENGINE_GUARD_TEMP';
@@ -399,9 +408,16 @@ function inspect(program, argv, depth = 0, context = {}) {
 // as a new invocation with the words after it (so its script is read and a
 // login shell is refused); a launcher also refuses a bare guarded word.
 function inspectUnlisted(base, argv, depth) {
+    // An argument that IS a guarded path is a command operand (`caffeinate -i
+    // /abs/podman ps`); a path merely mentioned inside a longer text (a script
+    // handed to an interpreter, a JSON document) is data, not a command.
     for (const word of argv) {
-        const found = scanPaths(word);
-        if (found) return { hit: found, argv };
+        const text = unquote(word);
+        if (text.includes('/') && guardedWord(text)) return { hit: text, argv };
+        if (LAUNCHERS.has(base)) {
+            const found = scanPaths(word);
+            if (found) return { hit: found, argv };
+        }
     }
     for (let index = 0; index < argv.length; index += 1) {
         const word = unquote(argv[index]);
@@ -449,9 +465,16 @@ function inspectShell(argv, depth, context) {
     // A login shell's profile rebuilds PATH after any injection and can run
     // anything (a directory prepended to PATH, a script file): it cannot be
     // judged, so it is refused outright.
-    if (login) return { hit: `${lower(context.shellName || 'sh')} (login shell)`, argv };
+    if (login && process.env[LOGIN_OPT_IN] !== '1') return { hit: `${lower(context.shellName || 'sh')} (login shell)`, argv };
+    // A test file that opted in (it runs a real login shell on purpose) is held
+    // to a stricter name-only reading: no fake on any PATH grants anything, and
+    // a guarded word anywhere in the script or arguments is refused.
+    if (login) {
+        const found = withSearchPath(NAME_ONLY, () => scanAnyGuarded([script, ...positional].join(' ')));
+        if (found) return { hit: found, argv };
+    }
     if (!command) return { hit: null, argv };
-    const found = lineHit(script, depth + 1) || scanPaths(script);
+    const found = withSearchPath(login ? NAME_ONLY : analysedPath, () => lineHit(script, depth + 1) || scanPaths(script));
     if (found) return { hit: found, argv };
     // Positional parameters ($0 first) feed `"$@"`, `$1` and friends: analyse
     // them as a command when the script uses them, and refuse a guarded word.
