@@ -609,6 +609,7 @@ export function buildRequiredCaseManifest() {
             'Y4.a-standalone-cleanup-journals-the-helper-stop-as-skipped-with-its-reason-and-still-proves-identity',
             'Y4.a-failed-identity-proof-stays-at-intent-and-nothing-after-it-runs',
             'W1.the-runner-classifies-the-sm-reply-with-the-products-strict-decimal-grammar',
+            'W2.a-p1-pass-copies-the-journaled-readback-into-its-case-artifact',
         ]),
         ...leaves(P, 'p4', unit('hardwareLimitsLiveProvision.test.mjs'), ['G1.prepare-live-apparatus-mps-concrete-manifest-and-summary']),
         ...leaves(P, 'p4', unit('hardwareLimitsMps.test.mjs'), [
@@ -646,7 +647,7 @@ export function buildRequiredCaseManifest() {
             'AC.the-first-share-names-each-failing-step-with-class-code-message-and-the-generic-fix',
             'AC.a-failed-transition-journals-its-cause-beside-the-generic-problem',
             'AC.the-cause-is-bounded-and-never-carries-a-secret',
-            'AC.a-typed-hardware-refusal-keeps-its-own-reason-and-gets-no-cause',
+            'AC.a-typed-hardware-refusal-keeps-its-own-reason-and-names-its-step-and-cause-beside-it',
             'AC.the-product-reconcile-names-launch-readiness-and-activation',
             'AC.a-failed-runtime-verification-of-a-share-client-is-the-verify-step',
             'AC.the-innermost-step-is-kept-and-values-that-are-not-errors-are-described',
@@ -659,6 +660,13 @@ export function buildRequiredCaseManifest() {
             'Z3b.apply-plans-a-profile-less-fixture-whose-record-carries-the-resolved-default-profile-and-reaches-the-launch',
             'Z3b.the-graph-planning-of-that-record-resolves-the-persisted-profile-and-an-unknown-one-is-still-refused',
             'Z3c.an-untyped-planning-failure-reports-the-planning-step',
+        ]),
+        // The MPS readback is conclusive: the reply is in the error, the cause, the journal and lastReadback.
+        ...leaves(P, 'p4', unit('hardwareLimitsMpsReadback.test.mjs'), [
+            'W2.an-unsupported-memory-reply-fails-closed-and-its-sanitized-text-reaches-the-error-the-cause-the-journal-and-the-readback',
+            'W2.a-reply-with-control-bytes-and-two-hundred-characters-is-sanitized-and-truncated-everywhere',
+            'W2.a-successful-readback-is-journaled-too-the-captured-fixture',
+            'W2.every-reply-parse-error-carries-the-sanitized-reply-and-the-grammar-stays-strict',
         ]),
         ...leaves(P, 'p4', unit('hardwareLimitsMpsCandidateRecovery.test.mjs'), [
             'MC.readiness-failure-then-retry-succeeds', 'MC.readiness-failure-leaving-the-candidate-removes-it-by-id',

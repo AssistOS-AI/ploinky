@@ -441,12 +441,15 @@ function typedMpsFailure(error, target) {
     if (['identity_changed', 'revision_conflict', 'apply_timeout', 'hardware_limits_transition'].includes(error?.code)) return error;
     if (!(error instanceof MpsError) && error?.code !== 'gpu_sharing_unavailable' && error?.code !== 'image_preparation_required') return error;
     const ref = `${target.record.repoName}/${target.record.agentName}`;
-    return new HardwareLimitsError(buildDirectRefusal({ key: target.key, ref, alias: target.record.alias || null,
+    // The refusal states the reason; the step and the bounded cause of the underlying error travel beside it, so the
+    // Apply result names where it stopped even when the refusal is typed.
+    const refusal = new HardwareLimitsError(buildDirectRefusal({ key: target.key, ref, alias: target.record.alias || null,
         refusalParts: { reasonCode: 'gpu_sharing_unavailable', reason: String(error.message).slice(0, 1024),
             fix: `Inspect ploinky limits status, repair the GPU prerequisite, then restart the agent; or clear its GPU share in Settings or with ploinky limits clear --agent ${ref} on the host.`,
             requested: [{ field: 'gpu', value: 'configured MPS share', source: 'settings' }] },
         inputFingerprint: hex64({ ref, key: target.key, reason: error.message }),
     }));
+    return Object.defineProperty(refusal, 'applyCause', { value: describeApplyCause(error, 'transition'), configurable: true });
 }
 export async function coordinateMpsLifecycle(input, dependencies) {
     try { return await coordinateMpsLifecycleImpl(input, dependencies); }

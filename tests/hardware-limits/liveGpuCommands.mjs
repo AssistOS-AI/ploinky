@@ -166,6 +166,7 @@ process.stdout.write(JSON.stringify(reply));
 export const MPS_OBSERVE = String.raw`
 const fs=require('node:fs');const cp=require('node:child_process');
 const root='/run/ploinky/mps';const out={state:null,daemon:null,control:null};
+const one=(v,n)=>String(v==null?'':v).replace(/[^\x20-\x7e]+/g,' ').trim().slice(0,n||200);
 const readBounded=(file,max)=>{const fd=fs.openSync(file,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);try{const st=fs.fstatSync(fd);
 if(!st.isFile()||st.uid!==process.getuid()||st.size>max)throw Error('Unsafe file');return {text:fs.readFileSync(fd,'utf8'),st};}finally{fs.closeSync(fd);}};
 let state=null;
@@ -173,7 +174,8 @@ try{const read=readBounded(root+'/state.json',65536);if((read.st.mode&0o777)!==0
 if(state){out.state={schema:state.schema,status:state.status,daemonGeneration:state.daemonGeneration||null,configurationGeneration:state.configurationGeneration||null,
 serverDefault:state.serverDefault||null,pipeDirectory:state.pipeDirectory||null,logDirectory:state.logDirectory||null,daemon:state.daemon||null,
 tools:state.tools?{control:state.tools.control||null,server:state.tools.server||null}:null,
-pendingClients:(state.pendingClients||[]).map((c)=>c.key),oldClients:(state.oldClients||[]).map((c)=>c.key),desiredClients:(state.desiredClients||[]).map((c)=>c.key)};}
+pendingClients:(state.pendingClients||[]).map((c)=>c.key),oldClients:(state.oldClients||[]).map((c)=>c.key),desiredClients:(state.desiredClients||[]).map((c)=>c.key),
+lastReadback:state.lastReadback&&typeof state.lastReadback==='object'?Object.fromEntries(['at','sm','memory','servers'].filter((k)=>state.lastReadback[k]!=null).map((k)=>[k,k==='at'?Number(state.lastReadback[k])||0:one(state.lastReadback[k],64)])):null};}
 if(state&&state.daemon&&Number.isSafeInteger(state.daemon.pid)){
 const pid=state.daemon.pid;const info={pid};
 try{const stat=fs.readFileSync('/proc/'+pid+'/stat','utf8');info.startTime=stat.slice(stat.lastIndexOf(')')+2).split(' ')[19];
@@ -207,7 +209,8 @@ out.state={schema:state.schema,status:one(state.status,32),transitionId:state.tr
 serverDefault:state.serverDefault||null,pipeDirectory:state.pipeDirectory||null,logDirectory:state.logDirectory||null,daemon:state.daemon||null,
 pendingClients:(Array.isArray(state.pendingClients)?state.pendingClients:[]).slice(0,32).map((c)=>({key:one(c.key,128),phase:one(c.phase,32),containerId:c.containerId?String(c.containerId).slice(0,12):null})),
 oldClients:(Array.isArray(state.oldClients)?state.oldClients:[]).slice(0,32).map((c)=>one(c.key,128)),drainedClients:Array.isArray(state.drainedClients)?state.drainedClients.length:0,
-lastProblem:lp?{code:one(lp.code,64),message:one(lp.message,300),cause}:null};}
+lastProblem:lp?{code:one(lp.code,64),message:one(lp.message,300),cause}:null,
+lastReadback:state.lastReadback&&typeof state.lastReadback==='object'?Object.fromEntries(['at','sm','memory','servers'].filter((k)=>state.lastReadback[k]!=null).map((k)=>[k,k==='at'?Number(state.lastReadback[k])||0:one(state.lastReadback[k],64)])):null};}
 if(state&&state.daemon&&Number.isSafeInteger(state.daemon.pid)){const pid=state.daemon.pid;const info={pid};
 try{const stat=fs.readFileSync('/proc/'+pid+'/stat','utf8');info.startTime=stat.slice(stat.lastIndexOf(')')+2).split(' ')[19];info.alive=true;
 info.status=fs.readFileSync('/proc/'+pid+'/status','utf8').split('\n').filter((l)=>/^(Uid|Gid):/.test(l));info.cgroup=fs.readFileSync('/proc/'+pid+'/cgroup','utf8').trim();}catch(e){info.alive=info.alive===true;info.error=one(e.code||e.message,64);}

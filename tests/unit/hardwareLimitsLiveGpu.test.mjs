@@ -1623,3 +1623,14 @@ test('W1.the-runner-classifies-the-sm-reply-with-the-products-strict-decimal-gra
     for (const [text, value] of [['25', 25], ['25.0', 25], ['25.00\n', 25], ['100.0', 100]]) assert.deepEqual(classifyMpsReply(text), { form: 'integer-percentage', value }, JSON.stringify(text));
     for (const text of ['25.5', '025', '0', '0.0', '101', '25.0.0', '25 %', '1e2']) assert.equal(classifyMpsReply(text).form, 'other', JSON.stringify(text));
 });
+
+// W2: a P1 pass keeps the daemon's own readback replies as the captured fixture.
+test('W2.a-p1-pass-copies-the-journaled-readback-into-its-case-artifact', async t => {
+    const w = await provisioned(t);
+    const report = await liveCases(w, ['LIVE-P1']);
+    assert.equal(caseOf(report, 'LIVE-P1').result, 'pass', JSON.stringify(report.limitations));
+    const readback = w.artifacts.get('gpu-live-p1').lastReadback;
+    assert.deepEqual(Object.keys(readback).sort(), ['at', 'memory', 'servers', 'sm']);
+    assert.match(readback.memory, /^\d+M$/); assert.match(readback.sm, /^\d+$/);
+    nothingOwned(w);
+});

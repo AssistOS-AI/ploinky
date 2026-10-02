@@ -48,6 +48,16 @@ export function formatApplyCause(cause) {
     return `${cause.step}: ${cause.errorClass}${cause.code ? ` (${cause.code})` : ''}: ${cause.message}`;
 }
 
+/**
+ * A sanitized excerpt of a reply, for an error or a journal: printable ASCII only (anything else becomes `?`),
+ * a newline shown as `\n`, at most 64 bytes, and credentials redacted. Replies of the MPS control daemon are
+ * numbers, so nothing else is expected; this keeps a surprising one bounded and harmless.
+ */
+export function replyExcerpt(text, limit = 64) {
+    const escaped = String(text ?? '').replace(/\r?\n/g, '\\n').replace(/[^\x20-\x7e]/g, '?');
+    return sanitizeAuthorityDiagnostic(escaped.slice(0, 256), { limit: 256 }).slice(0, limit);
+}
+
 /** What a failed child process looked like, bounded and secret-free: " (error CODE, signal S, exit N, stderr: ...)". */
 export function commandFailureDetail(result) {
     const parts = [];

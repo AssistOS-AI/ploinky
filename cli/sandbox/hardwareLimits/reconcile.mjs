@@ -328,9 +328,9 @@ export async function applyHardwareLimits({ expectedToken, containers }, {
                 const problem = findHardwareOutcome(error);
                 // An untyped failure keeps its cause (step, class, code and a
                 // bounded secret-free message); the generic text stays the fix.
-                const cause = problem ? undefined : describeApplyCause(error, 'apply');
+                const cause = problem ? error?.applyCause : describeApplyCause(error, 'apply');
                 const result = { key: problem?.key || instance.key, state: problem?.state || 'pending', problem, error: problem?.code || String(error?.code || 'apply_failed'),
-                    message: cause ? `Apply stopped at ${formatApplyCause(cause)}` : undefined, ...(cause ? { cause, fix: APPLY_FAILED_FIX } : {}) };
+                    message: cause && !problem ? `Apply stopped at ${formatApplyCause(cause)}` : undefined, ...(cause ? { cause, ...(problem ? {} : { fix: APPLY_FAILED_FIX }) } : {}) };
                 if (!results.some((entry) => entry.key === result.key && entry.state === 'applied')) recordResult(result);
                 if (problem?.key && problem.key !== instance.key) return { ok: false, status: 207, token, expandedContainers, results, pendingContainers: keys.filter((key) => !results.some((entry) => entry.key === key)) };
                 if (!problem) return { ok: false, status: error?.status || 409, error: result.error, message: result.message, cause: result.cause, token, expandedContainers, results, pendingContainers: keys.filter((key) => !results.some((result) => result.key === key)) };

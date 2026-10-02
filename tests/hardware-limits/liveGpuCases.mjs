@@ -480,6 +480,8 @@ export function createGpuCases(ctx) {
             const ids = line => String(line || '').split(/\s+/).slice(1);
             expects(daemon.box.status.some(line => /^Uid:/.test(line) && ids(line).every(value => value === '1000')), 'The daemon does not run as uid 1000 in the Box');
             expects(daemon.box.cgroup === '0::/ploinky/core' && daemon.host.cgroup === `${prepared.prefix}/ploinky/core`, 'The daemon is not placed in /ploinky/core');
+            // The captured fixture (spec 18.8): the daemon's own replies to the readback, sanitized, as the product journaled them.
+            evidence.put('lastReadback', identity.obs.state.lastReadback ?? null);
             expects(daemon.box.pipeEnvMatches === true && identity.obs.state.status === 'ready', 'The daemon is not the ready generation that owns the private pipe');
             const runner = host.uid();
             expects(Object.values(daemon.host.uid).every(value => value === runner), `The daemon's host UID is ${JSON.stringify(daemon.host.uid)}, not the runner's ${runner}`);

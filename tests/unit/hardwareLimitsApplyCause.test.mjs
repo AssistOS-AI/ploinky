@@ -98,13 +98,15 @@ test('AC.the-cause-is-bounded-and-never-carries-a-secret', async () => {
     assert.equal(/[\u0000-\u001f]/.test(result.cause.message), false);
 });
 
-test('AC.a-typed-hardware-refusal-keeps-its-own-reason-and-gets-no-cause', async () => {
+test('AC.a-typed-hardware-refusal-keeps-its-own-reason-and-names-its-step-and-cause-beside-it', async () => {
     const f = world({ fail: { start: () => new MpsError('GPU defaults cannot be applied') } });
     const result = await f.apply();
     assert.equal(result.status, 422, JSON.stringify(result));
     assert.equal(result.results[0].problem.reasonCode, 'gpu_sharing_unavailable');
     assert.match(result.results[0].problem.reason, /GPU defaults cannot be applied/);
-    assert.equal(result.results[0].cause, undefined);
+    // The refusal states the reason; the step and cause of the underlying error travel beside it (no generic fix hint).
+    assert.deepEqual({ ...result.results[0].cause }, { step: 'daemon-start', errorClass: 'MpsError', code: 'gpu_sharing_unavailable', message: 'GPU defaults cannot be applied' });
+    assert.equal(result.results[0].fix, undefined); assert.equal(result.results[0].message, undefined);
 });
 
 // The product reconcile of one exact instance (not the MPS lifecycle): the steps after the lifecycle.

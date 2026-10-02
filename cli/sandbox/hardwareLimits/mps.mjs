@@ -4,7 +4,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { MPS_TOOL_PATHS, revalidateMpsTools } from '../../../ploinky-box/lib/mpsTools.mjs';
 import { MpsError } from './mpsEligibility.mjs';
-import { commandFailureDetail, markApplyStep } from './applyCause.mjs';
+import { commandFailureDetail, markApplyStep, replyExcerpt } from './applyCause.mjs';
 import { AGENT_ALIAS_PATTERN, RESERVED_AGENT_REGISTRY_KEYS } from '../../utils/agentRegistryResolver.js';
 
 export const MPS_ROOT = '/run/ploinky/mps';
@@ -34,14 +34,14 @@ export function mpsClientArgs(share, state) {
 export function parseMpsSmReply(text) {
     const value = String(text || '').trim();
     // An integer 1..100, optionally with a zero-only fraction (`25`, `25.0`): the same integer, never another number.
-    if (!/^(?:100|[1-9]\d?)(?:\.0+)?$/.test(value)) throw new MpsError('Unsupported MPS SM default reply');
+    if (!/^(?:100|[1-9]\d?)(?:\.0+)?$/.test(value)) throw new MpsError(`Unsupported MPS SM default reply (reply: "${replyExcerpt(text)}")`);
     return Number(value);
 }
 // Only the complete explicit M/G unit form is supported. LIVE-P1 must capture
 // the selected driver's exact reply; an unrecognized ABI refuses sharing.
 export function parseMpsMemoryReply(text) {
     const match = /^([1-9]\d*)([MG])$/.exec(String(text || '').trim());
-    if (!match) throw new MpsError('Unsupported MPS device-memory default reply');
+    if (!match) throw new MpsError(`Unsupported MPS device-memory default reply (reply: "${replyExcerpt(text)}")`);
     const bytes = Number(match[1]) * (match[2] === 'M' ? 1048576 : 1073741824);
     if (!Number.isSafeInteger(bytes)) throw new MpsError('MPS memory reply exceeds supported bounds');
     return bytes;
@@ -50,7 +50,7 @@ export function parseMpsServerList(text) {
     const value = String(text || '').trim();
     if (!value) return [];
     const lines = value.split('\n');
-    if (lines.length > 256 || lines.some((line) => !/^[1-9]\d*$/.test(line) || !safeInteger(Number(line), 1, 2147483647))) throw new MpsError('Unsupported MPS server-list reply');
+    if (lines.length > 256 || lines.some((line) => !/^[1-9]\d*$/.test(line) || !safeInteger(Number(line), 1, 2147483647))) throw new MpsError(`Unsupported MPS server-list reply (reply: "${replyExcerpt(text)}")`);
     return [...new Set(lines.map(Number))];
 }
 const COMMAND = /^(?:set_default_active_thread_percentage (?:[1-9]\d?|100)|get_default_active_thread_percentage|set_default_device_pinned_mem_limit 0 [1-9]\d*M|get_default_device_pinned_mem_limit 0|get_server_list|quit)$/;
@@ -59,18 +59,23 @@ export function runMpsControl(command, { env, query = spawnSync, uid = process.g
     if (typeof command !== 'string' || !COMMAND.test(command) || command.length > 200) throw new MpsError('Unsupported MPS control command');
     const result = query(MPS_TOOL_PATHS.control, [], { input: `${command}\n`, encoding: 'utf8', env, timeout: Math.min(timeoutMs, 5000), maxBuffer: OUTPUT_BOUND, stdio: ['pipe', 'pipe', 'pipe'] });
     if (result.status !== 0 || result.signal || result.error || result.truncated || Buffer.byteLength(String(result.stdout || '')) > OUTPUT_BOUND || Buffer.byteLength(String(result.stderr || '')) > OUTPUT_BOUND) throw new MpsError(`MPS control failed, timed out or exceeded its output bound${commandFailureDetail(result)}`);
-    if (/[^\x09\x0a\x0d\x20-\x7e]/.test(String(result.stdout || ''))) throw new MpsError('MPS control reply is not ASCII');
+    if (/[^\x09\x0a\x0d\x20-\x7e]/.test(String(result.stdout || ''))) throw Object.defineProperty(new MpsError(`MPS control reply is not ASCII (reply: "${replyExcerpt(result.stdout)}")`), 'reply', { value: String(result.stdout) });
     return String(result.stdout || '');
 }
-export function configureMpsDefaults(value, { control = runMpsControl, env, uid = process.getuid?.(), query, verifyServer = () => false } = {}) {
+const READBACK_KIND = Object.freeze({ get_default_active_thread_percentage: 'sm', 'get_default_device_pinned_mem_limit 0': 'memory', get_server_list: 'servers' });
+export function configureMpsDefaults(value, { control = runMpsControl, env, uid = process.getuid?.(), query, verifyServer = () => false, onReadback = () => {} } = {}) {
     validateMpsDefault(value);
     const options = { env, uid, ...(query ? { query } : {}) };
     control(`set_default_active_thread_percentage ${value.smPercent}`, options);
     control(`set_default_device_pinned_mem_limit 0 ${value.memoryMiB}M`, options);
-    const sm = parseMpsSmReply(control('get_default_active_thread_percentage', options));
-    const memoryBytes = parseMpsMemoryReply(control('get_default_device_pinned_mem_limit 0', options));
-    if (sm !== value.smPercent || memoryBytes !== value.memoryMiB * 1048576) throw new MpsError('MPS default readback does not match configuration');
-    for (const pid of parseMpsServerList(control('get_server_list', options))) if (verifyServer(pid) !== true) throw new MpsError('MPS server process ownership is not proven');
+    // Each reply is recorded (sanitized, bounded) before it is judged, so a refused reply is on the record too.
+    const smReply = control('get_default_active_thread_percentage', options); onReadback('sm', smReply);
+    const sm = parseMpsSmReply(smReply);
+    const memoryReply = control('get_default_device_pinned_mem_limit 0', options); onReadback('memory', memoryReply);
+    const memoryBytes = parseMpsMemoryReply(memoryReply);
+    if (sm !== value.smPercent || memoryBytes !== value.memoryMiB * 1048576) throw new MpsError(`MPS default readback does not match configuration (requested ${value.smPercent}% and ${value.memoryMiB}M; read ${sm}% and ${memoryBytes} bytes)`);
+    const serverReply = control('get_server_list', options); onReadback('servers', serverReply);
+    for (const pid of parseMpsServerList(serverReply)) if (verifyServer(pid) !== true) throw new MpsError('MPS server process ownership is not proven');
     return Object.freeze({ smPercent: sm, memoryMiB: value.memoryMiB });
 }
 
@@ -320,6 +325,14 @@ export function createMpsDaemonBackend({ root = MPS_ROOT, fsApi = fs, query = sp
             if (launch.status !== 0 || launch.error || launch.signal) throw new MpsError(`MPS daemon start failed or timed out${commandFailureDetail(launch)}`);
             // The attempt's phase names where a failed readiness stopped: the PID receipt, the ownership proof or the defaults.
             let phase = 'pid receipt';
+            // The last replies of the readback, sanitized and bounded, kept in the state on success and on failure: the
+            // captured wire format of this driver (spec 18.8) whatever happens.
+            const readback = {};
+            // The last failed attempt, kept: whichever way the 30 s end (an attempt that fails after the deadline, or the
+            // deadline passing during the wait), the final error names where it stopped and the reply it got.
+            let last = null;
+            const readinessFailure = (error, at) => { onState(state); return markApplyStep(new MpsError(`MPS daemon readiness failed at ${at}: ${String(error.message).slice(0, 200)}`), at === 'set defaults' ? 'set-defaults' : 'daemon-start'); };
+            const record = (kind, text) => { readback[kind] = replyExcerpt(text); state.lastReadback = { at: now(), ...readback }; };
             do {
                 try {
                     phase = 'pid receipt';
@@ -333,10 +346,17 @@ export function createMpsDaemonBackend({ root = MPS_ROOT, fsApi = fs, query = sp
                     phase = 'ownership proof';
                     if (observe(state, { fsApi, uid }).state !== 'owned') throw new MpsError('MPS daemon ownership is not proven');
                     phase = 'set defaults';
-                    configureMpsDefaults(defaults, { control: (command) => control(state, command, { deadline }), uid, verifyServer: (pid) => observeOwnedMpsServer(state, pid, { fsApi, uid }) });
+                    configureMpsDefaults(defaults, { control: (command) => {
+                        try { return control(state, command, { deadline }); } catch (replyError) {
+                            // A reply the transport itself refused (not ASCII) is still the daemon's reply: kept, sanitized.
+                            if (typeof replyError?.reply === 'string') record(READBACK_KIND[command] || 'other', replyError.reply);
+                            throw replyError;
+                        }
+                    }, uid, verifyServer: (pid) => observeOwnedMpsServer(state, pid, { fsApi, uid }), onReadback: record });
                     state.status = 'ready'; return state;
-                } catch (error) { if (now() >= deadline) throw markApplyStep(new MpsError(`MPS daemon readiness failed at ${phase}: ${String(error.message).slice(0, 200)}`), phase === 'set defaults' ? 'set-defaults' : 'daemon-start'); wait(100); }
+                } catch (error) { last = { error, phase }; if (now() >= deadline) throw readinessFailure(error, phase); wait(100); }
             } while (now() < deadline);
+            if (last) throw readinessFailure(last.error, last.phase);
             throw new MpsError('MPS daemon readiness timed out');
         },
         verify(state) {
