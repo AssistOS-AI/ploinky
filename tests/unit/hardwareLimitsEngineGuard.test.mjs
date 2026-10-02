@@ -111,7 +111,7 @@ test('EG.shell-option-clusters-and-script-forms-are-refused', async (t) => {
         ['fd redirect before command', exec("'/bin/sh'", ['-c', `2>&1 ${CANARY} ps`])],
         ['eval', exec("'/bin/sh'", ['-c', `eval ${CANARY} ps`])],
         ['exec', exec("'/bin/sh'", ['-c', `exec ${CANARY} ps`])],
-        ['exec -a', exec("'/bin/sh'", ['-c', `exec -a name ${CANARY} ps`])],
+        ['exec -a', exec("'/bin/bash'", ['-c', `exec -a name ${CANARY} ps`])],
         ['command substitution', exec("'/bin/sh'", ['-c', `echo $(${CANARY} ps)`])],
         ['backticks', exec("'/bin/sh'", ['-c', `echo \`${CANARY} ps\``])],
         ['command -p', exec("'/bin/sh'", ['-c', `command -p ${CANARY} ps`])],
@@ -257,10 +257,11 @@ test('EG.login-shells-are-refused-outright', async (t) => {
         // Login forms without -l: zsh's login option, and a dash-prefixed argv[0] through exec.
         ['zsh -o login', exec("'/bin/zsh'", ['-o', 'login', '-c', 'true'])],
         ['zsh -o login after other options', exec("'/bin/zsh'", ['-f', '-o', 'login', '-c', 'true'])],
-        ['exec -a -bash in a shell line', exec("'/bin/sh'", ['-c', "exec -a -bash bash -c 'true'"])],
-        ['exec -l in a shell line', exec("'/bin/sh'", ['-c', "exec -l bash -c 'true'"])],
-        ['exec -a -sh in a shell line', exec("'/bin/sh'", ['-c', "exec -a -sh /bin/sh -c 'true'"])],
-        ['exec -a -bash as a wrapper', exec("'/usr/bin/env'", ['A=1', '/bin/sh', '-c', "exec -a -bash bash -c 'echo ok'"])],
+        // `exec -a` and `exec -l` are bash builtins' options (dash, /bin/sh on Debian and Ubuntu, has neither), so these run under /bin/bash.
+        ['exec -a -bash in a shell line', exec("'/bin/bash'", ['-c', "exec -a -bash bash -c 'true'"])],
+        ['exec -l in a shell line', exec("'/bin/bash'", ['-c', "exec -l bash -c 'true'"])],
+        ['exec -a -sh in a shell line', exec("'/bin/bash'", ['-c', "exec -a -sh /bin/sh -c 'true'"])],
+        ['exec -a -bash as a wrapper', exec("'/usr/bin/env'", ['A=1', '/bin/bash', '-c', "exec -a -bash bash -c 'echo ok'"])],
     ];
     const outcome = await w.probe('login-refused', forms);
     assertRefused(outcome, forms.map(([id]) => id), 'login shells');
@@ -269,7 +270,7 @@ test('EG.login-shells-are-refused-outright', async (t) => {
     const allowed = await w.probe('login-allowed', [
         ['plain shell', exec("'/bin/sh'", ['-c', 'echo ok'])],
         ['plain bash', exec("'/bin/bash'", ['-c', 'true'], "{ stdio: 'pipe', env: { PATH: '/usr/bin:/bin' } }")],
-        ['exec with a plain argv0', exec("'/bin/sh'", ['-c', "exec -a renamed sh -c 'echo ok'"])],
+        ['exec with a plain argv0', exec("'/bin/bash'", ['-c', "exec -a renamed sh -c 'echo ok'"])],
         ['exec without options', exec("'/bin/sh'", ['-c', 'exec echo ok'])],
     ]);
     for (const id of ['plain shell', 'plain bash', 'exec with a plain argv0', 'exec without options']) assert.equal(allowed.marked[id], 'not-refused', `${id}: ${allowed.messages[id]}`);

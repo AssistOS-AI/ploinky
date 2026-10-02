@@ -18,6 +18,9 @@ import { AGENTLIB_STABLE_MOUNT_PATH } from '../../agentlib/contract.mjs';
 import { PLOINKY_WORKSPACE_ROOT } from '../../cli/utils/config.js';
 import { agentLibFixture, writeAgentLibCheckout } from '../helpers/agentlibFixture.mjs';
 
+// This file runs real login shells on purpose (production `sh -lc` code under test): it opts in to the unit-test spawn guard's name-only login-shell reading.
+process.env.PLOINKY_ENGINE_GUARD_ALLOW_LOGIN_SHELLS = '1';
+
 function tempDir(prefix = 'bwrap-args-') {
     return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
