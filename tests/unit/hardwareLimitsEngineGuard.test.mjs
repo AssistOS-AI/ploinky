@@ -642,7 +642,9 @@ test('EG.a-sigkilled-descendant-with-an-explicit-env-leaves-nothing-behind', asy
     const info = path.join(w.root, 'child-info.json');
     // The child has an explicit environment without TMPDIR: it must not fall
     // back to /tmp, but create its directories inside the top-level root.
-    const childCode = `const fs = require('node:fs'); fs.writeFileSync(${JSON.stringify(info)}, JSON.stringify({ root: process.env.PLOINKY_ENGINE_GUARD_ROOT, firstPath: process.env.PATH.split(':')[0], tmpdir: require('node:os').tmpdir() })); setInterval(() => {}, 1000);`;
+    // The child publishes its facts atomically (a temporary file, then a rename): the parent kills it as soon as the file
+    // exists, and a file that exists before its content is written made this test fail once in a large batch.
+    const childCode = `const fs = require('node:fs'); fs.writeFileSync(${JSON.stringify(`${info}.part`)}, JSON.stringify({ root: process.env.PLOINKY_ENGINE_GUARD_ROOT, firstPath: process.env.PATH.split(':')[0], tmpdir: require('node:os').tmpdir() })); fs.renameSync(${JSON.stringify(`${info}.part`)}, ${JSON.stringify(info)}); setInterval(() => {}, 1000);`;
     const program = `const cp = require('node:child_process'); const fs = require('node:fs');
 const child = cp.spawn(process.execPath, ['-e', ${JSON.stringify(childCode)}], { env: { PATH: process.env.PATH }, stdio: 'ignore' });
 const wait = setInterval(() => { if (fs.existsSync(${JSON.stringify(info)})) { clearInterval(wait); child.kill('SIGKILL'); child.once('exit', () => process.exit(0)); } }, 25);`;
