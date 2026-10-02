@@ -610,6 +610,8 @@ export function buildRequiredCaseManifest() {
             'Y4.a-failed-identity-proof-stays-at-intent-and-nothing-after-it-runs',
             'W1.the-runner-classifies-the-sm-reply-with-the-products-strict-decimal-grammar',
             'W2.a-p1-pass-copies-the-journaled-readback-into-its-case-artifact',
+            'W3.a-share-client-recreated-by-image-id-passes-with-the-id-as-its-image-name',
+            'W3.a-recreated-share-client-with-another-image-id-or-a-foreign-image-name-fails',
         ]),
         ...leaves(P, 'p4', unit('hardwareLimitsLiveProvision.test.mjs'), ['G1.prepare-live-apparatus-mps-concrete-manifest-and-summary']),
         ...leaves(P, 'p4', unit('hardwareLimitsMps.test.mjs'), [

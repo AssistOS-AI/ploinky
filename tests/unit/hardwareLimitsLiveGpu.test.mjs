@@ -1634,3 +1634,36 @@ test('W2.a-p1-pass-copies-the-journaled-readback-into-its-case-artifact', async 
     assert.match(readback.memory, /^\d+M$/); assert.match(readback.sm, /^\d+$/);
     nothingOwned(w);
 });
+
+// --- W3: the image identity of a share client the product recreated from the immutable image ID --------------------
+test('W3.a-share-client-recreated-by-image-id-passes-with-the-id-as-its-image-name', async t => {
+    const w = await provisioned(t);
+    const report = await liveCases(w, ['LIVE-P1']);
+    assert.equal(caseOf(report, 'LIVE-P1').result, 'pass', JSON.stringify(report.limitations).slice(0, 500));
+    // The fake models the product: the recreated probe was created from the ID, so that is the name the engine reports.
+    const probe = w.fake.model.agents.get('probe') ?? null;
+    assert.ok(w.artifacts.get('gpu-live-p1').client.id);
+    assert.equal(probe, null, 'the Box and its agents are gone after cleanup');
+    nothingOwned(w);
+});
+
+test('W3.a-recreated-share-client-with-another-image-id-or-a-foreign-image-name-fails', async t => {
+    for (const [label, faults, pattern] of [
+        ['another image ID', { recreatedImageId: 'd'.repeat(64) }, /Agent probe is not the pinned running instance \(image d{12}, created from d{64}\)/],
+        ['a foreign image name', { recreatedImageName: `docker.io/other/node@sha256:${'e'.repeat(64)}` }, /Agent probe is not the pinned running instance .*created from docker\.io\/other\/node@sha256:e+/],
+    ]) {
+        const w = await provisioned(t, { faults });
+        const entry = caseOf(await liveCases(w, ['LIVE-P1']), 'LIVE-P1');
+        assert.equal(entry.result, 'fail', `${label}: ${JSON.stringify(entry).slice(0, 400)}`); assert.match(entry.reason, pattern, label);
+        nothingOwned(w);
+    }
+});
+
+test('W3.the-fixture-start-instance-must-still-be-created-from-the-digest-reference', async t => {
+    // Before any recreate the strict check holds: an agent created from a different reference is not the pinned instance.
+    const w = await provisioned(t);
+    const profile = w.run.target.execution;
+    profile.provision.image = `docker.io/assistos/ploinky-node@sha256:${'f'.repeat(64)}`;
+    const entry = caseOf(await liveCases(w, ['LIVE-P1']), 'LIVE-P1');
+    assert.notEqual(entry.result, 'pass');
+});

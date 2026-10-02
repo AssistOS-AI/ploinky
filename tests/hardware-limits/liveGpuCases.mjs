@@ -209,7 +209,18 @@ export function createGpuCases(ctx) {
         const rows = (await nestedRows()).filter(row => row.name === name);
         expects(rows.length === 1, `Expected exactly one nested container named ${name}, found ${rows.length}`);
         const inspected = await inspectNested(rows[0].id);
-        expects(inspected.running === true && (!image || inspected.imageName === image), `Agent ${role} is not the pinned running instance`);
+        expects(inspected.running === true, `Agent ${role} is not the pinned running instance`);
+        if (image) {
+            // The fixture start created the agent from the digest reference, so its name is that reference; its image ID is
+            // the pinned image's identity. A GPU share client is recreated from that immutable ID (agentServiceManager.js
+            // `image = launch.imageId`), and the engine reports the name the container was created with: the ID. Identity
+            // is therefore the image ID recorded at the fixture start, and the name is that reference or that same ID.
+            const pinned = prepared?.agents?.[role]?.imageId ?? null;
+            const bare = value => String(value ?? '').replace(/^sha256:/, '');
+            const named = pinned === null ? [image] : [image, bare(pinned), `sha256:${bare(pinned)}`];
+            expects((pinned === null || bare(inspected.image) === bare(pinned)) && named.includes(inspected.imageName),
+                `Agent ${role} is not the pinned running instance (image ${hexTail(bare(inspected.image))}, created from ${String(inspected.imageName).slice(0, 120)})`);
+        }
         return { role, ref: fixture.refs[role], name, ...inspected };
     }
 
@@ -360,7 +371,7 @@ export function createGpuCases(ctx) {
             const agent = await agentNow(role);
             // MPS eligibility: the share clients run as a non-root numeric UID:GID.
             if (fixture.clients.includes(role)) needs(MPS_CLIENT_USER.test(agent.user), `The fixture image of ${role} runs as '${agent.user}', not a non-root numeric UID:GID, which MPS eligibility requires`);
-            prepared.agents[role] = { id: agent.id, created: agent.created, startedAt: agent.startedAt, pid: agent.pid, user: agent.user };
+            prepared.agents[role] = { id: agent.id, created: agent.created, startedAt: agent.startedAt, pid: agent.pid, user: agent.user, imageId: agent.image };
         }
         if (fixture.unrelated) prepared.cpuBaseline = { ...prepared.agents[fixture.unrelated] };
         return prepared;

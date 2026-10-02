@@ -246,7 +246,7 @@ test('G2.L1-passes-budget-cgroup-runner-environment-uid-generation-text-and-dige
     assert.deepEqual(Object.keys(artifact.runner[0].cuda).sort(), ['CUDA_CACHE_PATH', 'CUDA_MPS_ACTIVE_THREAD_PERCENTAGE', 'CUDA_MPS_PINNED_DEVICE_MEM_LIMIT', 'CUDA_MPS_PIPE_DIRECTORY'], 'the three MPS names plus the product\'s own CUDA_CACHE_PATH');
     assert.equal(artifact.runner[0].cuda.CUDA_MPS_PINNED_DEVICE_MEM_LIMIT, '0=3072M'); assert.equal(artifact.runner[0].cuda.CUDA_MPS_ACTIVE_THREAD_PERCENTAGE, '50');
     assert.equal(artifact.runner[0].envNames.some(name => /TOKEN|KEY|SECRET/.test(name)), false);
-    assert.equal(artifact['agent:L1'].image, LLM_IMAGE); assert.match(artifact['agent:L1'].labels['ploinky.mpsgeneration'], /^[0-9a-f-]{36}:[0-9a-f-]{36}$/);
+    assert.match(artifact['agent:L1'].image, /^[0-9a-f]{64}$/, 'the share client was recreated from the immutable image ID, which is the name the engine reports'); assert.equal(artifact.image.configured, LLM_IMAGE, 'the fixture start used the digest reference'); assert.match(artifact['agent:L1'].labels['ploinky.mpsgeneration'], /^[0-9a-f-]{36}:[0-9a-f-]{36}$/);
     // The response and the digests of what ran.
     assert.equal(artifact.response.text, 'Pong.'); assert.equal(artifact.response.modelId, LLM_MODELS.small);
     assert.equal(artifact.digests.model.verified, true); assert.equal(artifact.digests.model.pinned.sha256, SMALL_FILE.sha256);

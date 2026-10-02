@@ -40,7 +40,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
     const refOf = role => `${fixture.repository}/${nameOf(role)}`;
     const roleOfName = name => fixture.roles.find(role => nameOf(role) === name) ?? name;
     const model = {
-        clock: 100, nextHost: 5000, nextBox: 100, agentCounter: 0, procs: new Map(), dirs: new Set(), agents: new Map(), helpers: new Map(),
+        clock: 100, nextHost: 5000, nextBox: 100, agentCounter: 0, imageIds: {}, procs: new Map(), dirs: new Set(), agents: new Map(), helpers: new Map(),
         boxId: null, workspace: null, instance: null, prefix: null,
         store: { epoch: hex('epoch').slice(0, 32), revision: 1, policies: {} },
         daemon: null, mpsStatus: 'inactive', events: [], signals: [], calls: [], programs: [], foreign: [], bypassProcs: [],
@@ -83,12 +83,17 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
         const id = recorded?.id ?? hex(`${role}-${++model.agentCounter}-${model.boxId}`);
         const agent = {
             role, id, name: fixtureContainerName(model.workspace, nameOf(role), fixture.repository), created: recorded?.created ?? `2026-10-02T12:00:${String(model.agentCounter % 60).padStart(2, '0')}Z`,
-            image: recorded?.image ?? hex('agent-image'), imageName: model.image, user: faults.imageUser ?? '1000:1000', running: true, startedAt: `2026-10-02T12:01:${String(model.agentCounter % 60).padStart(2, '0')}Z`,
+            // A replacement is created from the same image as the instance the engine's own start created for this role.
+            image: recorded?.image ?? model.imageIds[role] ?? hex('agent-image'), imageName: model.image, user: faults.imageUser ?? '1000:1000', running: true, startedAt: `2026-10-02T12:01:${String(model.agentCounter % 60).padStart(2, '0')}Z`,
             labels: { 'ploinky.limitshash': hex(`limits-${role}-${JSON.stringify(share)}`) }, env: [...baseEnv], mounts: [], boxPid: model.nextBox++, share,
             // The whole saved policy this instance was created with (a share, CPUs and RAM): an instance is applied while it equals the store's.
             limits: model.store.policies[refOf(role)] ?? null, limitsKey: JSON.stringify(model.store.policies[refOf(role)] ?? null),
         };
         if (share) {
+            // The product recreates a share client from the prepared image's immutable ID, and the engine reports the name the
+            // container was created with: the ID (faults model another image and a foreign name).
+            if (faults.recreatedImageId) agent.image = faults.recreatedImageId;
+            agent.imageName = faults.recreatedImageName ?? agent.image;
             const daemon = model.daemon;
             agent.labels['ploinky.mpsgeneration'] = `${daemon.gen}:${daemon.cfg}`;
             agent.env.push(`CUDA_MPS_PIPE_DIRECTORY=${CLIENT_PIPE}`, `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=${share.smPercent}`, `CUDA_MPS_PINNED_DEVICE_MEM_LIMIT=0=${shareMemoryMiB(share.vramPercent, gpu.memoryMiB)}M`);
@@ -98,6 +103,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
             if (faults.clientHoldsTool) agent.mounts.push({ Type: 'bind', Source: gpu.mpsControl, Destination: '/usr/local/nvidia/bin/nvidia-cuda-mps-control', RW: false });
             if (faults.readOnlyPipe) agent.mounts[0].RW = false;
         }
+        if (recorded) model.imageIds[role] = agent.image;
         agent.proc = spawn({ cgroup: leafOf(agent), ppid: BOX_INIT_PID, ns: [agent.boxPid, 1] });
         model.dirs.add(leafOf(agent));
         model.agents.set(role, agent);
