@@ -17,12 +17,15 @@ import { retireRuntimeRelaySocket } from '../docker/healthProbes.js';
 import { prepareTargetedAgentRestart } from '../../commands/targetedAgentRestart.js';
 import { readBoxHardwareContext } from './context.mjs';
 import { readAppliedObservation } from './runtimeState.mjs';
-import { assertKnownMpsClients, inspectMpsClient, resolveMpsClientAlias } from './mpsInventory.mjs';
+import {
+    assertKnownMpsClients, inspectMpsClient, inspectMpsClientPresence, resolveMpsClientAlias,
+    createdMpsCandidates, settleCreatedMpsCandidate, dropSettledMpsCandidate, mpsCandidateRecord,
+} from './mpsInventory.mjs';
 import { HardwareStoreError } from './store.mjs';
 import { HardwareLimitsError } from './errors.mjs';
 import { buildDirectRefusal, hex64 } from './requestedLimits.mjs';
 import { resolveStoredGpuShare } from './resolve.mjs';
-import { createMpsStateStore, createMpsDaemonBackend } from './mps.mjs';
+import { createMpsStateStore, createMpsDaemonBackend, isMpsClientAlias } from './mps.mjs';
 import { MpsError, inspectMpsImage } from './mpsEligibility.mjs';
 import { inspectPreparedMpsImage } from './mpsStatus.mjs';
 import { createMpsLaunch, readMpsLaunchForTracking, verifyMpsLaunch } from './mpsLaunch.mjs';
@@ -48,6 +51,11 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
     network = withNetworkLifecycleLockAsync, assertCapability = assertNetworkLifecycleCapability,
     reconcile = reconcileExactHardwareInstance, beforePlan = () => {},
     observeClients = assertKnownMpsClients, drainClient = null, policyCheck = assertHardwareApplyInputs, resolveShare = resolveStoredGpuShare,
+    inspectCandidate = (candidate, plan) => (plan && isMpsClientAlias(candidate.alias)
+        ? inspectMpsClient(candidate, { runtime: plan.runtime, network: plan.profile.network, alias: candidate.alias })
+        : inspectMpsClientPresence(candidate, { runtime: getRuntime() })),
+    removeCandidate = (candidate, plan, capability) => retireExactAgentRuntimePredecessor({ containerName: candidate.key, containerId: candidate.containerId,
+        registryRecord: mpsCandidateRecord(candidate), runtimeNetwork: plan.profile.network }, { networkLifecycleCapability: capability }),
 } = {}) {
     return network(async (capability) => {
         const context = readContext();
@@ -60,6 +68,16 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
         };
         check();
         const registry = loadRegistry();
+        // A created candidate whose readiness failed (or whose process died)
+        // is settled through its own exact tuple and immutable ID before any
+        // planning; the registry still names its predecessor (fix round 3, M1).
+        for (const candidate of createdMpsCandidates(store.read(), registry)) {
+            check();
+            let plan = null;
+            try { plan = loadPlan(candidate.ref, registry[candidate.key] || { alias: candidate.alias }); } catch (_) {}
+            settleCreatedMpsCandidate(candidate, { inspect: (value) => inspectCandidate(value, plan), remove: (value) => removeCandidate(value, plan, capability) });
+            dropSettledMpsCandidate(store, candidate);
+        }
         const oldClients = [];
         const desiredClients = [];
         const plans = new Map();

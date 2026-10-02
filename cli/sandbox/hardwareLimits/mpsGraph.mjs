@@ -10,8 +10,12 @@ import { drainTargetedContainer, TARGETED_DRAIN_ACKNOWLEDGEMENT } from '../docke
 import { retireRuntimeRelaySocket } from '../docker/healthProbes.js';
 import { readBoxHardwareContext } from './context.mjs';
 import { readAppliedObservation } from './runtimeState.mjs';
-import { assertKnownMpsClients, inspectMpsClient, resolveMpsClientAlias } from './mpsInventory.mjs';
-import { createMpsStateStore, createMpsDaemonBackend } from './mps.mjs';
+import {
+    assertKnownMpsClients, inspectMpsClient, inspectMpsClientPresence, resolveMpsClientAlias,
+    createdMpsCandidates, settleCreatedMpsCandidate, mpsCandidateRecord, sameMpsTuple,
+} from './mpsInventory.mjs';
+import { createMpsStateStore, createMpsDaemonBackend, isMpsClientAlias } from './mps.mjs';
+import { retireExactAgentRuntimePredecessor } from '../docker/agentServiceManager.js';
 import { MpsError } from './mpsEligibility.mjs';
 import { resolveStoredGpuShare } from './resolve.mjs';
 import { buildDirectRefusal, hex64 } from './requestedLimits.mjs';
@@ -22,15 +26,21 @@ const sameRecord = (client, record) => record?.type === 'agent' && client.instan
     && client.enableGeneration === record.enableGeneration && client.containerId === record.containerId;
 
 // Graph preparation already selected the complete workspace inactive. This
-// phase drains exact predecessors only; the existing graph batch owns removal,
-// identity rotation, its preparation lease, readiness and final publication.
+// phase drains exact predecessors and removes never-published created
+// candidates; the existing graph batch owns removal of predecessors, identity
+// rotation, its preparation lease, readiness and final publication.
+// `progress.mutating` turns true immediately before the first effect: every
+// failure before it is a contained GPU refusal (fix round 3, M2).
 async function prepareMpsGraphImpl({ nodes, networkLifecycleCapability, deadline = Date.now() + 15 * 60_000 } = {}, {
     readContext = readBoxHardwareContext, loadRegistry = readAgentRegistrySnapshot, readApplied = readAppliedObservation,
     store = createMpsStateStore(), backend = createMpsDaemonBackend(), assertCapability = assertNetworkLifecycleCapability,
     readSelection = readEdgeRoutingSelection, resolveShare = resolveStoredGpuShare, runtime = getRuntime,
     inspect = (client, network, engine) => inspectMpsClient(client, { network, runtime: engine }),
+    inspectPresence = (client, engine) => inspectMpsClientPresence(client, { runtime: engine }),
+    removeCandidate = (candidate, network, capability) => retireExactAgentRuntimePredecessor({ containerName: candidate.key, containerId: candidate.containerId,
+        registryRecord: mpsCandidateRecord(candidate), runtimeNetwork: network }, { networkLifecycleCapability: capability }),
     drain = drainTargetedContainer, observeClients = assertKnownMpsClients,
-} = {}) {
+} = {}, progress = {}) {
     assertCapability(networkLifecycleCapability);
     const context = readContext();
     const replacedKeys = new Set();
@@ -39,6 +49,20 @@ async function prepareMpsGraphImpl({ nodes, networkLifecycleCapability, deadline
     const members = new Map(nodes.map((entry) => [entry.key, entry]));
     let saved;
     try { saved = store.read(); } catch (_) { throw new MpsError('The private MPS state cannot be read safely', 'mps_backend_unavailable'); }
+    const networkOf = (key, ref) => {
+        const member = members.get(key);
+        return member ? resolveManifestRuntimeProfile(member.node.manifest, { agentName: ref, profileName: registry[key]?.profile || undefined }).network : null;
+    };
+    // Journaled created candidates are judged by their own tuple and ID.
+    const candidates = createdMpsCandidates(saved, registry).map((candidate) => {
+        const network = isMpsClientAlias(candidate.alias) ? networkOf(candidate.key, candidate.ref) : null;
+        const engine = runtime();
+        const observed = network ? inspect(candidate, network, engine) : inspectPresence(candidate, engine);
+        if (observed.state !== 'absent' && (observed.state !== 'exact' || observed.id !== candidate.containerId)) {
+            throw new MpsError(`The journaled MPS candidate ${candidate.key} is not its exact created runtime; no client was drained`, 'identity_changed');
+        }
+        return { candidate, network, absent: observed.state === 'absent' };
+    });
     const clients = new Map((saved?.oldClients || []).map((client) => [tuple(client), client]));
     for (const [key, record] of Object.entries(registry)) {
         if (record?.type !== 'agent' || !record.containerId) continue;
@@ -58,21 +82,32 @@ async function prepareMpsGraphImpl({ nodes, networkLifecycleCapability, deadline
         try { policies.push({ share: resolveShare(entry.gpu, context.gpu, ref) }); }
         catch (_) { /* Metadata admission contains this agent's GPU refusal. */ }
     }
-    if (!clients.size && !saved?.daemon && !policies.length) return { replacedKeys };
+    if (!clients.size && !saved?.daemon && !policies.length && !candidates.length) return { replacedKeys };
     observeClients({ runtime: runtime(), registry, state: saved });
     if (clients.size > 256) throw new MpsError('MPS graph cohort exceeds its bound');
+    const alreadyDrained = new Set(saved?.drainedClients || []);
+    // A journaled client outside this graph is settled only by an exact
+    // drain receipt or by proof that its immutable container is gone.
+    const outside = new Set();
+    for (const client of clients.values()) {
+        if (members.has(client.key)) continue;
+        if (!alreadyDrained.has(tuple(client))) {
+            if (inspectPresence(client, runtime()).state !== 'absent') throw new MpsError(`MPS client ${client.key} is outside the admitted graph; no client was drained`);
+            alreadyDrained.add(tuple(client));
+        }
+        outside.add(tuple(client));
+    }
     const desiredServerDefault = resolveMpsServerDefault(policies);
     const observation = saved?.daemon || saved?.pipeDirectory ? backend.observe(saved) : { state: 'gone' };
     if (['foreign', 'unknown'].includes(observation.state)) throw new MpsError('MPS graph preparation cannot prove daemon ownership', 'mps_backend_unavailable');
     const generation = saved?.daemonGeneration && saved?.configurationGeneration ? `${saved.daemonGeneration}:${saved.configurationGeneration}` : '';
     const healthy = saved?.status === 'ready' && observation.state === 'owned' && backend.verify(saved);
     const needsTransition = !isDeepStrictEqual(saved?.serverDefault || null, desiredServerDefault)
-        || Boolean(desiredServerDefault && !healthy) || [...clients.values()].some((client) => client.mpsGeneration !== generation);
-    const alreadyDrained = new Set(saved?.drainedClients || []);
+        || Boolean(desiredServerDefault && !healthy) || [...clients.values()].some((client) => !outside.has(tuple(client)) && client.mpsGeneration !== generation);
     const toDrain = [];
     for (const client of clients.values()) {
+        if (outside.has(tuple(client))) continue;
         const member = members.get(client.key);
-        if (!member) throw new MpsError(`MPS client ${client.key} is outside the admitted graph; no client was drained`);
         let desiredShare = null;
         const policy = context.overrides?.get(client.ref)?.gpu;
         if (policy) { try { desiredShare = resolveShare(policy, context.gpu, client.ref); } catch (_) {} }
@@ -94,12 +129,24 @@ async function prepareMpsGraphImpl({ nodes, networkLifecycleCapability, deadline
         if (selection.state !== 'inactive' || !isDeepStrictEqual(readSelection().selector, selection)) throw new MpsError('MPS graph preparation lost its exact inactive selector');
         if (!isDeepStrictEqual(readContext().storeToken, context.storeToken)) throw new MpsError('MPS graph policy changed before drain', 'revision_conflict');
     };
+    // The transaction checks are not GPU prerequisites: they still fail start.
+    progress.transactionChecks = true;
     check();
+    progress.mutating = true;
+    const settled = candidates.filter(({ absent }) => absent).map(({ candidate }) => candidate);
     const state = { ...(saved || { schema: 1, daemon: null, daemonGeneration: null, configurationGeneration: null,
         pipeDirectory: null, logDirectory: null, serverDefault: null }), status: needsTransition || replacedKeys.size ? 'pending' : saved?.status || 'inactive',
         graphPrepared: true, graphPreparationId: randomUUID(), graphNeedsTransition: needsTransition, replacedKeys: [...replacedKeys], desiredServerDefault,
-        oldClients: [...clients.values()], drainedClients: [...alreadyDrained], pendingClients: saved?.pendingClients || [], lastProblem: null };
+        oldClients: [...clients.values()], drainedClients: [...alreadyDrained],
+        pendingClients: (saved?.pendingClients || []).filter((entry) => !settled.some((candidate) => entry.phase === 'readiness' && sameMpsTuple(entry, candidate))), lastProblem: null };
     store.write(state);
+    // Never-published candidates are removed by their exact immutable ID.
+    for (const { candidate, network, absent } of candidates) {
+        if (absent) continue;
+        check();
+        settleCreatedMpsCandidate(candidate, { inspect: () => inspect(candidate, network, runtime()), remove: () => removeCandidate(candidate, network, networkLifecycleCapability) });
+        state.pendingClients = state.pendingClients.filter((entry) => !(entry.phase === 'readiness' && sameMpsTuple(entry, candidate))); store.write(state);
+    }
     for (const { client, observed, engine } of toDrain) {
         check();
         if (!sameRecord(client, loadRegistry()[client.key])) throw new MpsError('MPS graph predecessor identity changed before drain');
@@ -127,9 +174,14 @@ async function prepareMpsGraphImpl({ nodes, networkLifecycleCapability, deadline
 }
 
 export async function prepareMpsGraph(input, dependencies = {}) {
-    try { return await prepareMpsGraphImpl(input, dependencies); }
+    const progress = {};
+    try { return await prepareMpsGraphImpl(input, dependencies, progress); }
     catch (error) {
-        if (error.code !== 'mps_backend_unavailable') throw error;
+        // Before any effect, an MPS failure refuses only the GPU-share agents
+        // of this graph and leaves the daemon untouched; CPU-only agents and
+        // Explorer start (U10, §9.1). The graph transaction's own checks and
+        // any failure after the first effect still fail the start.
+        if (progress.mutating || progress.transactionChecks) throw error;
         const context = (dependencies.readContext || readBoxHardwareContext)();
         const registry = (dependencies.loadRegistry || readAgentRegistrySnapshot)();
         const readApplied = dependencies.readApplied || readAppliedObservation;
@@ -147,6 +199,6 @@ export async function prepareMpsGraph(input, dependencies = {}) {
                 inputFingerprint: hex64({ ref, configured, gpu: context.gpu?.wiringFingerprint, reason: error.message }),
             }));
         }
-        return { replacedKeys: new Set(), refusals, diagnostic: { code: 'mps_backend_unavailable', message: error.message, fix: 'Inspect ploinky limits status and restart this Box on the host before using GPU shares.' } };
+        return { replacedKeys: new Set(), refusals, diagnostic: { code: String(error.code || 'gpu_sharing_unavailable').slice(0, 64), message: String(error.message).slice(0, 1024), fix: 'Inspect ploinky limits status and restart this Box on the host before using GPU shares.' } };
     }
 }

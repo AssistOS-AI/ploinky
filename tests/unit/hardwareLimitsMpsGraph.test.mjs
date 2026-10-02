@@ -51,12 +51,18 @@ for (const mode of ['stopped', 'absent']) test(`MG.${mode} exact predecessor rec
     assert.equal(f.events.some((value) => value.startsWith('drain:')), false); assert.equal(f.state().drainedClients.length, 2);
 });
 test('MG.graph omission refuses before first journal or client drain', async () => {
-    const f = fixture(); f.nodes.pop();
-    await assert.rejects(f.run(), /outside the admitted graph/); assert.deepEqual(f.events, []);
+    // A live client outside the graph refuses only the graph's GPU agents
+    // before any effect (fix round 3, M2: contained, not a failed start).
+    const f = fixture(); f.nodes.pop(); f.deps.inspectPresence = () => ({ state: 'present', id: 'b'.repeat(64) });
+    const result = await f.run();
+    assert.deepEqual(result.refusals.map((value) => value.key), ['a']); assert.match(result.refusals[0].reason, /outside the admitted graph/);
+    assert.deepEqual(f.events, []);
 });
 test('MG.foreign peer refuses before draining selected client', async () => {
     const f = fixture(); f.deps.inspect = (client) => ({ state: client.key === 'b' ? 'foreign' : 'exact', id: client.containerId, running: true });
-    await assert.rejects(f.run(), /ownership/); assert.deepEqual(f.events, []);
+    const result = await f.run();
+    assert.deepEqual(result.refusals.map((value) => value.key), ['a', 'b']); assert.match(result.refusals[0].reason, /ownership/);
+    assert.deepEqual(f.events, []);
 });
 test('MG.post-provider pass preserves prior exact receipts after expected registry rotation', async () => {
     const f = fixture(); await f.run(); const previous = f.state().graphPreparationId;
@@ -270,11 +276,14 @@ test('GRAPH.alias-journal-registry-mismatch-refused', async (t) => {
     const f = await interruptedAliasWorld(t);
     f.journal((value) => { value.oldClients[0].alias = 'other'; });
     const before = JSON.stringify(f.store.state);
-    await assert.rejects(f.run(), { code: 'identity_changed' });
+    // Contained before any effect (fix round 3, M2): the GPU agent is refused.
+    const refused = await f.run();
+    assert.deepEqual(refused.refusals.map((value) => value.key), [f.key]); assert.equal(refused.diagnostic.code, 'identity_changed');
     assert.deepEqual(f.events, []); assert.equal(JSON.stringify(f.store.state), before);
     // The registry record changing alias under the same tuple is refused too.
     const g = await interruptedAliasWorld(t); g.setRegistry({ [g.key]: { ...g.record, alias: 'other' } });
-    await assert.rejects(g.run(), { code: 'identity_changed' }); assert.deepEqual(g.events, []);
+    const other = await g.run();
+    assert.deepEqual(other.refusals.map((value) => value.key), [g.key]); assert.equal(other.diagnostic.code, 'identity_changed'); assert.deepEqual(g.events, []);
     // The lifecycle drain and the transition plan refuse the same mismatch.
     const client = { key: 'k', ref: 'repo/gpu', alias: 'router', instanceId: 'i', enableGeneration: 'g', containerId: 'a'.repeat(64), share: aliasShare(25), mpsGeneration: 'old:config' };
     assert.throws(() => resolveMpsClientAlias(client, { instanceId: 'i', enableGeneration: 'g', containerId: 'a'.repeat(64), alias: 'other' }), { code: 'identity_changed' });

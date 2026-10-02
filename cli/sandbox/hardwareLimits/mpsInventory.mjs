@@ -53,3 +53,62 @@ export function inspectMpsClient(client, { network, runtime, alias = client.alia
         instanceId: client.instanceId, enableGeneration: client.enableGeneration, requireRuntimeIdentity: true,
     });
 }
+
+const IMMUTABLE_ID = /^[a-f0-9]{64}$/;
+export const sameMpsTuple = (left, right) => Boolean(left && right) && left.key === right.key && left.instanceId === right.instanceId
+    && left.enableGeneration === right.enableGeneration && left.containerId === right.containerId;
+
+/**
+ * Journaled created candidates: 'readiness' entries with an immutable ID that
+ * the registry does not publish for their key. A failed readiness or a crash
+ * leaves them behind while the registry still names the predecessor; they are
+ * settled through their own exact tuple, never through the registry record.
+ * An entry the registry publishes is an ordinary client whose receipt is
+ * pending, and an uncreated intent has no immutable ID.
+ */
+export function createdMpsCandidates(state, registry = {}) {
+    return (Array.isArray(state?.pendingClients) ? state.pendingClients : []).filter((entry) => entry?.phase === 'readiness'
+        && IMMUTABLE_ID.test(String(entry.containerId || ''))
+        && !sameMpsTuple({ ...entry }, registry[entry.key]?.type === 'agent' ? { key: entry.key, ...registry[entry.key] } : null));
+}
+
+/** Presence by immutable ID only, for a client without a resolvable network. */
+export function inspectMpsClientPresence(client, { runtime, createAdapter = createNetworkLifecycleAdapter } = {}) {
+    if (!IMMUTABLE_ID.test(String(client?.containerId || ''))) throw new MpsError('MPS inspection needs an immutable client ID', 'identity_changed');
+    const [, agentName] = String(client.ref || '').split('/');
+    // An empty contract hash proves absence or reports presence as foreign;
+    // it never accepts a runtime it cannot fully identify.
+    const observed = createAdapter({ runtime }).inspectContainerContract(client.containerId, null, agentName || 'unknown', { contractHash: '' });
+    return observed.state === 'absent' ? { state: 'absent', id: null } : { state: 'present', id: observed.id || null };
+}
+
+/** The registry-shaped exact identity a created candidate was launched with. */
+export function mpsCandidateRecord(candidate) {
+    const [repoName, agentName] = String(candidate.ref || '').split('/');
+    if (!repoName || !agentName || !isMpsClientAlias(candidate.alias ?? '')) throw new MpsError('A journaled MPS candidate has no exact identity', 'identity_changed');
+    return { type: 'agent', repoName, agentName, alias: candidate.alias || '', instanceId: candidate.instanceId, enableGeneration: candidate.enableGeneration, containerId: candidate.containerId };
+}
+
+/**
+ * Settle one created candidate: absent means it is already gone; the exact
+ * runtime (labels, instance identity and immutable ID) is removed by that ID;
+ * anything else is refused without effects.
+ */
+export function settleCreatedMpsCandidate(candidate, { inspect, remove }) {
+    const observation = inspect(candidate);
+    if (observation?.state === 'absent') return 'absent';
+    if (observation?.state !== 'exact' || observation.id !== candidate.containerId) {
+        throw new MpsError(`The journaled MPS candidate ${candidate.key} is not its exact created runtime. Recover this Box on the host before changing its daemon.`, 'identity_changed');
+    }
+    mpsCandidateRecord(candidate);
+    const removed = remove(candidate);
+    if (removed?.state !== 'removed' && removed?.state !== 'absent') throw new MpsError(`The journaled MPS candidate ${candidate.key} could not be removed by its immutable ID`, 'identity_changed');
+    return 'removed';
+}
+
+/** Drop exactly that candidate's journal entry after its cleanup succeeded. */
+export function dropSettledMpsCandidate(store, candidate) {
+    const current = store.read();
+    if (!current) return;
+    store.write({ ...current, pendingClients: (current.pendingClients || []).filter((entry) => !(entry.phase === 'readiness' && sameMpsTuple(entry, candidate))) });
+}
