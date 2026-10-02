@@ -86,12 +86,24 @@ class WorkspaceMetricsMonitor extends EventEmitter {
       },
       readVerified: readAppliedObservation,
     });
+    this.sampleTimer = null;
+    this.reconcileTimer = null;
+  }
+
+  // Observation starts explicitly (the Router at boot) or with the first
+  // subscriber, never on import: importing a module that reads the latest
+  // snapshot must not query the container engine or arm timers.
+  start() {
+    if (this.reconcileTimer) return this;
     void this.reconcile();
     this.sampleTimer = setInterval(() => void this.sample(), SAMPLE_INTERVAL_MS);
     this.reconcileTimer = setInterval(() => void this.reconcile(), RECONCILE_INTERVAL_MS);
     this.sampleTimer.unref?.();
     this.reconcileTimer.unref?.();
+    return this;
   }
+
+  get started() { return Boolean(this.reconcileTimer); }
 
   runningContainerNames() {
     return this.states
@@ -255,6 +267,7 @@ class WorkspaceMetricsMonitor extends EventEmitter {
   }
 
   subscribe(listener) {
+    this.start();
     const safeListener = (snapshot) => {
       try { listener(snapshot); } catch (_) {}
     };

@@ -23,7 +23,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { runBoundedProcess } from './liveProcess.mjs';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { runLiveCommand, LIVE_CASES, UNSUPPORTED, validateProfile } from './liveHarness.mjs';
 import { liveSourceDigest, workspaceSocketProblem } from './liveCommon.mjs';
 import { CONCRETE_BLOCKS, buildConcreteManifest, explorerFixtureImage, proposedWorkspace, renderSummary, selectPorts, summaryPathFor, validatePins } from './liveManifest.mjs';
@@ -382,14 +382,23 @@ async function configure(options) {
     return EXIT.PASS;
 }
 
-async function spawnSuite({ cwd, files, env, eventsPath, deadlineMs = DEFAULT_SUITE_DEADLINE_MS }) {
+async function spawnSuite({ cwd, files, env, eventsPath, deadlineMs = DEFAULT_SUITE_DEADLINE_MS, preload = null }) {
     const result = await runBoundedProcess(process.execPath, [
+        ...(preload ? ['--import', pathToFileURL(preload).href] : []),
         '--test', '--test-reporter=' + REPORTER, '--test-reporter-destination=' + eventsPath,
         '--test-reporter=dot', '--test-reporter-destination=stderr', ...files,
     ], { cwd, env, deadlineMs, maxBytes: 256 * 1024 });
     return { exitCode: result.status,
         signal: result.signal || (result.timedOut ? 'deadline' : result.truncated ? 'output-bound' : result.cancelled ? 'cancelled' : result.errorCode || result.settlementForced ? 'transport-incomplete' : null),
         stderr: result.stderr };
+}
+
+// Candidate Ploinky suites run with the unit-test isolation guard, which
+// fails any test process that starts a container engine, NVIDIA tool or
+// remote shell (tests/helpers/engineSpawnGuard.mjs).
+export function engineSpawnGuardFor(root) {
+    const guard = path.join(root, 'tests', 'helpers', 'engineSpawnGuard.mjs');
+    return fs.existsSync(guard) ? guard : null;
 }
 
 // Run one suite with the native reporter in an owned short temp directory.
@@ -405,6 +414,7 @@ export async function runSuite({
     required = [],
     baseline = null,
     knownBaselineFailures = new Map(),
+    preload = null,
 }) {
     // The owned temp directory lives outside the candidate root: a worktree
     // nested in another Ploinky workspace would otherwise let test
@@ -429,7 +439,7 @@ export async function runSuite({
             ...(agentLibDir ? { PLOINKY_AGENTLIB_DIR: agentLibDir } : {}),
             ...extraEnv,
         };
-        run = await spawnSuite({ cwd: root, files, env, eventsPath, deadlineMs });
+        run = await spawnSuite({ cwd: root, files, env, eventsPath, deadlineMs, preload });
     } finally {
         removeOwnedShortTemp(temp);
     }
@@ -671,6 +681,7 @@ async function offlineCommand(options) {
                 required,
                 baseline: inventory,
                 knownBaselineFailures,
+                preload: repo === 'ploinky' ? engineSpawnGuardFor(root) : null,
             })
             : evaluateSuiteRun({ exitCode: 1, eventText: '', files: [], required });
         // The staged Explorer layout is a runner-owned copy; the events file
@@ -705,7 +716,7 @@ async function selfTest(options) {
     const outputRoot = evidenceRoot || fs.mkdtempSync(path.join(PLOINKY_ROOT, '.hwl-self-'));
     const eventsPath = path.join(outputRoot, 'self-test-events.jsonl');
     try {
-        const result = await runSuite({ root: PLOINKY_ROOT, files, runId, childId: 'self-test', eventsPath, required });
+        const result = await runSuite({ root: PLOINKY_ROOT, files, runId, childId: 'self-test', eventsPath, required, preload: engineSpawnGuardFor(PLOINKY_ROOT) });
         const report = buildReport({
             runId, command: 'self-test', phase: 's0', suites: [{ ...result, repo: 'ploinky', files, eventsPath }],
             cases: result.cases, verdict: result.verdict, sources: {},

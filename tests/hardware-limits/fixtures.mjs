@@ -257,7 +257,7 @@ export function buildRequiredCaseManifest() {
             'H.malformed-pids', 'H.initial-busy', 'H.graphics-unknown-blocked', 'H.scratch-home',
             'H.duplicate-leaf-title-under-two-parents', 'H.p3-explorer-sibling-is-the-configured-ploinky-candidate',
         ]),
-        ...leaves(P, 's0', unit('hardwareLimitsFailureSignatures.test.mjs'), ['HS.proc-pid-normalization']),
+        ...leaves(P, 's0', unit('hardwareLimitsFailureSignatures.test.mjs'), ['HS.proc-pid-normalization', 'HS.engine-spawn-guard-fails-a-suite-that-starts-an-engine']),
         ...leaves(P, 's0', unit('hardwareLimitsLiveHarness.test.mjs'), ['HLIVE.R16-inherited-pipe-grandchild-deadline']),
         ...leaves(P, 'p0', unit('hardwareLimitsAdmission.test.mjs'), [
             'A.manifest-memory', 'A.catalog-cpu', 'A.profile-pids', 'A.lite-enabled-absent', 'A.lite-enabled-false',
@@ -422,7 +422,7 @@ export function buildRequiredCaseManifest() {
             'R.unlimited-and-stopped-no-op', 'R.authority-under-store-lock', 'R.cooperative-timeout-releases-real-lease',
             'R.cli-token-recheck-before-create', 'R.authorization-after-lock-wait',
             'R.limits-state-unplaced-instance-matches-apply', 'R.apply-demoted-while-waiting-for-lock',
-            'R.coordinated-client-pending-is-partial',
+            'R.coordinated-client-pending-is-partial', 'R.metrics-monitor-not-started-on-import',
         ]),
         ...leaves(P, 'p2', unit('marketplacePublicAdmin.test.mjs'), ['R.hardware-limits-production-admin-wiring']),
         ...leaves(P, 'p2', unit('workspaceMetricsLimits.test.mjs'), [

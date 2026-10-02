@@ -288,3 +288,13 @@ test('R.coordinated-client-pending-is-partial', async (t) => {
     assert.deepEqual(result.pendingContainers, ['alias1']);
     assert.deepEqual(result.results.map((value) => [value.key, value.state]), [['alias1', 'pending'], ['canonical', 'applied']]);
 });
+
+// Importing the routes (and through them the metrics monitor) starts no
+// engine query or timer; the Router starts the monitor at boot.
+test('R.metrics-monitor-not-started-on-import', async () => {
+    const { workspaceMetricsMonitor } = await import('../../cli/server/workspaceMetrics.js');
+    assert.equal(workspaceMetricsMonitor.started, false);
+    assert.equal(workspaceMetricsMonitor.latest, null);
+    const router = fs.readFileSync(new URL('../../cli/server/RoutingServer.js', import.meta.url), 'utf8');
+    assert.match(router, /workspaceMetricsMonitor\.start\(\);/);
+});

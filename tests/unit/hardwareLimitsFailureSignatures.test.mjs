@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { summarizeFailure } from '../hardware-limits/reporter.mjs';
 import { runSuite } from '../hardware-limits/verify.mjs';
 
@@ -112,4 +113,34 @@ test('HS.proc-pid-normalization', async (t) => {
     const changed = await runSuite({ root, files: ['cause.test.mjs'], runId: 'pid-run', childId: 'changed', eventsPath: path.join(root, 'changed.jsonl'), baseline: baseline.inventory, knownBaselineFailures: known });
     assert.equal(changed.newFailures.length, 1);
     assert.equal(changed.newFailures[0].reason, 'baseline failure diagnostic changed');
+});
+
+// The unit-test isolation guard the runner preloads: a test process that
+// starts a container engine fails, even when the code under test swallowed
+// the refusal; a test-owned fake under the test temporary directory is fine.
+test('HS.engine-spawn-guard-fails-a-suite-that-starts-an-engine', async (t) => {
+    const { engineSpawnGuardFor } = await import('../hardware-limits/verify.mjs');
+    const guard = engineSpawnGuardFor(fileURLToPath(new URL('../..', import.meta.url)));
+    assert.ok(guard, 'the candidate ships the guard');
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-guard-')));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    fs.writeFileSync(path.join(root, 'leak.test.mjs'), `import test from 'node:test'; import { execFile } from 'node:child_process'; import { promisify } from 'node:util';
+test('swallows an engine query', async () => { try { await promisify(execFile)('podman', ['ps']); } catch (_) {} });\n`);
+    fs.writeFileSync(path.join(root, 'clean.test.mjs'), `import test from 'node:test'; import fs from 'node:fs'; import os from 'node:os'; import path from 'node:path'; import { spawnSync } from 'node:child_process';
+test('runs only git and a test-owned fake', () => {
+    if (spawnSync('git', ['--version']).status !== 0) throw new Error('git');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-')); const fake = path.join(dir, 'podman');
+    fs.writeFileSync(fake, '#!/bin/sh\\nexit 0\\n', { mode: 0o755 });
+    if (spawnSync(fake, ['ps']).status !== 0) throw new Error('fake');
+});\n`);
+    // The leaking suite runs with an empty PATH, so no real engine can ever start.
+    const emptyBin = path.join(root, 'empty-bin'); fs.mkdirSync(emptyBin);
+    const run = (file, preload = guard) => runSuite({ root, files: [file], runId: 'guard-run', childId: `${file.replace('.test.mjs', '')}-${preload ? 'guarded' : 'plain'}`, eventsPath: path.join(root, `${file}-${preload ? 'guarded' : 'plain'}.jsonl`), preload,
+        ...(file === 'leak.test.mjs' ? { extraEnv: { PATH: emptyBin } } : {}) });
+    // Without the guard the swallowed engine query passes unnoticed.
+    assert.equal((await run('leak.test.mjs', null)).verdict, 'PASS');
+    const leak = await run('leak.test.mjs');
+    assert.equal(leak.verdict, 'FAIL');
+    assert.equal(leak.exitCode, 1);
+    assert.equal((await run('clean.test.mjs')).verdict, 'PASS');
 });

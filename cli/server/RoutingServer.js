@@ -6,6 +6,7 @@ import { execFileSync } from 'node:child_process';
 
 import { handleWebChat } from './handlers/webchat/index.js';
 import { handleStatus, streamWorkspaceMetrics } from './handlers/status.js';
+import { workspaceMetricsMonitor } from './workspaceMetrics.js';
 import { executeWorkspaceLogOperation } from './workspaceLogFiles.js';
 import { handleBlobs, handleWorkspaceUpload } from './handlers/blobs.js';
 import { handleWebtty } from './handlers/webtty.js';
@@ -1160,6 +1161,9 @@ healthServer.listen(detailedHealthSocket, () => {
     fs.chmodSync(detailedHealthSocket, 0o600);
     appendLog('health_server_start', { socket: detailedHealthSocket });
 });
+
+// Workspace metrics observe the engine for the Router's whole lifetime.
+workspaceMetricsMonitor.start();
 
 // Start server
 server.listen(port, '0.0.0.0', () => {
