@@ -2,6 +2,7 @@ import path from 'path';
 
 import { buildUpdateResult, createOperationRecord } from './updateOutcome.js';
 import { skillExportRecoveryProblem } from '../utils/skills/exportTransaction.mjs';
+import { sanitizeGitDiagnostic } from '../utils/gitCommand.js';
 
 // Record helpers shared by the core `ploinky update` entry points. Totals,
 // exit status and activation come from the operation records alone; the
@@ -194,6 +195,51 @@ export function defaultSkillsRecord(entry) {
     });
 }
 
+const SOURCE_REASON_LIMIT = 1000;
+const PRUNED_SKILLS_LIMIT = 100;
+
+function sourceReason(value) {
+    const text = sanitizeGitDiagnostic(value).replace(/\s*[\r\n]+\s*/g, '; ').trim();
+    return text.length > SOURCE_REASON_LIMIT ? `${text.slice(0, SOURCE_REASON_LIMIT)}…` : text;
+}
+
+// The sources a manifest could not use. `installSkillsFromManifest` marks each
+// retained source as failed or uncertain; a retained source with no structured
+// outcome is a failure, never a success.
+function retainedSourceFailures(sourceStates) {
+    const failed = [];
+    const uncertain = [];
+    for (const source of sourceStates) {
+        if (source?.state !== 'retained') continue;
+        const entry = {
+            name: source.name ?? null,
+            checkoutPath: source.checkoutPath ?? null,
+            url: source.url ?? null,
+            branch: source.branch ?? null,
+            code: String(source.code || 'source-unavailable'),
+            reason: sourceReason(source.reason || ''),
+            sourceOutcome: source.sourceOutcome === 'uncertain' ? 'uncertain' : 'failed',
+        };
+        (entry.sourceOutcome === 'uncertain' ? uncertain : failed).push(entry);
+    }
+    return { failed, uncertain };
+}
+
+function sourceFailureReason({ failed, uncertain }) {
+    const describe = (verb, source) => `Skill source '${source.name}' ${verb} (${source.code})${source.reason ? `: ${source.reason}` : ''}`;
+    return [...uncertain.map(source => describe('could not be verified', source)),
+        ...failed.map(source => describe('unavailable', source))].join('; ');
+}
+
+/**
+ * The record of one manifest folder. Outcome precedence: an export that
+ * needs recovery is uncertain; then any retained source whose state is
+ * unknown (uncertain); then any retained source that failed; otherwise the
+ * export decides changed or unchanged. A retained source's failure is never
+ * hidden by what was exported from the other sources. `details.sources` and
+ * `details.sourceStates` stay as they are: the graph resolves required
+ * membership from them for every outcome.
+ */
 export function skillsManifestRecord({ folder, manifestPath, label, result = null, error = null }) {
     const base = { phase: 'skills-manifest', id: folder };
     if (error) {
@@ -207,22 +253,54 @@ export function skillsManifestRecord({ folder, manifestPath, label, result = nul
     const exported = result?.managedExport || {};
     const recoveryProblem = skillExportRecoveryProblem(exported);
     const sourceStates = result?.sourceStates || result?.sources || [];
+    const sourceFailures = retainedSourceFailures(sourceStates);
+    const sourceProblem = sourceFailures.failed.length || sourceFailures.uncertain.length ? sourceFailureReason(sourceFailures) : '';
     const artifacts = Object.values(exported.artifacts || {});
     const changed = Boolean(exported.installed?.length || exported.removed?.length || result?.prunedSkills?.length
         || artifacts.some(value => value === true || value?.changed === true));
     const preserved = (exported.diagnostics || []).slice(0, 50).map(item => ({ name: item.name, reason: item.reason }));
+    // The prune is reported only once its export transaction settled: with a
+    // recovery problem the manifest rewrite is not known to have happened.
+    // The list is bounded; `prunedSkillCount` keeps the true total.
+    const prunedAll = recoveryProblem ? [] : (result?.prunedSkills || []);
+    const prunedSkills = prunedAll.slice(0, PRUNED_SKILLS_LIMIT)
+        .map(entry => ({ repository: String(entry.repository), skill: String(entry.skill) }));
+    let outcome;
+    let code;
+    let reason;
+    if (recoveryProblem) {
+        outcome = 'uncertain';
+        code = recoveryProblem.code;
+        reason = sourceProblem ? `${recoveryProblem.reason} ${sourceProblem}` : recoveryProblem.reason;
+    } else if (sourceFailures.uncertain.length) {
+        outcome = 'uncertain';
+        code = 'skill-source-uncertain';
+        reason = sourceProblem;
+    } else if (sourceFailures.failed.length) {
+        outcome = 'failed';
+        code = 'skill-source-unavailable';
+        reason = sourceProblem;
+    } else {
+        outcome = changed ? 'changed' : 'unchanged';
+        code = changed ? 'exported' : 'current';
+        reason = `${result?.skills?.length || 0} skill(s)${preserved.length ? `, ${preserved.length} existing output(s) preserved` : ''}`;
+    }
     return createOperationRecord({
         ...base,
-        outcome: recoveryProblem ? 'uncertain' : changed ? 'changed' : 'unchanged',
+        outcome,
         attempted: true,
-        code: recoveryProblem?.code || (changed ? 'exported' : 'current'),
-        reason: recoveryProblem?.reason || `${result?.skills?.length || 0} skill(s)${preserved.length ? `, ${preserved.length} existing output(s) preserved` : ''}`,
+        code,
+        reason,
         details: {
             folder,
             manifestPath,
             label,
             sources: [...new Set([...sourceStates.map(source => source.name), ...(result?.repos || []).map(repo => repo.name)].filter(Boolean))],
             sourceStates,
+            ...(sourceFailures.failed.length ? { failedSources: sourceFailures.failed } : {}),
+            ...(sourceFailures.uncertain.length ? { uncertainSources: sourceFailures.uncertain } : {}),
+            ...(sourceProblem ? { exportChanged: changed } : {}),
+            ...(prunedAll.length ? { prunedSkills, prunedSkillCount: prunedAll.length } : {}),
             transaction: exported.transaction || null,
             recovery: exported.recovery || null,
             preserved,

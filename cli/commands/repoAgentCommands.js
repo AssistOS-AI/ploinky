@@ -652,11 +652,18 @@ async function updateRepoResult(repoName, { command = ['update', 'repo', repoNam
             boxRun,
         });
         for (const result of skillConsumers.refreshed) {
-            records.push(skillsManifestRecord({
+            const consumerRecord = skillsManifestRecord({
                 folder: result.destRoot, manifestPath: result.manifestPath,
                 label: path.relative(PLOINKY_WORKSPACE_ROOT, result.destRoot) || path.basename(result.destRoot), result,
-            }));
-            console.log(`  ✓ skills consumer ${result.destRoot}: ${result.skills.length} skill(s)`);
+            });
+            records.push(consumerRecord);
+            // The line is derived from the record: a failed or uncertain
+            // source or export is never printed as an installation.
+            if (isErrorRecord(consumerRecord)) {
+                console.error(sanitizeGitDiagnostic(`  ✗ skills consumer ${result.destRoot}: ${consumerRecord.reason}`));
+            } else {
+                console.log(`  ✓ skills consumer ${result.destRoot}: ${result.skills.length} skill(s)`);
+            }
         }
         for (const failure of skillConsumers.failed) {
             records.push(skillsManifestRecord({
@@ -866,8 +873,23 @@ async function updateAllRepos(folderPath, options = {}) {
                     boxRun: options.boxRun,
                 });
                 manifestResults.push(result);
-                for (const entry of result.prunedSkills || []) {
-                    console.log(`    Removed missing skill '${entry.skill}' from '${entry.repository}' in the manifest.`);
+                const manifestRecord = skillsManifestRecord({ folder: manifestFolder, manifestPath, label: folderLabel, result });
+                records.push(manifestRecord);
+                // Both summaries are derived from the record: a failed or
+                // uncertain source or export is never printed as an installation.
+                // Present exactly when the export transaction settled, whatever
+                // the outcome of a source: the manifest rewrite did happen.
+                for (const entry of manifestRecord.details?.prunedSkills || []) {
+                    console.log(sanitizeGitDiagnostic(`    Removed missing skill '${entry.skill}' from '${entry.repository}' in the manifest.`));
+                }
+                const prunedListed = manifestRecord.details?.prunedSkills?.length || 0;
+                const prunedTotal = manifestRecord.details?.prunedSkillCount || prunedListed;
+                if (prunedTotal > prunedListed) {
+                    console.log(`    … and ${prunedTotal - prunedListed} more skill(s) removed from the manifest.`);
+                }
+                if (isErrorRecord(manifestRecord)) {
+                    console.error(sanitizeGitDiagnostic(`  ✗ ${folderLabel} skills: ${manifestRecord.reason}`));
+                    continue;
                 }
                 const reposLabel = result.repoCount ? ` from ${result.repoCount} repos` : '';
                 const skillNames = result.skills.join(', ');
@@ -881,7 +903,6 @@ async function updateAllRepos(folderPath, options = {}) {
                 if (result.gitignoreUpdated) {
                     console.log(`    .gitignore updated`);
                 }
-                records.push(skillsManifestRecord({ folder: manifestFolder, manifestPath, label: folderLabel, result }));
             } catch (err) {
                 const message = err?.message || String(err);
                 records.push(skillsManifestRecord({ folder: manifestFolder, manifestPath, label: folderLabel, error: err }));

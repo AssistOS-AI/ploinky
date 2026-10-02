@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { applyGraphRequirements, readUpdateGraph, withUpdateSkillScopes } from '../../cli/commands/updateGraph.js';
-import { createOperationRecord } from '../../cli/commands/updateOutcome.js';
+import { createOperationRecord, decideUpdateStatus } from '../../cli/commands/updateOutcome.js';
 import { skillsManifestRecord } from '../../cli/commands/updateRecords.js';
 
 // Graph closure: which update records are required inputs of the workspace
@@ -233,5 +233,74 @@ test('concurrent update commands keep their host skill-scope contexts separate',
             return [...graph.skillScopePaths];
         })));
         assert.deepEqual(results, [[fs.realpathSync(fx.workspace)], [fs.realpathSync(nested)]]);
+    } finally { fs.rmSync(fx.root, { recursive: true, force: true }); }
+});
+
+// A manifest record that failed because of a source keeps the membership
+// evidence (details.sources, sourceStates), so the graph still decides it and
+// the sources it names exactly as for a successful export.
+const failedSourceManifest = (folder, { checkout, name = 'Missing', sourceOutcome = 'failed' } = {}) => skillsManifestRecord({
+    folder, manifestPath: path.join(folder, 'ploinky-skills-manifest.json'), label: path.basename(folder),
+    result: {
+        skills: [], managedExport: { transaction: { status: 'unchanged' } },
+        sourceStates: [{ name, checkoutPath: checkout, state: 'retained', sourceOutcome, code: 'source-unavailable', reason: 'clone failed' }],
+    },
+});
+
+test('a failed required skills manifest stays required and makes its source repositories required', () => {
+    const fx = fixture();
+    try {
+        fx.manifest('Main', 'app', {});
+        const checkout = path.join(fx.workspace, '.ploinky', 'repos', 'Missing');
+        const graph = readUpdateGraph({ workspaceRoot: fx.workspace,
+            readRegistry: () => ({ a: { type: 'agent', repoName: 'Main', agentName: 'app' } }),
+            repositoryPath: fx.repositoryPath,
+            skillScopeContext: { prior: null, proposed: fx.workspace, priorRequired: false } });
+        const records = applyGraphRequirements([
+            failedSourceManifest(fx.workspace, { checkout }),
+            record('workspace-repository', checkout, { outcome: 'skipped', details: { checkout: { path: checkout } } }),
+            record('registered-repository', 'Missing', { outcome: 'skipped' }),
+        ], { prior: graph, proposed: graph });
+        assert.equal(records[0].outcome, 'failed');
+        assert.deepEqual(records.map(value => value.required), [true, true, true]);
+        const decision = decideUpdateStatus(records);
+        assert.equal(decision.activationAllowed, false);
+        assert.equal(decision.exitCode, 1);
+    } finally { fs.rmSync(fx.root, { recursive: true, force: true }); }
+});
+
+test('a failed optional skills manifest is optional, promotes nothing and still exits nonzero', () => {
+    const fx = fixture();
+    try {
+        fx.manifest('Main', 'app', {});
+        const optional = path.join(fx.workspace, 'optional');
+        fs.mkdirSync(optional);
+        const checkout = path.join(fx.workspace, '.ploinky', 'repos', 'Missing');
+        const graph = readUpdateGraph({ workspaceRoot: fx.workspace,
+            readRegistry: () => ({ a: { type: 'agent', repoName: 'Main', agentName: 'app' } }),
+            repositoryPath: fx.repositoryPath,
+            skillScopeContext: { prior: null, proposed: fx.workspace, priorRequired: false } });
+        const records = applyGraphRequirements([
+            failedSourceManifest(optional, { checkout }),
+            record('registered-repository', 'Missing', { outcome: 'unchanged' }),
+        ], { prior: graph, proposed: graph });
+        assert.deepEqual(records.map(value => value.required), [false, false]);
+        const decision = decideUpdateStatus(records);
+        assert.deepEqual([decision.exitCode, decision.activationAllowed, decision.status], [1, true, 'partial']);
+    } finally { fs.rmSync(fx.root, { recursive: true, force: true }); }
+});
+
+test('a failed or uncertain skills manifest with unknown membership is conservative', () => {
+    const fx = fixture();
+    try {
+        const broken = readUpdateGraph({ workspaceRoot: fx.workspace, readRegistry: () => { throw new Error('agents registry is invalid'); } });
+        for (const sourceOutcome of ['failed', 'uncertain']) {
+            const records = applyGraphRequirements([
+                failedSourceManifest(path.join(fx.workspace, 'elsewhere'), { checkout: path.join(fx.workspace, 'x'), sourceOutcome }),
+            ], { prior: broken, proposed: broken });
+            assert.equal(records[0].required, null);
+            const decision = decideUpdateStatus(records);
+            assert.deepEqual([decision.exitCode, decision.activationAllowed], [1, false], sourceOutcome);
+        }
     } finally { fs.rmSync(fx.root, { recursive: true, force: true }); }
 });
