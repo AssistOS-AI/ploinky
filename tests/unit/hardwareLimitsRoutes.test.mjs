@@ -219,3 +219,43 @@ test('R.limits-state-unplaced-instance-matches-apply', (t) => {
     // A stopped instance stays unavailable either way.
     assert.equal(buildHardwareLimitsState({ context, installed: [{ ref: 'demo/worker', manifestPath: '/x' }], registry: { canonical: f.registry.canonical }, metrics: null, admit: () => ({ descriptor: unlimited }) }).agents[0].containers[0].limitsState, 'unavailable');
 });
+
+test('R.apply-demoted-while-waiting-for-lock', async (t) => {
+    const f = fixture(t);
+    // The production check re-resolves the session's user on every call.
+    const sessions = new Map([['fixture-session', { id: 'fixture-admin', roles: ['admin'] }]]);
+    const ensureAdmin = async (req, res) => {
+        req.user = sessions.get(req.sessionId);
+        if (req.user?.roles?.includes('admin')) return true;
+        res.writeHead(req.user ? 403 : 401); res.end(JSON.stringify({ ok: false, error: 'admin_required' })); return false;
+    };
+    for (const demote of [false, true]) {
+        sessions.set('fixture-session', { id: 'fixture-admin', roles: ['admin'] });
+        let mutations = 0;
+        const result = await request(f, { method: 'POST', body: { action: 'apply', expectedToken: f.token, containers: ['canonical'] }, dependencies: {
+            ensureAdmin,
+            // The real worker thread holds the workspace lease, then asks the
+            // Router to authorize (its blocking round trip is the bridge
+            // below). The demotion lands while Apply waits for that lock.
+            apply: async (input, options) => {
+                if (demote) sessions.set('fixture-session', { id: 'fixture-admin', roles: ['user'] });
+                const allowed = await options.authorize();
+                return applyHardwareLimits(input, {
+                    lease: async (_options, callback) => callback(), authorize: () => allowed,
+                    loadRegistry: () => f.registry, loadRouting: () => ({ routes: {} }),
+                    readPolicy: () => ({ paths: f.paths, token: f.getContext().storeToken }),
+                    loadPlan: () => ({}), isUnchanged: () => false,
+                    reconcile: async (captured) => { mutations++; return { key: captured.key, state: 'applied', problem: null }; },
+                });
+            },
+        } });
+        if (demote) {
+            assert.equal(mutations, 0, 'a demoted administrator mutates nothing');
+            assert.equal(result.status, 409, JSON.stringify(result.body));
+            assert.equal(result.body.error, 'identity_changed');
+        } else {
+            assert.equal(result.status, 200, JSON.stringify(result.body));
+            assert.equal(mutations, 1);
+        }
+    }
+});

@@ -208,3 +208,33 @@ test('Marketplace advertises each agent manifest enable modes and default', asyn
     assert.deepEqual([agent('open').enableModes, agent('open').enableMode], [['isolated', 'global', 'devel'], 'isolated']);
     assert.deepEqual([agent('broken').enableModes, agent('broken').enableMode], [['isolated', 'global', 'devel'], 'isolated']);
 });
+
+test('hardware-limits route is wired to the real administrator check for every session role', async () => {
+    const guest = { sessionId: 'guest-provider-session', user: { id: 'guest', roles: ['guest'] } };
+    const guestAdmin = { sessionId: 'guest-admin-provider-session', user: { id: 'guest-admin', roles: ['admin', 'guest'] } };
+    const validate = authService.validateSession;
+    authService.validateSession = async id => [admin, user, guest, guestAdmin].find(session => session.sessionId === id) || null;
+    try {
+        const body = { action: 'clear_agent_limits', expectedToken: { epoch: 'a'.repeat(32), revision: 1 }, agentRef: 'repo/worker' };
+        for (const routePlan of [plan(), null]) {
+            for (const method of ['GET', 'POST']) {
+                const label = `${routePlan ? 'routed' : 'local'} ${method}`;
+                for (const who of [user, guest, guestAdmin]) {
+                    const res = await request({ resource: 'hardware-limits', who, routePlan, method, body });
+                    assert.equal(res.status, 403, `${label} ${who.user.id}: ${JSON.stringify(res.body)}`);
+                    assert.equal(res.body.error, 'admin_required', `${label} ${who.user.id}`);
+                }
+                assert.equal((await request({ resource: 'hardware-limits', who: foreign, routePlan, method, body })).status, 401, `${label} foreign`);
+            }
+        }
+        // Positive control: an administrator passes the same check and reaches
+        // the handler, which refuses only because this process is not in a Box.
+        for (const method of ['GET', 'POST']) {
+            const res = await request({ resource: 'hardware-limits', method, body });
+            assert.equal(res.status, 409, `admin ${method}: ${JSON.stringify(res.body)}`);
+            assert.equal(res.body.error, 'not_in_box');
+        }
+    } finally {
+        authService.validateSession = validate;
+    }
+});
