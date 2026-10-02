@@ -366,21 +366,42 @@ test('MC.shareless-crashed-launcher-leftover-is-still-settled', async (t) => {
 // earlier incarnation of the PID.
 const ownerOf = (extra) => ({ pid: process.pid, startTime: null, processToken: randomUUID(), operationId: randomUUID(), ...extra });
 
+// A worker's lifecycle: wait for its ready message (posted after its module graph
+// finished evaluating), then send 'done' and wait for its natural `exit`.
+// Terminating a worker while its ES module evaluation is still completing
+// asynchronously crashed the test process with a native SIGTRAP under load
+// (V8 `SourceTextModule::AsyncModuleExecutionFulfilled`); `terminate()` is only
+// the fallback for a worker that never exits.
+const WORKER_EXIT_TIMEOUT_MS = 10_000;
+function startWorker(file) {
+    const worker = new Worker(new URL(file, import.meta.url));
+    const exited = new Promise((resolve) => worker.once('exit', resolve));
+    const stop = async () => {
+        worker.postMessage('done');
+        let timer;
+        const fallback = new Promise((resolve) => { timer = setTimeout(() => resolve(worker.terminate()), WORKER_EXIT_TIMEOUT_MS); });
+        try { await Promise.race([exited, fallback]); } finally { clearTimeout(timer); }
+        await exited;
+    };
+    return { worker, stop };
+}
+
 test('MC.owner-in-a-worker-thread-of-this-process-is-live-for-every-thread', async () => {
-    const worker = new Worker(new URL('../helpers/mpsOwnerWorker.mjs', import.meta.url));
+    const { worker, stop } = startWorker('../helpers/mpsOwnerWorker.mjs');
     try {
         const message = await new Promise((resolve, reject) => { worker.once('message', resolve); worker.once('error', reject); });
+        assert.equal(message.type, 'ready');
         assert.equal(message.owner.pid, process.pid, 'same PID as this thread');
         assert.equal(message.selfView, 'live', 'the owning thread sees its operation live');
         assert.equal(mpsOwnerState(message.owner), 'live', 'another thread of the process never judges it gone');
-    } finally { worker.postMessage('done'); await worker.terminate(); }
+    } finally { await stop(); }
 });
 
 // The release of a worker thread's operation reaches every other thread of the
 // process: a candidate whose container remains (a failed cleanup) is in flight
 // only while its launching operation runs, not for the process's lifetime.
 test('MC.a-released-owner-of-a-worker-thread-is-gone-for-every-thread', async () => {
-    const worker = new Worker(new URL('../helpers/mpsOwnerReleaseWorker.mjs', import.meta.url));
+    const { worker, stop } = startWorker('../helpers/mpsOwnerReleaseWorker.mjs');
     const next = (type) => new Promise((resolve, reject) => {
         const onMessage = (message) => { if (message.type === type) { worker.off('message', onMessage); resolve(message); } };
         worker.on('message', onMessage); worker.once('error', reject);
@@ -399,7 +420,7 @@ test('MC.a-released-owner-of-a-worker-thread-is-gone-for-every-thread', async ()
         assert.equal(mpsOwnerState(owner), 'gone', 'released in the worker: gone for this thread too');
         assert.equal(settle(), 'removed', 'the remaining candidate is settled instead of blocking for the process lifetime');
         assert.equal(mpsOwnerState({ ...owner, operationId: randomUUID() }), 'live', 'an owner this process never recorded as released proves nothing');
-    } finally { worker.postMessage('done'); await worker.terminate(); }
+    } finally { await stop(); }
 });
 
 test('MC.owner-with-this-pid-and-another-token-is-gone-only-when-the-start-time-differs', () => {

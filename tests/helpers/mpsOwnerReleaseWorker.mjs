@@ -6,7 +6,10 @@ import { parentPort } from 'node:worker_threads';
 import { mpsLaunchOwner, mpsOwnerState, releaseMpsLaunchOwner } from '../../cli/sandbox/hardwareLimits/mpsInventory.mjs';
 
 const owner = mpsLaunchOwner();
-parentPort.postMessage({ type: 'created', owner, selfView: mpsOwnerState(owner) });
+// Report only after the module graph has finished evaluating (see
+// mpsOwnerWorker.mjs): the test never terminates a worker that is still
+// starting, it sends 'done' and waits for the worker's own `exit`.
+setImmediate(() => parentPort.postMessage({ type: 'created', owner, selfView: mpsOwnerState(owner) }));
 parentPort.on('message', (message) => {
     if (message === 'release') {
         releaseMpsLaunchOwner(owner);
