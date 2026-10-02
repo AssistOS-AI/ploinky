@@ -636,7 +636,7 @@ export function validateAgentLimits({
     if (entry.gpu !== undefined) {
         const gpu = capabilities.gpu || { eligible: false, code: 'gpu_sharing_unavailable', reason: 'GPU sharing is not available in this Box.' };
         if (gpu.memoryModel === 'unified' || gpu.memoryModel === 'unknown') {
-            fail(`GPU sharing is unsupported on this unified or unverified GPU memory model: ${gpu.name || 'unknown'}. Clear the GPU share.`, { code: 'gpu_sharing_unavailable', field: 'gpu' });
+            fail(`GPU sharing is unsupported on this unified or unverified GPU memory model: ${gpu.name || 'unknown'}. Clear the GPU share. CPU/RAM controls remain separately available.`, { code: 'gpu_sharing_unavailable', field: 'gpu' });
         }
         if (gpu.eligible !== true) fail(gpu.reason || 'GPU sharing is not available in this Box.', { code: gpu.code || 'gpu_sharing_unavailable', field: 'gpu' });
         if (gpu.imageUserKnown === false) {

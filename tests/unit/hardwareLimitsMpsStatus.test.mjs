@@ -78,3 +78,44 @@ test('MS.POST GPU validation sees exact profiles and fails before store write', 
         assert.equal(status.mpsGeneration, null); assert.equal(status.daemonStatus, 'pending');
     }
 });
+
+test('M7.gb10-refusal-carries-the-unified-memory-text', async (t) => {
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const { parseMpsGpuObservation } = await import('../../cli/sandbox/hardwareLimits/mpsEligibility.mjs');
+    const { resolveStoredOverride } = await import('../../cli/sandbox/hardwareLimits/resolve.mjs');
+    const { qualifyHardwareGpuTarget, hardwareHttpError } = await import('../../cli/server/authHandlers/hardwareLimitsRoutes.mjs');
+    const reason = 'GPU sharing is unsupported on this unified or unverified GPU memory model: NVIDIA GB10.';
+    const fix = 'Clear the GPU share. CPU/RAM controls remain separately available.';
+    // GB10 with numeric memory, and GB10 that reports no dedicated memory.
+    for (const line of ['0, GPU-12345678-1234-1234-1234-123456789012, NVIDIA GB10, 122570, 580.95.05', '0, GPU-12345678-1234-1234-1234-123456789012, NVIDIA GB10, [N/A], 580.95.05']) {
+        const status = readMpsStatus({ ...deps, observeGpu: () => parseMpsGpuObservation(line) });
+        assert.equal(status.eligible, false);
+        assert.equal(status.memoryModel, 'unified');
+        assert.equal(status.name, 'NVIDIA GB10');
+        assert.equal(status.reason, `${reason} ${fix}`);
+        // Admission: the stored share is refused with exactly the §9.3 text.
+        const resolved = resolveStoredOverride({ gpu: { smPercent: 25, vramPercent: 25 } }, { cpus: 8, memoryBytes: 8 * 1024 ** 3 }, { ref: 'demo/worker', gpu: status });
+        assert.equal(resolved.problem.reason, reason);
+        assert.equal(resolved.problem.fix, fix);
+        // API qualification of a Save: the typed HTTP message carries it too.
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-gb10-'));
+        t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+        const manifestPath = path.join(root, 'manifest.json');
+        fs.writeFileSync(manifestPath, JSON.stringify({ container: 'prepared:image', start: 'sleep infinity' }));
+        let error;
+        try {
+            qualifyHardwareGpuTarget({ ref: 'demo/worker', manifestPath }, [], { gpu: status, identity: { workspaceRoot: root } }, { gpu: { smPercent: 25, vramPercent: 25 } },
+                { inspectImage: () => assert.fail('a refused model never inspects an image') });
+        } catch (caught) { error = caught; }
+        assert.ok(error, 'qualification refuses');
+        const response = hardwareHttpError(error);
+        assert.equal(response.body.error, 'gpu_sharing_unavailable');
+        assert.equal(response.body.message, `${reason} ${fix}`);
+    }
+    // An unknown model names itself the same way.
+    const unknown = readMpsStatus({ ...deps, observeGpu: () => parseMpsGpuObservation('0, GPU-12345678-1234-1234-1234-123456789012, NVIDIA DGX Spark, 122570, 580.95.05') });
+    assert.equal(unknown.memoryModel, 'unknown');
+    assert.equal(unknown.reason, `GPU sharing is unsupported on this unified or unverified GPU memory model: NVIDIA DGX Spark. ${fix}`);
+});

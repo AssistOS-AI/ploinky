@@ -2,7 +2,7 @@
 // (plan §3 defaults, §8.1, §8.3). Pure functions over bounded observations.
 
 import crypto from 'node:crypto';
-import { resolveMpsShare, MpsError } from './mpsEligibility.mjs';
+import { resolveMpsShare, MpsError, unsupportedGpuMemoryModelReason, UNSUPPORTED_GPU_MEMORY_MODEL_FIX } from './mpsEligibility.mjs';
 
 export const MIB = 1024 * 1024;
 export const MIN_MEMORY_BYTES = 64 * MIB;
@@ -214,6 +214,18 @@ export function resolveStoredOverride(entry, envelope, { ref = 'REPO/AGENT', gpu
         // Every stored field replaces its declared value, so the refusal lists
         // the stored values (never a manifest value the entry overrides).
         const requested = storedRequestedLimits(entry);
+        if (error.code === 'gpu_sharing_unavailable' && entry.gpu !== undefined && (gpu?.memoryModel === 'unified' || gpu?.memoryModel === 'unknown')) {
+            // Plan §9.3: the exact unified/unknown memory-model refusal.
+            return Object.freeze({
+                policy: null,
+                problem: Object.freeze({
+                    reasonCode: 'gpu_sharing_unavailable',
+                    reason: unsupportedGpuMemoryModelReason(gpu.name),
+                    fix: UNSUPPORTED_GPU_MEMORY_MODEL_FIX,
+                    requested,
+                }),
+            });
+        }
         if (error.code === 'gpu_sharing_unavailable') {
             return Object.freeze({
                 policy: null,

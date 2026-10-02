@@ -13,15 +13,30 @@ export function classifyGpuMemoryModel(name) {
     return 'unknown';
 }
 
+// Plan §9.3: the unified/unknown memory-model refusal reason and fix.
+export function unsupportedGpuMemoryModelReason(name) {
+    const text = String(name || '').replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 256) || 'unknown';
+    return `GPU sharing is unsupported on this unified or unverified GPU memory model: ${text}.`;
+}
+export const UNSUPPORTED_GPU_MEMORY_MODEL_FIX = 'Clear the GPU share. CPU/RAM controls remain separately available.';
+
 export function parseMpsGpuObservation(text) {
     const lines = String(text || '').trim().split('\n');
     if (lines.length !== 1) throw new MpsError('GPU index 0 must have one exact observation');
     const fields = lines[0].split(',').map((value) => value.trim());
-    if (fields.length !== 5 || fields[0] !== '0' || !/^GPU-[a-f0-9-]{36}$/i.test(fields[1]) || !/^[1-9]\d*$/.test(fields[3]) || !/^\d+(?:\.\d+)+$/.test(fields[4])) throw new MpsError('GPU identity or dedicated memory is unknown');
+    if (fields.length !== 5 || fields[0] !== '0') throw new MpsError('GPU identity or dedicated memory is unknown');
+    // Classify the model before memory.total: a unified GPU (GB10) may not
+    // report dedicated memory at all, and must still refuse as unified.
+    const memoryModel = classifyGpuMemoryModel(fields[2]);
+    if (memoryModel !== 'dedicated') {
+        const error = new MpsError(memoryModel === 'unified' ? 'Unified GPUs cannot use configured MPS shares' : 'The GPU memory model is unknown');
+        error.memoryModel = memoryModel;
+        error.gpuName = fields[2];
+        throw error;
+    }
+    if (!/^GPU-[a-f0-9-]{36}$/i.test(fields[1]) || !/^[1-9]\d*$/.test(fields[3]) || !/^\d+(?:\.\d+)+$/.test(fields[4])) throw new MpsError('GPU identity or dedicated memory is unknown');
     const memoryMiB = Number(fields[3]);
     if (!Number.isSafeInteger(memoryMiB) || !Number.isSafeInteger(memoryMiB * 1048576)) throw new MpsError('GPU dedicated memory is out of range');
-    const memoryModel = classifyGpuMemoryModel(fields[2]);
-    if (memoryModel !== 'dedicated') throw new MpsError(memoryModel === 'unified' ? 'Unified GPUs cannot use configured MPS shares' : 'The GPU memory model is unknown');
     return Object.freeze({ index: 0, uuid: fields[1], name: fields[2], memoryMiB, driverVersion: fields[4], memoryModel });
 }
 

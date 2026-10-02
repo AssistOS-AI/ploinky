@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { readBoxGpuGrant } from '../../../ploinky-box/lib/gpuGrantMarker.mjs';
 import { createMpsStateStore, createMpsDaemonBackend } from './mps.mjs';
-import { MpsError, observeMpsGpu, inspectMpsImage, resolveMpsShare } from './mpsEligibility.mjs';
+import { MpsError, observeMpsGpu, inspectMpsImage, resolveMpsShare, unsupportedGpuMemoryModelReason, UNSUPPORTED_GPU_MEMORY_MODEL_FIX } from './mpsEligibility.mjs';
 
 /** Bounded observations only: never prepares an image or starts a daemon. */
 export function readMpsStatus({ workspaceRoot, readGrant = readBoxGpuGrant, observeGpu = observeMpsGpu,
@@ -28,7 +28,13 @@ export function readMpsStatus({ workspaceRoot, readGrant = readBoxGpuGrant, obse
         result.pendingClients = (Array.isArray(state.pendingClients) ? state.pendingClients : []).slice(0, 256).map(({ key, instanceId, enableGeneration }) => ({ key, instanceId, enableGeneration }));
         if (!verified) result.reason = 'MPS generation requires lifecycle recovery before clients can be ready.';
         return finish(result);
-    } catch (_) {
+    } catch (error) {
+        // A unified or unknown memory model is a definite refusal (§9.3),
+        // not an unverifiable fact: keep the model and name it was refused for.
+        if (error?.memoryModel === 'unified' || error?.memoryModel === 'unknown') {
+            return finish({ ...result, eligible: false, memoryModel: error.memoryModel, name: String(error.gpuName || '').slice(0, 256),
+                reason: `${unsupportedGpuMemoryModelReason(error.gpuName)} ${UNSUPPORTED_GPU_MEMORY_MODEL_FIX}`, code: 'gpu_sharing_unavailable' });
+        }
         return finish({ ...result, eligible: false, reason: 'GPU sharing facts or daemon ownership could not be verified. Inspect GPU wiring and MPS tools, then retry.', code: 'gpu_sharing_unavailable' });
     }
 }
