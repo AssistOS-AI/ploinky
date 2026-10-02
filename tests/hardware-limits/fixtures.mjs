@@ -378,6 +378,12 @@ export function buildRequiredCaseManifest() {
             'HLIVE.C2-counter-never-moving-fails-with-the-same-message',
             'HLIVE.C2-leaf-vanishing-after-exit-is-a-distinct-recorded-failure',
         ]),
+        ...leaves(P, 'p1', unit('hardwareLimitsRepeatStart.test.mjs'), [
+            'RS.host-env-gate-repeat-and-saved-gate-repeat-select-the-same-wiring-and-rewrite-nothing',
+            'RS.repeat-start-twice-replaces-no-unchanged-running-limited-agent',
+            'RS.service-reuse-comparison-matches-the-creation-label',
+            'RS.a-nested-backend-probe-failure-is-the-plan-defined-way-limited-agents-are-removed',
+        ]),
         ...leaves(P, 'p1', unit('hardwareLimitsLiveProvision.test.mjs'), [
             'L1.provision-mac-c1-c2-success', 'L1.provision-apparatus-a1-staged-success',
             'L1.provision-failure-boundaries-clean-up', 'L1.fake-engine-templates-are-strict',
