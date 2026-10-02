@@ -116,31 +116,44 @@ test('HS.proc-pid-normalization', async (t) => {
 });
 
 // The unit-test isolation guard the runner preloads: a test process that
-// starts a container engine fails, even when the code under test swallowed
-// the refusal; a test-owned fake under the test temporary directory is fine.
+// would run a container engine fails, directly, through a wrapper, through a
+// shell line or in a descendant Node process, even when the code under test
+// swallowed the refusal; a test-owned fake under the test temporary
+// directory is fine. A harmless sentinel named podman, first on PATH, records
+// any invocation that got through.
 test('HS.engine-spawn-guard-fails-a-suite-that-starts-an-engine', async (t) => {
     const { engineSpawnGuardFor } = await import('../hardware-limits/verify.mjs');
     const guard = engineSpawnGuardFor(fileURLToPath(new URL('../..', import.meta.url)));
     assert.ok(guard, 'the candidate ships the guard');
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-guard-')));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-    fs.writeFileSync(path.join(root, 'leak.test.mjs'), `import test from 'node:test'; import { execFile } from 'node:child_process'; import { promisify } from 'node:util';
-test('swallows an engine query', async () => { try { await promisify(execFile)('podman', ['ps']); } catch (_) {} });\n`);
-    fs.writeFileSync(path.join(root, 'clean.test.mjs'), `import test from 'node:test'; import fs from 'node:fs'; import os from 'node:os'; import path from 'node:path'; import { spawnSync } from 'node:child_process';
-test('runs only git and a test-owned fake', () => {
+    const sentinelBin = path.join(root, 'sentinel-bin'); fs.mkdirSync(sentinelBin);
+    const ledger = path.join(root, 'sentinel.log');
+    fs.writeFileSync(path.join(sentinelBin, 'podman'), `#!/bin/sh\necho "$0 $*" >> ${JSON.stringify(ledger)}\nexit 0\n`, { mode: 0o755 });
+    const header = "import test from 'node:test'; import { execFile, execFileSync, execSync, spawnSync } from 'node:child_process'; import { promisify } from 'node:util';";
+    const suites = {
+        'swallowed.test.mjs': "test('swallows an engine query', async () => { try { await promisify(execFile)('podman', ['ps']); } catch (_) {} });",
+        'env-wrapper.test.mjs': "test('runs the engine through env', () => { try { execFileSync('/usr/bin/env', ['podman', 'ps']); } catch (_) {} });",
+        'shell-line.test.mjs': "test('runs the engine in a shell line', () => { try { execSync('true && podman ps'); } catch (_) {} try { execFileSync('/bin/sh', ['-c', 'podman ps']); } catch (_) {} });",
+        'descendant-node.test.mjs': "test('runs the engine in a Node child', () => { spawnSync(process.execPath, ['-e', \"try { require('node:child_process').execFileSync('podman', ['ps']); } catch (_) {}\"]); });",
+        'descendant-native.test.mjs': "test('runs the engine in a native child script', () => { spawnSync('/bin/sh', ['-c', 'x=podman; $x ps']); });",
+    };
+    for (const [file, body] of Object.entries(suites)) fs.writeFileSync(path.join(root, file), `${header}\n${body}\n`);
+    fs.writeFileSync(path.join(root, 'clean.test.mjs'), `${header} import fs from 'node:fs'; import os from 'node:os'; import path from 'node:path';
+test('runs only git, a lookup and a test-owned fake', () => {
     if (spawnSync('git', ['--version']).status !== 0) throw new Error('git');
+    execSync('command -v podman || true');
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-')); const fake = path.join(dir, 'podman');
     fs.writeFileSync(fake, '#!/bin/sh\\nexit 0\\n', { mode: 0o755 });
     if (spawnSync(fake, ['ps']).status !== 0) throw new Error('fake');
 });\n`);
-    // The leaking suite runs with an empty PATH, so no real engine can ever start.
-    const emptyBin = path.join(root, 'empty-bin'); fs.mkdirSync(emptyBin);
-    const run = (file, preload = guard) => runSuite({ root, files: [file], runId: 'guard-run', childId: `${file.replace('.test.mjs', '')}-${preload ? 'guarded' : 'plain'}`, eventsPath: path.join(root, `${file}-${preload ? 'guarded' : 'plain'}.jsonl`), preload,
-        ...(file === 'leak.test.mjs' ? { extraEnv: { PATH: emptyBin } } : {}) });
-    // Without the guard the swallowed engine query passes unnoticed.
-    assert.equal((await run('leak.test.mjs', null)).verdict, 'PASS');
-    const leak = await run('leak.test.mjs');
-    assert.equal(leak.verdict, 'FAIL');
-    assert.equal(leak.exitCode, 1);
+    const run = (file) => runSuite({ root, files: [file], runId: 'guard-run', childId: file.replace('.test.mjs', ''), eventsPath: path.join(root, `${file}.jsonl`), preload: guard,
+        extraEnv: { PATH: `${sentinelBin}:/usr/bin:/bin` } });
+    for (const file of Object.keys(suites)) {
+        const result = await run(file);
+        assert.equal(result.verdict, 'FAIL', file);
+        assert.equal(result.exitCode, 1, file);
+    }
+    assert.equal(fs.existsSync(ledger), false, `no guarded program ran: ${fs.existsSync(ledger) ? fs.readFileSync(ledger, 'utf8') : ''}`);
     assert.equal((await run('clean.test.mjs')).verdict, 'PASS');
 });
