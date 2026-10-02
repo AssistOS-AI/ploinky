@@ -91,6 +91,26 @@ test('getConfiguredProjectPath still gives the static agent the workspace root',
     assert.equal(result.canonical, result.root);
 });
 
+function readLaunches(log) {
+    if (!fs.existsSync(log)) return [];
+    return fs.readFileSync(log, 'utf8').split('\n').filter(Boolean).flatMap((line) => {
+        try { return [JSON.parse(line)]; } catch { return []; } // a line still being written
+    });
+}
+
+async function waitForLaunches(log, pid, { timeoutMs = 15_000, intervalMs = 25 } = {}) {
+    assert.ok(Number.isInteger(pid) && pid > 0, `the start returned a pid (${pid})`);
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+        const launches = readLaunches(log);
+        if (launches.some(entry => entry.pid === pid)) return launches;
+        if (Date.now() >= deadline) {
+            assert.fail(`no launch record for pid ${pid} in ${log} within ${timeoutMs} ms (saw ${JSON.stringify(launches.map(entry => entry.pid))})`);
+        }
+        await new Promise(resolve => setTimeout(resolve, intervalMs));
+    }
+}
+
 function bindSources(args, target) {
     const sources = [];
     for (let index = 0; index < args.length - 2; index += 1) {
@@ -103,7 +123,7 @@ function bindSources(args, target) {
 // (The registry lookup itself is covered above; a prepared start rejects a
 // record whose projectPath changes after preparation.)
 {
-    test('bwrap start of the canonical instance mounts its own home', (t) => {
+    test('bwrap start of the canonical instance mounts its own home', async (t) => {
         const w = wiringWorkspace(t, { runtime: 'bwrap', manifest: MANIFEST, packageJson: null, prefix: 'bwrap-alias-first-' });
         const log = path.join(w.root, 'fake-bwrap-launches.jsonl');
         const fake = path.join(w.root, 'fake-bwrap');
@@ -112,9 +132,8 @@ require('fs').appendFileSync(${JSON.stringify(log)}, JSON.stringify({ pid: proce
 setTimeout(() => {}, 60000);
 `, { mode: 0o755 });
         t.after(() => {
-            if (!fs.existsSync(log)) return;
-            for (const line of fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean)) {
-                try { process.kill(JSON.parse(line).pid, 'SIGKILL'); } catch { /* gone */ }
+            for (const entry of readLaunches(log)) {
+                try { process.kill(entry.pid, 'SIGKILL'); } catch { /* gone */ }
             }
         });
         const home = path.join(w.ws, '.data', 'demo');
@@ -129,7 +148,10 @@ setTimeout(() => {}, 60000);
             { label: 'start', action: 'bwrap-ensure', containerName: CONTAINER, options: { preservePreparedRegistryRecord: true } },
         ], { nodeArgs: ['--import', SHIM], env: { FAKE_BWRAP: fake } });
         const started = stepValue(steps, 'start');
-        const launches = fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+        // The launcher can prove liveness before the fake process has run its
+        // first line, so wait (bounded) for the launch record of the pid the
+        // start returned instead of reading the log immediately.
+        const launches = await waitForLaunches(log, started.pid);
         assert.equal(launches.length, 1);
         const argv = launches[0].argv;
         assert.deepEqual(bindSources(argv, '/root'), [home], 'the canonical home is the only /root bind');
