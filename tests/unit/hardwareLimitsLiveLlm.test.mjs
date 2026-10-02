@@ -1351,3 +1351,23 @@ test('R2B.secret-names-match-whole-underscore-words-and-the-products-own-emitted
     assert.equal(failed.result, 'fail'); assert.match(failed.reason, /secret-looking variables: HF_TOKEN/);
     nothingOwned(leaked);
 });
+
+// --- R2C: the stage 2 refusal is confirmed from sources the tool route does not flatten -------------------------------
+test('R2C.stage-two-blocks-on-the-real-flattened-refusal-and-on-the-old-detailed-one-and-fails-on-an-unrelated-error', async t => {
+    for (const [label, faults] of [['the real route (code and message only)', { refusalFlattened: true }], ['a route that keeps the details', {}]]) {
+        const w = await provisioned(t, { block: 'apparatus-vllm', vllm: stageTwo(false), qualified: false, faults });
+        const l3 = caseOf(await liveCases(w, ['LIVE-L3']), 'LIVE-L3');
+        assert.equal(l3.result, 'blocked', `${label}: ${JSON.stringify(l3).slice(0, 500)}`); assert.match(l3.reason, /vllm_mps_unqualified was observed before the qualification data entry/, label);
+        const observed = w.artifacts.get('gpu-live-l3').refusalObserved;
+        assert.deepEqual([observed.refused, observed.error.code, observed.previewReasonCode, observed.runnerProcesses], [true, 'admission_incompatible', 'vllm_mps_unqualified', 0], label);
+        assert.equal(observed.detailsReasonCode, faults.refusalFlattened ? null : 'vllm_mps_unqualified', label);
+        assert.equal(toolCalls(w, 'local_llm_test_prompt').length, 0, label); nothingOwned(w);
+    }
+    // An error that is not an admission refusal, and a Run that is accepted, are failures, never the expected BLOCKED.
+    for (const [label, faults, pattern] of [['a plain tool error', { refusalFlattened: true, refusalAsPlainText: true }, /was not refused as vllm_mps_unqualified before any launch/], ['a Run accepted anyway', { runAcceptedAnyway: true }, /was not refused as vllm_mps_unqualified before any launch/]]) {
+        const w = await provisioned(t, { block: 'apparatus-vllm', vllm: stageTwo(false), qualified: false, faults });
+        const l3 = caseOf(await liveCases(w, ['LIVE-L3']), 'LIVE-L3');
+        assert.equal(l3.result, 'fail', `${label}: ${JSON.stringify(l3).slice(0, 400)}`); assert.match(l3.reason, pattern, label);
+        nothingOwned(w);
+    }
+});

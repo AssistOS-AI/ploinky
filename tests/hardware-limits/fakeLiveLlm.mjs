@@ -204,6 +204,8 @@ export function createLlmWorld({ statePath, node, engine, host, gpu, faults = {}
                 L.refusals.push({ modelId: args.modelId, runnerId: args.runnerId, status: verdict.status });
                 const code = `admission_${verdict.status.replace('-', '_')}`;
                 if (faults.refusalAsPlainText) return { ok: false, agent: 'local-llm', error: { code: 'tool_error', message: verdict.reason } };
+                // The real route flattens a tool error into text: the code and the message survive, the details do not.
+                if (faults.refusalFlattened) return refusal(code, verdict.reason);
                 return refusal(code, verdict.reason, { admission: { status: verdict.status, reason: verdict.reason, reasonCode: verdict.reasonCode ?? null, estimate: verdict.estimate } });
             }
             L.requests.add(args.requestId);

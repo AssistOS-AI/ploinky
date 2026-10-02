@@ -563,11 +563,21 @@ export function createLlmCases(ctx) {
             // The refusal at Run is the same one, before any launch.
             await gate.check('L3-refusal');
             const attempt = await tool('run-l3-refused', 'local_llm_run', { requestId: requestId('l3'), modelId: LLM_MODELS.awq, runnerId: 'vllm', params: {}, replace: false }, { mutating: true });
-            const refused = !attempt.ok && attempt.error.code === 'admission_incompatible' && attempt.error.details?.admission?.reasonCode === 'vllm_mps_unqualified';
+            // The refusal is confirmed from sources the tool route does not flatten. The real route turns a tool error into text
+            // ("admission_incompatible: <message>", Agent/server/AgentServer.mjs) and drops the refusal's `details`, so the code
+            // of the error is only half of it: the reason code comes from the admission preview taken after the attempt (a plain
+            // overview document), and "nothing launched" from the deployment status and the runner processes.
+            const after = await toolOk('preview-l3-after', 'local_llm_overview', { preview: { modelId: LLM_MODELS.awq, runnerId: 'vllm', params: {} } }, { view: { model: LLM_MODELS.awq } });
+            const afterAdmission = after.preview?.admission;
+            const status = await toolOk('status-l3-refused', 'local_llm_status', {});
             const processes = await runnerProcesses(agent, 'vllm');
-            evidence.put('refusalObserved', { refused, error: attempt.ok ? null : attempt.error, runnerProcesses: processes.length });
+            const detailed = !attempt.ok ? attempt.error.details?.admission?.reasonCode : undefined;
+            const refused = !attempt.ok && /^admission_(?:incompatible|insufficient_now)$/.test(attempt.error.code) && afterAdmission?.reasonCode === 'vllm_mps_unqualified'
+                && (detailed === undefined || detailed === 'vllm_mps_unqualified');
+            const launched = ACTIVE.includes(status.phase) || (status.deployment ? ACTIVE.includes(status.deployment.phase) : false);
+            evidence.put('refusalObserved', { refused, error: attempt.ok ? null : attempt.error, previewReasonCode: afterAdmission?.reasonCode ?? null, detailsReasonCode: detailed ?? null, phase: status.phase, runnerProcesses: processes.length });
             if (attempt.ok) { try { await toolOk('stop-l3-unsafe', 'local_llm_stop', {}, { mutating: true }); } catch { /* the failure below is the verdict */ } }
-            expects(refused && processes.length === 0, 'vLLM under MPS was not refused as vllm_mps_unqualified before any launch');
+            expects(refused && !launched && processes.length === 0, 'vLLM under MPS was not refused as vllm_mps_unqualified before any launch');
             throw blocked(`LIVE-L3 stage 2: vllm_mps_unqualified was observed before the qualification data entry (${String(admission.reason).slice(0, 200)}); that is the correct behaviour, and the model has not run. Add the reviewed entry from the stage 1 evidence and run stage 2 again.`);
         }
         expects(cal.expectQualified, 'vLLM under MPS was admitted although the candidate holds no matching reviewed qualification entry');

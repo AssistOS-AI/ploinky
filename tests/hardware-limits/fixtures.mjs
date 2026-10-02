@@ -742,6 +742,7 @@ export function buildRequiredCaseManifest() {
             // Stage 2 binds the host's tuple and the qualifying evidence to the stage 1 pin.
             'LLM3.stage-two-binds-the-hosts-tuple-and-the-qualifying-evidence-to-the-stage-one-pin',
             'LLM3.every-tuple-field-the-stage-one-pin-carries-is-bound-to-what-the-host-reports',
+            'R2C.stage-two-blocks-on-the-real-flattened-refusal-and-on-the-old-detailed-one-and-fails-on-an-unrelated-error',
             // The runner-environment check against local-llm's own launch environment.
             'R2B.secret-names-match-whole-underscore-words-and-the-products-own-emitted-names-are-allowed',
             'R2A.the-products-own-cuda-cache-variable-is-allowed-and-any-other-cuda-name-fails',
