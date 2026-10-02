@@ -473,6 +473,21 @@ test('L1.cleanup-refuses-unrecorded-host-record', async t => {
     assert.throws(() => validateProfile(w.run, { partial: true }), /non-exact host record/);
 });
 
+test('L1.cleanup-final-inventory-change-fails', async t => {
+    const w = await provisioned(t);
+    let listings = 0;
+    const late = 'd'.repeat(64);
+    const provider = async (binary, args, options) => {
+        const result = await w.engineProvider(binary, args, options);
+        if (args[0] === 'container' && args[1] === 'ps' && ++listings === 3) result.stdout += `${late}\n`;
+        return result;
+    };
+    const report = await executeCleanupRun({ run: w.run, persist: w.persist, processProvider: provider, hostIdentity: w.hostIdentity });
+    assert.equal(report.verdict, 'FAIL'); assert.match(w.run.cleanup.failures[0], /inventory changed at final verification/);
+    assert.equal(w.run.cleanup.steps.find(step => step.id === 'verify-absent').state, 'intent');
+    assert.ok(!worldState(w.statePath).calls.some(call => call.args.includes(late) && call.kind !== 'ps'), 'the unrelated container is never touched');
+});
+
 test('L1.cleanup-refuses-changed-host-record-identity', async t => {
     const w = await provisioned(t);
     const directory = w.run.ownedPaths.find(entry => entry.role === 'host-record' && entry.type === 'directory').path;

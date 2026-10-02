@@ -131,6 +131,10 @@ export async function runOwnedCleanup({ run, profile, persist = () => {}, proces
     const verify = step('verify-absent') || begin('verify-absent');
     const remaining = await listIds('final-inventory');
     if (profile.box?.id && remaining.includes(profile.box.id)) throw new Error('Exact Box absence not proved at final verification');
+    if (Array.isArray(run.preInventory.containers)
+        && jsonDigest([...remaining].sort()) !== jsonDigest(run.preInventory.containers.map(value => value.id).sort())) {
+        throw new Error('Unrelated container inventory changed at final verification; preserve evidence and do not undo it');
+    }
     const leftovers = [workspacePath, workspacePath && quarantinePath(workspacePath, run.runId), parent?.path || parentIntent?.path,
         ...(instance ? hostRecordPaths(profile.host.home, instance) : [])].filter(Boolean).filter(target => lstatOrNull(target));
     if (leftovers.length) throw new Error(`Owned paths remain after cleanup: ${leftovers.map(value => path.basename(value)).join(', ')}`);

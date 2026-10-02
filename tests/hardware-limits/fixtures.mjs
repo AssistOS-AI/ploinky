@@ -351,6 +351,7 @@ export function buildRequiredCaseManifest() {
             'L1.cleanup-resume-after-removal-before-complete', 'L1.cleanup-preserves-quarantine-with-wrong-marker',
             'L1.cleanup-after-interrupted-provision-without-receipts', 'L1.cleanup-removes-exact-recorded-host-records',
             'L1.cleanup-refuses-unrecorded-host-record', 'L1.cleanup-refuses-changed-host-record-identity',
+            'L1.cleanup-final-inventory-change-fails',
             'L1.cleanup-unshare-for-subordinate-owned-files', 'L1.prepare-live-mac-cpu-concrete-manifest-and-summary',
             'L1.prepare-live-apparatus-cpu-concrete-manifest-and-summary', 'L1.prepare-live-other-blocks-stay-unsupported',
             'L1.prepare-live-refuses-mismatched-local-pins',
