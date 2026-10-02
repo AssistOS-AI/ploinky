@@ -3,6 +3,13 @@ import test from 'node:test';
 import { planMpsTransition, resolveMpsServerDefault, runMpsTransition } from '../../cli/sandbox/hardwareLimits/mpsTransition.mjs';
 import { mpsClientArgs } from '../../cli/sandbox/hardwareLimits/mps.mjs';
 
+function before(events, first, second) {
+    const firstIndex = events.indexOf(first), secondIndex = events.indexOf(second);
+    assert(firstIndex >= 0, `Missing lifecycle event: ${first}`);
+    assert(secondIndex >= 0, `Missing lifecycle event: ${second}`);
+    assert(firstIndex < secondIndex, `${first} must precede ${second}`);
+}
+
 const share = (smPercent = 25, memoryMiB = 1024) => ({ smPercent, memoryMiB, deviceUuid: 'GPU-12345678-1234-1234-1234-123456789012', driverVersion: '595.91.07', wiringFingerprint: 'f'.repeat(64) });
 const client = (key, value = share(), extra = {}) => ({ key, ref: `repo/${key}`, instanceId: `instance-${key}`, enableGeneration: `generation-${key}`, containerId: key === 'a' ? 'a'.repeat(64) : 'b'.repeat(64), share: value, mpsGeneration: 'daemon-old:config-old', ...extra });
 const defaultFor = (values) => resolveMpsServerDefault(values.map((value) => ({ share: value })));
@@ -42,7 +49,7 @@ function fixture(input = {}) {
 test('MPL.first-apply', () => {
     const f = fixture({ desiredClients: [client('a')] });
     const result = f.run(); assert.equal(result.plan.action, 'restart');
-    assert(f.events.indexOf('set-readback') < f.events.indexOf('create:a'));
+    before(f.events, 'set-readback', 'create:a');
     assert.equal(f.state.status, 'ready'); assert.equal(f.state.pendingClients.length, 0);
     assert(result.results[0].args.includes('CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=25'));
     assert.equal(f.writes.find((value) => value.status === 'transitioning').pendingClients.length, 1);
@@ -63,14 +70,14 @@ test('MPL.full-cohort-drain-before-quit', () => {
     const old = [client('a'), client('b')]; const desired = [client('a', share(50, 2048)), client('b')];
     const f = fixture({ state: ready(), oldClients: old, desiredClients: desired });
     const result = f.run(); assert.deepEqual(result.plan.expandedKeys, ['b']);
-    for (const key of ['a', 'b']) assert(f.events.indexOf(`drain:${key}`) < f.events.indexOf('quit'));
-    assert(f.events.indexOf('quit') < f.events.indexOf('start'));
-    assert(f.events.indexOf('set-readback') < f.events.indexOf('create:a'));
+    for (const key of ['a', 'b']) before(f.events, `drain:${key}`, 'quit');
+    before(f.events, 'quit', 'start');
+    before(f.events, 'set-readback', 'create:a');
 });
 for (const [title, origin] of [['MPL.final-apply-clear', 'apply'], ['MPL.final-host-clear-restart', 'cli']]) test(title, () => {
     const f = fixture({ state: ready(), oldClients: [client('a')], desiredClients: [client('a', null)], origin });
     const result = f.run(); assert.equal(result.plan.action, 'clear');
-    assert(f.events.indexOf('drain:a') < f.events.indexOf('quit')); assert(f.events.indexOf('quit') < f.events.indexOf('create:a'));
+    before(f.events, 'drain:a', 'quit'); before(f.events, 'quit', 'create:a');
     assert(!f.events.includes('start')); assert.deepEqual(result.results[0].args, []); assert.equal(f.state.daemon, null); assert.equal(f.state.serverDefault, null);
 });
 test('MPL.daemon-loss', () => {
@@ -82,7 +89,7 @@ test('MPL.core-crash-journal', () => {
     const state = { ...ready(), status: 'pending', oldClients: [client('a'), client('b')], pendingClients: [client('b')] };
     const f = fixture({ state, oldClients: [], desiredClients: [client('a'), client('b')] });
     const result = f.run(); assert.deepEqual(result.plan.drain.map((value) => value.key), ['a', 'b']);
-    assert(f.events.indexOf('drain:b') < f.events.indexOf('quit')); assert.equal(f.state.oldClients.length, 0);
+    before(f.events, 'drain:b', 'quit'); assert.equal(f.state.oldClients.length, 0);
 });
 test('MPL.partial-retry', () => {
     const old = [client('a'), client('b')]; const desired = [client('a', share(50, 2048)), client('b')];
