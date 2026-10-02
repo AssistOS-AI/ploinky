@@ -45,6 +45,8 @@ test('production WebChat menu and session event handler expose the generic actio
     const [html, index, dom, css] = await Promise.all(['chat.html', 'index.js', 'domSetup.js', 'webchat.css'].map((name) => fs.readFile(new URL(name, client), 'utf8')));
     assert.match(html, /id="sessionSettingsLink" data-menu-action hidden/);
     assert.match(dom, /sessionSettingsLink: document\.getElementById\('sessionSettingsLink'\)/);
+    assert.match(index, /import \{ createSessionSettingsController \} from '\.\/sessionSettings\.js'/);
+    assert.match(index, /const sessionSettingsController = createSessionSettingsController\(\{ link: elements\.sessionSettingsLink \}\)/);
     assert.match(index, /sessionSettingsController\.handleSessionState\(payload, selected\)/);
     assert.match(css, /\.wa-session-settings-link\[hidden\]\s*\{\s*display: none/);
     const controller = await fs.readFile(new URL('sessionSettings.js', client), 'utf8');
@@ -78,7 +80,14 @@ test('traversal hrefs that collapse to a protocol-relative URL stay hidden throu
     const timestamps = { createdAt: '2026-09-10T00:00:00Z', updatedAt: '2026-09-10T00:00:00Z' };
     const envelope = (settingsAction) => ({ __webchatSession: 1, version: 1, event: 'current',
         session: { sessionId, messages: [], ...timestamps }, summary: { sessionId, hasHistory: false, ...timestamps }, settingsAction });
+    const toPayload = (state) => JSON.parse(serializeSessionStateSseEvent(state).split('\ndata: ')[1]);
+    const link = { removeAttribute(name) { delete this[name]; } };
+    const controller = createSessionSettingsController({ link, origin });
     for (const href of ['/a/..//evil.example/x', '/%2e%2e//evil.example/x']) {
+        // A valid action first, so that the hidden state below is a clearing and not the constructor default.
+        controller.handleSessionState(toPayload(parseWebchatSessionState(envelope(action))), sessionId);
+        assert.equal(link.hidden, false, href);
+        assert.equal(link.href, action.href, href);
         const state = parseWebchatSessionState(envelope({ ...action, href }));
         assert.ok(state, href);
         // The pipeline is parse, then the serializer re-parses; the client controller normalizes a third time.
@@ -87,15 +96,11 @@ test('traversal hrefs that collapse to a protocol-relative URL stay hidden throu
         const payload = JSON.parse(sse.split('\ndata: ')[1]);
         assert.equal(payload.settingsAction, undefined, href);
         assert.doesNotMatch(sse, /evil\.example/, href);
-        const link = { removeAttribute(name) { delete this[name]; } };
-        createSessionSettingsController({ link, origin }).handleSessionState(payload, sessionId);
+        controller.handleSessionState(payload, sessionId);
         assert.equal(link.hidden, true, href);
         assert.equal(link.href, undefined, href);
     }
-    const link = { removeAttribute(name) { delete this[name]; } };
-    const controller = createSessionSettingsController({ link, origin });
-    const okState = parseWebchatSessionState(envelope(action));
-    controller.handleSessionState(JSON.parse(serializeSessionStateSseEvent(okState).split('\ndata: ')[1]), sessionId);
+    controller.handleSessionState(toPayload(parseWebchatSessionState(envelope(action))), sessionId);
     assert.equal(link.hidden, false);
     assert.equal(link.href, action.href);
 });
