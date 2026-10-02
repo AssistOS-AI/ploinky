@@ -380,3 +380,9 @@ test('MP.cleanup-journal-boundary-intent-before-and-no-check-after-cleanup', asy
         assert.equal(fs.existsSync(state.pipeDirectory), false);
     }
 });
+
+// W1: the SM readback is an integer 1..100 with at most a zero-only fraction (a strict extension, not number extraction).
+test('W1.the-sm-readback-accepts-a-zero-only-fraction-and-nothing-else', () => {
+    for (const [text, value] of [['25', 25], ['25.0', 25], ['25.00\n', 25], ['100.0', 100], [' 1 ', 1], ['99.000', 99]]) assert.equal(parseMpsSmReply(text), value, JSON.stringify(text));
+    for (const text of ['25.5', '025', '0', '0.0', '101', '100.5', '25.0.0', '25 %', '1e2', '25.', '.0', '-25', '25.0 25.0', '', null]) assert.throws(() => parseMpsSmReply(text), /Unsupported MPS SM default reply/, JSON.stringify(text));
+});

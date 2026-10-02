@@ -1617,3 +1617,9 @@ test('Y4.a-failed-identity-proof-stays-at-intent-and-nothing-after-it-runs', asy
     assert.deepEqual(w.run.cleanup.steps.map(entry => [entry.id, entry.state]), [['gpu-stop-owned-helpers', 'skipped'], ['revalidate-identity', 'intent']]);
     assert.equal(worldState(w.statePath).destroyCalls ?? 0, 0, 'the Box was not destroyed');
 });
+
+// W1: the runner classifies the SM reply with the product's grammar.
+test('W1.the-runner-classifies-the-sm-reply-with-the-products-strict-decimal-grammar', () => {
+    for (const [text, value] of [['25', 25], ['25.0', 25], ['25.00\n', 25], ['100.0', 100]]) assert.deepEqual(classifyMpsReply(text), { form: 'integer-percentage', value }, JSON.stringify(text));
+    for (const text of ['25.5', '025', '0', '0.0', '101', '25.0.0', '25 %', '1e2']) assert.equal(classifyMpsReply(text).form, 'other', JSON.stringify(text));
+});

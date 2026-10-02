@@ -608,6 +608,7 @@ export function buildRequiredCaseManifest() {
             'Y4.a-live-run-journals-the-helper-stop-and-the-identity-proof-in-the-plan-order',
             'Y4.a-standalone-cleanup-journals-the-helper-stop-as-skipped-with-its-reason-and-still-proves-identity',
             'Y4.a-failed-identity-proof-stays-at-intent-and-nothing-after-it-runs',
+            'W1.the-runner-classifies-the-sm-reply-with-the-products-strict-decimal-grammar',
         ]),
         ...leaves(P, 'p4', unit('hardwareLimitsLiveProvision.test.mjs'), ['G1.prepare-live-apparatus-mps-concrete-manifest-and-summary']),
         ...leaves(P, 'p4', unit('hardwareLimitsMps.test.mjs'), [
@@ -618,6 +619,7 @@ export function buildRequiredCaseManifest() {
             'MP.stop-refuses-foreign-unknown-or-changed-daemon', 'MP.cleanup-journal-boundary-transition',
             'MP.cleanup-journal-boundary-finalize', 'MP.missing-generation-directories-need-the-proc-scan',
             'MP.cleanup-journal-boundary-intent-before-and-no-check-after-cleanup',
+            'W1.the-sm-readback-accepts-a-zero-only-fraction-and-nothing-else',
         ]),
         ...leaves(P, 'p4', unit('hardwareLimitsMpsLifecycle.test.mjs'), [
             'MPL.first-apply', 'MPL.unchanged-reuse', 'MPL.own-share-only', 'MPL.full-cohort-drain-before-quit',

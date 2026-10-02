@@ -93,7 +93,8 @@ export function assertMpsControlCommand(command) {
 }
 export function classifyMpsReply(text) {
     const value = String(text ?? '').trim();
-    if (/^[1-9][0-9]?$|^100$/.test(value)) return { form: 'integer-percentage', value: Number(value) };
+    // The product's own grammar (mps.mjs parseMpsSmReply): an integer 1..100, optionally with a zero-only fraction.
+    if (/^(?:100|[1-9][0-9]?)(?:\.0+)?$/.test(value)) return { form: 'integer-percentage', value: Number(value) };
     const memory = /^([1-9][0-9]*)([MG])$/.exec(value);
     if (memory) return { form: 'integer-with-M-or-G', bytes: Number(memory[1]) * (memory[2] === 'M' ? MIB : 1024 * MIB) };
     if (value === '') return { form: 'empty' };

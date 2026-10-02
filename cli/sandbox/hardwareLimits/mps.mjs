@@ -33,7 +33,8 @@ export function mpsClientArgs(share, state) {
 }
 export function parseMpsSmReply(text) {
     const value = String(text || '').trim();
-    if (!/^[1-9]\d?$|^100$/.test(value)) throw new MpsError('Unsupported MPS SM default reply');
+    // An integer 1..100, optionally with a zero-only fraction (`25`, `25.0`): the same integer, never another number.
+    if (!/^(?:100|[1-9]\d?)(?:\.0+)?$/.test(value)) throw new MpsError('Unsupported MPS SM default reply');
     return Number(value);
 }
 // Only the complete explicit M/G unit form is supported. LIVE-P1 must capture
