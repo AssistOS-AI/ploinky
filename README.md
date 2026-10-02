@@ -765,11 +765,7 @@ a top-level `hardwareLimits` object in its manifest or in a profile:
 
 Only `memory`, `cpus` and `pidsLimit` are accepted, each with the same rules as
 before; any other key is refused, and GPU shares stay administrator-only in
-Settings → Hardware limits. Where limits are placed under hardware limits,
-`cpus` is a decimal from `0.01` with at most two decimal places and within the
-Box CPU envelope; a finer value is refused with a fix, never rounded, because
-the engine truncates the quota it derives from `--cpus` and a finer value could
-not be read back exactly. The manifest root is one layer and the resolved
+Settings → Hardware limits. The manifest root is one layer and the resolved
 profile is another. The selected profile overrides the default profile key by
 key and inherits the keys it leaves out. Precedence is unchanged: built-in
 defaults, the manifest, the LLM catalog, the profile, and finally the
