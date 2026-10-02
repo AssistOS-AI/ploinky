@@ -50,6 +50,7 @@ const {
     topologicallyGroupDependencyGraph
 } = graphModule;
 const { applyManifestDirectives, parseEnableDirective } = bootstrapModule;
+const { buildManagedControlEnv } = await import('../../cli/sandbox/docker/agentServiceManager.js');
 const workspaceUtilModuleUrl = new URL('../../cli/commands/workspaceUtil.js', import.meta.url);
 const {
     assertStaticPreinstallSucceeded,
@@ -1310,6 +1311,9 @@ test('managed runtime hash reconstruction uses the retained signed semantic topo
         profile: {},
         extraEnv: {
             PLOINKY_NETWORK_MODE: 'default',
+            // The shared construction's managed control input, which the
+            // creation label carries (see hardwareLimitsEnvHashConsistency).
+            ...buildManagedControlEnv(node.manifest),
             PLOINKY_ROUTER_SEMANTIC_TOPOLOGY_DIGEST: 'sha256:semantic-topology',
             PLOINKY_ROUTER_DESCRIPTOR_SCHEMA: 'ploinky.generated-local-router.v1',
             PLOINKY_ROUTER_TRANSPORT_VERSION: 'node-authority-v1',

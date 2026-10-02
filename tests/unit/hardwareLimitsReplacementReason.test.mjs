@@ -224,6 +224,7 @@ function service({ options = {}, labels = {}, hashes = { desired: FULL_B }, desc
         readManifestStartCommand: () => null,
         randomUUID,
         computeEnvHash: () => hashes.desired,
+        computeAgentEnvHash: () => hashes.desired,
         getContainerLabel: (name, label) => (label in labels ? labels[label] : hashes.desired),
         debugLog: noOp,
         agentLibReuseProblem: () => agentLibProblem,

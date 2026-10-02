@@ -1197,6 +1197,47 @@ function manifestUsesHealthProbeBroker(manifest) {
     ));
 }
 
+// The managed control inputs a container is created with. They are part of the
+// environment hash, so every producer (creation, adoption) and every consumer
+// (service reuse, graph reuse) must take them from here.
+function buildManagedControlEnv(manifest) {
+    return Object.freeze({
+        PLOINKY_HEALTH_PROBE_BROKER: manifestUsesHealthProbeBroker(manifest) ? '1' : '0',
+    });
+}
+
+// The ONE construction of a container's environment hash. The label written at
+// creation, the hash expected at managed adoption, the service-level reuse
+// check and the graph reuse check all call it, so they cannot hash different
+// inputs. `runtimeRouterEnv` is the Router endpoint env of an unmanaged start;
+// `generatedRouter` ({ payload, principalId, instanceId, enableGeneration })
+// adds the signed semantic descriptor and identity of a managed network.
+// Security inputs (identity, principal, descriptor semantics and everything
+// computeEnvHash reads from the manifest, profile and secrets) stay in the hash.
+function computeAgentEnvHash(manifest, profileConfig, {
+    agentName,
+    repoName,
+    runtimeNetworkPlan,
+    runtimeRouterEnv = {},
+    generatedRouter = null,
+}, computeEnvHashImpl = computeEnvHash) {
+    const payload = generatedRouter?.payload;
+    return computeEnvHashImpl(manifest, profileConfig, {
+        ...(generatedRouter ? {} : runtimeRouterEnv),
+        ...runtimeNetworkPlan.hashEnv,
+        ...buildManagedControlEnv(manifest),
+        ...(generatedRouter ? {
+            PLOINKY_ROUTER_SEMANTIC_TOPOLOGY_DIGEST: payload.semanticTopologyDigest,
+            PLOINKY_ROUTER_DESCRIPTOR_SCHEMA: payload.schema,
+            PLOINKY_ROUTER_TRANSPORT_VERSION: payload.transportVersion,
+            PLOINKY_ROUTER_LOCAL_STREAMING: payload.localStreaming,
+            PLOINKY_AGENT_PRINCIPAL: generatedRouter.principalId,
+            PLOINKY_AGENT_INSTANCE_ID: generatedRouter.instanceId,
+            PLOINKY_AGENT_ENABLE_GENERATION: generatedRouter.enableGeneration,
+        } : {}),
+    }, { agentName, repoName });
+}
+
 function inspectImageEntrypoint(runtime, image, spawn = spawnSync) {
     const result = spawn(runtime, [
         'image', 'inspect', '--format', '{{json .Config.Entrypoint}}', image,
@@ -1417,10 +1458,7 @@ const SERVICE_NETWORK_LIFECYCLE = Symbol('serviceNetworkLifecycle');
 function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const repoName = resolveAgentRepositoryName(agentPath);
     const containerName = options.containerName || getAgentContainerName(agentName, repoName);
-    const useHealthProbeBroker = manifestUsesHealthProbeBroker(manifest);
-    const managedControlEnv = Object.freeze({
-        PLOINKY_HEALTH_PROBE_BROKER: useHealthProbeBroker ? '1' : '0',
-    });
+    const managedControlEnv = buildManagedControlEnv(manifest);
     const agentSnapshot = loadAgentsMap();
     const existingRecord = agentSnapshot[containerName] || {};
     const preservePreparedRegistryRecord = assertPreparedRegistryRecordPreservation(
@@ -1586,11 +1624,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         routerPort: options.routerPort,
         networkMode: runtimeNetworkPlan.mode,
     });
-    const envHash = computeEnvHash(manifest, profileConfig, {
-        ...runtimeRouterEnv,
-        ...runtimeNetworkPlan.hashEnv,
-        ...managedControlEnv,
-    }, { agentName, repoName });
+    const envHash = computeAgentEnvHash(manifest, profileConfig, {
+        agentName, repoName, runtimeNetworkPlan, runtimeRouterEnv,
+    });
 
     // LLM runtime opt-in: catalog-driven image, hardware-aware policy, reuse hash.
     // Resolved BEFORE dependency cache prep so the cache uses the selected image.
@@ -2160,17 +2196,17 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     }
 
     const principalId = deriveAgentPrincipalId(repoName, agentName);
-    const computeSemanticEnvHash = (payload) => computeEnvHash(manifest, profileConfig, {
-        ...runtimeNetworkPlan.hashEnv,
-        ...managedControlEnv,
-        PLOINKY_ROUTER_SEMANTIC_TOPOLOGY_DIGEST: payload.semanticTopologyDigest,
-        PLOINKY_ROUTER_DESCRIPTOR_SCHEMA: payload.schema,
-        PLOINKY_ROUTER_TRANSPORT_VERSION: payload.transportVersion,
-        PLOINKY_ROUTER_LOCAL_STREAMING: payload.localStreaming,
-        PLOINKY_AGENT_PRINCIPAL: principalId,
-        PLOINKY_AGENT_INSTANCE_ID: runtimeIdentity.instanceId,
-        PLOINKY_AGENT_ENABLE_GENERATION: runtimeIdentity.enableGeneration,
-    }, { agentName, repoName });
+    const computeSemanticEnvHash = (payload) => computeAgentEnvHash(manifest, profileConfig, {
+        agentName,
+        repoName,
+        runtimeNetworkPlan,
+        generatedRouter: {
+            payload,
+            principalId,
+            instanceId: runtimeIdentity.instanceId,
+            enableGeneration: runtimeIdentity.enableGeneration,
+        },
+    });
     const prepareGeneratedRouterAttestation = (plan) => {
         if (runtime !== 'podman' || !['default', 'bridge'].includes(plan?.mode)) {
             throw new Error('generated-local Router credentials require the exact verified managed Podman transaction');
@@ -3934,11 +3970,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         networkMode: manifestNetwork.mode,
     });
     const runtimeNetworkPlan = buildRuntimeNetworkPlan(runtime, manifestNetwork);
-    const envHashExtra = {
-        ...runtimeRouterEnv,
-        ...runtimeNetworkPlan.hashEnv,
-        PLOINKY_HEALTH_PROBE_BROKER: manifestUsesHealthProbeBroker(manifest) ? '1' : '0',
-    };
+    const computeContainerEnvHash = () => computeAgentEnvHash(manifest, profileConfig, {
+        agentName, repoName, runtimeNetworkPlan, runtimeRouterEnv,
+    });
 
     const { publishArgs: manifestPorts, portMappings } = parseManifestPorts(manifest, profileConfig);
     assertHostPortContract(runtimeNetworkPlan.mode, portMappings);
@@ -3981,7 +4015,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     }
 
     if (existingRuntimeAtEntry && !runtimeNetworkPlan.requiresManagedNetwork) {
-        const desired = computeEnvHash(manifest, profileConfig, envHashExtra, { agentName, repoName });
+        const desired = computeContainerEnvHash();
         const current = getContainerLabel(containerName, 'ploinky.envhash');
         if (desired && desired !== current) {
             debugLog(`[ensureAgentService] ${agentName}: env hash changed (current=${current || '<none>'}, desired=${desired.slice(0, 12)}…), recreating container`);
@@ -4025,7 +4059,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 agentName,
                 alias: aliasOverride,
                 containerName,
-                envHash: computeEnvHash(manifest, profileConfig, envHashExtra, { agentName, repoName }),
+                envHash: computeContainerEnvHash(),
                 serviceAdmission,
                 serviceLlmAdmissionContext,
             });
@@ -4897,9 +4931,11 @@ export {
     buildBoxPodmanHostArgs,
     buildDefaultPodmanNetworkArgs,
     buildPodmanStagedTargetMounts,
+    buildManagedControlEnv,
     buildRuntimeNetworkPlan,
     buildRuntimeRouterEnv,
     codeRelativeMountPath,
+    computeAgentEnvHash,
     collectManifestVolumeEntries,
     ensureAgentService,
     ensureManifestVolumeHostPath,

@@ -408,7 +408,8 @@ test('managed Docker identity derivation is a fail-closed launch precondition', 
     assert.doesNotMatch(source, /could not set agent identity/);
     assert.match(source, /Only non-secret principal fields exist before topology attestation/);
     assert.match(source, /generationLease\.checkpoint\('pre-credentials'\)[\s\S]*?signGeneratedRouterDescriptorEnvelope\(payload\)[\s\S]*?buildAgentCredentialEnv\(principalId, runtimeIdentity\)/);
-    assert.match(source, /computeSemanticEnvHash[\s\S]*PLOINKY_ROUTER_SEMANTIC_TOPOLOGY_DIGEST[\s\S]*PLOINKY_AGENT_ENABLE_GENERATION/);
+    // One shared construction carries the semantic inputs; the managed creation label and adoption call it.
+    assert.match(source, /PLOINKY_ROUTER_SEMANTIC_TOPOLOGY_DIGEST[\s\S]*PLOINKY_AGENT_ENABLE_GENERATION[\s\S]*const computeSemanticEnvHash = \(payload\) => computeAgentEnvHash\(/);
     assert.match(source, /canReuseExisting && runtimeNetworkPlan\.requiresManagedNetwork[\s\S]*adoptManagedRuntimeOnly = !managedReconciliationPreparationLease/);
     assert.match(source, /createRouterAttestationGenerationLease\(\{[\s\S]*expectedOwner:/);
 });

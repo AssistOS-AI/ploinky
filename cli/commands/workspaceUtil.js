@@ -21,6 +21,7 @@ import {
 import {
   buildRuntimeNetworkPlan,
   buildRuntimeRouterEnv,
+  computeAgentEnvHash,
   exactCleanupFailureOf,
   resolvePublishedPortMappings,
 } from '../sandbox/docker/agentServiceManager.js';
@@ -1035,16 +1036,18 @@ function computeRetainedManagedEnvHash(node, record, profileConfig, runtimeNetwo
         || payload?.generationId !== String(record.enableGeneration || '')) {
       return '';
     }
-    return computeEnvHashImpl(node.manifest, profileConfig, {
-      ...runtimeNetworkPlan.hashEnv,
-      PLOINKY_ROUTER_SEMANTIC_TOPOLOGY_DIGEST: payload.semanticTopologyDigest,
-      PLOINKY_ROUTER_DESCRIPTOR_SCHEMA: payload.schema,
-      PLOINKY_ROUTER_TRANSPORT_VERSION: payload.transportVersion,
-      PLOINKY_ROUTER_LOCAL_STREAMING: payload.localStreaming,
-      PLOINKY_AGENT_PRINCIPAL: principalId,
-      PLOINKY_AGENT_INSTANCE_ID: record.instanceId,
-      PLOINKY_AGENT_ENABLE_GENERATION: record.enableGeneration,
-    }, { agentName: node.shortAgentName, repoName: node.repoName });
+    // The same construction the creation label and managed adoption use.
+    return computeAgentEnvHash(node.manifest, profileConfig, {
+      agentName: node.shortAgentName,
+      repoName: node.repoName,
+      runtimeNetworkPlan,
+      generatedRouter: {
+        payload,
+        principalId,
+        instanceId: record.instanceId,
+        enableGeneration: record.enableGeneration,
+      },
+    }, computeEnvHashImpl);
   } catch (_) {
     return '';
   }
@@ -1138,12 +1141,12 @@ export function graphNodeRuntimeReplacementReason(plan, {
     routerEndpoint,
     networkMode: profileResolution.network.mode,
   });
-  const baseEnvHash = computeEnvHashImpl(
-    node.manifest,
-    profileResolution.profileConfig,
-    { ...runtimeRouterEnv, ...runtimeNetworkPlan.hashEnv },
-    { agentName: node.shortAgentName, repoName: node.repoName },
-  );
+  const baseEnvHash = computeAgentEnvHash(node.manifest, profileResolution.profileConfig, {
+    agentName: node.shortAgentName,
+    repoName: node.repoName,
+    runtimeNetworkPlan,
+    runtimeRouterEnv,
+  }, computeEnvHashImpl);
   const desiredEnvHash = runtimeNetworkPlan.requiresManagedNetwork
     ? computeRetainedManagedEnvHashImpl(
         node,

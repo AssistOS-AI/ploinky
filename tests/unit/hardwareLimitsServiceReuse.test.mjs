@@ -55,6 +55,7 @@ function fixture(mode, { problem = null, cleanupProblem = null, inactivationProb
         readManifestStartCommand: () => null,
         randomUUID,
         computeEnvHash: () => 'hash',
+        computeAgentEnvHash: () => 'hash',
         getContainerLabel: () => 'hash',
         debugLog: noOp,
         agentLibReuseProblem: () => null,
