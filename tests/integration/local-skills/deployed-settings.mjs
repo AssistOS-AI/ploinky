@@ -29,28 +29,44 @@ try { playwright = require('@playwright/test'); } catch {
     throw new Error('The selected Explorer smoke checkout needs its existing Playwright dependency. See README.md; this check installs no packages.');
 }
 const { chromium, expect } = playwright;
+// This check is unexecuted until the deployment gate (D1); Copilot-family flows are excluded from the 2026-10-02 post-merge acceptance.
+// This check drives RoboTeam's Conversation skills page through the Explorer smoke helper that ships with the deployment.
 const load = name => import(pathToFileURL(path.join(smoke, 'lib', `${name}.mjs`)).href);
-const { openExplorer, assertExplorerDirectory } = await load('explorer');
+const { openExplorer } = await load('explorer');
 const { createDirectory, deleteDirectoryIfPresent, directoryRow, openCopilotForDirectory } = await load('copilot');
 const { waitForWebchatIdle } = await load('webchat');
 const { callAgentToolViaRouter } = await load('mcp');
 const { createRedactor } = await load('security');
+let conversationSkills;
+try { conversationSkills = await load('conversation-skills'); } catch (cause) {
+    throw new Error('The selected Explorer smoke checkout lacks tests/smoke/lib/conversation-skills.mjs; use a revision that contains the Conversation skills helper.', { cause });
+}
+const { ROBOTEAM_BASE_PATH, conversationFromSkillsURL, roboTeamApi, roboTeamRobotId, openConversationSkills,
+    conversationSkillsState, setConversationSkill, refreshConversationSkills } = conversationSkills;
 const redact = createRedactor();
+const unique = randomUUID().slice(0, 8);
 const directoryName = runId;
 const directoryPath = `/${directoryName}`;
-const skillName = `conversation-settings-proof-${randomUUID().slice(0, 8)}`;
-const relativeSkillDirectory = `${directoryName}/.agents/skills/${skillName}`;
-const descriptorPath = `${relativeSkillDirectory}/SKILL.md`;
+const repositoryName = `set1-${unique}`;
+const skillName = `conversation-settings-proof-${unique}`;
+const repositoryDirectory = `${directoryName}/skills-repo`;
+const descriptorPath = `${repositoryDirectory}/${skillName}/SKILL.md`;
 const descriptor = `---\nname: ${skillName}\ndescription: Verify conversation-local skill settings in a disposable test folder.\n---\n\nUse only when explicitly testing conversation skill settings. Do not run commands or modify files.\n`;
-const evidence = { kind: 'deployed-production-ui', runId, baseURL: baseURL.origin, prerequisite,
-    directoryPath, descriptorPath, fixtureDescriptorSha256: hash(descriptor),
+const identity = `${repositoryName}/${skillName}`;
+const invalidLinkText = 'The conversation skills link is invalid. Open Conversation skills from the chat menu again.';
+const evidence = { kind: 'deployed-conversation-skills-page', runId, baseURL: baseURL.origin, prerequisite,
+    directoryPath, repositoryName, identity, fixtureDescriptorSha256: hash(descriptor),
     playwrightVersion: require('@playwright/test/package.json').version,
-    result: 'running', cleanup: 'not-started', requests: [] };
+    result: 'running', cleanup: 'not-started', conversationApiRequests: [], roboTeamPageMcpRequests: 0, probes: {} };
+// What this run created and must remove. Both stay in place, and are reported, when the run fails.
+const created = { registeredRepository: null, folder: null };
 const browser = await chromium.launch({ headless: true });
 const context = await browser.newContext({ baseURL: baseURL.origin, viewport: { width: 1440, height: 1000 } });
 context.setDefaultTimeout(30_000);
 context.setDefaultNavigationTimeout(60_000);
 const page = await context.newPage();
+const skillsPages = new Set();
+let dashboard;
 let copilotPage;
 let settingsPage;
 let phase = 'setup';
@@ -60,62 +76,40 @@ async function receipt() {
     await mkdir(output, { recursive: true });
     await writeFile(path.join(output, 'evidence.json'), redact(JSON.stringify(evidence, null, 2)) + '\n', { mode: 0o600 });
 }
-function catalogArguments(tool, expected, step) {
-    const calls = evidence.requests.filter(entry => entry.phase === step && entry.tool === tool);
-    assert.ok(calls.length, `Production UI made no ${tool} request during ${step}.`);
-    for (const call of calls) assert.deepEqual(call.arguments, expected);
-}
 function observeRequest(request) {
-    if (!new URL(request.url()).pathname.endsWith('/mcp') || request.method() !== 'POST') return;
-    let payload;
-    try { payload = request.postDataJSON(); } catch { return; }
-    const tool = payload?.params?.name;
-    if (payload?.method !== 'tools/call' || !['list_achilles_skills', 'set_achilles_skill_enabled'].includes(tool)) return;
-    const args = payload.params.arguments;
-    if (!args || Object.keys(args).some(key => !['robot', 'sessionId', 'dir', 'identity', 'enabled', 'policyVersion'].includes(key))) {
-        evidence.requests.push({ phase, tool, invalidArgumentShape: true });
-        return;
+    let url;
+    let origin;
+    try { url = new URL(request.url()); origin = request.frame()?.page(); } catch { return; }
+    if (!skillsPages.has(origin)) return;
+    if (url.pathname.endsWith('/mcp') && request.method() === 'POST') evidence.roboTeamPageMcpRequests += 1;
+    if (!/\/api\/robots\/[^/]+\/conversations\/[^/]+\/skills$/.test(url.pathname)) return;
+    let bodyKeys = null;
+    if (request.method() === 'PATCH') {
+        try { bodyKeys = Object.keys(request.postDataJSON()).sort(); } catch { bodyKeys = ['unparseable']; }
     }
-    // Headers, tokens, auth bodies and complete response payloads are never recorded.
-    evidence.requests.push({ phase, tool, arguments: structuredClone(args) });
+    // Headers and tokens are never recorded; only whether the browser mutation proof was sent.
+    evidence.conversationApiRequests.push({ phase, method: request.method(), search: url.search, bodyKeys,
+        csrfHeaderPresent: Boolean(request.headers()['x-ploinky-browser-csrf-token']) });
 }
 context.on('request', observeRequest);
 
-async function modalState(candidate) {
-    return candidate.locator('settings-modal').evaluate(element => {
-        const presenter = element.webSkelPresenter;
-        const state = presenter?.state;
-        if (!state) throw new Error('Production Settings presenter is unavailable.');
-        return { context: presenter.getCopilotContext(), policyVersion: state.copilotPolicyVersion,
-            policy: state.copilotPolicy, items: state.copilotItems, loaded: state.copilotDataLoaded,
-            activeRevision: state.copilotActiveRevision ?? null };
-    });
+async function defaults() {
+    const catalog = await callAgentToolViaRouter(page, { agent: 'roboTeamAgent', tool: 'list_achilles_skills', args: { robot: 'default' } });
+    assert.equal(catalog.scope, 'defaults');
+    return { policyVersion: catalog.policyVersion, policySha256: hash(catalog.policy) };
 }
-async function loadedModal(candidate, conversation) {
-    await expect(candidate.locator('settings-modal')).toBeVisible();
-    await expect(candidate.getByRole('tab', { name: 'Copilot', exact: true })).toHaveAttribute('aria-selected', 'true');
-    await expect(candidate.locator('#copilotSettingsStatus')).toContainText(conversation
-        ? 'Current selection loaded.' : 'defaults loaded.');
-    await expect(candidate.locator('#copilotSettingsStatus')).not.toHaveClass(/error/);
-    const state = await modalState(candidate);
-    assert.ok(state.loaded && Number.isSafeInteger(state.policyVersion));
-    return state;
-}
-async function ordinarySettings(candidate) {
-    await candidate.locator('#accountMenuButton').click();
-    await candidate.getByRole('menuitem', { name: 'Settings', exact: true }).click();
-    await expect(candidate.locator('settings-modal')).toBeVisible();
-    await candidate.getByRole('tab', { name: 'Copilot', exact: true }).click();
-    return loadedModal(candidate, false);
-}
-async function closeModal(candidate) {
-    await candidate.locator('settings-modal .close[data-local-action="closeModal"]').click();
-    await expect(candidate.locator('settings-modal')).toHaveCount(0);
+async function conversation(sessionId) {
+    return callAgentToolViaRouter(page, { agent: 'roboTeamAgent', tool: 'list_achilles_skills', args: { robot: 'default', sessionId } });
 }
 function selectedItem(catalog) {
-    const items = (catalog.skills || catalog.items).filter(item => item.name === skillName);
+    const items = catalog.skills.filter(item => item.identity === identity);
     assert.equal(items.length, 1, 'The fixture must have exactly one unambiguous inventory entry.');
     return items[0];
+}
+function rowOf(state) {
+    const rows = state.items.filter(item => item.identity === identity);
+    assert.equal(rows.length, 1, 'The Conversation skills page must list the registered skill exactly once.');
+    return rows[0];
 }
 
 try {
@@ -125,115 +119,145 @@ try {
     assert.ok(allowedRoots.length, 'Explorer must report its actual filesystem root.');
     const filesystemRoot = allowedRoots[0].replace(/\/+$/, '');
     evidence.fixtureFilesystemPath = `${filesystemRoot}/${descriptorPath}`;
-    await createDirectory(page, directoryName, directoryPath);
+
+    // Registering a repository is an administrator action. Refuse before any write when the user cannot do it.
+    phase = 'admin-check';
+    dashboard = await context.newPage();
+    await dashboard.goto(new URL(ROBOTEAM_BASE_PATH, baseURL).href, { waitUntil: 'domcontentloaded' });
+    const robots = await roboTeamApi(dashboard, { path: 'api/robots' });
+    assert.equal(robots.status, 200);
+    assert.ok(robots.payload.canAdmin === true, 'The signed-in user must be a RoboTeam administrator to register the run-owned repository.');
+    const robotId = await roboTeamRobotId(dashboard, 'default');
+    evidence.robotId = robotId;
 
     phase = 'defaults-before';
-    const before = await ordinarySettings(page);
-    assert.deepEqual(before.context, { robot: 'default' });
-    catalogArguments('list_achilles_skills', { robot: 'default' }, phase);
-    evidence.defaultsBefore = { policyVersion: before.policyVersion, policySha256: hash(before.policy) };
-    await closeModal(page);
+    const defaultsBefore = await defaults();
+    evidence.defaultsBefore = defaultsBefore;
 
     phase = 'conversation-launch';
+    await createDirectory(page, directoryName, directoryPath);
+    created.folder = directoryPath;
     copilotPage = await openCopilotForDirectory(page, directoryPath);
     await expect(copilotPage.locator('#cmd')).toBeEditable({ timeout: 60_000 });
     await waitForWebchatIdle(copilotPage, 60_000);
-    phase = 'live-skill-addition';
-    const created = await callAgentToolViaRouter(page, { agent: 'explorer', tool: 'create_directory',
-        args: { path: relativeSkillDirectory } });
-    assert.match(created.rawText || '', /^Successfully created directory /);
+
+    phase = 'repository-registration';
+    const made = await callAgentToolViaRouter(page, { agent: 'explorer', tool: 'create_directory',
+        args: { path: `${repositoryDirectory}/${skillName}` } });
+    assert.match(made.rawText || '', /^Successfully created directory /);
     const written = await callAgentToolViaRouter(page, { agent: 'explorer', tool: 'write_file',
         args: { path: descriptorPath, content: descriptor } });
     assert.match(written.rawText || '', /^Successfully wrote to /);
     const readBack = await callAgentToolViaRouter(page, { agent: 'explorer', tool: 'read_file', args: { path: descriptorPath } });
     assert.equal(readBack.rawText, descriptor);
-    evidence.fixtureAddedAfterConversationLaunch = true;
-    await copilotPage.locator('#settingsBtn').click();
-    const link = copilotPage.locator('#sessionSettingsLink');
-    await expect(link).toBeVisible({ timeout: 60_000 });
-    await expect(link).toHaveText('Conversation skills');
-    const actionURL = new URL(await link.getAttribute('href'), baseURL.origin);
-    assert.equal(actionURL.origin, baseURL.origin);
-    assert.equal(actionURL.pathname, '/explorer/index.html');
-    assert.deepEqual([...actionURL.searchParams.keys()].sort(), ['copilot-robot', 'copilot-session']);
-    const robot = actionURL.searchParams.get('copilot-robot');
-    const sessionId = actionURL.searchParams.get('copilot-session');
-    assert.equal(robot, 'default');
-    assert.match(sessionId, /^[a-f0-9-]{36}$/);
-    evidence.conversation = { robot, sessionId };
-    phase = 'conversation-settings-open';
-    const popup = context.waitForEvent('page');
-    await link.click();
-    settingsPage = await popup;
-    await settingsPage.waitForLoadState('domcontentloaded');
-    const current = await loadedModal(settingsPage, true);
-    assert.deepEqual(current.context, { robot, sessionId });
-    catalogArguments('list_achilles_skills', { robot, sessionId }, phase);
-    assert.equal(new URL(settingsPage.url()).search, '', 'Explorer must consume context query parameters once.');
-    // The opened browser is at root; the conversation still resolves its saved launch folder.
-    await assertExplorerDirectory(settingsPage, '/');
-    const item = selectedItem(current);
-    assert.equal(item.enabled, true, 'The new local skill must be effective without commit/update/import.');
-    assert.equal(item.sourcePath, `${filesystemRoot}/${relativeSkillDirectory}`);
-    assert.ok(item.identity.startsWith('workspace:'));
-    evidence.initial = { identity: item.identity, state: item.state, sourcePath: item.sourcePath,
-        enabled: item.enabled, policyVersion: current.policyVersion };
-    const row = settingsPage.locator('#copilotSettingsList .plugin-settings-row').filter({
-        has: settingsPage.locator('.plugin-settings-key', { hasText: new RegExp(`^${skillName}$`) }),
-    });
-    await expect(row).toHaveCount(1);
-    const toggle = row.locator('button[data-local-action^="toggleCopilotSkill "]');
-    await expect(toggle).toHaveAttribute('aria-pressed', 'true');
-    phase = 'conversation-disable';
-    await toggle.click();
-    await expect(toggle).toHaveAttribute('aria-pressed', 'false');
-    await loadedModal(settingsPage, true);
-    catalogArguments('set_achilles_skill_enabled', { robot, sessionId, identity: item.identity,
-        enabled: false, policyVersion: current.policyVersion }, phase);
+    const registered = await roboTeamApi(dashboard, { method: 'POST', path: `api/robots/${robotId}/skillsets`,
+        body: { name: repositoryName, source: `${filesystemRoot}/${repositoryDirectory}` } });
+    assert.equal(registered.status, 200);
+    created.registeredRepository = repositoryName;
 
-    phase = 'persisted-conversation-read';
-    const saved = await callAgentToolViaRouter(page, { agent: 'roboTeamAgent', tool: 'list_achilles_skills', args: { robot, sessionId } });
-    assert.equal(saved.scope, 'conversation');
-    assert.equal(saved.sessionId, sessionId);
-    assert.equal(saved.cwd, `${filesystemRoot}/${directoryName}`);
-    assert.ok(saved.policyVersion > current.policyVersion);
-    assert.equal(selectedItem(saved).enabled, false);
-    assert.ok(saved.policy.excludedSkills.includes(item.identity));
-    evidence.persisted = { scope: saved.scope, cwd: saved.cwd, policyVersion: saved.policyVersion,
-        enabled: false, exclusionSaved: true, policySha256: hash(saved.policy) };
-    phase = 'conversation-refresh';
-    await settingsPage.getByRole('button', { name: 'Refresh skills', exact: true }).click();
-    const refreshed = await loadedModal(settingsPage, true);
-    assert.equal(refreshed.policyVersion, saved.policyVersion);
-    assert.equal(selectedItem(refreshed).enabled, false);
-    catalogArguments('list_achilles_skills', { robot, sessionId }, phase);
-    await mkdir(output, { recursive: true });
-    await settingsPage.locator('settings-modal').screenshot({ path: path.join(output, 'conversation-disabled.png') });
-    await closeModal(settingsPage);
+    phase = 'conversation-settings-open';
+    settingsPage = await openConversationSkills(copilotPage);
+    skillsPages.add(settingsPage);
+    const target = conversationFromSkillsURL(settingsPage.url(), baseURL.origin, { robotId });
+    evidence.conversation = target;
+    await copilotPage.screenshot({ path: path.join(output, 'webchat-after-conversation-skills.png') });
+    const current = await conversationSkillsState(settingsPage);
+    assert.equal(current.robotId, robotId);
+    assert.equal(current.sessionId, target.sessionId);
+    const initial = rowOf(current);
+    assert.equal(initial.enabled, false, 'A newly registered repository is not selected until the user enables it.');
+    assert.equal(initial.state, 'available');
+
+    phase = 'conversation-enable';
+    const enabled = await setConversationSkill(settingsPage, identity, true);
+    assert.ok(enabled.policyVersion > current.policyVersion);
+    assert.equal(rowOf(enabled).enabled, true);
+    const afterEnable = await conversation(target.sessionId);
+    assert.equal(afterEnable.scope, 'conversation');
+    assert.equal(afterEnable.sessionId, target.sessionId);
+    assert.equal(selectedItem(afterEnable).enabled, true);
+    assert.ok(afterEnable.policy.selectors.skills.includes(identity));
+    assert.equal(afterEnable.cwd, `${filesystemRoot}/${directoryName}`);
+    assert.ok(afterEnable.policyVersion > current.policyVersion);
+
+    phase = 'conversation-disable';
+    const disabled = await setConversationSkill(settingsPage, identity, false);
+    assert.ok(disabled.policyVersion > enabled.policyVersion);
+    const afterDisable = await conversation(target.sessionId);
+    assert.equal(selectedItem(afterDisable).enabled, false);
+    assert.ok(afterDisable.policy.excludedSkills.includes(identity));
+    assert.ok(afterDisable.policyVersion > afterEnable.policyVersion);
+    evidence.persisted = { policyVersion: afterDisable.policyVersion, exclusionSaved: true, policySha256: hash(afterDisable.policy) };
+
+    phase = 'conversation-reload';
+    await settingsPage.reload({ waitUntil: 'domcontentloaded' });
+    const reloaded = await conversationSkillsState(settingsPage);
+    assert.equal(rowOf(reloaded).enabled, false);
+    assert.equal(reloaded.policyVersion, afterDisable.policyVersion);
+    const refreshed = await refreshConversationSkills(settingsPage);
+    assert.equal(rowOf(refreshed).enabled, false);
+    assert.equal(refreshed.policyVersion, afterDisable.policyVersion);
+    await settingsPage.screenshot({ path: path.join(output, 'conversation-skills-disabled.png') });
+
+    phase = 'api-evidence';
+    const calls = evidence.conversationApiRequests;
+    assert.ok(calls.some(call => call.method === 'GET'), 'The page must read the conversation through the conversation API.');
+    const patches = calls.filter(call => call.method === 'PATCH');
+    assert.ok(patches.length >= 2, 'Enabling and disabling must each send one PATCH.');
+    for (const call of calls) {
+        assert.ok(['GET', 'PATCH'].includes(call.method), `Unexpected method ${call.method} on the conversation API.`);
+        assert.equal(call.search, '', 'The conversation API takes no query parameters.');
+    }
+    for (const call of patches) {
+        assert.deepEqual(call.bodyKeys, ['enabled', 'identity', 'policyVersion']);
+        assert.equal(call.csrfHeaderPresent, true, 'A browser mutation must carry the Router mutation proof.');
+    }
+    assert.equal(evidence.roboTeamPageMcpRequests, 0, 'The RoboTeam page must not call MCP tools.');
+
+    phase = 'probes';
+    const stale = await roboTeamApi(dashboard, { method: 'PATCH',
+        path: `api/robots/${robotId}/conversations/${target.sessionId}/skills`,
+        body: { identity, enabled: true, policyVersion: current.policyVersion } });
+    assert.equal(stale.status, 409);
+    const afterStale = await conversation(target.sessionId);
+    assert.equal(afterStale.policyVersion, afterDisable.policyVersion, 'A rejected stale update must not change the version.');
+    assert.equal(selectedItem(afterStale).enabled, false);
+    const invalidPage = await context.newPage();
+    const invalidApiRequests = [];
+    invalidPage.on('request', request => { if (new URL(request.url()).pathname.includes('/api/')) invalidApiRequests.push(request.method()); });
+    await invalidPage.goto(new URL(`${ROBOTEAM_BASE_PATH}conversation-skills/${robotId}/not-a-uuid`, baseURL).href, { waitUntil: 'domcontentloaded' });
+    await expect(invalidPage.locator('#conversationSkillsStatus')).toHaveText(invalidLinkText);
+    await expect(invalidPage.locator('#conversationSkillsStatus')).toHaveClass(/error/);
+    assert.equal(invalidApiRequests.length, 0, 'An invalid link must not reach the API.');
+    await invalidPage.close();
+    evidence.probes = { staleStatus: stale.status, invalidLinkApiRequests: invalidApiRequests.length };
+
     phase = 'defaults-after';
-    const after = await ordinarySettings(settingsPage);
-    assert.deepEqual(after.context, { robot: 'default' });
-    assert.equal(after.policyVersion, before.policyVersion);
-    assert.deepEqual(after.policy, before.policy);
-    catalogArguments('list_achilles_skills', { robot: 'default' }, phase);
-    await expect(settingsPage.locator('#copilotSettingsList')).toContainText('Defaults apply to future conversations.');
-    evidence.defaultsAfter = { policyVersion: after.policyVersion, policySha256: hash(after.policy), unchanged: true };
-    await settingsPage.locator('settings-modal').screenshot({ path: path.join(output, 'defaults-unchanged.png') });
+    const defaultsAfter = await defaults();
+    assert.deepEqual(defaultsAfter, defaultsBefore, 'Conversation changes must not alter the robot defaults.');
+    evidence.defaultsAfter = { ...defaultsAfter, unchanged: true };
     evidence.result = 'checks-passed';
     await receipt();
+
+    // Remove what this run created: the repository first, then the folder.
+    phase = 'cleanup';
     await settingsPage.close();
     await copilotPage.close();
-    phase = 'successful-fixture-cleanup';
+    const removed = await roboTeamApi(dashboard, { method: 'DELETE', path: `api/robots/${robotId}/skillsets?name=${repositoryName}` });
+    assert.equal(removed.status, 200);
+    created.registeredRepository = null;
     await page.reload({ waitUntil: 'load' });
     await expect(directoryRow(page, directoryPath)).toHaveCount(1);
     await deleteDirectoryIfPresent(page, directoryPath);
-    evidence.cleanup = 'owned-folder-deleted';
+    created.folder = null;
+    evidence.cleanup = 'owned-repository-and-folder-deleted';
     evidence.result = 'passed';
 } catch (error) {
     evidence.result = 'failed';
     evidence.failedPhase = phase;
     evidence.error = redact(error.message);
     evidence.cleanup = 'failed-fixture-retained-for-diagnosis';
+    evidence.retained = { registeredRepository: created.registeredRepository, folder: created.folder };
     process.exitCode = 1;
 } finally {
     await receipt();

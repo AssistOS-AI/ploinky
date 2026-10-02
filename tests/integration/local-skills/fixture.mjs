@@ -168,8 +168,8 @@ export async function fixture(t, { robotName = 'acceptance' } = {}) {
         return skillCatalogRequest({ skillsets: service, robot: target, input, mutate: declared.mutate });
     };
     // The settings surface sends the declared tool inputs. The robot and conversation are inputs the tools declare, so the
-    // tests pass them explicitly. RoboTeam's WebChat Conversation skills action is not part of this contract: no Explorer
-    // code consumes it at the pinned revision.
+    // tests pass them explicitly. RoboTeam's WebChat Conversation skills action and the page it opens are not part of this
+    // contract; deployed-settings.mjs covers them against a deployment.
     const settings = { context: { robot: robot.name, sessionId: id }, policyVersion: null, items: [], scope: null,
         async load(extra = {}) {
             return this.apply(await callTool('list_achilles_skills', { ...this.context, ...extra }));
