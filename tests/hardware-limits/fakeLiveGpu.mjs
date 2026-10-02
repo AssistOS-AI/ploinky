@@ -31,14 +31,23 @@ const BOX_INIT_PID = 4000;
 const CLIENT_PIPE = '/run/ploinky-mps-pipe';
 const OVERHEAD_MIB = 148;
 
-export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}, unrelated = [], hostUid = 1000 }) {
+// The owned agents of the apparatus-mps fixture; the local-llm fixture passes its own (fakeLiveLlm.mjs).
+const P_WORLD = Object.freeze({ repository: 'hwlfixture', roles: Object.freeze(['probe', 'peer', 'cpu']), names: Object.freeze({}), clients: Object.freeze(['probe', 'peer']) });
+
+export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}, unrelated = [], hostUid = 1000, fixture = P_WORLD, envelope = null, hooks = {} }) {
     const base = createFakeWorld({ statePath, node, engine, host, unrelated, faults: faults.base || {} });
+    const nameOf = role => fixture.names?.[role] ?? role;
+    const refOf = role => `${fixture.repository}/${nameOf(role)}`;
+    const roleOfName = name => fixture.roles.find(role => nameOf(role) === name) ?? name;
     const model = {
         clock: 100, nextHost: 5000, nextBox: 100, agentCounter: 0, procs: new Map(), dirs: new Set(), agents: new Map(), helpers: new Map(),
         boxId: null, workspace: null, instance: null, prefix: null,
         store: { epoch: hex('epoch').slice(0, 32), revision: 1, policies: {} },
         daemon: null, mpsStatus: 'inactive', events: [], signals: [], calls: [], programs: [], foreign: [], bypassProcs: [],
         controlLog: [], grantCalls: [], widened: false, smiQueries: 0, applyCalls: [], observeCalls: 0, probes: [],
+        // Rows nvidia-smi lists without adding to the device's used memory (a runner the driver lists by PID), the memory the
+        // MPS server row states (when the driver lists only the server), and the utilisation it prints.
+        extraRows: [], serverMiB: undefined, gpuUtil: 0,
     };
     const tick = () => new Promise(resolve => setTimeout(resolve, faults.tickMs ?? 1));
     const event = name => { model.events.push(name); };
@@ -73,9 +82,11 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
     function createAgent(role, { share = null, recorded = null } = {}) {
         const id = recorded?.id ?? hex(`${role}-${++model.agentCounter}-${model.boxId}`);
         const agent = {
-            role, id, name: fixtureContainerName(model.workspace, role), created: recorded?.created ?? `2026-10-02T12:00:${String(model.agentCounter % 60).padStart(2, '0')}Z`,
+            role, id, name: fixtureContainerName(model.workspace, nameOf(role), fixture.repository), created: recorded?.created ?? `2026-10-02T12:00:${String(model.agentCounter % 60).padStart(2, '0')}Z`,
             image: recorded?.image ?? hex('agent-image'), imageName: model.image, user: faults.imageUser ?? '1000:1000', running: true, startedAt: `2026-10-02T12:01:${String(model.agentCounter % 60).padStart(2, '0')}Z`,
             labels: { 'ploinky.limitshash': hex(`limits-${role}-${JSON.stringify(share)}`) }, env: [...baseEnv], mounts: [], boxPid: model.nextBox++, share,
+            // The whole saved policy this instance was created with (a share, CPUs and RAM): an instance is applied while it equals the store's.
+            limits: model.store.policies[refOf(role)] ?? null, limitsKey: JSON.stringify(model.store.policies[refOf(role)] ?? null),
         };
         if (share) {
             const daemon = model.daemon;
@@ -103,7 +114,8 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
     }
 
     // --- The daemon ---------------------------------------------------------
-    const desiredShares = () => Object.fromEntries(Object.entries(model.store.policies).filter(([, limits]) => limits.gpu).map(([ref, limits]) => [ref.split('/')[1], limits.gpu]));
+    const desiredShares = () => Object.fromEntries(Object.entries(model.store.policies).filter(([, limits]) => limits.gpu).map(([ref, limits]) => [roleOfName(ref.split('/')[1]), limits.gpu]));
+    const policyKey = role => JSON.stringify(model.store.policies[refOf(role)] ?? null);
     const mibOf = share => shareMemoryMiB(share.vramPercent, gpu.memoryMiB);
     function desiredDefault() {
         const shares = Object.values(desiredShares());
@@ -148,14 +160,14 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
             if (want) { await tick(); startDaemon(want); }
             const recreate = new Set([...shared.map(agent => agent.role), ...roles]);
             for (const role of recreate) {
-                if (!['probe', 'peer'].includes(role)) continue;
+                if (!fixture.clients.includes(role)) continue;
                 await tick(); removeAgent(role);
                 await tick(); createAgent(role, { share: shares[role] || null });
             }
         } else {
             for (const role of roles) {
                 const agent = model.agents.get(role); const share = shares[role] || null;
-                if (agent && JSON.stringify(agent.share) === JSON.stringify(share) && (!share || agent.mpsGeneration === `${model.daemon.gen}:${model.daemon.cfg}`)) continue;
+                if (agent && JSON.stringify(agent.share) === JSON.stringify(share) && agent.limitsKey === policyKey(role) && (!share || agent.mpsGeneration === `${model.daemon.gen}:${model.daemon.cfg}`)) continue;
                 await tick(); removeAgent(role);
                 await tick(); createAgent(role, { share });
             }
@@ -166,15 +178,16 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
     // --- GPU ----------------------------------------------------------------
     function smiXml() {
         const rows = [];
-        if (model.daemon && !model.daemon.lost) for (const server of model.daemon.servers) rows.push({ pid: server.hostPid, type: 'M+C', name: 'nvidia-cuda-mps-server' });
+        if (model.daemon && !model.daemon.lost) for (const server of model.daemon.servers) rows.push({ pid: server.hostPid, type: 'M+C', name: 'nvidia-cuda-mps-server', ...(model.serverMiB !== undefined ? { mib: model.serverMiB, listOnly: true } : {}) });
         for (const proc of model.bypassProcs) rows.push({ pid: proc.hostPid, type: 'C', name: 'python3' });
         for (const foreign of model.foreign) rows.push({ pid: foreign.pid, type: foreign.type || 'C', name: foreign.name || 'train.py', mib: foreign.mib });
+        for (const extra of model.extraRows) if (model.procs.has(extra.pid)) rows.push({ ...extra, listOnly: true });
         // A row that states its memory (a display process) adds exactly that; the others keep the fixed 300 MiB.
-        const usedMiB = 13 + (rows.some(row => row.mib === undefined) ? 300 : 0) + rows.reduce((sum, row) => sum + (row.mib ?? 0), 0) + model.probes.filter(probe => probe.active).reduce((sum, probe) => sum + probe.allocatedMiB, 0);
+        const usedMiB = 13 + (rows.some(row => row.mib === undefined) ? 300 : 0) + rows.reduce((sum, row) => sum + (row.listOnly ? 0 : (row.mib ?? 0)), 0) + model.probes.filter(probe => probe.active).reduce((sum, probe) => sum + probe.allocatedMiB, 0);
         const section = faults.smiProcessesNA ? 'N/A'
             : rows.map(row => `<process_info><gpu_instance_id>N/A</gpu_instance_id><compute_instance_id>N/A</compute_instance_id><pid>${row.pid}</pid><type>${row.type}</type><process_name>${row.name}</process_name><used_memory>${row.mib ?? 300} MiB</used_memory></process_info>`).join('\n');
         const xml = `<?xml version="1.0" ?>\n<!DOCTYPE nvidia_smi_log SYSTEM "nvsmi_device_v12.dtd">\n<nvidia_smi_log>\n<timestamp>Fri Oct  2 19:30:00 2026</timestamp>\n<driver_version>${gpu.driverVersion}</driver_version>\n<attached_gpus>1</attached_gpus>\n`
-            + `<gpu id="00000000:01:00.0">\n<product_name>${gpu.name}</product_name>\n<uuid>${faults.smiOtherUuid ? 'GPU-00000000-0000-4000-8000-000000000000' : gpu.uuid}</uuid>\n<compute_mode>${faults.smiComputeMode || 'Default'}</compute_mode>\n`
+            + `<gpu id="00000000:01:00.0">\n<product_name>${gpu.name}</product_name>\n<uuid>${faults.smiOtherUuid ? 'GPU-00000000-0000-4000-8000-000000000000' : gpu.uuid}</uuid>\n<compute_mode>${faults.smiComputeMode || 'Default'}</compute_mode>\n<utilization><gpu_util>${model.gpuUtil} %</gpu_util><memory_util>0 %</memory_util></utilization>\n`
             + `<fb_memory_usage><total>${faults.smiTotalMiB ?? gpu.memoryMiB} MiB</total><reserved>201 MiB</reserved><used>${usedMiB} MiB</used><free>${gpu.memoryMiB - usedMiB} MiB</free></fb_memory_usage>\n`
             + `<processes>${section}</processes>\n</gpu>\n</nvidia_smi_log>\n`;
         return faults.smiTransform ? faults.smiTransform(xml) : xml;
@@ -261,7 +274,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
     }
 
     // --- The administrator route -------------------------------------------
-    const key = role => fixtureContainerName(model.workspace, role);
+    const key = role => fixtureContainerName(model.workspace, nameOf(role), fixture.repository);
     function gpuStatus() {
         const daemon = model.daemon;
         return {
@@ -273,23 +286,33 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
     }
     function agentsState() {
         const shares = desiredShares();
-        return ['cpu', 'peer', 'probe'].map(role => {
-            const ref = `hwlfixture/${role}`; const agent = model.agents.get(role); const share = shares[role] || null;
+        return [...fixture.roles].sort((a, b) => refOf(a).localeCompare(refOf(b))).map(role => {
+            const ref = refOf(role); const agent = model.agents.get(role); const share = shares[role] || null;
             const daemon = model.daemon;
-            const applied = share ? Boolean(agent?.share && JSON.stringify(agent.share) === JSON.stringify(share) && daemon && !daemon.lost && agent.mpsGeneration === `${daemon.gen}:${daemon.cfg}`) : !agent?.share;
+            const applied = (share ? Boolean(agent?.share && JSON.stringify(agent.share) === JSON.stringify(share) && daemon && !daemon.lost && agent.mpsGeneration === `${daemon.gen}:${daemon.cfg}`) : !agent?.share) && agent?.limitsKey === policyKey(role);
             return { ref, configured: model.store.policies[ref] || {}, declared: {}, effective: {}, containers: agent ? [{ key: key(role), alias: null, instanceId: agent.id, enableGeneration: agent.id, availability: 'ready', limitsState: applied ? 'applied' : 'pending', problem: null, mpsGeneration: agent.mpsGeneration || null }] : [] };
         });
     }
-    const adminState = () => ({ ok: true, token: { epoch: model.store.epoch, revision: model.store.revision }, gate: { state: 'on', prepared: true, backendReady: true, controllers: ['cpu', 'memory', 'pids'] }, envelope: null, gpu: gpuStatus(), help: {}, agents: agentsState(), apply: null });
+    const adminState = () => ({ ok: true, token: { epoch: model.store.epoch, revision: model.store.revision }, gate: { state: 'on', prepared: true, backendReady: true, controllers: ['cpu', 'memory', 'pids'] }, envelope: faults.envelope === undefined ? envelope : faults.envelope, gpu: gpuStatus(), help: {}, agents: agentsState(), apply: null });
     async function admin(method, bodyText) {
         if (faults.adminStatus && method === 'GET') return { status: faults.adminStatus, text: JSON.stringify({ ok: false, error: 'not_authenticated' }) };
         if (method === 'GET') return { status: 200, text: JSON.stringify(adminState()) };
         const body = JSON.parse(bodyText);
         if (JSON.stringify(body.expectedToken) !== JSON.stringify({ epoch: model.store.epoch, revision: model.store.revision })) return { status: 409, text: JSON.stringify({ ok: false, error: 'revision_conflict' }) };
         if (body.action === 'set_agent_limits') {
-            const gpuShare = body.limits?.gpu;
-            if (!gpuShare || !Number.isInteger(gpuShare.smPercent) || !Number.isInteger(gpuShare.vramPercent) || gpuShare.smPercent < 1 || gpuShare.vramPercent < 1 || shareMemoryMiB(gpuShare.vramPercent, gpu.memoryMiB) < 512) return { status: 400, text: JSON.stringify({ ok: false, error: 'invalid_limits' }) };
-            model.store.policies[body.agentRef] = { gpu: { smPercent: gpuShare.smPercent, vramPercent: gpuShare.vramPercent } };
+            const limits = body.limits || {};
+            const gpuShare = limits.gpu;
+            const bad = { status: 400, text: JSON.stringify({ ok: false, error: 'invalid_limits' }) };
+            if (Object.keys(limits).some(name => !['cpus', 'memoryPercent', 'gpu'].includes(name)) || !Object.keys(limits).length) return bad;
+            if (gpuShare !== undefined && (!gpuShare || !Number.isInteger(gpuShare.smPercent) || !Number.isInteger(gpuShare.vramPercent) || gpuShare.smPercent < 1 || gpuShare.vramPercent < 1 || shareMemoryMiB(gpuShare.vramPercent, gpu.memoryMiB) < 512)) return bad;
+            if (limits.memoryPercent !== undefined && (!Number.isInteger(limits.memoryPercent) || limits.memoryPercent < 1 || limits.memoryPercent > 100)) return bad;
+            if (limits.cpus !== undefined && (typeof limits.cpus !== 'number' || !(limits.cpus >= 0.05))) return bad;
+            const visible = faults.envelope === undefined ? envelope : faults.envelope;
+            if (limits.cpus !== undefined && visible && limits.cpus > visible.cpus) return { status: 422, text: JSON.stringify({ ok: false, error: 'exceeds_envelope', message: `cpus ${limits.cpus} exceeds the Box envelope of ${visible.cpus}` }) };
+            model.store.policies[body.agentRef] = {
+                ...(limits.cpus !== undefined ? { cpus: limits.cpus } : {}), ...(limits.memoryPercent !== undefined ? { memoryPercent: limits.memoryPercent } : {}),
+                ...(gpuShare !== undefined ? { gpu: { smPercent: gpuShare.smPercent, vramPercent: gpuShare.vramPercent } } : {}),
+            };
             model.store.revision += 1;
             return { status: 200, text: JSON.stringify({ ...adminState(), committed: true }) };
         }
@@ -301,7 +324,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
         if (body.action === 'apply') {
             model.applyCalls.push(body.containers);
             if (faults.applyStatus) return { status: faults.applyStatus, text: JSON.stringify({ ok: false, error: 'apply_failed' }) };
-            const roles = body.containers.map(container => ['probe', 'peer', 'cpu'].find(role => key(role) === container));
+            const roles = body.containers.map(container => fixture.roles.find(role => key(role) === container));
             if (roles.some(role => !role)) return { status: 400, text: JSON.stringify({ ok: false, error: 'unknown_container' }) };
             await applyFlow(roles);
             return { status: 200, text: JSON.stringify({ ok: true, results: roles.map(role => ({ key: key(role), state: 'applied' })) }) };
@@ -364,7 +387,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
             if (faults.reuseDaemonPid && model.daemon && !model.daemon.reused) { model.daemon.reused = true; model.procs.get(model.daemon.hostPid).start = String(++model.clock); }
             return ok(JSON.stringify(killProgram(rest)));
         }
-        void options;
+        if (hooks.core) { const handled = await hooks.core({ script, rest, options }); if (handled) return handled; }
         return failed('unmodeled in-Box program');
     }
 
@@ -416,6 +439,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
                 }
                 return new Promise(resolve => { const end = Date.now() + (faults.holderMs ?? 100000); const timer = setInterval(() => { if (options.signal?.aborted || Date.now() >= end) { clearInterval(timer); resolve(options.signal?.aborted ? ok('', { status: null, cancelled: true }) : ok('')); } }, 3); });
             }
+            if (hooks.agentExec) { const handled = await hooks.agentExec({ agent, command, options, overrides }); if (handled) return handled; }
             return failed('unmodeled agent command');
         }
         if (args[0] === 'run') {
@@ -496,7 +520,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
         const first = Object.values(state.agents)[0];
         model.image = first.imageName;
         // The agents the engine's own start created keep their recorded identities.
-        for (const role of ['probe', 'peer', 'cpu']) createAgent(role, { recorded: state.agents[fixtureContainerName(workspace, role)] });
+        for (const role of fixture.roles) createAgent(role, { recorded: state.agents[fixtureContainerName(workspace, nameOf(role), fixture.repository)] });
     }
 
     async function provider(binary, args, options = {}) {
@@ -513,8 +537,21 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
         }
         return base(binary, args, options);
     }
+    // What a fixture built on this world (fakeLiveLlm.mjs) needs of its internals.
+    const helpers = {
+        spawn, stop, leafOf, corePath, createAgent, agentByRole: role => model.agents.get(role), refOf, nameOf, policyOf: role => model.store.policies[refOf(role)] ?? null,
+        // A share client that creates a CUDA context makes the daemon start its server on demand.
+        ensureServer(agent) {
+            const daemon = model.daemon;
+            if (agent.share && daemon && !daemon.lost && !daemon.servers.length) {
+                const proc = spawn({ cgroup: corePath(), ppid: daemon.hostPid, ns: [model.nextBox++] });
+                daemon.servers.push({ proc, hostPid: proc.hostPid, boxPid: proc.nspid[1] });
+            }
+        },
+        dropServers() { if (model.daemon) { for (const server of model.daemon.servers) stop(server.proc); model.daemon.servers = []; } },
+    };
     return {
-        provider, hostProc, model, statePath,
+        provider, hostProc, model, statePath, helpers,
         // Test controls.
         addForeign(pid, type = 'C') { model.foreign.push({ pid, type }); },
         // A logged-in desktop's display process (amendment A5): listed by nvidia-smi with its small

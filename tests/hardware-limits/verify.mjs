@@ -6,7 +6,9 @@
 //   baseline      run scoped existing suites against the baseline staging copies
 //   offline       run one phase's required tests and affected regressions
 //   prepare-live  write a proposed run manifest for one live block (no engine
-//                 or SSH); mac-cpu, apparatus-cpu and apparatus-mps get concrete
+//                 or SSH); mac-cpu, apparatus-cpu, apparatus-mps, apparatus-local-llm and
+//                 apparatus-vllm (--stage calibration|qualified, and --calibration-evidence for
+//                 the second stage) get concrete
 //                 pins and a human approval summary beside the manifest. A mac block's
 //                 workspace lives under pins.workspaceParentRoot, which must be
 //                 short enough for the CLI's Unix sockets (a session scratch
@@ -28,6 +30,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { runLiveCommand, LIVE_CASES, UNSUPPORTED, validateProfile } from './liveHarness.mjs';
 import { liveSourceDigest, workspaceSocketProblem } from './liveCommon.mjs';
 import { CONCRETE_BLOCKS, buildConcreteManifest, explorerFixtureImage, proposedWorkspace, renderSummary, selectPorts, summaryPathFor, validatePins } from './liveManifest.mjs';
+import { LLM_SOURCE_DIRECTORY } from './liveLlmNames.mjs';
 import { validateStage, writeUstar } from './liveStage.mjs';
 
 import {
@@ -761,7 +764,7 @@ async function selfTest(options) {
 // A frozen candidate for live use: the committed revision through git
 // archive (every blob verified) plus real copies of the pinned dependencies,
 // so the live source digest needs no symlink and cannot follow a changing one.
-function buildFrozenCandidate(config, runId) {
+function buildFrozenCandidate(config, runId, { llm = false } = {}) {
     const source = config.repos.ploinky.candidateRoot;
     if (git(source, ['status', '--porcelain', '--untracked-files=no'])) throw new UsageError('the Ploinky candidate has uncommitted tracked changes; commit before prepare-live');
     const revision = git(source, ['rev-parse', 'HEAD']);
@@ -789,8 +792,56 @@ function buildFrozenCandidate(config, runId) {
         copy(dependency.realpath, target);
         if (treeDigest(target) !== dependency.treeDigest) throw new SchemaError(`dependency ${dependency.name} copy differs from its pinned digest`);
     }
+    // A local-llm block carries the local-llm candidate's own tree (the committed revision, every
+    // blob verified) beside the Ploinky candidate; the workspace copy is made from it on the host.
+    let llmRevision = null;
+    if (llm) {
+        const llmSource = config.repos.localLlms.candidateRoot;
+        if (git(llmSource, ['status', '--porcelain', '--untracked-files=no'])) throw new UsageError('the local-llms candidate has uncommitted tracked changes; commit before prepare-live');
+        llmRevision = git(llmSource, ['rev-parse', 'HEAD']);
+        const temporary = path.join(config.evidenceRoot, `llms-${runId}`);
+        createBaselineStage(llmSource, llmRevision, temporary);
+        try {
+            const target = path.join(stage, LLM_SOURCE_DIRECTORY);
+            fs.mkdirSync(target, { mode: 0o755 });
+            copyFrozenTree(path.join(temporary, 'local-llm'), path.join(target, 'local-llm'));
+        } finally { fs.rmSync(temporary, { recursive: true, force: true }); }
+    }
     const root = fs.realpathSync(stage);
-    return { root, revision, digest: liveSourceDigest(root) };
+    return { root, revision, digest: liveSourceDigest(root), ...(llm ? { llm: { revision: llmRevision } } : {}) };
+}
+
+function copyFrozenTree(from, to) {
+    fs.mkdirSync(to, { mode: 0o755 });
+    for (const name of fs.readdirSync(from).sort()) {
+        const entry = fs.lstatSync(path.join(from, name));
+        if (entry.isDirectory()) copyFrozenTree(path.join(from, name), path.join(to, name));
+        else if (entry.isFile()) fs.copyFileSync(path.join(from, name), path.join(to, name), fs.constants.COPYFILE_EXCL);
+        else throw new SchemaError(`the local-llm tree contains a link or special file: ${name}`);
+    }
+}
+
+// Stage 2 of apparatus-vllm: the stage 1 evidence, checked with the candidate's own digest function, and
+// whether the candidate's reviewed data already qualifies its tuple (production's resolver decides).
+async function vllmStage(options, candidate) {
+    const stage = options.stage ?? 'calibration';
+    if (!['calibration', 'qualified'].includes(stage)) throw new UsageError('--stage must be calibration or qualified');
+    if (stage === 'calibration') {
+        if (options['calibration-evidence'] !== undefined) throw new UsageError('stage 1 (calibration) takes no --calibration-evidence');
+        return { stage };
+    }
+    if (!options['calibration-evidence']) throw new UsageError('stage 2 (qualified) needs --calibration-evidence PATH, the stage 1 evidence document');
+    const document = readJsonBounded(requireAbsolute(options['calibration-evidence'], 'calibration-evidence'), 512 * 1024);
+    const evidence = document.evidence ?? document;
+    const tree = path.join(candidate.root, LLM_SOURCE_DIRECTORY, 'local-llm');
+    const tool = await import(pathToFileURL(path.join(tree, 'tools', 'vllm_mps_calibration.mjs')).href);
+    const qualification = await import(pathToFileURL(path.join(tree, 'src', 'controller', 'vllmMpsQualification.mjs')).href);
+    if (evidence?.schema !== tool.CALIBRATION_SCHEMA || evidence.verdict?.qualifiable !== true || evidence.evidenceDigest !== tool.evidenceDigest(evidence)) {
+        throw new UsageError('the calibration evidence is not a qualifiable stage 1 document that matches its own digest');
+    }
+    const tuple = Object.fromEntries(tool.TUPLE_FIELDS.map((field) => [field, evidence.tuple[field]]));
+    const resolved = qualification.resolveVllmMpsQualification(tuple);
+    return { stage, calibration: { evidenceDigest: evidence.evidenceDigest, tuple, expectQualified: resolved.qualified === true && resolved.evidenceDigest === evidence.evidenceDigest } };
 }
 
 function writePrivateText(target, text) {
@@ -799,7 +850,7 @@ function writePrivateText(target, text) {
     fs.renameSync(temporary, target);
 }
 
-function prepareLive(options) {
+async function prepareLive(options) {
     const { config } = loadConfig(requireAbsolute(options.config, 'config'));
     const block = options.block;
     const runPath = requireAbsolute(options.run, 'run');
@@ -814,14 +865,15 @@ function prepareLive(options) {
         // for the CLI's Unix sockets (pins.workspaceParentRoot selects it).
         const socketProblem = workspaceSocketProblem(proposedWorkspace(block, pins, runId).path);
         if (socketProblem) { console.error(`[prepare-live] BLOCKED: ${socketProblem}`); return EXIT.BLOCKED; }
-        const candidate = buildFrozenCandidate(config, runId);
+        const candidate = buildFrozenCandidate(config, runId, { llm: Boolean(CONCRETE_BLOCKS[block].llm) });
+        const vllm = CONCRETE_BLOCKS[block].vllm ? await vllmStage(options, candidate) : null;
         if (CONCRETE_BLOCKS[block].remote) {
             const payloadPath = path.join(config.evidenceRoot, `candidate-${runId}.tar`);
             candidate.payload = { path: payloadPath, ...writeUstar(candidate.root, payloadPath) };
         }
         const manifest = validateRunManifest(buildConcreteManifest({
             block, runId, configDigest, casesDigest: config.casesDigest, documentSuffix: config.documentSuffix, pins, candidate,
-            image: explorerFixtureImage(config.repos.explorer.candidateRoot), ports: selectPorts(pins), unsupported,
+            image: CONCRETE_BLOCKS[block].llm ? pins.llm.image : explorerFixtureImage(config.repos.explorer.candidateRoot), ports: selectPorts(pins), unsupported, vllm,
         }));
         validateProfile(manifest, { partial: true });
         if (manifest.target.remote) validateStage(manifest);

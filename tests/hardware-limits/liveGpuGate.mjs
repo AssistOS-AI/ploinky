@@ -22,7 +22,7 @@
 //     disappears is logged. It is never touched or signalled.
 //   - It never changes the compute mode and never signals any process.
 import { blocked } from './liveCommon.mjs';
-import { parseGpuInventory, parseGpuMemory, requireGpuIdle } from './liveGpu.mjs';
+import { parseGpuInventory, parseGpuMemory, parseGpuUtilization, requireGpuIdle } from './liveGpu.mjs';
 import { requireTransport } from './liveProcess.mjs';
 import { cgroupWithin, createHostProc } from './liveGpuHost.mjs';
 import { GPU_TOLERATED_MAX, GPU_TOLERATED_MAX_MIB } from './fixtures.mjs';
@@ -84,7 +84,7 @@ export function createGpuGate({
     const guarded = async label => {
         let result;
         try { result = await query(); } catch (error) { throw gpuBlocked('query_error', { message: error.message }); }
-        try { return { result, inventory: parseGpuInventory(result, uuid), memory: parseGpuMemory(result) }; }
+        try { return { result, inventory: parseGpuInventory(result, uuid), memory: parseGpuMemory(result), utilization: parseGpuUtilization(result) }; }
         catch (error) { throw gpuBlocked(classify(error.message), { message: error.message, label }); }
     };
     const tuple = (role, observed) => ({ role, hostPid: observed.hostPid, bootId: observed.bootId, startIdentity: observed.startIdentity });
@@ -201,26 +201,30 @@ export function createGpuGate({
             }
             remember(label, inventory, memory, owned, outcome);
             if (minFreeMiB && memory.freeMiB < minFreeMiB) throw gpuBlocked('insufficient_free_memory', { message: `${memory.freeMiB} MiB free, ${minFreeMiB} MiB needed`, label });
-            return { inventory, memory, owned: owned.map(value => value.hostPid), tolerated: outcome.tolerated.map(record => record.hostPid), vanished: outcome.vanished };
+            return { inventory, memory, utilization: query_.utilization, owned: owned.map(value => value.hostPid), tolerated: outcome.tolerated.map(record => record.hostPid), vanished: outcome.vanished };
         },
         // Run `task(signal)` while the GPU is re-queried every interval. A
         // foreign user starts no new work: the gate trips, the task's signal
         // aborts its owned client command and the failure is the gate's. The
         // owned clients themselves are stopped only by cleanup.
-        async monitor(task, { every = intervalMs } = {}) {
+        // `onCheck(checked)` receives each passing re-query (the same result `check` returns), for
+        // measurements taken at the gate's own cadence.
+        async monitor(task, { every = intervalMs, onCheck = null } = {}) {
             const controller = new AbortController();
             let finished = false; let value; let failure = null;
             const running = Promise.resolve().then(() => task(controller.signal)).then(result => { value = result; }, error => { failure = error; }).finally(() => { finished = true; });
             while (!finished) {
                 await Promise.race([running, sleep(every)]);
                 if (finished) break;
-                try { await gate.check('monitor'); }
+                let checked;
+                try { checked = await gate.check('monitor'); }
                 catch (error) {
                     tripped = error.gate?.reason === 'gpu_busy' ? gpuBlocked('foreign_process_appeared', { ...error.gate, message: error.message }) : error;
                     controller.abort();
                     await running;
                     throw tripped;
                 }
+                if (onCheck) onCheck(checked);
             }
             await running;
             if (failure) throw failure;

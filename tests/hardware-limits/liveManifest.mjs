@@ -9,8 +9,12 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { WANTED_CONTROLLERS } from '../../ploinky-box/entrypoint/cgroupDelegation.mjs';
-import { ENGINE_CONNECTIONS_ARGV, ENGINE_INFO_ARGV, HOST_RECORD_DIRECTORIES, IMAGE_REF, OWNER_MARKER, UNIX_SOCKET_PATH_LIMIT, WORKSPACE_SOCKET_NAME, digest, keys, AGENT_INSPECT, INSPECT } from './liveCommon.mjs';
-import { FIXTURE_REPOSITORY, GPU_PROBE_TARGET, fixtureContainerName, fixtureManifest, fixturePlan, proposedWorkspaceIdentity, startArgs } from './liveFixture.mjs';
+import { ENGINE_CONNECTIONS_ARGV, ENGINE_INFO_ARGV, HOST_RECORD_DIRECTORIES, IMAGE_REF, OWNER_MARKER, UNIX_SOCKET_PATH_LIMIT, WORKSPACE_SOCKET_NAME, digest, keys, liveSourceDigest, AGENT_INSPECT, INSPECT } from './liveCommon.mjs';
+import { FIXTURE_REPOSITORY, GPU_PROBE_TARGET, fixtureContainerName, fixtureManifest, fixturePlan, proposedWorkspaceIdentity, rewriteLlmManifest, startArgs } from './liveFixture.mjs';
+import { LLM_MODELS, LLM_REF, LLM_REPOSITORY, LLM_SOURCE_DIRECTORY } from './liveLlmNames.mjs';
+import {
+    INFERENCE_CADENCE, INFERENCE_TOLERANCE, INSUFFICIENT_RAM, L1_PROMPT, LLM_BUDGET, LLM_IMAGE_DIGESTS, LLM_IMAGE_FILES, LLM_LEAF_SAMPLE, LLM_RUNNER_PROCESSES, LLM_TOOL_CALL, PLAYGROUND_DECISION, VLLM_SHARE, insufficientMemoryPercent, llmToolWords, vllmToolWords,
+} from './liveLlmCommands.mjs';
 import { gpuQueryArgv } from './liveGpuGate.mjs';
 import {
     ADMIN_REQUEST, GPU_SHARES, MPS_CLIENT_PIPE, PROBE_FILE, TIGHTER_CLIENT, controlHelperRunArgv, probeBoundMiB, probeExecArgv, shareMemoryMiB,
@@ -23,6 +27,10 @@ export const CONCRETE_BLOCKS = Object.freeze({
     'mac-cpu': { platform: 'darwin', remote: false, cases: ['LIVE-C1', 'LIVE-C2'] },
     'apparatus-cpu': { platform: 'linux', remote: true, cases: ['LIVE-A1'] },
     'apparatus-mps': { platform: 'linux', remote: true, cases: ['LIVE-P1', 'LIVE-P2', 'LIVE-P3', 'LIVE-P4'], gpu: true },
+    // The local-llm candidate in its own owned workspace, behind the same idle gate: budgets and a llama.cpp
+    // model (L1, L2), and vLLM under an MPS share in two stages (L3).
+    'apparatus-local-llm': { platform: 'linux', remote: true, cases: ['LIVE-L1', 'LIVE-L2'], gpu: true, llm: true },
+    'apparatus-vllm': { platform: 'linux', remote: true, cases: ['LIVE-L3'], gpu: true, llm: true, vllm: true },
 });
 export const DEADLINES = Object.freeze({
     coreMs: 30000, startMs: 20 * 60 * 1000, destroyMs: 5 * 60 * 1000, fullGraphMs: 20 * 60 * 1000,
@@ -30,6 +38,12 @@ export const DEADLINES = Object.freeze({
 });
 // The GPU block needs longer than the CPU ones: P3 alone runs six Applies.
 export const GPU_DEADLINES = Object.freeze({ ...DEADLINES, blockMs: 24 * 60 * 1000 });
+// The local-llm blocks load a model after two Applies. The vLLM block installs 3.9 GB of wheels and
+// loads a 2.7 GB snapshot: its block deadline is the longest the SSH dispatch allows (1,800,000 ms
+// for block, cleanup and margin), and the install and the load are bounded inside it. An install
+// or a load that does not fit is BLOCKED with the progress it made, never an indefinite poll.
+export const LLM_DEADLINES = Object.freeze({ ...GPU_DEADLINES });
+export const VLLM_DEADLINES = Object.freeze({ ...GPU_DEADLINES, blockMs: 1470000, installMs: 12 * 60 * 1000, modelLoadMs: 8 * 60 * 1000 });
 const HASH = /^sha256:[a-f0-9]{64}$/;
 const SAFE = /^\/[A-Za-z0-9/_.-]+$/;
 const canonicalFile = file => path.isAbsolute(file) && fs.realpathSync(file) === file && fs.statSync(file).isFile();
@@ -39,7 +53,7 @@ const canonicalFile = file => path.isAbsolute(file) && fs.realpathSync(file) ===
 // are rechecked by the runner on arrival, before any mutation.
 export function validatePins(value, block) {
     const spec = CONCRETE_BLOCKS[block];
-    keys(value, ['schema', 'host', 'node', 'engine', 'boxImage'], 'pins', ['ssh', 'workspaceParentRoot', 'ports', 'gpu']);
+    keys(value, ['schema', 'host', 'node', 'engine', 'boxImage'], 'pins', ['ssh', 'workspaceParentRoot', 'ports', 'gpu', 'llm']);
     if (value.schema !== 1) throw new Error('Unsupported pins schema');
     keys(value.host, ['hostname', 'platform', 'home'], 'pinned host');
     keys(value.node, ['path', 'digest'], 'pinned node');
@@ -63,6 +77,15 @@ export function validatePins(value, block) {
             || !/^[0-9]+(?:\.[0-9]+)+$/.test(value.gpu.driverVersion) || !Number.isInteger(value.gpu.memoryMiB) || value.gpu.memoryMiB < 1024
             || !Number.isInteger(value.gpu.expectedSmCount) || value.gpu.expectedSmCount < 1) throw new Error('Invalid pinned GPU device');
     } else if (value.gpu !== undefined) throw new Error('A non-GPU block names no GPU');
+    // The immutable local-llm image (and, for vLLM, the pins of the image's lock entry) the operator observed.
+    if (spec.llm) {
+        keys(value.llm, ['image'], 'pinned local-llm', spec.vllm ? ['vllm'] : []);
+        if (!IMAGE_REF.test(value.llm.image)) throw new Error('The local-llm image must be an immutable digest reference');
+        if (spec.vllm) {
+            keys(value.llm.vllm, ['version', 'runnerLockDigest', 'files', 'downloadBytes'], 'pinned vLLM lock entry');
+            vllmToolWords('prerequisites', { pins: value.llm.vllm });
+        }
+    } else if (value.llm !== undefined) throw new Error('Only the local-llm blocks name a local-llm image');
     if (spec.remote) {
         if (value.workspaceParentRoot !== undefined) throw new Error('Apparatus workspaces live under the remote run root');
         keys(value.ssh, ['alias', 'sshBinary', 'address', 'hostKeyAlias', 'user', 'knownHosts', 'identityFile'], 'pinned SSH');
@@ -106,9 +129,33 @@ export function proposedWorkspace(block, pins, runId) {
     return { parent, path: path.join(parent, 'workspace') };
 }
 
-export function buildConcreteManifest({ block, runId, configDigest, casesDigest, documentSuffix, pins, candidate, image, ports, unsupported }) {
+// The pins of the local-llm candidate carried in the frozen payload (.hwl-local-llms/local-llm): its
+// tree digest, its manifest before and after the image is pinned, and the two models' catalog pins
+// the live cases compare the agent's own catalog with.
+export function describeLlmCandidate({ root, sourceRoot, revision, image }) {
+    const local = path.join(root, LLM_SOURCE_DIRECTORY, 'local-llm');
+    const bytes = fs.readFileSync(path.join(local, 'manifest.json'));
+    const catalog = JSON.parse(fs.readFileSync(path.join(local, 'catalog', 'models.json'), 'utf8'));
+    const model = id => { const found = catalog.models.find(entry => entry.id === id); if (!found) throw new Error(`The local-llm catalog has no model ${id}`); return found; };
+    const gguf = model(LLM_MODELS.small).sources.gguf;
+    const hf = model(LLM_MODELS.awq).sources.hf;
+    const files = hf.files.map(file => ({ path: file.path, size: file.size, sha256: file.sha256 }));
+    return {
+        revision, sourcePath: `${sourceRoot}/${LLM_SOURCE_DIRECTORY}/local-llm`, treeDigest: liveSourceDigest(local),
+        manifest: { originalContainer: JSON.parse(bytes).container, originalDigest: digest(bytes), rewrittenDigest: digest(rewriteLlmManifest(bytes, image)) },
+        models: {
+            small: { id: LLM_MODELS.small, repo: gguf.repo, file: gguf.file, commit: gguf.commit, size: gguf.size, sha256: gguf.sha256 },
+            awq: { id: LLM_MODELS.awq, repo: hf.repo, commit: hf.commit, size: files.reduce((sum, file) => sum + file.size, 0), files },
+        },
+    };
+}
+
+// `vllm` is the stage of an apparatus-vllm run: { stage: 'calibration' } or
+// { stage: 'qualified', calibration: { evidenceDigest, tuple, expectQualified } }.
+export function buildConcreteManifest({ block, runId, configDigest, casesDigest, documentSuffix, pins, candidate, image, ports, unsupported, vllm = null }) {
     const spec = CONCRETE_BLOCKS[block];
     if (!spec) throw new Error(`Block ${block} has no implemented executor`);
+    if (Boolean(spec.vllm) !== Boolean(vllm)) throw new Error(spec.vllm ? 'The vLLM block needs its stage' : 'Only the vLLM block has stages');
     const remote = spec.remote;
     const root = remote ? remoteRoot(pins.host.home, runId) : null;
     const { parent, path: workspacePath } = proposedWorkspace(block, pins, runId);
@@ -116,6 +163,9 @@ export function buildConcreteManifest({ block, runId, configDigest, casesDigest,
     const sourceRoot = remote ? `${root}/source` : candidate.root;
     const candidateFile = path.join(candidate.root, 'ploinky-box', 'bin', 'ploinky-box.mjs');
     const agents = fixturePlan(spec.cases);
+    // The local-llm candidate runs from its own immutable image, not the Explorer's fixture image.
+    if (spec.llm) image = pins.llm.image;
+    const llmCandidate = spec.llm ? describeLlmCandidate({ root: candidate.root, sourceRoot, revision: candidate.llm.revision, image }) : null;
     const execution = {
         protocol: 'owned-fixture-v1',
         host: { ...pins.host },
@@ -127,13 +177,22 @@ export function buildConcreteManifest({ block, runId, configDigest, casesDigest,
         box: null,
         agents: [],
         cases: [...spec.cases],
-        fixtures: spec.gpu ? { gpu: { ref: `${FIXTURE_REPOSITORY}/${agents[0].name}` } } : { cpu: { ref: `${FIXTURE_REPOSITORY}/${agents[0].name}` } },
+        fixtures: spec.llm ? { llm: { ref: LLM_REF } } : spec.gpu ? { gpu: { ref: `${FIXTURE_REPOSITORY}/${agents[0].name}` } } : { cpu: { ref: `${FIXTURE_REPOSITORY}/${agents[0].name}` } },
         provision: {
-            revision: candidate.revision, repository: FIXTURE_REPOSITORY, image, boxImage: pins.boxImage, agents,
+            revision: candidate.revision, repository: spec.llm ? LLM_REPOSITORY : FIXTURE_REPOSITORY, image, boxImage: pins.boxImage, agents,
             workspace: { parent, parentMode: remote ? 'staged' : 'create', path: workspacePath },
         },
     };
-    if (spec.gpu) {
+    if (spec.llm) {
+        const { models, ...plan } = llmCandidate;
+        execution.gpu = { ...pins.gpu };
+        execution.provision.gpu = { uuid: pins.gpu.uuid, grantAgents: [LLM_REF] };
+        execution.provision.llm = plan;
+        execution.llm = {
+            image, revision: llmCandidate.revision, models, budget: { ...LLM_BUDGET, gpu: { ...LLM_BUDGET.gpu } }, playground: { ...PLAYGROUND_DECISION },
+            vllm: spec.vllm ? { stage: vllm.stage, share: { ...VLLM_SHARE }, pins: { ...pins.llm.vllm }, calibration: vllm.stage === 'qualified' ? vllm.calibration : null } : null,
+        };
+    } else if (spec.gpu) {
         // The CUDA probe file travels in the frozen candidate; its digest is pinned
         // here and rechecked when the runner writes it into the probe agent.
         const probeSource = `${sourceRoot}/tests/hardware-limits/${PROBE_FILE}`;
@@ -165,9 +224,9 @@ export function buildConcreteManifest({ block, runId, configDigest, casesDigest,
         schema: 1, runId, configDigest, casesDigest, block, target, state: 'proposed',
         workspace: { proposedParent: parent, proposedPath: workspacePath, instance: identity.instance, pathHash: identity.pathHash },
         ports: { tcp: ports.tcp, udp: ports.udp },
-        deadlines: { ...(spec.gpu ? GPU_DEADLINES : DEADLINES) },
+        deadlines: { ...(spec.vllm ? VLLM_DEADLINES : spec.llm ? LLM_DEADLINES : spec.gpu ? GPU_DEADLINES : DEADLINES) },
         images: [
-            { role: 'fixture-agent', ref: image, source: 'AssistOSExplorer explorer/manifest.json line 2' },
+            { role: 'fixture-agent', ref: image, source: spec.llm ? 'operator pins (local-llm image)' : 'AssistOSExplorer explorer/manifest.json line 2' },
             { role: 'box', ref: pins.boxImage, source: 'operator pins' },
         ],
         ownedBoxes: [], ownedProcesses: [], ownedPaths: [], preInventory: {}, operations: [],
@@ -203,9 +262,11 @@ export function plannedCommands(run) {
         { id: 'port-preflight', action: `Bind-test TCP 127.0.0.1:${run.ports.tcp} and 0.0.0.0:${run.ports.tcp}, UDP 0.0.0.0:${run.ports.udp}; any collision aborts` },
         { id: 'pre-inventory', binary: engine, argv: ps, deadlineMs: run.deadlines.coreMs },
         { id: 'pre-inventory-inspect', binary: engine, argv: ['container', 'inspect', '--format', INSPECT, '<CONTAINER_ID>'], deadlineMs: run.deadlines.coreMs },
-        ...plan.agents.map(agent => ({ id: `fixture-write-${agent.name}`, action: `Write ${workspace}/.ploinky/repos/${FIXTURE_REPOSITORY}/${agent.name}/manifest.json`, content: fixtureManifest(agent, { image: plan.image, agents: plan.agents }) })),
+        ...(plan.llm
+            ? [{ id: 'fixture-write-local-llm', action: `Copy the frozen local-llm tree ${plan.llm.sourcePath} (${plan.llm.treeDigest}, revision ${plan.llm.revision}) byte for byte to ${workspace}/.ploinky/repos/${LLM_REPOSITORY}/local-llm; its manifest (${plan.llm.manifest.originalDigest}, image ${plan.llm.manifest.originalContainer}) is rewritten to the immutable image ${plan.image} and must then be ${plan.llm.manifest.rewrittenDigest}. The model data and the runner caches are created by the agent under ${workspace}/.data/local-llm and ${workspace}/.data/shared, inside the new workspace only` }]
+            : plan.agents.map(agent => ({ id: `fixture-write-${agent.name}`, action: `Write ${workspace}/.ploinky/repos/${FIXTURE_REPOSITORY}/${agent.name}/manifest.json`, content: fixtureManifest(agent, { image: plan.image, agents: plan.agents }) }))),
         ...(profile.gpu ? [
-            { id: 'fixture-write-probe-file', action: `Copy ${profile.gpu.probe.sourcePath} (${profile.gpu.probe.digest}) to ${workspace}/.ploinky/repos/${FIXTURE_REPOSITORY}/${GPU_PROBE_TARGET}; the nested engine stages it at /code/${PROBE_FILE}` },
+            ...(profile.gpu.probe ? [{ id: 'fixture-write-probe-file', action: `Copy ${profile.gpu.probe.sourcePath} (${profile.gpu.probe.digest}) to ${workspace}/.ploinky/repos/${FIXTURE_REPOSITORY}/${GPU_PROBE_TARGET}; the nested engine stages it at /code/${PROBE_FILE}` }] : []),
             { id: 'gpu-grant', binary: node, argv: [profile.candidate.path, 'gpu', 'grant', ...plan.gpu.grantAgents.flatMap(ref => ['--agent', ref])], cwd: workspace, env: {}, deadlineMs: run.deadlines.coreMs,
                 note: 'The supported product path: records the grant under ~/.ploinky-box/gpu-grants and discovers the host driver. No Box exists yet, so the next start applies it.' },
         ] : []),
@@ -233,7 +294,8 @@ export function plannedCommands(run) {
         { id: 'A1-handshake', binary: engine, argv: [...nested, 'container', 'exec', '<MEMORY_AGENT_ID>', 'node', '-e', '<ALLOCATION_HANDSHAKE>', run.runId, 'observe|release'], deadlineMs: 5000 },
         { id: 'A1-leaf-observer', binary: engine, argv: [...core, 'node', '-e', '<LEAF_OBSERVATION>', '<VERIFIED_LEAF>'], deadlineMs: 5000 },
     );
-    if (profile.gpu) live.push(...gpuPlan(run).commands);
+    if (profile.llm) live.push(...llmPlan(run).commands);
+    else if (profile.gpu) live.push(...gpuPlan(run).commands);
     const cleanup = [
         ...(profile.gpu ? [{ id: 'gpu-stop-owned-helpers', action: 'Remove the control helpers by exact recorded identity (name and run label re-proved first). The probes and the holder end with their commands or with the Box; nothing foreign is ever signalled.' }] : []),
         { id: 'revalidate-identity', binary: engine, argv: [...ENGINE_INFO_ARGV], action: 'Recheck engine identity (with its default connection when remote), workspace receipt and marker, or the run-derived quarantine' },
@@ -264,6 +326,32 @@ export function plannedCommands(run) {
 }
 
 const list = values => values.map(value => `\`${value}\``).join(', ');
+
+// The idle-gate checks of every apparatus GPU block (plan section 15.5 with amendment A5), as
+// the approval summary states them.
+export function gpuGateChecks(profile) {
+    const gpu = profile.gpu;
+    const uuid = gpu.uuid;
+    return [
+        [`\`${gpu.smi.path} ${gpuQueryArgv(uuid).join(' ')}\` exits 0 within 30 s with at most 1 MiB of output`, 'a query error blocks'],
+        ['the XML parses strictly: one gpu element, no entity, CDATA or ampersand, exactly one uuid and compute_mode, one fb_memory_usage', 'malformed or unsupported output blocks'],
+        [`the UUID is \`${uuid}\` and the total memory is ${gpu.memoryMiB} MiB`, 'another device blocks'],
+        ['the compute mode is Default', 'any other mode blocks; the runner never changes it'],
+        ['the process list is supported (no N/A) and, for the initial gate, empty: no compute or MPS process and no unrecorded graphics process (but for the one display process of amendment A5)', 'an unsupported inventory or any such process blocks'],
+        [`amendment A5, one recorded display process: at the run's FIRST gate check (the provision action) ${GPU_TOLERATED_MAX === 1 ? 'one foreign process' : `up to ${GPU_TOLERATED_MAX} foreign processes`} may be recorded as tolerated, of type exactly \`G\` (graphics only, never C, C+G, M+C or any type with compute), using at most ${GPU_TOLERATED_MAX_MIB} MiB, not owned by the run, with a proven host identity (boot id and /proc start time). It is written to toleratedProcesses of the run manifest with its PID, start identity, name, type and memory; the recorded process is also in the gpu-initial-gate evidence and in every check's history`, 'a process that is not of type G, is over the memory limit, is a second foreign graphics process, or whose identity cannot be proved blocks the first check'],
+        ['at every later check the only foreign process allowed is the recorded one: same PID and start identity, type still exactly G and memory still within the limit (the subset of that record). The runner never touches, signals or reprioritises a tolerated process and never changes the compute mode', 'a process that was not recorded, one that gained compute, one over the limit, a reused PID (another start identity) or an unprovable identity blocks; the recorded process disappearing is logged, not a failure'],
+        ['before EVERY later GPU operation the query is repeated; a listed PID is excluded only if it is a registered owned MPS server (a child of the registered owned daemon in the Box\'s /ploinky/core) or client (inside a registered owned agent leaf) and its tuple is freshly verified: host boot ID, host PID, process start time, cgroup beneath the exact Box scope libpod-<BOX_ID>', 'a bare PID, UID or name never excludes; a changed tuple blocks'],
+        ...(profile.llm ? [
+            ['free GPU memory (the actual figure, with the tolerated process\'s MiB accounted for) covers the applied share plus 256 MiB before the model starts', 'less blocks'],
+            ['during the runner install, the calibration, the model load and every prompt the gate re-queries every 2 s', 'a foreign process aborts the running command, trips the gate (no later GPU operation starts) and the case is BLOCKED; owned clients are stopped only by cleanup'],
+            ['the runner never changes the compute mode and never signals a foreign process', 'this block signals no process at all: the model is stopped through the agent\'s own stop tool and everything else goes with the Box'],
+        ] : [
+            ['free GPU memory covers the probe bound plus 1 GiB before each CUDA probe', 'less blocks'],
+            ['during a probe the gate re-queries every 2 s', 'a foreign process aborts the probe command, trips the gate (no later GPU operation starts) and the case is BLOCKED; owned clients are stopped only by cleanup'],
+            ['the runner never changes the compute mode and never signals a foreign process', 'the only signal it can send is the owned-daemon kill of P3, after both layers prove the identity'],
+        ]),
+    ];
+}
 
 // The GPU block's idle-gate checks and every GPU operation, from the same
 // constants the executors use. Identities known only at run time are
@@ -337,20 +425,88 @@ export function gpuPlan(run) {
         { case: 'P4', id: 'P4-probe-after-reconcile', binary: engine, argv: [...nested, ...probe(probeBoundMiB(cap))], deadlineMs: 55000, gpu: true, note: 'One more probe shows the share is not widened' },
         { case: 'cleanup', id: 'gpu-final-observation', binary: gpu.smi.path, argv: gpuQueryArgv(uuid), deadlineMs: 30000, gpu: true, note: 'After the Box is destroyed: none of the runner\'s registered GPU processes may remain' },
     ];
-    const gateChecks = [
-        [`\`${gpu.smi.path} ${gpuQueryArgv(uuid).join(' ')}\` exits 0 within 30 s with at most 1 MiB of output`, 'a query error blocks'],
-        ['the XML parses strictly: one gpu element, no entity, CDATA or ampersand, exactly one uuid and compute_mode, one fb_memory_usage', 'malformed or unsupported output blocks'],
-        [`the UUID is \`${uuid}\` and the total memory is ${gpu.memoryMiB} MiB`, 'another device blocks'],
-        ['the compute mode is Default', 'any other mode blocks; the runner never changes it'],
-        ['the process list is supported (no N/A) and, for the initial gate, empty: no compute or MPS process and no unrecorded graphics process (but for the one display process of amendment A5)', 'an unsupported inventory or any such process blocks'],
-        [`amendment A5, one recorded display process: at the run's FIRST gate check (the provision action) ${GPU_TOLERATED_MAX === 1 ? 'one foreign process' : `up to ${GPU_TOLERATED_MAX} foreign processes`} may be recorded as tolerated, of type exactly \`G\` (graphics only, never C, C+G, M+C or any type with compute), using at most ${GPU_TOLERATED_MAX_MIB} MiB, not owned by the run, with a proven host identity (boot id and /proc start time). It is written to toleratedProcesses of the run manifest with its PID, start identity, name, type and memory; the recorded process is also in the gpu-initial-gate evidence and in every check's history`, 'a process that is not of type G, is over the memory limit, is a second foreign graphics process, or whose identity cannot be proved blocks the first check'],
-        ['at every later check the only foreign process allowed is the recorded one: same PID and start identity, type still exactly G and memory still within the limit (the subset of that record). The runner never touches, signals or reprioritises a tolerated process and never changes the compute mode', 'a process that was not recorded, one that gained compute, one over the limit, a reused PID (another start identity) or an unprovable identity blocks; the recorded process disappearing is logged, not a failure'],
-        ['before EVERY later GPU operation the query is repeated; a listed PID is excluded only if it is a registered owned MPS server (a child of the registered owned daemon in the Box\'s /ploinky/core) or client (inside a registered owned agent leaf) and its tuple is freshly verified: host boot ID, host PID, process start time, cgroup beneath the exact Box scope libpod-<BOX_ID>', 'a bare PID, UID or name never excludes; a changed tuple blocks'],
-        ['free GPU memory covers the probe bound plus 1 GiB before each CUDA probe', 'less blocks'],
-        ['during a probe the gate re-queries every 2 s', 'a foreign process aborts the probe command, trips the gate (no later GPU operation starts) and the case is BLOCKED; owned clients are stopped only by cleanup'],
-        ['the runner never changes the compute mode and never signals a foreign process', 'the only signal it can send is the owned-daemon kill of P3, after both layers prove the identity'],
-    ];
+    const gateChecks = gpuGateChecks(profile);
     return { operations, gateChecks, commands: operations.filter(entry => entry.argv && entry.case !== 'provision' && entry.case !== 'cleanup').map(({ case: caseId, gpu: isGpu, ...entry }) => ({ ...entry, note: `${caseId}${isGpu ? ' (GPU operation)' : ''}${entry.note ? `: ${entry.note}` : ''}` })) };
+}
+
+// Every operation of an apparatus-local-llm or apparatus-vllm run, from the same constants the
+// executors use. Identities and values known only at run time are placeholders.
+export function llmPlan(run) {
+    const profile = run.target.execution;
+    const gpu = profile.gpu; const llm = profile.llm; const uuid = gpu.uuid;
+    const core = ['container', 'exec', '--user', 'podman', '<BOX_ID>'];
+    const nested = [...core, 'podman', '--cgroup-manager=cgroupfs'];
+    const engine = profile.engine.path; const node = profile.node.path;
+    const ports = ['--port', String(run.ports.tcp), '--udp-port', String(run.ports.udp)];
+    void ports; void node;
+    const gate = (id, note = 'The per-operation GPU idle gate: query again, exclude only owned PIDs with a freshly verified tuple, tolerate only the recorded display process (A5).') => ({ id, binary: gpu.smi.path, argv: gpuQueryArgv(uuid), deadlineMs: 30000, gpu: true, note });
+    const admin = (id, method, body, extra = {}) => ({ id, binary: engine, argv: [...core, 'node', '-e', '<ADMIN_REQUEST>', method, body], deadlineMs: run.deadlines.coreMs, ...extra });
+    const apply = (id) => admin(id, 'POST', `{"action":"apply","expectedToken":<TOKEN>,"containers":[<${LLM_REF} registry key>]}`, { deadlineMs: 600000, gpu: true });
+    const save = (id, limits) => admin(id, 'POST', `{"action":"set_agent_limits","expectedToken":<TOKEN>,"agentRef":"${LLM_REF}","limits":${limits}}`);
+    const tool = (id, name, args, view, extra = {}) => ({ id, binary: engine, argv: [...core, 'node', '-e', '<LLM_TOOL_CALL>', ...llmToolWords(name, args, view)], deadlineMs: 90000, ...extra });
+    const agentExec = (id, words, extra = {}) => ({ id, binary: engine, argv: [...nested, 'container', 'exec', '<AGENT_ID>', ...words], deadlineMs: 30000, ...extra });
+    const small = LLM_MODELS.small; const awq = LLM_MODELS.awq;
+    const budget = JSON.stringify(llm.budget);
+    const view = id => ({ model: id });
+    const common = [
+        { case: 'provision', ...gate('gpu-initial-gate'), note: 'The initial gate, before anything is created (amendment A5 applies: at most one recorded graphics-only display process)' },
+        { case: 'provision', id: 'gpu-grant', action: `${profile.candidate.path} gpu grant --agent ${LLM_REF} (host driver discovery; records the grant)`, gpu: true },
+    ];
+    const l1 = [
+        { case: 'L1', ...gate('L1-gate') },
+        { case: 'L1', ...admin('L1-admin-state', 'GET', ''), action: 'Read the Box state, the policy store token and the CPU and RAM envelope through the Router route (the local operator session)' },
+        { case: 'L1', ...tool('L1-overview-fresh', 'local_llm_overview', { preview: { modelId: small, runnerId: 'llama.cpp', params: {} } }, view(small)), action: 'The agent\'s catalog, pins and download state: the model data must be fresh' },
+        { case: 'L1', ...save('L1-save-budget', budget), action: `Save ${llm.budget.cpus} CPUs, ${llm.budget.memoryPercent}% of the Box RAM and the ${llm.budget.gpu.smPercent}% SM / ${llm.budget.gpu.vramPercent}% VRAM share` },
+        { case: 'L1', ...apply('L1-apply'), action: 'Apply replaces the agent: the MPS daemon (uid 1000, /ploinky/core) starts and the agent becomes a share client with the saved CPU and RAM limits' },
+        { case: 'L1', id: 'L1-observe-mps', binary: engine, argv: [...core, 'node', '-e', '<MPS_OBSERVE>'], deadlineMs: 30000, note: 'Read-only: the daemon, its generation and its pipe' },
+        { case: 'L1', id: 'L1-leaf', binary: engine, argv: [...core, 'node', '-e', '<LEAF_OBSERVATION>', '<LEAF>'], deadlineMs: 20000, note: 'Read-only: memory.max and cpu.max of the agent\'s cgroup leaf' },
+        { case: 'L1', ...tool('L1-overview-budget', 'local_llm_overview', { preview: { modelId: small, runnerId: 'llama.cpp', params: {} } }, view(small)), action: 'The agent\'s own view of the budget, and public admission of the model under it' },
+        { case: 'L1', ...tool('L1-run', 'local_llm_run', { requestId: '<REQUEST_ID>', modelId: small, runnerId: 'llama.cpp', params: {}, replace: false }, {}, { gpu: true }), action: `Run ${small} with llama.cpp (downloads ${llm.models.small.size} bytes into the fresh /data)` },
+        { case: 'L1', ...tool('L1-status', 'local_llm_status', {}, {}), action: 'Polled until the model is ready or fails; the gate re-queries every 2 s meanwhile' },
+        { case: 'L1', ...agentExec('L1-runner-env', ['node', '-e', '<LLM_RUNNER_PROCESSES>', 'llama-server']), note: 'Read-only: the runner\'s user, the names of its environment and its CUDA variables' },
+        { case: 'L1', id: 'L1-leaf-sample', binary: engine, argv: [...core, 'node', '-e', '<LLM_LEAF_SAMPLE>', '<LEAF>'], deadlineMs: 20000, note: `Read-only, repeated while the text request generates: one sample of the agent leaf's cpu.stat (usage_usec, nr_throttled, throttled_usec), cpu.max, memory.current, memory.peak (when the kernel has it), memory.max, memory.swap.current and memory.events, with the Box's monotonic clock; once before the request is sent, every ${INFERENCE_CADENCE.sampleMs} ms (plus the read) until the response completes, and once after` },
+        { case: 'L1', ...tool('L1-prompt', 'local_llm_test_prompt', { ...L1_PROMPT }, {}, { deadlineMs: 290000, gpu: true }), action: `The Playground's own tool (see the Playground deviation), sampled as above; the GPU idle gate re-queries nvidia-smi every ${INFERENCE_CADENCE.gpuMs} ms meanwhile (the runner's device memory by its verified host PID, or the owned MPS server's, and the GPU utilisation), and a foreign GPU process appearing aborts the request` },
+        { case: 'L1', ...agentExec('L1-image-digests', ['node', '-e', '<LLM_IMAGE_DIGESTS>'], { deadlineMs: 120000 }), note: 'Read-only: sha256 of llama-server, the source contract and the runner lock in the image' },
+    ];
+    const l2 = [
+        { case: 'L2', ...gate('L2-gate') },
+        { case: 'L2', ...tool('L2-status', 'local_llm_status', {}, {}), action: 'Is a model running?' },
+        { case: 'L2', ...tool('L2-stop', 'local_llm_stop', {}, {}), action: 'Stop the model; the old running model is never what is tested' },
+        { case: 'L2', ...save('L2-save-insufficient', '{"cpus":4,"memoryPercent":<PERCENT>,"gpu":{"smPercent":50,"vramPercent":50}}'), action: `Save a known-insufficient RAM budget: the whole percentage of the Box RAM whose cap is the largest at or below ${INSUFFICIENT_RAM.maxCapBytes} bytes (at least ${INSUFFICIENT_RAM.minCapBytes}), under admission's 768 MiB need plus 1 GiB margin` },
+        { case: 'L2', ...apply('L2-apply'), action: 'Apply it; the replacement agent has the new cap' },
+        { case: 'L2', id: 'L2-leaf', binary: engine, argv: [...core, 'node', '-e', '<LEAF_OBSERVATION>', '<LEAF>'], deadlineMs: 20000, note: 'Read-only: the new memory.max' },
+        { case: 'L2', ...tool('L2-overview', 'local_llm_overview', { preview: { modelId: small, runnerId: 'llama.cpp', params: {} } }, view(small)), action: 'The agent\'s own view of the new cap' },
+        { case: 'L2', ...tool('L2-run', 'local_llm_run', { requestId: '<REQUEST_ID>', modelId: small, runnerId: 'llama.cpp', params: {}, replace: false }, {}), action: 'A new Run: it must be refused with the RAM budget as its reason before anything launches' },
+        { case: 'L2', ...agentExec('L2-runner-processes', ['node', '-e', '<LLM_RUNNER_PROCESSES>', 'llama-server']), note: 'Read-only: no runner process exists after the refusal' },
+    ];
+    const l3 = [
+        { case: 'L3', ...gate('L3-gate') },
+        { case: 'L3', ...tool('L3-status', 'local_llm_status', {}, {}), action: 'The agent answers its status tool (after Apply replaces it, and while a model is polled)' },
+        { case: 'L3', ...agentExec('L3-step0-prerequisites', ['node', ...vllmToolWords('prerequisites', { pins: llm.vllm?.pins ?? { version: '0.0.0', runnerLockDigest: '0'.repeat(64), files: 1, downloadBytes: 1 } })], { deadlineMs: 120000 }), note: 'Step 0, read-only: the image\'s runner lock has a vLLM entry for linux/amd64 with CUDA wheels, the interpreter, driver, toolchain and disk can take it, and it equals the pins; anything missing is BLOCKED with that exact prerequisite' },
+        { case: 'L3', ...admin('L3-admin-state', 'GET', '') },
+        { case: 'L3', ...save('L3-save-share', JSON.stringify({ gpu: VLLM_SHARE })), action: `Save the ${VLLM_SHARE.smPercent}% SM / ${VLLM_SHARE.vramPercent}% VRAM share (${Math.floor(VLLM_SHARE.vramPercent * gpu.memoryMiB / 100)} MiB of ${gpu.memoryMiB}): the smallest share admission fits Qwen3-4B-AWQ in is 87%` },
+        { case: 'L3', ...apply('L3-apply'), action: 'Apply replaces the agent before the install, because the runnable copy lives in the container' },
+        { case: 'L3', ...tool('L3-install', 'local_llm_runner_install', { runnerId: 'vllm', acceptLicence: false }, {}, { gpu: true }), action: `The product's install of vLLM ${llm.vllm?.pins.version ?? ''} from the pinned lock (${llm.vllm?.pins.downloadBytes ?? 0} bytes, ${llm.vllm?.pins.files ?? 0} files)` },
+        { case: 'L3', ...tool('L3-install-poll', 'local_llm_overview', {}, {}), action: 'Polled until the install finishes; the gate re-queries every 2 s meanwhile' },
+        ...(llm.vllm?.stage === 'calibration' ? [
+            { case: 'L3', ...agentExec('L3-stage1-calibrate', ['node', ...vllmToolWords('calibrate', { hostNvmlBytes: gpu.memoryMiB * 1048576 })], { deadlineMs: 600000, gpu: true }), note: 'Stage 1, no model launch: bounded owned queries in the client (torch.cuda.mem_get_info, get_device_properties(0).total_memory, the ctypes cuMemGetInfo) under the saved and a tighter limit, the installed version\'s sizing source, the final argv, and the proposed tuple with its evidence digest' },
+        ] : [
+            { case: 'L3', ...tool('L3-preview', 'local_llm_overview', { preview: { modelId: awq, runnerId: 'vllm', params: {} } }, view(awq)), action: 'Public admission of the model at the share' },
+            { case: 'L3', ...tool('L3-run', 'local_llm_run', { requestId: '<REQUEST_ID>', modelId: awq, runnerId: 'vllm', params: {}, replace: false }, {}, { gpu: true }), action: `Stage 2: Run ${awq} (downloads ${llm.models.awq.size} bytes); before the reviewed entry exists it is refused as vllm_mps_unqualified and nothing launches` },
+            { case: 'L3', ...tool('L3-status-ready', 'local_llm_status', {}, {}), action: 'Polled until the model is ready' },
+            { case: 'L3', ...agentExec('L3-runner-env', ['node', '-e', '<LLM_RUNNER_PROCESSES>', 'vllm']), note: 'Read-only' },
+            { case: 'L3', ...tool('L3-prompt', 'local_llm_test_prompt', { prompt: '<PROMPT>', maxTokens: 256 }, {}, { deadlineMs: 290000, gpu: true }) },
+        ]),
+    ];
+    const operations = [
+        ...common,
+        ...(profile.cases.includes('LIVE-L1') ? l1 : []),
+        ...(profile.cases.includes('LIVE-L2') ? l2 : []),
+        ...(profile.cases.includes('LIVE-L3') ? [...l3,
+            { case: 'L3', id: 'L3-leaf-and-daemon', binary: engine, argv: [...core, 'node', '-e', '<MPS_OBSERVE>'], deadlineMs: 30000, note: 'Read-only' }] : []),
+        { case: 'cleanup', id: 'gpu-final-observation', binary: gpu.smi.path, argv: gpuQueryArgv(uuid), deadlineMs: 30000, gpu: true, note: 'After the Box is destroyed: none of the runner\'s registered GPU processes may remain' },
+    ];
+    return { operations, gateChecks: gpuGateChecks(profile), commands: operations.filter(entry => entry.argv && entry.case !== 'provision' && entry.case !== 'cleanup').map(({ case: caseId, gpu: isGpu, ...entry }) => ({ ...entry, note: `${caseId}${isGpu ? ' (GPU operation)' : ''}${entry.note ? `: ${entry.note}` : ''}` })) };
 }
 const plan = run => run.target.execution.provision;
 
@@ -404,7 +560,7 @@ export function renderSummary(run, manifestPath) {
         `| Host ports | TCP ${run.ports.tcp} (Router, loopback), UDP ${run.ports.udp} (media); a collision aborts |`,
         `| Box image | \`${plan.boxImage}\` |`,
         `| Fixture image | \`${plan.image}\` |`,
-        ...plan.agents.map(agent => `| Fixture agent ${FIXTURE_REPOSITORY}/${agent.name} | hardwareLimits memory ${agent.hardwareLimits.memory}, cpus ${agent.hardwareLimits.cpus}, pids ${agent.hardwareLimits.pidsLimit}, readiness none |`),
+        ...plan.agents.map(agent => (agent.hardwareLimits ? `| Fixture agent ${FIXTURE_REPOSITORY}/${agent.name} | hardwareLimits memory ${agent.hardwareLimits.memory}, cpus ${agent.hardwareLimits.cpus}, pids ${agent.hardwareLimits.pidsLimit}, readiness none |` : `| Agent ${LLM_REF} | the local-llm candidate's own manifest, which declares no limits; the administrator's Apply sets them |`)),
         `| Deadlines | core ${run.deadlines.coreMs} ms, start ${run.deadlines.startMs} ms, destroy ${run.deadlines.destroyMs} ms, cleanup ${run.deadlines.cleanupMs} ms${remote ? `, staging ${run.deadlines.stagingMs} ms` : ''} |`,
         '',
         '## Commands',
@@ -438,7 +594,7 @@ export function renderSummary(run, manifestPath) {
 function gpuSummary(run) {
     const profile = run.target.execution;
     const gpu = profile.gpu;
-    const { operations, gateChecks } = gpuPlan(run);
+    const { operations, gateChecks } = profile.llm ? llmPlan(run) : gpuPlan(run);
     const instance = run.workspace.instance;
     const cell = value => String(value).replaceAll('|', '\\|');
     const text = entry => (entry.argv ? `\`${[entry.binary, ...entry.argv].map(word => (word === profile.engine.path ? '$ENGINE' : word)).join(' ').replaceAll('|', '\\|')}\`` : cell(entry.action || ''));
@@ -459,17 +615,19 @@ function gpuSummary(run) {
         '| --- | --- | --- |',
         ...operations.map(entry => `| ${entry.case} | ${cell(entry.id)} | ${text(entry)}${entry.note ? ` (${cell(entry.note)})` : ''} |`),
         '',
-        '## Images, tools and digests',
-        '',
-        '| Item | Identity |',
-        '| --- | --- |',
-        `| Fixture image (probe, peer, cpu and the control helper) | \`${profile.provision.image}\` (non-root image user 1000:1000; python3 and ctypes) |`,
-        `| Box image | \`${profile.provision.boxImage}\` |`,
-        `| nvidia-smi | \`${gpu.smi.path}\` ${gpu.smi.digest} |`,
-        `| nvidia-cuda-mps-control | \`${gpu.mpsControl.path}\` ${gpu.mpsControl.digest} |`,
-        `| nvidia-cuda-mps-server | \`${gpu.mpsServer.path}\` ${gpu.mpsServer.digest} |`,
-        `| CUDA probe (mpsprobe.py) | \`${gpu.probe.sourcePath}\` ${gpu.probe.digest}, staged at /code/mpsprobe.py in the probe agent |`,
-        '',
+        ...(profile.llm ? llmImagesSection(run) : [
+            '## Images, tools and digests',
+            '',
+            '| Item | Identity |',
+            '| --- | --- |',
+            `| Fixture image (probe, peer, cpu and the control helper) | \`${profile.provision.image}\` (non-root image user 1000:1000; python3 and ctypes) |`,
+            `| Box image | \`${profile.provision.boxImage}\` |`,
+            `| nvidia-smi | \`${gpu.smi.path}\` ${gpu.smi.digest} |`,
+            `| nvidia-cuda-mps-control | \`${gpu.mpsControl.path}\` ${gpu.mpsControl.digest} |`,
+            `| nvidia-cuda-mps-server | \`${gpu.mpsServer.path}\` ${gpu.mpsServer.digest} |`,
+            `| CUDA probe (mpsprobe.py) | \`${gpu.probe.sourcePath}\` ${gpu.probe.digest}, staged at /code/mpsprobe.py in the probe agent |`,
+            '',
+        ]),
         '## Grant and policy records',
         '',
         '| Record | Created by | Removed by cleanup |',
@@ -478,6 +636,101 @@ function gpuSummary(run) {
         `| \`~/.ploinky-box/hardware-limits/${instance}.json\` and \`~/.ploinky-box/hardware-limits/${instance}/\` (the gate record and the policy store holding the saved shares) | the start and the Apply path | yes, only when recorded |`,
         `| \`~/.ploinky-box/router-bindings/${instance}[.json]\` | the start | yes, only when recorded |`,
         '| the parent directories of the three | pre-existing on the host (\`gpu-grants\` already exists and stays) | only a parent this run created, and only while empty |',
+        '',
+        ...(profile.llm ? llmDataSection(run) : []),
+    ];
+}
+
+// The images, models, runner-lock pins and expected downloads of a local-llm or vLLM run.
+function llmImagesSection(run) {
+    const profile = run.target.execution; const gpu = profile.gpu; const llm = profile.llm; const plan = profile.provision;
+    const cell = value => String(value).replaceAll('|', '\\|');
+    const small = llm.models.small; const awq = llm.models.awq;
+    const rows = [
+        ['Local-llm image (immutable)', `\`${plan.image}\` (the candidate's manifest names \`${plan.llm.manifest.originalContainer}\`; it is rewritten to this digest, manifest ${plan.llm.manifest.originalDigest} to ${plan.llm.manifest.rewrittenDigest}); pulled by the Box start, size not known before it`],
+        ['Local-llm candidate', `revision \`${plan.llm.revision}\`, tree \`${plan.llm.sourcePath}\` ${plan.llm.treeDigest}, copied into the new workspace only`],
+        ['Box image', `\`${plan.boxImage}\``],
+        ['nvidia-smi', `\`${gpu.smi.path}\` ${gpu.smi.digest}`],
+        ['nvidia-cuda-mps-control', `\`${gpu.mpsControl.path}\` ${gpu.mpsControl.digest}`],
+        ['nvidia-cuda-mps-server', `\`${gpu.mpsServer.path}\` ${gpu.mpsServer.digest}`],
+        ['Runner (llama.cpp)', 'the image\'s /opt/llama.cpp/llama-server (CUDA 12.8 build b11159); its sha256 and the image\'s source contract and runner lock are read in the container and recorded'],
+        [`Model ${small.id}`, `${small.repo} ${small.file} at commit \`${small.commit}\`, ${small.size} bytes, sha256 \`${small.sha256}\``],
+    ];
+    if (profile.cases.includes('LIVE-L3')) {
+        const pins = llm.vllm.pins;
+        rows.push(
+            ['Runner lock entry (vLLM)', `version ${pins.version}, ${pins.files} files, ${pins.downloadBytes} bytes, production lock digest \`${pins.runnerLockDigest}\`; read from the image's /opt/local-llm/runners.lock.json and compared with these pins in step 0`],
+            [`Model ${awq.id}`, `${awq.repo} at commit \`${awq.commit}\`, ${awq.files.length} files, ${awq.size} bytes (${awq.files.map(file => `${file.path} ${file.sha256.slice(0, 12)}`).join(', ')})`],
+            ['vLLM share', `${llm.vllm.share.smPercent}% SM / ${llm.vllm.share.vramPercent}% VRAM (${Math.floor(llm.vllm.share.vramPercent * gpu.memoryMiB / 100)} MiB): admission fits Qwen3-4B-AWQ at 8192 tokens only from 87%; 50% does not fit`],
+            ['Stage', llm.vllm.stage === 'calibration' ? 'stage 1, calibration: no model launch' : `stage 2: ${llm.vllm.calibration.expectQualified ? 'the candidate holds the reviewed entry for evidence ' + llm.vllm.calibration.evidenceDigest : 'the candidate holds NO matching reviewed entry: the correct outcome is a vllm_mps_unqualified refusal (BLOCKED, model not run)'}`],
+        );
+    }
+    const downloads = [
+        ['Model data (small GGUF)', `${small.size} bytes into the fresh /data (L1)`],
+        ...(profile.cases.includes('LIVE-L3') ? [
+            ['vLLM wheels', `${llm.vllm.pins.downloadBytes} bytes into /data/runners (verified cache), then a runnable copy rebuilt in the container (estimated at 3.5 times that)`],
+            ['Model data (Qwen3-4B-AWQ snapshot)', `${awq.size} bytes into /data (stage 2 only)`],
+        ] : []),
+    ];
+    return [
+        '## Images, models, runner-lock pins and downloads',
+        '',
+        '| Item | Identity |',
+        '| --- | --- |',
+        ...rows.map(([item, identity]) => `| ${cell(item)} | ${cell(identity)} |`),
+        '',
+        '| Expected download | Size |',
+        '| --- | --- |',
+        ...downloads.map(([item, size]) => `| ${cell(item)} | ${cell(size)} |`),
+        '',
+    ];
+}
+
+// The model data, the Playground deviation, the prerequisites that may block real execution, and the cleanup of model data.
+function llmDataSection(run) {
+    const profile = run.target.execution; const workspace = profile.provision.workspace.path;
+    const cell = value => String(value).replaceAll('|', '\\|');
+    const l3 = profile.cases.includes('LIVE-L3');
+    return [
+        '## Model data, caches and cleanup',
+        '',
+        '| Data | Where | Removed by cleanup |',
+        '| --- | --- | --- |',
+        `| Model weights and agent state | \`${workspace}/.data/local-llm\` (the agent's /data) and \`${workspace}/.data/shared\` | yes: with the new workspace, after the Box is destroyed with \`--delete-cache\`; subordinate-owned files go through the bounded \`podman unshare\` removal. The cleanup inventories them before and proves them gone after |`,
+        ...(l3 ? [`| vLLM wheel cache | \`${workspace}/.data/local-llm/runners\` | yes: the same |`, '| vLLM runnable copy and caches | the agent container\'s own filesystem (/opt/runners) | yes: with the Box |'] : []),
+        '| Unrelated model data | none is reused: the workspace and its /data are new, and the case fails when the model\'s weights are not absent at the start | n/a |',
+        '',
+        ...(profile.cases.includes('LIVE-L1') ? [
+            '## Measurements while the model generates (LIVE-L1)',
+            '',
+            `The text request is sampled while it generates, and the evidence is written before anything is asserted. The agent leaf's cgroup (resolved by its exact identity) is sampled before the request is sent, every ${INFERENCE_CADENCE.sampleMs} ms (plus the read) until the response completes, and once after. The GPU is re-queried at the idle gate's own cadence of ${INFERENCE_CADENCE.gpuMs} ms.`,
+            '',
+            '| Resource | Recorded as samples | Asserted |',
+            '| --- | --- | --- |',
+            `| CPU | cpu.stat usage_usec, nr_throttled, throttled_usec; cpu.max | cpu.max is the applied ${LLM_BUDGET.cpus}-CPU quota in every sample; the use over the inference window, and between neighbouring samples, does not exceed the quota by more than ${INFERENCE_TOLERANCE.cpuRatio * 100}% plus ${INFERENCE_TOLERANCE.cpuPeriodsOfSlack} period of quota (the kernel charges per 100 ms period) |`,
+            '| Memory | memory.current, memory.peak when present, memory.max, memory.swap.current, memory.events | the peak (the largest of memory.peak and every memory.current) is at or below memory.max (' + LLM_BUDGET.memoryPercent + '% of the Box RAM); swap is 0; oom_kill neither rises during the window nor is non-zero at its end |',
+            `| GPU | the device's process rows (nvidia-smi -q -x): the runner's own rows by its verified host PID, else the owned MPS server's; the GPU utilisation; the runner's MPS environment (exactly the three CUDA_MPS_* variables) | the runner's device memory is at or below the share's pinned limit plus a ${INFERENCE_TOLERANCE.gpuContextMiB} MiB allowance for the CUDA context; every GPU process is ours or the one tolerated display process (A5). A row of neither the runner nor the owned server leaves the run BLOCKED, never PASS |`,
+            '',
+            'A foreign GPU process appearing while the model generates aborts the request, cleans up and leaves the case BLOCKED.',
+            '',
+        ] : []),
+        '## Playground',
+        '',
+        cell(profile.llm.playground.reason),
+        '',
+        '## Prerequisites that may block real execution',
+        '',
+        '| Prerequisite | Evidence required | If it is missing |',
+        '| --- | --- | --- |',
+        '| The immutable local-llm image is present or pullable by the nested engine | the Box start pulls `' + cell(profile.provision.image) + '`; its size is not known before | the start fails and the run is cleaned up (BLOCKED when the failure is a missing prerequisite) |',
+        `| The Box memory envelope covers the budget | 25% of it must be at least 3 GiB, and a whole percentage must give a cap between ${INSUFFICIENT_RAM.minCapBytes / 1048576} and ${INSUFFICIENT_RAM.maxCapBytes / 1048576} MiB for L2; at least ${LLM_BUDGET.cpus} CPUs | BLOCKED with the envelope |`,
+        '| The host can reach Hugging Face | the model download | the Run fails or pauses (paused is BLOCKED) |',
+        ...(l3 ? [
+            '| The image lock has a vLLM entry for linux/amd64 with CUDA wheels, equal to the pins | step 0 reads and compares it | BLOCKED with the exact missing prerequisite; nothing unpinned is ever installed |',
+            '| Free disk for the wheels, their runnable copy and the model | step 0 states free and needed bytes per filesystem | BLOCKED |',
+            `| The install and the model load fit the block deadline | install within ${run.deadlines.installMs} ms, model load within ${run.deadlines.modelLoadMs} ms of a ${run.deadlines.blockMs} ms block | BLOCKED with the progress made |`,
+            '| The wheels support the device and the denominator is physical | stage 1 reads torch\'s total under two limits | BLOCKED: vLLM under MPS stays unavailable |',
+        ] : []),
         '',
     ];
 }

@@ -940,8 +940,9 @@ test('G1.prepare-live-apparatus-mps-concrete-manifest-and-summary', async t => {
 test('L1.prepare-live-other-blocks-stay-unsupported', async t => {
     const f = prepareFixture(t);
     const main = await verifyMain();
-    // apparatus-mps has concrete executors since round G1; the rest stay unsupported.
-    for (const block of ['mac-adversarial', 'mac-explorer', 'apparatus-local-llm', 'apparatus-vllm']) {
+    // apparatus-mps has concrete executors since round G1, apparatus-local-llm and apparatus-vllm since round G2;
+    // the rest stay unsupported.
+    for (const block of ['mac-adversarial', 'mac-explorer']) {
         const runPath = path.join(f.evidence, `${block}-run_claude.json`);
         assert.equal(await main(['prepare-live', '--config', f.configPath, '--block', block, '--run', runPath]), 0);
         const run = JSON.parse(fs.readFileSync(runPath, 'utf8'));

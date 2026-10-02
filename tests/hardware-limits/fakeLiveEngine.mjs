@@ -8,7 +8,7 @@ import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
-import { fixtureContainerName, FIXTURE_REPOSITORY } from './liveFixture.mjs';
+import { fixtureContainerName } from './liveFixture.mjs';
 
 // Exit status of a child runner that died at its named crash point.
 export const CRASH_EXIT = 99;
@@ -196,11 +196,17 @@ export function createFakeWorld({ statePath, node, engine, host, unrelated = [],
                         labels: { [BOX_LABELS.pathHash]: identity.pathHash, [BOX_LABELS.role]: 'box', [BOX_LABELS.hardwareLimits]: hex('gate'), [BOX_LABELS.imageRef]: options.env?.PLOINKY_BOX_IMAGE },
                         mounts: [{ Source: workspace, Destination: workspace }],
                     };
-                    const repository = path.join(workspace, '.ploinky', 'repos', FIXTURE_REPOSITORY);
-                    for (const name of fs.existsSync(repository) ? fs.readdirSync(repository).sort() : []) {
-                        const manifest = JSON.parse(fs.readFileSync(path.join(repository, name, 'manifest.json'), 'utf8'));
-                        const container = fixtureContainerName(workspace, name);
-                        state.agents[container] = { id: hex(`agent-${container}-${state.counter}`), created: '2026-10-02T00:01:00Z', image: hex(manifest.container), name: `/${container}`, imageName: manifest.container, running: true, labels: {}, mounts: [] };
+                    // Every repository the fixture wrote into the workspace: the generated fixture
+                    // repository, or the local-llm candidate's (local-llms).
+                    const repositories = path.join(workspace, '.ploinky', 'repos');
+                    for (const repositoryName of fs.existsSync(repositories) ? fs.readdirSync(repositories).sort() : []) {
+                        const repository = path.join(repositories, repositoryName);
+                        for (const name of fs.readdirSync(repository).sort()) {
+                            if (!fs.existsSync(path.join(repository, name, 'manifest.json'))) continue;
+                            const manifest = JSON.parse(fs.readFileSync(path.join(repository, name, 'manifest.json'), 'utf8'));
+                            const container = fixtureContainerName(workspace, name, repositoryName);
+                            state.agents[container] = { id: hex(`agent-${container}-${state.counter}`), created: '2026-10-02T00:01:00Z', image: hex(manifest.container), name: `/${container}`, imageName: manifest.container, running: true, labels: {}, mounts: [] };
+                        }
                     }
                 }
                 // Production saves the gate and initializes the hardware store

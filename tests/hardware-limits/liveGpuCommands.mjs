@@ -240,13 +240,20 @@ process.kill(pid,'SIGKILL');process.stdout.write(JSON.stringify({killed:true,pid
 // the host before it acts.
 export function validateGpuProfile(profile) {
     const gpu = profile.gpu;
-    keys(gpu, ['uuid', 'name', 'driverVersion', 'memoryMiB', 'expectedSmCount', 'smi', 'mpsControl', 'mpsServer', 'probe'], 'GPU pins');
+    // The local-llm blocks bring no CUDA probe of their own: their cases ask the product.
+    const llm = profile.llm !== undefined;
+    keys(gpu, ['uuid', 'name', 'driverVersion', 'memoryMiB', 'expectedSmCount', 'smi', 'mpsControl', 'mpsServer', ...(llm ? [] : ['probe'])], 'GPU pins');
     if (!/^GPU-[a-fA-F0-9-]{8,64}$/.test(gpu.uuid) || !bounded(gpu.name, 256) || !/^[0-9]+(?:\.[0-9]+)+$/.test(gpu.driverVersion)
         || !Number.isInteger(gpu.memoryMiB) || gpu.memoryMiB < 1024 || gpu.memoryMiB > 1048576
         || !Number.isInteger(gpu.expectedSmCount) || gpu.expectedSmCount < 1 || gpu.expectedSmCount > 1024) throw new Error('Invalid GPU device pins');
     for (const name of ['smi', 'mpsControl', 'mpsServer']) {
         keys(gpu[name], ['path', 'digest'], `GPU tool ${name}`);
         if (!absolute(gpu[name].path) || !HASH.test(gpu[name].digest)) throw new Error(`Invalid GPU tool pin ${name}`);
+    }
+    if (llm) {
+        if (!profile.provision?.gpu || profile.provision.gpu.uuid !== gpu.uuid) throw new Error('The GPU pins and the GPU provision plan disagree');
+        if (!(profile.fixtures?.llm?.ref === 'local-llms/local-llm')) throw new Error('The local-llm cases need the local-llm fixture reference');
+        return gpu;
     }
     keys(gpu.probe, ['sourcePath', 'digest'], 'GPU probe pin');
     if (!absolute(gpu.probe.sourcePath) || !HASH.test(gpu.probe.digest) || !gpu.probe.sourcePath.startsWith(`${profile.source.root}/`)) throw new Error('Invalid GPU probe pin');

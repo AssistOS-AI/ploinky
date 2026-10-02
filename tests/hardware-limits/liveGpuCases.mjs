@@ -26,6 +26,11 @@ import {
 
 const REPOSITORY = 'hwlfixture';
 export const GPU_AGENT_REFS = Object.freeze({ probe: `${REPOSITORY}/probe`, peer: `${REPOSITORY}/peer`, cpu: `${REPOSITORY}/cpu` });
+// The owned agents a GPU case set works on: the apparatus-mps fixture (two share clients and an
+// unrelated CPU agent), or the apparatus-local-llm and apparatus-vllm fixture (liveLlmCases.mjs
+// passes its own): the repository, the reference of each role, the agent name where it differs
+// from the role, the roles that take a share and the role that must stay untouched.
+export const P_FIXTURE = Object.freeze({ repository: REPOSITORY, refs: GPU_AGENT_REFS, names: Object.freeze({}), roles: Object.freeze(['probe', 'peer', 'cpu']), clients: Object.freeze(['probe', 'peer']), unrelated: 'cpu' });
 const MPS_ENV_NAMES = Object.freeze(['CUDA_MPS_PIPE_DIRECTORY', 'CUDA_MPS_ACTIVE_THREAD_PERCENTAGE', 'CUDA_MPS_PINNED_DEVICE_MEM_LIMIT']);
 const MPS_GENERATION_LABEL = 'ploinky.mpsgeneration';
 // A holder keeps one CUDA context (one MPS client connection) alive, so the
@@ -71,6 +76,8 @@ export const DEFAULT_TIMINGS = Object.freeze({
 
 export function createGpuCases(ctx) {
     const { profile, run, command, engine, core, nested, inspectBox, safeArtifact, persist, processProvider, env, signal } = ctx;
+    const fixture = ctx.fixture || P_FIXTURE;
+    const nameOf = role => fixture.names?.[role] ?? role;
     const host = ctx.host || createHostProc();
     const timings = { ...DEFAULT_TIMINGS, ...(ctx.timings || {}) };
     const sleep = ctx.sleep || (ms => new Promise(resolve => setTimeout(resolve, ms)));
@@ -139,12 +146,12 @@ export function createGpuCases(ctx) {
     // The one container that currently carries an owned agent's name. A
     // replacement keeps the name and has a new immutable ID.
     async function agentNow(role) {
-        const name = fixtureContainerName(workspace, role);
+        const name = fixtureContainerName(workspace, nameOf(role), fixture.repository);
         const rows = (await nestedRows()).filter(row => row.name === name);
         expects(rows.length === 1, `Expected exactly one nested container named ${name}, found ${rows.length}`);
         const inspected = await inspectNested(rows[0].id);
         expects(inspected.running === true && (!image || inspected.imageName === image), `Agent ${role} is not the pinned running instance`);
-        return { role, ref: GPU_AGENT_REFS[role], name, ...inspected };
+        return { role, ref: fixture.refs[role], name, ...inspected };
     }
 
     // ---------------------------------------------------------------------
@@ -186,13 +193,16 @@ export function createGpuCases(ctx) {
         needs(containers.length === 1 && typeof containers[0].key === 'string', `${ref} must have exactly one running instance to take a GPU share (found ${containers.length})`);
         return containers[0].key;
     }
-    // Save (or clear) shares, then Apply the named agents' exact instances.
+    // A policy is a GPU share ({smPercent, vramPercent}), as the MPS cases save, or a whole
+    // limits object ({cpus, memoryPercent, gpu}), as the local-llm cases do; null clears it.
+    const limitsOf = value => (value && (value.gpu !== undefined || value.cpus !== undefined || value.memoryPercent !== undefined) ? value : { gpu: value });
+    // Save (or clear) the limits, then Apply the named agents' exact instances.
     async function applyShares(label, policies, applyRefs, evidence) {
         const gate = prepared.gate;
         await gate.check(`before-apply:${label}`);
         for (const [ref, share] of Object.entries(policies)) {
             const reply = share
-                ? await admin.post(`gpu-set-${label}`, { action: 'set_agent_limits', agentRef: ref, limits: { gpu: share } })
+                ? await admin.post(`gpu-set-${label}`, { action: 'set_agent_limits', agentRef: ref, limits: limitsOf(share) })
                 : await admin.post(`gpu-clear-${label}`, { action: 'clear_agent_limits', agentRef: ref });
             evidence.step(`${share ? 'saved' : 'cleared'}:${ref}`, { status: reply.status });
             expects(reply.status === 200 && reply.body?.ok !== false, `The ${share ? 'save' : 'clear'} of ${ref} failed: ${reply.status} ${reply.text.slice(0, 300)}`);
@@ -210,7 +220,7 @@ export function createGpuCases(ctx) {
         const state = await admin.state();
         const policies = {}; const apply = [];
         for (const [role, share] of Object.entries(desired)) {
-            const ref = GPU_AGENT_REFS[role];
+            const ref = fixture.refs[role];
             const entry = agentEntry(state, ref);
             const configured = entry?.configured?.gpu || null;
             const container = entry?.containers?.[0];
@@ -282,13 +292,13 @@ export function createGpuCases(ctx) {
         }
         needs(mount('/usr/local/nvidia/lib64/libcuda.so.1')?.RW === false, 'The Box does not bind the driver library libcuda.so.1 read-only');
         prepared = { box, prefix, gate, agents: {} };
-        for (const role of ['probe', 'peer', 'cpu']) {
+        for (const role of fixture.roles) {
             const agent = await agentNow(role);
             // MPS eligibility: the share clients run as a non-root numeric UID:GID.
-            if (role !== 'cpu') needs(MPS_CLIENT_USER.test(agent.user), `The fixture image of ${role} runs as '${agent.user}', not a non-root numeric UID:GID, which MPS eligibility requires`);
+            if (fixture.clients.includes(role)) needs(MPS_CLIENT_USER.test(agent.user), `The fixture image of ${role} runs as '${agent.user}', not a non-root numeric UID:GID, which MPS eligibility requires`);
             prepared.agents[role] = { id: agent.id, created: agent.created, startedAt: agent.startedAt, pid: agent.pid, user: agent.user };
         }
-        prepared.cpuBaseline = { ...prepared.agents.cpu };
+        if (fixture.unrelated) prepared.cpuBaseline = { ...prepared.agents[fixture.unrelated] };
         return prepared;
     }
 
@@ -852,6 +862,12 @@ export function createGpuCases(ctx) {
     // compose, so a single guard (the owned-daemon kill) can be exercised alone.
     return {
         liveP1, liveP2, liveP3, liveP4, beforeCleanup, afterCleanup,
-        internals: { prepare, admin, agentNow, settleShares, daemonIdentity, killOwnedDaemon, startTimeline, evaluateDrain, evidenceFor },
+        internals: {
+            prepare, admin, agentNow, settleShares, daemonIdentity, killOwnedDaemon, startTimeline, evaluateDrain, evidenceFor,
+            // What the local-llm and vLLM cases build on (liveLlmCases.mjs): the same gate, administrator channel,
+            // Apply, daemon and ownership proofs, never a second copy of them.
+            runCase, applyShares, agentEntry, containerKey, observeMps, registerOwned, assertClientShare, assertUnshared, hostProcessesOf, boxProcessOnHost,
+            observe, nestedRows, inspectNested, smiQuery, timings, sleep, fixture, getPrepared: () => prepared, compactEvidence,
+        },
     };
 }

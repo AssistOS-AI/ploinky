@@ -167,9 +167,27 @@ The test-only live verification runner (`tests/hardware-limits/verify.mjs`
 It uses the operator's existing Podman, `git` to freeze the committed
 candidate and, for apparatus blocks, the system OpenSSH client with a pinned
 known-hosts file; on the remote host it runs only the pinned Node.js and
-`mkdir`, `dd`, `chmod`, `stat`, `cat`, `sha256sum`, `tar` and `rm`. The
+`mkdir`, `dd`, `chmod`, `stat`, `cat`, `ls`, `sha256sum`, `tar` and `rm`. After every
+dispatch, and before the owned staging root can be removed, it lists the remote run
+directory and fetches only the run artifacts named in its own artifact form, as
+bounded regular files verified by `sha256sum`. The
 `apparatus-mps` block additionally runs the pinned host `nvidia-smi` as a
 read-only XML query (the GPU idle gate) and reads the host's `/proc` and cgroup
 tree; it never changes the compute mode and signals only the one MPS daemon of
 its own Box, after proving it. Each action needs its own separate
 execution-time authorization binding.
+
+The `apparatus-local-llm` and `apparatus-vllm` blocks add no package dependency to
+Ploinky. They run the committed local-llm candidate from its own pinned immutable
+image, and drive it only through its MCP tools and the administrator route. While
+the model generates they read the agent's cgroup interface files (`cpu.stat`,
+`cpu.max`, `memory.*`) and the pinned host `nvidia-smi` XML query. The local-llm
+repository's calibration tool (`local-llm/tools/vllm_mps_calibration.mjs`) uses
+only Node.js built-ins and the vLLM installation the product itself makes from its
+own pinned runner lock: the lock entry (wheels, about 3.9 GB for the pinned vLLM
+version) is downloaded by the agent's own installer inside the owned Box and is
+removed with the owned workspace. Nothing is installed on the host and nothing
+unpinned is ever installed; a missing lock entry, driver, toolchain or disk is
+reported as BLOCKED with the missing prerequisite. The Playground is not a
+dependency: no browser or Playwright runtime is provisioned, and the cases call the
+same MCP tool through the Router.

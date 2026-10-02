@@ -80,6 +80,17 @@ export function parseGpuMemory(result) {
     return memory;
 }
 
+// The device's GPU utilisation percentage, when nvidia-smi prints exactly one in its utilization
+// element; evidence only, so anything else is null and never blocks.
+export function parseGpuUtilization(result) {
+    const xml = result?.stdout;
+    if (typeof xml !== 'string') return null;
+    const sections = [...xml.matchAll(/<utilization>([\s\S]*?)<\/utilization>/g)];
+    if (sections.length !== 1) return null;
+    const found = [...sections[0][1].matchAll(/<gpu_util>([0-9]{1,3}) %<\/gpu_util>/g)];
+    return found.length === 1 && Number(found[0][1]) <= 100 ? Number(found[0][1]) : null;
+}
+
 // `tolerate` ({mode: 'record'|'subset', recorded}) turns amendment A5 on: see
 // evaluateGpuIdleGate. Without it the GPU must show no foreign process at all.
 export async function requireGpuIdle({ query, expectedUuid, initial = false, owned = [], observe, bootId, boxCgroupPrefix, tolerate = null }) {

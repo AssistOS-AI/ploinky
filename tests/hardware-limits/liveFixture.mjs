@@ -23,6 +23,7 @@ import { runBoundedProcess } from './liveProcess.mjs';
 import { createJournal, recordHostRecords, runOwnedCleanup } from './liveCleanup.mjs';
 import { createHostProc } from './liveGpuHost.mjs';
 import { createGpuGate, gpuCleanupProof, gpuQueryArgv } from './liveGpuGate.mjs';
+import { LLM_AGENT, LLM_REF, LLM_REPOSITORY } from './liveLlmNames.mjs';
 
 export const FIXTURE_REPOSITORY = 'hwlfixture';
 export const FIXTURE_HARDWARE_LIMITS = Object.freeze({ memory: '64m', cpus: '0.5', pidsLimit: 64 });
@@ -32,11 +33,17 @@ const ROLES = Object.freeze(['memory', 'cpu', 'pids']);
 export const GPU_FIXTURE_HARDWARE_LIMITS = Object.freeze({ memory: '2g', cpus: '1', pidsLimit: 128 });
 export const GPU_ROLES = Object.freeze(['probe', 'peer']);
 export const GPU_PROBE_TARGET = 'probe/mpsprobe.py';
+// The local-llm fixture (apparatus-local-llm and apparatus-vllm): one owned agent, the local-llm
+// candidate's own, which declares no limits of its own: the administrator's Apply sets them.
+export { LLM_AGENT, LLM_REF, LLM_REPOSITORY };
 
 // The fixture agents a selection needs. C2 needs three distinct owned agents
 // (memory, cpu and pids pressure); C1 and A1 need one. Every agent carries all
 // three limits, because the live inspection requires them on each agent.
 export function fixturePlan(cases) {
+    if (cases.some(id => String(id).startsWith('LIVE-L'))) {
+        return [{ name: LLM_AGENT, role: 'llm', repository: LLM_REPOSITORY, hardwareLimits: null }];
+    }
     if (cases.some(id => String(id).startsWith('LIVE-P'))) {
         return [
             { name: 'probe', role: 'probe', hardwareLimits: { ...GPU_FIXTURE_HARDWARE_LIMITS } },
@@ -66,10 +73,18 @@ export function fixtureManifest(agent, { image, agents }) {
 
 // Production's nested container name for one workspace agent
 // (cli/sandbox/docker/common.js getAgentContainerName).
-export function fixtureContainerName(workspace, agentName) {
+export function fixtureContainerName(workspace, agentName, repository = FIXTURE_REPOSITORY) {
     const safe = value => String(value).replace(/[^a-zA-Z0-9_.-]/g, '_');
     const hash = crypto.createHash('sha256').update(workspace).digest('hex').slice(0, 8);
-    return `ploinky_${safe(FIXTURE_REPOSITORY)}_${safe(agentName)}_${safe(path.basename(workspace))}_${hash}`;
+    return `ploinky_${safe(repository)}_${safe(agentName)}_${safe(path.basename(workspace))}_${hash}`;
+}
+
+// The local-llm candidate's manifest with its image pinned immutably: the candidate's own
+// bytes, one field replaced, serialized the same way every time so the digest is a pin.
+export function rewriteLlmManifest(bytes, image) {
+    const manifest = JSON.parse(bytes);
+    if (typeof manifest.container !== 'string' || !manifest.container) throw new Error('The local-llm manifest has no container image');
+    return `${JSON.stringify({ ...manifest, container: image }, null, 2)}\n`;
 }
 
 export function proposedWorkspaceIdentity(workspacePath) {
@@ -79,12 +94,13 @@ export function proposedWorkspaceIdentity(workspacePath) {
 }
 
 export function startArgs(profile, ports) {
-    return [profile.candidate.path, '--port', String(ports.tcp), '--udp-port', String(ports.udp), 'start', (profile.fixtures.gpu || profile.fixtures.cpu).ref];
+    return [profile.candidate.path, '--port', String(ports.tcp), '--udp-port', String(ports.udp), 'start', (profile.fixtures.llm || profile.fixtures.gpu || profile.fixtures.cpu).ref];
 }
 
 export function validateProvisionPlan(value, run) {
-    keys(value, ['revision', 'repository', 'image', 'boxImage', 'agents', 'workspace'], 'provision plan', ['gpu']);
-    if (!/^[a-f0-9]{40}$/.test(value.revision) || value.repository !== FIXTURE_REPOSITORY
+    keys(value, ['revision', 'repository', 'image', 'boxImage', 'agents', 'workspace'], 'provision plan', ['gpu', 'llm']);
+    const llmFixture = value.llm !== undefined;
+    if (!/^[a-f0-9]{40}$/.test(value.revision) || value.repository !== (llmFixture ? LLM_REPOSITORY : FIXTURE_REPOSITORY)
         || !IMAGE_REF.test(value.image) || !IMAGE_REF.test(value.boxImage)) throw new Error('Invalid provision pins');
     keys(value.workspace, ['parent', 'parentMode', 'path'], 'provision workspace');
     if (!absolute(value.workspace.parent) || !absolute(value.workspace.path) || path.dirname(value.workspace.path) !== value.workspace.parent
@@ -92,6 +108,13 @@ export function validateProvisionPlan(value, run) {
     if (!Array.isArray(value.agents) || !value.agents.length || value.agents.length > 3) throw new Error('Invalid fixture agents');
     const names = new Set();
     for (const agent of value.agents) {
+        if (agent.role === 'llm') {
+            // The local-llm candidate's own agent: no generated limits, the administrator sets them.
+            keys(agent, ['name', 'role', 'repository', 'hardwareLimits'], 'fixture agent');
+            if (agent.name !== LLM_AGENT || agent.repository !== LLM_REPOSITORY || agent.hardwareLimits !== null || names.has(agent.name)) throw new Error('Invalid fixture agent');
+            names.add(agent.name);
+            continue;
+        }
         keys(agent, ['name', 'role', 'hardwareLimits'], 'fixture agent');
         keys(agent.hardwareLimits, ['memory', 'cpus', 'pidsLimit'], 'fixture hardwareLimits');
         const expected = GPU_ROLES.includes(agent.name) ? GPU_FIXTURE_HARDWARE_LIMITS : FIXTURE_HARDWARE_LIMITS;
@@ -99,15 +122,27 @@ export function validateProvisionPlan(value, run) {
             || jsonDigest(agent.hardwareLimits) !== jsonDigest(expected)) throw new Error('Invalid fixture agent');
         names.add(agent.name);
     }
-    // The GPU fixture is exactly probe (the root), peer and the unrelated cpu agent.
-    const gpuFixture = value.agents.some(agent => GPU_ROLES.includes(agent.name));
-    if (gpuFixture !== (value.gpu !== undefined) || (gpuFixture && (value.agents.map(agent => agent.name).join(',') !== 'probe,peer,cpu'))) throw new Error('The GPU fixture plan is inconsistent');
-    if (value.gpu !== undefined) {
-        keys(value.gpu, ['uuid', 'grantAgents', 'probe'], 'GPU provision plan');
-        keys(value.gpu.probe, ['sourcePath', 'digest', 'target'], 'GPU probe plan');
-        if (!/^GPU-[a-fA-F0-9-]{8,64}$/.test(value.gpu.uuid) || !Array.isArray(value.gpu.grantAgents)
-            || value.gpu.grantAgents.join(',') !== `${FIXTURE_REPOSITORY}/probe,${FIXTURE_REPOSITORY}/peer`
-            || !absolute(value.gpu.probe.sourcePath) || !/^sha256:[a-f0-9]{64}$/.test(value.gpu.probe.digest) || value.gpu.probe.target !== GPU_PROBE_TARGET) throw new Error('Invalid GPU provision plan');
+    if (llmFixture) {
+        // Exactly the local-llm agent, its frozen tree and manifest pins, and a GPU grant for it alone.
+        if (value.agents.map(agent => agent.role).join(',') !== 'llm' || value.gpu === undefined) throw new Error('The local-llm fixture plan is inconsistent');
+        keys(value.llm, ['revision', 'sourcePath', 'treeDigest', 'manifest'], 'local-llm provision plan');
+        keys(value.llm.manifest, ['originalContainer', 'originalDigest', 'rewrittenDigest'], 'local-llm manifest pins');
+        if (!/^[a-f0-9]{40}$/.test(value.llm.revision) || !absolute(value.llm.sourcePath) || !/^sha256:[a-f0-9]{64}$/.test(value.llm.treeDigest)
+            || !/^sha256:[a-f0-9]{64}$/.test(value.llm.manifest.originalDigest) || !/^sha256:[a-f0-9]{64}$/.test(value.llm.manifest.rewrittenDigest)
+            || typeof value.llm.manifest.originalContainer !== 'string' || !value.llm.manifest.originalContainer) throw new Error('Invalid local-llm provision plan');
+        keys(value.gpu, ['uuid', 'grantAgents'], 'GPU provision plan');
+        if (!/^GPU-[a-fA-F0-9-]{8,64}$/.test(value.gpu.uuid) || value.gpu.grantAgents?.join(',') !== LLM_REF) throw new Error('Invalid GPU provision plan');
+    } else {
+        // The GPU fixture is exactly probe (the root), peer and the unrelated cpu agent.
+        const gpuFixture = value.agents.some(agent => GPU_ROLES.includes(agent.name));
+        if (gpuFixture !== (value.gpu !== undefined) || (gpuFixture && (value.agents.map(agent => agent.name).join(',') !== 'probe,peer,cpu'))) throw new Error('The GPU fixture plan is inconsistent');
+        if (value.gpu !== undefined) {
+            keys(value.gpu, ['uuid', 'grantAgents', 'probe'], 'GPU provision plan');
+            keys(value.gpu.probe, ['sourcePath', 'digest', 'target'], 'GPU probe plan');
+            if (!/^GPU-[a-fA-F0-9-]{8,64}$/.test(value.gpu.uuid) || !Array.isArray(value.gpu.grantAgents)
+                || value.gpu.grantAgents.join(',') !== `${FIXTURE_REPOSITORY}/probe,${FIXTURE_REPOSITORY}/peer`
+                || !absolute(value.gpu.probe.sourcePath) || !/^sha256:[a-f0-9]{64}$/.test(value.gpu.probe.digest) || value.gpu.probe.target !== GPU_PROBE_TARGET) throw new Error('Invalid GPU provision plan');
+        }
     }
     if (run && (run.workspace?.proposedPath !== value.workspace.path || run.workspace?.instance !== proposedWorkspaceIdentity(value.workspace.path).instance)) {
         throw new Error('Provision workspace does not match the proposed identity');
@@ -253,19 +288,24 @@ export async function provisionRun({
         // 4. The fixture agents, only inside the new workspace.
         const fixtureOp = intent('fixture-write');
         const anchor = path.join(workspace.path, '.ploinky');
-        const repository = path.join(anchor, 'repos', FIXTURE_REPOSITORY);
+        const repository = path.join(anchor, 'repos', plan.repository);
         for (const directory of [anchor, path.join(anchor, 'repos'), repository]) fs.mkdirSync(directory, { mode: 0o755 });
         const files = {};
-        for (const agent of plan.agents) {
-            fs.mkdirSync(path.join(repository, agent.name), { mode: 0o755 });
-            const target = path.join(repository, agent.name, 'manifest.json');
-            const bytes = `${JSON.stringify(fixtureManifest(agent, { image: plan.image, agents: plan.agents }), null, 2)}\n`;
-            fs.writeFileSync(target, bytes, { flag: 'wx', mode: 0o644 });
-            files[path.relative(workspace.path, target)] = digest(bytes);
+        if (plan.llm) {
+            // The local-llm candidate: its frozen tree, copied byte for byte, and its manifest with the image pinned.
+            installLlmAgent({ plan, repository, workspacePath: workspace.path, files });
+        } else {
+            for (const agent of plan.agents) {
+                fs.mkdirSync(path.join(repository, agent.name), { mode: 0o755 });
+                const target = path.join(repository, agent.name, 'manifest.json');
+                const bytes = `${JSON.stringify(fixtureManifest(agent, { image: plan.image, agents: plan.agents }), null, 2)}\n`;
+                fs.writeFileSync(target, bytes, { flag: 'wx', mode: 0o644 });
+                files[path.relative(workspace.path, target)] = digest(bytes);
+            }
         }
         // The CUDA probe is test-only data in the probe agent's directory, so
         // the nested engine stages it at /code/mpsprobe.py; its bytes are pinned.
-        if (plan.gpu) {
+        if (plan.gpu?.probe) {
             const bytes = fs.readFileSync(plan.gpu.probe.sourcePath);
             if (digest(bytes) !== plan.gpu.probe.digest) throw blocked('The staged CUDA probe differs from the digest pinned in the manifest');
             const target = path.join(repository, plan.gpu.probe.target);
@@ -326,7 +366,7 @@ export async function provisionRun({
         // Agent identities inside the owned Box, by production's exact names.
         const nested = ['container', 'exec', '--user', 'podman', box.id, 'podman', '--cgroup-manager=cgroupfs'];
         for (const agent of plan.agents) {
-            const name = fixtureContainerName(workspace.path, agent.name);
+            const name = fixtureContainerName(workspace.path, agent.name, agent.repository || FIXTURE_REPOSITORY);
             const value = checkedJson(await engine('agent-inspect', [...nested, 'container', 'inspect', '--format', AGENT_INSPECT, name], { resourceIds: [box.id] }));
             if (!ID.test(value.id) || !ID.test(String(value.image).replace(/^sha256:/, '')) || typeof value.created !== 'string'
                 || String(value.name).replace(/^\//, '') !== name || value.imageName !== plan.image || value.running !== true) throw new Error(`Fixture agent ${agent.name} is not the pinned running instance`);
@@ -384,4 +424,32 @@ export async function provisionRun({
             || (typeof process.getuid === 'function' && stat.uid !== process.getuid())
             || fs.readFileSync(path.join(parent, OWNER_MARKER), 'utf8') !== run.runId) throw blocked('The staged remote root is not this run\'s private root');
     }
+}
+
+// Copy the frozen local-llm tree into <repository>/local-llm and pin its image. Both the tree
+// and the manifest are checked against the digests the approved manifest recorded, so what the
+// Box runs is exactly what was approved: only the image reference differs from the candidate.
+function installLlmAgent({ plan, repository, workspacePath, files }) {
+    const llm = plan.llm;
+    if (liveSourceDigest(llm.sourcePath) !== llm.treeDigest) throw blocked('The staged local-llm tree differs from the digest pinned in the manifest');
+    const target = path.join(repository, LLM_AGENT);
+    const copy = (from, to) => {
+        fs.mkdirSync(to, { mode: 0o755 });
+        for (const name of fs.readdirSync(from).sort()) {
+            const source = path.join(from, name); const stat = fs.lstatSync(source);
+            if (stat.isDirectory()) copy(source, path.join(to, name));
+            else if (stat.isFile()) fs.copyFileSync(source, path.join(to, name), fs.constants.COPYFILE_EXCL);
+            else throw new Error(`The local-llm tree holds a link or special file: ${name}`);
+        }
+    };
+    copy(llm.sourcePath, target);
+    const manifestFile = path.join(target, 'manifest.json');
+    const original = fs.readFileSync(manifestFile);
+    if (digest(original) !== llm.manifest.originalDigest) throw blocked('The staged local-llm manifest differs from the digest pinned in the manifest');
+    if (JSON.parse(original).container !== llm.manifest.originalContainer) throw blocked('The staged local-llm manifest names another image than the one pinned in the manifest');
+    const rewritten = rewriteLlmManifest(original, plan.image);
+    if (digest(rewritten) !== llm.manifest.rewrittenDigest) throw blocked('The rewritten local-llm manifest differs from the digest pinned in the manifest');
+    fs.writeFileSync(manifestFile, rewritten, { mode: 0o644 });
+    files[path.relative(workspacePath, target)] = llm.treeDigest;
+    files[path.relative(workspacePath, manifestFile)] = digest(rewritten);
 }
