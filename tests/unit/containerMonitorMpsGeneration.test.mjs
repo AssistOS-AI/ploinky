@@ -60,8 +60,34 @@ test('MW.no-wait launch and workspace maintenance defer lost-daemon restart', (t
 
 test('MW.multiple share instances use one bounded daemon observation', (t) => {
     const f = fixture(t); f.registry.alias = { ...f.registry[f.name], alias: 'alias', instanceId: 'alias-i', enableGeneration: 'alias-g', containerId: 'c'.repeat(64) };
+    // The alias is an applied share client of an older generation.
+    const observe = f.monitor.readAppliedObservation;
+    f.monitor.readAppliedObservation = (key, containerId) => key === 'alias' ? { ...f.registry.alias, mpsGeneration: 'old:config' } : observe(key, containerId);
     syncManagedContainers(f.monitor); assert.equal(f.reads(), 1); assert.equal(f.monitor.targets.get('alias').mpsPending, true);
 });
 test('MW.no share instances cause no daemon query', (t) => {
     const f = fixture(t); delete f.registry[f.name]; syncManagedContainers(f.monitor); assert.equal(f.reads(), 0); assert.equal(f.monitor.targets.get(f.plain).mpsPending, false);
 });
+
+// Plan §3 and §5.3: Save records desired policy and Clear does not restart
+// agents; only applied-share facts (daemon loss, generation change) do.
+for (const [label, setup, restart] of [
+    ['save-new-share', (f) => f.apply(undefined), false],
+    ['clear-share', (f) => { f.monitor.hardwareContext = { ...f.monitor.hardwareContext, overrides: new Map() }; }, false],
+    ['change-share', (f) => { f.monitor.hardwareContext = { ...f.monitor.hardwareContext, overrides: new Map([[`demo/${f.name}`, { gpu: { smPercent: 50, vramPercent: 50 } }]]) }; }, false],
+    ['unchanged-share', () => {}, false],
+    ['daemon-lost', (f) => f.status({ daemonStatus: 'lost', mpsGeneration: null }), true],
+    ['generation-changed', (f) => f.status({ daemonStatus: 'ready', mpsGeneration: 'new:config' }), true],
+    ['cleared-share-daemon-lost', (f) => { f.monitor.hardwareContext = { ...f.monitor.hardwareContext, overrides: new Map() }; f.status({ daemonStatus: 'lost', mpsGeneration: null }); }, true],
+]) {
+    test(`MW.p4-${label}`, (t) => {
+        const f = fixture(t); setup(f);
+        syncManagedContainers(f.monitor); monitorTick(f.monitor);
+        const target = f.monitor.targets.get(f.name);
+        const scheduled = f.events.filter(({ data }) => data?.reason === 'mps_generation_changed');
+        assert.equal(target.mpsPending, restart, label);
+        assert.equal(Boolean(target.pendingRestartTimer), restart, label);
+        assert.equal(scheduled.length, restart ? 1 : 0, label);
+        assert.equal(f.monitor.targets.get(f.plain).pendingRestartTimer, null, 'an ordinary agent is never restarted');
+    });
+}

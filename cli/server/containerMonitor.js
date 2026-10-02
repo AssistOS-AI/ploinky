@@ -781,15 +781,21 @@ export function syncManagedContainers(monitor) {
         try { applied = (monitorRef.readAppliedObservation || readAppliedObservation)(containerName, record.containerId); } catch (_) {}
         const exact = applied && applied.containerId === record.containerId && applied.instanceId === record.instanceId && applied.enableGeneration === record.enableGeneration;
         const desiredShare = Boolean(descriptor?.hardwareGpu);
-        if (!desiredShare && !(exact && applied.mpsGeneration)) return { mpsFingerprint: null, mpsPending: false };
+        const appliedShare = Boolean(applied?.mpsGeneration) && (exact || desiredShare);
+        if (!desiredShare && !appliedShare) return { mpsFingerprint: null, mpsPending: false };
         if (mpsStatus === undefined) {
             try { mpsStatus = (monitorRef.readMpsStatus || readMpsStatus)() || {}; } catch (_) { mpsStatus = { daemonStatus: 'unknown', mpsGeneration: null }; }
         }
         const generation = typeof mpsStatus?.mpsGeneration === 'string' ? mpsStatus.mpsGeneration.slice(0, 257) : null;
         const daemonStatus = String(mpsStatus?.daemonStatus || 'unknown').slice(0, 32);
+        // Only applied-share facts restart a running instance: an exact share
+        // client whose daemon is lost, or a client whose share is still
+        // desired and whose applied identity is stale or whose applied
+        // generation differs. Saving a new share or clearing one changes
+        // desired policy only; Apply, start and restart reconcile it (§3, §5.3).
         return {
             mpsFingerprint: digestValue({ generation, daemonStatus }),
-            mpsPending: !desiredShare || !exact || !applied.mpsGeneration || daemonStatus !== 'ready' || applied.mpsGeneration !== generation,
+            mpsPending: appliedShare && (!exact || daemonStatus !== 'ready' || (desiredShare && applied.mpsGeneration !== generation)),
         };
     };
     const desired = new Map();
