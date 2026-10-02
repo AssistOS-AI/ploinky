@@ -106,6 +106,7 @@ const PHASE_REGRESSIONS = Object.freeze({
             'tests/unit/ploinkyBoxAuthority.test.mjs',
             'tests/unit/llmRuntimeIntegration.test.mjs',
             'tests/unit/agentRegistryResolver.test.mjs',
+            'tests/unit/hardwareLimitsEnvHashConsistency.test.mjs',
         ],
     },
     'p1-ram': {

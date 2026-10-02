@@ -405,6 +405,17 @@ export function buildRequiredCaseManifest() {
             'RS.service-reuse-comparison-matches-the-creation-label',
             'RS.a-nested-backend-probe-failure-is-the-plan-defined-way-limited-agents-are-removed',
         ]),
+        ...leaves(P, 'p1', unit('hardwareLimitsEnvHashConsistency.test.mjs'), [
+            'EH.managed-repeat-start-reuses-every-unchanged-agent-on-the-environment-gate-and-the-saved-gate',
+            'EH.none-repeat-start-reuses-every-unchanged-agent-on-a-first-and-a-second-repeat-start',
+            'EH.none-label-the-creation-argv-renders-equals-the-hook-value-and-the-graph-recompute',
+            'EH.managed-label-rewrite-renders-the-semantic-hash-exactly-once',
+            'EH.managed-stable-env-change-replaces-one-agent-once-then-the-next-start-reuses-it',
+            'EH.none-service-reuse-check-matches-the-creation-label-and-replaces-only-on-a-stable-change',
+            'EH.managed-adoption-expectation-equals-the-label-the-graph-and-the-closure-agree-on',
+            'EH.every-security-relevant-input-and-the-broker-flag-change-the-managed-hash',
+            'EH.adoption-recomputes-the-same-generated-credential-env-for-an-unchanged-agent',
+        ]),
         ...leaves(P, 'p1', unit('hardwareLimitsLiveProvision.test.mjs'), [
             'L1.provision-fixture-start-keeps-bounded-redacted-output-tails', 'L1.provision-failed-fixture-start-still-leaves-its-tails',
             'L1.provision-mac-c1-c2-success', 'L1.provision-apparatus-a1-staged-success',

@@ -6,12 +6,19 @@
 //
 // Producer: the real ensureAgentService -> startAgentContainer path runs against
 // a test-owned fake `podman`. It cannot finish offline (the Router authority
-// attestation needs a real helper container), so a module-load hook adds two
+// attestation needs a real helper container), so a module-load hook adds three
 // observation-only assignments to agentServiceManager.js: the `envHash` the
-// creation path computes (the label of host and none networks) and the
+// creation path computes (the label of host and none networks), the
 // `computeSemanticEnvHash` closure the creation path writes the managed label
 // with and managed adoption compares against, each with the runtime identity
-// the creation path minted. Nothing else is changed.
+// the creation path minted, and the `buildCreateArgs` closure whose output is
+// the argv the managed create runs. Nothing else is changed.
+//
+// The label a running container carries is READ from the creation argv, never
+// taken from a computed value: host and none networks from the `create` argv the
+// fake engine records, the managed network from `buildCreateArgs` after its
+// label rewrite. Each is compared with the hash the creation path computed, so
+// a creation path that renders a different label than it hashed fails here.
 // Consumers: the graph reuse decision (ensureGraphNodesEnabled ->
 // graphNodeRuntimeReplacementReason -> computeRetainedManagedEnvHash) and the
 // service-level reuse check in ensureAgentService.
@@ -64,6 +71,7 @@ const HOOK = `
 const ANCHORS = [
   ['    // LLM runtime opt-in: catalog-driven image, hardware-aware policy, reuse hash.', '    Object.assign(globalThis.__envHashProbe ||= {}, { creation: envHash, runtimeIdentity });\\n'],
   ['    const prepareGeneratedRouterAttestation = (plan) => {', '    Object.assign(globalThis.__envHashProbe ||= {}, { semantic: computeSemanticEnvHash, runtimeIdentity });\\n'],
+  ['    // The engine create of an argv the hardware guard already produced.', '    Object.assign(globalThis.__envHashProbe ||= {}, { buildCreateArgs });\\n'],
 ];
 export async function load(url, context, nextLoad) {
   const result = await nextLoad(url, context);
@@ -80,7 +88,7 @@ register(`data:text/javascript;base64,${Buffer.from(HOOK).toString('base64')}`);
 
 const imp = (relative) => import(new URL(relative, import.meta.url).href);
 const { BOX_MARKER_CONTENT } = await imp('../../ploinky-box/constants.mjs');
-const { resolveDesiredHardwareWiring } = await imp('../../ploinky-box/hardwareLimitsGate.mjs');
+const { createHardwareGateStore, resolveDesiredHardwareWiring, selectHardwareGate } = await imp('../../ploinky-box/hardwareLimitsGate.mjs');
 const { buildWorkspaceIdentity } = await imp('../../ploinky-box/identity.mjs');
 const { initializeStore } = await imp('../../cli/sandbox/hardwareLimits/store.mjs');
 const { readBoxHardwareContext, resetHardwareContextCacheForTests } = await imp('../../cli/sandbox/hardwareLimits/context.mjs');
@@ -177,12 +185,27 @@ const payloads = new Map();
 // The runtime identity the creation path minted per agent (the registry keeps it).
 const identities = new Map();
 
+// The `ploinky.envhash=` label values of one argv (the words the fake engine
+// recorded for a call, or the array `buildCreateArgs` returns).
+function envHashLabelsOf(argv) {
+    const words = Array.isArray(argv) ? argv : String(argv).split(' ');
+    return words.flatMap((word, index) => (words[index - 1] === '--label' && String(word).startsWith('ploinky.envhash=') ? [String(word).slice('ploinky.envhash='.length)] : []));
+}
+// The fake engine creates its call log on its first call.
+const engineCalls = () => (fs.existsSync(fakeCalls) ? fs.readFileSync(fakeCalls, 'utf8').split('\n').filter(Boolean) : []);
+// The label each agent's creation rendered, by agent name (see createdEnvHash).
+const renderedLabels = new Map();
+
 // The creation path for one agent, through the repository's ensureAgentService
-// and the fake engine. Returns what the creation path hashes.
+// and the fake engine. Returns what the creation path hashes. The label the
+// creation renders is recorded separately in renderedLabels: from the engine's
+// `create` argv on host and none networks, from `buildCreateArgs` (after the
+// managed label rewrite) on the managed network.
 async function createdEnvHash(name, { network = 'managed' } = {}) {
     globalThis.__envHashProbe = {};
     const manifest = readManifest(name);
     const endpoint = workspaceUtil.resolveManifestRouterEndpoint(manifest, { explicitPort: 8080, path: `manifest(${FIXTURE_REPOSITORY}/${name})` });
+    const callsBefore = engineCalls().length;
     let failure = null;
     try {
         await manager.ensureAgentService(name, manifest, agentDir(name), {
@@ -200,9 +223,30 @@ async function createdEnvHash(name, { network = 'managed' } = {}) {
     const created = { instanceId: probe.runtimeIdentity?.instanceId, enableGeneration: probe.runtimeIdentity?.enableGeneration };
     assert.ok(created.instanceId && created.enableGeneration, `the creation path minted no runtime identity for ${name}`);
     identities.set(name, created);
-    if (network !== 'managed') return probe.creation;
+    if (network !== 'managed') {
+        // The engine's own record of the create this agent's creation ran.
+        const name_ = containerOf(name);
+        const creates = engineCalls().slice(callsBefore).filter((line) => /^create /.test(line) && line.split(' ').some((word, index, words) => words[index - 1] === '--name' && word === name_));
+        assert.equal(creates.length, 1, `the creation path ran exactly one engine create for ${name} (${creates.length})`);
+        const labels = envHashLabelsOf(creates[0]);
+        assert.equal(labels.length, 1, `the create argv of ${name} carries exactly one ploinky.envhash label`);
+        renderedLabels.set(name, labels[0]);
+        return probe.creation;
+    }
     assert.equal(typeof probe.semantic, 'function', `the managed creation path never defined its semantic env hash for ${name} (${failure?.message})`);
-    return probe.semantic(descriptorPayload(name));
+    assert.equal(typeof probe.buildCreateArgs, 'function', `the managed creation path never defined buildCreateArgs for ${name} (${failure?.message})`);
+    const semantic = probe.semantic(descriptorPayload(name));
+    // The managed create argv, after the label rewrite, for the launch state
+    // the creation path builds (its envHash is computeSemanticEnvHash(payload),
+    // pinned in the source by the managed label test below).
+    const createArgv = probe.buildCreateArgs({ mode: 'default', args: [] }, {
+        envHash: semantic, attested: { evidence: { target: { user: '1000:1000' } } },
+        descriptorHostFile: path.join(root, 'launch-descriptor.json'), env: {},
+    });
+    const labels = envHashLabelsOf(createArgv);
+    assert.equal(labels.length, 1, `the managed create argv of ${name} carries exactly one ploinky.envhash label after the rewrite`);
+    renderedLabels.set(name, labels[0]);
+    return semantic;
 }
 
 // ---------------------------------------------------------------------------
@@ -252,8 +296,9 @@ function compositeFs(fake) {
         },
     });
 }
-function boxContext() {
-    const wiring = resolveDesiredHardwareWiring({ identity, enabled: true, hostKind: 'podman-machine', homeDirectory: home, initializeStore });
+// The wiring of the gate one start selected (the default is an on gate).
+function boxContext({ enabled = true } = {}) {
+    const wiring = resolveDesiredHardwareWiring({ identity, enabled, hostKind: 'podman-machine', homeDirectory: home, initializeStore });
     resetHardwareContextCacheForTests();
     const fake = preparedCgroupFs({ controllers: ['cpu', 'memory', 'pids'] });
     return readBoxHardwareContext({
@@ -288,9 +333,9 @@ function limitsLabels(name, context) {
 
 // The graph reuse decision of one `ploinky start` process over running
 // containers. Only engine reads are faked; the env hashes are the repository's.
-function graphStart({ network = 'managed', limits = true, labels }) {
+function graphStart({ network = 'managed', limits = true, labels, gate = { enabled: true } }) {
     const reg = registry({ network });
-    const context = limits ? boxContext() : undefined;
+    const context = limits ? boxContext({ enabled: gate.enabled }) : undefined;
     const preflight = preflightWorkspaceStartRuntimeCapabilities(STATIC_REF, { hardwareContext: context, boxMarkerOptions });
     const unavailable = new Set(createGraphAvailabilityTracker(preflight.graph, preflight.admissions).unavailableEntries().map((entry) => entry.nodeId));
     const removed = [];
@@ -323,27 +368,107 @@ async function runningLabels({ network = 'managed', limits = true }) {
     const context = limits ? boxContext() : undefined;
     const labels = {};
     for (const agent of agents) {
+        const computed = await createdEnvHash(agent.name, { network });
+        // The running container carries the label its creation RENDERED. It must
+        // be the hash the creation path computed: a label rendered from anything
+        // else (or not at all) is the defect this file exists to catch.
+        assert.equal(renderedLabels.get(agent.name), computed, `${agent.name}: the label the creation renders equals the hash the creation path computed`);
         labels[containerOf(agent.name)] = {
             ...(limits ? limitsLabels(agent.name, context) : {}),
-            'ploinky.envhash': await createdEnvHash(agent.name, { network }),
+            'ploinky.envhash': renderedLabels.get(agent.name),
         };
     }
     return labels;
 }
 
-for (const [network, limits] of [['managed', true], ['none', false]]) {
-    test(`EH.${network}-repeat-start-reuses-every-unchanged-agent-on-the-environment-gate-and-the-saved-gate`, async () => {
-        writeManifests({ network, limits });
-        const labels = await runningLabels({ network, limits });
-        for (const label of Object.values(labels)) assert.match(label['ploinky.envhash'], /^[a-f0-9]{64}$/, 'the creation path wrote an environment hash');
-        for (const start of ['environment gate', 'saved gate']) {
-            const result = graphStart({ network, limits, labels });
-            assert.deepEqual([...result.unavailable], [], `${start}: no agent is refused`);
-            assert.deepEqual(result.removed.map((entry) => `${entry.key}: ${entry.reason}`), [], `${start}: no agent is replaced (envHashChanged would be the defect)`);
-            assert.deepEqual(result.prepared.changedContainers, [], `${start}: no agent is planned for replacement`);
-        }
-    });
-}
+// The saved-gate store of the workspace: the first start saved its gate, so a
+// later start with no environment value selects the saved one (selectHardwareGate,
+// the repository's own selection). The gate-off world (limits false) has no gate.
+const gateStore = createHardwareGateStore({ homeDirectory: home });
+const gateLock = { assertHeld() {} };
+
+test('EH.managed-repeat-start-reuses-every-unchanged-agent-on-the-environment-gate-and-the-saved-gate', async () => {
+    writeManifests({ network: 'managed', limits: true });
+    const labels = await runningLabels({ network: 'managed', limits: true });
+    for (const label of Object.values(labels)) assert.match(label['ploinky.envhash'], /^[a-f0-9]{64}$/, 'the creation path wrote an environment hash');
+    const first = selectHardwareGate({ identity, gateStore, env: { PLOINKY_BOX_HARDWARE_LIMITS: 'on' }, operation: 'start' });
+    assert.deepEqual([first.enabled, first.source], [true, 'environment']);
+    gateStore.write(identity, first.enabled, gateLock);
+    for (const [start, env, source] of [
+        ['environment gate', { PLOINKY_BOX_HARDWARE_LIMITS: 'on' }, 'environment'],
+        ['saved gate', {}, 'saved'],
+    ]) {
+        // Each repeat start selects its own gate before the graph decision.
+        const gate = selectHardwareGate({ identity, gateStore, env, operation: 'start' });
+        assert.deepEqual([gate.enabled, gate.source, gate.persist], [true, source, false], `${start}: the repository selects the ${source} gate`);
+        const result = graphStart({ network: 'managed', limits: true, labels, gate });
+        assert.deepEqual([...result.unavailable], [], `${start}: no agent is refused`);
+        assert.deepEqual(result.removed.map((entry) => `${entry.key}: ${entry.reason}`), [], `${start}: no agent is replaced (envHashChanged would be the defect)`);
+        assert.deepEqual(result.prepared.changedContainers, [], `${start}: no agent is planned for replacement`);
+    }
+});
+
+test('EH.none-repeat-start-reuses-every-unchanged-agent-on-a-first-and-a-second-repeat-start', async () => {
+    // A none-network, limit-free fixture has no hardware gate: both starts are
+    // the same graph decision, which is all this test claims.
+    writeManifests({ network: 'none', limits: false });
+    const labels = await runningLabels({ network: 'none', limits: false });
+    for (const label of Object.values(labels)) assert.match(label['ploinky.envhash'], /^[a-f0-9]{64}$/, 'the creation path wrote an environment hash');
+    for (const start of ['first repeat start', 'second repeat start']) {
+        const result = graphStart({ network: 'none', limits: false, labels });
+        assert.deepEqual([...result.unavailable], [], `${start}: no agent is refused`);
+        assert.deepEqual(result.removed.map((entry) => `${entry.key}: ${entry.reason}`), [], `${start}: no agent is replaced (envHashChanged would be the defect)`);
+        assert.deepEqual(result.prepared.changedContainers, [], `${start}: no agent is planned for replacement`);
+    }
+});
+
+// ---------------------------------------------------------------------------
+// The label the creation argv carries. The running label of the tests above is
+// read from it; these two pin the claim directly, so a creation path that
+// corrupts `--label ploinky.envhash=...` (or the managed rewrite of it) fails a
+// test named for it, not only a reuse decision.
+
+test('EH.none-label-the-creation-argv-renders-equals-the-hook-value-and-the-graph-recompute', async () => {
+    writeManifests({ network: 'none', limits: false });
+    const labels = await runningLabels({ network: 'none', limits: false });
+    for (const agent of agents) {
+        const rendered = renderedLabels.get(agent.name);
+        assert.match(rendered, /^[a-f0-9]{64}$/, `${agent.name}: the engine create argv carries a full ploinky.envhash label`);
+        assert.equal(labels[containerOf(agent.name)]['ploinky.envhash'], rendered);
+    }
+    // Hook value: createdEnvHash returned it and runningLabels asserted it equals
+    // the rendered label. Graph recompute: the graph decision over the rendered
+    // labels replaces nothing, and a label that differs by one character replaces
+    // exactly that agent with reason envHashChanged.
+    assert.deepEqual(graphStart({ network: 'none', limits: false, labels }).removed, [], 'the graph recompute equals the rendered label');
+    const corrupted = structuredClone(labels);
+    const key = containerOf('cpu');
+    corrupted[key]['ploinky.envhash'] = `${labels[key]['ploinky.envhash'].slice(0, 63)}${labels[key]['ploinky.envhash'].endsWith('0') ? '1' : '0'}`;
+    assert.deepEqual(graphStart({ network: 'none', limits: false, labels: corrupted }).removed.map((entry) => [entry.key, entry.reason]),
+        [[key, `workspaceGraph:${FIXTURE_REPOSITORY}/cpu:envHashChanged`]], 'the decision reads the rendered label');
+});
+
+test('EH.managed-label-rewrite-renders-the-semantic-hash-exactly-once', async () => {
+    writeManifests({ network: 'managed', limits: true });
+    const labels = await runningLabels({ network: 'managed', limits: true });
+    const reg = registry({ network: 'managed' });
+    for (const agent of agents) {
+        const rendered = renderedLabels.get(agent.name);
+        assert.equal(labels[containerOf(agent.name)]['ploinky.envhash'], rendered);
+        // The graph's retained recompute (the consumer of this label) equals the rendered one.
+        const node = { repoName: FIXTURE_REPOSITORY, shortAgentName: agent.name, manifest: readManifest(agent.name), profile: '' };
+        const profile = profileService.resolveManifestRuntimeProfile(node.manifest, { agentName: `${FIXTURE_REPOSITORY}/${agent.name}`, path: 'manifest' });
+        const plan = manager.buildRuntimeNetworkPlan('podman', profile.network);
+        assert.equal(workspaceUtil.computeRetainedManagedEnvHash(node, reg[containerOf(agent.name)], profile.profileConfig, plan, {
+            descriptorRoot, readDescriptorFileImpl: (file) => ({ payload: payloads.get(fs.realpathSync(file)) }),
+        }), rendered, `${agent.name}: the graph recompute equals the label the managed create renders`);
+    }
+    // The launch state the managed creation builds carries
+    // computeSemanticEnvHash(payload), and the rewrite renders launch.envHash:
+    // the two source facts the observation above cannot reach offline.
+    assert.match(managerSource, /const semanticEnvHash = computeSemanticEnvHash\(payload\);[\s\S]{0,240}envHash: semanticEnvHash,/);
+    assert.match(managerSource, /createArgs\[index \+ 1\] = `ploinky\.envhash=\$\{launch\.envHash\}`;/);
+});
 
 // ---------------------------------------------------------------------------
 // Control: a genuine, stable environment change replaces exactly that agent
