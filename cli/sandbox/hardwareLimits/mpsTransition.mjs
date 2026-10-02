@@ -57,14 +57,8 @@ export function planMpsTransition({ oldClients = [], desiredClients = [], config
     const generation = state?.daemonGeneration && state?.configurationGeneration ? `${state.daemonGeneration}:${state.configurationGeneration}` : '';
     const healthy = observedDaemon.state === 'owned' && defaultsVerified === true && state?.status === 'ready';
     const defaultChanged = !isDeepStrictEqual(state?.serverDefault || null, targetDefault);
-    // A client already drained by an earlier transition whose recreate failed
-    // has no runtime left on the old generation; it is recreated, not a
-    // reason to restart the daemon again.
-    const drainedBefore = new Set(state?.drainedClients || []);
-    const stale = old.some((value) => value.share && value.mpsGeneration !== generation && !drainedBefore.has(clientIdentity(value)));
-    // Created candidates ('readiness') and contained per-client failures
-    // ('failed') are client outcomes; only an interrupted intent restarts.
-    const unfinished = Boolean(state?.status === 'transitioning' || state?.status === 'pending' || state?.pendingClients?.some((client) => client.phase !== 'readiness' && client.phase !== 'failed'));
+    const stale = old.some((value) => value.share && value.mpsGeneration !== generation);
+    const unfinished = Boolean(state?.status === 'transitioning' || state?.status === 'pending' || state?.pendingClients?.some((client) => client.phase !== 'readiness'));
     const restart = needed && (!healthy || defaultChanged || stale || unfinished);
     const finalClear = !needed && !targetDefault && (old.some((value) => value.share) || state?.daemon);
     if (observedDaemon.state === 'foreign' || observedDaemon.state === 'unknown') {
@@ -135,8 +129,9 @@ function* transitionSteps(input, { assertCapability, store, backend, drain, recr
                 const observedState = store.read();
                 const created = (observedState?.transitionId === state.transitionId && observedState?.daemonGeneration === state.daemonGeneration ? observedState.pendingClients || [] : [])
                     .filter((entry) => entry.key === client.key && entry.phase === 'readiness' && /^[a-f0-9]{64}$/.test(String(entry.containerId || '')));
-                state.pendingClients = [...state.pendingClients.filter((entry) => entry.key !== client.key),
-                    ...(created.length ? created : [{ ...client, phase: 'failed' }])];
+                // A created candidate keeps its exact journaled identity for
+                // recovery; an uncreated client stays a pending intent.
+                if (created.length) state.pendingClients = [...state.pendingClients.filter((entry) => entry.key !== client.key), ...created];
                 failures.push({ client, error });
                 result = { key: client.key, state: 'pending', problem: findHardwareOutcome(error), error: String(error?.code || 'mps_client_failed').slice(0, 64), message: 'This exact GPU share client was not recreated; it stays inactive until retried.' };
                 results.push(result); onResult(result);
@@ -148,13 +143,18 @@ function* transitionSteps(input, { assertCapability, store, backend, drain, recr
             if (result?.state === 'starting') state.pendingClients.push({ ...client, ...(result.client || {}), phase: 'readiness' });
             save();
         }
-        // Keep drain receipts only for clients whose recreate failed, so their
-        // stale applied generation does not restart the daemon again.
-        const failedKeys = new Set(failures.map(({ client }) => client.key));
-        state = { ...state, status: state.daemon ? 'ready' : 'inactive', serverDefault: plan.serverDefault, oldClients: [], desiredClients: [], pendingClients: state.pendingClients,
-            drainedClients: state.drainedClients.filter((entry) => failedKeys.has(entry.split('\0')[0])), transitionId: null,
-            lastProblem: failures.length ? { code: 'mps_client_failed', message: `${failures.length} GPU share client(s) were not recreated; they stay inactive until retried.` } : null };
-        save();
+        if (failures.length) {
+            // Every client had its own attempt. The cohort is incomplete: keep
+            // the journal (old cohort, drain receipts, pending clients) so the
+            // next coordination retries from observations. Daemon health is
+            // reported separately (mpsStatus), so healthy clients stay up.
+            state = { ...state, status: 'pending', serverDefault: plan.serverDefault,
+                lastProblem: { code: 'mps_client_failed', message: `${failures.length} GPU share client(s) were not recreated; they stay inactive until retried.` } };
+            save();
+        } else {
+            state = { ...state, status: state.daemon ? 'ready' : 'inactive', serverDefault: plan.serverDefault, oldClients: [], desiredClients: [], pendingClients: state.pendingClients, drainedClients: [], transitionId: null, lastProblem: null };
+            save();
+        }
     } catch (error) {
         // The exact lifecycle may have recorded a created candidate before
         // readiness failed. Retain that newer identity for crash recovery.
@@ -163,11 +163,13 @@ function* transitionSteps(input, { assertCapability, store, backend, drain, recr
         state = { ...state, status: 'pending', lastProblem: { code: String(error.code || 'mps_transition_failed').slice(0, 64), message: 'MPS transition is incomplete; inactive clients remain pending. Retry after repairing the reported prerequisite.' } };
         save(); throw error;
     }
-    // The daemon generation is complete. A selected target that failed still
-    // fails its own operation, with every other client's outcome recorded.
-    const selected = failures.find(({ client }) => (input.selectedKeys || []).includes(client.key));
-    if (selected) throw Object.defineProperty(selected.error, 'mpsTransitionResults', { value: results, configurable: true });
-    return { plan, state, results, failures: failures.map(({ client, error }) => ({ key: client.key, code: String(error?.code || 'mps_client_failed').slice(0, 64) })) };
+    // The selected target's own failure wins; otherwise the first peer's.
+    // Every client's outcome is attached and was reported through onResult.
+    if (failures.length) {
+        const failure = failures.find(({ client }) => (input.selectedKeys || []).includes(client.key)) || failures[0];
+        throw Object.defineProperty(failure.error, 'mpsTransitionResults', { value: results, configurable: true });
+    }
+    return { plan, state, results };
 }
 
 export function runMpsTransition(input, dependencies) {

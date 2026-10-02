@@ -94,18 +94,9 @@ test('MPL.core-crash-journal', () => {
 test('MPL.partial-retry', () => {
     const old = [client('a'), client('b')]; const desired = [client('a', share(50, 2048)), client('b')];
     const f = fixture({ state: ready(), oldClients: old, desiredClients: desired, failKey: 'b' });
-    // The unselected peer's failure is its own outcome (fix round 3, M3): the
-    // selected target completes on a healthy daemon and b stays pending.
-    const first = f.run();
-    assert.deepEqual(first.results.map((value) => [value.key, value.state]), [['a', 'applied'], ['b', 'pending']]);
-    assert.equal(f.state.status, 'ready');
-    assert.deepEqual(f.state.pendingClients.map((value) => [value.key, value.phase]), [['b', 'failed']]); assert.equal(f.state.oldClients.length, 0);
-    // b's retry observes a's new generation and b's drained old tuple: it is a
-    // client retry on the healthy daemon, never another daemon restart.
-    const events = f.events.length;
-    const retry = f.run({ oldClients: [client('a', share(50, 2048), { mpsGeneration: 'daemon-new:config-new' }), client('b')], selectedKeys: ['b'] });
-    assert.notEqual(retry.plan.action, 'restart');
-    assert.equal(f.events.slice(events).some((value) => value === 'quit' || value === 'start'), false);
+    assert.throws(() => f.run(), /candidate failed/); assert.equal(f.state.status, 'pending');
+    assert.deepEqual(f.state.pendingClients.map((value) => value.key), ['b']); assert.equal(f.state.oldClients.length, 2);
+    assert.equal(f.run().state.status, 'ready'); assert.equal(f.state.pendingClients.length, 0);
 });
 test('MPL.no-unrelated-stop', () => {
     const f = fixture({ state: ready(), oldClients: [client('a'), client('unrelated', null)], desiredClients: [client('a', share(50, 2048)), client('unrelated', null)] });
@@ -162,15 +153,18 @@ function cohortFixture() {
     return { run, events, get state() { return state; } };
 }
 
-test('MPL.p6-peer-failure-recreates-the-rest-and-keeps-daemon-ready', async () => {
+test('MPL.p6-peer-failure-recreates-the-rest-and-reports-a-ready-daemon', async () => {
     const { readMpsStatus } = await import('../../cli/sandbox/hardwareLimits/mpsStatus.mjs');
     const f = cohortFixture();
-    const result = f.run('b');
+    let thrown;
+    assert.throws(() => f.run('b'), (error) => { thrown = error; return /b readiness failed/.test(error.message); });
+    // c is still recreated after b fails, and every client has its outcome.
     assert.ok(f.events.includes('create:c'), f.events.join(' '));
-    assert.deepEqual(result.results.map((value) => [value.key, value.state]), [['a', 'applied'], ['b', 'pending'], ['c', 'applied']]);
-    assert.deepEqual(result.failures.map((value) => value.key), ['b']);
-    assert.equal(f.state.status, 'ready');
-    assert.deepEqual(f.state.pendingClients.map((value) => [value.key, value.phase]), [['b', 'failed']]);
+    assert.deepEqual(thrown.mpsTransitionResults.map((value) => [value.key, value.state]), [['a', 'applied'], ['b', 'pending'], ['c', 'applied']]);
+    // The cohort stays pending for retry from observations; b is its pending client.
+    assert.equal(f.state.status, 'pending');
+    assert.deepEqual(f.state.pendingClients.map((value) => value.key), ['b']);
+    // Daemon health is separate: the verified d1 generation is ready.
     const status = readMpsStatus({ workspaceRoot: '/w', readGrant: () => ({ valid: true, state: 'active', mps: {}, fingerprint: 'f'.repeat(64) }),
         observeGpu: () => ({ uuid: 'GPU-12345678-1234-1234-1234-123456789012', driverVersion: '595.91.07', memoryModel: 'dedicated', name: 'RTX', memoryMiB: 12288 }),
         readState: () => f.state, backend: { observe: () => ({ state: 'owned' }), verify: () => true } });
@@ -183,6 +177,5 @@ test('MPL.p6-selected-failure-still-recreates-the-cohort', () => {
     const f = cohortFixture();
     assert.throws(() => f.run('a'), (error) => /a readiness failed/.test(error.message) && error.mpsTransitionResults?.length === 3);
     assert.ok(f.events.includes('create:b') && f.events.includes('create:c'), f.events.join(' '));
-    assert.equal(f.state.status, 'ready', 'the healthy daemon is not marked pending by one client');
-    assert.deepEqual(f.state.pendingClients.map((value) => [value.key, value.phase]), [['a', 'failed']]);
+    assert.deepEqual(f.state.pendingClients.map((value) => value.key), ['a']);
 });
