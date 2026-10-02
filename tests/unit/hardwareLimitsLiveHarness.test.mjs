@@ -600,7 +600,7 @@ const rejects = (box, pattern, options) => assert.throws(() => assertCoreLayout(
 function reviewerRootOwnedLayout() {
     const layout = { pid1: '0::/ploinky/core\n', self: '0::/ploinky/core\n', mounts: [mountinfoLine().split('\n')[1]], paths: {} };
     for (const suffix of ['/', '/ploinky/core', '/ploinky', '/ploinky/agents', '/ploinky/system']) {
-        layout.paths[suffix] = { uid: suffix === '/' || suffix === '/ploinky/core' ? 0 : 1000, files: { 'memory.max': { uid: 0, value: 'max' }, 'cpu.max': { uid: 0, value: 'max 100000' }, 'pids.max': { uid: 0, value: 'max' }, 'cgroup.procs': { uid: 0, value: '' }, 'cgroup.subtree_control': { uid: 0, value: '' } } };
+        layout.paths[suffix] = { uid: suffix === '/' || suffix === '/ploinky/core' ? 0 : 1000, files: { 'memory.max': { uid: 0, value: 'max' }, 'cpu.max': { uid: 0, value: 'max 100000' }, 'pids.max': { uid: 0, value: 'max' }, 'cgroup.procs': { uid: 0, value: '' }, 'cgroup.subtree_control': { uid: 0, value: '' }, 'cgroup.threads': { uid: 0, value: '' } } };
     }
     return layout;
 }
@@ -687,6 +687,36 @@ test('C1.layout-core-file-owned-by-1000-rejected', async () => {
     const procs = await productionBox();
     procs.layout.paths['/ploinky/core'].files['cgroup.procs'].uid = 1000;
     rejects(procs, /Root\/core cgroup ownership mismatch/);
+});
+
+// /ploinky/core is uid 0 throughout, interface files included: only the
+// namespace root's interface files may belong to the Box runtime uid.
+test('C1.layout-core-interface-files-owned-by-1000-rejected', async () => {
+    const probe = await productionBox();
+    const interfaceFiles = Object.keys(probe.layout.paths['/ploinky/core'].files)
+        .filter(name => !['cgroup.procs', 'cgroup.subtree_control', 'cgroup.threads'].includes(name) && probe.layout.paths['/ploinky/core'].files[name]?.present !== false);
+    assert.ok(interfaceFiles.length >= 2, `the core observation lists interface files: ${interfaceFiles}`);
+    for (const name of interfaceFiles) {
+        const box = await productionBox();
+        box.layout.paths['/ploinky/core'].files[name].uid = 1000;
+        rejects(box, /Root\/core cgroup ownership mismatch/);
+    }
+    // The same files at the namespace root stay allowed for uid 1000 (A4).
+    const root = await productionBox();
+    for (const name of interfaceFiles) if (root.layout.paths['/'].files[name]?.present !== false) root.layout.paths['/'].files[name].uid = 1000;
+    assert.doesNotThrow(() => assertCoreLayout(root.layout, { fixtureControllers: [] }));
+});
+
+// The three delegation files exist on every cgroup v2 directory, so an absent
+// one is missing evidence and fails C1 instead of passing for want of a value.
+test('C1.layout-absent-delegation-files-rejected', async () => {
+    for (const suffix of ['/', '/ploinky/core']) {
+        for (const name of ['cgroup.procs', 'cgroup.subtree_control', 'cgroup.threads']) {
+            const box = await productionBox();
+            box.layout.paths[suffix].files[name] = { present: false };
+            rejects(box, new RegExp(`Missing cgroup evidence for ${suffix === '/' ? '/' : suffix}/${name.replace('.', '\\.')}$`));
+        }
+    }
 });
 
 test('C1.layout-root-owned-delegation-files-rejected', async () => {

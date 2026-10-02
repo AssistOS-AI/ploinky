@@ -118,7 +118,10 @@ export function assertCoreLayout(value, { fixtureControllers = [] } = {}) {
     // entirely uid 0, as production prepares it.
     for (const suffix of ['/', '/ploinky/core']) {
         const entry = entries[suffix];
-        observedFile(entry, suffix, 'cgroup.procs');
+        // The three delegation files exist on every cgroup v2 directory: an
+        // absent one is missing evidence, never a pass. Only the controller
+        // interface files may be absent (a controller the root does not offer).
+        for (const name of ROOT_DELEGATION_FILES) observedFile(entry, suffix, name);
         if (entry.uid !== 0) throw new Error('Root/core cgroup ownership mismatch');
         for (const [name, file] of Object.entries(entry.files || {})) {
             if (file?.present === false) continue;
