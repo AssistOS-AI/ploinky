@@ -96,3 +96,45 @@ test('a replaced native lock is preserved and never published or removed by its 
     assert.equal(fs.readFileSync(`${w.config}.lock`, 'utf8'), 'successor lock');
     assert.deepEqual(fs.readFileSync(w.config), before);
 });
+
+// A second export folder in the same worktree, with the first folder's contribution already recorded.
+function withChild(w) {
+    const child = path.join(w.repo, 'child');
+    fs.mkdirSync(child);
+    const exclusions = () => createSkillExclusionPlanner({ env: w.env, containerExecutor: false, gitDirBoundary: w.root, capability: () => ({ supported: true }) });
+    const syncChild = (extra = {}) => syncManagedSkillExports({ folder: child, owner: 'fixture', sources: [{ name: 'fixture', path: w.source }], exclusions: exclusions(), ...extra });
+    return { child, syncChild };
+}
+const sharedMetadata = w => ['ploinky-skill-exports.exclude', 'ploinky-skill-exports.exclusions.json', 'config', 'config.worktree']
+    .map(name => { const file = path.join(w.repo, '.git', name); return fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null; });
+
+test('an existing native lock defers a second folder and keeps the first folder\'s recorded contribution', t => {
+    const w = fixture(t);
+    assert.equal(w.sync().exclusions.status, 'published');
+    const { syncChild } = withChild(w);
+    const before = sharedMetadata(w);
+    // The first export enabled worktree config, so a worktree-scope native lock is the one that matters.
+    const worktreeLock = path.join(w.repo, '.git', 'config.worktree.lock');
+    fs.writeFileSync(worktreeLock, 'foreign writer');
+    const result = syncChild();
+    assert.equal(result.exclusions.code, 'git-config-busy');
+    assert.equal(fs.readFileSync(worktreeLock, 'utf8'), 'foreign writer');
+    assert.deepEqual(sharedMetadata(w), before);
+    fs.rmSync(worktreeLock);
+    assert.equal(syncChild().exclusions.status, 'published');
+    const record = JSON.parse(fs.readFileSync(path.join(w.repo, '.git', 'ploinky-skill-exports.exclusions.json'), 'utf8'));
+    assert.deepEqual(Object.keys(record.owners).sort(), ['.', 'child']);
+});
+
+test('a pre-existing common Git lock without an owner blocks a second folder and is preserved', t => {
+    const w = fixture(t);
+    assert.equal(w.sync().exclusions.status, 'published');
+    const { syncChild } = withChild(w);
+    const before = sharedMetadata(w);
+    const lock = path.join(w.repo, '.git', 'ploinky-skill-exports-config.lock');
+    fs.mkdirSync(lock);
+    assert.throws(() => syncChild({ lock: { waitMs: 0 } }), { code: 'SKILL_EXPORT_LOCK_OWNERLESS' });
+    assert.ok(fs.statSync(lock).isDirectory(), 'the lock is preserved');
+    assert.deepEqual(sharedMetadata(w), before);
+    assert.equal(fs.existsSync(path.join(w.repo, 'child', '.agents', 'skills', 'fixture')), false, 'nothing was published');
+});

@@ -74,6 +74,9 @@ const IGNORE_RECEIPT = path.join('.agents', '.ploinky-ignore-receipt.json');
 const MANAGED_EXCLUDES = 'ploinky-skill-exports.exclude';
 const COMPOSITION_RECORD = 'ploinky-skill-exports.exclusions.json';
 const GIT_CONFIG_KEYS = new Set(['extensions.worktreeConfig', 'core.excludesFile', 'core.worktree', 'core.bare']);
+// Artifacts that change state shared by every folder of one Git repository:
+// config entries, and the managed excludes file with its composition record.
+const TOUCHES_COMMON_GIT = new Set(['git-config', 'private-file']);
 const CONTENT_KINDS = new Set(['ledger', 'manifest', 'gitignore', 'receipt', 'private-file']);
 const RECLAIM = '.reclaim';
 const SKILL_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
@@ -921,6 +924,15 @@ function publishContent(target, stagedBytes, before, mode) {
 function redoArtifacts(handle, journal, context) {
     const unexpected = [];
     const staging = journal.staging ? resolveInside(handle.root, journal.staging) : null;
+    // The managed excludes file and its composition record change together or
+    // not at all: once either has moved on to bytes this transaction neither
+    // wrote nor recorded (another folder published since), the pair is kept.
+    const privateFiles = journal.artifacts.filter(artifact => artifact.kind === 'private-file');
+    const heldBack = new Set();
+    if (privateFiles.some(artifact => {
+        const current = currentContent(artifactTarget(handle, artifact));
+        return !contentMatches(current, artifact.after) && !contentMatches(current, artifact.before);
+    })) privateFiles.forEach(artifact => heldBack.add(artifact));
     for (const artifact of journal.artifacts) {
         handle.assertSafeTarget?.();
         const target = artifactTarget(handle, artifact);
@@ -943,7 +955,9 @@ function redoArtifacts(handle, journal, context) {
             if (!applyGitConfig(handle, artifact)) unexpected.push({ name: 'git-config', path: artifact.path, key: artifact.key, reason: 'git-config-changed-preserved' });
         } else {
             const current = currentContent(target);
-            if (!contentMatches(current, artifact.after)) {
+            if (!contentMatches(current, artifact.after) && heldBack.has(artifact)) {
+                unexpected.push({ name: artifact.kind, path: artifact.path, reason: `${artifact.kind}-changed-preserved` });
+            } else if (!contentMatches(current, artifact.after)) {
                 const deleting = artifact.after.type === 'absent';
                 const bytes = !deleting && staging && artifact.staged ? readBytes(resolveInside(handle.root, artifact.staged)) : null;
                 if (!deleting && (bytes === null || sha256(bytes) !== artifact.after.digest)) {
@@ -980,7 +994,7 @@ function peekJournalCommonDir(root) {
         const journal = JSON.parse(fs.readFileSync(path.join(root, '.agents', EXPORT_JOURNAL), 'utf8'));
         const commonDir = journal?.config?.identity?.commonDir;
         return journal?.phase === 'metadata' && typeof commonDir === 'string' && path.isAbsolute(commonDir)
-            && journal.artifacts?.some(artifact => artifact?.kind === 'git-config') ? commonDir : null;
+            && journal.artifacts?.some(artifact => TOUCHES_COMMON_GIT.has(artifact?.kind)) ? commonDir : null;
     } catch (_) {
         return null;
     }
@@ -992,10 +1006,10 @@ export function recoverSkillExportTransaction(handle, options = {}) {
     handle.assertHeld();
     const journal = readJournal(handle);
     if (!journal) return { status: 'none' };
-    if (journal.phase === 'metadata' && journal.artifacts.some(artifact => artifact.kind === 'git-config')
+    if (journal.phase === 'metadata' && journal.artifacts.some(artifact => TOUCHES_COMMON_GIT.has(artifact.kind))
         && !(handle.gitLocks || []).includes(journal.config?.identity?.commonDir)) {
         throw skillExportError('SKILL_EXPORT_RECOVERY_REQUIRED',
-            `Skill export transaction ${journal.transaction} changes Git configuration, but the common Git configuration lock for ${journal.config?.identity?.commonDir} could not be held; it is preserved.`,
+            `Skill export transaction ${journal.transaction} changes Git configuration or the worktree's shared exclusion metadata, but the common Git configuration lock for ${journal.config?.identity?.commonDir} could not be held; it is preserved.`,
             { outcome: 'recovery-required', transaction: journal.transaction });
     }
     const context = { handle, hooks: options.recoveryHooks || null, recovering: true };
