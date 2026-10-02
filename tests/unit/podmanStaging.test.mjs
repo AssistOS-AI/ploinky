@@ -64,7 +64,15 @@ function tempDir(prefix = 'podman-staging-') {
     return path.resolve(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
 }
 
+// The real-engine tests are opt-in, decided before any probe runs: the probes
+// below start the real engine, which a guarded unit-test process refuses and
+// which a plain run would use whatever the machine happens to have installed.
+// This is the repository's existing opt-in for tests that need a real rootless
+// Podman (tests/e2e/ploinkyBox/nativeHelpers.mjs).
+const REAL_ENGINE_OPT_IN = process.env.PLOINKY_BOX_REQUIRE_PODMAN === '1';
+
 function hasLocalPodmanBusybox() {
+    if (!REAL_ENGINE_OPT_IN) return false;
     const podman = spawnSync('podman', ['--version'], { stdio: 'ignore' });
     if (podman.status !== 0) return false;
     const image = spawnSync('podman', ['image', 'exists', 'docker.io/library/busybox:1.36'], { stdio: 'ignore' });
@@ -72,6 +80,7 @@ function hasLocalPodmanBusybox() {
 }
 
 function hasLocalDockerBusybox() {
+    if (!REAL_ENGINE_OPT_IN) return false;
     const docker = spawnSync('docker', ['info'], { stdio: 'ignore' });
     if (docker.status !== 0) return false;
     const image = spawnSync('docker', ['image', 'inspect', 'docker.io/library/busybox:1.36'], { stdio: 'ignore' });
