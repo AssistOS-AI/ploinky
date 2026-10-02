@@ -450,6 +450,60 @@ export async function runSuite({
     return { ...evaluation, exitCode: run.exitCode, signal: run.signal, stderrTail: run.stderr.slice(-4096) };
 }
 
+// Explorer's tests import Ploinky as the sibling '../ploinky' of the Explorer
+// root (for example explorer/tests/unit/hardwareLimitsPanel.test.js). Run them
+// in place only when that sibling is exactly the configured Ploinky candidate;
+// otherwise stage the verified Explorer candidate beside a 'ploinky' link to
+// that candidate. Any other resulting sibling is refused, never tested.
+export function assertExplorerPloinkySibling(explorerRoot, ploinkyRoot) {
+    const sibling = path.join(path.dirname(explorerRoot), 'ploinky');
+    let actual = null;
+    try { actual = fs.realpathSync(sibling); } catch (error) { if (error?.code !== 'ENOENT') throw error; }
+    if (actual !== fs.realpathSync(ploinkyRoot)) {
+        throw new SchemaError(`Explorer's sibling ${sibling} is ${actual || 'absent'}, not the configured Ploinky candidate ${ploinkyRoot}`);
+    }
+    return sibling;
+}
+
+export function prepareExplorerLayout({ explorerRoot, explorerDigest, ploinkyRoot, stageParent, runId }) {
+    try {
+        assertExplorerPloinkySibling(explorerRoot, ploinkyRoot);
+        return { root: explorerRoot, staged: false, stage: null };
+    } catch (error) {
+        if (!(error instanceof SchemaError)) throw error;
+    }
+    const stage = path.join(stageParent, `explorer-layout-${runId}`);
+    if (fs.existsSync(stage)) throw new SchemaError(`refusing existing Explorer layout stage ${stage}`);
+    fs.mkdirSync(stage, { recursive: true, mode: 0o700 });
+    const root = path.join(stage, path.basename(explorerRoot) === 'ploinky' ? 'explorer' : path.basename(explorerRoot));
+    try {
+        if (explorerDigest.startsWith('git-tree:')) {
+            // A clean candidate: its exact committed tree, every blob verified.
+            createBaselineStage(explorerRoot, 'HEAD', root);
+            if (`git-tree:${git(explorerRoot, ['rev-parse', 'HEAD^{tree}'])}` !== explorerDigest) throw new SchemaError('Explorer candidate tree changed while staging');
+        } else {
+            const copy = (from, to) => {
+                fs.mkdirSync(to, { mode: 0o700 });
+                for (const name of fs.readdirSync(from).sort()) {
+                    if (name === '.git') continue;
+                    const entry = fs.lstatSync(path.join(from, name));
+                    if (entry.isDirectory()) copy(path.join(from, name), path.join(to, name));
+                    else if (entry.isFile()) fs.copyFileSync(path.join(from, name), path.join(to, name), fs.constants.COPYFILE_EXCL);
+                    else if (entry.isSymbolicLink()) fs.symlinkSync(fs.readlinkSync(path.join(from, name)), path.join(to, name));
+                }
+            };
+            copy(explorerRoot, root);
+            if (treeDigest(root) !== explorerDigest) throw new SchemaError('staged Explorer copy differs from the configured candidate digest');
+        }
+        fs.symlinkSync(fs.realpathSync(ploinkyRoot), path.join(stage, 'ploinky'));
+        assertExplorerPloinkySibling(root, ploinkyRoot);
+    } catch (error) {
+        fs.rmSync(stage, { recursive: true, force: true });
+        throw error;
+    }
+    return { root, staged: true, stage };
+}
+
 function phaseFiles(cases, phase, repo) {
     const required = cases.cases.filter((entry) => entry.phase === phase && REPO_KEYS[entry.repo] === repo);
     const regressions = PHASE_REGRESSIONS[phase]?.[repo] || [];
@@ -576,7 +630,11 @@ async function offlineCommand(options) {
         const { required, files } = phaseFiles(cases, phase, repo);
         if (!required.length && !files.length) continue;
         verifiedSources = verifyCandidateSources(config);
-        const root = config.repos[repo].candidateRoot;
+        const layout = repo === 'explorer' ? prepareExplorerLayout({
+            explorerRoot: config.repos.explorer.candidateRoot, explorerDigest: config.repos.explorer.sourceDigest,
+            ploinkyRoot: config.repos.ploinky.candidateRoot, stageParent: config.evidenceRoot, runId: randomRunId(),
+        }) : null;
+        const root = layout?.root || config.repos[repo].candidateRoot;
         const existing = files.filter((file) => fs.existsSync(path.join(root, file)));
         const missing = files.filter((file) => !existing.includes(file));
         let inventory = null;
@@ -606,6 +664,9 @@ async function offlineCommand(options) {
                 knownBaselineFailures,
             })
             : evaluateSuiteRun({ exitCode: 1, eventText: '', files: [], required });
+        // The staged Explorer layout is a runner-owned copy; the events file
+        // and report are the evidence.
+        if (layout?.staged) fs.rmSync(layout.stage, { recursive: true, force: true });
         verifiedSources = verifyCandidateSources(config);
         for (const file of missing) result.problems.push(`required test file is missing: ${file}`);
         if (missing.length) result.verdict = 'FAIL';

@@ -10,7 +10,7 @@ import {
     randomRunId,
     runCleanup,
 } from '../hardware-limits/fixtures.mjs';
-import { runSuite } from '../hardware-limits/verify.mjs';
+import { runSuite, prepareExplorerLayout, assertExplorerPloinkySibling } from '../hardware-limits/verify.mjs';
 
 function synthetic(t, files) {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-h-')));
@@ -310,4 +310,42 @@ test('H.duplicate-leaf-title-under-two-parents', async (t) => {
     assert.equal(repeated.result.verdict, 'FAIL');
     assert.ok(repeated.result.problems.some((problem) => /duplicate test identity: a\.test\.mjs::leaf/.test(problem)), repeated.result.problems.join('\n'));
     assert.equal(repeated.result.newFailures.length, 1, 'the earlier failure is not replaced by the later pass');
+});
+
+test('H.p3-explorer-sibling-is-the-configured-ploinky-candidate', async (t) => {
+    const { spawnSync } = await import('node:child_process');
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-layout-')));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const write = (file, text) => { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, text); };
+    // An Explorer candidate whose test imports Ploinky as its sibling, next to
+    // an unrelated 'ploinky' directory (the layout V3 found).
+    const explorer = path.join(root, 'side', 'explorer-candidate');
+    write(path.join(explorer, 'explorer/tests/unit/layout.test.js'), "import test from 'node:test';\nimport assert from 'node:assert/strict';\nimport { identity } from '../../../../ploinky/identity.mjs';\ntest('layout.leaf', () => assert.equal(identity, 'configured'));\n");
+    write(path.join(explorer, 'package.json'), '{"type":"module"}\n');
+    const gitIn = (cwd, ...args) => { const result = spawnSync('git', ['-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false', ...args], { cwd, encoding: 'utf8' }); assert.equal(result.status, 0, result.stderr); return result.stdout.trim(); };
+    gitIn(explorer, 'init', '-q'); gitIn(explorer, 'add', '-A'); gitIn(explorer, 'commit', '-q', '-m', 'fixture');
+    const digest = `git-tree:${gitIn(explorer, 'rev-parse', 'HEAD^{tree}')}`;
+    write(path.join(root, 'side', 'ploinky', 'identity.mjs'), "export const identity = 'unrelated';\n");
+    const candidate = path.join(root, 'candidates', 'ploinky-candidate');
+    write(path.join(candidate, 'identity.mjs'), "export const identity = 'configured';\n");
+    assert.throws(() => assertExplorerPloinkySibling(explorer, candidate), /not the configured Ploinky candidate/);
+    // Staged: the configured candidate becomes the sibling and the test passes.
+    const evidence = path.join(root, 'evidence'); fs.mkdirSync(evidence);
+    const layout = prepareExplorerLayout({ explorerRoot: explorer, explorerDigest: digest, ploinkyRoot: candidate, stageParent: evidence, runId: 'a'.repeat(32) });
+    assert.equal(layout.staged, true);
+    assert.equal(fs.realpathSync(path.join(path.dirname(layout.root), 'ploinky')), candidate);
+    const run = await runSuite({ root: layout.root, files: ['explorer/tests/unit/layout.test.js'], runId: randomRunId(), childId: 'layout', eventsPath: path.join(evidence, 'events.jsonl'),
+        required: [requiredCase('explorer/tests/unit/layout.test.js', 'layout.leaf')] });
+    assert.equal(run.verdict, 'PASS', JSON.stringify(run.cases));
+    // The unrelated sibling in place would have failed the same test.
+    const inPlace = await runSuite({ root: explorer, files: ['explorer/tests/unit/layout.test.js'], runId: randomRunId(), childId: 'in-place', eventsPath: path.join(evidence, 'in-place.jsonl'),
+        required: [requiredCase('explorer/tests/unit/layout.test.js', 'layout.leaf')] });
+    assert.equal(inPlace.verdict, 'FAIL');
+    // Refusals: an existing stage, and a staged copy that differs from the digest.
+    assert.throws(() => prepareExplorerLayout({ explorerRoot: explorer, explorerDigest: digest, ploinkyRoot: candidate, stageParent: evidence, runId: 'a'.repeat(32) }), /existing Explorer layout stage/);
+    assert.throws(() => prepareExplorerLayout({ explorerRoot: explorer, explorerDigest: `sha256:${'0'.repeat(64)}`, ploinkyRoot: candidate, stageParent: evidence, runId: 'b'.repeat(32) }), /differs from the configured candidate digest/);
+    assert.equal(fs.existsSync(path.join(evidence, `explorer-layout-${'b'.repeat(32)}`)), false, 'a refused stage is removed');
+    // In place when the sibling already is the configured candidate.
+    const correct = prepareExplorerLayout({ explorerRoot: explorer, explorerDigest: digest, ploinkyRoot: path.join(root, 'side', 'ploinky'), stageParent: evidence, runId: 'c'.repeat(32) });
+    assert.deepEqual(correct, { root: explorer, staged: false, stage: null });
 });
