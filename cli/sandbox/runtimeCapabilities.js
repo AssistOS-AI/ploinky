@@ -453,7 +453,7 @@ export function resolveEffectiveRuntimeCapabilities(manifest, {
     // The exact memory/cpus/pidsLimit request and its declaring layer, kept
     // whether or not llmRuntime.enabled is set (plan §8.1, R10).
     const hardwareRequest = requestedHardwareLimits(policySources);
-    const declarationConflicts = hardwareDeclarationConflicts({ manifest, profileConfig });
+    const declarationConflicts = hardwareDeclarationConflicts({ manifest, profileConfig, profileName });
     // `containerSecurity.shmSize` sizes the agent's own /dev/shm. The
     // operator's runtime policy wins: a size it sets, and host IPC, where a
     // size cannot apply (outside a Box; a Box refuses host IPC).

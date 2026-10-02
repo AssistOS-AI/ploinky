@@ -10,6 +10,7 @@
 // arguments are the same whichever field declared a value.
 
 import { validateHardwareLimitsShape } from '../docker/containerRuntimePolicy.js';
+import { declaredMemoryBytes } from './resolve.mjs';
 
 export const DECLARED_LIMIT_FIELDS = Object.freeze(['memory', 'cpus', 'pidsLimit']);
 export const DEPRECATED_LIMITS_PATH = 'llmRuntime.runtimePolicy.resources';
@@ -36,6 +37,21 @@ function declaresNeutral(source) {
     return Boolean(neutral) && DECLARED_LIMIT_FIELDS.some((field) => neutral[field] !== undefined);
 }
 
+// Two declarations of one field are equal when they mean the same limit:
+// memory in bytes (1g is 1024m), cpus as a number (1.0 is 1) and pidsLimit as
+// an integer. A value either parser rejects is compared as written; the
+// policy validator refuses it anyway.
+function sameDeclaredValue(field, left, right) {
+    if (String(left) === String(right)) return true;
+    if (field === 'memory') {
+        const a = declaredMemoryBytes(left); const b = declaredMemoryBytes(right);
+        return a !== null && b !== null && a === b;
+    }
+    const a = Number(left); const b = Number(right);
+    if (!/^[0-9]+(\.[0-9]+)?$/.test(String(left)) || !/^[0-9]+(\.[0-9]+)?$/.test(String(right)) || !Number.isFinite(a) || !Number.isFinite(b)) return false;
+    return field === 'pidsLimit' ? Number.isInteger(a) && Number.isInteger(b) && a === b : a === b;
+}
+
 /**
  * One layer's declaration: the value of each declared field (the neutral
  * field wins when both places declare it), the fields declared under the
@@ -54,7 +70,7 @@ export function readDeclaredLimits(source) {
         if (old !== undefined) deprecated.push(field);
         if (declared !== undefined) values[field] = declared;
         else if (old !== undefined) values[field] = old;
-        if (declared !== undefined && old !== undefined && String(declared) !== String(old)) {
+        if (declared !== undefined && old !== undefined && !sameDeclaredValue(field, declared, old)) {
             conflicts.push(Object.freeze({ field, value: String(declared), deprecatedValue: String(old) }));
         }
     }
@@ -82,15 +98,25 @@ export function declaredLayerPolicy(source, label = 'hardwareLimits') {
 }
 
 /**
- * Conflicts within the manifest layer and within the profile layer. The
- * profile layer is the resolver's merged profile (see
- * mergeProfileHardwareLimits), which keeps a conflict of either raw profile.
+ * Conflicts within the manifest layer and within each raw profile the
+ * resolved profile is built from (the selected one and the default one),
+ * each named with the values of that one raw layer. Without the manifest's
+ * raw profiles, the resolver's merged profile (see mergeProfileHardwareLimits,
+ * which keeps a raw profile's conflict) is read as one unnamed profile layer.
  */
-export function hardwareDeclarationConflicts({ manifest = null, profileConfig = null } = {}) {
+export function hardwareDeclarationConflicts({ manifest = null, profileConfig = null, profileName = '' } = {}) {
     const conflicts = [];
-    for (const [layer, source] of [['manifest', manifest], ['profile', profileConfig]]) {
-        for (const conflict of readDeclaredLimits(source).conflicts) conflicts.push({ layer, ...conflict });
+    for (const conflict of readDeclaredLimits(manifest).conflicts) conflicts.push({ layer: 'manifest', ...conflict });
+    const profiles = plainObject(manifest?.profiles) ? manifest.profiles : null;
+    const selected = String(profileName || '');
+    if (profiles && selected && Object.hasOwn(profiles, selected)) {
+        for (const name of selected === 'default' ? ['default'] : [selected, 'default']) {
+            if (!Object.hasOwn(profiles, name)) continue;
+            for (const conflict of readDeclaredLimits(profiles[name]).conflicts) conflicts.push({ layer: `profile ${safeName(name)}`, ...conflict });
+        }
+        return conflicts;
     }
+    for (const conflict of readDeclaredLimits(profileConfig).conflicts) conflicts.push({ layer: 'profile', ...conflict });
     return conflicts;
 }
 

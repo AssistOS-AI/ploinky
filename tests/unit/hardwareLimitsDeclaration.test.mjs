@@ -255,7 +255,8 @@ test('HD.conflict-profile-refused', () => {
         const manifest = { ...base, profiles };
         const refusal = refusalOf(manifest, { profileName: profiles.dev ? 'dev' : undefined });
         assert.equal(refusal.reasonCode, 'declaration_conflict');
-        assert.match(refusal.reason, /the profile declares pidsLimit as 64 in hardwareLimits and as 32 in the deprecated llmRuntime\.runtimePolicy\.resources\.$/);
+        // The reason names the raw profile that declares both values.
+        assert.match(refusal.reason, new RegExp(`the profile ${profiles.dev ? 'dev' : 'default'} declares pidsLimit as 64 in hardwareLimits and as 32 in the deprecated llmRuntime\\.runtimePolicy\\.resources\\.$`));
     }
 });
 
@@ -385,15 +386,16 @@ test('HD.profile-conflict-within-raw-profile', () => {
     // In the selected profile, and in the default profile even where the
     // selected profile overrides the key: a conflict of one raw profile is
     // always refused, typed and contained.
-    for (const profiles of [
-        { default: {}, dev: conflict },
-        { default: conflict, dev: { hardwareLimits: { memory: '1g' } } },
-        { default: { hardwareLimits: { memory: '1g' } }, dev: conflict },
+    for (const [profiles, named] of [
+        [{ default: {}, dev: conflict }, 'dev'],
+        [{ default: conflict, dev: { hardwareLimits: { memory: '1g' } } }, 'default'],
+        [{ default: { hardwareLimits: { memory: '1g' } }, dev: conflict }, 'dev'],
     ]) {
         const manifest = { ...base, profiles };
         const refusal = refusalOf(manifest, { profileName: 'dev' });
         assert.equal(refusal.reasonCode, 'declaration_conflict', JSON.stringify(profiles));
-        assert.match(refusal.reason, /the profile declares memory as 512m in hardwareLimits and as 256m in the deprecated/);
+        // The named raw profile and both of its own values, never an inherited one.
+        assert.match(refusal.reason, new RegExp(`: the profile ${named} declares memory as 512m in hardwareLimits and as 256m in the deprecated [^;]*\\.$`));
         assert.throws(() => admit(manifest, { profileName: 'dev', hardwareAdmission: 'strict' }), (error) => errors.findHardwareOutcome(error)?.reasonCode === 'declaration_conflict');
     }
     // Equal values within one raw profile are not a conflict.
@@ -739,4 +741,28 @@ test('HD.long-requested-value-is-a-bounded-refusal', () => {
     assert.ok(interactive && Buffer.byteLength(interactive.requested[0].value) <= errors.OUTCOME_BOUNDS.value);
     // A value within the bound is carried unchanged.
     assert.equal(refusalOf(NEW({ memory: '512m' }), { hardwareContext: { gate: 'off', storeState: 'none' } }).requested[0].value, '512m');
+});
+
+// Conflicts compare what the values mean, and name the raw layer that
+// declares both of them.
+test('HD.conflict-normalized-values-and-named-raw-layer', () => {
+    captureWarnings();
+    const both = (neutral, deprecated) => ({ hardwareLimits: neutral, llmRuntime: { runtimePolicy: { resources: deprecated } } });
+    // Equal limits written differently are accepted, at the root and in a profile.
+    for (const [neutral, deprecated] of [[{ memory: '1g' }, { memory: '1024m' }], [{ cpus: '1.0' }, { cpus: '1' }], [{ cpus: '0.50' }, { cpus: 0.5 }], [{ pidsLimit: 64 }, { pidsLimit: 64 }]]) {
+        const root = { ...base, ...both(neutral, deprecated) };
+        assert.equal(admit(root).admission.hardwareEligibility.state, 'eligible', JSON.stringify(neutral));
+        assert.equal(admit(root).admission.descriptor.hardwareDeclarationConflicts, undefined);
+        const profiled = { ...base, profiles: { default: {}, dev: both(neutral, deprecated) } };
+        assert.equal(admit(profiled, { profileName: 'dev' }).admission.hardwareEligibility.state, 'eligible', JSON.stringify(neutral));
+    }
+    // Genuinely different limits are refused, named by their own layer.
+    const root = refusalOf({ ...base, ...both({ memory: '1g' }, { memory: '512m' }) });
+    assert.match(root.reason, /: the manifest declares memory as 1g in hardwareLimits and as 512m in the deprecated/);
+    const cpus = refusalOf({ ...base, profiles: { default: {}, dev: both({ cpus: '1.5' }, { cpus: '1' }) } }, { profileName: 'dev' });
+    assert.match(cpus.reason, /: the profile dev declares cpus as 1\.5 in hardwareLimits and as 1 in the deprecated/);
+    // An inherited default value never appears as the conflicting partner.
+    const inherited = refusalOf({ ...base, profiles: { default: { llmRuntime: { runtimePolicy: { resources: { memory: '2g' } } } }, dev: both({ memory: '1g' }, { memory: '512m' }) } }, { profileName: 'dev' });
+    assert.match(inherited.reason, /the profile dev declares memory as 1g in hardwareLimits and as 512m in the deprecated/);
+    assert.doesNotMatch(inherited.reason, /2g/);
 });
