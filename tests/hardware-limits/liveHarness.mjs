@@ -9,7 +9,7 @@ import { runBoundedProcess, requireTransport } from './liveProcess.mjs';
 import { assertRemoteArrival } from './liveRemote.mjs';
 import {
     HASH, ID, INSPECT, absolute, assertWorkspace, blocked, bounded, candidateEnv, checkedJson, digest, hostRecordPaths,
-    jsonDigest, keys, liveSourceDigest, receipt,
+    jsonDigest, keys, liveSourceDigest, observeEngineIdentity, receipt,
 } from './liveCommon.mjs';
 import { recordHostRecords, runOwnedCleanup } from './liveCleanup.mjs';
 import { provisionRun, validateProvisionPlan } from './liveFixture.mjs';
@@ -214,8 +214,7 @@ export function createLiveAdapter(profile, {
     const nested = [...core, 'podman', '--cgroup-manager=cgroupfs'];
     const engine = (kind, args, options) => command(kind, profile.engine.path, args, options);
     async function assertEngine(cleanup = false) {
-        const host = checkedJson(await engine('engine-identity', ['info', '--format', '{{json .Host}}'], { cleanup }));
-        if (jsonDigest({ arch: host.arch, os: host.os, hostname: host.hostname, id: host.id }) !== profile.engine.identityDigest) throw new Error('Engine service identity changed');
+        if (await observeEngineIdentity((kind, argv) => engine(kind, argv, { cleanup })) !== profile.engine.identityDigest) throw new Error('Engine service identity changed');
     }
     async function inspectBox({ cleanup = false } = {}) {
         await assertEngine(cleanup);
@@ -385,7 +384,7 @@ function pinProblem(run, profile, hostIdentity, remoteArrival) {
 
 // Standalone cleanup resumes from the manifest alone, including after an
 // interrupted provisioning that never recorded a Box or workspace receipt.
-export async function executeCleanupRun({ run, persist = () => {}, processProvider, signal, remoteArrival = false, hostIdentity = defaultHostIdentity() } = {}) {
+export async function executeCleanupRun({ run, persist = () => {}, processProvider = runBoundedProcess, signal, remoteArrival = false, hostIdentity = defaultHostIdentity() } = {}) {
     const cases = LIVE_CASES[run.block].map(id => ({ id, result: 'blocked', reason: UNSUPPORTED[id] || 'Cleanup only' }));
     const report = { schema: 1, runId: run.runId, action: 'cleanup', verdict: 'BLOCKED', exitCode: EXIT.BLOCKED, cases, cleanup: run.cleanup, limitations: [] };
     let profile;
@@ -407,7 +406,7 @@ export async function executeCleanupRun({ run, persist = () => {}, processProvid
     return report;
 }
 
-export async function executeLiveRun({ run, action = 'live', persist = () => {}, processProvider, signal,
+export async function executeLiveRun({ run, action = 'live', persist = () => {}, processProvider = runBoundedProcess, signal,
     remoteArrival = false,
     hostIdentity = defaultHostIdentity(),
 } = {}) {
@@ -490,7 +489,7 @@ export async function runLiveCommand({
             : action === 'provision'
                 ? await provisionRun({ run, ...local, validateProfile, ...(portProbe ? { portProbe } : {}) })
                 : await executeLiveRun({ run, action, ...local });
-        writePrivateJson(path.join(path.dirname(runPath), `report_${action}_codex.json`), report);
+        writePrivateJson(path.join(path.dirname(runPath), `report_${action}.json`), report);
         return report;
     } finally { process.removeListener('SIGINT', abort); process.removeListener('SIGTERM', abort); process.removeListener('SIGHUP', abort); }
 }

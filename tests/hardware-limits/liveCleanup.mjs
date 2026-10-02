@@ -8,15 +8,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
-import { requireTransport } from './liveProcess.mjs';
+import { requireTransport, runBoundedProcess } from './liveProcess.mjs';
 import {
     ID, INSPECT, OWNER_MARKER, assertOwnedDirectory, assertWorkspace, candidateEnv, checkedJson, hostRecordPaths,
-    jsonDigest, liveSourceDigest, quarantinePath,
+    jsonDigest, liveSourceDigest, observeEngineIdentity, quarantinePath,
 } from './liveCommon.mjs';
 
 // One journaled command: the intent is persisted before the process starts and
 // the observed status after it ends. Output is never persisted here.
-export function createJournal({ run, persist, processProvider, signal }) {
+export function createJournal({ run, persist, processProvider = runBoundedProcess, signal }) {
     return async function journaled(kind, binary, args, { cwd, env, deadlineMs = 30000, stress = false, resourceIds = [], stdinPath = null } = {}) {
         if (run.operations.length >= 512 || Buffer.byteLength(JSON.stringify(run)) > 190000) throw new Error('Live journal bound exceeded');
         const op = { id: `live-${run.operations.length + 1}`, kind, state: 'intent', resourceIds, argvDigest: jsonDigest([binary, ...args]), resultArtifact: null };
@@ -65,7 +65,7 @@ export function recordHostRecords(run, profile, instance) {
     return changed;
 }
 
-export async function runOwnedCleanup({ run, profile, persist = () => {}, processProvider, signal, platform = profile.host.platform }) {
+export async function runOwnedCleanup({ run, profile, persist = () => {}, processProvider = runBoundedProcess, signal, platform = profile.host.platform }) {
     const journaled = createJournal({ run, persist, processProvider, signal });
     const env = candidateEnv(profile);
     const engine = (kind, args, options = {}) => journaled(kind, profile.engine.path, args, { cwd: profile.host.home, env, ...options });
@@ -84,8 +84,7 @@ export async function runOwnedCleanup({ run, profile, persist = () => {}, proces
     if (run.ownedProcesses.length) throw new Error('Cleanup cannot prove extra recorded processes');
 
     // 2. Revalidate the exact engine and the workspace identity.
-    const host = checkedJson(await engine('engine-identity', ['info', '--format', '{{json .Host}}']));
-    if (jsonDigest({ arch: host.arch, os: host.os, hostname: host.hostname, id: host.id }) !== profile.engine.identityDigest) throw new Error('Engine service identity changed');
+    if (await observeEngineIdentity((kind, argv) => engine(kind, argv)) !== profile.engine.identityDigest) throw new Error('Engine service identity changed');
     const workspace = classifyWorkspace();
 
     // 4. Destroy with the candidate, then prove the exact Box absent.

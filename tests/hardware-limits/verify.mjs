@@ -7,7 +7,10 @@
 //   offline       run one phase's required tests and affected regressions
 //   prepare-live  write a proposed run manifest for one live block (no engine
 //                 or SSH); mac-cpu and apparatus-cpu get concrete pins and a
-//                 human approval summary beside the manifest
+//                 human approval summary beside the manifest. A mac block's
+//                 workspace lives under pins.workspaceParentRoot, which must be
+//                 short enough for the CLI's Unix sockets (a session scratch
+//                 root is not): pin a canonical task-owned /private/tmp/<name>
 //   provision/live/cleanup
 //                 APPROVAL REQUIRED; each needs its own exact authorization
 //                 binding. Unsupported cases remain BLOCKED.
@@ -22,8 +25,8 @@ import { spawnSync } from 'node:child_process';
 import { runBoundedProcess } from './liveProcess.mjs';
 import { fileURLToPath } from 'node:url';
 import { runLiveCommand, LIVE_CASES, UNSUPPORTED, validateProfile } from './liveHarness.mjs';
-import { liveSourceDigest } from './liveCommon.mjs';
-import { CONCRETE_BLOCKS, buildConcreteManifest, explorerFixtureImage, renderSummary, selectPorts, summaryPathFor, validatePins } from './liveManifest.mjs';
+import { liveSourceDigest, workspaceSocketProblem } from './liveCommon.mjs';
+import { CONCRETE_BLOCKS, buildConcreteManifest, explorerFixtureImage, proposedWorkspace, renderSummary, selectPorts, summaryPathFor, validatePins } from './liveManifest.mjs';
 import { validateStage, writeUstar } from './liveStage.mjs';
 
 import {
@@ -767,6 +770,10 @@ function prepareLive(options) {
     if (CONCRETE_BLOCKS[block]) {
         if (!options.pins) throw new UsageError(`prepare-live --block ${block} needs --pins PATH with the observed host, node, engine, Box image and route pins`);
         const pins = validatePins(readJsonBounded(requireAbsolute(options.pins, 'pins'), 16 * 1024), block);
+        // Refuse before anything is staged when the workspace leaves no room
+        // for the CLI's Unix sockets (pins.workspaceParentRoot selects it).
+        const socketProblem = workspaceSocketProblem(proposedWorkspace(block, pins, runId).path);
+        if (socketProblem) { console.error(`[prepare-live] BLOCKED: ${socketProblem}`); return EXIT.BLOCKED; }
         const candidate = buildFrozenCandidate(config, runId);
         if (CONCRETE_BLOCKS[block].remote) {
             const payloadPath = path.join(config.evidenceRoot, `candidate-${runId}.tar`);

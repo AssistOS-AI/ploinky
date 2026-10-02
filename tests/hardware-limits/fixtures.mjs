@@ -374,6 +374,8 @@ export function buildRequiredCaseManifest() {
             'L1.cleanup-unshare-for-subordinate-owned-files', 'L1.prepare-live-mac-cpu-concrete-manifest-and-summary',
             'L1.prepare-live-apparatus-cpu-concrete-manifest-and-summary', 'L1.prepare-live-other-blocks-stay-unsupported',
             'L1.prepare-live-refuses-mismatched-local-pins', 'L1.fixture-declares-hardware-limits',
+            'L1.cli-provision-and-cleanup-run-real-processes-without-an-injected-provider', 'L1.engine-identity-strong-facts-fail-closed',
+            'L1.workspace-socket-room-refused-early',
             'L1.fixture-plan-validation-requires-hardware-limits',
         ]),
         ...leaves(P, 'p1', unit('hardwareLimitsDeclaration.test.mjs'), [

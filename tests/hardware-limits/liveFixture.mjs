@@ -17,8 +17,9 @@ import { assertBoxWorkspaceRoot } from '../../ploinky-box/contract/workspace-roo
 import { EXIT } from './fixtures.mjs';
 import {
     AGENT_INSPECT, ID, IMAGE_REF, INSPECT, OWNER_MARKER, absolute, blocked, candidateEnv, checkedJson, digest,
-    hostRecordPaths, jsonDigest, keys, liveSourceDigest,
+    hostRecordPaths, jsonDigest, keys, liveSourceDigest, observeEngineIdentity, workspaceSocketProblem,
 } from './liveCommon.mjs';
+import { runBoundedProcess } from './liveProcess.mjs';
 import { createJournal, recordHostRecords, runOwnedCleanup } from './liveCleanup.mjs';
 
 export const FIXTURE_REPOSITORY = 'hwlfixture';
@@ -110,7 +111,7 @@ function provisionReport(run, verdict, limitations) {
 }
 
 export async function provisionRun({
-    run, persist = () => {}, processProvider, signal, portProbe = probeLocalPorts, remoteArrival = false,
+    run, persist = () => {}, processProvider = runBoundedProcess, signal, portProbe = probeLocalPorts, remoteArrival = false,
     hostIdentity = { hostname: os.hostname(), platform: process.platform, home: fs.realpathSync(os.homedir()) },
     validateProfile,
 } = {}) {
@@ -124,6 +125,10 @@ export async function provisionRun({
         validateProvisionPlan(profile.provision, run);
         if (!Number.isInteger(run.ports.tcp) || !Number.isInteger(run.ports.udp) || run.ports.tcp === run.ports.udp
             || [run.ports.tcp, run.ports.udp].some(port => port < 1024 || port > 65535)) throw new Error('Provisioning needs separate selected TCP and UDP ports');
+        // A locally created workspace sits under the pinned parent root; the
+        // staged remote root is fixed by the runner and checked by prepare-live.
+        const socketProblem = profile.provision.workspace.parentMode === 'create' ? workspaceSocketProblem(profile.provision.workspace.path) : null;
+        if (socketProblem) throw new Error(socketProblem);
     } catch (error) { limitations.push(error.message); return provisionReport(run, 'BLOCKED', limitations); }
     if (run.target.ssh !== null && run.target.ssh !== undefined && !remoteArrival) {
         limitations.push('SSH target requires remote staging; no local fallback is permitted'); return provisionReport(run, 'BLOCKED', limitations);
@@ -149,8 +154,9 @@ export async function provisionRun({
     try {
         run.state = 'running'; persist();
         // Engine identity, before any mutation.
-        const host = checkedJson(await engine('engine-identity', ['info', '--format', '{{json .Host}}']));
-        if (jsonDigest({ arch: host.arch, os: host.os, hostname: host.hostname, id: host.id }) !== profile.engine.identityDigest) throw blocked('Engine service identity changed');
+        let engineIdentity;
+        try { engineIdentity = await observeEngineIdentity((kind, argv) => engine(kind, argv)); } catch (error) { throw error?.code === 'ENGINE_IDENTITY_INCOMPLETE' ? blocked(error.message) : error; }
+        if (engineIdentity !== profile.engine.identityDigest) throw blocked('Engine service identity changed');
         // No host record may already exist for this fresh instance.
         const instance = run.workspace.instance;
         const existing = hostRecordPaths(profile.host.home, instance).filter(target => { try { fs.lstatSync(target); return true; } catch (error) { if (error.code === 'ENOENT') return false; throw error; } });

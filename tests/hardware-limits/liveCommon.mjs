@@ -114,6 +114,64 @@ export const AGENT_INSPECT = INSPECT.replace('{"id":', '{"name":{{json .Name}},"
 
 export function checkedJson(result) { requireTransport(result); return JSON.parse(result.stdout); }
 
+// The engine service identity: stable, secret-free facts that tell one engine
+// service (and, for a remote client, its connection) from another. On a
+// Podman machine `.Host` alone is only {arch, os, hostname: localhost...},
+// which any other machine or engine can match. A missing required fact fails
+// closed; volatile facts (memory, uptime, counts) are never included.
+export const ENGINE_INFO_ARGV = Object.freeze(['info', '--format', '{{json .}}']);
+export const ENGINE_CONNECTIONS_ARGV = Object.freeze(['system', 'connection', 'list', '--format', 'json']);
+const incompleteIdentity = message => Object.assign(new Error(message), { code: 'ENGINE_IDENTITY_INCOMPLETE' });
+const identityText = (value, label) => {
+    if (typeof value !== 'string' || !value.trim() || Buffer.byteLength(value) > 1024 || /[\0\n]/.test(value)) throw incompleteIdentity(`Engine service identity is missing ${label}`);
+    return value;
+};
+export function engineIdentityFacts(info, connections = null) {
+    const host = info?.host; const store = info?.store; const version = info?.version;
+    const facts = {
+        arch: identityText(host?.arch, 'host.arch'), os: identityText(host?.os, 'host.os'),
+        hostname: identityText(host?.hostname, 'host.hostname'), kernel: identityText(host?.kernel, 'host.kernel'),
+        engineVersion: identityText(version?.Version, 'version.Version'),
+        graphRoot: identityText(store?.graphRoot, 'store.graphRoot'), runRoot: identityText(store?.runRoot, 'store.runRoot'),
+        serviceSocket: identityText(host?.remoteSocket?.path, 'host.remoteSocket.path'),
+        serviceIsRemote: host?.serviceIsRemote === true,
+        id: host?.id === undefined || host?.id === null ? null : identityText(String(host.id), 'host.id'),
+        connection: null,
+    };
+    if (facts.serviceIsRemote) {
+        // A remote client talks to its default connection; exactly one must exist.
+        const defaults = Array.isArray(connections) ? connections.filter(entry => entry?.Default === true) : [];
+        if (defaults.length !== 1) throw incompleteIdentity('Engine service identity needs exactly one default remote connection');
+        facts.connection = { name: identityText(defaults[0].Name, 'connection name'), uri: identityText(defaults[0].URI, 'connection URI') };
+    }
+    return facts;
+}
+export const engineIdentityDigest = (info, connections = null) => jsonDigest(engineIdentityFacts(info, connections));
+// Observe the identity through one bounded command runner `run(kind, argv)`.
+export async function observeEngineIdentity(run) {
+    const info = checkedJson(await run('engine-identity', [...ENGINE_INFO_ARGV]));
+    const connections = info?.host?.serviceIsRemote === true ? checkedJson(await run('engine-connection', [...ENGINE_CONNECTIONS_ARGV])) : null;
+    return engineIdentityDigest(info, connections);
+}
+
+// Unix socket paths are bounded by the kernel's sun_path: 108 bytes on Linux,
+// including the terminating NUL. The Box bind-mounts the workspace at the
+// same path into its Linux kernel, where the CLI's lifecycle binds its Unix
+// sockets (such as runtime-relay.sock); the host Box CLI binds none. Any
+// socket the CLI derives from the workspace is at least WORKSPACE/NAME long,
+// so a workspace that leaves no room for the shortest such path is refused
+// before anything is created. A session scratch root is far too long; pin a
+// short task-owned `workspaceParentRoot` (mac blocks) instead.
+export const UNIX_SOCKET_PATH_LIMIT = 108;
+export const WORKSPACE_SOCKET_NAME = 'runtime-relay.sock';
+export function workspaceSocketProblem(workspacePath) {
+    const socket = path.join(workspacePath, WORKSPACE_SOCKET_NAME);
+    const bytes = Buffer.byteLength(socket);
+    if (bytes < UNIX_SOCKET_PATH_LIMIT) return null;
+    return `The workspace ${workspacePath} leaves no room for the CLI's Unix sockets: ${socket} is ${bytes} bytes, over the ${UNIX_SOCKET_PATH_LIMIT - 1}-byte limit. `
+        + `Pin a workspaceParentRoot at least ${bytes - UNIX_SOCKET_PATH_LIMIT + 1} bytes shorter: a short, canonical, task-owned directory such as /private/tmp/<name>.`;
+}
+
 // The candidate's commands find the engine first on PATH, so the exact
 // recorded engine binary is the one the candidate drives.
 export function candidateEnv(profile, extra = {}) {

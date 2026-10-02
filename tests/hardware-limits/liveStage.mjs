@@ -17,7 +17,7 @@ import { HASH, OWNER_MARKER, RUN_ID, digest, jsonDigest, keys } from './liveComm
 const WORD = /^[A-Za-z0-9_./:=,%+@-]+$/;
 export const REMOTE_PARENT = '.cache/ploinky-hwlimits';
 
-export function remoteReportName(action) { return `report_${action}_codex.json`; }
+export function remoteReportName(action) { return `report_${action}.json`; }
 
 // ---------------------------------------------------------------------------
 // Deterministic ustar archive of the frozen candidate root. Regular files and

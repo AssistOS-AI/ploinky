@@ -18,6 +18,8 @@ import { prepareCgroupDelegation } from '../../ploinky-box/entrypoint/cgroupDele
 import { PREPARE_SCRIPT_BOX_PATH } from '../../ploinky-box/hardwareLimits/status.mjs';
 import { ensureAgentCgroupParents, readStructuralDelegation } from '../../cli/sandbox/hardwareLimits/delegation.mjs';
 import { parseGpuInventory, requireGpuIdle } from '../hardware-limits/liveGpu.mjs';
+import { engineIdentityDigest } from '../hardware-limits/liveCommon.mjs';
+import { fakeEngineInfo } from '../hardware-limits/fakeLiveEngine.mjs';
 import {
     assertWorkspace, executeLiveRun, jsonDigest, readPrivateJson, runLiveCommand,
     validateAuthorization, validateExecutionProfile, liveSourceDigest,
@@ -44,7 +46,7 @@ function fixture(t) {
         protocol: 'owned-fixture-v1', host: { hostname: os.hostname(), platform: process.platform, home: fixtureHome },
         node: { path: node, digest: hash(fs.readFileSync(node)) },
         candidate: { path: candidate, digest: hash(fs.readFileSync(candidate)) },
-        engine: { path: engine, digest: hash(fs.readFileSync(engine)), identityDigest: jsonDigest(host) },
+        engine: { path: engine, digest: hash(fs.readFileSync(engine)), identityDigest: engineIdentityDigest(fakeEngineInfo(host)) },
         source: { root: sourceRoot, digest: liveSourceDigest(sourceRoot) },
         workspace: { path: workspace, uid: stat.uid, dev: String(stat.dev), ino: String(stat.ino), marker: runId },
         box: { id: box.id, created: box.created, image: box.image, contractDigest: jsonDigest({ labels: box.labels, mounts: box.mounts }), pathHash: identity.pathHash, instance: identity.instance },
@@ -55,7 +57,7 @@ function fixture(t) {
     const provider = async (binary, args, options) => {
         calls.push({ binary, args, options });
         if (binary === node) { destroyed = true; return ok(''); }
-        if (args[0] === 'info') return ok(JSON.stringify(host));
+        if (args[0] === 'info') return ok(JSON.stringify(fakeEngineInfo(host)));
         if (args.includes('ps')) return ok(destroyed ? '' : box.id + '\n');
         if (args[0] === 'container' && args[1] === 'inspect') return ok(JSON.stringify(box));
         if (args.includes('inspect')) {

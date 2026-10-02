@@ -16,6 +16,18 @@ const hex = value => crypto.createHash('sha256').update(String(value)).digest('h
 export const ok = (stdout = '', extra = {}) => ({ status: 0, signal: null, stdout, stderr: '', timedOut: false, truncated: false, cancelled: false, errorCode: null, settlementForced: false, ...extra });
 const failed = (stderr, status = 1) => ok('', { status, stderr });
 
+// The `info --format {{json .}}` reply of the fake engine service: the given
+// host facts over stable defaults for every fact the runner's identity uses.
+export function fakeEngineInfo(host = {}) {
+    return {
+        host: { kernel: '6.12.0-fake', serviceIsRemote: false, remoteSocket: { path: '/run/fake/podman/podman.sock', exists: true }, memFree: 1, uptime: 'volatile', ...host },
+        store: { graphRoot: '/var/lib/fake/storage', runRoot: '/run/fake/storage', imageStore: { number: 3 } },
+        version: { Version: '6.0.1', APIVersion: '6.0.1' },
+    };
+}
+// The fake's default remote connections reply when its service is remote.
+export const FAKE_CONNECTIONS = Object.freeze([{ Name: 'fake-machine', URI: 'ssh://core@127.0.0.1:50123/run/user/501/podman/podman.sock', Identity: '/fake/key', Default: true }]);
+
 export function createFakeWorld({ statePath, node, engine, host, unrelated = [], faults = {} }) {
     const load = () => (fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, 'utf8'))
         : { boxes: {}, agents: {}, calls: [], destroyCalls: 0, startCalls: 0, unshare: [], unrelated, counter: 0 });
@@ -23,6 +35,7 @@ export function createFakeWorld({ statePath, node, engine, host, unrelated = [],
     const kindOf = (binary, args) => {
         if (binary === node) return args.includes('destroy') ? 'destroy' : args.includes('start') ? 'start' : 'node';
         if (args[0] === 'info') return 'info';
+        if (args[0] === 'system' && args[1] === 'connection') return 'connections';
         if (args[0] === 'unshare') return 'unshare';
         if (args[0] === 'container' && args[1] === 'ps') return 'ps';
         if (args[0] === 'container' && args[1] === 'inspect') return 'inspect';
@@ -42,7 +55,8 @@ export function createFakeWorld({ statePath, node, engine, host, unrelated = [],
         }
         try {
             switch (kind) {
-            case 'info': return ok(JSON.stringify(fault?.host || host));
+            case 'info': return ok(JSON.stringify(fault?.info || fakeEngineInfo(fault?.host || host)));
+            case 'connections': return ok(JSON.stringify(fault?.connections || FAKE_CONNECTIONS));
             case 'ps': return ok([...Object.keys(state.boxes), ...state.unrelated.map(value => value.id)].join('\n') + '\n');
             case 'inspect': {
                 const id = args.at(-1);

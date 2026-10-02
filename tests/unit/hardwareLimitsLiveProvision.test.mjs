@@ -18,8 +18,8 @@ import { admitManifestRuntimeCapabilities, validateManifestRuntimeCapabilities }
 import { deprecatedHardwareDeclarations } from '../../cli/sandbox/hardwareLimits/declaredLimits.mjs';
 import { buildConcreteManifest, summaryPathFor } from '../hardware-limits/liveManifest.mjs';
 import { writeUstar } from '../hardware-limits/liveStage.mjs';
-import { hostRecordPaths, quarantinePath } from '../hardware-limits/liveCommon.mjs';
-import { CRASH_EXIT, createFakeSsh, createFakeWorld, ok, worldState } from '../hardware-limits/fakeLiveEngine.mjs';
+import { engineIdentityDigest, engineIdentityFacts, hostRecordPaths, quarantinePath, workspaceSocketProblem } from '../hardware-limits/liveCommon.mjs';
+import { CRASH_EXIT, FAKE_CONNECTIONS, createFakeSsh, createFakeWorld, fakeEngineInfo, ok, worldState } from '../hardware-limits/fakeLiveEngine.mjs';
 
 const hash = value => `sha256:${crypto.createHash('sha256').update(value).digest('hex')}`;
 const REPO = fs.realpathSync(fileURLToPath(new URL('../..', import.meta.url)));
@@ -30,6 +30,18 @@ const BOX_IMAGE = `docker.io/assistos/ploinky-box@sha256:${'b'.repeat(64)}`;
 const UNRELATED = [{ id: 'e'.repeat(64), created: '2026-09-01T00:00:00Z', image: 'f'.repeat(64), labels: {}, mounts: [{ Source: '/elsewhere' }] }];
 const free = async () => ({ tcp: true, udp: true });
 const exists = target => { try { fs.lstatSync(target); return true; } catch (error) { if (error.code === 'ENOENT') return false; throw error; } };
+// A live workspace must leave room for the CLI's Unix sockets, so the
+// workspace parent root is a short task-owned directory: the temporary
+// directory when it is short enough, else /tmp. It is removed afterwards.
+function shortParent(t) {
+    const base = [os.tmpdir(), '/tmp'].map(value => fs.realpathSync(value)).find(value => Buffer.byteLength(value) <= 24);
+    const parent = fs.realpathSync(fs.mkdtempSync(path.join(base, 'hwl-')));
+    t.after(() => {
+        const open = target => { const stat = fs.lstatSync(target); if (!stat.isDirectory()) return; fs.chmodSync(target, 0o700); for (const name of fs.readdirSync(target)) open(path.join(target, name)); };
+        if (exists(parent)) { open(parent); fs.rmSync(parent, { recursive: true, force: true }); }
+    });
+    return parent;
+}
 
 function scratch(t) {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-l1-')));
@@ -57,12 +69,12 @@ function world(t, { block = 'mac-cpu', platform = null, stagedRoot = true, fault
     const ssh = path.join(bin, 'ssh'); fs.writeFileSync(ssh, 'fake ssh\n');
     const knownHosts = path.join(root, 'known_hosts'); fs.writeFileSync(knownHosts, '192.168.1.63 ssh-ed25519 AAAAfixture\n');
     const evidence = directory('evidence');
-    const parentRoot = directory('tmp');
+    const parentRoot = shortParent(t);
     const node = fs.realpathSync(process.execPath);
     const hostIdentity = remote ? { hostname: 'apparatus', platform: 'linux', home } : { hostname: os.hostname(), platform: platform || process.platform, home };
     const pins = {
         schema: 1, host: hostIdentity, node: { path: node, digest: hash(fs.readFileSync(node)) },
-        engine: { path: engine, digest: hash(fs.readFileSync(engine)), identityDigest: jsonDigest(ENGINE_HOST) }, boxImage: BOX_IMAGE,
+        engine: { path: engine, digest: hash(fs.readFileSync(engine)), identityDigest: engineIdentityDigest(fakeEngineInfo(ENGINE_HOST)) }, boxImage: BOX_IMAGE,
         ...(remote ? { ssh: { alias: 'ubuntu-codex', sshBinary: ssh, address: '100.76.22.69', hostKeyAlias: '192.168.1.63', user: 'skutner', knownHosts, identityFile: null } } : { workspaceParentRoot: parentRoot }),
     };
     const runId = crypto.randomBytes(16).toString('hex');
@@ -246,7 +258,7 @@ test('L1.provision-requires-separate-authorization', async t => {
     bind('provision');
     const report = await runLiveCommand({ runPath: w.runPath, authorizationPath, action: 'provision', processProvider: w.engineProvider, portProbe: free, hostIdentity: w.hostIdentity });
     assert.equal(report.verdict, 'PASS', JSON.stringify(report.limitations));
-    assert.equal(JSON.parse(fs.readFileSync(path.join(w.evidence, 'report_provision_codex.json'))).verdict, 'PASS');
+    assert.equal(JSON.parse(fs.readFileSync(path.join(w.evidence, 'report_provision.json'))).verdict, 'PASS');
     // The provisioned manifest needs a new binding for live: the old one no longer matches.
     await assert.rejects(runLiveCommand({ runPath: w.runPath, authorizationPath, action: 'provision', processProvider: w.engineProvider }), /authorization binding/);
     reload(w); assert.equal((await cleanup(w)).verdict, 'PASS');
@@ -564,18 +576,18 @@ function prepareFixture(t) {
     };
     const configPath = path.join(evidence, 'config_claude.json'); writePrivateJson(configPath, config);
     const engine = path.join(root, 'podman'); fs.writeFileSync(engine, 'fake engine\n');
-    const parentRoot = path.join(root, 'tmp'); fs.mkdirSync(parentRoot);
+    const parentRoot = shortParent(t);
     const node = fs.realpathSync(process.execPath);
     const macPins = {
         schema: 1, host: { hostname: os.hostname(), platform: process.platform, home: fs.realpathSync(os.homedir()) },
-        node: { path: node, digest: hash(fs.readFileSync(node)) }, engine: { path: engine, digest: hash(fs.readFileSync(engine)), identityDigest: jsonDigest(ENGINE_HOST) },
+        node: { path: node, digest: hash(fs.readFileSync(node)) }, engine: { path: engine, digest: hash(fs.readFileSync(engine)), identityDigest: engineIdentityDigest(fakeEngineInfo(ENGINE_HOST)) },
         boxImage: BOX_IMAGE, workspaceParentRoot: parentRoot, ports: { tcp: 24680, udp: 35791 },
     };
     const ssh = path.join(root, 'ssh'); fs.writeFileSync(ssh, 'fake ssh\n');
     const knownHosts = path.join(root, 'known_hosts'); fs.writeFileSync(knownHosts, '192.168.1.63 ssh-ed25519 AAAAfixture\n');
     const apparatusPins = {
         schema: 1, host: { hostname: 'apparatus', platform: 'linux', home: '/home/skutner' },
-        node: { path: '/usr/bin/node', digest: hash('remote node') }, engine: { path: '/usr/bin/podman', digest: hash('remote podman'), identityDigest: jsonDigest(ENGINE_HOST) },
+        node: { path: '/usr/bin/node', digest: hash('remote node') }, engine: { path: '/usr/bin/podman', digest: hash('remote podman'), identityDigest: engineIdentityDigest(fakeEngineInfo(ENGINE_HOST)) },
         boxImage: BOX_IMAGE, ssh: { alias: 'ubuntu-codex', sshBinary: ssh, address: '100.76.22.69', hostKeyAlias: '192.168.1.63', user: 'skutner', knownHosts, identityFile: null },
     };
     const pinsFile = (name, value) => { const file = path.join(evidence, name); writePrivateJson(file, value); return file; };
@@ -705,4 +717,150 @@ test('L1.fixture-plan-validation-requires-hardware-limits', () => {
     assert.throws(() => validateProvisionPlan(plan(changed)), /Invalid fixture agent$/);
     const extra = fixturePlan(['LIVE-C1']).map(agent => ({ ...agent, hardwareLimits: { ...agent.hardwareLimits, gpu: 'all' } }));
     assert.throws(() => validateProvisionPlan(plan(extra)), /Invalid fixture hardwareLimits fields/);
+});
+
+// --- The real process path ------------------------------------------------
+// The CLI entry and the runner's defaults, with NO injected process provider:
+// the pinned engine binary and the candidate are real executables that
+// interpret the same file-backed fake world (fakeLiveProcess.mjs).
+import { writeFakeExecutables } from '../hardware-limits/fakeLiveProcess.mjs';
+function realProcessWorld(t, { identityDigest = null, host = ENGINE_HOST } = {}) {
+    const root = scratch(t);
+    const directory = name => { const target = path.join(root, name); fs.mkdirSync(target, { recursive: true, mode: 0o700 }); return target; };
+    const home = directory('home');
+    const source = directory('source');
+    fs.mkdirSync(path.join(source, 'ploinky-box', 'bin'), { recursive: true });
+    fs.mkdirSync(path.join(source, 'tests', 'hardware-limits'), { recursive: true });
+    fs.writeFileSync(path.join(source, 'tests', 'hardware-limits', 'verify.mjs'), '// fixture runner\n');
+    const bin = directory('bin');
+    const engine = path.join(bin, 'podman');
+    const configPath = path.join(root, 'fake_process.json');
+    const node = fs.realpathSync(process.execPath);
+    const candidateFile = path.join(source, 'ploinky-box', 'bin', 'ploinky-box.mjs');
+    writeFakeExecutables({ configPath, enginePath: engine, candidatePath: candidateFile, node });
+    const statePath = path.join(root, 'world.json');
+    fs.writeFileSync(configPath, JSON.stringify({ statePath, node, engine, host, unrelated: UNRELATED, candidate: candidateFile }));
+    const evidence = directory('evidence');
+    const hostIdentity = { hostname: os.hostname(), platform: process.platform, home };
+    const pins = {
+        schema: 1, host: hostIdentity, node: { path: node, digest: hash(fs.readFileSync(node)) },
+        engine: { path: engine, digest: hash(fs.readFileSync(engine)), identityDigest: identityDigest || engineIdentityDigest(fakeEngineInfo(host)) },
+        boxImage: BOX_IMAGE, workspaceParentRoot: shortParent(t),
+    };
+    const runId = crypto.randomBytes(16).toString('hex');
+    const run = buildConcreteManifest({ block: 'mac-cpu', runId, configDigest: hash('config'), casesDigest: hash('cases'), documentSuffix: 'claude', pins,
+        candidate: { root: source, digest: liveSourceDigest(source), revision: 'c'.repeat(40) }, image: IMAGE, ports: { tcp: 23456, udp: 34567 }, unsupported: {} });
+    const runPath = path.join(evidence, 'run.json');
+    writePrivateJson(runPath, run);
+    const authorizationPath = path.join(evidence, 'authorization.json');
+    const bind = action => writePrivateJson(authorizationPath, { schema: 1, runId, manifestDigest: hash(fs.readFileSync(runPath)), targetDigest: jsonDigest(JSON.parse(fs.readFileSync(runPath, 'utf8')).target), action });
+    // The runner's host identity comes from HOME; run with the fixture home.
+    const withHome = async (fn) => { const prior = process.env.HOME; process.env.HOME = home; try { return await fn(); } finally { if (prior === undefined) delete process.env.HOME; else process.env.HOME = prior; } };
+    return { root, home, evidence, engine, node, statePath, runPath, authorizationPath, bind, withHome, hostIdentity, get run() { return JSON.parse(fs.readFileSync(runPath, 'utf8')); } };
+}
+const quiet = async (fn) => { const log = console.log; const error = console.error; console.log = () => {}; console.error = () => {}; try { return await fn(); } finally { console.log = log; console.error = error; } };
+
+test('L1.cli-provision-and-cleanup-run-real-processes-without-an-injected-provider', async t => {
+    const main = await verifyMain();
+    // The CLI provision entry reaches the real engine binary: the engine
+    // service identity is observed through a real process (and refused here,
+    // before any mutation, because the pin names another service).
+    const refused = realProcessWorld(t, { identityDigest: hash('another engine service') });
+    refused.bind('provision');
+    assert.equal(await refused.withHome(() => quiet(() => main(['provision', '--run', refused.runPath, '--authorization', refused.authorizationPath]))), 2);
+    const blockedReport = JSON.parse(fs.readFileSync(path.join(refused.evidence, 'report_provision.json'), 'utf8'));
+    assert.deepEqual(blockedReport.limitations, ['Engine service identity changed'], JSON.stringify(blockedReport));
+    assert.deepEqual(worldState(refused.statePath).calls.map(call => [call.kind, call.binary]), [['info', refused.engine]]);
+    assert.equal(exists(refused.run.target.execution.provision.workspace.path), false, 'nothing was created');
+    // Provisioning with the runner's default provider, then the CLI cleanup
+    // entry: every engine and candidate call is a real child process.
+    const w = realProcessWorld(t);
+    const run = w.run;
+    const report = await w.withHome(() => provisionRun({ run, persist: () => writePrivateJson(w.runPath, run), portProbe: free, hostIdentity: w.hostIdentity, validateProfile }));
+    assert.equal(report.verdict, 'PASS', JSON.stringify(report.limitations));
+    const provisioned = worldState(w.statePath);
+    assert.equal(Object.keys(provisioned.boxes).length, 1);
+    assert.ok(provisioned.calls.some(call => call.kind === 'start' && call.binary === w.node));
+    w.bind('cleanup');
+    assert.equal(await w.withHome(() => quiet(() => main(['cleanup', '--run', w.runPath, '--authorization', w.authorizationPath]))), 0);
+    const cleaned = JSON.parse(fs.readFileSync(path.join(w.evidence, 'report_cleanup.json'), 'utf8'));
+    assert.equal(cleaned.verdict, 'PASS', JSON.stringify(cleaned));
+    const state = worldState(w.statePath);
+    assert.deepEqual(Object.keys(state.boxes), []);
+    assert.equal(state.destroyCalls, 1);
+    assert.equal(exists(w.run.target.execution.provision.workspace.path), false);
+    assert.deepEqual(fs.readdirSync(w.evidence).filter(name => name.includes('codex')), [], 'runtime artifact names encode no agent name');
+});
+
+// The engine service identity uses stable, distinguishing facts and fails
+// closed when one is missing.
+test('L1.engine-identity-strong-facts-fail-closed', async t => {
+    const machine = (uri, graphRoot = '/var/home/core/.local/share/containers/storage') => ({
+        info: { host: { arch: 'arm64', os: 'linux', hostname: 'localhost.localdomain', kernel: '6.12.0', serviceIsRemote: true, remoteSocket: { path: '/run/user/501/podman/podman.sock' }, memFree: 1, uptime: '1h' },
+            store: { graphRoot, runRoot: '/run/user/501/containers' }, version: { Version: '6.0.1' } },
+        connections: [{ Name: 'podman-machine-default', URI: uri, Identity: '/Users/someone/.ssh/machine', Default: true }, { Name: 'other', URI: 'ssh://core@127.0.0.1:1/x', Default: false }],
+    });
+    const a = machine('ssh://core@127.0.0.1:50123/run/user/501/podman/podman.sock');
+    const facts = engineIdentityFacts(a.info, a.connections);
+    assert.deepEqual(facts.connection, { name: 'podman-machine-default', uri: a.connections[0].URI });
+    assert.equal(JSON.stringify(facts).includes('.ssh'), false, 'no key path or other secret-bearing value');
+    // The old {arch, os, hostname, id} identity cannot tell these apart; this one does.
+    const b = machine('ssh://core@127.0.0.1:50999/run/user/501/podman/podman.sock');
+    assert.notEqual(engineIdentityDigest(a.info, a.connections), engineIdentityDigest(b.info, b.connections));
+    const c = machine(a.connections[0].URI, '/var/lib/other/storage');
+    assert.notEqual(engineIdentityDigest(a.info, a.connections), engineIdentityDigest(c.info, c.connections));
+    // Volatile facts never change it.
+    assert.equal(engineIdentityDigest({ ...a.info, host: { ...a.info.host, memFree: 2, uptime: '2h' } }, a.connections), engineIdentityDigest(a.info, a.connections));
+    // Missing facts fail closed.
+    for (const [label, info, connections] of [
+        ['kernel', { ...a.info, host: { ...a.info.host, kernel: '' } }, a.connections],
+        ['graphRoot', { ...a.info, store: {} }, a.connections],
+        ['engine version', { ...a.info, version: {} }, a.connections],
+        ['service socket', { ...a.info, host: { ...a.info.host, remoteSocket: null } }, a.connections],
+        ['default connection', a.info, a.connections.map(entry => ({ ...entry, Default: false }))],
+        ['one default connection', a.info, a.connections.map(entry => ({ ...entry, Default: true }))],
+    ]) assert.throws(() => engineIdentityFacts(info, connections), { code: 'ENGINE_IDENTITY_INCOMPLETE' }, label);
+    // Provisioning observes it through the engine: a remote service adds its
+    // connection; an incomplete reply is BLOCKED before any mutation.
+    const remoteHost = { ...ENGINE_HOST, serviceIsRemote: true };
+    const remote = realProcessWorld(t, { host: remoteHost, identityDigest: engineIdentityDigest(fakeEngineInfo(remoteHost), FAKE_CONNECTIONS) });
+    const run = remote.run;
+    const report = await remote.withHome(() => provisionRun({ run, persist: () => writePrivateJson(remote.runPath, run), portProbe: free, hostIdentity: remote.hostIdentity, validateProfile }));
+    assert.equal(report.verdict, 'PASS', JSON.stringify(report.limitations));
+    assert.deepEqual(worldState(remote.statePath).calls.slice(0, 2).map(call => call.kind), ['info', 'connections']);
+    assert.equal((await remote.withHome(() => executeCleanupRun({ run, persist: () => writePrivateJson(remote.runPath, run), hostIdentity: remote.hostIdentity }))).verdict, 'PASS');
+    const w = world(t, { faults: { info: { info: { host: { arch: 'test', os: 'linux', hostname: 'fake-engine' }, version: { Version: '6' } } } } });
+    const incomplete = await provision(w);
+    assert.equal(incomplete.verdict, 'BLOCKED');
+    assert.match(incomplete.limitations[0], /Engine service identity is missing/);
+    assert.equal(exists(w.run.target.execution.provision.workspace.path), false);
+});
+
+// A workspace that leaves no room for the CLI's Unix sockets is refused
+// before anything is created or staged.
+test('L1.workspace-socket-room-refused-early', async t => {
+    assert.equal(workspaceSocketProblem('/private/tmp/h/ploinky-hwl-' + 'a'.repeat(32) + '/workspace'), null);
+    const long = `/private/tmp/claude-501/${'x'.repeat(120)}/ploinky-hwl-${'a'.repeat(32)}/workspace`;
+    assert.match(workspaceSocketProblem(long), /runtime-relay\.sock is \d+ bytes, over the 107-byte limit\. Pin a workspaceParentRoot/);
+    // provision: BLOCKED before any process or workspace creation.
+    const w = world(t);
+    const parent = path.join(w.root, 'p'.repeat(80)); fs.mkdirSync(parent);
+    const pins = { ...w.pins, workspaceParentRoot: parent };
+    const run = buildConcreteManifest({ block: 'mac-cpu', runId: w.runId, configDigest: hash('config'), casesDigest: hash('cases'), documentSuffix: 'claude', pins,
+        candidate: { root: w.source, digest: liveSourceDigest(w.source), revision: 'c'.repeat(40) }, image: IMAGE, ports: { tcp: 23456, udp: 34567 }, unsupported: {} });
+    const report = await provisionRun({ run, persist: () => {}, processProvider: w.engineProvider, portProbe: free, hostIdentity: w.hostIdentity, validateProfile });
+    assert.equal(report.verdict, 'BLOCKED');
+    assert.match(report.limitations[0], /leaves no room for the CLI's Unix sockets/);
+    assert.equal(exists(w.statePath), false, 'no engine call');
+    assert.equal(exists(run.target.execution.provision.workspace.parent), false);
+    // prepare-live: BLOCKED before the candidate is frozen or a manifest written.
+    const f = prepareFixture(t);
+    const main = await verifyMain();
+    const longParent = path.join(f.root, 'q'.repeat(80)); fs.mkdirSync(longParent);
+    const runPath = path.join(f.evidence, 'mac-cpu-run_claude.json');
+    const args = ['prepare-live', '--config', f.configPath, '--block', 'mac-cpu', '--run', runPath, '--pins', f.pinsFile('pins_long_claude.json', { ...f.macPins, workspaceParentRoot: longParent })];
+    if (process.platform !== 'darwin') { await assert.rejects(main(args), /Invalid pins/); return; }
+    const before = fs.readdirSync(f.evidence).sort();
+    assert.equal(await quiet(() => main(args)), 2);
+    assert.deepEqual(fs.readdirSync(f.evidence).sort(), before, 'nothing staged or written');
 });

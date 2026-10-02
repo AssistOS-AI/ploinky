@@ -8,7 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { WANTED_CONTROLLERS } from '../../ploinky-box/entrypoint/cgroupDelegation.mjs';
-import { HOST_RECORD_DIRECTORIES, IMAGE_REF, OWNER_MARKER, digest, keys, AGENT_INSPECT, INSPECT } from './liveCommon.mjs';
+import { ENGINE_CONNECTIONS_ARGV, ENGINE_INFO_ARGV, HOST_RECORD_DIRECTORIES, IMAGE_REF, OWNER_MARKER, UNIX_SOCKET_PATH_LIMIT, WORKSPACE_SOCKET_NAME, digest, keys, AGENT_INSPECT, INSPECT } from './liveCommon.mjs';
 import { FIXTURE_REPOSITORY, fixtureContainerName, fixtureManifest, fixturePlan, proposedWorkspaceIdentity, startArgs } from './liveFixture.mjs';
 import { remoteRoot, remoteReportName } from './liveStage.mjs';
 import { sshOptions } from './liveRemote.mjs';
@@ -76,13 +76,21 @@ export function selectPorts(pins) {
     return { tcp: crypto.randomInt(20000, 30000), udp: crypto.randomInt(30000, 40000) };
 }
 
+// The run's workspace: under the remote run root for a staged block, else
+// under the pinned short task-owned workspaceParentRoot.
+export function proposedWorkspace(block, pins, runId) {
+    const spec = CONCRETE_BLOCKS[block];
+    if (!spec) throw new Error(`Block ${block} has no implemented executor`);
+    const parent = spec.remote ? remoteRoot(pins.host.home, runId) : path.join(pins.workspaceParentRoot, `ploinky-hwl-${runId}`);
+    return { parent, path: path.join(parent, 'workspace') };
+}
+
 export function buildConcreteManifest({ block, runId, configDigest, casesDigest, documentSuffix, pins, candidate, image, ports, unsupported }) {
     const spec = CONCRETE_BLOCKS[block];
     if (!spec) throw new Error(`Block ${block} has no implemented executor`);
     const remote = spec.remote;
     const root = remote ? remoteRoot(pins.host.home, runId) : null;
-    const parent = remote ? root : path.join(pins.workspaceParentRoot, `ploinky-hwl-${runId}`);
-    const workspacePath = path.join(parent, 'workspace');
+    const { parent, path: workspacePath } = proposedWorkspace(block, pins, runId);
     const identity = proposedWorkspaceIdentity(workspacePath);
     const sourceRoot = remote ? `${root}/source` : candidate.root;
     const candidateFile = path.join(candidate.root, 'ploinky-box', 'bin', 'ploinky-box.mjs');
@@ -151,7 +159,8 @@ export function plannedCommands(run) {
     const env = { PLOINKY_BOX_HARDWARE_LIMITS: 'on', PLOINKY_BOX_IMAGE: plan.boxImage };
     const ps = ['container', 'ps', '--all', '--no-trunc', '--format', '{{.ID}}'];
     const provision = [
-        { id: 'engine-identity', binary: engine, argv: ['info', '--format', '{{json .Host}}'], deadlineMs: run.deadlines.coreMs },
+        { id: 'engine-identity', binary: engine, argv: [...ENGINE_INFO_ARGV], deadlineMs: run.deadlines.coreMs, note: 'Stable facts only: host arch/os/hostname/kernel, engine version, store graphRoot/runRoot and the service socket; a remote client adds its one default connection (name and URI). A missing fact refuses the run.' },
+        { id: 'engine-connection', binary: engine, argv: [...ENGINE_CONNECTIONS_ARGV], deadlineMs: run.deadlines.coreMs, note: 'Only when the service is remote.' },
         { id: 'host-records-absent', action: `Refuse unless ${HOST_RECORD_DIRECTORIES.map(name => `~/.ploinky-box/${name}/${run.workspace.instance}{,.json}`).join(', ')} are all absent` },
         ...(plan.workspace.parentMode === 'create'
             ? [{ id: 'workspace-parent-create', action: `mkdir ${plan.workspace.parent} (0700, refuse if it exists) and write ${OWNER_MARKER}=${run.runId}` }]
@@ -186,7 +195,7 @@ export function plannedCommands(run) {
         { id: 'A1-leaf-observer', binary: engine, argv: [...core, 'node', '-e', '<LEAF_OBSERVATION>', '<VERIFIED_LEAF>'], deadlineMs: 5000 },
     );
     const cleanup = [
-        { id: 'revalidate-identity', binary: engine, argv: ['info', '--format', '{{json .Host}}'], action: 'Recheck engine identity, workspace receipt and marker, or the run-derived quarantine' },
+        { id: 'revalidate-identity', binary: engine, argv: [...ENGINE_INFO_ARGV], action: 'Recheck engine identity (with its default connection when remote), workspace receipt and marker, or the run-derived quarantine' },
         { id: 'destroy-box', binary: node, argv: [profile.candidate.path, 'destroy', '--delete-cache'], cwd: workspace, deadlineMs: run.deadlines.destroyMs, action: 'Only when the recorded Box (or the one new Box labelled with this workspace) exists; then prove it absent and compare the unrelated inventory' },
         { id: 'host-records', action: `Remove only recorded ~/.ploinky-box/{${HOST_RECORD_DIRECTORIES.join(',')}}/${run.workspace.instance}[.json]; any unrecorded one refuses the step` },
         { id: 'workspace-removal', action: `Prove no container mounts ${workspace}; rename it to ${path.join(path.dirname(workspace), `.hwl-removing-${run.runId}`)}; reprove uid/dev/ino and marker; remove (marker last)` },
@@ -259,6 +268,7 @@ export function renderSummary(run, manifestPath) {
         '| --- | --- |',
         `| New workspace | \`${plan.workspace.path}\` (instance ${run.workspace.instance}), refused if it exists |`,
         `| Workspace parent | \`${plan.workspace.parent}\` (${plan.workspace.parentMode === 'create' ? 'created by this run' : 'the staged private remote root'}) |`,
+        `| Socket room | \`${path.join(plan.workspace.path, WORKSPACE_SOCKET_NAME)}\` is ${Buffer.byteLength(path.join(plan.workspace.path, WORKSPACE_SOCKET_NAME))} bytes, under the ${UNIX_SOCKET_PATH_LIMIT - 1}-byte Unix socket limit; a longer workspace is refused, so pin a short task-owned workspaceParentRoot |`,
         `| Host ports | TCP ${run.ports.tcp} (Router, loopback), UDP ${run.ports.udp} (media); a collision aborts |`,
         `| Box image | \`${plan.boxImage}\` |`,
         `| Fixture image | \`${plan.image}\` |`,
