@@ -747,6 +747,41 @@ CPU/RAM maxima are not reservations: host or ancestor memory pressure can still
 kill a process below its own cap. Dependency installation, diagnose and
 image-verification work is maintenance outside agent budgets.
 
+### Declaring limits in a manifest
+
+Any agent, whether or not it uses the LLM runtime, declares its own limits with
+a top-level `hardwareLimits` object in its manifest or in a profile:
+
+```json
+{
+  "container": "node:20-alpine",
+  "hardwareLimits": { "memory": "512m", "cpus": "0.5", "pidsLimit": 128 },
+  "profiles": {
+    "default": {},
+    "dev": { "hardwareLimits": { "cpus": "1" } }
+  }
+}
+```
+
+Only `memory`, `cpus` and `pidsLimit` are accepted, each with the same rules as
+before; any other key is refused, and GPU shares stay administrator-only in
+Settings → Hardware limits. The manifest root is one layer and the resolved
+profile is another. The selected profile overrides the default profile key by
+key and inherits the keys it leaves out. Precedence is unchanged: built-in
+defaults, the manifest, the LLM catalog, the profile, and finally the
+administrator's stored limits, which override every declaration.
+
+Declaring `memory`, `cpus` or `pidsLimit` under
+`llmRuntime.runtimePolicy.resources` still works but is deprecated: each
+command or Router start prints one warning per agent naming the deprecated
+paths and `hardwareLimits`, and the administrator read reports a
+`deprecatedDeclaration` note. A key declared in both places of the same manifest
+root or profile with different values refuses that agent with a fix; equal
+values are accepted. Moving a declaration to `hardwareLimits` gives the same
+limits hash and arguments, so it does not restart a running agent. The other
+`llmRuntime.runtimePolicy` settings (`shmSize`, `ulimits`, `devices`, `ipc` and
+the rest) are not deprecated.
+
 ### GPU share limits
 
 GPU shares use NVIDIA MPS and are best-effort, not a security boundary.
