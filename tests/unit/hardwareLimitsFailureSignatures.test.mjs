@@ -65,3 +65,16 @@ test('HS.typed assertion diagnostics cannot collide with lookalike object values
     const two = Object.assign(new Error('custom'), { actual: { undefined: true }, expected: 1 });
     assert.notEqual(summarizeFailure(one).signature, summarizeFailure(two).signature);
 });
+
+
+test('only verified mkdtemp components under the exact run TMPDIR lose random suffixes', () => {
+    const locations = { tmpdir: '/owned/tmp' };
+    const proof = (message) => summarizeFailure(new Error(message), locations).signature;
+    for (const prefix of ['ploinky-relay-', 'ploinky-directory-permissions-']) {
+        assert.equal(proof('/owned/tmp/' + prefix + 'aB12cD/child'), proof('/owned/tmp/' + prefix + 'Z98xyQ/child'));
+        assert.notEqual(proof('/owned/tmp/' + prefix + 'aB12cD/child'), proof('/owned/tmp/' + prefix + 'Z98xyQ/other'));
+        assert.notEqual(proof('/outside/' + prefix + 'aB12cD/child'), proof('/outside/' + prefix + 'Z98xyQ/child'));
+    }
+    assert.notEqual(proof('/owned/tmp/unrecognized-aB12cD/child'), proof('/owned/tmp/unrecognized-Z98xyQ/child'));
+    assert.notEqual(proof('509 !== 1533 /owned/tmp/ploinky-relay-aB12cD/child'), proof('500 !== 1533 /owned/tmp/ploinky-relay-Z98xyQ/child'));
+});

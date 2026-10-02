@@ -27,8 +27,11 @@ function relativeFile(file, root) {
 }
 
 // Only exact run-owned source/HOME/TMPDIR prefixes are normalized. Relative
-// filenames, fixture names, numeric values and diagnostic wording remain part
-// of the proof. Stack traces are omitted because source line/column locations
+// filenames, numeric values and diagnostic wording remain part of the proof.
+// Two verified mkdtemp prefixes have a generated six-character suffix:
+// RuntimeRelayManager creates ploinky-relay-* and the directory-permission
+// fixture creates ploinky-directory-permissions-*. Only those suffixes beneath
+// the exact run TMPDIR are normalized; their child paths remain significant. Stack traces are omitted because source line/column locations
 // change independently of the failure cause. No other message text is erased.
 function normalizeDiagnosticText(value, { root, home, tmpdir } = {}) {
     let text = String(value);
@@ -39,7 +42,7 @@ function normalizeDiagnosticText(value, { root, home, tmpdir } = {}) {
     for (const [prefix, label] of prefixes) {
         text = text === prefix ? label : text.split(`${prefix}/`).join(`${label}/`);
     }
-    return text;
+    return text.replace(/<TMP>\/(ploinky-relay-|ploinky-directory-permissions-)[A-Za-z0-9]{6}(?=\/|$)/g, '<TMP>/$1<UNIQUE>');
 }
 
 export function summarizeFailure(error, locations = {}) {
