@@ -399,7 +399,7 @@ function buildMarketplaceAgents(user = null, options = {}) {
     const enabledByRef = new Map(enabledAgents.map(record => [`${record.repoName}/${record.agentName}`, record]));
     const runtimeEntries = Object.hasOwn(options, 'runtimeEntries')
         ? (options.runtimeEntries || [])
-        : collectAgentRuntimeStates({ registry: agentsRegistry });
+        : collectAgentRuntimeStates({ registry: agentsRegistry, ...(Object.hasOwn(options, 'liveContainers') ? { liveContainers: options.liveContainers } : {}) });
     const noWaitStates = Object.hasOwn(options, 'noWaitStates')
         ? (options.noWaitStates || new Map())
         : collectMarketplaceNoWaitStates(agentsRegistry);
@@ -550,6 +550,9 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
             }
         },
     }),
+    // The agent listing's runtime observation; a test supplies its own live
+    // containers instead of querying the container engine.
+    agentListOptions = {},
 } = {}) {
     const route = parseMarketplacePath(parsedUrl.pathname || '/');
     if (!route) return false;
@@ -588,7 +591,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
         return authResult.ok;
     };
     const agentsMarketplace = () => ({
-        ...buildMarketplaceAgents(req.user),
+        ...buildMarketplaceAgents(req.user, agentListOptions),
         permissions: {
             canManage: isAdminUser(req.user)
                 && Boolean(publicMarketplaceAuthContext(routePlan) || canonicalControlOrigin(req)),

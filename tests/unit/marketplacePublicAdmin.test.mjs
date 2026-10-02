@@ -40,7 +40,8 @@ async function request({ resource = 'agents', who = admin, routePlan = plan(), o
     }
     if (mutate) mutate(req);
     const res = { status: 200, setHeader() {}, writeHead(code) { this.status = code; }, end(body) { this.body = JSON.parse(body); } };
-    await handleMarketplaceRoutes(req, res, new URL('https://explorer.example.test/api/marketplace' + (resource ? `/${resource}` : '')), { routePlan, enableAgentAction: async () => { enabled++; return { result: { status: 'enabled' } }; } });
+    // No container engine in a unit test: the listing observes no live containers.
+    await handleMarketplaceRoutes(req, res, new URL('https://explorer.example.test/api/marketplace' + (resource ? `/${resource}` : '')), { routePlan, enableAgentAction: async () => { enabled++; return { result: { status: 'enabled' } }; }, agentListOptions: { liveContainers: [] } });
     return res;
 }
 test.after(() => { authService.isConfigured = originalConfigured; authService.validateSession = originalValidate; process.chdir(previousCwd); if (previousKey === undefined) delete process.env.PLOINKY_MASTER_KEY; else process.env.PLOINKY_MASTER_KEY = previousKey; fs.rmSync(workspace, { recursive: true, force: true }); });
