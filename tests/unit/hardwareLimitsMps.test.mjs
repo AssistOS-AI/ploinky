@@ -216,3 +216,122 @@ test('MP.stop-refuses-foreign-unknown-or-changed-daemon', () => {
     createMpsDaemonBackend({ fsApi, uid: 1000, observe: () => ({ state: 'gone' }), query: (_b, _a, options) => { sent.push(options.input); return { status: 0 }; } }).stop(state);
     assert.deepEqual(sent, []);
 });
+
+// Plan §11.3 crash recovery: an interruption after generation cleanup removed
+// the directories, but before the journal dropped their paths, recovers.
+function cleanupBoundaryFixture(t, procEntries = {}) {
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-mps-boundary-')));
+    t.after(() => fs.rmSync(scratch, { recursive: true, force: true }));
+    const fsApi = new Proxy(fs, { get(target, property) {
+        if (['lstatSync', 'fstatSync', 'statSync'].includes(property)) return (file, ...args) => {
+            const entry = typeof file === 'string' && Object.entries(procEntries).find(([prefix]) => file === `/proc/${prefix}/exe`);
+            if (entry) return { dev: 1, ino: 2, isFile: () => true };
+            const value = target[property](file, ...args); value.uid = 1000; return value;
+        };
+        if (property === 'readdirSync') return (directory, ...args) => directory === '/proc' ? Object.keys(procEntries) : target.readdirSync(directory, ...args);
+        if (property === 'readFileSync') return (file, ...args) => {
+            const match = typeof file === 'string' && /^\/proc\/(\d+)\/(environ|stat)$/.exec(file);
+            if (match && procEntries[match[1]]) return match[2] === 'environ' ? Buffer.from(procEntries[match[1]]) : `${match[1]} (mps) S ${Array(18).fill('0').join(' ')} 1`;
+            return target.readFileSync(file, ...args);
+        };
+        return target[property];
+    } });
+    const share = { smPercent: 25, memoryMiB: 1024, deviceUuid: gpuUuid, driverVersion: '595.91.07', wiringFingerprint: 'f'.repeat(64) };
+    const generation = () => {
+        const root = fs.mkdtempSync(path.join(scratch, 'root-')); fs.chmodSync(root, 0o700);
+        const suffix = crypto.randomBytes(16).toString('hex');
+        const pipeDirectory = path.join(root, `pipe-${suffix}`), logDirectory = path.join(root, `log-${suffix}`);
+        for (const directory of [pipeDirectory, logDirectory]) { fs.mkdirSync(directory, { mode: 0o700 }); fs.chmodSync(directory, 0o700); }
+        fs.writeFileSync(path.join(logDirectory, 'control.log'), 'owned');
+        const id = (target) => { const stat = fs.lstatSync(target); return { dev: stat.dev, ino: stat.ino }; };
+        const state = { schema: 1, status: 'transitioning', daemon: null, daemonGeneration: null, configurationGeneration: null, pipeDirectory, logDirectory,
+            pipeIdentity: id(pipeDirectory), logIdentity: id(logDirectory), tools: { control: { dev: 1, ino: 2 }, server: { dev: 1, ino: 3 } }, serverDefault: share,
+            oldClients: [], pendingClients: [], drainedClients: [], lastProblem: null };
+        return { root, state, backend: createMpsDaemonBackend({ root, fsApi, uid: 1000 }) };
+    };
+    return { generation, share, fsApi };
+}
+
+test('MP.cleanup-journal-boundary-transition', async (t) => {
+    const { runMpsTransition } = await import('../../cli/sandbox/hardwareLimits/mpsTransition.mjs');
+    const { generation, share, fsApi } = cleanupBoundaryFixture(t);
+    const { root, state, backend } = generation();
+    assert.equal(backend.observe(state).state, 'gone');
+    backend.cleanup(state);
+    assert.equal(fs.existsSync(state.pipeDirectory) || fs.existsSync(state.logDirectory), false);
+    // A3: the journaled paths no longer exist and no owned daemon is running.
+    assert.equal(backend.observe(state).state, 'gone');
+    // A5: repeating the exact cleanup is idempotent.
+    assert.doesNotThrow(() => cleanupMpsGeneration(state, { root, fsApi, uid: 1000 }));
+    // A4: the next transition proceeds from the journal instead of wedging.
+    let journal = structuredClone(state);
+    const store = { read: () => journal, write: (value) => { journal = structuredClone(value); } };
+    const client = { key: 'k', ref: 'repo/gpu', alias: '', instanceId: 'i', enableGeneration: 'g', containerId: null, share };
+    const started = { ...state, daemon: { pid: 9, startTime: '1' }, daemonGeneration: 'd1', configurationGeneration: 'c1', pipeDirectory: null, logDirectory: null, status: 'ready' };
+    const fake = { ...backend, start: (_defaults, { onState }) => { onState(started); return started; }, verify: () => true };
+    const result = runMpsTransition({ oldClients: [], desiredClients: [client], configuredPolicies: [{ share }], selectedKeys: ['k'], capability: {}, origin: 'cli' },
+        { assertCapability: () => {}, store, backend: fake, drain: () => {}, recreate: () => ({ key: 'k', state: 'applied' }) });
+    assert.equal(result.state.status, 'ready');
+    // A crash after cleanup but before its journal write: the intent written
+    // first already dropped the daemon, so a retry observes 'gone' and finishes.
+    const second = generation();
+    journal = { ...structuredClone(second.state), status: 'ready', daemon: null, daemonGeneration: 'd0', configurationGeneration: 'c0' };
+    const crashing = { ...second.backend, cleanup: (value) => { second.backend.cleanup(value); throw new Error('process died after cleanup'); }, start: fake.start, verify: () => true };
+    assert.throws(() => runMpsTransition({ oldClients: [], desiredClients: [client], configuredPolicies: [{ share }], selectedKeys: ['k'], capability: {}, origin: 'cli' },
+        { assertCapability: () => {}, store, backend: crashing, drain: () => {}, recreate: () => ({ key: 'k', state: 'applied' }) }), /process died/);
+    assert.equal(journal.daemon, null);
+    assert.equal(journal.pipeDirectory, second.state.pipeDirectory, 'the journal still names the removed generation');
+    assert.equal(second.backend.observe(journal).state, 'gone');
+    const retried = runMpsTransition({ oldClients: [], desiredClients: [client], configuredPolicies: [{ share }], selectedKeys: ['k'], capability: {}, origin: 'cli' },
+        { assertCapability: () => {}, store, backend: { ...second.backend, start: fake.start, verify: () => true }, drain: () => {}, recreate: () => ({ key: 'k', state: 'applied' }) });
+    assert.equal(retried.state.status, 'ready');
+});
+
+test('MP.cleanup-journal-boundary-finalize', async (t) => {
+    const { finalizeMpsGraph } = await import('../../cli/sandbox/hardwareLimits/mpsLifecycle.mjs');
+    const { generation } = cleanupBoundaryFixture(t);
+    const context = (revision) => () => ({ gate: 'on', overrides: new Map(), storeToken: { epoch: '0'.repeat(32), revision } });
+    // B1/B2: a policy change after cleanup cannot strand the removed paths.
+    {
+        const { state, backend } = generation();
+        let journal = { ...structuredClone(state), graphPrepared: true, graphNeedsTransition: true };
+        const store = { read: () => journal, write: (value) => { journal = structuredClone(value); } };
+        let calls = 0;
+        const policyCheck = () => { calls += 1; if (calls >= 3) throw Object.assign(new Error('The hardware policy changed during reconciliation'), { code: 'revision_conflict' }); };
+        await finalizeMpsGraph({ networkLifecycleCapability: {} }, { readContext: context(1), store, backend, assertCapability: () => {}, policyCheck });
+        assert.equal(journal.pipeDirectory, null);
+        assert.equal(journal.status, 'inactive');
+        assert.equal(fs.existsSync(state.pipeDirectory), false);
+    }
+    // B3/B4: an interruption after cleanup recovers on the next finalize.
+    {
+        const { state, backend } = generation();
+        let journal = { ...structuredClone(state), graphPrepared: true, graphNeedsTransition: true };
+        const store = { read: () => journal, write: (value) => { journal = structuredClone(value); } };
+        const crashing = { ...backend, cleanup: (value) => { backend.cleanup(value); throw new Error('process died after cleanup'); } };
+        await assert.rejects(finalizeMpsGraph({ networkLifecycleCapability: {} }, { readContext: context(1), store, backend: crashing, assertCapability: () => {}, policyCheck: () => {} }), /process died/);
+        assert.ok(journal.pipeDirectory);
+        assert.equal(backend.observe(journal).state, 'gone');
+        await finalizeMpsGraph({ networkLifecycleCapability: {} }, { readContext: context(2), store, backend, assertCapability: () => {}, policyCheck: () => {} });
+        assert.equal(journal.pipeDirectory, null);
+        assert.equal(journal.status, 'inactive');
+    }
+});
+
+test('MP.missing-generation-directories-need-the-proc-scan', (t) => {
+    // A live control process still bound to the removed pipe directory keeps
+    // the generation unknown; missing directories alone never prove 'gone'.
+    const entries = {};
+    const { generation } = cleanupBoundaryFixture(t, entries);
+    const { state, backend } = generation();
+    fs.rmSync(state.pipeDirectory, { recursive: true }); fs.rmSync(state.logDirectory, { recursive: true });
+    assert.equal(backend.observe(state).state, 'gone');
+    entries['4242'] = `CUDA_MPS_PIPE_DIRECTORY=${state.pipeDirectory}\0`;
+    assert.equal(backend.observe(state).state, 'unknown');
+    delete entries['4242'];
+    // A path outside the exact private generation stays unknown.
+    assert.equal(backend.observe({ ...state, pipeDirectory: '/elsewhere/pipe-' + '1'.repeat(32) }).state, 'unknown');
+    // A pipe directory that still exists but is unsafe stays unknown.
+    fs.mkdirSync(state.pipeDirectory, { mode: 0o755 }); fs.chmodSync(state.pipeDirectory, 0o755);
+    assert.equal(backend.observe(state).state, 'unknown');
+});

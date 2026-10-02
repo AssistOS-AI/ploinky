@@ -269,11 +269,34 @@ export function createMpsDaemonBackend({ root = MPS_ROOT, fsApi = fs, query = sp
         if (path.dirname(state.pipeDirectory || '') !== root || !/^pipe-[a-f0-9]{32}$/.test(path.basename(state.pipeDirectory || '')) || path.dirname(state.logDirectory || '') !== root || !/^log-[a-f0-9]{32}$/.test(path.basename(state.logDirectory || ''))) throw new MpsError('MPS paths are outside the exact private generation');
         for (const target of [root, state.pipeDirectory, state.logDirectory]) privateDirectory(target, { fsApi, uid });
     };
+    // The exact private generation paths, the pipe directory absent and the
+    // log directory absent or still private: what an interrupted cleanup leaves.
+    const generationDirectoriesRemoved = (state) => {
+        if (path.dirname(state?.pipeDirectory || '') !== root || !/^pipe-[a-f0-9]{32}$/.test(path.basename(state?.pipeDirectory || ''))
+            || path.dirname(state?.logDirectory || '') !== root || !/^log-[a-f0-9]{32}$/.test(path.basename(state?.logDirectory || ''))) return false;
+        const absent = (target) => { try { fsApi.lstatSync(target); return false; } catch (error) { if (error.code === 'ENOENT') return true; throw error; } };
+        try {
+            privateDirectory(root, { fsApi, uid });
+            if (!absent(state.pipeDirectory)) return false;
+            if (!absent(state.logDirectory)) privateDirectory(state.logDirectory, { fsApi, uid });
+            return true;
+        } catch (_) { return false; }
+    };
     const control = (state, command, { deadline = Infinity } = {}) => { assertUid(uid); if (now() >= deadline) throw new MpsError('MPS operation exceeded its deadline'); checkDirectories(state); if (observe(state, { fsApi, uid }).state !== 'owned') throw new MpsError('The exact MPS daemon is not live and owned'); return runMpsControl(command, { env: envFor(state), query, uid, timeoutMs: Math.max(1, Math.min(5000, deadline - now())) }); };
     return {
         discover: (tools) => discoverOwnedMpsDaemon({ root, tools, fsApi, uid }),
         cleanup: (state) => cleanupMpsGeneration(state, { root, fsApi, uid }),
-        observe: (state) => { try { checkDirectories(state); } catch (_) { return { state: 'unknown' }; } return state?.daemon ? observe(state, { fsApi, uid }) : recoverMpsDaemonIdentity(state, { fsApi, uid }); },
+        observe: (state) => {
+            try { checkDirectories(state); } catch (_) {
+                // Cleanup may have removed this exact generation before the
+                // journal dropped its paths. Missing generation directories
+                // are gone only after the /proc scan proves no owned daemon.
+                if (!generationDirectoriesRemoved(state)) return { state: 'unknown' };
+                const scan = state?.daemon ? observe(state, { fsApi, uid }) : recoverMpsDaemonIdentity(state, { fsApi, uid });
+                return scan.state === 'gone' ? { state: 'gone' } : { state: 'unknown' };
+            }
+            return state?.daemon ? observe(state, { fsApi, uid }) : recoverMpsDaemonIdentity(state, { fsApi, uid });
+        },
         control,
         start(defaults, { tools, configurationGeneration = crypto.randomUUID(), onState = () => {} } = {}) {
             assertUid(uid); validateMpsDefault(defaults); revalidateMpsTools(tools, { fsApi, mounted: true });

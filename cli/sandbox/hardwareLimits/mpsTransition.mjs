@@ -100,8 +100,11 @@ function* transitionSteps(input, { assertCapability, store, backend, drain, recr
         }
         if (plan.stopDaemon) { check(); backend.stop(state); state.daemon = null; state.daemonGeneration = null; state.configurationGeneration = null; save(); }
         if (plan.stopDaemon || observation.state === 'gone') {
+            // Journal the terminated generation before its directories are
+            // removed, so an interruption after cleanup recovers from 'gone'.
+            state.daemon = null; state.daemonGeneration = null; state.configurationGeneration = null; save();
             if (backend.cleanup && state.pipeDirectory) { check(); backend.cleanup(state); }
-            state.daemon = null; state.daemonGeneration = null; state.configurationGeneration = null; state.pipeDirectory = null; state.logDirectory = null; save();
+            state.pipeDirectory = null; state.logDirectory = null; save();
         }
         if (plan.startDaemon) {
             check();

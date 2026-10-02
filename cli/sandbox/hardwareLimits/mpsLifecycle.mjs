@@ -304,7 +304,7 @@ export async function finalizeMpsGraph({ networkLifecycleCapability } = {}, {
     if (state.daemon && observed.state === 'owned') { check(); backend.stop(state); }
     state = { ...state, daemon: null, daemonGeneration: null, configurationGeneration: null }; store.write(state);
     if (state.pipeDirectory) { check(); backend.cleanup(state); }
-    check();
+    // No policy check between the completed cleanup and its journal write.
     store.write({ ...state, status: 'inactive', serverDefault: null, pipeDirectory: null, logDirectory: null,
         oldClients: [], drainedClients: [], pendingClients: [], desiredClients: [], graphPrepared: false,
         graphNeedsTransition: false, replacedKeys: [], lastProblem: null });
