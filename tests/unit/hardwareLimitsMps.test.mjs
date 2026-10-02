@@ -197,3 +197,22 @@ test('MPS cleanup removes only terminated owned generations and rejects substitu
     fs.unlinkSync(path.join(pipeDirectory, 'substituted')); fs.writeFileSync(path.join(logDirectory, 'control.log'), 'owned');
     cleanupMpsGeneration(state, { root, fsApi, uid: 1000 }); assert.equal(fs.existsSync(pipeDirectory), false); assert.equal(fs.existsSync(logDirectory), false); assert.equal(fs.existsSync(foreign), true);
 });
+
+test('MP.stop-refuses-foreign-unknown-or-changed-daemon', () => {
+    const state = { daemon: { pid: 12, startTime: '123' }, pipeDirectory: `/run/ploinky/mps/pipe-${'1'.repeat(32)}`, logDirectory: `/run/ploinky/mps/log-${'1'.repeat(32)}` };
+    const fsApi = { realpathSync: (value) => value, lstatSync: () => ({ uid: 1000, mode: 0o40700, isSymbolicLink: () => false, isDirectory: () => true }), readFileSync: () => { throw Object.assign(new Error('gone'), { code: 'ENOENT' }); } };
+    for (const sequence of [['foreign'], ['unknown'], ['owned', 'foreign'], ['owned', 'unknown'], ['owned', 'gone']]) {
+        const sent = [];
+        let index = 0;
+        const backend = createMpsDaemonBackend({ fsApi, uid: 1000, now: () => 0, wait: () => {},
+            observe: () => ({ state: sequence[Math.min(index++, sequence.length - 1)] }),
+            query: (_binary, _args, options) => { sent.push(options.input); return { status: 0 }; } });
+        // A daemon that is not (or no longer) the exact owned one is never sent quit.
+        assert.throws(() => backend.stop(state), /foreign or unknown|not live and owned/, sequence.join('>'));
+        assert.deepEqual(sent, [], `${sequence.join('>')}: no control command reached a non-owned daemon`);
+    }
+    // A daemon proven gone needs no quit at all.
+    const sent = [];
+    createMpsDaemonBackend({ fsApi, uid: 1000, observe: () => ({ state: 'gone' }), query: (_b, _a, options) => { sent.push(options.input); return { status: 0 }; } }).stop(state);
+    assert.deepEqual(sent, []);
+});
