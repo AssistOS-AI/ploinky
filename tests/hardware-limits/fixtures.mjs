@@ -449,6 +449,7 @@ export function buildRequiredCaseManifest() {
             'EV1.each-action-names-the-proof-its-pass-needs',
             'EV2.a-later-actions-changed-artifact-never-replaces-the-retained-one-and-both-validate-after-staging-removal',
             'EV2.retained-versions-are-bounded-private-and-never-rewritten',
+            'R2D.the-stager-certifies-a-cleanup-only-with-a-proof-written-by-that-cleanup-for-this-run',
         ]),
         ...leaves(P, 'p1', unit('hardwareLimitsDeclaration.test.mjs'), [
             'HD.identity-hash-args-equal', 'HD.identity-migration-no-restart-graph', 'HD.identity-llm-reuse-callers',
@@ -743,6 +744,8 @@ export function buildRequiredCaseManifest() {
             'LLM3.stage-two-binds-the-hosts-tuple-and-the-qualifying-evidence-to-the-stage-one-pin',
             'LLM3.every-tuple-field-the-stage-one-pin-carries-is-bound-to-what-the-host-reports',
             'R2C.stage-two-blocks-on-the-real-flattened-refusal-and-on-the-old-detailed-one-and-fails-on-an-unrelated-error',
+            'R2D.a-standalone-cleanup-writes-its-own-llm-cleanup-proof-and-the-live-runs-proof-is-not-accepted-for-it',
+            'R2D.a-proof-another-action-or-run-left-or-one-that-lists-remaining-data-does-not-certify-a-cleanup',
             // The runner-environment check against local-llm's own launch environment.
             'R2B.secret-names-match-whole-underscore-words-and-the-products-own-emitted-names-are-allowed',
             'R2A.the-products-own-cuda-cache-variable-is-allowed-and-any-other-cuda-name-fails',

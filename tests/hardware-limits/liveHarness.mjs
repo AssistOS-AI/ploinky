@@ -21,7 +21,7 @@ import {
 } from './liveCaseCommands.mjs';
 import { createGpuCases } from './liveGpuCases.mjs';
 import { validateGpuProfile } from './liveGpuCommands.mjs';
-import { createLlmCases } from './liveLlmCases.mjs';
+import { createLlmCases, llmCleanupProof } from './liveLlmCases.mjs';
 import { validateLlmProfile } from './liveLlmCommands.mjs';
 import { gpuCleanupProof, isGpuProcessRecord, isToleratedRecord } from './liveGpuGate.mjs';
 
@@ -593,6 +593,13 @@ export async function executeCleanupRun({ run, persist = () => {}, processProvid
         // as in the live run; the registered processes are the manifest's own records, so a
         // resumed run proves the same thing. Without it the cleanup stays failed and retryable.
         if (profile.gpu) await gpuCleanupProof({ run, profile, processProvider, signal: scope, hostProc, artifacts });
+        // An LLM block likewise: this action proves its model data is gone and writes the proof the stager demands of a
+        // cleanup (the live run's own proof belongs to that action and is never accepted for this one).
+        if (profile.llm) {
+            const workspacePath = profile.workspace?.path || run.operations.find(op => op.kind === 'workspace-create')?.path || profile.provision?.workspace?.path;
+            if (!workspacePath) throw new Error('The cleanup cannot prove the model data gone: no workspace path is recorded');
+            llmCleanupProof({ workspace: workspacePath, runId: run.runId, action: 'cleanup', write: artifacts });
+        }
         run.cleanup.state = 'complete'; run.state = 'complete';
     } catch (error) { run.cleanup.state = 'failed'; run.cleanup.failures.push(error.message); }
     finally { clearTimeout(timer); }

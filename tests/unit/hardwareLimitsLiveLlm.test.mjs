@@ -18,7 +18,7 @@ import { writePrivateJson } from '../hardware-limits/fixtures.mjs';
 import { createLiveAdapter, executeCleanupRun, executeLiveRun, liveSourceDigest, validateProfile } from '../hardware-limits/liveHarness.mjs';
 import { provisionRun } from '../hardware-limits/liveFixture.mjs';
 import { buildConcreteManifest, llmPlan, renderSummary, summaryPathFor } from '../hardware-limits/liveManifest.mjs';
-import { writeUstar } from '../hardware-limits/liveStage.mjs';
+import { llmCleanupProofProblem, writeUstar } from '../hardware-limits/liveStage.mjs';
 import { engineIdentityDigest, hostRecordPaths } from '../hardware-limits/liveCommon.mjs';
 import { fakeEngineInfo, worldState } from '../hardware-limits/fakeLiveEngine.mjs';
 import { createLlmWorld } from '../hardware-limits/fakeLiveLlm.mjs';
@@ -31,6 +31,7 @@ import {
 import { resolveMemoryPercent } from '../../cli/sandbox/hardwareLimits/resolve.mjs';
 
 const REPO = fs.realpathSync(fileURLToPath(new URL('../..', import.meta.url)));
+const clone = value => structuredClone(value);
 const hex = value => crypto.createHash('sha256').update(value).digest('hex');
 const hash = value => `sha256:${hex(value)}`;
 const MIB = 1048576; const GIB = 1024 * MIB;
@@ -1370,4 +1371,37 @@ test('R2C.stage-two-blocks-on-the-real-flattened-refusal-and-on-the-old-detailed
         assert.equal(l3.result, 'fail', `${label}: ${JSON.stringify(l3).slice(0, 400)}`); assert.match(l3.reason, pattern, label);
         nothingOwned(w);
     }
+});
+
+// --- R2D: a standalone cleanup produces the proof a cleanup is certified by --------------------------------------
+test('R2D.a-standalone-cleanup-writes-its-own-llm-cleanup-proof-and-the-live-runs-proof-is-not-accepted-for-it', async t => {
+    // Provision, then a standalone cleanup: the proof exists, is this action's own, and nothing remains.
+    const provisionedOnly = await provisioned(t);
+    const report = await provisionedOnly.cleanup();
+    assert.equal(report.verdict, 'PASS', JSON.stringify(report.limitations));
+    const proof = provisionedOnly.artifacts.get('llm-cleanup-proof');
+    assert.deepEqual([proof.schema, proof.runId, proof.action, proof.remaining], [1, provisionedOnly.runId, 'cleanup', []]);
+    assert.ok(Number.isSafeInteger(proof.at) && proof.at > 0);
+    assert.equal(llmCleanupProofProblem(Buffer.from(JSON.stringify(proof)), { runId: provisionedOnly.runId }), null);
+    nothingOwned(provisionedOnly);
+    // After a live run the run's own cleanup wrote a proof for the live action; the standalone cleanup that follows writes its own.
+    const w = await provisioned(t);
+    const live = await liveCases(w, ['LIVE-L1']);
+    assert.equal(caseOf(live, 'LIVE-L1').result, 'pass');
+    const livesProof = clone(w.artifacts.get('llm-cleanup-proof'));
+    assert.equal(livesProof.action, 'live');
+    assert.match(llmCleanupProofProblem(Buffer.from(JSON.stringify(livesProof)), { runId: w.runId }), /written by the live action, not by this cleanup/);
+});
+
+test('R2D.a-proof-another-action-or-run-left-or-one-that-lists-remaining-data-does-not-certify-a-cleanup', () => {
+    const good = { schema: 1, runId: 'r'.repeat(32), action: 'cleanup', at: 5, remaining: [] };
+    const problem = (change, runId = 'r'.repeat(32)) => llmCleanupProofProblem(Buffer.from(JSON.stringify({ ...good, ...change })), { runId });
+    assert.equal(problem({}), null);
+    assert.match(problem({ action: 'live' }), /written by the live action, not by this cleanup/);
+    assert.match(problem({}, 'x'.repeat(32)), /belongs to another run/);
+    assert.match(problem({ remaining: ['/ws'] }), /lists model data that remains/);
+    assert.match(problem({ remaining: undefined }), /lists model data that remains/);
+    assert.match(problem({ at: 0 }), /has no time/);
+    assert.match(problem({ schema: 2 }), /unknown shape/);
+    assert.match(llmCleanupProofProblem(Buffer.from('not json'), { runId: 'r' }), /is not JSON/);
 });

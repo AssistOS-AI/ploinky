@@ -1339,6 +1339,21 @@ test('EV2.retained-versions-are-bounded-private-and-never-rewritten', t => {
     assert.equal(fs.readFileSync(files[2], 'utf8'), 'tampered\n');
 });
 
+// R2D: the LLM proof a cleanup is certified by must be that cleanup's own.
+test('R2D.the-stager-certifies-a-cleanup-only-with-a-proof-written-by-that-cleanup-for-this-run', async t => {
+    const w = await provisionedStage(t);
+    const proof = change => JSON.stringify({ schema: 1, runId: w.runId, action: 'cleanup', at: Date.now(), remaining: [], ...change }) + '\n';
+    for (const [label, change, pattern] of [['a proof the live action left', { action: 'live' }, /written by the live action, not by this cleanup/], ['another run\'s proof', { runId: 'f'.repeat(32) }, /belongs to another run/], ['a proof that lists data', { remaining: ['/ws/.data'] }, /lists model data that remains/]]) {
+        remoteArtifact(w, 'llm-cleanup-proof', proof(change));
+        const report = await dispatchCleanup(w, { requiredFor: () => ['llm-cleanup-proof'] });
+        assert.equal(report.verdict, 'BLOCKED', `${label}: ${JSON.stringify(report.limitations)}`); assert.match(report.limitations.join(' '), pattern, label);
+        assert.equal(report.staging.removed, false, label); assert.equal(exists(w.remoteRoot), true, label);
+    }
+    remoteArtifact(w, 'llm-cleanup-proof', proof({}));
+    const certified = await dispatchCleanup(w, { requiredFor: () => ['llm-cleanup-proof'] });
+    assert.equal(certified.verdict, 'PASS', JSON.stringify(certified.limitations)); assert.equal(certified.staging.removed, true);
+});
+
 test('EV1.each-action-names-the-proof-its-pass-needs', () => {
     const gpuProfile = { gpu: { uuid: 'GPU-x' } }; const llmProfile = { gpu: { uuid: 'GPU-x' }, llm: {} };
     assert.deepEqual(requiredArtifacts({ profile: gpuProfile, action: 'cleanup', remoteReport: { verdict: 'PASS' } }), ['gpu-final-observation']);

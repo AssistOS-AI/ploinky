@@ -186,6 +186,19 @@ export function requiredArtifacts({ profile, action, remoteReport }) {
     return [];
 }
 
+// Why a fetched `llm-cleanup-proof` does not certify THIS cleanup, or null: it must be this run's, written by a cleanup
+// action (not by the live run), and list nothing remaining.
+export function llmCleanupProofProblem(bytes, { runId }) {
+    let proof;
+    try { proof = JSON.parse(Buffer.from(bytes).toString('utf8')); } catch { return 'the LLM cleanup proof is not JSON'; }
+    if (!proof || typeof proof !== 'object' || proof.schema !== 1) return 'the LLM cleanup proof has an unknown shape';
+    if (proof.runId !== runId) return 'the LLM cleanup proof belongs to another run';
+    if (proof.action !== 'cleanup') return `the LLM cleanup proof was written by the ${String(proof.action).slice(0, 20)} action, not by this cleanup`;
+    if (!Number.isSafeInteger(proof.at) || proof.at <= 0) return 'the LLM cleanup proof has no time';
+    if (!Array.isArray(proof.remaining) || proof.remaining.length) return 'the LLM cleanup proof lists model data that remains';
+    return null;
+}
+
 // What the run's artifacts mean for its verdict. A passing result with incomplete evidence is not certified
 // (BLOCKED, staging kept); a failed or blocked result keeps its verdict and reports the missing required
 // failure evidence with it.
@@ -318,6 +331,12 @@ export async function stageAndDispatch({ run, bytes, authorizationBytes, action,
         writePrivateBytes(path.join(runDirectory, `report_${action}_remote_${suffix}.json`), Buffer.from(reportText, 'utf8'));
         // The side artifacts, with digest proof, before anything can be removed.
         const artifacts = await fetchArtifacts({ required: requiredFor({ profile, action, remoteReport }) });
+        // A cleanup's LLM proof must be this action's own, for this run, with nothing remaining.
+        const proofEntry = action === 'cleanup' ? artifacts.fetched.find(entry => entry.name === 'llm-cleanup-proof') : null;
+        if (proofEntry) {
+            const problem = llmCleanupProofProblem(fs.readFileSync(path.join(runDirectory, proofEntry.file)), { runId: run.runId });
+            if (problem) { artifacts.failures.push({ name: 'llm-cleanup-proof', reason: problem }); artifacts.complete = false; }
+        }
         const result = judgeArtifacts(remoteReport, artifacts);
         let removed = false;
         if (action === 'cleanup' && remoteReport.verdict === 'PASS' && fetched.state === 'complete' && fetched.cleanup.state === 'complete' && artifacts.complete) {

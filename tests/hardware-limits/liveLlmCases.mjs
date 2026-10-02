@@ -39,6 +39,17 @@ export const LLM_DEFAULT_TIMINGS = Object.freeze({
 });
 
 
+// The proof that the owned model data is gone: the workspace, its `.data` and the run's quarantine no longer exist. It is
+// written by EVERY action that certifies a cleanup of an LLM block (the live run's own cleanup, and a standalone or resumed
+// `cleanup`), and carries the run, the action and the time, so the stager can refuse a proof another action left behind.
+export function llmCleanupProof({ workspace, runId, action, write, now = Date.now }) {
+    const gone = target => { try { fs.lstatSync(target); return false; } catch (error) { if (error.code === 'ENOENT') return true; throw error; } };
+    const remaining = [workspace, path.join(workspace, '.data'), path.join(path.dirname(workspace), `.hwl-removing-${runId}`)].filter(target => !gone(target));
+    write('llm-cleanup-proof', { schema: 1, runId, action, at: now(), remaining });
+    if (remaining.length) throw Object.assign(new Error(`The owned model data remains after cleanup: ${remaining.join(', ')}`), { code: 'LIVE_LLM_DATA_REMAINS' });
+    return remaining;
+}
+
 export function createLlmCases(ctx) {
     const { profile, run, command, engine, core, nested, safeArtifact } = ctx;
     const host = ctx.host || createHostProc();
@@ -643,9 +654,7 @@ export function createLlmCases(ctx) {
     // run's quarantine, as well as the GPU (nothing of ours may remain on it).
     async function afterCleanup() {
         const observation = await kit.afterCleanup();
-        const remaining = [workspace, dataRoot(), path.join(path.dirname(workspace), `.hwl-removing-${run.runId}`)].filter(target => { try { fs.lstatSync(target); return true; } catch (error) { if (error.code === 'ENOENT') return false; throw error; } });
-        safeArtifact('llm-cleanup-proof', { remaining });
-        if (remaining.length) throw Object.assign(new Error(`The owned model data remains after cleanup: ${remaining.join(', ')}`), { code: 'LIVE_LLM_DATA_REMAINS' });
+        llmCleanupProof({ workspace, runId: run.runId, action: 'live', write: (name, value) => { const problem = safeArtifact(name, value); if (problem) throw new Error(`The cleanup proof could not be written: ${problem}`); } });
         return observation;
     }
 
