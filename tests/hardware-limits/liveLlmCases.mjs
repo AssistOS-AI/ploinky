@@ -25,7 +25,7 @@ import { MIB, shareMemoryMiB } from './liveGpuCommands.mjs';
 import { LLM_SOURCE_DIRECTORY } from './liveLlmNames.mjs';
 import {
     GIB, INFERENCE_CADENCE, INSUFFICIENT_RAM, L1_MIN_RAM_BYTES, L1_PROMPT, LLM_BUDGET, LLM_FIXTURE, LLM_IMAGE_DIGESTS, LLM_LEAF_SAMPLE, LLM_MODELS, LLM_REF, LLM_RUNNER_PROCESSES, LLM_TOOL_CALL, VLLM_SHARE,
-    analyzeInference, insufficientMemoryPercent, llmToolWords, parseLeafSample, runnerEnvironmentProblems, sourceUnavailable, stageTwoFreeThreshold, summarizeGpuCheck, vllmToolWords,
+    INFERENCE_MIN_IN_FLIGHT, analyzeInference, insufficientMemoryPercent, llmToolWords, parseLeafSample, runnerEnvironmentProblems, sourceUnavailable, stageTwoFreeThreshold, summarizeGpuCheck, vllmToolWords,
 } from './liveLlmCommands.mjs';
 
 const needs = (condition, message) => { if (!condition) throw blocked(message); };
@@ -36,6 +36,9 @@ const ACTIVE = Object.freeze(['downloading', 'copying', 'verifying', 'starting',
 export const LLM_DEFAULT_TIMINGS = Object.freeze({
     pollMs: 3000, toolMs: 90000, promptMs: 290000, stopMs: 90000, readyMs: 180000, installPollMs: 15000, calibrateMs: 600000, prerequisiteMs: 120000,
     inferenceSampleMs: INFERENCE_CADENCE.sampleMs, inferenceGpuMs: INFERENCE_CADENCE.gpuMs,
+    // The sustained load of L1 (LLM1): requests follow each other until the in-flight minimums are met, but no new request starts
+    // after sustainedMs (about a minute) or after sustainedRequests requests. A model too fast to be measured inside that bound is BLOCKED.
+    sustainedMs: 75000, sustainedRequests: 40,
 });
 
 
@@ -254,33 +257,56 @@ export function createLlmCases(ctx) {
         };
         let answer = null; let failure = null;
         const startedAt = Date.now();
+        // Only a sample taken while a request is outstanding is in flight; the gaps between requests are labelled and never count.
+        let outstanding = false;
+        const load = { boundMs: timings.sustainedMs, maxRequests: timings.sustainedRequests, requests: 0, completionTokens: 0, invalidResponses: 0, stoppedBy: null };
+        const inFlight = list => list.filter(sample => sample.label === 'in-flight').length;
         try {
             // Before the request is sent: the first CPU/memory sample and the first GPU row.
             await sampleLeaf('before-send');
             sampleGpu('before-send', await gate.check(`${label}-inference-start`));
             answer = await gate.monitor(async abort => {
-                const own = new AbortController();
-                const signal = AbortSignal.any([abort, own.signal]);
-                let done = false;
-                const request = toolOk(`prompt-${label.toLowerCase()}`, 'local_llm_test_prompt', { ...L1_PROMPT }, { deadlineMs: timings.promptMs, mutating: true, abort: signal }).finally(() => { done = true; });
-                const settled = request.then(() => null, () => null);
-                try {
-                    while (!done) {
-                        await Promise.race([settled, sleep(timings.inferenceSampleMs)]);
-                        if (done) break;
-                        await sampleLeaf('in-flight');
-                    }
-                } catch (error) { own.abort(); await settled; throw error; }
-                return request;
-            }, { every: timings.inferenceGpuMs, onCheck: checked => sampleGpu('in-flight', checked) });
+                // One request, sampled while it is outstanding. Only the first is journaled; it is the evidence response.
+                const oneRequest = async first => {
+                    const own = new AbortController();
+                    const signal = AbortSignal.any([abort, own.signal]);
+                    let done = false;
+                    outstanding = true;
+                    const request = toolOk(first ? `prompt-${label.toLowerCase()}` : `prompt-${label.toLowerCase()}-more`, 'local_llm_test_prompt', { ...L1_PROMPT }, { deadlineMs: timings.promptMs, mutating: first, abort: signal }).finally(() => { done = true; outstanding = false; });
+                    const settled = request.then(() => null, () => null);
+                    try {
+                        while (!done) {
+                            await Promise.race([settled, sleep(timings.inferenceSampleMs)]);
+                            if (done) break;
+                            await sampleLeaf('in-flight');
+                        }
+                    } catch (error) { own.abort(); await settled; throw error; }
+                    return request;
+                };
+                // Sustained load: back-to-back requests until both minimums were met by samples taken while a request was
+                // outstanding, bounded in time and in count. The first valid response is the evidence; a later invalid one is a breach.
+                const sustainedUntil = Date.now() + timings.sustainedMs;
+                let kept = null;
+                for (;;) {
+                    load.requests += 1;
+                    const reply = await oneRequest(load.requests === 1);
+                    load.completionTokens += Number.isFinite(Number(reply.completionTokens)) ? Number(reply.completionTokens) : 0;
+                    if (kept === null) kept = reply; else if (typeof reply.text !== 'string' || !reply.text.trim()) load.invalidResponses += 1;
+                    if (inFlight(cgroup) >= INFERENCE_MIN_IN_FLIGHT.cgroup && inFlight(gpuSamples) >= INFERENCE_MIN_IN_FLIGHT.gpu) { load.stoppedBy = 'minimums-met'; break; }
+                    if (Date.now() >= sustainedUntil) { load.stoppedBy = 'time-bound'; break; }
+                    if (load.requests >= load.maxRequests) { load.stoppedBy = 'request-bound'; break; }
+                }
+                return kept;
+            }, { every: timings.inferenceGpuMs, onCheck: checked => sampleGpu(outstanding ? 'in-flight' : 'between-requests', checked) });
             await sampleLeaf('after-response');
             sampleGpu('after-response', await gate.check(`${label}-inference-end`));
         } catch (error) { failure = error; }
         const analysis = analyzeInference({ cgroup, gpu: gpuSamples, cpus: limits.cpus, memoryCapBytes, shareMiB });
         if (identityLost) analysis.violations.push(identityLost);
+        if (load.invalidResponses > 0) analysis.violations.push(`${load.invalidResponses} later response(s) of the sustained load carried no text`);
         const trimSamples = list => (list.length <= 120 ? list : [...list.slice(0, 60), ...list.slice(-60)]);
         evidence.put('inference', {
-            runner: runnerIdentities, windowMs: Date.now() - startedAt, ...analysis.summary, violations: analysis.violations, blockers: analysis.blockers,
+            runner: runnerIdentities, windowMs: Date.now() - startedAt, load, ...analysis.summary, violations: analysis.violations, blockers: analysis.blockers,
             cgroupSamples: trimSamples(cgroup), gpuSamples: trimSamples(gpuSamples), failure: failure ? String(failure.message ?? failure).slice(0, 300) : null,
         });
         if (failure) throw failure;

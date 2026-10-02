@@ -42,7 +42,7 @@ const UNRELATED = [{ id: 'e'.repeat(64), created: '2026-09-01T00:00:00Z', image:
 const GPU_UUID = 'GPU-905b8484-3b1e-30f6-defd-05d44f00f692';
 const free = async () => ({ tcp: true, udp: true });
 const exists = target => { try { fs.lstatSync(target); return true; } catch (error) { if (error.code === 'ENOENT') return false; throw error; } };
-const FAST = { sampleMs: 1, settleMs: 1, settleSamples: 2, monitorMs: 4, afterApplyMs: 0, serverWaitMs: 2000, controlMs: 20000, pollMs: 1, installPollMs: 1, readyMs: 2000, stopMs: 5000, promptMs: 5000, toolMs: 20000, calibrateMs: 20000, inferenceSampleMs: 1, inferenceGpuMs: 4 };
+const FAST = { sampleMs: 1, settleMs: 1, settleSamples: 2, monitorMs: 4, afterApplyMs: 0, serverWaitMs: 2000, controlMs: 20000, pollMs: 1, installPollMs: 1, readyMs: 2000, stopMs: 5000, promptMs: 5000, toolMs: 20000, calibrateMs: 20000, inferenceSampleMs: 1, inferenceGpuMs: 4, sustainedMs: 300, sustainedRequests: 40 };
 // The pins of the image's vLLM lock entry the operator observed (the real entry has 197 files and 3,879,736,753 bytes).
 const VLLM_PINS = Object.freeze({ version: '0.30.0', runnerLockDigest: hex('vllm lock entry'), files: 197, downloadBytes: 3879736753 });
 const SMALL_FILE = { repo: 'Qwen/Qwen2.5-0.5B-Instruct-GGUF', file: 'qwen2.5-0.5b-instruct-q4_k_m.gguf', commit: '9217f5db79a29953eb74d5343926648285ec7e67', size: 491400032, sha256: '74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db' };
@@ -1474,4 +1474,43 @@ test('R2E.the-playground-decision-states-the-route-and-session-deviation-and-the
     // What the decision states is what the tool program does.
     assert.match(LLM_TOOL_CALL, /createAgentClient\('http:\/\/127\.0\.0\.1:8080\/mcp'/); assert.match(LLM_TOOL_CALL, /id:'local:admin'/);
     assert.match(LLM_TOOL_CALL, /client\.callTool\(tool,args,\{agent:agents\[0\]\}\)/);
+});
+
+// --- R2F: a model too fast for one request to be measured is measured by a bounded sustained load -------------------
+test('R2F.a-fast-model-meets-the-in-flight-minimums-through-the-sustained-load-and-the-window-is-recorded', async t => {
+    // Each request is observed once by the CPU/RAM sampler and once by the GPU gate: below the minimums (3 and 2) alone.
+    const w = await provisioned(t, { faults: { generateReads: 1, generateGpuReads: 1 } });
+    const report = await liveCases(w, ['LIVE-L1']);
+    const l1 = caseOf(report, 'LIVE-L1');
+    assert.equal(l1.result, 'pass', JSON.stringify(l1).slice(0, 600));
+    const artifact = w.artifacts.get('gpu-live-l1');
+    const inference = artifact.inference;
+    assert.ok(inference.samples.inFlightCgroup >= INFERENCE_MIN_IN_FLIGHT.cgroup && inference.samples.inFlightGpu >= INFERENCE_MIN_IN_FLIGHT.gpu, JSON.stringify(inference.samples));
+    assert.ok(inference.load.requests >= 2 && inference.load.stoppedBy === 'minimums-met', JSON.stringify(inference.load));
+    assert.equal(inference.load.completionTokens, 3 * inference.load.requests, 'the tokens generated are recorded (3 per fake response)');
+    assert.equal(inference.load.boundMs, 300); assert.equal(inference.load.invalidResponses, 0); assert.ok(inference.windowMs > 0);
+    // The requests were real, back to back, and only samples taken while one was outstanding counted.
+    assert.equal(w.fake.llm.toolLog.filter(entry => entry.name === 'local_llm_test_prompt').length, inference.load.requests);
+    assert.equal(w.fake.llm.samples.filter(entry => entry.generating).length, inference.samples.inFlightCgroup, 'every in-flight CPU/RAM sample saw a generating model');
+    // One valid text response is the evidence; only the first request is journaled.
+    assert.equal(artifact.response.text, 'Pong.');
+    assert.equal(w.run.operations.filter(entry => entry.kind === 'llm-prompt-l1').length, 1, 'only the first request is journaled');
+    assert.deepEqual([inference.violations, inference.blockers], [[], []]);
+    nothingOwned(w);
+});
+
+test('R2F.a-model-too-fast-to-measure-is-blocked-at-the-time-bound-and-at-the-request-bound-never-passed', async t => {
+    // The model answers before any sampler runs, however many requests are sent.
+    const timed = await provisioned(t, { faults: { promptInstant: true } });
+    const byTime = caseOf(await liveCases(timed, ['LIVE-L1'], { timings: { sustainedMs: 100, sustainedRequests: 100000 } }), 'LIVE-L1');
+    assert.equal(byTime.result, 'blocked', JSON.stringify(byTime).slice(0, 500));
+    assert.match(byTime.reason, /Only 0 CPU\/RAM sample\(s\) were taken while the model generated/);
+    const load = timed.artifacts.get('gpu-live-l1').inference.load;
+    assert.ok(load.requests >= 2 && load.stoppedBy === 'time-bound', JSON.stringify(load));
+    nothingOwned(timed);
+    const counted = await provisioned(t, { faults: { promptInstant: true } });
+    const byCount = caseOf(await liveCases(counted, ['LIVE-L1'], { timings: { sustainedMs: 600000, sustainedRequests: 3 } }), 'LIVE-L1');
+    assert.equal(byCount.result, 'blocked', JSON.stringify(byCount).slice(0, 500));
+    assert.deepEqual([counted.artifacts.get('gpu-live-l1').inference.load.requests, counted.artifacts.get('gpu-live-l1').inference.load.stoppedBy], [3, 'request-bound']);
+    nothingOwned(counted);
 });
