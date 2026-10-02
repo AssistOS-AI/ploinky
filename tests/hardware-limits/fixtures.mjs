@@ -614,6 +614,11 @@ export function buildRequiredCaseManifest() {
             'W3.a-share-client-recreated-by-image-id-passes-with-the-id-as-its-image-name',
             'W3.a-recreated-share-client-with-another-image-id-or-a-foreign-image-name-fails',
             'F2.a-recreated-share-client-from-a-foreign-image-id-fails-even-when-its-name-is-the-digest-reference',
+            'V3.p1-expects-the-rounded-default-and-the-exact-client-share',
+            'V3.p1-fails-when-the-daemon-default-is-the-raw-share-instead-of-the-rounded-value',
+            'V3.p3-raising-the-share-changes-the-default-from-2-to-3-gib-and-drains-before-the-quit',
+            'V3.p4-the-reconciled-daemon-carries-the-rounded-default',
+            'V3.p2-still-passes-when-the-driver-truncates-a-client-value-to-a-whole-gib',
         ]),
         ...leaves(P, 'p4', unit('hardwareLimitsLiveProvision.test.mjs'), ['G1.prepare-live-apparatus-mps-concrete-manifest-and-summary']),
         ...leaves(P, 'p4', unit('hardwareLimitsMps.test.mjs'), [

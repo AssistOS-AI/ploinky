@@ -23,7 +23,7 @@ import { parseGpuInventory } from './liveGpu.mjs';
 import { createGpuGate, finalGpuObservation, gpuQueryArgv } from './liveGpuGate.mjs';
 import {
     ADMIN_REQUEST, GPU_AGENT_INSPECT, GPU_SHARES, MIB, MPS_CLIENT_PIPE, GPU_GRANT_FACTS, MPS_FAILURE_EVIDENCE, MPS_KILL_OWNED_DAEMON, MPS_OBSERVE, NESTED_NAME_LIST_FORMAT, PROBE_DEADLINE_MS,
-    MPS_CLIENT_USER, TIGHTER_CLIENT, assertMpsControlCommand, classifyMpsReply, controlHelperExecArgv, controlHelperRunArgv, parseProbeResult, probeBoundMiB, probeExecArgv, shareMemoryMiB,
+    MPS_CLIENT_USER, TIGHTER_CLIENT, assertMpsControlCommand, classifyMpsReply, controlHelperExecArgv, controlHelperRunArgv, parseProbeResult, probeBoundMiB, probeExecArgv, serverDefaultMiB, shareMemoryMiB,
 } from './liveGpuCommands.mjs';
 
 const REPOSITORY = 'hwlfixture';
@@ -473,10 +473,15 @@ export function createGpuCases(ctx) {
             const share = GPU_SHARES.first;
             const applied = await applyShares('p1', { [GPU_AGENT_REFS.probe]: share }, [GPU_AGENT_REFS.probe], evidence);
             const state = applied.state;
+            // The client keeps the exact share (memoryMiB); the daemon default is that share rounded up to a whole GiB (amendment A6).
             const memoryMiB = shareMemoryMiB(share.vramPercent, gpu.memoryMiB);
+            const defaultMiB = serverDefaultMiB(share.vramPercent, gpu.memoryMiB);
             evidence.put('applied', { gpu: state.gpu, container: agentEntry(state, GPU_AGENT_REFS.probe)?.containers });
-            expects(state.gpu.daemonStatus === 'ready' && state.gpu.serverDefault?.smPercent === share.smPercent && state.gpu.serverDefault?.vramMiB === memoryMiB,
-                `The daemon is not ready with the saved defaults ${share.smPercent}%/${memoryMiB}M (${JSON.stringify(state.gpu.serverDefault)}, ${state.gpu.daemonStatus})`);
+            evidence.put('expectedDefault', { shareMiB: memoryMiB, defaultMiB });
+            expects(state.gpu.daemonStatus === 'ready' && state.gpu.serverDefault?.smPercent === share.smPercent && state.gpu.serverDefault?.vramMiB === defaultMiB,
+                `The daemon is not ready with the saved defaults ${share.smPercent}%/${defaultMiB}M for a ${memoryMiB}M share (${JSON.stringify(state.gpu.serverDefault)}, ${state.gpu.daemonStatus})`);
+            expects(state.gpu.serverDefault?.shareMemoryMiB === memoryMiB,
+                `The status names ${state.gpu.serverDefault?.shareMemoryMiB} MiB as the share the default came from, not ${memoryMiB}`);
             expects(/^[0-9a-f-]{36}:[0-9a-f-]{36}$/.test(state.gpu.mpsGeneration || ''), 'The daemon reports no generation tuple');
             const container = agentEntry(state, GPU_AGENT_REFS.probe).containers[0];
             expects(container.limitsState === 'applied' && container.mpsGeneration === state.gpu.mpsGeneration, 'The probe instance is not applied at the daemon generation');
@@ -502,7 +507,7 @@ export function createGpuCases(ctx) {
             const smForm = classifyMpsReply(sm.stdout); const memForm = classifyMpsReply(mem.stdout);
             evidence.put('readbackForms', { sm: smForm, memory: memForm });
             needs(memForm.form === 'integer-with-M-or-G', `The device-memory default reply has an unsupported wire format: ${JSON.stringify(memForm)}`);
-            expects(smForm.value === share.smPercent && memForm.bytes === memoryMiB * MIB, 'The defaults read back from the daemon differ from the saved share');
+            expects(smForm.value === share.smPercent && memForm.bytes === defaultMiB * MIB, `The defaults read back from the daemon differ from the configured ${share.smPercent}%/${defaultMiB}M (read ${JSON.stringify({ sm: smForm, memory: memForm })})`);
             // The probe instance: effective host UID, exact labels, minimal environment, binds.
             const agent = await agentNow('probe');
             registerOwned(agent);
@@ -616,11 +621,16 @@ export function createGpuCases(ctx) {
             const { gate } = prepared;
             const total = gpu.memoryMiB;
             const first = GPU_SHARES.first; const raised = GPU_SHARES.raised;
+            // The default is the share rounded up to a whole GiB (A6); the raised share must still change it (2 GiB to 3 GiB on 6 GiB).
+            const firstDefaultMiB = serverDefaultMiB(first.vramPercent, total); const raisedDefaultMiB = serverDefaultMiB(raised.vramPercent, total);
+            evidence.put('expectedDefaults', { first: firstDefaultMiB, raised: raisedDefaultMiB });
+            expects(firstDefaultMiB !== raisedDefaultMiB, `The raised share does not change the server default (${firstDefaultMiB} MiB for both), so the default-change case cannot run`);
             await gate.check('P3-start');
             // A. Two share clients at the first default. The second share is an
             //    own-share change under the same default: only the peer is recreated.
             const base = await settleShares('p3-probe', { probe: first }, evidence);
             needs(base.state.gpu.daemonStatus === 'ready', 'The MPS daemon is not ready');
+            expects(base.state.gpu.serverDefault?.vramMiB === firstDefaultMiB, `The first default is ${base.state.gpu.serverDefault?.vramMiB} MiB, not ${firstDefaultMiB}`);
             const probeBefore = await agentNow('probe');
             const identityA = await daemonIdentity(); needs(identityA.daemon, 'No owned MPS daemon is observable');
             gate.registerDaemon(identityA.daemon.host.hostPid);
@@ -653,7 +663,7 @@ export function createGpuCases(ctx) {
             expects(!(oldAlive && oldAlive.startIdentity === oldDaemon.host.startIdentity), 'The old daemon is still running after the default change');
             expects(identityC.daemon.generation !== oldGeneration && identityC.daemon.host.hostPid !== oldDaemon.host.hostPid, 'The default change did not start a new daemon generation');
             expects(probeNew.id !== probeAfter.id && peerNew.id !== peer.id, 'The cohort was not recreated after the default change');
-            expects(changed.state.gpu.serverDefault?.smPercent === raised.smPercent && changed.state.gpu.serverDefault?.vramMiB === shareMemoryMiB(raised.vramPercent, total), 'The new server default is not the maximum configured share');
+            expects(changed.state.gpu.serverDefault?.smPercent === raised.smPercent && changed.state.gpu.serverDefault?.vramMiB === raisedDefaultMiB, `The new server default is not the maximum configured share rounded up to a whole GiB (${raisedDefaultMiB} MiB)`);
             assertClientShare(probeNew, raised, changed.state, identityC.daemon, { totalMiB: total, label: 'probe after the default change' });
             assertClientShare(peerNew, first, changed.state, identityC.daemon, { totalMiB: total, label: 'peer after the default change' });
             await assertCpuUntouched(evidence, 'P3-B');
@@ -906,10 +916,11 @@ export function createGpuCases(ctx) {
         const again = await applyShares('p4-reconcile-share', { [GPU_AGENT_REFS.probe]: share }, [GPU_AGENT_REFS.probe], evidence);
         const fresh = await daemonIdentity(); needs(fresh.daemon, 'No daemon after reconciling');
         gate.registerDaemon(fresh.daemon.host.hostPid);
+        const defaultMiB = serverDefaultMiB(share.vramPercent, gpu.memoryMiB);
         const capMiB = shareMemoryMiB(share.vramPercent, gpu.memoryMiB);
         const readbacks = Object.fromEntries((fresh.obs.control || []).map(reply => [reply.command, reply.stdout.trim()]));
         evidence.put('reconciled', { generation: fresh.daemon.generation, previous: oldDaemon.generation, serverDefault: again.state.gpu.serverDefault, readbacks });
-        expects(fresh.daemon.generation !== oldDaemon.generation && again.state.gpu.serverDefault?.smPercent === share.smPercent && again.state.gpu.serverDefault?.vramMiB === capMiB, 'The reconciled daemon does not carry the configured defaults');
+        expects(fresh.daemon.generation !== oldDaemon.generation && again.state.gpu.serverDefault?.smPercent === share.smPercent && again.state.gpu.serverDefault?.vramMiB === defaultMiB, `The reconciled daemon does not carry the configured defaults (${defaultMiB} MiB)`);
         const probe = await agentNow('probe'); registerOwned(probe);
         const measured = await runProbe(evidence, 'after-reconcile', { maxMiB: probeBoundMiB(capMiB) });
         evidence.put('afterReconcile', { smCount: measured.report.smCount, allocatedMiB: measured.report.allocatedMiB, termination: measured.report.termination });

@@ -524,9 +524,10 @@ test('G1.P1-passes-daemon-defaults-host-uid-labels-and-minimal-environment', asy
     assert.equal(p1.result, 'pass', JSON.stringify(p1));
     const evidence = p1.evidence;
     assert.equal(evidence.gateBaseline.uuid, GPU_UUID); assert.equal(evidence.gateBaseline.computeMode, 'Default');
-    assert.deepEqual(evidence.applied.gpu.serverDefault, { smPercent: 25, vramMiB: 1044 });
+    // The daemon default is the 1044-MiB share rounded up to a whole GiB (A6); the status names the share it came from.
+    assert.deepEqual(evidence.applied.gpu.serverDefault, { smPercent: 25, vramMiB: 2048, shareMemoryMiB: 1044 });
     assert.equal(evidence.daemon.box.cgroup, '0::/ploinky/core'); assert.deepEqual(evidence.daemon.host.uid, { real: 1000, effective: 1000, saved: 1000, fs: 1000 });
-    assert.deepEqual(evidence.readbackForms, { sm: { form: 'integer-percentage', value: 25 }, memory: { form: 'integer-with-M-or-G', bytes: 1044 * 1048576 } });
+    assert.deepEqual(evidence.readbackForms, { sm: { form: 'integer-percentage', value: 25 }, memory: { form: 'integer-with-M-or-G', bytes: 2048 * 1048576 } });
     assert.deepEqual(evidence.client.env.sort(), ['CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=25', 'CUDA_MPS_PINNED_DEVICE_MEM_LIMIT=0=1044M', 'CUDA_MPS_PIPE_DIRECTORY=/run/ploinky-mps-pipe']);
     assert.deepEqual(Object.keys(evidence.client.labels).filter(key => key.startsWith('ploinky.mps')), ['ploinky.mpsgeneration']);
     assert.ok(evidence.clientHostProcesses.length > 0);
@@ -667,7 +668,7 @@ test('G1.P3-passes-drain-before-quit-final-clear-host-clear-restart-and-an-owned
     assert.equal(e.ownShareChange.probeSame, true); assert.equal(e.ownShareChange.daemonSame, true);
     // The default change: a new generation and daemon, a recreated cohort, drained before the quit.
     assert.notEqual(e.defaultChange.old.generation, e.defaultChange.new.generation); assert.notEqual(e.defaultChange.old.pid, e.defaultChange.new.pid);
-    assert.deepEqual(e.defaultChange.new.serverDefault, { smPercent: 50, vramMiB: 2088 });
+    assert.deepEqual(e.defaultChange.new.serverDefault, { smPercent: 50, vramMiB: 3072, shareMemoryMiB: 2088 });
     assert.equal(e.defaultChangeTimeline.violation, null); assert.equal(e.defaultChangeTimeline.daemonGone, true); assert.ok(e.defaultChangeTimeline.samples > 3);
     assert.equal(e.defaultChangeTimeline.drainWindowObserved, true, 'the window between the last drained client and the quit was sampled');
     for (const key of ['finalClearTimeline', 'restartTimeline']) { assert.equal(e[key].ok, true, key); assert.equal(e[key].violation, null, key); }
@@ -1631,7 +1632,7 @@ test('W2.a-p1-pass-copies-the-journaled-readback-into-its-case-artifact', async 
     assert.equal(caseOf(report, 'LIVE-P1').result, 'pass', JSON.stringify(report.limitations));
     const readback = w.artifacts.get('gpu-live-p1').lastReadback;
     assert.deepEqual(Object.keys(readback).sort(), ['at', 'memory', 'servers', 'sm']);
-    assert.match(readback.memory, /^\d+M$/); assert.match(readback.sm, /^\d+$/);
+    assert.match(readback.memory, /^[1-9]\d*[MG]$/); assert.match(readback.sm, /^\d+$/);
     nothingOwned(w);
 });
 
@@ -1678,5 +1679,58 @@ test('F2.a-recreated-share-client-from-a-foreign-image-id-fails-even-when-its-na
     const entry = caseOf(await liveCases(w, ['LIVE-P1']), 'LIVE-P1');
     assert.equal(entry.result, 'fail', JSON.stringify(entry).slice(0, 400));
     assert.match(entry.reason, /Agent probe is not the pinned running instance \(image d{12}, created from docker\.io\/assistos\/ploinky-node@sha256:a+\)/);
+    nothingOwned(w);
+});
+
+// --- V3: the runner expects the product's whole-GiB server default; each client keeps its exact share ---------------
+test('V3.p1-expects-the-rounded-default-and-the-exact-client-share', async t => {
+    const w = await provisioned(t);
+    const report = await liveCases(w, ['LIVE-P1']);
+    const p1 = caseOf(report, 'LIVE-P1');
+    assert.equal(p1.result, 'pass', JSON.stringify(p1).slice(0, 600));
+    const e = p1.evidence;
+    assert.deepEqual(e.expectedDefault, { shareMiB: 1044, defaultMiB: 2048 });
+    assert.deepEqual(e.applied.gpu.serverDefault, { smPercent: 25, vramMiB: 2048, shareMemoryMiB: 1044 });
+    // The daemon's readback is the captured form: a whole GiB, 2G; the client environment stays the exact 1044M.
+    assert.match(e.lastReadback.memory, /^2G$/);
+    assert.deepEqual(e.readbackForms.memory, { form: 'integer-with-M-or-G', bytes: 2048 * 1048576 });
+    assert.ok(e.client.env.includes('CUDA_MPS_PINNED_DEVICE_MEM_LIMIT=0=1044M'), JSON.stringify(e.client.env));
+    nothingOwned(w);
+});
+
+test('V3.p1-fails-when-the-daemon-default-is-the-raw-share-instead-of-the-rounded-value', async t => {
+    const w = await provisioned(t, { faults: { rawServerDefault: true } });
+    const entry = caseOf(await liveCases(w, ['LIVE-P1']), 'LIVE-P1');
+    assert.equal(entry.result, 'fail', JSON.stringify(entry).slice(0, 400));
+    assert.match(entry.reason, /not ready with the saved defaults 25%\/2048M for a 1044M share/);
+    nothingOwned(w);
+});
+
+test('V3.p3-raising-the-share-changes-the-default-from-2-to-3-gib-and-drains-before-the-quit', async t => {
+    const w = await provisioned(t);
+    const p3 = caseOf(await liveCases(w, ['LIVE-P3']), 'LIVE-P3');
+    assert.equal(p3.result, 'pass', JSON.stringify(p3).slice(0, 600));
+    assert.deepEqual(p3.evidence.expectedDefaults, { first: 2048, raised: 3072 });
+    assert.equal(p3.evidence.defaultChange.new.serverDefault.vramMiB, 3072);
+    assert.equal(p3.evidence.defaultChangeTimeline.violation, null); assert.equal(p3.evidence.defaultChangeTimeline.daemonGone, true);
+    nothingOwned(w);
+});
+
+test('V3.p4-the-reconciled-daemon-carries-the-rounded-default', async t => {
+    const w = await provisioned(t);
+    const p4 = caseOf(await liveCases(w, ['LIVE-P4']), 'LIVE-P4');
+    assert.equal(p4.result, 'pass', JSON.stringify(p4).slice(0, 600));
+    assert.equal(p4.evidence.reconciled.serverDefault.vramMiB, 2048);
+    assert.equal(p4.evidence.reconciled.readbacks['get_default_device_pinned_mem_limit 0'], '2G');
+    nothingOwned(w);
+});
+
+test('V3.p2-still-passes-when-the-driver-truncates-a-client-value-to-a-whole-gib', async t => {
+    // P2 uses the client's own cap; low = max(128, cap - 640) = 404 MiB. A 1044M value applied as 1024M still allocates inside it.
+    const w = await provisioned(t, { faults: { truncateClientCap: true } });
+    const p2 = caseOf(await liveCases(w, ['LIVE-P2']), 'LIVE-P2');
+    assert.equal(p2.result, 'pass', JSON.stringify(p2).slice(0, 600));
+    const share = p2.evidence.measurements?.share ?? p2.evidence.rounding;
+    assert.ok(p2.evidence.rounding.capMiB === 1044 && p2.evidence.rounding.shareAllocatedMiB >= 404 && p2.evidence.rounding.shareAllocatedMiB <= 1024, JSON.stringify(share).slice(0, 300));
     nothingOwned(w);
 });

@@ -5,6 +5,7 @@
 // and only observe, except the two the plan defines as mutations: the
 // administrator request (Apply and the policy store, through the Router's own
 // route) and the owned-daemon kill of the crash case.
+import { mpsServerDefaultMemoryMiB } from '../../cli/sandbox/hardwareLimits/mps.mjs';
 import { validateProbe } from './liveCaseCommands.mjs';
 import { HASH, absolute, blocked, bounded, keys } from './liveCommon.mjs';
 
@@ -23,6 +24,9 @@ export const GPU_SHARES = Object.freeze({
     raised: Object.freeze({ smPercent: 50, vramPercent: 34 }),
 });
 export const shareMemoryMiB = (vramPercent, totalMiB) => Math.floor(vramPercent * totalMiB / 100);
+// The daemon-wide memory default the product configures for a share (amendment A6): the share rounded UP to a whole GiB, by
+// the product's own function. The client keeps the exact share (shareMemoryMiB) in its environment.
+export const serverDefaultMiB = (vramPercent, totalMiB) => mpsServerDefaultMemoryMiB(shareMemoryMiB(vramPercent, totalMiB));
 // A tighter client value the P2 probes set themselves: 10% of the SMs and a
 // 512-MiB per-process limit. A client may set any value; the server default
 // is only a default (that is the documented best-effort limit).
