@@ -3,8 +3,16 @@
 // limits hash, so nothing restarts). The host half proves the environment gate
 // and the saved gate select identical wiring and rewrite nothing; the in-Box
 // half runs the graph reuse decision of the start path twice over real
-// admissions against the cgroup fake, with the running containers' labels taken
-// from the arguments the creation path renders, never from the decision itself.
+// admissions against the cgroup fake, with the running containers' limits
+// labels taken from the arguments the creation path renders, never from the
+// decision itself.
+//
+// SCOPE: the ENVIRONMENT hash is stubbed here (computeEnvHashImpl,
+// computeRetainedManagedEnvHashImpl and the envhash label are one constant), so
+// this file proves the limits decision and the graph wiring GIVEN EQUAL env
+// hashes. It does not prove that the creation path and the graph compute equal
+// env hashes; hardwareLimitsEnvHashConsistency.test.mjs does, with the real
+// creation path, the real builders and the real hash functions.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -168,6 +176,7 @@ function createdLabels(context) {
         args.forEach((value, index) => {
             if (value === '--label') { const [key, ...rest] = args[index + 1].split('='); found[key] = rest.join('='); }
         });
+        // The env hash label is the constant the stubbed hash functions return (see SCOPE above).
         labels[dockerSvc.getAgentContainerName(agent.name, FIXTURE_REPOSITORY)] = { ...found, 'ploinky.envhash': 'envhash' };
     }
     return labels;
@@ -214,6 +223,7 @@ function repeatStart(context, labels) {
             isContainerRunningImpl: () => true,
             getRuntimeForAgentImpl: () => 'podman',
             getRuntimeImpl: () => 'podman',
+            // Stubbed on purpose: this test is about the limits decision given equal env hashes.
             computeEnvHashImpl: () => 'envhash',
             computeRetainedManagedEnvHashImpl: () => 'envhash',
             getContainerLabelImpl: (key, label) => labels[key]?.[label] ?? '',
@@ -230,7 +240,7 @@ function repeatStart(context, labels) {
     return { prepared, removed, registry, before, unavailable, preflight };
 }
 
-test('RS.repeat-start-twice-replaces-no-unchanged-running-limited-agent', () => {
+test('RS.repeat-start-twice-replaces-no-limited-agent-when-the-env-hashes-are-equal', () => {
     const creation = boxContext();
     assert.equal(creation.gate, 'on');
     assert.equal(creation.prepared, true);

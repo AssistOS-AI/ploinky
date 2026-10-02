@@ -401,7 +401,7 @@ export function buildRequiredCaseManifest() {
         ]),
         ...leaves(P, 'p1', unit('hardwareLimitsRepeatStart.test.mjs'), [
             'RS.host-env-gate-repeat-and-saved-gate-repeat-select-the-same-wiring-and-rewrite-nothing',
-            'RS.repeat-start-twice-replaces-no-unchanged-running-limited-agent',
+            'RS.repeat-start-twice-replaces-no-limited-agent-when-the-env-hashes-are-equal',
             'RS.service-reuse-comparison-matches-the-creation-label',
             'RS.a-nested-backend-probe-failure-is-the-plan-defined-way-limited-agents-are-removed',
         ]),
