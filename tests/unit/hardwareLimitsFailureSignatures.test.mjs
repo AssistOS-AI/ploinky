@@ -79,3 +79,37 @@ test('only verified mkdtemp components under the exact run TMPDIR lose random su
     assert.notEqual(proof('<TMP>/ploinky-relay-aB12cD/child'), proof('<TMP>/ploinky-relay-Z98xyQ/child'));
     assert.notEqual(proof('509 !== 1533 /owned/tmp/ploinky-relay-aB12cD/child'), proof('500 !== 1533 /owned/tmp/ploinky-relay-Z98xyQ/child'));
 });
+
+test('HS.process IDs in absolute /proc paths are normalized and nothing else is', async (t) => {
+    const proof = (message, extra = {}) => summarizeFailure(Object.assign(new Error(message), extra)).signature;
+    // The known Linux-only failure: same file, a different PID on every run.
+    const enoent = (pid) => proof(`ENOENT: no such file or directory, open '/proc/${pid}/oom_score_adj'`, { code: 'ENOENT', errno: -2, syscall: 'open', path: `/proc/${pid}/oom_score_adj` });
+    assert.equal(enoent(43132), enoent(7));
+    assert.equal(proof('cannot read /proc/12'), proof('cannot read /proc/345'));
+    // The rest of the diagnostic stays significant.
+    assert.notEqual(proof("open '/proc/43132/oom_score_adj'"), proof("open '/proc/43132/status'"));
+    assert.notEqual(proof("open '/proc/43132/oom_score_adj'"), proof("open '/proc/self/oom_score_adj'"));
+    assert.notEqual(proof('/proc/12/stat 509'), proof('/proc/12/stat 500'));
+    assert.notEqual(proof('pid 12 exited'), proof('pid 34 exited'));
+    // Only an absolute /proc/<digits> component: not a nested path, a
+    // non-numeric component or a number with a suffix.
+    assert.notEqual(proof('/data/proc/12/x'), proof('/data/proc/34/x'));
+    assert.notEqual(proof('/proc/12a/x'), proof('/proc/34a/x'));
+    assert.notEqual(proof('/proc/12.5/x'), proof('/proc/34.5/x'));
+    // Through the real runner: a known baseline failure whose only change is
+    // its PID stays a baseline failure, while a changed file is a new failure.
+    const body = (file) => `import test from 'node:test';\nimport fs from 'node:fs';\ntest('pid-bound', () => { fs.readFileSync('/proc/' + process.pid + '/absent-${file}'); });\n`;
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-pid-')));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    fs.writeFileSync(path.join(root, 'cause.test.mjs'), body('oom_score_adj'));
+    const baseline = await runSuite({ root, files: ['cause.test.mjs'], runId: 'pid-run', childId: 'baseline', eventsPath: path.join(root, 'baseline.jsonl') });
+    const known = new Map([...baseline.failureSignatures].filter(([, value]) => value));
+    assert.equal(known.size, 1);
+    const again = await runSuite({ root, files: ['cause.test.mjs'], runId: 'pid-run', childId: 'again', eventsPath: path.join(root, 'again.jsonl'), baseline: baseline.inventory, knownBaselineFailures: known });
+    assert.equal(again.newFailures.length, 0, JSON.stringify(again.newFailures));
+    assert.equal(again.baselineFailures.length, 1);
+    fs.writeFileSync(path.join(root, 'cause.test.mjs'), body('status'));
+    const changed = await runSuite({ root, files: ['cause.test.mjs'], runId: 'pid-run', childId: 'changed', eventsPath: path.join(root, 'changed.jsonl'), baseline: baseline.inventory, knownBaselineFailures: known });
+    assert.equal(changed.newFailures.length, 1);
+    assert.equal(changed.newFailures[0].reason, 'baseline failure diagnostic changed');
+});

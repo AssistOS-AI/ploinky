@@ -27,7 +27,8 @@ function relativeFile(file, root) {
     return relative.split(path.sep).join('/');
 }
 
-// Only exact run-owned source/HOME/TMPDIR prefixes are normalized. Relative
+// Only exact run-owned source/HOME/TMPDIR prefixes and the numeric PID in an
+// absolute /proc/<pid> path are normalized. Relative
 // filenames, numeric values and diagnostic wording remain part of the proof.
 // Two verified mkdtemp prefixes have a generated six-character suffix:
 // RuntimeRelayManager creates ploinky-relay-* and the directory-permission
@@ -47,7 +48,10 @@ function normalizeDiagnosticText(value, { root, home, tmpdir } = {}) {
         }
         text = text === prefix ? label : text.split(`${prefix}/`).join(`${label}/`);
     }
-    return text;
+    // A process ID in an absolute /proc/<pid> path differs on every run, like
+    // a mkdtemp suffix. Only that one numeric component is normalized; the
+    // rest of the path (/proc/<PID>/oom_score_adj versus /status) stays.
+    return text.replace(/(?<![\w./-])\/proc\/[1-9][0-9]{0,9}(?=\/|$|[^\w.-])/g, '/proc/<PID>');
 }
 
 export function summarizeFailure(error, locations = {}) {
