@@ -276,6 +276,7 @@ export function buildRequiredCaseManifest() {
             'HD.profile-other-llm-settings-unchanged', 'HD.parity-lite-sandbox', 'HD.parity-d4', 'HD.parity-gate-off',
             'HD.parity-unprepared-and-controller-missing', 'HD.parity-metadata-strict-and-launch', 'HD.parity-interactive',
             'HD.parity-graph-outcomes-and-blocked-dependants', 'HD.route-deprecated-declaration-note',
+            'HD.interactive-caller-resolves-the-profile', 'HD.long-requested-value-is-a-bounded-refusal',
         ]),
         ...leaves(P, 'p0', unit('hardwareLimitsOutcomes.test.mjs'), [
             'O.prelock-preflight-refusal', 'O.locked-preflight-refusal', 'O.defensive-preflight-refusal',
@@ -455,6 +456,7 @@ export function buildRequiredCaseManifest() {
             'MP.control-malformed', 'MP.timeout',
             'MP.stop-refuses-foreign-unknown-or-changed-daemon', 'MP.cleanup-journal-boundary-transition',
             'MP.cleanup-journal-boundary-finalize', 'MP.missing-generation-directories-need-the-proc-scan',
+            'MP.cleanup-journal-boundary-intent-before-and-no-check-after-cleanup',
         ]),
         ...leaves(P, 'p4', unit('hardwareLimitsMpsLifecycle.test.mjs'), [
             'MPL.first-apply', 'MPL.unchanged-reuse', 'MPL.own-share-only', 'MPL.full-cohort-drain-before-quit',
@@ -462,13 +464,20 @@ export function buildRequiredCaseManifest() {
             'MPL.partial-retry', 'MPL.no-unrelated-stop', 'MPL.lock-reuse', 'MPL.generation-drift',
             'MPL.p6-peer-failure-recreates-the-rest-and-reports-a-ready-daemon', 'MPL.p6-selected-failure-still-recreates-the-cohort',
         ]),
-        ...leaves(P, 'p4', unit('hardwareLimitsMpsIntegration.test.mjs'), ['MI.p7-peer-ineligible-image-or-missing-manifest-never-refuses-the-target']),
+        ...leaves(P, 'p4', unit('hardwareLimitsMpsIntegration.test.mjs'), [
+            'MI.p7-peer-ineligible-image-or-missing-manifest-never-refuses-the-target',
+            'MI.peer-failure-is-a-partial-result-and-apply-reports-207', 'MI.ineligible-peer-is-refused-reported-before-drain-and-journaled',
+            'MI.retry-recreates-only-the-failed-client', 'MI.watchdog-retries-of-a-failing-client-cause-no-healthy-churn',
+        ]),
+        ...leaves(P, 'p4', unit('hardwareLimitsOutcomes.test.mjs'), ['O.mps-graph-refusal-starts-cpu-agents-and-explorer']),
         ...leaves(P, 'p4', unit('hardwareLimitsMpsCandidateRecovery.test.mjs'), [
             'MC.readiness-failure-then-retry-succeeds', 'MC.readiness-failure-leaving-the-candidate-removes-it-by-id',
             'MC.non-exact-candidate-is-refused-without-daemon-change', 'MC.crash-during-readiness-then-recovery',
             'MC.graph-start-after-failed-apply-starts-cpu-agents',
             'MG2.inventory-query-failure', 'MG2.unknown-labelled-container', 'MG2.journaled-non-member', 'MG2.registry-drift',
             'MG2.alias-mismatch', 'MG2.transaction-checks-still-fail-the-start',
+            'MC.inflight-nowait-child-survives-apply-watchdog-and-graph', 'MC.crashed-launcher-leftover-is-still-settled',
+            'MC.disabled-journaled-client-absent-completes-present-refuses', 'MC.graph-keeps-candidate-entry-until-its-removal-is-proven',
         ]),
         ...leaves(P, 'p4', unit('containerMonitorMpsGeneration.test.mjs'), [
             'MW.p4-save-new-share', 'MW.p4-clear-share', 'MW.p4-change-share', 'MW.p4-unchanged-share', 'MW.p4-daemon-lost',
