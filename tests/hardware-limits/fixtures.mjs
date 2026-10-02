@@ -747,6 +747,7 @@ export function buildRequiredCaseManifest() {
             'R2E.a-foreign-gpu-process-during-the-install-pause-aborts-the-install-wait-and-blocks',
             'R2E.a-model-load-that-does-not-finish-in-time-is-blocked-with-its-progress-for-l1-and-l3',
             'R2E.an-unreachable-model-source-is-blocked-and-a-pin-mismatch-or-a-runner-failure-is-a-failure',
+            'R2E.the-stage-two-free-memory-threshold-is-the-admission-need-plus-slack-never-near-total-free-memory',
             'R2D.a-standalone-cleanup-writes-its-own-llm-cleanup-proof-and-the-live-runs-proof-is-not-accepted-for-it',
             'R2D.a-proof-another-action-or-run-left-or-one-that-lists-remaining-data-does-not-certify-a-cleanup',
             // The runner-environment check against local-llm's own launch environment.

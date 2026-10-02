@@ -30,6 +30,21 @@ export const RUNNER_PRODUCT_CUDA = Object.freeze(['CUDA_CACHE_PATH']);
 // are, TIKTOKEN_ENCODINGS_BASE (a path to a vocabulary) is not.
 const SECRET_WORDS = new Set(['KEY', 'KEYS', 'APIKEY', 'TOKEN', 'TOKENS', 'SECRET', 'SECRETS', 'PASSWORD', 'PASSWD', 'CREDENTIAL', 'CREDENTIALS', 'COOKIE', 'COOKIES']);
 export const isSecretName = name => String(name).toUpperCase().split(/[^A-Z0-9]+/).some(word => SECRET_WORDS.has(word));
+// The free GPU memory required before the stage 2 model starts. It is the model's own admission need plus a documented
+// slack, not near-total free memory: the real idle GPU of the apparatus has 5795 MiB free, so "the share plus 256 MiB"
+// (5785 MiB for the 90 % share) left a 10 MiB margin and blocked a correct run for 11 MiB of anything else. The slack
+// covers the CUDA context MPS adds to a client (about 150 MiB measured, 256 MiB allowed in every other check) and the
+// display process's small growth, doubled. It is never stricter than the old figure, and the basis is recorded.
+export const STAGE_TWO_FREE_SLACK_MIB = 512;
+export function stageTwoFreeThreshold({ estimateGpuBytes, shareMiB }) {
+    const ceiling = shareMiB + 256;
+    if (Number.isFinite(estimateGpuBytes) && estimateGpuBytes > 0) {
+        const needMiB = Math.ceil(estimateGpuBytes / MIB);
+        return Object.freeze({ basis: 'admission-estimate', needMiB, slackMiB: STAGE_TWO_FREE_SLACK_MIB, shareMiB, minFreeMiB: Math.min(ceiling, needMiB + STAGE_TWO_FREE_SLACK_MIB) });
+    }
+    return Object.freeze({ basis: 'share', needMiB: null, slackMiB: 256, shareMiB, minFreeMiB: ceiling });
+}
+
 // Whether a deployment's error text says the model SOURCE or the network was unavailable (a missing prerequisite of the
 // host, not a defect of the product): the messages local-llm's downloader gives for an unreachable Hugging Face, a
 // metadata or download request that failed, timed out or answered 429 or 5xx, and the usual network errnos. A pin that does

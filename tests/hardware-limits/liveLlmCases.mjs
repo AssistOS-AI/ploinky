@@ -25,7 +25,7 @@ import { MIB, shareMemoryMiB } from './liveGpuCommands.mjs';
 import { LLM_SOURCE_DIRECTORY } from './liveLlmNames.mjs';
 import {
     GIB, INFERENCE_CADENCE, INSUFFICIENT_RAM, L1_MIN_RAM_BYTES, L1_PROMPT, LLM_BUDGET, LLM_FIXTURE, LLM_IMAGE_DIGESTS, LLM_LEAF_SAMPLE, LLM_MODELS, LLM_REF, LLM_RUNNER_PROCESSES, LLM_TOOL_CALL, VLLM_SHARE,
-    analyzeInference, insufficientMemoryPercent, llmToolWords, parseLeafSample, runnerEnvironmentProblems, sourceUnavailable, summarizeGpuCheck, vllmToolWords,
+    analyzeInference, insufficientMemoryPercent, llmToolWords, parseLeafSample, runnerEnvironmentProblems, sourceUnavailable, stageTwoFreeThreshold, summarizeGpuCheck, vllmToolWords,
 } from './liveLlmCommands.mjs';
 
 const needs = (condition, message) => { if (!condition) throw blocked(message); };
@@ -606,7 +606,9 @@ export function createLlmCases(ctx) {
         expects(cal.expectQualified, 'vLLM under MPS was admitted although the candidate holds no matching reviewed qualification entry');
         needs(admission?.status === 'ok', `Public admission does not admit ${LLM_MODELS.awq} at the ${VLLM_SHARE.vramPercent}% share (${admission?.status}: ${String(admission?.reason).slice(0, 300)}); the documented share is insufficient on this host`);
 
-        await gate.check('L3-before-run', { minFreeMiB: shareMemoryMiB(llm.vllm.share.vramPercent, gpu.memoryMiB) + 256 });
+        const threshold = stageTwoFreeThreshold({ estimateGpuBytes: admission?.estimate?.gpuBytes, shareMiB: shareMemoryMiB(llm.vllm.share.vramPercent, gpu.memoryMiB) });
+        evidence.put('freeMemoryThreshold', threshold);
+        await gate.check('L3-before-run', { minFreeMiB: threshold.minFreeMiB });
         await toolOk('run-l3', 'local_llm_run', { requestId: requestId('l3'), modelId: LLM_MODELS.awq, runnerId: 'vllm', params: {}, replace: false }, { mutating: true });
         const ready = await gate.monitor(abort => waitDeployment(evidence, 'l3-ready', { done: status => status.phase === 'ready', signal: abort, deadlineMs: modelLoadMs, timeout: 'blocked' }));
         evidence.put('deployment', ready.deployment);

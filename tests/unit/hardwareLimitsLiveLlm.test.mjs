@@ -26,7 +26,7 @@ import { LEAF_OBSERVATION } from '../hardware-limits/liveCaseCommands.mjs';
 import {
     LOCAL_LLM_RUNNER_ENV, isSecretName, runnerEnvironmentProblems, runnerProductNames,
     INFERENCE_MIN_IN_FLIGHT, INFERENCE_TOLERANCE, INSUFFICIENT_RAM, LLM_BUDGET, LLM_IMAGE_DIGESTS, LLM_LEAF_SAMPLE, LLM_MODELS, LLM_RUNNER_PROCESSES, LLM_TOOL_CALL, VLLM_SHARE, VLLM_TOOL_PATH,
-    analyzeInference, insufficientMemoryPercent, llmToolWords, parseLeafSample, sourceUnavailable, summarizeGpuCheck, validateLlmModelPins, validateLlmProfile, vllmToolWords,
+    analyzeInference, insufficientMemoryPercent, llmToolWords, parseLeafSample, sourceUnavailable, stageTwoFreeThreshold, summarizeGpuCheck, validateLlmModelPins, validateLlmProfile, vllmToolWords,
 } from '../hardware-limits/liveLlmCommands.mjs';
 import { resolveMemoryPercent } from '../../cli/sandbox/hardwareLimits/resolve.mjs';
 
@@ -1449,4 +1449,20 @@ test('R2E.an-unreachable-model-source-is-blocked-and-a-pin-mismatch-or-a-runner-
         assert.match(entry.reason, result === 'blocked' ? /The model source is unavailable from this host: / : /The deployment failed: /, label);
         assert.equal(w.artifacts.get('gpu-live-l1').response, undefined, 'no text is ever accepted'); nothingOwned(w);
     }
+});
+
+// --- R2E(d): the stage 2 free-memory threshold is the model's admission need plus documented slack -------------------
+test('R2E.the-stage-two-free-memory-threshold-is-the-admission-need-plus-slack-never-near-total-free-memory', async t => {
+    const shareMiB = 5529;
+    const based = stageTwoFreeThreshold({ estimateGpuBytes: 4_695_175_807, shareMiB });
+    assert.deepEqual({ ...based }, { basis: 'admission-estimate', needMiB: 4478, slackMiB: 512, shareMiB, minFreeMiB: 4990 });
+    assert.ok(5795 - based.minFreeMiB > 500, 'the real idle GPU (5795 MiB free) has a wide margin, not 10 MiB');
+    // Never stricter than the share plus 256 MiB, and without an estimate that figure is the documented fallback.
+    assert.equal(stageTwoFreeThreshold({ estimateGpuBytes: 9e9, shareMiB }).minFreeMiB, shareMiB + 256);
+    for (const estimateGpuBytes of [undefined, null, 0, Number.NaN]) assert.deepEqual({ ...stageTwoFreeThreshold({ estimateGpuBytes, shareMiB }) }, { basis: 'share', needMiB: null, slackMiB: 256, shareMiB, minFreeMiB: shareMiB + 256 });
+    // The executor uses it and records it.
+    const w = await provisioned(t, { block: 'apparatus-vllm', vllm: stageTwo(true), qualified: true });
+    assert.equal(caseOf(await liveCases(w, ['LIVE-L3']), 'LIVE-L3').result, 'pass');
+    assert.deepEqual({ ...w.artifacts.get('gpu-live-l3').freeMemoryThreshold }, { ...based });
+    nothingOwned(w);
 });
