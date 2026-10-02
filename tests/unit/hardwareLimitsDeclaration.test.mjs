@@ -720,6 +720,28 @@ test('HD.interactive-caller-resolves-the-profile', () => {
     }
 });
 
+// N10b: the second production caller, ensureAgentContainer, passes the profile
+// the production resolver returns too: a limit declared only in a profile
+// (inherited from the default profile) is refused before any engine
+// operation. Reverting it to the raw profile lookup would drop that
+// declaration, so the call would reach the engine (refused by the unit-test
+// guard) instead of failing with the typed outcome.
+test('HD.interactive-ensure-agent-container-resolves-the-profile', () => {
+    const { ensureAgentContainer } = interactiveModule;
+    for (const [label, manifest] of [
+        ['neutral', { ...base, profiles: { default: { hardwareLimits: { memory: '256m' } }, dev: {} } }],
+        ['deprecated', { ...base, profiles: { default: { llmRuntime: { runtimePolicy: { resources: { memory: '256m' } } } }, dev: {} } }],
+    ]) {
+        let outcome = null;
+        let other = null;
+        try { ensureAgentContainer('shell', 'demo', manifest); } catch (error) { outcome = errors.findHardwareOutcome(error); if (!outcome) other = error; }
+        assert.equal(other, null, `${label}: nothing but the typed refusal is thrown (${other?.message})`);
+        assert.ok(outcome, `${label}: ensureAgentContainer refuses`);
+        assert.equal(outcome.reasonCode, 'interactive_runtime', label);
+        assert.deepEqual(outcome.requested, [{ field: 'memory', value: '256m', source: 'profile' }], label);
+    }
+});
+
 // A declared value longer than the outcome bound is still a typed refusal on
 // either declaration path, carrying a bounded prefix and the value's digest.
 test('HD.long-requested-value-is-a-bounded-refusal', () => {

@@ -354,6 +354,45 @@ test('H.p3-explorer-sibling-is-the-configured-ploinky-candidate', async (t) => {
     assert.throws(() => assertExplorerLayoutUnchanged(layout), /candidate source changed/);
 });
 
+// N19: the spawn calls themselves are recorded. Hashing never pipes bytes into
+// a child (no `input`, no piped or inherited stdin), and the archive goes
+// through a task-owned file: putting `git hash-object --stdin` or a tar stdin
+// pipe back would be seen here, not only through the results.
+test('H.baseline-stage-spawn-calls-never-use-stdin', async (t) => {
+    const { createBaselineStage } = await import('../hardware-limits/verify.mjs');
+    const childProcess = (await import('node:child_process')).default;
+    const { syncBuiltinESMExports } = await import('node:module');
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-stage-calls-')));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const repo = path.join(root, 'repo'); fs.mkdirSync(repo);
+    const git = (args) => { const result = childProcess.spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8', env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' } }); assert.equal(result.status, 0, result.stderr); return result.stdout.trim(); };
+    git(['init', '-q']);
+    fs.writeFileSync(path.join(repo, 'a.txt'), 'alpha\n'); fs.writeFileSync(path.join(repo, 'b.bin'), Buffer.alloc(4096, 3));
+    git(['add', '-A']); git(['-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-q', '-m', 'fixture']);
+    const revision = git(['rev-parse', 'HEAD']);
+    const calls = [];
+    const original = childProcess.spawnSync;
+    const recorded = function recordedSpawnSync(...args) { calls.push(args); return original.apply(this, args); };
+    childProcess.spawnSync = recorded; syncBuiltinESMExports();
+    try { assert.deepEqual(createBaselineStage(repo, revision, path.join(root, 'stage')), { checked: 2 }); }
+    finally { childProcess.spawnSync = original; syncBuiltinESMExports(); }
+    assert.ok(calls.length >= 3, `the stage ran child processes: ${calls.length}`);
+    for (const [program, argv, options = {}] of calls) {
+        const label = `${program} ${argv.join(' ')}`;
+        assert.equal(Object.hasOwn(options, 'input'), false, `${label}: no input option`);
+        assert.notEqual(options.stdio?.[0], 'pipe', `${label}: stdin is not piped`);
+        assert.notEqual(options.stdio?.[0], 'inherit', `${label}: stdin is not inherited`);
+        assert.equal(argv.includes('--stdin'), false, `${label}: no --stdin`);
+        assert.equal(argv.includes('--stdin-paths'), false, `${label}: no --stdin-paths`);
+        assert.equal(argv.includes('-'), false, `${label}: no standard-input operand`);
+    }
+    const archive = calls.find(([program, argv]) => program === 'git' && argv.includes('archive'));
+    assert.ok(archive && archive[1].includes('-o'), 'the archive is written to a task-owned file');
+    const extract = calls.find(([program]) => program === 'tar');
+    assert.ok(extract && extract[1].includes('-f'), 'tar reads that file, not standard input');
+    assert.equal(calls.some(([, argv]) => argv.includes('hash-object')), false, 'blob ids are computed in process');
+});
+
 // Staging never feeds a child through stdin (spawnSync stdin piping stalls
 // intermittently on macOS): blob ids are computed in process and must equal
 // git's own, and a staged revision is verified file by file.

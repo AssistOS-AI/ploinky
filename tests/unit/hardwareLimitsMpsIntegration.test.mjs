@@ -370,7 +370,7 @@ test('MI.graph-launch-failure-then-lifecycle-retry-recreates-only-the-failed-cli
 // drain composition (no injected drainClient): it is retired only from its
 // recorded identity, observed through fake low-level engine replies.
 import { NETWORK_LABELS, workspaceNetworkIdentity } from '../../cli/sandbox/networkLifecycle.js';
-function recordedPeerWorld({ labels = {}, init = true, healthyPeer = false, unprovableSecondPeer = false, cancelAfter = null } = {}) {
+function recordedPeerWorld({ labels = {}, init = true, healthyPeer = false, unprovableSecondPeer = false, cancelAfter = null, stop = 'works' } = {}) {
     const token = { epoch: 'e'.repeat(32), revision: 1 };
     const bId = 'b'.repeat(64);
     const registry = {
@@ -401,7 +401,13 @@ function recordedPeerWorld({ labels = {}, init = true, healthyPeer = false, unpr
         if (args[0] === 'container' && args[1] === 'inspect' && args[2] === bId) {
             return { ok: true, status: 0, stdout: JSON.stringify([{ Id: bId, Config: { Labels: containerLabels }, HostConfig: { Init: init }, State: { Running: running } }]), stderr: '' };
         }
-        if (args[0] === 'container' && args[1] === 'stop' && args.at(-1) === bId) { running = false; events.push('stop:b'); return { ok: true, status: 0, stdout: '', stderr: '' }; }
+        if (args[0] === 'container' && args[1] === 'stop' && args.at(-1) === bId) {
+            // 'fails': the engine refuses the stop; 'still-running': it reports
+            // success but the container keeps running.
+            if (stop === 'fails') { events.push('stop-failed:b'); return { ok: false, status: 125, stdout: '', stderr: 'cannot stop container' }; }
+            if (stop !== 'still-running') running = false;
+            events.push('stop:b'); return { ok: true, status: 0, stdout: '', stderr: '' };
+        }
         // c's runtime carries none of the recorded labels: not provable.
         if (args[0] === 'container' && args[1] === 'inspect' && args[2] === cId) {
             return { ok: true, status: 0, stdout: JSON.stringify([{ Id: cId, Config: { Labels: {} }, HostConfig: { Init: true }, State: { Running: true } }]), stderr: '' };
@@ -495,6 +501,37 @@ test('MI.refused-peer-outcome-survives-a-cancellation-after-its-drain', async ()
     // The abort happened right after b: c was never touched and the daemon is unchanged.
     assert.equal(f.events.some((value) => ['quit', 'start', 'launch:z', 'stop:c'].includes(value)), false, f.events.join(' '));
     assert.ok(f.state.pendingClients.some((value) => value.key === 'b' && value.phase === 'pending'), JSON.stringify(f.state.pendingClients));
+});
+
+// N21f / N21i: a recorded peer that cannot be stopped, or that is still
+// running after a stop that reported success, fails closed with every
+// outcome: the peer is refused with its own reason and fix, the target stays
+// pending ("stopped before any daemon change"), and nothing else changes.
+test('MI.recorded-peer-stop-failure-and-still-running-after-stop-fail-closed-with-outcomes', async () => {
+    for (const [label, stop, pattern] of [
+        ['the stop fails', 'fails', /could not be stopped by its immutable ID/],
+        ['still running after the stop', 'still-running', /is not proven stopped/],
+    ]) {
+        const f = recordedPeerWorld({ stop });
+        const result = await f.apply();
+        assert.equal(result.status, 207, `${label}: ${JSON.stringify(result)}`);
+        const peer = result.results.find((value) => value.key === 'b');
+        const target = result.results.find((value) => value.key === 'z');
+        assert.equal(peer?.state, 'refused', label);
+        assert.ok(peer.problem.reason.includes('Agent demo/b not found') && peer.problem.fix, label);
+        assert.equal(target?.state, 'pending', label);
+        assert.equal(target.error, 'mps_peer_unretirable', label);
+        assert.match(target.message, /stopped before any daemon change/, label);
+        assert.match(target.message, /not-stopped/, label);
+        assert.match(target.message, pattern, label);
+        assert.deepEqual(result.pendingContainers, ['z'], label);
+        // The route was made unavailable before the stop attempt; no daemon
+        // change, no launch, and the peer's pending intent stays journaled.
+        assert.ok(f.unavailable.includes('b'), label);
+        assert.ok(f.events.indexOf('unavailable:b') < f.events.indexOf(stop === 'fails' ? 'stop-failed:b' : 'stop:b'), `${label}: ${f.events.join(' ')}`);
+        assert.equal(f.events.some((value) => ['quit', 'start', 'launch:z'].includes(value)), false, `${label}: ${f.events.join(' ')}`);
+        assert.equal(f.state.status === 'transitioning' || f.state.status === 'pending', true, label);
+    }
 });
 
 test('MI.unprovable-peer-identity-fails-closed-with-every-outcome', async () => {
