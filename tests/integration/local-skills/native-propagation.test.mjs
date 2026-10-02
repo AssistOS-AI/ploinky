@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { constants } from 'node:fs';
 import test from 'node:test';
-import { fixture, source, roots, writeSkill, createAlaEngine } from './fixture.mjs';
+import { fixture, source, roots, writeSkill, createAlaEngine, ACHILLES_PRIVATE_DIRECTORY_NAME } from './fixture.mjs';
 
 // Explicit opt-in file: requires a working Linux sandbox, a real backend, and an
 // authenticated donor home. It never falls back to the deterministic consumer.
@@ -36,6 +36,7 @@ test('real native conversation uses live source edits, additions, deselection, a
     const unselectedHomeSkill = path.join(f.home, '.codex/skills/home-only');
     await writeSkill(unselectedHomeSkill, 'home-only');
     const homeDescriptor = await fs.readFile(path.join(unselectedHomeSkill, 'SKILL.md'), 'utf8');
+    const { alaTranscript } = await source('achilles', 'roboTeamAgent/copilot/src/lib/execution/alaTranscript.mjs');
     const { resolveAlaInstallation } = await source('achilles', 'roboTeamAgent/copilot/src/lib/execution/alaInstallation.mjs');
     const installation = await resolveAlaInstallation({ env: { ...process.env, ACHILLES_ALA_COMMAND: path.join(roots.ala, 'bin/ala.mjs') } });
     const engine = createAlaEngine({ workingDir: f.scopeRoot, sessionStore: f.sessionStore, skillCatalog: f.catalog,
@@ -48,10 +49,12 @@ test('real native conversation uses live source edits, additions, deselection, a
         for (const value of sourceAnswers) assert.ok(!prompt.includes(value), 'Expected skill answers must only exist in source files.');
         const result = await engine.executeTurn({ sessionId: f.id, prompt, signal: AbortSignal.timeout(150000) });
         for (const value of expected) assert.ok(result.outputText.includes(value), `${label} must use the current source answer or recall history`);
-        const metadata = JSON.parse(await fs.readFile(path.join(f.home, '.ala/sessions', `${f.id}.json`), 'utf8'));
+        // ALA saves the conversation as a transcript in the working folder's private directory; RoboTeam binds the home.
+        const metadata = alaTranscript.readSessionSync(path.join(f.scopeRoot, ACHILLES_PRIVATE_DIRECTORY_NAME, '.ala'), f.id);
+        const bound = f.sessionStore.loadSession(f.id).engine;
         assert.equal(metadata.id, f.id);
-        assert.equal(metadata.home, f.home);
-        assert.equal(metadata.workspace, f.scopeRoot);
+        assert.equal(bound.home, f.home);
+        assert.equal(bound.cwd, f.scopeRoot);
         assert.equal(metadata.agent, 'codex');
         assert.ok(metadata.continuation?.threadId);
         if (states.length) assert.equal(metadata.continuation.threadId, states[0].threadId);

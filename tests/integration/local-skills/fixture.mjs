@@ -15,6 +15,9 @@ for (const name of ['achilles', 'ala', 'ploinky', 'explorer']) {
 }
 if (process.platform !== 'linux') throw new Error('Run this acceptance test on Linux. RobotStore locks require /proc process identity. See README.md.');
 
+// RoboTeam loads ALA's transcript reader from ACHILLES_ALA_COMMAND when it is imported. Point it at the ALA under test,
+// so that no checkout found next to AchillesCLI can stand in for it.
+process.env.ACHILLES_ALA_COMMAND = path.join(roots.ala, 'bin/ala.mjs');
 export const source = (repo, file) => import(pathToFileURL(path.join(roots[repo], file)).href);
 export const { RobotStore } = await source('achilles', 'roboTeamAgent/server/robot-store.mjs');
 export const { RobotSkillsets } = await source('achilles', 'roboTeamAgent/server/robot-skillsets.mjs');
@@ -22,6 +25,7 @@ export const { RuntimeManager } = await source('achilles', 'roboTeamAgent/server
 export const { ConversationSessionStore } = await source('achilles', 'roboTeamAgent/copilot/src/lib/storage/conversationSessionStore.mjs');
 export const { createRobotSkillCatalog } = await source('achilles', 'roboTeamAgent/copilot/src/lib/skills/robotSkillCatalog.mjs');
 export const { createAlaEngine } = await source('achilles', 'roboTeamAgent/copilot/src/lib/execution/alaEngine.mjs');
+export const { ACHILLES_PRIVATE_DIRECTORY_NAME } = await source('achilles', 'roboTeamAgent/copilot/src/lib/storage/privateDataRoot.mjs');
 export const { registerProject } = await source('achilles', 'roboTeamAgent/server/project-storage.mjs');
 export const { skillCatalogRequest } = await source('achilles', 'roboTeamAgent/server/skill-catalog-api.mjs');
 export const { buildHostSkillScope, buildLocalSkillScope } = await source('ploinky', 'ploinky-box/skillScope.mjs');
@@ -56,9 +60,9 @@ export function declaredToolCall(name) {
 }
 
 export const deferred = () => {
-    let resolve;
-    const promise = new Promise((done) => { resolve = done; });
-    return { promise, resolve };
+    let resolve, reject;
+    const promise = new Promise((done, fail) => { resolve = done; reject = fail; });
+    return { promise, resolve, reject };
 };
 export async function waitFor(predicate, label, timeout = 15000) {
     const deadline = Date.now() + timeout;
@@ -200,6 +204,8 @@ export async function fixture(t, { robotName = 'acceptance' } = {}) {
         cleanup.push(() => engine.close());
         const ready = deferred();
         let controls, engineError;
+        // A failed execution must fail the waiting test with its error instead of leaving it to time out.
+        ready.promise.catch(() => {});
         const manager = new RuntimeManager({ dataDir: store.dataDir, workspaceRoot, skillsets: service,
             toolCache: { prepareCodingAgents: async () => ({}) },
             spawnImpl: (_command, args, spawnOptions) => {
@@ -217,7 +223,7 @@ export async function fixture(t, { robotName = 'acceptance' } = {}) {
                         if (event.type === 'session-ready') ready.resolve();
                     },
                 })).then((result) => { child.stdout.write(result.outputText); child.emit('close', 0, null); })
-                    .catch((error) => { engineError = error; child.emit('error', error); }));
+                    .catch((error) => { engineError = error; ready.reject(error); child.emit('error', error); }));
                 return child;
             } });
         cleanup.push(() => manager.stopAll());
