@@ -395,6 +395,7 @@ export function buildRequiredCaseManifest() {
             'L1.cleanup-removes-the-host-record-directory-this-run-created-when-empty',
             'L1.cleanup-keeps-a-host-record-directory-that-existed-before-the-run',
             'L1.cleanup-keeps-a-run-created-host-record-directory-that-holds-something-else',
+            'L1.evidence-names-use-the-configured-document-suffix',
             'L1.cleanup-final-inventory-change-fails',
             'L1.cleanup-unshare-for-subordinate-owned-files', 'L1.prepare-live-mac-cpu-concrete-manifest-and-summary',
             'L1.prepare-live-apparatus-cpu-concrete-manifest-and-summary', 'L1.prepare-live-other-blocks-stay-unsupported',

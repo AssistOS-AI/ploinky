@@ -55,7 +55,7 @@ function scratch(t) {
 
 // One fake world: a candidate source, a fake engine binary, a host home, an
 // evidence directory and a concrete manifest built by the real builder.
-function world(t, { block = 'mac-cpu', platform = null, stagedRoot = true, faults = {} } = {}) {
+function world(t, { block = 'mac-cpu', platform = null, stagedRoot = true, faults = {}, suffix = 'claude' } = {}) {
     const root = scratch(t);
     const remote = block === 'apparatus-cpu';
     const directory = name => { const target = path.join(root, name); fs.mkdirSync(target, { recursive: true, mode: 0o700 }); return target; };
@@ -85,7 +85,7 @@ function world(t, { block = 'mac-cpu', platform = null, stagedRoot = true, fault
         candidate.payload = { path: payloadPath, ...writeUstar(source, payloadPath) };
     }
     const run = buildConcreteManifest({
-        block, runId, configDigest: hash('config'), casesDigest: hash('cases'), documentSuffix: 'claude', pins, candidate, image: IMAGE,
+        block, runId, configDigest: hash('config'), casesDigest: hash('cases'), documentSuffix: suffix, pins, candidate, image: IMAGE,
         ports: { tcp: 23456, udp: 34567 }, unsupported: {},
     });
     const remoteRoot = remote ? run.target.stage.root : null;
@@ -94,7 +94,7 @@ function world(t, { block = 'mac-cpu', platform = null, stagedRoot = true, fault
         fs.writeFileSync(path.join(remoteRoot, '.ploinky-hwl-owner'), runId, { mode: 0o600 });
         fs.cpSync(source, path.join(remoteRoot, 'source'), { recursive: true });
     }
-    const runPath = path.join(evidence, 'run_claude.json');
+    const runPath = path.join(evidence, `run_${suffix}.json`);
     writePrivateJson(runPath, run);
     const statePath = path.join(root, 'world_claude.json');
     const engineProvider = createFakeWorld({ statePath, node, engine, host: ENGINE_HOST, unrelated: UNRELATED, faults });
@@ -378,8 +378,8 @@ test('L1.provision-requires-separate-authorization', async t => {
 
 // --- Remote staging -------------------------------------------------------
 
-function stagedWorld(t, sshFaults = {}) {
-    const w = world(t, { block: 'apparatus-cpu', stagedRoot: false });
+function stagedWorld(t, sshFaults = {}, { suffix = 'claude' } = {}) {
+    const w = world(t, { block: 'apparatus-cpu', stagedRoot: false, suffix });
     const remoteRun = w.run.target.remote.runPath;
     const dispatch = async (words) => {
         const option = name => words[words.indexOf(name) + 1];
@@ -393,7 +393,7 @@ function stagedWorld(t, sshFaults = {}) {
     };
     const ssh = createFakeSsh({ sshBinary: w.ssh, address: '100.76.22.69', hostname: 'apparatus', faults: sshFaults, dispatch });
     const authorize = action => {
-        const file = path.join(w.evidence, `authorization_${action}_claude.json`);
+        const file = path.join(w.evidence, `authorization_${action}_${suffix}.json`);
         writePrivateJson(file, { schema: 1, runId: w.runId, manifestDigest: hash(fs.readFileSync(w.runPath)), targetDigest: jsonDigest(reload(w).target), action });
         return file;
     };
@@ -708,7 +708,7 @@ function treeDigestOf(root) {
     };
     walk(root); return hash(rows.join('\n'));
 }
-function prepareFixture(t) {
+function prepareFixture(t, { suffix = 'claude' } = {}) {
     const root = scratch(t);
     const ploinky = path.join(root, 'ploinky');
     fs.mkdirSync(path.join(ploinky, 'ploinky-box', 'bin'), { recursive: true });
@@ -720,16 +720,16 @@ function prepareFixture(t) {
     fs.writeFileSync(path.join(explorer, 'explorer', 'manifest.json'), `{\n    "container": "${IMAGE}",\n    "lite-sandbox": true\n}\n`);
     const dependency = path.join(root, 'deps', 'smalldep'); fs.mkdirSync(dependency, { recursive: true }); fs.writeFileSync(path.join(dependency, 'index.js'), 'export default 1;\n');
     const evidence = path.join(root, 'evidence'); fs.mkdirSync(evidence, { mode: 0o700 });
-    const casesPath = path.join(evidence, 'cases_claude.json'); writePrivateJson(casesPath, { schema: 1, cases: [] });
+    const casesPath = path.join(evidence, `cases_${suffix}.json`); writePrivateJson(casesPath, { schema: 1, cases: [] });
     const entry = candidateRoot => ({ baselineRevision: '0'.repeat(40), baselineExport: root, baselineStage: null, candidateRoot, sourceDigest: hash('x'), instructionDigests: {} });
     const config = {
-        schema: 1, runId: crypto.randomBytes(16).toString('hex'), createdAt: new Date().toISOString(), documentSuffix: 'claude',
+        schema: 1, runId: crypto.randomBytes(16).toString('hex'), createdAt: new Date().toISOString(), documentSuffix: suffix,
         node: { absoluteExecutable: fs.realpathSync(process.execPath), version: process.version },
         repos: { ploinky: entry(ploinky), explorer: entry(explorer), localLlms: entry(root), images: { ...entry(null), candidateRoot: null } },
         dependencies: [{ name: 'smalldep', realpath: dependency, revision: null, treeDigest: treeDigestOf(dependency) }],
         evidenceRoot: evidence, casesPath, casesDigest: hash(fs.readFileSync(casesPath)), engine: null, ssh: null,
     };
-    const configPath = path.join(evidence, 'config_claude.json'); writePrivateJson(configPath, config);
+    const configPath = path.join(evidence, `config_${suffix}.json`); writePrivateJson(configPath, config);
     const engine = path.join(root, 'podman'); fs.writeFileSync(engine, 'fake engine\n');
     const parentRoot = shortParent(t);
     const node = fs.realpathSync(process.execPath);
@@ -776,12 +776,43 @@ test('L1.prepare-live-mac-cpu-concrete-manifest-and-summary', async t => {
     assert.deepEqual(run.target.plan.cleanup.map(entry => entry.id), ['revalidate-identity', 'destroy-box', 'host-records', 'workspace-removal', 'workspace-parent-removal', 'verify-absent']);
     assert.ok(run.target.plan.live.some(entry => entry.id === 'C1-core-layout') && run.target.plan.live.some(entry => entry.id === 'C2-pids-pressure'));
     assert.equal(run.target.ssh, null); assert.equal(run.target.remote, undefined);
-    const summary = fs.readFileSync(summaryPathFor(runPath), 'utf8');
-    assert.equal(summaryPathFor(runPath), path.join(f.evidence, 'mac-cpu-run_summary.md'));
+    const summary = fs.readFileSync(summaryPathFor(runPath, 'claude'), 'utf8');
+    assert.equal(summaryPathFor(runPath, 'claude'), path.join(f.evidence, 'mac-cpu-run_summary_claude.md'));
     for (const text of ['Nothing has run', 'TCP 24680', 'UDP 35791', profile.provision.workspace.path, 'memory 64m, cpus 0.5, pids 64', BOX_IMAGE, IMAGE,
         'destroy --delete-cache', 'LIVE-C3 | not run', f.revision, os.hostname(),
         'PLOINKY_BOX_HARDWARE_LIMITS=on', '$SOURCE/ploinky-box/bin/ploinky-box.mjs --port 24680 --udp-port 35791 start hwlfixture/memory`']) assert.ok(summary.includes(text), text);
-    assert.equal(fs.statSync(runPath).mode & 0o077, 0); assert.equal(fs.statSync(summaryPathFor(runPath)).mode & 0o077, 0);
+    assert.equal(fs.statSync(runPath).mode & 0o077, 0); assert.equal(fs.statSync(summaryPathFor(runPath, 'claude')).mode & 0o077, 0);
+});
+
+// O4: evidence names carry the configured document suffix (claude or codex),
+// exactly once before the extension: the run summary, the staging journal, the
+// fetched remote report and the self-test report.
+test('L1.evidence-names-use-the-configured-document-suffix', async t => {
+    assert.equal(summaryPathFor('/x/run_codex.json', 'codex'), '/x/run_summary_codex.md');
+    assert.equal(summaryPathFor('/x/run_claude.json', 'claude'), '/x/run_summary_claude.md');
+    assert.equal(summaryPathFor('/x/run.json', 'codex'), '/x/run_summary_codex.md');
+    for (const bad of [undefined, '', 'gpt', 'claude_codex']) assert.throws(() => summaryPathFor('/x/run.json', bad), /configured document suffix/);
+    const { selfTestReportPath } = await import('../hardware-limits/verify.mjs');
+    assert.equal(selfTestReportPath('/e', 'codex'), '/e/report_self-test_codex.json');
+    assert.equal(selfTestReportPath('/e', 'claude'), '/e/report_self-test_claude.json');
+    assert.throws(() => selfTestReportPath('/e', 'other'), /claude or codex/);
+    // prepare-live writes the summary with the configured suffix (codex here).
+    if (process.platform === 'darwin') {
+        const f = prepareFixture(t, { suffix: 'codex' });
+        const main = await verifyMain();
+        const runPath = path.join(f.evidence, 'mac-cpu-run_codex.json');
+        assert.equal(await main(['prepare-live', '--config', f.configPath, '--block', 'mac-cpu', '--run', runPath, '--pins', f.pinsFile('pins_codex.json', f.macPins)]), 0);
+        assert.ok(exists(path.join(f.evidence, 'mac-cpu-run_summary_codex.md')));
+        assert.equal(fs.readdirSync(f.evidence).some(name => name.includes('_claude')), false, 'no claude-named evidence is written for a codex run');
+    }
+    // The staging journal and the fetched remote report use it too.
+    const w = stagedWorld(t, {}, { suffix: 'codex' });
+    assert.equal(path.basename(w.remoteRun), 'run_codex.json');
+    const report = await w.act('provision');
+    assert.equal(report.verdict, 'PASS', JSON.stringify(report));
+    assert.ok(exists(path.join(w.evidence, `staging_${w.runId}_codex.json`)));
+    assert.ok(exists(path.join(w.evidence, 'report_provision_remote_codex.json')));
+    assert.equal(fs.readdirSync(w.evidence).filter(name => name.includes('_claude')).length, 0, `no claude-named evidence: ${fs.readdirSync(w.evidence).join(', ')}`);
 });
 
 test('L1.prepare-live-apparatus-cpu-concrete-manifest-and-summary', async t => {
@@ -805,11 +836,11 @@ test('L1.prepare-live-apparatus-cpu-concrete-manifest-and-summary', async t => {
     assert.equal(spawnSync('tar', ['-x', '-f', run.target.stage.payloadPath, '-C', extracted]).status, 0);
     assert.equal(liveSourceDigest(fs.realpathSync(extracted)), profile.source.digest);
     assert.ok(run.target.plan.staging.some(entry => entry.id === 'remove-staging'));
-    const summary = fs.readFileSync(summaryPathFor(runPath), 'utf8');
+    const summary = fs.readFileSync(summaryPathFor(runPath, 'claude'), 'utf8');
     for (const text of ['skutner@100.76.22.69', 'HostKeyAlias 192.168.1.63', root, 'LIVE-A1 | executed', 'fetched remote cleanup PASS']) assert.ok(summary.includes(text), text);
     // Nothing is unsupported here: no empty case list, and no agent name in the runtime summary file name.
     assert.deepEqual(run.target.unsupported, {}); assert.ok(!/Cases\s+stay BLOCKED/.test(summary)); assert.ok(summary.includes('No case is unsupported on this target.'));
-    assert.equal(path.basename(summaryPathFor(runPath)), 'apparatus-cpu-run_summary.md');
+    assert.equal(path.basename(summaryPathFor(runPath, 'claude')), 'apparatus-cpu-run_summary_claude.md');
 });
 
 test('L1.prepare-live-other-blocks-stay-unsupported', async t => {
@@ -821,7 +852,7 @@ test('L1.prepare-live-other-blocks-stay-unsupported', async t => {
         const run = JSON.parse(fs.readFileSync(runPath, 'utf8'));
         assert.match(run.target.note, /^Unsupported block/); assert.equal(run.target.execution, undefined);
         assert.ok(Object.keys(run.target.unsupported).length > 0);
-        assert.equal(exists(summaryPathFor(runPath)), false);
+        assert.equal(exists(summaryPathFor(runPath, 'claude')), false);
     }
     await assert.rejects(main(['prepare-live', '--config', f.configPath, '--block', 'mac-cpu', '--run', path.join(f.evidence, 'no-pins_claude.json')]), /needs --pins/);
 });

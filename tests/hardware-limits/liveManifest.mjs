@@ -11,6 +11,7 @@ import { WANTED_CONTROLLERS } from '../../ploinky-box/entrypoint/cgroupDelegatio
 import { ENGINE_CONNECTIONS_ARGV, ENGINE_INFO_ARGV, HOST_RECORD_DIRECTORIES, IMAGE_REF, OWNER_MARKER, UNIX_SOCKET_PATH_LIMIT, WORKSPACE_SOCKET_NAME, digest, keys, AGENT_INSPECT, INSPECT } from './liveCommon.mjs';
 import { FIXTURE_REPOSITORY, fixtureContainerName, fixtureManifest, fixturePlan, proposedWorkspaceIdentity, startArgs } from './liveFixture.mjs';
 import { remoteRoot, remoteReportName } from './liveStage.mjs';
+import { DOCUMENT_SUFFIXES } from './fixtures.mjs';
 import { sshOptions } from './liveRemote.mjs';
 
 export const CONCRETE_BLOCKS = Object.freeze({
@@ -300,6 +301,10 @@ export function renderSummary(run, manifestPath) {
     return lines.filter(value => value !== null).join('\n');
 }
 
-export function summaryPathFor(runPath) {
-    return runPath.replace(/(?:_claude|_codex)?\.json$/, '') + '_summary.md';
+// The summary beside a run manifest carries the configured document suffix
+// (claude or codex, exactly once before the extension), like every evidence
+// file the implementing agent writes.
+export function summaryPathFor(runPath, documentSuffix) {
+    if (!DOCUMENT_SUFFIXES.includes(documentSuffix)) throw new Error('The run summary needs the configured document suffix (claude or codex)');
+    return `${runPath.replace(/(?:_claude|_codex)?\.json$/, '')}_summary_${documentSuffix}.md`;
 }

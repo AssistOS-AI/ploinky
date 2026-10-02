@@ -31,6 +31,7 @@ import { CONCRETE_BLOCKS, buildConcreteManifest, explorerFixtureImage, proposedW
 import { validateStage, writeUstar } from './liveStage.mjs';
 
 import {
+    DOCUMENT_SUFFIXES,
     EXIT,
     SchemaError,
     buildRequiredCaseManifest,
@@ -728,6 +729,12 @@ async function offlineCommand(options) {
     return report.exitCode;
 }
 
+// The self-test evidence uses the configured document suffix (claude or codex).
+export function selfTestReportPath(evidenceRoot, documentSuffix) {
+    if (!DOCUMENT_SUFFIXES.includes(documentSuffix)) throw new SchemaError('document-suffix must be claude or codex');
+    return path.join(evidenceRoot, `report_self-test_${documentSuffix}.json`);
+}
+
 async function selfTest(options) {
     const evidenceRoot = options['evidence-root'] ? requireAbsolute(options['evidence-root'], 'evidence-root') : '';
     const manifest = buildRequiredCaseManifest();
@@ -742,7 +749,7 @@ async function selfTest(options) {
             runId, command: 'self-test', phase: 's0', suites: [{ ...result, repo: 'ploinky', files, eventsPath }],
             cases: result.cases, verdict: result.verdict, sources: {},
         });
-        if (evidenceRoot) writePrivateJson(path.join(evidenceRoot, 'report_self-test_claude.json'), report);
+        if (evidenceRoot) writePrivateJson(selfTestReportPath(evidenceRoot, options['document-suffix'] || 'claude'), report);
         console.log(JSON.stringify(summarize(report), null, 2));
         return report.exitCode;
     } finally {
@@ -818,7 +825,7 @@ function prepareLive(options) {
         validateProfile(manifest, { partial: true });
         if (manifest.target.remote) validateStage(manifest);
         writePrivateJson(runPath, manifest);
-        const summaryPath = summaryPathFor(runPath);
+        const summaryPath = summaryPathFor(runPath, config.documentSuffix);
         writePrivateText(summaryPath, renderSummary(manifest, runPath));
         console.log(JSON.stringify({ run: runPath, summary: summaryPath, block, state: manifest.state }, null, 2));
         return EXIT.PASS;

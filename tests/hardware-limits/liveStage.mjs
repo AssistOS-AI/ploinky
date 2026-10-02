@@ -129,14 +129,23 @@ function parseSums(stdout, files) {
     return sums;
 }
 
+// The configured document suffix of this run: the one its manifest names for
+// the remote run file, else the one of the local run file's name.
+export function documentSuffixOf(run, runPath) {
+    const match = /_(claude|codex)\.json$/.exec(path.basename(String(run.target?.remote?.runPath || '')))
+        || /_(claude|codex)\.json$/.exec(path.basename(String(runPath || '')));
+    if (!match) throw new Error('The run manifest names no configured document suffix (claude or codex)');
+    return match[1];
+}
+
 export async function stageAndDispatch({ run, bytes, authorizationBytes, action, runPath, processProvider = runBoundedProcess, signal }) {
     const report = { schema: 1, runId: run.runId, action, verdict: 'BLOCKED', exitCode: EXIT.BLOCKED, cases: [], cleanup: run.cleanup, limitations: [] };
-    let stage, remote, root;
-    try { ({ stage, remote, root } = validateStage(run)); assertLocalSshPins(remote); }
+    let stage, remote, root, suffix;
+    try { ({ stage, remote, root } = validateStage(run)); assertLocalSshPins(remote); suffix = documentSuffixOf(run, runPath); }
     catch (error) { report.limitations.push(error.message); return report; }
     const profile = run.target.execution;
     const runDirectory = path.dirname(runPath);
-    const journalPath = path.join(runDirectory, `staging_${run.runId}_claude.json`);
+    const journalPath = path.join(runDirectory, `staging_${run.runId}_${suffix}.json`);
     let journal;
     try { journal = JSON.parse(fs.readFileSync(journalPath, 'utf8')); }
     catch (error) { if (error.code !== 'ENOENT') throw error; journal = { schema: 1, runId: run.runId, root, rootIntent: false, identity: null, staged: false, dispatches: [], removal: null }; }
@@ -240,7 +249,7 @@ export async function stageAndDispatch({ run, bytes, authorizationBytes, action,
         const reportText = (await call(['cat', '--', reportFile], { maxBytes: 1048576 })).stdout;
         if (digest(Buffer.from(reportText, 'utf8')) !== reportSums.get(reportFile)) throw new Error('Fetched remote report digest mismatch');
         if (jsonDigest(JSON.parse(reportText)) !== jsonDigest(remoteReport)) throw new Error('Fetched remote report differs from the dispatched result');
-        writePrivateBytes(path.join(runDirectory, `report_${action}_remote_claude.json`), Buffer.from(reportText, 'utf8'));
+        writePrivateBytes(path.join(runDirectory, `report_${action}_remote_${suffix}.json`), Buffer.from(reportText, 'utf8'));
         let removed = false;
         if (action === 'cleanup' && remoteReport.verdict === 'PASS' && fetched.state === 'complete' && fetched.cleanup.state === 'complete') {
             await removeStaging(); removed = true;
