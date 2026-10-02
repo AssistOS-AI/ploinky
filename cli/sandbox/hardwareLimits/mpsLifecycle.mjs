@@ -8,7 +8,7 @@ import { resolveAgentRepositoryName } from '../../utils/agentRepositorySource.mj
 import { resolveManifestRuntimeProfile } from '../../utils/runtime/profileService.js';
 import { resolveManifestImage } from '../../utils/security/secretVars.js';
 import { resolveRouterEndpoint } from '../routerPort.js';
-import { assertNetworkLifecycleCapability, withNetworkLifecycleLockAsync, createNetworkLifecycleAdapter } from '../networkLifecycle.js';
+import { assertNetworkLifecycleCapability, withNetworkLifecycleLockAsync } from '../networkLifecycle.js';
 import { ensureAgentService, retireExactAgentRuntimePredecessor } from '../docker/agentServiceManager.js';
 import { ensureImagePresent, getRuntime, getAgentContainerName } from '../docker/common.js';
 import { resolveLlmRuntimeAdmissionContext } from '../docker/llmRuntimeIntegration.js';
@@ -17,7 +17,8 @@ import { retireRuntimeRelaySocket } from '../docker/healthProbes.js';
 import { prepareTargetedAgentRestart } from '../../commands/targetedAgentRestart.js';
 import { readBoxHardwareContext } from './context.mjs';
 import { readAppliedObservation } from './runtimeState.mjs';
-import { assertKnownMpsClients } from './mpsInventory.mjs';
+import { assertKnownMpsClients, inspectMpsClient } from './mpsInventory.mjs';
+import { HardwareStoreError } from './store.mjs';
 import { HardwareLimitsError } from './errors.mjs';
 import { buildDirectRefusal, hex64 } from './requestedLimits.mjs';
 import { resolveStoredGpuShare } from './resolve.mjs';
@@ -53,8 +54,8 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
         const token = options.expectedToken === undefined ? context.storeToken : options.expectedToken;
         const check = () => {
             options.beforeHardwareMutation?.();
-            if (options.isCancelled?.() || Date.now() >= (options.deadline || Infinity)) throw new MpsError('MPS lifecycle was cancelled or exceeded its deadline');
-            if (options.authorize && options.authorize() !== true) throw new MpsError('MPS lifecycle authorization changed');
+            if (options.isCancelled?.() || Date.now() >= (options.deadline || Infinity)) throw new HardwareStoreError('MPS lifecycle was cancelled or exceeded its deadline', { code: 'apply_timeout', status: 504 });
+            if (options.authorize && options.authorize() !== true) throw new HardwareStoreError('MPS lifecycle authorization changed', { code: 'identity_changed', status: 409 });
             policyCheck(token, { origin: options.origin || 'cli' });
         };
         check();
@@ -102,13 +103,12 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
             drain: async (client) => {
                 check();
                 const record = loadRegistry()[client.key];
-                if (!record || record.instanceId !== client.instanceId || record.enableGeneration !== client.enableGeneration || record.containerId !== client.containerId) throw new MpsError('MPS cohort registry identity changed before drain');
+                if (!record || record.instanceId !== client.instanceId || record.enableGeneration !== client.enableGeneration || record.containerId !== client.containerId) throw new HardwareStoreError('MPS cohort registry identity changed before drain', { code: 'identity_changed', status: 409 });
                 if (drainClient) return drainClient(client, record, capability);
                 const plan = plans.get(client.key) || loadPlan(client.ref, record);
-                const adapter = createNetworkLifecycleAdapter({ runtime: plan.runtime });
-                const observation = adapter.inspectContainerContract(client.key, plan.profile.network, record.agentName, { instanceId: client.instanceId, enableGeneration: client.enableGeneration, requireRuntimeIdentity: true });
+                const observation = inspectMpsClient(client, { runtime: plan.runtime, network: plan.profile.network, alias: record.alias || '' });
                 if (observation.state === 'absent') return;
-                if (observation.state !== 'exact' || observation.id !== client.containerId) throw new MpsError('MPS cohort runtime ownership changed before drain');
+                if (observation.state !== 'exact' || observation.id !== client.containerId) throw new HardwareStoreError('MPS cohort runtime ownership changed before drain', { code: 'identity_changed', status: 409 });
                 if (observation.running === false) {
                     check();
                     retireExactAgentRuntimePredecessor({ containerName: client.key, containerId: client.containerId, registryRecord: record, runtimeNetwork: plan.profile.network }, { networkLifecycleCapability: capability });
@@ -124,13 +124,13 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
                 check();
                 const capturedRecord = recordFor.get(client.key);
                 const currentRecord = loadRegistry()[client.key];
-                if (registry[client.key] && !isDeepStrictEqual(currentRecord, capturedRecord)) throw new MpsError('MPS exact client identity changed before recreate');
+                if (registry[client.key] && !isDeepStrictEqual(currentRecord, capturedRecord)) throw new HardwareStoreError('MPS exact client identity changed before recreate', { code: 'identity_changed', status: 409 });
                 const mpsLaunch = createMpsLaunch({ key: client.key, share: client.share, state, imageId: images.get(client.key) || null });
                 if (client.key === target.key) {
                     targetResult = await launchTarget({ ...options, mpsLaunch, mpsTransitionAction: 'clients', networkLifecycleCapability: capability });
                     if (targetResult?.state === 'applied') return targetResult;
                     if (targetResult?.mpsReady) return { key: client.key, observedKey: targetResult.containerName, state: 'applied', containerId: targetResult.containerId };
-                    const launchedClient = { ...client, key: targetResult.containerName, containerId: targetResult.containerId, instanceId: targetResult.registryRecord?.instanceId, enableGeneration: targetResult.registryRecord?.enableGeneration };
+                    const launchedClient = { ...client, mpsGeneration: state ? `${state.daemonGeneration}:${state.configurationGeneration}` : '', key: targetResult.containerName, containerId: targetResult.containerId, instanceId: targetResult.registryRecord?.instanceId, enableGeneration: targetResult.registryRecord?.enableGeneration };
                     if (client.share) Object.defineProperty(targetResult, 'mpsReadiness', { value: { mpsLaunch, key: client.key, share: client.share, client: launchedClient }, configurable: true });
                     return { key: client.key, state: 'starting', containerId: targetResult.containerId, client: launchedClient };
                 }
@@ -142,7 +142,7 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
         });
         if (!targetResult) {
             check();
-            if (registry[target.key] && !isDeepStrictEqual(loadRegistry()[target.key], recordFor.get(target.key))) throw new MpsError('MPS exact target identity changed before reuse');
+            if (registry[target.key] && !isDeepStrictEqual(loadRegistry()[target.key], recordFor.get(target.key))) throw new HardwareStoreError('MPS exact target identity changed before reuse', { code: 'identity_changed', status: 409 });
             const mpsLaunch = createMpsLaunch({ key: target.key, share: selected?.share || null, state: result.state, imageId: images.get(target.key) || null });
             targetResult = await launchTarget({ ...options, mpsLaunch, networkLifecycleCapability: capability });
         }
@@ -239,7 +239,7 @@ export async function ensureMpsGraphAgentService(agentName, manifest, agentPath,
         throw error;
     }
     if (share) {
-        const client = { key: result.containerName, ref, instanceId: result.registryRecord?.instanceId, enableGeneration: result.registryRecord?.enableGeneration, containerId: result.containerId, share, phase: 'readiness' };
+        const client = { key: result.containerName, ref, instanceId: result.registryRecord?.instanceId, enableGeneration: result.registryRecord?.enableGeneration, containerId: result.containerId, share, mpsGeneration: `${state.daemonGeneration}:${state.configurationGeneration}`, phase: 'readiness' };
         state = { ...store.read(), pendingClients: [...(store.read()?.pendingClients || []).filter((value) => value.key !== client.key), client] };
         store.write(state);
         Object.defineProperty(result, 'mpsReadiness', { value: { mpsLaunch, key, share, client }, configurable: true });
@@ -258,6 +258,7 @@ async function acknowledgeMpsRuntimeReadyStrict(result, { store = createMpsState
 }
 
 function typedMpsFailure(error, target) {
+    if (['identity_changed', 'revision_conflict', 'apply_timeout', 'hardware_limits_transition'].includes(error?.code)) return error;
     if (!(error instanceof MpsError) && error?.code !== 'gpu_sharing_unavailable' && error?.code !== 'image_preparation_required') return error;
     const ref = `${target.record.repoName}/${target.record.agentName}`;
     return new HardwareLimitsError(buildDirectRefusal({ key: target.key, ref, alias: target.record.alias || null,
@@ -330,7 +331,7 @@ export function trackMpsRuntimePending(result, { mpsLaunch, key }, { store = cre
     const record = result?.registryRecord;
     if (!record?.instanceId || !record?.enableGeneration || !/^[a-f0-9]{64}$/.test(result.containerId)) throw new MpsError('MPS client readiness requires its exact created identity');
     const client = { key: result.containerName, ref: `${record.repoName}/${record.agentName}`, instanceId: record.instanceId,
-        enableGeneration: record.enableGeneration, containerId: result.containerId, share: launch.share, phase: 'readiness' };
+        enableGeneration: record.enableGeneration, containerId: result.containerId, share: launch.share, mpsGeneration: `${launch.state.daemonGeneration}:${launch.state.configurationGeneration}`, phase: 'readiness' };
     const state = store.read();
     if (state?.daemonGeneration !== launch.state?.daemonGeneration || state?.configurationGeneration !== launch.state?.configurationGeneration) throw new MpsError('MPS generation changed before readiness tracking');
     store.write({ ...state, pendingClients: [...(state.pendingClients || []).filter((entry) => entry.key !== key && entry.key !== client.key), client] });

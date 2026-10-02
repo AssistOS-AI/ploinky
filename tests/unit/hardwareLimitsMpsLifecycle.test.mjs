@@ -112,3 +112,15 @@ test('MPL.generation-drift', () => {
     assert.equal(plan.action, 'restart'); assert.equal(plan.drain.length, 1);
     assert.throws(() => planMpsTransition({ desiredClients: [client('a')], state: ready(), observedDaemon: { state: 'foreign' }, defaultsVerified: false }), /another process/);
 });
+
+test('MPS recovery drains a created pending candidate before stopping its daemon', () => {
+    const pending = client('orphan', share(), { containerId: 'c'.repeat(64), mpsGeneration: 'daemon-old:config-old', phase: 'readiness' });
+    const state = { ...ready(), pendingClients: [pending], status: 'pending' };
+    const f = fixture({ state, oldClients: [client('a')], desiredClients: [client('a', share(50,2048))] });
+    f.run(); before(f.events, 'drain:orphan', 'quit');
+});
+test('MPS recovered pending observation can share an exact already-recorded identity', () => {
+    const same = client('a');
+    const plan = planMpsTransition({ oldClients: [same], desiredClients: [same], state: { ...ready(), pendingClients: [{ ...same, phase: 'readiness' }] }, observedDaemon: { state: 'owned' }, defaultsVerified: true });
+    assert.equal(plan.action, 'reuse'); assert.equal(plan.oldClients.length, 1);
+});

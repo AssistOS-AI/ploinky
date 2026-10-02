@@ -234,6 +234,7 @@ export async function reconcileExactHardwareInstance(captured, {
             else cleanupPrepared(result, error, 'hardware-reconcile-failed');
             const problem = findHardwareOutcome(error);
             if (problem && problem.key === captured.key) {
+                checkPolicy();
                 const current = loadRegistry()[captured.key];
                 if (current?.instanceId && current?.enableGeneration) {
                     const projection = buildAvailabilityProjection({ outcome: problem, instanceId: current.instanceId, enableGeneration: current.enableGeneration });
@@ -242,6 +243,7 @@ export async function reconcileExactHardwareInstance(captured, {
                         return routing;
                     }, { reason: 'hardware-apply-refused', networkLifecycleCapability: capability });
                     if (plan && captured.record.containerId && current.containerId === captured.record.containerId) {
+                        checkPolicy();
                         try {
                             retireUnavailable({ containerName: captured.key, containerId: captured.record.containerId, registryRecord: captured.record, runtimeNetwork: plan.profileResolution.network }, { networkLifecycleCapability: capability });
                         } catch (cleanupError) {

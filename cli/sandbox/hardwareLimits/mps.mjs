@@ -181,13 +181,33 @@ export function recoverMpsDaemonIdentity(state, { fsApi = fs, procRoot = '/proc'
         try {
             const entries = fsApi.readdirSync(procRoot).filter((entry) => /^[1-9]\d*$/.test(entry));
             if (entries.length > 4096) return { state: 'unknown' };
+            const absentNow = (pid) => {
+                try {
+                    const fields = String(fsApi.readFileSync(`${procRoot}/${pid}/stat`, 'utf8')).replace(/^.*\) /, '').split(' ');
+                    return fields.length >= 20 && /^\d+$/.test(fields[19]) && fields[0] === 'Z';
+                } catch (error) { return error.code === 'ENOENT'; }
+            };
             for (const pid of entries) {
+                let matchingExecutable = false;
                 try {
                     const binary = fsApi.statSync(`${procRoot}/${pid}/exe`);
                     if (binary.dev !== state.tools.control.dev || binary.ino !== state.tools.control.ino) continue;
+                    matchingExecutable = true;
                     const env = fsApi.readFileSync(`${procRoot}/${pid}/environ`);
-                    if (env.length <= 8192 && env.toString().split('\0').includes(`CUDA_MPS_PIPE_DIRECTORY=${state.pipeDirectory}`)) return { state: 'unknown' };
-                } catch (inspectionError) { if (!['ENOENT', 'EACCES', 'EPERM'].includes(inspectionError.code)) return { state: 'unknown' }; }
+                    if (env.length > 8192) {
+                        if (absentNow(pid)) continue;
+                        return { state: 'unknown' };
+                    }
+                    if (env.toString().split('\0').includes(`CUDA_MPS_PIPE_DIRECTORY=${state.pipeDirectory}`)) return { state: 'unknown' };
+                } catch (inspectionError) {
+                    // A matching executable may still use these pipes. Failure
+                    // to inspect its environment never proves termination.
+                    if (matchingExecutable) {
+                        if (absentNow(pid)) continue;
+                        return { state: 'unknown' };
+                    }
+                    if (!['ENOENT', 'EACCES', 'EPERM'].includes(inspectionError.code)) return { state: 'unknown' };
+                }
             }
             return { state: 'gone' };
         } catch (_) { return { state: 'unknown' }; }

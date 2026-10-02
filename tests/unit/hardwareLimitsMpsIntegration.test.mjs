@@ -142,3 +142,12 @@ test('MI.launch rejects missing immutable image and insufficient changed default
     const state = daemon(); const launch = createMpsLaunch({ key: 'a', share, state, imageId });
     assert.throws(() => verifyMpsLaunch(launch, 'a', share, { store: { read: () => ({ ...state, serverDefault: { ...state.serverDefault, smPercent: 1 } }) }, backend: { verify: () => true } }), /defaults/);
 });
+
+test('MI.authorization loss after awaited drain aborts before daemon mutation as a control error', async () => {
+    const f = fixture({ nextShare: { ...share, smPercent: 50 } }); let authorized = true;
+    f.input.options.authorize = () => authorized;
+    f.dependencies.drainClient = async () => { await tick(); authorized = false; };
+    await assert.rejects(coordinateMpsLifecycle(f.input, f.dependencies), { code: 'identity_changed' });
+    assert.equal(f.events.includes('stop-daemon'), false);
+    assert.equal(f.events.includes('launch:a'), false);
+});

@@ -2645,6 +2645,7 @@ async function startWorkspace(staticAgentArg, portArg, {
     });
     const prepareGraphMps = async () => {
       const prepared = await prepareMpsGraph({ nodes: mpsGraphNodes(), networkLifecycleCapability });
+      if (prepared.diagnostic) console.warn(`[hardware-limits] ${prepared.diagnostic.message}. ${prepared.diagnostic.fix}`);
       for (const refusal of prepared.refusals || []) graphAvailability.recordLaunchRefusal(refusal);
       for (const entry of graphAvailability.unavailableEntries()) unavailableNodeIds.add(entry.nodeId);
       return prepared;

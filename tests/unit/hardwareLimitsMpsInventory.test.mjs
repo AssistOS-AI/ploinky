@@ -12,3 +12,17 @@ for (const [name, reply] of Object.entries({ unknown:{status:0,stdout:b}, trunca
         assert.throws(()=>assertKnownMpsClients({runtime:'podman',registry:{a:{containerId:a}},query:()=>reply}));
     });
 }
+
+import { inspectMpsClient } from '../../cli/sandbox/hardwareLimits/mpsInventory.mjs';
+import { networkContractHash } from '../../cli/sandbox/networkContract.js';
+import { effectiveInstanceKey } from '../../cli/utils/workspaceDependencyGraph.js';
+test('MPS cohort inspection binds immutable ID and full alias network contract', () => {
+    const network = { mode: 'default' };
+    const client = { key: 'opaque', ref: 'repo/gpu', alias: 'router', containerId: a, instanceId: 'instance', enableGeneration: 'generation' };
+    let observed;
+    const result = inspectMpsClient(client, { network, runtime: 'podman', createAdapter: () => ({ inspectContainerContract(...args) { observed = args; return { state: 'exact', id: a }; } }) });
+    assert.equal(result.id, a); assert.equal(observed[0], a);
+    assert.equal(observed[3].contractHash, networkContractHash(network));
+    assert.equal(observed[3].instanceKey, effectiveInstanceKey('repo', 'gpu', 'router'));
+    assert.equal(observed[3].requireRuntimeIdentity, true);
+});

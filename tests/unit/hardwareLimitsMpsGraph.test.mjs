@@ -152,3 +152,16 @@ test('MG.unavailable daemon contains GPU refusals without failing unrelated grap
     assert.equal(result.refusals.every((value) => value.code === 'PLOINKY_HARDWARE_LIMITS_UNENFORCEABLE'), true);
     assert.deepEqual(f.events, []);
 });
+
+for (const code of ['EACCES', 'malformed']) {
+    test(`MG.CPU-only graph preserves unavailable MPS state and continues: ${code}`, async () => {
+        const f = fixture();
+        f.context.overrides = new Map(); f.deps.readApplied = () => null;
+        f.deps.store.read = () => { throw Object.assign(new Error('private state unreadable'), { code }); };
+        const result = await f.run();
+        assert.deepEqual(result.refusals, []); assert.equal(result.replacedKeys.size, 0);
+        assert.equal(result.diagnostic.code, 'mps_backend_unavailable');
+        assert.match(result.diagnostic.fix, /restart this Box/);
+        assert.deepEqual(f.events, []);
+    });
+}

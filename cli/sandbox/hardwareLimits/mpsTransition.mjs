@@ -10,11 +10,12 @@ function exactClient(value) {
     if (value.share) validateMpsDefault(value.share);
     return value;
 }
+function clientProof({ key, ref, instanceId, enableGeneration, containerId, share, mpsGeneration }) { return { key, ref, instanceId, enableGeneration, containerId, share, mpsGeneration }; }
 function clientIdentity(value) { return [value.key, value.instanceId, value.enableGeneration, value.containerId || ''].join('\0'); }
 function uniqueClients(values) {
     if (!Array.isArray(values) || values.length > 256) throw new MpsError('MPS client cohort exceeds its bound');
     const map = new Map();
-    for (const value of values) { exactClient(value); const key = clientIdentity(value); if (map.has(key) && !isDeepStrictEqual(map.get(key), value)) throw new MpsError('MPS exact client observations conflict'); map.set(key, value); }
+    for (const value of values) { exactClient(value); const key = clientIdentity(value); if (map.has(key) && !isDeepStrictEqual(clientProof(map.get(key)), clientProof(value))) throw new MpsError('MPS exact client observations conflict'); map.set(key, value); }
     return [...map.values()].sort((left, right) => left.key.localeCompare(right.key));
 }
 
@@ -31,7 +32,8 @@ export function resolveMpsServerDefault(configuredPolicies = []) {
 }
 
 export function planMpsTransition({ oldClients = [], desiredClients = [], configuredPolicies = desiredClients, selectedKeys = [], state = null, observedDaemon = { state: 'gone' }, defaultsVerified = false } = {}) {
-    const old = uniqueClients([...oldClients, ...(state?.oldClients || [])]);
+    const pendingCreated = (state?.pendingClients || []).filter((client) => client.share && /^[a-f0-9]{64}$/.test(String(client.containerId || '')));
+    const old = uniqueClients([...oldClients, ...(state?.oldClients || []), ...pendingCreated]);
     const desired = uniqueClients(desiredClients);
     const keys = new Set(selectedKeys);
     const targetDefault = resolveMpsServerDefault(configuredPolicies);

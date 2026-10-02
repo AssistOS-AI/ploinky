@@ -1,4 +1,7 @@
 import { spawnSync } from 'node:child_process';
+import { createNetworkLifecycleAdapter } from '../networkLifecycle.js';
+import { networkContractHash } from '../networkContract.js';
+import { effectiveInstanceKey } from '../../utils/workspaceDependencyGraph.js';
 import { MpsError } from './mpsEligibility.mjs';
 
 /** A daemon transition must not discard an unjournaled CUDA client's server. */
@@ -15,4 +18,13 @@ export function assertKnownMpsClients({ runtime, registry = {}, state = null, qu
         ...(state?.oldClients || []).map((client) => client.containerId), ...(state?.pendingClients || []).map((client) => client.containerId)]);
     if (ids.some((id) => !known.has(id))) throw new MpsError('An MPS client is outside the exact registry and transition journal. Recover this Box on the host before changing its daemon.');
     return ids;
+}
+
+export function inspectMpsClient(client, { network, runtime, alias = client.alias || '', createAdapter = createNetworkLifecycleAdapter } = {}) {
+    if (!/^[a-f0-9]{64}$/.test(String(client.containerId || ''))) throw new MpsError('MPS inspection needs an immutable client ID', 'identity_changed');
+    const [repoName, agentName] = String(client.ref || '').split('/');
+    return createAdapter({ runtime }).inspectContainerContract(client.containerId, network, agentName, {
+        instanceKey: effectiveInstanceKey(repoName, agentName, alias), contractHash: networkContractHash(network),
+        instanceId: client.instanceId, enableGeneration: client.enableGeneration, requireRuntimeIdentity: true,
+    });
 }

@@ -4,13 +4,13 @@ import { spawnSync } from 'node:child_process';
 import { readAgentRegistrySnapshot } from '../../utils/agentRegistrySnapshot.js';
 import { resolveManifestRuntimeProfile } from '../../utils/runtime/profileService.js';
 import { readEdgeRoutingSelection } from '../edgeGeneration.js';
-import { assertNetworkLifecycleCapability, createNetworkLifecycleAdapter } from '../networkLifecycle.js';
+import { assertNetworkLifecycleCapability } from '../networkLifecycle.js';
 import { getRuntime } from '../docker/common.js';
 import { drainTargetedContainer, TARGETED_DRAIN_ACKNOWLEDGEMENT } from '../docker/targetedContainerLifecycle.js';
 import { retireRuntimeRelaySocket } from '../docker/healthProbes.js';
 import { readBoxHardwareContext } from './context.mjs';
 import { readAppliedObservation } from './runtimeState.mjs';
-import { assertKnownMpsClients } from './mpsInventory.mjs';
+import { assertKnownMpsClients, inspectMpsClient } from './mpsInventory.mjs';
 import { createMpsStateStore, createMpsDaemonBackend } from './mps.mjs';
 import { MpsError } from './mpsEligibility.mjs';
 import { resolveStoredGpuShare } from './resolve.mjs';
@@ -28,8 +28,7 @@ async function prepareMpsGraphImpl({ nodes, networkLifecycleCapability, deadline
     readContext = readBoxHardwareContext, loadRegistry = readAgentRegistrySnapshot, readApplied = readAppliedObservation,
     store = createMpsStateStore(), backend = createMpsDaemonBackend(), assertCapability = assertNetworkLifecycleCapability,
     readSelection = readEdgeRoutingSelection, resolveShare = resolveStoredGpuShare, runtime = getRuntime,
-    inspect = (client, network, engine) => createNetworkLifecycleAdapter({ runtime: engine }).inspectContainerContract(
-        client.key, network, client.ref.split('/')[1], { instanceId: client.instanceId, enableGeneration: client.enableGeneration, requireRuntimeIdentity: true }),
+    inspect = (client, network, engine) => inspectMpsClient(client, { network, runtime: engine }),
     drain = drainTargetedContainer, observeClients = assertKnownMpsClients,
 } = {}) {
     assertCapability(networkLifecycleCapability);
@@ -45,7 +44,7 @@ async function prepareMpsGraphImpl({ nodes, networkLifecycleCapability, deadline
         if (record?.type !== 'agent' || !record.containerId) continue;
         const applied = readApplied(key, record.containerId);
         if (!applied?.mpsGeneration || applied.instanceId !== record.instanceId || applied.enableGeneration !== record.enableGeneration) continue;
-        const client = { key, ref: `${record.repoName}/${record.agentName}`, instanceId: record.instanceId,
+        const client = { key, alias: record.alias || '', ref: `${record.repoName}/${record.agentName}`, instanceId: record.instanceId,
             enableGeneration: record.enableGeneration, containerId: record.containerId, share: applied.gpuShare, mpsGeneration: applied.mpsGeneration };
         if (!clients.has(tuple(client))) clients.set(tuple(client), client);
     }
@@ -144,7 +143,6 @@ export async function prepareMpsGraph(input, dependencies = {}) {
                 inputFingerprint: hex64({ ref, configured, gpu: context.gpu?.wiringFingerprint, reason: error.message }),
             }));
         }
-        if (!refusals.length) throw error;
-        return { replacedKeys: new Set(), refusals };
+        return { replacedKeys: new Set(), refusals, diagnostic: { code: 'mps_backend_unavailable', message: error.message, fix: 'Inspect ploinky limits status and restart this Box on the host before using GPU shares.' } };
     }
 }
