@@ -527,7 +527,7 @@ export function evaluateSuiteRun({
     files = [],
     required = [],
     baseline = null,
-    knownBaselineFailures = new Set(),
+    knownBaselineFailures = new Map(),
 } = {}) {
     const problems = [];
     if (signal) problems.push(`test child terminated by signal ${signal}`);
@@ -582,10 +582,20 @@ export function evaluateSuiteRun({
     }
     const newFailures = [];
     const baselineFailures = [];
+    const failureSignatures = new Map();
+    const provenDiagnostic = (error) => error && typeof error.category === 'string' && error.category.length > 0 && error.category.length <= 256
+        && /^[a-f0-9]{64}$/.test(error.signature || '') && error.proofUnavailable !== true
+        ? { category: error.category, signature: error.signature } : null;
     for (const [testId, { result, record }] of leafResults) {
         if (result !== 'fail') continue;
-        if (knownBaselineFailures.has(testId)) baselineFailures.push({ testId, message: record.payload.error?.message || '' });
-        else newFailures.push({ testId, message: record.payload.error?.message || '' });
+        const proof = provenDiagnostic(record.payload.error);
+        failureSignatures.set(testId, proof);
+        const prior = knownBaselineFailures instanceof Map ? provenDiagnostic(knownBaselineFailures.get(testId)) : null;
+        const failure = { testId, message: record.payload.error?.message || '', ...(proof || {}) };
+        if (proof && prior && proof.category === prior.category && proof.signature === prior.signature) baselineFailures.push(failure);
+        else newFailures.push({ ...failure, reason: knownBaselineFailures.has(testId)
+            ? proof && prior ? 'baseline failure diagnostic changed' : 'baseline failure diagnostic proof unavailable'
+            : 'new failing test' });
     }
     const removed = [];
     const newlySkipped = [];
@@ -613,6 +623,7 @@ export function evaluateSuiteRun({
         cases,
         newFailures,
         baselineFailures,
+        failureSignatures,
         removed,
         newlySkipped,
         discovered: leafResults.size,

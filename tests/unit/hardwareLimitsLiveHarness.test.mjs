@@ -7,6 +7,8 @@ import crypto from 'node:crypto';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { runBoundedProcess } from '../hardware-limits/liveProcess.mjs';
+import { dispatchRemoteRun, assertRemoteArrival } from '../hardware-limits/liveRemote.mjs';
+import { CORE_LAYOUT, MEMBERSHIP as PROCESS_MEMBERSHIP, HELD_ALLOCATION, ALLOCATION_HANDSHAKE } from '../hardware-limits/liveCaseCommands.mjs';
 import { parseGpuInventory, requireGpuIdle } from '../hardware-limits/liveGpu.mjs';
 import {
     assertWorkspace, executeLiveRun, jsonDigest, readPrivateJson, runLiveCommand,
@@ -205,4 +207,195 @@ test('HLIVE.host-state-left-behind-prevents-workspace-deletion', async t => {
     const report = await executeLiveRun({ run: f.run, hostIdentity: f.profile.host, action: 'cleanup', processProvider: f.provider });
     assert.equal(report.verdict, 'FAIL'); assert.ok(fs.existsSync(f.workspace));
     assert.match(report.cleanup.failures[0], /host state/);
+});
+
+test('HLIVE.R13-removal-intent-directory-substitution-is-preserved', async t => {
+    const f = fixture(t); const original = f.workspace + '-original'; let replaced = false;
+    const persist = () => {
+        if (!replaced && f.run.cleanup.steps.some(step => step.id === 'workspace-removal' && step.state === 'intent')) {
+            replaced = true; fs.renameSync(f.workspace, original); fs.mkdirSync(f.workspace);
+            fs.writeFileSync(path.join(f.workspace, 'foreign.txt'), 'must remain');
+        }
+    };
+    const report = await executeLiveRun({ run: f.run, hostIdentity: f.profile.host, action: 'cleanup', processProvider: f.provider, persist });
+    assert.equal(report.verdict, 'FAIL');
+    assert.equal(fs.readFileSync(path.join(f.workspace, 'foreign.txt'), 'utf8'), 'must remain');
+    assert.ok(fs.existsSync(path.join(original, '.ploinky-hwl-owner')));
+});
+
+test('HLIVE.R16-inherited-pipe-grandchild-deadline', async t => {
+    const { root } = fixture(t); const pidFile = path.join(root, 'grandchild_codex.json');
+    const script = 'const {spawn}=require("node:child_process");const fs=require("node:fs");const c=spawn(process.execPath,["-e","setTimeout(()=>{},3000)"],{stdio:["ignore","inherit","inherit"]});fs.writeFileSync(process.argv[1],JSON.stringify({pid:c.pid}));setInterval(()=>{},1000);';
+    let pid = null;
+    t.after(() => { if(pid)try{process.kill(pid,'SIGKILL')}catch(e){if(e.code!=='ESRCH')throw e;} });
+    const start = Date.now();
+    const result = await runBoundedProcess(process.execPath, ['-e', script, pidFile], { cwd: root, env: { PATH: process.env.PATH }, deadlineMs: 200 });
+    const elapsed = Date.now() - start;
+    if (fs.existsSync(pidFile)) pid = JSON.parse(fs.readFileSync(pidFile)).pid;
+    assert.equal(result.timedOut, true); assert.ok(elapsed < 1500, `elapsed ${elapsed} ms`); assert.ok(pid);
+    let alive = true;
+    for(let i=0;i<30;i++){
+        try{process.kill(pid,0);if(process.platform==='linux'&&/^\d+ \(.*\) Z /.test(fs.readFileSync('/proc/'+pid+'/stat','utf8')))alive=false;}
+        catch(e){if(e.code==='ESRCH'||e.code==='ENOENT')alive=false;else throw e;}
+        if(!alive)break;await new Promise(resolve=>setTimeout(resolve,20));
+    }
+    assert.equal(alive,false,'owned grandchild still running'); pid=null;
+});
+
+function offlineSourceFixture(t, mutateDuringRun = false) {
+    const f = fixture(t); const evidence = path.join(f.root, 'evidence'); fs.mkdirSync(evidence);
+    const roots = Object.fromEntries(['ploinky', 'localLlms', 'explorer', 'images'].map(name => {
+        const root = path.join(f.root, 'offline-' + name); fs.mkdirSync(root); return [name, root];
+    }));
+    const testDirectory = path.join(roots.explorer, 'tests'); fs.mkdirSync(testDirectory);
+    const marker = path.join(evidence, 'executed_codex.json');
+    const body = `import test from 'node:test';import fs from 'node:fs';test('source.leaf',()=>{fs.writeFileSync(${JSON.stringify(marker)},'{}');${mutateDuringRun ? "fs.writeFileSync(new URL('../drift.mjs',import.meta.url),'changed');" : ''}});`;
+    fs.writeFileSync(path.join(testDirectory, 'source.test.mjs'), body);
+    function sourceDigest(root) {
+        const rows = [];
+        const walk = (directory, relative = '') => {
+            for (const name of fs.readdirSync(directory).sort()) {
+                if(name==='.git')continue; const target = path.join(directory, name), rel = relative ? relative + '/' + name : name;
+                const stat = fs.lstatSync(target);
+                if(stat.isDirectory())walk(target,rel);
+                else if(stat.isFile())rows.push(rel+'\0'+hash(fs.readFileSync(target)).slice(7));
+                else if(stat.isSymbolicLink())rows.push(rel+'\0link:'+fs.readlinkSync(target));
+            }
+        };walk(root);return hash(rows.join('\n'));
+    }
+    const cases = {schema:1,cases:[{id:'source.leaf',phase:'p3',repo:'explorer',file:'tests/source.test.mjs',name:'source.leaf',kind:'offline',requires:[],expected:'pass'}]};
+    const casesPath = path.join(evidence, 'cases_codex.json'); fs.writeFileSync(casesPath, JSON.stringify(cases), {mode:0o600});
+    const config = {schema:1,runId:f.run.runId,createdAt:new Date().toISOString(),documentSuffix:'codex',node:{absoluteExecutable:fs.realpathSync(process.execPath),version:process.version},repos:{},dependencies:[],evidenceRoot:evidence,casesPath,casesDigest:hash(fs.readFileSync(casesPath)),engine:null,ssh:null};
+    for(const [name,root] of Object.entries(roots))config.repos[name]={baselineRevision:'0'.repeat(40),baselineExport:root,baselineStage:root,candidateRoot:name==='images'?null:root,sourceDigest:sourceDigest(root),instructionDigests:{}};
+    const configPath=path.join(evidence,'config_codex.json');fs.writeFileSync(configPath,JSON.stringify(config),{mode:0o600});
+    const refresh = () => { for (const name of ['ploinky','localLlms','explorer']) config.repos[name].sourceDigest=sourceDigest(roots[name]); fs.writeFileSync(configPath,JSON.stringify(config),{mode:0o600}); };
+    return { ...f, configPath, roots, marker, evidence, refresh };
+}
+
+test('HLIVE.R15-configure-then-source-mutation-blocked-before-suite', async t => {
+    const f=offlineSourceFixture(t);fs.writeFileSync(path.join(f.roots.explorer,'changed.mjs'),'changed');
+    const {main}=await import('../hardware-limits/verify.mjs');
+    await assert.rejects(main(['offline','--config',f.configPath,'--phase','p3']),/candidate source changed/);
+    assert.equal(fs.existsSync(f.marker),false);
+});
+
+test('HLIVE.R15-source-mutation-during-suite-invalidates-report', async t => {
+    const f=offlineSourceFixture(t,true);const {main}=await import('../hardware-limits/verify.mjs');
+    await assert.rejects(main(['offline','--config',f.configPath,'--phase','p3']),/candidate source changed/);
+    assert.equal(fs.existsSync(f.marker),true);
+    assert.equal(fs.existsSync(path.join(f.evidence,'report_offline-p3_codex.json')),false);
+});
+
+
+test('HLIVE.R18-Explorer-baseline-records-and-detects-removed-skipped', async t => {
+    const f=offlineSourceFixture(t);const {main}=await import('../hardware-limits/verify.mjs');
+    const files=[['explorer/tests/unit/settingsAccount.test.js','legacy.settings'],['workspaceMonitorAgent/tests/currentSnapshot.test.mjs','legacy.monitor'],['tests/smoke/lib/box-evidence.test.mjs','legacy.smoke']];
+    for(const [file,name] of files){const target=path.join(f.roots.explorer,file);fs.mkdirSync(path.dirname(target),{recursive:true});fs.writeFileSync(target,`import test from 'node:test';test('${name}',()=>{});`);}
+    f.refresh();assert.equal(await main(['baseline','--config',f.configPath,'--phases','p3']),0);
+    const recorded=JSON.parse(fs.readFileSync(path.join(f.evidence,'baseline-inventory-explorer.json')));
+    assert.equal(Object.keys(recorded.tests).length,4);assert.ok(recorded.files.includes(files[0][0]));
+    fs.writeFileSync(path.join(f.roots.explorer,files[0][0]),"import test from 'node:test';test('replacement.settings',()=>{});");
+    fs.writeFileSync(path.join(f.roots.explorer,files[1][0]),"import test from 'node:test';test('legacy.monitor',{skip:true},()=>{});");
+    f.refresh();assert.equal(await main(['offline','--config',f.configPath,'--phase','p3']),1);
+    const report=JSON.parse(fs.readFileSync(path.join(f.evidence,'report_offline-p3_codex.json')));
+    assert.ok(report.suites[0].removed.some(id=>id.endsWith('legacy.settings')));
+    assert.ok(report.suites[0].newlySkipped.some(id=>id.endsWith('legacy.monitor')));
+});
+
+test('HLIVE.R18-empty-baseline-is-blocked', async t => {
+    const f=offlineSourceFixture(t);fs.rmSync(path.join(f.roots.explorer,'tests'),{recursive:true});f.refresh();
+    const {main}=await import('../hardware-limits/verify.mjs');
+    assert.equal(await main(['baseline','--config',f.configPath,'--phases','p3']),2);
+});
+
+
+test('HLIVE.C1-core-conmon-and-persisted-gate', async t => {
+    const f=fixture(t);f.box.labels[BOX_LABELS.hardwareLimits]='f'.repeat(64);f.profile.box.contractDigest=jsonDigest({labels:f.box.labels,mounts:f.box.mounts});f.profile.cases=['LIVE-C1'];f.profile.fixtures={cpu:{ref:'test/cpu'}};
+    const layout={pid1:'0::/ploinky/core\n',self:'0::/ploinky/core\n',paths:{}};
+    for(const name of ['/','/ploinky/core','/ploinky','/ploinky/agents','/ploinky/system']){
+        const uid=['/','/ploinky/core'].includes(name)?0:1000;
+        layout.paths[name]={uid,gid:uid,files:Object.fromEntries([['cpu.max','max 100000'],['memory.max','max'],['pids.max','max']].map(([key,value])=>[key,{uid,gid:uid,value}]))};
+    }
+    const starts=[];
+    const provider=async(binary,args,options)=>{
+        if(binary===f.profile.node.path&&args.includes('start')){starts.push(options.env.PLOINKY_BOX_HARDWARE_LIMITS);return ok('');}
+        if(args.includes(CORE_LAYOUT))return ok(JSON.stringify(layout));
+        if(args.includes(PROCESS_MEMBERSHIP))return ok(JSON.stringify({pid:Number(args.at(-1)),start:'100',cgroup:args.at(-1)==='456'?'0::/ploinky/core\n':'0::/ploinky/agents/task\n'}));
+        const result=await f.provider(binary,args,options);
+        if(args.includes('inspect')&&args.includes('--cgroup-manager=cgroupfs')){const value=JSON.parse(result.stdout);value.conmonPid=456;result.stdout=JSON.stringify(value);}
+        return result;
+    };
+    const report=await executeLiveRun({run:f.run,hostIdentity:f.profile.host,processProvider:provider});
+    assert.equal(report.cases.find(row=>row.id==='LIVE-C1').result,'pass',JSON.stringify(report));
+    assert.deepEqual(starts,['on',undefined]);assert.equal(report.verdict,'BLOCKED');
+});
+
+test('HLIVE.A1-held-allocation-swap-before-pressure', async t => {
+    const f=fixture(t);f.run.block='apparatus-cpu';f.profile.cases=['LIVE-A1'];let released=false,finishAllocation;
+    const provider=async(binary,args,options)=>{
+        if(args.includes(PROCESS_MEMBERSHIP))return ok(JSON.stringify({pid:123,start:'100',cgroup:'0::/ploinky/agents/task\n'}));
+        if(args.includes(HELD_ALLOCATION))return new Promise(resolve=>{finishAllocation=()=>resolve({...ok(''),status:137});});
+        if(args.includes(ALLOCATION_HANDSHAKE)){if(args.at(-1)==='release')released=true;return ok(JSON.stringify({pid:789,bytes:16777216}));}
+        const result=await f.provider(binary,args,options);
+        if(args.some(value=>value.includes('const names='))){const sample=JSON.parse(result.stdout);sample['memory.current']='33554432';sample['memory.swap.current']='0';sample['memory.events']='oom_kill '+(released?'1':'0')+'\n';result.stdout=JSON.stringify(sample);if(released)setTimeout(finishAllocation,2);}
+        return result;
+    };
+    const report=await executeLiveRun({run:f.run,hostIdentity:f.profile.host,processProvider:provider});
+    assert.equal(report.verdict,'PASS',JSON.stringify(report));
+    assert.equal(report.cases[0].evidence.aliveSamples.length,3);assert.equal(released,true);
+});
+
+test('HLIVE.remote-pins-fixed-argv-and-no-fallback', async t => {
+    const f=fixture(t);const ssh=path.join(f.root,'ssh');const known=path.join(f.root,'known_hosts');fs.writeFileSync(ssh,'fixture');fs.writeFileSync(known,'fixture public key');
+    f.run.target.ssh={expectedAddress:'192.168.1.63',expectedHostKeyAlias:'192.168.1.63'};
+    f.run.target.remote={sshBinary:ssh,sshDigest:hash(fs.readFileSync(ssh)),address:'192.168.1.63',hostKeyAlias:'192.168.1.63',user:'test',knownHosts:known,knownHostsDigest:hash(fs.readFileSync(known)),identityFile:null,runPath:'/tmp/run_codex.json',authorizationPath:'/tmp/auth_codex.json'};
+    let argsSeen;
+    const report=await dispatchRemoteRun({run:f.run,action:'live',cwd:f.root,manifestDigest:hash('manifest'),processProvider:async(binary,args)=>{assert.equal(binary,ssh);argsSeen=args;return {...ok(JSON.stringify({runId:f.run.runId,exitCode:2,verdict:'BLOCKED',cases:[]})),status:2};}});
+    assert.equal(report.verdict,'BLOCKED');assert.ok(argsSeen.includes('StrictHostKeyChecking=yes'));assert.ok(argsSeen.includes('192.168.1.63'));assert.ok(argsSeen.includes('--expected-manifest-digest'));assert.ok(argsSeen.includes('/dev/null'));
+    assert.equal(assertRemoteArrival(f.run,'10.0.0.2 45678 192.168.1.63 22'),true);
+    assert.throws(()=>assertRemoteArrival(f.run,'10.0.0.2 45678 100.76.22.69 22'));
+    f.profile.source.root='/tmp/bad;command';await assert.rejects(dispatchRemoteRun({run:f.run,action:'live',cwd:f.root,manifestDigest:hash('manifest'),processProvider:()=>{throw Error('must not call');}}),/path cannot/);
+});
+
+
+test('HLIVE.R15-unpinned-source-symlink-blocks-before-suite', async t => {
+    const f=offlineSourceFixture(t);const outside=path.join(f.root,'outside.mjs');fs.writeFileSync(outside,'export default 1;');
+    fs.symlinkSync(outside,path.join(f.roots.explorer,'alias.mjs'));f.refresh();
+    const {main}=await import('../hardware-limits/verify.mjs');
+    await assert.rejects(main(['offline','--config',f.configPath,'--phase','p3']),/unpinned symlink/);
+    assert.equal(fs.existsSync(f.marker),false);
+});
+
+test('HLIVE.R13-quarantine-substitution-is-preserved', async t => {
+    const f=fixture(t);let quarantine=null;let original=null;
+    const persist=()=>{
+        const step=f.run.cleanup.steps.find(value=>value.id==='workspace-removal'&&value.quarantine);
+        if(step&&!quarantine){quarantine=step.quarantine;original=quarantine+'-original';fs.renameSync(quarantine,original);fs.mkdirSync(quarantine);fs.writeFileSync(path.join(quarantine,'foreign.txt'),'preserve');}
+    };
+    const report=await executeLiveRun({run:f.run,hostIdentity:f.profile.host,action:'cleanup',processProvider:f.provider,persist});
+    assert.equal(report.verdict,'FAIL');assert.equal(fs.readFileSync(path.join(quarantine,'foreign.txt'),'utf8'),'preserve');assert.ok(fs.existsSync(path.join(original,'.ploinky-hwl-owner')));
+});
+
+test('HLIVE.R14-baseline-diagnostic-proof-survives-runner-roundtrip', async t => {
+    const f=offlineSourceFixture(t);const {main}=await import('../hardware-limits/verify.mjs');
+    const files=['explorer/tests/unit/settingsAccount.test.js','workspaceMonitorAgent/tests/currentSnapshot.test.mjs','tests/smoke/lib/box-evidence.test.mjs'];
+    for(const [i,file] of files.entries()){const target=path.join(f.roots.explorer,file);fs.mkdirSync(path.dirname(target),{recursive:true});fs.writeFileSync(target,`import test from 'node:test';test('legacy.${i}',()=>{});`);}
+    const failing=path.join(f.roots.explorer,files[0]);
+    const failure=expected=>`import test from 'node:test';import assert from 'node:assert/strict';test('legacy.0',()=>assert.equal(1,${expected}));`;
+    fs.writeFileSync(failing,failure(2));f.refresh();assert.equal(await main(['baseline','--config',f.configPath,'--phases','p3']),0);
+    const baseline=JSON.parse(fs.readFileSync(path.join(f.evidence,'baseline-inventory-explorer.json')));
+    assert.match(baseline.failureSignatures[files[0]+'::legacy.0'].signature,/^[a-f0-9]{64}$/);
+    assert.equal(await main(['offline','--config',f.configPath,'--phase','p3']),0);
+    let report=JSON.parse(fs.readFileSync(path.join(f.evidence,'report_offline-p3_codex.json')));
+    assert.equal(report.counts.baselineFailures,1);
+    fs.writeFileSync(failing,failure(3));f.refresh();assert.equal(await main(['offline','--config',f.configPath,'--phase','p3']),1);
+    report=JSON.parse(fs.readFileSync(path.join(f.evidence,'report_offline-p3_codex.json')));
+    assert.equal(report.counts.newFailures,1);assert.equal(report.counts.baselineFailures,0);
+});
+
+test('HLIVE.R18-baseline-import-failure-is-blocked-without-inventory', async t => {
+    const f=offlineSourceFixture(t);fs.writeFileSync(path.join(f.roots.explorer,'tests/source.test.mjs'),"import './missing.mjs';");f.refresh();
+    const {main}=await import('../hardware-limits/verify.mjs');
+    assert.equal(await main(['baseline','--config',f.configPath,'--phases','p3']),2);
+    assert.equal(fs.existsSync(path.join(f.evidence,'baseline-inventory-explorer.json')),false);
 });

@@ -15,7 +15,8 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
+import { runBoundedProcess } from './liveProcess.mjs';
 import { fileURLToPath } from 'node:url';
 import { runLiveCommand, LIVE_CASES, UNSUPPORTED } from './liveHarness.mjs';
 
@@ -110,7 +111,7 @@ const PHASE_REGRESSIONS = Object.freeze({
         ],
     },
     p2: { ploinky: ['tests/unit/agentRegistryResolver.test.mjs', 'tests/unit/marketplaceEnableWorker.test.mjs'] },
-    p3: { explorer: [] },
+    p3: { explorer: ['explorer/tests/unit/settingsAccount.test.js', 'workspaceMonitorAgent/tests/currentSnapshot.test.mjs', 'tests/smoke/lib/box-evidence.test.mjs'] },
     p4: { ploinky: ['tests/unit/ploinkyBoxGpuGrant.test.mjs'] },
     p5: { localLlms: ['local-llm/tests/gpu-profiles-unchanged.test.mjs', 'local-llm/tests/vllm.test.mjs'] },
 });
@@ -202,9 +203,39 @@ function dependencyIdentity(name, linkPath) {
 }
 
 function candidateDigest(root) {
-    const dirty = git(root, ['status', '--porcelain', '--untracked-files=no']);
+    const dirty = git(root, ['status', '--porcelain', '--untracked-files=all']);
     if (dirty) return treeDigest(root);
     return `git-tree:${git(root, ['rev-parse', 'HEAD^{tree}'])}`;
+}
+
+function assertPinnedSourceLinks(root, dependencies) {
+    const stat = fs.lstatSync(root);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || fs.realpathSync(root) !== root) throw new SchemaError('candidate source root is not canonical: ' + root);
+    const pinned = new Set(dependencies.map(value => value.realpath));
+    let count = 0;
+    function walk(directory) {
+        for (const name of fs.readdirSync(directory)) {
+            if (name === '.git') continue;
+            if (++count > 100000) throw new SchemaError('candidate source inventory exceeds bound');
+            const target = path.join(directory, name); const entry = fs.lstatSync(target);
+            if (entry.isSymbolicLink()) {
+                if (!pinned.has(fs.realpathSync(target))) throw new SchemaError('candidate source contains an unpinned symlink: ' + path.relative(root, target));
+            } else if (entry.isDirectory()) walk(target);
+        }
+    }
+    walk(root);
+}
+
+export function verifyCandidateSources(config) {
+    const verified = {};
+    for (const repo of ['ploinky', 'localLlms', 'explorer']) {
+        const entry = config.repos[repo];
+        assertPinnedSourceLinks(entry.candidateRoot, config.dependencies);
+        const actual = entry.sourceDigest.startsWith('sha256:') ? treeDigest(entry.candidateRoot) : candidateDigest(entry.candidateRoot);
+        if (actual !== entry.sourceDigest) throw new SchemaError('candidate source changed since configure: ' + repo);
+        verified[repo] = actual;
+    }
+    return verified;
 }
 
 // Create a task-owned baseline staging copy of `revision` with `git archive`,
@@ -330,30 +361,14 @@ async function configure(options) {
     return EXIT.PASS;
 }
 
-function spawnSuite({ cwd, files, env, eventsPath, deadlineMs = DEFAULT_SUITE_DEADLINE_MS }) {
-    return new Promise((resolve) => {
-        const child = spawn(process.execPath, [
-            '--test',
-            `--test-reporter=${REPORTER}`,
-            `--test-reporter-destination=${eventsPath}`,
-            '--test-reporter=dot',
-            '--test-reporter-destination=stderr',
-            ...files,
-        ], { cwd, env, stdio: ['ignore', 'ignore', 'pipe'] });
-        let stderr = '';
-        child.stderr.on('data', (chunk) => {
-            if (stderr.length < 256 * 1024) stderr += chunk;
-        });
-        let timedOut = false;
-        const timer = setTimeout(() => {
-            timedOut = true;
-            child.kill('SIGTERM');
-        }, deadlineMs);
-        child.on('close', (code, signal) => {
-            clearTimeout(timer);
-            resolve({ exitCode: code, signal: signal || (timedOut ? 'deadline' : null), stderr });
-        });
-    });
+async function spawnSuite({ cwd, files, env, eventsPath, deadlineMs = DEFAULT_SUITE_DEADLINE_MS }) {
+    const result = await runBoundedProcess(process.execPath, [
+        '--test', '--test-reporter=' + REPORTER, '--test-reporter-destination=' + eventsPath,
+        '--test-reporter=dot', '--test-reporter-destination=stderr', ...files,
+    ], { cwd, env, deadlineMs, maxBytes: 256 * 1024 });
+    return { exitCode: result.status,
+        signal: result.signal || (result.timedOut ? 'deadline' : result.truncated ? 'output-bound' : result.cancelled ? 'cancelled' : result.errorCode || result.settlementForced ? 'transport-incomplete' : null),
+        stderr: result.stderr };
 }
 
 // Run one suite with the native reporter in an owned short temp directory.
@@ -368,7 +383,7 @@ export async function runSuite({
     deadlineMs,
     required = [],
     baseline = null,
-    knownBaselineFailures = new Set(),
+    knownBaselineFailures = new Map(),
 }) {
     // The owned temp directory lives outside the candidate root: a worktree
     // nested in another Ploinky workspace would otherwise let test
@@ -470,8 +485,10 @@ function buildReport({ runId, command, phase, suites, cases, sources, verdict })
             problems: suite.problems.slice(0, 200),
             newFailures: suite.newFailures.slice(0, 200),
             baselineFailures: suite.baselineFailures.slice(0, 200),
+            removed: (suite.removed || []).slice(0, 200),
+            newlySkipped: (suite.newlySkipped || []).slice(0, 200),
         })),
-        streamComplete: suites.every((suite) => suite.streamComplete),
+        streamComplete: suites.length > 0 && suites.every((suite) => suite.streamComplete),
         cleanup: { state: 'complete', steps: [], failures: [] },
         artifacts: suites.map((suite) => suite.eventsPath),
     });
@@ -486,7 +503,7 @@ async function baselineCommand(options) {
     verifyDependenciesUnchanged(config);
     const phases = (options.phases || 's0,p0,p1,p1-ram').split(',');
     const suites = [];
-    for (const repo of ['ploinky', 'localLlms']) {
+    for (const repo of ['ploinky', 'localLlms', 'explorer']) {
         const entry = config.repos[repo];
         if (!fs.existsSync(entry.baselineStage)) {
             const { checked } = createBaselineStage(entry.candidateRoot, entry.baselineRevision, entry.baselineStage);
@@ -504,20 +521,21 @@ async function baselineCommand(options) {
             runId: config.runId,
             childId: `baseline-${repo}`,
             eventsPath,
-            agentLibDir: repo === 'ploinky' ? agentLibFor(config) : '',
+            agentLibDir: agentLibFor(config),
         });
-        writePrivateJson(inventoryPath(config.evidenceRoot, repo), {
+        if (result.streamComplete && !result.signal && !result.problems.length && result.discovered > 0) writePrivateJson(inventoryPath(config.evidenceRoot, repo), {
             schema: 1,
             revision: entry.baselineRevision,
             files,
             tests: Object.fromEntries(result.inventory),
+            failureSignatures: Object.fromEntries(result.failureSignatures || []),
         });
         suites.push({ ...result, repo, files, eventsPath });
     }
     verifyDependenciesUnchanged(config);
     // Baseline assertion failures are recorded, not converted to passes. A
     // harness failure (signal, incomplete stream, load failure) is BLOCKED.
-    const harnessBroken = suites.some((suite) => !suite.streamComplete || suite.signal);
+    const harnessBroken = suites.length === 0 || suites.some((suite) => !suite.streamComplete || suite.signal || suite.problems.length > 0 || suite.discovered === 0);
     const verdict = harnessBroken ? 'BLOCKED' : 'PASS';
     const report = buildReport({
         runId: config.runId, command: 'baseline', phase: phases.join(','), suites, cases: [], verdict,
@@ -530,6 +548,7 @@ async function baselineCommand(options) {
 
 async function offlineCommand(options) {
     const { config, cases } = loadConfig(requireAbsolute(options.config, 'config'));
+    let verifiedSources = verifyCandidateSources(config);
     const phase = options.phase;
     if (!phase) throw new UsageError('offline needs --phase');
     verifyDependenciesUnchanged(config);
@@ -538,16 +557,20 @@ async function offlineCommand(options) {
     for (const repo of ['ploinky', 'localLlms', 'explorer']) {
         const { required, files } = phaseFiles(cases, phase, repo);
         if (!required.length && !files.length) continue;
+        verifiedSources = verifyCandidateSources(config);
         const root = config.repos[repo].candidateRoot;
         const existing = files.filter((file) => fs.existsSync(path.join(root, file)));
         const missing = files.filter((file) => !existing.includes(file));
         let inventory = null;
-        const knownBaselineFailures = new Set();
+        const knownBaselineFailures = new Map();
         try {
             const recorded = readJsonBounded(inventoryPath(config.evidenceRoot, repo), 16 * 1024 * 1024);
+            if (recorded.revision !== config.repos[repo].baselineRevision) throw new SchemaError('baseline inventory revision changed: ' + repo);
             inventory = new Map(Object.entries(recorded.tests)
                 .filter(([testId]) => existing.some((file) => testId.startsWith(`${file}::`))));
-            for (const [testId, result] of inventory) if (result === 'fail') knownBaselineFailures.add(testId);
+            for (const [testId, result] of inventory) {
+                if (result === 'fail' && recorded.failureSignatures?.[testId]) knownBaselineFailures.set(testId, recorded.failureSignatures[testId]);
+            }
         } catch (error) {
             if (error?.code !== 'ENOENT') throw error;
         }
@@ -565,17 +588,19 @@ async function offlineCommand(options) {
                 knownBaselineFailures,
             })
             : evaluateSuiteRun({ exitCode: 1, eventText: '', files: [], required });
+        verifiedSources = verifyCandidateSources(config);
         for (const file of missing) result.problems.push(`required test file is missing: ${file}`);
         if (missing.length) result.verdict = 'FAIL';
         suites.push({ ...result, repo, files: existing, eventsPath });
         allCases.push(...result.cases);
     }
+    verifiedSources = verifyCandidateSources(config);
     if (!suites.length) throw new UsageError(`phase '${phase}' has no required cases`);
     verifyDependenciesUnchanged(config);
     const verdict = suites.some((suite) => suite.verdict !== 'PASS') ? 'FAIL' : 'PASS';
     const report = buildReport({
         runId: config.runId, command: 'offline', phase, suites, cases: allCases, verdict,
-        sources: Object.fromEntries(Object.entries(config.repos).map(([key, value]) => [key, value.sourceDigest])),
+        sources: verifiedSources,
     });
     writePrivateJson(path.join(config.evidenceRoot, `report_offline-${phase}_${config.documentSuffix}.json`), report);
     console.log(JSON.stringify(summarize(report), null, 2));
@@ -641,8 +666,8 @@ async function runLive(options, command) {
         return EXIT.BLOCKED;
     }
     try {
-        const report = await runLiveCommand({ runPath, authorizationPath: requireAbsolute(options.authorization, 'authorization'), action: command });
-        console.log(JSON.stringify({ verdict: report.verdict, cases: report.cases.map(({ id, result, reason }) => ({ id, result, reason })), limitations: report.limitations }, null, 2));
+        const report = await runLiveCommand({ runPath, authorizationPath: requireAbsolute(options.authorization, 'authorization'), action: command, remoteLocal: options['remote-local'] || null, expectedManifestDigest: options['expected-manifest-digest'] || null });
+        console.log(JSON.stringify(report, null, 2));
         return report.exitCode;
     } catch (error) {
         console.error('[live] BLOCKED: ' + error.message);

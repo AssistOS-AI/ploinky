@@ -8,6 +8,8 @@ import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { EXIT, validateRunManifest, writePrivateJson } from './fixtures.mjs';
 import { runBoundedProcess, requireTransport } from './liveProcess.mjs';
+import { dispatchRemoteRun, assertRemoteArrival } from './liveRemote.mjs';
+import { CORE_LAYOUT, MEMBERSHIP as PROCESS_MEMBERSHIP, HELD_ALLOCATION, ALLOCATION_HANDSHAKE, LEAF_OBSERVATION, assertCoreLayout } from './liveCaseCommands.mjs';
 
 export const LIVE_CASES = Object.freeze({
     'mac-cpu': ['LIVE-C1', 'LIVE-C2', 'LIVE-C3', 'LIVE-C4', 'LIVE-C5', 'LIVE-C6', 'LIVE-C7'],
@@ -19,7 +21,6 @@ export const LIVE_CASES = Object.freeze({
     'apparatus-vllm': ['LIVE-L3'],
 });
 export const UNSUPPORTED = Object.freeze({
-    'LIVE-C1': 'Fresh fixture provisioning and root/core/conmon placement evidence are not implemented.',
     'LIVE-C3': 'Actual D4 graph, routing and asynchronous optional-child fixtures are not implemented.',
     'LIVE-C4': 'Actual stored-policy downgrade/no-mutation fixture is not implemented.',
     'LIVE-C5': 'Host/in-Box writer and barrier interleaving fixture is not implemented.',
@@ -29,7 +30,6 @@ export const UNSUPPORTED = Object.freeze({
     'LIVE-S2': 'Guard-removal and reachability fixture is not implemented.',
     'LIVE-X0': 'Fresh complete Explorer graph readiness inventory is not implemented.',
     'LIVE-X1': 'Fresh browser account, UI mutation and screenshot fixture is not implemented.',
-    'LIVE-A1': 'Remote identity transport and touched-allocation handshake are not implemented.',
     'LIVE-P1': 'Remote provisioning, actual UID mapping and driver readback qualification are not implemented.',
     'LIVE-P2': 'Owned live CUDA SM/VRAM and bypass fixture is not implemented.',
     'LIVE-P3': 'Actual daemon crash/drain/restart cohort fixture is not implemented.',
@@ -43,9 +43,9 @@ const HASH = /^sha256:[a-f0-9]{64}$/;
 const digest = value => `sha256:${crypto.createHash('sha256').update(value).digest('hex')}`;
 export const jsonDigest = value => digest(JSON.stringify(value));
 
-function keys(value, required, label) {
+function keys(value, required, label, optional = []) {
     if (!value || Object.getPrototypeOf(value) !== Object.prototype
-        || Object.keys(value).some(key => !required.includes(key))
+        || Object.keys(value).some(key => !required.includes(key) && !optional.includes(key))
         || required.some(key => !Object.hasOwn(value, key))) throw new Error(`Invalid ${label} fields`);
 }
 function absolute(value) {
@@ -63,7 +63,14 @@ function receipt(value) {
 export function validateExecutionProfile(run) {
     validateRunManifest(run);
     const profile = run.target.execution;
-    keys(profile, ['protocol', 'host', 'node', 'candidate', 'engine', 'source', 'workspace', 'box', 'agents', 'cases'], 'execution profile');
+    keys(profile, ['protocol', 'host', 'node', 'candidate', 'engine', 'source', 'workspace', 'box', 'agents', 'cases'], 'execution profile', ['fixtures']);
+    if (profile.fixtures !== undefined) {
+        keys(profile.fixtures, [], 'fixtures', ['cpu']);
+        if (profile.fixtures.cpu !== undefined) {
+            keys(profile.fixtures.cpu, ['ref'], 'CPU fixture');
+            if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(profile.fixtures.cpu.ref)) throw new Error('Invalid CPU fixture reference');
+        }
+    }
     if (profile.protocol !== 'owned-fixture-v1') throw new Error('Unsupported execution profile');
     keys(profile.host, ['hostname', 'platform', 'home'], 'host');
     if (!absolute(profile.host.home) || !bounded(profile.host.hostname, 255) || !['darwin', 'linux'].includes(profile.host.platform)) throw new Error('Invalid host');
@@ -165,7 +172,7 @@ export function assertWorkspace(profile) {
     return identity;
 }
 
-const INSPECT = '{"id":{{json .Id}},"created":{{json .Created}},"image":{{json .Image}},"labels":{{json .Config.Labels}},"mounts":{{json .Mounts}},"running":{{json .State.Running}},"pid":{{json .State.Pid}},"startedAt":{{json .State.StartedAt}},"memory":{{json .HostConfig.Memory}},"memorySwap":{{json .HostConfig.MemorySwap}},"nanoCpus":{{json .HostConfig.NanoCpus}},"cpuQuota":{{json .HostConfig.CpuQuota}},"cpuPeriod":{{json .HostConfig.CpuPeriod}},"pidsLimit":{{json .HostConfig.PidsLimit}}}';
+const INSPECT = '{"id":{{json .Id}},"created":{{json .Created}},"image":{{json .Image}},"labels":{{json .Config.Labels}},"mounts":{{json .Mounts}},"running":{{json .State.Running}},"pid":{{json .State.Pid}},"startedAt":{{json .State.StartedAt}},"conmonPid":{{json .State.ConmonPid}},"memory":{{json .HostConfig.Memory}},"memorySwap":{{json .HostConfig.MemorySwap}},"nanoCpus":{{json .HostConfig.NanoCpus}},"cpuQuota":{{json .HostConfig.CpuQuota}},"cpuPeriod":{{json .HostConfig.CpuPeriod}},"pidsLimit":{{json .HostConfig.PidsLimit}}}';
 const MEMBERSHIP = 'const fs=require("node:fs");const pid=process.argv[1];if(!/^[1-9][0-9]*$/.test(pid))throw Error("Invalid PID");process.stdout.write(fs.readFileSync("/proc/"+pid+"/cgroup","utf8"));';
 const OBSERVE = 'const fs=require("node:fs");const p=process.argv[1];if(fs.realpathSync(p)!==p)throw Error("Noncanonical leaf");const names=["memory.max","memory.swap.max","memory.current","memory.swap.current","memory.events","cpu.max","cpu.stat","pids.max","pids.events"];const st=fs.statSync(p);process.stdout.write(JSON.stringify({...Object.fromEntries(names.map(n=>[n,fs.readFileSync(p+"/"+n,"utf8")])),identity:{dev:String(st.dev),ino:String(st.ino)}}));';
 const PRESSURE = Object.freeze({
@@ -190,13 +197,13 @@ export function createLiveAdapter(profile, {
 } = {}) {
     const env = { PATH: '/usr/local/bin:/usr/bin:/bin', HOME: profile.host.home, TMPDIR: process.env.TMPDIR };
     let sequence = run.operations.length;
-    async function command(kind, binary, args, { deadlineMs = 30000, stress = false, cleanup = false } = {}) {
+    async function command(kind, binary, args, { deadlineMs = 30000, stress = false, cleanup = false, gate = null } = {}) {
         assertWorkspace(profile);
         if (['pressure', 'destroy-box'].includes(kind) && liveSourceDigest(profile.source.root) !== profile.source.digest) throw new Error('Candidate source changed');
         const op = { id: `live-${++sequence}`, kind, state: 'intent', resourceIds: [profile.box.id], argvDigest: jsonDigest([binary, ...args]), resultArtifact: null };
         if (run.operations.length >= 512 || Buffer.byteLength(JSON.stringify(run)) > 190000) throw new Error('Live journal bound exceeded');
         run.operations.push(op); persist();
-        const result = await processProvider(binary, args, { cwd: profile.workspace.path, env, deadlineMs, maxBytes: 65536, signal: cleanup ? cleanupSignal : signal });
+        const result = await processProvider(binary, args, { cwd: profile.workspace.path, env: gate === null ? env : { ...env, PLOINKY_BOX_HARDWARE_LIMITS: gate }, deadlineMs, maxBytes: 65536, signal: cleanup ? cleanupSignal : signal });
         op.state = 'observed';
         // Only fixed observation commands return persisted output. Candidate
         // diagnostics may contain credentials; retain status flags alone.
@@ -264,6 +271,72 @@ export function createLiveAdapter(profile, {
         }
         return evidence;
     }
+    async function coreCase() {
+        const fixture = profile.fixtures?.cpu;
+        if (!fixture) throw blocked('LIVE-C1 needs the installed immutable CPU fixture reference');
+        const existing = await inspectBox();
+        if (!/^[a-f0-9]{64}$/.test(existing.labels?.[BOX_LABELS.hardwareLimits] || '')) throw blocked('LIVE-C1 requires a provisioned gate-on Box receipt before its repeat-start checks');
+        await command('repeat-gate-on-start', profile.node.path, [profile.candidate.path, 'start', fixture.ref], { gate: 'on', deadlineMs: 1200000 });
+        await inspectBox();
+        await command('repeat-saved-gate-start', profile.node.path, [profile.candidate.path, 'start', fixture.ref], { deadlineMs: 1200000 });
+        await inspectBox();
+        const layout = assertCoreLayout(checkedJson(await engine('core-layout', [...core, 'node', '-e', CORE_LAYOUT])));
+        const agents = [];
+        for (const agent of profile.agents) {
+            const current = await inspectAgent(agent);
+            if (!Number.isSafeInteger(current.conmonPid) || current.conmonPid <= 0) throw blocked('Engine did not expose exact conmon PID');
+            const observePid = async pid => checkedJson(await engine('process-placement', [...core, 'node', '-e', PROCESS_MEMBERSHIP, String(pid)]));
+            const workload = await observePid(current.pid), conmon = await observePid(current.conmonPid);
+            if (!/^0::\/ploinky\/agents\/[A-Za-z0-9_.:/-]+\s*$/.test(workload.cgroup)
+                || !/^0::\/ploinky\/(core|agents\/[A-Za-z0-9_.:/-]+)\s*$/.test(conmon.cgroup)) throw new Error('Workload/conmon placement mismatch');
+            const leaf = '/sys/fs/cgroup' + workload.cgroup.trim().slice(3);
+            const limits = checkedJson(await engine('leaf-observer', [...core, 'node', '-e', LEAF_OBSERVATION, leaf])); requireLeafLimits(limits);
+            agents.push({ id: agent.id, workload, conmon, limits });
+        }
+        return { layout, agents, omittedGateRetained: true };
+    }
+    async function swapCase() {
+        const agent = profile.agents.find(value => value.role === 'memory');
+        if (!agent) throw blocked('LIVE-A1 requires the owned 64-MiB memory fixture instance');
+        const original = await inspectAgent(agent);
+        const membership = checkedJson(await engine('process-placement', [...core, 'node', '-e', PROCESS_MEMBERSHIP, String(original.pid)]));
+        if (!/^0::\/ploinky\/agents\/[A-Za-z0-9_.:/-]+\s*$/.test(membership.cgroup)) throw new Error('Unproven memory fixture cgroup');
+        const leaf = '/sys/fs/cgroup' + membership.cgroup.trim().slice(3);
+        const observe = async () => checkedJson(await engine('leaf-observer', [...core, 'node', '-e', LEAF_OBSERVATION, leaf], { deadlineMs: 5000 }));
+        const before = await observe(); requireLeafLimits(before);
+        let finished = false;
+        const allocation = engine('held-pressure', [...nested, 'container', 'exec', agent.id, 'node', '-e', HELD_ALLOCATION, run.runId], { deadlineMs: 25000, stress: true }).finally(() => { finished = true; });
+        allocation.catch(() => {});
+        const aliveSamples = [], pressureSamples = []; let released = false; let receipt = null;
+        try {
+            const deadline = Date.now() + 20000;
+            while (!finished && Date.now() < deadline) {
+                if (!released) {
+                    receipt = checkedJson(await engine('allocation-ready', [...nested, 'container', 'exec', agent.id, 'node', '-e', ALLOCATION_HANDSHAKE, run.runId, 'observe'], { deadlineMs: 5000 }));
+                    if (receipt) {
+                        const sample = await observe(); requireLeafLimits(sample);
+                        if (sample['memory.swap.current'].trim() !== '0' || Number(sample['memory.current']) < receipt.bytes) throw new Error('Swap appeared or held allocation was not observed alive');
+                        if (jsonDigest(sample.identity) !== jsonDigest(before.identity)) throw new Error('Cgroup leaf identity changed');
+                        aliveSamples.push(sample);
+                        if (aliveSamples.length >= 3) {
+                            const current = await inspectAgent(agent);
+                            if (current.pid !== original.pid || current.startedAt !== original.startedAt) throw new Error('Memory fixture restarted');
+                            const release = checkedJson(await engine('allocation-release', [...nested, 'container', 'exec', agent.id, 'node', '-e', ALLOCATION_HANDSHAKE, run.runId, 'release'], { deadlineMs: 5000 }));
+                            if (!release || release.pid !== receipt.pid || release.bytes !== receipt.bytes) throw new Error('Allocation handshake identity changed');
+                            released = true;
+                        }
+                    }
+                } else {
+                    try { pressureSamples.push(await observe()); } catch { break; }
+                }
+                await new Promise(resolve => setTimeout(resolve, 50));
+            }
+        } finally { await allocation; }
+        if (!released || aliveSamples.length < 3) throw new Error('No live touched-allocation handshake evidence');
+        if (pressureSamples.some(sample => jsonDigest(sample.identity) !== jsonDigest(before.identity))
+            || !pressureSamples.some(sample => counter(sample['memory.events'], 'oom_kill') > counter(before['memory.events'], 'oom_kill'))) throw new Error('No same-leaf pressure OOM evidence');
+        return { id: agent.id, leaf, receipt, before, aliveSamples, pressureSamples };
+    }
     async function cleanup() {
         await assertEngine(true);
         // No additional owned background processes are accepted by this
@@ -303,13 +376,35 @@ export function createLiveAdapter(profile, {
         // owns its record cleanup; removal of unrecorded state is never inferred.
         run.cleanup.steps.push({ id: 'destroy-box', state: 'complete', artifact: null }); persist();
         run.cleanup.steps.push({ id: 'workspace-removal', state: 'intent', artifact: null }); persist();
-        fs.rmSync(profile.workspace.path, { recursive: true, force: false });
+        // Persist callbacks may expose a scheduling/interruption boundary.
+        // Revalidate after intent, quarantine by rename, then prove the inode
+        // again before deleting. A substituted path is never recursively rm'd.
+        assertWorkspace(profile);
+        const quarantine = path.join(path.dirname(profile.workspace.path), '.hwl-removing-' + run.runId);
+        try { fs.lstatSync(quarantine); throw new Error('Cleanup quarantine already exists; retain ownership evidence'); }
+        catch (error) { if (error.code !== 'ENOENT') throw error; }
+        fs.renameSync(profile.workspace.path, quarantine);
+        function assertQuarantine() {
+            const st = fs.lstatSync(quarantine);
+            if (!st.isDirectory() || st.isSymbolicLink() || fs.realpathSync(quarantine) !== quarantine
+                || st.uid !== profile.workspace.uid || String(st.dev) !== profile.workspace.dev || String(st.ino) !== profile.workspace.ino) throw new Error('Cleanup quarantine identity changed');
+            const fd = fs.openSync(path.join(quarantine, '.ploinky-hwl-owner'), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+            try { const marker = fs.fstatSync(fd); if (!marker.isFile() || marker.nlink !== 1 || marker.uid !== st.uid || marker.size !== 32 || fs.readFileSync(fd, 'utf8') !== run.runId) throw new Error('Cleanup quarantine marker changed'); }
+            finally { fs.closeSync(fd); }
+        }
+        assertQuarantine();
+        run.cleanup.steps.at(-1).quarantine = quarantine; persist();
+        assertQuarantine();
+        fs.rmSync(quarantine, { recursive: true, force: false });
         run.cleanup.steps.at(-1).state = 'complete'; persist();
     }
-    return { cpuCase, cleanup, inspectBox };
+    return { cpuCase, coreCase, swapCase, cleanup, inspectBox };
 }
 
+function blocked(message) { return Object.assign(new Error(message), { code: 'LIVE_PREREQUISITE_MISSING' }); }
+
 export async function executeLiveRun({ run, action = 'live', persist = () => {}, processProvider, signal,
+    remoteArrival = false,
     hostIdentity = { hostname: os.hostname(), platform: process.platform, home: fs.realpathSync(os.homedir()) },
 } = {}) {
     const selected = run.target.execution?.cases || LIVE_CASES[run.block];
@@ -317,7 +412,7 @@ export async function executeLiveRun({ run, action = 'live', persist = () => {},
     const report = { schema: 1, runId: run.runId, action, verdict: 'BLOCKED', exitCode: EXIT.BLOCKED, cases, cleanup: run.cleanup, limitations: [] };
     let profile;
     try { profile = validateExecutionProfile(run); } catch (error) { report.limitations.push(error.message); return report; }
-    if (run.target.ssh !== null && run.target.ssh !== undefined) {
+    if (run.target.ssh !== null && run.target.ssh !== undefined && !remoteArrival) {
         report.limitations.push('SSH transport is not implemented; no local fallback is permitted'); return report;
     }
     if (profile.host.hostname !== hostIdentity.hostname || profile.host.platform !== hostIdentity.platform
@@ -330,7 +425,7 @@ export async function executeLiveRun({ run, action = 'live', persist = () => {},
             report.limitations.push(`${name} executable identity changed`); return report;
         }
     }
-    if (action !== 'cleanup' && !selected.includes('LIVE-C2')) {
+    if (action !== 'cleanup' && !selected.some(id => ['LIVE-C1', 'LIVE-C2', 'LIVE-A1'].includes(id))) {
         report.limitations.push('Selected cases have no implemented live executor'); return report;
     }
     if (liveSourceDigest(profile.source.root) !== profile.source.digest) { report.limitations.push('Candidate source changed'); return report; }
@@ -340,18 +435,22 @@ export async function executeLiveRun({ run, action = 'live', persist = () => {},
     const blockTimer = setTimeout(() => blockController.abort(), 20 * 60 * 1000);
     const blockSignal = signal ? AbortSignal.any([signal, blockController.signal]) : blockController.signal;
     const adapter = createLiveAdapter(profile, { processProvider, signal: blockSignal, cleanupSignal: cleanupController.signal, persist, run });
-    let attempted = false;
+    let attempted = false; let activeCase = null;
     try {
         if (action !== 'cleanup') {
             run.state = 'running'; persist();
             await adapter.inspectBox(); attempted = true;
-            const evidence = await adapter.cpuCase();
-            const entry = cases.find(value => value.id === 'LIVE-C2');
-            Object.assign(entry, { result: 'pass', reason: '', evidence });
+            const executors = { 'LIVE-C1': adapter.coreCase, 'LIVE-C2': adapter.cpuCase, 'LIVE-A1': adapter.swapCase };
+            for (const id of selected) {
+                activeCase = id;
+                if (!executors[id]) continue;
+                const evidence = await executors[id]();
+                Object.assign(cases.find(value => value.id === id), { result: 'pass', reason: '', evidence });
+            }
         }
     } catch (error) {
-        const entry = cases.find(value => value.id === 'LIVE-C2');
-        if (entry) Object.assign(entry, { result: 'fail', reason: error.message });
+        const entry = cases.find(value => value.id === activeCase) || cases.find(value => value.id === selected[0]);
+        if (entry) Object.assign(entry, { result: error.code === 'LIVE_PREREQUISITE_MISSING' ? 'blocked' : 'fail', reason: error.message });
         report.limitations.push(error.message);
     } finally {
         clearTimeout(blockTimer);
@@ -371,19 +470,26 @@ export async function executeLiveRun({ run, action = 'live', persist = () => {},
     return report;
 }
 
-export async function runLiveCommand({ runPath, authorizationPath, action, processProvider } = {}) {
+export async function runLiveCommand({ runPath, authorizationPath, action, processProvider, remoteLocal = null, expectedManifestDigest = null } = {}) {
     const { value: run, bytes } = readPrivateJson(runPath);
     validateRunManifest(run);
     if (!authorizationPath) throw new Error('APPROVAL REQUIRED: provide the binding record for separate execution-time approval of this exact target/action');
     const { value: authorization } = readPrivateJson(authorizationPath, 4096);
     validateAuthorization(run, bytes, authorization, action);
+    if (remoteLocal !== null) {
+        if (remoteLocal !== run.runId) throw new Error('Remote invocation run identity mismatch');
+        if (expectedManifestDigest !== digest(bytes)) throw new Error('Remote manifest bytes do not match authorized local input');
+        assertRemoteArrival(run);
+    }
     const controller = new AbortController();
     const abort = () => controller.abort();
-    process.once('SIGINT', abort); process.once('SIGTERM', abort);
+    process.once('SIGINT', abort); process.once('SIGTERM', abort); process.once('SIGHUP', abort);
     const persist = () => writePrivateJson(runPath, run);
     try {
-        const report = await executeLiveRun({ run, action, persist, processProvider, signal: controller.signal });
+        const report = run.target.ssh && remoteLocal === null
+            ? await dispatchRemoteRun({ run, action, cwd: path.dirname(runPath), signal: controller.signal, manifestDigest: authorization.manifestDigest, processProvider })
+            : await executeLiveRun({ run, action, persist, processProvider, signal: controller.signal, remoteArrival: remoteLocal !== null });
         writePrivateJson(path.join(path.dirname(runPath), `report_${action}_codex.json`), report);
         return report;
-    } finally { process.removeListener('SIGINT', abort); process.removeListener('SIGTERM', abort); }
+    } finally { process.removeListener('SIGINT', abort); process.removeListener('SIGTERM', abort); process.removeListener('SIGHUP', abort); }
 }
