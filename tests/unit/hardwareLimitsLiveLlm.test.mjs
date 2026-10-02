@@ -24,7 +24,7 @@ import { fakeEngineInfo, worldState } from '../hardware-limits/fakeLiveEngine.mj
 import { createLlmWorld } from '../hardware-limits/fakeLiveLlm.mjs';
 import { LEAF_OBSERVATION } from '../hardware-limits/liveCaseCommands.mjs';
 import {
-    LOCAL_LLM_RUNNER_ENV, isSecretName, runnerEnvironmentProblems, runnerProductNames,
+    LOCAL_LLM_RUNNER_ENV, PLAYGROUND_DECISION, isSecretName, runnerEnvironmentProblems, runnerProductNames,
     INFERENCE_MIN_IN_FLIGHT, INFERENCE_TOLERANCE, INSUFFICIENT_RAM, LLM_BUDGET, LLM_IMAGE_DIGESTS, LLM_LEAF_SAMPLE, LLM_MODELS, LLM_RUNNER_PROCESSES, LLM_TOOL_CALL, VLLM_SHARE, VLLM_TOOL_PATH,
     analyzeInference, insufficientMemoryPercent, llmToolWords, parseLeafSample, sourceUnavailable, stageTwoFreeThreshold, summarizeGpuCheck, validateLlmModelPins, validateLlmProfile, vllmToolWords,
 } from '../hardware-limits/liveLlmCommands.mjs';
@@ -1465,4 +1465,13 @@ test('R2E.the-stage-two-free-memory-threshold-is-the-admission-need-plus-slack-n
     assert.equal(caseOf(await liveCases(w, ['LIVE-L3']), 'LIVE-L3').result, 'pass');
     assert.deepEqual({ ...w.artifacts.get('gpu-live-l3').freeMemoryThreshold }, { ...based });
     nothingOwned(w);
+});
+
+// --- R2E(e): the Playground deviation names the route and the session it replaces ----------------------------------------
+test('R2E.the-playground-decision-states-the-route-and-session-deviation-and-the-programs-use-exactly-that-route', () => {
+    const { reason } = PLAYGROUND_DECISION;
+    for (const part of ['`/<agent>/mcp`', 'browser account', 'aggregated `/mcp`', 'minted `local:admin` session', 'The tool handler that answers is the same one']) assert.ok(reason.includes(part), part);
+    // What the decision states is what the tool program does.
+    assert.match(LLM_TOOL_CALL, /createAgentClient\('http:\/\/127\.0\.0\.1:8080\/mcp'/); assert.match(LLM_TOOL_CALL, /id:'local:admin'/);
+    assert.match(LLM_TOOL_CALL, /client\.callTool\(tool,args,\{agent:agents\[0\]\}\)/);
 });
