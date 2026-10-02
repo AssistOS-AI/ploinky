@@ -556,7 +556,8 @@ let cleaned = false;
 function cleanup() {
     if (cleaned) return;
     cleaned = true;
-    try { fs.rmSync(isTop ? guardRoot : ownDirectory, { recursive: true, force: true }); } catch (_) {}
+    // A straggling descendant may still write into the root: retry the removal.
+    try { fs.rmSync(isTop ? guardRoot : ownDirectory, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }); } catch (_) {}
 }
 // A refusal anywhere below the top-level process fails it, even when swallowed
 // or when the process that made it was killed.
