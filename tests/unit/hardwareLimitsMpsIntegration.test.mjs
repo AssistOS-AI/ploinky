@@ -317,3 +317,104 @@ test('MI.graph-start-after-client-only-failure-keeps-the-daemon', async () => {
     assert.deepEqual(drained, [], 'no healthy client is drained');
     assert.deepEqual([...result.replacedKeys], ['b'], 'only the client that was not recreated is replaced');
 });
+
+// A drained peer whose manifest no longer resolves goes through the REAL
+// drain composition (no injected drainClient): it is retired only from its
+// recorded identity, observed through fake low-level engine replies.
+import { NETWORK_LABELS, workspaceNetworkIdentity } from '../../cli/sandbox/networkLifecycle.js';
+function recordedPeerWorld({ labels = {}, init = true, healthyPeer = false } = {}) {
+    const token = { epoch: 'e'.repeat(32), revision: 1 };
+    const bId = 'b'.repeat(64);
+    const registry = {
+        b: { type: 'agent', repoName: 'demo', agentName: 'b', runtime: 'podman', instanceId: 'i-b', enableGeneration: 'g-b', containerId: bId },
+        z: { type: 'agent', repoName: 'demo', agentName: 'z', runtime: 'podman', instanceId: 'i-z', enableGeneration: 'g-z', containerId: 'f'.repeat(64) },
+    };
+    // An optional healthy old client 'a' that sorts before b: it must not be
+    // drained when b cannot be proven, so b is drained first.
+    if (healthyPeer) registry.a = { type: 'agent', repoName: 'demo', agentName: 'a', runtime: 'podman', instanceId: 'i-a', enableGeneration: 'g-a', containerId: 'a'.repeat(64) };
+    const applied = { b: { ...registry.b, gpuShare: cohortShare(25), mpsGeneration: 'd0:c0' }, ...(healthyPeer ? { a: { ...registry.a, gpuShare: cohortShare(25), mpsGeneration: 'd0:c0' } } : {}) };
+    // z takes a first share above the current default: a cohort restart whose
+    // only old client is the peer b, whose manifest is gone.
+    const policies = new Map([['demo/z', { gpu: cohortShare(50) }], ['demo/b', { gpu: cohortShare(25) }], ...(healthyPeer ? [['demo/a', { gpu: cohortShare(25) }]] : [])]);
+    let state = { ...daemon(cohortShare(), 'd0'), configurationGeneration: 'c0', oldClients: [], drainedClients: [] };
+    let alive = true; let running = true;
+    const events = []; const engine = []; const unavailable = []; const results = [];
+    const containerLabels = {
+        [NETWORK_LABELS.managed]: '1', [NETWORK_LABELS.resource]: 'agent', [NETWORK_LABELS.schema]: '2',
+        [NETWORK_LABELS.workspace]: workspaceNetworkIdentity().hash, [NETWORK_LABELS.contract]: 'c'.repeat(64),
+        [NETWORK_LABELS.instanceId]: 'i-b', [NETWORK_LABELS.enableGeneration]: 'g-b', 'ploinky.mpsgeneration': 'd0:c0', ...labels,
+    };
+    const engineRun = (runtime, args) => {
+        engine.push([runtime, ...args].join(' '));
+        if (args[0] === 'container' && args[1] === 'inspect' && args[2] === bId) {
+            return { ok: true, status: 0, stdout: JSON.stringify([{ Id: bId, Config: { Labels: containerLabels }, HostConfig: { Init: init }, State: { Running: running } }]), stderr: '' };
+        }
+        if (args[0] === 'container' && args[1] === 'stop' && args.at(-1) === bId) { running = false; events.push('stop:b'); return { ok: true, status: 0, stdout: '', stderr: '' }; }
+        return { ok: false, status: 125, stdout: '', stderr: 'no such container' };
+    };
+    const dependencies = {
+        observeClients: () => [], readContext: () => ({ storeToken: token, overrides: policies, gpu: { grant: { mps: {} } } }),
+        loadRegistry: () => clone(registry), readApplied: (key, containerId) => (applied[key]?.containerId === containerId ? clone(applied[key]) : null),
+        loadPlan: (ref) => { if (ref === 'demo/b') throw new Error('Agent demo/b not found'); return { runtime: 'podman', manifest: {}, profile: { network: { mode: 'default' } }, image: 'prepared:tag' }; },
+        prepareImage: () => {}, inspectImage: () => ({ Id: imageId, Config: { User: '1000:1000' } }), resolveShare: (policy) => policy, policyCheck: () => {},
+        store: { read: () => clone(state), write: (value) => { state = clone(value); } },
+        backend: {
+            observe: () => ({ state: alive ? 'owned' : 'gone', daemon: state.daemon }), verify: (value) => alive && Boolean(value?.daemon),
+            stop: () => { events.push('quit'); alive = false; }, cleanup: () => events.push('cleanup'),
+            start: (value) => { events.push('start'); alive = true; return { ...daemon(value, 'd1'), configurationGeneration: 'c1' }; },
+        },
+        network: async (fn) => fn({}), assertCapability: () => {},
+        markUnavailable: async (outcome) => { unavailable.push(outcome.key); events.push(`unavailable:${outcome.key}`); },
+        engineRun,
+    };
+    const launchTarget = async (next) => { readMpsLaunch(next.mpsLaunch, 'z', policies.get('demo/z').gpu); events.push('launch:z'); return { key: 'z', state: 'applied', containerId: 'e'.repeat(64) }; };
+    const apply = () => applyHardwareLimits({ expectedToken: token, containers: ['z'] }, {
+        lease: (_options, callback) => callback(), loadRegistry: () => clone(registry), loadRouting: () => ({ routes: {} }), readPolicy: () => ({ token }), policyCheck: () => {},
+        loadPlan: () => ({}), isUnchanged: () => false, onPlan: (plan) => events.push(`plan:${plan.expandedContainers.join(',')}`),
+        onResult: (value) => results.push(value),
+        reconcile: (instance, options) => coordinateMpsLifecycle({ target: { key: instance.key, record: clone(registry[instance.key]) }, options: { onMpsPlan: options.onMpsPlan, onMpsResult: options.onMpsResult }, launchTarget }, dependencies),
+    });
+    return { apply, events, engine, unavailable, get state() { return state; } };
+}
+
+test('MI.missing-manifest-peer-is-retired-by-its-recorded-identity', async () => {
+    const f = recordedPeerWorld();
+    const result = await f.apply();
+    assert.equal(result.status, 207, JSON.stringify(result));
+    assert.deepEqual(result.results.map((value) => [value.key, value.state]), [['b', 'refused'], ['z', 'applied']]);
+    const peer = result.results.find((value) => value.key === 'b');
+    assert.equal(peer.problem.key, 'b'); assert.ok(peer.problem.reason.includes('Agent demo/b not found') && peer.problem.fix);
+    assert.deepEqual(result.expandedContainers, ['b']);
+    // Recorded identity only: an inspection and a stop by the immutable ID,
+    // the route revoked before the stop, all before the daemon changes.
+    assert.deepEqual(f.engine, [`podman container inspect ${'b'.repeat(64)}`, `podman container stop --time 30 ${'b'.repeat(64)}`, `podman container inspect ${'b'.repeat(64)}`]);
+    const order = (value) => f.events.indexOf(value);
+    assert.ok(order('plan:b') < order('unavailable:b') && order('unavailable:b') < order('stop:b') && order('stop:b') < order('quit') && order('quit') < order('launch:z'), f.events.join(' '));
+    assert.ok(f.unavailable.includes('b'));
+    assert.deepEqual(f.state.pendingClients.map((value) => [value.key, value.phase]), [['b', 'pending']], 'the peer stays journaled');
+    assert.equal(f.state.lastProblem.code, 'mps_client_failed');
+});
+
+test('MI.unprovable-peer-identity-fails-closed-with-every-outcome', async () => {
+    for (const [label, world] of [
+        ['instance identity label differs', { labels: { [NETWORK_LABELS.instanceId]: 'another-instance' } }],
+        ['network contract label missing', { labels: { [NETWORK_LABELS.contract]: '' } }],
+        ['another workspace', { labels: { [NETWORK_LABELS.workspace]: '000000000000' } }],
+        ['another MPS generation', { labels: { 'ploinky.mpsgeneration': 'd9:c9' } }],
+        ['no init reaper', { init: false }],
+        ['labels differ, with a healthy client that sorts first', { labels: { [NETWORK_LABELS.instanceId]: 'another-instance' }, healthyPeer: true }],
+    ]) {
+        const f = recordedPeerWorld(world);
+        const result = await f.apply();
+        assert.equal(result.status, 207, `${label}: ${JSON.stringify(result)}`);
+        const peer = result.results.find((value) => value.key === 'b');
+        const target = result.results.find((value) => value.key === 'z');
+        assert.equal(peer?.state, 'refused', label); assert.ok(peer.problem.reason && peer.problem.fix, label);
+        assert.equal(target?.state, 'pending', label);
+        assert.match(target.message, /stopped before any daemon change/, label);
+        assert.deepEqual(result.pendingContainers, ['z'], label);
+        // Nothing drained, no route touched, no daemon change, no launch.
+        assert.deepEqual(f.engine, [`podman container inspect ${'b'.repeat(64)}`], label);
+        assert.equal(f.events.some((value) => ['stop:b', 'quit', 'start', 'launch:z'].includes(value) || value.startsWith('unavailable:')), false, `${label}: ${f.events.join(' ')}`);
+    }
+});

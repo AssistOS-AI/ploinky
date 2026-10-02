@@ -1449,6 +1449,41 @@ export function createNetworkLifecycleAdapter({
         };
     }
 
+    // The exact recorded runtime without its manifest: the immutable ID, this
+    // workspace's agent ownership labels bound to the container's own network
+    // contract hash, the recorded instance identity labels and the init
+    // reaper. Used where the manifest that would rebuild the expected network
+    // contract can no longer be resolved; anything unproven is not 'exact'.
+    function inspectRecordedAgentRuntime(containerId, { instanceId = '', enableGeneration = '' } = {}) {
+        const exactId = String(containerId || '').trim();
+        if (!/^[a-f0-9]{64}$/.test(exactId)) throw new Error('recorded runtime inspection requires an immutable container ID');
+        const record = inspectContainer(exactId);
+        if (!record) return { state: 'absent', id: null };
+        let id;
+        try { id = containerRecordId(record, exactId); } catch (_) { return { state: 'foreign', id: null }; }
+        if (id !== exactId) return { state: 'foreign', id, reason: 'immutable-id-mismatch' };
+        const labels = labelsOf(record);
+        const contractHash = String(labels?.[NETWORK_LABELS.contract] || '');
+        if (!/^[a-f0-9]{64}$/.test(contractHash) || !hasRequiredLabels(labels, expectedAgentOwnershipLabels(identity.hash, contractHash))) {
+            return { state: 'foreign', id, reason: 'ownership-labels' };
+        }
+        const expectedInstanceId = String(instanceId || '').trim();
+        const expectedEnableGeneration = String(enableGeneration || '').trim();
+        if (!expectedInstanceId || !expectedEnableGeneration
+            || String(labels?.[NETWORK_LABELS.instanceId] || '') !== expectedInstanceId
+            || String(labels?.[NETWORK_LABELS.enableGeneration] || '') !== expectedEnableGeneration) {
+            return { state: 'owned-drift', id, reason: 'runtime-identity' };
+        }
+        if (record?.HostConfig?.Init !== true) return { state: 'owned-drift', id, reason: 'init-reaper' };
+        return {
+            state: 'exact',
+            id,
+            contractHash,
+            labels: { ...labels },
+            running: record.State?.Running === true || record.State?.Status === 'running',
+        };
+    }
+
     function verifyContainerContract(containerName, network, canonicalAgentId, options = {}) {
         return inspectContainerContract(containerName, network, canonicalAgentId, options).state === 'exact';
     }
@@ -1549,6 +1584,7 @@ export function createNetworkLifecycleAdapter({
         runManagedContainerTransaction,
         adoptManagedContainerTransaction,
         inspectContainerContract,
+        inspectRecordedAgentRuntime,
         verifyContainerContract,
         agentIdentityLabelArgs,
         removeExactContainer,

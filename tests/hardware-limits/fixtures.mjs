@@ -471,6 +471,8 @@ export function buildRequiredCaseManifest() {
             'MI.p7-peer-ineligible-image-or-missing-manifest-never-refuses-the-target',
             'MI.peer-failure-is-a-partial-result-and-apply-reports-207', 'MI.ineligible-peer-is-refused-reported-before-drain-and-journaled',
             'MI.retry-recreates-only-the-failed-client', 'MI.watchdog-retries-of-a-failing-client-cause-no-healthy-churn',
+            'MI.graph-start-after-client-only-failure-keeps-the-daemon', 'MI.missing-manifest-peer-is-retired-by-its-recorded-identity',
+            'MI.unprovable-peer-identity-fails-closed-with-every-outcome',
         ]),
         ...leaves(P, 'p4', unit('hardwareLimitsOutcomes.test.mjs'), ['O.mps-graph-refusal-starts-cpu-agents-and-explorer']),
         ...leaves(P, 'p4', unit('hardwareLimitsMpsCandidateRecovery.test.mjs'), [

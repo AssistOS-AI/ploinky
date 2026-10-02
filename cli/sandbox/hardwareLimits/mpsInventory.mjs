@@ -5,7 +5,7 @@ import { createNetworkLifecycleAdapter } from '../networkLifecycle.js';
 import { networkContractHash } from '../networkContract.js';
 import { effectiveInstanceKey } from '../../utils/workspaceDependencyGraph.js';
 import { MpsError } from './mpsEligibility.mjs';
-import { isMpsClientAlias } from './mps.mjs';
+import { isMpsClientAlias, MPS_GENERATION_LABEL } from './mps.mjs';
 
 /** A daemon transition must not discard an unjournaled CUDA client's server. */
 export function assertKnownMpsClients({ runtime, registry = {}, state = null, query = spawnSync } = {}) {
@@ -135,6 +135,39 @@ export function inspectMpsClientPresence(client, { runtime, createAdapter = crea
     // it never accepts a runtime it cannot fully identify.
     const observed = createAdapter({ runtime }).inspectContainerContract(client.containerId, null, agentName || 'unknown', { contractHash: '' });
     return observed.state === 'absent' ? { state: 'absent', id: null } : { state: 'present', id: observed.id || null };
+}
+
+/**
+ * A journaled share client whose manifest can no longer be resolved, judged
+ * only by its recorded identity: the exact immutable ID, this workspace's
+ * ownership and network contract labels, the recorded instance identity and
+ * the MPS generation it was launched under. Anything unproven is not 'exact'.
+ */
+export function inspectRecordedMpsClient(client, { runtime, run, createAdapter = createNetworkLifecycleAdapter } = {}) {
+    if (!IMMUTABLE_ID.test(String(client?.containerId || ''))) throw new MpsError('MPS inspection needs an immutable client ID', 'identity_changed');
+    const observed = createAdapter({ runtime, ...(run ? { run } : {}) }).inspectRecordedAgentRuntime(client.containerId, { instanceId: client.instanceId, enableGeneration: client.enableGeneration });
+    if (observed.state !== 'exact') return observed;
+    if (!client.mpsGeneration || String(observed.labels?.[MPS_GENERATION_LABEL] || '') !== client.mpsGeneration) return { state: 'owned-drift', id: observed.id, reason: 'mps-generation' };
+    return observed;
+}
+
+/** Stop that exact recorded client by its immutable ID and prove it stopped. */
+export function stopRecordedMpsClient(client, { runtime, run = defaultEngineRun, timeoutSeconds = 30 } = {}) {
+    if (!IMMUTABLE_ID.test(String(client?.containerId || ''))) throw new MpsError('MPS stop needs an immutable client ID', 'identity_changed');
+    const stopped = run(runtime, ['container', 'stop', '--time', String(timeoutSeconds), client.containerId], { timeoutMs: (timeoutSeconds + 15) * 1000 });
+    if (!stopped.ok) throw new MpsError(`The recorded MPS client ${client.key} could not be stopped by its immutable ID`, 'identity_changed');
+    const inspected = run(runtime, ['container', 'inspect', client.containerId], { timeoutMs: 10_000 });
+    let record = null;
+    try { record = JSON.parse(String(inspected.stdout || ''))?.[0] || null; } catch (_) {}
+    if (!inspected.ok || !record || (record.Id || record.ID) !== client.containerId || record.State?.Running === true) {
+        throw new MpsError(`The recorded MPS client ${client.key} is not proven stopped`, 'identity_changed');
+    }
+    return { state: 'stopped', id: client.containerId };
+}
+
+function defaultEngineRun(runtime, args, { timeoutMs = 10_000 } = {}) {
+    const reply = spawnSync(runtime, args, { encoding: 'utf8', timeout: timeoutMs, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
+    return { ok: reply.status === 0 && !reply.error && !reply.signal, status: reply.status, stdout: String(reply.stdout || ''), stderr: String(reply.stderr || '') };
 }
 
 /** The registry-shaped exact identity a created candidate was launched with. */

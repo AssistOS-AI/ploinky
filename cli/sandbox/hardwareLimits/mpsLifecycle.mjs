@@ -8,7 +8,7 @@ import { resolveAgentRepositoryName } from '../../utils/agentRepositorySource.mj
 import { resolveManifestRuntimeProfile } from '../../utils/runtime/profileService.js';
 import { resolveManifestImage } from '../../utils/security/secretVars.js';
 import { resolveRouterEndpoint } from '../routerPort.js';
-import { assertNetworkLifecycleCapability, withNetworkLifecycleLockAsync } from '../networkLifecycle.js';
+import { assertNetworkLifecycleCapability, withNetworkLifecycleLockAsync, createNetworkLifecycleAdapter } from '../networkLifecycle.js';
 import { ensureAgentService, retireExactAgentRuntimePredecessor } from '../docker/agentServiceManager.js';
 import { ensureImagePresent, getRuntime, getAgentContainerName } from '../docker/common.js';
 import { resolveLlmRuntimeAdmissionContext } from '../docker/llmRuntimeIntegration.js';
@@ -22,7 +22,7 @@ import { readAppliedObservation } from './runtimeState.mjs';
 import {
     assertKnownMpsClients, inspectMpsClient, inspectMpsClientPresence, resolveMpsClientAlias,
     createdMpsCandidates, settleCreatedMpsCandidate, dropSettledMpsCandidate, mpsCandidateRecord,
-    sameMpsTuple, mpsOwnerState, mpsLaunchOwner, releaseMpsLaunchOwner,
+    sameMpsTuple, mpsOwnerState, mpsLaunchOwner, releaseMpsLaunchOwner, inspectRecordedMpsClient, stopRecordedMpsClient,
 } from './mpsInventory.mjs';
 import { HardwareStoreError } from './store.mjs';
 import { HardwareLimitsError } from './errors.mjs';
@@ -33,7 +33,7 @@ import { MpsError, inspectMpsImage } from './mpsEligibility.mjs';
 import { inspectPreparedMpsImage } from './mpsStatus.mjs';
 import { createMpsLaunch, readMpsLaunchForTracking, verifyMpsLaunch } from './mpsLaunch.mjs';
 import { verifyMpsRuntimeObservation } from './mpsRuntimeObservation.mjs';
-import { runMpsTransitionAsync } from './mpsTransition.mjs';
+import { runMpsTransitionAsync, MpsPartialFailureError } from './mpsTransition.mjs';
 import { reconcileExactHardwareInstance, captureExactHardwareInstances, assertHardwareApplyInputs } from './reconcile.mjs';
 
 function loadClientPlan(ref, record = {}) {
@@ -62,11 +62,23 @@ function mpsPeerRefusal(error, key, record) {
     const ref = `${record.repoName}/${record.agentName}`;
     const reasonCode = error?.code === 'image_preparation_required' ? 'image_preparation_required' : 'gpu_sharing_unavailable';
     return buildDirectRefusal({ key, ref, alias: record.alias || null,
-        refusalParts: { reasonCode, reason: `GPU coordination drained ${ref}, but it cannot be recreated as a GPU share client: ${String(error?.message || error).slice(0, 1024)}`,
+        refusalParts: { reasonCode, reason: `GPU coordination of the share cohort includes ${ref}, which cannot be recreated as a GPU share client: ${String(error?.message || error).slice(0, 1024)}`,
             fix: `Repair ${ref} (restore its manifest or use an eligible image), then restart it; or clear its GPU share in Settings or with ploinky limits clear --agent ${ref} on the host.`,
             requested: [{ field: 'gpu', value: 'configured MPS share', source: 'settings' }] },
         inputFingerprint: hex64({ ref, key, peer: true, reason: String(error?.message || error) }),
     });
+}
+
+const recordRuntime = (record) => (['podman', 'docker'].includes(record?.runtime) ? record.runtime : getRuntime());
+
+// A peer whose manifest or image no longer resolves is retired only from its
+// recorded identity; when that cannot be proven nothing is drained and the
+// daemon is untouched.
+class MpsPeerNotRetirableError extends HardwareStoreError {
+    constructor(client, outcome, observed) {
+        super(`GPU coordination stopped before any daemon change: the share client ${client.key}, which cannot be recreated, is not provably its recorded runtime (${String(observed?.state || 'unknown')}${observed?.reason ? `: ${observed.reason}` : ''}).`, { code: 'mps_peer_unretirable', status: 409 });
+        Object.defineProperty(this, 'peerOutcome', { value: outcome });
+    }
 }
 
 async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }, {
@@ -83,6 +95,9 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
     removeCandidate = (candidate, plan, capability) => retireExactAgentRuntimePredecessor({ containerName: candidate.key, containerId: candidate.containerId,
         registryRecord: mpsCandidateRecord(candidate), runtimeNetwork: plan.profile.network }, { networkLifecycleCapability: capability }),
     ownerState = mpsOwnerState, markUnavailable = (outcome, capability) => markMpsPeerUnavailable(outcome, capability, { loadRegistry }),
+    engineRun = undefined,
+    inspectRecorded = (client, record) => inspectRecordedMpsClient(client, { runtime: recordRuntime(record), run: engineRun }),
+    stopRecorded = (client, record) => stopRecordedMpsClient(client, { runtime: recordRuntime(record), ...(engineRun ? { run: engineRun } : {}) }),
 } = {}) {
     return network(async (capability) => {
         const context = readContext();
@@ -183,8 +198,22 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
                 if (!record || record.instanceId !== client.instanceId || record.enableGeneration !== client.enableGeneration || record.containerId !== client.containerId) throw new HardwareStoreError('MPS cohort registry identity changed before drain', { code: 'identity_changed', status: 409 });
                 const alias = resolveMpsClientAlias(client, record);
                 if (drainClient) return drainClient(client, record, capability);
+                const refused = peerRefusals.find((entry) => sameMpsTuple(entry.client, client));
+                if (refused && !plans.has(client.key)) {
+                    // Never resolve its missing manifest: its recorded tuple,
+                    // labels and network contract identity decide.
+                    let observed;
+                    try { observed = inspectRecorded(client, record); } catch (error) { observed = { state: 'unknown', reason: String(error?.message || error).slice(0, 256) }; }
+                    if (observed.state === 'absent') return;
+                    if (observed.state !== 'exact' || observed.id !== client.containerId) throw new MpsPeerNotRetirableError(client, refused.outcome, observed);
+                    check();
+                    await markUnavailable(refused.outcome, capability);
+                    check();
+                    try { stopRecorded(client, record); } catch (error) { throw new MpsPeerNotRetirableError(client, refused.outcome, { state: 'not-stopped', reason: String(error?.message || error).slice(0, 256) }); }
+                    return;
+                }
                 const plan = plans.get(client.key) || loadPlan(client.ref, record);
-                const observation = inspectMpsClient(client, { runtime: plan.runtime, network: plan.profile.network, alias });
+                const observation = inspectMpsClient(client, { runtime: plan.runtime, network: plan.profile.network, alias, ...(engineRun ? { createAdapter: (adapterOptions) => createNetworkLifecycleAdapter({ ...adapterOptions, run: engineRun }) } : {}) });
                 if (observation.state === 'absent') return;
                 if (observation.state !== 'exact' || observation.id !== client.containerId) throw new HardwareStoreError('MPS cohort runtime ownership changed before drain', { code: 'identity_changed', status: 409 });
                 if (observation.running === false) {
@@ -232,6 +261,15 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
             onResult: (value) => { if (value?.state === 'refused' && value.problem && peerRefusals.some(({ client }) => client.key === value.key)) refusedResults.push(value); options.onMpsResult?.(value); },
         });
         } catch (error) {
+            if (error?.code === 'mps_peer_unretirable' && error.peerOutcome) {
+                // Fail closed with every agent's outcome: the peer is refused
+                // and the target stays pending with the reason.
+                releaseMpsLaunchOwner(targetOwner);
+                const results = [{ key: error.peerOutcome.key, state: error.peerOutcome.state, problem: error.peerOutcome },
+                    { key: target.key, state: 'pending', problem: null, error: 'mps_peer_unretirable', message: String(error.message).slice(0, 1024) }];
+                for (const value of results) options.onMpsResult?.(value);
+                throw new MpsPartialFailureError(String(error.message).slice(0, 2048), { results, state: store.read() });
+            }
             if (error?.code !== 'mps_partial_failure') { releaseMpsLaunchOwner(targetOwner); throw error; }
             partial = error;
             result = { state: error.mpsTransitionState };

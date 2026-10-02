@@ -120,7 +120,11 @@ function* transitionSteps(input, { assertCapability, store, backend, drain, recr
     try {
         // No daemon mutation can happen until every owned old share client
         // has completed bounded route revocation and exact runtime drain.
-        for (const client of plan.drain) {
+        // Peers that cannot be recreated go first: when one cannot be proven
+        // its recorded runtime, nothing else has been drained yet.
+        const refusedIds = new Set((input.refusedClients || []).map(({ client }) => clientIdentity(client)));
+        const drainOrder = [...plan.drain].sort((left, right) => Number(refusedIds.has(clientIdentity(right))) - Number(refusedIds.has(clientIdentity(left))));
+        for (const client of drainOrder) {
             if (state.drainedClients.includes(clientIdentity(client))) continue;
             check();
             yield () => drain(client, input.capability);
