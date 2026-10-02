@@ -1,4 +1,6 @@
 import fs from 'node:fs';
+import { readMpsStatus, inspectMpsTargetEligibility, inspectPreparedMpsImage } from '../../sandbox/hardwareLimits/mpsStatus.mjs';
+import { resolveManifestImage } from '../../utils/security/secretVars.js';
 import { validateHardwareRequest } from './hardwareLimitsRequest.mjs';
 export { validateHardwareRequest } from './hardwareLimitsRequest.mjs';
 import { readBoxHardwareMarker } from '../../../ploinky-box/lib/hardwareLimitsMarker.mjs';
@@ -51,7 +53,7 @@ function defaultContext({ refreshBackend = false } = {}) {
     if (context.gate !== 'on') return { ...context, identity: null, paths: null };
     if (!marker.valid) fail('store_unreadable', 'The hardware wiring marker cannot be read safely.', 503);
     const identity = { instance: marker.marker.instance, pathHash: marker.marker.pathHash, workspaceRoot: marker.marker.workspaceRoot };
-    return { ...context, identity, paths: hardwareStorePaths({ identity, context: 'box' }) };
+    return { ...context, gpu: readMpsStatus({ workspaceRoot: identity.workspaceRoot }), identity, paths: hardwareStorePaths({ identity, context: 'box' }) };
 }
 
 function installedAgents() {
@@ -70,6 +72,21 @@ function defaultAdmission(agent, record = {}, context) {
         instanceKey: record.key || agent.ref, alias: record.alias || '',
         hardwareAdmission: 'metadata', hardwareContext: context,
     });
+}
+
+export function qualifyHardwareGpuTarget(agent, records, context, limits, { inspectImage = inspectPreparedMpsImage, qualify = inspectMpsTargetEligibility } = {}) {
+    if (!agent) fail('unknown_agent', 'The selected agent is not installed.', 404);
+    const manifest = JSON.parse(fs.readFileSync(agent.manifestPath, 'utf8'));
+    const [repoName, agentName] = agent.ref.split('/');
+    let qualified;
+    for (const record of [{}, ...records]) {
+        const runtime = record.runtime || 'podman';
+        const profile = resolveManifestRuntimeProfile(manifest, { agentName: agent.ref, profileName: record.profile || undefined });
+        const llm = resolveLlmRuntimeAdmissionContext({ runtime, manifest, profileConfig: profile.profileConfig, agentName, alias: record.alias, env: process.env });
+        const image = llm.startup?.imageRef || resolveManifestImage(manifest, profile.profileConfig, { agentName, repoName });
+        qualified = qualify({ image, networkMode: profile.network?.mode || 'default', agentRef: agent.ref, gpuShare: limits.gpu, workspaceRoot: context.identity?.workspaceRoot, status: context.gpu }, { inspectImage: (target) => inspectImage(target, { runtime }) });
+    }
+    return qualified;
 }
 
 export function buildHardwareLimitsState({ context, installed, registry, routing = {}, metrics = null, admit = defaultAdmission, readApplied = readAppliedObservation }) {
@@ -102,15 +119,17 @@ export function buildHardwareLimitsState({ context, installed, registry, routing
             const ready = runtime?.state?.ready === true;
             const running = runtime?.state?.running === true;
             const availability = problem?.state || (projection || runtime?.state?.status === 'failed' ? 'failed' : ready ? 'ready' : running ? 'starting' : 'stopped');
-            const limitsState = projection ? 'unavailable' : !running ? 'unavailable' : matchingObservation && matchingObservation.limitsHash === hardwareLimitsHashOf(desired?.descriptor) ? 'applied' : 'pending';
+            const desiredMps = desired?.descriptor?.hardwareGpu;
+            const generationMatches = !desiredMps || (context.gpu?.daemonStatus === 'ready' && matchingObservation?.mpsGeneration === context.gpu.mpsGeneration);
+            const limitsState = projection ? 'unavailable' : !running ? 'unavailable' : matchingObservation && generationMatches && matchingObservation.limitsHash === hardwareLimitsHashOf(desired?.descriptor) ? 'applied' : 'pending';
             containers.push({
                 key, alias: record.alias || null, instanceId: record.instanceId || null, enableGeneration: record.enableGeneration || null,
-                availability, limitsState, problem, ...(runtime?.limits ? { limits: runtime.limits } : {}),
-                effective: desired?.descriptor?.hardwareResolved || desired?.descriptor?.hardwarePlacement?.expected || {},
+                availability, limitsState, problem, mpsGeneration: matchingObservation?.mpsGeneration || null, ...(runtime?.limits ? { limits: runtime.limits } : {}),
+                effective: { ...(desired?.descriptor?.hardwareResolved || desired?.descriptor?.hardwarePlacement?.expected || {}), ...(desiredMps ? { gpu: desiredMps } : {}) },
                 usage: runtime?.metrics?.available ? { cpuPercent: runtime.metrics.cpuPercent, memoryBytes: runtime.metrics.memoryBytes } : null,
             });
         }
-        agents.push({ ref: agent.ref, configured: context.overrides?.get(agent.ref) || {}, declared, effective: admission?.descriptor?.hardwarePlacement?.expected || {}, containers, ...(agent.orphaned ? { orphaned: true } : {}) });
+        agents.push({ ref: agent.ref, configured: context.overrides?.get(agent.ref) || {}, declared, effective: { ...(admission?.descriptor?.hardwarePlacement?.expected || {}), ...(admission?.descriptor?.hardwareGpu ? { gpu: admission.descriptor.hardwareGpu } : {}) }, containers, ...(agent.orphaned ? { orphaned: true } : {}) });
     }
     return {
         ok: true, token: context.storeToken || null,
@@ -149,7 +168,7 @@ export async function handleHardwareLimitsRoutes(req, res, parsedUrl, {
     getRegistry = readAgentRegistrySnapshot, getRouting = readRoutingConfig,
     getMetrics = () => workspaceMetricsMonitor.latest, apply = runHardwareLimitsApplyWorker,
     set = setAgentLimits, clear = clearAgentLimits, admit = defaultAdmission, verifyLease = () => true,
-    readSelection = null,
+    readSelection = null, qualifyGpu = qualifyHardwareGpuTarget,
 } = {}) {
     const send = (status, body) => { res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(body)); };
     if (hasHardwareBearer(req)) { send(403, { ok: false, error: 'agent_forbidden' }); return true; }
@@ -194,7 +213,9 @@ export async function handleHardwareLimitsRoutes(req, res, parsedUrl, {
             });
             send(result?.status || 200, { ok: result?.ok !== false, ...result });
         } else {
-            const capabilities = { gate: context.gate, controllers: context.backendReady ? context.controllers : [], gpu: context.gpu };
+            const gpu = body.action === 'set_agent_limits' && body.limits?.gpu
+                ? qualifyGpu(installed.find((agent) => agent.ref === body.agentRef), Object.values(registry).filter((record) => record?.type === 'agent' && `${record.repoName}/${record.agentName}` === body.agentRef), context, body.limits) : context.gpu;
+            const capabilities = { gate: context.gate, controllers: context.backendReady ? context.controllers : [], gpu };
             const result = body.action === 'set_agent_limits'
                 ? set({ paths: context.paths, identity: context.identity, expectedToken: body.expectedToken, agentRef: body.agentRef, limits: body.limits, installedRefs: new Set(installed.map((agent) => agent.ref)), capabilities, envelope: context.envelope, actor, beforeCommit: authorize })
                 : clear({ paths: context.paths, identity: context.identity, expectedToken: body.expectedToken, agentRef: body.agentRef, actor, beforeCommit: authorize });

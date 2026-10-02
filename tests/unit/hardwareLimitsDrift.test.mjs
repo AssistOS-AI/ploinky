@@ -737,7 +737,7 @@ test('D.interactive-stored-gpu-refused', () => {
         agentName: 'shell', repoName: 'demo', containerName: 'ploinky_demo_shell', insideBox: true, hardwareContext: context,
     }));
     assert.equal(outcome.reasonCode, 'gpu_sharing_unavailable');
-    assert.equal(outcome.reason, 'GPU sharing is not available in this release, so the stored GPU share cannot be enforced.');
+    assert.equal(outcome.reason, 'This agent has no active, qualified Box GPU grant.');
     assert.match(outcome.fix, /^Clear the GPU share in Settings, or run ploinky limits clear --agent demo\/shell on the host/);
     assert.deepEqual(outcome.requested, [{ field: 'gpu', value: '40/30 percent', source: 'settings' }]);
 });

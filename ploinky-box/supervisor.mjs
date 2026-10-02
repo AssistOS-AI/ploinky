@@ -407,7 +407,7 @@ export function createBoxSupervisor({
     // start, restart and update rediscovers the host driver, so a driver update
     // replaces the Box with regenerated wiring, and a failed discovery wires
     // only a stale-grant marker instead of stopping the whole workspace.
-    function selectSavedGpuWiring(identity) {
+    function selectSavedGpuWiring(identity, mpsEnabled = hardwareGateStore.read(identity)?.enabled === true) {
         const saved = gpuGrantStore.read(identity);
         // D14: manifests of the installed repos may declare GPU access; the
         // operator's grants and denies apply on top.
@@ -415,6 +415,7 @@ export function createBoxSupervisor({
         const desired = resolveDesiredGpuWiring(identity, saved, declared, {
             discover: discoverGpuDevices,
             homeDirectory: gpuGrantStore.homeDirectory,
+                mpsEnabled,
         });
         if (desired?.state === 'stale') {
             stderr?.write?.(
@@ -663,7 +664,7 @@ export function createBoxSupervisor({
             operation,
             oldContainerId: container.id,
             oldConfiguration: JSON.parse(JSON.stringify(oldConfiguration)),
-            desiredConfiguration: JSON.parse(JSON.stringify({ ...oldConfiguration, hardware: null })),
+            desiredConfiguration: JSON.parse(JSON.stringify({ ...oldConfiguration, hardware: null, gpu: selectSavedGpuWiring(identity, false).desired })),
             graphSnapshot: { schema: 1, coreArgv: coreArgv ? [...coreArgv] : [], skillScopeEnv: readGraphSkillScope(identity) || null },
             oldWasRunning,
             oldGraphRunning,
@@ -1079,7 +1080,7 @@ export function createBoxSupervisor({
                 identity,
                 options.explicitPort,
             );
-            const { saved: savedGpuGrant, desired: gpu } = selectSavedGpuWiring(identity);
+            const { saved: savedGpuGrant, desired: gpu } = selectSavedGpuWiring(identity, hardwareGate.enabled);
             const { selection } = await selectAgentLib({
                 workspaceRoot: identity.workspaceRoot,
                 branchPolicy: options.branchPolicy || null,
@@ -2124,6 +2125,7 @@ export function createBoxSupervisor({
             const gpu = resolveDesiredGpuWiring(identity, next, declared, {
                 discover: discoverGpuDevices,
                 homeDirectory: gpuGrantStore.homeDirectory,
+                mpsEnabled: hardwareGateStore.read(identity)?.enabled === true,
                 strict: true,
             });
             return applyGpuGrantChange({ identity, lock, ownership, saved, next, gpu, verb: 'grant', declared });
@@ -2157,6 +2159,7 @@ export function createBoxSupervisor({
             const gpu = resolveDesiredGpuWiring(identity, next, declared, {
                 discover: discoverGpuDevices,
                 homeDirectory: gpuGrantStore.homeDirectory,
+                mpsEnabled: hardwareGateStore.read(identity)?.enabled === true,
             });
             // A per-agent revoke must not strip GPU wiring that a lost record
             // left on the Box for other agents. Wiring that the manifests alone
@@ -2168,6 +2171,7 @@ export function createBoxSupervisor({
                     return resolveDesiredGpuWiring(identity, null, declared, {
                         discover: discoverGpuDevices,
                         homeDirectory: gpuGrantStore.homeDirectory,
+                mpsEnabled: hardwareGateStore.read(identity)?.enabled === true,
                     });
                 } catch {
                     return null;
@@ -2219,6 +2223,7 @@ export function createBoxSupervisor({
         const desired = resolveDesiredGpuWiring(identity, saved, declared, {
             discover: discoverGpuDevices,
             homeDirectory: gpuGrantStore.homeDirectory,
+                mpsEnabled: hardwareGateStore.read(identity)?.enabled === true,
         });
         return Object.freeze({
             identity,

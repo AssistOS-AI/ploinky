@@ -25,6 +25,8 @@ function fixture(mode, { problem = null, cleanupProblem = null, inactivationProb
     const dependencies = {
         admitAgentServicePreflight: () => ({ preflightRepoName: 'demo', preflightManifestPath: '/fixture/manifest.json', preflightManifestBytes: Buffer.from(JSON.stringify(manifest)), preflightAgentRuntime: 'podman', preflightRuntimeKind: 'container', preflightAdmission: admission, hardwareInstanceKey: key }),
         normalizeTargetedRestart: () => null,
+        readAppliedObservation: () => null,
+        hasMpsLaunch: () => false,
         assertNetworkLifecycleCapability: noOp,
         dependencyRefreshOperation: () => false,
         resolveAgentRepositoryName: () => 'demo',

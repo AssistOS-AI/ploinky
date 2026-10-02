@@ -23,6 +23,10 @@ import { readBoxHardwareContext } from './context.mjs';
 import { readBoxHardwareMarker } from '../../../ploinky-box/lib/hardwareLimitsMarker.mjs';
 import { hardwareStorePaths, readStoreSnapshot, validateStoreToken, assertPolicyWritesAllowed, HardwareStoreError } from './store.mjs';
 import { readAppliedObservation } from './runtimeState.mjs';
+import { verifyLaunchedHardwareLimits } from './delegation.mjs';
+import { hasMpsLaunch } from './mpsLaunch.mjs';
+import { coordinateMpsLifecycle, trackMpsRuntimePending, verifyMpsRuntimeReady, acknowledgeMpsRuntimeReady } from './mpsLifecycle.mjs';
+import { readMpsStatus } from './mpsStatus.mjs';
 
 function failure(code, message, status = 409) { return new HardwareStoreError(message, { code, status }); }
 
@@ -127,7 +131,7 @@ export function hardwareApplyIsUnchanged(captured, plan, {
         instanceKey: effectiveInstanceKey(captured.record.repoName, captured.record.agentName, captured.record.alias || ''),
         contractHash: networkContractHash(plan.profileResolution.network), instanceId: captured.record.instanceId, enableGeneration: captured.record.enableGeneration, requireRuntimeIdentity: true,
     }),
-    readApplied = readAppliedObservation, readLabel = getContainerLabel,
+    readApplied = readAppliedObservation, readLabel = getContainerLabel, verifyLimits = verifyLaunchedHardwareLimits,
 } = {}) {
     if (Object.values(loadRouting().routes || {}).some((route) => route?.container === captured.key && route.hardwareAvailability)) return false;
     const hash = hardwareLimitsHashOf(plan.runtimeAdmission.descriptor);
@@ -135,6 +139,8 @@ export function hardwareApplyIsUnchanged(captured, plan, {
     if (observed?.state !== 'exact' || observed.id !== captured.record.containerId || observed.running !== true) return false;
     if (!hash) return !plan.hardwareOutcome && !(plan.runtimeAdmission.descriptor.hardwareRequest?.length) && !readLabel(captured.key, 'ploinky.limitshash');
     const applied = readApplied(captured.key, captured.record.containerId);
+    try { verifyLimits({ descriptor: plan.runtimeAdmission.descriptor, containerId: observed.id, runtime: plan.runtime || getRuntime() }); } catch (_) { return false; }
+    if (plan.runtimeAdmission.descriptor.hardwareGpu && (!applied?.mpsGeneration || applied.mpsGeneration !== readMpsStatus().mpsGeneration || readLabel(captured.key, 'ploinky.mpsgeneration') !== applied.mpsGeneration)) return false;
     return Boolean(hash && applied && applied.instanceId === captured.record.instanceId && applied.enableGeneration === captured.record.enableGeneration && applied.limitsHash === hash
         && readLabel(captured.key, 'ploinky.limitshash') === hash);
 }
@@ -142,7 +148,7 @@ export function hardwareApplyIsUnchanged(captured, plan, {
 export async function reconcileExactHardwareInstance(captured, {
     origin = 'cli', expectedToken = undefined, networkLifecycleCapability = null,
     deadline = Date.now() + 15 * 60 * 1000,
-    authorize = () => true, isCancelled = () => false,
+    authorize = () => true, isCancelled = () => false, mpsLaunch = null, onMpsPlan = () => {}, onMpsResult = () => {},
 } = {}, {
     loadRegistry = readAgentRegistrySnapshot, loadPlan = readPlan, readPolicy = defaultPolicy,
     policyCheck = assertHardwareApplyInputs, maintenance = withMaintenanceLock, network = withNetworkLifecycleLock,
@@ -164,7 +170,8 @@ export async function reconcileExactHardwareInstance(captured, {
         checkPolicy();
         assertExactHardwareInstance(captured, loadRegistry());
     };
-    return maintenance(captured.key, { operation: origin === 'apply' ? 'hardware-apply' : 'restart' }, () => network(async (capability) => {
+    const maintain = hasMpsLaunch(mpsLaunch) && networkLifecycleCapability ? (_key, _options, callback) => callback() : maintenance;
+    return maintain(captured.key, { operation: origin === 'apply' ? 'hardware-apply' : 'restart' }, () => network(async (capability) => {
         check();
         let result = null;
         let transition = null;
@@ -172,6 +179,11 @@ export async function reconcileExactHardwareInstance(captured, {
         try {
             plan = loadPlan(captured);
             if (plan.hardwareOutcome) throw new HardwareLimitsError(plan.hardwareOutcome);
+            const priorMps = readAppliedObservation(captured.key, captured.record.containerId);
+            if (!hasMpsLaunch(mpsLaunch) && (plan.runtimeAdmission?.descriptor?.hardwareGpu || priorMps?.mpsGeneration)) {
+                return await coordinateMpsLifecycle({ target: captured, options: { origin, expectedToken: capturedToken, deadline, authorize, isCancelled, onMpsPlan, onMpsResult, networkLifecycleCapability: capability },
+                    launchTarget: (next) => reconcileExactHardwareInstance(captured, next) });
+            }
             const routeKey = captured.record.alias || captured.record.agentName;
             const route = loadRouting().routes?.[routeKey];
             if (!isSandboxRuntime(plan.runtime) && route && !route.hardwareAvailability) {
@@ -181,7 +193,7 @@ export async function reconcileExactHardwareInstance(captured, {
             // Preparation can rotate the registry. Revalidate its own exact
             // successor before create, while token/barrier checks stay fresh.
             checkPolicy();
-            result = ensure(captured.record.agentName, plan.manifest, plan.agentPath, {
+            result = await ensure(captured.record.agentName, plan.manifest, plan.agentPath, {
                 containerName: captured.key, alias: captured.record.alias, forceRecreate: true,
                 hardwareInstanceKey: captured.key,
                 profileName: plan.profileResolution.resolvedProfileName, profileResolution: plan.profileResolution,
@@ -189,17 +201,21 @@ export async function reconcileExactHardwareInstance(captured, {
                 networkLifecycleCapability: capability,
                 ...(transition ? { instanceId: transition.identity.instanceId, enableGeneration: transition.identity.enableGeneration, targetedRestart: transition.targetedRestart } : {}),
                 beforeHardwareMutation: checkPolicy,
+                mpsLaunch,
             });
+            if (mpsLaunch && plan.runtimeAdmission?.descriptor?.hardwareGpu) trackMpsRuntimePending(result, { mpsLaunch, key: captured.key });
             await readiness({ key: captured.key, label: captured.record.agentName, kind: 'reinstall', manifest: plan.manifest, route: { container: result.containerName, hostPort: result.hostPort || 0 } }, { deadline, beforeProbe: checkPolicy });
             checkPolicy();
+            await verifyMpsRuntimeReady(result);
             if (transition) await commit({ transition, result, agentPath: plan.agentPath, alias: captured.record.alias || '', networkLifecycleCapability: capability });
             else await activate({ result, routeKey, repoName: captured.record.repoName, shortAgentName: captured.record.agentName, agentPath: plan.agentPath, alias: captured.record.alias || '', networkLifecycleCapability: capability });
-            return { key: captured.key, observedKey: result.containerName, instanceId: result.registryRecord?.instanceId, enableGeneration: result.registryRecord?.enableGeneration, containerId: result.containerId, state: 'applied', problem: null };
+            await acknowledgeMpsRuntimeReady(result);
+            return Object.defineProperty({ key: captured.key, observedKey: result.containerName, instanceId: result.registryRecord?.instanceId, enableGeneration: result.registryRecord?.enableGeneration, containerId: result.containerId, state: 'applied', problem: null }, 'runtimeResult', { value: result });
         } catch (error) {
             if (transition) cleanupTargeted(result, error);
             else cleanupPrepared(result, error, 'hardware-reconcile-failed');
             const problem = findHardwareOutcome(error);
-            if (problem) {
+            if (problem && problem.key === captured.key) {
                 const current = loadRegistry()[captured.key];
                 if (current?.instanceId && current?.enableGeneration) {
                     const projection = buildAvailabilityProjection({ outcome: problem, instanceId: current.instanceId, enableGeneration: current.enableGeneration });
@@ -245,22 +261,33 @@ export async function applyHardwareLimits({ expectedToken, containers }, {
         const expandedContainers = keys.filter((key) => !requested.includes(key));
         onPlan({ containers: keys, expandedContainers });
         const results = [];
+        const recordResult = (result) => {
+            const index = results.findIndex((entry) => entry.key === result.key);
+            if (index >= 0) results[index] = result; else results.push(result);
+            onResult(result);
+        };
+        const onMpsPlan = (plan) => {
+            for (const key of plan.expandedKeys || []) {
+                if (!keys.includes(key)) { keys.push(key); expandedContainers.push(key); }
+            }
+            onPlan({ containers: [...keys], expandedContainers: [...expandedContainers] });
+        };
         for (const instance of captured) {
+            if (results.some((result) => result.key === instance.key && result.state === 'applied')) continue;
             try {
                 check();
                 assertExactHardwareInstance(instance, loadRegistry());
                 const plan = loadPlan(instance, { hardwareAdmission: 'metadata' });
                 const result = !plan.hardwareOutcome && isUnchanged(instance, plan)
                     ? { key: instance.key, observedKey: instance.key, state: 'unchanged', problem: null }
-                    : await reconcile(instance, { origin: 'apply', expectedToken: token, deadline, authorize, isCancelled });
-                results.push(result);
-                onResult(result);
+                    : await reconcile(instance, { origin: 'apply', expectedToken: token, deadline, authorize, isCancelled, onMpsPlan, onMpsResult: recordResult });
+                recordResult(result);
             } catch (error) {
                 const problem = findHardwareOutcome(error);
-                const result = { key: instance.key, state: problem?.state || 'pending', problem, error: problem?.code || String(error.code || 'apply_failed'), message: problem ? undefined : 'This exact instance was not applied. Reload its state and retry.' };
-                results.push(result);
-                onResult(result);
-                if (!problem) return { ok: false, status: error.status || 409, error: result.error, token, expandedContainers, results, pendingContainers: keys.slice(results.length) };
+                const result = { key: problem?.key || instance.key, state: problem?.state || 'pending', problem, error: problem?.code || String(error.code || 'apply_failed'), message: problem ? undefined : 'This exact instance was not applied. Reload its state and retry.' };
+                if (!results.some((entry) => entry.key === result.key && entry.state === 'applied')) recordResult(result);
+                if (problem?.key && problem.key !== instance.key) return { ok: false, status: 207, token, expandedContainers, results, pendingContainers: keys.filter((key) => !results.some((entry) => entry.key === key)) };
+                if (!problem) return { ok: false, status: error.status || 409, error: result.error, token, expandedContainers, results, pendingContainers: keys.filter((key) => !results.some((result) => result.key === key)) };
             }
         }
         const problems = results.filter((result) => result.problem);

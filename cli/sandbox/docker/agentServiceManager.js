@@ -112,6 +112,8 @@ import {
 } from '../hardwareLimits/delegation.mjs';
 import { captureHardwareContext } from '../hardwareLimits/requestedLimits.mjs';
 import { LIMITS_HASH_LABEL } from '../hardwareLimits/resolve.mjs';
+import { readAppliedObservation } from '../hardwareLimits/runtimeState.mjs';
+import { hasMpsLaunch, readMpsLaunch, verifyMpsLaunch, mpsLaunchArgs } from '../hardwareLimits/mpsLaunch.mjs';
 import { ensureBwrapService } from '../bwrap/bwrapServiceManager.js';
 import { isBwrapProcessRunning, stopBwrapProcess } from '../bwrap/bwrapFleet.js';
 import { ensureSeatbeltService } from '../seatbelt/seatbeltServiceManager.js';
@@ -1367,7 +1369,7 @@ export function runHardwareGuardedLaunch(hardwareLaunch, {
 }
 
 export function verifyReusableHardwareRuntime(runtimeAdmission, {
-    containerName, containerId, runtime, network, record, key, ref, alias = null,
+    containerName, containerId, runtime, network, record, key, ref, alias = null, mpsLaunch,
 }, {
     createGuard = createHardwareLaunchGuard,
     inactivate = inactivateEdgeRoutingGeneration,
@@ -1378,7 +1380,7 @@ export function verifyReusableHardwareRuntime(runtimeAdmission, {
     },
 } = {}) {
     try {
-        createGuard(runtimeAdmission, { key, observationKey: containerName, ref, alias, runtime, query, instanceId: record.instanceId, enableGeneration: record.enableGeneration }).afterLaunch({ containerId, adopted: true });
+        createGuard(runtimeAdmission, { key, observationKey: containerName, ref, alias, runtime, query, instanceId: record.instanceId, enableGeneration: record.enableGeneration, mpsLaunch }).afterLaunch({ containerId, adopted: true });
     } catch (error) {
         // A reused runtime is still an affected runtime. Revoke authorization
         // before removing only its captured immutable identity.
@@ -1501,6 +1503,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const hardwareLaunch = createHardwareLaunchGuard(runtimeAdmission, {
         key: hardwareInstanceKey,
         observationKey: containerName,
+        mpsLaunch: options.mpsLaunch,
         ref: `${repoName}/${agentName}`,
         alias: hardwareAlias || null,
         runtime,
@@ -1619,6 +1622,11 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
 
     if (!image) {
         throw new Error(`[image] ${agentName}: no container image resolved (manifest container unresolved and no catalog image selected).`);
+    }
+
+    if (runtimeAdmission.descriptor.hardwareGpu) {
+        const launch = readMpsLaunch(options.mpsLaunch, hardwareInstanceKey, runtimeAdmission.descriptor.hardwareGpu);
+        image = launch.imageId;
     }
 
     // Get profile mount modes (profile overrides default if provided)
@@ -2081,6 +2089,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     // NODE_PATH is needed because AgentServer.mjs runs from /Agent/server/, not /code/
     // Node.js module resolution walks up from script location, so it won't find /code/node_modules
     args.push('-e', `NODE_PATH=/code/node_modules`);
+    if (runtimeAdmission.descriptor.hardwareGpu) args.push(...mpsLaunchArgs(options.mpsLaunch, hardwareInstanceKey, runtimeAdmission.descriptor.hardwareGpu));
 
     let entrySummary = DEFAULT_AGENT_ENTRY;
     if (!adoptManagedRuntimeOnly) {
@@ -2429,6 +2438,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     // create-attempted receipt. runHardwareGuardedLaunch passes it through the
     // hardware guard before spawnCreate runs the engine create.
     const buildCreateArgs = (plan, launch) => {
+        if (runtimeAdmission.descriptor.hardwareGpu) verifyMpsLaunch(options.mpsLaunch, hardwareInstanceKey, runtimeAdmission.descriptor.hardwareGpu);
         const createArgs = [...args];
         if (plan?.args?.length) createArgs.splice(1, 0, ...plan.args);
         if (launch) {
@@ -3573,6 +3583,11 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         preflightAdmission,
         hardwareInstanceKey,
     } = admitAgentServicePreflight(agentName, manifest, agentPath, options);
+    const mpsRecord = loadAgentsMap()[options.containerName || getAgentContainerName(agentName, preflightRepoName)];
+    const appliedMps = mpsRecord?.containerId ? readAppliedObservation(options.containerName || getAgentContainerName(agentName, preflightRepoName), mpsRecord.containerId) : null;
+    if (!hasMpsLaunch(options.mpsLaunch) && (preflightAdmission.descriptor.hardwareGpu || appliedMps?.mpsGeneration)) {
+        return import('../hardwareLimits/mpsLifecycle.mjs').then(({ ensureMpsAgentService }) => ensureMpsAgentService(agentName, manifest, agentPath, options));
+    }
     const targetedRestart = normalizeTargetedRestart(options.targetedRestart);
     if (!options.networkLifecycleCapability) {
         return withNetworkLifecycleLock(
@@ -4093,7 +4108,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 containerName, containerId: reuseInspection.id, runtime,
                 network: manifestNetwork,
                 record: { ...existingRecord, containerId: reuseInspection.id },
-                key: hardwareInstanceKey, ref: `${repoName}/${agentName}`, alias: aliasOverride || null,
+                key: hardwareInstanceKey, ref: `${repoName}/${agentName}`, alias: aliasOverride || null, mpsLaunch: options.mpsLaunch,
             });
             debugLog(`[ensureAgentService] ${agentName}: returning early (container exists)`);
             if (runtimeNetworkPlan.mode === 'host') {
@@ -4284,6 +4299,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             networkLifecycleCapability: options.networkLifecycleCapability,
             runtimeAdmission: options.runtimeAdmission || serviceAdmission,
             beforeHardwareMutation: options.beforeHardwareMutation,
+            mpsLaunch: options.mpsLaunch,
             preparedRegistryRecord: launchRecord,
             preservePreparedRegistryRecord,
             preparationLease: options.preparationLease,

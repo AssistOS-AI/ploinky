@@ -108,6 +108,7 @@ export function normalizeHardwareContext(raw, { insideBox, runtimeKind }) {
         // Per-agent stored overrides and the visible envelope; consulted for
         // resolution, never part of another agent's fingerprint.
         overrides: value.overrides instanceof Map ? value.overrides : new Map(),
+        gpu: value.gpu || null,
         envelope: value.envelope && typeof value.envelope === 'object' ? value.envelope : null,
     });
 }
@@ -218,6 +219,7 @@ export function evaluateHardwareEligibility(descriptor, context, { helper = fals
             unpreparedDetail: context.unpreparedDetail,
             runtimeObserved: context.runtimeObserved,
             storeState: context.storeState,
+            ...(descriptor?.hardwareGpu ? { gpu: { deviceUuid: context.gpu?.deviceUuid, driverVersion: context.gpu?.driverVersion, wiringFingerprint: context.gpu?.wiringFingerprint, eligible: context.gpu?.eligible } } : {}),
         },
     });
     let refusal = null;

@@ -4,6 +4,7 @@ import { execSync } from 'child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'url';
 import { loadAgents, saveAgents } from './workspace.js';
+import { readAgentRegistrySnapshot } from './agentRegistrySnapshot.js';
 import {
     getAgentContainerName,
     parseManifestPorts,
@@ -771,7 +772,35 @@ export function prepareAgentEnableBatch(requests, {
     };
 }
 
+/** Validate enable arguments on detached desired state before cohort changes.
+ * No prepared generation, workspace structure, or registry write is produced. */
+export function previewAgentEnable(request, {
+    readRegistry = readAgentRegistrySnapshot, readRouting = loadRoutingConfig,
+    resolveInput = resolveAgentEnableInput,
+} = {}) {
+    const registry = readRegistry();
+    const plan = planAgentEnable(request, structuredClone(registry), structuredClone(readRouting()), resolveInput(request));
+    return { plan, predecessor: registry[plan.containerName] || null };
+}
+
+/** Coordinate existing GPU peers before enable captures its additive lease. */
+export async function withMpsEnablePreparation(request, stage, {
+    network = withNetworkLifecycleLock, preview = previewAgentEnable,
+    loadMps = () => import('../sandbox/hardwareLimits/mpsLifecycle.mjs'),
+} = {}) {
+    return network(async (networkLifecycleCapability) => {
+        const { plan, predecessor } = preview(request);
+        const mps = await loadMps();
+        const mpsLaunch = await mps.prepareMpsClientLaunch({ key: plan.containerName, record: predecessor || plan.record }, {
+            desiredRecord: plan.record, networkLifecycleCapability,
+        });
+        return stage({ mps, mpsLaunch, preview: plan }, networkLifecycleCapability);
+    });
+}
+
 export async function enableAgent(agentName, mode, repoNameParam, aliasParam, authModeParam, authOptions = {}) {
+    const request = { agentName, mode, repoNameParam, aliasParam, authModeParam, authOptions };
+    return withMpsEnablePreparation(request, async ({ mps, mpsLaunch }) => {
     let prepared;
     try {
         prepared = prepareAgentEnableBatch([{
@@ -811,7 +840,7 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
     try {
         return await withNetworkLifecycleLock(async (networkLifecycleCapability) => {
             console.log(`Starting agent '${shortAgentName}' from repo '${repoName}'...`);
-            started = ensureAgentService(shortAgentName, manifest, agentPath, {
+            started = await ensureAgentService(shortAgentName, manifest, agentPath, {
                 containerName,
                 alias: alias || undefined,
                 preferredHostPort,
@@ -827,7 +856,9 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
                 preparedHostModeCapability: plan.preparedHostModeCapability,
                 networkLifecycleCapability,
                 runtimeAdmission,
+                ...(mpsLaunch ? { mpsLaunch } : {}),
             });
+            mps.trackMpsRuntimePending(started, { mpsLaunch, key: containerName });
             verifyEnabledAgentStarted(shortAgentName, started?.containerName || containerName, {
                 runtime: started?.runtime || started?.registryRecord?.runtime || 'container',
             });
@@ -855,6 +886,7 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
             }, { hostPort });
             const finalLease = started?.preparationLease
                 || prepared.preparedGeneration?.preparationLease;
+            await mps.verifyMpsRuntimeReady(started);
             withEdgeGenerationApplyLock((applyLockCapability) => {
                 if (finalLease?.mode === 'additive') {
                     commitAdditiveEdgeRoutingGeneration(finalLease, {
@@ -878,6 +910,7 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
                 });
             }, { preparationLease: finalLease });
 
+            await mps.acknowledgeMpsRuntimeReady(started);
             if (started?.durableCandidate) {
                 try { retireRuntimeCandidate(started.durableCandidate); } catch (error) {
                     console.warn(`[enable] ${shortAgentName}: runtime committed; candidate receipt retained: ${error.message}`);
@@ -911,6 +944,7 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
             error,
         );
     }
+    });
 }
 
 function routeKeyForEnabledRecord(record) {

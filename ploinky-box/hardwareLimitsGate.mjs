@@ -326,8 +326,8 @@ export function formatLimitsStatus(status) {
     lines.push(`Nested backend: ${known(box?.nested?.runtime, NOT_OBSERVED)}; manager ${known(box?.nested?.manager, NOT_OBSERVED)}; `
         + `controllers ${box?.nested?.controllers?.length ? box.nested.controllers.join(' ') : `unknown (${NOT_OBSERVED})`}`);
     lines.push(`Internal helpers: ${known(box?.helpers, NOT_OBSERVED)}`);
-    lines.push(`GPU sharing: best-effort, not a security boundary; daemon ${known(box?.mps?.daemon, 'GPU sharing is not available in this release')}`);
-    lines.push(`MPS defaults: ${box?.mps?.defaults || 'none'}`);
+    lines.push(`GPU sharing: best-effort, not a security boundary; daemon ${known(box?.mps?.daemonStatus || box?.mps?.daemon, NOT_OBSERVED)}`);
+    lines.push(`MPS defaults: ${box?.mps?.serverDefault ? `${box.mps.serverDefault.smPercent}% SM; ${box.mps.serverDefault.vramMiB} MiB per CUDA process` : box?.mps?.defaults || `unknown (${NOT_OBSERVED})`}`);
     if (status.storeLock) {
         lines.push(`Store lock: held by ${status.storeLock.malformed ? `an unrecognized owner (${status.storeLock.reason})` : `${status.storeLock.owner.operation} since ${status.storeLock.owner.acquiredAt}`}`);
     }

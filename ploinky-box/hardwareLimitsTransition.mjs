@@ -559,6 +559,16 @@ export async function recoverHardwareDowngrades({ identity, homeDirectory = os.h
             continue;
         }
         try {
+            if (!effects.engineIdentity || journal.identity.engineIdentity !== effects.engineIdentity
+                || !effects.hostKind || journal.identity.hostKind !== effects.hostKind) {
+                persist(ctx, journal, { phase: 'recovery-blocked', lastProblem: {
+                    code: 'ENGINE_IDENTITY_CHANGED',
+                    message: 'the current engine identity or host kind differs from the recorded transition',
+                    action: 'recover',
+                } });
+                throw transitionError('Recovery is blocked: the current engine identity or host kind differs from the recorded transition',
+                    'PLOINKY_BOX_HARDWARE_RECOVERY_BLOCKED');
+            }
             if (journal.commitIntent?.result === 'desired-off') {
                 await rollForward(ctx, journal);
             } else {

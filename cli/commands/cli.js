@@ -529,7 +529,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                                     repo: resolved.repo,
                                 },
                             }, async () => withNetworkLifecycleLock(async (networkLifecycleCapability) => {
-                                const result = ensureAgentService(resolved.shortAgentName, manifest, path.dirname(resolved.manifestPath), {
+                                const result = await ensureAgentService(resolved.shortAgentName, manifest, path.dirname(resolved.manifestPath), {
                                     containerName,
                                     alias: registryRecord?.record?.alias,
                                     profileName: profileResolution.resolvedProfileName,
@@ -581,7 +581,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                             },
                         }, async () => withNetworkLifecycleLock(async (networkLifecycleCapability) => {
                             const agentPath = path.dirname(resolved.manifestPath);
-                            const restartResult = ensureAgentService(resolved.shortAgentName, manifest, agentPath, {
+                            const restartResult = await ensureAgentService(resolved.shortAgentName, manifest, agentPath, {
                                 containerName,
                                 alias: registryRecord?.record?.alias,
                                 forceRecreate: true,

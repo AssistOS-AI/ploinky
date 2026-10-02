@@ -617,3 +617,65 @@ vectorCases('private-paths', [
         assert.equal(isManagedManifestVolumeSource('data/models', { workspaceRoot: workspace }), true);
     }],
 ]);
+
+for (const kind of ['entries', 'bytes']) {
+    test(`store refuses ${kind} overflow before committing the policy or token`, (t) => {
+        const context = initialized(t);
+        const refs = new Set(Array.from({ length: 257 }, (_, i) => kind === 'entries'
+            ? `demo/a${i}` : `${'r'.repeat(128)}/${'a'.repeat(124)}${String(i).padStart(3, '0')}`));
+        let token = context.token;
+        let refused = false;
+        for (const ref of refs) {
+            const before = fs.readFileSync(context.paths.policyPath);
+            try {
+                token = set(context, token, { cpus: 1 }, ref, { installedRefs: refs }).token;
+            } catch (error) {
+                assert.equal(error.code, 'invalid_limits');
+                assert.notEqual(error.committed, true);
+                assert.deepEqual(fs.readFileSync(context.paths.policyPath), before);
+                const snapshot = readStoreSnapshot(context);
+                assert.equal(snapshot.status, 'valid');
+                assert.deepEqual(snapshot.token, token);
+                assert.equal(kind === 'entries' ? snapshot.agents.size === 256 : snapshot.agents.size < 256, true);
+                refused = true;
+                break;
+            }
+        }
+        assert.equal(refused, true);
+    });
+}
+
+test('large clear-all uses a bounded validated audit summary and recovers its outbox', (t) => {
+    const context = initialized(t);
+    const refs = new Set(Array.from({ length: 128 }, (_, i) => `demo/${'a'.repeat(85)}${i}`));
+    let token = context.token;
+    for (const ref of refs) token = set(context, token, { cpus: 1 }, ref, { installedRefs: refs }).token;
+    assert.throws(() => clearAllLimits({ ...context, faults: { afterRename() { throw new Error('interrupted'); } } }), /interrupted/);
+    const pending = readStoreSnapshot(context);
+    assert.equal(pending.status, 'valid');
+    assert.equal(pending.agents.size, 0);
+    assert.deepEqual(Object.keys(pending.document.auditOutbox.before).sort(), ['count', 'sha256']);
+    assert.equal(pending.document.auditOutbox.before.count, 128);
+    assert.match(pending.document.auditOutbox.before.sha256, /^[a-f0-9]{64}$/);
+    const broken = structuredClone(pending.document);
+    broken.auditOutbox.before.count = 257;
+    assert.throws(() => validateStoreDocument(broken), /summary is invalid/);
+    assert.equal(clearAllLimits(context).committed, true);
+    const events = auditEvents(context.paths).filter((event) => event.action === 'clear-all');
+    assert.equal(events.length, 2);
+    assert.equal(events[0].before.count, 128);
+    assert.equal(readStoreSnapshot(context).agents.size, 0);
+});
+
+test('bounded legacy clear-all audit outboxes remain recoverable', (t) => {
+    const context = initialized(t);
+    const result = set(context, context.token);
+    assert.throws(() => clearAllLimits({ ...context, faults: { afterRename() { throw new Error('interrupted'); } } }), /interrupted/);
+    const document = readStoreSnapshot(context).document;
+    document.auditOutbox.before = { 'demo/agent': { cpus: 2 } };
+    fs.writeFileSync(context.paths.policyPath, `${JSON.stringify(document, null, 2)}\n`);
+    assert.equal(readStoreSnapshot(context).status, 'valid');
+    const cleared = clearAllLimits(context);
+    assert.equal(cleared.token.revision, result.token.revision + 2);
+    assert.equal(auditEvents(context.paths).filter((event) => event.action === 'clear-all').length, 2);
+});

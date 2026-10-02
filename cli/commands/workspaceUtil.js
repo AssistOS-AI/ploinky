@@ -112,6 +112,8 @@ import {
   hardwareRefusalOf,
 } from '../sandbox/runtimeCapabilities.js';
 import { LIMITS_HASH_LABEL } from '../sandbox/hardwareLimits/resolve.mjs';
+import { prepareMpsGraph } from '../sandbox/hardwareLimits/mpsGraph.mjs';
+import { acknowledgeMpsRuntimeReady, finalizeMpsGraph, verifyMpsRuntimeReady } from '../sandbox/hardwareLimits/mpsLifecycle.mjs';
 import {
   blockingEdgesFromGraph,
   classifyAvailability,
@@ -2218,6 +2220,7 @@ async function activatePreparedRuntimeAfterReadiness({
     }
   };
   try {
+    if (result.mpsReadiness) await verifyMpsRuntimeReady(result);
     if (result.preparationLease.mode === 'additive') {
       await withApplyLock((applyLockCapability) => {
         const agents = loadAgents();
@@ -2255,6 +2258,7 @@ async function activatePreparedRuntimeAfterReadiness({
         }
       }
       retirePublishedCandidate();
+      if (result.mpsReadiness) await acknowledgeMpsRuntimeReady(result);
       return true;
     }
     await mergeRouting((cfg) => {
@@ -2279,6 +2283,7 @@ async function activatePreparedRuntimeAfterReadiness({
       preparationLease: result.preparationLease,
     });
     retirePublishedCandidate();
+    if (result.mpsReadiness) await acknowledgeMpsRuntimeReady(result);
     return true;
   } catch (error) {
     cleanupFailure(
@@ -2473,6 +2478,7 @@ async function startWorkspace(staticAgentArg, portArg, {
   const workspaceStartLock = await acquireWorkspaceMutationLease({ operation: 'workspace-start' });
   let workspacePreparationLease = null;
   const workspaceRuntimeCandidates = [];
+  const workspaceMpsRuntimes = [];
   try {
   return await withNetworkLifecycleLock(async (networkLifecycleCapability) => {
   try {
@@ -2634,10 +2640,23 @@ async function startWorkspace(staticAgentArg, portArg, {
 
     const waitClassification = classifyDependencyGraphWaitMode(dependencyGraph);
     const extraRuntimeNodes = lockedStart.additionalNodes;
+    const mpsGraphNodes = () => [...dependencyGraph.nodes.values(), ...extraRuntimeNodes].map((node) => {
+      return { key: graphNodeRegistryKey(node, reg, dockerSvc.getAgentContainerName), node };
+    });
+    const prepareGraphMps = async () => {
+      const prepared = await prepareMpsGraph({ nodes: mpsGraphNodes(), networkLifecycleCapability });
+      for (const refusal of prepared.refusals || []) graphAvailability.recordLaunchRefusal(refusal);
+      for (const entry of graphAvailability.unavailableEntries()) unavailableNodeIds.add(entry.nodeId);
+      return prepared;
+    };
+    let mpsGraphPreparation = await prepareGraphMps();
+    const mpsReplacementReason = (plan, options) => mpsGraphPreparation.replacedKeys.has(plan.existing.key)
+      ? 'mpsCohortTransition' : graphNodeRuntimeReplacementReason(plan, options);
     let preparedGraph = ensureGraphNodesEnabled(dependencyGraph, reg, {
       deferredNodeIds: waitClassification.noWait,
       additionalNodes: extraRuntimeNodes,
       unavailableNodeIds,
+      runtimeReplacementReason: mpsReplacementReason,
     });
     workspacePreparationLease = preparedGraph?.preparedGeneration?.preparationLease || null;
     if (preparedGraph?.preparedGeneration?.selector?.state !== 'inactive') {
@@ -2705,6 +2724,7 @@ async function startWorkspace(staticAgentArg, portArg, {
     // re-preparation; otherwise they would be mistaken for missing a second
     // time instead of retaining their already-fresh, never-launched tuple.
     reg = deduplicateAgentRegistry(workspaceSvc.loadAgents(), getAgentContainerName);
+    mpsGraphPreparation = await prepareGraphMps();
     const postProviderPreparation = reprepareGraphAfterStartupProviders(
       dependencyGraph,
       reg,
@@ -2713,6 +2733,7 @@ async function startWorkspace(staticAgentArg, portArg, {
         deferredNodeIds: waitClassification.noWait,
         additionalNodes: extraRuntimeNodes,
         graphEnableOptions: { unavailableNodeIds },
+        runtimeReplacementReason: mpsReplacementReason,
       },
     );
     preparedGraph = postProviderPreparation.preparedGraph;
@@ -2817,7 +2838,7 @@ async function startWorkspace(staticAgentArg, portArg, {
                 containerName: name,
               })
             : undefined;
-          const runtimeResult = ensureAgentService(shortAgentName, manifest, agentPath, {
+          const runtimeResult = await ensureAgentService(shortAgentName, manifest, agentPath, {
             containerName: name,
             hardwareInstanceKey: name,
             alias: rec.alias,
@@ -2831,6 +2852,7 @@ async function startWorkspace(staticAgentArg, portArg, {
             preparedHostModeCapability,
             networkLifecycleCapability,
           });
+          workspaceMpsRuntimes.push(runtimeResult);
           if (runtimeResult?.requiresEdgeActivation === true
               && runtimeResult?.preparationLease
               && runtimeResult?.containerId) {
@@ -2973,6 +2995,12 @@ async function startWorkspace(staticAgentArg, portArg, {
     });
     readyAgentKeys.push(...additional.readyAgentKeys);
 
+    for (const runtimeResult of workspaceMpsRuntimes) {
+      if (readyAgentKeys.includes(runtimeResult?.containerName)) await verifyMpsRuntimeReady(runtimeResult);
+    }
+
+    if (mpsGraphPreparation.graphPreparationId) await finalizeMpsGraph({ networkLifecycleCapability });
+
     // Runtime-only registry metadata may change while the lifecycle binding
     // remains exact. Persist it once, after all capability-sensitive launches
     // have completed, so one wave cannot invalidate the selector-bound host
@@ -2985,6 +3013,10 @@ async function startWorkspace(staticAgentArg, portArg, {
       preparationLease: workspacePreparationLease,
     });
     workspacePreparationLease = null;
+    for (const runtimeResult of workspaceMpsRuntimes) {
+      if (readyAgentKeys.includes(runtimeResult?.containerName)) await acknowledgeMpsRuntimeReady(runtimeResult);
+    }
+    workspaceMpsRuntimes.length = 0;
     for (const candidate of workspaceRuntimeCandidates) {
       if (!candidate.durableCandidate) continue;
       try { retireRuntimeCandidate(candidate.durableCandidate); } catch (error) {
@@ -3337,7 +3369,7 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
       }
       let result = null;
       try {
-        result = ensureAgentService(shortAgentName, manifest, agentDir, {
+        result = await ensureAgentService(shortAgentName, manifest, agentDir, {
           containerName: registryRecord?.containerName,
           alias: registryRecord?.record?.alias,
           routerEndpoint,
@@ -3502,7 +3534,7 @@ async function runShell(agentName) {
   const { containerInfo, containerName } = await withNetworkLifecycleLock(async (networkLifecycleCapability) => {
     let result = null;
     try {
-      result = ensureAgentService(shortAgentName, manifest, agentDir, {
+      result = await ensureAgentService(shortAgentName, manifest, agentDir, {
         containerName: registeredContainerName,
         alias: registryRecord?.record?.alias,
         routerEndpoint,

@@ -136,3 +136,28 @@ compatibility is implemented in that source's `utils/uuid.mjs` and used by
 `webSkel.js`; ESM and UMD outputs are regenerated with WebSkel's existing locked
 Vite build. Refresh the generated files together after its source/build tests.
 This adds no Ploinky runtime dependency or build-tool installation.
+
+## Optional NVIDIA MPS support
+
+GPU shares reuse the operator-installed NVIDIA driver tools
+`nvidia-cuda-mps-control` and `nvidia-cuda-mps-server`, bound read-only from the
+host into `/usr/local/nvidia/bin`. No npm packages or downloaded driver code are
+added. The exact installed driver version and both tool fingerprints are
+recorded and revalidated; the tool pair must match the host driver. Missing or
+changed tools refuse sharing while ordinary GPU access remains available.
+
+These tools are NVIDIA proprietary driver components. No copies or license
+files are redistributed in this repository. License terms and supported
+versions must be checked against the operator's installed driver distribution;
+a universal tool version or license grant is not asserted here. Source and
+updates are provided by NVIDIA at <https://developer.nvidia.com/deploy/mps>.
+Install or update through the host's existing NVIDIA driver installation, then
+restart the Box to rebuild its fingerprints and read-only binds. A Node.js
+implementation cannot replace the driver daemon or CUDA control protocol.
+Remove the optional dependency by clearing GPU shares; CPU/RAM limits do not
+require MPS. Ploinky performs no package installation.
+
+The optional live GPU probe uses the existing Python 3 standard library ctypes
+to call the installed CUDA driver API. It needs no Python packages and is not a
+runtime dependency. Its driver observations require an authorized isolated GPU
+fixture. Python is PSF-licensed and operator-provided; no interpreter is bundled.

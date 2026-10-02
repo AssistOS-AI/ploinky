@@ -513,7 +513,7 @@ test('blocking none-mode launches pass explicit null without forwarding a raw ro
     }), null);
 
     const source = startWorkspace.toString();
-    const launchStart = source.indexOf('const runtimeResult = ensureAgentService');
+    const launchStart = source.indexOf('const runtimeResult = await ensureAgentService');
     const launchEnd = source.indexOf('const executionMode = resolveAgentExecutionMode', launchStart);
     assert.ok(launchStart >= 0 && launchEnd > launchStart, 'blocking service launch must remain discoverable');
     const launch = source.slice(launchStart, launchEnd);

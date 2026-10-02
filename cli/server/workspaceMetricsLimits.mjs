@@ -30,11 +30,12 @@ export function projectAppliedLimits(inspected, verified = null, identity = null
     const bytes = valid ? verified.memoryBytes ?? null : null;
     const sm = /^\d{1,3}$/.test(env.CUDA_MPS_ACTIVE_THREAD_PERCENTAGE || '') ? Number(env.CUDA_MPS_ACTIVE_THREAD_PERCENTAGE) : null;
     const vram = /^0=(\d+)M$/.exec(env.CUDA_MPS_PINNED_DEVICE_MEM_LIMIT || '');
-    const gpuValid = sm >= 1 && sm <= 100 && vram && Number.isSafeInteger(Number(vram[1]) * 1024 ** 2);
+    const generation = labels['ploinky.mpsgeneration'];
+    const gpuValid = valid && typeof generation === 'string' && generation.length > 0 && verified.mpsGeneration === generation && sm >= 1 && sm <= 100 && vram && Number.isSafeInteger(Number(vram[1]) * 1024 ** 2);
     return {
         cpu: { cores, assurance: cores !== null ? 'kernel' : 'none' },
         memory: { bytes, assurance: bytes !== null ? 'kernel' : 'none' },
-        gpu: { smPercent: gpuValid ? sm : null, vramBytes: gpuValid ? Number(vram[1]) * 1024 ** 2 : null, assurance: gpuValid ? 'best-effort' : 'none' },
+        gpu: { mpsGeneration: gpuValid ? generation : null, smPercent: gpuValid ? sm : null, vramBytes: gpuValid ? Number(vram[1]) * 1024 ** 2 : null, assurance: gpuValid ? 'best-effort' : 'none' },
     };
 }
 

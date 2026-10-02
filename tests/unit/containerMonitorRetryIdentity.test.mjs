@@ -846,7 +846,7 @@ test('the recursive service launch failure carries the actual staged authority a
     const run = new Function(
         'runtimeIdentity', 'containerName', 'inspectedContainerId', 'existingRecord',
         'manifestNetwork', 'runtime', 'ensureAgentService', 'agentName', 'manifest',
-        'agentPath', 'options', 'attachRestartCandidate',
+        'agentPath', 'options', 'attachRestartCandidate', 'hardwareInstanceKey',
         source.slice(branchStart, branchEnd),
     );
     const original = {
@@ -867,7 +867,7 @@ test('the recursive service launch failure carries the actual staged authority a
     failure.ploinkyRestartCandidate = { cleanupReceipt, exactCleanupPerformed: true };
     assert.throws(() => run(
         identity, 'predecessor', original.containerId, original, { mode: 'default' }, 'podman',
-        () => { throw failure; }, 'sample', {}, '/fixture/sample', {}, attach,
+        () => { throw failure; }, 'sample', {}, '/fixture/sample', {}, attach, 'predecessor',
     ), error => {
         assert.equal(error, failure);
         const candidate = error.ploinkyRestartCandidate;

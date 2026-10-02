@@ -4,8 +4,8 @@ import { AppliedLimitsCache, parseMemoryUsage, projectAppliedLimits, limitsUsage
 
 const id = 'a'.repeat(64);
 const hash = 'b'.repeat(64);
-const inspected = { Id: id, Config: { Labels: { 'ploinky.limitshash': hash }, Env: ['SECRET=never-cache', 'CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=25', 'CUDA_MPS_PINNED_DEVICE_MEM_LIMIT=0=3072M', 'CUDA_MPS_PIPE_DIRECTORY=/run/ploinky-mps-pipe'] } };
-const proof = { containerId: id, limitsHash: hash, instanceId: 'one', enableGeneration: 'gen1', cpus: 0.25, memoryBytes: 64 * 1024 ** 2 };
+const inspected = { Id: id, Config: { Labels: { 'ploinky.limitshash': hash, 'ploinky.mpsgeneration': 'daemon:config' }, Env: ['SECRET=never-cache', 'CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=25', 'CUDA_MPS_PINNED_DEVICE_MEM_LIMIT=0=3072M', 'CUDA_MPS_PIPE_DIRECTORY=/run/ploinky-mps-pipe'] } };
+const proof = { containerId: id, limitsHash: hash, mpsGeneration: 'daemon:config', instanceId: 'one', enableGeneration: 'gen1', cpus: 0.25, memoryBytes: 64 * 1024 ** 2 };
 
 test('M.memory-both-halves', () => {
     assert.deepEqual(parseMemoryUsage('12.5MiB / 64MiB'), { memoryBytes: 13107200, memoryLimitBytes: 67108864 });

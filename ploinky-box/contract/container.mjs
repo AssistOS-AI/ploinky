@@ -25,6 +25,7 @@ import {
     routerBindingPublicAuthority,
 } from '../routerBinding.mjs';
 import { observeContainerGpuWiring } from '../gpuGrant.mjs';
+import { revalidateMpsTools } from '../lib/mpsTools.mjs';
 import { observeContainerHardwareWiring } from '../hardwareLimitsGate.mjs';
 import { nestedPodmanSeccompProfileContract } from '../seccomp.mjs';
 import {
@@ -329,6 +330,7 @@ export function validateContainerConfiguration(containerHandle, {
     const gpuWiring = gpu === undefined
         ? observeContainerGpuWiring(containerHandle, { identity })
         : gpu;
+    if (gpuWiring?.mps) revalidateMpsTools(gpuWiring.mps);
     const hardwareWiring = hardware === undefined
         ? observeContainerHardwareWiring(containerHandle, { identity })
         : hardware;

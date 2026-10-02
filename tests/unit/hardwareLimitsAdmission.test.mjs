@@ -202,7 +202,7 @@ test('A.stored-gpu-refused', (t) => {
             ...box, agentId: 'demo/worker', instanceKey: 'ploinky_demo_worker_ws', runtime: 'podman', hardwareContext: storedContext(entry),
         }));
         assert.equal(outcome.reasonCode, 'gpu_sharing_unavailable');
-        assert.match(outcome.reason, /^GPU sharing is not available in this release, so the stored GPU share cannot be enforced\.$/);
+        assert.match(outcome.reason, /^This agent has no active, qualified Box GPU grant\.$/);
         assert.match(outcome.fix, /ploinky limits clear --agent demo\/worker on the host/);
         // Every stored field is listed with its stored value (K8).
         assert.deepEqual(outcome.requested.map((requested) => [requested.field, requested.source]),

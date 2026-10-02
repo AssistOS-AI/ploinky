@@ -11,6 +11,7 @@ import { BOX_HARDWARE_MARKER_PATH, BOX_HARDWARE_STORE_PATH } from '../../../ploi
 import { readBoxHardwareMarker } from '../../../ploinky-box/lib/hardwareLimitsMarker.mjs';
 import { readDelegationState } from './delegation.mjs';
 import { readEnvelope } from './resolve.mjs';
+import { readMpsStatus } from './mpsStatus.mjs';
 import { hardwareStorePaths, readStoreSnapshot } from './store.mjs';
 
 const BACKEND_CACHE_MS = 60_000;
@@ -100,6 +101,7 @@ export function readBoxHardwareContext({
         storeDetail: snapshot.status === 'valid' ? '' : String(snapshot.diagnostic || ''),
         storeToken: snapshot.token || null,
         overrides: snapshot.agents,
+        ...([...snapshot.agents?.values() || []].some((entry) => entry.gpu) ? { gpu: readMpsStatus({ workspaceRoot: identity.workspaceRoot }) } : {}),
         envelope: envelope.unreadable ? null : envelope,
         envelopeProblem: envelope.unreadable ? envelope.reason : null,
     };

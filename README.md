@@ -747,6 +747,39 @@ CPU/RAM maxima are not reservations: host or ancestor memory pressure can still
 kill a process below its own cap. Dependency installation, diagnose and
 image-verification work is maintenance outside agent budgets.
 
+### GPU share limits
+
+GPU shares use NVIDIA MPS and are best-effort, not a security boundary.
+Share clients use the same Box user as the MPS daemon. They can issue control commands, widen settings, stop the daemon and alter its writable pipe-directory entries.
+A process that drops the MPS environment can use the GPU outside MPS in DEFAULT compute mode.
+The MPS device-memory limit applies to each CUDA process, not to the sum of every process in an agent.
+A RAM cgroup limit does not cap dedicated GPU memory.
+Only the host operator may choose EXCLUSIVE_PROCESS. It affects other CUDA users and workspaces. Ploinky never changes compute mode.
+
+The operator command is `sudo nvidia-smi -i 0 -c EXCLUSIVE_PROCESS`; undo it
+with `sudo nvidia-smi -i 0 -c DEFAULT`. These commands affect the whole selected
+GPU. They are manual choices and are never run by Ploinky's tests.
+
+Sharing requires GPU index 0 with a known dedicated memory model, a current GPU
+grant for the exact agent, and both matching host driver MPS tools. Unified
+GPUs, including GB10, and unknown memory models refuse a configured share.
+SM and VRAM percentages are integers from 1 to 100. VRAM resolves against
+dedicated device memory, rounded down to MiB, with a 512 MiB minimum.
+
+Prepare the selected image through normal agent startup before saving a GPU
+share. Save inspects the canonical image and registered alias profiles without
+pulling images or starting MPS. Images require an explicit nonroot numeric
+UID:GID and managed default or bridge networking. Changing the process UID
+later may make its MPS connection fail.
+
+The administrator endpoint reports observed daemon status, verified defaults,
+and the applied MPS generation. A lost daemon makes its clients pending even
+when their policy hash is unchanged. Metrics label GPU values best-effort only
+when the exact container's applied observation matches its generation label.
+A default change can expand Apply to the old share-client cohort. Live GPU
+behavior and the selected driver's control-reply format require separate
+hardware qualification; offline checks do not establish those properties.
+
 ## GPU access for agents
 
 Inside a Box, runtime admission rejects devices, CDI, `--gpus`, host IPC, and

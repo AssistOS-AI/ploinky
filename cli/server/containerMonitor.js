@@ -1,4 +1,6 @@
 import fs from 'fs';
+import { readMpsStatus } from '../sandbox/hardwareLimits/mpsStatus.mjs';
+import { readAppliedObservation } from '../sandbox/hardwareLimits/runtimeState.mjs';
 import { resolveAgentRepositoryPath } from '../utils/agentRepositorySource.mjs';
 import crypto from 'node:crypto';
 import path from 'path';
@@ -231,6 +233,7 @@ function recordTerminalFailure(monitor, info, error, restartInputDigest) {
         repoName: info.repoName,
         agentName: info.agentName,
         restartInputDigest,
+        mpsFingerprint: info.mpsFingerprint || null,
         blockerFingerprint,
         code,
         classification: classifyTerminalFailure(error) || 'policy',
@@ -298,6 +301,8 @@ function createContainerTarget(info, monitor) {
         probeConcurrencyDeferred: false,
         attemptEpoch: 0,
         restartInputDigest: info.restartInputDigest,
+        mpsFingerprint: info.mpsFingerprint || null,
+        mpsPending: info.mpsPending === true,
         runtimeAdmission: info.runtimeAdmission,
         restartSnapshot: info.restartSnapshot,
         terminalState: null,
@@ -351,6 +356,8 @@ function resolveWatchdogRestartInput(record, info, monitor) {
         alias: info.alias || '',
         ...(monitor.hardwareContext !== undefined ? { hardwareContext: monitor.hardwareContext } : {}),
         ...(monitor.boxMarkerOptions !== undefined ? { boxMarkerOptions: monitor.boxMarkerOptions } : {}),
+        ...(monitor.gpuGrantOptions !== undefined ? { gpuGrantOptions: monitor.gpuGrantOptions } : {}),
+        ...(monitor.workspaceRoot !== undefined ? { workspaceRoot: monitor.workspaceRoot } : {}),
     });
     const stat = fs.statSync(info.manifestPath, { bigint: true });
     const restartInputDigest = digestValue({
@@ -768,6 +775,23 @@ export function syncManagedContainers(monitor) {
     )));
     pruneTerminalLedger(monitorRef, presentRegistryNames);
 
+    let mpsStatus;
+    const observeMpsTarget = (containerName, record, descriptor) => {
+        let applied = null;
+        try { applied = (monitorRef.readAppliedObservation || readAppliedObservation)(containerName, record.containerId); } catch (_) {}
+        const exact = applied && applied.containerId === record.containerId && applied.instanceId === record.instanceId && applied.enableGeneration === record.enableGeneration;
+        const desiredShare = Boolean(descriptor?.hardwareGpu);
+        if (!desiredShare && !(exact && applied.mpsGeneration)) return { mpsFingerprint: null, mpsPending: false };
+        if (mpsStatus === undefined) {
+            try { mpsStatus = (monitorRef.readMpsStatus || readMpsStatus)() || {}; } catch (_) { mpsStatus = { daemonStatus: 'unknown', mpsGeneration: null }; }
+        }
+        const generation = typeof mpsStatus?.mpsGeneration === 'string' ? mpsStatus.mpsGeneration.slice(0, 257) : null;
+        const daemonStatus = String(mpsStatus?.daemonStatus || 'unknown').slice(0, 32);
+        return {
+            mpsFingerprint: digestValue({ generation, daemonStatus }),
+            mpsPending: !desiredShare || !exact || !applied.mpsGeneration || daemonStatus !== 'ready' || applied.mpsGeneration !== generation,
+        };
+    };
     const desired = new Map();
     const readRouting = monitorRef.readRoutingConfig || readRoutingConfig;
     const routing = readRouting();
@@ -836,9 +860,10 @@ export function syncManagedContainers(monitor) {
                     repoName,
                     instanceId: String(record.instanceId || '').trim() || null,
                     enableGeneration: String(record.enableGeneration || '').trim() || null,
+                    ...observeMpsTarget(containerName, record, { hardwareGpu: findHardwareOutcome(error)?.requested?.some((entry) => entry.field === 'gpu') === true }),
                 };
                 const existing = monitorRef.terminalLedger?.get(containerName);
-                if (existing?.restartInputDigest !== fallbackDigest) {
+                if (existing?.restartInputDigest !== fallbackDigest || (existing?.mpsFingerprint || null) !== info.mpsFingerprint) {
                     recordTerminalFailure(monitorRef, info, error, fallbackDigest);
                 }
                 const target = monitorRef.targets.get(containerName);
@@ -878,10 +903,11 @@ export function syncManagedContainers(monitor) {
             restartInputDigest: restartInput.restartInputDigest,
             runtimeAdmission: restartInput.runtimeAdmission,
             restartSnapshot: restartInput.restartSnapshot,
+            ...observeMpsTarget(containerName, record, restartInput.runtimeAdmission.descriptor),
         };
         monitorRef.terminalLedger ||= loadTerminalLedger(monitorRef);
         const terminal = monitorRef.terminalLedger.get(containerName);
-        if (terminal?.restartInputDigest === restartInput.restartInputDigest) {
+        if (terminal?.restartInputDigest === restartInput.restartInputDigest && (terminal?.mpsFingerprint || null) === info.mpsFingerprint) {
             continue;
         }
         if (terminal) {
@@ -912,7 +938,7 @@ export function syncManagedContainers(monitor) {
             // rejects it before publication; the next tick adopts state only
             // after that attempt has finished or failed stale.
             if (target.isRestarting) continue;
-            if (target.restartInputDigest !== restartInput.restartInputDigest) {
+            if (target.restartInputDigest !== restartInput.restartInputDigest || (target.mpsFingerprint || null) !== info.mpsFingerprint) {
                 target.attemptEpoch += 1;
                 if (target.pendingRestartTimer) clearTimeout(target.pendingRestartTimer);
                 target.pendingRestartTimer = null;
@@ -933,6 +959,8 @@ export function syncManagedContainers(monitor) {
             target.restartInputDigest = restartInput.restartInputDigest;
             target.runtimeAdmission = restartInput.runtimeAdmission;
             target.restartSnapshot = restartInput.restartSnapshot;
+            target.mpsFingerprint = info.mpsFingerprint;
+            target.mpsPending = info.mpsPending;
         }
     }
 
@@ -1793,7 +1821,7 @@ export async function performContainerRestart(monitor, target, reason, attempt =
             profileName: profileResolution.resolvedProfileName,
             profileResolution,
             routerEndpoint,
-            forceRecreate: reason === 'semantic_probe_failed',
+            forceRecreate: reason === 'semantic_probe_failed' || reason === 'mps_generation_changed',
             preserveActiveAuthorization,
             networkLifecycleCapability,
             runtimeAdmission: target.runtimeAdmission,
@@ -2193,6 +2221,11 @@ export function monitorTick(monitor) {
                 stopProbeWorker(target);
                 continue;
             }
+            if (target.mpsPending) {
+                stopProbeWorker(target);
+                scheduleContainerRestart(monitor, target, 'mps_generation_changed');
+                continue;
+            }
             const continuousProbeIntervalMs = positiveInteger(
                 monitor?.config?.CONTINUOUS_PROBE_INTERVAL_MS
                     ?? process.env.PLOINKY_CONTAINER_MONITOR_CONTINUOUS_PROBE_INTERVAL_MS,
@@ -2217,16 +2250,18 @@ export function monitorTick(monitor) {
         }
 
         stopProbeWorker(target);
-        scheduleContainerRestart(monitor, target, 'not_running');
+        scheduleContainerRestart(monitor, target, target.mpsPending ? 'mps_generation_changed' : 'not_running');
     }
 }
 
-export function createContainerMonitor({ config, log, isShuttingDown, terminalLedgerFile: ledgerFile } = {}) {
+export function createContainerMonitor({ config, log, isShuttingDown, terminalLedgerFile: ledgerFile, readMpsStatus: observeMps, readAppliedObservation: observeApplied } = {}) {
     const monitor = {
         config: config || {},
         log,
         isShuttingDown: typeof isShuttingDown === 'function' ? isShuttingDown : () => false,
         targets: new Map(),
+        ...(observeMps ? { readMpsStatus: observeMps } : {}),
+        ...(observeApplied ? { readAppliedObservation: observeApplied } : {}),
         timer: null,
         runtimeSnapshotFailures: 0,
         runtimeSnapshotRetryNotBefore: 0,

@@ -37,6 +37,8 @@ import {
 import { verifyLaunchedHardwareLimits } from './hardwareLimits/delegation.mjs';
 import { engineCommandArgs } from './hardwareLimits/runtimeCommand.mjs';
 import { writeAppliedObservation } from './hardwareLimits/runtimeState.mjs';
+import { verifyMpsLaunch } from './hardwareLimits/mpsLaunch.mjs';
+import { verifyMpsRuntimeObservation } from './hardwareLimits/mpsRuntimeObservation.mjs';
 
 export const RUNTIME_CAPABILITY_POLICY_VERSION = 'ploinky-runtime-capabilities-v1';
 const ADMITTED_DESCRIPTORS = new WeakSet();
@@ -676,13 +678,15 @@ export function admitManifestRuntimeCapabilities(manifest, {
     // their declared values.
     let effectiveOverride = overridePolicy;
     let overrideProblem = null;
+    let hardwareGpu = null;
     const storedOverride = effectiveOverride === null && !helper && hardwareFacts.gate === 'on'
         ? hardwareFacts.overrides.get(String(agentId || '')) || null
         : null;
     if (storedOverride) {
-        const resolved = resolveStoredOverride(storedOverride, hardwareFacts.envelope, { ref: String(agentId || 'REPO/AGENT') });
+        const resolved = resolveStoredOverride(storedOverride, hardwareFacts.envelope, { ref: String(agentId || 'REPO/AGENT'), gpu: hardwareFacts.gpu });
+        hardwareGpu = resolved.gpu || null;
         if (resolved.problem) overrideProblem = resolved.problem;
-        else effectiveOverride = resolved.policy;
+        else effectiveOverride = hardwareGpu ? { ...(resolved.policy || {}), devices: [{ type: 'cdi', value: BOX_GPU_CDI_DEVICE }] } : resolved.policy;
     }
     let descriptor = resolveEffectiveRuntimeCapabilities(exactManifest, {
         agentId,
@@ -702,6 +706,7 @@ export function admitManifestRuntimeCapabilities(manifest, {
             gpuGrantOptions,
         }),
     });
+    if (hardwareGpu) descriptor = deepFreeze({ ...descriptor, hardwareGpu, hardwareRequest: [...(descriptor.hardwareRequest || []), { field: 'gpu', value: `${hardwareGpu.smPercent}/${hardwareGpu.vramPercent} percent`, source: 'settings' }] });
     // Every non-hardware capability error stays strict in both modes.
     assertRuntimeCapabilitiesAllowed(descriptor, {
         runtimeKind,
@@ -765,7 +770,7 @@ function hardwarePlacementFor(descriptor, context, runtimeKind) {
         enginePrefix: ['--cgroup-manager=cgroupfs'],
         hardSwap: true,
         expected: resolved,
-        limitsHash: limitsHash({ resolved, placement: AGENT_PLACEMENT, hardSwap: true }),
+        limitsHash: limitsHash({ resolved, placement: AGENT_PLACEMENT, hardSwap: true, gpu: descriptor.hardwareGpu || null }),
     };
 }
 
@@ -815,6 +820,8 @@ export function createHardwareLaunchGuard(runtimeAdmission, {
     enableGeneration,
     recordApplied = writeAppliedObservation,
     observationKey = key,
+    mpsLaunch,
+    mpsVerification,
 } = {}) {
     const descriptor = runtimeAdmission.descriptor;
     const recheck = () => assertHardwareAdmissionCurrent(runtimeAdmission, { hardwareContext });
@@ -855,6 +862,8 @@ export function createHardwareLaunchGuard(runtimeAdmission, {
                 });
             }
             recheck();
+            const mps = descriptor.hardwareGpu ? verifyMpsLaunch(mpsLaunch, key, descriptor.hardwareGpu, mpsVerification) : null;
+            if (mps) verifyMpsRuntimeObservation({ containerId, imageId: mps.imageId, share: descriptor.hardwareGpu, state: mps.state, runtime, ...(query ? { query } : {}) });
             if (readback && instanceId && enableGeneration) {
                 const cpu = String(readback.observed['cpu.max'] || '').split(/\s+/);
                 recordApplied({
@@ -863,6 +872,7 @@ export function createHardwareLaunchGuard(runtimeAdmission, {
                     cpus: cpu.length === 2 && cpu[0] !== 'max' ? Number(cpu[0]) / Number(cpu[1]) : null,
                     memoryBytes: readback.observed['memory.max'] && readback.observed['memory.max'] !== 'max' ? Number(readback.observed['memory.max']) : null,
                     cgroupNamespace: readback.cgroupNamespace, leaf: readback.leaf,
+                    ...(mps ? { gpuShare: descriptor.hardwareGpu, mpsGeneration: `${mps.state.daemonGeneration}:${mps.state.configurationGeneration}` } : {}),
                 });
             }
         },
@@ -963,7 +973,7 @@ export function assertHardwareAdmissionCurrent(admission, { hardwareContext } = 
         // Recompute the admission's override problem from the same inputs so a
         // refused over-envelope entry stays current while nothing changed.
         const overrideProblem = freshOverride
-            ? resolveStoredOverride(freshOverride, freshContext.envelope, { ref: String(admission.descriptor.agentId || 'REPO/AGENT') }).problem
+            ? resolveStoredOverride(freshOverride, freshContext.envelope, { ref: String(admission.descriptor.agentId || 'REPO/AGENT'), gpu: freshContext.gpu }).problem
             : null;
         const current = evaluateHardwareEligibility(admission.descriptor, freshContext, { overrideProblem });
         const admittedOverride = admission.descriptor.hardwareOverride || null;

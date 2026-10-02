@@ -207,7 +207,7 @@ test('G.status-on', (t) => {
     const notObserved = '\\(in-Box facts are not observed from the host\\)';
     assert.match(text, new RegExp(`\\nBox mount: cgroup2 unknown ${notObserved}; rw unknown ${notObserved}; nsdelegate unknown ${notObserved}\\n`), 'the host never invents in-Box facts');
     assert.match(text, /\nHost delegation: unknown \(the host engine was not queried\)\n/);
-    assert.match(text, /\nGPU sharing: best-effort, not a security boundary; daemon unknown \(GPU sharing is not available in this release\)\n/);
+    assert.match(text, /\nGPU sharing: best-effort, not a security boundary; daemon unknown \(in-Box facts are not observed from the host\)\n/);
     // No instance was observed: the stored policy only, no invented key/availability.
     assert.match(text, /\nAgent: demo\/agent \(stored policy; instances not observed from the host\); cpu 2; RAM declared; GPU none\n/);
     assert.doesNotMatch(text, /not enabled|Availability: stopped|Limits: pending/);
@@ -1385,3 +1385,23 @@ test('G.status-transition', async (t) => {
     assert.doesNotMatch(text, /barrier-installed/);
     assert.ok(fs.existsSync(paths.barrierPath), 'status reports the barrier without mutating it');
 });
+
+for (const mismatch of ['engineIdentity', 'hostKind']) {
+    test(`supervisor restart blocks pending recovery on changed ${mismatch}`, async (t) => {
+        const state = fixture(t);
+        state.gateStore.write(state.identity, true, lockFor(state.identity));
+        await pendingDowngrade(state);
+        const events = [];
+        const ownership = { state: 'absent', engine: {
+            name: 'podman', identity: mismatch === 'engineIdentity' ? 'different-engine' : 'engine',
+            hostKind: mismatch === 'hostKind' ? 'podman-machine' : 'native-linux',
+        }, handles: {} };
+        await assert.rejects(realSupervisor(state, { events, ownership }).runRestartTransaction(['restart']),
+            (error) => error.code === 'PLOINKY_BOX_HARDWARE_RECOVERY_BLOCKED');
+        assert.equal(events.some((event) => event.startsWith('run:') || ['core', 'prepare', 'reconcile', 'start-core'].includes(event)), false);
+        assert.ok(fs.existsSync(storePaths(state).barrierPath));
+        const journal = createTransitionStore({ identity: state.identity, homeDirectory: state.home }).listPending()[0];
+        assert.equal(journal.phase, 'recovery-blocked');
+        assert.equal(journal.lastProblem.code, 'ENGINE_IDENTITY_CHANGED');
+    });
+}

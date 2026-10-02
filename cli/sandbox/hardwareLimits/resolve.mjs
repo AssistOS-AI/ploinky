@@ -2,6 +2,7 @@
 // (plan §3 defaults, §8.1, §8.3). Pure functions over bounded observations.
 
 import crypto from 'node:crypto';
+import { resolveMpsShare, MpsError } from './mpsEligibility.mjs';
 
 export const MIB = 1024 * 1024;
 export const MIN_MEMORY_BYTES = 64 * MIB;
@@ -155,13 +156,18 @@ export function resolveEffectiveLimits({ declared = {}, override = null, envelop
 // CPU must lie within the CURRENT envelope (plan §3 Bounds): a stored value
 // above it is refused at admission, never rendered. GPU shares are not part
 // of this release (P1), so a stored GPU entry is refused, never ignored (U4).
-export function overridePolicyFromStored(entry, envelope) {
-    if (!entry) return null;
-    if (entry.gpu !== undefined) {
-        throw new LimitResolutionError('GPU shares cannot be enforced in this release', {
-            code: 'gpu_sharing_unavailable', field: 'gpu', status: 409,
-        });
+export function resolveStoredGpuShare(policy, gpu, ref) {
+    try {
+        if (!gpu?.eligible || !gpu.grant?.agents?.includes(ref) || gpu.grant?.denied?.includes(ref)) throw new MpsError(gpu?.reason || 'This agent has no active, qualified Box GPU grant.');
+        return resolveMpsShare(policy, gpu.facts, { grant: gpu.grant, ...(gpu.fsApi ? { fsApi: gpu.fsApi } : {}) });
+    } catch (error) {
+        throw new LimitResolutionError(error.message, { code: 'gpu_sharing_unavailable', field: 'gpu', status: 409 });
     }
+}
+
+export function overridePolicyFromStored(entry, envelope, { gpu = null, ref = 'REPO/AGENT' } = {}) {
+    if (!entry) return null;
+    if (entry.gpu !== undefined) resolveStoredGpuShare(entry.gpu, gpu, ref);
     const resources = {};
     if (entry.cpus !== undefined) {
         const cpus = Number(entry.cpus);
@@ -199,10 +205,10 @@ export function storedRequestedLimits(entry) {
  * refuses the agent. Deterministic for identical inputs, so a refused record
  * stays current while nothing changed.
  */
-export function resolveStoredOverride(entry, envelope, { ref = 'REPO/AGENT' } = {}) {
+export function resolveStoredOverride(entry, envelope, { ref = 'REPO/AGENT', gpu = null } = {}) {
     if (!entry) return Object.freeze({ policy: null, problem: null });
     try {
-        return Object.freeze({ policy: overridePolicyFromStored(entry, envelope), problem: null });
+        return Object.freeze({ policy: overridePolicyFromStored(entry, envelope, { gpu, ref }), gpu: entry.gpu ? resolveStoredGpuShare(entry.gpu, gpu, ref) : null, problem: null });
     } catch (error) {
         if (!(error instanceof LimitResolutionError)) throw error;
         // Every stored field replaces its declared value, so the refusal lists
@@ -213,7 +219,7 @@ export function resolveStoredOverride(entry, envelope, { ref = 'REPO/AGENT' } = 
                 policy: null,
                 problem: Object.freeze({
                     reasonCode: 'gpu_sharing_unavailable',
-                    reason: 'GPU sharing is not available in this release, so the stored GPU share cannot be enforced.',
+                    reason: String(error.message).slice(0, 1024),
                     fix: `Clear the GPU share in Settings, or run ploinky limits clear --agent ${ref} on the host `
                         + '(this also clears its CPU/RAM override). CPU/RAM controls remain separately available.',
                     requested,

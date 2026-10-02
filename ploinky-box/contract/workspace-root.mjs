@@ -58,6 +58,7 @@ export const BOX_RESERVED_SUBTREES = Object.freeze([...new Set([
     '/root',
     '/home/agent',
     '/run/ploinky-health-probes',
+    '/run/ploinky-mps-pipe',
     '/run/ploinky-edge-topology',
 ])].sort());
 

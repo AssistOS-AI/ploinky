@@ -303,6 +303,24 @@ function validateAuditEvent(value) {
     exactKeys(value, EVENT_KEYS, 'audit event');
     if (!HEX32.test(value.transactionId)) fail('audit event transactionId is invalid');
     if (Buffer.byteLength(JSON.stringify(value)) > MAX_AUDIT_EVENT_BYTES) fail('audit event exceeds 8 KiB');
+    if (value.action === 'clear-all') {
+        if (plainObject(value.before) && Object.hasOwn(value.before, 'count')) {
+            exactKeys(value.before, ['count', 'sha256'], 'clear-all audit summary');
+            if (!Number.isInteger(value.before.count) || value.before.count < 0 || value.before.count > MAX_AGENT_ENTRIES
+                || !/^[0-9a-f]{64}$/.test(value.before.sha256)) fail('clear-all audit summary is invalid');
+        } else {
+            // Previously committed bounded v1 outboxes remain recoverable.
+            if (!plainObject(value.before) || Object.keys(value.before).length > MAX_AGENT_ENTRIES) {
+                fail('clear-all audit prior entries are invalid');
+            }
+            for (const [ref, entry] of Object.entries(value.before)) {
+                validateAgentRef(ref);
+                validateAgentEntry(entry);
+            }
+        }
+        exactKeys(value.after, [], 'clear-all audit after');
+        if (value.ref !== null) fail('clear-all audit ref must be null');
+    }
     return value;
 }
 
@@ -685,6 +703,17 @@ function commitPolicy({ paths, snapshot, agents, event, fsApi, faults, now }) {
         agents: Object.fromEntries([...agents].sort(([a], [b]) => a.localeCompare(b))),
         auditOutbox: { ...event, token: { epoch: document.epoch, revision: document.revision + 1 } },
     };
+    // Validate the exact persisted representation, including the pending audit
+    // event, before replacing the readable policy and advancing its CAS token.
+    try {
+        validateStoreDocument(next, { identityDocument: snapshot.identityDocument });
+    } catch (error) {
+        if (!(error instanceof HardwareStoreError)) throw error;
+        fail(error.message, { code: 'invalid_limits' });
+    }
+    if (Buffer.byteLength(`${JSON.stringify(next, null, 2)}\n`) > MAX_STORE_BYTES) {
+        fail(`limits.json would exceed ${MAX_STORE_BYTES} bytes`, { code: 'invalid_limits' });
+    }
     atomicPrivateWrite(fsApi, paths.policyPath, next, faults);
     const token = Object.freeze({ epoch: next.epoch, revision: next.revision });
     const flushed = recoverAuditOutbox({ paths, snapshot: { document: next }, fsApi, faults, now });
@@ -803,7 +832,14 @@ export function clearAllLimits({
             }
             const current = requireValid(readStoreSnapshot({ paths, identity, fsApi }));
             const event = auditEvent({
-                action: 'clear-all', ref: null, before: Object.fromEntries(current.agents), after: {}, actor, now, result: 'committed',
+                action: 'clear-all', ref: null,
+                before: {
+                    count: current.agents.size,
+                    sha256: crypto.createHash('sha256').update(JSON.stringify(Object.fromEntries(
+                        [...current.agents].sort(([a], [b]) => a.localeCompare(b)),
+                    ))).digest('hex'),
+                },
+                after: {}, actor, now, result: 'committed',
             });
             return committedResult(commitPolicy({ paths, snapshot: current, agents: new Map(), event, fsApi, faults, now }), { reset: false });
         }

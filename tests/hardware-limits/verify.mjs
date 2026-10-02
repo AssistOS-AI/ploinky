@@ -6,8 +6,8 @@
 //   baseline      run scoped existing suites against the baseline staging copies
 //   offline       run one phase's required tests and affected regressions
 //   prepare-live  write a proposed run manifest for one live block (no engine)
-//   live/cleanup  APPROVAL REQUIRED; this candidate validates the manifest and
-//                 refuses execution
+//   live/cleanup  APPROVAL REQUIRED; exact authorization binding and owned
+//                 fixture execution. Unsupported cases remain BLOCKED.
 //
 // Exit codes: PASS=0, FAIL=1, BLOCKED=2, SKIPPED=3. Child processes are
 // spawned with argument arrays, explicit cwd/environment and deadlines.
@@ -17,6 +17,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { runLiveCommand, LIVE_CASES, UNSUPPORTED } from './liveHarness.mjs';
 
 import {
     EXIT,
@@ -48,7 +49,7 @@ const PLAN_PINS = Object.freeze({
 // Existing suites whose behavior a phase can affect. Required feature files
 // come from the case manifest; these are additional regressions.
 const PHASE_REGRESSIONS = Object.freeze({
-    s0: { ploinky: [] },
+    s0: { ploinky: ['tests/unit/hardwareLimitsLiveHarness.test.mjs'] },
     p0: {
         ploinky: [
             'tests/unit/agentEnableBatch.test.mjs',
@@ -615,7 +616,7 @@ function prepareLive(options) {
         configDigest,
         casesDigest: config.casesDigest,
         block,
-        target: { engine: config.engine, ssh: config.ssh, note: 'filled during the approved preflight' },
+        target: { engine: config.engine, ssh: config.ssh, note: 'Execution profile and separate exact-target authorization binding required; no file grants permission.', cases: LIVE_CASES[block], unsupported: Object.fromEntries((LIVE_CASES[block] || []).filter(id => UNSUPPORTED[id]).map(id => [id, UNSUPPORTED[id]])) },
         state: 'proposed',
         workspace: { proposedParent: null, instance: null },
         ports: { tcp: null, udp: null },
@@ -633,12 +634,20 @@ function prepareLive(options) {
     return EXIT.PASS;
 }
 
-function refuseLive(options, command) {
+async function runLive(options, command) {
     const runPath = requireAbsolute(options.run, 'run');
-    validateRunManifest(readJsonBounded(runPath, 256 * 1024));
-    console.error(`[${command}] APPROVAL REQUIRED: live execution needs explicit execution-time approval of this exact `
-        + 'manifest, and this candidate does not implement live block execution. Nothing was run.');
-    return EXIT.BLOCKED;
+    if (!options.authorization) {
+        console.error('[live] APPROVAL REQUIRED: no execution-time authorization binding supplied. Nothing was run.');
+        return EXIT.BLOCKED;
+    }
+    try {
+        const report = await runLiveCommand({ runPath, authorizationPath: requireAbsolute(options.authorization, 'authorization'), action: command });
+        console.log(JSON.stringify({ verdict: report.verdict, cases: report.cases.map(({ id, result, reason }) => ({ id, result, reason })), limitations: report.limitations }, null, 2));
+        return report.exitCode;
+    } catch (error) {
+        console.error('[live] BLOCKED: ' + error.message);
+        return EXIT.BLOCKED;
+    }
 }
 
 export async function main(argv = process.argv.slice(2)) {
@@ -649,8 +658,8 @@ export async function main(argv = process.argv.slice(2)) {
     case 'baseline': return baselineCommand(options);
     case 'offline': return offlineCommand(options);
     case 'prepare-live': return prepareLive(options);
-    case 'live': return refuseLive(options, 'live');
-    case 'cleanup': return refuseLive(options, 'cleanup');
+    case 'live': return runLive(options, 'live');
+    case 'cleanup': return runLive(options, 'cleanup');
     default: throw new UsageError(`unknown command '${command || ''}'`);
     }
 }

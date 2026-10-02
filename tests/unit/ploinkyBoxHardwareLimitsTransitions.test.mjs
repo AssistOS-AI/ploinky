@@ -411,3 +411,36 @@ for (const effect of T_FAULT_EFFECTS) {
         }
     }
 }
+
+for (const mismatch of ['engineIdentity', 'hostKind']) {
+    test(`fresh-process recovery blocks changed ${mismatch} before engine or host effects`, async (t) => {
+        const w = world(t);
+        await assert.rejects(runHardwareDowngrade(downgradeArgs(w, { 'old-remove.after': 'process-death' })), SimulatedProcessDeath);
+        const statePath = path.join(w.home, 'recovery-state.json');
+        fs.writeFileSync(statePath, JSON.stringify(worldState(w)));
+        const transitionModule = new URL('../../ploinky-box/hardwareLimitsTransition.mjs', import.meta.url).href;
+        const worldModule = new URL('../hardware-limits/transitionWorld.mjs', import.meta.url).href;
+        const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
+            import fs from 'node:fs';
+            import { recoverHardwareDowngrades } from ${JSON.stringify(transitionModule)};
+            import { Engine, effectsFor } from ${JSON.stringify(worldModule)};
+            const state = JSON.parse(fs.readFileSync(process.argv[1]));
+            const w = { ...state, engine: new Engine().load(state.engine), records: new Map(state.records) };
+            const effects = effectsFor(w);
+            effects[${JSON.stringify(mismatch)}] = 'different';
+            let effectsRun = 0;
+            for (const [name, value] of Object.entries(effects)) if (typeof value === 'function') {
+                effects[name] = () => { effectsRun++; throw new Error('unexpected effect ' + name); };
+            }
+            const results = await recoverHardwareDowngrades({ identity: w.identity, homeDirectory: w.home, effects });
+            console.log(JSON.stringify({ results, effectsRun }));
+        `, statePath], { encoding: 'utf8' });
+        assert.equal(child.status, 0, child.stderr);
+        const result = JSON.parse(child.stdout);
+        assert.equal(result.effectsRun, 0);
+        assert.equal(result.results[0].phase, 'recovery-blocked');
+        assert.ok(readBarrier({ paths: w.paths }));
+        assert.equal(createTransitionStore({ identity: w.identity, homeDirectory: w.home }).listPending()[0].lastProblem.code,
+            'ENGINE_IDENTITY_CHANGED');
+    });
+}

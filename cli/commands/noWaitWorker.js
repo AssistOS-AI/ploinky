@@ -1,3 +1,4 @@
+import { acknowledgeMpsRuntimeReady, verifyMpsRuntimeReady } from '../sandbox/hardwareLimits/mpsLifecycle.mjs';
 import { retireRuntimeCandidate } from '../sandbox/runtimeCandidateStore.js';
 // Detached helper that boots a single `no-wait` dependency in the background
 // after `startWorkspace` has finished gating on its blocking dependencies.
@@ -1963,6 +1964,7 @@ async function main() {
                 const routedHostPort = context.profileResolution.network.mode === 'none'
                     ? null
                     : hostPort || null;
+                await verifyMpsRuntimeReady(result);
                 if (!context.adopted) {
                     await upsertRoute(routeKey, {
                         container: resolvedContainerName,
@@ -1985,6 +1987,7 @@ async function main() {
                     });
                 }
                 onCommitted();
+                await acknowledgeMpsRuntimeReady(result);
                 if (result?.durableCandidate) {
                     try { retireRuntimeCandidate(result.durableCandidate); } catch (error) {
                         console.warn(`[no-wait] ${shortAgent}: runtime committed; candidate receipt retained: ${error.message}`);

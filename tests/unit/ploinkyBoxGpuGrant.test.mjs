@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { discoverMpsTools, MPS_TOOL_PATHS } from '../../ploinky-box/lib/mpsTools.mjs';
 
 import { runOuterCli } from '../../ploinky-box/bin/ploinky-box.mjs';
 import { parseOuterArguments } from '../../ploinky-box/command/parse.mjs';
@@ -1125,6 +1126,32 @@ test('a failed replacement restores the old Box with its own GPU wiring', async 
     assert.equal(creates.length, 2);
     assert.deepEqual(optionValues(creates[1], '--device'), ['/dev/fuse', '/dev/net/tun', ...wiring.devices]);
     assert.equal(h.current().labels[BOX_LABELS.gpuGrant], wiring.fingerprint);
+});
+
+test('MPS enabled Box wiring is observed exactly and preserves both tools during rollback', async (t) => {
+    const state = boxFixture(t);
+    const host = fakeHost(); useFakeHostFiles(t, host);
+    t.mock.method(os, 'homedir', () => state.home);
+    const toolsRoot = path.join(state.root, 'tools'); fs.mkdirSync(toolsRoot);
+    for (const destination of Object.values(MPS_TOOL_PATHS)) fs.writeFileSync(path.join(toolsRoot, path.basename(destination)), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const mps = discoverMpsTools({ directories: [toolsRoot] });
+    const wiring = buildGpuWiring({ identity: state.identity, grant: GRANT, discovery: host.discover(), mps, homeDirectory: state.home });
+    state.store.materialize(state.identity, wiring, state.lock);
+    const old = containerHandle(state, { gpu: wiring });
+    assert.doesNotThrow(() => validateContainerConfiguration(old, desiredFor(state, undefined)));
+    assert.deepEqual(observeContainerGpuWiring(old, { identity: state.identity }).mps, mps);
+    for (const destination of Object.values(MPS_TOOL_PATHS)) {
+        const missing = structuredClone(old); missing.runtime.mounts = missing.runtime.mounts.filter((mount) => mount.destination !== destination);
+        assert.throws(() => observeContainerGpuWiring(missing, { identity: state.identity }), /both tools/);
+        const writable = structuredClone(old); writable.runtime.mounts.find((mount) => mount.destination === destination).rw = true;
+        assert.throws(() => validateContainerConfiguration(writable, desiredFor(state, wiring)), /incompatible/);
+    }
+    const h = harness(state, { initial: old, failCandidateReady: true });
+    await assert.rejects(() => reconcileBoxContainer(reconcileArguments(state, h, old, { gpu: null }), h.seams), (error) => error.boxRollback?.action === 'restored' && error.boxRollback.gpu.mps.control.sha256 === mps.control.sha256);
+    const restore = h.calls.filter((call) => call[3] === 'create')[1];
+    for (const tool of Object.values(mps)) assert(optionValues(restore, '--volume').includes(`${tool.source}:${tool.destination}:ro`));
+    fs.writeFileSync(mps.control.source, '#!/bin/sh\nexit 1\n');
+    assert.throws(() => state.store.materialize(state.identity, wiring, state.lock), /MPS tools changed/);
 });
 
 // ---------------------------------------------------------------------------
