@@ -326,3 +326,97 @@ test('real bwrap starts with a /code volume whose mount point was absent', { ski
         fs.rmSync(layout.root, { recursive: true, force: true });
     }
 });
+
+// The volume policy supports file volumes; the mount point has to be a file.
+function fileVolume(layout, name = 'config.json', content = 'volume') {
+    const dir = path.join(layout.root, 'workspace-data');
+    fs.mkdirSync(dir, { recursive: true });
+    const host = path.join(dir, name);
+    fs.writeFileSync(host, content);
+    return host;
+}
+
+test('a file volume onto a file the agent ships builds args and leaves that file untouched', () => {
+    const layout = fixture('bwrap-code-filevol-shipped-');
+    try {
+        const shipped = path.join(layout.agentCodePath, 'config.json');
+        fs.writeFileSync(shipped, 'shipped');
+        const host = fileVolume(layout);
+        const args = argsFor(layout, { volumes: { [host]: '/code/config.json' } });
+        assert.equal(fs.readFileSync(shipped, 'utf8'), 'shipped');
+        assert.equal(fs.lstatSync(shipped).isFile(), true);
+        const volume = mounts(args).find(mount => mount.target === '/code/config.json');
+        assert.deepEqual([volume.readOnly, volume.source], [false, host]);
+    } finally {
+        fs.rmSync(layout.root, { recursive: true, force: true });
+    }
+});
+
+test('a file volume onto an absent target gets an empty regular file below real directories', () => {
+    const layout = fixture('bwrap-code-filevol-absent-');
+    try {
+        const host = fileVolume(layout);
+        const args = argsFor(layout, { volumes: { [host]: '/code/conf/app/config.json' } });
+        const mountPoint = path.join(layout.agentCodePath, 'conf', 'app', 'config.json');
+        const stat = fs.lstatSync(mountPoint);
+        assert.deepEqual([stat.isFile(), stat.isSymbolicLink(), stat.size], [true, false, 0]);
+        for (const directory of ['conf', 'conf/app']) {
+            assert.equal(fs.lstatSync(path.join(layout.agentCodePath, directory)).isDirectory(), true, directory);
+        }
+        assert.ok(mounts(args).some(mount => mount.target === '/code/conf/app/config.json' && mount.source === host));
+        // A second launch finds the mount point and changes nothing.
+        argsFor(layout, { volumes: { [host]: '/code/conf/app/config.json' } });
+        assert.equal(fs.statSync(mountPoint).size, 0);
+    } finally {
+        fs.rmSync(layout.root, { recursive: true, force: true });
+    }
+});
+
+test('a file volume refuses a directory or symlink at its target, and a directory volume refuses a file', () => {
+    const layout = fixture('bwrap-code-filevol-mismatch-');
+    try {
+        const host = fileVolume(layout);
+        const outside = path.join(layout.root, 'outside.json');
+        fs.writeFileSync(outside, 'outside');
+        fs.mkdirSync(path.join(layout.agentCodePath, 'dir-target'));
+        fs.symlinkSync(outside, path.join(layout.agentCodePath, 'link-target'));
+        assert.throws(() => argsFor(layout, { volumes: { [host]: '/code/dir-target' } }), /is not a regular file/);
+        assert.throws(() => argsFor(layout, { volumes: { [host]: '/code/link-target' } }), /is not a regular file/);
+        assert.equal(fs.lstatSync(path.join(layout.agentCodePath, 'link-target')).isSymbolicLink(), true);
+        assert.equal(fs.readFileSync(outside, 'utf8'), 'outside', 'nothing is written through the symlink');
+        fs.writeFileSync(path.join(layout.agentCodePath, 'file-target'), 'file');
+        const dirVolume = path.join(layout.root, 'workspace-data', 'a-directory');
+        fs.mkdirSync(dirVolume, { recursive: true });
+        assert.throws(() => argsFor(layout, { volumes: { [dirVolume]: '/code/file-target' } }), /is not a directory/);
+    } finally {
+        fs.rmSync(layout.root, { recursive: true, force: true });
+    }
+});
+
+test('real bwrap starts with file volumes over a shipped file and over an absent target', { skip: !hasUsableBwrap() }, () => {
+    const layout = fixture('bwrap-code-filevol-live-');
+    try {
+        fs.writeFileSync(path.join(layout.agentCodePath, 'shipped.json'), 'shipped');
+        const shippedVolume = fileVolume(layout, 'shipped.json', 'volume-shipped');
+        const absentVolume = fileVolume(layout, 'absent.json', 'volume-absent');
+        const args = argsFor(layout, {
+            volumes: { [shippedVolume]: '/code/shipped.json', [absentVolume]: '/code/conf/absent.json' },
+        });
+        const probe = [
+            'set -eu',
+            'test "$(cat /code/shipped.json)" = volume-shipped',
+            'test "$(cat /code/conf/absent.json)" = volume-absent',
+            'echo written > /code/conf/absent.json',
+            'if touch /code/escaped 2>/dev/null; then exit 81; fi',
+            'echo BWRAP_FILE_VOLUMES_OK',
+        ].join('; ');
+        const result = spawnSync('bwrap', [...args, '/bin/sh', '-c', probe], { encoding: 'utf8' });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        assert.match(result.stdout, /BWRAP_FILE_VOLUMES_OK/);
+        assert.equal(fs.readFileSync(absentVolume, 'utf8').trim(), 'written');
+        assert.equal(fs.readFileSync(path.join(layout.agentCodePath, 'shipped.json'), 'utf8'), 'shipped');
+        assert.equal(fs.statSync(path.join(layout.agentCodePath, 'conf', 'absent.json')).size, 0);
+    } finally {
+        fs.rmSync(layout.root, { recursive: true, force: true });
+    }
+});
