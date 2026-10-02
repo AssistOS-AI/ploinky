@@ -262,7 +262,7 @@ export function renderSummary(run, manifestPath) {
         `| Host ports | TCP ${run.ports.tcp} (Router, loopback), UDP ${run.ports.udp} (media); a collision aborts |`,
         `| Box image | \`${plan.boxImage}\` |`,
         `| Fixture image | \`${plan.image}\` |`,
-        ...plan.agents.map(agent => `| Fixture agent ${FIXTURE_REPOSITORY}/${agent.name} | memory ${agent.resources.memory}, cpus ${agent.resources.cpus}, pids ${agent.resources.pidsLimit}, readiness none |`),
+        ...plan.agents.map(agent => `| Fixture agent ${FIXTURE_REPOSITORY}/${agent.name} | hardwareLimits memory ${agent.hardwareLimits.memory}, cpus ${agent.hardwareLimits.cpus}, pids ${agent.hardwareLimits.pidsLimit}, readiness none |`),
         `| Deadlines | core ${run.deadlines.coreMs} ms, start ${run.deadlines.startMs} ms, destroy ${run.deadlines.destroyMs} ms, cleanup ${run.deadlines.cleanupMs} ms${remote ? `, staging ${run.deadlines.stagingMs} ms` : ''} |`,
         '',
         '## Commands',

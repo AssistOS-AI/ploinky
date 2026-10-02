@@ -17,9 +17,15 @@ import {
     buildEffectivePolicy,
     canonicalize,
     emitRunArgs,
+    validateHardwareLimitsShape,
     validatePolicyShape,
 } from './docker/containerRuntimePolicy.js';
 import { HardwareLimitsError } from './hardwareLimits/errors.mjs';
+import {
+    declaredLayerPolicy,
+    hardwareDeclarationConflicts,
+    warnDeprecatedHardwareDeclarations,
+} from './hardwareLimits/declaredLimits.mjs';
 import {
     buildDirectRefusal,
     captureHardwareContext,
@@ -336,6 +342,7 @@ export function validateManifestRuntimeCapabilities(manifest, {
     rejectDirectCapabilityFields(manifest, path, context);
     const containerSecurity = validateContainerSecurityBlock(manifest.containerSecurity, context);
     validateLlmRuntimeBlock(manifest.llmRuntime, `${path}.llmRuntime`, context);
+    validateHardwareLimitsShape(manifest.hardwareLimits, `${path}.hardwareLimits`);
     validateVolumesBlock(manifest.volumes, `${path}.volumes`, context);
     for (const [profileName, profile] of profileEntries(manifest)) {
         if (!isPlainObject(profile)) {
@@ -359,6 +366,7 @@ export function validateManifestRuntimeCapabilities(manifest, {
             `${path}.profiles.${profileName}.llmRuntime`,
             { ...context, profileName },
         );
+        validateHardwareLimitsShape(profile.hardwareLimits, `${path}.profiles.${profileName}.hardwareLimits`);
         validateVolumesBlock(
             profile.volumes,
             `${path}.profiles.${profileName}.volumes`,
@@ -431,16 +439,21 @@ export function resolveEffectiveRuntimeCapabilities(manifest, {
         agentId,
         path: agentId ? `manifest(${agentId})` : 'manifest',
     });
+    // The neutral hardwareLimits declaration joins its own layer (manifest or
+    // profile); the deprecated llmRuntime.runtimePolicy.resources keys are
+    // read in the same layer, so the effective policy does not depend on
+    // which field declared a value.
     const policySources = {
-        manifestPolicy: manifest?.llmRuntime?.runtimePolicy || null,
+        manifestPolicy: declaredLayerPolicy(manifest, 'manifest.hardwareLimits'),
         catalogPolicy,
-        profilePolicy: profileConfig?.llmRuntime?.runtimePolicy || null,
+        profilePolicy: declaredLayerPolicy(profileConfig, 'profile.hardwareLimits'),
         overridePolicy,
     };
     let runtimePolicy = buildEffectivePolicy(policySources, { runtime });
     // The exact memory/cpus/pidsLimit request and its declaring layer, kept
     // whether or not llmRuntime.enabled is set (plan §8.1, R10).
     const hardwareRequest = requestedHardwareLimits(policySources);
+    const declarationConflicts = hardwareDeclarationConflicts({ manifest, profileConfig });
     // `containerSecurity.shmSize` sizes the agent's own /dev/shm. The
     // operator's runtime policy wins: a size it sets, and host IPC, where a
     // size cannot apply (outside a Box; a Box refuses host IPC).
@@ -516,6 +529,8 @@ export function resolveEffectiveRuntimeCapabilities(manifest, {
     // Present only when a hardware limit is requested, so the descriptors of
     // every unlimited agent are unchanged.
     if (hardwareRequest.length) descriptor.hardwareRequest = canonicalize(hardwareRequest);
+    // Present only for a conflicting declaration, which refuses the agent.
+    if (declarationConflicts.length) descriptor.hardwareDeclarationConflicts = canonicalize(declarationConflicts);
     return deepFreeze(descriptor);
 }
 
@@ -706,6 +721,8 @@ export function admitManifestRuntimeCapabilities(manifest, {
             gpuGrantOptions,
         }),
     });
+    // Once per agent and process: the deprecated declaration path.
+    warnDeprecatedHardwareDeclarations(exactManifest, agentId);
     if (hardwareGpu) descriptor = deepFreeze({ ...descriptor, hardwareGpu, hardwareRequest: [...(descriptor.hardwareRequest || []), { field: 'gpu', value: `${hardwareGpu.smPercent}/${hardwareGpu.vramPercent} percent`, source: 'settings' }] });
     // Every non-hardware capability error stays strict in both modes.
     assertRuntimeCapabilitiesAllowed(descriptor, {

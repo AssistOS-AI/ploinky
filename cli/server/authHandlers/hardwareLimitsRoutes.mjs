@@ -16,6 +16,7 @@ import { collectAgentsSummary } from '../../utils/status.js';
 import { readRoutingConfig } from '../routingFile.js';
 import { findHardwareOutcome, validateHardwareOutcome } from '../../sandbox/hardwareLimits/errors.mjs';
 import { readAppliedObservation } from '../../sandbox/hardwareLimits/runtimeState.mjs';
+import { deprecatedDeclarationNote } from '../../sandbox/hardwareLimits/declaredLimits.mjs';
 import { runHardwareLimitsApplyWorker, hardwareApplyFlight } from '../hardwareLimitsApplyWorker.mjs';
 import { workspaceMetricsMonitor } from '../workspaceMetrics.js';
 import { resolveManifestRuntimeProfile } from '../../utils/runtime/profileService.js';
@@ -74,6 +75,16 @@ function defaultAdmission(agent, record = {}, context) {
     });
 }
 
+// A bounded note when the agent's manifest still declares limits under the
+// deprecated llmRuntime.runtimePolicy.resources path; null otherwise.
+function defaultDeclarationNote(agent) {
+    try {
+        return deprecatedDeclarationNote(JSON.parse(fs.readFileSync(agent.manifestPath, 'utf8')));
+    } catch (_) {
+        return null;
+    }
+}
+
 export function qualifyHardwareGpuTarget(agent, records, context, limits, { inspectImage = inspectPreparedMpsImage, qualify = inspectMpsTargetEligibility } = {}) {
     if (!agent) fail('unknown_agent', 'The selected agent is not installed.', 404);
     const manifest = JSON.parse(fs.readFileSync(agent.manifestPath, 'utf8'));
@@ -89,13 +100,14 @@ export function qualifyHardwareGpuTarget(agent, records, context, limits, { insp
     return qualified;
 }
 
-export function buildHardwareLimitsState({ context, installed, registry, routing = {}, metrics = null, admit = defaultAdmission, readApplied = readAppliedObservation }) {
+export function buildHardwareLimitsState({ context, installed, registry, routing = {}, metrics = null, admit = defaultAdmission, readApplied = readAppliedObservation, readDeclarationNote = defaultDeclarationNote }) {
     const entries = new Map(installed.map((agent) => [agent.ref, agent]));
     for (const ref of context.overrides?.keys() || []) if (!entries.has(ref)) entries.set(ref, { ref, orphaned: true });
     const agents = [];
     for (const agent of entries.values()) {
         let admission = null;
         let declared = {};
+        const deprecatedDeclaration = agent.orphaned ? null : readDeclarationNote(agent);
         if (!agent.orphaned) {
             try {
                 declared = admit(agent, {}, { ...context, overrides: new Map() }).descriptor?.runtimePolicy?.resources || {};
@@ -139,7 +151,7 @@ export function buildHardwareLimitsState({ context, installed, registry, routing
                 usage: runtime?.metrics?.available ? { cpuPercent: runtime.metrics.cpuPercent, memoryBytes: runtime.metrics.memoryBytes } : null,
             });
         }
-        agents.push({ ref: agent.ref, configured: context.overrides?.get(agent.ref) || {}, declared, effective: { ...(admission?.descriptor?.hardwarePlacement?.expected || {}), ...(admission?.descriptor?.hardwareGpu ? { gpu: admission.descriptor.hardwareGpu } : {}) }, containers, ...(agent.orphaned ? { orphaned: true } : {}) });
+        agents.push({ ref: agent.ref, configured: context.overrides?.get(agent.ref) || {}, declared, effective: { ...(admission?.descriptor?.hardwarePlacement?.expected || {}), ...(admission?.descriptor?.hardwareGpu ? { gpu: admission.descriptor.hardwareGpu } : {}) }, containers, ...(deprecatedDeclaration ? { deprecatedDeclaration } : {}), ...(agent.orphaned ? { orphaned: true } : {}) });
     }
     return {
         ok: true, token: context.storeToken || null,

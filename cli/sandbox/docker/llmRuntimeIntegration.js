@@ -10,6 +10,7 @@ import {
     emitRunArgs,
 } from './containerRuntimePolicy.js';
 import { detectHardware } from './hardwareDetection.js';
+import { declaredLayerPolicy } from '../hardwareLimits/declaredLimits.mjs';
 import { isSensitiveEnvVariableName } from '../../utils/security/secretVars.js';
 
 const SAFE_AGENT_KEY_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/;
@@ -143,9 +144,9 @@ function prepareLlmStartup(input) {
     const policy = admittedRuntimePolicy
         ? buildEffectivePolicy({ overridePolicy: admittedRuntimePolicy }, { runtime })
         : buildEffectivePolicy({
-            manifestPolicy: manifest?.llmRuntime?.runtimePolicy || null,
+            manifestPolicy: declaredLayerPolicy(manifest, 'manifest.hardwareLimits'),
             catalogPolicy: selection.runtimePolicy,
-            profilePolicy: profileConfig?.llmRuntime?.runtimePolicy || null,
+            profilePolicy: declaredLayerPolicy(profileConfig, 'profile.hardwareLimits'),
             overridePolicy: null,
         }, { runtime });
 

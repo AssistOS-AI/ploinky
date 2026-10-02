@@ -265,6 +265,18 @@ export function buildRequiredCaseManifest() {
             'A.d4-unlimited-baseline', 'A.stored-gpu-refused', 'A.stored-cpus-above-envelope-refused',
             'A.stored-envelope-unknown', 'A.stored-combined-lists-stored-values',
         ]),
+        ...leaves(P, 'p0', unit('hardwareLimitsDeclaration.test.mjs'), [
+            'HD.schema-manifest-and-profile-field', 'HD.unknown-key-refused', 'HD.gpu-key-refused',
+            'HD.invalid-values-refused-like-resources',
+            ...['manifest', 'profile'].flatMap((layer) => ['absent', 'false', 'true'].map((llm) => `HD.a0-${layer}-llm-${llm}`)),
+            'HD.conflict-manifest-refused', 'HD.conflict-profile-refused', 'HD.equal-values-accepted-with-warning',
+            'HD.deprecation-warning-once', 'HD.deprecation-warning-bounded', 'HD.stored-overrides-declared',
+            'HD.profile-empty-default', 'HD.profile-partial-selected-override', 'HD.profile-old-default-neutral-selected',
+            'HD.profile-neutral-default-old-selected', 'HD.profile-conflict-within-raw-profile',
+            'HD.profile-other-llm-settings-unchanged', 'HD.parity-lite-sandbox', 'HD.parity-d4', 'HD.parity-gate-off',
+            'HD.parity-unprepared-and-controller-missing', 'HD.parity-metadata-strict-and-launch', 'HD.parity-interactive',
+            'HD.parity-graph-outcomes-and-blocked-dependants', 'HD.route-deprecated-declaration-note',
+        ]),
         ...leaves(P, 'p0', unit('hardwareLimitsOutcomes.test.mjs'), [
             'O.prelock-preflight-refusal', 'O.locked-preflight-refusal', 'O.defensive-preflight-refusal',
             'O.batch-first-enable-refusal', 'O.digest-refusal-current', 'O.digest-input-change',
@@ -357,7 +369,11 @@ export function buildRequiredCaseManifest() {
             'L1.cleanup-final-inventory-change-fails',
             'L1.cleanup-unshare-for-subordinate-owned-files', 'L1.prepare-live-mac-cpu-concrete-manifest-and-summary',
             'L1.prepare-live-apparatus-cpu-concrete-manifest-and-summary', 'L1.prepare-live-other-blocks-stay-unsupported',
-            'L1.prepare-live-refuses-mismatched-local-pins',
+            'L1.prepare-live-refuses-mismatched-local-pins', 'L1.fixture-declares-hardware-limits',
+            'L1.fixture-plan-validation-requires-hardware-limits',
+        ]),
+        ...leaves(P, 'p1', unit('hardwareLimitsDeclaration.test.mjs'), [
+            'HD.identity-hash-args-equal', 'HD.identity-migration-no-restart-graph', 'HD.identity-llm-reuse-callers',
         ]),
         ...leaves(P, 'p1', unit('hardwareLimitsDelegation.test.mjs'), [
             'DG.no-aggregate-write', 'DG.nonroot-parents', 'DG.runtime-contexts', 'DG.outer-inspect-runtime',

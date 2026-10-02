@@ -1,11 +1,12 @@
 // Shared hardware-limit request predicate and exact refusal construction.
 //
 // A request is any effective memory, cpus or pidsLimit value, whatever layer
-// declared it and whether or not llmRuntime.enabled is set. Inside a Box the
-// nested runtime enforces such a value only when the Box is hardware-prepared;
-// a lite sandbox never can. An unenforceable request refuses the agent instead
-// of silently dropping the limit. Outside a Box the container engine enforces
-// the flags and behavior is unchanged.
+// declared it (through the neutral hardwareLimits field or the deprecated
+// llmRuntime.runtimePolicy.resources) and whether or not llmRuntime.enabled
+// is set. Inside a Box the nested runtime enforces such a value only when the
+// Box is hardware-prepared; a lite sandbox never can. An unenforceable request
+// refuses the agent instead of silently dropping the limit. Outside a Box the
+// container engine enforces the flags and behavior is unchanged.
 
 import crypto from 'node:crypto';
 
@@ -15,6 +16,7 @@ import {
     validateHardwareOutcome,
 } from './errors.mjs';
 import { readBoxHardwareContext } from './context.mjs';
+import { declarationConflictRefusal, declaredLayerPolicy } from './declaredLimits.mjs';
 import { resolveStoredOverride, storedRequestedLimits } from './resolve.mjs';
 
 export const HARDWARE_RESOURCE_FIELDS = Object.freeze(['memory', 'cpus', 'pidsLimit']);
@@ -194,9 +196,12 @@ function storeRefusal(context) {
 export function evaluateHardwareEligibility(descriptor, context, { helper = false, overrideProblem = null } = {}) {
     const requested = Array.isArray(descriptor?.hardwareRequest) ? descriptor.hardwareRequest : [];
     const runtimeKind = context.runtimeKind;
+    const conflicts = Array.isArray(descriptor?.hardwareDeclarationConflicts) ? descriptor.hardwareDeclarationConflicts : [];
     // Internal helpers are never refused by hardware admission.
     if (helper) return Object.freeze({ applicable: false });
-    if (runtimeKind === 'container' && !context.insideBox) return Object.freeze({ applicable: false });
+    // A conflicting declaration refuses the agent everywhere; otherwise a
+    // container outside a Box is outside the hardware boundary.
+    if (runtimeKind === 'container' && !context.insideBox && !conflicts.length) return Object.freeze({ applicable: false });
     const hostNetwork = descriptor?.capabilities?.hostNetwork === true;
     const nestedPodman = descriptor?.capabilities?.nestedPodman === true;
     const inputFingerprint = hex64({
@@ -208,6 +213,7 @@ export function evaluateHardwareEligibility(descriptor, context, { helper = fals
         hostNetwork,
         nestedPodman,
         overrideProblem,
+        ...(conflicts.length ? { declarationConflicts: conflicts } : {}),
         context: {
             insideBox: context.insideBox,
             gate: context.gate,
@@ -223,7 +229,9 @@ export function evaluateHardwareEligibility(descriptor, context, { helper = fals
         },
     });
     let refusal = null;
-    if (runtimeKind !== 'container') {
+    if (conflicts.length) {
+        refusal = declarationConflictRefusal(conflicts);
+    } else if (runtimeKind !== 'container') {
         if (hasHardwareRequest(requested)) refusal = liteSandboxRefusal(requested);
     } else if (context.storeState === 'unreadable') {
         // No non-helper agent can prove the absence of stored limits.
@@ -326,8 +334,8 @@ export function buildDirectRefusal({ key, ref, alias = null, refusalParts, input
 export function interactiveHardwareRefusal({ manifest, profileConfig = null, ref, key, alias = null, context = null }) {
     const stored = context?.gate === 'on' && context.overrides instanceof Map ? context.overrides.get(ref) || null : null;
     const declared = requestedHardwareLimits({
-        manifestPolicy: manifest?.llmRuntime?.runtimePolicy || null,
-        profilePolicy: profileConfig?.llmRuntime?.runtimePolicy || null,
+        manifestPolicy: declaredLayerPolicy(manifest, 'manifest.hardwareLimits'),
+        profilePolicy: declaredLayerPolicy(profileConfig, 'profile.hardwareLimits'),
     });
     // Every stored field (a GPU share included) replaces its declared value.
     const storedRequested = stored ? storedRequestedLimits(stored) : [];

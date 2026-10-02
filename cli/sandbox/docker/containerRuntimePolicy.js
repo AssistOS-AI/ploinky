@@ -105,6 +105,32 @@ function validateResources(resources, label) {
     return resources;
 }
 
+const HARDWARE_LIMIT_KEYS = new Set(['memory', 'cpus', 'pidsLimit']);
+const GPU_SHARE_KEY_RE = /gpu|vram|^sm(percent)?$/i;
+
+// An agent's neutral `hardwareLimits` declaration: only memory, cpus and
+// pidsLimit, each validated exactly as the same key of `resources`. A GPU
+// share is administrator-only and never declarable.
+function validateHardwareLimitsShape(value, label) {
+    if (value === undefined) return null;
+    const code = 'PLOINKY_HARDWARE_LIMITS_DECLARATION_INVALID';
+    try {
+        ensurePlainObject(value, label);
+        for (const key of Object.keys(value)) {
+            if (HARDWARE_LIMIT_KEYS.has(key)) continue;
+            const shown = key.slice(0, 64);
+            if (GPU_SHARE_KEY_RE.test(key)) {
+                throw new RuntimePolicyError(`${label}: '${shown}' cannot be declared; GPU shares are administrator-only and are set in Explorer Settings → Hardware limits`);
+            }
+            throw new RuntimePolicyError(`${label}: unknown field '${shown}' (allowed: memory, cpus, pidsLimit)`);
+        }
+        return validateResources(value, label);
+    } catch (error) {
+        if (error instanceof RuntimePolicyError) error.code = code;
+        throw error;
+    }
+}
+
 function validateDevices(devices, label, options = {}) {
     if (devices === undefined) return [];
     if (!Array.isArray(devices)) {
@@ -338,5 +364,6 @@ export {
     emitRunArgs,
     mergePolicy,
     policyDefaults,
+    validateHardwareLimitsShape,
     validatePolicyShape,
 };

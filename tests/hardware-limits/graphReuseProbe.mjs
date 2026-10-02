@@ -3,12 +3,15 @@
 // bound to a temporary workspace, so the persisted Router port and every
 // workspace path resolve inside that fixture. The engine is stubbed; the
 // admitted descriptor comes from the real admission with the fixture Box
-// marker and the supplied hardware context.
+// marker and the supplied hardware context. Hardware detection is fixed
+// (no probe command and no engine inspection), so no engine is reached.
 //
 //   node graphReuseProbe.mjs SPEC.json
 //
 // SPEC: {markerPath, hardwareContext, llmEnv?, agents:[{key, ref, manifest,
-// running:{manifest?, hardwareContext?, admitted?:boolean}}]}
+// profile?, running:{manifest?, hardwareContext?, admitted?:boolean}}]}
+// A profile is resolved by the production profile resolver for both the
+// running and the desired manifest.
 // Prints {results:{key: reason}, probes:{key: [optionKeys]}} as JSON.
 
 import fs from 'node:fs';
@@ -24,6 +27,10 @@ const {
     prepareLlmStartup,
     resolveLlmRuntimeAdmissionContext,
 } = await import('../../cli/sandbox/docker/llmRuntimeIntegration.js');
+const { detectHardware } = await import('../../cli/sandbox/docker/hardwareDetection.js');
+const { resolveManifestRuntimeProfile } = await import('../../cli/utils/runtime/profileService.js');
+
+const OFFLINE_HARDWARE = detectHardware({ runtime: 'podman', arch: 'x64', probes: {}, podmanInspect: () => null });
 
 function revive(context) {
     if (!context || typeof context !== 'object') return context;
@@ -33,15 +40,31 @@ function revive(context) {
 const workDirRoot = path.join(process.env.PLOINKY_WORKSPACE_ROOT, 'llm-work');
 const llmEnv = spec.llmEnv || {};
 
+function resolveProfile(agent, manifest) {
+    return resolveManifestRuntimeProfile(manifest, {
+        agentName: agent.ref, profileName: agent.profile || undefined, fallbackProfileName: 'default',
+    });
+}
+
+function isLlm(manifest, profileConfig) {
+    return manifest.llmRuntime?.enabled === true || profileConfig?.llmRuntime?.enabled === true;
+}
+
 function admission(agent, manifest, hardwareContext) {
     const [repoName, agentName] = agent.ref.split('/');
-    const llm = manifest.llmRuntime?.enabled
-        ? resolveLlmRuntimeAdmissionContext({ runtime: 'podman', manifest, profileConfig: null, agentName, env: llmEnv })
+    const profile = resolveProfile(agent, manifest);
+    const llm = isLlm(manifest, profile.profileConfig)
+        ? resolveLlmRuntimeAdmissionContext({
+            runtime: 'podman', manifest, profileConfig: profile.profileConfig, agentName, env: llmEnv, resolvedHardware: OFFLINE_HARDWARE,
+        })
         : null;
     const admitted = admitManifestRuntimeCapabilities(manifest, {
         boxMarkerOptions: { markerPath: spec.markerPath },
         workspaceRoot: process.env.PLOINKY_WORKSPACE_ROOT,
         agentId: `${repoName}/${agentName}`,
+        profileName: profile.resolvedProfileName,
+        profileConfig: profile.profileConfig,
+        network: profile.network,
         runtime: 'podman',
         hardwareAdmission: 'metadata',
         hardwareContext: revive(hardwareContext),
@@ -49,13 +72,20 @@ function admission(agent, manifest, hardwareContext) {
         catalogPolicy: llm?.catalogPolicy ?? null,
         catalogIdentity: llm?.catalogIdentity ?? null,
     });
-    return { descriptor: admitted.descriptor, llmStartup: llm?.startup || null };
+    return { descriptor: admitted.descriptor, llmStartup: llm?.startup || null, profileConfig: profile.profileConfig };
 }
 
 function llmProbe(options) {
     // The engine-facing environment and work directory are fixture-owned; the
     // admitted policy and resolved selection/hardware come from the caller.
-    return prepareLlmStartup({ ...options, env: llmEnv, agentWorkDirRoot: workDirRoot, createDirectories: false, writeState: false });
+    return prepareLlmStartup({
+        ...options,
+        resolvedHardware: options.resolvedHardware || OFFLINE_HARDWARE,
+        env: llmEnv,
+        agentWorkDirRoot: workDirRoot,
+        createDirectories: false,
+        writeState: false,
+    });
 }
 
 const results = {};
@@ -71,10 +101,11 @@ for (const agent of spec.agents) {
         'ploinky.envhash': 'envhash',
         'ploinky.limitshash': hardwareLimitsHashOf(runningAdmission.descriptor),
     };
-    if (runningManifest.llmRuntime?.enabled) {
+    if (isLlm(runningManifest, runningAdmission.profileConfig)) {
         const created = llmProbe({
-            runtime: 'podman', manifest: runningManifest, profileConfig: null, agentName, alias: '',
-            manifestEnvNames: [], envHash: 'envhash', effectiveNetwork: null,
+            runtime: 'podman', manifest: runningManifest, profileConfig: runningAdmission.profileConfig, agentName, alias: '',
+            // The network creation used, exactly as the production reuse caller derives it.
+            manifestEnvNames: [], envHash: 'envhash', effectiveNetwork: runningAdmission.profileConfig?.network ?? runningManifest.network ?? null,
             ...(running.admitted === false ? {} : {
                 admittedRuntimePolicy: runningAdmission.descriptor.runtimePolicy,
                 resolvedSelection: runningAdmission.llmStartup?.selection,
@@ -84,7 +115,7 @@ for (const agent of spec.agents) {
         labels['ploinky.reusehash'] = created.reuseHash;
     }
     const node = {
-        id: agent.key, repoName, shortAgentName: agentName, manifest: agent.manifest, alias: '', profile: '',
+        id: agent.key, repoName, shortAgentName: agentName, manifest: agent.manifest, alias: '', profile: agent.profile || '',
     };
     const plan = {
         node,

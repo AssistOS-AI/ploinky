@@ -22,7 +22,7 @@ import {
 import { createJournal, recordHostRecords, runOwnedCleanup } from './liveCleanup.mjs';
 
 export const FIXTURE_REPOSITORY = 'hwlfixture';
-export const FIXTURE_RESOURCES = Object.freeze({ memory: '64m', cpus: '0.5', pidsLimit: 64 });
+export const FIXTURE_HARDWARE_LIMITS = Object.freeze({ memory: '64m', cpus: '0.5', pidsLimit: 64 });
 const ROLES = Object.freeze(['memory', 'cpu', 'pids']);
 
 // The fixture agents a selection needs. C2 needs three distinct owned agents
@@ -30,17 +30,19 @@ const ROLES = Object.freeze(['memory', 'cpu', 'pids']);
 // three limits, because the live inspection requires them on each agent.
 export function fixturePlan(cases) {
     const roles = cases.includes('LIVE-C2') ? ROLES : ['memory'];
-    return roles.map(role => ({ name: role, role, resources: { ...FIXTURE_RESOURCES } }));
+    return roles.map(role => ({ name: role, role, hardwareLimits: { ...FIXTURE_HARDWARE_LIMITS } }));
 }
 
-// The fixture manifest, readiness none, the pinned image and declared
-// limits. The root agent enables the other fixture agents.
+// The fixture manifest, readiness none, the pinned image and the limits
+// declared through the neutral hardwareLimits field (never the deprecated
+// llmRuntime.runtimePolicy.resources). The root agent enables the other
+// fixture agents.
 export function fixtureManifest(agent, { image, agents }) {
     const manifest = {
         container: image,
         agent: 'node -e "setInterval(()=>{},3600000)"',
         readiness: { protocol: 'none' },
-        llmRuntime: { runtimePolicy: { resources: { ...agent.resources } } },
+        hardwareLimits: { ...agent.hardwareLimits },
     };
     const others = agents.filter(value => value.name !== agent.name);
     if (agent.name === agents[0].name && others.length) manifest.enable = others.map(value => `${FIXTURE_REPOSITORY}/${value.name}`);
@@ -75,10 +77,10 @@ export function validateProvisionPlan(value, run) {
     if (!Array.isArray(value.agents) || !value.agents.length || value.agents.length > 3) throw new Error('Invalid fixture agents');
     const names = new Set();
     for (const agent of value.agents) {
-        keys(agent, ['name', 'role', 'resources'], 'fixture agent');
-        keys(agent.resources, ['memory', 'cpus', 'pidsLimit'], 'fixture resources');
+        keys(agent, ['name', 'role', 'hardwareLimits'], 'fixture agent');
+        keys(agent.hardwareLimits, ['memory', 'cpus', 'pidsLimit'], 'fixture hardwareLimits');
         if (!ROLES.includes(agent.name) || agent.role !== agent.name || names.has(agent.name)
-            || jsonDigest(agent.resources) !== jsonDigest(FIXTURE_RESOURCES)) throw new Error('Invalid fixture agent');
+            || jsonDigest(agent.hardwareLimits) !== jsonDigest(FIXTURE_HARDWARE_LIMITS)) throw new Error('Invalid fixture agent');
         names.add(agent.name);
     }
     if (run && (run.workspace?.proposedPath !== value.workspace.path || run.workspace?.instance !== proposedWorkspaceIdentity(value.workspace.path).instance)) {

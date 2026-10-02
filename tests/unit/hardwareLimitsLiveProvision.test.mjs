@@ -13,7 +13,9 @@ import { fileURLToPath } from 'node:url';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { writePrivateJson } from '../hardware-limits/fixtures.mjs';
 import { executeCleanupRun, jsonDigest, liveSourceDigest, runLiveCommand, validateExecutionProfile, validateProfile } from '../hardware-limits/liveHarness.mjs';
-import { FIXTURE_REPOSITORY, fixtureContainerName, provisionRun } from '../hardware-limits/liveFixture.mjs';
+import { FIXTURE_HARDWARE_LIMITS, FIXTURE_REPOSITORY, fixtureContainerName, fixtureManifest, fixturePlan, provisionRun, validateProvisionPlan } from '../hardware-limits/liveFixture.mjs';
+import { admitManifestRuntimeCapabilities, validateManifestRuntimeCapabilities } from '../../cli/sandbox/runtimeCapabilities.js';
+import { deprecatedHardwareDeclarations } from '../../cli/sandbox/hardwareLimits/declaredLimits.mjs';
 import { buildConcreteManifest, summaryPathFor } from '../hardware-limits/liveManifest.mjs';
 import { writeUstar } from '../hardware-limits/liveStage.mjs';
 import { hostRecordPaths, quarantinePath } from '../hardware-limits/liveCommon.mjs';
@@ -128,7 +130,8 @@ test('L1.provision-mac-c1-c2-success', async t => {
     for (const agent of plan.agents) {
         const manifest = JSON.parse(fs.readFileSync(path.join(plan.workspace.path, '.ploinky', 'repos', FIXTURE_REPOSITORY, agent.name, 'manifest.json'), 'utf8'));
         assert.equal(manifest.container, IMAGE); assert.deepEqual(manifest.readiness, { protocol: 'none' });
-        assert.deepEqual(manifest.llmRuntime.runtimePolicy.resources, { memory: '64m', cpus: '0.5', pidsLimit: 64 });
+        assert.deepEqual(manifest.hardwareLimits, { memory: '64m', cpus: '0.5', pidsLimit: 64 });
+        assert.equal(Object.hasOwn(manifest, 'llmRuntime'), false, 'the fixture never declares the deprecated path');
     }
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(plan.workspace.path, '.ploinky', 'repos', FIXTURE_REPOSITORY, 'memory', 'manifest.json'))).enable, ['hwlfixture/cpu', 'hwlfixture/pids']);
     // The exact start argv, gate on, pinned Box image, from the workspace.
@@ -666,4 +669,40 @@ test('L1.prepare-live-refuses-mismatched-local-pins', async t => {
         await assert.rejects(main(['prepare-live', '--config', f.configPath, '--block', 'mac-cpu', '--run', runPath, '--pins', f.pinsFile('pins_claude.json', pins)]), /pin|Pinned host|Invalid pins/);
         assert.equal(exists(runPath), false);
     }
+});
+
+test('L1.fixture-declares-hardware-limits', () => {
+    // Every fixture agent declares its limits through hardwareLimits, which
+    // production validates and admits as the agent's manifest request.
+    const agents = fixturePlan(['LIVE-C1', 'LIVE-C2']);
+    assert.deepEqual(agents.map(agent => agent.name), ['memory', 'cpu', 'pids']);
+    for (const agent of agents) {
+        const manifest = fixtureManifest(agent, { image: IMAGE, agents });
+        assert.deepEqual(manifest.hardwareLimits, FIXTURE_HARDWARE_LIMITS);
+        assert.equal(Object.hasOwn(manifest, 'llmRuntime'), false);
+        assert.deepEqual(deprecatedHardwareDeclarations(manifest), []);
+        assert.doesNotThrow(() => validateManifestRuntimeCapabilities(manifest));
+        const admission = admitManifestRuntimeCapabilities(manifest, { agentId: `${FIXTURE_REPOSITORY}/${agent.name}`, runtime: 'podman', insideBox: false });
+        assert.deepEqual(admission.descriptor.hardwareRequest, [
+            { field: 'memory', value: '64m', source: 'manifest' },
+            { field: 'cpus', value: '0.5', source: 'manifest' },
+            { field: 'pidsLimit', value: '64', source: 'manifest' },
+        ]);
+    }
+});
+
+test('L1.fixture-plan-validation-requires-hardware-limits', () => {
+    const plan = (agents) => ({
+        revision: 'c'.repeat(40), repository: FIXTURE_REPOSITORY, image: IMAGE, boxImage: BOX_IMAGE, agents,
+        workspace: { parent: '/tmp/hwl-parent', parentMode: 'create', path: '/tmp/hwl-parent/workspace' },
+    });
+    assert.doesNotThrow(() => validateProvisionPlan(plan(fixturePlan(['LIVE-C2']))));
+    // The old plan key (the deprecated llmRuntime.runtimePolicy.resources
+    // values) and any other limit values are refused.
+    const legacy = fixturePlan(['LIVE-C1']).map(({ hardwareLimits, ...agent }) => ({ ...agent, resources: hardwareLimits }));
+    assert.throws(() => validateProvisionPlan(plan(legacy)), /Invalid fixture agent fields/);
+    const changed = fixturePlan(['LIVE-C1']).map(agent => ({ ...agent, hardwareLimits: { ...agent.hardwareLimits, memory: '128m' } }));
+    assert.throws(() => validateProvisionPlan(plan(changed)), /Invalid fixture agent$/);
+    const extra = fixturePlan(['LIVE-C1']).map(agent => ({ ...agent, hardwareLimits: { ...agent.hardwareLimits, gpu: 'all' } }));
+    assert.throws(() => validateProvisionPlan(plan(extra)), /Invalid fixture hardwareLimits fields/);
 });

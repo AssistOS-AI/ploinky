@@ -31,6 +31,7 @@ export const HARDWARE_REASON_CODES = Object.freeze([
     'host_network_nested_podman',
     'exceeds_envelope',
     'envelope_unknown',
+    'declaration_conflict',
     'dependency_blocked',
 ]);
 
