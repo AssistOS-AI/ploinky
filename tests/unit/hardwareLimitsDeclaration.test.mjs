@@ -615,7 +615,9 @@ function llmCatalog() {
     fs.writeFileSync(path.join(catalogRoot, 'architectures/cpu-amd64.json'), JSON.stringify({
         id: 'cpu-amd64', status: 'stable', platform: 'linux/amd64', accelerator: { family: 'cpu' },
         match: { requiredProbes: [] }, image: 'cpu-amd64',
-        runtimePolicy: { platform: 'linux/amd64', resources: { memory: '4g', cpus: '2', pidsLimit: 512 }, ipc: 'default' },
+        // No catalog resources: the catalog layer sits above the manifest, so
+        // catalog values would mask which field the manifest declared.
+        runtimePolicy: { platform: 'linux/amd64', ipc: 'default' },
         engineDefaults: { enginePort: 8080, runtimePort: 9000 },
     }));
     fs.writeFileSync(path.join(catalogRoot, 'images/cpu-amd64.json'), JSON.stringify({ id: 'cpu-amd64', ref: 'reg.example.com/llm-cpu-amd64:dev', platform: 'linux/amd64' }));
@@ -682,6 +684,16 @@ test('HD.identity-llm-reuse-callers', (t) => {
     });
     assert.equal(direct(llmNew).policyHash, direct(llmOld).policyHash);
     assert.equal(direct(llmNew).reuseHash, direct(llmOld).reuseHash);
+    // The declared values themselves reach the rendered arguments, from either field.
+    for (const manifest of [llmNew, llmOld]) {
+        const args = direct(manifest).runArgs;
+        assert.equal(args[args.indexOf('--memory') + 1], '1g', JSON.stringify(args));
+        assert.equal(args[args.indexOf('--cpus') + 1], '1.5', JSON.stringify(args));
+    }
+    for (const manifest of [llmNew, llmOld]) {
+        const args = creation(manifest, admitted(manifest)).runArgs;
+        assert.equal(args[args.indexOf('--memory') + 1], '1g', JSON.stringify(args));
+    }
 });
 
 // The interactive create/reuse path refuses what admission refuses: its real
