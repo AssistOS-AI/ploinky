@@ -295,45 +295,76 @@ function ensureBwrapAgentLibDir(instanceName, nodeModulesDir, options = {}) {
 }
 
 /**
- * Guarantee the directory a nested bind will land on inside the source tree.
+ * Guarantee the directories a nested bind will land on inside the source tree.
  *
  * bwrap applies a read-only bind at bind time, so it cannot create
- * `/code/node_modules` or `/code/skills` inside an already read-only `/code`
- * ("Can't mkdir /code/node_modules: Read-only file system"). The empty host
- * directory is the mount point, as `ensureBwrapAgentLibDir` provides for
- * /Agent/node_modules; container runtimes create the equivalent before their
- * final read-only remount. It stays empty: the prepared dependency cache and
- * the skills tree are mounted over it, never written into it.
+ * `/code/node_modules`, `/code/skills` or a manifest volume target such as
+ * `/code/debuglogs` inside an already read-only `/code` ("Can't mkdir
+ * /code/node_modules: Read-only file system"). The empty host directories are
+ * the mount points, as `ensureBwrapAgentLibDir` provides for
+ * /Agent/node_modules. Podman does not need them because it stages a symlink
+ * tree for `/code` and mounts into that. They stay empty: the dependency
+ * cache, the skills tree and the volumes are mounted over them, never written
+ * into them.
  *
- * An existing real directory is left untouched. Anything else (a symlink such
- * as the Seatbelt dependency link) is refused rather than followed, because a
- * bind through it would land on whatever the link resolves to.
+ * `relPath` is a normalized path below /code. Every missing component is
+ * created. An existing real directory is left untouched. A symlink (such as
+ * the Seatbelt dependency link) or any other non-directory at any component is
+ * refused rather than followed, because a bind through it would land on
+ * whatever the link resolves to.
  */
-function ensureBwrapCodeMountPoint(agentCodePath, name) {
-    const mountPoint = path.join(agentCodePath, name);
-    let stat = null;
-    try {
-        stat = fs.lstatSync(mountPoint);
-    } catch (error) {
-        if (error?.code !== 'ENOENT') throw error;
+function ensureBwrapCodeMountPoint(agentCodePath, relPath) {
+    const segments = String(relPath || '').split('/').filter(Boolean);
+    if (!segments.length || segments.some(segment => segment === '..' || segment === '.')) {
+        throw new Error(`[bwrap] invalid /code mount point '${relPath}'`);
     }
-    if (!stat) {
+    let current = agentCodePath;
+    for (const segment of segments) {
+        current = path.join(current, segment);
+        let stat = null;
         try {
-            fs.mkdirSync(mountPoint);
+            stat = fs.lstatSync(current);
         } catch (error) {
-            if (error?.code !== 'EEXIST') {
-                throw new Error(`[bwrap] cannot create the /code/${name} mount point ${mountPoint}: ${error.message}`);
-            }
+            if (error?.code !== 'ENOENT') throw error;
         }
-        stat = fs.lstatSync(mountPoint);
+        if (!stat) {
+            try {
+                fs.mkdirSync(current);
+            } catch (error) {
+                if (error?.code !== 'EEXIST') {
+                    throw new Error(`[bwrap] cannot create the /code/${segments.join('/')} mount point ${current}: ${error.message}`);
+                }
+            }
+            stat = fs.lstatSync(current);
+        }
+        if (!stat.isDirectory()) {
+            throw new Error(
+                `[bwrap] ${current} is not a directory, so /code/${segments.join('/')} cannot be mounted over it. `
+                + 'Remove or move it, then restart.'
+            );
+        }
     }
-    if (!stat.isDirectory()) {
+    return current;
+}
+
+/**
+ * The path below /code that a manifest volume target names, or null when the
+ * target is outside /code (or is /code itself). Dependencies are prepared by
+ * Ploinky and mounted read-only at /code/node_modules, so a volume may not
+ * target it; Podman refuses the same targets (assertPodmanCodeMountAllowed).
+ */
+function bwrapCodeVolumeRelativePath(containerPath) {
+    const normalized = path.posix.normalize(String(containerPath || '').replace(/\\/g, '/'));
+    if (!normalized.startsWith('/code/')) return null;
+    const relPath = normalized.slice('/code/'.length).replace(/\/+$/, '');
+    if (!relPath) return null;
+    if (relPath === 'node_modules' || relPath.startsWith('node_modules/')) {
         throw new Error(
-            `[bwrap] ${mountPoint} is not a directory, so /code/${name} cannot be mounted over it. `
-            + 'Remove or move it, then restart.'
+            `[bwrap] manifest volume '${containerPath}' targets reserved /code/node_modules. `
+            + 'Dependencies are prepared by Ploinky and mounted read-only.'
         );
     }
-    return mountPoint;
+    return relPath;
 }
 
 function resolveSymlinkPath(symlinkPath) {
@@ -645,6 +676,8 @@ function buildBwrapArgs(options) {
                 || volumeOptions[String(containerPath || '').replace(/\/+$/, '')]
                 || {};
             ensureManifestVolumeHostPath(resolvedHostPath, containerPath, mountOptions);
+            const codeRelPath = bwrapCodeVolumeRelativePath(containerPath);
+            if (codeRelPath && codeReadOnly) ensureBwrapCodeMountPoint(agentCodePath, codeRelPath);
             args.push(mountOptions.readOnly === true ? '--ro-bind' : '--bind', resolvedHostPath, containerPath);
         }
     }
