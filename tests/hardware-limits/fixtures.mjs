@@ -690,6 +690,8 @@ export function buildRequiredCaseManifest() {
             // The swap cap is part of the budget.
             'LLM2.the-swap-cap-must-be-exactly-zero-after-apply-and-in-every-sample',
             'LLM2.the-analysis-refuses-an-unlimited-nonzero-or-missing-swap-cap-in-any-sample',
+            // Stage 1 judges how the calibration process ended.
+            'LLM4.stage-one-rejects-every-abnormal-completion-whatever-the-document-says-and-keeps-a-normal-completion',
             'G2.provision-copies-the-local-llm-tree-pins-its-image-and-grants-the-gpu-before-the-start',
             'G2.provision-blocks-a-changed-tree-or-manifest-and-an-image-the-agent-was-not-created-from',
             'G2.L1-passes-budget-cgroup-runner-environment-uid-generation-text-and-digests',

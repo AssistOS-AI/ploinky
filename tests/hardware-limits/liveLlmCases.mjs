@@ -16,7 +16,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { cpuMaxMatches } from '../../cli/sandbox/hardwareLimits/cpuQuota.mjs';
 import { resolveMemoryPercent } from '../../cli/sandbox/hardwareLimits/resolve.mjs';
-import { blocked, boundedTail, checkedJson } from './liveCommon.mjs';
+import { blocked, boundedTail, checkedJson, commandTails } from './liveCommon.mjs';
 import { LEAF_OBSERVATION } from './liveCaseCommands.mjs';
 import { agentLeaf, createHostProc } from './liveGpuHost.mjs';
 import { createGpuCases } from './liveGpuCases.mjs';
@@ -431,7 +431,19 @@ export function createLlmCases(ctx) {
     // LIVE-L3: vLLM under an MPS share (plan 12.2). Step 0 checks that the install can work
     // here; stage 1 calibrates (no model launch); stage 2 starts the model through the
     // product's public admission, which refuses until a reviewed tuple is in the data.
-    function vllmDocument(result, label) {
+    // A tool's document counts only when its process ended normally: a timeout, a signal, truncated output, a spawn
+    // error, a cancellation or a forced settlement never certifies it, whatever stdout holds. A nonzero exit status is
+    // allowed (the tool reports a blocker that way) because that is a normal completion, judged by its document.
+    function vllmDocument(result, label, evidence) {
+        const abnormal = [result?.timedOut && 'timed out', result?.signal && `killed by ${result.signal}`, result?.truncated && 'output truncated', result?.errorCode && `error ${result.errorCode}`,
+            result?.cancelled && 'cancelled', result?.settlementForced && 'forced settlement', !Number.isInteger(result?.status) && 'no exit status'].filter(Boolean);
+        if (abnormal.length) {
+            // The failed process stays evidence: its flags and bounded, redacted tails.
+            const record = { label, abnormal, ...commandTails(result ?? {}, { maxBytes: 4096 }) };
+            safeArtifact('llm-l3-process-failure', record);
+            evidence?.put('processFailure', { label, abnormal, status: result?.status ?? null, signal: result?.signal ?? null, timedOut: Boolean(result?.timedOut) });
+            throw new Error(`${label} did not complete normally (${abnormal.join(', ')}); its output is not accepted`);
+        }
         let doc = null;
         try { doc = JSON.parse(result.stdout); } catch { doc = null; }
         if (!doc || typeof doc.ok !== 'boolean') throw blocked(`${label} gave no document (exit ${result.status}): ${boundedTail(result.stderr || result.stdout, 300).text}`);
@@ -474,7 +486,7 @@ export function createLlmCases(ctx) {
 
             // STEP 0: does the pinned image's lock offer a vLLM install that can work here?
             await gate.check('L3-step0');
-            const pre = vllmDocument(await observe('llm-vllm-prerequisites', [...nested, 'container', 'exec', agent.id, 'node', ...vllmToolWords('prerequisites', { pins: l3.pins })], { deadlineMs: timings.prerequisiteMs, tolerate: true }), 'The prerequisite check');
+            const pre = vllmDocument(await observe('llm-vllm-prerequisites', [...nested, 'container', 'exec', agent.id, 'node', ...vllmToolWords('prerequisites', { pins: l3.pins })], { deadlineMs: timings.prerequisiteMs, tolerate: true }), 'The prerequisite check', evidence);
             evidence.put('prerequisites', pre);
             if (!pre.ok) throw blocked(`LIVE-L3 step 0: vLLM cannot be installed from the pinned image on this host: ${blockerText(pre)}`);
             expects(pre.facts?.lock?.vllm?.runnerLockDigest === l3.pins.runnerLockDigest && pre.facts.driverVersion === gpu.driverVersion, 'The prerequisite report differs from the pinned lock entry or driver');
@@ -504,7 +516,7 @@ export function createLlmCases(ctx) {
         await gate.check('L3-calibrate');
         const hostNvmlBytes = gate.baseline.memory.totalMiB * MIB;
         const result = await gate.monitor(abort => observe('llm-vllm-calibrate', [...nested, 'container', 'exec', agent.id, 'node', ...vllmToolWords('calibrate', { hostNvmlBytes })], { deadlineMs: timings.calibrateMs, tolerate: true, abort }));
-        const doc = vllmDocument(result, 'The calibration');
+        const doc = vllmDocument(result, 'The calibration', evidence);
         safeArtifact('llm-l3-calibration', doc);
         evidence.put('calibration', doc.evidence ? { ok: doc.ok, blockers: doc.blockers, verdict: doc.evidence.verdict, tuple: doc.evidence.tuple, evidenceDigest: doc.evidence.evidenceDigest, denominator: doc.evidence.denominator, measurements: doc.evidence.measurements, argv: doc.evidence.argv, admission: doc.evidence.admission, sizing: doc.evidence.sizing } : { ok: doc.ok, blockers: doc.blockers });
         if (!doc.ok) throw blocked(`LIVE-L3 stage 1: the calibration could not run: ${blockerText(doc)}`);

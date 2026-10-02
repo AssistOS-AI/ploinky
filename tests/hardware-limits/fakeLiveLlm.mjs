@@ -287,12 +287,14 @@ export function createLlmWorld({ statePath, node, engine, host, gpu, faults = {}
         if (faults.vllmDriverOld) blockers.push({ code: 'driver_too_old', message: 'Driver 570.86.10 is older than the 580 that CUDA 13.0 wheels need.', evidence: {} });
         const digest = faults.vllmWrongPins ? hex('another entry') : pins.runnerLockDigest;
         const doc = { schema: 'local-llm.vllm-prerequisites/v1', ok: blockers.length === 0, blockers, facts: { arch: 'x64', driverVersion: gpu.driverVersion, python: { major: 3, minor: 13 }, lock: { sha256: hex('lock'), vllm: { version: pins.version, kind: 'python', runnerLockDigest: digest, files: pins.files, downloadBytes: pins.downloadBytes, distributions: { vllm: pins.version, torch: '2.13.0' }, cudaRuntime: { major: 13, minor: 0 } } }, disk: { sameFilesystem: true } } };
-        return ok(`${JSON.stringify(doc)}\n`, { status: doc.ok ? 0 : 3 });
+        return ok(`${JSON.stringify(doc)}\n`, { status: doc.ok ? 0 : 3, ...(faults.prerequisitesProcess ?? {}) });
     }
     function calibration(words) {
         const host = Number(words[words.indexOf('--host-nvml-bytes') + 1]);
         L.vllmCalls.push({ command: 'calibrate', hostNvmlBytes: host });
         if (faults.calibrateBlocked) return ok(`${JSON.stringify({ schema: 'local-llm.vllm-mps-calibration/v1', ok: false, blockers: [{ code: 'vllm_not_installed', message: 'vLLM is not installed', evidence: {} }], evidence: null })}\n`, { status: 3 });
+        // The calibration process ended abnormally (a complete document may still be on stdout).
+        const abnormal = faults.calibrateProcess ?? null;
         const pins = lockPins();
         const share = agent().share;
         const physical = faults.denominator !== 'share';
@@ -315,7 +317,7 @@ export function createLlmWorld({ statePath, node, engine, host, gpu, faults = {}
             const entry = { ...tuple, denominator: 'physical-device', evidenceDigest: evidence.evidenceDigest };
             doc.proposed = faults.noProposal ? undefined : { entry: faults.proposalWrongDigest ? { ...entry, evidenceDigest: hex('x') } : entry, digest: evidence.evidenceDigest, source: '    Object.freeze({ ... }),' };
         }
-        return ok(`${JSON.stringify(doc)}\n`);
+        return ok(`${JSON.stringify(doc)}\n`, abnormal ?? {});
     }
     async function core({ script, rest }) {
         if (script === LLM_TOOL_CALL) {

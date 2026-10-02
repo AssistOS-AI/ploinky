@@ -1187,3 +1187,44 @@ test('LLM2.the-analysis-refuses-an-unlimited-nonzero-or-missing-swap-cap-in-any-
     assert.deepEqual(parseLeafSample({ atNs: '1', 'cpu.stat': 'usage_usec 1\n', 'memory.swap.max': 'max\n' }).swapMax, 'max');
     assert.equal(parseLeafSample({ atNs: '1', 'cpu.stat': 'usage_usec 1\n' }).swapMax, null);
 });
+
+// --- LLM4: stage 1 judges how the calibration process ended, not only its output ----------------------------------
+test('LLM4.stage-one-rejects-every-abnormal-completion-whatever-the-document-says-and-keeps-a-normal-completion', async t => {
+    for (const [label, process, pattern] of [
+        ['a timeout with a complete document', { status: null, signal: 'SIGKILL', timedOut: true }, /timed out, killed by SIGKILL, no exit status/],
+        ['a signal', { status: null, signal: 'SIGTERM' }, /killed by SIGTERM/],
+        ['truncated output', { truncated: true }, /output truncated/],
+        ['a spawn error', { status: null, errorCode: 'ENOENT' }, /error ENOENT/],
+        ['a forced settlement', { settlementForced: true }, /forced settlement/],
+        ['no exit status', { status: null }, /no exit status/],
+        ['a cancellation', { cancelled: true }, /was cancelled/],
+    ]) {
+        const w = await provisioned(t, { block: 'apparatus-vllm', faults: { calibrateProcess: process } });
+        const report = await liveCases(w, ['LIVE-L3']);
+        const l3 = caseOf(report, 'LIVE-L3');
+        assert.equal(l3.result, 'fail', `${label}: ${JSON.stringify(l3).slice(0, 500)}`); assert.match(l3.reason, pattern, label);
+        assert.equal(report.verdict, 'FAIL', label);
+        const artifact = w.artifacts.get('gpu-live-l3');
+        assert.equal(artifact.proposedEntry, undefined, `${label}: no entry is proposed from a calibration that did not complete`);
+        assert.equal(artifact.calibration, undefined, label);
+        if (!process.cancelled) {
+            assert.deepEqual(w.artifacts.get('llm-l3-process-failure').label, 'The calibration', label);
+            assert.equal(w.artifacts.has('llm-l3-calibration'), false, `${label}: the document is not kept as a calibration`);
+        }
+        nothingOwned(w);
+    }
+    // The prerequisite check is judged the same way.
+    const pre = await provisioned(t, { block: 'apparatus-vllm', faults: { prerequisitesProcess: { status: null, signal: 'SIGKILL', timedOut: true } } });
+    const preReport = caseOf(await liveCases(pre, ['LIVE-L3']), 'LIVE-L3');
+    assert.equal(preReport.result, 'fail'); assert.match(preReport.reason, /The prerequisite check did not complete normally \(timed out/);
+    assert.equal(toolCalls(pre, 'local_llm_runner_install').length, 0); nothingOwned(pre);
+    // A normally completed BLOCKED report from the tool stays a BLOCKED report, not an error; a normal success still passes.
+    const blockedByTool = await provisioned(t, { block: 'apparatus-vllm', faults: { calibrateBlocked: true } });
+    const blockedEntry = caseOf(await liveCases(blockedByTool, ['LIVE-L3']), 'LIVE-L3');
+    assert.equal(blockedEntry.result, 'blocked'); assert.match(blockedEntry.reason, /the calibration could not run: vllm_not_installed/);
+    assert.equal(blockedByTool.artifacts.has('llm-l3-process-failure'), false); nothingOwned(blockedByTool);
+    const prerequisiteBlocked = await provisioned(t, { block: 'apparatus-vllm', faults: { vllmDiskShort: true } });
+    assert.match(caseOf(await liveCases(prerequisiteBlocked, ['LIVE-L3']), 'LIVE-L3').reason, /insufficient_disk/);
+    const good = await provisioned(t, { block: 'apparatus-vllm' });
+    assert.equal(caseOf(await liveCases(good, ['LIVE-L3']), 'LIVE-L3').result, 'pass'); nothingOwned(good);
+});
