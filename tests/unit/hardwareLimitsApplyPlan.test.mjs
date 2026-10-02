@@ -87,6 +87,8 @@ test('Z3b.the-graph-planning-of-that-record-resolves-the-persisted-profile-and-a
     const record = readAgentRegistrySnapshot()[keyOf('probe')];
     const graph = resolveWorkspaceDependencyGraph({ staticAgentRef: `${REPOSITORY}/probe`, registry: readAgentRegistrySnapshot(), rootAlias: '', rootProfile: record.profile });
     assert.equal(graph.nodes.get(`${REPOSITORY}/probe`).profile, 'default');
+    // The fixture's shape: the probe enables peer and cpu, whose records carry 'default' too.
+    assert.deepEqual([...graph.nodes.values()].map(node => [node.agentRef, node.profile]).sort(), [[`${REPOSITORY}/cpu`, 'default'], [`${REPOSITORY}/peer`, 'default'], [`${REPOSITORY}/probe`, 'default']]);
     assert.throws(() => resolveWorkspaceDependencyGraph({ staticAgentRef: `${REPOSITORY}/probe`, registry: readAgentRegistrySnapshot(), rootProfile: 'gpu' }), /profile 'gpu' is not defined by hwlfixture\/probe; available profiles: \(none\)/);
 });
 

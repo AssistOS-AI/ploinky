@@ -2764,3 +2764,16 @@ test('resolveWorkspaceDependencyGraph resolves an explicit default on a profile-
     writeManifest('depDefault', 'twice', { container: 'node:20-alpine', enable: ['depDefault/leaf', { agent: 'depDefault/leaf', profile: 'default' }] });
     assert.equal(resolveWorkspaceDependencyGraph({ staticAgentRef: 'depDefault/twice' }).nodes.get('depDefault/leaf').profile, 'default');
 });
+
+// The live fixture's shape: a profile-less root that enables two profile-less agents, every registry record carrying the
+// resolved profile 'default' (what the product persists), the root's handed back as an explicit root profile (Apply).
+test('resolveWorkspaceDependencyGraph resolves a profile-less root and the two profile-less agents it enables to default from registry records', () => {
+    for (const name of ['probe', 'peer', 'cpu']) writeManifest('liveShape', name, { container: 'node:20-alpine', ...(name === 'probe' ? { enable: ['liveShape/peer', 'liveShape/cpu'] } : {}) });
+    const record = (name, index) => ({ type: 'agent', repoName: 'liveShape', agentName: name, instanceId: `i-${name}`, enableGeneration: `g-${name}`, containerId: String(index + 1).repeat(64), profile: 'default' });
+    const registry = Object.fromEntries(['probe', 'peer', 'cpu'].map((name, index) => [`ploinky_liveShape_${name}`, record(name, index)]));
+    for (const rootProfile of ['default', '']) {
+        const graph = resolveWorkspaceDependencyGraph({ staticAgentRef: 'liveShape/probe', registry, rootAlias: '', rootProfile });
+        assert.deepEqual([...graph.nodes.keys()].sort(), ['liveShape/cpu', 'liveShape/peer', 'liveShape/probe'], `root profile '${rootProfile}'`);
+        for (const node of graph.nodes.values()) assert.equal(node.profile, 'default', `${node.agentRef} with root profile '${rootProfile}'`);
+    }
+});
