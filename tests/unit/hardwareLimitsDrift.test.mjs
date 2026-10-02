@@ -27,6 +27,7 @@ import { HARDWARE_UNENFORCEABLE, HardwareLimitsError, findHardwareOutcome } from
 import { assertHardwareStateConfined } from '../../cli/sandbox/hardwareLimits/store.mjs';
 import { buildDirectRefusal } from '../../cli/sandbox/hardwareLimits/requestedLimits.mjs';
 import { prepareLlmStartup, resolveLlmRuntimeAdmissionContext } from '../../cli/sandbox/docker/llmRuntimeIntegration.js';
+import { detectHardware } from '../../cli/sandbox/docker/hardwareDetection.js';
 import { assertInteractiveHardwareLimitsAbsent } from '../../cli/sandbox/docker/interactive.js';
 import { getRuntimeForAgent } from '../../cli/sandbox/docker/common.js';
 import { preparedCgroupFs } from '../hardware-limits/fakeCgroupFs.mjs';
@@ -34,6 +35,8 @@ import { preparedCgroupFs } from '../hardware-limits/fakeCgroupFs.mjs';
 const ALL = Object.freeze(['cpu', 'memory', 'pids']);
 const LIMITED = Object.freeze({ container: 'node:20-alpine', llmRuntime: { runtimePolicy: { resources: { memory: '512m', cpus: 0.5, pidsLimit: 128 } } } });
 const UNLIMITED = Object.freeze({ container: 'node:20-alpine' });
+// Fixed hardware facts: no probe command runs and no engine is inspected.
+const OFFLINE_HARDWARE = detectHardware({ runtime: 'podman', arch: 'x64', probes: {}, podmanInspect: () => null });
 
 function source(relative) {
     return fs.readFileSync(new URL(`../../${relative}`, import.meta.url), 'utf8');
@@ -391,7 +394,7 @@ test('D.llm-admitted-policy-reuse', (t) => {
     const box = inBox(t);
     const { root, env } = llmCatalog(t);
     const manifest = { container: 'node:20-alpine', llmRuntime: { enabled: true } };
-    const llm = resolveLlmRuntimeAdmissionContext({ runtime: 'podman', manifest, profileConfig: null, agentName: 'llm', env });
+    const llm = resolveLlmRuntimeAdmissionContext({ runtime: 'podman', manifest, profileConfig: null, agentName: 'llm', env, resolvedHardware: OFFLINE_HARDWARE });
     // A stored administrator override (cpus 1.5) is the final policy layer.
     const admission = admit(box, manifest, {
         agentId: 'demo/llm', catalogPolicy: llm.catalogPolicy, catalogIdentity: llm.catalogIdentity,
@@ -662,7 +665,7 @@ test('D.service-llm-reuse', (t) => {
     const box = inBox(t);
     const { root, env } = llmCatalog(t);
     const manifest = { container: 'node:20-alpine', llmRuntime: { enabled: true } };
-    const llm = resolveLlmRuntimeAdmissionContext({ runtime: 'podman', manifest, profileConfig: null, agentName: 'llm', env });
+    const llm = resolveLlmRuntimeAdmissionContext({ runtime: 'podman', manifest, profileConfig: null, agentName: 'llm', env, resolvedHardware: OFFLINE_HARDWARE });
     const admission = admit(box, manifest, {
         agentId: 'demo/llm', catalogPolicy: llm.catalogPolicy, catalogIdentity: llm.catalogIdentity,
         hardwareContext: prepared(new Map([['demo/llm', { cpus: '1.5' }]])),

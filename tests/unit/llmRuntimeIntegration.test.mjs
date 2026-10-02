@@ -8,6 +8,10 @@ import {
     isLlmRuntimeManifest,
     prepareLlmStartup,
 } from '../../cli/sandbox/docker/llmRuntimeIntegration.js';
+import { detectHardware } from '../../cli/sandbox/docker/hardwareDetection.js';
+
+// Fixed hardware facts: no probe command runs and no engine is inspected.
+const OFFLINE_HARDWARE = detectHardware({ runtime: 'docker', arch: 'x64', probes: {}, dockerInspect: () => null });
 
 function withTempDirs(fn) {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-llm-integration-'));
@@ -91,6 +95,7 @@ test('prepareLlmStartup selects catalog architecture and writes state file', () 
                 'PLOINKY_AGENT_PRINCIPAL',
             ],
             envHash: 'envhash-abc',
+            resolvedHardware: OFFLINE_HARDWARE,
             effectiveNetwork: null,
         });
         assert.equal(result.enabled, true);
@@ -136,6 +141,7 @@ test('prepareLlmStartup writeState:false skips state file write', () => {
             },
             agentWorkDirRoot: agentsRoot,
             envHash: 'envhash-abc',
+            resolvedHardware: OFFLINE_HARDWARE,
             writeState: false,
         });
         assert.equal(result.enabled, true);
@@ -160,6 +166,7 @@ test('prepareLlmStartup reuse hash changes when image digest or policy changes',
             },
             agentWorkDirRoot: agentsRoot,
             envHash: 'envhash-abc',
+            resolvedHardware: OFFLINE_HARDWARE,
             writeState: false,
         });
 
@@ -180,6 +187,7 @@ test('prepareLlmStartup reuse hash changes when image digest or policy changes',
             },
             agentWorkDirRoot: agentsRoot,
             envHash: 'envhash-abc',
+            resolvedHardware: OFFLINE_HARDWARE,
             writeState: false,
         });
 
