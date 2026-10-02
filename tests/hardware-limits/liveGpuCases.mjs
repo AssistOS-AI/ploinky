@@ -20,7 +20,7 @@ import { createHostProc, boxCgroupPrefix, agentLeaf } from './liveGpuHost.mjs';
 import { parseGpuInventory } from './liveGpu.mjs';
 import { createGpuGate, finalGpuObservation, gpuQueryArgv } from './liveGpuGate.mjs';
 import {
-    ADMIN_REQUEST, GPU_AGENT_INSPECT, GPU_SHARES, MIB, MPS_CLIENT_PIPE, MPS_KILL_OWNED_DAEMON, MPS_OBSERVE, NESTED_NAME_LIST_FORMAT, PROBE_DEADLINE_MS,
+    ADMIN_REQUEST, GPU_AGENT_INSPECT, GPU_SHARES, MIB, MPS_CLIENT_PIPE, GPU_GRANT_FACTS, MPS_KILL_OWNED_DAEMON, MPS_OBSERVE, NESTED_NAME_LIST_FORMAT, PROBE_DEADLINE_MS,
     MPS_CLIENT_USER, TIGHTER_CLIENT, assertMpsControlCommand, classifyMpsReply, controlHelperExecArgv, controlHelperRunArgv, parseProbeResult, probeBoundMiB, probeExecArgv, shareMemoryMiB,
 } from './liveGpuCommands.mjs';
 
@@ -374,6 +374,13 @@ export function createGpuCases(ctx) {
             const before = await admin.state();
             evidence.put('administratorState', { gate: before.gate, gpu: before.gpu });
             needs(before.gate?.state === 'on', 'The Box hardware-limits gate is not on');
+            // When sharing is not eligible, the read-only facts that explain why are recorded first (grant marker,
+            // bound tools, the observation with and without the loader path), then the case stops as before.
+            if (!(before.gpu?.eligible === true && before.gpu.mode === 'mps-shared')) {
+                evidence.put('gpuStatusReason', { code: before.gpu?.code ?? null, reason: String(before.gpu?.reason ?? '').slice(0, 600), causeCode: before.gpu?.causeCode ?? null });
+                try { evidence.put('grantFacts', checkedJson(await observe('p1-grant-facts', [...core, 'node', '-e', GPU_GRANT_FACTS]))); }
+                catch (error) { evidence.put('grantFacts', { error: String(error?.message || error).slice(0, 300) }); }
+            }
             needs(before.gpu?.eligible === true && before.gpu.mode === 'mps-shared', `MPS sharing is not eligible in this Box: ${String(before.gpu?.reason || 'no reason').slice(0, 300)}`);
             needs(before.gpu.deviceUuid === gpu.uuid && before.gpu.memoryModel === 'dedicated' && before.gpu.driverVersion === gpu.driverVersion && before.gpu.deviceMemoryBytes === gpu.memoryMiB * MIB,
                 'The Box reports another device, memory model, driver version or memory than the pinned ones');

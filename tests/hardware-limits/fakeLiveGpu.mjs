@@ -19,7 +19,7 @@ import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { createFakeWorld, evaluateTemplate, ok, worldState } from './fakeLiveEngine.mjs';
 import { fixtureContainerName } from './liveFixture.mjs';
 import {
-    ADMIN_REQUEST, GPU_AGENT_INSPECT, MPS_KILL_OWNED_DAEMON, MPS_OBSERVE, NESTED_NAME_LIST_FORMAT, shareMemoryMiB,
+    ADMIN_REQUEST, GPU_AGENT_INSPECT, GPU_GRANT_FACTS, MPS_KILL_OWNED_DAEMON, MPS_OBSERVE, NESTED_NAME_LIST_FORMAT, shareMemoryMiB,
 } from './liveGpuCommands.mjs';
 
 const hex = value => crypto.createHash('sha256').update(String(value)).digest('hex');
@@ -352,6 +352,12 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
             model.programs.push({ program: 'admin', method: rest[0], body: rest[1] });
             const reply = await admin(rest[0], rest[1]);
             return ok(JSON.stringify(reply));
+        }
+        if (script === GPU_GRANT_FACTS) {
+            model.programs.push({ program: 'grant-facts' });
+            const smi = (stdout, stderr = '') => ({ status: stdout ? 0 : 127, signal: null, error: null, stdout, stderr });
+            return ok(JSON.stringify({ marker: { state: 'active', reason: null, fingerprint: 'f'.repeat(64), driverVersion: gpu.driverVersion, devices: 2, mps: ['control', 'server'], mpsProblem: null },
+                tools: {}, smi: { bare: smi('', 'NVIDIA-SMI has failed: libnvidia-ml.so.1: cannot open shared object file'), withLoaderPath: smi(`0, ${gpu.uuid}, ${gpu.name}, ${gpu.memoryMiB}, ${gpu.driverVersion}`) } }));
         }
         if (script === MPS_OBSERVE) { model.programs.push({ program: 'observe' }); return ok(JSON.stringify(mpsObserve())); }
         if (script === MPS_KILL_OWNED_DAEMON) {

@@ -58,7 +58,14 @@ test('MP.tool-only-fingerprint', (t) => {
 test('MP.missing-tools-ordinary-grant', (t) => {
     const { root, identity, wiring } = fixture(t);
     const actual = resolveDesiredGpuWiring(identity, grant, [], { discover: () => discovery, homeDirectory: root, mpsEnabled: true, discoverMps: () => { throw new Error('missing'); } });
-    assert.deepEqual(actual, wiring()); assert.equal(actual.state, 'active');
+    // Still an ordinary active grant: same agents, devices, driver and mounts, without the MPS tools. Only the
+    // recorded cause (and so the content-addressed generation that carries it) differs.
+    const ordinary = wiring();
+    assert.equal(actual.state, 'active'); assert.equal(actual.mps, undefined); assert.equal(actual.mpsProblem, 'missing');
+    assert.notEqual(actual.fingerprint, ordinary.fingerprint);
+    const common = ({ fingerprint, files, mounts, mpsProblem, ...rest }) => ({ rest, destinations: mounts.map(mount => mount.destination) });
+    assert.deepEqual(common(actual), common(ordinary));
+    assert.match(actual.files.find(file => file.path.endsWith('marker.json')).content, /"mpsProblem": "missing"/);
 });
 test('MP.uid-predicate', () => {
     const imageId = 'a'.repeat(64);

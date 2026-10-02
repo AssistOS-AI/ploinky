@@ -464,6 +464,7 @@ export function buildGpuWiring({
     denied = [],
     workspaceDenied = false,
     mps = null,
+    mpsFailure = null,
     homeDirectory = os.homedir(),
 }) {
     exactIdentity(identity);
@@ -494,6 +495,9 @@ export function buildGpuWiring({
     const state = revoked ? 'revoked' : discovery ? 'active' : 'stale';
     if (mps) { validateMpsTools(mps); if (!discovery) throw grantError('MPS tools require active GPU wiring'); }
     const reason = discovery || revoked ? null : singleLine(failure?.message || failure);
+    // Why the host's MPS tools were not wired although the gate asked for them: kept in the marker (bounded, one
+    // line), so the Box's own status can say it instead of a generic refusal. Present only then.
+    const mpsProblem = discovery && !mps && mpsFailure ? singleLine(mpsFailure?.message || mpsFailure, 400) : null;
     // The fingerprint binds the exact workspace, the operator decision and the
     // discovered driver files, so it names one generation of one workspace.
     const fingerprint = sha256(canonicalJson({
@@ -511,6 +515,7 @@ export function buildGpuWiring({
         libraries: discovery?.libraries ?? [],
         tools: discovery?.tools ?? [],
         ...(mps ? { mps } : {}),
+        ...(mpsProblem ? { mpsProblem } : {}),
     }));
     const generation = gpuGenerationDirectory(identity, fingerprint, homeDirectory);
     const specText = discovery ? renderBoxCdiSpec(discovery) : null;
@@ -529,6 +534,7 @@ export function buildGpuWiring({
         specSha256: specText ? sha256(specText) : null,
         ...denials,
         ...(mps ? { mps } : {}),
+        ...(mpsProblem ? { mpsProblem } : {}),
     }, null, 2)}\n`;
     const specPath = path.join(generation, 'box.json');
     const markerPath = path.join(generation, 'marker.json');
@@ -557,6 +563,7 @@ export function buildGpuWiring({
         workspaceDenied: workspaceDenied === true,
         driverVersion: discovery?.driverVersion ?? null,
         ...(mps ? { mps: Object.freeze(mps) } : {}),
+        ...(mpsProblem ? { mpsProblem } : {}),
         devices: Object.freeze((discovery?.devices ?? []).map((device) => device.path)),
         mounts: Object.freeze(mounts.map((mount) => Object.freeze(mount))),
         files: Object.freeze([
@@ -613,8 +620,12 @@ export function resolveDesiredGpuWiring(identity, decision, declared = [], {
             return buildGpuWiring({ identity, grant, failure: error, ...denials, homeDirectory });
         }
         let mps = null;
-        if (mpsEnabled) { try { mps = discoverMps(); validateMpsTools(mps); } catch (_) { mps = null; } }
-        return buildGpuWiring({ identity, grant, discovery, ...denials, mps, homeDirectory });
+        let mpsFailure = null;
+        if (mpsEnabled) {
+            try { mps = discoverMps(); validateMpsTools(mps); }
+            catch (error) { mps = null; mpsFailure = String(error?.message || error || 'MPS tool discovery failed'); }
+        }
+        return buildGpuWiring({ identity, grant, discovery, ...denials, mps, ...(mpsFailure ? { mpsFailure } : {}), homeDirectory });
     }
     if (access.denied.length || access.workspaceDenied) {
         return buildGpuWiring({ identity, grant: { vendor: access.vendor }, revoked: true, ...denials, homeDirectory });

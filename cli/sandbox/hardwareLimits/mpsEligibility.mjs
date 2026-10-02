@@ -40,9 +40,25 @@ export function parseMpsGpuObservation(text) {
     return Object.freeze({ index: 0, uuid: fields[1], name: fields[2], memoryMiB, driverVersion: fields[4], memoryModel });
 }
 
+// The Box image has no loader path for the bound driver libraries (they sit under /usr/local/nvidia/lib64,
+// which neither its loader cache nor its environment names), so the bound nvidia-smi cannot load
+// libnvidia-ml.so.1 unless the caller names the directory, as every other consumer of those libraries does.
+export const MPS_OBSERVATION_ENVIRONMENT = Object.freeze({ PATH: '/usr/local/nvidia/bin:/usr/bin:/bin', LD_LIBRARY_PATH: '/usr/local/nvidia/lib64' });
+
+// What a failed observation looked like, bounded and secret-free: the exit state and the first words of stderr.
+function observationFailure(result) {
+    const parts = [];
+    if (result.error) parts.push(`error ${String(result.error.code || result.error.message).slice(0, 40)}`);
+    if (result.signal) parts.push(`signal ${String(result.signal).slice(0, 20)}`);
+    if (Number.isInteger(result.status) && result.status !== 0) parts.push(`exit ${result.status}`);
+    const stderr = String(result.stderr || '').replace(/[^\x20-\x7e]+/g, ' ').trim().slice(0, 200);
+    if (stderr) parts.push(`stderr: ${stderr}`);
+    return parts.length ? ` (${parts.join(', ')})` : '';
+}
+
 export function observeMpsGpu({ query = spawnSync } = {}) {
-    const result = query('/usr/local/nvidia/bin/nvidia-smi', ['-i', '0', '--query-gpu=index,uuid,name,memory.total,driver_version', '--format=csv,noheader,nounits'], { encoding: 'utf8', timeout: 5000, maxBuffer: 8192, stdio: ['ignore', 'pipe', 'pipe'] });
-    if (result.status !== 0 || result.signal || result.error || Buffer.byteLength(String(result.stdout || '')) > 8192) throw new MpsError('GPU observation failed or timed out');
+    const result = query('/usr/local/nvidia/bin/nvidia-smi', ['-i', '0', '--query-gpu=index,uuid,name,memory.total,driver_version', '--format=csv,noheader,nounits'], { encoding: 'utf8', timeout: 5000, maxBuffer: 8192, stdio: ['ignore', 'pipe', 'pipe'], env: { ...MPS_OBSERVATION_ENVIRONMENT } });
+    if (result.status !== 0 || result.signal || result.error || Buffer.byteLength(String(result.stdout || '')) > 8192) throw new MpsError(`GPU observation failed or timed out${observationFailure(result)}`);
     return parseMpsGpuObservation(result.stdout);
 }
 

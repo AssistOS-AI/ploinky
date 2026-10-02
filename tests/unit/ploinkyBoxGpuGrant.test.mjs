@@ -2524,3 +2524,112 @@ for (const [operation, invoke] of [
         for (const gpu of requested) assert.deepEqual(gpu?.mps, tools, `${operation} wires both MPS tools from the requested gate`);
     });
 }
+
+// The real apparatus-mps LIVE-P1 sequence: the gate requested through the
+// environment, the host's wiring written by a real restart, the Box reading
+// its mounted marker and then the GPU through the bound nvidia-smi. The Box
+// image has no loader path for the bound driver libraries, so the observation
+// works only when it names them itself; and when the host's MPS tools were not
+// wired, the status says why instead of a generic refusal.
+async function restartedMarker(t, discoverGpuMpsTools, { toolsRoot = null } = {}) {
+    const box = graphBox(t);
+    const home = useTempHome(t, box.root);
+    useFakeHostFiles(t, fakeHost());
+    const { createHardwareGateStore } = await import('../../ploinky-box/hardwareLimitsGate.mjs');
+    const gateStore = createHardwareGateStore({ homeDirectory: home });
+    gateStore.write(box.identity, false, box.lock);
+    const events = [];
+    const requested = [];
+    const supervisor = gpuSupervisor(box, events, {
+        env: { PLOINKY_BOX_HARDWARE_LIMITS: 'on' },
+        gpuGrantStore: memoryGpuStore(events, Object.freeze({ vendor: 'nvidia', agents: [AGENT], admitted: null })),
+        hardwareGateStore: gateStore,
+        discoverGpuMpsTools,
+        selectAgentLib: async () => ({ selection: box.agentLib, mode: 'local' }),
+        updateAgentLib: async () => ({ selection: box.agentLib, changed: false, previous: null }),
+        updateWorkspacePloinky: async () => ({ found: false }),
+        commitAgentLibSelection: () => {},
+        revalidateAgentLibSource: () => {},
+        captureCoreStartArgv: () => ['start', 'explorer', '8080'],
+        runCoreCommand: async () => { events.push('core'); },
+        validateExistingImage: () => ({ immutableId: `sha256:${'b'.repeat(64)}` }),
+        validateContainer: () => {},
+        async reconcile(options) {
+            requested.push(options.gpu);
+            return { ...prepared(box, 'replaced', options.gpu, events), hardware: options.hardware };
+        },
+        async startCore() { events.push('start-core'); },
+        async healthCheck() { events.push('health'); },
+        prepareHardwareGeneration: async () => ({ structurallyPrepared: true }),
+    });
+    await supervisor.runRestartTransaction(['restart']);
+    const wiring = requested.at(-1);
+    assert.ok(wiring, events.join(' '));
+    // The files the host mounts into the Box, as the Box would read them.
+    for (const file of wiring.files) {
+        fs.mkdirSync(path.dirname(file.path), { recursive: true });
+        fs.writeFileSync(file.path, file.content, { mode: 0o600 });
+    }
+    const byDestination = Object.fromEntries(wiring.mounts.map((mount) => [mount.destination, mount.source]));
+    // The Box sees the bound tools under their destination; the test's stand-in is the host source directory.
+    const remap = (target) => (toolsRoot && String(target).startsWith('/usr/local/nvidia/bin/') ? path.join(toolsRoot, path.basename(target)) : target);
+    const fsApi = { ...fs, realpathSync: (target, ...rest) => fs.realpathSync(remap(target), ...rest), accessSync: (target, ...rest) => fs.accessSync(remap(target), ...rest) };
+    const grant = readBoxGpuGrant({ workspaceRoot: box.identity.workspaceRoot, markerPath: byDestination[BOX_GPU_MARKER_PATH], specPath: byDestination[BOX_GPU_CDI_SPEC_PATH], fsApi });
+    return { box, wiring, grant };
+}
+
+test('P1X.restart-wires-mps-and-the-box-observes-the-gpu-with-the-loader-path', async (t) => {
+    const { readMpsStatus } = await import('../../cli/sandbox/hardwareLimits/mpsStatus.mjs');
+    const { observeMpsGpu } = await import('../../cli/sandbox/hardwareLimits/mpsEligibility.mjs');
+    const toolsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'p1x-tools-'));
+    t.after(() => fs.rmSync(toolsRoot, { recursive: true, force: true }));
+    for (const destination of Object.values(MPS_TOOL_PATHS)) fs.writeFileSync(path.join(toolsRoot, path.basename(destination)), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const tools = discoverMpsTools({ directories: [toolsRoot] });
+    const { box, wiring, grant } = await restartedMarker(t, () => tools, { toolsRoot });
+    assert.deepEqual(wiring.mps, tools);
+    assert.equal(grant.valid, true, grant.problem); assert.equal(grant.state, 'active'); assert.deepEqual(grant.mps, tools);
+    const calls = [];
+    // The bound nvidia-smi fails exactly as it does in the Box image unless it is told where its libraries are.
+    const query = (command, args, options) => {
+        calls.push({ command, env: options?.env });
+        const loadable = String(options?.env?.LD_LIBRARY_PATH || '').split(':').includes('/usr/local/nvidia/lib64');
+        return loadable
+            ? { status: 0, stdout: '0, GPU-11111111-2222-3333-4444-555555555555, NVIDIA RTX PRO 6000 Blackwell, 97887, 580.95.05\n' }
+            : { status: 127, stdout: '', stderr: 'nvidia-smi: error while loading shared libraries: libnvidia-ml.so.1: cannot open shared object file' };
+    };
+    const status = readMpsStatus({ workspaceRoot: box.identity.workspaceRoot, readGrant: () => grant, observeGpu: () => observeMpsGpu({ query }), readState: () => null });
+    assert.equal(status.eligible, true, JSON.stringify({ reason: status.reason, code: status.code }));
+    assert.equal(status.mode, 'mps-shared'); assert.equal(status.deviceUuid, 'GPU-11111111-2222-3333-4444-555555555555');
+    assert.equal(calls.length, 1); assert.equal(calls[0].command, '/usr/local/nvidia/bin/nvidia-smi');
+});
+
+test('P1X.a-failing-observation-names-its-cause-instead-of-a-generic-refusal', async (t) => {
+    const { readMpsStatus } = await import('../../cli/sandbox/hardwareLimits/mpsStatus.mjs');
+    const { observeMpsGpu } = await import('../../cli/sandbox/hardwareLimits/mpsEligibility.mjs');
+    const toolsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'p1x-tools-'));
+    t.after(() => fs.rmSync(toolsRoot, { recursive: true, force: true }));
+    for (const destination of Object.values(MPS_TOOL_PATHS)) fs.writeFileSync(path.join(toolsRoot, path.basename(destination)), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const tools = discoverMpsTools({ directories: [toolsRoot] });
+    const { box, grant } = await restartedMarker(t, () => tools, { toolsRoot });
+    const status = readMpsStatus({
+        workspaceRoot: box.identity.workspaceRoot,
+        readGrant: () => grant,
+        observeGpu: () => observeMpsGpu({ query: () => ({ status: 127, stdout: '', stderr: 'libnvidia-ml.so.1: cannot open shared object file\u0000' }) }),
+        readState: () => null,
+    });
+    assert.equal(status.eligible, false); assert.equal(status.code, 'gpu_sharing_unavailable');
+    assert.match(status.reason, /exit 127/); assert.match(status.reason, /libnvidia-ml\.so\.1: cannot open shared object file/);
+    assert.ok(status.reason.length <= 600); assert.doesNotMatch(status.reason, /[\u0000-\u001f]/);
+});
+
+test('P1X.control-mps-tool-discovery-failure-reaches-the-box-status-with-its-cause', async (t) => {
+    const { readMpsStatus } = await import('../../cli/sandbox/hardwareLimits/mpsStatus.mjs');
+    const { box, wiring, grant } = await restartedMarker(t, () => { throw new Error('nvidia-cuda-mps-server is not an executable file'); });
+    assert.equal(wiring.mps, undefined);
+    assert.equal(grant.valid, true, grant.problem); assert.equal(grant.state, 'active'); assert.equal(grant.mps, undefined);
+    assert.match(grant.mpsDiscoveryProblem, /nvidia-cuda-mps-server is not an executable file/);
+    const status = readMpsStatus({ workspaceRoot: box.identity.workspaceRoot, readGrant: () => grant, observeGpu: () => assert.fail('no observation without wired tools') });
+    assert.equal(status.eligible, false); assert.equal(status.code, 'gpu_sharing_unavailable');
+    assert.match(status.reason, /nvidia-cuda-mps-server is not an executable file/);
+    assert.match(status.reason, /were not wired when the Box was created/);
+});

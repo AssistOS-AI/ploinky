@@ -36,7 +36,7 @@ const MARKER_KEYS = Object.freeze([
     'workspaceRoot',
 ]);
 // Present only when the operator's denies hide a manifest-declared agent (D14).
-const OPTIONAL_MARKER_KEYS = Object.freeze(['denied', 'workspaceDenied', 'mps']);
+const OPTIONAL_MARKER_KEYS = Object.freeze(['denied', 'workspaceDenied', 'mps', 'mpsProblem']);
 const SELECTOR_SEGMENT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
 /** REPO/AGENT, the same two segments Ploinky resolves agents by. */
@@ -145,6 +145,12 @@ export function readBoxGpuGrant({
             mps = marker.mps;
         } catch (error) { mpsProblem = `MPS tools are unavailable: ${error.message}`; }
     }
+    // Why the host did not wire the MPS tools (discovery failed when the Box was created): one bounded line.
+    let mpsDiscoveryProblem = null;
+    if (Object.hasOwn(marker, 'mpsProblem')) {
+        if (typeof marker.mpsProblem !== 'string' || !marker.mpsProblem.trim() || marker.mpsProblem.length > 402 || /[\u0000-\u001f\u007f]/.test(marker.mpsProblem) || Object.hasOwn(marker, 'mps')) return invalid('grant marker MPS problem is invalid');
+        mpsDiscoveryProblem = marker.mpsProblem;
+    }
     if (!/^[a-f0-9]{64}$/.test(String(marker.fingerprint))) return invalid('grant marker fingerprint is invalid');
     if (marker.state === 'active') {
         if (marker.cdiDevice !== BOX_GPU_CDI_DEVICE || !specBytes
@@ -176,5 +182,6 @@ export function readBoxGpuGrant({
         fingerprint: marker.fingerprint,
         cdiDevice: marker.cdiDevice,
         ...(Object.hasOwn(marker, 'mps') ? { mps, mpsProblem } : {}),
+        ...(mpsDiscoveryProblem ? { mpsDiscoveryProblem } : {}),
     });
 }

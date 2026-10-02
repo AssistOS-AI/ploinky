@@ -188,6 +188,29 @@ return {command,status:r.status,signal:r.signal,stdout:String(r.stdout||'').slic
 out.control=[ask('get_default_active_thread_percentage'),ask('get_default_device_pinned_mem_limit 0'),ask('get_server_list')];}}
 process.stdout.write(JSON.stringify(out));`;
 
+// Read-only facts for a LIVE-P1 whose Box reports sharing unavailable: the
+// grant marker as mounted (state, MPS fields and the identities it expects),
+// the bound tool files as the Box stats them (to compare with those), and one bounded nvidia-smi observation with the
+// loader path the Box image lacks and one with the bare environment, so the
+// real cause is on the record before the case stops. Nothing is signalled,
+// started or written.
+export const GPU_GRANT_FACTS = String.raw`
+const fs=require('node:fs');const cp=require('node:child_process');
+const out={marker:null,tools:{},smi:{}};
+const one=(v,n)=>String(v==null?'':v).replace(/[^\x20-\x7e]+/g,' ').trim().slice(0,n||200);
+try{const m=JSON.parse(fs.readFileSync('/etc/ploinky-box-gpu-grant.json','utf8'));
+out.marker={state:m.state,reason:m.reason?one(m.reason,300):null,fingerprint:m.fingerprint||null,driverVersion:m.driverVersion||null,devices:Array.isArray(m.devices)?m.devices.length:null,
+mps:m.mps?Object.keys(m.mps).sort():null,mpsProblem:m.mpsProblem?one(m.mpsProblem,400):null,
+mpsExpected:m.mps?Object.fromEntries(['control','server'].map((k)=>[k,m.mps[k]?{dev:m.mps[k].dev,ino:m.mps[k].ino,size:m.mps[k].size,mtimeMs:m.mps[k].mtimeMs,sha256:m.mps[k].sha256}:null])):null};}catch(e){out.marker={error:one(e.code||e.message,64)};}
+for(const f of ['/usr/local/nvidia/bin/nvidia-smi','/usr/local/nvidia/bin/nvidia-cuda-mps-control','/usr/local/nvidia/bin/nvidia-cuda-mps-server']){
+try{const st=fs.statSync(f);out.tools[f]={dev:st.dev,ino:st.ino,size:st.size,mtimeMs:st.mtimeMs,nlink:st.nlink,mode:(st.mode&0o777).toString(8)};
+if(/mps/.test(f)&&st.isFile()&&st.size>0&&st.size<=67108864)out.tools[f].sha256=require('node:crypto').createHash('sha256').update(fs.readFileSync(f)).digest('hex');}catch(e){out.tools[f]={error:one(e.code||e.message,64)};}}
+const smi=(env)=>{const r=cp.spawnSync('/usr/local/nvidia/bin/nvidia-smi',['-i','0','--query-gpu=index,uuid,name,memory.total,driver_version','--format=csv,noheader,nounits'],{encoding:'utf8',env,timeout:5000,maxBuffer:8192});
+return {status:r.status,signal:r.signal||null,error:r.error?one(r.error.code||r.error.message,64):null,stdout:one(r.stdout,300),stderr:one(r.stderr,300)};};
+out.smi.bare=smi({PATH:'/usr/local/nvidia/bin:/usr/bin:/bin'});
+out.smi.withLoaderPath=smi({PATH:'/usr/local/nvidia/bin:/usr/bin:/bin',LD_LIBRARY_PATH:'/usr/local/nvidia/lib64'});
+process.stdout.write(JSON.stringify(out));`;
+
 // The crash case's only mutation of the MPS generation: SIGKILL of the one
 // control daemon, after the program itself re-proves its identity from the
 // private state file and /proc (start time, uid, executable identity, the

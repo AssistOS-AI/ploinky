@@ -28,7 +28,7 @@ import { parseGpuInventory, parseGpuMemory } from '../hardware-limits/liveGpu.mj
 import { createHostProc } from '../hardware-limits/liveGpuHost.mjs';
 import { createGpuCases, compactEvidence } from '../hardware-limits/liveGpuCases.mjs';
 import {
-    ADMIN_REQUEST, MPS_KILL_OWNED_DAEMON, MPS_OBSERVE, assertMpsControlCommand, classifyMpsReply, controlHelperExecArgv, controlHelperRunArgv, parseProbeResult, probeBoundMiB, probeExecArgv,
+    ADMIN_REQUEST, GPU_GRANT_FACTS, MPS_KILL_OWNED_DAEMON, MPS_OBSERVE, assertMpsControlCommand, classifyMpsReply, controlHelperExecArgv, controlHelperRunArgv, parseProbeResult, probeBoundMiB, probeExecArgv,
 } from '../hardware-limits/liveGpuCommands.mjs';
 
 const REPO = fs.realpathSync(fileURLToPath(new URL('../..', import.meta.url)));
@@ -352,7 +352,7 @@ test('G1.probe-protocol-distinguishes-allocation-oom-from-initialization-and-pro
 });
 
 test('G1.programs-and-argument-builders-take-only-validated-words', () => {
-    for (const program of [ADMIN_REQUEST, MPS_OBSERVE, MPS_KILL_OWNED_DAEMON]) assert.doesNotThrow(() => new vm.Script(`(async()=>{${program}})`));
+    for (const program of [ADMIN_REQUEST, GPU_GRANT_FACTS, MPS_OBSERVE, MPS_KILL_OWNED_DAEMON]) assert.doesNotThrow(() => new vm.Script(`(async()=>{${program}})`));
     const id = 'a'.repeat(64);
     assert.deepEqual(probeExecArgv({ containerId: id, maxMiB: 1408 }), ['container', 'exec', id, 'python3', '/code/mpsprobe.py', '--max-mib', '1408']);
     assert.deepEqual(probeExecArgv({ containerId: id, maxMiB: 768, set: { CUDA_MPS_PINNED_DEVICE_MEM_LIMIT: '0=512M' } }).slice(0, 4), ['container', 'exec', '--env', 'CUDA_MPS_PINNED_DEVICE_MEM_LIMIT=0=512M']);
@@ -554,6 +554,15 @@ test('G1.P1-is-blocked-when-a-prerequisite-is-missing-and-never-passes', async t
         assert.notEqual(report.verdict, 'PASS'); assert.ok(p1.evidence?.steps, `${label}: evidence was written before the verdict`);
         nothingOwned(w);
     }
+    // An ineligible report records the read-only grant facts and the reported reason before it blocks, and never mutates.
+    const ineligible = await provisioned(t, { faults: { gpuIneligible: true } });
+    const ineligibleReport = await liveCases(ineligible, ['LIVE-P1']);
+    const evidence = caseOf(ineligibleReport, 'LIVE-P1').evidence;
+    assert.deepEqual(ineligible.fake.model.programs.filter(program => program.program === 'grant-facts').length, 1);
+    assert.equal(evidence.gpuStatusReason.reason, 'GPU sharing is not qualified in this Box.');
+    assert.equal(evidence.grantFacts.smi.bare.status, 127); assert.equal(evidence.grantFacts.smi.withLoaderPath.status, 0);
+    assert.equal(ineligible.fake.model.programs.filter(program => program.program === 'admin' && program.method === 'POST').length, 0, 'nothing was applied');
+    nothingOwned(ineligible);
     // A GPU that turned busy between provisioning and the live run blocks at the initial gate, before any GPU operation.
     const busy = await provisioned(t);
     busy.fake.addForeign(555);

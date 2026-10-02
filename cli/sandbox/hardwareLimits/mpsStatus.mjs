@@ -3,6 +3,20 @@ import { readBoxGpuGrant } from '../../../ploinky-box/lib/gpuGrantMarker.mjs';
 import { createMpsStateStore, createMpsDaemonBackend } from './mps.mjs';
 import { MpsError, observeMpsGpu, inspectMpsImage, resolveMpsShare, unsupportedGpuMemoryModelReason, UNSUPPORTED_GPU_MEMORY_MODEL_FIX } from './mpsEligibility.mjs';
 
+const GENERIC_FIX = 'Inspect GPU wiring and MPS tools, then retry.';
+const oneLine = (value, limit = 400) => String(value ?? '').replace(/[^\x20-\x7e]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, limit);
+
+// Why this Box's grant marker does not allow MPS, specifically: no marker, an invalid one, wiring that is not
+// active, the host's MPS tools that were not discovered when the Box was created, or tools that no longer match.
+export function mpsGrantProblem(grant) {
+    if (!grant?.present) return 'No GPU grant marker is mounted in this Box, so there is no GPU wiring.';
+    if (!grant.valid) return `The GPU grant marker is invalid: ${oneLine(grant.problem)}.`;
+    if (grant.state !== 'active') return `The GPU wiring is ${oneLine(grant.state, 40)}${grant.reason ? ` (${oneLine(grant.reason)})` : ''}, not active.`;
+    if (grant.mpsProblem) return `The MPS tools of the wiring cannot be used in this Box: ${oneLine(grant.mpsProblem)}.`;
+    if (grant.mpsDiscoveryProblem) return `The host's MPS tools were not wired when the Box was created: ${oneLine(grant.mpsDiscoveryProblem)}.`;
+    return 'The GPU wiring carries no MPS tools: the Box was created without the hardware-limits gate, or the host has no MPS tools.';
+}
+
 /** Bounded observations only: never prepares an image or starts a daemon. */
 export function readMpsStatus({ workspaceRoot, readGrant = readBoxGpuGrant, observeGpu = observeMpsGpu,
     readState = () => createMpsStateStore().read(), backend = createMpsDaemonBackend() } = {}) {
@@ -11,7 +25,7 @@ export function readMpsStatus({ workspaceRoot, readGrant = readBoxGpuGrant, obse
     const result = { eligible: false, mode: 'unavailable', assurance: 'best-effort', daemonStatus: 'unknown', serverDefault: null, mpsGeneration: null };
     try {
         const grant = readGrant({ workspaceRoot });
-        if (!grant.valid || grant.state !== 'active' || !grant.mps) throw new MpsError('Active GPU wiring and both host MPS tools are required. Restart the Box after installing the matching driver tools.');
+        if (!grant.valid || grant.state !== 'active' || !grant.mps) throw new MpsError(`${mpsGrantProblem(grant)} Active GPU wiring and both host MPS tools are required.`);
         const gpu = observeGpu();
         internal = { facts: gpu, grant };
         Object.assign(result, { eligible: true, mode: 'mps-shared', memoryModel: gpu.memoryModel, name: gpu.name, deviceUuid: gpu.uuid, driverVersion: gpu.driverVersion, deviceMemoryBytes: gpu.memoryMiB * 1048576, wiringFingerprint: grant.fingerprint });
@@ -39,7 +53,9 @@ export function readMpsStatus({ workspaceRoot, readGrant = readBoxGpuGrant, obse
             return finish({ ...result, eligible: false, memoryModel: error.memoryModel, name: String(error.gpuName || '').slice(0, 256),
                 reason: `${unsupportedGpuMemoryModelReason(error.gpuName)} ${UNSUPPORTED_GPU_MEMORY_MODEL_FIX}`, code: 'gpu_sharing_unavailable' });
         }
-        return finish({ ...result, eligible: false, reason: 'GPU sharing facts or daemon ownership could not be verified. Inspect GPU wiring and MPS tools, then retry.', code: 'gpu_sharing_unavailable' });
+        // The specific cause, bounded and one line, with the generic recovery step kept as the fix.
+        const cause = oneLine(error?.message) || 'an unreadable fact';
+        return finish({ ...result, eligible: false, reason: `GPU sharing facts or daemon ownership could not be verified: ${cause}`.slice(0, 600), code: 'gpu_sharing_unavailable', fix: GENERIC_FIX, ...(error?.code && error.code !== 'gpu_sharing_unavailable' && /^[a-z_]{3,64}$/.test(String(error.code)) ? { causeCode: error.code } : {}) });
     }
 }
 

@@ -293,6 +293,7 @@ export function gpuPlan(run) {
         { case: 'provision', id: 'gpu-grant', action: `${profile.candidate.path} gpu grant --agent ${plan(run).gpu.grantAgents.join(' --agent ')} (host driver discovery; records the grant)`, gpu: true },
         { case: 'P1', ...gate('P1-gate') },
         { case: 'P1', ...admin('P1-admin-state', 'GET', ''), action: 'Read the Box hardware-limits state and the policy store token through the Router route (the local operator session)' },
+        { case: 'P1', id: 'p1-grant-facts', binary: engine, argv: [...core, 'node', '-e', '<GPU_GRANT_FACTS>'], deadlineMs: 30000, note: 'Run only when the Box reports GPU sharing unavailable, before the case stops: read-only facts (the grant marker\'s state and MPS fields, the three bound tool files, and one bounded nvidia-smi observation with and without the loader path). Nothing is signalled, started or written.' },
         { case: 'P1', ...set('P1-save-share', 'hwlfixture/probe', first), action: `Save the first share ${first.smPercent}% SM / ${first.vramPercent}% VRAM (${cap} MiB of ${gpu.memoryMiB})` },
         { case: 'P1', ...apply('P1-apply', 'probe'), action: 'Apply starts the MPS daemon (uid 1000, /ploinky/core), sets and reads back both defaults, then recreates the probe as a share client' },
         { case: 'P1', ...observeMps('P1-observe-mps') },
