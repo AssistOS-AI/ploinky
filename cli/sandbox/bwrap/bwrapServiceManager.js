@@ -294,6 +294,48 @@ function ensureBwrapAgentLibDir(instanceName, nodeModulesDir, options = {}) {
     return stagedAgentLibPath;
 }
 
+/**
+ * Guarantee the directory a nested bind will land on inside the source tree.
+ *
+ * bwrap applies a read-only bind at bind time, so it cannot create
+ * `/code/node_modules` or `/code/skills` inside an already read-only `/code`
+ * ("Can't mkdir /code/node_modules: Read-only file system"). The empty host
+ * directory is the mount point, as `ensureBwrapAgentLibDir` provides for
+ * /Agent/node_modules; container runtimes create the equivalent before their
+ * final read-only remount. It stays empty: the prepared dependency cache and
+ * the skills tree are mounted over it, never written into it.
+ *
+ * An existing real directory is left untouched. Anything else (a symlink such
+ * as the Seatbelt dependency link) is refused rather than followed, because a
+ * bind through it would land on whatever the link resolves to.
+ */
+function ensureBwrapCodeMountPoint(agentCodePath, name) {
+    const mountPoint = path.join(agentCodePath, name);
+    let stat = null;
+    try {
+        stat = fs.lstatSync(mountPoint);
+    } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+    }
+    if (!stat) {
+        try {
+            fs.mkdirSync(mountPoint);
+        } catch (error) {
+            if (error?.code !== 'EEXIST') {
+                throw new Error(`[bwrap] cannot create the /code/${name} mount point ${mountPoint}: ${error.message}`);
+            }
+        }
+        stat = fs.lstatSync(mountPoint);
+    }
+    if (!stat.isDirectory()) {
+        throw new Error(
+            `[bwrap] ${mountPoint} is not a directory, so /code/${name} cannot be mounted over it. `
+            + 'Remove or move it, then restart.'
+        );
+    }
+    return mountPoint;
+}
+
 function resolveSymlinkPath(symlinkPath) {
     try {
         if (fs.existsSync(symlinkPath)) {
@@ -559,6 +601,7 @@ function buildBwrapArgs(options) {
 
     // node_modules — read-only immutable store generation (cli/utils/dependencies/store).
     // Mounted at both paths so AgentServer.mjs (/Agent/server/) can resolve modules.
+    if (codeReadOnly) ensureBwrapCodeMountPoint(agentCodePath, 'node_modules');
     args.push('--ro-bind', nodeModulesDir, '/code/node_modules');
     args.push('--ro-bind', nodeModulesDir, '/Agent/node_modules');
 
@@ -585,6 +628,7 @@ function buildBwrapArgs(options) {
 
     // Skills directory (if exists)
     if (skillsPath && fs.existsSync(skillsPath)) {
+        if (codeReadOnly) ensureBwrapCodeMountPoint(agentCodePath, 'skills');
         if (skillsReadOnly) {
             args.push('--ro-bind', skillsPath, '/code/skills');
         } else {
