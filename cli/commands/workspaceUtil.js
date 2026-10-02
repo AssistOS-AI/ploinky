@@ -17,15 +17,17 @@ import {
   getRuntimeForAgent,
   isSandboxRuntime,
   loadAgentsMap,
+  probeContainerRuntime,
 } from '../sandbox/docker/common.js';
 import {
   buildRuntimeNetworkPlan,
   buildRuntimeRouterEnv,
   manifestUsesHealthProbeBroker,
+  removeExactSandboxPredecessor,
   resolvePublishedPortMappings,
 } from '../sandbox/docker/agentServiceManager.js';
 import { inspectExactContainer, removeExactRegisteredContainer } from '../sandbox/docker/containerFleet.js';
-import { isBwrapProcessRunning } from '../sandbox/bwrap/bwrapFleet.js';
+import { observeSandboxRuntime, registeredRuntimeTuple } from '../sandbox/bwrap/bwrapFleet.js';
 import * as inputState from './inputState.js';
 import { MAX_NO_WAIT_BARRIER_ENTRIES, MAX_NO_WAIT_WAVE_INDEX } from './noWaitWorker.js';
 import {
@@ -1008,7 +1010,37 @@ function removeGraphContainerForRecreate(containerName, label, predecessorRecord
   retireRuntimeCandidateImpl = retireRuntimeCandidate,
   retireRuntimePredecessorImpl = retireRuntimePredecessor,
   inspectExactContainerImpl = inspectExactContainer,
+  removeExactSandboxPredecessorImpl = removeExactSandboxPredecessor,
 } = {}) {
+  // The predecessor record's own runtime selects how it is observed and
+  // removed, whatever backend its successor resolves to. A native predecessor
+  // has no container: only its exact PID record and process identity count.
+  if (isSandboxRuntime(predecessorRecord?.runtime)) {
+    let outcome;
+    try {
+      outcome = removeExactSandboxPredecessorImpl(containerName, predecessorRecord, {
+        process: predecessorReceipt?.predecessor?.process ?? predecessorRecord?.process,
+      });
+    } catch (cause) {
+      const error = new Error(
+        `[${label}] preserved sandbox '${containerName}' because exact process ownership/removal was not proven`,
+        { cause },
+      );
+      error.code = 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS';
+      throw error;
+    }
+    if (outcome?.state !== 'absent' && outcome?.state !== 'removed') {
+      const error = new Error(
+        `[${label}] preserved sandbox '${containerName}' because exact process ownership/removal was not proven (${outcome?.state || 'unknown'}: ${outcome?.reason || 'unreported'})`,
+      );
+      error.code = 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS';
+      throw error;
+    }
+    // Absent or removed: the exact predecessor no longer needs its proof.
+    clearLivenessStateImpl(containerName);
+    if (predecessorReceipt) retireRuntimePredecessorImpl(predecessorReceipt);
+    return { removed: outcome.state === 'removed', state: outcome.state === 'removed' ? 'removed' : 'absent' };
+  }
   // A staged predecessor whose launcher never published it (a no-wait worker
   // that stopped or was superseded) has no registered container ID. Its launch
   // receipt, or else the container's exact workspace, instance, generation and
@@ -1033,10 +1065,14 @@ function removeGraphContainerForRecreate(containerName, label, predecessorRecord
       // still present here carries. A name miss can be an unavailable engine,
       // so retire it, and continue toward a launch, only once the engine
       // positively reports the exact predecessor missing.
+      // The engine is probed, never required: with none installed the absence
+      // is simply not proven (getRuntime would end the process).
       let absent = false;
       try {
-        absent = inspectExactContainerImpl(
-          predecessorRecord?.runtime || getRuntimeImpl(),
+        const engine = predecessorRecord?.runtime
+          || (getRuntimeImpl === dockerSvc.getRuntime ? probeContainerRuntime() : getRuntimeImpl());
+        absent = Boolean(engine) && inspectExactContainerImpl(
+          engine,
           unpublished ? containerName : predecessorRecord.containerId,
         ) === null;
       } catch (_) {}
@@ -1090,10 +1126,70 @@ function removeGraphContainerForRecreate(containerName, label, predecessorRecord
   return result;
 }
 
+// 'seatbelt' | 'bwrap' | 'container', or '' for a record that names no
+// runtime (staged but never launched).
+function graphRecordBackend(record) {
+  const runtime = String(record?.runtime || '');
+  if (!runtime) return '';
+  return isSandboxRuntime(runtime) ? runtime : 'container';
+}
+
+// The backend a record's runtime was launched on, resolved once per graph
+// stage. A record that names its runtime answers directly. A runtime-less one
+// (legacy, or never finalized) never selects a backend by itself:
+//   - a predecessor receipt that names a runtime is authoritative;
+//   - the PID record of its exact tuple proves a native owner (live, or stale
+//     for that tuple), whose kind is the desired native kind or the host's;
+//   - an unverifiable slot refuses (the caller is still before any mutation);
+//   - verified absence of any native owner leaves it a container record, unless
+//     the desired backend is native and no container engine exists at all, in
+//     which case nothing but a native runtime could ever have run.
+function resolvePredecessorBackend(node, existing, {
+  observeImpl,
+  readReceiptImpl,
+  getRuntimeForAgentImpl = getRuntimeForAgent,
+  probeContainerRuntimeImpl = probeContainerRuntime,
+}) {
+  const named = graphRecordBackend(existing.rec);
+  if (named) return named;
+  const tuple = registeredRuntimeTuple(existing.rec);
+  if (!tuple) return '';
+  let receipt = null;
+  try { receipt = readReceiptImpl(existing.key, existing.rec); } catch (_) { receipt = null; }
+  if (receipt?.predecessor?.runtime) return graphRecordBackend(receipt.predecessor);
+  const desired = getRuntimeForAgentImpl(node.manifest);
+  const nativeKind = isSandboxRuntime(desired) ? desired : (process.platform === 'darwin' ? 'seatbelt' : 'bwrap');
+  const observed = observeImpl(existing.key, { expectedIdentity: tuple });
+  if (observed.state === 'unknown') throw sandboxOwnershipUnknown(existing.key, observed.reason);
+  const carriesTuple = observed.record
+    && observed.record.instanceId === tuple.instanceId
+    && observed.record.enableGeneration === tuple.enableGeneration;
+  if (observed.state === 'live-exact' || (observed.state === 'absent' && carriesTuple)) return nativeKind;
+  if (isSandboxRuntime(desired) && !probeContainerRuntimeImpl()) return desired;
+  return '';
+}
+
+function sandboxOwnershipUnknown(containerName, reason) {
+  const error = new Error(
+    `sandbox runtime '${containerName}' ownership could not be verified (${reason}); refusing to treat it as stopped`,
+  );
+  error.code = 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS';
+  return error;
+}
+
+// Liveness for the graph: an unknown observation is never "stopped".
+function isGraphSandboxRuntimeRunning(runtimeKey, expectedIdentity, {
+  observeImpl = observeSandboxRuntime,
+} = {}) {
+  const observed = observeImpl(runtimeKey, { expectedIdentity });
+  if (observed.state === 'unknown') throw sandboxOwnershipUnknown(runtimeKey, observed.reason);
+  return observed.state === 'live-exact';
+}
+
 function graphNodeRuntimeReplacementReason(plan, {
   containerExistsImpl = dockerSvc.containerExists,
   isContainerRunningImpl = dockerSvc.isContainerRunning,
-  isSandboxRunningImpl = isBwrapProcessRunning,
+  isSandboxRunningImpl = isGraphSandboxRuntimeRunning,
   getRuntimeForAgentImpl = getRuntimeForAgent,
   getRuntimeImpl = getRuntime,
   getContainerLabelImpl = getContainerLabel,
@@ -1119,12 +1215,20 @@ function graphNodeRuntimeReplacementReason(plan, {
     path: `manifest(${node.repoName}/${node.shortAgentName})`,
   });
   const runtimeKind = getRuntimeForAgentImpl(node.manifest);
+  // The existing record's own backend selects how it is probed; the desired
+  // backend only selects the successor. A record without a runtime (never
+  // launched) names no backend, so it never selects one for removal.
+  const recordBackend = plan.predecessorBackend !== undefined
+    ? plan.predecessorBackend
+    : graphRecordBackend(record);
+  const desiredBackend = isSandboxRuntime(runtimeKind) ? runtimeKind : 'container';
+  if (recordBackend && recordBackend !== desiredBackend) return 'runtimeBackendChanged';
   const routerEndpoint = resolveManifestRouterEndpoint(node.manifest, {
     explicitPort: resolvePersistedRouterPort(),
     profileName: node.profile || undefined,
     path: `manifest(${node.repoName}/${node.shortAgentName})`,
   });
-  if (isSandboxRuntime(runtimeKind)) {
+  if (recordBackend ? recordBackend !== 'container' : isSandboxRuntime(runtimeKind)) {
     if (!isSandboxRunningImpl(existing.key, {
       instanceId: record.instanceId,
       enableGeneration: record.enableGeneration,
@@ -1259,9 +1363,17 @@ function loadRegistryManifest(record) {
   return JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
 }
 
-function isRegistryRuntimeRunning(containerName, record) {
+// Native PID records are keyed by the exact container name and carry the
+// record's tuple. The short agent name or alias names no runtime.
+export function isRegistryRuntimeRunning(containerName, record, {
+  observeImpl = observeSandboxRuntime,
+} = {}) {
   if (isSandboxRuntime(record?.runtime)) {
-    return isBwrapProcessRunning(record.agentName);
+    const tuple = registeredRuntimeTuple(record);
+    if (!tuple) throw sandboxOwnershipUnknown(containerName, 'registry record has no exact runtime tuple');
+    const observed = observeImpl(containerName, { expectedIdentity: tuple });
+    if (observed.state === 'unknown') throw sandboxOwnershipUnknown(containerName, observed.reason);
+    return observed.state === 'live-exact';
   }
   return dockerSvc.isContainerRunning(containerName);
 }
@@ -1375,6 +1487,7 @@ function ensureGraphNodesEnabled(graph, reg, {
   readRuntimePredecessorImpl = readRuntimePredecessor,
   writeRuntimePredecessorImpl = writeRuntimePredecessor,
   retireRuntimePredecessorImpl = retireRuntimePredecessor,
+  observeSandboxRuntimeImpl = observeSandboxRuntime,
 } = {}) {
   const nodes = [
     ...Array.from(graph?.nodes?.values?.() || []),
@@ -1405,7 +1518,14 @@ function ensureGraphNodesEnabled(graph, reg, {
       : resolveRetainedGraphNodeExecutionRecord(node, existing.rec, executionRecordOptions);
     const executionChanged = executionRecordDiffers(existing.rec, expectedExecution);
     const profileChanged = Boolean(node.profile && existing.rec.profile !== node.profile);
-    const preliminary = { node, existing, expectedExecution, executionChanged, profileChanged };
+    const predecessorBackend = resolvePredecessorBackend(node, existing, {
+      observeImpl: observeSandboxRuntimeImpl,
+      readReceiptImpl: readRuntimePredecessorImpl,
+      getRuntimeForAgentImpl: runtimeReplacementOptions?.getRuntimeForAgentImpl,
+    });
+    const preliminary = {
+      node, existing, expectedExecution, executionChanged, profileChanged, predecessorBackend,
+    };
     // A stalled worker of an earlier start still holds this exact staged
     // identity and would resume under any generation that carries it again, so
     // the identity always rotates and its unpublished runtime is removed.
@@ -1422,17 +1542,46 @@ function ensureGraphNodesEnabled(graph, reg, {
     const priorPredecessorReceipt = executionChanged || profileChanged || runtimeReason
       ? readRuntimePredecessorImpl(existing.key, existing.rec)
       : null;
+    const predecessorRecord = priorPredecessorReceipt
+      ? { ...structuredClone(existing.rec), ...structuredClone(priorPredecessorReceipt.predecessor) }
+      : structuredClone(existing.rec);
+    // A runtime-less record proven native names its kind from here on, so the
+    // receipt and the removal take the native path.
+    if (isSandboxRuntime(predecessorBackend) && !isSandboxRuntime(predecessorRecord.runtime)) {
+      predecessorRecord.runtime = predecessorBackend;
+    }
+    // Capture the native predecessor's process evidence before anything is
+    // rotated. A slot that cannot be verified refuses the whole graph now,
+    // while nothing has been inactivated, rotated or signalled.
+    let predecessorProcess = null;
+    if ((executionChanged || profileChanged || runtimeReason)
+        && isSandboxRuntime(predecessorRecord.runtime)
+        && hasCompleteRuntimeTuple(predecessorRecord)) {
+      const observed = observeSandboxRuntimeImpl(existing.key, {
+        expectedIdentity: {
+          instanceId: predecessorRecord.instanceId,
+          enableGeneration: predecessorRecord.enableGeneration,
+        },
+      });
+      if (observed.state === 'unknown') throw sandboxOwnershipUnknown(existing.key, observed.reason);
+      if (observed.state === 'live-exact') {
+        predecessorProcess = {
+          pid: observed.record.pid,
+          processIdentity: observed.record.processIdentity,
+        };
+      }
+    }
+    if (isSandboxRuntime(predecessorRecord.runtime)) delete predecessorRecord.process;
     existingPlans.push({
       ...preliminary,
       runtimeReason,
       registryRecord: structuredClone(existing.rec),
       priorPredecessorReceipt,
+      predecessorProcess,
       // The desired registry receives a fresh candidate tuple before removal
       // so the inactive generation can be compiled. Keep a detached snapshot
       // as the only ownership proof authorized to remove the predecessor.
-      predecessorRecord: priorPredecessorReceipt
-        ? { ...structuredClone(existing.rec), ...structuredClone(priorPredecessorReceipt.predecessor) }
-        : structuredClone(existing.rec),
+      predecessorRecord,
     });
   }
 
@@ -1515,7 +1664,9 @@ function ensureGraphNodesEnabled(graph, reg, {
       plan.predecessorReceipt = writeRuntimePredecessorImpl({
         containerName: plan.existing.key,
         successor: reg[plan.existing.key],
-        predecessor: plan.predecessorRecord,
+        predecessor: plan.predecessorProcess
+          ? { ...plan.predecessorRecord, process: plan.predecessorProcess }
+          : plan.predecessorRecord,
       });
     }
     if (changedPlans.length) saveAgents(reg, { coordinate: false });
@@ -2483,6 +2634,9 @@ async function startWorkspace(staticAgentArg, portArg, {
             instanceId: rec.instanceId,
             enableGeneration: rec.enableGeneration,
             forceRecreate: newlyPreparedContainers.has(name),
+            // The graph removal step already removed every changed
+            // predecessor, so the slot holds nothing or the exact successor.
+            expectedPredecessor: null,
             preservePreparedRegistryRecord: true,
             preparationLease: workspacePreparationLease,
             preparedHostModeCapability,
@@ -3113,6 +3267,8 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
           routerEndpoint,
           runtimeAdmission: directAdmission.runtimeAdmission,
           networkLifecycleCapability,
+          // The registry tuple read above is the only runtime this start may replace.
+          expectedPredecessor: registeredRuntimeTuple(registryRecord?.record),
         });
         const exactContainerName = result?.containerName
           || registryRecord?.containerName
@@ -3278,6 +3434,7 @@ async function runShell(agentName) {
         routerEndpoint,
         runtimeAdmission: directAdmission.runtimeAdmission,
         networkLifecycleCapability,
+        expectedPredecessor: registeredRuntimeTuple(registryRecord?.record),
       });
       const exactContainerName = result?.containerName || registeredContainerName;
       const shellReadinessRoute = buildRelayReadinessRoute({
@@ -3476,6 +3633,14 @@ async function reinstallAgent(agentName) {
                 runtimeAdmission: directAdmission.runtimeAdmission,
                 networkLifecycleCapability,
                 stageAlongsidePredecessor,
+                // The registration read before the call (and re-verified under
+                // the locks above) is the runtime a reinstall replaces.
+                expectedPredecessor: registryRecord?.record?.instanceId && registryRecord?.record?.enableGeneration
+                    ? {
+                        instanceId: registryRecord.record.instanceId,
+                        enableGeneration: registryRecord.record.enableGeneration,
+                    }
+                    : null,
             });
             const { containerName: newContainerName, hostPort } = reinstallResult;
 

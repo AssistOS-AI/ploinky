@@ -59,6 +59,8 @@ test('dependency store wiring: a new image ID under the same tag builds a new ob
 const SEATBELT_MANIFEST = { 'lite-sandbox': true, start: 'node index.js', network: { mode: 'host' }, readiness: { protocol: 'none' } };
 const SEATBELT_SKIP = process.platform !== 'darwin' && 'seatbelt runs on macOS only';
 const ALIAS_B = 'ploinky_repo_demo_b';
+// A restart replaces only the runtime its caller names: here the registered one.
+const REGISTERED_TUPLE = { instanceId: 'inst-1', enableGeneration: 'gen-1' };
 
 function seatbeltWorkspace(t) {
     const w = wiringWorkspace(t, { manifest: SEATBELT_MANIFEST, prefix: 'depstore-seatbelt-' });
@@ -107,7 +109,7 @@ test('dependency store wiring (seatbelt): a package change never switches the sh
 
     fs.writeFileSync(path.join(w.agentDir, 'code', 'package.json'), JSON.stringify({ name: 'demo', dependencies: { 'left-pad': '1.3.1' } }));
     const changed = driveWiring(w, [
-        { label: 'replace-a', action: 'ensure-with-lease', hostRouter: true, containerName: CONTAINER, activate: true, allowFailure: true },
+        { label: 'replace-a', action: 'ensure-with-lease', hostRouter: true, containerName: CONTAINER, activate: true, allowFailure: true, options: { expectedPredecessor: REGISTERED_TUPLE } },
     ]);
     assert.equal(changed['replace-a'].ok, false, `A must not switch the link under live B: ${JSON.stringify(changed['replace-a'])}`);
     // The sandbox start path wraps the guard's error; the guard's own code
@@ -137,7 +139,7 @@ test('dependency store wiring (seatbelt): an unreadable reader receipt fails the
         consumer: { kind: 'seatbelt-attachment', sourceLink: link, process: { pid: process.pid } },
     }));
     const result = driveWiring(w, [
-        { label: 'switch', action: 'ensure-with-lease', hostRouter: true, containerName: CONTAINER, activate: true, allowFailure: true },
+        { label: 'switch', action: 'ensure-with-lease', hostRouter: true, containerName: CONTAINER, activate: true, allowFailure: true, options: { expectedPredecessor: REGISTERED_TUPLE } },
     ]);
     assert.equal(result.switch.ok, false, `an unreadable receipt must fail closed: ${JSON.stringify(result.switch)}`);
     assert.match(result.switch.message, /\[seatbelt\] demo: failed to inspect .*reader receipt zz-foreign\.json is unreadable/);

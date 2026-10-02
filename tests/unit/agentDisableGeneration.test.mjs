@@ -505,3 +505,58 @@ test('a batch rolls back only when no runtime in it was touched', async () => {
     assert.equal(partial.events.includes('restore'), false);
     assert.equal(partial.events.includes('inactive:agent-disable-batch-runtime-removal-failed'), true);
 });
+
+test('disabling a native runtime reports it removed only after its exact process is observed gone', async () => {
+    const record = agentRecord('native', { runtime: 'seatbelt' });
+    const routing = {
+        port: 8080,
+        routes: { native: { container: 'native_container', repo: 'demo', agent: 'native', hostPort: 33000 } },
+    };
+    const calls = [];
+    const sandboxDependencies = (harness, { before, after }) => ({
+        ...harness.dependencies,
+        isSandboxRuntimeImpl: (runtime) => runtime === 'seatbelt',
+        stopSandboxImpl: (name) => { calls.push(['stop', name]); return false; },
+        sandboxRunningImpl: () => false,
+        // The first observation precedes any signal; the second follows the stop.
+        sandboxObserveImpl: (() => {
+            let n = 0;
+            return () => (n++ === 0 ? before : after);
+        })(),
+    });
+
+    // A runtime whose owner cannot be verified refuses before anything is
+    // signalled, and the registration is restored with the process still tracked.
+    const unverifiable = lifecycleHarness({ initialRegistry: { native_container: record }, initialRouting: routing });
+    await assert.rejects(
+        agents.disableAgent('native_container', sandboxDependencies(unverifiable, {
+            before: { state: 'unknown', reason: 'identity-probe-failed', record: null },
+            after: { state: 'unknown', reason: 'identity-probe-failed', record: null },
+        })),
+        (error) => error.code === 'PLOINKY_AGENT_DISABLE_REFUSED',
+    );
+    assert.deepEqual(calls, [], 'nothing was signalled');
+    assert.deepEqual(unverifiable.registry().native_container, record, 'the registration is restored');
+    assert.equal(unverifiable.events.includes('restore'), true);
+    assert.equal(unverifiable.events.includes('apply'), false);
+
+    // A stop that does not end the process is not a removal.
+    const survivor = lifecycleHarness({ initialRegistry: { native_container: record }, initialRouting: routing });
+    await assert.rejects(
+        agents.disableAgent('native_container', sandboxDependencies(survivor, {
+            before: { state: 'live-exact', reason: 'live', record: null },
+            after: { state: 'live-exact', reason: 'live', record: null },
+        })),
+        /still running or its stop could not be verified/,
+    );
+    assert.deepEqual(calls, [['stop', 'native_container']]);
+    assert.equal(survivor.events.includes('apply'), false, 'authorization is never committed over an unverified stop');
+
+    const gone = lifecycleHarness({ initialRegistry: { native_container: record }, initialRouting: routing });
+    const result = await agents.disableAgent('native_container', sandboxDependencies(gone, {
+        before: { state: 'live-exact', reason: 'live', record: null },
+        after: { state: 'absent', reason: 'no-record', record: null },
+    }));
+    assert.equal(result.status, 'removed');
+    assert.equal(gone.events.includes('apply'), true);
+});

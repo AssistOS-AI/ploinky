@@ -15,10 +15,17 @@ import { openVerifiedRegularFile, readVerifiedJsonObject } from '../utils/verifi
 // It is durable evidence, not authority to remove a runtime: every consumer
 // still inspects the exact ID and verifies the workspace, managed labels and
 // tuple the container itself carries.
+//
+// A native (Seatbelt or bwrap) predecessor has no container ID. Its receipt
+// names the runtime kind and, when the predecessor was a verified live process
+// at capture time, the pid and start identity of that process. Removal still
+// observes the PID record: the receipt never authorizes a signal by name.
 
 const MAX_BYTES = 32 * 1024;
 const DESCRIPTOR_TARGET = '/run/ploinky/router-descriptor.json';
 const IMMUTABLE_ID = /^[a-f0-9]{64}$/;
+const CONTAINER_RUNTIMES = ['docker', 'podman'];
+const NATIVE_RUNTIMES = ['seatbelt', 'bwrap'];
 
 function predecessorError(message) {
     const error = new Error(`runtime predecessor receipt ${message}`);
@@ -44,9 +51,20 @@ function location(containerName, successor, workspaceRoot) {
     return { root, name, file: path.join(root, name) };
 }
 
+function normalizeNativeProcess(value) {
+    if (value === undefined || value === null) return null;
+    if (typeof value !== 'object' || Array.isArray(value)
+        || !Number.isSafeInteger(value.pid) || value.pid <= 0
+        || !exactString(value.processIdentity)) {
+        throw predecessorError('has a malformed native process evidence record');
+    }
+    return { pid: value.pid, processIdentity: value.processIdentity };
+}
+
 function normalize({ containerName, successor, predecessor } = {}) {
     const containerId = String(predecessor?.containerId || '');
     const runtime = String(predecessor?.runtime || '');
+    const native = NATIVE_RUNTIMES.includes(runtime);
     if (!exactString(containerName)
         || !hasCompleteRuntimeTuple(successor)
         || predecessor?.type !== 'agent'
@@ -58,9 +76,14 @@ function normalize({ containerName, successor, predecessor } = {}) {
         || [predecessor.instanceId, predecessor.enableGeneration]
             .some((value) => value === successor.instanceId || value === successor.enableGeneration)
         || (containerId && !IMMUTABLE_ID.test(containerId))
-        || (runtime && !['docker', 'podman'].includes(runtime))) {
+        || (native && containerId)
+        || (runtime && !native && !CONTAINER_RUNTIMES.includes(runtime))) {
         throw predecessorError('requires an exact registered predecessor tuple distinct from its rotated tuple');
     }
+    if (!native && predecessor.process !== undefined && predecessor.process !== null) {
+        throw predecessorError('records process evidence only for a native predecessor');
+    }
+    const nativeProcess = native ? normalizeNativeProcess(predecessor.process) : null;
     const binds = predecessor.config?.binds ?? [];
     if (!Array.isArray(binds)) throw predecessorError('has malformed registry binds');
     const descriptorBinds = binds.filter((bind) => (
@@ -82,6 +105,7 @@ function normalize({ containerName, successor, predecessor } = {}) {
             ...(predecessor.alias ? { alias: predecessor.alias } : {}),
             ...(containerId ? { containerId } : {}),
             ...(runtime ? { runtime } : {}),
+            ...(nativeProcess ? { process: nativeProcess } : {}),
             instanceId: predecessor.instanceId,
             enableGeneration: predecessor.enableGeneration,
             config: {

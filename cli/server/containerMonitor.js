@@ -25,7 +25,7 @@ import {
 import { shouldMonitorManifestRuntime } from '../utils/runtime/manifestStartup.js';
 import { getRuntimeForAgent, isSandboxRuntime } from '../sandbox/docker/common.js';
 import { resolveLlmRuntimeAdmissionContext } from '../sandbox/docker/llmRuntimeIntegration.js';
-import { isBwrapProcessRunning } from '../sandbox/bwrap/bwrapFleet.js';
+import { observeSandboxRuntime, registeredRuntimeTuple } from '../sandbox/bwrap/bwrapFleet.js';
 import { resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
 import { assertManifestStorageAdmission } from '../utils/runtime/manifestVolumePolicy.js';
 import {
@@ -2138,6 +2138,9 @@ export async function performContainerRestart(monitor, target, reason, attempt =
             profileResolution,
             routerEndpoint,
             forceRecreate: reason === 'semantic_probe_failed',
+            // The registry record captured with this restart attempt is the
+            // only runtime it may replace.
+            expectedPredecessor: registeredRuntimeTuple(restartRecord),
             preserveActiveAuthorization,
             networkLifecycleCapability,
             runtimeAdmission: target.runtimeAdmission,
@@ -2513,12 +2516,47 @@ export function monitorTick(monitor) {
 
         let running = false;
         try {
-            if (isSandboxRuntime(target.runtime)) {
-                running = Boolean(target.instanceId && target.enableGeneration)
-                    && isBwrapProcessRunning(target.containerName, {
-                        instanceId: target.instanceId,
-                        enableGeneration: target.enableGeneration,
+            // A target whose record names no runtime ('container' is only the
+            // default for that) is checked for a native owner of its exact
+            // tuple first; only a verified absence leaves it a container.
+            const namedNative = isSandboxRuntime(target.runtime);
+            const unnamed = target.runtime === 'container' && Boolean(target.instanceId && target.enableGeneration);
+            let nativeDecided = false;
+            if (namedNative || unnamed) {
+                nativeDecided = namedNative;
+                if (target.instanceId && target.enableGeneration) {
+                    const observeSandbox = monitor.observeSandboxRuntime || observeSandboxRuntime;
+                    const observed = observeSandbox(target.containerName, {
+                        expectedIdentity: {
+                            instanceId: target.instanceId,
+                            enableGeneration: target.enableGeneration,
+                        },
                     });
+                    if (observed.state === 'live-exact') {
+                        running = true;
+                        nativeDecided = true;
+                    } else if (observed.state !== 'absent') {
+                        // `unknown` is not absence, and a live foreign tuple
+                        // means a newer owner holds the slot: a restart here
+                        // would stop it or collide with it. Defer this tick.
+                        const signature = `${observed.state}:${observed.reason}`;
+                        if (target.sandboxObservationDeferred !== signature) {
+                            target.sandboxObservationDeferred = signature;
+                            logEvent(monitor, 'warn', 'container_restart_deferred_sandbox_observation', {
+                                container: target.containerName,
+                                agent: target.agentName,
+                                repo: target.repoName,
+                                state: observed.state,
+                                reason: observed.reason,
+                            });
+                        }
+                        continue;
+                    }
+                    target.sandboxObservationDeferred = null;
+                }
+            }
+            if (nativeDecided) {
+                // running was decided by the native observation above
             } else if (runningContainerNames) {
                 if (runningContainerNames.has(target.containerName)) {
                     running = true;

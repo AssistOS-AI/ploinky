@@ -94,7 +94,10 @@ import {
     assertBwrapPidSlotAvailable,
     isBwrapProcessRunning,
     normalizeSandboxRuntimeIdentity,
+    normalizeExpectedPredecessor,
+    resolveSandboxSlotForStart,
     stopBwrapProcess,
+    stopExactSandboxOrThrow,
     saveBwrapPid,
     clearBwrapPid,
     getBwrapPid
@@ -1110,6 +1113,7 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
         const stopped = stopBwrapProcess(containerName, { expectedIdentity: runtimeIdentity });
         if (!stopped && isBwrapProcessRunning(containerName, runtimeIdentity)) {
             error.message = `${error.message}; exact sandbox candidate cleanup failed`;
+            error.exactCleanupFailed = true;
         }
         throw error;
     }
@@ -1125,6 +1129,7 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
     let aliasOverride;
     let forceRecreate = false;
     let profileNameOverride;
+    let expectedPredecessor = null;
 
     if (typeof options === 'number') {
         preferredHostPort = options;
@@ -1134,6 +1139,7 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
         aliasOverride = options.alias;
         forceRecreate = options.forceRecreate === true;
         profileNameOverride = options.profileName;
+        expectedPredecessor = normalizeExpectedPredecessor(options.expectedPredecessor);
     }
 
     const repoName = resolveAgentRepositoryName(agentPath);
@@ -1178,17 +1184,23 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
         allPortMappings = [{ containerPort: hostPort, hostPort }];
     }
 
-    let exactRuntimeRunning = isBwrapProcessRunning(containerName, runtimeIdentity);
+    // What holds the runtime key decides what may be stopped. Only the exact
+    // requested successor or the caller's expected predecessor is ever
+    // signalled; any other live tuple, or a slot that cannot be verified,
+    // throws before a signal is sent or a PID record is touched.
+    const slot = resolveSandboxSlotForStart(containerName, {
+        successor: runtimeIdentity,
+        expectedPredecessor,
+    });
+    let exactRuntimeRunning = slot.kind === 'successor';
 
-    // Force recreate
-    if (forceRecreate) {
+    if (slot.kind === 'predecessor') {
+        console.log(`[bwrap] ${agentName}: runtime generation changed, replacing the expected predecessor sandbox...`);
+        stopExactSandboxOrThrow(containerName, expectedPredecessor);
+    } else if (forceRecreate && exactRuntimeRunning) {
         console.log(`[bwrap] ${agentName}: force recreating...`);
-        stopBwrapProcess(containerName);
+        stopExactSandboxOrThrow(containerName, runtimeIdentity);
         exactRuntimeRunning = false;
-    }
-
-    if (!forceRecreate && !exactRuntimeRunning && stopBwrapProcess(containerName)) {
-        console.log(`[bwrap] ${agentName}: runtime generation changed, replacing stale sandbox...`);
     }
 
     // Check if already running
@@ -1210,13 +1222,13 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
             : bwrapDependencyReuseProblem({ agentName, manifest, record: existingRecord, containerName });
         if (desired && desired !== current) {
             console.log(`[bwrap] ${agentName}: env hash changed, restarting...`);
-            stopBwrapProcess(containerName);
+            stopExactSandboxOrThrow(containerName, runtimeIdentity);
         } else if (agentLibProblem) {
             console.log(`[bwrap] ${agentName}: achillesAgentLib selection changed (${agentLibProblem}), restarting...`);
-            stopBwrapProcess(containerName);
+            stopExactSandboxOrThrow(containerName, runtimeIdentity);
         } else if (dependencyProblem) {
             console.log(`[bwrap] ${agentName}: dependency generation changed (${dependencyProblem}), restarting...`);
-            stopBwrapProcess(containerName);
+            stopExactSandboxOrThrow(containerName, runtimeIdentity);
         } else {
             debugLog(`[bwrap] ${agentName}: already running (PID ${getBwrapPid(containerName, runtimeIdentity)})`);
             const hostPort = allPortMappings[0]?.hostPort || 0;

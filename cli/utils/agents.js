@@ -18,7 +18,13 @@ import {
 import { findAgent } from './utils.js';
 import { getRuntimeForAgent, isSandboxRuntime } from '../sandbox/docker/common.js';
 import { resolveLlmRuntimeAdmissionContext } from '../sandbox/docker/llmRuntimeIntegration.js';
-import { isBwrapProcessRunning, stopBwrapProcess } from '../sandbox/bwrap/bwrapFleet.js';
+import {
+    isBwrapProcessRunning,
+    classifyRecordRuntime,
+    observeSandboxRuntime,
+    registeredRuntimeTuple,
+    stopBwrapProcess,
+} from '../sandbox/bwrap/bwrapFleet.js';
 import { REPOS_DIR, PLOINKY_WORKSPACE_ROOT } from './config.js';
 import { resolveAgentRepositoryPath } from './agentRepositorySource.mjs';
 import { resolveManifestRuntimeProfile } from './runtime/profileService.js';
@@ -410,6 +416,7 @@ function resolveAgentEnableInput({
         repoName,
         routerEndpoint,
         runtimeAdmission,
+        runtimeKind,
         shortAgentName,
     };
 }
@@ -433,6 +440,7 @@ function planAgentEnable({
         repoName,
         routerEndpoint,
         runtimeAdmission,
+        runtimeKind,
         shortAgentName,
     } = resolvedInput || resolveAgentEnableInput({ agentName, mode, repoNameParam, authOptions });
     const alias = normalizeAlias(aliasParam);
@@ -518,6 +526,10 @@ function planAgentEnable({
         runMode,
         develRepo: runMode === 'devel' ? String(normalized.repoNameParam || '') : undefined,
         type: 'agent',
+        // A native backend is recorded as soon as it is selected, so a record
+        // is never runtime-less once a native process can exist for it. The
+        // container engine is not resolved here; it is recorded at launch.
+        ...(runtimeKind === 'seatbelt' || runtimeKind === 'bwrap' ? { runtime: runtimeKind } : {}),
         instanceId,
         enableGeneration,
         config: {
@@ -814,6 +826,9 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
                 instanceId,
                 enableGeneration,
                 forceRecreate: true,
+                // The record this enable replaces, captured before the batch
+                // rotated the registry, is the only runtime it may stop.
+                expectedPredecessor: registeredRuntimeTuple(prepared.previousAgents?.[containerName]),
                 preservePreparedRegistryRecord: true,
                 preparedRegistryRecord: record,
                 preparationLease: prepared.preparedGeneration?.preparationLease,
@@ -1084,17 +1099,50 @@ function removeDisabledRuntimes(disabledRecords, {
     isSandboxRuntimeImpl = isSandboxRuntime,
     stopSandboxImpl = stopBwrapProcess,
     sandboxRunningImpl = isBwrapProcessRunning,
+    sandboxObserveImpl = observeSandboxRuntime,
+    classifyRecordRuntimeImpl = classifyRecordRuntime,
     containerExistsImpl = containerExists,
 } = {}) {
     const containerTargets = [];
     const containerRecords = {};
     let sandboxSignalled = false;
+    // Classify and observe every native target before the first signal: a
+    // runtime whose owner cannot be verified refuses the whole removal while
+    // nothing has been touched, so the caller restores the registration.
+    const nativeTargets = new Set();
     for (const { containerName, record } of disabledRecords) {
         if (isSandboxRuntimeImpl(record?.runtime)) {
+            nativeTargets.add(containerName);
+        } else if (!record?.runtime) {
+            const classified = classifyRecordRuntimeImpl(containerName, record);
+            if (classified.kind === 'native') nativeTargets.add(containerName);
+            else if (classified.kind === 'unknown') {
+                const error = new Error(`sandbox runtime '${containerName}' could not be verified (${classified.observation?.reason}); nothing was stopped`);
+                error.runtimeUntouched = true;
+                throw error;
+            }
+        }
+        if (nativeTargets.has(containerName)) {
+            const observed = sandboxObserveImpl(containerName);
+            if (observed?.state === 'unknown') {
+                const error = new Error(`sandbox runtime '${containerName}' could not be verified (${observed.reason}); nothing was stopped`);
+                error.runtimeUntouched = true;
+                throw error;
+            }
+        }
+    }
+    for (const { containerName, record } of disabledRecords) {
+        if (nativeTargets.has(containerName)) {
             sandboxSignalled = true;
             stopSandboxImpl(containerName);
             if (sandboxRunningImpl(containerName)) {
                 throw new Error(`sandbox runtime '${containerName}' is still running`);
+            }
+            // A stop is complete only when the exact process is observed gone;
+            // an unverifiable slot is never reported as removed.
+            const remaining = sandboxObserveImpl(containerName);
+            if (remaining?.state !== 'absent') {
+                throw new Error(`sandbox runtime '${containerName}' is still running or its stop could not be verified (${remaining?.state}: ${remaining?.reason})`);
             }
         } else {
             containerTargets.push(containerName);

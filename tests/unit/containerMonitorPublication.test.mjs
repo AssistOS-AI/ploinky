@@ -769,10 +769,14 @@ test('monitor rejects a malformed ensure result instead of reporting healthy reu
 
 test('sandbox monitor liveness keys the PID record by exact container name', () => {
     const source = fs.readFileSync(new URL('../../cli/server/containerMonitor.js', import.meta.url), 'utf8');
-    assert.match(source, /isBwrapProcessRunning\(target\.containerName, \{/);
+    // Liveness is the structured observation, not a boolean that reads an
+    // unknown or foreign owner as stopped (behaviour: containerMonitorStartPredecessor.test.mjs).
+    assert.match(source, /observeSandbox\(target\.containerName, \{/);
     assert.match(source, /instanceId: target\.instanceId/);
     assert.match(source, /enableGeneration: target\.enableGeneration/);
-    assert.doesNotMatch(source, /isBwrapProcessRunning\(target\.agentName\)/);
+    assert.match(source, /monitor\.observeSandboxRuntime \|\| observeSandboxRuntime/);
+    assert.doesNotMatch(source, /isBwrapProcessRunning/);
+    assert.doesNotMatch(source, /observeSandbox\(target\.agentName/);
 });
 
 test('semantic ownership probes recur, inactivate on failure, and force an exact replacement', () => {

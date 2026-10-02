@@ -105,7 +105,12 @@ import {
 import { deriveAgentPrincipalId } from '../../utils/security/agentIdentity.js';
 import { ensureSharedHostDir, runPostinstallHook } from './agentHooks.js';
 import { bwrapDependencyReuseProblem, ensureBwrapService } from '../bwrap/bwrapServiceManager.js';
-import { isBwrapProcessRunning, stopBwrapProcess } from '../bwrap/bwrapFleet.js';
+import {
+    clearBwrapPidIfExact,
+    normalizeExpectedPredecessor,
+    observeSandboxRuntime,
+    stopExactSandboxProcess,
+} from '../bwrap/bwrapFleet.js';
 import { ensureSeatbeltService, seatbeltDependencyReuseProblem } from '../seatbelt/seatbeltServiceManager.js';
 import { detectShellForImage, SHELL_FALLBACK_DIRECT } from './shellDetection.js';
 import {
@@ -3552,6 +3557,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         let sandboxStagedRegistryRecord = null;
         let sandboxRequiresEdgeActivation = false;
         let sandboxCleanupReceipt = null;
+        // The manager's own return, once it has one: only a runtime this call
+        // launched (createdByThisLaunch) is ever a candidate to clean up.
+        let sandboxLaunch = null;
         try {
             assertHostSandboxNetworkCompatibility(manifestNetwork, {
                 path: `manifest(${repoName}/${agentName}).network`,
@@ -3567,9 +3575,23 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                     enableGeneration: String(existingRecord.enableGeneration),
                 }
                 : null;
-            const anyRuntimeRunning = isBwrapProcessRunning(containerName);
+            // The tuple the caller proves it is replacing. Graph launches pass
+            // null: their predecessor was already removed by the graph removal
+            // step, so the slot must be empty or hold the exact successor.
+            // Passing nothing is the same as null: a caller gets no authority
+            // over a runtime it did not name.
+            const expectedPredecessor = normalizeExpectedPredecessor(options.expectedPredecessor);
+            const slotObservation = observeSandboxRuntime(containerName);
+            // An unknown slot is never absence: refuse before any identity is
+            // rotated, any receipt is written or any signal is sent.
+            if (slotObservation.state === 'unknown') {
+                throw sandboxOwnershipUnknownError(containerName, slotObservation);
+            }
+            const anyRuntimeRunning = slotObservation.state === 'live-exact';
             const runningAtEntry = Boolean(registeredIdentity)
-                && isBwrapProcessRunning(containerName, registeredIdentity);
+                && anyRuntimeRunning
+                && slotObservation.record.instanceId === registeredIdentity.instanceId
+                && slotObservation.record.enableGeneration === registeredIdentity.enableGeneration;
             const desiredEnvHash = computeEnvHash(manifest, profileConfig, routerEndpoint?.env || {}, {
                 agentName,
                 repoName,
@@ -3589,6 +3611,23 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 sandboxRecreateReason = 'dependencyGenerationChanged';
             }
             const requiresEdgeActivation = Boolean(existingRecord?.type === 'agent' && sandboxRecreateReason);
+            if (sandboxRecreateReason && anyRuntimeRunning) {
+                // A replacement stops the occupant, so only the tuple the caller
+                // named, or the exact successor a prepared record requests, may
+                // be there. Anything else is refused before the registry rotates.
+                const occupant = slotObservation.record;
+                const named = (tuple) => Boolean(tuple)
+                    && occupant.instanceId === tuple.instanceId
+                    && occupant.enableGeneration === tuple.enableGeneration;
+                const requestedSuccessor = String(options.instanceId || '') && String(options.enableGeneration || '')
+                    ? { instanceId: String(options.instanceId), enableGeneration: String(options.enableGeneration) }
+                    : null;
+                if (!named(expectedPredecessor) && !named(requestedSuccessor)) {
+                    const busy = new Error(`sandbox runtime ${containerName} is bound to a live process that is neither the requested successor nor the expected predecessor; no signal was sent`);
+                    busy.code = 'PLOINKY_SANDBOX_PID_SLOT_BUSY';
+                    throw busy;
+                }
+            }
             const runtimeIdentity = resolveReplacementRuntimeIdentity({
                 containerName,
                 existingRecord,
@@ -3649,6 +3688,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 preparedHostModeCapability,
                 runtimeAdmission: sandboxAdmission,
                 manifestBytes: preflightManifestBytes,
+                expectedPredecessor,
             };
             sandboxCleanupReceipt = advanceCandidateLifecycle(sandboxCleanupReceipt, {
                 phase: 'create-attempted',
@@ -3658,6 +3698,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             const result = agentRuntime === 'bwrap'
                 ? ensureBwrapService(agentName, manifest, agentPath, sandboxOptions)
                 : ensureSeatbeltService(agentName, manifest, agentPath, sandboxOptions);
+            sandboxLaunch = result;
             sandboxCleanupReceipt = advanceCandidateLifecycle(sandboxCleanupReceipt, {
                 phase: 'candidate-observed',
                 state: 'retryable-exact-id',
@@ -3689,18 +3730,24 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 instanceId: String(sandboxRuntimeIdentity?.instanceId || options.instanceId || existingRecord.instanceId || ''),
                 enableGeneration: String(sandboxRuntimeIdentity?.enableGeneration || options.enableGeneration || existingRecord.enableGeneration || ''),
             };
-            let exactCleanupPerformed = false;
-            if (identity.instanceId && identity.enableGeneration) {
-                try {
-                    if (isBwrapProcessRunning(containerName, identity)) {
-                        stopBwrapProcess(containerName, { expectedIdentity: identity });
-                    }
-                    exactCleanupPerformed = !isBwrapProcessRunning(containerName, identity);
-                } catch (cleanupError) {
-                    appendExactCleanupFailure(failure, cleanupError?.message || cleanupError);
-                }
-            }
-            if (sandboxCleanupReceipt) {
+            // Only a runtime this call launched is a candidate. A reused healthy
+            // runtime, the registered predecessor and a runtime the manager
+            // refused to touch are never stopped by a failure after them.
+            const candidateIdentity = {
+                instanceId: String(sandboxRuntimeIdentity?.instanceId || ''),
+                enableGeneration: String(sandboxRuntimeIdentity?.enableGeneration || ''),
+            };
+            const cleanupOutcome = resolveSandboxFailureCleanup({
+                containerName,
+                launch: sandboxLaunch,
+                error: err,
+                candidateIdentity,
+            });
+            const exactCleanupPerformed = cleanupOutcome.performed;
+            if (cleanupOutcome.detail) appendExactCleanupFailure(failure, cleanupOutcome.detail);
+            // A receipt that never reached create-attempted describes a call that
+            // launched nothing; there is no transition to record.
+            if (sandboxCleanupReceipt?.creationAttempted === true) {
                 try {
                     sandboxCleanupReceipt = advanceCandidateLifecycle(sandboxCleanupReceipt, exactCleanupPerformed
                         ? {
@@ -4446,6 +4493,123 @@ export function retireExactAgentRuntimePredecessor(predecessor, {
     });
 }
 
+/**
+ * Whether the runtime a failed sandbox start may have left behind is proven
+ * gone. Only a runtime this call launched is ever stopped.
+ *  - The manager returned (`launch`): a reused runtime is not a candidate; a
+ *    runtime this call launched is stopped by its exact tuple.
+ *  - The manager threw: it removed what it launched and flags a failure
+ *    (`exactCleanupFailed`). Without that flag the exact tuple is observed
+ *    again: only a verified absence (or a runtime that is not this call's, a
+ *    foreign tuple or a reused exact one) counts as clean. `unknown` never does.
+ */
+export function resolveSandboxFailureCleanup({
+    containerName,
+    launch,
+    error,
+    candidateIdentity,
+    observeImpl = observeSandboxRuntime,
+    stopImpl = stopExactSandboxProcess,
+} = {}) {
+    const hasCandidate = Boolean(candidateIdentity?.instanceId && candidateIdentity?.enableGeneration);
+    try {
+        if (launch === null || launch === undefined) {
+            if (error?.exactCleanupFailed === true) return { performed: false, detail: '' };
+            if (!hasCandidate) return { performed: true, detail: '' };
+            const observed = observeImpl(containerName, { expectedIdentity: candidateIdentity });
+            return observed.state === 'unknown'
+                ? { performed: false, detail: `candidate ownership could not be verified (${observed.reason})` }
+                : { performed: true, detail: '' };
+        }
+        if (launch.createdByThisLaunch !== true || !hasCandidate) return { performed: true, detail: '' };
+        // Only the exact candidate tuple is ever stopped. A foreign occupant
+        // proves the candidate absent and stays untouched; an unknown slot
+        // proves nothing and is never cleanup.
+        const observed = observeImpl(containerName, { expectedIdentity: candidateIdentity });
+        if (observed.state === 'absent' || observed.state === 'live-foreign') return { performed: true, detail: '' };
+        if (observed.state === 'live-exact') {
+            const stopped = stopImpl(containerName, candidateIdentity);
+            return { performed: stopped.state === 'absent' || stopped.state === 'stopped', detail: '' };
+        }
+        return { performed: false, detail: `candidate ownership could not be verified (${observed.reason})` };
+    } catch (cleanupError) {
+        return { performed: false, detail: String(cleanupError?.message || cleanupError) };
+    }
+}
+
+function sandboxRemovalAmbiguityError(containerName, detail) {
+    const error = new Error(`sandbox runtime '${containerName}': ${detail}`);
+    error.code = 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS';
+    return error;
+}
+
+function sandboxOwnershipUnknownError(containerName, observed) {
+    const error = new Error(
+        `sandbox runtime '${containerName}' ownership could not be verified (${observed.reason}); no signal was sent and its PID record was kept`,
+    );
+    error.code = observed.reason === 'invalid-record'
+        ? 'PLOINKY_SANDBOX_PID_RECORD_INVALID'
+        : 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS';
+    return error;
+}
+
+/**
+ * Removes the exact native (Seatbelt or bwrap) predecessor a registry record
+ * names. The record's own runtime selects this path; the successor's backend
+ * never does. Returns { removed, state, reason } and never throws for an
+ * ownership outcome:
+ *   absent   no live process owns this tuple (no record, a stale or zombie
+ *            record, or a live process under another tuple: the slot is
+ *            exclusive, so that tuple's owner is not this predecessor)
+ *   removed  the exact process was observed gone after termination
+ *   unknown  the PID record or process could not be verified; nothing was sent
+ *   refused / failed  the exact process was not stopped
+ * `process` is the pid/start identity captured when the receipt was written.
+ * When the PID record still carries the predecessor tuple it must equal it.
+ */
+export function removeExactSandboxPredecessor(containerName, predecessorRecord, {
+    process: capturedProcess = predecessorRecord?.process,
+    observeImpl = observeSandboxRuntime,
+    stopImpl = stopExactSandboxProcess,
+    timeout = 5000,
+} = {}) {
+    const name = String(containerName || '').trim();
+    const record = predecessorRecord;
+    if (!name || !record || record.type !== 'agent' || !isSandboxRuntime(record.runtime)
+        || !String(record.instanceId || '').trim() || !String(record.enableGeneration || '').trim()) {
+        throw new Error('exact sandbox predecessor removal requires its runtime key, native runtime and immutable tuple');
+    }
+    const identity = {
+        instanceId: String(record.instanceId),
+        enableGeneration: String(record.enableGeneration),
+    };
+    const observed = observeImpl(name, { expectedIdentity: identity });
+    if (observed.state === 'unknown') {
+        return { removed: false, state: 'unknown', reason: observed.reason };
+    }
+    const carriesTuple = observed.record
+        && observed.record.instanceId === identity.instanceId
+        && observed.record.enableGeneration === identity.enableGeneration;
+    if (carriesTuple && capturedProcess
+        && (observed.record.pid !== capturedProcess.pid
+            || observed.record.processIdentity !== capturedProcess.processIdentity)) {
+        return { removed: false, state: 'unknown', reason: 'captured-process-mismatch' };
+    }
+    if (observed.state === 'absent') {
+        // The predecessor's own stale record (exited, zombie, reused PID) goes
+        // by compare-and-delete; a record of another tuple is never touched.
+        if (carriesTuple) clearBwrapPidIfExact(observed.record);
+        return { removed: false, state: 'absent', reason: observed.reason };
+    }
+    if (observed.state === 'live-foreign') {
+        return { removed: false, state: 'absent', reason: 'slot-held-by-another-tuple' };
+    }
+    const stopped = stopImpl(name, identity, { timeout });
+    if (stopped.state === 'stopped') return { removed: true, state: 'removed', reason: stopped.reason };
+    if (stopped.state === 'absent') return { removed: false, state: 'absent', reason: stopped.reason };
+    return { removed: false, state: stopped.state, reason: stopped.reason };
+}
+
 export function cleanupExactAgentRuntimeCandidate(candidate) {
     const containerName = String(candidate?.containerName || '').trim();
     const record = candidate?.registryRecord;
@@ -4479,16 +4643,17 @@ export function cleanupExactAgentRuntimeCandidate(candidate) {
         throw error;
     }
     if (record.runtime === 'bwrap' || record.runtime === 'seatbelt') {
-        const identity = {
-            instanceId: record.instanceId,
-            enableGeneration: record.enableGeneration,
-        };
-        if (!isBwrapProcessRunning(containerName, identity)) {
+        const outcome = removeExactSandboxPredecessor(containerName, record);
+        if (outcome.state === 'absent') {
+            // Nothing owned by this tuple is live. A different tuple holding
+            // the slot is its owner's, and is left exactly as found.
             return { removed: false, state: 'absent' };
         }
-        const removed = stopBwrapProcess(containerName, { expectedIdentity: identity });
-        if (!removed || isBwrapProcessRunning(containerName, identity)) {
-            throw new Error('exact sandbox candidate remained live after cleanup');
+        if (outcome.state !== 'removed') {
+            throw sandboxRemovalAmbiguityError(
+                containerName,
+                `exact sandbox candidate remained live or unverified after cleanup (${outcome.state}: ${outcome.reason})`,
+            );
         }
         clearLivenessState(containerName);
         return { removed: true, state: 'removed' };

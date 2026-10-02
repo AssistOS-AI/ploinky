@@ -42,7 +42,7 @@ import {
     ensureAgentService
 } from '../sandbox/docker/index.js';
 import { getRuntimeForAgent, isSandboxRuntime } from '../sandbox/docker/common.js';
-import { isBwrapProcessRunning } from '../sandbox/bwrap/bwrapFleet.js';
+import { isBwrapProcessRunning, registeredRuntimeTuple } from '../sandbox/bwrap/bwrapFleet.js';
 import * as workspaceSvc from '../utils/workspace.js';
 import { handleSystemCommand, handleInvalidCommand, resetLlmInvokerCache } from './llmSystemCommands.js';
 import * as inputState from './inputState.js';
@@ -526,6 +526,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                                     routerEndpoint,
                                     runtimeAdmission: directAdmission.runtimeAdmission,
                                     networkLifecycleCapability,
+                                    expectedPredecessor: registeredRuntimeTuple(registryRecord?.record),
                                 });
                                 try {
                                     await waitForManifestReadiness({
@@ -579,6 +580,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                                 routerEndpoint,
                                 runtimeAdmission: directAdmission.runtimeAdmission,
                                 networkLifecycleCapability,
+                                expectedPredecessor: registeredRuntimeTuple(registryRecord?.record),
                             });
                             const {
                                 containerName: newContainerName,
