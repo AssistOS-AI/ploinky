@@ -266,7 +266,7 @@ export function createLlmWorld({ statePath, node, engine, host, gpu, faults = {}
     async function generating(work) {
         L.generating = true; model().gpuUtil = 45;
         if (faults.foreignDuringPrompt && !L.foreignAdded) { L.foreignAdded = true; world.addForeign(555); }
-        const until = Date.now() + (faults.generateMs ?? 1500); const wanted = L.inflightReads + (faults.generateReads ?? 2); const queries = model().smiQueries + (faults.generateGpuReads ?? 1);
+        const until = Date.now() + (faults.generateMs ?? 1500); const wanted = L.inflightReads + (faults.generateReads ?? 4); const queries = model().smiQueries + (faults.generateGpuReads ?? 3);
         try { while ((L.inflightReads < wanted || model().smiQueries < queries) && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 1)); return work(); }
         finally { L.generating = false; model().gpuUtil = 0; }
     }

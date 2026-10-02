@@ -24,7 +24,7 @@ import { fakeEngineInfo, worldState } from '../hardware-limits/fakeLiveEngine.mj
 import { createLlmWorld } from '../hardware-limits/fakeLiveLlm.mjs';
 import { LEAF_OBSERVATION } from '../hardware-limits/liveCaseCommands.mjs';
 import {
-    INFERENCE_TOLERANCE, INSUFFICIENT_RAM, LLM_BUDGET, LLM_IMAGE_DIGESTS, LLM_LEAF_SAMPLE, LLM_MODELS, LLM_RUNNER_PROCESSES, LLM_TOOL_CALL, VLLM_SHARE, VLLM_TOOL_PATH,
+    INFERENCE_MIN_IN_FLIGHT, INFERENCE_TOLERANCE, INSUFFICIENT_RAM, LLM_BUDGET, LLM_IMAGE_DIGESTS, LLM_LEAF_SAMPLE, LLM_MODELS, LLM_RUNNER_PROCESSES, LLM_TOOL_CALL, VLLM_SHARE, VLLM_TOOL_PATH,
     analyzeInference, insufficientMemoryPercent, llmToolWords, parseLeafSample, summarizeGpuCheck, validateLlmModelPins, validateLlmProfile, vllmToolWords,
 } from '../hardware-limits/liveLlmCommands.mjs';
 import { resolveMemoryPercent } from '../../cli/sandbox/hardwareLimits/resolve.mjs';
@@ -1099,4 +1099,51 @@ test('G2.prepare-live-apparatus-vllm-stage-two-checks-the-evidence-with-the-cand
     const f = prepareLlmFixture(t);
     const main = (await import('../hardware-limits/verify.mjs')).main;
     await assert.rejects(main(['prepare-live', '--config', f.configPath, '--block', 'apparatus-vllm', '--run', path.join(f.evidence, 'noev_claude.json'), '--pins', f.pinsFile('pins_noev_claude.json', f.pins({ image: LLM_IMAGE, vllm: VLLM_PINS })), '--stage', 'qualified']), /stage 2 \(qualified\) needs --calibration-evidence/);
+});
+
+// --- LLM1: the measurement must contain real in-flight observations ----------------------------------------------
+const leafAt = (label, atUs, usageUsec, extra = {}) => ({ label, atUs, usageUsec, nrPeriods: 1, nrThrottled: 0, throttledUsec: 0, cpuMax: '400000 100000', memoryMax: String(8 * GIB), swapMax: '0', memoryCurrent: GIB, memoryPeak: GIB, swapCurrent: 0, oom: 0, oomKill: 0, memoryHigh: 0, memoryMaxEvents: 0, ...extra });
+const gpuAt = (label, extra = {}) => ({ label, usedMiB: 700, utilizationPercent: 40, rows: [], runnerMiB: 600, ownedMiB: 900, runnerListed: 1, ownedListed: 2, ...extra });
+const analyzeSamples = (cgroup, gpu) => analyzeInference({ cgroup, gpu, cpus: 4, memoryCapBytes: 8 * GIB, shareMiB: 3072 });
+const cgroupRun = inFlight => [leafAt('before-send', 0, 0), ...Array.from({ length: inFlight }, (_, index) => leafAt('in-flight', (index + 1) * 250_000, (index + 1) * 250_000)), leafAt('after-response', (inFlight + 1) * 250_000, (inFlight + 1) * 250_000)];
+const gpuRun = inFlight => [gpuAt('before-send'), ...Array.from({ length: inFlight }, () => gpuAt('in-flight')), gpuAt('after-response')];
+
+test('LLM1.L1-with-an-instant-generation-is-blocked-and-never-passes-while-a-long-enough-one-passes', async t => {
+    assert.deepEqual(INFERENCE_MIN_IN_FLIGHT, { cgroup: 3, gpu: 2 }, 'the documented minimums');
+    // The model answers before either sampler ran: before and after samples exist, no in-flight sample does.
+    const instant = await provisioned(t, { faults: { promptInstant: true } });
+    const report = await liveCases(instant, ['LIVE-L1']);
+    const entry = caseOf(report, 'LIVE-L1');
+    assert.equal(entry.result, 'blocked', JSON.stringify(entry).slice(0, 600));
+    assert.match(entry.reason, /Only 0 CPU\/RAM sample\(s\) were taken while the model generated \(at least 3 are required\)/);
+    assert.match(entry.reason, /Only 0 GPU sample\(s\) were taken while the model generated \(at least 2 are required\)/);
+    assert.equal(report.verdict, 'BLOCKED');
+    const inference = instant.artifacts.get('gpu-live-l1').inference;
+    assert.deepEqual([inference.samples.inFlightCgroup, inference.samples.inFlightGpu], [0, 0]);
+    assert.deepEqual([inference.cgroupSamples[0].label, inference.cgroupSamples.at(-1).label], ['before-send', 'after-response'], 'before and after samples exist and do not count');
+    assert.deepEqual(inference.violations, []); assert.ok(inference.blockers.length >= 2, 'the evidence names what could not be measured');
+    nothingOwned(instant);
+    // A long-enough generation (the control) passes with at least the minimum in-flight samples.
+    const long = await provisioned(t);
+    const control = caseOf(await liveCases(long, ['LIVE-L1']), 'LIVE-L1');
+    assert.equal(control.result, 'pass', JSON.stringify(control).slice(0, 500));
+    const evidence = long.artifacts.get('gpu-live-l1').inference;
+    assert.ok(evidence.samples.inFlightCgroup >= INFERENCE_MIN_IN_FLIGHT.cgroup && evidence.samples.inFlightGpu >= INFERENCE_MIN_IN_FLIGHT.gpu, JSON.stringify(evidence.samples));
+    nothingOwned(long);
+});
+
+test('LLM1.the-analysis-needs-the-minimum-in-flight-samples-of-each-kind-and-counts-neither-before-nor-after', () => {
+    const min = INFERENCE_MIN_IN_FLIGHT;
+    const ok = analyzeSamples(cgroupRun(min.cgroup), gpuRun(min.gpu));
+    assert.deepEqual([ok.violations, ok.blockers], [[], []], 'exactly the minimum measures');
+    const fewCgroup = analyzeSamples(cgroupRun(min.cgroup - 1), gpuRun(min.gpu));
+    assert.deepEqual(fewCgroup.violations, []); assert.match(fewCgroup.blockers.join(), /Only 2 CPU\/RAM sample\(s\)/); assert.equal(fewCgroup.blockers.length, 1);
+    const fewGpu = analyzeSamples(cgroupRun(min.cgroup), gpuRun(min.gpu - 1));
+    assert.match(fewGpu.blockers.join(), /Only 1 GPU sample\(s\)/); assert.equal(fewGpu.blockers.length, 1);
+    const none = analyzeSamples(cgroupRun(0), gpuRun(0));
+    assert.equal(none.blockers.length, 2, 'only the before and after samples: nothing observed');
+    assert.deepEqual([none.summary.samples.cgroup, none.summary.samples.inFlightCgroup, none.summary.samples.gpu, none.summary.samples.inFlightGpu], [2, 0, 2, 0]);
+    // Setup or after-response samples relabelled never count, and a breach is still reported beside the blocker.
+    const breach = analyzeSamples([leafAt('before-send', 0, 0), leafAt('in-flight', 1_000_000, 100_000_000), leafAt('after-response', 2_000_000, 100_000_100)], gpuRun(min.gpu));
+    assert.ok(breach.violations.length >= 1 && breach.blockers.length === 1);
 });

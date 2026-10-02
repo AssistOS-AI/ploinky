@@ -178,10 +178,20 @@ for(const n of ['cpu.max','memory.max','memory.swap.max','memory.current','memor
 process.stdout.write(JSON.stringify(out));`;
 
 // The text request of LIVE-L1: long enough to be sampled while it generates (the tool's bounds are 200 characters and 512 tokens).
-export const L1_PROMPT = Object.freeze({ prompt: 'Write a numbered list of twenty short facts about graphics cards.', maxTokens: 256 });
+export const L1_PROMPT = Object.freeze({ prompt: 'Write a numbered list of forty short facts about graphics cards.', maxTokens: 512 });
 
 // While the model generates: the cgroup is sampled every 250 ms (plus the time of one read) and the GPU at the gate's own cadence of 500 ms.
 export const INFERENCE_CADENCE = Object.freeze({ sampleMs: 250, gpuMs: 500 });
+
+// The least number of samples that must be taken WHILE the model generates; the samples before the request and
+// after the response never count. A cgroup sample is a podman-exec read of the agent's leaf (a few hundred
+// milliseconds each at the 250 ms cadence) and a GPU sample a gate check at 500 ms, so:
+//   cgroup 3: the response was observed across at least two intervals between in-flight samples, which is what the
+//             between-samples CPU check needs and what makes the first and last in-flight values a window;
+//   gpu 2:    the runner's device memory was listed at least twice while it generated, at least 500 ms apart.
+// A generation that finishes sooner than that cannot be measured: the case is BLOCKED, never PASS. The L1 prompt asks
+// for the tool's longest answer (512 tokens) so that a normal run is far above both minimums.
+export const INFERENCE_MIN_IN_FLIGHT = Object.freeze({ cgroup: 3, gpu: 2 });
 
 // What the analysis allows beyond the strict limits, each with its reason.
 //   CPU: usage over a window may exceed quota x wall time by 10 % (the kernel charges usage per 100 ms
@@ -224,9 +234,13 @@ export function summarizeGpuCheck(label, checked, runnerHostPids, at = Date.now(
  * (the case fails); `blockers` are measurements that could not be made (the case is BLOCKED, never
  * PASS); `summary` is the evidence either way. The first and last cgroup samples bound the window.
  */
-export function analyzeInference({ cgroup, gpu, cpus, memoryCapBytes, shareMiB, tolerance = INFERENCE_TOLERANCE }) {
+export function analyzeInference({ cgroup, gpu, cpus, memoryCapBytes, shareMiB, tolerance = INFERENCE_TOLERANCE, minInFlight = INFERENCE_MIN_IN_FLIGHT }) {
     const violations = []; const blockers = [];
     const summary = { samples: { cgroup: cgroup.length, inFlightCgroup: cgroup.filter(sample => sample.label === 'in-flight').length, gpu: gpu.length, inFlightGpu: gpu.filter(sample => sample.label === 'in-flight').length } };
+    // Measurements taken while the model generated: a response that came back before the samplers ran leaves only the
+    // before and after samples, which bound a window but observe nothing of the inference.
+    if (summary.samples.inFlightCgroup < minInFlight.cgroup) blockers.push(`Only ${summary.samples.inFlightCgroup} CPU/RAM sample(s) were taken while the model generated (at least ${minInFlight.cgroup} are required), so the generation was too short to be measured`);
+    if (summary.samples.inFlightGpu < minInFlight.gpu) blockers.push(`Only ${summary.samples.inFlightGpu} GPU sample(s) were taken while the model generated (at least ${minInFlight.gpu} are required), so the generation was too short to be measured`);
     if (cgroup.length < 2 || cgroup.some(sample => sample.atUs === null || sample.usageUsec === null)) { blockers.push('The cgroup samples around the inference are missing or unreadable, so the CPU use cannot be measured'); return { violations, blockers, summary }; }
     // CPU: the quota in every sample, and the use over the whole window and between neighbours.
     const quota = String(cpus);
