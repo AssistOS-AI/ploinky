@@ -1417,3 +1417,22 @@ test('R2E.a-foreign-gpu-process-during-the-install-pause-aborts-the-install-wait
     assert.equal(artifact.install, undefined, 'the case stopped during the install wait');
     assert.equal(w.fake.model.signals.length, 0); nothingOwned(w);
 });
+
+// --- R2E(b): a model load that is too slow is BLOCKED, as the approval summary promises ---------------------------
+test('R2E.a-model-load-that-does-not-finish-in-time-is-blocked-with-its-progress-for-l1-and-l3', async t => {
+    for (const [label, options, id, pattern] of [
+        ['L1', { faults: { stalled: true } }, 'LIVE-L1', /l1-ready did not finish within 60 ms \(phase /],
+        ['L3 stage 2', { block: 'apparatus-vllm', vllm: stageTwo(true), qualified: true, faults: { stalled: true } }, 'LIVE-L3', /l3-ready did not finish within 60 ms \(phase /],
+    ]) {
+        const w = await provisioned(t, options);
+        w.run.deadlines.modelLoadMs = 60;
+        const report = await liveCases(w, [id]);
+        const entry = caseOf(report, id);
+        assert.equal(entry.result, 'blocked', `${label}: ${JSON.stringify(entry).slice(0, 400)}`); assert.match(entry.reason, pattern, label);
+        assert.equal(report.verdict, 'BLOCKED', label);
+        assert.equal(report.cleanup.state, 'complete', label); nothingOwned(w);
+    }
+    // A load that fails (the runner exits) stays a failure of the case.
+    const w = await provisioned(t, { faults: { loadFails: true } });
+    assert.equal(caseOf(await liveCases(w, ['LIVE-L1']), 'LIVE-L1').result, 'fail');
+});

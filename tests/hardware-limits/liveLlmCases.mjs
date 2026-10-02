@@ -325,7 +325,7 @@ export function createLlmCases(ctx) {
             await gate.check('L1-before-run', { minFreeMiB: shareMemoryMiB(limits.gpu.vramPercent, gpu.memoryMiB) + 256 });
             const accepted = await toolOk('run-l1', 'local_llm_run', { requestId: requestId('l1'), modelId: LLM_MODELS.small, runnerId: 'llama.cpp', params: {}, replace: false }, { mutating: true });
             evidence.step('run-accepted', { accepted: accepted?.accepted ?? null, deployment: accepted?.deployment?.phase ?? null });
-            const ready = await gate.monitor(abort => waitDeployment(evidence, 'l1-ready', { done: status => status.phase === 'ready', signal: abort, deadlineMs: modelLoadMs }));
+            const ready = await gate.monitor(abort => waitDeployment(evidence, 'l1-ready', { done: status => status.phase === 'ready', signal: abort, deadlineMs: modelLoadMs, timeout: 'blocked' }));
             const deployment = ready.deployment;
             evidence.put('deployment', deployment);
             expects(deployment.modelId === LLM_MODELS.small && deployment.runnerId === 'llama.cpp', 'The deployment is not the requested model on llama.cpp');
@@ -604,7 +604,7 @@ export function createLlmCases(ctx) {
 
         await gate.check('L3-before-run', { minFreeMiB: shareMemoryMiB(llm.vllm.share.vramPercent, gpu.memoryMiB) + 256 });
         await toolOk('run-l3', 'local_llm_run', { requestId: requestId('l3'), modelId: LLM_MODELS.awq, runnerId: 'vllm', params: {}, replace: false }, { mutating: true });
-        const ready = await gate.monitor(abort => waitDeployment(evidence, 'l3-ready', { done: status => status.phase === 'ready', signal: abort, deadlineMs: modelLoadMs }));
+        const ready = await gate.monitor(abort => waitDeployment(evidence, 'l3-ready', { done: status => status.phase === 'ready', signal: abort, deadlineMs: modelLoadMs, timeout: 'blocked' }));
         evidence.put('deployment', ready.deployment);
         evidence.put('runnerReport', ready.runnerReport);
         const processes = await runnerProcesses(agent, 'vllm');
