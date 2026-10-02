@@ -1455,6 +1455,15 @@ export function verifyReusableHardwareRuntime(runtimeAdmission, {
 // under its still-live lock. Independent service calls get a fresh adapter.
 const SERVICE_NETWORK_LIFECYCLE = Symbol('serviceNetworkLifecycle');
 
+/**
+ * The image a launch creates its container from, and the image identity the dependency installer records. A GPU share
+ * launch creates from the prepared image's immutable ID (the hardware launch capability); the installer identity is the
+ * resolved reference either way.
+ */
+export function selectLaunchImages({ resolvedImage, launch = null } = {}) {
+    return Object.freeze({ image: launch ? launch.imageId : resolvedImage, installerImage: resolvedImage });
+}
+
 function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const repoName = resolveAgentRepositoryName(agentPath);
     const containerName = options.containerName || getAgentContainerName(agentName, repoName);
@@ -1667,10 +1676,14 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         throw new Error(`[image] ${agentName}: no container image resolved (manifest container unresolved and no catalog image selected).`);
     }
 
-    if (runtimeAdmission.descriptor.hardwareGpu) {
-        const launch = readMpsLaunch(options.mpsLaunch, hardwareInstanceKey, runtimeAdmission.descriptor.hardwareGpu);
-        image = launch.imageId;
-    }
+    // The container is created from the immutable image ID of a GPU share launch; the dependency installer's identity
+    // (runtime-key probe and cache stamp) stays the resolved image reference in every path, so a recreate by ID is not an
+    // "installer image changed" for the cache the reference start prepared.
+    const { image: launchImage, installerImage } = selectLaunchImages({
+        resolvedImage: image,
+        launch: runtimeAdmission.descriptor.hardwareGpu ? readMpsLaunch(options.mpsLaunch, hardwareInstanceKey, runtimeAdmission.descriptor.hardwareGpu) : null,
+    });
+    image = launchImage;
 
     // Get profile mount modes (profile overrides default if provided)
     const {
@@ -1714,7 +1727,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             : null;
         const runtimeKey = adoptManagedRuntimeOnly
             ? (adoptionCacheMount?.runtimeKey || NO_NODE_RUNTIME_KEY)
-            : detectRuntimeKeyForAgent(manifest, repoName, agentName, profileConfig, image);
+            : detectRuntimeKeyForAgent(manifest, repoName, agentName, profileConfig, installerImage);
         const dependencyPlan = resolveDependencyCachePreparation({
             needsCoreDeps,
             agentHasPackageJson,
@@ -1735,7 +1748,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                     agentName,
                     runtimeKey,
                     agentPackagePath,
-                    image,
+                    image: installerImage,
                     runtime,
                 });
                 if (!inspected.valid) {
@@ -1751,7 +1764,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                     agentName,
                     runtimeKey,
                     agentPackagePath,
-                    image,
+                    image: installerImage,
                     runtime,
                 });
                 preparedNodeModulesDir = nodeModulesDir(prepared.cachePath);

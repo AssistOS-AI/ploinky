@@ -670,6 +670,12 @@ export function buildRequiredCaseManifest() {
             'W2.a-successful-readback-is-journaled-too-the-captured-fixture',
             'W2.every-reply-parse-error-carries-the-sanitized-reply-and-the-grammar-stays-strict',
         ]),
+        // LIVE-P1: a recreate by image ID keeps the dependency installer's identity.
+        ...leaves(P, 'p4', unit('hardwareLimitsInstallerImage.test.mjs'), [
+            'W4.a-start-by-reference-then-a-recreate-by-id-of-the-same-image-is-no-installer-change',
+            'W4.a-different-image-still-reports-an-installer-change',
+            'W4.the-dependency-preparation-sites-use-the-installer-identity-and-the-container-uses-the-launch-image',
+        ]),
         ...leaves(P, 'p4', unit('hardwareLimitsMpsCandidateRecovery.test.mjs'), [
             'MC.readiness-failure-then-retry-succeeds', 'MC.readiness-failure-leaving-the-candidate-removes-it-by-id',
             'MC.non-exact-candidate-is-refused-without-daemon-change', 'MC.crash-during-readiness-then-recovery',
