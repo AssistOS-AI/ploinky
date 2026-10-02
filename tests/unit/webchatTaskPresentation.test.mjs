@@ -205,6 +205,17 @@ test('task logs render multiline Markdown using the final-message renderer', t =
     assert.equal(html, globalThis.webchatMarkdown.render(text));
 });
 
+test('user input renders as its own Markdown block between assistant outputs', t => {
+    const container = logFixture(t);
+    renderTaskLog(container, 'Previous output\nyou> Continue where you left off\nyou> **Keep** the same scope\n\nWorking again');
+    assert.equal(container.children.length, 3);
+    assert.match(container.children[1].className, /is-user-prompt/);
+    assert.match(container.children[1].innerHTML, /Continue where you left off/);
+    assert.match(container.children[1].innerHTML, /<strong>Keep<\/strong>/);
+    assert.doesNotMatch(container.children[0].className, /is-user-prompt/);
+    assert.doesNotMatch(container.children[2].className, /is-user-prompt/);
+});
+
 test('stream updates reparse a complete code block while retaining final-output boundaries', t => {
     const container = logFixture(t);
     const start = '[worker stdout] # Progress\n[worker stdout] ```js\n[worker stdout] const value = 1;';

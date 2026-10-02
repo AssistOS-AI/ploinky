@@ -150,23 +150,35 @@ export function createComposer({ cmdInput, sendBtn, cancelBtn }, { purgeTriggerR
             return false;
         }
 
-        const revision = draftRevision;
-        const isCurrentDraft = () => draftRevision === revision && cmdInput.value === value;
+        let revision = draftRevision;
+        let expectedValue = value;
+        let cleared = false;
+        let accepted = false;
+        const isCurrentDraft = () => draftRevision === revision && cmdInput.value === expectedValue;
         isSubmitting = true;
         updateAvailability();
         try {
-            const result = typeof onSend === 'function'
-                ? await onSend(value, { isCurrentDraft })
+            // Let the handler capture attachments and references before input changes.
+            const pending = typeof onSend === 'function'
+                ? onSend(value, { isCurrentDraft })
                 : false;
+            if (isCurrentDraft()) {
+                clear();
+                revision = draftRevision;
+                expectedValue = '';
+                cleared = true;
+            }
+            const result = await pending;
             if (result === true) {
-                if (isCurrentDraft()) clear();
+                accepted = true;
                 return true;
             }
             return false;
         } catch (_) {
-            // The transport owns the error feedback. Keep the unaccepted draft.
+            // The transport owns the error feedback.
             return false;
         } finally {
+            if (!accepted && cleared && isCurrentDraft()) setValue(value);
             isSubmitting = false;
             updateAvailability();
             focusAfterAction();
