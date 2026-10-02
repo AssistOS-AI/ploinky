@@ -449,6 +449,12 @@ function observerFs(fake) {
             try { return fake.readFileSync(target); }
             catch (error) { const file = error.code === 'ENOENT' && interfaceFile(target); if (!file) throw error; return `${file.value}\n`; }
         },
+        // A real observer has the whole fs module; any write it attempts
+        // reaches the hierarchy, where the snapshot comparison sees it.
+        writeFileSync: (...args) => fake.writeFileSync(...args),
+        mkdirSync: (...args) => fake.mkdirSync(...args),
+        chownSync: (...args) => fake.chownSync(...args),
+        rmdirSync: (...args) => fake.rmdirSync(...args),
     };
 }
 function observeLayout(fsApi) {
@@ -621,14 +627,16 @@ function cgroupSnapshot(fake) {
     }
     return JSON.stringify({ groups, pids: [...fake.pidGroup.entries()].sort(), writes: fake.writes, chowns: fake.chowns, mkdirs: fake.mkdirs });
 }
-// A write-trapping view: every mutating call is counted and refused.
+// A write-trapping view: every mutating call is recorded and then applied to
+// the hierarchy, so a proof that writes is caught both by the recorded
+// attempts and by the byte-identical snapshot comparison.
 const MUTATING = new Set(['writeFileSync', 'mkdirSync', 'chownSync', 'rmdirSync', 'chmodSync', 'renameSync', 'unlinkSync', 'rmSync', 'appendFileSync', 'symlinkSync', 'linkSync', 'openSync']);
 function writeTrap(fake) {
     const attempts = [];
     const view = new Proxy(fake, {
         get(target, property) {
-            if (MUTATING.has(property)) return (...args) => { attempts.push([property, String(args[0])]); throw Object.assign(new Error(`trapped ${property}`), { code: 'EPERM' }); };
             const value = Reflect.get(target, property, target);
+            if (MUTATING.has(property)) return (...args) => { attempts.push([property, String(args[0])]); return value.apply(target, args); };
             return typeof value === 'function' ? value.bind(target) : value;
         },
     });
@@ -640,8 +648,8 @@ async function proveOnFake(t, fake, options) {
     const before = cgroupSnapshot(fake);
     const trap = writeTrap(fake);
     const c1 = await runC1(t, { fake: trap.view }, options);
-    assert.deepEqual(trap.attempts, []);
     assert.equal(cgroupSnapshot(fake), before, 'the C1 proof changed the cgroup fixture');
+    assert.deepEqual(trap.attempts, []);
     assert.ok(!c1.kinds.includes('preparation'));
     return c1;
 }
