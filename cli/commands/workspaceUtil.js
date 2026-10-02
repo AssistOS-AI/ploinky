@@ -1466,6 +1466,18 @@ export function createGraphAvailabilityTracker(graph, admissions, { explicitWait
 }
 
 /**
+ * Fold one MPS graph preparation into the start's availability: a contained
+ * preparation failure refuses only the graph's GPU-share agents (U10, §9.1),
+ * whose nodes are then excluded from launch while every other node starts.
+ */
+export function recordMpsGraphPreparation(prepared, { availability, unavailableNodeIds, warn = (line) => console.warn(line) }) {
+  if (prepared.diagnostic) warn(`[hardware-limits] ${prepared.diagnostic.message}. ${prepared.diagnostic.fix}`);
+  for (const refusal of prepared.refusals || []) availability.recordLaunchRefusal(refusal);
+  for (const entry of availability.unavailableEntries()) unavailableNodeIds.add(entry.nodeId);
+  return prepared;
+}
+
+/**
  * The availability projection for each unavailable exact instance that has a
  * registry record: its logical route key and the validated projection that
  * removes every runtime target (§9.2, §9.4).
@@ -2643,13 +2655,10 @@ async function startWorkspace(staticAgentArg, portArg, {
     const mpsGraphNodes = () => [...dependencyGraph.nodes.values(), ...extraRuntimeNodes].map((node) => {
       return { key: graphNodeRegistryKey(node, reg, dockerSvc.getAgentContainerName), node };
     });
-    const prepareGraphMps = async () => {
-      const prepared = await prepareMpsGraph({ nodes: mpsGraphNodes(), networkLifecycleCapability });
-      if (prepared.diagnostic) console.warn(`[hardware-limits] ${prepared.diagnostic.message}. ${prepared.diagnostic.fix}`);
-      for (const refusal of prepared.refusals || []) graphAvailability.recordLaunchRefusal(refusal);
-      for (const entry of graphAvailability.unavailableEntries()) unavailableNodeIds.add(entry.nodeId);
-      return prepared;
-    };
+    const prepareGraphMps = async () => recordMpsGraphPreparation(
+      await prepareMpsGraph({ nodes: mpsGraphNodes(), networkLifecycleCapability }),
+      { availability: graphAvailability, unavailableNodeIds },
+    );
     let mpsGraphPreparation = await prepareGraphMps();
     const mpsReplacementReason = (plan, options) => mpsGraphPreparation.replacedKeys.has(plan.existing.key)
       ? 'mpsCohortTransition' : graphNodeRuntimeReplacementReason(plan, options);

@@ -729,3 +729,73 @@ test('O.managed-refusal-candidate-removed', () => {
     Object.defineProperty(done, 'ploinkyRestartCandidate', { value: { containerId: 'b'.repeat(64), exactCleanupPerformed: true } });
     serviceManager.cleanupFailedServiceCandidate(done, { containerName: 'ploinky_demo_b', network: {}, removeCandidate: () => assert.fail('removed twice') });
 });
+
+// ---------------------------------------------------------------------------
+// The start composition with an MPS graph-preparation refusal: the real
+// prepareMpsGraph contains a pre-mutation failure as refusals of the GPU-share
+// agents, recordMpsGraphPreparation (what startWorkspace calls) folds them into
+// the start's availability, and the shared containment and wave launcher
+// start Explorer and the CPU-only agent while only the GPU agent is refused.
+const mpsGraphModule = await import(new URL('../../cli/sandbox/hardwareLimits/mpsGraph.mjs', import.meta.url).href);
+const mpsEligibility = await import(new URL('../../cli/sandbox/hardwareLimits/mpsEligibility.mjs', import.meta.url).href);
+
+test('O.mps-graph-refusal-starts-cpu-agents-and-explorer', async () => {
+    const node = (id, dependencies = []) => ({ id, dependencies: new Set(dependencies), dependencyEdges: new Map(dependencies.map((child) => [child, { noWait: false }])) });
+    // explorer --blocking--> cpu; gpu is an independent GPU-share agent.
+    const nodes = new Map([['demo/explorer', node('demo/explorer', ['demo/cpu'])], ['demo/cpu', node('demo/cpu')], ['demo/gpu', node('demo/gpu')]]);
+    const keys = { 'demo/explorer': 'ploinky_demo_explorer', 'demo/cpu': 'ploinky_demo_cpu', 'demo/gpu': 'ploinky_demo_gpu' };
+    const admissions = Object.entries(keys).map(([nodeId, key]) => ({ nodeId, key, alias: '', admission: { agentId: nodeId }, hardwareRefusal: null }));
+    const registry = Object.fromEntries(Object.entries(keys).map(([nodeId, key]) => [key, { type: 'agent', repoName: 'demo', agentName: nodeId.split('/')[1], instanceId: `${key}-i`, enableGeneration: `${key}-g`, containerId: null }]));
+    const registryNameByNodeId = new Map(Object.entries(keys));
+    const graph = { nodes };
+    const availability = workspaceUtil.createGraphAvailabilityTracker(graph, admissions);
+    const unavailableNodeIds = new Set(availability.unavailableEntries().map((entry) => entry.nodeId));
+    const warnings = [];
+    const share = { smPercent: 25, vramPercent: 25, memoryMiB: 1024, deviceUuid: 'GPU-12345678-1234-1234-1234-123456789012', driverVersion: '550.1', wiringFingerprint: 'f'.repeat(64) };
+    const prepared = await mpsGraphModule.prepareMpsGraph({
+        nodes: Object.entries(keys).map(([nodeId, key]) => ({ key, node: { agentRef: nodeId, manifest: {} } })), networkLifecycleCapability: {},
+    }, {
+        readContext: () => ({ gate: 'on', overrides: new Map([['demo/gpu', { gpu: { smPercent: 25, vramPercent: 25 } }]]), storeToken: { epoch: '0'.repeat(32), revision: 1 }, gpu: {} }),
+        loadRegistry: () => registry, readApplied: () => null, store: { read: () => null, write: () => assert.fail('no journal write') },
+        backend: { observe: () => ({ state: 'gone' }), verify: () => false, stop: () => assert.fail('no daemon change'), start: () => assert.fail('no daemon change') },
+        assertCapability: () => {}, readSelection: () => ({ selector: { state: 'inactive' } }), resolveShare: () => share, runtime: () => 'podman',
+        observeClients: () => { throw new mpsEligibility.MpsError('The complete MPS client inventory is unavailable'); },
+    });
+    workspaceUtil.recordMpsGraphPreparation(prepared, { availability, unavailableNodeIds, warn: (line) => warnings.push(line) });
+    assert.deepEqual([...unavailableNodeIds], ['demo/gpu']);
+    assert.match(warnings[0], /inventory is unavailable/);
+    const routes = Object.fromEntries(Object.entries(registry).map(([key, record]) => [record.agentName, { container: key, hostPort: 40000 }]));
+    const containment = workspaceUtil.createStartLaunchContainment({
+        availability, registry: () => registry, registryNameByNodeId,
+        applyUnavailableRoutes: async (unavailableRoutes) => { for (const { routeKey, projection } of unavailableRoutes) routes[routeKey] = availabilityModule.markRouteHardwareUnavailable(routes[routeKey], projection); },
+        log: { error() {}, warn() {} },
+    });
+    await containment.markUnavailable(availability.unavailableEntries());
+    const ensureCalls = []; const readiness = [];
+    const launch = (names) => containment.launchTargets(names, {
+        launchOne: async (name) => { ensureCalls.push(name); const routeKey = registry[name].agentName; return { ok: true, containerName: name, routeKey, shortAgentName: routeKey, route: { container: name, hostPort: 41000 } }; },
+        commitResults: async (results) => { for (const result of results) if (result?.ok) routes[result.routeKey] = result.route; },
+    });
+    const waves = await workspaceUtil.launchWorkspaceGraphWaves({
+        graphWaves: [['demo/cpu', 'demo/gpu'], ['demo/explorer']], nodes, registryNameByNodeId, availability, launch,
+        readinessEntryFor: (entry) => registryNameByNodeId.get(entry.id), waitForReadiness: async (entries) => { readiness.push(...entries); },
+        reportOutcome: containment.reportOutcome, log() {},
+    });
+    const summary = outcomes.summarizeStartResult({
+        readyAgents: waves.readyAgentKeys.map((key) => ({ key })),
+        refusedAgents: containment.hardwareOutcomes.refused, blockedAgents: containment.hardwareOutcomes.blocked,
+    });
+    assert.deepEqual(ensureCalls.sort(), ['ploinky_demo_cpu', 'ploinky_demo_explorer']);
+    assert.deepEqual(readiness.sort(), ['ploinky_demo_cpu', 'ploinky_demo_explorer']);
+    assert.equal(summary.state, 'degraded');
+    assert.deepEqual(summary.refusedAgents.entries.map((entry) => entry.key), ['ploinky_demo_gpu']);
+    assert.equal(summary.blockedAgents.count, 0);
+    const refusal = availability.outcomeForKey('ploinky_demo_gpu');
+    assert.equal(refusal.reasonCode, 'gpu_sharing_unavailable');
+    assert.match(refusal.reason, /inventory is unavailable/);
+    assert.ok(refusal.fix.length > 0);
+    assert.equal(routes.gpu.hostPort, undefined);
+    assert.equal(routes.gpu.hardwareAvailability.state, 'refused');
+    assert.equal(routes.explorer.hostPort, 41000);
+    assert.equal(routes.cpu.hostPort, 41000);
+});
