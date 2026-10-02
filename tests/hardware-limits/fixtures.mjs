@@ -602,6 +602,10 @@ export function buildRequiredCaseManifest() {
             'Y2.a-blocked-case-before-any-apply-says-so-and-a-failing-artifact-writer-is-recorded',
             'Y2.a-failed-or-blocked-mps-case-that-ran-requires-its-failure-evidence-and-a-missing-item-is-reported',
             'Y2.the-failure-evidence-program-reads-state-last-problem-and-bounded-logs-read-only',
+            // LIVE-P1 attempt 3: the cleanup order lists the helper stop and the identity proof; the journal records both.
+            'Y4.a-live-run-journals-the-helper-stop-and-the-identity-proof-in-the-plan-order',
+            'Y4.a-standalone-cleanup-journals-the-helper-stop-as-skipped-with-its-reason-and-still-proves-identity',
+            'Y4.a-failed-identity-proof-stays-at-intent-and-nothing-after-it-runs',
         ]),
         ...leaves(P, 'p4', unit('hardwareLimitsLiveProvision.test.mjs'), ['G1.prepare-live-apparatus-mps-concrete-manifest-and-summary']),
         ...leaves(P, 'p4', unit('hardwareLimitsMps.test.mjs'), [

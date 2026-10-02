@@ -524,7 +524,17 @@ export function createLiveAdapter(profile, {
         // (and, for a model block, none of its model data). A failure of the last
         // step is a cleanup failure, never erased.
         const hooks = llm || gpu;
-        if (hooks) { try { await hooks.beforeCleanup(); } catch (error) { run.cleanup.failures.push(`GPU pre-cleanup: ${String(error?.message || error).slice(0, 200)}`); } }
+        if (hooks) {
+            // Journaled like every other cleanup step (plan 15.6): a report shows the helpers were stopped, or that there were none.
+            let entry = run.cleanup.steps.find(value => value.id === 'gpu-stop-owned-helpers');
+            if (!entry) { entry = { id: 'gpu-stop-owned-helpers', state: 'intent', artifact: null }; run.cleanup.steps.push(entry); }
+            entry.state = 'intent'; persist();
+            try {
+                await hooks.beforeCleanup({ record: facts => { Object.assign(entry, { helpers: facts.helpers, removed: facts.removed }); } });
+                entry.state = 'complete';
+            } catch (error) { entry.state = 'failed'; run.cleanup.failures.push(`GPU pre-cleanup: ${String(error?.message || error).slice(0, 200)}`); }
+            persist();
+        }
         await runOwnedCleanup({ run, profile, persist, processProvider, signal: cleanupSignal });
         if (hooks) await hooks.afterCleanup();
     }
@@ -573,6 +583,11 @@ export async function executeCleanupRun({ run, persist = () => {}, processProvid
     const timer = setTimeout(() => controller.abort(), Number.isInteger(run.deadlines?.cleanupMs) ? run.deadlines.cleanupMs : 5 * 60 * 1000);
     try {
         const scope = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+        // A standalone cleanup runs in a new process: no helper of the live run is registered in it, and every nested
+        // container goes with the Box. The step is journaled as skipped, with that reason, never left out.
+        if (profile.gpu && !run.cleanup.steps.some(value => value.id === 'gpu-stop-owned-helpers')) {
+            run.cleanup.steps.push({ id: 'gpu-stop-owned-helpers', state: 'skipped', artifact: null, reason: 'no helper is registered in this process; the nested containers go with the Box' }); persist();
+        }
         await runOwnedCleanup({ run, profile, persist, processProvider, signal: scope });
         // A GPU block is certified clean only after a SUCCESSFUL final GPU observation, here
         // as in the live run; the registered processes are the manifest's own records, so a

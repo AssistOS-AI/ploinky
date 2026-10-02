@@ -1586,3 +1586,34 @@ test('Y2.the-failure-evidence-program-reads-state-last-problem-and-bounded-logs-
     const bare = JSON.parse((await runProgram(fake.localize(MPS_FAILURE_EVIDENCE), [], {})).stdout);
     assert.equal(bare.state, null); assert.equal(bare.daemon, null); assert.equal(bare.logs.length, 2);
 });
+
+// --- Y4: every step of the cleanup order is journaled, run or skipped, never left out --------------------------
+test('Y4.a-live-run-journals-the-helper-stop-and-the-identity-proof-in-the-plan-order', async t => {
+    const w = await provisioned(t);
+    const report = await liveCases(w, ['LIVE-P1']);
+    assert.equal(caseOf(report, 'LIVE-P1').result, 'pass', JSON.stringify(report.limitations)); assert.equal(w.run.cleanup.state, 'complete');
+    assert.deepEqual(w.run.cleanup.steps.map(entry => [entry.id, entry.state]), [['gpu-stop-owned-helpers', 'complete'], ['revalidate-identity', 'complete'], ['destroy-box', 'complete'], ['host-records', 'complete'], ['workspace-removal', 'complete'], ['verify-absent', 'complete']]);
+    const stop = w.run.cleanup.steps[0];
+    assert.deepEqual([stop.helpers, stop.removed], [0, 0], 'no helper was registered, and the step says so');
+    assert.deepEqual(w.run.target.plan.cleanup.map(entry => entry.id).slice(0, 3), ['gpu-stop-owned-helpers', 'revalidate-identity', 'destroy-box']);
+    nothingOwned(w);
+});
+
+test('Y4.a-standalone-cleanup-journals-the-helper-stop-as-skipped-with-its-reason-and-still-proves-identity', async t => {
+    const w = await provisioned(t);
+    const report = await w.cleanup();
+    assert.equal(report.verdict, 'PASS', JSON.stringify(report.limitations));
+    assert.deepEqual(w.run.cleanup.steps.map(entry => [entry.id, entry.state]), [['gpu-stop-owned-helpers', 'skipped'], ['revalidate-identity', 'complete'], ['destroy-box', 'complete'], ['host-records', 'complete'], ['workspace-removal', 'complete'], ['verify-absent', 'complete']]);
+    assert.match(w.run.cleanup.steps[0].reason, /no helper is registered in this process; the nested containers go with the Box/);
+    nothingOwned(w);
+});
+
+test('Y4.a-failed-identity-proof-stays-at-intent-and-nothing-after-it-runs', async t => {
+    const w = await provisioned(t);
+    w.run.target.execution.engine.identityDigest = hash('another engine service');
+    const report = await w.cleanup();
+    assert.equal(report.verdict, 'FAIL');
+    assert.match(w.run.cleanup.failures.join(' '), /Engine service identity changed/);
+    assert.deepEqual(w.run.cleanup.steps.map(entry => [entry.id, entry.state]), [['gpu-stop-owned-helpers', 'skipped'], ['revalidate-identity', 'intent']]);
+    assert.equal(worldState(w.statePath).destroyCalls ?? 0, 0, 'the Box was not destroyed');
+});

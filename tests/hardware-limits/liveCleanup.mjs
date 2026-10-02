@@ -109,9 +109,13 @@ export async function runOwnedCleanup({ run, profile, persist = () => {}, proces
     // cleanup; the final GPU observation proves them gone). Anything else cannot be proved.
     if (run.ownedProcesses.some(entry => entry?.kind !== 'gpu-process')) throw new Error('Cleanup cannot prove extra recorded processes');
 
-    // 2. Revalidate the exact engine and the workspace identity.
+    // 2. Revalidate the exact engine and the workspace identity. Every cleanup run does this, a resumed one again, and
+    // the proof is journaled: a failed proof leaves the step at 'intent' and nothing after it runs.
+    const revalidation = step('revalidate-identity') || begin('revalidate-identity');
+    if (revalidation.state !== 'intent') { revalidation.state = 'intent'; persist(); }
     if (await observeEngineIdentity((kind, argv) => engine(kind, argv)) !== profile.engine.identityDigest) throw new Error('Engine service identity changed');
     const workspace = classifyWorkspace();
+    complete(revalidation);
 
     // 4. Destroy with the candidate, then prove the exact Box absent.
     const destroyStep = step('destroy-box');

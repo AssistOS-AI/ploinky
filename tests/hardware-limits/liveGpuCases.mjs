@@ -906,12 +906,15 @@ export function createGpuCases(ctx) {
     // ---------------------------------------------------------------------
     // Cleanup hooks. Before the product cleanup: nothing of ours may still
     // use the GPU. After it: the GPU shows none of our processes.
-    async function beforeCleanup() {
+    async function beforeCleanup({ record = () => {} } = {}) {
         cleanupMode = true;
         const notes = [];
-        if (helpers.length && prepared) {
+        const owned = helpers.length;
+        if (owned && prepared) {
             try { await removeHelpers({ step: (name, value) => notes.push({ name, value }) }); } catch (error) { notes.push({ name: 'helpers', value: String(error?.message || error).slice(0, 200) }); }
         }
+        // How many owned helpers there were and how many were removed by exact identity, for the cleanup journal.
+        record({ helpers: owned, removed: notes.filter(note => note.name === 'helper-removed').length });
         return notes;
     }
     // After the product cleanup the GPU is observed again. The proof must SUCCEED: a
