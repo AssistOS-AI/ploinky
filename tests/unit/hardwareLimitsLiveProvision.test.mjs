@@ -19,7 +19,7 @@ import { admitManifestRuntimeCapabilities, validateManifestRuntimeCapabilities }
 import { deprecatedHardwareDeclarations } from '../../cli/sandbox/hardwareLimits/declaredLimits.mjs';
 import { buildConcreteManifest, summaryPathFor } from '../hardware-limits/liveManifest.mjs';
 import { writeUstar } from '../hardware-limits/liveStage.mjs';
-import { AGENT_INSPECT, ENGINE_INFO_ARGV, INSPECT, PS_IDENTITY_FORMAT, boxPsArgv, engineIdentityDigest, engineIdentityFacts, hostRecordPaths, quarantinePath, workspaceSocketProblem } from '../hardware-limits/liveCommon.mjs';
+import { AGENT_INSPECT, ENGINE_INFO_ARGV, INSPECT, PS_IDENTITY_FORMAT, boxPsArgv, engineIdentityDigest, engineIdentityFacts, hostRecordPaths, observeEngineIdentity, quarantinePath, workspaceSocketProblem } from '../hardware-limits/liveCommon.mjs';
 import { CRASH_EXIT, FAKE_CONNECTIONS, createFakeSsh, createFakeWorld, evaluateTemplate, fakeEngineInfo, ok, unsupportedFormat, worldState } from '../hardware-limits/fakeLiveEngine.mjs';
 
 const hash = value => `sha256:${crypto.createHash('sha256').update(value).digest('hex')}`;
@@ -983,6 +983,24 @@ test('L1.cli-provision-and-cleanup-run-real-processes-without-an-injected-provid
 
 // The engine service identity uses stable, distinguishing facts and fails
 // closed when one is missing.
+// R10: an engine whose info does not state whether its service is remote is
+// never assumed local (no connection would then be required): it fails closed.
+test('L1.engine-identity-requires-the-service-locality-fact', async () => {
+    const local = { host: { arch: 'arm64', os: 'linux', hostname: 'h', kernel: '6.12.0', serviceIsRemote: false, remoteSocket: { path: '/run/user/1/podman/podman.sock' } },
+        store: { graphRoot: '/g', runRoot: '/r' }, version: { Version: '6.0.1' } };
+    assert.doesNotThrow(() => engineIdentityFacts(local));
+    for (const value of [undefined, null, 'false', 0, 1, {}]) {
+        const info = { ...local, host: { ...local.host, serviceIsRemote: value } };
+        assert.throws(() => engineIdentityFacts(info), (error) => error.code === 'ENGINE_IDENTITY_INCOMPLETE' && /host\.serviceIsRemote/.test(error.message), String(value));
+    }
+    const missing = { ...local, host: Object.fromEntries(Object.entries(local.host).filter(([key]) => key !== 'serviceIsRemote')) };
+    assert.throws(() => engineIdentityFacts(missing), { code: 'ENGINE_IDENTITY_INCOMPLETE' });
+    // Through the observer: no connection command runs, and it fails.
+    const calls = [];
+    await assert.rejects(observeEngineIdentity(async (kind) => { calls.push(kind); return ok(JSON.stringify(missing)); }), { code: 'ENGINE_IDENTITY_INCOMPLETE' });
+    assert.deepEqual(calls, ['engine-identity']);
+});
+
 test('L1.engine-identity-strong-facts-fail-closed', async t => {
     const machine = (uri, graphRoot = '/var/home/core/.local/share/containers/storage') => ({
         info: { host: { arch: 'arm64', os: 'linux', hostname: 'localhost.localdomain', kernel: '6.12.0', serviceIsRemote: true, remoteSocket: { path: '/run/user/501/podman/podman.sock' }, memFree: 1, uptime: '1h' },

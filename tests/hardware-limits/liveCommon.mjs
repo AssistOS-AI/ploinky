@@ -143,7 +143,9 @@ export function engineIdentityFacts(info, connections = null) {
         engineVersion: identityText(version?.Version, 'version.Version'),
         graphRoot: identityText(store?.graphRoot, 'store.graphRoot'), runRoot: identityText(store?.runRoot, 'store.runRoot'),
         serviceSocket: identityText(host?.remoteSocket?.path, 'host.remoteSocket.path'),
-        serviceIsRemote: host?.serviceIsRemote === true,
+        // Whether the service is local or remote must be stated: an engine
+        // that does not report it is never assumed local.
+        serviceIsRemote: typeof host?.serviceIsRemote === 'boolean' ? host.serviceIsRemote : (() => { throw incompleteIdentity('Engine service identity is missing host.serviceIsRemote'); })(),
         id: host?.id === undefined || host?.id === null ? null : identityText(String(host.id), 'host.id'),
         connection: null,
     };
@@ -159,6 +161,7 @@ export const engineIdentityDigest = (info, connections = null) => jsonDigest(eng
 // Observe the identity through one bounded command runner `run(kind, argv)`.
 export async function observeEngineIdentity(run) {
     const info = checkedJson(await run('engine-identity', [...ENGINE_INFO_ARGV]));
+    // The facts check below fails closed when the locality is not reported.
     const connections = info?.host?.serviceIsRemote === true ? checkedJson(await run('engine-connection', [...ENGINE_CONNECTIONS_ARGV])) : null;
     return engineIdentityDigest(info, connections);
 }

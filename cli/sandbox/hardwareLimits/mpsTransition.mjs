@@ -166,10 +166,14 @@ function* transitionSteps(input, { assertCapability, store, backend, drain, recr
         }
         for (const client of plan.recreate) {
             check();
-            if (client.share && !backend.verify(state)) throw new MpsError('MPS daemon defaults changed before client create');
             const readyState = client.share ? { ...state, status: 'ready' } : null;
             let result;
             try {
+                // A daemon that lost its defaults fails the client being
+                // created, whatever the cause: only the selected target's own
+                // failure becomes the target's outcome (plan 10.2); a peer's
+                // is that peer's pending result and never the target's refusal.
+                if (client.share && !backend.verify(state)) throw new MpsError('MPS daemon defaults changed before client create');
                 result = yield () => recreate(client, readyState, input.capability);
             } catch (error) {
                 // One client's failure is its own terminal outcome; the rest

@@ -186,6 +186,25 @@ test('EG.absolute-guarded-paths-are-refused-wherever-they-appear', async (t) => 
     assert.equal(fake.canaryRuns, 0);
 });
 
+// A fake runtime a test puts first on PATH is not a real program; a real one
+// first on PATH still decides (the bare name is resolved like a shell would).
+test('EG.a-bare-name-resolving-first-to-a-test-owned-fake-is-allowed', async (t) => {
+    const w = world(t);
+    const allowed = await w.probe('bare-fake', [
+        ['fake first on an explicit PATH', `const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-bin-')); fs.writeFileSync(path.join(dir, CANARY), '#!/bin/sh\\nexit 0\\n', { mode: 0o755 }); cp.execFileSync(CANARY, ['ps'], { env: { PATH: dir + ':/usr/bin:/bin' }, stdio: 'pipe' });`],
+        ['fake first on the process PATH, through a shell', `const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-bin-')); fs.writeFileSync(path.join(dir, CANARY), '#!/bin/sh\\nexit 0\\n', { mode: 0o755 }); const saved = process.env.PATH; process.env.PATH = dir + ':' + saved; try { cp.execFileSync('/bin/sh', ['-c', CANARY + ' ps'], { stdio: 'pipe' }); } finally { process.env.PATH = saved; }`],
+    ]);
+    assert.equal(allowed.marked['fake first on an explicit PATH'], 'not-refused');
+    assert.equal(allowed.marked['fake first on the process PATH, through a shell'], 'not-refused');
+    assert.equal(allowed.result.verdict, 'PASS', JSON.stringify(allowed.marked));
+    assert.equal(allowed.canaryRuns, 0, 'only the fake ran');
+    const refused = [
+        ['real first, fake second', `const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-bin-')); fs.writeFileSync(path.join(dir, CANARY), '#!/bin/sh\\nexit 0\\n', { mode: 0o755 }); cp.execFileSync(CANARY, ['ps'], { env: { PATH: SENTINEL_BIN + ':' + dir }, stdio: 'pipe' });`],
+        ['no fake at all', `cp.execFileSync(CANARY, ['ps'], { env: { PATH: '/usr/bin:/bin' }, stdio: 'pipe' });`],
+    ];
+    assertRefused(await w.probe('bare-real', refused), refused.map(([id]) => id), 'real first');
+});
+
 test('EG.option-forms-shell-string-and-fork-exec-path', async (t) => {
     const w = world(t);
     const forms = [

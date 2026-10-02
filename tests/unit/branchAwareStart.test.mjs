@@ -1030,7 +1030,11 @@ test('applyManifestDirectives: duplicate aliased child enables are idempotent un
 test.after(() => {
     try {
         const records = JSON.parse(fs.readFileSync(path.join(tempDir, '.ploinky', 'agents.json'), 'utf8'));
-        for (const containerName of Object.keys(records).filter((name) => name.startsWith('ploinky_'))) {
+        // Only a record that names a created container (an immutable ID) can
+        // have one to remove: the enable seam records agents without any
+        // runtime, and those never start an engine.
+        for (const [containerName, record] of Object.entries(records)) {
+            if (!containerName.startsWith('ploinky_') || !/^[a-f0-9]{64}$/.test(String(record?.containerId || ''))) continue;
             execFileSync('podman', ['rm', '-f', '--time', '0', containerName], { stdio: 'ignore' });
         }
     } catch (_) {}

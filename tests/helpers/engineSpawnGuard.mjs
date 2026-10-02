@@ -63,6 +63,7 @@ export const GUARDED_PROGRAMS = Object.freeze(['podman', 'podman-remote', 'docke
 const EXTRA_ENV = 'PLOINKY_ENGINE_GUARD_EXTRA_PROGRAMS';
 const TOP_LOG_ENV = 'PLOINKY_ENGINE_GUARD_TOP_LOG';
 const ROOT_ENV = 'PLOINKY_ENGINE_GUARD_ROOT';
+const TEMP_ENV = 'PLOINKY_ENGINE_GUARD_TEMP';
 const GUARD_URL = import.meta.url;
 const DEFAULT_PATH = '/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin';
 const FIXED_BINARY_DIRECTORIES = ['/usr/bin', '/bin', '/usr/local/bin', '/opt/homebrew/bin', '/opt/podman/bin'];
@@ -100,7 +101,10 @@ const WRAPPER_OPTIONS = {
 };
 const SHELL_KEYWORDS = new Set(['if', 'then', 'else', 'elif', 'do', 'while', 'until', '!', '{', '}', 'fi', 'done']);
 
-let temporaryRoot = os.tmpdir();
+// The test temporary directory: what os.tmpdir() is for the top-level process,
+// inherited by every descendant, so a child whose environment lacks TMPDIR does
+// not widen "test-owned" to /tmp.
+let temporaryRoot = process.env[ROOT_ENV] && process.env[TEMP_ENV] ? process.env[TEMP_ENV] : os.tmpdir();
 try { temporaryRoot = fs.realpathSync(temporaryRoot); } catch (_) {}
 
 // --- top-level ledger and one temporary root --------------------------------
@@ -177,6 +181,7 @@ function withGuardPath(value, { all = false } = {}) {
 const withGuardOptions = (value = '') => (String(value || '').includes(GUARD_URL) ? String(value) : `${String(value || '')} --import=${GUARD_URL}`.trim());
 process.env[TOP_LOG_ENV] = topLog;
 process.env[ROOT_ENV] = guardRoot;
+process.env[TEMP_ENV] = temporaryRoot;
 process.env.PATH = withGuardPath(process.env.PATH);
 process.env.NODE_OPTIONS = withGuardOptions(process.env.NODE_OPTIONS);
 
@@ -190,6 +195,21 @@ function matchesRealBinary(target) {
     } catch (_) { return false; }
 }
 
+// A bare name resolves through PATH (the explicit environment of the call
+// being analysed, else this process's): when the first executable of that name
+// is a test-owned fake under the test temporary directory (a fake runtime a
+// test puts first on PATH), the name is not a real program. The guard's own
+// stub directories are skipped, and a real binary first on PATH still decides.
+let analysedPath = null;
+function bareNameIsTestFake(name) {
+    for (const directory of String(analysedPath ?? process.env.PATH ?? '').split(path.delimiter).filter((entry) => entry && !isStubDirectory(entry))) {
+        const candidate = path.join(directory, name);
+        try { fs.accessSync(candidate, fs.constants.X_OK); } catch (_) { continue; }
+        return underTemporaryRoot(candidate) && !matchesRealBinary(candidate);
+    }
+    return false;
+}
+
 // A command word is guarded when its case-folded basename is a guarded name,
 // unless it is an absolute test-owned fake; any path whose realpath or inode
 // is a real guarded binary is guarded under whatever name.
@@ -197,7 +217,7 @@ function guardedWord(word) {
     const text = unquote(word);
     if (!text) return false;
     const named = guardedNames.has(lower(path.basename(text)));
-    if (!text.includes('/')) return named;
+    if (!text.includes('/')) return named && !bareNameIsTestFake(text);
     if (matchesRealBinary(text)) return true;
     return named && !(path.isAbsolute(text) && underTemporaryRoot(text));
 }
@@ -409,7 +429,7 @@ function inspectEnv(argv, depth) {
         return `PATH=${withGuardPath(assignment.slice(5))}`;
     });
     // Re-injected after every -i/-u so that nothing earlier can remove them.
-    const guardEnvironment = [`NODE_OPTIONS=${withGuardOptions('')}`, `${TOP_LOG_ENV}=${topLog}`, `${ROOT_ENV}=${guardRoot}`,
+    const guardEnvironment = [`NODE_OPTIONS=${withGuardOptions('')}`, `${TOP_LOG_ENV}=${topLog}`, `${ROOT_ENV}=${guardRoot}`, `${TEMP_ENV}=${temporaryRoot}`,
         ...(process.env[EXTRA_ENV] ? [`${EXTRA_ENV}=${process.env[EXTRA_ENV]}`] : [])];
     if (!hasPath && (clears || unsetsPath)) guardEnvironment.push(`PATH=${withGuardPath(DEFAULT_PATH, { all: true })}`);
     return { hit: null, argv: [...options, ...rewritten, ...guardEnvironment, ...(operandArgv.length ? [operandArgv[0], ...nested.argv] : [])] };
@@ -421,8 +441,13 @@ export function guardedProgramOf(name, args) {
 }
 
 function analyzeCall(name, args) {
-    const [first, second, third] = args;
-    const options = [second, third].find((value) => value && typeof value === 'object' && !Array.isArray(value)) || {};
+    const options = [args[1], args[2]].find((value) => value && typeof value === 'object' && !Array.isArray(value)) || {};
+    analysedPath = options.env && options.env.PATH !== undefined ? String(options.env.PATH) : null;
+    try { return analyzeCallWith(name, args, options); } finally { analysedPath = null; }
+}
+
+function analyzeCallWith(name, args, options) {
+    const [first, second] = args;
     const argv = Array.isArray(second) ? second.filter((value) => typeof value === 'string') : [];
     if (name === 'fork') {
         const execPath = typeof options.execPath === 'string' && guardedWord(options.execPath) ? options.execPath : null;
@@ -468,10 +493,12 @@ function guardChildEnvironment(args) {
     if (independent) {
         delete env[TOP_LOG_ENV];
         delete env[ROOT_ENV];
+        delete env[TEMP_ENV];
         if (!options?.env || options.env[EXTRA_ENV] === undefined) delete env[EXTRA_ENV];
     } else {
         env[TOP_LOG_ENV] = topLog;
         env[ROOT_ENV] = guardRoot;
+        env[TEMP_ENV] = temporaryRoot;
         if (process.env[EXTRA_ENV]) env[EXTRA_ENV] = process.env[EXTRA_ENV];
     }
     const next = [...args];
@@ -510,7 +537,7 @@ class GuardedWorker extends OriginalWorker {
             ? [...options.execArgv, `--import=${GUARD_URL}`] : options?.execArgv;
         const own = options?.env && options.env !== workerThreads.SHARE_ENV && typeof options.env === 'object' ? options.env : null;
         const env = own
-            ? { ...own, NODE_OPTIONS: withGuardOptions(own.NODE_OPTIONS), PATH: own.PATH !== undefined ? withGuardPath(own.PATH) : withGuardPath(DEFAULT_PATH, { all: true }), [TOP_LOG_ENV]: topLog, [ROOT_ENV]: guardRoot, ...(process.env[EXTRA_ENV] ? { [EXTRA_ENV]: process.env[EXTRA_ENV] } : {}) }
+            ? { ...own, NODE_OPTIONS: withGuardOptions(own.NODE_OPTIONS), PATH: own.PATH !== undefined ? withGuardPath(own.PATH) : withGuardPath(DEFAULT_PATH, { all: true }), [TOP_LOG_ENV]: topLog, [ROOT_ENV]: guardRoot, [TEMP_ENV]: temporaryRoot, ...(process.env[EXTRA_ENV] ? { [EXTRA_ENV]: process.env[EXTRA_ENV] } : {}) }
             : options?.env;
         // `--import` does not apply to an eval worker: its CommonJS code first
         // requires this guard (an ES module without top-level await).

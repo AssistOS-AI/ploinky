@@ -173,7 +173,7 @@ import { findHardwareOutcome } from '../../cli/sandbox/hardwareLimits/errors.mjs
 import { MpsError } from '../../cli/sandbox/hardwareLimits/mpsEligibility.mjs';
 import { readMpsStatus } from '../../cli/sandbox/hardwareLimits/mpsStatus.mjs';
 const cohortShare = (smPercent = 25) => ({ ...share, smPercent, vramPercent: smPercent });
-function cohortWorld({ keys = ['a', 'b', 'c'], nextSm = 50, fail = {}, peerPlan = null, inspectImage = null } = {}) {
+function cohortWorld({ keys = ['a', 'b', 'c'], nextSm = 50, fail = {}, peerPlan = null, inspectImage = null, daemonLostAfter = null } = {}) {
     const token = { epoch: 'e'.repeat(32), revision: 1 };
     let counter = 16;
     const record = (key) => ({ type: 'agent', repoName: 'demo', agentName: key, instanceId: `i-${key}-${counter}`, enableGeneration: `g-${key}-${counter}`, containerId: (counter++).toString(16).padStart(64, '0') });
@@ -197,7 +197,7 @@ function cohortWorld({ keys = ['a', 'b', 'c'], nextSm = 50, fail = {}, peerPlan 
         prepareImage: () => {}, inspectImage: inspectImage || (() => ({ Id: imageId, Config: { User: '1000:1000' } })), resolveShare: (policy) => policy, policyCheck: () => {},
         store: { read: () => clone(state), write: (value) => { state = clone(value); } },
         backend: {
-            observe: () => ({ state: alive ? 'owned' : 'gone', daemon: state.daemon }), verify: (value) => alive && Boolean(value?.daemon),
+            observe: () => ({ state: alive ? 'owned' : 'gone', daemon: state.daemon }), verify: (value) => alive && Boolean(value?.daemon) && !(daemonLostAfter && events.includes(`create:${daemonLostAfter}`)),
             stop: () => { events.push('quit'); alive = false; }, cleanup: () => events.push('cleanup'),
             start: (value) => { daemons += 1; events.push('start'); alive = true; return { ...daemon(value, `d${daemons}`), configurationGeneration: `c${daemons}` }; },
         },
@@ -294,6 +294,35 @@ test('MI.watchdog-retries-of-a-failing-client-cause-no-healthy-churn', async () 
         readState: () => f.state, backend: { observe: () => ({ state: 'owned' }), verify: () => true } });
     assert.equal(status.daemonStatus, 'ready');
     assert.equal(status.mpsGeneration, `${f.state.daemonGeneration}:${f.state.configurationGeneration}`);
+});
+
+// R12 / N3: a daemon-level error raised while recreating a PEER (the daemon
+// lost its defaults after the target was created) is that peer's pending
+// outcome. It is never the target's refusal, and the pending peers are all
+// reported (207), not hidden behind the target's applied result.
+test('MI.daemon-level-error-while-recreating-a-peer-is-not-the-targets-refusal', async () => {
+    const direct = cohortWorld({ daemonLostAfter: 'a' });
+    let thrown;
+    await assert.rejects(direct.coordinate('a'), (error) => { thrown = error; return true; });
+    assert.equal(thrown.code, 'mps_partial_failure');
+    assert.equal(findHardwareOutcome(thrown), null, 'a peer\'s daemon-level failure is never the target\'s refusal');
+    assert.equal(thrown.targetResult.state, 'applied');
+    assert.deepEqual(thrown.mpsTransitionResults.map((value) => [value.key, value.state]), [['a', 'applied'], ['b', 'pending'], ['c', 'pending']]);
+    assert.ok(thrown.mpsTransitionResults.slice(1).every((value) => value.error === 'gpu_sharing_unavailable' || value.error === 'mps_client_failed' || typeof value.error === 'string'));
+    const f = cohortWorld({ daemonLostAfter: 'a' });
+    const result = await f.apply(['a']);
+    assert.equal(result.status, 207, JSON.stringify(result));
+    assert.deepEqual(result.results.map((value) => [value.key, value.state, value.problem ? value.problem.key : null]), [['a', 'applied', null], ['b', 'pending', null], ['c', 'pending', null]]);
+    assert.deepEqual(result.pendingContainers, ['b', 'c']);
+    assert.equal(f.events.includes('create:b') || f.events.includes('create:c'), false, 'nothing is created while the daemon cannot be verified');
+    // The target's OWN daemon-level failure stays the target's outcome.
+    const own = cohortWorld({ daemonLostAfter: 'a' });
+    own.policies.set('demo/b', own.policies.get('demo/a'));
+    const ownResult = await own.apply(['b']);
+    const ownOutcome = ownResult.results.find((value) => value.key === 'b');
+    assert.equal(ownOutcome?.state, 'refused', JSON.stringify(ownResult));
+    assert.equal(ownOutcome.problem.key, 'b');
+    assert.match(ownOutcome.problem.reason, /MPS daemon defaults changed before client create/);
 });
 
 test('MI.graph-start-after-client-only-failure-keeps-the-daemon', async () => {
@@ -532,6 +561,24 @@ test('MI.recorded-peer-stop-failure-and-still-running-after-stop-fail-closed-wit
         assert.equal(f.events.some((value) => ['quit', 'start', 'launch:z'].includes(value)), false, `${label}: ${f.events.join(' ')}`);
         assert.equal(f.state.status === 'transitioning' || f.state.status === 'pending', true, label);
     }
+});
+
+// R9: a peer that stays refused (its manifest is still gone, its share is
+// still configured) remains part of the cohort, so a later coordination
+// reports it again as refused (207). That is accurate (plan 10.2: partial
+// identities are reported as they are; the expansion names it), and it is
+// idempotent: the peer is not stopped a second time and its routes stay
+// unavailable.
+test('MI.a-still-refused-peer-is-reported-again-without-a-second-stop', async () => {
+    const f = recordedPeerWorld();
+    const first = await f.apply();
+    assert.equal(first.status, 207);
+    assert.equal(f.events.filter((value) => value === 'stop:b').length, 1);
+    const second = await f.apply();
+    assert.equal(second.status, 207, JSON.stringify(second));
+    assert.equal(second.results.find((value) => value.key === 'b')?.state, 'refused', 'still reported');
+    assert.equal(f.events.filter((value) => value === 'stop:b').length, 1, 'never stopped twice');
+    assert.ok(f.unavailable.includes('b'), 'its routes stay unavailable');
 });
 
 test('MI.unprovable-peer-identity-fails-closed-with-every-outcome', async () => {
