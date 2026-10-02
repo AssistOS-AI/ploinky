@@ -391,7 +391,16 @@ export async function ensureMpsGraphAgentService(agentName, manifest, agentPath,
     let result;
     try { result = await ensure(agentName, manifest, agentPath, { ...options, mpsLaunch }); }
     catch (error) {
-        if (share) store.write({ ...store.read(), status: 'pending', lastProblem: { code: String(error.code || 'client_launch_failed').slice(0, 64), message: 'Graph MPS client launch did not complete; its route remains inactive.' } });
+        if (share) {
+            // The daemon was verified just above: this is one client's own
+            // failure (plan 11.3, partial transition failure), journaled as a
+            // client-only failure, so the next lifecycle retry recreates this
+            // client alone and keeps the healthy daemon and clients.
+            const current = store.read();
+            store.write({ ...current, status: 'pending',
+                pendingClients: (current?.pendingClients || []).map((entry) => (entry.key === key && entry.phase === 'launching' ? { ...entry, phase: 'pending' } : entry)),
+                lastProblem: { code: 'mps_client_failed', message: `Graph MPS client launch did not complete (${String(error.code || 'client_launch_failed').slice(0, 64)}); its route remains inactive until it is retried.` } });
+        }
         throw error;
     }
     if (share) {

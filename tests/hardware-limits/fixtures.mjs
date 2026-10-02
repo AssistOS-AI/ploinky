@@ -509,6 +509,7 @@ export function buildRequiredCaseManifest() {
             'MI.retry-recreates-only-the-failed-client', 'MI.watchdog-retries-of-a-failing-client-cause-no-healthy-churn',
             'MI.graph-start-after-client-only-failure-keeps-the-daemon', 'MI.missing-manifest-peer-is-retired-by-its-recorded-identity',
             'MI.unprovable-peer-identity-fails-closed-with-every-outcome',
+            'MI.graph-launch-failure-then-lifecycle-retry-recreates-only-the-failed-client',
             'MI.two-refused-peers-keep-the-stopped-peers-outcome-when-the-second-is-unprovable',
             'MI.refused-peer-outcome-survives-a-cancellation-after-its-drain',
         ]),

@@ -318,6 +318,54 @@ test('MI.graph-start-after-client-only-failure-keeps-the-daemon', async () => {
     assert.deepEqual([...result.replacedKeys], ['b'], 'only the client that was not recreated is replaced');
 });
 
+// O6: a graph launch failure of one GPU client is that client's own failure.
+// The healthy daemon and the healthy clients stay; the next lifecycle retry of
+// that client recreates it alone.
+test('MI.graph-launch-failure-then-lifecycle-retry-recreates-only-the-failed-client', async () => {
+    const { ensureMpsGraphAgentService } = await import('../../cli/sandbox/hardwareLimits/mpsLifecycle.mjs');
+    const gshare = { smPercent: 25, vramPercent: 25, memoryMiB: 1024, vramMiB: 1024, memoryBytes: 1024 ** 3, deviceUuid: 'GPU-12345678-1234-1234-1234-123456789012', driverVersion: '550.1', wiringFingerprint: 'f'.repeat(64) };
+    const def = (value) => ({ smPercent: value.smPercent, memoryMiB: value.memoryMiB, deviceUuid: value.deviceUuid, driverVersion: value.driverVersion, wiringFingerprint: value.wiringFingerprint });
+    let counter = 16;
+    const record = (key) => ({ type: 'agent', repoName: 'demo', agentName: key, alias: '', instanceId: `i-${key}-${counter}`, enableGeneration: `g-${key}-${counter}`, containerId: (counter++).toString(16).padStart(64, '0') });
+    const registry = { a: record('a'), b: record('b'), c: record('c') };
+    const applied = Object.fromEntries(['a', 'b', 'c'].map((key) => [key, { ...registry[key], gpuShare: gshare, mpsGeneration: 'd0:c0' }]));
+    const policies = new Map(['a', 'b', 'c'].map((key) => [`demo/${key}`, { gpu: gshare }]));
+    let state = { schema: 1, status: 'ready', daemon: { pid: 9, startTime: '1' }, daemonGeneration: 'd0', configurationGeneration: 'c0', pipeDirectory: `/run/ploinky/mps/pipe-${'1'.repeat(32)}`, logDirectory: `/run/ploinky/mps/log-${'1'.repeat(32)}`, serverDefault: def(gshare), oldClients: [], pendingClients: [], drainedClients: [] };
+    let alive = true; const events = [];
+    const store = { read: () => clone(state), write: (value) => { state = clone(value); } };
+    const backend = { observe: () => ({ state: alive ? 'owned' : 'gone', daemon: state.daemon }), verify: (value) => alive && Boolean(value?.daemon),
+        stop: () => { events.push('quit'); alive = false; }, cleanup: () => events.push('cleanup'),
+        start: () => { events.push('start'); alive = true; return { ...state, status: 'ready', daemon: { pid: 10, startTime: '2' }, daemonGeneration: 'd1', configurationGeneration: 'c1' }; } };
+    const context = { gate: 'on', storeToken: { epoch: 'e'.repeat(32), revision: 1 }, overrides: policies, gpu: { grant: { mps: {} } } };
+    const failure = await ensureMpsGraphAgentService('b', {}, '/fixture/demo/b', { containerName: 'b', preparationLease: { transactionId: 'g1' }, networkLifecycleCapability: {}, preparedRegistryRecord: clone(registry.b) }, {
+        observeClients: () => [], readContext: () => context, loadRegistry: () => clone(registry), store, backend,
+        loadPlan: () => ({ runtime: 'podman', image: 'img', profile: { network: { mode: 'default' } } }), prepareImage: () => {}, inspectImage: () => ({ Id: `sha256:${imageId}`, Config: { User: '1000:1000' } }),
+        assertCapability: () => {}, policyCheck: () => {}, resolveShare: (policy) => policy,
+        ensure: async () => { events.push('graph-ensure:b'); throw Object.assign(new Error('b failed to start'), { code: 'PLOINKY_AGENT_START_FAILED' }); },
+    }).then(() => null, (error) => error);
+    assert.equal(failure?.code, 'PLOINKY_AGENT_START_FAILED', 'the graph launch error is the launcher\'s own');
+    // Journaled as one client's own failure, not as an unfinished transition.
+    assert.equal(state.status, 'pending');
+    assert.equal(state.lastProblem.code, 'mps_client_failed');
+    assert.match(state.lastProblem.message, /PLOINKY_AGENT_START_FAILED/);
+    assert.deepEqual(state.pendingClients.map((entry) => [entry.key, entry.phase]), [['b', 'pending']]);
+    // The lifecycle retry (watchdog restart or CLI restart) recreates b alone.
+    const replace = (key, launch) => { events.push(`create:${key}`); const next = record(key); registry[key] = next; applied[key] = { ...next, gpuShare: clone(launch.share), mpsGeneration: `${launch.state.daemonGeneration}:${launch.state.configurationGeneration}` }; return { key, state: 'applied', containerId: next.containerId }; };
+    const deps = {
+        observeClients: () => [], readContext: () => context, loadRegistry: () => clone(registry), readApplied: (key, containerId) => (applied[key]?.containerId === containerId ? clone(applied[key]) : null),
+        loadPlan: () => ({ runtime: 'podman', manifest: {}, profile: { network: { mode: 'default' } }, image: 'img' }), prepareImage: () => {}, inspectImage: () => ({ Id: `sha256:${imageId}`, Config: { User: '1000:1000' } }),
+        resolveShare: (policy) => policy, policyCheck: () => {}, store, backend, network: async (callback) => callback({}), assertCapability: () => {},
+        drainClient: async (client) => { events.push(`drain:${client.key}`); },
+        reconcile: async (captured, options) => replace(captured.key, readMpsLaunch(options.mpsLaunch, captured.key, policies.get(`demo/${captured.key}`).gpu)),
+    };
+    const offset = events.length;
+    await coordinateMpsLifecycle({ target: { key: 'b', record: clone(registry.b) }, options: {}, launchTarget: async (next) => replace('b', readMpsLaunch(next.mpsLaunch, 'b', policies.get('demo/b').gpu)) }, deps);
+    const retry = events.slice(offset);
+    assert.equal(retry.includes('quit') || retry.includes('start'), false, `the healthy daemon is kept: ${retry.join(' ')}`);
+    assert.equal(retry.some((event) => event === 'drain:a' || event === 'drain:c' || event === 'create:a' || event === 'create:c'), false, `the healthy clients are untouched: ${retry.join(' ')}`);
+    assert.deepEqual(retry.filter((event) => event.startsWith('create:')), ['create:b'], 'only b is recreated');
+});
+
 // A drained peer whose manifest no longer resolves goes through the REAL
 // drain composition (no injected drainClient): it is retired only from its
 // recorded identity, observed through fake low-level engine replies.
