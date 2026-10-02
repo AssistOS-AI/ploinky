@@ -776,11 +776,20 @@ Declaring `memory`, `cpus` or `pidsLimit` under
 command or Router start prints one warning per agent naming the deprecated
 paths and `hardwareLimits`, and the administrator read reports a
 `deprecatedDeclaration` note. A key declared in both places of the same manifest
-root or profile with different values refuses that agent with a fix; equal
-values are accepted. Moving a declaration to `hardwareLimits` gives the same
-limits hash and arguments, so it does not restart a running agent. The other
-`llmRuntime.runtimePolicy` settings (`shmSize`, `ulimits`, `devices`, `ipc` and
-the rest) are not deprecated.
+root or profile with different values refuses that agent with a fix that names
+the manifest root or the profile; equal values are accepted, compared by meaning
+(`1g` equals `1024m`, `1.0` equals `1`). Moving a declaration to `hardwareLimits`
+gives the same limits hash and arguments, so it does not restart a running
+agent. The other `llmRuntime.runtimePolicy` settings (`shmSize`, `ulimits`,
+`devices`, `ipc` and the rest) are not deprecated.
+
+Upgrade note: earlier releases dropped a selected non-default profile's
+`llmRuntime` settings, so `memory`, `cpus` or `pidsLimit` declared under
+`llmRuntime.runtimePolicy.resources` in such a profile were silently ignored.
+They now apply. On the next start or Apply that agent can be recreated with the
+new limits, or, where limits cannot be enforced (hardware limits off or an
+unprepared Box), refused with a fix for the declared limit. Remove or move the
+declaration before upgrading if that is not wanted.
 
 ### GPU share limits
 
