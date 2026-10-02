@@ -27,7 +27,7 @@ const failed = (stderr, status = 1) => ok('', { status, stderr });
 // purpose, after it is proved on a real engine.
 const INSPECT_FIELDS = Object.freeze({
     ID: true, Created: true, Image: true, ImageName: true, Name: true, Mounts: true,
-    Config: { Labels: true },
+    Config: { Labels: true, Env: true, User: true },
     State: { Status: true, Running: true, Pid: true, StartedAt: true, FinishedAt: true, ConmonPid: true, ExitCode: true, OOMKilled: true },
     HostConfig: { Memory: true, MemorySwap: true, NanoCpus: true, CpuQuota: true, CpuPeriod: true, PidsLimit: true },
 });
@@ -82,7 +82,7 @@ const formatOf = args => { const at = args.indexOf('--format'); return at < 0 ? 
 const filtersOf = args => args.flatMap((value, at) => (value === '--filter' ? [args[at + 1]] : value.startsWith('--filter=') ? [value.slice(9)] : []));
 export const inspectModel = record => ({
     ID: record.id, Created: record.created, Image: record.image, ImageName: record.imageName ?? '', Name: record.name ?? '', Mounts: record.mounts ?? [],
-    Config: { Labels: record.labels ?? null },
+    Config: { Labels: record.labels ?? null, Env: record.env ?? [], User: record.user ?? '' },
     State: {
         Status: record.status ?? (record.running === false ? 'exited' : 'running'), Running: record.running ?? false, Pid: record.pid ?? 1, StartedAt: record.startedAt ?? 'x',
         FinishedAt: record.finishedAt ?? '0001-01-01T00:00:00Z', ConmonPid: record.conmonPid ?? 2, ExitCode: record.exitCode ?? 0, OOMKilled: record.oomKilled ?? false,

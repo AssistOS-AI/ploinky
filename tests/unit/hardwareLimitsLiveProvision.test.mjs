@@ -762,6 +762,7 @@ function prepareFixture(t, { suffix = 'claude' } = {}) {
     fs.writeFileSync(path.join(ploinky, 'ploinky-box', 'bin', 'ploinky-box.mjs'), '// candidate\n');
     fs.mkdirSync(path.join(ploinky, 'tests', 'hardware-limits'), { recursive: true });
     fs.writeFileSync(path.join(ploinky, 'tests', 'hardware-limits', 'verify.mjs'), '// runner\n');
+    fs.writeFileSync(path.join(ploinky, 'tests', 'hardware-limits', 'mpsprobe.py'), '# the CUDA probe\n');
     const revision = gitRepo(ploinky);
     const explorer = path.join(root, 'explorer'); fs.mkdirSync(path.join(explorer, 'explorer'), { recursive: true });
     fs.writeFileSync(path.join(explorer, 'explorer', 'manifest.json'), `{\n    "container": "${IMAGE}",\n    "lite-sandbox": true\n}\n`);
@@ -793,7 +794,12 @@ function prepareFixture(t, { suffix = 'claude' } = {}) {
         boxImage: BOX_IMAGE, ssh: { alias: 'ubuntu-codex', sshBinary: ssh, address: '100.76.22.69', hostKeyAlias: '192.168.1.63', user: 'skutner', knownHosts, identityFile: null },
     };
     const pinsFile = (name, value) => { const file = path.join(evidence, name); writePrivateJson(file, value); return file; };
-    return { root, ploinky, revision, evidence, configPath, macPins, apparatusPins, pinsFile };
+    // The observed GPU device and NVIDIA tools of the apparatus (paths only: prepare-live opens no SSH).
+    const gpuPins = {
+        uuid: 'GPU-905b8484-3b1e-30f6-defd-05d44f00f692', name: 'NVIDIA GeForce RTX 3060 Laptop GPU', driverVersion: '595.91.07', memoryMiB: 6144, expectedSmCount: 30,
+        smi: { path: '/usr/bin/nvidia-smi', digest: hash('smi') }, mpsControl: { path: '/usr/bin/nvidia-cuda-mps-control', digest: hash('control') }, mpsServer: { path: '/usr/bin/nvidia-cuda-mps-server', digest: hash('server') },
+    };
+    return { root, ploinky, revision, evidence, configPath, macPins, apparatusPins, gpuPins, pinsFile };
 }
 async function verifyMain() { return (await import('../hardware-limits/verify.mjs')).main; }
 
@@ -890,10 +896,52 @@ test('L1.prepare-live-apparatus-cpu-concrete-manifest-and-summary', async t => {
     assert.equal(path.basename(summaryPathFor(runPath, 'claude')), 'apparatus-cpu-run_summary_claude.md');
 });
 
+test('G1.prepare-live-apparatus-mps-concrete-manifest-and-summary', async t => {
+    const f = prepareFixture(t);
+    const main = await verifyMain();
+    const runPath = path.join(f.evidence, 'apparatus-mps-run_claude.json');
+    assert.equal(await main(['prepare-live', '--config', f.configPath, '--block', 'apparatus-mps', '--run', runPath, '--pins', f.pinsFile('pins_claude.json', { ...f.apparatusPins, gpu: f.gpuPins })]), 0);
+    const run = JSON.parse(fs.readFileSync(runPath, 'utf8'));
+    const profile = validateProfile(run, { partial: true });
+    const root = `/home/skutner/.cache/ploinky-hwlimits/${run.runId}`;
+    assert.deepEqual(profile.cases, ['LIVE-P1', 'LIVE-P2', 'LIVE-P3', 'LIVE-P4']); assert.deepEqual(run.target.unsupported, {});
+    assert.deepEqual(profile.provision.agents.map(agent => [agent.name, agent.hardwareLimits.memory]), [['probe', '2g'], ['peer', '2g'], ['cpu', '64m']]);
+    assert.equal(profile.fixtures.gpu.ref, 'hwlfixture/probe'); assert.equal(profile.fixtures.cpu, undefined);
+    assert.equal(run.deadlines.blockMs, 24 * 60 * 1000);
+    // The pins: the device and the three NVIDIA tools, and the probe file pinned from the FROZEN candidate.
+    assert.deepEqual({ ...profile.gpu, probe: undefined }, { ...f.gpuPins, probe: undefined });
+    const frozenProbe = fs.readFileSync(path.join(f.evidence, `candidate-${run.runId}`, 'tests', 'hardware-limits', 'mpsprobe.py'));
+    assert.deepEqual(profile.gpu.probe, { sourcePath: `${root}/source/tests/hardware-limits/mpsprobe.py`, digest: hash(frozenProbe) });
+    assert.deepEqual(profile.provision.gpu, { uuid: f.gpuPins.uuid, grantAgents: ['hwlfixture/probe', 'hwlfixture/peer'], probe: { ...profile.gpu.probe, target: 'probe/mpsprobe.py' } });
+    // The plan: the gate, the grant before the start, every case's commands, the cleanup bracket.
+    const provisionIds = run.target.plan.provision.map(entry => entry.id);
+    assert.ok(provisionIds.indexOf('gpu-initial-gate') < provisionIds.indexOf('gpu-grant') && provisionIds.indexOf('gpu-grant') < provisionIds.indexOf('fixture-start'), provisionIds.join(','));
+    assert.deepEqual(run.target.plan.cleanup.map(entry => entry.id), ['gpu-stop-owned-helpers', 'revalidate-identity', 'destroy-box', 'host-records', 'workspace-removal', 'verify-absent', 'gpu-final-observation']);
+    for (const id of ['P1-apply', 'P2-probe-bypass', 'P3-kill-owned-daemon', 'P4-control-rw-widen-sm', 'P4-probe-after-reconcile']) assert.ok(run.target.plan.live.some(entry => entry.id === id), id);
+    const summary = fs.readFileSync(summaryPathFor(runPath, 'claude'), 'utf8');
+    for (const text of [
+        '## GPU idle gate', 'compute mode is Default', 'a bare PID, UID or name never excludes', 'the runner never changes the compute mode and never signals a foreign process', f.gpuPins.uuid,
+        '## GPU operations', 'P1-apply', 'P2-probe-bypass', 'P3-apply-default-change', 'P3-kill-owned-daemon', 'P3-restart-agent', 'P4-control-rw-widen-sm', 'gpu-final-observation',
+        '## Images, tools and digests', IMAGE, BOX_IMAGE, f.gpuPins.smi.digest, f.gpuPins.mpsControl.digest, f.gpuPins.mpsServer.digest, profile.gpu.probe.digest,
+        '## Grant and policy records', `~/.ploinky-box/gpu-grants/${run.workspace.instance}.json`, `~/.ploinky-box/hardware-limits/${run.workspace.instance}/`, 'already exists and stays',
+        'Order: gpu-stop-owned-helpers, revalidate-identity, destroy-box, host-records, workspace-removal, verify-absent, gpu-final-observation', 'No case is unsupported on this target.',
+    ]) assert.ok(summary.includes(text), text);
+    assert.equal(fs.statSync(runPath).mode & 0o077, 0);
+    // A GPU block without GPU pins, or with malformed ones, is refused before anything is written; a CPU block names no GPU.
+    for (const [label, pins] of [['no GPU pins', f.apparatusPins], ['a short UUID', { ...f.apparatusPins, gpu: { ...f.gpuPins, uuid: 'GPU-1' } }], ['a relative tool path', { ...f.apparatusPins, gpu: { ...f.gpuPins, smi: { path: 'nvidia-smi', digest: hash('smi') } } }],
+        ['an extra field', { ...f.apparatusPins, gpu: { ...f.gpuPins, extra: 1 } }]]) {
+        const refused = path.join(f.evidence, `refused-${label.replaceAll(' ', '-')}_claude.json`);
+        await assert.rejects(main(['prepare-live', '--config', f.configPath, '--block', 'apparatus-mps', '--run', refused, '--pins', f.pinsFile('pins_refused_claude.json', pins)]), /pinned GPU|Invalid pinned|fields/, label);
+        assert.equal(exists(refused), false, label);
+    }
+    await assert.rejects(main(['prepare-live', '--config', f.configPath, '--block', 'apparatus-cpu', '--run', path.join(f.evidence, 'cpu-gpu_claude.json'), '--pins', f.pinsFile('pins_cpu_gpu_claude.json', { ...f.apparatusPins, gpu: f.gpuPins })]), /names no GPU/);
+});
+
 test('L1.prepare-live-other-blocks-stay-unsupported', async t => {
     const f = prepareFixture(t);
     const main = await verifyMain();
-    for (const block of ['mac-adversarial', 'mac-explorer', 'apparatus-mps', 'apparatus-local-llm', 'apparatus-vllm']) {
+    // apparatus-mps has concrete executors since round G1; the rest stay unsupported.
+    for (const block of ['mac-adversarial', 'mac-explorer', 'apparatus-local-llm', 'apparatus-vllm']) {
         const runPath = path.join(f.evidence, `${block}-run_claude.json`);
         assert.equal(await main(['prepare-live', '--config', f.configPath, '--block', block, '--run', runPath]), 0);
         const run = JSON.parse(fs.readFileSync(runPath, 'utf8'));
