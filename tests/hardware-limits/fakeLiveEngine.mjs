@@ -28,7 +28,7 @@ const failed = (stderr, status = 1) => ok('', { status, stderr });
 const INSPECT_FIELDS = Object.freeze({
     ID: true, Created: true, Image: true, ImageName: true, Name: true, Mounts: true,
     Config: { Labels: true },
-    State: { Running: true, Pid: true, StartedAt: true, ConmonPid: true },
+    State: { Status: true, Running: true, Pid: true, StartedAt: true, FinishedAt: true, ConmonPid: true, ExitCode: true, OOMKilled: true },
     HostConfig: { Memory: true, MemorySwap: true, NanoCpus: true, CpuQuota: true, CpuPeriod: true, PidsLimit: true },
 });
 const PS_FIELDS = Object.freeze({ ID: true, Names: true, Image: true, ImageID: true, Labels: true, State: true, Status: true, Mounts: true, Created: true, CreatedAt: true, Pid: true });
@@ -80,10 +80,13 @@ export function unsupportedFormat(args) {
 }
 const formatOf = args => { const at = args.indexOf('--format'); return at < 0 ? args.find(value => value.startsWith('--format='))?.slice(9) : args[at + 1]; };
 const filtersOf = args => args.flatMap((value, at) => (value === '--filter' ? [args[at + 1]] : value.startsWith('--filter=') ? [value.slice(9)] : []));
-const inspectModel = record => ({
+export const inspectModel = record => ({
     ID: record.id, Created: record.created, Image: record.image, ImageName: record.imageName ?? '', Name: record.name ?? '', Mounts: record.mounts ?? [],
     Config: { Labels: record.labels ?? null },
-    State: { Running: record.running ?? false, Pid: record.pid ?? 1, StartedAt: record.startedAt ?? 'x', ConmonPid: record.conmonPid ?? 2 },
+    State: {
+        Status: record.status ?? (record.running === false ? 'exited' : 'running'), Running: record.running ?? false, Pid: record.pid ?? 1, StartedAt: record.startedAt ?? 'x',
+        FinishedAt: record.finishedAt ?? '0001-01-01T00:00:00Z', ConmonPid: record.conmonPid ?? 2, ExitCode: record.exitCode ?? 0, OOMKilled: record.oomKilled ?? false,
+    },
     HostConfig: { Memory: record.memory ?? 0, MemorySwap: record.memorySwap ?? 0, NanoCpus: record.nanoCpus ?? 0, CpuQuota: record.cpuQuota ?? 0, CpuPeriod: record.cpuPeriod ?? 0, PidsLimit: record.pidsLimit ?? 0 },
 });
 const psModel = record => ({
@@ -129,6 +132,7 @@ export function createFakeWorld({ statePath, node, engine, host, unrelated = [],
         if (args[0] === 'container' && args[1] === 'ps') return filtersOf(args).length ? 'ps-filter' : 'ps';
         if (args[0] === 'container' && args[1] === 'inspect') return 'inspect';
         if (args[0] === 'container' && args[1] === 'exec' && args.includes('inspect')) return 'agent-inspect';
+        if (args[0] === 'container' && args[1] === 'exec' && args.includes('--cgroup-manager=cgroupfs') && args.includes('ps')) return 'agent-ps';
         return 'exec';
     };
     const render = (args, kind, model) => {
@@ -167,10 +171,18 @@ export function createFakeWorld({ statePath, node, engine, host, unrelated = [],
                 const box = state.boxes[id] || state.unrelated.find(value => value.id === id);
                 return box ? render(args, 'inspect', inspectModel(box)) : failed('no such container');
             }
+            case 'agent-ps': {
+                // The nested engine's whole listing: one ID per container.
+                const rendered = evaluateTemplate(formatOf(args), 'ps', { ID: '' });
+                if (typeof rendered !== 'string') return rendered;
+                return ok(Object.values(state.agents).map(agent => `${agent.id}\n`).join(''));
+            }
             case 'agent-inspect': {
-                const name = args.at(-1);
-                const agent = state.agents[name];
-                if (!agent || fault?.drop === name) return failed('no such container');
+                // By name or by the immutable ID the harness recorded.
+                const key = args.at(-1);
+                const name = state.agents[key] ? key : Object.keys(state.agents).find(candidate => state.agents[candidate].id === key);
+                const agent = name === undefined ? undefined : state.agents[name];
+                if (!agent || fault?.drop === name) return failed('Error: no such container', 125);
                 return render(args, 'inspect', inspectModel({ ...agent, ...(fault?.patch || {}) }));
             }
             case 'start': {

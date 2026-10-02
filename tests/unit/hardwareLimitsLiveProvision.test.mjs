@@ -19,7 +19,7 @@ import { admitManifestRuntimeCapabilities, validateManifestRuntimeCapabilities }
 import { deprecatedHardwareDeclarations } from '../../cli/sandbox/hardwareLimits/declaredLimits.mjs';
 import { buildConcreteManifest, summaryPathFor } from '../hardware-limits/liveManifest.mjs';
 import { writeUstar } from '../hardware-limits/liveStage.mjs';
-import { AGENT_INSPECT, ENGINE_INFO_ARGV, INSPECT, PS_IDENTITY_FORMAT, boxPsArgv, engineIdentityDigest, engineIdentityFacts, hostRecordPaths, observeEngineIdentity, quarantinePath, workspaceSocketProblem } from '../hardware-limits/liveCommon.mjs';
+import { AGENT_INSPECT, ENGINE_INFO_ARGV, INSPECT, MAX_TAIL_BYTES, NESTED_CONTAINER_INSPECT, NESTED_LIST_FORMAT, PS_IDENTITY_FORMAT, boxPsArgv, engineIdentityDigest, engineIdentityFacts, hostRecordPaths, observeEngineIdentity, quarantinePath, workspaceSocketProblem } from '../hardware-limits/liveCommon.mjs';
 import { CRASH_EXIT, FAKE_CONNECTIONS, createFakeSsh, createFakeWorld, evaluateTemplate, fakeEngineInfo, ok, unsupportedFormat, worldState } from '../hardware-limits/fakeLiveEngine.mjs';
 
 const hash = value => `sha256:${crypto.createHash('sha256').update(value).digest('hex')}`;
@@ -169,6 +169,36 @@ test('L1.provision-mac-c1-c2-success', async t => {
     assert.equal(worldState(w.statePath).destroyCalls, 1);
 });
 
+test('L1.provision-fixture-start-keeps-bounded-redacted-output-tails', async t => {
+    const w = world(t);
+    const artifacts = new Map();
+    const noisy = `${'y'.repeat(30000)}\nPLOINKY_MASTER_KEY=hunter2hunter2\n[start] Router: http://127.0.0.1:23456\n`;
+    const processProvider = async (binary, args, options) => {
+        const result = await w.engineProvider(binary, args, options);
+        return binary === w.node && args.includes('start') ? { ...result, stdout: noisy, stderr: 'Authorization: Bearer abcdefghijklmnop\n' } : result;
+    };
+    const report = await provisionRun({ run: w.run, persist: w.persist, processProvider, portProbe: free, hostIdentity: w.hostIdentity, validateProfile, artifacts: (name, value) => artifacts.set(name, structuredClone(value)) });
+    assert.equal(report.verdict, 'PASS', JSON.stringify(report.limitations));
+    const tails = artifacts.get('fixture-start');
+    assert.equal(tails.status, 0); assert.equal(tails.kind, 'fixture-start');
+    assert.ok(Buffer.byteLength(tails.stdoutTail) <= MAX_TAIL_BYTES); assert.ok(tails.stdoutDroppedBytes > 0);
+    assert.match(tails.stdoutTail, /\[start\] Router: http:\/\/127\.0\.0\.1:23456/);
+    assert.match(tails.stdoutTail, /PLOINKY_MASTER_KEY=\[redacted\]/); assert.match(tails.stderrTail, /Bearer \[redacted\]/);
+    for (const secret of ['hunter2', 'abcdefghijklmnop']) assert.equal(JSON.stringify(tails).includes(secret) || JSON.stringify(w.run).includes(secret), false, secret);
+    const op = w.run.operations.find(value => value.kind === 'fixture-start');
+    assert.equal(op.artifact, 'fixture-start'); assert.equal(Object.hasOwn(op, 'stdout'), false);
+    await cleanup(w); assertNothingOwned(w);
+});
+
+test('L1.provision-failed-fixture-start-still-leaves-its-tails', async t => {
+    const w = world(t, { faults: { start: { status: 7 } } });
+    const artifacts = new Map();
+    const report = await provisionRun({ run: w.run, persist: w.persist, processProvider: w.engineProvider, portProbe: free, hostIdentity: w.hostIdentity, validateProfile, artifacts: (name, value) => artifacts.set(name, structuredClone(value)) });
+    assert.equal(report.verdict, 'FAIL'); assert.match(report.limitations[0], /Live command failed/);
+    const tails = artifacts.get('fixture-start');
+    assert.equal(tails.status, 7); assert.match(tails.stderrTail, /start failed/);
+});
+
 test('L1.provision-apparatus-a1-staged-success', async t => {
     const w = world(t, { block: 'apparatus-cpu' });
     const report = await provision(w);
@@ -231,7 +261,15 @@ test('L1.fake-engine-templates-are-strict', async t => {
     assert.equal(evaluateTemplate('{{json .}}', 'info', { host: 1 }), '{"host":1}');
     // Every template the harness really sends is supported, argv by argv.
     for (const args of [['container', 'inspect', '--format', INSPECT, 'id'], ['container', 'exec', 'box', 'podman', 'container', 'inspect', '--format', AGENT_INSPECT, 'name'],
-        [...boxPsArgv('0'.repeat(12))], ['container', 'ps', '--all', '--no-trunc', '--format', '{{.ID}}'], [...ENGINE_INFO_ARGV]]) assert.equal(unsupportedFormat(args), null, args.join(' '));
+        [...boxPsArgv('0'.repeat(12))], ['container', 'ps', '--all', '--no-trunc', '--format', '{{.ID}}'], [...ENGINE_INFO_ARGV],
+        // The evidence-only nested listing and per-container inspect.
+        ['container', 'exec', 'box', 'podman', '--cgroup-manager=cgroupfs', 'container', 'ps', '--all', '--no-trunc', '--format', NESTED_LIST_FORMAT],
+        ['container', 'exec', 'box', 'podman', '--cgroup-manager=cgroupfs', 'container', 'inspect', '--format', NESTED_CONTAINER_INSPECT, 'id']]) assert.equal(unsupportedFormat(args), null, args.join(' '));
+    // The new State fields are addressed by Go name; JSON-key spellings and fields the fake does not know are refused.
+    for (const spelled of ['.State.OOMKilled>.State.oomKilled', '.State.ExitCode>.State.exitCode', '.State.Status>.State.status', '.State.FinishedAt>.State.Dead']) {
+        const [from, to] = spelled.split('>');
+        assert.equal(unsupportedFormat(['container', 'inspect', '--format', NESTED_CONTAINER_INSPECT.replace(from, to), 'id']).status, 125, spelled);
+    }
     assert.equal(unsupportedFormat(['container', 'inspect', '--format', INSPECT.replace('.ID', '.Id'), 'id']).status, 125);
     // The same strictness holds through the file-backed engine of the world.
     const w = await provisioned(t);
@@ -245,6 +283,15 @@ test('L1.fake-engine-templates-are-strict', async t => {
     assert.equal((await run('container', 'ps', '--all', '--no-trunc', '--filter', `label=${BOX_LABELS.pathHash}=${'0'.repeat(12)}`, '--format', '{{.ID}}')).stdout, '');
     assert.equal((await run('container', 'ps', '--all', '--format', '{{.Id}}')).status, 125);
     assert.equal((await run('container', 'ps', '--all', '--filter', 'bogus=1', '--format', '{{.ID}}')).status, 125);
+    // The nested engine answers the evidence listing through the same strict templates.
+    const nestedArgs = ['container', 'exec', '--user', 'podman', box.id, 'podman', '--cgroup-manager=cgroupfs'];
+    const listed = (await run(...nestedArgs, 'container', 'ps', '--all', '--no-trunc', '--format', NESTED_LIST_FORMAT)).stdout.trim().split(/\s+/);
+    assert.equal(listed.length, 3);
+    const one = JSON.parse((await run(...nestedArgs, 'container', 'inspect', '--format', NESTED_CONTAINER_INSPECT, listed[0])).stdout);
+    assert.deepEqual([one.id, one.status, one.running, one.exitCode, one.oomKilled], [listed[0], 'running', true, 0, false]);
+    assert.equal((await run(...nestedArgs, 'container', 'inspect', '--format', NESTED_CONTAINER_INSPECT.replace('.State.OOMKilled', '.State.oomKilled'), listed[0])).status, 125);
+    const missing = await run(...nestedArgs, 'container', 'inspect', '--format', NESTED_CONTAINER_INSPECT, '9'.repeat(64));
+    assert.equal(missing.status, 125); assert.match(missing.stderr, /no such container/);
 });
 
 // Provision creates the Box, then the post-create inspect fails (as `.Id` did

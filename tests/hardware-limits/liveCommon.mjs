@@ -7,6 +7,7 @@ import crypto from 'node:crypto';
 import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { requireTransport } from './liveProcess.mjs';
+import { LIMITS_HASH_LABEL } from '../../cli/sandbox/hardwareLimits/resolve.mjs';
 
 export const ID = /^[a-f0-9]{64}$/;
 export const HASH = /^sha256:[a-f0-9]{64}$/;
@@ -115,6 +116,75 @@ export const INSPECT = '{"id":{{json .ID}},"created":{{json .Created}},"image":{
 // Nested fixture agents additionally report their name and the image
 // reference they were created from.
 export const AGENT_INSPECT = INSPECT.replace('{"id":', '{"name":{{json .Name}},"imageName":{{json .ImageName}},"id":');
+
+// Evidence-only nested container query. Its State fields (Status, FinishedAt,
+// ExitCode, OOMKilled) are Podman's Go struct names but have not yet been
+// proved on a real engine, so no gating inspect uses them: a template failure
+// here is recorded as evidence and can never fail a case by itself.
+export const NESTED_CONTAINER_INSPECT = '{"id":{{json .ID}},"name":{{json .Name}},"created":{{json .Created}},"image":{{json .Image}},"imageName":{{json .ImageName}},"labels":{{json .Config.Labels}},"status":{{json .State.Status}},"running":{{json .State.Running}},"startedAt":{{json .State.StartedAt}},"finishedAt":{{json .State.FinishedAt}},"exitCode":{{json .State.ExitCode}},"oomKilled":{{json .State.OOMKilled}}}';
+export const NESTED_LIST_FORMAT = '{{.ID}}';
+export const MAX_NESTED_LISTED = 16;
+export const MAX_TAIL_BYTES = 8192;
+
+// Output of candidate and engine commands may carry credentials, so persisted
+// tails pass through this one redactor first: secret-named assignments and
+// JSON members, bearer and basic credentials, JWTs and URL userinfo. Container
+// IDs and digests are evidence and are never touched.
+const SECRET_NAME = '[A-Za-z0-9_.-]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIAL|AUTH|COOKIE|SESSION)[A-Za-z0-9_.-]*';
+export function redactDiagnostic(text) {
+    return String(text ?? '')
+        // eslint-disable-next-line no-control-regex
+        .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '')
+        // eslint-disable-next-line no-control-regex
+        .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '?')
+        // Credentials with a scheme word first, so a secret-named header such as
+        // `Authorization: Bearer TOKEN` cannot stop at the scheme word.
+        .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, '$1 [redacted]')
+        .replace(new RegExp(`(\\b${SECRET_NAME})(\\s*[=:]\\s*)(?!(?:Bearer|Basic) \\[redacted\\])("[^"\\n]*"|'[^'\\n]*'|[^\\s,;"']+)`, 'gi'), '$1$2[redacted]')
+        .replace(new RegExp(`("${SECRET_NAME}"\\s*:\\s*)"[^"\\n]*"`, 'gi'), '$1"[redacted]"')
+        .replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*/g, '[redacted-jwt]')
+        .replace(/(\b[a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/gi, '$1[redacted]@');
+}
+// The last `maxBytes` bytes of the redacted text on a character boundary, with
+// the count of bytes dropped from the front.
+export function boundedTail(text, maxBytes = MAX_TAIL_BYTES) {
+    const redacted = redactDiagnostic(text);
+    const bytes = Buffer.from(redacted, 'utf8');
+    if (bytes.length <= maxBytes) return { text: redacted, droppedBytes: 0 };
+    let start = bytes.length - maxBytes;
+    while (start < bytes.length && (bytes[start] & 0xc0) === 0x80) start += 1;
+    return { text: bytes.subarray(start).toString('utf8'), droppedBytes: start };
+}
+// What is kept of one finished command: its transport flags and the bounded,
+// redacted tails of both streams.
+export function commandTails(result, { maxBytes = MAX_TAIL_BYTES } = {}) {
+    const out = boundedTail(result?.stdout, maxBytes);
+    const err = boundedTail(result?.stderr, maxBytes);
+    return {
+        status: result?.status ?? null, signal: result?.signal ?? null, timedOut: Boolean(result?.timedOut), truncated: Boolean(result?.truncated),
+        cancelled: Boolean(result?.cancelled), errorCode: result?.errorCode ?? null, settlementForced: Boolean(result?.settlementForced),
+        stdoutTail: out.text, stdoutDroppedBytes: out.droppedBytes, stderrTail: err.text, stderrDroppedBytes: err.droppedBytes,
+    };
+}
+// A run-artifact path beside the run manifest, carrying the manifest's own
+// document suffix exactly once before the extension.
+export function artifactPathFor(runPath, name) {
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(String(name))) throw new Error('Invalid artifact name');
+    const match = /(_claude|_codex)?\.json$/.exec(runPath);
+    return `${runPath.replace(/(?:_claude|_codex)?\.json$/, '')}_${name}${match?.[1] || ''}.json`;
+}
+// One nested container as evidence: identity, lifecycle state, why it stopped
+// and the limits hash label it was created with. Never the other labels.
+export function nestedContainerEvidence(value) {
+    const text = (field, max = 256) => (typeof field === 'string' ? field.slice(0, max) : null);
+    return {
+        id: text(value?.id, 64), name: text(value?.name), created: text(value?.created, 128), image: text(value?.image, 128), imageName: text(value?.imageName),
+        status: text(value?.status, 64), running: typeof value?.running === 'boolean' ? value.running : null,
+        startedAt: text(value?.startedAt, 128), finishedAt: text(value?.finishedAt, 128),
+        exitCode: Number.isSafeInteger(value?.exitCode) ? value.exitCode : null, oomKilled: typeof value?.oomKilled === 'boolean' ? value.oomKilled : null,
+        limitsHash: text(value?.labels?.[LIMITS_HASH_LABEL], 128),
+    };
+}
 
 // The minimal, version-robust query that finds a container by identity
 // without parsing an inspect document: `{{.ID}} {{.Names}}` per line.

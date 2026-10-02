@@ -10,16 +10,17 @@ import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { requireTransport, runBoundedProcess } from './liveProcess.mjs';
 import {
-    HOST_RECORD_DIRECTORIES, ID, INSPECT, OWNER_MARKER, assertOwnedDirectory, assertWorkspace, boxPsArgv, candidateEnv, checkedJson, hostRecordPaths,
+    HOST_RECORD_DIRECTORIES, ID, INSPECT, OWNER_MARKER, assertOwnedDirectory, assertWorkspace, boxPsArgv, candidateEnv, checkedJson, commandTails, hostRecordPaths,
     jsonDigest, liveSourceDigest, observeEngineIdentity, quarantinePath,
 } from './liveCommon.mjs';
 
 // One journaled command: the intent is persisted before the process starts and
-// the observed status after it ends. Output is never persisted here. A `box`
+// the observed status after it ends. Output stays out of the journal; a command
+// named with `capture` writes bounded, redacted tails as a run artifact. A `box`
 // identity ({ name, pathHash }) is stored on the intent, so it is durable
 // before the command that creates that Box can run.
-export function createJournal({ run, persist, processProvider = runBoundedProcess, signal }) {
-    return async function journaled(kind, binary, args, { cwd, env, deadlineMs = 30000, stress = false, resourceIds = [], stdinPath = null, box = null } = {}) {
+export function createJournal({ run, persist, processProvider = runBoundedProcess, signal, artifacts = () => {} }) {
+    return async function journaled(kind, binary, args, { cwd, env, deadlineMs = 30000, stress = false, resourceIds = [], stdinPath = null, box = null, capture = null } = {}) {
         if (run.operations.length >= 512 || Buffer.byteLength(JSON.stringify(run)) > 190000) throw new Error('Live journal bound exceeded');
         const op = { id: `live-${run.operations.length + 1}`, kind, state: 'intent', resourceIds, argvDigest: jsonDigest([binary, ...args]), resultArtifact: null, ...(box ? { box } : {}) };
         run.operations.push(op); persist();
@@ -27,6 +28,14 @@ export function createJournal({ run, persist, processProvider = runBoundedProces
         op.state = 'observed';
         op.result = { status: result.status, signal: result.signal, timedOut: result.timedOut, truncated: result.truncated, cancelled: result.cancelled, errorCode: result.errorCode, settlementForced: Boolean(result.settlementForced) };
         persist();
+        // A command named for capture keeps the bounded, redacted tails of both
+        // streams as a run artifact before its transport is judged, so a failed
+        // or truncated command leaves its own evidence.
+        if (capture) {
+            try { artifacts(capture, { operation: op.id, kind, ...commandTails(result) }); op.artifact = capture; }
+            catch (error) { op.artifactError = String(error?.message || error).slice(0, 256); }
+            persist();
+        }
         requireTransport(result, { stress });
         return result;
     };

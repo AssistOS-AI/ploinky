@@ -377,6 +377,15 @@ export function buildRequiredCaseManifest() {
             'HLIVE.C2-counter-moving-only-after-the-pressure-exits-passes',
             'HLIVE.C2-counter-never-moving-fails-with-the-same-message',
             'HLIVE.C2-leaf-vanishing-after-exit-is-a-distinct-recorded-failure',
+            'R7.listing-is-persisted-after-each-repeat-start-before-anything-else',
+            'R7.start-output-tails-are-persisted-bounded-and-redacted-not-journaled',
+            'R7.redaction-keeps-identities-and-drops-credentials',
+            'R7.agent-recreated-by-the-repeat-start-is-reported-with-both-identities',
+            'R7.agent-exited-is-reported-with-exit-code-and-oom-kill',
+            'R7.agent-vanished-is-reported-when-no-container-of-that-name-remains',
+            'R7.agent-loss-with-an-unreadable-nested-listing-is-unclassified-not-vanished',
+            'R7.agent-present-but-uninspectable-is-an-engine-error-not-a-loss',
+            'R7.identity-check-stays-strict-for-a-running-agent-with-another-creation-time',
         ]),
         ...leaves(P, 'p1', unit('hardwareLimitsRepeatStart.test.mjs'), [
             'RS.host-env-gate-repeat-and-saved-gate-repeat-select-the-same-wiring-and-rewrite-nothing',
@@ -385,6 +394,7 @@ export function buildRequiredCaseManifest() {
             'RS.a-nested-backend-probe-failure-is-the-plan-defined-way-limited-agents-are-removed',
         ]),
         ...leaves(P, 'p1', unit('hardwareLimitsLiveProvision.test.mjs'), [
+            'L1.provision-fixture-start-keeps-bounded-redacted-output-tails', 'L1.provision-failed-fixture-start-still-leaves-its-tails',
             'L1.provision-mac-c1-c2-success', 'L1.provision-apparatus-a1-staged-success',
             'L1.provision-failure-boundaries-clean-up', 'L1.fake-engine-templates-are-strict',
             'L1.provision-box-inspect-failure-still-records-and-cleans-the-box', 'L1.cleanup-refuses-a-box-that-does-not-match-the-recorded-identity',

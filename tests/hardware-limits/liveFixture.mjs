@@ -111,7 +111,7 @@ function provisionReport(run, verdict, limitations) {
 }
 
 export async function provisionRun({
-    run, persist = () => {}, processProvider = runBoundedProcess, signal, portProbe = probeLocalPorts, remoteArrival = false,
+    run, persist = () => {}, processProvider = runBoundedProcess, signal, portProbe = probeLocalPorts, remoteArrival = false, artifacts = () => {},
     hostIdentity = { hostname: os.hostname(), platform: process.platform, home: fs.realpathSync(os.homedir()) },
     validateProfile,
 } = {}) {
@@ -144,7 +144,7 @@ export async function provisionRun({
     }
     if (liveSourceDigest(profile.source.root) !== profile.source.digest) { limitations.push('Candidate source changed'); return provisionReport(run, 'BLOCKED', limitations); }
 
-    const journaled = createJournal({ run, persist, processProvider, signal });
+    const journaled = createJournal({ run, persist, processProvider, signal, artifacts });
     const env = candidateEnv(profile);
     const plan = profile.provision;
     const engine = (kind, args, options = {}) => journaled(kind, profile.engine.path, args, { cwd: profile.host.home, env, deadlineMs: run.deadlines.coreMs || 30000, ...options });
@@ -227,7 +227,7 @@ export async function provisionRun({
             // intent before the process that creates it can run.
             await journaled('fixture-start', profile.node.path, startArgs(profile, run.ports), {
                 cwd: workspace.path, env: { ...env, PLOINKY_BOX_HARDWARE_LIMITS: 'on' }, deadlineMs: run.deadlines.startMs || 1200000,
-                box: { name: identity.instance, pathHash: identity.pathHash },
+                box: { name: identity.instance, pathHash: identity.pathHash }, capture: 'fixture-start',
             });
         } finally { recordHostRecords(run, profile, instance); persist(); }
         const after = await listIds('box-inventory');

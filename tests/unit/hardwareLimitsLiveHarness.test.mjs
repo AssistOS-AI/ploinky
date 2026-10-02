@@ -18,8 +18,9 @@ import { prepareCgroupDelegation } from '../../ploinky-box/entrypoint/cgroupDele
 import { PREPARE_SCRIPT_BOX_PATH } from '../../ploinky-box/hardwareLimits/status.mjs';
 import { ensureAgentCgroupParents, readStructuralDelegation } from '../../cli/sandbox/hardwareLimits/delegation.mjs';
 import { parseGpuInventory, requireGpuIdle } from '../hardware-limits/liveGpu.mjs';
-import { engineIdentityDigest } from '../hardware-limits/liveCommon.mjs';
-import { fakeEngineInfo, unsupportedFormat } from '../hardware-limits/fakeLiveEngine.mjs';
+import { MAX_TAIL_BYTES, artifactPathFor, engineIdentityDigest, redactDiagnostic } from '../hardware-limits/liveCommon.mjs';
+import { fixtureContainerName } from '../hardware-limits/liveFixture.mjs';
+import { evaluateTemplate, fakeEngineInfo, inspectModel, unsupportedFormat } from '../hardware-limits/fakeLiveEngine.mjs';
 import {
     assertWorkspace, executeLiveRun, jsonDigest, readPrivateJson, runLiveCommand,
     validateAuthorization, validateExecutionProfile, liveSourceDigest, postExitObservation, POST_EXIT_VANISHED,
@@ -327,7 +328,7 @@ test('HLIVE.R18-empty-baseline-is-blocked', async t => {
 });
 
 
-async function runC1(t, box, { agents = null } = {}) {
+async function runC1(t, box, { agents = null, wrap = null, artifacts = () => {} } = {}) {
     const f=fixture(t);f.box.labels[BOX_LABELS.hardwareLimits]='f'.repeat(64);f.profile.box.contractDigest=jsonDigest({labels:f.box.labels,mounts:f.box.mounts});f.profile.cases=['LIVE-C1'];f.profile.fixtures={cpu:{ref:'test/cpu'}};
     if(agents)f.profile.agents=agents;
     const starts=[];const kinds=[];const persisted=[];
@@ -345,9 +346,9 @@ async function runC1(t, box, { agents = null } = {}) {
     // Each persisted manifest is captured, so evidence persisted before the
     // assertion is visible exactly as a crash would leave it.
     const persist=()=>persisted.push(JSON.parse(JSON.stringify(f.run)));
-    const report=await executeLiveRun({run:f.run,hostIdentity:f.profile.host,processProvider:provider,persist});
+    const report=await executeLiveRun({run:f.run,hostIdentity:f.profile.host,processProvider:wrap?wrap(provider,f):provider,persist,artifacts});
     const row=report.cases.find(entry=>entry.id==='LIVE-C1');
-    return {report,starts,kinds,persisted,row,result:row.result};
+    return {report,starts,kinds,persisted,row,result:row.result,f};
 }
 
 test('HLIVE.C1-core-conmon-and-persisted-gate', async t => {
@@ -1042,4 +1043,200 @@ test('C1.proof-valid-partial-host-blocked-unchanged', async t => {
     const c1 = await proveOnFake(t, fake);
     assert.equal(c1.result, 'blocked'); assert.match(c1.row.reason, /needs controller cpu/);
     assertEvidencePersisted(c1, fake);
+});
+
+// --- Round 7: nested listing, command tails and distinct agent-loss failures --
+// The nested engine is a strict fake: `container exec ... podman
+// --cgroup-manager=cgroupfs container ps|inspect` answer from a map of
+// containers, and every `--format` template is evaluated against the fake's
+// known Go field names (fakeLiveEngine.mjs), so a field the harness reaches
+// for that was never proved on a real engine fails here until added on purpose.
+const NESTED_IMAGE = `docker.io/assistos/ploinky-node@sha256:${'d'.repeat(64)}`;
+const LIMITS_HASH = 'e'.repeat(64);
+const failed = (status, stderr) => ({ status, signal: null, stdout: '', stderr, timedOut: false, truncated: false, cancelled: false, errorCode: null });
+
+function nestedEngine({ onStart = () => {}, psFails = false, failInspectOf = null, startOutput = null } = {}) {
+    const events = [];
+    const artifactValues = new Map();
+    let records = null;
+    const sink = (name, value) => { artifactValues.set(name, structuredClone(value)); events.push({ kind: 'artifact', name }); };
+    const wrap = (next, f) => {
+        records = new Map();
+        for (const agent of f.profile.agents) {
+            records.set(agent.id, {
+                id: agent.id, name: `/${fixtureContainerName(f.profile.workspace.path, agent.role)}`, created: agent.created, image: agent.image, imageName: NESTED_IMAGE,
+                labels: { 'ploinky.limitshash': LIMITS_HASH, 'ploinky.other': 'must-not-be-persisted' }, status: 'running', running: true, pid: 123,
+                startedAt: '2026-10-01T01:00:00Z', conmonPid: 456, memory: 67108864, memorySwap: 67108864, nanoCpus: 500000000, pidsLimit: 64,
+            });
+        }
+        let starts = 0;
+        return async (binary, args, options) => {
+            if (binary === f.profile.node.path && args.includes('start')) {
+                events.push({ kind: 'start', gate: options.env.PLOINKY_BOX_HARDWARE_LIMITS ?? null });
+                onStart(records, starts++, f);
+                const result = await next(binary, args, options);
+                return startOutput ? { ...result, ...startOutput } : result;
+            }
+            if (args.includes('--cgroup-manager=cgroupfs') && args.includes('container') && (args.includes('ps') || args.includes('inspect'))) {
+                if (args.includes('ps')) {
+                    events.push({ kind: 'nested-ps' });
+                    if (psFails) return failed(125, 'Error: nested engine unavailable');
+                    const refused = unsupportedFormat(args); if (refused) return refused;
+                    return ok([...records.keys()].map(id => `${id}\n`).join(''));
+                }
+                const id = args.at(-1);
+                events.push({ kind: 'nested-inspect', id });
+                const record = records.get(id);
+                if (!record) return failed(125, `Error: no such container ${id}`);
+                const format = args[args.indexOf('--format') + 1];
+                if (failInspectOf && failInspectOf(id, format)) return failed(125, 'Error: inspect failed password=hunter2');
+                const rendered = evaluateTemplate(format, 'inspect', inspectModel(record));
+                return typeof rendered === 'string' ? ok(rendered) : rendered;
+            }
+            if (args[0] === 'container' && args[1] === 'inspect') events.push({ kind: 'box-inspect' });
+            return next(binary, args, options);
+        };
+    };
+    return { wrap, sink, events, artifacts: artifactValues, records: () => records };
+}
+
+test('R7.listing-is-persisted-after-each-repeat-start-before-anything-else', async t => {
+    const world = nestedEngine();
+    const c1 = await runC1(t, await productionBox(), { wrap: world.wrap, artifacts: world.sink });
+    assert.equal(c1.result, 'pass', JSON.stringify(c1.report));
+    const starts = world.events.map((event, index) => ({ event, index })).filter(({ event }) => event.kind === 'start');
+    assert.deepEqual(starts.map(({ event }) => event.gate), ['on', null]);
+    ['repeat-gate-on-start', 'repeat-saved-gate-start'].forEach((kind, round) => {
+        const listing = world.artifacts.get(`nested-containers-${kind}`);
+        assert.ok(listing, `${kind}: no listing artifact`);
+        assert.equal(listing.complete, true);
+        assert.equal(listing.containers.length, 3);
+        for (const container of listing.containers) {
+            assert.deepEqual(Object.keys(container).sort(), ['created', 'exitCode', 'finishedAt', 'id', 'image', 'imageName', 'limitsHash', 'name', 'oomKilled', 'running', 'startedAt', 'status']);
+            assert.equal(container.limitsHash, LIMITS_HASH);
+            assert.equal(container.status, 'running');
+            assert.equal(container.exitCode, 0);
+            assert.equal(container.oomKilled, false);
+        }
+        assert.ok(listing.containers.some(container => container.name === `/${fixtureContainerName(c1.f.profile.workspace.path, 'memory')}`));
+        // Written after its own start and before the next Box inspect.
+        const written = world.events.findIndex(event => event.kind === 'artifact' && event.name === `nested-containers-${kind}`);
+        const next = world.events.findIndex((event, index) => index > starts[round].index && event.kind === 'box-inspect');
+        assert.ok(starts[round].index < written && written < next, `${kind}: listing order ${starts[round].index} < ${written} < ${next}`);
+    });
+    assert.equal(JSON.stringify([...world.artifacts.values()]).includes('must-not-be-persisted'), false, 'only the limits hash label is kept');
+});
+
+test('R7.start-output-tails-are-persisted-bounded-and-redacted-not-journaled', async t => {
+    const noisy = `${'x'.repeat(20000)}\nPLOINKY_MASTER_KEY=hunter2hunter2\nAuthorization: Bearer abcdefghijklmnop\n[start] Router: http://127.0.0.1:24240\n`;
+    const world = nestedEngine({ startOutput: { stdout: noisy, stderr: 'warn token=abc123 https://user:pw@example.test/x\n' } });
+    const c1 = await runC1(t, await productionBox(), { wrap: world.wrap, artifacts: world.sink });
+    assert.equal(c1.result, 'pass', JSON.stringify(c1.report));
+    for (const kind of ['repeat-gate-on-start', 'repeat-saved-gate-start']) {
+        const tails = world.artifacts.get(kind);
+        assert.ok(tails, `${kind}: no tails artifact`);
+        assert.equal(tails.status, 0);
+        assert.ok(Buffer.byteLength(tails.stdoutTail) <= MAX_TAIL_BYTES);
+        assert.ok(tails.stdoutDroppedBytes > 0, 'the head of a long stream is dropped, the tail kept');
+        assert.match(tails.stdoutTail, /\[start\] Router: http:\/\/127\.0\.0\.1:24240/);
+        assert.match(tails.stdoutTail, /PLOINKY_MASTER_KEY=\[redacted\]/);
+        assert.match(tails.stdoutTail, /Bearer \[redacted\]/);
+        assert.match(tails.stderrTail, /token=\[redacted\]/);
+        const text = JSON.stringify(tails);
+        for (const secret of ['hunter2', 'abcdefghijklmnop', 'abc123', 'user:pw']) assert.equal(text.includes(secret), false, `${kind}: ${secret} leaked`);
+    }
+    // The journal keeps status flags and the artifact name, never the output.
+    const journal = JSON.stringify(c1.persisted.at(-1));
+    assert.equal(journal.includes('hunter2'), false);
+    const start = c1.persisted.at(-1).operations.find(op => op.kind === 'repeat-gate-on-start');
+    assert.equal(start.artifact, 'repeat-gate-on-start');
+    assert.deepEqual(Object.keys(start.result).sort(), ['cancelled', 'errorCode', 'signal', 'status', 'timedOut', 'truncated']);
+});
+
+test('R7.redaction-keeps-identities-and-drops-credentials', () => {
+    const id = 'a'.repeat(64);
+    const text = redactDiagnostic(`container ${id} sha256:${'b'.repeat(64)}\nAPI_KEY="s3cr3t value" password: p4ss\n{"client_secret": "zzz", "name": "ok"}\neyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2ln\n\u001b[31mred\u001b[0m\u0000`);
+    assert.match(text, new RegExp(id));
+    assert.match(text, new RegExp(`sha256:${'b'.repeat(64)}`));
+    assert.match(text, /API_KEY=\[redacted\]/);
+    assert.match(text, /password: \[redacted\]/);
+    assert.match(text, /"client_secret": "\[redacted\]"/);
+    assert.match(text, /"name": "ok"/);
+    assert.match(text, /\[redacted-jwt\]/);
+    assert.equal(/s3cr3t|p4ss|zzz|c2ln|\u001b|\u0000/.test(text), false);
+    assert.equal(artifactPathFor('/x/mac-cpu-run_claude.json', 'repeat-gate-on-start'), '/x/mac-cpu-run_repeat-gate-on-start_claude.json');
+    assert.equal(artifactPathFor('/x/run.json', 'a-b'), '/x/run_a-b.json');
+    assert.throws(() => artifactPathFor('/x/run.json', '../escape'));
+});
+
+async function agentLoss(t, options, mutate) {
+    const world = nestedEngine({ ...options, onStart: (records, index, f) => { if (index === 0) mutate(records, f); } });
+    const c1 = await runC1(t, await productionBox(), { wrap: world.wrap, artifacts: world.sink });
+    return { world, c1, memory: c1.f.profile.agents.find(agent => agent.role === 'memory') };
+}
+
+test('R7.agent-recreated-by-the-repeat-start-is-reported-with-both-identities', async t => {
+    const replacement = { id: 'f'.repeat(64), created: '2026-10-01T00:05:00Z' };
+    const { world, c1, memory } = await agentLoss(t, {}, (records) => {
+        const old = records.get('1'.repeat(64));
+        records.delete(old.id);
+        records.set(replacement.id, { ...old, ...replacement });
+    });
+    assert.equal(c1.result, 'fail');
+    assert.match(c1.row.reason, /^Agent memory was recreated: /);
+    for (const value of [memory.id, memory.created, replacement.id, replacement.created]) assert.ok(c1.row.reason.includes(value), value);
+    assert.doesNotMatch(c1.row.reason, /Live command failed/);
+    assert.equal(c1.row.evidence.failure, 'LIVE_AGENT_RECREATED');
+    // The failing command's bounded stderr and a fresh listing are kept.
+    const stderr = world.artifacts.get('inspect-agent-failure-memory');
+    assert.equal(stderr.status, 125);
+    assert.match(stderr.stderrTail, /no such container/);
+    assert.ok(Buffer.byteLength(stderr.stderrTail) <= 2048);
+    const listing = world.artifacts.get('nested-containers-after-inspect-failure-memory');
+    assert.ok(listing.containers.some(container => container.id === replacement.id));
+    assert.equal(listing.containers.some(container => container.id === memory.id), false);
+    // C1 stays strict: the replacement is never accepted as the recorded agent.
+    assert.equal(c1.report.verdict, 'FAIL');
+});
+
+test('R7.agent-exited-is-reported-with-exit-code-and-oom-kill', async t => {
+    const { world, c1 } = await agentLoss(t, {}, (records) => {
+        Object.assign(records.get('1'.repeat(64)), { status: 'exited', running: false, pid: 0, exitCode: 137, oomKilled: true, finishedAt: '2026-10-01T01:00:20Z' });
+    });
+    assert.equal(c1.result, 'fail');
+    assert.match(c1.row.reason, /^Agent memory exited: container 111111111111 is exited, exit code 137, OOMKilled true, finished 2026-10-01T01:00:20Z$/);
+    assert.equal(c1.row.evidence.failure, 'LIVE_AGENT_EXITED');
+    const listing = world.artifacts.get('nested-containers-after-inspect-not-running-memory');
+    assert.deepEqual(listing.containers.find(container => container.id === '1'.repeat(64)).exitCode, 137);
+});
+
+test('R7.agent-vanished-is-reported-when-no-container-of-that-name-remains', async t => {
+    const { c1, memory } = await agentLoss(t, {}, (records) => { records.delete('1'.repeat(64)); });
+    assert.equal(c1.result, 'fail');
+    assert.match(c1.row.reason, /^Agent memory vanished: neither recorded container /);
+    assert.ok(c1.row.reason.includes(memory.id));
+    assert.equal(c1.row.evidence.failure, 'LIVE_AGENT_VANISHED');
+});
+
+test('R7.agent-loss-with-an-unreadable-nested-listing-is-unclassified-not-vanished', async t => {
+    const { c1 } = await agentLoss(t, { psFails: true }, (records) => { records.delete('1'.repeat(64)); });
+    assert.equal(c1.result, 'fail');
+    assert.match(c1.row.reason, /^Agent memory \(111111111111\) cannot be found and the nested engine listing is incomplete/);
+    assert.equal(c1.row.evidence.failure, 'LIVE_AGENT_UNCLASSIFIED');
+    assert.equal(c1.row.evidence.listing.complete, false);
+});
+
+test('R7.agent-present-but-uninspectable-is-an-engine-error-not-a-loss', async t => {
+    const memoryId = '1'.repeat(64);
+    const { world, c1 } = await agentLoss(t, { failInspectOf: (id, format) => id === memoryId && !format.includes('oomKilled') }, () => {});
+    assert.equal(c1.result, 'fail');
+    assert.match(c1.row.reason, /^Agent memory container 111111111111 is listed as running but its inspect failed \(exit 125\)$/);
+    assert.equal(c1.row.evidence.failure, 'LIVE_AGENT_INSPECT_FAILED');
+    assert.equal(world.artifacts.get('inspect-agent-failure-memory').stderrTail.includes('hunter2'), false, 'the persisted stderr is redacted');
+});
+
+test('R7.identity-check-stays-strict-for-a-running-agent-with-another-creation-time', async t => {
+    const { c1 } = await agentLoss(t, {}, (records) => { records.get('1'.repeat(64)).created = '2026-10-01T09:09:09Z'; });
+    assert.equal(c1.result, 'fail');
+    assert.equal(c1.row.reason, 'Agent identity changed');
 });

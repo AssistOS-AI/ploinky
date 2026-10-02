@@ -9,11 +9,12 @@ import { EXIT, validateRunManifest, writePrivateJson } from './fixtures.mjs';
 import { runBoundedProcess, requireTransport } from './liveProcess.mjs';
 import { assertRemoteArrival } from './liveRemote.mjs';
 import {
-    HASH, HOST_RECORD_DIRECTORIES, ID, INSPECT, absolute, assertWorkspace, blocked, bounded, candidateEnv, checkedJson, digest, hostRecordPaths,
-    jsonDigest, keys, liveSourceDigest, observeEngineIdentity, receipt,
+    HASH, HOST_RECORD_DIRECTORIES, ID, INSPECT, MAX_NESTED_LISTED, NESTED_CONTAINER_INSPECT, NESTED_LIST_FORMAT, absolute, artifactPathFor, assertWorkspace,
+    blocked, bounded, candidateEnv, checkedJson, commandTails, digest, hostRecordPaths, jsonDigest, keys, liveSourceDigest, nestedContainerEvidence,
+    observeEngineIdentity, receipt,
 } from './liveCommon.mjs';
 import { recordHostRecords, runOwnedCleanup } from './liveCleanup.mjs';
-import { provisionRun, validateProvisionPlan } from './liveFixture.mjs';
+import { fixtureContainerName, provisionRun, validateProvisionPlan } from './liveFixture.mjs';
 import { stageAndDispatch } from './liveStage.mjs';
 import {
     CORE_LAYOUT, MEMBERSHIP as PROCESS_MEMBERSHIP, HELD_ALLOCATION, ALLOCATION_HANDSHAKE, LEAF_OBSERVATION, assertCoreLayout,
@@ -209,10 +210,14 @@ export const postExitObservation = { windowMs: 2000, intervalMs: 100 };
 export const POST_EXIT_VANISHED = 'The same-leaf cgroup vanished or could not be observed after the pressure process exited, so no post-exit counter evidence exists (the kernel may have killed the agent main process rather than the pressure process)';
 
 export function createLiveAdapter(profile, {
-    processProvider = runBoundedProcess, signal, cleanupSignal, persist = () => {}, run,
+    processProvider = runBoundedProcess, signal, cleanupSignal, persist = () => {}, run, artifacts = () => {},
 } = {}) {
     const env = candidateEnv(profile);
-    async function command(kind, binary, args, { deadlineMs = 30000, stress = false, cleanup = false, gate = null } = {}) {
+    // `tolerate` returns a finished command whatever its status, for evidence
+    // gathering that must not throw before it has recorded what it saw (a
+    // cancelled command is still a transport failure). `capture` names the run
+    // artifact that keeps its bounded, redacted stream tails.
+    async function command(kind, binary, args, { deadlineMs = 30000, stress = false, cleanup = false, gate = null, tolerate = false, capture = null } = {}) {
         assertWorkspace(profile);
         if (['pressure', 'destroy-box'].includes(kind) && liveSourceDigest(profile.source.root) !== profile.source.digest) throw new Error('Candidate source changed');
         const op = { id: `live-${run.operations.length + 1}`, kind, state: 'intent', resourceIds: [profile.box.id], argvDigest: jsonDigest([binary, ...args]), resultArtifact: null };
@@ -224,6 +229,12 @@ export function createLiveAdapter(profile, {
         // diagnostics may contain credentials; retain status flags alone.
         op.result = { status: result.status, signal: result.signal, timedOut: result.timedOut, truncated: result.truncated, cancelled: result.cancelled, errorCode: result.errorCode };
         persist();
+        if (capture) {
+            try { artifacts(capture, { operation: op.id, kind, ...commandTails(result) }); op.artifact = capture; }
+            catch (error) { op.artifactError = String(error?.message || error).slice(0, 256); }
+            persist();
+        }
+        if (tolerate && !result.cancelled) return result;
         requireTransport(result, { stress });
         return result;
     }
@@ -242,9 +253,81 @@ export function createLiveAdapter(profile, {
             || jsonDigest({ labels: box.labels, mounts: box.mounts }) !== profile.box.contractDigest) throw new Error('Box identity/contract changed');
         return box;
     }
+    const cleanlyFinished = result => Boolean(result) && !result.errorCode && !result.signal && !result.timedOut && !result.truncated && !result.cancelled && !result.settlementForced;
+    const agentContainerName = agent => fixtureContainerName(profile.workspace.path, agent.role);
+    const bareName = value => String(value ?? '').replace(/^\//, '');
+    const short = id => String(id).slice(0, 12);
+    const safeArtifact = (name, value) => { try { artifacts(name, value); return null; } catch (error) { return String(error?.message || error).slice(0, 256); } };
+    // A bounded listing of every container the Box's nested engine holds, with
+    // identity, state, stop reason and limits-hash label, persisted as a run
+    // artifact. Every step tolerates failure and records it: the listing is
+    // evidence, so it neither throws on an engine error nor gates a case.
+    async function observeNested(label) {
+        const listing = { label, complete: true, ids: [], omitted: 0, containers: [], errors: [] };
+        const ps = await engine('nested-ps', [...nested, 'container', 'ps', '--all', '--no-trunc', '--format', NESTED_LIST_FORMAT], { tolerate: true });
+        const ids = cleanlyFinished(ps) && ps.status === 0 ? ps.stdout.trim().split(/\s+/).filter(Boolean) : null;
+        if (!ids || ids.some(id => !ID.test(id))) {
+            listing.complete = false;
+            listing.errors.push({ command: 'nested-ps', ...commandTails(ps, { maxBytes: 1024 }) });
+        } else {
+            listing.ids = ids.slice(0, MAX_NESTED_LISTED);
+            listing.omitted = ids.length - listing.ids.length;
+            for (const id of listing.ids) {
+                const found = await engine('nested-inspect', [...nested, 'container', 'inspect', '--format', NESTED_CONTAINER_INSPECT, id], { tolerate: true, deadlineMs: 10000 });
+                let value = null;
+                if (cleanlyFinished(found) && found.status === 0) { try { value = JSON.parse(found.stdout); } catch { value = null; } }
+                if (value && value.id === id) listing.containers.push(nestedContainerEvidence(value));
+                else {
+                    listing.complete = false;
+                    listing.errors.push({ command: 'nested-inspect', id, ...commandTails(found, { maxBytes: 1024 }) });
+                }
+            }
+            if (listing.omitted) listing.complete = false;
+        }
+        const artifactError = safeArtifact(`nested-containers-${label}`, listing);
+        if (artifactError) listing.artifactError = artifactError;
+        persist();
+        return listing;
+    }
+    // Why an owned agent is no longer the recorded container, from the nested
+    // engine's own listing. Each outcome has its own message and error code and
+    // carries the evidence; none of them is the generic transport failure.
+    function classifyAgent(agent, listing, { inspect = null } = {}) {
+        const name = agentContainerName(agent);
+        const recorded = { role: agent.role, id: agent.id, created: agent.created, image: agent.image };
+        const evidence = { agent: recorded, name, ...(inspect ? { inspect } : {}), listing };
+        const byId = listing.containers.find(value => value.id === agent.id);
+        const sameName = listing.containers.filter(value => bareName(value.name) === name && value.id !== agent.id);
+        const fail = (code, message) => Object.assign(new Error(message), { code, evidence: { ...evidence, failure: code } });
+        if (byId && byId.running !== true) {
+            const detail = `container ${short(agent.id)} is ${byId.status || 'not running'}, exit code ${byId.exitCode ?? 'unknown'}, OOMKilled ${byId.oomKilled ?? 'unknown'}, finished ${byId.finishedAt || 'unknown'}`;
+            return fail('LIVE_AGENT_EXITED', `Agent ${agent.role} exited: ${detail}`);
+        }
+        if (byId) return fail('LIVE_AGENT_INSPECT_FAILED', `Agent ${agent.role} container ${short(agent.id)} is listed as ${byId.status || 'running'} but its inspect failed${inspect ? ` (exit ${inspect.status})` : ''}`);
+        if (sameName.length) {
+            const found = sameName[0];
+            return fail('LIVE_AGENT_RECREATED', `Agent ${agent.role} was recreated: recorded ${agent.id} created ${agent.created}; now ${found.id} created ${found.created} under the same name ${name}`);
+        }
+        if (listing.complete) return fail('LIVE_AGENT_VANISHED', `Agent ${agent.role} vanished: neither recorded container ${agent.id} nor any container named ${name} exists in the nested engine`);
+        return fail('LIVE_AGENT_UNCLASSIFIED', `Agent ${agent.role} (${short(agent.id)}) cannot be found and the nested engine listing is incomplete, so its loss cannot be classified (${listing.errors.length} listing error(s))`);
+    }
     async function inspectAgent(agent) {
         await inspectBox();
-        const actual = checkedJson(await engine('inspect-agent', [...nested, 'container', 'inspect', '--format', INSPECT, agent.id]));
+        const result = await engine('inspect-agent', [...nested, 'container', 'inspect', '--format', INSPECT, agent.id], { tolerate: true });
+        if (cleanlyFinished(result) && result.status !== 0) {
+            // The nested engine answered with a failure: keep its bounded stderr,
+            // then classify from a fresh listing. This is evidence only; the
+            // identity check below is unchanged.
+            const failure = { operation: run.operations.at(-1)?.id || null, role: agent.role, id: agent.id, ...commandTails(result, { maxBytes: 2048 }) };
+            safeArtifact(`inspect-agent-failure-${agent.role}`, failure);
+            const listing = await observeNested(`after-inspect-failure-${agent.role}`);
+            throw classifyAgent(agent, listing, { inspect: { status: result.status, stderrTail: failure.stderrTail } });
+        }
+        const actual = checkedJson(result);
+        if (actual.id === agent.id && actual.created === agent.created && actual.image === agent.image && actual.running !== true) {
+            const listing = await observeNested(`after-inspect-not-running-${agent.role}`);
+            throw classifyAgent(agent, listing);
+        }
         if (actual.id !== agent.id || actual.created !== agent.created || actual.image !== agent.image || actual.running !== true
             || !Number.isSafeInteger(actual.pid) || actual.pid <= 0 || !bounded(actual.startedAt, 128)) throw new Error('Agent identity changed');
         if (actual.memory !== 67108864 || actual.memorySwap !== 67108864 || actual.pidsLimit !== 64
@@ -322,11 +405,18 @@ export function createLiveAdapter(profile, {
         const ports = Number.isInteger(run.ports?.tcp) && Number.isInteger(run.ports?.udp)
             ? ['--port', String(run.ports.tcp), '--udp-port', String(run.ports.udp)] : [];
         const startDeadline = Number.isInteger(run.deadlines?.startMs) ? run.deadlines.startMs : 1200000;
-        try { await command('repeat-gate-on-start', profile.node.path, [profile.candidate.path, ...ports, 'start', fixture.ref], { gate: 'on', deadlineMs: startDeadline }); }
-        finally { if (recordHostRecords(run, profile, profile.box.instance)) persist(); }
+        // After each start, before anything else: what the nested engine holds
+        // (a bounded listing artifact) and the start's own bounded output tails.
+        const repeatStart = async (kind, options) => {
+            try { await command(kind, profile.node.path, [profile.candidate.path, ...ports, 'start', fixture.ref], { ...options, deadlineMs: startDeadline, capture: kind }); }
+            finally {
+                try { await observeNested(kind); } catch { /* evidence only; the start's own outcome decides */ }
+                if (recordHostRecords(run, profile, profile.box.instance)) persist();
+            }
+        };
+        await repeatStart('repeat-gate-on-start', { gate: 'on' });
         await inspectBox();
-        try { await command('repeat-saved-gate-start', profile.node.path, [profile.candidate.path, ...ports, 'start', fixture.ref], { deadlineMs: startDeadline }); }
-        finally { if (recordHostRecords(run, profile, profile.box.instance)) persist(); }
+        await repeatStart('repeat-saved-gate-start', {});
         await inspectBox();
         // The proof below only observes; it never runs production's
         // repairing root preparation. The read-only CORE_LAYOUT observation,
@@ -451,7 +541,7 @@ export async function executeCleanupRun({ run, persist = () => {}, processProvid
 }
 
 export async function executeLiveRun({ run, action = 'live', persist = () => {}, processProvider = runBoundedProcess, signal,
-    remoteArrival = false,
+    remoteArrival = false, artifacts = () => {},
     hostIdentity = defaultHostIdentity(),
 } = {}) {
     if (action === 'cleanup') return executeCleanupRun({ run, persist, processProvider, signal, remoteArrival, hostIdentity });
@@ -472,7 +562,7 @@ export async function executeLiveRun({ run, action = 'live', persist = () => {},
     const cleanupController = new AbortController();
     const blockTimer = setTimeout(() => blockController.abort(), 20 * 60 * 1000);
     const blockSignal = signal ? AbortSignal.any([signal, blockController.signal]) : blockController.signal;
-    const adapter = createLiveAdapter(profile, { processProvider, signal: blockSignal, cleanupSignal: cleanupController.signal, persist, run });
+    const adapter = createLiveAdapter(profile, { processProvider, signal: blockSignal, cleanupSignal: cleanupController.signal, persist, run, artifacts });
     let attempted = false; let activeCase = null;
     try {
         if (action !== 'cleanup') {
@@ -526,8 +616,10 @@ export async function runLiveCommand({
     const abort = () => controller.abort();
     process.once('SIGINT', abort); process.once('SIGTERM', abort); process.once('SIGHUP', abort);
     const persist = () => writePrivateJson(runPath, run);
+    // Bounded evidence beside the run manifest, one private file per name.
+    const artifacts = (name, value) => writePrivateJson(artifactPathFor(runPath, name), value);
     try {
-        const local = { persist, processProvider, signal: controller.signal, remoteArrival: remoteLocal !== null, ...(hostIdentity ? { hostIdentity } : {}) };
+        const local = { persist, artifacts, processProvider, signal: controller.signal, remoteArrival: remoteLocal !== null, ...(hostIdentity ? { hostIdentity } : {}) };
         const report = run.target.ssh && remoteLocal === null
             ? await stageAndDispatch({ run, bytes, authorizationBytes, action, runPath, processProvider, signal: controller.signal })
             : action === 'provision'
