@@ -49,6 +49,16 @@ test('bwrap keeps the selected workspace separate from the persistent /root home
     assert.match(env.PATH, /^\/opt\/ploinky-node\/bin:/);
 });
 
+test('bwrap env carries the HOME selected by the agent home layout', () => {
+    const workspacePath = path.join(tempDir, 'workspace');
+    const build = (...extra) => buildFullEnvMap(
+        'lifecycle', {}, {}, workspacePath, 'repo', 'dev', 'bwrap', null, routerEndpoint, undefined, null, ...extra,
+    );
+    assert.equal(build('/home/agent').HOME, '/home/agent');
+    assert.equal(build('/root').HOME, '/root');
+    assert.equal(build().HOME, '/root');
+});
+
 test('uncertified bwrap env carries only the canonical non-secret principal', () => {
     const env = envForAgent('AssistOSExplorer', 'dpuAgent');
     const principal = deriveAgentPrincipalId('AssistOSExplorer', 'dpuAgent');

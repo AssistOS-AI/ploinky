@@ -59,6 +59,7 @@ import {
 } from '../../utils/runtime/agentDataPathPolicy.js';
 import { deriveAgentPrincipalId } from '../../utils/security/agentIdentity.js';
 import { ensureSharedHostDir } from '../docker/agentHooks.js';
+import { resolveAgentHomeLayout } from '../docker/agentHomeLayout.js';
 import {
     runPreContainerLifecycle,
     runProfileLifecycle
@@ -367,6 +368,19 @@ function addProtectedWorkspaceOverlays(args, options) {
  * Build the bwrap argument array for running a Node.js agent in a sandbox.
  */
 /**
+ * Project and HOME binds, shared with the container runtimes. A static agent
+ * projects the workspace at /root, so its private home moves to /home/agent
+ * instead of competing for the same target.
+ */
+function resolveBwrapHomeLayout({ cwd, cwdMountTarget, agentHomeDir }) {
+    return resolveAgentHomeLayout({
+        cwd: cwd || agentHomeDir,
+        cwdMountTarget: cwdMountTarget || cwd || agentHomeDir,
+        agentHomeDir: agentHomeDir || cwd,
+    });
+}
+
+/**
  * The writable binds bwrap compiles, in the order it emits them, so any alias of
  * the selected achillesAgentLib source can be shadowed read-only afterwards.
  */
@@ -374,12 +388,11 @@ function writableBwrapBinds({ agentCodePath, codeReadOnly, cwd, cwdMountTarget, 
     const binds = [];
     if (!codeReadOnly && agentCodePath) binds.push({ hostPath: agentCodePath, runtimePath: '/code' });
     if (sharedDir) binds.push({ hostPath: sharedDir, runtimePath: '/shared' });
-    const projectTarget = cwdMountTarget || cwd;
-    const homeDir = agentHomeDir || cwd;
-    if (cwd && (cwd !== homeDir || projectTarget !== '/root')) {
-        binds.push({ hostPath: cwd, runtimePath: projectTarget });
+    if (cwd || agentHomeDir) {
+        for (const { source, target } of resolveBwrapHomeLayout({ cwd, cwdMountTarget, agentHomeDir }).binds) {
+            binds.push({ hostPath: source, runtimePath: target });
+        }
     }
-    if (homeDir) binds.push({ hostPath: homeDir, runtimePath: '/root' });
     if (volumes && typeof volumes === 'object') {
         for (const [hostPath, containerPath] of Object.entries(volumes)) {
             const mountOptions = (volumeOptions || {})[containerPath] || {};
@@ -559,15 +572,16 @@ function buildBwrapArgs(options) {
     // Project/workspace access is independent from the persistent agent home.
     // Isolated agents use the home bind as their project mount; global and
     // devel agents retain the selected project at its host-absolute path.
-    const projectTarget = cwdMountTarget || cwd;
-    const homeDir = agentHomeDir || cwd;
+    const homeLayout = resolveBwrapHomeLayout({ cwd, cwdMountTarget, agentHomeDir });
     const storageWorkspaceRoot = path.dirname(path.dirname(path.resolve(sharedDir)));
     assertCanonicalAgentDataPath(sharedDir, { workspaceRoot: storageWorkspaceRoot });
     if (agentHomeDir) assertCanonicalAgentDataPath(agentHomeDir, { workspaceRoot: storageWorkspaceRoot });
-    if (cwd !== homeDir || projectTarget !== '/root') {
-        args.push('--bind', cwd, projectTarget);
+    for (const { source, target } of homeLayout.binds) {
+        // bwrap creates mount points on its own root, but the HOME target that
+        // moves out of /root is created explicitly before anything binds to it.
+        if (target === homeLayout.containerHome && target !== '/root') args.push('--dir', target);
+        args.push('--bind', source, target);
     }
-    args.push('--bind', homeDir, '/root');
 
     // Skills directory (if exists)
     if (skillsPath && fs.existsSync(skillsPath)) {
@@ -637,7 +651,8 @@ function buildBwrapArgs(options) {
 
     // Environment: clear all, then set explicitly
     args.push('--clearenv');
-    for (const [key, value] of Object.entries(envMap || {})) {
+    // HOME follows the bind layout above, whatever the caller's map says.
+    for (const [key, value] of Object.entries({ ...(envMap || {}), HOME: homeLayout.containerHome })) {
         if (value !== undefined && value !== null) {
             args.push('--setenv', key, String(value));
         }
@@ -653,7 +668,7 @@ function buildBwrapArgs(options) {
  * Build the full environment map for a bwrap agent.
  * Mirrors the env construction in startAgentContainer.
  */
-function buildFullEnvMap(agentName, manifest, profileConfig, workspacePath, repoName, activeProfile, runtimeName = 'bwrap', runtimeResourcePlan = null, routerEndpoint = undefined, runtimeIdentity = undefined, agentLibGrantForEnv = null) {
+function buildFullEnvMap(agentName, manifest, profileConfig, workspacePath, repoName, activeProfile, runtimeName = 'bwrap', runtimeResourcePlan = null, routerEndpoint = undefined, runtimeIdentity = undefined, agentLibGrantForEnv = null, containerHome = '/root') {
     const endpoint = assertRouterEndpoint(routerEndpoint, 'host');
     // Start with manifest env vars (resolved from secrets)
     const env = buildEnvMap(manifest, profileConfig, { agentName, repoName, forRuntime: true });
@@ -721,7 +736,7 @@ function buildFullEnvMap(agentName, manifest, profileConfig, workspacePath, repo
 
     // Essential system vars
     env.NODE_PATH = '/code/node_modules';
-    env.HOME = '/root';
+    env.HOME = containerHome;
     env.PATH = `${BWRAP_NODE_RUNTIME_PATH}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
 
     // Exact final-runner equivalence is not yet available for bwrap/seatbelt.
@@ -836,6 +851,7 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     const agentHomeDir = getAgentWorkDir(instanceName);
     const cwdMountTarget = isolatedHome ? '/root' : cwd;
     const workspacePath = isolatedHome ? '/root' : cwd;
+    const homeLayout = resolveBwrapHomeLayout({ cwd, cwdMountTarget, agentHomeDir });
 
     // Profile and network are resolved atomically before any sandbox work.
     const profileRecord = existingRecord;
@@ -908,7 +924,7 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     const hostPort = allPortMappings[0]?.hostPort;
 
     // Build environment map
-    const envMap = buildFullEnvMap(agentName, manifest, profileConfig, workspacePath, repoName, activeProfile, 'bwrap', runtimeResourcePlan, routerEndpoint, runtimeIdentity, grant);
+    const envMap = buildFullEnvMap(agentName, manifest, profileConfig, workspacePath, repoName, activeProfile, 'bwrap', runtimeResourcePlan, routerEndpoint, runtimeIdentity, grant, homeLayout.containerHome);
     const agentPrivateKeyPath = envMap.__PLOINKY_AGENT_PRIVATE_KEY_HOST_PATH || '';
     delete envMap.__PLOINKY_AGENT_PRIVATE_KEY_HOST_PATH;
 
@@ -1061,8 +1077,7 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
                 { source: nodeModulesDir, target: '/Agent/node_modules', ro: true },
                 { source: sharedDir, target: '/shared' },
                 ...(fs.existsSync(agentSkillsPath) ? [{ source: agentSkillsPath, target: '/skills', ro: skillsReadOnly }] : []),
-                ...(!isolatedHome ? [{ source: cwd, target: cwd }] : []),
-                { source: agentHomeDir, target: '/root' }
+                ...homeLayout.binds
             ],
             env: Array.from(new Set(declaredEnvNames)).map((name) => ({ name })),
             ports: allPortMappings,
@@ -1291,6 +1306,7 @@ function attachBwrapInteractive(agentName, manifest, agentPath, workdir, entryCo
     const agentHomeDir = getAgentWorkDir(instanceName);
     const cwdMountTarget = isolatedHome ? '/root' : projectPath;
     const workspacePath = isolatedHome ? '/root' : projectPath;
+    const homeLayout = resolveBwrapHomeLayout({ cwd: projectPath, cwdMountTarget, agentHomeDir });
     const sharedDir = ensureSharedHostDir();
     ensureAgentDataDirectory(agentHomeDir);
     const needsCoreDeps = bwrapNeedsDependencies(agentCodePath, manifest);
@@ -1321,13 +1337,14 @@ function attachBwrapInteractive(agentName, manifest, agentPath, workdir, entryCo
         keepPaths: serviceAgentLibPath ? [serviceAgentLibPath] : []
     });
     const agentLibPath = ensureBwrapAgentLibDir(instanceName, nodeModulesDir);
+    const grant = agentLibGrant(detectHostRuntimeKey('bwrap'));
     const { codeReadOnly, skillsReadOnly } = getProfileMountModes(activeProfile, profileConfig || {});
 
     // Build environment (same as running agent)
     const runtimeResourcePlan = planRuntimeResources(manifest, { agentName, repoName });
     const nodeRuntime = resolveBwrapNodeRuntime();
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
-    const envMap = buildFullEnvMap(agentName, manifest, profileConfig, workspacePath, repoName, activeProfile, 'bwrap', runtimeResourcePlan, routerEndpoint, runtimeIdentity);
+    const envMap = buildFullEnvMap(agentName, manifest, profileConfig, workspacePath, repoName, activeProfile, 'bwrap', runtimeResourcePlan, routerEndpoint, runtimeIdentity, grant, homeLayout.containerHome);
     const agentPrivateKeyPath = envMap.__PLOINKY_AGENT_PRIVATE_KEY_HOST_PATH || '';
     delete envMap.__PLOINKY_AGENT_PRIVATE_KEY_HOST_PATH;
     const hostPort = record.config?.ports?.[0]?.hostPort;
