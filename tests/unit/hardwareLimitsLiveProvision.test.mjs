@@ -594,7 +594,8 @@ test('L1.prepare-live-mac-cpu-concrete-manifest-and-summary', async t => {
     const summary = fs.readFileSync(summaryPathFor(runPath), 'utf8');
     assert.equal(summaryPathFor(runPath), path.join(f.evidence, 'mac-cpu-run_summary_claude.md'));
     for (const text of ['Nothing has run', 'TCP 24680', 'UDP 35791', profile.provision.workspace.path, 'memory 64m, cpus 0.5, pids 64', BOX_IMAGE, IMAGE,
-        'destroy --delete-cache', 'LIVE-C3 | not run', f.revision, os.hostname()]) assert.ok(summary.includes(text), text);
+        'destroy --delete-cache', 'LIVE-C3 | not run', f.revision, os.hostname(),
+        'PLOINKY_BOX_HARDWARE_LIMITS=on', '$SOURCE/ploinky-box/bin/ploinky-box.mjs --port 24680 --udp-port 35791 start hwlfixture/memory`']) assert.ok(summary.includes(text), text);
     assert.equal(fs.statSync(runPath).mode & 0o077, 0); assert.equal(fs.statSync(summaryPathFor(runPath)).mode & 0o077, 0);
 });
 

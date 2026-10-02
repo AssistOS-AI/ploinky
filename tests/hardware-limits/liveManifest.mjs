@@ -218,8 +218,16 @@ export function renderSummary(run, manifestPath) {
     const plan = profile.provision;
     const remote = Boolean(run.target.remote);
     const line = (...parts) => parts.join('');
+    // Long fixed values are named, never truncated, so every argument that
+    // varies between runs (ports, refs, IDs, paths) stays visible.
+    const shown = value => (value === INSPECT ? '<INSPECT_FORMAT>' : value === AGENT_INSPECT ? '<AGENT_INSPECT_FORMAT>'
+        : value.startsWith(`${profile.source.root}/`) ? `$SOURCE/${value.slice(profile.source.root.length + 1)}` : value);
     const commands = [...run.target.plan.provision, ...run.target.plan.live].filter(entry => entry.argv)
-        .map(entry => `| ${entry.id} | \`${[path.basename(entry.binary), ...entry.argv].join(' ').replaceAll('|', '\\|').slice(0, 220)}\` |`);
+        .map(entry => {
+            const env = Object.entries(entry.env || {}).map(([key, value]) => `${key}=${value}`);
+            const text = [...env, entry.binary, ...entry.argv].map(shown).join(' ').replaceAll('|', '\\|');
+            return `| ${entry.id} | \`${text}\`${entry.cwd ? ` in \`${entry.cwd}\`` : ''} |`;
+        });
     const lines = [
         `# Live run proposal ${run.runId} (${run.block})`,
         '',
@@ -260,6 +268,8 @@ export function renderSummary(run, manifestPath) {
         '## Commands',
         '',
         'Every command runs as an argument array (shell:false) with a bounded deadline in its own process group. The full list, with environment and placeholders for identities known only after provisioning, is in `target.plan` of the manifest.',
+        '',
+        `\`$SOURCE\` is \`${profile.source.root}\`; \`<INSPECT_FORMAT>\` and \`<AGENT_INSPECT_FORMAT>\` are the fixed inspect templates in the manifest plan.`,
         '',
         '| Step | Command |',
         '| --- | --- |',
