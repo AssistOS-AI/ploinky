@@ -108,13 +108,13 @@ An agent is discoverable only when its agent directory contains a readable, vali
 | `containerSecurity.nestedPodman` | Boolean. Requests the bounded nested-Podman contract: `SYS_ADMIN`, `NET_ADMIN`, `/dev/fuse`, `/dev/net/tun`, SELinux label disablement, and Ploinky's fixed nested-Podman seccomp profile. It is root-only and cannot be combined with `privileged`. |
 | `hardwareLimits` | Object with only `memory`, `cpus` and `pidsLimit`. Declares the agent's own CPU, RAM and process-count limits for every agent, whatever `llmRuntime` says. Unknown keys are rejected; GPU shares are administrator-only and cannot be declared. |
 | `hardwareLimits.memory` | Size such as `512m`, validated like `llmRuntime.runtimePolicy.resources.memory`. Sets the container memory limit. |
-| `hardwareLimits.cpus` | Positive numeric string or number, validated like `llmRuntime.runtimePolicy.resources.cpus`. Sets the CPU limit. |
+| `hardwareLimits.cpus` | Positive numeric string or number, validated like `llmRuntime.runtimePolicy.resources.cpus`. Sets the CPU limit. Where hardware limits are placed it must also be a decimal with at most two decimal places (never rounded), at least `0.01` (`0.05` for an administrator's stored limit), and within the Box CPU envelope; an unknown envelope refuses it as `envelope_unknown`. The start readback accepts the exact quota or the engine's one-microsecond truncation of it (`N` or `N-1` at a period of 100000). |
 | `hardwareLimits.pidsLimit` | Integer 1–1,048,576, validated like `llmRuntime.runtimePolicy.resources.pidsLimit`. Sets the process-count limit. |
 | `llmRuntime.enabled` | Boolean. Activates the container LLM runtime integration. |
 | `llmRuntime.allowExperimental` | Boolean. Allows catalog/runtime features marked experimental. |
 | `llmRuntime.runtimePolicy.platform` | `"linux/amd64"` or `"linux/arm64"`. Selects the OCI platform. |
 | `llmRuntime.runtimePolicy.resources.memory` | Deprecated; use `hardwareLimits.memory`. Size such as `8g`. Still sets the container memory limit and emits a deprecation warning. |
-| `llmRuntime.runtimePolicy.resources.cpus` | Deprecated; use `hardwareLimits.cpus`. Positive numeric string or number. Still sets the CPU limit and emits a deprecation warning. |
+| `llmRuntime.runtimePolicy.resources.cpus` | Deprecated; use `hardwareLimits.cpus`. Positive numeric string or number, with the same placement rules as `hardwareLimits.cpus`. Still sets the CPU limit and emits a deprecation warning. |
 | `llmRuntime.runtimePolicy.resources.pidsLimit` | Deprecated; use `hardwareLimits.pidsLimit`. Integer 1–1,048,576. Still sets the process-count limit and emits a deprecation warning. |
 | `llmRuntime.runtimePolicy.resources.shmSize` | Size such as `1g`. Sets shared-memory size. |
 | `llmRuntime.runtimePolicy.resources.ulimits.memlock.soft` / `.hard` | Integer at least `-1`; both required when `memlock` exists. Sets the soft and hard locked-memory limits. |
