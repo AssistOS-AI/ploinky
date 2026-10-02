@@ -322,7 +322,7 @@ test('MI.graph-start-after-client-only-failure-keeps-the-daemon', async () => {
 // drain composition (no injected drainClient): it is retired only from its
 // recorded identity, observed through fake low-level engine replies.
 import { NETWORK_LABELS, workspaceNetworkIdentity } from '../../cli/sandbox/networkLifecycle.js';
-function recordedPeerWorld({ labels = {}, init = true, healthyPeer = false } = {}) {
+function recordedPeerWorld({ labels = {}, init = true, healthyPeer = false, unprovableSecondPeer = false, cancelAfter = null } = {}) {
     const token = { epoch: 'e'.repeat(32), revision: 1 };
     const bId = 'b'.repeat(64);
     const registry = {
@@ -332,10 +332,14 @@ function recordedPeerWorld({ labels = {}, init = true, healthyPeer = false } = {
     // An optional healthy old client 'a' that sorts before b: it must not be
     // drained when b cannot be proven, so b is drained first.
     if (healthyPeer) registry.a = { type: 'agent', repoName: 'demo', agentName: 'a', runtime: 'podman', instanceId: 'i-a', enableGeneration: 'g-a', containerId: 'a'.repeat(64) };
-    const applied = { b: { ...registry.b, gpuShare: cohortShare(25), mpsGeneration: 'd0:c0' }, ...(healthyPeer ? { a: { ...registry.a, gpuShare: cohortShare(25), mpsGeneration: 'd0:c0' } } : {}) };
+    // An optional second peer c, whose manifest is also gone and whose
+    // recorded runtime cannot be proven: it sorts after b.
+    const cId = 'c'.repeat(64);
+    if (unprovableSecondPeer) registry.c = { type: 'agent', repoName: 'demo', agentName: 'c', runtime: 'podman', instanceId: 'i-c', enableGeneration: 'g-c', containerId: cId };
+    const applied = { b: { ...registry.b, gpuShare: cohortShare(25), mpsGeneration: 'd0:c0' }, ...(healthyPeer ? { a: { ...registry.a, gpuShare: cohortShare(25), mpsGeneration: 'd0:c0' } } : {}), ...(unprovableSecondPeer ? { c: { ...registry.c, gpuShare: cohortShare(25), mpsGeneration: 'd0:c0' } } : {}) };
     // z takes a first share above the current default: a cohort restart whose
     // only old client is the peer b, whose manifest is gone.
-    const policies = new Map([['demo/z', { gpu: cohortShare(50) }], ['demo/b', { gpu: cohortShare(25) }], ...(healthyPeer ? [['demo/a', { gpu: cohortShare(25) }]] : [])]);
+    const policies = new Map([['demo/z', { gpu: cohortShare(50) }], ['demo/b', { gpu: cohortShare(25) }], ...(healthyPeer ? [['demo/a', { gpu: cohortShare(25) }]] : []), ...(unprovableSecondPeer ? [['demo/c', { gpu: cohortShare(25) }]] : [])]);
     let state = { ...daemon(cohortShare(), 'd0'), configurationGeneration: 'c0', oldClients: [], drainedClients: [] };
     let alive = true; let running = true;
     const events = []; const engine = []; const unavailable = []; const results = [];
@@ -350,12 +354,16 @@ function recordedPeerWorld({ labels = {}, init = true, healthyPeer = false } = {
             return { ok: true, status: 0, stdout: JSON.stringify([{ Id: bId, Config: { Labels: containerLabels }, HostConfig: { Init: init }, State: { Running: running } }]), stderr: '' };
         }
         if (args[0] === 'container' && args[1] === 'stop' && args.at(-1) === bId) { running = false; events.push('stop:b'); return { ok: true, status: 0, stdout: '', stderr: '' }; }
+        // c's runtime carries none of the recorded labels: not provable.
+        if (args[0] === 'container' && args[1] === 'inspect' && args[2] === cId) {
+            return { ok: true, status: 0, stdout: JSON.stringify([{ Id: cId, Config: { Labels: {} }, HostConfig: { Init: true }, State: { Running: true } }]), stderr: '' };
+        }
         return { ok: false, status: 125, stdout: '', stderr: 'no such container' };
     };
     const dependencies = {
         observeClients: () => [], readContext: () => ({ storeToken: token, overrides: policies, gpu: { grant: { mps: {} } } }),
         loadRegistry: () => clone(registry), readApplied: (key, containerId) => (applied[key]?.containerId === containerId ? clone(applied[key]) : null),
-        loadPlan: (ref) => { if (ref === 'demo/b') throw new Error('Agent demo/b not found'); return { runtime: 'podman', manifest: {}, profile: { network: { mode: 'default' } }, image: 'prepared:tag' }; },
+        loadPlan: (ref) => { if (ref === 'demo/b' || ref === 'demo/c') throw new Error(`Agent ${ref} not found`); return { runtime: 'podman', manifest: {}, profile: { network: { mode: 'default' } }, image: 'prepared:tag' }; },
         prepareImage: () => {}, inspectImage: () => ({ Id: imageId, Config: { User: '1000:1000' } }), resolveShare: (policy) => policy, policyCheck: () => {},
         store: { read: () => clone(state), write: (value) => { state = clone(value); } },
         backend: {
@@ -372,9 +380,9 @@ function recordedPeerWorld({ labels = {}, init = true, healthyPeer = false } = {
         lease: (_options, callback) => callback(), loadRegistry: () => clone(registry), loadRouting: () => ({ routes: {} }), readPolicy: () => ({ token }), policyCheck: () => {},
         loadPlan: () => ({}), isUnchanged: () => false, onPlan: (plan) => events.push(`plan:${plan.expandedContainers.join(',')}`),
         onResult: (value) => results.push(value),
-        reconcile: (instance, options) => coordinateMpsLifecycle({ target: { key: instance.key, record: clone(registry[instance.key]) }, options: { onMpsPlan: options.onMpsPlan, onMpsResult: options.onMpsResult }, launchTarget }, dependencies),
+        reconcile: (instance, options) => coordinateMpsLifecycle({ target: { key: instance.key, record: clone(registry[instance.key]) }, options: { onMpsPlan: options.onMpsPlan, onMpsResult: options.onMpsResult, ...(cancelAfter ? { isCancelled: () => events.includes(cancelAfter) } : {}) }, launchTarget }, dependencies),
     });
-    return { apply, events, engine, unavailable, get state() { return state; } };
+    return { apply, events, engine, unavailable, results, get state() { return state; } };
 }
 
 test('MI.missing-manifest-peer-is-retired-by-its-recorded-identity', async () => {
@@ -393,6 +401,52 @@ test('MI.missing-manifest-peer-is-retired-by-its-recorded-identity', async () =>
     assert.ok(f.unavailable.includes('b'));
     assert.deepEqual(f.state.pendingClients.map((value) => [value.key, value.phase]), [['b', 'pending']], 'the peer stays journaled');
     assert.equal(f.state.lastProblem.code, 'mps_client_failed');
+});
+
+// A refused peer that was already stopped keeps its outcome when a later
+// peer's identity cannot be proven (the drain order puts b before c).
+test('MI.two-refused-peers-keep-the-stopped-peers-outcome-when-the-second-is-unprovable', async () => {
+    const f = recordedPeerWorld({ unprovableSecondPeer: true });
+    const result = await f.apply();
+    assert.equal(result.status, 207, JSON.stringify(result));
+    const byKey = Object.fromEntries(result.results.map((value) => [value.key, value]));
+    assert.deepEqual(Object.keys(byKey).sort(), ['b', 'c', 'z'], JSON.stringify(result.results));
+    // b: stopped, with its own typed refusal and unavailable routes.
+    assert.equal(byKey.b.state, 'refused');
+    assert.equal(byKey.b.problem.key, 'b');
+    assert.ok(byKey.b.problem.reason.includes('Agent demo/b not found') && byKey.b.problem.fix);
+    assert.ok(f.unavailable.includes('b'));
+    // c: refused, NOT stopped, no route touched.
+    assert.equal(byKey.c.state, 'refused');
+    assert.equal(byKey.c.problem.key, 'c');
+    assert.ok(byKey.c.problem.reason.includes('Agent demo/c not found') && byKey.c.problem.fix);
+    assert.equal(f.unavailable.includes('c'), false);
+    assert.equal(f.engine.some((line) => line.includes('stop') && line.includes('c'.repeat(64))), false, f.engine.join('\n'));
+    // z: pending, stopped before any daemon change.
+    assert.equal(byKey.z.state, 'pending');
+    assert.match(byKey.z.message, /stopped before any daemon change/);
+    assert.deepEqual(result.pendingContainers, ['z']);
+    assert.deepEqual(result.expandedContainers, ['b', 'c']);
+    // No daemon change and no launch; b is the only peer stopped.
+    assert.equal(f.events.some((value) => ['quit', 'start', 'launch:z', 'stop:c'].includes(value)), false, f.events.join(' '));
+    assert.equal(f.events.filter((value) => value === 'stop:b').length, 1);
+    // The journal keeps b's pending intent: b is drained and pending.
+    assert.ok(f.state.drainedClients.length >= 1 && f.state.pendingClients.some((value) => value.key === 'b' && value.phase === 'pending'), JSON.stringify(f.state.pendingClients));
+});
+
+test('MI.refused-peer-outcome-survives-a-cancellation-after-its-drain', async () => {
+    const f = recordedPeerWorld({ unprovableSecondPeer: true, cancelAfter: 'stop:b' });
+    const result = await f.apply();
+    const byKey = Object.fromEntries(result.results.map((value) => [value.key, value]));
+    assert.equal(byKey.b?.state, 'refused', JSON.stringify(result));
+    assert.ok(byKey.b.problem.reason.includes('Agent demo/b not found') && byKey.b.problem.fix);
+    assert.ok(f.unavailable.includes('b'));
+    assert.equal(result.ok, false);
+    assert.equal(result.status, 504, JSON.stringify(result));
+    assert.equal(byKey.z?.state, 'pending', JSON.stringify(result));
+    // The abort happened right after b: c was never touched and the daemon is unchanged.
+    assert.equal(f.events.some((value) => ['quit', 'start', 'launch:z', 'stop:c'].includes(value)), false, f.events.join(' '));
+    assert.ok(f.state.pendingClients.some((value) => value.key === 'b' && value.phase === 'pending'), JSON.stringify(f.state.pendingClients));
 });
 
 test('MI.unprovable-peer-identity-fails-closed-with-every-outcome', async () => {

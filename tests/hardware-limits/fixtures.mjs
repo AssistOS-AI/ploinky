@@ -476,6 +476,8 @@ export function buildRequiredCaseManifest() {
             'MI.retry-recreates-only-the-failed-client', 'MI.watchdog-retries-of-a-failing-client-cause-no-healthy-churn',
             'MI.graph-start-after-client-only-failure-keeps-the-daemon', 'MI.missing-manifest-peer-is-retired-by-its-recorded-identity',
             'MI.unprovable-peer-identity-fails-closed-with-every-outcome',
+            'MI.two-refused-peers-keep-the-stopped-peers-outcome-when-the-second-is-unprovable',
+            'MI.refused-peer-outcome-survives-a-cancellation-after-its-drain',
         ]),
         ...leaves(P, 'p4', unit('hardwareLimitsOutcomes.test.mjs'), ['O.mps-graph-refusal-starts-cpu-agents-and-explorer']),
         ...leaves(P, 'p4', unit('hardwareLimitsMpsCandidateRecovery.test.mjs'), [

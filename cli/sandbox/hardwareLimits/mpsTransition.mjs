@@ -124,22 +124,32 @@ function* transitionSteps(input, { assertCapability, store, backend, drain, recr
         // its recorded runtime, nothing else has been drained yet.
         const refusedIds = new Set((input.refusedClients || []).map(({ client }) => clientIdentity(client)));
         const drainOrder = [...plan.drain].sort((left, right) => Number(refusedIds.has(clientIdentity(right))) - Number(refusedIds.has(clientIdentity(left))));
+        // A drained peer that cannot be recreated (its manifest or image is
+        // no longer eligible) keeps its pending intent in the journal and
+        // gets its own typed refusal; it never refuses the selected target.
+        // The outcome is journaled and reported as soon as that peer is
+        // down, so a later abort (an unprovable peer, a cancellation, lost
+        // authorization, any other error) cannot lose it.
+        const settledRefusals = new Set();
+        const settleRefusedPeers = () => {
+            for (const { client, outcome } of input.refusedClients || []) {
+                if (settledRefusals.has(clientIdentity(client)) || !state.drainedClients.includes(clientIdentity(client))) continue;
+                settledRefusals.add(clientIdentity(client));
+                state.pendingClients = [...state.pendingClients.filter((entry) => entry.key !== client.key), { ...client, phase: 'pending' }];
+                const result = { key: client.key, state: outcome.state, problem: outcome };
+                failures.push({ client, error: Object.assign(new Error(outcome.reason), { hardwareOutcome: outcome }) });
+                results.push(result); save(); onResult(result);
+            }
+        };
         for (const client of drainOrder) {
             if (state.drainedClients.includes(clientIdentity(client))) continue;
             check();
             yield () => drain(client, input.capability);
             state.drainedClients = [...new Set([...state.drainedClients, clientIdentity(client)])]; save();
+            settleRefusedPeers();
         }
-        // A drained peer that cannot be recreated (its manifest or image is
-        // no longer eligible) keeps its pending intent in the journal and
-        // gets its own typed refusal; it never refuses the selected target.
-        for (const { client, outcome } of input.refusedClients || []) {
-            if (!state.drainedClients.includes(clientIdentity(client))) continue;
-            state.pendingClients = [...state.pendingClients.filter((entry) => entry.key !== client.key), { ...client, phase: 'pending' }];
-            const result = { key: client.key, state: outcome.state, problem: outcome };
-            failures.push({ client, error: Object.assign(new Error(outcome.reason), { hardwareOutcome: outcome }) });
-            results.push(result); onResult(result); save();
-        }
+        // Peers drained by an earlier attempt of this transition.
+        settleRefusedPeers();
         if (plan.stopDaemon) { check(); backend.stop(state); state.daemon = null; state.daemonGeneration = null; state.configurationGeneration = null; save(); }
         if (plan.stopDaemon || observation.state === 'gone') {
             // Journal the terminated generation before its directories are
@@ -201,7 +211,10 @@ function* transitionSteps(input, { assertCapability, store, backend, drain, recr
         const observedState = store.read();
         if (observedState?.transitionId === state.transitionId && observedState?.daemonGeneration === state.daemonGeneration) state = observedState;
         state = { ...state, status: 'pending', lastProblem: { code: String(error.code || 'mps_transition_failed').slice(0, 64), message: 'MPS transition is incomplete; inactive clients remain pending. Retry after repairing the reported prerequisite.' } };
-        save(); throw error;
+        save();
+        // Every abort carries the outcomes completed so far.
+        if (error && typeof error === 'object' && !Object.hasOwn(error, 'mpsTransitionResults')) Object.defineProperty(error, 'mpsTransitionResults', { value: results, configurable: true });
+        throw error;
     }
     // Only the selected target's own failure is that target's outcome. A
     // peer's failure is a partial result carrying every client's outcome

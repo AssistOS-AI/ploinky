@@ -265,9 +265,13 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
                 // Fail closed with every agent's outcome: the peer is refused
                 // and the target stays pending with the reason.
                 releaseMpsLaunchOwner(targetOwner);
-                const results = [{ key: error.peerOutcome.key, state: error.peerOutcome.state, problem: error.peerOutcome },
+                // Peers already drained and refused before this one keep
+                // their outcomes (they were reported when they went down).
+                const earlier = (error.mpsTransitionResults || []).filter((value) => value.key !== error.peerOutcome.key && value.key !== target.key);
+                const latest = [{ key: error.peerOutcome.key, state: error.peerOutcome.state, problem: error.peerOutcome },
                     { key: target.key, state: 'pending', problem: null, error: 'mps_peer_unretirable', message: String(error.message).slice(0, 1024) }];
-                for (const value of results) options.onMpsResult?.(value);
+                const results = [...earlier, ...latest];
+                for (const value of latest) options.onMpsResult?.(value);
                 throw new MpsPartialFailureError(String(error.message).slice(0, 2048), { results, state: store.read() });
             }
             if (error?.code !== 'mps_partial_failure') { releaseMpsLaunchOwner(targetOwner); throw error; }
