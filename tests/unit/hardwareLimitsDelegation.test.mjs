@@ -348,7 +348,8 @@ for (const [name, subset] of Object.entries(SUBSETS)) {
         assert.equal(placement.status, subset.length === 3 ? 'enforced' : 'recorded, not enforced');
         // Per-resource admission follows the subset: each resource checks only its controller.
         const box = inBox(t);
-        const hardwareContext = { gate: 'on', prepared: true, backendReady: true, controllers: state.controllers, storeState: 'valid' };
+        // A known envelope: these tests are about controllers, and a declared cpus value is never admitted against an unknown one.
+        const hardwareContext = { gate: 'on', prepared: true, backendReady: true, controllers: state.controllers, storeState: 'valid', envelope: { memoryBytes: 8 * 1024 ** 3, cpus: 8 } };
         for (const entry of RESOURCE_CASES) {
             const admission = admitManifestRuntimeCapabilities(
                 { container: 'node:20-alpine', llmRuntime: { runtimePolicy: { resources: entry.resources } } },

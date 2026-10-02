@@ -76,6 +76,8 @@ const readyQuery = () => ({ ok: true, stdout: JSON.stringify({ host: { ociRuntim
 const failedQuery = () => ({ ok: false, status: null, stdout: '' });
 
 // Real files for the marker and the bound store; the fake for cgroup and proc.
+// The Box's own facts the envelope is read from: 8 GiB, no namespace-root cap.
+const SERVED = new Map([['/proc/meminfo', 'MemTotal:     8388608 kB\n'], [`${ROOT}/memory.max`, 'max\n'], [`${ROOT}/cpu.max`, 'max 100000\n']]);
 function compositeFs(fake) {
     const routed = new Set(['readFileSync', 'lstatSync', 'mkdirSync', 'writeFileSync', 'readdirSync', 'rmdirSync']);
     return new Proxy(fs, {
@@ -83,6 +85,7 @@ function compositeFs(fake) {
             if (!routed.has(property)) return target[property];
             return (first, ...rest) => {
                 const value = typeof first === 'string' ? first : '';
+                if (property === 'readFileSync' && SERVED.has(value)) return SERVED.get(value);
                 if (value === ROOT || value.startsWith(`${ROOT}/`) || value.startsWith('/proc/')) return fake[property](first, ...rest);
                 return target[property](first, ...rest);
             };

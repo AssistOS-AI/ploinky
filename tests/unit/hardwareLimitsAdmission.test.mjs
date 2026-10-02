@@ -7,6 +7,7 @@ import path from 'node:path';
 import { BOX_MARKER_CONTENT } from '../../ploinky-box/constants.mjs';
 import {
     admitManifestRuntimeCapabilities,
+    assertHardwareAdmissionCurrent,
     hardwareRefusalOf,
     renderRuntimePolicyArgs,
     runtimeCapabilityDigest,
@@ -266,4 +267,80 @@ test('A.stored-combined-lists-stored-values', (t) => {
         { field: 'cpus', value: '2', source: 'settings' },
         { field: 'gpu', value: '25/30 percent', source: 'settings' },
     ]);
+});
+
+// --- A declared cpus value and the Box CPU envelope -------------------------
+// A declared value is never admitted against an unknown envelope, and the
+// agent's own envelope decision is part of its input fingerprint (so the
+// Watchdog's re-arm and the launch-time currentness check see it), while no
+// other agent's fingerprint carries the envelope.
+const envelopeOf = (cpus) => (cpus === null ? undefined : { cpus, memoryBytes: 8 * 1024 ** 3 });
+function declaredAdmission(box, { declare = { cpus: '4' }, envelope, mode = 'metadata', agentId = 'demo/cpu', context = {} } = {}) {
+    const hardwareContext = { ...PREPARED_ALL, ...context, ...(envelope === undefined ? {} : { envelope }) };
+    return admitManifestRuntimeCapabilities({ container: 'node:20-alpine', hardwareLimits: declare }, {
+        ...box, agentId, instanceKey: `ploinky_${agentId.replace('/', '_')}_ws`, runtime: 'podman', hardwareAdmission: mode, hardwareContext,
+    });
+}
+const fingerprintOf = (admission) => admission.hardwareEligibility.inputFingerprint;
+
+test('A.declared-cpus-with-an-unknown-envelope-is-refused-as-envelope-unknown', (t) => {
+    const box = inBox(t);
+    const refused = declaredAdmission(box, { envelope: undefined });
+    assert.equal(refused.hardwareEligibility.state, 'refused');
+    const outcome = refusalOf(() => declaredAdmission(box, { envelope: undefined, mode: 'strict' }));
+    assert.equal(outcome.reasonCode, 'envelope_unknown');
+    assert.deepEqual(outcome.requested, [{ field: 'cpus', value: '4', source: 'manifest' }]);
+    assert.match(outcome.reason, /^The Box CPU envelope is unknown, so the cpus value 4 declared in the manifest cannot be checked against it\.$/);
+    assert.match(outcome.fix, /^On the host run ploinky limits status, repair the reported prerequisite, then ploinky restart; or remove the declared cpus limit in the manifest\.$/);
+    // A value that cannot be quota-exact keeps its own refusal; a known envelope admits.
+    assert.equal(declaredAdmission(box, { envelope: envelopeOf(8) }).hardwareEligibility.state, 'eligible');
+    assert.equal(refusalOf(() => declaredAdmission(box, { declare: { cpus: '999999999.99' }, envelope: undefined, mode: 'strict' })).reasonCode, 'envelope_unknown');
+    assert.equal(refusalOf(() => declaredAdmission(box, { declare: { cpus: '999999999.99' }, envelope: envelopeOf(8), mode: 'strict' })).reasonCode, 'exceeds_envelope');
+    // Only a declared cpus value depends on the envelope.
+    assert.equal(declaredAdmission(box, { declare: { memory: '512m' }, envelope: undefined }).hardwareEligibility.state, 'eligible');
+    // An unprepared Box reports its own state, not the envelope.
+    assert.equal(refusalOf(() => declaredAdmission(box, { envelope: undefined, mode: 'strict', context: { prepared: false, backendReady: false, unpreparedKind: 'placement' } })).reasonCode, 'unprepared');
+});
+
+test('A.declared-cpus-envelope-decision-is-part-of-that-agents-own-fingerprint', (t) => {
+    const box = inBox(t);
+    const cpu = (envelope) => fingerprintOf(declaredAdmission(box, { envelope }));
+    const within = cpu(envelopeOf(8));
+    const exceeds = cpu(envelopeOf(2));
+    const unknown = cpu(undefined);
+    assert.equal(new Set([within, exceeds, unknown]).size, 3, 'eligible, exceeds and unknown are three different decisions');
+    // A change that does not cross the declared value changes nothing.
+    assert.equal(cpu(envelopeOf(16)), within);
+    assert.equal(cpu(envelopeOf(4)), within);
+    // The refusal's fingerprint is the re-arm key: it differs from the one a grown Box produces.
+    const refusal = refusalOf(() => declaredAdmission(box, { envelope: envelopeOf(2), mode: 'strict' }));
+    assert.equal(refusal.reasonCode, 'exceeds_envelope');
+    assert.equal(refusal.inputFingerprint, exceeds);
+    assert.notEqual(refusal.inputFingerprint, within, 'a Box that grew past the declared value re-arms the refused agent');
+    // No other agent's fingerprint carries the envelope.
+    for (const declare of [{ memory: '512m' }, { pidsLimit: 64 }]) {
+        const other = (envelope) => fingerprintOf(declaredAdmission(box, { declare, envelope, agentId: 'demo/other' }));
+        assert.equal(other(envelopeOf(8)), other(envelopeOf(2)), JSON.stringify(declare));
+        assert.equal(other(envelopeOf(8)), other(undefined), JSON.stringify(declare));
+    }
+    // Outside a prepared gate-on Box the envelope is not an input at all.
+    const off = (envelope) => fingerprintOf(declaredAdmission(box, { envelope, context: { gate: 'off', prepared: false, backendReady: false } }));
+    assert.equal(off(envelopeOf(8)), off(envelopeOf(2)));
+});
+
+test('A.an-envelope-change-across-a-declared-cpus-value-makes-the-admission-stale', (t) => {
+    const box = inBox(t);
+    const admitted = declaredAdmission(box, { envelope: envelopeOf(8), mode: 'strict' });
+    const context = (cpus) => ({ ...PREPARED_ALL, ...(envelopeOf(cpus) ? { envelope: envelopeOf(cpus) } : {}) });
+    // Crossing the declared value, in either direction, is stale before create or publication.
+    for (const crossing of [2, null]) {
+        assert.throws(() => assertHardwareAdmissionCurrent(admitted, { hardwareContext: context(crossing) }),
+            { code: 'PLOINKY_RUNTIME_INPUT_CHANGED', message: /hardware-limit inputs changed after admission/ }, String(crossing));
+    }
+    // Moving within the decision keeps it current.
+    assert.doesNotThrow(() => assertHardwareAdmissionCurrent(admitted, { hardwareContext: context(16) }));
+    assert.doesNotThrow(() => assertHardwareAdmissionCurrent(admitted, { hardwareContext: context(8) }));
+    // An agent that declares no cpus is never made stale by the envelope.
+    const memory = declaredAdmission(box, { declare: { memory: '512m' }, envelope: envelopeOf(8), mode: 'strict', agentId: 'demo/other' });
+    for (const crossing of [2, null]) assert.doesNotThrow(() => assertHardwareAdmissionCurrent(memory, { hardwareContext: context(crossing) }));
 });

@@ -110,7 +110,8 @@ export function normalizeHardwareContext(raw, { insideBox, runtimeKind }) {
             ? Object.freeze({ epoch: String(value.storeToken.epoch || ''), revision: Number(value.storeToken.revision) || 0 })
             : null,
         // Per-agent stored overrides and the visible envelope; consulted for
-        // resolution, never part of another agent's fingerprint.
+        // resolution. The envelope reaches an agent's fingerprint only through
+        // that agent's own declared-cpus decision (declaredCpusEnvelopeState).
         overrides: value.overrides instanceof Map ? value.overrides : new Map(),
         gpu: value.gpu || null,
         envelope: value.envelope && typeof value.envelope === 'object' ? value.envelope : null,
@@ -184,9 +185,38 @@ function controllerRefusal(controller, context) {
     };
 }
 
+// The Box CPU envelope as one number, or null when it is unknown.
+function envelopeCpusOf(context) {
+    const envelopeCpus = Number(context.envelope?.cpus);
+    return Number.isFinite(envelopeCpus) && envelopeCpus > 0 ? envelopeCpus : null;
+}
+
+// The declared cpus entry of one agent (a stored value was checked when its
+// entry was resolved), or null.
+const declaredCpusOf = (requested) => requested.find((entry) => entry.field === 'cpus' && entry.source !== 'settings') || null;
+
+// This agent's own envelope decision for its declared cpus value, placed under
+// hardware limits only: 'invalid' (not a two-decimal value), 'unknown' (the Box
+// reports no envelope), 'exceeds' or 'within'. It is part of this agent's input
+// fingerprint and of no other agent's, so a Box that grows or shrinks re-arms
+// or invalidates exactly the agents whose declared value moved across the
+// envelope, and one that changes without crossing it changes nothing.
+function declaredCpusEnvelopeState(requested, context) {
+    if (context.gate !== 'on' || !context.prepared || !context.backendReady) return null;
+    const entry = declaredCpusOf(requested);
+    if (!entry) return null;
+    const admitted = parseAdmittedCpus(entry.value);
+    if (!admitted.ok) return 'invalid';
+    const envelopeCpus = envelopeCpusOf(context);
+    if (envelopeCpus === null) return 'unknown';
+    return Number(admitted.canonical) > envelopeCpus ? 'exceeds' : 'within';
+}
+
 // Plan §8.1 and amendment A3: a cpus value placed under hardware limits is a
 // decimal with at most two places (never rounded) and does not exceed the
-// envelope. A stored value was checked when its entry was resolved.
+// envelope. A declared value is never admitted against an unknown envelope:
+// like a stored value it is refused as envelope_unknown, because the envelope
+// is the only bound on it.
 function cpuAdmissionRefusal(requested, context) {
     for (const entry of requested) {
         if (entry.field !== 'cpus' || entry.source === 'settings') continue;
@@ -198,12 +228,15 @@ function cpuAdmissionRefusal(requested, context) {
                 fix: `Declare cpus as a decimal from 0.01 with at most two decimal places (for example 0.29) in the ${entry.source}, or remove the limit.`,
             };
         }
-        // An unknown envelope (a context that does not carry one) does not
-        // bound a declared value; a stored value is refused as envelope_unknown
-        // when resolved against the envelope, because there the envelope is
-        // the only bound.
-        const envelopeCpus = Number(context.envelope?.cpus);
-        if (Number.isFinite(envelopeCpus) && envelopeCpus > 0 && Number(admitted.canonical) > envelopeCpus) {
+        const envelopeCpus = envelopeCpusOf(context);
+        if (envelopeCpus === null) {
+            return {
+                reasonCode: 'envelope_unknown',
+                reason: `The Box CPU envelope is unknown, so the cpus value ${admitted.canonical} declared in the ${entry.source} cannot be checked against it.`,
+                fix: `On the host run ploinky limits status, repair the reported prerequisite, then ploinky restart; or remove the declared cpus limit in the ${entry.source}.`,
+            };
+        }
+        if (Number(admitted.canonical) > envelopeCpus) {
             return {
                 reasonCode: 'exceeds_envelope',
                 reason: `The cpus value ${admitted.canonical} declared in the ${entry.source} exceeds the Box CPU envelope of ${envelopeCpus}.`,
@@ -236,6 +269,7 @@ export function evaluateHardwareEligibility(descriptor, context, { helper = fals
     if (runtimeKind === 'container' && !context.insideBox && !conflicts.length) return Object.freeze({ applicable: false });
     const hostNetwork = descriptor?.capabilities?.hostNetwork === true;
     const nestedPodman = descriptor?.capabilities?.nestedPodman === true;
+    const declaredEnvelope = declaredCpusEnvelopeState(requested, context);
     const inputFingerprint = hex64({
         schema: 1,
         agentId: String(descriptor?.agentId || ''),
@@ -246,6 +280,8 @@ export function evaluateHardwareEligibility(descriptor, context, { helper = fals
         nestedPodman,
         overrideProblem,
         ...(conflicts.length ? { declarationConflicts: conflicts } : {}),
+        // Only an agent that declares cpus carries its envelope decision.
+        ...(declaredEnvelope ? { declaredCpusEnvelope: declaredEnvelope } : {}),
         context: {
             insideBox: context.insideBox,
             gate: context.gate,
