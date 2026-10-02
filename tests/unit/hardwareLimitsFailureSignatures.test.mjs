@@ -76,5 +76,6 @@ test('only verified mkdtemp components under the exact run TMPDIR lose random su
         assert.notEqual(proof('/outside/' + prefix + 'aB12cD/child'), proof('/outside/' + prefix + 'Z98xyQ/child'));
     }
     assert.notEqual(proof('/owned/tmp/unrecognized-aB12cD/child'), proof('/owned/tmp/unrecognized-Z98xyQ/child'));
+    assert.notEqual(proof('<TMP>/ploinky-relay-aB12cD/child'), proof('<TMP>/ploinky-relay-Z98xyQ/child'));
     assert.notEqual(proof('509 !== 1533 /owned/tmp/ploinky-relay-aB12cD/child'), proof('500 !== 1533 /owned/tmp/ploinky-relay-Z98xyQ/child'));
 });

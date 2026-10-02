@@ -40,9 +40,13 @@ function normalizeDiagnosticText(value, { root, home, tmpdir } = {}) {
         .map(([prefix, label]) => [prefix.replace(/\/+$/, ''), label])
         .sort(([left], [right]) => right.length - left.length);
     for (const [prefix, label] of prefixes) {
+        if (label === '<TMP>') {
+            const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            text = text.replace(new RegExp(`${escaped}/(ploinky-relay-|ploinky-directory-permissions-)[A-Za-z0-9]{6}(?=/|$)`, 'g'), '<TMP>/$1<UNIQUE>');
+        }
         text = text === prefix ? label : text.split(`${prefix}/`).join(`${label}/`);
     }
-    return text.replace(/<TMP>\/(ploinky-relay-|ploinky-directory-permissions-)[A-Za-z0-9]{6}(?=\/|$)/g, '<TMP>/$1<UNIQUE>');
+    return text;
 }
 
 export function summarizeFailure(error, locations = {}) {
