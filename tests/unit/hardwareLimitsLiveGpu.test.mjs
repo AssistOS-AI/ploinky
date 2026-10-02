@@ -16,6 +16,8 @@ import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { writePrivateJson } from '../hardware-limits/fixtures.mjs';
+import { failureEvidenceNames } from '../hardware-limits/liveCommon.mjs';
+import { judgeArtifacts, requiredArtifacts } from '../hardware-limits/liveStage.mjs';
 import { executeCleanupRun, executeLiveRun, liveSourceDigest, validateExecutionProfile, validateProfile } from '../hardware-limits/liveHarness.mjs';
 import { provisionRun } from '../hardware-limits/liveFixture.mjs';
 import { buildConcreteManifest, renderSummary, summaryPathFor } from '../hardware-limits/liveManifest.mjs';
@@ -28,7 +30,7 @@ import { parseGpuInventory, parseGpuMemory } from '../hardware-limits/liveGpu.mj
 import { createHostProc } from '../hardware-limits/liveGpuHost.mjs';
 import { createGpuCases, compactEvidence } from '../hardware-limits/liveGpuCases.mjs';
 import {
-    ADMIN_REQUEST, GPU_GRANT_FACTS, MPS_KILL_OWNED_DAEMON, MPS_OBSERVE, assertMpsControlCommand, classifyMpsReply, controlHelperExecArgv, controlHelperRunArgv, parseProbeResult, probeBoundMiB, probeExecArgv,
+    ADMIN_REQUEST, GPU_GRANT_FACTS, MPS_FAILURE_EVIDENCE, MPS_KILL_OWNED_DAEMON, MPS_OBSERVE, assertMpsControlCommand, classifyMpsReply, controlHelperExecArgv, controlHelperRunArgv, parseProbeResult, probeBoundMiB, probeExecArgv,
 } from '../hardware-limits/liveGpuCommands.mjs';
 
 const REPO = fs.realpathSync(fileURLToPath(new URL('../..', import.meta.url)));
@@ -1449,4 +1451,138 @@ test('A5.the-manifest-validates-the-tolerated-records-and-the-approval-summary-s
     assert.ok(gateNote.includes('at most ONE recorded graphics-only (type G) display process of at most 64 MiB, present at this first check with a proven host identity') && !/at most 4|four/.test(gateNote), gateNote);
     assert.ok(summary.includes('except for at most one recorded graphics-only (type G) display process of at most 64 MiB, present at this first check with a proven identity (amendment A5)'));
     assert.equal(summary.includes('the process list must be empty)'), false); assert.equal(/at most 4 graphics|four display/.test(summary), false);
+});
+
+// --- Y2: the evidence a failed MPS case keeps before its Box is destroyed ---------------------------------------
+const CAUSE = { step: 'daemon-start', errorClass: 'MpsError', code: 'gpu_sharing_unavailable', message: 'MPS daemon readiness failed at set defaults: MPS control failed (exit 1, stderr: cannot open log)' };
+const FAILURE_PARTS = ['mps-state', 'mps-logs', 'router-logs', 'apply-response'];
+
+test('Y2.a-failed-first-apply-keeps-the-mps-state-logs-router-tails-and-the-apply-response-before-cleanup', async t => {
+    const w = await provisioned(t, { faults: { applyStatus: 409, applyBody: { ok: false, status: 409, error: 'apply_failed', results: [{ cause: CAUSE }] }, controlLogSecret: true, logApply: 'apply failed', lastProblem: { code: 'gpu_sharing_unavailable', message: 'MPS transition is incomplete', cause: CAUSE } } });
+    const logs = path.join(w.run.target.execution.workspace.path, '.ploinky', 'logs');
+    fs.mkdirSync(logs, { recursive: true });
+    fs.writeFileSync(path.join(logs, 'router.log'), 'EARLIER router line\n'); fs.writeFileSync(path.join(logs, 'watchdog.log'), 'EARLIER watchdog line\n');
+    const report = await liveCases(w, ['LIVE-P1']);
+    assert.equal(caseOf(report, 'LIVE-P1').result, 'fail');
+    for (const part of FAILURE_PARTS) assert.ok(w.artifacts.has(`gpu-live-p1-${part}`), `${part} is a run artifact`);
+    assert.deepEqual(failureEvidenceNames('LIVE-P1'), FAILURE_PARTS.map(part => `gpu-live-p1-${part}`));
+    // The MPS state, with the product's last problem and its cause.
+    const state = w.artifacts.get('gpu-live-p1-mps-state');
+    assert.equal(state.state.status, 'pending'); assert.deepEqual(state.state.lastProblem.cause, CAUSE); assert.equal(state.state.pendingClients[0].phase, 'pending');
+    // The MPS logs: bounded, redacted.
+    const mpsLogs = w.artifacts.get('gpu-live-p1-mps-logs');
+    assert.equal(mpsLogs.unavailable, undefined);
+    assert.deepEqual(mpsLogs.directories, []); // no daemon was ever started in this world
+    // The Router and Watchdog tails cover the Apply window only, not what was there before.
+    const routerLogs = w.artifacts.get('gpu-live-p1-router-logs');
+    assert.equal(routerLogs.router.window, 'since-apply-start'); assert.match(routerLogs.router.text, /\[router\.log\] apply failed/); assert.equal(routerLogs.router.text.includes('EARLIER'), false);
+    assert.match(routerLogs.watchdog.text, /\[watchdog\.log\] apply failed/); assert.equal(routerLogs.watchdog.text.includes('EARLIER'), false);
+    // The Apply response, complete.
+    const apply = w.artifacts.get('gpu-live-p1-apply-response').apply;
+    assert.equal(apply.status, 409); assert.equal(JSON.parse(apply.response).results[0].cause.step, 'daemon-start'); assert.equal(apply.refs[0], 'hwlfixture/probe');
+    // The case evidence names what was written, and it was written before the Box was destroyed.
+    const caseEvidence = w.artifacts.get('gpu-live-p1');
+    assert.deepEqual(caseEvidence.failureEvidence, { artifacts: failureEvidenceNames('LIVE-P1'), written: Object.fromEntries(FAILURE_PARTS.map(part => [part, 'written'])) });
+    const calls = w.fake.model.calls;
+    const captured = calls.findIndex(call => call.args.includes(MPS_FAILURE_EVIDENCE));
+    const destroyed = calls.findIndex(call => call.args.includes('destroy'));
+    assert.ok(captured >= 0 && destroyed > captured, `evidence ${captured} before destroy ${destroyed}`);
+    nothingOwned(w);
+});
+
+test('Y2.the-daemons-logs-are-kept-redacted-and-bounded-when-a-daemon-exists', async t => {
+    // P2 fails on its measurements, with the daemon up: its control and server logs are in the evidence.
+    const w = await provisioned(t, { faults: { bypassCapped: true, controlLogSecret: true } });
+    const report = await liveCases(w, ['LIVE-P1', 'LIVE-P2']);
+    assert.deepEqual(report.cases.slice(0, 2).map(entry => entry.result), ['pass', 'fail']);
+    const mpsLogs = w.artifacts.get('gpu-live-p2-mps-logs');
+    assert.equal(mpsLogs.directories.length, 1);
+    const [control, server] = mpsLogs.directories[0].files;
+    assert.deepEqual([control.name, server.name], ['control.log', 'server.log']);
+    assert.match(control.tail, /\[fake\] control log of /);
+    assert.equal(control.tail.includes('abcdef123456'), false); assert.equal(control.tail.includes('ghijklmnopqrstu'), false);
+    assert.match(control.tail, /token=\[redacted\]/);
+    assert.equal(w.artifacts.get('gpu-live-p2-mps-state').state.status, 'ready');
+    // A passing case writes no failure evidence.
+    for (const part of FAILURE_PARTS) assert.equal(w.artifacts.has(`gpu-live-p1-${part}`), false);
+    nothingOwned(w);
+});
+
+test('Y2.an-unreadable-source-is-recorded-as-unavailable-and-never-hides-the-failure', async t => {
+    const w = await provisioned(t, { faults: { applyStatus: 409, evidenceProgramFails: true } });
+    const report = await liveCases(w, ['LIVE-P1']);
+    const entry = caseOf(report, 'LIVE-P1');
+    assert.equal(entry.result, 'fail'); assert.match(entry.reason, /Apply of hwlfixture\/probe failed: 409/);
+    assert.match(w.artifacts.get('gpu-live-p1-mps-state').unavailable, /./); assert.match(w.artifacts.get('gpu-live-p1-mps-logs').unavailable, /./);
+    // No router.log exists in this workspace: recorded, not thrown.
+    assert.match(w.artifacts.get('gpu-live-p1-router-logs').router.unavailable, /ENOENT/);
+    assert.equal(w.artifacts.get('gpu-live-p1-apply-response').apply.status, 409);
+    assert.deepEqual(Object.values(w.artifacts.get('gpu-live-p1').failureEvidence.written), ['written', 'written', 'written', 'written']);
+    nothingOwned(w);
+});
+
+test('Y2.a-blocked-case-before-any-apply-says-so-and-a-failing-artifact-writer-is-recorded', async t => {
+    const w = await provisioned(t, { faults: { gpuIneligible: true } });
+    w.run.target.execution.cases = ['LIVE-P1'];
+    const report = await w.live({ artifacts: (name, value) => { if (name === 'gpu-live-p1-mps-logs') throw new Error('disk full'); w.artifacts.set(name, structuredClone(value)); } });
+    const entry = caseOf(report, 'LIVE-P1');
+    assert.equal(entry.result, 'blocked');
+    assert.deepEqual(w.artifacts.get('gpu-live-p1-apply-response').apply, undefined);
+    assert.equal(w.artifacts.get('gpu-live-p1-apply-response').unavailable, 'no Apply was sent before the failure');
+    assert.equal(w.artifacts.has('gpu-live-p1-mps-logs'), false);
+    const written = w.artifacts.get('gpu-live-p1').failureEvidence.written;
+    assert.match(written['mps-logs'].error, /disk full/);
+    assert.deepEqual([written['mps-state'], written['router-logs'], written['apply-response']], ['written', 'written', 'written']);
+    nothingOwned(w);
+});
+
+test('Y2.a-failed-or-blocked-mps-case-that-ran-requires-its-failure-evidence-and-a-missing-item-is-reported', () => {
+    const profile = { gpu: { uuid: 'GPU-x' } };
+    const remoteReport = { verdict: 'FAIL', cases: [
+        { id: 'LIVE-P1', result: 'fail', evidence: {} }, { id: 'LIVE-P2', result: 'blocked', reason: 'Not selected or no completed enforcement evidence' },
+        { id: 'LIVE-P3', result: 'blocked', evidence: { truncated: true } }, { id: 'LIVE-P4', result: 'pass', evidence: {} }, { id: 'LIVE-L1', result: 'fail', evidence: {} },
+    ] };
+    assert.deepEqual(requiredArtifacts({ profile, action: 'live', remoteReport }), [...failureEvidenceNames('LIVE-P1'), ...failureEvidenceNames('LIVE-P3')], 'only the cases that ran and failed or were blocked, only MPS cases');
+    assert.deepEqual(requiredArtifacts({ profile, action: 'cleanup', remoteReport }), []);
+    assert.deepEqual(requiredArtifacts({ profile: {}, action: 'live', remoteReport }), []);
+    assert.deepEqual(requiredArtifacts({ profile, action: 'live', remoteReport: { verdict: 'PASS', cases: [{ id: 'LIVE-P1', result: 'pass' }] } }), ['gpu-live-p1'], 'a passing run still needs its case evidence only');
+    // A failed run keeps its verdict and reports the missing evidence; a passing run with missing evidence is not certified.
+    const missing = failureEvidenceNames('LIVE-P1');
+    const failed = judgeArtifacts(remoteReport, { complete: false, missingRequired: missing, failures: [] });
+    assert.equal(failed.verdict, 'FAIL'); assert.match(failed.limitations.join(' '), /Failure evidence is incomplete \(missing required gpu-live-p1-mps-state; missing required gpu-live-p1-mps-logs/);
+    assert.deepEqual(judgeArtifacts(remoteReport, { complete: true, missingRequired: [], failures: [] }), remoteReport);
+    const passed = judgeArtifacts({ verdict: 'PASS', exitCode: 0, cases: [] }, { complete: false, missingRequired: ['gpu-live-p1'], failures: [] });
+    assert.equal(passed.verdict, 'BLOCKED');
+});
+
+test('Y2.the-failure-evidence-program-reads-state-last-problem-and-bounded-logs-read-only', async t => {
+    const fake = fakeMpsHost(t, { pid: 777 });
+    const state = JSON.parse(fs.readFileSync(path.join(fake.mps, 'state.json'), 'utf8'));
+    fs.writeFileSync(path.join(fake.mps, 'state.json'), JSON.stringify({ ...state, status: 'pending', transitionId: 'tid', pendingClients: [{ key: 'k1', phase: 'launching', containerId: 'c'.repeat(64) }], drainedClients: ['x'],
+        lastProblem: { code: 'gpu_sharing_unavailable', message: 'MPS transition is incomplete', cause: CAUSE } }), { mode: 0o600 });
+    const log = path.join(fake.mps, `log-${'a'.repeat(32)}`);
+    fs.writeFileSync(path.join(log, 'control.log'), `${'x'.repeat(10000)}\nTAIL control line\n`);
+    fs.writeFileSync(path.join(log, 'server.log'), 'server line\n');
+    fs.writeFileSync(path.join(log, 'weird name.log'), 'ignored\n');
+    fs.mkdirSync(path.join(fake.mps, `log-${'b'.repeat(32)}`), { mode: 0o700 });
+    fs.symlinkSync('/etc/hostname', path.join(log, 'linked.log'));
+    const run = await runProgram(fake.localize(MPS_FAILURE_EVIDENCE), [], {});
+    assert.equal(run.status, 0, run.stderr);
+    const out = JSON.parse(run.stdout);
+    assert.deepEqual([out.state.status, out.state.transitionId, out.state.pendingClients, out.state.drainedClients], ['pending', 'tid', [{ key: 'k1', phase: 'launching', containerId: 'c'.repeat(12) }], 1]);
+    assert.deepEqual(out.state.lastProblem, { code: 'gpu_sharing_unavailable', message: 'MPS transition is incomplete', cause: CAUSE });
+    assert.deepEqual([out.daemon.pid, out.daemon.alive, out.daemon.cgroup], [777, true, '0::/ploinky/core']);
+    const files = Object.fromEntries(out.logs.flatMap(directory => directory.files.map(file => [`${path.basename(directory.directory)}/${file.name}`, file])));
+    assert.match(files[`log-${'a'.repeat(32)}/control.log`].tail, /TAIL control line\n$/);
+    assert.ok(files[`log-${'a'.repeat(32)}/control.log`].tail.length <= 6144, 'bounded to the last bytes');
+    assert.equal(files[`log-${'a'.repeat(32)}/server.log`].tail, 'server line\n');
+    assert.equal(Object.keys(files).some(name => /weird/.test(name)), false, 'only plainly named files');
+    assert.ok(files[`log-${'a'.repeat(32)}/linked.log`].error, 'a symbolic link is never followed');
+    assert.ok(out.entries.includes('state.json') && out.logs.length === 2);
+    // Read-only: nothing was written or removed, and no control command ran.
+    assert.deepEqual(fs.readdirSync(fake.mps).sort(), [`log-${'a'.repeat(32)}`, `log-${'b'.repeat(32)}`, `pipe-${'a'.repeat(32)}`, 'state.json'].sort());
+    // No state at all: logs are still read from the owned log directories.
+    fs.rmSync(path.join(fake.mps, 'state.json'));
+    const bare = JSON.parse((await runProgram(fake.localize(MPS_FAILURE_EVIDENCE), [], {})).stdout);
+    assert.equal(bare.state, null); assert.equal(bare.daemon, null); assert.equal(bare.logs.length, 2);
 });

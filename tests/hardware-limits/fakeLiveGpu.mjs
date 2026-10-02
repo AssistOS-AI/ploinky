@@ -19,7 +19,7 @@ import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { createFakeWorld, evaluateTemplate, ok, worldState } from './fakeLiveEngine.mjs';
 import { fixtureContainerName } from './liveFixture.mjs';
 import {
-    ADMIN_REQUEST, GPU_AGENT_INSPECT, GPU_GRANT_FACTS, MPS_KILL_OWNED_DAEMON, MPS_OBSERVE, NESTED_NAME_LIST_FORMAT, shareMemoryMiB,
+    ADMIN_REQUEST, GPU_AGENT_INSPECT, GPU_GRANT_FACTS, MPS_FAILURE_EVIDENCE, MPS_KILL_OWNED_DAEMON, MPS_OBSERVE, NESTED_NAME_LIST_FORMAT, shareMemoryMiB,
 } from './liveGpuCommands.mjs';
 
 const hex = value => crypto.createHash('sha256').update(String(value)).digest('hex');
@@ -323,7 +323,13 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
         }
         if (body.action === 'apply') {
             model.applyCalls.push(body.containers);
-            if (faults.applyStatus) return { status: faults.applyStatus, text: JSON.stringify({ ok: false, error: 'apply_failed' }) };
+            // The Router and Watchdog write their logs into the owned workspace while an Apply runs.
+            if (faults.logApply) {
+                const directory = path.join(model.workspace, '.ploinky', 'logs');
+                fs.mkdirSync(directory, { recursive: true });
+                for (const name of ['router.log', 'watchdog.log']) fs.appendFileSync(path.join(directory, name), `[${name}] ${faults.logApply}\n`);
+            }
+            if (faults.applyStatus) return { status: faults.applyStatus, text: JSON.stringify(faults.applyBody ?? { ok: false, error: 'apply_failed' }) };
             const roles = body.containers.map(container => fixture.roles.find(role => key(role) === container));
             if (roles.some(role => !role)) return { status: 400, text: JSON.stringify({ ok: false, error: 'unknown_container' }) };
             await applyFlow(roles);
@@ -352,6 +358,21 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
             return { command, status: reply.status, signal: null, stdout: reply.stdout, stderr: reply.stderr, error: null };
         });
         return out;
+    }
+    // The failure evidence program: the private state with its last problem and the daemon's logs, read-only.
+    function failureEvidence() {
+        model.programs.push({ program: 'failure-evidence' });
+        const daemon = model.daemon;
+        const logs = daemon ? [{ directory: daemon.log, files: [
+            { name: 'control.log', size: 64, tail: `[fake] control log of ${daemon.gen}\n${faults.controlLogSecret ? 'token=abcdef123456 Authorization: Bearer ghijklmnopqrstu\n' : ''}` },
+            { name: 'server.log', size: 24, tail: '[fake] server log\n' }] }] : [];
+        return {
+            state: daemon ? { schema: 1, status: model.mpsStatus, transitionId: null, daemonGeneration: daemon.gen, configurationGeneration: daemon.cfg, serverDefault: { smPercent: daemon.defaults.sm, memoryMiB: daemon.defaults.mib }, pipeDirectory: daemon.pipe, logDirectory: daemon.log,
+                daemon: { pid: daemon.boxPid, startTime: daemon.start }, pendingClients: [], oldClients: [], drainedClients: 0, lastProblem: faults.lastProblem ?? null }
+                : { schema: 1, status: 'pending', transitionId: 'fake', daemonGeneration: null, configurationGeneration: null, serverDefault: null, pipeDirectory: null, logDirectory: null, daemon: null, pendingClients: [{ key: key('probe'), phase: 'pending', containerId: null }], oldClients: [], drainedClients: 0, lastProblem: faults.lastProblem ?? null },
+            daemon: daemon ? { pid: daemon.boxPid, alive: !daemon.lost, startTime: daemon.start, cgroup: '0::/ploinky/core' } : null,
+            logs, entries: daemon ? [path.basename(daemon.pipe), path.basename(daemon.log), 'state.json'] : ['state.json'], omittedLogFiles: 0, problems: [],
+        };
     }
     function killProgram(args) {
         model.programs.push({ program: 'kill', args });
@@ -383,6 +404,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
                 tools: {}, smi: { bare: smi('', 'NVIDIA-SMI has failed: libnvidia-ml.so.1: cannot open shared object file'), withLoaderPath: smi(`0, ${gpu.uuid}, ${gpu.name}, ${gpu.memoryMiB}, ${gpu.driverVersion}`) } }));
         }
         if (script === MPS_OBSERVE) { model.programs.push({ program: 'observe' }); return ok(JSON.stringify(mpsObserve())); }
+        if (script === MPS_FAILURE_EVIDENCE) return faults.evidenceProgramFails ? failed('Error: the Box is not running') : ok(JSON.stringify(failureEvidence()));
         if (script === MPS_KILL_OWNED_DAEMON) {
             if (faults.reuseDaemonPid && model.daemon && !model.daemon.reused) { model.daemon.reused = true; model.procs.get(model.daemon.hostPid).start = String(++model.clock); }
             return ok(JSON.stringify(killProgram(rest)));

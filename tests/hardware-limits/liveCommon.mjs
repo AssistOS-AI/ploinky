@@ -173,6 +173,17 @@ export function artifactPathFor(runPath, name) {
     const match = /(_claude|_codex)?\.json$/.exec(runPath);
     return `${runPath.replace(/(?:_claude|_codex)?\.json$/, '')}_${name}${match?.[1] || ''}.json`;
 }
+
+// What a failed MPS case (LIVE-P1 to LIVE-P4) leaves before its Box is destroyed:
+// the owned daemon's state and control and server logs, the Router and Watchdog
+// tails of the Apply window and the Apply response. They are written for every
+// failure, with the reason an item could not be read, so the stager can require them.
+export const FAILURE_EVIDENCE_SUFFIXES = Object.freeze(['mps-state', 'mps-logs', 'router-logs', 'apply-response']);
+export const FAILURE_EVIDENCE_CASE = /^LIVE-P[0-9]+$/;
+export const failureEvidenceNames = caseId => {
+    if (!FAILURE_EVIDENCE_CASE.test(String(caseId))) return [];
+    return FAILURE_EVIDENCE_SUFFIXES.map(suffix => `gpu-${String(caseId).toLowerCase()}-${suffix}`);
+};
 // One nested container as evidence: identity, lifecycle state, why it stopped
 // and the limits hash label it was created with. Never the other labels.
 export function nestedContainerEvidence(value) {

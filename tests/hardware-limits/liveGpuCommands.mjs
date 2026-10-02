@@ -188,6 +188,45 @@ return {command,status:r.status,signal:r.signal,stdout:String(r.stdout||'').slic
 out.control=[ask('get_default_active_thread_percentage'),ask('get_default_device_pinned_mem_limit 0'),ask('get_server_list')];}}
 process.stdout.write(JSON.stringify(out));`;
 
+// What a failed MPS case needs from inside the Box before the Box is destroyed, read-only
+// and bounded: the private state file (status, daemon, pending clients, last problem and
+// its cause) and, from the owned log directories, bounded tails of the daemon's control
+// and server logs. It sends no control command, starts nothing and writes nothing.
+export const MPS_FAILURE_EVIDENCE = String.raw`
+const fs=require('node:fs');
+const root='/run/ploinky/mps';const FILE_BYTES=6144;const TOTAL_BYTES=40960;
+const one=(v,n)=>String(v==null?'':v).replace(/[^\x20-\x7e]+/g,' ').trim().slice(0,n||200);
+const out={state:null,daemon:null,logs:[],entries:[],omittedLogFiles:0,problems:[]};
+const note=(where,e)=>out.problems.push(where+': '+one(e&&(e.code||e.message)||e,80));
+const open=(file)=>fs.openSync(file,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW|fs.constants.O_NONBLOCK);
+let state=null;
+try{const fd=open(root+'/state.json');try{const st=fs.fstatSync(fd);if(!st.isFile()||st.uid!==process.getuid()||st.size>65536)throw Error('Unsafe state file');state=JSON.parse(fs.readFileSync(fd,'utf8'));}finally{fs.closeSync(fd);}}catch(e){if(e.code!=='ENOENT')note('state',e);}
+if(state){const lp=state.lastProblem;const cause=lp&&lp.cause?{step:one(lp.cause.step,40),errorClass:one(lp.cause.errorClass,64),code:lp.cause.code==null?null:one(lp.cause.code,64),message:one(lp.cause.message,400)}:null;
+out.state={schema:state.schema,status:one(state.status,32),transitionId:state.transitionId?one(state.transitionId,64):null,daemonGeneration:state.daemonGeneration||null,configurationGeneration:state.configurationGeneration||null,
+serverDefault:state.serverDefault||null,pipeDirectory:state.pipeDirectory||null,logDirectory:state.logDirectory||null,daemon:state.daemon||null,
+pendingClients:(Array.isArray(state.pendingClients)?state.pendingClients:[]).slice(0,32).map((c)=>({key:one(c.key,128),phase:one(c.phase,32),containerId:c.containerId?String(c.containerId).slice(0,12):null})),
+oldClients:(Array.isArray(state.oldClients)?state.oldClients:[]).slice(0,32).map((c)=>one(c.key,128)),drainedClients:Array.isArray(state.drainedClients)?state.drainedClients.length:0,
+lastProblem:lp?{code:one(lp.code,64),message:one(lp.message,300),cause}:null};}
+if(state&&state.daemon&&Number.isSafeInteger(state.daemon.pid)){const pid=state.daemon.pid;const info={pid};
+try{const stat=fs.readFileSync('/proc/'+pid+'/stat','utf8');info.startTime=stat.slice(stat.lastIndexOf(')')+2).split(' ')[19];info.alive=true;
+info.status=fs.readFileSync('/proc/'+pid+'/status','utf8').split('\n').filter((l)=>/^(Uid|Gid):/.test(l));info.cgroup=fs.readFileSync('/proc/'+pid+'/cgroup','utf8').trim();}catch(e){info.alive=info.alive===true;info.error=one(e.code||e.message,64);}
+out.daemon=info;}
+let entries=[];try{entries=fs.readdirSync(root).sort();}catch(e){if(e.code!=='ENOENT')note('root',e);}
+out.entries=entries.slice(0,64);
+const logDirectories=[...new Set([...(state&&typeof state.logDirectory==='string'&&state.logDirectory.startsWith(root+'/')?[state.logDirectory.slice(root.length+1)]:[]),...entries.filter((n)=>/^log-[a-f0-9]{32}$/.test(n))])].filter((n)=>/^log-[a-f0-9]{32}$/.test(n)).slice(0,4);
+let total=0;
+for(const name of logDirectories){const directory=root+'/'+name;const item={directory,files:[]};
+try{const st=fs.lstatSync(directory);if(!st.isDirectory()||st.isSymbolicLink()||st.uid!==process.getuid())throw Error('Unsafe log directory');
+for(const file of fs.readdirSync(directory).sort().slice(0,16)){
+if(!/^[A-Za-z0-9._-]{1,64}$/.test(file))continue;
+if(total>=TOTAL_BYTES){out.omittedLogFiles+=1;continue;}
+try{const fd=open(directory+'/'+file);try{const fst=fs.fstatSync(fd);if(!fst.isFile()||fst.uid!==process.getuid()){item.files.push({name:file,unsafe:true});continue;}
+const length=Math.min(fst.size,FILE_BYTES,TOTAL_BYTES-total);const buffer=Buffer.alloc(length);if(length>0)fs.readSync(fd,buffer,0,length,fst.size-length);total+=length;
+item.files.push({name:file,size:fst.size,tail:buffer.toString('utf8').replace(/[^\x20-\x7e\n]+/g,' ')});}finally{fs.closeSync(fd);}}catch(e){item.files.push({name:file,error:one(e.code||e.message,64)});}}
+}catch(e){item.error=one(e.code||e.message,64);}
+out.logs.push(item);}
+process.stdout.write(JSON.stringify(out));`;
+
 // Read-only facts for a LIVE-P1 whose Box reports sharing unavailable: the
 // grant marker as mounted (state, MPS fields and the identities it expects),
 // the bound tool files as the Box stats them (to compare with those), and one bounded nvidia-smi observation with the

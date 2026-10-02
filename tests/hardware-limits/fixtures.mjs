@@ -595,6 +595,13 @@ export function buildRequiredCaseManifest() {
             'A5.provision-records-the-tolerated-set-in-the-run-manifest-and-the-live-cases-keep-to-it',
             'A5.a-tolerated-process-that-gains-compute-after-provisioning-blocks-the-live-run-and-a-compute-process-blocks-provisioning',
             'A5.the-manifest-validates-the-tolerated-records-and-the-approval-summary-states-the-rule',
+            // LIVE-P1 attempt 3: a failed MPS case keeps the daemon's state and logs, the Router and Watchdog tails and the Apply response.
+            'Y2.a-failed-first-apply-keeps-the-mps-state-logs-router-tails-and-the-apply-response-before-cleanup',
+            'Y2.the-daemons-logs-are-kept-redacted-and-bounded-when-a-daemon-exists',
+            'Y2.an-unreadable-source-is-recorded-as-unavailable-and-never-hides-the-failure',
+            'Y2.a-blocked-case-before-any-apply-says-so-and-a-failing-artifact-writer-is-recorded',
+            'Y2.a-failed-or-blocked-mps-case-that-ran-requires-its-failure-evidence-and-a-missing-item-is-reported',
+            'Y2.the-failure-evidence-program-reads-state-last-problem-and-bounded-logs-read-only',
         ]),
         ...leaves(P, 'p4', unit('hardwareLimitsLiveProvision.test.mjs'), ['G1.prepare-live-apparatus-mps-concrete-manifest-and-summary']),
         ...leaves(P, 'p4', unit('hardwareLimitsMps.test.mjs'), [

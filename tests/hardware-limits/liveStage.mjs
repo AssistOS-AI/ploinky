@@ -12,7 +12,7 @@ import crypto from 'node:crypto';
 import { EXIT, validateRunManifest } from './fixtures.mjs';
 import { runBoundedProcess } from './liveProcess.mjs';
 import { assertLocalSshPins, dispatchRemoteRun, safePath, sshOptions, validateRemoteTarget } from './liveRemote.mjs';
-import { HASH, OWNER_MARKER, RUN_ID, artifactPathFor, digest, jsonDigest, keys } from './liveCommon.mjs';
+import { HASH, OWNER_MARKER, RUN_ID, artifactPathFor, digest, failureEvidenceNames, jsonDigest, keys } from './liveCommon.mjs';
 
 const WORD = /^[A-Za-z0-9_./:=,%+@-]+$/;
 export const REMOTE_PARENT = '.cache/ploinky-hwlimits';
@@ -151,11 +151,29 @@ const STAT_LINE = /^([a-z ]+):([0-9]+):([0-9]+):(\/[^\n]+)$/;
 
 // What a run must have left for its PASS to be certified: the proof each action ends with.
 export function requiredArtifacts({ profile, action, remoteReport }) {
-    if (remoteReport?.verdict !== 'PASS' || !profile?.gpu) return [];
+    if (!profile?.gpu) return [];
+    // A failed or blocked MPS case that ran left its failure evidence (the daemon's state and logs, the Router and
+    // Watchdog tails, the Apply response) before the Box was destroyed; a missing item is reported with the run.
+    if (remoteReport?.verdict !== 'PASS') {
+        return action === 'live' ? (remoteReport?.cases || []).filter(entry => ['fail', 'blocked'].includes(entry?.result) && entry.evidence).flatMap(entry => failureEvidenceNames(entry.id)) : [];
+    }
     if (action === 'cleanup') return ['gpu-final-observation', ...(profile.llm ? ['llm-cleanup-proof'] : [])];
     if (action === 'provision') return ['gpu-initial-gate'];
     if (action === 'live') return (remoteReport.cases || []).filter(entry => ['pass', 'fail', 'blocked'].includes(entry?.result) && /^LIVE-[A-Z0-9]+$/.test(String(entry.id))).map(entry => `gpu-${String(entry.id).toLowerCase()}`);
     return [];
+}
+
+// What the run's artifacts mean for its verdict. A passing result with incomplete evidence is not certified
+// (BLOCKED, staging kept); a failed or blocked result keeps its verdict and reports the missing required
+// failure evidence with it.
+export function judgeArtifacts(remoteReport, artifacts) {
+    if (!artifacts.complete && remoteReport.verdict === 'PASS') {
+        return { ...remoteReport, verdict: 'BLOCKED', exitCode: EXIT.BLOCKED, limitations: [...(remoteReport.limitations || []), `Run evidence is incomplete (${[...artifacts.missingRequired.map(name => `missing required ${name}`), ...artifacts.failures.map(entry => `${entry.name}: ${entry.reason}`)].join('; ').slice(0, 600)}); the remote staging root was kept`] };
+    }
+    if (remoteReport.verdict !== 'PASS' && artifacts.missingRequired.length) {
+        return { ...remoteReport, limitations: [...(remoteReport.limitations || []), `Failure evidence is incomplete (${artifacts.missingRequired.map(name => `missing required ${name}`).join('; ').slice(0, 600)})`] };
+    }
+    return { ...remoteReport };
 }
 
 export async function stageAndDispatch({ run, bytes, authorizationBytes, action, runPath, processProvider = runBoundedProcess, signal, requiredFor = requiredArtifacts }) {
@@ -277,10 +295,7 @@ export async function stageAndDispatch({ run, bytes, authorizationBytes, action,
         writePrivateBytes(path.join(runDirectory, `report_${action}_remote_${suffix}.json`), Buffer.from(reportText, 'utf8'));
         // The side artifacts, with digest proof, before anything can be removed.
         const artifacts = await fetchArtifacts({ required: requiredFor({ profile, action, remoteReport }) });
-        let result = { ...remoteReport };
-        if (!artifacts.complete && remoteReport.verdict === 'PASS') {
-            result = { ...result, verdict: 'BLOCKED', exitCode: EXIT.BLOCKED, limitations: [...(remoteReport.limitations || []), `Run evidence is incomplete (${[...artifacts.missingRequired.map(name => `missing required ${name}`), ...artifacts.failures.map(entry => `${entry.name}: ${entry.reason}`)].join('; ').slice(0, 600)}); the remote staging root was kept`] };
-        }
+        const result = judgeArtifacts(remoteReport, artifacts);
         let removed = false;
         if (action === 'cleanup' && remoteReport.verdict === 'PASS' && fetched.state === 'complete' && fetched.cleanup.state === 'complete' && artifacts.complete) {
             await removeStaging(); removed = true;

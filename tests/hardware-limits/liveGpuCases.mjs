@@ -10,9 +10,11 @@
 // assertion carries that evidence in `error.evidence`. A busy GPU, an
 // unsupported readback, a missing prerequisite or an unavailable
 // administrator channel is BLOCKED (code LIVE_PREREQUISITE_MISSING), never PASS.
+import fs from 'node:fs';
+import path from 'node:path';
 import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { LIMITS_HASH_LABEL } from '../../cli/sandbox/hardwareLimits/resolve.mjs';
-import { blocked, boundedTail, checkedJson, commandTails, jsonDigest } from './liveCommon.mjs';
+import { FAILURE_EVIDENCE_CASE, blocked, boundedTail, checkedJson, commandTails, failureEvidenceNames, jsonDigest } from './liveCommon.mjs';
 import { requireTransport } from './liveProcess.mjs';
 import { fixtureContainerName } from './liveFixture.mjs';
 import { recordHostRecords } from './liveCleanup.mjs';
@@ -20,7 +22,7 @@ import { createHostProc, boxCgroupPrefix, agentLeaf } from './liveGpuHost.mjs';
 import { parseGpuInventory } from './liveGpu.mjs';
 import { createGpuGate, finalGpuObservation, gpuQueryArgv } from './liveGpuGate.mjs';
 import {
-    ADMIN_REQUEST, GPU_AGENT_INSPECT, GPU_SHARES, MIB, MPS_CLIENT_PIPE, GPU_GRANT_FACTS, MPS_KILL_OWNED_DAEMON, MPS_OBSERVE, NESTED_NAME_LIST_FORMAT, PROBE_DEADLINE_MS,
+    ADMIN_REQUEST, GPU_AGENT_INSPECT, GPU_SHARES, MIB, MPS_CLIENT_PIPE, GPU_GRANT_FACTS, MPS_FAILURE_EVIDENCE, MPS_KILL_OWNED_DAEMON, MPS_OBSERVE, NESTED_NAME_LIST_FORMAT, PROBE_DEADLINE_MS,
     MPS_CLIENT_USER, TIGHTER_CLIENT, assertMpsControlCommand, classifyMpsReply, controlHelperExecArgv, controlHelperRunArgv, parseProbeResult, probeBoundMiB, probeExecArgv, shareMemoryMiB,
 } from './liveGpuCommands.mjs';
 
@@ -90,6 +92,30 @@ export function createGpuCases(ctx) {
     // Set while the product cleanup runs: owned-helper removal then uses the cleanup signal.
     let cleanupMode = false;
 
+    // The last Apply this executor sent, for the failure evidence.
+    let applyAttempt = null;
+    const routerLog = path.join(workspace, '.ploinky', 'logs', 'router.log');
+    const watchdogLog = path.join(workspace, '.ploinky', 'logs', 'watchdog.log');
+    const logSizes = () => ({ router: fileSize(routerLog), watchdog: fileSize(watchdogLog) });
+    function fileSize(file) { try { return fs.lstatSync(file).size; } catch { return null; } }
+    // The bounded, redacted tail of one host log, from where it stood when the Apply began when that is known. The
+    // workspace logs are host files of the owned workspace; they are opened without following links.
+    const readLog = ctx.readLog || ((file, { from = null, maxBytes = 16384 } = {}) => {
+        let fd = null;
+        try {
+            fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+            const stat = fs.fstatSync(fd);
+            if (!stat.isFile()) return { file, unavailable: 'not a regular file' };
+            const windowed = Number.isInteger(from) && from >= 0 && from <= stat.size;
+            const start = Math.max(windowed ? from : 0, stat.size - maxBytes);
+            const buffer = Buffer.alloc(stat.size - start);
+            if (buffer.length) fs.readSync(fd, buffer, 0, buffer.length, start);
+            const tail = boundedTail(buffer.toString('utf8'), maxBytes);
+            return { file, size: stat.size, from: start, window: windowed ? 'since-apply-start' : 'tail', text: tail.text, droppedBytes: tail.droppedBytes };
+        } catch (error) { return { file, unavailable: String(error?.code || error?.message || error).slice(0, 64) }; }
+        finally { if (fd !== null) { try { fs.closeSync(fd); } catch { /* read only */ } } }
+    });
+
     // ---------------------------------------------------------------------
     // Evidence: one artifact per case, rewritten as the case learns something.
     function evidenceFor(id) {
@@ -102,7 +128,7 @@ export function createGpuCases(ctx) {
             write,
         };
     }
-    async function runCase(id, body) {
+    async function runCase(id, body, { failureEvidence = FAILURE_EVIDENCE_CASE.test(id) } = {}) {
         const evidence = evidenceFor(id);
         // The gate's own summary (baseline, registered owned processes, the
         // last checks, a trip) belongs to the evidence on every path.
@@ -113,11 +139,44 @@ export function createGpuCases(ctx) {
             withGate();
             return compactEvidence({ ...evidence.data, ...(result || {}) });
         } catch (error) {
+            // The daemon's state and logs, the Router and Watchdog tails and the Apply response are written as run
+            // artifacts now: the product cleanup destroys the Box and everything in it. A failed capture is recorded in
+            // the evidence and never hides this failure.
+            if (failureEvidence) { try { evidence.put('failureEvidence', await captureFailureEvidence(id, error)); } catch (captureError) { evidence.put('failureEvidence', { error: String(captureError?.message || captureError).slice(0, 300) }); } }
             evidence.put('failure', { message: String(error?.message || error).slice(0, 1024), code: error?.code || null, gate: error?.gate || null });
             withGate();
             error.evidence = compactEvidence({ ...evidence.data });
             throw error;
         }
+    }
+
+    // The failure evidence of a MPS case, written as four run artifacts (liveCommon failureEvidenceNames) before the
+    // product cleanup destroys the Box. Each item records why it could not be read instead of being left out.
+    async function captureFailureEvidence(id, error) {
+        const names = failureEvidenceNames(id);
+        const at = Date.now();
+        const reason = String(error?.message || error).slice(0, 300);
+        const written = {};
+        const put = (suffix, value) => {
+            const problem = safeArtifact(`gpu-${id.toLowerCase()}-${suffix}`, { caseId: id, at, reason, ...value });
+            written[suffix] = problem ? { error: problem } : 'written';
+        };
+        let observed;
+        try { observed = checkedJson(await observe('mps-failure-evidence', [...core, 'node', '-e', MPS_FAILURE_EVIDENCE], { deadlineMs: 30000, cleanup: true })); }
+        catch (observationError) { observed = { unavailable: String(observationError?.message || observationError).slice(0, 300) }; }
+        put('mps-state', observed.unavailable ? { unavailable: observed.unavailable } : { state: observed.state ?? null, daemon: observed.daemon ?? null, problems: observed.problems ?? [] });
+        put('mps-logs', observed.unavailable ? { unavailable: observed.unavailable } : {
+            directories: (observed.logs || []).map(directory => ({ directory: directory.directory, error: directory.error ?? null, files: (directory.files || []).map(file => ({
+                name: file.name, size: file.size ?? null, error: file.error ?? null, unsafe: file.unsafe ?? false, ...(typeof file.tail === 'string' ? { tail: boundedTail(file.tail, 8192).text } : {}) })) })),
+            entries: observed.entries ?? [], omittedLogFiles: observed.omittedLogFiles ?? 0, problems: observed.problems ?? [],
+        });
+        const attempt = applyAttempt;
+        put('router-logs', {
+            window: attempt ? { startedAt: attempt.startedAt, endedAt: attempt.endedAt, label: attempt.label } : null,
+            router: readLog(routerLog, { from: attempt?.logMarks?.router ?? null }), watchdog: readLog(watchdogLog, { from: attempt?.logMarks?.watchdog ?? null }),
+        });
+        put('apply-response', attempt ? { apply: { label: attempt.label, refs: attempt.refs, startedAt: attempt.startedAt, endedAt: attempt.endedAt, status: attempt.status, error: attempt.error, response: attempt.response } } : { unavailable: 'no Apply was sent before the failure' });
+        return { artifacts: names, written };
     }
 
     // ---------------------------------------------------------------------
@@ -169,7 +228,7 @@ export function createGpuCases(ctx) {
         }
         let parsed = null;
         try { parsed = JSON.parse(reply.text); } catch { parsed = null; }
-        return { status: reply.status, body: parsed, text: boundedTail(reply.text, 2048).text };
+        return { status: reply.status, body: parsed, text: boundedTail(reply.text, 2048).text, fullText: boundedTail(reply.text, 65536).text };
     }
     const admin = {
         async state() {
@@ -209,7 +268,12 @@ export function createGpuCases(ctx) {
         }
         const before = await admin.state();
         const keys = applyRefs.map(ref => containerKey(before, ref));
-        const applied = await admin.post(`gpu-apply-${label}`, { action: 'apply', containers: keys });
+        // What a failed Apply needs afterwards: where the Router and Watchdog logs stood when it began, and its full response.
+        applyAttempt = { label, refs: [...applyRefs], startedAt: Date.now(), endedAt: null, logMarks: logSizes(), status: null, response: null, error: null };
+        let applied;
+        try { applied = await admin.post(`gpu-apply-${label}`, { action: 'apply', containers: keys }); }
+        catch (error) { applyAttempt.endedAt = Date.now(); applyAttempt.error = String(error?.message || error).slice(0, 300); throw error; }
+        applyAttempt.endedAt = Date.now(); applyAttempt.status = applied.status; applyAttempt.response = applied.fullText;
         evidence.step(`applied:${applyRefs.join(',')}`, { status: applied.status, body: applied.text });
         expects(applied.status === 200 && applied.body?.ok !== false, `Apply of ${applyRefs.join(', ')} failed: ${applied.status} ${applied.text.slice(0, 400)}`);
         await sleep(timings.afterApplyMs);
