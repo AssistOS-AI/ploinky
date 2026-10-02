@@ -511,6 +511,9 @@ export function buildRequiredCaseManifest() {
             'MG2.alias-mismatch', 'MG2.transaction-checks-still-fail-the-start',
             'MC.inflight-nowait-child-survives-apply-watchdog-and-graph', 'MC.crashed-launcher-leftover-is-still-settled',
             'MC.disabled-journaled-client-absent-completes-present-refuses', 'MC.graph-keeps-candidate-entry-until-its-removal-is-proven',
+            'MC.shareless-nowait-target-survives-a-concurrent-apply-watchdog-and-graph', 'MC.shareless-target-owner-is-released-when-the-launch-fails',
+            'MC.shareless-crashed-launcher-leftover-is-still-settled', 'MC.owner-in-a-worker-thread-of-this-process-is-live-for-every-thread',
+            'MC.owner-with-this-pid-and-another-token-is-gone-only-when-the-start-time-differs', 'MC.owner-whose-pid-was-reused-is-gone-by-start-time',
         ]),
         ...leaves(P, 'p4', unit('containerMonitorMpsGeneration.test.mjs'), [
             'MW.p4-save-new-share', 'MW.p4-clear-share', 'MW.p4-change-share', 'MW.p4-unchanged-share', 'MW.p4-daemon-lost',

@@ -239,9 +239,16 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
                     if (targetResult?.mpsReady) return { key: client.key, observedKey: targetResult.containerName, state: 'applied', containerId: targetResult.containerId };
                     const launchedClient = { ...client, mpsGeneration: state ? `${state.daemonGeneration}:${state.configurationGeneration}` : '', key: targetResult.containerName, containerId: targetResult.containerId, instanceId: targetResult.registryRecord?.instanceId, enableGeneration: targetResult.registryRecord?.enableGeneration, alias: targetResult.registryRecord ? targetResult.registryRecord.alias || '' : client.alias };
                     // The caller may wait for readiness after releasing the
-                    // lifecycle locks: the readiness entry names its owner.
-                    if (client.share && /^[a-f0-9]{64}$/.test(String(targetResult.containerId || ''))) launchedClient.owner = targetOwner = mpsLaunchOwner();
+                    // lifecycle locks: every readiness entry names its owner,
+                    // a share-less target too (a share cleared by Apply or by
+                    // the host is recreated without one), so a concurrent
+                    // coordination never removes a launch that is still
+                    // starting. The owner is released when the caller
+                    // acknowledges readiness or its failure cleanup runs.
+                    const created = /^[a-f0-9]{64}$/.test(String(targetResult.containerId || ''));
+                    if (created) launchedClient.owner = targetOwner = mpsLaunchOwner();
                     if (client.share) Object.defineProperty(targetResult, 'mpsReadiness', { value: { mpsLaunch, key: client.key, share: client.share, client: launchedClient }, configurable: true });
+                    else if (created) Object.defineProperty(targetResult, 'mpsReadiness', { value: { shareless: true, key: client.key, client: launchedClient }, configurable: true });
                     return { key: client.key, state: 'starting', containerId: targetResult.containerId, client: launchedClient };
                 }
                 const captured = captureExactHardwareInstances(loadRegistry(), [client.key])[0];
@@ -407,8 +414,8 @@ function targetOfPartialFailure(error) {
 
 async function acknowledgeMpsRuntimeReadyStrict(result, { store = createMpsStateStore(), backend = createMpsDaemonBackend(), loadRegistry = readAgentRegistrySnapshot } = {}) {
     if (!result?.mpsReadiness) return;
-    const { mpsLaunch, key, share, client } = result.mpsReadiness;
-    verifyMpsLaunch(mpsLaunch, key, share, { store, backend });
+    const { mpsLaunch, key, share, client, shareless } = result.mpsReadiness;
+    if (!shareless) verifyMpsLaunch(mpsLaunch, key, share, { store, backend });
     const record = loadRegistry()[client.key];
     if (!record || record.containerId !== client.containerId || record.instanceId !== client.instanceId || record.enableGeneration !== client.enableGeneration) throw new MpsError('Ready MPS target no longer has its exact published identity');
     const state = store.read();
@@ -505,10 +512,18 @@ export function trackMpsRuntimePending(result, { mpsLaunch, key }, { store = cre
 
 export async function verifyMpsRuntimeReady(result, { store = createMpsStateStore(), backend = createMpsDaemonBackend(), verifyRuntime = verifyMpsRuntimeObservation } = {}) {
     if (!result?.mpsReadiness) return true;
+    // A share-less target has no daemon facts to verify; its readiness entry
+    // exists only to keep the launching operation owned.
+    if (result.mpsReadiness.shareless) return true;
     const { mpsLaunch, key, share, client } = result.mpsReadiness;
     const launch = verifyMpsLaunch(mpsLaunch, key, share, { store, backend });
     verifyRuntime({ containerId: client.containerId, imageId: launch.imageId, share, state: launch.state, runtime: result.registryRecord?.runtime || 'podman' });
     return true;
+}
+
+/** The failure counterpart of acknowledging readiness: the launch is over, so its owner is no longer live. */
+export function releaseMpsRuntimeOwner(result) {
+    releaseMpsLaunchOwner(result?.mpsReadiness?.client?.owner);
 }
 
 export async function acknowledgeMpsRuntimeReady(result, { report = () => console.warn('[hardware-limits] MPS readiness receipt remains pending; inspect ploinky limits status.'), ...dependencies } = {}) {

@@ -113,7 +113,7 @@ import {
 } from '../sandbox/runtimeCapabilities.js';
 import { LIMITS_HASH_LABEL } from '../sandbox/hardwareLimits/resolve.mjs';
 import { prepareMpsGraph } from '../sandbox/hardwareLimits/mpsGraph.mjs';
-import { acknowledgeMpsRuntimeReady, finalizeMpsGraph, verifyMpsRuntimeReady } from '../sandbox/hardwareLimits/mpsLifecycle.mjs';
+import { acknowledgeMpsRuntimeReady, finalizeMpsGraph, releaseMpsRuntimeOwner, verifyMpsRuntimeReady } from '../sandbox/hardwareLimits/mpsLifecycle.mjs';
 import {
   blockingEdgesFromGraph,
   classifyAvailability,
@@ -2321,6 +2321,9 @@ export function cleanupFailedPreparedRuntime(
 ) {
   const failedResult = result || error?.ploinkyRestartCandidate || null;
   if (!failedResult) return;
+  // The launching operation is over: a GPU share or share-less readiness
+  // owner must not stay live in this process.
+  releaseMpsRuntimeOwner(failedResult);
   // The activation helper and its lifecycle caller see the same prepared
   // runtime. A launch failure can instead surface the exact candidate only on
   // the error, before the caller receives a result. Cleanup receipts are

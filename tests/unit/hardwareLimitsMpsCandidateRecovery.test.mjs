@@ -5,7 +5,8 @@ import path from 'node:path';
 import test from 'node:test';
 import { writeAppliedObservation, readAppliedObservation } from '../../cli/sandbox/hardwareLimits/runtimeState.mjs';
 import { randomUUID } from 'node:crypto';
-import { coordinateMpsLifecycle, trackMpsRuntimePending, acknowledgeMpsRuntimeReady } from '../../cli/sandbox/hardwareLimits/mpsLifecycle.mjs';
+import { Worker } from 'node:worker_threads';
+import { coordinateMpsLifecycle, trackMpsRuntimePending, acknowledgeMpsRuntimeReady, releaseMpsRuntimeOwner } from '../../cli/sandbox/hardwareLimits/mpsLifecycle.mjs';
 import { mpsOwnerState, mpsLaunchOwner, releaseMpsLaunchOwner } from '../../cli/sandbox/hardwareLimits/mpsInventory.mjs';
 import { prepareMpsGraph } from '../../cli/sandbox/hardwareLimits/mpsGraph.mjs';
 import { MpsError } from '../../cli/sandbox/hardwareLimits/mpsEligibility.mjs';
@@ -217,22 +218,25 @@ test('MG2.transaction-checks-still-fail-the-start', async (t) => {
 // after releasing the lifecycle locks; its readiness entry names its launching
 // operation. Other coordinations and graph preparation never remove it while
 // that operation is live; a crashed launcher's leftover is still settled.
-const lId = 'e'.repeat(64), zId = '1'.repeat(64);
-function inflightWorld(t, { owner = undefined, zPolicy = 25 } = {}) {
+const lId = 'e'.repeat(64), zId = '1'.repeat(64), lOldId = '9'.repeat(64);
+function inflightWorld(t, { owner = undefined, zPolicy = 25, lShareCleared = false } = {}) {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-inflight-')));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const applied = path.join(root, 'applied');
     const Z = { type: 'agent', repoName: 'repo', agentName: 'z', alias: '', instanceId: 'iz', enableGeneration: 'gz', containerId: zId };
-    const L = { type: 'agent', repoName: 'repo', agentName: 'l', alias: '', instanceId: 'il', enableGeneration: 'gl' };
+    // lShareCleared: L was a GPU share client and its share was cleared, so it
+    // is recreated WITHOUT a share (plan 11.3, host/API clear then start).
+    const L = { type: 'agent', repoName: 'repo', agentName: 'l', alias: '', instanceId: 'il', enableGeneration: 'gl', ...(lShareCleared ? { containerId: lOldId } : {}) };
     const CPU = { type: 'agent', repoName: 'repo', agentName: 'cpu', instanceId: 'ic', enableGeneration: 'gc', containerId: cpuId };
     writeAppliedObservation({ key: 'z_key', containerId: zId, instanceId: 'iz', enableGeneration: 'gz', limitsHash: 'e'.repeat(64), gpuShare: share(25), mpsGeneration: 'd0:c0' }, { root: applied });
+    if (lShareCleared) writeAppliedObservation({ key: 'l_key', containerId: lOldId, instanceId: 'il', enableGeneration: 'gl', limitsHash: 'e'.repeat(64), gpuShare: share(25), mpsGeneration: 'd0:c0' }, { root: applied });
     const registry = { z_key: Z, l_key: L, cpu_key: CPU };
     let state = { schema: 1, status: 'ready', daemon: { pid: 9, startTime: '1' }, daemonGeneration: 'd0', configurationGeneration: 'c0',
         pipeDirectory: `/run/ploinky/mps/pipe-${'1'.repeat(32)}`, logDirectory: `/run/ploinky/mps/log-${'1'.repeat(32)}`, serverDefault: serverDefault(25), oldClients: [], pendingClients: [], drainedClients: [] };
     if (owner !== undefined) state.pendingClients = [{ key: 'l_key', ref: 'repo/l', alias: '', instanceId: 'il', enableGeneration: 'gl', containerId: lId, share: share(25), mpsGeneration: 'd0:c0', phase: 'readiness', ...(owner ? { owner } : {}) }];
-    const live = new Set([zId, cpuId, ...(owner !== undefined ? [lId] : [])]);
+    const live = new Set([zId, cpuId, ...(owner !== undefined ? [lId] : []), ...(lShareCleared ? [lOldId] : [])]);
     const events = []; const removed = [];
-    const policies = () => new Map([['repo/z', { gpu: { smPercent: w.zPolicy, vramPercent: w.zPolicy } }], ['repo/l', { gpu: { smPercent: 25, vramPercent: 25 } }]]);
+    const policies = () => new Map([['repo/z', { gpu: { smPercent: w.zPolicy, vramPercent: w.zPolicy } }], ...(lShareCleared ? [] : [['repo/l', { gpu: { smPercent: 25, vramPercent: 25 } }]])]);
     const exactById = (candidate) => (live.has(candidate.containerId) ? { state: 'exact', id: candidate.containerId, running: true } : { state: 'absent', id: null });
     const store = { read: () => structuredClone(state), write: (value) => { state = structuredClone(value); events.push(`journal:${value.status}`); } };
     const remove = (candidate) => { removed.push(candidate.containerId); live.delete(candidate.containerId); return { state: 'removed' }; };
@@ -297,6 +301,97 @@ test('MC.inflight-nowait-child-survives-apply-watchdog-and-graph', async (t) => 
     await acknowledgeMpsRuntimeReady(started, { store: w.store, backend: { verify: () => true }, loadRegistry: () => structuredClone(w.registry) });
     assert.equal(lEntries(w.state).length, 0);
     assert.equal(mpsOwnerState(started.mpsReadiness.client.owner), 'gone');
+});
+
+// O5 (§11.3 host/API clear, then start/restart): a no-wait launch recreated
+// WITHOUT a share is journaled as a starting entry; it names its owner like a
+// share client, so no concurrent coordination removes it while it is starting.
+test('MC.shareless-nowait-target-survives-a-concurrent-apply-watchdog-and-graph', async (t) => {
+    const w = inflightWorld(t, { lShareCleared: true });
+    const started = await w.launchNoWaitChild();
+    assert.ok(w.events.includes('drain:l_key'), 'the old share client was drained');
+    assert.equal(started.mpsReadiness?.shareless, true, 'the caller waits for readiness after the coordination returned');
+    assert.equal(lEntries(w.state).length, 1);
+    const [entry] = lEntries(w.state);
+    assert.equal(entry.share ?? null, null, 'the entry is share-less');
+    assert.equal(mpsOwnerState(entry.owner), 'live', 'its launching operation owns it');
+    // Apply of another GPU agent (its share unchanged: the daemon default
+    // stays), then a watchdog restart of it.
+    await w.coordinate('z_key');
+    await w.coordinate('z_key');
+    assert.equal(w.events.includes('quit') || w.events.includes('start'), false);
+    assert.deepEqual(w.removed, [], 'the starting runtime is never removed by a coordination');
+    assert.ok(w.live.has(lId));
+    // Graph preparation leaves it alone as well.
+    const graph = await prepareMpsGraph({ nodes: w.nodes, networkLifecycleCapability: {} }, w.graphDeps);
+    assert.deepEqual(w.removed, [], 'nor by graph preparation');
+    assert.ok(w.live.has(lId));
+    assert.equal(lEntries(w.state).length, 1, 'its readiness entry stays journaled');
+    assert.ok(graph, 'graph preparation completed');
+    // Normal completion: the caller acknowledges readiness, which releases the
+    // launching operation and drops the entry.
+    w.registry.l_key = { ...w.registry.l_key, containerId: lId };
+    assert.deepEqual(await acknowledgeMpsRuntimeReady(started, { store: w.store, backend: { verify: () => true }, loadRegistry: () => structuredClone(w.registry) }), { acknowledged: true });
+    assert.equal(lEntries(w.state).length, 0);
+    assert.equal(mpsOwnerState(entry.owner), 'gone', 'the owner is released after a normal share-less launch completes');
+});
+
+test('MC.shareless-target-owner-is-released-when-the-launch-fails', async (t) => {
+    const w = inflightWorld(t, { lShareCleared: true });
+    const started = await w.launchNoWaitChild();
+    const owner = started.mpsReadiness.client.owner;
+    assert.equal(mpsOwnerState(owner), 'live');
+    // The failure cleanup of the caller releases it, so a later coordination
+    // settles the failed candidate instead of leaving it forever "in flight".
+    releaseMpsRuntimeOwner(started);
+    assert.equal(mpsOwnerState(owner), 'gone');
+    await w.coordinate('z_key');
+    assert.deepEqual(w.removed, [lId], 'the failed share-less candidate is removed by its immutable ID');
+    assert.equal(lEntries(w.state).length, 0);
+});
+
+test('MC.shareless-crashed-launcher-leftover-is-still-settled', async (t) => {
+    const dead = { pid: 4194305, startTime: null, processToken: randomUUID(), operationId: randomUUID() };
+    const w = inflightWorld(t, { lShareCleared: true, owner: dead });
+    assert.equal(lEntries(w.state).length, 1);
+    await w.coordinate('z_key');
+    assert.deepEqual(w.removed, [lId], 'the leftover of a crashed launcher is removed by its immutable ID');
+    assert.equal(lEntries(w.state).length, 0);
+});
+
+// O7: how a launch owner is judged. The Router runs Apply and Marketplace
+// enable in worker threads: each thread has its own module instance, so a live
+// operation of a sibling thread has another token under the same PID. It is
+// never judged gone from here; only a different process start time proves an
+// earlier incarnation of the PID.
+const ownerOf = (extra) => ({ pid: process.pid, startTime: null, processToken: randomUUID(), operationId: randomUUID(), ...extra });
+
+test('MC.owner-in-a-worker-thread-of-this-process-is-live-for-every-thread', async () => {
+    const worker = new Worker(new URL('../helpers/mpsOwnerWorker.mjs', import.meta.url));
+    try {
+        const message = await new Promise((resolve, reject) => { worker.once('message', resolve); worker.once('error', reject); });
+        assert.equal(message.owner.pid, process.pid, 'same PID as this thread');
+        assert.equal(message.selfView, 'live', 'the owning thread sees its operation live');
+        assert.equal(mpsOwnerState(message.owner), 'live', 'another thread of the process never judges it gone');
+    } finally { worker.postMessage('done'); await worker.terminate(); }
+});
+
+test('MC.owner-with-this-pid-and-another-token-is-gone-only-when-the-start-time-differs', () => {
+    assert.equal(mpsOwnerState(ownerOf({ startTime: '100' }), { readStartTime: () => '200' }), 'gone', 'an earlier incarnation of this PID');
+    assert.equal(mpsOwnerState(ownerOf({ startTime: '100' }), { readStartTime: () => '100' }), 'live', 'the same process (another thread)');
+    assert.equal(mpsOwnerState(ownerOf({ startTime: null }), { readStartTime: () => '100' }), 'live', 'no recorded start time proves nothing');
+    assert.equal(mpsOwnerState(ownerOf({ startTime: '100' }), { readStartTime: () => null }), 'live', 'an unreadable own start time proves nothing');
+});
+
+test('MC.owner-whose-pid-was-reused-is-gone-by-start-time', () => {
+    const kill = () => {};
+    const other = process.pid + 1;
+    assert.equal(mpsOwnerState(ownerOf({ pid: other, startTime: '100' }), { kill, readStartTime: () => '200' }), 'gone', 'the PID now belongs to another process incarnation');
+    assert.equal(mpsOwnerState(ownerOf({ pid: other, startTime: '100' }), { kill, readStartTime: () => '100' }), 'live', 'the same incarnation is still running');
+    assert.equal(mpsOwnerState(ownerOf({ pid: other, startTime: '100' }), { kill, readStartTime: () => null }), 'live', 'an unreadable start time proves nothing');
+    assert.equal(mpsOwnerState(ownerOf({ pid: other, startTime: null }), { kill, readStartTime: () => '200' }), 'live', 'no recorded start time proves nothing');
+    assert.equal(mpsOwnerState(ownerOf({ pid: other, startTime: '100' }), { kill: () => { throw Object.assign(new Error('no such process'), { code: 'ESRCH' }); }, readStartTime: () => '100' }), 'gone', 'no such process');
+    // A PID-reusing leftover is still settled by the coordinator.
 });
 
 test('MC.crashed-launcher-leftover-is-still-settled', async (t) => {

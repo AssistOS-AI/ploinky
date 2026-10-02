@@ -26,7 +26,7 @@ import { hardwareStorePaths, readStoreSnapshot, validateStoreToken, assertPolicy
 import { readAppliedObservation } from './runtimeState.mjs';
 import { verifyLaunchedHardwareLimits } from './delegation.mjs';
 import { hasMpsLaunch } from './mpsLaunch.mjs';
-import { coordinateMpsLifecycle, trackMpsRuntimePending, verifyMpsRuntimeReady, acknowledgeMpsRuntimeReady } from './mpsLifecycle.mjs';
+import { coordinateMpsLifecycle, trackMpsRuntimePending, verifyMpsRuntimeReady, acknowledgeMpsRuntimeReady, releaseMpsRuntimeOwner } from './mpsLifecycle.mjs';
 import { readMpsStatus, inspectPreparedMpsImage } from './mpsStatus.mjs';
 import { inspectMpsImage } from './mpsEligibility.mjs';
 import { createMpsStateStore } from './mps.mjs';
@@ -230,6 +230,7 @@ export async function reconcileExactHardwareInstance(captured, {
             await acknowledgeMpsRuntimeReady(result);
             return Object.defineProperty({ key: captured.key, observedKey: result.containerName, instanceId: result.registryRecord?.instanceId, enableGeneration: result.registryRecord?.enableGeneration, containerId: result.containerId, state: 'applied', problem: null }, 'runtimeResult', { value: result });
         } catch (error) {
+            releaseMpsRuntimeOwner(result);
             if (transition) cleanupTargeted(result, error);
             else cleanupPrepared(result, error, 'hardware-reconcile-failed');
             const problem = findHardwareOutcome(error);

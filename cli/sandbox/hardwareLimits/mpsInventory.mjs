@@ -105,8 +105,16 @@ export function mpsOwnerState(owner, { kill = (pid) => process.kill(pid, 0), rea
     if (typeof owner !== 'object' || !Number.isSafeInteger(owner.pid) || owner.pid < 1 || !UUID.test(String(owner.processToken))
         || !UUID.test(String(owner.operationId)) || (owner.startTime !== null && !/^\d{1,20}$/.test(String(owner.startTime)))) return 'live';
     if (owner.processToken === PROCESS_TOKEN) return liveOperations.has(owner.operationId) ? 'live' : 'gone';
-    // This PID now runs this process: the recorded owner was an earlier incarnation.
-    if (owner.pid === process.pid) return 'gone';
+    if (owner.pid === process.pid) {
+        // This PID runs this process, with another token: either another
+        // thread of this process (the Router runs Apply and Marketplace
+        // enable in worker threads, each with its own module instance and
+        // token, so its live operation is unknown here) or an earlier
+        // incarnation of the PID. Only a different process start time proves
+        // the latter; anything unprovable is live.
+        const own = owner.startTime ? readStartTime(process.pid) : null;
+        return owner.startTime && own && own !== owner.startTime ? 'gone' : 'live';
+    }
     try { kill(owner.pid); } catch (error) { if (error?.code === 'ESRCH') return 'gone'; }
     const current = owner.startTime ? readStartTime(owner.pid) : null;
     if (owner.startTime && current && current !== owner.startTime) return 'gone';
