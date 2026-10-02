@@ -117,6 +117,29 @@ function writePrivateBytes(target, bytes) {
     fs.renameSync(temporary, target);
 }
 
+// Retained artifact bytes are never replaced by different bytes. The first version of an artifact is kept at its
+// own name; a later fetch of the same name with other bytes (a later action's changed observation) is kept at a
+// digest-addressed name beside it, and each report names the file that holds its own bytes. A re-fetch of the
+// same bytes changes nothing. The versions of one name are bounded.
+export const ARTIFACT_VERSIONS = 8;
+export function retainArtifact(runPath, part, bytes) {
+    const sum = crypto.createHash('sha256').update(bytes).digest('hex');
+    const same = target => { try { return fs.readFileSync(target).equals(bytes); } catch (error) { if (error.code === 'ENOENT') return null; throw error; } };
+    const canonical = artifactPathFor(runPath, part);
+    const first = same(canonical);
+    if (first === null) { writePrivateBytes(canonical, bytes); return canonical; }
+    if (first) return canonical;
+    const addressed = artifactPathFor(runPath, `${part}-v${sum.slice(0, 16)}`);
+    const known = same(addressed);
+    if (known) return addressed;
+    if (known === false) throw new Error('A retained artifact version has other bytes than its digest names');
+    const prefix = path.basename(artifactPathFor(runPath, `${part}-v`)).replace(/_(?:claude|codex)\.json$/, '');
+    const versions = fs.readdirSync(path.dirname(addressed)).filter(name => name.startsWith(prefix)).length;
+    if (versions + 2 > ARTIFACT_VERSIONS) throw new Error(`More than ${ARTIFACT_VERSIONS} retained versions of ${part}`);
+    writePrivateBytes(addressed, bytes);
+    return addressed;
+}
+
 function parseSums(stdout, files) {
     const lines = String(stdout).split('\n').filter(Boolean);
     const sums = new Map();
@@ -367,9 +390,9 @@ export async function stageAndDispatch({ run, bytes, authorizationBytes, action,
                     const text = (await call(['cat', '--', entry.target], { maxBytes: entry.size + 4096, deadlineMs: 120000 })).stdout;
                     const bytesFetched = Buffer.from(text, 'utf8');
                     if (bytesFetched.length > ARTIFACT_LIMITS.bytes || digest(bytesFetched) !== sums.get(entry.target)) { lastReason = 'digest mismatch after transfer'; continue; }
-                    writePrivateBytes(artifactPathFor(runPath, entry.part), bytesFetched);
+                    const file = retainArtifact(runPath, entry.part, bytesFetched);
                     total += bytesFetched.length;
-                    outcome.fetched.push({ name: entry.part, bytes: bytesFetched.length, sha256: sums.get(entry.target) });
+                    outcome.fetched.push({ name: entry.part, bytes: bytesFetched.length, sha256: sums.get(entry.target), file: path.basename(file) });
                     lastReason = null;
                     break;
                 } catch (error) { lastReason = String(error.message).slice(0, 120); }

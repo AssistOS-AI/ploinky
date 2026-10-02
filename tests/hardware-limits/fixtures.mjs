@@ -447,6 +447,8 @@ export function buildRequiredCaseManifest() {
             'EV1.an-unexpected-name-a-symlink-an-oversized-file-and-a-corrupt-transfer-are-never-copied',
             'EV1.a-required-artifact-that-is-missing-keeps-the-staging-and-the-run-is-not-certified',
             'EV1.each-action-names-the-proof-its-pass-needs',
+            'EV2.a-later-actions-changed-artifact-never-replaces-the-retained-one-and-both-validate-after-staging-removal',
+            'EV2.retained-versions-are-bounded-private-and-never-rewritten',
         ]),
         ...leaves(P, 'p1', unit('hardwareLimitsDeclaration.test.mjs'), [
             'HD.identity-hash-args-equal', 'HD.identity-migration-no-restart-graph', 'HD.identity-llm-reuse-callers',

@@ -18,7 +18,7 @@ import { FIXTURE_HARDWARE_LIMITS, FIXTURE_REPOSITORY, fixtureContainerName, fixt
 import { admitManifestRuntimeCapabilities, validateManifestRuntimeCapabilities } from '../../cli/sandbox/runtimeCapabilities.js';
 import { deprecatedHardwareDeclarations } from '../../cli/sandbox/hardwareLimits/declaredLimits.mjs';
 import { buildConcreteManifest, summaryPathFor } from '../hardware-limits/liveManifest.mjs';
-import { ARTIFACT_LIMITS, requiredArtifacts, stageAndDispatch, writeUstar } from '../hardware-limits/liveStage.mjs';
+import { ARTIFACT_LIMITS, ARTIFACT_VERSIONS, requiredArtifacts, retainArtifact, stageAndDispatch, writeUstar } from '../hardware-limits/liveStage.mjs';
 import { AGENT_INSPECT, ENGINE_INFO_ARGV, INSPECT, MAX_TAIL_BYTES, NESTED_CONTAINER_INSPECT, NESTED_LIST_FORMAT, PS_IDENTITY_FORMAT, boxPsArgv, engineIdentityDigest, engineIdentityFacts, hostRecordPaths, observeEngineIdentity, quarantinePath, workspaceSocketProblem } from '../hardware-limits/liveCommon.mjs';
 import { CRASH_EXIT, FAKE_CONNECTIONS, createFakeSsh, createFakeWorld, evaluateTemplate, fakeEngineInfo, ok, unsupportedFormat, worldState } from '../hardware-limits/fakeLiveEngine.mjs';
 
@@ -1289,6 +1289,54 @@ test('EV1.a-required-artifact-that-is-missing-keeps-the-staging-and-the-run-is-n
     assert.equal(retry.verdict, 'PASS', JSON.stringify(retry.limitations)); assert.equal(retry.staging.removed, true);
     assert.equal(exists(w.remoteRoot), false);
     assert.ok(exists(localArtifact(w, 'gpu-final-observation')));
+});
+
+// A later action's changed observation of the same artifact (the final GPU proof is written by the live run and
+// again by a standalone cleanup) must not replace the bytes an earlier report recorded.
+test('EV2.a-later-actions-changed-artifact-never-replaces-the-retained-one-and-both-validate-after-staging-removal', async t => {
+    const w = await provisionedStage(t);
+    const first = JSON.stringify({ processes: [], at: 'after the live run' }, null, 2) + '\n';
+    const second = JSON.stringify({ processes: [], at: 'after the standalone cleanup', note: 'changed' }, null, 2) + '\n';
+    remoteArtifact(w, 'gpu-final-observation', first);
+    // The first dispatch demands an artifact that does not exist, so it fetches but keeps the staging.
+    const live = await dispatchCleanup(w, { requiredFor: () => ['gpu-final-observation', 'not-written-yet'] });
+    assert.equal(live.staging.removed, false); assert.equal(exists(w.remoteRoot), true);
+    remoteArtifact(w, 'gpu-final-observation', second);
+    const cleanup = await dispatchCleanup(w, { requiredFor: () => ['gpu-final-observation'] });
+    assert.equal(cleanup.verdict, 'PASS', JSON.stringify(cleanup.limitations));
+    assert.equal(cleanup.staging.removed, true); assert.equal(exists(w.remoteRoot), false);
+    const entry = report => report.artifacts.fetched.find(value => value.name === 'gpu-final-observation');
+    assert.notEqual(entry(live).sha256, entry(cleanup).sha256);
+    // Each report's own file holds exactly the bytes it recorded, after the remote copy is gone.
+    for (const [label, report, bytes] of [['live', live, first], ['cleanup', cleanup, second]]) {
+        const file = path.join(w.evidence, entry(report).file);
+        assert.deepEqual(fs.readFileSync(file), Buffer.from(bytes), `${label}: the referenced file holds the recorded bytes`);
+        assert.equal(hash(fs.readFileSync(file)), entry(report).sha256, label);
+        assert.equal(fs.statSync(file).mode & 0o777, 0o600, label);
+    }
+    assert.notEqual(entry(live).file, entry(cleanup).file);
+    // The first version stays at its own name, never replaced.
+    assert.deepEqual(fs.readFileSync(localArtifact(w, 'gpu-final-observation')), Buffer.from(first));
+    // Another fetch of the same bytes adds no file.
+    const before = fs.readdirSync(w.evidence).sort();
+    await dispatchCleanup(w, { requiredFor: () => ['gpu-final-observation'] });
+    assert.deepEqual(fs.readdirSync(w.evidence).sort(), before, 'a repeat of the same bytes adds nothing');
+});
+
+test('EV2.retained-versions-are-bounded-private-and-never-rewritten', t => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-ev2-')); t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+    const runPath = path.join(directory, 'run_claude.json'); fs.writeFileSync(runPath, '{}');
+    const files = [];
+    for (let version = 0; version < ARTIFACT_VERSIONS; version += 1) files.push(retainArtifact(runPath, 'gpu-final-observation', Buffer.from(`version ${version}\n`)));
+    assert.equal(new Set(files).size, ARTIFACT_VERSIONS);
+    assert.equal(files[0], path.join(directory, 'run_gpu-final-observation_claude.json'));
+    for (const [index, file] of files.entries()) { assert.deepEqual(fs.readFileSync(file), Buffer.from(`version ${index}\n`)); assert.equal(fs.statSync(file).mode & 0o777, 0o600); }
+    assert.equal(retainArtifact(runPath, 'gpu-final-observation', Buffer.from('version 3\n')), files[3], 'the same bytes resolve to the file that holds them');
+    assert.throws(() => retainArtifact(runPath, 'gpu-final-observation', Buffer.from('one version too many\n')), /More than 8 retained versions/);
+    // A tampered addressed file is detected, never trusted or rewritten.
+    fs.writeFileSync(files[2], 'tampered\n');
+    assert.throws(() => retainArtifact(runPath, 'gpu-final-observation', Buffer.from('version 2\n')), /other bytes than its digest names/);
+    assert.equal(fs.readFileSync(files[2], 'utf8'), 'tampered\n');
 });
 
 test('EV1.each-action-names-the-proof-its-pass-needs', () => {
