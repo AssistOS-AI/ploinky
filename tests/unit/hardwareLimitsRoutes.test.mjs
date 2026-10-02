@@ -5,15 +5,27 @@ import path from 'node:path';
 import test from 'node:test';
 import { Readable } from 'node:stream';
 import { EventEmitter } from 'node:events';
-import { handleHardwareLimitsRoutes, buildHardwareLimitsState, hardwareHttpError } from '../../cli/server/authHandlers/hardwareLimitsRoutes.mjs';
-import { hardwareStorePaths, initializeStore, readStoreSnapshot, beginDowngradeBarrier, setAgentLimits as setAgentLimitsForTest } from '../../cli/sandbox/hardwareLimits/store.mjs';
-import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
-import { mintAdminCsrfToken, verifyAdminMutationRequest } from '../../cli/server/adminControlSecurity.js';
-import { captureExactHardwareInstances, assertExactHardwareInstance, applyHardwareLimits, assertHardwareApplyInputs, reconcileExactHardwareInstance, hardwareApplyIsUnchanged } from '../../cli/sandbox/hardwareLimits/reconcile.mjs';
-import { runHardwareLimitsApplyWorker, hardwareApplyFlight } from '../../cli/server/hardwareLimitsApplyWorker.mjs';
-import { withWorkspaceMutationLease, inspectWorkspaceStartLock } from '../../cli/utils/runtime/maintenanceLocks.js';
-import { HardwareLimitsError, serializeHardwareAwareError } from '../../cli/sandbox/hardwareLimits/errors.mjs';
-import { buildDirectRefusal } from '../../cli/sandbox/hardwareLimits/requestedLimits.mjs';
+
+// Every workspace-relative write (the generated master key behind CSRF
+// tokens, the workspace lease under .ploinky/running) goes to this test's own
+// temporary workspace, never to the checkout the suite runs from. The
+// workspace root is read when the modules load, so it is set first.
+const priorWorkspaceRoot = process.env.PLOINKY_WORKSPACE_ROOT;
+const testWorkspace = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-routes-workspace-')));
+process.env.PLOINKY_WORKSPACE_ROOT = testWorkspace;
+test.after(() => {
+    if (priorWorkspaceRoot === undefined) delete process.env.PLOINKY_WORKSPACE_ROOT; else process.env.PLOINKY_WORKSPACE_ROOT = priorWorkspaceRoot;
+    fs.rmSync(testWorkspace, { recursive: true, force: true });
+});
+const { handleHardwareLimitsRoutes, buildHardwareLimitsState, hardwareHttpError } = await import('../../cli/server/authHandlers/hardwareLimitsRoutes.mjs');
+const { hardwareStorePaths, initializeStore, readStoreSnapshot, beginDowngradeBarrier, setAgentLimits: setAgentLimitsForTest } = await import('../../cli/sandbox/hardwareLimits/store.mjs');
+const { buildWorkspaceIdentity } = await import('../../ploinky-box/identity.mjs');
+const { mintAdminCsrfToken, verifyAdminMutationRequest } = await import('../../cli/server/adminControlSecurity.js');
+const { captureExactHardwareInstances, assertExactHardwareInstance, applyHardwareLimits, assertHardwareApplyInputs, reconcileExactHardwareInstance, hardwareApplyIsUnchanged } = await import('../../cli/sandbox/hardwareLimits/reconcile.mjs');
+const { runHardwareLimitsApplyWorker, hardwareApplyFlight } = await import('../../cli/server/hardwareLimitsApplyWorker.mjs');
+const { withWorkspaceMutationLease, inspectWorkspaceStartLock } = await import('../../cli/utils/runtime/maintenanceLocks.js');
+const { HardwareLimitsError, serializeHardwareAwareError } = await import('../../cli/sandbox/hardwareLimits/errors.mjs');
+const { buildDirectRefusal } = await import('../../cli/sandbox/hardwareLimits/requestedLimits.mjs');
 
 function fixture(t) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-api-'));
