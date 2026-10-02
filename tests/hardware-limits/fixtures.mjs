@@ -697,6 +697,8 @@ export function buildRequiredCaseManifest() {
             'LLM3.every-tuple-field-the-stage-one-pin-carries-is-bound-to-what-the-host-reports',
             // The runner-environment check against local-llm's own launch environment.
             'R2B.secret-names-match-whole-underscore-words-and-the-products-own-emitted-names-are-allowed',
+            'R2A.the-products-own-cuda-cache-variable-is-allowed-and-any-other-cuda-name-fails',
+            'R2A.L1-and-L3-accept-the-runner-environment-local-llm-really-builds-and-refuse-a-foreign-cuda-name',
             'G2.provision-copies-the-local-llm-tree-pins-its-image-and-grants-the-gpu-before-the-start',
             'G2.provision-blocks-a-changed-tree-or-manifest-and-an-image-the-agent-was-not-created-from',
             'G2.L1-passes-budget-cgroup-runner-environment-uid-generation-text-and-digests',

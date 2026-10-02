@@ -243,7 +243,7 @@ test('G2.L1-passes-budget-cgroup-runner-environment-uid-generation-text-and-dige
     const saved = toolCalls(w, 'local_llm_run');
     assert.equal(saved.length, 1); assert.deepEqual([saved[0].args.modelId, saved[0].args.runnerId, saved[0].args.replace], [LLM_MODELS.small, 'llama.cpp', false]);
     // The runner's environment is exactly the three MPS variables, and no secret; the user and the generation.
-    assert.deepEqual(Object.keys(artifact.runner[0].cuda).sort(), ['CUDA_MPS_ACTIVE_THREAD_PERCENTAGE', 'CUDA_MPS_PINNED_DEVICE_MEM_LIMIT', 'CUDA_MPS_PIPE_DIRECTORY']);
+    assert.deepEqual(Object.keys(artifact.runner[0].cuda).sort(), ['CUDA_CACHE_PATH', 'CUDA_MPS_ACTIVE_THREAD_PERCENTAGE', 'CUDA_MPS_PINNED_DEVICE_MEM_LIMIT', 'CUDA_MPS_PIPE_DIRECTORY'], 'the three MPS names plus the product\'s own CUDA_CACHE_PATH');
     assert.equal(artifact.runner[0].cuda.CUDA_MPS_PINNED_DEVICE_MEM_LIMIT, '0=3072M'); assert.equal(artifact.runner[0].cuda.CUDA_MPS_ACTIVE_THREAD_PERCENTAGE, '50');
     assert.equal(artifact.runner[0].envNames.some(name => /TOKEN|KEY|SECRET/.test(name)), false);
     assert.equal(artifact['agent:L1'].image, LLM_IMAGE); assert.match(artifact['agent:L1'].labels['ploinky.mpsgeneration'], /^[0-9a-f-]{36}:[0-9a-f-]{36}$/);
@@ -640,7 +640,7 @@ test('G2.vllm-stage-two-qualified-after-the-data-entry-starts-the-model-through-
     assert.equal(artifact.publicAdmission.status, 'ok'); assert.equal(artifact.publicAdmission.estimate.gpuMemoryUtilization, 0.81);
     const runs = toolCalls(w, 'local_llm_run'); assert.equal(runs.length, 1); assert.deepEqual([runs[0].args.modelId, runs[0].args.runnerId], [LLM_MODELS.awq, 'vllm']);
     assert.equal(artifact.response.text, 'Pong.');
-    assert.deepEqual(Object.keys(artifact.runner[0].cuda).sort(), ['CUDA_MPS_ACTIVE_THREAD_PERCENTAGE', 'CUDA_MPS_PINNED_DEVICE_MEM_LIMIT', 'CUDA_MPS_PIPE_DIRECTORY']);
+    assert.deepEqual(Object.keys(artifact.runner[0].cuda).sort(), ['CUDA_CACHE_PATH', 'CUDA_MPS_ACTIVE_THREAD_PERCENTAGE', 'CUDA_MPS_PINNED_DEVICE_MEM_LIMIT', 'CUDA_MPS_PIPE_DIRECTORY'], 'the three MPS names plus the product\'s own CUDA_CACHE_PATH');
     assert.equal(artifact.runner[0].cuda.CUDA_MPS_PINNED_DEVICE_MEM_LIMIT, '0=5529M');
     // Bounded share evidence, and the model, runner and qualification digests.
     assert.equal(artifact.shareEvidence.shareMiB, 5529); assert.ok(artifact.shareEvidence.peakUsedMiB - artifact.shareEvidence.baselineUsedMiB <= 5529 + 256, JSON.stringify(artifact.shareEvidence));
@@ -1283,14 +1283,52 @@ test('LLM3.every-tuple-field-the-stage-one-pin-carries-is-bound-to-what-the-host
     }
 });
 
-// --- R2B: the runner-environment check against local-llm's own launch environment -------------------------
+// --- R2A and R2B: the runner-environment check against local-llm's own launch environment -------------------------
 // The names come from captureLocalLlmRunnerEnv.mjs, which builds them from local-llm's controller and adapters.
 const SHARE = { smPercent: 50, memory: '0=3072M' };
 const processOf = (runner, change = {}) => {
     const env = Object.fromEntries(Object.entries(LOCAL_LLM_RUNNER_ENV.runners[runner]).map(([name, entry]) => [name, name.startsWith('CUDA_MPS_') ? { CUDA_MPS_PIPE_DIRECTORY: '/run/ploinky-mps-pipe', CUDA_MPS_ACTIVE_THREAD_PERCENTAGE: '50', CUDA_MPS_PINNED_DEVICE_MEM_LIMIT: '0=3072M' }[name] : entry.perStartSecret ? 'secret' : entry.value]));
-    const cuda = Object.fromEntries(Object.entries(env).filter(([name]) => name.startsWith('CUDA_') && name !== 'CUDA_CACHE_PATH'));
+    const cuda = Object.fromEntries(Object.entries(env).filter(([name]) => name.startsWith('CUDA_')));
     return { pid: 7, uid: [1000, 1000, 1000, 1000], envNames: Object.keys(env).sort(), cuda, ...change };
 };
+
+test('R2A.the-products-own-cuda-cache-variable-is-allowed-and-any-other-cuda-name-fails', () => {
+    for (const runner of ['llama.cpp', 'vllm']) {
+        const real = processOf(runner);
+        assert.ok(real.cuda.CUDA_CACHE_PATH, `${runner}: local-llm's own launch sets CUDA_CACHE_PATH`);
+        assert.deepEqual(runnerEnvironmentProblems(real, { share: SHARE, runnerId: runner }), [], `${runner}: the real product environment passes`);
+        // Absent is allowed too: the product variable is allow-listed, not required.
+        const without = { ...real.cuda }; delete without.CUDA_CACHE_PATH;
+        assert.deepEqual(runnerEnvironmentProblems(processOf(runner, { cuda: without }), { share: SHARE, runnerId: runner }), []);
+        for (const extra of ['CUDA_VISIBLE_DEVICES', 'CUDA_MPS_LOG_DIRECTORY', 'CUDA_DEVICE_ORDER']) {
+            assert.match(runnerEnvironmentProblems(processOf(runner, { cuda: { ...real.cuda, [extra]: '0' } }), { share: SHARE, runnerId: runner }).join(), /not exactly the three MPS variables \(plus the product's CUDA_CACHE_PATH\)/, `${runner}: ${extra}`);
+        }
+        // The three MPS names stay mandatory and exact.
+        const dropped = { ...real.cuda }; delete dropped.CUDA_MPS_PINNED_DEVICE_MEM_LIMIT;
+        assert.match(runnerEnvironmentProblems(processOf(runner, { cuda: dropped }), { share: SHARE, runnerId: runner }).join(), /not exactly the three MPS variables/);
+        assert.match(runnerEnvironmentProblems(processOf(runner, { cuda: { ...real.cuda, CUDA_MPS_ACTIVE_THREAD_PERCENTAGE: '51' } }), { share: SHARE, runnerId: runner }).join(), /not the saved share 50% \/ 0=3072M/);
+        // The cache stays in the container's own filesystem, never in the workspace's /data or /shared.
+        for (const place of ['/data/.cuda-cache', '/shared', 'relative/cache']) assert.match(runnerEnvironmentProblems(processOf(runner, { cuda: { ...real.cuda, CUDA_CACHE_PATH: place } }), { share: SHARE, runnerId: runner }).join(), /keeps its CUDA cache at/, place);
+    }
+});
+
+test('R2A.L1-and-L3-accept-the-runner-environment-local-llm-really-builds-and-refuse-a-foreign-cuda-name', async t => {
+    // The fake runner environment is local-llm's: CUDA_CACHE_PATH is present, and the executors pass.
+    const l1 = await provisioned(t);
+    const entry = caseOf(await liveCases(l1, ['LIVE-L1']), 'LIVE-L1');
+    assert.equal(entry.result, 'pass', JSON.stringify(entry).slice(0, 600));
+    assert.equal(l1.artifacts.get('gpu-live-l1').runner[0].cuda.CUDA_CACHE_PATH, '/opt/runners/.cuda-cache');
+    nothingOwned(l1);
+    for (const [label, faults, pattern] of [['a foreign CUDA name', { runnerExtraCuda: true }, /not exactly the three MPS variables \(plus the product's CUDA_CACHE_PATH\)/], ['a CUDA cache in the workspace data', { runnerCudaCache: '/data/.cuda-cache' }, /keeps its CUDA cache at \/data\/\.cuda-cache/]]) {
+        const w = await provisioned(t, { faults });
+        const failed = caseOf(await liveCases(w, ['LIVE-L1']), 'LIVE-L1');
+        assert.equal(failed.result, 'fail', label); assert.match(failed.reason, pattern, label);
+        nothingOwned(w);
+    }
+    const noCache = await provisioned(t, { faults: { runnerNoCudaCache: true } });
+    assert.equal(caseOf(await liveCases(noCache, ['LIVE-L1']), 'LIVE-L1').result, 'pass');
+    nothingOwned(noCache);
+});
 
 test('R2B.secret-names-match-whole-underscore-words-and-the-products-own-emitted-names-are-allowed', async t => {
     // vLLM's TIKTOKEN_ENCODINGS_BASE (a vocabulary path, always set by buildLaunch) is not a secret.

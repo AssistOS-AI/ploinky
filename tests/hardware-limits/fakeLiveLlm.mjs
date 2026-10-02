@@ -128,8 +128,6 @@ export function createLlmWorld({ statePath, node, engine, host, gpu, faults = {}
         if (faults.runnerNoCudaCache) delete runnerEnv.CUDA_CACHE_PATH;
         for (const name of faults.runnerExtraEnv ?? []) runnerEnv[name] = 'x';
         if (faults.runnerLeaksToken) runnerEnv.LOCAL_LLM_CONTROL_TOKEN = 'x';
-        // The CUDA cache variable is not modelled yet (the next change allows it).
-        delete runnerEnv.CUDA_CACHE_PATH;
         const cuda = Object.fromEntries(Object.entries(runnerEnv).filter(([name]) => name.startsWith('CUDA_')));
         const envNames = Object.keys(runnerEnv).sort();
         const allocatedMiB = matcher === 'vllm' ? (faults.vllmOverShare ? 5600 : 4400) : (faults.gpuOverShare ? 3600 : 600);

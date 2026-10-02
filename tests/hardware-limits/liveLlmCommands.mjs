@@ -25,7 +25,7 @@ export const LOCAL_LLM_RUNNER_ENV = Object.freeze(JSON.parse(fs.readFileSync(new
 export const MPS_RUNNER_NAMES = Object.freeze(['CUDA_MPS_ACTIVE_THREAD_PERCENTAGE', 'CUDA_MPS_PINNED_DEVICE_MEM_LIMIT', 'CUDA_MPS_PIPE_DIRECTORY']);
 // The documented product variable that is a CUDA name: the driver's JIT cache, kept in the container's own
 // filesystem (local-llm DS004; deployments.mjs sets it for every runner). Any other CUDA_* name is not the product's.
-export const RUNNER_PRODUCT_CUDA = Object.freeze([]);
+export const RUNNER_PRODUCT_CUDA = Object.freeze(['CUDA_CACHE_PATH']);
 // A secret-looking name is one with a whole `_`-delimited word that names a credential: API_KEY, TOKEN and HF_TOKEN
 // are, TIKTOKEN_ENCODINGS_BASE (a path to a vocabulary) is not.
 const SECRET_WORDS = new Set(['KEY', 'KEYS', 'APIKEY', 'TOKEN', 'TOKENS', 'SECRET', 'SECRETS', 'PASSWORD', 'PASSWD', 'CREDENTIAL', 'CREDENTIALS', 'COOKIE', 'COOKIES']);
@@ -43,7 +43,7 @@ export function runnerEnvironmentProblems(process, { share, runnerId, label = 'r
     const names = Object.keys(cuda).sort();
     const missing = MPS_RUNNER_NAMES.filter(name => !names.includes(name));
     const foreign = names.filter(name => !MPS_RUNNER_NAMES.includes(name) && !RUNNER_PRODUCT_CUDA.includes(name));
-    if (missing.length || foreign.length) problems.push(`${label}: the runner ${process.pid} has CUDA variables ${names.join(',')}, not exactly the three MPS variables`);
+    if (missing.length || foreign.length) problems.push(`${label}: the runner ${process.pid} has CUDA variables ${names.join(',')}, not exactly the three MPS variables (plus the product's ${RUNNER_PRODUCT_CUDA.join(', ')})`);
     if (cuda.CUDA_MPS_PIPE_DIRECTORY !== '/run/ploinky-mps-pipe' || cuda.CUDA_MPS_ACTIVE_THREAD_PERCENTAGE !== String(share.smPercent) || cuda.CUDA_MPS_PINNED_DEVICE_MEM_LIMIT !== share.memory) {
         problems.push(`${label}: the runner ${process.pid} sees ${JSON.stringify(Object.fromEntries(MPS_RUNNER_NAMES.map(name => [name, cuda[name]])))}, not the saved share ${share.smPercent}% / ${share.memory}`);
     }
