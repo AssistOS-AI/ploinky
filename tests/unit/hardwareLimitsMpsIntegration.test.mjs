@@ -517,6 +517,36 @@ test('MI.two-refused-peers-keep-the-stopped-peers-outcome-when-the-second-is-unp
     assert.ok(f.state.drainedClients.length >= 1 && f.state.pendingClients.some((value) => value.key === 'b' && value.phase === 'pending'), JSON.stringify(f.state.pendingClients));
 });
 
+// The same abort on a second Apply: b was drained and settled by the first
+// attempt, so the second finds it already stopped. It must still report b's
+// refusal and keep b's pending entry, with the abort on c unchanged.
+test('MI.a-repeated-apply-keeps-the-stopped-refused-peers-outcome-and-pending-entry', async () => {
+    const f = recordedPeerWorld({ unprovableSecondPeer: true });
+    const first = await f.apply();
+    assert.equal(first.status, 207, JSON.stringify(first));
+    assert.deepEqual(first.results.map((value) => `${value.key}:${value.state}`).sort(), ['b:refused', 'c:refused', 'z:pending']);
+    const pendingOf = (key) => f.state.pendingClients.filter((value) => value.key === key && value.phase === 'pending');
+    assert.equal(pendingOf('b').length, 1, 'attempt 1 journals b as pending');
+    const stopsOfB = () => f.events.filter((value) => value === 'stop:b').length;
+    assert.equal(stopsOfB(), 1);
+    for (const attempt of [2, 3]) {
+        const again = await f.apply();
+        assert.equal(again.status, 207, `attempt ${attempt}: ${JSON.stringify(again)}`);
+        const byKey = Object.fromEntries(again.results.map((value) => [value.key, value]));
+        assert.deepEqual(Object.keys(byKey).sort(), ['b', 'c', 'z'], `attempt ${attempt}: ${JSON.stringify(again.results)}`);
+        assert.equal(byKey.b.state, 'refused', `attempt ${attempt}: b keeps its refusal`);
+        assert.equal(byKey.b.problem.key, 'b');
+        assert.ok(byKey.b.problem.reason.includes('Agent demo/b not found') && byKey.b.problem.fix);
+        assert.equal(byKey.c.state, 'refused', `attempt ${attempt}: c is still unprovable`);
+        assert.equal(pendingOf('b').length, 1, `attempt ${attempt}: b keeps exactly one pending entry`);
+        assert.equal(stopsOfB(), 1, `attempt ${attempt}: b is not stopped again`);
+        assert.ok(f.unavailable.includes('b'), `attempt ${attempt}: b stays unavailable`);
+        assert.equal(f.unavailable.includes('c'), false);
+        assert.equal(f.engine.some((line) => line.includes('stop') && line.includes('c'.repeat(64))), false, 'c is never stopped');
+        assert.deepEqual(again.expandedContainers, ['b', 'c'], `attempt ${attempt}`);
+    }
+});
+
 test('MI.refused-peer-outcome-survives-a-cancellation-after-its-drain', async () => {
     const f = recordedPeerWorld({ unprovableSecondPeer: true, cancelAfter: 'stop:b' });
     const result = await f.apply();

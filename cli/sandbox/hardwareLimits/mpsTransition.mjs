@@ -112,7 +112,13 @@ function* transitionSteps(input, { assertCapability, store, backend, drain, recr
     const plan = planMpsTransition({ ...input, state: prior, observedDaemon: observation, defaultsVerified: prior?.daemon ? backend.verify(prior) : false });
     onPlan(plan);
     if (plan.action === 'reuse') return { plan, state: prior, results: [] };
-    let state = { ...(prior || { schema: 1, daemonGeneration: null, configurationGeneration: null, daemon: null, pipeDirectory: null, logDirectory: null }), transitionId: prior?.transitionId || crypto.randomUUID(), origin: String(input.origin || 'lifecycle').slice(0, 32), status: 'transitioning', oldClients: plan.oldClients, desiredClients: plan.desiredClients, pendingClients: [...(input.preservedPending || []), ...plan.recreate.map((client) => ({ ...client, phase: 'pending' }))], drainedClients: prior?.drainedClients || [], serverDefault: prior?.serverDefault || null, lastProblem: null };
+    const initialPending = [...(input.preservedPending || []), ...plan.recreate.map((client) => ({ ...client, phase: 'pending' }))];
+    // A refused peer drained by an earlier attempt keeps its pending intent:
+    // it is not in the recreate list, so a rebuilt journal would otherwise lose
+    // it before this attempt can settle its outcome.
+    const refusedKeys = new Set((input.refusedClients || []).map(({ client }) => client.key));
+    const carriedPending = (prior?.pendingClients || []).filter((entry) => refusedKeys.has(entry.key) && entry.phase === 'pending' && !initialPending.some((value) => value.key === entry.key));
+    let state = { ...(prior || { schema: 1, daemonGeneration: null, configurationGeneration: null, daemon: null, pipeDirectory: null, logDirectory: null }), transitionId: prior?.transitionId || crypto.randomUUID(), origin: String(input.origin || 'lifecycle').slice(0, 32), status: 'transitioning', oldClients: plan.oldClients, desiredClients: plan.desiredClients, pendingClients: [...initialPending, ...carriedPending], drainedClients: prior?.drainedClients || [], serverDefault: prior?.serverDefault || null, lastProblem: null };
     const save = () => store.write(state);
     save();
     const results = [];
@@ -141,6 +147,10 @@ function* transitionSteps(input, { assertCapability, store, backend, drain, recr
                 results.push(result); save(); onResult(result);
             }
         };
+        // Peers drained by an earlier attempt of this transition are settled
+        // first: a later abort in this attempt (an unprovable peer, a
+        // cancellation) must not leave them without their outcome.
+        settleRefusedPeers();
         for (const client of drainOrder) {
             if (state.drainedClients.includes(clientIdentity(client))) continue;
             check();
@@ -148,8 +158,6 @@ function* transitionSteps(input, { assertCapability, store, backend, drain, recr
             state.drainedClients = [...new Set([...state.drainedClients, clientIdentity(client)])]; save();
             settleRefusedPeers();
         }
-        // Peers drained by an earlier attempt of this transition.
-        settleRefusedPeers();
         if (plan.stopDaemon) { check(); backend.stop(state); state.daemon = null; state.daemonGeneration = null; state.configurationGeneration = null; save(); }
         if (plan.stopDaemon || observation.state === 'gone') {
             // Journal the terminated generation before its directories are
