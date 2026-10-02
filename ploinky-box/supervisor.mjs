@@ -753,6 +753,25 @@ export function createBoxSupervisor({
         });
     }
 
+    async function reconcileSafely(options) {
+        return reconcile({
+            ...options,
+            assertGateOffRestore: () => {
+                const { identity, lock } = options;
+                lock.assertHeld(identity.instance);
+                const state = observeBoxState(identity);
+                if (state.state !== 'absent') {
+                    throw supervisorError('Cannot restore gate-off wiring until candidate Box writers are proven absent. Run PLOINKY_BOX_HARDWARE_LIMITS=on ploinky restart.', 'PLOINKY_BOX_HARDWARE_ROLLBACK_BLOCKED');
+                }
+                const paths = hardwareStorePaths({ identity, homeDirectory: hardwareGateStore.homeDirectory });
+                return withStaleStoreLockRecovery(() => assertGateOffStoreEmpty({ paths, identity }), {
+                    storeRoot: paths.storeRoot, hostLock: lock, instance: identity.instance,
+                    inspectBox: () => observeBoxState(identity),
+                });
+            },
+        });
+    }
+
     async function prepareBoxForCommand({
         explicitPort,
         explicitMediaPort,
@@ -792,7 +811,7 @@ export function createBoxSupervisor({
                 branchPolicy,
                 loadImageBundle: imageBundleLoader(ownership, imageRef),
             });
-            const prepared = await reconcile({
+            const prepared = await reconcileSafely({
                 identity,
                 ownership,
                 engine: ownership.engine,
@@ -1033,7 +1052,7 @@ export function createBoxSupervisor({
     async function reconcileConfiguredGraph(options, { priorCoreStartArgv, priorSkillScopeEnv }) {
         const priorRunning = options.ownership.handles?.container?.runtime?.running === true;
         try {
-            return await reconcile(options);
+            return await reconcileSafely(options);
         } catch (error) {
             await recoverFailedGraphReconcile({
                 identity: options.identity,
@@ -1497,7 +1516,7 @@ export function createBoxSupervisor({
                     recoveredContainerId = handle.id;
                     recoveredHardware = observedHardwareWiring(identity, observed);
                 } else {
-                    const restarted = await reconcile({
+                    const restarted = await reconcileSafely({
                         identity,
                         ownership: observed,
                         engine,
@@ -1633,7 +1652,7 @@ export function createBoxSupervisor({
             );
             let prepared;
             try {
-                prepared = await reconcile({
+                prepared = await reconcileSafely({
                     identity,
                     ownership,
                     engine,
@@ -1968,7 +1987,7 @@ export function createBoxSupervisor({
         );
         let prepared;
         try {
-            prepared = await reconcile({
+            prepared = await reconcileSafely({
                 identity,
                 ownership,
                 engine,

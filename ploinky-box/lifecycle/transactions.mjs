@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import { observeContainerHardwareWiring, sameHardwareWiring } from '../hardwareLimitsGate.mjs';
 import { isDeepStrictEqual } from 'node:util';
+import { assertGateOffStoreEmpty, hardwareStorePaths, readStoreSnapshot } from '../../cli/sandbox/hardwareLimits/store.mjs';
 
 import {
     BOX_DATA_FINGERPRINT_LABELS,
@@ -286,6 +287,7 @@ async function restoreOldContainer({
             );
         }
     }
+    if (!old.hardware) await dependencies.assertGateOffRestore({ identity, lock, engine, runner });
     return createAndStart({
         engine,
         identity,
@@ -333,6 +335,7 @@ export async function reconcileBoxContainer({
     // Same for the hardware-limits wiring: undefined keeps the Box's own,
     // null selects gate off, a wiring selects gate on exactly.
     hardware = undefined,
+    assertGateOffRestore = null,
     imageRef = BOX_IMAGE_REFERENCE,
     imagePolicy = 'pull',
     platform = process.platform,
@@ -374,6 +377,15 @@ export async function reconcileBoxContainer({
         }),
         fsApi: seams.fsApi || fs,
         token: seams.token || (() => crypto.randomBytes(12).toString('hex')),
+        assertGateOffRestore: assertGateOffRestore || (({ identity: selectedIdentity, lock: selectedLock }) => {
+            selectedLock.assertHeld(selectedIdentity.instance);
+            const paths = hardwareStorePaths({ identity: selectedIdentity });
+            if (readStoreSnapshot({ paths, identity: selectedIdentity }).status !== 'absent-never-initialized') {
+                const observed = dependencies.discover(selectedIdentity, { runner });
+                if (observed?.state !== 'absent') throw transactionError('Cannot restore gate-off wiring until candidate Box writers are proven absent; run PLOINKY_BOX_HARDWARE_LIMITS=on ploinky restart');
+            }
+            return assertGateOffStoreEmpty({ paths, identity: selectedIdentity });
+        }),
     };
     function validateFinalOwnership(containerId, desired) {
         lock.assertHeld(identity.instance);

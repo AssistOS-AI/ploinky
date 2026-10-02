@@ -550,12 +550,15 @@ function runProbeLoop(agentName, containerName, type, probe, options = {}) {
     }
 
     while (true) {
+        if (options.beforeProbe) options.beforeProbe();
+        if (options.deadline !== undefined && Date.now() >= options.deadline) throw new Error('Readiness deadline expired.');
+        const currentProbe = options.deadline === undefined ? probe : { ...probe, timeout: Math.min(probe.timeout, Math.max(0, options.deadline - Date.now()) / 1000) };
         let result;
         try {
             result = runProbeWithControlPlaneRetry(
                 agentName,
                 `${type} probe`,
-                () => runProbeOnce(agentName, containerName, probe, { ...options, probeContainerIdentity }),
+                () => runProbeOnce(agentName, containerName, currentProbe, { ...options, probeContainerIdentity }),
                 options,
             );
         } catch (error) {
@@ -579,7 +582,8 @@ function runProbeLoop(agentName, containerName, type, probe, options = {}) {
             }
         }
 
-        const intervalMs = Math.max(0, Math.round(probe.interval * 1000));
+        const requestedIntervalMs = Math.max(0, Math.round(probe.interval * 1000));
+        const intervalMs = options.deadline === undefined ? requestedIntervalMs : Math.min(requestedIntervalMs, Math.max(0, options.deadline - Date.now()));
         if (intervalMs > 0) {
             const sleepMsImpl = options.sleepMsImpl || sleepMs;
             sleepMsImpl(intervalMs);

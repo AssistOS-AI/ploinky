@@ -24,6 +24,29 @@ function ok(stdout = '') {
     return { ok: true, status: 0, stdout, stderr: '' };
 }
 
+test('R.managed-policy-before-predecessor-stop-and-remove', (t) => {
+    for (const failedBoundary of ['prepare-network', 'stop', 'remove']) {
+        const harness = networkHarness(t);
+        const network = canonicalizeNetwork({ mode: 'default' });
+        const plan = harness.adapter.prepare(network, 'demo');
+        const primary = plan.attachments[0];
+        const predecessorId = 'previous1234567890';
+        const previous = managedAgentRecord({ id: predecessorId, name: 'demo-container', labels: managedAgentLabels(harness.identity, network), networks: { [primary.name]: { Aliases: [plan.alias, predecessorId.slice(0, 12)] } }, running: true });
+        harness.containers.set(predecessorId, previous);
+        harness.networks.get(primary.name).Containers[predecessorId] = { Name: previous.Name };
+        let creates = 0;
+        assert.throws(() => harness.adapter.runManagedContainerTransaction({
+            network, canonicalAgentId: 'demo', containerName: 'demo-container', runtimeIdentity: TEST_RUNTIME_IDENTITY,
+            beforeDestructiveWork: ({ kind }) => { if (kind === failedBoundary) throw new Error('policy changed'); },
+            createContainer: () => { creates++; },
+        }), /policy changed/);
+        assert.equal(creates, 0);
+        const destructive = harness.calls.filter((args) => ['stop', 'rm'].includes(args[0]) && args.includes(predecessorId));
+        assert.deepEqual(destructive.map((args) => args[0]), failedBoundary === 'remove' ? ['stop'] : []);
+        assert.equal(harness.containers.has(predecessorId), true);
+    }
+});
+
 function absent(resource = 'resource') {
     return { ok: false, status: 125, stdout: '', stderr: `no such ${resource}` };
 }

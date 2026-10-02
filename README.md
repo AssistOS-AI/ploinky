@@ -669,6 +669,24 @@ URLs registered with an SSO provider.
 
 ## Hardware limits for agents
 
+Explorer administrators edit CPU cores, RAM percentage and eligible NVIDIA GPU
+shares in Settings → Hardware limits. A policy belongs to `REPO/AGENT` and
+applies to every alias instance. Save records desired policy; Apply reconciles
+selected exact registry keys, drains and recreates changed instances, waits for
+their required readiness and publishes fresh routes. Unchanged instances are
+left running. Repaired blocking dependants are included in dependency order;
+the response lists that expansion and each applied, refused, blocked or pending
+identity. CPU and memory usage is shown against applied kernel limits.
+
+The Router owns `GET` and `POST /api/marketplace/hardware-limits`. Reads require
+an administrator session. Mutations also require exact Origin, current CSRF
+proof and a policy epoch/revision token; Bearer requests are rejected before
+body parsing. Concurrent changes return a conflict instead of overwriting
+newer policy. Partial Apply results retain completed identities. Its bounded
+deadline cancels cooperatively so runtime cleanup and lifecycle lease release
+finish before another Apply starts. An unexpected worker exit requires host
+restart recovery. Administration remains a separate navigation tab.
+
 Hardware limits are off by default. Turn them on for a workspace with
 `PLOINKY_BOX_HARDWARE_LIMITS=on ploinky start` (or `restart`, `update`); the
 choice is saved on the host in `~/.ploinky-box/hardware-limits` and later

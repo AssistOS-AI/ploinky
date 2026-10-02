@@ -32,6 +32,7 @@ import { runMarketplaceEnableWorker } from '../marketplaceEnableWorker.js';
 import { authService, LOCAL_AUTH_COOKIE_NAME, parseCookies, sendJson, sessionTokenService, SSO_AUTH_COOKIE_NAME } from './shared.js';
 import { localSessionAllowedForRoutePlan } from './authContext.js';
 import { findHardwareOutcome, formatHardwareOutcome } from '../../sandbox/hardwareLimits/errors.mjs';
+import { handleHardwareLimitsRoutes } from './hardwareLimitsRoutes.mjs';
 
 export const MARKETPLACE_PATH = '/api/marketplace';
 export const MARKETPLACE_AGENT_TARGET = 'ploinky-router';
@@ -558,6 +559,19 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
     }
 
     const method = (req.method || 'GET').toUpperCase();
+
+    if (route.resource === 'hardware-limits') {
+        return handleHardwareLimitsRoutes(req, res, parsedUrl, {
+            ensureAdmin: (request, response, url) => ensureAdmin(request, response, url, { routePlan }),
+            verifyMutation: (request) => {
+                const publicContext = publicMarketplaceAuthContext(routePlan);
+                return publicContext
+                    ? verifyBrowserMutationRequest(request, { routePlan, authContext: publicContext, sessionId: request.sessionId })
+                    : verifyAdminMutationRequest(request, request.sessionId);
+            },
+            verifyLease: () => !routePlan?.lease?.commit || routePlan.lease.commit() === true,
+        });
+    }
 
     const authorizeRead = async () => {
         if (readAuthorizationBearer(req)) {

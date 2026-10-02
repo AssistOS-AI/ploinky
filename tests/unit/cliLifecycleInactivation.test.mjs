@@ -4,6 +4,7 @@ import fs from 'node:fs';
 
 const cliSource = fs.readFileSync(new URL('../../cli/commands/cli.js', import.meta.url), 'utf8');
 const workspaceSource = fs.readFileSync(new URL('../../cli/commands/workspaceUtil.js', import.meta.url), 'utf8');
+const reconcileSource = fs.readFileSync(new URL('../../cli/sandbox/hardwareLimits/reconcile.mjs', import.meta.url), 'utf8');
 
 function assertOrdered(source, labels) {
     let previous = -1;
@@ -89,18 +90,14 @@ test('single restart and reinstall delegate physical replacement to the shared r
 });
 
 test('managed single-agent restart drains before replacement and publishes only after readiness', () => {
-    const restartStart = cliSource.indexOf('// Recreate through the managed transaction');
-    const restartEnd = cliSource.indexOf("console.log('✓ Agent restarted.');", restartStart);
-    const restart = cliSource.slice(restartStart, restartEnd);
-
-    assertOrdered(restart, [
-        'await prepareTargetedAgentRestart({',
+    assert.match(cliSource, /withWorkspaceMutationLease\(\{ operation: 'exact-agent-restart' \}, \(\) => reconcileExactHardwareInstance\(/);
+    assertOrdered(reconcileSource, [
+        'transition = await prepare({',
         'targetedRestart: transition.targetedRestart',
-        'await waitForManifestReadiness({',
-        'await commitTargetedAgentRestart({',
+        'await readiness({',
+        'await commit({',
     ]);
-    assert.match(restart, /catch \(error\) \{[\s\S]*cleanupFailedTargetedAgentRestart\(result, error\)/);
-    assert.doesNotMatch(restart, /activatePreparedRuntimeAfterReadiness/);
+    assert.match(reconcileSource, /if \(transition\) cleanupTargeted\(result, error\)/);
 });
 
 test('sandbox ownership checks use exact runtime keys rather than short agent names', () => {

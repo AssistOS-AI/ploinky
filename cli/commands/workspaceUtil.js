@@ -2088,6 +2088,9 @@ async function waitForReadinessEntries(readinessEntries, options = {}) {
   }
 
   await Promise.all(readinessEntries.map(async (entry) => {
+    if (options.beforeProbe) options.beforeProbe();
+    const remainingMs = options.deadline === undefined ? null : Math.max(0, options.deadline - Date.now());
+    if (remainingMs === 0) throw new Error('Readiness deadline expired.');
     if (entry.protocol === 'none') {
       readinessProgress.set(entry.key, {
         elapsedMs: 0,
@@ -2103,7 +2106,8 @@ async function waitForReadinessEntries(readinessEntries, options = {}) {
       const result = await Promise.resolve(runContainerScriptReadinessImpl(
         entry.label,
         entry.route.container,
-        entry.scriptProbe
+        remainingMs === null ? entry.scriptProbe : { ...entry.scriptProbe, timeout: Math.min(entry.scriptProbe.timeout, remainingMs / 1000) },
+        { beforeProbe: options.beforeProbe, deadline: options.deadline },
       ));
       if (result?.status !== 'success') {
         const reason = result?.reason || 'unknown failure';
@@ -2122,10 +2126,11 @@ async function waitForReadinessEntries(readinessEntries, options = {}) {
       return;
     }
     const ready = await waitForAgentReadyImpl(entry.route, {
-      timeoutMs: entry.timeoutMs,
+      timeoutMs: remainingMs === null ? entry.timeoutMs : Math.min(entry.timeoutMs, remainingMs),
       intervalMs: entry.intervalMs,
       probeTimeoutMs: entry.probeTimeoutMs,
       protocol: entry.protocol,
+      beforeProbe: options.beforeProbe,
       onProgress: (progress) => {
         readinessProgress.set(entry.key, {
           ...progress,
@@ -2188,6 +2193,7 @@ async function activatePreparedRuntimeAfterReadiness({
   mergeRouting = mergeRoutingConfig,
   mergeRoute = mergeRuntimeRoute,
   loadAgents = workspaceSvc.loadAgents,
+  saveAgents = workspaceSvc.saveAgents,
   readRouting = readRoutingConfig,
   commitAdditive = commitAdditiveEdgeRoutingGeneration,
   withApplyLock = withEdgeGenerationApplyLock,
@@ -2234,6 +2240,7 @@ async function activatePreparedRuntimeAfterReadiness({
           agent: shortAgentName,
           ...(alias ? { alias } : {}),
         }, { hostPort: result.hostPort || 0 });
+        delete routing.routes[routeKey].hardwareAvailability;
         return commitAdditive(result.preparationLease, {
           agents,
           routing,
@@ -2251,9 +2258,9 @@ async function activatePreparedRuntimeAfterReadiness({
       return true;
     }
     await mergeRouting((cfg) => {
-      const agents = workspaceSvc.loadAgents();
+      const agents = loadAgents();
       agents[result.containerName] = result.registryRecord;
-      workspaceSvc.saveAgents(agents, { coordinate: false });
+      saveAgents(agents, { coordinate: false });
       cfg.routes = cfg.routes || {};
       cfg.routes[routeKey] = {
         ...(cfg.routes[routeKey] || {}),
@@ -2265,6 +2272,7 @@ async function activatePreparedRuntimeAfterReadiness({
         ...(result.hostPort ? { hostPort: result.hostPort } : {}),
       };
       if (!result.hostPort) delete cfg.routes[routeKey].hostPort;
+      delete cfg.routes[routeKey].hardwareAvailability;
       return cfg;
     }, {
       reason: 'runtime-replacement-ready',
@@ -2811,6 +2819,7 @@ async function startWorkspace(staticAgentArg, portArg, {
             : undefined;
           const runtimeResult = ensureAgentService(shortAgentName, manifest, agentPath, {
             containerName: name,
+            hardwareInstanceKey: name,
             alias: rec.alias,
             routerEndpoint,
             profileName: rec.profile || undefined,
@@ -3116,6 +3125,8 @@ export function admitDirectAgentRuntimeManifest(manifest, {
   agentId = '',
   profileName,
   persistedProfileName,
+  instanceKey,
+  alias,
 } = {}) {
   const exactBytes = manifestBytes === undefined
     ? (manifestPath && fs.existsSync(manifestPath)
@@ -3150,6 +3161,8 @@ export function admitDirectAgentRuntimeManifest(manifest, {
     manifestBytes: exactBytes,
     manifestPath,
     agentId,
+    instanceKey,
+    alias,
     profileName: profileResolution.resolvedProfileName,
     profileConfig: profileResolution.profileConfig,
     network: profileResolution.network,

@@ -302,6 +302,7 @@ export function verifyLeafLimits({ fsApi = fs, cgroupRoot = CGROUP_ROOT, leaf, e
     const directory = path.join(cgroupRoot, leaf);
     const problems = [];
     const readFailures = [];
+    const observed = {};
     let refusal = null;
     let leafPresent = false;
     try {
@@ -315,7 +316,9 @@ export function verifyLeafLimits({ fsApi = fs, cgroupRoot = CGROUP_ROOT, leaf, e
     }
     const read = (name) => {
         try {
-            return { value: String(fsApi.readFileSync(`${directory}/${name}`, 'utf8')).trim() };
+            const value = String(fsApi.readFileSync(`${directory}/${name}`, 'utf8')).trim();
+            observed[name] = value;
+            return { value };
         } catch (error) {
             readFailures.push(name);
             return { value: null, code: error?.code || 'EIO' };
@@ -345,7 +348,7 @@ export function verifyLeafLimits({ fsApi = fs, cgroupRoot = CGROUP_ROOT, leaf, e
         const pidsMax = value('pids.max');
         if (pidsMax !== String(expected.pidsLimit)) problems.push(`pids.max is ${pidsMax}`);
     }
-    return Object.freeze({ ok: problems.length === 0, problems, refusal, leafPresent, readFailures });
+    return Object.freeze({ ok: problems.length === 0, problems, refusal, leafPresent, readFailures, observed });
 }
 
 // Re-check that the launched process is still the one in `leaf`: returns the
@@ -446,5 +449,5 @@ export function verifyLaunchedHardwareLimits({
         if (disappeared) throw notObserved(disappeared);
         throw refuse('the agent cgroup namespace changed during limits readback');
     }
-    return Object.freeze({ leaf, cgroupNamespace: agentNamespace, verified: true });
+    return Object.freeze({ leaf, cgroupNamespace: agentNamespace, observed: readback.observed, verified: true });
 }

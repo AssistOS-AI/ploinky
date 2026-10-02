@@ -36,6 +36,7 @@ import {
 } from './hardwareLimits/resolve.mjs';
 import { verifyLaunchedHardwareLimits } from './hardwareLimits/delegation.mjs';
 import { engineCommandArgs } from './hardwareLimits/runtimeCommand.mjs';
+import { writeAppliedObservation } from './hardwareLimits/runtimeState.mjs';
 
 export const RUNTIME_CAPABILITY_POLICY_VERSION = 'ploinky-runtime-capabilities-v1';
 const ADMITTED_DESCRIPTORS = new WeakSet();
@@ -810,6 +811,10 @@ export function createHardwareLaunchGuard(runtimeAdmission, {
     fsApi,
     cgroupRoot,
     procRoot,
+    instanceId,
+    enableGeneration,
+    recordApplied = writeAppliedObservation,
+    observationKey = key,
 } = {}) {
     const descriptor = runtimeAdmission.descriptor;
     const recheck = () => assertHardwareAdmissionCurrent(runtimeAdmission, { hardwareContext });
@@ -825,8 +830,9 @@ export function createHardwareLaunchGuard(runtimeAdmission, {
         // a matching limits-hash label is never proof that its leaf holds the
         // admitted limits (plan §8.1: an inspect field alone is not proof).
         afterLaunch({ containerId }) {
+            let readback = null;
             if (descriptor.hardwarePlacement) {
-                verifyLaunchedHardwareLimits({
+                readback = verifyLaunchedHardwareLimits({
                     descriptor,
                     containerId,
                     runtime,
@@ -849,6 +855,16 @@ export function createHardwareLaunchGuard(runtimeAdmission, {
                 });
             }
             recheck();
+            if (readback && instanceId && enableGeneration) {
+                const cpu = String(readback.observed['cpu.max'] || '').split(/\s+/);
+                recordApplied({
+                    key: observationKey, containerId, instanceId, enableGeneration,
+                    limitsHash: descriptor.hardwarePlacement.limitsHash,
+                    cpus: cpu.length === 2 && cpu[0] !== 'max' ? Number(cpu[0]) / Number(cpu[1]) : null,
+                    memoryBytes: readback.observed['memory.max'] && readback.observed['memory.max'] !== 'max' ? Number(readback.observed['memory.max']) : null,
+                    cgroupNamespace: readback.cgroupNamespace, leaf: readback.leaf,
+                });
+            }
         },
     });
 }

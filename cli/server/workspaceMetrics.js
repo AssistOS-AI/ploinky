@@ -7,6 +7,11 @@ import { getAgentsRegistry } from '../sandbox/docker/containerRegistry.js';
 import { getRuntime } from '../sandbox/docker/common.js';
 import { applyRuntimeReadinessProjection } from '../utils/noWaitReadiness.js';
 import { aggregateProcessTreeMetrics } from './workspaceProcessMetrics.js';
+import { AppliedLimitsCache, parseMemoryUsage, limitsUsage } from './workspaceMetricsLimits.mjs';
+import { readAppliedObservation } from '../sandbox/hardwareLimits/runtimeState.mjs';
+import { readBoxHardwareContext } from '../sandbox/hardwareLimits/context.mjs';
+import { readRoutingConfig } from './routingFile.js';
+import { metricHardwareAvailability } from './workspaceMetricsAvailability.mjs';
 
 const RECONCILE_INTERVAL_MS = 5_000;
 const SAMPLE_INTERVAL_MS = 2_000;
@@ -70,6 +75,17 @@ class WorkspaceMetricsMonitor extends EventEmitter {
     this.latest = null;
     this.reconcileInFlight = false;
     this.sampleInFlight = false;
+    this.hardwareEnabled = false;
+    this.hardwareAvailability = new Map();
+    this.appliedLimits = new AppliedLimitsCache({
+      inspect: async (target) => {
+        const { stdout } = await execFileAsync(getRuntime(), ['container', 'inspect', target], { encoding: 'utf8', timeout: 5_000, maxBuffer: 1024 * 1024 });
+        const records = JSON.parse(stdout);
+        if (!Array.isArray(records) || records.length !== 1) throw new Error('ambiguous metrics identity');
+        return records[0];
+      },
+      readVerified: readAppliedObservation,
+    });
     void this.reconcile();
     this.sampleTimer = setInterval(() => void this.sample(), SAMPLE_INTERVAL_MS);
     this.reconcileTimer = setInterval(() => void this.reconcile(), RECONCILE_INTERVAL_MS);
@@ -92,6 +108,18 @@ class WorkspaceMetricsMonitor extends EventEmitter {
       const registry = getAgentsRegistry() || {};
       const states = await collectAgentRuntimeStatesAsync({ registry });
       this.states = applyRuntimeReadinessProjection(states, registry);
+      this.hardwareEnabled = readBoxHardwareContext().gate === 'on';
+      if (this.hardwareEnabled) {
+        const routing = readRoutingConfig();
+        this.hardwareAvailability = new Map(this.states.map((entry) => [entry.containerName, metricHardwareAvailability(entry, registry[entry.containerName], routing)]));
+      }
+      if (this.hardwareEnabled) await this.appliedLimits.reconcile(this.states.map((entry) => ({
+        ...entry,
+        containerId: entry.containerId || entry.state?.containerId || '',
+        registryContainerId: registry[entry.containerName]?.containerId || '',
+        instanceId: registry[entry.containerName]?.instanceId,
+        enableGeneration: registry[entry.containerName]?.enableGeneration,
+      })));
     } catch (_) {
       this.publish();
       return;
@@ -149,6 +177,7 @@ class WorkspaceMetricsMonitor extends EventEmitter {
             available: true,
             cpuPercent: parsePercent(value.CPUPerc || value.CPU),
             memoryBytes: parseBytes(value.MemUsage || value.Mem),
+            ...(this.hardwareEnabled ? { memoryLimitBytes: parseMemoryUsage(value.MemUsage || value.Mem).memoryLimitBytes } : {}),
           });
         } catch (_) {}
       }
@@ -198,7 +227,18 @@ class WorkspaceMetricsMonitor extends EventEmitter {
           || unavailable;
       }
       if (['bwrap', 'seatbelt'].includes(entry.runtime) && entry.state?.running) metrics = this.hostMetrics.get(Number(entry.state.pid)) || unavailable;
-      return publicRuntimeEntry(entry, metrics);
+      const projected = publicRuntimeEntry(entry, metrics);
+      const limits = this.hardwareEnabled ? this.appliedLimits.values.get(entry.containerName) : null;
+      if (limits) {
+        projected.limits = limits;
+        projected.metrics = limitsUsage(metrics, limits);
+      }
+      const hardware = this.hardwareEnabled ? this.hardwareAvailability.get(entry.containerName) : null;
+      if (hardware) {
+        Object.assign(projected, hardware);
+        if (['refused', 'blocked', 'failed', 'stopped'].includes(hardware.availability)) projected.state.ready = false;
+      }
+      return projected;
     });
     const total = runtimes.reduce((sum, entry) => ({
       cpuPercent: sum.cpuPercent + (entry.metrics.available ? entry.metrics.cpuPercent : 0),

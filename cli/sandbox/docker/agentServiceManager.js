@@ -1353,8 +1353,10 @@ export function runHardwareGuardedLaunch(hardwareLaunch, {
     buildCreateArgs,
     spawnCreate,
     launch,
+    beforeMutation = () => {},
 }) {
     const createContainer = (plan, launchState, createOptions) => {
+        beforeMutation();
         const guarded = hardwareLaunch.createArgs(buildCreateArgs(plan, launchState));
         if (placed) removeStaleLeaves();
         return spawnCreate(guarded, launchState, createOptions);
@@ -1376,7 +1378,7 @@ export function verifyReusableHardwareRuntime(runtimeAdmission, {
     },
 } = {}) {
     try {
-        createGuard(runtimeAdmission, { key, ref, alias, runtime, query }).afterLaunch({ containerId, adopted: true });
+        createGuard(runtimeAdmission, { key, observationKey: containerName, ref, alias, runtime, query, instanceId: record.instanceId, enableGeneration: record.enableGeneration }).afterLaunch({ containerId, adopted: true });
     } catch (error) {
         // A reused runtime is still an affected runtime. Revoke authorization
         // before removing only its captured immutable identity.
@@ -1498,9 +1500,12 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     }
     const hardwareLaunch = createHardwareLaunchGuard(runtimeAdmission, {
         key: hardwareInstanceKey,
+        observationKey: containerName,
         ref: `${repoName}/${agentName}`,
         alias: hardwareAlias || null,
         runtime,
+        instanceId: runtimeIdentity.instanceId,
+        enableGeneration: runtimeIdentity.enableGeneration,
         query: (command, queryArgs) => {
             const result = spawnSync(command, queryArgs, { encoding: 'utf8', timeout: 10_000 });
             return { ok: result.status === 0 && !result.error, stdout: String(result.stdout || '') };
@@ -2580,6 +2585,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     // A refusal or a stale admission removes this candidate in the cleanup
     // below.
     runHardwareGuardedLaunch(hardwareLaunch, {
+        beforeMutation: options.beforeHardwareMutation,
         placed: Boolean(runtimeAdmission.descriptor.hardwarePlacement),
         removeStaleLeaves: () => removeStaleHardwareLeaves(runtime),
         buildCreateArgs,
@@ -2598,7 +2604,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                     runtimeIdentity,
                     inspectAdoption: inspectGeneratedRouterAdoption,
                     networkLockWaitMs: options.networkLockWaitMs,
-                    networkLifecycleCapability: options.networkLifecycleCapability,
+                        networkLifecycleCapability: options.networkLifecycleCapability,
+                        beforeDestructiveWork: options.beforeHardwareMutation,
                 };
                 const launched = adoptManagedRuntimeOnly
                     ? networkLifecycle.adoptManagedContainerTransaction(transaction)
@@ -2626,6 +2633,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             } else {
                 // All manifest/profile/port/image/mount validation above is complete.
                 // Only now is the old host/none container deliberately replaced.
+                options.beforeHardwareMutation?.();
                 cleanupReceipt = advanceCandidateLifecycle(cleanupReceipt, {
                     phase: 'predecessor-inspected',
                     inspectionComplete: true,
@@ -3474,7 +3482,8 @@ export function admitAgentServicePreflight(agentName, manifest, agentPath, optio
     // Every refusal this admission raises names the exact admitted instance:
     // the registry key (a staged replacement candidate belongs to it) and
     // the instance alias, as graph admission records them.
-    const hardwareInstanceKey = String(options.hardwareInstanceKey || '') || admittedInstanceKeyFor(preflightContainerName);
+    const hardwareInstanceKey = String(options.hardwareInstanceKey || '')
+        || (mutablePreflightRecord.type === 'agent' ? preflightContainerName : admittedInstanceKeyFor(preflightContainerName));
     const hardwareAlias = String(options.alias || preflightRecord.alias || '');
     const preflightProfile = resolveManifestRuntimeProfile(manifest, {
         agentName: `${preflightRepoName}/${agentName}`,
@@ -4188,6 +4197,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         try {
             return ensureAgentService(agentName, manifest, agentPath, {
                 ...options,
+                hardwareInstanceKey,
                 containerName: runtimeIdentity.candidateContainerName,
                 forceRecreate: true,
                 preservePreparedRegistryRecord: true,
@@ -4235,6 +4245,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     }
 
     if (targetedRestart) {
+        options.beforeHardwareMutation?.();
         const drainOptions = {
             runtime,
             reason: `coordinated-targeted-restart:${containerName}`,
@@ -4272,6 +4283,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             reuseStagedMounts: existingRuntimeAtEntry && !recreateReason,
             networkLifecycleCapability: options.networkLifecycleCapability,
             runtimeAdmission: options.runtimeAdmission || serviceAdmission,
+            beforeHardwareMutation: options.beforeHardwareMutation,
             preparedRegistryRecord: launchRecord,
             preservePreparedRegistryRecord,
             preparationLease: options.preparationLease,
@@ -4434,6 +4446,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             });
             return ensureAgentService(agentName, manifest, agentPath, {
                 ...options,
+                hardwareInstanceKey,
                 forceRecreate: true,
                 containerName: rotated.candidateContainerName,
                 preservePreparedRegistryRecord: true,

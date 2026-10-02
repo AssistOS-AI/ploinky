@@ -36,6 +36,7 @@ import {
     waitForReadyLine,
 } from '../../ploinky-box/lifecycle/container.mjs';
 import { reconcileBoxContainer } from '../../ploinky-box/lifecycle/transactions.mjs';
+import { hardwareStorePaths, initializeStore, readStoreSnapshot, setAgentLimits, assertGateOffStoreEmpty } from '../../cli/sandbox/hardwareLimits/store.mjs';
 import {
     agentLibFixture,
     agentLibFixtureEnv,
@@ -479,6 +480,44 @@ function harness(state, {
 
 function assertNoEngineVolumeCommand(calls) {
     assert.equal(calls.some((call) => call.includes('volume')), false);
+}
+
+for (const [name, failDuringReconcile] of [['G.first-enable-rollback-policy', false], ['G.first-enable-reconcile-failure-policy', true]]) {
+    test(name, async (t) => {
+        const state = fixture(t);
+        const paths = hardwareStorePaths({ identity: state.identity, homeDirectory: path.join(state.root, 'private-home') });
+        initializeStore({ paths, identity: state.identity });
+        const installPolicy = () => setAgentLimits({
+            paths, identity: state.identity, expectedToken: readStoreSnapshot({ paths, identity: state.identity }).token,
+            agentRef: 'demo/worker', limits: { cpus: 1 }, installedRefs: new Set(['demo/worker']),
+            capabilities: { gate: 'on', controllers: ['cpu'] }, envelope: { cpus: 8, memoryBytes: 8 * 1024 ** 3 },
+        });
+        const old = containerHandle({ identity: state.identity, agentLib: state.agentLib, repositoryRoot: state.root, imageId: 'd'.repeat(64), imageRef: BOX_IMAGE_REFERENCE, hostPort: 18080, id: 'e'.repeat(64) });
+        const h = harness(state, { initial: old, failCandidateReady: failDuringReconcile });
+        const ready = h.seams.startAndWaitReady;
+        if (failDuringReconcile) h.seams.startAndWaitReady = async (...args) => { installPolicy(); return ready(...args); };
+        let checks = 0;
+        const args = {
+            identity: state.identity, agentLib: state.agentLib, ownership: { state: 'owned', handles: { container: old } },
+            engine: { name: 'podman', identity: 'engine' }, runner: h.runner, lock: state.lock, repositoryRoot: state.root, explicitPort: 19090,
+            assertGateOffRestore: () => {
+                checks++;
+                assert.equal(h.current(), null, 'candidate writers are gone before reading policy');
+                return assertGateOffStoreEmpty({ paths, identity: state.identity });
+            },
+        };
+        if (failDuringReconcile) await assert.rejects(reconcileBoxContainer(args, h.seams), /agents have stored hardware limits/);
+        else {
+            const prepared = await reconcileBoxContainer(args, h.seams);
+            installPolicy();
+            await assert.rejects(prepared.rollback(), /agents have stored hardware limits/);
+        }
+        assert.equal(checks, 1, 'both restoration paths invoke the shared guard');
+        assert.equal(h.current(), null, 'a gate-off Box was not restored');
+        assert.equal(h.calls.filter((call) => call.includes('create')).length, 1);
+        assert.equal(readStoreSnapshot({ paths, identity: state.identity }).agents.size, 1, 'saved policy survives');
+        assert.equal(fs.existsSync(paths.barrierPath), false, 'first enable has no downgrade barrier');
+    });
 }
 
 function imageAgentLibFixture(commit = canonicalAgentLibRemote().commit) {

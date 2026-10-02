@@ -46,6 +46,7 @@ export function readBoxHardwareContext({
     procRoot = '/proc',
     query = defaultQuery,
     now = () => Date.now(),
+    refreshBackend = false,
 } = {}) {
     const marker = readBoxHardwareMarker({ markerPath, fsApi });
     if (!marker.present) {
@@ -68,7 +69,7 @@ export function readBoxHardwareContext({
         snapshot = { status: 'unreadable', diagnostic: 'the bound store is not the store this Box was wired to', agents: new Map(), token: null };
     }
     let delegation;
-    if (backendCache && now() - backendCache.at < BACKEND_CACHE_MS) {
+    if (!refreshBackend && backendCache && now() - backendCache.at < BACKEND_CACHE_MS) {
         delegation = backendCache.value;
     } else {
         delegation = readDelegationState({ gate: 'on', fsApi, cgroupRoot, procRoot, query });

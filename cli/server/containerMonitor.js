@@ -1786,6 +1786,7 @@ export async function performContainerRestart(monitor, target, reason, attempt =
             });
         }
         result = await Promise.resolve(ensureAgentServiceImpl(target.agentName, manifest, agentDir, {
+            hardwareInstanceKey: target.containerName,
             containerName: target.containerName,
             commandHint: `ploinky restart ${target.alias || target.agentName}`,
             networkLockWaitMs: 0,

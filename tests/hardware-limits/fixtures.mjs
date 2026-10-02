@@ -365,10 +365,23 @@ export function buildRequiredCaseManifest() {
             'R.cas-conflict', 'R.alias-canonical', 'R.two-aliases', 'R.alias-router', 'R.exact-key-only',
             'R.stale-identity', 'R.no-op', 'R.dedup', 'R.concurrent-entry-order', 'R.partial-apply',
             'R.barrier-apply-only',
+            'R.unlimited-and-stopped-no-op', 'R.authority-under-store-lock', 'R.cooperative-timeout-releases-real-lease',
+            'R.cli-token-recheck-before-create', 'R.authorization-after-lock-wait',
         ]),
         ...leaves(P, 'p2', unit('workspaceMetricsLimits.test.mjs'), [
             'M.memory-both-halves', 'M.cpu-fraction', 'M.separate-assurance', 'M.inspect-identity-cache',
             'M.no-full-environment', 'M.off-shape',
+            'M.late-proof-and-generation-change',
+        ]),
+        ...leaves(P, 'p2', unit('preparedRuntimeCleanup.test.mjs'), [
+            'R.promoted-ready-zero-port-clears-availability-and-keeps-proof',
+            'R.ordinary-ready-repair-clears-availability',
+        ]),
+        ...leaves(P, 'p2', unit('networkLifecycle.test.mjs'), [
+            'R.managed-policy-before-predecessor-stop-and-remove',
+        ]),
+        ...leaves(P, 'p2', unit('ploinkyBoxTransactions.test.mjs'), [
+            'G.first-enable-rollback-policy', 'G.first-enable-reconcile-failure-policy',
         ]),
         ...leaves(X, 'p3', 'explorer/tests/unit/hardwareLimitsPanel.test.js', [
             'X.exact-payload', 'X.fresh-proof', 'X.conflict-keeps-edits', 'X.pending-applied',

@@ -729,10 +729,12 @@ function prepareMutation({ paths, identity, expectedToken, fsApi, now }) {
 export function setAgentLimits({
     paths, identity, expectedToken, agentRef, limits, actor = null,
     installedRefs, capabilities, envelope, fsApi = fs, faults = {}, now = () => new Date(), lockOptions: lockOverrides,
+    beforeCommit = () => true,
 } = {}) {
     const lock = acquireStoreLock(lockOptions(paths, 'set_agent_limits', { lockOptions: lockOverrides }));
     try {
         const snapshot = prepareMutation({ paths, identity, expectedToken, fsApi, now });
+        if (beforeCommit() !== true) fail('The authenticated authority changed while waiting for the policy lock.', { code: 'identity_changed' });
         let validated;
         try {
             validated = validateAgentLimits({ agentRef, limits, installedRefs, capabilities, envelope });
@@ -753,11 +755,13 @@ export function setAgentLimits({
 
 export function clearAgentLimits({
     paths, identity, expectedToken, agentRef, actor = null, fsApi = fs, faults = {}, now = () => new Date(), lockOptions: lockOverrides,
+    beforeCommit = () => true,
 } = {}) {
     validateAgentRef(agentRef);
     const lock = acquireStoreLock(lockOptions(paths, 'clear_agent_limits', { lockOptions: lockOverrides }));
     try {
         const snapshot = prepareMutation({ paths, identity, expectedToken, fsApi, now });
+        if (beforeCommit() !== true) fail('The authenticated authority changed while waiting for the policy lock.', { code: 'identity_changed' });
         const agents = new Map(snapshot.agents);
         const before = agents.get(agentRef) || null;
         agents.delete(agentRef);

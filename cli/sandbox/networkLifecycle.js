@@ -1029,6 +1029,7 @@ export function createNetworkLifecycleAdapter({
         networkLockWaitMs = NETWORK_LOCK_WAIT_MS,
         networkLifecycleCapability,
         commandPrefix = [],
+        beforeDestructiveWork = null,
     }) {
         if (typeof createContainer !== 'function') throw new Error('managed container transaction requires createContainer');
         if (inspectAdoption !== null && typeof inspectAdoption !== 'function') {
@@ -1067,6 +1068,7 @@ export function createNetworkLifecycleAdapter({
             let plan = null;
             let launch = null;
             try {
+                beforeDestructiveWork?.({ kind: 'prepare-network', containerName });
                 plan = prepareFromPreflight(checked);
                 if (previous && inspectAdoption
                     && hasRequiredLabels(labelsOf(previous), agentLabels)
@@ -1105,6 +1107,7 @@ export function createNetworkLifecycleAdapter({
                     assertRequiredLabels(containerName, labelsOf(current), ownershipLabels);
                     const previousDescriptor = captureGeneratedRouterDescriptorArtifact(current);
                     if (previous?.State?.Running === true || previous?.State?.Status === 'running') {
+                        beforeDestructiveWork?.({ kind: 'stop', containerName, containerId: previousId });
                         const stopped = execute(['stop', previousId]);
                         if (!stopped.ok) {
                             const reconciled = inspectContainer(previousId);
@@ -1125,6 +1128,7 @@ export function createNetworkLifecycleAdapter({
                             );
                         }
                     }
+                    beforeDestructiveWork?.({ kind: 'remove', containerName, containerId: previousId });
                     const removed = execute(['rm', '-f', previousId]);
                     if (!removed.ok && !missing(removed)) {
                         throw new Error(`cannot remove predecessor '${containerName}' for managed replacement: ${failure(removed)}`);
