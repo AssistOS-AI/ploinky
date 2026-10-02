@@ -5,6 +5,7 @@ import path from 'node:path';
 import { domainToASCII } from 'node:url';
 import { assertWorkspaceMutationLease } from '../utils/runtime/maintenanceLocks.js';
 import { assertNetworkLifecycleCapability } from './networkLifecycle.js';
+import { recordOwnedEdgeSelection } from './edgeSelectionMutations.mjs';
 
 import {
     AGENTS_FILE,
@@ -1611,7 +1612,7 @@ function selectInactiveCandidate(paths, expected, generationId, reason) {
         activationId: crypto.randomUUID(),
         changedAt: new Date().toISOString(),
     });
-    atomicWrite(paths.activeSelectorFile, Buffer.from(JSON.stringify(selector, null, 2)), { mode: 0o600 });
+    writeOwnedEdgeSelector(paths, selector);
     return deepFreeze(selector);
 }
 
@@ -1655,6 +1656,12 @@ export function prepareHostModeCapabilityForInactiveGeneration(owner, options = 
     return createPreparedHostModeCapability(paths, selector, generation, exact, preparationLease);
 }
 
+function writeOwnedEdgeSelector(paths, selector) {
+    const before = readSelector(paths);
+    atomicWrite(paths.activeSelectorFile, Buffer.from(JSON.stringify(selector, null, 2)), { mode: 0o600 });
+    recordOwnedEdgeSelection({ selectorFile: paths.activeSelectorFile, before, after: selector });
+}
+
 function sealSelector(selector) {
     return {
         ...selector,
@@ -1680,7 +1687,7 @@ export function inactivateEdgeRoutingGeneration(reason = 'candidate-change', opt
             activationId: crypto.randomUUID(),
             changedAt: new Date().toISOString(),
         });
-        atomicWrite(paths.activeSelectorFile, Buffer.from(JSON.stringify(selector, null, 2)), { mode: 0o600 });
+        writeOwnedEdgeSelector(paths, selector);
         return deepFreeze(selector);
     } finally {
         release();
@@ -2581,7 +2588,7 @@ export function applyEdgeRoutingGeneration(options = {}) {
             throw edgeError('edge selector changed before authorization commit', 'EDGE_GENERATION_RACE');
         }
         if (preparationLease) removePreparationLease(paths, preparationLease);
-        atomicWrite(paths.activeSelectorFile, Buffer.from(JSON.stringify(selector, null, 2)), { mode: 0o600 });
+        writeOwnedEdgeSelector(paths, selector);
         return { selector: deepFreeze(selector), generation, topology, paths };
     } catch (error) {
         if (transactionStarted && applyLockHeld) {
@@ -2790,7 +2797,7 @@ export function commitAdditiveEdgeRoutingGeneration(preparationLease, options = 
             options.testHooks.afterBeforeSelectorCommit({ paths, generation, topology, selector });
         }
         assertPreparedSelectorStillSelected(paths, lease);
-        atomicWrite(paths.activeSelectorFile, Buffer.from(JSON.stringify(selector, null, 2)), { mode: 0o600 });
+        writeOwnedEdgeSelector(paths, selector);
         selectorCommitted = true;
         removePreparationLease(paths, lease);
         return { selector: deepFreeze(selector), generation, topology, paths };

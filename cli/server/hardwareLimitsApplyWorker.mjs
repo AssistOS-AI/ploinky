@@ -9,6 +9,7 @@ export function hardwareApplyFlight() { return current ? structuredClone(current
 
 export async function runHardwareLimitsApplyWorker(input, {
     WorkerClass = Worker, timeoutMs = 15 * 60 * 1000, onPlan = () => {}, authorize = () => true,
+    onOwnedSelection = () => false,
 } = {}) {
     validateHardwareRequest({ action: 'apply', ...input });
     if (Buffer.byteLength(JSON.stringify(input)) > 16 * 1024) throw Object.assign(new Error('Apply transport exceeds 16 KiB.'), { code: 'invalid_limits', status: 400 });
@@ -38,7 +39,11 @@ export async function runHardwareLimitsApplyWorker(input, {
             timer.unref?.();
             worker.on('message', async (message) => {
                 if (settled || message?.type === 'log') return;
-                if (message?.type === 'authorize') {
+                if (message?.type === 'owned-selection') {
+                    try {
+                        if (onOwnedSelection(message.receipt) !== true) cancel(new Error('Apply routing transition does not belong to this operation.'));
+                    } catch (error) { cancel(error); }
+                } else if (message?.type === 'authorize') {
                     if (!Number.isSafeInteger(message.requestId) || message.requestId <= 0) { cancel(new Error('Invalid authorization request.')); return; }
                     let allowed = false;
                     try { allowed = Atomics.load(control, 0) === 0 && await authorize() === true; } catch (_) {}

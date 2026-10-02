@@ -33,6 +33,7 @@ import { authService, LOCAL_AUTH_COOKIE_NAME, parseCookies, sendJson, sessionTok
 import { localSessionAllowedForRoutePlan } from './authContext.js';
 import { findHardwareOutcome, formatHardwareOutcome } from '../../sandbox/hardwareLimits/errors.mjs';
 import { handleHardwareLimitsRoutes } from './hardwareLimitsRoutes.mjs';
+import { readEdgeRoutingSelection } from '../../sandbox/edgeGeneration.js';
 
 export const MARKETPLACE_PATH = '/api/marketplace';
 export const MARKETPLACE_AGENT_TARGET = 'ploinky-router';
@@ -570,6 +571,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
                     : verifyAdminMutationRequest(request, request.sessionId);
             },
             verifyLease: () => !routePlan?.lease?.commit || routePlan.lease.commit() === true,
+            readSelection: readEdgeRoutingSelection,
         });
     }
 

@@ -19,6 +19,7 @@ import { workspaceMetricsMonitor } from '../workspaceMetrics.js';
 import { resolveManifestRuntimeProfile } from '../../utils/runtime/profileService.js';
 import { resolveLlmRuntimeAdmissionContext } from '../../sandbox/docker/llmRuntimeIntegration.js';
 import { isSessionRevoked } from '../auth/sessionRevocations.js';
+import { createHardwareApplyAuthority } from '../hardwareLimitsApplyAuthority.mjs';
 
 export const HARDWARE_HELP = Object.freeze({
     authority: 'Workspace-capable agents may read the workspace master key and forge administrator cookie/CSRF requests. This exposure is accepted for v1.',
@@ -148,6 +149,7 @@ export async function handleHardwareLimitsRoutes(req, res, parsedUrl, {
     getRegistry = readAgentRegistrySnapshot, getRouting = readRoutingConfig,
     getMetrics = () => workspaceMetricsMonitor.latest, apply = runHardwareLimitsApplyWorker,
     set = setAgentLimits, clear = clearAgentLimits, admit = defaultAdmission, verifyLease = () => true,
+    readSelection = null,
 } = {}) {
     const send = (status, body) => { res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(body)); };
     if (hasHardwareBearer(req)) { send(403, { ok: false, error: 'agent_forbidden' }); return true; }
@@ -174,14 +176,16 @@ export async function handleHardwareLimitsRoutes(req, res, parsedUrl, {
         if (!context.paths || context.gate !== 'on') fail('hardware_limits_off', 'On the host run PLOINKY_BOX_HARDWARE_LIMITS=on ploinky restart.', 409);
         assertPolicyWritesAllowed({ paths: context.paths });
         const actor = { id: String(req.user?.id || '').slice(0, 256), name: String(req.user?.username || req.user?.name || '').slice(0, 256) };
+        const authority = body.action === 'apply' && readSelection ? createHardwareApplyAuthority({ readSelection, verifyInitial: verifyLease }) : null;
         const authorize = () => {
             const signed = req.session?._jwtPayload;
             if ((req.session?.expiresAt && Date.now() >= req.session.expiresAt) || (signed?.exp && Date.now() / 1000 >= signed.exp)
                 || isSessionRevoked({ sid: signed?.sid || req.sessionId, jti: signed?.jti })) return false;
-            return verifyLease() === true && verifyMutation(req)?.ok === true;
+            return (authority ? authority.isCurrent() : verifyLease() === true) && verifyMutation(req)?.ok === true;
         };
         if (body.action === 'apply') {
             const result = await apply({ expectedToken: body.expectedToken, containers: body.containers }, {
+                onOwnedSelection: (receipt) => authority?.accept(receipt) === true,
                 authorize: async () => {
                     if (!authorize()) return false;
                     const silentResponse = { writeHead() {}, end() {} };
