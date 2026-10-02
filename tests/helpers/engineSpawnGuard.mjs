@@ -5,11 +5,12 @@
 //
 // - A child-process call that would run one of these programs is refused
 //   with an error: named directly, through a wrapper (env, sh -c, bash -c,
-//   xargs, ...) or anywhere in a shell command line. A lookup such as
+//   xargs, ...) or as a command of a shell line. A lookup such as
 //   `command -v podman` runs nothing and is allowed.
 // - Descendants are guarded too: Node children load this guard through
-//   NODE_OPTIONS, and every child finds failing stubs for these programs
-//   first on PATH, so a native or deeper spawn is refused as well.
+//   NODE_OPTIONS, and wherever a child's PATH would run a real one of these
+//   programs a failing stub is found first, so a native or deeper spawn is
+//   refused as well; an absent program stays absent.
 // - Every refusal is recorded in a per-process ledger that is passed on to
 //   the parent's ledger, and a process whose ledger is not empty exits
 //   non-zero, so a refusal the code under test swallowed still fails the
@@ -29,7 +30,6 @@ const WRAPPERS = new Set(['env', 'sh', 'bash', 'zsh', 'dash', 'ksh', 'xargs', 'n
 const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'busybox']);
 const GUARD_URL = import.meta.url;
 const LOG_ENV = 'PLOINKY_ENGINE_GUARD_LOG';
-const BIN_ENV = 'PLOINKY_ENGINE_GUARD_BIN';
 
 let temporaryRoot = os.tmpdir();
 try { temporaryRoot = fs.realpathSync(temporaryRoot); } catch (_) {}
@@ -37,22 +37,51 @@ const parentLog = process.env[LOG_ENV] || '';
 const ownDirectory = fs.mkdtempSync(path.join(temporaryRoot, 'engine-guard-'));
 const ownLog = path.join(ownDirectory, 'violations.log');
 fs.writeFileSync(ownLog, '', { mode: 0o600 });
-let binDirectory = process.env[BIN_ENV] || '';
-if (!binDirectory || !fs.existsSync(path.join(binDirectory, GUARDED_PROGRAMS[0]))) {
-    binDirectory = path.join(ownDirectory, 'bin');
-    fs.mkdirSync(binDirectory, { mode: 0o700 });
+
+const underTemporaryRoot = (target) => {
+    let real = target;
+    try { real = fs.realpathSync(target); } catch (_) {}
+    return real.startsWith(`${temporaryRoot}${path.sep}`) && !real.startsWith(`${ownDirectory}${path.sep}`);
+};
+// The guarded programs a PATH would really run: found and executable, and
+// not a test-owned fake under the test temporary directory. Only those are
+// shadowed, so a lookup of a program that is absent still finds nothing.
+function realProgramsOn(searchPath) {
+    const found = [];
     for (const program of GUARDED_PROGRAMS) {
-        fs.writeFileSync(path.join(binDirectory, program), '#!/bin/sh\n'
+        for (const directory of String(searchPath || '').split(path.delimiter).filter(Boolean)) {
+            const candidate = path.join(directory, program);
+            try { fs.accessSync(candidate, fs.constants.X_OK); } catch (_) { continue; }
+            if (!underTemporaryRoot(candidate)) found.push(program);
+            break;
+        }
+    }
+    return found;
+}
+const stubDirectories = new Map();
+function stubDirectoryFor(programs) {
+    const key = programs.join(',');
+    if (stubDirectories.has(key)) return stubDirectories.get(key);
+    const directory = path.join(ownDirectory, `bin-${stubDirectories.size}`);
+    fs.mkdirSync(directory, { mode: 0o700 });
+    for (const program of programs) {
+        fs.writeFileSync(path.join(directory, program), '#!/bin/sh\n'
             + `printf '%s\\n' "[engine-spawn-guard] a test process ran ${program}" >&2\n`
             + `[ -n "$${LOG_ENV}" ] && printf '%s\\n' "[engine-spawn-guard] a test process ran ${program} (native)" >> "$${LOG_ENV}"\n`
             + 'exit 97\n', { mode: 0o755 });
     }
+    stubDirectories.set(key, directory);
+    return directory;
 }
-
+const isStubDirectory = (entry) => entry.startsWith(`${ownDirectory}${path.sep}bin-`) || /\/engine-guard-[^/]+\/bin-\d+$/.test(entry);
+function withGuardPath(value) {
+    if (value === undefined || value === null) return value;
+    const entries = String(value).split(path.delimiter).filter((entry) => entry && !isStubDirectory(entry));
+    const programs = realProgramsOn(entries.join(path.delimiter));
+    return (programs.length ? [stubDirectoryFor(programs), ...entries] : entries).join(path.delimiter);
+}
 const withGuardOptions = (value = '') => (String(value || '').includes(GUARD_URL) ? String(value) : `${String(value || '')} --import=${GUARD_URL}`.trim());
-const withGuardPath = (value = '') => [binDirectory, ...String(value || '').split(path.delimiter).filter((entry) => entry && entry !== binDirectory)].join(path.delimiter);
 process.env[LOG_ENV] = ownLog;
-process.env[BIN_ENV] = binDirectory;
 process.env.PATH = withGuardPath(process.env.PATH);
 process.env.NODE_OPTIONS = withGuardOptions(process.env.NODE_OPTIONS);
 
@@ -60,19 +89,33 @@ export function isGuardedCommand(command) {
     const text = String(command || '').replace(/^['"]|['"]$/g, '');
     if (!guarded.has(path.basename(text))) return false;
     // A test-owned fake under the test temporary directory is allowed.
-    if (path.isAbsolute(text)) {
-        let real = text;
-        try { real = fs.realpathSync(text); } catch (_) {}
-        if (real.startsWith(`${temporaryRoot}${path.sep}`) && !real.startsWith(`${binDirectory}${path.sep}`)) return false;
-    }
-    return true;
+    return !(path.isAbsolute(text) && underTemporaryRoot(text));
 }
 
-// The words a shell would run: lookups (command -v, which, type, hash) run
-// nothing, and assignments are not programs.
-function shellWords(line) {
-    const withoutLookups = String(line || '').replace(/\b(?:command\s+-[vV]|which|type|hash)\s+\S+/g, ' ');
-    return withoutLookups.split(/[\s;&|()<>`$'"\\{}]+/).filter(Boolean).filter((word) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(word));
+// The programs a shell line runs: the first word of each command, after
+// assignments, keywords and wrappers. Lookups (command -v, which, type,
+// hash) and words in argument positions run nothing.
+const SHELL_PREFIXES = new Set(['if', 'then', 'else', 'elif', 'do', 'while', 'until', '!', '{', 'time', 'exec', 'nohup', 'env', 'builtin', 'xargs', 'sudo', 'doas', 'nice', 'ionice', 'timeout', 'stdbuf', 'setsid', 'unbuffer', 'command']);
+function shellCommands(line) {
+    const commands = [];
+    for (const segment of String(line || '').split(/\|\||&&|[;|&\n()`]|\$\(/)) {
+        const words = segment.trim().split(/\s+/).filter(Boolean).map((word) => word.replace(/^['"]|['"]$/g, ''));
+        let index = 0;
+        while (index < words.length) {
+            const word = words[index];
+            if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) { index += 1; continue; }
+            if ((word === 'command' && /^-[vV]$/.test(words[index + 1] || '')) || ['which', 'type', 'hash'].includes(word)) break;
+            if (SHELL_PREFIXES.has(word)) {
+                index += 1;
+                while (index < words.length && /^-/.test(words[index])) index += 1;
+                if (word === 'timeout' && /^\d/.test(words[index] || '')) index += 1;
+                continue;
+            }
+            commands.push(word);
+            break;
+        }
+    }
+    return commands;
 }
 
 // The guarded program an invocation would run, or null.
@@ -81,16 +124,16 @@ export function guardedProgramOf(name, args) {
     const options = [second, third].find((value) => value && typeof value === 'object' && !Array.isArray(value)) || {};
     const argv = Array.isArray(second) ? second.filter((value) => typeof value === 'string') : [];
     if (name === 'exec' || name === 'execSync' || options.shell) {
-        return shellWords([first, ...argv].filter((value) => typeof value === 'string').join(' ')).find(isGuardedCommand) || null;
+        return shellCommands([first, ...argv].filter((value) => typeof value === 'string').join(' ')).find(isGuardedCommand) || null;
     }
     const program = typeof first === 'string' ? first : '';
     if (isGuardedCommand(program)) return program;
     const base = path.basename(program);
     if (!WRAPPERS.has(base)) return null;
-    const direct = argv.find(isGuardedCommand);
-    if (direct) return direct;
-    if (SHELLS.has(base) && argv.includes('-c')) return shellWords(argv[argv.indexOf('-c') + 1]).find(isGuardedCommand) || null;
-    return null;
+    if (SHELLS.has(base)) return argv.includes('-c') ? shellCommands(argv[argv.indexOf('-c') + 1]).find(isGuardedCommand) || null : null;
+    // A wrapper runs its first non-option, non-assignment operand.
+    const operand = argv.find((value) => !/^-/.test(value) && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(value) && !/^\d+(\.\d+)?[smhd]?$/.test(value));
+    return operand && isGuardedCommand(operand) ? operand : null;
 }
 
 const violations = [];
@@ -111,7 +154,8 @@ function guardChildEnvironment(args) {
     if (index === undefined || !args[index].env) return args;
     const argv = Array.isArray(args[1]) ? args[1] : [];
     const independent = argv.some((value) => typeof value === 'string' && value.includes('engineSpawnGuard'));
-    const env = { ...args[index].env, PATH: withGuardPath(args[index].env.PATH), NODE_OPTIONS: withGuardOptions(args[index].env.NODE_OPTIONS), [BIN_ENV]: binDirectory };
+    const env = { ...args[index].env, NODE_OPTIONS: withGuardOptions(args[index].env.NODE_OPTIONS) };
+    if (env.PATH !== undefined) env.PATH = withGuardPath(env.PATH);
     if (independent) delete env[LOG_ENV]; else env[LOG_ENV] = ownLog;
     const next = [...args];
     next[index] = { ...args[index], env };
