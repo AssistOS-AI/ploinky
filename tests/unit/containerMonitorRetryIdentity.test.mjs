@@ -321,7 +321,7 @@ test('successive failed replacements reach the circuit breaker instead of resett
 // The failure counterpart of acknowledging readiness: a failed restart ends its
 // launching operation, so its GPU share (or share-less readiness) owner must not
 // stay live in the Router process for as long as it runs.
-test('a failed restart releases the launching MPS owner of its result', async t => {
+test('MON.a-failed-restart-releases-the-launching-mps-owner-of-its-result', async t => {
     const { mpsLaunchOwner, mpsOwnerState } = await import('../../cli/sandbox/hardwareLimits/mpsInventory.mjs');
     const { state, monitor, target } = fixture(t);
     const owner = mpsLaunchOwner();

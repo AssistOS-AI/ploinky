@@ -325,7 +325,7 @@ export function buildRequiredCaseManifest() {
         ...leaves(P, 'p0', unit('containerMonitorAdmission.test.mjs'), [
             'MON.refused-terminal', 'MON.blocked-terminal', 'MON.unchanged-no-retry', 'MON.repair-fingerprint',
         ]),
-        ...leaves(P, 'p0', unit('containerMonitorRetryIdentity.test.mjs'), ['MON.unrelated-write-no-rearm', 'a failed restart releases the launching MPS owner of its result']),
+        ...leaves(P, 'p0', unit('containerMonitorRetryIdentity.test.mjs'), ['MON.unrelated-write-no-rearm', 'MON.a-failed-restart-releases-the-launching-mps-owner-of-its-result']),
         ...leaves(P, 'p0', unit('marketplaceEnableWorker.test.mjs'), [
             'E.cli-cause', 'E.marketplace-outbound', 'E.marketplace-inbound', 'E.bounded-secret-free',
             'E.max-ref-roundtrip', 'E.long-key-roundtrip',
