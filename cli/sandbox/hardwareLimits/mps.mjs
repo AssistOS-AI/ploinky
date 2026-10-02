@@ -95,7 +95,7 @@ export function configureMpsDefaults(value, { control = runMpsControl, env, uid 
     const sm = parseMpsSmReply(smReply);
     const memoryReply = control('get_default_device_pinned_mem_limit 0', options); onReadback('memory', memoryReply);
     const memoryBytes = parseMpsMemoryReply(memoryReply);
-    if (sm !== value.smPercent || memoryBytes !== value.memoryMiB * 1048576) throw new MpsError(`MPS default readback does not match configuration (requested ${value.smPercent}% and ${value.memoryMiB}M; read ${sm}% and ${memoryBytes} bytes)`);
+    if (sm !== value.smPercent || memoryBytes !== value.memoryMiB * 1048576) throw new MpsError(`MPS default readback does not match configuration (requested ${value.smPercent}% and ${value.memoryMiB}M; read ${sm}% and ${memoryBytes} bytes; SM (reply: "${replyExcerpt(smReply)}"), memory (reply: "${replyExcerpt(memoryReply)}"))`);
     const serverReply = control('get_server_list', options); onReadback('servers', serverReply);
     for (const pid of parseMpsServerList(serverReply)) if (verifyServer(pid) !== true) throw new MpsError(`MPS server process ownership is not proven (server ${pid}${explainServer(pid) ? `: ${explainServer(pid)}` : ''})`);
     return Object.freeze({ smPercent: sm, memoryMiB: value.memoryMiB });

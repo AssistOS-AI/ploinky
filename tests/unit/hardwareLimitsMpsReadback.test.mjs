@@ -7,8 +7,9 @@ import test from 'node:test';
 import { applyHardwareLimits } from '../../cli/sandbox/hardwareLimits/reconcile.mjs';
 import { coordinateMpsLifecycle } from '../../cli/sandbox/hardwareLimits/mpsLifecycle.mjs';
 import { readMpsLaunch } from '../../cli/sandbox/hardwareLimits/mpsLaunch.mjs';
-import { configureMpsDefaults, createMpsDaemonBackend, mpsClientEnvironment, mpsServerDefaultMemoryMiB, parseMpsMemoryReply, parseMpsServerList, parseMpsSmReply, runMpsControl, validateMpsServerDefault } from '../../cli/sandbox/hardwareLimits/mps.mjs';
+import { configureMpsDefaults, createMpsDaemonBackend, mpsClientArgs, mpsClientEnvironment, mpsServerDefaultMemoryMiB, parseMpsMemoryReply, parseMpsServerList, parseMpsSmReply, runMpsControl, validateMpsServerDefault } from '../../cli/sandbox/hardwareLimits/mps.mjs';
 import { resolveMpsServerDefault } from '../../cli/sandbox/hardwareLimits/mpsTransition.mjs';
+import { classifyMpsReply } from '../hardware-limits/liveGpuCommands.mjs';
 import { replyExcerpt } from '../../cli/sandbox/hardwareLimits/applyCause.mjs';
 import { describeMpsTool, MPS_TOOL_PATHS } from '../../ploinky-box/lib/mpsTools.mjs';
 
@@ -35,13 +36,17 @@ function fakeHost() {
 
 // One Apply of the first share, with the real lifecycle and a real backend start over the fake host. `replies` are the
 // daemon's answers to the three queries.
-function world({ replies = {} } = {}) {
+function world({ replies = {}, share: desired = share, display = null } = {}) {
     const host = fakeHost();
     const queries = [];
+    let setMemory = null;
     const query = (_binary, args, options) => {
         if (args[0] === '-d') return { status: 0 };
         const command = String(options.input).trim(); queries.push(command);
-        const reply = command === 'get_default_active_thread_percentage' ? replies.sm ?? '25\n' : command === 'get_default_device_pinned_mem_limit 0' ? replies.memory ?? '1024M\n' : command === 'get_server_list' ? replies.servers ?? '' : '';
+        const set = /^set_default_device_pinned_mem_limit 0 (\d+)M$/.exec(command); if (set) setMemory = Number(set[1]);
+        // The observed display of the driver (595.91.07): a limit of at least 1 GiB is shown as floor(MiB/1024)G.
+        const shown = display === 'floor-gib' && setMemory !== null ? (setMemory >= 1024 ? `${Math.floor(setMemory / 1024)}G\n` : `${setMemory}M\n`) : null;
+        const reply = command === 'get_default_active_thread_percentage' ? replies.sm ?? `${desired.smPercent}\n` : command === 'get_default_device_pinned_mem_limit 0' ? replies.memory ?? shown ?? '1024M\n' : command === 'get_server_list' ? replies.servers ?? '' : '';
         return { status: 0, stdout: reply, stderr: '' };
     };
     // The 30 s deadline passes during the wait after the first refused attempt (the usual way the retries end).
@@ -51,20 +56,21 @@ function world({ replies = {} } = {}) {
     const registry = { a: record };
     let state = null;
     const dependencies = {
-        observeClients: () => [], readContext: () => ({ storeToken: token, overrides: new Map([['demo/a', { gpu: share }]]), gpu: { eligible: true, grant: { mps: host.descriptors } } }),
+        observeClients: () => [], readContext: () => ({ storeToken: token, overrides: new Map([['demo/a', { gpu: desired }]]), gpu: { eligible: true, grant: { mps: host.descriptors } } }),
         loadRegistry: () => registry, readApplied: () => null,
         loadPlan: () => ({ runtime: 'podman', manifest: {}, profile: { network: { mode: 'default' } }, image: 'prepared:tag' }),
         prepareImage: () => {}, inspectImage: () => ({ Id: imageId, Config: { User: '1000:1000' } }), resolveShare: policy => policy, policyCheck: () => {},
         store: { read: () => clone(state), write: value => { state = clone(value); } }, backend,
         network: async fn => fn({}), assertCapability: () => {}, drainClient: async () => {},
     };
-    const launchTarget = async next => { readMpsLaunch(next.mpsLaunch, 'a', share); return { containerName: 'a', containerId: 'c'.repeat(64) }; };
+    const launched = [];
+    const launchTarget = async next => { const launch = readMpsLaunch(next.mpsLaunch, 'a', desired); launched.push({ args: mpsClientArgs(desired, launch.state), state: launch.state }); return { containerName: 'a', containerId: 'c'.repeat(64) }; };
     const apply = () => applyHardwareLimits({ expectedToken: token, containers: ['a'] }, {
         lease: (_options, callback) => callback(), loadRegistry: () => clone(registry), loadRouting: () => ({ routes: {} }), readPolicy: () => ({ token }), policyCheck: () => {},
         loadPlan: () => ({}), isUnchanged: () => false,
         reconcile: (instance, options) => coordinateMpsLifecycle({ target: { key: instance.key, record: clone(registry[instance.key]) }, options: { onMpsPlan: options.onMpsPlan, onMpsResult: options.onMpsResult }, launchTarget }, dependencies),
     });
-    return { apply, queries, get state() { return state; } };
+    return { apply, queries, launched, get state() { return state; } };
 }
 
 test('W2.an-unsupported-memory-reply-fails-closed-and-its-sanitized-text-reaches-the-error-the-cause-the-journal-and-the-readback', async () => {
@@ -159,8 +165,12 @@ test('F1.a-deadline-with-no-refused-reply-is-reported-as-the-deadline-alone', ()
     assert.doesNotMatch(result.message, /last refused reply/);
 });
 
-// V1 (amendment A6): the daemon-wide memory default is a whole GiB; the driver reports it in whole GiB and is lossy below that.
-const share17 = { smPercent: 25, vramPercent: 17, vramMiB: 1044, memoryMiB: 1044, memoryBytes: 1044 * 1048576, deviceUuid: 'GPU-fixture', driverVersion: '595.91.07', wiringFingerprint: 'wiring' };
+// V1/V2 (amendment A6): the daemon-wide memory default is a whole GiB. The driver reports its memory default in whole GiB
+// and is lossy below that. LIVE-P1 attempt 5 captured it: the default 1044M read back as 1G.
+// Provenance of the pinned fixture: driver 595.91.07, RTX 3060 Laptop (6144 MiB), 2026-10-03, run id
+// 12ef3818df01c980cbe4caa4dd530493; control.log "get_default_active_thread_percentage" -> "25.0", "get_default_device_pinned_mem_limit 0" -> "1G".
+const CAPTURED = Object.freeze({ driver: '595.91.07', runId: '12ef3818df01c980cbe4caa4dd530493', sm: '25.0\n', memory: '1G\n' });
+const share17 = { smPercent: 25, vramPercent: 17, vramMiB: 1044, memoryMiB: 1044, memoryBytes: 1044 * 1048576, deviceUuid: 'GPU-fixture', driverVersion: CAPTURED.driver, wiringFingerprint: 'wiring' };
 const policies = (...shares) => shares.map(entry => ({ share: entry }));
 
 test('V1.the-server-default-memory-is-the-largest-share-rounded-up-to-a-whole-gib-and-keeps-the-share-it-came-from', () => {
@@ -189,4 +199,38 @@ test('V1.a-memory-default-that-is-not-a-whole-gib-is-refused-by-the-daemon-confi
         assert.throws(() => backend.start({ smPercent: 25, memoryMiB }, { tools: host.descriptors }), /Invalid MPS server defaults/, String(memoryMiB));
         assert.equal(calls.length, 0, 'the daemon is not started');
     }
+});
+
+test('V2.the-captured-driver-replies-are-pinned-and-normalize-exactly-in-the-product-parser-and-the-runner-classifier', () => {
+    assert.equal(CAPTURED.driver, '595.91.07');
+    assert.equal(parseMpsSmReply(CAPTURED.sm), 25);
+    assert.equal(parseMpsMemoryReply(CAPTURED.memory), 1073741824);
+    assert.deepEqual(classifyMpsReply(CAPTURED.sm), { form: 'integer-percentage', value: 25 });
+    assert.deepEqual(classifyMpsReply(CAPTURED.memory), { form: 'integer-with-M-or-G', bytes: 1073741824 });
+    // The observed display, as the fake daemon models it: floor(MiB/1024)G from 1 GiB up.
+    for (const [mib, shown] of [[1044, '1G\n'], [2048, '2G\n'], [3072, '3G\n']]) assert.equal(parseMpsMemoryReply(shown), Math.floor(mib / 1024) * 1073741824);
+});
+
+test('V2.a-seventeen-percent-share-of-a-6144-mib-gpu-is-applied-with-a-2048-mib-default-read-back-as-2g-and-a-1044m-client-env', async () => {
+    const w = world({ share: share17, display: 'floor-gib' });
+    const result = await w.apply();
+    assert.equal(result.status, 200, JSON.stringify(result).slice(0, 600));
+    assert.ok(w.queries.includes('set_default_device_pinned_mem_limit 0 2048M'), JSON.stringify(w.queries));
+    // The journal keeps the sanitized text, a newline shown as \\n.
+    assert.equal(w.state.lastReadback.memory, '2G\\n'); assert.equal(w.state.lastReadback.sm, '25\\n');
+    assert.deepEqual({ memoryMiB: w.state.serverDefault.memoryMiB, shareMemoryMiB: w.state.serverDefault.shareMemoryMiB }, { memoryMiB: 2048, shareMemoryMiB: 1044 });
+    assert.equal(w.launched.length, 1);
+    const env = w.launched[0].args.filter((_, index, all) => all[index - 1] === '--env');
+    assert.ok(env.includes('CUDA_MPS_PINNED_DEVICE_MEM_LIMIT=0=1044M'), env.join(' '));
+    assert.ok(env.includes('CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=25'), env.join(' '));
+});
+
+test('V2.a-daemon-that-answers-1g-for-a-configured-2048-mib-is-still-refused-and-the-message-carries-both-replies', async () => {
+    const w = world({ share: share17, replies: { memory: CAPTURED.memory } });
+    const result = await w.apply();
+    assert.equal(result.status, 422, JSON.stringify(result).slice(0, 400));
+    assert.equal(w.launched.length, 0);
+    const reason = result.results[0].problem.reason;
+    assert.match(reason, /MPS default readback does not match configuration \(requested 25% and 2048M; read 25% and 1073741824 bytes; SM \(reply: "25\\n"\), memory \(reply: "1G\\n"\)\)/);
+    assert.equal(result.results[0].cause.step, 'set-defaults');
 });
