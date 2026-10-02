@@ -34,6 +34,8 @@ const CHILD = String.raw`
     const inside = path.join(barrier, 'inside');
     const hooks = {
         crash(point) {
+            // A real crash: the process dies without recovery or lock release.
+            if (process.env.KILL_AT === point) process.kill(process.pid, 'SIGKILL');
             if (point === 'before-journal') {
                 // Only one process may ever be between the lock and its release.
                 try { fs.writeFileSync(inside, role, { flag: 'wx' }); } catch (error) { events.push({ violation: error.code, holder: fs.readFileSync(inside, 'utf8') }); }
@@ -59,7 +61,7 @@ const CHILD = String.raw`
             lock: { waitMs: Number(process.env.WAIT_MS) },
             hooks,
         });
-        result = { ok: true, installed: exported.installed, transaction: exported.transaction.status, exclusions: exported.exclusions?.status };
+        result = { ok: true, installed: exported.installed, transaction: exported.transaction.status, exclusions: exported.exclusions?.status, exclusionsCode: exported.exclusions?.code, recovery: exported.recovery?.status };
     } catch (error) {
         result = { ok: false, code: error.code, outcome: error.outcome, message: error.message };
     }
@@ -100,7 +102,7 @@ function fixture(t) {
     fs.mkdirSync(barrier);
     const child = (role, extra) => {
         const proc = spawn(process.execPath, ['--input-type=module', '-e', CHILD], {
-            cwd: base, env: { ...env, ...extra, ROLE: role, BARRIER: barrier, FOLDER: project }, stdio: ['ignore', 'pipe', 'pipe'],
+            cwd: base, env: { ...env, ROLE: role, BARRIER: barrier, FOLDER: project, ...extra }, stdio: ['ignore', 'pipe', 'pipe'],
         });
         let stdout = '';
         let stderr = '';
@@ -144,7 +146,23 @@ function fixture(t) {
         assert.equal(fs.existsSync(path.join(project, '.git', 'ploinky-skill-exports-config.lock')), false);
         assert.equal(fs.existsSync(path.join(barrier, 'inside')), false);
     };
-    return { base, project, skill, child, until, signal, assertConsistent };
+    // One child at a time, started only after it announced itself.
+    const sequential = async (role, extra) => {
+        const running = child(role, { ...extra, START: `go-${role}` });
+        await until(`ready-${role}`);
+        signal(`go-${role}`);
+        return running.done;
+    };
+    const folder = name => { const directory = path.join(project, name); fs.mkdirSync(directory, { recursive: true }); return directory; };
+    const ignored = relative => { try { git('check-ignore', '-q', '--', relative); return true; } catch (_) { return false; } };
+    const generated = (prefix, names) => [...names.map(name => `${prefix}/.agents/skills/${name}`), `${prefix}/.agents/.ploinky-skill-exports.json`, `${prefix}/.claude`];
+    const owners = () => Object.keys(JSON.parse(fs.readFileSync(path.join(project, '.git', 'ploinky-skill-exports.exclusions.json'), 'utf8')).owners).sort();
+    const assertQuiescent = () => {
+        assert.equal(git('status', '--porcelain', '--untracked-files=all'), '', 'every generated output is ignored');
+        assert.equal(fs.existsSync(path.join(project, '.git', 'ploinky-skill-exports-config.lock')), false, 'no stale common Git lock');
+        assert.equal(fs.existsSync(path.join(barrier, 'inside')), false);
+    };
+    return { base, project, skill, child, until, signal, assertConsistent, sequential, folder, ignored, generated, owners, assertQuiescent, git };
 }
 
 test('a second real exporter process reports the live holder as busy and changes nothing', async t => {
@@ -196,4 +214,65 @@ test('two real exporter processes started together publish one at a time and bot
         .sort((left, right) => left.enter - right.enter);
     assert.ok(a.leave <= b.enter, `sections overlap: ${JSON.stringify([a, b])}`);
     f.assertConsistent({ alpha: ['manifest', alpha], beta: ['defaults:other', beta] });
+});
+
+test('real exporter processes publishing different folders of one worktree keep every folder\'s rules', async t => {
+    const f = fixture(t);
+    const alpha = f.skill('alpha');
+    const folders = ['', 'one', 'two'];
+    f.folder('one'); f.folder('two');
+    const common = { WAIT_MS: '30000', DWELL_MS: '300' };
+    const children = folders.map(name => f.child(`folder-${name || 'root'}`, { ...common, OWNER: 'manifest', FOLDER: name ? path.join(f.project, name) : f.project, SOURCES: JSON.stringify([['alpha', alpha]]) }));
+    await Promise.all(folders.map(name => f.until(`ready-folder-${name || 'root'}`)));
+    f.signal('go');
+    const results = await Promise.all(children.map(item => item.done));
+    for (const { code, stderr, result } of results) {
+        assert.equal(code, 0, stderr);
+        assert.equal(result.ok, true, result.message);
+        assert.equal(result.transaction, 'committed');
+        assert.equal(result.exclusions, 'published');
+        assert.ok(result.events.every(event => !event.violation), JSON.stringify(result.events));
+    }
+    const sections = results.map(({ result }) => ({ enter: result.events.find(event => event.enter).enter, leave: result.events.find(event => event.leave).leave })).sort((left, right) => left.enter - right.enter);
+    for (let index = 1; index < sections.length; index++) assert.ok(sections[index - 1].leave <= sections[index].enter, `sections overlap: ${JSON.stringify(sections)}`);
+    assert.deepEqual(f.owners(), ['.', 'one', 'two']);
+    for (const prefix of ['one', 'two']) for (const target of f.generated(prefix, ['alpha'])) assert.ok(f.ignored(target), `${target} stays ignored`);
+    assert.ok(f.ignored('.agents/skills/alpha'));
+    assert.ok(f.ignored('.agents/.ploinky-skill-exports.json'));
+    f.assertQuiescent();
+    assert.equal(fs.readFileSync(path.join(f.project, '.agents', 'skills', 'mine', 'SKILL.md'), 'utf8'), '# mine\n', 'authored skill untouched');
+});
+
+test('a real exporter process killed between the managed file and its record leaves recoverable, never replaced, shared rules', async t => {
+    const f = fixture(t);
+    const alpha = f.skill('alpha');
+    const sources = JSON.stringify([['alpha', alpha]]);
+    f.folder('one'); f.folder('two');
+    const run = (role, folderName, extra = {}) => f.sequential(role, { WAIT_MS: '30000', OWNER: 'manifest', FOLDER: folderName ? path.join(f.project, folderName) : f.project, SOURCES: sources, ...extra });
+    const first = await run('root', '');
+    assert.equal(first.result.exclusions, 'published', first.stderr);
+    // The second folder's process dies by SIGKILL right after the managed file moved ahead of the record.
+    const killed = await run('killed', 'one', { KILL_AT: 'after-private-file' });
+    assert.equal(killed.result, null);
+    assert.equal(killed.code, null, 'terminated by a signal');
+    fs.rmSync(path.join(f.base, 'barrier', 'inside'), { force: true });
+    assert.ok(fs.existsSync(path.join(f.project, 'one', '.agents', '.ploinky-skill-exports.journal.json')), 'the crashed folder keeps its pending journal');
+    const managedTorn = fs.readFileSync(path.join(f.project, '.git', 'ploinky-skill-exports.exclude'), 'utf8');
+    // A third folder publishes while the crashed holder's locks are still on disk: it reclaims the dead locks
+    // and is refused, with nothing replaced.
+    const other = await run('other', 'two');
+    assert.equal(other.result.ok, true, other.result.message);
+    assert.equal(other.result.exclusions, 'relinquished');
+    assert.equal(other.result.exclusionsCode, 'managed-excludes-edited');
+    assert.equal(fs.readFileSync(path.join(f.project, '.git', 'ploinky-skill-exports.exclude'), 'utf8'), managedTorn);
+    assert.ok(f.ignored('.agents/skills/alpha'), 'the completed root stays ignored');
+    // Recovery by the crashed folder's own next run completes the pair; then the refused folder publishes.
+    const recovered = await run('recovered', 'one');
+    assert.equal(recovered.result.ok, true, recovered.result.message);
+    assert.equal(recovered.result.recovery, 'rolled-forward');
+    const again = await run('again', 'two');
+    assert.equal(again.result.exclusions, 'published', again.result.message);
+    assert.deepEqual(f.owners(), ['.', 'one', 'two']);
+    for (const target of [...f.generated('one', ['alpha']), ...f.generated('two', ['alpha']), '.agents/skills/alpha']) assert.ok(f.ignored(target), target);
+    f.assertQuiescent();
 });
