@@ -25,7 +25,7 @@ import { MIB, shareMemoryMiB } from './liveGpuCommands.mjs';
 import { LLM_SOURCE_DIRECTORY } from './liveLlmNames.mjs';
 import {
     GIB, INFERENCE_CADENCE, INSUFFICIENT_RAM, L1_MIN_RAM_BYTES, L1_PROMPT, LLM_BUDGET, LLM_FIXTURE, LLM_IMAGE_DIGESTS, LLM_LEAF_SAMPLE, LLM_MODELS, LLM_REF, LLM_RUNNER_PROCESSES, LLM_TOOL_CALL, VLLM_SHARE,
-    analyzeInference, insufficientMemoryPercent, llmToolWords, parseLeafSample, runnerEnvironmentProblems, summarizeGpuCheck, vllmToolWords,
+    analyzeInference, insufficientMemoryPercent, llmToolWords, parseLeafSample, runnerEnvironmentProblems, sourceUnavailable, summarizeGpuCheck, vllmToolWords,
 } from './liveLlmCommands.mjs';
 
 const needs = (condition, message) => { if (!condition) throw blocked(message); };
@@ -105,7 +105,11 @@ export function createLlmCases(ctx) {
             if (samples % 10 === 0) evidence.step(`status:${label}`, { phase: last.phase, download: last.deployment?.download ?? null, error: last.deployment?.error ?? null });
             samples += 1;
             if (done(last)) return last;
-            if (last.deployment?.phase === 'error') throw Object.assign(new Error(`The deployment failed: ${String(last.deployment.error).slice(0, 300)}`), { status: last });
+            if (last.deployment?.phase === 'error') {
+                // An unreachable model source is a missing prerequisite of the host (BLOCKED); anything else is a failure.
+                if (sourceUnavailable(last.deployment.error)) throw blocked(`The model source is unavailable from this host: ${String(last.deployment.error).slice(0, 300)}`);
+                throw Object.assign(new Error(`The deployment failed: ${String(last.deployment.error).slice(0, 300)}`), { status: last });
+            }
             if (last.deployment?.phase === 'paused') throw blocked(`The deployment paused: ${String(last.deployment.pausedReason || last.deployment.error).slice(0, 300)}`);
             if (Date.now() - started > deadlineMs) {
                 const message = `${label} did not finish within ${deadlineMs} ms (phase ${last.phase})`;

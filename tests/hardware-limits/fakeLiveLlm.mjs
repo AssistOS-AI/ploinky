@@ -158,6 +158,7 @@ export function createLlmWorld({ statePath, node, engine, host, gpu, faults = {}
         const a = agent();
         if (!L.deployment || faults.stalled) return;
         L.polls += 1;
+        if (L.phase === 'downloading' && faults.downloadFails) { L.phase = 'error'; L.deployment.error = faults.downloadFails; return; }
         if (L.phase === 'downloading' && L.polls >= 1) { L.phase = 'loading'; L.polls = 0; if (L.deployment.modelId === LLM_MODELS.small) L.downloaded.small = true; else L.downloaded.awq = true; writeModelData(L.deployment.modelId === LLM_MODELS.small ? 'small' : 'awq'); return; }
         if (L.phase === 'loading' && L.polls >= (faults.readyAfter ?? 1)) {
             if (faults.loadFails) { L.phase = 'error'; L.deployment.error = 'The runner exited while loading (out of memory).'; return; }

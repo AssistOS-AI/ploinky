@@ -26,7 +26,7 @@ import { LEAF_OBSERVATION } from '../hardware-limits/liveCaseCommands.mjs';
 import {
     LOCAL_LLM_RUNNER_ENV, isSecretName, runnerEnvironmentProblems, runnerProductNames,
     INFERENCE_MIN_IN_FLIGHT, INFERENCE_TOLERANCE, INSUFFICIENT_RAM, LLM_BUDGET, LLM_IMAGE_DIGESTS, LLM_LEAF_SAMPLE, LLM_MODELS, LLM_RUNNER_PROCESSES, LLM_TOOL_CALL, VLLM_SHARE, VLLM_TOOL_PATH,
-    analyzeInference, insufficientMemoryPercent, llmToolWords, parseLeafSample, summarizeGpuCheck, validateLlmModelPins, validateLlmProfile, vllmToolWords,
+    analyzeInference, insufficientMemoryPercent, llmToolWords, parseLeafSample, sourceUnavailable, summarizeGpuCheck, validateLlmModelPins, validateLlmProfile, vllmToolWords,
 } from '../hardware-limits/liveLlmCommands.mjs';
 import { resolveMemoryPercent } from '../../cli/sandbox/hardwareLimits/resolve.mjs';
 
@@ -1435,4 +1435,18 @@ test('R2E.a-model-load-that-does-not-finish-in-time-is-blocked-with-its-progress
     // A load that fails (the runner exits) stays a failure of the case.
     const w = await provisioned(t, { faults: { loadFails: true } });
     assert.equal(caseOf(await liveCases(w, ['LIVE-L1']), 'LIVE-L1').result, 'fail');
+});
+
+// --- R2E(c): an unreachable model source is BLOCKED, a pin that does not match is a failure --------------------------
+test('R2E.an-unreachable-model-source-is-blocked-and-a-pin-mismatch-or-a-runner-failure-is-a-failure', async t => {
+    for (const text of ['Hugging Face metadata request failed', 'Hugging Face metadata request timed out', 'Hugging Face metadata request returned HTTP 503', 'Hugging Face metadata request returned HTTP 429',
+        'Download failed after repeated attempts; the partial file is kept', 'Download returned HTTP 502', 'getaddrinfo ENOTFOUND huggingface.co', 'connect ETIMEDOUT 18.1.1.1:443', 'TypeError: fetch failed']) assert.equal(sourceUnavailable(text), true, text);
+    for (const text of ['Model file not found as an LFS object at the pinned commit', 'Server reported a size that differs from the pinned artifact', 'Hugging Face metadata request returned HTTP 404', 'Download returned HTTP 403', 'The runner exited while loading (out of memory).', 'Disk is full; the partial file is kept for resume', '', null]) assert.equal(sourceUnavailable(text), false, String(text));
+    for (const [label, error, result] of [['an unreachable Hugging Face', 'Hugging Face metadata request failed', 'blocked'], ['a download that kept failing', 'Download failed after repeated attempts; the partial file is kept', 'blocked'], ['a file that is not at the pin', 'Model file not found as an LFS object at the pinned commit', 'fail']]) {
+        const w = await provisioned(t, { faults: { downloadFails: error } });
+        const entry = caseOf(await liveCases(w, ['LIVE-L1']), 'LIVE-L1');
+        assert.equal(entry.result, result, `${label}: ${JSON.stringify(entry).slice(0, 400)}`);
+        assert.match(entry.reason, result === 'blocked' ? /The model source is unavailable from this host: / : /The deployment failed: /, label);
+        assert.equal(w.artifacts.get('gpu-live-l1').response, undefined, 'no text is ever accepted'); nothingOwned(w);
+    }
 });

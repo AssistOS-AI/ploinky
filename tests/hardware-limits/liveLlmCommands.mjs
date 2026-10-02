@@ -30,6 +30,14 @@ export const RUNNER_PRODUCT_CUDA = Object.freeze(['CUDA_CACHE_PATH']);
 // are, TIKTOKEN_ENCODINGS_BASE (a path to a vocabulary) is not.
 const SECRET_WORDS = new Set(['KEY', 'KEYS', 'APIKEY', 'TOKEN', 'TOKENS', 'SECRET', 'SECRETS', 'PASSWORD', 'PASSWD', 'CREDENTIAL', 'CREDENTIALS', 'COOKIE', 'COOKIES']);
 export const isSecretName = name => String(name).toUpperCase().split(/[^A-Z0-9]+/).some(word => SECRET_WORDS.has(word));
+// Whether a deployment's error text says the model SOURCE or the network was unavailable (a missing prerequisite of the
+// host, not a defect of the product): the messages local-llm's downloader gives for an unreachable Hugging Face, a
+// metadata or download request that failed, timed out or answered 429 or 5xx, and the usual network errnos. A pin that does
+// not match (not found, a changed size or digest) is a real failure and is not matched.
+export function sourceUnavailable(text) {
+    return /Hugging Face metadata request (?:failed|timed out)|Hugging Face metadata request returned HTTP (?:429|5\d\d)|Download failed after repeated attempts|Download returned HTTP (?:429|5\d\d)|\b(?:ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH)\b|getaddrinfo|fetch failed/i.test(String(text ?? ''));
+}
+
 // The exact names local-llm's launch for this runner emits: these are the product's, whatever they look like
 // (vLLM's per-start VLLM_API_KEY is one; llama.cpp has none).
 export const runnerProductNames = runnerId => new Set(Object.keys(LOCAL_LLM_RUNNER_ENV.runners[runnerId] ?? {}));
