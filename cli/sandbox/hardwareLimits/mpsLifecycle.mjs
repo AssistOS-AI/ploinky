@@ -216,7 +216,8 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
                     try { stopRecorded(client, record); } catch (error) { throw new MpsPeerNotRetirableError(client, refused.outcome, { state: 'not-stopped', reason: String(error?.message || error).slice(0, 256) }); }
                     return;
                 }
-                const plan = plans.get(client.key) || inApplyStep('planning', () => loadPlan(client.ref, record));
+                // A drained client's plan is part of draining it: a failure here reports the step 'drain' (the transition's label).
+                const plan = plans.get(client.key) || loadPlan(client.ref, record);
                 const observation = inspectMpsClient(client, { runtime: plan.runtime, network: plan.profile.network, alias, ...(engineRun ? { createAdapter: (adapterOptions) => createNetworkLifecycleAdapter({ ...adapterOptions, run: engineRun }) } : {}) });
                 if (observation.state === 'absent') return;
                 if (observation.state !== 'exact' || observation.id !== client.containerId) throw new HardwareStoreError('MPS cohort runtime ownership changed before drain', { code: 'identity_changed', status: 409 });

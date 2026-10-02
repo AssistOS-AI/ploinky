@@ -689,6 +689,10 @@ export function buildRequiredCaseManifest() {
         ...leaves(P, 'p4', unit('hardwareLimitsApplyStepLabels.test.mjs'), [
             'W7.a-failure-inside-the-mps-coordination-is-the-coordination-step-not-planning',
             'W7.a-check-between-two-steps-is-not-credited-to-the-step-that-just-finished',
+            'W8.prepare-and-commit-on-a-published-route-report-restart-preparation-and-activation',
+            'W8.a-plan-failure-of-the-target-through-the-coordination-is-planning',
+            'W8.a-plan-failure-of-a-client-being-drained-is-the-drain-step',
+            'W8.a-plan-failure-in-the-graph-launch-is-planning',
         ]),
         ...leaves(P, 'p4', unit('hardwareLimitsMpsCandidateRecovery.test.mjs'), [
             'MC.readiness-failure-then-retry-succeeds', 'MC.readiness-failure-leaving-the-candidate-removes-it-by-id',

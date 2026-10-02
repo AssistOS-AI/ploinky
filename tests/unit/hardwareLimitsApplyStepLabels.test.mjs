@@ -20,6 +20,8 @@ test.after(() => {
     fs.rmSync(workspace, { recursive: true, force: true });
 });
 const { applyHardwareLimits, reconcileExactHardwareInstance, captureExactHardwareInstances } = await import('../../cli/sandbox/hardwareLimits/reconcile.mjs');
+const { coordinateMpsLifecycle, ensureMpsGraphAgentService } = await import('../../cli/sandbox/hardwareLimits/mpsLifecycle.mjs');
+const { readMpsLaunch } = await import('../../cli/sandbox/hardwareLimits/mpsLaunch.mjs');
 const { HardwareStoreError } = await import('../../cli/sandbox/hardwareLimits/store.mjs');
 
 const token = { epoch: 'e'.repeat(32), revision: 1 };
@@ -76,4 +78,66 @@ test('W7.a-check-between-two-steps-is-not-credited-to-the-step-that-just-finishe
         ['readiness', { readiness: async () => { throw new Error('Readiness deadline expired.'); } }, 'readiness'],
         ['the plan', { loadPlan: () => { throw new Error('manifest unreadable'); } }, 'planning'],
     ]) assert.equal((await apply({ deps })).results[0].cause.step, step, label);
+});
+
+test('W8.prepare-and-commit-on-a-published-route-report-restart-preparation-and-activation', async () => {
+    const routing = { routes: { worker: { container: 'exact' } } };
+    const published = { loadRouting: () => routing };
+    const prepared = { identity: { instanceId: 'next', enableGeneration: 'next' }, targetedRestart: {} };
+    const prepareFails = await apply({ deps: { ...published, prepare: async () => { throw new Error('drain refused by the engine'); } } });
+    assert.equal(prepareFails.results[0].cause.step, 'restart-preparation', JSON.stringify(prepareFails.results[0]));
+    const commitFails = await apply({ deps: { ...published, prepare: async () => prepared, commit: async () => { throw new Error('route publication failed'); }, cleanupTargeted: () => {} } });
+    assert.equal(commitFails.results[0].cause.step, 'activation', JSON.stringify(commitFails.results[0]));
+    // The same flow with both steps working reaches readiness first: the order is prepare, launch, readiness, commit.
+    const order = [];
+    await apply({ deps: { ...published, prepare: async () => { order.push('prepare'); return prepared; }, ensure: () => { order.push('ensure'); return { containerName: 'exact', containerId: 'd'.repeat(64), registryRecord: record }; },
+        readiness: async () => { order.push('readiness'); }, commit: async () => { order.push('commit'); } } });
+    assert.deepEqual(order, ['prepare', 'ensure', 'readiness', 'commit']);
+});
+
+// The MPS lifecycle's own plan loads, through the real coordination and the real graph launch.
+const coordinationWorld = ({ loadPlan, oldClients = [] } = {}) => {
+    const target = { type: 'agent', repoName: 'demo', agentName: 'a', instanceId: 'i-a', enableGeneration: 'g-a', containerId: 'b'.repeat(64) };
+    const peer = { type: 'agent', repoName: 'demo', agentName: 'c', instanceId: 'i-c', enableGeneration: 'g-c', containerId: 'c'.repeat(64) };
+    const reg = { a: target, c: peer };
+    const defaults = { smPercent: 25, memoryMiB: 1024, deviceUuid: share.deviceUuid, driverVersion: share.driverVersion, wiringFingerprint: share.wiringFingerprint };
+    let state = oldClients.length ? { schema: 1, status: 'ready', daemon: { pid: 1 }, daemonGeneration: 'd0', configurationGeneration: 'c0', pipeDirectory: `/run/ploinky/mps/pipe-${'a'.repeat(32)}`, serverDefault: defaults, pendingClients: [], oldClients, drainedClients: [] } : null;
+    const dependencies = {
+        observeClients: () => [], readContext: () => ({ storeToken: token, overrides: new Map([['demo/a', { gpu: { ...share, smPercent: 50 } }]]), gpu: { eligible: true, grant: { mps: {} } } }),
+        loadRegistry: () => reg, readApplied: () => null, loadPlan, prepareImage: () => {}, inspectImage: () => ({ Id: 'a'.repeat(64), Config: { User: '1000:1000' } }),
+        resolveShare: policy => policy, policyCheck: () => {}, store: { read: () => clone(state), write: value => { state = clone(value); } },
+        backend: { observe: () => ({ state: state?.daemon ? 'owned' : 'gone', daemon: state?.daemon }), verify: () => true, stop() {}, cleanup() {}, start: () => ({ ...state, status: 'ready' }) },
+        network: async fn => fn({}), assertCapability: () => {},
+    };
+    const run = () => applyHardwareLimits({ expectedToken: token, containers: ['a'] }, {
+        lease: (_options, callback) => callback(), loadRegistry: () => clone(reg), loadRouting: () => ({ routes: {} }), readPolicy: () => ({ token }), policyCheck: () => {}, loadPlan: () => ({}), isUnchanged: () => false,
+        reconcile: (instance, options) => coordinateMpsLifecycle({ target: { key: instance.key, record: clone(reg[instance.key]) }, options: { onMpsPlan: options.onMpsPlan, onMpsResult: options.onMpsResult },
+            launchTarget: async next => { readMpsLaunch(next.mpsLaunch, 'a', { ...share, smPercent: 50 }); return { containerName: 'a', containerId: 'e'.repeat(64) }; } }, dependencies),
+    });
+    return { run };
+};
+
+test('W8.a-plan-failure-of-the-target-through-the-coordination-is-planning', async () => {
+    const world = coordinationWorld({ loadPlan: () => { throw new Error('manifest of the target is unreadable'); } });
+    const result = await world.run();
+    assert.equal(result.error, 'apply_failed'); assert.equal(result.results[0].cause.step, 'planning', JSON.stringify(result.results[0]));
+    assert.match(result.results[0].cause.message, /manifest of the target is unreadable/);
+});
+
+test('W8.a-plan-failure-of-a-client-being-drained-is-the-drain-step', async () => {
+    // A journaled share client of another agent that the cohort drains; its plan cannot be loaded (its manifest is gone).
+    const peerClient = { key: 'c', ref: 'demo/c', alias: '', instanceId: 'i-c', enableGeneration: 'g-c', containerId: 'c'.repeat(64), share, mpsGeneration: 'd0:c0' };
+    const world = coordinationWorld({ oldClients: [peerClient], loadPlan: ref => { if (ref === 'demo/c') throw new Error('manifest of the peer is unreadable'); return { runtime: 'podman', manifest: {}, profile: { network: { mode: 'default' } }, image: 'prepared:tag' }; } });
+    const result = await world.run();
+    const entry = result.results.find(value => value.cause || value.error === 'apply_failed') ?? result.results[0];
+    assert.equal(entry.cause?.step, 'drain', JSON.stringify(result));
+    assert.match(entry.cause.message, /manifest of the peer is unreadable/);
+});
+
+test('W8.a-plan-failure-in-the-graph-launch-is-planning', async () => {
+    const options = { networkLifecycleCapability: {}, preparedRegistryRecord: record, hardwareInstanceKey: 'exact' };
+    await assert.rejects(ensureMpsGraphAgentService('worker', {}, '/ws/.ploinky/repos/demo/worker', options, {
+        assertCapability: () => {}, readContext: () => ({ storeToken: token, overrides: new Map([['demo/worker', { gpu: share }]]), gpu: { eligible: true } }), policyCheck: () => {},
+        resolveShare: policy => policy, loadPlan: () => { throw new Error('graph plan unreadable'); },
+    }), error => error.applyStep === 'planning' && /graph plan unreadable/.test(error.message));
 });
