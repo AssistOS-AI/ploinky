@@ -10,7 +10,7 @@ import { drainTargetedContainer, TARGETED_DRAIN_ACKNOWLEDGEMENT } from '../docke
 import { retireRuntimeRelaySocket } from '../docker/healthProbes.js';
 import { readBoxHardwareContext } from './context.mjs';
 import { readAppliedObservation } from './runtimeState.mjs';
-import { assertKnownMpsClients, inspectMpsClient } from './mpsInventory.mjs';
+import { assertKnownMpsClients, inspectMpsClient, resolveMpsClientAlias } from './mpsInventory.mjs';
 import { createMpsStateStore, createMpsDaemonBackend } from './mps.mjs';
 import { MpsError } from './mpsEligibility.mjs';
 import { resolveStoredGpuShare } from './resolve.mjs';
@@ -46,7 +46,11 @@ async function prepareMpsGraphImpl({ nodes, networkLifecycleCapability, deadline
         if (!applied?.mpsGeneration || applied.instanceId !== record.instanceId || applied.enableGeneration !== record.enableGeneration) continue;
         const client = { key, alias: record.alias || '', ref: `${record.repoName}/${record.agentName}`, instanceId: record.instanceId,
             enableGeneration: record.enableGeneration, containerId: record.containerId, share: applied.gpuShare, mpsGeneration: applied.mpsGeneration };
-        if (!clients.has(tuple(client))) clients.set(tuple(client), client);
+        const journaled = clients.get(tuple(client));
+        // The re-observed exact tuple carries its registry alias into the one
+        // journaled entry; a different journaled alias is an identity change.
+        if (!journaled) clients.set(tuple(client), client);
+        else clients.set(tuple(client), { ...journaled, alias: resolveMpsClientAlias(journaled, record) });
     }
     const policies = [];
     for (const [ref, entry] of context.overrides || []) {
@@ -79,7 +83,7 @@ async function prepareMpsGraphImpl({ nodes, networkLifecycleCapability, deadline
         const network = resolveManifestRuntimeProfile(member.node.manifest, { agentName: client.ref,
             profileName: registry[client.key].profile || undefined }).network;
         const engine = runtime();
-        const observed = inspect(client, network, engine);
+        const observed = inspect({ ...client, alias: resolveMpsClientAlias(client, registry[client.key]) }, network, engine);
         if (observed.state !== 'absent' && (observed.state !== 'exact' || observed.id !== client.containerId)) throw new MpsError('MPS graph predecessor runtime ownership is not exact');
         toDrain.push({ client, observed, engine });
     }

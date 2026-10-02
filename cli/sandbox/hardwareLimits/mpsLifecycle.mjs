@@ -17,7 +17,7 @@ import { retireRuntimeRelaySocket } from '../docker/healthProbes.js';
 import { prepareTargetedAgentRestart } from '../../commands/targetedAgentRestart.js';
 import { readBoxHardwareContext } from './context.mjs';
 import { readAppliedObservation } from './runtimeState.mjs';
-import { assertKnownMpsClients, inspectMpsClient } from './mpsInventory.mjs';
+import { assertKnownMpsClients, inspectMpsClient, resolveMpsClientAlias } from './mpsInventory.mjs';
 import { HardwareStoreError } from './store.mjs';
 import { HardwareLimitsError } from './errors.mjs';
 import { buildDirectRefusal, hex64 } from './requestedLimits.mjs';
@@ -70,7 +70,7 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
             const ref = `${record.repoName}/${record.agentName}`;
             const applied = record.containerId ? readApplied(key, record.containerId) : null;
             const old = applied?.mpsGeneration && applied.instanceId === record.instanceId && applied.enableGeneration === record.enableGeneration;
-            if (old) oldClients.push({ key, ref, instanceId: record.instanceId, enableGeneration: record.enableGeneration, containerId: record.containerId, share: applied.gpuShare, mpsGeneration: applied.mpsGeneration });
+            if (old) oldClients.push({ key, ref, alias: record.alias || '', instanceId: record.instanceId, enableGeneration: record.enableGeneration, containerId: record.containerId, share: applied.gpuShare, mpsGeneration: applied.mpsGeneration });
             const policy = context.overrides?.get(ref)?.gpu;
             if (key !== target.key && !old) continue;
             const plan = loadPlan(ref, key === target.key ? options.desiredRecord || record : record); plans.set(key, plan);
@@ -80,7 +80,7 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
                 const inspected = inspectMpsImage({ image: plan.image, networkMode: plan.profile.network.mode }, { inspectImage: (image) => inspectImage(image, { runtime: plan.runtime }) });
                 images.set(key, inspected.imageId);
             }
-            desiredClients.push({ key, ref, instanceId: record.instanceId || options.instanceId || randomUUID(), enableGeneration: record.enableGeneration || options.enableGeneration || randomUUID(), containerId: record.containerId || null, share });
+            desiredClients.push({ key, ref, alias: record.alias || '', instanceId: record.instanceId || options.instanceId || randomUUID(), enableGeneration: record.enableGeneration || options.enableGeneration || randomUUID(), containerId: record.containerId || null, share });
         }
         observeClients({ runtime: plans.get(target.key)?.runtime || 'podman', registry, state: store.read() });
         const configuredPolicies = [];
@@ -104,9 +104,10 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
                 check();
                 const record = loadRegistry()[client.key];
                 if (!record || record.instanceId !== client.instanceId || record.enableGeneration !== client.enableGeneration || record.containerId !== client.containerId) throw new HardwareStoreError('MPS cohort registry identity changed before drain', { code: 'identity_changed', status: 409 });
+                const alias = resolveMpsClientAlias(client, record);
                 if (drainClient) return drainClient(client, record, capability);
                 const plan = plans.get(client.key) || loadPlan(client.ref, record);
-                const observation = inspectMpsClient(client, { runtime: plan.runtime, network: plan.profile.network, alias: record.alias || '' });
+                const observation = inspectMpsClient(client, { runtime: plan.runtime, network: plan.profile.network, alias });
                 if (observation.state === 'absent') return;
                 if (observation.state !== 'exact' || observation.id !== client.containerId) throw new HardwareStoreError('MPS cohort runtime ownership changed before drain', { code: 'identity_changed', status: 409 });
                 if (observation.running === false) {
@@ -130,7 +131,7 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
                     targetResult = await launchTarget({ ...options, mpsLaunch, mpsTransitionAction: 'clients', networkLifecycleCapability: capability });
                     if (targetResult?.state === 'applied') return targetResult;
                     if (targetResult?.mpsReady) return { key: client.key, observedKey: targetResult.containerName, state: 'applied', containerId: targetResult.containerId };
-                    const launchedClient = { ...client, mpsGeneration: state ? `${state.daemonGeneration}:${state.configurationGeneration}` : '', key: targetResult.containerName, containerId: targetResult.containerId, instanceId: targetResult.registryRecord?.instanceId, enableGeneration: targetResult.registryRecord?.enableGeneration };
+                    const launchedClient = { ...client, mpsGeneration: state ? `${state.daemonGeneration}:${state.configurationGeneration}` : '', key: targetResult.containerName, containerId: targetResult.containerId, instanceId: targetResult.registryRecord?.instanceId, enableGeneration: targetResult.registryRecord?.enableGeneration, alias: targetResult.registryRecord ? targetResult.registryRecord.alias || '' : client.alias };
                     if (client.share) Object.defineProperty(targetResult, 'mpsReadiness', { value: { mpsLaunch, key: client.key, share: client.share, client: launchedClient }, configurable: true });
                     return { key: client.key, state: 'starting', containerId: targetResult.containerId, client: launchedClient };
                 }
@@ -228,7 +229,7 @@ export async function ensureMpsGraphAgentService(agentName, manifest, agentPath,
     const mpsLaunch = createMpsLaunch({ key, share, state: share ? { ...state, status: 'ready' } : null, imageId });
     check();
     if (share) {
-        const pending = { key, ref, instanceId: record.instanceId, enableGeneration: record.enableGeneration, containerId: null, share, phase: 'launching' };
+        const pending = { key, ref, alias: record.alias || '', instanceId: record.instanceId, enableGeneration: record.enableGeneration, containerId: null, share, phase: 'launching' };
         state = { ...store.read(), status: 'ready', pendingClients: [...(store.read()?.pendingClients || []).filter((value) => value.key !== key), pending] };
         store.write(state);
     }
@@ -239,7 +240,7 @@ export async function ensureMpsGraphAgentService(agentName, manifest, agentPath,
         throw error;
     }
     if (share) {
-        const client = { key: result.containerName, ref, instanceId: result.registryRecord?.instanceId, enableGeneration: result.registryRecord?.enableGeneration, containerId: result.containerId, share, mpsGeneration: `${state.daemonGeneration}:${state.configurationGeneration}`, phase: 'readiness' };
+        const client = { key: result.containerName, ref, alias: result.registryRecord?.alias || '', instanceId: result.registryRecord?.instanceId, enableGeneration: result.registryRecord?.enableGeneration, containerId: result.containerId, share, mpsGeneration: `${state.daemonGeneration}:${state.configurationGeneration}`, phase: 'readiness' };
         state = { ...store.read(), pendingClients: [...(store.read()?.pendingClients || []).filter((value) => value.key !== client.key), client] };
         store.write(state);
         Object.defineProperty(result, 'mpsReadiness', { value: { mpsLaunch, key, share, client }, configurable: true });
@@ -330,7 +331,7 @@ export function trackMpsRuntimePending(result, { mpsLaunch, key }, { store = cre
     if (!launch.share) return result;
     const record = result?.registryRecord;
     if (!record?.instanceId || !record?.enableGeneration || !/^[a-f0-9]{64}$/.test(result.containerId)) throw new MpsError('MPS client readiness requires its exact created identity');
-    const client = { key: result.containerName, ref: `${record.repoName}/${record.agentName}`, instanceId: record.instanceId,
+    const client = { key: result.containerName, ref: `${record.repoName}/${record.agentName}`, alias: record.alias || '', instanceId: record.instanceId,
         enableGeneration: record.enableGeneration, containerId: result.containerId, share: launch.share, mpsGeneration: `${launch.state.daemonGeneration}:${launch.state.configurationGeneration}`, phase: 'readiness' };
     const state = store.read();
     if (state?.daemonGeneration !== launch.state?.daemonGeneration || state?.configurationGeneration !== launch.state?.configurationGeneration) throw new MpsError('MPS generation changed before readiness tracking');

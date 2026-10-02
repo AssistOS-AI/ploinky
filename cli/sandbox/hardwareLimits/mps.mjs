@@ -4,6 +4,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { MPS_TOOL_PATHS, revalidateMpsTools } from '../../../ploinky-box/lib/mpsTools.mjs';
 import { MpsError } from './mpsEligibility.mjs';
+import { AGENT_ALIAS_PATTERN, RESERVED_AGENT_REGISTRY_KEYS } from '../../utils/agentRegistryResolver.js';
 
 export const MPS_ROOT = '/run/ploinky/mps';
 export const MPS_GENERATION_LABEL = 'ploinky.mpsgeneration';
@@ -87,12 +88,19 @@ function readBounded(target, { fsApi, maxBytes, uid, privateMode = false }) {
         return buffer.subarray(0, count).toString('utf8');
     } finally { fsApi.closeSync(fd); }
 }
+// A journaled client's alias: the registry's own spelling, or '' for the
+// canonical instance. Journals written before aliases were recorded omit it.
+export function isMpsClientAlias(value) {
+    return value === '' || (typeof value === 'string' && Buffer.byteLength(value) <= 1024
+        && AGENT_ALIAS_PATTERN.test(value) && !RESERVED_AGENT_REGISTRY_KEYS.has(value));
+}
 function validateMpsState(value) {
     if (!value || typeof value !== 'object' || Array.isArray(value) || value.schema !== 1
         || !['inactive', 'ready', 'starting', 'transitioning', 'pending'].includes(value.status)) throw new MpsError('Unsupported private MPS state');
     for (const field of ['oldClients', 'desiredClients', 'pendingClients']) {
         if (value[field] !== undefined && (!Array.isArray(value[field]) || value[field].length > 256
-            || value[field].some((client) => !client || typeof client !== 'object' || typeof client.key !== 'string' || !client.key || Buffer.byteLength(client.key) > 1024))) throw new MpsError('Invalid private MPS client cohort');
+            || value[field].some((client) => !client || typeof client !== 'object' || typeof client.key !== 'string' || !client.key || Buffer.byteLength(client.key) > 1024
+                || (Object.hasOwn(client, 'alias') && !isMpsClientAlias(client.alias))))) throw new MpsError('Invalid private MPS client cohort');
     }
     if (value.drainedClients !== undefined && (!Array.isArray(value.drainedClients) || value.drainedClients.length > 512
         || value.drainedClients.some((entry) => typeof entry !== 'string' || Buffer.byteLength(entry) > 4096))) throw new MpsError('Invalid private MPS drain receipts');

@@ -3,6 +3,7 @@ import { createNetworkLifecycleAdapter } from '../networkLifecycle.js';
 import { networkContractHash } from '../networkContract.js';
 import { effectiveInstanceKey } from '../../utils/workspaceDependencyGraph.js';
 import { MpsError } from './mpsEligibility.mjs';
+import { isMpsClientAlias } from './mps.mjs';
 
 /** A daemon transition must not discard an unjournaled CUDA client's server. */
 export function assertKnownMpsClients({ runtime, registry = {}, state = null, query = spawnSync } = {}) {
@@ -20,8 +21,32 @@ export function assertKnownMpsClients({ runtime, registry = {}, state = null, qu
     return ids;
 }
 
-export function inspectMpsClient(client, { network, runtime, alias = client.alias || '', createAdapter = createNetworkLifecycleAdapter } = {}) {
+/**
+ * The alias to inspect or drain one journaled client with. The exact current
+ * registry record (same key, instanceId, enableGeneration and containerId)
+ * decides; a journaled alias that disagrees with it is an identity change.
+ * Without an exact record only the journaled alias can be used, and a journal
+ * written before aliases were recorded cannot prove one.
+ */
+export function resolveMpsClientAlias(client, record) {
+    const journaled = Object.hasOwn(client, 'alias') ? client.alias : undefined;
+    if (journaled !== undefined && !isMpsClientAlias(journaled)) throw new MpsError('MPS client alias is invalid', 'identity_changed');
+    const exact = record && record.instanceId === client.instanceId && record.enableGeneration === client.enableGeneration
+        && record.containerId === client.containerId;
+    if (exact) {
+        const current = record.alias === undefined || record.alias === null ? '' : record.alias;
+        if (!isMpsClientAlias(current)) throw new MpsError('MPS client registry alias is invalid', 'identity_changed');
+        if (journaled !== undefined && journaled !== current) throw new MpsError('MPS client alias changed since it was journaled', 'identity_changed');
+        return current;
+    }
+    if (journaled === undefined) throw new MpsError('MPS client has neither an exact registry record nor a journaled alias', 'identity_changed');
+    return journaled;
+}
+
+export function inspectMpsClient(client, { network, runtime, alias = client.alias, createAdapter = createNetworkLifecycleAdapter } = {}) {
     if (!/^[a-f0-9]{64}$/.test(String(client.containerId || ''))) throw new MpsError('MPS inspection needs an immutable client ID', 'identity_changed');
+    // Never the canonical identity by default: an aliased instance has its own.
+    if (!isMpsClientAlias(alias)) throw new MpsError('MPS inspection needs the exact client alias', 'identity_changed');
     const [repoName, agentName] = String(client.ref || '').split('/');
     return createAdapter({ runtime }).inspectContainerContract(client.containerId, network, agentName, {
         instanceKey: effectiveInstanceKey(repoName, agentName, alias), contractHash: networkContractHash(network),

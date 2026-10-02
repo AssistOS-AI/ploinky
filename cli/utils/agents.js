@@ -63,6 +63,7 @@ import {
     getAgentDataDir
 } from './workspaceStructure.js';
 import {
+    AGENT_ALIAS_PATTERN,
     RESERVED_AGENT_REGISTRY_KEYS,
     resolveEnabledAgentRecordFromMap,
 } from './agentRegistryResolver.js';
@@ -74,7 +75,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 export const AGENT_LIB_PATH = path.resolve(__dirname, '../../Agent');
 const RESERVED_AGENT_KEYS = RESERVED_AGENT_REGISTRY_KEYS;
-const ALIAS_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
+const ALIAS_PATTERN = AGENT_ALIAS_PATTERN;
 const AUTH_MODES = new Set(['none', 'sso', 'guest']);
 export const DEFAULT_ENABLE_AGENT_MODE = 'isolated';
 export const ENABLE_AGENT_MODES = Object.freeze(['isolated', 'global', 'devel']);

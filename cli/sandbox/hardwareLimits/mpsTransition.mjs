@@ -1,21 +1,30 @@
 import crypto from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { MpsError } from './mpsEligibility.mjs';
-import { validateMpsDefault } from './mps.mjs';
+import { isMpsClientAlias, validateMpsDefault } from './mps.mjs';
 
 function exactClient(value) {
     if (!value || typeof value.key !== 'string' || !value.key || Buffer.byteLength(value.key) > 1024 || typeof value.ref !== 'string' || !value.ref
         || typeof value.instanceId !== 'string' || !value.instanceId || typeof value.enableGeneration !== 'string' || !value.enableGeneration
-        || (value.containerId !== null && value.containerId !== undefined && !/^[a-f0-9]{64}$/.test(value.containerId))) throw new MpsError('MPS client identity is incomplete');
+        || (value.containerId !== null && value.containerId !== undefined && !/^[a-f0-9]{64}$/.test(value.containerId))
+        || (Object.hasOwn(value, 'alias') && !isMpsClientAlias(value.alias))) throw new MpsError('MPS client identity is incomplete');
     if (value.share) validateMpsDefault(value.share);
     return value;
 }
 function clientProof({ key, ref, instanceId, enableGeneration, containerId, share, mpsGeneration }) { return { key, ref, instanceId, enableGeneration, containerId, share, mpsGeneration }; }
 function clientIdentity(value) { return [value.key, value.instanceId, value.enableGeneration, value.containerId || ''].join('\0'); }
+// One exact tuple keeps the alias any of its observations carries; two
+// different aliases for the same tuple are an identity change.
+function withAlias(previous, value) {
+    if (!previous || !Object.hasOwn(previous, 'alias')) return value;
+    if (!Object.hasOwn(value, 'alias')) return { ...value, alias: previous.alias };
+    if (previous.alias !== value.alias) throw new MpsError('MPS exact client observations disagree on its alias', 'identity_changed');
+    return value;
+}
 function uniqueClients(values) {
     if (!Array.isArray(values) || values.length > 256) throw new MpsError('MPS client cohort exceeds its bound');
     const map = new Map();
-    for (const value of values) { exactClient(value); const key = clientIdentity(value); if (map.has(key) && !isDeepStrictEqual(clientProof(map.get(key)), clientProof(value))) throw new MpsError('MPS exact client observations conflict'); map.set(key, value); }
+    for (const value of values) { exactClient(value); const key = clientIdentity(value); if (map.has(key) && !isDeepStrictEqual(clientProof(map.get(key)), clientProof(value))) throw new MpsError('MPS exact client observations conflict'); map.set(key, withAlias(map.get(key), value)); }
     return [...map.values()].sort((left, right) => left.key.localeCompare(right.key));
 }
 

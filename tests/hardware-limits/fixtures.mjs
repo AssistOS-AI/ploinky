@@ -413,6 +413,12 @@ export function buildRequiredCaseManifest() {
             'MPL.final-apply-clear', 'MPL.final-host-clear-restart', 'MPL.daemon-loss', 'MPL.core-crash-journal',
             'MPL.partial-retry', 'MPL.no-unrelated-stop', 'MPL.lock-reuse', 'MPL.generation-drift',
         ]),
+        ...leaves(P, 'p4', unit('hardwareLimitsMpsGraph.test.mjs'), [
+            'GRAPH.alias-journal-generated-by-real-coordinator-recovery', 'GRAPH.alias-fresh-registry-control',
+            'GRAPH.alias-interrupted-router-cohort-journal-and-registry', 'GRAPH.alias-legacy-journal-enriched-from-exact-registry',
+            'GRAPH.alias-journal-registry-mismatch-refused', 'GRAPH.alias-unaliased-client-unchanged',
+            'GRAPH.alias-inspection-never-defaults-to-canonical', 'GRAPH.alias-journal-validator-legacy-and-bounds',
+        ]),
         ...leaves(L, 'p5', 'local-llm/tests/ploinky-budget.test.mjs', [
             'LL.vllm-qualification-absent', 'LL.vllm-qualification-mismatch', 'LL.vllm-qualification-match',
             'LL.vllm-six-three-two', 'LL.vllm-over-cap-incompatible', 'LL.vllm-free-shortage-temporary',
