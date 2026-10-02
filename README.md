@@ -765,7 +765,11 @@ a top-level `hardwareLimits` object in its manifest or in a profile:
 
 Only `memory`, `cpus` and `pidsLimit` are accepted, each with the same rules as
 before; any other key is refused, and GPU shares stay administrator-only in
-Settings → Hardware limits. The manifest root is one layer and the resolved
+Settings → Hardware limits. Where limits are placed under hardware limits,
+`cpus` is a decimal from `0.01` with at most two decimal places and within the
+Box CPU envelope; a finer value is refused with a fix, never rounded, because
+the engine truncates the quota it derives from `--cpus` and a finer value could
+not be read back exactly. The manifest root is one layer and the resolved
 profile is another. The selected profile overrides the default profile key by
 key and inherits the keys it leaves out. Precedence is unchanged: built-in
 defaults, the manifest, the LLM catalog, the profile, and finally the
@@ -778,9 +782,10 @@ paths and `hardwareLimits`, and the administrator read reports a
 `deprecatedDeclaration` note. A key declared in both places of the same manifest
 root or profile with different values refuses that agent with a fix that names
 the manifest root or the profile; equal values are accepted, compared by meaning
-(`1g` equals `1024m`, `1.0` equals `1`). Moving a declaration to `hardwareLimits`
-gives the same limits hash and arguments, so it does not restart a running
-agent. The other `llmRuntime.runtimePolicy` settings (`shmSize`, `ulimits`,
+(`1g` equals `1024m`, `1.0` equals `1`). Moving a declaration to `hardwareLimits`,
+or writing an equal value in another spelling, leaves the limits hash unchanged,
+so nothing restarts; the rendered arguments follow the declaration's own
+spelling (`--memory 1g` versus `--memory 1024m`). The other `llmRuntime.runtimePolicy` settings (`shmSize`, `ulimits`,
 `devices`, `ipc` and the rest) are not deprecated.
 
 Upgrade note: earlier releases dropped a selected non-default profile's
