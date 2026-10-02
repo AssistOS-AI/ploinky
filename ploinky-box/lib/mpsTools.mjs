@@ -10,7 +10,7 @@ const MAX_TOOL_BYTES = 64 * 1024 * 1024;
 
 export function describeMpsTool(source, destination, { fsApi = fs } = {}) {
     const canonical = fsApi.realpathSync(source);
-    const fd = fsApi.openSync(canonical, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const fd = fsApi.openSync(canonical, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
     try {
         const before = fsApi.fstatSync(fd);
         if (!before.isFile() || before.nlink !== 1 || before.size <= 0 || before.size > MAX_TOOL_BYTES) throw new Error('MPS tool is not a bounded regular file');

@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { withWorkspaceMutationLease, withMaintenanceLock } from '../../utils/runtime/maintenanceLocks.js';
@@ -26,7 +27,11 @@ import { readAppliedObservation } from './runtimeState.mjs';
 import { verifyLaunchedHardwareLimits } from './delegation.mjs';
 import { hasMpsLaunch } from './mpsLaunch.mjs';
 import { coordinateMpsLifecycle, trackMpsRuntimePending, verifyMpsRuntimeReady, acknowledgeMpsRuntimeReady } from './mpsLifecycle.mjs';
-import { readMpsStatus } from './mpsStatus.mjs';
+import { readMpsStatus, inspectPreparedMpsImage } from './mpsStatus.mjs';
+import { inspectMpsImage } from './mpsEligibility.mjs';
+import { createMpsStateStore } from './mps.mjs';
+import { verifyMpsRuntimeObservation } from './mpsRuntimeObservation.mjs';
+import { resolveManifestImage } from '../../utils/security/secretVars.js';
 
 function failure(code, message, status = 409) { return new HardwareStoreError(message, { code, status }); }
 
@@ -122,7 +127,8 @@ function readPlan(captured, { hardwareAdmission = 'strict' } = {}) {
         catalogPolicy: llm.catalogPolicy, catalogIdentity: llm.catalogIdentity,
         instanceKey: captured.key, alias: captured.record.alias || '', hardwareAdmission: 'metadata',
     });
-    return { ref, resolved, manifest, bytes, profileResolution, runtime, runtimeAdmission, hardwareOutcome: ownOutcome, agentPath: path.dirname(resolved.manifestPath), routerEndpoint: resolveRouterEndpoint(profileResolution.network.mode) };
+    const image = runtimeAdmission.descriptor.hardwareGpu ? llm.startup?.selection?.imageRef || resolveManifestImage(manifest, profileResolution.profileConfig, { agentName: captured.record.agentName, repoName: captured.record.repoName }) : null;
+    return { ref, resolved, manifest, bytes, profileResolution, runtime, runtimeAdmission, image, hardwareOutcome: ownOutcome, agentPath: path.dirname(resolved.manifestPath), routerEndpoint: resolveRouterEndpoint(profileResolution.network.mode) };
 }
 
 export function hardwareApplyIsUnchanged(captured, plan, {
@@ -132,6 +138,15 @@ export function hardwareApplyIsUnchanged(captured, plan, {
         contractHash: networkContractHash(plan.profileResolution.network), instanceId: captured.record.instanceId, enableGeneration: captured.record.enableGeneration, requireRuntimeIdentity: true,
     }),
     readApplied = readAppliedObservation, readLabel = getContainerLabel, verifyLimits = verifyLaunchedHardwareLimits,
+    fsApi = fs, cgroupRoot = '/sys/fs/cgroup', procRoot = '/proc',
+    query = (command, args, { timeoutMs = 10_000 } = {}) => {
+        const reply = spawnSync(command, args, { encoding: 'utf8', timeout: Math.min(timeoutMs, 10_000), maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
+        return { ok: reply.status === 0 && !reply.error && !reply.signal, stdout: String(reply.stdout || '') };
+    },
+    readMps = readMpsStatus, verifyMps = (_captured, currentPlan, containerId) => {
+        const prepared = inspectMpsImage({ image: currentPlan.image, networkMode: currentPlan.profileResolution.network.mode }, { inspectImage: (image) => inspectPreparedMpsImage(image, { runtime: currentPlan.runtime }) });
+        return verifyMpsRuntimeObservation({ containerId, imageId: prepared.imageId, share: currentPlan.runtimeAdmission.descriptor.hardwareGpu, state: createMpsStateStore().read(), runtime: currentPlan.runtime });
+    },
 } = {}) {
     if (Object.values(loadRouting().routes || {}).some((route) => route?.container === captured.key && route.hardwareAvailability)) return false;
     const hash = hardwareLimitsHashOf(plan.runtimeAdmission.descriptor);
@@ -139,8 +154,11 @@ export function hardwareApplyIsUnchanged(captured, plan, {
     if (observed?.state !== 'exact' || observed.id !== captured.record.containerId || observed.running !== true) return false;
     if (!hash) return !plan.hardwareOutcome && !(plan.runtimeAdmission.descriptor.hardwareRequest?.length) && !readLabel(captured.key, 'ploinky.limitshash');
     const applied = readApplied(captured.key, captured.record.containerId);
-    try { verifyLimits({ descriptor: plan.runtimeAdmission.descriptor, containerId: observed.id, runtime: plan.runtime || getRuntime() }); } catch (_) { return false; }
-    if (plan.runtimeAdmission.descriptor.hardwareGpu && (!applied?.mpsGeneration || applied.mpsGeneration !== readMpsStatus().mpsGeneration || readLabel(captured.key, 'ploinky.mpsgeneration') !== applied.mpsGeneration)) return false;
+    try { verifyLimits({ descriptor: plan.runtimeAdmission.descriptor, containerId: observed.id, runtime: plan.runtime || getRuntime(), query, fsApi, cgroupRoot, procRoot, refuse: (detail) => failure('hardware_limits_drift', String(detail).slice(0, 2048)) }); } catch (_) { return false; }
+    if (plan.runtimeAdmission.descriptor.hardwareGpu) {
+        if (!applied?.mpsGeneration || applied.mpsGeneration !== readMps().mpsGeneration || readLabel(captured.key, 'ploinky.mpsgeneration') !== applied.mpsGeneration) return false;
+        try { verifyMps(captured, plan, observed.id); } catch (_) { return false; }
+    }
     return Boolean(hash && applied && applied.instanceId === captured.record.instanceId && applied.enableGeneration === captured.record.enableGeneration && applied.limitsHash === hash
         && readLabel(captured.key, 'ploinky.limitshash') === hash);
 }

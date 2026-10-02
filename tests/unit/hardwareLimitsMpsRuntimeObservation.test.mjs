@@ -38,3 +38,33 @@ test('MRO.failed and oversized replies never expose environment', () => {
 test('MRO.invalid expected identity refuses without executing query', () => {
     assert.throws(() => verify(null, { containerId: 'name', query: () => assert.fail('must not run') }), /exact container/);
 });
+
+import { applyHardwareLimits, hardwareApplyIsUnchanged } from '../../cli/sandbox/hardwareLimits/reconcile.mjs';
+for (const [name, mutate] of [
+    ['exact', () => {}],
+    ['environment drift', (value) => { value.Config.Env[2] = 'CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=100'; }],
+    ['image drift', (value) => { value.Image = 'e'.repeat(64); }],
+    ['pipe drift', (value) => { value.Mounts[0].Source = '/different-pipe'; }],
+]) test(`Apply verifies the actual MPS client before no-op: ${name}`, async () => {
+    const current = inspected(); mutate(current);
+    const limitsHash = 'f'.repeat(64);
+    const record = { type: 'agent', repoName: 'repo', agentName: 'gpu', containerId, instanceId: 'instance', enableGeneration: 'generation' };
+    const token = { epoch: '1'.repeat(32), revision: 1 };
+    const plan = { runtime: 'podman', image: imageId, profileResolution: { network: { mode: 'default' } },
+        runtimeAdmission: { descriptor: { hardwareGpu: share, hardwarePlacement: { limitsHash } } } };
+    let mutations = 0;
+    const result = await applyHardwareLimits({ expectedToken: token, containers: ['exact'] }, {
+        lease: (_options, callback) => callback(), loadRegistry: () => ({ exact: record }), loadRouting: () => ({}),
+        readPolicy: () => ({ token }), policyCheck: () => {}, loadPlan: () => plan,
+        isUnchanged: (captured, targetPlan) => hardwareApplyIsUnchanged(captured, targetPlan, {
+            loadRouting: () => ({}), inspect: () => ({ state: 'exact', id: containerId, running: true }),
+            readLabel: (_key, label) => label === 'ploinky.mpsgeneration' ? 'daemon:config' : limitsHash,
+            readApplied: () => ({ ...record, limitsHash, mpsGeneration: 'daemon:config' }),
+            verifyLimits: () => {}, readMps: () => ({ mpsGeneration: 'daemon:config' }),
+            verifyMps: () => verify(current),
+        }),
+        reconcile: async () => { mutations += 1; return { key: 'exact', state: 'applied' }; },
+    });
+    assert.equal(result.results[0].state, name === 'exact' ? 'unchanged' : 'applied');
+    assert.equal(mutations, name === 'exact' ? 0 : 1);
+});

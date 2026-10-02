@@ -872,7 +872,7 @@ export function createHardwareLaunchGuard(runtimeAdmission, {
                     cpus: cpu.length === 2 && cpu[0] !== 'max' ? Number(cpu[0]) / Number(cpu[1]) : null,
                     memoryBytes: readback.observed['memory.max'] && readback.observed['memory.max'] !== 'max' ? Number(readback.observed['memory.max']) : null,
                     cgroupNamespace: readback.cgroupNamespace, leaf: readback.leaf,
-                    ...(mps ? { gpuShare: descriptor.hardwareGpu, mpsGeneration: `${mps.state.daemonGeneration}:${mps.state.configurationGeneration}` } : {}),
+                    ...(mps ? { imageId: mps.imageId, gpuShare: descriptor.hardwareGpu, mpsGeneration: `${mps.state.daemonGeneration}:${mps.state.configurationGeneration}` } : {}),
                 });
             }
         },
