@@ -180,6 +180,43 @@ const EXACT_LEAF = Object.freeze({
     'memory.max': String(512 * 1024 * 1024), 'memory.swap.max': '0', 'cpu.max': '50000 100000', 'pids.max': '128',
 });
 
+// Amendment A3: the readback compares integers. The engine truncates the
+// quota it derives from --cpus (28999 for 0.29), which must pass; any other
+// quota or period is a typed refusal. The applied record reports the
+// admitted value and keeps the raw observation as evidence.
+test('CPU.readback-accepts-the-exact-and-truncated-quota-and-records-the-admitted-value', (t) => {
+    const box = inBox(t);
+    const manifest = { container: 'node:20-alpine', llmRuntime: { runtimePolicy: { resources: { memory: '512m', cpus: '0.29', pidsLimit: 128 } } } };
+    const launched = (cpuMax, recorded = []) => createHardwareLaunchGuard(admit(box, manifest), {
+        key: 'ploinky_demo_worker', ref: 'demo/worker', hardwareContext: prepared(), fsApi: launchedFixture({ ...EXACT_LEAF, 'cpu.max': cpuMax }),
+        instanceId: 'i-1', enableGeneration: 'g-1', recordApplied: (value) => recorded.push(value),
+        query: (_command, args) => (args.includes('{{.State.Pid}}') ? { ok: true, stdout: '321\n' } : { ok: false, stdout: '' }),
+    }).afterLaunch({ containerId: 'f'.repeat(64) });
+    for (const cpuMax of ['28999 100000', '29000 100000']) {
+        const recorded = [];
+        assert.equal(launched(cpuMax, recorded), undefined, cpuMax);
+        assert.equal(recorded.length, 1, cpuMax);
+        assert.equal(recorded[0].cpus, 0.29, `the admitted value, not ${cpuMax}`);
+        assert.equal(recorded[0].cpuMax, cpuMax, 'the raw observation stays as evidence');
+    }
+    for (const cpuMax of ['28998 100000', '29001 100000', '29000 50000', 'max 100000']) {
+        const recorded = [];
+        assert.throws(() => launched(cpuMax, recorded), (error) => {
+            assert.equal(findHardwareOutcome(error)?.code, HARDWARE_UNENFORCEABLE, cpuMax);
+            assert.match(error.message, /cpu\.max/, cpuMax);
+            return true;
+        }, cpuMax);
+        assert.deepEqual(recorded, [], `${cpuMax}: nothing is recorded for a refused launch`);
+    }
+    // The leaf check itself, without a launch.
+    const check = (cpuMax) => verifyLeafLimits({ fsApi: launchedFixture({ 'cpu.max': cpuMax }), leaf: '/ploinky/agents/libpod-abc', expected: { cpus: '0.29' } }).ok;
+    assert.equal(check('28999 100000'), true);
+    assert.equal(check('29000 100000'), true);
+    assert.equal(check('28998 100000'), false);
+    assert.equal(check('29001 100000'), false);
+    assert.equal(check('29000 50000'), false);
+});
+
 test('D.readback-mismatch', (t) => {
     const box = inBox(t);
     const launched = (fake) => launchGuard(box, LIMITED, { fake }).afterLaunch({ containerId: 'f'.repeat(64) });

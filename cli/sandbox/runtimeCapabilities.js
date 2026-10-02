@@ -41,6 +41,7 @@ import {
     resolveStoredOverride,
 } from './hardwareLimits/resolve.mjs';
 import { verifyLaunchedHardwareLimits } from './hardwareLimits/delegation.mjs';
+import { parseAdmittedCpus, cpuMaxMatches } from './hardwareLimits/cpuQuota.mjs';
 import { engineCommandArgs } from './hardwareLimits/runtimeCommand.mjs';
 import { writeAppliedObservation } from './hardwareLimits/runtimeState.mjs';
 import { verifyMpsLaunch } from './hardwareLimits/mpsLaunch.mjs';
@@ -778,7 +779,7 @@ function hardwarePlacementFor(descriptor, context, runtimeKind) {
     const resources = descriptor.runtimePolicy?.resources || {};
     const resolved = {
         // Canonical decimal: 0.5 and 0.50 are the same rendered quota.
-        cpus: resources.cpus === undefined ? null : String(Number(resources.cpus)),
+        cpus: resources.cpus === undefined ? null : (parseAdmittedCpus(String(resources.cpus)).canonical ?? String(Number(resources.cpus))),
         memoryBytes: resources.memory === undefined ? null : declaredMemoryBytes(resources.memory),
         pidsLimit: resources.pidsLimit === undefined ? null : Number(resources.pidsLimit),
     };
@@ -812,6 +813,13 @@ export function limitsHashReuseReason(descriptor, observedLabel) {
 // The refusal recorded by a metadata admission, or null.
 export function hardwareRefusalOf(admission) {
     return admission?.hardwareEligibility?.state === 'refused' ? admission.hardwareEligibility.refusal : null;
+}
+
+// The cpus value an applied record reports: the admitted canonical decimal when
+// the verified readback matches it, otherwise the observed ratio.
+function appliedCpus(expected, cpuMax) {
+    if (expected !== null && expected !== undefined && cpuMaxMatches(cpuMax.join(' '), expected)) return Number(expected);
+    return Number(cpuMax[0]) / Number(cpuMax[1]);
 }
 
 /**
@@ -886,7 +894,11 @@ export function createHardwareLaunchGuard(runtimeAdmission, {
                 recordApplied({
                     key: observationKey, containerId, instanceId, enableGeneration,
                     limitsHash: descriptor.hardwarePlacement.limitsHash,
-                    cpus: cpu.length === 2 && cpu[0] !== 'max' ? Number(cpu[0]) / Number(cpu[1]) : null,
+                    // The admitted canonical value, never the engine's truncated
+                    // quota ratio (28999/100000 for 0.29); the raw observation
+                    // stays available as evidence.
+                    cpus: cpu.length === 2 && cpu[0] !== 'max' ? appliedCpus(descriptor.hardwarePlacement.expected?.cpus, cpu) : null,
+                    ...(cpu.length === 2 && cpu[0] !== 'max' ? { cpuMax: cpu.join(' ') } : {}),
                     memoryBytes: readback.observed['memory.max'] && readback.observed['memory.max'] !== 'max' ? Number(readback.observed['memory.max']) : null,
                     cgroupNamespace: readback.cgroupNamespace, leaf: readback.leaf,
                     ...(mps ? { imageId: mps.imageId, gpuShare: descriptor.hardwareGpu, mpsGeneration: `${mps.state.daemonGeneration}:${mps.state.configurationGeneration}` } : {}),

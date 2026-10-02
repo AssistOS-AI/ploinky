@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
+import { cpuMaxMatches, cpuQuotaMatches, nanoCpusMatches } from '../../cli/sandbox/hardwareLimits/cpuQuota.mjs';
 import { EXIT, validateRunManifest, writePrivateJson } from './fixtures.mjs';
 import { runBoundedProcess, requireTransport } from './liveProcess.mjs';
 import { assertRemoteArrival } from './liveRemote.mjs';
@@ -185,10 +186,12 @@ function counter(text, name) {
     if (!match || !Number.isSafeInteger(Number(match[1]))) throw new Error(`Missing counter ${name}`);
     return Number(match[1]);
 }
+// The owned fixtures declare 0.5 CPUs; the engine may truncate the quota by one
+// microsecond, so the shared exact-integer comparison decides (cpuQuota.mjs).
+const FIXTURE_CPUS = '0.5';
 function requireLeafLimits(leaf) {
-    const cpu = String(leaf['cpu.max']).trim().split(/\s+/);
     if (String(leaf['memory.max']).trim() !== '67108864' || String(leaf['memory.swap.max']).trim() !== '0'
-        || cpu[0] !== '50000' || cpu[1] !== '100000' || String(leaf['pids.max']).trim() !== '64') throw new Error('Actual leaf limits differ');
+        || !cpuMaxMatches(leaf['cpu.max'], FIXTURE_CPUS) || String(leaf['pids.max']).trim() !== '64') throw new Error('Actual leaf limits differ');
 }
 
 export function createLiveAdapter(profile, {
@@ -231,7 +234,7 @@ export function createLiveAdapter(profile, {
         if (actual.id !== agent.id || actual.created !== agent.created || actual.image !== agent.image || actual.running !== true
             || !Number.isSafeInteger(actual.pid) || actual.pid <= 0 || !bounded(actual.startedAt, 128)) throw new Error('Agent identity changed');
         if (actual.memory !== 67108864 || actual.memorySwap !== 67108864 || actual.pidsLimit !== 64
-            || !(actual.nanoCpus === 500000000 || actual.cpuQuota === 50000 && actual.cpuPeriod === 100000)) throw new Error('Agent inspect limits differ');
+            || !(nanoCpusMatches(actual.nanoCpus, FIXTURE_CPUS) || cpuQuotaMatches(actual.cpuQuota, actual.cpuPeriod, FIXTURE_CPUS))) throw new Error('Agent inspect limits differ');
         return actual;
     }
     async function cpuCase() {

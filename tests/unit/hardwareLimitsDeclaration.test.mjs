@@ -736,7 +736,7 @@ test('HD.long-requested-value-is-a-bounded-refusal', () => {
     assert.equal(outcomes[0].requested[0].value, outcomes[1].requested[0].value);
     // The interactive refusal is bounded the same way.
     let interactive = null;
-    try { assertInteractiveHardwareLimitsAbsent(NEW({ cpus: `0.${'5'.repeat(200)}` }), { agentName: 'shell', repoName: 'demo', containerName: 'ploinky_demo_shell' }); }
+    try { assertInteractiveHardwareLimitsAbsent(NEW({ cpus: `${'0'.repeat(200)}0.5` }), { agentName: 'shell', repoName: 'demo', containerName: 'ploinky_demo_shell' }); }
     catch (error) { interactive = errors.findHardwareOutcome(error); }
     assert.ok(interactive && Buffer.byteLength(interactive.requested[0].value) <= errors.OUTCOME_BOUNDS.value);
     // A value within the bound is carried unchanged.
@@ -789,7 +789,7 @@ test('HD.unrepresentable-or-zero-limits-are-refused-on-every-path', () => {
     captureWarnings();
     const invalid = [
         ['memory', '9007199254740992'], ['memory', '18014398509481984'], ['memory', `${'9'.repeat(70)}t`], ['memory', '0'], ['memory', 0],
-        ['cpus', '0'], ['cpus', 0], ['cpus', '9'.repeat(400)], ['cpus', '0.000001'],
+        ['cpus', '0'], ['cpus', 0], ['cpus', '9'.repeat(400)], ['cpus', '0.000001'], ['cpus', '0.00001'], ['cpus', '0.005'], ['cpus', '0.123456'],
     ];
     const paths = {
         'manifest hardwareLimits': (field, value) => ({ manifest: NEW({ [field]: value }) }),
@@ -806,11 +806,11 @@ test('HD.unrepresentable-or-zero-limits-are-refused-on-every-path', () => {
             }
         }
     }
-    // The largest representable memory and the smallest quota are accepted
+    // The largest representable memory and the smallest quota (0.01, never a finer value) are accepted
     // and placed with a real readback target.
-    const largest = admit(NEW({ memory: String(Number.MAX_SAFE_INTEGER), cpus: '0.00001' }), { hardwareAdmission: 'strict' }).admission;
+    const largest = admit(NEW({ memory: String(Number.MAX_SAFE_INTEGER), cpus: '0.01' }), { hardwareAdmission: 'strict' }).admission;
     assert.equal(largest.descriptor.hardwarePlacement.expected.memoryBytes, Number.MAX_SAFE_INTEGER);
-    assert.equal(largest.descriptor.hardwarePlacement.expected.cpus, '0.00001');
+    assert.equal(largest.descriptor.hardwarePlacement.expected.cpus, '0.01');
     // Reuse: the graph decision never treats an unrepresentable change as unchanged.
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-declaration-unsafe-'));
     try {
@@ -827,4 +827,89 @@ test('HD.unrepresentable-or-zero-limits-are-refused-on-every-path', () => {
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }
+});
+
+// Plan §8.1, §18.4 and amendment A3: a cpus value placed under hardware
+// limits has at most two decimal places and is never rounded; the minimum
+// is 0.01 for every declaration, and a finer value is a typed refusal.
+test('CPU.declared-cpus-admits-two-decimals-in-both-fields-and-both-profile-positions', () => {
+    captureWarnings();
+    const positions = {
+        'manifest hardwareLimits': (value) => ({ manifest: NEW({ cpus: value }) }),
+        'manifest deprecated path': (value) => ({ manifest: OLD({ cpus: value }) }),
+        'selected profile hardwareLimits': (value) => ({ manifest: { ...base, profiles: { default: {}, dev: { hardwareLimits: { cpus: value } } } }, profileName: 'dev' }),
+        'default profile deprecated path': (value) => ({ manifest: { ...base, profiles: { default: { llmRuntime: { runtimePolicy: { resources: { cpus: value } } } }, dev: {} } }, profileName: 'dev' }),
+    };
+    for (const [label, make] of Object.entries(positions)) {
+        for (const value of ['0.29', '0.57', '1.13', '0.01', '0.50', 0.29, 8]) {
+            const { manifest, profileName } = make(value);
+            for (const hardwareAdmission of ['metadata', 'strict']) {
+                const { admission } = admit(manifest, { profileName, hardwareAdmission });
+                assert.equal(admission.hardwareEligibility.state, 'eligible', `${label} ${value} (${hardwareAdmission})`);
+            }
+        }
+        for (const value of ['0.123456', '0.005', '0.001', '0.000005', '0.004999', 0.001]) {
+            const { manifest, profileName } = make(value);
+            for (const hardwareAdmission of ['metadata', 'strict']) {
+                assert.throws(() => admit(manifest, { profileName, hardwareAdmission }), (error) => error.name === 'RuntimePolicyError'
+                    && /\.cpus: must be a decimal from 0\.01 with at most two decimal places/.test(error.message), `${label} ${value} (${hardwareAdmission})`);
+            }
+        }
+    }
+});
+
+test('CPU.declared-cpus-is-refused-above-the-envelope-and-never-clamped', () => {
+    captureWarnings();
+    for (const [label, make] of [['hardwareLimits', NEW], ['deprecated', OLD]]) {
+        const atEnvelope = admit(make({ cpus: '8' }), { hardwareAdmission: 'metadata' }).admission;
+        assert.equal(atEnvelope.hardwareEligibility.state, 'eligible', label);
+        const above = admit(make({ cpus: '8.01' }), { hardwareAdmission: 'metadata' }).admission;
+        assert.equal(above.hardwareEligibility.state, 'refused', label);
+        const refusal = above.hardwareEligibility.refusal;
+        assert.equal(refusal.reasonCode, 'exceeds_envelope', label);
+        assert.match(refusal.reason, /cpus value 8\.01 declared in the manifest exceeds the Box CPU envelope of 8/, label);
+        assert.match(refusal.fix, /Declare at most 8 CPUs/, label);
+        assert.deepEqual(refusal.requested, [{ field: 'cpus', value: '8.01', source: 'manifest' }], label);
+        assert.throws(() => admit(make({ cpus: '8.01' }), { hardwareAdmission: 'strict' }), (error) => errors.findHardwareOutcome(error)?.reasonCode === 'exceeds_envelope', label);
+    }
+});
+
+test('CPU.admission-keeps-equal-values-equal-in-hash-and-rendered-argv', () => {
+    captureWarnings();
+    const a = admit(NEW({ cpus: '0.5' }), { hardwareAdmission: 'strict' }).admission;
+    const b = admit(NEW({ cpus: '0.50' }), { hardwareAdmission: 'strict' }).admission;
+    const c = admit(OLD({ cpus: 0.5 }), { hardwareAdmission: 'strict' }).admission;
+    assert.equal(hardwareLimitsHashOf(a.descriptor), hardwareLimitsHashOf(b.descriptor));
+    assert.equal(hardwareLimitsHashOf(a.descriptor), hardwareLimitsHashOf(c.descriptor));
+    const argv = (admission) => renderRuntimePolicyArgs(admission.descriptor, { runtime: 'podman' });
+    const cpusArgs = (admission) => argv(admission).slice(argv(admission).indexOf('--cpus'), argv(admission).indexOf('--cpus') + 2);
+    // Rendering is unchanged: --cpus VALUE with the declared decimal (the
+    // spelling follows the declaration); the hash and the expected readback
+    // use the canonical value, so nothing restarts.
+    assert.deepEqual(cpusArgs(a), ['--cpus', '0.5']);
+    assert.deepEqual(cpusArgs(b), ['--cpus', '0.50']);
+    assert.deepEqual(cpusArgs(c), ['--cpus', '0.5']);
+    assert.deepEqual(argv(a).filter((arg) => !/^0\.5/.test(arg)), argv(b).filter((arg) => !/^0\.5/.test(arg)));
+    assert.equal(a.descriptor.hardwarePlacement.expected.cpus, '0.5');
+    assert.equal(b.descriptor.hardwarePlacement.expected.cpus, '0.5');
+    // 0.29 renders as the canonical decimal, not a computed quota.
+    const decimal = admit(NEW({ cpus: '0.29' }), { hardwareAdmission: 'strict' }).admission;
+    assert.deepEqual(cpusArgs(decimal), ['--cpus', '0.29']);
+    assert.equal(decimal.descriptor.hardwarePlacement.expected.cpus, '0.29');
+});
+
+test('CPU.administrator-cpus-keeps-the-plan-vector-0.05-minimum-and-two-decimals', async () => {
+    const { resolveStoredOverride, overridePolicyFromStored } = await import('../../cli/sandbox/hardwareLimits/resolve.mjs');
+    const envelope = { cpus: 8, memoryBytes: 16 * 1024 ** 3 };
+    assert.deepEqual(resolveStoredOverride({ cpus: 0.05 }, envelope).policy, { resources: { cpus: '0.05' } });
+    assert.deepEqual(resolveStoredOverride({ cpus: 8 }, envelope).policy, { resources: { cpus: '8' } });
+    assert.deepEqual(resolveStoredOverride({ cpus: 0.29 }, envelope).policy, { resources: { cpus: '0.29' } });
+    for (const cpus of [0.04, 0.01, 0, 1.234, 0.123456, 0.004999, 8.01, -1, Number.NaN, Number.POSITIVE_INFINITY, null]) {
+        const resolved = resolveStoredOverride({ cpus }, envelope);
+        assert.equal(resolved.policy, null, String(cpus));
+        assert.equal(resolved.problem?.reasonCode, 'exceeds_envelope', String(cpus));
+        assert.deepEqual(resolved.problem.requested, [{ field: 'cpus', value: String(cpus), source: 'settings' }], String(cpus));
+    }
+    assert.throws(() => overridePolicyFromStored({ cpus: 0.04 }, envelope), (error) => error.field === 'cpus' && /0\.04 is below the 0\.05 minimum/.test(error.message));
+    assert.throws(() => overridePolicyFromStored({ cpus: 1.234 }, envelope), (error) => error.field === 'cpus' && /more than two decimal places/.test(error.message));
 });

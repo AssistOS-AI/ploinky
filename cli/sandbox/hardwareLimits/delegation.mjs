@@ -7,6 +7,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { cpuMaxMatches } from './cpuQuota.mjs';
 import { parseCgroupMount } from '../../../ploinky-box/entrypoint/cgroupDelegation.mjs';
 import {
     AGENTS_CGROUP_PARENT,
@@ -338,11 +339,10 @@ export function verifyLeafLimits({ fsApi = fs, cgroupRoot = CGROUP_ROOT, leaf, e
         }
     }
     if (expected.cpus) {
+        // Exact integer comparison: the period is 100000 and the quota is the
+        // admitted decimal's quota or the one the engine truncates it to.
         const cpuMax = value('cpu.max');
-        const parts = String(cpuMax || '').split(/\s+/);
-        const quota = Number(parts[0]);
-        const period = Number(parts[1]);
-        if (!(quota > 0 && period > 0) || Math.abs(quota / period - Number(expected.cpus)) > 1e-9) problems.push(`cpu.max is ${cpuMax}`);
+        if (!cpuMaxMatches(cpuMax, expected.cpus)) problems.push(`cpu.max is ${cpuMax}`);
     }
     if (expected.pidsLimit) {
         const pidsMax = value('pids.max');

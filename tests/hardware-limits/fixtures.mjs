@@ -384,6 +384,16 @@ export function buildRequiredCaseManifest() {
         ]),
         ...leaves(P, 'p1', unit('hardwareLimitsDeclaration.test.mjs'), [
             'HD.identity-hash-args-equal', 'HD.identity-migration-no-restart-graph', 'HD.identity-llm-reuse-callers',
+            'CPU.declared-cpus-admits-two-decimals-in-both-fields-and-both-profile-positions',
+            'CPU.declared-cpus-is-refused-above-the-envelope-and-never-clamped',
+            'CPU.admission-keeps-equal-values-equal-in-hash-and-rendered-argv',
+            'CPU.administrator-cpus-keeps-the-plan-vector-0.05-minimum-and-two-decimals',
+        ]),
+        ...leaves(P, 'p1', unit('hardwareLimitsCpuQuota.test.mjs'), [
+            'CPU.admission-accepts-up-to-two-decimals-and-canonicalizes',
+            'CPU.admission-refuses-finer-precision-and-never-rounds',
+            'CPU.readback-accepts-the-exact-quota-and-the-engine-truncation-only',
+            'CPU.readback-accepts-every-two-decimal-value-as-podman-truncates-it',
         ]),
         ...leaves(P, 'p1', unit('hardwareLimitsDelegation.test.mjs'), [
             'DG.no-aggregate-write', 'DG.nonroot-parents', 'DG.runtime-contexts', 'DG.outer-inspect-runtime',
@@ -394,6 +404,7 @@ export function buildRequiredCaseManifest() {
         ]),
         ...leaves(P, 'p1', unit('hardwareLimitsDrift.test.mjs'), [
             'D.memory-swap-equal', 'D.cgroupfs-prefix', 'D.exempt-prefix-absent', 'D.readback-mismatch',
+            'CPU.readback-accepts-the-exact-and-truncated-quota-and-records-the-admitted-value',
             'D.readback-page-rounding', 'D.readback-swap-accounting', 'D.readback-private-namespace', 'D.readback-namespace-process-exit', 'D.precreate-change', 'D.prepublish-change',
             'D.managed-reuse', 'D.host-none-reuse', 'D.graph-reuse',
             'D.llm-admitted-policy-reuse', 'D.one-replace-then-reuse', 'D.unrelated-token-no-replace',

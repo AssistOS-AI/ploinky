@@ -19,6 +19,7 @@ import {
 import { readBoxHardwareContext } from './context.mjs';
 import { declarationConflictRefusal, declaredLayerPolicy } from './declaredLimits.mjs';
 import { resolveStoredOverride, storedRequestedLimits } from './resolve.mjs';
+import { parseAdmittedCpus } from './cpuQuota.mjs';
 
 export const HARDWARE_RESOURCE_FIELDS = Object.freeze(['memory', 'cpus', 'pidsLimit']);
 const LAYERS = Object.freeze([
@@ -183,6 +184,32 @@ function controllerRefusal(controller, context) {
     };
 }
 
+// Plan §8.1 and amendment A3: a cpus value placed under hardware limits is a
+// decimal with at most two places (never rounded) and does not exceed the
+// envelope. A stored value was checked when its entry was resolved.
+function cpuAdmissionRefusal(requested, context) {
+    for (const entry of requested) {
+        if (entry.field !== 'cpus' || entry.source === 'settings') continue;
+        const admitted = parseAdmittedCpus(entry.value);
+        if (!admitted.ok) {
+            return {
+                reasonCode: 'exceeds_envelope',
+                reason: `The cpus value ${String(entry.value).slice(0, 64)} declared in the ${entry.source} ${admitted.reason}, so its CPU quota cannot be read back exactly.`,
+                fix: `Declare cpus as a decimal from 0.01 with at most two decimal places (for example 0.29) in the ${entry.source}, or remove the limit.`,
+            };
+        }
+        const envelopeCpus = Number(context.envelope?.cpus);
+        if (Number.isFinite(envelopeCpus) && envelopeCpus > 0 && Number(admitted.canonical) > envelopeCpus) {
+            return {
+                reasonCode: 'exceeds_envelope',
+                reason: `The cpus value ${admitted.canonical} declared in the ${entry.source} exceeds the Box CPU envelope of ${envelopeCpus}.`,
+                fix: `Declare at most ${envelopeCpus} CPUs in the ${entry.source}, or remove the limit.`,
+            };
+        }
+    }
+    return null;
+}
+
 function storeRefusal(context) {
     return {
         reasonCode: 'store_unreadable',
@@ -272,6 +299,7 @@ export function evaluateHardwareEligibility(descriptor, context, { helper = fals
                     break;
                 }
             }
+            if (!refusal) refusal = cpuAdmissionRefusal(requested, context);
         }
     }
     let refusalParts = null;

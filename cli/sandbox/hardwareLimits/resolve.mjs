@@ -2,6 +2,7 @@
 // (plan §3 defaults, §8.1, §8.3). Pure functions over bounded observations.
 
 import crypto from 'node:crypto';
+import { parseAdmittedCpus, MIN_ADMINISTRATOR_CPU_HUNDREDTHS } from './cpuQuota.mjs';
 import { resolveMpsShare, MpsError, unsupportedGpuMemoryModelReason, UNSUPPORTED_GPU_MEMORY_MODEL_FIX } from './mpsEligibility.mjs';
 
 export const MIB = 1024 * 1024;
@@ -127,7 +128,7 @@ export function resolveEffectiveLimits({ declared = {}, override = null, envelop
         provenance: { cpus: null, memory: null, pidsLimit: null },
     };
     if (declared.cpus !== undefined && declared.cpus !== null) {
-        resolved.cpus = String(declared.cpus);
+        resolved.cpus = parseAdmittedCpus(declared.cpus).canonical ?? String(declared.cpus);
         resolved.provenance.cpus = 'declared';
     }
     if (declared.memory !== undefined && declared.memory !== null) {
@@ -140,7 +141,7 @@ export function resolveEffectiveLimits({ declared = {}, override = null, envelop
         resolved.provenance.pidsLimit = 'declared';
     }
     if (override?.cpus !== undefined) {
-        resolved.cpus = String(override.cpus);
+        resolved.cpus = parseAdmittedCpus(override.cpus).canonical ?? String(override.cpus);
         resolved.provenance.cpus = 'settings';
     }
     if (override?.memoryPercent !== undefined) {
@@ -170,10 +171,12 @@ export function overridePolicyFromStored(entry, envelope, { gpu = null, ref = 'R
     if (entry.gpu !== undefined) resolveStoredGpuShare(entry.gpu, gpu, ref);
     const resources = {};
     if (entry.cpus !== undefined) {
-        const cpus = Number(entry.cpus);
-        if (!Number.isFinite(cpus) || cpus < MIN_CPUS) {
-            throw new LimitResolutionError(`cpus ${entry.cpus} is below the ${MIN_CPUS} minimum`, { field: 'cpus' });
+        // At most two decimals and at least 0.05, never rounded (plan §18.4, A3).
+        const admitted = parseAdmittedCpus(entry.cpus, { minimumHundredths: MIN_ADMINISTRATOR_CPU_HUNDREDTHS });
+        if (!admitted.ok) {
+            throw new LimitResolutionError(`cpus ${String(entry.cpus).slice(0, 64)} ${admitted.reason}; use a decimal from ${MIN_CPUS} with at most two decimal places`, { field: 'cpus' });
         }
+        const cpus = Number(admitted.canonical);
         if (!Number.isFinite(Number(envelope?.cpus)) || Number(envelope.cpus) <= 0) {
             throw new LimitResolutionError('the Box CPU envelope is unknown', { code: 'controller_unavailable', field: 'cpus', status: 409 });
         }
@@ -182,7 +185,7 @@ export function overridePolicyFromStored(entry, envelope, { gpu = null, ref = 'R
                 code: 'exceeds_envelope', field: 'cpus',
             });
         }
-        resources.cpus = String(entry.cpus);
+        resources.cpus = admitted.canonical;
     }
     if (entry.memoryPercent !== undefined) resources.memory = String(resolveMemoryPercent(entry.memoryPercent, envelope?.memoryBytes));
     return Object.keys(resources).length ? { resources } : null;
