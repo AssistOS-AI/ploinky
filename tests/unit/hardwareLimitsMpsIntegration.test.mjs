@@ -3,10 +3,11 @@ import test from 'node:test';
 import { coordinateMpsLifecycle } from '../../cli/sandbox/hardwareLimits/mpsLifecycle.mjs';
 import { createMpsLaunch, readMpsLaunch, verifyMpsLaunch } from '../../cli/sandbox/hardwareLimits/mpsLaunch.mjs';
 import { reconcileExactHardwareInstance } from '../../cli/sandbox/hardwareLimits/reconcile.mjs';
+import { resolveMpsServerDefault } from '../../cli/sandbox/hardwareLimits/mpsTransition.mjs';
 
 const imageId = 'a'.repeat(64);
 const share = { smPercent: 25, vramPercent: 25, vramMiB: 1024, memoryMiB: 1024, memoryBytes: 1024 ** 3, deviceUuid: 'GPU-fixture', driverVersion: '550.1', wiringFingerprint: 'wiring' };
-const defaults = (value) => ({ smPercent: value.smPercent, memoryMiB: value.memoryMiB, deviceUuid: value.deviceUuid, driverVersion: value.driverVersion, wiringFingerprint: value.wiringFingerprint });
+const defaults = (value) => resolveMpsServerDefault([{ share: value }]);
 const daemon = (value = share, generation = 'old') => ({ schema: 1, status: 'ready', daemon: { pid: 123 }, daemonGeneration: generation, configurationGeneration: 'config', pipeDirectory: `/run/ploinky/mps/pipe-${'a'.repeat(32)}`, serverDefault: defaults(value), pendingClients: [] });
 const clone = (value) => structuredClone(value);
 const tick = () => new Promise((resolve) => setImmediate(resolve));
@@ -353,7 +354,7 @@ test('MI.graph-start-after-client-only-failure-keeps-the-daemon', async () => {
 test('MI.graph-launch-failure-then-lifecycle-retry-recreates-only-the-failed-client', async () => {
     const { ensureMpsGraphAgentService } = await import('../../cli/sandbox/hardwareLimits/mpsLifecycle.mjs');
     const gshare = { smPercent: 25, vramPercent: 25, memoryMiB: 1024, vramMiB: 1024, memoryBytes: 1024 ** 3, deviceUuid: 'GPU-12345678-1234-1234-1234-123456789012', driverVersion: '550.1', wiringFingerprint: 'f'.repeat(64) };
-    const def = (value) => ({ smPercent: value.smPercent, memoryMiB: value.memoryMiB, deviceUuid: value.deviceUuid, driverVersion: value.driverVersion, wiringFingerprint: value.wiringFingerprint });
+    const def = (value) => resolveMpsServerDefault([{ share: value }]);
     let counter = 16;
     const record = (key) => ({ type: 'agent', repoName: 'demo', agentName: key, alias: '', instanceId: `i-${key}-${counter}`, enableGeneration: `g-${key}-${counter}`, containerId: (counter++).toString(16).padStart(64, '0') });
     const registry = { a: record('a'), b: record('b'), c: record('c') };

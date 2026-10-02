@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { ensureMpsGraphAgentService, acknowledgeMpsRuntimeReady, verifyMpsRuntimeReady, finalizeMpsGraph } from '../../cli/sandbox/hardwareLimits/mpsLifecycle.mjs';
 import { readMpsLaunch } from '../../cli/sandbox/hardwareLimits/mpsLaunch.mjs';
+import { resolveMpsServerDefault } from '../../cli/sandbox/hardwareLimits/mpsTransition.mjs';
 
 const imageId = `sha256:${'a'.repeat(64)}`;
 const share = (smPercent = 25) => ({ smPercent, memoryMiB: 1024, deviceUuid: 'GPU-fixture', driverVersion: '550.1', wiringFingerprint: 'wiring' });
@@ -9,7 +10,7 @@ const record = (key) => ({ type: 'agent', repoName: 'demo', agentName: key, inst
 const client = (key, value = share()) => ({ key, ref: `demo/${key}`, ...record(key), share: value, mpsGeneration: 'old:config' });
 const tuple = (value) => [value.key, value.instanceId, value.enableGeneration, value.containerId || ''].join('\0');
 const ready = (value = share()) => ({ schema: 1, status: 'ready', daemon: { pid: 1000 }, daemonGeneration: 'old', configurationGeneration: 'config',
-    pipeDirectory: `/run/ploinky/mps/pipe-${'a'.repeat(32)}`, logDirectory: `/run/ploinky/mps/log-${'a'.repeat(32)}`, serverDefault: value,
+    pipeDirectory: `/run/ploinky/mps/pipe-${'a'.repeat(32)}`, logDirectory: `/run/ploinky/mps/log-${'a'.repeat(32)}`, serverDefault: resolveMpsServerDefault([{ share: value }]),
     pendingClients: [], oldClients: [], drainedClients: [], graphPrepared: true, graphPreparationId: 'graph-1', graphNeedsTransition: false });
 
 function fixture({ state: initial = null, policies = [['demo/a', { gpu: share() }]] } = {}) {

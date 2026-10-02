@@ -4,7 +4,7 @@ import { readMpsStatus, inspectPreparedMpsImage, inspectMpsTargetEligibility } f
 import { projectAppliedLimits } from '../../cli/server/workspaceMetricsLimits.mjs';
 const facts = { memoryModel: 'dedicated', name: 'RTX 4090', uuid: 'GPU-fixture', driverVersion: '550.1', memoryMiB: 24576 };
 const grant = { valid: true, state: 'active', fingerprint: 'wiring', agents: ['demo/worker'], mps: { control: { source: '/private/tool' } } };
-const ready = { status: 'ready', daemonGeneration: 'daemon1', configurationGeneration: 'config1', serverDefault: { smPercent: 50, memoryMiB: 4096, deviceUuid: facts.uuid, driverVersion: facts.driverVersion, wiringFingerprint: grant.fingerprint }, pendingClients: [{ key: 'alias', instanceId: 'i', enableGeneration: 'g', secret: 'omit' }] };
+const ready = { status: 'ready', daemonGeneration: 'daemon1', configurationGeneration: 'config1', serverDefault: { smPercent: 50, memoryMiB: 4096, shareMemoryMiB: 3500, deviceUuid: facts.uuid, driverVersion: facts.driverVersion, wiringFingerprint: grant.fingerprint }, pendingClients: [{ key: 'alias', instanceId: 'i', enableGeneration: 'g', secret: 'omit' }] };
 const deps = { readGrant: () => grant, observeGpu: () => facts, readState: () => ready, backend: { observe: () => ({ state: 'owned' }), verify: () => true } };
 test('MS.read-only status retains private admission facts without serializing them', () => {
     const result = readMpsStatus(deps);
@@ -12,7 +12,7 @@ test('MS.read-only status retains private admission facts without serializing th
     assert.equal(result.facts, facts); assert.equal(result.grant, grant);
     assert.equal(JSON.stringify(result).includes('/private/tool'), false);
     assert.equal(JSON.stringify(result).includes('omit'), false);
-    assert.deepEqual(result.serverDefault, { smPercent: 50, vramMiB: 4096 });
+    assert.deepEqual(result.serverDefault, { smPercent: 50, vramMiB: 4096, shareMemoryMiB: 3500 });
 });
 test('MS.dormant policies require no daemon and lost daemon has no applied generation', () => {
     assert.equal(readMpsStatus({ ...deps, readState: () => null }).daemonStatus, 'stopped');

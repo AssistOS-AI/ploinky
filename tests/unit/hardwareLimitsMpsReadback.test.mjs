@@ -7,7 +7,8 @@ import test from 'node:test';
 import { applyHardwareLimits } from '../../cli/sandbox/hardwareLimits/reconcile.mjs';
 import { coordinateMpsLifecycle } from '../../cli/sandbox/hardwareLimits/mpsLifecycle.mjs';
 import { readMpsLaunch } from '../../cli/sandbox/hardwareLimits/mpsLaunch.mjs';
-import { createMpsDaemonBackend, parseMpsMemoryReply, parseMpsServerList, parseMpsSmReply, runMpsControl } from '../../cli/sandbox/hardwareLimits/mps.mjs';
+import { configureMpsDefaults, createMpsDaemonBackend, mpsClientEnvironment, mpsServerDefaultMemoryMiB, parseMpsMemoryReply, parseMpsServerList, parseMpsSmReply, runMpsControl, validateMpsServerDefault } from '../../cli/sandbox/hardwareLimits/mps.mjs';
+import { resolveMpsServerDefault } from '../../cli/sandbox/hardwareLimits/mpsTransition.mjs';
 import { replyExcerpt } from '../../cli/sandbox/hardwareLimits/applyCause.mjs';
 import { describeMpsTool, MPS_TOOL_PATHS } from '../../ploinky-box/lib/mpsTools.mjs';
 
@@ -156,4 +157,36 @@ test('F1.a-deadline-with-no-refused-reply-is-reported-as-the-deadline-alone', ()
     const result = startWithStep(100_000, '1024M\n');
     assert.match(result.message, /exceeded its deadline/);
     assert.doesNotMatch(result.message, /last refused reply/);
+});
+
+// V1 (amendment A6): the daemon-wide memory default is a whole GiB; the driver reports it in whole GiB and is lossy below that.
+const share17 = { smPercent: 25, vramPercent: 17, vramMiB: 1044, memoryMiB: 1044, memoryBytes: 1044 * 1048576, deviceUuid: 'GPU-fixture', driverVersion: '595.91.07', wiringFingerprint: 'wiring' };
+const policies = (...shares) => shares.map(entry => ({ share: entry }));
+
+test('V1.the-server-default-memory-is-the-largest-share-rounded-up-to-a-whole-gib-and-keeps-the-share-it-came-from', () => {
+    for (const [share, whole] of [[512, 1024], [1023, 1024], [1024, 1024], [1025, 2048], [1044, 2048], [2048, 2048], [2088, 3072], [6144, 6144]]) assert.equal(mpsServerDefaultMemoryMiB(share), whole, String(share));
+    for (const bad of [0, -1, 1.5, NaN, Infinity, '1024', null, undefined, Number.MAX_SAFE_INTEGER]) assert.throws(() => mpsServerDefaultMemoryMiB(bad), /Invalid MPS share memory/, String(bad));
+    const first = resolveMpsServerDefault(policies(share17));
+    assert.deepEqual({ smPercent: first.smPercent, memoryMiB: first.memoryMiB, shareMemoryMiB: first.shareMemoryMiB }, { smPercent: 25, memoryMiB: 2048, shareMemoryMiB: 1044 });
+    const raised = resolveMpsServerDefault(policies(share17, { ...share17, smPercent: 50, vramPercent: 34, vramMiB: 2088, memoryMiB: 2088, memoryBytes: 2088 * 1048576 }));
+    assert.deepEqual({ smPercent: raised.smPercent, memoryMiB: raised.memoryMiB, shareMemoryMiB: raised.shareMemoryMiB }, { smPercent: 50, memoryMiB: 3072, shareMemoryMiB: 2088 });
+    // Raising the share across a GiB boundary changes the default (a restart); a change inside one GiB does not.
+    assert.notDeepEqual(first, raised);
+    assert.equal(resolveMpsServerDefault(policies({ ...share17, memoryMiB: 1100, vramMiB: 1100 })).memoryMiB, first.memoryMiB);
+    // The client's own variables keep the EXACT share.
+    assert.equal(mpsClientEnvironment(share17, `/run/ploinky/mps/pipe-${'a'.repeat(32)}`).CUDA_MPS_PINNED_DEVICE_MEM_LIMIT, '0=1044M');
+});
+
+test('V1.a-memory-default-that-is-not-a-whole-gib-is-refused-by-the-daemon-configuration-and-start', () => {
+    assert.equal(validateMpsServerDefault({ smPercent: 25, memoryMiB: 2048 }).memoryMiB, 2048);
+    for (const memoryMiB of [1044, 1000, 1536, 2049]) {
+        assert.throws(() => validateMpsServerDefault({ smPercent: 25, memoryMiB }), /not a whole number of GiB/, String(memoryMiB));
+        const calls = [];
+        assert.throws(() => configureMpsDefaults({ smPercent: 25, memoryMiB }, { uid: 1000, query: () => { calls.push(1); return { status: 0, stdout: '', stderr: '' }; } }), /Invalid MPS server defaults/, String(memoryMiB));
+        assert.equal(calls.length, 0, 'nothing is sent to the daemon');
+        const host = fakeHost();
+        const backend = createMpsDaemonBackend({ fsApi: host.fsApi, uid: 1000, query: () => { calls.push(1); return { status: 0 }; }, observe: () => ({ state: 'owned' }), now: () => 0, wait: () => {} });
+        assert.throws(() => backend.start({ smPercent: 25, memoryMiB }, { tools: host.descriptors }), /Invalid MPS server defaults/, String(memoryMiB));
+        assert.equal(calls.length, 0, 'the daemon is not started');
+    }
 });

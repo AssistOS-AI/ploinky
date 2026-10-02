@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { MpsError } from './mpsEligibility.mjs';
-import { isMpsClientAlias, validateMpsDefault, verifyDetail } from './mps.mjs';
+import { isMpsClientAlias, mpsServerDefaultMemoryMiB, validateMpsDefault, verifyDetail } from './mps.mjs';
 import { findHardwareOutcome } from './errors.mjs';
 import { inApplyStep, describeApplyCause, formatApplyCause } from './applyCause.mjs';
 
@@ -57,7 +57,9 @@ export function resolveMpsServerDefault(configuredPolicies = []) {
         validateMpsDefault(share);
         for (const field of ['deviceUuid', 'driverVersion', 'wiringFingerprint']) if (share[field] !== identity[field]) throw new MpsError('MPS policies describe different GPU wiring');
     }
-    return Object.freeze({ smPercent: Math.max(...policies.map((value) => value.share.smPercent)), memoryMiB: Math.max(...policies.map((value) => value.share.memoryMiB)), deviceUuid: identity.deviceUuid, driverVersion: identity.driverVersion, wiringFingerprint: identity.wiringFingerprint });
+    // The daemon default is the largest share rounded up to a whole GiB (A6); each client keeps its exact share.
+    const shareMemoryMiB = Math.max(...policies.map((value) => value.share.memoryMiB));
+    return Object.freeze({ smPercent: Math.max(...policies.map((value) => value.share.smPercent)), memoryMiB: mpsServerDefaultMemoryMiB(shareMemoryMiB), shareMemoryMiB, deviceUuid: identity.deviceUuid, driverVersion: identity.driverVersion, wiringFingerprint: identity.wiringFingerprint });
 }
 
 export function planMpsTransition({ oldClients = [], desiredClients = [], configuredPolicies = desiredClients, selectedKeys = [], state = null, observedDaemon = { state: 'gone' }, defaultsVerified = false } = {}) {

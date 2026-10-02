@@ -673,6 +673,8 @@ export function buildRequiredCaseManifest() {
             'W2.every-reply-parse-error-carries-the-sanitized-reply-and-the-grammar-stays-strict',
             'F1.the-final-readiness-error-keeps-the-last-refused-reply-wherever-the-deadline-lands',
             'F1.a-deadline-with-no-refused-reply-is-reported-as-the-deadline-alone',
+            'V1.the-server-default-memory-is-the-largest-share-rounded-up-to-a-whole-gib-and-keeps-the-share-it-came-from',
+            'V1.a-memory-default-that-is-not-a-whole-gib-is-refused-by-the-daemon-configuration-and-start',
         ]),
         // LIVE-P1: a recreate by image ID keeps the dependency installer's identity.
         ...leaves(P, 'p4', unit('hardwareLimitsInstallerImage.test.mjs'), [

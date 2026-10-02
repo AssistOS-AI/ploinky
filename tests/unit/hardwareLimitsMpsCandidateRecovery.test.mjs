@@ -10,6 +10,7 @@ import { coordinateMpsLifecycle, trackMpsRuntimePending, acknowledgeMpsRuntimeRe
 import { mpsOwnerState, mpsLaunchOwner, releaseMpsLaunchOwner, settleCreatedMpsCandidate } from '../../cli/sandbox/hardwareLimits/mpsInventory.mjs';
 import { prepareMpsGraph } from '../../cli/sandbox/hardwareLimits/mpsGraph.mjs';
 import { MpsError } from '../../cli/sandbox/hardwareLimits/mpsEligibility.mjs';
+import { resolveMpsServerDefault } from '../../cli/sandbox/hardwareLimits/mpsTransition.mjs';
 
 // Fix round 3, M1: a created share-client candidate whose readiness failed,
 // or whose process died before readiness, is settled through its own exact
@@ -18,7 +19,8 @@ import { MpsError } from '../../cli/sandbox/hardwareLimits/mpsEligibility.mjs';
 // and every cohort drain still passes the coordinator's registry check.
 const uuid = 'GPU-12345678-1234-1234-1234-123456789012';
 const share = (sm) => ({ smPercent: sm, vramPercent: sm, vramMiB: 1024 * sm / 25, memoryMiB: 1024 * sm / 25, memoryBytes: 1024 * sm / 25 * 1048576, deviceUuid: uuid, driverVersion: '595.91.07', wiringFingerprint: 'f'.repeat(64) });
-const serverDefault = (sm) => ({ smPercent: sm, memoryMiB: 1024 * sm / 25, deviceUuid: uuid, driverVersion: '595.91.07', wiringFingerprint: 'f'.repeat(64) });
+// The daemon default is the product's own: the largest share rounded up to a whole GiB, with the share it came from.
+const serverDefault = (sm) => resolveMpsServerDefault([{ share: share(sm) }]);
 const oldId = 'a'.repeat(64), newId = 'c'.repeat(64), cpuId = 'd'.repeat(64);
 
 function world(t, { policy = 50, journal = null } = {}) {

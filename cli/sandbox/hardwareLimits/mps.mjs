@@ -20,6 +20,20 @@ export function validateMpsDefault(value) {
     if (!value || !safeInteger(value.smPercent, 1, 100) || !safeInteger(value.memoryMiB, 512, Number.MAX_SAFE_INTEGER / 1048576)) throw new MpsError('Invalid MPS server defaults');
     return value;
 }
+// The MPS server's own default memory limit. The daemon reports a limit in whole GiB and is lossy below that (an observed
+// 1044M reads back as 1G), so the daemon-wide default is the largest share rounded UP to the next whole GiB and the exact
+// share is carried by each client's own environment (a client value can only tighten the default). Every caller, the status
+// and the live runner use this one function.
+export function mpsServerDefaultMemoryMiB(maxShareMiB) {
+    if (!safeInteger(maxShareMiB, 1, Number.MAX_SAFE_INTEGER / 1048576)) throw new MpsError('Invalid MPS share memory');
+    return Math.ceil(maxShareMiB / 1024) * 1024;
+}
+// A daemon-wide default (never a client share): the share rules and a whole number of GiB, so that the readback is exact.
+export function validateMpsServerDefault(value) {
+    validateMpsDefault(value);
+    if (value.memoryMiB % 1024 !== 0) throw new MpsError('Invalid MPS server defaults (the memory default is not a whole number of GiB)');
+    return value;
+}
 // The backend's verification decision, with the reason when it refuses. The decision is always `verify`'s (a caller may
 // wrap or replace it); the reason is asked only after a refusal and is best effort.
 export function verifyDetail(backend, state) {
@@ -72,7 +86,7 @@ export function runMpsControl(command, { env, query = spawnSync, uid = process.g
 }
 const READBACK_KIND = Object.freeze({ get_default_active_thread_percentage: 'sm', 'get_default_device_pinned_mem_limit 0': 'memory', get_server_list: 'servers' });
 export function configureMpsDefaults(value, { control = runMpsControl, env, uid = process.getuid?.(), query, verifyServer = () => false, explainServer = () => null, onReadback = () => {} } = {}) {
-    validateMpsDefault(value);
+    validateMpsServerDefault(value);
     const options = { env, uid, ...(query ? { query } : {}) };
     control(`set_default_active_thread_percentage ${value.smPercent}`, options);
     control(`set_default_device_pinned_mem_limit 0 ${value.memoryMiB}M`, options);
@@ -349,7 +363,7 @@ export function createMpsDaemonBackend({ root = MPS_ROOT, fsApi = fs, query = sp
         },
         control,
         start(defaults, { tools, configurationGeneration = crypto.randomUUID(), onState = () => {} } = {}) {
-            assertUid(uid); validateMpsDefault(defaults);
+            assertUid(uid); validateMpsServerDefault(defaults);
             // The mounted tools are revalidated against the wiring's fingerprint. A drifted or unreadable tool is a typed
             // sharing refusal with its own reason, like every other prerequisite; the plain errors of the fingerprint helper
             // carry no code and would otherwise surface as a generic Apply failure.

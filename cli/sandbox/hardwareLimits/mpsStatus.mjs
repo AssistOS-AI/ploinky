@@ -39,7 +39,8 @@ export function readMpsStatus({ workspaceRoot, readGrant = readBoxGpuGrant, obse
         const verified = sameHardware && owned === 'owned' && Boolean(state.daemonGeneration && state.configurationGeneration) && backend.verify(state);
         result.daemonStatus = verified ? 'ready' : owned === 'gone' ? 'lost' : 'pending';
         if (verified) {
-            result.serverDefault = { smPercent: state.serverDefault.smPercent, vramMiB: state.serverDefault.memoryMiB };
+            // vramMiB is the daemon's configured default (a whole GiB); shareMemoryMiB is the largest share it was derived from.
+            result.serverDefault = { smPercent: state.serverDefault.smPercent, vramMiB: state.serverDefault.memoryMiB, shareMemoryMiB: state.serverDefault.shareMemoryMiB ?? null };
             result.mpsGeneration = `${state.daemonGeneration}:${state.configurationGeneration}`;
         }
         result.pendingClients = (Array.isArray(state.pendingClients) ? state.pendingClients : []).slice(0, 256).map(({ key, instanceId, enableGeneration }) => ({ key, instanceId, enableGeneration }));

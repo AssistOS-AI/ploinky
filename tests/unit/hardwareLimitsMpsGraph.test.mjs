@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { prepareMpsGraph } from '../../cli/sandbox/hardwareLimits/mpsGraph.mjs';
 import { drainTargetedContainer } from '../../cli/sandbox/docker/targetedContainerLifecycle.js';
+import { resolveMpsServerDefault } from '../../cli/sandbox/hardwareLimits/mpsTransition.mjs';
 
 const share = { smPercent: 25, memoryMiB: 1024, deviceUuid: 'GPU-fixture', driverVersion: '550.1', wiringFingerprint: 'wiring' };
 const record = (key) => ({ type: 'agent', repoName: 'demo', agentName: key, instanceId: `i-${key}`, enableGeneration: `g-${key}`, containerId: key.repeat(64) });
@@ -10,7 +11,7 @@ function fixture({ changed = true, stopped = false, absent = false } = {}) {
     const registry = { a: record('a'), b: record('b') };
     const nodes = Object.keys(registry).map((key) => ({ key, node: { manifest: { container: 'fixture', network: { mode: 'default' } } } }));
     let state = { schema: 1, daemon: { pid: 1000 }, status: 'ready', daemonGeneration: 'old', configurationGeneration: 'config',
-        serverDefault: share, oldClients: [], drainedClients: [], pendingClients: [] };
+        serverDefault: resolveMpsServerDefault([{ share }]), oldClients: [], drainedClients: [], pendingClients: [] };
     const nextShare = { ...share, smPercent: changed ? 50 : 25 };
     const context = { gate: 'on', storeToken: { epoch: 'a'.repeat(32), revision: 1 }, overrides: new Map([['demo/a', { gpu: nextShare }], ['demo/b', { gpu: share }]]) };
     const selection = { state: 'inactive', generation: 'prepared', selectorDigest: 'digest' };
@@ -37,7 +38,7 @@ test('MG.changed default drains complete exact cohort and defers daemon and runt
     assert.deepEqual([...result.replacedKeys], ['a', 'b']);
     assert.deepEqual(f.events.filter((value) => value.startsWith('drain:')), ['drain:a', 'drain:b']);
     assert.equal(f.state().graphPrepared, true); assert.equal(f.state().graphNeedsTransition, true);
-    assert.deepEqual(f.state().serverDefault, share); assert.equal(f.state().desiredServerDefault.smPercent, 50);
+    assert.deepEqual(f.state().serverDefault, resolveMpsServerDefault([{ share }])); assert.equal(f.state().desiredServerDefault.smPercent, 50);
     assert.deepEqual(f.state().drainedClients, f.state().oldClients.map(tuple));
     assert.deepEqual(f.registry.a, record('a')); assert.equal(f.selection.state, 'inactive');
 });

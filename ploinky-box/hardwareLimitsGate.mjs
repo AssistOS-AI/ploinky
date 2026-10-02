@@ -327,7 +327,7 @@ export function formatLimitsStatus(status) {
         + `controllers ${box?.nested?.controllers?.length ? box.nested.controllers.join(' ') : `unknown (${NOT_OBSERVED})`}`);
     lines.push(`Internal helpers: ${known(box?.helpers, NOT_OBSERVED)}`);
     lines.push(`GPU sharing: best-effort, not a security boundary; daemon ${known(box?.mps?.daemonStatus || box?.mps?.daemon, NOT_OBSERVED)}`);
-    lines.push(`MPS defaults: ${box?.mps?.serverDefault ? `${box.mps.serverDefault.smPercent}% SM; ${box.mps.serverDefault.vramMiB} MiB per CUDA process` : box?.mps?.defaults || `unknown (${NOT_OBSERVED})`}`);
+    lines.push(`MPS defaults: ${box?.mps?.serverDefault ? `${box.mps.serverDefault.smPercent}% SM; ${box.mps.serverDefault.vramMiB} MiB per CUDA process${box.mps.serverDefault.shareMemoryMiB ? ` (largest share ${box.mps.serverDefault.shareMemoryMiB} MiB, rounded up to a whole GiB)` : ''}` : box?.mps?.defaults || `unknown (${NOT_OBSERVED})`}`);
     if (status.storeLock) {
         lines.push(`Store lock: held by ${status.storeLock.malformed ? `an unrecognized owner (${status.storeLock.reason})` : `${status.storeLock.owner.operation} since ${status.storeLock.owner.acquiredAt}`}`);
     }
