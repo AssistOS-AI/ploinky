@@ -1,7 +1,5 @@
 import crypto from 'crypto';
 
-import { parseAdmittedCpus } from '../hardwareLimits/cpuQuota.mjs';
-
 const ALLOWED_PLATFORMS = new Set(['linux/amd64', 'linux/arm64']);
 const ALLOWED_DEVICE_TYPES = new Set(['cdi', 'hostDevice']);
 const ALLOWED_HOST_DEVICE_PREFIXES = ['/dev/kfd', '/dev/dri', '/dev/accel'];
@@ -83,16 +81,17 @@ function validateResources(resources, label) {
             throw new RuntimePolicyError(`${label}.memory: must be a size from 1 byte to ${Number.MAX_SAFE_INTEGER} bytes`);
         }
     }
+    if (resources.cpus !== undefined && !CPU_RE.test(String(resources.cpus))) {
+        throw new RuntimePolicyError(`${label}.cpus: invalid CPU value`);
+    }
     if (resources.cpus !== undefined) {
-        // At most two decimal places, never rounded: the engine truncates the
-        // quota it derives from --cpus, so a finer value could not be read
-        // back exactly (plan §8.1; amendment A3).
-        if (!CPU_RE.test(String(resources.cpus))) {
-            throw new RuntimePolicyError(`${label}.cpus: invalid CPU value`);
-        }
-        const admitted = parseAdmittedCpus(String(resources.cpus));
-        if (!admitted.ok) {
-            throw new RuntimePolicyError(`${label}.cpus: must be a decimal from 0.01 with at most two decimal places, such as 0.29 (${String(resources.cpus).slice(0, 64)} ${admitted.reason})`);
+        // Base validation keeps its representability rule and never rounds up:
+        // the quota the engine derives truncates. The two-decimal rule of
+        // plan §8.1 and amendment A3 applies only where limits are placed
+        // under hardware limits (hardware eligibility), not on every path.
+        const quota = Math.floor(Number(resources.cpus) * 100000);
+        if (!Number.isFinite(Number(resources.cpus)) || !Number.isSafeInteger(quota) || quota < 1) {
+            throw new RuntimePolicyError(`${label}.cpus: must be a positive CPU count of at least 0.00001 with a representable quota`);
         }
     }
     if (resources.shmSize !== undefined) {

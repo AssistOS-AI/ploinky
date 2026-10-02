@@ -198,6 +198,10 @@ function cpuAdmissionRefusal(requested, context) {
                 fix: `Declare cpus as a decimal from 0.01 with at most two decimal places (for example 0.29) in the ${entry.source}, or remove the limit.`,
             };
         }
+        // An unknown envelope (a context that does not carry one) does not
+        // bound a declared value; a stored value is refused as envelope_unknown
+        // when resolved against the envelope, because there the envelope is
+        // the only bound.
         const envelopeCpus = Number(context.envelope?.cpus);
         if (Number.isFinite(envelopeCpus) && envelopeCpus > 0 && Number(admitted.canonical) > envelopeCpus) {
             return {

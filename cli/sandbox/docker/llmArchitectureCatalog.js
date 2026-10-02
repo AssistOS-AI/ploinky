@@ -5,7 +5,6 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 import { PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../../utils/config.js';
-import { parseAdmittedCpus } from '../hardwareLimits/cpuQuota.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -124,11 +123,7 @@ function validateRuntimePolicy(policy, label) {
         ensureObject(policy.resources, `${label}.runtimePolicy.resources`);
         rejectUnknownKeys(policy.resources, new Set(CATALOG_VALIDATION_CONTRACT.resourceKeys), `${label}.runtimePolicy.resources`);
         if (policy.resources.memory !== undefined) ensureStringPattern(policy.resources.memory, SIZE_RE, `${label}.runtimePolicy.resources.memory`);
-        if (policy.resources.cpus !== undefined) {
-            ensureStringPattern(policy.resources.cpus, CPU_RE, `${label}.runtimePolicy.resources.cpus`);
-            const admitted = parseAdmittedCpus(policy.resources.cpus);
-            if (!admitted.ok) throw new CatalogValidationError(`${label}.runtimePolicy.resources.cpus: ${admitted.reason}; use a decimal from 0.01 with at most two decimal places`);
-        }
+        if (policy.resources.cpus !== undefined) ensureStringPattern(policy.resources.cpus, CPU_RE, `${label}.runtimePolicy.resources.cpus`);
         if (policy.resources.shmSize !== undefined) ensureStringPattern(policy.resources.shmSize, SIZE_RE, `${label}.runtimePolicy.resources.shmSize`);
         if (policy.resources.pidsLimit !== undefined) {
             if (!Number.isInteger(policy.resources.pidsLimit) || policy.resources.pidsLimit < 1 || policy.resources.pidsLimit > MAX_PIDS_LIMIT) {

@@ -206,7 +206,7 @@ function requireLeafLimits(leaf) {
 // when the process has already exited) is otherwise invisible. The window is
 // bounded; tests shorten it.
 export const postExitObservation = { windowMs: 2000, intervalMs: 100 };
-export const POST_EXIT_VANISHED = 'The same-leaf cgroup vanished after the pressure process exited, so no post-exit counter evidence exists (the kernel may have killed the agent main process rather than the pressure process)';
+export const POST_EXIT_VANISHED = 'The same-leaf cgroup vanished or could not be observed after the pressure process exited, so no post-exit counter evidence exists (the kernel may have killed the agent main process rather than the pressure process)';
 
 export function createLiveAdapter(profile, {
     processProvider = runBoundedProcess, signal, cleanupSignal, persist = () => {}, run,

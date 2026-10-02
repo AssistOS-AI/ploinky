@@ -736,7 +736,7 @@ test('HD.long-requested-value-is-a-bounded-refusal', () => {
     assert.equal(outcomes[0].requested[0].value, outcomes[1].requested[0].value);
     // The interactive refusal is bounded the same way.
     let interactive = null;
-    try { assertInteractiveHardwareLimitsAbsent(NEW({ cpus: `${'0'.repeat(200)}0.5` }), { agentName: 'shell', repoName: 'demo', containerName: 'ploinky_demo_shell' }); }
+    try { assertInteractiveHardwareLimitsAbsent(NEW({ cpus: `0.${'5'.repeat(200)}` }), { agentName: 'shell', repoName: 'demo', containerName: 'ploinky_demo_shell' }); }
     catch (error) { interactive = errors.findHardwareOutcome(error); }
     assert.ok(interactive && Buffer.byteLength(interactive.requested[0].value) <= errors.OUTCOME_BOUNDS.value);
     // A value within the bound is carried unchanged.
@@ -789,7 +789,7 @@ test('HD.unrepresentable-or-zero-limits-are-refused-on-every-path', () => {
     captureWarnings();
     const invalid = [
         ['memory', '9007199254740992'], ['memory', '18014398509481984'], ['memory', `${'9'.repeat(70)}t`], ['memory', '0'], ['memory', 0],
-        ['cpus', '0'], ['cpus', 0], ['cpus', '9'.repeat(400)], ['cpus', '0.000001'], ['cpus', '0.00001'], ['cpus', '0.005'], ['cpus', '0.123456'],
+        ['cpus', '0'], ['cpus', 0], ['cpus', '9'.repeat(400)], ['cpus', '0.000001'],
     ];
     const paths = {
         'manifest hardwareLimits': (field, value) => ({ manifest: NEW({ [field]: value }) }),
@@ -806,7 +806,7 @@ test('HD.unrepresentable-or-zero-limits-are-refused-on-every-path', () => {
             }
         }
     }
-    // The largest representable memory and the smallest quota (0.01, never a finer value) are accepted
+    // The largest representable memory and the smallest placed quota (0.01; a finer value is a typed placement refusal, see CPU.*) are accepted
     // and placed with a real readback target.
     const largest = admit(NEW({ memory: String(Number.MAX_SAFE_INTEGER), cpus: '0.01' }), { hardwareAdmission: 'strict' }).admission;
     assert.equal(largest.descriptor.hardwarePlacement.expected.memoryBytes, Number.MAX_SAFE_INTEGER);
@@ -848,13 +848,35 @@ test('CPU.declared-cpus-admits-two-decimals-in-both-fields-and-both-profile-posi
                 assert.equal(admission.hardwareEligibility.state, 'eligible', `${label} ${value} (${hardwareAdmission})`);
             }
         }
-        for (const value of ['0.123456', '0.005', '0.001', '0.000005', '0.004999', 0.001]) {
+        for (const value of ['0.123456', '0.005', '0.001', '0.004999', 0.001, '0.00001']) {
             const { manifest, profileName } = make(value);
-            for (const hardwareAdmission of ['metadata', 'strict']) {
-                assert.throws(() => admit(manifest, { profileName, hardwareAdmission }), (error) => error.name === 'RuntimePolicyError'
-                    && /\.cpus: must be a decimal from 0\.01 with at most two decimal places/.test(error.message), `${label} ${value} (${hardwareAdmission})`);
+            // Inside a prepared Box the finer value is a typed refusal with a fix.
+            const { admission } = admit(manifest, { profileName, hardwareAdmission: 'metadata' });
+            assert.equal(admission.hardwareEligibility?.state, 'refused', `${label} ${value} (metadata)`);
+            assert.equal(admission.hardwareEligibility.refusal.reasonCode, 'exceeds_envelope', `${label} ${value}`);
+            assert.match(admission.hardwareEligibility.refusal.reason, /more than two decimal places|below the 0\.01 minimum/, `${label} ${value}`);
+            assert.match(admission.hardwareEligibility.refusal.fix, /decimal from 0\.01 with at most two decimal places/, `${label} ${value}`);
+            assert.throws(() => admit(manifest, { profileName, hardwareAdmission: 'strict' }), (error) => errors.findHardwareOutcome(error)?.reasonCode === 'exceeds_envelope', `${label} ${value} (strict)`);
+        }
+    }
+});
+
+// Paths that neither place nor verify limits keep their base validation: a
+// finer declaration is still accepted there (the engine enforces it), and is
+// refused only once it would be placed under hardware limits.
+test('CPU.paths-without-placement-keep-their-base-validation', () => {
+    captureWarnings();
+    for (const value of ['0.125', '0.12345', '0.00001']) {
+        for (const make of [NEW, OLD]) {
+            for (const hardwareContext of [{ gate: 'none', storeState: 'none' }]) {
+                assert.doesNotThrow(() => admit(make({ cpus: value }), { hardwareContext, insideBox: false }), value);
             }
         }
+        assert.doesNotThrow(() => validateManifestRuntimeCapabilities(NEW({ cpus: value })), value);
+    }
+    // Base validation never rounds: a value whose truncated quota is zero stays refused.
+    for (const value of ['0', '0.000001', '0.000005']) {
+        assert.throws(() => validateManifestRuntimeCapabilities(NEW({ cpus: value })), (error) => error.name === 'RuntimePolicyError' && /\.cpus: must be a positive CPU count/.test(error.message), value);
     }
 });
 

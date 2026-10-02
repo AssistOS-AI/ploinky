@@ -397,6 +397,7 @@ export function buildRequiredCaseManifest() {
             'HD.identity-hash-args-equal', 'HD.identity-migration-no-restart-graph', 'HD.identity-llm-reuse-callers',
             'CPU.declared-cpus-admits-two-decimals-in-both-fields-and-both-profile-positions',
             'CPU.declared-cpus-is-refused-above-the-envelope-and-never-clamped',
+            'CPU.paths-without-placement-keep-their-base-validation',
             'CPU.admission-keeps-equal-values-equal-in-hash-and-rendered-argv',
             'CPU.administrator-cpus-keeps-the-plan-vector-0.05-minimum-and-two-decimals',
         ]),

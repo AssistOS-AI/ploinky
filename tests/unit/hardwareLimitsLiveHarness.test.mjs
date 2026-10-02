@@ -655,12 +655,15 @@ test('C1.layout-root-interface-files-owned-by-the-box-runtime-uid-pass', async (
 });
 
 test('C1.layout-root-delegation-file-owned-by-1000-rejected', async () => {
+    let exercised = 0;
     for (const name of ['cgroup.procs', 'cgroup.subtree_control', 'cgroup.threads']) {
         const box = await productionBox();
-        if (box.layout.paths['/'].files[name]?.present === false) continue;
+        assert.notEqual(box.layout.paths['/'].files[name]?.present, false, `${name} is observed at the root`);
         box.layout.paths['/'].files[name].uid = 1000;
         rejects(box, /Root\/core cgroup ownership mismatch/);
+        exercised += 1;
     }
+    assert.equal(exercised, 3, 'all three root delegation files were exercised');
     const directory = await productionBox();
     directory.layout.paths['/'].uid = 1000;
     rejects(directory, /Root\/core cgroup ownership mismatch/);
