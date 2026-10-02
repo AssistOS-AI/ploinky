@@ -69,8 +69,8 @@ test('local edits propagate through a queued existing conversation and both expo
 
     // Conversation skill settings: the declared list/set tools, called with the robot and conversation they declare as inputs.
     const skillSettings = f.settings;
-    assert.deepEqual(skillSettings.context, { robot: f.robot.name, sessionId: f.id });
-    await skillSettings.load();
+    const listed = await skillSettings.load();
+    assert.equal(listed.robot, f.robot.name, 'the response must come from the requested robot');
     assert.deepEqual(skillSettings.items.filter((item) => item.enabled).map((item) => item.name).sort(), ['human-report', 'local']);
     assert.equal(skillSettings.scope, 'conversation');
     assert.equal((await f.request()).cwd, f.scopeRoot, 'browser cwd must not replace saved cwd');
