@@ -1,21 +1,14 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { EventEmitter } from 'node:events';
-import { PassThrough } from 'node:stream';
-import { fileURLToPath } from 'node:url';
 import test from 'node:test';
-import { fixture, write, writeSkill, waitFor, deferred, source, RuntimeManager, createAlaEngine,
-    exportPloinky, exportExplorer } from './fixture.mjs';
+import { fixture, write, writeSkill, source, exportPloinky, exportExplorer } from './fixture.mjs';
 
 // The skills the user selected, without the human-report skill that RoboTeam always adds.
 const selected = (catalog) => catalog.skills.filter((entry) => entry.enabled && !entry.required).map((entry) => entry.name).sort();
 // The links RoboTeam published for one execution, as the native backend sees them.
 const linked = (view) => Object.entries(view.output).filter(([, entry]) => entry.link).map(([name]) => name).sort();
-const settings = { readAchillesSettings: () => ({}), getCodingAgentModels: () => ({}), getPermissionMode: () => 'ask-for-approval' };
 const { INITIAL_SKILL_INSTRUCTIONS, HUMAN_REPORT_INSTRUCTIONS } = await source('achilles', 'roboTeamAgent/copilot/src/lib/prompts.mjs');
-const installation = { entryPath: fileURLToPath(new URL('./native-skill-consumer.mjs', import.meta.url)),
-    discoverCodingAgents: async () => [{ name: 'codex', available: true, binary: process.execPath }] };
 
 test('local edits propagate through a queued existing conversation and both exporters preserve author files', { timeout: 60000 }, async (t) => {
     const f = await fixture(t);
@@ -74,7 +67,7 @@ test('local edits propagate through a queued existing conversation and both expo
         /unavailable/, 'a repository outside the launch scope cannot be selected');
     t.diagnostic('Bounded launch, contained alias, dependency pruning, and edited exports passed.');
 
-    // Conversation skill settings: the WebChat action's robot and session context drive the declared list/set tools.
+    // Conversation skill settings: the declared list/set tools, called with the robot and conversation they declare as inputs.
     const skillSettings = f.settings;
     assert.deepEqual(skillSettings.context, { robot: f.robot.name, sessionId: f.id });
     await skillSettings.load();
@@ -83,46 +76,7 @@ test('local edits propagate through a queued existing conversation and both expo
     assert.equal((await f.request()).cwd, f.scopeRoot, 'browser cwd must not replace saved cwd');
     assert.equal((await skillSettings.load({ dir: f.sibling })).cwd, f.scopeRoot, 'a browser folder hint must not replace the saved cwd');
 
-    const engine = createAlaEngine({ workingDir: f.scopeRoot, sessionStore: f.sessionStore, skillCatalog: f.catalog,
-        settings, installation, interactions: { cancelTurn() {} }, execution: { robotId: f.robot.id } });
-    f.cleanup.push(() => engine.close());
-    const ready = deferred();
-    let controls, engineError;
-    const manager = new RuntimeManager({ dataDir: f.store.dataDir, workspaceRoot: f.workspaceRoot, skillsets: f.service,
-        toolCache: { prepareCodingAgents: async () => ({}) },
-        // Replace only the robot-task process launch. The real engine spawns a child that parses its command line with
-        // the real ALA argument parser, then reads and executes the skills RoboTeam linked for the execution.
-        spawnImpl: (_command, args, options) => {
-            assert.ok(!args.includes('--skill-catalog'), 'queue launcher must not forward a skill catalog');
-            assert.ok(args.includes('--resume-session'), 'the pre-existing conversation must use the real bootstrap resume flag');
-            assert.equal(options.env.ROBOTEAM_TASK_SKILL_SELECTION, undefined);
-            const get = (flag) => args[args.indexOf(flag) + 1];
-            const child = new EventEmitter();
-            child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.stdin = new PassThrough();
-            child.kill = () => true;
-            child.stdin.on('data', (chunk) => controls(JSON.parse(chunk.toString())));
-            queueMicrotask(() => void fs.readFile(get('--taskFile'), 'utf8').then((prompt) => engine.executeTurn({
-                sessionId: get('--session-id'), prompt, onControl: (send) => { controls = send; }, onEvent: (event) => {
-                    child.stderr.write(`@@ALA_EVENT@@${JSON.stringify(event)}\n`);
-                    if (event.type === 'session-ready') ready.resolve();
-                },
-            })).then((result) => { child.stdout.write(result.outputText); child.emit('close', 0, null); })
-                .catch((error) => { engineError = error; child.emit('error', error); }));
-            return child;
-        } });
-    f.cleanup.push(() => manager.stopAll());
-    manager.ensureContainer = async () => ({ mcpPort: 18100 });
-    const start = (task) => manager.startTask(f.robot, 'desktop', { cwd: f.scopeRoot, task, ca: 'codex',
-        alaSessionId: f.id, skillPolicyRef: f.id, resumeSession: true });
-    const completed = async (task) => {
-        const status = await waitFor(() => {
-            const row = manager.taskStatus(f.robot.id, task.taskId);
-            return ['completed', 'failed'].includes(row.state) && row;
-        }, 'task completion');
-        if (engineError) throw engineError;
-        assert.equal(status.state, 'completed', status.error);
-        return { ...JSON.parse(status.result), task: status };
-    };
+    const { manager, start, completed, ready } = f.bridge();
     const firstTask = start('WAIT_FOR_STEERING. Read the current skill files.');
     await ready.promise;
     assert.equal(f.installs.count, 1);
@@ -188,19 +142,24 @@ test('local edits propagate through a queued existing conversation and both expo
     assert.deepEqual(Object.keys(fourth.before.output).sort(), ['authoring', 'distributed', 'human-report', 'local']);
     t.diagnostic('New skill discovered in the registered repository and settings toggle applied to persisted execution policy.');
 
-    // Deselect every skill through the settings tool, then continue the older terminal task.
+    // Deselect every skill through the settings tool, then continue the older terminal task. This is not an explicit
+    // empty selection (see the next assertion and the explicit-empty tests below).
     await skillSettings.load();
     for (const item of skillSettings.items.filter((entry) => entry.enabled && !entry.required)) await skillSettings.toggle(item.identity);
     assert.deepEqual(selected(await f.request()), []);
-    // Continue the original terminal task after the policy changed. Its stored request predates the empty choice.
-    const resumed = await manager.resumeTask(f.robot, firstTask.taskId, 'Report the current empty selection.');
+    // Continue the original terminal task after the policy changed. Its stored request predates the deselection.
+    const resumed = await manager.resumeTask(f.robot, firstTask.taskId, 'Report the current deselection.');
     const empty = await completed(resumed);
     assert.deepEqual(linked(empty.before), ['human-report']);
+    // The native backend still sees the unmanaged authoring folder and the exported copy; RoboTeam does not manage them.
+    assert.deepEqual(Object.keys(empty.before.output).sort(), ['authoring', 'distributed', 'human-report']);
     assert.deepEqual(empty.session, first.session);
     assert.equal(empty.resumed, true);
-    await writeSkill(path.join(f.scopeRoot, 'later-skills/skills/later'), 'later');
-    await f.register('later-skills', path.join(f.scopeRoot, 'later-skills'));
-    assert.deepEqual(selected(await f.request()), [], 'a newly registered source must not undo the deselection');
+    // Tracks escalation 4: per-skill deselection leaves the source selected, so a new skill in it is picked up again.
+    // The product documents this (skills.html), but it differs from the old `use none` behavior.
+    await writeSkill(path.join(localRepo, 'skills/later'), 'later');
+    assert.deepEqual(selected(await f.request()), ['later']);
+    await fs.rm(path.join(localRepo, 'skills/later'), { recursive: true });
     await skillSettings.load();
     await skillSettings.toggle('local-skills/local');
     await fs.rm(path.join(f.scopeRoot, '.agents/skills'), { recursive: true });
@@ -216,39 +175,41 @@ test('local edits propagate through a queued existing conversation and both expo
 });
 
 for (const change of ['helper', 'asset', 'executable-mode']) {
-    test(`isolated ${change} change reaches the live link without changing SKILL.md`, async (t) => {
+    test(`isolated ${change} change reaches the next execution through the live link without changing SKILL.md`, { timeout: 30000 }, async (t) => {
         const f = await fixture(t);
         const repo = path.join(f.scopeRoot, 'local-skills');
         const dir = path.join(repo, 'skills/local');
         await writeSkill(dir, 'local');
         await f.useSources({ 'local-skills': repo });
-        const descriptor = await fs.readFile(path.join(dir, 'SKILL.md'), 'utf8');
-        const first = await f.capture();
-        const link = path.join(f.scopeRoot, '.agents/skills/local');
-        assert.ok((await fs.lstat(link)).isSymbolicLink(), 'the execution must link the live source');
-        assert.equal(await fs.realpath(link), await fs.realpath(dir));
+        const { start, completed } = f.bridge();
+        const first = await completed(start('Read the current skill files.'));
         const name = change === 'asset' ? 'assets/value.txt' : 'helper.mjs';
         const file = path.join(dir, name);
         const previous = await fs.stat(file);
-        const read = (target) => fs.readFile(path.join(link, name), 'utf8');
-        const unchanged = await read();
-        if (change === 'executable-mode') await fs.chmod(file, 0o755);
+        const text = await fs.readFile(file, 'utf8');
+        let expected = first.before.output.local.helper;
+        let executable = first.before.output.local.executable;
+        if (change === 'executable-mode') { await fs.chmod(file, 0o755); executable = 0o111; }
         else {
-            const after = change === 'asset' ? unchanged.replace(/[a-f0-9]/, (value) => value === 'a' ? 'b' : 'a')
-                : unchanged.replace(/(console\.log\(")([a-f0-9])/, (_match, prefix, value) => prefix + (value === 'a' ? 'b' : 'a'));
-            assert.notEqual(after, unchanged);
-            assert.equal(Buffer.byteLength(after), previous.size);
-            await fs.writeFile(file, after);
+            const edited = change === 'asset' ? text.replace(/[a-f0-9]/, (value) => value === 'a' ? 'b' : 'a')
+                : text.replace(/(console\.log\(")([a-f0-9])/, (_match, prefix, value) => prefix + (value === 'a' ? 'b' : 'a'));
+            assert.notEqual(edited, text);
+            assert.equal(Buffer.byteLength(edited), previous.size);
+            await fs.writeFile(file, edited);
+            // Same size and restored mtime: only a live link, never a stat-keyed copy, shows the change.
             await fs.utimes(file, previous.atime, previous.mtime);
+            expected = change === 'asset' ? `${first.before.output.local.helper.split(':')[0]}:${edited}`
+                : `${edited.match(/console\.log\("([^"]+)"/)[1]}:${first.before.output.local.helper.split(':').slice(1).join(':')}`;
         }
-        // Same size and restored mtime: only a live link, never a stat-keyed copy, shows the change at once.
-        if (change === 'executable-mode') assert.equal((await fs.stat(path.join(link, name))).mode & 0o111, 0o111);
-        else assert.notEqual(await read(), unchanged);
-        assert.equal(f.installs.count, 1, 'no new installation is needed for the edit to be visible');
-        assert.equal(await fs.readFile(path.join(link, 'SKILL.md'), 'utf8'), descriptor);
-        const next = await f.capture();
-        assert.equal(next.revision, first.revision, 'the revision identifies the link set; edits do not change it');
-        assert.equal(await fs.readFile(path.join(dir, 'SKILL.md'), 'utf8'), descriptor);
+        const second = await completed(start('Read the current skill files again.'));
+        assert.notEqual(`${second.before.output.local.helper}/${second.before.output.local.executable}`,
+            `${first.before.output.local.helper}/${first.before.output.local.executable}`, 'the backend must observe the edit');
+        assert.equal(second.before.output.local.helper, expected);
+        assert.equal(second.before.output.local.executable, executable);
+        assert.equal(second.before.output.local.descriptor, first.before.output.local.descriptor, 'SKILL.md is unchanged');
+        assert.equal(second.before.output.local.link, await fs.realpath(dir));
+        assert.equal(second.task.skillExecution.revision, first.task.skillExecution.revision,
+            'the revision identifies the link set; edits do not change it');
     });
 }
 
@@ -311,8 +272,10 @@ for (const change of ['delete', 'malform']) {
     });
 }
 
+// Both tests below run under the default robot, whose implicit selection is the non-empty bundled copilot skillset, so
+// ignoring the stored empty selection changes the result.
 test('explicit legacy empty selection stays empty after a new untracked skill appears', async (t) => {
-    const f = await fixture(t);
+    const f = await fixture(t, { robotName: 'default' });
     const repo = path.join(f.scopeRoot, 'new-skills');
     await writeSkill(path.join(repo, 'skills/existing'), 'existing');
     await f.register('new-skills', repo);
@@ -326,5 +289,19 @@ test('explicit legacy empty selection stays empty after a new untracked skill ap
     const migrated = f.sessionStore.loadSession(legacy.sessionId);
     assert.deepEqual(migrated.legacySkillSelection, { skillSets: [], skills: [] });
     assert.equal(migrated.skillSelection, undefined);
+    assert.deepEqual(await fs.readdir(path.join(f.scopeRoot, '.agents/skills')), ['human-report']);
+});
+
+test('an explicit empty selection at creation stays empty after a new untracked skill appears', async (t) => {
+    const f = await fixture(t, { robotName: 'default' });
+    const repo = path.join(f.scopeRoot, 'new-skills');
+    await writeSkill(path.join(repo, 'skills/existing'), 'existing');
+    // The task-start shape: an explicit empty selection, as a delegated task without skills sends.
+    await f.useSources({ 'new-skills': repo }, { skillSets: [], skills: [] });
+    assert.deepEqual((await f.capture()).entries.filter((entry) => !entry.required), []);
+    await writeSkill(path.join(repo, 'skills/new-local'), 'new-local');
+    const capture = await f.capture();
+    assert.deepEqual(capture.entries.filter((entry) => !entry.required), []);
+    assert.deepEqual(selected(await f.request()), []);
     assert.deepEqual(await fs.readdir(path.join(f.scopeRoot, '.agents/skills')), ['human-report']);
 });
