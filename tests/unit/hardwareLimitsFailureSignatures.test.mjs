@@ -80,7 +80,7 @@ test('only verified mkdtemp components under the exact run TMPDIR lose random su
     assert.notEqual(proof('509 !== 1533 /owned/tmp/ploinky-relay-aB12cD/child'), proof('500 !== 1533 /owned/tmp/ploinky-relay-Z98xyQ/child'));
 });
 
-test('HS.process IDs in absolute /proc paths are normalized and nothing else is', async (t) => {
+test('HS.proc-pid-normalization', async (t) => {
     const proof = (message, extra = {}) => summarizeFailure(Object.assign(new Error(message), extra)).signature;
     // The known Linux-only failure: same file, a different PID on every run.
     const enoent = (pid) => proof(`ENOENT: no such file or directory, open '/proc/${pid}/oom_score_adj'`, { code: 'ENOENT', errno: -2, syscall: 'open', path: `/proc/${pid}/oom_score_adj` });

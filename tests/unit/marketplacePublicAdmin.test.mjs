@@ -209,7 +209,7 @@ test('Marketplace advertises each agent manifest enable modes and default', asyn
     assert.deepEqual([agent('broken').enableModes, agent('broken').enableMode], [['isolated', 'global', 'devel'], 'isolated']);
 });
 
-test('hardware-limits route is wired to the real administrator check for every session role', async () => {
+test('R.hardware-limits-production-admin-wiring', async () => {
     const guest = { sessionId: 'guest-provider-session', user: { id: 'guest', roles: ['guest'] } };
     const guestAdmin = { sessionId: 'guest-admin-provider-session', user: { id: 'guest-admin', roles: ['admin', 'guest'] } };
     const validate = authService.validateSession;
