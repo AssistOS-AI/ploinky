@@ -638,6 +638,53 @@ test('C1.observer-records-delegation-files-and-absence', async () => {
     rejects(box, /Missing cgroup evidence for \/ploinky\/system/);
 });
 
+// A4: the engine leaves the Box root's interface files (other than its
+// directory and the three delegation files) owned by the engine user, who is
+// uid 1000 inside the keep-id Box. The observed real-engine pattern passes;
+// anything else at the root, and any non-root file under /ploinky/core, fails.
+test('C1.layout-root-interface-files-owned-by-the-box-runtime-uid-pass', async () => {
+    const box = await productionBox();
+    const root = box.layout.paths['/'].files;
+    const observed = ['cgroup.controllers', 'cpu.max', 'memory.max', 'pids.max'].filter(name => root[name]?.present !== false);
+    assert.ok(observed.length >= 1, 'the fixture observes interface files at the root');
+    for (const name of observed) root[name].uid = 1000;
+    for (const name of ['cgroup.procs', 'cgroup.subtree_control', 'cgroup.threads']) if (root[name]?.present !== false) assert.equal(root[name].uid, 0, `${name} stays root-owned`);
+    assert.equal(box.layout.paths['/'].uid, 0);
+    const delegation = assertCoreLayout(box.layout, { fixtureControllers: ['cpu', 'memory', 'pids'] });
+    assert.deepEqual([...delegation.required], ['cpu', 'memory', 'pids']);
+});
+
+test('C1.layout-root-delegation-file-owned-by-1000-rejected', async () => {
+    for (const name of ['cgroup.procs', 'cgroup.subtree_control', 'cgroup.threads']) {
+        const box = await productionBox();
+        if (box.layout.paths['/'].files[name]?.present === false) continue;
+        box.layout.paths['/'].files[name].uid = 1000;
+        rejects(box, /Root\/core cgroup ownership mismatch/);
+    }
+    const directory = await productionBox();
+    directory.layout.paths['/'].uid = 1000;
+    rejects(directory, /Root\/core cgroup ownership mismatch/);
+});
+
+test('C1.layout-root-interface-file-owned-by-another-uid-rejected', async () => {
+    for (const uid of [1001, 65534, 1]) {
+        const box = await productionBox();
+        const name = ['cgroup.controllers', 'cpu.max', 'memory.max', 'pids.max'].find(value => box.layout.paths['/'].files[value]?.present !== false);
+        box.layout.paths['/'].files[name].uid = uid;
+        rejects(box, /Root\/core cgroup ownership mismatch/);
+    }
+});
+
+test('C1.layout-core-file-owned-by-1000-rejected', async () => {
+    const box = await productionBox();
+    const name = Object.keys(box.layout.paths['/ploinky/core'].files).find(value => box.layout.paths['/ploinky/core'].files[value]?.present !== false && value !== 'cgroup.procs');
+    box.layout.paths['/ploinky/core'].files[name].uid = 1000;
+    rejects(box, /Root\/core cgroup ownership mismatch/);
+    const procs = await productionBox();
+    procs.layout.paths['/ploinky/core'].files['cgroup.procs'].uid = 1000;
+    rejects(procs, /Root\/core cgroup ownership mismatch/);
+});
+
 test('C1.layout-root-owned-delegation-files-rejected', async () => {
     const box = await productionBox();
     for (const name of ['cgroup.procs', 'cgroup.subtree_control', 'cgroup.threads']) Object.assign(box.layout.paths['/ploinky'].files[name], { uid: 0, gid: 0 });

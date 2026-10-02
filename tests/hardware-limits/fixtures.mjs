@@ -359,6 +359,8 @@ export function buildRequiredCaseManifest() {
             'C1.layout-parent-delegation-files-rejected', 'C1.layout-parent-directory-mode-and-group-rejected',
             'C1.proof-parent-delegation-fails-unchanged', 'C1.proof-broken-delegation-with-missing-controller-fails-unchanged',
             'C1.proof-valid-partial-host-blocked-unchanged',
+            'C1.layout-root-interface-files-owned-by-the-box-runtime-uid-pass', 'C1.layout-root-delegation-file-owned-by-1000-rejected',
+            'C1.layout-root-interface-file-owned-by-another-uid-rejected', 'C1.layout-core-file-owned-by-1000-rejected',
             'HLIVE.A1-oom-counter-moving-only-after-the-allocation-exits-passes',
             'HLIVE.A1-oom-counter-never-moving-fails-with-the-same-message',
             'HLIVE.A1-leaf-vanishing-after-exit-is-a-distinct-recorded-failure',

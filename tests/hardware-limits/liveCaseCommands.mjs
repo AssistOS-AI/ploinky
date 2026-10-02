@@ -55,6 +55,10 @@ const AGGREGATE = Object.freeze({
     cpu: ['cpu.max', (value) => /^max [1-9][0-9]*$/.test(value)],
 });
 const words = (value) => String(value).split(/\s+/).filter(Boolean);
+// A4: the files at the namespace root the engine hands to uid 0, and the
+// uid every other root interface file may have (the engine user under keep-id).
+const ROOT_DELEGATION_FILES = Object.freeze(['cgroup.procs', 'cgroup.subtree_control', 'cgroup.threads']);
+const BOX_RUNTIME_UID = 1000;
 
 function observedEntry(value, suffix) {
     const entry = value.paths?.[suffix];
@@ -107,10 +111,20 @@ export function assertCoreLayout(value, { fixtureControllers = [] } = {}) {
     }
     if (!/^0::\/ploinky\/core\s*$/.test(value.pid1) || !/^0::\/ploinky\/core\s*$/.test(value.self)) throw new Error('Box PID1/core observer placement mismatch');
     const entries = Object.fromEntries(['/', '/ploinky/core', '/ploinky', '/ploinky/agents', '/ploinky/system'].map((suffix) => [suffix, observedEntry(value, suffix)]));
+    // Amendment A4: the engine hands the Box root only the directory and the
+    // three delegation files; every other interface file at `/` belongs to the
+    // engine user, who is uid 1000 inside the keep-id Box (nsdelegate makes
+    // those files unwritable from inside whoever owns them). /ploinky/core is
+    // entirely uid 0, as production prepares it.
     for (const suffix of ['/', '/ploinky/core']) {
         const entry = entries[suffix];
         observedFile(entry, suffix, 'cgroup.procs');
-        if (entry.uid !== 0 || Object.values(entry.files || {}).some((file) => file?.present !== false && file?.uid !== 0)) throw new Error('Root/core cgroup ownership mismatch');
+        if (entry.uid !== 0) throw new Error('Root/core cgroup ownership mismatch');
+        for (const [name, file] of Object.entries(entry.files || {})) {
+            if (file?.present === false) continue;
+            const permitted = suffix === '/' && !ROOT_DELEGATION_FILES.includes(name) ? [0, BOX_RUNTIME_UID] : [0];
+            if (!permitted.includes(file?.uid)) throw new Error('Root/core cgroup ownership mismatch');
+        }
     }
     // Production delegates /ploinky and exactly these files to 1000:1000.
     const delegated = [];
