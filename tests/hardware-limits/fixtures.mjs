@@ -442,6 +442,11 @@ export function buildRequiredCaseManifest() {
             'L1.cli-provision-and-cleanup-run-real-processes-without-an-injected-provider', 'L1.engine-identity-strong-facts-fail-closed',
             'L1.workspace-socket-room-refused-early',
             'L1.fixture-plan-validation-requires-hardware-limits',
+            'EV1.the-gpu-proof-case-evidence-and-diagnostics-are-kept-byte-identical-before-the-staging-root-is-removed',
+            'EV1.an-interrupted-transfer-is-retried-and-a-failed-one-keeps-the-staging-until-a-retry-succeeds',
+            'EV1.an-unexpected-name-a-symlink-an-oversized-file-and-a-corrupt-transfer-are-never-copied',
+            'EV1.a-required-artifact-that-is-missing-keeps-the-staging-and-the-run-is-not-certified',
+            'EV1.each-action-names-the-proof-its-pass-needs',
         ]),
         ...leaves(P, 'p1', unit('hardwareLimitsDeclaration.test.mjs'), [
             'HD.identity-hash-args-equal', 'HD.identity-migration-no-restart-graph', 'HD.identity-llm-reuse-callers',

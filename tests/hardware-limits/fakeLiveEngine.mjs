@@ -275,7 +275,17 @@ export function createFakeSsh({ sshBinary, address, hostname, faults = {}, dispa
                 return ok('');
             }
             case 'chmod': fs.chmodSync(words.at(-1), parseInt(words[1], 8)); return ok('');
+            case 'ls': {
+                const directory = words.at(-1);
+                if (!fs.existsSync(directory)) return failed(`ls: cannot access '${directory}': No such file or directory`);
+                return ok(`${fs.readdirSync(directory).sort().join('\n')}\n`);
+            }
             case 'stat': {
+                if (words.includes('%F:%s:%u:%n')) {
+                    const targets = words.slice(words.indexOf('--') + 1);
+                    if (targets.some(target => !fs.existsSync(target) && !fs.lstatSync(target, { throwIfNoEntry: false }))) return failed('stat: cannot statx: No such file or directory');
+                    return ok(targets.map(target => { const stat = fs.lstatSync(target); return `${stat.isSymbolicLink() ? 'symbolic link' : stat.isFile() ? 'regular file' : 'directory'}:${stat.size}:${stat.uid}:${target}`; }).join('\n') + '\n');
+                }
                 const target = words.at(-1);
                 if (!fs.existsSync(target)) return failed(`stat: cannot statx '${target}': No such file or directory`);
                 return ok(`${statLine(target)}\n`);

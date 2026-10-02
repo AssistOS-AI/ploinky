@@ -256,7 +256,8 @@ export function plannedCommands(run) {
             { id: 'manifest-and-authorization', action: `dd the exact authorized manifest bytes to ${run.target.remote.runPath} and the binding to ${root}/run/authorization_ACTION_DIGEST.json; chmod 0600; sha256sum verify` },
             { id: 'dispatch', argv: [...ssh, profile.node.path, `${profile.source.root}/tests/hardware-limits/verify.mjs`, 'ACTION', '--run', run.target.remote.runPath, '--authorization', '<STAGED_BINDING>', '--remote-local', run.runId, '--expected-manifest-digest', '<MANIFEST_DIGEST>'] },
             { id: 'fetch', action: `sha256sum then cat ${run.target.remote.runPath} and ${root}/run/${remoteReportName('ACTION')}; digests must match; the fetched manifest replaces the local one` },
-            { id: 'remove-staging', argv: [...ssh, 'rm', '-rf', '--', root], action: 'Only after a fetched remote cleanup PASS, or when no remote run was ever dispatched; identity re-proved first' },
+            { id: 'fetch-run-artifacts', argv: [...ssh, 'ls', '-1A', '--', `${root}/run`], action: `After every dispatch and before any removal: list ${root}/run, and for each regular file named exactly <run>_<name>_<suffix>.json (at most 512 files of at most 8 MiB, 64 MiB in all; never a symlink, a directory, an authorization binding or a name that suggests a credential) stat, sha256sum and cat it, verify the digest after transfer (three attempts) and write it beside the local manifest with mode 0600. A required proof that is missing or corrupt keeps the staging root and the run is BLOCKED, never certified` },
+            { id: 'remove-staging', argv: [...ssh, 'rm', '-rf', '--', root], action: 'Only after a fetched remote cleanup PASS with complete run artifacts, or when no remote run was ever dispatched; identity re-proved first' },
         ];
     }
     return result;

@@ -18,7 +18,7 @@ import { FIXTURE_HARDWARE_LIMITS, FIXTURE_REPOSITORY, fixtureContainerName, fixt
 import { admitManifestRuntimeCapabilities, validateManifestRuntimeCapabilities } from '../../cli/sandbox/runtimeCapabilities.js';
 import { deprecatedHardwareDeclarations } from '../../cli/sandbox/hardwareLimits/declaredLimits.mjs';
 import { buildConcreteManifest, summaryPathFor } from '../hardware-limits/liveManifest.mjs';
-import { writeUstar } from '../hardware-limits/liveStage.mjs';
+import { ARTIFACT_LIMITS, requiredArtifacts, stageAndDispatch, writeUstar } from '../hardware-limits/liveStage.mjs';
 import { AGENT_INSPECT, ENGINE_INFO_ARGV, INSPECT, MAX_TAIL_BYTES, NESTED_CONTAINER_INSPECT, NESTED_LIST_FORMAT, PS_IDENTITY_FORMAT, boxPsArgv, engineIdentityDigest, engineIdentityFacts, hostRecordPaths, observeEngineIdentity, quarantinePath, workspaceSocketProblem } from '../hardware-limits/liveCommon.mjs';
 import { CRASH_EXIT, FAKE_CONNECTIONS, createFakeSsh, createFakeWorld, evaluateTemplate, fakeEngineInfo, ok, unsupportedFormat, worldState } from '../hardware-limits/fakeLiveEngine.mjs';
 
@@ -1165,4 +1165,137 @@ test('L1.workspace-socket-room-refused-early', async t => {
     const before = fs.readdirSync(f.evidence).sort();
     assert.equal(await quiet(() => main(args)), 2);
     assert.deepEqual(fs.readdirSync(f.evidence).sort(), before, 'nothing staged or written');
+});
+
+// --- Run artifacts of the remote runner (EV1) -------------------------------
+// The runner writes its evidence beside the manifest in the remote run directory: the final GPU
+// proof, each case's evidence and captured diagnostics. They must reach the local run directory,
+// verified, before a passing cleanup lets the owned staging root go.
+async function provisionedStage(t, sshFaults = {}) {
+    const w = stagedWorld(t, sshFaults);
+    const provisioned = await w.act('provision');
+    assert.equal(provisioned.verdict, 'PASS', JSON.stringify(provisioned));
+    return w;
+}
+const remoteRunDirectory = w => path.dirname(w.remoteRun);
+const remoteArtifact = (w, part, value) => { const file = path.join(remoteRunDirectory(w), `run_${part}_claude.json`); fs.writeFileSync(file, value, { mode: 0o600 }); return file; };
+const localArtifact = (w, part) => path.join(w.evidence, `run_${part}_claude.json`);
+// The dispatcher as runLiveCommand calls it, with the staging pieces exposed (a proof the run must have left can be demanded).
+function dispatchCleanup(w, extra = {}) {
+    const file = path.join(w.evidence, 'authorization_cleanup_claude.json');
+    writePrivateJson(file, { schema: 1, runId: w.runId, manifestDigest: hash(fs.readFileSync(w.runPath)), targetDigest: jsonDigest(reload(w).target), action: 'cleanup' });
+    return stageAndDispatch({ run: reload(w), bytes: fs.readFileSync(w.runPath), authorizationBytes: fs.readFileSync(file), action: 'cleanup', runPath: w.runPath, processProvider: extra.provider || w.ssh.provider, ...(extra.requiredFor ? { requiredFor: extra.requiredFor } : {}) });
+}
+// A provider that answers like the fake host, except where `intercept(words, count)` returns a result.
+function interposed(w, intercept) {
+    const counts = new Map();
+    return async (binary, args, options) => {
+        const words = args.slice(args.indexOf('100.76.22.69') + 1);
+        const key = `${words[0]} ${words.at(-1)}`;
+        counts.set(key, (counts.get(key) || 0) + 1);
+        const replaced = intercept(words, counts.get(key));
+        return replaced === undefined ? w.ssh.provider(binary, args, options) : replaced;
+    };
+}
+
+test('EV1.the-gpu-proof-case-evidence-and-diagnostics-are-kept-byte-identical-before-the-staging-root-is-removed', async t => {
+    const w = await provisionedStage(t);
+    const proof = remoteArtifact(w, 'gpu-final-observation', `${JSON.stringify({ processes: [], uuid: 'GPU-00000000-0000-0000-0000-000000000000', note: 'unicode é中' }, null, 2)}\n`);
+    const evidence = remoteArtifact(w, 'gpu-live-p1', '{"caseId":"LIVE-P1","steps":[]}\n');
+    const diagnostics = remoteArtifact(w, 'p1-grant-facts', '{"marker":{"state":"active"},"smi":{"bare":{"status":127}}}\n');
+    const before = new Map([['gpu-final-observation', fs.readFileSync(proof)], ['gpu-live-p1', fs.readFileSync(evidence)], ['p1-grant-facts', fs.readFileSync(diagnostics)]]);
+    // Things the runner also keeps there, which are never fetched: the authorization binding, a foreign name, an owner marker.
+    const authorizations = fs.readdirSync(remoteRunDirectory(w)).filter(name => name.startsWith('authorization_'));
+    assert.ok(authorizations.length >= 1);
+    const report = await dispatchCleanup(w, { requiredFor: () => ['gpu-final-observation'] });
+    assert.equal(report.verdict, 'PASS', JSON.stringify(report));
+    assert.equal(report.staging.removed, true); assert.equal(exists(w.remoteRoot), false);
+    for (const [part, bytes] of before) {
+        const local = localArtifact(w, part);
+        assert.deepEqual(fs.readFileSync(local), bytes, `${part} is byte-identical after the remote copy is gone`);
+        assert.equal(fs.statSync(local).mode & 0o777, 0o600, part);
+        assert.ok(report.artifacts.fetched.some(entry => entry.name === part && entry.sha256 === hash(bytes) && entry.bytes === bytes.length), part);
+    }
+    assert.equal(report.artifacts.complete, true); assert.deepEqual(report.artifacts.missingRequired, []);
+    assert.ok(!w.ssh.calls.some(call => call.words[0] === 'cat' && /\/authorization_/.test(call.words.at(-1))), 'no authorization binding was read');
+});
+
+test('EV1.an-interrupted-transfer-is-retried-and-a-failed-one-keeps-the-staging-until-a-retry-succeeds', async t => {
+    const w = await provisionedStage(t);
+    const proof = remoteArtifact(w, 'gpu-final-observation', '{"processes":[]}\n');
+    // One interrupted read of the proof: the bounded retry gets it.
+    const flaky = interposed(w, (words, count) => (words[0] === 'cat' && words.at(-1) === proof && count === 1 ? { ...ok(''), settlementForced: true } : undefined));
+    const first = await dispatchCleanup(w, { provider: flaky, requiredFor: () => ['gpu-final-observation'] });
+    assert.equal(first.verdict, 'PASS', JSON.stringify(first.limitations));
+    assert.equal(first.artifacts.complete, true); assert.equal(exists(w.remoteRoot), false);
+    assert.deepEqual(fs.readFileSync(localArtifact(w, 'gpu-final-observation')), Buffer.from('{"processes":[]}\n'));
+    assert.ok(w.ssh.calls.filter(call => call.words[0] === 'cat' && call.words.at(-1) === proof).length >= 1);
+    // A transfer that keeps failing: the evidence is incomplete, the cleanup is not certified and the staging stays.
+    const second = await provisionedStage(t);
+    const proof2 = remoteArtifact(second, 'gpu-final-observation', '{"processes":[]}\n');
+    let reads = 0;
+    const dead = interposed(second, words => { if (words[0] === 'cat' && words.at(-1) === proof2) { reads += 1; return { ...ok(''), settlementForced: true }; } return undefined; });
+    const failed = await dispatchCleanup(second, { provider: dead, requiredFor: () => ['gpu-final-observation'] });
+    assert.equal(reads, ARTIFACT_LIMITS.attempts, 'bounded attempts');
+    assert.equal(failed.verdict, 'BLOCKED'); assert.match(failed.limitations.join(' '), /Run evidence is incomplete/);
+    assert.equal(failed.staging.removed, false); assert.equal(exists(second.remoteRoot), true, 'the staging root is kept');
+    assert.equal(failed.artifacts.complete, false); assert.deepEqual(failed.artifacts.missingRequired, ['gpu-final-observation']);
+    // The retry over the same staging, with a healthy transport, fetches the proof and only then removes the root.
+    const retry = await dispatchCleanup(second, { requiredFor: () => ['gpu-final-observation'] });
+    assert.equal(retry.verdict, 'PASS', JSON.stringify(retry.limitations));
+    assert.equal(retry.staging.removed, true); assert.equal(exists(second.remoteRoot), false);
+    assert.deepEqual(fs.readFileSync(localArtifact(second, 'gpu-final-observation')), Buffer.from('{"processes":[]}\n'));
+});
+
+test('EV1.an-unexpected-name-a-symlink-an-oversized-file-and-a-corrupt-transfer-are-never-copied', async t => {
+    const w = await provisionedStage(t);
+    const directory = remoteRunDirectory(w);
+    const outside = path.join(w.remoteRoot, 'outside.txt'); fs.writeFileSync(outside, 'not an artifact\n');
+    fs.symlinkSync(outside, path.join(directory, 'run_linked_claude.json'));
+    const big = path.join(directory, 'run_big_claude.json'); fs.writeFileSync(big, ''); fs.truncateSync(big, ARTIFACT_LIMITS.bytes + 1);
+    fs.mkdirSync(path.join(directory, 'run_folder_claude.json'));
+    for (const name of ['run_Upper_claude.json', 'run_x_claude.json.bak', 'run_x_codex.json', 'other_x_claude.json', 'run_authorization-live_claude.json', 'run_token-file_claude.json', 'notes.txt']) fs.writeFileSync(path.join(directory, name), 'x\n');
+    remoteArtifact(w, 'good', '{"ok":true}\n');
+    remoteArtifact(w, 'garbled', '{"ok":false}\n');
+    // The listing also claims entries a directory cannot hold: an absolute path and a parent reference.
+    const lying = interposed(w, words => {
+        if (words[0] === 'ls') { const real = fs.readdirSync(directory).sort(); return ok(`${[...real, '/etc/passwd', '../outside.txt', 'a/b_claude.json', ''].join('\n')}`); }
+        if (words[0] === 'sha256sum' && words.at(-1).endsWith('run_garbled_claude.json')) return ok(`${'0'.repeat(64)}  ${words.at(-1)}\n`);
+        return undefined;
+    });
+    const report = await dispatchCleanup(w, { provider: lying });
+    // 'fixture-start' is the diagnostic the provisioning run itself left; it is allowed and arrives too.
+    assert.deepEqual(report.artifacts.fetched.map(entry => entry.name).sort(), ['fixture-start', 'good']);
+    assert.deepEqual(report.artifacts.refused.map(entry => [entry.name, entry.reason.replace(/ \(.*/, '').replace(/larger than \d+ bytes/, 'oversized')]).sort(), [['big', 'oversized'], ['folder', 'not a regular file'], ['linked', 'symbolic link']]);
+    assert.deepEqual(report.artifacts.failures.map(entry => [entry.name, entry.reason]), [['garbled', 'digest mismatch after transfer']]);
+    for (const part of ['linked', 'big', 'folder', 'Upper', 'garbled']) assert.equal(exists(localArtifact(w, part)), false, `${part} was not copied`);
+    assert.deepEqual(fs.readdirSync(w.evidence).filter(name => /^run_.+_claude\.json$/.test(name)).sort(), ['run_fixture-start_claude.json', 'run_good_claude.json']);
+    for (const call of w.ssh.calls.filter(entry => entry.words[0] === 'cat')) assert.ok(!/outside|linked|big|folder|Upper|bak|codex|authorization|token|notes|passwd/.test(path.basename(call.words.at(-1))) || /run_claude/.test(call.words.at(-1)), call.words.at(-1));
+    assert.equal(report.artifacts.complete, false);
+    assert.equal(report.staging.removed, false); assert.equal(exists(w.remoteRoot), true, 'a corrupt allowed artifact keeps the staging root');
+    assert.equal(report.verdict, 'BLOCKED'); assert.match(report.limitations.join(' '), /garbled: digest mismatch after transfer/);
+});
+
+test('EV1.a-required-artifact-that-is-missing-keeps-the-staging-and-the-run-is-not-certified', async t => {
+    const w = await provisionedStage(t);
+    const report = await dispatchCleanup(w, { requiredFor: () => ['gpu-final-observation'] });
+    assert.equal(report.verdict, 'BLOCKED'); assert.match(report.limitations.join(' '), /missing required gpu-final-observation/);
+    assert.equal(report.staging.removed, false); assert.equal(exists(w.remoteRoot), true);
+    assert.equal(report.artifacts.complete, false);
+    // The remote cleanup itself passed, so a later retry with the proof present removes the root.
+    remoteArtifact(w, 'gpu-final-observation', '{"processes":[]}\n');
+    const retry = await dispatchCleanup(w, { requiredFor: () => ['gpu-final-observation'] });
+    assert.equal(retry.verdict, 'PASS', JSON.stringify(retry.limitations)); assert.equal(retry.staging.removed, true);
+    assert.equal(exists(w.remoteRoot), false);
+    assert.ok(exists(localArtifact(w, 'gpu-final-observation')));
+});
+
+test('EV1.each-action-names-the-proof-its-pass-needs', () => {
+    const gpuProfile = { gpu: { uuid: 'GPU-x' } }; const llmProfile = { gpu: { uuid: 'GPU-x' }, llm: {} };
+    assert.deepEqual(requiredArtifacts({ profile: gpuProfile, action: 'cleanup', remoteReport: { verdict: 'PASS' } }), ['gpu-final-observation']);
+    assert.deepEqual(requiredArtifacts({ profile: llmProfile, action: 'cleanup', remoteReport: { verdict: 'PASS' } }), ['gpu-final-observation', 'llm-cleanup-proof']);
+    assert.deepEqual(requiredArtifacts({ profile: gpuProfile, action: 'provision', remoteReport: { verdict: 'PASS' } }), ['gpu-initial-gate']);
+    assert.deepEqual(requiredArtifacts({ profile: gpuProfile, action: 'live', remoteReport: { verdict: 'PASS', cases: [{ id: 'LIVE-P1', result: 'pass' }, { id: 'LIVE-P2', result: 'not-run' }, { id: 'LIVE-P3', result: 'blocked' }] } }), ['gpu-live-p1', 'gpu-live-p3']);
+    assert.deepEqual(requiredArtifacts({ profile: gpuProfile, action: 'cleanup', remoteReport: { verdict: 'FAIL' } }), [], 'only a passing result needs proof to be certified');
+    assert.deepEqual(requiredArtifacts({ profile: {}, action: 'cleanup', remoteReport: { verdict: 'PASS' } }), [], 'a block without a GPU has no GPU proof');
 });

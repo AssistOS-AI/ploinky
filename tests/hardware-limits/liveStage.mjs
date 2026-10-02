@@ -12,7 +12,7 @@ import crypto from 'node:crypto';
 import { EXIT, validateRunManifest } from './fixtures.mjs';
 import { runBoundedProcess } from './liveProcess.mjs';
 import { assertLocalSshPins, dispatchRemoteRun, safePath, sshOptions, validateRemoteTarget } from './liveRemote.mjs';
-import { HASH, OWNER_MARKER, RUN_ID, digest, jsonDigest, keys } from './liveCommon.mjs';
+import { HASH, OWNER_MARKER, RUN_ID, artifactPathFor, digest, jsonDigest, keys } from './liveCommon.mjs';
 
 const WORD = /^[A-Za-z0-9_./:=,%+@-]+$/;
 export const REMOTE_PARENT = '.cache/ploinky-hwlimits';
@@ -138,7 +138,27 @@ export function documentSuffixOf(run, runPath) {
     return match[1];
 }
 
-export async function stageAndDispatch({ run, bytes, authorizationBytes, action, runPath, processProvider = runBoundedProcess, signal }) {
+// ---------------------------------------------------------------------------
+// The run artifacts the remote runner writes beside its manifest (evidence per
+// case, the final GPU proof, captured diagnostics: liveCommon artifactPathFor).
+// They are fetched, before the staging root can be removed, from an explicit
+// allow-list only: regular files directly inside the remote run directory whose
+// name is exactly the runner's own artifact form `<run>_<name>_<suffix>.json`,
+// within the size bounds, never a symlink, never a credential or authorization.
+export const ARTIFACT_LIMITS = Object.freeze({ files: 512, bytes: 8 * 1024 * 1024, totalBytes: 64 * 1024 * 1024, attempts: 3 });
+const ARTIFACT_DENIED = /^(?:authorization|secret|token|credential|key|password|cookie|identity)/;
+const STAT_LINE = /^([a-z ]+):([0-9]+):([0-9]+):(\/[^\n]+)$/;
+
+// What a run must have left for its PASS to be certified: the proof each action ends with.
+export function requiredArtifacts({ profile, action, remoteReport }) {
+    if (remoteReport?.verdict !== 'PASS' || !profile?.gpu) return [];
+    if (action === 'cleanup') return ['gpu-final-observation', ...(profile.llm ? ['llm-cleanup-proof'] : [])];
+    if (action === 'provision') return ['gpu-initial-gate'];
+    if (action === 'live') return (remoteReport.cases || []).filter(entry => ['pass', 'fail', 'blocked'].includes(entry?.result) && /^LIVE-[A-Z0-9]+$/.test(String(entry.id))).map(entry => `gpu-${String(entry.id).toLowerCase()}`);
+    return [];
+}
+
+export async function stageAndDispatch({ run, bytes, authorizationBytes, action, runPath, processProvider = runBoundedProcess, signal, requiredFor = requiredArtifacts }) {
     const report = { schema: 1, runId: run.runId, action, verdict: 'BLOCKED', exitCode: EXIT.BLOCKED, cases: [], cleanup: run.cleanup, limitations: [] };
     let stage, remote, root, suffix;
     try { ({ stage, remote, root } = validateStage(run)); assertLocalSshPins(remote); suffix = documentSuffixOf(run, runPath); }
@@ -241,7 +261,12 @@ export async function stageAndDispatch({ run, bytes, authorizationBytes, action,
         journal.dispatches.push({ action, state: 'intent', manifestDigest }); save();
         let remoteReport;
         try { remoteReport = await dispatchRemoteRun({ run, action, cwd: runDirectory, signal, manifestDigest, processProvider, authorizationPath }); }
-        catch (error) { journal.dispatches.at(-1).state = 'incomplete'; save(); throw error; }
+        catch (error) {
+            journal.dispatches.at(-1).state = 'incomplete'; save();
+            // Whatever the runner wrote before it stopped is evidence too; the staging stays either way.
+            try { await fetchArtifacts(); } catch { /* the dispatch failure below is the verdict */ }
+            throw error;
+        }
         journal.dispatches.at(-1).state = 'returned'; save();
         const fetched = await fetchManifest();
         const reportFile = `${root}/run/${remoteReportName(action)}`;
@@ -250,11 +275,17 @@ export async function stageAndDispatch({ run, bytes, authorizationBytes, action,
         if (digest(Buffer.from(reportText, 'utf8')) !== reportSums.get(reportFile)) throw new Error('Fetched remote report digest mismatch');
         if (jsonDigest(JSON.parse(reportText)) !== jsonDigest(remoteReport)) throw new Error('Fetched remote report differs from the dispatched result');
         writePrivateBytes(path.join(runDirectory, `report_${action}_remote_${suffix}.json`), Buffer.from(reportText, 'utf8'));
+        // The side artifacts, with digest proof, before anything can be removed.
+        const artifacts = await fetchArtifacts({ required: requiredFor({ profile, action, remoteReport }) });
+        let result = { ...remoteReport };
+        if (!artifacts.complete && remoteReport.verdict === 'PASS') {
+            result = { ...result, verdict: 'BLOCKED', exitCode: EXIT.BLOCKED, limitations: [...(remoteReport.limitations || []), `Run evidence is incomplete (${[...artifacts.missingRequired.map(name => `missing required ${name}`), ...artifacts.failures.map(entry => `${entry.name}: ${entry.reason}`)].join('; ').slice(0, 600)}); the remote staging root was kept`] };
+        }
         let removed = false;
-        if (action === 'cleanup' && remoteReport.verdict === 'PASS' && fetched.state === 'complete' && fetched.cleanup.state === 'complete') {
+        if (action === 'cleanup' && remoteReport.verdict === 'PASS' && fetched.state === 'complete' && fetched.cleanup.state === 'complete' && artifacts.complete) {
             await removeStaging(); removed = true;
         }
-        return { ...remoteReport, staging: { root, removed } };
+        return { ...result, artifacts, staging: { root, removed } };
     } catch (error) {
         report.limitations.push(error.message);
         return report;
@@ -272,6 +303,67 @@ export async function stageAndDispatch({ run, bytes, authorizationBytes, action,
         for (const key of ['ssh', 'remote', 'stage']) if (jsonDigest(fetched.target[key]) !== jsonDigest(run.target[key])) throw new Error('Fetched remote manifest changed its pins');
         writePrivateBytes(runPath, fetchedBytes);
         return fetched;
+    }
+
+    // Fetch the allowed run artifacts into the local run directory, each verified
+    // against the remote sha256sum after transfer and written with a private mode.
+    // A transfer that failed is retried; a refused or missing one is reported.
+    async function fetchArtifacts({ required = [] } = {}) {
+        const outcome = { complete: false, fetched: [], refused: [], failures: [], required: [...required], missingRequired: [] };
+        const runName = path.posix.basename(remote.runPath);
+        const prefix = runName.replace(new RegExp(`_${suffix}\\.json$`), '');
+        const form = new RegExp(`^${prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}_([a-z0-9][a-z0-9-]*)_${suffix}\\.json$`);
+        const runRoot = `${root}/run`;
+        const names = [];
+        try {
+            const listing = (await call(['ls', '-1A', '--', runRoot])).stdout.split('\n').filter(Boolean);
+            for (const name of listing) {
+                const match = form.exec(name);
+                if (match && !ARTIFACT_DENIED.test(match[1])) names.push({ name, part: match[1] });
+            }
+            if (names.length > ARTIFACT_LIMITS.files) { outcome.failures.push({ name: '*', reason: `more than ${ARTIFACT_LIMITS.files} artifacts` }); names.length = 0; }
+        } catch (error) { outcome.failures.push({ name: '*', reason: `the run directory cannot be listed (${String(error.message).slice(0, 120)})` }); }
+        // Type, size and owner of every candidate before any byte is read.
+        const accepted = [];
+        for (let at = 0; at < names.length; at += 32) {
+            const batch = names.slice(at, at + 32);
+            let lines;
+            try { lines = (await call(['stat', '-c', '%F:%s:%u:%n', '--', ...batch.map(entry => `${runRoot}/${entry.name}`)])).stdout.split('\n').filter(Boolean); }
+            catch (error) { for (const entry of batch) outcome.failures.push({ name: entry.part, reason: `stat failed (${String(error.message).slice(0, 80)})` }); continue; }
+            for (const entry of batch) {
+                const target = `${runRoot}/${entry.name}`;
+                const parsed = lines.map(line => STAT_LINE.exec(line)).find(found => found && found[4] === target);
+                if (!parsed) { outcome.failures.push({ name: entry.part, reason: 'no stat line' }); continue; }
+                const [, type, size, uid] = parsed;
+                const refuse = reason => outcome.refused.push({ name: entry.part, reason });
+                if (type !== 'regular file') refuse(type === 'symbolic link' ? 'symbolic link' : `not a regular file (${type})`);
+                else if (Number(size) > ARTIFACT_LIMITS.bytes) refuse(`larger than ${ARTIFACT_LIMITS.bytes} bytes`);
+                else if (journal.identity && uid !== journal.identity.uid) refuse('owned by another user');
+                else accepted.push({ ...entry, target, size: Number(size) });
+            }
+        }
+        let total = 0;
+        for (const entry of accepted) {
+            if (total + entry.size > ARTIFACT_LIMITS.totalBytes) { outcome.failures.push({ name: entry.part, reason: 'the total artifact size bound would be exceeded' }); continue; }
+            let lastReason = 'not attempted';
+            for (let attempt = 1; attempt <= ARTIFACT_LIMITS.attempts; attempt += 1) {
+                try {
+                    const sums = parseSums((await call(['sha256sum', '--', entry.target], { deadlineMs: 120000 })).stdout, [entry.target]);
+                    const text = (await call(['cat', '--', entry.target], { maxBytes: entry.size + 4096, deadlineMs: 120000 })).stdout;
+                    const bytesFetched = Buffer.from(text, 'utf8');
+                    if (bytesFetched.length > ARTIFACT_LIMITS.bytes || digest(bytesFetched) !== sums.get(entry.target)) { lastReason = 'digest mismatch after transfer'; continue; }
+                    writePrivateBytes(artifactPathFor(runPath, entry.part), bytesFetched);
+                    total += bytesFetched.length;
+                    outcome.fetched.push({ name: entry.part, bytes: bytesFetched.length, sha256: sums.get(entry.target) });
+                    lastReason = null;
+                    break;
+                } catch (error) { lastReason = String(error.message).slice(0, 120); }
+            }
+            if (lastReason !== null) outcome.failures.push({ name: entry.part, reason: lastReason });
+        }
+        outcome.missingRequired = required.filter(name => !outcome.fetched.some(entry => entry.name === name));
+        outcome.complete = outcome.failures.length === 0 && outcome.missingRequired.length === 0;
+        return outcome;
     }
 
     // A resumed removal accepts an already absent root only after its own
