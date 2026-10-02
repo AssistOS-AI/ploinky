@@ -28,6 +28,9 @@ function attach(t, projectPathFor, { agentLibInWorkspace = false } = {}) {
     const w = wiringWorkspace(t, { runtime: 'bwrap', manifest: MANIFEST, packageJson: null, prefix: 'bwrap-attach-' });
     const projectPath = projectPathFor(w);
     fs.mkdirSync(path.join(w.ws, '.ploinky'), { recursive: true });
+    // Workspace structure links the agent's code tree here before any sandbox starts.
+    fs.mkdirSync(path.join(w.ws, '.ploinky', 'code'), { recursive: true });
+    fs.symlinkSync(path.join(w.agentDir, 'code'), path.join(w.ws, '.ploinky', 'code', 'demo'), 'dir');
     fs.writeFileSync(path.join(w.ws, '.ploinky', 'agents.json'), JSON.stringify({
         [CONTAINER]: {
             type: 'agent', runtime: 'bwrap', repoName: 'repo', agentName: 'demo', runMode: 'isolated',
