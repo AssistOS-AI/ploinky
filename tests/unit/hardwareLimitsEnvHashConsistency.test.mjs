@@ -28,6 +28,10 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { register } from 'node:module';
+// The creation path needs the selected achillesAgentLib identity in the environment. The
+// repository test runners preload this; the hardware-limits phase runner does not, and
+// this file is a required phase case, so it establishes the contract itself.
+import '../helpers/agentlibTestContract.mjs';
 
 const originalCwd = process.cwd();
 const originalEnv = Object.fromEntries(['PLOINKY_WORKSPACE_ROOT', 'PLOINKY_ROUTER_HOST_PORT', 'PLOINKY_MASTER_KEY', 'CONTAINER_RUNTIME', 'PATH']
