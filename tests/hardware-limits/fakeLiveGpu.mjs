@@ -115,6 +115,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
         const proc = spawn({ cgroup: corePath(), ppid: BOX_INIT_PID, ns: [model.nextBox++] });
         model.daemon = { gen: uuid(`gen-${model.clock}`), cfg: uuid(`cfg-${model.clock}`), proc, hostPid: proc.hostPid, boxPid: proc.nspid[1], start: proc.start, pipe: `/run/ploinky/mps/pipe-${suffix}`, log: `/run/ploinky/mps/log-${suffix}`, defaults, servers: [], lost: false };
         model.mpsStatus = 'ready';
+        model.memoryLimited = false;
         event('start');
     }
     function stopDaemon() {
@@ -181,6 +182,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
         model.smiQueries += 1;
         if (args.join(' ') !== `-q -x -i ${gpu.uuid}`) return failed('unexpected nvidia-smi invocation', 2);
         if (faults.smiExit && (faults.smiExit.at === undefined || faults.smiExit.at === model.smiQueries)) return failed('NVIDIA-SMI has failed', 9);
+        if (faults.smiTimeout) return ok('', { status: null, timedOut: true });
         return ok(smiXml());
     }
 
@@ -191,6 +193,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
         if (faults.probeInit) return { status: 2, report: { ok: false, status: 'failed', step: 'cuInit', error: 'CUDA_ERROR_NO_DEVICE' } };
         const daemon = model.daemon;
         const mpsOn = Boolean(environment.CUDA_MPS_PIPE_DIRECTORY) && daemon && !daemon.lost && agent.mounts.some(mount => mount.Destination === CLIENT_PIPE);
+        if (mpsOn && model.memoryLimited) return { status: 2, report: { ok: false, status: 'failed', step: 'cuCtxCreate', error: 'CUDA_ERROR_OUT_OF_MEMORY' } };
         let smCount = gpu.smCount; let allocated = maxMiB; let termination = 'bound';
         const capped = mpsOn || faults.bypassCapped;
         if (capped) {
@@ -248,6 +251,9 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
             model.controlLog.push({ command, helper });
             if (faults.controlDenied) return ok('Error: operation not permitted\n');
             if (/^set_active_thread_percentage .* 100$/.test(command)) model.widened = true;
+            // `memorySetterBreaksNextContext`: an accepted low per-server memory limit makes the
+            // next context creation fail until the daemon is replaced.
+            if (/^set_device_pinned_mem_limit /.test(command) && faults.memorySetterBreaksNextContext) model.memoryLimited = true;
             return ok('');
         }
         return failed('unknown MPS command', 1);
@@ -454,7 +460,12 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
         }
         const result = await base(binary, args, options);
         if (verbs.includes('start') && result.status === 0) initializeGpuWorld(options.cwd);
-        if (verbs.includes('destroy')) { model.procs.clear(); model.dirs.clear(); model.agents.clear(); model.helpers.clear(); model.daemon = null; }
+        if (verbs.includes('destroy')) {
+            // `survivorAfterDestroy`: the Box is gone but its MPS daemon process is still there.
+            const survivors = faults.survivorAfterDestroy && model.daemon ? [model.daemon.proc] : [];
+            model.procs.clear(); for (const proc of survivors) model.procs.set(proc.hostPid, proc);
+            model.dirs.clear(); model.agents.clear(); model.helpers.clear(); model.daemon = null;
+        }
         return result;
     }
     function initializeGpuWorld(workspace) {

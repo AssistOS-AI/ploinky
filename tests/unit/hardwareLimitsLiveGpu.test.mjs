@@ -111,7 +111,11 @@ function gpuWorld(t, { faults = {}, suffix = 'claude', existingGrantDirectory = 
         run: w.run, persist, processProvider: fake.provider, hostIdentity, remoteArrival: true, hostProc: fake.hostProc, gpuTimings: { ...FAST, ...(options.timings || {}) },
         artifacts: (name, value) => artifacts.set(name, structuredClone(value)), ...options,
     });
-    w.cleanup = () => executeCleanupRun({ run: w.run, persist, processProvider: fake.provider, hostIdentity, remoteArrival: true });
+    w.cleanup = (options = {}) => executeCleanupRun({
+        run: w.run, persist, processProvider: fake.provider, hostIdentity, remoteArrival: true, hostProc: fake.hostProc,
+        artifacts: (name, value) => artifacts.set(name, structuredClone(value)), ...options,
+    });
+    w.faults = faults;
     return w;
 }
 async function provisioned(t, options) {
@@ -587,7 +591,7 @@ test('G1.P2-passes-share-tighter-values-and-bypass-with-recorded-rounding', asyn
     assert.ok(measurements.tighterSm.smCount <= measurements.share.smCount); assert.ok(measurements.tighterMemory.allocatedMiB <= 512);
     assert.deepEqual([measurements.bypass.smCount, measurements.bypass.allocatedMiB, measurements.bypass.termination], [30, 1408, 'bound']);
     assert.ok(Object.values(measurements.bypass.mpsEnv).every(value => value === null), 'the bypass really dropped the MPS environment');
-    assert.deepEqual([rounding.overheadMiB, rounding.stepMiB, rounding.fullSmCount, rounding.expectedSmShare, rounding.planEvidence.matchesFull], [148, 128, 30, 8, true]);
+    assert.deepEqual([rounding.overheadMiB, rounding.stepMiB, rounding.pinnedFullSmCount, rounding.bypassSmCount, rounding.expectedSmShare, rounding.bypassMatchesPinned], [148, 128, 30, 30, 8, true]);
     // After every probe settled, the GPU and the MPS state are recorded (the A1 pattern), before any assertion.
     const afterSteps = p2.evidence.steps.filter(step => step.name.startsWith('probe-after:'));
     assert.deepEqual(afterSteps.map(step => step.name), ['probe-after:share', 'probe-after:tighter-sm', 'probe-after:tighter-memory', 'probe-after:bypass']);
@@ -1012,4 +1016,223 @@ test('G1.gpu-plan-and-profile-validation-refuse-inconsistent-fixtures-and-pins',
         assert.throws(() => validateProfile(run, { partial: true }), label);
     }
     assert.doesNotThrow(() => validateProfile(clone(), { partial: true }));
+});
+
+// --- GF4: an ambiguous process inventory is unsupported ------------------------------------------
+test('G1.gate-an-ambiguous-process-inventory-is-unsupported-whichever-section-comes-first', async () => {
+    const busy = `<processes>${row(456, 'G')}</processes>`;
+    const empty = '<processes></processes>';
+    const wrap = body => smiXml().replace(empty, body);
+    for (const [label, body] of [['empty then busy', empty + busy], ['busy then empty', busy + empty], ['two empty sections', empty + empty], ['two busy sections', busy + busy]]) {
+        assert.throws(() => parseGpuInventory(smiOk(wrap(body)), UUID), /Ambiguous GPU process inventory structure/, label);
+        const { gate } = scriptedGate({ replies: [smiOk(wrap(body)), smiOk(wrap(body))] });
+        await assert.rejects(gate.initial(), blockedWith('unsupported_output'), `${label}: the initial gate is blocked as unsupported`);
+        const later = scriptedGate({ replies: [smiOk(smiXml()), smiOk(wrap(body))] });
+        await later.gate.initial();
+        await assert.rejects(later.gate.check('op'), blockedWith('unsupported_output'), `${label}: a later check is blocked as unsupported too`);
+    }
+    // A section outside the selected device, an unbalanced tag and a missing device element are unsupported as well.
+    assert.throws(() => parseGpuInventory(smiOk(smiXml().replace('</gpu>', `</gpu>${empty}`)), UUID), /Ambiguous GPU process inventory structure/);
+    assert.throws(() => parseGpuInventory(smiOk(smiXml().replace(empty, '<processes>')), UUID), /Ambiguous GPU process inventory structure|Unsupported GPU inventory/);
+    assert.throws(() => parseGpuInventory(smiOk(smiXml().replace('</gpu>', '</gpu></gpu>')), UUID), /Unsupported GPU inventory/);
+    // Controls: exactly one section is read, whether empty or busy.
+    assert.deepEqual(parseGpuInventory(smiOk(wrap(empty)), UUID).processes, []);
+    assert.deepEqual(parseGpuInventory(smiOk(wrap(busy)), UUID).processes, [{ pid: 456, type: 'G' }]);
+    const { gate } = scriptedGate({ replies: [smiOk(wrap(busy))] });
+    await assert.rejects(gate.initial(), blockedWith('gpu_busy'));
+});
+
+// --- GF2: the bypass must see the pinned full-device SM count --------------------------------------
+test('G1.P2-a-bypass-that-sees-fewer-sms-than-the-pinned-device-fails-and-keeps-the-evidence', async t => {
+    // 24 SMs against the pinned 30: the bypass is itself restricted, so it proves nothing about the unrestricted device.
+    const restricted = await provisioned(t, { gpuOverrides: { smCount: 24 } });
+    const report = await liveCases(restricted, ['LIVE-P2']);
+    const p2 = caseOf(report, 'LIVE-P2');
+    assert.equal(p2.result, 'fail', JSON.stringify(p2).slice(0, 500));
+    assert.match(p2.reason, /bypass SM count 24 differs from the pinned full-device count 30/);
+    assert.deepEqual([p2.evidence.rounding.bypassSmCount, p2.evidence.rounding.pinnedFullSmCount, p2.evidence.rounding.bypassMatchesPinned], [24, 30, false]);
+    assert.ok(p2.evidence.measurements.bypass && p2.evidence.measurements.share, 'the measurements are kept');
+    nothingOwned(restricted);
+    // A device with MORE SMs than pinned fails the same way: the pin is exact, not a lower bound.
+    const larger = await provisioned(t, { gpuOverrides: { smCount: 36 } });
+    const bigger = caseOf(await liveCases(larger, ['LIVE-P2']), 'LIVE-P2');
+    assert.equal(bigger.result, 'fail'); assert.match(bigger.reason, /bypass SM count 36 differs from the pinned full-device count 30/);
+    // The 30-versus-30 control passes (the whole-block and P2 tests above run it).
+    const control = await provisioned(t);
+    const passed = caseOf(await liveCases(control, ['LIVE-P2']), 'LIVE-P2');
+    assert.equal(passed.result, 'pass'); assert.equal(passed.evidence.rounding.bypassMatchesPinned, true);
+});
+
+// --- GF3: P4 observes the SM change before the independent memory setter -------------------------------
+test('G1.P4-the-sm-observation-precedes-the-independent-memory-setter-and-is-not-confounded', async t => {
+    // The fake models an ACCEPTED low per-server memory limit that makes the next context creation fail.
+    const w = await provisioned(t, { faults: { memorySetterBreaksNextContext: true } });
+    const report = await liveCases(w, ['LIVE-P4']);
+    const p4 = caseOf(report, 'LIVE-P4');
+    assert.equal(p4.result, 'pass', JSON.stringify(p4).slice(0, 700));
+    const names = p4.evidence.steps.map(step => step.name);
+    const at = name => names.indexOf(name);
+    assert.ok(at('control:rw-widen-sm') >= 0 && at('control:rw-widen-sm') < at('probe:after-sm-mutation') && at('probe:after-sm-mutation') < at('control:rw-set-memory') && at('control:rw-set-memory') < at('probe:after-memory-mutation'), names.join(','));
+    // The SM observation completed in a context that was not affected by the memory setter.
+    assert.ok(p4.evidence.afterMutation.smCount > 0); assert.equal(p4.evidence.afterMutation.termination, 'allocation_oom');
+    // The memory setter's effect is recorded as an observation: the next context failed, and the case did not fail for it.
+    assert.deepEqual([p4.evidence.controlMutation.setMemory.accepted, p4.evidence.controlMutation.setMemory.effect.observed, p4.evidence.controlMutation.setMemory.effect.contextCreated], [true, true, false]);
+    assert.match(p4.evidence.controlMutation.setMemory.effect.error, /cuCtxCreate: CUDA_ERROR_OUT_OF_MEMORY/);
+    // The owned daemon was reconciled afterwards: a new generation, with the limit gone.
+    assert.notEqual(p4.evidence.reconciled.generation, p4.evidence.reconciled.previous); assert.equal(w.fake.model.memoryLimited, false);
+    assert.equal(p4.evidence.afterReconcile.smCount, 6);
+    nothingOwned(w);
+    // A DENIED memory setter is not reported as isolation: no effect is claimed, the limitation text stays.
+    const denied = await provisioned(t, { faults: { controlDenied: true } });
+    const quiet = caseOf(await liveCases(denied, ['LIVE-P4']), 'LIVE-P4');
+    assert.equal(quiet.result, 'pass');
+    assert.deepEqual([quiet.evidence.controlMutation.setMemory.accepted, quiet.evidence.controlMutation.setMemory.effect.observed], [false, false]);
+    assert.match(quiet.evidence.controlMutation.setMemory.effect.reason, /denied or did not answer/); assert.match(quiet.evidence.controlMutation.limitation, /not a security boundary/);
+    assert.equal(quiet.evidence.steps.some(step => step.name === 'probe:after-memory-mutation'), false, 'no context is tried after a denied setter');
+});
+
+test('G1.P4-always-reconciles-the-owned-daemon-even-when-the-case-fails-or-is-blocked', async t => {
+    // A blocked helper (cannot reach the daemon) still reconciles; a case failure after the mutation too.
+    const blockedCase = await provisioned(t, { faults: { helperCannotConnect: true } });
+    const report = await liveCases(blockedCase, ['LIVE-P4']);
+    const p4 = caseOf(report, 'LIVE-P4');
+    assert.equal(p4.result, 'blocked'); assert.ok(p4.evidence.reconciled, 'the daemon was reconciled although the case was blocked');
+    assert.equal(blockedCase.fake.model.helpers.size, 0);
+    nothingOwned(blockedCase);
+    // A tripped gate starts no new work: the reconcile is skipped and cleanup stops the owned clients.
+    const tripped = await provisioned(t, { faults: { foreignDuringProbe: true, probeMs: 400 } });
+    const r2 = await liveCases(tripped, ['LIVE-P4']);
+    const t4 = caseOf(r2, 'LIVE-P4');
+    assert.equal(t4.result, 'blocked'); assert.match(t4.reason, /foreign_process_appeared/);
+    assert.equal(t4.evidence.reconciled, undefined); assert.ok(t4.evidence.steps.some(step => step.name === 'reconcile-skipped'));
+    nothingOwned(tripped);
+});
+
+// --- GF1: cleanup is certified only by a SUCCESSFUL final GPU observation -------------------------------
+const liveWithFinalFault = async (w, faults, fault, ids = ['LIVE-P1']) => {
+    const original = w.fake.provider;
+    // The fault starts when the Box has been destroyed, i.e. at the final observation only.
+    const processProvider = async (binary, args, options) => {
+        const result = await original(binary, args, options);
+        if (binary === w.node && args.includes('destroy')) Object.assign(faults, fault);
+        return result;
+    };
+    w.run.target.execution.cases = ids;
+    return executeLiveRun({
+        run: w.run, persist: w.persist, processProvider, hostIdentity: w.hostIdentity, remoteArrival: true, hostProc: w.fake.hostProc, gpuTimings: FAST,
+        artifacts: (name, value) => w.artifacts.set(name, structuredClone(value)),
+    });
+};
+const FINAL_FAULTS = [
+    ['the final query exits nonzero', { smiExit: {} }],
+    ['the final query times out', { smiTimeout: true }],
+    ['the final reply is truncated XML', { smiTransform: xml => xml.slice(0, 120) }],
+    ['the final process inventory is unavailable', { smiProcessesNA: true }],
+    ['the final reply is ambiguous (two process sections)', { smiTransform: xml => xml.replace('</gpu>', '<processes></processes></gpu>') }],
+    ['the compute mode is no longer Default', { smiComputeMode: 'Exclusive_Process' }],
+    ['the device is another one', { smiOtherUuid: true }],
+];
+
+test('G1.gf1-a-missing-malformed-or-timed-out-final-gpu-observation-never-certifies-cleanup-or-a-pass', async t => {
+    for (const [label, fault] of FINAL_FAULTS) {
+        const faults = {};
+        const w = await provisioned(t, { faults });
+        const report = await liveWithFinalFault(w, faults, fault);
+        // The case outcome is preserved, the overall result and the cleanup are not a pass.
+        assert.equal(caseOf(report, 'LIVE-P1').result, 'pass', label);
+        assert.equal(report.verdict, 'FAIL', label); assert.equal(report.exitCode, 1, label);
+        assert.equal(w.run.cleanup.state, 'failed', label); assert.notEqual(w.run.state, 'complete', label);
+        assert.match(w.run.cleanup.failures.at(-1), /final GPU observation failed, so cleanup is not certified/, label);
+        assert.equal(w.artifacts.get('gpu-final-observation').error !== null, true, `${label}: the failed observation is evidence`);
+        // The recovery records survive in the manifest, in memory and on disk, each with its full tuple.
+        assert.ok(w.run.ownedProcesses.length >= 1 && w.run.ownedProcesses.some(entry => entry.role === 'mps-server'), label);
+        assert.ok(w.run.ownedProcesses.every(entry => entry.kind === 'gpu-process' && ['mps-server', 'mps-client'].includes(entry.role) && entry.hostPid > 0 && entry.bootId && /^\d+$/.test(entry.startIdentity) && entry.cgroup.startsWith('/') && Number.isSafeInteger(entry.ppid)), label);
+        assert.deepEqual(JSON.parse(fs.readFileSync(w.runPath, 'utf8')).ownedProcesses, w.run.ownedProcesses, `${label}: persisted`);
+        assert.doesNotThrow(() => validateProfile(w.run, { partial: true }), label);
+        // The Box itself is gone and nothing foreign was signalled.
+        assert.deepEqual(Object.keys(worldState(w.statePath).boxes), [], label); assert.equal(w.fake.model.signals.length, 0, label);
+    }
+    // After P2 the manifest also holds the clients the bypass probe registered, each with its tuple.
+    const faults = {};
+    const w = await provisioned(t, { faults });
+    const report = await liveWithFinalFault(w, faults, { smiExit: {} }, ['LIVE-P2']);
+    assert.equal(caseOf(report, 'LIVE-P2').result, 'pass'); assert.equal(w.run.cleanup.state, 'failed');
+    assert.ok(w.run.ownedProcesses.some(entry => entry.role === 'mps-server') && w.run.ownedProcesses.some(entry => entry.role === 'mps-client'), JSON.stringify(w.run.ownedProcesses.map(entry => entry.role)));
+    // The retry proves every one of them gone.
+    delete faults.smiExit;
+    assert.equal((await w.cleanup()).verdict, 'PASS');
+    assert.ok(w.artifacts.get('gpu-final-observation').registered >= 2); assert.deepEqual(w.artifacts.get('gpu-final-observation').survivors, []);
+});
+
+test('G1.gf1-standalone-cleanup-needs-the-final-gpu-observation-and-a-retry-passes-once-it-works', async t => {
+    // Resumed after a live run whose final observation failed: the standalone cleanup is not a PASS while the query is unavailable.
+    const faults = {};
+    const w = await provisioned(t, { faults });
+    const live = await liveWithFinalFault(w, faults, { smiExit: {} });
+    assert.equal(live.verdict, 'FAIL');
+    const records = structuredClone(w.run.ownedProcesses);
+    const unavailable = await w.cleanup();
+    assert.equal(unavailable.verdict, 'FAIL'); assert.equal(w.run.cleanup.state, 'failed'); assert.match(w.run.cleanup.failures.at(-1), /final GPU observation failed/);
+    assert.deepEqual(w.run.ownedProcesses, records, 'the recovery records are kept for the retry');
+    // The retry passes once the query works, and certifies it with a successful observation.
+    delete faults.smiExit;
+    const retried = await w.cleanup();
+    assert.equal(retried.verdict, 'PASS', JSON.stringify(w.run.cleanup)); assert.equal(w.run.cleanup.state, 'complete'); assert.equal(w.run.state, 'complete');
+    assert.deepEqual(w.artifacts.get('gpu-final-observation').processes, []); assert.equal(w.artifacts.get('gpu-final-observation').error, null);
+    assert.ok(w.artifacts.get('gpu-final-observation').registered >= 1, 'the registered owned processes were checked');
+    assert.deepEqual(w.run.ownedProcesses, records);
+    nothingOwned(w);
+    // A fixture that never ran a case is held to the same proof: no GPU query, no PASS.
+    const freshFaults = {};
+    const fresh = await provisioned(t, { faults: freshFaults });
+    freshFaults.smiExit = {};
+    const never = await fresh.cleanup();
+    assert.equal(never.verdict, 'FAIL'); assert.equal(fresh.run.cleanup.state, 'failed');
+    delete fresh.faults.smiExit;
+    assert.equal((await fresh.cleanup()).verdict, 'PASS'); nothingOwned(fresh);
+});
+
+test('G1.gf1-an-owned-process-that-survives-the-destruction-fails-cleanup-and-is-not-signalled', async t => {
+    const w = await provisioned(t, { faults: { survivorAfterDestroy: true } });
+    w.run.target.execution.cases = ['LIVE-P1'];
+    const report = await w.live();
+    assert.equal(caseOf(report, 'LIVE-P1').result, 'pass'); assert.equal(report.verdict, 'FAIL');
+    assert.equal(w.run.cleanup.state, 'failed'); assert.match(w.run.cleanup.failures.at(-1), /An owned GPU process survived the destruction of its Box: mps-server \d+; it was not signalled/);
+    const survivors = w.artifacts.get('gpu-final-observation').survivors;
+    assert.equal(survivors.length, 1); assert.equal(w.fake.model.signals.length, 0, 'nothing was signalled');
+    // A standalone retry still fails while the process lives, and passes once its owner has stopped it.
+    assert.equal((await w.cleanup()).verdict, 'FAIL');
+    w.fake.model.procs.clear();
+    assert.equal((await w.cleanup()).verdict, 'PASS'); assert.equal(w.run.cleanup.state, 'complete');
+    // A process that merely reuses a registered PID (another start identity) is not ours and is not a survivor.
+    const reused = await provisioned(t);
+    reused.run.target.execution.cases = ['LIVE-P1'];
+    const original = reused.fake.provider;
+    await reused.live({ processProvider: async (binary, args, options) => { const result = await original(binary, args, options); if (binary === reused.node && args.includes('destroy')) for (const entry of reused.run.ownedProcesses) reused.fake.model.procs.set(entry.hostPid, { hostPid: entry.hostPid, start: '999999', ppid: 1, cgroup: '/elsewhere', nspid: [entry.hostPid], uid: 1000 }); return result; } });
+    assert.equal(reused.run.cleanup.state, 'complete', JSON.stringify(reused.run.cleanup.failures));
+});
+
+test('G1.gf1-a-gpu-fixture-whose-provisioning-failed-is-certified-clean-only-by-a-successful-final-observation', async t => {
+    // The grant fails; the cleanup that follows needs the final observation, whose query (the second) is unavailable.
+    const faults = { grantFails: true, smiExit: { at: 2 } };
+    const w = gpuWorld(t, { faults });
+    const report = await w.provision();
+    assert.equal(report.verdict, 'FAIL', JSON.stringify(report.limitations)); assert.equal(w.run.cleanup.state, 'failed');
+    assert.match(w.run.cleanup.failures.at(-1), /final GPU observation failed/);
+    assert.deepEqual(Object.keys(worldState(w.statePath).boxes), [], 'the resources were cleaned; only the certification is missing');
+    delete faults.smiExit;
+    assert.equal((await w.cleanup()).verdict, 'PASS'); nothingOwned(w);
+});
+
+test('G1.gf1-only-registered-gpu-processes-may-be-recorded-in-the-manifest', async t => {
+    const w = await provisioned(t);
+    const record = { kind: 'gpu-process', role: 'mps-server', hostPid: 4242, bootId: 'boot-1', startIdentity: '123', cgroup: '/box/ploinky/core', ppid: 1 };
+    const withRecords = entries => { const run = structuredClone(w.run); run.ownedProcesses = entries; return run; };
+    assert.doesNotThrow(() => validateProfile(withRecords([record])));
+    for (const [label, entry] of [['another kind', { ...record, kind: 'process' }], ['another role', { ...record, role: 'foreign' }], ['a missing field', (({ ppid, ...rest }) => rest)(record)], ['an extra field', { ...record, extra: 1 }], ['a non-numeric start identity', { ...record, startIdentity: 'x' }], ['a bare PID', 4242]]) {
+        assert.throws(() => validateProfile(withRecords([entry])), /cannot clean extra recorded processes or paths/, label);
+    }
+    // A CPU block records no process at all.
+    const cpu = structuredClone(w.run); cpu.target.execution.gpu = undefined; cpu.ownedProcesses = [record];
+    assert.throws(() => validateProfile(cpu, { partial: true }));
 });

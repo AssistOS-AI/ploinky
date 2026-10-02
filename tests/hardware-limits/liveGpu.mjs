@@ -19,8 +19,16 @@ export function parseGpuInventory(result, expectedUuid) {
         || !xml.includes('</nvidia_smi_log>') || (xml.match(/<gpu\s+id=/g) || []).length !== 1) throw new Error('Unsupported GPU inventory');
     if (!/^GPU-[a-fA-F0-9-]{8,64}$/.test(expectedUuid) || textTag(xml, 'uuid') !== expectedUuid
         || textTag(xml, 'compute_mode') !== 'Default') throw new Error('GPU device or compute mode mismatch');
-    const section = xml.match(/<processes>([\s\S]*?)<\/processes>/);
-    if (!section) throw new Error('GPU activity inventory unavailable');
+    // Exactly one process-inventory section, inside the one selected device: two
+    // sections (an empty one first, a busy one second, or the reverse) are an
+    // ambiguous structure, never read as "the first one".
+    const device = /<gpu\s+id=[^>]*>([\s\S]*?)<\/gpu>/.exec(xml);
+    const sections = [...xml.matchAll(/<processes>([\s\S]*?)<\/processes>/g)];
+    const opens = (xml.match(/<processes>/g) || []).length; const closes = (xml.match(/<\/processes>/g) || []).length;
+    if (!device || (xml.match(/<\/gpu>/g) || []).length !== 1) throw new Error('Unsupported GPU inventory');
+    if (opens !== closes || sections.length !== opens || sections.length > 1) throw new Error('Ambiguous GPU process inventory structure');
+    const section = sections[0];
+    if (!section || !device[1].includes(section[0])) throw new Error('GPU activity inventory unavailable');
     const rows = [...section[1].matchAll(/<process_info>([\s\S]*?)<\/process_info>/g)];
     // What is left of the section once the process rows are removed must be
     // empty: `N/A` or `Not Supported` there means the inventory is unavailable.

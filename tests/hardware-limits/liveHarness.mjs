@@ -21,6 +21,7 @@ import {
 } from './liveCaseCommands.mjs';
 import { createGpuCases } from './liveGpuCases.mjs';
 import { validateGpuProfile } from './liveGpuCommands.mjs';
+import { gpuCleanupProof, isGpuProcessRecord } from './liveGpuGate.mjs';
 
 export const LIVE_CASES = Object.freeze({
     'mac-cpu': ['LIVE-C1', 'LIVE-C2', 'LIVE-C3', 'LIVE-C4', 'LIVE-C5', 'LIVE-C6', 'LIVE-C7'],
@@ -120,7 +121,10 @@ export function validateProfile(run, { partial = false } = {}) {
     }
     if (run.preInventory.containers !== undefined && (!Array.isArray(run.preInventory.containers) || run.preInventory.containers.length > 256
         || run.preInventory.containers.some(value => !ID.test(value.id) || !bounded(value.created, 128) || !bounded(value.image, 128)))) throw new Error('Invalid before inventory');
-    if (run.ownedProcesses.length) throw new Error('This executor cannot clean extra recorded processes or paths');
+    // The only recorded processes are the registered GPU processes of an apparatus-mps run,
+    // each with its full tuple; cleanup never signals them and the final GPU observation
+    // proves them gone.
+    if (run.ownedProcesses.some(entry => !profile.gpu || !isGpuProcessRecord(entry))) throw new Error('This executor cannot clean extra recorded processes or paths');
     validateOwnedPaths(run, profile);
     return profile;
 }
@@ -543,7 +547,7 @@ function pinProblem(run, profile, hostIdentity, remoteArrival) {
 
 // Standalone cleanup resumes from the manifest alone, including after an
 // interrupted provisioning that never recorded a Box or workspace receipt.
-export async function executeCleanupRun({ run, persist = () => {}, processProvider = runBoundedProcess, signal, remoteArrival = false, hostIdentity = defaultHostIdentity() } = {}) {
+export async function executeCleanupRun({ run, persist = () => {}, processProvider = runBoundedProcess, signal, remoteArrival = false, hostIdentity = defaultHostIdentity(), hostProc, artifacts = () => {} } = {}) {
     const cases = LIVE_CASES[run.block].map(id => ({ id, result: 'blocked', reason: UNSUPPORTED[id] || 'Cleanup only' }));
     const report = { schema: 1, runId: run.runId, action: 'cleanup', verdict: 'BLOCKED', exitCode: EXIT.BLOCKED, cases, cleanup: run.cleanup, limitations: [] };
     let profile;
@@ -555,7 +559,12 @@ export async function executeCleanupRun({ run, persist = () => {}, processProvid
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), Number.isInteger(run.deadlines?.cleanupMs) ? run.deadlines.cleanupMs : 5 * 60 * 1000);
     try {
-        await runOwnedCleanup({ run, profile, persist, processProvider, signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal });
+        const scope = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+        await runOwnedCleanup({ run, profile, persist, processProvider, signal: scope });
+        // A GPU block is certified clean only after a SUCCESSFUL final GPU observation, here
+        // as in the live run; the registered processes are the manifest's own records, so a
+        // resumed run proves the same thing. Without it the cleanup stays failed and retryable.
+        if (profile.gpu) await gpuCleanupProof({ run, profile, processProvider, signal: scope, hostProc, artifacts });
         run.cleanup.state = 'complete'; run.state = 'complete';
     } catch (error) { run.cleanup.state = 'failed'; run.cleanup.failures.push(error.message); }
     finally { clearTimeout(timer); }
@@ -569,7 +578,7 @@ export async function executeLiveRun({ run, action = 'live', persist = () => {},
     remoteArrival = false, artifacts = () => {},
     hostIdentity = defaultHostIdentity(), hostProc, gpuTimings,
 } = {}) {
-    if (action === 'cleanup') return executeCleanupRun({ run, persist, processProvider, signal, remoteArrival, hostIdentity });
+    if (action === 'cleanup') return executeCleanupRun({ run, persist, processProvider, signal, remoteArrival, hostIdentity, hostProc, artifacts });
     const selected = run.target.execution?.cases || LIVE_CASES[run.block];
     const cases = LIVE_CASES[run.block].map(id => ({ id, result: 'blocked', reason: UNSUPPORTED[id] || 'Not selected or no completed enforcement evidence' }));
     const report = { schema: 1, runId: run.runId, action, verdict: 'BLOCKED', exitCode: EXIT.BLOCKED, cases, cleanup: run.cleanup, limitations: [] };

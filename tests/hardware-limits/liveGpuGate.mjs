@@ -18,7 +18,8 @@
 //   - It never changes the compute mode and never signals any process.
 import { blocked } from './liveCommon.mjs';
 import { parseGpuInventory, parseGpuMemory, requireGpuIdle } from './liveGpu.mjs';
-import { cgroupWithin } from './liveGpuHost.mjs';
+import { requireTransport } from './liveProcess.mjs';
+import { cgroupWithin, createHostProc } from './liveGpuHost.mjs';
 
 // `nvidia-smi -q -x -i UUID`: one device, the full XML inventory.
 export const gpuQueryArgv = uuid => ['-q', '-x', '-i', uuid];
@@ -43,7 +44,7 @@ function classify(message) {
 }
 
 export function createGpuGate({
-    query, uuid, host, boxPrefix, expectedMemoryMiB = null, intervalMs = 2000, retryMs = 100,
+    query, uuid, host, boxPrefix, expectedMemoryMiB = null, intervalMs = 2000, retryMs = 100, onRegister = () => {},
     sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), now = Date.now,
 } = {}) {
     if (typeof query !== 'function' || !/^GPU-[a-fA-F0-9-]{8,64}$/.test(String(uuid)) || !host || typeof boxPrefix !== 'string' || !boxPrefix.startsWith('/')) {
@@ -70,6 +71,9 @@ export function createGpuGate({
         if (!observed || !cgroupWithin(observed.cgroup, boxPrefix)) throw gpuBlocked('owned_provenance_unproved', { hostPid, role, message: 'the process is not provably beneath the exact Box' });
         const record = tuple(role, observed);
         registry.set(hostPid, record);
+        // The registration is durable: the owner persists it into the run manifest
+        // with its full tuple, so a resumed cleanup can prove the process is gone.
+        onRegister({ ...record, cgroup: observed.cgroup, ppid: observed.ppid });
         return record;
     }
     // A listed PID that is not registered may still be owned: a child of a
@@ -186,4 +190,63 @@ export function createGpuGate({
         },
     };
     return gate;
+}
+
+// ---------------------------------------------------------------------------
+// The final GPU observation that certifies a GPU block's cleanup. Cleanup is
+// complete only when this SUCCEEDS: a failed, timed-out or malformed query, a
+// device or compute mode that is not the pinned one, or a registered owned
+// process that still exists with its recorded tuple all fail it. It reads only:
+// it never signals a process, owned or not. The registrations it checks are the
+// run manifest's own `ownedProcesses` records, so a resumed cleanup in a new
+// process proves the same thing as the run that registered them.
+export const GPU_PROCESS_RECORD_KEYS = Object.freeze(['kind', 'role', 'hostPid', 'bootId', 'startIdentity', 'cgroup', 'ppid']);
+export function isGpuProcessRecord(value) {
+    return Boolean(value) && Object.getPrototypeOf(value) === Object.prototype && value.kind === 'gpu-process'
+        && Object.keys(value).length === GPU_PROCESS_RECORD_KEYS.length && GPU_PROCESS_RECORD_KEYS.every(key => Object.hasOwn(value, key))
+        && ['mps-server', 'mps-client'].includes(value.role) && Number.isSafeInteger(value.hostPid) && value.hostPid > 0
+        && typeof value.bootId === 'string' && value.bootId.length > 0 && value.bootId.length <= 64
+        && /^[0-9]+$/.test(String(value.startIdentity)) && typeof value.cgroup === 'string' && value.cgroup.length <= 1024 && Number.isSafeInteger(value.ppid);
+}
+export async function finalGpuObservation({ gpu, run, host, query, artifacts = () => {}, now = Date.now }) {
+    const observation = { at: now(), uuid: gpu.uuid, processes: null, computeMode: null, memory: null, registered: 0, survivors: [], error: null };
+    const fail = message => {
+        observation.error = message;
+        try { artifacts('gpu-final-observation', observation); } catch { /* the failure below is the verdict */ }
+        throw Object.assign(new Error(`The final GPU observation failed, so cleanup is not certified: ${message}`), { code: 'LIVE_GPU_FINAL_OBSERVATION' });
+    };
+    let result;
+    try { result = await query(); requireTransport(result); } catch (error) { fail(`the nvidia-smi query did not complete (${String(error?.message || error).slice(0, 200)})`); }
+    let inventory; let memory;
+    try { inventory = parseGpuInventory(result, gpu.uuid); memory = parseGpuMemory(result); } catch (error) { fail(`the reply is unsupported or not the pinned device in Default mode (${String(error?.message || error).slice(0, 200)})`); }
+    observation.processes = inventory.processes.map(value => value.pid);
+    observation.computeMode = 'Default';
+    observation.memory = memory;
+    const records = (run.ownedProcesses || []).filter(isGpuProcessRecord);
+    observation.registered = records.length;
+    for (const record of records) {
+        let seen = null;
+        try { seen = host.observe(record.hostPid); } catch (error) { fail(`a registered process cannot be re-observed (${String(error?.message || error).slice(0, 120)})`); }
+        // Still the very process that was registered: PID, boot and start identity all match.
+        if (seen && seen.bootId === record.bootId && seen.startIdentity === String(record.startIdentity)) {
+            observation.survivors.push({ role: record.role, hostPid: record.hostPid, listed: observation.processes.includes(record.hostPid) });
+        }
+    }
+    try { artifacts('gpu-final-observation', observation); } catch { /* evidence only */ }
+    if (observation.survivors.length) {
+        throw Object.assign(new Error(`An owned GPU process survived the destruction of its Box: ${observation.survivors.map(value => `${value.role} ${value.hostPid}`).join(', ')}; it was not signalled`), { code: 'LIVE_GPU_OWNED_SURVIVOR' });
+    }
+    return observation;
+}
+
+// The GPU block's cleanup proof, shared by every cleanup path (normal, standalone,
+// resumed, provisioning failure): a SUCCESSFUL final observation of the GPU through
+// the pinned nvidia-smi. `artifacts` keeps the evidence.
+export function gpuCleanupProof({ run, profile, processProvider, signal, hostProc, artifacts = () => {} }) {
+    return finalGpuObservation({
+        gpu: profile.gpu, run, host: hostProc || createHostProc(), artifacts,
+        query: () => processProvider(profile.gpu.smi.path, gpuQueryArgv(profile.gpu.uuid), {
+            cwd: profile.host.home, env: { PATH: '/usr/bin:/bin', HOME: profile.host.home }, deadlineMs: 30000, maxBytes: 1048576, signal,
+        }),
+    });
 }

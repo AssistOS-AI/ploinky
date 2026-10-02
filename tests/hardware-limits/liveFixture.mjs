@@ -22,7 +22,7 @@ import {
 import { runBoundedProcess } from './liveProcess.mjs';
 import { createJournal, recordHostRecords, runOwnedCleanup } from './liveCleanup.mjs';
 import { createHostProc } from './liveGpuHost.mjs';
-import { createGpuGate, gpuQueryArgv } from './liveGpuGate.mjs';
+import { createGpuGate, gpuCleanupProof, gpuQueryArgv } from './liveGpuGate.mjs';
 
 export const FIXTURE_REPOSITORY = 'hwlfixture';
 export const FIXTURE_HARDWARE_LIMITS = Object.freeze({ memory: '64m', cpus: '0.5', pidsLimit: 64 });
@@ -336,6 +336,8 @@ export async function provisionRun({
         run.state = 'cleanup-required'; run.cleanup.state = 'running'; persist();
         try {
             await runOwnedCleanup({ run, profile, persist, processProvider, signal });
+            // A GPU fixture is certified clean only after a successful final GPU observation.
+            if (profile.gpu) await gpuCleanupProof({ run, profile, processProvider, signal, hostProc, artifacts });
             run.cleanup.state = 'complete'; run.state = 'complete';
         } catch (cleanupError) { run.cleanup.state = 'failed'; run.cleanup.failures.push(cleanupError.message); }
         persist();

@@ -18,7 +18,7 @@ import { fixtureContainerName } from './liveFixture.mjs';
 import { recordHostRecords } from './liveCleanup.mjs';
 import { createHostProc, boxCgroupPrefix, agentLeaf } from './liveGpuHost.mjs';
 import { parseGpuInventory } from './liveGpu.mjs';
-import { createGpuGate, gpuQueryArgv } from './liveGpuGate.mjs';
+import { createGpuGate, finalGpuObservation, gpuQueryArgv } from './liveGpuGate.mjs';
 import {
     ADMIN_REQUEST, GPU_AGENT_INSPECT, GPU_SHARES, MIB, MPS_CLIENT_PIPE, MPS_KILL_OWNED_DAEMON, MPS_OBSERVE, NESTED_NAME_LIST_FORMAT, PROBE_DEADLINE_MS,
     MPS_CLIENT_USER, TIGHTER_CLIENT, assertMpsControlCommand, classifyMpsReply, controlHelperExecArgv, controlHelperRunArgv, parseProbeResult, probeBoundMiB, probeExecArgv, shareMemoryMiB,
@@ -258,7 +258,16 @@ export function createGpuCases(ctx) {
         const box = await inspectBox();
         needs(Number.isSafeInteger(box.pid) && box.pid > 0, 'The engine did not expose the Box init PID');
         const prefix = boxCgroupPrefix(host, { boxPid: box.pid, boxId: box.id });
-        const gate = createGpuGate({ query: () => smiQuery(), uuid: gpu.uuid, host, boxPrefix: prefix, expectedMemoryMiB: gpu.memoryMiB, intervalMs: timings.monitorMs, sleep });
+        const gate = createGpuGate({
+            query: () => smiQuery(), uuid: gpu.uuid, host, boxPrefix: prefix, expectedMemoryMiB: gpu.memoryMiB, intervalMs: timings.monitorMs, sleep,
+            // Every registration is written into the run manifest, with its full tuple.
+            onRegister: record => {
+                const entry = { kind: 'gpu-process', ...record };
+                if (run.ownedProcesses.some(value => value.hostPid === entry.hostPid && value.startIdentity === entry.startIdentity && value.bootId === entry.bootId)) return;
+                if (run.ownedProcesses.length >= 256) throw new Error('Too many registered GPU processes for the manifest');
+                run.ownedProcesses.push(entry); persist();
+            },
+        });
         await gate.initial();
         const mount = destination => box.mounts?.find(entry => entry.Destination === destination);
         const wired = [['nvidia-cuda-mps-control', gpu.mpsControl.path], ['nvidia-cuda-mps-server', gpu.mpsServer.path], ['nvidia-smi', gpu.smi.path]];
@@ -443,12 +452,14 @@ export function createGpuCases(ctx) {
                 smCount: value.report.smCount, allocatedMiB: value.report.allocatedMiB, boundMiB: value.report.boundMiB, termination: value.report.termination,
                 memGetInfo: value.report.memGetInfo, mpsEnv: value.report.mpsEnv, driverApiVersion: value.report.driverApiVersion,
             }]));
-            const fullSm = summary.bypass.smCount;
+            // The full-device SM count is the independently pinned one; the bypass under
+            // test is never what defines it. The mismatch, if any, stays in the evidence.
+            const fullSm = gpu.expectedSmCount;
             evidence.put('measurements', summary);
             evidence.put('rounding', {
                 capMiB, shareAllocatedMiB: summary.share.allocatedMiB, overheadMiB: capMiB - summary.share.allocatedMiB, stepMiB: 128,
-                shareSmCount: summary.share.smCount, fullSmCount: fullSm, requestedSmPercent: GPU_SHARES.first.smPercent, expectedSmShare: Math.ceil(fullSm * GPU_SHARES.first.smPercent / 100),
-                planEvidence: { smCount: gpu.expectedSmCount, matchesFull: fullSm === gpu.expectedSmCount },
+                shareSmCount: summary.share.smCount, pinnedFullSmCount: fullSm, bypassSmCount: summary.bypass.smCount, bypassMatchesPinned: summary.bypass.smCount === fullSm,
+                requestedSmPercent: GPU_SHARES.first.smPercent, expectedSmShare: Math.ceil(fullSm * GPU_SHARES.first.smPercent / 100),
             });
             // Assertions, after the evidence.
             expects(same(summary.share.mpsEnv, sharedEnv), `The share probe saw another MPS environment than the saved share: ${JSON.stringify(summary.share.mpsEnv)}`);
@@ -463,9 +474,12 @@ export function createGpuCases(ctx) {
             expects(summary.tighterSm.smCount > 0 && summary.tighterSm.smCount <= summary.share.smCount, `A tighter SM value gave ${summary.tighterSm.smCount} SMs, more than the share's ${summary.share.smCount}`);
             expects(summary.tighterMemory.termination === 'allocation_oom' && summary.tighterMemory.allocatedMiB <= TIGHTER_CLIENT.memoryMiB && summary.tighterMemory.allocatedMiB <= summary.share.allocatedMiB,
                 `A tighter memory value allocated ${summary.tighterMemory.allocatedMiB} MiB, more than allowed`);
-            // The bypass must allocate above the cap (at or below it proves nothing) and see every SM.
+            // The bypass must allocate above the cap (at or below it proves nothing) and see
+            // EVERY SM of the device, as pinned: a bypass that is itself restricted proves
+            // nothing about the unrestricted device.
             expects(summary.bypass.termination === 'bound' && summary.bypass.allocatedMiB > capMiB && summary.bypass.allocatedMiB === summary.bypass.boundMiB,
                 `The bypass did not allocate above the ${capMiB}-MiB cap (${summary.bypass.termination}, ${summary.bypass.allocatedMiB} of ${summary.bypass.boundMiB} MiB)`);
+            expects(summary.bypass.smCount === fullSm, `The bypass SM count ${summary.bypass.smCount} differs from the pinned full-device count ${fullSm}, so the bypass is not proven unrestricted`);
             expects(fullSm > summary.share.smCount, `The bypass did not get more SMs than the share (${fullSm} vs ${summary.share.smCount})`);
             await assertCpuUntouched(evidence, 'P2');
         });
@@ -660,7 +674,9 @@ export function createGpuCases(ctx) {
             let rw = null; let ro = null;
             let holder = null;
             const holderAbort = new AbortController();
+            let failure = null;
             try {
+              try {
                 // A holder keeps one client connected so the daemon has a server to name.
                 await gate.check('P4-holder');
                 holder = gate.monitor(abort => command('gpu-holder', profile.engine.path, [...nested, 'container', 'exec', probe.id, 'python3', '-c', HOLDER_PROGRAM],
@@ -683,28 +699,56 @@ export function createGpuCases(ctx) {
                 const servers = list.stdout.split('\n').map(value => value.trim()).filter(Boolean);
                 needs(list.status === 0 && servers.length > 0 && servers.every(value => /^[1-9][0-9]*$/.test(value)) && servers.includes(String(server.boxPid)), 'The writable-pipe helper cannot read the owned daemon\'s server list');
                 const reads = [await ask(rw, 'get_default_active_thread_percentage', 'rw-sm'), await ask(rw, 'get_default_device_pinned_mem_limit 0', 'rw-memory')];
-                const widen = await ask(rw, `set_active_thread_percentage ${server.boxPid} 100`, 'rw-widen-sm');
-                const limit = await ask(rw, `set_device_pinned_mem_limit ${server.boxPid} 0 64M`, 'rw-set-memory');
+                // The plan's order (§18.10): the SM setter, then a new client with percentage 100
+                // and its SM probe, and only then the independent memory setter. A memory
+                // setter that is accepted may affect later contexts, so it never precedes the
+                // SM observation.
                 const failureWords = /error|invalid|fail|denied|not permitted|unknown/i;
                 const accepted = outcome => outcome.status === 0 && !outcome.timedOut && !failureWords.test(`${outcome.stdout}\n${outcome.stderr}`);
+                const widen = await ask(rw, `set_active_thread_percentage ${server.boxPid} 100`, 'rw-widen-sm');
+                // A new client sets 100 itself (leaving 25 would mask a widened server).
+                const widened = await runProbe(evidence, 'after-sm-mutation', { maxMiB: probeBoundMiB(capMiB), set: { CUDA_MPS_ACTIVE_THREAD_PERCENTAGE: '100' } });
+                evidence.put('afterMutation', { smCount: widened.report.smCount, allocatedMiB: widened.report.allocatedMiB, termination: widened.report.termination });
+                const limit = await ask(rw, `set_device_pinned_mem_limit ${server.boxPid} 0 64M`, 'rw-set-memory');
+                // The memory setter's effect is observational only: one more context is tried
+                // and what happens is recorded, never asserted. A denied setter is not reported as
+                // isolation, and a failed context after an accepted one is its recorded effect.
+                let memoryEffect = { observed: false, reason: accepted(limit) ? null : 'the setter was denied or did not answer, so there is no effect to observe' };
+                if (accepted(limit)) {
+                    try {
+                        const probed = await runProbe(evidence, 'after-memory-mutation', { maxMiB: 384 });
+                        memoryEffect = { observed: true, contextCreated: true, allocatedMiB: probed.report.allocatedMiB, termination: probed.report.termination };
+                    } catch (error) {
+                        // A gate trip or a missing prerequisite is never an observation.
+                        if (error.gate || error.code === 'LIVE_PREREQUISITE_MISSING') throw error;
+                        memoryEffect = { observed: true, contextCreated: false, error: String(error.message).slice(0, 300) };
+                    }
+                }
                 // The read-only pipe: the connection result is recorded, not presumed.
                 const roList = await ask(ro, 'get_server_list', 'ro-list');
                 const roServers = roList.stdout.split('\n').map(value => value.trim()).filter(Boolean);
                 const roConnected = roList.status === 0 && roServers.includes(String(server.boxPid));
-                evidence.put('controlMutation', { widenSm: { accepted: accepted(widen), reply: widen }, setMemory: { accepted: accepted(limit), reply: limit }, readsAccepted: reads.map(accepted),
+                evidence.put('controlMutation', { widenSm: { accepted: accepted(widen), reply: widen }, setMemory: { accepted: accepted(limit), reply: limit, effect: memoryEffect }, readsAccepted: reads.map(accepted),
                     limitation: 'Share clients use the same Box user as the MPS daemon and can widen settings; MPS shares are best-effort, not a security boundary.' });
                 evidence.put('pipeComparison', { writable: { mount: rw.mount, connected: true }, readOnly: { mount: ro.mount, connected: roConnected, reply: roList } });
-                // A new client after the SM mutation sets 100 itself (leaving 25 would mask a widened server).
-                const widened = await runProbe(evidence, 'after-sm-mutation', { maxMiB: probeBoundMiB(capMiB), set: { CUDA_MPS_ACTIVE_THREAD_PERCENTAGE: '100' } });
-                evidence.put('afterMutation', { smCount: widened.report.smCount, allocatedMiB: widened.report.allocatedMiB, termination: widened.report.termination });
                 expects(widened.report.smCount > 0, 'The new client reported no SMs after the mutation');
-            } finally {
-                // Stop the owned holder and helpers by exact identity, then reconcile.
+              } finally {
+                // Stop the owned holder and helpers by exact identity first.
                 await removeHelpers(evidence);
                 holderAbort.abort();
                 if (holder) { try { await holder; } catch (error) { evidence.step('holder-ended', String(error?.message || error).slice(0, 200)); } }
+              }
+            } catch (error) { failure = error; throw error; } finally {
+                // The owned test daemon is ALWAYS reconciled, whatever the case concluded: its
+                // defaults are restored through the product's drain-quit-start path before any
+                // other measurement. After a tripped gate no new work starts; cleanup stops the
+                // owned clients. A reconcile failure never hides the case's own failure.
+                if (gate.tripped) evidence.step('reconcile-skipped', 'the gate tripped; cleanup stops the owned clients');
+                else {
+                    try { await reconcileDefaults(evidence, share, identity.daemon); }
+                    catch (error) { if (!failure) throw error; evidence.step('reconcile-failed', String(error?.message || error).slice(0, 300)); }
+                }
             }
-            await reconcileDefaults(evidence, share, identity.daemon);
             await assertCpuUntouched(evidence, 'P4');
         });
     }
@@ -786,27 +830,12 @@ export function createGpuCases(ctx) {
         }
         return notes;
     }
+    // After the product cleanup the GPU is observed again. The proof must SUCCEED: a
+    // failed, malformed or timed-out query, a changed device or mode, or an owned
+    // process that survived the Box's destruction fails the cleanup (nothing is
+    // signalled). Standalone and resumed cleanup runs the very same proof.
     async function afterCleanup() {
-        const observation = { at: Date.now(), processes: null, computeMode: null, owned: [] };
-        try {
-            const result = await smiQuery(new AbortController().signal);
-            requireTransport(result);
-            const inventory = parseGpuInventory(result, gpu.uuid);
-            observation.processes = inventory.processes.map(value => value.pid);
-            observation.computeMode = 'Default';
-            if (prepared) {
-                // Still listed, still alive and still the very process registered (its start
-                // identity unchanged): a reused PID of someone else's process is not ours.
-                observation.owned = prepared.gate.summary().registered.filter(record => {
-                    if (!inventory.processes.some(value => value.pid === record.hostPid)) return false;
-                    const seen = host.observe(record.hostPid);
-                    return Boolean(seen && seen.startIdentity === record.startIdentity && seen.bootId === record.bootId);
-                }).map(record => ({ role: record.role, hostPid: record.hostPid }));
-            }
-        } catch (error) { observation.error = String(error?.message || error).slice(0, 300); }
-        safeArtifact('gpu-final-observation', observation);
-        if (observation.owned.length) throw new Error(`An owned GPU process survived cleanup: ${observation.owned.map(value => value.hostPid).join(',')}`);
-        return observation;
+        return finalGpuObservation({ gpu, run, host, query: () => smiQuery(new AbortController().signal), artifacts: safeArtifact });
     }
 
     // `internals` is for the offline tests: the building blocks the cases

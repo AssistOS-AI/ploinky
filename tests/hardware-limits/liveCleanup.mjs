@@ -105,7 +105,9 @@ export async function runOwnedCleanup({ run, profile, persist = () => {}, proces
     const instance = profile.box?.instance || run.workspace?.instance || (workspacePath ? buildWorkspaceIdentity(workspacePath).instance : null);
 
     // 1. Only bounded, awaited commands exist; no extra owned processes.
-    if (run.ownedProcesses.length) throw new Error('Cleanup cannot prove extra recorded processes');
+    // Only registered GPU processes may be recorded (they are never signalled by
+    // cleanup; the final GPU observation proves them gone). Anything else cannot be proved.
+    if (run.ownedProcesses.some(entry => entry?.kind !== 'gpu-process')) throw new Error('Cleanup cannot prove extra recorded processes');
 
     // 2. Revalidate the exact engine and the workspace identity.
     if (await observeEngineIdentity((kind, argv) => engine(kind, argv)) !== profile.engine.identityDigest) throw new Error('Engine service identity changed');
