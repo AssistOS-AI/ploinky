@@ -1405,3 +1405,15 @@ test('R2D.a-proof-another-action-or-run-left-or-one-that-lists-remaining-data-do
     assert.match(problem({ schema: 2 }), /unknown shape/);
     assert.match(llmCleanupProofProblem(Buffer.from('not json'), { runId: 'r' }), /is not JSON/);
 });
+
+// --- R2E(a): the GPU gate is watched across the whole vLLM install wait, the pause between polls included ------------
+test('R2E.a-foreign-gpu-process-during-the-install-pause-aborts-the-install-wait-and-blocks', async t => {
+    const w = await provisioned(t, { block: 'apparatus-vllm', faults: { foreignDuringInstall: true } });
+    const report = await liveCases(w, ['LIVE-L3'], { timings: { installPollMs: 200, monitorMs: 4 } });
+    const l3 = caseOf(report, 'LIVE-L3');
+    assert.equal(l3.result, 'blocked', JSON.stringify(l3).slice(0, 500)); assert.match(l3.reason, /GPU idle gate blocked: (?:gpu_busy|foreign_process_appeared)/);
+    // The install never completed: the wait ended in the pause, before the poll that would have seen it installed.
+    const artifact = w.artifacts.get('gpu-live-l3');
+    assert.equal(artifact.install, undefined, 'the case stopped during the install wait');
+    assert.equal(w.fake.model.signals.length, 0); nothingOwned(w);
+});

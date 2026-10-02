@@ -176,6 +176,7 @@ export function createLlmWorld({ statePath, node, engine, host, gpu, faults = {}
         case 'local_llm_overview': {
             if (L.install.phase === 'downloading' || L.install.phase === 'installing') {
                 L.install.polls += 1;
+                if (faults.foreignDuringInstall && L.install.polls === 2) world.addForeign(555);
                 const total = llm.vllm?.pins?.downloadBytes ?? 1;
                 if (faults.installError && L.install.polls >= 2) { L.install.phase = 'error'; L.install.error = 'Installing vllm failed: no matching distribution found for torch (cp313)'; }
                 else if (faults.installPaused && L.install.polls >= 2) { L.install.phase = 'paused'; L.install.pausedReason = 'Not enough free disk to continue the download.'; }

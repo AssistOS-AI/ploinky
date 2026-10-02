@@ -465,8 +465,17 @@ export function createLlmCases(ctx) {
         if (!reply.ok) throw blocked(`The product's runner install refused vLLM (${reply.error.code}): ${String(reply.error.message).slice(0, 300)}`);
         const started = Date.now(); let samples = 0; let last = null;
         const sampleInstall = overview => overview.runners.find(entry => entry.id === 'vllm')?.install ?? null;
+        // The gate is watched across the whole wait, the pause between two polls included: a foreign process that appears
+        // while the install runs aborts the wait at once (a 15 s sleep outside the monitor left it unwatched).
+        const pause = (ms, abort) => Promise.race([sleep(ms), new Promise(resolve => { if (abort.aborted) resolve(); else abort.addEventListener('abort', resolve, { once: true }); })]);
         for (;;) {
-            const overview = await gate.monitor(abort => toolOk('install-poll', 'local_llm_overview', {}, { view: {}, abort }));
+            let overview;
+            let finished = false;
+            await gate.monitor(async abort => {
+                overview = await toolOk('install-poll', 'local_llm_overview', {}, { view: {}, abort });
+                finished = ['installed', 'error', 'paused'].includes(sampleInstall(overview)?.phase) || Date.now() - started > installMs;
+                if (!finished) await pause(timings.installPollMs, abort);
+            });
             last = sampleInstall(overview);
             if (samples % 8 === 0 && samples < 400) evidence.step('install', { phase: last?.phase, download: last?.download, installing: last?.installing, version: last?.version });
             samples += 1;
@@ -474,7 +483,6 @@ export function createLlmCases(ctx) {
             if (last?.phase === 'error') throw blocked(`The product's vLLM install failed on this host: ${String(last.error).slice(0, 400)}`);
             if (last?.phase === 'paused') throw blocked(`The vLLM install paused: ${String(last.pausedReason || last.error).slice(0, 300)}`);
             if (Date.now() - started > installMs) throw blocked(`The vLLM install did not finish within ${installMs} ms (phase ${last?.phase}, ${JSON.stringify(last?.download)})`);
-            await sleep(timings.installPollMs);
         }
     }
 
