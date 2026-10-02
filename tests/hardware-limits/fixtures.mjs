@@ -277,7 +277,7 @@ export function buildRequiredCaseManifest() {
             'HD.parity-unprepared-and-controller-missing', 'HD.parity-metadata-strict-and-launch', 'HD.parity-interactive',
             'HD.parity-graph-outcomes-and-blocked-dependants', 'HD.route-deprecated-declaration-note',
             'HD.interactive-caller-resolves-the-profile', 'HD.long-requested-value-is-a-bounded-refusal',
-            'HD.conflict-normalized-values-and-named-raw-layer',
+            'HD.conflict-normalized-values-and-named-raw-layer', 'HD.deprecation-warning-sanitizes-the-agent-ref',
         ]),
         ...leaves(P, 'p0', unit('hardwareLimitsOutcomes.test.mjs'), [
             'O.prelock-preflight-refusal', 'O.locked-preflight-refusal', 'O.defensive-preflight-refusal',

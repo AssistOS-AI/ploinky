@@ -234,7 +234,8 @@ export function setHardwareDeclarationWarningSink(sink) {
 export function warnDeprecatedHardwareDeclarations(manifest, agentRef) {
     const note = deprecatedDeclarationNote(manifest);
     if (!note) return false;
-    const ref = String(agentRef || 'agent').slice(0, 257);
+    // Sanitized like profile names: the warning is one log line.
+    const ref = String(agentRef || 'agent').replace(/[^A-Za-z0-9._/-]/g, '_').slice(0, 257);
     const key = `${ref}\0${note.paths.join('\0')}\0${note.omitted}`;
     if (warned.has(key)) return false;
     warned.add(key);

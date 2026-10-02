@@ -766,3 +766,17 @@ test('HD.conflict-normalized-values-and-named-raw-layer', () => {
     assert.match(inherited.reason, /the profile dev declares memory as 1g in hardwareLimits and as 512m in the deprecated/);
     assert.doesNotMatch(inherited.reason, /2g/);
 });
+
+// The deprecation warning is one log line: the agent ref is sanitized like
+// profile names, so a newline or other control character cannot forge lines.
+test('HD.deprecation-warning-sanitizes-the-agent-ref', () => {
+    const messages = captureWarnings();
+    const manifest = OLD({ memory: '512m' });
+    declared.warnDeprecatedHardwareDeclarations(manifest, 'demo/worker\n[hardware-limits] forged\u001b[31m\u0000');
+    assert.equal(messages.length, 1);
+    assert.doesNotMatch(messages[0], /[\u0000-\u001f\u007f]/);
+    assert.match(messages[0], /^\[hardware-limits\] demo\/worker__hardware-limits__forged__31m_: llmRuntime\.runtimePolicy\.resources\.memory is deprecated/);
+    // An ordinary ref is unchanged.
+    declared.warnDeprecatedHardwareDeclarations(manifest, 'demo/other-agent.v2');
+    assert.match(messages[1], /^\[hardware-limits\] demo\/other-agent\.v2: /);
+});
