@@ -18,12 +18,28 @@
 //   inode is a real guarded binary found at start-up (the original PATH plus
 //   /usr/bin, /bin, /usr/local/bin, /opt/homebrew/bin, /opt/podman/bin), is
 //   refused wherever it appears (`eval /abs/podman`, `"$@"`, renamed symlinks,
-//   `/.../PODMAN` on a case-insensitive file system).
+//   `/.../PODMAN` on a case-insensitive file system). Inodes are compared as
+//   BigInt keys: macOS inodes exceed 2^53 and a Number key makes unrelated
+//   system binaries collide with the real ones.
+// - Programs that are not in WRAPPERS are still scanned: every absolute or
+//   path-shaped guarded word in their argv is refused, and a shell word in
+//   their argv is analysed as a new invocation with its script, so
+//   `sandbox-exec -p '...' sh -c 'cd /x && podman ps'` is caught. Launchers
+//   (LAUNCHERS: caffeinate, arch, sandbox-exec, bwrap, unshare, su, ...) run a
+//   command named in their argv, so a bare guarded word anywhere in their
+//   argv is refused too.
 // - Login shells (-l, --login, a cluster containing l, argv0 starting with
-//   "-") rebuild PATH from their profile after any injection, so they are
-//   refused when the script contains a guarded word anywhere (command
-//   position or not); otherwise they run, with a PATH the guard cannot
-//   shadow.
+//   "-", `-o login`, `exec -l` and `exec -a -NAME`) are refused outright: their
+//   profile rebuilds PATH after any injection and can run anything, so neither
+//   a script nor a PATH can be judged.
+// - A bare name is judged against the PATH it would really resolve through. A
+//   test-owned fake first on the caller's PATH is allowed only when nothing
+//   in the invocation replaces that PATH: a PATH assignment in a shell line
+//   (a leading `PATH=...`, a standalone assignment or `export PATH=...`, in
+//   this or an earlier segment) and `env PATH=...` are judged against the
+//   assigned PATH when it is a literal (or `$PATH` expanded), and the name is
+//   judged by name alone (the fake grants nothing) when it is not; `env -i`
+//   and `env -u PATH` do the same.
 // - `options.shell` given as a string, and `fork` with `execPath`, are checked.
 // - Descendants are guarded: Node children (and worker threads) load this
 //   guard, an explicit environment gets a PATH that starts with failing stubs
@@ -43,12 +59,24 @@
 // is a real guarded binary.
 //
 // Not covered: interpreters running engines (perl, awk, python, `find -exec`);
-// scripts read from files or standard input; `process.binding`, internal
-// spawn APIs and `ChildProcess.prototype.spawn`; native addons; hard links in
-// the test temporary directory; glob or quote obfuscation (`p""odman`,
-// `podma?`); environment resets inside a shell line given as one string
-// (their words are still analysed, but they cannot be rewritten); sudo and
-// doas environment resets.
+// scripts read from files or standard input (a shell given a script FILE is
+// not read, only refused when it is a login shell); `process.binding`,
+// internal spawn APIs and `ChildProcess.prototype.spawn`; native addons; hard
+// links in the test temporary directory; glob or quote obfuscation
+// (`p""odman`, `podma?`); environment resets inside a shell line given as one
+// string (their words are still analysed, but they cannot be rewritten); sudo
+// and doas environment resets and their login forms (`sudo -i`, `su -`);
+// programs outside WRAPPERS and LAUNCHERS that run a command given as a bare
+// guarded name in their argv (`my-launcher podman ps`; an absolute path or an
+// embedded shell is caught); PATH changes other than the assignment forms
+// above (`unset PATH`, functions, aliases, `cd` into a directory of fakes).
+//
+// Known limits that cannot be closed from inside the process (nothing real
+// runs in any of them): the native PATH stub refuses and exits 97 but cannot
+// reach the ledger when a test unsets the ledger variable
+// (PLOINKY_ENGINE_GUARD_TOP_LOG) or when a child's argv names engineSpawnGuard
+// (an independent nested runner owns its own ledger); the test then sees the
+// status 97 itself.
 //
 // Test-only: PLOINKY_ENGINE_GUARD_EXTRA_PROGRAMS (comma-separated names) adds
 // guarded names, so tests can use a canary that exists nowhere on any PATH.
@@ -57,6 +85,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import util from 'node:util';
+import vm from 'node:vm';
 import workerThreads from 'node:worker_threads';
 import { syncBuiltinESMExports } from 'node:module';
 import { fileURLToPath } from 'node:url';
@@ -78,6 +107,10 @@ const guardedNames = new Set(allGuarded.map(lower));
 
 const WRAPPERS = new Set(['env', 'sh', 'bash', 'zsh', 'dash', 'ksh', 'xargs', 'nohup', 'timeout', 'nice', 'ionice', 'stdbuf', 'sudo', 'doas', 'exec', 'time', 'setsid', 'script', 'unbuffer', 'flock', 'chroot', 'taskset', 'busybox', 'command', 'builtin']);
 const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh']);
+// Programs that run the command named in their argv without being parsed as
+// wrappers: a guarded word anywhere in their argv is a guarded command.
+const LAUNCHERS = new Set(['caffeinate', 'arch', 'sandbox-exec', 'bwrap', 'unshare', 'nsenter', 'su', 'runuser', 'setpriv', 'chrt', 'firejail', 'systemd-run',
+    'proot', 'fakeroot', 'strace', 'ltrace', 'gdb', 'lldb', 'valgrind', 'launchctl', 'osascript']);
 // Options that take an argument, per wrapper, and the positionals the wrapper
 // itself consumes before its command.
 const WRAPPER_OPTIONS = {
@@ -148,14 +181,16 @@ const underTemporaryRoot = (target) => {
 const originalPath = String(process.env.PATH || '');
 const realPaths = new Set();
 const realInodes = new Set();
+// dev:ino as exact integers: macOS inodes are larger than 2^53.
+const inodeKey = (stat) => `${stat.dev}:${stat.ino}`;
 for (const directory of [...originalPath.split(path.delimiter), ...FIXED_BINARY_DIRECTORIES].filter(Boolean)) {
     for (const program of allGuarded) {
         const candidate = path.join(directory, program);
         try {
-            const stat = fs.statSync(candidate);
+            const stat = fs.statSync(candidate, { bigint: true });
             if (!stat.isFile() || underTemporaryRoot(candidate)) continue;
             realPaths.add(fs.realpathSync(candidate));
-            realInodes.add(`${stat.dev}:${stat.ino}`);
+            realInodes.add(inodeKey(stat));
         } catch (_) {}
     }
 }
@@ -211,19 +246,46 @@ const unquote = (word) => String(word).replace(/^['"]+|['"]+$/g, '');
 
 function matchesRealBinary(target) {
     try {
-        const stat = fs.statSync(target);
-        return realInodes.has(`${stat.dev}:${stat.ino}`) || realPaths.has(fs.realpathSync(target));
+        const stat = fs.statSync(target, { bigint: true });
+        return realInodes.has(inodeKey(stat)) || realPaths.has(fs.realpathSync(target));
     } catch (_) { return false; }
 }
 
 // A bare name resolves through PATH (the explicit environment of the call
-// being analysed, else this process's): when the first executable of that name
-// is a test-owned fake under the test temporary directory (a fake runtime a
-// test puts first on PATH), the name is not a real program. The guard's own
-// stub directories are skipped, and a real binary first on PATH still decides.
+// being analysed, else this process's, else the PATH a shell line or `env`
+// assigns for the command): when the first executable of that name is a
+// test-owned fake under the test temporary directory (a fake runtime a test
+// puts first on PATH), the name is not a real program. The guard's own stub
+// directories are skipped, and a real binary first on PATH still decides.
+// NAME_ONLY marks a PATH the guard cannot know (a login shell, a PATH built
+// from other variables, an environment reset): no fake is granted anything.
+const NAME_ONLY = Symbol('name-only');
 let analysedPath = null;
+const currentSearchPath = () => (analysedPath === NAME_ONLY ? NAME_ONLY : String(analysedPath ?? process.env.PATH ?? ''));
+function withSearchPath(value, run) {
+    const saved = analysedPath;
+    analysedPath = value;
+    try { return run(); } finally { analysedPath = saved; }
+}
+// The PATH a shell assignment or `env` argument gives: a literal, `$PATH`
+// expanded against the PATH in force, or NAME_ONLY for anything else.
+function assignedSearchPath(text, { shell = true } = {}) {
+    const literal = unquote(text);
+    // `env` assigns its argument as written; only a shell expands it.
+    if (!shell) return literal;
+    if (/[`]|\$\(/.test(literal)) return NAME_ONLY;
+    const current = currentSearchPath();
+    let unresolved = false;
+    const expanded = literal.replace(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g, (_, name) => {
+        if (name === 'PATH' && current !== NAME_ONLY) return current;
+        unresolved = true;
+        return '';
+    });
+    return unresolved ? NAME_ONLY : expanded;
+}
 function bareNameIsTestFake(name) {
-    for (const directory of String(analysedPath ?? process.env.PATH ?? '').split(path.delimiter).filter((entry) => entry && !isStubDirectory(entry))) {
+    if (analysedPath === NAME_ONLY) return false;
+    for (const directory of currentSearchPath().split(path.delimiter).filter((entry) => entry && !isStubDirectory(entry))) {
         const candidate = path.join(directory, name);
         try { fs.accessSync(candidate, fs.constants.X_OK); } catch (_) { continue; }
         return underTemporaryRoot(candidate) && !matchesRealBinary(candidate);
@@ -261,10 +323,16 @@ const withoutRedirectionAmpersands = (line) => String(line ?? '').replace(/(\d*[
 const REDIRECTION = /^\d*(?:[<>]{1,2}|&>|>&|<&)/;
 const BARE_REDIRECTION = /^\d*(?:[<>]{1,2}|&>|>&|<&)$/;
 function skipLeading(words) {
+    return splitLeading(words).command;
+}
+// The assignments in front of a command, and the command words themselves.
+function splitLeading(words) {
+    const assignments = [];
     let index = 0;
     while (index < words.length) {
         const word = words[index];
-        if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word) || SHELL_KEYWORDS.has(word)) { index += 1; continue; }
+        if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) { assignments.push(word); index += 1; continue; }
+        if (SHELL_KEYWORDS.has(word)) { index += 1; continue; }
         if (REDIRECTION.test(word)) {
             // A bare operator takes the next word as its target.
             index += BARE_REDIRECTION.test(word) ? 2 : 1;
@@ -272,22 +340,40 @@ function skipLeading(words) {
         }
         break;
     }
-    return words.slice(index);
+    return { assignments, command: words.slice(index) };
 }
-// The guarded program a shell line runs, or null.
+const lastPathAssignment = (assignments) => [...assignments].reverse().find((assignment) => /^PATH=/.test(assignment));
+// The guarded program a shell line runs, or null. A PATH assignment changes
+// how every later bare name resolves: a leading `PATH=x` applies to its own
+// command, a standalone `PATH=x` or `export PATH=x` to the rest of the line.
 function lineHit(line, depth) {
-    for (const segment of withoutRedirectionAmpersands(line).split(SEGMENT)) {
-        const words = segment.trim().split(/\s+/).filter(Boolean).map(unquote);
-        const command = skipLeading(words);
-        if (!command.length) continue;
-        const [first, ...rest] = command;
-        if (['which', 'type', 'hash'].includes(first)) continue;
-        if (first === 'command' && /^-[vV]$/.test(rest[0] || '')) continue;
-        if (first === 'eval') { const hit = lineHit(rest.join(' '), depth + 1); if (hit) return hit; continue; }
-        const result = inspect(first, rest, depth + 1);
-        if (result.hit) return result.hit;
-    }
-    return null;
+    let linePath = analysedPath;
+    return withSearchPath(linePath, () => {
+        for (const segment of withoutRedirectionAmpersands(line).split(SEGMENT)) {
+            const words = segment.trim().split(/\s+/).filter(Boolean).map(unquote);
+            const { assignments, command } = splitLeading(words);
+            const own = lastPathAssignment(assignments);
+            if (!command.length) {
+                if (own) { linePath = assignedSearchPath(own.slice(5)); analysedPath = linePath; }
+                continue;
+            }
+            const [first, ...rest] = command;
+            if (['export', 'declare', 'typeset', 'readonly', 'local'].includes(first)) {
+                const exported = lastPathAssignment(rest);
+                if (exported) { linePath = assignedSearchPath(exported.slice(5)); analysedPath = linePath; }
+                continue;
+            }
+            if (['which', 'type', 'hash'].includes(first)) continue;
+            if (first === 'command' && /^-[vV]$/.test(rest[0] || '')) continue;
+            const commandPath = own ? assignedSearchPath(own.slice(5)) : linePath;
+            const hit = withSearchPath(commandPath, () => {
+                if (first === 'eval') return lineHit(rest.join(' '), depth + 1);
+                return inspect(first, rest, depth + 1).hit;
+            });
+            if (hit) return hit;
+        }
+        return null;
+    });
 }
 
 // --- invocation analysis -----------------------------------------------------
@@ -298,14 +384,36 @@ function inspect(program, argv, depth = 0, context = {}) {
     const text = unquote(program);
     if (guardedWord(text)) return { hit: text, argv };
     const base = lower(path.basename(text));
-    if (!WRAPPERS.has(base)) return { hit: null, argv };
+    if (!WRAPPERS.has(base)) return inspectUnlisted(base, argv, depth);
     for (const word of argv) {
         const found = scanPaths(word);
         if (found) return { hit: found, argv };
     }
-    if (SHELLS.has(base)) return inspectShell(argv, depth, context);
+    if (SHELLS.has(base)) return inspectShell(argv, depth, { ...context, shellName: base });
     if (base === 'env') return inspectEnv(argv, depth);
     return inspectWrapper(base, argv, depth);
+}
+
+// A program that is not parsed as a wrapper may still run a command given in
+// its argv. Every path-shaped guarded word is refused; a shell word is analysed
+// as a new invocation with the words after it (so its script is read and a
+// login shell is refused); a launcher also refuses a bare guarded word.
+function inspectUnlisted(base, argv, depth) {
+    for (const word of argv) {
+        const found = scanPaths(word);
+        if (found) return { hit: found, argv };
+    }
+    for (let index = 0; index < argv.length; index += 1) {
+        const word = unquote(argv[index]);
+        if (!SHELLS.has(lower(path.basename(word)))) continue;
+        const nested = inspect(word, argv.slice(index + 1), depth + 1);
+        if (nested.hit) return { hit: nested.hit, argv };
+    }
+    if (LAUNCHERS.has(base)) {
+        const found = scanAnyGuarded(argv.join(' '));
+        if (found) return { hit: found, argv };
+    }
+    return { hit: null, argv };
 }
 
 function inspectShell(argv, depth, context) {
@@ -317,6 +425,7 @@ function inspectShell(argv, depth, context) {
         if (word === '--') { index += 1; break; }
         if (word === '--login') { login = true; continue; }
         if (['--rcfile', '--init-file'].includes(word)) { index += 1; continue; }
+        if (/^--option(=|$)/.test(word) && /login/i.test(word.includes('=') ? word : String(argv[index + 1] ?? ''))) login = true;
         if (/^--/.test(word)) continue;
         if (/^[-+][A-Za-z]+$/.test(word)) {
             const letters = word.slice(1);
@@ -324,8 +433,12 @@ function inspectShell(argv, depth, context) {
                 if (letters.includes('c')) command = true;
                 if (letters.includes('l')) login = true;
             }
-            // -o/-O (and +o/+O) take the next word as their argument.
-            if (/[oO]$/.test(letters)) index += 1;
+            // -o/-O (and +o/+O) take the next word as their argument; `-o login`
+            // makes a login shell (zsh), whatever else the cluster holds.
+            if (/[oO]$/.test(letters)) {
+                if (word[0] === '-' && lower(argv[index + 1] ?? '') === 'login') login = true;
+                index += 1;
+            }
             continue;
         }
         break;
@@ -333,12 +446,10 @@ function inspectShell(argv, depth, context) {
     const operands = argv.slice(index);
     const script = command ? String(operands[0] ?? '') : '';
     const positional = command ? operands.slice(1) : operands;
-    // A login shell's profile rebuilds PATH after any injection: refuse it
-    // when anything guarded is in its script or arguments; otherwise it runs.
-    if (login) {
-        const found = scanAnyGuarded([script, ...positional].join(' '));
-        if (found) return { hit: found, argv };
-    }
+    // A login shell's profile rebuilds PATH after any injection and can run
+    // anything (a directory prepended to PATH, a script file): it cannot be
+    // judged, so it is refused outright.
+    if (login) return { hit: `${lower(context.shellName || 'sh')} (login shell)`, argv };
     if (!command) return { hit: null, argv };
     const found = lineHit(script, depth + 1) || scanPaths(script);
     if (found) return { hit: found, argv };
@@ -381,6 +492,19 @@ function splitWrapperArguments(base, argv) {
     return { commandString, rest: argv.slice(index) };
 }
 
+// `exec -l CMD` and `exec -a -NAME CMD` start CMD with a dash-prefixed argv[0]:
+// a shell started that way is a login shell.
+function execArgv0(argv) {
+    let argv0 = null;
+    for (let index = 0; index < argv.length; index += 1) {
+        const word = argv[index];
+        if (word === '--' || !/^-./.test(word)) break;
+        if (word === '-a') { argv0 = String(argv[index + 1] ?? ''); index += 1; continue; }
+        if (/^-[A-Za-z]*l[A-Za-z]*$/.test(word)) argv0 = argv0 ?? '-login';
+    }
+    return argv0;
+}
+
 function inspectWrapper(base, argv, depth) {
     const { commandString, rest } = splitWrapperArguments(base, argv);
     if (commandString !== null) {
@@ -388,7 +512,7 @@ function inspectWrapper(base, argv, depth) {
         if (hit) return { hit, argv };
     }
     if (!rest.length) return { hit: null, argv };
-    const nested = inspect(rest[0], rest.slice(1), depth + 1);
+    const nested = inspect(rest[0], rest.slice(1), depth + 1, base === 'exec' ? { argv0: execArgv0(argv) } : {});
     if (nested.hit) return { hit: nested.hit, argv };
     return { hit: null, argv: [...argv.slice(0, argv.length - rest.length), rest[0], ...nested.argv] };
 }
@@ -441,7 +565,11 @@ function inspectEnv(argv, depth) {
     if (split !== null) operandArgv = [...String(split).trim().split(/\s+/).filter(Boolean), ...operandArgv];
     // Words after `--` or from an `-S` string may themselves be assignments.
     while (operandArgv.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(operandArgv[0])) assignments.push(operandArgv.shift());
-    const nested = operandArgv.length ? inspect(operandArgv[0], operandArgv.slice(1), depth + 1) : { hit: null, argv: [] };
+    // The operand resolves through the PATH `env` leaves it: an assigned one, or
+    // a default search nothing here knows after a reset.
+    const assigned = lastPathAssignment(assignments);
+    const operandPath = assigned ? assignedSearchPath(assigned.slice(5), { shell: false }) : (clears || unsetsPath ? NAME_ONLY : analysedPath);
+    const nested = operandArgv.length ? withSearchPath(operandPath, () => inspect(operandArgv[0], operandArgv.slice(1), depth + 1)) : { hit: null, argv: [] };
     if (nested.hit) return { hit: nested.hit, argv };
     let hasPath = false;
     const rewritten = assignments.map((assignment) => {
@@ -463,8 +591,7 @@ export function guardedProgramOf(name, args) {
 
 function analyzeCall(name, args) {
     const options = [args[1], args[2]].find((value) => value && typeof value === 'object' && !Array.isArray(value)) || {};
-    analysedPath = options.env && options.env.PATH !== undefined ? String(options.env.PATH) : null;
-    try { return analyzeCallWith(name, args, options); } finally { analysedPath = null; }
+    return withSearchPath(options.env && options.env.PATH !== undefined ? String(options.env.PATH) : null, () => analyzeCallWith(name, args, options));
 }
 
 function analyzeCallWith(name, args, options) {
@@ -547,6 +674,15 @@ for (const name of ['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execF
     childProcess[name] = wrapped;
 }
 
+// An eval worker's source is a CommonJS script unless it uses module syntax
+// (import/export, top-level await), which Node then evaluates as an ES module:
+// a CommonJS source requires the guard first, a module imports it first.
+function guardedEvalSource(source) {
+    let script = true;
+    try { new vm.Script(source); } catch (_) { script = false; }
+    return script ? `require(${JSON.stringify(fileURLToPath(GUARD_URL))});\n${source}` : `import ${JSON.stringify(GUARD_URL)};\n${source}`;
+}
+
 // A worker thread has its own child_process module: it loads this guard too.
 const OriginalWorker = workerThreads.Worker;
 class GuardedWorker extends OriginalWorker {
@@ -562,7 +698,7 @@ class GuardedWorker extends OriginalWorker {
             : options?.env;
         // `--import` does not apply to an eval worker: its CommonJS code first
         // requires this guard (an ES module without top-level await).
-        const source = options?.eval === true && typeof file === 'string' ? `require(${JSON.stringify(fileURLToPath(GUARD_URL))});\n${file}` : file;
+        const source = options?.eval === true && typeof file === 'string' ? guardedEvalSource(file) : file;
         super(source, { ...(options || {}), ...(execArgv !== undefined ? { execArgv } : {}), ...(env !== undefined ? { env } : {}) });
     }
 }

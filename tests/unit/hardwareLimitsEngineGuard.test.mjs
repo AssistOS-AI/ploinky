@@ -45,8 +45,10 @@ function world(t) {
         const file = `${name}.test.mjs`;
         const tests = forms.map(([id, body]) => `test(${JSON.stringify(id)}, async () => {
     let marker = 'not-refused';
-    try { await (async () => { ${body} })(); } catch (error) { marker = error?.code || ('status:' + error?.status) || 'error'; }
+    let message = '';
+    try { await (async () => { ${body} })(); } catch (error) { marker = error?.code || ('status:' + error?.status) || 'error'; message = String(error?.message || '').slice(0, 300); }
     fs.writeFileSync(path.join(MARKERS, ${JSON.stringify(id.replace(/[^A-Za-z0-9._-]/g, '_'))}), String(marker));
+    fs.writeFileSync(path.join(MARKERS, ${JSON.stringify(id.replace(/[^A-Za-z0-9._-]/g, '_'))} + '.msg'), message);
 });`).join('\n');
         fs.writeFileSync(path.join(suiteRoot, file), `import test from 'node:test';
 import cp from 'node:child_process';
@@ -68,7 +70,11 @@ ${tests}
             const target = path.join(markers, id.replace(/[^A-Za-z0-9._-]/g, '_'));
             return [id, fs.existsSync(target) ? fs.readFileSync(target, 'utf8') : 'missing'];
         }));
-        return { result, marked, canaryRuns: canaryRuns() - before };
+        const messages = Object.fromEntries(forms.map(([id]) => {
+            const target = path.join(markers, `${id.replace(/[^A-Za-z0-9._-]/g, '_')}.msg`);
+            return [id, fs.existsSync(target) ? fs.readFileSync(target, 'utf8') : ''];
+        }));
+        return { result, marked, messages, canaryRuns: canaryRuns() - before };
     }
     return { root, sentinelBin, sentinel, probe, canaryRuns };
 }
@@ -77,6 +83,13 @@ function assertRefused(outcome, ids, label) {
     for (const id of ids) assert.equal(outcome.marked[id], REFUSED, `${label}: ${id} got the JS refusal`);
     assert.equal(outcome.result.verdict, 'FAIL', `${label}: the suite fails`);
     assert.equal(outcome.canaryRuns, 0, `${label}: the canary never ran`);
+}
+
+// The refusal names the program the guard stopped: every form of these tests
+// must be stopped at the canary operand, never at a wrapper that merely shares
+// a number-rounded inode with a real guarded binary.
+function assertStoppedAt(outcome, ids, name, label) {
+    for (const id of ids) assert.match(outcome.messages[id], new RegExp(`tried to run ${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} through`), `${label}: ${id} was stopped at ${name}: ${outcome.messages[id]}`);
 }
 
 const exec = (command, args, options = '{ stdio: \'pipe\' }') => `cp.execFileSync(${command}, ${JSON.stringify(args)}, ${options});`;
@@ -156,7 +169,11 @@ test('EG.wrapper-operands-are-analysed-as-invocations', async (t) => {
         ['script -c', exec("'/usr/bin/script'", ['-q', '-c', `${CANARY} ps`, '/dev/null'])],
         ['flock', exec("'/usr/bin/flock'", ['-w', '1', '/tmp/lock', CANARY, 'ps'])],
     ];
-    assertRefused(await w.probe('wrapper-forms', forms), forms.map(([id]) => id), 'wrapper forms');
+    const outcome = await w.probe('wrapper-forms', forms);
+    assertRefused(outcome, forms.map(([id]) => id), 'wrapper forms');
+    // Including the sudo and script rows: refused at the canary operand. (A
+    // login shell is refused as a login shell.)
+    assertStoppedAt(outcome, forms.filter(([id]) => !/login shell/.test(id)).map(([id]) => id), CANARY, 'wrapper forms');
 });
 
 test('EG.absolute-guarded-paths-are-refused-wherever-they-appear', async (t) => {
@@ -217,24 +234,165 @@ test('EG.option-forms-shell-string-and-fork-exec-path', async (t) => {
     assertRefused(await w.probe('option-forms', forms), forms.map(([id]) => id), 'option forms');
 });
 
-test('EG.login-shells-are-refused-with-a-guarded-word-and-run-otherwise', async (t) => {
+// A login shell's profile rebuilds PATH after any injection and can run
+// anything, so it is refused outright: with a guarded word, without one, with
+// a script file, through argv0 and behind a wrapper.
+test('EG.login-shells-are-refused-outright', async (t) => {
     const w = world(t);
-    const refused = [
+    const script = path.join(w.root, 'run-canary.sh');
+    fs.writeFileSync(script, `#!/bin/sh\n${CANARY} ps\n`, { mode: 0o755 });
+    const forms = [
         ['login shell hidden name', exec("'/bin/bash'", ['-lc', `x=${CANARY}; "$x" ps`], "{ stdio: 'pipe', env: { PATH: '/usr/bin:/bin' } }")],
         ['login shell via argv0', `cp.execFileSync('/bin/sh', ['-c', 'x=${CANARY}; "$x" ps'], { argv0: '-sh', stdio: 'pipe' });`],
         ['login shell positional', exec("'/bin/bash'", ['-lc', 'exec "$@"', 'bash', CANARY, 'ps'])],
+        ['login shell --login -c', exec("'/bin/bash'", ['--login', '-c', `${CANARY} ps`])],
+        ['login shell -l -c', exec("'/bin/bash'", ['-l', '-c', 'true'])],
+        ['login shell cluster -xlc', exec("'/bin/sh'", ['-xlc', 'true'])],
+        // C1: the login profile prepends a directory and a script file runs the canary indirectly.
+        ['login shell running a script file', exec("'/bin/bash'", ['-lc', script])],
+        ['login shell with nothing guarded', exec("'/bin/bash'", ['-lc', 'true'], "{ stdio: 'pipe', env: { PATH: '/usr/bin:/bin' } }")],
+        ['login sh with nothing guarded', exec("'/bin/sh'", ['-lc', 'echo ok'])],
+        ['env then login shell', exec("'/usr/bin/env'", ['A=1', '/bin/bash', '-lc', 'true'])],
+        ['login shell in a shell line', exec("'/bin/sh'", ['-c', "bash -lc 'echo ok'"])],
+        // Login forms without -l: zsh's login option, and a dash-prefixed argv[0] through exec.
+        ['zsh -o login', exec("'/bin/zsh'", ['-o', 'login', '-c', 'true'])],
+        ['zsh -o login after other options', exec("'/bin/zsh'", ['-f', '-o', 'login', '-c', 'true'])],
+        ['exec -a -bash in a shell line', exec("'/bin/sh'", ['-c', "exec -a -bash bash -c 'true'"])],
+        ['exec -l in a shell line', exec("'/bin/sh'", ['-c', "exec -l bash -c 'true'"])],
+        ['exec -a -sh in a shell line', exec("'/bin/sh'", ['-c', "exec -a -sh /bin/sh -c 'true'"])],
+        ['exec -a -bash as a wrapper', exec("'/usr/bin/env'", ['A=1', '/bin/sh', '-c', "exec -a -bash bash -c 'echo ok'"])],
     ];
-    assertRefused(await w.probe('login-refused', refused), refused.map(([id]) => id), 'login shells');
-    // A login shell without anything guarded runs: its PATH is rebuilt by its
-    // profile, which the guard cannot shadow, and that is documented.
+    const outcome = await w.probe('login-refused', forms);
+    assertRefused(outcome, forms.map(([id]) => id), 'login shells');
+    for (const [id] of forms) assert.match(outcome.messages[id], /\(login shell\)|tried to run /, id);
+    // Non-login shells with nothing guarded still run.
     const allowed = await w.probe('login-allowed', [
-        ['unrelated login command', exec("'/bin/bash'", ['-lc', 'true'], "{ stdio: 'pipe', env: { PATH: '/usr/bin:/bin' } }")],
-        ['unrelated login sh', exec("'/bin/sh'", ['-lc', 'echo ok'])],
+        ['plain shell', exec("'/bin/sh'", ['-c', 'echo ok'])],
+        ['plain bash', exec("'/bin/bash'", ['-c', 'true'], "{ stdio: 'pipe', env: { PATH: '/usr/bin:/bin' } }")],
+        ['exec with a plain argv0', exec("'/bin/sh'", ['-c', "exec -a renamed sh -c 'echo ok'"])],
+        ['exec without options', exec("'/bin/sh'", ['-c', 'exec echo ok'])],
     ]);
-    assert.equal(allowed.marked['unrelated login command'], 'not-refused');
-    assert.equal(allowed.marked['unrelated login sh'], 'not-refused');
+    for (const id of ['plain shell', 'plain bash', 'exec with a plain argv0', 'exec without options']) assert.equal(allowed.marked[id], 'not-refused', `${id}: ${allowed.messages[id]}`);
     assert.equal(allowed.result.verdict, 'PASS');
     assert.equal(allowed.canaryRuns, 0);
+});
+
+// A fake runtime first on the caller's PATH grants nothing once the invocation
+// replaces that PATH: the name is judged by the PATH the command really
+// resolves through, or by name alone when that PATH is not knowable.
+test('EG.a-fake-on-the-callers-path-grants-nothing-when-the-invocation-replaces-the-path', async (t) => {
+    const w = world(t);
+    const withFake = (body) => `const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-bin-')); fs.writeFileSync(path.join(dir, CANARY), '#!/bin/sh\\nexit 0\\n', { mode: 0o755 }); const env = { ...process.env, PATH: dir + ':' + SENTINEL_BIN + ':/usr/bin:/bin' }; ${body}`;
+    const run = (command, args) => withFake(`cp.execFileSync(${JSON.stringify(command)}, ${JSON.stringify(args)}, { stdio: 'pipe', env });`);
+    const runWithDir = (command, build) => withFake(`cp.execFileSync(${JSON.stringify(command)}, (${build})(dir), { stdio: 'pipe', env });`);
+    const forms = [
+        // A1: a login shell is refused whatever the caller's PATH holds.
+        ['A1 login shell with a fake first', run('/bin/bash', ['-lc', `${CANARY} ps`])],
+        // B1: an inline PATH replaces the caller's.
+        ['B1 inline PATH to the real directory', run('/bin/sh', ['-c', `PATH=${w.sentinelBin} ${CANARY} ps`])],
+        ['standalone assignment', run('/bin/sh', ['-c', `PATH=${w.sentinelBin}; ${CANARY} ps`])],
+        ['export', run('/bin/sh', ['-c', `export PATH=${w.sentinelBin}; ${CANARY} ps`])],
+        ['assignment in an earlier segment', run('/bin/sh', ['-c', `PATH=${w.sentinelBin} && ${CANARY} ps`])],
+        ['assignment before a pipe', run('/bin/sh', ['-c', `PATH=${w.sentinelBin}; true | ${CANARY} ps`])],
+        ['assignment inside eval', run('/bin/sh', ['-c', `eval 'PATH=${w.sentinelBin} ${CANARY} ps'`])],
+        ['assignment from another variable', run('/bin/sh', ['-c', `PATH=$HOME/nowhere ${CANARY} ps`])],
+        ['assignment from a command substitution', run('/bin/sh', ['-c', `PATH=$(echo ${w.sentinelBin}) ${CANARY} ps`])],
+        ['nested shell keeps the assignment', run('/bin/sh', ['-c', `PATH=${w.sentinelBin}; sh -c '${CANARY} ps'`])],
+        ['env assigns a real directory', run('/usr/bin/env', [`PATH=${w.sentinelBin}`, CANARY, 'ps'])],
+        ['env -i resets the PATH', run('/usr/bin/env', ['-i', CANARY, 'ps'])],
+        ['env -u PATH', run('/usr/bin/env', ['-u', 'PATH', CANARY, 'ps'])],
+        ['env assigns a PATH that does not hold the fake', run('/usr/bin/env', ['PATH=/usr/bin:/bin', '/bin/sh', '-c', `${CANARY} ps`])],
+    ];
+    const outcome = await w.probe('fake-path-replaced', forms);
+    assertRefused(outcome, forms.map(([id]) => id), 'a replaced PATH');
+    assertStoppedAt(outcome, forms.filter(([id]) => !id.startsWith('A1')).map(([id]) => id), CANARY, 'a replaced PATH');
+    // Controls: nothing replaces the fake's directory, so the fake is allowed.
+    const allowed = await w.probe('fake-path-kept', [
+        ['no replacement', run('/bin/sh', ['-c', `${CANARY} ps`])],
+        ['PATH keeps $PATH', run('/bin/sh', ['-c', `PATH="$PATH:/usr/sbin" ${CANARY} ps`])],
+        ['export keeps the fake directory', runWithDir('/bin/sh', "(dir) => ['-c', 'export PATH=' + dir + ':/usr/bin:/bin; ' + CANARY + ' ps']")],
+        ['env assigns a PATH that keeps the fake', runWithDir('/usr/bin/env', "(dir) => ['PATH=' + dir + ':/usr/bin:/bin', CANARY, 'ps']")],
+    ]);
+    for (const id of ['no replacement', 'PATH keeps $PATH', 'export keeps the fake directory', 'env assigns a PATH that keeps the fake']) {
+        assert.equal(allowed.marked[id], 'not-refused', `${id}: ${allowed.messages[id]}`);
+    }
+    assert.equal(allowed.result.verdict, 'PASS', JSON.stringify(allowed.marked));
+    assert.equal(allowed.canaryRuns, 0, 'only the fake ran');
+});
+
+// Programs outside the wrapper table still run commands named in their argv
+// (sandbox-exec, caffeinate, arch, bwrap, unshare, su), and the production
+// seatbelt and bwrap shapes end in `sh -lc`.
+test('EG.unlisted-wrappers-launchers-and-embedded-shells-are-analysed', async (t) => {
+    const w = world(t);
+    const sandboxProfile = '(version 1)(allow default)';
+    const forms = [
+        // D1: an absolute guarded path as an operand of an unlisted wrapper.
+        ['D1 caffeinate with an absolute path', exec("'/usr/bin/caffeinate'", ['-i', w.sentinel, 'ps'])],
+        ['caffeinate with a bare name', exec("'/usr/bin/caffeinate'", ['-i', CANARY, 'ps'])],
+        ['arch with a bare name', exec("'/usr/bin/arch'", ['-arm64', CANARY, 'ps'])],
+        ['bwrap with a bare name', exec("'bwrap'", ['--bind', '/', '/', CANARY, 'ps'])],
+        ['unshare with a bare name', exec("'/usr/bin/unshare'", ['-m', CANARY, 'ps'])],
+        ['su -c', exec("'/usr/bin/su'", ['-c', `${CANARY} ps`, 'nobody'])],
+        ['unlisted program with an absolute guarded path', exec("'/usr/bin/true'", ['--', w.sentinel, 'ps'])],
+        ['unlisted program with an embedded shell', exec("'/usr/bin/true'", ['sh', '-c', `${CANARY} ps`])],
+        ['unlisted program with an embedded nested shell', exec("'/usr/bin/true'", ['--flag', '/bin/sh', '-c', `cd /tmp && ${CANARY} ps`])],
+        // E: sandbox-exec running a shell, login and not.
+        ['E0 sandbox-exec sh -c', exec("'/usr/bin/sandbox-exec'", ['-p', sandboxProfile, '/bin/sh', '-c', `${CANARY} ps`])],
+        ['E1 sandbox-exec sh -lc', exec("'/usr/bin/sandbox-exec'", ['-p', sandboxProfile, '/bin/sh', '-lc', `cd /tmp && ${CANARY} ps`])],
+        ['E2 bare sandbox-exec sh -lc (production shape)', exec("'sandbox-exec'", ['-p', sandboxProfile, 'sh', '-lc', `cd /tmp && ${CANARY} ps`])],
+        // The production seatbelt shape: sandbox-exec -f PROFILE sh -lc "cd 'WD' && COMMAND".
+        ['seatbelt shape with a login shell', exec("'sandbox-exec'", ['-f', '/tmp/profile.sb', 'sh', '-lc', `cd '/tmp' && ${CANARY} ps`])],
+        ['seatbelt shape without the login flag', exec("'sandbox-exec'", ['-f', '/tmp/profile.sb', 'sh', '-c', `cd '/tmp' && ${CANARY} ps`])],
+        // The production bwrap shape: bwrap ...ARGS -- sh -lc COMMAND.
+        ['bwrap shape with a login shell', exec("'bwrap'", ['--unshare-all', '--bind', '/', '/', '--', 'sh', '-lc', `${CANARY} ps`])],
+        ['bwrap shape without the login flag', exec("'bwrap'", ['--unshare-all', '--bind', '/', '/', '--', 'sh', '-c', `${CANARY} ps`])],
+        ['bwrap shape with a hidden name', exec("'bwrap'", ['--bind', '/', '/', '--', 'sh', '-c', 'x=' + CANARY + '; "$x" ps'])],
+    ];
+    const outcome = await w.probe('unlisted-forms', forms);
+    for (const [id] of forms) {
+        // A hidden name is stopped by the PATH stubs (status 97) or by the JS refusal; nothing may run the sentinel.
+        assert.ok([REFUSED, 'status:97'].includes(outcome.marked[id]), `${id}: ${outcome.marked[id]} ${outcome.messages[id]}`);
+    }
+    assert.equal(outcome.result.verdict, 'FAIL');
+    assert.equal(outcome.canaryRuns, 0, 'the canary never ran');
+    // Everything but the hidden name is refused by the JS layer.
+    for (const [id] of forms.filter(([form]) => !form.includes('hidden'))) assert.equal(outcome.marked[id], REFUSED, id);
+    // Benign shapes of unlisted programs are not refused.
+    const allowed = await w.probe('unlisted-allowed', [
+        ['unlisted program with benign operands', exec("'/usr/bin/true'", ['--flag', 'sh', 'value'])],
+        ['unlisted program with an embedded benign shell', exec("'/usr/bin/true'", ['sh', '-c', 'echo ok'])],
+        ['unlisted program naming a guarded word as data', exec("'/usr/bin/true'", ['--grep', CANARY])],
+    ]);
+    for (const id of ['unlisted program with benign operands', 'unlisted program with an embedded benign shell', 'unlisted program naming a guarded word as data']) {
+        assert.equal(allowed.marked[id], 'not-refused', `${id}: ${allowed.messages[id]}`);
+    }
+    assert.equal(allowed.result.verdict, 'PASS');
+});
+
+// The guard's seatbelt and bwrap forms are the shapes production builds: pin
+// them, so a change of either shape reaches this test.
+test('EG.the-seatbelt-and-bwrap-shapes-the-guard-analyses-are-the-production-shapes', () => {
+    const seatbelt = fs.readFileSync(path.join(REPO, 'cli', 'sandbox', 'seatbelt', 'seatbeltServiceManager.js'), 'utf8');
+    assert.match(seatbelt, /spawnSync\('sandbox-exec', \['-f', profilePath, 'sh', '-lc', `cd '\$\{wd\}' && \$\{rewrittenCmd\}`\]/);
+    const bwrap = fs.readFileSync(path.join(REPO, 'cli', 'sandbox', 'bwrap', 'bwrapServiceManager.js'), 'utf8');
+    assert.match(bwrap, /bwrapArgs\.push\('--', 'sh', '-lc', shellCommand\)/);
+});
+
+// Absolute system binaries are not the real guarded binaries: on macOS, where
+// inodes exceed 2^53, a Number key made 113 of them collide with ssh or scp.
+test('EG.system-binaries-are-not-refused-by-a-number-rounded-inode', async (t) => {
+    const w = world(t);
+    const forms = [
+        ['FP1 absolute sed', exec("'/usr/bin/sed'", ['-n', '1p', '/etc/hosts'])],
+        ['FP2 absolute printf in a shell', exec("'/bin/sh'", ['-c', '/usr/bin/printf ok'])],
+        ['FP0 absolute env true', exec("'/usr/bin/env'", ['true'])],
+        ['absolute cat in a shell line', exec("'/bin/sh'", ['-c', 'echo x | /bin/cat'])],
+    ];
+    const outcome = await w.probe('system-binaries', forms);
+    for (const [id] of forms) assert.equal(outcome.marked[id], 'not-refused', `${id}: ${outcome.messages[id]}`);
+    assert.equal(outcome.result.verdict, 'PASS', JSON.stringify(outcome.marked));
+    assert.equal(outcome.canaryRuns, 0);
 });
 
 // The brief's four bypasses and the no-PATH variant: each must fail its suite
@@ -303,6 +461,29 @@ parentPort.postMessage('done');
     assert.equal(outcome.result.verdict, 'FAIL', 'the descendants\' refusals fail the suite');
 });
 
+// An eval worker whose source uses module syntax is evaluated as an ES module,
+// where `require` does not exist: the guard imports itself first instead.
+test('EG.an-eval-worker-with-module-syntax-is-guarded', async (t) => {
+    const w = world(t);
+    const header = `import cp from 'node:child_process';
+import fs from 'node:fs';
+import { parentPort, workerData } from 'node:worker_threads';
+let marker = 'not-refused';
+try { cp.execFileSync(workerData.canary, ['ps'], { stdio: 'pipe' }); } catch (error) { marker = error?.code || ('status:' + error?.status); }
+fs.writeFileSync(workerData.marker, String(marker));
+`;
+    const modules = {
+        'eval worker with import statements': `${header}parentPort.postMessage('done');`,
+        'eval worker with import statements and top-level await': `${header}const later = await Promise.resolve('module');\nparentPort.postMessage(later);`,
+    };
+    const forms = Object.entries(modules).map(([id, code], index) => [id, `const marker = path.join(ROOT, 'esm-worker-marker-${index}');
+await new Promise((resolve, reject) => { const w = new Worker(${JSON.stringify(code)}, { eval: true, env: { PATH: SENTINEL_BIN + ':/usr/bin:/bin' }, execArgv: [], workerData: { canary: CANARY, marker } }); w.once('message', resolve); w.once('error', reject); w.once('exit', resolve); });
+throw Object.assign(new Error('worker finished'), { code: fs.readFileSync(marker, 'utf8') });`]);
+    const outcome = await w.probe('esm-worker', forms);
+    for (const [id] of forms) assert.equal(outcome.marked[id], REFUSED, `${id}: the worker's own guard refused the canary (${outcome.messages[id]})`);
+    assert.equal(outcome.canaryRuns, 0);
+});
+
 test('EG.a-violating-child-killed-by-a-signal-still-fails-the-top-level-suite', async (t) => {
     const w = world(t);
     const code = `const cp = require('node:child_process'); try { cp.execFileSync(${JSON.stringify(CANARY)}, ['ps'], { stdio: 'pipe' }); } catch (_) {} process.kill(process.pid, 'SIGKILL');`;
@@ -334,7 +515,48 @@ async function runGuardedTop({ tmp, program, signal = null, waitFor = null, env 
     if (signal) child.kill(signal);
     return { ...(await closed), stderr };
 }
+// The same, but the top-level process starts with NO NODE_OPTIONS and no
+// inherited ledger: the test process is itself guarded, and its guard injects
+// NODE_OPTIONS into every child it starts, which would hide the top-level
+// guard's own propagation. A shell removes the injected variables before it
+// execs the Node top-level with `--import` on its command line only.
+async function runBareGuardedTop({ tmp, program, env = {} }) {
+    const script = 'unset NODE_OPTIONS PLOINKY_ENGINE_GUARD_TOP_LOG PLOINKY_ENGINE_GUARD_ROOT PLOINKY_ENGINE_GUARD_TEMP; exec "$HWL_NODE" --import "$HWL_GUARD" -e "$HWL_PROGRAM"';
+    const child = spawn('/bin/sh', ['-c', script], { env: { PATH: process.env.PATH, HOME: tmp, TMPDIR: tmp, HWL_NODE: process.execPath, HWL_GUARD: GUARD, HWL_PROGRAM: program, ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = '';
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.stdout.resume();
+    const closed = await new Promise((resolve) => child.once('close', (code, signal) => resolve({ code, signal })));
+    return { ...closed, stderr };
+}
 const guardRoots = (directory) => fs.readdirSync(directory).filter((name) => name.startsWith('engine-guard-'));
+
+// A Node child loads the guard through NODE_OPTIONS: a top-level process started
+// with `--import` on its command line only passes that on by setting the
+// variable in its own environment (inherited by a child that is given none) and
+// by re-injecting it after `env -i` / `env -u`. The child runs an ABSOLUTE
+// canary path, which no PATH stub can stop: only the guard in the child can.
+test('EG.a-node-child-is-guarded-through-the-inherited-environment-and-after-env-i', async (t) => {
+    const w = world(t);
+    const tmp = path.join(w.root, 'nodeopts-tmp'); fs.mkdirSync(tmp);
+    // The canary's absolute path is read from a file inside the child: written
+    // in the child's argv it would be refused in the PARENT, which is the
+    // conservative scan doing its job, not the child guard under test.
+    const target = path.join(w.root, 'canary-target'); fs.writeFileSync(target, w.sentinel);
+    const childCode = `const cp = require('node:child_process'); const fs = require('node:fs'); let m = 'not-refused'; try { cp.execFileSync(fs.readFileSync(process.argv[2], 'utf8'), ['ps'], { stdio: 'pipe' }); } catch (error) { m = error?.code || ('status:' + error?.status); } fs.writeFileSync(process.argv[1], m);`;
+    const markers = { inherited: path.join(w.root, 'inherited-marker'), envI: path.join(w.root, 'env-i-marker'), envU: path.join(w.root, 'env-u-marker') };
+    const program = `const cp = require('node:child_process');
+cp.spawnSync(process.execPath, ['-e', ${JSON.stringify(childCode)}, ${JSON.stringify(markers.inherited)}, ${JSON.stringify(target)}]);
+cp.spawnSync('/usr/bin/env', ['-i', 'PATH=/usr/bin:/bin', process.execPath, '-e', ${JSON.stringify(childCode)}, ${JSON.stringify(markers.envI)}, ${JSON.stringify(target)}]);
+cp.spawnSync('/usr/bin/env', ['-u', 'NODE_OPTIONS', process.execPath, '-e', ${JSON.stringify(childCode)}, ${JSON.stringify(markers.envU)}, ${JSON.stringify(target)}]);`;
+    const result = await runBareGuardedTop({ tmp, program, env: { PATH: `${w.sentinelBin}:/usr/bin:/bin`, PLOINKY_ENGINE_GUARD_EXTRA_PROGRAMS: CANARY } });
+    const read = (file) => (fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : 'missing');
+    assert.equal(read(markers.inherited), REFUSED, `a child with the inherited environment is guarded: ${result.stderr}`);
+    assert.equal(read(markers.envI), REFUSED, 'a child after env -i is guarded');
+    assert.equal(read(markers.envU), REFUSED, 'a child after env -u NODE_OPTIONS is guarded');
+    assert.equal(w.canaryRuns(), 0, 'the canary never ran');
+    assert.notEqual(result.code, 0, 'the refusals fail the top-level process through the ledger');
+});
 
 test('EG.the-top-level-removes-its-temporary-root-on-exit-and-on-sigterm', async (t) => {
     const w = world(t);
