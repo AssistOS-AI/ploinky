@@ -670,6 +670,8 @@ export function buildRequiredCaseManifest() {
             'W2.a-reply-with-control-bytes-and-two-hundred-characters-is-sanitized-and-truncated-everywhere',
             'W2.a-successful-readback-is-journaled-too-the-captured-fixture',
             'W2.every-reply-parse-error-carries-the-sanitized-reply-and-the-grammar-stays-strict',
+            'F1.the-final-readiness-error-keeps-the-last-refused-reply-wherever-the-deadline-lands',
+            'F1.a-deadline-with-no-refused-reply-is-reported-as-the-deadline-alone',
         ]),
         // LIVE-P1: a recreate by image ID keeps the dependency installer's identity.
         ...leaves(P, 'p4', unit('hardwareLimitsInstallerImage.test.mjs'), [

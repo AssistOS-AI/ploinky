@@ -118,3 +118,42 @@ test('W2.every-reply-parse-error-carries-the-sanitized-reply-and-the-grammar-sta
     assert.equal(replyExcerpt('a\r\nb'), 'a\\nb'); assert.equal(replyExcerpt('x'.repeat(500)).length, 64); assert.equal(replyExcerpt(undefined), '');
     assert.equal(replyExcerpt('token=hunter2'), 'token=[REDACTED]');
 });
+
+// F1: the readiness retries end on the 30 s deadline wherever it lands. The clock advances on every control call (stepMs),
+// so the deadline falls between two calls of an attempt, often before the memory query, and the attempt then ends on a bare
+// "exceeded its deadline". The last refused reply must still be in the final error, the Apply step and the journal.
+function startWithStep(stepMs, memoryReply) {
+    const host = fakeHost();
+    let clock = 0;
+    const query = (_binary, args, options) => {
+        if (args[0] === '-d') return { status: 0 };
+        clock += stepMs;
+        const command = String(options.input).trim();
+        return { status: 0, stdout: command === 'get_default_active_thread_percentage' ? '25\n' : command === 'get_default_device_pinned_mem_limit 0' ? memoryReply : '', stderr: '' };
+    };
+    let saved = null;
+    const backend = createMpsDaemonBackend({ fsApi: host.fsApi, uid: 1000, query, observe: () => ({ state: 'owned' }), now: () => clock, wait: ms => { clock += ms; } });
+    try { backend.start({ smPercent: 25, memoryMiB: 1024 }, { tools: host.descriptors, onState: state => { saved = structuredClone(state); } }); return { ok: true }; }
+    catch (error) { return { message: error.message, step: error.applyStep, journaled: saved?.lastReadback?.memory ?? null }; }
+}
+
+test('F1.the-final-readiness-error-keeps-the-last-refused-reply-wherever-the-deadline-lands', () => {
+    const lost = [];
+    let deadlineEnded = 0;
+    for (let step = 1; step <= 60; step += 1) {
+        const result = startWithStep(step, '1024 MB\n');
+        if (/exceeded its deadline/.test(result.message)) deadlineEnded += 1;
+        if (!/reply: "1024 MB\\n"/.test(result.message) || result.step !== 'set-defaults' && result.step !== 'daemon-start' || result.journaled !== '1024 MB\\n') lost.push({ step, ...result });
+    }
+    assert.deepEqual(lost, []);
+    assert.ok(deadlineEnded > 10, `the sweep must include runs that end on the bare deadline (${deadlineEnded})`);
+    // A run that ended on the deadline names both causes; a run refused by the reply alone is unchanged.
+    const both = startWithStep(1000, '1024 MB\n');
+    assert.match(both.message, /exceeded its deadline; last refused reply \(set defaults\): Unsupported MPS device-memory default reply \(reply: "1024 MB\\n"\)/);
+});
+
+test('F1.a-deadline-with-no-refused-reply-is-reported-as-the-deadline-alone', () => {
+    const result = startWithStep(100_000, '1024M\n');
+    assert.match(result.message, /exceeded its deadline/);
+    assert.doesNotMatch(result.message, /last refused reply/);
+});

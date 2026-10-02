@@ -374,7 +374,15 @@ export function createMpsDaemonBackend({ root = MPS_ROOT, fsApi = fs, query = sp
             // The last failed attempt, kept: whichever way the 30 s end (an attempt that fails after the deadline, or the
             // deadline passing during the wait), the final error names where it stopped and the reply it got.
             let last = null;
-            const readinessFailure = (error, at) => { onState(state); return markApplyStep(new MpsError(`MPS daemon readiness failed at ${at}: ${String(error.message).slice(0, 200)}`), at === 'set defaults' ? 'set-defaults' : 'daemon-start'); };
+            // The last attempt that was refused WITH the daemon's reply: a later attempt that ended on the deadline or a timeout
+            // (a bare "exceeded its deadline") must not replace the reply as the cause.
+            let lastRefused = null;
+            const bearsReply = (error) => /\(reply: "/.test(String(error?.message));
+            const readinessFailure = (error, at) => {
+                onState(state);
+                const refusal = lastRefused && lastRefused.error !== error && !bearsReply(error) ? `; last refused reply (${lastRefused.phase}): ${String(lastRefused.error.message).slice(0, 160)}` : '';
+                return markApplyStep(new MpsError(`MPS daemon readiness failed at ${at}: ${String(error.message).slice(0, 200)}${refusal}`), at === 'set defaults' ? 'set-defaults' : 'daemon-start');
+            };
             const record = (kind, text) => { readback[kind] = replyExcerpt(text); state.lastReadback = { at: now(), ...readback }; };
             do {
                 try {
@@ -397,7 +405,7 @@ export function createMpsDaemonBackend({ root = MPS_ROOT, fsApi = fs, query = sp
                         }
                     }, uid, verifyServer: (pid) => observeOwnedMpsServer(state, pid, { fsApi, uid }), explainServer: (pid) => inspectOwnedMpsServer(state, pid, { fsApi, uid }).reason, onReadback: record });
                     state.status = 'ready'; return state;
-                } catch (error) { last = { error, phase }; if (now() >= deadline) throw readinessFailure(error, phase); wait(100); }
+                } catch (error) { last = { error, phase }; if (bearsReply(error)) lastRefused = { error, phase }; if (now() >= deadline) throw readinessFailure(error, phase); wait(100); }
             } while (now() < deadline);
             if (last) throw readinessFailure(last.error, last.phase);
             throw new MpsError('MPS daemon readiness timed out');
