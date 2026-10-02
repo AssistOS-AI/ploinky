@@ -1435,4 +1435,9 @@ test('A5.the-manifest-validates-the-tolerated-records-and-the-approval-summary-s
     const summary = renderSummary(w.run, w.runPath);
     for (const text of ['amendment A5', 'one recorded display process', 'one foreign process', 'toleratedProcesses', 'type exactly `G`', 'at most 64 MiB', 'the only foreign process allowed is the recorded one', 'second foreign graphics process', 'never touches, signals or reprioritises']) assert.ok(summary.includes(text), text);
     assert.deepEqual(w.run.toleratedProcesses, [], 'the proposal records none: the first check does');
+    // The notes of the plan and of the summary's operation table say what is enforced: one recorded display process, never four, never "must be empty".
+    const gateNote = w.run.target.plan.provision.find(entry => entry.id === 'gpu-initial-gate').note;
+    assert.ok(gateNote.includes('at most ONE recorded graphics-only (type G) display process of at most 64 MiB, present at this first check with a proven host identity') && !/at most 4|four/.test(gateNote), gateNote);
+    assert.ok(summary.includes('except for at most one recorded graphics-only (type G) display process of at most 64 MiB, present at this first check with a proven identity (amendment A5)'));
+    assert.equal(summary.includes('the process list must be empty)'), false); assert.equal(/at most 4 graphics|four display/.test(summary), false);
 });
