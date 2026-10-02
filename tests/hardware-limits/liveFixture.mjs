@@ -21,15 +21,29 @@ import {
 } from './liveCommon.mjs';
 import { runBoundedProcess } from './liveProcess.mjs';
 import { createJournal, recordHostRecords, runOwnedCleanup } from './liveCleanup.mjs';
+import { createHostProc } from './liveGpuHost.mjs';
+import { createGpuGate, gpuQueryArgv } from './liveGpuGate.mjs';
 
 export const FIXTURE_REPOSITORY = 'hwlfixture';
 export const FIXTURE_HARDWARE_LIMITS = Object.freeze({ memory: '64m', cpus: '0.5', pidsLimit: 64 });
 const ROLES = Object.freeze(['memory', 'cpu', 'pids']);
+// The apparatus-mps fixture: two GPU share clients and one unrelated CPU agent
+// (the CPU fixture's own limits). The GPU agents need room for a CUDA context.
+export const GPU_FIXTURE_HARDWARE_LIMITS = Object.freeze({ memory: '2g', cpus: '1', pidsLimit: 128 });
+export const GPU_ROLES = Object.freeze(['probe', 'peer']);
+export const GPU_PROBE_TARGET = 'probe/mpsprobe.py';
 
 // The fixture agents a selection needs. C2 needs three distinct owned agents
 // (memory, cpu and pids pressure); C1 and A1 need one. Every agent carries all
 // three limits, because the live inspection requires them on each agent.
 export function fixturePlan(cases) {
+    if (cases.some(id => String(id).startsWith('LIVE-P'))) {
+        return [
+            { name: 'probe', role: 'probe', hardwareLimits: { ...GPU_FIXTURE_HARDWARE_LIMITS } },
+            { name: 'peer', role: 'peer', hardwareLimits: { ...GPU_FIXTURE_HARDWARE_LIMITS } },
+            { name: 'cpu', role: 'cpu', hardwareLimits: { ...FIXTURE_HARDWARE_LIMITS } },
+        ];
+    }
     const roles = cases.includes('LIVE-C2') ? ROLES : ['memory'];
     return roles.map(role => ({ name: role, role, hardwareLimits: { ...FIXTURE_HARDWARE_LIMITS } }));
 }
@@ -65,11 +79,11 @@ export function proposedWorkspaceIdentity(workspacePath) {
 }
 
 export function startArgs(profile, ports) {
-    return [profile.candidate.path, '--port', String(ports.tcp), '--udp-port', String(ports.udp), 'start', profile.fixtures.cpu.ref];
+    return [profile.candidate.path, '--port', String(ports.tcp), '--udp-port', String(ports.udp), 'start', (profile.fixtures.gpu || profile.fixtures.cpu).ref];
 }
 
 export function validateProvisionPlan(value, run) {
-    keys(value, ['revision', 'repository', 'image', 'boxImage', 'agents', 'workspace'], 'provision plan');
+    keys(value, ['revision', 'repository', 'image', 'boxImage', 'agents', 'workspace'], 'provision plan', ['gpu']);
     if (!/^[a-f0-9]{40}$/.test(value.revision) || value.repository !== FIXTURE_REPOSITORY
         || !IMAGE_REF.test(value.image) || !IMAGE_REF.test(value.boxImage)) throw new Error('Invalid provision pins');
     keys(value.workspace, ['parent', 'parentMode', 'path'], 'provision workspace');
@@ -80,9 +94,20 @@ export function validateProvisionPlan(value, run) {
     for (const agent of value.agents) {
         keys(agent, ['name', 'role', 'hardwareLimits'], 'fixture agent');
         keys(agent.hardwareLimits, ['memory', 'cpus', 'pidsLimit'], 'fixture hardwareLimits');
-        if (!ROLES.includes(agent.name) || agent.role !== agent.name || names.has(agent.name)
-            || jsonDigest(agent.hardwareLimits) !== jsonDigest(FIXTURE_HARDWARE_LIMITS)) throw new Error('Invalid fixture agent');
+        const expected = GPU_ROLES.includes(agent.name) ? GPU_FIXTURE_HARDWARE_LIMITS : FIXTURE_HARDWARE_LIMITS;
+        if (!(ROLES.includes(agent.name) || GPU_ROLES.includes(agent.name)) || agent.role !== agent.name || names.has(agent.name)
+            || jsonDigest(agent.hardwareLimits) !== jsonDigest(expected)) throw new Error('Invalid fixture agent');
         names.add(agent.name);
+    }
+    // The GPU fixture is exactly probe (the root), peer and the unrelated cpu agent.
+    const gpuFixture = value.agents.some(agent => GPU_ROLES.includes(agent.name));
+    if (gpuFixture !== (value.gpu !== undefined) || (gpuFixture && (value.agents.map(agent => agent.name).join(',') !== 'probe,peer,cpu'))) throw new Error('The GPU fixture plan is inconsistent');
+    if (value.gpu !== undefined) {
+        keys(value.gpu, ['uuid', 'grantAgents', 'probe'], 'GPU provision plan');
+        keys(value.gpu.probe, ['sourcePath', 'digest', 'target'], 'GPU probe plan');
+        if (!/^GPU-[a-fA-F0-9-]{8,64}$/.test(value.gpu.uuid) || !Array.isArray(value.gpu.grantAgents)
+            || value.gpu.grantAgents.join(',') !== `${FIXTURE_REPOSITORY}/probe,${FIXTURE_REPOSITORY}/peer`
+            || !absolute(value.gpu.probe.sourcePath) || !/^sha256:[a-f0-9]{64}$/.test(value.gpu.probe.digest) || value.gpu.probe.target !== GPU_PROBE_TARGET) throw new Error('Invalid GPU provision plan');
     }
     if (run && (run.workspace?.proposedPath !== value.workspace.path || run.workspace?.instance !== proposedWorkspaceIdentity(value.workspace.path).instance)) {
         throw new Error('Provision workspace does not match the proposed identity');
@@ -113,7 +138,7 @@ function provisionReport(run, verdict, limitations) {
 export async function provisionRun({
     run, persist = () => {}, processProvider = runBoundedProcess, signal, portProbe = probeLocalPorts, remoteArrival = false, artifacts = () => {},
     hostIdentity = { hostname: os.hostname(), platform: process.platform, home: fs.realpathSync(os.homedir()) },
-    validateProfile,
+    validateProfile, hostProc,
 } = {}) {
     const limitations = [];
     let profile;
@@ -142,6 +167,13 @@ export async function provisionRun({
             limitations.push(`${name} executable identity changed`); return provisionReport(run, 'BLOCKED', limitations);
         }
     }
+    // The pinned NVIDIA tools, by canonical path and content, before any GPU command.
+    for (const name of ['smi', 'mpsControl', 'mpsServer']) {
+        const file = profile.gpu?.[name];
+        if (file && (!fs.existsSync(file.path) || fs.realpathSync(file.path) !== file.path || digest(fs.readFileSync(file.path)) !== file.digest)) {
+            limitations.push(`NVIDIA tool ${name} identity changed`); return provisionReport(run, 'BLOCKED', limitations);
+        }
+    }
     if (liveSourceDigest(profile.source.root) !== profile.source.digest) { limitations.push('Candidate source changed'); return provisionReport(run, 'BLOCKED', limitations); }
 
     const journaled = createJournal({ run, persist, processProvider, signal, artifacts });
@@ -168,6 +200,18 @@ export async function provisionRun({
             let existed = true;
             try { fs.lstatSync(target); } catch (error) { if (error.code !== 'ENOENT') throw error; existed = false; }
             observed(intent('host-directory-preflight', { directory }), { existed });
+        }
+
+        // The GPU idle gate runs before anything is created: a busy, foreign,
+        // unsupported or wrong-mode GPU is BLOCKED with nothing to clean up.
+        if (plan.gpu) {
+            const gate = createGpuGate({
+                query: () => processProvider(profile.gpu.smi.path, gpuQueryArgv(profile.gpu.uuid), { cwd: profile.host.home, env: { PATH: '/usr/bin:/bin', HOME: profile.host.home }, deadlineMs: 30000, maxBytes: 1048576, signal }),
+                uuid: profile.gpu.uuid, host: hostProc || createHostProc(), boxPrefix: '/before-the-box', expectedMemoryMiB: profile.gpu.memoryMiB,
+            });
+            const baseline = await gate.initial();
+            artifacts('gpu-initial-gate', { baseline, history: gate.history });
+            observed(intent('gpu-initial-gate'), { result: { uuid: baseline.uuid, computeMode: baseline.computeMode, memory: baseline.memory } });
         }
 
         // 1. The workspace, refusing any pre-existing path.
@@ -214,9 +258,29 @@ export async function provisionRun({
             fs.writeFileSync(target, bytes, { flag: 'wx', mode: 0o644 });
             files[path.relative(workspace.path, target)] = digest(bytes);
         }
+        // The CUDA probe is test-only data in the probe agent's directory, so
+        // the nested engine stages it at /code/mpsprobe.py; its bytes are pinned.
+        if (plan.gpu) {
+            const bytes = fs.readFileSync(plan.gpu.probe.sourcePath);
+            if (digest(bytes) !== plan.gpu.probe.digest) throw blocked('The staged CUDA probe differs from the digest pinned in the manifest');
+            const target = path.join(repository, plan.gpu.probe.target);
+            fs.writeFileSync(target, bytes, { flag: 'wx', mode: 0o644 });
+            files[path.relative(workspace.path, target)] = digest(bytes);
+        }
         const resolved = resolveWorkspaceIdentity({ env: {}, cwd: () => workspace.path });
         if (resolved.workspaceRoot !== workspace.path || resolved.instance !== instance) throw new Error('The fixture workspace does not resolve to itself');
         observed(fixtureOp, { resultArtifact: jsonDigest(files), files });
+
+        // 4b. The GPU grant, through the supported product path, before the
+        //     first start (no Box exists yet, so the next start applies it).
+        //     Its host records are recorded at once, whether or not it succeeds.
+        if (plan.gpu) {
+            try {
+                await journaled('gpu-grant', profile.node.path, [profile.candidate.path, 'gpu', 'grant', ...plan.gpu.grantAgents.flatMap(ref => ['--agent', ref])],
+                    { cwd: workspace.path, env, deadlineMs: run.deadlines.coreMs || 30000, capture: 'gpu-grant' });
+            } catch (error) { throw blocked(`The GPU grant did not complete: ${String(error.message).slice(0, 300)}`); }
+            finally { recordHostRecords(run, profile, instance); persist(); }
+        }
 
         // 5. Start the gate-on Box through the absolute candidate.
         // Host records were proved absent before this start, so every exact
@@ -243,6 +307,12 @@ export async function provisionRun({
             || !Array.isArray(box.mounts) || !box.mounts.some(mount => mount.Source === workspace.path)
             || !/^[a-f0-9]{64}$/.test(box.labels?.[BOX_LABELS.hardwareLimits] || '')
             || box.labels?.[BOX_LABELS.imageRef] !== plan.boxImage || box.running !== true) throw new Error('The new Box is not the pinned gate-on Box of this workspace');
+        if (plan.gpu) {
+            const bound = destination => box.mounts.find(mount => mount.Destination === destination);
+            if (!/^[a-f0-9]{64}$/.test(box.labels?.[BOX_LABELS.gpuGrant] || '')
+                || !['nvidia-cuda-mps-control', 'nvidia-cuda-mps-server', 'nvidia-smi'].every(name => bound(`/usr/local/nvidia/bin/${name}`)?.RW === false)
+                || bound('/usr/local/nvidia/lib64/libcuda.so.1')?.RW !== false) throw blocked('The Box was created without the GPU and MPS tool wiring (read-only NVIDIA tools and libcuda); check the host driver and the GPU grant');
+        }
         profile.box = { id: box.id, created: box.created, image: box.image, contractDigest: jsonDigest({ labels: box.labels, mounts: box.mounts }), pathHash: identity.pathHash, instance };
         run.ownedBoxes.push({ id: box.id, created: box.created, contractDigest: profile.box.contractDigest, operation: 'fixture-start' });
         run.operations.push({ id: 'fixture-created', kind: 'fixture-created', state: 'observed', resourceIds: [box.id], argvDigest: null, resultArtifact: profile.box.contractDigest });

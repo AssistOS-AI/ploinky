@@ -63,7 +63,9 @@ export async function dispatchRemoteRun({ run, action, cwd, signal, manifestDige
         '--run', target.runPath, '--authorization', authorizationPath || target.authorizationPath, '--remote-local', run.runId, '--expected-manifest-digest', manifestDigest);
     const result = await processProvider(target.sshBinary, args, {
         cwd, env: { PATH: '/usr/bin:/bin', HOME: process.env.HOME, SSH_AUTH_SOCK: process.env.SSH_AUTH_SOCK },
-        deadlineMs: 1530000, maxBytes: 1048576, signal,
+        // The block deadline, the cleanup bound and a margin; the CPU blocks keep 1530000 ms.
+        deadlineMs: Math.min(1800000, (Number.isInteger(run.deadlines?.blockMs) ? run.deadlines.blockMs : 1200000) + (Number.isInteger(run.deadlines?.cleanupMs) ? run.deadlines.cleanupMs : 300000) + 30000),
+        maxBytes: 1048576, signal,
     });
     if (result.signal || result.errorCode || result.timedOut || result.truncated || result.cancelled || result.settlementForced || ![0,1,2,3].includes(result.status)) {
         throw new Error('Remote command incomplete; retain manifest and reconcile the bounded remote runner before retrying');

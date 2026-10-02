@@ -6,8 +6,8 @@
 //   baseline      run scoped existing suites against the baseline staging copies
 //   offline       run one phase's required tests and affected regressions
 //   prepare-live  write a proposed run manifest for one live block (no engine
-//                 or SSH); mac-cpu and apparatus-cpu get concrete pins and a
-//                 human approval summary beside the manifest. A mac block's
+//                 or SSH); mac-cpu, apparatus-cpu and apparatus-mps get concrete
+//                 pins and a human approval summary beside the manifest. A mac block's
 //                 workspace lives under pins.workspaceParentRoot, which must be
 //                 short enough for the CLI's Unix sockets (a session scratch
 //                 root is not): pin a canonical task-owned /private/tmp/<name>
@@ -136,7 +136,7 @@ const PHASE_REGRESSIONS = Object.freeze({
         ],
     },
     p3: { explorer: ['explorer/tests/unit/settingsAccount.test.js', 'workspaceMonitorAgent/tests/currentSnapshot.test.mjs', 'tests/smoke/lib/box-evidence.test.mjs'] },
-    p4: { ploinky: ['tests/unit/ploinkyBoxGpuGrant.test.mjs'] },
+    p4: { ploinky: ['tests/unit/ploinkyBoxGpuGrant.test.mjs', 'tests/unit/hardwareLimitsLiveGpu.test.mjs'] },
     p5: { localLlms: ['local-llm/tests/gpu-profiles-unchanged.test.mjs', 'local-llm/tests/vllm.test.mjs'] },
 });
 const REPO_KEYS = Object.freeze({ ploinky: 'ploinky', explorer: 'explorer', 'local-llms': 'localLlms' });

@@ -1,5 +1,6 @@
 // Concrete run manifests and their human approval summaries for the blocks
-// with implemented executors (mac-cpu: LIVE-C1/C2; apparatus-cpu: LIVE-A1).
+// with implemented executors (mac-cpu: LIVE-C1/C2; apparatus-cpu: LIVE-A1;
+// apparatus-mps: LIVE-P1 to LIVE-P4).
 // Building a manifest reads local files only: no engine, SSH or network call.
 // A manifest is a proposal; only separate execution-time authorization
 // bindings (provision, live, cleanup) let the runner act on it.
@@ -9,7 +10,11 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { WANTED_CONTROLLERS } from '../../ploinky-box/entrypoint/cgroupDelegation.mjs';
 import { ENGINE_CONNECTIONS_ARGV, ENGINE_INFO_ARGV, HOST_RECORD_DIRECTORIES, IMAGE_REF, OWNER_MARKER, UNIX_SOCKET_PATH_LIMIT, WORKSPACE_SOCKET_NAME, digest, keys, AGENT_INSPECT, INSPECT } from './liveCommon.mjs';
-import { FIXTURE_REPOSITORY, fixtureContainerName, fixtureManifest, fixturePlan, proposedWorkspaceIdentity, startArgs } from './liveFixture.mjs';
+import { FIXTURE_REPOSITORY, GPU_PROBE_TARGET, fixtureContainerName, fixtureManifest, fixturePlan, proposedWorkspaceIdentity, startArgs } from './liveFixture.mjs';
+import { gpuQueryArgv } from './liveGpuGate.mjs';
+import {
+    ADMIN_REQUEST, GPU_SHARES, MPS_CLIENT_PIPE, PROBE_FILE, TIGHTER_CLIENT, controlHelperRunArgv, probeBoundMiB, probeExecArgv, shareMemoryMiB,
+} from './liveGpuCommands.mjs';
 import { remoteRoot, remoteReportName } from './liveStage.mjs';
 import { DOCUMENT_SUFFIXES } from './fixtures.mjs';
 import { sshOptions } from './liveRemote.mjs';
@@ -17,11 +22,14 @@ import { sshOptions } from './liveRemote.mjs';
 export const CONCRETE_BLOCKS = Object.freeze({
     'mac-cpu': { platform: 'darwin', remote: false, cases: ['LIVE-C1', 'LIVE-C2'] },
     'apparatus-cpu': { platform: 'linux', remote: true, cases: ['LIVE-A1'] },
+    'apparatus-mps': { platform: 'linux', remote: true, cases: ['LIVE-P1', 'LIVE-P2', 'LIVE-P3', 'LIVE-P4'], gpu: true },
 });
 export const DEADLINES = Object.freeze({
     coreMs: 30000, startMs: 20 * 60 * 1000, destroyMs: 5 * 60 * 1000, fullGraphMs: 20 * 60 * 1000,
     modelLoadMs: 20 * 60 * 1000, cleanupMs: 5 * 60 * 1000, stagingMs: 10 * 60 * 1000, blockMs: 20 * 60 * 1000,
 });
+// The GPU block needs longer than the CPU ones: P3 alone runs six Applies.
+export const GPU_DEADLINES = Object.freeze({ ...DEADLINES, blockMs: 24 * 60 * 1000 });
 const HASH = /^sha256:[a-f0-9]{64}$/;
 const SAFE = /^\/[A-Za-z0-9/_.-]+$/;
 const canonicalFile = file => path.isAbsolute(file) && fs.realpathSync(file) === file && fs.statSync(file).isFile();
@@ -31,7 +39,7 @@ const canonicalFile = file => path.isAbsolute(file) && fs.realpathSync(file) ===
 // are rechecked by the runner on arrival, before any mutation.
 export function validatePins(value, block) {
     const spec = CONCRETE_BLOCKS[block];
-    keys(value, ['schema', 'host', 'node', 'engine', 'boxImage'], 'pins', ['ssh', 'workspaceParentRoot', 'ports']);
+    keys(value, ['schema', 'host', 'node', 'engine', 'boxImage'], 'pins', ['ssh', 'workspaceParentRoot', 'ports', 'gpu']);
     if (value.schema !== 1) throw new Error('Unsupported pins schema');
     keys(value.host, ['hostname', 'platform', 'home'], 'pinned host');
     keys(value.node, ['path', 'digest'], 'pinned node');
@@ -43,6 +51,18 @@ export function validatePins(value, block) {
         keys(value.ports, ['tcp', 'udp'], 'pinned ports');
         if (![value.ports.tcp, value.ports.udp].every(port => Number.isInteger(port) && port >= 1024 && port <= 65535) || value.ports.tcp === value.ports.udp) throw new Error('Invalid pinned ports');
     }
+    // The observed GPU device and NVIDIA tools: required for the GPU block and
+    // refused for every other (a CPU block never names a GPU).
+    if (spec.gpu) {
+        keys(value.gpu, ['uuid', 'name', 'driverVersion', 'memoryMiB', 'expectedSmCount', 'smi', 'mpsControl', 'mpsServer'], 'pinned GPU');
+        for (const tool of ['smi', 'mpsControl', 'mpsServer']) {
+            keys(value.gpu[tool], ['path', 'digest'], `pinned GPU tool ${tool}`);
+            if (!SAFE.test(value.gpu[tool].path) || !HASH.test(value.gpu[tool].digest)) throw new Error(`Invalid pinned GPU tool ${tool}`);
+        }
+        if (!/^GPU-[a-fA-F0-9-]{8,64}$/.test(value.gpu.uuid) || typeof value.gpu.name !== 'string' || !value.gpu.name || value.gpu.name.length > 256
+            || !/^[0-9]+(?:\.[0-9]+)+$/.test(value.gpu.driverVersion) || !Number.isInteger(value.gpu.memoryMiB) || value.gpu.memoryMiB < 1024
+            || !Number.isInteger(value.gpu.expectedSmCount) || value.gpu.expectedSmCount < 1) throw new Error('Invalid pinned GPU device');
+    } else if (value.gpu !== undefined) throw new Error('A non-GPU block names no GPU');
     if (spec.remote) {
         if (value.workspaceParentRoot !== undefined) throw new Error('Apparatus workspaces live under the remote run root');
         keys(value.ssh, ['alias', 'sshBinary', 'address', 'hostKeyAlias', 'user', 'knownHosts', 'identityFile'], 'pinned SSH');
@@ -107,12 +127,23 @@ export function buildConcreteManifest({ block, runId, configDigest, casesDigest,
         box: null,
         agents: [],
         cases: [...spec.cases],
-        fixtures: { cpu: { ref: `${FIXTURE_REPOSITORY}/${agents[0].name}` } },
+        fixtures: spec.gpu ? { gpu: { ref: `${FIXTURE_REPOSITORY}/${agents[0].name}` } } : { cpu: { ref: `${FIXTURE_REPOSITORY}/${agents[0].name}` } },
         provision: {
             revision: candidate.revision, repository: FIXTURE_REPOSITORY, image, boxImage: pins.boxImage, agents,
             workspace: { parent, parentMode: remote ? 'staged' : 'create', path: workspacePath },
         },
     };
+    if (spec.gpu) {
+        // The CUDA probe file travels in the frozen candidate; its digest is pinned
+        // here and rechecked when the runner writes it into the probe agent.
+        const probeSource = `${sourceRoot}/tests/hardware-limits/${PROBE_FILE}`;
+        const probeDigest = digest(fs.readFileSync(path.join(candidate.root, 'tests', 'hardware-limits', PROBE_FILE)));
+        execution.gpu = { ...pins.gpu, probe: { sourcePath: probeSource, digest: probeDigest } };
+        execution.provision.gpu = {
+            uuid: pins.gpu.uuid, grantAgents: agents.filter(agent => agent.name !== 'cpu').map(agent => `${FIXTURE_REPOSITORY}/${agent.name}`),
+            probe: { sourcePath: probeSource, digest: probeDigest, target: GPU_PROBE_TARGET },
+        };
+    }
     const target = {
         engine: { binary: pins.engine.path, kind: 'podman', identity: pins.engine.identityDigest },
         ssh: remote ? { alias: pins.ssh.alias, expectedAddress: pins.ssh.address, expectedHostKeyAlias: pins.ssh.hostKeyAlias } : null,
@@ -134,7 +165,7 @@ export function buildConcreteManifest({ block, runId, configDigest, casesDigest,
         schema: 1, runId, configDigest, casesDigest, block, target, state: 'proposed',
         workspace: { proposedParent: parent, proposedPath: workspacePath, instance: identity.instance, pathHash: identity.pathHash },
         ports: { tcp: ports.tcp, udp: ports.udp },
-        deadlines: { ...DEADLINES },
+        deadlines: { ...(spec.gpu ? GPU_DEADLINES : DEADLINES) },
         images: [
             { role: 'fixture-agent', ref: image, source: 'AssistOSExplorer explorer/manifest.json line 2' },
             { role: 'box', ref: pins.boxImage, source: 'operator pins' },
@@ -163,6 +194,7 @@ export function plannedCommands(run) {
         { id: 'engine-identity', binary: engine, argv: [...ENGINE_INFO_ARGV], deadlineMs: run.deadlines.coreMs, note: 'Stable facts only: host arch/os/hostname/kernel, engine version, store graphRoot/runRoot and the service socket; a remote client adds its one default connection (name and URI). A missing fact refuses the run.' },
         { id: 'engine-connection', binary: engine, argv: [...ENGINE_CONNECTIONS_ARGV], deadlineMs: run.deadlines.coreMs, note: 'Only when the service is remote.' },
         { id: 'host-records-absent', action: `Refuse unless ${HOST_RECORD_DIRECTORIES.map(name => `~/.ploinky-box/${name}/${run.workspace.instance}{,.json}`).join(', ')} are all absent` },
+        ...(profile.gpu ? [{ id: 'gpu-initial-gate', binary: profile.gpu.smi.path, argv: gpuQueryArgv(profile.gpu.uuid), deadlineMs: run.deadlines.coreMs, note: 'The initial GPU idle gate, before anything is created: success, strict XML, the pinned UUID and memory, compute mode Default, a supported activity inventory and an empty process list. Nothing else runs if it is not met.' }] : []),
         ...(plan.workspace.parentMode === 'create'
             ? [{ id: 'workspace-parent-create', action: `mkdir ${plan.workspace.parent} (0700, refuse if it exists) and write ${OWNER_MARKER}=${run.runId}` }]
             : [{ id: 'workspace-parent-staged', action: `Require the staged private root ${plan.workspace.parent} (0700, marker ${run.runId})` }]),
@@ -171,6 +203,11 @@ export function plannedCommands(run) {
         { id: 'pre-inventory', binary: engine, argv: ps, deadlineMs: run.deadlines.coreMs },
         { id: 'pre-inventory-inspect', binary: engine, argv: ['container', 'inspect', '--format', INSPECT, '<CONTAINER_ID>'], deadlineMs: run.deadlines.coreMs },
         ...plan.agents.map(agent => ({ id: `fixture-write-${agent.name}`, action: `Write ${workspace}/.ploinky/repos/${FIXTURE_REPOSITORY}/${agent.name}/manifest.json`, content: fixtureManifest(agent, { image: plan.image, agents: plan.agents }) })),
+        ...(profile.gpu ? [
+            { id: 'fixture-write-probe-file', action: `Copy ${profile.gpu.probe.sourcePath} (${profile.gpu.probe.digest}) to ${workspace}/.ploinky/repos/${FIXTURE_REPOSITORY}/${GPU_PROBE_TARGET}; the nested engine stages it at /code/${PROBE_FILE}` },
+            { id: 'gpu-grant', binary: node, argv: [profile.candidate.path, 'gpu', 'grant', ...plan.gpu.grantAgents.flatMap(ref => ['--agent', ref])], cwd: workspace, env: {}, deadlineMs: run.deadlines.coreMs,
+                note: 'The supported product path: records the grant under ~/.ploinky-box/gpu-grants and discovers the host driver. No Box exists yet, so the next start applies it.' },
+        ] : []),
         { id: 'fixture-start', binary: node, argv: startArgs(profile, run.ports), cwd: workspace, env, deadlineMs: run.deadlines.startMs,
             note: 'Production start creates the gate-on Box and runs its bounded root preparation before graph work; this is the declared provisioning step that may change cgroup state.' },
         { id: 'box-inventory', binary: engine, argv: ps, deadlineMs: run.deadlines.coreMs },
@@ -195,13 +232,16 @@ export function plannedCommands(run) {
         { id: 'A1-handshake', binary: engine, argv: [...nested, 'container', 'exec', '<MEMORY_AGENT_ID>', 'node', '-e', '<ALLOCATION_HANDSHAKE>', run.runId, 'observe|release'], deadlineMs: 5000 },
         { id: 'A1-leaf-observer', binary: engine, argv: [...core, 'node', '-e', '<LEAF_OBSERVATION>', '<VERIFIED_LEAF>'], deadlineMs: 5000 },
     );
+    if (profile.gpu) live.push(...gpuPlan(run).commands);
     const cleanup = [
+        ...(profile.gpu ? [{ id: 'gpu-stop-owned-helpers', action: 'Remove the control helpers by exact recorded identity (name and run label re-proved first). The probes and the holder end with their commands or with the Box; nothing foreign is ever signalled.' }] : []),
         { id: 'revalidate-identity', binary: engine, argv: [...ENGINE_INFO_ARGV], action: 'Recheck engine identity (with its default connection when remote), workspace receipt and marker, or the run-derived quarantine' },
         { id: 'destroy-box', binary: node, argv: [profile.candidate.path, 'destroy', '--delete-cache'], cwd: workspace, deadlineMs: run.deadlines.destroyMs, action: 'Only when the recorded Box exists, or, when its receipt was never persisted, the one container found by the name and path-hash label recorded at fixture-start (`container ps --all --filter label=<path-hash label>=<hash> --format "{{.ID}} {{.Names}}"`) that also proves the Box role and a mount of exactly this workspace; then prove it absent and compare the unrelated inventory' },
         { id: 'host-records', action: `Remove only recorded ~/.ploinky-box/{${HOST_RECORD_DIRECTORIES.join(',')}}/${run.workspace.instance}[.json]; any unrecorded one refuses the step` },
         { id: 'workspace-removal', action: `Prove no container mounts ${workspace}; rename it to ${path.join(path.dirname(workspace), `.hwl-removing-${run.runId}`)}; reprove uid/dev/ino and marker; remove (marker last)` },
         ...(plan.workspace.parentMode === 'create' ? [{ id: 'workspace-parent-removal', action: `Remove ${plan.workspace.parent} only while it holds nothing but its marker` }] : []),
         { id: 'verify-absent', binary: engine, argv: ps, action: 'No owned Box, workspace, quarantine, parent or host record remains' },
+        ...(profile.gpu ? [{ id: 'gpu-final-observation', binary: profile.gpu.smi.path, argv: gpuQueryArgv(profile.gpu.uuid), deadlineMs: 30000, action: 'The GPU shows none of the runner\'s registered processes; compute mode is read, never written' }] : []),
     ];
     const result = { provision, live, cleanup };
     if (run.target.remote) {
@@ -222,6 +262,91 @@ export function plannedCommands(run) {
 }
 
 const list = values => values.map(value => `\`${value}\``).join(', ');
+
+// The GPU block's idle-gate checks and every GPU operation, from the same
+// constants the executors use. Identities known only at run time are
+// placeholders (<PROBE_ID>, <BOX_ID>, <PIPE>, <SERVER_PID>).
+export function gpuPlan(run) {
+    const profile = run.target.execution;
+    const gpu = profile.gpu;
+    const uuid = gpu.uuid;
+    const core = ['container', 'exec', '--user', 'podman', '<BOX_ID>'];
+    const nested = [...core, 'podman', '--cgroup-manager=cgroupfs'];
+    const node = profile.node.path; const engine = profile.engine.path;
+    const first = GPU_SHARES.first; const raised = GPU_SHARES.raised;
+    const cap = shareMemoryMiB(first.vramPercent, gpu.memoryMiB);
+    const raisedCap = shareMemoryMiB(raised.vramPercent, gpu.memoryMiB);
+    const probe = (maxMiB, options = {}) => probeExecArgv({ containerId: '0'.repeat(64), maxMiB, ...options }).map(word => (word === '0'.repeat(64) ? '<PROBE_ID>' : word));
+    const ports = ['--port', String(run.ports.tcp), '--udp-port', String(run.ports.udp)];
+    const admin = (id, method, body, extra = {}) => ({ id, binary: engine, argv: [...core, 'node', '-e', '<ADMIN_REQUEST>', method, body], deadlineMs: run.deadlines.coreMs, ...extra });
+    const apply = (id, refs) => admin(id, 'POST', `{"action":"apply","expectedToken":<TOKEN>,"containers":[<${refs} registry key>]}`, { deadlineMs: 600000, gpu: true });
+    const gate = id => ({ id, binary: gpu.smi.path, argv: gpuQueryArgv(uuid), deadlineMs: 30000, gpu: true, note: 'The per-operation GPU idle gate: query again, exclude only owned PIDs with a freshly verified tuple.' });
+    const share = value => `{"smPercent":${value.smPercent},"vramPercent":${value.vramPercent}}`;
+    const set = (id, ref, value) => admin(id, 'POST', `{"action":"set_agent_limits","expectedToken":<TOKEN>,"agentRef":"${ref}","limits":{"gpu":${share(value)}}}`);
+    const clear = (id, ref) => admin(id, 'POST', `{"action":"clear_agent_limits","expectedToken":<TOKEN>,"agentRef":"${ref}"}`);
+    const observeMps = id => ({ id, binary: engine, argv: [...core, 'node', '-e', '<MPS_OBSERVE>'], deadlineMs: 30000, note: 'Read-only: the private state file, the daemon\'s /proc facts and the three read-only control queries get_default_active_thread_percentage, get_default_device_pinned_mem_limit 0 and get_server_list.' });
+    const helper = writable => ({ id: `P4-helper-create-${writable ? 'rw' : 'ro'}`, binary: engine, argv: [...nested, ...controlHelperRunArgv({ name: `hwl-${run.runId.slice(0, 12)}-ctl-${writable ? 'rw' : 'ro'}`, image: profile.provision.image, pipeDirectory: `/run/ploinky/mps/pipe-${'0'.repeat(32)}`, writable, runId: run.runId }).map(word => word.replace(`pipe-${'0'.repeat(32)}`, 'pipe-<PIPE>'))], deadlineMs: 60000, gpu: true });
+    const control = (id, command) => ({ id, binary: engine, argv: [...nested, 'container', 'exec', '--env', `CUDA_MPS_PIPE_DIRECTORY=${MPS_CLIENT_PIPE}`, '--env', 'LD_LIBRARY_PATH=/usr/local/nvidia/lib64', '<HELPER_ID>', 'sh', '-c', 'printf "%s\\n" "$1" | /x', 'sh', command], deadlineMs: 20000, gpu: true });
+    const operations = [
+        { case: 'provision', ...gate('gpu-initial-gate'), note: 'The initial gate, before anything is created: the process list must be empty' },
+        { case: 'provision', id: 'gpu-grant', action: `${profile.candidate.path} gpu grant --agent ${plan(run).gpu.grantAgents.join(' --agent ')} (host driver discovery; records the grant)`, gpu: true },
+        { case: 'P1', ...gate('P1-gate') },
+        { case: 'P1', ...admin('P1-admin-state', 'GET', ''), action: 'Read the Box hardware-limits state and the policy store token through the Router route (the local operator session)' },
+        { case: 'P1', ...set('P1-save-share', 'hwlfixture/probe', first), action: `Save the first share ${first.smPercent}% SM / ${first.vramPercent}% VRAM (${cap} MiB of ${gpu.memoryMiB})` },
+        { case: 'P1', ...apply('P1-apply', 'probe'), action: 'Apply starts the MPS daemon (uid 1000, /ploinky/core), sets and reads back both defaults, then recreates the probe as a share client' },
+        { case: 'P1', ...observeMps('P1-observe-mps') },
+        { case: 'P2', ...gate('P2-gate') },
+        { case: 'P2', id: 'P2-probe-share', binary: engine, argv: [...nested, ...probe(probeBoundMiB(cap))], deadlineMs: 55000, gpu: true, note: `${first.smPercent}% share, ${cap} MiB cap; monitored by the gate` },
+        { case: 'P2', id: 'P2-probe-tighter-sm', binary: engine, argv: [...nested, ...probe(probeBoundMiB(cap), { set: { CUDA_MPS_ACTIVE_THREAD_PERCENTAGE: String(TIGHTER_CLIENT.smPercent) } })], deadlineMs: 55000, gpu: true },
+        { case: 'P2', id: 'P2-probe-tighter-memory', binary: engine, argv: [...nested, ...probe(probeBoundMiB(TIGHTER_CLIENT.memoryMiB), { set: { CUDA_MPS_PINNED_DEVICE_MEM_LIMIT: `0=${TIGHTER_CLIENT.memoryMiB}M` } })], deadlineMs: 55000, gpu: true },
+        { case: 'P2', id: 'P2-probe-bypass', binary: engine, argv: [...nested, ...probe(probeBoundMiB(cap), { unset: ['CUDA_MPS_PIPE_DIRECTORY', 'CUDA_MPS_ACTIVE_THREAD_PERCENTAGE', 'CUDA_MPS_PINNED_DEVICE_MEM_LIMIT'] })], deadlineMs: 55000, gpu: true, note: 'No MPS environment: the process uses the GPU outside MPS (Default compute mode)' },
+        { case: 'P3', ...set('P3-save-peer-share', 'hwlfixture/peer', first), action: `Own-share change under the same default (${first.smPercent}% / ${cap} MiB)` },
+        { case: 'P3', ...apply('P3-apply-peer', 'peer'), action: 'Recreates only the peer; the daemon and the probe stay' },
+        { case: 'P3', ...set('P3-raise-default', 'hwlfixture/probe', raised), action: `Raise the server default to ${raised.smPercent}% / ${raisedCap} MiB` },
+        { case: 'P3', ...apply('P3-apply-default-change', 'probe'), action: 'Drains the whole cohort first, then quits the old daemon, starts a new generation and recreates the clients; a host-side timeline samples the order' },
+        { case: 'P3', ...clear('P3-clear-peer', 'hwlfixture/peer') },
+        { case: 'P3', ...apply('P3-apply-clear-peer', 'peer'), action: 'The peer returns to an unshared replacement; the daemon stays' },
+        { case: 'P3', ...clear('P3-clear-final', 'hwlfixture/probe') },
+        { case: 'P3', ...apply('P3-apply-clear-final', 'probe'), action: 'Final share cleared: drain, quit, verify, unshared replacement without MPS env/bind/label' },
+        { case: 'P3', ...set('P3-reshare', 'hwlfixture/probe', first) },
+        { case: 'P3', ...apply('P3-apply-reshare', 'probe') },
+        { case: 'P3', id: 'P3-host-clear', binary: node, argv: [profile.candidate.path, 'limits', 'clear', '--agent', 'hwlfixture/probe'], cwd: plan(run).workspace.path, env: {}, deadlineMs: 120000, gpu: true },
+        { case: 'P3', id: 'P3-restart-agent', binary: node, argv: [profile.candidate.path, ...ports, 'restart', 'hwlfixture/probe'], cwd: plan(run).workspace.path, env: {}, deadlineMs: 600000, gpu: true, note: 'An ordinary restart after the host clear: the final-share shutdown logic runs' },
+        { case: 'P3', id: 'P3-crash-setup', action: 'Share both clients again (one Apply of the probe and the peer)', gpu: true },
+        { case: 'P3', id: 'P3-kill-owned-daemon', binary: engine, argv: [...core, 'node', '-e', '<MPS_KILL_OWNED_DAEMON>', '<DAEMON_BOX_PID>', '<DAEMON_START_TIME>'], deadlineMs: 20000, gpu: true, note: 'SIGKILL of the one owned MPS control daemon, only after the host (boot ID, host PID, start time, /ploinky/core under the exact Box, UID) and the Box (state file, /proc start time, UID, executable identity, cgroup, pipe environment) both prove it. Nothing else is signalled; CPU agents are not restarted.' },
+        { case: 'P3', ...apply('P3-apply-recover', 'probe'), action: 'Recovery: rebuild the generation and recreate the cohort' },
+        { case: 'P4', ...gate('P4-gate') },
+        { case: 'P4', id: 'P4-holder', binary: engine, argv: [...nested, 'container', 'exec', '<PROBE_ID>', 'python3', '-c', '<HOLDER>'], deadlineMs: 180000, gpu: true, note: 'Holds one CUDA context (one MPS client) so the daemon has a server to name; aborted by the runner at the end' },
+        { case: 'P4', ...helper(true) }, { case: 'P4', ...helper(false) },
+        { case: 'P4', ...control('P4-control-rw-list', 'get_server_list') },
+        { case: 'P4', ...control('P4-control-rw-sm', 'get_default_active_thread_percentage') },
+        { case: 'P4', ...control('P4-control-rw-memory', 'get_default_device_pinned_mem_limit 0') },
+        { case: 'P4', ...control('P4-control-rw-widen-sm', 'set_active_thread_percentage <SERVER_PID> 100'), note: 'The documented best-effort limitation: a same-UID client can widen the server' },
+        { case: 'P4', ...control('P4-control-rw-set-memory', 'set_device_pinned_mem_limit <SERVER_PID> 0 64M') },
+        { case: 'P4', ...control('P4-control-ro-list', 'get_server_list'), note: 'The read-only pipe: the connection result is recorded' },
+        { case: 'P4', id: 'P4-probe-after-sm-mutation', binary: engine, argv: [...nested, ...probe(probeBoundMiB(cap), { set: { CUDA_MPS_ACTIVE_THREAD_PERCENTAGE: '100' } })], deadlineMs: 55000, gpu: true },
+        { case: 'P4', id: 'P4-helper-remove', binary: engine, argv: [...nested, 'container', 'rm', '--force', '<HELPER_ID>'], deadlineMs: 60000, gpu: true, note: 'By exact recorded identity, after its name and run label are re-proved' },
+        { case: 'P4', ...clear('P4-reconcile-clear', 'hwlfixture/probe') },
+        { case: 'P4', ...apply('P4-reconcile-apply-clear', 'probe'), action: 'Reconcile: drain and quit the test daemon' },
+        { case: 'P4', ...set('P4-reconcile-share', 'hwlfixture/probe', first) },
+        { case: 'P4', ...apply('P4-reconcile-apply-share', 'probe'), action: 'A fresh daemon with the configured defaults' },
+        { case: 'P4', id: 'P4-probe-after-reconcile', binary: engine, argv: [...nested, ...probe(probeBoundMiB(cap))], deadlineMs: 55000, gpu: true, note: 'One more probe shows the share is not widened' },
+        { case: 'cleanup', id: 'gpu-final-observation', binary: gpu.smi.path, argv: gpuQueryArgv(uuid), deadlineMs: 30000, gpu: true, note: 'After the Box is destroyed: none of the runner\'s registered GPU processes may remain' },
+    ];
+    const gateChecks = [
+        [`\`${gpu.smi.path} ${gpuQueryArgv(uuid).join(' ')}\` exits 0 within 30 s with at most 1 MiB of output`, 'a query error blocks'],
+        ['the XML parses strictly: one gpu element, no entity, CDATA or ampersand, exactly one uuid and compute_mode, one fb_memory_usage', 'malformed or unsupported output blocks'],
+        [`the UUID is \`${uuid}\` and the total memory is ${gpu.memoryMiB} MiB`, 'another device blocks'],
+        ['the compute mode is Default', 'any other mode blocks; the runner never changes it'],
+        ['the process list is supported (no N/A) and, for the initial gate, empty: no compute, graphics or MPS process at all', 'an unsupported inventory or any process blocks'],
+        ['before EVERY later GPU operation the query is repeated; a listed PID is excluded only if it is a registered owned MPS server (a child of the registered owned daemon in the Box\'s /ploinky/core) or client (inside a registered owned agent leaf) and its tuple is freshly verified: host boot ID, host PID, process start time, cgroup beneath the exact Box scope libpod-<BOX_ID>', 'a bare PID, UID or name never excludes; a changed tuple blocks'],
+        ['free GPU memory covers the probe bound plus 1 GiB before each CUDA probe', 'less blocks'],
+        ['during a probe the gate re-queries every 2 s', 'a foreign process aborts the probe command, trips the gate (no later GPU operation starts) and the case is BLOCKED; owned clients are stopped only by cleanup'],
+        ['the runner never changes the compute mode and never signals a foreign process', 'the only signal it can send is the owned-daemon kill of P3, after both layers prove the identity'],
+    ];
+    return { operations, gateChecks, commands: operations.filter(entry => entry.argv && entry.case !== 'provision' && entry.case !== 'cleanup').map(({ case: caseId, gpu: isGpu, ...entry }) => ({ ...entry, note: `${caseId}${isGpu ? ' (GPU operation)' : ''}${entry.note ? `: ${entry.note}` : ''}` })) };
+}
+const plan = run => run.target.execution.provision;
 
 export function renderSummary(run, manifestPath) {
     const profile = run.target.execution;
@@ -286,6 +411,7 @@ export function renderSummary(run, manifestPath) {
         '| --- | --- |',
         ...commands,
         '',
+        ...(profile.gpu ? gpuSummary(run) : []),
         '## Cleanup',
         '',
         line('Cleanup runs in a finally block after `live`, after any provisioning failure, and as the standalone `cleanup` action. It is journaled in the manifest and resumes from it after a crash. Order: ',
@@ -299,6 +425,55 @@ export function renderSummary(run, manifestPath) {
         '',
     ];
     return lines.filter(value => value !== null).join('\n');
+}
+
+// The extra approval sections of the GPU block: the idle-gate checks, every
+// GPU operation, the images, tools and digests, and the grant and policy records.
+function gpuSummary(run) {
+    const profile = run.target.execution;
+    const gpu = profile.gpu;
+    const { operations, gateChecks } = gpuPlan(run);
+    const instance = run.workspace.instance;
+    const cell = value => String(value).replaceAll('|', '\\|');
+    const text = entry => (entry.argv ? `\`${[entry.binary, ...entry.argv].map(word => (word === profile.engine.path ? '$ENGINE' : word)).join(' ').replaceAll('|', '\\|')}\`` : cell(entry.action || ''));
+    return [
+        '## GPU idle gate',
+        '',
+        `The device is ${gpu.name} (\`${gpu.uuid}\`, ${gpu.memoryMiB} MiB, driver ${gpu.driverVersion}). Compute mode is never changed; nothing here is a reservation against another operator.`,
+        '',
+        '| Check | If it fails |',
+        '| --- | --- |',
+        ...gateChecks.map(([check, fails]) => `| ${cell(check)} | ${cell(fails)} |`),
+        '',
+        '## GPU operations',
+        '',
+        'Every GPU-relevant operation, in order. Each one after the first is preceded by the idle gate above. Identities known only at run time are placeholders.',
+        '',
+        '| Case | Operation | Command or action |',
+        '| --- | --- | --- |',
+        ...operations.map(entry => `| ${entry.case} | ${cell(entry.id)} | ${text(entry)}${entry.note ? ` (${cell(entry.note)})` : ''} |`),
+        '',
+        '## Images, tools and digests',
+        '',
+        '| Item | Identity |',
+        '| --- | --- |',
+        `| Fixture image (probe, peer, cpu and the control helper) | \`${profile.provision.image}\` (non-root image user 1000:1000; python3 and ctypes) |`,
+        `| Box image | \`${profile.provision.boxImage}\` |`,
+        `| nvidia-smi | \`${gpu.smi.path}\` ${gpu.smi.digest} |`,
+        `| nvidia-cuda-mps-control | \`${gpu.mpsControl.path}\` ${gpu.mpsControl.digest} |`,
+        `| nvidia-cuda-mps-server | \`${gpu.mpsServer.path}\` ${gpu.mpsServer.digest} |`,
+        `| CUDA probe (mpsprobe.py) | \`${gpu.probe.sourcePath}\` ${gpu.probe.digest}, staged at /code/mpsprobe.py in the probe agent |`,
+        '',
+        '## Grant and policy records',
+        '',
+        '| Record | Created by | Removed by cleanup |',
+        '| --- | --- | --- |',
+        `| \`~/.ploinky-box/gpu-grants/${instance}.json\` and \`~/.ploinky-box/gpu-grants/${instance}/\` | \`gpu grant\` and the Box start | yes, only when recorded |`,
+        `| \`~/.ploinky-box/hardware-limits/${instance}.json\` and \`~/.ploinky-box/hardware-limits/${instance}/\` (the gate record and the policy store holding the saved shares) | the start and the Apply path | yes, only when recorded |`,
+        `| \`~/.ploinky-box/router-bindings/${instance}[.json]\` | the start | yes, only when recorded |`,
+        '| the parent directories of the three | pre-existing on the host (\`gpu-grants\` already exists and stays) | only a parent this run created, and only while empty |',
+        '',
+    ];
 }
 
 // The summary beside a run manifest carries the configured document suffix

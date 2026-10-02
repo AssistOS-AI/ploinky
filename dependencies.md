@@ -167,5 +167,9 @@ The test-only live verification runner (`tests/hardware-limits/verify.mjs`
 It uses the operator's existing Podman, `git` to freeze the committed
 candidate and, for apparatus blocks, the system OpenSSH client with a pinned
 known-hosts file; on the remote host it runs only the pinned Node.js and
-`mkdir`, `dd`, `chmod`, `stat`, `cat`, `sha256sum`, `tar` and `rm`. Each
-action needs its own separate execution-time authorization binding.
+`mkdir`, `dd`, `chmod`, `stat`, `cat`, `sha256sum`, `tar` and `rm`. The
+`apparatus-mps` block additionally runs the pinned host `nvidia-smi` as a
+read-only XML query (the GPU idle gate) and reads the host's `/proc` and cgroup
+tree; it never changes the compute mode and signals only the one MPS daemon of
+its own Box, after proving it. Each action needs its own separate
+execution-time authorization binding.

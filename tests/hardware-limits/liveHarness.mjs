@@ -19,6 +19,8 @@ import { stageAndDispatch } from './liveStage.mjs';
 import {
     CORE_LAYOUT, MEMBERSHIP as PROCESS_MEMBERSHIP, HELD_ALLOCATION, ALLOCATION_HANDSHAKE, LEAF_OBSERVATION, assertCoreLayout,
 } from './liveCaseCommands.mjs';
+import { createGpuCases } from './liveGpuCases.mjs';
+import { validateGpuProfile } from './liveGpuCommands.mjs';
 
 export const LIVE_CASES = Object.freeze({
     'mac-cpu': ['LIVE-C1', 'LIVE-C2', 'LIVE-C3', 'LIVE-C4', 'LIVE-C5', 'LIVE-C6', 'LIVE-C7'],
@@ -39,10 +41,6 @@ export const UNSUPPORTED = Object.freeze({
     'LIVE-S2': 'Guard-removal and reachability fixture is not implemented.',
     'LIVE-X0': 'Fresh complete Explorer graph readiness inventory is not implemented.',
     'LIVE-X1': 'Fresh browser account, UI mutation and screenshot fixture is not implemented.',
-    'LIVE-P1': 'Remote provisioning, actual UID mapping and driver readback qualification are not implemented.',
-    'LIVE-P2': 'Owned live CUDA SM/VRAM and bypass fixture is not implemented.',
-    'LIVE-P3': 'Actual daemon crash/drain/restart cohort fixture is not implemented.',
-    'LIVE-P4': 'Owned writable-pipe control helper fixture is not implemented.',
     'LIVE-L1': 'Fresh model-data, runner and browser inference fixture is not implemented.',
     'LIVE-L2': 'Live model stop/replacement/refusal fixture is not implemented.',
     'LIVE-L3': 'Actual vLLM denominator and pinned model qualification fixture is not implemented.',
@@ -58,12 +56,13 @@ export const LIVE_ACTIONS = Object.freeze(['provision', 'live', 'cleanup']);
 export function validateProfile(run, { partial = false } = {}) {
     validateRunManifest(run);
     const profile = run.target.execution;
-    keys(profile, ['protocol', 'host', 'node', 'candidate', 'engine', 'source', 'workspace', 'box', 'agents', 'cases'], 'execution profile', ['fixtures', 'provision']);
+    keys(profile, ['protocol', 'host', 'node', 'candidate', 'engine', 'source', 'workspace', 'box', 'agents', 'cases'], 'execution profile', ['fixtures', 'provision', 'gpu']);
     if (profile.fixtures !== undefined) {
-        keys(profile.fixtures, [], 'fixtures', ['cpu']);
-        if (profile.fixtures.cpu !== undefined) {
-            keys(profile.fixtures.cpu, ['ref'], 'CPU fixture');
-            if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(profile.fixtures.cpu.ref)) throw new Error('Invalid CPU fixture reference');
+        keys(profile.fixtures, [], 'fixtures', ['cpu', 'gpu']);
+        for (const name of ['cpu', 'gpu']) {
+            if (profile.fixtures[name] === undefined) continue;
+            keys(profile.fixtures[name], ['ref'], `${name} fixture`);
+            if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(profile.fixtures[name].ref)) throw new Error(`Invalid ${name} fixture reference`);
         }
     }
     if (profile.protocol !== 'owned-fixture-v1') throw new Error('Unsupported execution profile');
@@ -97,14 +96,17 @@ export function validateProfile(run, { partial = false } = {}) {
     for (const agent of profile.agents) {
         keys(agent, ['id', 'created', 'image', 'role'], 'agent');
         if (!ID.test(agent.id) || !ID.test(agent.image.replace(/^sha256:/, '')) || !bounded(agent.created, 128)
-            || !['memory', 'cpu', 'pids'].includes(agent.role) || ids.has(agent.id) || roles.has(agent.role)) throw new Error('Invalid agent identity');
+            || !['memory', 'cpu', 'pids', 'probe', 'peer'].includes(agent.role) || ids.has(agent.id) || roles.has(agent.role)) throw new Error('Invalid agent identity');
         ids.add(agent.id); roles.add(agent.role);
     }
     if (!Array.isArray(profile.cases) || !profile.cases.length || profile.cases.length > 20
         || new Set(profile.cases).size !== profile.cases.length
         || profile.cases.some(id => !LIVE_CASES[run.block].includes(id))) throw new Error('Invalid case selection');
+    const gpuCases = profile.cases.some(id => id.startsWith('LIVE-P'));
+    if (gpuCases || profile.gpu !== undefined) validateGpuProfile(profile);
     if (!partial) {
         if (profile.cases.includes('LIVE-C2') && (profile.agents.length !== 3 || roles.size !== 3)) throw new Error('C2 requires three distinct owned agents');
+        if (gpuCases && !['probe', 'peer', 'cpu'].every(role => roles.has(role))) throw new Error('The GPU cases require the owned probe, peer and cpu agents');
         if (profile.provision && (profile.agents.length !== profile.provision.agents.length
             || profile.provision.agents.some(agent => !roles.has(agent.role)))) throw new Error('Provisioned agents differ from the fixture plan');
         if (run.ownedBoxes.length !== 1) throw new Error('Only one immutable owned Box is supported');
@@ -210,29 +212,38 @@ export const postExitObservation = { windowMs: 2000, intervalMs: 100 };
 export const POST_EXIT_VANISHED = 'The same-leaf cgroup vanished or could not be observed after the pressure process exited, so no post-exit counter evidence exists (the kernel may have killed the agent main process rather than the pressure process)';
 
 export function createLiveAdapter(profile, {
-    processProvider = runBoundedProcess, signal, cleanupSignal, persist = () => {}, run, artifacts = () => {},
+    processProvider = runBoundedProcess, signal, cleanupSignal, persist = () => {}, run, artifacts = () => {}, hostProc, gpuTimings,
 } = {}) {
     const env = candidateEnv(profile);
     // `tolerate` returns a finished command whatever its status, for evidence
     // gathering that must not throw before it has recorded what it saw (a
     // cancelled command is still a transport failure). `capture` names the run
     // artifact that keeps its bounded, redacted stream tails.
-    async function command(kind, binary, args, { deadlineMs = 30000, stress = false, cleanup = false, gate = null, tolerate = false, capture = null } = {}) {
+    // `journal: false` is for read-only observations that a case repeats many
+    // times (the journal is bounded); every mutation stays journaled. `abort`
+    // adds one more cancellation to the block's own (a monitored probe).
+    async function command(kind, binary, args, { deadlineMs = 30000, stress = false, cleanup = false, gate = null, tolerate = false, capture = null, journal = true, abort = null } = {}) {
         assertWorkspace(profile);
         if (['pressure', 'destroy-box'].includes(kind) && liveSourceDigest(profile.source.root) !== profile.source.digest) throw new Error('Candidate source changed');
-        const op = { id: `live-${run.operations.length + 1}`, kind, state: 'intent', resourceIds: [profile.box.id], argvDigest: jsonDigest([binary, ...args]), resultArtifact: null };
-        if (run.operations.length >= 512 || Buffer.byteLength(JSON.stringify(run)) > 190000) throw new Error('Live journal bound exceeded');
-        run.operations.push(op); persist();
-        const result = await processProvider(binary, args, { cwd: profile.workspace.path, env: gate === null ? env : { ...env, PLOINKY_BOX_HARDWARE_LIMITS: gate }, deadlineMs, maxBytes: 65536, signal: cleanup ? cleanupSignal : signal });
-        op.state = 'observed';
-        // Only fixed observation commands return persisted output. Candidate
-        // diagnostics may contain credentials; retain status flags alone.
-        op.result = { status: result.status, signal: result.signal, timedOut: result.timedOut, truncated: result.truncated, cancelled: result.cancelled, errorCode: result.errorCode };
-        persist();
-        if (capture) {
-            try { artifacts(capture, { operation: op.id, kind, ...commandTails(result) }); op.artifact = capture; }
-            catch (error) { op.artifactError = String(error?.message || error).slice(0, 256); }
+        let op = null;
+        if (journal) {
+            op = { id: `live-${run.operations.length + 1}`, kind, state: 'intent', resourceIds: [profile.box.id], argvDigest: jsonDigest([binary, ...args]), resultArtifact: null };
+            if (run.operations.length >= 512 || Buffer.byteLength(JSON.stringify(run)) > 190000) throw new Error('Live journal bound exceeded');
+            run.operations.push(op); persist();
+        }
+        const callSignal = cleanup ? cleanupSignal : (abort ? (signal ? AbortSignal.any([signal, abort]) : abort) : signal);
+        const result = await processProvider(binary, args, { cwd: profile.workspace.path, env: gate === null ? env : { ...env, PLOINKY_BOX_HARDWARE_LIMITS: gate }, deadlineMs, maxBytes: 65536, signal: callSignal });
+        if (op) {
+            op.state = 'observed';
+            // Only fixed observation commands return persisted output. Candidate
+            // diagnostics may contain credentials; retain status flags alone.
+            op.result = { status: result.status, signal: result.signal, timedOut: result.timedOut, truncated: result.truncated, cancelled: result.cancelled, errorCode: result.errorCode };
             persist();
+        }
+        if (capture) {
+            try { artifacts(capture, { operation: op?.id ?? null, kind, ...commandTails(result) }); if (op) op.artifact = capture; }
+            catch (error) { if (op) op.artifactError = String(error?.message || error).slice(0, 256); }
+            if (op) persist();
         }
         if (tolerate && !result.cancelled) return result;
         requireTransport(result, { stress });
@@ -489,10 +500,18 @@ export function createLiveAdapter(profile, {
         if (!pressureSamples.some(sample => counter(sample['memory.events'], 'oom_kill') > oomBaseline) && !post.samples.some(sample => counter(sample['memory.events'], 'oom_kill') > oomBaseline)) throw new Error('No same-leaf pressure OOM evidence');
         return { id: agent.id, leaf, receipt, before, aliveSamples, pressureSamples, postExitSamples: post.samples };
     }
+    // The GPU cases of an apparatus-mps run (liveGpuCases.mjs), built over this
+    // adapter's own journaled commands.
+    const gpu = profile.gpu ? createGpuCases({ profile, run, command, engine, core, nested, inspectBox, safeArtifact, persist, processProvider, env, signal, host: hostProc, timings: gpuTimings }) : null;
     async function cleanup() {
+        // The GPU block first stops its own helpers by exact identity, then the
+        // product cleanup runs, and last the GPU must show none of our processes.
+        // A failure of the last step is a cleanup failure, never erased.
+        if (gpu) { try { await gpu.beforeCleanup(); } catch (error) { run.cleanup.failures.push(`GPU pre-cleanup: ${String(error?.message || error).slice(0, 200)}`); } }
         await runOwnedCleanup({ run, profile, persist, processProvider, signal: cleanupSignal });
+        if (gpu) await gpu.afterCleanup();
     }
-    return { cpuCase, coreCase, swapCase, cleanup, inspectBox };
+    return { cpuCase, coreCase, swapCase, cleanup, inspectBox, gpu };
 }
 
 // Every fixture agent carries memory, cpu and pids limits (inspectAgent), so
@@ -512,6 +531,12 @@ function pinProblem(run, profile, hostIdentity, remoteArrival) {
     for (const name of ['node', 'candidate', 'engine']) {
         const file = profile[name];
         if (fs.realpathSync(file.path) !== file.path || digest(fs.readFileSync(file.path)) !== file.digest) return `${name} executable identity changed`;
+    }
+    // The pinned NVIDIA tools: the query binary and both MPS binaries, by
+    // canonical path and content, before any GPU command.
+    for (const name of ['smi', 'mpsControl', 'mpsServer']) {
+        const file = profile.gpu?.[name];
+        if (file && (fs.realpathSync(file.path) !== file.path || digest(fs.readFileSync(file.path)) !== file.digest)) return `NVIDIA tool ${name} identity changed`;
     }
     return null;
 }
@@ -542,7 +567,7 @@ export async function executeCleanupRun({ run, persist = () => {}, processProvid
 
 export async function executeLiveRun({ run, action = 'live', persist = () => {}, processProvider = runBoundedProcess, signal,
     remoteArrival = false, artifacts = () => {},
-    hostIdentity = defaultHostIdentity(),
+    hostIdentity = defaultHostIdentity(), hostProc, gpuTimings,
 } = {}) {
     if (action === 'cleanup') return executeCleanupRun({ run, persist, processProvider, signal, remoteArrival, hostIdentity });
     const selected = run.target.execution?.cases || LIVE_CASES[run.block];
@@ -553,22 +578,28 @@ export async function executeLiveRun({ run, action = 'live', persist = () => {},
     if (run.cleanup.state !== 'not-started') { report.limitations.push('Cleanup has already started for this run; provision a new one'); return report; }
     const problem = pinProblem(run, profile, hostIdentity, remoteArrival);
     if (problem) { report.limitations.push(problem); return report; }
-    if (!selected.some(id => ['LIVE-C1', 'LIVE-C2', 'LIVE-A1'].includes(id))) {
+    if (!selected.some(id => ['LIVE-C1', 'LIVE-C2', 'LIVE-A1', 'LIVE-P1', 'LIVE-P2', 'LIVE-P3', 'LIVE-P4'].includes(id))) {
         report.limitations.push('Selected cases have no implemented live executor'); return report;
     }
     if (liveSourceDigest(profile.source.root) !== profile.source.digest) { report.limitations.push('Candidate source changed'); return report; }
     assertWorkspace(profile);
     const blockController = new AbortController();
     const cleanupController = new AbortController();
-    const blockTimer = setTimeout(() => blockController.abort(), 20 * 60 * 1000);
+    // The block deadline recorded in the manifest (the GPU block needs longer
+    // than the CPU ones); an unrecorded or out-of-range value keeps 20 minutes.
+    const blockMs = Number.isInteger(run.deadlines?.blockMs) && run.deadlines.blockMs >= 60000 && run.deadlines.blockMs <= 1500000 ? run.deadlines.blockMs : 20 * 60 * 1000;
+    const blockTimer = setTimeout(() => blockController.abort(), blockMs);
     const blockSignal = signal ? AbortSignal.any([signal, blockController.signal]) : blockController.signal;
-    const adapter = createLiveAdapter(profile, { processProvider, signal: blockSignal, cleanupSignal: cleanupController.signal, persist, run, artifacts });
+    const adapter = createLiveAdapter(profile, { processProvider, signal: blockSignal, cleanupSignal: cleanupController.signal, persist, run, artifacts, hostProc, gpuTimings });
     let attempted = false; let activeCase = null;
     try {
         if (action !== 'cleanup') {
             run.state = 'running'; persist();
             await adapter.inspectBox(); attempted = true;
-            const executors = { 'LIVE-C1': adapter.coreCase, 'LIVE-C2': adapter.cpuCase, 'LIVE-A1': adapter.swapCase };
+            const executors = {
+                'LIVE-C1': adapter.coreCase, 'LIVE-C2': adapter.cpuCase, 'LIVE-A1': adapter.swapCase,
+                ...(adapter.gpu ? { 'LIVE-P1': adapter.gpu.liveP1, 'LIVE-P2': adapter.gpu.liveP2, 'LIVE-P3': adapter.gpu.liveP3, 'LIVE-P4': adapter.gpu.liveP4 } : {}),
+            };
             for (const id of selected) {
                 activeCase = id;
                 if (!executors[id]) continue;
