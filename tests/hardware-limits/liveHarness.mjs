@@ -9,7 +9,10 @@ import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { EXIT, validateRunManifest, writePrivateJson } from './fixtures.mjs';
 import { runBoundedProcess, requireTransport } from './liveProcess.mjs';
 import { dispatchRemoteRun, assertRemoteArrival } from './liveRemote.mjs';
-import { CORE_LAYOUT, MEMBERSHIP as PROCESS_MEMBERSHIP, HELD_ALLOCATION, ALLOCATION_HANDSHAKE, LEAF_OBSERVATION, assertCoreLayout } from './liveCaseCommands.mjs';
+import {
+    CORE_LAYOUT, MEMBERSHIP as PROCESS_MEMBERSHIP, HELD_ALLOCATION, ALLOCATION_HANDSHAKE, LEAF_OBSERVATION, assertCoreLayout,
+    preparationClaim, preparationReportArgs,
+} from './liveCaseCommands.mjs';
 
 export const LIVE_CASES = Object.freeze({
     'mac-cpu': ['LIVE-C1', 'LIVE-C2', 'LIVE-C3', 'LIVE-C4', 'LIVE-C5', 'LIVE-C6', 'LIVE-C7'],
@@ -280,7 +283,15 @@ export function createLiveAdapter(profile, {
         await inspectBox();
         await command('repeat-saved-gate-start', profile.node.path, [profile.candidate.path, 'start', fixture.ref], { deadlineMs: 1200000 });
         await inspectBox();
-        const layout = assertCoreLayout(checkedJson(await engine('core-layout', [...core, 'node', '-e', CORE_LAYOUT])));
+        // The claimed enforceable controllers come from production's own root
+        // preparation report, never from the CORE_LAYOUT observation below:
+        // the host does not record the report it receives at start, and
+        // ploinky limits status does not observe in-Box preparation. This is
+        // the exact fixed command production runs; preparationClaim accepts
+        // only already:true, which production reports only for a layout and
+        // controller state it found settled and did not change.
+        const preparation = preparationClaim((await engine('preparation-report', preparationReportArgs(profile.box.id))).stdout);
+        const layout = assertCoreLayout(checkedJson(await engine('core-layout', [...core, 'node', '-e', CORE_LAYOUT])), preparation);
         const agents = [];
         for (const agent of profile.agents) {
             const current = await inspectAgent(agent);
@@ -293,7 +304,7 @@ export function createLiveAdapter(profile, {
             const limits = checkedJson(await engine('leaf-observer', [...core, 'node', '-e', LEAF_OBSERVATION, leaf])); requireLeafLimits(limits);
             agents.push({ id: agent.id, workload, conmon, limits });
         }
-        return { layout, agents, omittedGateRetained: true };
+        return { preparation, layout, agents, omittedGateRetained: true };
     }
     async function swapCase() {
         const agent = profile.agents.find(value => value.role === 'memory');

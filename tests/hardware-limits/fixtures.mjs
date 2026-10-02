@@ -327,6 +327,14 @@ export function buildRequiredCaseManifest() {
             'CG.pid1-and-self-moved', 'CG.root-busy', 'CG.partial-retry', 'CG.idempotent-core-self',
             'CG.empty-controller-structural-success',
         ]),
+        ...leaves(P, 'p1', unit('hardwareLimitsLiveHarness.test.mjs'), [
+            'HLIVE.C1-core-conmon-and-persisted-gate', 'C1.layout-full-controllers-pass', 'C1.layout-partial-controllers-pass',
+            'C1.observer-records-delegation-files-and-absence', 'C1.layout-root-owned-delegation-files-rejected',
+            'C1.layout-root-owned-cgroup-threads-rejected', 'C1.layout-missing-cgroup-threads-rejected',
+            'C1.layout-empty-subtree-control-rejected', 'C1.layout-claimed-controller-missing-rejected',
+            'C1.layout-mode-without-owner-write-rejected', 'C1.layout-nonroot-root-or-core-procs-rejected',
+            'C1.layout-reviewer-delegated-root-owned-files-rejected', 'C1.preparation-claim-is-production-report',
+        ]),
         ...leaves(P, 'p1', unit('hardwareLimitsDelegation.test.mjs'), [
             'DG.no-aggregate-write', 'DG.nonroot-parents', 'DG.runtime-contexts', 'DG.outer-inspect-runtime',
             'DG.helper-complete-flags', 'DG.helper-proof', 'DG.helper-peak-after-probe-before-cleanup',
