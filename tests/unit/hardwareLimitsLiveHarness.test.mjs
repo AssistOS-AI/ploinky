@@ -22,7 +22,7 @@ import { engineIdentityDigest } from '../hardware-limits/liveCommon.mjs';
 import { fakeEngineInfo, unsupportedFormat } from '../hardware-limits/fakeLiveEngine.mjs';
 import {
     assertWorkspace, executeLiveRun, jsonDigest, readPrivateJson, runLiveCommand,
-    validateAuthorization, validateExecutionProfile, liveSourceDigest,
+    validateAuthorization, validateExecutionProfile, liveSourceDigest, postExitObservation, POST_EXIT_VANISHED,
 } from '../hardware-limits/liveHarness.mjs';
 
 const hash = bytes => `sha256:${crypto.createHash('sha256').update(bytes).digest('hex')}`;
@@ -378,6 +378,114 @@ test('HLIVE.A1-held-allocation-swap-before-pressure', async t => {
     assert.equal(report.verdict,'PASS',JSON.stringify(report));
     assert.equal(report.cases[0].evidence.aliveSamples.length,3);assert.equal(released,true);
 });
+
+// O10: the kernel can report a kill after the pressure or allocation process
+// has exited, so the leaf is observed again once the process settles.
+function withShortPostExit(fn) {
+    return async t => {
+        const saved = { ...postExitObservation };
+        postExitObservation.windowMs = 300; postExitObservation.intervalMs = 20;
+        try { await fn(t); } finally { Object.assign(postExitObservation, saved); }
+    };
+}
+// A1 provider: the counter follows the allocation process exit state.
+function a1ProviderAfterExit(f, { counterAfterExit = true, vanishAfterExit = false } = {}) {
+    let released = false; let exited = false; let finishAllocation;
+    return async (binary, args, options) => {
+        if (args.includes(PROCESS_MEMBERSHIP)) return ok(JSON.stringify({ pid: 123, start: '100', cgroup: '0::/ploinky/agents/task\n' }));
+        if (args.includes(HELD_ALLOCATION)) return new Promise(resolve => { finishAllocation = () => { exited = true; resolve({ ...ok(''), status: 137 }); }; });
+        if (args.includes(ALLOCATION_HANDSHAKE)) { if (args.at(-1) === 'release') released = true; return ok(JSON.stringify({ pid: 789, bytes: 16777216 })); }
+        const result = await f.provider(binary, args, options);
+        if (args.some(value => value.includes('const names='))) {
+            if (vanishAfterExit && exited) return { ...ok(''), status: 1 };
+            const sample = JSON.parse(result.stdout);
+            sample['memory.current'] = '33554432'; sample['memory.swap.current'] = '0';
+            sample['memory.events'] = `oom_kill ${counterAfterExit && exited ? 1 : 0}\n`;
+            result.stdout = JSON.stringify(sample);
+            if (released && !exited) setTimeout(finishAllocation, 2);
+        }
+        return result;
+    };
+}
+function a1Fixture(t) { const f = fixture(t); f.run.block = 'apparatus-cpu'; f.profile.cases = ['LIVE-A1']; return f; }
+
+test('HLIVE.A1-oom-counter-moving-only-after-the-allocation-exits-passes', withShortPostExit(async t => {
+    const f = a1Fixture(t);
+    const report = await executeLiveRun({ run: f.run, hostIdentity: f.profile.host, processProvider: a1ProviderAfterExit(f) });
+    assert.equal(report.verdict, 'PASS', JSON.stringify(report));
+    const evidence = report.cases[0].evidence;
+    assert.ok(evidence.postExitSamples.length >= 1, 'post-exit samples are part of the evidence');
+    assert.ok(evidence.pressureSamples.every(sample => sample['memory.events'] === 'oom_kill 0\n'), 'no in-flight sample saw the kill');
+    assert.equal(evidence.postExitSamples.at(-1)['memory.events'], 'oom_kill 1\n');
+}));
+
+test('HLIVE.A1-oom-counter-never-moving-fails-with-the-same-message', withShortPostExit(async t => {
+    const f = a1Fixture(t);
+    const report = await executeLiveRun({ run: f.run, hostIdentity: f.profile.host, processProvider: a1ProviderAfterExit(f, { counterAfterExit: false }) });
+    assert.equal(report.verdict, 'FAIL', JSON.stringify(report));
+    assert.equal(report.cases[0].result, 'fail');
+    assert.equal(report.cases[0].reason, 'No same-leaf pressure OOM evidence');
+}));
+
+test('HLIVE.A1-leaf-vanishing-after-exit-is-a-distinct-recorded-failure', withShortPostExit(async t => {
+    const f = a1Fixture(t);
+    const report = await executeLiveRun({ run: f.run, hostIdentity: f.profile.host, processProvider: a1ProviderAfterExit(f, { vanishAfterExit: true }) });
+    assert.equal(report.verdict, 'FAIL', JSON.stringify(report));
+    assert.equal(report.cases[0].result, 'fail');
+    assert.equal(report.cases[0].reason, POST_EXIT_VANISHED);
+    assert.match(report.cases[0].evidence.leafVanished, /Live command failed/);
+    assert.ok(Array.isArray(report.cases[0].evidence.aliveSamples) && report.cases[0].evidence.aliveSamples.length === 3, 'the evidence so far is kept');
+}));
+
+// C2: the same for the cpu case (memory oom_kill, cpu nr_throttled, pids max).
+function c2ProviderAfterExit(f, { counterAfterExit = true, vanishAfterExit = false } = {}) {
+    let exited = false;
+    return async (binary, args, options) => {
+        const script = args.includes('-e') ? args[args.indexOf('-e') + 1] : null;
+        const observer = script?.includes('const names=');
+        const membership = script?.includes('const pid=');
+        if (observer && vanishAfterExit && exited) return { ...ok(''), status: 1 };
+        const result = await f.provider(binary, args, options);
+        if (membership) exited = false;
+        if (observer) {
+            const sample = JSON.parse(result.stdout);
+            const value = counterAfterExit && exited ? 1 : 0;
+            sample['memory.events'] = `oom_kill ${value}\n`; sample['cpu.stat'] = `nr_throttled ${value}\n`; sample['pids.events'] = `max ${value}\n`;
+            result.stdout = JSON.stringify(sample);
+        } else if (args.includes('exec') && script && !membership) exited = true;
+        return result;
+    };
+}
+
+test('HLIVE.C2-counter-moving-only-after-the-pressure-exits-passes', withShortPostExit(async t => {
+    const f = fixture(t);
+    const report = await executeLiveRun({ run: f.run, hostIdentity: f.profile.host, processProvider: c2ProviderAfterExit(f) });
+    const row = report.cases.find(value => value.id === 'LIVE-C2');
+    assert.equal(row.result, 'pass', JSON.stringify(report));
+    assert.equal(row.evidence.length, 3);
+    for (const entry of row.evidence) {
+        assert.ok(entry.postExitSamples.length >= 1, entry.role);
+        assert.ok(entry.samples.every(sample => /(oom_kill|nr_throttled|max) 0\n/.test(sample['memory.events'] + sample['cpu.stat'] + sample['pids.events'])), entry.role);
+    }
+}));
+
+test('HLIVE.C2-counter-never-moving-fails-with-the-same-message', withShortPostExit(async t => {
+    const f = fixture(t);
+    const report = await executeLiveRun({ run: f.run, hostIdentity: f.profile.host, processProvider: c2ProviderAfterExit(f, { counterAfterExit: false }) });
+    const row = report.cases.find(value => value.id === 'LIVE-C2');
+    assert.equal(row.result, 'fail', JSON.stringify(report));
+    assert.equal(row.reason, 'No same-leaf oom_kill delta');
+}));
+
+test('HLIVE.C2-leaf-vanishing-after-exit-is-a-distinct-recorded-failure', withShortPostExit(async t => {
+    const f = fixture(t);
+    const report = await executeLiveRun({ run: f.run, hostIdentity: f.profile.host, processProvider: c2ProviderAfterExit(f, { vanishAfterExit: true }) });
+    const row = report.cases.find(value => value.id === 'LIVE-C2');
+    assert.equal(row.result, 'fail', JSON.stringify(report));
+    assert.equal(row.reason, POST_EXIT_VANISHED);
+    assert.match(row.evidence.leafVanished, /Live command failed/);
+    assert.equal(row.evidence.role, 'memory');
+}));
 
 test('HLIVE.remote-pins-fixed-argv-and-no-fallback', async t => {
     const f=fixture(t);const ssh=path.join(f.root,'ssh');const known=path.join(f.root,'known_hosts');fs.writeFileSync(ssh,'fixture');fs.writeFileSync(known,'fixture public key');

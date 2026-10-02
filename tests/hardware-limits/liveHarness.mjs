@@ -9,7 +9,7 @@ import { EXIT, validateRunManifest, writePrivateJson } from './fixtures.mjs';
 import { runBoundedProcess, requireTransport } from './liveProcess.mjs';
 import { assertRemoteArrival } from './liveRemote.mjs';
 import {
-    HASH, ID, INSPECT, absolute, assertWorkspace, blocked, bounded, candidateEnv, checkedJson, digest, hostRecordPaths,
+    HASH, HOST_RECORD_DIRECTORIES, ID, INSPECT, absolute, assertWorkspace, blocked, bounded, candidateEnv, checkedJson, digest, hostRecordPaths,
     jsonDigest, keys, liveSourceDigest, observeEngineIdentity, receipt,
 } from './liveCommon.mjs';
 import { recordHostRecords, runOwnedCleanup } from './liveCleanup.mjs';
@@ -132,6 +132,7 @@ export function validateExecutionProfile(run) {
 function validateOwnedPaths(run, profile) {
     const instance = profile.box?.instance || run.workspace?.instance;
     const allowedRecords = instance && /^ploinky-box-[a-z0-9-]+-[a-f0-9]{12}$/.test(instance) ? hostRecordPaths(profile.host.home, instance) : [];
+    const allowedDirectories = HOST_RECORD_DIRECTORIES.map(directory => path.join(profile.host.home, '.ploinky-box', directory));
     const seen = new Set();
     for (const entry of run.ownedPaths) {
         if (!entry || seen.has(entry.path)) throw new Error('This executor cannot clean extra recorded processes or paths');
@@ -148,6 +149,12 @@ function validateOwnedPaths(run, profile) {
             keys(entry, ['path', 'role', 'type', 'uid', 'dev', 'ino'], 'owned host record');
             if (!allowedRecords.includes(entry.path) || !['file', 'directory'].includes(entry.type) || !Number.isSafeInteger(entry.uid)
                 || !/^\d+$/.test(entry.dev) || !/^\d+$/.test(entry.ino)) throw new Error('Refusing an unrecorded or non-exact host record');
+        } else if (entry.role === 'host-created-directory') {
+            // A shared host-record directory that did not exist before this
+            // run's start and was created by it (removed only while empty).
+            keys(entry, ['path', 'role', 'type', 'uid', 'dev', 'ino'], 'owned host-created directory');
+            if (!allowedDirectories.includes(entry.path) || entry.type !== 'directory' || !Number.isSafeInteger(entry.uid)
+                || !/^\d+$/.test(entry.dev) || !/^\d+$/.test(entry.ino)) throw new Error('Refusing an unrecorded or non-exact host-created directory');
         } else throw new Error('This executor cannot clean extra recorded processes or paths');
     }
 }
@@ -194,6 +201,13 @@ function requireLeafLimits(leaf) {
         || !cpuMaxMatches(leaf['cpu.max'], FIXTURE_CPUS) || String(leaf['pids.max']).trim() !== '64') throw new Error('Actual leaf limits differ');
 }
 
+// After a pressure or allocation process settles, the leaf is observed again:
+// a kill that lands after the last in-flight sample (the kernel reports it
+// when the process has already exited) is otherwise invisible. The window is
+// bounded; tests shorten it.
+export const postExitObservation = { windowMs: 2000, intervalMs: 100 };
+export const POST_EXIT_VANISHED = 'The same-leaf cgroup vanished after the pressure process exited, so no post-exit counter evidence exists (the kernel may have killed the agent main process rather than the pressure process)';
+
 export function createLiveAdapter(profile, {
     processProvider = runBoundedProcess, signal, cleanupSignal, persist = () => {}, run,
 } = {}) {
@@ -237,6 +251,27 @@ export function createLiveAdapter(profile, {
             || !(nanoCpusMatches(actual.nanoCpus, FIXTURE_CPUS) || cpuQuotaMatches(actual.cpuQuota, actual.cpuPeriod, FIXTURE_CPUS))) throw new Error('Agent inspect limits differ');
         return actual;
     }
+    // Same-leaf observations after the settled process, until the expected
+    // counter moves or the bound passes. Every sample passes the identity and
+    // limits checks. A leaf that vanishes is recorded as evidence and fails
+    // with its own message; it is never skipped.
+    async function observePostExit({ observe, before, field, key, alreadyMoved }) {
+        const baseline = counter(before[field], key);
+        const samples = [];
+        const deadline = Date.now() + postExitObservation.windowMs;
+        let vanished = null;
+        for (;;) {
+            let sample;
+            try { sample = await observe(); } catch (error) { vanished = String(error?.message || error).slice(0, 256); break; }
+            requireLeafLimits(sample);
+            if (jsonDigest(sample.identity) !== jsonDigest(before.identity)) throw new Error('Cgroup leaf identity changed');
+            samples.push(sample);
+            if (alreadyMoved || counter(sample[field], key) > baseline) break;
+            if (Date.now() >= deadline) break;
+            await new Promise(resolve => setTimeout(resolve, postExitObservation.intervalMs));
+        }
+        return { samples, vanished };
+    }
     async function cpuCase() {
         const evidence = [];
         for (const agent of profile.agents) {
@@ -266,8 +301,11 @@ export function createLiveAdapter(profile, {
                 : agent.role === 'cpu' ? ['cpu.stat', 'nr_throttled'] : ['pids.events', 'max'];
             const baseline = counter(before[field], key);
             if (!before.identity?.dev || !before.identity?.ino || samples.some(sample => jsonDigest(sample.identity) !== jsonDigest(before.identity))) throw new Error('Cgroup leaf identity changed');
-            if (!samples.some(sample => counter(sample[field], key) > baseline)) throw new Error(`No same-leaf ${key} delta`);
-            evidence.push({ id: agent.id, created: agent.created, pid: processIdentity.pid, startedAt: processIdentity.startedAt, leafPath, role: agent.role, before, samples, status: result.status, observationError });
+            const identity = { id: agent.id, created: agent.created, pid: processIdentity.pid, startedAt: processIdentity.startedAt, leafPath, role: agent.role };
+            const post = await observePostExit({ observe, before, field, key, alreadyMoved: samples.some(sample => counter(sample[field], key) > baseline) });
+            if (post.vanished) throw Object.assign(new Error(POST_EXIT_VANISHED), { evidence: { ...identity, before, samples, postExitSamples: post.samples, leafVanished: post.vanished, status: result.status, observationError } });
+            if (!samples.some(sample => counter(sample[field], key) > baseline) && !post.samples.some(sample => counter(sample[field], key) > baseline)) throw new Error(`No same-leaf ${key} delta`);
+            evidence.push({ ...identity, before, samples, postExitSamples: post.samples, status: result.status, observationError });
         }
         return evidence;
     }
@@ -354,9 +392,12 @@ export function createLiveAdapter(profile, {
             }
         } finally { await allocation; }
         if (!released || aliveSamples.length < 3) throw new Error('No live touched-allocation handshake evidence');
-        if (pressureSamples.some(sample => jsonDigest(sample.identity) !== jsonDigest(before.identity))
-            || !pressureSamples.some(sample => counter(sample['memory.events'], 'oom_kill') > counter(before['memory.events'], 'oom_kill'))) throw new Error('No same-leaf pressure OOM evidence');
-        return { id: agent.id, leaf, receipt, before, aliveSamples, pressureSamples };
+        if (pressureSamples.some(sample => jsonDigest(sample.identity) !== jsonDigest(before.identity))) throw new Error('No same-leaf pressure OOM evidence');
+        const oomBaseline = counter(before['memory.events'], 'oom_kill');
+        const post = await observePostExit({ observe, before, field: 'memory.events', key: 'oom_kill', alreadyMoved: pressureSamples.some(sample => counter(sample['memory.events'], 'oom_kill') > oomBaseline) });
+        if (post.vanished) throw Object.assign(new Error(POST_EXIT_VANISHED), { evidence: { id: agent.id, leaf, receipt, before, aliveSamples, pressureSamples, postExitSamples: post.samples, leafVanished: post.vanished } });
+        if (!pressureSamples.some(sample => counter(sample['memory.events'], 'oom_kill') > oomBaseline) && !post.samples.some(sample => counter(sample['memory.events'], 'oom_kill') > oomBaseline)) throw new Error('No same-leaf pressure OOM evidence');
+        return { id: agent.id, leaf, receipt, before, aliveSamples, pressureSamples, postExitSamples: post.samples };
     }
     async function cleanup() {
         await runOwnedCleanup({ run, profile, persist, processProvider, signal: cleanupSignal });

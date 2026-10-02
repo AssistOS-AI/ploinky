@@ -585,6 +585,49 @@ test('L1.cleanup-removes-exact-recorded-host-records', async t => {
     for (const target of neighbours) assert.equal(fs.readFileSync(target, 'utf8'), 'keep');
 });
 
+// O11: a shared host-record directory the run created is removed once empty;
+// one that existed before the run, or that holds anything else, is kept.
+test('L1.cleanup-removes-the-host-record-directory-this-run-created-when-empty', async t => {
+    const w = world(t);
+    const directory = path.join(w.home, '.ploinky-box', 'hardware-limits');
+    assert.equal(exists(directory), false, 'the directory is absent before the run');
+    assert.equal(exists(path.join(w.home, '.ploinky-box')), false);
+    const report = await provision(w);
+    assert.equal(report.verdict, 'PASS', JSON.stringify(report.limitations));
+    assert.equal(exists(directory), true, 'the start created it');
+    const preflight = w.run.operations.filter(op => op.kind === 'host-directory-preflight');
+    assert.deepEqual(preflight.map(op => [op.directory, op.existed]), [['hardware-limits', false], ['gpu-grants', false], ['router-bindings', false]]);
+    const created = w.run.ownedPaths.filter(entry => entry.role === 'host-created-directory');
+    assert.deepEqual(created.map(entry => entry.path), [directory], 'only the directory that exists now is recorded');
+    const result = await cleanup(w);
+    assert.equal(result.verdict, 'PASS', JSON.stringify(w.run.cleanup));
+    assert.equal(exists(directory), false, 'the run-created, now empty directory is removed');
+    assert.equal(exists(path.join(w.home, '.ploinky-box')), true, 'the shared parent is never removed');
+});
+
+test('L1.cleanup-keeps-a-host-record-directory-that-existed-before-the-run', async t => {
+    const w = world(t);
+    const directory = path.join(w.home, '.ploinky-box', 'hardware-limits');
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const report = await provision(w);
+    assert.equal(report.verdict, 'PASS', JSON.stringify(report.limitations));
+    assert.deepEqual(w.run.operations.filter(op => op.kind === 'host-directory-preflight').map(op => [op.directory, op.existed]), [['hardware-limits', true], ['gpu-grants', false], ['router-bindings', false]]);
+    assert.equal(w.run.ownedPaths.some(entry => entry.role === 'host-created-directory'), false);
+    const result = await cleanup(w);
+    assert.equal(result.verdict, 'PASS', JSON.stringify(w.run.cleanup));
+    assert.equal(exists(directory), true, 'a pre-existing directory is kept even though it is empty');
+    assert.deepEqual(fs.readdirSync(directory), []);
+});
+
+test('L1.cleanup-keeps-a-run-created-host-record-directory-that-holds-something-else', async t => {
+    const w = await provisioned(t);
+    const directory = path.join(w.home, '.ploinky-box', 'hardware-limits');
+    fs.writeFileSync(path.join(directory, 'someone-elses.json'), 'keep');
+    const result = await cleanup(w);
+    assert.equal(result.verdict, 'PASS', JSON.stringify(w.run.cleanup));
+    assert.equal(fs.readFileSync(path.join(directory, 'someone-elses.json'), 'utf8'), 'keep');
+});
+
 test('L1.cleanup-refuses-unrecorded-host-record', async t => {
     const w = await provisioned(t);
     const unrecorded = hostRecordPaths(w.home, w.run.workspace.instance).find(target => target.includes('/router-bindings/') && target.endsWith('.json'));

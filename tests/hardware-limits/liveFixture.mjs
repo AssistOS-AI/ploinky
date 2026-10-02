@@ -17,7 +17,7 @@ import { assertBoxWorkspaceRoot } from '../../ploinky-box/contract/workspace-roo
 import { EXIT } from './fixtures.mjs';
 import {
     AGENT_INSPECT, ID, IMAGE_REF, INSPECT, OWNER_MARKER, absolute, blocked, candidateEnv, checkedJson, digest,
-    hostRecordPaths, jsonDigest, keys, liveSourceDigest, observeEngineIdentity, workspaceSocketProblem,
+    HOST_RECORD_DIRECTORIES, hostRecordPaths, jsonDigest, keys, liveSourceDigest, observeEngineIdentity, workspaceSocketProblem,
 } from './liveCommon.mjs';
 import { runBoundedProcess } from './liveProcess.mjs';
 import { createJournal, recordHostRecords, runOwnedCleanup } from './liveCleanup.mjs';
@@ -161,6 +161,14 @@ export async function provisionRun({
         const instance = run.workspace.instance;
         const existing = hostRecordPaths(profile.host.home, instance).filter(target => { try { fs.lstatSync(target); return true; } catch (error) { if (error.code === 'ENOENT') return false; throw error; } });
         if (existing.length) throw blocked('Host state already exists for the proposed workspace instance; it is not task-owned');
+        // Which shared host-record directories exist before this run: one
+        // that is absent now and present after the start was created by it.
+        for (const directory of HOST_RECORD_DIRECTORIES) {
+            const target = path.join(profile.host.home, '.ploinky-box', directory);
+            let existed = true;
+            try { fs.lstatSync(target); } catch (error) { if (error.code !== 'ENOENT') throw error; existed = false; }
+            observed(intent('host-directory-preflight', { directory }), { existed });
+        }
 
         // 1. The workspace, refusing any pre-existing path.
         mutated = true;

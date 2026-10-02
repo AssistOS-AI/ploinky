@@ -10,7 +10,7 @@ import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { requireTransport, runBoundedProcess } from './liveProcess.mjs';
 import {
-    ID, INSPECT, OWNER_MARKER, assertOwnedDirectory, assertWorkspace, boxPsArgv, candidateEnv, checkedJson, hostRecordPaths,
+    HOST_RECORD_DIRECTORIES, ID, INSPECT, OWNER_MARKER, assertOwnedDirectory, assertWorkspace, boxPsArgv, candidateEnv, checkedJson, hostRecordPaths,
     jsonDigest, liveSourceDigest, observeEngineIdentity, quarantinePath,
 } from './liveCommon.mjs';
 
@@ -62,6 +62,19 @@ export function recordHostRecords(run, profile, instance) {
         if (!stat || run.ownedPaths.some(entry => entry.path === target)) continue;
         if (stat.isSymbolicLink() || !(stat.isFile() || stat.isDirectory())) throw new Error(`Unexpected host record kind: ${target}`);
         run.ownedPaths.push({ path: target, role: 'host-record', type: stat.isDirectory() ? 'directory' : 'file', uid: stat.uid, dev: String(stat.dev), ino: String(stat.ino) });
+        changed = true;
+    }
+    // A shared host-record directory that the provisioning preflight saw
+    // absent, and that exists now, was created by this run's candidate
+    // commands: it is recorded so that cleanup can remove it once empty.
+    for (const directory of HOST_RECORD_DIRECTORIES) {
+        const target = path.join(profile.host.home, '.ploinky-box', directory);
+        const absentBefore = run.operations.some(op => op.kind === 'host-directory-preflight' && op.directory === directory && op.existed === false);
+        if (!absentBefore || run.ownedPaths.some(entry => entry.path === target)) continue;
+        const stat = lstatOrNull(target);
+        if (!stat) continue;
+        if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(`Unexpected host record directory kind: ${target}`);
+        run.ownedPaths.push({ path: target, role: 'host-created-directory', type: 'directory', uid: stat.uid, dev: String(stat.dev), ino: String(stat.ino) });
         changed = true;
     }
     return changed;
@@ -229,6 +242,19 @@ export async function runOwnedCleanup({ run, profile, persist = () => {}, proces
             assertRecordedHostRecord(entry, fs.lstatSync(entry.path));
             if (entry.type === 'file') fs.unlinkSync(entry.path);
             else fs.rmSync(entry.path, { recursive: true, force: false });
+        }
+        removeCreatedHostDirectories();
+    }
+
+    // A shared host-record directory this run created is removed only while it
+    // is still the recorded directory and empty; a directory that existed
+    // before the run, or that holds anything now, is never touched.
+    function removeCreatedHostDirectories() {
+        for (const entry of run.ownedPaths.filter(value => value.role === 'host-created-directory')) {
+            const stat = lstatOrNull(entry.path);
+            if (!stat) continue;
+            assertRecordedHostRecord(entry, stat);
+            if (fs.readdirSync(entry.path).length === 0) fs.rmdirSync(entry.path);
         }
     }
 
