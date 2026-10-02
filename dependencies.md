@@ -161,3 +161,11 @@ The optional live GPU probe uses the existing Python 3 standard library ctypes
 to call the installed CUDA driver API. It needs no Python packages and is not a
 runtime dependency. Its driver observations require an authorized isolated GPU
 fixture. Python is PSF-licensed and operator-provided; no interpreter is bundled.
+
+The test-only live verification runner (`tests/hardware-limits/verify.mjs`
+`prepare-live`, `provision`, `live` and `cleanup`) adds no package dependency.
+It uses the operator's existing Podman, `git` to freeze the committed
+candidate and, for apparatus blocks, the system OpenSSH client with a pinned
+known-hosts file; on the remote host it runs only the pinned Node.js and
+`mkdir`, `dd`, `chmod`, `stat`, `cat`, `sha256sum`, `tar` and `rm`. Each
+action needs its own separate execution-time authorization binding.

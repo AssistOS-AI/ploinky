@@ -1,15 +1,19 @@
 // Fixed-command transport. Every POSIX child starts a new owned process group;
 // deadlines terminate that group and have a separate final settlement bound.
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
 import path from 'node:path';
 
+// stdinPath, when given, is one private regular file streamed as the child's
+// standard input (remote staging uploads); otherwise standard input is closed.
 export function runBoundedProcess(binary, args, {
-    cwd, env, deadlineMs = 30000, maxBytes = 65536, signal, spawnProcess = spawn,
+    cwd, env, deadlineMs = 30000, maxBytes = 65536, signal, spawnProcess = spawn, stdinPath = null,
 } = {}) {
     if (!path.isAbsolute(binary) || !path.isAbsolute(cwd || '')
         || !Array.isArray(args) || args.some(value => typeof value !== 'string' || value.includes('\0'))
         || !Number.isInteger(deadlineMs) || deadlineMs < 1 || deadlineMs > 1800000
-        || !Number.isInteger(maxBytes) || maxBytes < 1 || maxBytes > 1048576) throw new Error('Invalid bounded process invocation');
+        || !Number.isInteger(maxBytes) || maxBytes < 1 || maxBytes > 1048576
+        || !(stdinPath === null || (path.isAbsolute(stdinPath) && path.normalize(stdinPath) === stdinPath))) throw new Error('Invalid bounded process invocation');
     if (process.platform === 'win32') throw new Error('Owned process-group transport requires POSIX');
     return new Promise(resolve => {
         let child, timer, killTimer, settlementTimer, groupTimer;
@@ -56,9 +60,15 @@ export function runBoundedProcess(binary, args, {
         };
         const abort = () => { cancelled = true; stop(); };
         if (cancelled) { finish(null, null); return; }
+        let input = 'ignore';
         try {
-            child = spawnProcess(binary, args, { cwd, env, shell: false, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+            if (stdinPath !== null) {
+                input = fs.openSync(stdinPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+                if (!fs.fstatSync(input).isFile()) throw Object.assign(new Error('stdin is not a regular file'), { code: 'STDIN_NOT_FILE' });
+            }
+            child = spawnProcess(binary, args, { cwd, env, shell: false, detached: true, stdio: [input, 'pipe', 'pipe'] });
         } catch (error) { errorCode = error.code || 'SPAWN_ERROR'; finish(null, null); return; }
+        finally { if (typeof input === 'number') fs.closeSync(input); }
         const collect = (name, chunk) => {
             const buffer = Buffer.from(chunk); const remaining = Math.max(0, maxBytes - bytes);
             const value = buffer.subarray(0, remaining).toString('utf8');

@@ -5,9 +5,12 @@
 //   self-test     run the harness self-tests (no container or network activity)
 //   baseline      run scoped existing suites against the baseline staging copies
 //   offline       run one phase's required tests and affected regressions
-//   prepare-live  write a proposed run manifest for one live block (no engine)
-//   live/cleanup  APPROVAL REQUIRED; exact authorization binding and owned
-//                 fixture execution. Unsupported cases remain BLOCKED.
+//   prepare-live  write a proposed run manifest for one live block (no engine
+//                 or SSH); mac-cpu and apparatus-cpu get concrete pins and a
+//                 human approval summary beside the manifest
+//   provision/live/cleanup
+//                 APPROVAL REQUIRED; each needs its own exact authorization
+//                 binding. Unsupported cases remain BLOCKED.
 //
 // Exit codes: PASS=0, FAIL=1, BLOCKED=2, SKIPPED=3. Child processes are
 // spawned with argument arrays, explicit cwd/environment and deadlines.
@@ -18,7 +21,10 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { runBoundedProcess } from './liveProcess.mjs';
 import { fileURLToPath } from 'node:url';
-import { runLiveCommand, LIVE_CASES, UNSUPPORTED } from './liveHarness.mjs';
+import { runLiveCommand, LIVE_CASES, UNSUPPORTED, validateProfile } from './liveHarness.mjs';
+import { liveSourceDigest } from './liveCommon.mjs';
+import { CONCRETE_BLOCKS, buildConcreteManifest, explorerFixtureImage, renderSummary, selectPorts, summaryPathFor, validatePins } from './liveManifest.mjs';
+import { validateStage, writeUstar } from './liveStage.mjs';
 
 import {
     EXIT,
@@ -629,19 +635,82 @@ async function selfTest(options) {
     }
 }
 
+// A frozen candidate for live use: the committed revision through git
+// archive (every blob verified) plus real copies of the pinned dependencies,
+// so the live source digest needs no symlink and cannot follow a changing one.
+function buildFrozenCandidate(config, runId) {
+    const source = config.repos.ploinky.candidateRoot;
+    if (git(source, ['status', '--porcelain', '--untracked-files=no'])) throw new UsageError('the Ploinky candidate has uncommitted tracked changes; commit before prepare-live');
+    const revision = git(source, ['rev-parse', 'HEAD']);
+    const stage = path.join(config.evidenceRoot, `candidate-${runId}`);
+    createBaselineStage(source, revision, stage);
+    verifyDependenciesUnchanged(config);
+    const modules = path.join(stage, 'node_modules');
+    if (!fs.existsSync(modules)) fs.mkdirSync(modules, { mode: 0o755 });
+    for (const dependency of config.dependencies) {
+        const target = path.join(modules, dependency.name);
+        if (dependency.revision) {
+            createBaselineStage(dependency.realpath, dependency.revision, target);
+            continue;
+        }
+        const copy = (from, to) => {
+            fs.mkdirSync(to, { mode: 0o755 });
+            for (const name of fs.readdirSync(from).sort()) {
+                if (name === '.git') continue;
+                const entry = fs.lstatSync(path.join(from, name));
+                if (entry.isDirectory()) copy(path.join(from, name), path.join(to, name));
+                else if (entry.isFile()) fs.copyFileSync(path.join(from, name), path.join(to, name), fs.constants.COPYFILE_EXCL);
+                else throw new SchemaError(`dependency ${dependency.name} contains a link or special file; it cannot be frozen`);
+            }
+        };
+        copy(dependency.realpath, target);
+        if (treeDigest(target) !== dependency.treeDigest) throw new SchemaError(`dependency ${dependency.name} copy differs from its pinned digest`);
+    }
+    const root = fs.realpathSync(stage);
+    return { root, revision, digest: liveSourceDigest(root) };
+}
+
+function writePrivateText(target, text) {
+    const temporary = path.join(path.dirname(target), `.${path.basename(target)}.${randomRunId()}.tmp`);
+    fs.writeFileSync(temporary, text, { flag: 'wx', mode: 0o600 });
+    fs.renameSync(temporary, target);
+}
+
 function prepareLive(options) {
     const { config } = loadConfig(requireAbsolute(options.config, 'config'));
     const block = options.block;
     const runPath = requireAbsolute(options.run, 'run');
     if (path.dirname(runPath) !== config.evidenceRoot) throw new UsageError('--run must be inside the evidence root');
     const configDigest = fileDigest(requireAbsolute(options.config, 'config'));
+    const runId = randomRunId();
+    const unsupported = Object.fromEntries((LIVE_CASES[block] || []).filter(id => UNSUPPORTED[id]).map(id => [id, UNSUPPORTED[id]]));
+    if (CONCRETE_BLOCKS[block]) {
+        if (!options.pins) throw new UsageError(`prepare-live --block ${block} needs --pins PATH with the observed host, node, engine, Box image and route pins`);
+        const pins = validatePins(readJsonBounded(requireAbsolute(options.pins, 'pins'), 16 * 1024), block);
+        const candidate = buildFrozenCandidate(config, runId);
+        if (CONCRETE_BLOCKS[block].remote) {
+            const payloadPath = path.join(config.evidenceRoot, `candidate-${runId}.tar`);
+            candidate.payload = { path: payloadPath, ...writeUstar(candidate.root, payloadPath) };
+        }
+        const manifest = validateRunManifest(buildConcreteManifest({
+            block, runId, configDigest, casesDigest: config.casesDigest, documentSuffix: config.documentSuffix, pins, candidate,
+            image: explorerFixtureImage(config.repos.explorer.candidateRoot), ports: selectPorts(pins), unsupported,
+        }));
+        validateProfile(manifest, { partial: true });
+        if (manifest.target.remote) validateStage(manifest);
+        writePrivateJson(runPath, manifest);
+        const summaryPath = summaryPathFor(runPath);
+        writePrivateText(summaryPath, renderSummary(manifest, runPath));
+        console.log(JSON.stringify({ run: runPath, summary: summaryPath, block, state: manifest.state }, null, 2));
+        return EXIT.PASS;
+    }
     const manifest = validateRunManifest({
         schema: 1,
-        runId: randomRunId(),
+        runId,
         configDigest,
         casesDigest: config.casesDigest,
         block,
-        target: { engine: config.engine, ssh: config.ssh, note: 'Execution profile and separate exact-target authorization binding required; no file grants permission.', cases: LIVE_CASES[block], unsupported: Object.fromEntries((LIVE_CASES[block] || []).filter(id => UNSUPPORTED[id]).map(id => [id, UNSUPPORTED[id]])) },
+        target: { engine: config.engine, ssh: config.ssh, note: 'Unsupported block: no case in it has an implemented live executor, so this proposal cannot be provisioned or run. No file grants permission.', cases: LIVE_CASES[block], unsupported },
         state: 'proposed',
         workspace: { proposedParent: null, instance: null },
         ports: { tcp: null, udp: null },
@@ -683,6 +752,7 @@ export async function main(argv = process.argv.slice(2)) {
     case 'baseline': return baselineCommand(options);
     case 'offline': return offlineCommand(options);
     case 'prepare-live': return prepareLive(options);
+    case 'provision': return runLive(options, 'provision');
     case 'live': return runLive(options, 'live');
     case 'cleanup': return runLive(options, 'cleanup');
     default: throw new UsageError(`unknown command '${command || ''}'`);
