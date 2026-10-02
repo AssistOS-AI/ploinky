@@ -335,3 +335,41 @@ test('MP.missing-generation-directories-need-the-proc-scan', (t) => {
     fs.mkdirSync(state.pipeDirectory, { mode: 0o755 }); fs.chmodSync(state.pipeDirectory, 0o755);
     assert.equal(backend.observe(state).state, 'unknown');
 });
+
+// The transition journals the terminated generation before its directories
+// are removed, and no policy check separates the completed cleanup from the
+// journal write that drops their paths.
+test('MP.cleanup-journal-boundary-intent-before-and-no-check-after-cleanup', async (t) => {
+    const { runMpsTransition } = await import('../../cli/sandbox/hardwareLimits/mpsTransition.mjs');
+    const { generation, share } = cleanupBoundaryFixture(t);
+    const client = { key: 'k', ref: 'repo/gpu', alias: '', instanceId: 'i', enableGeneration: 'g', containerId: null, share };
+    const input = { oldClients: [], desiredClients: [client], configuredPolicies: [{ share }], selectedKeys: ['k'], capability: {}, origin: 'cli' };
+    const started = (state) => ({ ...state, daemon: { pid: 9, startTime: '1' }, daemonGeneration: 'd1', configurationGeneration: 'c1', pipeDirectory: null, logDirectory: null, status: 'ready' });
+    // A daemon already gone (not stopped by this transition): the intent is journaled first.
+    {
+        const { state, backend } = generation();
+        let journal = { ...structuredClone(state), status: 'ready', daemonGeneration: 'd0', configurationGeneration: 'c0' };
+        const store = { read: () => journal, write: (value) => { journal = structuredClone(value); } };
+        let atCleanup = null;
+        const observing = { ...backend, cleanup: (value) => { atCleanup = structuredClone(journal); backend.cleanup(value); }, start: (_d, { onState }) => { const next = started(journal); onState(next); return next; }, verify: () => true };
+        runMpsTransition(input, { assertCapability: () => {}, store, backend: observing, drain: () => {}, recreate: () => ({ key: 'k', state: 'applied' }) });
+        assert.ok(atCleanup, 'cleanup ran');
+        assert.equal(atCleanup.daemon, null);
+        assert.equal(atCleanup.daemonGeneration, null, 'the terminated generation is journaled before cleanup');
+        assert.equal(atCleanup.configurationGeneration, null);
+    }
+    // A policy change observed right after cleanup still leaves the journal without the removed paths.
+    {
+        const { state, backend } = generation();
+        let journal = { ...structuredClone(state), status: 'ready', daemonGeneration: 'd0', configurationGeneration: 'c0' };
+        const store = { read: () => journal, write: (value) => { journal = structuredClone(value); } };
+        let cleaned = false;
+        const check = () => { if (cleaned) throw Object.assign(new Error('The hardware policy changed during reconciliation'), { code: 'revision_conflict' }); };
+        const observing = { ...backend, cleanup: (value) => { backend.cleanup(value); cleaned = true; }, start: (_d, { onState }) => { const next = started(journal); onState(next); return next; }, verify: () => true };
+        assert.throws(() => runMpsTransition(input, { assertCapability: () => {}, store, backend: observing, check, drain: () => {}, recreate: () => ({ key: 'k', state: 'applied' }) }), /policy changed/);
+        assert.equal(cleaned, true);
+        assert.equal(journal.pipeDirectory, null, 'the removed generation is no longer journaled');
+        assert.equal(journal.logDirectory, null);
+        assert.equal(fs.existsSync(state.pipeDirectory), false);
+    }
+});

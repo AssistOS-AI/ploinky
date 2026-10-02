@@ -12,7 +12,7 @@ import { readBoxHardwareContext } from './context.mjs';
 import { readAppliedObservation } from './runtimeState.mjs';
 import {
     assertKnownMpsClients, inspectMpsClient, inspectMpsClientPresence, resolveMpsClientAlias,
-    createdMpsCandidates, settleCreatedMpsCandidate, mpsCandidateRecord, sameMpsTuple,
+    createdMpsCandidates, settleCreatedMpsCandidate, mpsCandidateRecord, sameMpsTuple, mpsOwnerState, releaseMpsLaunchOwner,
 } from './mpsInventory.mjs';
 import { createMpsStateStore, createMpsDaemonBackend, isMpsClientAlias } from './mps.mjs';
 import { retireExactAgentRuntimePredecessor } from '../docker/agentServiceManager.js';
@@ -39,7 +39,7 @@ async function prepareMpsGraphImpl({ nodes, networkLifecycleCapability, deadline
     inspectPresence = (client, engine) => inspectMpsClientPresence(client, { runtime: engine }),
     removeCandidate = (candidate, network, capability) => retireExactAgentRuntimePredecessor({ containerName: candidate.key, containerId: candidate.containerId,
         registryRecord: mpsCandidateRecord(candidate), runtimeNetwork: network }, { networkLifecycleCapability: capability }),
-    drain = drainTargetedContainer, observeClients = assertKnownMpsClients,
+    drain = drainTargetedContainer, observeClients = assertKnownMpsClients, ownerState = mpsOwnerState,
 } = {}, progress = {}) {
     assertCapability(networkLifecycleCapability);
     const context = readContext();
@@ -58,6 +58,12 @@ async function prepareMpsGraphImpl({ nodes, networkLifecycleCapability, deadline
         const network = isMpsClientAlias(candidate.alias) ? networkOf(candidate.key, candidate.ref) : null;
         const engine = runtime();
         const observed = network ? inspect(candidate, network, engine) : inspectPresence(candidate, engine);
+        // A launch still starting under its own operation (a no-wait child
+        // waiting for readiness outside the locks) is never removed; this
+        // graph's GPU agents are refused until it settles.
+        if (observed.state !== 'absent' && ownerState(candidate.owner) === 'live') {
+            throw new MpsError(`The GPU share client ${candidate.key} is still starting under its launching operation; no client was drained`, 'hardware_limits_transition');
+        }
         if (observed.state !== 'absent' && (observed.state !== 'exact' || observed.id !== candidate.containerId)) {
             throw new MpsError(`The journaled MPS candidate ${candidate.key} is not its exact created runtime; no client was drained`, 'identity_changed');
         }
@@ -101,12 +107,22 @@ async function prepareMpsGraphImpl({ nodes, networkLifecycleCapability, deadline
     const observation = saved?.daemon || saved?.pipeDirectory ? backend.observe(saved) : { state: 'gone' };
     if (['foreign', 'unknown'].includes(observation.state)) throw new MpsError('MPS graph preparation cannot prove daemon ownership', 'mps_backend_unavailable');
     const generation = saved?.daemonGeneration && saved?.configurationGeneration ? `${saved.daemonGeneration}:${saved.configurationGeneration}` : '';
-    const healthy = saved?.status === 'ready' && observation.state === 'owned' && backend.verify(saved);
+    // As in the lifecycle planner: a verified owned daemon whose only problem
+    // is clients that were not recreated is healthy, and a drained client is
+    // not a live client of any generation.
+    const clientFailuresOnly = saved?.status === 'pending' && saved?.lastProblem?.code === 'mps_client_failed';
+    const healthy = (saved?.status === 'ready' || clientFailuresOnly) && observation.state === 'owned' && backend.verify(saved);
     const needsTransition = !isDeepStrictEqual(saved?.serverDefault || null, desiredServerDefault)
-        || Boolean(desiredServerDefault && !healthy) || [...clients.values()].some((client) => !outside.has(tuple(client)) && client.mpsGeneration !== generation);
+        || Boolean(desiredServerDefault && !healthy) || [...clients.values()].some((client) => !outside.has(tuple(client)) && !alreadyDrained.has(tuple(client)) && client.mpsGeneration !== generation);
     const toDrain = [];
+    // A drained journal entry whose key the registry now names with a newer
+    // live share client is history: that newer client is judged on its own.
+    // A drained predecessor whose key has no live client still needs its
+    // replacement launched by this graph.
+    const liveKeys = new Set([...clients.values()].filter((client) => !alreadyDrained.has(tuple(client)) && sameRecord(client, registry[client.key])).map((client) => client.key));
     for (const client of clients.values()) {
         if (outside.has(tuple(client))) continue;
+        if (alreadyDrained.has(tuple(client)) && liveKeys.has(client.key)) continue;
         const member = members.get(client.key);
         let desiredShare = null;
         const policy = context.overrides?.get(client.ref)?.gpu;
@@ -140,12 +156,14 @@ async function prepareMpsGraphImpl({ nodes, networkLifecycleCapability, deadline
         oldClients: [...clients.values()], drainedClients: [...alreadyDrained],
         pendingClients: (saved?.pendingClients || []).filter((entry) => !settled.some((candidate) => entry.phase === 'readiness' && sameMpsTuple(entry, candidate))), lastProblem: null };
     store.write(state);
+    for (const candidate of settled) releaseMpsLaunchOwner(candidate.owner);
     // Never-published candidates are removed by their exact immutable ID.
     for (const { candidate, network, absent } of candidates) {
         if (absent) continue;
         check();
-        settleCreatedMpsCandidate(candidate, { inspect: () => inspect(candidate, network, runtime()), remove: () => removeCandidate(candidate, network, networkLifecycleCapability) });
+        settleCreatedMpsCandidate(candidate, { inspect: () => inspect(candidate, network, runtime()), remove: () => removeCandidate(candidate, network, networkLifecycleCapability), ownerState });
         state.pendingClients = state.pendingClients.filter((entry) => !(entry.phase === 'readiness' && sameMpsTuple(entry, candidate))); store.write(state);
+        releaseMpsLaunchOwner(candidate.owner);
     }
     for (const { client, observed, engine } of toDrain) {
         check();

@@ -303,6 +303,16 @@ export async function applyHardwareLimits({ expectedToken, containers }, {
                     : await reconcile(instance, { origin: 'apply', expectedToken: token, deadline, authorize, isCancelled, onMpsPlan, onMpsResult: recordResult });
                 recordResult(result);
             } catch (error) {
+                // GPU coordination finished its target but did not recreate
+                // some peers: a partial result (207) whose per-agent results
+                // name the pending and refused clients. The target is not
+                // refused by a peer's failure.
+                if (error?.code === 'mps_partial_failure') {
+                    for (const entry of [...(error.mpsTransitionResults || []), ...(error.targetResult?.state === 'applied' ? [error.targetResult] : [])]) {
+                        if (entry?.key && !results.some((value) => value.key === entry.key && (value.state === 'applied' || value.state === entry.state))) recordResult(entry);
+                    }
+                    continue;
+                }
                 const problem = findHardwareOutcome(error);
                 const result = { key: problem?.key || instance.key, state: problem?.state || 'pending', problem, error: problem?.code || String(error.code || 'apply_failed'), message: problem ? undefined : 'This exact instance was not applied. Reload its state and retry.' };
                 if (!results.some((entry) => entry.key === result.key && entry.state === 'applied')) recordResult(result);

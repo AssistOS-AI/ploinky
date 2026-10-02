@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { createNetworkLifecycleAdapter } from '../networkLifecycle.js';
 import { networkContractHash } from '../networkContract.js';
@@ -58,6 +60,59 @@ const IMMUTABLE_ID = /^[a-f0-9]{64}$/;
 export const sameMpsTuple = (left, right) => Boolean(left && right) && left.key === right.key && left.instanceId === right.instanceId
     && left.enableGeneration === right.enableGeneration && left.containerId === right.containerId;
 
+/*
+ * The launching operation of a created candidate. A launch whose caller waits
+ * for readiness after releasing the lifecycle locks (a no-wait child) leaves
+ * its readiness entry visible to other coordinations while it is still
+ * starting. Such an entry records its owner: the launching process (PID, its
+ * kernel start time where /proc exposes it, and a per-process token) and one
+ * operation ID. The entry is settled only when that owner is proven gone:
+ * the process no longer exists or is another incarnation of the PID, or, in
+ * this process, the operation was released. An entry without an owner was
+ * written under locks its launcher held through readiness, so a coordination
+ * that now holds those locks sees a finished attempt.
+ */
+const PROCESS_TOKEN = randomUUID();
+const liveOperations = new Set();
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+export function readProcessStartTime(pid, { fsApi = fs } = {}) {
+    try {
+        const text = String(fsApi.readFileSync(`/proc/${pid}/stat`, 'utf8'));
+        const fields = text.slice(text.lastIndexOf(')') + 2).split(' ');
+        return /^\d{1,20}$/.test(fields[19] || '') ? fields[19] : null;
+    } catch (_) { return null; }
+}
+
+/** Register one launch operation of this process as live and return its owner record. */
+export function mpsLaunchOwner({ readStartTime = readProcessStartTime } = {}) {
+    const operationId = randomUUID();
+    liveOperations.add(operationId);
+    return { pid: process.pid, startTime: readStartTime(process.pid), processToken: PROCESS_TOKEN, operationId };
+}
+
+/** The launch operation finished (acknowledged, failed or settled). */
+export function releaseMpsLaunchOwner(owner) {
+    if (owner && owner.processToken === PROCESS_TOKEN) liveOperations.delete(owner.operationId);
+}
+
+/**
+ * 'released' (no owner recorded), 'gone' (proven) or 'live'. Anything that
+ * cannot be proven gone, including a malformed owner, is 'live'.
+ */
+export function mpsOwnerState(owner, { kill = (pid) => process.kill(pid, 0), readStartTime = readProcessStartTime } = {}) {
+    if (owner === undefined || owner === null) return 'released';
+    if (typeof owner !== 'object' || !Number.isSafeInteger(owner.pid) || owner.pid < 1 || !UUID.test(String(owner.processToken))
+        || !UUID.test(String(owner.operationId)) || (owner.startTime !== null && !/^\d{1,20}$/.test(String(owner.startTime)))) return 'live';
+    if (owner.processToken === PROCESS_TOKEN) return liveOperations.has(owner.operationId) ? 'live' : 'gone';
+    // This PID now runs this process: the recorded owner was an earlier incarnation.
+    if (owner.pid === process.pid) return 'gone';
+    try { kill(owner.pid); } catch (error) { if (error?.code === 'ESRCH') return 'gone'; }
+    const current = owner.startTime ? readStartTime(owner.pid) : null;
+    if (owner.startTime && current && current !== owner.startTime) return 'gone';
+    return 'live';
+}
+
 /**
  * Journaled created candidates: 'readiness' entries with an immutable ID that
  * the registry does not publish for their key. A failed readiness or a crash
@@ -90,13 +145,16 @@ export function mpsCandidateRecord(candidate) {
 }
 
 /**
- * Settle one created candidate: absent means it is already gone; the exact
- * runtime (labels, instance identity and immutable ID) is removed by that ID;
- * anything else is refused without effects.
+ * Settle one created candidate: absent means it is already gone; a present
+ * runtime whose launching operation is not proven gone is still starting and
+ * is left untouched ('in-flight'); otherwise the exact runtime (labels,
+ * instance identity and immutable ID) is removed by that ID; anything else is
+ * refused without effects.
  */
-export function settleCreatedMpsCandidate(candidate, { inspect, remove }) {
+export function settleCreatedMpsCandidate(candidate, { inspect, remove, ownerState = mpsOwnerState }) {
     const observation = inspect(candidate);
     if (observation?.state === 'absent') return 'absent';
+    if (ownerState(candidate.owner) === 'live') return 'in-flight';
     if (observation?.state !== 'exact' || observation.id !== candidate.containerId) {
         throw new MpsError(`The journaled MPS candidate ${candidate.key} is not its exact created runtime. Recover this Box on the host before changing its daemon.`, 'identity_changed');
     }

@@ -164,3 +164,156 @@ test('MI.p7-peer-ineligible-image-or-missing-manifest-never-refuses-the-target',
         assert.ok(f.events.includes('launch:a'), `${label}: ${f.events.join(' ')}`);
     }
 });
+
+// One coordination's per-agent outcomes, through the real coordinator and,
+// for Apply, the real applyHardwareLimits. Only the engine, daemon, registry
+// and route publication are fakes; drains pass the registry identity check.
+import { applyHardwareLimits } from '../../cli/sandbox/hardwareLimits/reconcile.mjs';
+import { findHardwareOutcome } from '../../cli/sandbox/hardwareLimits/errors.mjs';
+import { MpsError } from '../../cli/sandbox/hardwareLimits/mpsEligibility.mjs';
+import { readMpsStatus } from '../../cli/sandbox/hardwareLimits/mpsStatus.mjs';
+const cohortShare = (smPercent = 25) => ({ ...share, smPercent, vramPercent: smPercent });
+function cohortWorld({ keys = ['a', 'b', 'c'], nextSm = 50, fail = {}, peerPlan = null, inspectImage = null } = {}) {
+    const token = { epoch: 'e'.repeat(32), revision: 1 };
+    let counter = 16;
+    const record = (key) => ({ type: 'agent', repoName: 'demo', agentName: key, instanceId: `i-${key}-${counter}`, enableGeneration: `g-${key}-${counter}`, containerId: (counter++).toString(16).padStart(64, '0') });
+    const registry = Object.fromEntries(keys.map((key) => [key, record(key)]));
+    const applied = Object.fromEntries(keys.map((key) => [key, { ...registry[key], gpuShare: cohortShare(), mpsGeneration: 'd0:c0' }]));
+    const policies = new Map(keys.map((key) => [`demo/${key}`, { gpu: cohortShare(key === keys[0] ? nextSm : 25) }]));
+    let state = { ...daemon(cohortShare(), 'd0'), configurationGeneration: 'c0', oldClients: [], drainedClients: [] };
+    let daemons = 0; let alive = true;
+    const events = []; const unavailable = [];
+    const replace = (key, launch) => {
+        events.push(`create:${key}`);
+        if (fail[key]) { const make = fail[key]; if (make.once) delete fail[key]; throw make(); }
+        const next = record(key); registry[key] = next;
+        applied[key] = { ...next, gpuShare: clone(launch.share), mpsGeneration: `${launch.state.daemonGeneration}:${launch.state.configurationGeneration}` };
+        return { key, state: 'applied', containerId: next.containerId };
+    };
+    const dependencies = {
+        observeClients: () => [], readContext: () => ({ storeToken: token, overrides: policies, gpu: { grant: { mps: {} } } }),
+        loadRegistry: () => clone(registry), readApplied: (key, containerId) => (applied[key]?.containerId === containerId ? clone(applied[key]) : null),
+        loadPlan: peerPlan || (() => ({ runtime: 'podman', manifest: {}, profile: { network: { mode: 'default' } }, image: 'prepared:tag' })),
+        prepareImage: () => {}, inspectImage: inspectImage || (() => ({ Id: imageId, Config: { User: '1000:1000' } })), resolveShare: (policy) => policy, policyCheck: () => {},
+        store: { read: () => clone(state), write: (value) => { state = clone(value); } },
+        backend: {
+            observe: () => ({ state: alive ? 'owned' : 'gone', daemon: state.daemon }), verify: (value) => alive && Boolean(value?.daemon),
+            stop: () => { events.push('quit'); alive = false; }, cleanup: () => events.push('cleanup'),
+            start: (value) => { daemons += 1; events.push('start'); alive = true; return { ...daemon(value, `d${daemons}`), configurationGeneration: `c${daemons}` }; },
+        },
+        network: async (fn) => fn({}), assertCapability: () => {},
+        drainClient: async (client) => { events.push(`drain:${client.key}`); },
+        reconcile: async (captured, options) => replace(captured.key, readMpsLaunch(options.mpsLaunch, captured.key, policies.get(`demo/${captured.key}`).gpu)),
+        markUnavailable: async (outcome) => { unavailable.push(outcome.key); },
+    };
+    const coordinate = (key, options = {}) => coordinateMpsLifecycle({ target: { key, record: clone(registry[key]) }, options,
+        launchTarget: async (next) => replace(key, readMpsLaunch(next.mpsLaunch, key, policies.get(`demo/${key}`).gpu)) }, dependencies);
+    const apply = (containers) => applyHardwareLimits({ expectedToken: token, containers }, {
+        lease: (_options, callback) => callback(), loadRegistry: () => clone(registry), loadRouting: () => ({ routes: {} }), readPolicy: () => ({ token }), policyCheck: () => {},
+        loadPlan: () => ({}), isUnchanged: () => false,
+        onPlan: (plan) => events.push(`plan:${plan.expandedContainers.join(',')}`),
+        reconcile: (instance, options) => coordinate(instance.key, { onMpsPlan: options.onMpsPlan, onMpsResult: options.onMpsResult }),
+    });
+    return { events, registry, unavailable, coordinate, apply, policies, get state() { return state; } };
+}
+
+test('MI.peer-failure-is-a-partial-result-and-apply-reports-207', async () => {
+    for (const [label, make] of [['generic readiness error', () => new Error('Readiness deadline expired.')], ['MPS error', () => new MpsError('MPS daemon generation or defaults changed before runtime admission')]]) {
+        const direct = cohortWorld({ fail: { b: make } });
+        let thrown;
+        await assert.rejects(direct.coordinate('a'), (error) => { thrown = error; return true; });
+        assert.equal(thrown.code, 'mps_partial_failure', label);
+        assert.equal(findHardwareOutcome(thrown), null, `${label}: the peer's failure is never the target's refusal`);
+        assert.equal(thrown.targetResult.state, 'applied', `${label}: the target was recreated`);
+        assert.deepEqual(thrown.mpsTransitionResults.map((value) => [value.key, value.state]), [['a', 'applied'], ['b', 'pending'], ['c', 'applied']]);
+        // Apply: the target is applied, the peer pending, and the status is 207.
+        const f = cohortWorld({ fail: { b: make } });
+        const result = await f.apply(['a']);
+        assert.equal(result.status, 207, label);
+        assert.deepEqual(result.results.map((value) => [value.key, value.state, value.problem ? value.problem.key : null]), [['a', 'applied', null], ['b', 'pending', null], ['c', 'applied', null]], label);
+        assert.deepEqual(result.pendingContainers, ['b'], label);
+        assert.equal(result.error, undefined, label);
+    }
+});
+
+test('MI.ineligible-peer-is-refused-reported-before-drain-and-journaled', async () => {
+    for (const [label, peerPlan, inspect] of [
+        ['peer image runs as root', null, (image) => (image === 'peer:tag' ? { Id: 'd'.repeat(64), Config: { User: '0' } } : { Id: imageId, Config: { User: '1000:1000' } })],
+        ['peer manifest removed', (ref) => { if (ref === 'demo/b') throw new Error('Agent demo/b not found'); return { runtime: 'podman', manifest: {}, profile: { network: { mode: 'default' } }, image: 'prepared:tag' }; }, null],
+    ]) {
+        const f = cohortWorld({ keys: ['a', 'b'], inspectImage: inspect,
+            peerPlan: peerPlan || ((ref) => ({ runtime: 'podman', manifest: {}, profile: { network: { mode: 'default' } }, image: ref === 'demo/b' ? 'peer:tag' : 'prepared:tag' })) });
+        const result = await f.apply(['a']);
+        assert.equal(result.status, 207, label);
+        const peer = result.results.find((value) => value.key === 'b');
+        assert.equal(peer.state, 'refused', label);
+        assert.ok(peer.problem.reason && peer.problem.fix, `${label}: the peer's own reason and fix`);
+        assert.equal(peer.problem.key, 'b');
+        assert.equal(result.results.find((value) => value.key === 'a').state, 'applied', label);
+        assert.deepEqual(result.expandedContainers, ['b'], `${label}: listed in the expansion`);
+        const firstDrain = f.events.findIndex((value) => value.startsWith('drain:'));
+        assert.ok(f.events.findIndex((value) => value === 'plan:b') >= 0 && f.events.findIndex((value) => value === 'plan:b') < firstDrain, `${label}: expansion reported before the first drain: ${f.events.join(' ')}`);
+        assert.deepEqual(f.unavailable, ['b'], `${label}: its routes are marked unavailable`);
+        assert.deepEqual(f.state.pendingClients.map((value) => [value.key, value.phase]), [['b', 'pending']], `${label}: it stays journaled`);
+        assert.equal(f.state.lastProblem.code, 'mps_client_failed');
+    }
+});
+
+// §11.3 "Healthy daemon, unchanged default: reuse it": after one client was
+// not recreated, a retry recreates only that client and never restarts the
+// healthy cohort or its daemon.
+test('MI.retry-recreates-only-the-failed-client', async () => {
+    const f = cohortWorld({ fail: { b: Object.assign(() => new Error('Readiness deadline expired.'), { once: true }) } });
+    await assert.rejects(f.coordinate('a'), { code: 'mps_partial_failure' });
+    const healthy = { a: f.registry.a.containerId, c: f.registry.c.containerId };
+    const offset = f.events.length;
+    await f.coordinate('b');
+    assert.deepEqual(f.events.slice(offset), ['create:b'], f.events.slice(offset).join(' '));
+    assert.deepEqual({ a: f.registry.a.containerId, c: f.registry.c.containerId }, healthy);
+    assert.equal(f.state.status, 'ready');
+    assert.deepEqual(f.state.pendingClients, []);
+    assert.deepEqual(f.state.oldClients, []);
+});
+
+test('MI.watchdog-retries-of-a-failing-client-cause-no-healthy-churn', async () => {
+    const f = cohortWorld({ fail: { b: () => new Error('Readiness deadline expired.') } });
+    await assert.rejects(f.coordinate('a'), { code: 'mps_partial_failure' });
+    const healthy = { a: f.registry.a.containerId, c: f.registry.c.containerId };
+    const daemonGeneration = f.state.daemonGeneration;
+    // The watchdog's not_running restarts of b, each through the coordinator.
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+        const offset = f.events.length;
+        await assert.rejects(f.coordinate('b', { origin: 'cli' }), /Readiness deadline expired/);
+        assert.deepEqual(f.events.slice(offset), ['create:b'], `attempt ${attempt}: ${f.events.slice(offset).join(' ')}`);
+    }
+    assert.deepEqual({ a: f.registry.a.containerId, c: f.registry.c.containerId }, healthy, 'healthy clients are never recreated');
+    assert.equal(f.state.daemonGeneration, daemonGeneration, 'the daemon is never restarted');
+    // The daemon the monitor observes stays ready, so healthy clients are not restarted either.
+    const status = readMpsStatus({ workspaceRoot: '/w', readGrant: () => ({ valid: true, state: 'active', mps: {}, fingerprint: share.wiringFingerprint }),
+        observeGpu: () => ({ uuid: share.deviceUuid, driverVersion: share.driverVersion, memoryModel: 'dedicated', name: 'RTX', memoryMiB: 8192 }),
+        readState: () => f.state, backend: { observe: () => ({ state: 'owned' }), verify: () => true } });
+    assert.equal(status.daemonStatus, 'ready');
+    assert.equal(status.mpsGeneration, `${f.state.daemonGeneration}:${f.state.configurationGeneration}`);
+});
+
+test('MI.graph-start-after-client-only-failure-keeps-the-daemon', async () => {
+    const { prepareMpsGraph } = await import('../../cli/sandbox/hardwareLimits/mpsGraph.mjs');
+    const f = cohortWorld({ fail: { b: () => new Error('Readiness deadline expired.') } });
+    await assert.rejects(f.coordinate('a'), { code: 'mps_partial_failure' });
+    const journal = clone(f.state);
+    let state = clone(journal);
+    const drained = [];
+    const result = await prepareMpsGraph({ nodes: ['a', 'b', 'c'].map((key) => ({ key, node: { agentRef: `demo/${key}`, manifest: {} } })), networkLifecycleCapability: {} }, {
+        readContext: () => ({ gate: 'on', overrides: f.policies, storeToken: { epoch: '0'.repeat(32), revision: 1 }, gpu: {} }),
+        loadRegistry: () => clone(f.registry), readApplied: (key, containerId) => (f.registry[key]?.containerId === containerId && key !== 'b' ? { instanceId: f.registry[key].instanceId, enableGeneration: f.registry[key].enableGeneration, gpuShare: f.policies.get(`demo/${key}`).gpu, mpsGeneration: `${journal.daemonGeneration}:${journal.configurationGeneration}` } : null),
+        store: { read: () => clone(state), write: (value) => { state = clone(value); } },
+        backend: { observe: () => ({ state: 'owned' }), verify: () => true }, assertCapability: () => {}, observeClients: () => [],
+        readSelection: () => ({ selector: { state: 'inactive' } }), resolveShare: (policy) => policy, runtime: () => 'podman',
+        inspect: (client) => ({ state: 'exact', id: client.containerId, running: true }), inspectPresence: () => ({ state: 'absent', id: null }),
+        drain: (key) => drained.push(key),
+    });
+    assert.equal(result.refusals, undefined);
+    assert.equal(state.graphNeedsTransition, false, 'the verified daemon with only a failed client is reused');
+    assert.deepEqual(drained, [], 'no healthy client is drained');
+    assert.deepEqual([...result.replacedKeys], ['b'], 'only the client that was not recreated is replaced');
+});

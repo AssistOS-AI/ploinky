@@ -15,11 +15,14 @@ import { resolveLlmRuntimeAdmissionContext } from '../docker/llmRuntimeIntegrati
 import { drainTargetedContainer } from '../docker/targetedContainerLifecycle.js';
 import { retireRuntimeRelaySocket } from '../docker/healthProbes.js';
 import { prepareTargetedAgentRestart } from '../../commands/targetedAgentRestart.js';
+import { mergeRoutingConfig } from '../../server/routingFile.js';
+import { buildAvailabilityProjection, markRouteHardwareUnavailable } from '../../server/hardwareAvailability.mjs';
 import { readBoxHardwareContext } from './context.mjs';
 import { readAppliedObservation } from './runtimeState.mjs';
 import {
     assertKnownMpsClients, inspectMpsClient, inspectMpsClientPresence, resolveMpsClientAlias,
     createdMpsCandidates, settleCreatedMpsCandidate, dropSettledMpsCandidate, mpsCandidateRecord,
+    sameMpsTuple, mpsOwnerState, mpsLaunchOwner, releaseMpsLaunchOwner,
 } from './mpsInventory.mjs';
 import { HardwareStoreError } from './store.mjs';
 import { HardwareLimitsError } from './errors.mjs';
@@ -43,6 +46,29 @@ function loadClientPlan(ref, record = {}) {
     return { manifest, profile, runtime, image, agentPath: path.dirname(resolved.manifestPath) };
 }
 
+// A drained peer that cannot be recreated keeps its logical routes without a
+// runtime target, exactly like a refused Apply target (§9.2).
+async function markMpsPeerUnavailable(outcome, capability, { loadRegistry = readAgentRegistrySnapshot, publish = mergeRoutingConfig } = {}) {
+    const current = loadRegistry()[outcome.key];
+    if (!current?.instanceId || !current?.enableGeneration) return;
+    const projection = buildAvailabilityProjection({ outcome, instanceId: current.instanceId, enableGeneration: current.enableGeneration });
+    await publish((routing) => {
+        for (const [routeKey, route] of Object.entries(routing.routes || {})) if (route?.container === outcome.key) routing.routes[routeKey] = markRouteHardwareUnavailable(route, projection);
+        return routing;
+    }, { reason: 'hardware-apply-refused', networkLifecycleCapability: capability });
+}
+
+function mpsPeerRefusal(error, key, record) {
+    const ref = `${record.repoName}/${record.agentName}`;
+    const reasonCode = error?.code === 'image_preparation_required' ? 'image_preparation_required' : 'gpu_sharing_unavailable';
+    return buildDirectRefusal({ key, ref, alias: record.alias || null,
+        refusalParts: { reasonCode, reason: `GPU coordination drained ${ref}, but it cannot be recreated as a GPU share client: ${String(error?.message || error).slice(0, 1024)}`,
+            fix: `Repair ${ref} (restore its manifest or use an eligible image), then restart it; or clear its GPU share in Settings or with ploinky limits clear --agent ${ref} on the host.`,
+            requested: [{ field: 'gpu', value: 'configured MPS share', source: 'settings' }] },
+        inputFingerprint: hex64({ ref, key, peer: true, reason: String(error?.message || error) }),
+    });
+}
+
 async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }, {
     readContext = readBoxHardwareContext, loadRegistry = readAgentRegistrySnapshot,
     readApplied = readAppliedObservation, loadPlan = loadClientPlan,
@@ -56,6 +82,7 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
         : inspectMpsClientPresence(candidate, { runtime: getRuntime() })),
     removeCandidate = (candidate, plan, capability) => retireExactAgentRuntimePredecessor({ containerName: candidate.key, containerId: candidate.containerId,
         registryRecord: mpsCandidateRecord(candidate), runtimeNetwork: plan.profile.network }, { networkLifecycleCapability: capability }),
+    ownerState = mpsOwnerState, markUnavailable = (outcome, capability) => markMpsPeerUnavailable(outcome, capability, { loadRegistry }),
 } = {}) {
     return network(async (capability) => {
         const context = readContext();
@@ -70,14 +97,21 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
         const registry = loadRegistry();
         // A created candidate whose readiness failed (or whose process died)
         // is settled through its own exact tuple and immutable ID before any
-        // planning; the registry still names its predecessor.
+        // planning; the registry still names its predecessor. A candidate
+        // whose launching operation is not proven gone is still starting (a
+        // no-wait child waits for readiness outside the locks): it is never
+        // removed, and its journal entry is kept.
+        const inFlight = [];
         for (const candidate of createdMpsCandidates(store.read(), registry)) {
             check();
             let plan = null;
             try { plan = loadPlan(candidate.ref, registry[candidate.key] || { alias: candidate.alias }); } catch (_) {}
-            settleCreatedMpsCandidate(candidate, { inspect: (value) => inspectCandidate(value, plan), remove: (value) => removeCandidate(value, plan, capability) });
+            const settled = settleCreatedMpsCandidate(candidate, { inspect: (value) => inspectCandidate(value, plan), remove: (value) => removeCandidate(value, plan, capability), ownerState });
+            if (settled === 'in-flight') { inFlight.push(candidate); continue; }
             dropSettledMpsCandidate(store, candidate);
+            releaseMpsLaunchOwner(candidate.owner);
         }
+        const peerRefusals = [];
         const oldClients = [];
         const desiredClients = [];
         const plans = new Map();
@@ -102,12 +136,15 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
                 }
             } catch (error) {
                 // A peer's unresolved manifest or ineligible image is that
-                // peer's own refusal, exactly as for configured policies below:
-                // it stays an old client to drain, is not recreated here, and
-                // never refuses the selected target.
+                // peer's own refusal: it stays an old client, is not recreated
+                // here, and never refuses the selected target. If the cohort
+                // drains it, it is listed in the expansion before the drain,
+                // gets its typed refusal and an unavailable route, and keeps
+                // its pending intent in the journal.
                 if (key === target.key) throw error;
                 check();
                 plans.delete(key);
+                if (old) { try { peerRefusals.push({ client: oldClients.at(-1), outcome: mpsPeerRefusal(error, key, record) }); } catch (_) { /* An unrepresentable identity has no typed outcome. */ } }
                 continue;
             }
             desiredClients.push({ key, ref, alias: record.alias || '', instanceId: record.instanceId || options.instanceId || randomUUID(), enableGeneration: record.enableGeneration || options.enableGeneration || randomUUID(), containerId: record.containerId || null, share });
@@ -128,11 +165,21 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
         const selected = desiredClients.find((client) => client.key === target.key);
         if (selected?.share && !configuredPolicies.some((entry) => isDeepStrictEqual(entry.share, selected.share))) configuredPolicies.push({ share: selected.share });
         let targetResult;
-        const result = await runMpsTransitionAsync({ oldClients, desiredClients, configuredPolicies, selectedKeys: [target.key], capability, origin: options.origin || 'lifecycle' }, {
+        let targetOwner = null;
+        const refusedResults = [];
+        let result;
+        let partial = null;
+        try {
+        result = await runMpsTransitionAsync({ oldClients, desiredClients, configuredPolicies, selectedKeys: [target.key], capability, origin: options.origin || 'lifecycle',
+            preservedPending: inFlight, refusedClients: peerRefusals }, {
             store, backend, assertCapability, tools: context.gpu?.grant?.mps, check,
             drain: async (client) => {
                 check();
                 const record = loadRegistry()[client.key];
+                // A journaled client whose agent left the registry (disabled)
+                // is drained once its immutable container is proven absent,
+                // as graph preparation settles it; a present one is refused.
+                if (!record && inspectCandidate(client, null)?.state === 'absent') return;
                 if (!record || record.instanceId !== client.instanceId || record.enableGeneration !== client.enableGeneration || record.containerId !== client.containerId) throw new HardwareStoreError('MPS cohort registry identity changed before drain', { code: 'identity_changed', status: 409 });
                 const alias = resolveMpsClientAlias(client, record);
                 if (drainClient) return drainClient(client, record, capability);
@@ -162,21 +209,50 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
                     if (targetResult?.state === 'applied') return targetResult;
                     if (targetResult?.mpsReady) return { key: client.key, observedKey: targetResult.containerName, state: 'applied', containerId: targetResult.containerId };
                     const launchedClient = { ...client, mpsGeneration: state ? `${state.daemonGeneration}:${state.configurationGeneration}` : '', key: targetResult.containerName, containerId: targetResult.containerId, instanceId: targetResult.registryRecord?.instanceId, enableGeneration: targetResult.registryRecord?.enableGeneration, alias: targetResult.registryRecord ? targetResult.registryRecord.alias || '' : client.alias };
+                    // The caller may wait for readiness after releasing the
+                    // lifecycle locks: the readiness entry names its owner.
+                    if (client.share && /^[a-f0-9]{64}$/.test(String(targetResult.containerId || ''))) launchedClient.owner = targetOwner = mpsLaunchOwner();
                     if (client.share) Object.defineProperty(targetResult, 'mpsReadiness', { value: { mpsLaunch, key: client.key, share: client.share, client: launchedClient }, configurable: true });
                     return { key: client.key, state: 'starting', containerId: targetResult.containerId, client: launchedClient };
                 }
                 const captured = captureExactHardwareInstances(loadRegistry(), [client.key])[0];
                 return reconcile(captured, { ...options, expectedToken: token, mpsLaunch, networkLifecycleCapability: capability });
             },
-            onPlan: (plan) => { beforePlan(plan); options.onMpsPlan?.(plan); if (!options.onMpsPlan && plan.expandedKeys.length) console.log(`[hardware-limits] GPU coordination also recreates: ${plan.expandedKeys.join(', ')}`); },
-            onResult: (result) => options.onMpsResult?.(result),
+            onPlan: (plan) => {
+                // Never drain a client whose launch is still starting.
+                const starting = plan.drain.find((client) => inFlight.some((candidate) => sameMpsTuple(candidate, client)));
+                if (starting) throw new HardwareStoreError(`The GPU share client ${starting.key} is still starting under its launching operation; retry after its readiness settles.`, { code: 'hardware_limits_transition', status: 409 });
+                // Drained peers that will not be recreated are reported in the
+                // expansion before any drain (§10.2).
+                const refused = peerRefusals.filter(({ client }) => plan.drain.some((entry) => sameMpsTuple(entry, client))).map(({ client }) => client.key);
+                const reported = refused.length ? { ...plan, expandedKeys: [...new Set([...plan.expandedKeys, ...refused])] } : plan;
+                beforePlan(reported); options.onMpsPlan?.(reported);
+                if (!options.onMpsPlan && reported.expandedKeys.length) console.log(`[hardware-limits] GPU coordination also affects: ${reported.expandedKeys.join(', ')}`);
+            },
+            onResult: (value) => { if (value?.state === 'refused' && value.problem && peerRefusals.some(({ client }) => client.key === value.key)) refusedResults.push(value); options.onMpsResult?.(value); },
         });
+        } catch (error) {
+            if (error?.code !== 'mps_partial_failure') { releaseMpsLaunchOwner(targetOwner); throw error; }
+            partial = error;
+            result = { state: error.mpsTransitionState };
+        } finally {
+            for (const value of refusedResults) {
+                try { await markUnavailable(value.problem, capability); }
+                catch (error) { console.warn(`[hardware-limits] ${value.key} is refused, but its routes could not be marked unavailable: ${String(error?.message || error).slice(0, 256)}`); }
+            }
+        }
         if (!targetResult) {
             check();
             if (registry[target.key] && !isDeepStrictEqual(loadRegistry()[target.key], recordFor.get(target.key))) throw new HardwareStoreError('MPS exact target identity changed before reuse', { code: 'identity_changed', status: 409 });
-            const mpsLaunch = createMpsLaunch({ key: target.key, share: selected?.share || null, state: result.state, imageId: images.get(target.key) || null });
+            // A reused or partially recreated cohort whose daemon still
+            // verifies admits the target like a ready generation.
+            const launchState = result.state?.daemon && result.state.status !== 'ready' && backend.verify(result.state) ? { ...result.state, status: 'ready' } : result.state;
+            const mpsLaunch = createMpsLaunch({ key: target.key, share: selected?.share || null, state: launchState, imageId: images.get(target.key) || null });
             targetResult = await launchTarget({ ...options, mpsLaunch, networkLifecycleCapability: capability });
         }
+        // Peers that were not recreated are a partial result; the target's
+        // own result travels with it.
+        if (partial) throw Object.defineProperty(partial, 'targetResult', { value: targetResult, configurable: true });
         return targetResult;
     }, options.networkLifecycleCapability ? { capability: options.networkLifecycleCapability } : { waitMs: 60_000 });
 }
@@ -278,6 +354,15 @@ export async function ensureMpsGraphAgentService(agentName, manifest, agentPath,
     return result;
 }
 
+// A peer that was not recreated never fails the target's own launch: the
+// caller continues with the target's result, and the peer's outcome is in the
+// journal and in the coordination's per-agent results.
+function targetOfPartialFailure(error) {
+    if (error?.code !== 'mps_partial_failure' || !error.targetResult) return null;
+    console.warn(`[hardware-limits] ${String(error.message).slice(0, 1024)}`);
+    return error.targetResult;
+}
+
 async function acknowledgeMpsRuntimeReadyStrict(result, { store = createMpsStateStore(), backend = createMpsDaemonBackend(), loadRegistry = readAgentRegistrySnapshot } = {}) {
     if (!result?.mpsReadiness) return;
     const { mpsLaunch, key, share, client } = result.mpsReadiness;
@@ -306,6 +391,8 @@ export async function coordinateMpsLifecycle(input, dependencies) {
 export async function ensureMpsAgentService(agentName, manifest, agentPath, options = {}) {
     try { return await ensureMpsAgentServiceImpl(agentName, manifest, agentPath, options); }
     catch (error) {
+        const targetResult = targetOfPartialFailure(error);
+        if (targetResult) return targetResult;
         const repoName = resolveAgentRepositoryName(agentPath);
         throw typedMpsFailure(error, { key: options.hardwareInstanceKey || options.containerName || getAgentContainerName(agentName, repoName), record: { repoName, agentName, alias: options.alias } });
     }
@@ -348,10 +435,14 @@ export async function prepareMpsClientLaunch(target, options = {}) {
     const applied = target.record.containerId ? readAppliedObservation(target.key, target.record.containerId) : null;
     if (!context.overrides?.get(ref)?.gpu && !applied?.mpsGeneration) return null;
     let launch;
-    await coordinateMpsLifecycle({ target, options, launchTarget: async (next) => {
-        launch = next.mpsLaunch;
-        return { containerName: target.key, containerId: null, registryRecord: target.record };
-    } });
+    try {
+        await coordinateMpsLifecycle({ target, options, launchTarget: async (next) => {
+            launch = next.mpsLaunch;
+            return { containerName: target.key, containerId: null, registryRecord: target.record };
+        } });
+    } catch (error) {
+        if (!targetOfPartialFailure(error) || !launch) throw error;
+    }
     return launch;
 }
 
@@ -381,4 +472,5 @@ export async function verifyMpsRuntimeReady(result, { store = createMpsStateStor
 export async function acknowledgeMpsRuntimeReady(result, { report = () => console.warn('[hardware-limits] MPS readiness receipt remains pending; inspect ploinky limits status.'), ...dependencies } = {}) {
     try { await acknowledgeMpsRuntimeReadyStrict(result, dependencies); return { acknowledged: true }; }
     catch (_) { report(); return { acknowledged: false }; }
+    finally { releaseMpsLaunchOwner(result?.mpsReadiness?.client?.owner); }
 }
