@@ -32,7 +32,7 @@ import { inspectMpsImage } from './mpsEligibility.mjs';
 import { createMpsStateStore } from './mps.mjs';
 import { verifyMpsRuntimeObservation } from './mpsRuntimeObservation.mjs';
 import { resolveManifestImage } from '../../utils/security/secretVars.js';
-import { inApplyStep, describeApplyCause, formatApplyCause } from './applyCause.mjs';
+import { inApplyStep, markApplyStep, describeApplyCause, formatApplyCause } from './applyCause.mjs';
 
 const APPLY_FAILED_FIX = 'This exact instance was not applied. Reload its state and retry.';
 function failure(code, message, status = 409) { return new HardwareStoreError(message, { code, status }); }
@@ -196,8 +196,11 @@ export async function reconcileExactHardwareInstance(captured, {
         let result = null;
         let transition = null;
         let plan = null;
+        // The step an untyped failure happened in, recorded on the error where it is caught.
+        let phase = 'planning';
         try {
-            plan = inApplyStep('planning', () => loadPlan(captured));
+            plan = loadPlan(captured);
+            const gpuClient = Boolean(plan.runtimeAdmission?.descriptor?.hardwareGpu);
             if (plan.hardwareOutcome) throw new HardwareLimitsError(plan.hardwareOutcome);
             const priorMps = readAppliedObservation(captured.key, captured.record.containerId);
             if (!hasMpsLaunch(mpsLaunch) && (plan.runtimeAdmission?.descriptor?.hardwareGpu || priorMps?.mpsGeneration)) {
@@ -208,13 +211,14 @@ export async function reconcileExactHardwareInstance(captured, {
             const route = loadRouting().routes?.[routeKey];
             if (!isSandboxRuntime(plan.runtime) && route && !route.hardwareAvailability) {
                 check();
-                transition = await inApplyStep('restart-preparation', () => prepare({ containerName: captured.key, routeKey, repoName: captured.record.repoName, shortAgentName: captured.record.agentName, record: captured.record, networkLifecycleCapability: capability }));
+                phase = 'restart-preparation';
+                transition = await prepare({ containerName: captured.key, routeKey, repoName: captured.record.repoName, shortAgentName: captured.record.agentName, record: captured.record, networkLifecycleCapability: capability });
             }
             // Preparation can rotate the registry. Revalidate its own exact
             // successor before create, while token/barrier checks stay fresh.
             checkPolicy();
-            const gpuClient = Boolean(plan.runtimeAdmission?.descriptor?.hardwareGpu);
-            result = await inApplyStep(gpuClient ? 'client-launch' : 'runtime-launch', () => ensure(captured.record.agentName, plan.manifest, plan.agentPath, {
+            phase = gpuClient ? 'client-launch' : 'runtime-launch';
+            result = await ensure(captured.record.agentName, plan.manifest, plan.agentPath, {
                 containerName: captured.key, alias: captured.record.alias, forceRecreate: true, forceRecreateReason: 'hardware limits reconciliation',
                 hardwareInstanceKey: captured.key,
                 profileName: plan.profileResolution.resolvedProfileName, profileResolution: plan.profileResolution,
@@ -223,17 +227,20 @@ export async function reconcileExactHardwareInstance(captured, {
                 ...(transition ? { instanceId: transition.identity.instanceId, enableGeneration: transition.identity.enableGeneration, targetedRestart: transition.targetedRestart } : {}),
                 beforeHardwareMutation: checkPolicy,
                 mpsLaunch,
-            }));
-            if (mpsLaunch && gpuClient) inApplyStep('client-launch', () => trackMpsRuntimePending(result, { mpsLaunch, key: captured.key }));
-            await inApplyStep('readiness', () => readiness({ key: captured.key, label: captured.record.agentName, kind: 'reinstall', manifest: plan.manifest, route: { container: result.containerName, hostPort: result.hostPort || 0 } }, { deadline, beforeProbe: checkPolicy }));
+            });
+            if (mpsLaunch && gpuClient) trackMpsRuntimePending(result, { mpsLaunch, key: captured.key });
+            phase = 'readiness';
+            await readiness({ key: captured.key, label: captured.record.agentName, kind: 'reinstall', manifest: plan.manifest, route: { container: result.containerName, hostPort: result.hostPort || 0 } }, { deadline, beforeProbe: checkPolicy });
             checkPolicy();
-            await inApplyStep('verify', () => verifyMpsRuntimeReady(result));
-            await inApplyStep('activation', () => (transition
-                ? commit({ transition, result, agentPath: plan.agentPath, alias: captured.record.alias || '', networkLifecycleCapability: capability })
-                : activate({ result, routeKey, repoName: captured.record.repoName, shortAgentName: captured.record.agentName, agentPath: plan.agentPath, alias: captured.record.alias || '', networkLifecycleCapability: capability })));
+            phase = 'verify';
+            await verifyMpsRuntimeReady(result);
+            phase = 'activation';
+            if (transition) await commit({ transition, result, agentPath: plan.agentPath, alias: captured.record.alias || '', networkLifecycleCapability: capability });
+            else await activate({ result, routeKey, repoName: captured.record.repoName, shortAgentName: captured.record.agentName, agentPath: plan.agentPath, alias: captured.record.alias || '', networkLifecycleCapability: capability });
             await acknowledgeMpsRuntimeReady(result);
             return Object.defineProperty({ key: captured.key, observedKey: result.containerName, instanceId: result.registryRecord?.instanceId, enableGeneration: result.registryRecord?.enableGeneration, containerId: result.containerId, state: 'applied', problem: null }, 'runtimeResult', { value: result });
         } catch (error) {
+            markApplyStep(error, phase);
             releaseMpsRuntimeOwner(result);
             if (transition) cleanupTargeted(result, error);
             else cleanupPrepared(result, error, 'hardware-reconcile-failed');
