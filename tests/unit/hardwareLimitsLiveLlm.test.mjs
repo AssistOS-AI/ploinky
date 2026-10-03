@@ -1587,3 +1587,27 @@ test('M04r.a-nonzero-exit-with-an-ok-document-is-not-accepted-while-status-zero-
     const passing = await provisioned(t, { block: 'apparatus-vllm' });
     assert.equal(caseOf(await liveCases(passing, ['LIVE-L3']), 'LIVE-L3').result, 'pass'); assert.equal(passing.artifacts.has('llm-l3-process-failure'), false); nothingOwned(passing);
 });
+
+// --- M-LLM-05: the Run's own refusal cause is never replaced by a later preview's reason ---------------------------------
+test('M05llm.a-run-refused-for-unreadable-gpu-telemetry-keeps-its-own-cause-and-a-recovered-unqualified-preview-does-not-certify-it', async t => {
+    const w = await provisioned(t, { block: 'apparatus-vllm', vllm: stageTwo(false), qualified: false, faults: { refusalFlattened: true, runRefusedTelemetry: true } });
+    const report = await liveCases(w, ['LIVE-L3']);
+    const l3 = caseOf(report, 'LIVE-L3');
+    // The verdict stays BLOCKED with no model launch, but it does not claim the qualification refusal was observed at Run.
+    assert.equal(l3.result, 'blocked', JSON.stringify(l3).slice(0, 500)); assert.equal(report.verdict, 'BLOCKED');
+    assert.match(l3.reason, /the Run was refused as admission_insufficient_now \(Physical GPU capacity and current free memory cannot be read/);
+    assert.match(l3.reason, /its own cause and not the expected vllm_mps_unqualified refusal/);
+    assert.doesNotMatch(l3.reason, /vllm_mps_unqualified was observed before the qualification data entry/);
+    const observed = w.artifacts.get('gpu-live-l3').refusalObserved;
+    assert.equal(observed.refused, false, 'the qualification refusal is not certified');
+    assert.deepEqual([observed.runCause.code, observed.runCause.reasonCode, /telemetry is unavailable/.test(observed.runCause.message)], ['admission_insufficient_now', null, true]);
+    assert.equal(observed.previewReasonCode, 'vllm_mps_unqualified', 'the later preview is recorded as what it is');
+    assert.equal(observed.runnerProcesses, 0); assert.equal(toolCalls(w, 'local_llm_test_prompt').length, 0);
+    nothingOwned(w);
+    // Controls: the legitimate flattened qualification refusal still certifies; a refusal that is neither fails.
+    const legit = await provisioned(t, { block: 'apparatus-vllm', vllm: stageTwo(false), qualified: false, faults: { refusalFlattened: true } });
+    const legitCase = caseOf(await liveCases(legit, ['LIVE-L3']), 'LIVE-L3');
+    assert.equal(legitCase.result, 'blocked'); assert.match(legitCase.reason, /vllm_mps_unqualified was observed before the qualification data entry/);
+    assert.deepEqual([legit.artifacts.get('gpu-live-l3').refusalObserved.refused, legit.artifacts.get('gpu-live-l3').refusalObserved.runCause.code], [true, 'admission_incompatible']);
+    nothingOwned(legit);
+});

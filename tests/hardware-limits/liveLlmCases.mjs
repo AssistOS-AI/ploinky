@@ -633,11 +633,20 @@ export function createLlmCases(ctx) {
             const status = await toolOk('status-l3-refused', 'local_llm_status', {});
             const processes = await runnerProcesses(agent, 'vllm');
             const detailed = !attempt.ok ? attempt.error.details?.admission?.reasonCode : undefined;
-            const refused = !attempt.ok && /^admission_(?:incompatible|insufficient_now)$/.test(attempt.error.code) && afterAdmission?.reasonCode === 'vllm_mps_unqualified'
-                && (detailed === undefined || detailed === 'vllm_mps_unqualified');
+            // The Run's OWN cause is what its refusal says: the details when the route keeps them, otherwise its code and message. The
+            // preview taken afterwards describes the host at that later time and never stands in for it (production checks that the
+            // GPU's capacity is readable before it checks the qualification, so the two can differ).
+            const runCode = attempt.ok ? null : attempt.error.code;
+            const refused = !attempt.ok && /^admission_(?:incompatible|insufficient_now)$/.test(runCode)
+                && (detailed !== undefined ? detailed === 'vllm_mps_unqualified' : runCode === 'admission_incompatible' && afterAdmission?.reasonCode === 'vllm_mps_unqualified');
+            // A flattened admission_insufficient_now is a refusal for its own reason (the host cannot be measured or has no room now).
+            const otherCause = !attempt.ok && !refused && runCode === 'admission_insufficient_now' && detailed === undefined;
             const launched = ACTIVE.includes(status.phase) || (status.deployment ? ACTIVE.includes(status.deployment.phase) : false);
-            evidence.put('refusalObserved', { refused, error: attempt.ok ? null : attempt.error, previewReasonCode: afterAdmission?.reasonCode ?? null, detailsReasonCode: detailed ?? null, phase: status.phase, runnerProcesses: processes.length });
+            evidence.put('refusalObserved', { refused, error: attempt.ok ? null : attempt.error, runCause: attempt.ok ? null : { code: runCode, reasonCode: detailed ?? null, message: String(attempt.error.message ?? '').slice(0, 300) }, previewReasonCode: afterAdmission?.reasonCode ?? null, detailsReasonCode: detailed ?? null, phase: status.phase, runnerProcesses: processes.length });
             if (attempt.ok) { try { await toolOk('stop-l3-unsafe', 'local_llm_stop', {}, { mutating: true }); } catch { /* the failure below is the verdict */ } }
+            if (otherCause && !launched && processes.length === 0) {
+                throw blocked(`LIVE-L3 stage 2: the Run was refused as ${runCode} (${String(attempt.error.message).slice(0, 200)}), which is its own cause and not the expected vllm_mps_unqualified refusal; the admission preview taken afterwards (${afterAdmission?.reasonCode ?? 'no reason code'}) does not describe that Run. The model has not run. Run stage 2 again when the host reports its GPU memory.`);
+            }
             expects(refused && !launched && processes.length === 0, 'vLLM under MPS was not refused as vllm_mps_unqualified before any launch');
             throw blocked(`LIVE-L3 stage 2: vllm_mps_unqualified was observed before the qualification data entry (${String(admission.reason).slice(0, 200)}); that is the correct behaviour, and the model has not run. Add the reviewed entry from the stage 1 evidence and run stage 2 again.`);
         }

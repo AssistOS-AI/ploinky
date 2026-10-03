@@ -202,6 +202,12 @@ export function createLlmWorld({ statePath, node, engine, host, gpu, faults = {}
             if (L.requests.has(args.requestId)) return { ok: true, agent: 'local-llm', result: { accepted: true, duplicate: true } };
             if (['downloading', 'loading', 'ready', 'starting'].includes(L.phase) && !args.replace) return refusal('busy', `${L.deployment.modelId} on ${L.deployment.runnerId} is ${L.phase}; stop it first or run with replace.`);
             const verdict = admission(args.modelId, args.runnerId);
+            // `runRefusedTelemetry`: the Run is refused because the GPU's capacity cannot be read right now (production checks this before
+            // the qualification); the admission previews, taken before and after, still show the qualification reason.
+            if (faults.runRefusedTelemetry && args.runnerId === 'vllm') {
+                L.refusals.push({ modelId: args.modelId, runnerId: args.runnerId, status: 'insufficient-now' });
+                return refusal('admission_insufficient_now', 'Physical GPU capacity and current free memory cannot be read under this share (GPU telemetry is unavailable).');
+            }
             if (verdict.status !== 'ok' && !faults.runAcceptedAnyway) {
                 L.refusals.push({ modelId: args.modelId, runnerId: args.runnerId, status: verdict.status });
                 const code = `admission_${verdict.status.replace('-', '_')}`;
