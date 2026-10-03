@@ -274,6 +274,20 @@ export function createGpuCases(ctx) {
     // limits object ({cpus, memoryPercent, gpu}), as the local-llm cases do; null clears it.
     const limitsOf = value => (value && (value.gpu !== undefined || value.cpus !== undefined || value.memoryPercent !== undefined) ? value : { gpu: value });
     // Save (or clear) the limits, then Apply the named agents' exact instances.
+    // A captured candidate or Box command whose failure carries its cause in the case reason (R12-c(i) does the same for Apply): the exit
+    // status, timeout, signal or error, and a bounded, redacted stderr tail. Without this the reason was only the generic transport message
+    // and the real cause (attempt 7: `--port is valid only before start, diagnose, or repair`) sat in the capture artifact alone.
+    async function causedCommand(kind, binary, args, options) {
+        let result = null;
+        try { result = await command(kind, binary, args, { ...options, tolerate: true }); }
+        catch (error) { throw Object.assign(new Error(`${kind} did not run: ${String(error?.message || error).slice(0, 300)}`), { result: null, cause: error }); }
+        try { return requireTransport(result); } catch {
+            const tails = commandTails(result, { maxBytes: 300 });
+            const parts = [Number.isInteger(result?.status) && result.status !== 0 ? `exit ${result.status}` : null, result?.timedOut ? 'timed out' : null, result?.signal ? `killed by ${result.signal}` : null,
+                result?.errorCode ? `error ${result.errorCode}` : null, result?.cancelled ? 'cancelled' : null, result?.truncated ? 'output truncated' : null, result?.settlementForced ? 'forced settlement' : null].filter(Boolean);
+            throw Object.assign(new Error(`${kind} failed (${parts.join(', ') || 'no exit status'})${tails.stderrTail ? `: ${tails.stderrTail.trim()}` : ''}`), { result });
+        }
+    }
     async function applyShares(label, policies, applyRefs, evidence) {
         const gate = prepared.gate;
         await gate.check(`before-apply:${label}`);
@@ -711,7 +725,7 @@ export function createGpuCases(ctx) {
             gate.registerDaemon(identityE.daemon.host.hostPid);
             const probeE = await agentNow('probe'); registerOwned(probeE);
             await gate.check('P3-host-clear');
-            try { await command('gpu-host-clear', profile.node.path, [profile.candidate.path, 'limits', 'clear', '--agent', GPU_AGENT_REFS.probe], { deadlineMs: 120000, capture: `gpu-host-clear-${++captureCounter}` }); }
+            try { await causedCommand('gpu-host-clear', profile.node.path, [profile.candidate.path, 'limits', 'clear', '--agent', GPU_AGENT_REFS.probe], { deadlineMs: 120000, capture: `gpu-host-clear-${++captureCounter}` }); }
             finally { recordHostState(); }
             const storeAfterClear = await admin.state();
             evidence.step('host-clear', { configured: agentEntry(storeAfterClear, GPU_AGENT_REFS.probe)?.configured, daemon: storeAfterClear.gpu.daemonStatus });
@@ -723,12 +737,12 @@ export function createGpuCases(ctx) {
             const restartTimeline = startTimeline(identityE.daemon, [probeE]);
             let restartResult = null;
             try {
-                restartResult = await command('gpu-restart', profile.node.path, [profile.candidate.path, 'restart', GPU_AGENT_REFS.probe], { deadlineMs: timings.applyMs, capture: `gpu-restart-${++captureCounter}`, tolerate: true });
-                requireTransport(restartResult);
+                restartResult = await causedCommand('gpu-restart', profile.node.path, [profile.candidate.path, 'restart', GPU_AGENT_REFS.probe], { deadlineMs: timings.applyMs, capture: `gpu-restart-${++captureCounter}` });
                 // Only a restart that completed successfully supports the drain inference.
                 evidence.put('restartDrainAcknowledgement', { command: 'restart', acknowledged: true, ...DRAIN_ACKNOWLEDGEMENT_BASIS });
             } catch (error) {
                 // A restart that failed, timed out or never ran proves nothing about a drain: its real outcome is the record.
+                restartResult = restartResult ?? error.result ?? null;
                 evidence.put('restartDrainAcknowledgement', { command: 'restart', acknowledged: false, outcome: {
                     status: Number.isInteger(restartResult?.status) ? restartResult.status : null, signal: restartResult?.signal ?? null, timedOut: Boolean(restartResult?.timedOut),
                     transportError: restartResult?.errorCode ?? (restartResult ? null : String(error?.message || error).slice(0, 200)), stderr: boundedTail(restartResult?.stderr ?? '', 300).text,
@@ -784,7 +798,7 @@ export function createGpuCases(ctx) {
             && Object.values(fresh.uid).every(value => value === host.uid()), 'The daemon is not provably the owned process; nothing was signalled');
         // The servers it spawned are registered by tuple first, so their exit is not mistaken for a foreign process.
         for (const server of (host.cgroupProcs(`${prepared.prefix}/ploinky/core`) || []).map(pid => host.observe(pid)).filter(value => value && value.ppid === daemon.host.hostPid)) prepared.gate.registerServer(server.hostPid);
-        const result = await command('gpu-kill-owned-daemon', profile.engine.path, [...core, 'node', '-e', MPS_KILL_OWNED_DAEMON, String(daemon.box.pid), String(daemon.box.startTime)], { deadlineMs: timings.controlMs, capture: `gpu-kill-${++captureCounter}` });
+        const result = await causedCommand('gpu-kill-owned-daemon', profile.engine.path, [...core, 'node', '-e', MPS_KILL_OWNED_DAEMON, String(daemon.box.pid), String(daemon.box.startTime)], { deadlineMs: timings.controlMs, capture: `gpu-kill-${++captureCounter}` });
         let reply = null; try { reply = JSON.parse(result.stdout); } catch { reply = null; }
         evidence.step('kill-owned-daemon', reply);
         needs(reply?.killed === true, `The Box refused to kill the daemon (${String(reply?.refused || 'no reply').slice(0, 120)}); nothing was signalled`);

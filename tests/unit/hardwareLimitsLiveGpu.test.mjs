@@ -1884,3 +1884,22 @@ test('M-EVID-03.a-restart-that-fails-times-out-or-cannot-spawn-records-its-real-
     assert.equal(record.acknowledged, true); assert.match(record.basis, /assertCleanTermination/);
     nothingOwned(ok);
 });
+
+// --- R14-b: a failed captured command carries its cause in the case reason ------------------------------------------------------
+test('R14b.a-failed-host-clear-restart-or-kill-reports-its-exit-timeout-or-error-and-stderr-in-the-case-reason', async t => {
+    const failures = [
+        ['a nonzero exit', { status: 1, stderr: 'ploinky: synthetic pre-action refusal' }, /\bfailed \(exit 1\): ploinky: synthetic pre-action refusal/],
+        ['a timeout', { status: null, signal: 'SIGKILL', timedOut: true }, /\bfailed \(timed out, killed by SIGKILL\)/],
+        ['a transport error', { status: null, errorCode: 'ENOENT' }, /\bfailed \(error ENOENT\)/],
+    ];
+    for (const [command, fault, id] of [['gpu-host-clear', 'limitsClearResult', 'P3'], ['gpu-restart', 'restartResult', 'P3'], ['gpu-kill-owned-daemon', 'killResult', 'P3']]) {
+        for (const [label, result, pattern] of failures) {
+            const w = await provisioned(t, { faults: { [fault]: result } });
+            const entry = caseOf(await liveCases(w, ['LIVE-P3']), `LIVE-${id}`);
+            assert.equal(entry.result, 'fail', `${command} ${label}: ${JSON.stringify(entry).slice(0, 300)}`);
+            assert.match(entry.reason, new RegExp(`^${command} ${pattern.source}`), `${command} ${label}: ${entry.reason}`);
+            assert.equal(/returned incomplete output/.test(entry.reason), false, 'not the generic transport message');
+            nothingOwned(w);
+        }
+    }
+});

@@ -434,6 +434,8 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
         if (script === MPS_OBSERVE) { model.programs.push({ program: 'observe' }); return ok(JSON.stringify(mpsObserve())); }
         if (script === MPS_FAILURE_EVIDENCE) return faults.evidenceProgramFails ? failed('Error: the Box is not running') : ok(JSON.stringify(failureEvidence()));
         if (script === MPS_KILL_OWNED_DAEMON) {
+            // `killResult`: the kill program itself fails (a nonzero exit, a timeout, a spawn error).
+            if (faults.killResult) return ok('', faults.killResult);
             if (faults.reuseDaemonPid && model.daemon && !model.daemon.reused) { model.daemon.reused = true; model.procs.get(model.daemon.hostPid).start = String(++model.clock); }
             return ok(JSON.stringify(killProgram(rest)));
         }
@@ -533,6 +535,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
             return ok('GPU grant saved\nNo Box exists yet; the next `ploinky start` applies it.\n');
         }
         if (verbs.includes('limits') && verbs.includes('clear')) {
+            if (faults.limitsClearResult) return ok('', faults.limitsClearResult);
             const ref = args[args.indexOf('--agent') + 1];
             delete model.store.policies[ref]; model.store.revision += 1;
             return ok(`Cleared the stored hardware limits of ${ref}.\n`);
