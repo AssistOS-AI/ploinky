@@ -645,3 +645,15 @@ test('F2.the-apply-response-carries-the-numeric-wait-and-the-status-carries-the-
     assert.equal(read.body.metricsReadFailed, false);
 });
 
+// T2b: after a reconcile that failed before any I/O the next attempt waits (the backoff); without it the attempts follow at once.
+test('T2b.the-attempts-after-a-failed-reconcile-are-spaced-by-the-backoff', async () => {
+    const attempts = [];
+    const monitor = new Monitor({
+        readRegistry: () => { attempts.push(Date.now()); throw Object.assign(new Error('agents registry is unreadable or corrupt: synthetic'), { code: 'EDGE_GENERATION_INVALID' }); },
+        collectContainers: async () => [], runtimeStateOptions: { activeGeneration: null, routes: {} }, readHardwareContext: () => ({ gate: 'off' }), readRouting: () => ({ routes: {} }), containerStats: false,
+    });
+    const result = await monitor.reconcileAfter(Date.now(), 1000);
+    assert.equal(result.fresh, false);
+    assert.ok(attempts.length >= 2 && attempts.length <= 6, `attempts in one second: ${attempts.length}`);
+    for (let index = 1; index < attempts.length; index += 1) assert.ok(attempts[index] - attempts[index - 1] >= 240, `attempt ${index} followed after ${attempts[index] - attempts[index - 1]} ms`);
+});
