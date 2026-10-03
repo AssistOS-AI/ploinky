@@ -8,7 +8,8 @@ import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
-import { fixtureContainerName } from './liveFixture.mjs';
+import { FIXTURE_REPOSITORY, fixtureContainerName } from './liveFixture.mjs';
+import { drainExitCode } from './fixtureDrain.mjs';
 
 // Exit status of a child runner that died at its named crash point.
 export const CRASH_EXIT = 99;
@@ -205,7 +206,10 @@ export function createFakeWorld({ statePath, node, engine, host, unrelated = [],
                             if (!fs.existsSync(path.join(repository, name, 'manifest.json'))) continue;
                             const manifest = JSON.parse(fs.readFileSync(path.join(repository, name, 'manifest.json'), 'utf8'));
                             const container = fixtureContainerName(workspace, name, repositoryName);
-                            state.agents[container] = { id: hex(`agent-${container}-${state.counter}`), created: '2026-10-02T00:01:00Z', image: hex(manifest.container), name: `/${container}`, imageName: manifest.container, running: true, labels: {}, mounts: [] };
+                            state.agents[container] = { id: hex(`agent-${container}-${state.counter}`), created: '2026-10-02T00:01:00Z', image: hex(manifest.container), name: `/${container}`, imageName: manifest.container, running: true, labels: {}, mounts: [],
+                                // What a targeted drain of this agent exits with: measured by running the manifest's own agent command for a fixture
+                                // agent (the local-llm agent is the real one, documented to exit 0 on SIGTERM, SIGINT and SIGHUP: src/main.mjs).
+                                drainExit: repositoryName === FIXTURE_REPOSITORY && typeof manifest.agent === 'string' ? drainExitCode(faults.fixtureAgentCommand ?? manifest.agent) : 0 };
                         }
                     }
                 }

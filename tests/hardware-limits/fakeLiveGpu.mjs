@@ -41,7 +41,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
     const refOf = role => `${fixture.repository}/${nameOf(role)}`;
     const roleOfName = name => fixture.roles.find(role => nameOf(role) === name) ?? name;
     const model = {
-        clock: 100, nextHost: 5000, nextBox: 100, agentCounter: 0, imageIds: {}, procs: new Map(), dirs: new Set(), agents: new Map(), helpers: new Map(),
+        clock: 100, nextHost: 5000, nextBox: 100, agentCounter: 0, imageIds: {}, drainExits: {}, procs: new Map(), dirs: new Set(), agents: new Map(), helpers: new Map(),
         boxId: null, workspace: null, instance: null, prefix: null,
         store: { epoch: hex('epoch').slice(0, 32), revision: 1, policies: {} },
         daemon: null, mpsStatus: 'inactive', events: [], signals: [], calls: [], programs: [], foreign: [], bypassProcs: [],
@@ -85,7 +85,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
         const agent = {
             role, id, name: fixtureContainerName(model.workspace, nameOf(role), fixture.repository), created: recorded?.created ?? `2026-10-02T12:00:${String(model.agentCounter % 60).padStart(2, '0')}Z`,
             // A replacement is created from the same image as the instance the engine's own start created for this role.
-            image: recorded?.image ?? model.imageIds[role] ?? hex('agent-image'), imageName: model.image, user: faults.imageUser ?? '1000:1000', running: true, startedAt: `2026-10-02T12:01:${String(model.agentCounter % 60).padStart(2, '0')}Z`,
+            image: recorded?.image ?? model.imageIds[role] ?? hex('agent-image'), imageName: model.image, drainExit: recorded?.drainExit ?? model.drainExits[role] ?? 0, user: faults.imageUser ?? '1000:1000', running: true, startedAt: `2026-10-02T12:01:${String(model.agentCounter % 60).padStart(2, '0')}Z`,
             labels: { 'ploinky.limitshash': hex(`limits-${role}-${JSON.stringify(share)}`) }, env: [...baseEnv], mounts: [], boxPid: model.nextBox++, share,
             // The whole saved policy this instance was created with (a share, CPUs and RAM): an instance is applied while it equals the store's.
             limits: model.store.policies[refOf(role)] ?? null, limitsKey: JSON.stringify(model.store.policies[refOf(role)] ?? null),
@@ -104,7 +104,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
             if (faults.clientHoldsTool) agent.mounts.push({ Type: 'bind', Source: gpu.mpsControl, Destination: '/usr/local/nvidia/bin/nvidia-cuda-mps-control', RW: false });
             if (faults.readOnlyPipe) agent.mounts[0].RW = false;
         }
-        if (recorded) model.imageIds[role] = agent.image;
+        if (recorded) { model.imageIds[role] = agent.image; model.drainExits[role] = recorded.drainExit ?? 0; }
         agent.proc = spawn({ cgroup: leafOf(agent), ppid: BOX_INIT_PID, ns: [agent.boxPid, 1] });
         model.dirs.add(leafOf(agent));
         model.agents.set(role, agent);
@@ -114,6 +114,9 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
     function removeAgent(role) {
         const agent = model.agents.get(role);
         if (!agent) return;
+        // The targeted drain (cli/sandbox/docker/targetedContainerLifecycle.js assertCleanTermination): the container is stopped with
+        // SIGTERM and only exit 0 is the application's acknowledgement. Anything else refuses the removal and the recreate.
+        if (agent.drainExit !== 0) throw Object.assign(new Error(`targeted drain for '${agent.name}' did not exit cleanly (exit=${agent.drainExit}); refusing removal or recreate`), { drainFailure: true });
         event(`${agent.share ? 'drain' : 'replace'}:${role}`);
         for (const proc of [...model.procs.values()].filter(value => value.cgroup === leafOf(agent))) stop(proc);
         model.dirs.delete(leafOf(agent));
@@ -347,7 +350,14 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
             if (faults.applyStatus) return { status: faults.applyStatus, text: JSON.stringify(faults.applyBody ?? { ok: false, error: 'apply_failed' }) };
             const roles = body.containers.map(container => fixture.roles.find(role => key(role) === container));
             if (roles.some(role => !role)) return { status: 400, text: JSON.stringify({ ok: false, error: 'unknown_container' }) };
-            await applyFlow(roles);
+            try { await applyFlow(roles); } catch (error) {
+                if (!error.drainFailure) throw error;
+                // The real Apply response of a refused drain (observed in LIVE-P1 attempt 6).
+                const cause = { step: 'client-launch', errorClass: 'Error', code: 'TARGETED_DRAIN_FAILED', message: error.message };
+                const message = `Apply stopped at client-launch: Error (TARGETED_DRAIN_FAILED): ${error.message}`;
+                return { status: 409, text: JSON.stringify({ ok: false, status: 409, error: 'TARGETED_DRAIN_FAILED', message, cause, token: { epoch: model.store.epoch, revision: model.store.revision }, expandedContainers: [],
+                    results: roles.map(role => ({ key: key(role), state: 'pending', problem: null, error: 'TARGETED_DRAIN_FAILED', message, cause })) }) };
+            }
             return { status: 200, text: JSON.stringify({ ok: true, results: roles.map(role => ({ key: key(role), state: 'applied' })) }) };
         }
         return { status: 400, text: JSON.stringify({ ok: false, error: 'unknown_action' }) };

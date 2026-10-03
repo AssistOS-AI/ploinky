@@ -1734,3 +1734,27 @@ test('V3.p2-still-passes-when-the-driver-truncates-a-client-value-to-a-whole-gib
     assert.ok(p2.evidence.rounding.capMiB === 1044 && p2.evidence.rounding.shareAllocatedMiB >= 404 && p2.evidence.rounding.shareAllocatedMiB <= 1024, JSON.stringify(share).slice(0, 300));
     nothingOwned(w);
 });
+
+// --- U3: the fakes model the targeted drain of a fixture agent -----------------------------------------------------------
+test('U3.the-compliant-fixture-agent-drains-with-exit-zero-and-the-recreate-proceeds', async t => {
+    const w = await provisioned(t);
+    const report = await liveCases(w, ['LIVE-P1']);
+    const p1 = caseOf(report, 'LIVE-P1');
+    assert.equal(p1.result, 'pass', JSON.stringify(p1).slice(0, 500));
+    // The exit code the drain saw is the one measured from the manifest's own agent command, run as a real process.
+    assert.deepEqual(w.fake.model.drainExits, { probe: 0, peer: 0, cpu: 0 });
+    nothingOwned(w);
+});
+
+test('U3.a-fixture-agent-that-dies-on-sigterm-fails-apply-at-client-launch-with-the-targeted-drain-refusal', async t => {
+    // The previous fixture command has no signal handler: SIGTERM kills it (143) and the product refuses removal and recreate.
+    const w = await provisioned(t, { faults: { base: { fixtureAgentCommand: 'node -e "setInterval(()=>{},3600000)"' } } });
+    const report = await liveCases(w, ['LIVE-P1']);
+    const p1 = caseOf(report, 'LIVE-P1');
+    assert.equal(p1.result, 'fail', JSON.stringify(p1).slice(0, 500));
+    assert.match(p1.reason, /Apply of hwlfixture\/probe failed: 409/);
+    assert.match(p1.reason, /TARGETED_DRAIN_FAILED/); assert.match(p1.reason, /did not exit cleanly \(exit=143\); refusing removal or recreate/);
+    assert.deepEqual(w.fake.model.drainExits, { probe: 143, peer: 143, cpu: 143 });
+    assert.equal(report.verdict, 'FAIL');
+    nothingOwned(w);
+});
