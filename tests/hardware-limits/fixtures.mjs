@@ -353,6 +353,10 @@ export function buildRequiredCaseManifest() {
             'G.gate-store-clear-and-restore-are-lock-checked-and-exact',
         ]),
         ...leaves(P, 'p1', unit('ploinkyBoxGpuGrant.test.mjs'), ['G.every-final-generation-gpu']),
+        ...leaves(P, 'p1', unit('hardwareLimitsReconcilePredecessor.test.mjs'), [
+            'R20.reconcile-passes-the-exact-registered-runtime-tuple-as-the-expected-predecessor',
+            'R20.reconcile-never-launches-with-a-tuple-the-record-does-not-name',
+        ]),
         ...leaves(P, 'p1', unit('ploinkyBoxHardwareLimitsTransitions.test.mjs'), [
             'T.first-on-no-barrier', 'T.on-on-no-barrier', 'T.policy-write-before-barrier',
             'T.policy-write-after-barrier', 'T.reads-and-watchdog-during-barrier', 'T.apply-blocked',
