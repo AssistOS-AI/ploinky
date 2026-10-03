@@ -88,6 +88,8 @@ test('the in-Box writer probe reads real process groups from /proc', (t) => {
 // same-group writer, then hangs. Never pulls; skipped without the local image.
 const BOX_IMAGE = 'docker.io/assistos/ploinky-box:latest';
 function localBoxImage() {
+    // The engine-spawn guard forbids a real engine in a unit test; this opt-in real-engine check runs only without it.
+    if (process.env.PLOINKY_ENGINE_GUARD_ROOT) return false;
     if (spawnSync('podman', ['--version'], { stdio: 'ignore' }).status !== 0) return false;
     return spawnSync('podman', ['image', 'exists', BOX_IMAGE], { stdio: 'ignore' }).status === 0;
 }

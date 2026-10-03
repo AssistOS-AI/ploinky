@@ -31,6 +31,8 @@ const IMAGE = 'docker.io/library/busybox:1.36';
 const SECRET_NAMES = ['master-key', '.secrets', 'ploinky_subject_identity_ed25519_v1.enc'];
 
 function localPodmanImageId() {
+    // The engine-spawn guard forbids a real engine in a unit test; this opt-in real-engine check runs only without it.
+    if (process.env.PLOINKY_ENGINE_GUARD_ROOT) return null;
     if (spawnSync('podman', ['--version'], { stdio: 'ignore' }).status !== 0) return null;
     const inspected = spawnSync('podman', ['image', 'inspect', '--format', '{{.Id}}', IMAGE], { encoding: 'utf8' });
     return inspected.status === 0 ? inspected.stdout.trim() : null;

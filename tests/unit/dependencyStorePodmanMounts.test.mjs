@@ -24,6 +24,8 @@ const IMAGE = 'docker.io/library/busybox:1.36';
 const GLOBAL = Object.freeze({ name: 'ploinky-global-deps', version: '1.0.0', dependencies: { 'left-pad': '1.3.0' } });
 
 function localPodmanImageId() {
+    // The engine-spawn guard forbids a real engine in a unit test; this opt-in real-engine check runs only without it.
+    if (process.env.PLOINKY_ENGINE_GUARD_ROOT) return null;
     if (spawnSync('podman', ['--version'], { stdio: 'ignore' }).status !== 0) return null;
     const inspected = spawnSync('podman', ['image', 'inspect', '--format', '{{.Id}}', IMAGE], { encoding: 'utf8' });
     return inspected.status === 0 ? inspected.stdout.trim() : null;
