@@ -821,12 +821,13 @@ export async function withMpsEnablePreparation(request, stage, {
 }
 
 export async function enableAgent(agentName, mode, repoNameParam, aliasParam, authModeParam, authOptions = {}) {
-    const request = { agentName, mode, repoNameParam, aliasParam, authModeParam, authOptions };
     // Enabling mutates the registry and admits a runtime: hold the workspace
     // mutation lease (reusing one this process already holds) for the whole
     // operation, before any runtime lock. The GPU peers are coordinated (under
     // the network lifecycle lock) only after the lease is held.
-    return withHeldOrAcquiredWorkspaceMutationLease({ operation: 'agent-enable' }, async () => withMpsEnablePreparation(request, async ({ mps, mpsLaunch }) => {
+    return withHeldOrAcquiredWorkspaceMutationLease({ operation: 'agent-enable' }, async () => {
+    const request = { agentName, mode, repoNameParam, aliasParam, authModeParam, authOptions };
+    return withMpsEnablePreparation(request, async ({ mps, mpsLaunch }) => {
     let prepared;
     try {
         prepared = prepareAgentEnableBatch([{
@@ -974,7 +975,8 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
             error,
         );
     }
-    }));
+    });
+    });
 }
 
 function routeKeyForEnabledRecord(record) {

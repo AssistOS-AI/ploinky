@@ -3238,10 +3238,10 @@ async function startWorkspace(staticAgentArg, portArg, {
             instanceId: rec.instanceId,
             enableGeneration: rec.enableGeneration,
             forceRecreate: newlyPreparedContainers.has(name),
-            forceRecreateReason: 'runtime identity rotated earlier in this start',
             // The graph removal step already removed every changed
             // predecessor, so the slot holds nothing or the exact successor.
             expectedPredecessor: null,
+            forceRecreateReason: 'runtime identity rotated earlier in this start',
             preservePreparedRegistryRecord: true,
             preparationLease: workspacePreparationLease,
             preparedHostModeCapability,
