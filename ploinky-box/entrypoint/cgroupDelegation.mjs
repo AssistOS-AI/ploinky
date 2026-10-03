@@ -10,6 +10,7 @@
 
 import fs from 'node:fs';
 import process from 'node:process';
+import { pathToFileURL } from 'node:url';
 
 export const CGROUP_ROOT = '/sys/fs/cgroup';
 export const WANTED_CONTROLLERS = Object.freeze(['cpu', 'memory', 'pids']);
@@ -239,7 +240,13 @@ export async function prepareCgroupDelegation({
     }
 }
 
-const invokedDirectly = Boolean(process.argv[1]) && import.meta.url === new URL(`file://${process.argv[1]}`).href;
+// process.argv[1] is the script path when run directly; under `node -e SOURCE ARG` it is the first ARG, which may itself be a URL
+// (or any text). Only a real script path that names this module counts as a direct run; anything else is an import.
+const invokedDirectly = (() => {
+    const entry = process.argv[1];
+    if (!entry) return false;
+    try { return import.meta.url === pathToFileURL(entry).href; } catch (_) { return false; }
+})();
 if (invokedDirectly) {
     const { exitCode, result } = await prepareCgroupDelegation();
     process.stdout.write(`${JSON.stringify(result)}\n`);
