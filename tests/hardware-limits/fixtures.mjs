@@ -797,6 +797,8 @@ export function buildRequiredCaseManifest() {
             'M06.cpu-ram-reads-that-return-after-their-request-settled-never-count-as-in-flight',
             'M06.gpu-rows-that-return-after-their-request-settled-never-count-as-in-flight',
             'M06.slow-reads-inside-a-long-request-and-fast-reads-inside-slow-requests-count-and-pass',
+            'R12a.a-reduced-route-refusal-whose-later-preview-shows-another-reason-fails-and-so-does-a-refusal-with-an-active-deployment',
+            'R12a.free-gpu-memory-between-the-old-share-threshold-and-the-admission-threshold-proceeds-and-less-than-the-admission-need-blocks',
             'R2D.a-standalone-cleanup-writes-its-own-llm-cleanup-proof-and-the-live-runs-proof-is-not-accepted-for-it',
             'R2D.a-proof-another-action-or-run-left-or-one-that-lists-remaining-data-does-not-certify-a-cleanup',
             // The runner-environment check against local-llm's own launch environment.

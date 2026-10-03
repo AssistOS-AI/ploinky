@@ -66,6 +66,11 @@ export function createLlmWorld({ statePath, node, engine, host, gpu, faults = {}
 
     // --- Admission -----------------------------------------------------------------------------
     const qualified = () => faults.qualified === true || llm.qualified === true;
+    // `laterPreviewReason`: once a Run has been refused, the admission preview shows another reason code (the host changed).
+    function previewAdmission(modelId, runnerId) {
+        const verdict = admission(modelId, runnerId);
+        return faults.laterPreviewReason && L.refusals.length > 0 ? { ...verdict, status: 'incompatible', reasonCode: faults.laterPreviewReason } : verdict;
+    }
     function admission(modelId, runnerId) {
         const a = agent();
         if (runnerId === 'llama.cpp') {
@@ -187,7 +192,7 @@ export function createLlmWorld({ statePath, node, engine, host, gpu, faults = {}
                 else { L.install.phase = 'installed'; writeModelData('vllm-cache'); fs.mkdirSync(path.join(model().workspace, '.data', 'local-llm', 'runners', 'vllm'), { recursive: true }); fs.writeFileSync(path.join(model().workspace, '.data', 'local-llm', 'runners', 'vllm', 'cache.whl'), 'fake wheel'); }
             }
             const wanted = view.model ? modelView(view.model) : null;
-            const preview = args.preview ? { modelId: args.preview.modelId, runnerId: args.preview.runnerId, params: {}, admission: admission(args.preview.modelId, args.preview.runnerId) } : undefined;
+            const preview = args.preview ? { modelId: args.preview.modelId, runnerId: args.preview.runnerId, params: {}, admission: previewAdmission(args.preview.modelId, args.preview.runnerId) } : undefined;
             return { ok: true, agent: 'local-llm', result: {
                 profile: 'dedicated', limits: budgetOf(a) ? { budget: budgetOf(a) } : null,
                 hardware: { gpu: { available: true, name: gpu.name, driverVersion: gpu.driverVersion, totalBytes: gpu.memoryMiB * MIB, usedBytes: 13 * MIB, freeBytes: (gpu.memoryMiB - 13) * MIB, memoryModel: 'dedicated', device: { pciDeviceId: '0x252010DE', computeCapability: '8.6' } }, memory: { totalBytes: visible.memoryBytes, availableBytes: visible.memoryBytes - GIB }, cpus: visible.cpus },
@@ -211,6 +216,8 @@ export function createLlmWorld({ statePath, node, engine, host, gpu, faults = {}
             if (verdict.status !== 'ok' && !faults.runAcceptedAnyway) {
                 L.refusals.push({ modelId: args.modelId, runnerId: args.runnerId, status: verdict.status });
                 const code = `admission_${verdict.status.replace('-', '_')}`;
+                // `refusedWhileActive`: the refusal is reported, yet a deployment is active (a launch the refusal did not prevent).
+                if (faults.refusedWhileActive) L.phase = 'loading';
                 if (faults.refusalAsPlainText) return { ok: false, agent: 'local-llm', error: { code: 'tool_error', message: verdict.reason } };
                 // The real route flattens a tool error into text: the code and the message survive, the details do not.
                 if (faults.refusalFlattened) return refusal(code, verdict.reason);

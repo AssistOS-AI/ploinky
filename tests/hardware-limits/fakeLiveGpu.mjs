@@ -195,7 +195,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
         for (const foreign of model.foreign) rows.push({ pid: foreign.pid, type: foreign.type || 'C', name: foreign.name || 'train.py', mib: foreign.mib });
         for (const extra of model.extraRows) if (model.procs.has(extra.pid)) rows.push({ ...extra, listOnly: true });
         // A row that states its memory (a display process) adds exactly that; the others keep the fixed 300 MiB.
-        const usedMiB = 13 + (rows.some(row => row.mib === undefined) ? 300 : 0) + rows.reduce((sum, row) => sum + (row.listOnly ? 0 : (row.mib ?? 0)), 0) + model.probes.filter(probe => probe.active).reduce((sum, probe) => sum + probe.allocatedMiB, 0);
+        const usedMiB = (faults.smiExtraUsedMiB ?? 0) + 13 + (rows.some(row => row.mib === undefined) ? 300 : 0) + rows.reduce((sum, row) => sum + (row.listOnly ? 0 : (row.mib ?? 0)), 0) + model.probes.filter(probe => probe.active).reduce((sum, probe) => sum + probe.allocatedMiB, 0);
         const section = faults.smiProcessesNA ? 'N/A'
             : rows.map(row => `<process_info><gpu_instance_id>N/A</gpu_instance_id><compute_instance_id>N/A</compute_instance_id><pid>${row.pid}</pid><type>${row.type}</type><process_name>${row.name}</process_name><used_memory>${row.mib ?? 300} MiB</used_memory></process_info>`).join('\n');
         const xml = `<?xml version="1.0" ?>\n<!DOCTYPE nvidia_smi_log SYSTEM "nvsmi_device_v12.dtd">\n<nvidia_smi_log>\n<timestamp>Fri Oct  2 19:30:00 2026</timestamp>\n<driver_version>${gpu.driverVersion}</driver_version>\n<attached_gpus>1</attached_gpus>\n`

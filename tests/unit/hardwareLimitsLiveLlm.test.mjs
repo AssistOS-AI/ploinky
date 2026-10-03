@@ -1663,3 +1663,34 @@ test('M06.slow-reads-inside-a-long-request-and-fast-reads-inside-slow-requests-c
     }
     nothingOwned(fast);
 });
+
+// --- R12-a: the stage 2 checks that survived mutation ---------------------------------------------------------------------
+test('R12a.a-reduced-route-refusal-whose-later-preview-shows-another-reason-fails-and-so-does-a-refusal-with-an-active-deployment', async t => {
+    for (const [label, faults, pattern] of [
+        ['a flattened refusal and a later preview with another reason code', { refusalFlattened: true, laterPreviewReason: 'admission_other_reason' }, /was not refused as vllm_mps_unqualified before any launch/],
+        ['a refusal while the deployment phase is active', { refusalFlattened: true, refusedWhileActive: true }, /was not refused as vllm_mps_unqualified before any launch/],
+    ]) {
+        const w = await provisioned(t, { block: 'apparatus-vllm', vllm: stageTwo(false), qualified: false, faults });
+        const l3 = caseOf(await liveCases(w, ['LIVE-L3']), 'LIVE-L3');
+        assert.equal(l3.result, 'fail', `${label}: ${JSON.stringify(l3).slice(0, 400)}`); assert.match(l3.reason, pattern, label);
+        const observed = w.artifacts.get('gpu-live-l3').refusalObserved;
+        assert.equal(observed.refused === false || observed.phase === 'loading', true, label);
+        assert.equal(toolCalls(w, 'local_llm_test_prompt').length, 0, label);
+        nothingOwned(w);
+    }
+});
+
+test('R12a.free-gpu-memory-between-the-old-share-threshold-and-the-admission-threshold-proceeds-and-less-than-the-admission-need-blocks', async t => {
+    // The 90 % share is 5529 MiB: the old figure (share + 256) was 5785 MiB; the admission need plus slack is 4990 MiB.
+    const proceeds = await provisioned(t, { block: 'apparatus-vllm', vllm: stageTwo(true), qualified: true, faults: { smiExtraUsedMiB: 400 } });
+    const passed = caseOf(await liveCases(proceeds, ['LIVE-L3']), 'LIVE-L3');
+    assert.equal(passed.result, 'pass', JSON.stringify(passed).slice(0, 500));
+    const threshold = proceeds.artifacts.get('gpu-live-l3').freeMemoryThreshold;
+    assert.deepEqual([threshold.basis, threshold.minFreeMiB, threshold.shareMiB + 256], ['admission-estimate', 4990, 5785]);
+    nothingOwned(proceeds);
+    const blocks = await provisioned(t, { block: 'apparatus-vllm', vllm: stageTwo(true), qualified: true, faults: { smiExtraUsedMiB: 1200 } });
+    const blocked = caseOf(await liveCases(blocks, ['LIVE-L3']), 'LIVE-L3');
+    assert.equal(blocked.result, 'blocked', JSON.stringify(blocked).slice(0, 500)); assert.match(blocked.reason, /insufficient_free_memory|MiB free, 4990 MiB needed/);
+    assert.equal(toolCalls(blocks, 'local_llm_run').filter(call => call.args.runnerId === 'vllm').length, 0, 'no model was started');
+    nothingOwned(blocks);
+});
