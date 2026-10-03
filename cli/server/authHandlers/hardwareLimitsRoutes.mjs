@@ -171,7 +171,7 @@ export function buildHardwareLimitsState({ context, installed, registry, routing
         agents.push({ ref: agent.ref, configured: context.overrides?.get(agent.ref) || {}, declared, effective: { ...(admission?.descriptor?.hardwarePlacement?.expected || {}), ...(admission?.descriptor?.hardwareGpu ? { gpu: admission.descriptor.hardwareGpu } : {}) }, containers, ...(deprecatedDeclaration ? { deprecatedDeclaration } : {}), ...(agent.orphaned ? { orphaned: true } : {}) });
     }
     return {
-        ok: true, token: context.storeToken || null, metricsSampledAt: metrics?.sampledAt || null,
+        ok: true, token: context.storeToken || null, metricsSampledAt: metrics?.sampledAt || null, metricsReadStartedAt: metrics?.readStartedAt || null,
         gate: { state: context.gate, prepared: context.prepared === true, backendReady: context.backendReady === true, controllers: context.controllers || [] },
         envelope: context.envelope || null, gpu: context.gpu || { eligible: false, mode: 'unavailable', assurance: 'best-effort', reason: 'GPU sharing is not qualified in this Box.' },
         help: HARDWARE_HELP, agents: agents.sort((a, b) => a.ref.localeCompare(b.ref)),
@@ -253,11 +253,13 @@ export async function handleHardwareLimitsRoutes(req, res, parsedUrl, {
             });
             // A successful Apply changed containers: the next status read must not see the snapshot of before. Wait, bounded, for a metrics
             // reconcile that started after the Apply ended; if the bound passes the answer still goes out and says the status may lag.
-            let statusFresh = null;
+            let statusFresh = null; let statusWaitMs = null;
             if (result?.ok !== false && (result?.status || 200) < 400) {
-                try { statusFresh = (await refreshMetrics(Date.now()))?.fresh === true; } catch (_) { statusFresh = false; }
+                const waitStartedAt = Date.now();
+                try { statusFresh = (await refreshMetrics(waitStartedAt))?.fresh === true; } catch (_) { statusFresh = false; }
+                statusWaitMs = Date.now() - waitStartedAt;
             }
-            send(result?.status || 200, { ok: result?.ok !== false, ...result, ...(statusFresh === null ? {} : { statusFresh, ...(statusFresh ? {} : { statusNote: 'The workspace metrics snapshot may lag this Apply by a few seconds.' }) }) });
+            send(result?.status || 200, { ok: result?.ok !== false, ...result, ...(statusFresh === null ? {} : { statusFresh, statusWaitMs, ...(statusFresh ? {} : { statusNote: 'The workspace metrics snapshot may lag this Apply by a few seconds.' }) }) });
         } else {
             const gpu = body.action === 'set_agent_limits' && body.limits?.gpu
                 ? qualifyGpu(installed.find((agent) => agent.ref === body.agentRef), Object.values(registry).filter((record) => record?.type === 'agent' && `${record.repoName}/${record.agentName}` === body.agentRef), context, body.limits) : context.gpu;

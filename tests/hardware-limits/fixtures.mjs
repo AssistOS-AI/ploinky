@@ -645,6 +645,8 @@ export function buildRequiredCaseManifest() {
             'S3.a-status-that-is-stale-right-after-the-apply-fails-the-case-and-records-that-it-settled-later-and-what-the-container-was',
             'S3.a-container-that-really-stopped-fails-with-its-exit-code-and-its-log-tail',
             'S3.a-fresh-immediate-status-passes-and-records-nothing-unsettled',
+            'T3.a-status-the-apply-calls-fresh-with-a-ready-target-passes-and-records-its-freshness',
+            'T3.a-status-that-is-not-fresh-fails-even-when-the-instance-reads-starting-and-applied-and-a-fresh-status-that-reads-starting-fails-too',
             'E5.a-diagnostic-poll-that-fails-never-turns-the-immediate-fail-into-a-block-and-the-evidence-survives',
             'E5.a-lagging-status-whose-first-diagnostic-poll-fails-is-still-diagnosed-as-settling-later',
             'E5.a-failed-inspect-or-failed-logs-or-both-leave-the-partial-evidence-and-the-errors-and-still-fail',

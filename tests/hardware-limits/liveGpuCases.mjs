@@ -292,21 +292,23 @@ export function createGpuCases(ctx) {
     }
     // What the status must show of each instance an Apply recreated: its limits applied, not stopped or refused, and (for a share) the
     // daemon's generation.
-    function unsettledProblems(state, refs, keys) {
+    function unsettledProblems(state, refs, keys, { fresh = true } = {}) {
         return refs.flatMap((ref, index) => {
             const entry = agentEntry(state, ref);
             const container = entry?.containers?.find(value => value.key === keys[index]);
             if (!container) return [`${ref}: the status has no instance ${keys[index]}`];
             const problems = [];
-            if (!['ready', 'starting'].includes(container.availability)) problems.push(`${ref}: availability ${container.availability}`);
+            // After the Apply's own fresh status reconcile a target is ready; `starting` is what a snapshot that predates it shows.
+            if (container.availability !== 'ready') problems.push(`${ref}: availability ${container.availability}`);
             if (container.limitsState !== 'applied') problems.push(`${ref}: limitsState ${container.limitsState}`);
             if (entry.configured?.gpu && container.mpsGeneration !== state.gpu?.mpsGeneration) problems.push(`${ref}: mpsGeneration ${container.mpsGeneration} is not the daemon's ${state.gpu?.mpsGeneration}`);
+            if (index === 0 && !fresh) problems.unshift('the Apply did not report a fresh status (statusFresh is not true: the status may predate it)');
             return problems;
         });
     }
     // Watch a status that was not settled (bounded, diagnostic only), capture the containers' own state and logs read-only before cleanup,
     // and fail: a lagging status and a real stop are told apart in the evidence, and neither is a pass.
-    async function failUnsettled(label, refs, keys, immediate, problems, evidence) {
+    async function failUnsettled(label, refs, keys, immediate, problems, evidence, freshness = {}) {
         // The verdict is the immediate FAIL, whatever the diagnostic phase meets: nothing below throws out of this function except that FAIL,
         // every step tolerates its own failure and records it, and the evidence is written first and updated as data arrives.
         const startedAt = Date.now();
@@ -317,7 +319,7 @@ export function createGpuCases(ctx) {
             return `${parts.join(', ') || 'no usable output'}${result?.stderr ? `: ${boundedTail(result.stderr, 160).text.trim()}` : ''}`;
         };
         const record = {
-            label, refs, problems, metricsSampledAt: immediate.metricsSampledAt ?? null, immediate: compact(immediate), last: compact(immediate),
+            label, refs, problems, statusFresh: freshness.statusFresh ?? null, statusWaitMs: freshness.statusWaitMs ?? null, readStartedAt: freshness.readStartedAt ?? null, immediate: compact(immediate), last: compact(immediate),
             convergence: { converged: false, afterMs: null, boundMs: timings.convergenceMs, polls: [], pollErrors: [] }, containers: null, containersAfterPoll: null, phase: 'immediate-failure',
         };
         const persist = () => { try { evidence.put('statusUnsettled', record); } catch { /* the verdict does not depend on it */ } };
@@ -441,8 +443,10 @@ export function createGpuCases(ctx) {
         // instances it recreated read as they are. A status that is not settled is never accepted because a later read converged: the
         // convergence is only watched, to say whether the status lagged or the container really stopped, and the case then fails.
         const stateNow = await admin.state();
-        const unsettled = unsettledProblems(stateNow, applyRefs, keys);
-        if (unsettled.length) await failUnsettled(label, applyRefs, keys, stateNow, unsettled, evidence);
+        const freshness = { label, statusFresh: applied.body?.statusFresh ?? null, statusWaitMs: applied.body?.statusWaitMs ?? null, readStartedAt: stateNow.metricsReadStartedAt ?? null };
+        evidence.put('statusFreshness', [...(evidence.data.statusFreshness ?? []), freshness]);
+        const unsettled = unsettledProblems(stateNow, applyRefs, keys, { fresh: applied.body?.statusFresh === true });
+        if (unsettled.length) await failUnsettled(label, applyRefs, keys, stateNow, unsettled, evidence, freshness);
         return { keys, state: stateNow, reply: applied };
     }
     // An idempotent setup: saves only what differs and applies only what is not applied.

@@ -1932,12 +1932,13 @@ test('S3.a-status-that-is-stale-right-after-the-apply-fails-the-case-and-records
     const w = await provisioned(t, { faults: { statusLagMs: 300 } });
     const p1 = caseOf(await liveCases(w, ['LIVE-P1'], { timings: { convergenceMs: 5000, convergencePollMs: 10 } }), 'LIVE-P1');
     assert.equal(p1.result, 'fail', JSON.stringify(p1).slice(0, 400));
-    assert.match(p1.reason, /^The status was not settled right after the Apply of hwlfixture\/probe \(hwlfixture\/probe: availability stopped; hwlfixture\/probe: limitsState unavailable;/);
+    // The lag renders as the product's S1 does (starting and applied) and the Apply says its status is not fresh.
+    assert.match(p1.reason, /^The status was not settled right after the Apply of hwlfixture\/probe \(the Apply did not report a fresh status \(statusFresh is not true: the status may predate it\); hwlfixture\/probe: availability starting/);
     assert.match(p1.reason, /it settled \d+ ms later, which is a lagging status and not an acceptance/);
     const unsettled = w.artifacts.get('gpu-live-p1').statusUnsettled;
     assert.equal(unsettled.convergence.converged, true); assert.ok(unsettled.convergence.afterMs > 0 && unsettled.convergence.afterMs < 5000);
-    assert.deepEqual([unsettled.immediate[0].availability, unsettled.immediate[0].limitsState, unsettled.last[0].availability, unsettled.last[0].limitsState], ['stopped', 'unavailable', 'ready', 'applied']);
-    assert.match(unsettled.metricsSampledAt, /^\d{4}-\d\d-\d\dT/);
+    assert.deepEqual([unsettled.immediate[0].availability, unsettled.immediate[0].limitsState, unsettled.last[0].availability, unsettled.last[0].limitsState], ['starting', 'applied', 'ready', 'applied']);
+    assert.deepEqual([unsettled.statusFresh, unsettled.statusWaitMs], [false, 12]); assert.match(unsettled.readStartedAt, /^\d{4}-\d\d-\d\dT/); assert.equal('metricsSampledAt' in unsettled, false);
     // The container's own state, read-only: running, so the lag was the status.
     assert.deepEqual([unsettled.containers[0].state.running, unsettled.containers[0].state.status, unsettled.containers[0].state.exitCode, unsettled.containers[0].state.oomKilled], [true, 'running', 0, false]);
     assert.match(unsettled.containers[0].state.id, /^[a-f0-9]{64}$/); assert.ok('startedAt' in unsettled.containers[0].state && 'finishedAt' in unsettled.containers[0].state);
@@ -2049,4 +2050,32 @@ test('E5.a-failed-inspect-or-failed-logs-or-both-leave-the-partial-evidence-and-
         for (const captured of [record.containers, record.containersAfterPoll]) { assert.equal(captured.length, 1, label); assert.ok(check(captured[0]), `${label}: ${JSON.stringify(captured[0])}`); }
         nothingOwned(w);
     }
+});
+
+// --- T3: the immediate acceptance needs a fresh status and a ready target ------------------------------------------------------
+test('T3.a-status-the-apply-calls-fresh-with-a-ready-target-passes-and-records-its-freshness', async t => {
+    const w = await provisioned(t);
+    const p1 = caseOf(await liveCases(w, ['LIVE-P1']), 'LIVE-P1');
+    assert.equal(p1.result, 'pass', JSON.stringify(p1).slice(0, 300));
+    const [freshness] = w.artifacts.get('gpu-live-p1').statusFreshness;
+    assert.deepEqual({ label: freshness.label, statusFresh: freshness.statusFresh, statusWaitMs: freshness.statusWaitMs }, { label: 'p1', statusFresh: true, statusWaitMs: 12 });
+    assert.match(freshness.readStartedAt, /^\d{4}-\d\d-\d\dT/);
+    nothingOwned(w);
+});
+
+test('T3.a-status-that-is-not-fresh-fails-even-when-the-instance-reads-starting-and-applied-and-a-fresh-status-that-reads-starting-fails-too', async t => {
+    const lag = await provisioned(t, { faults: { statusLagMs: 300 } });
+    const lagged = caseOf(await liveCases(lag, ['LIVE-P1'], { timings: { convergenceMs: 3000, convergencePollMs: 10 } }), 'LIVE-P1');
+    assert.equal(lagged.result, 'fail', JSON.stringify(lagged).slice(0, 300));
+    const record = lag.artifacts.get('gpu-live-p1').statusUnsettled;
+    assert.deepEqual([record.immediate[0].availability, record.immediate[0].limitsState, record.statusFresh], ['starting', 'applied', false]);
+    assert.match(lagged.reason, /did not report a fresh status/);
+    nothingOwned(lag);
+    // statusFresh true, yet the target still reads starting: after a fresh reconcile it must be ready.
+    const starting = await provisioned(t, { faults: { startingAfterApply: true } });
+    const entry = caseOf(await liveCases(starting, ['LIVE-P1'], { timings: { convergenceMs: 100, convergencePollMs: 10 } }), 'LIVE-P1');
+    assert.equal(entry.result, 'fail', JSON.stringify(entry).slice(0, 300));
+    assert.match(entry.reason, /hwlfixture\/probe: availability starting/); assert.equal(/did not report a fresh status/.test(entry.reason), false);
+    assert.equal(starting.artifacts.get('gpu-live-p1').statusUnsettled.statusFresh, true);
+    nothingOwned(starting);
 });

@@ -321,10 +321,10 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
             const lagging = Boolean(faults.statusLagMs && agent && Date.now() - (agent.createdMs ?? 0) < faults.statusLagMs);
             const stopped = Boolean(agent && agent.running === false);
             const applied = (share ? Boolean(agent?.share && JSON.stringify(agent.share) === JSON.stringify(share) && daemon && !daemon.lost && agent.mpsGeneration === `${daemon.gen}:${daemon.cfg}`) : !agent?.share) && agent?.limitsKey === policyKey(role);
-            return { ref, configured: model.store.policies[ref] || {}, declared: {}, effective: {}, containers: agent ? [{ key: key(role), alias: null, instanceId: agent.id, enableGeneration: agent.id, availability: lagging || stopped ? 'stopped' : 'ready', limitsState: lagging || stopped ? 'unavailable' : applied ? 'applied' : 'pending', problem: null, mpsGeneration: lagging || stopped ? null : agent.mpsGeneration || null }] : [] };
+            return { ref, configured: model.store.policies[ref] || {}, declared: {}, effective: {}, containers: agent ? [{ key: key(role), alias: null, instanceId: agent.id, enableGeneration: agent.id, availability: stopped ? 'stopped' : lagging || faults.startingAfterApply ? 'starting' : 'ready', limitsState: stopped ? 'unavailable' : lagging ? 'applied' : applied ? 'applied' : 'pending', problem: null, mpsGeneration: stopped ? null : agent.mpsGeneration || null }] : [] };
         });
     }
-    const adminState = () => ({ ok: true, metricsSampledAt: new Date().toISOString(), token: { epoch: model.store.epoch, revision: model.store.revision }, gate: { state: 'on', prepared: true, backendReady: true, controllers: ['cpu', 'memory', 'pids'] }, envelope: faults.envelope === undefined ? envelope : faults.envelope, gpu: gpuStatus(), help: {}, agents: agentsState(), apply: null });
+    const adminState = () => ({ ok: true, metricsSampledAt: new Date().toISOString(), metricsReadStartedAt: new Date(Date.now() - 20).toISOString(), token: { epoch: model.store.epoch, revision: model.store.revision }, gate: { state: 'on', prepared: true, backendReady: true, controllers: ['cpu', 'memory', 'pids'] }, envelope: faults.envelope === undefined ? envelope : faults.envelope, gpu: gpuStatus(), help: {}, agents: agentsState(), apply: null });
     async function admin(method, bodyText) {
         if (faults.adminStatus && method === 'GET') return { status: faults.adminStatus, text: JSON.stringify({ ok: false, error: 'not_authenticated' }) };
         if (method === 'GET') return { status: 200, text: JSON.stringify(adminState()) };
@@ -375,7 +375,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
                 return { status: 409, text: JSON.stringify({ ok: false, status: 409, error: 'TARGETED_DRAIN_FAILED', message, ...(faults.applyBodyPadding ? { padding: 'x'.repeat(faults.applyBodyPadding) } : {}), cause, token: { epoch: model.store.epoch, revision: model.store.revision }, expandedContainers: [],
                     results: roles.map(role => ({ key: key(role), state: 'pending', problem: null, error: 'TARGETED_DRAIN_FAILED', message, cause })) }) };
             }
-            return { status: 200, text: JSON.stringify({ ok: true, expandedContainers: faults.applyUnreported ? [] : [...model.lastReplaced].filter(role => !roles.includes(role)).map(role => key(role)), results: faults.applyUnreported ? [] : roles.map(role => ({ key: key(role), state: 'applied' })) }) };
+            return { status: 200, text: JSON.stringify({ ok: true, statusFresh: !faults.statusLagMs, statusWaitMs: 12, ...(faults.statusLagMs ? { statusNote: 'The workspace metrics snapshot may lag this Apply by a few seconds.' } : {}), expandedContainers: faults.applyUnreported ? [] : [...model.lastReplaced].filter(role => !roles.includes(role)).map(role => key(role)), results: faults.applyUnreported ? [] : roles.map(role => ({ key: key(role), state: 'applied' })) }) };
         }
         return { status: 400, text: JSON.stringify({ ok: false, error: 'unknown_action' }) };
     }
@@ -441,7 +441,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
             // `diagnosticGetFault`: once a GET has shown an unsettled instance (the acceptance read), the GETs that follow while it is still
             // unsettled fail (a nonzero exit, a timeout, or a reply that is not JSON): the diagnostic poll of the runner.
             if (faults.diagnosticGetFault && rest[0] === 'GET' && model.applyCalls.length > 0) {
-                const unsettled = JSON.parse(reply.text).agents?.some(agent => agent.containers.some(container => container.availability === 'stopped')) === true;
+                const unsettled = JSON.parse(reply.text).agents?.some(agent => agent.containers.some(container => container.availability !== 'ready')) === true;
                 if (unsettled) {
                     model.unsettledReads = (model.unsettledReads ?? 0) + 1;
                     if (model.unsettledReads > 1) return { exit: ok('', { status: 1, stderr: 'synthetic: the administrator channel failed' }), timeout: ok('', { status: null, signal: 'SIGKILL', timedOut: true }), malformed: ok('not json {') }[faults.diagnosticGetFault];
