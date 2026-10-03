@@ -1043,6 +1043,12 @@ export function buildRequiredCaseManifest() {
             'CAL.an-unavailable-accelerator-api-is-a-blocking-prerequisite-with-a-clear-message',
             'CAL.the-torch-query-runs-and-records-the-accelerator-pair-or-its-error',
         ]),
+        ...leaves(L, 'p5', 'local-llm/tests/vllm-mps-qualification.test.mjs', [
+            'L3Q.the-reviewed-tuple-resolves-to-the-calibration-evidence-digest-through-the-production-resolver',
+            'L3Q.every-single-changed-tuple-field-resolves-unqualified',
+            'L3Q.the-committed-table-holds-exactly-the-one-reviewed-entry-in-the-tools-rendering',
+            'L3Q.the-comment-above-the-table-states-a-candidate-pending-stage-two-and-claims-nothing-finished',
+        ]),
     ];
     const manifest = { schema: 1, cases };
     return validateCaseManifest(manifest);
