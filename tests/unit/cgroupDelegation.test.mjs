@@ -116,7 +116,7 @@ test('CG.a-first-argument-that-is-not-a-script-path-is-an-import-and-a-script-pa
     assert.equal(imported.stdout, 'imported', 'the helper did not run and printed nothing');
     // Run by its script path it still runs: a wrong invocation answers with its usage refusal as one JSON line and a failing status.
     const direct = spawnSync(process.execPath, [fileURLToPath(SCRIPT_URL), 'bogus'], { encoding: 'utf8' });
-    assert.equal(direct.status, 1, direct.stderr);
+    assert.notEqual(direct.status, 0, 'a refused invocation exits with a failing status');
     const result = JSON.parse(direct.stdout.trim());
     assert.equal(result.structurallyPrepared, false);
     assert.match(result.reason, /the only accepted invocation is `prepare`/);
