@@ -43,7 +43,12 @@ export const GPU_DEADLINES = Object.freeze({ ...DEADLINES, blockMs: 24 * 60 * 10
 // for block, cleanup and margin), and the install and the load are bounded inside it. An install
 // or a load that does not fit is BLOCKED with the progress it made, never an indefinite poll.
 export const LLM_DEADLINES = Object.freeze({ ...GPU_DEADLINES });
-export const VLLM_DEADLINES = Object.freeze({ ...GPU_DEADLINES, blockMs: 1470000, installMs: 12 * 60 * 1000, modelLoadMs: 8 * 60 * 1000 });
+// The vLLM install is bounded by throughput, not by a short clock: a hard cap of 3.5 h for the pinned 3.88 GB wheel set (the product
+// measured about 0.4 MB/s, a raw PyPI probe 1.5 to 2 MB/s) and a stall window: BLOCKED when the download shows no progress for 10 minutes.
+// The block deadline holds the cap, the prerequisites, the calibration, the model load and a margin.
+export const VLLM_INSTALL_CAP_MS = 3.5 * 60 * 60 * 1000;
+export const VLLM_INSTALL_STALL_MS = 10 * 60 * 1000;
+export const VLLM_DEADLINES = Object.freeze({ ...GPU_DEADLINES, blockMs: 15_300_000, installMs: VLLM_INSTALL_CAP_MS, installStallMs: VLLM_INSTALL_STALL_MS, modelLoadMs: 8 * 60 * 1000 });
 const HASH = /^sha256:[a-f0-9]{64}$/;
 const SAFE = /^\/[A-Za-z0-9/_.-]+$/;
 const canonicalFile = file => path.isAbsolute(file) && fs.realpathSync(file) === file && fs.statSync(file).isFile();
@@ -729,7 +734,7 @@ function llmDataSection(run) {
         ...(l3 ? [
             '| The image lock has a vLLM entry for linux/amd64 with CUDA wheels, equal to the pins | step 0 reads and compares it | BLOCKED with the exact missing prerequisite; nothing unpinned is ever installed |',
             '| Free disk for the wheels, their runnable copy and the model | step 0 states free and needed bytes per filesystem | BLOCKED |',
-            `| The install and the model load fit the block deadline | install within ${run.deadlines.installMs} ms, model load within ${run.deadlines.modelLoadMs} ms of a ${run.deadlines.blockMs} ms block | BLOCKED with the progress made |`,
+            `| The install and the model load fit the block deadline | the install has a hard cap of ${run.deadlines.installMs} ms (${(run.deadlines.installMs / 3600000).toFixed(1)} h) and is BLOCKED when its download shows no progress for ${run.deadlines.installStallMs} ms (${run.deadlines.installStallMs / 60000} min); model load within ${run.deadlines.modelLoadMs} ms; the whole block has ${run.deadlines.blockMs} ms (${(run.deadlines.blockMs / 3600000).toFixed(2)} h). The download throughput samples (bytes and time) are recorded | BLOCKED with the progress made, never PASS |`,
             '| The wheels support the device and the denominator is physical | stage 1 reads torch\'s total under two limits | BLOCKED: vLLM under MPS stays unavailable |',
         ] : []),
         '',

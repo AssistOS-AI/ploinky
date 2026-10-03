@@ -63,7 +63,9 @@ export function createLlmCases(ctx) {
     const llm = profile.llm;
     const workspace = profile.workspace.path;
     const timings = { ...LLM_DEFAULT_TIMINGS, ...k.timings };
+    // The install's hard cap and its stall window (no download progress): see VLLM_DEADLINES in liveManifest.mjs.
     const installMs = Number.isInteger(run.deadlines?.installMs) ? run.deadlines.installMs : 12 * 60 * 1000;
+    const installStallMs = Number.isInteger(run.deadlines?.installStallMs) ? run.deadlines.installStallMs : 10 * 60 * 1000;
     const modelLoadMs = Number.isInteger(run.deadlines?.modelLoadMs) ? run.deadlines.modelLoadMs : 20 * 60 * 1000;
     let captureCounter = 0;
     const ref = LLM_REF;
@@ -518,6 +520,14 @@ export function createLlmCases(ctx) {
         evidence.put('installRequest', reply.ok ? { ok: true } : reply.error);
         if (!reply.ok) throw blocked(`The product's runner install refused vLLM (${reply.error.code}): ${String(reply.error.message).slice(0, 300)}`);
         const started = Date.now(); let samples = 0; let last = null;
+        // Throughput evidence and the stall check: progress is any change of the phase, the downloaded bytes or the installing state.
+        const throughput = []; let signature = null; let progressAt = started;
+        const putThroughput = (outcome) => {
+            const withBytes = throughput.filter(entry => Number.isFinite(entry.bytes));
+            const first = withBytes[0]; const lastSample = withBytes.at(-1);
+            const seconds = first && lastSample ? (lastSample.atMs - first.atMs) / 1000 : 0;
+            evidence.put('installThroughput', { capMs: installMs, stallMs: installStallMs, outcome, elapsedMs: Date.now() - started, bytesPerSecond: seconds > 0 ? Math.round((lastSample.bytes - first.bytes) / seconds) : null, samples: throughput.slice(0, 600) });
+        };
         const sampleInstall = overview => overview.runners.find(entry => entry.id === 'vllm')?.install ?? null;
         // The gate is watched across the whole wait, the pause between two polls included: a foreign process that appears
         // while the install runs aborts the wait at once (a 15 s sleep outside the monitor left it unwatched).
@@ -531,12 +541,18 @@ export function createLlmCases(ctx) {
                 if (!finished) await pause(timings.installPollMs, abort);
             });
             last = sampleInstall(overview);
+            const now = Date.now();
+            const nextSignature = JSON.stringify([last?.phase ?? null, last?.download?.bytes ?? null, last?.installing ?? null]);
+            if (nextSignature !== signature) { signature = nextSignature; progressAt = now; }
+            if (throughput.length < 600) throughput.push({ atMs: now - started, phase: last?.phase ?? null, bytes: Number.isFinite(last?.download?.bytes) ? last.download.bytes : null });
             if (samples % 8 === 0 && samples < 400) evidence.step('install', { phase: last?.phase, download: last?.download, installing: last?.installing, version: last?.version });
             samples += 1;
-            if (last?.phase === 'installed') { evidence.put('install', { ...last, elapsedMs: Date.now() - started }); return last; }
-            if (last?.phase === 'error') throw blocked(`The product's vLLM install failed on this host: ${String(last.error).slice(0, 400)}`);
-            if (last?.phase === 'paused') throw blocked(`The vLLM install paused: ${String(last.pausedReason || last.error).slice(0, 300)}`);
-            if (Date.now() - started > installMs) throw blocked(`The vLLM install did not finish within ${installMs} ms (phase ${last?.phase}, ${JSON.stringify(last?.download)})`);
+            if (last?.phase === 'installed') { putThroughput('installed'); evidence.put('install', { ...last, elapsedMs: Date.now() - started }); return last; }
+            if (last?.phase === 'error') { putThroughput('error'); throw blocked(`The product's vLLM install failed on this host: ${String(last.error).slice(0, 400)}`); }
+            if (last?.phase === 'paused') { putThroughput('paused'); throw blocked(`The vLLM install paused: ${String(last.pausedReason || last.error).slice(0, 300)}`); }
+            // STALL: no progress for the stall window is BLOCKED well before the cap (the install cannot finish at that rate).
+            if (now - progressAt > installStallMs) { putThroughput('stalled'); throw blocked(`The vLLM install made no progress for ${installStallMs} ms (phase ${last?.phase}, ${JSON.stringify(last?.download)}); it is BLOCKED, never a pass`); }
+            if (Date.now() - started > installMs) { putThroughput('cap'); throw blocked(`The vLLM install did not finish within ${installMs} ms (phase ${last?.phase}, ${JSON.stringify(last?.download)})`); }
         }
     }
 

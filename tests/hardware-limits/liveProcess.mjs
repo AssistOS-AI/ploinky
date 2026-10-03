@@ -11,7 +11,7 @@ export function runBoundedProcess(binary, args, {
 } = {}) {
     if (!path.isAbsolute(binary) || !path.isAbsolute(cwd || '')
         || !Array.isArray(args) || args.some(value => typeof value !== 'string' || value.includes('\0'))
-        || !Number.isInteger(deadlineMs) || deadlineMs < 1 || deadlineMs > 1800000
+        || !Number.isInteger(deadlineMs) || deadlineMs < 1 || deadlineMs > 18_000_000
         || !Number.isInteger(maxBytes) || maxBytes < 1 || maxBytes > 1048576
         || !(stdinPath === null || (path.isAbsolute(stdinPath) && path.normalize(stdinPath) === stdinPath))) throw new Error('Invalid bounded process invocation');
     if (process.platform === 'win32') throw new Error('Owned process-group transport requires POSIX');

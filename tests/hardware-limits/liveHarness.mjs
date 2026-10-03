@@ -631,7 +631,7 @@ export async function executeLiveRun({ run, action = 'live', persist = () => {},
     const cleanupController = new AbortController();
     // The block deadline recorded in the manifest (the GPU block needs longer
     // than the CPU ones); an unrecorded or out-of-range value keeps 20 minutes.
-    const blockMs = Number.isInteger(run.deadlines?.blockMs) && run.deadlines.blockMs >= 60000 && run.deadlines.blockMs <= 1500000 ? run.deadlines.blockMs : 20 * 60 * 1000;
+    const blockMs = Number.isInteger(run.deadlines?.blockMs) && run.deadlines.blockMs >= 60000 && run.deadlines.blockMs <= 16_200_000 ? run.deadlines.blockMs : 20 * 60 * 1000;
     const blockTimer = setTimeout(() => blockController.abort(), blockMs);
     const blockSignal = signal ? AbortSignal.any([signal, blockController.signal]) : blockController.signal;
     const adapter = createLiveAdapter(profile, { processProvider, signal: blockSignal, cleanupSignal: cleanupController.signal, persist, run, artifacts, hostProc, gpuTimings });

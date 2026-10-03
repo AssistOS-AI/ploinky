@@ -18,7 +18,7 @@ import { writePrivateJson } from '../hardware-limits/fixtures.mjs';
 import { createLiveAdapter, executeCleanupRun, executeLiveRun, liveSourceDigest, validateProfile } from '../hardware-limits/liveHarness.mjs';
 import { provisionRun } from '../hardware-limits/liveFixture.mjs';
 import { candidateArgvProblem, candidateOperationsOf, isCandidateArgv } from '../hardware-limits/candidateArgv.mjs';
-import { buildConcreteManifest, llmPlan, renderSummary, summaryPathFor } from '../hardware-limits/liveManifest.mjs';
+import { buildConcreteManifest, llmPlan, renderSummary, summaryPathFor, VLLM_DEADLINES } from '../hardware-limits/liveManifest.mjs';
 import { llmCleanupProofProblem, writeUstar } from '../hardware-limits/liveStage.mjs';
 import { engineIdentityDigest, hostRecordPaths } from '../hardware-limits/liveCommon.mjs';
 import { fakeEngineInfo, worldState } from '../hardware-limits/fakeLiveEngine.mjs';
@@ -1050,7 +1050,8 @@ test('G2.prepare-live-apparatus-vllm-stage-one-pins-the-lock-entry-and-asks-for-
     const profile = validateProfile(run, { partial: true });
     assert.deepEqual(profile.cases, ['LIVE-L3']); assert.equal(profile.llm.vllm.stage, 'calibration'); assert.equal(profile.llm.vllm.calibration, null);
     assert.deepEqual(profile.llm.vllm.pins, VLLM_PINS); assert.deepEqual(profile.llm.vllm.share, VLLM_SHARE);
-    assert.equal(run.deadlines.blockMs, 1470000); assert.equal(run.deadlines.installMs, 12 * 60 * 1000);
+    // The vLLM install is bounded by throughput: a hard cap of 3.5 h and a 10-minute stall window, inside a block deadline that holds them.
+    assert.equal(run.deadlines.blockMs, 15_300_000); assert.equal(run.deadlines.installMs, 3.5 * 60 * 60 * 1000); assert.equal(run.deadlines.installStallMs, 10 * 60 * 1000);
     const ids = run.target.plan.live.map(entry => entry.id);
     for (const id of ['L3-step0-prerequisites', 'L3-apply', 'L3-install', 'L3-stage1-calibrate']) assert.ok(ids.includes(id), id);
     assert.ok(!ids.includes('L3-run'), 'stage 1 launches no model');
@@ -1715,7 +1716,7 @@ test('R12b.the-approval-summary-says-an-unreachable-source-and-a-slow-model-load
             assert.match(load, new RegExp(`up to ${run.deadlines.modelLoadMs} ms`)); assert.match(load, /BLOCKED with the phase and the download progress; a slow load is never a failure of the case/);
         } else {
             assert.equal(load, undefined, 'the vLLM block runs no L1');
-            assert.ok(rows.some(line => /install within \d+ ms, model load within \d+ ms/.test(line) && /BLOCKED with the progress made/.test(line)), 'the vLLM block states its own deadline row');
+            assert.ok(rows.some(line => /hard cap of \d+ ms .*model load within \d+ ms/.test(line) && /BLOCKED with the progress made/.test(line)), 'the vLLM block states its own deadline row');
         }
     }
 });
@@ -1781,4 +1782,54 @@ test('S3.l1-fails-on-a-status-that-is-stale-right-after-its-apply-and-diagnoses-
     const unsettled = w.artifacts.get('gpu-live-l1').statusUnsettled;
     assert.equal(unsettled.convergence.converged, true); assert.equal(unsettled.containers[0].state.running, true);
     nothingOwned(w);
+});
+
+// --- L3B: the vLLM install bound follows throughput: a hard cap, and a stall window ---------------------------------------------------
+test('L3B.a-slow-but-progressing-install-continues-past-the-stall-window-and-records-its-throughput', async t => {
+    // 150 polls, each moving the download a little: the run lasts far longer than the 100 ms stall window yet never stalls.
+    const w = await provisioned(t, { block: 'apparatus-vllm', faults: { installProgressPolls: 150 } });
+    w.run.deadlines.installMs = 60_000; w.run.deadlines.installStallMs = 100;
+    const report = await liveCases(w, ['LIVE-L3'], { timings: { installPollMs: 2 } });
+    const l3 = caseOf(report, 'LIVE-L3');
+    assert.equal(l3.result, 'pass', JSON.stringify(l3).slice(0, 400));
+    const throughput = w.artifacts.get('gpu-live-l3').installThroughput;
+    assert.equal(throughput.outcome, 'installed'); assert.deepEqual([throughput.capMs, throughput.stallMs], [60_000, 100]);
+    assert.ok(throughput.samples.length >= 100 && throughput.elapsedMs > 100, JSON.stringify({ n: throughput.samples.length, ms: throughput.elapsedMs }));
+    const bytes = throughput.samples.map(sample => sample.bytes).filter(Number.isFinite);
+    assert.ok(bytes.every((value, index) => index === 0 || value >= bytes[index - 1]) && bytes.at(-1) > bytes[0], 'bytes and time samples are recorded and rise');
+    assert.ok(throughput.bytesPerSecond > 0);
+    nothingOwned(w);
+});
+
+test('L3B.a-stalled-install-is-blocked-after-the-stall-window-and-an-install-over-the-cap-is-blocked', async t => {
+    const stalled = await provisioned(t, { block: 'apparatus-vllm', faults: { installStalls: true } });
+    stalled.run.deadlines.installMs = 5_000; stalled.run.deadlines.installStallMs = 80;
+    const t0 = Date.now();
+    const stalledCase = caseOf(await liveCases(stalled, ['LIVE-L3'], { timings: { installPollMs: 5 } }), 'LIVE-L3');
+    assert.equal(stalledCase.result, 'blocked', JSON.stringify(stalledCase).slice(0, 300));
+    assert.match(stalledCase.reason, /The vLLM install made no progress for 80 ms .*BLOCKED, never a pass/);
+    assert.ok(Date.now() - t0 < 4_000, 'blocked at the stall window, long before the cap');
+    assert.equal(stalled.artifacts.get('gpu-live-l3').installThroughput.outcome, 'stalled');
+    assert.equal(toolCalls(stalled, 'local_llm_run').length, 0);
+    nothingOwned(stalled);
+    // Progress that never ends is cut by the cap.
+    const over = await provisioned(t, { block: 'apparatus-vllm', faults: { installProgressForever: true } });
+    over.run.deadlines.installMs = 150; over.run.deadlines.installStallMs = 60_000;
+    const overCase = caseOf(await liveCases(over, ['LIVE-L3'], { timings: { installPollMs: 5 } }), 'LIVE-L3');
+    assert.equal(overCase.result, 'blocked', JSON.stringify(overCase).slice(0, 300));
+    assert.match(overCase.reason, /did not finish within 150 ms/);
+    assert.equal(over.artifacts.get('gpu-live-l3').installThroughput.outcome, 'cap');
+    nothingOwned(over);
+});
+
+test('L3B.the-vllm-block-states-its-cap-its-stall-window-and-a-block-deadline-that-holds-them', async t => {
+    assert.equal(VLLM_DEADLINES.installMs, 12_600_000); assert.equal(VLLM_DEADLINES.installStallMs, 600_000);
+    assert.ok(VLLM_DEADLINES.blockMs >= VLLM_DEADLINES.installMs + VLLM_DEADLINES.modelLoadMs + 600_000 && VLLM_DEADLINES.blockMs <= 16_200_000, 'the block deadline holds the cap and the load, inside the runner ceiling');
+    const f = prepareLlmFixture(t);
+    const { code, runPath, run } = await prepare(f, 'apparatus-vllm', 'l3b', f.pins({ image: LLM_IMAGE, vllm: VLLM_PINS }));
+    assert.equal(code, 0);
+    assert.deepEqual([run.deadlines.installMs, run.deadlines.installStallMs, run.deadlines.blockMs], [12_600_000, 600_000, 15_300_000]);
+    const summary = fs.readFileSync(summaryPathFor(runPath, 'claude'), 'utf8');
+    assert.match(summary, /hard cap of 12600000 ms \(3\.5 h\) and is BLOCKED when its download shows no progress for 600000 ms \(10 min\)/);
+    assert.match(summary, /the whole block has 15300000 ms \(4\.25 h\)/); assert.match(summary, /throughput samples \(bytes and time\) are recorded/);
 });
