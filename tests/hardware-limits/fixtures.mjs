@@ -621,6 +621,7 @@ export function buildRequiredCaseManifest() {
             'P3R.the-candidate-parser-refuses-ports-before-restart-as-live-attempt-7-saw-and-accepts-them-before-start',
             'P3R.every-candidate-argv-of-the-apparatus-mps-manifest-and-of-its-cases-is-accepted-and-restart-carries-no-port',
             'P3R.a-runner-argv-with-ports-before-restart-fails-an-offline-p3-as-attempt-7-did',
+            'P3R.p1-and-p3-record-the-drain-acknowledgement-basis-for-every-apply-and-the-restart',
             'V3.p1-expects-the-rounded-default-and-the-exact-client-share',
             'V3.p1-fails-when-the-daemon-default-is-the-raw-share-instead-of-the-rounded-value',
             'V3.p3-raising-the-share-changes-the-default-from-2-to-3-gib-and-drains-before-the-quit',

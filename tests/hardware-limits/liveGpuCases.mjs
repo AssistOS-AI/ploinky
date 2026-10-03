@@ -23,7 +23,7 @@ import { createHostProc, boxCgroupPrefix, agentLeaf } from './liveGpuHost.mjs';
 import { parseGpuInventory } from './liveGpu.mjs';
 import { createGpuGate, finalGpuObservation, gpuQueryArgv } from './liveGpuGate.mjs';
 import {
-    ADMIN_REQUEST, GPU_AGENT_INSPECT, GPU_SHARES, MIB, MPS_CLIENT_PIPE, GPU_GRANT_FACTS, MPS_FAILURE_EVIDENCE, MPS_KILL_OWNED_DAEMON, MPS_OBSERVE, NESTED_NAME_LIST_FORMAT, PROBE_DEADLINE_MS,
+    ADMIN_REQUEST, DRAIN_ACKNOWLEDGEMENT_BASIS, GPU_AGENT_INSPECT, GPU_SHARES, MIB, MPS_CLIENT_PIPE, GPU_GRANT_FACTS, MPS_FAILURE_EVIDENCE, MPS_KILL_OWNED_DAEMON, MPS_OBSERVE, NESTED_NAME_LIST_FORMAT, PROBE_DEADLINE_MS,
     MPS_CLIENT_USER, TIGHTER_CLIENT, assertMpsControlCommand, classifyMpsReply, controlHelperExecArgv, controlHelperRunArgv, parseProbeResult, probeBoundMiB, probeExecArgv, serverDefaultMiB, shareMemoryMiB,
 } from './liveGpuCommands.mjs';
 
@@ -303,6 +303,10 @@ export function createGpuCases(ctx) {
         };
         const cause = applied.status === 200 && applied.body?.ok !== false ? null : causeOf(applied);
         expects(applied.status === 200 && applied.body?.ok !== false, `Apply of ${applyRefs.join(', ')} failed: ${applied.status} ${cause ? `(${cause}) ` : ''}${applied.text.slice(0, 400)}`);
+        // The drain acknowledgement of every recreate this Apply made, as the product lets it be known (see the basis).
+        evidence.put('drainAcknowledgements', [...(evidence.data.drainAcknowledgements ?? []), {
+            label, refs: [...applyRefs], applyStatus: applied.status, results: (applied.body?.results ?? []).map(entry => ({ state: entry.state })), ...DRAIN_ACKNOWLEDGEMENT_BASIS,
+        }]);
         await sleep(timings.afterApplyMs);
         return { keys, state: await admin.state(), reply: applied };
     }
@@ -718,7 +722,7 @@ export function createGpuCases(ctx) {
             await gate.check('P3-restart');
             const restartTimeline = startTimeline(identityE.daemon, [probeE]);
             try { await command('gpu-restart', profile.node.path, [profile.candidate.path, 'restart', GPU_AGENT_REFS.probe], { deadlineMs: timings.applyMs, capture: `gpu-restart-${++captureCounter}` }); }
-            finally { recordHostState(); evidence.put('restartTimeline', evaluateDrain(await restartTimeline.stop(), { quit: true })); }
+            finally { recordHostState(); evidence.put('restartDrainAcknowledgement', { command: 'restart', ...DRAIN_ACKNOWLEDGEMENT_BASIS }); evidence.put('restartTimeline', evaluateDrain(await restartTimeline.stop(), { quit: true })); }
             expects(evidence.data.restartTimeline.ok, `Host clear and restart: the daemon quit before its client drained, or never quit: ${JSON.stringify(evidence.data.restartTimeline.violation)}`);
             const stateAfterRestart = await admin.state();
             await expectDaemonAbsent(identityE.daemon, stateAfterRestart, 'host clear and ordinary restart', evidence);

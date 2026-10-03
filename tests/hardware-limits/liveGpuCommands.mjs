@@ -23,6 +23,16 @@ export const GPU_SHARES = Object.freeze({
     first: Object.freeze({ smPercent: 25, vramPercent: 17 }),
     raised: Object.freeze({ smPercent: 50, vramPercent: 34 }),
 });
+// What a successful Apply or restart proves about each drained container, recorded in the case evidence. The product does not expose
+// the drained container's exit status: drainTargetedContainer returns it, but its callers discard it (mpsGraph.mjs:181 `drain(...)`,
+// mpsLifecycle.mjs:231) and the journal keeps only the drain receipt. What is certain: a drain returns only after assertCleanTermination
+// (cli/sandbox/docker/targetedContainerLifecycle.js:107-122, called at :184 and :207) found exit status 0, no OOM kill and no state error,
+// and throws TARGETED_DRAIN_FAILED otherwise; so an Apply that answered 200 with state `applied` drained every replaced client with exit 0.
+export const DRAIN_ACKNOWLEDGEMENT_BASIS = Object.freeze({
+    exitStatus: 'not exposed by the product',
+    basis: 'applied-implies-assertCleanTermination-passed (exit 0)',
+    source: 'cli/sandbox/docker/targetedContainerLifecycle.js:107-122',
+});
 export const shareMemoryMiB = (vramPercent, totalMiB) => Math.floor(vramPercent * totalMiB / 100);
 // The daemon-wide memory default the product configures for a share (amendment A6): the share rounded UP to a whole GiB, by
 // the product's own function. The client keeps the exact share (shareMemoryMiB) in its environment.

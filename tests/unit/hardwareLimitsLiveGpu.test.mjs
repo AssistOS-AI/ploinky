@@ -1815,3 +1815,23 @@ test('P3R.a-runner-argv-with-ports-before-restart-fails-an-offline-p3-as-attempt
     assert.equal((await w.cleanup()).verdict, 'PASS');
     nothingOwned(w);
 });
+
+// --- P3R-4: the evidence records the basis of each recreate's drain acknowledgement ---------------------------------------
+test('P3R.p1-and-p3-record-the-drain-acknowledgement-basis-for-every-apply-and-the-restart', async t => {
+    const w = await provisioned(t);
+    const report = await liveCases(w, ['LIVE-P1', 'LIVE-P3']);
+    assert.deepEqual(['LIVE-P1', 'LIVE-P3'].map(id => caseOf(report, id).result), ['pass', 'pass'], JSON.stringify(report.limitations).slice(0, 300));
+    const basis = { exitStatus: 'not exposed by the product', basis: 'applied-implies-assertCleanTermination-passed (exit 0)', source: 'cli/sandbox/docker/targetedContainerLifecycle.js:107-122' };
+    const p1 = w.artifacts.get('gpu-live-p1').drainAcknowledgements;
+    assert.deepEqual(p1, [{ label: 'p1', refs: ['hwlfixture/probe'], applyStatus: 200, results: [{ state: 'applied' }], ...basis }]);
+    const p3 = w.artifacts.get('gpu-live-p3');
+    assert.ok(p3.drainAcknowledgements.length >= 5, JSON.stringify(p3.drainAcknowledgements.map(entry => entry.label)));
+    assert.ok(p3.drainAcknowledgements.every(entry => entry.applyStatus === 200 && entry.results.every(result => result.state === 'applied') && entry.basis === basis.basis && entry.source === basis.source));
+    assert.deepEqual(p3.restartDrainAcknowledgement, { command: 'restart', ...basis });
+    nothingOwned(w);
+    // A refused drain is a failed Apply: no acknowledgement is recorded for it.
+    const refused = await provisioned(t, { faults: { base: { fixtureAgentCommand: 'node -e "setInterval(()=>{},3600000)"' } } });
+    await liveCases(refused, ['LIVE-P1']);
+    assert.equal(refused.artifacts.get('gpu-live-p1').drainAcknowledgements, undefined);
+    nothingOwned(refused);
+});
