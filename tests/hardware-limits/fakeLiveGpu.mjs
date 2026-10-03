@@ -445,7 +445,11 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
                 const unsettled = JSON.parse(reply.text).agents?.some(agent => agent.containers.some(container => container.availability !== 'ready')) === true;
                 if (unsettled) {
                     model.unsettledReads = (model.unsettledReads ?? 0) + 1;
-                    if (model.unsettledReads > 1) return { exit: ok('', { status: 1, stderr: 'synthetic: the administrator channel failed' }), timeout: ok('', { status: null, signal: 'SIGKILL', timedOut: true }), malformed: ok('not json {') }[faults.diagnosticGetFault];
+                    if (model.unsettledReads > 1) {
+                        // `http503`: the route answers 503 store_unreadable with the whole state as its body (over a kilobyte).
+                        if (faults.diagnosticGetFault === 'http503') return ok(JSON.stringify({ status: 503, text: JSON.stringify({ ...adminState(), ok: false, error: 'store_unreadable', message: 'The hardware store is unreadable.', padding: 'x'.repeat(1500) }) }));
+                        return { exit: ok('', { status: 1, stderr: 'synthetic: the administrator channel failed' }), timeout: ok('', { status: null, signal: 'SIGKILL', timedOut: true }), malformed: ok('not json {') }[faults.diagnosticGetFault];
+                    }
                 }
             }
             return ok(JSON.stringify(reply));
@@ -491,6 +495,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
         if (verb === 'container inspect') {
             const format = args[args.indexOf('--format') + 1]; const id = args.at(-1);
             if (format !== GPU_AGENT_INSPECT && format !== CONTAINER_TRUTH_FORMAT) return null;
+            if (format === CONTAINER_TRUTH_FORMAT && faults.truthDelayMs) await new Promise(resolve => setTimeout(resolve, faults.truthDelayMs));
             if (format === CONTAINER_TRUTH_FORMAT && faults.truthInspectResult) return ok(faults.truthInspectResult.stdout ?? '', faults.truthInspectResult);
             if (faults.dropNested?.includes(id)) return failed('Error: no such container');
             const agent = byId(id); const helper = model.helpers.get(id);

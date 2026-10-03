@@ -1949,7 +1949,7 @@ test('S3.a-container-that-really-stopped-fails-with-its-exit-code-and-its-log-ta
     const w = await provisioned(t, { faults: { stopAfterApply: 'probe', stopOomKilled: true, containerLogs: 'serving\nOut of memory: Killed process 7 (python3) token=synthetic-secret-value\n' } });
     const p1 = caseOf(await liveCases(w, ['LIVE-P1'], { timings: { convergenceMs: 150, convergencePollMs: 10 } }), 'LIVE-P1');
     assert.equal(p1.result, 'fail', JSON.stringify(p1).slice(0, 400));
-    assert.match(p1.reason, /it did not settle within 150 ms; the container: hwlfixture\/probe exited exit 137 oom-killed/);
+    assert.match(p1.reason, /it did not settle within 150 ms \(\d+ poll\(s\) in a window of \d+ ms\); the container: hwlfixture\/probe exited exit 137 oom-killed/);
     const unsettled = w.artifacts.get('gpu-live-p1').statusUnsettled;
     assert.equal(unsettled.convergence.converged, false); assert.equal(unsettled.convergence.afterMs, null);
     const [container] = unsettled.containers;
@@ -2010,7 +2010,7 @@ test('E5.a-diagnostic-poll-that-fails-never-turns-the-immediate-fail-into-a-bloc
         assert.match(p1.reason, /^The status was not settled right after the Apply of hwlfixture\/probe \(hwlfixture\/probe: availability stopped; hwlfixture\/probe: limitsState unavailable;/, label);
         const record = w.artifacts.get('gpu-live-p1').statusUnsettled;
         assert.equal(record.phase, 'complete', label);
-        assert.ok(record.convergence.pollErrors.length >= 1 && pattern.test(record.convergence.pollErrors[0].error), `${label}: ${JSON.stringify(record.convergence.pollErrors[0])}`);
+        assert.ok(record.convergence.pollErrors.length >= 1 && pattern.test(record.convergence.pollErrors[0].message), `${label}: ${JSON.stringify(record.convergence.pollErrors[0])}`);
         assert.equal(record.convergence.converged, false);
         // Both moments are captured: right after the immediate failure, and after the watching.
         for (const captured of [record.containers, record.containersAfterPoll]) {
@@ -2137,4 +2137,24 @@ test('T8.a-failed-transport-keeps-its-error-and-marks-the-printed-data-partial-f
     assert.deepEqual([captured.stateTrusted, captured.stateError, captured.logsTrusted, captured.logsError], [true, null, true, null]);
     assert.equal(captured.state.exitCode, 137);
     nothingOwned(normal);
+});
+
+// --- T10: a long poll error keeps its HTTP status and code; the poll window starts after the first capture ----------------------------
+test('T10.a-state-sized-503-poll-error-keeps-its-status-and-code-as-fields-and-a-slow-capture-does-not-use-up-the-poll-window', async t => {
+    const w = await provisioned(t, { faults: { ...STOPPED, diagnosticGetFault: 'http503' } });
+    const p1 = caseOf(await liveCases(w, ['LIVE-P1'], { timings: QUICK_POLL }), 'LIVE-P1');
+    assert.equal(p1.result, 'fail', JSON.stringify(p1).slice(0, 200));
+    const [first] = w.artifacts.get('gpu-live-p1').statusUnsettled.convergence.pollErrors;
+    assert.deepEqual([first.status, first.code], [503, 'store_unreadable']);
+    assert.match(first.message, /^The hardware-limits administrator route answered 503: /, 'the head of the message is kept');
+    assert.ok(first.message.length <= 200);
+    nothingOwned(w);
+    // The first capture takes 300 ms, longer than the 200 ms window: the polls still happen, and the reason says how many.
+    const slow = await provisioned(t, { faults: { ...STOPPED, truthDelayMs: 300 } });
+    const entry = caseOf(await liveCases(slow, ['LIVE-P1'], { timings: QUICK_POLL }), 'LIVE-P1');
+    assert.equal(entry.result, 'fail');
+    const convergence = slow.artifacts.get('gpu-live-p1').statusUnsettled.convergence;
+    assert.ok(convergence.pollCount >= 3 && convergence.pollWindowMs >= 190, JSON.stringify({ count: convergence.pollCount, window: convergence.pollWindowMs }));
+    assert.match(entry.reason, /it did not settle within 200 ms \(\d+ poll\(s\) in a window of \d+ ms\)/);
+    nothingOwned(slow);
 });

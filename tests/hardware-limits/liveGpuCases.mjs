@@ -255,7 +255,7 @@ export function createGpuCases(ctx) {
             const reply = await adminCall('gpu-admin-state', 'GET');
             // An unauthenticated, forbidden, missing or unavailable route is a
             // prerequisite, not a failure of the share.
-            if ([401, 403, 404, 409, 503].includes(reply.status) || !reply.body) throw blocked(`The hardware-limits administrator route answered ${reply.status}: ${reply.text.slice(0, 200)}`);
+            if ([401, 403, 404, 409, 503].includes(reply.status) || !reply.body) throw Object.assign(blocked(`The hardware-limits administrator route answered ${reply.status}: ${reply.text.slice(0, 200)}`), { httpStatus: reply.status, httpError: typeof reply.body?.error === 'string' ? reply.body.error.slice(0, 64) : null });
             expects(reply.status === 200 && reply.body.ok === true && reply.body.token, `Unexpected administrator state reply (${reply.status})`);
             return reply.body;
         },
@@ -357,9 +357,11 @@ export function createGpuCases(ctx) {
         };
         // 1. Right after the immediate failure: what the containers are now.
         record.containers = await captureTruth(); record.phase = 'captured-after-immediate-failure'; persist();
-        // 2. Watch the status, bounded; a poll that fails is recorded and the watching goes on.
+        // 2. Watch the status, bounded; a poll that fails is recorded and the watching goes on. The bound counts from here, after the first
+        //    capture: a slow capture must not use up the window.
+        const pollStartedAt = Date.now();
         let polling = true;
-        while (polling && Date.now() - startedAt < timings.convergenceMs && !signal?.aborted) {
+        while (polling && Date.now() - pollStartedAt < timings.convergenceMs && !signal?.aborted) {
             await sleep(timings.convergencePollMs);
             const afterMs = Date.now() - startedAt;
             try {
@@ -368,16 +370,20 @@ export function createGpuCases(ctx) {
                 const remaining = unsettledProblems(state, refs, keys);
                 record.convergence.polls.push({ afterMs, problems: remaining.length });
                 if (!remaining.length) { record.convergence.converged = true; record.convergence.afterMs = afterMs; polling = false; }
-            } catch (error) { if (record.convergence.pollErrors.length < 60) record.convergence.pollErrors.push({ afterMs, error: bounded(error) }); }
+            } catch (error) {
+                // The HTTP status and the code are separate fields: a long message keeps its head, never only its tail.
+                if (record.convergence.pollErrors.length < 60) record.convergence.pollErrors.push({ afterMs, status: Number.isInteger(error?.httpStatus) ? error.httpStatus : null, code: error?.httpError ?? (typeof error?.code === 'string' ? error.code.slice(0, 64) : null), message: boundedTail(String(error?.message || error), 4096).text.slice(0, 200) });
+            }
             record.convergence.polls = record.convergence.polls.slice(0, 60);
             persist();
         }
         // 3. After the watching: what the containers are then, so the evidence shows both moments.
+        record.convergence.pollWindowMs = Date.now() - pollStartedAt; record.convergence.pollCount = record.convergence.polls.length + record.convergence.pollErrors.length;
         record.containersAfterPoll = await captureTruth(); record.phase = 'complete'; persist();
         const last = record.containersAfterPoll.length ? record.containersAfterPoll : record.containers;
         const truth = last.map(entry => (entry.state && entry.stateTrusted ? `${entry.ref} ${entry.state.status}${entry.state.running ? '' : ` exit ${entry.state.exitCode}${entry.state.oomKilled ? ' oom-killed' : ''}`}` : null)).filter(Boolean).join('; ');
         const { converged, afterMs } = record.convergence;
-        throw new Error(`The status was not settled right after the Apply of ${refs.join(', ')} (${problems.join('; ')}); ${converged ? `it settled ${afterMs} ms later, which is a lagging status and not an acceptance` : `it did not settle within ${timings.convergenceMs} ms`}${truth ? `; the container: ${truth}` : ''}`);
+        throw new Error(`The status was not settled right after the Apply of ${refs.join(', ')} (${problems.join('; ')}); ${converged ? `it settled ${afterMs} ms later, which is a lagging status and not an acceptance` : `it did not settle within ${timings.convergenceMs} ms (${record.convergence.pollCount} poll(s) in a window of ${record.convergence.pollWindowMs} ms)`}${truth ? `; the container: ${truth}` : ''}`);
     }
     // Which fixture clients are running right now (never throws): the observation a drain acknowledgement rests on.
     async function observeClientsRunning() {

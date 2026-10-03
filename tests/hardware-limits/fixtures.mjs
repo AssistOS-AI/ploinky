@@ -653,6 +653,7 @@ export function buildRequiredCaseManifest() {
             'E5.a-lagging-status-whose-first-diagnostic-poll-fails-is-still-diagnosed-as-settling-later',
             'E5.a-failed-inspect-or-failed-logs-or-both-leave-the-partial-evidence-and-the-errors-and-still-fail',
             'T8.a-failed-transport-keeps-its-error-and-marks-the-printed-data-partial-for-the-inspect-and-the-logs',
+            'T10.a-state-sized-503-poll-error-keeps-its-status-and-code-as-fields-and-a-slow-capture-does-not-use-up-the-poll-window',
             'V3.p1-expects-the-rounded-default-and-the-exact-client-share',
             'V3.p1-fails-when-the-daemon-default-is-the-raw-share-instead-of-the-rounded-value',
             'V3.p3-raising-the-share-changes-the-default-from-2-to-3-gib-and-drains-before-the-quit',
