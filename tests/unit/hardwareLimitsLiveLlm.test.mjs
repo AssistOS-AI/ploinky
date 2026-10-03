@@ -17,6 +17,7 @@ import { fileURLToPath } from 'node:url';
 import { writePrivateJson } from '../hardware-limits/fixtures.mjs';
 import { createLiveAdapter, executeCleanupRun, executeLiveRun, liveSourceDigest, validateProfile } from '../hardware-limits/liveHarness.mjs';
 import { provisionRun } from '../hardware-limits/liveFixture.mjs';
+import { candidateArgvProblem, candidateOperationsOf, isCandidateArgv } from '../hardware-limits/candidateArgv.mjs';
 import { buildConcreteManifest, llmPlan, renderSummary, summaryPathFor } from '../hardware-limits/liveManifest.mjs';
 import { llmCleanupProofProblem, writeUstar } from '../hardware-limits/liveStage.mjs';
 import { engineIdentityDigest, hostRecordPaths } from '../hardware-limits/liveCommon.mjs';
@@ -1716,5 +1717,20 @@ test('R12b.the-approval-summary-says-an-unreachable-source-and-a-slow-model-load
             assert.equal(load, undefined, 'the vLLM block runs no L1');
             assert.ok(rows.some(line => /install within \d+ ms, model load within \d+ ms/.test(line) && /BLOCKED with the progress made/.test(line)), 'the vLLM block states its own deadline row');
         }
+    }
+});
+
+// --- P3R: every candidate CLI argv of the local-llm and vLLM blocks is accepted by the real outer parser ----------------------
+test('P3R.every-candidate-argv-of-the-local-llm-and-vllm-manifests-and-cases-is-accepted', async t => {
+    for (const [block, cases, stage] of [['apparatus-local-llm', ['LIVE-L1', 'LIVE-L2'], null], ['apparatus-vllm', ['LIVE-L3'], stageTwo(true)]]) {
+        const w = await provisioned(t, stage ? { block, vllm: stage, qualified: true } : { block });
+        const operations = candidateOperationsOf(w.run);
+        assert.ok(operations.length >= 3, `${block}: ${operations.map(operation => operation.id)}`);
+        for (const operation of operations) assert.equal(candidateArgvProblem(operation.argv), null, `${block} ${operation.id}: ${operation.argv.join(' ')}`);
+        const report = await liveCases(w, cases);
+        assert.equal(report.cases.every(entry => entry.result === 'pass'), true, `${block}: ${JSON.stringify(report.cases.map(entry => [entry.id, entry.result, entry.reason])).slice(0, 400)}`);
+        const issued = w.fake.model?.calls?.filter(call => isCandidateArgv(call.args)).map(call => call.args) ?? [];
+        for (const argv of issued) assert.equal(candidateArgvProblem(argv), null, `${block}: ${argv.join(' ')}`);
+        nothingOwned(w);
     }
 });

@@ -17,6 +17,7 @@ import { executeCleanupRun, jsonDigest, liveSourceDigest, runLiveCommand, valida
 import { FIXTURE_HARDWARE_LIMITS, FIXTURE_REPOSITORY, fixtureContainerName, fixtureManifest, fixturePlan, provisionRun, validateProvisionPlan } from '../hardware-limits/liveFixture.mjs';
 import { admitManifestRuntimeCapabilities, validateManifestRuntimeCapabilities } from '../../cli/sandbox/runtimeCapabilities.js';
 import { deprecatedHardwareDeclarations } from '../../cli/sandbox/hardwareLimits/declaredLimits.mjs';
+import { candidateArgvProblem, candidateOperationsOf, isCandidateArgv } from '../hardware-limits/candidateArgv.mjs';
 import { buildConcreteManifest, summaryPathFor } from '../hardware-limits/liveManifest.mjs';
 import { ARTIFACT_LIMITS, ARTIFACT_VERSIONS, requiredArtifacts, retainArtifact, stageAndDispatch, writeUstar } from '../hardware-limits/liveStage.mjs';
 import { AGENT_INSPECT, ENGINE_INFO_ARGV, INSPECT, MAX_TAIL_BYTES, NESTED_CONTAINER_INSPECT, NESTED_LIST_FORMAT, PS_IDENTITY_FORMAT, boxPsArgv, engineIdentityDigest, engineIdentityFacts, hostRecordPaths, observeEngineIdentity, quarantinePath, workspaceSocketProblem } from '../hardware-limits/liveCommon.mjs';
@@ -1362,4 +1363,22 @@ test('EV1.each-action-names-the-proof-its-pass-needs', () => {
     assert.deepEqual(requiredArtifacts({ profile: gpuProfile, action: 'live', remoteReport: { verdict: 'PASS', cases: [{ id: 'LIVE-P1', result: 'pass' }, { id: 'LIVE-P2', result: 'not-run' }, { id: 'LIVE-P3', result: 'blocked' }] } }), ['gpu-live-p1', 'gpu-live-p3']);
     assert.deepEqual(requiredArtifacts({ profile: gpuProfile, action: 'cleanup', remoteReport: { verdict: 'FAIL' } }), [], 'only a passing result needs proof to be certified');
     assert.deepEqual(requiredArtifacts({ profile: {}, action: 'cleanup', remoteReport: { verdict: 'PASS' } }), [], 'a block without a GPU has no GPU proof');
+});
+
+// --- P3R: every candidate CLI argv of the CPU blocks is accepted by the real outer parser ---------------------------------------
+test('P3R.every-candidate-argv-of-the-cpu-manifests-and-their-provisioning-is-accepted', async t => {
+    for (const block of ['mac-cpu', 'apparatus-cpu']) {
+        const w = world(t, { block });
+        const operations = candidateOperationsOf(w.run);
+        const ids = operations.map(operation => operation.id);
+        for (const id of ['fixture-start', 'destroy-box']) assert.ok(ids.includes(id), `${block}: ${id} in ${ids}`);
+        for (const operation of operations) assert.equal(candidateArgvProblem(operation.argv), null, `${block} ${operation.id}: ${operation.argv.join(' ')}`);
+        const report = await provision(w);
+        assert.equal(report.verdict, 'PASS', `${block}: ${JSON.stringify(report.limitations)}`);
+        const issued = worldState(w.statePath).calls.filter(call => isCandidateArgv(call.args)).map(call => call.args);
+        assert.ok(issued.length >= 1, block);
+        for (const argv of issued) assert.equal(candidateArgvProblem(argv), null, `${block}: ${argv.join(' ')}`);
+        const cleaned = await cleanup(w);
+        assert.equal(cleaned.verdict, 'PASS', block);
+    }
 });

@@ -20,6 +20,7 @@ import { failureEvidenceNames } from '../hardware-limits/liveCommon.mjs';
 import { judgeArtifacts, requiredArtifacts } from '../hardware-limits/liveStage.mjs';
 import { executeCleanupRun, executeLiveRun, liveSourceDigest, validateExecutionProfile, validateProfile } from '../hardware-limits/liveHarness.mjs';
 import { provisionRun } from '../hardware-limits/liveFixture.mjs';
+import { candidateArgvProblem, candidateOperationsOf, isCandidateArgv } from '../hardware-limits/candidateArgv.mjs';
 import { buildConcreteManifest, renderSummary, summaryPathFor } from '../hardware-limits/liveManifest.mjs';
 import { writeUstar } from '../hardware-limits/liveStage.mjs';
 import { engineIdentityDigest, hostRecordPaths } from '../hardware-limits/liveCommon.mjs';
@@ -1777,5 +1778,30 @@ test('R12c.the-fake-daemon-answers-the-sm-default-in-the-captured-form-and-the-r
     const replies = Object.fromEntries(p1.evidence.daemon.controlReplies.map(reply => [reply.command, reply.stdout]));
     assert.equal(replies.get_default_active_thread_percentage, '25.0\n'); assert.equal(replies['get_default_device_pinned_mem_limit 0'], '2G\n');
     assert.deepEqual(p1.evidence.readbackForms.sm, { form: 'integer-percentage', value: 25 });
+    nothingOwned(w);
+});
+
+// --- P3R: every candidate CLI argv of the runner is accepted by the candidate's real outer parser ---------------------------
+test('P3R.the-candidate-parser-refuses-ports-before-restart-as-live-attempt-7-saw-and-accepts-them-before-start', () => {
+    assert.equal(candidateArgvProblem(['/x/ploinky-box/bin/ploinky-box.mjs', '--port', '23456', '--udp-port', '34567', 'restart', 'hwlfixture/probe']), '--port is valid only before start, diagnose, or repair');
+    assert.equal(candidateArgvProblem(['/x/ploinky-box/bin/ploinky-box.mjs', '--udp-port', '34567', 'restart', 'a/b']), '--udp-port is valid only before start, diagnose, or repair');
+    assert.equal(candidateArgvProblem(['/x/ploinky-box/bin/ploinky-box.mjs', '--port', '23456', '--udp-port', '34567', 'start', 'hwlfixture/probe']), null);
+    assert.equal(candidateArgvProblem(['/usr/bin/podman', '--port', '1', 'restart']), null, 'only the candidate CLI is judged');
+});
+
+test('P3R.every-candidate-argv-of-the-apparatus-mps-manifest-and-of-its-cases-is-accepted-and-restart-carries-no-port', async t => {
+    const w = await provisioned(t);
+    const operations = candidateOperationsOf(w.run);
+    const ids = operations.map(operation => operation.id);
+    for (const id of ['gpu-grant', 'fixture-start', 'destroy-box', 'P3-host-clear', 'P3-restart-agent']) assert.ok(ids.includes(id), `${id} in ${ids}`);
+    for (const operation of operations) assert.equal(candidateArgvProblem(operation.argv), null, `${operation.id}: ${operation.argv.join(' ')}`);
+    assert.deepEqual(operations.find(operation => operation.id === 'P3-restart-agent').argv.slice(1), ['restart', 'hwlfixture/probe']);
+    // The case code: every candidate command the run really issued went through the fake's use of the real parser.
+    const report = await liveCases(w, ['LIVE-P1', 'LIVE-P2', 'LIVE-P3', 'LIVE-P4']);
+    assert.deepEqual(report.cases.map(entry => entry.result), ['pass', 'pass', 'pass', 'pass'], JSON.stringify(report.limitations).slice(0, 300));
+    const issued = w.fake.model.calls.filter(call => isCandidateArgv(call.args)).map(call => call.args);
+    for (const argv of issued) assert.equal(candidateArgvProblem(argv), null, argv.join(' '));
+    assert.ok(issued.some(argv => argv.includes('restart')) && issued.some(argv => argv.includes('limits')) && issued.some(argv => argv.includes('grant')) && issued.some(argv => argv.includes('start')) && issued.some(argv => argv.includes('destroy')));
+    assert.deepEqual(issued.find(argv => argv.includes('restart')).slice(1), ['restart', 'hwlfixture/probe']);
     nothingOwned(w);
 });
