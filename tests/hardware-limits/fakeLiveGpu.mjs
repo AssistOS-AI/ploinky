@@ -334,6 +334,8 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
                 ...(gpuShare !== undefined ? { gpu: { smPercent: gpuShare.smPercent, vramPercent: gpuShare.vramPercent } } : {}),
             };
             model.store.revision += 1;
+            // `stopOnSave`: that client stops (by itself) between its save and the Apply.
+            if (faults.stopOnSave) { const stopped = model.agents.get(faults.stopOnSave); if (stopped && refOf(faults.stopOnSave) === body.agentRef) stopped.running = false; }
             return { status: 200, text: JSON.stringify({ ...adminState(), committed: true }) };
         }
         if (body.action === 'clear_agent_limits') {

@@ -626,6 +626,7 @@ export function buildRequiredCaseManifest() {
             'P3R.p1-and-p3-record-the-drain-acknowledgement-basis-for-every-apply-and-the-restart',
             'M-EVID-03.a-restart-that-fails-times-out-or-cannot-spawn-records-its-real-outcome-and-no-acknowledgement',
             'R14b.a-failed-host-clear-restart-or-kill-reports-its-exit-timeout-or-error-and-stderr-in-the-case-reason',
+            'R14c.a-client-that-was-not-running-before-the-apply-is-never-recorded-as-acknowledged',
             'V3.p1-expects-the-rounded-default-and-the-exact-client-share',
             'V3.p1-fails-when-the-daemon-default-is-the-raw-share-instead-of-the-rounded-value',
             'V3.p3-raising-the-share-changes-the-default-from-2-to-3-gib-and-drains-before-the-quit',

@@ -27,10 +27,13 @@ export const GPU_SHARES = Object.freeze({
 // the drained container's exit status: drainTargetedContainer returns it, but its callers discard it (mpsGraph.mjs:181 `drain(...)`,
 // mpsLifecycle.mjs:231) and the journal keeps only the drain receipt. What is certain: a drain returns only after assertCleanTermination
 // (cli/sandbox/docker/targetedContainerLifecycle.js:107-122, called at :184 and :207) found exit status 0, no OOM kill and no state error,
-// and throws TARGETED_DRAIN_FAILED otherwise; so an Apply that answered 200 with state `applied` drained every replaced client with exit 0.
+// and throws TARGETED_DRAIN_FAILED otherwise. That holds only for a client the drain actually reached: a cohort client that was already not
+// running is retired directly (mpsLifecycle.mjs:222-227) and an absent container returns early (targetedContainerLifecycle.js:180-182),
+// both without it. So the claim is made by observation: only a client seen RUNNING immediately before an Apply that answered `applied` is
+// recorded as acknowledged; every other client is recorded as not acknowledged.
 export const DRAIN_ACKNOWLEDGEMENT_BASIS = Object.freeze({
     exitStatus: 'not exposed by the product',
-    basis: 'applied-implies-assertCleanTermination-passed (exit 0)',
+    basis: 'running-before-and-applied-implies-assertCleanTermination-passed (exit 0)',
     source: 'cli/sandbox/docker/targetedContainerLifecycle.js:107-122',
 });
 export const shareMemoryMiB = (vramPercent, totalMiB) => Math.floor(vramPercent * totalMiB / 100);

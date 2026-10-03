@@ -1821,12 +1821,13 @@ test('P3R.p1-and-p3-record-the-drain-acknowledgement-basis-for-every-apply-and-t
     const w = await provisioned(t);
     const report = await liveCases(w, ['LIVE-P1', 'LIVE-P3']);
     assert.deepEqual(['LIVE-P1', 'LIVE-P3'].map(id => caseOf(report, id).result), ['pass', 'pass'], JSON.stringify(report.limitations).slice(0, 300));
-    const basis = { exitStatus: 'not exposed by the product', basis: 'applied-implies-assertCleanTermination-passed (exit 0)', source: 'cli/sandbox/docker/targetedContainerLifecycle.js:107-122' };
+    const basis = { exitStatus: 'not exposed by the product', basis: 'running-before-and-applied-implies-assertCleanTermination-passed (exit 0)', source: 'cli/sandbox/docker/targetedContainerLifecycle.js:107-122' };
     const p1 = w.artifacts.get('gpu-live-p1').drainAcknowledgements;
-    assert.deepEqual(p1, [{ label: 'p1', refs: ['hwlfixture/probe'], applyStatus: 200, results: [{ state: 'applied' }], ...basis }]);
+    assert.equal(p1.length, 1);
+    assert.deepEqual({ ...p1[0], clientsBefore: p1[0].clientsBefore.map(entry => [entry.role, entry.running]) }, { label: 'p1', refs: ['hwlfixture/probe'], applyStatus: 200, results: [{ state: 'applied' }], clientsBefore: [['probe', true], ['peer', true]], acknowledged: ['probe', 'peer'], notAcknowledged: [], ...basis });
     const p3 = w.artifacts.get('gpu-live-p3');
     assert.ok(p3.drainAcknowledgements.length >= 5, JSON.stringify(p3.drainAcknowledgements.map(entry => entry.label)));
-    assert.ok(p3.drainAcknowledgements.every(entry => entry.applyStatus === 200 && entry.results.every(result => result.state === 'applied') && entry.basis === basis.basis && entry.source === basis.source));
+    assert.ok(p3.drainAcknowledgements.every(entry => entry.applyStatus === 200 && entry.results.every(result => result.state === 'applied') && entry.basis === basis.basis && entry.source === basis.source && Array.isArray(entry.clientsBefore)));
     assert.deepEqual(p3.restartDrainAcknowledgement, { command: 'restart', acknowledged: true, ...basis });
     nothingOwned(w);
     // A refused drain is a failed Apply: no acknowledgement is recorded for it.
@@ -1902,4 +1903,23 @@ test('R14b.a-failed-host-clear-restart-or-kill-reports-its-exit-timeout-or-error
             nothingOwned(w);
         }
     }
+});
+
+// --- R14-c: a client that was not running is never recorded as acknowledged --------------------------------------------------
+test('R14c.a-client-that-was-not-running-before-the-apply-is-never-recorded-as-acknowledged', async t => {
+    // The probe stops by itself between its save and the Apply: the drain never reached a running container.
+    const stopped = await provisioned(t, { faults: { stopOnSave: 'probe' } });
+    const report = await liveCases(stopped, ['LIVE-P1']);
+    const p1 = caseOf(report, 'LIVE-P1');
+    assert.equal(p1.result, 'pass', JSON.stringify(p1).slice(0, 300));
+    const [entry] = stopped.artifacts.get('gpu-live-p1').drainAcknowledgements;
+    assert.deepEqual(entry.clientsBefore.map(client => [client.role, client.running]), [['probe', false], ['peer', true]]);
+    assert.deepEqual([entry.acknowledged, entry.notAcknowledged], [['peer'], ['probe']], 'the stopped probe is not recorded as exit-0 acknowledged');
+    nothingOwned(stopped);
+    // The control: every client was running, so every client is acknowledged by observation.
+    const running = await provisioned(t);
+    await liveCases(running, ['LIVE-P1']);
+    const [control] = running.artifacts.get('gpu-live-p1').drainAcknowledgements;
+    assert.deepEqual([control.acknowledged, control.notAcknowledged], [['probe', 'peer'], []]);
+    nothingOwned(running);
 });

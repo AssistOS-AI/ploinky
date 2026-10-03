@@ -288,6 +288,19 @@ export function createGpuCases(ctx) {
             throw Object.assign(new Error(`${kind} failed (${parts.join(', ') || 'no exit status'})${tails.stderrTail ? `: ${tails.stderrTail.trim()}` : ''}`), { result });
         }
     }
+    // Which fixture clients are running right now (never throws): the observation a drain acknowledgement rests on.
+    async function observeClientsRunning() {
+        const rows = await nestedRows();
+        const observed = [];
+        for (const role of fixture.clients) {
+            const name = fixtureContainerName(workspace, nameOf(role), fixture.repository);
+            const matches = rows.filter(row => row.name === name);
+            if (matches.length !== 1) { observed.push({ role, running: false, observed: matches.length ? 'ambiguous' : 'absent' }); continue; }
+            const inspected = await inspectNested(matches[0].id);
+            observed.push({ role, id: hexTail(matches[0].id), running: inspected.running === true });
+        }
+        return observed;
+    }
     async function applyShares(label, policies, applyRefs, evidence) {
         const gate = prepared.gate;
         await gate.check(`before-apply:${label}`);
@@ -302,6 +315,7 @@ export function createGpuCases(ctx) {
         const keys = applyRefs.map(ref => containerKey(before, ref));
         // What a failed Apply needs afterwards: where the Router and Watchdog logs stood when it began, and its full response.
         applyAttempt = { label, refs: [...applyRefs], startedAt: Date.now(), endedAt: null, logMarks: logSizes(), status: null, response: null, error: null };
+        const runningBefore = await observeClientsRunning();
         let applied;
         try { applied = await admin.post(`gpu-apply-${label}`, { action: 'apply', containers: keys }); }
         catch (error) { applyAttempt.endedAt = Date.now(); applyAttempt.error = String(error?.message || error).slice(0, 300); throw error; }
@@ -319,7 +333,8 @@ export function createGpuCases(ctx) {
         expects(applied.status === 200 && applied.body?.ok !== false, `Apply of ${applyRefs.join(', ')} failed: ${applied.status} ${cause ? `(${cause}) ` : ''}${applied.text.slice(0, 400)}`);
         // The drain acknowledgement of every recreate this Apply made, as the product lets it be known (see the basis).
         evidence.put('drainAcknowledgements', [...(evidence.data.drainAcknowledgements ?? []), {
-            label, refs: [...applyRefs], applyStatus: applied.status, results: (applied.body?.results ?? []).map(entry => ({ state: entry.state })), ...DRAIN_ACKNOWLEDGEMENT_BASIS,
+            label, refs: [...applyRefs], applyStatus: applied.status, results: (applied.body?.results ?? []).map(entry => ({ state: entry.state })),
+            clientsBefore: runningBefore, acknowledged: runningBefore.filter(entry => entry.running).map(entry => entry.role), notAcknowledged: runningBefore.filter(entry => !entry.running).map(entry => entry.role), ...DRAIN_ACKNOWLEDGEMENT_BASIS,
         }]);
         await sleep(timings.afterApplyMs);
         return { keys, state: await admin.state(), reply: applied };
