@@ -666,6 +666,8 @@ export function buildRequiredCaseManifest() {
             'R18-1.a-build-that-shows-no-progress-for-longer-than-the-stall-window-passes-but-a-stalled-download-still-blocks',
             'R18-1.a-build-that-never-ends-is-cut-by-the-hard-cap',
             'R18-1.the-operator-summary-states-the-download-stall-window-and-the-build-bound',
+            'R18-2.more-samples-than-the-old-limit-keep-the-first-and-last-download-samples-and-the-throughput-spans-the-whole-download',
+            'R18-2.the-operator-summary-states-the-sample-limit',
             'T9.the-first-artifact-write-holds-the-immediate-failure-before-any-capture-or-poll',
             'T9.a-failed-container-listing-in-both-captures-still-fails-with-the-evidence-present',
             'T9.synthetic-secrets-in-a-poll-error-a-thrown-read-and-a-failed-read-stderr-are-redacted',

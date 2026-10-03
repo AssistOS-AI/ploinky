@@ -1876,3 +1876,39 @@ test('R18-1.the-operator-summary-states-the-download-stall-window-and-the-build-
     assert.match(row, /BLOCKED when its download shows no progress for 600000 ms \(10 min\); that stall window applies only while the product is downloading/);
     assert.match(row, /'installing' is bounded by the hard cap only/);
 });
+
+// --- R18-2: the throughput evidence keeps the first and the last download sample however many polls the install took ------------------
+test('R18-2.more-samples-than-the-old-limit-keep-the-first-and-last-download-samples-and-the-throughput-spans-the-whole-download', async t => {
+    // 1000 progressing polls, then 100 polls of the build (no progress), then installed: 1101 samples against the old limit of 600.
+    const w = await provisioned(t, { block: 'apparatus-vllm', faults: { installProgressPolls: 1000, installingHoldPolls: 100 } });
+    w.run.deadlines.installMs = 120_000; w.run.deadlines.installStallMs = 60_000;
+    const l3 = caseOf(await liveCases(w, ['LIVE-L3'], { timings: { installPollMs: 1 } }), 'LIVE-L3');
+    assert.equal(l3.result, 'pass', JSON.stringify(l3).slice(0, 400));
+    const throughput = w.artifacts.get('gpu-live-l3').installThroughput;
+    const samples = throughput.samples;
+    assert.equal(throughput.outcome, 'installed');
+    assert.ok(throughput.sampleCount >= 1100, `sampleCount ${throughput.sampleCount}`);
+    assert.ok(samples.length <= 602 && samples.length < throughput.sampleCount, `kept ${samples.length}`);
+    assert.equal(throughput.samplesDropped, throughput.sampleCount - samples.length);
+    assert.ok(samples.every((sample, index) => index === 0 || sample.atMs >= samples[index - 1].atMs), 'in time order');
+    // The first poll and the final poll (past the old limit) are both there.
+    assert.equal(samples[0].phase, 'downloading'); assert.equal(samples.at(-1).phase, 'installed');
+    const bytes = samples.map(sample => sample.bytes);
+    assert.ok(bytes.every((value, index) => index === 0 || value >= bytes[index - 1]), 'bytes rise');
+    // The last DOWNLOAD sample is where the bytes last grew; the build samples after it must not dilute the rate.
+    const top = Math.max(...bytes); const lastDownload = samples.find(sample => sample.bytes === top);
+    assert.ok(lastDownload.phase === 'installing' && lastDownload.atMs > samples[0].atMs);
+    const span = (lastDownload.atMs - samples[0].atMs) / 1000;
+    assert.equal(throughput.bytesPerSecond, Math.round((top - samples[0].bytes) / span));
+    assert.ok(samples.at(-1).atMs - lastDownload.atMs > 0, 'the build took time after the download');
+    nothingOwned(w);
+});
+
+test('R18-2.the-operator-summary-states-the-sample-limit', async t => {
+    const f = prepareLlmFixture(t);
+    const { code, runPath } = await prepare(f, 'apparatus-vllm', 'r18-2', f.pins({ image: LLM_IMAGE, vllm: VLLM_PINS }));
+    assert.equal(code, 0);
+    const summary = fs.readFileSync(summaryPathFor(runPath, 'claude'), 'utf8');
+    assert.match(summary, /at most 600 are kept \(the first 300 and the newest 300\), the first and the last download sample are always kept, and the throughput spans the whole download/);
+    assert.match(summary, /the whole block has 15300000 ms \(4\.25 h\)/);
+});

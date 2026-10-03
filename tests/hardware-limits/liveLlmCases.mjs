@@ -22,7 +22,7 @@ import { LEAF_OBSERVATION } from './liveCaseCommands.mjs';
 import { agentLeaf, createHostProc } from './liveGpuHost.mjs';
 import { createGpuCases } from './liveGpuCases.mjs';
 import { MIB, shareMemoryMiB } from './liveGpuCommands.mjs';
-import { LLM_SOURCE_DIRECTORY } from './liveLlmNames.mjs';
+import { INSTALL_SAMPLES_HEAD, INSTALL_SAMPLES_TAIL, LLM_SOURCE_DIRECTORY } from './liveLlmNames.mjs';
 import {
     GIB, INFERENCE_CADENCE, INSUFFICIENT_RAM, L1_MIN_RAM_BYTES, L1_PROMPT, LLM_BUDGET, LLM_FIXTURE, LLM_IMAGE_DIGESTS, LLM_LEAF_SAMPLE, LLM_MODELS, LLM_REF, LLM_RUNNER_PROCESSES, LLM_TOOL_CALL, VLLM_SHARE,
     INFERENCE_MIN_IN_FLIGHT, analyzeInference, classifyObservation, insufficientMemoryPercent, llmToolWords, parseLeafSample, runnerEnvironmentProblems, sourceUnavailable, stageTwoFreeThreshold, summarizeGpuCheck, vllmToolWords,
@@ -521,12 +521,21 @@ export function createLlmCases(ctx) {
         if (!reply.ok) throw blocked(`The product's runner install refused vLLM (${reply.error.code}): ${String(reply.error.message).slice(0, 300)}`);
         const started = Date.now(); let samples = 0; let last = null;
         // Throughput evidence and the stall check: progress is any change of the phase, the downloaded bytes or the installing state.
-        const throughput = []; let signature = null; let progressAt = started;
+        // The evidence keeps the first INSTALL_SAMPLES_HEAD and the newest INSTALL_SAMPLES_TAIL samples, and the first and the last
+        // download sample always (the last one is where the downloaded bytes last grew), so the throughput spans the whole download
+        // however many polls it took and is not diluted by the build that follows it.
+        const head = []; const tail = []; let sampleCount = 0; let firstDownload = null; let lastDownload = null;
+        let signature = null; let progressAt = started;
+        const recordSample = (sample) => {
+            sampleCount += 1;
+            if (Number.isFinite(sample.bytes)) { firstDownload ||= sample; if (!lastDownload || sample.bytes > lastDownload.bytes) lastDownload = sample; }
+            if (head.length < INSTALL_SAMPLES_HEAD) head.push(sample);
+            else { tail.push(sample); if (tail.length > INSTALL_SAMPLES_TAIL) tail.shift(); }
+        };
         const putThroughput = (outcome) => {
-            const withBytes = throughput.filter(entry => Number.isFinite(entry.bytes));
-            const first = withBytes[0]; const lastSample = withBytes.at(-1);
-            const seconds = first && lastSample ? (lastSample.atMs - first.atMs) / 1000 : 0;
-            evidence.put('installThroughput', { capMs: installMs, stallMs: installStallMs, outcome, elapsedMs: Date.now() - started, bytesPerSecond: seconds > 0 ? Math.round((lastSample.bytes - first.bytes) / seconds) : null, samples: throughput.slice(0, 600) });
+            const kept = [...new Set([...head, ...(firstDownload ? [firstDownload] : []), ...tail, ...(lastDownload ? [lastDownload] : [])])].sort((a, b) => a.atMs - b.atMs);
+            const seconds = firstDownload && lastDownload ? (lastDownload.atMs - firstDownload.atMs) / 1000 : 0;
+            evidence.put('installThroughput', { capMs: installMs, stallMs: installStallMs, outcome, elapsedMs: Date.now() - started, bytesPerSecond: seconds > 0 ? Math.round((lastDownload.bytes - firstDownload.bytes) / seconds) : null, sampleCount, samplesDropped: sampleCount - kept.length, samples: kept });
         };
         const sampleInstall = overview => overview.runners.find(entry => entry.id === 'vllm')?.install ?? null;
         // The gate is watched across the whole wait, the pause between two polls included: a foreign process that appears
@@ -544,7 +553,7 @@ export function createLlmCases(ctx) {
             const now = Date.now();
             const nextSignature = JSON.stringify([last?.phase ?? null, last?.download?.bytes ?? null, last?.installing ?? null]);
             if (nextSignature !== signature) { signature = nextSignature; progressAt = now; }
-            if (throughput.length < 600) throughput.push({ atMs: now - started, phase: last?.phase ?? null, bytes: Number.isFinite(last?.download?.bytes) ? last.download.bytes : null });
+            recordSample({ atMs: now - started, phase: last?.phase ?? null, bytes: Number.isFinite(last?.download?.bytes) ? last.download.bytes : null });
             if (samples % 8 === 0 && samples < 400) evidence.step('install', { phase: last?.phase, download: last?.download, installing: last?.installing, version: last?.version });
             samples += 1;
             if (last?.phase === 'installed') { putThroughput('installed'); evidence.put('install', { ...last, elapsedMs: Date.now() - started }); return last; }

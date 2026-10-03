@@ -11,7 +11,7 @@ import crypto from 'node:crypto';
 import { WANTED_CONTROLLERS } from '../../ploinky-box/entrypoint/cgroupDelegation.mjs';
 import { ENGINE_CONNECTIONS_ARGV, ENGINE_INFO_ARGV, HOST_RECORD_DIRECTORIES, IMAGE_REF, OWNER_MARKER, UNIX_SOCKET_PATH_LIMIT, WORKSPACE_SOCKET_NAME, digest, keys, liveSourceDigest, AGENT_INSPECT, INSPECT } from './liveCommon.mjs';
 import { FIXTURE_AGENT_COMMAND, FIXTURE_REPOSITORY, GPU_PROBE_TARGET, fixtureContainerName, fixtureManifest, fixturePlan, proposedWorkspaceIdentity, rewriteLlmManifest, startArgs } from './liveFixture.mjs';
-import { LLM_MODELS, LLM_REF, LLM_REPOSITORY, LLM_SOURCE_DIRECTORY } from './liveLlmNames.mjs';
+import { INSTALL_SAMPLES_HEAD, INSTALL_SAMPLES_TAIL, LLM_MODELS, LLM_REF, LLM_REPOSITORY, LLM_SOURCE_DIRECTORY } from './liveLlmNames.mjs';
 import {
     INFERENCE_CADENCE, INFERENCE_TOLERANCE, INSUFFICIENT_RAM, L1_PROMPT, LLM_BUDGET, LLM_IMAGE_DIGESTS, LLM_IMAGE_FILES, LLM_LEAF_SAMPLE, LLM_RUNNER_PROCESSES, LLM_TOOL_CALL, PLAYGROUND_DECISION, VLLM_SHARE, insufficientMemoryPercent, llmToolWords, vllmToolWords,
 } from './liveLlmCommands.mjs';
@@ -38,10 +38,10 @@ export const DEADLINES = Object.freeze({
 });
 // The GPU block needs longer than the CPU ones: P3 alone runs six Applies.
 export const GPU_DEADLINES = Object.freeze({ ...DEADLINES, blockMs: 24 * 60 * 1000 });
-// The local-llm blocks load a model after two Applies. The vLLM block installs 3.9 GB of wheels and
-// loads a 2.7 GB snapshot: its block deadline is the longest the SSH dispatch allows (1,800,000 ms
-// for block, cleanup and margin), and the install and the load are bounded inside it. An install
-// or a load that does not fit is BLOCKED with the progress it made, never an indefinite poll.
+// The local-llm blocks (L1, L2) load a model after two Applies, inside the GPU block deadline. The vLLM block (L3) installs 3.9 GB of
+// wheels and loads a 2.7 GB snapshot: it has its own deadlines, VLLM_DEADLINES below, which the SSH dispatch allows (up to 18,000,000 ms
+// for the block, cleanup and margin), and the install and the load are bounded inside them. An install or a load that does not fit
+// is BLOCKED with the progress it made, never an indefinite poll.
 export const LLM_DEADLINES = Object.freeze({ ...GPU_DEADLINES });
 // The vLLM install is bounded by throughput, not by a short clock: a hard cap of 3.5 h for the pinned 3.88 GB wheel set (the product
 // measured about 0.4 MB/s, a raw PyPI probe 1.5 to 2 MB/s) and a stall window: BLOCKED when the download shows no progress for 10 minutes.
@@ -734,7 +734,7 @@ function llmDataSection(run) {
         ...(l3 ? [
             '| The image lock has a vLLM entry for linux/amd64 with CUDA wheels, equal to the pins | step 0 reads and compares it | BLOCKED with the exact missing prerequisite; nothing unpinned is ever installed |',
             '| Free disk for the wheels, their runnable copy and the model | step 0 states free and needed bytes per filesystem | BLOCKED |',
-            `| The install and the model load fit the block deadline | the install has a hard cap of ${run.deadlines.installMs} ms (${(run.deadlines.installMs / 3600000).toFixed(1)} h) and is BLOCKED when its download shows no progress for ${run.deadlines.installStallMs} ms (${run.deadlines.installStallMs / 60000} min); that stall window applies only while the product is downloading, because the product reports no progress while it builds ('installing': the Python environment and the wheel install), so 'installing' is bounded by the hard cap only; model load within ${run.deadlines.modelLoadMs} ms; the whole block has ${run.deadlines.blockMs} ms (${(run.deadlines.blockMs / 3600000).toFixed(2)} h). The download throughput samples (bytes and time) are recorded | BLOCKED with the progress made, never PASS |`,
+            `| The install and the model load fit the block deadline | the install has a hard cap of ${run.deadlines.installMs} ms (${(run.deadlines.installMs / 3600000).toFixed(1)} h) and is BLOCKED when its download shows no progress for ${run.deadlines.installStallMs} ms (${run.deadlines.installStallMs / 60000} min); that stall window applies only while the product is downloading, because the product reports no progress while it builds ('installing': the Python environment and the wheel install), so 'installing' is bounded by the hard cap only; model load within ${run.deadlines.modelLoadMs} ms; the whole block has ${run.deadlines.blockMs} ms (${(run.deadlines.blockMs / 3600000).toFixed(2)} h). The download throughput samples (bytes and time) are recorded: at most ${INSTALL_SAMPLES_HEAD + INSTALL_SAMPLES_TAIL} are kept (the first ${INSTALL_SAMPLES_HEAD} and the newest ${INSTALL_SAMPLES_TAIL}), the first and the last download sample are always kept, and the throughput spans the whole download | BLOCKED with the progress made, never PASS |`,
             '| The wheels support the device and the denominator is physical | stage 1 reads torch\'s total under two limits | BLOCKED: vLLM under MPS stays unavailable |',
         ] : []),
         '',
