@@ -441,12 +441,14 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
             const reply = await admin(rest[0], rest[1]);
             // `diagnosticGetFault`: once a GET has shown an unsettled instance (the acceptance read), the GETs that follow while it is still
             // unsettled fail (a nonzero exit, a timeout, or a reply that is not JSON): the diagnostic poll of the runner.
+            if (rest[0] === 'GET' && model.applyCalls.length > 0 && JSON.parse(reply.text).agents?.some(agent => agent.containers.some(container => container.availability !== 'ready'))) model.unsettledSeen = true;
             if (faults.diagnosticGetFault && rest[0] === 'GET' && model.applyCalls.length > 0) {
                 const unsettled = JSON.parse(reply.text).agents?.some(agent => agent.containers.some(container => container.availability !== 'ready')) === true;
                 if (unsettled) {
                     model.unsettledReads = (model.unsettledReads ?? 0) + 1;
                     if (model.unsettledReads > 1) {
                         // `http503`: the route answers 503 store_unreadable with the whole state as its body (over a kilobyte).
+                        if (faults.diagnosticGetFault === 'errorText') return ok(JSON.stringify({ error: 'boom token=SYNTHETIC-SECRET-POLL-1' }));
                         if (faults.diagnosticGetFault === 'http503') return ok(JSON.stringify({ status: 503, text: JSON.stringify({ ...adminState(), ok: false, error: 'store_unreadable', message: 'The hardware store is unreadable.', padding: 'x'.repeat(1500) }) }));
                         return { exit: ok('', { status: 1, stderr: 'synthetic: the administrator channel failed' }), timeout: ok('', { status: null, signal: 'SIGKILL', timedOut: true }), malformed: ok('not json {') }[faults.diagnosticGetFault];
                     }
@@ -484,6 +486,10 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
         const verb = args.slice(0, 2).join(' ');
         // `observeFailsBeforeApply`: between a save and the Apply, the runner's own look at the clients fails (the listing or an inspect).
         const beforeApply = faults.observeFailsBeforeApply && model.saved && model.applyCalls.length === 0;
+        // `listingFailsAfterUnsettled`: once an unsettled status has been answered, the nested container listing fails.
+        if (faults.listingFailsAfterUnsettled && model.unsettledSeen && verb === 'container ps') return failed('Error: synthetic listing failure');
+        if (faults.truthThrows && verb === 'container inspect' && args[args.indexOf('--format') + 1] === CONTAINER_TRUTH_FORMAT) throw new Error('spawn failure token=SYNTHETIC-SECRET-READ-2');
+        if (faults.onTruthInspect && verb === 'container inspect' && args[args.indexOf('--format') + 1] === CONTAINER_TRUTH_FORMAT) faults.onTruthInspect();
         if (beforeApply && faults.observeFailsBeforeApply === 'ps' && verb === 'container ps') return failed('Error: synthetic nested listing failure token=SYNTHETIC-SECRET-VALUE-1');
         if (beforeApply && faults.observeFailsBeforeApply === 'inspect' && verb === 'container inspect') return failed('Error: synthetic nested inspect failure');
         if (verb === 'container ps') {

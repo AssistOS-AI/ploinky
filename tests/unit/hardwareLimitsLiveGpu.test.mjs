@@ -2158,3 +2158,63 @@ test('T10.a-state-sized-503-poll-error-keeps-its-status-and-code-as-fields-and-a
     assert.match(entry.reason, /it did not settle within 200 ms \(\d+ poll\(s\) in a window of \d+ ms\)/);
     nothingOwned(slow);
 });
+
+// --- T9: the guarantees of the failure diagnosis are pinned: write order, the listing, redaction, the abort check and the cap -------
+const SECRETS = ['SYNTHETIC-SECRET-POLL-1', 'SYNTHETIC-SECRET-READ-2', 'SYNTHETIC-SECRET-STDERR-3'];
+test('T9.the-first-artifact-write-holds-the-immediate-failure-before-any-capture-or-poll', async t => {
+    const w = await provisioned(t, { faults: STOPPED });
+    const phases = [];
+    const record = (name, value) => { w.artifacts.set(name, structuredClone(value)); if (name === 'gpu-live-p1' && value.statusUnsettled) phases.push({ phase: value.statusUnsettled.phase, captured: value.statusUnsettled.containers !== null, polls: value.statusUnsettled.convergence.polls.length + value.statusUnsettled.convergence.pollErrors.length, after: value.statusUnsettled.containersAfterPoll !== null }); };
+    await liveCases(w, ['LIVE-P1'], { timings: QUICK_POLL, artifacts: record });
+    // The very first write that carries the record: the immediate failure only, nothing captured, nothing polled.
+    assert.deepEqual(phases[0], { phase: 'immediate-failure', captured: false, polls: 0, after: false });
+    const order = phases.map(entry => entry.phase);
+    assert.ok(order.indexOf('captured-after-immediate-failure') > order.indexOf('immediate-failure') && order.indexOf('complete') > order.indexOf('captured-after-immediate-failure'), order.join(','));
+    assert.ok(phases.some(entry => entry.phase === 'captured-after-immediate-failure' && entry.captured && entry.polls === 0), 'the first capture is written before the first poll');
+    assert.ok(phases.filter(entry => entry.polls > 0).length >= 1, 'the polls are written as they happen');
+    nothingOwned(w);
+});
+
+test('T9.a-failed-container-listing-in-both-captures-still-fails-with-the-evidence-present', async t => {
+    const w = await provisioned(t, { faults: { ...STOPPED, listingFailsAfterUnsettled: true } });
+    const p1 = caseOf(await liveCases(w, ['LIVE-P1'], { timings: QUICK_POLL }), 'LIVE-P1');
+    assert.equal(p1.result, 'fail', JSON.stringify(p1).slice(0, 300));
+    const record = w.artifacts.get('gpu-live-p1').statusUnsettled;
+    assert.equal(record.phase, 'complete');
+    for (const captured of [record.containers, record.containersAfterPoll]) { assert.equal(captured.length, 1); assert.match(captured[0].error, /Live command failed/); }
+    assert.deepEqual(record.immediate.map(entry => entry.availability), ['stopped']);
+    nothingOwned(w);
+});
+
+test('T9.synthetic-secrets-in-a-poll-error-a-thrown-read-and-a-failed-read-stderr-are-redacted', async t => {
+    const w = await provisioned(t, { faults: { ...STOPPED, diagnosticGetFault: 'errorText', truthThrows: true } });
+    const p1 = caseOf(await liveCases(w, ['LIVE-P1'], { timings: QUICK_POLL }), 'LIVE-P1');
+    assert.equal(p1.result, 'fail');
+    const record = w.artifacts.get('gpu-live-p1').statusUnsettled;
+    assert.ok(record.convergence.pollErrors.length >= 1 && /\[redacted\]/i.test(record.convergence.pollErrors[0].message), JSON.stringify(record.convergence.pollErrors[0]));
+    assert.match(record.containers[0].stateError, /\[redacted\]/i);
+    for (const secret of SECRETS.slice(0, 2)) assert.equal(JSON.stringify(record).includes(secret), false, secret);
+    nothingOwned(w);
+    const stderr = await provisioned(t, { faults: { ...STOPPED, truthInspectResult: { status: 125, stderr: 'Error: failed token=SYNTHETIC-SECRET-STDERR-3' } } });
+    await liveCases(stderr, ['LIVE-P1'], { timings: QUICK_POLL });
+    const stderrRecord = stderr.artifacts.get('gpu-live-p1').statusUnsettled;
+    assert.match(stderrRecord.containers[0].stateError, /\[redacted\]/i); assert.equal(JSON.stringify(stderrRecord).includes(SECRETS[2]), false);
+    nothingOwned(stderr);
+});
+
+test('T9.an-aborted-run-stops-the-polling-at-once-and-the-poll-error-list-is-capped', async t => {
+    // The run is aborted while the first capture reads the container: the poll loop must not keep polling to its bound.
+    const controller = new AbortController();
+    const aborted = await provisioned(t, { faults: { ...STOPPED, onTruthInspect: () => controller.abort() } });
+    const t0 = Date.now();
+    await liveCases(aborted, ['LIVE-P1'], { timings: { convergenceMs: 5000, convergencePollMs: 10 }, signal: controller.signal });
+    const record = aborted.artifacts.get('gpu-live-p1')?.statusUnsettled;
+    assert.ok(Date.now() - t0 < 2500, `stopped at once (${Date.now() - t0} ms)`);
+    assert.ok(record && record.convergence.pollCount === 0, JSON.stringify(record?.convergence));
+    // The error list is capped at 60 entries however long the polls keep failing.
+    const w = await provisioned(t, { faults: { ...STOPPED, diagnosticGetFault: 'exit' } });
+    await liveCases(w, ['LIVE-P1'], { timings: { convergenceMs: 1500, convergencePollMs: 1 } });
+    const capped = w.artifacts.get('gpu-live-p1').statusUnsettled.convergence;
+    assert.equal(capped.pollErrors.length, 60); assert.ok(capped.pollCount >= 60);
+    nothingOwned(w);
+});
