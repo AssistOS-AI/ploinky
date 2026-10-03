@@ -106,7 +106,7 @@ test('origin lists are exact, bounded, sorted, and duplicate-free', () => {
     assert.throws(() => parseRouterOriginList([, 'http://pgx:3000']), { code: 'ROUTER_ORIGINS_INVALID' });
 });
 
-test('topology readers treat an absent field as legacy and a present malformed field as invalid', (t) => {
+test('topology readers reject a missing or malformed Router origin list', (t) => {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-router-origins-topology-'));
     t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
     const topologyDir = path.join(workspace, '.ploinky', 'run', 'edge-topology');
@@ -121,8 +121,8 @@ test('topology readers treat an absent field as legacy and a present malformed f
     const write = (value) => fs.writeFileSync(file, JSON.stringify(value));
 
     write(base);
-    assert.equal(Object.hasOwn(readEdgeTopology({ file }), 'routerOrigins'), false);
-    assert.equal(Object.hasOwn(readCurrentEdgeTopology({ workspaceRoot: workspace }), 'routerOrigins'), false);
+    assert.throws(() => readEdgeTopology({ file }), /invalid routerOrigins/);
+    assert.throws(() => readCurrentEdgeTopology({ workspaceRoot: workspace }), { code: 'EDGE_TOPOLOGY_INVALID' });
 
     for (const routerOrigins of [[], ['http://100.73.151.25:3000', 'http://pgx:3000']]) {
         write({ ...base, routerOrigins });

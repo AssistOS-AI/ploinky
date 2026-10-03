@@ -104,7 +104,7 @@ function oldDesired(identity, ownership, repositoryRoot, engine) {
         String(container.labels?.[BOX_DATA_FINGERPRINT_LABELS[key]] || ''),
     ])));
     const agentLib = agentLibContractFromContainer(container);
-    // Legacy Boxes without bind metadata reconstruct as loopback publications.
+    // A Box without bind metadata is the loopback publication.
     const routerBinding = observeContainerRouterBinding(container);
     // The GPU wiring comes from the Box's own label, create command and
     // mounts, never from a fresh discovery, so a driver change can replace
@@ -274,9 +274,10 @@ async function restoreOldContainer({
     stderr,
 }) {
     if (old.agentLib.mode === 'image') {
-        const bundle = dependencies.probeAgentLib(engine.name, old.imageId, runner, { expectedCommit: old.agentLib.commit });
-        if (bundle.fingerprint !== old.agentLib.fingerprint) {
-            throw transactionError('Refusing to restore the old Box because its AchillesAgentLib image bundle changed');
+        // The old image is immutable; its supplied package must still be usable.
+        const bundle = dependencies.probeAgentLib(engine.name, old.imageId, runner);
+        if (bundle.supplyingImageId !== old.agentLib.supplyingImageId) {
+            throw transactionError('Refusing to restore the old Box because its AchillesAgentLib image changed');
         }
     } else {
         const observedSource = fingerprintSource(old.agentLib.sourceDir, { fsApi: dependencies.fsApi });
@@ -338,6 +339,7 @@ export async function reconcileBoxContainer({
     assertGateOffRestore = null,
     imageRef = BOX_IMAGE_REFERENCE,
     imagePolicy = 'pull',
+    allowReplacement = true,
     platform = process.platform,
     env = process.env,
     stdout = process.stdout,
@@ -421,9 +423,9 @@ export async function reconcileBoxContainer({
     if (old) {
         oldImage = dependencies.validateExistingImage(engine.name, old.imageId, old.imageRef, runner);
         if (old.agentLib.mode === 'image') {
-            const bundle = dependencies.probeAgentLib(engine.name, old.imageId, runner, { expectedCommit: old.agentLib.commit });
-            if (bundle.fingerprint !== old.agentLib.fingerprint) {
-                throw transactionError('Owned Box AchillesAgentLib bundle does not match its admitted fingerprint');
+            const bundle = dependencies.probeAgentLib(engine.name, old.imageId, runner);
+            if (bundle.supplyingImageId !== old.agentLib.supplyingImageId) {
+                throw transactionError('Owned Box AchillesAgentLib image does not match its admitted supplying image');
             }
         }
     }
@@ -464,6 +466,16 @@ export async function reconcileBoxContainer({
         // leave the old inode mounted in a reused Box.
         || agentLibSelectionChanged(old.agentLib, desiredAgentLib)
     );
+    // Targeted commands may reuse, start, or create a Box, but must never
+    // replace one: a replacement stops its graph and they would not restart it.
+    if (old && requiresReplacement && allowReplacement !== true) {
+        throw new PloinkyBoxError(
+            'The existing Box cannot be reused for this command because its image, publication, data paths, '
+            + 'or AchillesAgentLib selection changed; nothing was replaced. Run `ploinky update` or '
+            + '`ploinky restart` to replace it coherently.',
+            { code: 'PLOINKY_BOX_REPLACEMENT_REFUSED' },
+        );
+    }
     if (old && !requiresReplacement) {
         // Reuse is valid only while the host directories are the exact bind
         // sources captured at creation. Revalidation immediately before start
@@ -528,6 +540,9 @@ export async function reconcileBoxContainer({
             previousRouterBinding: reusedBinding,
             previousGpu: old.gpu,
             previousHardware: old.hardware ?? null,
+            // Non-settling proof of the exact reused Box, for use immediately
+            // before a graph mutation or admission write.
+            validate() { validateFinalOwnership(currentContainer.id, old); },
             finalize() { validateFinalOwnership(currentContainer.id, old); },
             async rollback() {
                 // Reuse did not replace an outer resource. The supervisor owns
@@ -574,13 +589,11 @@ export async function reconcileBoxContainer({
         image = dependencies.validateImage(engine.name, imageRef, runner);
     }
     if (desiredAgentLib.mode === 'image') {
-        if (desiredAgentLib.imageId !== normalizeImageId(image.immutableId)) {
+        if (desiredAgentLib.supplyingImageId !== normalizeImageId(image.immutableId)) {
             throw transactionError('Box image changed after AchillesAgentLib selection; run the command again');
         }
-        const bundle = dependencies.probeAgentLib(engine.name, image.immutableId, runner, { expectedCommit: desiredAgentLib.commit });
-        if (bundle.fingerprint !== desiredAgentLib.fingerprint) {
-            throw transactionError('Selected AchillesAgentLib image bundle fingerprint changed before Box creation');
-        }
+        // Package availability only: the supplying image ID just verified is the identity.
+        dependencies.probeAgentLib(engine.name, image.immutableId, runner);
     }
     try {
         dependencies.ensureDataPaths({ identity, lock, fsApi: dependencies.fsApi });
@@ -649,6 +662,10 @@ export async function reconcileBoxContainer({
         candidateId = created.containerId;
         const candidateDesired = oldDesired(identity, created.ownership, repositoryRoot, engine);
         let settled = false;
+        const validate = () => {
+            if (settled) throw transactionError('Box candidate was already settled or rolled back');
+            validateFinalOwnership(candidateId, candidateDesired);
+        };
         const finalize = () => {
             if (settled) return;
             validateFinalOwnership(candidateId, candidateDesired);
@@ -718,6 +735,7 @@ export async function reconcileBoxContainer({
             previousAgentLib: old?.agentLib || null,
             previousRouterBinding: old ? routerBindingResult(old.routerBinding, old.hostPort) : null,
             previousGpu: old ? old.gpu : null,
+            validate,
             finalize,
             rollback,
         });

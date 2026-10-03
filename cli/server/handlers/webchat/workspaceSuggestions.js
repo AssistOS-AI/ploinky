@@ -161,19 +161,6 @@ export function resolveWebchatWorkspaceBase(parsedUrl, { workspaceRoot: configur
             throw new Error('Invalid WebChat workspace directory.');
         }
     }
-    const rawCompatDir = parsedUrl.searchParams.get('dir');
-    if (rawCompatDir !== null) {
-        try {
-            const resolved = resolveWorkspacePath(rawCompatDir, {
-                workspaceRoot,
-                leadingSlashIsWorkspaceRelative: false
-            });
-            const relativeBase = path.relative(workspaceRoot, resolved).replace(/\\+/g, '/');
-            return { root: workspaceRoot, base: resolved, relativeBase };
-        } catch (_) {
-            throw new Error('Invalid WebChat workspace directory.');
-        }
-    }
     return { root: workspaceRoot, base: workspaceRoot, relativeBase: '' };
 }
 

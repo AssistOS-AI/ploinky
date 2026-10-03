@@ -8,8 +8,6 @@ import { spawnSync } from 'node:child_process';
 import {
     ensureAgentLibCacheLink,
     agentLibCacheLinkProblem,
-    agentLibStampProblem,
-    agentLibStampSection,
 } from '../../cli/utils/dependencies/agentLibLink.js';
 
 function writePackage(directory, name, marker = 'private-copy') {
@@ -100,19 +98,6 @@ test('linked package, scope and nested module trees with private AgentLib fail w
         assert.match(fs.readFileSync(path.join(privateLibrary, 'index.mjs'), 'utf8'), /private-copy/);
         assert.deepEqual(fs.readdirSync(outside), [placement === 'package' ? 'node_modules' : 'ploinky-agent-lib']);
     }
-});
-
-test('legacy and unknown adapter schemas fail admission while the selected-source identity stays exact', () => {
-    const selection = { sourceDir: '/selected', mode: 'local', fingerprint: 'a'.repeat(64), sourceIdHash: 'b'.repeat(64) };
-    const current = agentLibStampSection('container-linux-x64-node25', selection);
-    const legacy = { ...current };
-    delete legacy.adapterSchema;
-    assert.match(agentLibStampProblem({ agentLib: legacy }, current), /adapterSchema changed/);
-    assert.match(agentLibStampProblem({ agentLib: { ...current, adapterSchema: 999 } }, current), /adapterSchema changed/);
-    assert.match(agentLibStampProblem({ agentLib: { ...current, adapterSchema: '1' } }, current), /adapterSchema changed/);
-    assert.equal(agentLibStampProblem({ agentLib: current }, current), '');
-    assert.equal(current.linkTarget, '/opt/ploinky-agentlib');
-    assert.equal(agentLibStampSection('seatbelt-darwin-arm64-node25', selection).linkTarget, '/selected');
 });
 
 test('unrelated local package links and linked packages using the selected library remain supported', (t) => {

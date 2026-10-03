@@ -11,6 +11,7 @@ import { findAgent } from './utils.js';
 import { gatherSsoStatus, listAuthProviders } from './security/sso.js';
 import { inspectWorkspaceAgentLibSource } from '../../ploinky-box/agentlib-source.mjs';
 import { sourceIdHash } from '../../agentlib/fingerprint.mjs';
+import { agentLibSourceIdHash } from '../../agentlib/contract.mjs';
 
 const PREDEFINED_REPOS = reposSvc.getPredefinedRepos();
 
@@ -362,9 +363,11 @@ function printRouterStatus(routerPort, isListening) {
  *
  * A local checkout can change independently of Ploinky, so the bytes on disk
  * are hashed here and compared against the active selection: a difference is a
- * `restart required` state, not something status repairs.
+ * `restart required` state, not something status repairs. The copy a Box image
+ * supplies is reported by the image that carries it, with any build provenance;
+ * it is never hashed.
  */
-function printAgentLibStatus({ verbose = false } = {}) {
+export function printAgentLibStatus({ verbose = false } = {}) {
     let info;
     try {
         info = inspectWorkspaceAgentLibSource({ workspaceRoot: PLOINKY_WORKSPACE_ROOT });
@@ -380,7 +383,20 @@ function printAgentLibStatus({ verbose = false } = {}) {
             : 'no git revision';
         console.log(`AgentLib content:  ${info.contentFingerprint.slice(0, 12)} — ${revision}`);
     }
-    if (info.active) {
+    if (info.active?.mode === 'image') {
+        // Supplied by the Box image: identified by that image, with whatever
+        // build provenance the image records (informational only).
+        const provenance = info.active.provenance || {};
+        const details = [
+            provenance.packageVersion ? `version ${provenance.packageVersion}` : '',
+            provenance.commit ? `commit ${provenance.commit.slice(0, 12)}` : '',
+            provenance.branch ? `branch ${provenance.branch}` : '',
+        ].filter(Boolean);
+        console.log(`AgentLib active:   Box image ${info.active.supplyingImageId.slice(0, 19)}`);
+        console.log(`AgentLib package:  ${details.length ? details.join(', ') : 'provenance unavailable'}`);
+        console.log(`AgentLib identity: ${agentLibSourceIdHash(info.active).slice(0, 12)}`
+            + `  source ${info.active.sourceRelativePath}`);
+    } else if (info.active) {
         console.log(`AgentLib active:   ${info.active.contentFingerprint.slice(0, 12)}`
             + `${info.active.resolvedCommit ? ` @ ${info.active.resolvedCommit.slice(0, 12)}` : ''}`);
         console.log(`AgentLib identity: ${sourceIdHash(info.active.sourceId).slice(0, 12)}`

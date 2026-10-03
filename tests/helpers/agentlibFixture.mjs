@@ -9,17 +9,28 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { AGENTLIB_LOCAL_DIR_NAME, AGENTLIB_PACKAGE_NAME } from '../../agentlib/contract.mjs';
+import {
+    AGENTLIB_LOCAL_DIR_NAME,
+    AGENTLIB_PACKAGE_NAME,
+    AGENTLIB_STABLE_MOUNT_PATH,
+    imageSourceIdentity,
+} from '../../agentlib/contract.mjs';
 import { fingerprintSource, sourceIdHash } from '../../agentlib/fingerprint.mjs';
 import { BOX_AGENTLIB_LABELS } from '../../ploinky-box/constants.mjs';
 import {
     agentLibBoxEnv,
     agentLibLabels,
+    boxImageIdEnv,
     expectedAgentLibMounts,
     normalizeBoxAgentLib,
 } from '../../ploinky-box/contract/agentlib.mjs';
 
 export const AGENTLIB_FIXTURE_FINGERPRINT = 'a1'.repeat(32);
+
+/** The outer Box image that supplies image-mode libraries in fixtures. */
+export const OUTER_IMAGE_ID_FIXTURE = `sha256:${'b2'.repeat(32)}`;
+/** A nested agent image ID, deliberately unlike the outer one so confusing them fails. */
+export const NESTED_IMAGE_ID_FIXTURE = `sha256:${'c3'.repeat(32)}`;
 
 /** Write a minimal but structurally valid achillesAgentLib checkout. */
 export function writeAgentLibCheckout(dir) {
@@ -40,6 +51,9 @@ export function writeAgentLibCheckout(dir) {
     }));
     fs.writeFileSync(path.join(dir, 'index.mjs'), 'export const marker = "fixture";\n');
     fs.writeFileSync(path.join(dir, 'LLMAgents/index.mjs'), 'export const marker = "fixture";\n');
+    fs.writeFileSync(path.join(dir, 'LLMAgents/openAiAgenticResponder.mjs'),
+        'export function isOptOutModel() { return false; }\n'
+        + 'export async function runOpenAiAgenticResponse() { return {}; }\n');
     fs.writeFileSync(path.join(dir, 'utils/LLMClient.mjs'), 'export function getPrioritizedModels() { return []; }\n');
     fs.writeFileSync(path.join(dir, 'jwt/jwtSign.mjs'), 'export function signHmacJwt() { return ""; }\n');
     fs.writeFileSync(path.join(dir, 'jwt/jwtVerify.mjs'), 'export function verifyJws() { return null; }\n');
@@ -77,6 +91,25 @@ export function agentLibFixture(workspaceRoot, {
     });
 }
 
+/**
+ * The image-supplied selection: the AgentLib copy the outer Box image carries.
+ * It has no content fingerprint, no host source and no revision; its identity is
+ * the outer image ID plus the library.
+ *
+ * @param {object} [opts]
+ * @param {string} [opts.supplyingImageId]
+ * @returns {Readonly<object>} the normalized Box AgentLib contract
+ */
+export function imageAgentLibFixture({ supplyingImageId = OUTER_IMAGE_ID_FIXTURE } = {}) {
+    return normalizeBoxAgentLib({
+        sourceDir: AGENTLIB_STABLE_MOUNT_PATH,
+        sourceRelativePath: 'image',
+        mode: 'image',
+        supplyingImageId,
+        sourceId: imageSourceIdentity(supplyingImageId),
+    });
+}
+
 /** The labels an existing Box must carry for `contract`. */
 export function agentLibFixtureLabels(contract) {
     return agentLibLabels(contract);
@@ -85,6 +118,11 @@ export function agentLibFixtureLabels(contract) {
 /** The environment an existing Box must expose for `contract`. */
 export function agentLibFixtureEnv(contract) {
     return agentLibBoxEnv(contract);
+}
+
+/** The outer image ID environment every process in an existing Box inherits. */
+export function boxImageIdFixtureEnv(imageId) {
+    return boxImageIdEnv(imageId);
 }
 
 /** The two observed bind mounts an existing Box must report for `contract`. */

@@ -39,9 +39,11 @@ test.after(() => {
     }
 });
 
-const LOCK_COMMIT = 'a'.repeat(40);
-const REMOTE = { url: 'https://example.invalid/AchillesAgentLib.git', commit: LOCK_COMMIT };
-const IMAGE_BUNDLE = { commit: LOCK_COMMIT, fingerprint: 'b'.repeat(64), imageId: 'sha256:' + 'c'.repeat(64) };
+const BUILD_COMMIT = 'a'.repeat(40);
+const IMAGE_BUNDLE = {
+    supplyingImageId: 'sha256:' + 'c'.repeat(64),
+    provenance: { repository: 'https://example.invalid/AchillesAgentLib.git', branch: 'master', commit: BUILD_COMMIT, packageVersion: '1.0.0' },
+};
 
 // --- update ----------------------------------------------------------------
 
@@ -73,44 +75,74 @@ test('update never pulls, resets, or checks out a local checkout', async () => {
     assert.equal(second.selection.dirty, true);
 });
 
-test('an image update changes provenance without committing active state before readiness', async () => {
+test('an image update changes with the supplying image without committing active state before readiness', async () => {
     const workspace = makeWorkspace({ withCheckout: false });
     const base = await boxSource.updateWorkspaceAgentLibSource({
-        workspaceRoot: workspace, insideBox: false, imageBundle: IMAGE_BUNDLE, remote: REMOTE,
+        workspaceRoot: workspace, insideBox: false, imageBundle: IMAGE_BUNDLE,
     });
+    assert.equal(base.changed, true, 'the first selection is a change from no selection');
     source.writeActiveDescriptor(workspace, base.selection);
     const updated = await boxSource.updateWorkspaceAgentLibSource({
         workspaceRoot: workspace, insideBox: false,
-        imageBundle: { ...IMAGE_BUNDLE, imageId: 'sha256:' + 'd'.repeat(64) }, remote: REMOTE,
+        imageBundle: { ...IMAGE_BUNDLE, supplyingImageId: 'sha256:' + 'd'.repeat(64) },
     });
     assert.equal(updated.changed, true);
-    assert.equal(updated.selection.resolvedCommit, LOCK_COMMIT);
-    assert.equal(source.readActiveDescriptor(workspace).imageId, base.selection.imageId);
-    assert.equal(fs.existsSync(source.managedGenerationsDir(workspace)), false);
-    assert.equal(fs.existsSync(source.managedMirrorPath(workspace)), false);
+    assert.equal(updated.selection.provenance.commit, BUILD_COMMIT);
+    assert.equal(source.readActiveDescriptor(workspace).supplyingImageId, base.selection.supplyingImageId);
+    assert.equal(fs.existsSync(path.join(source.managedRootPath(workspace), 'generations')), false);
+    assert.equal(fs.existsSync(path.join(source.managedRootPath(workspace), 'mirror.git')), false);
 });
 
-test('an image update follows the lock commit and ignores the global branch without Git', async () => {
+test('an image update ignores the global branch and never uses Git', async () => {
     const workspace = makeWorkspace({ withCheckout: false });
     const result = await boxSource.updateWorkspaceAgentLibSource({
         workspaceRoot: workspace, insideBox: false,
         branchPolicy: { branch: 'feature-x', fallback: 'fail' },
         runner: { run() { throw new Error('must not invoke host Git'); } },
-        imageBundle: IMAGE_BUNDLE, remote: REMOTE,
+        imageBundle: IMAGE_BUNDLE,
     });
-    assert.equal(result.selection.resolvedCommit, LOCK_COMMIT);
-    assert.equal(result.selection.requestedRef, null);
+    assert.equal(result.selection.mode, 'image');
+    assert.equal(result.selection.provenance.commit, BUILD_COMMIT, 'the commit is informational provenance');
+    assert.equal(Object.hasOwn(result.selection, 'requestedRef'), false);
     assert.equal(fs.existsSync(source.managedRootPath(workspace)), false);
 });
 
-test('an unchanged image update keeps its source identity across selection timestamps', async () => {
+test('an unchanged image update keeps its source identity across selection timestamps and provenance', async () => {
     const workspace = makeWorkspace({ withCheckout: false });
-    const params = { workspaceRoot: workspace, insideBox: false, imageBundle: IMAGE_BUNDLE, remote: REMOTE };
+    const params = { workspaceRoot: workspace, insideBox: false, imageBundle: IMAGE_BUNDLE };
     const first = await boxSource.updateWorkspaceAgentLibSource({ ...params, now: () => 'first' });
     source.writeActiveDescriptor(workspace, first.selection);
     const updated = await boxSource.updateWorkspaceAgentLibSource({ ...params, now: () => 'second' });
     assert.equal(updated.changed, false);
     assert.deepEqual(updated.selection.sourceId, first.selection.sourceId);
+    const differentBuild = await boxSource.updateWorkspaceAgentLibSource({
+        ...params,
+        imageBundle: { ...IMAGE_BUNDLE, provenance: { ...IMAGE_BUNDLE.provenance, commit: 'e'.repeat(40), packageVersion: '2.0.0' } },
+    });
+    assert.equal(differentBuild.changed, false, 'provenance alone never changes identity');
+});
+
+test('switching between a local checkout and the image is a change in both directions', async () => {
+    const workspace = makeWorkspace();
+    const local = await boxSource.updateWorkspaceAgentLibSource({
+        workspaceRoot: workspace, insideBox: false, gitState: () => ({ commit: null, branch: null, dirty: false }),
+    });
+    source.writeActiveDescriptor(workspace, local.selection);
+    fs.rmSync(path.join(workspace, contract.AGENTLIB_LOCAL_DIR_NAME), { recursive: true, force: true });
+    const image = await boxSource.updateWorkspaceAgentLibSource({
+        workspaceRoot: workspace, insideBox: false, imageBundle: IMAGE_BUNDLE,
+    });
+    assert.equal(image.changed, true);
+    source.writeActiveDescriptor(workspace, image.selection);
+    const localAgain = path.join(workspace, contract.AGENTLIB_LOCAL_DIR_NAME);
+    fs.mkdirSync(localAgain);
+    writeAgentLibCheckout(localAgain);
+    const back = await boxSource.updateWorkspaceAgentLibSource({
+        workspaceRoot: workspace, insideBox: false, gitState: () => ({ commit: null, branch: null, dirty: false }),
+        loadImageBundle: async () => { throw new Error('a local checkout must win without probing the image'); },
+    });
+    assert.equal(back.mode, 'local');
+    assert.equal(back.changed, true);
 });
 
 // --- status ----------------------------------------------------------------
@@ -164,10 +196,9 @@ test('a local source that disappears switches provenance on the next lifecycle c
         workspaceRoot: workspace,
         insideBox: false,
         imageBundle: IMAGE_BUNDLE,
-        remote: REMOTE,
     });
     assert.equal(bundled.mode, 'image');
-    assert.equal(bundled.selection.resolvedCommit, LOCK_COMMIT);
+    assert.equal(bundled.selection.supplyingImageId, IMAGE_BUNDLE.supplyingImageId);
 });
 
 // --- retired paths ---------------------------------------------------------
@@ -177,7 +208,8 @@ test('no executable path installs, pulls, or refreshes a second achillesAgentLib
         'cli/commands/updateService.js',
         'cli/commands/repoAgentCommands.js',
         'cli/utils/dependencies/dependencyInstaller.js',
-        'cli/utils/dependencies/dependencyCache.js',
+        'cli/utils/dependencies/store/installers.mjs',
+        'cli/utils/dependencies/store/objectStore.mjs',
         'cli/commands/help.js',
         'globalDeps/package.json',
     ];
@@ -240,13 +272,20 @@ test('the achillesAgentLib submodule is no longer tracked', () => {
     );
 });
 
-test('the Box dependency lock stays the canonical source policy', () => {
-    const remote = contract.canonicalAgentLibRemote();
-    assert.match(remote.url, /AchillesAgentLib/i);
-    assert.match(remote.commit, /^[0-9a-f]{40}$/);
-    // But the Box does not install it.
+test('no Ploinky-owned library lock, pin policy or managed source implementation remains', () => {
+    for (const relative of [
+        'ploinky-box/dependencies.lock.json', 'ploinky-box/agentlib-pin.mjs', 'agentlib/materialize.mjs',
+    ]) {
+        assert.equal(fs.existsSync(path.join(repoRoot, relative)), false, `${relative} must be gone`);
+    }
+    assert.equal(contract.canonicalAgentLibRemote, undefined);
+    assert.equal(contract.DEPENDENCIES_LOCK_PATH, undefined);
+    assert.equal(contract.validateImageBundleMetadata, undefined);
+    assert.equal(contract.AGENTLIB_ERROR_CODES.imagePinMismatch, undefined);
+    // The Box installs only the SDK it copies from the image, never AgentLib.
     const installer = fs.readFileSync(path.join(repoRoot, 'ploinky-box/entrypoint/install-dependencies.mjs'), 'utf8');
-    assert.match(installer, /BOX_INSTALLED_DEPENDENCIES = Object\.freeze\(\['mcp-sdk'\]\)/);
+    assert.match(installer, /BOX_INSTALLED_DEPENDENCIES = Object\.freeze\(\[MCP_SDK_LIBRARY_NAME\]\)/);
+    assert.equal(/dependencies\.lock|expected-commit|STRICT_PIN/.test(installer), false);
 });
 
 // --- in-Box update ownership ------------------------------------------------
@@ -300,7 +339,7 @@ test('the outer host owns source mutation and the Box only validates', async () 
     assert.equal(
         fs.existsSync(path.join(workspace, '.ploinky', 'agentlib')),
         false,
-        'a failed in-Box bootstrap must not create managed source state',
+        'a failed in-Box bootstrap must not create source state',
     );
     assert.throws(
         () => boxSource.assertNotInBoxSourceOwner(true),

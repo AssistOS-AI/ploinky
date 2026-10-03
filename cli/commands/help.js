@@ -38,7 +38,7 @@ function mainHelpText(surface) {
   add <url|repoName> [name] [branch]     Alias for install
   uninstall <name|url>           Uninstall repository and its enabled agents
   remove <name|url>              Alias for uninstall
-  update [folderPath]            Update Ploinky, .ploinky/repos, Achilles deps, projects, and default skills
+  update [folderPath]            Verified fast-forward update of Ploinky, AgentLib, repos, projects, and skills
   start <agent> [port] [--profile <name>]
                                  Start agents from .ploinky/agents.json and launch Router
   shell <agentName>              Open interactive shell in container (attached TTY)
@@ -67,7 +67,7 @@ function mainHelpText(surface) {
 ${lifecycleHelpLines(surface).join('\n')}
   restart                        Restart enabled agents + Router
   reinstall <agentName>          Re-create a running agent container (destructive)
-  Agent dependencies: update/start/enable/reinstall reuse valid installs.
+  Agent dependencies: start/enable/restart reuse verified immutable trees; reinstall rebuilds one agent.
   npm install runs for a changed package.json or a missing/invalid cache.
   manifest link-install: Git URL array; clone missing workspace repos only.
   /Agent/linked/<repo> links to <checkout> at its workspace path; global agents can edit it.
@@ -89,7 +89,7 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
     const helpContent = {
         // Local development commands
         'add': {
-            description: 'Add repositories or environment variables',
+            description: 'Alias for install: clone and register a repository',
             syntax: 'add <url|repoName> [name] [branch] | add <url|repoName> [name] --branch <branch>',
             params: {
                 '<url|repoName>': 'Git URL to clone, or a repository name already present in repo_sources.json or the predefined catalog.',
@@ -102,7 +102,7 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
                 'add https://github.com/user/repo.git myrepo',
                 'add repo https://github.com/user/repo.git myrepo --branch feature'
             ],
-            notes: '`add` is an alias for `install`. The optional `repo` token is still accepted. Branch can be specified as a positional argument or with --branch.'
+            notes: '`add` is an alias for `install`. The optional `repo` token is accepted but not required. Branch can be specified as a positional argument or with --branch.'
         },
         'install': {
             syntax: 'install <url|repoName> [name] [branch] | install <url|repoName> [name] --branch <branch>',
@@ -132,7 +132,7 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
             notes: 'The optional `repo` token is accepted but not required.'
         },
         'var': {
-            description: 'Set a workspace variable (stored encrypted in .ploinky/.secrets)',
+            description: 'Set a workspace variable (stored encrypted in .ploinky/data/.secrets)',
             syntax: 'var <VAR> <value>',
             examples: [
                 'var API_KEY sk-123456'
@@ -140,7 +140,7 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
             notes: "Use 'vars' to list variables. Router control surfaces use authenticated workspace sessions."
         },
         'vars': {
-            description: 'List workspace variables (from encrypted .ploinky/.secrets)',
+            description: 'List workspace variables (from encrypted .ploinky/data/.secrets)',
             syntax: 'vars',
             examples: [ 'vars' ]
         },
@@ -149,7 +149,7 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
             description: 'Update Ploinky itself, its Achilles runtime checkout, workspace repositories, Achilles dependencies, and project repositories',
             syntax: 'update [folderPath] | update all [folderPath] | update repos | update repo <name>',
             examples: [ 'update', 'update /work/projects', 'update all /work/projects', 'update repos', 'update repo basic' ],
-            notes: '`update` is the same full workflow as `update all`. The current directory is the selected update folder unless folderPath is supplied. A Ploinky checkout is pulled with git pull --rebase --autostash only when it is inside that folder or the command is launched from inside the checkout; an out-of-scope Ploinky checkout is skipped. The workflow still advances the selected achillesAgentLib source, updates .ploinky/repos, and updates git repositories discovered recursively from folderPath. Inside a Ploinky box, the read-only source self-pull is skipped while writable runtime dependencies, managed repos, projects, and skills continue updating. Missing or unreachable remotes in discovered project repositories are logged and skipped instead of failing the full update; bulk updates continue after individual repository or skills failures and repeat their details in the final error summary without aborting the remaining workflow. Explicit `update repo <name>` failures still return an error. `update`, `update all`, `update repos`, and `update repo <name>` refresh `AchillesCopilotBasicSkills`, `DocumentationSkills`, and `PloinkySkills` into eligible installed .ploinky/repos entries, maintaining `.claude` compatibility and the managed `.gitignore` block; each source repo and all skills-only repos are skipped. `update repos` also advances the achillesAgentLib source: a local <workspace>/achillesAgentLib checkout is revalidated and reported but never pulled or reset, while a managed source stages a new immutable generation. Inside a Ploinky box the outer host owns that source, so the in-box update skips it. Discovered workspace folders can define `ploinky-skills-manifest.json`; when present, that file must be an array of objects with url/name/branch/skills and selects the exact skills to install into `.agents/skills` for that workspace folder. Existing skills caches must match the requested source URL; a conflicting cache is reported without replacing it. Explicit manifest branches are selected without fallback, and uncommitted changes prevent a branch switch. In an interactive Ploinky session, a detected Ploinky self-update is deferred: close the session, run `ploinky update`, then restart Ploinky so the new changes are visible.'
+            notes: '`update` is the same full workflow as `update all`. The current directory is the selected update folder unless folderPath is supplied; folderPath must be inside the workspace. A Ploinky checkout is updated only when it is inside that folder or the command is launched from inside the checkout; an out-of-scope Ploinky checkout is skipped. Every checkout is fetched once and fast-forwarded only when it is clean, on its configured branch and upstream, and not diverged. Dirty, conflicted, diverged, detached, operation-in-progress and upstream-mismatch checkouts are preserved untouched and reported with a named reason; Ploinky never stashes, rebases, resets or aborts user Git state. A changed or untracked .gitignore containing a Ploinky managed block without matching write provenance is preserved and may skip the checkout with `unverified-ignore-block-preserved`; inspect the reported edit before resolving it. An unchanged committed block remains repository policy and does not by itself block an update. The workflow advances the selected achillesAgentLib source (a local <workspace>/achillesAgentLib checkout is revalidated but never pulled; inside a Ploinky box the outer host owns it), updates .ploinky/repos, git repositories discovered recursively from folderPath and declared skills sources, then refreshes default skills and ploinky-skills-manifest.json selections without pulling again. Generated skill links are excluded through private per-worktree Git configuration, never through a tracked .gitignore or the shared info/exclude; when a live external excludes policy would be shadowed the exclusion is deferred and reported (set PLOINKY_SKILL_EXCLUDES_COMPOSE=1 to authorize composing it). Each phase produces a record: the command exits nonzero when any record failed or when a required input of the configured graph was not verified, and the workspace is restarted only when every required input verified. `update repos` and `update repo <name>` run under the same workspace transaction but record activation as pending instead of restarting the whole graph; run `ploinky restart` to activate. Dependency caches are never prepared by update. In an interactive Ploinky session, a detected Ploinky self-update is deferred: close the session, run `ploinky update`, then restart Ploinky so the new changes are visible.'
         },
         
         
@@ -305,7 +305,7 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
             description: 'Start enabled agents and the local Router',
             syntax: 'start <agent> [port] [--profile <name>] [--branch <branch>] [--repo-branch <repo>=<branch>] [--branch-fallback default|fail] [--reset-repos]',
             examples: [ 'start MyStaticAgent 8080 --profile dev', 'start explorer 8080 --profile prod --branch my-feature' ],
-            notes: 'Reads manifest of static agent: applies repos{} (clone+enable) and enable[] (enable agents). First run needs agent and port. An explicit --profile selects and persists the workspace profile before startup; direct in-box starts that omit it retain the active workspace profile. --branch <branch> applies to every default boot repo (AchillesIDE, AchillesCLI, copilot-agents), the static agent\'s repo and every manifest dependency repo. achillesAgentLib is selected from <workspace>/achillesAgentLib when that directory exists (never modified by Ploinky; --branch only checks that it is on the requested branch) and otherwise from the copy bundled in the Box image, which normally matches the commit pinned in ploinky-box/dependencies.lock.json; when it differs, Ploinky warns on stderr and uses the image\'s bundled commit, and PLOINKY_AGENTLIB_STRICT_PIN=1 makes the difference fatal (any value other than 0 or 1 is rejected whenever Ploinky selects the Box image\'s bundle). When that branch is absent, --branch-fallback default keeps repos on their configured ref and logs it; --branch-fallback fail aborts. --repo-branch <repo>=<branch> (repeatable) reconciles an existing named repo before manifest traversal and overrides that repo when traversal installs it; --reset-repos hard-resets targeted managed repos to the refreshed remote branch.'
+            notes: 'Reads manifest of static agent: applies repos{} (clone+enable) and enable[] (enable agents). First run needs agent and port. An explicit --profile selects and persists the workspace profile before startup; direct in-box starts that omit it retain the active workspace profile. --branch <branch> applies to every default boot repo (AchillesIDE, AchillesCLI, copilot-agents), the static agent\'s repo and every manifest dependency repo. achillesAgentLib is selected from <workspace>/achillesAgentLib when that directory exists (never modified by Ploinky; --branch only checks that it is on the requested branch) and otherwise from the copy the Box image supplies. The image chooses and packages that copy, Ploinky compares it with no expected revision and hashes none of its files, and it is identified by the Box image that carries it; a local checkout always wins, and adding, removing or changing one needs a full workspace restart. When that branch is absent, --branch-fallback default keeps repos on their configured ref and logs it; --branch-fallback fail aborts. --repo-branch <repo>=<branch> (repeatable) reconciles an existing named repo before manifest traversal and overrides that repo when traversal installs it; --reset-repos hard-resets targeted managed repos to the refreshed remote branch.'
         },
         'status': {
             description: 'Show enabled agents and router configuration',
@@ -318,7 +318,7 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
             subcommands: {
                 'agent': {
                     syntax: 'reinstall <name> | reinstall agent <name>',
-                    description: 'Stops, removes, and re-creates the agent\'s container. This is a destructive operation that ensures the agent starts from a clean state. This command only has an effect if the agent\'s container is currently running.',
+                    description: 'Re-creates one exact enabled agent registration and rebuilds its dependency tree from empty npm state. Other aliases and shared seeds keep their trees. The previous runtime stays admitted if the rebuild or readiness fails.',
                     examples: [ 'reinstall MyAPI', 'reinstall agent MyAPI' ],
                     notes: 'This is useful for applying configuration changes that require a new container.'
                 }
@@ -398,12 +398,6 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
                     syntax: 'disable [agent] <agentName>',
                     description: 'Remove an enabled agent from .ploinky/agents.json, then stop and remove its runtime instance',
                     examples: [ 'disable demo', 'disable agent repoName/demo' ]
-                },
-                'agents-all': {
-                    syntax: 'disable agents-all',
-                    description: 'Disable all enabled agents from .ploinky/agents.json and remove their runtime instances',
-                    examples: [ 'disable agents-all' ],
-                    notes: 'Registry entries are removed before runtime instances are stopped so the watchdog does not restart them.'
                 }
             }
         },
@@ -696,18 +690,6 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
                         "client tool process -a data-agent -p 'config.level=high' -batch 1"
                     ],
                     notes: 'Flag-style parameters (e.g., --dry-run) are sent as boolean true. Use --agent when the same tool name exists on multiple agents.'
-                },
-                'task-status': {
-                    syntax: 'client task-status <agent> <task-id>',
-                    description: 'Compatibility helper for older task-status flows.',
-                    params: {
-                        '<agent>': 'Agent name',
-                        '<task-id>': 'Task ID returned by an older agent-specific async task flow'
-                    },
-                    examples: [
-                        'client task-status MyAPI task-123'
-                    ],
-                    notes: 'This is not standardized for MCP tools. Prefer `client tool <toolName>` for current agent operations.'
                 }
             }
         }
@@ -728,7 +710,7 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
                 description: 'Stop nested agents and remove the outer runtime, retaining the host workspace and its .ploinky/box dependency and image cache directories by default.',
                 syntax: 'destroy [--delete-cache]',
                 examples: ['destroy', 'destroy --delete-cache'],
-                notes: 'Nested agents are stopped through the in-box helper before the outer runtime is removed; if that stop fails, the outer runtime is halted but nothing is removed. Both forms run without prompting. Without the flag, this host-level command retains the host workspace plus .ploinky/box/dependencies and .ploinky/box/images, so pinned dependencies and reusable nested image content survive destroy and recreate. With --delete-cache, it removes the outer runtime and then deletes exactly those two directories; the workspace, .ploinky/master-key, repositories, agents, routing state, and secrets are never deleted. Nested container records, writable layers, and inner named volumes are not retained by either form: they live on the outer runtime writable layer and are discarded with it, so persistent agent data must use workspace binds.',
+                notes: 'Nested agents are stopped through the in-box helper before the outer runtime is removed; if that stop fails, the outer runtime is halted but nothing is removed. Both forms run without prompting. Without the flag, this host-level command retains the host workspace plus .ploinky/box/dependencies and .ploinky/box/images, so the MCP SDK copied from the Box image and reusable nested image content survive destroy and recreate. With --delete-cache, it removes the outer runtime and then deletes exactly those two directories; the workspace, .ploinky/data/master-key, repositories, agents, routing state, and secrets are never deleted. Nested container records, writable layers, and inner named volumes are not retained by either form: they live on the outer runtime writable layer and are discarded with it, so persistent agent data must use workspace binds.',
             },
         }
         : {

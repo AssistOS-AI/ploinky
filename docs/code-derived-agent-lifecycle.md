@@ -81,10 +81,13 @@ The outer storage boundary has four durable host binds and one transient `/tmp` 
 | `<workspace>/.ploinky/box/images` | `/home/podman/.local/share/ploinky-images` | Read-write bind |
 | tmpfs | `/tmp` | `rw,exec,nosuid,nodev,mode=1777,notmpcopyup`; empty each outer boot |
 
-The image contains the dependency-lock-selected MCP SDK as a sealed,
-content-hashed tree at `/usr/local/lib/ploinky/mcp-sdk`. Entrypoint preparation
-validates and transactionally copies those local bytes into the dependency
-bind. No Box startup path fetches or installs MCP SDK content from the network.
+The image contains the MCP SDK its build selected, at
+`/usr/local/lib/ploinky/mcp-sdk`. Entrypoint preparation checks that supplied
+package (its name, entry point and a plain file tree) and transactionally copies
+those local bytes into the dependency bind, writing a marker last that names the
+outer Box image supplying the copy. It compares no expected revision and hashes
+no library file. No Box startup path fetches or installs MCP SDK content from
+the network.
 
 A missing box causes an unconditional pull and full configuration validation. The supervisor creates the box from the validated image ID, closing a mutable-tag race. A stopped compatible box starts on the same immutable container ID and a running compatible box is reused without pulling. Before every start, the supervisor captures cumulative stdout and stderr. Only appended current-boot bytes can contain the exact `PLOINKY_BOX_READY` line, and the same poll plus final rediscovery must prove the container is running.
 
@@ -92,36 +95,24 @@ Here, compatible means an exact normalized creation-configuration match. Changin
 
 Every incompatible, malformed, or identity-incompatible Box is blocked before pulling, cache preparation, restart, upgrade, or replacement. It requires explicit `ploinky destroy`; the supervisor never reads it as compatible state or migrates, cleans, relabels, or adopts it. The next permitted create retains and remounts the image and dependency cache directories. No old basename-only container or volume is copied, adopted, mapped, or discovered by the path-hashed identity.
 
-Direct/core users must invoke the old checkout's core entry before a legacy cutover:
-
-```sh
-node cli/index.js destroy
-node cli/index.js network prune
-```
-
-They must not use the public `ploinky` wrapper for this step because, outside a box, it controls the outer runtime. After inspecting or resolving any foreign resources and confirming no container references them, one-time cleanup may remove only `.ploinky/run/router.sock`, `.ploinky/run/managed-hosts`, and the cached exact image `docker.io/assistos/ploinky-network-gateway:1@sha256:68c47ce93d16ea1a2d03944f7b50ce82e6f2f9a26b183d2c9c7fbabcc828fb7e`. Operators must also revoke retired publication connector/API tokens and delete its plaintext state before activation; the current runtime has no migration or cleanup reader. No broad container, image, volume, or network prune is part of this cutover.
-
-An older basename-only Box is outside current discovery. Identify its exact owning engine and container, remove that container first, back up any data that exists only in its workspace volume, and then remove only its exact old `-containers` and `-workspace` volumes. Broad pruning is not a recovery path.
-
 `status` bypasses reconciliation and is read-only. `stop` and `destroy` also bypass reconciliation: host stop attempts core shutdown before stopping the outer runtime, while host destroy stops nested agents before stopping and removing the exact outer container. The two workspace-backed cache directories remain available for the next permitted recreation. An absent Box is an idempotent destroy success, not a cache-deletion request. Ordinary agent images intentionally contain neither Podman nor Docker; nested container control exists only in the outer runtime.
 
 ## Commands
 
-The command surface is split between the registry in `cli/services/commandRegistry.js` and explicit switch cases in `cli/commands/cli.js`. The registry is used for known-command checks; dispatcher-only cases such as `webchat`, `sso`, and `deps` still run because `handleCommand()` has direct cases for them.
+The command surface is split between the registry in `cli/services/commandRegistry.js` and explicit switch cases in `cli/commands/cli.js`. The registry is used for known-command checks; dispatcher-only cases such as `webchat` and `sso` still run because `handleCommand()` has direct cases for them.
 
 | Command | Main behavior |
 | --- | --- |
 | `help` | Prints generated help from `cli/services/help.js`. |
 | `install [repo] <url> [name] [branch]` / `add [repo] <url> [name] [branch]` | Clones a repo under `.ploinky/repos/<name>`, deriving the name from the URL when omitted, and stores source metadata. |
 | `uninstall [repo] <name-or-url>` / `remove [repo] <name-or-url>` | Disables enabled agents from that repo by container key, removes their runtime containers, removes `.ploinky/repos/<name>`, and preserves source metadata for reinstall. |
-| `update repo <name>` | Updates one installed repo with `git pull --rebase --autostash` or reclones a non-git repo when source metadata exists, then refreshes `AchillesCopilotBasicSkills` there when eligible. |
-| `update repos` | Updates installed Ploinky repos, refreshes runtime Achilles dependencies, and refreshes `AchillesCopilotBasicSkills` in eligible managed repos. |
-| `update all [folder]` | Updates Ploinky only when its checkout is in the selected folder (or contains the launch folder), then updates AgentLib, installed repos, managed-repo default skills, discovered workspace git repos, and default skills for discovered repos. |
-| `reinstall [agent]` / `reinstall agent <agent>` | Removes the running service for an enabled agent, recreates it with `ensureAgentService`, updates routing, and starts the router if needed. |
+| `update repo <name>` | Fast-forwards one installed repo through the verified Git update (clean, on its configured upstream, not diverged; otherwise preserved with a named skip), clones only into an absent or empty directory when source metadata exists, refreshes default skills there when eligible, and refreshes the manifest consumers of that source. Activation is recorded as pending. |
+| `update repos` | Fast-forwards installed Ploinky repos, advances the AgentLib source outside the Box, and refreshes default skills in eligible managed repos without pulling again. Activation is recorded as pending. No dependency caches are prepared. |
+| `update all [folder]` | Builds one operation set (registered repos, discovered workspace repos and declared skills sources, deduplicated by physical checkout) and fetches each checkout once; updates Ploinky only when its checkout is in the selected folder (or contains the launch folder), AgentLib, then default skills and skills manifests from the verified sources. Produces per-phase records; exits nonzero on failures or unverified required inputs and activates only when every required input verified. |
+| `reinstall [agent]` / `reinstall agent <agent>` | Resolves one exact enabled registration, issues a new rebuild token so its dependency tree is rebuilt from empty npm state, recreates the service with `ensureAgentService`, updates routing, and starts the router if needed. |
 | `enable agent <agent> [global|devel <repo>]` | Resolves an agent manifest, writes an enabled-agent record, creates work dirs/symlinks, starts the selected runtime, verifies backend-specific liveness and readiness, and publishes its route through coordinated apply. |
 | `enable sandbox` | Outside a Ploinky box, allows host sandbox runtimes for manifests with `lite-sandbox: true`; inside a box, fails because nested Podman is forced. |
 | `disable agent <agent>` | Removes the enabled-agent record and route in an inactive generation, stops/removes the selected container or sandbox process from a captured record snapshot, commits route removal, removes symlinks, and preserves the work dir. |
-| `disable agents-all` | Removes all selected enabled-agent records and routes in one inactive generation, then tears down their runtime instances from captured record snapshots. |
 | `disable sandbox` | Disables host sandbox runtimes, causing `lite-sandbox` agents to fall back to containers; this is already the forced box state. |
 | `sandbox status|enable|disable` | Reads or changes the host-sandbox toggle outside a box; inside a box, status reports forced nested Podman and enable cannot persist an override. |
 | `start [agent] [8080] [branch flags]` | Ensures repos/agents/dependencies, starts dependency graph services, writes routing, and launches the fixed inner Router watchdog. The public wrapper consumes any selected physical-host port and forwards inner `8080`. |
@@ -139,9 +130,8 @@ The command surface is split between the registry in `cli/services/commandRegist
 | `shell <agent>` | Ensures the agent service is running, then attaches an interactive shell. |
 | `cli <agent> [args]` | Ensures the agent service is running, then attaches the manifest CLI command or default CLI script. |
 | `webchat` | Prints the `/webchat` URL for the router login flow. Positional config arguments are rejected as removed. |
-| `client status|list|tool` | Talks to the local router MCP endpoint. `call`, `methods`, `task`, and `task-status` are old forms that print migration guidance. |
+| `client status|list|tool` | Talks to the local router MCP endpoint. |
 | `/settings` / `settings` | Opens the settings menu and refreshes the LLM suggestion cache when env changes. |
-| `set` | Legacy spelling; prints that the command was renamed to `/settings`. |
 | `logs tail [router\|agent] [--startup]` | Follows `.ploinky/logs/router.log` by default, or one exact enabled agent. Linux `/proc` argv or macOS `KERN_PROCARGS2` must prove the exact no-wait worker invocation. While that worker starts, agent `tail` follows `.ploinky/logs/no-wait/<container>.<runId>.log`, then opens/proves the runtime source and rechecks the marker, registry generation, and source identity before the one handoff. A followed failure returns 1 without falling back. `--startup` applies only to agents and follows only startup output. |
 | `logs last [<N>] [router\|agent] [--startup]` | Prints the last N lines (default 200, maximum 10000) from `.ploinky/logs/router.log` by default or one agent. For agents, a proved runtime is selected before no-wait state is consulted. `--startup` applies only to agents. Output is capped at 16 MiB. |
 | `logs` target resolution | Targets resolve against a read-only `agents.json` snapshot by exact registry key, unique alias, `repo/agent`, then unique bare agent name. Completion offers one round-trip-proved reference per enabled record. |
@@ -152,8 +142,6 @@ The command surface is split between the registry in `cli/services/commandRegist
 | `profile [name|list|show|validate]` | Reads or changes `.ploinky/profile` and validates profile definitions. |
 | `default-skills <repo>` | Copies repo skills into workspace `.agents/skills` and manages `.claude` alias symlinks. |
 | `sso enable|disable|status` | Binds/unbinds an SSO provider and reports SSO state. |
-| `deps prepare|status|clean` | Prepares, reports, or removes dependency caches. |
-| `delete` | Legacy path that shows help. |
 | `cloud` | Dispatcher path that prints that cloud commands are unavailable in this build. |
 
 `cloud` help text exists, but this build's dispatcher reports cloud commands as unavailable/unsupported.
@@ -444,18 +432,9 @@ Agent cache behavior:
 | Manifest has only `start` and no agent package | Container startup may skip core dependency preparation. |
 | LLM runtime manifest | Forces dependency preparation. |
 
-The `deps` command exposes this machinery:
+Runtimes resolve an immutable tree from `.ploinky/deps/store/` keyed by every install input; `reinstall <agent>` is the explicit rebuild.
 
-| Command | Behavior |
-| --- | --- |
-| `deps prepare` | Prepares caches for enabled agents. |
-| `deps prepare <repo>/<agent>` | Prepares caches for one agent, skipping start-only/no-package agents. |
-| `deps status` | Prints cache stamp/validity information. |
-| `deps clean <repo>/<agent>` | Removes one agent's dependency cache. |
-| `deps clean --global` | Removes global caches. |
-| `deps clean --all` | Removes all dependency caches. |
-
-There is also a legacy `dependencyInstaller.js` path used by lifecycle code only when profile lifecycle is run without `skipInstallHooks`; the main container creation path uses `dependencyCache.js`.
+`dependencyInstaller.js` also runs lifecycle install hooks when profile lifecycle is run without `skipInstallHooks`; the main container creation path installs through the dependency store.
 
 ## Container Runtime
 
@@ -535,7 +514,7 @@ Before consumers start, Ploinky mounts a box-owned non-secret topology snapshot.
 
 Private service calls on `8081` require effective authenticated policy plus an exact current-instance/current-enable-generation ACL. The caller receives `PLOINKY_AGENT_INSTANCE_ID`, `PLOINKY_AGENT_ENABLE_GENERATION`, and one tuple-derived `PLOINKY_AGENT_PRIVATE_SECRET`; its assertion binds type, audience, caller, generation, method, canonical path, query, body hash, expiry, and replay state. It is not user/admin identity. TURN's long-term secret remains in core, and only exact current-generation consumers can obtain rate-limited short-lived credentials and expiry through the private broker.
 
-Every Ploinky-created nested agent, helper, and sidecar container receives the exact ownership label `io.assistos.ploinky.managed=1`. On Box boot, the entrypoint enumerates that exact key/value and retires only non-running records whose immutable registry ownership is exact, or superseded predecessors whose name and stable labels are exact and whose immutable ID and complete lifecycle pair were both replaced in the registry. It also retires legacy helper records whose only Ploinky label is the historical managed marker. Running, paused, transitional, partially labelled, ambiguous, and foreign records fail the Box self-check without removal. Unlabelled, other-value, and near-name containers, nested images, nested named volumes, valid schema-2 networks, and retained workspace data remain untouched. Enumeration failure fails the box self-check. Manual containers have no Ploinky restart or repair guarantee.
+Every Ploinky-created nested agent, helper, and sidecar container receives the exact ownership label `io.assistos.ploinky.managed=1`. On Box boot, the entrypoint enumerates that exact key/value and retires only non-running records whose immutable registry ownership is exact, or superseded predecessors whose name and stable labels are exact and whose immutable ID and complete lifecycle pair were both replaced in the registry. It also retires stopped one-shot helpers, interrupted before their `--rm` cleanup, whose only Ploinky label is the managed marker. Running, paused, transitional, partially labelled, ambiguous, and foreign records fail the Box self-check without removal. Unlabelled, other-value, and near-name containers, nested images, nested named volumes, valid schema-2 networks, and retained workspace data remain untouched. Enumeration failure fails the box self-check. Manual containers have no Ploinky restart or repair guarantee.
 
 Nested container records no longer survive their box. The inner Podman graphroot at `/home/podman/.local/share/containers/storage` lives on the outer box writable layer with `transient_store` enabled, and only the separate imagestore at `/home/podman/.local/share/ploinky-images` is a durable host bind. The inner runroot at `/tmp/storage-run-1000` lives on the outer `/tmp` tmpfs, which is recreated empty on every boot. Removing the outer box therefore discards every nested container record, writable layer, network, and inner named volume, while cached nested images survive.
 
@@ -577,7 +556,7 @@ Important bwrap mounts:
 | Manifest volumes | Configured target paths from the root manifest and active profile, with relative host paths resolved against the workspace root and absolute host paths honored as declared. |
 | Runtime persistent storage | Configured container path. |
 
-Manifest admission rejects root-level and selected-profile volume sources below `.ploinky/data` or `.ploinky/shared`, including normalized absolute and symlink aliases. Runtime admission also rejects a project or other bind whose source is canonically equal to or inside either protected tree. Container and bwrap launches append final read-only empty-directory guards over either old path when a broader bind would expose it; Seatbelt applies final read and write denials. These guards do not create either legacy path in the workspace. Watchdog restarts classify the same admission failure as terminal policy state instead of retrying it.
+Manifest admission rejects root-level and selected-profile volume sources anywhere in the `.ploinky` controller root, including normalized absolute and symlink aliases. Runtime admission also rejects a project or other bind whose source is canonically equal to or inside `.ploinky/data` (Router security, edge routing and edge publication state). Container and bwrap launches append a final read-only empty-directory guard over `.ploinky/data` and pin the rest of `.ploinky`, including the dependency store, read-only when a broader bind would expose it; Seatbelt applies final read and write denials. These guards do not create `.ploinky/data` in the workspace. Watchdog restarts classify the same admission failure as terminal policy state instead of retrying it.
 
 The bwrap process does not unshare networking, so agent ports bind on the host. It does unshare PID. The runtime explicitly sets env vars with `--clearenv` plus `--setenv`, including `PORT`, router URL, manifest env, profile env/secrets, runtime resource env, `NODE_PATH=/code/node_modules`, `HOME=/root`, `PATH`, and identity variables. `WORKSPACE_PATH` is `/root` in isolated mode and remains the separately mounted workspace or development checkout in global and development modes.
 

@@ -81,8 +81,6 @@ class ClientCommands {
         }
     }
 
-    // Removed legacy PloinkyClient-based call; using local RoutingServer instead.
-
     formatToolLine(tool) {
         const agent = this.getToolAgentName(tool) || 'unknown';
         const name = tool && tool.name ? String(tool.name) : '(unnamed)';
@@ -230,29 +228,11 @@ class ClientCommands {
         }
     }
 
-    async getTaskStatus(agentName, taskId) {
-        if (!agentName || !taskId) {
-            console.log('Usage: client task-status <agent> <task-id>');
-            console.log('Example: client task-status myAgent task-123');
-            return;
-        }
-
-        console.log('Not standardized. If supported by your agent, call its status method via:');
-        console.log("  client call <path-or-agent> 'task.status' <taskId>");
-    }
-
     async handleClientCommand(args) {
         const [subcommand, ...options] = args;
         debugLog(`Handling client command: '${subcommand}' with options: [${options.join(', ')}]`);
 
         switch (subcommand) {
-            case 'call':
-                console.log('client call is no longer supported. Use "client tool <toolName>" instead.');
-                break;
-            case 'methods':
-                console.log('client methods has been replaced by "client list tools". Showing aggregated tools:');
-                await this.listTools();
-                break;
             case 'status':
                 await this.getAgentStatus(options[0]);
                 break;
@@ -402,12 +382,6 @@ class ClientCommands {
                 await this.callTool(toolName, fields, targetAgent);
                 break;
             }
-            case 'task':
-                console.log('client task has been replaced by client tool. Use: client tool <toolName> [...]');
-                break;
-            case 'task-status':
-                await this.getTaskStatus(options[0], options[1]);
-                break;
             default:
                 console.log('Client commands:');
                 console.log('  client tool <toolName> [--agent <agent>] [-p <params>] [-key val]  - Call an MCP tool');

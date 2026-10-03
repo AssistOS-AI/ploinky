@@ -26,11 +26,9 @@ function fixture(t) {
     }
     paths.rootPackage = path.join(paths.ploinky, 'package.json');
     paths.globalPackage = path.join(paths.ploinky, 'globalDeps', 'package.json');
-    paths.dependencyLock = path.join(paths.ploinky, 'ploinky-box', 'dependencies.lock.json');
     for (const [file, value] of [
         [paths.rootPackage, { scripts: { postinstall: LOCKED_ROOT_POSTINSTALL } }],
         [paths.globalPackage, { dependencies: {} }],
-        [paths.dependencyLock, { repositories: { achillesAgentLib: { url: 'https://example.invalid/lib.git', ...release.repositories.achillesAgentLib } } }],
     ]) {
         fs.mkdirSync(path.dirname(file), { recursive: true });
         fs.writeFileSync(file, JSON.stringify(value));

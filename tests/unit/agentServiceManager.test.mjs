@@ -18,11 +18,9 @@ import {
     isGenerationCapabilityRuntimeEffective,
     restartGenerationCapabilityRuntime,
     replaceRuntimeRouterEnvFlags,
-    resolveManagedAdoptionAgentCacheMount,
     stripReservedAndRestoreRuntimeRouterEnvFlags,
 } from '../../cli/sandbox/docker/agentServiceManager.js';
 import { PROBE_CONTROL_CONTAINER_ROOT } from '../../cli/sandbox/docker/healthProbes.js';
-import { getAgentCachePath } from '../../cli/utils/dependencies/dependencyCache.js';
 import { buildRouterEndpoint } from '../../cli/sandbox/routerPort.js';
 import { BOX_MARKER_CONTENT } from '../../ploinky-box/constants.mjs';
 
@@ -573,6 +571,26 @@ test('reserved env filtering restores only the runtime-owned Router authority', 
     }
 });
 
+test('the outer Box image ID name is reserved: extra env flags cannot introduce it into a nested agent', () => {
+    const supplied = [
+        '-e SAFE="kept"',
+        '-e PLOINKY_BOX_IMAGE_ID="sha256:forged"',
+        '-e PLOINKY_BOX_IMAGE_ID_SUFFIXED="kept-because-it-is-a-different-name"',
+    ];
+    const runtimeRouterEnv = buildRuntimeRouterEnv('podman', {
+        networkMode: 'bridge',
+        routerEndpoint: buildRouterEndpoint('bridge', 8080),
+        routerPort: 8080,
+    });
+
+    stripReservedAndRestoreRuntimeRouterEnvFlags(supplied, runtimeRouterEnv);
+
+    assert.equal(supplied.some((entry) => entry.startsWith('-e PLOINKY_BOX_IMAGE_ID=')), false);
+    assert.equal(supplied.includes('-e SAFE="kept"'), true);
+    assert.equal(supplied.includes('-e PLOINKY_BOX_IMAGE_ID_SUFFIXED="kept-because-it-is-a-different-name"'), true);
+    assert.equal(Object.keys(runtimeRouterEnv).includes('PLOINKY_BOX_IMAGE_ID'), false);
+});
+
 test('existing-container ownership inspection is unconditional across network modes', () => {
     const source = fs.readFileSync(new URL('../../cli/sandbox/docker/agentServiceManager.js', import.meta.url), 'utf8');
     assert.doesNotMatch(source, /\bresolveRouterEndpoint\s*\(/, 'service manager must not reread persisted routing state');
@@ -609,44 +627,6 @@ test('service startup passes its platform adapter through a private lock-bound h
     assert.equal((service.match(/createNetworkLifecycleAdapter\(\{ runtime \}\)/g) || []).length, 1);
 });
 
-test('managed adoption derives one exact dependency runtime key from registered cache mounts', () => {
-    const repoName = 'repo';
-    const agentName = 'agent';
-    const runtimeKey = 'container-linux-arm64-glibc-node22';
-    const cachePath = getAgentCachePath(repoName, agentName, runtimeKey);
-    const mountedNodeModules = path.join(cachePath, 'node_modules');
-    const record = {
-        config: {
-            binds: [
-                { source: mountedNodeModules, target: '/code/node_modules', ro: true },
-                { source: mountedNodeModules, target: '/Agent/node_modules', ro: true },
-                { source: '/tmp/unrelated/node_modules', target: '/unrelated', ro: true },
-            ],
-        },
-    };
-
-    assert.deepEqual(resolveManagedAdoptionAgentCacheMount(record, repoName, agentName), {
-        cachePath,
-        nodeModulesDir: mountedNodeModules,
-        runtimeKey,
-    });
-    assert.equal(resolveManagedAdoptionAgentCacheMount({ config: { binds: [] } }, repoName, agentName), null);
-
-    const secondRuntimeKey = 'container-linux-arm64-musl-node22';
-    assert.throws(() => resolveManagedAdoptionAgentCacheMount({
-        config: {
-            binds: [
-                { source: mountedNodeModules, target: mountedNodeModules, ro: true },
-                {
-                    source: path.join(getAgentCachePath(repoName, agentName, secondRuntimeKey), 'node_modules'),
-                    target: '/duplicate',
-                    ro: true,
-                },
-            ],
-        },
-    }, repoName, agentName), /more than one agent cache/);
-});
-
 test('healthy managed reuse is validation-only while replacement remains an explicit transaction', () => {
     const source = fs.readFileSync(new URL('../../cli/sandbox/docker/agentServiceManager.js', import.meta.url), 'utf8');
     assert.match(source, /adoptManagedRuntimeOnly = !managedReconciliationPreparationLease/);
@@ -658,8 +638,10 @@ test('healthy managed reuse is validation-only while replacement remains an expl
     assert.match(source, /prepareEdgeRoutingGeneration as prepareEdgeRoutingGenerationRaw/);
     assert.match(source, /if \(preserveActiveAuthorization\) \{[\s\S]*prepared = prepare\(\{[\s\S]*saveRegistry\(agents[\s\S]*prepared = prepareReplacement/);
     assert.match(source, /writeState:\s*!adoptManagedRuntimeOnly,\s*createDirectories:\s*!adoptManagedRuntimeOnly/);
-    assert.match(source, /const runtimeKey = adoptManagedRuntimeOnly\s*\? \(adoptionCacheMount\?\.runtimeKey \|\| NO_NODE_RUNTIME_KEY\)\s*:\s*detectRuntimeKeyForAgent/);
-    assert.match(source, /if \(adoptManagedRuntimeOnly\) \{[\s\S]*inspectAgentCache\([\s\S]*\} else \{\s*const prepared = prepareAgentCache/);
+    assert.match(source, /const runtimeKey = adoptManagedRuntimeOnly\s*\? \(admittedDependencies\?\.runtimeKey \|\| NO_NODE_RUNTIME_KEY\)\s*:\s*detectRuntimeKeyForAgent/);
+    // Adoption validates the admitted immutable generation read-only; only a
+    // non-adopting launch resolves (or builds) a generation from the store.
+    assert.match(source, /if \(adoptManagedRuntimeOnly\) \{\s*const problem = containerDependencyReuseProblem\([\s\S]*\} else if \(dependencyPlan\.prepare\) \{\s*preparedDependencies = prepareRuntimeDependencies\(/);
     assert.match(source, /if \(adoptManagedRuntimeOnly\) \{\s*requireManagedAdoptionDirectory\(agentHomeDir[\s\S]*assertManagedAdoptionMcpConfig[\s\S]*\} else \{[\s\S]*syncAgentMcpConfig/);
     assert.match(source, /if \(adoptManagedRuntimeOnly\) \{[\s\S]*imageExists\(ROUTER_AUTHORITY_HELPER_IMAGE[\s\S]*imageExists\(image[\s\S]*\} else \{\s*ensureImagePresent\(ROUTER_AUTHORITY_HELPER_IMAGE/);
     const adoptionReturnStart = source.indexOf('if (adoptManagedRuntimeOnly) {', source.indexOf('started = startAgentContainer'));

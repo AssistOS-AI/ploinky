@@ -16,7 +16,7 @@ import {
     digestGenerationParts as digestParts,
     generationDocumentFile as generationFile,
     generationSourceParts as sourceParts,
-    installLegacyGeneration,
+    installGenerationWithoutPublicHosts,
     readGenerationDocument,
     selectActiveGeneration as selectActive,
     selectBinding,
@@ -123,24 +123,29 @@ test('source tampering and impossible source shapes fail generation verification
     assert.throws(load, { code: 'EDGE_GENERATION_CORRUPT' });
 });
 
-test('a legacy generation verifies exactly and never gains origins from the current environment', (t) => {
+test('a generation without its public Router hosts source is rejected and never completed from the environment', (t) => {
     const fixture = createRouterOriginsWorkspace(t, { hosts: ['100.73.151.25', 'pgx'] });
-    const legacySelector = installLegacyGeneration(fixture.edgeDir, fixture.applied.selector.generation);
-    const legacy = loadActiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace });
-    assert.equal(legacy.selector.generation, legacySelector.generation);
-    assert.notEqual(legacy.selector.generation, fixture.applied.selector.generation);
-    assert.equal(legacy.generation.routerPublicHosts, null);
-    assert.equal(legacy.generation.routerOrigins, null);
-    assert.equal(Object.hasOwn(legacy.generation.sourceDigests, 'routerPublicHosts'), false);
+    const unsupported = installGenerationWithoutPublicHosts(fixture.edgeDir, fixture.applied.selector.generation);
+    assert.notEqual(unsupported.generation, fixture.applied.selector.generation);
+    const load = () => loadActiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace });
+    assert.throws(load, (error) => error?.code === 'EDGE_GENERATION_CORRUPT'
+        && /missing its required routerPublicHosts source/.test(error.message));
 
-    // A legacy generation has no captured binding to compare, so it stays
-    // loadable across environments without being enriched by any of them.
-    selectBinding({ hosts: ['192.168.1.10'] });
-    assert.equal(loadActiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace }).generation.routerOrigins, null);
+    // No binding, including the one it was captured under, completes it.
+    for (const hosts of [['100.73.151.25', 'pgx'], ['192.168.1.10'], undefined]) {
+        selectBinding({ hosts });
+        assert.throws(load, { code: 'EDGE_GENERATION_CORRUPT' }, JSON.stringify(hosts));
+    }
 
-    const replacement = applyEdgeRoutingGeneration({ workspaceRoot: fixture.workspace, reason: 'legacy-replacement' });
-    assert.deepEqual(replacement.generation.routerOrigins, ['http://192.168.1.10:3000']);
-    assert.deepEqual(replacement.topology.routerOrigins, ['http://192.168.1.10:3000']);
+    // Nor is it silently superseded: a replacement requires a readable predecessor.
+    const selectorFile = path.join(fixture.edgeDir, 'active.json');
+    const selectorBytes = fs.readFileSync(selectorFile, 'utf8');
+    assert.throws(
+        () => applyEdgeRoutingGeneration({ workspaceRoot: fixture.workspace, reason: 'unsupported-replacement' }),
+        { code: 'EDGE_GENERATION_CORRUPT' },
+    );
+    assert.equal(fs.readFileSync(selectorFile, 'utf8'), selectorBytes);
+    assert.equal(JSON.parse(selectorBytes).generation, unsupported.generation);
 });
 
 test('an active generation fails closed when the Box host list differs from its capture', (t) => {

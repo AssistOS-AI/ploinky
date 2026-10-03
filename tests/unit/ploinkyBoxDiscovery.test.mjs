@@ -108,6 +108,29 @@ function fakeRunner(identity, {
     };
 }
 
+// Fake Podman Machine marker files: a string is the file content, an Error is
+// thrown as-is, and any other path is absent (ENOENT). Records every read.
+function markerFiles(entries = {}) {
+    const reads = [];
+    const read = (file) => {
+        reads.push(file);
+        const value = entries[file];
+        if (value instanceof Error) throw value;
+        if (value === undefined) {
+            throw Object.assign(new Error(`ENOENT: no such file, open '${file}'`), { code: 'ENOENT' });
+        }
+        return value;
+    };
+    read.reads = reads;
+    return read;
+}
+
+// Unit discovery never reads the real /etc: without an explicit reader these
+// tests see a host that has no Podman Machine marker.
+function discover(identity, options) {
+    return discoverBoxOwnership(identity, { readMachineMarkerFile: markerFiles(), ...options });
+}
+
 function assertOnlyPodmanExactInspect(runner, identity) {
     assert.deepEqual(runner.calls, [
         ['podman', 'info', '--format', 'json'],
@@ -118,7 +141,7 @@ function assertOnlyPodmanExactInspect(runner, identity) {
 test('discovery accepts native Linux and the default macOS Podman Machine', (t) => {
     const identity = identityFixture(t);
     const linuxRunner = fakeRunner(identity);
-    const linux = discoverBoxOwnership(identity, {
+    const linux = discover(identity, {
         platform: 'linux',
         env: {},
         runner: linuxRunner,
@@ -131,7 +154,7 @@ test('discovery accepts native Linux and the default macOS Podman Machine', (t) 
         podman: podmanInfo({ serviceIsRemote: true }),
         connections: [{ Default: true, IsMachine: true }],
     });
-    const machine = discoverBoxOwnership(identity, {
+    const machine = discover(identity, {
         platform: 'darwin',
         env: {},
         runner: machineRunner,
@@ -151,7 +174,7 @@ test('discovery retains the selected rootless helper without guessing from platf
         const info = podmanInfo();
         info.host.rootlessNetworkCmd = helper;
         const runner = fakeRunner(identity, { podman: info });
-        const result = discoverBoxOwnership(identity, { platform: 'linux', env: {}, runner });
+        const result = discover(identity, { platform: 'linux', env: {}, runner });
         assert.equal(result.engine.rootlessNetworkCmd, helper);
         assertOnlyPodmanExactInspect(runner, identity);
     }
@@ -160,7 +183,7 @@ test('discovery retains the selected rootless helper without guessing from platf
 test('discovery rejects unsupported, rootful, and remote engines before inspection', (t) => {
     const identity = identityFixture(t);
     const unsupportedRunner = fakeRunner(identity);
-    assert.equal(discoverBoxOwnership(identity, {
+    assert.equal(discover(identity, {
         platform: 'win32',
         env: {},
         runner: unsupportedRunner,
@@ -168,7 +191,7 @@ test('discovery rejects unsupported, rootful, and remote engines before inspecti
     assert.equal(unsupportedRunner.calls.length, 0);
 
     const configuredRemoteRunner = fakeRunner(identity);
-    assert.equal(discoverBoxOwnership(identity, {
+    assert.equal(discover(identity, {
         platform: 'linux',
         env: { CONTAINER_HOST: 'ssh://elsewhere' },
         runner: configuredRemoteRunner,
@@ -178,7 +201,7 @@ test('discovery rejects unsupported, rootful, and remote engines before inspecti
     const rootfulRunner = fakeRunner(identity, {
         podman: podmanInfo({ rootless: false }),
     });
-    assert.equal(discoverBoxOwnership(identity, {
+    assert.equal(discover(identity, {
         platform: 'linux',
         env: {},
         runner: rootfulRunner,
@@ -188,7 +211,7 @@ test('discovery rejects unsupported, rootful, and remote engines before inspecti
     const linuxRemoteRunner = fakeRunner(identity, {
         podman: podmanInfo({ serviceIsRemote: true }),
     });
-    assert.equal(discoverBoxOwnership(identity, {
+    assert.equal(discover(identity, {
         platform: 'linux',
         env: {},
         runner: linuxRemoteRunner,
@@ -199,7 +222,7 @@ test('discovery rejects unsupported, rootful, and remote engines before inspecti
         podman: podmanInfo({ serviceIsRemote: true }),
         connections: [{ Default: true, IsMachine: false }],
     });
-    const arbitraryResult = discoverBoxOwnership(identity, {
+    const arbitraryResult = discover(identity, {
         platform: 'darwin',
         env: {},
         runner: arbitraryMacRemote,
@@ -212,6 +235,117 @@ test('discovery rejects unsupported, rootful, and remote engines before inspecti
     );
 });
 
+test('discovery refuses a gvproxy-based Podman Machine guest before querying Podman', (t) => {
+    const identity = identityFixture(t);
+    for (const [file, content] of [
+        ['/etc/podman-machine', 'applehv\n'],
+        ['/etc/podman-machine', 'qemu'],
+        ['/etc/podman-machine', 'hyperv'],
+        ['/etc/podman-machine', 'libkrun'],
+        ['/etc/podman-machine', ''],
+        ['/etc/podman-machine', ' \n'],
+        ['/etc/podman-machine', 'unknown-provider'],
+        // Podman compares the type exactly, so only lowercase `wsl` is exempt.
+        ['/etc/podman-machine', 'WSL'],
+        // Go's TrimSpace keeps a byte-order mark, so Podman treats these as
+        // gvproxy-based; JavaScript's trim() would strip it and admit them.
+        ['/etc/podman-machine', '﻿wsl'],
+        ['/etc/podman-machine', 'wsl﻿\n'],
+        // Only ASCII whitespace is trimmed. Podman also trims these, but
+        // refusing them can only fail closed.
+        ['/etc/podman-machine', '\u0085wsl'],
+        ['/etc/podman-machine', ' wsl'],
+        ['/etc/containers/podman-machine', 'applehv'],
+    ]) {
+        const runner = fakeRunner(identity);
+        const result = discoverBoxOwnership(identity, {
+            platform: 'linux',
+            env: {},
+            runner,
+            readMachineMarkerFile: markerFiles({ [file]: content }),
+        });
+        const label = `${file}=${JSON.stringify(content)}`;
+        assert.equal(result.state, 'unsupported', label);
+        assert.match(result.message, /gvproxy-based Podman Machine guest/, label);
+        assert.ok(result.message.includes(file), label);
+        assert.equal(result.engine, undefined, label);
+        assert.deepEqual(runner.calls, [], label);
+    }
+
+    // The current marker decides; the pre-Podman-6 path is only a fallback.
+    const primary = markerFiles({
+        '/etc/podman-machine': 'applehv',
+        '/etc/containers/podman-machine': 'wsl',
+    });
+    assert.equal(discoverBoxOwnership(identity, {
+        platform: 'linux', env: {}, runner: fakeRunner(identity), readMachineMarkerFile: primary,
+    }).state, 'unsupported');
+    assert.deepEqual(primary.reads, ['/etc/podman-machine']);
+});
+
+test('discovery keeps native Linux without a gvproxy marker and ignores markers on macOS', (t) => {
+    const identity = identityFixture(t);
+    for (const entries of [
+        {},
+        { '/etc/podman-machine': 'wsl\n' },
+        { '/etc/podman-machine': ' wsl \n' },
+        // Every ASCII whitespace character Go's TrimSpace removes.
+        { '/etc/podman-machine': '\t\v\f\r wsl\r\n' },
+        { '/etc/containers/podman-machine': 'wsl' },
+    ]) {
+        const runner = fakeRunner(identity);
+        const reader = markerFiles(entries);
+        const result = discoverBoxOwnership(identity, {
+            platform: 'linux', env: {}, runner, readMachineMarkerFile: reader,
+        });
+        assert.equal(result.state, 'absent', JSON.stringify(entries));
+        assert.equal(result.engine.hostKind, 'native-linux');
+        assertOnlyPodmanExactInspect(runner, identity);
+        assert.deepEqual(reader.reads, entries['/etc/podman-machine']
+            ? ['/etc/podman-machine']
+            : ['/etc/podman-machine', '/etc/containers/podman-machine']);
+    }
+
+    const machineRunner = fakeRunner(identity, {
+        podman: podmanInfo({ serviceIsRemote: true }),
+        connections: [{ Default: true, IsMachine: true }],
+    });
+    const macReader = markerFiles({ '/etc/podman-machine': 'applehv' });
+    const machine = discoverBoxOwnership(identity, {
+        platform: 'darwin', env: {}, runner: machineRunner, readMachineMarkerFile: macReader,
+    });
+    assert.equal(machine.state, 'absent');
+    assert.equal(machine.engine.hostKind, 'podman-machine');
+    assert.deepEqual(macReader.reads, []);
+});
+
+test('an unreadable Podman Machine marker fails closed with its path and reason', (t) => {
+    const identity = identityFixture(t);
+    const denied = Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+    const directory = Object.assign(new Error('EISDIR: illegal operation on a directory'), { code: 'EISDIR' });
+    for (const [entries, file, code, reads] of [
+        [{ '/etc/podman-machine': denied }, '/etc/podman-machine', 'EACCES', ['/etc/podman-machine']],
+        [
+            { '/etc/containers/podman-machine': directory },
+            '/etc/containers/podman-machine',
+            'EISDIR',
+            ['/etc/podman-machine', '/etc/containers/podman-machine'],
+        ],
+    ]) {
+        const runner = fakeRunner(identity);
+        const reader = markerFiles(entries);
+        const result = discoverBoxOwnership(identity, {
+            platform: 'linux', env: {}, runner, readMachineMarkerFile: reader,
+        });
+        assert.equal(result.state, 'unsupported', code);
+        assert.ok(result.message.includes(file), code);
+        assert.ok(result.message.includes(code), code);
+        assert.match(result.message, /cannot read the Podman Machine marker/, code);
+        assert.deepEqual(reader.reads, reads, code);
+        assert.deepEqual(runner.calls, [], code);
+    }
+});
+
 test('unavailable and malformed Podman information fails closed', (t) => {
     const identity = identityFixture(t);
     const infoKey = ['podman', 'info', '--format', 'json'].join('\0');
@@ -222,7 +356,7 @@ test('unavailable and malformed Podman information fails closed', (t) => {
             { ok: false, stdout: '', stderr: '', error: { code: 'ENOENT' } },
         ]]),
     });
-    const absent = discoverBoxOwnership(identity, {
+    const absent = discover(identity, {
         platform: 'linux',
         env: {},
         runner: absentRunner,
@@ -236,7 +370,7 @@ test('unavailable and malformed Podman information fails closed', (t) => {
             { ok: false, stdout: '', stderr: 'engine busy', error: null },
         ]]),
     });
-    const unreachable = discoverBoxOwnership(identity, {
+    const unreachable = discover(identity, {
         platform: 'linux',
         env: {},
         runner: unreachableRunner,
@@ -250,7 +384,7 @@ test('unavailable and malformed Podman information fails closed', (t) => {
             { ok: true, stdout: '{', stderr: '', error: null },
         ]]),
     });
-    const malformed = discoverBoxOwnership(identity, {
+    const malformed = discover(identity, {
         platform: 'linux',
         env: {},
         runner: malformedRunner,
@@ -262,7 +396,7 @@ test('unavailable and malformed Podman information fails closed', (t) => {
 test('ownership handles carry only the exact outer container', (t) => {
     const identity = identityFixture(t);
     const absentRunner = fakeRunner(identity);
-    const absent = discoverBoxOwnership(identity, {
+    const absent = discover(identity, {
         platform: 'linux',
         env: {},
         runner: absentRunner,
@@ -272,7 +406,7 @@ test('ownership handles carry only the exact outer container', (t) => {
     assertOnlyPodmanExactInspect(absentRunner, identity);
 
     const runner = fakeRunner(identity, { container: ownedContainer(identity) });
-    const owned = discoverBoxOwnership(identity, {
+    const owned = discover(identity, {
         platform: 'linux',
         env: {},
         runner,
@@ -291,7 +425,7 @@ test('Podman exact-name inspection is the only Box inventory source', (t) => {
     differentlyNamed.Name = 'another-container-with-copied-labels';
     const runner = fakeRunner(identity, { container: differentlyNamed });
 
-    const result = discoverBoxOwnership(identity, {
+    const result = discover(identity, {
         platform: 'linux',
         env: {},
         runner,
@@ -325,12 +459,12 @@ test('a Box replacement between commands is rediscovered without a frontend conf
         },
     };
 
-    const first = discoverBoxOwnership(identity, {
+    const first = discover(identity, {
         platform: 'linux',
         env: {},
         runner,
     });
-    const second = discoverBoxOwnership(identity, {
+    const second = discover(identity, {
         platform: 'linux',
         env: {},
         runner,
@@ -355,7 +489,7 @@ test('discovery checks workspace provenance but leaves configuration to reconcil
     wrongRole.Labels[BOX_LABELS.role] = 'images';
 
     for (const container of [unlabeled, wrongPath, wrongRole]) {
-        const result = discoverBoxOwnership(identity, {
+        const result = discover(identity, {
             platform: 'linux',
             env: {},
             runner: fakeRunner(identity, { container }),
@@ -376,9 +510,17 @@ test('discovery checks workspace provenance but leaves configuration to reconcil
     delete incompleteConfiguration.Labels[BOX_LABELS.imagesFingerprint];
     delete incompleteConfiguration.Labels[BOX_AGENTLIB_LABELS.fingerprint];
     incompleteConfiguration.Labels[BOX_AGENTLIB_LABELS.mode] = 'legacy';
+    // An image-supplied library carries only the mode, source identity and relative
+    // path: it has no content fingerprint or commit label, and the supplying image is
+    // the container's own immutable image, so discovery reads none of them for ownership.
+    const imageSupplied = ownedContainer(identity);
+    delete imageSupplied.Labels[BOX_AGENTLIB_LABELS.fingerprint];
+    delete imageSupplied.Labels[BOX_AGENTLIB_LABELS.commit];
+    imageSupplied.Labels[BOX_AGENTLIB_LABELS.mode] = 'image';
+    imageSupplied.Labels[BOX_AGENTLIB_LABELS.sourceRelativePath] = 'image';
 
-    for (const container of [minimal, extraLabel, incompleteConfiguration]) {
-        const result = discoverBoxOwnership(identity, {
+    for (const container of [minimal, extraLabel, incompleteConfiguration, imageSupplied]) {
+        const result = discover(identity, {
             platform: 'linux',
             env: {},
             runner: fakeRunner(identity, { container }),
@@ -392,7 +534,7 @@ test('a container without an immutable ID is foreign rather than owned', (t) => 
     const container = ownedContainer(identity);
     delete container.Id;
 
-    const result = discoverBoxOwnership(identity, {
+    const result = discover(identity, {
         platform: 'linux',
         env: {},
         runner: fakeRunner(identity, { container }),
@@ -413,7 +555,7 @@ test('an unreadable or malformed exact inspection is unknown rather than absent'
             { ok: false, stdout: '', stderr: 'engine busy', error: null },
         ]]),
     });
-    const unreadable = discoverBoxOwnership(identity, {
+    const unreadable = discover(identity, {
         platform: 'linux',
         env: {},
         runner: unreadableRunner,
@@ -422,7 +564,7 @@ test('an unreadable or malformed exact inspection is unknown rather than absent'
     assert.match(unreadable.message, /could not determine whether container/);
 
     for (const inspectStdout of ['[]', '[{}, {}]', 'not-json']) {
-        const malformed = discoverBoxOwnership(identity, {
+        const malformed = discover(identity, {
             platform: 'linux',
             env: {},
             runner: fakeRunner(identity, { inspectStdout }),

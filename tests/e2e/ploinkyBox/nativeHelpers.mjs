@@ -187,6 +187,9 @@ export function createPodmanHarness(t, candidateReference, {
         runner,
         lockManager,
         resolveIdentity,
+        // Host skill scope needs a launch directory inside the fixture workspace;
+        // the test process itself runs from the Ploinky checkout.
+        launchCwd: workspace,
         platform: process.platform,
         env: {},
         stdout: output,

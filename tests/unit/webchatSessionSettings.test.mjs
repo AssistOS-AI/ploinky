@@ -40,11 +40,19 @@ test('conversation navigation rejects external origins, credentials, script sche
     assert.equal(normalizeSessionSettingsAction({ ...action, label: '' }, origin), null);
 });
 
-test('production WebChat does not expose session settings navigation', async () => {
+test('production WebChat menu and session event handler expose the generic action', async () => {
     const client = new URL('../../cli/server/webchat/', import.meta.url);
-    for (const name of ['chat.html', 'index.js', 'domSetup.js', 'webchat.css']) {
-        const source = await fs.readFile(new URL(name, client), 'utf8');
-        assert.doesNotMatch(source, /sessionSettingsLink|sessionSettingsController|wa-session-settings-link/);
+    const [html, index, dom, css] = await Promise.all(['chat.html', 'index.js', 'domSetup.js', 'webchat.css'].map((name) => fs.readFile(new URL(name, client), 'utf8')));
+    assert.match(html, /id="sessionSettingsLink" data-menu-action hidden/);
+    assert.match(dom, /sessionSettingsLink: document\.getElementById\('sessionSettingsLink'\)/);
+    assert.match(index, /import \{ createSessionSettingsController \} from '\.\/sessionSettings\.js'/);
+    assert.match(index, /const sessionSettingsController = createSessionSettingsController\(\{ link: elements\.sessionSettingsLink \}\)/);
+    assert.match(index, /sessionSettingsController\.handleSessionState\(payload, selected\)/);
+    assert.match(css, /\.wa-session-settings-link\[hidden\]\s*\{\s*display: none/);
+    const controller = await fs.readFile(new URL('sessionSettings.js', client), 'utf8');
+    assert.doesNotMatch(controller, /roboTeamAgent|copilot-session|list_achilles_skills/);
+    for (const source of [controller, html, index, dom, css]) {
+        assert.doesNotMatch(source, /roboTeamAgent|AchillesCLI|copilot-session|copilot-robot|list_achilles_skills|conversation-skills/);
     }
 });
 
@@ -65,4 +73,34 @@ test('session settings survive the production protocol parser and SSE serializer
     assert.equal(link.href, action.href);
     assert.equal(parseWebchatSessionState({ ...envelope, settingsAction: { ...action, href: '//evil.example' } }).settingsAction, undefined);
     assert.equal(parseWebchatSessionState({ ...envelope, summary: { sessionId: 'dba7d510-d4a7-4e82-bb74-4c1b2e1c74fd' } }), undefined);
+});
+
+test('traversal hrefs that collapse to a protocol-relative URL stay hidden through parse, SSE and controller', () => {
+    const sessionId = 'caa7d510-d4a7-4e82-bb74-4c1b2e1c74fd';
+    const timestamps = { createdAt: '2026-09-10T00:00:00Z', updatedAt: '2026-09-10T00:00:00Z' };
+    const envelope = (settingsAction) => ({ __webchatSession: 1, version: 1, event: 'current',
+        session: { sessionId, messages: [], ...timestamps }, summary: { sessionId, hasHistory: false, ...timestamps }, settingsAction });
+    const toPayload = (state) => JSON.parse(serializeSessionStateSseEvent(state).split('\ndata: ')[1]);
+    const link = { removeAttribute(name) { delete this[name]; } };
+    const controller = createSessionSettingsController({ link, origin });
+    for (const href of ['/a/..//evil.example/x', '/%2e%2e//evil.example/x']) {
+        // A valid action first, so that the hidden state below is a clearing and not the constructor default.
+        controller.handleSessionState(toPayload(parseWebchatSessionState(envelope(action))), sessionId);
+        assert.equal(link.hidden, false, href);
+        assert.equal(link.href, action.href, href);
+        const state = parseWebchatSessionState(envelope({ ...action, href }));
+        assert.ok(state, href);
+        // The pipeline is parse, then the serializer re-parses; the client controller normalizes a third time.
+        // Only the serialized payload and the rendered link are pinned, not the intermediate parse result.
+        const sse = serializeSessionStateSseEvent(state);
+        const payload = JSON.parse(sse.split('\ndata: ')[1]);
+        assert.equal(payload.settingsAction, undefined, href);
+        assert.doesNotMatch(sse, /evil\.example/, href);
+        controller.handleSessionState(payload, sessionId);
+        assert.equal(link.hidden, true, href);
+        assert.equal(link.href, undefined, href);
+    }
+    controller.handleSessionState(toPayload(parseWebchatSessionState(envelope(action))), sessionId);
+    assert.equal(link.hidden, false);
+    assert.equal(link.href, action.href);
 });

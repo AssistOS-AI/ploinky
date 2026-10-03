@@ -14,6 +14,7 @@ import {
     AGENTLIB_STABLE_MOUNT_PATH,
     agentLibError,
     agentLibRuntimeEnv,
+    assertSupplyingImageId,
 } from '../../agentlib/contract.mjs';
 import { activeAgentLibSelection, agentLibLinkTarget } from '../utils/dependencies/agentLibLink.js';
 
@@ -28,7 +29,9 @@ export { AGENTLIB_STABLE_MOUNT_PATH, activeAgentLibSelection };
  *
  * @param {string} runtimeKey
  * @param {object} [selection] - defaults to this process's runtime contract
- * @returns {Readonly<{sourceDir: string, runtimePath: string, mode: string, fingerprint: string, commit: string, sourceIdHash: string, namespaced: boolean}>}
+ * @returns {Readonly<{sourceDir: string, runtimePath: string, mode: string, sourceIdHash: string, namespaced: boolean, fingerprint?: string, commit?: string, supplyingImageId?: string}>}
+ *   A local grant carries the content fingerprint and commit; an image grant
+ *   carries the outer Box image ID that supplies the source.
  */
 export function agentLibGrant(runtimeKey, selection = null) {
     const active = selection || activeAgentLibSelection();
@@ -38,22 +41,37 @@ export function agentLibGrant(runtimeKey, selection = null) {
     if (!/^[a-f0-9]{64}$/.test(sourceIdHash)) {
         throw agentLibError(
             AGENTLIB_ERROR_CODES.contractMissing,
-            'Agent runtime admission requires the selected physical achillesAgentLib source identity.',
+            'Agent runtime admission requires the selected achillesAgentLib source identity.',
         );
     }
-    return Object.freeze({
+    const common = {
         sourceDir,
         runtimePath,
         mode: active.mode,
-        fingerprint: active.fingerprint,
-        commit: active.commit || '',
         sourceIdHash,
         namespaced: runtimePath === AGENTLIB_STABLE_MOUNT_PATH,
+    };
+    if (active.mode === 'image') {
+        return Object.freeze({
+            ...common,
+            supplyingImageId: assertSupplyingImageId(active.supplyingImageId),
+        });
+    }
+    return Object.freeze({
+        ...common,
+        fingerprint: active.fingerprint,
+        commit: active.commit || '',
     });
 }
 
-/** The reserved runtime environment an agent must receive for a grant. */
+/**
+ * The reserved runtime environment an agent must receive for a grant. It never
+ * carries the outer Box image ID: nothing inside a nested runtime consumes it.
+ */
 export function agentLibGrantEnv(grant) {
+    if (grant.mode === 'image') {
+        return agentLibRuntimeEnv({ mode: 'image', sourceIdHash: grant.sourceIdHash }, grant.runtimePath);
+    }
     return agentLibRuntimeEnv(
         {
             mode: grant.mode,
@@ -111,6 +129,12 @@ export function agentLibAliasShadows(grant, writableBinds = []) {
  * persisting them duplicates configuration without improving reuse decisions.
  */
 export function agentLibRuntimeRecord(grant) {
+    if (grant.mode === 'image') {
+        return {
+            supplyingImageId: grant.supplyingImageId,
+            sourceIdHash: grant.sourceIdHash,
+        };
+    }
     return {
         fingerprint: grant.fingerprint,
         sourceIdHash: grant.sourceIdHash,
@@ -135,9 +159,12 @@ export { AGENTLIB_ENV };
 export function agentLibReuseProblem(existingRecord, grant) {
     const recorded = existingRecord?.agentLib;
     if (!recorded) return 'agentLib runtime record missing';
-    for (const key of ['fingerprint', 'sourceIdHash']) {
-        if (String(recorded[key] ?? '') !== String(grant[key] ?? '')) {
-            return `agentLib ${key} changed (${recorded[key] ?? 'null'} != ${grant[key] ?? 'null'})`;
+    // Compare exactly the identity this grant records: a record of the other
+    // mode, or of a shape this version does not write, never matches.
+    const expected = agentLibRuntimeRecord(grant);
+    for (const key of Object.keys(expected)) {
+        if (String(recorded[key] ?? '') !== String(expected[key] ?? '')) {
+            return `agentLib ${key} changed (${recorded[key] ?? 'null'} != ${expected[key] ?? 'null'})`;
         }
     }
     return '';

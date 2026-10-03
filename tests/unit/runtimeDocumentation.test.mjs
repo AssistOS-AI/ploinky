@@ -96,19 +96,6 @@ test('active runtime documentation separates durable caches from disposable nest
     }
 });
 
-test('direct/core cutover documentation uses the explicit old core entry', () => {
-    for (const relativePath of [
-        'README.md',
-        'container/README.md',
-        'docs/code-derived-agent-lifecycle.md',
-    ]) {
-        const content = read(relativePath);
-        assert.match(content, /node cli\/index\.js destroy/, relativePath);
-        assert.match(content, /node cli\/index\.js network prune/, relativePath);
-        assert.match(content, /public [`']?ploinky[`']? wrapper[\s\S]*outer runtime|outside a managed box[\s\S]*outer supervisor/i, relativePath);
-    }
-});
-
 test('active runtime documentation describes the same-path workspace mount without a fixed root', () => {
     for (const relativePath of [
         'README.md',

@@ -390,7 +390,7 @@ test('task view renders a complete terminal log snapshot without waiting for ano
         'taskStatus',
         'taskDuration',
         'taskError',
-        'taskStop',
+        'taskPause',
         'taskActionError',
         'taskLog',
         'taskContinuation',
@@ -541,7 +541,7 @@ test('task view sends continuation through the AchillesCLI command bridge', () =
     assert.ok(html.indexOf('id="taskAgent"') < html.indexOf('id="taskModel"'));
     assert.ok(html.indexOf('id="taskModel"') < html.indexOf('id="taskDescription"'));
     assert.match(source, /`\/task continue \$\{taskId\} \$\{message\}`/);
-    assert.match(source, /TERMINAL_STATUSES = new Set\(\['finished', 'stopped', 'error'\]\)/);
+    assert.match(source, /TERMINAL_STATUSES = new Set\(\['finished', 'paused', 'error'\]\)/);
     assert.match(source, /TERMINAL_STATUSES\.has\(task\?\.status\)/);
     assert.match(source, /applyUpdate\(payload\)/);
     assert.match(source, /task\?\.commands/);
@@ -598,11 +598,11 @@ test('task view stops ongoing work through the AchillesCLI command bridge', () =
         new URL('../../cli/server/webchat/task-view.html', import.meta.url),
         'utf8',
     );
-    assert.match(html, /id="taskStop"/);
+    assert.match(html, /id="taskPause"/);
     assert.match(source, /task\?\.status === 'ongoing'/);
     assert.match(source, /remoteStatus \|\| ''\).*=== 'cancelling'/);
-    assert.match(source, /`\/task stop \$\{taskId\}`/);
-    assert.match(source, /Stopping…/);
+    assert.match(source, /`\/task pause \$\{taskId\}`/);
+    assert.match(source, /Pausing…/);
 });
 
 test('generic side panel stops above the floating composer and scrolls its content', () => {

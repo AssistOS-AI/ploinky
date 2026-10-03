@@ -59,7 +59,7 @@ test('pinned Explorer graph starts through one immutable Box candidate', {
 
     const prepared = await harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference });
     const workspaceRoot = harness.identity.workspaceRoot;
-    const masterKeyPath = path.join(workspaceRoot, '.ploinky', 'master-key');
+    const masterKeyPath = path.join(workspaceRoot, '.ploinky', 'data', 'master-key');
     stageSmokeGraph({
         graph,
         containerId: prepared.containerId,

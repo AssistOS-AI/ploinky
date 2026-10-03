@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import {
+    publishNoWaitRunMarker,
     retireNoWaitRunMarker,
     retireNoWaitRunMarkers,
 } from '../../cli/commands/noWaitMarkerLifecycle.js';
@@ -87,11 +88,12 @@ test('an exact prior-generation marker is atomically retired and removed', (t) =
     const env = fixture(t);
     const identity = markerIdentity();
     writeMarker(env.markerPath, identity);
+    // A retirement returns the exact verified identity it retired.
     assert.deepEqual(
         retireNoWaitRunMarker(CONTAINER, retireOptions(env.runningDir, {
             expectedRecord: expectedRecord(identity),
         })),
-        { retired: true, containerName: CONTAINER, markerPath: env.markerPath },
+        { retired: true, containerName: CONTAINER, markerPath: env.markerPath, identity },
     );
     assert.equal(fs.existsSync(env.markerPath), false);
     assert.deepEqual(fs.readdirSync(env.markerDirectory), []);
@@ -101,6 +103,68 @@ test('an exact prior-generation marker is atomically retired and removed', (t) =
         })),
         { retired: false, containerName: CONTAINER, markerPath: env.markerPath },
     );
+});
+
+test('a retirement reports exactly the immutable identity it retired and nothing else', (t) => {
+    const env = fixture(t);
+    const identity = markerIdentity();
+    // Real markers also carry their publication time.
+    fs.writeFileSync(env.markerPath, JSON.stringify({ createdAt: '2026-09-30T00:00:00.000Z', ...identity }), {
+        mode: 0o600,
+    });
+    const retired = retireNoWaitRunMarker(CONTAINER, retireOptions(env.runningDir, {
+        expectedRecord: expectedRecord(identity),
+    }));
+    assert.equal(Object.isFrozen(retired), true);
+    assert.deepEqual(retired.identity, identity);
+    assert.equal(Object.hasOwn(retired.identity, 'createdAt'), false);
+    const again = retireNoWaitRunMarker(CONTAINER, retireOptions(env.runningDir, {
+        expectedRecord: expectedRecord(identity),
+    }));
+    assert.equal(again.retired, false);
+    assert.equal(Object.hasOwn(again, 'identity'), false, 'nothing retired, so no identity is claimed');
+});
+
+test('a published marker is one private regular file of exactly one identity', (t) => {
+    const env = fixture(t);
+    const identity = markerIdentity();
+    const published = publishNoWaitRunMarker(identity, {
+        runningDir: env.runningDir,
+        randomUUID: () => RETIREMENT_ID,
+        now: () => new Date('2026-09-30T00:00:00.000Z'),
+    });
+    assert.equal(published.markerPath, env.markerPath);
+    assert.deepEqual(published.identity, identity);
+    const stat = fs.lstatSync(env.markerPath);
+    assert.equal(stat.isFile(), true);
+    assert.equal(stat.nlink, 1, 'published by rename, never by a link');
+    assert.equal(stat.mode & 0o777, 0o600);
+    assert.deepEqual(JSON.parse(fs.readFileSync(env.markerPath, 'utf8')), {
+        createdAt: '2026-09-30T00:00:00.000Z',
+        ...identity,
+    });
+    assert.deepEqual(fs.readdirSync(env.markerDirectory), [path.basename(env.markerPath)], 'no temporary file remains');
+    // The published marker is retired by the same exact-record contract.
+    assert.equal(retireNoWaitRunMarker(CONTAINER, retireOptions(env.runningDir, {
+        expectedRecord: expectedRecord(identity),
+    })).retired, true);
+});
+
+test('marker publication never replaces an existing marker and rejects an inexact identity', (t) => {
+    const env = fixture(t);
+    const existing = markerIdentity({ runId: '22222222-3333-4444-8555-666666666666' });
+    writeMarker(env.markerPath, { ...existing, statusFile: `${CONTAINER}.${existing.runId}.json` });
+    const before = fs.readFileSync(env.markerPath);
+    assert.throws(() => publishNoWaitRunMarker(markerIdentity(), { runningDir: env.runningDir }),
+        { code: 'NO_WAIT_MARKER_PUBLICATION_FAILED' });
+    assert.deepEqual(fs.readFileSync(env.markerPath), before);
+    assert.deepEqual(fs.readdirSync(env.markerDirectory), [path.basename(env.markerPath)]);
+
+    const other = fixture(t);
+    assert.throws(() => publishNoWaitRunMarker(markerIdentity({ statusFile: 'foreign.json' }), {
+        runningDir: other.runningDir,
+    }), { code: 'NO_WAIT_MARKER_PUBLICATION_FAILED' });
+    assert.equal(fs.existsSync(other.markerPath), false);
 });
 
 test('generation, repository, agent, alias, and route disagreement all fail closed', (t) => {

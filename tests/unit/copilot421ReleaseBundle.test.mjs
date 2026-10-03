@@ -48,17 +48,6 @@ function globalPackage({ declaresAgentLib = false } = {}) {
     };
 }
 
-function dependencyLock(commit = SHAS.achillesAgentLib) {
-    return {
-        repositories: {
-            achillesAgentLib: {
-                url: 'https://github.com/AssistOS-AI/AchillesAgentLib.git',
-                commit,
-            },
-        },
-    };
-}
-
 function rootPackage(postinstall = LOCKED_ROOT_POSTINSTALL) {
     return {
         scripts: { postinstall },
@@ -73,7 +62,6 @@ function verificationFixture({ states = {} } = {}) {
         explorer: '/fixture/explorer',
         rootPackage: '/fixture/package.json',
         globalPackage: '/fixture/globalDeps/package.json',
-        dependencyLock: '/fixture/ploinky-box/dependencies.lock.json',
     };
     const stateByPath = Object.fromEntries(Object.entries(SHAS).map(([name, head]) => [
         paths[name],
@@ -84,7 +72,6 @@ function verificationFixture({ states = {} } = {}) {
         readJson(filePath) {
             if (filePath === paths.rootPackage) return rootPackage();
             if (filePath === paths.globalPackage) return globalPackage();
-            if (filePath === paths.dependencyLock) return dependencyLock();
             throw new Error(`unexpected fixture path ${filePath}`);
         },
         inspectRepository(repositoryPath) {
@@ -170,46 +157,38 @@ test('release manifest rejects missing, extra, branch, and non-immutable identit
     }
 });
 
-test('delivery metadata requires the Box lock alone and rejects a second installed AgentLib', () => {
+test('delivery metadata rejects a second installed AgentLib and reads no Box lock', () => {
     const result = validateAgentlibDeliveryMetadata({
         globalPackage: globalPackage(),
-        dependencyLock: dependencyLock(),
         expectedCommit: SHAS.achillesAgentLib,
     });
-    assert.equal(result.commit, SHAS.achillesAgentLib);
+    assert.deepEqual({ ...result }, { commit: SHAS.achillesAgentLib });
 
     // A bundle whose globalDeps still installs achillesAgentLib would ship a
-    // second, independently resolved copy alongside the direct mount.
+    // second, independently resolved copy alongside the selected source.
     assert.throws(() => validateAgentlibDeliveryMetadata({
         globalPackage: globalPackage({ declaresAgentLib: true }),
-        dependencyLock: dependencyLock(),
         expectedCommit: SHAS.achillesAgentLib,
     }), /must not declare achillesAgentLib/);
 
+    // The manifest commit is release evidence about the deployed checkout, so it
+    // must still be an exact immutable commit.
     assert.throws(() => validateAgentlibDeliveryMetadata({
         globalPackage: globalPackage(),
-        dependencyLock: dependencyLock('6'.repeat(40)),
-        expectedCommit: SHAS.achillesAgentLib,
-    }), /must name the same AgentLib commit/);
-
-    const alternateRemote = dependencyLock();
-    alternateRemote.repositories.achillesAgentLib.url = 'not-a-github-url';
-    assert.throws(() => validateAgentlibDeliveryMetadata({
-        globalPackage: globalPackage(),
-        dependencyLock: alternateRemote,
-        expectedCommit: SHAS.achillesAgentLib,
-    }), /Box dependency lock achillesAgentLib/);
+        expectedCommit: 'master',
+    }), /exact lowercase 40-hex commit/);
 });
 
-test('root package accepts only the exact immutable lock-driven installer contract', () => {
-    const paths = {
-        rootPackagePath: '/candidate/ploinky/package.json',
-        dependencyLockPath: '/candidate/ploinky/ploinky-box/dependencies.lock.json',
-    };
-    const valid = validateRootPackageInstaller({
-        rootPackage: rootPackage(),
-        ...paths,
-    });
+test('the verifier no longer depends on any Ploinky dependency lock', () => {
+    const source = fs.readFileSync(new URL('../release/verifyCopilot421Bundle.mjs', import.meta.url), 'utf8');
+    assert.doesNotMatch(source, /dependencies\.lock|dependencyLock|ROOT_DEPENDENCY_LOCK/);
+    const fixtureState = verificationFixture();
+    assert.equal('dependencyLock' in defaultPaths('/candidate/ploinky', { env: {} }), false);
+    assert.equal('dependencyLock' in fixtureState.paths, false);
+});
+
+test('root package accepts only the exact immutable installer contract', () => {
+    const valid = validateRootPackageInstaller({ rootPackage: rootPackage() });
     assert.equal(valid.postinstall, LOCKED_ROOT_POSTINSTALL);
 
     for (const mutablePostinstall of [
@@ -221,18 +200,11 @@ test('root package accepts only the exact immutable lock-driven installer contra
     ]) {
         assert.throws(() => validateRootPackageInstaller({
             rootPackage: rootPackage(mutablePostinstall),
-            ...paths,
-        }), /immutable Box dependency-lock installer/);
+        }), /must use the Box dependency installer/);
     }
     assert.throws(() => validateRootPackageInstaller({
-        rootPackage: rootPackage(),
-        rootPackagePath: paths.rootPackagePath,
-        dependencyLockPath: '/candidate/other/dependencies.lock.json',
-    }), /must be tied to ploinky-box\/dependencies\.lock\.json/);
-    assert.throws(() => validateRootPackageInstaller({
         rootPackage: { scripts: {} },
-        ...paths,
-    }), /immutable Box dependency-lock installer/);
+    }), /must use the Box dependency installer/);
 });
 
 test('exact dependency specs reject branches, shorthand, whitespace, and credentials', () => {

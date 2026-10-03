@@ -28,7 +28,6 @@ import {
 } from '../utils/publicRouterHosts.mjs';
 import { parseRouterOriginList } from '../../Agent/lib/routerOrigins.mjs';
 import {
-    INITIAL_MEDIA_HOST_PORT,
     parseMediaHostPort,
     parseRouterHostPort,
     selectedMediaHostPort,
@@ -1674,6 +1673,17 @@ export function inactivateEdgeRoutingGeneration(reason = 'candidate-change', opt
     const { release } = acquireApplyLockCapability(paths, options);
     try {
         const previous = readSelector(paths);
+        // An exact-selector inactivation withdraws only the named active
+        // activation. Any other selector already reflects a newer decision
+        // (or already fails closed) and is left untouched.
+        if (options.expectedActiveSelector !== undefined) {
+            const expected = options.expectedActiveSelector;
+            if (previous?.state !== 'active'
+                || previous.generation !== expected?.generation
+                || previous.activationId !== expected?.activationId) {
+                return null;
+            }
+        }
         const selector = sealSelector({
             schemaVersion: EDGE_GENERATION_SCHEMA_VERSION,
             state: 'inactive',
@@ -1694,6 +1704,39 @@ export function inactivateEdgeRoutingGeneration(reason = 'candidate-change', opt
     }
 }
 
+/**
+ * `stop`'s inactivation. A killed start's graph preparation can be retired
+ * only while its exact inactive selector is still selected; when stop could
+ * not retire it itself (for example while a live Watchdog held the workspace
+ * lease), that selector is the next start's only proof. Routing is already
+ * fail-closed under it and every apply is denied while the lease exists, so
+ * it is kept instead of replaced. Any other selector is inactivated as usual.
+ */
+export function inactivateEdgeRoutingGenerationForStop(reason, options = {}) {
+    const paths = resolveEdgeGenerationPaths(options);
+    const { capability, release } = acquireApplyLockCapability(paths, options);
+    try {
+        let lease = null;
+        try { lease = readPreparationLease(paths); } catch (_) {}
+        if (lease && lease.pid !== process.pid
+            && lease.mode === 'replacement' && lease.reason === 'workspace-graph-enable-prelaunch'
+            && preparationOwnerStopped(lease.pid)) {
+            try {
+                assertPreparedSelectorStillSelected(paths, lease);
+                return deepFreeze({ preserved: true, pid: lease.pid, selector: readSelector(paths) });
+            } catch (_) {
+                // No longer the exact prepared selector: nothing to preserve.
+            }
+        }
+        return deepFreeze({
+            preserved: false,
+            selector: inactivateEdgeRoutingGeneration(reason, { ...options, applyLockCapability: capability }),
+        });
+    } finally {
+        release();
+    }
+}
+
 function sourceDigests(captured) {
     return {
         routing: sourceDigest(captured.bytes.routingBytes),
@@ -1701,12 +1744,8 @@ function sourceDigests(captured) {
         desired: sourceDigest(captured.bytes.desiredBytes),
         agents: sourceDigest(captured.bytes.agentsBytes),
         routerHostPort: sourceDigest(captured.bytes.routerHostPortBytes),
-        ...(captured.bytes.mediaHostPortBytes
-            ? { mediaHostPort: sourceDigest(captured.bytes.mediaHostPortBytes) }
-            : {}),
-        ...(captured.bytes.routerPublicHostsBytes
-            ? { routerPublicHosts: sourceDigest(captured.bytes.routerPublicHostsBytes) }
-            : {}),
+        mediaHostPort: sourceDigest(captured.bytes.mediaHostPortBytes),
+        routerPublicHosts: sourceDigest(captured.bytes.routerPublicHostsBytes),
         manifests: Object.fromEntries(
             Object.entries(captured.bytes.manifestBytes).sort(([left], [right]) => left.localeCompare(right))
                 .map(([key, bytes]) => [key, sourceDigest(bytes)]),
@@ -1976,6 +2015,17 @@ function removePreparationLease(paths, expected) {
     fsyncDirectory(paths.edgeDir);
 }
 
+// ESRCH is the only proof that a preparation owner stopped. EPERM or success
+// leaves the owner live, including when an unrelated process reused its PID.
+function preparationOwnerStopped(pid) {
+    try {
+        process.kill(pid, 0);
+        return false;
+    } catch (error) {
+        return error?.code === 'ESRCH';
+    }
+}
+
 /** Retire a failed inactive preparation while a serialized reinstall owns the workspace. */
 export function retireAbandonedAgentPreparation(containerName, options = {}) {
     const paths = resolveEdgeGenerationPaths(options);
@@ -1993,12 +2043,8 @@ export function retireAbandonedAgentPreparation(containerName, options = {}) {
             throw edgeError('reinstall cannot retire an additive routing preparation', 'EDGE_PREPARATION_BUSY');
         }
         assertPreparedSelectorStillSelected(paths, lease);
-        if (lease.pid !== process.pid) {
-            let dead = false;
-            try { process.kill(lease.pid, 0); } catch (error) { dead = error?.code === 'ESRCH'; }
-            if (!dead) {
-                throw edgeError(`routing preparation is still owned by pid ${lease.pid}`, 'EDGE_PREPARATION_BUSY');
-            }
+        if (lease.pid !== process.pid && !preparationOwnerStopped(lease.pid)) {
+            throw edgeError(`routing preparation is still owned by pid ${lease.pid}`, 'EDGE_PREPARATION_BUSY');
         }
         const prepared = loadCapturedGeneration(paths, lease.preparedGeneration).generation;
         if (lifecycleBindingDigest(prepared) !== lease.lifecycleBindingDigest) {
@@ -2026,6 +2072,75 @@ export function retireAbandonedAgentPreparation(containerName, options = {}) {
         assertPreparedSelectorStillSelected(paths, lease);
         removePreparationLease(paths, lease);
         return { retired: true, transactionId: lease.transactionId };
+    } finally {
+        release();
+    }
+}
+
+/**
+ * Retire the graph preparation of a workspace start whose process stopped
+ * before committing or aborting it. Start and restart call this before their
+ * first selector rewrite: only the exact inactive selector captured in the
+ * lease still binds it. Anything that cannot be proven abandoned is refused
+ * with the host recovery, which retires the lease while the Box is stopped.
+ */
+export function retireAbandonedWorkspaceStartPreparation(options = {}) {
+    const paths = resolveEdgeGenerationPaths(options);
+    assertWorkspaceMutationLease(options.workspaceMutationLease, {
+        runningDir: path.join(paths.root, '.ploinky', 'running'),
+    });
+    assertNetworkLifecycleCapability(options.networkLifecycleCapability, {
+        lockPath: path.join(paths.root, '.ploinky', 'run', 'network.lock'),
+    });
+    const { release } = acquireApplyLockCapability(paths, options);
+    try {
+        const lease = readPreparationLease(paths);
+        if (!lease) return { retired: false };
+        const owner = `edge lifecycle preparation ${JSON.stringify(lease.reason)} (pid ${lease.pid})`;
+        const hostRecovery = 'stop the exact Box from its host workspace with `ploinky stop`, '
+            + 'then run `ploinky start`, which retires the preparation while the Box is stopped';
+        const refuse = (why) => edgeError(
+            `${owner} cannot be retired automatically: ${why}; ${hostRecovery}`,
+            'EDGE_PREPARATION_BUSY',
+        );
+        if (lease.pid === process.pid) throw refuse('it is owned by this process');
+        if (!preparationOwnerStopped(lease.pid)) {
+            throw edgeError(
+                `${owner} is still owned by a running process; wait for that operation to finish, or ${hostRecovery}`,
+                'EDGE_PREPARATION_BUSY',
+            );
+        }
+        if (lease.mode !== 'replacement' || lease.reason !== 'workspace-graph-enable-prelaunch') {
+            throw refuse('it belongs to another lifecycle operation');
+        }
+        try {
+            assertPreparedSelectorStillSelected(paths, lease);
+        } catch (_) {
+            throw refuse('its exact inactive selector was replaced');
+        }
+        let prepared;
+        try {
+            prepared = loadCapturedGeneration(paths, lease.preparedGeneration).generation;
+        } catch (_) {
+            throw refuse('its captured generation cannot be loaded');
+        }
+        if (lifecycleBindingDigest(prepared) !== lease.lifecycleBindingDigest) {
+            throw refuse('its captured generation no longer matches its lifecycle binding');
+        }
+        let agents;
+        try {
+            agents = JSON.parse(fs.readFileSync(paths.agentsFile, 'utf8'));
+        } catch (_) {
+            throw refuse('the agent registry cannot be read');
+        }
+        if (stableStringify(lifecycleAgentProjection(agents))
+            !== stableStringify(lifecycleAgentProjection(prepared.agents))) {
+            throw refuse('enabled agent identities changed after it was captured');
+        }
+        assertPreparationLeaseForApply(paths, lease);
+        assertPreparedSelectorStillSelected(paths, lease);
+        removePreparationLease(paths, lease);
+        return { retired: true, transactionId: lease.transactionId, pid: lease.pid };
     } finally {
         release();
     }
@@ -2114,10 +2229,12 @@ function decodeGenerationSources(document) {
         'routerPublicHosts',
         'manifests',
     ]), 'generation sources');
-    // Optional sources are additive: every writer that captured public Router
-    // hosts also captured the media port, so the reverse shape was never valid.
-    if (sources.routerPublicHosts !== undefined && sources.mediaHostPort === undefined) {
-        throw edgeError('generation public Router hosts source requires its media host-port source', 'EDGE_GENERATION_CORRUPT');
+    // Every generation binds its physical publication inputs. A document
+    // without one of them is unsupported, never completed from the environment.
+    for (const source of ['routerHostPort', 'mediaHostPort', 'routerPublicHosts']) {
+        if (sources[source] === undefined) {
+            throw edgeError(`generation is missing its required ${source} source`, 'EDGE_GENERATION_CORRUPT');
+        }
     }
     const manifestSources = assertObject(sources.manifests, 'generation manifest sources');
     const manifestBytes = Object.fromEntries(Object.entries(manifestSources).sort(([left], [right]) => left.localeCompare(right)).map(([routeKey, value]) => {
@@ -2130,12 +2247,8 @@ function decodeGenerationSources(document) {
         desiredBytes: decodeCanonicalBase64(sources.desired, 'generation desired source'),
         agentsBytes: decodeCanonicalBase64(sources.agents, 'generation agents source'),
         routerHostPortBytes: decodeCanonicalBase64(sources.routerHostPort, 'generation Router host-port source'),
-        ...(sources.mediaHostPort === undefined
-            ? {}
-            : { mediaHostPortBytes: decodeCanonicalBase64(sources.mediaHostPort, 'generation media host-port source') }),
-        ...(sources.routerPublicHosts === undefined
-            ? {}
-            : { routerPublicHostsBytes: decodeCanonicalBase64(sources.routerPublicHosts, 'generation public Router hosts source') }),
+        mediaHostPortBytes: decodeCanonicalBase64(sources.mediaHostPort, 'generation media host-port source'),
+        routerPublicHostsBytes: decodeCanonicalBase64(sources.routerPublicHosts, 'generation public Router hosts source'),
         manifestBytes,
     };
 }
@@ -2157,27 +2270,22 @@ function reconstructGeneration(document, selector) {
     } catch (error) {
         throw edgeError(`captured Router host port is invalid: ${error?.message || error}`, 'EDGE_GENERATION_CORRUPT');
     }
-    let mediaHostPort = INITIAL_MEDIA_HOST_PORT;
-    if (bytes.mediaHostPortBytes) {
-        try {
-            mediaHostPort = parseMediaHostPort(bytes.mediaHostPortBytes.toString('utf8'), {
-                source: 'captured media host port',
-            });
-        } catch (error) {
-            throw edgeError(`captured media host port is invalid: ${error?.message || error}`, 'EDGE_GENERATION_CORRUPT');
-        }
+    let mediaHostPort;
+    try {
+        mediaHostPort = parseMediaHostPort(bytes.mediaHostPortBytes.toString('utf8'), {
+            source: 'captured media host port',
+        });
+    } catch (error) {
+        throw edgeError(`captured media host port is invalid: ${error?.message || error}`, 'EDGE_GENERATION_CORRUPT');
     }
-    // A generation captured before public Router hosts were a source has no
-    // origin capability. Never derive one for it from today's environment.
-    let routerPublicHosts = null;
-    let routerOrigins = null;
-    if (bytes.routerPublicHostsBytes) {
-        try {
-            routerPublicHosts = parsePublicRouterHosts(bytes.routerPublicHostsBytes.toString('utf8'));
-            routerOrigins = deriveRouterOrigins(routerPublicHosts, routerHostPort);
-        } catch (error) {
-            throw edgeError(`captured public Router hosts are invalid: ${error?.message || error}`, 'EDGE_GENERATION_CORRUPT');
-        }
+    // Origins derive only from the captured hosts, never from today's environment.
+    let routerPublicHosts;
+    let routerOrigins;
+    try {
+        routerPublicHosts = parsePublicRouterHosts(bytes.routerPublicHostsBytes.toString('utf8'));
+        routerOrigins = deriveRouterOrigins(routerPublicHosts, routerHostPort);
+    } catch (error) {
+        throw edgeError(`captured public Router hosts are invalid: ${error?.message || error}`, 'EDGE_GENERATION_CORRUPT');
     }
     const manifests = Object.fromEntries(Object.entries(bytes.manifestBytes).map(([routeKey, value]) => (
         [routeKey, parseJsonBytes(value, `captured manifest(${routeKey})`)]
@@ -2208,8 +2316,8 @@ function reconstructGeneration(document, selector) {
         ['edge-desired.json', bytes.desiredBytes],
         ['agents.json', bytes.agentsBytes],
         ['router-host-port', bytes.routerHostPortBytes],
-        ...(bytes.mediaHostPortBytes ? [['media-host-port', bytes.mediaHostPortBytes]] : []),
-        ...(bytes.routerPublicHostsBytes ? [['router-public-hosts', bytes.routerPublicHostsBytes]] : []),
+        ['media-host-port', bytes.mediaHostPortBytes],
+        ['router-public-hosts', bytes.routerPublicHostsBytes],
         ...Object.entries(bytes.manifestBytes).sort(([left], [right]) => left.localeCompare(right)).map(([routeKey, value]) => [`manifest:${routeKey}`, value]),
     ];
     if (digestParts(parts) !== selector.generation) {
@@ -2217,32 +2325,11 @@ function reconstructGeneration(document, selector) {
     }
     const expectedDigests = sourceDigests({ bytes });
     const storedCompiled = assertObject(document.compiled, 'generation compiled state');
-    // Generations written before a derived allowlist was introduced do not
-    // contain that field. Accept only these exact additive omissions so a
-    // running workspace can load its previous generation long enough to commit
-    // a newly compiled one. Runtime behavior remains unchanged (and therefore
-    // fail-closed for a missing capability) until replacement is committed.
-    let legacyCompiledShape = false;
-    let semanticForStoredShape = semantic.compiled;
-    if (!Object.hasOwn(storedCompiled, 'dependencyHttpRoutes')) {
-        legacyCompiledShape = true;
-        semanticForStoredShape = Object.fromEntries(
-            Object.entries(semanticForStoredShape).filter(([key]) => key !== 'dependencyHttpRoutes'),
-        );
-    }
-    const storedSecurity = assertObject(storedCompiled.security, 'generation compiled security state');
-    if (!Object.hasOwn(storedSecurity, 'workspaceLogConsumers')) {
-        legacyCompiledShape = true;
-        semanticForStoredShape = {
-            ...semanticForStoredShape,
-            security: Object.fromEntries(
-                Object.entries(semanticForStoredShape.security).filter(([key]) => key !== 'workspaceLogConsumers'),
-            ),
-        };
-    }
+    // The stored compiled state must equal today's compilation exactly; a
+    // generation missing a derived field is unsupported and fails closed.
     if (stableStringify(document.sourceDigests) !== stableStringify(expectedDigests)
-        || document.compiledDigest !== compiledDigest(semanticForStoredShape)
-        || stableStringify(storedCompiled) !== stableStringify(semanticForStoredShape)) {
+        || document.compiledDigest !== compiledDigest(semantic.compiled)
+        || stableStringify(storedCompiled) !== stableStringify(semantic.compiled)) {
         throw edgeError('active edge routing generation semantic verification failed', 'EDGE_GENERATION_CORRUPT');
     }
     return {
@@ -2259,7 +2346,7 @@ function reconstructGeneration(document, selector) {
         mediaHostPort,
         routerPublicHosts,
         routerOrigins,
-        compiled: legacyCompiledShape ? storedCompiled : semantic.compiled,
+        compiled: semantic.compiled,
     };
 }
 
@@ -2323,10 +2410,8 @@ function topologyMedia(desired, mediaHostPort) {
     return media;
 }
 
-// A generation without the captured source has no origin capability, and its
-// topology omits the field so consumers can tell legacy from an empty list.
 function topologyRouterOrigins(generation) {
-    return Array.isArray(generation.routerOrigins) ? [...generation.routerOrigins] : undefined;
+    return [...generation.routerOrigins];
 }
 
 function topologyConfigurationGeneration(generation) {
@@ -2335,10 +2420,9 @@ function topologyConfigurationGeneration(generation) {
     // are intentionally represented by the separate authorization/publication
     // generations below.
     const media = topologyMedia(generation.desired, generation.mediaHostPort);
-    const routerOrigins = topologyRouterOrigins(generation);
     const configuration = {
         ...(media ? { media } : {}),
-        ...(routerOrigins ? { routerOrigins } : {}),
+        routerOrigins: topologyRouterOrigins(generation),
     };
     return sourceDigest(Buffer.from(stableStringify(configuration)));
 }
@@ -2361,7 +2445,7 @@ function writeTopologyForGeneration(paths, generation, publicationState, options
         // Advisory discovery only. This file is published before the selector
         // commit, so consumers confirm active origins through the private
         // runtime-origins operation before relying on them.
-        ...(routerOrigins ? { routerOrigins } : {}),
+        routerOrigins,
     };
     fs.mkdirSync(paths.topologyGenerationsDir, { recursive: true });
     const topologyName = `${generation.generation.replace(/^sha256:/, '')}-${topology.publicationGeneration}.json`;
@@ -2869,10 +2953,9 @@ export function applyEdgeDesiredStateFile(candidateFile, options = {}) {
     });
 }
 
-// A generation binds the public hosts the Box was created with. Legacy
-// generations carry none and remain loadable without gaining a capability.
+// A generation binds the public hosts the Box was created with.
 function routerPublicHostsMatchRuntime(generation) {
-    if (!Array.isArray(generation?.routerPublicHosts)) return true;
+    if (!Array.isArray(generation?.routerPublicHosts)) return false;
     try {
         return serializePublicRouterHosts(capturePublicRouterHosts())
             === serializePublicRouterHosts(generation.routerPublicHosts);
@@ -2995,6 +3078,16 @@ export function readEdgeRoutingSelection(options = {}) {
         throw edgeError('edge routing selector is missing or corrupt', 'EDGE_GENERATION_CORRUPT');
     }
     return deepFreeze({ selector, paths });
+}
+
+/**
+ * Observe who owns the outstanding preparation lease, or null. This grants
+ * nothing: every retirement or apply still validates the lease under the
+ * apply lock.
+ */
+export function readEdgeRoutingPreparationOwner(options = {}) {
+    const lease = readPreparationLease(resolveEdgeGenerationPaths(options));
+    return lease ? deepFreeze({ pid: lease.pid, reason: lease.reason, mode: lease.mode }) : null;
 }
 
 export function captureEdgeRoutingLease(options = {}) {
@@ -3290,12 +3383,10 @@ export function readCurrentEdgeTopology(options = {}) {
         || !/^sha256:[a-f0-9]{64}$/.test(String(document.authorizationGeneration || ''))) {
         throw edgeError('edge topology has an unsupported or invalid schema', 'EDGE_TOPOLOGY_INVALID');
     }
-    if (Object.hasOwn(document, 'routerOrigins')) {
-        try {
-            parseRouterOriginList(document.routerOrigins);
-        } catch (_) {
-            throw edgeError('edge topology Router origins are invalid', 'EDGE_TOPOLOGY_INVALID');
-        }
+    try {
+        parseRouterOriginList(document.routerOrigins);
+    } catch (_) {
+        throw edgeError('edge topology Router origins are invalid', 'EDGE_TOPOLOGY_INVALID');
     }
     return deepFreeze(document);
 }

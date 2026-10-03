@@ -217,7 +217,7 @@ function isSensitiveEnvVariableName(name) {
  * Get all available environment variable names from all sources.
  * Sources checked (in order):
  *   1. process.env (current environment)
- *   2. .ploinky/.secrets file
+ *   2. .ploinky/data/.secrets file
  *   3. .env file in workspace root
  *
  * @returns {Set<string>} Set of all available variable names
@@ -230,7 +230,7 @@ function getAllAvailableEnvNames() {
         names.add(key);
     }
 
-    // Add from .ploinky/.secrets
+    // Add from .ploinky/data/.secrets
     try {
         const secretsMap = loadSecretsFile();
         for (const key of Object.keys(secretsMap)) {
@@ -532,7 +532,7 @@ function resolveManifestEnv(manifest, secrets, options = {}) {
 
     // Lazy-load .env so we only read the file when .secrets and process.env
     // both miss.  Mirrors the fallback order in secretInjector.getSecret():
-    //   1. .ploinky/.secrets  2. process.env  3. $CWD/.env
+    //   1. .ploinky/data/.secrets  2. process.env  3. $CWD/.env
     let envFileCache;
     const getEnvFile = () => {
         if (envFileCache === undefined) {

@@ -105,12 +105,12 @@ import {
     ensureAgentDataDirectory,
 } from '../../utils/runtime/agentDataPathPolicy.js';
 import {
-    legacyAgentGuardMounts,
-    legacyAgentGuardTargets,
+    controllerGuardMounts,
+    controllerGuardTargets,
     normalizeRuntimeMountTarget,
-    prepareLegacyGuardMountpointCleanup,
-    protectedLegacyAgentRoots,
-} from '../../utils/runtime/legacyAgentDataGuards.js';
+    prepareControllerGuardMountpointCleanup,
+    protectedControllerStateRoots,
+} from '../../utils/runtime/controllerStateGuards.js';
 import { deriveAgentPrincipalId } from '../../utils/security/agentIdentity.js';
 import { ensureSharedHostDir, runPostinstallHook } from './agentHooks.js';
 import {
@@ -121,9 +121,14 @@ import { captureHardwareContext } from '../hardwareLimits/requestedLimits.mjs';
 import { LIMITS_HASH_LABEL } from '../hardwareLimits/resolve.mjs';
 import { readAppliedObservation } from '../hardwareLimits/runtimeState.mjs';
 import { hasMpsLaunch, readMpsLaunch, verifyMpsLaunch, mpsLaunchArgs } from '../hardwareLimits/mpsLaunch.mjs';
-import { ensureBwrapService } from '../bwrap/bwrapServiceManager.js';
-import { isBwrapProcessRunning, stopBwrapProcess } from '../bwrap/bwrapFleet.js';
-import { ensureSeatbeltService } from '../seatbelt/seatbeltServiceManager.js';
+import { bwrapDependencyReuseProblem, ensureBwrapService } from '../bwrap/bwrapServiceManager.js';
+import {
+    clearBwrapPidIfExact,
+    normalizeExpectedPredecessor,
+    observeSandboxRuntime,
+    stopExactSandboxProcess,
+} from '../bwrap/bwrapFleet.js';
+import { ensureSeatbeltService, seatbeltDependencyReuseProblem } from '../seatbelt/seatbeltServiceManager.js';
 import { detectShellForImage, SHELL_FALLBACK_DIRECT } from './shellDetection.js';
 import {
     detectRuntimeKeyForAgent,
@@ -131,11 +136,12 @@ import {
     NO_NODE_RUNTIME_KEY,
 } from '../../utils/dependencies/dependencyRuntimeKey.js';
 import {
-    getAgentCachePath,
-    inspectAgentCache,
-    nodeModulesDir,
-    prepareAgentCache,
-} from '../../utils/dependencies/dependencyCache.js';
+    admittedDependencyRecord,
+    noCacheDependencyRecord,
+    prepareRuntimeDependencies,
+    runtimeDependencyReuseProblem,
+} from '../../utils/dependencies/store/runtimeDependencies.mjs';
+import { containerToolchainIdentity } from '../../utils/dependencies/store/installContract.mjs';
 import {
     agentLibCacheLinkProblem,
     ensureAgentLibCacheLink,
@@ -621,7 +627,7 @@ function ensurePodmanStagedCodeDir(agentName, agentCodePath, nodeModulesDir, cod
     return stagedCodePath;
 }
 
-function resolveReusablePodmanStagedMounts(existingRecord, runtimeRoot) {
+function resolveReusablePodmanStagedMounts(existingRecord, runtimeRoot, expectedNodeModulesDir = null) {
     const binds = Array.isArray(existingRecord?.config?.binds) ? existingRecord.config.binds : [];
     const resolvedRoot = path.resolve(String(runtimeRoot || ''));
     if (!resolvedRoot || !fs.existsSync(resolvedRoot)) return null;
@@ -647,6 +653,17 @@ function resolveReusablePodmanStagedMounts(existingRecord, runtimeRoot) {
     const agentLibMountPath = resolveTarget('/Agent', 'Agent');
     const codeMountPath = resolveTarget('/code', 'code');
     if (!agentLibMountPath || !codeMountPath) return null;
+    if (expectedNodeModulesDir) {
+        // Staged trees are reusable only when their dependency links still
+        // name the exact admitted payload.
+        for (const staged of [agentLibMountPath, codeMountPath]) {
+            try {
+                if (fs.readlinkSync(path.join(staged, 'node_modules')) !== expectedNodeModulesDir) return null;
+            } catch (_) {
+                return null;
+            }
+        }
+    }
     return Object.freeze({ agentLibMountPath, codeMountPath });
 }
 
@@ -1088,7 +1105,7 @@ function appendExactManagedBindMount(args, value) {
     return true;
 }
 
-function appendLegacyAgentDataGuards(args, runtime, {
+function appendControllerStateGuards(args, runtime, {
     workspaceRoot,
     canonicalRuntimeWorkspaceGuards = isPloinkyBoxRuntime(),
 } = {}) {
@@ -1098,12 +1115,12 @@ function appendLegacyAgentDataGuards(args, runtime, {
         readOnly: !mount.rw,
     }));
     const guardOptions = { workspaceRoot, bindings };
-    const targets = legacyAgentGuardTargets(bindings, guardOptions);
+    const targets = controllerGuardTargets(bindings, guardOptions);
     // Narrow repository grants can still cause the container engine to create
     // the canonical workspace parents. Guard those synthetic parents too so
     // the retired paths remain read-only even when no broad bind exposes them.
     if (!targets.length && canonicalRuntimeWorkspaceGuards) {
-        for (const protectedRoot of protectedLegacyAgentRoots(workspaceRoot)) {
+        for (const protectedRoot of protectedControllerStateRoots(workspaceRoot)) {
             targets.push(Object.freeze({
                 key: protectedRoot.key,
                 target: protectedRoot.hostPath,
@@ -1111,7 +1128,7 @@ function appendLegacyAgentDataGuards(args, runtime, {
             }));
         }
     }
-    for (const guard of legacyAgentGuardMounts(targets, guardOptions)) {
+    for (const guard of controllerGuardMounts(targets, guardOptions)) {
         if (guard.replaceExisting) {
             for (let index = 0; index < args.length - 1; index += 1) {
                 if (args[index] !== '-v' && args[index] !== '--volume') continue;
@@ -1361,30 +1378,85 @@ function managedAdoptionLlmPaths(llmStartup) {
     return Object.freeze({ ...llmStartup, modelDir, stateDir });
 }
 
-function resolveManagedAdoptionAgentCacheMount(record, repoName, agentName) {
-    const matches = new Map();
-    for (const bind of record?.config?.binds || []) {
-        const source = String(bind?.source || '').trim();
-        if (!source || path.basename(source) !== 'node_modules') continue;
-        const cachePath = path.dirname(path.resolve(source));
-        const runtimeKey = path.basename(cachePath);
-        let expectedCachePath;
-        try {
-            expectedCachePath = path.resolve(getAgentCachePath(repoName, agentName, runtimeKey));
-        } catch (_) {
-            continue;
-        }
-        if (cachePath !== expectedCachePath) continue;
-        matches.set(cachePath, Object.freeze({
-            cachePath,
-            nodeModulesDir: path.resolve(source),
-            runtimeKey,
-        }));
+/**
+ * Dependency reuse decision for any admitted runtime record (container,
+ * bwrap or seatbelt). No-wait adoption and every runtime reuse path share it.
+ */
+function admittedRuntimeDependencyProblem({ agentName, manifest, profileConfig, record, containerName }, deps = {}) {
+    const runtime = String(record?.runtime || '');
+    if (runtime === 'bwrap') return bwrapDependencyReuseProblem({ agentName, manifest, record, containerName }, deps);
+    if (runtime === 'seatbelt') return seatbeltDependencyReuseProblem({ agentName, manifest, record, containerName }, deps);
+    let image = '';
+    try {
+        image = resolveManifestImage(manifest, profileConfig, { agentName, repoName: record?.repoName });
+    } catch (_) {
+        image = String(record?.containerImage || '');
     }
-    if (matches.size > 1) {
-        throw managedAdoptionMismatch('registered dependency mounts name more than one agent cache');
+    return containerDependencyReuseProblem({
+        agentName, manifest, profileConfig, record, runtime: runtime || getRuntime(), image, containerName,
+    }, deps);
+}
+
+/**
+ * The record that proves predecessor ownership for a same-name replacement:
+ * the exact pre-rotation record, but only for the very container ID that is
+ * still registered. Anything else falls back to the registered record (whose
+ * rotated tuple then fails the ownership proof and preserves the container).
+ */
+function selectPredecessorRemovalRecord(registeredRecord, predecessorRecord) {
+    const registeredId = String(registeredRecord?.containerId || '');
+    if (predecessorRecord && registeredId && String(predecessorRecord.containerId || '') === registeredId) {
+        return predecessorRecord;
     }
-    return matches.values().next().value || null;
+    return registeredRecord;
+}
+
+/** The actual container mounts include the admitted store payload read-only. */
+function hasAdmittedDependencyMount(inspected, record) {
+    const admitted = admittedDependencyRecord(record);
+    if (admitted.mode !== 'store') return true;
+    const expected = path.resolve(admitted.nodeModulesPath || '');
+    const mounts = Array.isArray(inspected?.Mounts) ? inspected.Mounts : [];
+    const matching = mounts.filter((mount) => path.resolve(String(mount?.Source || '/')) === expected);
+    return matching.length > 0 && matching.every((mount) => mount.RW === false);
+}
+
+function inspectContainerImageId(runtime, image) {
+    try {
+        return containerToolchainIdentity({ runtime, image }).identity.imageId;
+    } catch (_) {
+        return null;
+    }
+}
+
+/**
+ * Container dependency reuse decision for an admitted runtime: '' when its
+ * mounted tree is the desired immutable generation, otherwise a reason that
+ * requires replacement. Read-only (no receipts, builds or probes containers).
+ */
+function containerDependencyReuseProblem({
+    agentName,
+    manifest,
+    profileConfig,
+    record,
+    runtime,
+    image,
+    containerName,
+}, deps = {}) {
+    const agentCodePath = resolveSymlinkPath(getAgentCodePath(agentName));
+    const agentHasPackageJson = fs.existsSync(path.join(agentCodePath, 'package.json'));
+    const llmRuntime = isLlmRuntimeManifest(manifest, profileConfig);
+    const needsDependencies = !readManifestStartCommand(manifest) || agentHasPackageJson || llmRuntime;
+    return runtimeDependencyReuseProblem({
+        record,
+        family: 'container',
+        needsDependencies,
+        agentCodePath,
+        registration: containerName,
+        engine: runtime,
+        image: llmRuntime ? (record?.containerImage || image) : image,
+        noNodeAllowed: !agentHasPackageJson && !llmRuntime,
+    }, deps);
 }
 
 /**
@@ -1717,16 +1789,15 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const agentHasPackageJson = fs.existsSync(path.join(agentCodePath, 'package.json'));
     const needsCoreDeps = !useStartEntry || agentHasPackageJson || llmRuntimeManifest;
     let preparedNodeModulesDir = path.join(agentWorkDir, 'node_modules');
+    // Every dependency tree comes from the immutable store. A healthy managed
+    // runtime is adopted only when it already mounts the desired generation;
+    // adoption is read-only and never publishes receipts or probes images.
+    let dependencyRecord = null;
+    let preparedDependencies = null;
     if (needsCoreDeps) {
-        // A healthy managed runtime already records the exact cache it has
-        // admitted and mounted. Reuse that immutable evidence: rediscovering the
-        // key would pull the image and launch a transient probe container, which
-        // would make an ordinary CLI attachment observably non-idempotent.
-        const adoptionCacheMount = adoptManagedRuntimeOnly
-            ? resolveManagedAdoptionAgentCacheMount(launchRecord, repoName, agentName)
-            : null;
+        const admittedDependencies = adoptManagedRuntimeOnly ? admittedDependencyRecord(launchRecord) : null;
         const runtimeKey = adoptManagedRuntimeOnly
-            ? (adoptionCacheMount?.runtimeKey || NO_NODE_RUNTIME_KEY)
+            ? (admittedDependencies?.runtimeKey || NO_NODE_RUNTIME_KEY)
             : detectRuntimeKeyForAgent(manifest, repoName, agentName, profileConfig, installerImage);
         const dependencyPlan = resolveDependencyCachePreparation({
             needsCoreDeps,
@@ -1737,46 +1808,49 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         if (dependencyPlan.fatal) {
             throw new Error(`[deps] ${agentName}: ${dependencyPlan.message}.`);
         }
-        if (dependencyPlan.prepare) {
-            const agentPackagePath = agentHasPackageJson ? path.join(agentCodePath, 'package.json') : null;
-            if (adoptManagedRuntimeOnly) {
-                if (!adoptionCacheMount) {
-                    throw managedAdoptionMismatch('registered dependency cache mount is unavailable');
-                }
-                const inspected = inspectAgentCache({
-                    repoName,
-                    agentName,
-                    runtimeKey,
-                    agentPackagePath,
-                    image: installerImage,
-                    runtime,
-                });
-                if (!inspected.valid) {
-                    throw managedAdoptionMismatch(`dependency cache drifted (${inspected.reason})`);
-                }
-                if (path.resolve(inspected.cachePath) !== adoptionCacheMount.cachePath) {
-                    throw managedAdoptionMismatch('registered dependency cache path drifted');
-                }
-                preparedNodeModulesDir = adoptionCacheMount.nodeModulesDir;
+        if (adoptManagedRuntimeOnly) {
+            const problem = containerDependencyReuseProblem({
+                agentName, manifest, profileConfig, record: launchRecord, runtime, image: installerImage, containerName,
+            });
+            if (problem) throw managedAdoptionMismatch(`dependency generation drifted (${problem})`);
+            dependencyRecord = admittedDependencies;
+            if (dependencyPlan.prepare) {
+                preparedNodeModulesDir = admittedDependencies.nodeModulesPath;
             } else {
-                const prepared = prepareAgentCache({
-                    repoName,
-                    agentName,
-                    runtimeKey,
-                    agentPackagePath,
-                    image: installerImage,
-                    runtime,
-                });
-                preparedNodeModulesDir = nodeModulesDir(prepared.cachePath);
-                debugLog(`[deps] ${agentName}: prepared dependency cache ready at ${preparedNodeModulesDir}`);
+                requireManagedAdoptionDirectory(preparedNodeModulesDir, 'agent node_modules directory');
             }
+        } else if (dependencyPlan.prepare) {
+            preparedDependencies = prepareRuntimeDependencies({
+                family: 'container',
+                runtimeKey,
+                engine: runtime,
+                image: installerImage,
+                agentCodePath,
+                registration: containerName,
+                admittedRecord: launchRecord,
+            }, {
+                consumer: {
+                    kind: 'container',
+                    key: `container:${containerName}:${runtimeIdentity.instanceId}:${runtimeIdentity.enableGeneration}`,
+                    engine: runtime,
+                    containerName,
+                    registration: containerName,
+                    phase: 'creating',
+                },
+            });
+            preparedNodeModulesDir = preparedDependencies.nodeModulesPath;
+            dependencyRecord = preparedDependencies.record;
+            debugLog(`[deps] ${agentName}: dependency generation ${dependencyRecord.generationId.slice(0, 12)} ready at ${preparedNodeModulesDir} (${preparedDependencies.status})`);
         } else {
             debugLog(`[deps] ${agentName}: Skipping dependency cache prep (${dependencyPlan.reason})`);
-            if (adoptManagedRuntimeOnly) {
-                requireManagedAdoptionDirectory(preparedNodeModulesDir, 'agent node_modules directory');
-            } else if (!fs.existsSync(preparedNodeModulesDir)) {
+            if (!fs.existsSync(preparedNodeModulesDir)) {
                 ensureAgentDataDirectory(preparedNodeModulesDir);
             }
+            dependencyRecord = noCacheDependencyRecord(dependencyPlan.reason, {
+                family: 'container',
+                runtimeKey,
+                imageId: inspectContainerImageId(runtime, installerImage),
+            });
         }
     } else {
         debugLog(`[deps] ${agentName}: Skipping dependency cache prep (uses start command, no package.json)`);
@@ -1785,6 +1859,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         } else if (!fs.existsSync(preparedNodeModulesDir)) {
             ensureAgentDataDirectory(preparedNodeModulesDir);
         }
+        dependencyRecord = adoptManagedRuntimeOnly
+            ? admittedDependencyRecord(launchRecord)
+            : noCacheDependencyRecord('no-core-deps', { family: 'container' });
     }
 
     // Manifest / profile install hook (e.g. coral-agent's installPrerequisites.sh)
@@ -1839,7 +1916,10 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     // package-resolution adapter as dependency-bearing agents. No branch that
     // skips npm may leave an empty node_modules directory behind.
     const agentLibCachePath = path.dirname(preparedNodeModulesDir);
-    if (adoptManagedRuntimeOnly) {
+    if (dependencyRecord?.mode === 'store') {
+        // The immutable object already carries its verified AgentLib links. A
+        // mounted tree is never repaired or relinked in place.
+    } else if (adoptManagedRuntimeOnly) {
         const linkProblem = agentLibCacheLinkProblem(
             agentLibCachePath,
             containerAgentLibGrant.runtimePath,
@@ -1860,7 +1940,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         }
         const podmanRuntimeRoot = path.join(PODMAN_RUNTIME_ROOT, runtimeSegment(containerName));
         const reusableStagedMounts = options.reuseStagedMounts === true
-            ? resolveReusablePodmanStagedMounts(existingRecord, podmanRuntimeRoot)
+            ? resolveReusablePodmanStagedMounts(existingRecord, podmanRuntimeRoot, preparedNodeModulesDir)
             : null;
         if (reusableStagedMounts) {
             agentLibMountPath = reusableStagedMounts.agentLibMountPath;
@@ -2039,9 +2119,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         args.push('-v', `${resourcePlan.persistentStorage.hostPath}:${resourcePlan.persistentStorage.containerPath}${runtime === 'podman' ? ':z' : ''}`);
     }
 
-    // Apply opaque legacy-root guards after every broad, manifest, staged, and
+    // Apply controller-state guards after every broad, manifest, staged, and
     // resource bind so no later agent-controlled mount can expose old state.
-    appendLegacyAgentDataGuards(args, runtime);
+    appendControllerStateGuards(args, runtime);
 
     const envStrings = [
         ...buildEnvFlags(manifest, profileConfig, { agentName, repoName, profileName: activeProfile, forRuntime: true }),
@@ -2434,24 +2514,24 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         }
     };
 
-    let cleanupLegacyGuardMountpointsAfterStart = null;
-    const prepareLegacyGuardMountpointCleanupBeforeStart = () => {
-        if (cleanupLegacyGuardMountpointsAfterStart) {
-            throw new Error('legacy guard mountpoint cleanup is already pending');
+    let pendingGuardMountpointCleanup = null;
+    const prepareGuardMountpointCleanupBeforeStart = () => {
+        if (pendingGuardMountpointCleanup) {
+            throw new Error('controller guard mountpoint cleanup is already pending');
         }
-        cleanupLegacyGuardMountpointsAfterStart = prepareLegacyGuardMountpointCleanup();
+        pendingGuardMountpointCleanup = prepareControllerGuardMountpointCleanup();
     };
-    const cleanupLegacyGuardMountpointCleanupAfterStart = () => {
-        const cleanup = cleanupLegacyGuardMountpointsAfterStart;
-        cleanupLegacyGuardMountpointsAfterStart = null;
-        if (!cleanup) throw new Error('legacy guard mountpoint cleanup was not prepared before runtime start');
+    const cleanupGuardMountpointsAfterStart = () => {
+        const cleanup = pendingGuardMountpointCleanup;
+        pendingGuardMountpointCleanup = null;
+        if (!cleanup) throw new Error('controller guard mountpoint cleanup was not prepared before runtime start');
         cleanup();
     };
 
     const preStartGeneratedRouterLaunch = ({ launch }) => {
         if (!launch) throw new Error('managed generated-local launch is missing before runtime start');
         launch.generationLease.checkpoint('pre-runtime');
-        prepareLegacyGuardMountpointCleanupBeforeStart();
+        prepareGuardMountpointCleanupBeforeStart();
     };
 
     const finalizeGeneratedRouterLaunch = ({ launch, record }) => {
@@ -2533,7 +2613,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         // Per-request directories remain untouched and fail closed separately.
         prepareHealthProbeHostDirForLaunch(containerName);
         const res = withNetworkLifecycleLock(() => {
-            const cleanupLegacyMountpoints = prepareLegacyGuardMountpointCleanup();
+            const cleanupGuardMountpoints = prepareControllerGuardMountpointCleanup();
             try {
                 const res = spawnSync(runtime, createArgs, { stdio: ['inherit', 'pipe', 'inherit'], encoding: 'utf8' });
                 if (res.status === 0) {
@@ -2547,7 +2627,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 }
                 return res;
             } finally {
-                cleanupLegacyMountpoints();
+                cleanupGuardMountpoints();
             }
         }, { waitMs: 15 * 60 * 1000 });
         if (res.status !== 0) throw new Error(`${runtime} create failed with code ${res.status}`);
@@ -2596,12 +2676,21 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             },
         });
         if (createdIdentityPersisted) return;
+        if (preparedDependencies) {
+            try {
+                preparedDependencies.updateConsumer({ containerId, phase: 'created' });
+            } catch (error) {
+                // The receipt already roots the object by container name.
+                debugLog(`[deps] ${agentName}: dependency receipt container update deferred: ${error?.message || error}`);
+            }
+        }
         createdRegistryRecord = {
             ...launchRecord,
             type: 'agent', agentName, repoName, runtime, containerId,
             ...(options.alias ? { alias: options.alias } : {}),
             instanceId: runtimeIdentity.instanceId,
             enableGeneration: runtimeIdentity.enableGeneration,
+            ...(dependencyRecord ? { dependencies: dependencyRecord } : {}),
             config: {
                 ...launchRecord.config,
                 binds: launch?.descriptorHostFile ? [{
@@ -2680,7 +2769,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                         createContainer,
                         prepareLaunch: prepareGeneratedRouterLaunch,
                         preStartLaunch: preStartGeneratedRouterLaunch,
-                        postStartLaunch: cleanupLegacyGuardMountpointCleanupAfterStart,
+                        postStartLaunch: cleanupGuardMountpointsAfterStart,
                         finalizeLaunch: finalizeGeneratedRouterLaunch,
                         onContainerCreated: recordCreatedIdentity,
                         commandPrefix: hardwareLaunch.commandPrefix(),
@@ -2705,11 +2794,16 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                     inspectionComplete: true,
                     ownershipProof: { predecessorRegistryIdentity: true },
                 });
+                // A coordinated same-name replacement rotates the registered tuple
+                // before launch while the container still carries its predecessor's
+                // labels. Prove ownership with the exact pre-rotation record that
+                // ensureAgentService observed, and only for that same container ID.
+                const predecessorRecord = selectPredecessorRemovalRecord(existingRecord, options.predecessorRegistryRecord);
                 const predecessorRemoval = removeContainerForRecreate(
                     runtime,
                     containerName,
                     `startAgentContainer:${agentName}`,
-                    existingRecord,
+                    predecessorRecord,
                 );
                 cleanupReceipt = advanceCandidateLifecycle(cleanupReceipt, {
                     phase: 'predecessor-removed',
@@ -2723,8 +2817,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                         runtimeIdentity,
                         expectedContainerId: createdId,
                         onCreated: recordCreatedIdentity,
-                        beforeStart: prepareLegacyGuardMountpointCleanupBeforeStart,
-                        afterStart: cleanupLegacyGuardMountpointCleanupAfterStart,
+                        beforeStart: prepareGuardMountpointCleanupBeforeStart,
+                        afterStart: cleanupGuardMountpointsAfterStart,
                         commandPrefix: hardwareLaunch.commandPrefix(),
                     }) || '');
                 }, { waitMs: 15 * 60 * 1000 });
@@ -2920,6 +3014,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         instanceId: runtimeIdentity.instanceId,
         enableGeneration: runtimeIdentity.enableGeneration,
         agentLib: agentLibRuntimeRecord(containerAgentLibGrant),
+        ...(dependencyRecord ? { dependencies: dependencyRecord } : {}),
         config: {
             binds: [
                 { source: agentLibMountPath, target: '/Agent', ro: true },
@@ -3666,8 +3761,14 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     preferredHostPort = options.preferredHostPort;
     containerOverride = options.containerName;
     aliasOverride = options.alias;
+    // Container and bwrap runtimes compare their admitted immutable dependency
+    // generation with the desired one before any reuse. Seatbelt keeps the
+    // package-presence recreation guard: its source-tree node_modules link is
+    // shared by every consumer of that source and cannot switch generations
+    // underneath another live consumer.
     forceRecreate = options.forceRecreate === true
-        || (Boolean(dependencyRefreshOperation()) && hasAgentPackageJson(agentPath));
+        || (preflightAgentRuntime === 'seatbelt'
+            && Boolean(dependencyRefreshOperation()) && hasAgentPackageJson(agentPath));
     const forceRecreateCause = options.forceRecreate === true
         ? String(options.forceRecreateReason || 'requested by the caller')
         : (forceRecreate ? 'dependency refresh of an agent with a package.json' : '');
@@ -3773,6 +3874,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         let sandboxStagedRegistryRecord = null;
         let sandboxRequiresEdgeActivation = false;
         let sandboxCleanupReceipt = null;
+        // The manager's own return, once it has one: only a runtime this call
+        // launched (createdByThisLaunch) is ever a candidate to clean up.
+        let sandboxLaunch = null;
         try {
             assertHostSandboxNetworkCompatibility(manifestNetwork, {
                 path: `manifest(${repoName}/${agentName}).network`,
@@ -3788,19 +3892,41 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                     enableGeneration: String(existingRecord.enableGeneration),
                 }
                 : null;
-            const anyRuntimeRunning = isBwrapProcessRunning(containerName);
+            // The tuple the caller proves it is replacing. Graph launches pass
+            // null: their predecessor was already removed by the graph removal
+            // step, so the slot must be empty or hold the exact successor.
+            // Passing nothing is the same as null: a caller gets no authority
+            // over a runtime it did not name.
+            const expectedPredecessor = normalizeExpectedPredecessor(options.expectedPredecessor);
+            const slotObservation = observeSandboxRuntime(containerName);
+            // An unknown slot is never absence: refuse before any identity is
+            // rotated, any receipt is written or any signal is sent.
+            if (slotObservation.state === 'unknown') {
+                throw sandboxOwnershipUnknownError(containerName, slotObservation);
+            }
+            const anyRuntimeRunning = slotObservation.state === 'live-exact';
             const runningAtEntry = Boolean(registeredIdentity)
-                && isBwrapProcessRunning(containerName, registeredIdentity);
+                && anyRuntimeRunning
+                && slotObservation.record.instanceId === registeredIdentity.instanceId
+                && slotObservation.record.enableGeneration === registeredIdentity.enableGeneration;
             const desiredEnvHash = computeEnvHash(manifest, profileConfig, routerEndpoint?.env || {}, {
                 agentName,
                 repoName,
             });
             const currentEnvHash = String(existingRecord.envHash || '');
-            const sandboxRecreateReason = forceRecreate
+            let sandboxRecreateReason = forceRecreate
                 ? 'forceRecreate'
                 : (!runningAtEntry
                     ? (anyRuntimeRunning ? 'runtimeIdentityDrift' : 'sandboxRuntimeStopped')
                     : (desiredEnvHash && desiredEnvHash !== currentEnvHash ? 'envHashChanged' : null));
+            // A changed bwrap dependency generation is a new sandbox with a
+            // coordinated identity, never a rebind of the running one.
+            if (!sandboxRecreateReason
+                && (agentRuntime === 'bwrap' ? bwrapDependencyReuseProblem : seatbeltDependencyReuseProblem)(
+                    { agentName, manifest, record: existingRecord, containerName },
+                )) {
+                sandboxRecreateReason = 'dependencyGenerationChanged';
+            }
             if (anyRuntimeRunning && sandboxRecreateReason) {
                 logRuntimeReplacement(`${repoName}/${agentName}`, formatReplacementReason(
                     sandboxRecreateReason,
@@ -3810,6 +3936,23 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 ));
             }
             const requiresEdgeActivation = Boolean(existingRecord?.type === 'agent' && sandboxRecreateReason);
+            if (sandboxRecreateReason && anyRuntimeRunning) {
+                // A replacement stops the occupant, so only the tuple the caller
+                // named, or the exact successor a prepared record requests, may
+                // be there. Anything else is refused before the registry rotates.
+                const occupant = slotObservation.record;
+                const named = (tuple) => Boolean(tuple)
+                    && occupant.instanceId === tuple.instanceId
+                    && occupant.enableGeneration === tuple.enableGeneration;
+                const requestedSuccessor = String(options.instanceId || '') && String(options.enableGeneration || '')
+                    ? { instanceId: String(options.instanceId), enableGeneration: String(options.enableGeneration) }
+                    : null;
+                if (!named(expectedPredecessor) && !named(requestedSuccessor)) {
+                    const busy = new Error(`sandbox runtime ${containerName} is bound to a live process that is neither the requested successor nor the expected predecessor; no signal was sent`);
+                    busy.code = 'PLOINKY_SANDBOX_PID_SLOT_BUSY';
+                    throw busy;
+                }
+            }
             const runtimeIdentity = resolveReplacementRuntimeIdentity({
                 containerName,
                 existingRecord,
@@ -3870,6 +4013,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 preparedHostModeCapability,
                 runtimeAdmission: sandboxAdmission,
                 manifestBytes: preflightManifestBytes,
+                expectedPredecessor,
             };
             sandboxCleanupReceipt = advanceCandidateLifecycle(sandboxCleanupReceipt, {
                 phase: 'create-attempted',
@@ -3879,6 +4023,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             const result = agentRuntime === 'bwrap'
                 ? ensureBwrapService(agentName, manifest, agentPath, sandboxOptions)
                 : ensureSeatbeltService(agentName, manifest, agentPath, sandboxOptions);
+            sandboxLaunch = result;
             sandboxCleanupReceipt = advanceCandidateLifecycle(sandboxCleanupReceipt, {
                 phase: 'candidate-observed',
                 state: 'retryable-exact-id',
@@ -3910,18 +4055,24 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 instanceId: String(sandboxRuntimeIdentity?.instanceId || options.instanceId || existingRecord.instanceId || ''),
                 enableGeneration: String(sandboxRuntimeIdentity?.enableGeneration || options.enableGeneration || existingRecord.enableGeneration || ''),
             };
-            let exactCleanupPerformed = false;
-            if (identity.instanceId && identity.enableGeneration) {
-                try {
-                    if (isBwrapProcessRunning(containerName, identity)) {
-                        stopBwrapProcess(containerName, { expectedIdentity: identity });
-                    }
-                    exactCleanupPerformed = !isBwrapProcessRunning(containerName, identity);
-                } catch (cleanupError) {
-                    appendExactCleanupFailure(failure, cleanupError?.message || cleanupError);
-                }
-            }
-            if (sandboxCleanupReceipt) {
+            // Only a runtime this call launched is a candidate. A reused healthy
+            // runtime, the registered predecessor and a runtime the manager
+            // refused to touch are never stopped by a failure after them.
+            const candidateIdentity = {
+                instanceId: String(sandboxRuntimeIdentity?.instanceId || ''),
+                enableGeneration: String(sandboxRuntimeIdentity?.enableGeneration || ''),
+            };
+            const cleanupOutcome = resolveSandboxFailureCleanup({
+                containerName,
+                launch: sandboxLaunch,
+                error: err,
+                candidateIdentity,
+            });
+            const exactCleanupPerformed = cleanupOutcome.performed;
+            if (cleanupOutcome.detail) appendExactCleanupFailure(failure, cleanupOutcome.detail);
+            // A receipt that never reached create-attempted describes a call that
+            // launched nothing; there is no transition to record.
+            if (sandboxCleanupReceipt?.creationAttempted === true) {
                 try {
                     sandboxCleanupReceipt = advanceCandidateLifecycle(sandboxCleanupReceipt, exactCleanupPerformed
                         ? {
@@ -4049,6 +4200,27 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         }
     }
 
+    // Dependency trees are immutable store generations. A changed, missing,
+    // unrecorded or corrupt admitted generation (or a new rebuild token) replaces
+    // the runtime; the mounted tree is never mutated. This precedes every
+    // reuse path below: host/none early return, validation-only managed
+    // adoption and prepared-lease reuse.
+    if (existingRuntimeAtEntry && !recreateReason) {
+        const dependencyProblem = containerDependencyReuseProblem({
+            agentName,
+            manifest,
+            profileConfig,
+            record: launchRecord,
+            runtime,
+            image,
+            containerName,
+        });
+        if (dependencyProblem) {
+            debugLog(`[ensureAgentService] ${agentName}: ${dependencyProblem}, recreating container`);
+            recreateReason ||= 'dependencyGenerationChanged';
+        }
+    }
+
     // Hardware limits: creation, adoption and reuse compare one admitted
     // descriptor's limits hash (empty without hardware placement).
     if (existingRuntimeAtEntry) {
@@ -4173,7 +4345,13 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             if (!hasExactAgentHomeLayout(inspectedRecords[0], desiredHomeLayout)) {
                 canReuseExisting = false;
                 recreateReason ||= 'agentHomeLayoutChanged';
+            } else if (!hasAdmittedDependencyMount(inspectedRecords[0], launchRecord)) {
+                // The record is launch authority; the actual mount topology
+                // must name the same immutable payload before early reuse.
+                canReuseExisting = false;
+                recreateReason ||= 'dependencyMountDrifted';
             }
+            if (!canReuseExisting) debugLog(`[ensureAgentService] ${agentName}: host/none reuse rejected (${recreateReason})`);
         }
         if (canReuseExisting) {
             verifyReusableHardwareRuntime(serviceAdmission, {
@@ -4381,6 +4559,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             preservePreparedRegistryRecord,
             preparationLease: options.preparationLease,
             adoptManagedRuntimeOnly,
+            ...(existingRuntimeAtEntry && recreateReason && !targetedRestart && !preservePreparedRegistryRecord
+                ? { predecessorRegistryRecord: structuredClone(existingRecord) }
+                : {}),
             [SERVICE_NETWORK_LIFECYCLE]: {
                 runtime,
                 capability: options.networkLifecycleCapability,
@@ -4469,6 +4650,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         instanceId: runtimeIdentity.instanceId,
         enableGeneration: runtimeIdentity.enableGeneration,
         agentLib: structuredClone(startedRecord.agentLib),
+        // The admitted dependency generation is launch authority for every
+        // later reuse decision; losing it would force a replacement per start.
+        ...(startedRecord.dependencies ? { dependencies: structuredClone(startedRecord.dependencies) } : {}),
         config: {
             binds: hasStartedBinds ? startedRecord.config.binds : [
                 { source: AGENT_LIB_PATH, target: '/Agent', ro: true },
@@ -4643,6 +4827,123 @@ export function retireExactAgentRuntimePredecessor(predecessor, {
     });
 }
 
+/**
+ * Whether the runtime a failed sandbox start may have left behind is proven
+ * gone. Only a runtime this call launched is ever stopped.
+ *  - The manager returned (`launch`): a reused runtime is not a candidate; a
+ *    runtime this call launched is stopped by its exact tuple.
+ *  - The manager threw: it removed what it launched and flags a failure
+ *    (`exactCleanupFailed`). Without that flag the exact tuple is observed
+ *    again: only a verified absence (or a runtime that is not this call's, a
+ *    foreign tuple or a reused exact one) counts as clean. `unknown` never does.
+ */
+export function resolveSandboxFailureCleanup({
+    containerName,
+    launch,
+    error,
+    candidateIdentity,
+    observeImpl = observeSandboxRuntime,
+    stopImpl = stopExactSandboxProcess,
+} = {}) {
+    const hasCandidate = Boolean(candidateIdentity?.instanceId && candidateIdentity?.enableGeneration);
+    try {
+        if (launch === null || launch === undefined) {
+            if (error?.exactCleanupFailed === true) return { performed: false, detail: '' };
+            if (!hasCandidate) return { performed: true, detail: '' };
+            const observed = observeImpl(containerName, { expectedIdentity: candidateIdentity });
+            return observed.state === 'unknown'
+                ? { performed: false, detail: `candidate ownership could not be verified (${observed.reason})` }
+                : { performed: true, detail: '' };
+        }
+        if (launch.createdByThisLaunch !== true || !hasCandidate) return { performed: true, detail: '' };
+        // Only the exact candidate tuple is ever stopped. A foreign occupant
+        // proves the candidate absent and stays untouched; an unknown slot
+        // proves nothing and is never cleanup.
+        const observed = observeImpl(containerName, { expectedIdentity: candidateIdentity });
+        if (observed.state === 'absent' || observed.state === 'live-foreign') return { performed: true, detail: '' };
+        if (observed.state === 'live-exact') {
+            const stopped = stopImpl(containerName, candidateIdentity);
+            return { performed: stopped.state === 'absent' || stopped.state === 'stopped', detail: '' };
+        }
+        return { performed: false, detail: `candidate ownership could not be verified (${observed.reason})` };
+    } catch (cleanupError) {
+        return { performed: false, detail: String(cleanupError?.message || cleanupError) };
+    }
+}
+
+function sandboxRemovalAmbiguityError(containerName, detail) {
+    const error = new Error(`sandbox runtime '${containerName}': ${detail}`);
+    error.code = 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS';
+    return error;
+}
+
+function sandboxOwnershipUnknownError(containerName, observed) {
+    const error = new Error(
+        `sandbox runtime '${containerName}' ownership could not be verified (${observed.reason}); no signal was sent and its PID record was kept`,
+    );
+    error.code = observed.reason === 'invalid-record'
+        ? 'PLOINKY_SANDBOX_PID_RECORD_INVALID'
+        : 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS';
+    return error;
+}
+
+/**
+ * Removes the exact native (Seatbelt or bwrap) predecessor a registry record
+ * names. The record's own runtime selects this path; the successor's backend
+ * never does. Returns { removed, state, reason } and never throws for an
+ * ownership outcome:
+ *   absent   no live process owns this tuple (no record, a stale or zombie
+ *            record, or a live process under another tuple: the slot is
+ *            exclusive, so that tuple's owner is not this predecessor)
+ *   removed  the exact process was observed gone after termination
+ *   unknown  the PID record or process could not be verified; nothing was sent
+ *   refused / failed  the exact process was not stopped
+ * `process` is the pid/start identity captured when the receipt was written.
+ * When the PID record still carries the predecessor tuple it must equal it.
+ */
+export function removeExactSandboxPredecessor(containerName, predecessorRecord, {
+    process: capturedProcess = predecessorRecord?.process,
+    observeImpl = observeSandboxRuntime,
+    stopImpl = stopExactSandboxProcess,
+    timeout = 5000,
+} = {}) {
+    const name = String(containerName || '').trim();
+    const record = predecessorRecord;
+    if (!name || !record || record.type !== 'agent' || !isSandboxRuntime(record.runtime)
+        || !String(record.instanceId || '').trim() || !String(record.enableGeneration || '').trim()) {
+        throw new Error('exact sandbox predecessor removal requires its runtime key, native runtime and immutable tuple');
+    }
+    const identity = {
+        instanceId: String(record.instanceId),
+        enableGeneration: String(record.enableGeneration),
+    };
+    const observed = observeImpl(name, { expectedIdentity: identity });
+    if (observed.state === 'unknown') {
+        return { removed: false, state: 'unknown', reason: observed.reason };
+    }
+    const carriesTuple = observed.record
+        && observed.record.instanceId === identity.instanceId
+        && observed.record.enableGeneration === identity.enableGeneration;
+    if (carriesTuple && capturedProcess
+        && (observed.record.pid !== capturedProcess.pid
+            || observed.record.processIdentity !== capturedProcess.processIdentity)) {
+        return { removed: false, state: 'unknown', reason: 'captured-process-mismatch' };
+    }
+    if (observed.state === 'absent') {
+        // The predecessor's own stale record (exited, zombie, reused PID) goes
+        // by compare-and-delete; a record of another tuple is never touched.
+        if (carriesTuple) clearBwrapPidIfExact(observed.record);
+        return { removed: false, state: 'absent', reason: observed.reason };
+    }
+    if (observed.state === 'live-foreign') {
+        return { removed: false, state: 'absent', reason: 'slot-held-by-another-tuple' };
+    }
+    const stopped = stopImpl(name, identity, { timeout });
+    if (stopped.state === 'stopped') return { removed: true, state: 'removed', reason: stopped.reason };
+    if (stopped.state === 'absent') return { removed: false, state: 'absent', reason: stopped.reason };
+    return { removed: false, state: stopped.state, reason: stopped.reason };
+}
+
 export function cleanupExactAgentRuntimeCandidate(candidate) {
     const containerName = String(candidate?.containerName || '').trim();
     const record = candidate?.registryRecord;
@@ -4676,16 +4977,17 @@ export function cleanupExactAgentRuntimeCandidate(candidate) {
         throw error;
     }
     if (record.runtime === 'bwrap' || record.runtime === 'seatbelt') {
-        const identity = {
-            instanceId: record.instanceId,
-            enableGeneration: record.enableGeneration,
-        };
-        if (!isBwrapProcessRunning(containerName, identity)) {
+        const outcome = removeExactSandboxPredecessor(containerName, record);
+        if (outcome.state === 'absent') {
+            // Nothing owned by this tuple is live. A different tuple holding
+            // the slot is its owner's, and is left exactly as found.
             return { removed: false, state: 'absent' };
         }
-        const removed = stopBwrapProcess(containerName, { expectedIdentity: identity });
-        if (!removed || isBwrapProcessRunning(containerName, identity)) {
-            throw new Error('exact sandbox candidate remained live after cleanup');
+        if (outcome.state !== 'removed') {
+            throw sandboxRemovalAmbiguityError(
+                containerName,
+                `exact sandbox candidate remained live or unverified after cleanup (${outcome.state}: ${outcome.reason})`,
+            );
         }
         clearLivenessState(containerName);
         return { removed: true, state: 'removed' };
@@ -4937,7 +5239,7 @@ export function isGenerationCapabilityRuntimeEffective({
 
 export {
     assertPodmanCodeMountAllowed,
-    appendLegacyAgentDataGuards,
+    appendControllerStateGuards,
     appendExactManagedBindMount,
     appendUniquePortMapping,
     buildPersistentAgentRunArgs,
@@ -4970,7 +5272,10 @@ export {
     resolveHostPortFromRuntime,
     resolveImplicitAgentServerPort,
     resolvePublishedPortMappings,
-    resolveManagedAdoptionAgentCacheMount,
+    containerDependencyReuseProblem,
+    hasAdmittedDependencyMount,
+    admittedRuntimeDependencyProblem,
+    selectPredecessorRemovalRecord,
     resolveAgentHomeLayout,
     restartGenerationCapabilityRuntime,
     replaceRuntimeRouterEnvFlags,

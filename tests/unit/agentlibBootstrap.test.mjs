@@ -96,7 +96,7 @@ test('an ambient host contract cannot bypass workspace selection', async () => {
     const sourceDir = fs.realpathSync(path.join(workspace, 'achillesAgentLib'));
     const env = {
         [contract.AGENTLIB_ENV.dir]: '/ambient/wrong-agentlib',
-        [contract.AGENTLIB_ENV.mode]: 'managed',
+        [contract.AGENTLIB_ENV.mode]: 'image',
         [contract.AGENTLIB_ENV.fingerprint]: 'c'.repeat(64),
         [contract.AGENTLIB_ENV.commit]: '',
         [contract.AGENTLIB_ENV.sourceId]: 'd'.repeat(64),
@@ -154,16 +154,16 @@ test('the in-Box source owner guard is explicit', async () => {
     );
 });
 
-test('in-Box image bootstrap verifies bundle bytes and fails on contract or image drift', async () => {
+test('in-Box image bootstrap validates the supplied package against the Box image and fails on contract drift', async () => {
     const workspace = makeWorkspace();
     const checkout = path.join(workspace, 'achillesAgentLib');
     const metadataPath = path.join(workspace, 'bundle.json');
-    const { prepareImageBundle } = await import('../../agentlib/image-bundle.mjs');
-    const commit = 'a'.repeat(40);
-    const metadata = prepareImageBundle({
-        sourceDir: checkout, metadataPath, commit,
-        spawn: (_command, args) => ({ status: 0, stdout: args.includes('rev-parse') ? commit : '' }),
-    });
+    const { OUTER_IMAGE_ID_FIXTURE } = await import(path.join(repoRoot, 'tests/helpers/agentlibFixture.mjs'));
+    fs.writeFileSync(metadataPath, JSON.stringify({
+        schema: 'ploinky.box.library/v1', library: 'achillesAgentLib', packageName: 'ploinky-agent-lib',
+        packageVersion: '9.9.9', repository: 'https://github.com/AssistOS-AI/AchillesAgentLib.git',
+        branch: 'master', commit: 'a'.repeat(40),
+    }));
     const stable = contract.AGENTLIB_STABLE_MOUNT_PATH;
     const immutableMetadata = contract.AGENTLIB_IMAGE_METADATA_PATH;
     const map = (value) => {
@@ -172,6 +172,7 @@ test('in-Box image bootstrap verifies bundle bytes and fails on contract or imag
         if (stable.startsWith(`${value}/`) || immutableMetadata.startsWith(`${value}/`) || value === '/') return workspace;
         return value;
     };
+    const readPaths = [];
     const fsApi = {
         ...fs,
         realpathSync(value) {
@@ -185,27 +186,66 @@ test('in-Box image bootstrap verifies bundle bytes and fails on contract or imag
             stat.mode &= ~0o022;
             return stat;
         },
-        readFileSync: (value, ...rest) => fs.readFileSync(map(value), ...rest),
+        readFileSync: (value, ...rest) => { readPaths.push(String(value)); return fs.readFileSync(map(value), ...rest); },
         readdirSync: (value, ...rest) => fs.readdirSync(map(value), ...rest),
         readlinkSync: (value, ...rest) => fs.readlinkSync(map(value), ...rest),
     };
+    const sourceId = contract.imageSourceIdHash(contract.imageSourceIdentity(OUTER_IMAGE_ID_FIXTURE));
     const env = {
         [contract.AGENTLIB_ENV.dir]: stable,
         [contract.AGENTLIB_ENV.mode]: 'image',
-        [contract.AGENTLIB_ENV.commit]: commit,
-        [contract.AGENTLIB_ENV.fingerprint]: metadata.fingerprint,
-        [contract.AGENTLIB_ENV.sourceId]: 'b'.repeat(64),
+        [contract.AGENTLIB_ENV.sourceId]: sourceId,
+        [contract.BOX_IMAGE_ID_ENV]: OUTER_IMAGE_ID_FIXTURE,
     };
     const result = await freshBootstrap()({ env, fsApi, insideBox: true });
     assert.equal(result.mode, 'image');
     assert.equal(result.owned, false);
-    await assert.rejects(freshBootstrap()({ env: { ...env, [contract.AGENTLIB_ENV.commit]: 'c'.repeat(40) }, fsApi, insideBox: true }),
-        { code: contract.AGENTLIB_ERROR_CODES.imagePinMismatch });
-    await assert.rejects(freshBootstrap()({ env: { ...env, [contract.AGENTLIB_ENV.fingerprint]: 'c'.repeat(64) }, fsApi, insideBox: true }),
-        { code: contract.AGENTLIB_ERROR_CODES.imageInvalid });
-    fs.appendFileSync(path.join(checkout, 'index.mjs'), '// drift\n');
+    assert.equal(result.supplyingImageId, OUTER_IMAGE_ID_FIXTURE);
+    assert.equal(result.sourceIdHash, sourceId);
+    assert.equal(result.fingerprint, '', 'an image source has no content fingerprint');
+    assert.deepEqual([...new Set(readPaths)].sort(), [`${stable}/package.json`, immutableMetadata].sort(),
+        'only package metadata is read: no library file body is read for a digest');
+
+    const { [contract.BOX_IMAGE_ID_ENV]: _removed, ...withoutBoxId } = env;
+    for (const [label, broken] of Object.entries({
+        'a missing Box image ID': withoutBoxId,
+        'a mutable image reference': { ...env, [contract.BOX_IMAGE_ID_ENV]: 'docker.io/assistos/ploinky-box:latest' },
+        'a bare hex Box image ID': { ...env, [contract.BOX_IMAGE_ID_ENV]: 'b2'.repeat(32) },
+        'a source identity for another image': { ...env, [contract.BOX_IMAGE_ID_ENV]: `sha256:${'d4'.repeat(32)}` },
+    })) {
+        await assert.rejects(freshBootstrap()({ env: broken, fsApi, insideBox: true }),
+            (error) => [contract.AGENTLIB_ERROR_CODES.imageInvalid, contract.AGENTLIB_ERROR_CODES.contractMissing].includes(error.code),
+            `${label} must be rejected`);
+    }
+
+    // A functional edit of the supplied copy is not a content-digest failure.
+    fs.appendFileSync(path.join(checkout, 'index.mjs'), '// same-shape edit\n');
+    assert.equal((await freshBootstrap()({ env, fsApi, insideBox: true })).mode, 'image');
+    // A missing required entry point still is.
+    fs.unlinkSync(path.join(checkout, 'LLMAgents/openAiAgenticResponder.mjs'));
     await assert.rejects(freshBootstrap()({ env, fsApi, insideBox: true }),
         { code: contract.AGENTLIB_ERROR_CODES.imageInvalid });
+});
+
+test('the in-Box local bootstrap still requires the selected content fingerprint', async () => {
+    const workspace = makeWorkspace();
+    const stable = contract.AGENTLIB_STABLE_MOUNT_PATH;
+    const checkout = path.join(workspace, 'achillesAgentLib');
+    const fsApi = {
+        ...fs,
+        realpathSync: (value) => (value === stable ? fs.realpathSync(checkout) : fs.realpathSync(value)),
+    };
+    const env = {
+        [contract.AGENTLIB_ENV.dir]: stable,
+        [contract.AGENTLIB_ENV.mode]: 'local',
+        [contract.AGENTLIB_ENV.sourceId]: 'b'.repeat(64),
+    };
+    await assert.rejects(freshBootstrap()({ env, fsApi, insideBox: true }), /must carry the selected content fingerprint/);
+    const result = await freshBootstrap()({
+        env: { ...env, [contract.AGENTLIB_ENV.fingerprint]: 'c'.repeat(64) }, fsApi, insideBox: true,
+    });
+    assert.equal(result.mode, 'local');
+    assert.equal(result.fingerprint, 'c'.repeat(64));
 });
 
 // --- read-only commands ----------------------------------------------------
@@ -224,7 +264,7 @@ test('host bootstrap without a local source reports the required Box image', asy
     assert.equal(
         fs.existsSync(path.join(workspace, '.ploinky', 'agentlib')),
         false,
-        'a read-only command must not create managed source state',
+        'a read-only command must not create source state',
     );
 });
 
@@ -287,7 +327,6 @@ test('direct start commits active.json after core startup and source revalidatio
     const selection = buildSelection({
         workspaceRoot: workspace,
         sourceDir: path.join(workspace, 'achillesAgentLib'),
-        mode: 'local',
     });
     const env = { PLOINKY_WORKSPACE_ROOT: workspace };
     const events = [];
@@ -320,7 +359,6 @@ test('direct start preserves an inactive diagnostic Router after a core graph fa
     const selection = buildSelection({
         workspaceRoot: workspace,
         sourceDir: path.join(workspace, 'achillesAgentLib'),
-        mode: 'local',
     });
     const env = { PLOINKY_WORKSPACE_ROOT: workspace };
     const coreCalls = [];
@@ -354,15 +392,12 @@ test('direct start restores a different prior AgentLib selection after a core gr
     const prior = buildSelection({
         workspaceRoot: workspace,
         sourceDir: path.join(workspace, 'achillesAgentLib'),
-        mode: 'local',
     });
-    const candidateDir = path.join(workspace, '.ploinky', 'agentlib', 'generations', 'failed-start');
+    const candidateDir = path.join(workspace, 'candidate-checkouts', 'failed-start');
     writeAgentLibCheckout(candidateDir);
     const candidate = buildSelection({
         workspaceRoot: workspace,
         sourceDir: candidateDir,
-        mode: 'managed',
-        remoteUrl: 'https://example.invalid/achillesAgentLib.git',
         resolvedCommit: '3'.repeat(40),
     });
     const env = { PLOINKY_WORKSPACE_ROOT: workspace };
@@ -407,7 +442,6 @@ test('direct start tears down when the selected source changes before commit', a
     const selection = buildSelection({
         workspaceRoot: workspace,
         sourceDir: path.join(workspace, 'achillesAgentLib'),
-        mode: 'local',
     });
     const env = { PLOINKY_WORKSPACE_ROOT: workspace };
     const coreCalls = [];
@@ -444,16 +478,12 @@ test('direct update forwards branch policy to the source owner and activates in 
     const current = buildSelection({
         workspaceRoot: workspace,
         sourceDir: path.join(workspace, 'achillesAgentLib'),
-        mode: 'local',
     });
-    const candidateDir = path.join(workspace, '.ploinky', 'agentlib', 'generations', 'candidate');
+    const candidateDir = path.join(workspace, 'candidate-checkouts', 'candidate');
     writeAgentLibCheckout(candidateDir);
     const candidate = buildSelection({
         workspaceRoot: workspace,
         sourceDir: candidateDir,
-        mode: 'managed',
-        remoteUrl: 'https://example.invalid/achillesAgentLib.git',
-        requestedRef: 'candidate',
         resolvedCommit: '1'.repeat(40),
     });
     const env = { PLOINKY_WORKSPACE_ROOT: workspace };
@@ -497,15 +527,12 @@ test('direct update activation failure stages and restarts the exact prior selec
     const prior = buildSelection({
         workspaceRoot: workspace,
         sourceDir: path.join(workspace, 'achillesAgentLib'),
-        mode: 'local',
     });
-    const candidateDir = path.join(workspace, '.ploinky', 'agentlib', 'generations', 'candidate-failure');
+    const candidateDir = path.join(workspace, 'candidate-checkouts', 'candidate-failure');
     writeAgentLibCheckout(candidateDir);
     const candidate = buildSelection({
         workspaceRoot: workspace,
         sourceDir: candidateDir,
-        mode: 'managed',
-        remoteUrl: 'https://example.invalid/achillesAgentLib.git',
         resolvedCommit: '2'.repeat(40),
     });
     const env = { PLOINKY_WORKSPACE_ROOT: workspace };

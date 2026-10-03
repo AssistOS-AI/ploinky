@@ -29,6 +29,8 @@ test('empty workspace gets one private random key that remains byte-stable', (t)
     assert.match(bytes.toString('utf8'), /^[a-f0-9]{64}\n$/);
     assert.equal(fs.statSync(first.path).mode & 0o777, 0o600);
     assert.equal(fs.statSync(path.join(root, '.ploinky')).mode & 0o777, 0o700);
+    assert.equal(first.path, path.join(root, '.ploinky', 'data', 'master-key'));
+    assert.equal(fs.statSync(path.join(root, '.ploinky', 'data')).mode & 0o777, 0o700);
     assert.equal(fs.existsSync(path.join(root, '.env')), false);
 
     fs.chmodSync(first.path, 0o644);
@@ -88,7 +90,7 @@ test('symlink, directory, FIFO, and hard-linked targets fail closed', (t) => {
     for (const type of types) {
         const parent = path.join(fixture(t), type);
         fs.mkdirSync(parent);
-        fs.mkdirSync(path.join(parent, '.ploinky'));
+        fs.mkdirSync(path.join(parent, '.ploinky', 'data'), { recursive: true });
         const target = workspaceMasterKeyPath(parent);
         if (type === 'symlink') {
             const foreign = path.join(parent, 'foreign');
@@ -136,7 +138,7 @@ test('write or permission failure removes only the newly created incomplete file
 
 test('managed reads reject malformed content and permissive modes without replacing either', (t) => {
     const root = fixture(t);
-    fs.mkdirSync(path.join(root, '.ploinky'));
+    fs.mkdirSync(path.join(root, '.ploinky', 'data'), { recursive: true });
     const target = workspaceMasterKeyPath(root);
     fs.writeFileSync(target, 'not-a-key\n', { mode: 0o600 });
     assert.throws(() => readWorkspaceMasterKey({ workspaceRoot: root }), /64-character lowercase hexadecimal key/);
@@ -153,8 +155,24 @@ test('a symlinked .ploinky state directory supports private master-key creation'
     const foreign = fixture(t);
     fs.symlinkSync(foreign, path.join(root, '.ploinky'));
     initializeWorkspaceMasterKey({ workspaceRoot: root });
-    assert.equal(fs.statSync(path.join(foreign, 'master-key')).mode & 0o777, 0o600);
+    assert.equal(fs.statSync(path.join(foreign, 'data', 'master-key')).mode & 0o777, 0o600);
     assert.equal(fs.lstatSync(path.join(root, '.ploinky')).isSymbolicLink(), true);
+});
+
+// Agent runtimes mask the controller-state directory itself; a symlink there
+// would place the key wherever it points, outside that mask.
+test('a symlinked or non-directory controller-state directory fails closed', (t) => {
+    for (const kind of ['symlink', 'file']) {
+        const root = fixture(t);
+        const foreign = fixture(t);
+        fs.mkdirSync(path.join(root, '.ploinky'));
+        const data = path.join(root, '.ploinky', 'data');
+        if (kind === 'symlink') fs.symlinkSync(foreign, data);
+        else fs.writeFileSync(data, '');
+        assert.throws(() => initializeWorkspaceMasterKey({ workspaceRoot: root }), /controller-state directory is not a real directory/);
+        assert.throws(() => readWorkspaceMasterKey({ workspaceRoot: root }), /controller-state directory is not a real directory/);
+        assert.deepEqual(fs.readdirSync(foreign), []);
+    }
 });
 
 test('master-key access has no fixed default workspace root', () => {

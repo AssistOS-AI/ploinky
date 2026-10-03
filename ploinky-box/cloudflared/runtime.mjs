@@ -8,13 +8,22 @@ import {
     inactivateEdgeRoutingGeneration,
     loadActiveEdgeRoutingGeneration,
     readEdgeRoutingSelection,
+    withEdgeGenerationApplyLock,
 } from '../../cli/sandbox/edgeGeneration.js';
 import { applyEdgeRoutingGeneration } from '../../cli/sandbox/coordinatedEdgeApply.js';
+import { withNetworkLifecycleLock } from '../../cli/sandbox/networkLifecycle.js';
+import { readRouterSupervisorId } from '../../cli/server/routerSupervisorIdentity.js';
 import {
     createWorkspaceMutationLease,
     inspectWorkspaceStartLock,
     releaseWorkspaceMutationLease,
 } from '../../cli/utils/runtime/maintenanceLocks.js';
+import {
+    readRouterRestartHandoff,
+    removeRouterRestartHandoff,
+    routerRestartHandoffFile,
+    writeRouterRestartHandoff,
+} from './routerRestartHandoff.mjs';
 import { writeCloudflarePublicationStatus } from './status.mjs';
 
 const DEFAULT_STATUS_FILE = path.join(PLOINKY_DIR, 'run', 'cloudflare-publication-status.json');
@@ -29,6 +38,16 @@ const RETRYABLE_SELECTED_PUBLICATION_STATES = new Set([
 ]);
 const DEFAULT_EDGE_APPLY_BUSY_RETRY_ATTEMPTS = 50;
 const DEFAULT_EDGE_APPLY_BUSY_RETRY_DELAY_MS = 100;
+const EXACT_GENERATION = /^sha256:[a-f0-9]{64}$/;
+export const ROUTER_STOP_INACTIVATION_REASON = 'cloudflare-controller-stop';
+export const ROUTER_RESTART_RESTORE_REASON = 'router-restart-restore';
+// Pre-mutation contention on a lock or an outstanding lifecycle preparation.
+// A pending restore retries on the next poll instead of being abandoned.
+const ROUTER_RESTART_RESTORE_BUSY_CODES = new Set([
+    'EDGE_GENERATION_BUSY',
+    'EDGE_PREPARATION_BUSY',
+    'PLOINKY_NETWORK_LIFECYCLE_BUSY',
+]);
 
 function publicationRuntimeError(message, code = 'CLOUDFLARE_RUNTIME_COORDINATION_FAILED') {
     const error = new Error(message);
@@ -97,6 +116,28 @@ export async function releaseExactPublicationLease(lease, {
     }
 }
 
+// The publication state a Watchdog replacement may restore for the exact
+// generation its predecessor stopped serving. A replacement has no connector,
+// so a Cloudflare generation returns only as reconciling: public hosts stay
+// closed until the new Router proves publication again. A generation whose
+// publication had failed (error) is never restored and stays withdrawn.
+function restorePublicationStateFor(active) {
+    const mode = active?.generation?.compiled?.publication?.mode;
+    const state = active?.selector?.publicationState;
+    if (mode === 'local-only' && state === 'ready') return 'ready';
+    if (mode === 'cloudflare' && (state === 'ready' || state === 'reconciling')) return 'reconciling';
+    return null;
+}
+
+export function matchesRouterStopSelector(selector, handoff) {
+    return selector?.state === 'inactive'
+        && selector.generation === undefined
+        && selector.reason === ROUTER_STOP_INACTIVATION_REASON
+        && selector.previousGeneration === handoff?.generation
+        && selector.activationId === handoff?.inactiveActivationId
+        && selector.selectorDigest === handoff?.inactiveSelectorDigest;
+}
+
 function sleepForWithSignal(delayMs, signal) {
     return new Promise((resolve, reject) => {
         if (signal?.aborted) {
@@ -119,6 +160,7 @@ function sleepForWithSignal(delayMs, signal) {
 export function createEdgePublicationRouteCoordinator({
     workspaceRoot = PLOINKY_WORKSPACE_ROOT,
     onCommit = () => {},
+    onStopInactivation = () => {},
     edgeApplyBusyRetryAttempts = DEFAULT_EDGE_APPLY_BUSY_RETRY_ATTEMPTS,
     edgeApplyBusyRetryDelayMs = DEFAULT_EDGE_APPLY_BUSY_RETRY_DELAY_MS,
     sleep = sleepFor,
@@ -130,6 +172,8 @@ export function createEdgePublicationRouteCoordinator({
     },
 } = {}) {
     let captured = null;
+    const withApplyLock = edgeOps.withApplyLock || withEdgeGenerationApplyLock;
+    const withNetworkLock = edgeOps.withNetworkLifecycleLock || withNetworkLifecycleLock;
     const maximumApplyAttempts = Math.max(
         1,
         Math.min(100, Math.trunc(Number(edgeApplyBusyRetryAttempts) || 1)),
@@ -182,6 +226,67 @@ export function createEdgePublicationRouteCoordinator({
                 }
             }
             edgeOps.inactivate(String(reason || 'publication-reconcile'), { workspaceRoot });
+        },
+
+        async inactivateForStop({
+            configurationGeneration,
+            reason = ROUTER_STOP_INACTIVATION_REASON,
+        } = {}) {
+            const expected = String(configurationGeneration || '');
+            if (!EXACT_GENERATION.test(expected)) return null;
+            let active;
+            try {
+                active = edgeOps.load({ workspaceRoot });
+            } catch (error) {
+                // Inactive authorization already fails closed. Rewriting it
+                // would replace the failure or lifecycle reason recorded there
+                // and drop a selected inactive candidate.
+                if (error?.code === 'EDGE_GENERATION_INACTIVE') return null;
+                throw error;
+            }
+            if (active.selector.generation !== expected) return null;
+            const inactiveSelector = edgeOps.inactivate(String(reason), {
+                workspaceRoot,
+                expectedActiveSelector: {
+                    generation: active.selector.generation,
+                    activationId: active.selector.activationId,
+                },
+            });
+            if (!inactiveSelector) return null;
+            const stopped = Object.freeze({
+                generation: expected,
+                restorePublicationState: restorePublicationStateFor(active),
+                inactiveSelector,
+            });
+            onStopInactivation(stopped);
+            return stopped;
+        },
+
+        async restoreRouterStop(handoff) {
+            return withNetworkLock((networkLifecycleCapability) => withApplyLock((applyLockCapability) => {
+                const { selector } = edgeOps.selection({ workspaceRoot });
+                if (!matchesRouterStopSelector(selector, handoff)) {
+                    throw publicationRuntimeError(
+                        'edge selector changed after the predecessor Router stop',
+                        'CLOUDFLARE_ROUTER_RESTART_SUPERSEDED',
+                    );
+                }
+                // expectedGeneration is checked before the apply transaction
+                // starts, so changed sources abort without any mutation.
+                const result = edgeOps.apply({
+                    workspaceRoot,
+                    reason: ROUTER_RESTART_RESTORE_REASON,
+                    publicationState: handoff.restorePublicationState,
+                    expectedGeneration: handoff.generation,
+                    applyLockCapability,
+                    networkLifecycleCapability,
+                });
+                if (result?.selector?.state !== 'active'
+                    || result.selector.generation !== handoff.generation) {
+                    throw publicationRuntimeError('Router restart restore did not select the exact stopped generation');
+                }
+                return result;
+            }, { workspaceRoot }));
         },
 
         async commit({
@@ -326,11 +431,16 @@ export function startCloudflarePublicationRuntime({
     leaseReleaseRetryDelayMs = 100,
     leaseReleaseSleep = sleepFor,
     inactivateInvalidGeneration = inactivateEdgeRoutingGeneration,
+    readSelection = readEdgeRoutingSelection,
+    routerSupervisorId = readRouterSupervisorId(),
+    restartHandoffFile = routerRestartHandoffFile(workspaceRoot),
 } = {}) {
     const handledActivations = new Set();
     let stopped = false;
     let inFlight = null;
     let scheduledRetry = null;
+    let pendingRestart = null;
+    let restartRestoreInFlight = false;
     let controller;
     const initialRetryDelay = Math.max(1, Number(retryInitialDelayMs) || 1_000);
     const maximumRetryDelay = Math.max(initialRetryDelay, Number(retryMaximumDelayMs) || 30_000);
@@ -342,7 +452,32 @@ export function startCloudflarePublicationRuntime({
             handledActivations.delete(handledActivations.values().next().value);
         }
     };
-    const routeCoordinator = routeCoordinatorFactory({ workspaceRoot, onCommit: rememberActivation });
+    const discardRestartHandoff = (reason, detail = {}) => {
+        pendingRestart = null;
+        try { removeRouterRestartHandoff(restartHandoffFile); } catch (_) {}
+        audit('cloudflare-router-restart-restore-skipped', { reason, ...detail });
+    };
+    const recordRouterStop = ({ generation, restorePublicationState, inactiveSelector }) => {
+        const restorable = Boolean(routerSupervisorId && restorePublicationState);
+        audit('cloudflare-router-stop-inactivated', { generation, restorable });
+        if (!restorable) {
+            removeRouterRestartHandoff(restartHandoffFile);
+            return;
+        }
+        writeRouterRestartHandoff(restartHandoffFile, {
+            routerSupervisorId,
+            generation,
+            restorePublicationState,
+            inactiveActivationId: inactiveSelector.activationId,
+            inactiveSelectorDigest: inactiveSelector.selectorDigest,
+            stoppedAt: new Date().toISOString(),
+        }, { trustedRoot: workspaceRoot });
+    };
+    const routeCoordinator = routeCoordinatorFactory({
+        workspaceRoot,
+        onCommit: rememberActivation,
+        onStopInactivation: recordRouterStop,
+    });
     controller = controllerFactory({
         workspaceRoot,
         routeCoordinator,
@@ -360,6 +495,77 @@ export function startCloudflarePublicationRuntime({
     }, {
         trustedRoot: workspaceRoot,
     });
+
+    function claimRestartHandoff() {
+        let handoff;
+        try {
+            handoff = readRouterRestartHandoff(restartHandoffFile);
+        } catch (error) {
+            discardRestartHandoff('handoff-invalid', {
+                code: error?.code || 'CLOUDFLARE_ROUTER_RESTART_HANDOFF_INVALID',
+            });
+            return;
+        }
+        if (!handoff) return;
+        // Only a later Router of the same Watchdog supervision lifetime may
+        // restore the generation; the record stays bound to that lifetime, so
+        // replacements that exit before restoring leave it to the next one. A
+        // new lifetime (for example after a Box shutdown) discards it.
+        if (!routerSupervisorId || handoff.routerSupervisorId !== routerSupervisorId) {
+            discardRestartHandoff('other-supervision-lifetime', { generation: handoff.generation });
+            return;
+        }
+        pendingRestart = handoff;
+        audit('cloudflare-router-restart-restore-pending', { generation: handoff.generation });
+    }
+
+    // Returns true while the exact predecessor stop selector must still wait
+    // for workspace or edge serialization; normal scanning has nothing to do
+    // for that inactive selector in the meantime.
+    async function restorePredecessorGeneration() {
+        if (restartRestoreInFlight) return true;
+        const handoff = pendingRestart;
+        let selector;
+        try {
+            selector = readSelection({ workspaceRoot }).selector;
+        } catch (error) {
+            discardRestartHandoff('selector-unreadable', {
+                code: error?.code || 'EDGE_GENERATION_CORRUPT',
+                generation: handoff.generation,
+            });
+            return false;
+        }
+        if (!matchesRouterStopSelector(selector, handoff)) {
+            discardRestartHandoff('superseded', { generation: handoff.generation });
+            return false;
+        }
+        restartRestoreInFlight = true;
+        let workspaceLease = null;
+        try {
+            workspaceLease = acquirePublicationLease('router-restart-restore');
+            if (!workspaceLease) return true;
+            if (stopped || pendingRestart !== handoff) return true;
+            const restored = await routeCoordinator.restoreRouterStop(handoff);
+            pendingRestart = null;
+            try { removeRouterRestartHandoff(restartHandoffFile); } catch (_) {}
+            audit('cloudflare-router-restart-restored', {
+                generation: handoff.generation,
+                publicationState: handoff.restorePublicationState,
+                activationId: restored.selector.activationId,
+            });
+            return false;
+        } catch (error) {
+            if (ROUTER_RESTART_RESTORE_BUSY_CODES.has(error?.code)) return true;
+            discardRestartHandoff('restore-failed', {
+                code: error?.code || 'CLOUDFLARE_ROUTER_RESTART_RESTORE_FAILED',
+                generation: handoff.generation,
+            });
+            return false;
+        } finally {
+            restartRestoreInFlight = false;
+            if (workspaceLease) await releasePublicationLease(workspaceLease);
+        }
+    }
 
     function clearScheduledRetry() {
         if (!scheduledRetry) return;
@@ -487,6 +693,8 @@ export function startCloudflarePublicationRuntime({
 
     async function scan() {
         if (stopped) return;
+        if (pendingRestart && await restorePredecessorGeneration()) return;
+        if (stopped) return;
         let active;
         try {
             active = loadActive({ workspaceRoot });
@@ -576,6 +784,7 @@ export function startCloudflarePublicationRuntime({
         }
     }
 
+    claimRestartHandoff();
     const timer = setInterval(() => { void scan(); }, Math.max(100, Number(pollIntervalMs) || 500));
     timer.unref?.();
     void scan();

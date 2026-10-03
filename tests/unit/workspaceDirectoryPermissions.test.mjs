@@ -54,7 +54,14 @@ function fixture(t, mode = 0o775) {
     fs.mkdirSync(markerDirectory, { recursive: true, mode: 0o700 });
     fs.mkdirSync(edgeDirectory, { recursive: true, mode: 0o700 });
     const directories = [workspaceRoot, stateDirectory, runningDir, markerDirectory, dataDirectory, edgeDirectory];
-    for (const directory of directories) fs.chmodSync(directory, mode);
+    for (const directory of directories) {
+        // macOS temporary directories inherit wheel, which an ordinary user
+        // cannot grant via setgid. Establish an assignable group before chmod
+        // so this test measures preservation of a mode that actually exists.
+        if (typeof process.getgid === 'function') fs.chownSync(directory, fs.statSync(directory).uid, process.getgid());
+        fs.chmodSync(directory, mode);
+        assert.equal(permissionMode(directory), mode, `fixture mode was not established for ${directory}`);
+    }
     const identity = buildWorkspaceIdentity(workspaceRoot, { markerFound: true });
     return {
         workspaceRoot, runningDir, markerDirectory, edgeDirectory, directories, identity,

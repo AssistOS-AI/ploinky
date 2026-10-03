@@ -14,7 +14,6 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 export const AGENTLIB_DIR_ENV = 'PLOINKY_AGENTLIB_DIR';
-export const AGENTLIB_FINGERPRINT_ENV = 'PLOINKY_AGENTLIB_FINGERPRINT';
 const AGENTLIB_PACKAGE_NAME = 'ploinky-agent-lib';
 
 const loaded = new Map();

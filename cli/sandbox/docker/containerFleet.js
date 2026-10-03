@@ -13,7 +13,11 @@ import {
     probeContainerRuntime
 } from './common.js';
 import { clearLivenessState, retireRuntimeRelaySocket } from './healthProbes.js';
-import { stopBwrapProcesses, isBwrapProcessRunning } from '../bwrap/bwrapFleet.js';
+import {
+    classifyRecordRuntime,
+    observeSandboxRuntime,
+    stopExactSandboxProcesses,
+} from '../bwrap/bwrapFleet.js';
 import {
     withNetworkLifecycleLock,
     workspaceNetworkIdentity,
@@ -202,7 +206,22 @@ function controlSucceeded(result) {
     return !result?.error && result?.status === 0;
 }
 
-function removeExactContainerAndDescriptor(name, record, runtime, {
+// A refusal raised before the first relay retirement, signal, or removal is
+// marked `runtimeUntouched`, so a caller that staged registry changes can roll
+// them back. Any other failure stays unmarked and must be treated as touched.
+function removeExactContainerAndDescriptor(name, record, runtime, options = {}) {
+    const progress = { runtimeTouched: false };
+    try {
+        return removeExactContainerAndDescriptorOnce(name, record, runtime, options, progress);
+    } catch (error) {
+        if (!progress.runtimeTouched && error && typeof error === 'object') {
+            error.runtimeUntouched = true;
+        }
+        throw error;
+    }
+}
+
+function removeExactContainerAndDescriptorOnce(name, record, runtime, {
     fast = false,
     remove = true,
     inspect = inspectExactContainer,
@@ -214,7 +233,7 @@ function removeExactContainerAndDescriptor(name, record, runtime, {
     retireRelay = retireRuntimeRelaySocket,
     recoverIncompleteIdentity = false,
     onRecoveredIdentity = null,
-} = {}) {
+} = {}, progress) {
     let expectedId = String(record?.containerId || '').trim();
     const incompleteId = !IMMUTABLE_CONTAINER_ID.test(expectedId);
     if (incompleteId && !recoverIncompleteIdentity) {
@@ -223,7 +242,10 @@ function removeExactContainerAndDescriptor(name, record, runtime, {
     if (recoverIncompleteIdentity && !remove) {
         throw new Error(`reinstall recovery for '${name}' requires an explicit removal operation`);
     }
-    if (incompleteId && expectedId && expectedId !== name && !/^[a-f0-9]{12,63}$/.test(expectedId)) {
+    // Only an absent ID is a recoverable current state: `create` can succeed
+    // and the launcher die before persisting its output. Any other non-full
+    // value is malformed and never resolved by name or prefix.
+    if (incompleteId && expectedId) {
         throw new Error(`reinstall recovery for '${name}' found a malformed registry container ID; restore the exact launch record`);
     }
     const completeRegistryIdentity = !(record?.type !== 'agent'
@@ -242,8 +264,9 @@ function removeExactContainerAndDescriptor(name, record, runtime, {
         if (!workspaceHash) {
             throw new Error(`fleet lifecycle for '${name}' could not resolve the workspace identity`);
         }
-        // A name is only a discovery key for an incomplete legacy record. It
-        // never authorizes control, and cannot replace a recorded immutable ID.
+        // A name is only a discovery key for a record whose launcher died
+        // between `create` and persisting the ID. It never authorizes control,
+        // and cannot replace a recorded immutable ID.
         let inspected = inspect(runtime, incompleteId ? name : expectedId);
         if (!inspected) {
             if (recoverIncompleteIdentity) {
@@ -263,9 +286,8 @@ function removeExactContainerAndDescriptor(name, record, runtime, {
         }
         if (incompleteId) {
             const actualId = String(inspected?.Id || inspected?.ID || '');
-            if (!IMMUTABLE_CONTAINER_ID.test(actualId)
-                || (expectedId && expectedId !== name && !actualId.startsWith(expectedId))) {
-                throw new Error(`reinstall recovery for '${name}' could not resolve its recorded container ID prefix to one exact immutable ID`);
+            if (!IMMUTABLE_CONTAINER_ID.test(actualId)) {
+                throw new Error(`reinstall recovery for '${name}' could not resolve its named container to one exact immutable ID`);
             }
             expectedId = actualId;
         }
@@ -311,6 +333,7 @@ function removeExactContainerAndDescriptor(name, record, runtime, {
         }
 
         try {
+            progress.runtimeTouched = true;
             if (inspected?.State?.Running === true) {
                 // Retire the projected pathname while the producer is still alive.
                 // On macOS nested Podman, metadata and unlink can both become
@@ -439,6 +462,40 @@ function getContainerCandidates(name, rec) {
     return name ? [name] : [];
 }
 
+// `ploinky stop` and `destroy` act on whatever exact process a native runtime
+// key's PID record names (an operator's slot-wide stop), but never claim a
+// stop that was not observed. Returns a Map of runtimeKey to
+// { state: absent|stopped|refused|failed, reason, touched }, where `touched`
+// is false only when nothing was signalled.
+function stopSandboxRuntimes(runtimeKeys, { timeout }) {
+    const outcomes = new Map();
+    const requests = [];
+    for (const runtimeKey of runtimeKeys) {
+        const observed = observeSandboxRuntime(runtimeKey);
+        if (observed.state === 'unknown') {
+            outcomes.set(runtimeKey, {
+                state: 'failed',
+                reason: `observation-unknown:${observed.reason}`,
+                touched: false,
+            });
+        } else if (observed.state === 'live-exact') {
+            requests.push({
+                runtimeKey,
+                expectedIdentity: {
+                    instanceId: observed.record.instanceId,
+                    enableGeneration: observed.record.enableGeneration,
+                },
+            });
+        } else {
+            requests.push({ runtimeKey });
+        }
+    }
+    for (const [runtimeKey, result] of stopExactSandboxProcesses(requests, { timeout })) {
+        outcomes.set(runtimeKey, { ...result, touched: result.state === 'stopped' || result.state === 'failed' });
+    }
+    return outcomes;
+}
+
 function stopConfiguredAgents({ fast = false } = {}) {
     const agents = loadAgents();
     const entries = Object.entries(agents || {})
@@ -449,23 +506,37 @@ function stopConfiguredAgents({ fast = false } = {}) {
     const bwrapEntries = [];
     const containerEntries = [];
     for (const [name, rec] of entries) {
-        if (isSandboxRuntime(rec?.runtime)) {
+        // A record that names no runtime is native only when the PID record of
+        // its exact tuple proves a native owner; unverifiable is preserved.
+        const classified = classifyRecordRuntime(name, rec);
+        if (classified.kind === 'unknown') {
+            console.log(`[stop] Preserved ${rec.agentName || name}: runtime ownership could not be verified (${classified.observation?.reason}).`);
+            continue;
+        }
+        if (classified.kind === 'native') {
             const agentName = rec.agentName || name;
-            if (isBwrapProcessRunning(name)) {
+            const observed = observeSandboxRuntime(name);
+            if (observed.state === 'live-exact') {
                 bwrapEntries.push({ name, runtimeKey: name, agentName, runtime: rec.runtime });
+            } else if (observed.state === 'unknown') {
+                console.log(`[stop] Preserved ${agentName}: ${rec.runtime} ownership could not be verified (${observed.reason}).`);
             } else {
-                console.log(`[stop] ${agentName}: no running ${rec.runtime} process found.`);
+                console.log(`[stop] ${agentName}: no running ${rec.runtime || 'native'} process found.`);
             }
         } else {
             containerEntries.push([name, rec]);
         }
     }
     if (bwrapEntries.length) {
-        const stoppedSandboxRuntimes = new Set(stopBwrapProcesses(bwrapEntries.map((entry) => entry.runtimeKey), {
+        const outcomes = stopSandboxRuntimes(bwrapEntries.map((entry) => entry.runtimeKey), {
             timeout: fast ? 100 : 5000
-        }));
+        });
         for (const entry of bwrapEntries) {
-            if (!stoppedSandboxRuntimes.has(entry.runtimeKey)) continue;
+            const outcome = outcomes.get(entry.runtimeKey);
+            if (outcome?.state !== 'stopped' && outcome?.state !== 'absent') {
+                console.log(`[stop] Preserved ${entry.agentName} (${entry.runtime}): the process was not stopped (${outcome?.state}: ${outcome?.reason}).`);
+                continue;
+            }
             console.log(`[stop] Stopped ${entry.agentName} (${entry.runtime})`);
             bwrapStopped.push(entry.name);
         }
@@ -497,8 +568,13 @@ function stopConfiguredAgents({ fast = false } = {}) {
     return [...bwrapStopped, ...stoppedContainers];
 }
 
-function stopAndRemoveMany(names, { fast = false, records = null } = {}) {
+// `onPreserved` receives every container left in place. `runtimeTouched` is
+// false only when the refusal provably happened before any signal or removal.
+function stopAndRemoveMany(names, { fast = false, records = null, onPreserved = null } = {}) {
     if (!Array.isArray(names) || !names.length) return [];
+    const preserve = (name, error, runtimeTouched) => {
+        if (typeof onPreserved === 'function') onPreserved({ name, error, runtimeTouched });
+    };
 
     const agents = {
         ...(loadAgents() || {}),
@@ -508,21 +584,45 @@ function stopAndRemoveMany(names, { fast = false, records = null } = {}) {
     // Handle sandbox (bwrap/seatbelt) agents first
     const bwrapEntries = [];
     const containerNames = [];
+    const unverifiable = [];
     for (const agentName of names) {
         if (!agentName) continue;
         const rec = agents ? agents[agentName] : null;
-        if (isSandboxRuntime(rec?.runtime)) {
+        const classified = rec ? classifyRecordRuntime(agentName, rec) : { kind: 'container' };
+        if (classified.kind === 'unknown') {
+            unverifiable.push({ agentName, reason: classified.observation?.reason });
+            continue;
+        }
+        if (classified.kind === 'native') {
             bwrapEntries.push({ agentName, runtimeKey: agentName });
             continue;
         }
         containerNames.push(agentName);
     }
+    for (const { agentName, reason } of unverifiable) {
+        // Nothing was signalled: the owner could not be verified.
+        const failure = new Error(`runtime ownership could not be verified (${reason})`);
+        console.log(`${fast ? '[destroy-fast]' : '[destroy]'} Preserved ${agentName}: ${failure.message}`);
+        preserve(agentName, failure, false);
+    }
+    const bwrapRemoved = [];
     if (bwrapEntries.length) {
-        stopBwrapProcesses(bwrapEntries.map((entry) => entry.runtimeKey), {
+        const outcomes = stopSandboxRuntimes(bwrapEntries.map((entry) => entry.runtimeKey), {
             timeout: fast ? 100 : 5000
         });
+        for (const entry of bwrapEntries) {
+            const outcome = outcomes.get(entry.runtimeKey);
+            if (outcome?.state === 'stopped' || outcome?.state === 'absent') {
+                bwrapRemoved.push(entry.agentName);
+                continue;
+            }
+            // Never report a native runtime as removed unless its exact
+            // process was observed gone; its PID record stays as evidence.
+            const failure = new Error(`sandbox process was not stopped (${outcome?.state}: ${outcome?.reason})`);
+            console.log(`${fast ? '[destroy-fast]' : '[destroy]'} Preserved ${entry.agentName}: ${failure.message}`);
+            preserve(entry.agentName, failure, outcome?.touched !== false);
+        }
     }
-    const bwrapRemoved = bwrapEntries.map((entry) => entry.agentName);
 
     const prefix = fast ? '[destroy-fast]' : '[destroy]';
     let runtime = null;
@@ -531,6 +631,7 @@ function stopAndRemoveMany(names, { fast = false, records = null } = {}) {
         const record = agents?.[name];
         if (!record) {
             console.log(`${prefix} Preserved ${name}: no exact registry record.`);
+            preserve(name, new Error('no exact registry record'), false);
             continue;
         }
         try {
@@ -546,6 +647,7 @@ function stopAndRemoveMany(names, { fast = false, records = null } = {}) {
             }
         } catch (error) {
             console.log(`${prefix} Preserved ${name}: ${error?.message || error}`);
+            preserve(name, error, error?.runtimeUntouched !== true);
         }
     }
 
@@ -613,6 +715,7 @@ export {
     forceStopContainers,
     getContainerCandidates,
     gracefulStopContainer,
+    inspectExactContainer,
     listAllContainerNames,
     removeExactContainerAndDescriptor,
     stopAndRemove,

@@ -17,16 +17,18 @@ import {
   getRuntimeForAgent,
   isSandboxRuntime,
   loadAgentsMap,
+  probeContainerRuntime,
 } from '../sandbox/docker/common.js';
 import {
   buildRuntimeNetworkPlan,
   buildRuntimeRouterEnv,
   computeAgentEnvHash,
   exactCleanupFailureOf,
+  removeExactSandboxPredecessor,
   resolvePublishedPortMappings,
 } from '../sandbox/docker/agentServiceManager.js';
-import { removeExactRegisteredContainer } from '../sandbox/docker/containerFleet.js';
-import { isBwrapProcessRunning } from '../sandbox/bwrap/bwrapFleet.js';
+import { inspectExactContainer, removeExactRegisteredContainer } from '../sandbox/docker/containerFleet.js';
+import { observeSandboxRuntime, registeredRuntimeTuple } from '../sandbox/bwrap/bwrapFleet.js';
 import * as inputState from './inputState.js';
 import { MAX_NO_WAIT_BARRIER_ENTRIES, MAX_NO_WAIT_WAVE_INDEX } from './noWaitWorker.js';
 import {
@@ -38,6 +40,7 @@ import {
   exactNoWaitImmutableIdentity,
 } from './noWaitWorkerArgs.js';
 import { retireNoWaitRunMarkers } from './noWaitMarkerLifecycle.js';
+import { acquireSettledWorkspaceMutationLease, inspectLiveNoWaitWorkers } from './noWaitRunSettlement.js';
 import { prepareDefaultBootRepositories } from './ploinkyboot.js';
 import { prepareManifestRepositories, resolveWorkspaceGraphSsoConfig } from '../utils/runtime/bootstrapManifest.js';
 import { buildLifecycleHookEnv, executeHostHook, markPreinstallRunInProcess, resetPreinstallRunInProcess, isInlineCommand } from '../utils/runtime/lifecycleHooks.js';
@@ -61,7 +64,23 @@ import {
 import { resolveAgentExecutionMode, resolveAgentReadinessProtocol, resolveManifestReadinessWaitOptions } from '../utils/runtime/startupReadiness.js';
 import { normalizeProbeConfig, runContainerScriptReadiness } from '../sandbox/docker/healthProbes.js';
 import { applyStartupConfigProvidersForGraph } from '../sandbox/startupConfigProviders.js';
-import { acquireWorkspaceMutationLease, releaseWorkspaceStartLock, withMaintenanceLock, withWorkspaceMutationLease } from '../utils/runtime/maintenanceLocks.js';
+import {
+  createWorkspaceMutationLease,
+  releaseWorkspaceMutationLease,
+  releaseWorkspaceStartLock,
+  runWithWorkspaceMutationLease,
+  withMaintenanceLock,
+  withWorkspaceMutationLease,
+} from '../utils/runtime/maintenanceLocks.js';
+import {
+  issueDependencyRebuildRequest,
+  runtimeCarriesRebuildToken,
+  settleDependencyRebuildRequest,
+} from '../utils/dependencies/store/runtimeDependencies.mjs';
+import {
+  collectDependencyObjectsAfterAdmission,
+  reportDependencyCollection,
+} from '../utils/dependencies/store/collector.mjs';
 import {
   AGENTS_DATA_DIR,
   LOGS_DIR,
@@ -84,12 +103,20 @@ import {
   initializeFreshEdgeRoutingSources,
   inactivateEdgeRoutingGeneration,
   prepareHostModeCapabilityForInactiveGeneration,
+  readEdgeRoutingPreparationOwner,
   readEdgeRoutingSelection,
   retireAbandonedAgentPreparation,
+  retireAbandonedWorkspaceStartPreparation,
   withEdgeGenerationApplyLock,
 } from '../sandbox/edgeGeneration.js';
 import { applyEdgeRoutingGeneration } from '../sandbox/coordinatedEdgeApply.js';
-import { retireRuntimeCandidate } from '../sandbox/runtimeCandidateStore.js';
+import { readRuntimeCandidate, retireRuntimeCandidate } from '../sandbox/runtimeCandidateStore.js';
+import {
+  hasCompleteRuntimeTuple,
+  readRuntimePredecessor,
+  retireRuntimePredecessor,
+  writeRuntimePredecessor,
+} from '../sandbox/runtimePredecessorStore.js';
 import {
   finalizeStartupRoutes,
   partitionAdditionalStartupAgents,
@@ -104,6 +131,7 @@ import {
   NETWORK_LOCK_WAIT_MS,
   withNetworkLifecycleLock,
   withNetworkLifecycleLockAsync,
+  withNetworkLifecycleLockReclaimingStoppedOwner,
 } from '../sandbox/networkLifecycle.js';
 import { networkContractHash } from '../sandbox/networkContract.js';
 import {
@@ -236,7 +264,7 @@ function createAppendLogStdio(logFile) {
 
 // Resolve the env handed to the Watchdog (and, by inheritance, to the
 // RoutingServer it spawns and respawns). Merge order mirrors
-// secretInjector.getSecret(): walked-up `.env` -> `.ploinky/.secrets` ->
+// secretInjector.getSecret(): walked-up `.env` -> `.ploinky/data/.secrets` ->
 // `process.env`, with operator-exported values winning. This way the router
 // stays able to forward LLM/auth secrets to handlers across crash-restart
 // cycles without depending on the operator having `export`'d each one. Managed
@@ -1054,21 +1082,118 @@ function computeRetainedManagedEnvHash(node, record, profileConfig, runtimeNetwo
 }
 
 function removeGraphContainerForRecreate(containerName, label, predecessorRecord, {
+  predecessorReceipt = null,
   clearLivenessStateImpl = dockerSvc.clearLivenessState,
   containerExistsImpl = dockerSvc.containerExists,
   getRuntimeImpl = dockerSvc.getRuntime,
   removeExactRegisteredContainerImpl = removeExactRegisteredContainer,
+  readRuntimeCandidateImpl = readRuntimeCandidate,
+  retireRuntimeCandidateImpl = retireRuntimeCandidate,
+  retireRuntimePredecessorImpl = retireRuntimePredecessor,
+  inspectExactContainerImpl = inspectExactContainer,
+  removeExactSandboxPredecessorImpl = removeExactSandboxPredecessor,
 } = {}) {
-  if (!containerExistsImpl(containerName)) return { removed: false, state: 'absent' };
+  // The predecessor record's own runtime selects how it is observed and
+  // removed, whatever backend its successor resolves to. A native predecessor
+  // has no container: only its exact PID record and process identity count.
+  if (isSandboxRuntime(predecessorRecord?.runtime)) {
+    let outcome;
+    try {
+      outcome = removeExactSandboxPredecessorImpl(containerName, predecessorRecord, {
+        process: predecessorReceipt?.predecessor?.process ?? predecessorRecord?.process,
+      });
+    } catch (cause) {
+      const error = new Error(
+        `[${label}] preserved sandbox '${containerName}' because exact process ownership/removal was not proven`,
+        { cause },
+      );
+      error.code = 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS';
+      throw error;
+    }
+    if (outcome?.state !== 'absent' && outcome?.state !== 'removed') {
+      const error = new Error(
+        `[${label}] preserved sandbox '${containerName}' because exact process ownership/removal was not proven (${outcome?.state || 'unknown'}: ${outcome?.reason || 'unreported'})`,
+      );
+      error.code = 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS';
+      throw error;
+    }
+    // Absent or removed: the exact predecessor no longer needs its proof.
+    clearLivenessStateImpl(containerName);
+    if (predecessorReceipt) retireRuntimePredecessorImpl(predecessorReceipt);
+    return { removed: outcome.state === 'removed', state: outcome.state === 'removed' ? 'removed' : 'absent' };
+  }
+  // A staged predecessor whose launcher never published it (a no-wait worker
+  // that stopped or was superseded) has no registered container ID. Its launch
+  // receipt, or else the container's exact workspace, instance, generation and
+  // launch identity, proves ownership instead, exactly as for a reinstall whose
+  // launcher died before persisting the ID.
+  const unpublished = !/^[a-f0-9]{64}$/.test(String(predecessorRecord?.containerId || ''));
+  if (!containerExistsImpl(containerName)) {
+    // Nothing to remove by name. The launch receipt is the only recovery
+    // evidence, so it is retired only when its own engine positively reports
+    // the exact recorded ID missing. An unavailable engine, a timeout or any
+    // other inspection failure is unknown and leaves the receipt in place.
+    if (unpublished) {
+      try {
+        const receipt = readRuntimeCandidateImpl(containerName, predecessorRecord);
+        if (receipt && inspectExactContainerImpl(receipt.runtime, receipt.containerId) === null) {
+          retireRuntimeCandidateImpl(receipt);
+        }
+      } catch (_) {}
+    }
+    if (predecessorReceipt) {
+      // The predecessor receipt is the only proof of the tuple a predecessor
+      // still present here carries. A name miss can be an unavailable engine,
+      // so retire it, and continue toward a launch, only once the engine
+      // positively reports the exact predecessor missing.
+      // The engine is probed, never required: with none installed the absence
+      // is simply not proven (getRuntime would end the process).
+      let absent = false;
+      try {
+        const engine = predecessorRecord?.runtime
+          || (getRuntimeImpl === dockerSvc.getRuntime ? probeContainerRuntime() : getRuntimeImpl());
+        absent = Boolean(engine) && inspectExactContainerImpl(
+          engine,
+          unpublished ? containerName : predecessorRecord.containerId,
+        ) === null;
+      } catch (_) {}
+      if (!absent) {
+        const error = new Error(
+          `[${label}] preserved the predecessor receipt of '${containerName}' because the exact predecessor's absence was not proven`,
+        );
+        error.code = 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS';
+        throw error;
+      }
+      retireRuntimePredecessorImpl(predecessorReceipt);
+    }
+    return { removed: false, state: 'absent' };
+  }
+  let result;
   try {
-    const result = removeExactRegisteredContainerImpl(containerName, predecessorRecord, {
-      runtime: getRuntimeImpl(),
-    });
+    // A launch for this exact tuple that stopped before publishing keeps the
+    // replaced predecessor's ID in the registry; its receipt names the runtime
+    // it created in that predecessor's place, exactly as for a direct recreate.
+    const receipt = unpublished || hasCompleteRuntimeTuple(predecessorRecord)
+      ? readRuntimeCandidateImpl(containerName, predecessorRecord)
+      : null;
+    if (receipt && !unpublished
+        && receipt.containerId !== predecessorRecord.containerId
+        && receipt.predecessorContainerId !== predecessorRecord.containerId) {
+      throw new Error('registered container ID conflicts with the persisted launch receipt');
+    }
+    result = removeExactRegisteredContainerImpl(
+      containerName,
+      receipt ? { ...predecessorRecord, ...receipt.registryRecord } : predecessorRecord,
+      {
+        runtime: getRuntimeImpl(),
+        ...(unpublished && !receipt ? { recoverIncompleteIdentity: true } : {}),
+      },
+    );
     if (result?.removed !== true) {
       throw new Error(`exact predecessor removal returned '${result?.state || 'unknown'}'`);
     }
+    if (receipt) retireRuntimeCandidateImpl(receipt);
     clearLivenessStateImpl(containerName);
-    return result;
   } catch (cause) {
     const error = new Error(
       `[${label}] preserved container '${containerName}' because exact immutable ownership/removal was not proven`,
@@ -1077,12 +1202,75 @@ function removeGraphContainerForRecreate(containerName, label, predecessorRecord
     error.code = 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS';
     throw error;
   }
+  // Removed: this exact predecessor no longer needs its proof.
+  if (predecessorReceipt) retireRuntimePredecessorImpl(predecessorReceipt);
+  return result;
+}
+
+// 'seatbelt' | 'bwrap' | 'container', or '' for a record that names no
+// runtime (staged but never launched).
+function graphRecordBackend(record) {
+  const runtime = String(record?.runtime || '');
+  if (!runtime) return '';
+  return isSandboxRuntime(runtime) ? runtime : 'container';
+}
+
+// The backend a record's runtime was launched on, resolved once per graph
+// stage. A record that names its runtime answers directly. A runtime-less one
+// (legacy, or never finalized) never selects a backend by itself:
+//   - a predecessor receipt that names a runtime is authoritative;
+//   - the PID record of its exact tuple proves a native owner (live, or stale
+//     for that tuple), whose kind is the desired native kind or the host's;
+//   - an unverifiable slot refuses (the caller is still before any mutation);
+//   - verified absence of any native owner leaves it a container record, unless
+//     the desired backend is native and no container engine exists at all, in
+//     which case nothing but a native runtime could ever have run.
+function resolvePredecessorBackend(node, existing, {
+  observeImpl,
+  readReceiptImpl,
+  getRuntimeForAgentImpl = getRuntimeForAgent,
+  probeContainerRuntimeImpl = probeContainerRuntime,
+}) {
+  const named = graphRecordBackend(existing.rec);
+  if (named) return named;
+  const tuple = registeredRuntimeTuple(existing.rec);
+  if (!tuple) return '';
+  let receipt = null;
+  try { receipt = readReceiptImpl(existing.key, existing.rec); } catch (_) { receipt = null; }
+  if (receipt?.predecessor?.runtime) return graphRecordBackend(receipt.predecessor);
+  const desired = getRuntimeForAgentImpl(node.manifest);
+  const nativeKind = isSandboxRuntime(desired) ? desired : (process.platform === 'darwin' ? 'seatbelt' : 'bwrap');
+  const observed = observeImpl(existing.key, { expectedIdentity: tuple });
+  if (observed.state === 'unknown') throw sandboxOwnershipUnknown(existing.key, observed.reason);
+  const carriesTuple = observed.record
+    && observed.record.instanceId === tuple.instanceId
+    && observed.record.enableGeneration === tuple.enableGeneration;
+  if (observed.state === 'live-exact' || (observed.state === 'absent' && carriesTuple)) return nativeKind;
+  if (isSandboxRuntime(desired) && !probeContainerRuntimeImpl()) return desired;
+  return '';
+}
+
+function sandboxOwnershipUnknown(containerName, reason) {
+  const error = new Error(
+    `sandbox runtime '${containerName}' ownership could not be verified (${reason}); refusing to treat it as stopped`,
+  );
+  error.code = 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS';
+  return error;
+}
+
+// Liveness for the graph: an unknown observation is never "stopped".
+function isGraphSandboxRuntimeRunning(runtimeKey, expectedIdentity, {
+  observeImpl = observeSandboxRuntime,
+} = {}) {
+  const observed = observeImpl(runtimeKey, { expectedIdentity });
+  if (observed.state === 'unknown') throw sandboxOwnershipUnknown(runtimeKey, observed.reason);
+  return observed.state === 'live-exact';
 }
 
 export function graphNodeRuntimeReplacementReason(plan, {
   containerExistsImpl = dockerSvc.containerExists,
   isContainerRunningImpl = dockerSvc.isContainerRunning,
-  isSandboxRunningImpl = isBwrapProcessRunning,
+  isSandboxRunningImpl = isGraphSandboxRuntimeRunning,
   getRuntimeForAgentImpl = getRuntimeForAgent,
   getRuntimeImpl = getRuntime,
   getContainerLabelImpl = getContainerLabel,
@@ -1109,12 +1297,20 @@ export function graphNodeRuntimeReplacementReason(plan, {
     path: `manifest(${node.repoName}/${node.shortAgentName})`,
   });
   const runtimeKind = getRuntimeForAgentImpl(node.manifest);
+  // The existing record's own backend selects how it is probed; the desired
+  // backend only selects the successor. A record without a runtime (never
+  // launched) names no backend, so it never selects one for removal.
+  const recordBackend = plan.predecessorBackend !== undefined
+    ? plan.predecessorBackend
+    : graphRecordBackend(record);
+  const desiredBackend = isSandboxRuntime(runtimeKind) ? runtimeKind : 'container';
+  if (recordBackend && recordBackend !== desiredBackend) return 'runtimeBackendChanged';
   const routerEndpoint = resolveManifestRouterEndpoint(node.manifest, {
     explicitPort: resolvePersistedRouterPort(),
     profileName: node.profile || undefined,
     path: `manifest(${node.repoName}/${node.shortAgentName})`,
   });
-  if (isSandboxRuntime(runtimeKind)) {
+  if (recordBackend ? recordBackend !== 'container' : isSandboxRuntime(runtimeKind)) {
     if (!isSandboxRunningImpl(existing.key, {
       instanceId: record.instanceId,
       enableGeneration: record.enableGeneration,
@@ -1310,9 +1506,17 @@ function loadRegistryManifest(record) {
   return JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
 }
 
-function isRegistryRuntimeRunning(containerName, record) {
+// Native PID records are keyed by the exact container name and carry the
+// record's tuple. The short agent name or alias names no runtime.
+export function isRegistryRuntimeRunning(containerName, record, {
+  observeImpl = observeSandboxRuntime,
+} = {}) {
   if (isSandboxRuntime(record?.runtime)) {
-    return isBwrapProcessRunning(record.agentName);
+    const tuple = registeredRuntimeTuple(record);
+    if (!tuple) throw sandboxOwnershipUnknown(containerName, 'registry record has no exact runtime tuple');
+    const observed = observeImpl(containerName, { expectedIdentity: tuple });
+    if (observed.state === 'unknown') throw sandboxOwnershipUnknown(containerName, observed.reason);
+    return observed.state === 'live-exact';
   }
   return dockerSvc.isContainerRunning(containerName);
 }
@@ -1752,6 +1956,20 @@ export async function launchAdditionalRuntimes({
   return { readyAgentKeys };
 }
 
+// Match on every immutable field, never on the container name alone: only the
+// exact staged tuple the worker was launched with can let it resume.
+function supersededNoWaitRunFor(runs, containerName, record) {
+  const alias = record?.alias === undefined || record?.alias === null ? '' : record.alias;
+  return (Array.isArray(runs) ? runs : []).find(({ identity } = {}) => (
+    identity?.containerName === containerName
+      && identity.instanceId === record?.instanceId
+      && identity.enableGeneration === record?.enableGeneration
+      && identity.repoName === record?.repoName
+      && identity.shortAgent === record?.agentName
+      && identity.alias === alias
+  )) || null;
+}
+
 function ensureGraphNodesEnabled(graph, reg, {
   prepareAgentEnableBatch = agentsSvc.prepareAgentEnableBatch,
   removeAgentContainerForRecreate = removeGraphContainerForRecreate,
@@ -1771,6 +1989,11 @@ function ensureGraphNodesEnabled(graph, reg, {
   boxMarkerOptions,
   unavailableNodeIds = new Set(),
   logLine = (line) => console.log(line),
+  supersededNoWaitRuns = [],
+  readRuntimePredecessorImpl = readRuntimePredecessor,
+  writeRuntimePredecessorImpl = writeRuntimePredecessor,
+  retireRuntimePredecessorImpl = retireRuntimePredecessor,
+  observeSandboxRuntimeImpl = observeSandboxRuntime,
 } = {}) {
   const nodes = [
     ...Array.from(graph?.nodes?.values?.() || []),
@@ -1810,24 +2033,77 @@ function ensureGraphNodesEnabled(graph, reg, {
     const executionDifferences = executionChanged
       ? executionRecordDifferences(existing.rec, expectedExecution)
       : [];
-    const preliminary = { node, existing, expectedExecution, executionChanged, profileChanged };
+    const predecessorBackend = resolvePredecessorBackend(node, existing, {
+      observeImpl: observeSandboxRuntimeImpl,
+      readReceiptImpl: readRuntimePredecessorImpl,
+      getRuntimeForAgentImpl: runtimeReplacementOptions?.getRuntimeForAgentImpl,
+    });
+    const preliminary = {
+      node, existing, expectedExecution, executionChanged, profileChanged, predecessorBackend,
+    };
+    // A stalled worker of an earlier start still holds this exact staged
+    // identity and would resume under any generation that carries it again, so
+    // the identity always rotates and its unpublished runtime is removed.
+    const superseded = supersededNoWaitRunFor(supersededNoWaitRuns, existing.key, existing.rec);
     // A refused or blocked instance keeps no authority: an existing runtime is
     // revoked by identity rotation and removed through exact ownership checks.
     const hardwareUnavailable = unavailableNodeIds.has(node.id)
       && (runtimeReplacementOptions?.containerExistsImpl || dockerSvc.containerExists)(existing.key);
-    const runtimeReason = executionChanged || profileChanged
-      ? ''
-      : hardwareUnavailable
+    let runtimeReason = '';
+    if (!executionChanged && !profileChanged) {
+      runtimeReason = hardwareUnavailable
         ? 'hardwareUnavailable'
-        : String(runtimeReplacementReason(preliminary, runtimeReplacementOptions) || '');
+        : superseded
+          ? 'noWaitRunSuperseded'
+          : String(runtimeReplacementReason(preliminary, runtimeReplacementOptions) || '');
+    }
+    // A start that stopped after persisting this record's rotated tuple but
+    // before removing its predecessor left that predecessor's own tuple in a
+    // receipt keyed by the rotated one. Only that tuple proves the container.
+    const priorPredecessorReceipt = executionChanged || profileChanged || runtimeReason
+      ? readRuntimePredecessorImpl(existing.key, existing.rec)
+      : null;
+    const predecessorRecord = priorPredecessorReceipt
+      ? { ...structuredClone(existing.rec), ...structuredClone(priorPredecessorReceipt.predecessor) }
+      : structuredClone(existing.rec);
+    // A runtime-less record proven native names its kind from here on, so the
+    // receipt and the removal take the native path.
+    if (isSandboxRuntime(predecessorBackend) && !isSandboxRuntime(predecessorRecord.runtime)) {
+      predecessorRecord.runtime = predecessorBackend;
+    }
+    // Capture the native predecessor's process evidence before anything is
+    // rotated. A slot that cannot be verified refuses the whole graph now,
+    // while nothing has been inactivated, rotated or signalled.
+    let predecessorProcess = null;
+    if ((executionChanged || profileChanged || runtimeReason)
+        && isSandboxRuntime(predecessorRecord.runtime)
+        && hasCompleteRuntimeTuple(predecessorRecord)) {
+      const observed = observeSandboxRuntimeImpl(existing.key, {
+        expectedIdentity: {
+          instanceId: predecessorRecord.instanceId,
+          enableGeneration: predecessorRecord.enableGeneration,
+        },
+      });
+      if (observed.state === 'unknown') throw sandboxOwnershipUnknown(existing.key, observed.reason);
+      if (observed.state === 'live-exact') {
+        predecessorProcess = {
+          pid: observed.record.pid,
+          processIdentity: observed.record.processIdentity,
+        };
+      }
+    }
+    if (isSandboxRuntime(predecessorRecord.runtime)) delete predecessorRecord.process;
     existingPlans.push({
       ...preliminary,
       executionDifferences,
       runtimeReason,
+      registryRecord: structuredClone(existing.rec),
+      priorPredecessorReceipt,
+      predecessorProcess,
       // The desired registry receives a fresh candidate tuple before removal
       // so the inactive generation can be compiled. Keep a detached snapshot
       // as the only ownership proof authorized to remove the predecessor.
-      predecessorRecord: structuredClone(existing.rec),
+      predecessorRecord,
     });
   }
 
@@ -1900,11 +2176,29 @@ function ensureGraphNodesEnabled(graph, reg, {
     retireNoWaitMarkers([
       ...stagedPlans.map((plan) => ({
         containerName: plan.existing.key,
-        record: plan.predecessorRecord,
+        record: plan.registryRecord,
       })),
       ...missingContainerNames,
     ]);
+    // The rotated registry below keeps each predecessor's container ID under
+    // the fresh tuple. Make every predecessor's own tuple durable first, so a
+    // start stopped before the removal loop completes stays recoverable.
+    for (const plan of changedPlans) {
+      if (!hasCompleteRuntimeTuple(plan.predecessorRecord)) continue;
+      plan.predecessorReceipt = writeRuntimePredecessorImpl({
+        containerName: plan.existing.key,
+        successor: reg[plan.existing.key],
+        predecessor: plan.predecessorProcess
+          ? { ...plan.predecessorRecord, process: plan.predecessorProcess }
+          : plan.predecessorRecord,
+      });
+    }
     if (changedPlans.length) saveAgents(reg, { coordinate: false });
+    // The receipts just written now carry every earlier receipt's predecessor.
+    for (const plan of changedPlans) {
+      if (!plan.priorPredecessorReceipt) continue;
+      try { retireRuntimePredecessorImpl(plan.priorPredecessorReceipt); } catch (_) {}
+    }
     saveRouting(routing);
   } else if (missingContainerNames.length) {
     // prepareAgentEnableBatch persists the new registry tuple, so stale marker
@@ -1942,6 +2236,7 @@ function ensureGraphNodesEnabled(graph, reg, {
         plan.existing.key,
         `workspaceGraph:${plan.node.id}:${reasons.join('+')}`,
         plan.predecessorRecord,
+        { predecessorReceipt: plan.predecessorReceipt || null },
       );
     }
   } catch (error) {
@@ -2546,16 +2841,30 @@ async function startWorkspace(staticAgentArg, portArg, {
   // Only the final post-provider lease may authorize runtime targets.
   resetPreinstallRunInProcess();
   // A previous start may have returned while its no-wait workers are still
-  // activating routes. Serialize with them using the same bounded wait they
-  // use for startup, then revalidate the admitted graph under the lease.
-  const workspaceStartLock = await acquireWorkspaceMutationLease({ operation: 'workspace-start' });
+  // creating and activating runtimes. Wait until none can still make progress
+  // (they need the lease, so the wait holds none), then revalidate the
+  // admitted graph under the lease.
+  const workspaceStartLock = await acquireSettledWorkspaceMutationLease({ operation: 'workspace-start' });
   let workspacePreparationLease = null;
   const workspaceRuntimeCandidates = [];
   const workspaceMpsRuntimes = [];
   try {
-  return await withNetworkLifecycleLock(async (networkLifecycleCapability) => {
+  // Everything below is this start's own work: nested lifecycle code reuses
+  // this lease, and nothing else in the process can. A rollback start can
+  // follow a killed start at once: wait out only that dead owner's stale
+  // network-lock grace, never a live owner.
+  return await runWithWorkspaceMutationLease(workspaceStartLock, () => withNetworkLifecycleLockReclaimingStoppedOwner(async (networkLifecycleCapability) => {
   try {
   assertWorkspaceGraphAdmissionsCurrent(admittedStart.admissions);
+  // No earlier no-wait worker still alive here can change anything while this
+  // start holds the workspace lease and network lock, and none has published.
+  // Whether a stop or a source change stalled it or it became able to
+  // progress just after the settle, staging rotates its identity.
+  const supersededNoWaitRuns = inspectLiveNoWaitWorkers();
+  if (supersededNoWaitRuns.length) {
+    console.log(`[start] Superseding ${supersededNoWaitRuns.length} live no-wait worker(s) of an earlier start: ${supersededNoWaitRuns
+      .map(({ containerName, pid }) => `${containerName} (${pid ? `pid ${pid}` : 'pid not yet published'})`).join(', ')}`);
+  }
   const lockedStart = preflightWorkspaceStartRuntimeCapabilities(staticAgentArg);
   // Hardware refusals are recorded per exact instance; blocking and explicit
   // waiting consumers become blocked, unrelated agents start (plan §9.1).
@@ -2565,6 +2874,16 @@ async function startWorkspace(staticAgentArg, portArg, {
   const workspaceConfigForAuth = workspaceSvc.getConfig() || {};
   const graphSsoConfig = resolveWorkspaceGraphSsoConfig(lockedStart.graph, workspaceConfigForAuth.sso);
   initializeFreshEdgeRoutingSources({ workspaceRoot: PLOINKY_WORKSPACE_ROOT });
+  // The inactivation below replaces the selector that binds a stopped start's
+  // graph preparation, so retire or refuse that lease first.
+  const abandonedPreparation = retireAbandonedWorkspaceStartPreparation({
+    workspaceRoot: PLOINKY_WORKSPACE_ROOT,
+    workspaceMutationLease: workspaceStartLock,
+    networkLifecycleCapability,
+  });
+  if (abandonedPreparation.retired) {
+    console.log(`[start] Retired the routing preparation of stopped workspace start pid ${abandonedPreparation.pid}.`);
+  }
   inactivateEdgeRoutingGeneration('workspace-start-prepare', { workspaceRoot: PLOINKY_WORKSPACE_ROOT });
   if (graphSsoConfig) {
     workspaceSvc.setConfig({ ...workspaceConfigForAuth, sso: graphSsoConfig });
@@ -2727,6 +3046,7 @@ async function startWorkspace(staticAgentArg, portArg, {
       deferredNodeIds: waitClassification.noWait,
       additionalNodes: extraRuntimeNodes,
       unavailableNodeIds,
+      supersededNoWaitRuns,
       runtimeReplacementReason: mpsReplacementReason,
     });
     workspacePreparationLease = preparedGraph?.preparedGeneration?.preparationLease || null;
@@ -2803,7 +3123,7 @@ async function startWorkspace(staticAgentArg, portArg, {
       {
         deferredNodeIds: waitClassification.noWait,
         additionalNodes: extraRuntimeNodes,
-        graphEnableOptions: { unavailableNodeIds },
+        graphEnableOptions: { unavailableNodeIds, supersededNoWaitRuns },
         runtimeReplacementReason: mpsReplacementReason,
       },
     );
@@ -2919,6 +3239,9 @@ async function startWorkspace(staticAgentArg, portArg, {
             enableGeneration: rec.enableGeneration,
             forceRecreate: newlyPreparedContainers.has(name),
             forceRecreateReason: 'runtime identity rotated earlier in this start',
+            // The graph removal step already removed every changed
+            // predecessor, so the slot holds nothing or the exact successor.
+            expectedPredecessor: null,
             preservePreparedRegistryRecord: true,
             preparationLease: workspacePreparationLease,
             preparedHostModeCapability,
@@ -3182,6 +3505,7 @@ async function startWorkspace(staticAgentArg, portArg, {
     console.log(`[start] Server logs: ${path.join(LOGS_DIR, 'router.log')}`);
     console.log(`[start] Watchdog logs: ${path.join(LOGS_DIR, 'watchdog.log')}`);
     console.log(`[start] Router: ${buildRouterUrl(staticPort)}`);
+    reportDependencyCollection(collectDependencyObjectsAfterAdmission({ lease: workspaceStartLock, reason: 'workspace-start' }));
     const startResult = summarizeStartResult({
       readyAgents: readyAgentKeys.map((key) => ({ key })),
       asynchronousAgents: asynchronousAgentKeys.map((key) => ({ key })),
@@ -3217,9 +3541,97 @@ async function startWorkspace(staticAgentArg, portArg, {
     }
     throw new Error(`start (workspace) failed: ${message}`);
   }
-  });
+  }));
   } finally {
     releaseWorkspaceStartLock(workspaceStartLock);
+  }
+}
+
+/**
+ * Restarts replace the selector and stop the Router and agents before
+ * startWorkspace runs. First wait for the previous start's no-wait workers,
+ * whose half-created runtimes the stop could neither see nor remove, then
+ * settle a stopped start's graph preparation under that same lease, so that
+ * either refusal happens while the running graph is still untouched.
+ */
+async function settleWorkspaceBeforeRestart() {
+  const workspaceMutationLease = await acquireSettledWorkspaceMutationLease({ operation: 'workspace-restart' });
+  let callbackError = null;
+  try {
+    // Bound as this restart's own lease, like every lease owner without a callback.
+    return runWithWorkspaceMutationLease(workspaceMutationLease, () => (
+      withNetworkLifecycleLockReclaimingStoppedOwner((networkLifecycleCapability) => {
+        const result = retireAbandonedWorkspaceStartPreparation({
+          workspaceRoot: PLOINKY_WORKSPACE_ROOT,
+          workspaceMutationLease,
+          networkLifecycleCapability,
+        });
+        if (result.retired) {
+          console.log(`[restart] Retired the routing preparation of stopped workspace start pid ${result.pid}.`);
+        }
+        return result;
+      })
+    ));
+  } catch (error) {
+    callbackError = error;
+    throw error;
+  } finally {
+    if (!releaseWorkspaceMutationLease(workspaceMutationLease)) {
+      const releaseError = new Error("workspace mutation 'workspace-restart' could not release its exact lease");
+      releaseError.code = 'workspace_mutation_lock_release_failed';
+      if (callbackError) callbackError.message += `; ${releaseError.message}`;
+      else throw releaseError;
+    }
+  }
+}
+
+/**
+ * `stop` replaces the selector that binds a killed start's graph preparation,
+ * after which only a stopped Box can retire that lease. Retire it before the
+ * rewrite, on exactly the proof start and restart require, but never at the
+ * cost of the stop: a busy lease or lock, a live owner or any mismatch leaves
+ * the preparation in place and the stop continues.
+ */
+function retireAbandonedStartPreparationBeforeStop({ log = (message) => console.log(message) } = {}) {
+  let owner;
+  try {
+    owner = readEdgeRoutingPreparationOwner({ workspaceRoot: PLOINKY_WORKSPACE_ROOT });
+  } catch (error) {
+    log(`[stop] Could not inspect the routing preparation lease: ${error?.message || error}`);
+    return { retired: false };
+  }
+  if (!owner) return { retired: false };
+  const leftInPlace = (why) => {
+    log(`[stop] Left the routing preparation of pid ${owner.pid} (${owner.reason}) in place: ${why}`);
+    return { retired: false };
+  };
+  let workspaceMutationLease;
+  try {
+    workspaceMutationLease = createWorkspaceMutationLease({ operation: 'workspace-stop' });
+  } catch (error) {
+    return leftInPlace(error?.message || String(error));
+  }
+  try {
+    const retire = (networkLifecycleCapability) => retireAbandonedWorkspaceStartPreparation({
+      workspaceRoot: PLOINKY_WORKSPACE_ROOT,
+      workspaceMutationLease,
+      networkLifecycleCapability,
+    });
+    // A killed start leaves its network lock behind, reclaimable once the
+    // stale-owner grace has passed. Wait out that grace, never a live owner.
+    const result = runWithWorkspaceMutationLease(workspaceMutationLease, () => (
+      withNetworkLifecycleLockReclaimingStoppedOwner(retire)
+    ));
+    if (result.retired) {
+      log(`[stop] Retired the routing preparation of stopped workspace start pid ${result.pid}.`);
+    }
+    return result;
+  } catch (error) {
+    return leftInPlace(error?.message || String(error));
+  } finally {
+    let released = false;
+    try { released = releaseWorkspaceMutationLease(workspaceMutationLease); } catch (_) {}
+    if (!released) log('[stop] Could not release the workspace lease taken to inspect the routing preparation.');
   }
 }
 
@@ -3447,6 +3859,8 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
           routerEndpoint,
           runtimeAdmission: directAdmission.runtimeAdmission,
           networkLifecycleCapability,
+          // The registry tuple read above is the only runtime this start may replace.
+          expectedPredecessor: registeredRuntimeTuple(registryRecord?.record),
         });
         const exactContainerName = result?.containerName
           || registryRecord?.containerName
@@ -3612,6 +4026,7 @@ async function runShell(agentName) {
         routerEndpoint,
         runtimeAdmission: directAdmission.runtimeAdmission,
         networkLifecycleCapability,
+        expectedPredecessor: registeredRuntimeTuple(registryRecord?.record),
       });
       const exactContainerName = result?.containerName || registeredContainerName;
       const shellReadinessRoute = buildRelayReadinessRoute({
@@ -3684,12 +4099,14 @@ async function reinstallAgent(agentName) {
     if (!agentName) { throw new Error('Usage: reinstall <name> | reinstall agent <name>'); }
 
     const { getAgentContainerName, ensureAgentService } = dockerSvc;
+    // Reinstall targets exactly one enabled registration/alias. An ambiguous
+    // or unresolvable reference fails (nonzero) before any state changes.
     let registryRecord = null;
     try {
         registryRecord = agentsSvc.resolveEnabledAgentRecord(agentName);
     } catch (err) {
         console.error(err?.message || err);
-        return;
+        throw err;
     }
     if (!registryRecord) {
         throw new Error(`Agent '${agentName}' is not enabled. Run 'ploinky start ${agentName}' first.`);
@@ -3745,6 +4162,8 @@ async function reinstallAgent(agentName) {
         }, async () => {
           return await withNetworkLifecycleLock(async (networkLifecycleCapability) => {
             let reinstallResult = null;
+            let dependencyRebuild = null;
+            let runtimeAdmitted = false;
             try {
             const currentRegistration = agentsSvc.resolveEnabledAgentRecord(agentName);
             if (currentRegistration?.containerName !== containerName
@@ -3753,6 +4172,10 @@ async function reinstallAgent(agentName) {
                 )) {
               throw new Error(`Agent '${agentName}' changed while waiting for reinstall; retry with its current registration.`);
             }
+            // One exact logical registration gets a persistent desired rebuild
+            // request (reused while it is still pending or failed). Its runtime
+            // then builds from empty npm state, bypassing seeds.
+            dependencyRebuild = issueDependencyRebuildRequest(containerName, { lease: workspaceMutationLease });
             const short = resolved.shortAgentName;
             const agentPath = path.dirname(resolved.manifestPath);
             const edgeSelection = readEdgeRoutingSelection();
@@ -3803,6 +4226,14 @@ async function reinstallAgent(agentName) {
                 runtimeAdmission: directAdmission.runtimeAdmission,
                 networkLifecycleCapability,
                 stageAlongsidePredecessor,
+                // The registration read before the call (and re-verified under
+                // the locks above) is the runtime a reinstall replaces.
+                expectedPredecessor: registryRecord?.record?.instanceId && registryRecord?.record?.enableGeneration
+                    ? {
+                        instanceId: registryRecord.record.instanceId,
+                        enableGeneration: registryRecord.record.enableGeneration,
+                    }
+                    : null,
             });
             const { containerName: newContainerName, hostPort } = reinstallResult;
 
@@ -3836,10 +4267,42 @@ async function reinstallAgent(agentName) {
                 alias: registryRecord?.record?.alias || '',
                 networkLifecycleCapability,
             });
+            runtimeAdmitted = true;
 
+            // Only an activated replacement publishes its admitted reference.
+            // The runtime is already active here, so a settlement failure is
+            // reported without undoing the activation.
+            try {
+              // Admit only a replacement that actually used the request's token.
+              const applied = runtimeCarriesRebuildToken(reinstallResult?.registryRecord, dependencyRebuild.token);
+              settleDependencyRebuildRequest(containerName, dependencyRebuild.token, {
+                lease: workspaceMutationLease,
+                outcome: applied ? 'admitted' : 'failed',
+                ...(applied ? {} : { error: new Error('the activated runtime did not use the requested dependency rebuild') }),
+              });
+              if (!applied) throw new Error('the activated runtime did not use the requested dependency rebuild; the request stays retryable');
+            } catch (settleError) {
+              const recovery = new Error(`[reinstall] ${short}: runtime activated, but dependency rebuild settlement requires recovery: ${settleError?.message || settleError}`);
+              recovery.code = 'PLOINKY_DEPS_REBUILD_RECOVERY_REQUIRED';
+              recovery.cause = settleError;
+              throw recovery;
+            }
             console.log(`[reinstall] reinstalled '${short}' [container: ${newContainerName}]`);
+            reportDependencyCollection(collectDependencyObjectsAfterAdmission({ lease: workspaceMutationLease, reason: 'reinstall' }));
             } catch (error) {
+              // Activation is already committed. Report failure without
+              // destroying the admitted replacement or claiming a rollback.
+              if (runtimeAdmitted) throw error;
               cleanupFailedPreparedRuntime(reinstallResult, error, 'runtime-reinstall-readiness-failed');
+              if (dependencyRebuild) {
+                try {
+                  settleDependencyRebuildRequest(containerName, dependencyRebuild.token, {
+                    lease: workspaceMutationLease, outcome: 'failed', error,
+                  });
+                } catch (settleError) {
+                  error.message += `; dependency rebuild request could not record the failure: ${settleError?.message || settleError}`;
+                }
+              }
               throw error;
             }
           });
@@ -3867,6 +4330,8 @@ export {
   resolveAndPersistStartRouterPort,
   resolveGraphNodeExecutionRecord,
   resolveRetainedGraphNodeExecutionRecord,
+  retireAbandonedStartPreparationBeforeStop,
+  settleWorkspaceBeforeRestart,
   waitForRouterReady,
   waitForManifestReadiness,
   waitForReadinessEntries,

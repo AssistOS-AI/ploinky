@@ -59,18 +59,6 @@ test('container and bwrap link into the stable mount path; seatbelt links to the
     );
 });
 
-test('the stamp section separates a family whose link target differs', () => {
-    const containerStamp = link.agentLibStampSection('container-linux-x64-node25', SELECTION);
-    const seatbeltStamp = link.agentLibStampSection('seatbelt-darwin-arm64-node25', SELECTION);
-    assert.notEqual(containerStamp.linkTarget, seatbeltStamp.linkTarget);
-    // A cache prepared for one family cannot be silently adopted by the other.
-    assert.match(
-        link.agentLibStampProblem({ agentLib: containerStamp }, seatbeltStamp),
-        /linkTarget changed/,
-    );
-    assert.equal(link.agentLibStampProblem({ agentLib: containerStamp }, containerStamp), '');
-});
-
 // --- link creation and npm pruning ----------------------------------------
 
 test('an npm prune between install and stamp is repaired by the final link step', () => {
@@ -150,14 +138,14 @@ test('the active selection comes from the validated runtime contract, not the cw
     );
     const env = {
         [contract.AGENTLIB_ENV.dir]: '/selected/achillesAgentLib',
-        [contract.AGENTLIB_ENV.mode]: 'managed',
+        [contract.AGENTLIB_ENV.mode]: 'local',
         [contract.AGENTLIB_ENV.fingerprint]: 'b2'.repeat(32),
         [contract.AGENTLIB_ENV.commit]: 'c'.repeat(40),
         [contract.AGENTLIB_ENV.sourceId]: SOURCE_ID_HASH,
     };
     assert.deepEqual(link.activeAgentLibSelection(env), {
         sourceDir: '/selected/achillesAgentLib',
-        mode: 'managed',
+        mode: 'local',
         fingerprint: 'b2'.repeat(32),
         commit: 'c'.repeat(40),
         sourceIdHash: SOURCE_ID_HASH,
@@ -261,10 +249,6 @@ test('a stale fingerprint is not reusable in any runtime family', () => {
             `${runtimeKey} must replace a runtime running older AgentLib bytes`,
         );
 
-        // A legacy full record remains reusable; only its generation identity
-        // is significant.
-        const legacy = { agentLib: { ...grant, aliasShadows: ['/workspace/achillesAgentLib'] } };
-        assert.equal(grantMod.agentLibReuseProblem(legacy, grant), '');
         assert.match(
             grantMod.agentLibReuseProblem(
                 running,
@@ -337,5 +321,109 @@ test('the interactive container carries the same grant as the detached service',
             assert.ok(command.includes(`-e ${name}="${value}"`),
                 `${runtime} must carry the exact ${name} grant field`);
         }
+    }
+});
+
+// --- image-supplied source ---------------------------------------------------
+
+const OUTER_IMAGE = `sha256:${'b2'.repeat(32)}`;
+const OTHER_OUTER_IMAGE = `sha256:${'d4'.repeat(32)}`;
+const IMAGE_SOURCE_ID = contract.imageSourceIdHash(contract.imageSourceIdentity(OUTER_IMAGE));
+
+function imageEnv(overrides = {}) {
+    return {
+        [contract.AGENTLIB_ENV.dir]: contract.AGENTLIB_STABLE_MOUNT_PATH,
+        [contract.AGENTLIB_ENV.mode]: 'image',
+        [contract.AGENTLIB_ENV.sourceId]: IMAGE_SOURCE_ID,
+        [contract.BOX_IMAGE_ID_ENV]: OUTER_IMAGE,
+        ...overrides,
+    };
+}
+
+test('an image selection is read from the inherited Box image ID, with no fingerprint or commit', () => {
+    assert.deepEqual(link.activeAgentLibSelection(imageEnv()), {
+        sourceDir: contract.AGENTLIB_STABLE_MOUNT_PATH,
+        mode: 'image',
+        sourceIdHash: IMAGE_SOURCE_ID,
+        supplyingImageId: OUTER_IMAGE,
+    });
+    for (const [label, env] of Object.entries({
+        'a missing Box image ID': imageEnv({ [contract.BOX_IMAGE_ID_ENV]: undefined }),
+        'a mutable image reference': imageEnv({ [contract.BOX_IMAGE_ID_ENV]: 'docker.io/assistos/ploinky-box:latest' }),
+        'a bare hex ID': imageEnv({ [contract.BOX_IMAGE_ID_ENV]: 'b2'.repeat(32) }),
+        'an identity for another image': imageEnv({ [contract.BOX_IMAGE_ID_ENV]: OTHER_OUTER_IMAGE }),
+    })) {
+        assert.throws(() => link.activeAgentLibSelection(env), undefined, `${label} must fail in a Box`);
+    }
+});
+
+test('a local selection needs no Box image ID', () => {
+    const selection = link.activeAgentLibSelection({
+        [contract.AGENTLIB_ENV.dir]: '/selected/achillesAgentLib',
+        [contract.AGENTLIB_ENV.mode]: 'local',
+        [contract.AGENTLIB_ENV.fingerprint]: 'b2'.repeat(32),
+        [contract.AGENTLIB_ENV.commit]: '',
+        [contract.AGENTLIB_ENV.sourceId]: SOURCE_ID_HASH,
+    });
+    assert.equal(selection.mode, 'local');
+    assert.equal(Object.hasOwn(selection, 'supplyingImageId'), false);
+});
+
+test('an image grant carries the supplying image, never a fingerprint, and never emits the Box image ID', () => {
+    const selection = link.activeAgentLibSelection(imageEnv());
+    for (const runtimeKey of ['container-linux-x64-node25', 'bwrap-linux-x64-node25']) {
+        const grant = grantMod.agentLibGrant(runtimeKey, selection);
+        assert.equal(grant.runtimePath, contract.AGENTLIB_STABLE_MOUNT_PATH);
+        assert.equal(grant.supplyingImageId, OUTER_IMAGE);
+        assert.equal(Object.hasOwn(grant, 'fingerprint'), false);
+        assert.deepEqual(grantMod.agentLibGrantEnv(grant), {
+            [contract.AGENTLIB_ENV.dir]: contract.AGENTLIB_STABLE_MOUNT_PATH,
+            [contract.AGENTLIB_ENV.mode]: 'image',
+            [contract.AGENTLIB_ENV.sourceId]: IMAGE_SOURCE_ID,
+        });
+        assert.equal(Object.hasOwn(grantMod.agentLibGrantEnv(grant), contract.BOX_IMAGE_ID_ENV), false,
+            'no nested runtime consumes the outer image ID, so none receives it');
+        assert.deepEqual(grantMod.agentLibRuntimeRecord(grant), {
+            supplyingImageId: OUTER_IMAGE, sourceIdHash: IMAGE_SOURCE_ID,
+        });
+    }
+    assert.throws(() => grantMod.agentLibGrant('container-linux-x64-node25', { ...selection, supplyingImageId: 'latest' }));
+});
+
+test('a runtime is reused only for the same supplying image and never across modes', () => {
+    const image = grantMod.agentLibGrant('container-linux-x64-node25', link.activeAgentLibSelection(imageEnv()));
+    const running = { agentLib: grantMod.agentLibRuntimeRecord(image) };
+    assert.equal(grantMod.agentLibReuseProblem(running, image), '');
+
+    const otherImage = grantMod.agentLibGrant('container-linux-x64-node25', link.activeAgentLibSelection(imageEnv({
+        [contract.AGENTLIB_ENV.sourceId]: contract.imageSourceIdHash(contract.imageSourceIdentity(OTHER_OUTER_IMAGE)),
+        [contract.BOX_IMAGE_ID_ENV]: OTHER_OUTER_IMAGE,
+    })));
+    assert.match(grantMod.agentLibReuseProblem(running, otherImage), /supplyingImageId changed/);
+
+    const local = grantMod.agentLibGrant('container-linux-x64-node25', SELECTION);
+    assert.match(grantMod.agentLibReuseProblem(running, local), /fingerprint changed/);
+    const localRunning = { agentLib: grantMod.agentLibRuntimeRecord(local) };
+    assert.match(grantMod.agentLibReuseProblem(localRunning, image), /supplyingImageId changed/);
+    // A record of the shape earlier versions wrote for an image source matches nothing.
+    assert.match(grantMod.agentLibReuseProblem({ agentLib: { fingerprint: 'a1'.repeat(32), sourceIdHash: IMAGE_SOURCE_ID } }, image),
+        /supplyingImageId changed/);
+});
+
+test('the outer Box image ID is reserved so no config layer can introduce it, and it is never emitted to agents', async () => {
+    const identity = await import(path.join(repoRoot, 'cli/utils/security/agentIdentityEnv.js'));
+    assert.ok(identity.RESERVED_AGENT_ENV_NAMES.includes(contract.BOX_IMAGE_ID_ENV));
+    const env = { SAFE: 'yes', [contract.BOX_IMAGE_ID_ENV]: OTHER_OUTER_IMAGE };
+    identity.stripReservedAgentEnv(env);
+    assert.equal(env[contract.BOX_IMAGE_ID_ENV], undefined);
+    assert.equal(env.SAFE, 'yes');
+    // Nothing that builds a nested runtime's environment emits the name.
+    for (const relative of [
+        'cli/sandbox/agentLibGrant.js', 'cli/sandbox/docker/agentServiceManager.js', 'cli/sandbox/docker/interactive.js',
+        'cli/sandbox/bwrap/bwrapServiceManager.js', 'cli/sandbox/seatbelt/seatbeltServiceManager.js',
+    ]) {
+        const text = fs.readFileSync(path.join(repoRoot, relative), 'utf8');
+        assert.equal(/BOX_IMAGE_ID/.test(text.replace(/assertSupplyingImageId/g, '')), false,
+            `${relative} must not reference the outer Box image ID`);
     }
 });

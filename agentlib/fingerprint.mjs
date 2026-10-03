@@ -2,8 +2,9 @@
 // achillesAgentLib source directory.
 //
 // A Git commit is revision evidence, not a content proof: a local checkout can
-// be dirty and a managed generation can be verified offline. The fingerprint is
-// therefore a hash over the actual runtime bytes.
+// be dirty. The fingerprint is therefore a hash over the actual runtime bytes.
+// It identifies a local source only; the copy a Box image supplies is identified
+// by that image and is never hashed.
 
 import crypto from 'node:crypto';
 import fs from 'node:fs';

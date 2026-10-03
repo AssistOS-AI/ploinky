@@ -60,7 +60,9 @@ export function applyTestAgentLibContract(env = process.env) {
     const sourceDir = declared ? fs.realpathSync(declared) : resolveTestAgentLibSource(env);
     const observed = fingerprintSource(sourceDir);
     env[AGENTLIB_ENV.dir] = sourceDir;
-    env[AGENTLIB_ENV.mode] ||= 'local';
+    // The test source is a local checkout whose content is fingerprinted below;
+    // it is never an image-supplied source, so an inherited mode is replaced.
+    env[AGENTLIB_ENV.mode] = 'local';
     env[AGENTLIB_ENV.fingerprint] = observed.fingerprint;
     env[AGENTLIB_ENV.commit] ||= '';
     env[AGENTLIB_ENV.sourceId] = sourceIdHash(observed.sourceId);

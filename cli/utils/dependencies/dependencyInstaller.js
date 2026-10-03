@@ -15,14 +15,16 @@ import { withoutBoxMcpSdk } from '../../../ploinky-box/agent-dependencies/mcp-sd
  *
  * @param {object} globalPackage - ploinky/globalDeps/package.json contents
  * @param {object|null} agentPackage - agent's own package.json contents, or null
+ * @param {{ bundle?: object|null }} [options] - the Box SDK selected for this
+ *   lifecycle command; omit to select it here
  * @returns {object} Merged package.json
  */
-function mergePackageJson(globalPackage, agentPackage) {
-    const global = withoutBoxMcpSdk(globalPackage, { source: 'globalDeps/package.json' });
+function mergePackageJson(globalPackage, agentPackage, { bundle } = {}) {
+    const global = withoutBoxMcpSdk(globalPackage, { source: 'globalDeps/package.json', bundle });
     const merged = { ...global };
     const agent = withoutBoxMcpSdk(
         assertNoReservedAgentLibDependency(agentPackage || {}, 'agent package.json'),
-        { source: 'agent package.json' },
+        { source: 'agent package.json', bundle },
     );
 
     merged.dependencies = {
@@ -61,10 +63,12 @@ function mergePackageJson(globalPackage, agentPackage) {
  * than silently ship a stale template that has drifted from the real
  * one.
  *
+ * @param {{ bundle?: object|null }} [options] - the Box SDK selected for this
+ *   lifecycle command; omit to select it here
  * @returns {object} The parsed global package.json
  * @throws {Error} if globalDeps/package.json cannot be read
  */
-function readGlobalDepsPackage() {
+function readGlobalDepsPackage({ bundle } = {}) {
     const globalPackagePath = path.join(GLOBAL_DEPS_PATH, 'package.json');
     if (!fs.existsSync(globalPackagePath)) {
         throw new Error(
@@ -77,7 +81,7 @@ function readGlobalDepsPackage() {
             JSON.parse(fs.readFileSync(globalPackagePath, 'utf8')),
             globalPackagePath,
         ),
-        { source: globalPackagePath },
+        { source: globalPackagePath, bundle },
     );
 }
 

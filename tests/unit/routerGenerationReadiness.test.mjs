@@ -10,13 +10,9 @@ import {
     ensureRouterGenerationReady,
     readRouterGenerationHealth,
 } from '../../cli/utils/runtime/routerGenerationReadiness.mjs';
-import {
-    applyEdgeRoutingGeneration,
-    loadActiveEdgeRoutingGeneration,
-} from '../../cli/sandbox/edgeGeneration.js';
+import { applyEdgeRoutingGeneration } from '../../cli/sandbox/edgeGeneration.js';
 import {
     createRouterOriginsWorkspace,
-    installLegacyGeneration,
 } from '../helpers/routerOriginsWorkspace.mjs';
 
 const READY = Object.freeze({
@@ -128,8 +124,6 @@ test('a compatible running Router is reused without stopping or spawning', async
 
 test('legacy Router replacement is confirmed before an actual generation migration may run', async (t) => {
     const fixture = createRouterOriginsWorkspace(t, { hosts: ['pgx'] });
-    installLegacyGeneration(fixture.edgeDir, fixture.applied.selector.generation);
-    assert.equal(loadActiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace }).generation.routerOrigins, null);
     const before = migrationState(fixture);
     const events = [];
     const child = { pid: 1234, exitCode: null };
@@ -208,7 +202,6 @@ test('cold startup cleans a surviving Watchdog before spawning and verifies its 
 
 test('failed or unverified Router replacement never reaches the generation-write continuation', async (t) => {
     const fixture = createRouterOriginsWorkspace(t, { hosts: ['pgx'] });
-    installLegacyGeneration(fixture.edgeDir, fixture.applied.selector.generation);
     const before = migrationState(fixture);
     const cases = [
         ['no stop operation', {

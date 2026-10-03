@@ -260,7 +260,7 @@ test('expired workspace lease is not reaped while the owner is alive and can ren
     assert.equal(locks.releaseWorkspaceStartLock(expired), true);
 });
 
-test('fresh malformed workspace leases fail closed and become recoverable only after the stale grace', () => {
+test('malformed workspace leases require proven Box recovery even after the stale grace', () => {
     fs.mkdirSync(path.dirname(locks.WORKSPACE_START_LOCK_PATH), { recursive: true });
     fs.writeFileSync(locks.WORKSPACE_START_LOCK_PATH, '{malformed', { mode: 0o600 });
     const fresh = locks.inspectWorkspaceStartLock();
@@ -274,9 +274,11 @@ test('fresh malformed workspace leases fail closed and become recoverable only a
     const stale = new Date(Date.now() - 6_000);
     fs.utimesSync(locks.WORKSPACE_START_LOCK_PATH, stale, stale);
     const recovered = locks.inspectWorkspaceStartLock();
-    assert.equal(recovered.active, false);
-    assert.equal(recovered.stale, true);
-    assert.equal(fs.existsSync(locks.WORKSPACE_START_LOCK_PATH), false);
+    assert.equal(recovered.active, true);
+    assert.equal(recovered.recoveryRequired, true);
+    assert.equal(fs.existsSync(locks.WORKSPACE_START_LOCK_PATH), true);
+    assert.throws(() => locks.createWorkspaceMutationLease(), { code: 'PLOINKY_WORKSPACE_MUTATION_RECOVERY_REQUIRED' });
+    fs.rmSync(locks.WORKSPACE_START_LOCK_PATH);
 });
 
 test('token comparison preserves a replacement maintenance lock', async () => {
@@ -373,15 +375,59 @@ test('a lease created without a birth identity never reaps a live PID', (t) => {
     assert.equal(locks.releaseWorkspaceStartLock(owner), true);
 });
 
-test('legacy live PID leases remain protected and dead PID leases recover', (t) => {
+test('a lease without a valid owner identity is held for Box recovery even when its PID is dead', (t) => {
     mockLinuxOwnerIdentity(t);
     const owner = locks.createWorkspaceStartLock({ ttlMs: -1 });
-    delete owner.ownerIdentity;
-    fs.writeFileSync(locks.WORKSPACE_START_LOCK_PATH, JSON.stringify(owner));
-    assert.equal(locks.inspectWorkspaceStartLock().active, true);
-    owner.ownerPid = 2_147_483_647;
-    fs.writeFileSync(locks.WORKSPACE_START_LOCK_PATH, JSON.stringify(owner));
+    const { ownerIdentity } = owner;
+    const deadPid = 2_147_483_647;
+    const malformed = [
+        (record) => { delete record.ownerIdentity; },
+        (record) => { record.ownerIdentity = null; },
+        (record) => { record.ownerIdentity = 'linux-proc:100'; },
+        (record) => { record.ownerIdentity = { scope: ownerIdentity.scope }; },
+        (record) => { record.ownerIdentity = { ...ownerIdentity, startIdentity: 100 }; },
+        (record) => { delete record.ownerPid; },
+    ];
+    for (const mutate of malformed) {
+        const record = { ...owner, ownerPid: deadPid };
+        mutate(record);
+        const bytes = JSON.stringify(record);
+        fs.writeFileSync(locks.WORKSPACE_START_LOCK_PATH, bytes);
+        const state = locks.inspectWorkspaceStartLock();
+        assert.equal(state.active, true, bytes);
+        assert.equal(state.stale, false, bytes);
+        assert.equal(state.recoveryRequired, true, bytes);
+        assert.throws(() => locks.createWorkspaceMutationLease(), (error) => (
+            error?.code === 'PLOINKY_WORKSPACE_MUTATION_RECOVERY_REQUIRED'
+            && error.leasePath === locks.WORKSPACE_START_LOCK_PATH
+            && error.message.includes(locks.WORKSPACE_START_LOCK_PATH)
+        ), bytes);
+        assert.equal(locks.releaseWorkspaceStartLock(owner), false, bytes);
+        assert.equal(fs.readFileSync(locks.WORKSPACE_START_LOCK_PATH, 'utf8'), bytes);
+    }
+
+    // The same lease with its recorded identity and a dead PID is reclaimed.
+    fs.writeFileSync(locks.WORKSPACE_START_LOCK_PATH, JSON.stringify({ ...owner, ownerPid: deadPid }));
     assert.equal(locks.inspectWorkspaceStartLock().active, false);
+    assert.equal(fs.existsSync(locks.WORKSPACE_START_LOCK_PATH), false);
+});
+
+test('a truncated workspace lease is never reclaimed and names its file', (t) => {
+    t.after(() => fs.rmSync(locks.WORKSPACE_START_LOCK_PATH, { force: true }));
+    const owner = locks.createWorkspaceStartLock();
+    const bytes = JSON.stringify(owner).slice(0, 40);
+    fs.writeFileSync(locks.WORKSPACE_START_LOCK_PATH, bytes);
+    const stale = new Date(Date.now() - 6_000);
+    fs.utimesSync(locks.WORKSPACE_START_LOCK_PATH, stale, stale);
+    const state = locks.inspectWorkspaceStartLock();
+    assert.equal(state.active, true);
+    assert.equal(state.recoveryRequired, true);
+    assert.throws(() => locks.createWorkspaceMutationLease(), (error) => (
+        error?.code === 'PLOINKY_WORKSPACE_MUTATION_RECOVERY_REQUIRED'
+        && error.message.includes(locks.WORKSPACE_START_LOCK_PATH)
+    ));
+    assert.equal(locks.releaseWorkspaceStartLock(owner), false);
+    assert.equal(fs.readFileSync(locks.WORKSPACE_START_LOCK_PATH, 'utf8'), bytes);
 });
 
 test('workspace start waits for no-wait activation before acquiring its own lease', async () => {
@@ -444,4 +490,38 @@ test('scoped workspace lease recovers a dead owner but preserves inconclusive li
     t.mock.method(process, 'kill', () => { throw Object.assign(new Error('dead'), { code: 'ESRCH' }); });
     assert.equal(locks.inspectWorkspaceStartLock().active, false);
     assert.equal(fs.existsSync(locks.WORKSPACE_START_LOCK_PATH), false);
+});
+
+test('worker recovery retains the lease across owner death until exact quiescent Box cleanup', async () => {
+    const { buildWorkspaceIdentity } = await import('../../ploinky-box/identity.mjs');
+    const { retireQuiescentBoxWorkspaceStartLock } = await import('../../ploinky-box/noWaitCleanup.mjs');
+    fs.rmSync(locks.WORKSPACE_START_LOCK_PATH, { force: true });
+    const lease = locks.createWorkspaceMutationLease({ operation: 'marketplace-enable:test', requireQuiescenceOnOwnerDeath: true });
+    assert.equal(locks.retainWorkspaceMutationLeaseForRecovery({ token: 'other' }), false);
+    assert.equal(locks.retainWorkspaceMutationLeaseForRecovery({ operation: 'marketplace-enable:test' }), true);
+    assert.equal(locks.releaseWorkspaceMutationLease(lease), false);
+    const record = JSON.parse(fs.readFileSync(locks.WORKSPACE_START_LOCK_PATH, 'utf8'));
+    record.ownerPid = 2147483647;
+    fs.writeFileSync(locks.WORKSPACE_START_LOCK_PATH, JSON.stringify(record));
+    assert.equal(locks.inspectWorkspaceStartLock().recoveryRequired, true);
+    await assert.rejects(locks.acquireWorkspaceMutationLease({ waitTimeoutMs: 0 }),
+        { code: 'PLOINKY_WORKSPACE_MUTATION_RECOVERY_REQUIRED' });
+    // This is the same cleanup called only after the lifecycle layer proves
+    // the exact Box stopped or absent; no live runtime is involved in this test.
+    const identity = buildWorkspaceIdentity(workspace);
+    retireQuiescentBoxWorkspaceStartLock({ identity, lock: { assertHeld(instance) { assert.equal(instance, identity.instance); } } });
+    const next = locks.createWorkspaceMutationLease();
+    assert.equal(locks.releaseWorkspaceMutationLease(next), true);
+});
+
+test('a dead worker owner cannot silently drop an unacknowledged quiescence-required lease', (t) => {
+    const lease = locks.createWorkspaceMutationLease({ requireQuiescenceOnOwnerDeath: true });
+    const record = JSON.parse(fs.readFileSync(locks.WORKSPACE_START_LOCK_PATH, 'utf8'));
+    record.ownerPid = 2147483647;
+    record.ownerIdentity = null;
+    fs.writeFileSync(locks.WORKSPACE_START_LOCK_PATH, JSON.stringify(record));
+    t.mock.method(process, 'kill', () => { throw Object.assign(new Error('dead'), { code: 'ESRCH' }); });
+    assert.equal(locks.inspectWorkspaceStartLock().recoveryRequired, true);
+    assert.equal(locks.releaseWorkspaceMutationLease(lease), false);
+    fs.rmSync(locks.WORKSPACE_START_LOCK_PATH);
 });

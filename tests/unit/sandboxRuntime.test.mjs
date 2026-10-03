@@ -760,3 +760,124 @@ test('Ploinky box never falls back to Docker when nested Podman is missing', () 
         fs.rmSync(root, { recursive: true, force: true });
     }
 });
+
+// ------------------------------------------------------------------
+// The dispatcher in front of both native managers (Seatbelt, with a fake
+// sandbox-exec on macOS): it observes the runtime key before it rotates any
+// identity, and it replaces only the predecessor the caller names.
+
+const DISPATCH_SKIP = process.platform !== 'darwin' && 'seatbelt runs on macOS only';
+const DISPATCH_MANIFEST = { 'lite-sandbox': true, start: 'node index.js', network: { mode: 'host' }, readiness: { protocol: 'none' } };
+
+// The harness is imported lazily: loading the production config module sets
+// PLOINKY_WORKSPACE_ROOT for this process, which the earlier tests of this file
+// must not inherit.
+async function dispatchFixture(t) {
+    const {
+        CONTAINER: WIRING_CONTAINER,
+        driveWiring,
+        registration,
+        stepValue,
+        wiringWorkspace,
+    } = await import('./dependencyStoreWiringHarness.mjs');
+    const w = wiringWorkspace(t, { manifest: DISPATCH_MANIFEST, prefix: 'sandbox-dispatch-' });
+    const pids = new Set();
+    t.after(() => {
+        for (const pid of pids) {
+            try { process.kill(-pid, 'SIGKILL'); } catch { /* gone */ }
+            try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ }
+        }
+    });
+    const first = stepValue(driveWiring(w, [
+        { action: 'init-edge' },
+        { action: 'enable-sandbox' },
+        { action: 'register', containerName: WIRING_CONTAINER, record: { ...registration(), runtime: 'seatbelt', projectPath: path.join(w.ws, '.data', 'demo') } },
+        { action: 'prepare-lease' },
+        { label: 'first', action: 'ensure-with-lease', hostRouter: true, containerName: WIRING_CONTAINER, startPath: true, activate: true, routeKey: 'demo' },
+    ]), 'first');
+    pids.add(first.pid);
+    const pidFile = path.join(w.ws, '.ploinky', 'bwrap-pids', `${WIRING_CONTAINER}.pid`);
+    const registryRecord = () => JSON.parse(fs.readFileSync(path.join(w.ws, '.ploinky', 'agents.json'), 'utf8'))[WIRING_CONTAINER];
+    const alive = (pid) => {
+        try { process.kill(pid, 0); } catch { return false; }
+        const state = String(spawnSync('ps', ['-p', String(pid), '-o', 'stat='], { encoding: 'utf8' }).stdout || '').trim();
+        return Boolean(state) && !state.startsWith('Z');
+    };
+    return { w, pids, first, pidFile, registryRecord, alive, driveWiring, stepValue, CONTAINER: WIRING_CONTAINER };
+}
+
+const RESTART = (container, options) => [{
+    label: 'restart',
+    action: 'ensure-with-lease',
+    hostRouter: true,
+    containerName: container,
+    activate: true,
+    allowFailure: true,
+    options,
+}];
+
+test('the dispatcher refuses an unverifiable PID slot before rotating the registry or signalling anything', { skip: DISPATCH_SKIP }, async (t) => {
+    const f = await dispatchFixture(t);
+    const registryBefore = f.registryRecord();
+    fs.writeFileSync(f.pidFile, '{"pid": 1}\n');
+
+    const result = f.driveWiring(f.w, RESTART(f.CONTAINER, {
+        forceRecreate: true,
+        expectedPredecessor: { instanceId: registryBefore.instanceId, enableGeneration: registryBefore.enableGeneration },
+    }));
+    assert.equal(result.restart.ok, false);
+    assert.equal(result.restart.causeCode, 'PLOINKY_SANDBOX_PID_RECORD_INVALID');
+    assert.equal(f.alive(f.first.pid), true, 'no signal reached the process');
+    assert.equal(fs.readFileSync(f.pidFile, 'utf8'), '{"pid": 1}\n', 'the unverifiable record is preserved');
+    assert.deepEqual(f.registryRecord(), registryBefore, 'no identity was rotated');
+});
+
+for (const handed of ['null', 'nothing']) {
+    test(`a restart whose expected predecessor is ${handed} refuses the live registered runtime before rotating the registry`, { skip: DISPATCH_SKIP }, async (t) => {
+        const f = await dispatchFixture(t);
+        const registryBefore = f.registryRecord();
+
+        const refused = f.driveWiring(f.w, RESTART(f.CONTAINER, handed === 'null'
+            ? { forceRecreate: true, expectedPredecessor: null }
+            : { forceRecreate: true }));
+        assert.equal(refused.restart.ok, false);
+        assert.equal(refused.restart.causeCode, 'PLOINKY_SANDBOX_PID_SLOT_BUSY');
+        assert.equal(f.alive(f.first.pid), true, 'the occupant was not stopped');
+        assert.deepEqual(f.registryRecord(), registryBefore, 'the registry was not rotated');
+    });
+}
+
+test('a restart that is handed the registered tuple replaces exactly that runtime and rotates the identity', { skip: DISPATCH_SKIP }, async (t) => {
+    const f = await dispatchFixture(t);
+    const before = f.registryRecord();
+    const restarted = f.stepValue(f.driveWiring(f.w, [{
+        ...RESTART(f.CONTAINER, {
+            forceRecreate: true,
+            expectedPredecessor: { instanceId: before.instanceId, enableGeneration: before.enableGeneration },
+        })[0],
+        allowFailure: false,
+    }]), 'restart');
+    f.pids.add(restarted.pid);
+    assert.notEqual(restarted.pid, f.first.pid);
+    assert.equal(f.alive(f.first.pid), false, 'the registered predecessor exited');
+    assert.equal(f.alive(restarted.pid), true);
+    assert.notEqual(restarted.instanceId, before.instanceId, 'the successor tuple is fresh');
+    assert.equal(JSON.parse(fs.readFileSync(f.pidFile, 'utf8')).instanceId, restarted.instanceId);
+});
+
+test('a failure after a healthy runtime was reused never stops that runtime', { skip: DISPATCH_SKIP }, async (t) => {
+    const f = await dispatchFixture(t);
+    const pidBytes = fs.readFileSync(f.pidFile, 'utf8');
+    const registryBefore = f.registryRecord();
+    // Nothing needs replacing, so the dispatcher reuses the runtime; the host
+    // capability check then fails because the generation was revoked.
+    const result = f.driveWiring(f.w, [
+        { action: 'inactivate-edge' },
+        { label: 'reuse', action: 'ensure-with-lease', hostRouter: true, containerName: f.CONTAINER, allowFailure: true },
+    ]);
+    assert.equal(result.reuse.ok, false, JSON.stringify(result.reuse));
+    assert.equal(f.alive(f.first.pid), true, 'the reused runtime was not launched by this call, so a later failure never stops it');
+    assert.equal(fs.readFileSync(f.pidFile, 'utf8'), pidBytes, 'its PID record is untouched');
+    assert.doesNotMatch(result.reuse.message, /receipt transition/, 'no misleading cleanup-receipt error for a call that launched nothing');
+    assert.deepEqual(f.registryRecord(), registryBefore);
+});

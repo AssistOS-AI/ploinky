@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { canonicalAgentLibRemote, imageSourceId } from '../../agentlib/contract.mjs';
+import { imageSourceIdentity } from '../../agentlib/contract.mjs';
 import { normalizeBoxAgentLib } from '../../ploinky-box/contract/agentlib.mjs';
 
 import {
@@ -15,6 +15,7 @@ import {
     BOX_USERNS,
 } from '../../ploinky-box/constants.mjs';
 import {
+    BOX_SOURCE_MISMATCH,
     normalizeContainerRuntime,
     validateContainerConfiguration,
 } from '../../ploinky-box/contract/container.mjs';
@@ -40,6 +41,7 @@ import { hardwareStorePaths, initializeStore, readStoreSnapshot, setAgentLimits,
 import {
     agentLibFixture,
     agentLibFixtureEnv,
+    boxImageIdFixtureEnv,
     agentLibFixtureLabels,
     agentLibFixtureMounts,
 } from '../helpers/agentlibFixture.mjs';
@@ -131,6 +133,7 @@ function containerHandle({
                 ...IMAGE_CONTRACT.environment,
                 PLOINKY_WORKSPACE_ROOT: identity.workspaceRoot,
                 ...agentLibFixtureEnv(agentLib),
+                ...boxImageIdFixtureEnv(imageId),
                 PLOINKY_PRIVATE_BIND: '0.0.0.0',
                 PLOINKY_PUBLIC_BIND: '0.0.0.0',
                 PLOINKY_PUBLIC_AUTHORITY: `127.0.0.1:${hostPort}`,
@@ -520,13 +523,10 @@ for (const [name, failDuringReconcile] of [['G.first-enable-rollback-policy', fa
     });
 }
 
-function imageAgentLibFixture(commit = canonicalAgentLibRemote().commit) {
-    const imageId = `sha256:${'f'.repeat(64)}`;
-    const fingerprint = 'e'.repeat(64);
+function imageAgentLibFixture(supplyingImageId = `sha256:${'f'.repeat(64)}`) {
     return normalizeBoxAgentLib({
-        sourceDir: '/opt/ploinky-agentlib', sourceRelativePath: 'image', mode: 'image', imageId,
-        fingerprint, commit,
-        sourceId: imageSourceId(imageId, fingerprint),
+        sourceDir: '/opt/ploinky-agentlib', sourceRelativePath: 'image', mode: 'image', supplyingImageId,
+        sourceId: imageSourceIdentity(supplyingImageId),
     });
 }
 
@@ -535,18 +535,23 @@ for (const imageIdPrefix of ['', 'sha256:']) {
         const state = fixture(t);
         fs.rmSync(state.agentLib.sourceDir, { recursive: true });
         state.agentLib = imageAgentLibFixture();
-        const candidateImage = state.agentLib.imageId.replace(/^sha256:/, imageIdPrefix);
+        const candidateImage = state.agentLib.supplyingImageId.replace(/^sha256:/, imageIdPrefix);
         const h = harness(state, { candidateImage });
-        h.seams.probeAgentLib = (_engine, id, _runner, options) => {
+        h.seams.probeAgentLib = (_engine, id, _runner, ...rest) => {
             assert.equal(id, candidateImage);
-            assert.equal(options.expectedCommit, state.agentLib.commit);
-            return { fingerprint: state.agentLib.fingerprint };
+            assert.deepEqual(rest, [], 'the probe takes no expected commit or fingerprint');
+            return { supplyingImageId: state.agentLib.supplyingImageId };
         };
         const result = await reconcileBoxContainer(reconciliationArguments(state, h, null), h.seams);
         assert.equal(result.action, 'created');
         const created = h.current();
         assert.equal(created.runtime.mounts.length, 4);
         assert.equal(created.runtime.environment.PLOINKY_AGENTLIB_MODE, 'image');
+        assert.equal(created.runtime.environment.PLOINKY_BOX_IMAGE_ID, state.agentLib.supplyingImageId,
+            'the outer image ID is set once at creation, in canonical form');
+        assert.equal(Object.hasOwn(created.runtime.environment, 'PLOINKY_AGENTLIB_FINGERPRINT'), false);
+        assert.equal(Object.hasOwn(created.runtime.environment, 'PLOINKY_AGENTLIB_COMMIT'), false);
+        assert.equal(Object.hasOwn(created.labels, 'io.assistos.ploinky-box.agentlib-fingerprint'), false);
         const callsBefore = h.calls.length;
         const reused = await reconcileBoxContainer(reconciliationArguments(state, h, created), h.seams);
         assert.equal(reused.action, 'reused');
@@ -560,26 +565,24 @@ for (const imageIdPrefix of ['', 'sha256:']) {
     });
 }
 
-test('X1 an image commit that differs from the lock creates the Box once and is then reused', async t => {
-    const other = '9'.repeat(40);
+test('X1 an image source creates the Box once and is then reused; no revision reaches its labels or environment', async t => {
     const state = fixture(t);
     fs.rmSync(state.agentLib.sourceDir, { recursive: true });
-    state.agentLib = imageAgentLibFixture(other);
-    const h = harness(state, { candidateImage: state.agentLib.imageId });
+    state.agentLib = imageAgentLibFixture();
+    const h = harness(state, { candidateImage: state.agentLib.supplyingImageId });
     const probed = [];
-    h.seams.probeAgentLib = (_engine, _id, _runner, options) => {
-        probed.push(options.expectedCommit);
-        return { fingerprint: state.agentLib.fingerprint };
+    h.seams.probeAgentLib = (_engine, id) => {
+        probed.push(id);
+        return { supplyingImageId: state.agentLib.supplyingImageId };
     };
     const result = await reconcileBoxContainer(reconciliationArguments(state, h, null), h.seams);
     assert.equal(result.action, 'created');
-    assert.deepEqual(probed, [other]);
+    assert.deepEqual(probed, [state.agentLib.supplyingImageId]);
     const create = h.calls.find(call => call[0] === 'run' && call[2] === 'container' && call[3] === 'create');
-    assert.ok(create.includes(`io.assistos.ploinky-box.agentlib-commit=${other}`));
-    assert.ok(create.includes(`PLOINKY_AGENTLIB_COMMIT=${other}`));
+    assert.equal(create.some(value => /agentlib-commit|PLOINKY_AGENTLIB_COMMIT|agentlib-fingerprint|PLOINKY_AGENTLIB_FINGERPRINT/.test(value)), false);
+    assert.ok(create.includes(`PLOINKY_BOX_IMAGE_ID=${state.agentLib.supplyingImageId}`));
     const created = h.current();
-    assert.equal(created.labels['io.assistos.ploinky-box.agentlib-commit'], other);
-    assert.equal(created.runtime.environment.PLOINKY_AGENTLIB_COMMIT, other);
+    assert.equal(created.runtime.environment.PLOINKY_BOX_IMAGE_ID, state.agentLib.supplyingImageId);
     const callsBefore = h.calls.length;
     const reused = await reconcileBoxContainer(reconciliationArguments(state, h, created), h.seams);
     assert.equal(reused.action, 'reused');
@@ -604,12 +607,12 @@ test('failed image-bundle replacement restores the old image without host source
     state.agentLib = imageAgentLibFixture();
     const initial = containerHandle({
         identity: state.identity, agentLib: state.agentLib, repositoryRoot: state.root,
-        imageId: state.agentLib.imageId, imageRef: BOX_IMAGE_REFERENCE, hostPort: 8080,
+        imageId: state.agentLib.supplyingImageId, imageRef: BOX_IMAGE_REFERENCE, hostPort: 8080,
         id: 'e'.repeat(64),
     });
-    const h = harness(state, { initial, candidateImage: state.agentLib.imageId, failCandidateReady: true });
+    const h = harness(state, { initial, candidateImage: state.agentLib.supplyingImageId, failCandidateReady: true });
     let probes = 0;
-    h.seams.probeAgentLib = () => { probes += 1; return { fingerprint: state.agentLib.fingerprint }; };
+    h.seams.probeAgentLib = () => { probes += 1; return { supplyingImageId: state.agentLib.supplyingImageId }; };
     await assert.rejects(reconcileBoxContainer(reconciliationArguments(state, h, initial, true), h.seams), /ready timeout/);
     assert.equal(h.current().runtime.imageId, initial.runtime.imageId);
     assert.equal(h.current().labels[BOX_LABELS.routerHostPort], '8080');
@@ -688,6 +691,9 @@ test('container argv is exact, unprivileged, and ends with immutable image ID', 
     assert.equal(args.includes(`PLOINKY_AGENTLIB_DIR=/opt/ploinky-agentlib`), true);
     assert.equal(args.includes(`PLOINKY_AGENTLIB_MODE=local`), true);
     assert.equal(args.includes(`PLOINKY_AGENTLIB_FINGERPRINT=${state.agentLib.fingerprint}`), true);
+    // The engine-observed outer image ID is set once, independent of the Achilles mode.
+    assert.equal(args.filter((value) => value.startsWith('PLOINKY_BOX_IMAGE_ID=')).length, 1);
+    assert.equal(args.includes(`PLOINKY_BOX_IMAGE_ID=sha256:${'a'.repeat(64)}`), true);
     for (const mount of mountArgs) {
         assert.equal(path.isAbsolute(mount.split(':')[0]), true);
         assert.equal(mount.includes(state.identity.instance), false);
@@ -1015,6 +1021,116 @@ test('a stale seccomp fingerprint is rejected before stopped Box reuse or start'
     }), /label set is incompatible/);
     assert.equal(current.runtime.running, false);
     assert.equal(current.runtime.status, 'exited');
+});
+
+function otherCheckout(state) {
+    const root = path.join(state.root, 'other-checkout');
+    const profile = nestedPodmanSeccompProfilePath(root);
+    fs.mkdirSync(path.dirname(profile), { recursive: true });
+    fs.copyFileSync(
+        new URL('../../ploinky-box/seccomp/podman-nested-pid-fallback.json', import.meta.url),
+        profile,
+    );
+    return root;
+}
+
+test('a Box created by another Ploinky checkout is named before any other contract comparison', (t) => {
+    const state = fixture(t);
+    const creator = otherCheckout(state);
+    const handle = containerHandle({
+        identity: state.identity,
+        agentLib: state.agentLib,
+        repositoryRoot: creator,
+        imageId: 'd'.repeat(64),
+        imageRef: BOX_IMAGE_REFERENCE,
+        hostPort: 8080,
+        id: 'e'.repeat(64),
+    });
+    const desired = {
+        identity: state.identity,
+        agentLib: state.agentLib,
+        repositoryRoot: state.root,
+        imageId: 'd'.repeat(64),
+        imageRef: BOX_IMAGE_REFERENCE,
+        hostPort: 8080,
+    };
+    assert.throws(() => validateContainerConfiguration(handle, desired), (error) => {
+        assert.equal(error.code, BOX_SOURCE_MISMATCH);
+        assert.ok(error.message.includes(`runs Ploinky from ${creator},`), error.message);
+        assert.ok(error.message.includes(`this command runs Ploinky from ${state.root}.`), error.message);
+        assert.ok(error.message.includes(path.join(creator, 'bin', 'ploinky')), error.message);
+        assert.match(error.message, /'ploinky stop' and 'ploinky destroy' here/);
+        assert.doesNotMatch(error.message, /security options|mount set/);
+        return true;
+    });
+    // The creating checkout still admits its own Box unchanged.
+    assert.doesNotThrow(() => validateContainerConfiguration(handle, { ...desired, repositoryRoot: creator }));
+});
+
+test('the creating checkout still rejects a foreign seccomp profile path', (t) => {
+    const state = fixture(t);
+    const foreign = otherCheckout(state);
+    const handle = containerHandle({
+        identity: state.identity,
+        agentLib: state.agentLib,
+        repositoryRoot: state.root,
+        imageId: 'd'.repeat(64),
+        imageRef: BOX_IMAGE_REFERENCE,
+        hostPort: 8080,
+        id: 'e'.repeat(64),
+    });
+    handle.runtime.securityOptions = handle.runtime.securityOptions.map((option) => (
+        option.startsWith('seccomp=') ? `seccomp=${nestedPodmanSeccompProfilePath(foreign)}` : option
+    ));
+    assert.throws(() => validateContainerConfiguration(handle, {
+        identity: state.identity,
+        agentLib: state.agentLib,
+        repositoryRoot: state.root,
+        imageId: 'd'.repeat(64),
+        imageRef: BOX_IMAGE_REFERENCE,
+        hostPort: 8080,
+    }), (error) => {
+        assert.equal(error.code, 'PLOINKY_BOX_PUBLICATION_INCOMPATIBLE');
+        assert.match(error.message, /security options are incompatible; back up any Box-only data/);
+        return true;
+    });
+});
+
+test('reconciliation from another checkout mutates no container, image or data', async (t) => {
+    // Running or stopped, and with a candidate image ('c') that differs from
+    // the Box's ('d'), the source check refuses before any reuse or
+    // replacement decision, so an update preflight refusal changes no outcome.
+    for (const running of [true, false]) {
+        const state = fixture(t);
+        const creator = otherCheckout(state);
+        const current = containerHandle({
+            identity: state.identity,
+            agentLib: state.agentLib,
+            repositoryRoot: creator,
+            imageId: 'd'.repeat(64),
+            imageRef: BOX_IMAGE_REFERENCE,
+            hostPort: 8080,
+            id: 'e'.repeat(64),
+            running,
+        });
+        const h = harness(state, { initial: current });
+        await assert.rejects(() => reconcileBoxContainer({
+            identity: state.identity,
+            agentLib: state.agentLib,
+            ownership: { state: 'owned', handles: { container: current } },
+            engine: { name: 'podman', identity: 'engine' },
+            runner: h.runner,
+            lock: state.lock,
+            repositoryRoot: state.root,
+            imageRef: BOX_IMAGE_REFERENCE,
+        }, h.seams), (error) => error.code === BOX_SOURCE_MISMATCH);
+        assert.equal(current.runtime.running, running);
+        for (const verb of ['container stop', 'container rm', 'container create', 'container start']) {
+            assert.equal(h.calls.some((call) => call.join(' ').includes(verb)), false, `${running}: ${verb}`);
+        }
+        assert.equal(h.calls.some((call) => call.includes('pull')), false);
+        assert.equal(h.calls.some((call) => call.join(' ').includes('stop-ploinky-local')), false);
+    }
 });
 
 test('stopped reuse baseline failure mutates no container or image state', async (t) => {
@@ -1986,4 +2102,103 @@ test('two workspaces render independent identities and same-path binds', (t) => 
     assert.equal(rendered[0].some((value) => value.includes(second)), false);
     assert.equal(rendered[1].includes(`${second}:${second}`), true);
     assert.equal(rendered[1].some((value) => value.startsWith(`${first}:`) || value === `PLOINKY_WORKSPACE_ROOT=${first}`), false);
+});
+
+test('a Box that needs replacement is refused before any mutation when replacement is not allowed', async (t) => {
+    const state = fixture(t);
+    const old = containerHandle({
+        identity: state.identity,
+        agentLib: state.agentLib,
+        repositoryRoot: state.root,
+        imageId: 'd'.repeat(64),
+        imageRef: BOX_IMAGE_REFERENCE,
+        hostPort: 18080,
+        mediaHostPort: 17880,
+        id: 'e'.repeat(64),
+    });
+    const h = harness(state, { initial: old });
+    await assert.rejects(() => reconcileBoxContainer({
+        identity: state.identity,
+        agentLib: state.agentLib,
+        ownership: { state: 'owned', handles: { container: old } },
+        engine: { name: 'podman', identity: 'engine' },
+        runner: h.runner,
+        lock: state.lock,
+        repositoryRoot: state.root,
+        // A different publication requires replacement.
+        explicitPort: 19090,
+        allowReplacement: false,
+    }, h.seams), { code: 'PLOINKY_BOX_REPLACEMENT_REFUSED' });
+    assert.equal(h.current(), old);
+    assert.equal(h.current().runtime.running, true);
+    for (const forbidden of ['preflight', 'stop-ploinky-local', 'container rm', 'container create', 'container stop', ' pull']) {
+        assert.equal(h.calls.some(call => call.join(' ').includes(forbidden)), false, forbidden);
+    }
+});
+
+test('replacement validation is non-settling while finalization ends rollback authority', async (t) => {
+    for (const settle of [false, true]) {
+        const state = fixture(t);
+        const old = containerHandle({
+            identity: state.identity,
+            agentLib: state.agentLib,
+            repositoryRoot: state.root,
+            imageId: 'd'.repeat(64),
+            imageRef: BOX_IMAGE_REFERENCE,
+            hostPort: 18080,
+            mediaHostPort: 17880,
+            id: 'e'.repeat(64),
+        });
+        const h = harness(state, { initial: old });
+        const result = await reconcileBoxContainer({
+            identity: state.identity,
+            agentLib: state.agentLib,
+            ownership: { state: 'owned', handles: { container: old } },
+            engine: { name: 'podman', identity: 'engine' },
+            runner: h.runner,
+            lock: state.lock,
+            repositoryRoot: state.root,
+            explicitPort: 19090,
+        }, h.seams);
+        assert.equal(result.action, 'replaced');
+        result.validate();
+        result.validate();
+        if (settle) {
+            result.finalize();
+            assert.throws(() => result.validate(), /already settled/);
+            assert.deepEqual(await result.rollback(), { action: 'already-settled' });
+        } else {
+            const rolledBack = await result.rollback();
+            assert.equal(rolledBack.action, 'restored');
+            assert.equal(h.current().runtime.imageId, 'd'.repeat(64));
+        }
+    }
+});
+
+test('reused Boxes expose the same exact-ownership validation without settling', async (t) => {
+    const state = fixture(t);
+    const current = containerHandle({
+        identity: state.identity,
+        agentLib: state.agentLib,
+        repositoryRoot: state.root,
+        imageId: 'd'.repeat(64),
+        imageRef: BOX_IMAGE_REFERENCE,
+        hostPort: 8080,
+        id: 'e'.repeat(64),
+    });
+    const h = harness(state, { initial: current });
+    const result = await reconcileBoxContainer({
+        identity: state.identity,
+        agentLib: state.agentLib,
+        ownership: { state: 'owned', handles: { container: current } },
+        engine: { name: 'podman', identity: 'engine' },
+        runner: h.runner,
+        lock: state.lock,
+        repositoryRoot: state.root,
+        allowReplacement: false,
+    }, h.seams);
+    assert.equal(result.action, 'reused');
+    result.validate();
+    h.current().runtime.running = false;
+    assert.throws(() => result.validate());
 });

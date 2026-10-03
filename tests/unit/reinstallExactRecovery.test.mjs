@@ -101,7 +101,7 @@ function fixture({ strictLegacyRemoval = false, foreign = false, removeFails = f
     const endpoint = { mode: 'bridge' };
     const context = {
         path, fs, resolveAgentRepositoryName,
-        console: { log() {}, error(message) { errors.push(message); } },
+        console: { log() {}, warn() {}, error(message) { errors.push(message); } },
         resolvePersistedRouterPort: () => 8080,
         agentsSvc: { resolveEnabledAgentRecord: () => ({ containerName: NAME, record: loadAgentsMap()[NAME] }) },
         utils: { findAgent: () => ({ repo: 'Example', shortAgentName: 'failed', manifestPath }) },
@@ -159,6 +159,21 @@ function fixture({ strictLegacyRemoval = false, foreign = false, removeFails = f
         },
         cleanupFailedPreparedRuntime: (value, error) => calls.push(['cleanup-failure', error.message]),
         execSync: () => Buffer.from('123'),
+        issueDependencyRebuildRequest(name, options) {
+            assert.equal(name, NAME);
+            assert.equal(options.lease, workspaceMutationLease);
+            calls.push(['rebuild-request', name]);
+            return { registration: name, token: 'rebuild-token', reused: false };
+        },
+        settleDependencyRebuildRequest(name, token, options) {
+            calls.push([`rebuild-${options.outcome}`, token]);
+        },
+        runtimeCarriesRebuildToken: () => true,
+        reportDependencyCollection: (value) => value,
+        collectDependencyObjectsAfterAdmission(options) {
+            assert.equal(options.lease, workspaceMutationLease);
+            calls.push(['collect', options.reason]);
+        },
     };
     return { run: vm.runInNewContext(`(${reinstallAgent.toString()})`, context), calls, errors,
         get current() { return current; } };
@@ -168,7 +183,8 @@ test('actual reinstall removal recovers the failed exited runtime ID and reaches
     const state = fixture();
     await state.run('chosen-name');
     assert.deepEqual(state.calls.map(([step]) => step), [
-        'retire-preparation', 'remove-exact', 'clear-liveness', 'retry-install', 'readiness', 'activate',
+        'rebuild-request', 'retire-preparation', 'remove-exact', 'clear-liveness', 'retry-install', 'readiness', 'activate',
+        'rebuild-admitted', 'collect',
     ]);
     assert.equal(state.current.Id, NEW_ID);
     assert.deepEqual(state.errors, []);

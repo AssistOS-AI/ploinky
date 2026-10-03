@@ -73,11 +73,11 @@ test('watchdog policy rejection is terminal before target or timer creation and 
     assert.equal(respawned.targets.get('unsafe_runtime').pendingRestartTimer, null);
 });
 
-test('watchdog treats selected-profile legacy storage as terminal agent-data policy', () => {
+test('watchdog treats a selected-profile controller-root volume as terminal agent-data policy', () => {
     fs.writeFileSync(manifestFile, JSON.stringify({
         container: 'node:20-alpine',
         profiles: {
-            default: { volumes: { '.ploinky/shared/legacy': '/legacy' } },
+            default: { volumes: { '.ploinky/deps/store': '/store' } },
         },
     }));
     const ledger = path.join(ploinkyDir, 'running', 'agent-data-terminal-ledger.json');
@@ -94,7 +94,7 @@ test('watchdog treats selected-profile legacy storage as terminal agent-data pol
 
     fs.writeFileSync(manifestFile, JSON.stringify({
         container: 'node:20-alpine',
-        volumes: { '.ploinky/data/legacy': '/legacy' },
+        volumes: { '.ploinky/data/router-security': '/router-security' },
     }));
     syncManagedContainers(respawned);
     assert.equal(respawned.targets.size, 0);

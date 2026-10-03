@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import net from 'node:net';
+import { EventEmitter } from 'node:events';
 import test from 'node:test';
 
 import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
@@ -427,4 +428,25 @@ test('TCP probes bind the requested address and reject addresses this host does 
         () => probeTcpAvailability(port, { host: '192.0.2.1' }),
         { code: 'PLOINKY_BOX_BIND_ADDRESS_UNASSIGNED' },
     );
+});
+
+test('wildcard TCP availability rejects a specific-address listener even if wildcard bind would succeed', async () => {
+    const checked = [];
+    const available = await probeTcpAvailability(19090, {
+        host: '0.0.0.0',
+        listAddresses: () => ['127.0.0.1', '10.20.30.40'],
+        createServer() {
+            const server = new EventEmitter();
+            server.listen = ({ host }, callback) => {
+                checked.push(host);
+                queueMicrotask(() => host === '10.20.30.40'
+                    ? server.emit('error', Object.assign(new Error('busy'), { code: 'EADDRINUSE' }))
+                    : callback());
+            };
+            server.close = callback => callback();
+            return server;
+        },
+    });
+    assert.equal(available, false);
+    assert.deepEqual(checked, ['127.0.0.1', '10.20.30.40']);
 });

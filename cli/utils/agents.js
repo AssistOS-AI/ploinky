@@ -19,7 +19,13 @@ import {
 import { findAgent } from './utils.js';
 import { getRuntimeForAgent, isSandboxRuntime } from '../sandbox/docker/common.js';
 import { resolveLlmRuntimeAdmissionContext } from '../sandbox/docker/llmRuntimeIntegration.js';
-import { isBwrapProcessRunning, stopBwrapProcess } from '../sandbox/bwrap/bwrapFleet.js';
+import {
+    isBwrapProcessRunning,
+    classifyRecordRuntime,
+    observeSandboxRuntime,
+    registeredRuntimeTuple,
+    stopBwrapProcess,
+} from '../sandbox/bwrap/bwrapFleet.js';
 import { REPOS_DIR, PLOINKY_WORKSPACE_ROOT } from './config.js';
 import { resolveAgentRepositoryPath } from './agentRepositorySource.mjs';
 import { resolveManifestRuntimeProfile } from './runtime/profileService.js';
@@ -46,18 +52,26 @@ import {
     prepareAdditiveEdgeRoutingGeneration,
     prepareEdgeRoutingGeneration,
     prepareHostModeCapabilityForInactiveGeneration,
+    readEdgeRoutingSelection,
+    resolveEdgeGenerationPaths,
     withEdgeGenerationApplyLock,
 } from '../sandbox/edgeGeneration.js';
 import { applyEdgeRoutingGeneration } from '../sandbox/coordinatedEdgeApply.js';
 import { resolveManifestStartup } from './runtime/manifestStartup.js';
-import { withNetworkLifecycleLock } from '../sandbox/networkLifecycle.js';
+import {
+    NETWORK_LOCK_WAIT_MS,
+    withNetworkLifecycleLock,
+    withNetworkLifecycleLockAsync,
+} from '../sandbox/networkLifecycle.js';
+import { withHeldOrAcquiredWorkspaceMutationLease } from './runtime/maintenanceLocks.js';
 import {
     admitManifestRuntimeCapabilities,
     assertRuntimeAdmissionCurrent,
 } from '../sandbox/runtimeCapabilities.js';
 import {
     createAgentSymlinks,
-    removeAgentSymlinks,
+    getAgentCodePath,
+    getAgentSkillsPath,
     createAgentWorkDir,
     removeAgentWorkDir,
     getAgentDataDir
@@ -65,6 +79,7 @@ import {
 import {
     AGENT_ALIAS_PATTERN,
     RESERVED_AGENT_REGISTRY_KEYS,
+    parseQualifiedAgentReference,
     resolveEnabledAgentRecordFromMap,
 } from './agentRegistryResolver.js';
 import { retireNoWaitRunMarkers } from '../commands/noWaitMarkerLifecycle.js';
@@ -416,6 +431,7 @@ function resolveAgentEnableInput({
         repoName,
         routerEndpoint,
         runtimeAdmission,
+        runtimeKind,
         shortAgentName,
     };
 }
@@ -439,6 +455,7 @@ function planAgentEnable({
         repoName,
         routerEndpoint,
         runtimeAdmission,
+        runtimeKind,
         shortAgentName,
     } = resolvedInput || resolveAgentEnableInput({ agentName, mode, repoNameParam, authOptions });
     const alias = normalizeAlias(aliasParam);
@@ -524,6 +541,10 @@ function planAgentEnable({
         runMode,
         develRepo: runMode === 'devel' ? String(normalized.repoNameParam || '') : undefined,
         type: 'agent',
+        // A native backend is recorded as soon as it is selected, so a record
+        // is never runtime-less once a native process can exist for it. The
+        // container engine is not resolved here; it is recorded at launch.
+        ...(runtimeKind === 'seatbelt' || runtimeKind === 'bwrap' ? { runtime: runtimeKind } : {}),
         instanceId,
         enableGeneration,
         config: {
@@ -801,7 +822,11 @@ export async function withMpsEnablePreparation(request, stage, {
 
 export async function enableAgent(agentName, mode, repoNameParam, aliasParam, authModeParam, authOptions = {}) {
     const request = { agentName, mode, repoNameParam, aliasParam, authModeParam, authOptions };
-    return withMpsEnablePreparation(request, async ({ mps, mpsLaunch }) => {
+    // Enabling mutates the registry and admits a runtime: hold the workspace
+    // mutation lease (reusing one this process already holds) for the whole
+    // operation, before any runtime lock. The GPU peers are coordinated (under
+    // the network lifecycle lock) only after the lease is held.
+    return withHeldOrAcquiredWorkspaceMutationLease({ operation: 'agent-enable' }, async () => withMpsEnablePreparation(request, async ({ mps, mpsLaunch }) => {
     let prepared;
     try {
         prepared = prepareAgentEnableBatch([{
@@ -852,6 +877,9 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
                 enableGeneration,
                 forceRecreate: true,
                 forceRecreateReason: 'agent enable',
+                // The record this enable replaces, captured before the batch
+                // rotated the registry, is the only runtime it may stop.
+                expectedPredecessor: registeredRuntimeTuple(prepared.previousAgents?.[containerName]),
                 preservePreparedRegistryRecord: true,
                 preparedRegistryRecord: record,
                 preparationLease: prepared.preparedGeneration?.preparationLease,
@@ -946,7 +974,7 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
             error,
         );
     }
-    });
+    }));
 }
 
 function routeKeyForEnabledRecord(record) {
@@ -971,6 +999,99 @@ function removeDisabledRoutes(routing, disabledRecords) {
         }
     }
     return next;
+}
+
+// Disabling rewrites the registry, routing sources and edge selector, then
+// removes a runtime. Serialize it like every other lifecycle transaction: the
+// workspace mutation lease first (no-wait workers take the network lock only
+// inside it), then a bounded wait for the network lifecycle lock. Both stay
+// held across registry resolution, staging, physical removal and the selector
+// commit, so a disable that waited never writes back a stale registry and its
+// removal and commit inherit the network capability instead of failing fast.
+function withAgentDisableLocks(operation, dependencies, callback) {
+    const withWorkspaceLease = dependencies.withWorkspaceLeaseImpl || withHeldOrAcquiredWorkspaceMutationLease;
+    const withNetworkLock = dependencies.withNetworkLockImpl || withNetworkLifecycleLockAsync;
+    const leaseOptions = dependencies.workspaceLeaseWaitMs === undefined
+        ? { operation }
+        : { operation, waitTimeoutMs: dependencies.workspaceLeaseWaitMs };
+    return withWorkspaceLease(leaseOptions, () => withNetworkLock(
+        () => callback(),
+        { waitMs: dependencies.networkLockWaitMs ?? NETWORK_LOCK_WAIT_MS },
+    ));
+}
+
+// The edge generation digest covers the raw registry and routing bytes, so a
+// rollback restores exactly what was read; re-serialized objects could select
+// a different generation than the one this disable inactivated.
+function snapshotDisableSources() {
+    const paths = resolveEdgeGenerationPaths();
+    const capture = (file) => {
+        try {
+            return { bytes: fs.readFileSync(file), mode: fs.statSync(file).mode & 0o777 };
+        } catch (error) {
+            if (error?.code === 'ENOENT') return null;
+            throw error;
+        }
+    };
+    let selector = null;
+    try { selector = readEdgeRoutingSelection().selector; } catch (_) {}
+    return {
+        selector,
+        files: [paths.agentsFile, paths.routingFile].map((file) => [file, capture(file)]),
+    };
+}
+
+function restoreDisableSources(snapshot) {
+    for (const [file, saved] of snapshot?.files || []) {
+        if (!saved) {
+            fs.rmSync(file, { force: true });
+            continue;
+        }
+        const temporary = `${file}.${process.pid}.${Date.now()}.restore.tmp`;
+        fs.writeFileSync(temporary, saved.bytes, { mode: saved.mode });
+        fs.renameSync(temporary, file);
+    }
+}
+
+// Runtime removal was refused before any runtime was signalled or removed, so
+// the disable did not happen. Restore the exact registry and routing bytes and,
+// when this disable inactivated an active generation, reactivate exactly that
+// generation. Anything that cannot be proven identical stays inactive.
+function rollBackRefusedAgentDisable(prepared, snapshot, refusal, {
+    message,
+    reason,
+    withApplyLock = withEdgeGenerationApplyLock,
+    abortPreparation = abortEdgeRoutingPreparation,
+    applyGeneration = applyEdgeRoutingGeneration,
+    inactivateGeneration = inactivateEdgeRoutingGeneration,
+    restoreSourcesImpl = restoreDisableSources,
+} = {}) {
+    let restored = false;
+    let outcome;
+    try {
+        withApplyLock((applyLockCapability) => {
+            abortPreparation(prepared?.preparationLease, { reason, applyLockCapability });
+            restoreSourcesImpl(snapshot);
+            restored = true;
+        }, { preparationLease: prepared?.preparationLease });
+        const prior = snapshot?.selector;
+        if (prior?.state === 'active' && prior.generation) {
+            applyGeneration({ reason, expectedGeneration: prior.generation });
+            outcome = 'its registration and routing were restored';
+        } else {
+            outcome = 'its registration and routing were restored; the routing generation was not active before this disable and stays inactive';
+        }
+    } catch (restoreError) {
+        try { inactivateGeneration(`${reason}-failed`, { preserveSelectedGeneration: true }); } catch (_) {}
+        try { abortPreparation(prepared?.preparationLease, { reason: `${reason}-failed` }); } catch (_) {}
+        outcome = restored
+            ? `its registration and routing were restored, but the prior routing generation could not be reactivated (${restoreError?.message || restoreError}); routing stays inactive`
+            : `restoring its prior registration failed (${restoreError?.message || restoreError}); routing stays inactive`;
+    }
+    const error = new Error(`${message}: runtime removal was refused before the runtime was touched (${refusal?.message || refusal}); ${outcome}`);
+    error.code = 'PLOINKY_AGENT_DISABLE_REFUSED';
+    error.cause = refusal;
+    return error;
 }
 
 function stageAgentDisableGeneration(map, disabledRecords, {
@@ -1033,33 +1154,179 @@ function removeDisabledRuntimes(disabledRecords, {
     isSandboxRuntimeImpl = isSandboxRuntime,
     stopSandboxImpl = stopBwrapProcess,
     sandboxRunningImpl = isBwrapProcessRunning,
+    sandboxObserveImpl = observeSandboxRuntime,
+    classifyRecordRuntimeImpl = classifyRecordRuntime,
     containerExistsImpl = containerExists,
 } = {}) {
     const containerTargets = [];
     const containerRecords = {};
+    let sandboxSignalled = false;
+    // Classify and observe every native target before the first signal: a
+    // runtime whose owner cannot be verified refuses the whole removal while
+    // nothing has been touched, so the caller restores the registration.
+    const nativeTargets = new Set();
     for (const { containerName, record } of disabledRecords) {
         if (isSandboxRuntimeImpl(record?.runtime)) {
+            nativeTargets.add(containerName);
+        } else if (!record?.runtime) {
+            const classified = classifyRecordRuntimeImpl(containerName, record);
+            if (classified.kind === 'native') nativeTargets.add(containerName);
+            else if (classified.kind === 'unknown') {
+                const error = new Error(`sandbox runtime '${containerName}' could not be verified (${classified.observation?.reason}); nothing was stopped`);
+                error.runtimeUntouched = true;
+                throw error;
+            }
+        }
+        if (nativeTargets.has(containerName)) {
+            const observed = sandboxObserveImpl(containerName);
+            if (observed?.state === 'unknown') {
+                const error = new Error(`sandbox runtime '${containerName}' could not be verified (${observed.reason}); nothing was stopped`);
+                error.runtimeUntouched = true;
+                throw error;
+            }
+        }
+    }
+    for (const { containerName, record } of disabledRecords) {
+        if (nativeTargets.has(containerName)) {
+            sandboxSignalled = true;
             stopSandboxImpl(containerName);
             if (sandboxRunningImpl(containerName)) {
                 throw new Error(`sandbox runtime '${containerName}' is still running`);
+            }
+            // A stop is complete only when the exact process is observed gone;
+            // an unverifiable slot is never reported as removed.
+            const remaining = sandboxObserveImpl(containerName);
+            if (remaining?.state !== 'absent') {
+                throw new Error(`sandbox runtime '${containerName}' is still running or its stop could not be verified (${remaining?.state}: ${remaining?.reason})`);
             }
         } else {
             containerTargets.push(containerName);
             containerRecords[containerName] = record;
         }
     }
+    const preserved = new Map();
+    const onPreserved = (entry) => { preserved.set(entry.name, entry); };
+    let removed = [];
     if (containerTargets.length === 1) {
-        stopAndRemoveImpl(containerTargets[0], { records: containerRecords });
+        removed = stopAndRemoveImpl(containerTargets[0], { records: containerRecords, onPreserved }) || [];
     } else if (containerTargets.length > 1) {
-        stopAndRemoveManyImpl(containerTargets, { records: containerRecords });
+        removed = stopAndRemoveManyImpl(containerTargets, { records: containerRecords, onPreserved }) || [];
     }
     const retained = containerTargets.filter((containerName) => containerExistsImpl(containerName));
     if (retained.length) {
-        throw new Error(`runtime removal left existing container(s): ${retained.join(', ')}`);
+        const reasons = retained
+            .filter((containerName) => preserved.has(containerName))
+            .map((containerName) => `${containerName}: ${preserved.get(containerName).error?.message || 'preserved'}`);
+        const error = new Error(`runtime removal left existing container(s): ${retained.join(', ')}`
+            + (reasons.length ? ` (${reasons.join('; ')})` : ''));
+        // Untouched only on positive evidence: nothing was signalled or
+        // removed, and every retained runtime was refused before its first
+        // signal. Anything else leaves uncertain runtime state and fails closed.
+        if (!sandboxSignalled && removed.length === 0
+            && [...preserved.values()].every((entry) => entry.runtimeTouched === false)
+            && retained.every((containerName) => preserved.get(containerName)?.runtimeTouched === false)) {
+            error.runtimeUntouched = true;
+        }
+        throw error;
     }
 }
 
-export function disableAgent(agentRef, dependencies = {}) {
+function configuredStaticRegistration(map, config, readRoutingImpl = loadRoutingConfig) {
+    const container = String(config?.static?.container || '').trim();
+    if (container) return container;
+    const reference = String(config?.static?.agent || '').trim();
+    if (!reference) return null;
+    try {
+        const selected = resolveEnabledAgentRecordFromMap(reference, map);
+        if (selected && (!selected.record.alias || selected.record.alias === reference || selected.containerName === reference)) {
+            return selected.containerName;
+        }
+    } catch (_) {}
+    const routedAlias = configuredRoutedStaticAlias(map, reference, readRoutingImpl);
+    if (routedAlias) return routedAlias;
+    // A configured bare/qualified primary can acquire additional aliases later.
+    // Without an exact routed alias, they do not replace the primary selection.
+    const primaryRecords = Object.fromEntries(Object.entries(map || {}).filter(([, record]) =>
+        record?.type === 'agent' && !String(record.alias || '').trim()));
+    try {
+        const primary = resolveEnabledAgentRecordFromMap(reference, primaryRecords);
+        if (primary) return primary.containerName;
+    } catch (_) {}
+    return null;
+}
+
+function configuredRoutedStaticAlias(map, reference, readRoutingImpl) {
+    // Workspace start normalizes an alias selection to its qualified source.
+    // Only the matching exact routed alias can distinguish that selection from
+    // a configured primary which is currently stopped and unregistered.
+    const source = parseQualifiedAgentReference(reference);
+    if (!source.qualified || source.malformed) return null;
+    let routing;
+    try { routing = readRoutingImpl(); } catch (_) { return null; }
+    const routedContainer = String(routing?.static?.container || '').trim();
+    const routedSource = parseQualifiedAgentReference(String(routing?.static?.agent || '').trim());
+    const record = map?.[routedContainer];
+    if (!record || record.type !== 'agent' || !record.alias
+        || record.repoName !== source.repoName || record.agentName !== source.agentName
+        || routedSource.malformed || routedSource.repoName !== source.repoName
+        || routedSource.agentName !== source.agentName) return null;
+    const route = routing?.routes?.[record.alias];
+    if (!route || route.container !== routedContainer || route.repo !== record.repoName
+        || route.agent !== record.agentName || route.alias !== record.alias) return null;
+    return routedContainer;
+}
+
+function sourceDirectoryIdentity(target) {
+    const realpath = fs.realpathSync(target);
+    const stat = fs.statSync(realpath, { bigint: true });
+    if (!stat.isDirectory()) throw new Error(`Agent source is not a directory: ${target}`);
+    return { realpath, device: stat.dev, inode: stat.ino };
+}
+
+function agentSourceDirectories(record) {
+    const root = path.join(resolveAgentRepositoryPath(record.repoName), record.agentName);
+    const code = path.join(root, 'code');
+    const skills = path.join(root, 'skills');
+    return {
+        code: sourceDirectoryIdentity(fs.existsSync(code) ? code : root),
+        skills: fs.existsSync(skills) ? sourceDirectoryIdentity(skills) : null,
+    };
+}
+
+function sameSourceDirectory(left, right) {
+    return Boolean(left && right && (left.realpath === right.realpath
+        || left.device === right.device && left.inode === right.inode));
+}
+
+// These two lookups are shared by source name, not owned by an individual
+// alias. Remove only a link into the retired source when no surviving exact
+// principal or physical-source consumer can still need it.
+function removeUnusedAgentSourceLinks(record, remaining) {
+    if (!record?.repoName || !record.agentName) return;
+    const survivors = Object.values(remaining || {}).filter(candidate =>
+        candidate?.type === 'agent' && candidate.agentName === record.agentName);
+    if (survivors.some(candidate => candidate.repoName === record.repoName)) return;
+    let retired;
+    try { retired = agentSourceDirectories(record); } catch (_) { return; }
+    for (const [kind, link] of [['code', getAgentCodePath(record.agentName)], ['skills', getAgentSkillsPath(record.agentName)]]) {
+        const before = fs.lstatSync(link, { bigint: true, throwIfNoEntry: false });
+        if (!before?.isSymbolicLink() || !retired[kind]) continue;
+        const text = fs.readlinkSync(link);
+        let actual;
+        try { actual = sourceDirectoryIdentity(link); } catch (_) { continue; }
+        if (!sameSourceDirectory(actual, retired[kind])) continue; // Another source or user replacement.
+        const needed = survivors.some(candidate => {
+            try { return sameSourceDirectory(actual, agentSourceDirectories(candidate)[kind]); }
+            catch (_) { return true; } // Unknown surviving source: preserve the shared lookup.
+        });
+        if (needed) continue;
+        const current = fs.lstatSync(link, { bigint: true, throwIfNoEntry: false });
+        if (current?.isSymbolicLink() && current.dev === before.dev && current.ino === before.ino
+            && fs.readlinkSync(link) === text) fs.unlinkSync(link);
+    }
+}
+
+export async function disableAgent(agentRef, dependencies = {}) {
     const input = typeof agentRef === 'string' ? agentRef.trim() : '';
     if (!input) {
         throw new Error("disable agent: missing agent name. Usage: disable <agentName>");
@@ -1077,16 +1344,26 @@ export function disableAgent(agentRef, dependencies = {}) {
         [targetRepo, targetAgent] = parts;
     }
 
+    return withAgentDisableLocks('agent-disable', dependencies, () => disableAgentLocked(
+        { input, hasNamespace, targetRepo, targetAgent },
+        dependencies,
+    ));
+}
+
+function disableAgentLocked({ input, hasNamespace, targetRepo, targetAgent }, dependencies) {
     const loadAgentsImpl = dependencies.loadAgentsImpl || loadAgents;
     const applyGeneration = dependencies.applyGeneration || applyEdgeRoutingGeneration;
     const inactivateGeneration = dependencies.inactivateGeneration || inactivateEdgeRoutingGeneration;
     const abortPreparation = dependencies.abortPreparation || abortEdgeRoutingPreparation;
+    const snapshotSources = dependencies.snapshotSourcesImpl || snapshotDisableSources;
     const map = loadAgentsImpl();
     const config = (map && typeof map._config === 'object') ? map._config : null;
+    const staticRegistration = configuredStaticRegistration(map, config, dependencies.readRoutingImpl);
     const directRecord = (map && map[input] && map[input].type === 'agent') ? map[input] : null;
 
     const clearStaticConfig = ({ repoName, shortName, containerName, rawInput }) => {
         if (!config || !config.static) return false;
+        if (containerName && containerName !== staticRegistration) return false;
         const comparisons = new Set();
         if (shortName) comparisons.add(String(shortName).trim().toLowerCase());
         if (repoName && shortName) {
@@ -1101,7 +1378,7 @@ export function disableAgent(agentRef, dependencies = {}) {
         const staticContainer = String(config.static.container || '').trim();
 
         const matchesAgent = staticAgent && (comparisons.has(staticAgent));
-        const matchesContainer = containerName && staticContainer && staticContainer === containerName;
+        const matchesContainer = containerName && (staticContainer === containerName || staticRegistration === containerName);
 
         if (!matchesAgent && !matchesContainer) return false;
 
@@ -1157,6 +1434,7 @@ export function disableAgent(agentRef, dependencies = {}) {
                     repoName: targetRepo || '',
                 },
             }] : [];
+            const sourceSnapshot = snapshotSources();
             const prepared = stageAgentDisableGeneration(map, disabledStaticRecords, {
                 ...dependencies,
                 inactivateGeneration,
@@ -1165,6 +1443,16 @@ export function disableAgent(agentRef, dependencies = {}) {
             try {
                 removeDisabledRuntimes(disabledStaticRecords, dependencies);
             } catch (error) {
+                if (error?.runtimeUntouched === true) {
+                    throw rollBackRefusedAgentDisable(prepared, sourceSnapshot, error, {
+                        ...dependencies,
+                        applyGeneration,
+                        inactivateGeneration,
+                        abortPreparation,
+                        message: `disable agent: static runtime '${staticContainer}' was not disabled`,
+                        reason: 'agent-disable-static-runtime-removal-refused',
+                    });
+                }
                 try {
                     inactivateGeneration('agent-disable-static-runtime-removal-failed', {
                         preserveSelectedGeneration: true,
@@ -1214,6 +1502,7 @@ export function disableAgent(agentRef, dependencies = {}) {
     });
 
     const disabledRecords = [{ containerName, record }];
+    const sourceSnapshot = snapshotSources();
     const prepared = stageAgentDisableGeneration(map, disabledRecords, {
         ...dependencies,
         inactivateGeneration,
@@ -1222,6 +1511,16 @@ export function disableAgent(agentRef, dependencies = {}) {
     try {
         removeDisabledRuntimes(disabledRecords, dependencies);
     } catch (error) {
+        if (error?.runtimeUntouched === true) {
+            throw rollBackRefusedAgentDisable(prepared, sourceSnapshot, error, {
+                ...dependencies,
+                applyGeneration,
+                inactivateGeneration,
+                abortPreparation,
+                message: `disable agent: '${containerName}' was not disabled`,
+                reason: 'agent-disable-runtime-removal-refused',
+            });
+        }
         try {
             inactivateGeneration('agent-disable-runtime-removal-failed', {
                 preserveSelectedGeneration: true,
@@ -1240,7 +1539,7 @@ export function disableAgent(agentRef, dependencies = {}) {
     // Remove workspace structure for the agent
     try {
         // Remove symlinks: $CWD/code/<agentName> and $CWD/skills/<agentName>
-        removeAgentSymlinks(record.agentName);
+        removeUnusedAgentSourceLinks(record, loadAgentsImpl());
 
         // Note: We don't remove the agent work directory by default to preserve data
         // Use removeAgentWorkDir(record.agentName, true) to force removal if needed
@@ -1256,23 +1555,32 @@ export function disableAgent(agentRef, dependencies = {}) {
     };
 }
 
-export function disableAgentContainers(containerNames = [], dependencies = {}) {
+export async function disableAgentContainers(containerNames = [], dependencies = {}) {
     const targets = Array.from(new Set((containerNames || [])
         .map(name => String(name || '').trim())
         .filter(Boolean)));
     if (!targets.length) return [];
 
+    return withAgentDisableLocks('agent-disable-batch', dependencies, () => disableAgentContainersLocked(
+        targets,
+        dependencies,
+    ));
+}
+
+function disableAgentContainersLocked(targets, dependencies) {
     const loadAgentsImpl = dependencies.loadAgentsImpl || loadAgents;
     const applyGeneration = dependencies.applyGeneration || applyEdgeRoutingGeneration;
     const inactivateGeneration = dependencies.inactivateGeneration || inactivateEdgeRoutingGeneration;
     const abortPreparation = dependencies.abortPreparation || abortEdgeRoutingPreparation;
     const map = loadAgentsImpl();
     const config = (map && typeof map._config === 'object') ? map._config : null;
+    const staticRegistration = configuredStaticRegistration(map, config, dependencies.readRoutingImpl);
     const disabled = [];
     const disabledRuntimeRecords = [];
 
     const clearStaticConfig = ({ repoName, shortName, containerName }) => {
         if (!config || !config.static) return false;
+        if (containerName && containerName !== staticRegistration) return false;
         const comparisons = new Set();
         if (shortName) comparisons.add(String(shortName).trim().toLowerCase());
         if (repoName && shortName) {
@@ -1285,7 +1593,7 @@ export function disableAgentContainers(containerNames = [], dependencies = {}) {
         const staticAgent = String(config.static.agent || '').trim().toLowerCase();
         const staticContainer = String(config.static.container || '').trim();
         const matchesAgent = staticAgent && comparisons.has(staticAgent);
-        const matchesContainer = containerName && staticContainer && staticContainer === containerName;
+        const matchesContainer = containerName && (staticContainer === containerName || staticRegistration === containerName);
 
         if (!matchesAgent && !matchesContainer) return false;
 
@@ -1326,6 +1634,7 @@ export function disableAgentContainers(containerNames = [], dependencies = {}) {
 
     if (!disabledRuntimeRecords.length) return disabled;
     const disabledRecords = disabledRuntimeRecords;
+    const sourceSnapshot = (dependencies.snapshotSourcesImpl || snapshotDisableSources)();
     const prepared = stageAgentDisableGeneration(map, disabledRecords, {
         ...dependencies,
         inactivateGeneration,
@@ -1334,6 +1643,16 @@ export function disableAgentContainers(containerNames = [], dependencies = {}) {
     try {
         removeDisabledRuntimes(disabledRecords, dependencies);
     } catch (error) {
+        if (error?.runtimeUntouched === true) {
+            throw rollBackRefusedAgentDisable(prepared, sourceSnapshot, error, {
+                ...dependencies,
+                applyGeneration,
+                inactivateGeneration,
+                abortPreparation,
+                message: 'disable agents: no container was disabled',
+                reason: 'agent-disable-batch-runtime-removal-refused',
+            });
+        }
         try {
             inactivateGeneration('agent-disable-batch-runtime-removal-failed', {
                 preserveSelectedGeneration: true,
@@ -1349,12 +1668,11 @@ export function disableAgentContainers(containerNames = [], dependencies = {}) {
         abortPreparation,
     });
 
-    for (const item of disabled) {
-        if (item.status !== 'removed' || !item.shortAgentName) continue;
+    for (const item of disabledRuntimeRecords) {
         try {
-            removeAgentSymlinks(item.shortAgentName);
+            removeUnusedAgentSourceLinks(item.record, loadAgentsImpl());
         } catch (err) {
-            console.error(`Warning: Failed to remove workspace structure for ${item.shortAgentName}: ${err.message}`);
+            console.error(`Warning: Failed to remove workspace structure for ${item.record.agentName}: ${err.message}`);
         }
     }
 

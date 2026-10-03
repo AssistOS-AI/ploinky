@@ -2,18 +2,18 @@ import { renderLogMarkdown } from './logMarkdown.js';
 import { normalizeTaskLiveSession } from './taskLiveSession.js';
 import { normalizeTaskDetails } from './taskDetails.js';
 
-const TERMINAL_STATUSES = new Set(['finished', 'stopped', 'error']);
+const TERMINAL_STATUSES = new Set(['finished', 'paused', 'error']);
 const ANSI_RE = /[\u001b\u009b][[\]()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g;
 const STREAM_PREFIX_RE = /^\[([^\]]+)\s+(stdout|stderr)\]\s?/i;
 const RUNNER_PREFIX_RE = /^\[[^\]]+\/[^\]]+\]\s?/;
 export function taskStatusPresentation(task) {
     if (!task) return { label: 'UNAVAILABLE', className: 'unavailable' };
     if (task.status === 'finished') return { label: 'COMPLETED', className: 'finished' };
-    if (task.status === 'stopped') return { label: 'STOPPED', className: 'stopped' };
+    if (task.status === 'paused') return { label: 'PAUSED', className: 'paused' };
     if (task.status === 'error') return { label: 'FAILED', className: 'error' };
     const remoteStatus = String(task.remoteStatus || '').trim().toLowerCase();
     if (remoteStatus === 'cancelling') {
-        return { label: 'STOPPING', className: 'cancelling' };
+        return { label: 'PAUSING', className: 'cancelling' };
     }
     if (remoteStatus === 'pending' || remoteStatus === 'queued') {
         return { label: 'QUEUED', className: 'queued' };
@@ -44,12 +44,13 @@ function taskFinalOutputRanges(task) {
     const declared = Array.isArray(task?.finalOutputRanges)
         ? task.finalOutputRanges
         : [];
-    const legacy = {
+    // Task producers also report the current turn's range as single fields.
+    const currentTurn = {
         turn: task?.turn,
         offset: task?.finalOutputOffset,
         length: task?.finalOutputLength,
     };
-    return [...declared, legacy].filter((range) => {
+    return [...declared, currentTurn].filter((range) => {
         return Number.isSafeInteger(range?.offset)
             && range.offset >= 0
             && Number.isSafeInteger(range?.length)

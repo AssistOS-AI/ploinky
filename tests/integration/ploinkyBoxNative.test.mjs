@@ -16,10 +16,10 @@ import {
 import {
     AGENTLIB_ENV,
     AGENTLIB_STABLE_MOUNT_PATH,
-    canonicalAgentLibRemote,
-    imageSourceId,
+    BOX_IMAGE_ID_ENV,
+    imageSourceIdHash,
+    imageSourceIdentity,
 } from '../../agentlib/contract.mjs';
-import { sourceIdHash } from '../../agentlib/fingerprint.mjs';
 import { normalizeImageId } from '../../ploinky-box/contract/image-id.mjs';
 import { resolveWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import {
@@ -146,10 +146,15 @@ function assertExactOuterStorage(harness, containerId, repositoryRoot) {
     );
     assert.equal(agentLibSourceRelativePath, hasLocalAgentLib ? 'achillesAgentLib' : 'image');
     const fingerprint = labels[BOX_AGENTLIB_LABELS.fingerprint];
-    assert.match(fingerprint, /^[a-f0-9]{64}$/);
     assert.match(labels[BOX_AGENTLIB_LABELS.sourceIdHash], /^[a-f0-9]{64}$/);
     const expectedAgentLibMounts = [];
+    // The engine-observed outer image ID identifies the libraries the image
+    // supplies in both Achilles modes and is inherited by every process in the Box.
+    const outerImageId = normalizeImageId(record.Image);
+    assert.deepEqual(record.Config.Env.filter((entry) => entry.startsWith(`${BOX_IMAGE_ID_ENV}=`)),
+        [`${BOX_IMAGE_ID_ENV}=${outerImageId}`]);
     if (hasLocalAgentLib) {
+        assert.match(fingerprint, /^[a-f0-9]{64}$/);
         const source = fs.realpathSync(localAgentLib);
         assert.equal(source, localAgentLib, 'the fixture selects one real workspace-local AgentLib directory');
         expectedAgentLibMounts.push(
@@ -157,20 +162,37 @@ function assertExactOuterStorage(harness, containerId, repositoryRoot) {
             { type: 'bind', source, destination: localAgentLib, rw: false },
         );
     } else {
-        assert.equal(labels[BOX_AGENTLIB_LABELS.commit], canonicalAgentLibRemote().commit);
+        // An image source is identified by the supplying outer image and carries
+        // no content fingerprint or commit label.
+        assert.equal(fingerprint, undefined);
+        assert.equal(labels[BOX_AGENTLIB_LABELS.commit], undefined);
         assert.equal(labels[BOX_AGENTLIB_LABELS.sourceIdHash],
-            sourceIdHash(imageSourceId(normalizeImageId(record.Image), fingerprint)));
-        assert.equal(fs.existsSync(path.join(workspaceRoot, '.ploinky', 'agentlib')), false,
+            imageSourceIdHash(imageSourceIdentity(outerImageId)));
+        // Image selection never materializes managed AgentLib sources; graph
+        // admission only records the selected image in `active.json`.
+        const managedRoot = path.join(workspaceRoot, '.ploinky', 'agentlib');
+        const managedEntries = fs.existsSync(managedRoot) ? fs.readdirSync(managedRoot) : [];
+        assert.deepEqual(managedEntries.filter((entry) => entry !== 'active.json'), [],
             'image selection must not materialize managed AgentLib state');
+        if (managedEntries.includes('active.json')) {
+            assert.equal(JSON.parse(fs.readFileSync(path.join(managedRoot, 'active.json'), 'utf8')).mode, 'image');
+        }
     }
     for (const [name, value] of Object.entries({
         [AGENTLIB_ENV.dir]: AGENTLIB_STABLE_MOUNT_PATH,
         [AGENTLIB_ENV.mode]: hasLocalAgentLib ? 'local' : 'image',
-        [AGENTLIB_ENV.fingerprint]: fingerprint,
-        [AGENTLIB_ENV.commit]: labels[BOX_AGENTLIB_LABELS.commit],
+        ...(hasLocalAgentLib ? {
+            [AGENTLIB_ENV.fingerprint]: fingerprint,
+            [AGENTLIB_ENV.commit]: labels[BOX_AGENTLIB_LABELS.commit],
+        } : {}),
         [AGENTLIB_ENV.sourceId]: labels[BOX_AGENTLIB_LABELS.sourceIdHash],
     })) {
         assert.deepEqual(record.Config.Env.filter((entry) => entry.startsWith(`${name}=`)), [`${name}=${value}`]);
+    }
+    if (!hasLocalAgentLib) {
+        for (const name of [AGENTLIB_ENV.fingerprint, AGENTLIB_ENV.commit]) {
+            assert.deepEqual(record.Config.Env.filter((entry) => entry.startsWith(`${name}=`)), []);
+        }
     }
     // The selected workspace is its own Box path: bind destination, working
     // directory, reserved environment, and physical shell cwd all agree.
@@ -313,6 +335,37 @@ function readDependencyCacheFile(harness, relativePath) {
     ).trim();
 }
 
+// Runs from /opt/ploinky, so `mcp-sdk` resolves the way Ploinky's own modules
+// import it. Arguments: the Box copy and the image bundle it was copied from.
+const MCP_SDK_EVIDENCE_SCRIPT = [
+    "import fs from 'node:fs';",
+    'const [copy, bundle] = process.argv.slice(1);',
+    "const read = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));",
+    "const pkg = read(copy + '/package.json');",
+    "const sdk = await import('mcp-sdk');",
+    'const { z } = sdk.zod;',
+    'const schema = z.object({ text: z.string() });',
+    "schema.parse({ text: 'probe' });",
+    'let rejected = false;',
+    'try { schema.parse({ text: 1 }); } catch { rejected = true; }',
+    "new sdk.mcp.McpServer({ name: 'ploinky-box-native-probe', version: '1.0.0' });",
+    'process.stdout.write(JSON.stringify({',
+    'packageName: pkg.name,',
+    'packageVersion: pkg.version,',
+    "copyProvenance: read(copy + '/.ploinky-box-mcp-sdk.json'),",
+    "bundleProvenance: read(bundle + '/.ploinky-box-mcp-sdk.json'),",
+    'rejected,',
+    'members: {',
+    "'types.isInitializeRequest': typeof sdk.types?.isInitializeRequest,",
+    "'types.McpError': typeof sdk.types?.McpError,",
+    "'streamHttp.StreamableHTTPServerTransport': typeof sdk.streamHttp?.StreamableHTTPServerTransport,",
+    "'mcp.McpServer': typeof sdk.mcp?.McpServer,",
+    "'client.Client': typeof sdk.client?.Client,",
+    "StreamableHTTPClientTransport: typeof sdk.StreamableHTTPClientTransport,",
+    '},',
+    '}));',
+].join('\n');
+
 // Core bootstrap also runs for stop. These graphless fixtures contain empty
 // installed repositories so the real stop/replacement path has no optional
 // application sources to fetch. The full smoke graph uses its own staging.
@@ -449,8 +502,8 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     assert.match(candidateImageId, /^(?:sha256:)?[a-f0-9]{64}$/);
     assert.equal(fs.existsSync(path.join(harness.workspace, '.ploinky')), true);
     assert.deepEqual(fs.readdirSync(path.join(harness.workspace, '.ploinky')).sort(),
-        ['box', 'master-key'],
-        'image-backed AgentLib creates no source state beside the Box master key and cache root');
+        ['box', 'data'],
+        'image-backed AgentLib creates no source state beside the Box controller-state and cache roots');
     assert.equal(fs.existsSync(path.join(harness.child, '.ploinky')), false);
     // Workspace-backed persistence: both cache directories exist on the real
     // host, back the Box through exact bind mounts, and no named volume exists.
@@ -546,24 +599,60 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     assert.equal(directExternal.ok, true, directExternal.stderr);
     assert.match(directExternal.stdout, /host-visible\.txt/);
 
-    const masterKeyPath = path.join(harness.identity.workspaceRoot, '.ploinky', 'master-key');
+    const masterKeyPath = path.join(harness.identity.workspaceRoot, '.ploinky', 'data', 'master-key');
     const keyEvidence = execInBox(harness.runner, prepared.containerId, [
         'bash', '-c', 'stat -c %a "$1"; sha256sum "$1"', 'bash', masterKeyPath,
     ]).split(/\n/);
     assert.equal(keyEvidence[0], '600');
     assert.match(keyEvidence[1], /^[a-f0-9]{64}\s/);
-    // The Box materializes mcp-sdk from the immutable image bundle only.
+    // The Box materializes mcp-sdk from the immutable image bundle only. Its
+    // identity is the observed outer Box image that supplies it; the image
+    // build owns the revision, so none is pinned here.
+    assert.deepEqual(JSON.parse(readDependencyCacheFile(harness, '.ploinky-box-dependencies.json')), {
+        schema: 'ploinky.box.dependencies/v2',
+        providedLibraries: {
+            'mcp-sdk': {
+                kind: 'image',
+                library: 'mcp-sdk',
+                supplyingImageId: normalizeImageId(candidateImageId),
+            },
+        },
+    });
+    const sdkProbe = harness.runner.query('podman', [
+        'container', 'exec', '--user', 'podman', '--workdir', '/opt/ploinky',
+        prepared.containerId,
+        'node', '--input-type=module', '-e', MCP_SDK_EVIDENCE_SCRIPT,
+        '/opt/ploinky/node_modules/mcp-sdk', '/usr/local/lib/ploinky/mcp-sdk',
+    ], { timeoutMs: 120_000 });
+    assert.equal(sdkProbe.ok, true, sdkProbe.stderr);
+    const sdkEvidence = JSON.parse(sdkProbe.stdout);
+    assert.equal(sdkEvidence.packageName, '@modelcontextprotocol/sdk');
+    // The copy carries the supplying image's own flat provenance record.
+    const sdkProvenance = sdkEvidence.copyProvenance;
+    assert.deepEqual(sdkProvenance, {
+        schema: 'ploinky.box.library/v1',
+        library: 'mcp-sdk',
+        packageName: '@modelcontextprotocol/sdk',
+        packageVersion: sdkEvidence.packageVersion,
+        repository: 'https://github.com/AssistOS-AI/MCPSDK.git',
+        branch: sdkProvenance.branch,
+        commit: sdkProvenance.commit,
+    });
+    assert.match(sdkProvenance.commit, /^[a-f0-9]{40}$/);
+    assert.ok(sdkProvenance.branch === null
+        || (typeof sdkProvenance.branch === 'string' && sdkProvenance.branch !== ''));
+    assert.deepEqual(sdkEvidence.bundleProvenance, sdkProvenance);
+    // The package works through Ploinky's own import path.
+    assert.equal(sdkEvidence.rejected, true);
+    assert.deepEqual(sdkEvidence.members, {
+        'types.isInitializeRequest': 'function',
+        'types.McpError': 'function',
+        'streamHttp.StreamableHTTPServerTransport': 'function',
+        'mcp.McpServer': 'function',
+        'client.Client': 'function',
+        StreamableHTTPClientTransport: 'function',
+    });
     // With no local checkout, achillesAgentLib stays in its protected image tree.
-    for (const [repository, revision] of [
-        ['mcp-sdk', '7efe9d17f52a625743e411089d3a6879f6f89156'],
-    ]) {
-        assert.equal(execInBox(harness.runner, prepared.containerId, [
-            'node', '-e', [
-                `const metadata=require('/opt/ploinky/node_modules/${repository}/.ploinky-box-mcp-sdk.json');`,
-                'process.stdout.write(metadata.repository.commit);',
-            ].join(''),
-        ]), revision);
-    }
     // The selected bundle is present at the stable path, and no writable
     // dependency-cache copy can shadow it.
     assert.match(
@@ -583,12 +672,16 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
         ].join(''),
     ]);
     assert.equal(protectedLibraryWrite.ok, true, protectedLibraryWrite.stderr);
-    const verifiedBundle = JSON.parse(execInBox(harness.runner, prepared.containerId, [
-        'node', '/opt/ploinky/agentlib/image-bundle.mjs', 'verify',
-        '--expected-commit', canonicalAgentLibRemote().commit,
+    // The image's own probe confirms a usable package; no revision or content
+    // digest is compared, and the supplying image is the Box image itself.
+    const inspectedLibrary = JSON.parse(execInBox(harness.runner, prepared.containerId, [
+        'node', '/usr/local/share/ploinky/smoke-libraries.mjs', 'inspect', 'achillesAgentLib',
     ]));
-    assert.equal(verifiedBundle.fingerprint,
-        boxInspection(harness, prepared.containerId).Config.Labels[BOX_AGENTLIB_LABELS.fingerprint]);
+    assert.equal(inspectedLibrary.packageName, 'ploinky-agent-lib');
+    assert.equal(Object.hasOwn(inspectedLibrary, 'fingerprint'), false);
+    assert.equal(execInBox(harness.runner, prepared.containerId, ['printenv', BOX_IMAGE_ID_ENV]),
+        normalizeImageId(boxInspection(harness, prepared.containerId).Image),
+        'every exec inherits the outer image ID set when the Box was created');
     const innerInfo = JSON.parse(execInBox(harness.runner, prepared.containerId, [
         'podman', 'info', '--format', 'json',
     ]));
@@ -664,7 +757,6 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
             'printf agent-created > "$1/agent-created-folder/from-agent.txt"',
             'mkdir -p "$2/agent-created-nested"',
             'printf nested-agent-created > "$2/agent-created-nested/from-agent.txt"',
-            'printf persisted > "$1/.ploinky/from-agent.txt"',
         ].join('; '),
         'sh', harness.identity.workspaceRoot, harness.child,
     ]);
@@ -676,16 +768,21 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
         path.join(harness.child, 'agent-created-nested', 'from-agent.txt'),
         'utf8',
     ), 'nested-agent-created');
-    assert.equal(fs.readFileSync(
-        path.join(harness.workspace, '.ploinky', 'from-agent.txt'),
-        'utf8',
-    ), 'persisted');
+    // The controller root stays read-only to agents: they write the workspace,
+    // never Ploinky's own state under `.ploinky`.
+    const agentControllerWrite = queryInBox(harness, started.containerId, [
+        'podman', 'container', 'exec', agent.id,
+        '/bin/sh', '-c', 'printf refused > "$1/.ploinky/from-agent.txt"',
+        'sh', harness.identity.workspaceRoot,
+    ]);
+    assert.equal(agentControllerWrite.ok, false);
+    assert.match(agentControllerWrite.stderr, /Read-only file system/);
+    assert.equal(fs.existsSync(path.join(harness.workspace, '.ploinky', 'from-agent.txt')), false);
     for (const createdPath of [
         path.join(harness.workspace, 'agent-created-folder'),
         path.join(harness.workspace, 'agent-created-folder', 'from-agent.txt'),
         path.join(harness.child, 'agent-created-nested'),
         path.join(harness.child, 'agent-created-nested', 'from-agent.txt'),
-        path.join(harness.workspace, '.ploinky', 'from-agent.txt'),
     ]) {
         assert.equal(fs.statSync(createdPath).uid, process.getuid());
     }
@@ -784,7 +881,8 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     // listing: `box` is gone and every other named entry survives.
     const anchorEntries = fs.readdirSync(path.join(harness.workspace, '.ploinky'));
     assert.equal(anchorEntries.includes('box'), false);
-    for (const kept of ['master-key', 'unrelated.json', 'from-agent.txt']) {
+    assert.equal(fs.existsSync(path.join(harness.workspace, '.ploinky', 'data', 'master-key')), true);
+    for (const kept of ['data', 'unrelated.json']) {
         assert.equal(anchorEntries.includes(kept), true, `.ploinky/${kept} must survive`);
     }
     assert.equal(fs.readFileSync(
@@ -792,8 +890,8 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     ), 'workspace-retained');
     assertNoOwnedNamedVolume(harness);
 
-    // A clean rebuild recreates both cache directories and reinstalls the
-    // pinned dependencies from scratch.
+    // A clean rebuild recreates both cache directories and copies the
+    // image-supplied mcp-sdk from scratch.
     const rebuilt = await harness.supervisor.prepareBoxForCommand(
         isolatedBoxOptions(candidateReference, lifecyclePorts),
     );

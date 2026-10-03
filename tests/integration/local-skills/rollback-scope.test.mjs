@@ -15,6 +15,7 @@ const { buildWorkspaceIdentity } = await importSource('ploinky-box/identity.mjs'
 const { buildHostSkillScope } = await importSource('ploinky-box/skillScope.mjs');
 const { readGraphSkillScope } = await importSource('ploinky-box/graphSkillScope.mjs');
 const { agentLibFixture } = await importSource('tests/helpers/agentlibFixture.mjs');
+const { fakeRestartCore } = await importSource('tests/helpers/fakeUpdateCore.mjs');
 const { fingerprintSource } = await importSource('agentlib/fingerprint.mjs');
 
 for (const differentLaunch of [false, true]) {
@@ -92,6 +93,8 @@ for (const differentLaunch of [false, true]) {
             healthCheck: async () => { healthChecks += 1; },
             commitAgentLibSelection() { assert.equal(initial, true, 'A failed candidate must not become active.'); },
         };
+        // The workspace restart runs through the bounded restart runner.
+        options.runRestartCore = fakeRestartCore(options.runCoreCommand);
 
         await createBoxSupervisor({ ...options, launchCwd: priorLaunch }).runStartTransaction(['start', 'fixture-agent']);
         assert.deepEqual(readGraphSkillScope(identity), expectedScope, 'Successful graph admission persists its trusted launch scope.');

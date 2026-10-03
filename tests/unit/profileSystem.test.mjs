@@ -24,7 +24,7 @@ const workspaceStructure = await import(`${workspaceStructureUrl.href}${moduleSu
 const { setSecretValue } = await import(`${encryptedSecretsUrl.href}${moduleSuffix}`);
 
 function clearSecretsFile() {
-    const secretsPath = path.join(tempDir, '.ploinky', '.secrets');
+    const secretsPath = path.join(tempDir, '.ploinky', 'data', '.secrets');
     fs.rmSync(secretsPath, { force: true });
 }
 

@@ -1,6 +1,7 @@
 import { buildExecArgs } from '../../sandbox/docker/index.js';
 import { spawn } from 'child_process';
 import { createStartupOutputFilter } from './startupOutput.js';
+import { createStartupFailureRecorder } from './startupFailure.js';
 
 import fs from 'fs';
 import os from 'os';
@@ -252,12 +253,14 @@ function createLocalTTYFactory({ workdir, command, startupProtocol = false }) {
         const closeHandlers = new Set();
         const startupHandlers = new Set();
         let startupState = startupProtocol ? 'starting' : 'ready';
+        const startupFailure = createStartupFailureRecorder();
         let startupOutput = '';
         let startupControl = '';
         let closeEmitted = false;
         const setStartupState = (state) => {
             if (startupState !== 'starting') return;
             startupState = state;
+            if (state === 'ready') startupFailure.ready();
             for (const handler of startupHandlers) {
                 try { handler({ state }); } catch (_) { }
             }
@@ -357,6 +360,7 @@ function createLocalTTYFactory({ workdir, command, startupProtocol = false }) {
                 }
                 ptyProc.stdout.setEncoding('utf8');
                 ptyProc.stderr.setEncoding('utf8');
+                if (startupProtocol) ptyProc.stderr.on('data', data => startupFailure.append(data));
                 ptyProc.stdout.on('data', startupProtocol ? createStartupOutputFilter(emitOutput) : emitOutput);
                 ptyProc.stderr.on('data', startupProtocol ? createStartupOutputFilter(emitOutput) : emitOutput);
                 ptyProc.stdin.on('error', (e) => {
@@ -366,8 +370,9 @@ function createLocalTTYFactory({ workdir, command, startupProtocol = false }) {
                     log('local child error', e?.message || e);
                     emitClose();
                 });
-                ptyProc.on('close', () => {
+                ptyProc.on('close', (code, signal) => {
                     log('local child close');
+                    if (startupProtocol) startupFailure.failed({ pid: ptyProc.pid, code, signal });
                     emitClose();
                 });
             } catch (e) {

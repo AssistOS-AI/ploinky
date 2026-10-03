@@ -29,8 +29,8 @@ export function buildHostSkillScope(workspaceRoot, launchCwd) {
 
 // Runtime config and session cwd cannot override host-owned launch metadata.
 // Direct ploinky-local invocation uses its actual process cwd when contained.
-// Legacy library callers can select an explicit workspace from another cwd;
-// absent host metadata, that selected workspace remains their default scope.
+// A process can select its workspace explicitly (PLOINKY_WORKSPACE_ROOT) from a
+// cwd outside it; absent host metadata, that workspace is the default scope.
 export function buildLocalSkillScope(workspaceRoot, launchCwd, env = process.env) {
     const root = fs.realpathSync(workspaceRoot);
     if (env.PLOINKY_SKILL_SCOPE_VERSION && env.PLOINKY_SKILL_SCOPE_VERSION !== '1') throw new Error('Unsupported Ploinky skill scope version');

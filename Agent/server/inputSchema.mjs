@@ -33,9 +33,10 @@ function equalJsonValues(left, right) {
 
 export function isJsonSchema(spec) {
     if (!isObject(spec)) return false;
-    // Legacy field maps may have a field named "type", including the shorthand
-    // { type: 'string' }. Prefer that established form when it is ambiguous;
-    // standard schemas identify their object properties or another keyword.
+    // Field-map schemas (still used by agent configs such as dpuAgent's) may
+    // have a field named "type", including the shorthand { type: 'string' }.
+    // Prefer the field-map form when ambiguous; standard schemas identify
+    // their object properties or another keyword.
     return (spec.type === 'object' && Object.hasOwn(spec, 'properties')
             && !(typeof spec.properties === 'string' || (isObject(spec.properties) && typeof spec.properties.type === 'string')))
         || Object.keys(spec).some(key => key.startsWith('$'))
@@ -162,7 +163,7 @@ export function buildJsonSchema(spec) {
 export function preserveJsonSchemaToolListings(server, schemas) {
     // The pinned SDK converts Zod back to JSON Schema and loses refinements
     // (e.g. minProperties and uniqueItems). Wrap its public handler installation
-    // to retain the original, validated schema without changing legacy listings.
+    // to retain the original, validated schema without changing field-map listings.
     const setRequestHandler = server.server.setRequestHandler;
     server.server.setRequestHandler = function (requestSchema, handler) {
         if (requestSchema.shape.method.value === 'tools/list') {

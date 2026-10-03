@@ -83,6 +83,7 @@ test('status renders terminal color intent without changing workspace state', (t
     fs.writeFileSync(path.join(agentLib, 'package.json'), '{"name":"ploinky-agent-lib"}\n');
     for (const entrypoint of [
         'LLMAgents/index.mjs',
+        'LLMAgents/openAiAgenticResponder.mjs',
         'utils/LLMClient.mjs',
         'jwt/jwtSign.mjs',
         'jwt/jwtVerify.mjs',

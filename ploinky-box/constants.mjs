@@ -25,7 +25,7 @@ export const BOX_LABELS = Object.freeze({
     routerHostPort: 'io.assistos.ploinky-box.router-host-port',
     mediaHostPort: 'io.assistos.ploinky-box.media-host-port',
     // Present only for an explicit non-loopback `ploinky bind`; its absence
-    // keeps the legacy loopback meaning of existing Boxes.
+    // means the default loopback publication.
     routerBindAddress: 'io.assistos.ploinky-box.router-bind-address',
     seccompFingerprint: 'io.assistos.ploinky-box.seccomp-fingerprint',
     dependenciesFingerprint: 'io.assistos.ploinky-box.dependencies-fingerprint',
@@ -67,6 +67,10 @@ export const BOX_AGENTLIB_LABELS = Object.freeze({
     sourceRelativePath: 'io.assistos.ploinky-box.agentlib-source-path',
     commit: 'io.assistos.ploinky-box.agentlib-commit',
 });
+
+/** The recovery an owned Box created under an incompatible contract needs; no adapter exists. */
+export const INCOMPATIBLE_BOX_GUIDANCE = "; back up any Box-only data, then run 'ploinky stop'"
+    + " and 'ploinky destroy' before retrying";
 
 export const BOX_ROLES = Object.freeze({
     container: 'box',

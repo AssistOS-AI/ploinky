@@ -11,7 +11,7 @@ import {
     ensureAgentLibCacheLink,
     installWithAgentLib,
 } from '../../cli/utils/dependencies/agentLibLink.js';
-import { canonicalAgentLibRemote } from '../../agentlib/contract.mjs';
+import { AGENTLIB_REPOSITORY_URL } from '../../agentlib/contract.mjs';
 
 function fixture(t) {
     const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'agentlib-install-'));
@@ -33,7 +33,7 @@ test('both AgentLib dependency names, aliases and overrides are reserved before 
             assert.throws(() => assertNoReservedAgentLibDependency({ [field]: { [name]: 'file:../private' } }),
                 { code: 'PLOINKY_AGENTLIB_RESERVED_DEPENDENCY' });
         }
-        for (const spec of ['npm:ploinky-agent-lib@1', 'npm:achillesAgentLib@1', `${canonicalAgentLibRemote().url}#main`]) {
+        for (const spec of ['npm:ploinky-agent-lib@1', 'npm:achillesAgentLib@1', `${AGENTLIB_REPOSITORY_URL}#main`]) {
             assert.throws(() => assertNoReservedAgentLibDependency({ [field]: { renamed: spec } }),
                 { code: 'PLOINKY_AGENTLIB_RESERVED_DEPENDENCY' });
         }

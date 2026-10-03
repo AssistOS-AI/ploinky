@@ -1,5 +1,5 @@
 import { SKILL_SCOPE_ENV_NAMES } from '../../../ploinky-box/skillScope.mjs';
-import { AGENTLIB_RESERVED_ENV_NAMES } from '../../../agentlib/contract.mjs';
+import { AGENTLIB_RESERVED_ENV_NAMES, BOX_IMAGE_ID_ENV } from '../../../agentlib/contract.mjs';
 import { PUBLIC_ROUTER_HOSTS_ENV } from '../publicRouterHosts.mjs';
 import { deriveAgentRequestSecret, derivePrivateAgentRequestSecret } from './masterKey.js';
 import { buildSubjectIdentityKey, getSubjectIdentityPublicKey } from './subjectIdentityKey.js';
@@ -86,15 +86,6 @@ export function buildAgentCredentialEnv(principalId, { instanceId = '', enableGe
     return identity;
 }
 
-// Backward-compatible aggregate used by non-generated-local callers. New
-// lifecycle code must use the two phases above around topology attestation.
-export function buildAgentIdentityEnv(principalId, options = {}) {
-    return {
-        ...buildAgentPrincipalEnv(principalId, options),
-        ...buildAgentCredentialEnv(principalId, options),
-    };
-}
-
 // Env names that are router-managed and must NEVER be settable by agent-supplied
 // configuration (manifest env, profile env, profile secrets, runtime resources):
 // the workspace master keys (must never enter an agent at all), the per-agent
@@ -147,6 +138,10 @@ export const RESERVED_AGENT_ENV_NAMES = Object.freeze([
     // layer must not be able to point an agent at a different source than the
     // one the workspace selected.
     ...AGENTLIB_RESERVED_ENV_NAMES,
+    // The outer Box image ID that identifies the libraries the image supplies.
+    // Only the host-created Box environment carries it; no runtime layer may
+    // introduce it, and nothing emits it into a nested agent.
+    BOX_IMAGE_ID_ENV,
     ...SKILL_SCOPE_ENV_NAMES,
 ]);
 
@@ -157,7 +152,8 @@ const RESERVED = new Set(RESERVED_AGENT_ENV_NAMES);
  * manifest/profile/secret layer can inject a master key or override an agent's
  * derived identity (DS013/DS015). Dropped names are logged (never their values).
  * Returns the same object for chaining. Apply this to config-sourced env BEFORE
- * the authoritative identity is (re)asserted with `buildAgentIdentityEnv`.
+ * the authoritative identity is (re)asserted with `buildAgentPrincipalEnv` and,
+ * after topology attestation, `buildAgentCredentialEnv`.
  */
 export function stripReservedAgentEnv(env) {
     if (!env || typeof env !== 'object') return env;
@@ -176,7 +172,6 @@ export function stripReservedAgentEnv(env) {
 export default {
     buildAgentPrincipalEnv,
     buildAgentCredentialEnv,
-    buildAgentIdentityEnv,
     stripReservedAgentEnv,
     GENERATED_RUNTIME_ENV_NAMES,
     RESERVED_AGENT_ENV_NAMES,

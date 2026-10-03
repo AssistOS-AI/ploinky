@@ -73,7 +73,12 @@ function getConfiguredProjectPath(agentName, repoName, alias) {
                 if (normalized) return normalized;
             }
         }
-        const rec = Object.values(map || {}).find(r => r && r.type === 'agent' && r.agentName === agentName && r.repoName === repoName);
+        // Without an alias the caller names the canonical instance. An alias
+        // record of the same agent is a different instance with its own data
+        // directory, even when it was registered first.
+        const rec = Object.values(map || {}).find(r => r && r.type === 'agent'
+            && r.agentName === agentName && r.repoName === repoName
+            && (alias || !String(r.alias || '').trim()));
         if (rec && (rec.runMode || 'isolated') === 'isolated') {
             const isolatedPath = getAgentWorkDir(rec.alias || agentName);
             return ensureAgentDataDirectory(isolatedPath);

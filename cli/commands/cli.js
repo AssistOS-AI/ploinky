@@ -14,6 +14,8 @@ import { runLogCommand } from './logCommands.js';
 import { activeForegroundSignal } from './foregroundCommand.js';
 import {
     startWorkspace,
+    retireAbandonedStartPreparationBeforeStop,
+    settleWorkspaceBeforeRestart,
     runCli,
     runShell,
     reinstallAgent,
@@ -27,7 +29,7 @@ import {
     commitTargetedAgentRestart,
     prepareTargetedAgentRestart,
 } from './targetedAgentRestart.js';
-import { withMaintenanceLock, withWorkspaceMutationLease } from '../utils/runtime/maintenanceLocks.js';
+import { withHeldOrAcquiredWorkspaceMutationLease, withMaintenanceLock } from '../utils/runtime/maintenanceLocks.js';
 import { reconcileExactHardwareInstance } from '../sandbox/hardwareLimits/reconcile.mjs';
 import { wrapPreservingHardwareCause } from '../sandbox/hardwareLimits/errors.mjs';
 import { printComponentAccess } from '../server/utils/routerEnv.js';
@@ -41,7 +43,7 @@ import {
     ensureAgentService
 } from '../sandbox/docker/index.js';
 import { getRuntimeForAgent, isSandboxRuntime } from '../sandbox/docker/common.js';
-import { isBwrapProcessRunning } from '../sandbox/bwrap/bwrapFleet.js';
+import { isBwrapProcessRunning, registeredRuntimeTuple } from '../sandbox/bwrap/bwrapFleet.js';
 import * as workspaceSvc from '../utils/workspace.js';
 import { handleSystemCommand, handleInvalidCommand, resetLlmInvokerCache } from './llmSystemCommands.js';
 import * as inputState from './inputState.js';
@@ -53,13 +55,11 @@ import {
     enableRepo,
     disableRepo,
     uninstallRepo,
-    updateRepo,
-    updatePloinkyRepos,
-    updateAllRepos,
     enableAgent,
     findAgentManifest,
 } from './repoAgentCommands.js';
 import { parseStartArgs } from '../utils/repos.js';
+import { runUpdateCommand } from './updateCommand.js';
 import { parseBranchPolicy, stripBranchPolicyArgs } from '../../agentlib/branchPolicy.mjs';
 import { importAgentLib } from '../../agentlib/runtime.mjs';
 import {
@@ -78,7 +78,6 @@ import {
     shutdownSession,
 } from './sessionControl.js';
 import { handleSsoCommand } from './ssoCommands.js';
-import { handleDepsCommand } from './depsCommands.js';
 import { disableHostSandbox, enableHostSandbox, handleSandboxCommand } from './sandboxCommands.js';
 import ClientCommands from './client.js';
 import {
@@ -90,7 +89,17 @@ import {
 import { resolvePersistedRouterPort, resolveRouterEndpoint } from '../sandbox/routerPort.js';
 import { runOuterRuntimeShell } from '../sandbox/runtimeShell.js';
 import { createNetworkLifecycleAdapter, withNetworkLifecycleLock } from '../sandbox/networkLifecycle.js';
-import { inactivateEdgeRoutingGeneration } from '../sandbox/edgeGeneration.js';
+import { inactivateEdgeRoutingGeneration, inactivateEdgeRoutingGenerationForStop } from '../sandbox/edgeGeneration.js';
+
+// Restart acquires the workspace mutation lease before the per-runtime
+// maintenance lock (the same order as reinstall), so dependency preparation
+// reuses the held lease and no maintenance lock is held while waiting.
+function withRestartLocks(containerName, lockOptions, fn) {
+    return withHeldOrAcquiredWorkspaceMutationLease(
+        { operation: `${lockOptions?.operation || 'restart'}:${containerName}` },
+        () => withMaintenanceLock(containerName, lockOptions, fn),
+    );
+}
 
 let llmAgentsLoadPromise = null;
 const ENABLE_AGENT_CLI_TOKENS = Object.freeze({
@@ -235,22 +244,21 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
             break;
         case 'cli':
             return handleCliCommand(options);
-        // 'agent' command removed; use 'enable agent <agentName>' then 'start'
         case 'add':
             {
                 const parsed = parseInstallRepoArgs(options);
-                addRepo(parsed.url, parsed.name, parsed.branch);
+                await addRepo(parsed.url, parsed.name, parsed.branch);
             }
             break;
         case 'install':
             {
                 const parsed = parseInstallRepoArgs(options);
-                installRepo(parsed.url, parsed.name, parsed.branch);
+                await installRepo(parsed.url, parsed.name, parsed.branch);
             }
             break;
         case 'remove':
         case 'uninstall':
-            uninstallRepo(parseUninstallRepoTarget(options));
+            await uninstallRepo(parseUninstallRepoTarget(options));
             break;
         case 'vars':
             handleVarsCommand();
@@ -266,25 +274,14 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                 const normalizedOptions = stripBranchPolicyArgs(options);
                 const updateBranchPolicy = agentLibBranchPolicy || parseBranchPolicy(args);
                 const interactiveSession = Boolean(inputState.getInterface?.());
-                const first = String(normalizedOptions[0] || '').trim();
-                const firstLower = first.toLowerCase();
-                if (!first || firstLower === 'all') {
-                    const folderArg = first ? String(normalizedOptions[1] || '').trim() || undefined : undefined;
-                    return updateAllRepos(folderArg, { interactiveSession, agentLibBranchPolicy: updateBranchPolicy });
-                } else if (firstLower === 'repos' || firstLower === 'repositories') {
-                    return updatePloinkyRepos({ interactiveSession, agentLibBranchPolicy: updateBranchPolicy });
-                } else if (firstLower === 'repo' || firstLower === 'repository') {
-                    return updateRepo(normalizedOptions[1]);
-                } else {
-                    const resolved = path.resolve(first);
-                    if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
-                        return updateAllRepos(first, { interactiveSession, agentLibBranchPolicy: updateBranchPolicy });
-                    } else {
-                        return updateRepo(first);
-                    }
-                }
+                // One structured result for every update form: parsed once before
+                // any mutation, run under the workspace mutation lease, a thrown
+                // error converted into a record and a host report published once.
+                return runUpdateCommand(normalizedOptions, {
+                    agentLibBranchPolicy: updateBranchPolicy,
+                    interactiveSession,
+                });
             }
-            break;
         case 'reinstall': {
             const sub = String(options[0] || '').trim();
             const target = sub.toLowerCase() === 'agent'
@@ -297,7 +294,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
         case 'enable':
             if (String(options[0] || '').toLowerCase() === 'repo' || String(options[0] || '').toLowerCase() === 'repository') {
                 const parsed = parseRepoToggleArgs(options);
-                enableRepo(parsed.repoName, parsed.branch);
+                await enableRepo(parsed.repoName, parsed.branch);
             }
             else if (options[0] === 'agent') {
                 const parsed = parseEnableAgentArgs(options.slice(1));
@@ -319,7 +316,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
             handleExposeCommand(options);
             break;
         case 'default-skills':
-            handleDefaultSkillsCommand(options);
+            await handleDefaultSkillsCommand(options);
             break;
         case 'disable': {
             if (!options.length) {
@@ -329,7 +326,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
 
             if (String(options[0] || '').toLowerCase() === 'repo' || String(options[0] || '').toLowerCase() === 'repository') {
                 const parsed = parseRepoToggleArgs(options);
-                disableRepo(parsed.repoName);
+                await disableRepo(parsed.repoName);
                 break;
             }
 
@@ -349,7 +346,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
             }
 
             try {
-                const result = agentsSvc.disableAgent(target);
+                const result = await agentsSvc.disableAgent(target);
                 switch (result.status) {
                     case 'removed':
                         console.log(`✓ Agent '${result.shortAgentName}' from repo '${result.repoName}' disabled.`);
@@ -375,7 +372,6 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
             }
             break;
         }
-        // 'run' legacy commands removed; use 'start', 'cli', 'shell', 'console'.
         case 'start': {
             const startParsed = parseStartArgs(options);
             if (startParsed.profile) {
@@ -385,9 +381,8 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                 }
             }
             // The global --branch is applied to achillesAgentLib by the source
-            // selector that runs before this command, which resolves the branch
-            // to one exact managed generation or validates a local checkout
-            // against it. Nothing here reconfigures an AgentLib dependency.
+            // selector that runs before this command, which validates the local
+            // checkout against it. Nothing here reconfigures an AgentLib dependency.
             await startWorkspace(startParsed.staticAgent, startParsed.port ?? undefined, {
                 enableAgent,
                 killRouterIfRunning,
@@ -395,15 +390,11 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
             });
             break;
         }
-        // 'route' and 'probe' commands removed (replaced by start/status and client commands)
         case 'sso':
             await handleSsoCommand(options);
             break;
         case 'sandbox':
             handleSandboxCommand(options);
-            break;
-        case 'deps':
-            await handleDepsCommand(options);
             break;
         case 'list':
             if (options[0] === 'agents') listAgents();
@@ -446,6 +437,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                 if (!cfg || !cfg.static || !cfg.static.agent || !cfg.static.port) {
                     throw new Error('restart router: start is not configured. Run: start <staticAgent> <port> first.');
                 }
+                await settleWorkspaceBeforeRestart();
                 inactivateEdgeRoutingGeneration('cli-router-restart');
                 console.log('[restart] Restarting RoutingServer (containers untouched)...');
                 resolvePersistedRouterPort();
@@ -522,7 +514,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                     if (!bwrapRunning && !containerAlsoRunning && containerPresent) {
                         console.log(`Starting (${agentRuntime}) agent '${agentName}'...`);
                         try {
-                            await withMaintenanceLock(containerName, {
+                            await withRestartLocks(containerName, {
                                 operation: 'start',
                                 metadata: {
                                     agent: resolved.shortAgentName,
@@ -537,6 +529,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                                     routerEndpoint,
                                     runtimeAdmission: directAdmission.runtimeAdmission,
                                     networkLifecycleCapability,
+                                    expectedPredecessor: registeredRuntimeTuple(registryRecord?.record),
                                 });
                                 try {
                                     await waitForManifestReadiness({
@@ -573,7 +566,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                     console.log(`Restarting (${agentRuntime}) agent '${agentName}'...`);
 
                     try {
-                        await withMaintenanceLock(containerName, {
+                        await withRestartLocks(containerName, {
                             operation: 'restart',
                             metadata: {
                                 agent: resolved.shortAgentName,
@@ -591,6 +584,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                                 routerEndpoint,
                                 runtimeAdmission: directAdmission.runtimeAdmission,
                                 networkLifecycleCapability,
+                                expectedPredecessor: registeredRuntimeTuple(registryRecord?.record),
                             });
                             const {
                                 containerName: newContainerName,
@@ -631,13 +625,29 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                         );
                     }
                 } else {
+                    // Restart is the feature's exact-instance reconcile (it recreates through the managed transaction with the
+                    // hardware guard), under the workspace lease this operation already holds or acquires (before any maintenance lock).
+                    const containerRunning = isContainerRunning(containerName);
+                    const containerPresent = containerRunning || containerExists(containerName) || Boolean(registryRecord?.containerName);
+                    if (!containerPresent) {
+                        throw new Error(`Agent '${agentName}' has no existing container. Run 'ploinky reinstall ${agentName}'.`);
+                    }
                     if (!registryRecord) throw new Error('Restart requires one exact registered agent.');
+
+                    const runtimeAction = 'restart';
                     console.log(`Restarting (${getRuntime()}) agent '${agentName}'...`);
-                    await withWorkspaceMutationLease({ operation: 'exact-agent-restart' }, () => reconcileExactHardwareInstance({
-                        key: registryRecord.containerName,
-                        record: structuredClone(registryRecord.record),
-                    }, { origin: 'cli' }));
-                    console.log('✓ Agent restarted.');
+                    try {
+                        await withHeldOrAcquiredWorkspaceMutationLease({ operation: 'exact-agent-restart' }, () => reconcileExactHardwareInstance({
+                            key: registryRecord.containerName,
+                            record: structuredClone(registryRecord.record),
+                        }, { origin: 'cli' }));
+                        console.log('✓ Agent restarted.');
+                    } catch (e) {
+                        throw wrapPreservingHardwareCause(
+                            `Failed to ${runtimeAction} container ${containerName}: ${e.message}`,
+                            e,
+                        );
+                    }
                 }
             } else {
                 const cfg = workspaceSvc.getConfig();
@@ -645,6 +655,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                     throw new Error('restart: start is not configured. Run: start <staticAgent> <port>');
                 }
                 resolvePersistedRouterPort();
+                await settleWorkspaceBeforeRestart();
                 inactivateEdgeRoutingGeneration('cli-workspace-restart');
                 console.log('[restart] Stopping Router and configured agents...');
                 killRouterIfRunning();
@@ -661,9 +672,6 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
             }
             break;
         }
-        case 'delete':
-            showHelp();
-            break;
         case 'shutdown': {
             inactivateEdgeRoutingGeneration('cli-workspace-shutdown');
             console.log('[shutdown] Stopping RoutingServer...');
@@ -682,7 +690,13 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                 showHelp(['stop']);
                 break;
             }
-            inactivateEdgeRoutingGeneration('cli-workspace-stop');
+            // Stop is the documented recovery, so this retirement never
+            // refuses it; it only runs before the selector rewrite below.
+            retireAbandonedStartPreparationBeforeStop();
+            const stopSelection = inactivateEdgeRoutingGenerationForStop('cli-workspace-stop');
+            if (stopSelection.preserved) {
+                console.log(`[stop] Kept the inactive routing selector of stopped workspace start pid ${stopSelection.pid}; the next start retires its preparation.`);
+            }
             console.log('[stop] Stopping RoutingServer...');
             killRouterIfRunning();
             console.log('[stop] Stopping configured agent containers...');
@@ -726,10 +740,6 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
         }
         case 'settings': {
             await runSettingsMenu({ onEnvChange: resetLlmInvokerCache });
-            break;
-        }
-        case 'set': {
-            console.log("Command renamed to '/settings'.");
             break;
         }
         case 'profile': {
@@ -796,54 +806,6 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
             break;
         }
     }
-}
-
-function disableAllAgents() {
-    const agentsMap = workspaceSvc.loadAgents();
-    const enabledAgents = Object.entries(agentsMap || {})
-        .filter(([containerName, record]) => containerName !== '_config' && record && record.type === 'agent');
-
-    if (!enabledAgents.length) {
-        console.log('No enabled agents found in this workspace.');
-        return;
-    }
-
-    const summary = {
-        removed: 0,
-        notFound: 0,
-        ambiguous: 0,
-        staticRemoved: 0,
-        unchanged: 0,
-        failed: 0,
-    };
-
-    for (const [containerName] of enabledAgents) {
-        try {
-            const result = agentsSvc.disableAgent(containerName);
-            switch (result?.status) {
-                case 'removed':
-                    summary.removed += 1;
-                    break;
-                case 'not-found':
-                    summary.notFound += 1;
-                    break;
-                case 'ambiguous':
-                    summary.ambiguous += 1;
-                    break;
-                case 'static-removed':
-                    summary.staticRemoved += 1;
-                    break;
-                default:
-                    summary.unchanged += 1;
-                    break;
-            }
-        } catch (error) {
-            summary.failed += 1;
-            console.error(`- Failed to disable '${containerName}': ${error?.message || error}`);
-        }
-    }
-
-    console.log(`Disable agents-all summary: removed=${summary.removed}, not-found=${summary.notFound}, ambiguous=${summary.ambiguous}, static-removed=${summary.staticRemoved}, unchanged=${summary.unchanged}, failed=${summary.failed}`);
 }
 
 export {

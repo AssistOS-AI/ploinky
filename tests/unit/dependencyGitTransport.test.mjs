@@ -5,11 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-import {
-    buildContainerInstallScript,
-    NPM_INSTALL_ARGS,
-    runNpmInstall,
-} from '../../cli/utils/dependencies/dependencyCache.js';
+import { buildContainerInstallScript } from '../../cli/utils/dependencies/store/installers.mjs';
+import { CONTAINER_NPM_INSTALL_ARGS } from '../../cli/utils/dependencies/store/npmPolicy.mjs';
 
 function fixture(t, transport) {
     const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'dependency-git-'));
@@ -54,7 +51,7 @@ function assertObserved(f, transport) {
         transport,
         inherited: 'kept',
         url: 'https://github.com/AssistOS-AI/soplang.git',
-        args: NPM_INSTALL_ARGS,
+        args: CONTAINER_NPM_INSTALL_ARGS,
     });
 }
 
@@ -81,11 +78,11 @@ test('npm update advances a Git branch dependency without a package.json edit', 
     const manifest = JSON.stringify({ name: 'consumer', version: '1.0.0',
         dependencies: { 'moving-example': `git+${pathToFileURL(source).href}#main` } });
     fs.writeFileSync(path.join(consumer, 'package.json'), manifest);
-    run('npm', NPM_INSTALL_ARGS, consumer);
+    run('npm', CONTAINER_NPM_INSTALL_ARGS, consumer);
     const installed = path.join(consumer, 'node_modules/moving-example/feature.txt');
     assert.equal(fs.readFileSync(installed, 'utf8'), 'before');
     commit('effort-support');
-    run('npm', ['update', ...NPM_INSTALL_ARGS.slice(1)], consumer);
+    run('npm', ['update', ...CONTAINER_NPM_INSTALL_ARGS.slice(1)], consumer);
     assert.equal(fs.readFileSync(installed, 'utf8'), 'effort-support');
     assert.equal(fs.readFileSync(path.join(consumer, 'package.json'), 'utf8'), manifest);
 });
@@ -107,18 +104,5 @@ for (const transport of [null, 'HTTP/2']) {
             assert.equal(result.status, exitCode, `${result.stdout}\n${result.stderr}`);
             assertObserved(f, transport);
         }
-    });
-
-    test(`host npm preserves ${label}, caller environment and Git configuration`, (t) => {
-        const f = fixture(t, transport);
-        const originalEnv = process.env;
-        process.env = { ...f.env };
-        t.after(() => { process.env = originalEnv; });
-        const before = { ...process.env };
-        const config = fs.readFileSync(f.config, 'utf8');
-        runNpmInstall(f.root, { log() {} });
-        assertObserved(f, transport);
-        assert.deepEqual(process.env, before);
-        assert.equal(fs.readFileSync(f.config, 'utf8'), config);
     });
 }

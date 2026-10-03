@@ -143,6 +143,19 @@ test('buildProviderSubprocessEnv includes only allowlisted runtime and provider 
     }
 });
 
+test('the outer Box image ID name is reserved and never reaches a config-provider process', () => {
+    assert.ok(RESERVED_AGENT_ENV_NAMES.includes('PLOINKY_BOX_IMAGE_ID'));
+    const env = buildProviderSubprocessEnv({
+        provider: providerDescriptor({
+            profileConfig: { env: { PLOINKY_BOX_IMAGE_ID: `sha256:${'f'.repeat(64)}`, EXAMPLE_REGION: 'eu-test-1' } },
+        }),
+        workspaceRoot: tempDir,
+        profileName: 'qa',
+    });
+    assert.equal(env.PLOINKY_BOX_IMAGE_ID, undefined);
+    assert.equal(env.EXAMPLE_REGION, 'eu-test-1');
+});
+
 test('buildProviderSubprocessEnv rejects invalid direct provider data keys', () => {
     for (const shortAgentName of ['', '..', 'nested/provider']) {
         assert.throws(() => buildProviderSubprocessEnv({

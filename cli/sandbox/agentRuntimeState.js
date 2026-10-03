@@ -1,4 +1,4 @@
-import { getBwrapPid, isBwrapProcessRunning } from './bwrap/bwrapFleet.js';
+import { getBwrapPid, isBwrapProcessRunning, registeredRuntimeTuple } from './bwrap/bwrapFleet.js';
 import { collectLiveAgentContainers, collectLiveAgentContainersAsync, getAgentsRegistry } from './docker/containerRegistry.js';
 import { loadActiveEdgeRoutingGeneration } from './edgeGeneration.js';
 import { resolveAgentExecutionMode, resolveAgentReadinessProtocol } from '../utils/runtime/startupReadiness.js';
@@ -145,8 +145,11 @@ function collectAgentRuntimeStates(options = {}) {
         const runtime = normalizeRuntime(record);
 
         if (HOST_SANDBOX_RUNTIMES.has(runtime)) {
-            const processRunning = Boolean(sandboxRunning(record.agentName));
-            const pid = processRunning ? Number(sandboxPid(record.agentName) || record.pid || 0) : 0;
+            // PID records are keyed by the exact runtime key (the registry key)
+            // and bound to the record's tuple; the short agent name names none.
+            const tuple = registeredRuntimeTuple(record) || undefined;
+            const processRunning = Boolean(sandboxRunning(containerName, tuple));
+            const pid = processRunning ? Number(sandboxPid(containerName, tuple) || record.pid || 0) : 0;
             states.push({
                 ...stoppedRuntimeEntry(containerName, record, runtime),
                 engineRunning: processRunning,

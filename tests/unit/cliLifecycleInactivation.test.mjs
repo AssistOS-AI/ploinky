@@ -15,6 +15,13 @@ function assertOrdered(source, labels) {
     }
 }
 
+function sliceBetween(source, startLabel, endLabel) {
+    const start = source.indexOf(startLabel);
+    const end = source.indexOf(endLabel, start);
+    assert.ok(start >= 0 && end > start, `expected a block from '${startLabel}' to '${endLabel}'`);
+    return source.slice(start, end);
+}
+
 test('whole-workspace and Router lifecycle commands inactivate edge authorization before stopping processes', () => {
     assertOrdered(cliSource, [
         "inactivateEdgeRoutingGeneration('cli-router-restart')",
@@ -32,7 +39,8 @@ test('whole-workspace and Router lifecycle commands inactivate edge authorizatio
         'const list = destroyWorkspaceContainers();',
     ]);
     assertOrdered(cliSource, [
-        "inactivateEdgeRoutingGeneration('cli-workspace-stop')",
+        'retireAbandonedStartPreparationBeforeStop();',
+        "inactivateEdgeRoutingGenerationForStop('cli-workspace-stop')",
         'killRouterIfRunning();',
         'const list = stopConfiguredAgents();',
     ]);
@@ -41,6 +49,50 @@ test('whole-workspace and Router lifecycle commands inactivate edge authorizatio
         'killRouterIfRunning();',
         'await destroyAll();',
     ]);
+});
+
+test('restarts settle earlier no-wait workers and a stopped start preparation before replacing its selector or stopping processes', () => {
+    // The restart inactivation replaces the only selector that binds a stopped
+    // start's preparation, and its stop cannot see a no-wait worker's
+    // half-created runtime; either refusal must happen before any stop.
+    assertOrdered(sliceBetween(cliSource, "'restart router: start is not configured", "'[restart] RoutingServer restarted.'"), [
+        'await settleWorkspaceBeforeRestart();',
+        "inactivateEdgeRoutingGeneration('cli-router-restart')",
+        'killRouterIfRunning();',
+        'await startWorkspace(',
+    ]);
+    assertOrdered(sliceBetween(cliSource, "'restart: start is not configured", "'[restart] Done.'"), [
+        'await settleWorkspaceBeforeRestart();',
+        "inactivateEdgeRoutingGeneration('cli-workspace-restart')",
+        'killRouterIfRunning();',
+        'const list = stopConfiguredAgents();',
+        'await startWorkspace(',
+    ]);
+    assertOrdered(sliceBetween(workspaceSource, 'async function settleWorkspaceBeforeRestart(', '\n}\n'), [
+        "await acquireSettledWorkspaceMutationLease({ operation: 'workspace-restart' })",
+        'runWithWorkspaceMutationLease(workspaceMutationLease',
+        'withNetworkLifecycleLockReclaimingStoppedOwner(',
+        'retireAbandonedWorkspaceStartPreparation({',
+        'releaseWorkspaceMutationLease(workspaceMutationLease)',
+    ]);
+});
+
+test('stop retires a stopped start preparation only before its own selector rewrite and never waits on a live owner', () => {
+    const stopBlock = sliceBetween(cliSource, "case 'stop': {", "case 'destroy':");
+    assertOrdered(stopBlock, [
+        'retireAbandonedStartPreparationBeforeStop();',
+        "inactivateEdgeRoutingGenerationForStop('cli-workspace-stop')",
+    ]);
+    assert.doesNotMatch(stopBlock, /await retireAbandonedStartPreparationBeforeStop/,
+        'the stop retirement is synchronous and has no outcome that can refuse the stop');
+    const helper = sliceBetween(workspaceSource, 'function retireAbandonedStartPreparationBeforeStop(', '\n}\n');
+    assertOrdered(helper, [
+        "createWorkspaceMutationLease({ operation: 'workspace-stop' })",
+        'runWithWorkspaceMutationLease(workspaceMutationLease',
+        'withNetworkLifecycleLockReclaimingStoppedOwner(retire)',
+    ]);
+    assert.doesNotMatch(helper, /acquireWorkspaceMutationLease|withWorkspaceMutationLease/,
+        'stop never waits for the workspace lease');
 });
 
 test('start admits prepared repositories before persisting the fixed Router port in the inactive transaction', () => {
@@ -58,8 +110,9 @@ test('start admits prepared repositories before persisting the fixed Router port
         'prepareDefaultBootRepositories',
         'prepareManifestRepositories',
         'const admittedStart = preflightWorkspaceStartRuntimeCapabilities',
-        "await acquireWorkspaceMutationLease({ operation: 'workspace-start' })",
+        "await acquireSettledWorkspaceMutationLease({ operation: 'workspace-start' })",
         'assertWorkspaceGraphAdmissionsCurrent(admittedStart.admissions)',
+        'retireAbandonedWorkspaceStartPreparation({',
         "inactivateEdgeRoutingGeneration('workspace-start-prepare'",
         'resolveAndPersistStartRouterPort(staticAgentArg, portArg, {',
         'coordinate: false',

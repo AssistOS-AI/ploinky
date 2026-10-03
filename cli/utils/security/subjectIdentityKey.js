@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
-import { PLOINKY_DIR } from '../config.js';
+import { CONTROLLER_STATE_DIR } from '../config.js';
 import { deriveSubkey, resolveMasterKey as resolveConfiguredMasterKey } from './masterKey.js';
 
 // Signed-subject identity key primitive.
@@ -17,11 +17,11 @@ import { deriveSubkey, resolveMasterKey as resolveConfiguredMasterKey } from './
 //
 // Storage uses an AES-256-GCM envelope keyed by a
 // HKDF subkey derived from the workspace master key via deriveSubkey(), written
-// atomically with 0o600 permissions under .ploinky/. The private key is
-// therefore encrypted at rest and never persisted in plaintext.
+// atomically with 0o600 permissions under the agent-masked .ploinky/data/. The
+// private key is therefore encrypted at rest and never persisted in plaintext.
 
 const KEYPAIR_NAME = 'ploinky_subject_identity_ed25519_v1';
-const KEYPAIR_STORE_FILE = path.join(PLOINKY_DIR, `${KEYPAIR_NAME}.enc`);
+const KEYPAIR_STORE_FILE = path.join(CONTROLLER_STATE_DIR, `${KEYPAIR_NAME}.enc`);
 const STORE_VERSION = 1;
 const ALGORITHM = 'aes-256-gcm';
 const IV_BYTES = 12;
@@ -65,7 +65,7 @@ function resolveKeypairStoreFile() {
 
 function getStorageKey() {
     // masterKey.js applies the active runtime's single source of truth. Managed
-    // Boxes use `.ploinky/master-key` exclusively; non-Box execution retains
+    // Boxes use `.ploinky/data/master-key` exclusively; non-Box execution retains
     // its explicit environment and local fallback sources.
     resolveConfiguredMasterKey({ purpose: 'subject identity signing keypair storage' });
     return deriveSubkey(SUBKEY_PURPOSE);
@@ -123,7 +123,7 @@ function readStore() {
 function writeStore(store) {
     const storeFile = resolveKeypairStoreFile();
     const packed = encryptStoreToPacked(store);
-    fs.mkdirSync(path.dirname(storeFile), { recursive: true });
+    fs.mkdirSync(path.dirname(storeFile), { recursive: true, mode: 0o700 });
     const tempPath = `${storeFile}.${process.pid}.${Date.now()}.tmp`;
     fs.writeFileSync(tempPath, `${packed}\n`, { encoding: 'utf8', mode: 0o600 });
     fs.renameSync(tempPath, storeFile);

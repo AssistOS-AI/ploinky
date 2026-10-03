@@ -17,6 +17,7 @@ import {
     agentLibEnvArgs,
     agentLibLabels,
     agentLibMountArgs,
+    boxImageIdEnv,
     normalizeBoxAgentLib,
 } from '../contract/agentlib.mjs';
 import { validateContainerConfiguration } from '../contract/container.mjs';
@@ -125,8 +126,8 @@ export function containerCreateArgs({
         throw lifecycleError('Container creation requires a selected achillesAgentLib source');
     }
     const agentLibContract = normalizeBoxAgentLib(agentLib);
-    if (agentLibContract.mode === 'image' && agentLibContract.imageId !== normalizeImageId(imageId)) {
-        throw lifecycleError('Container image does not match the selected AchillesAgentLib bundle');
+    if (agentLibContract.mode === 'image' && agentLibContract.supplyingImageId !== normalizeImageId(imageId)) {
+        throw lifecycleError('Container image does not match the image that supplies the selected AchillesAgentLib');
     }
     // One public Router TCP publication on the selected host address. Only a
     // non-loopback binding records its address label and trusted outer hosts.
@@ -188,6 +189,9 @@ export function containerCreateArgs({
         ...Object.entries(boxWorkspaceEnvironment(workspaceRoot))
             .flatMap(([key, value]) => ['--env', `${key}=${value}`]),
         ...agentLibEnvArgs(agentLibContract),
+        // The outer image ID identifies the libraries the image supplies in
+        // both Achilles modes. Every exec in this Box inherits it.
+        ...Object.entries(boxImageIdEnv(imageId)).flatMap(([key, value]) => ['--env', `${key}=${value}`]),
         '--env', 'PLOINKY_PUBLIC_BIND=0.0.0.0',
         '--env', `PLOINKY_PUBLIC_AUTHORITY=${publicAuthority}`,
         '--env', 'PLOINKY_PRIVATE_BIND=0.0.0.0',

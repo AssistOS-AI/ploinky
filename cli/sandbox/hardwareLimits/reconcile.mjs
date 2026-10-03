@@ -11,6 +11,7 @@ import { resolveManifestRuntimeProfile } from '../../utils/runtime/profileServic
 import { resolveRouterEndpoint } from '../routerPort.js';
 import { ensureAgentService, retireExactAgentRuntimePredecessor } from '../docker/agentServiceManager.js';
 import { getRuntimeForAgent, isSandboxRuntime, getContainerLabel, getRuntime } from '../docker/common.js';
+import { registeredRuntimeTuple } from '../bwrap/bwrapFleet.js';
 import { resolveLlmRuntimeAdmissionContext } from '../docker/llmRuntimeIntegration.js';
 import { admitManifestRuntimeCapabilities, hardwareLimitsHashOf } from '../runtimeCapabilities.js';
 import { waitForManifestReadiness, activatePreparedRuntimeAfterReadiness, cleanupFailedPreparedRuntime, admitWorkspaceGraphRuntimeCapabilities } from '../../commands/workspaceUtil.js';
@@ -225,6 +226,8 @@ export async function reconcileExactHardwareInstance(captured, {
             phase = gpuClient ? 'client-launch' : 'runtime-launch';
             result = await ensure(captured.record.agentName, plan.manifest, plan.agentPath, {
                 containerName: captured.key, alias: captured.record.alias, forceRecreate: true, forceRecreateReason: 'hardware limits reconciliation',
+                // The exact registered runtime this reconcile replaces (the only occupant a native sandbox slot may be stopped for).
+                expectedPredecessor: registeredRuntimeTuple(captured.record),
                 hardwareInstanceKey: captured.key,
                 profileName: plan.profileResolution.resolvedProfileName, profileResolution: plan.profileResolution,
                 routerEndpoint: plan.routerEndpoint, runtimeAdmission: plan.runtimeAdmission,

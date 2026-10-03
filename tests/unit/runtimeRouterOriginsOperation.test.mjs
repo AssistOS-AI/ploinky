@@ -25,7 +25,7 @@ import {
     consumerAssertionEnv,
     createRouterOriginsWorkspace,
     handlePrivateRuntimeOrigins,
-    installLegacyGeneration,
+    installGenerationWithoutPublicHosts,
     selectBinding,
     signedRuntimeOriginsHeaders,
 } from '../helpers/routerOriginsWorkspace.mjs';
@@ -302,15 +302,8 @@ test('origins are available whether the consumer is added after binding or the g
     assert.deepEqual((await call()).json().routerOrigins, ORIGINS);
 });
 
-test('a legacy active generation gives no Router-origin answer even on a bound Box', async (t) => {
+test('an active generation without public Router hosts gives no Router-origin answer even on a bound Box', async (t) => {
     const fixture = createRouterOriginsWorkspace(t, { hosts: ['100.73.151.25', 'pgx'] });
-    installLegacyGeneration(fixture.edgeDir, fixture.applied.selector.generation);
-    const legacy = await call();
-    assert.equal(legacy.statusCode, 503);
-    assert.equal(errorCode(legacy), 'RUNTIME_ORIGINS_UNSUPPORTED_GENERATION');
-    assert.doesNotMatch(legacy.body, /pgx|100\.73/);
-
-    applyEdgeRoutingGeneration({ workspaceRoot: fixture.workspace, reason: 'legacy-replacement' });
     assert.deepEqual((await call()).json().routerOrigins, ORIGINS);
 
     const plan = resolveEdgeRoutePlan({
@@ -322,4 +315,10 @@ test('a legacy active generation gives no Router-origin answer even on a bound B
         { code: 'RUNTIME_ORIGINS_INVALID', status: 503 });
     assert.throws(() => buildRuntimeRouterOriginsResponse({ ...plan, lease: { ...plan.lease, activationId: 'not-a-uuid' } }),
         { code: 'RUNTIME_ORIGINS_LEASE_INVALID', status: 503 });
+
+    installGenerationWithoutPublicHosts(fixture.edgeDir, fixture.applied.selector.generation);
+    const unsupported = await call();
+    assert.equal(unsupported.statusCode, 503);
+    assert.equal(errorCode(unsupported), 'EDGE_GENERATION_CORRUPT');
+    assert.doesNotMatch(unsupported.body, /pgx|100\.73/);
 });

@@ -1,39 +1,37 @@
-#!/usr/bin/env node
-import crypto from 'node:crypto';
+// Runtime checks for the MCP SDK the Box image supplies.
+//
+// The image build owns selecting, packaging and describing the SDK. Ploinky only
+// checks that the copy is a usable package - the right package, its declared
+// entry point present, and a plain file tree - and identifies it by the
+// immutable Box image that supplies it. It never hashes SDK bytes and never
+// compares the copy with a revision Ploinky expects.
+
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
 
-export const MCP_SDK_BUNDLE_SCHEMA = 'ploinky.box.mcp-sdk/v1';
+import {
+    AGENTLIB_ERROR_CODES,
+    agentLibError,
+    assertSupplyingImageId,
+    normalizeLibraryProvenance,
+} from '../agentlib/contract.mjs';
+
+/** The name Ploinky imports and provides the SDK under. */
+export const MCP_SDK_LIBRARY_NAME = 'mcp-sdk';
 export const MCP_SDK_BUNDLE_PATH = '/usr/local/lib/ploinky/mcp-sdk';
 export const MCP_SDK_BUNDLE_METADATA_NAME = '.ploinky-box-mcp-sdk.json';
+export const MCP_SDK_METADATA_SCHEMA = 'ploinky.box.library/v1';
 export const MCP_SDK_PACKAGE_NAME = '@modelcontextprotocol/sdk';
-
-const PIN_PATTERN = /^[a-f0-9]{40}$/;
-const HASH_PATTERN = /^[a-f0-9]{64}$/;
+/**
+ * Repository identity used to recognize a dependency that would duplicate the
+ * provided SDK. It identifies the package and never selects a commit.
+ */
+export const MCP_SDK_REPOSITORY_URL = 'https://github.com/AssistOS-AI/MCPSDK.git';
 
 function bundleError(message, cause) {
     const error = new Error(message, cause ? { cause } : undefined);
     error.code = 'PLOINKY_BOX_MCP_SDK_BUNDLE_FAILED';
     return error;
-}
-
-function exactKeys(value, expected) {
-    return value
-        && typeof value === 'object'
-        && !Array.isArray(value)
-        && JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...expected].sort());
-}
-
-function assertRepository(repository) {
-    if (!exactKeys(repository, ['commit', 'url'])
-        || typeof repository.url !== 'string'
-        || !repository.url.startsWith('https://github.com/')
-        || !PIN_PATTERN.test(repository.commit)) {
-        throw bundleError('MCP SDK bundle repository metadata is invalid');
-    }
-    return repository;
 }
 
 function assertRealDirectory(directory, fsApi) {
@@ -61,47 +59,68 @@ function readJsonFile(filename, fsApi, description) {
     }
 }
 
-function readPackage(sourceRoot, fsApi) {
-    const pkg = readJsonFile(path.join(sourceRoot, 'package.json'), fsApi, 'MCP SDK package.json');
+/** The file `exports["."]` names, whether a plain string or a condition map. */
+function entryTarget(pkg) {
+    const declared = pkg?.exports?.['.'];
+    const pick = (value) => {
+        if (typeof value === 'string') return value;
+        if (!value || typeof value !== 'object') return null;
+        for (const condition of ['import', 'default', 'node', 'require']) {
+            const found = pick(value[condition]);
+            if (found) return found;
+        }
+        return null;
+    };
+    return pick(declared);
+}
+
+/**
+ * Check the SDK package: the expected package name and version, and a present,
+ * contained entry point. No revision, repository or content is compared.
+ *
+ * @returns {Readonly<{sourceRoot: string, packageName: string, packageVersion: string, entry: string}>}
+ */
+export function readMcpSdkPackage({ sourceRoot = MCP_SDK_BUNDLE_PATH, fsApi = fs } = {}) {
+    const root = path.resolve(sourceRoot);
+    assertRealDirectory(root, fsApi);
+    const pkg = readJsonFile(path.join(root, 'package.json'), fsApi, 'MCP SDK package.json');
     if (pkg?.name !== MCP_SDK_PACKAGE_NAME
         || typeof pkg.version !== 'string'
         || !pkg.version.trim()) {
         throw bundleError(`MCP SDK bundle must contain ${MCP_SDK_PACKAGE_NAME}`);
     }
-    return pkg;
-}
-
-function assertNoRuntimeDependencies(pkg) {
-    for (const field of ['dependencies', 'optionalDependencies', 'peerDependencies']) {
-        const declared = pkg[field];
-        if (declared !== undefined
-            && (!declared || typeof declared !== 'object' || Array.isArray(declared)
-                || Object.keys(declared).length > 0)) {
-            throw bundleError(
-                `Pinned MCP SDK declares ${field}; its image bundle contract must be extended first`,
-            );
-        }
+    const target = entryTarget(pkg);
+    if (!target) throw bundleError('The MCP SDK package declares no exports["."] entry point');
+    const entry = path.resolve(root, target);
+    if (entry !== root && !entry.startsWith(`${root}${path.sep}`)) {
+        throw bundleError(`The MCP SDK entry point ${target} is outside the package`);
     }
-}
-
-export function readMcpSdkRepositoryFromLock({ lockPath, fsApi = fs } = {}) {
-    const lock = readJsonFile(lockPath, fsApi, 'Ploinky Box dependency lock');
-    if (!exactKeys(lock, ['repositories'])
-        || !exactKeys(lock.repositories, ['achillesAgentLib', 'mcp-sdk'])) {
-        throw bundleError('Ploinky Box dependency lock has an unexpected repository set');
+    let entryStat;
+    try {
+        entryStat = fsApi.lstatSync(entry);
+    } catch (error) {
+        throw bundleError(`The MCP SDK entry point ${target} is missing`, error);
     }
-    return Object.freeze({ ...assertRepository(lock.repositories['mcp-sdk']) });
+    if (entryStat.isSymbolicLink() || !entryStat.isFile()) {
+        throw bundleError(`The MCP SDK entry point ${target} is not a regular file`);
+    }
+    return Object.freeze({
+        sourceRoot: root,
+        packageName: pkg.name,
+        packageVersion: pkg.version,
+        entry: path.relative(root, entry).split(path.sep).join('/'),
+    });
 }
 
-export function fingerprintMcpSdkBundle(sourceRoot, fsApi = fs) {
+/**
+ * The plain file tree of a supplied or copied SDK: no symlinks, no Git
+ * metadata, only regular files. This walks entries and never reads file bytes.
+ */
+export function assertMcpSdkTree(sourceRoot, fsApi = fs) {
     const root = path.resolve(sourceRoot);
     assertRealDirectory(root, fsApi);
-    const hash = crypto.createHash('sha256');
-
     const visit = (directory, relativeDirectory = '') => {
-        const names = fsApi.readdirSync(directory).sort();
-        for (const name of names) {
-            if (!relativeDirectory && name === MCP_SDK_BUNDLE_METADATA_NAME) continue;
+        for (const name of fsApi.readdirSync(directory).sort()) {
             if (!relativeDirectory && name === '.git') {
                 throw bundleError('MCP SDK image bundle must not contain Git metadata');
             }
@@ -112,157 +131,45 @@ export function fingerprintMcpSdkBundle(sourceRoot, fsApi = fs) {
                 throw bundleError(`MCP SDK image bundle must not contain symlinks: ${relative}`);
             }
             if (stat.isDirectory()) {
-                hash.update(`directory\0${relative}\0`);
                 visit(absolute, relative);
                 continue;
             }
             if (!stat.isFile() || stat.nlink !== 1) {
                 throw bundleError(`MCP SDK image bundle contains a non-regular file: ${relative}`);
             }
-            const bytes = fsApi.readFileSync(absolute);
-            hash.update(`file\0${relative}\0${bytes.length}\0`);
-            hash.update(bytes);
         }
     };
-
     visit(root);
-    return hash.digest('hex');
 }
 
-export function createMcpSdkBundleMetadata({ sourceRoot, repository, fsApi = fs }) {
-    const selectedRepository = assertRepository(repository);
-    const pkg = readPackage(sourceRoot, fsApi);
-    assertNoRuntimeDependencies(pkg);
-    return Object.freeze({
-        schema: MCP_SDK_BUNDLE_SCHEMA,
-        repository: Object.freeze({ ...selectedRepository }),
-        package: Object.freeze({ name: pkg.name, version: pkg.version }),
-        contentSha256: fingerprintMcpSdkBundle(sourceRoot, fsApi),
-    });
-}
-
-export function validateMcpSdkBundle({
-    sourceRoot = MCP_SDK_BUNDLE_PATH,
-    expectedRepository,
-    fsApi = fs,
-} = {}) {
-    const root = path.resolve(sourceRoot);
-    assertRealDirectory(root, fsApi);
-    const metadata = readJsonFile(
-        path.join(root, MCP_SDK_BUNDLE_METADATA_NAME),
-        fsApi,
-        'MCP SDK bundle metadata',
-    );
-    if (!exactKeys(metadata, ['contentSha256', 'package', 'repository', 'schema'])
-        || metadata.schema !== MCP_SDK_BUNDLE_SCHEMA
-        || !exactKeys(metadata.package, ['name', 'version'])
-        || metadata.package.name !== MCP_SDK_PACKAGE_NAME
-        || typeof metadata.package.version !== 'string'
-        || !HASH_PATTERN.test(metadata.contentSha256)) {
-        throw bundleError('MCP SDK bundle metadata has an invalid contract');
-    }
-    const repository = assertRepository(metadata.repository);
-    if (expectedRepository
-        && (repository.url !== expectedRepository.url
-            || repository.commit !== expectedRepository.commit)) {
-        throw bundleError('MCP SDK image bundle does not match the Ploinky dependency lock');
-    }
-    const pkg = readPackage(root, fsApi);
-    assertNoRuntimeDependencies(pkg);
-    if (pkg.name !== metadata.package.name || pkg.version !== metadata.package.version) {
-        throw bundleError('MCP SDK bundle package metadata does not match its contract');
-    }
-    const observedFingerprint = fingerprintMcpSdkBundle(root, fsApi);
-    if (observedFingerprint !== metadata.contentSha256) {
-        throw bundleError('MCP SDK bundle content fingerprint does not match its contract');
-    }
-    return Object.freeze({
-        schema: metadata.schema,
-        repository: Object.freeze({ ...repository }),
-        package: Object.freeze({ ...metadata.package }),
-        contentSha256: metadata.contentSha256,
-        sourceRoot: root,
-    });
-}
-
-function defaultGit(args, { cwd, env = process.env } = {}) {
-    const result = spawnSync('git', args, {
-        cwd,
-        env,
-        encoding: 'utf8',
-        maxBuffer: 1024 * 1024,
-    });
-    if (result.error || result.status !== 0) {
-        const detail = String(result.stderr || result.stdout || result.error?.message || '').trim();
-        throw bundleError(`git ${args[0]} failed while preparing the MCP SDK bundle${detail ? `: ${detail}` : ''}`);
-    }
-    return String(result.stdout || '').trim();
-}
-
-export function prepareMcpSdkBundle({
-    sourceRoot,
-    lockPath,
-    fsApi = fs,
-    git = defaultGit,
-} = {}) {
-    const root = path.resolve(sourceRoot);
-    assertRealDirectory(root, fsApi);
-    const repository = readMcpSdkRepositoryFromLock({ lockPath, fsApi });
-    const toolEnvironment = {
-        PATH: String(process.env.PATH || '/usr/local/bin:/usr/bin:/bin'),
-        HOME: '/tmp/ploinky-mcp-sdk-build-home',
-        GIT_CONFIG_NOSYSTEM: '1',
-        GIT_CONFIG_GLOBAL: '/dev/null',
-    };
-    const head = git(['-C', root, 'rev-parse', 'HEAD'], { cwd: root, env: toolEnvironment });
-    if (head !== repository.commit) {
-        throw bundleError(`MCP SDK checkout ${head || 'has no HEAD'}; expected ${repository.commit}`);
-    }
-    const dirty = git(['-C', root, 'status', '--porcelain=v1'], { cwd: root, env: toolEnvironment });
-    if (dirty) throw bundleError('MCP SDK checkout is not clean');
-    // Reject an unsupported package shape before changing the checked-out
-    // source. Builder inputs remain inspectable when preparation fails.
-    assertNoRuntimeDependencies(readPackage(root, fsApi));
-    fsApi.rmSync(path.join(root, '.git'), { recursive: true, force: true });
-    const metadata = createMcpSdkBundleMetadata({ sourceRoot: root, repository, fsApi });
-    fsApi.writeFileSync(
-        path.join(root, MCP_SDK_BUNDLE_METADATA_NAME),
-        `${JSON.stringify(metadata)}\n`,
-        { flag: 'wx', mode: 0o644 },
-    );
-    return validateMcpSdkBundle({ sourceRoot: root, expectedRepository: repository, fsApi });
-}
-
-function parseCli(argv) {
-    const [operation, ...rest] = argv;
-    const options = {};
-    for (let index = 0; index < rest.length; index += 2) {
-        const key = rest[index];
-        const value = rest[index + 1];
-        if (!key?.startsWith('--') || value === undefined) {
-            throw bundleError('MCP SDK bundle command arguments are invalid');
-        }
-        options[key.slice(2)] = value;
-    }
-    if (!['prepare', 'verify'].includes(operation) || !options.source) {
-        throw bundleError('Usage: mcp-sdk-bundle.mjs <prepare|verify> --source <path> [--lock <path>]');
-    }
-    if (operation === 'prepare' && !options.lock) {
-        throw bundleError('MCP SDK bundle preparation requires --lock');
-    }
-    return { operation, options };
-}
-
-const invokedPath = process.argv[1] ? path.resolve(process.argv[1]) : '';
-if (invokedPath === fileURLToPath(import.meta.url)) {
+/**
+ * Build-generated provenance of the SDK copy, or all-null when the record is
+ * absent or not in the current format. It is diagnostic information only.
+ */
+export function readMcpSdkProvenance({ sourceRoot = MCP_SDK_BUNDLE_PATH, fsApi = fs } = {}) {
     try {
-        const { operation, options } = parseCli(process.argv.slice(2));
-        const result = operation === 'prepare'
-            ? prepareMcpSdkBundle({ sourceRoot: options.source, lockPath: options.lock })
-            : validateMcpSdkBundle({ sourceRoot: options.source });
-        process.stdout.write(`${JSON.stringify(result)}\n`);
-    } catch (error) {
-        process.stderr.write(`ploinky-box MCP SDK bundle failed: ${error.message}\n`);
-        process.exitCode = 1;
+        const metadata = readJsonFile(
+            path.join(path.resolve(sourceRoot), MCP_SDK_BUNDLE_METADATA_NAME), fsApi, 'MCP SDK bundle metadata',
+        );
+        if (metadata?.schema !== MCP_SDK_METADATA_SCHEMA || metadata?.library !== MCP_SDK_LIBRARY_NAME) {
+            return normalizeLibraryProvenance(null);
+        }
+        return normalizeLibraryProvenance(metadata);
+    } catch (_) {
+        return normalizeLibraryProvenance(null);
     }
+}
+
+/**
+ * The identity of the SDK a Box supplies: the immutable outer Box image that
+ * carries it, plus the library name. Nested agent images never appear here.
+ */
+export function mcpSdkIdentity(supplyingImageId) {
+    let imageId;
+    try {
+        imageId = assertSupplyingImageId(supplyingImageId, 'MCP SDK supplying image ID');
+    } catch (error) {
+        throw agentLibError(AGENTLIB_ERROR_CODES.imageInvalid, error.message, { cause: error });
+    }
+    return Object.freeze({ kind: 'image', library: MCP_SDK_LIBRARY_NAME, supplyingImageId: imageId });
 }

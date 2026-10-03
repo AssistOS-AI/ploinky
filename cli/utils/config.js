@@ -69,7 +69,9 @@ if (!process.env.PLOINKY_CWD) {
 export const PLOINKY_DIR = path.join(PLOINKY_WORKSPACE_ROOT, '.ploinky');
 export const REPOS_DIR = path.join(PLOINKY_DIR, 'repos');
 export const AGENTS_FILE = path.join(PLOINKY_DIR, 'agents.json');
-export const SECRETS_FILE = path.join(PLOINKY_DIR, '.secrets');
+// Controller-only state: agent runtimes mask `.ploinky/data` entirely.
+export const CONTROLLER_STATE_DIR = path.join(PLOINKY_DIR, 'data');
+export const SECRETS_FILE = path.join(CONTROLLER_STATE_DIR, '.secrets');
 export const PROFILE_FILE = path.join(PLOINKY_DIR, 'profile');
 export const AGENTS_DATA_DIR = path.join(PLOINKY_WORKSPACE_ROOT, '.data');
 
@@ -81,8 +83,6 @@ export const RUNNING_DIR = path.join(PLOINKY_DIR, 'running');
 export const ROUTING_FILE = path.join(PLOINKY_DIR, 'routing.json');
 export const SERVERS_CONFIG_FILE = path.join(PLOINKY_DIR, 'servers.json');
 export const DEPS_DIR = path.join(PLOINKY_DIR, 'deps');
-export const GLOBAL_DEPS_CACHE_DIR = path.join(DEPS_DIR, 'global');
-export const AGENTS_DEPS_CACHE_DIR = path.join(DEPS_DIR, 'agents');
 export const HISTORY_FILE = path.join(PLOINKY_DIR, 'ploinky_history');
 export const TEMPLATES_DIR = path.join(path.dirname(new URL(import.meta.url).pathname), '../../templates');
 export const GLOBAL_DEPS_PATH = path.join(path.dirname(new URL(import.meta.url).pathname), '../../globalDeps');

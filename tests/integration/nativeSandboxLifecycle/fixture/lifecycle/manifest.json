@@ -1,0 +1,15 @@
+{
+  "lite-sandbox": true,
+  "start": "node server.js",
+  "network": { "mode": "host" },
+  "readiness": { "protocol": "tcp" },
+  "env": [
+    { "name": "LIFECYCLE_MARKER", "value": "__MARKER__" },
+    { "name": "LIFECYCLE_PROBE_PATH", "value": "__PROBE_PATH__" }
+  ],
+  "profiles": {
+    "default": {
+      "openPorts": ["127.0.0.1:__PORT__:__PORT__"]
+    }
+  }
+}

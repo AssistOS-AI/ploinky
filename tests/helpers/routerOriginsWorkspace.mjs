@@ -117,9 +117,10 @@ export function selectActiveGeneration(edgeDir, generation) {
     return selector;
 }
 
-// Rewrite one document exactly as a writer from before public Router hosts
-// were a generation source would have produced it, then select it.
-export function installLegacyGeneration(edgeDir, current) {
+// Rewrite one document without its public Router hosts source, with a digest
+// that is otherwise self-consistent, then select it. Such a generation is an
+// unsupported shape that every loader must reject as corrupt.
+export function installGenerationWithoutPublicHosts(edgeDir, current) {
     const document = readGenerationDocument(edgeDir, current);
     const parts = generationSourceParts(document, { withPublicHosts: false });
     delete document.sources.routerPublicHosts;

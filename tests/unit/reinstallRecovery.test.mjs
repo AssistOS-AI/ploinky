@@ -7,11 +7,12 @@ import { reinstallAgent } from '../../cli/commands/workspaceUtil.js';
 // Execute the command body with runtime boundaries replaced, so recovery can
 // be tested without installing agents or mutating a real workspace.
 function fixture({ runtime = 'docker', running = false, active = true, failure, enabled = true, changedRegistration = false,
-    routerRunning = true, routerFailure = null } = {}) {
+    routerRunning = true, routerFailure = null, ambiguous = false, settlementFailure = false, applied = true } = {}) {
     let resolutions = 0;
     let routerReady = routerRunning;
     const calls = [];
     const errors = [];
+    const rebuild = [];
     const record = {
         containerName: 'workspace-example',
         record: { repoName: 'repo', agentName: 'example', alias: 'chosen-name', profile: 'local',
@@ -26,10 +27,11 @@ function fixture({ runtime = 'docker', running = false, active = true, failure, 
         path,
         __dirname: '/ploinky/cli/commands',
         RUNNING_DIR: '/workspace/.ploinky/running',
-        console: { log() {}, error(message) { errors.push(message); } },
+        console: { log() {}, warn() {}, error(message) { errors.push(message); } },
         resolvePersistedRouterPort: () => 8080,
         agentsSvc: { resolveEnabledAgentRecord: () => {
             resolutions += 1;
+            if (ambiguous) throw new Error("agent reference 'chosen-name' is ambiguous");
             if (!enabled) return null;
             return changedRegistration && resolutions > 1
                 ? { ...record, record: { ...record.record, enableGeneration: 'concurrent-generation' } }
@@ -124,8 +126,26 @@ function fixture({ runtime = 'docker', running = false, active = true, failure, 
             if (!routerRunning) throw new Error('Router is stopped');
             return Buffer.from('123');
         },
+        issueDependencyRebuildRequest(name, options) {
+            assert.equal(name, record.containerName);
+            assert.equal(options.lease, 'workspace-lease');
+            rebuild.push(['request', name]);
+            return { registration: name, token: 'rebuild-token', reused: false };
+        },
+        settleDependencyRebuildRequest(name, token, options) {
+            assert.equal(name, record.containerName);
+            assert.equal(token, 'rebuild-token');
+            rebuild.push([options.outcome, options.error?.message || null]);
+            if (settlementFailure && options.outcome === 'admitted') throw new Error('rebuild state write failed');
+        },
+        runtimeCarriesRebuildToken: () => applied,
+        reportDependencyCollection: (value) => value,
+        collectDependencyObjectsAfterAdmission(options) {
+            assert.equal(options.lease, 'workspace-lease');
+            rebuild.push(['collect', options.reason]);
+        },
     };
-    return { run: vm.runInNewContext(`(${reinstallAgent.toString()})`, context), calls, errors, result };
+    return { run: vm.runInNewContext(`(${reinstallAgent.toString()})`, context), calls, errors, result, rebuild };
 }
 
 for (const runtime of ['docker', 'bwrap', 'seatbelt']) {
@@ -199,3 +219,41 @@ test('reinstall revalidates the enabled identity after waiting for the workspace
     await assert.rejects(run('chosen-name'), /changed while waiting for reinstall/);
     assert.deepEqual(calls.map(([step]) => step), ['cleanup']);
 });
+
+test('reinstall issues one desired rebuild request after revalidation and admits it only after activation', async () => {
+    const { run, calls, rebuild } = fixture();
+    await run('chosen-name');
+    assert.deepEqual(calls.map(([step]) => step), ['prepare', 'readiness', 'activate']);
+    assert.deepEqual(rebuild, [['request', 'workspace-example'], ['admitted', null], ['collect', 'reinstall']]);
+});
+
+for (const failure of ['install', 'readiness']) {
+    test(`a failed ${failure} keeps the admitted generation and records the desired request failure`, async () => {
+        const { run, rebuild } = fixture({ failure });
+        await assert.rejects(run('chosen-name'), { message: `${failure} failed` });
+        assert.deepEqual(rebuild, [['request', 'workspace-example'], ['failed', `${failure} failed`]], 'no admission, no collection');
+    });
+}
+
+test('reinstall of an ambiguous reference fails before any state change', async () => {
+    const { run, calls, rebuild } = fixture({ ambiguous: true });
+    await assert.rejects(run('chosen-name'), /ambiguous/);
+    assert.deepEqual(calls, []);
+    assert.deepEqual(rebuild, []);
+});
+
+test('a registration that changed while waiting never receives a rebuild request', async () => {
+    const { run, rebuild } = fixture({ changedRegistration: true });
+    await assert.rejects(run('chosen-name'), /changed while waiting for reinstall/);
+    assert.deepEqual(rebuild, []);
+});
+
+for (const options of [{ settlementFailure: true }, { applied: false }]) {
+    test(`an activated reinstall reports settlement failure without destroying the admitted runtime (${JSON.stringify(options)})`, async () => {
+        const { run, calls, rebuild } = fixture(options);
+        await assert.rejects(run('chosen-name'), { code: 'PLOINKY_DEPS_REBUILD_RECOVERY_REQUIRED' });
+        assert.equal(calls.some(([step]) => step === 'activate'), true);
+        assert.equal(calls.some(([step]) => step === 'cleanup'), false);
+        assert.equal(rebuild.some(([step]) => step === 'collect'), false);
+    });
+}

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import test from 'node:test';
 
 import { annotateRemediations, formatRemediationActions } from '../../ploinky-box/diagnose/remediations.mjs';
@@ -262,29 +263,24 @@ test('formatter separates admin blockers and optional inspections and safely quo
     assert.doesNotMatch(rendered, /do-not-print|\u001b/);
 });
 
-test('R1 a bundled AchillesAgentLib pin warning points to the supported image as an optional action', () => {
-    const result = annotate([check('image.agentlib.pin', 'The Box image bundles AchillesAgentLib x', { status: 'warn' })]);
-    assert.equal(result.actions[0].id, 'restore-supported-box-image');
-    assert.equal(result.actions[0].required, false);
-    // Image references, paths, and branch names in the detail must not select another remedy.
+test('R1 an unusable image AchillesAgentLib package points to the supported image as its action', () => {
     for (const detail of [
-        'The Box image registry.example.com/ploinky-box:latest (image cccccccccccc) bundles AchillesAgentLib bbbbbbbb.',
-        'This Ploinky checkout is probably older than the Box image: /home/u/overlay-work/ploinky (master at deadbeef) has never pinned bbbbbbbb.',
-        'This Ploinky checkout is probably older than the Box image: /home/u/ploinky (fix-cgroup-timeout at deadbeef) has never pinned bbbbbbbb.',
-        'unauthorized TLS certificate ENOSPC crun: unknown version specified',
+        'The Box AchillesAgentLib package is missing or failed inspection',
+        'The Box image (image cccccccccccc) does not supply the achillesAgentLib package. It reported package "something-else".',
+        'The Box AchillesAgentLib package is missing or failed inspection. The inspection command exited with status 1 without output.',
     ]) {
-        for (const status of ['warn', 'fail']) {
-            assert.deepEqual(annotate([check('image.agentlib.pin', detail, { status })]).actions.map((entry) => entry.id),
-                ['restore-supported-box-image'], `${status}: ${detail}`);
-        }
+        const [action] = annotate([check('image.agentlib', detail, { status: 'fail' })]).actions;
+        assert.equal(action.id, 'restore-supported-box-image', detail);
     }
 });
 
-test('R2 an invalid strict-pin setting points to the environment, not the image', () => {
-    const [action] = annotate([check('image.agentlib.pin', 'PLOINKY_AGENTLIB_STRICT_PIN must be 0 or 1 (got "yes")',
-        { code: 'PLOINKY_BOX_ARGUMENT_INVALID' })]).actions;
-    assert.equal(action.id, 'set-agentlib-strict-pin');
-    assert.equal(action.mode, 'manual');
-    assert.equal(action.requiresSudo, false);
-    assert.equal(action.required, true);
+test('R2 the strict-pin remediation and pin classification no longer exist', () => {
+    for (const id of ['image.agentlib.pin', 'image.agentlib']) {
+        for (const code of ['PLOINKY_BOX_ARGUMENT_INVALID', undefined]) {
+            const ids = annotate([check(id, 'PLOINKY_AGENTLIB_STRICT_PIN must be 0 or 1 (got "yes")', { code })]).actions.map((entry) => entry.id);
+            assert.equal(ids.includes('set-agentlib-strict-pin'), false, `${id} ${code}`);
+        }
+    }
+    const source = fs.readFileSync(new URL('../../ploinky-box/diagnose/remediations.mjs', import.meta.url), 'utf8');
+    assert.doesNotMatch(source, /STRICT_PIN|agentlib\.pin|pinPolicy/);
 });

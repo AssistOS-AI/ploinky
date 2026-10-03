@@ -95,10 +95,22 @@ export function resolveEffectiveHostPort({
     });
 }
 
-export function probeTcpAvailability(port, {
+export async function probeTcpAvailability(port, {
     host = ROUTER_BIND_LOOPBACK,
     createServer = () => net.createServer(),
+    listAddresses = listHostIpv4Addresses,
 } = {}) {
+    const addresses = [...new Set([ROUTER_BIND_LOOPBACK, ...listAddresses()])];
+    if (host === ROUTER_BIND_WILDCARD) {
+        // BSD/macOS can allow a reuse-address wildcard listener alongside a
+        // specific listener. Such a publication is still unsafe: traffic to
+        // that address would reach the other service instead of this Box.
+        for (const address of addresses.filter(value => value !== ROUTER_BIND_WILDCARD)) {
+            if (!await probeTcpAvailability(port, { host: address, createServer, listAddresses: () => addresses })) return false;
+        }
+    } else if (!addresses.includes(host)) {
+        throw portError(`Physical-host TCP address ${host} is not assigned to this host`, 'PLOINKY_BOX_BIND_ADDRESS_UNASSIGNED');
+    }
     return new Promise((resolve, reject) => {
         const server = createServer();
         let settled = false;

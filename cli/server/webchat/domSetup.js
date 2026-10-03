@@ -273,6 +273,7 @@ export function initDom() {
             interactionPromptOptions,
             attachmentContainer,
             sessionsBtn,
+            sessionSettingsLink: document.getElementById('sessionSettingsLink'),
             historyGate,
             sessionDialog,
             sessionDialogClose,

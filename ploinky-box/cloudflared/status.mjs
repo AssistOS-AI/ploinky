@@ -169,7 +169,11 @@ function ensureRealDirectoryChain(anchor, directory, fsApi) {
     }
 }
 
-export function writeCloudflarePublicationStatus(filePath, value, {
+/**
+ * Atomically replace one private JSON runtime file below a trusted workspace
+ * root, refusing symlinked parents and non-regular targets.
+ */
+export function writeTrustedCloudflareRuntimeFile(filePath, value, {
     fsApi = fs,
     now = () => Date.now(),
     pid = process.pid,
@@ -180,13 +184,12 @@ export function writeCloudflarePublicationStatus(filePath, value, {
     ensureRealDirectoryChain(trustedRoot, directory, fsApi);
     fsApi.chmodSync(directory, 0o700);
     assertRegularFileOrMissing(absolutePath, fsApi);
-    const serialized = serializeCloudflarePublicationStatus(value);
     const temporary = path.join(
         directory,
         `.${path.basename(absolutePath)}.${pid}.${now()}.tmp`,
     );
     try {
-        fsApi.writeFileSync(temporary, `${JSON.stringify(serialized, null, 2)}\n`, {
+        fsApi.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, {
             encoding: 'utf8',
             mode: 0o600,
             flag: 'wx',
@@ -196,5 +199,13 @@ export function writeCloudflarePublicationStatus(filePath, value, {
     } finally {
         try { fsApi.unlinkSync(temporary); } catch (_) {}
     }
-    return serialized;
+    return value;
+}
+
+export function writeCloudflarePublicationStatus(filePath, value, options = {}) {
+    return writeTrustedCloudflareRuntimeFile(
+        filePath,
+        serializeCloudflarePublicationStatus(value),
+        options,
+    );
 }

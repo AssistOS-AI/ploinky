@@ -30,14 +30,15 @@ test('collectAgentRuntimeStates reports live and stopped host sandboxes from tra
         routes: {
             codexAgent: { repo: 'Agents', agent: 'codexAgent', hostPort: 41001 },
         },
-        isSandboxRunning(agentName) {
-            checked.push(agentName);
-            return agentName === 'codexAgent';
+        // PID records are keyed by the registry key (the exact runtime key), not the agent name.
+        isSandboxRunning(runtimeKey) {
+            checked.push(runtimeKey);
+            return runtimeKey === 'bwrapKey';
         },
         getSandboxPid: () => 4242,
     });
 
-    assert.deepEqual(checked, ['codexAgent', 'piAgent']);
+    assert.deepEqual(checked, ['bwrapKey', 'seatbeltKey']);
     assert.deepEqual(states.map((entry) => ({
         name: entry.agentName,
         runtime: entry.runtime,
@@ -519,4 +520,30 @@ test('routes-only evidence cannot declare a portless script runtime ready', () =
     options.routes = options.activeGeneration.routing.routes;
     delete options.activeGeneration;
     assert.equal(collectAgentRuntimeStates(options)[0].state.running, false);
+});
+
+test('collectAgentRuntimeStates observes native runtimes by registry key and exact tuple, never by short agent name', () => {
+    const registry = {
+        ploinky_repoa_agent_ws: { type: 'agent', runtime: 'seatbelt', repoName: 'repoa', agentName: 'agent', instanceId: 'a-i', enableGeneration: 'a-g' },
+        ploinky_repob_agent_ws: { type: 'agent', runtime: 'bwrap', repoName: 'repob', agentName: 'agent', instanceId: 'b-i', enableGeneration: 'b-g' },
+    };
+    const checked = [];
+    const states = collectAgentRuntimeStates({
+        registry,
+        liveContainers: [],
+        routes: {},
+        isSandboxRunning(key, tuple) {
+            checked.push([key, tuple]);
+            return key === 'ploinky_repoa_agent_ws';
+        },
+        getSandboxPid: () => 4242,
+    });
+    assert.deepEqual(checked, [
+        ['ploinky_repoa_agent_ws', { instanceId: 'a-i', enableGeneration: 'a-g' }],
+        ['ploinky_repob_agent_ws', { instanceId: 'b-i', enableGeneration: 'b-g' }],
+    ]);
+    assert.deepEqual(states.map((entry) => [entry.containerName, entry.state.pid]), [
+        ['ploinky_repoa_agent_ws', 4242],
+        ['ploinky_repob_agent_ws', 0],
+    ], 'only the runtime observed under its own key reports a process');
 });

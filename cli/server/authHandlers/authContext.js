@@ -656,14 +656,6 @@ export function buildIdentityHeaders(req) {
     return headers;
 }
 
-export async function ensureAgentAuthenticated(req, res, parsedUrl) {
-    return {
-        ok: false,
-        error: 'legacy_agent_bearer_auth_removed',
-        detail: 'Agent-to-agent calls use an Agent Assertion JWT carried as `Authorization: Bearer`, verified by the router (DS015).'
-    };
-}
-
 function capabilityDenialRedirectTarget(req, parsedUrl, manifest) {
     const target = normalizeRelativePath(manifest?.routerAccess?.capabilityDeniedRedirect, '');
     if (!target || String(req?.method || '').toUpperCase() !== 'GET') return '';

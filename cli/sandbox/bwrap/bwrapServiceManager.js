@@ -35,7 +35,6 @@ import {
     PLOINKY_DIR,
     PROFILE_FILE,
     ROUTING_FILE,
-    SECRETS_FILE,
     SERVERS_CONFIG_FILE,
     PLOINKY_WORKSPACE_ROOT,
     PLOINKY_SKILL_SCOPE_ENV
@@ -49,10 +48,10 @@ import {
     ensurePersistentStorageHostDir
 } from '../../utils/runtime/runtimeResourcePlanner.js';
 import {
-    legacyAgentGuardMounts,
-    legacyAgentGuardTargets,
+    controllerGuardMounts,
+    controllerGuardTargets,
     normalizeRuntimeMountTarget,
-} from '../../utils/runtime/legacyAgentDataGuards.js';
+} from '../../utils/runtime/controllerStateGuards.js';
 import {
     assertCanonicalAgentDataPath,
     ensureAgentDataDirectory,
@@ -60,6 +59,7 @@ import {
 } from '../../utils/runtime/agentDataPathPolicy.js';
 import { deriveAgentPrincipalId } from '../../utils/security/agentIdentity.js';
 import { ensureSharedHostDir } from '../docker/agentHooks.js';
+import { resolveAgentHomeLayout } from '../docker/agentHomeLayout.js';
 import {
     runPreContainerLifecycle,
     runProfileLifecycle
@@ -84,12 +84,21 @@ import {
     getAgentCodePath,
     getAgentSkillsPath
 } from '../../utils/workspaceStructure.js';
-import { ensureAgentCacheForFamily } from '../../utils/dependencies/dependencyCache.js';
+import {
+    attachAdmittedDependencies,
+    noCacheDependencyRecord,
+    prepareRuntimeDependencies,
+    runtimeDependencyReuseProblem,
+    sandboxProcessIdentity,
+} from '../../utils/dependencies/store/runtimeDependencies.mjs';
 import {
     assertBwrapPidSlotAvailable,
     isBwrapProcessRunning,
     normalizeSandboxRuntimeIdentity,
+    normalizeExpectedPredecessor,
+    resolveSandboxSlotForStart,
     stopBwrapProcess,
+    stopExactSandboxOrThrow,
     saveBwrapPid,
     clearBwrapPid,
     getBwrapPid
@@ -204,24 +213,56 @@ function resolveBwrapNodeRuntime(nodeExecPath = process.execPath) {
     };
 }
 
+function bwrapNeedsDependencies(agentCodePath, manifest) {
+    const agentHasPackageJson = fs.existsSync(path.join(agentCodePath, 'package.json'));
+    return !readManifestStartCommand(manifest) || agentHasPackageJson;
+}
+
+/**
+ * Obtain the sandbox dependency tree from the immutable store and publish
+ * this service's reader receipt before launch.
+ */
 function resolveBwrapAgentNodeModules({
-    repoName,
-    agentName,
     agentCodePath,
     agentWorkDir,
     needsCoreDeps,
+    containerName,
+    runtimeIdentity,
+    admittedRecord,
 }) {
     if (!needsCoreDeps) {
         const fallback = path.join(agentWorkDir, 'node_modules');
         ensureAgentDataDirectory(fallback);
-        return fallback;
+        return { nodeModulesDir: fallback, record: noCacheDependencyRecord('no-core-deps', { family: 'bwrap' }), prepared: null };
     }
-    return ensureAgentCacheForFamily({
+    const prepared = prepareRuntimeDependencies({
         family: 'bwrap',
-        repoName,
-        agentName,
+        runtimeKey: detectHostRuntimeKey('bwrap'),
         agentCodePath,
+        registration: containerName,
+        admittedRecord,
+    }, {
+        consumer: {
+            kind: 'bwrap-service',
+            key: `bwrap:${containerName}:${runtimeIdentity.instanceId}:${runtimeIdentity.enableGeneration}`,
+            containerName,
+            registration: containerName,
+            phase: 'creating',
+        },
     });
+    return { nodeModulesDir: prepared.nodeModulesPath, record: prepared.record, prepared };
+}
+
+/** '' when the running sandbox already binds the desired generation. */
+function bwrapDependencyReuseProblem({ agentName, manifest, record, containerName }, deps = {}) {
+    const agentCodePath = resolveSymlinkPath(getAgentCodePath(agentName));
+    return runtimeDependencyReuseProblem({
+        record,
+        family: 'bwrap',
+        needsDependencies: bwrapNeedsDependencies(agentCodePath, manifest),
+        agentCodePath,
+        registration: containerName,
+    }, deps);
 }
 
 function ensureBwrapAgentLibDir(instanceName, nodeModulesDir, options = {}) {
@@ -254,6 +295,83 @@ function ensureBwrapAgentLibDir(instanceName, nodeModulesDir, options = {}) {
     fs.mkdirSync(path.join(stagedAgentLibPath, 'node_modules'), { recursive: true });
 
     return stagedAgentLibPath;
+}
+
+/**
+ * Guarantee the entries a nested bind will land on inside the source tree.
+ *
+ * bwrap applies a read-only bind at bind time, so it cannot create
+ * `/code/node_modules`, `/code/skills` or a manifest volume target such as
+ * `/code/debuglogs` inside an already read-only `/code` ("Can't mkdir
+ * /code/node_modules: Read-only file system"). The empty host entries are the
+ * mount points, as `ensureBwrapAgentLibDir` provides for /Agent/node_modules.
+ * Podman does not need them because it stages a symlink tree for `/code` and
+ * mounts into that. They stay empty: the dependency cache, the skills tree and
+ * the volumes are mounted over them, never written into them.
+ *
+ * `relPath` is a normalized path below /code. The type of the last component
+ * follows the bind source, as bwrap requires: a directory source needs a
+ * directory, a file source needs a regular file (`file: true`). Every other
+ * component is a directory. Missing components are created (the file
+ * exclusively, so an entry that appears meanwhile is never truncated). An
+ * existing entry of the right type is left untouched. A symlink at any
+ * component, or an entry of the wrong type, is refused rather than followed,
+ * because a bind through it would land on whatever the link resolves to.
+ */
+function ensureBwrapCodeMountPoint(agentCodePath, relPath, { file = false } = {}) {
+    const segments = String(relPath || '').split('/').filter(Boolean);
+    if (!segments.length || segments.some(segment => segment === '..' || segment === '.')) {
+        throw new Error(`[bwrap] invalid /code mount point '${relPath}'`);
+    }
+    let current = agentCodePath;
+    segments.forEach((segment, index) => {
+        current = path.join(current, segment);
+        const wantFile = file && index === segments.length - 1;
+        let stat = null;
+        try {
+            stat = fs.lstatSync(current);
+        } catch (error) {
+            if (error?.code !== 'ENOENT') throw error;
+        }
+        if (!stat) {
+            try {
+                if (wantFile) fs.closeSync(fs.openSync(current, 'wx', 0o644));
+                else fs.mkdirSync(current);
+            } catch (error) {
+                if (error?.code !== 'EEXIST') {
+                    throw new Error(`[bwrap] cannot create the /code/${segments.join('/')} mount point ${current}: ${error.message}`);
+                }
+            }
+            stat = fs.lstatSync(current);
+        }
+        if (wantFile ? !stat.isFile() : !stat.isDirectory()) {
+            throw new Error(
+                `[bwrap] ${current} is not a ${wantFile ? 'regular file' : 'directory'}, `
+                + `so /code/${segments.join('/')} cannot be mounted over it. Remove or move it, then restart.`
+            );
+        }
+    });
+    return current;
+}
+
+/**
+ * The path below /code that a manifest volume target names, or null when the
+ * target is outside /code (or is /code itself). Dependencies are prepared by
+ * Ploinky and mounted read-only at /code/node_modules, so a volume may not
+ * target it; Podman refuses the same targets (assertPodmanCodeMountAllowed).
+ */
+function bwrapCodeVolumeRelativePath(containerPath) {
+    const normalized = path.posix.normalize(String(containerPath || '').replace(/\\/g, '/'));
+    if (!normalized.startsWith('/code/')) return null;
+    const relPath = normalized.slice('/code/'.length).replace(/\/+$/, '');
+    if (!relPath) return null;
+    if (relPath === 'node_modules' || relPath.startsWith('node_modules/')) {
+        throw new Error(
+            `[bwrap] manifest volume '${containerPath}' targets reserved /code/node_modules. `
+            + 'Dependencies are prepared by Ploinky and mounted read-only.'
+        );
+    }
+    return relPath;
 }
 
 function resolveSymlinkPath(symlinkPath) {
@@ -294,12 +412,21 @@ function isSameOrInside(candidate, parent) {
     return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
-function addReadOnlyOverlay(args, hostPath, cwd, seen) {
+function addReadOnlyOverlay(args, hostPath, cwd, seen, projectTarget = cwd) {
     if (!hostPath || !isSameOrInside(hostPath, cwd) || !fs.existsSync(hostPath)) return;
     const resolved = path.resolve(hostPath);
     if (seen.has(resolved)) return;
+    const relative = path.relative(path.resolve(cwd), resolved).split(path.sep).filter(Boolean);
+    // Remapped into the sandbox, an overlay of the project root itself would
+    // turn the whole project mount (an isolated agent's HOME) read-only.
+    if (!relative.length && path.posix.normalize(projectTarget) !== path.resolve(cwd)) return;
     seen.add(resolved);
-    args.push('--ro-bind', resolved, resolved);
+    // The overlay lands where the project is mounted in the sandbox. That is
+    // the host path for global and devel agents, and /root for a static agent,
+    // whose host-absolute path does not exist there and would otherwise be
+    // created as a stray entry (through the writable /root bind when the
+    // workspace itself lives below /root).
+    args.push('--ro-bind', resolved, path.posix.join(projectTarget, ...relative));
 }
 
 function addProtectedWorkspaceOverlays(args, options) {
@@ -307,29 +434,62 @@ function addProtectedWorkspaceOverlays(args, options) {
         agentCodePath,
         nodeModulesDir,
         cwd,
+        projectTarget = cwd,
         protectAgentCodePath,
     } = options;
     const seen = new Set();
     const nodeModulesParent = nodeModulesDir ? path.dirname(nodeModulesDir) : '';
 
-    addReadOnlyOverlay(args, DEPS_DIR, cwd, seen);
-    addReadOnlyOverlay(args, nodeModulesParent, cwd, seen);
-    addReadOnlyOverlay(args, path.join(agentCodePath || '', 'node_modules'), cwd, seen);
-    addReadOnlyOverlay(args, CODE_DIR, cwd, seen);
-    addReadOnlyOverlay(args, path.join(PLOINKY_DIR, 'seatbelt-runtime'), cwd, seen);
-    addReadOnlyOverlay(args, SECRETS_FILE, cwd, seen);
-    addReadOnlyOverlay(args, PROFILE_FILE, cwd, seen);
-    addReadOnlyOverlay(args, ROUTING_FILE, cwd, seen);
-    addReadOnlyOverlay(args, SERVERS_CONFIG_FILE, cwd, seen);
+    addReadOnlyOverlay(args, DEPS_DIR, cwd, seen, projectTarget);
+    addReadOnlyOverlay(args, nodeModulesParent, cwd, seen, projectTarget);
+    addReadOnlyOverlay(args, path.join(agentCodePath || '', 'node_modules'), cwd, seen, projectTarget);
+    addReadOnlyOverlay(args, CODE_DIR, cwd, seen, projectTarget);
+    addReadOnlyOverlay(args, path.join(PLOINKY_DIR, 'seatbelt-runtime'), cwd, seen, projectTarget);
+    addReadOnlyOverlay(args, PROFILE_FILE, cwd, seen, projectTarget);
+    addReadOnlyOverlay(args, ROUTING_FILE, cwd, seen, projectTarget);
+    addReadOnlyOverlay(args, SERVERS_CONFIG_FILE, cwd, seen, projectTarget);
 
     if (protectAgentCodePath) {
-        addReadOnlyOverlay(args, agentCodePath, cwd, seen);
+        addReadOnlyOverlay(args, agentCodePath, cwd, seen, projectTarget);
     }
 }
 
 /**
  * Build the bwrap argument array for running a Node.js agent in a sandbox.
  */
+/**
+ * Project and HOME binds, shared with the container runtimes. A static agent
+ * projects the workspace at /root, so its private home moves to /home/agent
+ * instead of competing for the same target.
+ */
+function resolveBwrapHomeLayout({ cwd, cwdMountTarget, agentHomeDir }) {
+    return resolveAgentHomeLayout({
+        cwd: cwd || agentHomeDir,
+        cwdMountTarget: cwdMountTarget || cwd || agentHomeDir,
+        agentHomeDir: agentHomeDir || cwd,
+    });
+}
+
+/**
+ * An isolated agent's project is its own persistent home, or the whole
+ * workspace for the workspace's static agent. Any other directory means the
+ * registry resolved another instance's data (for example an alias registered
+ * before the canonical instance), which would be mounted writable at /root.
+ */
+function assertIsolatedProjectIsOwnHome({ cwd, cwdMountTarget, agentHomeDir, workspaceRoot }) {
+    if (cwdMountTarget !== '/root' || !cwd || !agentHomeDir) return;
+    const canonical = (value) => {
+        const resolved = path.resolve(value);
+        try { return fs.realpathSync(resolved); } catch (_) { return resolved; }
+    };
+    const project = canonical(cwd);
+    if (project === canonical(agentHomeDir) || (workspaceRoot && project === canonical(workspaceRoot))) return;
+    throw new Error(
+        `[bwrap] isolated project '${cwd}' is neither the agent home '${agentHomeDir}' nor the workspace root; `
+        + 'refusing to mount another instance\'s data at /root'
+    );
+}
+
 /**
  * The writable binds bwrap compiles, in the order it emits them, so any alias of
  * the selected achillesAgentLib source can be shadowed read-only afterwards.
@@ -338,12 +498,11 @@ function writableBwrapBinds({ agentCodePath, codeReadOnly, cwd, cwdMountTarget, 
     const binds = [];
     if (!codeReadOnly && agentCodePath) binds.push({ hostPath: agentCodePath, runtimePath: '/code' });
     if (sharedDir) binds.push({ hostPath: sharedDir, runtimePath: '/shared' });
-    const projectTarget = cwdMountTarget || cwd;
-    const homeDir = agentHomeDir || cwd;
-    if (cwd && (cwd !== homeDir || projectTarget !== '/root')) {
-        binds.push({ hostPath: cwd, runtimePath: projectTarget });
+    if (cwd || agentHomeDir) {
+        for (const { source, target } of resolveBwrapHomeLayout({ cwd, cwdMountTarget, agentHomeDir }).binds) {
+            binds.push({ hostPath: source, runtimePath: target });
+        }
     }
-    if (homeDir) binds.push({ hostPath: homeDir, runtimePath: '/root' });
     if (volumes && typeof volumes === 'object') {
         for (const [hostPath, containerPath] of Object.entries(volumes)) {
             const mountOptions = (volumeOptions || {})[containerPath] || {};
@@ -354,7 +513,7 @@ function writableBwrapBinds({ agentCodePath, codeReadOnly, cwd, cwdMountTarget, 
     return binds;
 }
 
-function appendLegacyAgentDataGuards(args, { workspaceRoot = PLOINKY_WORKSPACE_ROOT } = {}) {
+function appendControllerStateGuards(args, { workspaceRoot = PLOINKY_WORKSPACE_ROOT } = {}) {
     const bindings = [];
     const remainder = [];
     let insertionIndex = 0;
@@ -367,8 +526,8 @@ function appendLegacyAgentDataGuards(args, { workspaceRoot = PLOINKY_WORKSPACE_R
         });
         index += 2;
     }
-    const targets = legacyAgentGuardTargets(bindings, { workspaceRoot });
-    const guards = legacyAgentGuardMounts(targets, { workspaceRoot, bindings });
+    const targets = controllerGuardTargets(bindings, { workspaceRoot });
+    const guards = controllerGuardMounts(targets, { workspaceRoot, bindings });
     if (!guards.length) return targets;
     for (const guard of guards) {
         if (guard.replaceExisting) {
@@ -508,8 +667,9 @@ function buildBwrapArgs(options) {
         args.push('--bind', agentCodePath, '/code');
     }
 
-    // node_modules — read-only prepared cache (see ploinky/cli/utils/dependencies/dependencyCache.js).
+    // node_modules — read-only immutable store generation (cli/utils/dependencies/store).
     // Mounted at both paths so AgentServer.mjs (/Agent/server/) can resolve modules.
+    if (codeReadOnly) ensureBwrapCodeMountPoint(agentCodePath, 'node_modules');
     args.push('--ro-bind', nodeModulesDir, '/code/node_modules');
     args.push('--ro-bind', nodeModulesDir, '/Agent/node_modules');
 
@@ -523,18 +683,23 @@ function buildBwrapArgs(options) {
     // Project/workspace access is independent from the persistent agent home.
     // Isolated agents use the home bind as their project mount; global and
     // devel agents retain the selected project at its host-absolute path.
-    const projectTarget = cwdMountTarget || cwd;
-    const homeDir = agentHomeDir || cwd;
+    const homeLayout = resolveBwrapHomeLayout({ cwd, cwdMountTarget, agentHomeDir });
+    assertIsolatedProjectIsOwnHome({
+        cwd, cwdMountTarget, agentHomeDir, workspaceRoot: options.workspaceRoot || PLOINKY_WORKSPACE_ROOT,
+    });
     const storageWorkspaceRoot = path.dirname(path.dirname(path.resolve(sharedDir)));
     assertCanonicalAgentDataPath(sharedDir, { workspaceRoot: storageWorkspaceRoot });
     if (agentHomeDir) assertCanonicalAgentDataPath(agentHomeDir, { workspaceRoot: storageWorkspaceRoot });
-    if (cwd !== homeDir || projectTarget !== '/root') {
-        args.push('--bind', cwd, projectTarget);
+    for (const { source, target } of homeLayout.binds) {
+        // bwrap creates mount points on its own root, but the HOME target that
+        // moves out of /root is created explicitly before anything binds to it.
+        if (target === homeLayout.containerHome && target !== '/root') args.push('--dir', target);
+        args.push('--bind', source, target);
     }
-    args.push('--bind', homeDir, '/root');
 
     // Skills directory (if exists)
     if (skillsPath && fs.existsSync(skillsPath)) {
+        if (codeReadOnly) ensureBwrapCodeMountPoint(agentCodePath, 'skills');
         if (skillsReadOnly) {
             args.push('--ro-bind', skillsPath, '/code/skills');
         } else {
@@ -551,6 +716,11 @@ function buildBwrapArgs(options) {
                 || volumeOptions[String(containerPath || '').replace(/\/+$/, '')]
                 || {};
             ensureManifestVolumeHostPath(resolvedHostPath, containerPath, mountOptions);
+            const codeRelPath = bwrapCodeVolumeRelativePath(containerPath);
+            // The mount point must match the source: a file volume needs a file.
+            if (codeRelPath && codeReadOnly) {
+                ensureBwrapCodeMountPoint(agentCodePath, codeRelPath, { file: !fs.statSync(resolvedHostPath).isDirectory() });
+            }
             args.push(mountOptions.readOnly === true ? '--ro-bind' : '--bind', resolvedHostPath, containerPath);
         }
     }
@@ -568,6 +738,7 @@ function buildBwrapArgs(options) {
         agentCodePath,
         nodeModulesDir,
         cwd,
+        projectTarget: homeLayout.binds[0].target,
         protectAgentCodePath: codeReadOnly && !projectSourceWritable,
     });
 
@@ -587,7 +758,7 @@ function buildBwrapArgs(options) {
     }
 
     // Apply the old-root opacity boundary after every ordinary bind.
-    appendLegacyAgentDataGuards(args, { workspaceRoot: options.workspaceRoot });
+    appendControllerStateGuards(args, { workspaceRoot: options.workspaceRoot });
 
     // Process isolation — do NOT unshare network (agents need host network)
     // NOTE: --die-with-parent is intentionally omitted. Agent processes must survive
@@ -601,7 +772,8 @@ function buildBwrapArgs(options) {
 
     // Environment: clear all, then set explicitly
     args.push('--clearenv');
-    for (const [key, value] of Object.entries(envMap || {})) {
+    // HOME follows the bind layout above, whatever the caller's map says.
+    for (const [key, value] of Object.entries({ ...(envMap || {}), HOME: homeLayout.containerHome })) {
         if (value !== undefined && value !== null) {
             args.push('--setenv', key, String(value));
         }
@@ -617,7 +789,7 @@ function buildBwrapArgs(options) {
  * Build the full environment map for a bwrap agent.
  * Mirrors the env construction in startAgentContainer.
  */
-function buildFullEnvMap(agentName, manifest, profileConfig, workspacePath, repoName, activeProfile, runtimeName = 'bwrap', runtimeResourcePlan = null, routerEndpoint = undefined, runtimeIdentity = undefined, agentLibGrantForEnv = null) {
+function buildFullEnvMap(agentName, manifest, profileConfig, workspacePath, repoName, activeProfile, runtimeName = 'bwrap', runtimeResourcePlan = null, routerEndpoint = undefined, runtimeIdentity = undefined, agentLibGrantForEnv = null, containerHome = '/root') {
     const endpoint = assertRouterEndpoint(routerEndpoint, 'host');
     // Start with manifest env vars (resolved from secrets)
     const env = buildEnvMap(manifest, profileConfig, { agentName, repoName, forRuntime: true });
@@ -685,7 +857,7 @@ function buildFullEnvMap(agentName, manifest, profileConfig, workspacePath, repo
 
     // Essential system vars
     env.NODE_PATH = '/code/node_modules';
-    env.HOME = '/root';
+    env.HOME = containerHome;
     env.PATH = `${BWRAP_NODE_RUNTIME_PATH}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
 
     // Exact final-runner equivalence is not yet available for bwrap/seatbelt.
@@ -718,8 +890,8 @@ function buildFullEnvMap(agentName, manifest, profileConfig, workspacePath, repo
 /**
  * Build the shell command that runs inside the bwrap sandbox.
  *
- * No runtime `npm install` — dependencies are prepared on the host
- * via `prepareAgentCache` and mounted read-only at /code/node_modules.
+ * No runtime `npm install` — dependencies come from an immutable store
+ * generation (`prepareRuntimeDependencies`) mounted read-only at /code/node_modules.
  * Only manifest-declared install hooks run here.
  */
 function buildBwrapEntryCommand(agentName, manifest, profileConfig) {
@@ -795,11 +967,16 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     const alias = options.alias || existingRecord.alias;
     const instanceName = alias || agentName;
     const runtimeIdentity = normalizeSandboxRuntimeIdentity(options);
-    const cwd = getConfiguredProjectPath(agentName, repoName, alias);
+    // A prepared registry record already names the exact instance's project, as
+    // it does for containers; otherwise resolve it from the registry.
+    const cwd = options.preservePreparedRegistryRecord === true && existingRecord.projectPath
+        ? existingRecord.projectPath
+        : getConfiguredProjectPath(agentName, repoName, alias);
     const isolatedHome = (existingRecord.runMode || 'isolated') === 'isolated';
     const agentHomeDir = getAgentWorkDir(instanceName);
     const cwdMountTarget = isolatedHome ? '/root' : cwd;
     const workspacePath = isolatedHome ? '/root' : cwd;
+    const homeLayout = resolveBwrapHomeLayout({ cwd, cwdMountTarget, agentHomeDir });
 
     // Profile and network are resolved atomically before any sandbox work.
     const profileRecord = existingRecord;
@@ -839,19 +1016,21 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     ensureAgentDataDirectory(agentHomeDir);
     syncAgentMcpConfig(containerName, path.resolve(agentPath), instanceName, { workDir: agentHomeDir });
 
-    // Prepare node dependencies via prepared cache (see dependencyCache.js).
+    // Resolve node dependencies from the immutable dependency store.
     // Non-Node agents (start-only, no package.json) still get an empty
     // node_modules so the mount resolves.
     const agentHasPackageJson = fs.existsSync(path.join(agentCodePath, 'package.json'));
     const startCmd = readManifestStartCommand(manifest);
     const needsCoreDeps = !startCmd || agentHasPackageJson;
-    const nodeModulesDir = resolveBwrapAgentNodeModules({
-        repoName,
-        agentName,
+    const dependencies = resolveBwrapAgentNodeModules({
         agentCodePath,
         agentWorkDir: agentHomeDir,
         needsCoreDeps,
+        containerName,
+        runtimeIdentity,
+        admittedRecord: profileRecord,
     });
+    const nodeModulesDir = dependencies.nodeModulesDir;
     const bwrapAgentRoot = path.join(BWRAP_RUNTIME_ROOT, runtimeSegment(instanceName));
     fs.mkdirSync(bwrapAgentRoot, { recursive: true });
     pruneStaleRuntimeEntries(bwrapAgentRoot);
@@ -870,7 +1049,7 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     const hostPort = allPortMappings[0]?.hostPort;
 
     // Build environment map
-    const envMap = buildFullEnvMap(agentName, manifest, profileConfig, workspacePath, repoName, activeProfile, 'bwrap', runtimeResourcePlan, routerEndpoint, runtimeIdentity, grant);
+    const envMap = buildFullEnvMap(agentName, manifest, profileConfig, workspacePath, repoName, activeProfile, 'bwrap', runtimeResourcePlan, routerEndpoint, runtimeIdentity, grant, homeLayout.containerHome);
     const agentPrivateKeyPath = envMap.__PLOINKY_AGENT_PRIVATE_KEY_HOST_PATH || '';
     delete envMap.__PLOINKY_AGENT_PRIVATE_KEY_HOST_PATH;
 
@@ -973,7 +1152,15 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
             try { process.kill(child.pid, 'SIGKILL'); } catch (_) { }
         }
         logHandle.discard();
+        if (!child?.pid) dependencies.prepared?.release();
         throw error;
+    }
+    if (dependencies.prepared) {
+        try {
+            dependencies.prepared.updateConsumer({ process: sandboxProcessIdentity(child.pid), phase: 'running' });
+        } catch (error) {
+            debugLog(`[bwrap] ${agentName}: dependency receipt process update deferred: ${error?.message || error}`);
+        }
     }
     console.log(`[bwrap] ${agentName}: started with PID ${child.pid}`);
 
@@ -1005,6 +1192,7 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
             agentLibPath
         },
         agentLib: agentLibRuntimeRecord(grant),
+        dependencies: dependencies.record,
         config: {
             binds: [
                 { source: agentLibPath, target: '/Agent', ro: true },
@@ -1014,8 +1202,7 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
                 { source: nodeModulesDir, target: '/Agent/node_modules', ro: true },
                 { source: sharedDir, target: '/shared' },
                 ...(fs.existsSync(agentSkillsPath) ? [{ source: agentSkillsPath, target: '/skills', ro: skillsReadOnly }] : []),
-                ...(!isolatedHome ? [{ source: cwd, target: cwd }] : []),
-                { source: agentHomeDir, target: '/root' }
+                ...homeLayout.binds
             ],
             env: Array.from(new Set(declaredEnvNames)).map((name) => ({ name })),
             ports: allPortMappings,
@@ -1063,6 +1250,7 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
         const stopped = stopBwrapProcess(containerName, { expectedIdentity: runtimeIdentity });
         if (!stopped && isBwrapProcessRunning(containerName, runtimeIdentity)) {
             error.message = `${error.message}; exact sandbox candidate cleanup failed`;
+            error.exactCleanupFailed = true;
         }
         throw error;
     }
@@ -1078,6 +1266,7 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
     let aliasOverride;
     let forceRecreate = false;
     let profileNameOverride;
+    let expectedPredecessor = null;
 
     if (typeof options === 'number') {
         preferredHostPort = options;
@@ -1087,6 +1276,7 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
         aliasOverride = options.alias;
         forceRecreate = options.forceRecreate === true;
         profileNameOverride = options.profileName;
+        expectedPredecessor = normalizeExpectedPredecessor(options.expectedPredecessor);
     }
 
     const repoName = resolveAgentRepositoryName(agentPath);
@@ -1131,17 +1321,23 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
         allPortMappings = [{ containerPort: hostPort, hostPort }];
     }
 
-    let exactRuntimeRunning = isBwrapProcessRunning(containerName, runtimeIdentity);
+    // What holds the runtime key decides what may be stopped. Only the exact
+    // requested successor or the caller's expected predecessor is ever
+    // signalled; any other live tuple, or a slot that cannot be verified,
+    // throws before a signal is sent or a PID record is touched.
+    const slot = resolveSandboxSlotForStart(containerName, {
+        successor: runtimeIdentity,
+        expectedPredecessor,
+    });
+    let exactRuntimeRunning = slot.kind === 'successor';
 
-    // Force recreate
-    if (forceRecreate) {
+    if (slot.kind === 'predecessor') {
+        console.log(`[bwrap] ${agentName}: runtime generation changed, replacing the expected predecessor sandbox...`);
+        stopExactSandboxOrThrow(containerName, expectedPredecessor);
+    } else if (forceRecreate && exactRuntimeRunning) {
         console.log(`[bwrap] ${agentName}: force recreating...`);
-        stopBwrapProcess(containerName);
+        stopExactSandboxOrThrow(containerName, runtimeIdentity);
         exactRuntimeRunning = false;
-    }
-
-    if (!forceRecreate && !exactRuntimeRunning && stopBwrapProcess(containerName)) {
-        console.log(`[bwrap] ${agentName}: runtime generation changed, replacing stale sandbox...`);
     }
 
     // Check if already running
@@ -1156,12 +1352,20 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
             existingRecord,
             agentLibGrant(detectHostRuntimeKey('bwrap')),
         );
+        // Dependency trees are immutable generations: a changed or invalid
+        // admitted generation means a new sandbox, never a mutated bind.
+        const dependencyProblem = (desired && desired !== current) || agentLibProblem
+            ? ''
+            : bwrapDependencyReuseProblem({ agentName, manifest, record: existingRecord, containerName });
         if (desired && desired !== current) {
             console.log(`[bwrap] ${agentName}: env hash changed, restarting...`);
-            stopBwrapProcess(containerName);
+            stopExactSandboxOrThrow(containerName, runtimeIdentity);
         } else if (agentLibProblem) {
             console.log(`[bwrap] ${agentName}: achillesAgentLib selection changed (${agentLibProblem}), restarting...`);
-            stopBwrapProcess(containerName);
+            stopExactSandboxOrThrow(containerName, runtimeIdentity);
+        } else if (dependencyProblem) {
+            console.log(`[bwrap] ${agentName}: dependency generation changed (${dependencyProblem}), restarting...`);
+            stopExactSandboxOrThrow(containerName, runtimeIdentity);
         } else {
             debugLog(`[bwrap] ${agentName}: already running (PID ${getBwrapPid(containerName, runtimeIdentity)})`);
             const hostPort = allPortMappings[0]?.hostPort || 0;
@@ -1236,18 +1440,30 @@ function attachBwrapInteractive(agentName, manifest, agentPath, workdir, entryCo
     const agentHomeDir = getAgentWorkDir(instanceName);
     const cwdMountTarget = isolatedHome ? '/root' : projectPath;
     const workspacePath = isolatedHome ? '/root' : projectPath;
+    const homeLayout = resolveBwrapHomeLayout({ cwd: projectPath, cwdMountTarget, agentHomeDir });
     const sharedDir = ensureSharedHostDir();
     ensureAgentDataDirectory(agentHomeDir);
-    const agentHasPackageJson = fs.existsSync(path.join(agentCodePath, 'package.json'));
-    const startCmd = readManifestStartCommand(manifest);
-    const needsCoreDeps = !startCmd || agentHasPackageJson;
-    const nodeModulesDir = resolveBwrapAgentNodeModules({
-        repoName,
-        agentName,
-        agentCodePath,
-        agentWorkDir: agentHomeDir,
-        needsCoreDeps,
+    const needsCoreDeps = bwrapNeedsDependencies(agentCodePath, manifest);
+    // An interactive session reuses the service's admitted generation
+    // read-only under its own receipt; it never builds or repairs a tree.
+    const attached = attachAdmittedDependencies(record, {
+        consumer: {
+            kind: 'bwrap-attachment',
+            containerName,
+            registration: containerName,
+            process: sandboxProcessIdentity(process.pid),
+        },
     });
+    let nodeModulesDir;
+    if (attached) {
+        nodeModulesDir = attached.nodeModulesPath;
+    } else if (!needsCoreDeps) {
+        nodeModulesDir = path.join(agentHomeDir, 'node_modules');
+        ensureAgentDataDirectory(nodeModulesDir);
+    } else {
+        throw new Error(`[bwrap] ${agentName}: the running service has no admitted dependency generation; restart it first`);
+    }
+    try {
     const bwrapAgentRoot = path.join(BWRAP_RUNTIME_ROOT, runtimeSegment(instanceName));
     fs.mkdirSync(bwrapAgentRoot, { recursive: true });
     const serviceAgentLibPath = record.runtimeStaging?.agentLibPath;
@@ -1255,13 +1471,14 @@ function attachBwrapInteractive(agentName, manifest, agentPath, workdir, entryCo
         keepPaths: serviceAgentLibPath ? [serviceAgentLibPath] : []
     });
     const agentLibPath = ensureBwrapAgentLibDir(instanceName, nodeModulesDir);
+    const grant = agentLibGrant(detectHostRuntimeKey('bwrap'));
     const { codeReadOnly, skillsReadOnly } = getProfileMountModes(activeProfile, profileConfig || {});
 
     // Build environment (same as running agent)
     const runtimeResourcePlan = planRuntimeResources(manifest, { agentName, repoName });
     const nodeRuntime = resolveBwrapNodeRuntime();
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
-    const envMap = buildFullEnvMap(agentName, manifest, profileConfig, workspacePath, repoName, activeProfile, 'bwrap', runtimeResourcePlan, routerEndpoint, runtimeIdentity);
+    const envMap = buildFullEnvMap(agentName, manifest, profileConfig, workspacePath, repoName, activeProfile, 'bwrap', runtimeResourcePlan, routerEndpoint, runtimeIdentity, grant, homeLayout.containerHome);
     const agentPrivateKeyPath = envMap.__PLOINKY_AGENT_PRIVATE_KEY_HOST_PATH || '';
     delete envMap.__PLOINKY_AGENT_PRIVATE_KEY_HOST_PATH;
     const hostPort = record.config?.ports?.[0]?.hostPort;
@@ -1326,13 +1543,16 @@ function attachBwrapInteractive(agentName, manifest, agentPath, workdir, entryCo
             fs.rmSync(agentLibPath, { recursive: true, force: true });
         } catch (_) {}
     }
+    } finally {
+        attached?.release();
+    }
 }
 
 export {
     ensureBwrapService,
     resolveBwrapRuntimeProfile,
     startBwrapProcess,
-    appendLegacyAgentDataGuards,
+    appendControllerStateGuards,
     mergeBwrapManifestVolumes,
     buildBwrapArgs,
     buildFullEnvMap,
@@ -1340,6 +1560,7 @@ export {
     buildShellCommand,
     ensureBwrapAgentLibDir,
     resolveBwrapNodeRuntime,
+    bwrapDependencyReuseProblem,
     attachBwrapInteractive,
     BWRAP_PATH
 };

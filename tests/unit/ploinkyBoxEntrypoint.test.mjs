@@ -198,6 +198,55 @@ test('failure between final commits restores the complete prior transport pair',
     assert.equal(mode(paths.containersConf), 0o640);
 });
 
+test('transport rollback preserves prior inodes without requiring privilege to recreate their ownership', (t) => {
+    const { paths } = fixture(t);
+    const targets = [paths.transport, paths.containersConf];
+    for (const target of targets) {
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, `prior ${path.basename(target)}\n`, { mode: 0o640 });
+    }
+    const before = targets.map(target => ({ stat: fs.statSync(target), bytes: fs.readFileSync(target, 'utf8') }));
+    let rollback = false;
+    assert.throws(() => writeTransportPair({
+        transport: { address: '10.88.0.17', interface: 'eth0' },
+        transportFile: paths.transport,
+        containersConf: paths.containersConf,
+        fsApi: { ...fs, fchownSync(...args) {
+            if (rollback) throw Object.assign(new Error('prior group cannot be assigned by this user'), { code: 'EPERM' });
+            return fs.fchownSync(...args);
+        } },
+        afterFirstCommit() { rollback = true; throw new Error('injected'); },
+    }), error => /Transport pair update failed/.test(error.message) && !/rollback failures/.test(error.message));
+    targets.forEach((target, index) => {
+        const after = fs.statSync(target);
+        assert.equal(fs.readFileSync(target, 'utf8'), before[index].bytes);
+        for (const field of ['ino', 'uid', 'gid', 'mode']) assert.equal(after[field], before[index].stat[field], field);
+        assert.equal(after.nlink, 1);
+    });
+});
+
+test('failure reserving the second prior transport file leaves both original files and no hardlink residue', (t) => {
+    const { paths } = fixture(t);
+    for (const target of [paths.transport, paths.containersConf]) {
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, 'prior\n');
+    }
+    let links = 0;
+    assert.throws(() => writeTransportPair({
+        transport: { address: '10.88.0.17', interface: 'eth0' },
+        transportFile: paths.transport, containersConf: paths.containersConf,
+        fsApi: { ...fs, linkSync(...args) {
+            if (++links === 2) throw Object.assign(new Error('cannot reserve second backup'), { code: 'EIO' });
+            return fs.linkSync(...args);
+        } },
+    }), /Transport pair update failed/);
+    for (const target of [paths.transport, paths.containersConf]) {
+        assert.equal(fs.readFileSync(target, 'utf8'), 'prior\n');
+        assert.equal(fs.statSync(target).nlink, 1);
+        assert.deepEqual(fs.readdirSync(path.dirname(target)), [path.basename(target)]);
+    }
+});
+
 test('entrypoint validates its marker and mounts before its first persistent write', (t) => {
     const { paths, box } = fixture(t);
     fs.writeFileSync(paths.marker, 'wrong\n');
@@ -209,13 +258,13 @@ test('entrypoint validates its marker and mounts before its first persistent wri
         installDependencies() { throw new Error('must not install'); },
     }), /marker has invalid content/i);
     assert.equal(initialized, false);
-    assert.equal(fs.existsSync(path.join(paths.workspace, '.ploinky', 'master-key')), false);
+    assert.equal(fs.existsSync(path.join(paths.workspace, '.ploinky', 'data', 'master-key')), false);
 
     fs.writeFileSync(paths.marker, BOX_MARKER_CONTENT);
     fs.rmSync(paths.dependencies, { recursive: true });
     fs.symlinkSync(paths.workspace, paths.dependencies);
     assert.throws(() => prepareEntrypoint({ ...box }), /mount target|mount is missing/);
-    assert.equal(fs.existsSync(path.join(paths.workspace, '.ploinky', 'master-key')), false);
+    assert.equal(fs.existsSync(path.join(paths.workspace, '.ploinky', 'data', 'master-key')), false);
 });
 
 test('transient cleanup removes only UID-keyed children and retains the tmpfs parent', (t) => {
@@ -271,7 +320,7 @@ test('full preparation creates one stable key, resets only transient runtime, an
     fs.writeFileSync(envPath, 'APPLICATION_SETTING=preserve-me\n', { mode: 0o640 });
     const envBytes = fs.readFileSync(envPath);
     prepareEntrypoint(options);
-    const keyPath = path.join(paths.workspace, '.ploinky', 'master-key');
+    const keyPath = path.join(paths.workspace, '.ploinky', 'data', 'master-key');
     const keyBytes = fs.readFileSync(keyPath);
     assert.match(keyBytes.toString('utf8'), /^[a-f0-9]{64}\n$/);
     assert.equal(mode(keyPath), 0o600);
@@ -298,6 +347,31 @@ test('full preparation creates one stable key, resets only transient runtime, an
     prepareEntrypoint(options);
     assert.deepEqual(fs.readFileSync(keyPath), keyBytes);
     assert.deepEqual(fs.readFileSync(envPath), envBytes);
+});
+
+test('transport cleanup warnings are reported before readiness without failing the Box', (t) => {
+    const { box } = fixture(t);
+    const events = [];
+    runEntrypoint({
+        ...box,
+        runner: routeRunner(),
+        initialize() {},
+        configureTransport() {
+            return { address: '10.88.0.17', interface: 'eth0', warnings: ['transport backup /run/x.backup could not be removed: EIO'] };
+        },
+        configureStorage() { return { storageConf: '/home/podman/.config/containers/storage.conf' }; },
+        resetRuntime() {},
+        retireContainers() {},
+        installDependencies() {},
+        selfCheck() { events.push('self-check'); },
+        errorOutput: { write(chunk) { events.push(`error:${String(chunk).trim()}`); } },
+        output: { write(chunk) { events.push(`output:${String(chunk).trim()}`); } },
+    });
+    assert.deepEqual(events, [
+        '[ploinky-box] WARNING: transport backup /run/x.backup could not be removed: EIO',
+        'self-check',
+        `output:${BOX_READY_LINE}`,
+    ].map((event) => (event.startsWith('[ploinky-box]') ? `error:${event}` : event)));
 });
 
 test('ready line is emitted exactly once and only after every required stage', (t) => {
@@ -402,8 +476,8 @@ test('entrypoint retires only an exact stopped managed container without touchin
     assert.equal(calls.some((call) => call.includes('-f') || call.includes('--volumes')), false);
 });
 
-test('entrypoint retires a stopped pre-lifecycle-label container with exact legacy ownership', (t) => {
-    const legacy = retainedContainerFixture(t, {
+test('entrypoint refuses and preserves a registered container without lifecycle labels', (t) => {
+    const unlabeled = retainedContainerFixture(t, {
         mutateLabels(labels) {
             const copy = { ...labels };
             delete copy['io.assistos.ploinky.instance-id'];
@@ -412,14 +486,11 @@ test('entrypoint retires a stopped pre-lifecycle-label container with exact lega
         },
     });
 
-    assert.deepEqual(
-        retireStoppedManagedContainers(legacy.paths, { runner: legacy.runner }),
-        [legacy.containerId],
+    assert.throws(
+        () => retireStoppedManagedContainers(unlabeled.paths, { runner: unlabeled.runner }),
+        /exact registry ownership \(lifecycle-ownership-labels\)/,
     );
-    assert.deepEqual(
-        legacy.calls.at(-1),
-        ['run', 'podman', 'container', 'rm', legacy.containerId],
-    );
+    assert.equal(unlabeled.calls.some((call) => call[0] === 'run'), false);
 });
 
 test('entrypoint retires a stopped predecessor with a complete stale lifecycle pair', (t) => {
@@ -474,7 +545,7 @@ test('entrypoint retires only a fully superseded staged predecessor', (t) => {
     assert.equal(duplicateIdentity.calls.some((call) => call[0] === 'run'), false);
 });
 
-test('entrypoint retires only a stopped legacy helper with the exact historical label', (t) => {
+test('entrypoint retires only a stopped interrupted helper with the exact managed label', (t) => {
     const helper = retainedContainerFixture(t, {
         includeRegistry: false,
         mutateLabels() {

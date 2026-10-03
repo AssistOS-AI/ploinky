@@ -101,7 +101,7 @@ export function completer(line) {
             } else if (command === 'client' && words.length === 2) {
                 // For client commands, show agent names where appropriate
                 const clientSubcommand = words[1];
-                if (['methods', 'status', 'task', 'task-status'].includes(clientSubcommand)) {
+                if (['status'].includes(clientSubcommand)) {
                     context = 'args'; // Will show agent names
                 } else {
                     context = 'none';
@@ -156,7 +156,7 @@ export function completer(line) {
                 }
             } else if (command === 'client' && words.length === 3) {
                 const clientSubcommand = words[1];
-                if (['methods', 'status', 'task', 'task-status'].includes(clientSubcommand)) {
+                if (['status'].includes(clientSubcommand)) {
                     context = 'args'; // Will show agent names
                 }
             } else if (command === 'logs' && words.length >= 3) {
@@ -201,7 +201,7 @@ export function completer(line) {
                 (command === 'cli') ||
                 (command === 'reinstall' && (subcommand === 'agent' || words.length <= 2)) ||
                 (command === 'enable' && subcommand === 'agent') ||
-                (command === 'client' && ['methods', 'status', 'task', 'task-status'].includes(subcommand))) {
+                (command === 'client' && ['status'].includes(subcommand))) {
                 completions = getAgentNames();
             } else if (command === 'update') {
                 const repos = getRepoNames();

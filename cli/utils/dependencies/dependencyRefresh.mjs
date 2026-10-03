@@ -3,7 +3,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const operations = new AsyncLocalStorage();
-const refreshCommands = new Set(['update', 'start', 'enable', 'reinstall']);
+// `update` only changes sources. Lifecycle commands prepare dependencies
+// when they (re)admit the affected runtime.
+const refreshCommands = new Set(['start', 'enable', 'reinstall']);
 
 // One command can reach the same agent through several manifest edges.
 // Only successful preparations are remembered, and never across commands.

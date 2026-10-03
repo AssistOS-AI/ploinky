@@ -63,8 +63,9 @@ function normalizeRecord(identity, record) {
     });
 }
 
-// Missing metadata identifies a pre-migration graph, never a workspace-wide
-// scope. Successful activation can replace it; automatic rollback cannot infer it.
+// Missing metadata means no graph admission has saved a scope yet (for example
+// a fresh workspace), never a workspace-wide scope. Successful activation can
+// replace it; automatic rollback cannot infer it.
 export function readGraphSkillScope(identity) {
     const state = statePath(identity);
     const { target } = state;

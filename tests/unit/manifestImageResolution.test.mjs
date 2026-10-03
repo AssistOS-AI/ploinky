@@ -45,8 +45,8 @@ test('resolveManifestImage can use manifest defaults when the master key is abse
 });
 
 test('resolveManifestImage fails closed when encrypted secrets are corrupt', () => {
-    fs.mkdirSync(path.join(workspace, '.ploinky'), { recursive: true });
-    fs.writeFileSync(path.join(workspace, '.ploinky/.secrets'), 'not-a-valid-envelope\n');
+    fs.mkdirSync(path.join(workspace, '.ploinky', 'data'), { recursive: true });
+    fs.writeFileSync(path.join(workspace, '.ploinky/data/.secrets'), 'not-a-valid-envelope\n');
     process.env.PLOINKY_MASTER_KEY = '8'.repeat(64);
 
     const manifest = {
@@ -61,6 +61,6 @@ test('resolveManifestImage fails closed when encrypted secrets are corrupt', () 
 
     assert.throws(
         () => resolveManifestImage(manifest),
-        /Unable to decrypt .ploinky\/.secrets/,
+        /Unable to decrypt .ploinky\/data\/.secrets/,
     );
 });

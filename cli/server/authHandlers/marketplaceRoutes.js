@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { withWorkspaceMutationLease } from '../../utils/runtime/maintenanceLocks.js';
+import { uninstallRepositoryUnderLease } from '../../utils/repositoryUninstall.mjs';
 import { installRepositoryLinks, removeRepositoryLinks } from '../../utils/repositoryInstall.mjs';
 
 import * as reposSvc from '../../utils/repos.js';
@@ -241,13 +242,19 @@ export async function enableMarketplaceAgent(body, {
     return { ref, mode, result };
 }
 
-function disableMarketplaceAgentsForRepo(repoName) {
-    const targetRepo = String(repoName || '').trim();
-    if (!targetRepo) return [];
-    const containerNames = Object.entries(workspaceSvc.loadAgents())
-        .filter(([, record]) => record && record.type === 'agent' && record.repoName === targetRepo && record.agentName)
-        .map(([containerName]) => containerName);
-    return agentsSvc.disableAgentContainers(containerNames);
+// A repository uninstall is one workspace mutation under a lease this request
+// acquires itself; see uninstallRepositoryUnderLease for the ordering.
+export async function uninstallMarketplaceRepository(body, {
+    workspaceLeaseWaitMs,
+    agentDisableDependencies = {},
+} = {}) {
+    const target = String(body?.target || body?.name || '').trim();
+    return uninstallRepositoryUnderLease(target, {
+        withLease: withWorkspaceMutationLease,
+        workspaceLeaseWaitMs,
+        agentDisableDependencies,
+        stdio: 'pipe',
+    });
 }
 
 function normalizeMarketplaceContainerSegment(value) {
@@ -549,7 +556,9 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
                 throw error;
             }
         },
-    }), agentListOptions = {}, // a test's listing observes its own live containers
+    }),
+    agentListOptions = {}, // a test's listing observes its own live containers
+    uninstallRepositoryAction = (body) => uninstallMarketplaceRepository(body),
 } = {}) {
     const route = parseMarketplacePath(parsedUrl.pathname || '/');
     if (!route) return false;
@@ -688,17 +697,12 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
                 const branch = String(body?.branch || '').trim() || null;
                 result = await withWorkspaceMutationLease({ operation: 'repositories-prepare' }, () => reposSvc.installRepo(url, name, branch, { stdio: 'pipe' }));
             } else if (action === 'uninstall_repo') {
-                const target = String(body?.target || body?.name || '').trim();
-                const repoName = reposSvc.resolveInstalledRepoTarget(target);
-                result = {
-                    ...reposSvc.uninstallRepo(repoName, { stdio: 'pipe' }),
-                    disabledAgents: disableMarketplaceAgentsForRepo(repoName)
-                };
+                result = await uninstallRepositoryAction(body);
             } else if (action === 'enable_agent') {
                 ({ result } = await enableAgentAction(body));
             } else if (action === 'disable_agent') {
                 const ref = normalizeMarketplaceAgentRef(body?.agentRef);
-                result = agentsSvc.disableAgent(ref);
+                result = await agentsSvc.disableAgent(ref);
                 if (result?.status && result.status !== 'removed' && result.status !== 'static-removed') {
                     sendMarketplaceError(res, 409, 'agent_disable_blocked', result.status);
                     return true;

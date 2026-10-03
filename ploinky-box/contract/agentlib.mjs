@@ -1,21 +1,27 @@
-// The Box side of the direct-mounted achillesAgentLib contract.
+// The Box side of the achillesAgentLib contract.
 //
-// One selected host directory is exposed to the Box twice: once at the stable
-// runtime path every mount namespace agrees on, and once as a read-only shadow
-// over the alias the broad writable workspace bind would otherwise expose.
-// Without that second bind the same inode stays writable through the workspace
-// and the stable read-only mount is not a real confinement boundary.
+// A local selection is one host directory exposed to the Box twice: once at the
+// stable runtime path every mount namespace agrees on, and once as a read-only
+// shadow over the alias the broad writable workspace bind would otherwise
+// expose. Without that second bind the same inode stays writable through the
+// workspace and the stable read-only mount is not a real confinement boundary.
+//
+// An image selection has no host source: the library is the copy the outer Box
+// image supplies at the stable path, identified by that image's immutable ID.
 
 import path from 'node:path';
 
 import {
     AGENTLIB_ENV,
     AGENTLIB_STABLE_MOUNT_PATH,
+    BOX_IMAGE_ID_ENV,
     agentLibRuntimeEnv,
-    imageSourceId,
+    agentLibSourceIdHash,
+    assertSupplyingImageId,
+    imageSourceIdentity,
+    imageSourceIdHash,
 } from '../../agentlib/contract.mjs';
-import { sourceIdHash } from '../../agentlib/fingerprint.mjs';
-import { BOX_AGENTLIB_LABELS } from '../constants.mjs';
+import { BOX_AGENTLIB_LABELS, INCOMPATIBLE_BOX_GUIDANCE } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 import { normalizeImageId } from './image-id.mjs';
 import { boxWorkspacePath } from './workspace-root.mjs';
@@ -29,7 +35,9 @@ function agentLibContractError(message) {
  *
  * Accepts either an `AgentLibSelection` or an already-normalized contract, so
  * threading a contract through a second validation boundary is idempotent
- * rather than a spurious "missing fingerprint" failure.
+ * rather than a spurious "missing fingerprint" failure. The two modes have
+ * distinct shapes: a local contract carries its content fingerprint and Git
+ * commit, an image contract only the immutable image ID that supplies it.
  *
  * @param {object} selection - an AgentLibSelection with `sourceDir`, or a contract
  * @returns {Readonly<object>}
@@ -37,7 +45,6 @@ function agentLibContractError(message) {
 export function normalizeBoxAgentLib(selection) {
     const sourceDir = String(selection?.sourceDir || '');
     const sourceRelativePath = String(selection?.sourceRelativePath || '');
-    const fingerprint = String(selection?.contentFingerprint ?? selection?.fingerprint ?? '');
     const mode = String(selection?.mode || '');
     if (!path.isAbsolute(sourceDir)) {
         throw agentLibContractError('Box AgentLib contract requires an absolute selected source directory');
@@ -45,26 +52,39 @@ export function normalizeBoxAgentLib(selection) {
     if (!sourceRelativePath || sourceRelativePath.startsWith('/') || sourceRelativePath.split('/').includes('..')) {
         throw agentLibContractError('Box AgentLib contract requires a workspace-relative source path');
     }
-    if (!/^[a-f0-9]{64}$/.test(fingerprint)) {
-        throw agentLibContractError('Box AgentLib contract requires a 64-hex content fingerprint');
-    }
-    if (!['local', 'managed', 'image'].includes(mode)) {
+    if (!['local', 'image'].includes(mode)) {
         throw agentLibContractError(`Box AgentLib contract has an unknown source mode '${mode}'`);
     }
     if (!selection?.sourceId && !/^[a-f0-9]{64}$/.test(String(selection?.sourceIdHash || ''))) {
         throw agentLibContractError('Box AgentLib contract requires a source identity');
     }
-    const imageId = mode === 'image' ? normalizeImageId(selection?.imageId) : null;
-    const identityHash = selection?.sourceId
-        ? sourceIdHash(selection.sourceId)
-        : String(selection?.sourceIdHash || '');
     if (mode === 'image') {
-        if (sourceDir !== AGENTLIB_STABLE_MOUNT_PATH || sourceRelativePath !== 'image'
-            || !/^sha256:[a-f0-9]{64}$/.test(imageId)
-            || !/^[a-f0-9]{40}$/.test(String(selection?.resolvedCommit ?? selection?.commit ?? ''))
-            || identityHash !== sourceIdHash(imageSourceId(imageId, fingerprint))) {
-            throw agentLibContractError('Box AgentLib image selection has an incompatible path, revision, or immutable identity');
+        let supplyingImageId;
+        try {
+            supplyingImageId = assertSupplyingImageId(
+                normalizeImageId(selection?.supplyingImageId ?? selection?.sourceId?.supplyingImageId),
+            );
+        } catch (error) {
+            throw agentLibContractError(`Box AgentLib image selection has no immutable supplying image: ${error.message}`);
         }
+        const identityHash = imageSourceIdHash(imageSourceIdentity(supplyingImageId));
+        if (sourceDir !== AGENTLIB_STABLE_MOUNT_PATH || sourceRelativePath !== 'image'
+            || (selection?.sourceIdHash !== undefined && String(selection.sourceIdHash) !== identityHash)
+            || (selection?.sourceId && agentLibSourceIdHash(selection) !== identityHash)) {
+            throw agentLibContractError('Box AgentLib image selection has an incompatible path or immutable identity');
+        }
+        return Object.freeze({
+            sourceDir: AGENTLIB_STABLE_MOUNT_PATH,
+            sourceRelativePath,
+            mode,
+            sourceIdHash: identityHash,
+            supplyingImageId,
+            stablePath: AGENTLIB_STABLE_MOUNT_PATH,
+        });
+    }
+    const fingerprint = String(selection?.contentFingerprint ?? selection?.fingerprint ?? '');
+    if (!/^[a-f0-9]{64}$/.test(fingerprint)) {
+        throw agentLibContractError('Box AgentLib contract requires a 64-hex content fingerprint');
     }
     return Object.freeze({
         sourceDir: path.resolve(sourceDir),
@@ -72,8 +92,9 @@ export function normalizeBoxAgentLib(selection) {
         mode,
         fingerprint,
         commit: String(selection?.resolvedCommit ?? selection?.commit ?? ''),
-        sourceIdHash: identityHash,
-        ...(imageId ? { imageId } : {}),
+        sourceIdHash: selection?.sourceId
+            ? agentLibSourceIdHash(selection)
+            : String(selection?.sourceIdHash || ''),
         stablePath: AGENTLIB_STABLE_MOUNT_PATH,
     });
 }
@@ -119,6 +140,9 @@ export function agentLibMountArgs(contract, workspaceRoot) {
 
 /** The reserved runtime environment, as it appears inside the Box. */
 export function agentLibBoxEnv(contract) {
+    if (contract.mode === 'image') {
+        return agentLibRuntimeEnv({ mode: 'image', sourceIdHash: contract.sourceIdHash }, contract.stablePath);
+    }
     return agentLibRuntimeEnv(
         {
             mode: contract.mode,
@@ -134,7 +158,23 @@ export function agentLibEnvArgs(contract) {
     return Object.entries(agentLibBoxEnv(contract)).flatMap(([key, value]) => ['--env', `${key}=${value}`]);
 }
 
+/**
+ * The engine-observed immutable outer image ID, as the Box environment carries
+ * it. It is set once when the Box is created and inherited by every process in
+ * it; it is independent of the AgentLib mode.
+ */
+export function boxImageIdEnv(imageId) {
+    return { [BOX_IMAGE_ID_ENV]: assertSupplyingImageId(normalizeImageId(imageId), 'Box image ID') };
+}
+
 export function agentLibLabels(contract) {
+    if (contract.mode === 'image') {
+        return {
+            [BOX_AGENTLIB_LABELS.mode]: contract.mode,
+            [BOX_AGENTLIB_LABELS.sourceIdHash]: contract.sourceIdHash,
+            [BOX_AGENTLIB_LABELS.sourceRelativePath]: contract.sourceRelativePath,
+        };
+    }
     return {
         [BOX_AGENTLIB_LABELS.mode]: contract.mode,
         [BOX_AGENTLIB_LABELS.sourceIdHash]: contract.sourceIdHash,
@@ -146,11 +186,11 @@ export function agentLibLabels(contract) {
 
 /**
  * Reconstruct the desired AgentLib contract of an existing Box from its labels
- * and observed mounts.
+ * and observed mounts and image.
  *
- * Labels alone are never treated as proof: the real bind source is read back
- * from the observed mount set, so a relabelled Box cannot claim a source it
- * does not actually have.
+ * Labels alone are never treated as proof: a local source is read back from the
+ * observed mount set, and an image source from the observed image ID, so a
+ * relabelled Box cannot claim a source it does not actually have.
  *
  * @returns {Readonly<object>}
  */
@@ -168,15 +208,20 @@ export function agentLibContractFromContainer(container) {
     const stable = mounts.find((mount) => mount.destination === AGENTLIB_STABLE_MOUNT_PATH);
     if (mode === 'image') {
         if (stable) throw agentLibContractError('An image AgentLib selection must not have a source bind mount');
-        return normalizeBoxAgentLib({
-            sourceDir: AGENTLIB_STABLE_MOUNT_PATH,
-            sourceRelativePath,
-            mode,
-            fingerprint,
-            commit,
-            sourceIdHash: sourceIdHashValue,
-            imageId: container?.runtime?.imageId,
-        });
+        try {
+            return normalizeBoxAgentLib({
+                sourceDir: AGENTLIB_STABLE_MOUNT_PATH,
+                sourceRelativePath,
+                mode,
+                sourceIdHash: sourceIdHashValue,
+                supplyingImageId: container?.runtime?.imageId,
+            });
+        } catch (error) {
+            // A Box whose image AgentLib labels follow another contract (one
+            // created by an earlier Ploinky, for example) is not adapted.
+            if (error?.code !== 'PLOINKY_BOX_AGENTLIB_INCOMPATIBLE') throw error;
+            throw agentLibContractError(`Owned Box AgentLib labels are incompatible (${error.message})${INCOMPATIBLE_BOX_GUIDANCE}`);
+        }
     }
     if (!stable) {
         throw agentLibContractError(
@@ -197,19 +242,22 @@ export function agentLibContractFromContainer(container) {
 /**
  * Whether a running Box must be replaced because the selection changed.
  *
- * Source directory identity, mode, and content fingerprint each independently
- * force replacement: a Box may not keep an old inode mounted after the
- * workspace selected different bytes.
+ * Source directory identity, mode, and (local) content fingerprint each
+ * independently force replacement: a Box may not keep an old inode mounted
+ * after the workspace selected different bytes. An image selection changes
+ * only with the outer image that supplies it.
  */
 export function agentLibSelectionChanged(current, desired) {
     if (!current) return true;
-    return current.sourceDir !== desired.sourceDir
-        || current.imageId !== desired.imageId
+    if (current.sourceDir !== desired.sourceDir
         || current.sourceRelativePath !== desired.sourceRelativePath
         || current.mode !== desired.mode
-        || current.commit !== desired.commit
-        || current.sourceIdHash !== desired.sourceIdHash
-        || current.fingerprint !== desired.fingerprint;
+        || current.sourceIdHash !== desired.sourceIdHash) {
+        return true;
+    }
+    return desired.mode === 'image'
+        ? current.supplyingImageId !== desired.supplyingImageId
+        : current.commit !== desired.commit || current.fingerprint !== desired.fingerprint;
 }
 
-export { AGENTLIB_ENV, AGENTLIB_STABLE_MOUNT_PATH };
+export { AGENTLIB_ENV, AGENTLIB_STABLE_MOUNT_PATH, BOX_IMAGE_ID_ENV };

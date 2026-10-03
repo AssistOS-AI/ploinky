@@ -50,7 +50,13 @@ const {
     topologicallyGroupDependencyGraph
 } = graphModule;
 const { applyManifestDirectives, parseEnableDirective } = bootstrapModule;
-const { buildManagedControlEnv } = await import('../../cli/sandbox/docker/agentServiceManager.js');
+const { computeEnvHash } = await import('../../cli/sandbox/docker/common.js');
+const {
+    buildManagedControlEnv,
+    buildRuntimeNetworkPlan,
+    buildRuntimeRouterEnv,
+} = await import('../../cli/sandbox/docker/agentServiceManager.js');
+const { resolveManifestRuntimeProfile } = await import('../../cli/utils/runtime/profileService.js');
 const workspaceUtilModuleUrl = new URL('../../cli/commands/workspaceUtil.js', import.meta.url);
 const {
     assertStaticPreinstallSucceeded,
@@ -62,6 +68,8 @@ const {
     computeRetainedManagedEnvHash,
     deduplicateAgentRegistry,
     ensureGraphNodesEnabled,
+    isRegistryRuntimeRunning,
+    removeGraphContainerForRecreate,
     reprepareGraphAfterStartupProviders,
     reinstallAgent,
     resolveStaticRouterContainerName,
@@ -553,7 +561,7 @@ test('coordinated graph topology precedes startup preinstall and config provider
 
 test('canonical startup validates provider binding under the workspace lock before mutation and persists it before the Router', () => {
     const source = startWorkspace.toString();
-    const lock = source.indexOf("await acquireWorkspaceMutationLease({ operation: 'workspace-start' })");
+    const lock = source.indexOf("await acquireSettledWorkspaceMutationLease({ operation: 'workspace-start' })");
     const admission = source.indexOf('assertWorkspaceGraphAdmissionsCurrent(admittedStart.admissions)');
     const resolution = source.indexOf('resolveWorkspaceGraphSsoConfig(lockedStart.graph');
     const inactivation = source.indexOf("inactivateEdgeRoutingGeneration('workspace-start-prepare'");
@@ -603,7 +611,7 @@ test('workspace Router generation reader and both inactive graph preparations pr
     const generationIndex = source.indexOf('ensureGraphNodesEnabled(dependencyGraph, reg, {');
     const finalPreparationIndex = source.indexOf('reprepareGraphAfterStartupProviders(');
     const launchIndex = source.indexOf('ensureAgentService(shortAgentName');
-    const lockIndex = source.indexOf("await acquireWorkspaceMutationLease({ operation: 'workspace-start' })");
+    const lockIndex = source.indexOf("await acquireSettledWorkspaceMutationLease({ operation: 'workspace-start' })");
 
     assert.ok(lockIndex >= 0 && lockIndex < routerIndex, 'workspace start must suppress watchdog container reconciliation before router startup');
     assert.ok(routerIndex >= 0, 'workspace start must establish the router listener');
@@ -1314,6 +1322,7 @@ test('managed runtime hash reconstruction uses the retained signed semantic topo
             // The shared construction's managed control input, which the
             // creation label carries (see hardwareLimitsEnvHashConsistency).
             ...buildManagedControlEnv(node.manifest),
+            PLOINKY_HEALTH_PROBE_BROKER: '0',
             PLOINKY_ROUTER_SEMANTIC_TOPOLOGY_DIGEST: 'sha256:semantic-topology',
             PLOINKY_ROUTER_DESCRIPTOR_SCHEMA: 'ploinky.generated-local-router.v1',
             PLOINKY_ROUTER_TRANSPORT_VERSION: 'node-authority-v1',
@@ -1324,6 +1333,139 @@ test('managed runtime hash reconstruction uses the retained signed semantic topo
         },
         identity: { agentName: 'managed', repoName: 'demo' },
     });
+});
+
+function prepareRetainedBrokerRuntime({ mode, health, launchBroker, descriptorOverrides = {}, inspection = { state: 'exact' } }) {
+    writePersistedRouterPort();
+    const node = {
+        id: 'demo/broker', repoName: 'demo', shortAgentName: 'broker', alias: '',
+        agentRef: 'demo/broker', enableSpec: 'demo/broker global', profile: '', isStatic: false,
+        manifest: {
+            container: 'node:20-alpine',
+            network: { mode, ...(mode === 'bridge' ? { attachments: [{ name: 'broker-test', primary: true }] } : {}) },
+            ...(health ? { health } : {}),
+        },
+    };
+    const descriptorRoot = path.join(tempDir, '.ploinky', 'run', 'broker-hash-descriptors');
+    const descriptorFile = path.join(descriptorRoot, '12345678-1234-4234-8234-123456789abc.json');
+    fs.mkdirSync(descriptorRoot, { recursive: true });
+    fs.writeFileSync(descriptorFile, '{}', { mode: 0o600 });
+    const predecessor = {
+        type: 'agent', repoName: 'demo', agentName: 'broker', runMode: 'global', projectPath: tempDir,
+        instanceId: 'retained-instance', enableGeneration: 'retained-generation',
+        config: { binds: [{
+            source: descriptorFile, target: '/run/ploinky/router-descriptor.json',
+            ro: true, generatedRouterDescriptor: true,
+        }] },
+    };
+    const payload = {
+        agentPrincipal: 'agent:demo/broker', instanceId: predecessor.instanceId,
+        generationId: predecessor.enableGeneration, semanticTopologyDigest: 'sha256:retained-topology',
+        schema: 'ploinky.generated-local-router.v1', transportVersion: 'node-authority-v1',
+        localStreaming: 'disabled',
+    };
+    const { profileConfig, network } = resolveManifestRuntimeProfile(node.manifest);
+    const networkPlan = buildRuntimeNetworkPlan('podman', network);
+    const routerEnv = buildRuntimeRouterEnv('podman', {
+        routerEndpoint: resolveManifestRouterEndpoint(node.manifest, { explicitPort: 8080 }),
+        networkMode: network.mode,
+    });
+    // Reconstruct the launcher's persisted label with an explicit broker value;
+    // the graph must independently derive that same value from the manifest.
+    const launchedHash = computeEnvHash(node.manifest, profileConfig, {
+        ...(networkPlan.requiresManagedNetwork ? {
+            PLOINKY_ROUTER_SEMANTIC_TOPOLOGY_DIGEST: payload.semanticTopologyDigest,
+            PLOINKY_ROUTER_DESCRIPTOR_SCHEMA: payload.schema,
+            PLOINKY_ROUTER_TRANSPORT_VERSION: payload.transportVersion,
+            PLOINKY_ROUTER_LOCAL_STREAMING: payload.localStreaming,
+            PLOINKY_AGENT_PRINCIPAL: payload.agentPrincipal,
+            PLOINKY_AGENT_INSTANCE_ID: predecessor.instanceId,
+            PLOINKY_AGENT_ENABLE_GENERATION: predecessor.enableGeneration,
+        } : routerEnv),
+        ...networkPlan.hashEnv,
+        PLOINKY_HEALTH_PROBE_BROKER: launchBroker,
+    }, { agentName: node.shortAgentName, repoName: node.repoName });
+    assert.match(launchedHash, /^[a-f0-9]{64}$/);
+    const registry = { broker_container: structuredClone(predecessor) };
+    const removalReasons = [];
+    const prepared = ensureGraphNodesEnabled({ nodes: new Map([[node.id, node]]) }, registry, {
+        runtimeReplacementOptions: {
+            containerExistsImpl() { return true; },
+            isContainerRunningImpl() { return true; },
+            getRuntimeForAgentImpl() { return 'podman'; },
+            getRuntimeImpl() { return 'podman'; },
+            getContainerLabelImpl(containerName, label) {
+                assert.equal(containerName, 'broker_container');
+                assert.equal(label, 'ploinky.envhash');
+                return launchedHash;
+            },
+            retainedManagedEnvHashOptions: {
+                descriptorRoot,
+                readDescriptorFileImpl() { return { payload: { ...payload, ...descriptorOverrides } }; },
+            },
+            isLlmRuntimeManifestImpl() { return false; },
+            createNetworkLifecycleAdapterImpl() {
+                return { inspectContainerContract() { return inspection; } };
+            },
+        },
+        inactivateGeneration() {},
+        retireNoWaitMarkers() {},
+        loadRouting() { return { routes: { broker: { container: 'broker_container', repo: 'demo', agent: 'broker' } } }; },
+        saveRouting() {},
+        saveAgents() {},
+        prepareAgentEnableBatch(requests) {
+            assert.deepEqual(requests, []);
+            return { plans: [], preparedGeneration: { selector: { state: 'inactive' } } };
+        },
+        removeAgentContainerForRecreate(containerName, reason, observedPredecessor) {
+            assert.equal(containerName, 'broker_container');
+            assert.deepEqual(observedPredecessor, predecessor);
+            removalReasons.push(reason);
+        },
+        executionRecordOptions: { workspaceRoot: tempDir },
+    });
+    return { prepared, registry, predecessor, removalReasons };
+}
+
+for (const mode of ['default', 'bridge', 'host', 'none']) {
+    for (const [name, health, broker] of [
+        ['absent', undefined, '0'],
+        ['blank', { readiness: { script: '  ' }, liveness: { script: '' } }, '0'],
+        ['readiness', { readiness: { script: 'healthcheck.sh' } }, '1'],
+        ['liveness', { liveness: { script: 'healthcheck.sh' } }, '1'],
+    ]) {
+        test(`retained ${mode} runtime preserves identity with ${name} health broker scripts`, () => {
+            const { prepared, registry, predecessor, removalReasons } = prepareRetainedBrokerRuntime({
+                mode, health, launchBroker: broker,
+            });
+            assert.deepEqual(prepared.changedContainers, []);
+            assert.deepEqual(registry.broker_container, predecessor);
+            assert.deepEqual(removalReasons, []);
+        });
+    }
+    test(`retained ${mode} runtime still replaces a changed health broker setting`, () => {
+        const { prepared, removalReasons } = prepareRetainedBrokerRuntime({
+            mode, health: { readiness: { script: 'healthcheck.sh' } }, launchBroker: '0',
+        });
+        assert.deepEqual(prepared.changedContainers, ['broker_container']);
+        assert.match(removalReasons[0], /envHashChanged/);
+    });
+}
+
+for (const field of ['agentPrincipal', 'instanceId', 'generationId']) {
+    test(`retained managed runtime still rejects descriptor ${field} drift`, () => {
+        const { prepared, removalReasons } = prepareRetainedBrokerRuntime({
+            mode: 'default', launchBroker: '0', descriptorOverrides: { [field]: 'foreign' },
+        });
+        assert.deepEqual(prepared.changedContainers, ['broker_container']);
+        assert.match(removalReasons[0], /managedRouterDescriptorDrift/);
+    });
+}
+
+test('matching health broker hash still rejects foreign runtime ownership', () => {
+    assert.throws(() => prepareRetainedBrokerRuntime({
+        mode: 'default', launchBroker: '0', inspection: { state: 'foreign' },
+    }), /refusing graph replacement of foreign runtime/);
 });
 
 test('a healthy managed runtime reuses its semantic env hash instead of rotating on the ordinary hash', () => {
@@ -1790,6 +1932,256 @@ test('a stopped enabled runtime outside the dependency graph is staged target-le
     assert.deepEqual(registry.outside_container.auth, { mode: 'sso', retained: true });
     const source = startWorkspace.toString();
     assert.match(source, /const extraRuntimeNodes = lockedStart\.additionalNodes;[\s\S]*?additionalNodes:\s*extraRuntimeNodes/);
+});
+
+const NATIVE_RUNTIMES = ['seatbelt', 'bwrap'];
+
+function nativePredecessor(runtime, overrides = {}) {
+    return {
+        type: 'agent',
+        repoName: 'demo',
+        agentName: 'background',
+        runtime,
+        runMode: 'global',
+        projectPath: tempDir,
+        instanceId: 'native-old-instance',
+        enableGeneration: 'native-old-generation',
+        ...overrides,
+    };
+}
+
+for (const runtime of NATIVE_RUNTIMES) {
+    test(`a ${runtime} predecessor is removed by its own record's backend and its proof retires only after exact absence or removal`, () => {
+        for (const state of ['absent', 'removed']) {
+            const events = [];
+            const receipt = { containerName: 'native_container', predecessor: { process: { pid: 4242, processIdentity: 'ps-lstart:x' } } };
+            const result = removeGraphContainerForRecreate('native_container', 'workspaceGraph:demo/background:test', nativePredecessor(runtime), {
+                predecessorReceipt: receipt,
+                removeExactSandboxPredecessorImpl(name, record, options) {
+                    events.push(['sandbox', name, record.runtime, options.process]);
+                    return { removed: state === 'removed', state, reason: 'fixture' };
+                },
+                clearLivenessStateImpl(name) { events.push(['clear', name]); },
+                retireRuntimePredecessorImpl(retired) { events.push(['retire', retired === receipt]); },
+                containerExistsImpl() { throw new Error('a native predecessor must not probe a container engine'); },
+                removeExactRegisteredContainerImpl() { throw new Error('a native predecessor must not reach container removal'); },
+            });
+            assert.deepEqual(events, [
+                ['sandbox', 'native_container', runtime, { pid: 4242, processIdentity: 'ps-lstart:x' }],
+                ['clear', 'native_container'],
+                ['retire', true],
+            ], state);
+            assert.deepEqual(result, { removed: state === 'removed', state: state === 'removed' ? 'removed' : 'absent' });
+        }
+    });
+
+    test(`a ${runtime} predecessor whose stop is refused, failed or unverified keeps its proof and throws`, () => {
+        const outcomes = [
+            { removed: false, state: 'refused', reason: 'foreign-tuple' },
+            { removed: false, state: 'failed', reason: 'still-alive-after-kill' },
+            { removed: false, state: 'unknown', reason: 'identity-probe-failed' },
+            () => { throw new Error('observation exploded'); },
+        ];
+        for (const outcome of outcomes) {
+            const events = [];
+            assert.throws(
+                () => removeGraphContainerForRecreate('native_container', 'workspaceGraph:demo/background:test', nativePredecessor(runtime), {
+                    predecessorReceipt: { containerName: 'native_container', predecessor: {} },
+                    removeExactSandboxPredecessorImpl() {
+                        events.push('sandbox');
+                        return typeof outcome === 'function' ? outcome() : outcome;
+                    },
+                    clearLivenessStateImpl() { events.push('clear'); },
+                    retireRuntimePredecessorImpl() { events.push('retire'); },
+                }),
+                (error) => error.code === 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS',
+            );
+            assert.deepEqual(events, ['sandbox'], 'neither liveness state nor the proof is touched');
+        }
+    });
+}
+
+// removeGraphContainerForRecreate itself never infers a backend: a record that
+// names no runtime reaches it only after ensureGraphNodesEnabled proved its
+// backend (next test) and, when native, gave it its runtime.
+test('a container predecessor, or a record that names no runtime, never reaches the native removal', () => {
+    for (const record of [
+        { ...nativePredecessor('podman'), runtime: 'podman', containerId: 'a'.repeat(64) },
+        { ...nativePredecessor('podman'), runtime: undefined },
+    ]) {
+        const result = removeGraphContainerForRecreate('native_container', 'workspaceGraph:demo/background:test', record, {
+            removeExactSandboxPredecessorImpl() { throw new Error('the native removal must not run'); },
+            containerExistsImpl: () => false,
+            inspectExactContainerImpl: () => null,
+            getRuntimeImpl: () => 'podman',
+        });
+        assert.deepEqual(result, { removed: false, state: 'absent' });
+    }
+});
+
+for (const runtime of NATIVE_RUNTIMES) {
+    test(`staging a ${runtime} replacement: observe the predecessor first, revoke routing, persist its proof with the captured process, then publish the rotated state`, () => {
+        const events = [];
+        const registry = { native_container: nativePredecessor(runtime) };
+        const routing = { routes: { background: { container: 'native_container', repo: 'demo', agent: 'background', hostPort: 45000 } } };
+        const node = {
+            id: 'demo/background', repoName: 'demo', shortAgentName: 'background', alias: '',
+            agentRef: 'demo/background', enableSpec: 'demo/background global', profile: 'default', isStatic: false,
+            manifest: { 'lite-sandbox': true, network: { mode: 'none' } },
+        };
+        const stage = (observation) => ensureGraphNodesEnabled({ nodes: new Map([[node.id, node]]) }, structuredClone(registry), {
+            runtimeReplacementReason() { return 'sandboxRuntimeStopped'; },
+            observeSandboxRuntimeImpl(name, options) {
+                events.push(['observe', name, options.expectedIdentity]);
+                return observation;
+            },
+            inactivateGeneration() { events.push('inactive'); },
+            loadRouting() { return structuredClone(routing); },
+            writeRuntimePredecessorImpl(receipt) {
+                events.push(['receipt', receipt.predecessor.runtime, receipt.predecessor.process || null]);
+                return { containerName: receipt.containerName, predecessor: receipt.predecessor };
+            },
+            retireNoWaitMarkers() { events.push('markers'); },
+            saveAgents() { events.push('registry'); },
+            saveRouting() { events.push('route'); },
+            prepareAgentEnableBatch() {
+                events.push('prepared');
+                return { plans: [], preparedGeneration: { selector: { state: 'inactive' } } };
+            },
+            removeAgentContainerForRecreate(name, label, record, options) {
+                events.push(['removed', name, record.runtime, Boolean(options.predecessorReceipt)]);
+            },
+            uuid: (() => { const ids = ['native-new-instance', 'native-new-generation']; return () => ids.shift(); })(),
+        });
+
+        const observedTuple = { instanceId: 'native-old-instance', enableGeneration: 'native-old-generation' };
+        const live = { state: 'live-exact', reason: 'live', record: { pid: 777, processIdentity: 'ps-lstart:live', runtimeKey: 'native_container' } };
+        const result = stage(live);
+        assert.deepEqual(result.changedContainers, ['native_container']);
+        assert.deepEqual(events, [
+            ['observe', 'native_container', observedTuple],
+            'inactive',
+            'markers',
+            ['receipt', runtime, { pid: 777, processIdentity: 'ps-lstart:live' }],
+            'registry',
+            'route',
+            'prepared',
+            ['removed', 'native_container', runtime, true],
+        ]);
+
+        // A predecessor that is verifiably absent carries no process evidence.
+        events.length = 0;
+        stage({ state: 'absent', reason: 'no-record', record: null });
+        assert.deepEqual(events.find((entry) => entry[0] === 'receipt'), ['receipt', runtime, null]);
+
+        // A slot that cannot be verified refuses before anything is revoked or written.
+        events.length = 0;
+        assert.throws(
+            () => stage({ state: 'unknown', reason: 'identity-probe-failed', record: null }),
+            (error) => error.code === 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS',
+        );
+        assert.deepEqual(events, [['observe', 'native_container', observedTuple]]);
+    });
+}
+
+test('a record that names no runtime gets a backend only from the evidence of its exact tuple', () => {
+    const node = {
+        id: 'demo/background', repoName: 'demo', shortAgentName: 'background', alias: '',
+        agentRef: 'demo/background', enableSpec: 'demo/background global', profile: 'default', isStatic: false,
+        manifest: { 'lite-sandbox': true, network: { mode: 'none' } },
+    };
+    const run = ({ observation, engine = true, desired = 'seatbelt' }) => {
+        const events = [];
+        const removed = [];
+        const registry = { native_container: nativePredecessor('seatbelt') };
+        delete registry.native_container.runtime;
+        const seen = [];
+        const stage = () => ensureGraphNodesEnabled({ nodes: new Map([[node.id, node]]) }, registry, {
+            runtimeReplacementOptions: { getRuntimeForAgentImpl: () => desired },
+            observeSandboxRuntimeImpl(name, options) {
+                events.push('observe');
+                return typeof observation === 'function' ? observation(name, options) : observation;
+            },
+            probeContainerRuntimeImpl: undefined,
+            runtimeReplacementReason(plan) {
+                seen.push(plan.predecessorBackend);
+                return 'sandboxRuntimeStopped';
+            },
+            inactivateGeneration() { events.push('inactive'); },
+            loadRouting() { return { routes: { background: { container: 'native_container', repo: 'demo', agent: 'background', hostPort: 45000 } } }; },
+            writeRuntimePredecessorImpl(receipt) {
+                events.push(['receipt', receipt.predecessor.runtime || null]);
+                return { containerName: receipt.containerName, predecessor: receipt.predecessor };
+            },
+            readRuntimePredecessorImpl: () => null,
+            retireNoWaitMarkers() {},
+            saveAgents() {},
+            saveRouting() {},
+            prepareAgentEnableBatch() { return { plans: [], preparedGeneration: { selector: { state: 'inactive' } } }; },
+            removeAgentContainerForRecreate(name, label, record) { removed.push(record.runtime || null); },
+            uuid: (() => { const ids = ['n-i', 'n-g']; return () => ids.shift(); })(),
+        });
+        try { stage(); return { ok: true, events, removed, seen }; } catch (error) { return { ok: false, code: error.code, events, removed, seen }; }
+    };
+    const tuple = { instanceId: 'native-old-instance', enableGeneration: 'native-old-generation' };
+
+    // A live native owner of the exact tuple, or a stale record of it: native, kind named for the removal.
+    for (const observation of [
+        { state: 'live-exact', reason: 'live', record: { ...tuple, pid: 9, processIdentity: 'x', runtimeKey: 'native_container' } },
+        { state: 'absent', reason: 'stale-record', record: { ...tuple, pid: 9, processIdentity: 'x', runtimeKey: 'native_container' } },
+    ]) {
+        const out = run({ observation });
+        assert.equal(out.ok, true);
+        assert.deepEqual(out.removed, ['seatbelt'], 'the removal takes the native path');
+        assert.ok(out.events.some((entry) => Array.isArray(entry) && entry[1] === 'seatbelt'), 'and the receipt names the kind');
+    }
+    // A live native owner of that tuple wins even when the successor is a container.
+    const toContainer = run({ desired: 'podman', observation: { state: 'live-exact', reason: 'live', record: { ...tuple, pid: 9, processIdentity: 'x', runtimeKey: 'native_container' } } });
+    assert.equal(toContainer.ok, true);
+    assert.deepEqual(toContainer.removed, [process.platform === 'darwin' ? 'seatbelt' : 'bwrap']);
+
+    // Another tuple in the slot, or nothing there: no native evidence for this record.
+    for (const observation of [
+        { state: 'live-foreign', reason: 'foreign-tuple', record: { instanceId: 'x', enableGeneration: 'y', pid: 9, processIdentity: 'x', runtimeKey: 'native_container' } },
+        { state: 'absent', reason: 'no-record', record: null },
+    ]) {
+        const out = run({ observation, desired: 'podman' });
+        assert.deepEqual(out.removed, [null]);
+    }
+
+    // An unverifiable slot refuses before routing is revoked.
+    const unknown = run({ observation: { state: 'unknown', reason: 'identity-probe-failed', record: null } });
+    assert.equal(unknown.ok, false);
+    assert.equal(unknown.code, 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS');
+    assert.deepEqual(unknown.events, ['observe'], 'before inactivation');
+});
+
+test('native additional startup liveness observes the exact runtime key with the record\'s tuple, never the short agent name', () => {
+    const seen = [];
+    const observeImpl = (name, options) => {
+        seen.push([name, options.expectedIdentity]);
+        return { state: name === 'ploinky_repoa_agent_ws' ? 'live-exact' : 'absent', reason: 'fixture', record: null };
+    };
+    const base = { type: 'agent', agentName: 'agent', runtime: 'seatbelt' };
+    const repoA = { ...base, repoName: 'repoa', instanceId: 'a-i', enableGeneration: 'a-g' };
+    const repoB = { ...base, repoName: 'repob', instanceId: 'b-i', enableGeneration: 'b-g' };
+    assert.equal(isRegistryRuntimeRunning('ploinky_repoa_agent_ws', repoA, { observeImpl }), true);
+    assert.equal(isRegistryRuntimeRunning('ploinky_repob_agent_ws', repoB, { observeImpl }), false);
+    assert.equal(isRegistryRuntimeRunning('ploinky_repoa_agent_alias_ws', { ...repoA, alias: 'alias' }, { observeImpl }), false);
+    assert.deepEqual(seen, [
+        ['ploinky_repoa_agent_ws', { instanceId: 'a-i', enableGeneration: 'a-g' }],
+        ['ploinky_repob_agent_ws', { instanceId: 'b-i', enableGeneration: 'b-g' }],
+        ['ploinky_repoa_agent_alias_ws', { instanceId: 'a-i', enableGeneration: 'a-g' }],
+    ]);
+    assert.throws(
+        () => isRegistryRuntimeRunning('ploinky_repoa_agent_ws', repoA, { observeImpl: () => ({ state: 'unknown', reason: 'identity-probe-failed' }) }),
+        (error) => error.code === 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS',
+        'an unverifiable runtime is not "stopped"',
+    );
+    assert.throws(
+        () => isRegistryRuntimeRunning('ploinky_repoa_agent_ws', { ...repoA, instanceId: '' }, { observeImpl }),
+        (error) => error.code === 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS',
+    );
 });
 
 test('devel execution preflight fails before removing any retained graph container', () => {

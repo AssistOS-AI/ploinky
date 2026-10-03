@@ -23,7 +23,7 @@ const TASK_LOG_SSE_CHUNK_CHARS = 64 * 1024;
 const INTERACTION_ID_RE = /^[A-Za-z0-9_-]{8,128}$/;
 const INTERACTION_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const PLOINKY_WORKSPACE_BANNER_RE = /^\[ploinky\]\s+using \.ploinky:\s+.+$/;
-const TASK_STATUSES = new Set(['ongoing', 'finished', 'stopped', 'error']);
+const TASK_STATUSES = new Set(['ongoing', 'finished', 'paused', 'error']);
 const MAX_WORKSPACE_FILE_PATHS = 100000;
 const MAX_WORKSPACE_FILE_DELTA_PATHS = 20000;
 const MAX_WORKSPACE_FILE_PATH_LENGTH = 4096;
@@ -36,12 +36,13 @@ function normalizeFinalOutputRanges(raw) {
     const declared = Array.isArray(raw?.finalOutputRanges)
         ? raw.finalOutputRanges.slice(-MAX_TASK_FINAL_OUTPUT_RANGES)
         : [];
-    const legacy = {
+    // Task producers also report the current turn's range as single fields.
+    const currentTurn = {
         turn: raw?.turn,
         offset: raw?.finalOutputOffset,
         length: raw?.finalOutputLength,
     };
-    for (const candidate of [...declared, legacy]) {
+    for (const candidate of [...declared, currentTurn]) {
         if (!Number.isSafeInteger(candidate?.turn) || candidate.turn < 1) continue;
         if (!Number.isSafeInteger(candidate.offset) || candidate.offset < 0) continue;
         if (!Number.isSafeInteger(candidate.length) || candidate.length < 1) continue;

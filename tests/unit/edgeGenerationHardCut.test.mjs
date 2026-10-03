@@ -1465,7 +1465,7 @@ test('prepared Router attestation fails closed when lifecycle sources change bet
     );
 });
 
-test('legacy generation without dependency HTTP routes remains loadable until replacement', (t) => {
+test('a generation missing a derived compiled field is rejected as corrupt, not loaded', (t) => {
     const fixture = createFixture(t, {
         desired: {
             hosts: {
@@ -1478,79 +1478,33 @@ test('legacy generation without dependency HTTP routes remains loadable until re
     });
     const applied = applyEdgeRoutingGeneration({
         workspaceRoot: fixture.workspace,
-        reason: 'legacy-generation-baseline',
+        reason: 'derived-field-baseline',
     });
     const generationFile = path.join(
         fixture.edgeDir,
         'generations',
         `${applied.selector.generation.replace(/^sha256:/, '')}.json`,
     );
-    const legacyDocument = JSON.parse(fs.readFileSync(generationFile, 'utf8'));
-    delete legacyDocument.compiled.dependencyHttpRoutes;
-    legacyDocument.compiledDigest = compiledDigest(legacyDocument.compiled);
-    fs.writeFileSync(generationFile, JSON.stringify(legacyDocument, null, 2));
-
-    const legacyActive = loadActiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace });
-    assert.equal(Object.hasOwn(legacyActive.generation.compiled, 'dependencyHttpRoutes'), false);
-
-    fs.writeFileSync(path.join(fixture.edgeDir, 'desired.json'), JSON.stringify({
-        hosts: {
-            'replacement.example.test': {
-                agent: 'fixtures/alpha',
-                routerSurfaces: [],
-            },
-        },
-    }, null, 2));
-    const replacement = applyEdgeRoutingGeneration({
-        workspaceRoot: fixture.workspace,
-        reason: 'legacy-generation-replacement',
-    });
-    assert.notEqual(replacement.selector.generation, applied.selector.generation);
-    assert.equal(Object.hasOwn(replacement.generation.compiled, 'dependencyHttpRoutes'), true);
-});
-
-test('legacy generation without workspace log consumers remains loadable fail-closed until replacement', (t) => {
-    const fixture = createFixture(t, {
-        desired: {
-            hosts: {
-                'explorer.example.test': {
-                    agent: 'fixtures/alpha',
-                    routerSurfaces: [],
-                },
-            },
-        },
-    });
-    const applied = applyEdgeRoutingGeneration({
-        workspaceRoot: fixture.workspace,
-        reason: 'legacy-workspace-logs-baseline',
-    });
-    const generationFile = path.join(
-        fixture.edgeDir,
-        'generations',
-        `${applied.selector.generation.replace(/^sha256:/, '')}.json`,
-    );
-    const legacyDocument = JSON.parse(fs.readFileSync(generationFile, 'utf8'));
-    delete legacyDocument.compiled.security.workspaceLogConsumers;
-    legacyDocument.compiledDigest = compiledDigest(legacyDocument.compiled);
-    fs.writeFileSync(generationFile, JSON.stringify(legacyDocument, null, 2));
-
-    const legacyActive = loadActiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace });
-    assert.equal(Object.hasOwn(legacyActive.generation.compiled.security, 'workspaceLogConsumers'), false);
-
-    fs.writeFileSync(path.join(fixture.edgeDir, 'desired.json'), JSON.stringify({
-        hosts: {
-            'replacement.example.test': {
-                agent: 'fixtures/alpha',
-                routerSurfaces: [],
-            },
-        },
-    }, null, 2));
-    const replacement = applyEdgeRoutingGeneration({
-        workspaceRoot: fixture.workspace,
-        reason: 'legacy-workspace-logs-replacement',
-    });
-    assert.notEqual(replacement.selector.generation, applied.selector.generation);
-    assert.deepEqual(replacement.generation.compiled.security.workspaceLogConsumers, []);
+    const original = fs.readFileSync(generationFile, 'utf8');
+    const omissions = [
+        (compiled) => { delete compiled.dependencyHttpRoutes; },
+        (compiled) => { delete compiled.security.workspaceLogConsumers; },
+    ];
+    for (const omit of omissions) {
+        const document = JSON.parse(original);
+        omit(document.compiled);
+        // A self-consistent digest proves the omission itself is rejected.
+        document.compiledDigest = compiledDigest(document.compiled);
+        fs.writeFileSync(generationFile, JSON.stringify(document, null, 2));
+        assert.throws(
+            () => loadActiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace }),
+            { code: 'EDGE_GENERATION_CORRUPT' },
+        );
+    }
+    fs.writeFileSync(generationFile, original);
+    const restored = loadActiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace });
+    assert.equal(Object.hasOwn(restored.generation.compiled, 'dependencyHttpRoutes'), true);
+    assert.deepEqual(restored.generation.compiled.security.workspaceLogConsumers, []);
 });
 
 test('live source drift is rejected without inactivating the selected generation', (t) => {

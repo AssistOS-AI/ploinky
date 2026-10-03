@@ -32,11 +32,11 @@ import { buildAgentShellArgs } from './agentShell.js';
 import { SHARED_DIR } from '../../utils/config.js';
 import { ensureAgentDataDirectory } from '../../utils/runtime/agentDataPathPolicy.js';
 import {
-    legacyAgentGuardMounts,
-    legacyAgentGuardTargets,
+    controllerGuardMounts,
+    controllerGuardTargets,
     normalizeRuntimeMountTarget,
-    prepareLegacyGuardMountpointCleanup,
-} from '../../utils/runtime/legacyAgentDataGuards.js';
+    prepareControllerGuardMountpointCleanup,
+} from '../../utils/runtime/controllerStateGuards.js';
 import { withNetworkLifecycleLock } from '../networkLifecycle.js';
 import {
     agentLibAliasShadows,
@@ -60,13 +60,13 @@ function joinShellCommandParts(parts) {
     return parts.filter((part) => String(part || '').trim()).join(' ');
 }
 
-function legacyGuardMountOptions(runtime, bindings, { workspaceRoot } = {}) {
-    const targets = legacyAgentGuardTargets(bindings, { workspaceRoot });
+function controllerGuardMountOptions(runtime, bindings, { workspaceRoot } = {}) {
+    const targets = controllerGuardTargets(bindings, { workspaceRoot });
     const mounts = bindings.map(binding => ({
         ...binding,
         runtimePath: normalizeRuntimeMountTarget(binding.runtimePath),
     }));
-    for (const guard of legacyAgentGuardMounts(targets, { workspaceRoot, bindings })) {
+    for (const guard of controllerGuardMounts(targets, { workspaceRoot, bindings })) {
         if (guard.replaceExisting) {
             for (const binding of mounts) {
                 if (binding.runtimePath !== guard.target) continue;
@@ -85,9 +85,9 @@ function legacyGuardMountOptions(runtime, bindings, { workspaceRoot } = {}) {
     return mounts.map(binding => `-v "${binding.hostPath}:${binding.runtimePath}${binding.suffix || ''}"`);
 }
 
-function withLegacyMountpointCleanup(operation) {
+function withGuardMountpointCleanup(operation) {
     return withNetworkLifecycleLock(() => {
-        const cleanup = prepareLegacyGuardMountpointCleanup();
+        const cleanup = prepareControllerGuardMountpointCleanup();
         try {
             return operation();
         } finally {
@@ -150,7 +150,7 @@ function buildInteractiveAgentCreateCommand({
         ...workspaceBinds,
         { hostPath: sharedDir, runtimePath: '/shared' },
     ]);
-    const mountOptions = legacyGuardMountOptions(runtime, [
+    const mountOptions = controllerGuardMountOptions(runtime, [
         ...workspaceBinds.map(binding => ({ ...binding, suffix: volumeSuffix })),
         { hostPath: agentLibPath, runtimePath: '/Agent', readOnly: true, suffix: readOnlySuffix },
         { hostPath: absAgentPath, runtimePath: '/code', readOnly: true, suffix: readOnlySuffix },
@@ -228,7 +228,7 @@ function runCommandInContainer(agentName, repoName, manifest, command, interacti
         ];
         const envVars = envVarParts.join(' ');
         const volumeSuffix = runtime === 'podman' ? ':z' : '';
-        const mountOptions = legacyGuardMountOptions(runtime, [
+        const mountOptions = controllerGuardMountOptions(runtime, [
             ...homeLayout.binds.map(({ source, target }) => ({
                 hostPath: source, runtimePath: target, suffix: volumeSuffix,
             })),
@@ -253,7 +253,7 @@ function runCommandInContainer(agentName, repoName, manifest, command, interacti
                 containerImage,
             });
             debugLog(`Executing create command: ${createCommand}`);
-            createOutput = withLegacyMountpointCleanup(() => (
+            createOutput = withGuardMountpointCleanup(() => (
                 execSync(createCommand, { stdio: ['pipe', 'pipe', 'inherit'] }).toString().trim()
             ));
             containerId = createOutput;
@@ -279,7 +279,7 @@ function runCommandInContainer(agentName, repoName, manifest, command, interacti
                 debugLog(`Executing retry command: ${retryCommand}`);
 
                 try {
-                    createOutput = withLegacyMountpointCleanup(() => (
+                    createOutput = withGuardMountpointCleanup(() => (
                         execSync(retryCommand, { stdio: ['pipe', 'pipe', 'inherit'] }).toString().trim()
                     ));
                     containerId = createOutput;
@@ -342,7 +342,7 @@ function runCommandInContainer(agentName, repoName, manifest, command, interacti
         const startCommand = `${runtime} start ${containerName}`;
         debugLog(`Executing start command: ${startCommand}`);
         try {
-            withLegacyMountpointCleanup(() => execSync(startCommand, { stdio: 'inherit' }));
+            withGuardMountpointCleanup(() => execSync(startCommand, { stdio: 'inherit' }));
         } catch (error) {
             console.error(`Error starting container. Try removing it with: ${runtime} rm ${containerName}`);
             throw error;
@@ -472,7 +472,7 @@ function ensureAgentContainer(agentName, repoName, manifest) {
                 containerImage,
             });
             debugLog(`Executing create command: ${createCommand}`);
-            withLegacyMountpointCleanup(() => (
+            withGuardMountpointCleanup(() => (
                 execSync(createCommand, { stdio: ['pipe', 'pipe', 'inherit'] })
             ));
             createdNew = true;
@@ -497,7 +497,7 @@ function ensureAgentContainer(agentName, repoName, manifest) {
                     containerImage,
                 });
                 debugLog(`Executing retry command: ${retryCommand}`);
-                withLegacyMountpointCleanup(() => (
+                withGuardMountpointCleanup(() => (
                     execSync(retryCommand, { stdio: ['pipe', 'pipe', 'inherit'] })
                 ));
                 manifest.container = containerImage;
@@ -534,7 +534,7 @@ function ensureAgentContainer(agentName, repoName, manifest) {
     if (!isContainerRunning(containerName)) {
         const startCommand = `${runtime} start ${containerName}`;
         debugLog(`Executing start command: ${startCommand}`);
-        try { withLegacyMountpointCleanup(() => execSync(startCommand, { stdio: 'inherit' })); }
+        try { withGuardMountpointCleanup(() => execSync(startCommand, { stdio: 'inherit' })); }
         catch (e) { console.error('[docker.ensureAgentContainer] start failed:', e.message || e); throw e; }
     }
     syncAgentMcpConfig(containerName, absAgentPath);

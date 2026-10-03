@@ -19,10 +19,13 @@ import {
     runBoundedCoreStart,
 } from '../../ploinky-box/supervisor.mjs';
 import {
+    OUTER_IMAGE_ID_FIXTURE,
     agentLibFixture,
     agentLibFixtureLabels,
     agentLibFixtureMounts,
+    imageAgentLibFixture,
 } from '../helpers/agentlibFixture.mjs';
+import { fakeRestartCore, fakeUpdateCore } from '../helpers/fakeUpdateCore.mjs';
 
 function fixture(t) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-supervisor-'));
@@ -83,7 +86,8 @@ function seedBoxCache(identity) {
     fs.mkdirSync(identity.dataPaths.dependencies, { recursive: true });
     fs.mkdirSync(identity.dataPaths.images, { recursive: true });
     fs.writeFileSync(path.join(identity.dataPaths.images, 'layer'), 'image data');
-    fs.writeFileSync(path.join(identity.anchorPath, 'master-key'), 'secret');
+    fs.mkdirSync(path.join(identity.anchorPath, 'data'), { recursive: true });
+    fs.writeFileSync(path.join(identity.anchorPath, 'data', 'master-key'), 'secret');
     return identity.dataPaths;
 }
 
@@ -566,14 +570,21 @@ test('update pulls a workspace Ploinky checkout under the workspace lock before 
                 finalize() { events.push('finalize'); },
             };
         },
-        async runCoreCommand(engine, containerId, argv, _hostPort, _mediaHostPort, _runner, options) {
-            assert.equal(engine, ownership.engine);
-            assert.equal(containerId, ownership.handles.container.id);
-            assert.deepEqual(argv, ['update']);
-            assert.equal(options.workspaceRoot, identity.workspaceRoot);
-            assert.equal(options.updateExcludedRepoPath, path.join(identity.workspaceRoot, 'ploinky'));
-            events.push('core-update');
-        },
+        runUpdateCore: fakeUpdateCore({
+            onCall({ engine, containerId, argv, options }) {
+                assert.equal(engine, ownership.engine);
+                assert.equal(containerId, ownership.handles.container.id);
+                assert.deepEqual(argv, ['update']);
+                assert.equal(options.workspaceRoot, identity.workspaceRoot);
+                assert.equal(options.updateExcludedRepoPath, path.join(identity.workspaceRoot, 'ploinky'));
+                // The expected context carries the exact identity and source snapshot.
+                assert.deepEqual(options.reportContext.workspace, {
+                    instance: identity.instance, workspaceRoot: identity.workspaceRoot,
+                });
+                assert.equal(options.reportContext.source.workspacePloinky.updated, true);
+                events.push('core-update');
+            },
+        }),
         revalidateAgentLibSource() {
             events.push('revalidate-agentlib');
         },
@@ -684,7 +695,7 @@ test('explicit cache deletion happens only after the outer container is removed'
     assert.equal(boxCacheExists(identity), false);
     assert.equal(fs.existsSync(identity.boxDataRoot), false);
     // Unrelated workspace state is never touched.
-    assert.equal(fs.readFileSync(path.join(identity.anchorPath, 'master-key'), 'utf8'), 'secret');
+    assert.equal(fs.readFileSync(path.join(identity.anchorPath, 'data', 'master-key'), 'utf8'), 'secret');
     assert.equal(events.some((value) => value.includes('volume')), false);
 });
 
@@ -1071,6 +1082,14 @@ test('a failed replacement restores and health-checks the prior Box graph before
     const events = [];
     let coreCalls = 0;
     let committed = false;
+    const coreCommand = async (_engine, containerId, args, _host, _media, _runner, options) => {
+        coreCalls += 1;
+        events.push(`core:${containerId}:${args.join(' ')}:${options.agentLib.fingerprint}`);
+        if (coreCalls === 1) throw new Error('candidate restart failed');
+        assert.equal(containerId, oldOwnership.handles.container.id);
+        assert.equal(options.agentLib, priorAgentLib);
+        assert.deepEqual(options.skillScopeEnv, priorScope);
+    };
     const supervisor = createBoxSupervisor({
         env: {},
         resolveIdentity: () => identity,
@@ -1080,7 +1099,7 @@ test('a failed replacement restores and health-checks the prior Box graph before
         runner: {
             run(_command, args) { events.push(`run:${args.join(' ')}`); },
         },
-        selectAgentLib: async () => ({ selection: candidateAgentLib, mode: 'managed' }),
+        selectAgentLib: async () => ({ selection: candidateAgentLib, mode: 'local' }),
         captureCoreStartArgv: () => Object.freeze(['start', 'explorer', '8080']),
         reconcile: async () => ({
             action: 'replaced',
@@ -1102,14 +1121,8 @@ test('a failed replacement restores and health-checks the prior Box graph before
         }),
         readEdgeDesired: () => null,
         resolveHostReachableIpv4: async () => '192.168.1.12',
-        runCoreCommand: async (_engine, containerId, args, _host, _media, _runner, options) => {
-            coreCalls += 1;
-            events.push(`core:${containerId}:${args.join(' ')}:${options.agentLib.fingerprint}`);
-            if (coreCalls === 1) throw new Error('candidate restart failed');
-            assert.equal(containerId, oldOwnership.handles.container.id);
-            assert.equal(options.agentLib, priorAgentLib);
-            assert.deepEqual(options.skillScopeEnv, priorScope);
-        },
+        runCoreCommand: coreCommand,
+        runRestartCore: fakeRestartCore(coreCommand),
         healthCheck: async () => { events.push('prior-health'); },
         commitAgentLibSelection: () => { committed = true; },
     });
@@ -1181,6 +1194,35 @@ test('bounded start requires the external Router URL and preserves normalized ar
     assert.equal(calls[0][2].stdout, output);
     assert.equal(calls[0][2].stderr, output);
     assert.equal(output.value.match(/Debug mode enabled/g)?.length, 1);
+
+    // An image source carries neither a fingerprint nor a commit. The outer image
+    // ID is deliberately NOT injected per exec: every exec inherits the value set
+    // when the Box was created, which the container validation checked against the
+    // observed image.
+    const imageAgentLib = imageAgentLibFixture();
+    const imageCalls = [];
+    await runBoundedCoreStart(
+        { name: 'podman' }, 'a'.repeat(64), ['start', 'Agent', '8080'], 19090, 17891,
+        {
+            async stream(command, args, options) {
+                imageCalls.push([command, args, options]);
+                options.stdout.write('[start] Router: http://127.0.0.1:19090\n');
+                return { ok: true, status: 0, stdout: '[start] Router: http://127.0.0.1:19090\n', stderr: '' };
+            },
+        },
+        { workspaceRoot: boundedRoot, stdout: output, stderr: output, timeoutMs: 1000, hostReachableIpv4: '192.168.1.12', agentLib: imageAgentLib },
+    );
+    const imageArgs = imageCalls[0][1];
+    const imageEnv = imageArgs.flatMap((value, index) => (value === '--env' ? [imageArgs[index + 1]] : []));
+    assert.deepEqual(imageEnv, [
+        'PLOINKY_ROUTER_HOST_PORT=19090',
+        'PLOINKY_MEDIA_HOST_PORT=17891',
+        'PLOINKY_HOST_REACHABLE_IPV4=192.168.1.12',
+        'PLOINKY_AGENTLIB_DIR=/opt/ploinky-agentlib',
+        'PLOINKY_AGENTLIB_MODE=image',
+        `PLOINKY_AGENTLIB_SOURCE_ID=${imageAgentLib.sourceIdHash}`,
+    ]);
+    assert.equal(imageArgs.some((value) => value.includes(OUTER_IMAGE_ID_FIXTURE) || value.includes('BOX_IMAGE_ID')), false);
 
     const defaultTimeoutCalls = [];
     await runBoundedCoreStart(

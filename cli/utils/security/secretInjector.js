@@ -5,7 +5,7 @@ import { findEnvFile, loadEnvFile } from './masterKey.js';
 import { debugLog } from '../utils.js';
 
 /**
- * Load secrets from the .ploinky/.secrets file.
+ * Load secrets from the .ploinky/data/.secrets file.
  * File format is KEY=VALUE, one per line, with # comments.
  * @returns {object} Map of secret names to values
  */
