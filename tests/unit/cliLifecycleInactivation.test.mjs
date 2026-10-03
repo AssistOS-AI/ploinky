@@ -143,7 +143,7 @@ test('single restart and reinstall delegate physical replacement to the shared r
 });
 
 test('managed single-agent restart drains before replacement and publishes only after readiness', () => {
-    assert.match(cliSource, /withWorkspaceMutationLease\(\{ operation: 'exact-agent-restart' \}, \(\) => reconcileExactHardwareInstance\(/);
+    assert.match(cliSource, /withHeldOrAcquiredWorkspaceMutationLease\(\{ operation: 'exact-agent-restart' \}, \(\) => reconcileExactHardwareInstance\(/);
     assertOrdered(reconcileSource, [
         'transition = await prepare({',
         'targetedRestart: transition.targetedRestart',

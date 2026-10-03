@@ -62,6 +62,9 @@ function fixture(mode, { problem = null, cleanupProblem = null, inactivationProb
         agentLibGrant: () => ({}),
         limitsHashReuseReason: () => null,
         LIMITS_HASH_LABEL: 'ploinky.limitshash',
+        // The admitted immutable dependency generation matches the desired one, and the host/none mount topology names it.
+        containerDependencyReuseProblem: () => '',
+        hasAdmittedDependencyMount: () => true,
         isLlmRuntimeManifest: () => false,
         createNetworkLifecycleAdapter: () => ({ inspectContainerContract: () => ({ state: 'exact', running: true, id }) }),
         effectiveInstanceKey: () => key,

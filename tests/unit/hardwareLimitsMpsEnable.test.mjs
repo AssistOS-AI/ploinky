@@ -68,6 +68,9 @@ function realEnableWithDependencies(f, { failReadiness = false } = {}) {
     const lease = { mode: 'additive' };
     const started = { containerName: 'a', containerId: 'b'.repeat(64), registryRecord: { ...desired, containerId: 'b'.repeat(64) } };
     const bindings = {
+        // enableAgent runs under the workspace lease it holds or acquires; the lease is not what this lifecycle test observes.
+        withHeldOrAcquiredWorkspaceMutationLease: async (_options, callback) => callback({}),
+        registeredRuntimeTuple: () => null,
         withMpsEnablePreparation: (request, stage) => withMpsEnablePreparation(request, stage, f.deps),
         prepareAgentEnableBatch: () => { f.events.push('prepare'); return { plans: [f.plan], preparedGeneration: { preparationLease: lease, generation: { agents: {}, routing: { routes: {} } } } }; },
         withNetworkLifecycleLock: async (callback) => callback(f.capability),

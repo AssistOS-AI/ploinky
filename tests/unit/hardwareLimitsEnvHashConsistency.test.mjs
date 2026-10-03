@@ -57,12 +57,15 @@ fs.writeFileSync(path.join(fakeBin, 'podman'), `#!/bin/sh
 printf '%s\\n' "$*" >> ${JSON.stringify(fakeCalls)}
 case "$*" in
   --version*|version*) echo "podman version 5.7.0"; exit 0 ;;
-  *"process.report"*) printf '{"platform":"linux","arch":"arm64","nodeMajor":24,"libc":"glibc"}'; exit 0 ;;
+  # The runtime-key probe reports an image without Node: this test observes the environment hash, so no dependency generation is
+  # prepared (the immutable dependency store builds one only for an image that has Node).
+  *"process.report"*) printf '{"noNode":true}'; exit 0 ;;
   "info "*) printf '{"rootless":false,"networkBackend":"netavark","pasta":null,"serviceIsRemote":false}'; exit 0 ;;
   *"container exists"*|*"container inspect"*|"inspect "*) echo "Error: no such container" >&2; exit 1 ;;
   *"image exists"*) exit 0 ;;
   *"image inspect --format {{json .Config.Entrypoint}}"*) echo '["docker-entrypoint.sh"]'; exit 0 ;;
   *"image inspect --format {{json .Config.Cmd}}"*) echo '["node"]'; exit 0 ;;
+  *"image inspect --format {{.Id}}"*) echo 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'; exit 0 ;;
   *"image inspect --format"*) echo '""'; exit 0 ;;
   *"image inspect"*) echo '[{"Id":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","Config":{"User":"","Entrypoint":["docker-entrypoint.sh"],"Cmd":["node"],"WorkingDir":"/"}}]'; exit 0 ;;
   *) exit 0 ;;
@@ -582,6 +585,9 @@ function serviceReuse(name, { envHashLabel }) {
         spawnSync: () => ({ status: 0, stdout: JSON.stringify([{ Id: id }]) }),
         hasExactAgentHomeLayout: () => true,
         verifyReusableHardwareRuntime: noOp,
+        // The admitted immutable dependency generation is the desired one, and the host/none mount topology names it.
+        containerDependencyReuseProblem: () => '',
+        hasAdmittedDependencyMount: () => true,
         assertHostModeGenerationCapability: noOp,
         deriveAgentPrincipalId,
         syncAgentMcpConfig: noOp,
