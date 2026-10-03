@@ -202,6 +202,19 @@ export function createGpuCases(ctx) {
         expects(value.id === id, `Nested inspect answered for another container (${hexTail(value.id)})`);
         return value;
     }
+    // The identity of one inspected agent against the pinned image. The fixture start created the agent from the digest
+    // reference, so its name is that reference; its image ID is the pinned image's identity. A GPU share client is recreated
+    // from that immutable ID (agentServiceManager.js `image = launch.imageId`), and the engine reports the name the container
+    // was created with: the ID. Identity is therefore the image ID recorded at the fixture start, and the name is that
+    // reference or that same ID. Before the ID is recorded only the reference is accepted. Shared by every case runner.
+    function pinnedImageIdentity(role, inspected) {
+        const pinned = prepared?.agents?.[role]?.imageId ?? null;
+        const bare = value => String(value ?? '').replace(/^sha256:/, '');
+        const named = pinned === null ? [image] : [image, bare(pinned), `sha256:${bare(pinned)}`];
+        const ok = (pinned === null || bare(inspected.image) === bare(pinned)) && named.includes(inspected.imageName);
+        return { ok, pinnedImageId: pinned === null ? null : bare(pinned), imageId: bare(inspected.image), imageName: inspected.imageName ?? null, pinnedReference: image, createdByReference: inspected.imageName === image };
+    }
+
     // The one container that currently carries an owned agent's name. A
     // replacement keeps the name and has a new immutable ID.
     async function agentNow(role) {
@@ -211,15 +224,8 @@ export function createGpuCases(ctx) {
         const inspected = await inspectNested(rows[0].id);
         expects(inspected.running === true, `Agent ${role} is not the pinned running instance`);
         if (image) {
-            // The fixture start created the agent from the digest reference, so its name is that reference; its image ID is
-            // the pinned image's identity. A GPU share client is recreated from that immutable ID (agentServiceManager.js
-            // `image = launch.imageId`), and the engine reports the name the container was created with: the ID. Identity
-            // is therefore the image ID recorded at the fixture start, and the name is that reference or that same ID.
-            const pinned = prepared?.agents?.[role]?.imageId ?? null;
-            const bare = value => String(value ?? '').replace(/^sha256:/, '');
-            const named = pinned === null ? [image] : [image, bare(pinned), `sha256:${bare(pinned)}`];
-            expects((pinned === null || bare(inspected.image) === bare(pinned)) && named.includes(inspected.imageName),
-                `Agent ${role} is not the pinned running instance (image ${hexTail(bare(inspected.image))}, created from ${String(inspected.imageName).slice(0, 120)})`);
+            const identity = pinnedImageIdentity(role, inspected);
+            expects(identity.ok, `Agent ${role} is not the pinned running instance (image ${hexTail(identity.imageId)}, created from ${String(inspected.imageName).slice(0, 120)})`);
         }
         return { role, ref: fixture.refs[role], name, ...inspected };
     }
@@ -954,7 +960,7 @@ export function createGpuCases(ctx) {
     return {
         liveP1, liveP2, liveP3, liveP4, beforeCleanup, afterCleanup,
         internals: {
-            prepare, admin, agentNow, settleShares, daemonIdentity, killOwnedDaemon, startTimeline, evaluateDrain, evidenceFor,
+            prepare, admin, agentNow, pinnedImageIdentity, settleShares, daemonIdentity, killOwnedDaemon, startTimeline, evaluateDrain, evidenceFor,
             // What the local-llm and vLLM cases build on (liveLlmCases.mjs): the same gate, administrator channel,
             // Apply, daemon and ownership proofs, never a second copy of them.
             runCase, applyShares, agentEntry, containerKey, observeMps, registerOwned, assertClientShare, assertUnshared, hostProcessesOf, boxProcessOnHost,

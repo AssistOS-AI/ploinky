@@ -247,7 +247,7 @@ test('G2.L1-passes-budget-cgroup-runner-environment-uid-generation-text-and-dige
     assert.deepEqual(Object.keys(artifact.runner[0].cuda).sort(), ['CUDA_CACHE_PATH', 'CUDA_MPS_ACTIVE_THREAD_PERCENTAGE', 'CUDA_MPS_PINNED_DEVICE_MEM_LIMIT', 'CUDA_MPS_PIPE_DIRECTORY'], 'the three MPS names plus the product\'s own CUDA_CACHE_PATH');
     assert.equal(artifact.runner[0].cuda.CUDA_MPS_PINNED_DEVICE_MEM_LIMIT, '0=3072M'); assert.equal(artifact.runner[0].cuda.CUDA_MPS_ACTIVE_THREAD_PERCENTAGE, '50');
     assert.equal(artifact.runner[0].envNames.some(name => /TOKEN|KEY|SECRET/.test(name)), false);
-    assert.match(artifact['agent:L1'].image, /^[0-9a-f]{64}$/, 'the share client was recreated from the immutable image ID, which is the name the engine reports'); assert.equal(artifact.image.configured, LLM_IMAGE, 'the fixture start used the digest reference'); assert.match(artifact['agent:L1'].labels['ploinky.mpsgeneration'], /^[0-9a-f-]{36}:[0-9a-f-]{36}$/);
+    assert.match(artifact['agent:L1'].imageName, /^[0-9a-f]{64}$/, 'the share client was recreated from the immutable image ID, which is the name the engine reports'); assert.equal(artifact['agent:L1'].imageId, artifact['agent:L1'].imageName, 'the evidence records the ID and the name'); assert.equal(artifact.image.configured, LLM_IMAGE, 'the fixture start used the digest reference'); assert.match(artifact['agent:L1'].labels['ploinky.mpsgeneration'], /^[0-9a-f-]{36}:[0-9a-f-]{36}$/);
     // The response and the digests of what ran.
     assert.equal(artifact.response.text, 'Pong.'); assert.equal(artifact.response.modelId, LLM_MODELS.small);
     assert.equal(artifact.digests.model.verified, true); assert.equal(artifact.digests.model.pinned.sha256, SMALL_FILE.sha256);
@@ -1513,4 +1513,45 @@ test('R2F.a-model-too-fast-to-measure-is-blocked-at-the-time-bound-and-at-the-re
     assert.equal(byCount.result, 'blocked', JSON.stringify(byCount).slice(0, 500));
     assert.deepEqual([counted.artifacts.get('gpu-live-l1').inference.load.requests, counted.artifacts.get('gpu-live-l1').inference.load.stoppedBy], [3, 'request-bound']);
     nothingOwned(counted);
+});
+
+// --- R2G: the L runner's identity checks are the immutable image ID, as the P runner's are (W3, F2) --------------------
+test('R2G.l1-records-the-pinned-id-and-the-name-of-the-start-instance-and-of-the-client-recreated-by-image-id', async t => {
+    // The start instance is the fixture-start one (named by the digest reference); Apply replaces it from the immutable image ID,
+    // which is the name the engine then reports. Both are checked against the ID recorded at the fixture start.
+    const w = await provisioned(t);
+    const report = await liveCases(w, ['LIVE-L1', 'LIVE-L2']);
+    assert.deepEqual(report.cases.map(entry => [entry.id, entry.result]), [['LIVE-L1', 'pass'], ['LIVE-L2', 'pass']], JSON.stringify(report.limitations).slice(0, 500));
+    const l1 = w.artifacts.get('gpu-live-l1');
+    assert.match(l1.image.imageId, /^[0-9a-f]{64}$/); assert.equal(l1.image.imageName, LLM_IMAGE, 'the start instance is named by the digest reference');
+    assert.equal(l1.image.pinnedImageId, l1.image.imageId); assert.equal(l1.image.createdByReference, true); assert.equal(l1.image.pinned, LLM_IMAGE); assert.equal(l1.image.ok, true);
+    const applied = l1['agent:L1'];
+    assert.equal(applied.imageId, l1.image.imageId, 'the recreated client is the pinned image'); assert.equal(applied.imageName, applied.imageId, 'and is named by the ID');
+    nothingOwned(w);
+});
+
+test('R2G.a-recreated-client-from-a-foreign-image-id-fails-in-l1-including-one-named-with-the-digest-reference', async t => {
+    for (const [label, faults, pattern] of [
+        ['a foreign ID', { recreatedImageId: 'd'.repeat(64) }, /is not the pinned running instance \(image d{12}, created from d{64}\)/],
+        ['a foreign ID named with the digest reference', { recreatedImageId: 'd'.repeat(64), recreatedImageName: LLM_IMAGE }, /is not the pinned running instance \(image d{12}, created from docker\.io\/assistos\/local-llm@sha256:/],
+        ['a foreign name with the right ID', { recreatedImageName: `docker.io/other/node@sha256:${'e'.repeat(64)}` }, /is not the pinned running instance .*created from docker\.io\/other\/node@sha256:e+/],
+    ]) {
+        const w = await provisioned(t, { faults });
+        const entry = caseOf(await liveCases(w, ['LIVE-L1']), 'LIVE-L1');
+        assert.equal(entry.result, 'fail', `${label}: ${JSON.stringify(entry).slice(0, 400)}`); assert.match(entry.reason, pattern, label);
+        nothingOwned(w);
+    }
+});
+
+test('R2G.a-recreated-client-from-a-foreign-image-id-fails-in-l3-and-a-recreate-by-the-pinned-id-passes', async t => {
+    const ok = await provisioned(t, { block: 'apparatus-vllm' });
+    const pass = caseOf(await liveCases(ok, ['LIVE-L3']), 'LIVE-L3');
+    assert.equal(pass.result, 'pass', JSON.stringify(pass).slice(0, 500));
+    const image = ok.artifacts.get('gpu-live-l3').image;
+    assert.equal(image.ok, true); assert.equal(image.createdByReference, true, 'the L3 start instance is the fixture-start one'); assert.match(image.imageId, /^[0-9a-f]{64}$/);
+    nothingOwned(ok);
+    const bad = await provisioned(t, { block: 'apparatus-vllm', faults: { recreatedImageId: 'd'.repeat(64), recreatedImageName: LLM_IMAGE } });
+    const entry = caseOf(await liveCases(bad, ['LIVE-L3']), 'LIVE-L3');
+    assert.equal(entry.result, 'fail', JSON.stringify(entry).slice(0, 400)); assert.match(entry.reason, /is not the pinned running instance \(image d{12}/);
+    nothingOwned(bad);
 });

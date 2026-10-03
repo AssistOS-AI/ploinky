@@ -166,7 +166,7 @@ export function createLlmCases(ctx) {
         gate.registerDaemon(identity.daemon.host.hostPid);
         const agent = await agentNow();
         k.registerOwned(agent);
-        evidence.put(`agent:${label}`, { id: agent.id, created: agent.created, user: agent.user, image: agent.imageName, labels: agent.labels, env: (agent.env || []).filter(value => /^CUDA_/.test(value)), generation: identity.daemon.generation });
+        evidence.put(`agent:${label}`, { id: agent.id, created: agent.created, user: agent.user, imageId: agent.image, imageName: agent.imageName, labels: agent.labels, env: (agent.env || []).filter(value => /^CUDA_/.test(value)), generation: identity.daemon.generation });
         k.assertClientShare(agent, limits.gpu, state, identity.daemon, { totalMiB: gpu.memoryMiB, label: `${label} agent` });
         // The agent's host UID is the daemon's: one owner for the whole cohort.
         const leaf = agentLeaf(host, k.getPrepared().prefix, agent.id);
@@ -332,8 +332,10 @@ export function createLlmCases(ctx) {
             // Fresh model data and the pinned image: nothing downloaded, no other model in use.
             const baseline = await agentNow();
             k.registerOwned(baseline);
-            evidence.put('image', { configured: baseline.imageName, pinned: llm.image, id: baseline.id });
-            expects(baseline.imageName === llm.image, 'The local-llm agent was not created from the pinned immutable image');
+            // Identity is the immutable image ID recorded at the fixture start; the name is the digest reference or that same ID (a recreate by ID).
+            const baselineImage = k.pinnedImageIdentity('llm', baseline);
+            evidence.put('image', { configured: baseline.imageName, pinned: llm.image, id: baseline.id, imageId: baseline.image, ...baselineImage });
+            expects(baselineImage.ok, 'The local-llm agent is not the pinned instance of the pinned immutable image');
             await agentAnswering(evidence, 'l1-before');
             const fresh = await agentView(evidence, 'before');
             pinned(fresh.model, llm.models.small);
@@ -526,7 +528,9 @@ export function createLlmCases(ctx) {
             await gate.check('L3-start');
             let agent = await agentNow();
             k.registerOwned(agent);
-            expects(agent.imageName === llm.image, 'The local-llm agent was not created from the pinned immutable image');
+            const startImage = k.pinnedImageIdentity('llm', agent);
+            evidence.put('image', { pinned: llm.image, id: agent.id, imageId: agent.image, ...startImage });
+            expects(startImage.ok, 'The local-llm agent is not the pinned instance of the pinned immutable image');
             await agentAnswering(evidence, 'l3-start');
 
             // STEP 0: does the pinned image's lock offer a vLLM install that can work here?

@@ -764,6 +764,9 @@ export function buildRequiredCaseManifest() {
             'R2E.the-playground-decision-states-the-route-and-session-deviation-and-the-programs-use-exactly-that-route',
             'R2F.a-fast-model-meets-the-in-flight-minimums-through-the-sustained-load-and-the-window-is-recorded',
             'R2F.a-model-too-fast-to-measure-is-blocked-at-the-time-bound-and-at-the-request-bound-never-passed',
+            'R2G.l1-records-the-pinned-id-and-the-name-of-the-start-instance-and-of-the-client-recreated-by-image-id',
+            'R2G.a-recreated-client-from-a-foreign-image-id-fails-in-l1-including-one-named-with-the-digest-reference',
+            'R2G.a-recreated-client-from-a-foreign-image-id-fails-in-l3-and-a-recreate-by-the-pinned-id-passes',
             'R2D.a-standalone-cleanup-writes-its-own-llm-cleanup-proof-and-the-live-runs-proof-is-not-accepted-for-it',
             'R2D.a-proof-another-action-or-run-left-or-one-that-lists-remaining-data-does-not-certify-a-cleanup',
             // The runner-environment check against local-llm's own launch environment.
