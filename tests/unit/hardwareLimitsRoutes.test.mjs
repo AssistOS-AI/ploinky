@@ -602,3 +602,33 @@ test('T4.a-real-stop-read-one-millisecond-after-the-observation-reads-stopped-in
     // One millisecond EARLIER (the read started before the observation) is a stale snapshot, still not a stop.
     assert.deepEqual((({ availability, limitsState }) => ({ availability, limitsState }))(statusOf(f, [productionEntry], 1)), { availability: 'starting', limitsState: 'applied' });
 });
+
+// F1 (round 17): after an engine read that failed, nothing is read from the kept runtimes as if it were now.
+test('F1.a-failed-engine-read-makes-every-kept-runtime-stale-so-a-stopped-container-never-reads-ready', async (t) => {
+    const f = fixture(t);
+    const record = { ...f.registry.canonical, containerId: NEW_ID };
+    const { readApplied } = recreated(f, new Date(Date.now() - 60_000).toISOString());
+    const running = engineEntry({ containerId: NEW_ID, state: { status: 'running', running: true, pid: 7 } });
+    for (const failing of [true, false]) {
+        let engine = 'running';
+        const monitor = new Monitor({
+            readRegistry: () => ({ canonical: record }), runtimeStateOptions: { activeGeneration: null, routes: { worker: { container: 'canonical', repo: 'demo', agent: 'worker', hostPort: 4100 } } },
+            readHardwareContext: () => ({ gate: 'off' }), readRouting: () => ({ routes: {} }), containerStats: false,
+            collectContainers: async () => { if (engine === 'fails') throw Object.assign(new Error('the container list could not be read: synthetic'), { code: 'ENGINE_READ_FAILED' }); return engine === 'running' ? [running] : []; },
+        });
+        const status = () => { const state = buildHardwareLimitsState({ context: f.getContext(), installed: [{ ref: 'demo/worker', manifestPath: '/fixture/manifest.json' }], registry: { canonical: record }, metrics: monitor.latest, admit: placementAdmit, readApplied }); const c = state.agents[0].containers[0]; return { availability: c.availability, limitsState: c.limitsState, failed: state.metricsReadFailed }; };
+        await monitor.reconcile();
+        assert.deepEqual(status(), { availability: 'ready', limitsState: 'applied', failed: false });
+        // The container exits; the next engine read fails (or, in the control, succeeds and lists nothing).
+        engine = failing ? 'fails' : 'gone';
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        const wait = await monitor.reconcileAfter(Date.now(), failing ? 300 : 1000);
+        assert.equal(wait.fresh, !failing);
+        if (failing) {
+            assert.equal(monitor.latest.readFailed, true);
+            // The kept runtime still says running; that is not read as ready, and the payload says the read failed.
+            assert.deepEqual(status(), { availability: 'starting', limitsState: 'applied', failed: true });
+        } else assert.deepEqual(status(), { availability: 'stopped', limitsState: 'unavailable', failed: false }, 'a successful read after the stop reads stopped');
+    }
+});
+

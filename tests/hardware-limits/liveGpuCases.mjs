@@ -321,7 +321,7 @@ export function createGpuCases(ctx) {
             return `${parts.join(', ') || 'no usable output'}${result?.stderr ? `: ${boundedTail(result.stderr, 160).text.trim()}` : ''}`;
         };
         const record = {
-            label, refs, problems, statusFresh: freshness.statusFresh ?? null, statusWaitMs: freshness.statusWaitMs ?? null, readStartedAt: freshness.readStartedAt ?? null, immediate: compact(immediate), last: compact(immediate),
+            label, refs, problems, statusFresh: freshness.statusFresh ?? null, statusWaitMs: freshness.statusWaitMs ?? null, readStartedAt: freshness.readStartedAt ?? null, metricsReadFailed: immediate.metricsReadFailed ?? null, immediate: compact(immediate), last: compact(immediate),
             convergence: { converged: false, afterMs: null, boundMs: timings.convergenceMs, polls: [], pollErrors: [] }, containers: null, containersAfterPoll: null, phase: 'immediate-failure',
         };
         const persist = () => { try { evidence.put('statusUnsettled', record); } catch { /* the verdict does not depend on it */ } };
@@ -368,7 +368,7 @@ export function createGpuCases(ctx) {
                 const state = await admin.state();
                 record.last = compact(state);
                 const remaining = unsettledProblems(state, refs, keys);
-                record.convergence.polls.push({ afterMs, problems: remaining.length });
+                record.convergence.polls.push({ afterMs, problems: remaining.length, metricsReadFailed: state.metricsReadFailed ?? null });
                 if (!remaining.length) { record.convergence.converged = true; record.convergence.afterMs = afterMs; polling = false; }
             } catch (error) {
                 // The HTTP status and the code are separate fields: a long message keeps its head, never only its tail.
