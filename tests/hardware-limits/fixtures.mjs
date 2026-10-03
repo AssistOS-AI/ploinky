@@ -614,6 +614,36 @@ export function buildRequiredCaseManifest() {
             'X4.c6-real-modules-a-lease-of-another-owner-is-refused-by-the-real-product',
             'X4.c6-real-modules-every-product-function-the-program-calls-is-an-export-of-the-real-module',
         ]),
+        ...leaves(P, 'p4', unit('hardwareLimitsLiveStore.test.mjs'), [
+            'X5.c5-block-fixture-pins-and-deadlines-are-wired',
+            'X5.c5-manifest-and-summary-name-the-spec-row-the-writers-the-program-every-bound-and-the-open-points-and-every-candidate-argv-is-accepted',
+            'X5.c5-params-and-argv-use-the-products-own-roots-and-the-box-exec-runs-as-the-box-user',
+            'X5.c5-the-program-inspects-holds-abandons-and-reports-the-product-s-own-answers-over-a-real-store',
+            'X5.c5-the-program-installs-and-removes-the-barrier-and-a-gate-off-check-sees-the-store-the-product-sees',
+            'X5.c5-the-program-refuses-another-workspace-a-wrong-store-root-and-invalid-parameters',
+            'X5.c5-the-evaluators-accept-exactly-what-they-describe',
+            'X5.c5-passes-every-step-over-the-real-store-and-leaves-the-box-stopped-for-the-cleanup-action',
+            'X5.c5-is-blocked-never-passed-when-a-prerequisite-is-missing',
+            'X5.c5-fails-when-the-box-and-the-host-do-not-read-one-store-or-run-as-different-users',
+            'X5.c5-fails-when-two-in-box-setters-of-one-stamp-both-win-or-a-stale-setter-is-accepted-and-the-clear-is-lost',
+            'X5.c5-fails-when-the-host-clear-does-not-commit-and-when-the-store-is-not-the-product-s',
+            'X5.c5-fails-when-a-live-lock-is-taken-by-either-side',
+            'X5.c5-fails-when-the-barrier-does-not-hold-a-write-back',
+            'X5.c5-fails-when-a-stale-lock-is-not-preserved-or-the-stop-does-not-leave-the-box-holder-s-lock-stale',
+            'X5.c5-fails-when-a-holder-s-own-release-is-refused-because-its-lock-was-replaced',
+            'X5.c5-sets-and-clears-only-the-stored-override-of-the-fixture-agent-and-leaves-nothing-running',
+            'X5.c5-is-blocked-when-the-box-is-not-running-and-fails-when-a-lock-or-a-barrier-is-already-there',
+            'X5.c5-fails-when-the-route-and-the-host-read-different-stamps-or-an-in-box-write-is-not-what-the-host-reads',
+            'X5.c5-fails-when-the-losing-setter-is-not-refused-with-revision-conflict-and-when-a-stale-setter-is-accepted-or-changes-the-store',
+            'X5.c5-orders-each-race-round-by-the-stamp-and-passes-both-orders',
+            'X5.c5-fails-when-a-lock-is-not-visible-through-the-mount-or-is-a-different-lock-on-the-two-sides',
+            'X5.c5-fails-when-a-refused-writer-changed-the-store-or-the-lock-it-was-refused-by',
+            'X5.c5-fails-when-the-barrier-leaves-a-gap-or-a-gate-off-start-does-not-follow-the-store',
+            'X5.c5-removes-the-barrier-even-when-the-case-fails-and-says-when-it-could-not',
+            'X5.c5-fails-when-a-stale-lock-is-recovered-without-one-committed-clear-or-the-abandoned-holder-is-alive-or-another-lock',
+            'X5.c5-fails-when-the-box-is-still-running-after-the-stop-and-when-the-stop-fails',
+            'X5.c5-fails-when-a-holder-ends-without-its-own-verified-release',
+        ]),
         ...leaves(P, 'p4', unit('hardwareLimitsLiveAvailability.test.mjs'), [
             'X4.c3-blocks-fixtures-and-pins-are-wired-and-the-dedicated-workspace-has-its-own-ports',
             'X4.c3-manifest-and-summary-name-the-spec-rows-the-edits-the-bounds-and-the-declared-limit-and-every-candidate-argv-is-accepted',
@@ -1517,7 +1547,7 @@ export function validateRunManifest(value) {
     for (const key of ['configDigest', 'casesDigest']) {
         if (!/^sha256:[0-9a-f]{64}$/.test(value[key])) fail(`${label}.${key}`, 'invalid digest');
     }
-    if (!['mac-cpu', 'mac-adversarial', 'mac-explorer', 'apparatus-cpu', 'apparatus-core', 'apparatus-authority', 'apparatus-availability', 'apparatus-router-controls', 'apparatus-mps', 'apparatus-local-llm',
+    if (!['mac-cpu', 'mac-adversarial', 'mac-explorer', 'apparatus-cpu', 'apparatus-core', 'apparatus-authority', 'apparatus-availability', 'apparatus-router-controls', 'apparatus-store', 'apparatus-mps', 'apparatus-local-llm',
         'apparatus-vllm'].includes(value.block)) {
         fail(`${label}.block`, 'unknown block');
     }

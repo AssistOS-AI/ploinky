@@ -25,6 +25,7 @@ import { createHostProc } from './liveGpuHost.mjs';
 import { createGpuGate, gpuCleanupProof, gpuQueryArgv } from './liveGpuGate.mjs';
 import { LLM_AGENT, LLM_REF, LLM_REPOSITORY } from './liveLlmNames.mjs';
 import { C3_AGENTS, C3V_AGENTS } from './liveAvailabilityCommands.mjs';
+import { C5_AGENTS } from './liveStoreCommands.mjs';
 
 export const FIXTURE_REPOSITORY = 'hwlfixture';
 export const FIXTURE_HARDWARE_LIMITS = Object.freeze({ memory: '64m', cpus: '0.5', pidsLimit: 64 });
@@ -45,6 +46,8 @@ export function fixturePlan(cases) {
     // LIVE-C3: a (the root) enables b, c and x; LIVE-C3V: the static agent alone. They declare no limits: the administrator's stored override is the request.
     if (cases.includes('LIVE-C3')) return C3_AGENTS.map(name => ({ name, role: name, hardwareLimits: null }));
     if (cases.includes('LIVE-C3V')) return C3V_AGENTS.map(name => ({ name, role: name, hardwareLimits: null }));
+    // LIVE-C5: the one managed-network agent whose stored override the host and the in-Box writers contend for.
+    if (cases.includes('LIVE-C5')) return C5_AGENTS.map(name => ({ name, role: name, hardwareLimits: null }));
     if (cases.some(id => String(id).startsWith('LIVE-L'))) {
         return [{ name: LLM_AGENT, role: 'llm', repository: LLM_REPOSITORY, hardwareLimits: null }];
     }
@@ -109,7 +112,7 @@ export function proposedWorkspaceIdentity(workspacePath) {
 }
 
 export function startArgs(profile, ports) {
-    return [profile.candidate.path, '--port', String(ports.tcp), '--udp-port', String(ports.udp), 'start', (profile.fixtures.llm || profile.fixtures.gpu || profile.fixtures.availability || profile.fixtures.cpu).ref];
+    return [profile.candidate.path, '--port', String(ports.tcp), '--udp-port', String(ports.udp), 'start', (profile.fixtures.llm || profile.fixtures.gpu || profile.fixtures.availability || profile.fixtures.store || profile.fixtures.cpu).ref];
 }
 
 export function validateProvisionPlan(value, run) {

@@ -21,6 +21,7 @@ import {
 } from './liveGpuCommands.mjs';
 import { AUTHORITY_HELPER_PROGRAM, DELAYED_ALLOCATION } from './liveHelperCommands.mjs';
 import { MANIFEST_ENABLE, NESTED_STATE_FORMAT, RESERVED_PORTS, availabilityPolling, ROUTER_CONTROLS_PORTS, STORED_OVERRIDE, VARIANT_III_EVIDENCE } from './liveAvailabilityCommands.mjs';
+import { BARRIER_MESSAGE, BOX_PRODUCT_ROOT, BOX_STORE_ROOT, OVERRIDES, STORE_BOUNDS, STORE_LOCK_DEADLINE_MS, STORE_PROGRAM, hostStoreRoot } from './liveStoreCommands.mjs';
 import { remoteRoot, remoteReportName } from './liveStage.mjs';
 import { DOCUMENT_SUFFIXES, GPU_TOLERATED_MAX, GPU_TOLERATED_MAX_MIB } from './fixtures.mjs';
 import { sshOptions } from './liveRemote.mjs';
@@ -37,6 +38,9 @@ export const CONCRETE_BLOCKS = Object.freeze({
     // C3-v: the Router's own controls while the STATIC agent is the blocked fixture, in a DEDICATED workspace with its own Box and a port pair
     // distinct from every other block (18080/17882 belong to the first). The pair is a manifest value, free-checked at provisioning.
     'apparatus-router-controls': { platform: 'linux', remote: true, cases: ['LIVE-C3V'], availability: true, ports: ROUTER_CONTROLS_PORTS },
+    // C5: a host writer and an in-Box writer of the policy store over the actual shared mount, its lock and the downgrade barrier, then stale-lock
+    // recovery with the Box STOPPED (the Box is left stopped for the cleanup action). One owned workspace and Box, the default port pair.
+    'apparatus-store': { platform: 'linux', remote: true, cases: ['LIVE-C5'], store: true },
     'apparatus-mps': { platform: 'linux', remote: true, cases: ['LIVE-P1', 'LIVE-P2', 'LIVE-P3', 'LIVE-P4'], gpu: true },
     // The local-llm candidate in its own owned workspace, behind the same idle gate: budgets and a llama.cpp
     // model (L1, L2), and vLLM under an MPS share in two stages (L3).
@@ -71,6 +75,12 @@ export const CASE_PASS_CONDITIONS = Object.freeze({
         passes: 'The static route answers the terminal unavailable response (HTTP 503 JSON, AGENT_HARDWARE_UNAVAILABLE, code hardware_refused, reason and fix) and not an endless startup or reload page; GET /auth/login answers 200; the administrator API GET answers 200 and lists the static fixture as refused; the host `ploinky limits status` and `ploinky limits clear --agent hwlfixture/s` exit 0 and the override is gone; the dedicated Box is destroyed and proven absent (cleanup complete). A check that cannot be made is BLOCKED with evidence (N-5), never passed.',
         evidence: 'router-controls-baseline, -manifest, -restart, -refused, -static-route, -auth-login, -admin-api, -limits-status, -limits-clear, -cleared artifacts',
     },
+    'LIVE-C5': {
+        row: 'spec 15.4 LIVE-C5 (:1326, "Coordinate a host writer and an in-Box writer using the actual shared mount/lock; exercise transition barrier interleaving and stale-lock recovery with a stopped Box"); release plan C5-linux',
+        procedure: `In one owned workspace and Box (gate on, the fixture agent s), the host writer is the candidate's \`limits clear --agent\` and the in-Box writer is the Router's administrator route (set_agent_limits and clear_agent_limits, the product's local operator session). A reviewed fixed program, run on the host and inside the Box as the Box user through the product's store modules, reads the store, holds or abandons its lock and installs or removes the downgrade barrier with the product's own functions. Steps: (1) the host and the Box read one store and an in-Box write is seen by the host; (2) two in-Box setters of one stamp; (3) a host clear against an in-Box setter that read the stamp earlier; (4) ${STORE_BOUNDS.raceRounds} rounds of a host clear started together with an in-Box setter; (5) a live host holder against the in-Box setter and a live Box holder against the host clear (each held ${STORE_BOUNDS.holdMs} ms, longer than the product's own ${STORE_LOCK_DEADLINE_MS} ms wait); (6) a pending downgrade barrier against the in-Box setter and clear and the host clear, with the gate-off emptiness check before and after a commit; (7) the Box stopped (host \`stop\`) while it holds the lock, a live host holder with the Box stopped, and a dead host holder with the Box stopped, each followed by the host clear.`,
+        passes: 'One conflicting mutation wins and the other conflicts: of two in-Box setters of one stamp exactly one commits (HTTP 200, committed) and the other is refused 409 revision_conflict with nothing committed; an in-Box setter that read the stamp before a host clear is refused 409 revision_conflict. No lost clear: after every host clear the entry is gone, the stamp advanced exactly once (twice only when the setter committed first), and the refused stale setter changed nothing. No live lock theft: a setter against a live host holder is refused 409 store_busy and a host clear against a live Box holder (Box running) or a live host holder (Box stopped) is refused, the lock stays the same owner, token, pid and directory identity, nothing is quarantined, and each holder ends with its own verified release. The barrier: the in-Box setter and clear are refused 409 hardware_limits_transition, the host clear is refused with the barrier message, the stamp and the empty store are unchanged, a gate-off start sees an empty store; after the barrier is removed and a policy is committed a gate-off start is refused stored_limits_present (no gate-off Box with newly committed policy), and after the clear it sees an empty store again. Stale recovery only with proof: the host clear recovers a Box-domain lock only with the Box observed stopped and a host-domain lock only with its holder dead and the Box stopped; each recovery commits exactly one new stamp and preserves the stale lock as one quarantined directory carrying its owner record (renamed, never deleted).',
+        evidence: 'store-baseline, -visibility, -cas-race, -stale-setter, -host-box-race, -lock-host-held, -lock-box-held, -barrier, -stale-box-lock, -stale-host-live, -stale-host-dead, -final artifacts, and the tails of every program, administrator request and host command',
+    },
     'LIVE-C6': {
         row: 'spec 15.4 LIVE-C6 (:1327)',
         procedure: 'A reviewed fixed program runs inside the owned Box as the Box user through the product modules at /opt/ploinky: it prepares the fixture agent\'s exact managed-network plan, captures its exact edge generation lease and runs the product\'s own attestRouterAuthority and runContainerAuthorityProbe unchanged, adding only the post-probe/pre-cleanup observation seam. A first run is the real probe; a second run delays and allocates 16 MiB inside the helper\'s probe exec (after 2000 ms) to prove the sampling order. The program text is fixed in tests/hardware-limits/liveHelperCommands.mjs (sha256:' + crypto.createHash('sha256').update(AUTHORITY_HELPER_PROGRAM).digest('hex') + ').',
@@ -92,6 +102,8 @@ export const GPU_DEADLINES = Object.freeze({ ...DEADLINES, blockMs: 24 * 60 * 10
 export const LLM_DEADLINES = Object.freeze({ ...GPU_DEADLINES });
 // The availability blocks restart the whole graph up to three times and poll for it to settle after each.
 export const AVAILABILITY_DEADLINES = Object.freeze({ ...DEADLINES, blockMs: 60 * 60 * 1000 });
+// The store block waits for the product's own 10 s lock wait several times, stops the Box once and leaves it stopped.
+export const STORE_DEADLINES = Object.freeze({ ...DEADLINES, blockMs: 30 * 60 * 1000 });
 // The vLLM install is bounded by throughput, not by a short clock: a hard cap of 3.5 h for the pinned 3.88 GB wheel set (the product
 // measured about 0.4 MB/s, a raw PyPI probe 1.5 to 2 MB/s) and a stall window: BLOCKED when the download shows no progress for 10 minutes.
 // The block deadline holds the cap, the prerequisites, the calibration, the model load and a margin.
@@ -234,7 +246,7 @@ export function buildConcreteManifest({ block, runId, configDigest, casesDigest,
         box: null,
         agents: [],
         cases: [...spec.cases],
-        fixtures: spec.llm ? { llm: { ref: LLM_REF } } : spec.availability ? { availability: { ref: `${FIXTURE_REPOSITORY}/${agents[0].name}` } } : spec.gpu ? { gpu: { ref: `${FIXTURE_REPOSITORY}/${agents[0].name}` } } : { cpu: { ref: `${FIXTURE_REPOSITORY}/${agents[0].name}` } },
+        fixtures: spec.llm ? { llm: { ref: LLM_REF } } : spec.store ? { store: { ref: `${FIXTURE_REPOSITORY}/${agents[0].name}` } } : spec.availability ? { availability: { ref: `${FIXTURE_REPOSITORY}/${agents[0].name}` } } : spec.gpu ? { gpu: { ref: `${FIXTURE_REPOSITORY}/${agents[0].name}` } } : { cpu: { ref: `${FIXTURE_REPOSITORY}/${agents[0].name}` } },
         provision: {
             revision: candidate.revision, repository: spec.llm ? LLM_REPOSITORY : FIXTURE_REPOSITORY, image, boxImage: pins.boxImage, agents,
             workspace: { parent, parentMode: remote ? 'staged' : 'create', path: workspacePath },
@@ -281,7 +293,7 @@ export function buildConcreteManifest({ block, runId, configDigest, casesDigest,
         schema: 1, runId, configDigest, casesDigest, block, target, state: 'proposed',
         workspace: { proposedParent: parent, proposedPath: workspacePath, instance: identity.instance, pathHash: identity.pathHash },
         ports: { tcp: ports.tcp, udp: ports.udp },
-        deadlines: { ...(spec.vllm ? VLLM_DEADLINES : spec.llm ? LLM_DEADLINES : spec.gpu ? GPU_DEADLINES : spec.availability ? AVAILABILITY_DEADLINES : DEADLINES) },
+        deadlines: { ...(spec.vllm ? VLLM_DEADLINES : spec.llm ? LLM_DEADLINES : spec.gpu ? GPU_DEADLINES : spec.store ? STORE_DEADLINES : spec.availability ? AVAILABILITY_DEADLINES : DEADLINES) },
         images: [
             { role: 'fixture-agent', ref: image, source: spec.llm ? 'operator pins (local-llm image)' : 'AssistOSExplorer explorer/manifest.json line 2' },
             { role: 'box', ref: pins.boxImage, source: 'operator pins' },
@@ -385,6 +397,28 @@ export function plannedCommands(run) {
         { id: 'C3V-limits-status', binary: node, argv: [profile.candidate.path, 'limits', 'status'], cwd: workspace, env: { PLOINKY_BOX_IMAGE: plan.boxImage }, deadlineMs: 120000, note: 'Host command, exit 0' },
         { id: 'C3V-limits-clear', binary: node, argv: [profile.candidate.path, 'limits', 'clear', '--agent', `${FIXTURE_REPOSITORY}/s`], cwd: workspace, env: { PLOINKY_BOX_IMAGE: plan.boxImage }, deadlineMs: 120000, note: 'Host recovery command, exit 0; the override is gone afterwards' },
     );
+    if (profile.cases.includes('LIVE-C5')) {
+        const program = (id, domain, mode, note, deadlineMs = STORE_BOUNDS.programMs) => (domain === 'box'
+            ? { id, binary: engine, argv: [...core, 'node', '--input-type=module', '-e', '<STORE_PROGRAM>', `<PARAMS domain=box mode=${mode}>`], deadlineMs, note }
+            : { id, binary: node, argv: ['--input-type=module', '-e', '<STORE_PROGRAM>', `<PARAMS domain=host mode=${mode}>`], cwd: workspace, deadlineMs, note });
+        const write = (id, action, extra) => admin(id, 'POST', JSON.stringify({ action, agentRef: `${FIXTURE_REPOSITORY}/s`, ...extra, expectedToken: '<TOKEN>' }), 'In-Box writer: the Router\'s administrator route');
+        const hostClear = (id, note) => ({ id, binary: node, argv: [profile.candidate.path, 'limits', 'clear', '--agent', `${FIXTURE_REPOSITORY}/s`], cwd: workspace, env: { PLOINKY_BOX_IMAGE: plan.boxImage }, deadlineMs: STORE_BOUNDS.hostClearMs, note });
+        live.push(
+            admin('C5-admin-state', 'GET', null, 'Baseline and the stamp before each in-Box write; read-only'),
+            program('C5-store-inspect-host', 'host', 'inspect', 'Read-only, repeated (not journaled): the store identity, stamp, entries, lock owner, barrier and quarantined locks, read from the host side of the mount'),
+            program('C5-store-inspect-box', 'box', 'inspect', 'Read-only, repeated (not journaled): the same reading from inside the Box, as the Box user'),
+            write('C5-set', 'set_agent_limits', { limits: OVERRIDES.low }),
+            write('C5-clear', 'clear_agent_limits', {}),
+            hostClear('C5-host-clear', 'The host writer; also against a live Box lock (refused), under the barrier (refused), and with the Box stopped (recovery)'),
+            program('C5-hold-host', 'host', 'hold', `A host holder takes the store lock and keeps it ${STORE_BOUNDS.holdMs} ms, then releases it (its own release is verified)`, STORE_BOUNDS.holdMs + STORE_BOUNDS.programMs),
+            program('C5-hold-box', 'box', 'hold', `A Box holder takes the store lock and keeps it ${STORE_BOUNDS.holdMs} ms, then releases it; once more for ${STORE_BOUNDS.staleHoldMs} ms, ended by the host stop of the Box`, STORE_BOUNDS.staleHoldMs + STORE_BOUNDS.programMs),
+            program('C5-abandon-host-lock', 'host', 'stale', 'A host process takes the store lock and exits without releasing it: a dead holder'),
+            program('C5-barrier-begin', 'host', 'barrier-begin', 'The product\'s beginDowngradeBarrier over the empty store, with a fresh random operation id'),
+            program('C5-barrier-remove', 'host', 'barrier-remove', 'The product\'s removeDowngradeBarrier of exactly that operation (also in the failure path)'),
+            program('C5-gate-off-check', 'host', 'gate-off-check', 'The product\'s assertGateOffStoreEmpty: what a gate-off start would see'),
+            { id: 'C5-stop', binary: node, argv: [profile.candidate.path, 'stop'], cwd: workspace, env: { PLOINKY_BOX_IMAGE: plan.boxImage }, deadlineMs: STORE_BOUNDS.stopMs, note: 'The host stops the Box while its holder holds the lock; the Box stays stopped and the cleanup action destroys it' },
+        );
+    }
     if (profile.cases.includes('LIVE-A1')) live.push(
         { id: 'A1-held-allocation', binary: engine, argv: [...nested, 'container', 'exec', '<MEMORY_AGENT_ID>', 'node', '-e', '<HELD_ALLOCATION>', run.runId], deadlineMs: 25000 },
         { id: 'A1-handshake', binary: engine, argv: [...nested, 'container', 'exec', '<MEMORY_AGENT_ID>', 'node', '-e', '<ALLOCATION_HANDSHAKE>', run.runId, 'observe|release'], deadlineMs: 5000 },
@@ -673,6 +707,7 @@ export function renderSummary(run, manifestPath) {
         '',
         ...(profile.gpu ? gpuSummary(run) : []),
         ...(profile.fixtures?.availability ? availabilitySummary(run) : []),
+        ...(profile.fixtures?.store ? storeSummary(run) : []),
         '## Cleanup',
         '',
         line('Cleanup runs in a finally block after `live`, after any provisioning failure, and as the standalone `cleanup` action. It is journaled in the manifest and resumes from it after a crash. Order: ',
@@ -728,6 +763,25 @@ function availabilitySummary(run) {
     return ['## Availability fixture', '', '| Item | Value |', '| --- | --- |', ...rows.map(([item, value]) => `| ${item} | ${cell(value)} |`), '',
         '## Planned file and HTTP actions', '', 'These steps run no candidate or engine command; each manifest edit is journaled and every other manifest is re-proved unchanged.', '', '| Step | Action |', '| --- | --- |',
         ...actions.map(entry => `| ${entry.id} | ${cell(entry.action)} |`), ''];
+}
+
+// The approval section of the store block (LIVE-C5): the writers, the shared store, the reviewed program, every bound and what is left behind.
+function storeSummary(run) {
+    const profile = run.target.execution;
+    const instance = run.workspace.instance;
+    const rows = [
+        ['Writers', 'Host: the candidate\'s `limits clear --agent hwlfixture/s` (the only host writer the product has). In the Box: the Router\'s administrator route (set_agent_limits and clear_agent_limits) with the product\'s local operator session. Neither is replaced or modified by the runner.'],
+        ['Shared store', `Host \`${hostStoreRoot(profile.host.home, instance)}\`, in the Box \`${BOX_STORE_ROOT}\` (the read-write private bind of the gate-on Box): one directory seen from both sides. Entries written: only the stored override of hwlfixture/s (memoryPercent ${OVERRIDES.low.memoryPercent} or ${OVERRIDES.high.memoryPercent}); every case ends with that entry cleared.`],
+        ['Reviewed program', `STORE_PROGRAM in tests/hardware-limits/liveStoreCommands.mjs (sha256 ${crypto.createHash('sha256').update(STORE_PROGRAM).digest('hex')}), run as \`node --input-type=module -e\` on the host with the staged product root \`${profile.source.root}\` and inside the Box as the Box user with \`${BOX_PRODUCT_ROOT}\`. It imports only Node built-ins and the product's store.mjs and storeLock.mjs and uses their own functions: readStoreSnapshot, readStoreLockOwner, readBarrier, acquireStoreLock, beginDowngradeBarrier, removeDowngradeBarrier, assertGateOffStoreEmpty. Its modes: inspect (read-only), hold, stale, barrier-begin, barrier-remove, gate-off-check. The parameters are one JSON argv; no value reaches it as source text.`],
+        ['Locks', `A holder keeps the store lock ${STORE_BOUNDS.holdMs} ms (longer than the product's own wait); the stale-Box holder is bounded at ${STORE_BOUNDS.staleHoldMs} ms and is ended by the Box stop. Every holder is settled before the case returns; a lock a holder leaves is the stale lock under test and is quarantined by the product's own recovery, never deleted by the runner. A holder's own release verifies its owner token and directory identity: a stolen lock fails it.`],
+        ['Barrier', 'The downgrade barrier is installed with an empty store through the product\'s own function, never by writing the file, and removed in a finally block. A real gate-off restart is not performed: C4 (the U9 wrapper) owns it. What is shown is what that restart relies on: nothing can commit while the barrier is pending, and a gate-off start refuses a store with a policy.'],
+        ['Box state', 'The Box is STOPPED by `ploinky stop` in step 7 and stays stopped; the cleanup action destroys it with `destroy --delete-cache` and proves it absent. The administrator channel is not used after the stop.'],
+        ['Bounds', `block ${run.deadlines.blockMs} ms; program ${STORE_BOUNDS.programMs} ms; administrator request ${STORE_BOUNDS.adminMs} ms; host clear ${STORE_BOUNDS.hostClearMs} ms (it waits the product's ${STORE_LOCK_DEADLINE_MS} ms for a held lock); stop ${STORE_BOUNDS.stopMs} ms; a started holder must show its lock within ${STORE_BOUNDS.visibleMs} ms (polled every ${STORE_BOUNDS.visibleIntervalMs} ms, read-only, not journaled); ${STORE_BOUNDS.raceRounds} race rounds`],
+        ['Ports', `TCP ${run.ports.tcp} and UDP ${run.ports.udp} (the Router and media ports of the owned Box; a collision aborts at provisioning)`],
+        ['Open points (not assumed)', `The Box program must run as the host user's uid through the keep-id mapping (a different uid is recorded and fails the case). Device and inode numbers of a lock are compared on one side only. The product waits synchronously for the store lock inside the Router and the CLI, so the refused in-Box setter holds the Router for about ${STORE_LOCK_DEADLINE_MS} ms; this is observed, not changed. A refusal text the product changes is a FAIL naming the text (${BARRIER_MESSAGE}...).`],
+    ];
+    const cell = value => String(value).replaceAll('|', '\\|');
+    return ['## Store fixture', '', '| Item | Value |', '| --- | --- |', ...rows.map(([item, value]) => `| ${item} | ${cell(value)} |`), ''];
 }
 
 // The extra approval sections of the GPU block: the idle-gate checks, every

@@ -8,6 +8,7 @@
 //   prepare-live  write a proposed run manifest for one live block (no engine
 //                 or SSH); mac-cpu, apparatus-cpu, apparatus-core, apparatus-authority,
 //                 apparatus-availability, apparatus-router-controls (its own port pair, 18090/17892),
+//                 apparatus-store (LIVE-C5: host and in-Box writers of the policy store, its lock and barrier),
 //                 apparatus-mps, apparatus-local-llm and
 //                 apparatus-vllm (--stage calibration|qualified, and --calibration-evidence for
 //                 the second stage) get concrete
