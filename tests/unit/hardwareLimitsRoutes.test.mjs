@@ -535,11 +535,11 @@ const { collectLiveAgentContainersStrictAsync } = await import('../../cli/sandbo
 test('T5.the-strict-collector-rejects-a-failed-engine-read-and-the-monitor-uses-it-by-default', async () => {
     const inspected = JSON.stringify([{ Id: NEW_ID, Name: '/ploinky_demo_worker', Config: { Env: [] }, State: { Status: 'running', Running: true, Pid: 7 }, Mounts: [], NetworkSettings: { Ports: {} } }]);
     const exec = (outcomes) => async (_runtime, args) => { const next = outcomes[args[0] === 'ps' ? 'list' : 'inspect']; if (next instanceof Error) throw next; return { stdout: next }; };
-    await assert.rejects(collectLiveAgentContainersStrictAsync({ runtime: 'podman', exec: exec({ list: new Error('podman: connection refused') }) }), (error) => error.code === 'ENGINE_READ_FAILED' && /container list could not be read/.test(error.message));
-    await assert.rejects(collectLiveAgentContainersStrictAsync({ runtime: 'podman', exec: exec({ list: 'ploinky_demo_worker\n', inspect: new Error('inspect: timed out') }) }), (error) => error.code === 'ENGINE_READ_FAILED' && /could not be inspected/.test(error.message));
+    await assert.rejects(collectLiveAgentContainersStrictAsync({ runtime: 'podman', execFileAsync: exec({ list: new Error('podman: connection refused') }) }), (error) => error.code === 'ENGINE_READ_FAILED' && /container list could not be read/.test(error.message));
+    await assert.rejects(collectLiveAgentContainersStrictAsync({ runtime: 'podman', execFileAsync: exec({ list: 'ploinky_demo_worker\n', inspect: new Error('inspect: timed out') }) }), (error) => error.code === 'ENGINE_READ_FAILED' && /could not be inspected/.test(error.message));
     // Controls: a good read, an engine with nothing running, and no runtime at all.
-    assert.equal((await collectLiveAgentContainersStrictAsync({ runtime: 'podman', exec: exec({ list: 'ploinky_demo_worker\n', inspect: inspected }) })).length, 1);
-    assert.deepEqual(await collectLiveAgentContainersStrictAsync({ runtime: 'podman', exec: exec({ list: '' }) }), []);
+    assert.equal((await collectLiveAgentContainersStrictAsync({ runtime: 'podman', execFileAsync: exec({ list: 'ploinky_demo_worker\n', inspect: inspected }) })).length, 1);
+    assert.deepEqual(await collectLiveAgentContainersStrictAsync({ runtime: 'podman', execFileAsync: exec({ list: '' }) }), []);
     assert.deepEqual(await collectLiveAgentContainersStrictAsync({ runtime: null }), []);
     assert.equal(new Monitor().liveCollector, collectLiveAgentContainersStrictAsync);
 });
