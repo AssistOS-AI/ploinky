@@ -3,7 +3,7 @@ import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 
 import { collectAgentRuntimeStatesAsync } from '../sandbox/agentRuntimeState.js';
-import { getAgentsRegistry } from '../sandbox/docker/containerRegistry.js';
+import { collectLiveAgentContainersStrictAsync, getAgentsRegistry } from '../sandbox/docker/containerRegistry.js';
 import { getRuntime } from '../sandbox/docker/common.js';
 import { applyRuntimeReadinessProjection } from '../utils/noWaitReadiness.js';
 import { aggregateProcessTreeMetrics } from './workspaceProcessMetrics.js';
@@ -72,7 +72,9 @@ export class WorkspaceMetricsMonitor extends EventEmitter {
   constructor({ readRegistry = getAgentsRegistry, collectContainers = null, runtimeStateOptions = {}, readHardwareContext = readBoxHardwareContext, readRouting = readRoutingConfig, containerStats = true } = {}) {
     super();
     this.readRegistry = readRegistry;
+    // Strict by default: an engine read that fails rejects, so the reconcile fails instead of publishing "no container".
     this.collectContainers = collectContainers;
+    this.liveCollector = collectContainers || collectLiveAgentContainersStrictAsync;
     this.runtimeStateOptions = runtimeStateOptions;
     this.readHardwareContext = readHardwareContext;
     this.readRouting = readRouting;
@@ -173,7 +175,7 @@ export class WorkspaceMetricsMonitor extends EventEmitter {
     let completed = false;
     try {
       const registry = this.readRegistry() || {};
-      const states = await collectAgentRuntimeStatesAsync({ registry, ...this.runtimeStateOptions, ...(this.collectContainers ? { collectContainers: this.collectContainers } : {}) });
+      const states = await collectAgentRuntimeStatesAsync({ registry, ...this.runtimeStateOptions, collectContainers: this.liveCollector });
       this.states = applyRuntimeReadinessProjection(states, registry);
       this.statesReadStartedAt = startedAt;
       this.hardwareEnabled = this.readHardwareContext().gate === 'on';
@@ -319,6 +321,8 @@ export class WorkspaceMetricsMonitor extends EventEmitter {
     this.latest = {
       ok: true,
       sampledAt: new Date().toISOString(),
+      // The last engine read failed: `runtimes` are those of the last read that succeeded, kept and not replaced by an empty set.
+      readFailed: this.lastReconcileOk === false,
       readStartedAt: this.statesReadStartedAt ? new Date(this.statesReadStartedAt).toISOString() : null,
       router: { status: 'running', pid: process.pid, metrics: routerMetrics },
       runtimes,

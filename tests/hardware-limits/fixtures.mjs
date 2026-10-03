@@ -507,6 +507,8 @@ export function buildRequiredCaseManifest() {
             'T2.a-reconcile-that-fails-before-any-io-returns-not-fresh-within-the-bound-with-bounded-publishes-and-the-event-loop-free',
             'T2.an-interval-reconcile-still-runs-and-a-successful-reconcileafter-is-fresh-at-once',
             'T2.a-wait-for-a-time-that-has-not-come-publishes-a-bounded-number-of-times-and-leaves-timers-free',
+            'T5.the-strict-collector-rejects-a-failed-engine-read-and-the-monitor-uses-it-by-default',
+            'T5.a-reconcile-whose-engine-read-failed-is-not-fresh-keeps-the-last-runtimes-and-never-reads-a-running-container-as-stopped',
             'E.apply-outbound', 'E.apply-inbound', 'E.http-cause',
             'R.anonymous', 'R.nonadmin', 'R.guest', 'R.admin', 'R.origin', 'R.csrf', 'R.cross-session-csrf',
             'R.bearer-get', 'R.bearer-set', 'R.bearer-clear', 'R.bearer-apply', 'R.duplicate-authorization',

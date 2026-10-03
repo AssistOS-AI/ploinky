@@ -135,27 +135,30 @@ function collectLiveAgentContainers() {
     }
 }
 
-async function collectLiveAgentContainersAsync() {
-    const runtime = probeContainerRuntime();
+// The live containers, or a REJECTION when the engine could not be read: a reader that must tell "no container is running" from "the
+// engine could not be asked" (the workspace metrics monitor) uses this one. With no container runtime at all the answer is an empty list.
+async function collectLiveAgentContainersStrictAsync({ runtime = probeContainerRuntime(), exec = execFileAsync } = {}) {
     if (!runtime) return [];
-    let names = [];
+    let names;
     try {
-        const { stdout = '' } = await execFileAsync(runtime, LIST_ARGS, {
-            encoding: 'utf8',
-            maxBuffer: LIST_MAX_BUFFER_BYTES,
-        });
+        const { stdout = '' } = await exec(runtime, LIST_ARGS, { encoding: 'utf8', maxBuffer: LIST_MAX_BUFFER_BYTES });
         names = parseLiveContainerNames(stdout);
-    } catch (_) {
-        return [];
+    } catch (error) {
+        throw Object.assign(new Error(`the container list could not be read: ${error?.message || error}`), { code: 'ENGINE_READ_FAILED', cause: error });
     }
     if (!names.length) return [];
-
     try {
-        const { stdout = '' } = await execFileAsync(runtime, ['inspect', ...names], {
-            encoding: 'utf8',
-            maxBuffer: INSPECT_MAX_BUFFER_BYTES,
-        });
+        const { stdout = '' } = await exec(runtime, ['inspect', ...names], { encoding: 'utf8', maxBuffer: INSPECT_MAX_BUFFER_BYTES });
         return projectInspectOutput(stdout, names);
+    } catch (error) {
+        throw Object.assign(new Error(`the containers could not be inspected: ${error?.message || error}`), { code: 'ENGINE_READ_FAILED', cause: error });
+    }
+}
+
+// The long-standing callers' form: any failure reads as "no live container".
+async function collectLiveAgentContainersAsync() {
+    try {
+        return await collectLiveAgentContainersStrictAsync();
     } catch (error) {
         debugLog(`collectLiveAgentContainersAsync: ${error?.message || error}`);
         return [];
@@ -165,6 +168,7 @@ async function collectLiveAgentContainersAsync() {
 export {
     collectLiveAgentContainers,
     collectLiveAgentContainersAsync,
+    collectLiveAgentContainersStrictAsync,
     formatPortBindings,
     getAgentsRegistry,
     parseAgentInfoFromMounts

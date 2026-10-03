@@ -400,7 +400,7 @@ test('S2.when-the-bound-expires-the-response-still-goes-out-and-says-the-status-
     const w = appliedWorld(t, { boundMs: 30 });
     await w.monitor.reconcile();
     // The next engine listing never answers, so no fresh reconcile can complete inside the bound.
-    w.monitor.collectContainers = () => new Promise(() => {});
+    w.monitor.liveCollector = () => new Promise(() => {});
     const response = await request(w.f, { method: 'POST', body: applyBody(w.f), dependencies: w.deps({ apply: async () => { w.applied(); return { ok: true, status: 200, results: [] }; } }) });
     assert.equal(response.status, 200); assert.equal(response.body.ok, true);
     assert.equal(response.body.statusFresh, false); assert.match(response.body.statusNote, /may lag this Apply/);
@@ -528,4 +528,45 @@ test('T2.a-wait-for-a-time-that-has-not-come-publishes-a-bounded-number-of-times
     assert.equal(result.fresh, false);
     assert.ok(timeoutZeroAfter !== null && timeoutZeroAfter < 50, `a setTimeout(0) fired in ${timeoutZeroAfter} ms`);
     assert.ok(publishes <= 2 + Math.ceil(400 / 250), `publishes stayed bounded (${publishes})`);
+});
+
+// T5: an engine read that failed is not a fresh reconcile and never publishes "no container".
+const { collectLiveAgentContainersStrictAsync } = await import('../../cli/sandbox/docker/containerRegistry.js');
+test('T5.the-strict-collector-rejects-a-failed-engine-read-and-the-monitor-uses-it-by-default', async () => {
+    const inspected = JSON.stringify([{ Id: NEW_ID, Name: '/ploinky_demo_worker', Config: { Env: [] }, State: { Status: 'running', Running: true, Pid: 7 }, Mounts: [], NetworkSettings: { Ports: {} } }]);
+    const exec = (outcomes) => async (_runtime, args) => { const next = outcomes[args[0] === 'ps' ? 'list' : 'inspect']; if (next instanceof Error) throw next; return { stdout: next }; };
+    await assert.rejects(collectLiveAgentContainersStrictAsync({ runtime: 'podman', exec: exec({ list: new Error('podman: connection refused') }) }), (error) => error.code === 'ENGINE_READ_FAILED' && /container list could not be read/.test(error.message));
+    await assert.rejects(collectLiveAgentContainersStrictAsync({ runtime: 'podman', exec: exec({ list: 'ploinky_demo_worker\n', inspect: new Error('inspect: timed out') }) }), (error) => error.code === 'ENGINE_READ_FAILED' && /could not be inspected/.test(error.message));
+    // Controls: a good read, an engine with nothing running, and no runtime at all.
+    assert.equal((await collectLiveAgentContainersStrictAsync({ runtime: 'podman', exec: exec({ list: 'ploinky_demo_worker\n', inspect: inspected }) })).length, 1);
+    assert.deepEqual(await collectLiveAgentContainersStrictAsync({ runtime: 'podman', exec: exec({ list: '' }) }), []);
+    assert.deepEqual(await collectLiveAgentContainersStrictAsync({ runtime: null }), []);
+    assert.equal(new Monitor().liveCollector, collectLiveAgentContainersStrictAsync);
+});
+
+test('T5.a-reconcile-whose-engine-read-failed-is-not-fresh-keeps-the-last-runtimes-and-never-reads-a-running-container-as-stopped', async (t) => {
+    const f = fixture(t);
+    const record = { ...f.registry.canonical, containerId: NEW_ID };
+    const { readApplied } = recreated(f, new Date(Date.now() - 60_000).toISOString());
+    const running = engineEntry({ containerId: NEW_ID, state: { status: 'running', running: true, pid: 7 } });
+    let failing = false;
+    const monitor = new Monitor({
+        readRegistry: () => ({ canonical: record }), runtimeStateOptions: { activeGeneration: null, routes: { worker: { container: 'canonical', repo: 'demo', agent: 'worker', hostPort: 4100 } } },
+        readHardwareContext: () => ({ gate: 'off' }), readRouting: () => ({ routes: {} }), containerStats: false,
+        collectContainers: async () => { if (failing) throw Object.assign(new Error('the container list could not be read: synthetic'), { code: 'ENGINE_READ_FAILED' }); return [running]; },
+    });
+    const statusNow = () => { const c = buildHardwareLimitsState({ context: fixture(t).getContext(), installed: [{ ref: 'demo/worker', manifestPath: '/fixture/manifest.json' }], registry: { canonical: record }, metrics: monitor.latest, admit: placementAdmit, readApplied }).agents[0].containers[0]; return { availability: c.availability, limitsState: c.limitsState }; };
+    await monitor.reconcile();
+    const good = monitor.completedReconcileStartedAt; const goodStart = monitor.latest.readStartedAt;
+    assert.deepEqual(statusNow(), { availability: 'ready', limitsState: 'applied' }); assert.equal(monitor.latest.readFailed, false);
+    failing = true;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const since = Date.now();
+    const wait = await monitor.reconcileAfter(since, 300);
+    assert.equal(wait.fresh, false, 'a failed engine read is not a fresh reconcile');
+    assert.equal(monitor.completedReconcileStartedAt, good, 'and does not advance the completed read');
+    assert.equal(monitor.latest.readFailed, true); assert.equal(monitor.latest.readStartedAt, goodStart);
+    assert.equal(monitor.latest.runtimes.length, 1, 'the last runtimes are kept, not an empty set');
+    assert.equal(monitor.latest.runtimes[0].state.running, true);
+    assert.notEqual(statusNow().availability, 'stopped', 'a running container is never read as stopped');
 });
