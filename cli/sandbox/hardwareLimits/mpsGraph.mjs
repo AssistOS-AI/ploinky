@@ -14,7 +14,7 @@ import {
     assertKnownMpsClients, inspectMpsClient, inspectMpsClientPresence, resolveMpsClientAlias,
     createdMpsCandidates, settleCreatedMpsCandidate, mpsCandidateRecord, sameMpsTuple, mpsOwnerState, releaseMpsLaunchOwner,
 } from './mpsInventory.mjs';
-import { createMpsStateStore, createMpsDaemonBackend, isMpsClientAlias } from './mps.mjs';
+import { createMpsStateStore, createMpsDaemonBackend, isMpsClientAlias, sameMpsServerDefault } from './mps.mjs';
 import { retireExactAgentRuntimePredecessor } from '../docker/agentServiceManager.js';
 import { MpsError } from './mpsEligibility.mjs';
 import { resolveStoredGpuShare } from './resolve.mjs';
@@ -112,7 +112,7 @@ async function prepareMpsGraphImpl({ nodes, networkLifecycleCapability, deadline
     // not a live client of any generation.
     const clientFailuresOnly = saved?.status === 'pending' && saved?.lastProblem?.code === 'mps_client_failed';
     const healthy = (saved?.status === 'ready' || clientFailuresOnly) && observation.state === 'owned' && backend.verify(saved);
-    const needsTransition = !isDeepStrictEqual(saved?.serverDefault || null, desiredServerDefault)
+    const needsTransition = !sameMpsServerDefault(saved?.serverDefault, desiredServerDefault)
         || Boolean(desiredServerDefault && !healthy) || [...clients.values()].some((client) => !outside.has(tuple(client)) && !alreadyDrained.has(tuple(client)) && client.mpsGeneration !== generation);
     const toDrain = [];
     // A drained journal entry whose key the registry now names with a newer

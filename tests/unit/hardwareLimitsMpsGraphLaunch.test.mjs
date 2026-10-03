@@ -5,7 +5,7 @@ import { readMpsLaunch } from '../../cli/sandbox/hardwareLimits/mpsLaunch.mjs';
 import { resolveMpsServerDefault } from '../../cli/sandbox/hardwareLimits/mpsTransition.mjs';
 
 const imageId = `sha256:${'a'.repeat(64)}`;
-const share = (smPercent = 25) => ({ smPercent, memoryMiB: 1024, deviceUuid: 'GPU-fixture', driverVersion: '550.1', wiringFingerprint: 'wiring' });
+const share = (smPercent = 25, memoryMiB = 1024) => ({ smPercent, memoryMiB, deviceUuid: 'GPU-fixture', driverVersion: '550.1', wiringFingerprint: 'wiring' });
 const record = (key) => ({ type: 'agent', repoName: 'demo', agentName: key, instanceId: `i-${key}`, enableGeneration: `g-${key}`, containerId: key.repeat(64) });
 const client = (key, value = share()) => ({ key, ref: `demo/${key}`, ...record(key), share: value, mpsGeneration: 'old:config' });
 const tuple = (value) => [value.key, value.instanceId, value.enableGeneration, value.containerId || ''].join('\0');
@@ -139,4 +139,18 @@ test('MGL.invalid image refuses before daemon ownership or target mutation', asy
     await assert.rejects(f.launch(), /UID|user|root/i);
     assert.equal(f.events.includes('start'), false); assert.equal(f.events.includes('ensure:a'), false);
     assert.equal(f.state(), null);
+});
+
+// M-MPS-05: the largest share is reporting only; a change of it inside the same whole-GiB default keeps the daemon.
+test('MGL.a-largest-share-change-inside-the-same-gib-keeps-the-daemon-and-updates-the-reported-share', async () => {
+    const f = fixture({ state: ready(share(25, 700)), policies: [['demo/a', { gpu: share(25, 900) }]] });
+    assert.deepEqual([f.state().serverDefault.memoryMiB, f.state().serverDefault.shareMemoryMiB], [1024, 700]);
+    await f.launch();
+    assert.equal(f.state().daemonGeneration, 'old'); assert.equal(f.events.includes('stop'), false); assert.equal(f.events.includes('start'), false);
+    assert.deepEqual([f.state().serverDefault.memoryMiB, f.state().serverDefault.shareMemoryMiB], [1024, 900], 'the reported share follows the policies');
+    // Across a GiB boundary the daemon default really changes, so the cohort restarts.
+    const crossing = fixture({ state: { ...ready(share(25, 700)), graphNeedsTransition: true }, policies: [['demo/a', { gpu: share(25, 1100) }]] });
+    await crossing.launch();
+    assert.equal(crossing.events.includes('stop'), true); assert.equal(crossing.events.includes('start'), true);
+    assert.equal(crossing.state().serverDefault.memoryMiB, 2048);
 });

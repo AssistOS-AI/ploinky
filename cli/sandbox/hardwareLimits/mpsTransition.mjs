@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { MpsError } from './mpsEligibility.mjs';
-import { isMpsClientAlias, mpsServerDefaultMemoryMiB, validateMpsDefault, verifyDetail } from './mps.mjs';
+import { isMpsClientAlias, mpsServerDefaultMemoryMiB, sameMpsServerDefault, validateMpsDefault, verifyDetail } from './mps.mjs';
 import { findHardwareOutcome } from './errors.mjs';
 import { inApplyStep, describeApplyCause, formatApplyCause } from './applyCause.mjs';
 
@@ -84,7 +84,7 @@ export function planMpsTransition({ oldClients = [], desiredClients = [], config
     const live = old.filter((value) => !drainedIds.has(clientIdentity(value)));
     const clientFailuresOnly = state?.status === 'pending' && state?.lastProblem?.code === 'mps_client_failed';
     const healthy = observedDaemon.state === 'owned' && defaultsVerified === true && (state?.status === 'ready' || clientFailuresOnly);
-    const defaultChanged = !isDeepStrictEqual(state?.serverDefault || null, targetDefault);
+    const defaultChanged = !sameMpsServerDefault(state?.serverDefault, targetDefault);
     const stale = live.some((value) => value.share && value.mpsGeneration !== generation);
     const unfinished = Boolean(state?.status === 'transitioning' || (state?.status === 'pending' && !clientFailuresOnly)
         || state?.pendingClients?.some((client) => client.phase !== 'readiness' && !(clientFailuresOnly && client.phase === 'pending')));

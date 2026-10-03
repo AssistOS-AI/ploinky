@@ -29,7 +29,7 @@ import { HardwareLimitsError } from './errors.mjs';
 import { inApplyStep, describeApplyCause } from './applyCause.mjs';
 import { buildDirectRefusal, hex64 } from './requestedLimits.mjs';
 import { resolveStoredGpuShare } from './resolve.mjs';
-import { createMpsStateStore, createMpsDaemonBackend, isMpsClientAlias, verifyDetail } from './mps.mjs';
+import { createMpsStateStore, createMpsDaemonBackend, isMpsClientAlias, sameMpsServerDefault, verifyDetail } from './mps.mjs';
 import { MpsError, inspectMpsImage } from './mpsEligibility.mjs';
 import { inspectPreparedMpsImage } from './mpsStatus.mjs';
 import { createMpsLaunch, readMpsLaunchForTracking, verifyMpsLaunch } from './mpsLaunch.mjs';
@@ -366,7 +366,7 @@ export async function ensureMpsGraphAgentService(agentName, manifest, agentPath,
     const allDrained = (state?.oldClients || []).every((client) => drained.has(identityOf(client)));
     const observation = state?.daemon || state?.pipeDirectory ? backend.observe(state) : { state: 'gone' };
     if (['foreign', 'unknown'].includes(observation.state)) throw new MpsError('Prepared graph cannot adopt an unknown MPS daemon');
-    const defaultsChanged = !isDeepStrictEqual(state?.serverDefault || null, serverDefault);
+    const defaultsChanged = !sameMpsServerDefault(state?.serverDefault, serverDefault);
     const mustRestart = Boolean(state?.graphNeedsTransition || defaultsChanged || (state?.daemon && !backend.verify(state)));
     if (mustRestart && state?.daemon && (!state.graphPrepared || !allDrained)) throw new MpsError('MPS cohort was not completely drained by graph preparation');
     if (mustRestart && state?.daemon) {
@@ -384,6 +384,8 @@ export async function ensureMpsGraphAgentService(agentName, manifest, agentPath,
         state = { ...previous, ...daemon, pendingClients: previous.pendingClients || [], graphPrepared: false, graphNeedsTransition: false, oldClients: [], drainedClients: [] };
         store.write(state);
     }
+    // An unchanged daemon keeps running; only the reporting field (the largest share) follows the new policies.
+    if (share && state?.daemon && !defaultsChanged && state.serverDefault?.shareMemoryMiB !== serverDefault.shareMemoryMiB) { state = { ...state, serverDefault: { ...state.serverDefault, shareMemoryMiB: serverDefault.shareMemoryMiB } }; store.write(state); }
     if (!share && !state?.daemon && state) {
         state = { ...state, status: 'inactive', serverDefault: null, graphPrepared: false, graphNeedsTransition: false, oldClients: [], drainedClients: [] }; store.write(state);
     }

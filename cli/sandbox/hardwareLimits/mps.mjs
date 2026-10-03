@@ -28,6 +28,13 @@ export function mpsServerDefaultMemoryMiB(maxShareMiB) {
     if (!safeInteger(maxShareMiB, 1, Number.MAX_SAFE_INTEGER / 1048576)) throw new MpsError('Invalid MPS share memory');
     return Math.ceil(maxShareMiB / 1024) * 1024;
 }
+// The fields that define the daemon's configuration and identity. `shareMemoryMiB` (the largest share the memory default came
+// from) is reporting only and never counts as a daemon change. Every comparison of a saved against a desired server default uses this.
+export const MPS_SERVER_DEFAULT_IDENTITY = Object.freeze(['smPercent', 'memoryMiB', 'deviceUuid', 'driverVersion', 'wiringFingerprint']);
+export function sameMpsServerDefault(left, right) {
+    if (!left || !right) return !left && !right;
+    return MPS_SERVER_DEFAULT_IDENTITY.every((field) => left[field] === right[field]);
+}
 // A daemon-wide default (never a client share): the share rules and a whole number of GiB, so that the readback is exact.
 export function validateMpsServerDefault(value) {
     validateMpsDefault(value);

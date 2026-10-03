@@ -671,6 +671,14 @@ export function buildRequiredCaseManifest() {
             'Z3c.an-untyped-planning-failure-reports-the-planning-step',
         ]),
         // The MPS readback is conclusive: the reply is in the error, the cause, the journal and lastReadback.
+        // M-MPS-05: the largest share is reporting only; a real default change still restarts the cohort.
+        ...leaves(P, 'p4', unit('hardwareLimitsMpsDefaultIdentity.test.mjs'), [
+            'M05.the-daemon-identity-fields-are-compared-and-the-reported-share-never-counts',
+            'M05.a-client-change-inside-the-same-default-recreates-only-that-client-and-keeps-the-daemon-and-the-peer',
+            'M05.a-real-default-change-still-drains-quits-and-restarts-the-cohort',
+            'M05.graph-preparation-drains-only-the-changed-client-inside-the-same-default-and-the-cohort-across-a-real-change',
+        ]),
+        ...leaves(P, 'p4', unit('hardwareLimitsMpsGraphLaunch.test.mjs'), ['MGL.a-largest-share-change-inside-the-same-gib-keeps-the-daemon-and-updates-the-reported-share']),
         ...leaves(P, 'p4', unit('hardwareLimitsMpsReadback.test.mjs'), [
             'W2.an-unsupported-memory-reply-fails-closed-and-its-sanitized-text-reaches-the-error-the-cause-the-journal-and-the-readback',
             'W2.a-reply-with-control-bytes-and-two-hundred-characters-is-sanitized-and-truncated-everywhere',
