@@ -55,12 +55,15 @@ export function fixturePlan(cases) {
     return roles.map(role => ({ name: role, role, hardwareLimits: { ...FIXTURE_HARDWARE_LIMITS } }));
 }
 
-// The fixture agent's process. Ploinky starts a manifest `agent` as `<shell> -c "cd <cwd> && <agent>"` under its control
-// entrypoint, which forwards SIGTERM, SIGINT and SIGHUP to that shell and treats only EXIT ZERO as the application's drain
-// acknowledgement (Agent/server/AgentEntrypoint.sh forward_termination; cli/sandbox/docker/targetedContainerLifecycle.js
-// assertCleanTermination: "Signal termination (including 143) is never an acknowledgement"). So, like local-llm
-// (`exec node /code/src/main.mjs`), the fixture agent execs its node process, which becomes the signalled main process, and
-// exits 0 at once on each of the three signals. The ready line only lets a test know the handlers are installed.
+// The fixture agent's process. Ploinky starts a manifest `agent` as `<shell> -c "cd <cwd> && <agent>"`, preceded by the image's
+// ENTRYPOINT when it has one (agentServiceManager.js `args.splice(mainCommandIndex, 0, ...mainEntrypoint)`), all under its control
+// entrypoint. That entrypoint sends SIGTERM (and only SIGTERM, whichever of HUP, INT or TERM it received) to its main process and
+// keeps that process's real exit status, treating only EXIT ZERO as the application's drain acknowledgement
+// (Agent/server/AgentEntrypoint.sh forward_termination and the wait that follows; cli/sandbox/docker/targetedContainerLifecycle.js
+// assertCleanTermination: "Signal termination (including 143) is never an acknowledgement"). The signal reaches the agent only if every
+// hop between that main process and the agent execs, the image ENTRYPOINT included. So, like local-llm (`exec node /code/src/main.mjs`),
+// the fixture agent execs its node process, which exits 0 at once on SIGTERM and, for a direct signal, on SIGINT and SIGHUP too.
+// The ready line only lets a test know the handlers are installed.
 export const FIXTURE_AGENT_COMMAND = 'exec node -e "for (const s of [\'SIGTERM\',\'SIGINT\',\'SIGHUP\']) process.on(s, () => process.exit(0)); console.log(\'fixture agent ready\'); setInterval(() => {}, 3600000)"';
 
 // The fixture manifest, readiness none, the pinned image and the limits

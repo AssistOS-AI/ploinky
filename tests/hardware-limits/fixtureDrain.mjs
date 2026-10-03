@@ -1,7 +1,9 @@
 // What a fixture agent's process does when Ploinky drains it. Ploinky starts a manifest `agent` as `<shell> -c "cd <cwd> && <agent>"`
-// (cli/sandbox/docker/agentServiceManager.js, agentShell.js) under a control entrypoint that forwards SIGTERM, SIGINT and SIGHUP to
-// that shell; the targeted drain accepts only EXIT ZERO (targetedContainerLifecycle.js assertCleanTermination). This module runs the
-// exact command, in that launch form, as a local process: no engine, no container. Test-only.
+// (cli/sandbox/docker/agentServiceManager.js, agentShell.js), behind the image's ENTRYPOINT when it has one, under a control entrypoint
+// (Agent/server/AgentEntrypoint.sh) that always sends SIGTERM to its main process and keeps that process's real exit status; the targeted
+// drain accepts only EXIT ZERO (targetedContainerLifecycle.js assertCleanTermination). The signal reaches the agent only if every hop
+// execs. This module runs the exact `<shell> -c` form as a local process, with no image ENTRYPOINT hop (not modelled), no engine and no
+// container. Test-only.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
