@@ -192,6 +192,8 @@ export function createLlmWorld({ statePath, node, engine, host, gpu, faults = {}
                 else if (faults.installStalls) L.install.download = { bytes: Math.floor(total / 10), total, rate: 1000 };
                 else if (L.install.polls === 1) L.install.download = { bytes: Math.floor(total / 2), total, rate: 50_000_000 };
                 else if (L.install.polls === 2) { L.install.phase = 'installing'; L.install.download = { bytes: total, total, rate: 0 }; }
+                // `installingHoldPolls`: the build after the download changes nothing for that many polls (the product exposes no build progress).
+                else if (L.install.phase === 'installing' && faults.installingHoldPolls && (L.install.holdPolls = (L.install.holdPolls || 0) + 1) <= faults.installingHoldPolls) { /* unchanged */ }
                 else { L.install.phase = 'installed'; writeModelData('vllm-cache'); fs.mkdirSync(path.join(model().workspace, '.data', 'local-llm', 'runners', 'vllm'), { recursive: true }); fs.writeFileSync(path.join(model().workspace, '.data', 'local-llm', 'runners', 'vllm', 'cache.whl'), 'fake wheel'); }
             }
             const wanted = view.model ? modelView(view.model) : null;

@@ -1833,3 +1833,46 @@ test('L3B.the-vllm-block-states-its-cap-its-stall-window-and-a-block-deadline-th
     assert.match(summary, /hard cap of 12600000 ms \(3\.5 h\) and is BLOCKED when its download shows no progress for 600000 ms \(10 min\)/);
     assert.match(summary, /the whole block has 15300000 ms \(4\.25 h\)/); assert.match(summary, /throughput samples \(bytes and time\) are recorded/);
 });
+
+// --- R18-1: the stall window covers the download only; the build after it is bounded by the hard cap -----------------------------------
+test('R18-1.a-build-that-shows-no-progress-for-longer-than-the-stall-window-passes-but-a-stalled-download-still-blocks', async t => {
+    // The product reports nothing while it builds: `installing` holds for 120 polls (about 0.6 s) against a 100 ms stall window.
+    const w = await provisioned(t, { block: 'apparatus-vllm', faults: { installingHoldPolls: 120 } });
+    w.run.deadlines.installMs = 60_000; w.run.deadlines.installStallMs = 100;
+    const l3 = caseOf(await liveCases(w, ['LIVE-L3'], { timings: { installPollMs: 5 } }), 'LIVE-L3');
+    assert.equal(l3.result, 'pass', JSON.stringify(l3).slice(0, 400));
+    const throughput = w.artifacts.get('gpu-live-l3').installThroughput;
+    assert.equal(throughput.outcome, 'installed');
+    const building = throughput.samples.filter(sample => sample.phase === 'installing');
+    assert.ok(building.length >= 20 && building.at(-1).atMs - building[0].atMs > 100, JSON.stringify({ n: building.length, ms: building.length ? building.at(-1).atMs - building[0].atMs : 0 }));
+    nothingOwned(w);
+    // The control: a download that stalls is still BLOCKED at the same window.
+    const stalled = await provisioned(t, { block: 'apparatus-vllm', faults: { installStalls: true } });
+    stalled.run.deadlines.installMs = 5_000; stalled.run.deadlines.installStallMs = 100;
+    const blockedCase = caseOf(await liveCases(stalled, ['LIVE-L3'], { timings: { installPollMs: 5 } }), 'LIVE-L3');
+    assert.equal(blockedCase.result, 'blocked', JSON.stringify(blockedCase).slice(0, 300));
+    assert.match(blockedCase.reason, /made no progress for 100 ms \(phase downloading/);
+    assert.equal(stalled.artifacts.get('gpu-live-l3').installThroughput.outcome, 'stalled');
+    nothingOwned(stalled);
+});
+
+test('R18-1.a-build-that-never-ends-is-cut-by-the-hard-cap', async t => {
+    const w = await provisioned(t, { block: 'apparatus-vllm', faults: { installingHoldPolls: 1_000_000 } });
+    w.run.deadlines.installMs = 400; w.run.deadlines.installStallMs = 60;
+    const l3 = caseOf(await liveCases(w, ['LIVE-L3'], { timings: { installPollMs: 5 } }), 'LIVE-L3');
+    assert.equal(l3.result, 'blocked', JSON.stringify(l3).slice(0, 300));
+    assert.match(l3.reason, /did not finish within 400 ms \(phase installing/);
+    assert.equal(w.artifacts.get('gpu-live-l3').installThroughput.outcome, 'cap');
+    nothingOwned(w);
+});
+
+test('R18-1.the-operator-summary-states-the-download-stall-window-and-the-build-bound', async t => {
+    const f = prepareLlmFixture(t);
+    const { code, runPath } = await prepare(f, 'apparatus-vllm', 'r18-1', f.pins({ image: LLM_IMAGE, vllm: VLLM_PINS }));
+    assert.equal(code, 0);
+    const summary = fs.readFileSync(summaryPathFor(runPath, 'claude'), 'utf8');
+    const row = summary.split('\n').find(line => line.includes('The install and the model load fit the block deadline'));
+    assert.ok(row, 'the install row is in the summary');
+    assert.match(row, /BLOCKED when its download shows no progress for 600000 ms \(10 min\); that stall window applies only while the product is downloading/);
+    assert.match(row, /'installing' is bounded by the hard cap only/);
+});

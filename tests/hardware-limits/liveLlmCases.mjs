@@ -550,8 +550,11 @@ export function createLlmCases(ctx) {
             if (last?.phase === 'installed') { putThroughput('installed'); evidence.put('install', { ...last, elapsedMs: Date.now() - started }); return last; }
             if (last?.phase === 'error') { putThroughput('error'); throw blocked(`The product's vLLM install failed on this host: ${String(last.error).slice(0, 400)}`); }
             if (last?.phase === 'paused') { putThroughput('paused'); throw blocked(`The vLLM install paused: ${String(last.pausedReason || last.error).slice(0, 300)}`); }
-            // STALL: no progress for the stall window is BLOCKED well before the cap (the install cannot finish at that rate).
-            if (now - progressAt > installStallMs) { putThroughput('stalled'); throw blocked(`The vLLM install made no progress for ${installStallMs} ms (phase ${last?.phase}, ${JSON.stringify(last?.download)}); it is BLOCKED, never a pass`); }
+            // STALL: no progress for the stall window is BLOCKED well before the cap (the install cannot finish at that rate). It applies
+            // only while the product DOWNLOADS. The 'installing' phase (uv venv, then uv pip install of the wheel set, with UV_NO_PROGRESS=1;
+            // local-llms deployments.mjs startInstallJob, runnerInstaller.mjs build) exposes no step or byte count and updates nothing until
+            // 'installed', so a healthy build there is bounded by the hard cap only.
+            if (last?.phase !== 'installing' && now - progressAt > installStallMs) { putThroughput('stalled'); throw blocked(`The vLLM install made no progress for ${installStallMs} ms (phase ${last?.phase}, ${JSON.stringify(last?.download)}); it is BLOCKED, never a pass`); }
             if (Date.now() - started > installMs) { putThroughput('cap'); throw blocked(`The vLLM install did not finish within ${installMs} ms (phase ${last?.phase}, ${JSON.stringify(last?.download)})`); }
         }
     }
