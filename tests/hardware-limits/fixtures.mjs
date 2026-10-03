@@ -1030,6 +1030,15 @@ export function buildRequiredCaseManifest() {
             'CAL.a-quoted-expression-is-not-a-statement-docstrings-and-triple-quoted-blocks-included',
             'CAL.a-real-statement-next-to-comments-and-strings-qualifies-with-its-original-line-number',
             'CAL.stripping-blanks-comments-and-literals-and-keeps-every-line',
+            'CAL.the-real-vllm-0-30-0-statement-was-refused-by-the-old-rule-and-the-real-tree-excerpts-qualify-with-exactly-the-mem-utils-line',
+            'CAL.a-denominator-from-a-constant-or-the-device-properties-in-the-real-tree-is-blocked-even-with-the-sleep-mode-line-present',
+            'CAL.a-statement-counts-only-in-its-reviewed-file-class-and-method',
+            'CAL.the-enclosing-python-scope-is-read-from-the-indentation-of-the-executable-code',
+            'CAL.only-the-accelerator-total-in-its-reviewed-position-and-executable-code-is-a-sizing-statement',
+            'CAL.the-accelerator-api-is-measured-under-both-limits-and-recorded-raw-next-to-the-cuda-and-driver-views',
+            'CAL.the-accelerator-view-must-agree-exactly-with-the-cuda-views-and-with-the-driver-under-each-limit',
+            'CAL.an-unavailable-accelerator-api-is-a-blocking-prerequisite-with-a-clear-message',
+            'CAL.the-torch-query-runs-and-records-the-accelerator-pair-or-its-error',
         ]),
     ];
     const manifest = { schema: 1, cases };
