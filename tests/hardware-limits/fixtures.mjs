@@ -707,6 +707,7 @@ export function buildRequiredCaseManifest() {
             'V2.a-daemon-that-answers-1g-for-a-configured-2048-mib-is-still-refused-and-the-message-carries-both-replies',
             'M03.no-part-of-a-known-secret-in-a-reply-reaches-the-error-the-cause-the-journal-or-the-readback',
             'M03.the-excerpt-redacts-before-escaping-and-cutting-and-keeps-ordinary-replies-and-structured-secrets-bounded',
+            'M03.a-reply-with-a-credential-and-the-literal-word-redacted-never-shows-the-raw-reply',
         ]),
         // LIVE-P1: a recreate by image ID keeps the dependency installer's identity.
         ...leaves(P, 'p4', unit('hardwareLimitsInstallerImage.test.mjs'), [

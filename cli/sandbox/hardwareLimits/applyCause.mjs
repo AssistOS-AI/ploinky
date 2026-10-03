@@ -52,7 +52,7 @@ const REPLY_REDACTION_BOUND = 4096;
 
 /**
  * A sanitized excerpt of a reply, for an error or a journal: printable ASCII only (anything else becomes `?`),
- * a newline shown as `\n`, at most 64 bytes, and credentials redacted. Replies of the MPS control daemon are
+ * a newline shown as `\n`, at most 64 bytes, and credentials redacted from the whole original reply first. Replies of the MPS control daemon are
  * numbers, so nothing else is expected; this keeps a surprising one bounded and harmless.
  */
 export function replyExcerpt(text, limit = 64) {
@@ -60,11 +60,15 @@ export function replyExcerpt(text, limit = 64) {
     // Credentials are redacted from the ORIGINAL reply, before it is escaped or cut: an exact known value is only found whole and
     // unchanged. A reply too long to redact whole is not shown at all (only its size), so no prefix of anything in it can leak.
     if (raw.length > REPLY_REDACTION_BOUND) return `[${Buffer.byteLength(raw)} bytes not shown]`.slice(0, limit);
-    const redacted = sanitizeAuthorityDiagnostic(raw, { limit: REPLY_REDACTION_BOUND });
-    // The sanitizer shows a newline as `?` and trims. An ordinary reply (nothing was redacted) keeps its own form, a newline
-    // shown as `\n`; a reply that had a redaction is shown as redacted.
-    const marks = value => (value.match(/REDACTED/g) || []).length;
-    const shown = marks(redacted) > marks(raw) ? redacted : raw.replace(/\r?\n/g, '\\n');
+    const clean = (value) => sanitizeAuthorityDiagnostic(value, { limit: REPLY_REDACTION_BOUND });
+    // What is shown is always the sanitizer's own output. The whole reply is sanitized (so a credential spanning lines is found); the
+    // sanitizer shows a newline as `?`. When sanitizing line by line gives exactly the same text, the newlines are shown as `\n`
+    // instead; otherwise the whole-reply output is shown as it is. The raw reply is never shown and no test of its text is made.
+    const whole = clean(raw);
+    const parts = raw.split(/(\r?\n)/);
+    const lines = parts.map((part, index) => (index % 2 ? part : clean(part)));
+    const joined = parts.map((part, index) => (index % 2 ? part.replace(/[\r\n]/g, '?') : lines[index])).join('');
+    const shown = joined === whole ? parts.map((part, index) => (index % 2 ? '\\n' : lines[index])).join('') : whole;
     return shown.replace(/[^\x20-\x7e]/g, '?').slice(0, limit);
 }
 

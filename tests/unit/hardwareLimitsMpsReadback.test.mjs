@@ -100,9 +100,10 @@ test('W2.a-reply-with-control-bytes-and-two-hundred-characters-is-sanitized-and-
     // The transport refuses non-ASCII replies; the excerpt is printable ASCII, a newline shown as \n, at most 64 bytes.
     assert.match(reason, /MPS control reply is not ASCII \(reply: /);
     assert.ok(/^[\x20-\x7e]*$/.test(excerpt) && Buffer.byteLength(excerpt) <= 64, JSON.stringify(excerpt));
-    assert.ok(excerpt.startsWith('??? line one\\nline two xxxx'), excerpt);
+    // The shared sanitizer removes the control bytes (they are not shown as `?`); the non-ASCII letter and the newline are shown as `?` and `\\n`.
+    assert.ok(excerpt.startsWith('? line one\\nline two xxxx'), excerpt);
     assert.equal(w.state.lastReadback.sm.length <= 64 && /^[\x20-\x7e]*$/.test(w.state.lastReadback.sm), true, JSON.stringify(w.state.lastReadback));
-    assert.ok(w.state.lastReadback.sm.startsWith('??? line one\\nline two'), w.state.lastReadback.sm);
+    assert.ok(w.state.lastReadback.sm.startsWith('? line one\\nline two'), w.state.lastReadback.sm);
     assert.equal(JSON.stringify(result).includes('\u0007'), false);
 });
 
@@ -283,4 +284,21 @@ test('M03.the-excerpt-redacts-before-escaping-and-cutting-and-keeps-ordinary-rep
     assert.equal(replyExcerpt(`{"password": "${'q'.repeat(90)}"}`).includes('qqqq'), false);
     // A reply too long to redact whole is not shown at all; only its size is.
     assert.match(replyExcerpt('z'.repeat(5000)), /^\[5000 bytes not shown\]$/);
+});
+
+// M-MPS-03 (round 2): what is shown is always the sanitizer's output, never the raw reply chosen by a test of its text. A reply that
+// holds a (synthetic) credential and also the literal word REDACTED collapses to the same count of markers.
+const SYNTHETIC_BEARER = 'SYNTHCRED0123456789abcdefghijklmnopqrstuvwxyz';
+test('M03.a-reply-with-a-credential-and-the-literal-word-redacted-never-shows-the-raw-reply', async () => {
+    for (const reply of [`Authorization: Bearer ${SYNTHETIC_BEARER} REDACTED`, `Bearer ${SYNTHETIC_BEARER}, REDACTED`, `token=${SYNTHETIC_BEARER} REDACTED`, `REDACTED password=${SYNTHETIC_BEARER}`]) {
+        const shown = replyExcerpt(reply);
+        assert.equal(shown.includes('SYNTHCRED'), false, `${reply}: ${shown}`);
+        assert.match(shown, /REDACTED/);
+        const w = world({ replies: { sm: '25.0\n', memory: `${reply}\n` } });
+        const result = await w.apply();
+        assert.equal(result.status, 422);
+        const blob = `${JSON.stringify(result)}\n${JSON.stringify(w.state)}`;
+        assert.equal(blob.includes('SYNTHCRED'), false, `${reply}: the credential reached the Apply result or the journal`);
+        assert.equal(w.state.lastReadback.memory.includes('SYNTHCRED'), false);
+    }
 });
