@@ -314,8 +314,10 @@ export function createGpuCases(ctx) {
         const startedAt = Date.now();
         const bounded = error => boundedTail(String(error?.message || error), 200).text;
         const compact = state => refs.map((ref, index) => { const container = agentEntry(state, ref)?.containers?.find(value => value.key === keys[index]); return { ref, key: keys[index], availability: container?.availability ?? null, limitsState: container?.limitsState ?? null, mpsGeneration: container?.mpsGeneration ?? null }; });
+        // The same transport predicate as requireTransport: a read counts only if it finished cleanly with exit status 0.
+        const transportOk = result => Boolean(result) && !result.errorCode && !result.signal && !result.timedOut && !result.truncated && !result.cancelled && !result.settlementForced && Number.isInteger(result.status) && result.status === 0;
         const outcomeOf = result => {
-            const parts = [Number.isInteger(result?.status) && result.status !== 0 ? `exit ${result.status}` : null, result?.timedOut ? 'timed out' : null, result?.signal ? `killed by ${result.signal}` : null, result?.errorCode ? `error ${result.errorCode}` : null].filter(Boolean);
+            const parts = [Number.isInteger(result?.status) && result.status !== 0 ? `exit ${result.status}` : null, result && !Number.isInteger(result.status) && !result.timedOut && !result.signal ? 'no exit status' : null, result?.timedOut ? 'timed out' : null, result?.signal ? `killed by ${result.signal}` : null, result?.truncated ? 'output truncated' : null, result?.cancelled ? 'cancelled' : null, result?.settlementForced ? 'forced settlement' : null, result?.errorCode ? `error ${result.errorCode}` : null].filter(Boolean);
             return `${parts.join(', ') || 'no usable output'}${result?.stderr ? `: ${boundedTail(result.stderr, 160).text.trim()}` : ''}`;
         };
         const record = {
@@ -333,14 +335,19 @@ export function createGpuCases(ctx) {
                     const role = fixture.roles.find(value => fixture.refs[value] === ref);
                     const name = role ? fixtureContainerName(workspace, nameOf(role), fixture.repository) : null;
                     for (const row of rows.filter(value => name && value.name === name)) {
-                        const entry = { ref, name, id: row.id, state: null, stateError: null, logsTail: null, logsError: null, at: Date.now() };
+                        const entry = { ref, name, id: row.id, state: null, stateTrusted: false, stateError: null, logsTail: null, logsTrusted: false, logsError: null, at: Date.now() };
                         try {
                             const result = await observe('gpu-truth-inspect', [...nested, 'container', 'inspect', '--format', CONTAINER_TRUTH_FORMAT, row.id], { deadlineMs: 10000, tolerate: true });
-                            try { entry.state = JSON.parse(result.stdout); } catch { entry.stateError = outcomeOf(result); }
+                            let parsed = null; try { parsed = JSON.parse(result.stdout); } catch { parsed = null; }
+                            // A read that did not finish cleanly always carries its error, and whatever it printed is kept as partial, never trusted.
+                            if (transportOk(result) && parsed) { entry.state = parsed; entry.stateTrusted = true; }
+                            else { entry.stateError = transportOk(result) ? 'the inspect output is not JSON' : outcomeOf(result); if (parsed) entry.state = parsed; }
                         } catch (error) { entry.stateError = bounded(error); }
                         try {
                             const result = await observe('gpu-truth-logs', [...nested, 'container', 'logs', '--tail', '40', row.id], { deadlineMs: 10000, tolerate: true });
-                            if (result.status === 0 && !result.timedOut && !result.signal) entry.logsTail = boundedTail(`${result.stdout}${result.stderr}`, 2048).text; else entry.logsError = outcomeOf(result);
+                            const text = boundedTail(`${result.stdout ?? ''}${result.stderr ?? ''}`, 2048).text;
+                            if (transportOk(result)) { entry.logsTail = text; entry.logsTrusted = true; }
+                            else { entry.logsError = outcomeOf(result); if (text) entry.logsTail = text; }
                         } catch (error) { entry.logsError = bounded(error); }
                         captured.push(entry);
                     }
@@ -368,7 +375,7 @@ export function createGpuCases(ctx) {
         // 3. After the watching: what the containers are then, so the evidence shows both moments.
         record.containersAfterPoll = await captureTruth(); record.phase = 'complete'; persist();
         const last = record.containersAfterPoll.length ? record.containersAfterPoll : record.containers;
-        const truth = last.map(entry => (entry.state ? `${entry.ref} ${entry.state.status}${entry.state.running ? '' : ` exit ${entry.state.exitCode}${entry.state.oomKilled ? ' oom-killed' : ''}`}` : null)).filter(Boolean).join('; ');
+        const truth = last.map(entry => (entry.state && entry.stateTrusted ? `${entry.ref} ${entry.state.status}${entry.state.running ? '' : ` exit ${entry.state.exitCode}${entry.state.oomKilled ? ' oom-killed' : ''}`}` : null)).filter(Boolean).join('; ');
         const { converged, afterMs } = record.convergence;
         throw new Error(`The status was not settled right after the Apply of ${refs.join(', ')} (${problems.join('; ')}); ${converged ? `it settled ${afterMs} ms later, which is a lagging status and not an acceptance` : `it did not settle within ${timings.convergenceMs} ms`}${truth ? `; the container: ${truth}` : ''}`);
     }

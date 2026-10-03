@@ -2038,7 +2038,7 @@ test('E5.a-failed-inspect-or-failed-logs-or-both-leave-the-partial-evidence-and-
     const cases = [
         ['inspect fails, logs succeed', { truthInspectResult: { status: 1, stderr: 'Error: inspect synthetic failure' } }, entry => entry.state === null && /exit 1: Error: inspect synthetic failure/.test(entry.stateError) && /agent started/.test(entry.logsTail) && entry.logsError === null],
         ['logs fail, inspect succeeds', { truthLogsResult: { status: null, signal: 'SIGKILL', timedOut: true } }, entry => entry.state?.exitCode === 137 && entry.stateError === null && entry.logsTail === null && /timed out, killed by SIGKILL/.test(entry.logsError)],
-        ['both fail', { truthInspectResult: { status: 125, stderr: 'Error: no such container' }, truthLogsResult: { status: 1, stderr: 'Error: logs synthetic failure' } }, entry => entry.state === null && /exit 125/.test(entry.stateError) && entry.logsTail === null && /exit 1: Error: logs synthetic failure/.test(entry.logsError)],
+        ['both fail', { truthInspectResult: { status: 125, stderr: 'Error: no such container' }, truthLogsResult: { status: 1, stderr: 'Error: logs synthetic failure' } }, entry => entry.state === null && /exit 125/.test(entry.stateError) && entry.logsTrusted === false && /exit 1: Error: logs synthetic failure/.test(entry.logsError)],
     ];
     for (const [label, faults, check] of cases) {
         const w = await provisioned(t, { faults: { ...STOPPED, ...faults } });
@@ -2094,4 +2094,47 @@ test('T6.a-failed-observation-of-the-clients-is-recorded-as-evidence-the-apply-g
         assert.equal(JSON.stringify(entry).includes('SYNTHETIC-SECRET-VALUE-1'), false, 'the error text is bounded and redacted');
         nothingOwned(w);
     }
+});
+
+// --- T8: a read that did not finish cleanly never yields an error-free, trusted truth --------------------------------------------
+const VALID_INSPECT = JSON.stringify({ id: 'f'.repeat(64), status: 'exited', running: false, exitCode: 137, oomKilled: true, startedAt: '2026-10-03T00:00:00Z', finishedAt: '2026-10-03T00:00:05Z' });
+test('T8.a-failed-transport-keeps-its-error-and-marks-the-printed-data-partial-for-the-inspect-and-the-logs', async t => {
+    const inspectCases = [
+        ['(a) exit 125', { status: 125, stderr: 'Error: synthetic' }, /exit 125/],
+        ['(b) a timeout', { status: null, timedOut: true }, /timed out/],
+        ['(c) SIGKILL', { status: null, signal: 'SIGKILL' }, /killed by SIGKILL/],
+        ['(d) truncated output', { status: 0, truncated: true }, /output truncated/],
+    ];
+    for (const [label, fault, pattern] of inspectCases) {
+        const w = await provisioned(t, { faults: { ...STOPPED, truthInspectResult: { ...fault, stdout: VALID_INSPECT } } });
+        const p1 = caseOf(await liveCases(w, ['LIVE-P1'], { timings: QUICK_POLL }), 'LIVE-P1');
+        assert.equal(p1.result, 'fail', `${label}: ${JSON.stringify(p1).slice(0, 200)}`);
+        const record = w.artifacts.get('gpu-live-p1').statusUnsettled;
+        for (const captured of [record.containers, record.containersAfterPoll]) {
+            assert.ok(pattern.test(captured[0].stateError), `${label}: ${JSON.stringify(captured[0].stateError)}`);
+            assert.equal(captured[0].stateTrusted, false, label);
+            assert.equal(captured[0].state.exitCode, 137, `${label}: the printed data is kept, marked partial`);
+        }
+        // No conclusion about the container is drawn from an untrusted read.
+        assert.equal(/exit 137/.test(p1.reason), false, `${label}: ${p1.reason}`);
+        nothingOwned(w);
+    }
+    for (const [label, fault, pattern] of [['(e) truncated logs', { status: 0, truncated: true }, /output truncated/], ['(f) nonzero exit', { status: 1, stderr: 'Error: logs synthetic' }, /exit 1/]]) {
+        const w = await provisioned(t, { faults: { ...STOPPED, truthLogsResult: { ...fault, stdout: 'partial log line\n' } } });
+        const p1 = caseOf(await liveCases(w, ['LIVE-P1'], { timings: QUICK_POLL }), 'LIVE-P1');
+        assert.equal(p1.result, 'fail', label);
+        const record = w.artifacts.get('gpu-live-p1').statusUnsettled;
+        for (const captured of [record.containers, record.containersAfterPoll]) {
+            assert.ok(pattern.test(captured[0].logsError), `${label}: ${captured[0].logsError}`);
+            assert.equal(captured[0].logsTrusted, false, label); assert.match(captured[0].logsTail, /partial log line/);
+        }
+        nothingOwned(w);
+    }
+    // (g) The normal read is trusted and error-free.
+    const normal = await provisioned(t, { faults: STOPPED });
+    await liveCases(normal, ['LIVE-P1'], { timings: QUICK_POLL });
+    const [captured] = normal.artifacts.get('gpu-live-p1').statusUnsettled.containers;
+    assert.deepEqual([captured.stateTrusted, captured.stateError, captured.logsTrusted, captured.logsError], [true, null, true, null]);
+    assert.equal(captured.state.exitCode, 137);
+    nothingOwned(normal);
 });

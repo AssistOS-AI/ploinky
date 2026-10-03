@@ -491,7 +491,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
         if (verb === 'container inspect') {
             const format = args[args.indexOf('--format') + 1]; const id = args.at(-1);
             if (format !== GPU_AGENT_INSPECT && format !== CONTAINER_TRUTH_FORMAT) return null;
-            if (format === CONTAINER_TRUTH_FORMAT && faults.truthInspectResult) return ok('', faults.truthInspectResult);
+            if (format === CONTAINER_TRUTH_FORMAT && faults.truthInspectResult) return ok(faults.truthInspectResult.stdout ?? '', faults.truthInspectResult);
             if (faults.dropNested?.includes(id)) return failed('Error: no such container');
             const agent = byId(id); const helper = model.helpers.get(id);
             if (!agent && !helper) return failed('Error: no such container');
@@ -499,7 +499,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
             return typeof rendered === 'string' ? ok(rendered) : rendered;
         }
         if (verb === 'container logs') {
-            if (faults.truthLogsResult) return ok('', faults.truthLogsResult);
+            if (faults.truthLogsResult) return ok(faults.truthLogsResult.stdout ?? '', faults.truthLogsResult);
             const agent = byId(args.at(-1));
             return agent ? ok(`${faults.containerLogs ?? 'agent started\n'}`) : failed('Error: no such container');
         }
