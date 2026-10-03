@@ -1454,3 +1454,165 @@ test('G.status-mps-defaults-line-states-only-the-configured-default', () => {
     assert.match(text, /^MPS defaults: 25% SM; 2048 MiB per CUDA process$/m);
     assert.equal(/largest share/.test(text), false);
 });
+
+// ---------------------------------------------------------------------------
+// R20-1: the selected gate is a journal item of the graph admission. Master's rule (update/admission.mjs): every candidate
+// write happens inside the error boundary and nothing after settlement can trigger a restoration.
+const FIXED_PRIOR = '2026-01-02T03:04:05.000Z';
+function gateAdmissionWorld(t, { action, failWrite = false, failFinalize = null, priorGate = null, events = [] }) {
+    const state = fixture(t);
+    const previousHome = process.env.HOME;
+    process.env.HOME = state.home;
+    t.after(() => { process.env.HOME = previousHome; });
+    writeGraphSkillScope(state.identity, buildHostSkillScope(state.identity.workspaceRoot, state.identity.workspaceRoot), lockFor(state.identity));
+    if (priorGate !== null) state.gateStore.write(state.identity, priorGate, lockFor(state.identity), { now: () => new Date(FIXED_PRIOR) });
+    const candidate = owned(state.identity, { id: (action === 'replaced' ? '1' : 'a').repeat(64) });
+    const priorAgentLib = agentLibFixture(state.identity.workspaceRoot);
+    let settled = false;
+    const gate = Object.freeze({
+        homeDirectory: state.gateStore.homeDirectory,
+        root: state.gateStore.root,
+        recordPath: state.gateStore.recordPath,
+        read: (identity) => state.gateStore.read(identity),
+        write: (identity, enabled, lock, options) => {
+            events.push(settled ? 'gate-write-after-settlement' : 'gate-write');
+            if (failWrite) throw new Error('simulated gate record write failure');
+            return state.gateStore.write(identity, enabled, lock, options);
+        },
+        clear: (identity, lock) => state.gateStore.clear(identity, lock),
+        restore: (identity, previous, lock) => { events.push('gate-restore'); return state.gateStore.restore(identity, previous, lock); },
+    });
+    const supervisor = createBoxSupervisor({
+        env: { PLOINKY_BOX_HARDWARE_LIMITS: 'on' },
+        resolveIdentity: () => state.identity,
+        launchCwd: state.identity.workspaceRoot,
+        lockManager: fakeLockManager(state.root, events),
+        discover: () => owned(state.identity),
+        runner: {
+            run(_command, args) { if (args.includes('ploinky-local')) events.push(`graph-stop:${settled ? 'after-settlement' : 'before-settlement'}`); },
+            query() { return { ok: true, status: 0, stdout: INBOX_READY }; },
+        },
+        selectAgentLib: async () => ({ selection: agentLibFixture(state.identity.workspaceRoot), mode: 'local' }),
+        updateAgentLib: async () => ({ selection: agentLibFixture(state.identity.workspaceRoot), changed: false, previous: null }),
+        updateWorkspacePloinky: async () => ({ found: false }),
+        reconcile: async (options) => ({
+            action, ownership: candidate, hostPort: 8080, mediaHostPort: 7882, hardware: options.hardware, previousAgentLib: priorAgentLib,
+            validate() { if (settled) throw new Error('already settled'); },
+            finalize() {
+                events.push('finalize');
+                if (failFinalize) failFinalize(state, events);
+                settled = true;
+            },
+            async rollback() {
+                events.push(`rollback:${settled ? 'after-settlement' : 'before-settlement'}`);
+                return Object.freeze({ action: action === 'reused' ? 'reused-preserved' : 'candidate-removed', ownership: candidate, containerId: candidate.handles.container.id, hostPort: 8080, mediaHostPort: 7882, routerBinding: null, gpu: null, agentLib: priorAgentLib });
+            },
+        }),
+        captureCoreStartArgv: () => ['start', 'explorer', '8080'],
+        readEdgeDesired: () => null,
+        startCore: async () => { events.push('start-core'); },
+        runCoreCommand: async () => {},
+        runRestartCore: fakeRestartCore(async () => {}),
+        runUpdateCore: fakeUpdateCore({ onCall: () => Promise.resolve() }),
+        resolveHostReachableIpv4: async () => '192.168.1.12',
+        healthCheck: async () => {},
+        revalidateAgentLibSource: () => {},
+        commitAgentLibSelection: () => {},
+        validateExistingImage: () => ({ immutableId: `sha256:${'b'.repeat(64)}` }),
+        validateContainer: () => {},
+        hardwareGateStore: gate,
+        prepareHardwareGeneration: async () => ({ structurallyPrepared: true }),
+        stdout: { write() { return true; } },
+        stderr: { write() { return true; } },
+    });
+    const invoke = {
+        start: () => supervisor.runStartTransaction(['start', 'explorer', '8080']),
+        restart: () => supervisor.runRestartTransaction(['restart']),
+        update: () => supervisor.runUpdateTransaction(['update'], { restartAfterUpdate: true }),
+    };
+    return { state, events, invoke };
+}
+
+for (const operation of ['start', 'restart', 'update']) {
+    test(`G.gate-write-is-a-journal-item-before-settlement-${operation}`, async (t) => {
+        for (const action of ['replaced', 'reused']) {
+            const world = gateAdmissionWorld(t, { action });
+            await world.invoke[operation]();
+            const { events, state } = world;
+            assert.ok(events.includes('gate-write'), `${operation}/${action} saves the selected gate: ${events}`);
+            assert.ok(events.indexOf('gate-write') < events.indexOf('finalize'), `${operation}/${action}: the gate is written inside the journaled admission, before settlement: ${events}`);
+            assert.equal(events.some((event) => event.endsWith('after-settlement')), false, `nothing runs after settlement: ${events}`);
+            assert.equal(state.gateStore.read(state.identity).enabled, true);
+        }
+    });
+
+    test(`G.gate-write-failure-never-reaches-a-rollback-after-settlement-${operation}`, async (t) => {
+        for (const action of ['replaced', 'reused']) {
+            const world = gateAdmissionWorld(t, { action, failWrite: true });
+            const error = await world.invoke[operation]().then(() => null, (failure) => failure);
+            const { events, state } = world;
+            assert.ok(error, `${operation}/${action}: a failing gate write fails the transaction`);
+            assert.match(error.message, /simulated gate record write failure/);
+            // The failure is inside the journaled boundary: the admission never settled, so the candidate is rolled back
+            // under its rollback authority, exactly once, and the settlement never ran for a graph that was not admitted.
+            assert.equal(events.includes('finalize'), false, `${operation}/${action}: no settlement after a failed gate write: ${events}`);
+            assert.equal(events.filter((event) => event === 'rollback:before-settlement').length, 1, events.join(' '));
+            assert.equal(events.some((event) => event.endsWith('after-settlement')), false, events.join(' '));
+            assert.equal(error.admission?.outcome, 'recovered', JSON.stringify(error.admission));
+            assert.deepEqual(error.admission.results.find((result) => result.name === 'hardware-gate'), { name: 'hardware-gate', outcome: 'unchanged' });
+            assert.equal(state.gateStore.read(state.identity), null, 'a failed write leaves no saved gate');
+        }
+    });
+
+    test(`G.gate-is-restored-to-its-exact-prior-record-only-while-it-is-this-transactions-candidate-${operation}`, async (t) => {
+        // A prior saved gate (off, with its own timestamp) and a settlement that fails after the gate was written: the journal
+        // puts back exactly the prior record, timestamp included, and reports the recovery.
+        const restored = gateAdmissionWorld(t, { action: 'replaced', priorGate: false, failFinalize: () => { throw new Error('simulated settlement failure'); } });
+        const error = await restored.invoke[operation]().then(() => null, (failure) => failure);
+        assert.match(String(error?.message), /simulated settlement failure/);
+        assert.deepEqual(error.admission.results.find((result) => result.name === 'hardware-gate'), { name: 'hardware-gate', outcome: 'restored' });
+        assert.deepEqual({ ...restored.state.gateStore.read(restored.state.identity) }, { enabled: false, savedAt: FIXED_PRIOR });
+        // No prior record: restoration removes the candidate record.
+        const absent = gateAdmissionWorld(t, { action: 'reused', failFinalize: () => { throw new Error('simulated settlement failure'); } });
+        const absentError = await absent.invoke[operation]().then(() => null, (failure) => failure);
+        assert.deepEqual(absentError.admission.results.find((result) => result.name === 'hardware-gate'), { name: 'hardware-gate', outcome: 'restored' });
+        assert.equal(absent.state.gateStore.read(absent.state.identity), null);
+        assert.ok(absent.events.includes('gate-restore'));
+        // A successor wrote its own gate before the failure: its value is preserved and the recovery is reported, never overwritten.
+        const successor = gateAdmissionWorld(t, {
+            action: 'replaced', priorGate: false,
+            failFinalize: (state) => { state.gateStore.write(state.identity, false, lockFor(state.identity), { now: () => new Date('2026-02-03T04:05:06.000Z') }); throw new Error('simulated settlement failure'); },
+        });
+        const successorError = await successor.invoke[operation]().then(() => null, (failure) => failure);
+        assert.equal(successorError.admission.outcome, 'recovery-required');
+        assert.deepEqual(successorError.admission.results.find((result) => result.name === 'hardware-gate'), { name: 'hardware-gate', outcome: 'successor-preserved' });
+        assert.deepEqual({ ...successor.state.gateStore.read(successor.state.identity) }, { enabled: false, savedAt: '2026-02-03T04:05:06.000Z' });
+        assert.equal(successor.events.includes('gate-restore'), false, 'a successor value is never restored over');
+    });
+}
+
+test('G.gate-store-clear-and-restore-are-lock-checked-and-exact', (t) => {
+    const state = fixture(t);
+    const lock = lockFor(state.identity);
+    const record = state.gateStore.recordPath(state.identity);
+    // Both mutations need the workspace lock, and a lock for another instance is refused.
+    for (const operation of [() => state.gateStore.clear(state.identity), () => state.gateStore.restore(state.identity, null)]) {
+        assert.throws(operation, (error) => error.code === 'PLOINKY_BOX_HARDWARE_STATE_INVALID' && /workspace mutation lock/.test(error.message));
+    }
+    assert.throws(() => state.gateStore.clear(state.identity, { assertHeld: () => { throw new Error('not held'); } }), /not held/);
+    // Clearing an absent record is a no-op; clearing a saved one removes exactly it.
+    assert.equal(state.gateStore.clear(state.identity, lock), false);
+    state.gateStore.write(state.identity, true, lock);
+    assert.equal(state.gateStore.clear(state.identity, lock), true);
+    assert.equal(fs.existsSync(record), false);
+    // Restoring a previous record puts back its value and its timestamp; restoring absence removes the record.
+    state.gateStore.restore(state.identity, { enabled: false, savedAt: FIXED_PRIOR }, lock);
+    assert.deepEqual({ ...state.gateStore.read(state.identity) }, { enabled: false, savedAt: FIXED_PRIOR });
+    state.gateStore.restore(state.identity, null, lock);
+    assert.equal(state.gateStore.read(state.identity), null);
+    // A non-regular record is never removed.
+    fs.mkdirSync(path.dirname(record), { recursive: true });
+    fs.mkdirSync(record);
+    assert.throws(() => state.gateStore.clear(state.identity, lock), /non-regular hardware-limits gate path/);
+    assert.equal(fs.existsSync(record), true);
+});

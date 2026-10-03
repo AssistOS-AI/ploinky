@@ -735,11 +735,6 @@ export function createBoxSupervisor({
         return inspect(identity);
     }
 
-    function persistHardwareGate(identity, lock, gate) {
-        if (!gate?.persist) return null;
-        return hardwareGateStore.write(identity, gate.enabled, lock);
-    }
-
     // The admitted record always comes from the desired wiring that was passed
     // to reconciliation. Reconciliation reuses a Box only when its fingerprint
     // equals that wiring's, so this is the Box's wiring too, but unlike a
@@ -1109,6 +1104,7 @@ export function createBoxSupervisor({
         source = null,
         activated = true,
         gpuGrantUpdate = null,
+        hardwareGate = null,
     }) {
         if (requireHealth) await healthCheck(prepared.hostPort, { routerBinding: prepared.routerBinding });
         revalidateAgentLibSource(selection, {
@@ -1146,6 +1142,16 @@ export function createBoxSupervisor({
                 read: () => gpuGrantStore.read(identity),
                 write: () => gpuGrantStore.write(identity, gpuGrantUpdate.next, lock, { admitted: gpuGrantUpdate.admitted }),
                 restore: prior => gpuGrantStore.restore(identity, prior, lock),
+            });
+        }
+        if (hardwareGate?.persist) {
+            // The selected gate is recorded inside the journaled boundary, last, so a failing write is rolled back with the
+            // other candidate metadata before settlement and can never reach a rollback after it.
+            items.push({
+                name: 'hardware-gate',
+                read: () => hardwareGateStore.read(identity),
+                write: () => hardwareGateStore.write(identity, hardwareGate.enabled, lock),
+                restore: prior => hardwareGateStore.restore(identity, prior, lock),
             });
         }
         const admitted = await runJournaledAdmission({
@@ -1291,8 +1297,8 @@ export function createBoxSupervisor({
                     routerBindingUpdate: savedRouterBindingUpdate(savedBinding, prepared),
                     gpuGrantUpdate: savedGpuGrantUpdate(savedGpuGrant, gpu, prepared),
                     operation: 'start',
+                    hardwareGate,
                 });
-                persistHardwareGate(identity, lock, hardwareGate);
             } catch (error) {
                 await rollbackPreparedGraph({
                     identity,
@@ -1370,8 +1376,8 @@ export function createBoxSupervisor({
                 admission = await completeGraphAdmission({
                     identity, lock, prepared, selection, skillScopeEnv, operation: 'restart',
                     gpuGrantUpdate: savedGpuGrantUpdate(savedGpuGrant, gpu, prepared),
+                    hardwareGate,
                 });
-                persistHardwareGate(identity, lock, hardwareGate);
             } catch (error) {
                 // A Box whose restart writer may still run is never rolled back.
                 if (error?.skipRollback) throw error;
@@ -2295,8 +2301,8 @@ export function createBoxSupervisor({
                     source: { coreArgv: [...coreArgv], ...sourceSnapshot },
                     // Without a restart there is no health proof to record against.
                     gpuGrantUpdate: restart ? savedGpuGrantUpdate(savedGpuGrant, gpu, prepared) : null,
+                    hardwareGate,
                 });
-                persistHardwareGate(identity, lock, hardwareGate);
                 outcome = restart ? 'restarted' : (activity.undetermined ? 'deferred' : 'not-required');
             }
         } catch (error) {

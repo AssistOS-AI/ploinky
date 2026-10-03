@@ -96,12 +96,16 @@ export function createHardwareGateStore({ homeDirectory = os.homedir(), fsApi = 
         return Object.freeze({ enabled: record.enabled, savedAt: record.savedAt });
     }
 
-    function write(identity, enabled, lock, { now = () => new Date() } = {}) {
+    function requireLock(identity, lock) {
         if (typeof lock?.assertHeld !== 'function') {
             throw gateError('Changing the hardware-limits gate requires the workspace mutation lock', 'PLOINKY_BOX_HARDWARE_STATE_INVALID');
         }
         lock.assertHeld(identity.instance);
         assertRouterBindingStateConfined(identity, { homeDirectory, fsApi });
+    }
+
+    function write(identity, enabled, lock, { now = () => new Date() } = {}) {
+        requireLock(identity, lock);
         fsApi.mkdirSync(path.dirname(root), { recursive: true, mode: 0o700 });
         ensurePrivateDirectory(fsApi, root, STATE_FILES);
         const target = recordPath(identity);
@@ -110,7 +114,31 @@ export function createHardwareGateStore({ homeDirectory = os.homedir(), fsApi = 
         return Object.freeze({ enabled: record.enabled, savedAt: record.savedAt });
     }
 
-    return Object.freeze({ homeDirectory, root, recordPath, read, write });
+    // Removes only this workspace's saved gate record (false when there is none), under the workspace lock.
+    function clear(identity, lock) {
+        requireLock(identity, lock);
+        const target = recordPath(identity);
+        let stat;
+        try {
+            stat = fsApi.lstatSync(target);
+        } catch (error) {
+            if (error?.code === 'ENOENT') return false;
+            throw gateError(`Unable to inspect the saved hardware-limits gate: ${target}`, 'PLOINKY_BOX_HARDWARE_STATE_INVALID');
+        }
+        if (!stat.isFile() && !stat.isSymbolicLink()) {
+            throw gateError(`Refusing to remove a non-regular hardware-limits gate path: ${target}`, 'PLOINKY_BOX_HARDWARE_STATE_INVALID');
+        }
+        fsApi.unlinkSync(target);
+        return true;
+    }
+
+    /** Put back exactly the record captured before a failed mutation (its value and its timestamp), or its absence. */
+    function restore(identity, previous, lock) {
+        if (previous) write(identity, previous.enabled, lock, { now: () => new Date(previous.savedAt) });
+        else clear(identity, lock);
+    }
+
+    return Object.freeze({ homeDirectory, root, recordPath, read, write, clear, restore });
 }
 
 /**
