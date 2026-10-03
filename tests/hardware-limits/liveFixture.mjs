@@ -55,6 +55,14 @@ export function fixturePlan(cases) {
     return roles.map(role => ({ name: role, role, hardwareLimits: { ...FIXTURE_HARDWARE_LIMITS } }));
 }
 
+// The fixture agent's process. Ploinky starts a manifest `agent` as `<shell> -c "cd <cwd> && <agent>"` under its control
+// entrypoint, which forwards SIGTERM, SIGINT and SIGHUP to that shell and treats only EXIT ZERO as the application's drain
+// acknowledgement (Agent/server/AgentEntrypoint.sh forward_termination; cli/sandbox/docker/targetedContainerLifecycle.js
+// assertCleanTermination: "Signal termination (including 143) is never an acknowledgement"). So, like local-llm
+// (`exec node /code/src/main.mjs`), the fixture agent execs its node process, which becomes the signalled main process, and
+// exits 0 at once on each of the three signals. The ready line only lets a test know the handlers are installed.
+export const FIXTURE_AGENT_COMMAND = 'exec node -e "for (const s of [\'SIGTERM\',\'SIGINT\',\'SIGHUP\']) process.on(s, () => process.exit(0)); console.log(\'fixture agent ready\'); setInterval(() => {}, 3600000)"';
+
 // The fixture manifest, readiness none, the pinned image and the limits
 // declared through the neutral hardwareLimits field (never the deprecated
 // llmRuntime.runtimePolicy.resources). The root agent enables the other
@@ -62,7 +70,7 @@ export function fixturePlan(cases) {
 export function fixtureManifest(agent, { image, agents }) {
     const manifest = {
         container: image,
-        agent: 'node -e "setInterval(()=>{},3600000)"',
+        agent: FIXTURE_AGENT_COMMAND,
         readiness: { protocol: 'none' },
         hardwareLimits: { ...agent.hardwareLimits },
     };

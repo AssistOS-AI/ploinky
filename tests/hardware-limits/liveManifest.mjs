@@ -10,7 +10,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { WANTED_CONTROLLERS } from '../../ploinky-box/entrypoint/cgroupDelegation.mjs';
 import { ENGINE_CONNECTIONS_ARGV, ENGINE_INFO_ARGV, HOST_RECORD_DIRECTORIES, IMAGE_REF, OWNER_MARKER, UNIX_SOCKET_PATH_LIMIT, WORKSPACE_SOCKET_NAME, digest, keys, liveSourceDigest, AGENT_INSPECT, INSPECT } from './liveCommon.mjs';
-import { FIXTURE_REPOSITORY, GPU_PROBE_TARGET, fixtureContainerName, fixtureManifest, fixturePlan, proposedWorkspaceIdentity, rewriteLlmManifest, startArgs } from './liveFixture.mjs';
+import { FIXTURE_AGENT_COMMAND, FIXTURE_REPOSITORY, GPU_PROBE_TARGET, fixtureContainerName, fixtureManifest, fixturePlan, proposedWorkspaceIdentity, rewriteLlmManifest, startArgs } from './liveFixture.mjs';
 import { LLM_MODELS, LLM_REF, LLM_REPOSITORY, LLM_SOURCE_DIRECTORY } from './liveLlmNames.mjs';
 import {
     INFERENCE_CADENCE, INFERENCE_TOLERANCE, INSUFFICIENT_RAM, L1_PROMPT, LLM_BUDGET, LLM_IMAGE_DIGESTS, LLM_IMAGE_FILES, LLM_LEAF_SAMPLE, LLM_RUNNER_PROCESSES, LLM_TOOL_CALL, PLAYGROUND_DECISION, VLLM_SHARE, insufficientMemoryPercent, llmToolWords, vllmToolWords,
@@ -621,6 +621,7 @@ function gpuSummary(run) {
             '| Item | Identity |',
             '| --- | --- |',
             `| Fixture image (probe, peer, cpu and the control helper) | \`${profile.provision.image}\` (non-root image user 1000:1000; python3 and ctypes) |`,
+            `| Fixture agent process (probe, peer, cpu) | \`${FIXTURE_AGENT_COMMAND}\`: the agent execs node, which exits 0 at once on SIGTERM, SIGINT and SIGHUP, so the fixture agents acknowledge a drain with exit 0 as Ploinky's targeted-drain contract requires (a process killed by the signal, exit 143, is refused) |`,
             `| Box image | \`${profile.provision.boxImage}\` |`,
             `| nvidia-smi | \`${gpu.smi.path}\` ${gpu.smi.digest} |`,
             `| nvidia-cuda-mps-control | \`${gpu.mpsControl.path}\` ${gpu.mpsControl.digest} |`,
