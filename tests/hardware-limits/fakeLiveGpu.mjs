@@ -300,7 +300,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
         return {
             eligible: !faults.gpuIneligible, mode: 'mps-shared', assurance: 'best-effort', memoryModel: 'dedicated', name: gpu.name, deviceUuid: gpu.uuid, driverVersion: gpu.driverVersion,
             deviceMemoryBytes: gpu.memoryMiB * 1048576, daemonStatus: daemon ? (daemon.lost ? 'lost' : 'ready') : 'stopped',
-            serverDefault: daemon && !daemon.lost ? { smPercent: daemon.defaults.sm, vramMiB: daemon.defaults.mib, shareMemoryMiB: daemon.defaults.share ?? null } : null,
+            serverDefault: daemon && !daemon.lost ? { smPercent: daemon.defaults.sm, vramMiB: daemon.defaults.mib, shareMemoryMiB: faults.statusShareMiB ?? daemon.defaults.share ?? null } : null,
             mpsGeneration: daemon && !daemon.lost ? `${daemon.gen}:${daemon.cfg}` : null, reason: faults.gpuIneligible ? 'GPU sharing is not qualified in this Box.' : undefined,
         };
     }

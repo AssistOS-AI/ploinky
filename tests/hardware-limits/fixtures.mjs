@@ -618,6 +618,8 @@ export function buildRequiredCaseManifest() {
             'U3.a-fixture-agent-that-dies-on-sigterm-fails-apply-at-client-launch-with-the-targeted-drain-refusal',
             'R12c.a-failed-apply-reason-carries-the-parsed-cause-before-the-cut-response-text',
             'R12c.the-fake-daemon-answers-the-sm-default-in-the-captured-form-and-the-runner-accepts-it',
+            'R12c.p1-fails-when-the-status-names-another-share-than-the-one-the-default-came-from',
+            'R12c.p3-fails-when-the-first-default-is-not-the-rounded-value-and-when-the-raised-share-does-not-change-the-default',
             'P3R.the-candidate-parser-refuses-ports-before-restart-as-live-attempt-7-saw-and-accepts-them-before-start',
             'P3R.every-candidate-argv-of-the-apparatus-mps-manifest-and-of-its-cases-is-accepted-and-restart-carries-no-port',
             'P3R.a-runner-argv-with-ports-before-restart-fails-an-offline-p3-as-attempt-7-did',

@@ -1835,3 +1835,28 @@ test('P3R.p1-and-p3-record-the-drain-acknowledgement-basis-for-every-apply-and-t
     assert.equal(refused.artifacts.get('gpu-live-p1').drainAcknowledgements, undefined);
     nothingOwned(refused);
 });
+
+// --- R12-c(iv): the runner assertions on the whole-GiB default that no test could fail -------------------------------------
+test('R12c.p1-fails-when-the-status-names-another-share-than-the-one-the-default-came-from', async t => {
+    const w = await provisioned(t, { faults: { statusShareMiB: 999 } });
+    const entry = caseOf(await liveCases(w, ['LIVE-P1']), 'LIVE-P1');
+    assert.equal(entry.result, 'fail', JSON.stringify(entry).slice(0, 300));
+    assert.match(entry.reason, /The status names 999 MiB as the share the default came from, not 1044/);
+    nothingOwned(w);
+});
+
+test('R12c.p3-fails-when-the-first-default-is-not-the-rounded-value-and-when-the-raised-share-does-not-change-the-default', async t => {
+    // The first default is the raw share instead of the rounded one.
+    const raw = await provisioned(t, { faults: { rawServerDefault: true } });
+    const rawCase = caseOf(await liveCases(raw, ['LIVE-P3']), 'LIVE-P3');
+    assert.equal(rawCase.result, 'fail', JSON.stringify(rawCase).slice(0, 300));
+    assert.match(rawCase.reason, /The first default is 1044 MiB, not 2048/);
+    nothingOwned(raw);
+    // On a 3012-MiB device the 17% (512 MiB) and 34% (1024 MiB) shares round to the same 1 GiB default, so the default-change case cannot run.
+    const same = await provisioned(t, { gpuOverrides: { memoryMiB: 3012 } });
+    const sameCase = caseOf(await liveCases(same, ['LIVE-P3']), 'LIVE-P3');
+    assert.equal(sameCase.result, 'fail', JSON.stringify(sameCase).slice(0, 300));
+    assert.match(sameCase.reason, /The raised share does not change the server default \(1024 MiB for both\)/);
+    assert.deepEqual(same.artifacts.get('gpu-live-p3').expectedDefaults, { first: 1024, raised: 1024 });
+    nothingOwned(same);
+});
