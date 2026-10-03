@@ -643,6 +643,7 @@ export function buildRequiredCaseManifest() {
             'R14c.a-client-that-was-not-running-before-the-apply-is-never-recorded-as-acknowledged',
             'S5.drain-acknowledgement-follows-the-containers-that-were-replaced-an-unchanged-peer-a-one-client-change-an-expanded-cohort-and-a-stopped-client',
             'S5.a-replaced-client-the-response-does-not-name-is-not-acknowledged',
+            'T6.a-failed-observation-of-the-clients-is-recorded-as-evidence-the-apply-goes-on-and-no-credit-is-given',
             'S3.a-status-that-is-stale-right-after-the-apply-fails-the-case-and-records-that-it-settled-later-and-what-the-container-was',
             'S3.a-container-that-really-stopped-fails-with-its-exit-code-and-its-log-tail',
             'S3.a-fresh-immediate-status-passes-and-records-nothing-unsettled',

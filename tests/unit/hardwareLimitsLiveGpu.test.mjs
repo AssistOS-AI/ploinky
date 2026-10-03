@@ -2079,3 +2079,19 @@ test('T3.a-status-that-is-not-fresh-fails-even-when-the-instance-reads-starting-
     assert.equal(starting.artifacts.get('gpu-live-p1').statusUnsettled.statusFresh, true);
     nothingOwned(starting);
 });
+
+// --- T6: the observation of the clients around an Apply never throws -------------------------------------------------------------
+test('T6.a-failed-observation-of-the-clients-is-recorded-as-evidence-the-apply-goes-on-and-no-credit-is-given', async t => {
+    for (const [label, mode, pattern] of [['the listing fails', 'ps', /Live command failed/], ['an inspect fails', 'inspect', /Live command failed/]]) {
+        const w = await provisioned(t, { faults: { observeFailsBeforeApply: mode } });
+        const p1 = caseOf(await liveCases(w, ['LIVE-P1']), 'LIVE-P1');
+        assert.equal(p1.result, 'pass', `${label}: ${JSON.stringify(p1).slice(0, 300)}`);
+        const [entry] = w.artifacts.get('gpu-live-p1').drainAcknowledgements;
+        assert.equal(entry.applyStatus, 200);
+        assert.deepEqual(entry.acknowledged, [], `${label}: an unobserved client is never acknowledged`);
+        assert.ok(entry.clientsBefore.every(client => client.observed === 'error' && client.running === false && pattern.test(client.observeError)), `${label}: ${JSON.stringify(entry.clientsBefore)}`);
+        assert.ok(entry.notAcknowledged.every(client => client.outcome === 'unobserved-before'), label);
+        assert.equal(JSON.stringify(entry).includes('SYNTHETIC-SECRET-VALUE-1'), false, 'the error text is bounded and redacted');
+        nothingOwned(w);
+    }
+});

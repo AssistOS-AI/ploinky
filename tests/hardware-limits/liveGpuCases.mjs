@@ -374,14 +374,20 @@ export function createGpuCases(ctx) {
     }
     // Which fixture clients are running right now (never throws): the observation a drain acknowledgement rests on.
     async function observeClientsRunning() {
-        const rows = await nestedRows();
+        const failure = error => boundedTail(String(error?.message || error), 200).text;
+        let rows;
+        // Every call that can fail is guarded: an error becomes evidence (`observeError`) and the client counts as unobserved, which is
+        // never acknowledged. Nothing here may stop an Apply.
+        try { rows = await nestedRows(); } catch (error) { return fixture.clients.map(role => ({ role, running: false, observed: 'error', observeError: failure(error) })); }
         const observed = [];
         for (const role of fixture.clients) {
             const name = fixtureContainerName(workspace, nameOf(role), fixture.repository);
             const matches = rows.filter(row => row.name === name);
             if (matches.length !== 1) { observed.push({ role, running: false, observed: matches.length ? 'ambiguous' : 'absent' }); continue; }
-            const inspected = await inspectNested(matches[0].id);
-            observed.push({ role, id: hexTail(matches[0].id), fullId: matches[0].id, running: inspected.running === true });
+            try {
+                const inspected = await inspectNested(matches[0].id);
+                observed.push({ role, id: hexTail(matches[0].id), fullId: matches[0].id, running: inspected.running === true });
+            } catch (error) { observed.push({ role, running: false, observed: 'error', observeError: failure(error) }); }
         }
         return observed;
     }

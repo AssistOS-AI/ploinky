@@ -345,6 +345,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
                 ...(gpuShare !== undefined ? { gpu: { smPercent: gpuShare.smPercent, vramPercent: gpuShare.vramPercent } } : {}),
             };
             model.store.revision += 1;
+            model.saved = true;
             // `stopOnSave`: that client stops (by itself) between its save and the Apply.
             if (faults.stopOnSave) { const stopped = model.agents.get(faults.stopOnSave); if (stopped && refOf(faults.stopOnSave) === body.agentRef) stopped.running = false; }
             return { status: 200, text: JSON.stringify({ ...adminState(), committed: true }) };
@@ -477,6 +478,10 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
     const byId = id => [...model.agents.values()].find(agent => agent.id === id) || null;
     async function nested(args, options) {
         const verb = args.slice(0, 2).join(' ');
+        // `observeFailsBeforeApply`: between a save and the Apply, the runner's own look at the clients fails (the listing or an inspect).
+        const beforeApply = faults.observeFailsBeforeApply && model.saved && model.applyCalls.length === 0;
+        if (beforeApply && faults.observeFailsBeforeApply === 'ps' && verb === 'container ps') return failed('Error: synthetic nested listing failure token=SYNTHETIC-SECRET-VALUE-1');
+        if (beforeApply && faults.observeFailsBeforeApply === 'inspect' && verb === 'container inspect') return failed('Error: synthetic nested inspect failure');
         if (verb === 'container ps') {
             const format = args[args.indexOf('--format') + 1];
             if (format !== NESTED_NAME_LIST_FORMAT) return null;
