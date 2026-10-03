@@ -127,15 +127,28 @@ export function buildHardwareLimitsState({ context, installed, registry, routing
             try { desired = admit(agent, { ...record, key }, context); } catch (_) {}
             const observed = readApplied(key, record.containerId);
             const matchingObservation = observed && observed.instanceId === record.instanceId && observed.enableGeneration === record.enableGeneration ? observed : null;
-            const runtime = metrics?.runtimes?.find((value) => value.containerName === key);
+            const snapshotRuntime = metrics?.runtimes?.find((value) => value.containerName === key);
+            // A snapshot is only a statement about the container it read. When the current instance has an applied observation (written
+            // when it was created) that is newer than the snapshot, or the snapshot's entry names another container, or has no entry
+            // for it, the snapshot predates the instance: it says nothing about it, and the instance is starting, never stopped.
+            const entryId = snapshotRuntime?.containerId || '';
+            const currentId = /^[a-f0-9]{64}$/.test(record.containerId || '') ? record.containerId : '';
+            const sampledAt = Date.parse(metrics?.sampledAt);
+            const observedAt = Date.parse(matchingObservation?.observedAt);
+            const predates = Number.isFinite(sampledAt) && Number.isFinite(observedAt) && sampledAt < observedAt;
+            const staleSnapshot = Boolean(metrics) && Boolean(matchingObservation) && !projection
+                && (entryId ? Boolean(currentId) && entryId !== currentId : predates);
+            const runtime = staleSnapshot ? null : snapshotRuntime;
             const ready = runtime?.state?.ready === true;
-            const running = runtime?.state?.running === true;
-            const availability = problem?.state || (projection || runtime?.state?.status === 'failed' ? 'failed' : ready ? 'ready' : running ? 'starting' : 'stopped');
+            // The engine runs it but no route is active yet (agentRuntimeState status `starting`): starting, not stopped.
+            const engineStarting = runtime?.state?.status === 'starting';
+            const running = runtime?.state?.running === true || engineStarting;
+            const availability = problem?.state || (projection || runtime?.state?.status === 'failed' ? 'failed' : ready ? 'ready' : running || staleSnapshot ? 'starting' : 'stopped');
             const desiredMps = desired?.descriptor?.hardwareGpu;
             const generationMatches = !desiredMps || (context.gpu?.daemonStatus === 'ready' && matchingObservation?.mpsGeneration === context.gpu.mpsGeneration);
             const desiredHash = hardwareLimitsHashOf(desired?.descriptor);
             let limitsState;
-            if (projection || !running) limitsState = 'unavailable';
+            if (projection || (!running && !staleSnapshot)) limitsState = 'unavailable';
             else if (!desiredHash) {
                 // No hardware placement is desired (unprepared Box, unlimited
                 // D4 instance, sandbox runtime). Apply's unchanged predicate
@@ -154,7 +167,7 @@ export function buildHardwareLimitsState({ context, installed, registry, routing
         agents.push({ ref: agent.ref, configured: context.overrides?.get(agent.ref) || {}, declared, effective: { ...(admission?.descriptor?.hardwarePlacement?.expected || {}), ...(admission?.descriptor?.hardwareGpu ? { gpu: admission.descriptor.hardwareGpu } : {}) }, containers, ...(deprecatedDeclaration ? { deprecatedDeclaration } : {}), ...(agent.orphaned ? { orphaned: true } : {}) });
     }
     return {
-        ok: true, token: context.storeToken || null,
+        ok: true, token: context.storeToken || null, metricsSampledAt: metrics?.sampledAt || null,
         gate: { state: context.gate, prepared: context.prepared === true, backendReady: context.backendReady === true, controllers: context.controllers || [] },
         envelope: context.envelope || null, gpu: context.gpu || { eligible: false, mode: 'unavailable', assurance: 'best-effort', reason: 'GPU sharing is not qualified in this Box.' },
         help: HARDWARE_HELP, agents: agents.sort((a, b) => a.ref.localeCompare(b.ref)),

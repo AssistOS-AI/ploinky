@@ -298,3 +298,48 @@ test('R.metrics-monitor-not-started-on-import', async () => {
     const router = fs.readFileSync(new URL('../../cli/server/RoutingServer.js', import.meta.url), 'utf8');
     assert.match(router, /workspaceMetricsMonitor\.start\(\);/);
 });
+
+// --- P1S: a snapshot is a statement about the container it read, and a successful Apply leaves the next status read fresh -----
+const { workspaceMetricsMonitor } = await import('../../cli/server/workspaceMetrics.js');
+const Monitor = workspaceMetricsMonitor.constructor;
+const OLD_ID = 'a'.repeat(64);
+const NEW_ID = 'b'.repeat(64);
+const LIMITS_HASH = 'b'.repeat(64);
+const placementAdmit = () => ({ descriptor: { runtimePolicy: { resources: {} }, hardwarePlacement: { limitsHash: LIMITS_HASH, expected: { cpus: 1 } } } });
+const engineEntry = (extra = {}) => ({ containerName: 'canonical', containerId: OLD_ID, agentName: 'worker', repoName: 'demo', runtime: 'container', enabled: true, state: { status: 'exited', running: false, pid: 0 }, ...extra });
+// A record whose CURRENT container is NEW_ID, and the applied observation written when that container was created.
+function recreated(f, observedAt) {
+    const record = { ...f.registry.canonical, containerId: NEW_ID };
+    const observation = { key: 'canonical', containerId: NEW_ID, instanceId: record.instanceId, enableGeneration: record.enableGeneration, limitsHash: LIMITS_HASH, mpsGeneration: null, observedAt };
+    return { record, observation, readApplied: (key, id) => (key === 'canonical' && id === NEW_ID ? observation : null) };
+}
+// The real monitor publishing the states the engine reader returned; only that reader's output is injected.
+function snapshotOf(states) { const monitor = new Monitor(); monitor.states = states; monitor.publish(); return monitor.latest; }
+function statusOf(f, states, observedOffsetMs) {
+    const metrics = snapshotOf(states);
+    const { record, readApplied } = recreated(f, new Date(Date.parse(metrics.sampledAt) + observedOffsetMs).toISOString());
+    const state = buildHardwareLimitsState({ context: f.getContext(), installed: [{ ref: 'demo/worker', manifestPath: '/fixture/manifest.json' }], registry: { canonical: record }, metrics, admit: placementAdmit, readApplied });
+    const container = state.agents[0].containers[0];
+    return { availability: container.availability, limitsState: container.limitsState, limits: container.limits ?? null };
+}
+
+test('S1.a-stale-snapshot-never-reports-a-just-recreated-instance-as-stopped-or-unavailable', (t) => {
+    const f = fixture(t);
+    const stale = 60_000; const fresh = -60_000;
+    const starting = { availability: 'starting', limitsState: 'applied' };
+    const stopped = { availability: 'stopped', limitsState: 'unavailable' };
+    for (const [label, states, offset, expected] of [
+        ['an entry of the earlier container (it was stopped by the drain)', [engineEntry()], stale, starting],
+        ['no entry for the instance at all', [], stale, starting],
+        ['an entry without a container id that predates the instance', [engineEntry({ containerId: undefined })], stale, starting],
+        ['a fresh entry of the CURRENT container that is not running', [engineEntry({ containerId: NEW_ID })], fresh, stopped],
+        ['a fresh entry without a container id that is not running (a real stop)', [engineEntry({ containerId: undefined })], fresh, stopped],
+        ['a fresh entry of the current container, running and ready', [engineEntry({ containerId: NEW_ID, state: { status: 'running', running: true, ready: true, pid: 5 } })], fresh, { availability: 'ready', limitsState: 'applied' }],
+        ['the engine runs it and no route is active yet', [engineEntry({ containerId: NEW_ID, state: { status: 'starting', running: false, pid: 5 } })], fresh, starting],
+    ]) {
+        const { availability, limitsState } = statusOf(f, states, offset);
+        assert.deepEqual({ availability, limitsState }, expected, label);
+    }
+    // The stale entry's own limits belong to the earlier container and are not shown for the new one.
+    assert.equal(statusOf(f, [engineEntry({ limits: { cpus: 9 } })], stale).limits, null);
+});

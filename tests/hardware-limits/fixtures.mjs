@@ -497,6 +497,7 @@ export function buildRequiredCaseManifest() {
             ...llRamIds(),
         ]),
         ...leaves(P, 'p2', unit('hardwareLimitsRoutes.test.mjs'), [
+            'S1.a-stale-snapshot-never-reports-a-just-recreated-instance-as-stopped-or-unavailable',
             'E.apply-outbound', 'E.apply-inbound', 'E.http-cause',
             'R.anonymous', 'R.nonadmin', 'R.guest', 'R.admin', 'R.origin', 'R.csrf', 'R.cross-session-csrf',
             'R.bearer-get', 'R.bearer-set', 'R.bearer-clear', 'R.bearer-apply', 'R.duplicate-authorization',
