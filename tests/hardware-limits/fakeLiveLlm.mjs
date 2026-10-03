@@ -189,7 +189,7 @@ export function createLlmWorld({ statePath, node, engine, host, gpu, faults = {}
                 // `installProgressForever` never finishes.
                 const quietPolls = faults.installNoBytesPolls || 0;
                 const progressed = L.install.polls - quietPolls;
-                if (L.install.polls <= quietPolls) { /* no bytes reported yet */ }
+                if (L.install.polls <= quietPolls) L.install.download = null; // no bytes reported yet
                 else if ((faults.installProgressPolls && progressed <= faults.installProgressPolls) || faults.installProgressForever) L.install.download = { bytes: Math.floor(total * progressed / ((faults.installProgressPolls ?? 1_000_000) + 1)), total, rate: 1000 };
                 else if (faults.installError && L.install.polls >= 2) { L.install.phase = 'error'; L.install.error = 'Installing vllm failed: no matching distribution found for torch (cp313)'; }
                 else if (faults.installPaused && L.install.polls >= 2) { L.install.phase = 'paused'; L.install.pausedReason = 'Not enough free disk to continue the download.'; }
