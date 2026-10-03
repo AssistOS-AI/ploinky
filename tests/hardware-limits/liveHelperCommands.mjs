@@ -16,6 +16,24 @@ export const HELPER_LEAF_PARENT = '/ploinky/system';
 
 // Runs inside the Box. argv[1] is one JSON object:
 //   { root, cgroupRoot, mode: 'real'|'delayed', routerPort, containerName, repoName, agentName, image, delayed: { bytes, delayMs } }
+// The generation lease of the fixture agent's exact owner and the topology intent over it, as the product's own
+// prepareGeneratedRouterAttestation builds them (cli/sandbox/docker/agentServiceManager.js). It reads the active edge generation, so the exec
+// environment must be the one the core compiled it in: the lease compares the generation's physical media port with PLOINKY_MEDIA_HOST_PORT
+// (cli/sandbox/edgeGeneration.js loadActiveEdgeRoutingGeneration) and the intent's public authority is built from the Router port. Kept as its own
+// text so that a test runs these exact statements against the real product modules.
+export const LEASE_AND_INTENT_SOURCE = String.raw`
+const leaseAndIntent = ({ edge, attestation, identity }, params, record, plan) => {
+  const principal = identity.deriveAgentPrincipalId(params.repoName, params.agentName);
+  const lease = edge.createRouterAttestationGenerationLease({ expectedOwner: { containerName: params.containerName, principal, instanceId: record.instanceId, enableGeneration: record.enableGeneration } });
+  const topology = edge.edgeRuntimeEnvironment('default');
+  const intent = attestation.buildRouterAuthorityTopologyIntent({
+    networkMode: plan.mode, runtimeProof: plan.runtimeProof, networkFingerprint: plan.networkFingerprint, runtimeKind: 'container',
+    edgeTopologyFile: topology.PLOINKY_EDGE_TOPOLOGY_FILE, authRouteKey: lease.snapshot?.routing?.static?.agent, routerHostPort: Number(params.routerPort),
+  });
+  return { lease, intent };
+};
+`;
+
 export const AUTHORITY_HELPER_PROGRAM = String.raw`
 import fs from 'node:fs';
 import path from 'node:path';
@@ -34,15 +52,10 @@ const [lifecycle, edge, attestation, delegation, requested, registryModule, grap
 ]);
 const record = registryModule.readAgentRegistrySnapshot()[params.containerName];
 if (!record || !record.instanceId || !record.enableGeneration) throw new Error('The fixture agent has no exact registry record');
-const principal = identity.deriveAgentPrincipalId(params.repoName, params.agentName);
 const adapter = lifecycle.createNetworkLifecycleAdapter({ runtime: 'podman' });
 const plan = adapter.prepare({ mode: 'default' }, params.agentName, { instanceKey: graph.effectiveInstanceKey(params.repoName, params.agentName, record.alias || '') });
-const lease = edge.createRouterAttestationGenerationLease({ expectedOwner: { containerName: params.containerName, principal, instanceId: record.instanceId, enableGeneration: record.enableGeneration } });
-const topology = edge.edgeRuntimeEnvironment('default');
-const intent = attestation.buildRouterAuthorityTopologyIntent({
-  networkMode: plan.mode, runtimeProof: plan.runtimeProof, networkFingerprint: plan.networkFingerprint, runtimeKind: 'container',
-  edgeTopologyFile: topology.PLOINKY_EDGE_TOPOLOGY_FILE, authRouteKey: lease.snapshot?.routing?.static?.agent, routerHostPort: Number(params.routerPort),
-});
+${LEASE_AND_INTENT_SOURCE}
+const { lease, intent } = leaseAndIntent({ edge, attestation, identity }, params, record, plan);
 const placement = delegation.authorityHelperPlacementFromContext(requested.captureHardwareContext({ insideBox: hardwareState.isInsideBox(), runtimeKind: 'container' }));
 // The product's own probe runs unchanged. In delayed mode only the helper's probe exec gets a prefix that allocates and touches memory
 // late; the exec still returns the probe's own output, once the process has exited.
@@ -98,9 +111,15 @@ process.stdout.write(JSON.stringify({
 }));
 `;
 
-// The exec argv that runs the program inside the owned Box as the Box user, in the workspace, with the run's Router port.
-export function helperProgramArgv({ boxId, workspace, routerPort, params }) {
-    return ['container', 'exec', '--user', 'podman', '--workdir', workspace, '--env', `PLOINKY_ROUTER_HOST_PORT=${routerPort}`, boxId,
+// The exec argv that runs the program inside the owned Box as the Box user, in the workspace, with the run's Router port AND media port: the
+// product's own exec paths pass both (ploinky-box/command/execute.mjs), and the active edge generation was compiled with the Box's published UDP port.
+const portText = (value, what) => {
+    if (!Number.isInteger(value) || value < 1 || value > 65535) throw new Error(`The ${what} must be a port number`);
+    return String(value);
+};
+export function helperProgramArgv({ boxId, workspace, routerPort, mediaPort, params }) {
+    return ['container', 'exec', '--user', 'podman', '--workdir', workspace,
+        '--env', `PLOINKY_ROUTER_HOST_PORT=${portText(routerPort, 'Router port')}`, '--env', `PLOINKY_MEDIA_HOST_PORT=${portText(mediaPort, 'media port')}`, boxId,
         'node', '--input-type=module', '-e', AUTHORITY_HELPER_PROGRAM, JSON.stringify(params)];
 }
 
@@ -110,10 +129,25 @@ const bytesOf = (text, label) => {
     if (!Number.isSafeInteger(value) || value <= 0) throw failure(`The helper ${label} is missing or not a positive integer (${JSON.stringify(String(text ?? '').slice(0, 40))})`);
     return value;
 };
+// The product's attestation retries when a probe's observation expired, up to this many attempts (routerAuthorityAttestation.js
+// ROUTER_AUTHORITY_ATTESTATION_MAX_ATTEMPTS); every attempt creates its own helper and runs the probe once. The observation seam runs only
+// after a probe whose observation was consumed, so exactly one 'observe' and one 'sample' exist, and the lifecycle of THAT attempt is its last one.
+export const ATTESTATION_MAX_ATTEMPTS = 3;
+const eventsNamed = (value, name) => (Array.isArray(value.events) ? value.events.filter(event => event?.name === name) : []);
+const ATTEMPT_STEPS = Object.freeze(['register', 'probe-exec-begin', 'probe-exec-end', 'consume']);
 const eventAt = (value, name) => {
-    const found = value.events?.filter(event => event.name === name) ?? [];
+    const found = eventsNamed(value, name);
     if (found.length !== 1 || !Number.isSafeInteger(found[0].atUs)) throw failure(`The helper observation has ${found.length} '${name}' events instead of exactly one`);
     return found[0].atUs;
+};
+// How many attestation attempts the program made: one registration, one probe exec and one consumption each.
+const attemptsOf = value => {
+    const attempts = eventsNamed(value, 'register').length;
+    for (const name of ['probe-exec-begin', 'probe-exec-end', 'consume']) {
+        if (eventsNamed(value, name).length !== attempts) throw failure(`The helper observation has ${eventsNamed(value, name).length} '${name}' events for ${attempts} attestation attempts`);
+    }
+    if (attempts < 1 || attempts > ATTESTATION_MAX_ATTEMPTS) throw failure(`The attestation made ${attempts} attempts; the product makes between 1 and ${ATTESTATION_MAX_ATTEMPTS}`);
+    return attempts;
 };
 
 // One helper observation: real attestation success, the immutable helper identity, the exact lifecycle order (the seam runs after the probe
@@ -125,17 +159,24 @@ export function assertHelperObservation(value, { mode = 'real' } = {}) {
     if (!Array.isArray(value.external) || value.external.length !== 2 || value.external.some(entry => !Number.isInteger(entry?.status))) throw failure('The probe did not produce exactly two observations');
     const observed = value.observed;
     if (!observed || observed.helperId !== value.helper.id) throw failure('The post-probe observation was not made for the attested helper');
-    const begin = eventAt(value, 'probe-exec-begin'); const end = eventAt(value, 'probe-exec-end');
-    const consume = eventAt(value, 'consume'); const observe = eventAt(value, 'observe'); const sample = eventAt(value, 'sample');
-    const register = eventAt(value, 'register');
+    const attempts = attemptsOf(value);
+    const observe = eventAt(value, 'observe'); const sample = eventAt(value, 'sample');
+    // The lifecycle is the product's: per attempt a registration, the probe exec (begin, end) and a consumption, then the seam once.
+    const sequence = value.events.map(event => event?.name);
+    const expected = [...Array(attempts).fill(ATTEMPT_STEPS).flat(), 'observe', 'sample'];
+    if (JSON.stringify(sequence) !== JSON.stringify(expected)) throw failure(`The helper was sampled out of order: the events ${JSON.stringify(sequence)} are not the product's lifecycle ${JSON.stringify(expected)}`);
+    const times = value.events.map(event => event.atUs);
+    if (times.some((at, index) => !Number.isSafeInteger(at) || (index > 0 && at < times[index - 1]))) throw failure('The helper was sampled out of order: the events are not in time order');
+    // The attempt that counts is the last one: the four events before the seam.
+    const [register, begin, end, consume] = value.events.slice(-6, -2).map(event => event.atUs);
     if (!(register <= begin && begin <= end && end <= consume && consume <= observe && observe <= sample)) throw failure('The helper was sampled out of order: the post-probe seam must run after the probe exec ended and its observation was consumed');
-    if (value.events.find(event => event.name === 'probe-exec-end')?.status !== 0) throw failure('The probe exec did not end successfully');
+    if (value.events.at(-4).status !== 0) throw failure('The probe exec did not end successfully');
     if (observed.placement !== 'enforced') throw failure(`The helper was not placed in the delegated hierarchy (placement: ${observed.placement}); its peak is not the enforced helper's`);
     if (!observed.leaf) throw failure(`The helper has no leaf under ${HELPER_LEAF_PARENT}${observed.leafError ? ` (${observed.leafError})` : ''}; its peak cannot be measured`);
     const peak = bytesOf(observed.memoryPeak, 'memory.peak'); const max = bytesOf(observed.memoryMax, 'memory.max');
     if (max !== HELPER_MEMORY_BYTES) throw failure(`The helper memory.max is ${max}, not the recorded ${HELPER_MEMORY_BYTES} (64m)`);
     if (peak > max) throw failure('The helper memory.peak exceeds its own memory.max');
-    return Object.freeze({ peakBytes: peak, maxBytes: max, begin, end, observe, sample });
+    return Object.freeze({ peakBytes: peak, maxBytes: max, begin, end, observe, sample, attempts });
 }
 
 // The real probe: the final memory.peak is at most 48 MiB for the 64m helper. A larger need is a reviewed redesign (128m with 96 MiB), never a silent increase.
@@ -160,5 +201,5 @@ export function assertDelayedSamplingOrder(delayed, real) {
     if (facts.peakBytes < baseline.peakBytes + DELAYED_ALLOCATION.minPeakIncreaseBytes) {
         throw failure(`The delayed probe's peak ${facts.peakBytes} does not carry its late allocation (the real peak ${baseline.peakBytes} plus ${DELAYED_ALLOCATION.minPeakIncreaseBytes}): the sample was taken before the allocation, or the peak is not the final one`);
     }
-    return Object.freeze({ delayedPeakBytes: facts.peakBytes, realPeakBytes: baseline.peakBytes, execMs: (facts.end - facts.begin) / 1000 });
+    return Object.freeze({ delayedPeakBytes: facts.peakBytes, realPeakBytes: baseline.peakBytes, execMs: (facts.end - facts.begin) / 1000, attempts: facts.attempts });
 }

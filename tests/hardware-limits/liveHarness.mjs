@@ -531,7 +531,7 @@ export function createLiveAdapter(profile, {
                 root: '/opt/ploinky', cgroupRoot: '/sys/fs/cgroup', mode, routerPort: run.ports.tcp, containerName: agentContainerName(agent), repoName: FIXTURE_REPOSITORY,
                 agentName: agent.role, image: profile.provision.image, ...(mode === 'delayed' ? { delayed: { bytes: DELAYED_ALLOCATION.bytes, delayMs: DELAYED_ALLOCATION.delayMs } } : {}),
             };
-            const result = await engine(`authority-helper-${mode}`, helperProgramArgv({ boxId: profile.box.id, workspace: profile.workspace.path, routerPort: run.ports.tcp, params }),
+            const result = await engine(`authority-helper-${mode}`, helperProgramArgv({ boxId: profile.box.id, workspace: profile.workspace.path, routerPort: run.ports.tcp, mediaPort: run.ports.udp, params }),
                 { deadlineMs: 120000, tolerate: true, capture: `authority-helper-${mode}-output` });
             let value = null;
             if (cleanlyFinished(result) && result.status === 0) { try { value = JSON.parse(result.stdout); } catch { value = null; } }

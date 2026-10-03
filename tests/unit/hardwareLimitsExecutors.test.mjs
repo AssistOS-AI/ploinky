@@ -184,9 +184,15 @@ import {
 const MiB = 1024 * 1024;
 const HELPER_ID = 'd'.repeat(64);
 // A helper observation as the in-Box program writes it: lifecycle events in microseconds, the leaf readings, the attested helper.
-function observation({ mode = 'real', peak = 30 * MiB, max = HELPER_MEMORY_BYTES, placement = 'enforced', leaf = `libpod-${HELPER_ID}`, order = null, execMs = 120, attestation = `sha256:${'e'.repeat(64)}`, helperId = HELPER_ID, external = [{ host: 'a', status: 401 }, { host: 'b', status: 421 }], delayed = mode === 'delayed' } = {}) {
+function observation({ mode = 'real', peak = 30 * MiB, max = HELPER_MEMORY_BYTES, placement = 'enforced', leaf = `libpod-${HELPER_ID}`, order = null, execMs = 120, attestation = `sha256:${'e'.repeat(64)}`, helperId = HELPER_ID, external = [{ host: 'a', status: 401 }, { host: 'b', status: 421 }], delayed = mode === 'delayed', attempts = 1, firstStatus = 0 } = {}) {
     const base = 1_000_000;
+    // An expired attempt: its registration, probe exec and consumption are recorded, then the next attempt starts; only the last one reaches the seam.
+    const earlier = Array.from({ length: attempts - 1 }, (_, index) => [
+        { name: 'register', atUs: base - 1000 * (attempts - index) }, { name: 'probe-exec-begin', atUs: base - 1000 * (attempts - index) + 1 },
+        { name: 'probe-exec-end', atUs: base - 1000 * (attempts - index) + 2, status: index === 0 ? firstStatus : 0 }, { name: 'consume', atUs: base - 1000 * (attempts - index) + 3 },
+    ]).flat();
     const events = order || [
+        ...earlier,
         { name: 'register', atUs: base }, { name: 'probe-exec-begin', atUs: base + 10 }, { name: 'probe-exec-end', atUs: base + 10 + execMs * 1000, status: 0 },
         { name: 'consume', atUs: base + 20 + execMs * 1000 }, { name: 'observe', atUs: base + 30 + execMs * 1000, helperId, placement }, { name: 'sample', atUs: base + 40 + execMs * 1000 },
     ];
@@ -334,14 +340,14 @@ test('X4.c6-the-program-fails-closed-without-a-registry-record-an-unplaced-helpe
     const value = JSON.parse(runProgram(noLeaf, 'real').stdout);
     assert.equal(value.observed.leaf, null); assert.throws(() => assertRealHelperPeak(value), /has no leaf under/);
     // The program's argv carries every manifest value as one JSON argument, never as source text.
-    const argv = helperProgramArgv({ boxId: 'b'.repeat(64), workspace: '/ws', routerPort: 23456, params: { mode: 'real', root: '/opt/ploinky' } });
-    assert.deepEqual(argv.slice(0, 8), ['container', 'exec', '--user', 'podman', '--workdir', '/ws', '--env', 'PLOINKY_ROUTER_HOST_PORT=23456']);
+    const argv = helperProgramArgv({ boxId: 'b'.repeat(64), workspace: '/ws', routerPort: 23456, mediaPort: 34567, params: { mode: 'real', root: '/opt/ploinky' } });
+    assert.deepEqual(argv.slice(0, 11), ['container', 'exec', '--user', 'podman', '--workdir', '/ws', '--env', 'PLOINKY_ROUTER_HOST_PORT=23456', '--env', 'PLOINKY_MEDIA_HOST_PORT=34567', 'b'.repeat(64)]);
     assert.equal(argv.at(-2), AUTHORITY_HELPER_PROGRAM); assert.equal(JSON.parse(argv.at(-1)).mode, 'real');
     assert.equal(AUTHORITY_HELPER_PROGRAM.includes('23456'), false);
 });
 
 // A provisioned apparatus-authority run whose in-Box program answers are scripted: the executor, its persistence and its cleanup.
-async function liveC6(t, { real = observation(), delayed = delayedObservation(), left = '', failProgram = null, calls = [] } = {}) {
+async function liveC6(t, { real = observation(), delayed = delayedObservation(), left = '', failProgram = null, calls = [], execs = [] } = {}) {
     const patch = { pid: 123, startedAt: '2026-10-02T00:02:00Z', conmonPid: 456, memory: 67108864, memorySwap: 67108864, pidsLimit: 64, nanoCpus: 500000000 };
     const w = world(t, { block: 'apparatus-authority', faults: { 'agent-inspect': { patch } } });
     const report = await provision(w);
@@ -349,7 +355,7 @@ async function liveC6(t, { real = observation(), delayed = delayedObservation(),
     const artifacts = new Map();
     const provider = async (binary, args, options) => {
         if (args.includes(AUTHORITY_HELPER_PROGRAM)) {
-            const mode = JSON.parse(args.at(-1)).mode; calls.push(mode);
+            const mode = JSON.parse(args.at(-1)).mode; calls.push(mode); execs.push(args);
             if (failProgram === mode) return { ...ok(''), status: 1, stderr: 'Error: no exact registry record\nPLOINKY_MASTER_KEY=hunter2hunter2' };
             return ok(JSON.stringify(mode === 'real' ? real : delayed));
         }
@@ -361,9 +367,17 @@ async function liveC6(t, { real = observation(), delayed = delayedObservation(),
 }
 
 test('X4.c6-the-executor-runs-the-real-and-the-delayed-probe-persists-both-and-passes-only-when-every-condition-holds', async t => {
-    const pass = await liveC6(t);
+    const execs = [];
+    const pass = await liveC6(t, { execs });
+    pass.execs = execs;
     assert.equal(pass.row.result, 'pass', JSON.stringify(pass.row)); assert.equal(pass.live.verdict, 'PASS'); assert.equal(pass.live.cleanup.state, 'complete');
     assert.deepEqual(pass.calls, ['real', 'delayed', 'cleanup-proof']);
+    // Both exec calls carry the Router port AND the media port of the run: the active edge generation was compiled with the Box's published UDP port.
+    assert.equal(pass.execs.length, 2);
+    for (const args of pass.execs) {
+        const env = args.flatMap((value, index) => (args[index - 1] === '--env' ? [value] : []));
+        assert.deepEqual(env, ['PLOINKY_ROUTER_HOST_PORT=23456', 'PLOINKY_MEDIA_HOST_PORT=34567']);
+    }
     assert.equal(pass.row.evidence.real.helperId, HELPER_ID); assert.equal(pass.row.evidence.real.peakBytes, 30 * MiB); assert.deepEqual(pass.row.evidence.helperRemaining, []);
     assert.ok(pass.artifacts.has('authority-helper-real') && pass.artifacts.has('authority-helper-delayed') && pass.artifacts.has('authority-helper-cleanup'));
     assert.deepEqual(Object.keys(worldState(pass.w.statePath).boxes), [], 'the owned Box is destroyed by the cleanup');
@@ -389,6 +403,11 @@ test('X4.c6-manifest-and-summary-show-the-program-the-bounds-and-the-guard-and-e
     assert.deepEqual(w.run.target.execution.cases, ['LIVE-C6']); assert.deepEqual(w.run.target.execution.provision.agents.map(agent => agent.role), ['memory']);
     const ids = w.run.target.plan.live.map(step => step.id);
     assert.deepEqual(ids, ['C6-helper-real', 'C6-helper-delayed', 'C6-helper-cleanup-proof']);
+    for (const id of ['C6-helper-real', 'C6-helper-delayed']) {
+        const argv = w.run.target.plan.live.find(step => step.id === id).argv;
+        const env = argv.flatMap((value, index) => (argv[index - 1] === '--env' ? [value] : []));
+        assert.deepEqual(env, [`PLOINKY_ROUTER_HOST_PORT=${w.run.ports.tcp}`, `PLOINKY_MEDIA_HOST_PORT=${w.run.ports.udp}`], id);
+    }
     const summary = renderSummary(w.run, w.runPath);
     for (const text of ['spec 15.4 LIVE-C6 (:1327)', 'at most 48 MiB for 64m', '128m with at most 96 MiB', 'local-llm'].slice(0, 3)) assert.ok(summary.includes(text), text);
     const programDigest = crypto.createHash('sha256').update(AUTHORITY_HELPER_PROGRAM).digest('hex');
@@ -449,4 +468,57 @@ test('R21.the-box-contract-observation-is-planned-shown-and-uses-parser-clean-re
     assert.ok(ids.indexOf('box-inspect') < ids.indexOf('box-contract') && ids.indexOf('box-contract') < ids.findIndex(id => id.startsWith('agent-inspect')), ids.join(','));
     const summary = renderSummary(w.run, w.runPath);
     assert.ok(summary.includes('box-contract') && summary.includes('<BOX_CONTRACT_FORMAT>') && !summary.includes('HostConfig.Privileged'), 'the long template is named, never printed');
+});
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// R23-1: the attestation's retries, and the exec's ports.
+test('X4.c6-an-expired-attempt-that-the-product-retried-is-counted-and-the-last-successful-attempt-is-judged', () => {
+    const facts = assertRealHelperPeak(observation({ attempts: 2 }));
+    assert.equal(facts.attempts, 2); assert.equal(assertRealHelperPeak(observation({ attempts: 3 })).attempts, 3); assert.equal(assertRealHelperPeak(observation()).attempts, 1);
+    // The delayed run judges its own last attempt too, and the attempts of both runs are evidence.
+    assert.equal(assertDelayedSamplingOrder(delayedObservation({ attempts: 2 }), observation({ attempts: 2 })).execMs >= DELAYED_ALLOCATION.delayMs, true);
+    // More attempts than the product makes, or an attempt with a missing step, is not a lifecycle the product produces.
+    assert.throws(() => assertHelperObservation(observation({ attempts: 4 })), /made 4 attempts; the product makes between 1 and 3/);
+    const missingConsume = observation({ attempts: 2 }); missingConsume.events.splice(missingConsume.events.findIndex(event => event.name === 'consume'), 1);
+    assert.throws(() => assertHelperObservation(missingConsume), /'consume' events for 2 attestation attempts/);
+    const noAttempt = observation(); noAttempt.events = noAttempt.events.filter(event => event.name === 'observe' || event.name === 'sample');
+    assert.throws(() => assertHelperObservation(noAttempt), /made 0 attempts/);
+    // Only the seam's own events are exactly-once: two observations or two samples are never produced.
+    for (const name of ['observe', 'sample']) { const doubled = observation({ attempts: 2 }); doubled.events.push({ ...doubled.events.find(event => event.name === name) }); assert.throws(() => assertHelperObservation(doubled), new RegExp(`2 '${name}' events instead of exactly one`)); }
+    // The exec status that counts is the last attempt's: an earlier expired attempt may have ended with any status, the last may not.
+    assert.doesNotThrow(() => assertRealHelperPeak(observation({ attempts: 2, firstStatus: 1 })));
+    const lastFailed = observation({ attempts: 2 }); lastFailed.events.filter(event => event.name === 'probe-exec-end').at(-1).status = 1;
+    assert.throws(() => assertHelperObservation(lastFailed), /did not end successfully/);
+    // The lifecycle is the product's sequence: names in another order are refused even when their times ascend, and so is a retried attempt that
+    // ended after the next one began.
+    const swapped = observation({ attempts: 2 });
+    const [endAt, consumeAt] = [swapped.events.length - 4, swapped.events.length - 3];
+    [swapped.events[endAt].name, swapped.events[consumeAt].name] = [swapped.events[consumeAt].name, swapped.events[endAt].name];
+    assert.throws(() => assertHelperObservation(swapped), /are not the product's lifecycle/);
+    const overlapping = observation({ attempts: 2 }); overlapping.events[3].atUs = overlapping.events.at(-6).atUs + 1;
+    assert.throws(() => assertHelperObservation(overlapping), /events are not in time order/);
+    // The order that counts is the last attempt's, and the events are in time order.
+    const reordered = observation({ attempts: 2 }); const lastRegister = reordered.events.filter(event => event.name === 'register').at(-1); lastRegister.atUs = reordered.events.find(event => event.name === 'observe').atUs + 5;
+    assert.throws(() => assertHelperObservation(reordered), /sampled out of order/);
+});
+
+test('X4.c6-the-executor-persists-the-attempts-of-both-runs-and-passes-a-retried-success', async t => {
+    const retried = await liveC6(t, { real: observation({ attempts: 2 }), delayed: delayedObservation({ attempts: 3 }) });
+    assert.equal(retried.row.result, 'pass', JSON.stringify(retried.row).slice(0, 400));
+    assert.equal(retried.row.evidence.real.attempts, 2); assert.equal(retried.row.evidence.delayed.attempts, 3);
+    const tooMany = await liveC6(t, { real: observation({ attempts: 4 }) });
+    assert.equal(tooMany.row.result, 'fail'); assert.match(tooMany.row.reason, /made 4 attempts/);
+});
+
+test('X4.c6-the-argv-carries-both-ports-as-valid-port-numbers-in-one-env-pair-each', () => {
+    const base = { boxId: 'b'.repeat(64), workspace: '/ws', params: { mode: 'real' } };
+    const argv = helperProgramArgv({ ...base, routerPort: 23456, mediaPort: 34567 });
+    const envPairs = argv.flatMap((value, index) => (argv[index - 1] === '--env' ? [value] : []));
+    assert.deepEqual(envPairs, ['PLOINKY_ROUTER_HOST_PORT=23456', 'PLOINKY_MEDIA_HOST_PORT=34567']);
+    for (const bad of [undefined, 0, 70000, 1.5, '34567', null]) {
+        assert.throws(() => helperProgramArgv({ ...base, routerPort: 23456, mediaPort: bad }), /media port must be a port number/, String(bad));
+        assert.throws(() => helperProgramArgv({ ...base, routerPort: bad, mediaPort: 34567 }), /Router port must be a port number/, String(bad));
+    }
+    // The real parser accepts the planned exec as a Box exec (it is an engine command, never a candidate command line).
+    assert.equal(argv[0], 'container'); assert.equal(argv.includes('--user'), true);
 });
