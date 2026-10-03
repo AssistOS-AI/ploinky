@@ -17,7 +17,7 @@ import { assertBoxWorkspaceRoot } from '../../ploinky-box/contract/workspace-roo
 import { EXIT } from './fixtures.mjs';
 import {
     AGENT_INSPECT, ID, IMAGE_REF, INSPECT, OWNER_MARKER, absolute, blocked, candidateEnv, checkedJson, digest,
-    HOST_RECORD_DIRECTORIES, hostRecordPaths, jsonDigest, keys, liveSourceDigest, observeEngineIdentity, workspaceSocketProblem,
+    HOST_RECORD_DIRECTORIES, assertNoForeignWorkspace, foreignGuardInput, hostRecordPaths, jsonDigest, keys, liveSourceDigest, observeEngineIdentity, workspaceSocketProblem,
 } from './liveCommon.mjs';
 import { runBoundedProcess } from './liveProcess.mjs';
 import { createJournal, recordHostRecords, runOwnedCleanup } from './liveCleanup.mjs';
@@ -194,6 +194,8 @@ export async function provisionRun({
         profile = validateProfile(run, { partial: true });
         if (profile.workspace || profile.box || profile.agents.length || !profile.provision) throw new Error('Provisioning needs an unprovisioned execution profile');
         validateProvisionPlan(profile.provision, run);
+        // The foreign-workspace guard (plan C7): before any host, port or engine touch.
+        assertNoForeignWorkspace(foreignGuardInput(run, profile));
         if (!Number.isInteger(run.ports.tcp) || !Number.isInteger(run.ports.udp) || run.ports.tcp === run.ports.udp
             || [run.ports.tcp, run.ports.udp].some(port => port < 1024 || port > 65535)) throw new Error('Provisioning needs separate selected TCP and UDP ports');
         // A locally created workspace sits under the pinned parent root; the

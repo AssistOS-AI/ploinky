@@ -6,7 +6,8 @@
 //   baseline      run scoped existing suites against the baseline staging copies
 //   offline       run one phase's required tests and affected regressions
 //   prepare-live  write a proposed run manifest for one live block (no engine
-//                 or SSH); mac-cpu, apparatus-cpu, apparatus-mps, apparatus-local-llm and
+//                 or SSH); mac-cpu, apparatus-cpu, apparatus-core, apparatus-authority,
+//                 apparatus-mps, apparatus-local-llm and
 //                 apparatus-vllm (--stage calibration|qualified, and --calibration-evidence for
 //                 the second stage) get concrete
 //                 pins and a human approval summary beside the manifest. A mac block's
@@ -28,7 +29,8 @@ import { spawnSync } from 'node:child_process';
 import { runBoundedProcess } from './liveProcess.mjs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { runLiveCommand, LIVE_CASES, UNSUPPORTED, validateProfile } from './liveHarness.mjs';
-import { liveSourceDigest, workspaceSocketProblem } from './liveCommon.mjs';
+import { foreignWorkspaceProblem, liveSourceDigest, workspaceSocketProblem } from './liveCommon.mjs';
+import { proposedWorkspaceIdentity } from './liveFixture.mjs';
 import { CONCRETE_BLOCKS, buildConcreteManifest, explorerFixtureImage, proposedWorkspace, renderSummary, selectPorts, summaryPathFor, validatePins } from './liveManifest.mjs';
 import { LLM_SOURCE_DIRECTORY } from './liveLlmNames.mjs';
 import { validateStage, writeUstar } from './liveStage.mjs';
@@ -865,6 +867,15 @@ async function prepareLive(options) {
         // for the CLI's Unix sockets (pins.workspaceParentRoot selects it).
         const socketProblem = workspaceSocketProblem(proposedWorkspace(block, pins, runId).path);
         if (socketProblem) { console.error(`[prepare-live] BLOCKED: ${socketProblem}`); return EXIT.BLOCKED; }
+        // The foreign-workspace guard (plan C7): the proposed workspace, the evidence root, the candidate and the working directory
+        // must not sit under the other session's directories, and the derived Box name must not be theirs.
+        const proposed = proposedWorkspace(block, pins, runId);
+        const foreign = foreignWorkspaceProblem({
+            homes: [pins.host.home, process.env.HOME, os.homedir()],
+            paths: [proposed.path, proposed.parent, config.evidenceRoot, config.repos.ploinky.candidateRoot, process.cwd()],
+            names: [proposedWorkspaceIdentity(proposed.path).instance],
+        });
+        if (foreign) { console.error(`[prepare-live] BLOCKED: ${foreign}`); return EXIT.BLOCKED; }
         const candidate = buildFrozenCandidate(config, runId, { llm: Boolean(CONCRETE_BLOCKS[block].llm) });
         const vllm = CONCRETE_BLOCKS[block].vllm ? await vllmStage(options, candidate) : null;
         if (CONCRETE_BLOCKS[block].remote) {

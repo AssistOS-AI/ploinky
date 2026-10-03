@@ -19,6 +19,7 @@ import { gpuQueryArgv } from './liveGpuGate.mjs';
 import {
     ADMIN_REQUEST, GPU_SHARES, MPS_CLIENT_PIPE, PROBE_FILE, TIGHTER_CLIENT, controlHelperRunArgv, probeBoundMiB, probeExecArgv, shareMemoryMiB,
 } from './liveGpuCommands.mjs';
+import { AUTHORITY_HELPER_PROGRAM, DELAYED_ALLOCATION } from './liveHelperCommands.mjs';
 import { remoteRoot, remoteReportName } from './liveStage.mjs';
 import { DOCUMENT_SUFFIXES, GPU_TOLERATED_MAX, GPU_TOLERATED_MAX_MIB } from './fixtures.mjs';
 import { sshOptions } from './liveRemote.mjs';
@@ -26,12 +27,40 @@ import { sshOptions } from './liveRemote.mjs';
 export const CONCRETE_BLOCKS = Object.freeze({
     'mac-cpu': { platform: 'darwin', remote: false, cases: ['LIVE-C1', 'LIVE-C2'] },
     'apparatus-cpu': { platform: 'linux', remote: true, cases: ['LIVE-A1'] },
+    // C1 and C2 on native Linux (release plan C8b): the same owned CPU fixture and executors as mac-cpu, on the apparatus.
+    'apparatus-core': { platform: 'linux', remote: true, cases: ['LIVE-C1', 'LIVE-C2'] },
+    // C6: the Router authority helper's post-probe peak, measured through the product's observation seam (inside the owned Box).
+    'apparatus-authority': { platform: 'linux', remote: true, cases: ['LIVE-C6'] },
     'apparatus-mps': { platform: 'linux', remote: true, cases: ['LIVE-P1', 'LIVE-P2', 'LIVE-P3', 'LIVE-P4'], gpu: true },
     // The local-llm candidate in its own owned workspace, behind the same idle gate: budgets and a llama.cpp
     // model (L1, L2), and vLLM under an MPS share in two stages (L3).
     'apparatus-local-llm': { platform: 'linux', remote: true, cases: ['LIVE-L1', 'LIVE-L2'], gpu: true, llm: true },
     'apparatus-vllm': { platform: 'linux', remote: true, cases: ['LIVE-L3'], gpu: true, llm: true, vllm: true },
 });
+// The pass condition of each executor case, copied from the spec's section 15.4 row (and its amendment) without weakening, so the
+// approver sees exactly what a PASS means. `row` names the spec line; `procedure` is what the runner does; `passes` the observable
+// artifact; `evidence` the files the case writes. The summary prints every selected case that has an entry.
+export const CASE_PASS_CONDITIONS = Object.freeze({
+    'LIVE-C1': {
+        row: 'spec 15.4 LIVE-C1 (:1322) with amendment A4',
+        procedure: 'The owned CPU fixture (memory, cpu and pids agents, 64m/0.5 CPU/64 pids, readiness none) is started with the gate on and started again without the flag; the Box and workload cgroups and owners are inspected read-only (no write is ever attempted).',
+        passes: 'Saved gate on; PID 1 and the core exec under /ploinky/core; the cgroup root directory and its cgroup.procs, cgroup.subtree_control and cgroup.threads are owned by uid 0 (A4: every other present interface file at / is owned by uid 0 or by the Box runtime uid 1000, nothing else), /ploinky/core entirely uid 0, the delegated files and parents uid 1000; no aggregate cap; exact leaf values and conmon placement compatible with lifecycle and cleanup.',
+        evidence: 'core-layout observation in the run manifest; repeat-gate-on-start and repeat-saved-gate-start tails; nested-containers listings',
+    },
+    'LIVE-C2': {
+        row: 'spec 15.4 LIVE-C2 (:1323)',
+        procedure: 'Touched allocations above the leaf memory cap are made inside the memory agent while the leaf events are observed from outside the limited leaf; a bounded CPU burn and a process-count pressure run in the cpu and pids agents. The runner does not assume which process the kernel OOM kills.',
+        passes: 'memory.max=67108864; memory.swap.max=0; cpu.max=50000 100000 (the exact-integer comparison tolerates the engine truncating the quota by 1 microsecond); pids.max=64; the leaf oom_kill delta, the throttled delta and the pids max-event delta are all positive on the SAME leaf identity (dev and inode) as the container identity.',
+        evidence: 'per-agent same-leaf samples and post-exit samples',
+    },
+    'LIVE-C6': {
+        row: 'spec 15.4 LIVE-C6 (:1327)',
+        procedure: 'A reviewed fixed program runs inside the owned Box as the Box user through the product modules at /opt/ploinky: it prepares the fixture agent\'s exact managed-network plan, captures its exact edge generation lease and runs the product\'s own attestRouterAuthority and runContainerAuthorityProbe unchanged, adding only the post-probe/pre-cleanup observation seam. A first run is the real probe; a second run delays and allocates 16 MiB inside the helper\'s probe exec (after 2000 ms) to prove the sampling order. The program text is fixed in tests/hardware-limits/liveHelperCommands.mjs (sha256:' + crypto.createHash('sha256').update(AUTHORITY_HELPER_PROGRAM).digest('hex') + ').',
+        passes: 'Real attestation success (an attestation identity and exactly two observations); an immutable helper container and image ID; the helper is placed (placement enforced) in the delegated hierarchy and has memory.max=67108864 (64m); the post-probe observation runs after the probe exec ended and its observation was consumed, before cleanup; the real probe\'s final memory.peak is at most 48 MiB for 64m (otherwise the creation and the proof are updated together to 128m with at most 96 MiB in a reviewed change and a new candidate, never a silent increase); the delayed probe\'s peak carries its late allocation (the real peak plus at least 8 MiB) and its exec lasted at least the delay; no authority helper container remains afterwards.',
+        evidence: 'authority-helper-real and authority-helper-delayed artifacts (events with microsecond timestamps, helper identity, leaf readings), authority-helper-cleanup',
+    },
+});
+
 export const DEADLINES = Object.freeze({
     coreMs: 30000, startMs: 20 * 60 * 1000, destroyMs: 5 * 60 * 1000, fullGraphMs: 20 * 60 * 1000,
     modelLoadMs: 20 * 60 * 1000, cleanupMs: 5 * 60 * 1000, stagingMs: 10 * 60 * 1000, blockMs: 20 * 60 * 1000,
@@ -294,6 +323,11 @@ export function plannedCommands(run) {
         { id: `C2-${role}-pressure`, binary: engine, argv: [...nested, 'container', 'exec', `<${role.toUpperCase()}_AGENT_ID>`, 'node', '-e', `<${role.toUpperCase()}_PRESSURE>`], deadlineMs: 15000 },
         { id: `C2-${role}-observer`, binary: engine, argv: [...core, 'node', '-e', '<LEAF_OBSERVER>', '<VERIFIED_LEAF>'], deadlineMs: 5000 },
     );
+    if (profile.cases.includes('LIVE-C6')) live.push(
+        { id: 'C6-helper-real', binary: engine, argv: ['container', 'exec', '--user', 'podman', '--workdir', workspace, '--env', `PLOINKY_ROUTER_HOST_PORT=${run.ports.tcp}`, box, 'node', '--input-type=module', '-e', '<AUTHORITY_HELPER_PROGRAM>', '<PARAMS mode=real>'], deadlineMs: 120000, note: 'Runs the product\'s own attestation and helper probe once, with the post-probe observation seam; reads the helper leaf\'s memory.peak/max' },
+        { id: 'C6-helper-delayed', binary: engine, argv: ['container', 'exec', '--user', 'podman', '--workdir', workspace, '--env', `PLOINKY_ROUTER_HOST_PORT=${run.ports.tcp}`, box, 'node', '--input-type=module', '-e', '<AUTHORITY_HELPER_PROGRAM>', `<PARAMS mode=delayed bytes=${DELAYED_ALLOCATION.bytes} delayMs=${DELAYED_ALLOCATION.delayMs}>`], deadlineMs: 120000, note: 'The same run with an allocating, delayed probe exec to prove the sampling order' },
+        { id: 'C6-helper-cleanup-proof', binary: engine, argv: [...nested, 'container', 'ps', '--all', '--no-trunc', '--filter', 'label=io.assistos.ploinky.authority-helper', '--format', '{{.ID}}'], deadlineMs: run.deadlines.coreMs, note: 'No authority helper container remains' },
+    );
     if (profile.cases.includes('LIVE-A1')) live.push(
         { id: 'A1-held-allocation', binary: engine, argv: [...nested, 'container', 'exec', '<MEMORY_AGENT_ID>', 'node', '-e', '<HELD_ALLOCATION>', run.runId], deadlineMs: 25000 },
         { id: 'A1-handshake', binary: engine, argv: [...nested, 'container', 'exec', '<MEMORY_AGENT_ID>', 'node', '-e', '<ALLOCATION_HANDSHAKE>', run.runId, 'observe|release'], deadlineMs: 5000 },
@@ -543,6 +577,7 @@ export function renderSummary(run, manifestPath) {
         ...profile.cases.map(id => `| ${id} | executed |`),
         ...Object.entries(run.target.unsupported).map(([id, reason]) => `| ${id} | not run: ${reason} |`),
         '',
+        ...passConditionsSection(profile),
         '## Where',
         '',
         '| Item | Value |',
@@ -591,6 +626,25 @@ export function renderSummary(run, manifestPath) {
         '',
     ];
     return lines.filter(value => value !== null).join('\n');
+}
+
+// The pass conditions of the selected cases, from the spec rows (never weakened), with the guard every preflight applies.
+function passConditionsSection(profile) {
+    const entries = profile.cases.filter(id => CASE_PASS_CONDITIONS[id]);
+    if (!entries.length) return [];
+    const cell = value => String(value).replaceAll('|', '\\|');
+    return [
+        '## Pass conditions (the spec rows, unchanged)',
+        '',
+        '| Case | Spec row | Procedure | PASS requires | Evidence written |',
+        '| --- | --- | --- | --- | --- |',
+        ...entries.map(id => { const entry = CASE_PASS_CONDITIONS[id]; return `| ${id} | ${cell(entry.row)} | ${cell(entry.procedure)} | ${cell(entry.passes)} | ${cell(entry.evidence)} |`; }),
+        '',
+        '## Foreign-workspace guard',
+        '',
+        `Every preflight (prepare-live, provision, live and cleanup) aborts before any mutation when the workspace, the stage, the candidate or the working directory lies under \`~/work/testExplorerFresh\` or \`~/cleanup-repair-claude-20261002\` (the pinned home ${profile.host.home} and this process's own home are both checked, symlinks resolved), or when a derived Box name matches \`ploinky-box-testexplorerfresh-*\`. The other session's Box, workspace and records are never read, written or signalled.`,
+        '',
+    ];
 }
 
 // The extra approval sections of the GPU block: the idle-gate checks, every

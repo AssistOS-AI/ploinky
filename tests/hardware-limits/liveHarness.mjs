@@ -11,15 +11,16 @@ import { assertRemoteArrival } from './liveRemote.mjs';
 import {
     HASH, HOST_RECORD_DIRECTORIES, ID, INSPECT, MAX_NESTED_LISTED, NESTED_CONTAINER_INSPECT, NESTED_LIST_FORMAT, absolute, artifactPathFor, assertWorkspace,
     blocked, bounded, candidateEnv, checkedJson, commandTails, digest, hostRecordPaths, jsonDigest, keys, liveSourceDigest, nestedContainerEvidence,
-    observeEngineIdentity, receipt,
+    observeEngineIdentity, receipt, foreignGuardInput, foreignWorkspaceProblem,
 } from './liveCommon.mjs';
 import { recordHostRecords, runOwnedCleanup } from './liveCleanup.mjs';
-import { fixtureContainerName, provisionRun, validateProvisionPlan } from './liveFixture.mjs';
+import { FIXTURE_REPOSITORY, fixtureContainerName, provisionRun, validateProvisionPlan } from './liveFixture.mjs';
 import { stageAndDispatch } from './liveStage.mjs';
 import {
     CORE_LAYOUT, MEMBERSHIP as PROCESS_MEMBERSHIP, HELD_ALLOCATION, ALLOCATION_HANDSHAKE, LEAF_OBSERVATION, assertCoreLayout,
 } from './liveCaseCommands.mjs';
 import { createGpuCases } from './liveGpuCases.mjs';
+import { DELAYED_ALLOCATION, assertDelayedSamplingOrder, assertRealHelperPeak, helperProgramArgv } from './liveHelperCommands.mjs';
 import { validateGpuProfile } from './liveGpuCommands.mjs';
 import { createLlmCases, llmCleanupProof } from './liveLlmCases.mjs';
 import { validateLlmProfile } from './liveLlmCommands.mjs';
@@ -30,6 +31,8 @@ export const LIVE_CASES = Object.freeze({
     'mac-adversarial': ['LIVE-S1', 'LIVE-S2'],
     'mac-explorer': ['LIVE-X0', 'LIVE-X1'],
     'apparatus-cpu': ['LIVE-A1'],
+    'apparatus-core': ['LIVE-C1', 'LIVE-C2'],
+    'apparatus-authority': ['LIVE-C6'],
     'apparatus-mps': ['LIVE-P1', 'LIVE-P2', 'LIVE-P3', 'LIVE-P4'],
     'apparatus-local-llm': ['LIVE-L1', 'LIVE-L2'],
     'apparatus-vllm': ['LIVE-L3'],
@@ -38,7 +41,6 @@ export const UNSUPPORTED = Object.freeze({
     'LIVE-C3': 'Actual D4 graph, routing and asynchronous optional-child fixtures are not implemented.',
     'LIVE-C4': 'Actual stored-policy downgrade/no-mutation fixture is not implemented.',
     'LIVE-C5': 'Host/in-Box writer and barrier interleaving fixture is not implemented.',
-    'LIVE-C6': 'Live authority-helper post-probe observation fixture is not implemented.',
     'LIVE-C7': 'Host bind/GPU/reapply/rollback generation matrix is not implemented.',
     'LIVE-S1': 'Capable namespace attack fixture and ownership proof are not implemented.',
     'LIVE-S2': 'Guard-removal and reachability fixture is not implemented.',
@@ -512,6 +514,39 @@ export function createLiveAdapter(profile, {
         if (!pressureSamples.some(sample => counter(sample['memory.events'], 'oom_kill') > oomBaseline) && !post.samples.some(sample => counter(sample['memory.events'], 'oom_kill') > oomBaseline)) throw new Error('No same-leaf pressure OOM evidence');
         return { id: agent.id, leaf, receipt, before, aliveSamples, pressureSamples, postExitSamples: post.samples };
     }
+    // LIVE-C6 (spec 15.4 :1327): the Router authority helper through the product's post-probe/pre-cleanup seam. The reviewed program runs in
+    // the owned Box as the Box user, over the product modules the Box mounts at /opt/ploinky (liveHelperCommands.mjs). Every run's output is
+    // persisted as an artifact before anything is asserted.
+    async function helperCase() {
+        const agent = profile.agents.find(value => value.role === 'memory');
+        if (!agent) throw blocked('LIVE-C6 requires the owned fixture agent');
+        await inspectBox(); await inspectAgent(agent);
+        const runMode = async mode => {
+            const params = {
+                root: '/opt/ploinky', cgroupRoot: '/sys/fs/cgroup', mode, routerPort: run.ports.tcp, containerName: agentContainerName(agent), repoName: FIXTURE_REPOSITORY,
+                agentName: agent.role, image: profile.provision.image, ...(mode === 'delayed' ? { delayed: { bytes: DELAYED_ALLOCATION.bytes, delayMs: DELAYED_ALLOCATION.delayMs } } : {}),
+            };
+            const result = await engine(`authority-helper-${mode}`, helperProgramArgv({ boxId: profile.box.id, workspace: profile.workspace.path, routerPort: run.ports.tcp, params }),
+                { deadlineMs: 120000, tolerate: true, capture: `authority-helper-${mode}-output` });
+            let value = null;
+            if (cleanlyFinished(result) && result.status === 0) { try { value = JSON.parse(result.stdout); } catch { value = null; } }
+            if (!value) throw Object.assign(new Error(`The in-Box authority helper program (${mode}) did not complete: exit ${result.status}${result.errorCode ? `, ${result.errorCode}` : ''}${result.timedOut ? ', timed out' : ''}`), { evidence: { mode, ...commandTails(result, { maxBytes: 4096 }) } });
+            safeArtifact(`authority-helper-${mode}`, value);
+            return value;
+        };
+        const real = await runMode('real');
+        let realFacts;
+        try { realFacts = assertRealHelperPeak(real); } catch (error) { throw Object.assign(error, { evidence: { real } }); }
+        const delayed = await runMode('delayed');
+        let delayedFacts;
+        try { delayedFacts = assertDelayedSamplingOrder(delayed, real); } catch (error) { throw Object.assign(error, { evidence: { real, delayed } }); }
+        // The helper is gone afterwards: no container of the product's helper label remains in the Box's engine.
+        const remaining = await engine('authority-helper-cleanup', [...nested, 'container', 'ps', '--all', '--no-trunc', '--filter', 'label=io.assistos.ploinky.authority-helper', '--format', '{{.ID}}'], { deadlineMs: 30000 });
+        const left = remaining.stdout.trim() ? remaining.stdout.trim().split(/\s+/) : [];
+        safeArtifact('authority-helper-cleanup', { left });
+        if (left.length) throw Object.assign(new Error(`An authority helper container remains after the probes: ${left.map(short).join(', ')}`), { evidence: { real, delayed, left } });
+        return { real: { helperId: real.helper.id, image: real.helper.image, attestationId: real.attestationId, ...realFacts }, delayed: delayedFacts, helperRemaining: left };
+    }
     // The GPU cases of an apparatus-mps run (liveGpuCases.mjs), built over this
     // adapter's own journaled commands.
     const gpuContext = { profile, run, command, engine, core, nested, inspectBox, safeArtifact, persist, processProvider, env, signal, host: hostProc, timings: gpuTimings };
@@ -538,7 +573,7 @@ export function createLiveAdapter(profile, {
         await runOwnedCleanup({ run, profile, persist, processProvider, signal: cleanupSignal });
         if (hooks) await hooks.afterCleanup();
     }
-    return { cpuCase, coreCase, swapCase, cleanup, inspectBox, gpu, llm };
+    return { cpuCase, coreCase, swapCase, helperCase, cleanup, inspectBox, gpu, llm };
 }
 
 // Every fixture agent carries memory, cpu and pids limits (inspectAgent), so
@@ -573,6 +608,9 @@ function pinProblem(run, profile, hostIdentity, remoteArrival) {
 export async function executeCleanupRun({ run, persist = () => {}, processProvider = runBoundedProcess, signal, remoteArrival = false, hostIdentity = defaultHostIdentity(), hostProc, artifacts = () => {} } = {}) {
     const cases = LIVE_CASES[run.block].map(id => ({ id, result: 'blocked', reason: UNSUPPORTED[id] || 'Cleanup only' }));
     const report = { schema: 1, runId: run.runId, action: 'cleanup', verdict: 'BLOCKED', exitCode: EXIT.BLOCKED, cases, cleanup: run.cleanup, limitations: [] };
+    // The foreign-workspace guard speaks first, over whatever the manifest names, before the profile is even validated.
+    const foreign = foreignWorkspaceProblem(foreignGuardInput(run, run.target?.execution));
+    if (foreign) { report.limitations.push(foreign); return report; }
     let profile;
     try { profile = validateProfile(run, { partial: true }); } catch (error) { report.limitations.push(error.message); return report; }
     const problem = pinProblem(run, profile, hostIdentity, remoteArrival);
@@ -617,12 +655,14 @@ export async function executeLiveRun({ run, action = 'live', persist = () => {},
     const selected = run.target.execution?.cases || LIVE_CASES[run.block];
     const cases = LIVE_CASES[run.block].map(id => ({ id, result: 'blocked', reason: UNSUPPORTED[id] || 'Not selected or no completed enforcement evidence' }));
     const report = { schema: 1, runId: run.runId, action, verdict: 'BLOCKED', exitCode: EXIT.BLOCKED, cases, cleanup: run.cleanup, limitations: [] };
+    const foreign = foreignWorkspaceProblem(foreignGuardInput(run, run.target?.execution));
+    if (foreign) { report.limitations.push(foreign); return report; }
     let profile;
     try { profile = validateExecutionProfile(run); } catch (error) { report.limitations.push(error.message); return report; }
     if (run.cleanup.state !== 'not-started') { report.limitations.push('Cleanup has already started for this run; provision a new one'); return report; }
     const problem = pinProblem(run, profile, hostIdentity, remoteArrival);
     if (problem) { report.limitations.push(problem); return report; }
-    if (!selected.some(id => ['LIVE-C1', 'LIVE-C2', 'LIVE-A1', 'LIVE-P1', 'LIVE-P2', 'LIVE-P3', 'LIVE-P4', 'LIVE-L1', 'LIVE-L2', 'LIVE-L3'].includes(id))) {
+    if (!selected.some(id => ['LIVE-C1', 'LIVE-C2', 'LIVE-C6', 'LIVE-A1', 'LIVE-P1', 'LIVE-P2', 'LIVE-P3', 'LIVE-P4', 'LIVE-L1', 'LIVE-L2', 'LIVE-L3'].includes(id))) {
         report.limitations.push('Selected cases have no implemented live executor'); return report;
     }
     if (liveSourceDigest(profile.source.root) !== profile.source.digest) { report.limitations.push('Candidate source changed'); return report; }
@@ -641,7 +681,7 @@ export async function executeLiveRun({ run, action = 'live', persist = () => {},
             run.state = 'running'; persist();
             await adapter.inspectBox(); attempted = true;
             const executors = {
-                'LIVE-C1': adapter.coreCase, 'LIVE-C2': adapter.cpuCase, 'LIVE-A1': adapter.swapCase,
+                'LIVE-C1': adapter.coreCase, 'LIVE-C2': adapter.cpuCase, 'LIVE-C6': adapter.helperCase, 'LIVE-A1': adapter.swapCase,
                 ...(adapter.gpu ? { 'LIVE-P1': adapter.gpu.liveP1, 'LIVE-P2': adapter.gpu.liveP2, 'LIVE-P3': adapter.gpu.liveP3, 'LIVE-P4': adapter.gpu.liveP4 } : {}),
                 ...(adapter.llm ? { 'LIVE-L1': adapter.llm.liveL1, 'LIVE-L2': adapter.llm.liveL2, 'LIVE-L3': adapter.llm.liveL3 } : {}),
             };

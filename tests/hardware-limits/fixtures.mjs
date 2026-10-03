@@ -558,6 +558,23 @@ export function buildRequiredCaseManifest() {
             'X.store-rw-marker-ro', 'X.hardware-unexpected-bind-rejected', 'X.tool-binds-ro',
         ]),
         // Round G1: the apparatus-mps executors, their gate, probe protocol, provisioning, cleanup and manifest.
+        ...leaves(P, 'p4', unit('hardwareLimitsExecutors.test.mjs'), [
+            'X4.foreign-guard-refuses-a-workspace-stage-or-cwd-under-the-other-sessions-directories-and-a-derived-box-name',
+            'X4.foreign-guard-aborts-provision-live-and-cleanup-before-any-command',
+            'X4.foreign-guard-aborts-when-the-working-directory-is-under-the-other-sessions-directory',
+            'X4.foreign-guard-refuses-a-derived-box-name-of-the-other-session',
+            'X4.apparatus-core-block-is-a-linux-remote-block-with-the-c1-and-c2-executors-and-no-unsupported-entry',
+            'X4.apparatus-core-manifest-and-summary-name-the-pass-conditions-the-guard-and-the-owned-resources',
+            'X4.apparatus-core-every-candidate-argv-is-accepted-by-the-real-parser-and-provision-and-cleanup-leave-nothing',
+            'X4.apparatus-core-c1-passes-on-a-native-linux-layout-with-the-a4-ownership-and-fails-on-another-owner',
+            'X4.c6-a-real-helper-observation-passes-only-with-attestation-identity-placement-order-and-a-readable-peak',
+            'X4.c6-the-real-peak-is-at-most-48-mib-at-64m-and-a-larger-need-is-a-reviewed-redesign-never-a-silent-increase',
+            'X4.c6-the-delayed-allocating-probe-proves-the-sampling-order-and-an-early-sample-or-a-missing-allocation-fails',
+            'X4.c6-the-program-runs-the-products-probe-with-only-the-seam-and-rewrites-only-the-delayed-probe-exec',
+            'X4.c6-the-program-fails-closed-without-a-registry-record-an-unplaced-helper-or-a-failed-probe',
+            'X4.c6-the-executor-runs-the-real-and-the-delayed-probe-persists-both-and-passes-only-when-every-condition-holds',
+            'X4.c6-manifest-and-summary-show-the-program-the-bounds-and-the-guard-and-every-candidate-argv-is-accepted',
+        ]),
         ...leaves(P, 'p4', unit('hardwareLimitsLiveGpu.test.mjs'), [
             'G1.gate-initial-idle-records-uuid-mode-and-memory',
             'G1.gate-initial-blocks-on-a-query-error-malformed-unsupported-wrong-device-mode-memory-or-any-process',
@@ -1400,7 +1417,7 @@ export function validateRunManifest(value) {
     for (const key of ['configDigest', 'casesDigest']) {
         if (!/^sha256:[0-9a-f]{64}$/.test(value[key])) fail(`${label}.${key}`, 'invalid digest');
     }
-    if (!['mac-cpu', 'mac-adversarial', 'mac-explorer', 'apparatus-cpu', 'apparatus-mps', 'apparatus-local-llm',
+    if (!['mac-cpu', 'mac-adversarial', 'mac-explorer', 'apparatus-cpu', 'apparatus-core', 'apparatus-authority', 'apparatus-mps', 'apparatus-local-llm',
         'apparatus-vllm'].includes(value.block)) {
         fail(`${label}.block`, 'unknown block');
     }

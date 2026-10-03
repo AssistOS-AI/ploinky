@@ -2,6 +2,7 @@
 // workspace receipt and marker, the exact task-owned host record names and
 // the fixed container inspect format. Test-only; nothing here runs a process.
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
@@ -278,4 +279,67 @@ export function candidateEnv(profile, extra = {}) {
     if (profile.provision?.boxImage) env.PLOINKY_BOX_IMAGE = profile.provision.boxImage;
     for (const key of Object.keys(env)) if (env[key] === undefined) delete env[key];
     return env;
+}
+
+// The foreign-workspace guard (release plan C7). Another session owns
+// ~/work/testExplorerFresh and ~/cleanup-repair-claude-20261002 and its Box
+// `ploinky-box-testexplorerfresh-*`. No live block may place a workspace, a
+// stage or its working directory under either directory, or derive a Box with
+// that name. Every preflight runs this BEFORE any mutation and refuses.
+export const FOREIGN_WORKSPACE_DIRECTORIES = Object.freeze(['work/testExplorerFresh', 'cleanup-repair-claude-20261002']);
+export const FOREIGN_BOX_NAME = /^ploinky-box-testexplorerfresh-/i;
+// The real path of `target`, or of its nearest existing ancestor plus the rest
+// (a path that does not exist yet is judged where it would be created).
+function resolvedPath(target) {
+    const absolutePath = path.resolve(String(target));
+    let existing = absolutePath; const rest = [];
+    for (;;) {
+        try { return path.join(fs.realpathSync(existing), ...rest.reverse()); } catch (error) { if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') return absolutePath; }
+        const parent = path.dirname(existing);
+        if (parent === existing) return absolutePath;
+        rest.push(path.basename(existing)); existing = parent;
+    }
+}
+const insideDirectory = (candidate, directory) => candidate === directory || candidate.startsWith(`${directory}${path.sep}`);
+// `homes` are the home directories the foreign directories hang under (the
+// pinned host home and this process's own). `paths` is every workspace, stage
+// or working directory the run would touch; `names` every derived Box or
+// instance name. Returns the problem text, or null.
+export function foreignWorkspaceProblem({ homes = [], paths = [], names = [] } = {}) {
+    const roots = new Set();
+    for (const home of homes) {
+        if (typeof home !== 'string' || !path.isAbsolute(home)) continue;
+        for (const directory of FOREIGN_WORKSPACE_DIRECTORIES) {
+            const root = path.join(path.resolve(home), directory);
+            roots.add(root); roots.add(resolvedPath(root));
+        }
+    }
+    for (const entry of paths) {
+        if (typeof entry !== 'string' || !entry) continue;
+        for (const candidate of new Set([path.resolve(entry), resolvedPath(entry)])) {
+            for (const root of roots) {
+                if (insideDirectory(candidate, root)) return `Foreign-workspace guard: ${entry} is under ${root}, which another session owns; this block refuses to touch it`;
+            }
+        }
+    }
+    for (const name of names) {
+        if (typeof name === 'string' && FOREIGN_BOX_NAME.test(name.replace(/^\//, ''))) return `Foreign-workspace guard: the Box name ${name} matches the other session's ploinky-box-testexplorerfresh-* Box; this block refuses to derive it`;
+    }
+    return null;
+}
+export function assertNoForeignWorkspace(input) {
+    const problem = foreignWorkspaceProblem(input);
+    if (problem) throw blocked(problem);
+}
+// The guard inputs of a live action over an execution profile: the pinned and
+// the process's own home, every path the profile names, the working directory
+// and the Box instance names.
+export function foreignGuardInput(run, profileInput, extraPaths = []) {
+    const profile = profileInput || {};
+    const workspace = profile.workspace?.path || profile.provision?.workspace?.path || null;
+    return {
+        homes: [profile.host?.home, process.env.HOME, os.homedir()].filter(Boolean),
+        paths: [workspace, profile.provision?.workspace?.parent, profile.source?.root, profile.candidate?.path, run?.target?.stage?.root, process.cwd(), ...extraPaths].filter(Boolean),
+        names: [run?.workspace?.instance, profile.box?.instance].filter(Boolean),
+    };
 }
