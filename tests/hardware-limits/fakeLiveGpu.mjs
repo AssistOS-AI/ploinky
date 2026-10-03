@@ -19,6 +19,7 @@ import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { createFakeWorld, evaluateTemplate, ok, worldState } from './fakeLiveEngine.mjs';
 import { fixtureContainerName } from './liveFixture.mjs';
 import { mpsServerDefaultMemoryMiB } from '../../cli/sandbox/hardwareLimits/mps.mjs';
+import { candidateArgvProblem } from './candidateArgv.mjs';
 import {
     ADMIN_REQUEST, GPU_AGENT_INSPECT, GPU_GRANT_FACTS, MPS_FAILURE_EVIDENCE, MPS_KILL_OWNED_DAEMON, MPS_OBSERVE, NESTED_NAME_LIST_FORMAT, shareMemoryMiB,
 } from './liveGpuCommands.mjs';
@@ -516,6 +517,9 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
 
     // --- Candidate commands ---------------------------------------------------
     async function candidate(binary, args, options) {
+        // The candidate's own outer parser decides first, as in the real CLI (its message, exit 1).
+        const refusal = candidateArgvProblem(args);
+        if (refusal) return failed(`ploinky: ${refusal}`, 1);
         const verbs = args.filter(value => !value.startsWith('-') && !/^[0-9]+$/.test(value));
         const identity = buildWorkspaceIdentity(options.cwd);
         const home = options.env.HOME;

@@ -1805,3 +1805,13 @@ test('P3R.every-candidate-argv-of-the-apparatus-mps-manifest-and-of-its-cases-is
     assert.deepEqual(issued.find(argv => argv.includes('restart')).slice(1), ['restart', 'hwlfixture/probe']);
     nothingOwned(w);
 });
+
+test('P3R.a-runner-argv-with-ports-before-restart-fails-an-offline-p3-as-attempt-7-did', async t => {
+    // The fake's candidate refuses it with the parser's own message and exit 1, so P3 cannot pass with such an argv.
+    const w = await provisioned(t);
+    const candidate = w.run.target.execution.candidate.path;
+    const refused = await w.fake.provider(w.run.target.execution.node.path, [candidate, '--port', '23456', '--udp-port', '34567', 'restart', 'hwlfixture/probe'], { cwd: w.run.target.execution.workspace.path, env: { HOME: w.home } });
+    assert.deepEqual([refused.status, refused.stderr], [1, 'ploinky: --port is valid only before start, diagnose, or repair']);
+    assert.equal((await w.cleanup()).verdict, 'PASS');
+    nothingOwned(w);
+});

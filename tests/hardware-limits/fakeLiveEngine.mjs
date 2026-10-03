@@ -10,6 +10,7 @@ import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { FIXTURE_REPOSITORY, fixtureContainerName } from './liveFixture.mjs';
 import { drainExitCode } from './fixtureDrain.mjs';
+import { candidateArgvProblem } from './candidateArgv.mjs';
 
 // Exit status of a child runner that died at its named crash point.
 export const CRASH_EXIT = 99;
@@ -141,6 +142,9 @@ export function createFakeWorld({ statePath, node, engine, host, unrelated = [],
         return typeof rendered === 'string' ? ok(rendered) : rendered;
     };
     return async function provider(binary, args, options = {}) {
+        // The candidate's own outer parser decides first, as in the real CLI (its message, exit 1).
+        const refusal = binary === node ? candidateArgvProblem(args) : null;
+        if (refusal) return ok('', { status: 1, stderr: `ploinky: ${refusal}\n` });
         const state = load();
         const kind = kindOf(binary, args);
         state.calls.push({ binary, args, kind, cwd: options.cwd, gate: options.env?.PLOINKY_BOX_HARDWARE_LIMITS ?? null, boxImage: options.env?.PLOINKY_BOX_IMAGE ?? null, path: options.env?.PATH ?? null });
