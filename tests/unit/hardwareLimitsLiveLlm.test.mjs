@@ -1555,3 +1555,35 @@ test('R2G.a-recreated-client-from-a-foreign-image-id-fails-in-l3-and-a-recreate-
     assert.equal(entry.result, 'fail', JSON.stringify(entry).slice(0, 400)); assert.match(entry.reason, /is not the pinned running instance \(image d{12}/);
     nothingOwned(bad);
 });
+
+// --- M-LLM-04 residual: a success document needs a successful exit --------------------------------------------------
+test('M04r.a-nonzero-exit-with-an-ok-document-is-not-accepted-while-status-zero-success-and-documented-blocker-reports-are', async t => {
+    for (const [label, process] of [['status 1', { status: 1 }], ['status 3', { status: 3 }]]) {
+        const w = await provisioned(t, { block: 'apparatus-vllm', faults: { calibrateProcess: process } });
+        const report = await liveCases(w, ['LIVE-L3']);
+        const l3 = caseOf(report, 'LIVE-L3');
+        assert.equal(l3.result, 'fail', `${label}: ${JSON.stringify(l3).slice(0, 500)}`);
+        assert.match(l3.reason, new RegExp(`The calibration did not complete normally \\(exit ${process.status} with a document claiming success\\)`), label);
+        assert.equal(report.verdict, 'FAIL', label);
+        const artifact = w.artifacts.get('gpu-live-l3');
+        assert.equal(artifact.proposedEntry, undefined, `${label}: nothing is proposed`); assert.equal(artifact.calibration, undefined, label);
+        const failure = w.artifacts.get('llm-l3-process-failure');
+        assert.equal(failure.label, 'The calibration'); assert.equal(failure.claimedOk, true); assert.deepEqual(failure.abnormal, [`exit ${process.status} with a document claiming success`]);
+        assert.equal(artifact.processFailure.status, process.status, 'the exit result is preserved');
+        assert.equal(w.artifacts.has('llm-l3-calibration'), false, `${label}: the document is not kept as a calibration`);
+        nothingOwned(w);
+    }
+    // The prerequisite check is judged the same way.
+    const pre = await provisioned(t, { block: 'apparatus-vllm', faults: { prerequisitesProcess: { status: 1 } } });
+    const preEntry = caseOf(await liveCases(pre, ['LIVE-L3']), 'LIVE-L3');
+    assert.equal(preEntry.result, 'fail'); assert.match(preEntry.reason, /The prerequisite check did not complete normally \(exit 1 with a document claiming success\)/);
+    assert.equal(toolCalls(pre, 'local_llm_runner_install').length, 0); nothingOwned(pre);
+    // Controls: the documented blocker report (ok:false with its own nonzero exit) stays BLOCKED; a status-0 success passes.
+    const blockedByTool = await provisioned(t, { block: 'apparatus-vllm', faults: { calibrateBlocked: true } });
+    const blockedEntry = caseOf(await liveCases(blockedByTool, ['LIVE-L3']), 'LIVE-L3');
+    assert.equal(blockedEntry.result, 'blocked'); assert.equal(blockedByTool.artifacts.has('llm-l3-process-failure'), false); nothingOwned(blockedByTool);
+    const prerequisiteBlocked = await provisioned(t, { block: 'apparatus-vllm', faults: { vllmDiskShort: true } });
+    assert.equal(caseOf(await liveCases(prerequisiteBlocked, ['LIVE-L3']), 'LIVE-L3').result, 'blocked'); assert.equal(prerequisiteBlocked.artifacts.has('llm-l3-process-failure'), false); nothingOwned(prerequisiteBlocked);
+    const passing = await provisioned(t, { block: 'apparatus-vllm' });
+    assert.equal(caseOf(await liveCases(passing, ['LIVE-L3']), 'LIVE-L3').result, 'pass'); assert.equal(passing.artifacts.has('llm-l3-process-failure'), false); nothingOwned(passing);
+});

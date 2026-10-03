@@ -486,6 +486,14 @@ export function createLlmCases(ctx) {
         let doc = null;
         try { doc = JSON.parse(result.stdout); } catch { doc = null; }
         if (!doc || typeof doc.ok !== 'boolean') throw blocked(`${label} gave no document (exit ${result.status}): ${boundedTail(result.stderr || result.stdout, 300).text}`);
+        // A success document is only trusted from a process that exited successfully. A tool's own documented blocker report
+        // (ok:false, its nonzero exit) is still a normally completed report; a nonzero exit that claims success is not evidence.
+        if (doc.ok === true && result.status !== 0) {
+            const abnormalExit = [`exit ${result.status} with a document claiming success`];
+            safeArtifact('llm-l3-process-failure', { label, abnormal: abnormalExit, claimedOk: true, ...commandTails(result, { maxBytes: 4096 }) });
+            evidence?.put('processFailure', { label, abnormal: abnormalExit, status: result.status, signal: null, timedOut: false, claimedOk: true });
+            throw new Error(`${label} did not complete normally (${abnormalExit.join(', ')}); its output is not accepted`);
+        }
         return doc;
     }
     const blockerText = doc => (doc.blockers || []).map(entry => `${entry.code}: ${entry.message}`).join('; ').slice(0, 900);
