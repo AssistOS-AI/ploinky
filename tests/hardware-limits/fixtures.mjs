@@ -617,6 +617,7 @@ export function buildRequiredCaseManifest() {
             'U3.the-compliant-fixture-agent-drains-with-exit-zero-and-the-recreate-proceeds',
             'U3.a-fixture-agent-that-dies-on-sigterm-fails-apply-at-client-launch-with-the-targeted-drain-refusal',
             'R12c.a-failed-apply-reason-carries-the-parsed-cause-before-the-cut-response-text',
+            'R12c.the-fake-daemon-answers-the-sm-default-in-the-captured-form-and-the-runner-accepts-it',
             'V3.p1-expects-the-rounded-default-and-the-exact-client-share',
             'V3.p1-fails-when-the-daemon-default-is-the-raw-share-instead-of-the-rounded-value',
             'V3.p3-raising-the-share-changes-the-default-from-2-to-3-gib-and-drains-before-the-quit',

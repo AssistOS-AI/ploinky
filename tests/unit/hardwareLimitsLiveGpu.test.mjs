@@ -1632,7 +1632,7 @@ test('W2.a-p1-pass-copies-the-journaled-readback-into-its-case-artifact', async 
     assert.equal(caseOf(report, 'LIVE-P1').result, 'pass', JSON.stringify(report.limitations));
     const readback = w.artifacts.get('gpu-live-p1').lastReadback;
     assert.deepEqual(Object.keys(readback).sort(), ['at', 'memory', 'servers', 'sm']);
-    assert.match(readback.memory, /^[1-9]\d*[MG]$/); assert.match(readback.sm, /^\d+$/);
+    assert.match(readback.memory, /^[1-9]\d*[MG]$/); assert.equal(readback.sm, '25.0', 'the fake answers the SM default in the captured form'); 
     nothingOwned(w);
 });
 
@@ -1767,5 +1767,15 @@ test('R12c.a-failed-apply-reason-carries-the-parsed-cause-before-the-cut-respons
     assert.equal(p1.result, 'fail', JSON.stringify(p1).slice(0, 300));
     assert.match(p1.reason, /^Apply of hwlfixture\/probe failed: 409 \(client-launch: Error \(TARGETED_DRAIN_FAILED\): targeted drain for '[^']+' did not exit cleanly \(exit=143\); refusing removal or recreate\) /);
     assert.equal(p1.reason.includes('"cause"'), false, 'the cause was cut out of the text, so only the parsed form carries it');
+    nothingOwned(w);
+});
+
+test('R12c.the-fake-daemon-answers-the-sm-default-in-the-captured-form-and-the-runner-accepts-it', async t => {
+    const w = await provisioned(t);
+    const p1 = caseOf(await liveCases(w, ['LIVE-P1']), 'LIVE-P1');
+    assert.equal(p1.result, 'pass', JSON.stringify(p1).slice(0, 300));
+    const replies = Object.fromEntries(p1.evidence.daemon.controlReplies.map(reply => [reply.command, reply.stdout]));
+    assert.equal(replies.get_default_active_thread_percentage, '25.0\n'); assert.equal(replies['get_default_device_pinned_mem_limit 0'], '2G\n');
+    assert.deepEqual(p1.evidence.readbackForms.sm, { form: 'integer-percentage', value: 25 });
     nothingOwned(w);
 });

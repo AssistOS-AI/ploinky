@@ -277,7 +277,8 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
         const daemon = model.daemon;
         if (!daemon || daemon.lost) return ok('', { status: 1, stderr: 'Cannot connect to MPS control daemon' });
         if (command === 'get_server_list') return ok(`${daemon.servers.map(server => server.boxPid).join('\n')}${daemon.servers.length ? '\n' : ''}`);
-        if (command === 'get_default_active_thread_percentage') return ok(`${daemon.defaults.sm}\n`);
+        // The captured form of the driver (595.91.07): a decimal with a zero fraction.
+        if (command === 'get_default_active_thread_percentage') return ok(`${daemon.defaults.sm}.0\n`);
         if (command === 'get_default_device_pinned_mem_limit 0') return ok(memoryReply());
         if (/^set_(?:active_thread_percentage|device_pinned_mem_limit) /.test(command)) {
             model.controlLog.push({ command, helper });
@@ -373,7 +374,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
             state: {
                 schema: 1, status: model.mpsStatus, daemonGeneration: daemon.gen, configurationGeneration: daemon.cfg, serverDefault: { smPercent: daemon.defaults.sm, memoryMiB: daemon.defaults.mib, shareMemoryMiB: daemon.defaults.share },
                 pipeDirectory: daemon.pipe, logDirectory: daemon.log, daemon: { pid: daemon.boxPid, startTime: daemon.start, executableDev: 1, executableIno: 2 }, tools: null, pendingClients: [], oldClients: [], desiredClients: [],
-                lastReadback: { at: 1, sm: `${daemon.defaults.sm}`, memory: displayMemory(daemon.defaults.mib), servers: '' },
+                lastReadback: { at: 1, sm: `${daemon.defaults.sm}.0`, memory: displayMemory(daemon.defaults.mib), servers: '' },
             },
             daemon: { pid: daemon.boxPid, alive, startTime: daemon.start, status: [faults.daemonUid0 ? 'Uid:\t0\t0\t0\t0' : 'Uid:\t1000\t1000\t1000\t1000', 'Gid:\t1000\t1000\t1000\t1000'], cgroup: '0::/ploinky/core', exe: { dev: 1, ino: 2 }, pipeEnvMatches: true },
             control: null,
@@ -394,7 +395,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
             { name: 'server.log', size: 24, tail: '[fake] server log\n' }] }] : [];
         return {
             state: daemon ? { schema: 1, status: model.mpsStatus, transitionId: null, daemonGeneration: daemon.gen, configurationGeneration: daemon.cfg, serverDefault: { smPercent: daemon.defaults.sm, memoryMiB: daemon.defaults.mib, shareMemoryMiB: daemon.defaults.share }, pipeDirectory: daemon.pipe, logDirectory: daemon.log,
-                daemon: { pid: daemon.boxPid, startTime: daemon.start }, pendingClients: [], oldClients: [], drainedClients: 0, lastProblem: faults.lastProblem ?? null, lastReadback: faults.lastReadback ?? { at: 1, sm: `${daemon.defaults.sm}`, memory: displayMemory(daemon.defaults.mib), servers: '' } }
+                daemon: { pid: daemon.boxPid, startTime: daemon.start }, pendingClients: [], oldClients: [], drainedClients: 0, lastProblem: faults.lastProblem ?? null, lastReadback: faults.lastReadback ?? { at: 1, sm: `${daemon.defaults.sm}.0`, memory: displayMemory(daemon.defaults.mib), servers: '' } }
                 : { schema: 1, status: 'pending', transitionId: 'fake', daemonGeneration: null, configurationGeneration: null, serverDefault: null, pipeDirectory: null, logDirectory: null, daemon: null, pendingClients: [{ key: key('probe'), phase: 'pending', containerId: null }], oldClients: [], drainedClients: 0, lastProblem: faults.lastProblem ?? null },
             daemon: daemon ? { pid: daemon.boxPid, alive: !daemon.lost, startTime: daemon.start, cgroup: '0::/ploinky/core' } : null,
             logs, entries: daemon ? [path.basename(daemon.pipe), path.basename(daemon.log), 'state.json'] : ['state.json'], omittedLogFiles: 0, problems: [],
