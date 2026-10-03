@@ -1266,12 +1266,12 @@ test('EV1.an-unexpected-name-a-symlink-an-oversized-file-and-a-corrupt-transfer-
         return undefined;
     });
     const report = await dispatchCleanup(w, { provider: lying });
-    // 'fixture-start' is the diagnostic the provisioning run itself left; it is allowed and arrives too.
-    assert.deepEqual(report.artifacts.fetched.map(entry => entry.name).sort(), ['fixture-start', 'good']);
+    // 'fixture-start', 'box-inspect' and 'box-contract' are the evidence the provisioning run itself left; they are allowed and arrive too.
+    assert.deepEqual(report.artifacts.fetched.map(entry => entry.name).sort(), ['box-contract', 'box-inspect', 'fixture-start', 'good']);
     assert.deepEqual(report.artifacts.refused.map(entry => [entry.name, entry.reason.replace(/ \(.*/, '').replace(/larger than \d+ bytes/, 'oversized')]).sort(), [['big', 'oversized'], ['folder', 'not a regular file'], ['linked', 'symbolic link']]);
     assert.deepEqual(report.artifacts.failures.map(entry => [entry.name, entry.reason]), [['garbled', 'digest mismatch after transfer']]);
     for (const part of ['linked', 'big', 'folder', 'Upper', 'garbled']) assert.equal(exists(localArtifact(w, part)), false, `${part} was not copied`);
-    assert.deepEqual(fs.readdirSync(w.evidence).filter(name => /^run_.+_claude\.json$/.test(name)).sort(), ['run_fixture-start_claude.json', 'run_good_claude.json']);
+    assert.deepEqual(fs.readdirSync(w.evidence).filter(name => /^run_.+_claude\.json$/.test(name)).sort(), ['run_box-contract_claude.json', 'run_box-inspect_claude.json', 'run_fixture-start_claude.json', 'run_good_claude.json']);
     for (const call of w.ssh.calls.filter(entry => entry.words[0] === 'cat')) assert.ok(!/outside|linked|big|folder|Upper|bak|codex|authorization|token|notes|passwd/.test(path.basename(call.words.at(-1))) || /run_claude/.test(call.words.at(-1)), call.words.at(-1));
     assert.equal(report.artifacts.complete, false);
     assert.equal(report.staging.removed, false); assert.equal(exists(w.remoteRoot), true, 'a corrupt allowed artifact keeps the staging root');
