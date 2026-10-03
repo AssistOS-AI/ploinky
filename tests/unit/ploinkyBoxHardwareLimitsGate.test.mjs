@@ -1639,7 +1639,10 @@ test('G.targeted-update-selection-refuses-another-gate-and-notes-a-matching-one'
         // The same request, or none, keeps the saved gate; the matching request is acknowledged, never reported as ignored.
         const same = select({ [GATE_VARIABLE]: 'off' }, 'targeted-update');
         assert.deepEqual({ enabled: same.enabled, persist: same.persist, changed: same.changed }, { enabled: false, persist: false, changed: false });
-        assert.equal(same.note, `${GATE_VARIABLE}=off matches the saved gate; a targeted update follows the saved gate`);
+        // R23-4: the unsaved iteration says the default gate, the saved-off iteration the saved gate.
+        assert.equal(same.note, saved === null
+            ? `${GATE_VARIABLE}=off matches the default gate (no gate is saved); a targeted update follows the default gate`
+            : `${GATE_VARIABLE}=off matches the saved gate; a targeted update follows the saved gate`);
         assert.doesNotMatch(same.note, /only start, restart and update apply it/);
         assert.equal(select({}, 'targeted-update').note, null);
     }
@@ -1651,6 +1654,24 @@ test('G.targeted-update-selection-refuses-another-gate-and-notes-a-matching-one'
     assert.throws(() => select({ [GATE_VARIABLE]: 'maybe' }, 'targeted-update'), { code: 'PLOINKY_BOX_HARDWARE_GATE_INVALID' });
     // Other non-applying operations are unchanged: the generic note, no refusal.
     assert.match(select({ [GATE_VARIABLE]: 'off' }, 'saved').note, /only start, restart and update apply it/);
+});
+
+// R23-4: "matches the saved gate" is only true when a gate is saved; with none saved the request matches the default gate.
+test('G.the-targeted-update-note-names-the-default-gate-when-none-is-saved-and-the-saved-gate-when-one-is', (t) => {
+    const state = fixture(t);
+    const select = (env) => selectHardwareGate({ identity: state.identity, gateStore: state.gateStore, env, operation: 'targeted-update' });
+    // No gate saved: the default is off, so only off matches, and the note never claims a saved gate.
+    const unsaved = select({ [GATE_VARIABLE]: 'off' });
+    assert.equal(unsaved.saved, null);
+    assert.match(unsaved.note, /matches the default gate \(no gate is saved\)/);
+    assert.doesNotMatch(unsaved.note, /saved gate/);
+    // A saved gate, off or on: the note names it.
+    state.gateStore.write(state.identity, false, lockFor(state.identity));
+    assert.match(select({ [GATE_VARIABLE]: 'off' }).note, /matches the saved gate; a targeted update follows the saved gate/);
+    assert.doesNotMatch(select({ [GATE_VARIABLE]: 'off' }).note, /default gate/);
+    state.gateStore.write(state.identity, true, lockFor(state.identity));
+    assert.match(select({ [GATE_VARIABLE]: 'on' }).note, /on matches the saved gate; a targeted update follows the saved gate/);
+    assert.doesNotMatch(select({ [GATE_VARIABLE]: 'on' }).note, /default gate/);
 });
 
 test('G.targeted-update-preflight-and-host-command-refuse-before-the-host-source-update', async (t) => {

@@ -353,6 +353,7 @@ export function buildRequiredCaseManifest() {
             'G.gate-is-restored-to-its-exact-prior-record-only-while-it-is-this-transactions-candidate-update',
             'G.gate-store-clear-and-restore-are-lock-checked-and-exact',
             'G.targeted-update-selection-refuses-another-gate-and-notes-a-matching-one',
+            'G.the-targeted-update-note-names-the-default-gate-when-none-is-saved-and-the-saved-gate-when-one-is',
             'G.targeted-update-preflight-and-host-command-refuse-before-the-host-source-update',
             'G.targeted-update-transaction-refuses-another-gate-under-the-lock-before-any-mutation',
             'G.full-update-scope-failure-under-the-lock-settles-no-downgrade',

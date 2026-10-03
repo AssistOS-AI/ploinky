@@ -166,7 +166,10 @@ export function selectHardwareGate({ identity, gateStore, env = process.env, ope
             source: saved ? 'saved' : 'default',
             persist: false,
             changed: false,
-            note: `${HARDWARE_GATE_ENV}=${requested ? 'on' : 'off'} matches the saved gate; a targeted update follows the saved gate`,
+            // With no saved gate the request matches the default gate, never "the saved gate".
+            note: saved
+                ? `${HARDWARE_GATE_ENV}=${requested ? 'on' : 'off'} matches the saved gate; a targeted update follows the saved gate`
+                : `${HARDWARE_GATE_ENV}=${requested ? 'on' : 'off'} matches the default gate (no gate is saved); a targeted update follows the default gate`,
         });
     }
     if (requested !== undefined && GATE_APPLYING_OPERATIONS.includes(operation)) {
