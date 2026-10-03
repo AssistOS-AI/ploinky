@@ -702,6 +702,7 @@ export function buildRequiredCaseManifest() {
             'M05.a-client-change-inside-the-same-default-recreates-only-that-client-and-keeps-the-daemon-and-the-peer',
             'M05.a-real-default-change-still-drains-quits-and-restarts-the-cohort',
             'M05.graph-preparation-drains-only-the-changed-client-inside-the-same-default-and-the-cohort-across-a-real-change',
+            'M05.a-launch-whose-saved-default-differs-only-in-the-reported-share-is-not-refused-and-a-real-difference-is',
         ]),
         ...leaves(P, 'p4', unit('hardwareLimitsMpsGraphLaunch.test.mjs'), ['MGL.a-largest-share-change-inside-the-same-gib-keeps-the-daemon-and-updates-the-reported-share']),
         ...leaves(P, 'p4', unit('hardwareLimitsMpsReadback.test.mjs'), [

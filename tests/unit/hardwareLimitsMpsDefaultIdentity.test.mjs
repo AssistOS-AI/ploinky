@@ -6,6 +6,7 @@ import test from 'node:test';
 import { mpsClientEnvironment, sameMpsServerDefault, MPS_SERVER_DEFAULT_IDENTITY } from '../../cli/sandbox/hardwareLimits/mps.mjs';
 import { prepareMpsGraph } from '../../cli/sandbox/hardwareLimits/mpsGraph.mjs';
 import { resolveMpsServerDefault, runMpsTransition } from '../../cli/sandbox/hardwareLimits/mpsTransition.mjs';
+import { createMpsLaunch, verifyMpsLaunch } from '../../cli/sandbox/hardwareLimits/mpsLaunch.mjs';
 
 const device = { deviceUuid: 'GPU-fixture', driverVersion: '595.91.07', wiringFingerprint: 'wiring' };
 // A share of a 6144-MiB device: 17% = 1044 MiB, 18% = 1105 MiB, 12% = 737 MiB, 34% = 2088 MiB.
@@ -101,4 +102,22 @@ test('M05.graph-preparation-drains-only-the-changed-client-inside-the-same-defau
     const changed = await real.run();
     assert.deepEqual([...changed.replacedKeys].sort(), ['a', 'b']); assert.deepEqual(real.events, ['drain:a', 'drain:b']);
     assert.equal(real.state().graphNeedsTransition, true);
+});
+
+// M5b: verifyMpsLaunch compares the daemon-defining fields only. The largest share is reporting and may differ between the saved state
+// and the state the launch captured; a real default change is still refused.
+test('M05.a-launch-whose-saved-default-differs-only-in-the-reported-share-is-not-refused-and-a-real-difference-is', () => {
+    const own = share(700);
+    const ready = serverDefault => ({ schema: 1, status: 'ready', daemon: { pid: 9, startTime: '1' }, daemonGeneration: 'd0', configurationGeneration: 'c0', pipeDirectory: PIPE, serverDefault });
+    const captured = ready(resolveMpsServerDefault([{ share: own }]));
+    const launch = createMpsLaunch({ key: 'a', share: own, state: captured, imageId: 'a'.repeat(64) });
+    const backend = { verify: () => true, verifyReason: () => ({ ok: true }) };
+    const verify = saved => verifyMpsLaunch(launch, 'a', own, { store: { read: () => saved }, backend });
+    // Only shareMemoryMiB differs (a later pass reported another largest share): accepted.
+    assert.doesNotThrow(() => verify(ready({ ...captured.serverDefault, shareMemoryMiB: 900 })));
+    assert.equal(captured.serverDefault.memoryMiB, 1024);
+    // A real difference in any daemon-defining field is refused as before.
+    for (const [field, value] of [['smPercent', 50], ['memoryMiB', 2048], ['deviceUuid', 'GPU-other'], ['driverVersion', '600.1'], ['wiringFingerprint', 'other']]) {
+        assert.throws(() => verify(ready({ ...captured.serverDefault, [field]: value })), /the server defaults changed|the server defaults are below|the device, driver or wiring differs/, field);
+    }
 });
