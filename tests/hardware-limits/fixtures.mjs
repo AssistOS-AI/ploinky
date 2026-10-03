@@ -355,6 +355,9 @@ export function buildRequiredCaseManifest() {
             'G.targeted-update-preflight-and-host-command-refuse-before-the-host-source-update',
             'G.targeted-update-transaction-refuses-another-gate-under-the-lock-before-any-mutation',
             'G.full-update-scope-failure-under-the-lock-settles-no-downgrade',
+            'G.deferred-update-saves-the-requested-gate-with-the-kept-box',
+            'G.deferred-update-gate-write-failure-never-settles-the-box-and-a-settlement-failure-restores-the-prior-gate',
+            'G.deferred-update-writes-no-gate-when-nothing-changes-or-the-prior-box-is-restored',
         ]),
         ...leaves(P, 'p1', unit('ploinkyBoxGpuGrant.test.mjs'), ['G.every-final-generation-gpu']),
         ...leaves(P, 'p1', unit('hardwareLimitsReconcilePredecessor.test.mjs'), [

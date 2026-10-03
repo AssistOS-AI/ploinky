@@ -1086,6 +1086,17 @@ export function createBoxSupervisor({
         throw error;
     }
 
+    // The journal item of the selected hardware gate: its prior record (or absence) is restored only while the saved value is still this
+    // transaction's candidate.
+    function hardwareGateItem(identity, lock, hardwareGate) {
+        return {
+            name: 'hardware-gate',
+            read: () => hardwareGateStore.read(identity),
+            write: () => hardwareGateStore.write(identity, hardwareGate.enabled, lock),
+            restore: prior => hardwareGateStore.restore(identity, prior, lock),
+        };
+    }
+
     /**
      * Admit a ready candidate graph. Health and exact AgentLib identity are
      * proven first; the metadata writes then happen inside the journaled error
@@ -1145,16 +1156,9 @@ export function createBoxSupervisor({
                 restore: prior => gpuGrantStore.restore(identity, prior, lock),
             });
         }
-        if (hardwareGate?.persist) {
-            // The selected gate is recorded inside the journaled boundary, last, so a failing write is rolled back with the
-            // other candidate metadata before settlement and can never reach a rollback after it.
-            items.push({
-                name: 'hardware-gate',
-                read: () => hardwareGateStore.read(identity),
-                write: () => hardwareGateStore.write(identity, hardwareGate.enabled, lock),
-                restore: prior => hardwareGateStore.restore(identity, prior, lock),
-            });
-        }
+        // The selected gate is recorded inside the journaled boundary, last, so a failing write is rolled back with the
+        // other candidate metadata before settlement and can never reach a rollback after it.
+        if (hardwareGate?.persist) items.push(hardwareGateItem(identity, lock, hardwareGate));
         const admitted = await runJournaledAdmission({
             identity,
             store: updateHostState,
@@ -2279,7 +2283,25 @@ export function createBoxSupervisor({
                 }
             } else if (blocked) {
                 lock.assertHeld(identity.instance);
-                prepared.finalize?.();
+                if (hardwareGate.persist) {
+                    // The Box this transaction keeps carries the requested gate's wiring, so the request is saved with it (U1): as a
+                    // gate-only journaled admission whose settlement is the Box's own, so nothing after settlement can restore anything.
+                    const settled = await runJournaledAdmission({
+                        identity,
+                        store: updateHostState,
+                        operation: 'update',
+                        source: { containerId: prepared.ownership.handles.container.id, boxAction: prepared.action || null, deferred: true },
+                        items: [hardwareGateItem(identity, lock, hardwareGate)],
+                        validate: async () => lock.assertHeld(identity.instance),
+                        settle: async () => {
+                            lock.assertHeld(identity.instance);
+                            prepared.finalize?.();
+                        },
+                    });
+                    warnings.push(...settled.warnings);
+                } else {
+                    prepared.finalize?.();
+                }
                 outcome = 'deferred';
             } else {
                 if (restart) {

@@ -28,7 +28,7 @@ import {
     agentLibFixtureLabels,
     agentLibFixtureMounts,
 } from '../helpers/agentlibFixture.mjs';
-import { fakeRestartCore, fakeUpdateCore } from '../helpers/fakeUpdateCore.mjs';
+import { fakeRestartCore, fakeUpdateCore, verifiedRecord } from '../helpers/fakeUpdateCore.mjs';
 
 function fixture(t) {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-gate-')));
@@ -1459,7 +1459,7 @@ test('G.status-mps-defaults-line-states-only-the-configured-default', () => {
 // R20-1: the selected gate is a journal item of the graph admission. Master's rule (update/admission.mjs): every candidate
 // write happens inside the error boundary and nothing after settlement can trigger a restoration.
 const FIXED_PRIOR = '2026-01-02T03:04:05.000Z';
-function gateAdmissionWorld(t, { action, failWrite = false, failFinalize = null, priorGate = null, events = [], env = { PLOINKY_BOX_HARDWARE_LIMITS: 'on' }, stderrLines = [] }) {
+function gateAdmissionWorld(t, { action, failWrite = false, failFinalize = null, priorGate = null, events = [], env = { PLOINKY_BOX_HARDWARE_LIMITS: 'on' }, stderrLines = [], unverified = false }) {
     const state = fixture(t);
     const previousHome = process.env.HOME;
     process.env.HOME = state.home;
@@ -1513,7 +1513,8 @@ function gateAdmissionWorld(t, { action, failWrite = false, failFinalize = null,
         startCore: async () => { events.push('start-core'); },
         runCoreCommand: async () => {},
         runRestartCore: fakeRestartCore(async () => {}),
-        runUpdateCore: fakeUpdateCore({ onCall: () => Promise.resolve() }),
+        // `unverified`: the in-Box update reports a REQUIRED input it could not verify, so activation is blocked.
+        runUpdateCore: fakeUpdateCore({ onCall: () => Promise.resolve(), ...(unverified ? { records: () => [verifiedRecord('fixture-repo', { outcome: 'uncertain', code: 'unverified', reason: 'not verified' })] } : {}) }),
         resolveHostReachableIpv4: async () => '192.168.1.12',
         healthCheck: async () => {},
         revalidateAgentLibSource: () => {},
@@ -1530,6 +1531,7 @@ function gateAdmissionWorld(t, { action, failWrite = false, failFinalize = null,
         restart: () => supervisor.runRestartTransaction(['restart']),
         update: () => supervisor.runUpdateTransaction(['update'], { restartAfterUpdate: true }),
         targetedUpdate: () => supervisor.runUpdateTransaction(['update', 'repos']),
+        fullUpdate: () => supervisor.runUpdateTransaction(['update']),
     };
     return { state, events, invoke, supervisor };
 }
@@ -1735,4 +1737,58 @@ test('G.full-update-scope-failure-under-the-lock-settles-no-downgrade', async (t
     assert.equal(world.events.some((event) => event.startsWith('box-create')), false, world.events.join(' '));
     assert.equal(world.state.gateStore.read(world.state.identity).enabled, true, 'the saved gate is still on');
     assert.deepEqual(createTransitionStore({ identity: world.state.identity, homeDirectory: world.state.home }).listPending(), [], 'no downgrade journal was written');
+});
+
+// ---------------------------------------------------------------------------
+// R23-2 (U1): a full update whose activation is blocked keeps the Box (created or reused) and its requested gate wiring, so it saves the request
+// with it, inside a journaled admission that settles with the Box's own settlement. Nothing after settlement can restore anything.
+test('G.deferred-update-saves-the-requested-gate-with-the-kept-box', async (t) => {
+    for (const action of ['created', 'reused']) {
+        for (const priorGate of [null, false]) {
+            const world = gateAdmissionWorld(t, { action, priorGate, unverified: true });
+            const result = await world.invoke.fullUpdate();
+            const { events, state } = world;
+            assert.equal(result.activation.activationAllowed, false, `${action}/${priorGate}: activation was blocked`);
+            assert.equal(result.activation.outcome, 'deferred');
+            assert.equal(state.gateStore.read(state.identity)?.enabled, true, `${action}/${priorGate}: the requested gate is saved`);
+            assert.ok(events.includes('gate-write') && events.indexOf('gate-write') < events.indexOf('finalize'), `${action}/${priorGate}: written inside the journaled admission, before settlement: ${events}`);
+            assert.equal(events.some((event) => event.startsWith('rollback') || event.endsWith('after-settlement')), false, events.join(' '));
+            // The next start without the variable keeps the saved gate on.
+            assert.equal(selectHardwareGate({ identity: state.identity, gateStore: state.gateStore, env: {}, operation: 'start' }).enabled, true);
+        }
+    }
+});
+
+test('G.deferred-update-gate-write-failure-never-settles-the-box-and-a-settlement-failure-restores-the-prior-gate', async (t) => {
+    // A failing gate write is inside the journaled boundary: nothing settled, the candidate is rolled back once, no gate is saved.
+    const failing = gateAdmissionWorld(t, { action: 'created', failWrite: true, unverified: true });
+    const error = await failing.invoke.fullUpdate().then(() => null, (failure) => failure);
+    assert.match(String(error?.message), /simulated gate record write failure/);
+    assert.equal(failing.events.includes('finalize'), false, failing.events.join(' '));
+    assert.equal(failing.events.filter((event) => event === 'rollback:before-settlement').length, 1, failing.events.join(' '));
+    assert.equal(failing.state.gateStore.read(failing.state.identity), null);
+    assert.deepEqual(error.admission.results.find((result) => result.name === 'hardware-gate'), { name: 'hardware-gate', outcome: 'unchanged' });
+    // A settlement that fails after the write restores the exact prior record (value and timestamp) or its absence.
+    for (const [priorGate, expected] of [[false, { enabled: false, savedAt: FIXED_PRIOR }], [null, null]]) {
+        const world = gateAdmissionWorld(t, { action: 'reused', priorGate, unverified: true, failFinalize: () => { throw new Error('simulated settlement failure'); } });
+        const failure = await world.invoke.fullUpdate().then(() => null, (value) => value);
+        assert.match(String(failure?.message), /simulated settlement failure/);
+        assert.deepEqual(failure.admission.results.find((result) => result.name === 'hardware-gate'), { name: 'hardware-gate', outcome: 'restored' });
+        const saved = world.state.gateStore.read(world.state.identity);
+        assert.deepEqual(saved === null ? null : { ...saved }, expected);
+    }
+});
+
+test('G.deferred-update-writes-no-gate-when-nothing-changes-or-the-prior-box-is-restored', async (t) => {
+    // The request equals the saved gate: nothing to save, and the Box still settles.
+    const same = gateAdmissionWorld(t, { action: 'reused', priorGate: true, unverified: true });
+    await same.invoke.fullUpdate();
+    assert.equal(same.events.includes('gate-write'), false, same.events.join(' '));
+    assert.ok(same.events.includes('finalize'));
+    // A replaced Box whose activation is blocked is rolled back to the prior one: the requested gate is not saved for a Box that is gone.
+    const replaced = gateAdmissionWorld(t, { action: 'replaced', priorGate: null, unverified: true });
+    await replaced.invoke.fullUpdate().catch(() => {});
+    assert.equal(replaced.events.includes('gate-write'), false, replaced.events.join(' '));
+    assert.equal(replaced.state.gateStore.read(replaced.state.identity), null);
+    assert.ok(replaced.events.some((event) => event.startsWith('rollback')), replaced.events.join(' '));
 });
