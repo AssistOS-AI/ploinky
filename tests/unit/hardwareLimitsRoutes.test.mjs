@@ -337,7 +337,8 @@ test('S1.a-stale-snapshot-never-reports-a-just-recreated-instance-as-stopped-or-
         ['a fresh entry of the CURRENT container that is not running', [engineEntry({ containerId: NEW_ID })], fresh, stopped],
         ['a fresh entry without a container id that is not running (a real stop)', [engineEntry({ containerId: undefined })], fresh, stopped],
         ['a fresh entry of the current container, running and ready', [engineEntry({ containerId: NEW_ID, state: { status: 'running', running: true, ready: true, pid: 5 } })], fresh, { availability: 'ready', limitsState: 'applied' }],
-        ['the engine runs it and no route is active yet', [engineEntry({ containerId: NEW_ID, state: { status: 'starting', running: false, pid: 5 } })], fresh, starting],
+        ['the engine runs it and no route is active yet', [engineEntry({ containerId: NEW_ID, engineRunning: true, state: { status: 'starting', running: false, pid: 5 } })], fresh, starting],
+        ['marked starting but the engine does not run it', [engineEntry({ containerId: NEW_ID, engineRunning: false, state: { status: 'starting', running: false, pid: 0 } })], fresh, stopped],
     ]) {
         const { availability, limitsState } = statusOf(f, states, offset);
         assert.deepEqual({ availability, limitsState }, expected, label);
@@ -454,4 +455,29 @@ test('S4.an-old-listing-published-after-the-apply-never-proves-the-new-container
     await monitor.reconcile();
     const gone = containerOf(await request(f, { dependencies: deps() }));
     assert.deepEqual({ availability: gone.availability, limitsState: gone.limitsState }, { availability: 'stopped', limitsState: 'unavailable' });
+});
+
+// T1: the real collector and the real no-wait projection; only the marker IO is injected (as tests/unit/agentRuntimeState.test.mjs does).
+const { collectAgentRuntimeStates } = await import('../../cli/sandbox/agentRuntimeState.js');
+const { applyCurrentNoWaitReadiness } = await import('../../cli/utils/noWaitReadiness.js');
+test('T1.the-no-wait-projection-never-masks-a-container-the-engine-does-not-run-as-starting', (t) => {
+    const f = fixture(t);
+    const registry = { canonical: { ...f.registry.canonical, containerId: NEW_ID, runtime: 'podman' } };
+    const project = (liveContainers, observation) => {
+        const [entry] = collectAgentRuntimeStates({ registry, liveContainers, routes: {} });
+        return observation === null ? entry : applyCurrentNoWaitReadiness(entry, registry, { readMarker: () => ({}), createBinding: () => ({}), observeRun: () => ({ state: observation }) });
+    };
+    const live = { containerName: 'canonical', containerId: NEW_ID, agentName: 'worker', repoName: 'demo', state: { status: 'running', running: true, pid: 7 } };
+    for (const observation of ['pending', 'starting']) {
+        // The container exited: `ps` lists no running container, the collector yields its stopped entry, the projection says `starting`.
+        const exited = project([], observation);
+        assert.deepEqual([exited.state.status, exited.engineRunning], ['starting', false], observation);
+        assert.deepEqual(((({ availability, limitsState }) => ({ availability, limitsState }))(statusOf(f, [exited], -60_000))), { availability: 'stopped', limitsState: 'unavailable' }, `exited, no-wait ${observation}`);
+        // The container runs and no route is active yet: that is starting.
+        const running = project([live], observation);
+        assert.equal(running.engineRunning, true);
+        assert.deepEqual(((({ availability, limitsState }) => ({ availability, limitsState }))(statusOf(f, [running], -60_000))), { availability: 'starting', limitsState: 'applied' }, `running, no-wait ${observation}`);
+    }
+    // Without a no-wait marker an exited container is plainly stopped.
+    assert.deepEqual(statusOf(f, [project([], null)], -60_000).availability, 'stopped');
 });

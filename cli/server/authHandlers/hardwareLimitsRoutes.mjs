@@ -143,7 +143,9 @@ export function buildHardwareLimitsState({ context, installed, registry, routing
             const runtime = staleSnapshot ? null : snapshotRuntime;
             const ready = runtime?.state?.ready === true;
             // The engine runs it but no route is active yet (agentRuntimeState status `starting`): starting, not stopped.
-            const engineStarting = runtime?.state?.status === 'starting';
+            // Only a container the ENGINE reports running can be starting: the no-wait projection marks any pending run `starting`,
+            // including one whose container has exited and is not listed at all.
+            const engineStarting = runtime?.state?.status === 'starting' && runtime?.engineRunning === true;
             const running = runtime?.state?.running === true || engineStarting;
             const availability = problem?.state || (projection || runtime?.state?.status === 'failed' ? 'failed' : ready ? 'ready' : running || staleSnapshot ? 'starting' : 'stopped');
             const desiredMps = desired?.descriptor?.hardwareGpu;

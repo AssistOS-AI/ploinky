@@ -503,6 +503,7 @@ export function buildRequiredCaseManifest() {
             'S2.when-the-bound-expires-the-response-still-goes-out-and-says-the-status-may-lag',
             'S2.a-failed-apply-does-not-wait-for-a-metrics-reconcile',
             'S4.an-old-listing-published-after-the-apply-never-proves-the-new-container-stopped',
+            'T1.the-no-wait-projection-never-masks-a-container-the-engine-does-not-run-as-starting',
             'E.apply-outbound', 'E.apply-inbound', 'E.http-cause',
             'R.anonymous', 'R.nonadmin', 'R.guest', 'R.admin', 'R.origin', 'R.csrf', 'R.cross-session-csrf',
             'R.bearer-get', 'R.bearer-set', 'R.bearer-clear', 'R.bearer-apply', 'R.duplicate-authorization',

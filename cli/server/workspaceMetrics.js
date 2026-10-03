@@ -50,6 +50,8 @@ function publicRuntimeEntry(entry, metrics) {
     containerName: String(entry?.containerName || ''),
     // The container this state was read from: a reader of the snapshot can tell the current container from an earlier one of the same name.
     containerId: /^[a-f0-9]{64}$/.test(String(entry?.containerId || '')) ? String(entry.containerId) : '',
+    // The engine's own running bit, whatever the readiness projection says of the state.
+    engineRunning: entry?.engineRunning === true,
     agentName: String(entry?.agentName || '-'),
     repoName: String(entry?.repoName || '-'),
     runtime: String(entry?.runtime || 'container'),
