@@ -1722,3 +1722,17 @@ test('G.targeted-update-transaction-refuses-another-gate-under-the-lock-before-a
     assert.equal(stderrLines.some((line) => /only start, restart and update apply it/.test(line)), false, stderrLines.join('|'));
     assert.equal(world.events.includes('gate-write'), false, 'a targeted update never rewrites the gate');
 });
+
+// R20 (R2): the full update re-resolves its folder under the lock BEFORE it settles a gate-on to gate-off downgrade, as master
+// orders it, so a scope that fails there leaves the running gate-on Box, its graph and its saved gate untouched.
+test('G.full-update-scope-failure-under-the-lock-settles-no-downgrade', async (t) => {
+    const world = downgradeWorld(t, { boxRunning: true, graphRunning: true });
+    const missing = path.join(world.state.root, 'folder-that-vanished-while-waiting-for-the-lock');
+    const request = Object.freeze({ kind: 'all', folder: 'vanished', folderPath: missing });
+    const error = await world.supervisor.runUpdateTransaction(['update'], { request }).then(() => null, (failure) => failure);
+    assert.equal(error?.code, 'PLOINKY_UPDATE_SCOPE_MISSING', String(error?.message));
+    for (const effect of ['graph-stop', 'box-stop', 'box-remove', 'box-start']) assert.equal(world.events.includes(effect), false, `${effect} did not run: ${world.events.join(' ')}`);
+    assert.equal(world.events.some((event) => event.startsWith('box-create')), false, world.events.join(' '));
+    assert.equal(world.state.gateStore.read(world.state.identity).enabled, true, 'the saved gate is still on');
+    assert.deepEqual(createTransitionStore({ identity: world.state.identity, homeDirectory: world.state.home }).listPending(), [], 'no downgrade journal was written');
+});

@@ -2080,13 +2080,15 @@ export function createBoxSupervisor({
         const plan = updatePlan(coreArgs, options);
         return lockedMutation(async (identity, lock, ownership) => {
             const barrierWarnings = await assertNoUpdateRecoveryBarrier(identity, ownership);
+            // The folder is re-resolved under the lock before anything is settled or changed, as master does: a scope that
+            // fails here must not leave a settled gate-on to gate-off transition behind.
+            const scope = lockedUpdateScope(identity, plan);
             // The update-recovery barrier comes first, then the hardware-limits gate. The full form applies the gate request and
             // settles a pending or requested gate-on to gate-off transition (it reconciles the Box); the targeted forms never
             // replace a Box, so they follow the saved gate and refuse while a downgrade is pending.
             const hardwareGate = selectHardwareGateForOperation(identity, plan.request.kind === 'all' ? 'update' : TARGETED_UPDATE_OPERATION, lock);
             if (plan.request.kind === 'all') ownership = await settleHardwareTransitions(identity, lock, ownership, hardwareGate, 'update');
             else assertNoPendingHardwareTransition(identity, 'update');
-            const scope = lockedUpdateScope(identity, plan);
             const coreArgv = updateCoreArgv(plan, scope);
             const priorCoreStartArgv = captureCoreStartArgv(identity);
             const activity = sampleGraphActivity(identity, ownership);
