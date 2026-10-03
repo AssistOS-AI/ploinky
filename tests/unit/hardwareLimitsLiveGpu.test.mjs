@@ -2233,3 +2233,23 @@ test('R17.a-status-freshness-the-apply-response-does-not-state-fails-the-immedia
     }
 });
 
+test('R17.cancelled-forced-settlement-and-error-code-truth-reads-keep-their-error-and-are-never-trusted', async t => {
+    for (const [label, flag, pattern, keepsData] of [
+        ['cancelled', { cancelled: true }, /cancelled|Live command failed/, false],
+        ['forced settlement', { settlementForced: true }, /forced settlement/, true],
+        ['an error code', { errorCode: 'ENOENT' }, /error ENOENT/, true],
+    ]) {
+        const w = await provisioned(t, { faults: { ...STOPPED, truthInspectResult: { status: 0, ...flag, stdout: VALID_INSPECT } } });
+        const p1 = caseOf(await liveCases(w, ['LIVE-P1'], { timings: QUICK_POLL }), 'LIVE-P1');
+        assert.equal(p1.result, 'fail', `${label}: ${JSON.stringify(p1).slice(0, 200)}`);
+        const record = w.artifacts.get('gpu-live-p1').statusUnsettled;
+        for (const captured of [record.containers, record.containersAfterPoll]) {
+            assert.ok(pattern.test(captured[0].stateError), `${label}: ${JSON.stringify(captured[0].stateError)}`);
+            assert.equal(captured[0].stateTrusted, false, label);
+            if (keepsData) assert.equal(captured[0].state.exitCode, 137, `${label}: the printed data is kept, marked partial`);
+        }
+        assert.equal(/exit 137/.test(p1.reason), false, `${label}: no conclusion from an untrusted read`);
+        nothingOwned(w);
+    }
+});
+

@@ -658,6 +658,7 @@ export function buildRequiredCaseManifest() {
             'T8.a-failed-transport-keeps-its-error-and-marks-the-printed-data-partial-for-the-inspect-and-the-logs',
             'T10.a-state-sized-503-poll-error-keeps-its-status-and-code-as-fields-and-a-slow-capture-does-not-use-up-the-poll-window',
             'R17.a-status-freshness-the-apply-response-does-not-state-fails-the-immediate-check',
+            'R17.cancelled-forced-settlement-and-error-code-truth-reads-keep-their-error-and-are-never-trusted',
             'T9.the-first-artifact-write-holds-the-immediate-failure-before-any-capture-or-poll',
             'T9.a-failed-container-listing-in-both-captures-still-fails-with-the-evidence-present',
             'T9.synthetic-secrets-in-a-poll-error-a-thrown-read-and-a-failed-read-stderr-are-redacted',
