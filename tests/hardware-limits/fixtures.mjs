@@ -643,6 +643,11 @@ export function buildRequiredCaseManifest() {
             'X5.c5-fails-when-a-stale-lock-is-recovered-without-one-committed-clear-or-the-abandoned-holder-is-alive-or-another-lock',
             'X5.c5-fails-when-the-box-is-still-running-after-the-stop-and-when-the-stop-fails',
             'X5.c5-fails-when-a-holder-ends-without-its-own-verified-release',
+            'X5.c5-fails-naming-the-write-that-was-not-committed',
+            'X5.c5-fails-naming-the-host-command-that-did-not-exit-zero-or-did-nothing',
+            'X5.c5-fails-when-the-store-is-not-what-each-step-requires',
+            'X5.c5-fails-when-the-barrier-survives-its-removal-or-the-host-ignores-it-or-the-store-moves-under-it',
+            'X5.c5-fails-when-a-second-recovery-does-not-preserve-its-lock-and-when-the-live-host-holder-does-not-release',
         ]),
         ...leaves(P, 'p4', unit('hardwareLimitsLiveAvailability.test.mjs'), [
             'X4.c3-blocks-fixtures-and-pins-are-wired-and-the-dedicated-workspace-has-its-own-ports',
