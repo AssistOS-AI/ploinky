@@ -430,6 +430,8 @@ test('S4.an-old-listing-published-after-the-apply-never-proves-the-new-container
     // 1. An engine listing starts BEFORE the Apply, sees no container, and is held.
     const held = monitor.reconcile();
     await new Promise((resolve) => setImmediate(resolve));
+    // A real gap: the read began strictly before the observation, never in the same millisecond.
+    await new Promise((resolve) => setTimeout(resolve, 3));
     // 2. The Apply creates the new running container; the bounded refresh cannot start a newer reconcile and expires.
     const response = await request(f, { method: 'POST', body: applyBody(f), dependencies: deps({ apply: async () => { engine.containers = [newRunning]; observation.observedAt = new Date().toISOString(); return { ok: true, status: 200, results: [] }; } }) });
     assert.equal(response.body.statusFresh, false);
@@ -655,6 +657,48 @@ test('F1.a-failed-engine-read-is-stale-even-when-the-instance-has-no-applied-obs
             assert.equal(monitor.latest.readFailed, true);
             assert.deepEqual(status(), { availability: 'starting', failed: true });
         }
+    }
+});
+
+// R18-4: the tie rule. A read that STARTED in the same millisecond as the observation is stale (never a stop read from a past moment);
+// reconcileAfter accepts only a reconcile that started strictly after `since`; and so a reconcile it accepted is never judged predating.
+test('R18-4.a-read-that-started-in-the-same-millisecond-as-the-observation-is-stale', (t) => {
+    const f = fixture(t);
+    const [productionEntry] = collectAgentRuntimeStates({ registry: { canonical: { ...f.registry.canonical, containerId: NEW_ID, runtime: 'podman' } }, liveContainers: [], routes: {} });
+    const stopped = { availability: 'stopped', limitsState: 'unavailable' }; const starting = { availability: 'starting', limitsState: 'applied' };
+    for (const [offset, expected] of [[-1, stopped], [0, starting], [1, starting]]) {
+        const { availability, limitsState } = statusOf(f, [productionEntry], offset);
+        assert.deepEqual({ availability, limitsState }, expected, `the observation ${offset} ms after the read started`);
+    }
+});
+
+test('R18-4.a-reconcile-that-started-at-the-same-millisecond-as-since-is-not-fresh', async () => {
+    const monitor = new Monitor({ readRegistry: () => ({}), collectContainers: () => new Promise(() => {}), runtimeStateOptions: { activeGeneration: null, routes: {} }, readHardwareContext: () => ({ gate: 'off' }), readRouting: () => ({ routes: {} }), containerStats: false });
+    const since = Date.now() - 5;
+    monitor.completedReconcileStartedAt = since;
+    assert.equal((await monitor.reconcileAfter(since, 30)).fresh, false, 'a tie is not fresh');
+    monitor.completedReconcileStartedAt = since + 1;
+    assert.equal((await monitor.reconcileAfter(since, 30)).fresh, true, 'one millisecond later is');
+});
+
+test('R18-4.a-reconcile-accepted-by-reconcileAfter-is-never-judged-predating-an-observation-the-same-apply-wrote', async (t) => {
+    const f = fixture(t);
+    const { observation, readApplied, record } = recreated(f, new Date(0).toISOString());
+    const engine = { containers: [] };
+    const newRunning = engineEntry({ containerId: NEW_ID, state: { status: 'running', running: true, pid: 7 } });
+    const monitor = new Monitor({
+        readRegistry: () => ({ canonical: record }), runtimeStateOptions: { activeGeneration: null, routes: { worker: { container: 'canonical', repo: 'demo', agent: 'worker', hostPort: 4100 } } },
+        readHardwareContext: () => ({ gate: 'off' }), readRouting: () => ({ routes: {} }), containerStats: false, collectContainers: async () => engine.containers,
+    });
+    const deps = { getRegistry: () => ({ canonical: record }), getMetrics: () => monitor.latest, readApplied, admit: placementAdmit, refreshMetrics: (since) => monitor.reconcileAfter(since, 2000) };
+    // No sleeps: the reconcile before the Apply, the observation and `since` fall in the same millisecond as often as the clock allows.
+    for (let round = 0; round < 40; round += 1) {
+        engine.containers = []; await monitor.reconcile();
+        const response = await request(f, { method: 'POST', body: applyBody(f), dependencies: { ...deps, apply: async () => { engine.containers = [newRunning]; observation.observedAt = new Date().toISOString(); return { ok: true, status: 200, results: [] }; } } });
+        assert.equal(response.body.statusFresh, true, `round ${round}`);
+        const read = containerOf(await request(f, { dependencies: deps }));
+        assert.deepEqual({ availability: read.availability, limitsState: read.limitsState }, { availability: 'ready', limitsState: 'applied' }, `round ${round}: the accepted reconcile read the new container`);
+        assert.ok(Date.parse(monitor.latest.readStartedAt) > Date.parse(observation.observedAt), `round ${round}: it started strictly after the observation`);
     }
 });
 

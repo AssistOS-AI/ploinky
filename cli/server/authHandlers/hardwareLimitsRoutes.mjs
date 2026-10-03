@@ -133,11 +133,11 @@ export function buildHardwareLimitsState({ context, installed, registry, routing
             // for it, the snapshot predates the instance: it says nothing about it, and the instance is starting, never stopped.
             const entryId = snapshotRuntime?.containerId || '';
             const currentId = /^[a-f0-9]{64}$/.test(record.containerId || '') ? record.containerId : '';
-            // Freshness is judged by when the engine read STARTED, not by when the snapshot was published (a read begun before the Apply
-            // can publish long after it).
+            // Freshness is judged by when the engine read STARTED, not when it was published; a read that started in the same millisecond as the observation is stale too (`<=`).
+            // reconcileAfter accepts only a reconcile that started strictly after the Apply ended, and the Apply writes its observations first: an accepted one never predates.
             const sampledAt = Date.parse(metrics?.readStartedAt ?? metrics?.sampledAt);
             const observedAt = Date.parse(matchingObservation?.observedAt);
-            const predates = Number.isFinite(sampledAt) && Number.isFinite(observedAt) && sampledAt < observedAt;
+            const predates = Number.isFinite(sampledAt) && Number.isFinite(observedAt) && sampledAt <= observedAt;
             // After an engine read that FAILED the snapshot only keeps the last good read's runtimes: none of them is a statement about now,
             // so every instance is judged stale (never `ready`, never a stop read from a past moment).
             const readFailed = metrics?.readFailed === true;
