@@ -481,3 +481,51 @@ test('T1.the-no-wait-projection-never-masks-a-container-the-engine-does-not-run-
     // Without a no-wait marker an exited container is plainly stopped.
     assert.deepEqual(statusOf(f, [project([], null)], -60_000).availability, 'stopped');
 });
+
+// T2: reconcileAfter never occupies the event loop, whatever the reconcile does.
+const failingMonitor = () => new Monitor({
+    readRegistry: () => { throw Object.assign(new Error('agents registry is unreadable or corrupt: synthetic'), { code: 'EDGE_GENERATION_INVALID' }); },
+    collectContainers: async () => [], runtimeStateOptions: { activeGeneration: null, routes: {} }, readHardwareContext: () => ({ gate: 'off' }), readRouting: () => ({ routes: {} }), containerStats: false,
+});
+test('T2.a-reconcile-that-fails-before-any-io-returns-not-fresh-within-the-bound-with-bounded-publishes-and-the-event-loop-free', async () => {
+    const monitor = failingMonitor();
+    let publishes = 0; monitor.on('snapshot', () => { publishes += 1; });
+    let ticks = 0; const interval = setInterval(() => { ticks += 1; }, 10);
+    const t0 = performance.now(); let timeoutZeroAfter = null; setTimeout(() => { timeoutZeroAfter = performance.now() - t0; }, 0);
+    const result = await monitor.reconcileAfter(Date.now(), 600);
+    const elapsed = performance.now() - t0;
+    clearInterval(interval);
+    assert.equal(result.fresh, false);
+    assert.ok(elapsed >= 550 && elapsed < 900, `returned at the bound (${Math.round(elapsed)} ms)`);
+    assert.ok(timeoutZeroAfter !== null && timeoutZeroAfter < 50, `a setTimeout(0) fired in ${timeoutZeroAfter} ms`);
+    assert.ok(ticks >= 20, `the interval kept firing (${ticks} ticks)`);
+    assert.ok(publishes <= 6, `publishes stayed bounded (${publishes})`);
+});
+
+test('T2.an-interval-reconcile-still-runs-and-a-successful-reconcileafter-is-fresh-at-once', async (t) => {
+    const f = fixture(t);
+    const record = { ...f.registry.canonical, containerId: NEW_ID };
+    const monitor = new Monitor({ readRegistry: () => ({ canonical: record }), collectContainers: async () => [], runtimeStateOptions: { activeGeneration: null, routes: {} }, readHardwareContext: () => ({ gate: 'off' }), readRouting: () => ({ routes: {} }), containerStats: false });
+    monitor.start();
+    try {
+        await monitor.reconcilePromise;
+        assert.ok(monitor.latest && monitor.latest.runtimes.length === 1, 'start() reconciled');
+        assert.ok(monitor.reconcileTimer && monitor.sampleTimer, 'the interval timers are armed');
+    } finally { clearInterval(monitor.reconcileTimer); clearInterval(monitor.sampleTimer); }
+    const t0 = performance.now();
+    assert.equal((await monitor.reconcileAfter(Date.now() - 1, 2000)).fresh, true);
+    assert.ok(performance.now() - t0 < 500);
+});
+
+test('T2.a-wait-for-a-time-that-has-not-come-publishes-a-bounded-number-of-times-and-leaves-timers-free', async (t) => {
+    const f = fixture(t);
+    const record = { ...f.registry.canonical, containerId: NEW_ID };
+    const monitor = new Monitor({ readRegistry: () => ({ canonical: record }), collectContainers: async () => [], runtimeStateOptions: { activeGeneration: null, routes: {} }, readHardwareContext: () => ({ gate: 'off' }), readRouting: () => ({ routes: {} }), containerStats: false });
+    let publishes = 0; monitor.on('snapshot', () => { publishes += 1; });
+    let timeoutZeroAfter = null; const t0 = performance.now(); setTimeout(() => { timeoutZeroAfter = performance.now() - t0; }, 0);
+    // `since` lies 300 ms ahead: no reconcile can start strictly after it for a while, however many are run.
+    const result = await monitor.reconcileAfter(Date.now() + 300, 400);
+    assert.equal(result.fresh, false);
+    assert.ok(timeoutZeroAfter !== null && timeoutZeroAfter < 50, `a setTimeout(0) fired in ${timeoutZeroAfter} ms`);
+    assert.ok(publishes <= 2 + Math.ceil(400 / 250), `publishes stayed bounded (${publishes})`);
+});

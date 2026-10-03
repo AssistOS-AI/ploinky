@@ -14,6 +14,8 @@ import { readRoutingConfig } from './routingFile.js';
 import { metricHardwareAvailability } from './workspaceMetricsAvailability.mjs';
 
 const RECONCILE_INTERVAL_MS = 5_000;
+export const POST_APPLY_STATUS_WAIT_MS = 4_000;
+export const RECONCILE_FAILURE_BACKOFF_MS = 250;
 const SAMPLE_INTERVAL_MS = 2_000;
 const execFileAsync = promisify(execFile);
 
@@ -77,6 +79,7 @@ export class WorkspaceMetricsMonitor extends EventEmitter {
     this.containerStats = containerStats;
     this.reconcilePromise = null;
     this.completedReconcileStartedAt = 0;
+    this.lastReconcileOk = null;
     // When the engine read behind `states` STARTED (epoch ms; 0 before the first). A snapshot says nothing about what happened after that,
     // however late it is published.
     this.statesReadStartedAt = 0;
@@ -139,13 +142,29 @@ export class WorkspaceMetricsMonitor extends EventEmitter {
 
   // Resolves once a reconcile that STARTED strictly after `since` (epoch ms) has completed and published, or `boundMs` has passed. One
   // already in flight that began earlier does not count: it may have read the engine before the change the caller made.
-  async reconcileAfter(since, boundMs = 4_000) {
+  //
+  // It never occupies the event loop: every turn yields a macrotask (timers, I/O and the interval reconcile keep running), and after a
+  // reconcile that failed the next attempt waits RECONCILE_FAILURE_BACKOFF_MS instead of starting at once (a reconcile that fails before
+  // any I/O settles in microtasks, and would otherwise be repeated, and published, as fast as the CPU allows).
+  async reconcileAfter(since, boundMs = POST_APPLY_STATUS_WAIT_MS) {
     const deadline = Date.now() + boundMs;
     const waitFor = (promise, ms) => new Promise((resolve) => { const timer = setTimeout(resolve, ms); Promise.resolve(promise).finally(() => { clearTimeout(timer); resolve(); }); });
+    // At most this many reconciles are started for one wait, so the snapshot is published a bounded number of times.
+    const maxAttempts = 2 + Math.ceil(boundMs / RECONCILE_FAILURE_BACKOFF_MS); let attempts = 0;
+    const pause = (ms) => new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.min(ms, deadline - Date.now()))));
     while (Date.now() < deadline) {
       if (this.completedReconcileStartedAt > since) return { fresh: true };
+      const failedBefore = this.lastReconcileOk === false;
       if (this.reconcileInFlight) await waitFor(this.reconcilePromise, Math.max(1, deadline - Date.now()));
-      else await waitFor(this.reconcile(), Math.max(1, deadline - Date.now()));
+      else {
+        // The previous reconcile failed: let the interval or the backoff come before another attempt.
+        if (failedBefore || attempts >= maxAttempts) await pause(RECONCILE_FAILURE_BACKOFF_MS);
+        if (Date.now() >= deadline || this.completedReconcileStartedAt > since) continue;
+        if (attempts >= maxAttempts) continue;
+        attempts += 1;
+        await waitFor(this.reconcile(), Math.max(1, deadline - Date.now()));
+      }
+      await pause(0);
     }
     return { fresh: this.completedReconcileStartedAt > since };
   }
@@ -171,11 +190,13 @@ export class WorkspaceMetricsMonitor extends EventEmitter {
       })));
       completed = true;
     } catch (_) {
+      this.lastReconcileOk = false;
       this.publish();
       return;
     } finally {
       this.reconcileInFlight = false;
     }
+    this.lastReconcileOk = true;
     const names = this.runningContainerNames();
     const key = names.join('\0');
     if (key !== this.activeContainerKey) this.statsUnsupportedKey = '';
