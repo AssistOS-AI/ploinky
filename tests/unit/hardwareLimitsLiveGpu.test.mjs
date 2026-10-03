@@ -2219,3 +2219,17 @@ test('T9.an-aborted-run-stops-the-polling-at-once-and-the-poll-error-list-is-cap
     nothingOwned(w);
 });
 
+// --- R17: unknown freshness, the other transport flags of a truth read, and the persist inside the poll loop -------------------------
+test('R17.a-status-freshness-the-apply-response-does-not-state-fails-the-immediate-check', async t => {
+    for (const unknown of ['omit', 'null']) {
+        const w = await provisioned(t, { faults: { statusFreshUnknown: unknown } });
+        const p1 = caseOf(await liveCases(w, ['LIVE-P1'], { timings: { convergenceMs: 100, convergencePollMs: 10 } }), 'LIVE-P1');
+        assert.equal(p1.result, 'fail', `${unknown}: ${JSON.stringify(p1).slice(0, 300)}`);
+        assert.match(p1.reason, /did not report a fresh status/, unknown);
+        const record = w.artifacts.get('gpu-live-p1').statusUnsettled;
+        assert.equal(record.statusFresh, null, unknown);
+        assert.equal(record.immediate[0].availability, 'ready', 'the instance itself reads ready; only the unknown freshness fails it');
+        nothingOwned(w);
+    }
+});
+

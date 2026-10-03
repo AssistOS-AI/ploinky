@@ -376,7 +376,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
                 return { status: 409, text: JSON.stringify({ ok: false, status: 409, error: 'TARGETED_DRAIN_FAILED', message, ...(faults.applyBodyPadding ? { padding: 'x'.repeat(faults.applyBodyPadding) } : {}), cause, token: { epoch: model.store.epoch, revision: model.store.revision }, expandedContainers: [],
                     results: roles.map(role => ({ key: key(role), state: 'pending', problem: null, error: 'TARGETED_DRAIN_FAILED', message, cause })) }) };
             }
-            return { status: 200, text: JSON.stringify({ ok: true, statusFresh: !faults.statusLagMs, statusWaitMs: 12, ...(faults.statusLagMs ? { statusNote: 'The workspace metrics snapshot may lag this Apply by a few seconds.' } : {}), expandedContainers: faults.applyUnreported ? [] : [...model.lastReplaced].filter(role => !roles.includes(role)).map(role => key(role)), results: faults.applyUnreported ? [] : roles.map(role => ({ key: key(role), state: 'applied' })) }) };
+            return { status: 200, text: JSON.stringify({ ok: true, ...(faults.statusFreshUnknown === 'omit' ? {} : { statusFresh: faults.statusFreshUnknown === 'null' ? null : !faults.statusLagMs }), statusWaitMs: 12, ...(faults.statusLagMs ? { statusNote: 'The workspace metrics snapshot may lag this Apply by a few seconds.' } : {}), expandedContainers: faults.applyUnreported ? [] : [...model.lastReplaced].filter(role => !roles.includes(role)).map(role => key(role)), results: faults.applyUnreported ? [] : roles.map(role => ({ key: key(role), state: 'applied' })) }) };
         }
         return { status: 400, text: JSON.stringify({ ok: false, error: 'unknown_action' }) };
     }
