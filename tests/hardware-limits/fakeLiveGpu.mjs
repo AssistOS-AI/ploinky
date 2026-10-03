@@ -538,6 +538,8 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
             return ok(`Cleared the stored hardware limits of ${ref}.\n`);
         }
         if (verbs.includes('restart')) {
+            // `restartResult`: the restart command itself fails before it acts (a nonzero exit, a timeout, a spawn error).
+            if (faults.restartResult) return ok('', faults.restartResult);
             const ref = args.at(-1); const role = ref.split('/')[1];
             await applyFlow([role]);
             return ok('restarted\n');

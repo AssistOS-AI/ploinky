@@ -1827,7 +1827,7 @@ test('P3R.p1-and-p3-record-the-drain-acknowledgement-basis-for-every-apply-and-t
     const p3 = w.artifacts.get('gpu-live-p3');
     assert.ok(p3.drainAcknowledgements.length >= 5, JSON.stringify(p3.drainAcknowledgements.map(entry => entry.label)));
     assert.ok(p3.drainAcknowledgements.every(entry => entry.applyStatus === 200 && entry.results.every(result => result.state === 'applied') && entry.basis === basis.basis && entry.source === basis.source));
-    assert.deepEqual(p3.restartDrainAcknowledgement, { command: 'restart', ...basis });
+    assert.deepEqual(p3.restartDrainAcknowledgement, { command: 'restart', acknowledged: true, ...basis });
     nothingOwned(w);
     // A refused drain is a failed Apply: no acknowledgement is recorded for it.
     const refused = await provisioned(t, { faults: { base: { fixtureAgentCommand: 'node -e "setInterval(()=>{},3600000)"' } } });
@@ -1859,4 +1859,28 @@ test('R12c.p3-fails-when-the-first-default-is-not-the-rounded-value-and-when-the
     assert.match(sameCase.reason, /The raised share does not change the server default \(1024 MiB for both\)/);
     assert.deepEqual(same.artifacts.get('gpu-live-p3').expectedDefaults, { first: 1024, raised: 1024 });
     nothingOwned(same);
+});
+
+// --- M-EVID-03: a restart that did not succeed never records a drain acknowledgement --------------------------------------
+test('M-EVID-03.a-restart-that-fails-times-out-or-cannot-spawn-records-its-real-outcome-and-no-acknowledgement', async t => {
+    for (const [label, restartResult, expected] of [
+        ['a nonzero exit', { status: 1, stderr: 'ploinky: synthetic pre-action refusal' }, { status: 1, signal: null, timedOut: false, transportError: null, stderr: 'ploinky: synthetic pre-action refusal' }],
+        ['a timeout', { status: null, signal: 'SIGKILL', timedOut: true }, { status: null, signal: 'SIGKILL', timedOut: true, transportError: null, stderr: '' }],
+        ['a spawn error', { status: null, errorCode: 'ENOENT' }, { status: null, signal: null, timedOut: false, transportError: 'ENOENT', stderr: '' }],
+    ]) {
+        const w = await provisioned(t, { faults: { restartResult } });
+        const p3 = caseOf(await liveCases(w, ['LIVE-P3']), 'LIVE-P3');
+        assert.equal(p3.result, 'fail', `${label}: ${JSON.stringify(p3).slice(0, 300)}`);
+        const record = w.artifacts.get('gpu-live-p3').restartDrainAcknowledgement;
+        assert.deepEqual(record, { command: 'restart', acknowledged: false, outcome: expected }, label);
+        assert.equal(JSON.stringify(record).includes('assertCleanTermination'), false, `${label}: no acknowledgement basis is claimed`);
+        nothingOwned(w);
+    }
+    // The positive control: a successful restart carries the acknowledgement and the basis.
+    const ok = await provisioned(t);
+    const p3 = caseOf(await liveCases(ok, ['LIVE-P3']), 'LIVE-P3');
+    assert.equal(p3.result, 'pass', JSON.stringify(p3).slice(0, 300));
+    const record = ok.artifacts.get('gpu-live-p3').restartDrainAcknowledgement;
+    assert.equal(record.acknowledged, true); assert.match(record.basis, /assertCleanTermination/);
+    nothingOwned(ok);
 });

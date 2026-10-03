@@ -721,8 +721,21 @@ export function createGpuCases(ctx) {
             // `.ploinky` marker resolveWorkspaceIdentity (ploinky-box/identity.mjs) walks up to; the Box and its ports are the saved ones.
             await gate.check('P3-restart');
             const restartTimeline = startTimeline(identityE.daemon, [probeE]);
-            try { await command('gpu-restart', profile.node.path, [profile.candidate.path, 'restart', GPU_AGENT_REFS.probe], { deadlineMs: timings.applyMs, capture: `gpu-restart-${++captureCounter}` }); }
-            finally { recordHostState(); evidence.put('restartDrainAcknowledgement', { command: 'restart', ...DRAIN_ACKNOWLEDGEMENT_BASIS }); evidence.put('restartTimeline', evaluateDrain(await restartTimeline.stop(), { quit: true })); }
+            let restartResult = null;
+            try {
+                restartResult = await command('gpu-restart', profile.node.path, [profile.candidate.path, 'restart', GPU_AGENT_REFS.probe], { deadlineMs: timings.applyMs, capture: `gpu-restart-${++captureCounter}`, tolerate: true });
+                requireTransport(restartResult);
+                // Only a restart that completed successfully supports the drain inference.
+                evidence.put('restartDrainAcknowledgement', { command: 'restart', acknowledged: true, ...DRAIN_ACKNOWLEDGEMENT_BASIS });
+            } catch (error) {
+                // A restart that failed, timed out or never ran proves nothing about a drain: its real outcome is the record.
+                evidence.put('restartDrainAcknowledgement', { command: 'restart', acknowledged: false, outcome: {
+                    status: Number.isInteger(restartResult?.status) ? restartResult.status : null, signal: restartResult?.signal ?? null, timedOut: Boolean(restartResult?.timedOut),
+                    transportError: restartResult?.errorCode ?? (restartResult ? null : String(error?.message || error).slice(0, 200)), stderr: boundedTail(restartResult?.stderr ?? '', 300).text,
+                } });
+                throw error;
+            }
+            finally { recordHostState(); evidence.put('restartTimeline', evaluateDrain(await restartTimeline.stop(), { quit: true })); }
             expects(evidence.data.restartTimeline.ok, `Host clear and restart: the daemon quit before its client drained, or never quit: ${JSON.stringify(evidence.data.restartTimeline.violation)}`);
             const stateAfterRestart = await admin.state();
             await expectDaemonAbsent(identityE.daemon, stateAfterRestart, 'host clear and ordinary restart', evidence);
