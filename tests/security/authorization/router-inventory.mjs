@@ -40,11 +40,11 @@ add('users-delete', 'DELETE', '/api/agents/:agent/users/:userId', 'cli/server/au
 add('removed-settings', '*', '/api/agents/:agent/settings', 'cli/server/authHandlers/userAdminRoutes.js:173', 'private', 'Reserved removed route returns 404 before session resolution; provider settings live in UserPersisto.');
 add('marketplace-repos-read', 'GET', '/api/marketplace/repos', 'cli/server/authHandlers/marketplaceRoutes.js:616', 'session', 'All authenticated roles can discover the repository catalog. Assertion callers require bound marketplace-read authority. Audit skillSource.source/origin separately from catalog access.', { anchor: 'const marketplacePayload = () =>' });
 add('marketplace-agents-read', 'GET', '/api/marketplace/agents', 'cli/server/authHandlers/marketplaceRoutes.js:591', 'session', 'All authenticated roles can read agent runtime state and their own identity; canManage derives from real administrator. Audit manifestPath, pid and containerName separately from agent access.', { anchor: '...buildMarketplaceAgents(req.user, agentListOptions),' });
-add('hardware-limits-read', 'GET', '/api/marketplace/hardware-limits', 'cli/server/authHandlers/hardwareLimitsRoutes.mjs:210', 'admin', 'Administrator cookie session only; every Bearer form is rejected before body or store access. Workspace-master-key cookie/CSRF forgery remains an accepted v1 exposure.', { anchor: "if (method === 'GET') {" });
+add('hardware-limits-read', 'GET', '/api/marketplace/hardware-limits', 'cli/server/authHandlers/hardwareLimitsRoutes.mjs:226', 'admin', 'Administrator cookie session only; every Bearer form is rejected before body or store access. Workspace-master-key cookie/CSRF forgery remains an accepted v1 exposure.', { anchor: "if (method === 'GET') {" });
 for (const [action, line, anchor] of [
-  ['set_agent_limits', 241, "const result = body.action === 'set_agent_limits'"],
-  ['clear_agent_limits', 241, "const result = body.action === 'set_agent_limits'"],
-  ['apply', 227, "if (body.action === 'apply') {"],
+  ['set_agent_limits', 263, "const result = body.action === 'set_agent_limits'"],
+  ['clear_agent_limits', 263, "const result = body.action === 'set_agent_limits'"],
+  ['apply', 243, "if (body.action === 'apply') {"],
 ]) {
   add(`hardware-limits-${action}`, 'POST', '/api/marketplace/hardware-limits', `cli/server/authHandlers/hardwareLimitsRoutes.mjs:${line}`, 'admin', 'Administrator session, exact Origin/current CSRF proof, routing authority and CAS token. Apply uses exact registry keys and checks policy/barrier before destructive work and create. No pool action.', { body: { action }, anchor, gap: 'Live mutations require a selected disposable Box; offline authorization and exact-identity cases are mandatory.' });
 }
