@@ -671,6 +671,18 @@ export function buildRequiredCaseManifest() {
             'Z3c.an-untyped-planning-failure-reports-the-planning-step',
         ]),
         // The MPS readback is conclusive: the reply is in the error, the cause, the journal and lastReadback.
+        // P1U: the live fixture agents acknowledge a targeted drain with exit 0 (real processes, no engine).
+        ...leaves(P, 'p4', unit('hardwareLimitsFixtureDrain.test.mjs'), [
+            'P1U.the-fixture-manifest-carries-the-exec-form-agent-command-that-acknowledges-a-drain',
+            'P1U.the-fixture-agent-exits-zero-without-a-signal-on-sigterm-in-the-sh-launch-form',
+            'P1U.the-fixture-agent-exits-zero-without-a-signal-on-sigint-in-the-sh-launch-form',
+            'P1U.the-fixture-agent-exits-zero-without-a-signal-on-sighup-in-the-sh-launch-form',
+            'P1U.the-fixture-agent-exits-zero-without-a-signal-on-sigterm-in-the-bash-launch-form',
+            'P1U.the-fixture-agent-exits-zero-without-a-signal-on-sigint-in-the-bash-launch-form',
+            'P1U.the-fixture-agent-exits-zero-without-a-signal-on-sighup-in-the-bash-launch-form',
+            'P1U.the-previous-fixture-agent-is-killed-by-sigterm-as-in-live-attempt-6-and-is-not-an-acknowledgement',
+            'P1U.the-drain-exit-code-the-fakes-use-is-measured-from-the-real-process',
+        ]),
         // M-MPS-05: the largest share is reporting only; a real default change still restarts the cohort.
         ...leaves(P, 'p4', unit('hardwareLimitsMpsDefaultIdentity.test.mjs'), [
             'M05.the-daemon-identity-fields-are-compared-and-the-reported-share-never-counts',
