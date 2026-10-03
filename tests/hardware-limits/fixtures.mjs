@@ -604,6 +604,7 @@ export function buildRequiredCaseManifest() {
             'R21.provision-saves-the-box-labels-image-privileges-and-publications-as-artifacts-in-every-block',
             'R21.a-box-contract-query-that-fails-is-recorded-as-a-limitation-and-never-fails-provisioning',
             'R21.the-box-contract-observation-is-planned-shown-and-uses-parser-clean-read-only-argv',
+            'R23.the-prepare-live-summary-renders-the-note-of-every-planned-command-step',
         ]),
         ...leaves(P, 'p4', unit('hardwareLimitsHelperRealModules.test.mjs'), [
             'X4.c6-real-modules-the-intent-names-the-generations-own-authentication-route',

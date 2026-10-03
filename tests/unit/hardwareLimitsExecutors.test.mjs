@@ -470,6 +470,24 @@ test('R21.the-box-contract-observation-is-planned-shown-and-uses-parser-clean-re
     assert.ok(summary.includes('box-contract') && summary.includes('<BOX_CONTRACT_FORMAT>') && !summary.includes('HostConfig.Privileged'), 'the long template is named, never printed');
 });
 
+// R23-3: the approver reads the note of every planned step, not only its command (the box-contract query's failure is recorded, never a provisioning failure).
+test('R23.the-prepare-live-summary-renders-the-note-of-every-planned-command-step', async t => {
+    for (const block of ['apparatus-cpu', 'apparatus-core', 'apparatus-authority']) {
+        const w = world(t, { block });
+        const summary = renderSummary(w.run, w.runPath);
+        const rows = summary.split('\n');
+        const steps = [...w.run.target.plan.provision, ...w.run.target.plan.live].filter(entry => entry.argv && entry.note);
+        assert.ok(steps.length > 3, `${block}: steps with notes exist`);
+        for (const entry of steps) {
+            const row = rows.find(line => line.startsWith(`| ${entry.id} | `));
+            assert.ok(row, `${block}: a command row for ${entry.id}`);
+            assert.ok(row.includes(String(entry.note).replace(/\s+/g, ' ').replaceAll('|', '\\|')), `${block}: the row of ${entry.id} carries its note: ${row}`);
+        }
+        const contract = rows.find(line => line.startsWith('| box-contract | '));
+        assert.ok(contract && contract.includes('a failure is recorded, never a provisioning failure'), `${block}: ${contract}`);
+    }
+});
+
 // ---------------------------------------------------------------------------------------------------------------------------------
 // R23-1: the attestation's retries, and the exec's ports.
 test('X4.c6-an-expired-attempt-that-the-product-retried-is-counted-and-the-last-successful-attempt-is-judged', () => {

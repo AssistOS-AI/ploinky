@@ -618,7 +618,9 @@ export function renderSummary(run, manifestPath) {
         .map(entry => {
             const env = Object.entries(entry.env || {}).map(([key, value]) => `${key}=${value}`);
             const text = [...env, entry.binary, ...entry.argv].map(shown).join(' ').replaceAll('|', '\\|');
-            return `| ${entry.id} | \`${text}\`${entry.cwd ? ` in \`${entry.cwd}\`` : ''} |`;
+            // The step's note is part of what the approver reads (for example that a failing read-only evidence query is recorded, never a provisioning failure).
+            const note = entry.note ? ` (${String(entry.note).replace(/\s+/g, ' ').replaceAll('|', '\\|')})` : '';
+            return `| ${entry.id} | \`${text}\`${entry.cwd ? ` in \`${entry.cwd}\`` : ''}${note} |`;
         });
     const lines = [
         `# Live run proposal ${run.runId} (${run.block})`,
