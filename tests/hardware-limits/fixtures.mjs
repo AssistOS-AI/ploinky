@@ -361,7 +361,7 @@ export function buildRequiredCaseManifest() {
             'S.stale-lock-never-stolen-unproven', 'S.clear-all-keeps-pending-audit', ...sVectorIds(),
         ]),
         ...leaves(P, 'p1', unit('cgroupDelegation.test.mjs'), [
-            'CG.uid', 'CG.cgroup-v1', 'CG.readonly', 'CG.nsdelegate', 'CG.no-subprocess', 'CG.node-imports-only',
+            'CG.uid', 'CG.cgroup-v1', 'CG.readonly', 'CG.nsdelegate', 'CG.no-subprocess', 'CG.node-imports-only', 'CG.a-first-argument-that-is-not-a-script-path-is-an-import-and-a-script-path-still-runs-directly',
             'CG.writable-source-refused', 'CG.root-procs-owned-root', 'CG.core-owned-root', 'CG.only-ploinky-chowned',
             'CG.pid1-and-self-moved', 'CG.root-busy', 'CG.partial-retry', 'CG.idempotent-core-self',
             'CG.empty-controller-structural-success',

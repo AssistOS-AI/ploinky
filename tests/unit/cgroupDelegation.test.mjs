@@ -3,6 +3,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 
 import { prepareCgroupDelegation } from '../../ploinky-box/entrypoint/cgroupDelegation.mjs';
 import {
@@ -104,6 +106,20 @@ test('CG.node-imports-only', () => {
     const allowed = new Set(['node:fs', 'node:process', 'node:timers/promises']);
     for (const specifier of specifiers) assert.ok(allowed.has(specifier), `unexpected import ${specifier}`);
     assert.doesNotMatch(source, /\bexport\s+\*\s+from|\bexport\s+\{[^}]*\}\s+from/);
+});
+
+// `node -e SOURCE ARG` makes process.argv[1] the first ARG. The helper decides "run directly" from it, so an argument that is not a
+// script path (a URL, as a test or a tool passes when it imports the module) must be an import, never a crash and never a run.
+test('CG.a-first-argument-that-is-not-a-script-path-is-an-import-and-a-script-path-still-runs-directly', () => {
+    const imported = spawnSync(process.execPath, ['--input-type=module', '-e', "await import(process.argv[1]); process.stdout.write('imported');", SCRIPT_URL.href], { encoding: 'utf8' });
+    assert.equal(imported.status, 0, imported.stderr);
+    assert.equal(imported.stdout, 'imported', 'the helper did not run and printed nothing');
+    // Run by its script path it still runs: a wrong invocation answers with its usage refusal as one JSON line and a failing status.
+    const direct = spawnSync(process.execPath, [fileURLToPath(SCRIPT_URL), 'bogus'], { encoding: 'utf8' });
+    assert.equal(direct.status, 1, direct.stderr);
+    const result = JSON.parse(direct.stdout.trim());
+    assert.equal(result.structurallyPrepared, false);
+    assert.match(result.reason, /the only accepted invocation is `prepare`/);
 });
 
 function installation(t) {
