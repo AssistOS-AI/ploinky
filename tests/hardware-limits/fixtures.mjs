@@ -705,6 +705,8 @@ export function buildRequiredCaseManifest() {
             'V2.the-captured-driver-replies-are-pinned-and-normalize-exactly-in-the-product-parser-and-the-runner-classifier',
             'V2.a-seventeen-percent-share-of-a-6144-mib-gpu-is-applied-with-a-2048-mib-default-read-back-as-2g-and-a-1044m-client-env',
             'V2.a-daemon-that-answers-1g-for-a-configured-2048-mib-is-still-refused-and-the-message-carries-both-replies',
+            'M03.no-part-of-a-known-secret-in-a-reply-reaches-the-error-the-cause-the-journal-or-the-readback',
+            'M03.the-excerpt-redacts-before-escaping-and-cutting-and-keeps-ordinary-replies-and-structured-secrets-bounded',
         ]),
         // LIVE-P1: a recreate by image ID keeps the dependency installer's identity.
         ...leaves(P, 'p4', unit('hardwareLimitsInstallerImage.test.mjs'), [

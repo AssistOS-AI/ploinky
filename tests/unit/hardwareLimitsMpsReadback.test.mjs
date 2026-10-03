@@ -234,3 +234,53 @@ test('V2.a-daemon-that-answers-1g-for-a-configured-2048-mib-is-still-refused-and
     assert.match(reason, /MPS default readback does not match configuration \(requested 25% and 2048M; read 25% and 1073741824 bytes; SM \(reply: "25\\n"\), memory \(reply: "1G\\n"\)\)/);
     assert.equal(result.results[0].cause.step, 'set-defaults');
 });
+
+// M-MPS-03: credentials are redacted from the ORIGINAL reply, before it is escaped or cut to its 256 and 64 character bounds.
+// The secret is synthetic (never a real credential); it contains a newline and straddles both bounds.
+const SYNTHETIC = `SYNTH-${'abcdefghij'.repeat(10)}\n${'klmnopqrst'.repeat(20)}`;
+function withSyntheticSecret(callback) {
+    const name = 'PLOINKY_SYNTHETIC_TEST_TOKEN';
+    const before = process.env[name];
+    process.env[name] = SYNTHETIC;
+    const restore = () => { if (before === undefined) delete process.env[name]; else process.env[name] = before; };
+    try { const result = callback(); if (result?.then) return result.finally(restore); restore(); return result; } catch (error) { restore(); throw error; }
+}
+const prefixLeaks = blob => { for (let at = 0; at + 8 <= SYNTHETIC.length; at += 1) { if (blob.includes(SYNTHETIC.slice(at, at + 8)) || blob.includes(JSON.stringify(SYNTHETIC.slice(at, at + 8)).slice(1, -1))) return at; } return -1; };
+
+test('M03.no-part-of-a-known-secret-in-a-reply-reaches-the-error-the-cause-the-journal-or-the-readback', async () => {
+    assert.ok(SYNTHETIC.includes('\n') && SYNTHETIC.length > 300);
+    // The reply puts the secret across the 64 and the 256 character bounds, after an ordinary prefix.
+    const reply = `${'p'.repeat(40)}${SYNTHETIC}\n`;
+    await withSyntheticSecret(async () => {
+        const w = world({ replies: { sm: '25.0\n', memory: reply } });
+        const result = await w.apply();
+        assert.equal(result.status, 422, JSON.stringify(result).slice(0, 300));
+        const blob = `${JSON.stringify(result)}\n${JSON.stringify(w.state)}`;
+        assert.equal(prefixLeaks(blob), -1, 'a window of the secret reached the Apply result or the journal');
+        assert.ok(blob.includes('[REDACTED]'), 'the redaction is visible');
+        assert.ok(blob.includes(`reply: \\"${'p'.repeat(40)}[REDACTED]`) || blob.includes(`reply: "${'p'.repeat(40)}[REDACTED]`), 'the ordinary part of the reply is still shown');
+        assert.ok(w.state.lastReadback.memory.startsWith(`${'p'.repeat(40)}[REDACTED]`), w.state.lastReadback.memory);
+        assert.equal(w.state.lastReadback.sm, '25.0\\n');
+        assert.equal(w.state.lastProblem.cause.step, 'set-defaults');
+    });
+});
+
+test('M03.the-excerpt-redacts-before-escaping-and-cutting-and-keeps-ordinary-replies-and-structured-secrets-bounded', async () => {
+    withSyntheticSecret(() => {
+        for (const reply of [SYNTHETIC, `${'p'.repeat(40)}${SYNTHETIC}`, `${'p'.repeat(200)}${SYNTHETIC}`, `${SYNTHETIC}\n`, `x${SYNTHETIC.slice(0, 120)}`]) {
+            const shown = replyExcerpt(reply);
+            assert.ok(shown.length <= 64 && /^[\x20-\x7e]*$/.test(shown), shown);
+            if (reply.includes(SYNTHETIC)) assert.equal(prefixLeaks(shown), -1, JSON.stringify(shown));
+        }
+        // The secret value is not cut away piecemeal: a partial copy of it in the reply is not a known value and is shown as it is.
+        assert.equal(replyExcerpt(`x${SYNTHETIC.slice(0, 20)}`.replace('\n', '')).startsWith('xSYNTH-'), true);
+    });
+    // Ordinary replies keep their form, including a trailing newline and bounded length.
+    assert.equal(replyExcerpt('25.0\n'), '25.0\\n'); assert.equal(replyExcerpt('1G\n'), '1G\\n'); assert.equal(replyExcerpt('\n'), '\\n');
+    assert.equal(replyExcerpt('a\r\nb'), 'a\\nb'); assert.equal(replyExcerpt('x'.repeat(500)).length, 64); assert.equal(replyExcerpt(undefined), '');
+    // Structured and assignment-style credentials are redacted whole, before any cut.
+    assert.equal(replyExcerpt('token=hunter2'), 'token=[REDACTED]');
+    assert.equal(replyExcerpt(`{"password": "${'q'.repeat(90)}"}`).includes('qqqq'), false);
+    // A reply too long to redact whole is not shown at all; only its size is.
+    assert.match(replyExcerpt('z'.repeat(5000)), /^\[5000 bytes not shown\]$/);
+});

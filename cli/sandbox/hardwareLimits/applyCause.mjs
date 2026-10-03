@@ -48,14 +48,24 @@ export function formatApplyCause(cause) {
     return `${cause.step}: ${cause.errorClass}${cause.code ? ` (${cause.code})` : ''}: ${cause.message}`;
 }
 
+const REPLY_REDACTION_BOUND = 4096;
+
 /**
  * A sanitized excerpt of a reply, for an error or a journal: printable ASCII only (anything else becomes `?`),
  * a newline shown as `\n`, at most 64 bytes, and credentials redacted. Replies of the MPS control daemon are
  * numbers, so nothing else is expected; this keeps a surprising one bounded and harmless.
  */
 export function replyExcerpt(text, limit = 64) {
-    const escaped = String(text ?? '').replace(/\r?\n/g, '\\n').replace(/[^\x20-\x7e]/g, '?');
-    return sanitizeAuthorityDiagnostic(escaped.slice(0, 256), { limit: 256 }).slice(0, limit);
+    const raw = String(text ?? '');
+    // Credentials are redacted from the ORIGINAL reply, before it is escaped or cut: an exact known value is only found whole and
+    // unchanged. A reply too long to redact whole is not shown at all (only its size), so no prefix of anything in it can leak.
+    if (raw.length > REPLY_REDACTION_BOUND) return `[${Buffer.byteLength(raw)} bytes not shown]`.slice(0, limit);
+    const redacted = sanitizeAuthorityDiagnostic(raw, { limit: REPLY_REDACTION_BOUND });
+    // The sanitizer shows a newline as `?` and trims. An ordinary reply (nothing was redacted) keeps its own form, a newline
+    // shown as `\n`; a reply that had a redaction is shown as redacted.
+    const marks = value => (value.match(/REDACTED/g) || []).length;
+    const shown = marks(redacted) > marks(raw) ? redacted : raw.replace(/\r?\n/g, '\\n');
+    return shown.replace(/[^\x20-\x7e]/g, '?').slice(0, limit);
 }
 
 /** What a failed child process looked like, bounded and secret-free: " (error CODE, signal S, exit N, stderr: ...)". */
