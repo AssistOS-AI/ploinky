@@ -498,6 +498,10 @@ export function buildRequiredCaseManifest() {
         ]),
         ...leaves(P, 'p2', unit('hardwareLimitsRoutes.test.mjs'), [
             'S1.a-stale-snapshot-never-reports-a-just-recreated-instance-as-stopped-or-unavailable',
+            'S2.a-status-read-right-after-an-apply-response-sees-the-new-container-running',
+            'S2.a-reconcile-already-in-flight-when-the-apply-ends-does-not-count-and-a-later-one-is-awaited',
+            'S2.when-the-bound-expires-the-response-still-goes-out-and-says-the-status-may-lag',
+            'S2.a-failed-apply-does-not-wait-for-a-metrics-reconcile',
             'E.apply-outbound', 'E.apply-inbound', 'E.http-cause',
             'R.anonymous', 'R.nonadmin', 'R.guest', 'R.admin', 'R.origin', 'R.csrf', 'R.cross-session-csrf',
             'R.bearer-get', 'R.bearer-set', 'R.bearer-clear', 'R.bearer-apply', 'R.duplicate-authorization',

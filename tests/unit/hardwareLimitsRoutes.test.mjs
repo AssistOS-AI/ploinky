@@ -47,6 +47,8 @@ function fixture(t) {
         verifyMutation: verifyAdminMutationRequest, getContext,
         getInstalled: () => [{ ref: 'demo/worker', manifestPath: '/fixture/manifest.json' }],
         getRegistry: () => registry, getRouting: () => ({ routes: {} }), getMetrics: () => null,
+        // An Apply waits for a fresh metrics reconcile before it answers; these tests have no engine to read.
+        refreshMetrics: async () => ({ fresh: true }),
         admit: () => ({ descriptor: { runtimePolicy: { resources: {} }, hardwarePlacement: { limitsHash: 'b'.repeat(64), expected: { cpus: 1 } } } }),
         apply: async (input) => applyHardwareLimits(input, {
             lease: async (_options, callback) => callback(), loadRegistry: () => registry, loadRouting: () => ({ routes: {} }),
@@ -342,4 +344,70 @@ test('S1.a-stale-snapshot-never-reports-a-just-recreated-instance-as-stopped-or-
     }
     // The stale entry's own limits belong to the earlier container and are not shown for the new one.
     assert.equal(statusOf(f, [engineEntry({ limits: { cpus: 9 } })], stale).limits, null);
+});
+
+// S2: the real monitor and the real route; only the engine's container list (and the registry it is read against) is injected.
+function appliedWorld(t, { gate = null, boundMs = 4000 } = {}) {
+    const f = fixture(t);
+    const record = { ...f.registry.canonical, containerId: NEW_ID };
+    const { observation, readApplied } = recreated(f, new Date(0).toISOString());
+    // The engine at first: the earlier container, stopped by the drain. The Apply (below) leaves the new container running.
+    const engine = { containers: [engineEntry()], listings: 0 };
+    const newRunning = engineEntry({ containerId: NEW_ID, state: { status: 'running', running: true, pid: 7 } });
+    const monitor = new Monitor({
+        readRegistry: () => ({ canonical: record }), runtimeStateOptions: { activeGeneration: null, routes: { worker: { container: 'canonical', repo: 'demo', agent: 'worker', hostPort: 4100 } } },
+        readHardwareContext: () => ({ gate: 'off' }), readRouting: () => ({ routes: {} }), containerStats: false,
+        collectContainers: async () => { const listing = engine.containers; engine.listings += 1; if (gate && engine.listings === 2) await gate.promise; return listing; },
+    });
+    const applied = () => { engine.containers = [newRunning]; observation.observedAt = new Date().toISOString(); };
+    const deps = (extra = {}) => ({
+        getRegistry: () => ({ canonical: record }), getMetrics: () => monitor.latest, readApplied, admit: placementAdmit,
+        refreshMetrics: (since) => monitor.reconcileAfter(since, boundMs), ...extra,
+    });
+    return { f, monitor, engine, applied, deps, record };
+}
+const applyBody = f => ({ action: 'apply', expectedToken: f.token, containers: ['canonical'] });
+const containerOf = response => response.body.agents[0].containers[0];
+
+test('S2.a-status-read-right-after-an-apply-response-sees-the-new-container-running', async (t) => {
+    const w = appliedWorld(t);
+    await w.monitor.reconcile();                      // the snapshot of before the Apply
+    assert.deepEqual([containerOf(await request(w.f, { dependencies: w.deps() })).availability], ['starting'], 'the earlier snapshot only says the instance is starting');
+    const response = await request(w.f, { method: 'POST', body: applyBody(w.f), dependencies: w.deps({ apply: async () => { w.applied(); return { ok: true, status: 200, results: [{ key: 'canonical', state: 'applied' }] }; } }) });
+    assert.equal(response.status, 200); assert.equal(response.body.statusFresh, true); assert.equal(response.body.statusNote, undefined);
+    // The very next read: the new container, running and ready, with its limits applied.
+    const after = containerOf(await request(w.f, { dependencies: w.deps() }));
+    assert.deepEqual({ availability: after.availability, limitsState: after.limitsState }, { availability: 'ready', limitsState: 'applied' });
+});
+
+test('S2.a-reconcile-already-in-flight-when-the-apply-ends-does-not-count-and-a-later-one-is-awaited', async (t) => {
+    let release; const gate = { promise: new Promise((resolve) => { release = resolve; }) };
+    const w = appliedWorld(t, { gate });
+    await w.monitor.reconcile();                      // listing 1: the earlier container
+    const inFlight = w.monitor.reconcile();           // listing 2: started before the Apply, holds the earlier list until released
+    await new Promise((resolve) => setImmediate(resolve));
+    const started = w.monitor.reconcileInFlight;
+    assert.equal(started, true);
+    const response = await request(w.f, { method: 'POST', body: applyBody(w.f), dependencies: w.deps({ apply: async () => { w.applied(); setTimeout(release, 5); return { ok: true, status: 200, results: [] }; } }) });
+    await inFlight;
+    assert.equal(response.body.statusFresh, true);
+    assert.equal(w.engine.listings, 3, 'a reconcile that started after the Apply ran');
+    assert.equal(containerOf(await request(w.f, { dependencies: w.deps() })).availability, 'ready');
+});
+
+test('S2.when-the-bound-expires-the-response-still-goes-out-and-says-the-status-may-lag', async (t) => {
+    const w = appliedWorld(t, { boundMs: 30 });
+    await w.monitor.reconcile();
+    // The next engine listing never answers, so no fresh reconcile can complete inside the bound.
+    w.monitor.collectContainers = () => new Promise(() => {});
+    const response = await request(w.f, { method: 'POST', body: applyBody(w.f), dependencies: w.deps({ apply: async () => { w.applied(); return { ok: true, status: 200, results: [] }; } }) });
+    assert.equal(response.status, 200); assert.equal(response.body.ok, true);
+    assert.equal(response.body.statusFresh, false); assert.match(response.body.statusNote, /may lag this Apply/);
+});
+
+test('S2.a-failed-apply-does-not-wait-for-a-metrics-reconcile', async (t) => {
+    const w = appliedWorld(t);
+    let waits = 0;
+    const response = await request(w.f, { method: 'POST', body: applyBody(w.f), dependencies: w.deps({ refreshMetrics: async () => { waits += 1; return { fresh: true }; }, apply: async () => ({ ok: false, status: 409, error: 'apply_failed' }) }) });
+    assert.equal(response.status, 409); assert.equal(waits, 0); assert.equal(response.body.statusFresh, undefined);
 });

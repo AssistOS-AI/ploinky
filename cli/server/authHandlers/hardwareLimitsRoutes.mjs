@@ -201,7 +201,8 @@ function readBody(req) {
 export async function handleHardwareLimitsRoutes(req, res, parsedUrl, {
     ensureAdmin, verifyMutation, getContext = defaultContext, getInstalled = installedAgents,
     getRegistry = readAgentRegistrySnapshot, getRouting = readRoutingConfig,
-    getMetrics = () => workspaceMetricsMonitor.latest, apply = runHardwareLimitsApplyWorker,
+    getMetrics = () => workspaceMetricsMonitor.latest, apply = runHardwareLimitsApplyWorker, readApplied = readAppliedObservation,
+    refreshMetrics = (since) => workspaceMetricsMonitor.reconcileAfter(since),
     set = setAgentLimits, clear = clearAgentLimits, admit = defaultAdmission, verifyLease = () => true,
     readSelection = null, qualifyGpu = qualifyHardwareGpuTarget,
 } = {}) {
@@ -219,7 +220,7 @@ export async function handleHardwareLimitsRoutes(req, res, parsedUrl, {
         const context = getContext({ refreshBackend: method === 'POST' });
         const installed = getInstalled();
         const registry = getRegistry();
-        const state = () => ({ ...buildHardwareLimitsState({ context: getContext(), installed, registry: getRegistry(), routing: getRouting(), metrics: getMetrics(), admit }), apply: hardwareApplyFlight() });
+        const state = () => ({ ...buildHardwareLimitsState({ context: getContext(), installed, registry: getRegistry(), routing: getRouting(), metrics: getMetrics(), admit, readApplied }), apply: hardwareApplyFlight() });
         if (method === 'GET') {
             const result = state();
             if (context.storeState === 'unreadable') send(503, { ...result, ok: false, error: 'store_unreadable', message: context.storeDetail || 'The hardware store is unreadable.' });
@@ -246,7 +247,13 @@ export async function handleHardwareLimitsRoutes(req, res, parsedUrl, {
                     return await ensureAdmin(req, silentResponse, parsedUrl) === true && authorize();
                 },
             });
-            send(result?.status || 200, { ok: result?.ok !== false, ...result });
+            // A successful Apply changed containers: the next status read must not see the snapshot of before. Wait, bounded, for a metrics
+            // reconcile that started after the Apply ended; if the bound passes the answer still goes out and says the status may lag.
+            let statusFresh = null;
+            if (result?.ok !== false && (result?.status || 200) < 400) {
+                try { statusFresh = (await refreshMetrics(Date.now()))?.fresh === true; } catch (_) { statusFresh = false; }
+            }
+            send(result?.status || 200, { ok: result?.ok !== false, ...result, ...(statusFresh === null ? {} : { statusFresh, ...(statusFresh ? {} : { statusNote: 'The workspace metrics snapshot may lag this Apply by a few seconds.' }) }) });
         } else {
             const gpu = body.action === 'set_agent_limits' && body.limits?.gpu
                 ? qualifyGpu(installed.find((agent) => agent.ref === body.agentRef), Object.values(registry).filter((record) => record?.type === 'agent' && `${record.repoName}/${record.agentName}` === body.agentRef), context, body.limits) : context.gpu;

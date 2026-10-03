@@ -63,9 +63,18 @@ function publicRuntimeEntry(entry, metrics) {
   };
 }
 
-class WorkspaceMetricsMonitor extends EventEmitter {
-  constructor() {
+export class WorkspaceMetricsMonitor extends EventEmitter {
+  // The readers default to the real ones; tests inject only what the engine and the host would answer.
+  constructor({ readRegistry = getAgentsRegistry, collectContainers = null, runtimeStateOptions = {}, readHardwareContext = readBoxHardwareContext, readRouting = readRoutingConfig, containerStats = true } = {}) {
     super();
+    this.readRegistry = readRegistry;
+    this.collectContainers = collectContainers;
+    this.runtimeStateOptions = runtimeStateOptions;
+    this.readHardwareContext = readHardwareContext;
+    this.readRouting = readRouting;
+    this.containerStats = containerStats;
+    this.reconcilePromise = null;
+    this.completedReconcileStartedAt = 0;
     this.setMaxListeners(0);
     this.states = [];
     this.containerMetrics = new Map();
@@ -116,15 +125,35 @@ class WorkspaceMetricsMonitor extends EventEmitter {
   }
 
   async reconcile() {
-    if (this.reconcileInFlight) return;
+    if (this.reconcileInFlight) return this.reconcilePromise;
     this.reconcileInFlight = true;
+    const startedAt = Date.now();
+    this.reconcilePromise = this.runReconcile(startedAt);
+    return this.reconcilePromise;
+  }
+
+  // Resolves once a reconcile that STARTED strictly after `since` (epoch ms) has completed and published, or `boundMs` has passed. One
+  // already in flight that began earlier does not count: it may have read the engine before the change the caller made.
+  async reconcileAfter(since, boundMs = 4_000) {
+    const deadline = Date.now() + boundMs;
+    const waitFor = (promise, ms) => new Promise((resolve) => { const timer = setTimeout(resolve, ms); Promise.resolve(promise).finally(() => { clearTimeout(timer); resolve(); }); });
+    while (Date.now() < deadline) {
+      if (this.completedReconcileStartedAt > since) return { fresh: true };
+      if (this.reconcileInFlight) await waitFor(this.reconcilePromise, Math.max(1, deadline - Date.now()));
+      else await waitFor(this.reconcile(), Math.max(1, deadline - Date.now()));
+    }
+    return { fresh: this.completedReconcileStartedAt > since };
+  }
+
+  async runReconcile(startedAt) {
+    let completed = false;
     try {
-      const registry = getAgentsRegistry() || {};
-      const states = await collectAgentRuntimeStatesAsync({ registry });
+      const registry = this.readRegistry() || {};
+      const states = await collectAgentRuntimeStatesAsync({ registry, ...this.runtimeStateOptions, ...(this.collectContainers ? { collectContainers: this.collectContainers } : {}) });
       this.states = applyRuntimeReadinessProjection(states, registry);
-      this.hardwareEnabled = readBoxHardwareContext().gate === 'on';
+      this.hardwareEnabled = this.readHardwareContext().gate === 'on';
       if (this.hardwareEnabled) {
-        const routing = readRoutingConfig();
+        const routing = this.readRouting();
         this.hardwareAvailability = new Map(this.states.map((entry) => [entry.containerName, metricHardwareAvailability(entry, registry[entry.containerName], routing)]));
       }
       if (this.hardwareEnabled) await this.appliedLimits.reconcile(this.states.map((entry) => ({
@@ -134,6 +163,7 @@ class WorkspaceMetricsMonitor extends EventEmitter {
         instanceId: registry[entry.containerName]?.instanceId,
         enableGeneration: registry[entry.containerName]?.enableGeneration,
       })));
+      completed = true;
     } catch (_) {
       this.publish();
       return;
@@ -143,10 +173,11 @@ class WorkspaceMetricsMonitor extends EventEmitter {
     const names = this.runningContainerNames();
     const key = names.join('\0');
     if (key !== this.activeContainerKey) this.statsUnsupportedKey = '';
-    if (this.statsUnsupportedKey !== key && (key !== this.activeContainerKey || (!this.statsProcess && names.length))) {
+    if (this.containerStats && this.statsUnsupportedKey !== key && (key !== this.activeContainerKey || (!this.statsProcess && names.length))) {
       this.startContainerStats(names);
     }
     this.publish();
+    if (completed) this.completedReconcileStartedAt = startedAt;
   }
 
   async sample() {
