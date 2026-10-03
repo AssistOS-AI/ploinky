@@ -632,6 +632,32 @@ test('F1.a-failed-engine-read-makes-every-kept-runtime-stale-so-a-stopped-contai
     }
 });
 
+// R18-3: the same with NO applied observation (a gate-off context, or an instance that was never applied): a failed read still makes
+// the kept runtime stale. The control is the same world with a successful read.
+test('F1.a-failed-engine-read-is-stale-even-when-the-instance-has-no-applied-observation', async (t) => {
+    const f = fixture(t);
+    const record = { ...f.registry.canonical, containerId: NEW_ID };
+    const running = engineEntry({ containerId: NEW_ID, state: { status: 'running', running: true, pid: 7 } });
+    for (const failing of [true, false]) {
+        let engine = 'running';
+        const monitor = new Monitor({
+            readRegistry: () => ({ canonical: record }), runtimeStateOptions: { activeGeneration: null, routes: { worker: { container: 'canonical', repo: 'demo', agent: 'worker', hostPort: 4100 } } },
+            readHardwareContext: () => ({ gate: 'off' }), readRouting: () => ({ routes: {} }), containerStats: false,
+            collectContainers: async () => { if (engine === 'fails') throw Object.assign(new Error('the container list could not be read: synthetic'), { code: 'ENGINE_READ_FAILED' }); return [running]; },
+        });
+        const status = () => { const state = buildHardwareLimitsState({ context: f.getContext(), installed: [{ ref: 'demo/worker', manifestPath: '/fixture/manifest.json' }], registry: { canonical: record }, metrics: monitor.latest, admit: placementAdmit, readApplied: () => null }); return { availability: state.agents[0].containers[0].availability, failed: state.metricsReadFailed }; };
+        await monitor.reconcile();
+        assert.deepEqual(status(), { availability: 'ready', failed: false }, 'without an observation a good read is read as it is');
+        if (failing) {
+            engine = 'fails';
+            await new Promise((resolve) => setTimeout(resolve, 5));
+            assert.equal((await monitor.reconcileAfter(Date.now(), 300)).fresh, false);
+            assert.equal(monitor.latest.readFailed, true);
+            assert.deepEqual(status(), { availability: 'starting', failed: true });
+        }
+    }
+});
+
 // F2: the product half of T3.
 test('F2.the-apply-response-carries-the-numeric-wait-and-the-status-carries-the-snapshots-read-start', async (t) => {
     const w = appliedWorld(t, { listDelayMs: 40 });

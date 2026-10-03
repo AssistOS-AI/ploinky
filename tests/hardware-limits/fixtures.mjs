@@ -513,6 +513,7 @@ export function buildRequiredCaseManifest() {
             'T5.a-reconcile-whose-engine-read-failed-is-not-fresh-keeps-the-last-runtimes-and-never-reads-a-running-container-as-stopped',
             'T7.the-post-apply-wait-is-the-named-ten-second-constant-and-a-six-second-reconcile-within-it-is-fresh',
             'F1.a-failed-engine-read-makes-every-kept-runtime-stale-so-a-stopped-container-never-reads-ready',
+            'F1.a-failed-engine-read-is-stale-even-when-the-instance-has-no-applied-observation',
             'F2.the-apply-response-carries-the-numeric-wait-and-the-status-carries-the-snapshots-read-start',
             'E.apply-outbound', 'E.apply-inbound', 'E.http-cause',
             'R.anonymous', 'R.nonadmin', 'R.guest', 'R.admin', 'R.origin', 'R.csrf', 'R.cross-session-csrf',
