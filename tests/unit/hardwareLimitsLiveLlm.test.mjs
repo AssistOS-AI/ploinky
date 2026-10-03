@@ -27,7 +27,7 @@ import { LEAF_OBSERVATION } from '../hardware-limits/liveCaseCommands.mjs';
 import {
     LOCAL_LLM_RUNNER_ENV, PLAYGROUND_DECISION, isSecretName, runnerEnvironmentProblems, runnerProductNames,
     INFERENCE_MIN_IN_FLIGHT, INFERENCE_TOLERANCE, INSUFFICIENT_RAM, LLM_BUDGET, LLM_IMAGE_DIGESTS, LLM_LEAF_SAMPLE, LLM_MODELS, LLM_RUNNER_PROCESSES, LLM_TOOL_CALL, VLLM_SHARE, VLLM_TOOL_PATH,
-    analyzeInference, insufficientMemoryPercent, llmToolWords, parseLeafSample, sourceUnavailable, stageTwoFreeThreshold, summarizeGpuCheck, validateLlmModelPins, validateLlmProfile, vllmToolWords,
+    analyzeInference, classifyObservation, insufficientMemoryPercent, llmToolWords, parseLeafSample, sourceUnavailable, stageTwoFreeThreshold, summarizeGpuCheck, validateLlmModelPins, validateLlmProfile, vllmToolWords,
 } from '../hardware-limits/liveLlmCommands.mjs';
 import { resolveMemoryPercent } from '../../cli/sandbox/hardwareLimits/resolve.mjs';
 
@@ -1751,4 +1751,23 @@ test('R13a.a-later-empty-reply-of-the-sustained-load-fails-the-case-and-only-the
     assert.equal(w.run.operations.some(entry => /prompt-l1-more/.test(String(entry.kind))), false);
     assert.equal(toolCalls(w, 'local_llm_test_prompt').length, inference.load.requests);
     nothingOwned(w);
+});
+
+// --- R13-b: the labelling of an observation against the request windows ---------------------------------------------------
+test('R13b.an-observation-is-in-flight-only-inside-one-settled-request-window-and-every-other-position-is-labelled-and-never-counted', () => {
+    const windows = [{ sent: 100, settled: 200 }, { sent: 300, settled: 400 }, { sent: 500, settled: null }];
+    const at = (startedAt, endedAt) => classifyObservation({ startedAt, endedAt }, windows);
+    // Inside one settled window.
+    assert.equal(at(100, 150), 'in-flight'); assert.equal(at(120, 199), 'in-flight'); assert.equal(at(310, 399), 'in-flight');
+    // Late: it returns at or after the request settled, however it started.
+    assert.equal(at(150, 200), 'late'); assert.equal(at(150, 250), 'late');
+    // Late: it started before the request was sent.
+    assert.equal(at(90, 150), 'late');
+    // Late: it spans two requests, so no single request vouches for it (a later request never justifies an earlier read).
+    assert.equal(at(150, 350), 'late'); assert.equal(at(190, 310), 'late');
+    // Between requests: outside every window.
+    assert.equal(at(210, 290), 'between-requests'); assert.equal(at(410, 490), 'between-requests'); assert.equal(at(10, 50), 'between-requests');
+    // A request that has not settled yet vouches for nothing (its observations are labelled late until it settles).
+    assert.equal(at(520, 530), 'late');
+    assert.equal(classifyObservation({ startedAt: 1, endedAt: 2 }, []), 'between-requests');
 });

@@ -25,7 +25,7 @@ import { MIB, shareMemoryMiB } from './liveGpuCommands.mjs';
 import { LLM_SOURCE_DIRECTORY } from './liveLlmNames.mjs';
 import {
     GIB, INFERENCE_CADENCE, INSUFFICIENT_RAM, L1_MIN_RAM_BYTES, L1_PROMPT, LLM_BUDGET, LLM_FIXTURE, LLM_IMAGE_DIGESTS, LLM_LEAF_SAMPLE, LLM_MODELS, LLM_REF, LLM_RUNNER_PROCESSES, LLM_TOOL_CALL, VLLM_SHARE,
-    INFERENCE_MIN_IN_FLIGHT, analyzeInference, insufficientMemoryPercent, llmToolWords, parseLeafSample, runnerEnvironmentProblems, sourceUnavailable, stageTwoFreeThreshold, summarizeGpuCheck, vllmToolWords,
+    INFERENCE_MIN_IN_FLIGHT, analyzeInference, classifyObservation, insufficientMemoryPercent, llmToolWords, parseLeafSample, runnerEnvironmentProblems, sourceUnavailable, stageTwoFreeThreshold, summarizeGpuCheck, vllmToolWords,
 } from './liveLlmCommands.mjs';
 
 const needs = (condition, message) => { if (!condition) throw blocked(message); };
@@ -268,9 +268,7 @@ export function createLlmCases(ctx) {
         const relabel = () => {
             for (const sample of [...cgroup, ...gpuSamples]) {
                 if (!['pending', 'in-flight', 'late', 'between-requests'].includes(sample.label)) continue;
-                const inside = windows.some(window => window.settled !== null && sample.startedAt >= window.sent && sample.endedAt < window.settled);
-                const overlaps = windows.some(window => sample.startedAt < (window.settled ?? Infinity) && sample.endedAt >= window.sent);
-                sample.label = inside ? 'in-flight' : overlaps ? 'late' : 'between-requests';
+                sample.label = classifyObservation(sample, windows);
             }
         };
         const load = { boundMs: timings.sustainedMs, maxRequests: timings.sustainedRequests, requests: 0, completionTokens: 0, invalidResponses: 0, stoppedBy: null };

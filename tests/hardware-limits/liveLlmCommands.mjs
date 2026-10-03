@@ -285,6 +285,17 @@ export function parseLeafSample(raw) {
 // The GPU part of one gate check, reduced to what the analysis reads. `runnerHostPids` are the runner's
 // host PIDs, resolved by verified identity; `owned` are the PIDs the gate proved ours. Device memory is
 // summed over the runner's own rows (null when it has none) and over every owned row.
+// Where an observation (a cgroup read or a GPU check, with the real times its read started and returned) lies against the requests'
+// [sent, settled) windows. `in-flight` only when the whole [startedAt, endedAt] lies inside ONE window (a settled request); `late` when it
+// overlaps a window without lying inside it (it started before the request was sent, or returned at or after it settled, or spans two
+// requests); `between-requests` when it overlaps none. Only `in-flight` ever counts.
+export function classifyObservation(sample, windows) {
+    const inside = windows.some(window => window.settled !== null && sample.startedAt >= window.sent && sample.endedAt < window.settled);
+    if (inside) return 'in-flight';
+    const overlaps = windows.some(window => sample.startedAt < (window.settled ?? Infinity) && sample.endedAt >= window.sent);
+    return overlaps ? 'late' : 'between-requests';
+}
+
 export function summarizeGpuCheck(label, checked, runnerHostPids, at = Date.now()) {
     const rows = (checked.inventory?.details ?? []).map(row => ({ pid: row.pid, type: row.type, memoryMiB: row.memoryMiB }));
     const sum = list => (list.length && list.every(row => Number.isFinite(row.memoryMiB)) ? list.reduce((total, row) => total + row.memoryMiB, 0) : null);
