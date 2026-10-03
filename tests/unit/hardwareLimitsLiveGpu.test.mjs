@@ -687,7 +687,7 @@ test('G1.P3-passes-drain-before-quit-final-clear-host-clear-restart-and-an-owned
     // The host clear and the restart used the supported product commands.
     const candidate = w.fake.model.calls.filter(call => call.binary === w.node).map(call => call.args.slice(1));
     assert.ok(candidate.some(args => args.join(' ') === 'limits clear --agent hwlfixture/probe'));
-    assert.ok(candidate.some(args => args.join(' ') === '--port 23456 --udp-port 34567 restart hwlfixture/probe'));
+    assert.ok(candidate.some(args => args.join(' ') === 'restart hwlfixture/probe'), 'the restart carries no port: --port and --udp-port are valid only before start, diagnose or repair');
     nothingOwned(w);
 });
 

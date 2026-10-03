@@ -707,15 +707,17 @@ export function createGpuCases(ctx) {
             gate.registerDaemon(identityE.daemon.host.hostPid);
             const probeE = await agentNow('probe'); registerOwned(probeE);
             await gate.check('P3-host-clear');
-            const ports = Number.isInteger(run.ports?.tcp) && Number.isInteger(run.ports?.udp) ? ['--port', String(run.ports.tcp), '--udp-port', String(run.ports.udp)] : [];
             try { await command('gpu-host-clear', profile.node.path, [profile.candidate.path, 'limits', 'clear', '--agent', GPU_AGENT_REFS.probe], { deadlineMs: 120000, capture: `gpu-host-clear-${++captureCounter}` }); }
             finally { recordHostState(); }
             const storeAfterClear = await admin.state();
             evidence.step('host-clear', { configured: agentEntry(storeAfterClear, GPU_AGENT_REFS.probe)?.configured, daemon: storeAfterClear.gpu.daemonStatus });
             expects(!agentEntry(storeAfterClear, GPU_AGENT_REFS.probe)?.configured?.gpu, 'The host clear left a stored GPU share');
+            // `--port` and `--udp-port` are valid only before start, diagnose or repair (ploinky-box/command/parse.mjs). The restart finds the
+            // fixture's own Box from its working directory: the command runs in the fixture workspace (liveHarness.mjs `command`), whose
+            // `.ploinky` marker resolveWorkspaceIdentity (ploinky-box/identity.mjs) walks up to; the Box and its ports are the saved ones.
             await gate.check('P3-restart');
             const restartTimeline = startTimeline(identityE.daemon, [probeE]);
-            try { await command('gpu-restart', profile.node.path, [profile.candidate.path, ...ports, 'restart', GPU_AGENT_REFS.probe], { deadlineMs: timings.applyMs, capture: `gpu-restart-${++captureCounter}` }); }
+            try { await command('gpu-restart', profile.node.path, [profile.candidate.path, 'restart', GPU_AGENT_REFS.probe], { deadlineMs: timings.applyMs, capture: `gpu-restart-${++captureCounter}` }); }
             finally { recordHostState(); evidence.put('restartTimeline', evaluateDrain(await restartTimeline.stop(), { quit: true })); }
             expects(evidence.data.restartTimeline.ok, `Host clear and restart: the daemon quit before its client drained, or never quit: ${JSON.stringify(evidence.data.restartTimeline.violation)}`);
             const stateAfterRestart = await admin.state();

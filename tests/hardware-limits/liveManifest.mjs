@@ -367,7 +367,6 @@ export function gpuPlan(run) {
     const cap = shareMemoryMiB(first.vramPercent, gpu.memoryMiB);
     const raisedCap = shareMemoryMiB(raised.vramPercent, gpu.memoryMiB);
     const probe = (maxMiB, options = {}) => probeExecArgv({ containerId: '0'.repeat(64), maxMiB, ...options }).map(word => (word === '0'.repeat(64) ? '<PROBE_ID>' : word));
-    const ports = ['--port', String(run.ports.tcp), '--udp-port', String(run.ports.udp)];
     const admin = (id, method, body, extra = {}) => ({ id, binary: engine, argv: [...core, 'node', '-e', '<ADMIN_REQUEST>', method, body], deadlineMs: run.deadlines.coreMs, ...extra });
     const apply = (id, refs) => admin(id, 'POST', `{"action":"apply","expectedToken":<TOKEN>,"containers":[<${refs} registry key>]}`, { deadlineMs: 600000, gpu: true });
     const gate = id => ({ id, binary: gpu.smi.path, argv: gpuQueryArgv(uuid), deadlineMs: 30000, gpu: true, note: 'The per-operation GPU idle gate: query again, exclude only owned PIDs with a freshly verified tuple.' });
@@ -402,7 +401,7 @@ export function gpuPlan(run) {
         { case: 'P3', ...set('P3-reshare', 'hwlfixture/probe', first) },
         { case: 'P3', ...apply('P3-apply-reshare', 'probe') },
         { case: 'P3', id: 'P3-host-clear', binary: node, argv: [profile.candidate.path, 'limits', 'clear', '--agent', 'hwlfixture/probe'], cwd: plan(run).workspace.path, env: {}, deadlineMs: 120000, gpu: true },
-        { case: 'P3', id: 'P3-restart-agent', binary: node, argv: [profile.candidate.path, ...ports, 'restart', 'hwlfixture/probe'], cwd: plan(run).workspace.path, env: {}, deadlineMs: 600000, gpu: true, note: 'An ordinary restart after the host clear: the final-share shutdown logic runs' },
+        { case: 'P3', id: 'P3-restart-agent', binary: node, argv: [profile.candidate.path, 'restart', 'hwlfixture/probe'], cwd: plan(run).workspace.path, env: {}, deadlineMs: 600000, gpu: true, note: 'An ordinary restart after the host clear: the final-share shutdown logic runs' },
         { case: 'P3', id: 'P3-crash-setup', action: 'Share both clients again (one Apply of the probe and the peer)', gpu: true },
         { case: 'P3', id: 'P3-kill-owned-daemon', binary: engine, argv: [...core, 'node', '-e', '<MPS_KILL_OWNED_DAEMON>', '<DAEMON_BOX_PID>', '<DAEMON_START_TIME>'], deadlineMs: 20000, gpu: true, note: 'SIGKILL of the one owned MPS control daemon, only after the host (boot ID, host PID, start time, /ploinky/core under the exact Box, UID) and the Box (state file, /proc start time, UID, executable identity, cgroup, pipe environment) both prove it. Nothing else is signalled; CPU agents are not restarted.' },
         { case: 'P3', ...apply('P3-apply-recover', 'probe'), action: 'Recovery: rebuild the generation and recreate the cohort' },
