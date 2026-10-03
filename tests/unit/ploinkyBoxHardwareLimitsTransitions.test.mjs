@@ -282,7 +282,9 @@ test('T.ownerless-host-lock', async (t) => {
     const manager = createMutationLockManager({ homeDirectory: w.home, timeoutMs: 100, retryMs: 10 });
     const lockPath = path.join(manager.locksRoot, `${w.identity.instance}.lock`);
     fs.mkdirSync(lockPath, { recursive: true, mode: 0o700 });
-    await assert.rejects(manager.acquire(w.identity.instance), /mutation lock owner/);
+    // An ownerless lock is a transient observation (an acquirer publishes the directory before its owner file): the acquirer keeps waiting
+    // and times out, never reclaiming it.
+    await assert.rejects(manager.acquire(w.identity.instance), /Timed out waiting for mutation lock/);
     assert.ok(fs.existsSync(lockPath), 'an ownerless lock is preserved, never reclaimed by age');
 });
 

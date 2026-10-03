@@ -59,6 +59,7 @@ import {
     agentLibFixtureLabels,
     agentLibFixtureMounts,
 } from '../helpers/agentlibFixture.mjs';
+import { fakeRestartCore, fakeUpdateCore } from '../helpers/fakeUpdateCore.mjs';
 
 const DRIVER = '595.91.07';
 // Each fixture host names its architecture, so discovery never depends on the
@@ -1252,7 +1253,7 @@ function gpuSupervisor(box, events, overrides = {}) {
         gpuGrantStore: memoryGpuStore(events),
         discoverGpuDevices: () => fakeHost().discover(),
         routerBindingStore: { read: () => null, write: () => assert.fail('GPU grants never save a Router binding'), restore() {} },
-        resolveHostReachableIpv4: async () => '127.0.0.1',
+        resolveHostReachableIpv4: async () => '192.168.1.12',
         selectAgentLib: async () => assert.fail('a GPU grant keeps the mounted AgentLib generation'),
         commitAgentLibSelection: () => assert.fail('a GPU grant must not advance AgentLib state'),
         stdout: { write() {} },
@@ -2511,6 +2512,9 @@ for (const [operation, invoke] of [
             revalidateAgentLibSource: () => {},
             captureCoreStartArgv: () => ['start', 'explorer', '8080'],
             runCoreCommand: async () => { events.push('core'); },
+            // The restart and update of the Box run through master's bounded runners; the same recorder plays the in-Box core.
+            runRestartCore: fakeRestartCore(async () => { events.push('core'); }),
+            runUpdateCore: fakeUpdateCore({ onCall: ({ engine, containerId, argv, hostPort, mediaHostPort, options }) => (async () => { events.push('core'); })(engine, containerId, argv, hostPort, mediaHostPort, null, options) }),
             validateExistingImage: () => ({ immutableId: `sha256:${'b'.repeat(64)}` }),
             validateContainer: () => {},
             async reconcile(options) {
@@ -2554,6 +2558,9 @@ async function restartedMarker(t, discoverGpuMpsTools, { toolsRoot = null } = {}
         revalidateAgentLibSource: () => {},
         captureCoreStartArgv: () => ['start', 'explorer', '8080'],
         runCoreCommand: async () => { events.push('core'); },
+        // The restart and update of the Box run through master's bounded runners; the same recorder plays the in-Box core.
+        runRestartCore: fakeRestartCore(async () => { events.push('core'); }),
+        runUpdateCore: fakeUpdateCore({ onCall: ({ engine, containerId, argv, hostPort, mediaHostPort, options }) => (async () => { events.push('core'); })(engine, containerId, argv, hostPort, mediaHostPort, null, options) }),
         validateExistingImage: () => ({ immutableId: `sha256:${'b'.repeat(64)}` }),
         validateContainer: () => {},
         async reconcile(options) {

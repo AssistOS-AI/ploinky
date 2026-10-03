@@ -24,9 +24,11 @@ import {
 import {
     agentLibFixture,
     agentLibFixtureEnv,
+    boxImageIdFixtureEnv,
     agentLibFixtureLabels,
     agentLibFixtureMounts,
 } from '../helpers/agentlibFixture.mjs';
+import { fakeRestartCore, fakeUpdateCore } from '../helpers/fakeUpdateCore.mjs';
 
 function fixture(t) {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-gate-')));
@@ -423,9 +425,10 @@ function createArgsFor(state, extra = {}) {
 test('G.off-byte-identical', async (t) => {
     const state = fixture(t);
     // The gate-off create argv equals the golden captured from the baseline
-    // 8d8c4b77 export (tests/hardware-limits/gateOffCreateArgs.mjs), not the
-    // candidate compared with itself.
-    const golden = JSON.parse(fs.readFileSync(new URL('../fixtures/hardware-limits/gate-off-create-args-8d8c4b77.json', import.meta.url), 'utf8'));
+    // export (tests/hardware-limits/gateOffCreateArgs.mjs), not the candidate
+    // compared with itself. The baseline is master 4dae3a99 since the integration
+    // merge; the 8d8c4b77 golden is kept as the record of the earlier baseline.
+    const golden = JSON.parse(fs.readFileSync(new URL('../fixtures/hardware-limits/gate-off-create-args-4dae3a99.json', import.meta.url), 'utf8'));
     const repository = path.resolve(import.meta.dirname, '../..');
     assert.deepEqual(await normalizedGateOffCreateArgs(repository), golden, 'default (no hardware argument) matches the baseline bytes');
     assert.deepEqual(await normalizedGateOffCreateArgs(repository, { extra: { hardware: null } }), golden, 'gate off matches the baseline bytes');
@@ -521,6 +524,7 @@ function completeHandle(box, hardware) {
                 ...IMAGE_CONTRACT.environment,
                 PLOINKY_WORKSPACE_ROOT: box.identity.workspaceRoot,
                 ...agentLibFixtureEnv(box.agentLib),
+                ...boxImageIdFixtureEnv(imageId),
                 PLOINKY_PRIVATE_BIND: '0.0.0.0',
                 PLOINKY_PUBLIC_BIND: '0.0.0.0',
                 PLOINKY_PUBLIC_AUTHORITY: '127.0.0.1:8090',
@@ -604,7 +608,10 @@ test('G.targeted-gate-change', async (t) => {
             return { action: 'replaced', ownership, hostPort: 8080, mediaHostPort: 7882, hardware: options.hardware };
         },
         runCoreCommand: async (_engine, _id, argv) => { events.push(`core:${argv.join(' ')}`); },
-        resolveHostReachableIpv4: async () => '127.0.0.1',
+        // The restart and update of the Box run through master's bounded runners; the same recorder plays the in-Box core.
+        runRestartCore: fakeRestartCore(async (_engine, _id, argv) => { events.push(`core:${argv.join(' ')}`); }),
+        runUpdateCore: fakeUpdateCore({ onCall: ({ engine, containerId, argv, hostPort, mediaHostPort, options }) => (async (_engine, _id, argv) => { events.push(`core:${argv.join(' ')}`); })(engine, containerId, argv, hostPort, mediaHostPort, null, options) }),
+        resolveHostReachableIpv4: async () => '192.168.1.12',
         healthCheck: async () => {},
         revalidateAgentLibSource: () => {},
         commitAgentLibSelection: () => {},
@@ -650,7 +657,10 @@ test('G.every-final-generation', async (t) => {
         readEdgeDesired: () => null,
         startCore: async () => { events.push('start-core'); },
         runCoreCommand: async (_engine, _id, argv) => { events.push(argv[0] === 'start' && argv.length > 1 ? 'graph' : `core:${argv[0]}`); },
-        resolveHostReachableIpv4: async () => '127.0.0.1',
+        // The restart and update of the Box run through master's bounded runners; the same recorder plays the in-Box core.
+        runRestartCore: fakeRestartCore(async (_engine, _id, argv) => { events.push(argv[0] === 'start' && argv.length > 1 ? 'graph' : `core:${argv[0]}`); }),
+        runUpdateCore: fakeUpdateCore({ onCall: ({ engine, containerId, argv, hostPort, mediaHostPort, options }) => (async (_engine, _id, argv) => { events.push(argv[0] === 'start' && argv.length > 1 ? 'graph' : `core:${argv[0]}`); })(engine, containerId, argv, hostPort, mediaHostPort, null, options) }),
+        resolveHostReachableIpv4: async () => '192.168.1.12',
         healthCheck: async () => {},
         revalidateAgentLibSource: () => {},
         commitAgentLibSelection: () => {},
@@ -714,7 +724,16 @@ test('G.every-final-generation', async (t) => {
             rollbackEvents.push(`core:${id.slice(0, 4)}:${argv.join(' ')}`);
             if (id.startsWith('1111')) throw new Error('candidate graph failed');
         },
-        resolveHostReachableIpv4: async () => '127.0.0.1',
+        // The restart and update of the Box run through master's bounded runners; the same recorder plays the in-Box core.
+        runRestartCore: fakeRestartCore(async (_engine, id, argv) => {
+            rollbackEvents.push(`core:${id.slice(0, 4)}:${argv.join(' ')}`);
+            if (id.startsWith('1111')) throw new Error('candidate graph failed');
+        }),
+        runUpdateCore: fakeUpdateCore({ onCall: ({ engine, containerId, argv, hostPort, mediaHostPort, options }) => (async (_engine, id, argv) => {
+            rollbackEvents.push(`core:${id.slice(0, 4)}:${argv.join(' ')}`);
+            if (id.startsWith('1111')) throw new Error('candidate graph failed');
+        })(engine, containerId, argv, hostPort, mediaHostPort, null, options) }),
+        resolveHostReachableIpv4: async () => '192.168.1.12',
         healthCheck: async () => {},
         revalidateAgentLibSource: () => {},
         commitAgentLibSelection: () => {},
@@ -766,7 +785,10 @@ test('G.every-final-generation', async (t) => {
             captureCoreStartArgv: () => ['start', 'explorer', '8080'],
             readEdgeDesired: () => null,
             runCoreCommand: async (_engine, id, argv) => { events.push(`core:${id.slice(0, 4)}:${argv.join(' ')}`); },
-            resolveHostReachableIpv4: async () => '127.0.0.1',
+            // The restart and update of the Box run through master's bounded runners; the same recorder plays the in-Box core.
+            runRestartCore: fakeRestartCore(async (_engine, id, argv) => { events.push(`core:${id.slice(0, 4)}:${argv.join(' ')}`); }),
+            runUpdateCore: fakeUpdateCore({ onCall: ({ engine, containerId, argv, hostPort, mediaHostPort, options }) => (async (_engine, id, argv) => { events.push(`core:${id.slice(0, 4)}:${argv.join(' ')}`); })(engine, containerId, argv, hostPort, mediaHostPort, null, options) }),
+            resolveHostReachableIpv4: async () => '192.168.1.12',
             healthCheck: async () => {},
             revalidateAgentLibSource: () => {},
             commitAgentLibSelection: () => {},
@@ -814,9 +836,12 @@ function realSupervisor(state, { env = {}, events = [], ownership = owned(state.
         selectAgentLib: async () => { events.push('select-agentlib'); return { selection: agentLibFixture(state.identity.workspaceRoot), mode: 'local' }; },
         reconcile: async (options) => { events.push('reconcile'); return { action: 'reused', ownership: reconciled, hostPort: 8080, mediaHostPort: 7882, hardware: options.hardware }; },
         readEdgeDesired: () => null,
-        resolveHostReachableIpv4: async () => '127.0.0.1',
+        resolveHostReachableIpv4: async () => '192.168.1.12',
         startCore: async () => { events.push('start-core'); },
         runCoreCommand: async () => { events.push('core'); },
+        // The restart and update of the Box run through master's bounded runners; the same recorder plays the in-Box core.
+        runRestartCore: fakeRestartCore(async () => { events.push('core'); }),
+        runUpdateCore: fakeUpdateCore({ onCall: ({ engine, containerId, argv, hostPort, mediaHostPort, options }) => (async () => { events.push('core'); })(engine, containerId, argv, hostPort, mediaHostPort, null, options) }),
         healthCheck: async () => {},
         revalidateAgentLibSource: () => {},
         commitAgentLibSelection: () => {},
@@ -1010,12 +1035,23 @@ function downgradeWorld(t, { boxRunning, graphRunning }) {
         reconcile: async () => ({ action: 'reused', ownership: ownership(), hostPort: 8090, mediaHostPort: 7882, hardware: null }),
         captureCoreStartArgv: () => ['start', 'explorer', '8090'],
         readEdgeDesired: () => null,
-        resolveHostReachableIpv4: async () => '127.0.0.1',
+        resolveHostReachableIpv4: async () => '192.168.1.12',
         runCoreCommand: async (_engine, id, argv) => {
             const entry = containers.get(id);
             entry.graphRunning = true;
             events.push(`core:${argv.join(' ')}`);
         },
+        // The restart and update of the Box run through master's bounded runners; the same recorder plays the in-Box core.
+        runRestartCore: fakeRestartCore(async (_engine, id, argv) => {
+            const entry = containers.get(id);
+            entry.graphRunning = true;
+            events.push(`core:${argv.join(' ')}`);
+        }),
+        runUpdateCore: fakeUpdateCore({ onCall: ({ engine, containerId, argv, hostPort, mediaHostPort, options }) => (async (_engine, id, argv) => {
+            const entry = containers.get(id);
+            entry.graphRunning = true;
+            events.push(`core:${argv.join(' ')}`);
+        })(engine, containerId, argv, hostPort, mediaHostPort, null, options) }),
         startCore: async () => { events.push('start-core'); },
         healthCheck: async () => {},
         revalidateAgentLibSource: () => {},
@@ -1157,7 +1193,10 @@ function preservedRecoveryWorld(t, { removalFailures = 1 } = {}) {
         readEdgeDesired: () => null,
         startCore: async () => { events.push('start-core'); },
         runCoreCommand: async (_engine, _id, argv) => { events.push(`core:${argv.join(' ')}`); },
-        resolveHostReachableIpv4: async () => '127.0.0.1',
+        // The restart and update of the Box run through master's bounded runners; the same recorder plays the in-Box core.
+        runRestartCore: fakeRestartCore(async (_engine, _id, argv) => { events.push(`core:${argv.join(' ')}`); }),
+        runUpdateCore: fakeUpdateCore({ onCall: ({ engine, containerId, argv, hostPort, mediaHostPort, options }) => (async (_engine, _id, argv) => { events.push(`core:${argv.join(' ')}`); })(engine, containerId, argv, hostPort, mediaHostPort, null, options) }),
+        resolveHostReachableIpv4: async () => '192.168.1.12',
         healthCheck: async () => {},
         revalidateAgentLibSource: () => {},
         commitAgentLibSelection: () => {},
@@ -1315,7 +1354,10 @@ test('G.update-recovers-stale-lock', async (t) => {
         reconcile: async (options) => { events.push('reconcile'); return { action: 'created', ownership: owned(state.identity), hostPort: 8080, mediaHostPort: 7882, hardware: options.hardware }; },
         readEdgeDesired: () => null,
         runCoreCommand: async () => { events.push('core'); },
-        resolveHostReachableIpv4: async () => '127.0.0.1',
+        // The restart and update of the Box run through master's bounded runners; the same recorder plays the in-Box core.
+        runRestartCore: fakeRestartCore(async () => { events.push('core'); }),
+        runUpdateCore: fakeUpdateCore({ onCall: ({ engine, containerId, argv, hostPort, mediaHostPort, options }) => (async () => { events.push('core'); })(engine, containerId, argv, hostPort, mediaHostPort, null, options) }),
+        resolveHostReachableIpv4: async () => '192.168.1.12',
         healthCheck: async () => {},
         revalidateAgentLibSource: () => {},
         commitAgentLibSelection: () => {},
