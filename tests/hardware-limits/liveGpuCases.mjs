@@ -583,10 +583,13 @@ export function createGpuCases(ctx) {
         const forbidden = (agent.mounts || []).filter(mount => /nvidia-cuda-mps-(?:control|server)$/.test(String(mount.Source)) || (String(mount.Source).startsWith('/run/ploinky/mps') && mount.Source !== daemon.pipeDirectory));
         expects(!forbidden.length, `${label}: the client holds an MPS tool binary or the state directory (${forbidden.map(mount => mount.Destination).join(',')})`);
     }
-    function assertUnshared(agent, label) {
+    // An unshared replacement carries no MPS label, no CUDA_MPS_* variable and no MPS pipe mount. The raw observation (label KEYS,
+    // variable NAMES, mount destinations: never a value) is saved as a case step before it is judged.
+    function assertUnshared(agent, label, evidence = null) {
         const mpsLabels = Object.keys(agent.labels || {}).filter(key => key.startsWith('ploinky.mps'));
         const cuda = (agent.env || []).filter(entry => /^CUDA_MPS_/.test(entry));
         const pipe = (agent.mounts || []).filter(mount => mount.Destination === MPS_CLIENT_PIPE || String(mount.Source).startsWith('/run/ploinky/mps'));
+        evidence?.step(`unshared:${label}`, { id: hexTail(agent.id), mpsLabelKeys: mpsLabels.sort(), cudaMpsEnvKeys: cuda.map(entry => entry.split('=')[0]).sort(), mpsPipeMounts: pipe.map(mount => ({ destination: mount.Destination, rw: mount.RW === true })) });
         expects(!mpsLabels.length && !cuda.length && !pipe.length, `${label}: the unshared replacement still carries MPS state (labels ${mpsLabels.join(',')}, env ${cuda.length}, mounts ${pipe.length})`);
     }
 
@@ -697,7 +700,7 @@ export function createGpuCases(ctx) {
             expects(processes.length > 0 && processes.every(value => Object.values(value.uid).every(uid => uid === daemon.host.uid.effective)), 'A probe process does not run as the same host UID as the daemon');
             // The Box itself is unchanged by a share, and other agents stay unshared.
             await inspectBox();
-            assertUnshared(await agentNow('cpu'), 'cpu agent');
+            assertUnshared(await agentNow('cpu'), 'cpu agent', evidence);
             await assertCpuUntouched(evidence, 'P1');
         });
     }
@@ -849,7 +852,7 @@ export function createGpuCases(ctx) {
             // C. Clear the final share through Apply: first the peer (the daemon stays), then the last one.
             await applyShares('p3-clear-peer', { [GPU_AGENT_REFS.peer]: null }, [GPU_AGENT_REFS.peer], evidence);
             const peerPlain = await agentNow('peer');
-            assertUnshared(peerPlain, 'peer after its clear');
+            assertUnshared(peerPlain, 'peer after its clear', evidence);
             const identityD = await daemonIdentity();
             expects(identityD.daemon?.generation === identityC.daemon.generation, 'Clearing a non-final share replaced the daemon');
             const probeD = await agentNow('probe'); registerOwned(probeD);
@@ -859,7 +862,7 @@ export function createGpuCases(ctx) {
             finally { evidence.put('finalClearTimeline', evaluateDrain(await clearTimeline.stop(), { quit: true })); }
             expects(evidence.data.finalClearTimeline.ok, `Final clear: the daemon quit before its client drained, or never quit: ${JSON.stringify(evidence.data.finalClearTimeline.violation)}`);
             await expectDaemonAbsent(identityD.daemon, cleared.state, 'final clear through Apply', evidence);
-            assertUnshared(await agentNow('probe'), 'probe after the final clear');
+            assertUnshared(await agentNow('probe'), 'probe after the final clear', evidence);
             await assertCpuUntouched(evidence, 'P3-C');
 
             // D. Host clear followed by an ordinary restart of the agent.
@@ -897,7 +900,7 @@ export function createGpuCases(ctx) {
             expects(evidence.data.restartTimeline.ok, `Host clear and restart: the daemon quit before its client drained, or never quit: ${JSON.stringify(evidence.data.restartTimeline.violation)}`);
             const stateAfterRestart = await admin.state();
             await expectDaemonAbsent(identityE.daemon, stateAfterRestart, 'host clear and ordinary restart', evidence);
-            assertUnshared(await agentNow('probe'), 'probe after the host clear and restart');
+            assertUnshared(await agentNow('probe'), 'probe after the host clear and restart', evidence);
             await inspectBox();
             await assertCpuUntouched(evidence, 'P3-D');
 

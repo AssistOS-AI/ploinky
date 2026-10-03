@@ -685,11 +685,39 @@ test('G1.P3-passes-drain-before-quit-final-clear-host-clear-restart-and-an-owned
     // CPU agents were never restarted, at any step.
     for (const step of e.steps.filter(entry => entry.name.startsWith('cpu-agent:'))) assert.equal(step.value.unchanged, true, step.name);
     assert.ok(e.steps.filter(entry => entry.name.startsWith('cpu-agent:')).length >= 6);
+    // Every unshared replacement has its raw MPS observation saved (label keys, variable names, pipe mounts: none, and no values).
+    const unshared = e.steps.filter(entry => entry.name.startsWith('unshared:'));
+    assert.deepEqual(unshared.map(entry => entry.name), ['unshared:peer after its clear', 'unshared:probe after the final clear', 'unshared:probe after the host clear and restart']);
+    for (const step of unshared) assert.deepEqual([step.value.mpsLabelKeys, step.value.cudaMpsEnvKeys, step.value.mpsPipeMounts], [[], [], []], step.name);
+    for (const step of unshared) assert.match(step.value.id, /^[a-f0-9]{12}$/, step.name);
     // The host clear and the restart used the supported product commands.
     const candidate = w.fake.model.calls.filter(call => call.binary === w.node).map(call => call.args.slice(1));
     assert.ok(candidate.some(args => args.join(' ') === 'limits clear --agent hwlfixture/probe'));
     assert.ok(candidate.some(args => args.join(' ') === 'restart hwlfixture/probe'), 'the restart carries no port: --port and --udp-port are valid only before start, diagnose or repair');
     nothingOwned(w);
+});
+
+test('G1.P3-the-observation-of-an-unshared-replacement-is-saved-before-it-is-judged-and-names-keys-never-values', async t => {
+    const w = await provisioned(t);
+    const adapter = await adapterOf(w);
+    await adapter.internals.prepare();
+    const steps = [];
+    const evidence = { step: (name, value) => steps.push({ name, value }) };
+    const plain = { id: 'a'.repeat(64), labels: { 'io.assistos.ploinky.role': 'agent', 'ploinky.limitshash': 'f'.repeat(64) }, env: ['PATH=/usr/bin', 'CUDA_VISIBLE_DEVICES=all'], mounts: [{ Destination: '/code', Source: '/work/code', RW: false }] };
+    assert.doesNotThrow(() => adapter.internals.assertUnshared(plain, 'plain', evidence));
+    assert.deepEqual(steps, [{ name: 'unshared:plain', value: { id: 'aaaaaaaaaaaa', mpsLabelKeys: [], cudaMpsEnvKeys: [], mpsPipeMounts: [] } }]);
+    // A replacement that still carries MPS state fails, and the saved observation shows exactly what it carried: names only.
+    steps.length = 0;
+    const carrying = { ...plain, labels: { ...plain.labels, 'ploinky.mpsgeneration': 'g1' }, env: [...plain.env, 'CUDA_MPS_PIPE_DIRECTORY=/run/secret-looking-value', 'CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=25'],
+        mounts: [...plain.mounts, { Destination: '/run/ploinky-mps-pipe', Source: '/run/ploinky/mps/pipe', RW: true }] };
+    assert.throws(() => adapter.internals.assertUnshared(carrying, 'carrying', evidence), /the unshared replacement still carries MPS state \(labels ploinky\.mpsgeneration, env 2, mounts 1\)/);
+    assert.equal(steps.length, 1, 'the observation was saved although the replacement was then refused');
+    assert.deepEqual(steps[0].value, { id: 'aaaaaaaaaaaa', mpsLabelKeys: ['ploinky.mpsgeneration'], cudaMpsEnvKeys: ['CUDA_MPS_ACTIVE_THREAD_PERCENTAGE', 'CUDA_MPS_PIPE_DIRECTORY'], mpsPipeMounts: [{ destination: '/run/ploinky-mps-pipe', rw: true }] });
+    assert.equal(JSON.stringify(steps).includes('secret-looking-value'), false, 'no variable value is recorded');
+    // Each carried kind fails on its own.
+    for (const [label, change] of [['a label', { labels: { 'ploinky.mpsgeneration': 'g' } }], ['a variable', { env: ['CUDA_MPS_PINNED_DEVICE_MEM_LIMIT=0=1024M'] }], ['a pipe mount', { mounts: [{ Destination: '/run/ploinky-mps-pipe', Source: '/x', RW: true }] }], ['a state-directory mount', { mounts: [{ Destination: '/mps', Source: '/run/ploinky/mps/state', RW: false }] }]]) {
+        assert.throws(() => adapter.internals.assertUnshared({ ...plain, ...change }, label, null), /still carries MPS state/, label);
+    }
 });
 
 test('G1.P3-a-daemon-that-quits-before-its-clients-drain-fails', async t => {

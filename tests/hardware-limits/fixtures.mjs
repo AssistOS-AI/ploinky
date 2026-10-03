@@ -623,6 +623,7 @@ export function buildRequiredCaseManifest() {
             'G1.P2-fails-when-the-share-does-not-cap-and-reports-probe-errors-with-their-step',
             'G1.P2-a-foreign-process-appearing-during-a-probe-blocks-and-starts-no-new-work',
             'G1.P3-passes-drain-before-quit-final-clear-host-clear-restart-and-an-owned-daemon-crash',
+            'G1.P3-the-observation-of-an-unshared-replacement-is-saved-before-it-is-judged-and-names-keys-never-values',
             'G1.P3-a-daemon-that-quits-before-its-clients-drain-fails',
             'G1.P3-fails-when-an-unrelated-cpu-agent-is-restarted',
             'G1.P3-the-crash-case-kills-only-an-owned-daemon-and-refuses-anything-it-cannot-prove',
