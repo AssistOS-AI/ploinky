@@ -316,10 +316,10 @@ function recreated(f, observedAt) {
     return { record, observation, readApplied: (key, id) => (key === 'canonical' && id === NEW_ID ? observation : null) };
 }
 // The real monitor publishing the states the engine reader returned; only that reader's output is injected.
-function snapshotOf(states) { const monitor = new Monitor(); monitor.states = states; monitor.publish(); return monitor.latest; }
+function snapshotOf(states) { const monitor = new Monitor(); monitor.states = states; monitor.statesReadStartedAt = Date.now(); monitor.publish(); return monitor.latest; }
 function statusOf(f, states, observedOffsetMs) {
     const metrics = snapshotOf(states);
-    const { record, readApplied } = recreated(f, new Date(Date.parse(metrics.sampledAt) + observedOffsetMs).toISOString());
+    const { record, readApplied } = recreated(f, new Date(Date.parse(metrics.readStartedAt) + observedOffsetMs).toISOString());
     const state = buildHardwareLimitsState({ context: f.getContext(), installed: [{ ref: 'demo/worker', manifestPath: '/fixture/manifest.json' }], registry: { canonical: record }, metrics, admit: placementAdmit, readApplied });
     const container = state.agents[0].containers[0];
     return { availability: container.availability, limitsState: container.limitsState, limits: container.limits ?? null };
@@ -410,4 +410,48 @@ test('S2.a-failed-apply-does-not-wait-for-a-metrics-reconcile', async (t) => {
     let waits = 0;
     const response = await request(w.f, { method: 'POST', body: applyBody(w.f), dependencies: w.deps({ refreshMetrics: async () => { waits += 1; return { fresh: true }; }, apply: async () => ({ ok: false, status: 409, error: 'apply_failed' }) }) });
     assert.equal(response.status, 409); assert.equal(waits, 0); assert.equal(response.body.statusFresh, undefined);
+});
+
+// S4: freshness is judged by when the engine read STARTED. A listing begun before the Apply can publish after it.
+test('S4.an-old-listing-published-after-the-apply-never-proves-the-new-container-stopped', async (t) => {
+    let release; const gate = { promise: new Promise((resolve) => { release = resolve; }) };
+    const f = fixture(t);
+    const record = { ...f.registry.canonical, containerId: NEW_ID };
+    const { observation, readApplied } = recreated(f, new Date(0).toISOString());
+    const engine = { containers: [], calls: 0 };
+    const newRunning = engineEntry({ containerId: NEW_ID, state: { status: 'running', running: true, pid: 7 } });
+    const monitor = new Monitor({
+        readRegistry: () => ({ canonical: record }), runtimeStateOptions: { activeGeneration: null, routes: { worker: { container: 'canonical', repo: 'demo', agent: 'worker', hostPort: 4100 } } },
+        readHardwareContext: () => ({ gate: 'off' }), readRouting: () => ({ routes: {} }), containerStats: false,
+        collectContainers: async () => { engine.calls += 1; const listing = engine.containers; if (engine.calls === 1) await gate.promise; return listing; },
+    });
+    const deps = (extra = {}) => ({ getRegistry: () => ({ canonical: record }), getMetrics: () => monitor.latest, readApplied, admit: placementAdmit, refreshMetrics: (since) => monitor.reconcileAfter(since, 30), ...extra });
+    // 1. An engine listing starts BEFORE the Apply, sees no container, and is held.
+    const held = monitor.reconcile();
+    await new Promise((resolve) => setImmediate(resolve));
+    // 2. The Apply creates the new running container; the bounded refresh cannot start a newer reconcile and expires.
+    const response = await request(f, { method: 'POST', body: applyBody(f), dependencies: deps({ apply: async () => { engine.containers = [newRunning]; observation.observedAt = new Date().toISOString(); return { ok: true, status: 200, results: [] }; } }) });
+    assert.equal(response.body.statusFresh, false);
+    // 3. The old listing is released and publishes now, with a publication time later than the Apply.
+    release(); await held;
+    assert.ok(Date.parse(monitor.latest.sampledAt) >= Date.parse(observation.observedAt), 'it was published after the Apply');
+    assert.ok(Date.parse(monitor.latest.readStartedAt) < Date.parse(observation.observedAt), 'but its read began before it');
+    // The new container is running: the status must not call it stopped.
+    const lagging = containerOf(await request(f, { dependencies: deps() }));
+    assert.deepEqual({ availability: lagging.availability, limitsState: lagging.limitsState }, { availability: 'starting', limitsState: 'applied' });
+    // (b) A reconcile that really started afterwards sees it running and ready.
+    await monitor.reconcile();
+    const fresh = containerOf(await request(f, { dependencies: deps() }));
+    assert.deepEqual({ availability: fresh.availability, limitsState: fresh.limitsState }, { availability: 'ready', limitsState: 'applied' });
+    // (c) A genuine stop of the CURRENT container, read after the Apply, still reads stopped.
+    engine.containers = [engineEntry({ containerId: NEW_ID, state: { status: 'exited', running: false, pid: 0 } })];
+    await monitor.reconcile();
+    const stopped = containerOf(await request(f, { dependencies: deps() }));
+    assert.deepEqual({ availability: stopped.availability, limitsState: stopped.limitsState }, { availability: 'stopped', limitsState: 'unavailable' });
+    // (c2) The same with no container at all, in a read that started after the observation was written.
+    observation.observedAt = new Date(Date.now() - 60_000).toISOString();
+    engine.containers = [];
+    await monitor.reconcile();
+    const gone = containerOf(await request(f, { dependencies: deps() }));
+    assert.deepEqual({ availability: gone.availability, limitsState: gone.limitsState }, { availability: 'stopped', limitsState: 'unavailable' });
 });

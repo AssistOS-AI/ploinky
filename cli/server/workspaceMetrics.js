@@ -75,6 +75,9 @@ export class WorkspaceMetricsMonitor extends EventEmitter {
     this.containerStats = containerStats;
     this.reconcilePromise = null;
     this.completedReconcileStartedAt = 0;
+    // When the engine read behind `states` STARTED (epoch ms; 0 before the first). A snapshot says nothing about what happened after that,
+    // however late it is published.
+    this.statesReadStartedAt = 0;
     this.setMaxListeners(0);
     this.states = [];
     this.containerMetrics = new Map();
@@ -151,6 +154,7 @@ export class WorkspaceMetricsMonitor extends EventEmitter {
       const registry = this.readRegistry() || {};
       const states = await collectAgentRuntimeStatesAsync({ registry, ...this.runtimeStateOptions, ...(this.collectContainers ? { collectContainers: this.collectContainers } : {}) });
       this.states = applyRuntimeReadinessProjection(states, registry);
+      this.statesReadStartedAt = startedAt;
       this.hardwareEnabled = this.readHardwareContext().gate === 'on';
       if (this.hardwareEnabled) {
         const routing = this.readRouting();
@@ -292,6 +296,7 @@ export class WorkspaceMetricsMonitor extends EventEmitter {
     this.latest = {
       ok: true,
       sampledAt: new Date().toISOString(),
+      readStartedAt: this.statesReadStartedAt ? new Date(this.statesReadStartedAt).toISOString() : null,
       router: { status: 'running', pid: process.pid, metrics: routerMetrics },
       runtimes,
       total,

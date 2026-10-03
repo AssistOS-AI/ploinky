@@ -133,7 +133,9 @@ export function buildHardwareLimitsState({ context, installed, registry, routing
             // for it, the snapshot predates the instance: it says nothing about it, and the instance is starting, never stopped.
             const entryId = snapshotRuntime?.containerId || '';
             const currentId = /^[a-f0-9]{64}$/.test(record.containerId || '') ? record.containerId : '';
-            const sampledAt = Date.parse(metrics?.sampledAt);
+            // Freshness is judged by when the engine read STARTED, not by when the snapshot was published (a read begun before the Apply
+            // can publish long after it).
+            const sampledAt = Date.parse(metrics?.readStartedAt ?? metrics?.sampledAt);
             const observedAt = Date.parse(matchingObservation?.observedAt);
             const predates = Number.isFinite(sampledAt) && Number.isFinite(observedAt) && sampledAt < observedAt;
             const staleSnapshot = Boolean(metrics) && Boolean(matchingObservation) && !projection
