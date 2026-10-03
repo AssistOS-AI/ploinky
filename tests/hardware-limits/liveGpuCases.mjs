@@ -14,6 +14,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { LIMITS_HASH_LABEL } from '../../cli/sandbox/hardwareLimits/resolve.mjs';
+import { formatApplyCause } from '../../cli/sandbox/hardwareLimits/applyCause.mjs';
 import { FAILURE_EVIDENCE_CASE, blocked, boundedTail, checkedJson, commandTails, failureEvidenceNames, jsonDigest } from './liveCommon.mjs';
 import { requireTransport } from './liveProcess.mjs';
 import { fixtureContainerName } from './liveFixture.mjs';
@@ -292,7 +293,16 @@ export function createGpuCases(ctx) {
         catch (error) { applyAttempt.endedAt = Date.now(); applyAttempt.error = String(error?.message || error).slice(0, 300); throw error; }
         applyAttempt.endedAt = Date.now(); applyAttempt.status = applied.status; applyAttempt.response = applied.fullText;
         evidence.step(`applied:${applyRefs.join(',')}`, { status: applied.status, body: applied.text });
-        expects(applied.status === 200 && applied.body?.ok !== false, `Apply of ${applyRefs.join(', ')} failed: ${applied.status} ${applied.text.slice(0, 400)}`);
+        // A failed Apply's reason leads with its parsed cause (step, class, code, message): the response text is cut at 400
+        // characters and, in LIVE-P1 attempt 5, the cut fell before the cause.
+        const causeOf = reply => {
+            let body = reply.body;
+            if (!body) { try { body = JSON.parse(reply.fullText); } catch { body = null; } }
+            const cause = body?.cause?.step ? body.cause : body?.results?.find(entry => entry?.cause?.step)?.cause;
+            return cause ? formatApplyCause(cause).slice(0, 500) : null;
+        };
+        const cause = applied.status === 200 && applied.body?.ok !== false ? null : causeOf(applied);
+        expects(applied.status === 200 && applied.body?.ok !== false, `Apply of ${applyRefs.join(', ')} failed: ${applied.status} ${cause ? `(${cause}) ` : ''}${applied.text.slice(0, 400)}`);
         await sleep(timings.afterApplyMs);
         return { keys, state: await admin.state(), reply: applied };
     }

@@ -1758,3 +1758,14 @@ test('U3.a-fixture-agent-that-dies-on-sigterm-fails-apply-at-client-launch-with-
     assert.equal(report.verdict, 'FAIL');
     nothingOwned(w);
 });
+
+// --- R12-c(i): the case reason of a failed Apply leads with its parsed cause --------------------------------------------
+test('R12c.a-failed-apply-reason-carries-the-parsed-cause-before-the-cut-response-text', async t => {
+    // The response puts 600 characters before its cause: the 400-character cut of the text alone would lose the cause.
+    const w = await provisioned(t, { faults: { base: { fixtureAgentCommand: 'node -e "setInterval(()=>{},3600000)"' }, applyBodyPadding: 600 } });
+    const p1 = caseOf(await liveCases(w, ['LIVE-P1']), 'LIVE-P1');
+    assert.equal(p1.result, 'fail', JSON.stringify(p1).slice(0, 300));
+    assert.match(p1.reason, /^Apply of hwlfixture\/probe failed: 409 \(client-launch: Error \(TARGETED_DRAIN_FAILED\): targeted drain for '[^']+' did not exit cleanly \(exit=143\); refusing removal or recreate\) /);
+    assert.equal(p1.reason.includes('"cause"'), false, 'the cause was cut out of the text, so only the parsed form carries it');
+    nothingOwned(w);
+});

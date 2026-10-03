@@ -355,7 +355,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
                 // The real Apply response of a refused drain (observed in LIVE-P1 attempt 6).
                 const cause = { step: 'client-launch', errorClass: 'Error', code: 'TARGETED_DRAIN_FAILED', message: error.message };
                 const message = `Apply stopped at client-launch: Error (TARGETED_DRAIN_FAILED): ${error.message}`;
-                return { status: 409, text: JSON.stringify({ ok: false, status: 409, error: 'TARGETED_DRAIN_FAILED', message, cause, token: { epoch: model.store.epoch, revision: model.store.revision }, expandedContainers: [],
+                return { status: 409, text: JSON.stringify({ ok: false, status: 409, error: 'TARGETED_DRAIN_FAILED', message, ...(faults.applyBodyPadding ? { padding: 'x'.repeat(faults.applyBodyPadding) } : {}), cause, token: { epoch: model.store.epoch, revision: model.store.revision }, expandedContainers: [],
                     results: roles.map(role => ({ key: key(role), state: 'pending', problem: null, error: 'TARGETED_DRAIN_FAILED', message, cause })) }) };
             }
             return { status: 200, text: JSON.stringify({ ok: true, results: roles.map(role => ({ key: key(role), state: 'applied' })) }) };
