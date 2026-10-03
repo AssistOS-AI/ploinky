@@ -3,14 +3,17 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
+    buildRequiredCaseManifest,
     evaluateGpuIdleGate,
     evaluateSuiteRun,
     randomRunId,
     runCleanup,
 } from '../hardware-limits/fixtures.mjs';
 import { runSuite, prepareExplorerLayout, assertExplorerPloinkySibling, assertExplorerLayoutUnchanged } from '../hardware-limits/verify.mjs';
+import { runBoundedProcess } from '../hardware-limits/liveProcess.mjs';
 
 function synthetic(t, files) {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-h-')));
@@ -44,6 +47,71 @@ async function run(t, files, options = {}) {
 function requiredCase(file, name) {
     return { id: name, phase: 's0', repo: 'ploinky', file, name, kind: 'offline', requires: [], expected: 'pass' };
 }
+
+test('H.l3load-required-cases-resolve-to-real-p4-llm-leaves', async (t) => {
+    const names = [
+        'L3LOAD.the-vllm-model-load-is-thirty-minutes-and-the-block-is-the-runner-maximum-and-the-summary-renders-both',
+        'L3LOAD.a-load-within-the-deadline-continues-and-records-each-phase-transition-and-the-total-wait',
+        'L3LOAD.a-load-past-the-deadline-is-blocked-never-failed-and-a-failed-load-is-a-failure-and-both-record-their-timing',
+    ];
+    const required = buildRequiredCaseManifest().cases.filter(entry => entry.name.startsWith('L3LOAD.'));
+    assert.deepEqual(required.map(entry => entry.name).sort(), [...names].sort());
+    const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+    const scratch = synthetic(t, {});
+    const home = path.join(scratch, 'home');
+    fs.mkdirSync(home, { mode: 0o700 });
+    const runId = randomRunId();
+    const childId = 'l3load-registration';
+    const eventsPath = path.join(scratch, 'l3load_events_codex.jsonl');
+    const tapPath = path.join(scratch, 'l3load_child_codex.tap');
+    const file = 'tests/unit/hardwareLimitsLiveLlm.test.mjs';
+    const child = await runBoundedProcess(process.execPath, [
+        '--import', pathToFileURL(path.join(root, 'tests/helpers/agentlibTestContract.mjs')).href,
+        '--import', pathToFileURL(path.join(root, 'tests/helpers/engineSpawnGuard.mjs')).href,
+        '--test', '--test-concurrency=1', '--test-timeout=60000', '--test-name-pattern=^L3LOAD[.]',
+        '--test-reporter=' + path.join(root, 'tests/hardware-limits/reporter.mjs'),
+        '--test-reporter-destination=' + eventsPath,
+        '--test-reporter=tap', '--test-reporter-destination=' + tapPath,
+        file,
+    ], {
+        cwd: root,
+        env: {
+            PATH: process.env.PATH || '/usr/bin:/bin',
+            HOME: home,
+            TMPDIR: scratch,
+            NO_COLOR: '1',
+            PLOINKY_ROOT: root,
+            PLOINKY_HWL_TEST_ROOT: root,
+            PLOINKY_HWL_RUN_ID: runId,
+            PLOINKY_HWL_CHILD_ID: childId,
+            ...(process.env.PLOINKY_AGENTLIB_DIR ? { PLOINKY_AGENTLIB_DIR: process.env.PLOINKY_AGENTLIB_DIR } : {}),
+        },
+        deadlineMs: 60000,
+        maxBytes: 262144,
+    });
+    assert.deepEqual({
+        status: child.status, signal: child.signal, timedOut: child.timedOut,
+        truncated: child.truncated, cancelled: child.cancelled,
+        errorCode: child.errorCode, settlementForced: child.settlementForced,
+    }, {
+        status: 0, signal: null, timedOut: false, truncated: false,
+        cancelled: false, errorCode: null, settlementForced: false,
+    }, child.stderr);
+    const evaluation = evaluateSuiteRun({
+        exitCode: child.status, signal: child.signal,
+        eventText: fs.readFileSync(eventsPath, 'utf8'),
+        runId, childId, files: [file], required,
+    });
+    assert.equal(evaluation.streamComplete, true);
+    assert.equal(evaluation.discovered, 3);
+    assert.equal(evaluation.completed, 3);
+    assert.deepEqual([...evaluation.inventory.values()], ['pass', 'pass', 'pass']);
+    assert.equal(evaluation.verdict, 'PASS', JSON.stringify(evaluation.cases, null, 2));
+    assert.deepEqual(evaluation.cases.map(entry => entry.id).sort(), [...names].sort());
+    assert.deepEqual(required.map(entry => ({
+        file: entry.file, phase: entry.phase, repo: entry.repo, kind: entry.kind, expected: entry.expected,
+    })), names.map(() => ({ file, phase: 'p4', repo: 'ploinky', kind: 'offline', expected: 'pass' })));
+});
 
 test('H.assertion-failure', async (t) => {
     const { result } = await run(t, {

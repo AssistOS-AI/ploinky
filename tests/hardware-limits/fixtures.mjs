@@ -256,6 +256,7 @@ export function buildRequiredCaseManifest() {
             'H.cleanup-original-and-cleanup-errors', 'H.pid-12-34-not-123-934', 'H.pid-reuse', 'H.query-error',
             'H.malformed-pids', 'H.initial-busy', 'H.graphics-unknown-blocked', 'H.scratch-home', 'H.baseline-stage-hashes-without-stdin', 'H.baseline-stage-spawn-calls-never-use-stdin',
             'H.duplicate-leaf-title-under-two-parents', 'H.p3-explorer-sibling-is-the-configured-ploinky-candidate',
+            'H.l3load-required-cases-resolve-to-real-p4-llm-leaves',
         ]),
         ...leaves(P, 's0', unit('hardwareLimitsFailureSignatures.test.mjs'), ['HS.proc-pid-normalization', 'HS.engine-spawn-guard-fails-a-suite-that-starts-an-engine']),
         ...leaves(P, 's0', unit('hardwareLimitsEngineGuard.test.mjs'), [
@@ -667,9 +668,6 @@ export function buildRequiredCaseManifest() {
             'L3B.a-slow-but-progressing-install-continues-past-the-stall-window-and-records-its-throughput',
             'L3B.a-stalled-install-is-blocked-after-the-stall-window-and-an-install-over-the-cap-is-blocked',
             'L3B.the-vllm-block-states-its-cap-its-stall-window-and-a-block-deadline-that-holds-them',
-            'L3LOAD.the-vllm-model-load-is-thirty-minutes-and-the-block-is-the-runner-maximum-and-the-summary-renders-both',
-            'L3LOAD.a-load-within-the-deadline-continues-and-records-each-phase-transition-and-the-total-wait',
-            'L3LOAD.a-load-past-the-deadline-is-blocked-never-failed-and-a-failed-load-is-a-failure-and-both-record-their-timing',
             'R18-1.a-build-that-shows-no-progress-for-longer-than-the-stall-window-passes-but-a-stalled-download-still-blocks',
             'R18-1.a-build-that-never-ends-is-cut-by-the-hard-cap',
             'R18-1.the-operator-summary-states-the-download-stall-window-and-the-build-bound',
@@ -835,6 +833,9 @@ export function buildRequiredCaseManifest() {
             'LL.partial-mps-refused', 'LL.unified-share-refused', 'LL.gpu-unlimited-golden',
         ]),
         ...leaves(P, 'p4', unit('hardwareLimitsLiveLlm.test.mjs'), [
+            'L3LOAD.the-vllm-model-load-is-thirty-minutes-and-the-block-is-the-runner-maximum-and-the-summary-renders-both',
+            'L3LOAD.a-load-within-the-deadline-continues-and-records-each-phase-transition-and-the-total-wait',
+            'L3LOAD.a-load-past-the-deadline-is-blocked-never-failed-and-a-failed-load-is-a-failure-and-both-record-their-timing',
             // The L1 measurement needs real in-flight observations.
             'LLM1.L1-with-an-instant-generation-is-blocked-and-never-passes-while-a-long-enough-one-passes',
             'LLM1.the-analysis-needs-the-minimum-in-flight-samples-of-each-kind-and-counts-neither-before-nor-after',
