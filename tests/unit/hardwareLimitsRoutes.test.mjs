@@ -348,7 +348,7 @@ test('S1.a-stale-snapshot-never-reports-a-just-recreated-instance-as-stopped-or-
 });
 
 // S2: the real monitor and the real route; only the engine's container list (and the registry it is read against) is injected.
-function appliedWorld(t, { gate = null, boundMs = 4000 } = {}) {
+function appliedWorld(t, { gate = null, boundMs = 4000, listDelayMs = 0 } = {}) {
     const f = fixture(t);
     const record = { ...f.registry.canonical, containerId: NEW_ID };
     const { observation, readApplied } = recreated(f, new Date(0).toISOString());
@@ -358,7 +358,7 @@ function appliedWorld(t, { gate = null, boundMs = 4000 } = {}) {
     const monitor = new Monitor({
         readRegistry: () => ({ canonical: record }), runtimeStateOptions: { activeGeneration: null, routes: { worker: { container: 'canonical', repo: 'demo', agent: 'worker', hostPort: 4100 } } },
         readHardwareContext: () => ({ gate: 'off' }), readRouting: () => ({ routes: {} }), containerStats: false,
-        collectContainers: async () => { const listing = engine.containers; engine.listings += 1; if (gate && engine.listings === 2) await gate.promise; return listing; },
+        collectContainers: async () => { if (listDelayMs) await new Promise((resolve) => setTimeout(resolve, listDelayMs)); const listing = engine.containers; engine.listings += 1; if (gate && engine.listings === 2) await gate.promise; return listing; },
     });
     const applied = () => { engine.containers = [newRunning]; observation.observedAt = new Date().toISOString(); };
     const deps = (extra = {}) => ({
@@ -630,5 +630,18 @@ test('F1.a-failed-engine-read-makes-every-kept-runtime-stale-so-a-stopped-contai
             assert.deepEqual(status(), { availability: 'starting', limitsState: 'applied', failed: true });
         } else assert.deepEqual(status(), { availability: 'stopped', limitsState: 'unavailable', failed: false }, 'a successful read after the stop reads stopped');
     }
+});
+
+// F2: the product half of T3.
+test('F2.the-apply-response-carries-the-numeric-wait-and-the-status-carries-the-snapshots-read-start', async (t) => {
+    const w = appliedWorld(t, { listDelayMs: 40 });
+    await w.monitor.reconcile();
+    const response = await request(w.f, { method: 'POST', body: applyBody(w.f), dependencies: w.deps({ apply: async () => { w.applied(); return { ok: true, status: 200, results: [] }; } }) });
+    assert.equal(response.body.statusFresh, true);
+    assert.ok(Number.isInteger(response.body.statusWaitMs) && response.body.statusWaitMs >= 35 && response.body.statusWaitMs <= 4000, `statusWaitMs ${response.body.statusWaitMs}`);
+    const read = await request(w.f, { dependencies: w.deps() });
+    assert.equal(typeof w.monitor.latest.readStartedAt, 'string');
+    assert.equal(read.body.metricsReadStartedAt, w.monitor.latest.readStartedAt);
+    assert.equal(read.body.metricsReadFailed, false);
 });
 
