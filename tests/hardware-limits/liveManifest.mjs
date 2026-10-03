@@ -725,7 +725,8 @@ function llmDataSection(run) {
         '| --- | --- | --- |',
         '| The immutable local-llm image is present or pullable by the nested engine | the Box start pulls `' + cell(profile.provision.image) + '`; its size is not known before | the start fails and the run is cleaned up (BLOCKED when the failure is a missing prerequisite) |',
         `| The Box memory envelope covers the budget | 25% of it must be at least 3 GiB, and a whole percentage must give a cap between ${INSUFFICIENT_RAM.minCapBytes / 1048576} and ${INSUFFICIENT_RAM.maxCapBytes / 1048576} MiB for L2; at least ${LLM_BUDGET.cpus} CPUs | BLOCKED with the envelope |`,
-        '| The host can reach Hugging Face | the model download | the Run fails or pauses (paused is BLOCKED) |',
+        '| The host can reach the model source (Hugging Face and the network) | the model download | BLOCKED when Hugging Face or the network is unreachable, and when the download pauses (for example for lack of disk). A pin, size or digest mismatch, a deployment that ends in any other error, or a runner exit is a failure |',
+        ...(l3 ? [] : [`| The model loads within the block deadline (LIVE-L1) | L1 waits for the deployment to be ready for up to ${run.deadlines.modelLoadMs} ms | BLOCKED with the phase and the download progress; a slow load is never a failure of the case |`]),
         ...(l3 ? [
             '| The image lock has a vLLM entry for linux/amd64 with CUDA wheels, equal to the pins | step 0 reads and compares it | BLOCKED with the exact missing prerequisite; nothing unpinned is ever installed |',
             '| Free disk for the wheels, their runnable copy and the model | step 0 states free and needed bytes per filesystem | BLOCKED |',

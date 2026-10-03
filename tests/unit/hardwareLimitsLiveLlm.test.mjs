@@ -1694,3 +1694,27 @@ test('R12a.free-gpu-memory-between-the-old-share-threshold-and-the-admission-thr
     assert.equal(toolCalls(blocks, 'local_llm_run').filter(call => call.args.runnerId === 'vllm').length, 0, 'no model was started');
     nothingOwned(blocks);
 });
+
+// --- R12-b: the approval summary states what BLOCKS and what fails ------------------------------------------------------
+test('R12b.the-approval-summary-says-an-unreachable-source-and-a-slow-model-load-are-blocked-and-a-mismatch-or-runner-exit-is-a-failure', async t => {
+    for (const block of ['apparatus-local-llm', 'apparatus-vllm']) {
+        const f = prepareLlmFixture(t);
+        const { code, runPath, run } = await prepare(f, block, `r12b-${block}`, block === 'apparatus-vllm' ? f.pins({ image: LLM_IMAGE, vllm: VLLM_PINS }) : f.pins({ image: LLM_IMAGE }));
+        assert.equal(code, 0, block);
+        const summary = fs.readFileSync(summaryPathFor(runPath, 'claude'), 'utf8');
+        const rows = summary.split('\n').filter(line => line.startsWith('|'));
+        const source = rows.find(line => line.startsWith('| The host can reach the model source'));
+        assert.ok(source, `${block}: the source row`);
+        assert.match(source, /BLOCKED when Hugging Face or the network is unreachable/); assert.match(source, /download pauses/);
+        assert.match(source, /A pin, size or digest mismatch, a deployment that ends in any other error, or a runner exit is a failure/);
+        assert.equal(/the Run fails or pauses/.test(summary), false, 'the old wording is gone');
+        const load = rows.find(line => line.startsWith('| The model loads within the block deadline (LIVE-L1)'));
+        if (block === 'apparatus-local-llm') {
+            assert.ok(load, 'the slow-load row of L1');
+            assert.match(load, new RegExp(`up to ${run.deadlines.modelLoadMs} ms`)); assert.match(load, /BLOCKED with the phase and the download progress; a slow load is never a failure of the case/);
+        } else {
+            assert.equal(load, undefined, 'the vLLM block runs no L1');
+            assert.ok(rows.some(line => /install within \d+ ms, model load within \d+ ms/.test(line) && /BLOCKED with the progress made/.test(line)), 'the vLLM block states its own deadline row');
+        }
+    }
+});
