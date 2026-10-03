@@ -558,11 +558,13 @@ export function buildRequiredCaseManifest() {
             'X.store-rw-marker-ro', 'X.hardware-unexpected-bind-rejected', 'X.tool-binds-ro',
         ]),
         // Round G1: the apparatus-mps executors, their gate, probe protocol, provisioning, cleanup and manifest.
-        ...leaves(P, 'p4', unit('hardwareLimitsExecutors.test.mjs'), [
+        ...leaves(P, 's0', unit('hardwareLimitsExecutors.test.mjs'), [
             'X4.foreign-guard-refuses-a-workspace-stage-or-cwd-under-the-other-sessions-directories-and-a-derived-box-name',
             'X4.foreign-guard-aborts-provision-live-and-cleanup-before-any-command',
             'X4.foreign-guard-aborts-when-the-working-directory-is-under-the-other-sessions-directory',
             'X4.foreign-guard-refuses-a-derived-box-name-of-the-other-session',
+        ]),
+        ...leaves(P, 'p4', unit('hardwareLimitsExecutors.test.mjs'), [
             'X4.apparatus-core-block-is-a-linux-remote-block-with-the-c1-and-c2-executors-and-no-unsupported-entry',
             'X4.apparatus-core-manifest-and-summary-name-the-pass-conditions-the-guard-and-the-owned-resources',
             'X4.apparatus-core-every-candidate-argv-is-accepted-by-the-real-parser-and-provision-and-cleanup-leave-nothing',
