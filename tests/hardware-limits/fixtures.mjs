@@ -1000,6 +1000,7 @@ export function buildRequiredCaseManifest() {
             'G2.validation-refuses-inconsistent-local-llm-pins-profiles-budgets-and-tool-words',
             'G2.prepare-live-apparatus-local-llm-pins-the-image-the-tree-and-the-models-and-writes-the-approval-summary',
             'G2.prepare-live-apparatus-vllm-stage-one-pins-the-lock-entry-and-asks-for-no-evidence',
+            'G2.the-stage-one-approval-row-names-every-read-only-memory-query-the-calibration-performs-under-both-limits',
             'G2.prepare-live-apparatus-vllm-stage-two-checks-the-evidence-with-the-candidates-digest-and-asks-production-whether-the-tuple-is-qualified',
         ]),
         ...leaves(P, 'p4', unit('ploinkyBoxGpuGrant.test.mjs'), [

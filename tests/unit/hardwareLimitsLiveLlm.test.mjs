@@ -1064,6 +1064,20 @@ test('G2.prepare-live-apparatus-vllm-stage-one-pins-the-lock-entry-and-asks-for-
     await assert.rejects(main(['prepare-live', '--config', f.configPath, '--block', 'apparatus-vllm', '--run', path.join(f.evidence, 'stage_claude.json'), '--pins', f.pinsFile('pins_stage_claude.json', f.pins({ image: LLM_IMAGE, vllm: VLLM_PINS })), '--stage', 'both']), /--stage must be calibration or qualified/);
 });
 
+// R22 (R4): the approver reads the stage-1 row to learn which queries the calibration tool performs in the client. The tool of local-llms
+// e572c1a also asks torch.accelerator.get_memory_info(0), the call vLLM 0.30.0 reads its device total through, under both limits.
+test('G2.the-stage-one-approval-row-names-every-read-only-memory-query-the-calibration-performs-under-both-limits', async t => {
+    const f = prepareLlmFixture(t);
+    const { code, runPath } = await prepare(f, 'apparatus-vllm', 'vllm1q', f.pins({ image: LLM_IMAGE, vllm: VLLM_PINS }));
+    assert.equal(code, 0);
+    const summary = fs.readFileSync(summaryPathFor(runPath, 'claude'), 'utf8');
+    const rows = summary.split('\n').filter(line => line.startsWith('| L3 | L3-stage1-calibrate |'));
+    assert.equal(rows.length, 1, 'one stage-1 calibration row');
+    for (const query of ['torch.cuda.mem_get_info', 'torch.accelerator.get_memory_info(0)', 'get_device_properties(0).total_memory', 'cuMemGetInfo', 'read-only', 'under the saved and a tighter limit']) {
+        assert.ok(rows[0].includes(query), `the stage-1 row names ${query}: ${rows[0]}`);
+    }
+});
+
 test('G2.prepare-live-apparatus-vllm-stage-two-checks-the-evidence-with-the-candidates-digest-and-asks-production-whether-the-tuple-is-qualified', async t => {
     const tuple = { runnerLockDigest: VLLM_PINS.runnerLockDigest, driverVersion: '595.91.07', gpuPciDeviceId: '0x252010DE', computeCapability: '8.6', deviceTotalBytes: 6144 * MIB };
     // The stage 1 evidence document, with the digest the candidate's own function gives (the tool stub's canonical form).
