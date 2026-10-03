@@ -2253,3 +2253,15 @@ test('R17.cancelled-forced-settlement-and-error-code-truth-reads-keep-their-erro
     }
 });
 
+test('R17.every-poll-is-written-to-the-evidence-as-it-happens', async t => {
+    const w = await provisioned(t, { faults: STOPPED });
+    const writes = [];
+    const record = (name, value) => { w.artifacts.set(name, structuredClone(value)); if (name === 'gpu-live-p1' && value.statusUnsettled) writes.push({ phase: value.statusUnsettled.phase, polls: value.statusUnsettled.convergence.polls.length }); };
+    await liveCases(w, ['LIVE-P1'], { timings: { convergenceMs: 150, convergencePollMs: 10 }, artifacts: record });
+    const final = w.artifacts.get('gpu-live-p1').statusUnsettled.convergence.polls.length;
+    assert.ok(final >= 3, `polls ${final}`);
+    // Before the evidence is completed, a write exists for each poll count 1..final.
+    const during = new Set(writes.filter(entry => entry.phase === 'captured-after-immediate-failure').map(entry => entry.polls));
+    for (let count = 1; count <= final; count += 1) assert.ok(during.has(count), `no write held exactly ${count} poll(s) before completion: ${JSON.stringify([...during])}`);
+    nothingOwned(w);
+});
