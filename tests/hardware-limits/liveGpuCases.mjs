@@ -307,35 +307,68 @@ export function createGpuCases(ctx) {
     // Watch a status that was not settled (bounded, diagnostic only), capture the containers' own state and logs read-only before cleanup,
     // and fail: a lagging status and a real stop are told apart in the evidence, and neither is a pass.
     async function failUnsettled(label, refs, keys, immediate, problems, evidence) {
-        const startedAt = Date.now(); const polls = []; let convergedAfterMs = null; let last = immediate;
-        while (Date.now() - startedAt < timings.convergenceMs) {
-            await sleep(timings.convergencePollMs);
-            last = await admin.state();
-            const remaining = unsettledProblems(last, refs, keys);
-            polls.push({ afterMs: Date.now() - startedAt, problems: remaining.length });
-            if (!remaining.length) { convergedAfterMs = Date.now() - startedAt; break; }
-        }
+        // The verdict is the immediate FAIL, whatever the diagnostic phase meets: nothing below throws out of this function except that FAIL,
+        // every step tolerates its own failure and records it, and the evidence is written first and updated as data arrives.
+        const startedAt = Date.now();
+        const bounded = error => boundedTail(String(error?.message || error), 200).text;
         const compact = state => refs.map((ref, index) => { const container = agentEntry(state, ref)?.containers?.find(value => value.key === keys[index]); return { ref, key: keys[index], availability: container?.availability ?? null, limitsState: container?.limitsState ?? null, mpsGeneration: container?.mpsGeneration ?? null }; });
-        const containers = [];
-        try {
-            const rows = await nestedRows();
-            for (const ref of refs) {
-                const role = fixture.roles.find(value => fixture.refs[value] === ref);
-                const name = role ? fixtureContainerName(workspace, nameOf(role), fixture.repository) : null;
-                for (const row of rows.filter(value => name && value.name === name)) {
-                    let truth = null; let logs = null;
-                    try { truth = JSON.parse((await observe('gpu-truth-inspect', [...nested, 'container', 'inspect', '--format', CONTAINER_TRUTH_FORMAT, row.id], { deadlineMs: 10000, tolerate: true })).stdout); } catch { truth = null; }
-                    try { const result = await observe('gpu-truth-logs', [...nested, 'container', 'logs', '--tail', '40', row.id], { deadlineMs: 10000, tolerate: true }); logs = boundedTail(`${result.stdout}${result.stderr}`, 2048).text; } catch { logs = null; }
-                    containers.push({ ref, name, id: row.id, state: truth, logsTail: logs });
+        const outcomeOf = result => {
+            const parts = [Number.isInteger(result?.status) && result.status !== 0 ? `exit ${result.status}` : null, result?.timedOut ? 'timed out' : null, result?.signal ? `killed by ${result.signal}` : null, result?.errorCode ? `error ${result.errorCode}` : null].filter(Boolean);
+            return `${parts.join(', ') || 'no usable output'}${result?.stderr ? `: ${boundedTail(result.stderr, 160).text.trim()}` : ''}`;
+        };
+        const record = {
+            label, refs, problems, metricsSampledAt: immediate.metricsSampledAt ?? null, immediate: compact(immediate), last: compact(immediate),
+            convergence: { converged: false, afterMs: null, boundMs: timings.convergenceMs, polls: [], pollErrors: [] }, containers: null, containersAfterPoll: null, phase: 'immediate-failure',
+        };
+        const persist = () => { try { evidence.put('statusUnsettled', record); } catch { /* the verdict does not depend on it */ } };
+        persist();
+        // The containers' own state and a bounded, redacted log tail, read-only; each read keeps whatever it got and records its own error.
+        const captureTruth = async () => {
+            const captured = [];
+            try {
+                const rows = await nestedRows();
+                for (const ref of refs) {
+                    const role = fixture.roles.find(value => fixture.refs[value] === ref);
+                    const name = role ? fixtureContainerName(workspace, nameOf(role), fixture.repository) : null;
+                    for (const row of rows.filter(value => name && value.name === name)) {
+                        const entry = { ref, name, id: row.id, state: null, stateError: null, logsTail: null, logsError: null, at: Date.now() };
+                        try {
+                            const result = await observe('gpu-truth-inspect', [...nested, 'container', 'inspect', '--format', CONTAINER_TRUTH_FORMAT, row.id], { deadlineMs: 10000, tolerate: true });
+                            try { entry.state = JSON.parse(result.stdout); } catch { entry.stateError = outcomeOf(result); }
+                        } catch (error) { entry.stateError = bounded(error); }
+                        try {
+                            const result = await observe('gpu-truth-logs', [...nested, 'container', 'logs', '--tail', '40', row.id], { deadlineMs: 10000, tolerate: true });
+                            if (result.status === 0 && !result.timedOut && !result.signal) entry.logsTail = boundedTail(`${result.stdout}${result.stderr}`, 2048).text; else entry.logsError = outcomeOf(result);
+                        } catch (error) { entry.logsError = bounded(error); }
+                        captured.push(entry);
+                    }
                 }
-            }
-        } catch (error) { containers.push({ error: String(error?.message || error).slice(0, 200) }); }
-        evidence.put('statusUnsettled', {
-            label, refs, problems, metricsSampledAt: immediate.metricsSampledAt ?? null, immediate: compact(immediate), last: compact(last),
-            convergence: { converged: convergedAfterMs !== null, afterMs: convergedAfterMs, boundMs: timings.convergenceMs, polls: polls.slice(0, 60) }, containers,
-        });
-        const state = containers.map(entry => (entry.state ? `${entry.ref} ${entry.state.status}${entry.state.running ? '' : ` exit ${entry.state.exitCode}${entry.state.oomKilled ? ' oom-killed' : ''}`}` : null)).filter(Boolean).join('; ');
-        throw new Error(`The status was not settled right after the Apply of ${refs.join(', ')} (${problems.join('; ')}); ${convergedAfterMs !== null ? `it settled ${convergedAfterMs} ms later, which is a lagging status and not an acceptance` : `it did not settle within ${timings.convergenceMs} ms`}${state ? `; the container: ${state}` : ''}`);
+            } catch (error) { captured.push({ error: bounded(error) }); }
+            return captured;
+        };
+        // 1. Right after the immediate failure: what the containers are now.
+        record.containers = await captureTruth(); record.phase = 'captured-after-immediate-failure'; persist();
+        // 2. Watch the status, bounded; a poll that fails is recorded and the watching goes on.
+        let polling = true;
+        while (polling && Date.now() - startedAt < timings.convergenceMs && !signal?.aborted) {
+            await sleep(timings.convergencePollMs);
+            const afterMs = Date.now() - startedAt;
+            try {
+                const state = await admin.state();
+                record.last = compact(state);
+                const remaining = unsettledProblems(state, refs, keys);
+                record.convergence.polls.push({ afterMs, problems: remaining.length });
+                if (!remaining.length) { record.convergence.converged = true; record.convergence.afterMs = afterMs; polling = false; }
+            } catch (error) { if (record.convergence.pollErrors.length < 60) record.convergence.pollErrors.push({ afterMs, error: bounded(error) }); }
+            record.convergence.polls = record.convergence.polls.slice(0, 60);
+            persist();
+        }
+        // 3. After the watching: what the containers are then, so the evidence shows both moments.
+        record.containersAfterPoll = await captureTruth(); record.phase = 'complete'; persist();
+        const last = record.containersAfterPoll.length ? record.containersAfterPoll : record.containers;
+        const truth = last.map(entry => (entry.state ? `${entry.ref} ${entry.state.status}${entry.state.running ? '' : ` exit ${entry.state.exitCode}${entry.state.oomKilled ? ' oom-killed' : ''}`}` : null)).filter(Boolean).join('; ');
+        const { converged, afterMs } = record.convergence;
+        throw new Error(`The status was not settled right after the Apply of ${refs.join(', ')} (${problems.join('; ')}); ${converged ? `it settled ${afterMs} ms later, which is a lagging status and not an acceptance` : `it did not settle within ${timings.convergenceMs} ms`}${truth ? `; the container: ${truth}` : ''}`);
     }
     // Which fixture clients are running right now (never throws): the observation a drain acknowledgement rests on.
     async function observeClientsRunning() {

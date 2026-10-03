@@ -438,6 +438,15 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
         if (script === ADMIN_REQUEST) {
             model.programs.push({ program: 'admin', method: rest[0], body: rest[1] });
             const reply = await admin(rest[0], rest[1]);
+            // `diagnosticGetFault`: once a GET has shown an unsettled instance (the acceptance read), the GETs that follow while it is still
+            // unsettled fail (a nonzero exit, a timeout, or a reply that is not JSON): the diagnostic poll of the runner.
+            if (faults.diagnosticGetFault && rest[0] === 'GET' && model.applyCalls.length > 0) {
+                const unsettled = JSON.parse(reply.text).agents?.some(agent => agent.containers.some(container => container.availability === 'stopped')) === true;
+                if (unsettled) {
+                    model.unsettledReads = (model.unsettledReads ?? 0) + 1;
+                    if (model.unsettledReads > 1) return { exit: ok('', { status: 1, stderr: 'synthetic: the administrator channel failed' }), timeout: ok('', { status: null, signal: 'SIGKILL', timedOut: true }), malformed: ok('not json {') }[faults.diagnosticGetFault];
+                }
+            }
             return ok(JSON.stringify(reply));
         }
         if (script === GPU_GRANT_FACTS) {
@@ -477,6 +486,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
         if (verb === 'container inspect') {
             const format = args[args.indexOf('--format') + 1]; const id = args.at(-1);
             if (format !== GPU_AGENT_INSPECT && format !== CONTAINER_TRUTH_FORMAT) return null;
+            if (format === CONTAINER_TRUTH_FORMAT && faults.truthInspectResult) return ok('', faults.truthInspectResult);
             if (faults.dropNested?.includes(id)) return failed('Error: no such container');
             const agent = byId(id); const helper = model.helpers.get(id);
             if (!agent && !helper) return failed('Error: no such container');
@@ -484,6 +494,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
             return typeof rendered === 'string' ? ok(rendered) : rendered;
         }
         if (verb === 'container logs') {
+            if (faults.truthLogsResult) return ok('', faults.truthLogsResult);
             const agent = byId(args.at(-1));
             return agent ? ok(`${faults.containerLogs ?? 'agent started\n'}`) : failed('Error: no such container');
         }

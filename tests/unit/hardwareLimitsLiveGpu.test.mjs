@@ -1997,3 +1997,56 @@ test('S5.a-replaced-client-the-response-does-not-name-is-not-acknowledged', asyn
     assert.deepEqual([entry.acknowledged, entry.notAcknowledged], [[], [{ role: 'probe', outcome: 'replaced-unreported' }]]);
     nothingOwned(w);
 });
+
+// --- M-EVID-05: whatever the diagnostic phase meets, the verdict is the immediate FAIL and the evidence survives ----------------
+const STOPPED = { stopAfterApply: 'probe', stopOomKilled: true };
+const QUICK_POLL = { convergenceMs: 200, convergencePollMs: 10 };
+test('E5.a-diagnostic-poll-that-fails-never-turns-the-immediate-fail-into-a-block-and-the-evidence-survives', async t => {
+    for (const [label, mode, pattern] of [['a nonzero exit', 'exit', /administrator channel did not answer \(exit 1\)/], ['a timeout', 'timeout', /administrator channel did not answer \(exit null\)/], ['malformed JSON', 'malformed', /administrator channel did not answer \(exit 0\)/]]) {
+        const w = await provisioned(t, { faults: { ...STOPPED, diagnosticGetFault: mode } });
+        const p1 = caseOf(await liveCases(w, ['LIVE-P1'], { timings: QUICK_POLL }), 'LIVE-P1');
+        assert.equal(p1.result, 'fail', `${label}: ${JSON.stringify(p1).slice(0, 300)}`);
+        assert.match(p1.reason, /^The status was not settled right after the Apply of hwlfixture\/probe \(hwlfixture\/probe: availability stopped; hwlfixture\/probe: limitsState unavailable;/, label);
+        const record = w.artifacts.get('gpu-live-p1').statusUnsettled;
+        assert.equal(record.phase, 'complete', label);
+        assert.ok(record.convergence.pollErrors.length >= 1 && pattern.test(record.convergence.pollErrors[0].error), `${label}: ${JSON.stringify(record.convergence.pollErrors[0])}`);
+        assert.equal(record.convergence.converged, false);
+        // Both moments are captured: right after the immediate failure, and after the watching.
+        for (const captured of [record.containers, record.containersAfterPoll]) {
+            assert.equal(captured.length, 1, label);
+            assert.deepEqual([captured[0].state.running, captured[0].state.exitCode, captured[0].state.oomKilled, captured[0].stateError, captured[0].logsError], [false, 137, true, null, null], label);
+            assert.match(captured[0].logsTail, /agent started/, label);
+        }
+        assert.deepEqual(record.immediate.map(entry => [entry.availability, entry.limitsState]), [['stopped', 'unavailable']]);
+        nothingOwned(w);
+    }
+});
+
+test('E5.a-lagging-status-whose-first-diagnostic-poll-fails-is-still-diagnosed-as-settling-later', async t => {
+    const w = await provisioned(t, { faults: { statusLagMs: 300, diagnosticGetFault: 'exit' } });
+    const p1 = caseOf(await liveCases(w, ['LIVE-P1'], { timings: { convergenceMs: 5000, convergencePollMs: 10 } }), 'LIVE-P1');
+    assert.equal(p1.result, 'fail', JSON.stringify(p1).slice(0, 300));
+    const record = w.artifacts.get('gpu-live-p1').statusUnsettled;
+    assert.ok(record.convergence.pollErrors.length >= 1);
+    assert.equal(record.convergence.converged, true); assert.match(p1.reason, /it settled \d+ ms later, which is a lagging status and not an acceptance/);
+    assert.equal(record.containers[0].state.running, true);
+    nothingOwned(w);
+});
+
+test('E5.a-failed-inspect-or-failed-logs-or-both-leave-the-partial-evidence-and-the-errors-and-still-fail', async t => {
+    const cases = [
+        ['inspect fails, logs succeed', { truthInspectResult: { status: 1, stderr: 'Error: inspect synthetic failure' } }, entry => entry.state === null && /exit 1: Error: inspect synthetic failure/.test(entry.stateError) && /agent started/.test(entry.logsTail) && entry.logsError === null],
+        ['logs fail, inspect succeeds', { truthLogsResult: { status: null, signal: 'SIGKILL', timedOut: true } }, entry => entry.state?.exitCode === 137 && entry.stateError === null && entry.logsTail === null && /timed out, killed by SIGKILL/.test(entry.logsError)],
+        ['both fail', { truthInspectResult: { status: 125, stderr: 'Error: no such container' }, truthLogsResult: { status: 1, stderr: 'Error: logs synthetic failure' } }, entry => entry.state === null && /exit 125/.test(entry.stateError) && entry.logsTail === null && /exit 1: Error: logs synthetic failure/.test(entry.logsError)],
+    ];
+    for (const [label, faults, check] of cases) {
+        const w = await provisioned(t, { faults: { ...STOPPED, ...faults } });
+        const p1 = caseOf(await liveCases(w, ['LIVE-P1'], { timings: QUICK_POLL }), 'LIVE-P1');
+        assert.equal(p1.result, 'fail', `${label}: ${JSON.stringify(p1).slice(0, 300)}`);
+        assert.match(p1.reason, /^The status was not settled right after the Apply of hwlfixture\/probe/, label);
+        const record = w.artifacts.get('gpu-live-p1').statusUnsettled;
+        assert.equal(record.phase, 'complete', label);
+        for (const captured of [record.containers, record.containersAfterPoll]) { assert.equal(captured.length, 1, label); assert.ok(check(captured[0]), `${label}: ${JSON.stringify(captured[0])}`); }
+        nothingOwned(w);
+    }
+});
