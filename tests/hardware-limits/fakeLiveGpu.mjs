@@ -573,7 +573,8 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
 
     async function provider(binary, args, options = {}) {
         model.calls.push({ binary, args, cwd: options.cwd });
-        if (binary === gpu.smi) return smi(args);
+        // `smiDelayMs`: nvidia-smi is slow, and answers with the state at the END of the delay.
+        if (binary === gpu.smi) { if (faults.smiDelayMs) await new Promise(resolve => setTimeout(resolve, faults.smiDelayMs)); return smi(args); }
         if (binary === node) return candidate(binary, args, options);
         if (binary === engine && args[0] === 'container' && args[1] === 'exec' && args[2] === '--user' && args[3] === 'podman' && args[4] === model.boxId) {
             const inner = args.slice(5);

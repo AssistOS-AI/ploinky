@@ -344,7 +344,8 @@ export function createLlmWorld({ statePath, node, engine, host, gpu, faults = {}
             return rest[0] === 'local_llm_test_prompt' && L.phase === 'ready' && L.runner && !faults.promptInstant ? generating(run) : run();
         }
         if (script === LEAF_OBSERVATION) return leafValues(rest[0]);
-        if (script === LLM_LEAF_SAMPLE) return leafSample(rest[0]);
+        // `leafReadDelayMs`: the nested read is slow, and the counters are read AFTER the delay (as a slow exec would).
+        if (script === LLM_LEAF_SAMPLE) { if (faults.leafReadDelayMs) await new Promise(resolve => setTimeout(resolve, faults.leafReadDelayMs)); return leafSample(rest[0]); }
         return null;
     }
     async function agentExec({ agent: target, command }) {

@@ -217,6 +217,7 @@ export function createGpuGate({
                 await Promise.race([running, sleep(every)]);
                 if (finished) break;
                 let checked;
+                const startedAt = Date.now();
                 try { checked = await gate.check('monitor'); }
                 catch (error) {
                     tripped = error.gate?.reason === 'gpu_busy' ? gpuBlocked('foreign_process_appeared', { ...error.gate, message: error.message }) : error;
@@ -224,7 +225,7 @@ export function createGpuGate({
                     await running;
                     throw tripped;
                 }
-                if (onCheck) onCheck(checked);
+                if (onCheck) onCheck(checked, { startedAt, endedAt: Date.now() });
             }
             await running;
             if (failure) throw failure;

@@ -330,7 +330,8 @@ test('G2.L1-measures-cpu-memory-and-gpu-while-the-request-generates-and-records-
     assert.equal(inference.gpuSamples[0].label, 'before-send'); assert.equal(inference.gpuSamples.at(-1).label, 'after-response');
     const send = w.fake.llm.toolLog.findIndex(entry => entry.name === 'local_llm_test_prompt');
     assert.ok(send >= 0 && w.fake.llm.samples.slice(0, w.fake.llm.samples.length).some(entry => entry.generating), 'a sample saw the model generating');
-    assert.equal(w.fake.llm.samples.filter(entry => entry.generating).length, inference.samples.inFlightCgroup, 'every in-flight sample was taken while the request ran');
+    // A counted sample always saw the generating model; a read that returned in the very millisecond the request settled is conservatively `late`.
+    assert.ok(w.fake.llm.samples.filter(entry => entry.generating).length >= inference.samples.inFlightCgroup, 'every in-flight sample was taken while the request ran');
     // CPU: usage over the window below the 4-CPU quota, throttling recorded; memory: the peak under memory.max, no swap, no kill.
     assert.equal(inference.cpu.cpus, 4); assert.ok(inference.cpu.windowUs > 0 && inference.cpu.usageUsec > 0 && inference.cpu.usageUsec <= inference.cpu.allowedUsec, JSON.stringify(inference.cpu));
     assert.ok(inference.cpu.averageCpus < 4 && inference.cpu.peakIntervalCpus > 0, JSON.stringify(inference.cpu)); assert.equal(inference.cpu.nrThrottled, 0);
@@ -1491,7 +1492,7 @@ test('R2F.a-fast-model-meets-the-in-flight-minimums-through-the-sustained-load-a
     assert.equal(inference.load.boundMs, 300); assert.equal(inference.load.invalidResponses, 0); assert.ok(inference.windowMs > 0);
     // The requests were real, back to back, and only samples taken while one was outstanding counted.
     assert.equal(w.fake.llm.toolLog.filter(entry => entry.name === 'local_llm_test_prompt').length, inference.load.requests);
-    assert.equal(w.fake.llm.samples.filter(entry => entry.generating).length, inference.samples.inFlightCgroup, 'every in-flight CPU/RAM sample saw a generating model');
+    assert.ok(w.fake.llm.samples.filter(entry => entry.generating).length >= inference.samples.inFlightCgroup, 'every in-flight CPU/RAM sample saw a generating model');
     // One valid text response is the evidence; only the first request is journaled.
     assert.equal(artifact.response.text, 'Pong.');
     assert.equal(w.run.operations.filter(entry => entry.kind === 'llm-prompt-l1').length, 1, 'only the first request is journaled');
@@ -1610,4 +1611,55 @@ test('M05llm.a-run-refused-for-unreadable-gpu-telemetry-keeps-its-own-cause-and-
     assert.equal(legitCase.result, 'blocked'); assert.match(legitCase.reason, /vllm_mps_unqualified was observed before the qualification data entry/);
     assert.deepEqual([legit.artifacts.get('gpu-live-l3').refusalObserved.refused, legit.artifacts.get('gpu-live-l3').refusalObserved.runCause.code], [true, 'admission_incompatible']);
     nothingOwned(legit);
+});
+
+// --- M-LLM-06: an observation counts as in flight only when it lies inside ONE request's real window ----------------------
+// Each request settles in 8 ms; a slow read returns long after that, with the state of the idle model.
+const QUICK = { generateMs: 8, generateReads: 1000, generateGpuReads: 1000 };
+test('M06.cpu-ram-reads-that-return-after-their-request-settled-never-count-as-in-flight', async t => {
+    const w = await provisioned(t, { faults: { ...QUICK, leafReadDelayMs: 40 } });
+    const report = await liveCases(w, ['LIVE-L1']);
+    const l1 = caseOf(report, 'LIVE-L1');
+    assert.equal(l1.result, 'blocked', JSON.stringify(l1).slice(0, 500)); assert.equal(report.verdict, 'BLOCKED');
+    assert.match(l1.reason, /Only 0 CPU\/RAM sample\(s\) were taken while the model generated \(at least 3 are required\)/);
+    const inference = w.artifacts.get('gpu-live-l1').inference;
+    assert.equal(inference.samples.inFlightCgroup, 0);
+    assert.equal(w.fake.llm.samples.filter(entry => entry.generating).length, 0, 'the provider saw no read during generation');
+    assert.ok(inference.late.cgroup >= 3, `the late reads are kept as evidence: ${JSON.stringify(inference.late)}`);
+    assert.ok(inference.cgroupSamples.filter(sample => sample.label === 'late').every(sample => Number.isFinite(sample.startedAt) && sample.endedAt > sample.startedAt), 'with their own timestamps');
+    assert.ok(inference.load.requests >= 3 && inference.load.stoppedBy !== 'minimums-met', JSON.stringify(inference.load));
+    assert.equal(toolCalls(w, 'local_llm_test_prompt').length, inference.load.requests);
+    nothingOwned(w);
+});
+
+test('M06.gpu-rows-that-return-after-their-request-settled-never-count-as-in-flight', async t => {
+    const w = await provisioned(t, { faults: { ...QUICK, smiDelayMs: 40 } });
+    const report = await liveCases(w, ['LIVE-L1']);
+    const l1 = caseOf(report, 'LIVE-L1');
+    assert.equal(l1.result, 'blocked', JSON.stringify(l1).slice(0, 500));
+    assert.match(l1.reason, /Only 0 GPU sample\(s\) were taken while the model generated \(at least 2 are required\)/);
+    const inference = w.artifacts.get('gpu-live-l1').inference;
+    assert.equal(inference.samples.inFlightGpu, 0);
+    assert.ok(inference.late.gpu >= 1 || inference.gpuSamples.some(sample => sample.label === 'between-requests' || sample.label === 'late'), JSON.stringify(inference.late));
+    assert.ok(inference.gpuSamples.every(sample => Number.isFinite(sample.startedAt) && Number.isFinite(sample.endedAt)));
+    nothingOwned(w);
+});
+
+test('M06.slow-reads-inside-a-long-request-and-fast-reads-inside-slow-requests-count-and-pass', async t => {
+    // A slow read (40 ms) that returns while the request is still outstanding is a genuine in-flight observation.
+    const slow = await provisioned(t, { faults: { leafReadDelayMs: 40, generateReads: 4, generateGpuReads: 3 } });
+    const slowCase = caseOf(await liveCases(slow, ['LIVE-L1']), 'LIVE-L1');
+    assert.equal(slowCase.result, 'pass', JSON.stringify(slowCase).slice(0, 500));
+    const evidence = slow.artifacts.get('gpu-live-l1').inference;
+    assert.ok(evidence.samples.inFlightCgroup >= INFERENCE_MIN_IN_FLIGHT.cgroup && evidence.samples.inFlightGpu >= INFERENCE_MIN_IN_FLIGHT.gpu, JSON.stringify(evidence.samples));
+    assert.equal(slow.fake.llm.samples.filter(entry => entry.generating).length >= evidence.samples.inFlightCgroup, true, 'every counted read saw the generating model');
+    nothingOwned(slow);
+    // Fast reads inside slow requests (the default fake) pass, and every counted sample lies inside one request window.
+    const fast = await provisioned(t);
+    assert.equal(caseOf(await liveCases(fast, ['LIVE-L1']), 'LIVE-L1').result, 'pass');
+    const inference = fast.artifacts.get('gpu-live-l1').inference;
+    for (const sample of [...inference.cgroupSamples, ...inference.gpuSamples].filter(entry => entry.label === 'in-flight')) {
+        assert.ok(inference.requestWindows.some(window => sample.startedAt >= window.sent && sample.endedAt < window.settled), 'an in-flight sample lies inside one request window');
+    }
+    nothingOwned(fast);
 });
