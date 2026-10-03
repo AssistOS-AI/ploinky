@@ -585,3 +585,20 @@ test('T7.the-post-apply-wait-is-the-named-ten-second-constant-and-a-six-second-r
     assert.equal(result.fresh, true);
     assert.ok(Date.now() - t0 >= 5_900 && Date.now() - t0 < 8_000, `waited for the slow reconcile (${Date.now() - t0} ms)`);
 });
+
+// T4: the real-stop boundary in the production shape: `ps` without -a lists no exited container, so the collector yields a stopped entry
+// with no live entry and no container ID, and the read that saw it started 1 ms after the instance's observation was written.
+test('T4.a-real-stop-read-one-millisecond-after-the-observation-reads-stopped-in-the-production-shape-and-with-an-id', (t) => {
+    const f = fixture(t);
+    const registry = { canonical: { ...f.registry.canonical, containerId: NEW_ID, runtime: 'podman' } };
+    const [productionEntry] = collectAgentRuntimeStates({ registry, liveContainers: [], routes: {} });
+    assert.equal(productionEntry.containerId, undefined, 'no container id: the engine lists no exited container');
+    assert.equal(productionEntry.state.running, false);
+    const stopped = { availability: 'stopped', limitsState: 'unavailable' };
+    for (const [label, entry] of [['production shape (no entry from the engine, no id)', productionEntry], ['a stopped entry that carries the id', engineEntry({ containerId: NEW_ID })]]) {
+        const { availability, limitsState } = statusOf(f, [entry], -1);
+        assert.deepEqual({ availability, limitsState }, stopped, label);
+    }
+    // One millisecond EARLIER (the read started before the observation) is a stale snapshot, still not a stop.
+    assert.deepEqual((({ availability, limitsState }) => ({ availability, limitsState }))(statusOf(f, [productionEntry], 1)), { availability: 'starting', limitsState: 'applied' });
+});
