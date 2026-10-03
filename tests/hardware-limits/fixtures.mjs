@@ -810,6 +810,7 @@ export function buildRequiredCaseManifest() {
             'R12a.free-gpu-memory-between-the-old-share-threshold-and-the-admission-threshold-proceeds-and-less-than-the-admission-need-blocks',
             'R12b.the-approval-summary-says-an-unreachable-source-and-a-slow-model-load-are-blocked-and-a-mismatch-or-runner-exit-is-a-failure',
             'P3R.every-candidate-argv-of-the-local-llm-and-vllm-manifests-and-cases-is-accepted',
+            'R13a.a-later-empty-reply-of-the-sustained-load-fails-the-case-and-only-the-first-request-is-ever-journaled',
             'R2D.a-standalone-cleanup-writes-its-own-llm-cleanup-proof-and-the-live-runs-proof-is-not-accepted-for-it',
             'R2D.a-proof-another-action-or-run-left-or-one-that-lists-remaining-data-does-not-certify-a-cleanup',
             // The runner-environment check against local-llm's own launch environment.

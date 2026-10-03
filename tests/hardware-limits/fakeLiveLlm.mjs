@@ -246,7 +246,8 @@ export function createLlmWorld({ statePath, node, engine, host, gpu, faults = {}
         case 'local_llm_test_prompt': {
             if (L.phase !== 'ready' || !L.runner) return refusal('not_ready', 'No model is ready.');
             L.prompts += 1;
-            const text = faults.emptyText ? '' : 'Pong.';
+            // `laterReplyEmpty`: the sustained load's second and later replies carry no text.
+            const text = faults.emptyText || (faults.laterReplyEmpty && L.prompts >= 2) ? '' : 'Pong.';
             return { ok: true, agent: 'local-llm', result: { text, truncated: false, reasoningChars: faults.emptyText ? 300 : 0, finishReason: faults.emptyText ? 'length' : 'stop', runnerId: L.deployment.runnerId, modelId: faults.wrongModel ? 'other-model' : L.deployment.modelId, via: 'loopback runner (admin test prompt)', completionTokens: 3 } };
         }
         default: return { ok: false, error: { code: 'invalid', message: 'Unsupported tool' } };

@@ -1734,3 +1734,21 @@ test('P3R.every-candidate-argv-of-the-local-llm-and-vllm-manifests-and-cases-is-
         nothingOwned(w);
     }
 });
+
+// --- R13-a: the sustained load's later replies and its journal --------------------------------------------------------------
+test('R13a.a-later-empty-reply-of-the-sustained-load-fails-the-case-and-only-the-first-request-is-ever-journaled', async t => {
+    const w = await provisioned(t, { faults: { generateReads: 1, generateGpuReads: 1, laterReplyEmpty: true } });
+    const report = await liveCases(w, ['LIVE-L1']);
+    const l1 = caseOf(report, 'LIVE-L1');
+    assert.equal(l1.result, 'fail', JSON.stringify(l1).slice(0, 400)); assert.equal(report.verdict, 'FAIL');
+    assert.match(l1.reason, /\d+ later response\(s\) of the sustained load carried no text/);
+    const inference = w.artifacts.get('gpu-live-l1').inference;
+    assert.ok(inference.load.requests >= 2 && inference.load.invalidResponses >= 1, JSON.stringify(inference.load));
+    assert.ok(inference.violations.some(entry => /later response\(s\) of the sustained load carried no text/.test(entry)));
+    // Only the first request is journaled, however many were sent.
+    const prompts = w.run.operations.filter(entry => /prompt-l1/.test(String(entry.kind)));
+    assert.deepEqual(prompts.map(entry => entry.kind), ['llm-prompt-l1']);
+    assert.equal(w.run.operations.some(entry => /prompt-l1-more/.test(String(entry.kind))), false);
+    assert.equal(toolCalls(w, 'local_llm_test_prompt').length, inference.load.requests);
+    nothingOwned(w);
+});
