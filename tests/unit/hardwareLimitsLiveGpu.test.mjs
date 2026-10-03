@@ -1824,7 +1824,9 @@ test('P3R.p1-and-p3-record-the-drain-acknowledgement-basis-for-every-apply-and-t
     const basis = { exitStatus: 'not exposed by the product', basis: 'running-before-and-applied-implies-assertCleanTermination-passed (exit 0)', source: 'cli/sandbox/docker/targetedContainerLifecycle.js:107-122' };
     const p1 = w.artifacts.get('gpu-live-p1').drainAcknowledgements;
     assert.equal(p1.length, 1);
-    assert.deepEqual({ ...p1[0], clientsBefore: p1[0].clientsBefore.map(entry => [entry.role, entry.running]) }, { label: 'p1', refs: ['hwlfixture/probe'], applyStatus: 200, results: [{ state: 'applied' }], clientsBefore: [['probe', true], ['peer', true]], acknowledged: ['probe', 'peer'], notAcknowledged: [], ...basis });
+    // Only the probe was replaced; the peer kept its container and is not credited with a drain it never had.
+    assert.deepEqual({ ...p1[0], clientsBefore: p1[0].clientsBefore.map(entry => [entry.role, entry.running]), clients: p1[0].clients.map(entry => [entry.role, entry.outcome]) },
+        { label: 'p1', refs: ['hwlfixture/probe'], applyStatus: 200, results: [{ state: 'applied' }], expanded: 0, clientsBefore: [['probe', true], ['peer', true]], clients: [['probe', 'replaced'], ['peer', 'unchanged']], acknowledged: ['probe'], unchanged: ['peer'], notAcknowledged: [], ...basis });
     const p3 = w.artifacts.get('gpu-live-p3');
     assert.ok(p3.drainAcknowledgements.length >= 5, JSON.stringify(p3.drainAcknowledgements.map(entry => entry.label)));
     assert.ok(p3.drainAcknowledgements.every(entry => entry.applyStatus === 200 && entry.results.every(result => result.state === 'applied') && entry.basis === basis.basis && entry.source === basis.source && Array.isArray(entry.clientsBefore)));
@@ -1914,13 +1916,13 @@ test('R14c.a-client-that-was-not-running-before-the-apply-is-never-recorded-as-a
     assert.equal(p1.result, 'pass', JSON.stringify(p1).slice(0, 300));
     const [entry] = stopped.artifacts.get('gpu-live-p1').drainAcknowledgements;
     assert.deepEqual(entry.clientsBefore.map(client => [client.role, client.running]), [['probe', false], ['peer', true]]);
-    assert.deepEqual([entry.acknowledged, entry.notAcknowledged], [['peer'], ['probe']], 'the stopped probe is not recorded as exit-0 acknowledged');
+    assert.deepEqual([entry.acknowledged, entry.unchanged, entry.notAcknowledged], [[], ['peer'], [{ role: 'probe', outcome: 'replaced-not-running-before' }]], 'the stopped probe is replaced but never recorded as exit-0 acknowledged');
     nothingOwned(stopped);
     // The control: every client was running, so every client is acknowledged by observation.
     const running = await provisioned(t);
     await liveCases(running, ['LIVE-P1']);
     const [control] = running.artifacts.get('gpu-live-p1').drainAcknowledgements;
-    assert.deepEqual([control.acknowledged, control.notAcknowledged], [['probe', 'peer'], []]);
+    assert.deepEqual([control.acknowledged, control.unchanged, control.notAcknowledged], [['probe'], ['peer'], []]);
     nothingOwned(running);
 });
 
@@ -1962,5 +1964,36 @@ test('S3.a-fresh-immediate-status-passes-and-records-nothing-unsettled', async t
     const p1 = caseOf(await liveCases(w, ['LIVE-P1']), 'LIVE-P1');
     assert.equal(p1.result, 'pass', JSON.stringify(p1).slice(0, 300));
     assert.equal(w.artifacts.get('gpu-live-p1').statusUnsettled, undefined);
+    nothingOwned(w);
+});
+
+// --- S5: only a client this Apply REPLACED, and that was running right before it, is acknowledged -----------------------------------
+test('S5.drain-acknowledgement-follows-the-containers-that-were-replaced-an-unchanged-peer-a-one-client-change-an-expanded-cohort-and-a-stopped-client', async t => {
+    const w = await provisioned(t);
+    const report = await liveCases(w, ['LIVE-P3']);
+    assert.equal(caseOf(report, 'LIVE-P3').result, 'pass', JSON.stringify(caseOf(report, 'LIVE-P3')).slice(0, 300));
+    const byLabel = Object.fromEntries(w.artifacts.get('gpu-live-p3').drainAcknowledgements.map(entry => [entry.label, entry]));
+    const outcomes = entry => Object.fromEntries(entry.clients.map(client => [client.role, client.outcome]));
+    // The first share is the probe's alone: the peer keeps its container.
+    assert.deepEqual([byLabel['p3-probe'].acknowledged, byLabel['p3-probe'].unchanged], [['probe'], ['peer']]);
+    // P3 A: the peer's own share changes under the same default; only the peer is replaced, and only the peer is acknowledged.
+    assert.deepEqual(outcomes(byLabel['p3-peer']), { probe: 'unchanged', peer: 'replaced' });
+    assert.deepEqual([byLabel['p3-peer'].acknowledged, byLabel['p3-peer'].unchanged], [['peer'], ['probe']]);
+    // P3 B: a default change expands the cohort beyond the requested probe; both clients were replaced and both are acknowledged.
+    assert.deepEqual(outcomes(byLabel['p3-default']), { probe: 'replaced', peer: 'replaced' });
+    assert.deepEqual(byLabel['p3-default'].acknowledged, ['probe', 'peer']); assert.equal(byLabel['p3-default'].expanded, 1);
+    assert.deepEqual(byLabel['p3-default'].unchanged, []);
+    // Every acknowledged client has a different container before and after, and every unchanged one the same.
+    for (const entry of Object.values(byLabel)) for (const client of entry.clients) assert.equal(client.outcome === 'unchanged', client.before.id === client.after.id, `${entry.label} ${client.role}`);
+    nothingOwned(w);
+});
+
+test('S5.a-replaced-client-the-response-does-not-name-is-not-acknowledged', async t => {
+    // The response names no key at all: a replacement it does not report cannot be credited with the product's drain.
+    const w = await provisioned(t, { faults: { applyUnreported: true } });
+    const p1 = caseOf(await liveCases(w, ['LIVE-P1']), 'LIVE-P1');
+    assert.equal(p1.result, 'pass', JSON.stringify(p1).slice(0, 300));
+    const [entry] = w.artifacts.get('gpu-live-p1').drainAcknowledgements;
+    assert.deepEqual([entry.acknowledged, entry.notAcknowledged], [[], [{ role: 'probe', outcome: 'replaced-unreported' }]]);
     nothingOwned(w);
 });

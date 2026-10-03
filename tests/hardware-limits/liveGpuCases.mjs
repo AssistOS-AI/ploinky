@@ -346,7 +346,7 @@ export function createGpuCases(ctx) {
             const matches = rows.filter(row => row.name === name);
             if (matches.length !== 1) { observed.push({ role, running: false, observed: matches.length ? 'ambiguous' : 'absent' }); continue; }
             const inspected = await inspectNested(matches[0].id);
-            observed.push({ role, id: hexTail(matches[0].id), running: inspected.running === true });
+            observed.push({ role, id: hexTail(matches[0].id), fullId: matches[0].id, running: inspected.running === true });
         }
         return observed;
     }
@@ -380,10 +380,28 @@ export function createGpuCases(ctx) {
         };
         const cause = applied.status === 200 && applied.body?.ok !== false ? null : causeOf(applied);
         expects(applied.status === 200 && applied.body?.ok !== false, `Apply of ${applyRefs.join(', ')} failed: ${applied.status} ${cause ? `(${cause}) ` : ''}${applied.text.slice(0, 400)}`);
-        // The drain acknowledgement of every recreate this Apply made, as the product lets it be known (see the basis).
+        // The drain acknowledgement of a client this Apply REPLACED and that was running right before it, as the product lets it be known
+        // (see the basis). A client is replaced when its immutable container ID differs before and after, and the keyed outcome (the
+        // results and the expanded containers of the response) names it: a default change expands the cohort beyond the requested
+        // refs, an unchanged peer keeps its container and is never credited, a client that was not running was never drained.
+        const runningAfter = await observeClientsRunning();
+        const affected = new Set([...(applied.body?.results ?? []).map(entry => entry?.key), ...(Array.isArray(applied.body?.expandedContainers) ? applied.body.expandedContainers : [])]);
+        const clients = runningBefore.map(was => {
+            const now = runningAfter.find(entry => entry.role === was.role);
+            let key = null; try { key = containerKey(before, fixture.refs[was.role]); } catch { key = null; }
+            let outcome;
+            if (!was.fullId) outcome = 'unobserved-before';
+            else if (!now?.fullId) outcome = 'unobserved-after';
+            else if (was.fullId === now.fullId) outcome = 'unchanged';
+            else if (!was.running) outcome = 'replaced-not-running-before';
+            else outcome = key !== null && affected.has(key) ? 'replaced' : 'replaced-unreported';
+            return { role: was.role, key, outcome, before: { id: was.id ?? null, running: was.running }, after: { id: now?.id ?? null, running: now?.running ?? false } };
+        });
         evidence.put('drainAcknowledgements', [...(evidence.data.drainAcknowledgements ?? []), {
             label, refs: [...applyRefs], applyStatus: applied.status, results: (applied.body?.results ?? []).map(entry => ({ state: entry.state })),
-            clientsBefore: runningBefore, acknowledged: runningBefore.filter(entry => entry.running).map(entry => entry.role), notAcknowledged: runningBefore.filter(entry => !entry.running).map(entry => entry.role), ...DRAIN_ACKNOWLEDGEMENT_BASIS,
+            expanded: Array.isArray(applied.body?.expandedContainers) ? applied.body.expandedContainers.length : 0, clientsBefore: runningBefore.map(({ fullId, ...rest }) => rest), clients,
+            acknowledged: clients.filter(entry => entry.outcome === 'replaced').map(entry => entry.role), unchanged: clients.filter(entry => entry.outcome === 'unchanged').map(entry => entry.role),
+            notAcknowledged: clients.filter(entry => !['replaced', 'unchanged'].includes(entry.outcome)).map(entry => ({ role: entry.role, outcome: entry.outcome })), ...DRAIN_ACKNOWLEDGEMENT_BASIS,
         }]);
         await sleep(timings.afterApplyMs);
         // The IMMEDIATE status read is the acceptance: after a successful Apply the product answers from a fresh metrics reconcile, so the

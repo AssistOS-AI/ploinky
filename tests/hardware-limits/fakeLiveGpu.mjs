@@ -109,6 +109,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
         agent.proc = spawn({ cgroup: leafOf(agent), ppid: BOX_INIT_PID, ns: [agent.boxPid, 1] });
         model.dirs.add(leafOf(agent));
         agent.createdMs = Date.now();
+        model.applying?.add(role);
         model.agents.set(role, agent);
         event(`create:${role}`);
         return agent;
@@ -155,6 +156,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
     }
     const sameDefault = (left, right) => left && right && left.sm === right.sm && left.mib === right.mib && left.share === right.share;
     async function applyFlow(roles) {
+        model.applying = new Set();
         const want = desiredDefault();
         const current = model.daemon;
         const shared = [...model.agents.values()].filter(agent => agent.share);
@@ -363,7 +365,9 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
             if (faults.applyStatus) return { status: faults.applyStatus, text: JSON.stringify(faults.applyBody ?? { ok: false, error: 'apply_failed' }) };
             const roles = body.containers.map(container => fixture.roles.find(role => key(role) === container));
             if (roles.some(role => !role)) return { status: 400, text: JSON.stringify({ ok: false, error: 'unknown_container' }) };
-            try { await applyFlow(roles); } catch (error) {
+            model.lastReplaced = new Set();
+            try { await applyFlow(roles); model.lastReplaced = model.applying ?? new Set(); model.applying = null; } catch (error) {
+                model.applying = null;
                 if (!error.drainFailure) throw error;
                 // The real Apply response of a refused drain (observed in LIVE-P1 attempt 6).
                 const cause = { step: 'client-launch', errorClass: 'Error', code: 'TARGETED_DRAIN_FAILED', message: error.message };
@@ -371,7 +375,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
                 return { status: 409, text: JSON.stringify({ ok: false, status: 409, error: 'TARGETED_DRAIN_FAILED', message, ...(faults.applyBodyPadding ? { padding: 'x'.repeat(faults.applyBodyPadding) } : {}), cause, token: { epoch: model.store.epoch, revision: model.store.revision }, expandedContainers: [],
                     results: roles.map(role => ({ key: key(role), state: 'pending', problem: null, error: 'TARGETED_DRAIN_FAILED', message, cause })) }) };
             }
-            return { status: 200, text: JSON.stringify({ ok: true, results: roles.map(role => ({ key: key(role), state: 'applied' })) }) };
+            return { status: 200, text: JSON.stringify({ ok: true, expandedContainers: faults.applyUnreported ? [] : [...model.lastReplaced].filter(role => !roles.includes(role)).map(role => key(role)), results: faults.applyUnreported ? [] : roles.map(role => ({ key: key(role), state: 'applied' })) }) };
         }
         return { status: 400, text: JSON.stringify({ ok: false, error: 'unknown_action' }) };
     }
