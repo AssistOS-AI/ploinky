@@ -23,7 +23,7 @@ import { createHostProc, boxCgroupPrefix, agentLeaf } from './liveGpuHost.mjs';
 import { parseGpuInventory } from './liveGpu.mjs';
 import { createGpuGate, finalGpuObservation, gpuQueryArgv } from './liveGpuGate.mjs';
 import {
-    ADMIN_REQUEST, DRAIN_ACKNOWLEDGEMENT_BASIS, GPU_AGENT_INSPECT, GPU_SHARES, MIB, MPS_CLIENT_PIPE, GPU_GRANT_FACTS, MPS_FAILURE_EVIDENCE, MPS_KILL_OWNED_DAEMON, MPS_OBSERVE, NESTED_NAME_LIST_FORMAT, PROBE_DEADLINE_MS,
+    ADMIN_REQUEST, CONTAINER_TRUTH_FORMAT, DRAIN_ACKNOWLEDGEMENT_BASIS, GPU_AGENT_INSPECT, GPU_SHARES, MIB, MPS_CLIENT_PIPE, GPU_GRANT_FACTS, MPS_FAILURE_EVIDENCE, MPS_KILL_OWNED_DAEMON, MPS_OBSERVE, NESTED_NAME_LIST_FORMAT, PROBE_DEADLINE_MS,
     MPS_CLIENT_USER, TIGHTER_CLIENT, assertMpsControlCommand, classifyMpsReply, controlHelperExecArgv, controlHelperRunArgv, parseProbeResult, probeBoundMiB, probeExecArgv, serverDefaultMiB, shareMemoryMiB,
 } from './liveGpuCommands.mjs';
 
@@ -75,6 +75,8 @@ const hexTail = id => String(id).slice(0, 12);
 export const DEFAULT_TIMINGS = Object.freeze({
     sampleMs: 20, settleMs: 250, settleSamples: 4, monitorMs: 2000, applyMs: 600000, controlMs: 20000, probeMs: PROBE_DEADLINE_MS + 10000,
     holderMs: 180000, serverWaitMs: 20000, recoveryMs: 120000, afterApplyMs: 1000,
+    // Diagnostic only: how long a status that was not settled right after an Apply is watched (two metrics reconcile periods), and how often.
+    convergenceMs: 20000, convergencePollMs: 1000,
 });
 
 export function createGpuCases(ctx) {
@@ -288,6 +290,53 @@ export function createGpuCases(ctx) {
             throw Object.assign(new Error(`${kind} failed (${parts.join(', ') || 'no exit status'})${tails.stderrTail ? `: ${tails.stderrTail.trim()}` : ''}`), { result });
         }
     }
+    // What the status must show of each instance an Apply recreated: its limits applied, not stopped or refused, and (for a share) the
+    // daemon's generation.
+    function unsettledProblems(state, refs, keys) {
+        return refs.flatMap((ref, index) => {
+            const entry = agentEntry(state, ref);
+            const container = entry?.containers?.find(value => value.key === keys[index]);
+            if (!container) return [`${ref}: the status has no instance ${keys[index]}`];
+            const problems = [];
+            if (!['ready', 'starting'].includes(container.availability)) problems.push(`${ref}: availability ${container.availability}`);
+            if (container.limitsState !== 'applied') problems.push(`${ref}: limitsState ${container.limitsState}`);
+            if (entry.configured?.gpu && container.mpsGeneration !== state.gpu?.mpsGeneration) problems.push(`${ref}: mpsGeneration ${container.mpsGeneration} is not the daemon's ${state.gpu?.mpsGeneration}`);
+            return problems;
+        });
+    }
+    // Watch a status that was not settled (bounded, diagnostic only), capture the containers' own state and logs read-only before cleanup,
+    // and fail: a lagging status and a real stop are told apart in the evidence, and neither is a pass.
+    async function failUnsettled(label, refs, keys, immediate, problems, evidence) {
+        const startedAt = Date.now(); const polls = []; let convergedAfterMs = null; let last = immediate;
+        while (Date.now() - startedAt < timings.convergenceMs) {
+            await sleep(timings.convergencePollMs);
+            last = await admin.state();
+            const remaining = unsettledProblems(last, refs, keys);
+            polls.push({ afterMs: Date.now() - startedAt, problems: remaining.length });
+            if (!remaining.length) { convergedAfterMs = Date.now() - startedAt; break; }
+        }
+        const compact = state => refs.map((ref, index) => { const container = agentEntry(state, ref)?.containers?.find(value => value.key === keys[index]); return { ref, key: keys[index], availability: container?.availability ?? null, limitsState: container?.limitsState ?? null, mpsGeneration: container?.mpsGeneration ?? null }; });
+        const containers = [];
+        try {
+            const rows = await nestedRows();
+            for (const ref of refs) {
+                const role = fixture.roles.find(value => fixture.refs[value] === ref);
+                const name = role ? fixtureContainerName(workspace, nameOf(role), fixture.repository) : null;
+                for (const row of rows.filter(value => name && value.name === name)) {
+                    let truth = null; let logs = null;
+                    try { truth = JSON.parse((await observe('gpu-truth-inspect', [...nested, 'container', 'inspect', '--format', CONTAINER_TRUTH_FORMAT, row.id], { deadlineMs: 10000, tolerate: true })).stdout); } catch { truth = null; }
+                    try { const result = await observe('gpu-truth-logs', [...nested, 'container', 'logs', '--tail', '40', row.id], { deadlineMs: 10000, tolerate: true }); logs = boundedTail(`${result.stdout}${result.stderr}`, 2048).text; } catch { logs = null; }
+                    containers.push({ ref, name, id: row.id, state: truth, logsTail: logs });
+                }
+            }
+        } catch (error) { containers.push({ error: String(error?.message || error).slice(0, 200) }); }
+        evidence.put('statusUnsettled', {
+            label, refs, problems, metricsSampledAt: immediate.metricsSampledAt ?? null, immediate: compact(immediate), last: compact(last),
+            convergence: { converged: convergedAfterMs !== null, afterMs: convergedAfterMs, boundMs: timings.convergenceMs, polls: polls.slice(0, 60) }, containers,
+        });
+        const state = containers.map(entry => (entry.state ? `${entry.ref} ${entry.state.status}${entry.state.running ? '' : ` exit ${entry.state.exitCode}${entry.state.oomKilled ? ' oom-killed' : ''}`}` : null)).filter(Boolean).join('; ');
+        throw new Error(`The status was not settled right after the Apply of ${refs.join(', ')} (${problems.join('; ')}); ${convergedAfterMs !== null ? `it settled ${convergedAfterMs} ms later, which is a lagging status and not an acceptance` : `it did not settle within ${timings.convergenceMs} ms`}${state ? `; the container: ${state}` : ''}`);
+    }
     // Which fixture clients are running right now (never throws): the observation a drain acknowledgement rests on.
     async function observeClientsRunning() {
         const rows = await nestedRows();
@@ -337,7 +386,13 @@ export function createGpuCases(ctx) {
             clientsBefore: runningBefore, acknowledged: runningBefore.filter(entry => entry.running).map(entry => entry.role), notAcknowledged: runningBefore.filter(entry => !entry.running).map(entry => entry.role), ...DRAIN_ACKNOWLEDGEMENT_BASIS,
         }]);
         await sleep(timings.afterApplyMs);
-        return { keys, state: await admin.state(), reply: applied };
+        // The IMMEDIATE status read is the acceptance: after a successful Apply the product answers from a fresh metrics reconcile, so the
+        // instances it recreated read as they are. A status that is not settled is never accepted because a later read converged: the
+        // convergence is only watched, to say whether the status lagged or the container really stopped, and the case then fails.
+        const stateNow = await admin.state();
+        const unsettled = unsettledProblems(stateNow, applyRefs, keys);
+        if (unsettled.length) await failUnsettled(label, applyRefs, keys, stateNow, unsettled, evidence);
+        return { keys, state: stateNow, reply: applied };
     }
     // An idempotent setup: saves only what differs and applies only what is not applied.
     async function settleShares(label, desired, evidence) {

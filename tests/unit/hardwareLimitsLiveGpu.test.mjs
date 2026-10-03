@@ -1923,3 +1923,44 @@ test('R14c.a-client-that-was-not-running-before-the-apply-is-never-recorded-as-a
     assert.deepEqual([control.acknowledged, control.notAcknowledged], [['probe', 'peer'], []]);
     nothingOwned(running);
 });
+
+// --- S3: the immediate status read is the acceptance; a later convergence is only diagnosed, and the truth is captured ---------
+test('S3.a-status-that-is-stale-right-after-the-apply-fails-the-case-and-records-that-it-settled-later-and-what-the-container-was', async t => {
+    // The status keeps showing the recreated probe as stopped for 300 ms: the immediate read is stale, a later one is not.
+    const w = await provisioned(t, { faults: { statusLagMs: 300 } });
+    const p1 = caseOf(await liveCases(w, ['LIVE-P1'], { timings: { convergenceMs: 5000, convergencePollMs: 10 } }), 'LIVE-P1');
+    assert.equal(p1.result, 'fail', JSON.stringify(p1).slice(0, 400));
+    assert.match(p1.reason, /^The status was not settled right after the Apply of hwlfixture\/probe \(hwlfixture\/probe: availability stopped; hwlfixture\/probe: limitsState unavailable;/);
+    assert.match(p1.reason, /it settled \d+ ms later, which is a lagging status and not an acceptance/);
+    const unsettled = w.artifacts.get('gpu-live-p1').statusUnsettled;
+    assert.equal(unsettled.convergence.converged, true); assert.ok(unsettled.convergence.afterMs > 0 && unsettled.convergence.afterMs < 5000);
+    assert.deepEqual([unsettled.immediate[0].availability, unsettled.immediate[0].limitsState, unsettled.last[0].availability, unsettled.last[0].limitsState], ['stopped', 'unavailable', 'ready', 'applied']);
+    assert.match(unsettled.metricsSampledAt, /^\d{4}-\d\d-\d\dT/);
+    // The container's own state, read-only: running, so the lag was the status.
+    assert.deepEqual([unsettled.containers[0].state.running, unsettled.containers[0].state.status, unsettled.containers[0].state.exitCode, unsettled.containers[0].state.oomKilled], [true, 'running', 0, false]);
+    assert.match(unsettled.containers[0].state.id, /^[a-f0-9]{64}$/); assert.ok('startedAt' in unsettled.containers[0].state && 'finishedAt' in unsettled.containers[0].state);
+    nothingOwned(w);
+});
+
+test('S3.a-container-that-really-stopped-fails-with-its-exit-code-and-its-log-tail', async t => {
+    const w = await provisioned(t, { faults: { stopAfterApply: 'probe', stopOomKilled: true, containerLogs: 'serving\nOut of memory: Killed process 7 (python3) token=synthetic-secret-value\n' } });
+    const p1 = caseOf(await liveCases(w, ['LIVE-P1'], { timings: { convergenceMs: 150, convergencePollMs: 10 } }), 'LIVE-P1');
+    assert.equal(p1.result, 'fail', JSON.stringify(p1).slice(0, 400));
+    assert.match(p1.reason, /it did not settle within 150 ms; the container: hwlfixture\/probe exited exit 137 oom-killed/);
+    const unsettled = w.artifacts.get('gpu-live-p1').statusUnsettled;
+    assert.equal(unsettled.convergence.converged, false); assert.equal(unsettled.convergence.afterMs, null);
+    const [container] = unsettled.containers;
+    assert.deepEqual([container.state.running, container.state.status, container.state.exitCode, container.state.oomKilled], [false, 'exited', 137, true]);
+    assert.match(container.state.finishedAt, /^\d{4}-/);
+    // The log tail is bounded and redacted like every other capture.
+    assert.match(container.logsTail, /Out of memory: Killed process 7/); assert.equal(container.logsTail.includes('synthetic-secret-value'), false);
+    nothingOwned(w);
+});
+
+test('S3.a-fresh-immediate-status-passes-and-records-nothing-unsettled', async t => {
+    const w = await provisioned(t);
+    const p1 = caseOf(await liveCases(w, ['LIVE-P1']), 'LIVE-P1');
+    assert.equal(p1.result, 'pass', JSON.stringify(p1).slice(0, 300));
+    assert.equal(w.artifacts.get('gpu-live-p1').statusUnsettled, undefined);
+    nothingOwned(w);
+});

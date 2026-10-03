@@ -54,6 +54,8 @@ export const probeBoundMiB = capMiB => Math.ceil((capMiB + 256) / 128) * 128;
 export const GPU_AGENT_INSPECT = '{"id":{{json .ID}},"name":{{json .Name}},"created":{{json .Created}},"image":{{json .Image}},"imageName":{{json .ImageName}},"user":{{json .Config.User}},"labels":{{json .Config.Labels}},"env":{{json .Config.Env}},"mounts":{{json .Mounts}},"running":{{json .State.Running}},"pid":{{json .State.Pid}},"startedAt":{{json .State.StartedAt}}}';
 // `{{.ID}} {{.Names}}`: one row per nested container, to find the container a
 // replacement created under the same name.
+// A container's own state, read-only: what a status that reads `stopped` has to be compared with (a real stop has an exit code).
+export const CONTAINER_TRUTH_FORMAT = '{"id":{{json .ID}},"status":{{json .State.Status}},"running":{{json .State.Running}},"exitCode":{{json .State.ExitCode}},"oomKilled":{{json .State.OOMKilled}},"startedAt":{{json .State.StartedAt}},"finishedAt":{{json .State.FinishedAt}}}';
 export const NESTED_NAME_LIST_FORMAT = '{{.ID}} {{.Names}}';
 
 // The CUDA probe command inside one agent container. `set` overrides client

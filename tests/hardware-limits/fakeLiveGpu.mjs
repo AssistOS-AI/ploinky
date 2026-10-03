@@ -21,7 +21,7 @@ import { fixtureContainerName } from './liveFixture.mjs';
 import { mpsServerDefaultMemoryMiB } from '../../cli/sandbox/hardwareLimits/mps.mjs';
 import { candidateArgvProblem } from './candidateArgv.mjs';
 import {
-    ADMIN_REQUEST, GPU_AGENT_INSPECT, GPU_GRANT_FACTS, MPS_FAILURE_EVIDENCE, MPS_KILL_OWNED_DAEMON, MPS_OBSERVE, NESTED_NAME_LIST_FORMAT, shareMemoryMiB,
+    ADMIN_REQUEST, CONTAINER_TRUTH_FORMAT, GPU_AGENT_INSPECT, GPU_GRANT_FACTS, MPS_FAILURE_EVIDENCE, MPS_KILL_OWNED_DAEMON, MPS_OBSERVE, NESTED_NAME_LIST_FORMAT, shareMemoryMiB,
 } from './liveGpuCommands.mjs';
 
 const hex = value => crypto.createHash('sha256').update(String(value)).digest('hex');
@@ -108,6 +108,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
         if (recorded) { model.imageIds[role] = agent.image; model.drainExits[role] = recorded.drainExit ?? 0; }
         agent.proc = spawn({ cgroup: leafOf(agent), ppid: BOX_INIT_PID, ns: [agent.boxPid, 1] });
         model.dirs.add(leafOf(agent));
+        agent.createdMs = Date.now();
         model.agents.set(role, agent);
         event(`create:${role}`);
         return agent;
@@ -186,6 +187,10 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
             }
         }
         if (faults.restartCpu) { removeAgent('cpu'); createAgent('cpu'); }
+        if (faults.stopAfterApply && roles.some(role => role === faults.stopAfterApply)) {
+            const stopped = model.agents.get(faults.stopAfterApply);
+            if (stopped) { stopped.running = false; stopped.stateStatus = 'exited'; stopped.exitCode = 137; stopped.oomKilled = Boolean(faults.stopOomKilled); stopped.finishedAt = new Date().toISOString(); }
+        }
     }
 
     // --- GPU ----------------------------------------------------------------
@@ -309,11 +314,15 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
         return [...fixture.roles].sort((a, b) => refOf(a).localeCompare(refOf(b))).map(role => {
             const ref = refOf(role); const agent = model.agents.get(role); const share = shares[role] || null;
             const daemon = model.daemon;
+            // `statusLagMs`: for that long after the container was created the status still shows the instance as it was (a stale snapshot);
+            // `stopAfterApply` leaves the container really stopped (the status then says so, for good).
+            const lagging = Boolean(faults.statusLagMs && agent && Date.now() - (agent.createdMs ?? 0) < faults.statusLagMs);
+            const stopped = Boolean(agent && agent.running === false);
             const applied = (share ? Boolean(agent?.share && JSON.stringify(agent.share) === JSON.stringify(share) && daemon && !daemon.lost && agent.mpsGeneration === `${daemon.gen}:${daemon.cfg}`) : !agent?.share) && agent?.limitsKey === policyKey(role);
-            return { ref, configured: model.store.policies[ref] || {}, declared: {}, effective: {}, containers: agent ? [{ key: key(role), alias: null, instanceId: agent.id, enableGeneration: agent.id, availability: 'ready', limitsState: applied ? 'applied' : 'pending', problem: null, mpsGeneration: agent.mpsGeneration || null }] : [] };
+            return { ref, configured: model.store.policies[ref] || {}, declared: {}, effective: {}, containers: agent ? [{ key: key(role), alias: null, instanceId: agent.id, enableGeneration: agent.id, availability: lagging || stopped ? 'stopped' : 'ready', limitsState: lagging || stopped ? 'unavailable' : applied ? 'applied' : 'pending', problem: null, mpsGeneration: lagging || stopped ? null : agent.mpsGeneration || null }] : [] };
         });
     }
-    const adminState = () => ({ ok: true, token: { epoch: model.store.epoch, revision: model.store.revision }, gate: { state: 'on', prepared: true, backendReady: true, controllers: ['cpu', 'memory', 'pids'] }, envelope: faults.envelope === undefined ? envelope : faults.envelope, gpu: gpuStatus(), help: {}, agents: agentsState(), apply: null });
+    const adminState = () => ({ ok: true, metricsSampledAt: new Date().toISOString(), token: { epoch: model.store.epoch, revision: model.store.revision }, gate: { state: 'on', prepared: true, backendReady: true, controllers: ['cpu', 'memory', 'pids'] }, envelope: faults.envelope === undefined ? envelope : faults.envelope, gpu: gpuStatus(), help: {}, agents: agentsState(), apply: null });
     async function admin(method, bodyText) {
         if (faults.adminStatus && method === 'GET') return { status: faults.adminStatus, text: JSON.stringify({ ok: false, error: 'not_authenticated' }) };
         if (method === 'GET') return { status: 200, text: JSON.stringify(adminState()) };
@@ -449,7 +458,7 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
     const agentModel = agent => ({
         ID: agent.id, Name: `/${agent.name}`, Created: agent.created, Image: agent.image, ImageName: agent.imageName,
         Config: { Labels: agent.labels, Env: agent.env, User: agent.user }, Mounts: agent.mounts,
-        State: { Status: 'running', Running: agent.running, Pid: agent.boxPid, StartedAt: agent.startedAt, FinishedAt: '0001-01-01T00:00:00Z', ConmonPid: 2, ExitCode: 0, OOMKilled: false },
+        State: { Status: agent.stateStatus ?? (agent.running ? 'running' : 'exited'), Running: agent.running, Pid: agent.boxPid, StartedAt: agent.startedAt, FinishedAt: agent.finishedAt ?? '0001-01-01T00:00:00Z', ConmonPid: 2, ExitCode: agent.exitCode ?? 0, OOMKilled: agent.oomKilled ?? false },
     });
     const helperModel = helper => ({ ID: helper.id, Name: `/${helper.name}`, Created: helper.created, Image: hex('agent-image'), ImageName: model.image, Config: { Labels: helper.labels, Env: [], User: '1000:1000' }, Mounts: helper.mounts, State: { Status: 'running', Running: true, Pid: helper.boxPid, StartedAt: helper.created, FinishedAt: '0001-01-01T00:00:00Z', ConmonPid: 2, ExitCode: 0, OOMKilled: false } });
     const byId = id => [...model.agents.values()].find(agent => agent.id === id) || null;
@@ -463,12 +472,16 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
         }
         if (verb === 'container inspect') {
             const format = args[args.indexOf('--format') + 1]; const id = args.at(-1);
-            if (format !== GPU_AGENT_INSPECT) return null;
+            if (format !== GPU_AGENT_INSPECT && format !== CONTAINER_TRUTH_FORMAT) return null;
             if (faults.dropNested?.includes(id)) return failed('Error: no such container');
             const agent = byId(id); const helper = model.helpers.get(id);
             if (!agent && !helper) return failed('Error: no such container');
             const rendered = evaluateTemplate(format, 'inspect', agent ? agentModel(agent) : helperModel(helper));
             return typeof rendered === 'string' ? ok(rendered) : rendered;
+        }
+        if (verb === 'container logs') {
+            const agent = byId(args.at(-1));
+            return agent ? ok(`${faults.containerLogs ?? 'agent started\n'}`) : failed('Error: no such container');
         }
         if (verb === 'container exec') {
             let index = 2; const overrides = {};

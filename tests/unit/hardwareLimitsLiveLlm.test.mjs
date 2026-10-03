@@ -1771,3 +1771,14 @@ test('R13b.an-observation-is-in-flight-only-inside-one-settled-request-window-an
     assert.equal(at(520, 530), 'late');
     assert.equal(classifyObservation({ startedAt: 1, endedAt: 2 }, []), 'between-requests');
 });
+
+// --- S3 (L cases): the same acceptance and diagnosis after the local-llm Apply ------------------------------------------------
+test('S3.l1-fails-on-a-status-that-is-stale-right-after-its-apply-and-diagnoses-the-lag', async t => {
+    const w = await provisioned(t, { faults: { statusLagMs: 300 } });
+    const l1 = caseOf(await liveCases(w, ['LIVE-L1'], { timings: { convergenceMs: 5000, convergencePollMs: 10 } }), 'LIVE-L1');
+    assert.equal(l1.result, 'fail', JSON.stringify(l1).slice(0, 400));
+    assert.match(l1.reason, /The status was not settled right after the Apply of .*it settled \d+ ms later, which is a lagging status and not an acceptance/);
+    const unsettled = w.artifacts.get('gpu-live-l1').statusUnsettled;
+    assert.equal(unsettled.convergence.converged, true); assert.equal(unsettled.containers[0].state.running, true);
+    nothingOwned(w);
+});
