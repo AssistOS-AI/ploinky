@@ -7,6 +7,7 @@
 //   offline       run one phase's required tests and affected regressions
 //   prepare-live  write a proposed run manifest for one live block (no engine
 //                 or SSH); mac-cpu, apparatus-cpu, apparatus-core, apparatus-authority,
+//                 apparatus-availability, apparatus-router-controls (its own port pair, 18090/17892),
 //                 apparatus-mps, apparatus-local-llm and
 //                 apparatus-vllm (--stage calibration|qualified, and --calibration-evidence for
 //                 the second stage) get concrete
@@ -884,7 +885,7 @@ async function prepareLive(options) {
         }
         const manifest = validateRunManifest(buildConcreteManifest({
             block, runId, configDigest, casesDigest: config.casesDigest, documentSuffix: config.documentSuffix, pins, candidate,
-            image: CONCRETE_BLOCKS[block].llm ? pins.llm.image : explorerFixtureImage(config.repos.explorer.candidateRoot), ports: selectPorts(pins), unsupported, vllm,
+            image: CONCRETE_BLOCKS[block].llm ? pins.llm.image : explorerFixtureImage(config.repos.explorer.candidateRoot), ports: selectPorts(pins, block), unsupported, vllm,
         }));
         validateProfile(manifest, { partial: true });
         if (manifest.target.remote) validateStage(manifest);

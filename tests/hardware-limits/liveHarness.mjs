@@ -20,6 +20,8 @@ import {
     CORE_LAYOUT, MEMBERSHIP as PROCESS_MEMBERSHIP, HELD_ALLOCATION, ALLOCATION_HANDSHAKE, LEAF_OBSERVATION, assertCoreLayout,
 } from './liveCaseCommands.mjs';
 import { createGpuCases } from './liveGpuCases.mjs';
+import { createAvailabilityCases } from './liveAvailabilityCases.mjs';
+import { C3_AGENTS, C3V_AGENTS } from './liveAvailabilityCommands.mjs';
 import { DELAYED_ALLOCATION, assertDelayedSamplingOrder, assertRealHelperPeak, helperProgramArgv } from './liveHelperCommands.mjs';
 import { validateGpuProfile } from './liveGpuCommands.mjs';
 import { createLlmCases, llmCleanupProof } from './liveLlmCases.mjs';
@@ -33,12 +35,13 @@ export const LIVE_CASES = Object.freeze({
     'apparatus-cpu': ['LIVE-A1'],
     'apparatus-core': ['LIVE-C1', 'LIVE-C2'],
     'apparatus-authority': ['LIVE-C6'],
+    'apparatus-availability': ['LIVE-C3'],
+    'apparatus-router-controls': ['LIVE-C3V'],
     'apparatus-mps': ['LIVE-P1', 'LIVE-P2', 'LIVE-P3', 'LIVE-P4'],
     'apparatus-local-llm': ['LIVE-L1', 'LIVE-L2'],
     'apparatus-vllm': ['LIVE-L3'],
 });
 export const UNSUPPORTED = Object.freeze({
-    'LIVE-C3': 'Actual D4 graph, routing and asynchronous optional-child fixtures are not implemented.',
     'LIVE-C4': 'Actual stored-policy downgrade/no-mutation fixture is not implemented.',
     'LIVE-C5': 'Host/in-Box writer and barrier interleaving fixture is not implemented.',
     'LIVE-C7': 'Host bind/GPU/reapply/rollback generation matrix is not implemented.',
@@ -60,8 +63,8 @@ export function validateProfile(run, { partial = false } = {}) {
     const profile = run.target.execution;
     keys(profile, ['protocol', 'host', 'node', 'candidate', 'engine', 'source', 'workspace', 'box', 'agents', 'cases'], 'execution profile', ['fixtures', 'provision', 'gpu', 'llm']);
     if (profile.fixtures !== undefined) {
-        keys(profile.fixtures, [], 'fixtures', ['cpu', 'gpu', 'llm']);
-        for (const name of ['cpu', 'gpu', 'llm']) {
+        keys(profile.fixtures, [], 'fixtures', ['cpu', 'gpu', 'llm', 'availability']);
+        for (const name of ['cpu', 'gpu', 'llm', 'availability']) {
             if (profile.fixtures[name] === undefined) continue;
             keys(profile.fixtures[name], ['ref'], `${name} fixture`);
             if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(profile.fixtures[name].ref)) throw new Error(`Invalid ${name} fixture reference`);
@@ -92,13 +95,13 @@ export function validateProfile(run, { partial = false } = {}) {
             || !HASH.test(profile.box.contractDigest) || !bounded(profile.box.created, 128)
             || !/^[a-f0-9]{12}$/.test(profile.box.pathHash) || !bounded(profile.box.instance, 128)) throw new Error('Invalid Box identity');
     }
-    if (!Array.isArray(profile.agents) || profile.agents.length > 3) throw new Error('Invalid agents');
+    if (!Array.isArray(profile.agents) || profile.agents.length > 4) throw new Error('Invalid agents');
     const ids = new Set();
     const roles = new Set();
     for (const agent of profile.agents) {
         keys(agent, ['id', 'created', 'image', 'role'], 'agent');
         if (!ID.test(agent.id) || !ID.test(agent.image.replace(/^sha256:/, '')) || !bounded(agent.created, 128)
-            || !['memory', 'cpu', 'pids', 'probe', 'peer', 'llm'].includes(agent.role) || ids.has(agent.id) || roles.has(agent.role)) throw new Error('Invalid agent identity');
+            || !['memory', 'cpu', 'pids', 'probe', 'peer', 'llm', ...C3_AGENTS, ...C3V_AGENTS].includes(agent.role) || ids.has(agent.id) || roles.has(agent.role)) throw new Error('Invalid agent identity');
         ids.add(agent.id); roles.add(agent.role);
     }
     if (!Array.isArray(profile.cases) || !profile.cases.length || profile.cases.length > 20
@@ -113,6 +116,8 @@ export function validateProfile(run, { partial = false } = {}) {
         if (profile.cases.includes('LIVE-C2') && (profile.agents.length !== 3 || roles.size !== 3)) throw new Error('C2 requires three distinct owned agents');
         if (gpuCases && !['probe', 'peer', 'cpu'].every(role => roles.has(role))) throw new Error('The GPU cases require the owned probe, peer and cpu agents');
         if (llmCases && !(roles.size === 1 && roles.has('llm'))) throw new Error('The local-llm cases require the owned local-llm agent alone');
+        if (profile.cases.includes('LIVE-C3') && [...roles].sort().join(',') !== C3_AGENTS.join(',')) throw new Error('LIVE-C3 requires the owned agents a, b, c and x');
+        if (profile.cases.includes('LIVE-C3V') && [...roles].join(',') !== C3V_AGENTS.join(',')) throw new Error('LIVE-C3V requires the owned static fixture agent alone');
         if (profile.provision && (profile.agents.length !== profile.provision.agents.length
             || profile.provision.agents.some(agent => !roles.has(agent.role)))) throw new Error('Provisioned agents differ from the fixture plan');
         if (run.ownedBoxes.length !== 1) throw new Error('Only one immutable owned Box is supported');
@@ -226,7 +231,7 @@ export const postExitObservation = { windowMs: 2000, intervalMs: 100 };
 export const POST_EXIT_VANISHED = 'The same-leaf cgroup vanished or could not be observed after the pressure process exited, so no post-exit counter evidence exists (the kernel may have killed the agent main process rather than the pressure process)';
 
 export function createLiveAdapter(profile, {
-    processProvider = runBoundedProcess, signal, cleanupSignal, persist = () => {}, run, artifacts = () => {}, hostProc, gpuTimings,
+    processProvider = runBoundedProcess, signal, cleanupSignal, persist = () => {}, run, artifacts = () => {}, hostProc, gpuTimings, availabilitySeams = {},
 } = {}) {
     const env = candidateEnv(profile);
     // `tolerate` returns a finished command whatever its status, for evidence
@@ -553,6 +558,8 @@ export function createLiveAdapter(profile, {
     const gpu = profile.gpu && !profile.llm ? createGpuCases(gpuContext) : null;
     // The local-llm and vLLM cases (liveLlmCases.mjs) build on the same kit and cleanup hooks.
     const llm = profile.llm ? createLlmCases(gpuContext) : null;
+    // The availability cases (LIVE-C3 and LIVE-C3V) of their own fixtures.
+    const availability = profile.fixtures?.availability ? createAvailabilityCases({ profile, run, command, engine, core, nested, inspectBox, safeArtifact, persist, ...availabilitySeams }) : null;
     async function cleanup() {
         // The GPU block first stops its own helpers by exact identity, then the
         // product cleanup runs, and last the GPU must show none of our processes
@@ -573,7 +580,7 @@ export function createLiveAdapter(profile, {
         await runOwnedCleanup({ run, profile, persist, processProvider, signal: cleanupSignal });
         if (hooks) await hooks.afterCleanup();
     }
-    return { cpuCase, coreCase, swapCase, helperCase, cleanup, inspectBox, gpu, llm };
+    return { cpuCase, coreCase, swapCase, helperCase, cleanup, inspectBox, gpu, llm, availability };
 }
 
 // Every fixture agent carries memory, cpu and pids limits (inspectAgent), so
@@ -649,7 +656,7 @@ export async function executeCleanupRun({ run, persist = () => {}, processProvid
 
 export async function executeLiveRun({ run, action = 'live', persist = () => {}, processProvider = runBoundedProcess, signal,
     remoteArrival = false, artifacts = () => {},
-    hostIdentity = defaultHostIdentity(), hostProc, gpuTimings,
+    hostIdentity = defaultHostIdentity(), hostProc, gpuTimings, availabilitySeams,
 } = {}) {
     if (action === 'cleanup') return executeCleanupRun({ run, persist, processProvider, signal, remoteArrival, hostIdentity, hostProc, artifacts });
     const selected = run.target.execution?.cases || LIVE_CASES[run.block];
@@ -662,7 +669,7 @@ export async function executeLiveRun({ run, action = 'live', persist = () => {},
     if (run.cleanup.state !== 'not-started') { report.limitations.push('Cleanup has already started for this run; provision a new one'); return report; }
     const problem = pinProblem(run, profile, hostIdentity, remoteArrival);
     if (problem) { report.limitations.push(problem); return report; }
-    if (!selected.some(id => ['LIVE-C1', 'LIVE-C2', 'LIVE-C6', 'LIVE-A1', 'LIVE-P1', 'LIVE-P2', 'LIVE-P3', 'LIVE-P4', 'LIVE-L1', 'LIVE-L2', 'LIVE-L3'].includes(id))) {
+    if (!selected.some(id => ['LIVE-C1', 'LIVE-C2', 'LIVE-C3', 'LIVE-C3V', 'LIVE-C6', 'LIVE-A1', 'LIVE-P1', 'LIVE-P2', 'LIVE-P3', 'LIVE-P4', 'LIVE-L1', 'LIVE-L2', 'LIVE-L3'].includes(id))) {
         report.limitations.push('Selected cases have no implemented live executor'); return report;
     }
     if (liveSourceDigest(profile.source.root) !== profile.source.digest) { report.limitations.push('Candidate source changed'); return report; }
@@ -674,7 +681,7 @@ export async function executeLiveRun({ run, action = 'live', persist = () => {},
     const blockMs = Number.isInteger(run.deadlines?.blockMs) && run.deadlines.blockMs >= 60000 && run.deadlines.blockMs <= 16_200_000 ? run.deadlines.blockMs : 20 * 60 * 1000;
     const blockTimer = setTimeout(() => blockController.abort(), blockMs);
     const blockSignal = signal ? AbortSignal.any([signal, blockController.signal]) : blockController.signal;
-    const adapter = createLiveAdapter(profile, { processProvider, signal: blockSignal, cleanupSignal: cleanupController.signal, persist, run, artifacts, hostProc, gpuTimings });
+    const adapter = createLiveAdapter(profile, { processProvider, signal: blockSignal, cleanupSignal: cleanupController.signal, persist, run, artifacts, hostProc, gpuTimings, availabilitySeams });
     let attempted = false; let activeCase = null;
     try {
         if (action !== 'cleanup') {
@@ -682,6 +689,7 @@ export async function executeLiveRun({ run, action = 'live', persist = () => {},
             await adapter.inspectBox(); attempted = true;
             const executors = {
                 'LIVE-C1': adapter.coreCase, 'LIVE-C2': adapter.cpuCase, 'LIVE-C6': adapter.helperCase, 'LIVE-A1': adapter.swapCase,
+                ...(adapter.availability ? { 'LIVE-C3': adapter.availability.liveC3, 'LIVE-C3V': adapter.availability.liveC3V } : {}),
                 ...(adapter.gpu ? { 'LIVE-P1': adapter.gpu.liveP1, 'LIVE-P2': adapter.gpu.liveP2, 'LIVE-P3': adapter.gpu.liveP3, 'LIVE-P4': adapter.gpu.liveP4 } : {}),
                 ...(adapter.llm ? { 'LIVE-L1': adapter.llm.liveL1, 'LIVE-L2': adapter.llm.liveL2, 'LIVE-L3': adapter.llm.liveL3 } : {}),
             };

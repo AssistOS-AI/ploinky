@@ -34,7 +34,7 @@ export function shortParent(t) {
 }
 
 // `extraSource` lets a block carry the reviewed in-Box programs it freezes (name -> text).
-export function world(t, { block, stagedRoot = true, faults = {}, suffix = 'claude', home: homeOverride = null, parentRoot: parentRootOverride = null, extraSource = {}, extraPins = {}, buildOptions = {} } = {}) {
+export function world(t, { block, stagedRoot = true, faults = {}, suffix = 'claude', home: homeOverride = null, parentRoot: parentRootOverride = null, extraSource = {}, extraPins = {}, buildOptions = {}, ports = { tcp: 23456, udp: 34567 } } = {}) {
     const spec = CONCRETE_BLOCKS[block];
     if (!spec) throw new Error(`no concrete block ${block}`);
     const root = scratch(t);
@@ -71,7 +71,7 @@ export function world(t, { block, stagedRoot = true, faults = {}, suffix = 'clau
     }
     const run = buildConcreteManifest({
         block, runId, configDigest: hash('config'), casesDigest: hash('cases'), documentSuffix: suffix, pins, candidate, image: IMAGE,
-        ports: { tcp: 23456, udp: 34567 }, unsupported: {}, ...buildOptions,
+        ports, unsupported: {}, ...buildOptions,
     });
     const remoteRoot = remote ? run.target.stage.root : null;
     if (remote && stagedRoot) {

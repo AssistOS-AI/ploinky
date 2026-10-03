@@ -20,6 +20,7 @@ import {
     ADMIN_REQUEST, GPU_SHARES, MPS_CLIENT_PIPE, PROBE_FILE, TIGHTER_CLIENT, controlHelperRunArgv, probeBoundMiB, probeExecArgv, shareMemoryMiB,
 } from './liveGpuCommands.mjs';
 import { AUTHORITY_HELPER_PROGRAM, DELAYED_ALLOCATION } from './liveHelperCommands.mjs';
+import { MANIFEST_ENABLE, NESTED_STATE_FORMAT, RESERVED_PORTS, availabilityPolling, ROUTER_CONTROLS_PORTS, STORED_OVERRIDE, VARIANT_III_EVIDENCE } from './liveAvailabilityCommands.mjs';
 import { remoteRoot, remoteReportName } from './liveStage.mjs';
 import { DOCUMENT_SUFFIXES, GPU_TOLERATED_MAX, GPU_TOLERATED_MAX_MIB } from './fixtures.mjs';
 import { sshOptions } from './liveRemote.mjs';
@@ -31,6 +32,11 @@ export const CONCRETE_BLOCKS = Object.freeze({
     'apparatus-core': { platform: 'linux', remote: true, cases: ['LIVE-C1', 'LIVE-C2'] },
     // C6: the Router authority helper's post-probe peak, measured through the product's observation seam (inside the owned Box).
     'apparatus-authority': { platform: 'linux', remote: true, cases: ['LIVE-C6'] },
+    // C3: hardware availability over a dependency graph (refused, blocked, ready, optional no-wait, enabled extra), in one owned workspace.
+    'apparatus-availability': { platform: 'linux', remote: true, cases: ['LIVE-C3'], availability: true },
+    // C3-v: the Router's own controls while the STATIC agent is the blocked fixture, in a DEDICATED workspace with its own Box and a port pair
+    // distinct from every other block (18080/17882 belong to the first). The pair is a manifest value, free-checked at provisioning.
+    'apparatus-router-controls': { platform: 'linux', remote: true, cases: ['LIVE-C3V'], availability: true, ports: ROUTER_CONTROLS_PORTS },
     'apparatus-mps': { platform: 'linux', remote: true, cases: ['LIVE-P1', 'LIVE-P2', 'LIVE-P3', 'LIVE-P4'], gpu: true },
     // The local-llm candidate in its own owned workspace, behind the same idle gate: budgets and a llama.cpp
     // model (L1, L2), and vLLM under an MPS share in two stages (L3).
@@ -53,6 +59,18 @@ export const CASE_PASS_CONDITIONS = Object.freeze({
         passes: 'memory.max=67108864; memory.swap.max=0; cpu.max=50000 100000 (the exact-integer comparison tolerates the engine truncating the quota by 1 microsecond); pids.max=64; the leaf oom_kill delta, the throttled delta and the pids max-event delta are all positive on the SAME leaf identity (dev and inode) as the container identity.',
         evidence: 'per-agent same-leaf samples and post-exit samples',
     },
+    'LIVE-C3': {
+        row: 'spec 15.4 LIVE-C3 (:1324); release plan C3 variants (i)-(iv)',
+        procedure: 'A new owned fixture (a, the root, enables b, c and x) is started; a valid stored RAM override is saved for the managed-network agents b and x (memoryPercent 10); then ONLY b\'s manifest is changed to host-network plus nestedPodman. The stored historical policy now fails D4, and a normal attempt to set it again is made. A whole restart then runs blocking a to b with the unrelated c (variant i); a\'s enable is changed so that b is an optional no-wait child (variant ii); x is dropped from a\'s enable and refused itself, so it is an enabled extra of the registry (variant iv). Variant iii, an independently explicit status waiter, has no producer in this product revision and is declared infeasible.',
+        passes: 'The normal setter is refused with the typed unenforceable-limit outcome (HTTP 422, PLOINKY_HARDWARE_LIMITS_UNENFORCEABLE, reasonCode host_network_nested_podman, reason and fix) and commits nothing; each whole restart exits 0 (degraded); (i) b refused, a blocked by exactly b, c and x ready, the exact b and a routes inactive (the logical route kept, every runtime target removed) and not running in the Box\'s engine; (ii) a ready with b refused and its routes inactive; (iv) the extra x refused with a and c ready; the delegated controllers the Box reports are the same at the end. Variant iii is NOT passed: the case ends BLOCKED naming it (N-5) with every other variant proven.',
+        evidence: 'availability-baseline, -stored, -manifest-b, -setter, -variant-i, -variant-ii, -variant-iv, -controllers, -variant-iii artifacts, and the restart tails',
+    },
+    'LIVE-C3V': {
+        row: 'spec 15.4 :774, :1227 (A genuinely blocked static fixture leaves Router controls available) and :1332; release plan C3-v',
+        procedure: 'In a DEDICATED owned workspace with its own Box and port pair, the static agent s is the fixture: a valid stored RAM override is saved, only its manifest is changed to host-network plus nestedPodman, and a whole restart refuses it. The static route, /auth/login, the administrator API, the host `limits status` and `limits clear --agent` are then exercised. The Box is destroyed and proven absent by the cleanup action.',
+        passes: 'The static route answers the terminal unavailable response (HTTP 503 JSON, AGENT_HARDWARE_UNAVAILABLE, code hardware_refused, reason and fix) and not an endless startup or reload page; GET /auth/login answers 200; the administrator API GET answers 200 and lists the static fixture as refused; the host `ploinky limits status` and `ploinky limits clear --agent hwlfixture/s` exit 0 and the override is gone; the dedicated Box is destroyed and proven absent (cleanup complete). A check that cannot be made is BLOCKED with evidence (N-5), never passed.',
+        evidence: 'router-controls-baseline, -manifest, -restart, -refused, -static-route, -auth-login, -admin-api, -limits-status, -limits-clear, -cleared artifacts',
+    },
     'LIVE-C6': {
         row: 'spec 15.4 LIVE-C6 (:1327)',
         procedure: 'A reviewed fixed program runs inside the owned Box as the Box user through the product modules at /opt/ploinky: it prepares the fixture agent\'s exact managed-network plan, captures its exact edge generation lease and runs the product\'s own attestRouterAuthority and runContainerAuthorityProbe unchanged, adding only the post-probe/pre-cleanup observation seam. A first run is the real probe; a second run delays and allocates 16 MiB inside the helper\'s probe exec (after 2000 ms) to prove the sampling order. The program text is fixed in tests/hardware-limits/liveHelperCommands.mjs (sha256:' + crypto.createHash('sha256').update(AUTHORITY_HELPER_PROGRAM).digest('hex') + ').',
@@ -72,6 +90,8 @@ export const GPU_DEADLINES = Object.freeze({ ...DEADLINES, blockMs: 24 * 60 * 10
 // for the block, cleanup and margin), and the install and the load are bounded inside them. An install or a load that does not fit
 // is BLOCKED with the progress it made, never an indefinite poll.
 export const LLM_DEADLINES = Object.freeze({ ...GPU_DEADLINES });
+// The availability blocks restart the whole graph up to three times and poll for it to settle after each.
+export const AVAILABILITY_DEADLINES = Object.freeze({ ...DEADLINES, blockMs: 60 * 60 * 1000 });
 // The vLLM install is bounded by throughput, not by a short clock: a hard cap of 3.5 h for the pinned 3.88 GB wheel set (the product
 // measured about 0.4 MB/s, a raw PyPI probe 1.5 to 2 MB/s) and a stall window: BLOCKED when the download shows no progress for 10 minutes.
 // The block deadline holds the cap, the prerequisites, the calibration, the model load and a margin.
@@ -98,6 +118,8 @@ export function validatePins(value, block) {
     if (value.ports !== undefined) {
         keys(value.ports, ['tcp', 'udp'], 'pinned ports');
         if (![value.ports.tcp, value.ports.udp].every(port => Number.isInteger(port) && port >= 1024 && port <= 65535) || value.ports.tcp === value.ports.udp) throw new Error('Invalid pinned ports');
+        // The dedicated Router-controls workspace never shares a port with the other blocks' default pair.
+        if (spec.ports && [value.ports.tcp, value.ports.udp].some(port => RESERVED_PORTS.includes(port))) throw new Error('The Router-controls workspace needs a port pair distinct from 18080/17882');
     }
     // The observed GPU device and NVIDIA tools: required for the GPU block and
     // refused for every other (a CPU block never names a GPU).
@@ -149,8 +171,9 @@ export function explorerFixtureImage(explorerRoot) {
     return image;
 }
 
-export function selectPorts(pins) {
+export function selectPorts(pins, block = null) {
     if (pins.ports) return { tcp: pins.ports.tcp, udp: pins.ports.udp };
+    if (block && CONCRETE_BLOCKS[block]?.ports) return { ...CONCRETE_BLOCKS[block].ports };
     return { tcp: crypto.randomInt(20000, 30000), udp: crypto.randomInt(30000, 40000) };
 }
 
@@ -211,7 +234,7 @@ export function buildConcreteManifest({ block, runId, configDigest, casesDigest,
         box: null,
         agents: [],
         cases: [...spec.cases],
-        fixtures: spec.llm ? { llm: { ref: LLM_REF } } : spec.gpu ? { gpu: { ref: `${FIXTURE_REPOSITORY}/${agents[0].name}` } } : { cpu: { ref: `${FIXTURE_REPOSITORY}/${agents[0].name}` } },
+        fixtures: spec.llm ? { llm: { ref: LLM_REF } } : spec.availability ? { availability: { ref: `${FIXTURE_REPOSITORY}/${agents[0].name}` } } : spec.gpu ? { gpu: { ref: `${FIXTURE_REPOSITORY}/${agents[0].name}` } } : { cpu: { ref: `${FIXTURE_REPOSITORY}/${agents[0].name}` } },
         provision: {
             revision: candidate.revision, repository: spec.llm ? LLM_REPOSITORY : FIXTURE_REPOSITORY, image, boxImage: pins.boxImage, agents,
             workspace: { parent, parentMode: remote ? 'staged' : 'create', path: workspacePath },
@@ -258,7 +281,7 @@ export function buildConcreteManifest({ block, runId, configDigest, casesDigest,
         schema: 1, runId, configDigest, casesDigest, block, target, state: 'proposed',
         workspace: { proposedParent: parent, proposedPath: workspacePath, instance: identity.instance, pathHash: identity.pathHash },
         ports: { tcp: ports.tcp, udp: ports.udp },
-        deadlines: { ...(spec.vllm ? VLLM_DEADLINES : spec.llm ? LLM_DEADLINES : spec.gpu ? GPU_DEADLINES : DEADLINES) },
+        deadlines: { ...(spec.vllm ? VLLM_DEADLINES : spec.llm ? LLM_DEADLINES : spec.gpu ? GPU_DEADLINES : spec.availability ? AVAILABILITY_DEADLINES : DEADLINES) },
         images: [
             { role: 'fixture-agent', ref: image, source: spec.llm ? 'operator pins (local-llm image)' : 'AssistOSExplorer explorer/manifest.json line 2' },
             { role: 'box', ref: pins.boxImage, source: 'operator pins' },
@@ -328,6 +351,39 @@ export function plannedCommands(run) {
         { id: 'C6-helper-real', binary: engine, argv: ['container', 'exec', '--user', 'podman', '--workdir', workspace, '--env', `PLOINKY_ROUTER_HOST_PORT=${run.ports.tcp}`, box, 'node', '--input-type=module', '-e', '<AUTHORITY_HELPER_PROGRAM>', '<PARAMS mode=real>'], deadlineMs: 120000, note: 'Runs the product\'s own attestation and helper probe once, with the post-probe observation seam; reads the helper leaf\'s memory.peak/max' },
         { id: 'C6-helper-delayed', binary: engine, argv: ['container', 'exec', '--user', 'podman', '--workdir', workspace, '--env', `PLOINKY_ROUTER_HOST_PORT=${run.ports.tcp}`, box, 'node', '--input-type=module', '-e', '<AUTHORITY_HELPER_PROGRAM>', `<PARAMS mode=delayed bytes=${DELAYED_ALLOCATION.bytes} delayMs=${DELAYED_ALLOCATION.delayMs}>`], deadlineMs: 120000, note: 'The same run with an allocating, delayed probe exec to prove the sampling order' },
         { id: 'C6-helper-cleanup-proof', binary: engine, argv: [...nested, 'container', 'ps', '--all', '--no-trunc', '--filter', 'label=io.assistos.ploinky.authority-helper', '--format', '{{.ID}}'], deadlineMs: run.deadlines.coreMs, note: 'No authority helper container remains' },
+    );
+    const admin = (id, method, body, note) => ({ id, binary: engine, argv: [...core, 'node', '-e', '<ADMIN_REQUEST>', method, ...(body ? [body] : [])], deadlineMs: 60000, note });
+    const edit = (id, action) => ({ id, action });
+    const restart = (id, note) => ({ id, binary: node, argv: [profile.candidate.path, 'restart'], cwd: workspace, env: { PLOINKY_BOX_IMAGE: plan.boxImage }, deadlineMs: run.deadlines.startMs, note });
+    const nestedStates = id => ({ id, binary: engine, argv: [...nested, 'container', 'ps', '--all', '--no-trunc', '--format', NESTED_STATE_FORMAT], deadlineMs: 30000, note: 'Read-only: which exact agents run in the Box\'s engine' });
+    const override = JSON.stringify({ action: 'set_agent_limits', agentRef: `${FIXTURE_REPOSITORY}/<AGENT>`, limits: STORED_OVERRIDE, expectedToken: '<TOKEN>' });
+    if (profile.cases.includes('LIVE-C3')) live.push(
+        admin('C3-admin-state', 'GET', null, 'Baseline (every agent ready) and, polled after each restart, the settled graph; polls are read-only and not journaled'),
+        admin('C3-store-override-b', 'POST', override.replace('<AGENT>', 'b'), 'A valid stored RAM override of the managed-network agent b (memoryPercent 10)'),
+        admin('C3-store-override-x', 'POST', override.replace('<AGENT>', 'x'), 'A valid stored RAM override of the managed-network agent x (memoryPercent 10)'),
+        edit('C3-manifest-d4-b', `Rewrite ${workspace}/.ploinky/repos/${FIXTURE_REPOSITORY}/b/manifest.json with network.mode=host and containerSecurity.nestedPodman=true and nothing else changed; every other fixture manifest must equal what provisioning recorded before and after`),
+        admin('C3-setter-refusal', 'POST', override.replace('<AGENT>', 'b'), 'The normal setter again: must be refused (HTTP 422, PLOINKY_HARDWARE_LIMITS_UNENFORCEABLE, reasonCode host_network_nested_podman, reason and fix) with the store token unchanged'),
+        restart('C3-restart-i', 'Variant (i): a blocking to b, c unrelated. The whole restart must exit 0 (degraded). `--port` and `--udp-port` are valid only before start.'),
+        nestedStates('C3-nested-i'),
+        edit('C3-manifest-enable-ii', `Rewrite ${workspace}/.ploinky/repos/${FIXTURE_REPOSITORY}/a/manifest.json with enable ${JSON.stringify(MANIFEST_ENABLE.ii(FIXTURE_REPOSITORY))}`),
+        restart('C3-restart-ii', 'Variant (ii): b is an optional no-wait child of a; a must be ready'),
+        nestedStates('C3-nested-ii'),
+        edit('C3-manifest-iv', `Rewrite a's manifest with enable ${JSON.stringify(MANIFEST_ENABLE.iv(FIXTURE_REPOSITORY))} and x's manifest with network.mode=host and containerSecurity.nestedPodman=true`),
+        restart('C3-restart-iv', 'Variant (iv): x is an enabled extra of the registry, refused'),
+        nestedStates('C3-nested-iv'),
+        edit('C3-routing-read', `Read ${workspace}/.ploinky/routing.json after each restart: the b and a routes keep their logical entry with hardwareAvailability and no hostPort or serviceTargets`),
+        edit('C3-variant-iii', `Declared infeasible, never passed (N-5): ${VARIANT_III_EVIDENCE}`),
+    );
+    if (profile.cases.includes('LIVE-C3V')) live.push(
+        admin('C3V-admin-state', 'GET', null, 'Baseline and the settled state; the static fixture must be ready first'),
+        admin('C3V-store-override', 'POST', override.replace('<AGENT>', 's'), 'A valid stored RAM override of the static fixture (memoryPercent 10)'),
+        edit('C3V-manifest-d4', `Rewrite ${workspace}/.ploinky/repos/${FIXTURE_REPOSITORY}/s/manifest.json with network.mode=host and containerSecurity.nestedPodman=true and nothing else changed`),
+        restart('C3V-restart', 'The static fixture becomes refused'),
+        edit('C3V-http-static', `GET http://127.0.0.1:${run.ports.tcp}/ with Accept: application/json: HTTP 503 JSON AGENT_HARDWARE_UNAVAILABLE (code hardware_refused, reason, fix)`),
+        edit('C3V-http-login', `GET http://127.0.0.1:${run.ports.tcp}/auth/login: HTTP 200`),
+        admin('C3V-admin-api', 'GET', null, 'The administrator API answers 200 with the runner\'s local administrator session and lists the static fixture as refused'),
+        { id: 'C3V-limits-status', binary: node, argv: [profile.candidate.path, 'limits', 'status'], cwd: workspace, env: { PLOINKY_BOX_IMAGE: plan.boxImage }, deadlineMs: 120000, note: 'Host command, exit 0' },
+        { id: 'C3V-limits-clear', binary: node, argv: [profile.candidate.path, 'limits', 'clear', '--agent', `${FIXTURE_REPOSITORY}/s`], cwd: workspace, env: { PLOINKY_BOX_IMAGE: plan.boxImage }, deadlineMs: 120000, note: 'Host recovery command, exit 0; the override is gone afterwards' },
     );
     if (profile.cases.includes('LIVE-A1')) live.push(
         { id: 'A1-held-allocation', binary: engine, argv: [...nested, 'container', 'exec', '<MEMORY_AGENT_ID>', 'node', '-e', '<HELD_ALLOCATION>', run.runId], deadlineMs: 25000 },
@@ -614,6 +670,7 @@ export function renderSummary(run, manifestPath) {
         ...commands,
         '',
         ...(profile.gpu ? gpuSummary(run) : []),
+        ...(profile.fixtures?.availability ? availabilitySummary(run) : []),
         '## Cleanup',
         '',
         line('Cleanup runs in a finally block after `live`, after any provisioning failure, and as the standalone `cleanup` action. It is journaled in the manifest and resumes from it after a crash. Order: ',
@@ -646,6 +703,29 @@ function passConditionsSection(profile) {
         `Every preflight (prepare-live, provision, live and cleanup) aborts before any mutation when the workspace, the stage, the candidate or the working directory lies under \`~/work/testExplorerFresh\` or \`~/cleanup-repair-claude-20261002\` (the pinned home ${profile.host.home} and this process's own home are both checked, symlinks resolved), or when a derived Box name matches \`ploinky-box-testexplorerfresh-*\`. The other session's Box, workspace and records are never read, written or signalled.`,
         '',
     ];
+}
+
+// The approval section of the availability blocks (LIVE-C3 and LIVE-C3V): the fixture graph, what is edited and how, the bounds and the declared limit.
+function availabilitySummary(run) {
+    const profile = run.target.execution;
+    const router = profile.cases.includes('LIVE-C3V');
+    const workspace = profile.provision.workspace.path;
+    const names = profile.provision.agents.map(agent => agent.name);
+    const rows = [
+        ['Fixture graph', router ? `the static agent ${FIXTURE_REPOSITORY}/s alone (it is the fixture that becomes refused)` : `${FIXTURE_REPOSITORY}/a (the root) enables ${names.slice(1).map(name => `${FIXTURE_REPOSITORY}/${name}`).join(', ')}; c is unrelated to b`],
+        ['Stored override', `memoryPercent ${STORED_OVERRIDE.memoryPercent}, saved through the Router's administrator route (the product's local operator session, inside the owned Box) for ${router ? 's while its manifest is' : 'b and x while their manifests are'} valid`],
+        ['Manifest edits', `only files under ${workspace}/.ploinky/repos/${FIXTURE_REPOSITORY}/, one at a time, each journaled with its before and after digest; every other manifest must equal what provisioning recorded, before and after each edit; the edits make an agent host-network plus nestedPodman (D4)${router ? '' : ' and change a\'s enable list'}`],
+        ['Whole restarts', router ? '1 (`restart`, no port options)' : '3 (`restart`, no port options), each followed by a bounded poll of the administrator state'],
+        ['Bounds', `restart ${run.deadlines.startMs} ms; settle poll ${availabilityPolling.deadlineMs} ms every ${availabilityPolling.intervalMs} ms (read-only, not journaled); every HTTP probe 15000 ms and 64 KiB; the block ${run.deadlines.blockMs} ms`],
+        ['Ports', router ? `TCP ${run.ports.tcp} and UDP ${run.ports.udp}: a pair distinct from 18080/17882, free-checked at provisioning (a collision aborts); own Box, own workspace` : `TCP ${run.ports.tcp} and UDP ${run.ports.udp}`],
+        ['Declared limit', router ? 'The Router controls are checked live. A check that cannot be made is BLOCKED with evidence (N-5), never passed. The Box is destroyed and proven absent by the cleanup action.' : `Variant iii is declared infeasible and never passed: ${VARIANT_III_EVIDENCE}`],
+        ['Product expectation under test', router ? 'The static route answers the terminal unavailable response; /auth/login 200; administrator API 200; host `limits status` and `limits clear --agent` exit 0.' : 'The normal setter refuses the stored historical policy with the typed unenforceable-limit outcome (spec :1324). The code read at this revision builds no manifest-aware check in the setter route, so a live FAIL here is a product finding to decide, not a runner problem.'],
+    ];
+    const cell = value => String(value).replaceAll('|', '\\|');
+    const actions = run.target.plan.live.filter(entry => entry.action);
+    return ['## Availability fixture', '', '| Item | Value |', '| --- | --- |', ...rows.map(([item, value]) => `| ${item} | ${cell(value)} |`), '',
+        '## Planned file and HTTP actions', '', 'These steps run no candidate or engine command; each manifest edit is journaled and every other manifest is re-proved unchanged.', '', '| Step | Action |', '| --- | --- |',
+        ...actions.map(entry => `| ${entry.id} | ${cell(entry.action)} |`), ''];
 }
 
 // The extra approval sections of the GPU block: the idle-gate checks, every

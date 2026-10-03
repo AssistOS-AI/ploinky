@@ -24,6 +24,7 @@ import { createJournal, recordHostRecords, runOwnedCleanup } from './liveCleanup
 import { createHostProc } from './liveGpuHost.mjs';
 import { createGpuGate, gpuCleanupProof, gpuQueryArgv } from './liveGpuGate.mjs';
 import { LLM_AGENT, LLM_REF, LLM_REPOSITORY } from './liveLlmNames.mjs';
+import { C3_AGENTS, C3V_AGENTS } from './liveAvailabilityCommands.mjs';
 
 export const FIXTURE_REPOSITORY = 'hwlfixture';
 export const FIXTURE_HARDWARE_LIMITS = Object.freeze({ memory: '64m', cpus: '0.5', pidsLimit: 64 });
@@ -41,6 +42,9 @@ export { LLM_AGENT, LLM_REF, LLM_REPOSITORY };
 // (memory, cpu and pids pressure); C1 and A1 need one. Every agent carries all
 // three limits, because the live inspection requires them on each agent.
 export function fixturePlan(cases) {
+    // LIVE-C3: a (the root) enables b, c and x; LIVE-C3V: the static agent alone. They declare no limits: the administrator's stored override is the request.
+    if (cases.includes('LIVE-C3')) return C3_AGENTS.map(name => ({ name, role: name, hardwareLimits: null }));
+    if (cases.includes('LIVE-C3V')) return C3V_AGENTS.map(name => ({ name, role: name, hardwareLimits: null }));
     if (cases.some(id => String(id).startsWith('LIVE-L'))) {
         return [{ name: LLM_AGENT, role: 'llm', repository: LLM_REPOSITORY, hardwareLimits: null }];
     }
@@ -75,7 +79,7 @@ export function fixtureManifest(agent, { image, agents }) {
         container: image,
         agent: FIXTURE_AGENT_COMMAND,
         readiness: { protocol: 'none' },
-        hardwareLimits: { ...agent.hardwareLimits },
+        ...(agent.hardwareLimits ? { hardwareLimits: { ...agent.hardwareLimits } } : {}),
     };
     const others = agents.filter(value => value.name !== agent.name);
     if (agent.name === agents[0].name && others.length) manifest.enable = others.map(value => `${FIXTURE_REPOSITORY}/${value.name}`);
@@ -105,7 +109,7 @@ export function proposedWorkspaceIdentity(workspacePath) {
 }
 
 export function startArgs(profile, ports) {
-    return [profile.candidate.path, '--port', String(ports.tcp), '--udp-port', String(ports.udp), 'start', (profile.fixtures.llm || profile.fixtures.gpu || profile.fixtures.cpu).ref];
+    return [profile.candidate.path, '--port', String(ports.tcp), '--udp-port', String(ports.udp), 'start', (profile.fixtures.llm || profile.fixtures.gpu || profile.fixtures.availability || profile.fixtures.cpu).ref];
 }
 
 export function validateProvisionPlan(value, run) {
@@ -116,7 +120,7 @@ export function validateProvisionPlan(value, run) {
     keys(value.workspace, ['parent', 'parentMode', 'path'], 'provision workspace');
     if (!absolute(value.workspace.parent) || !absolute(value.workspace.path) || path.dirname(value.workspace.path) !== value.workspace.parent
         || !['create', 'staged'].includes(value.workspace.parentMode)) throw new Error('Invalid provision workspace');
-    if (!Array.isArray(value.agents) || !value.agents.length || value.agents.length > 3) throw new Error('Invalid fixture agents');
+    if (!Array.isArray(value.agents) || !value.agents.length || value.agents.length > 4) throw new Error('Invalid fixture agents');
     const names = new Set();
     for (const agent of value.agents) {
         if (agent.role === 'llm') {
@@ -126,6 +130,14 @@ export function validateProvisionPlan(value, run) {
             names.add(agent.name);
             continue;
         }
+        if (C3_AGENTS.includes(agent.name) || C3V_AGENTS.includes(agent.name)) {
+            // The availability fixtures declare no limits of their own.
+            keys(agent, ['name', 'role', 'hardwareLimits'], 'fixture agent');
+            if (agent.role !== agent.name || agent.hardwareLimits !== null || names.has(agent.name)) throw new Error('Invalid fixture agent');
+            names.add(agent.name);
+            continue;
+        }
+        if (value.agents.length > 3) throw new Error('Invalid fixture agents');
         keys(agent, ['name', 'role', 'hardwareLimits'], 'fixture agent');
         keys(agent.hardwareLimits, ['memory', 'cpus', 'pidsLimit'], 'fixture hardwareLimits');
         const expected = GPU_ROLES.includes(agent.name) ? GPU_FIXTURE_HARDWARE_LIMITS : FIXTURE_HARDWARE_LIMITS;
@@ -133,6 +145,9 @@ export function validateProvisionPlan(value, run) {
             || jsonDigest(agent.hardwareLimits) !== jsonDigest(expected)) throw new Error('Invalid fixture agent');
         names.add(agent.name);
     }
+    const availabilityNames = value.agents.map(agent => agent.name).join(',');
+    const availabilityFixture = value.agents.some(agent => C3_AGENTS.includes(agent.name) || C3V_AGENTS.includes(agent.name));
+    if (availabilityFixture && (llmFixture || value.gpu !== undefined || ![C3_AGENTS.join(','), C3V_AGENTS.join(',')].includes(availabilityNames))) throw new Error('The availability fixture plan is inconsistent');
     if (llmFixture) {
         // Exactly the local-llm agent, its frozen tree and manifest pins, and a GPU grant for it alone.
         if (value.agents.map(agent => agent.role).join(',') !== 'llm' || value.gpu === undefined) throw new Error('The local-llm fixture plan is inconsistent');
