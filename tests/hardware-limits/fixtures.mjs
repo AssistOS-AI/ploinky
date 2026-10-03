@@ -331,7 +331,7 @@ export function buildRequiredCaseManifest() {
             'E.max-ref-roundtrip', 'E.long-key-roundtrip',
         ]),
         ...leaves(P, 'p1', unit('ploinkyBoxHardwareLimitsGate.test.mjs'), [
-            'G.parse', 'G.omitted-persists', 'G.invalid-no-mutation', 'G.u9-nonempty-no-mutation',
+            'G.status-mps-defaults-line-states-only-the-configured-default', 'G.parse', 'G.omitted-persists', 'G.invalid-no-mutation', 'G.u9-nonempty-no-mutation',
             'G.u9-corrupt-not-empty', 'G.generic-never-enabled-cli-creates-starts', 'G.generic-saved-off-absent-legacy',
             'G.generic-saved-on-inspect', 'G.generic-initialized-empty-inspect', 'G.generic-nonempty-inspect',
             'G.generic-unknown-refuses', 'G.off-byte-identical', 'G.bind-contract', 'G.store-directory-replaced',

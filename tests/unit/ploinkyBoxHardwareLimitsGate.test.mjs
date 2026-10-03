@@ -1405,3 +1405,10 @@ for (const mismatch of ['engineIdentity', 'hostKind']) {
         assert.equal(journal.lastProblem.code, 'ENGINE_IDENTITY_CHANGED');
     });
 }
+
+// R12-c(v): the status text states the daemon default as configured; no producer feeds a "largest share" clause.
+test('G.status-mps-defaults-line-states-only-the-configured-default', () => {
+    const text = formatLimitsStatus({ identity: 'w', gate: { state: 'on', savedAt: '2026-10-03T00:00:00.000Z' }, box: { mps: { daemonStatus: 'ready', serverDefault: { smPercent: 25, vramMiB: 2048, shareMemoryMiB: 1044 } } }, agents: [] });
+    assert.match(text, /^MPS defaults: 25% SM; 2048 MiB per CUDA process$/m);
+    assert.equal(/largest share/.test(text), false);
+});
