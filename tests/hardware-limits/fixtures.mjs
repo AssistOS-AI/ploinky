@@ -256,6 +256,7 @@ export function buildRequiredCaseManifest() {
             'H.cleanup-original-and-cleanup-errors', 'H.pid-12-34-not-123-934', 'H.pid-reuse', 'H.query-error',
             'H.malformed-pids', 'H.initial-busy', 'H.graphics-unknown-blocked', 'H.scratch-home', 'H.baseline-stage-hashes-without-stdin', 'H.baseline-stage-spawn-calls-never-use-stdin',
             'H.duplicate-leaf-title-under-two-parents', 'H.p3-explorer-sibling-is-the-configured-ploinky-candidate',
+            'H.the-p5-calibration-leaves-include-the-tests-added-for-the-accelerator-total-and-the-anchored-rules',
         ]),
         ...leaves(P, 's0', unit('hardwareLimitsFailureSignatures.test.mjs'), ['HS.proc-pid-normalization', 'HS.engine-spawn-guard-fails-a-suite-that-starts-an-engine']),
         ...leaves(P, 's0', unit('hardwareLimitsEngineGuard.test.mjs'), [

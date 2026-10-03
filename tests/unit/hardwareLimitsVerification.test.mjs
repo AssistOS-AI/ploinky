@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import {
+    buildRequiredCaseManifest,
     evaluateGpuIdleGate,
     evaluateSuiteRun,
     randomRunId,
@@ -415,4 +416,25 @@ test('H.baseline-stage-hashes-without-stdin', async (t) => {
     assert.deepEqual(fs.readFileSync(path.join(stage, 'large.bin')), files['large.bin']);
     // A tiny deadline is reported clearly, not as a hang.
     assert.throws(() => createBaselineStage(repo, revision, path.join(root, 'stage-timeout'), { timeoutMs: 1 }), /timed out after 1 ms|failed/);
+});
+
+// R22 (R5): the p5 calibration leaves are the tests of local-llm/tests/vllm-mps-calibration.test.mjs at local-llms e572c1a, the 21 older ones plus the 6 that
+// f502797 added (the accelerator total) and the 3 that e572c1a added (the anchored rules). A test left out of the manifest is never required.
+test('H.the-p5-calibration-leaves-include-the-tests-added-for-the-accelerator-total-and-the-anchored-rules', () => {
+    const file = 'local-llm/tests/vllm-mps-calibration.test.mjs';
+    const leaves = buildRequiredCaseManifest().cases.filter((entry) => entry.phase === 'p5' && entry.repo === 'local-llms' && entry.file === file);
+    const names = leaves.map((entry) => entry.name);
+    assert.equal(new Set(names).size, names.length, 'no title is listed twice');
+    assert.equal(names.length, 30);
+    for (const name of [
+        'CAL.the-real-vllm-0-30-0-statement-was-refused-by-the-old-rule-and-the-real-tree-excerpts-qualify-with-exactly-the-mem-utils-line',
+        'CAL.a-denominator-from-a-constant-or-the-device-properties-in-the-real-tree-is-blocked-even-with-the-sleep-mode-line-present',
+        'CAL.a-statement-counts-only-in-its-reviewed-file-class-and-method',
+        'CAL.the-enclosing-python-scope-is-read-from-the-indentation-of-the-executable-code',
+        'CAL.only-the-accelerator-total-in-its-reviewed-position-and-executable-code-is-a-sizing-statement',
+        'CAL.the-accelerator-api-is-measured-under-both-limits-and-recorded-raw-next-to-the-cuda-and-driver-views',
+        'CAL.the-accelerator-view-must-agree-exactly-with-the-cuda-views-and-with-the-driver-under-each-limit',
+        'CAL.an-unavailable-accelerator-api-is-a-blocking-prerequisite-with-a-clear-message',
+        'CAL.the-torch-query-runs-and-records-the-accelerator-pair-or-its-error',
+    ]) assert.ok(names.includes(name), name);
 });
