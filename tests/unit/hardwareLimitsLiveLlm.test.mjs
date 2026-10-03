@@ -1909,6 +1909,33 @@ test('R18-2.the-operator-summary-states-the-sample-limit', async t => {
     const { code, runPath } = await prepare(f, 'apparatus-vllm', 'r18-2', f.pins({ image: LLM_IMAGE, vllm: VLLM_PINS }));
     assert.equal(code, 0);
     const summary = fs.readFileSync(summaryPathFor(runPath, 'claude'), 'utf8');
-    assert.match(summary, /at most 600 are kept \(the first 300 and the newest 300\), the first and the last download sample are always kept, and the throughput spans the whole download/);
+    assert.match(summary, /at most 600 plus the first and the last download sample are kept \(the first 300 and the newest 300 samples\), and the throughput spans the whole download/);
     assert.match(summary, /the whole block has 15300000 ms \(4\.25 h\)/);
+});
+
+// --- R19: the first and the last download sample are kept even when neither falls inside the first 300 or the newest 300 samples -------
+test('R19.the-first-and-last-download-samples-are-kept-outside-the-head-and-the-tail-and-the-throughput-spans-them', async t => {
+    // 350 polls report no bytes, 400 report a growing download, then the build holds for 350 polls: 1101 samples. The first download
+    // sample is number 351 (past the first 300) and the last one, where the bytes last grew, is number 751 (before the newest 300).
+    const w = await provisioned(t, { block: 'apparatus-vllm', faults: { installNoBytesPolls: 350, installProgressPolls: 400, installingHoldPolls: 350 } });
+    w.run.deadlines.installMs = 120_000; w.run.deadlines.installStallMs = 60_000;
+    const l3 = caseOf(await liveCases(w, ['LIVE-L3'], { timings: { installPollMs: 1 } }), 'LIVE-L3');
+    assert.equal(l3.result, 'pass', JSON.stringify(l3).slice(0, 400));
+    const throughput = w.artifacts.get('gpu-live-l3').installThroughput;
+    const samples = throughput.samples;
+    assert.ok(throughput.sampleCount >= 1100, `sampleCount ${throughput.sampleCount}`);
+    assert.ok(samples.length <= 602, `kept ${samples.length}`);
+    assert.ok(samples.every((sample, index) => index === 0 || sample.atMs >= samples[index - 1].atMs), 'in time order');
+    assert.equal(samples[0].bytes, null, 'the head holds the polls that reported no bytes');
+    const total = VLLM_PINS.downloadBytes;
+    const first = samples.find(sample => sample.bytes === Math.floor(total / 401));
+    const last = samples.find(sample => sample.bytes === total && sample.phase === 'installing');
+    assert.ok(first && first.phase === 'downloading', 'the first download sample is kept');
+    assert.ok(last, 'the last download sample, where the bytes last grew, is kept');
+    // Neither sits in the head (the first 300 samples) or in the newest 300: the evidence keeps them on purpose.
+    const newest = samples.slice(-300);
+    assert.equal(samples.slice(0, 300).includes(first), false); assert.equal(newest.includes(first), false);
+    assert.equal(newest.includes(last), false);
+    assert.equal(throughput.bytesPerSecond, Math.round((total - first.bytes) / ((last.atMs - first.atMs) / 1000)), 'the throughput spans first to last download sample');
+    nothingOwned(w);
 });
