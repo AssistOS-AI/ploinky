@@ -67,6 +67,7 @@ export function createLlmCases(ctx) {
     const installMs = Number.isInteger(run.deadlines?.installMs) ? run.deadlines.installMs : 12 * 60 * 1000;
     const installStallMs = Number.isInteger(run.deadlines?.installStallMs) ? run.deadlines.installStallMs : 10 * 60 * 1000;
     const modelLoadMs = Number.isInteger(run.deadlines?.modelLoadMs) ? run.deadlines.modelLoadMs : 20 * 60 * 1000;
+    const TIMING_PHASES_MAX = 64;
     let captureCounter = 0;
     const ref = LLM_REF;
 
@@ -101,26 +102,41 @@ export function createLlmCases(ctx) {
             await sleep(timings.pollMs);
         }
     }
-    // Poll the deployment until `done` says so; a failed or paused deployment ends the wait.
+    // Poll the deployment until `done` says so; a failed or paused deployment ends the wait. However it ends, the evidence records the TOTAL wait and the
+    // time of each PHASE TRANSITION the status reported (`timing:<label>`): recording only, it never changes what passes, fails or blocks.
     async function waitDeployment(evidence, label, { done, signal, deadlineMs, timeout = 'fail' }) {
         const started = Date.now(); let samples = 0; let last = null;
-        for (;;) {
-            if (signal?.aborted) throw Object.assign(new Error('The wait was aborted'), { aborted: true });
-            last = await toolOk(`status-${label}`, 'local_llm_status', {});
-            if (samples % 10 === 0) evidence.step(`status:${label}`, { phase: last.phase, download: last.deployment?.download ?? null, error: last.deployment?.error ?? null });
-            samples += 1;
-            if (done(last)) return last;
-            if (last.deployment?.phase === 'error') {
-                // An unreachable model source is a missing prerequisite of the host (BLOCKED); anything else is a failure.
-                if (sourceUnavailable(last.deployment.error)) throw blocked(`The model source is unavailable from this host: ${String(last.deployment.error).slice(0, 300)}`);
-                throw Object.assign(new Error(`The deployment failed: ${String(last.deployment.error).slice(0, 300)}`), { status: last });
+        const phases = []; let seen = null; let outcome = 'running';
+        const note = status => {
+            const key = `${status?.phase ?? ''}/${status?.deployment?.phase ?? ''}`;
+            if (key === seen || phases.length >= TIMING_PHASES_MAX) return;
+            seen = key;
+            phases.push({ phase: status?.phase ?? null, deploymentPhase: status?.deployment?.phase ?? null, atMs: Date.now() - started });
+        };
+        try {
+            for (;;) {
+                if (signal?.aborted) { outcome = 'aborted'; throw Object.assign(new Error('The wait was aborted'), { aborted: true }); }
+                last = await toolOk(`status-${label}`, 'local_llm_status', {});
+                note(last);
+                if (samples % 10 === 0) evidence.step(`status:${label}`, { phase: last.phase, download: last.deployment?.download ?? null, error: last.deployment?.error ?? null });
+                samples += 1;
+                if (done(last)) { outcome = 'done'; return last; }
+                if (last.deployment?.phase === 'error') {
+                    outcome = 'error';
+                    // An unreachable model source is a missing prerequisite of the host (BLOCKED); anything else is a failure.
+                    if (sourceUnavailable(last.deployment.error)) throw blocked(`The model source is unavailable from this host: ${String(last.deployment.error).slice(0, 300)}`);
+                    throw Object.assign(new Error(`The deployment failed: ${String(last.deployment.error).slice(0, 300)}`), { status: last });
+                }
+                if (last.deployment?.phase === 'paused') { outcome = 'paused'; throw blocked(`The deployment paused: ${String(last.deployment.pausedReason || last.deployment.error).slice(0, 300)}`); }
+                if (Date.now() - started > deadlineMs) {
+                    outcome = 'deadline';
+                    const message = `${label} did not finish within ${deadlineMs} ms (phase ${last.phase})`;
+                    throw timeout === 'blocked' ? blocked(message) : new Error(message);
+                }
+                await sleep(timings.pollMs);
             }
-            if (last.deployment?.phase === 'paused') throw blocked(`The deployment paused: ${String(last.deployment.pausedReason || last.deployment.error).slice(0, 300)}`);
-            if (Date.now() - started > deadlineMs) {
-                const message = `${label} did not finish within ${deadlineMs} ms (phase ${last.phase})`;
-                throw timeout === 'blocked' ? blocked(message) : new Error(message);
-            }
-            await sleep(timings.pollMs);
+        } finally {
+            evidence.put(`timing:${label}`, { totalMs: Date.now() - started, deadlineMs, samples, outcome, phases });
         }
     }
     const requestId = tag => `hwl${run.runId.slice(0, 16)}${tag}${Date.now().toString(36)}`.slice(0, 64);

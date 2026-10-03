@@ -1051,7 +1051,7 @@ test('G2.prepare-live-apparatus-vllm-stage-one-pins-the-lock-entry-and-asks-for-
     assert.deepEqual(profile.cases, ['LIVE-L3']); assert.equal(profile.llm.vllm.stage, 'calibration'); assert.equal(profile.llm.vllm.calibration, null);
     assert.deepEqual(profile.llm.vllm.pins, VLLM_PINS); assert.deepEqual(profile.llm.vllm.share, VLLM_SHARE);
     // The vLLM install is bounded by throughput: a hard cap of 3.5 h and a 10-minute stall window, inside a block deadline that holds them.
-    assert.equal(run.deadlines.blockMs, 15_300_000); assert.equal(run.deadlines.installMs, 3.5 * 60 * 60 * 1000); assert.equal(run.deadlines.installStallMs, 10 * 60 * 1000);
+    assert.equal(run.deadlines.blockMs, 16_200_000); assert.equal(run.deadlines.installMs, 3.5 * 60 * 60 * 1000); assert.equal(run.deadlines.installStallMs, 10 * 60 * 1000);
     const ids = run.target.plan.live.map(entry => entry.id);
     for (const id of ['L3-step0-prerequisites', 'L3-apply', 'L3-install', 'L3-stage1-calibrate']) assert.ok(ids.includes(id), id);
     assert.ok(!ids.includes('L3-run'), 'stage 1 launches no model');
@@ -1842,10 +1842,10 @@ test('L3B.the-vllm-block-states-its-cap-its-stall-window-and-a-block-deadline-th
     const f = prepareLlmFixture(t);
     const { code, runPath, run } = await prepare(f, 'apparatus-vllm', 'l3b', f.pins({ image: LLM_IMAGE, vllm: VLLM_PINS }));
     assert.equal(code, 0);
-    assert.deepEqual([run.deadlines.installMs, run.deadlines.installStallMs, run.deadlines.blockMs], [12_600_000, 600_000, 15_300_000]);
+    assert.deepEqual([run.deadlines.installMs, run.deadlines.installStallMs, run.deadlines.blockMs], [12_600_000, 600_000, 16_200_000]);
     const summary = fs.readFileSync(summaryPathFor(runPath, 'claude'), 'utf8');
     assert.match(summary, /hard cap of 12600000 ms \(3\.5 h\) and is BLOCKED when its download shows no progress for 600000 ms \(10 min\)/);
-    assert.match(summary, /the whole block has 15300000 ms \(4\.25 h\)/); assert.match(summary, /throughput samples \(bytes and time\) are recorded/);
+    assert.match(summary, /the whole block has 16200000 ms \(4\.50 h\)/); assert.match(summary, /throughput samples \(bytes and time\) are recorded/);
 });
 
 // --- R18-1: the stall window covers the download only; the build after it is bounded by the hard cap -----------------------------------
@@ -1924,7 +1924,7 @@ test('R18-2.the-operator-summary-states-the-sample-limit', async t => {
     assert.equal(code, 0);
     const summary = fs.readFileSync(summaryPathFor(runPath, 'claude'), 'utf8');
     assert.match(summary, /at most 600 plus the first and the last download sample are kept \(the first 300 and the newest 300 samples\), and the throughput spans the whole download/);
-    assert.match(summary, /the whole block has 15300000 ms \(4\.25 h\)/);
+    assert.match(summary, /the whole block has 16200000 ms \(4\.50 h\)/);
 });
 
 // --- R19: the first and the last download sample are kept even when neither falls inside the first 300 or the newest 300 samples -------
@@ -1952,4 +1952,47 @@ test('R19.the-first-and-last-download-samples-are-kept-outside-the-head-and-the-
     assert.equal(newest.includes(last), false);
     assert.equal(throughput.bytesPerSecond, Math.round((total - first.bytes) / ((last.atMs - first.atMs) / 1000)), 'the throughput spans first to last download sample');
     nothingOwned(w);
+});
+
+// --- L3LOAD (D-L3-LOAD-01): the model-load wait of stage 2 -------------------------------------------------------------
+test('L3LOAD.the-vllm-model-load-is-thirty-minutes-and-the-block-is-the-runner-maximum-and-the-summary-renders-both', async t => {
+    // A fresh 2.68 GB snapshot at about 7.8 MB/s takes about 5.7 minutes before vLLM loads: the load had 8 minutes. Nothing else of VLLM_DEADLINES moved.
+    assert.equal(VLLM_DEADLINES.modelLoadMs, 1_800_000); assert.equal(VLLM_DEADLINES.blockMs, 16_200_000);
+    assert.deepEqual([VLLM_DEADLINES.installMs, VLLM_DEADLINES.installStallMs, VLLM_DEADLINES.cleanupMs, VLLM_DEADLINES.fullGraphMs], [12_600_000, 600_000, 300_000, 1_200_000]);
+    const f = prepareLlmFixture(t);
+    const { code, runPath, run } = await prepare(f, 'apparatus-vllm', 'l3load', f.pins({ image: LLM_IMAGE, vllm: VLLM_PINS }));
+    assert.equal(code, 0);
+    assert.deepEqual([run.deadlines.modelLoadMs, run.deadlines.blockMs], [1_800_000, 16_200_000]);
+    const summary = fs.readFileSync(summaryPathFor(runPath, 'claude'), 'utf8');
+    assert.match(summary, /model load within 1800000 ms; the whole block has 16200000 ms \(4\.50 h\)/);
+});
+
+test('L3LOAD.a-load-within-the-deadline-continues-and-records-each-phase-transition-and-the-total-wait', async t => {
+    const w = await provisioned(t, { block: 'apparatus-vllm', vllm: stageTwo(true), qualified: true, faults: { readyAfter: 4 } });
+    const report = await liveCases(w, ['LIVE-L3']);
+    const entry = caseOf(report, 'LIVE-L3');
+    assert.equal(entry.result, 'pass', JSON.stringify(entry).slice(0, 500));
+    const timing = w.artifacts.get('gpu-live-l3')['timing:l3-ready'];
+    assert.ok(timing, 'the readiness wait records its timing');
+    assert.equal(timing.outcome, 'done'); assert.equal(timing.deadlineMs, w.run.deadlines.modelLoadMs); assert.ok(timing.samples >= 4);
+    // Every transition the status reported, once, in order, from the first poll; the last is ready; the total spans them.
+    assert.ok(timing.phases.length >= 2, JSON.stringify(timing.phases));
+    assert.deepEqual(timing.phases.map(phase => phase.atMs), [...timing.phases.map(phase => phase.atMs)].sort((a, b) => a - b));
+    assert.equal(timing.phases.at(-1).phase, 'ready'); assert.ok(timing.phases.some(phase => phase.phase === 'loading'));
+    assert.equal(new Set(timing.phases.map(phase => `${phase.phase}/${phase.deploymentPhase}`)).size, timing.phases.length, 'a phase is recorded when it changes, not at every poll');
+    assert.ok(Number.isInteger(timing.totalMs) && timing.totalMs >= timing.phases.at(-1).atMs);
+});
+
+test('L3LOAD.a-load-past-the-deadline-is-blocked-never-failed-and-a-failed-load-is-a-failure-and-both-record-their-timing', async t => {
+    const slow = await provisioned(t, { block: 'apparatus-vllm', vllm: stageTwo(true), qualified: true, faults: { stalled: true } });
+    slow.run.deadlines.modelLoadMs = 60;
+    const blockedEntry = caseOf(await liveCases(slow, ['LIVE-L3']), 'LIVE-L3');
+    assert.equal(blockedEntry.result, 'blocked', JSON.stringify(blockedEntry).slice(0, 400)); assert.match(blockedEntry.reason, /l3-ready did not finish within 60 ms/);
+    const late = slow.artifacts.get('gpu-live-l3')['timing:l3-ready'];
+    assert.equal(late.outcome, 'deadline'); assert.ok(late.totalMs >= 60); assert.ok(late.phases.length >= 1);
+    const failing = await provisioned(t, { block: 'apparatus-vllm', vllm: stageTwo(true), qualified: true, faults: { loadFails: true } });
+    const failedEntry = caseOf(await liveCases(failing, ['LIVE-L3']), 'LIVE-L3');
+    assert.equal(failedEntry.result, 'fail', JSON.stringify(failedEntry).slice(0, 400));
+    const failed = failing.artifacts.get('gpu-live-l3')['timing:l3-ready'];
+    assert.equal(failed.outcome, 'error'); assert.equal(failed.phases.at(-1).deploymentPhase, 'error');
 });

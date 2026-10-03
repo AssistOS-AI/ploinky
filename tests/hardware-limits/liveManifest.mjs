@@ -106,10 +106,12 @@ export const AVAILABILITY_DEADLINES = Object.freeze({ ...DEADLINES, blockMs: 60 
 export const STORE_DEADLINES = Object.freeze({ ...DEADLINES, blockMs: 30 * 60 * 1000 });
 // The vLLM install is bounded by throughput, not by a short clock: a hard cap of 3.5 h for the pinned 3.88 GB wheel set (the product
 // measured about 0.4 MB/s, a raw PyPI probe 1.5 to 2 MB/s) and a stall window: BLOCKED when the download shows no progress for 10 minutes.
-// The block deadline holds the cap, the prerequisites, the calibration, the model load and a margin.
+// The block deadline holds the cap, the prerequisites, the calibration, the model load and a margin. The model load is 30 minutes (it was 8): a
+// fresh 2.68 GB snapshot at the observed rate of about 7.8 MB/s from Hugging Face takes about 5.7 minutes before vLLM even starts to load it. The
+// block deadline is the runner's own maximum, 16,200,000 ms (4.5 h): the install cap, the load and a margin for step 0, the calibration and the stage.
 export const VLLM_INSTALL_CAP_MS = 3.5 * 60 * 60 * 1000;
 export const VLLM_INSTALL_STALL_MS = 10 * 60 * 1000;
-export const VLLM_DEADLINES = Object.freeze({ ...GPU_DEADLINES, blockMs: 15_300_000, installMs: VLLM_INSTALL_CAP_MS, installStallMs: VLLM_INSTALL_STALL_MS, modelLoadMs: 8 * 60 * 1000 });
+export const VLLM_DEADLINES = Object.freeze({ ...GPU_DEADLINES, blockMs: 16_200_000, installMs: VLLM_INSTALL_CAP_MS, installStallMs: VLLM_INSTALL_STALL_MS, modelLoadMs: 30 * 60 * 1000 });
 const HASH = /^sha256:[a-f0-9]{64}$/;
 const SAFE = /^\/[A-Za-z0-9/_.-]+$/;
 const canonicalFile = file => path.isAbsolute(file) && fs.realpathSync(file) === file && fs.statSync(file).isFile();
