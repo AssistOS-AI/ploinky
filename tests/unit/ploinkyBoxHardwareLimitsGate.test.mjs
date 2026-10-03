@@ -1459,7 +1459,7 @@ test('G.status-mps-defaults-line-states-only-the-configured-default', () => {
 // R20-1: the selected gate is a journal item of the graph admission. Master's rule (update/admission.mjs): every candidate
 // write happens inside the error boundary and nothing after settlement can trigger a restoration.
 const FIXED_PRIOR = '2026-01-02T03:04:05.000Z';
-function gateAdmissionWorld(t, { action, failWrite = false, failFinalize = null, priorGate = null, events = [] }) {
+function gateAdmissionWorld(t, { action, failWrite = false, failFinalize = null, priorGate = null, events = [], env = { PLOINKY_BOX_HARDWARE_LIMITS: 'on' }, stderrLines = [] }) {
     const state = fixture(t);
     const previousHome = process.env.HOME;
     process.env.HOME = state.home;
@@ -1483,7 +1483,7 @@ function gateAdmissionWorld(t, { action, failWrite = false, failFinalize = null,
         restore: (identity, previous, lock) => { events.push('gate-restore'); return state.gateStore.restore(identity, previous, lock); },
     });
     const supervisor = createBoxSupervisor({
-        env: { PLOINKY_BOX_HARDWARE_LIMITS: 'on' },
+        env,
         resolveIdentity: () => state.identity,
         launchCwd: state.identity.workspaceRoot,
         lockManager: fakeLockManager(state.root, events),
@@ -1523,14 +1523,15 @@ function gateAdmissionWorld(t, { action, failWrite = false, failFinalize = null,
         hardwareGateStore: gate,
         prepareHardwareGeneration: async () => ({ structurallyPrepared: true }),
         stdout: { write() { return true; } },
-        stderr: { write() { return true; } },
+        stderr: { write(text) { stderrLines.push(String(text).trim()); return true; } },
     });
     const invoke = {
         start: () => supervisor.runStartTransaction(['start', 'explorer', '8080']),
         restart: () => supervisor.runRestartTransaction(['restart']),
         update: () => supervisor.runUpdateTransaction(['update'], { restartAfterUpdate: true }),
+        targetedUpdate: () => supervisor.runUpdateTransaction(['update', 'repos']),
     };
-    return { state, events, invoke };
+    return { state, events, invoke, supervisor };
 }
 
 for (const operation of ['start', 'restart', 'update']) {
@@ -1615,4 +1616,109 @@ test('G.gate-store-clear-and-restore-are-lock-checked-and-exact', (t) => {
     fs.mkdirSync(record);
     assert.throws(() => state.gateStore.clear(state.identity, lock), /non-regular hardware-limits gate path/);
     assert.equal(fs.existsSync(record), true);
+});
+
+// ---------------------------------------------------------------------------
+// R20-3: the repository forms of `ploinky update` follow the saved gate, so a request for another gate is refused BEFORE any
+// mutation instead of being checked and then ignored. Only the full form applies it.
+const GATE_VARIABLE = 'PLOINKY_BOX_HARDWARE_LIMITS';
+const NOT_APPLIED = /would change the saved hardware-limits gate \((on|off)\), but a targeted update never replaces the Box, so it cannot apply it\. No change was made\./;
+
+test('G.targeted-update-selection-refuses-another-gate-and-notes-a-matching-one', (t) => {
+    const state = fixture(t);
+    const select = (env, operation) => selectHardwareGate({ identity: state.identity, gateStore: state.gateStore, env, operation });
+    // Saved off (or never set): a request for on cannot be applied by a targeted update.
+    for (const saved of [null, false]) {
+        if (saved === false) state.gateStore.write(state.identity, false, lockFor(state.identity));
+        assert.throws(() => select({ [GATE_VARIABLE]: 'on' }, 'targeted-update'), (error) => error.code === 'PLOINKY_BOX_HARDWARE_GATE_NOT_APPLIED' && NOT_APPLIED.test(error.message) && /\(off\)/.test(error.message));
+        // The full form applies it.
+        assert.equal(select({ [GATE_VARIABLE]: 'on' }, 'update').enabled, true);
+        assert.equal(select({ [GATE_VARIABLE]: 'on' }, 'update').source, 'environment');
+        // The same request, or none, keeps the saved gate; the matching request is acknowledged, never reported as ignored.
+        const same = select({ [GATE_VARIABLE]: 'off' }, 'targeted-update');
+        assert.deepEqual({ enabled: same.enabled, persist: same.persist, changed: same.changed }, { enabled: false, persist: false, changed: false });
+        assert.equal(same.note, `${GATE_VARIABLE}=off matches the saved gate; a targeted update follows the saved gate`);
+        assert.doesNotMatch(same.note, /only start, restart and update apply it/);
+        assert.equal(select({}, 'targeted-update').note, null);
+    }
+    // Saved on: a request for off is refused (the saved gate stays on), a matching on is acknowledged.
+    state.gateStore.write(state.identity, true, lockFor(state.identity));
+    assert.throws(() => select({ [GATE_VARIABLE]: 'off' }, 'targeted-update'), (error) => error.code === 'PLOINKY_BOX_HARDWARE_GATE_NOT_APPLIED' && /\(on\)/.test(error.message));
+    assert.equal(select({ [GATE_VARIABLE]: '1' }, 'targeted-update').note, `${GATE_VARIABLE}=on matches the saved gate; a targeted update follows the saved gate`);
+    // An invalid value fails like every other operation.
+    assert.throws(() => select({ [GATE_VARIABLE]: 'maybe' }, 'targeted-update'), { code: 'PLOINKY_BOX_HARDWARE_GATE_INVALID' });
+    // Other non-applying operations are unchanged: the generic note, no refusal.
+    assert.match(select({ [GATE_VARIABLE]: 'off' }, 'saved').note, /only start, restart and update apply it/);
+});
+
+test('G.targeted-update-preflight-and-host-command-refuse-before-the-host-source-update', async (t) => {
+    for (const form of [['update', 'repos'], ['update', 'repo', 'demo']]) {
+        for (const [label, setup, value, code] of [
+            ['on against a saved-off gate', (state) => state.gateStore.write(state.identity, false, lockFor(state.identity)), 'on', 'PLOINKY_BOX_HARDWARE_GATE_NOT_APPLIED'],
+            ['on against no saved gate', () => {}, 'on', 'PLOINKY_BOX_HARDWARE_GATE_NOT_APPLIED'],
+            // The change would not happen, so the stored-limits refusal (U9) of a downgrade must not be raised for it.
+            ['off against a saved-on gate with stored limits', (state) => { state.gateStore.write(state.identity, true, lockFor(state.identity)); storeWithEntry(state); }, 'off', 'PLOINKY_BOX_HARDWARE_GATE_NOT_APPLIED'],
+        ]) {
+            const state = fixture(t);
+            setup(state);
+            const before = fs.existsSync(storePaths(state).policyPath) ? fs.readFileSync(storePaths(state).policyPath, 'utf8') : null;
+            const savedBefore = state.gateStore.read(state.identity);
+            const env = { [GATE_VARIABLE]: value };
+            const events = [];
+            const hostUpdates = [];
+            await assert.rejects(runOuterCli(form, {
+                env, input: {}, output: sink(), errorOutput: sink(), cwd: () => state.identity.workspaceRoot,
+                supervisor: realSupervisor(state, { env, events }), detectInsideBox: () => false,
+                updateHostSource: async (options) => { hostUpdates.push(options); return { updated: true }; },
+                relaunch: () => { hostUpdates.push('relaunch'); return 0; },
+            }), (error) => error.code === code && NOT_APPLIED.test(error.message), `${form.join(' ')} / ${label}`);
+            assert.deepEqual(hostUpdates, [], `${form.join(' ')} / ${label}: the host source was never updated or relaunched`);
+            assert.equal(events.includes('reconcile'), false, `${form.join(' ')} / ${label}: no Box mutation`);
+            assert.equal(events.includes('lock'), false, `${form.join(' ')} / ${label}: refused by the lock-free preflight, before the workspace lock is taken`);
+            assert.deepEqual(state.gateStore.read(state.identity), savedBefore, `${label}: the saved gate is untouched`);
+            if (before !== null) assert.equal(fs.readFileSync(storePaths(state).policyPath, 'utf8'), before, `${label}: the store is untouched`);
+        }
+    }
+    // The full form is unchanged: it applies the request, and its downgrade is still refused with stored limits.
+    const full = fixture(t);
+    assert.deepEqual(realSupervisor(full, { env: { [GATE_VARIABLE]: 'on' } }).preflightHardwareGate('update'), { enabled: true, source: 'environment' });
+    const stored = fixture(t);
+    stored.gateStore.write(stored.identity, true, lockFor(stored.identity));
+    storeWithEntry(stored);
+    assert.throws(() => realSupervisor(stored, { env: { [GATE_VARIABLE]: 'off' } }).preflightHardwareGate('update'), { code: 'PLOINKY_BOX_HARDWARE_LIMITS_STORED' });
+    // Through the host command: the full form still applies the request (its preflight passes and the host source update is reached);
+    // only the repository forms refuse it.
+    const hostFull = fixture(t);
+    const fullEvents = [];
+    const fullHostUpdates = [];
+    const fullEnv = { [GATE_VARIABLE]: 'on' };
+    const fullError = await runOuterCli(['update'], {
+        env: fullEnv, input: {}, output: sink(), errorOutput: sink(), cwd: () => hostFull.identity.workspaceRoot,
+        supervisor: realSupervisor(hostFull, { env: fullEnv, events: fullEvents }), detectInsideBox: () => false,
+        updateHostSource: async (options) => { fullHostUpdates.push(options); return { updated: false }; },
+        relaunch: () => 0,
+    }).then(() => null, (failure) => failure);
+    assert.notEqual(fullError?.code, 'PLOINKY_BOX_HARDWARE_GATE_NOT_APPLIED', String(fullError?.message));
+    assert.equal(fullHostUpdates.length, 1, 'the full form passed its preflight and reached the host source update');
+    // The matching request passes the targeted preflight and reports the saved gate.
+    stored.gateStore.write(stored.identity, true, lockFor(stored.identity));
+    assert.deepEqual(realSupervisor(stored, { env: { [GATE_VARIABLE]: 'on' } }).preflightHardwareGate('targeted-update'), { enabled: true, source: 'saved' });
+});
+
+test('G.targeted-update-transaction-refuses-another-gate-under-the-lock-before-any-mutation', async (t) => {
+    for (const [label, priorGate, value] of [['on against saved-off', false, 'on'], ['off against saved-on', true, 'off'], ['on against no saved gate', null, 'on']]) {
+        const events = [];
+        const world = gateAdmissionWorld(t, { action: 'reused', priorGate, events, env: { [GATE_VARIABLE]: value } });
+        const error = await world.invoke.targetedUpdate().then(() => null, (failure) => failure);
+        assert.equal(error?.code, 'PLOINKY_BOX_HARDWARE_GATE_NOT_APPLIED', `${label}: ${error?.message}`);
+        assert.equal(events.some((event) => ['finalize', 'gate-write', 'start-core'].includes(event) || event.startsWith('rollback')), false, `${label}: nothing mutated: ${events}`);
+        assert.equal(world.state.gateStore.read(world.state.identity)?.enabled ?? null, priorGate, `${label}: the saved gate is untouched`);
+    }
+    // A matching request runs the update with the saved gate, says so, and never claims it was ignored or applied.
+    const stderrLines = [];
+    const world = gateAdmissionWorld(t, { action: 'reused', priorGate: true, env: { [GATE_VARIABLE]: 'on' }, stderrLines });
+    await world.invoke.targetedUpdate();
+    assert.ok(stderrLines.some((line) => line.includes(`${GATE_VARIABLE}=on matches the saved gate; a targeted update follows the saved gate`)), stderrLines.join('|'));
+    assert.equal(stderrLines.some((line) => /only start, restart and update apply it/.test(line)), false, stderrLines.join('|'));
+    assert.equal(world.events.includes('gate-write'), false, 'a targeted update never rewrites the gate');
 });

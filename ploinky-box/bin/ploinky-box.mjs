@@ -33,7 +33,7 @@ import {
 } from '../supervisor.mjs';
 import { isInsideBox } from '../lib/boxMarker.mjs';
 import { parseBranchPolicy, stripBranchPolicyArgs } from '../../agentlib/branchPolicy.mjs';
-import { formatLimitsStatus } from '../hardwareLimitsGate.mjs';
+import { TARGETED_UPDATE_OPERATION, formatLimitsStatus } from '../hardwareLimitsGate.mjs';
 
 function formatLimitsClearResult(result) {
     if (result.absent) return 'No hardware limits are stored for this workspace; nothing was changed.\n';
@@ -634,9 +634,11 @@ async function runHostUpdate({
 }) {
     const identity = supervisor.resolveWorkspaceIdentity();
     // The hardware gate is parsed and the stored-limits (U9) check runs before
-    // any mutation, including the host source update and the relaunch.
+    // any mutation, including the host source update and the relaunch. Only the
+    // full form applies a requested gate; the repository forms follow the saved
+    // gate and refuse a request for another one.
     if (typeof supervisor.preflightHardwareGate === 'function') {
-        await supervisor.preflightHardwareGate('update');
+        await supervisor.preflightHardwareGate(route.request?.kind === 'all' ? 'update' : TARGETED_UPDATE_OPERATION);
     }
     const request = withDefaultUpdateFolder(route.request, cwd(), identity.workspaceRoot);
     let scope = null;

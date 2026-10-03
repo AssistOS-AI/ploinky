@@ -351,6 +351,9 @@ export function buildRequiredCaseManifest() {
             'G.gate-write-failure-never-reaches-a-rollback-after-settlement-update',
             'G.gate-is-restored-to-its-exact-prior-record-only-while-it-is-this-transactions-candidate-update',
             'G.gate-store-clear-and-restore-are-lock-checked-and-exact',
+            'G.targeted-update-selection-refuses-another-gate-and-notes-a-matching-one',
+            'G.targeted-update-preflight-and-host-command-refuse-before-the-host-source-update',
+            'G.targeted-update-transaction-refuses-another-gate-under-the-lock-before-any-mutation',
         ]),
         ...leaves(P, 'p1', unit('ploinkyBoxGpuGrant.test.mjs'), ['G.every-final-generation-gpu']),
         ...leaves(P, 'p1', unit('hardwareLimitsReconcilePredecessor.test.mjs'), [

@@ -98,6 +98,7 @@ import {
     runLimitsClear,
     selectHardwareGate,
     HARDWARE_GATE_ENV,
+    TARGETED_UPDATE_OPERATION,
 } from './hardwareLimitsGate.mjs';
 import {
     assertGateOffStoreEmpty,
@@ -2082,7 +2083,7 @@ export function createBoxSupervisor({
             // The update-recovery barrier comes first, then the hardware-limits gate. The full form applies the gate request and
             // settles a pending or requested gate-on to gate-off transition (it reconciles the Box); the targeted forms never
             // replace a Box, so they follow the saved gate and refuse while a downgrade is pending.
-            const hardwareGate = selectHardwareGateForOperation(identity, plan.request.kind === 'all' ? 'update' : 'saved', lock);
+            const hardwareGate = selectHardwareGateForOperation(identity, plan.request.kind === 'all' ? 'update' : TARGETED_UPDATE_OPERATION, lock);
             if (plan.request.kind === 'all') ownership = await settleHardwareTransitions(identity, lock, ownership, hardwareGate, 'update');
             else assertNoPendingHardwareTransition(identity, 'update');
             const scope = lockedUpdateScope(identity, plan);

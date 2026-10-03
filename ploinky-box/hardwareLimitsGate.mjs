@@ -36,6 +36,8 @@ import { createTransitionStore, downgradeRecoveryAdvice } from './hardwareLimits
 
 export const HARDWARE_GATE_ENV = 'PLOINKY_BOX_HARDWARE_LIMITS';
 export const GATE_APPLYING_OPERATIONS = Object.freeze(['start', 'restart', 'update']);
+// The repository forms of `ploinky update`: they follow the saved gate and never apply a request for another one.
+export const TARGETED_UPDATE_OPERATION = 'targeted-update';
 const GATE_RECORD_KEYS = ['enabled', 'savedAt', 'schema'];
 const MAX_GATE_BYTES = 1024;
 const STATE_FILES = Object.freeze({
@@ -149,6 +151,24 @@ export function selectHardwareGate({ identity, gateStore, env = process.env, ope
     const requested = parseHardwareGateValue(env?.[HARDWARE_GATE_ENV]);
     const saved = gateStore.read(identity);
     const savedEnabled = saved?.enabled === true;
+    if (operation === TARGETED_UPDATE_OPERATION && requested !== undefined) {
+        // A targeted update never replaces the Box, so it follows the saved gate and cannot apply a different request. A request
+        // for another gate is refused before anything is changed rather than checked and then ignored.
+        if (requested !== savedEnabled) {
+            throw gateError(`${HARDWARE_GATE_ENV}=${requested ? 'on' : 'off'} would change the saved hardware-limits gate (${savedEnabled ? 'on' : 'off'}), `
+                + 'but a targeted update never replaces the Box, so it cannot apply it. No change was made. '
+                + `Run the full \`ploinky update\` (or \`ploinky restart\`) to apply the gate, or unset ${HARDWARE_GATE_ENV} to run this update with the saved gate.`,
+            'PLOINKY_BOX_HARDWARE_GATE_NOT_APPLIED');
+        }
+        return Object.freeze({
+            enabled: savedEnabled,
+            saved,
+            source: saved ? 'saved' : 'default',
+            persist: false,
+            changed: false,
+            note: `${HARDWARE_GATE_ENV}=${requested ? 'on' : 'off'} matches the saved gate; a targeted update follows the saved gate`,
+        });
+    }
     if (requested !== undefined && GATE_APPLYING_OPERATIONS.includes(operation)) {
         return Object.freeze({
             enabled: requested,
