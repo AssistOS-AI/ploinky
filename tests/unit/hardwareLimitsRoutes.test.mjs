@@ -570,3 +570,18 @@ test('T5.a-reconcile-whose-engine-read-failed-is-not-fresh-keeps-the-last-runtim
     assert.equal(monitor.latest.runtimes[0].state.running, true);
     assert.notEqual(statusNow().availability, 'stopped', 'a running container is never read as stopped');
 });
+
+// T7: the wait bound is one named constant that fits a slow nested Box.
+const { POST_APPLY_STATUS_WAIT_MS } = await import('../../cli/server/workspaceMetrics.js');
+test('T7.the-post-apply-wait-is-the-named-ten-second-constant-and-a-six-second-reconcile-within-it-is-fresh', async (t) => {
+    assert.equal(POST_APPLY_STATUS_WAIT_MS, 10_000);
+    const route = fs.readFileSync(new URL('../../cli/server/authHandlers/hardwareLimitsRoutes.mjs', import.meta.url), 'utf8');
+    assert.match(route, /reconcileAfter\(since\)/, 'the route uses the default bound, which is the constant');
+    const f = fixture(t);
+    const record = { ...f.registry.canonical, containerId: NEW_ID };
+    const monitor = new Monitor({ readRegistry: () => ({ canonical: record }), collectContainers: () => new Promise((resolve) => setTimeout(() => resolve([]), 6_000)), runtimeStateOptions: { activeGeneration: null, routes: {} }, readHardwareContext: () => ({ gate: 'off' }), readRouting: () => ({ routes: {} }), containerStats: false });
+    const t0 = Date.now();
+    const result = await monitor.reconcileAfter(Date.now() - 5);     // the default bound; the Apply ended a few ms ago
+    assert.equal(result.fresh, true);
+    assert.ok(Date.now() - t0 >= 5_900 && Date.now() - t0 < 8_000, `waited for the slow reconcile (${Date.now() - t0} ms)`);
+});

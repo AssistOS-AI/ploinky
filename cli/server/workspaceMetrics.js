@@ -14,7 +14,9 @@ import { readRoutingConfig } from './routingFile.js';
 import { metricHardwareAvailability } from './workspaceMetricsAvailability.mjs';
 
 const RECONCILE_INTERVAL_MS = 5_000;
-export const POST_APPLY_STATUS_WAIT_MS = 4_000;
+// How long a successful Apply waits for a metrics reconcile that started after it: the reconcile re-inspects every running container in
+// sequence, each with a 5 s limit (workspaceMetricsLimits.mjs), so a nested Box can need several seconds.
+export const POST_APPLY_STATUS_WAIT_MS = 10_000;
 export const RECONCILE_FAILURE_BACKOFF_MS = 250;
 const SAMPLE_INTERVAL_MS = 2_000;
 const execFileAsync = promisify(execFile);
