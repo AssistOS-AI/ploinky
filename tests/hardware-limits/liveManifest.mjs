@@ -692,7 +692,8 @@ export function renderSummary(run, manifestPath) {
         `| Host ports | TCP ${run.ports.tcp} (Router, loopback), UDP ${run.ports.udp} (media); a collision aborts |`,
         `| Box image | \`${plan.boxImage}\` |`,
         `| Fixture image | \`${plan.image}\` |`,
-        ...plan.agents.map(agent => (agent.hardwareLimits ? `| Fixture agent ${FIXTURE_REPOSITORY}/${agent.name} | hardwareLimits memory ${agent.hardwareLimits.memory}, cpus ${agent.hardwareLimits.cpus}, pids ${agent.hardwareLimits.pidsLimit}, readiness none |` : `| Agent ${LLM_REF} | the local-llm candidate's own manifest, which declares no limits; the administrator's Apply sets them |`)),
+        ...plan.agents.map(agent => (agent.hardwareLimits ? `| Fixture agent ${FIXTURE_REPOSITORY}/${agent.name} | hardwareLimits memory ${agent.hardwareLimits.memory}, cpus ${agent.hardwareLimits.cpus}, pids ${agent.hardwareLimits.pidsLimit}, readiness none |` : agent.role === 'llm' ? `| Agent ${LLM_REF} | the local-llm candidate's own manifest, which declares no limits; the administrator's Apply sets them |`
+            : `| Fixture agent ${FIXTURE_REPOSITORY}/${agent.name} | declares no hardware limits of its own (readiness none); the stored override the live case saves through the administrator route is its only request |`)),
         `| Deadlines | core ${run.deadlines.coreMs} ms, start ${run.deadlines.startMs} ms, destroy ${run.deadlines.destroyMs} ms, cleanup ${run.deadlines.cleanupMs} ms${remote ? `, staging ${run.deadlines.stagingMs} ms` : ''} |`,
         '',
         '## Commands',

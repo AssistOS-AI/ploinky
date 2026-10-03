@@ -648,6 +648,7 @@ export function buildRequiredCaseManifest() {
             'X5.c5-fails-when-the-store-is-not-what-each-step-requires',
             'X5.c5-fails-when-the-barrier-survives-its-removal-or-the-host-ignores-it-or-the-store-moves-under-it',
             'X5.c5-fails-when-a-second-recovery-does-not-preserve-its-lock-and-when-the-live-host-holder-does-not-release',
+            'X5.the-approval-summary-lists-the-fixture-agents-that-declare-no-limits-and-names-no-local-llm-agent',
         ]),
         ...leaves(P, 'p4', unit('hardwareLimitsLiveAvailability.test.mjs'), [
             'X4.c3-blocks-fixtures-and-pins-are-wired-and-the-dedicated-workspace-has-its-own-ports',

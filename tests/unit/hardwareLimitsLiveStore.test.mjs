@@ -527,3 +527,13 @@ test('X5.c5-fails-when-a-second-recovery-does-not-preserve-its-lock-and-when-the
     await failsWith(t, { deleteQuarantineFrom: 11 }, /The abandoned host lock was not preserved as a quarantined lock/);
     await failsWith(t, { mutateProgram: (domain, mode, lines, count) => (domain === 'host' && mode === 'hold' && count === 2 ? lines.slice(0, 1) : lines) }, /The live host holder: the holder did not release its own lock/);
 });
+
+// A fixture agent that declares no limits is listed as that fixture agent; the local-llm blocks keep their own row (tests/unit/hardwareLimitsLiveLlm.test.mjs).
+test('X5.the-approval-summary-lists-the-fixture-agents-that-declare-no-limits-and-names-no-local-llm-agent', t => {
+    for (const [block, agents] of [[BLOCK, ['s']], ['apparatus-availability', ['a', 'b', 'c', 'x']], ['apparatus-router-controls', ['s']]]) {
+        const w = world(t, { block, ...(block === 'apparatus-router-controls' ? { ports: { tcp: 18090, udp: 17892 } } : {}) });
+        const summary = renderSummary(w.run, w.runPath);
+        for (const name of agents) assert.ok(summary.includes(`| Fixture agent hwlfixture/${name} | declares no hardware limits of its own`), `${block}: ${name}`);
+        assert.equal(summary.includes('| Agent local-llms/local-llm |'), false, `${block} names no local-llm agent`);
+    }
+});
