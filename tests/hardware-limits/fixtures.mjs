@@ -594,6 +594,9 @@ export function buildRequiredCaseManifest() {
             'X4.c6-the-program-fails-closed-without-a-registry-record-an-unplaced-helper-or-a-failed-probe',
             'X4.c6-the-executor-runs-the-real-and-the-delayed-probe-persists-both-and-passes-only-when-every-condition-holds',
             'X4.c6-manifest-and-summary-show-the-program-the-bounds-and-the-guard-and-every-candidate-argv-is-accepted',
+            'R21.provision-saves-the-box-labels-image-privileges-and-publications-as-artifacts-in-every-block',
+            'R21.a-box-contract-query-that-fails-is-recorded-as-a-limitation-and-never-fails-provisioning',
+            'R21.the-box-contract-observation-is-planned-shown-and-uses-parser-clean-read-only-argv',
         ]),
         ...leaves(P, 'p4', unit('hardwareLimitsLiveGpu.test.mjs'), [
             'G1.gate-initial-idle-records-uuid-mode-and-memory',

@@ -117,6 +117,10 @@ export const INSPECT = '{"id":{{json .ID}},"created":{{json .Created}},"image":{
 // Nested fixture agents additionally report their name and the image
 // reference they were created from.
 export const AGENT_INSPECT = INSPECT.replace('{"id":', '{"name":{{json .Name}},"imageName":{{json .ImageName}},"id":');
+// The owned Box's privilege and publication contract, evidence only (never an identity check): its labels and image, whether it is
+// privileged, its added and dropped capabilities, security options, init, network and user-namespace modes, devices and configured
+// publications. Every HostConfig field here is one the engine's own inspect reports; a failing query is recorded, not a provisioning failure.
+export const BOX_CONTRACT_INSPECT = '{"id":{{json .ID}},"image":{{json .Image}},"labels":{{json .Config.Labels}},"privileged":{{json .HostConfig.Privileged}},"capAdd":{{json .HostConfig.CapAdd}},"capDrop":{{json .HostConfig.CapDrop}},"securityOpt":{{json .HostConfig.SecurityOpt}},"init":{{json .HostConfig.Init}},"networkMode":{{json .HostConfig.NetworkMode}},"usernsMode":{{json .HostConfig.UsernsMode}},"devices":{{json .HostConfig.Devices}},"publications":{{json .HostConfig.PortBindings}}}';
 
 // Evidence-only nested container query. Its State fields (Status, FinishedAt,
 // ExitCode, OOMKilled) are Podman's Go struct names but have not yet been

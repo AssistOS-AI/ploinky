@@ -9,7 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { WANTED_CONTROLLERS } from '../../ploinky-box/entrypoint/cgroupDelegation.mjs';
-import { ENGINE_CONNECTIONS_ARGV, ENGINE_INFO_ARGV, HOST_RECORD_DIRECTORIES, IMAGE_REF, OWNER_MARKER, UNIX_SOCKET_PATH_LIMIT, WORKSPACE_SOCKET_NAME, digest, keys, liveSourceDigest, AGENT_INSPECT, INSPECT } from './liveCommon.mjs';
+import { ENGINE_CONNECTIONS_ARGV, ENGINE_INFO_ARGV, HOST_RECORD_DIRECTORIES, IMAGE_REF, OWNER_MARKER, UNIX_SOCKET_PATH_LIMIT, WORKSPACE_SOCKET_NAME, digest, keys, liveSourceDigest, AGENT_INSPECT, BOX_CONTRACT_INSPECT, INSPECT } from './liveCommon.mjs';
 import { FIXTURE_AGENT_COMMAND, FIXTURE_REPOSITORY, GPU_PROBE_TARGET, fixtureContainerName, fixtureManifest, fixturePlan, proposedWorkspaceIdentity, rewriteLlmManifest, startArgs } from './liveFixture.mjs';
 import { INSTALL_SAMPLES_HEAD, INSTALL_SAMPLES_TAIL, LLM_MODELS, LLM_REF, LLM_REPOSITORY, LLM_SOURCE_DIRECTORY } from './liveLlmNames.mjs';
 import {
@@ -308,6 +308,7 @@ export function plannedCommands(run) {
             note: 'Production start creates the gate-on Box and runs its bounded root preparation before graph work; this is the declared provisioning step that may change cgroup state.' },
         { id: 'box-inventory', binary: engine, argv: ps, deadlineMs: run.deadlines.coreMs },
         { id: 'box-inspect', binary: engine, argv: ['container', 'inspect', '--format', INSPECT, '<NEW_CONTAINER_ID>'], deadlineMs: run.deadlines.coreMs },
+        { id: 'box-contract', binary: engine, argv: ['container', 'inspect', '--format', BOX_CONTRACT_INSPECT, '<BOX_ID>'], deadlineMs: run.deadlines.coreMs, note: 'Read-only evidence of the Box labels, privileges and publications; a failure is recorded, never a provisioning failure' },
         ...plan.agents.map(agent => ({ id: `agent-inspect-${agent.name}`, binary: engine, argv: [...nested, 'container', 'inspect', '--format', AGENT_INSPECT, fixtureContainerName(workspace, agent.name)], deadlineMs: run.deadlines.coreMs })),
         { id: 'host-records', action: 'Record the exact host records of this instance that now exist (path, type, uid, dev, ino)' },
     ];
@@ -555,7 +556,7 @@ export function renderSummary(run, manifestPath) {
     const line = (...parts) => parts.join('');
     // Long fixed values are named, never truncated, so every argument that
     // varies between runs (ports, refs, IDs, paths) stays visible.
-    const shown = value => (value === INSPECT ? '<INSPECT_FORMAT>' : value === AGENT_INSPECT ? '<AGENT_INSPECT_FORMAT>'
+    const shown = value => (value === INSPECT ? '<INSPECT_FORMAT>' : value === AGENT_INSPECT ? '<AGENT_INSPECT_FORMAT>' : value === BOX_CONTRACT_INSPECT ? '<BOX_CONTRACT_FORMAT>'
         : value.startsWith(`${profile.source.root}/`) ? `$SOURCE/${value.slice(profile.source.root.length + 1)}` : value);
     const commands = [...run.target.plan.provision, ...run.target.plan.live].filter(entry => entry.argv)
         .map(entry => {

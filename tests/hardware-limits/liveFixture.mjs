@@ -16,7 +16,7 @@ import { buildWorkspaceIdentity, resolveWorkspaceIdentity, workspacePathHash, wo
 import { assertBoxWorkspaceRoot } from '../../ploinky-box/contract/workspace-root.mjs';
 import { EXIT } from './fixtures.mjs';
 import {
-    AGENT_INSPECT, ID, IMAGE_REF, INSPECT, OWNER_MARKER, absolute, blocked, candidateEnv, checkedJson, digest,
+    AGENT_INSPECT, BOX_CONTRACT_INSPECT, ID, IMAGE_REF, INSPECT, OWNER_MARKER, absolute, blocked, candidateEnv, checkedJson, digest,
     HOST_RECORD_DIRECTORIES, assertNoForeignWorkspace, foreignGuardInput, hostRecordPaths, jsonDigest, keys, liveSourceDigest, observeEngineIdentity, workspaceSocketProblem,
 } from './liveCommon.mjs';
 import { runBoundedProcess } from './liveProcess.mjs';
@@ -370,6 +370,19 @@ export async function provisionRun({
             if (!/^[a-f0-9]{64}$/.test(box.labels?.[BOX_LABELS.gpuGrant] || '')
                 || !['nvidia-cuda-mps-control', 'nvidia-cuda-mps-server', 'nvidia-smi'].every(name => bound(`/usr/local/nvidia/bin/${name}`)?.RW === false)
                 || bound('/usr/local/nvidia/lib64/libcuda.so.1')?.RW !== false) throw blocked('The Box was created without the GPU and MPS tool wiring (read-only NVIDIA tools and libcuda); check the host driver and the GPU grant');
+        }
+        // The Box's labels, image and privilege and publication contract are saved as evidence before anything else uses the Box. The
+        // contract query is read-only and never gates provisioning: a failure is recorded and named as a limitation.
+        try { artifacts('box-inspect', { id: box.id, created: box.created, image: box.image, running: box.running, labels: box.labels, mounts: box.mounts.map(mount => ({ type: mount.Type, destination: mount.Destination, rw: mount.RW === true, source: mount.Source })) }); }
+        catch (error) { limitations.push(`The Box inspect artifact could not be saved: ${String(error?.message || error).slice(0, 160)}`); }
+        try {
+            const contract = checkedJson(await engine('box-contract', ['container', 'inspect', '--format', BOX_CONTRACT_INSPECT, box.id], { resourceIds: [box.id] }));
+            if (contract.id !== box.id) throw new Error('the contract query answered for another container');
+            artifacts('box-contract', contract);
+        } catch (error) {
+            const message = String(error?.message || error).slice(0, 160);
+            limitations.push(`The Box privilege and publication contract could not be observed: ${message}`);
+            try { artifacts('box-contract', { unavailable: message }); } catch { /* the limitation above stands */ }
         }
         profile.box = { id: box.id, created: box.created, image: box.image, contractDigest: jsonDigest({ labels: box.labels, mounts: box.mounts }), pathHash: identity.pathHash, instance };
         run.ownedBoxes.push({ id: box.id, created: box.created, contractDigest: profile.box.contractDigest, operation: 'fixture-start' });

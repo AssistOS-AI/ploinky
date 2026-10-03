@@ -31,7 +31,10 @@ const INSPECT_FIELDS = Object.freeze({
     ID: true, Created: true, Image: true, ImageName: true, Name: true, Mounts: true,
     Config: { Labels: true, Env: true, User: true },
     State: { Status: true, Running: true, Pid: true, StartedAt: true, FinishedAt: true, ConmonPid: true, ExitCode: true, OOMKilled: true },
-    HostConfig: { Memory: true, MemorySwap: true, NanoCpus: true, CpuQuota: true, CpuPeriod: true, PidsLimit: true },
+    HostConfig: {
+        Memory: true, MemorySwap: true, NanoCpus: true, CpuQuota: true, CpuPeriod: true, PidsLimit: true,
+        Privileged: true, CapAdd: true, CapDrop: true, SecurityOpt: true, Init: true, NetworkMode: true, UsernsMode: true, Devices: true, PortBindings: true,
+    },
 });
 const PS_FIELDS = Object.freeze({ ID: true, Names: true, Image: true, ImageID: true, Labels: true, State: true, Status: true, Mounts: true, Created: true, CreatedAt: true, Pid: true });
 // `info` is only ever rendered whole.
@@ -89,7 +92,12 @@ export const inspectModel = record => ({
         Status: record.status ?? (record.running === false ? 'exited' : 'running'), Running: record.running ?? false, Pid: record.pid ?? 1, StartedAt: record.startedAt ?? 'x',
         FinishedAt: record.finishedAt ?? '0001-01-01T00:00:00Z', ConmonPid: record.conmonPid ?? 2, ExitCode: record.exitCode ?? 0, OOMKilled: record.oomKilled ?? false,
     },
-    HostConfig: { Memory: record.memory ?? 0, MemorySwap: record.memorySwap ?? 0, NanoCpus: record.nanoCpus ?? 0, CpuQuota: record.cpuQuota ?? 0, CpuPeriod: record.cpuPeriod ?? 0, PidsLimit: record.pidsLimit ?? 0 },
+    HostConfig: {
+        Memory: record.memory ?? 0, MemorySwap: record.memorySwap ?? 0, NanoCpus: record.nanoCpus ?? 0, CpuQuota: record.cpuQuota ?? 0, CpuPeriod: record.cpuPeriod ?? 0, PidsLimit: record.pidsLimit ?? 0,
+        Privileged: record.privileged ?? false, CapAdd: record.capAdd ?? ['SYS_ADMIN', 'NET_ADMIN'], CapDrop: record.capDrop ?? null, SecurityOpt: record.securityOpt ?? ['label=disable'], Init: record.init ?? true,
+        NetworkMode: record.networkMode ?? 'bridge', UsernsMode: record.usernsMode ?? 'private', Devices: record.devices ?? [],
+        PortBindings: record.portBindings ?? { '8080/tcp': [{ HostIp: '127.0.0.1', HostPort: '23456' }], '7882/udp': [{ HostIp: '0.0.0.0', HostPort: '34567' }] },
+    },
 });
 const psModel = record => ({
     ID: record.id, Names: record.name ?? record.id.slice(0, 12), Image: record.imageName ?? record.image, ImageID: record.image, Labels: record.labels ?? {},

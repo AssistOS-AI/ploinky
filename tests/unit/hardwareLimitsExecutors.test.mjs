@@ -16,10 +16,13 @@ import { FOREIGN_WORKSPACE_DIRECTORIES, foreignWorkspaceProblem } from '../hardw
 import { worldState } from '../hardware-limits/fakeLiveEngine.mjs';
 import { productionLayout } from '../hardware-limits/coreLayoutWorld.mjs';
 import { BOX_IMAGE, exists, free, world } from '../hardware-limits/executorWorld.mjs';
+import { BOX_CONTRACT_INSPECT } from '../hardware-limits/liveCommon.mjs';
+import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 
 const ok = stdout => ({ status: 0, signal: null, stdout, stderr: '', timedOut: false, truncated: false, cancelled: false, errorCode: null, settlementForced: false });
 const provision = (w, options = {}) => provisionRun({
     run: w.run, persist: w.persist, processProvider: options.processProvider || w.engineProvider, portProbe: free, hostIdentity: w.hostIdentity, remoteArrival: w.remote, validateProfile,
+    ...(options.artifacts ? { artifacts: options.artifacts } : {}),
 });
 
 // ---------------------------------------------------------------------------------------------------------------------------------
@@ -393,4 +396,57 @@ test('X4.c6-manifest-and-summary-show-the-program-the-bounds-and-the-guard-and-e
     for (const text of ['C6-helper-real', 'C6-helper-delayed', 'C6-helper-cleanup-proof', '16 MiB', '2000 ms', '## Foreign-workspace guard', 'apparatus-authority']) assert.ok(summary.includes(text), text);
     for (const operation of candidateOperationsOf(w.run)) assert.equal(candidateArgvProblem(operation.argv), null, operation.argv.join(' '));
     assert.deepEqual(['LIVE-C6'].filter(id => UNSUPPORTED[id]), []);
+});
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// R21-2: the provisioned Box's labels, image, privileges and publications are saved as run artifacts (every block, apparatus-cpu included).
+test('R21.provision-saves-the-box-labels-image-privileges-and-publications-as-artifacts-in-every-block', async t => {
+    for (const block of ['apparatus-cpu', 'apparatus-core', 'mac-cpu']) {
+        const w = world(t, { block });
+        const artifacts = new Map();
+        const report = await provision(w, { artifacts: (name, value) => artifacts.set(name, structuredClone(value)) });
+        assert.equal(report.verdict, 'PASS', `${block}: ${JSON.stringify(report.limitations)}`);
+        assert.deepEqual(report.limitations, [], block);
+        const box = w.run.target.execution.box;
+        const inspect = artifacts.get('box-inspect');
+        assert.equal(inspect.id, box.id, block); assert.equal(inspect.image, box.image, block); assert.equal(inspect.running, true, block);
+        assert.equal(inspect.labels[BOX_LABELS.role], 'box', block); assert.match(inspect.labels[BOX_LABELS.hardwareLimits], /^[a-f0-9]{64}$/, block);
+        assert.equal(inspect.labels[BOX_LABELS.imageRef], BOX_IMAGE, block);
+        assert.ok(inspect.mounts.some(mount => mount.destination && typeof mount.rw === 'boolean' && mount.source), block);
+        const contract = artifacts.get('box-contract');
+        assert.equal(contract.id, box.id, block); assert.equal(contract.image, box.image, block); assert.deepEqual(contract.labels, inspect.labels, block);
+        assert.equal(contract.privileged, false, block); assert.deepEqual(contract.capAdd, ['SYS_ADMIN', 'NET_ADMIN'], block); assert.deepEqual(contract.securityOpt, ['label=disable'], block);
+        assert.deepEqual(Object.keys(contract.publications).sort(), ['7882/udp', '8080/tcp'], block);
+        assert.equal(contract.publications['8080/tcp'][0].HostIp, '127.0.0.1', `${block}: the Router publication is loopback`);
+        // The contract query is one journaled, read-only, identified command.
+        const op = w.run.operations.find(entry => entry.kind === 'box-contract');
+        assert.deepEqual([op.state, op.resourceIds], ['observed', [box.id]], block);
+        assert.equal(op.argvDigest !== null, true, block);
+    }
+});
+
+test('R21.a-box-contract-query-that-fails-is-recorded-as-a-limitation-and-never-fails-provisioning', async t => {
+    const w = world(t, { block: 'apparatus-cpu' });
+    const artifacts = new Map();
+    const provider = async (binary, args, options) => (args.includes(BOX_CONTRACT_INSPECT) ? { ...ok(''), status: 125, stderr: "Error: can't evaluate field Privileged" } : w.engineProvider(binary, args, options));
+    const report = await provision(w, { processProvider: provider, artifacts: (name, value) => artifacts.set(name, structuredClone(value)) });
+    assert.equal(report.verdict, 'PASS', JSON.stringify(report.limitations));
+    // Nothing is hidden: the limitation names it and the saved artifact says the observation was unavailable. The Box inspect artifact is unaffected.
+    assert.equal(report.limitations.length, 1); assert.match(report.limitations[0], /The Box privilege and publication contract could not be observed: /);
+    assert.deepEqual(Object.keys(artifacts.get('box-contract')), ['unavailable']); assert.match(artifacts.get('box-contract').unavailable, /Live command failed|did not return|exit/i);
+    assert.equal(artifacts.get('box-inspect').id, w.run.target.execution.box.id);
+    assert.equal(w.run.operations.find(entry => entry.kind === 'box-contract').state, 'observed');
+    // Cleanup still destroys the owned Box and proves it absent.
+    const cleanup = await executeCleanupRun({ run: w.run, hostIdentity: w.hostIdentity, processProvider: w.engineProvider, persist: w.persist, remoteArrival: w.remote });
+    assert.equal(cleanup.verdict, 'PASS', JSON.stringify(cleanup.limitations)); assert.equal(exists(w.run.target.execution.workspace.path), false);
+});
+
+test('R21.the-box-contract-observation-is-planned-shown-and-uses-parser-clean-read-only-argv', async t => {
+    const w = world(t, { block: 'apparatus-cpu' });
+    const step = w.run.target.plan.provision.find(entry => entry.id === 'box-contract');
+    assert.deepEqual(step.argv.slice(0, 3), ['container', 'inspect', '--format']); assert.equal(step.argv[3], BOX_CONTRACT_INSPECT); assert.equal(step.argv.at(-1), '<BOX_ID>');
+    const ids = w.run.target.plan.provision.map(entry => entry.id);
+    assert.ok(ids.indexOf('box-inspect') < ids.indexOf('box-contract') && ids.indexOf('box-contract') < ids.findIndex(id => id.startsWith('agent-inspect')), ids.join(','));
+    const summary = renderSummary(w.run, w.runPath);
+    assert.ok(summary.includes('box-contract') && summary.includes('<BOX_CONTRACT_FORMAT>') && !summary.includes('HostConfig.Privileged'), 'the long template is named, never printed');
 });
