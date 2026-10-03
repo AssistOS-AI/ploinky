@@ -196,7 +196,9 @@ test('V1.a-memory-default-that-is-not-a-whole-gib-is-refused-by-the-daemon-confi
         assert.throws(() => configureMpsDefaults({ smPercent: 25, memoryMiB }, { uid: 1000, query: () => { calls.push(1); return { status: 0, stdout: '', stderr: '' }; } }), /Invalid MPS server defaults/, String(memoryMiB));
         assert.equal(calls.length, 0, 'nothing is sent to the daemon');
         const host = fakeHost();
-        const backend = createMpsDaemonBackend({ fsApi: host.fsApi, uid: 1000, query: () => { calls.push(1); return { status: 0 }; }, observe: () => ({ state: 'owned' }), now: () => 0, wait: () => {} });
+        // An advancing clock: a start that is not refused up front ends on its deadline, so a missing check fails this test by name.
+        let clock = 0;
+        const backend = createMpsDaemonBackend({ fsApi: host.fsApi, uid: 1000, query: () => { calls.push(1); return { status: 0 }; }, observe: () => ({ state: 'owned' }), now: () => { clock += 1000; return clock; }, wait: () => {} });
         assert.throws(() => backend.start({ smPercent: 25, memoryMiB }, { tools: host.descriptors }), /Invalid MPS server defaults/, String(memoryMiB));
         assert.equal(calls.length, 0, 'the daemon is not started');
     }
