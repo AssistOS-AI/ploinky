@@ -18,14 +18,16 @@ function releaseManifestFrom(manifest, patch = () => {}) {
 
 function build({ faults = {}, patch } = {}) {
     const { value: manifest } = manifestFixture(), release = releaseManifestFrom(manifest, patch), calls = []; let wall = Date.parse('2026-10-04T12:30:30Z');
-    const observedFor = (m, generation = 'g-1') => { const expected = expectedLiveFromManifest(m);
+    const observedFor = (m, generation = 'g-1', tag = 0) => { const expected = expectedLiveFromManifest(m);
         return { hostPlatform: 'linux', engine: 'podman', rootless: true, running: true, initialized: true, activeGeneration: generation, pendingActivation: false, recoveryBarrier: false, workspace: { ...expected.workspace }, box: { ...expected.box },
             candidate: structuredClone(expected.candidate), publications: expected.publications, sourceMounts: expected.sourceMounts, engineIdentity: expected.engineIdentity,
-            graph: m.graph.map(entry => ({ name: entry.name, graphGeneration: generation, running: true, runtimeId: 'r', instanceId: 'i', enableGeneration: 'e', ready: faults.notReady !== true, externalHealth: true, noWaitState: null })) }; };
-    let gateIndex = 0;
+            graph: m.graph.map(entry => ({ name: entry.name, graphGeneration: generation, running: true, runtimeId: `r${tag}`, instanceId: 'i', enableGeneration: 'e', ready: faults.notReady !== true, externalHealth: true, noWaitState: null })) }; };
+    let gateIndex = 0, observeCalls = 0;
     const ports = { release: { async load() { calls.push('load'); return release; },
             observerFor: m => ({ admit: async () => { calls.push('admit'); return { phase: 'U0', admitted: true, activeGeneration: 'g-1', runtimes: 1 }; },
-                observe: async () => { calls.push('observe'); const observed = observedFor(m, faults.generationMoves && gateIndex > 0 ? `g-${gateIndex}` : 'g-1'); if (faults.boxChangesAfterGate !== undefined && gateIndex === faults.boxChangesAfterGate) observed.box.id = H('other-box'); return observed; } }) },
+                observe: async () => { calls.push('observe'); observeCalls += 1;
+                    const generation = faults.driftOnObserve === observeCalls ? 'g-drift' : `g-${1 + (faults.generationMoves ?? []).filter(n => n <= gateIndex).length}`;
+                    const observed = observedFor(m, generation, (faults.runtimeReplacedAfter ?? []).filter(n => n <= gateIndex).length); if (faults.boxChangesAfterGate !== undefined && gateIndex === faults.boxChangesAfterGate) observed.box.id = H('other-box'); return observed; } }) },
         gates: { async run(gate) { calls.push(`gate:${gate}`); gateIndex += 1; wall += 1000; const base = { name: gate, runId: `r-${gate}`, discovered: 1, passed: 1, failed: 0, skipped: 0, retries: 0, ignoredErrors: 0, closed: true, startedAt: new Date(wall).toISOString(), finishedAt: new Date(wall + 500).toISOString() };
             return faults.skipGate === gate ? { ...base, passed: 0, skipped: 1 } : base; } },
         browser: { async close() { calls.push('browser-close'); return { closed: true }; }, openContexts: () => faults.openContext ? 1 : 0 }, custody: { snapshot: () => [{ settled: faults.unsettled !== true }] },
@@ -70,6 +72,20 @@ test('release gates refuse an unready fixture, a changed outer Box, a skipped ga
     const skipped = build({ faults: { skipGate: 'OnlyOffice' } }); await skipped.phases.U7c(); await assert.rejects(skipped.phases.U8(), error => error.code === 'canonical-gate-invalid'); assert.equal(skipped.calls.includes('gate:WebMeet'), false);
     const late = build(); await late.phases.U7c(); late.advance(200000); await assert.rejects(late.phases.U8(), error => error.code === 'box-freshness-insufficient'); assert.equal(late.calls.some(call => call.startsWith('gate:')), false);
     const aged = build({ patch: r => { r.box.imageCreatedAt = '2026-10-04T07:00:00Z'; } }); await aged.phases.U7c(); await assert.rejects(aged.phases.U8(), error => error.code === 'image-freshness-insufficient');
+});
+
+test('the epoch may move only inside the OnlyOffice bracket: generation and runtime tuples hold across Copilot, between gates and across WebMeet', async () => {
+    const run = async faults => { const h = build({ faults }); await h.phases.U7c(); await h.phases.U8(); return h; };
+    // Observation order after U7c: Copilot before(2) after(3); OnlyOffice before(4) after(5) refresh(6); WebMeet before(7) after(8).
+    const allowed = await run({ generationMoves: [2], runtimeReplacedAfter: [2] });
+    assert.deepEqual(allowed.state.gates.map(gate => [gate.before.generation, gate.after.generation]), [['g-1', 'g-1'], ['g-1', 'g-2'], ['g-2', 'g-2']]);
+    assert.notEqual(allowed.state.gates[1].after.runtimes[0][1], allowed.state.gates[1].before.runtimes[0][1], 'the targeted restart replaced the runtime inside its bracket');
+    assert.equal(allowed.state.gates[2].before.runtimes[0][1], allowed.state.gates[1].after.runtimes[0][1], 'WebMeet starts from the refreshed epoch');
+    for (const [label, faults] of [['generation moves during Copilot', { generationMoves: [1] }], ['generation moves during WebMeet', { generationMoves: [3] }], ['runtime replaced during Copilot', { runtimeReplacedAfter: [1] }], ['runtime replaced during WebMeet', { runtimeReplacedAfter: [3] }],
+        ['drift before OnlyOffice', { driftOnObserve: 4 }], ['unstable refresh after OnlyOffice', { driftOnObserve: 6 }], ['drift before WebMeet', { driftOnObserve: 7 }], ['drift after WebMeet', { driftOnObserve: 8 }], ['drift before Copilot', { driftOnObserve: 2 }]]) {
+        const h = build({ faults }); await h.phases.U7c(); await assert.rejects(h.phases.U8(), error => /canonical-epoch-changed|workspace-not-live|live-binding-mismatch/.test(error.code), label);
+        if (label.includes('Copilot') || label.includes('before OnlyOffice')) assert.equal(h.calls.includes('gate:WebMeet'), false, label);
+    }
 });
 
 test('U9 refuses any unsettled owned command, open browser context, remaining fixture or dirty run', async () => {

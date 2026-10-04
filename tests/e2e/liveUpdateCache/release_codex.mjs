@@ -18,11 +18,15 @@ export function functionalRecord({ manifest, observed, finishedAt, frozen, clean
 
 export function createReleasePhases(ctx) {
     const { manifest, ports, state } = ctx;
-    async function epoch(observer, release) {
-        const observed = await observer.observe(), expected = expectedLiveFromManifest(release); expected.activeGeneration = observed.activeGeneration;
+    // An epoch observation: the Box, workspace and candidate bindings that assertCanonicalGateResults compares, plus the
+    // active edge generation and every required runtime's identity tuple, which must not move except in one bracket.
+    async function epoch(observer, release, { generation } = {}) {
+        const observed = await observer.observe(), expected = expectedLiveFromManifest(release); expected.activeGeneration = generation ?? observed.activeGeneration;
         assertLiveBefore({ expected, observed });
-        return Object.freeze({ boxId: observed.box.id, startedAt: observed.box.startedAt, workspaceIdentity: identityOf(observed), candidate: candidateOf(observed, release.box.imageId) });
+        return Object.freeze({ boxId: observed.box.id, startedAt: observed.box.startedAt, workspaceIdentity: identityOf(observed), candidate: candidateOf(observed, release.box.imageId),
+            generation: observed.activeGeneration, runtimes: observed.graph.map(row => [row.name, row.runtimeId, row.instanceId, row.enableGeneration]) });
     }
+    const sameState = (left, right) => left.generation === right.generation && isDeepStrictEqual(left.runtimes, right.runtimes);
     return {
         async U7c() {
             const functional = state.functional; need(functional, 'functional-epoch-missing');
@@ -37,16 +41,22 @@ export function createReleasePhases(ctx) {
             return { phase: 'U7c', fresh: true, workspaceRecreated: true, sameCandidate: true, sameImage: true, generation: admission.activeGeneration, browserGateCredit: 0 };
         },
         async U8() {
-            const release = state.releaseManifest, observer = state.releaseObserver, gates = [];
+            const release = state.releaseManifest, observer = state.releaseObserver, gates = []; let known = state.release;
             for (const [index, gate] of REQUIRED_GATES.entries()) {
                 ctx.check();
-                const before = await epoch(observer, release);
+                // Nothing may move between gates: the epoch about to be used is the epoch last proved.
+                const before = await epoch(observer, release, { generation: known.generation }); need(sameState(before, known), 'canonical-epoch-changed');
                 // The remaining validity must cover every gate still to run; it is never renewed by re-reading metadata.
                 admitCanonicalFreshness({ nowMs: ctx.wallNow(), boxStartedAt: release.box.startedAt, imageCreatedAt: release.box.imageCreatedAt, remainingWorkMs: remainingGateWorkMs(REQUIRED_GATES.slice(index)) });
                 const row = await ports.gates.run(gate);
                 need(row.discovered === 1 && row.passed === 1 && row.failed === 0 && row.skipped === 0 && row.retries === 0 && row.ignoredErrors === 0, 'canonical-gate-invalid');
-                const after = await epoch(observer, release);
-                gates.push({ ...row, before, after });
+                // Only OnlyOffice performs targeted restarts; its change is accepted once and must then be stable, so the next
+                // gate starts from an observed, refreshed epoch. Copilot and WebMeet must leave the epoch exactly as they found it.
+                let after;
+                if (gate === 'OnlyOffice') {
+                    after = await epoch(observer, release); const refreshed = await epoch(observer, release, { generation: after.generation }); need(sameState(refreshed, after), 'canonical-epoch-changed');
+                } else { after = await epoch(observer, release, { generation: known.generation }); need(sameState(after, before), 'canonical-epoch-changed'); }
+                known = after; gates.push({ ...row, before, after });
             }
             assertCanonicalGateResults({ release: state.release, gates }); state.gates = gates;
             return { phase: 'U8', gates: gates.map(gate => ({ name: gate.name, runId: gate.runId, discovered: gate.discovered, passed: gate.passed, skipped: gate.skipped, retries: gate.retries, ignoredErrors: gate.ignoredErrors })) };
