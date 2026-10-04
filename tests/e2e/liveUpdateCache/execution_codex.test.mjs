@@ -129,3 +129,12 @@ test('public worker projection rejects raw fields/status alteration and keeps gr
         const changed = structuredClone(proof); mutate(changed); assert.throws(() => validatePublicWorkerProof(changed, { operation: proof.operation, returnedCode: 0, expected }));
     }
 });
+
+test('default-skills record ids over two known repositories are accepted in an expectation, unknown ones are not', async () => {
+    const { manifestFixture, expectationFixture } = await import('./test_support_codex.mjs');
+    const { value } = manifestFixture(), { expected } = expectationFixture(value), { validateExpectation } = await import('./execution_codex.mjs');
+    assert.doesNotThrow(() => validateExpectation({ ...expected, recordIds: [...expected.recordIds, 'AssistOSExplorer->AchillesCLI'] }, value));
+    for (const id of ['AssistOSExplorer->unknown', 'unknown->AchillesCLI', 'a->b->c', '->AchillesCLI', 'AssistOSExplorer->']) {
+        assert.throws(() => validateExpectation({ ...expected, recordIds: [...expected.recordIds, id] }, value), error => error.code === 'update-expectation', id);
+    }
+});

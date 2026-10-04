@@ -21,9 +21,11 @@ export function validateExpectation(expected, manifest) {
     for (const [index, name] of ['detached', 'staged', 'unstaged', 'diverged', 'collision', 'branch', 'origin', 'later'].entries()) {
         ids.add(`${index === 7 ? 'ZZ' : 'AA'}UpdateE2E${index}-${name}-${manifest.runId}`);
     }
+    // A default-skills record is named `<source repository>-><target repository>` over two known repositories.
+    const skillsPair = id => { const match = /^([A-Za-z0-9][A-Za-z0-9._-]*)->([A-Za-z0-9][A-Za-z0-9._-]*)$/.exec(id); return Boolean(match) && ids.has(match[1]) && ids.has(match[2]); };
     need(Array.isArray(expected.errors) && Array.isArray(expected.blockedBy) && Array.isArray(expected.recordIds)
         && expected.recordIds.length > 0 && expected.recordIds.length <= 1024 && new Set(expected.recordIds).size === expected.recordIds.length
-        && expected.recordIds.every(id => (word(id) || absolute(id)) && ids.has(id)), 'update-expectation');
+        && expected.recordIds.every(id => ((word(id) || absolute(id)) && ids.has(id)) || skillsPair(id)), 'update-expectation');
     for (const row of [...expected.errors, ...expected.blockedBy]) {
         exact(row, ['phase', 'id', 'outcome', 'required', 'code']);
         need(PHASES.has(row.phase) && expected.recordIds.includes(row.id) && OUTCOMES.has(row.outcome) && row.outcome !== 'uncertain'
