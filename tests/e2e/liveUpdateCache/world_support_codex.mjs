@@ -33,7 +33,7 @@ export function createWorld(faults = {}) {
         fixture,
         observer: { async admit() { return { phase: 'U0', admitted: true, activeGeneration: world.generation, runtimes: 1 }; },
             async observe() { const expected = expectedLiveFromManifest(manifest);
-                return { hostPlatform: 'linux', engine: 'podman', rootless: true, running: true, initialized: true, activeGeneration: world.generation, pendingActivation: false, recoveryBarrier: false, workspace: { ...expected.workspace }, box: { ...expected.box },
+                return { hostPlatform: 'linux', engine: 'podman', rootless: true, running: true, initialized: true, activeGeneration: world.generation, pendingActivation: world.pending === true, recoveryBarrier: false, workspace: { ...expected.workspace }, box: { ...expected.box },
                     candidate: structuredClone(expected.candidate), publications: expected.publications, sourceMounts: expected.sourceMounts, engineIdentity: expected.engineIdentity,
                     graph: manifest.graph.map(entry => ({ name: entry.name, graphGeneration: world.generation, running: true, runtimeId: 'rt', instanceId: 'inst', enableGeneration: 'en', ready: faults.graphNotReady !== true, externalHealth: true, noWaitState: null })),
                     publicConfig: faults.configChanges && world.generation !== 'gen-1' ? { staticAgent: 'other', staticPort: 8080 } : { ...world.publicConfig }, activation: { generation: world.generation, activationId: 'act' } }; } },
@@ -42,6 +42,7 @@ export function createWorld(faults = {}) {
             if (operation === 'normal-update') { const runtime = world.runtimes.get('primary'), B = world.commits.B; const old = runtime.objectId; if (!faults.updateKeepsObject) { runtime.objectId = addObject('pkg-B-updated'); runtime.selectorId = H(`sel-${world.counter++}`); }
                 if (!faults.noRestart) runtime.runtimeId = id('rt-primary-B'); runtime.commit = faults.wrongCommit ? H('wrong').slice(0, 40) : B.commit; runtime.markerSha256 = B.markerSha256; runtime.marker = B.marker; if (faults.mutatePredecessor) world.objects.get(old).treeMatches = false; if (faults.removePredecessor) world.objects.get(old).present = false; if (!faults.noGenerationChange) bump(); }
             else if (!faults.noGenerationChange) bump();
+            world.pending = false;
             return { fulfilled: true, returnedCode: faults.updateExit ?? 0, result: { activation: { outcome: faults.activation ?? 'restarted' } } }; } },
         cache: {
             async probeStore({ targets, objects }) { return { targets: targets.map(target => { if (target.packageName === null) { const runtime = world.runtimes.get(`g${targets.indexOf(target)}`) ?? world.runtimes.get('g0'); return { label: target.label, containerName: 'ploinky_g', runtimeId: runtime.runtimeId, instanceId: runtime.instanceId, enableGeneration: runtime.enableGeneration, running: runtime.running, labelsEqual: true, objectId: faults.graphNoStore ? null : runtime.objectId, selectorId: faults.graphNoStore ? null : runtime.selectorId, payloadSha256: faults.graphNoStore ? null : world.objects.get(runtime.objectId).payloadSha256, storeMode: faults.graphNoStore ? 'none' : 'store' }; }
@@ -61,7 +62,7 @@ export function createWorld(faults = {}) {
                 const summary = faults.gcSkipped ? { outcome: 'skipped' } : { outcome: 'collected', removedCount: 1, retainedBytesByReason: faults.noRetainedReason ? {} : { 'admitted-record': 4, 'container-mount': 4, 'reader:container': 4 } };
                 onChunk?.({ summary }); return { code: 0, summary, bytes: 100, discardedLines: 1 }; },
         },
-        negative: { async run() { world.calls.push('negative-run'); return { phase: 'U6', optional: 'passed', required: 'passed' }; }, async restore() { world.calls.push('negative-restore'); } },
+        negative: { async run() { world.calls.push('negative-run'); if (!faults.noPending) world.pending = true; return { phase: 'U6', optional: 'passed', required: 'passed' }; }, async restore() { world.calls.push('negative-restore'); } },
         cleanup: { async run({ writersQuiescent }) { world.calls.push(`cleanup:${writersQuiescent}`); return { repo: 'uninstalled', server: 'removed', files: 'removed', marker: 'removed' }; } },
     };
     const state = {}, inputs = { expectedUpdates: { 'normal-update': {}, 'settling-update': {} } };

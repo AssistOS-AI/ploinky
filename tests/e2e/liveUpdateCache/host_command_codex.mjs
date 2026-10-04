@@ -6,8 +6,8 @@ import { AcceptanceError, LIMITS, need, absolute } from './manifest_codex.mjs';
 // Every host command of the live acceptance run goes through this one owner: an exact argument array, a
 // private environment, one retained ChildProcess, bounded bytes, a bounded deadline and observed close.
 // There are no shells, process groups, name searches or signals; a command that does not settle is handed off.
-export const COMMAND_KINDS = Object.freeze({ git: 30000, read: 120000, mutation: LIMITS.commandMs });
-export const COMMAND_STREAM_BYTES = Object.freeze({ git: 4 * 1024 * 1024, read: 4 * 1024 * 1024, mutation: LIMITS.outputBytes });
+export const COMMAND_KINDS = Object.freeze({ git: 30000, read: 120000, mutation: LIMITS.commandMs, continuation: 3300000 });
+export const COMMAND_STREAM_BYTES = Object.freeze({ git: 4 * 1024 * 1024, read: 4 * 1024 * 1024, mutation: LIMITS.outputBytes, continuation: LIMITS.outputBytes });
 const ENV_ALLOWLIST = Object.freeze(['HOME', 'USER', 'LOGNAME', 'PATH', 'XDG_RUNTIME_DIR', 'TMPDIR']);
 
 export const monotonicNow = () => Math.floor(performance.now());

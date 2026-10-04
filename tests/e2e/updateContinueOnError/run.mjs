@@ -4,36 +4,39 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn, spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { sanitizeGitDiagnostic } from '../../../cli/utils/gitCommand.js';
-import { buildWorkspaceIdentity } from '../../../ploinky-box/identity.mjs';
-import { createMutationLockManager } from '../../../ploinky-box/locks.mjs';
-import { syncManagedSkillExports } from '../../../cli/utils/skills/exportTransaction.mjs';
-import { createUpdateHostState } from '../../../ploinky-box/update/hostState.mjs';
+import { LIMITS, parseStrictJson, validateManifest } from '../liveUpdateCache/manifest_codex.mjs';
+import { PHASE_CAPS_MS, assertOptionalFailureActivation, assertDeferredFailure } from '../liveUpdateCache/contracts_codex.mjs';
+import { createOwnedCustody, createStopLatch } from '../liveUpdateCache/execution_codex.mjs';
+import { runOwnedCommand, buildCommandEnvironment, monotonicNow, defaultDelay } from '../liveUpdateCache/host_command_codex.mjs';
+import { createLinuxProcessObserver } from '../liveUpdateCache/linux_observer_codex.mjs';
+import { createLiveObserver } from '../liveUpdateCache/live_admission_codex.mjs';
+import { createWorkerHost, } from '../liveUpdateCache/worker_host_codex.mjs';
+import { readBoundedRegularFile } from '../liveUpdateCache/worker_codex.mjs';
 
 const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const expectedWorkspace = path.join(os.homedir(), 'work', 'testExplorerFresh');
-const usage = 'Usage: node tests/e2e/updateContinueOnError/run.mjs --workspace ~/work/testExplorerFresh --artifacts /absolute/new/artifact-directory [--ploinky /absolute/candidate/bin/ploinky] [--timeout-ms 1200000]';
+const usage = 'Usage: node tests/e2e/updateContinueOnError/run.mjs --workspace ~/work/testExplorerFresh --manifest /absolute/manifest_codex.json --artifacts /absolute/new/artifact-directory [--ploinky /absolute/candidate/bin/ploinky] [--timeout-ms 1200000]';
 
 function parseArgs(args) {
     if (args.length === 1 && args[0] === '--help') return null;
     const values = {};
     for (let index = 0; index < args.length; index += 2) {
         const name = args[index];
-        if (!['--workspace', '--artifacts', '--ploinky', '--timeout-ms'].includes(name)
+        if (!['--workspace', '--artifacts', '--ploinky', '--timeout-ms', '--manifest'].includes(name)
             || Object.hasOwn(values, name) || !args[index + 1] || args[index + 1].startsWith('--')) {
             throw new Error(usage);
         }
         values[name] = args[index + 1];
     }
-    if (!values['--workspace'] || !values['--artifacts']) throw new Error(usage);
+    if (!values['--workspace'] || !values['--artifacts'] || !values['--manifest']) throw new Error(usage);
     const timeoutMs = Number(values['--timeout-ms'] || 1_200_000);
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 3_600_000) {
         throw new Error('--timeout-ms must be an integer between 1000 and 3600000.');
     }
-    return { workspace: values['--workspace'], artifacts: values['--artifacts'],
+    return { workspace: values['--workspace'], artifacts: values['--artifacts'], manifest: values['--manifest'],
         ploinky: values['--ploinky'] || path.join(sourceRoot, 'bin', 'ploinky'), timeoutMs };
 }
 
@@ -81,7 +84,7 @@ function git(repoPath, args) {
         env: { ...process.env, LC_ALL: 'C', GIT_TERMINAL_PROMPT: '0' },
     });
     if (result.error || result.status !== 0) {
-        throw new Error(sanitizeGitDiagnostic('Fixture git ' + args.join(' ') + ': '
+        throw new Error(sanitize('Fixture git ' + args.join(' ') + ': '
             + (result.error?.message || result.stderr || result.status)));
     }
     return result.stdout.trim();
@@ -99,6 +102,35 @@ function readSources(metadataPath) {
 
 const digest = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 
+// Product helpers are loaded only after live admission has proved the exact pushed candidate; they serve fixture
+// preparation (locks, identity, skill seeding, host state) and never produce a claim about the update itself.
+let product = null;
+const sanitize = value => (product ? product.sanitizeGitDiagnostic(value) : String(value).replace(/[\0-\x08\x0b-\x1f]/g, '?').slice(0, 4000));
+async function loadProduct(root) {
+    const load = relative => import(pathToFileURL(path.join(root, relative)).href);
+    const [identity, locks, exportTransaction, hostStateModule, gitCommand] = await Promise.all([load('ploinky-box/identity.mjs'), load('ploinky-box/locks.mjs'),
+        load('cli/utils/skills/exportTransaction.mjs'), load('ploinky-box/update/hostState.mjs'), load('cli/utils/gitCommand.js')]);
+    return { buildWorkspaceIdentity: identity.buildWorkspaceIdentity, createMutationLockManager: locks.createMutationLockManager,
+        syncManagedSkillExports: exportTransaction.syncManagedSkillExports, createUpdateHostState: hostStateModule.createUpdateHostState, sanitizeGitDiagnostic: gitCommand.sanitizeGitDiagnostic };
+}
+
+// Admission comes first: a manifest bound to this exact workspace, candidate and operator, and an actually live,
+// ready deployment. Nothing is created in the workspace before this returns.
+async function admitLive(options) {
+    const bytes = readBoundedRegularFile(options.manifest, LIMITS.manifestBytes);
+    const manifest = validateManifest(parseStrictJson(bytes));
+    assert.equal(manifest.workspace.path, options.workspace, 'The manifest names another workspace');
+    assert.equal(manifest.candidate.root, options.cliRoot, 'The manifest names another candidate checkout');
+    assert.equal(manifest.candidate.cliPath, options.ploinky, 'The manifest names another outer CLI');
+    assert.equal(process.getuid?.(), manifest.host.uid, 'The manifest names another operator');
+    const observer = createLinuxProcessObserver(), latch = createStopLatch(), custody = createOwnedCustody();
+    const deps = { latch, custody, runId: manifest.runId, register: observer.register, current: observer.current };
+    const workerHost = createWorkerHost({ manifest, deps });
+    const live = createLiveObserver({ manifest, deps, statusProof: () => workerHost.status() });
+    const receipt = await live.admit();
+    return { manifest, live, deps, latch, custody, receipt, env: buildCommandEnvironment(process.env, { PLOINKY_WORKSPACE_ROOT: manifest.workspace.path }) };
+}
+
 function unverifiedRecords(output) {
     return output.split('\n').flatMap(line => {
         const match = /^\s*-\s+(\S+)\s+(.+?):\s+(failed|uncertain|skipped|deferred)\s+\(([^,]+),\s*(optional|required(?: \(membership unknown\))?)\)/.exec(line);
@@ -107,8 +139,14 @@ function unverifiedRecords(output) {
 }
 
 async function main(rawOptions) {
-    const { workspace, artifacts, ploinky, cliRoot, timeoutMs } = validatePaths(rawOptions);
-    const runId = new Date().toISOString().replace(/[^0-9]/g, '') + '-' + crypto.randomBytes(4).toString('hex');
+    const options = validatePaths(rawOptions);
+    const { workspace, artifacts, ploinky, cliRoot, timeoutMs } = options;
+    const started = monotonicNow(), overallDeadline = started + PHASE_CAPS_MS.U6, restorationReserveMs = 120_000;
+    const admission = await admitLive(options);
+    product = await loadProduct(cliRoot);
+    const { buildWorkspaceIdentity, createMutationLockManager, createUpdateHostState, syncManagedSkillExports } = product;
+    const runId = admission.manifest.runId;
+    admission.generation = admission.receipt.activeGeneration;
     const token = crypto.randomBytes(24).toString('hex');
     const sourceParent = path.join(workspace, '.update-e2e-' + runId);
     const scenarioRoot = path.join(workspace, 'UpdateE2E-' + runId);
@@ -123,6 +161,7 @@ async function main(rawOptions) {
     const sourceFor = name => ['branch', 'origin'].includes(name) ? 'branch' : 'advance';
     const expectedOrigins = Object.fromEntries(names.map(name => [cacheNames[name], sourcePaths[sourceFor(name)]]));
     const identity = buildWorkspaceIdentity(workspace, { markerFound: true });
+    assert.equal(identity.instance, admission.manifest.workspace.instance, 'The workspace identity differs from the admitted manifest');
     const locks = createMutationLockManager({ timeoutMs: 30_000 });
     const hostState = createUpdateHostState();
     const owned = [];
@@ -136,7 +175,7 @@ async function main(rawOptions) {
     let activeManifestBackup = null;
     let unsafeToClean = false;
     fs.mkdirSync(artifacts, { mode: 0o700 });
-    const artifact = (name, content) => fs.writeFileSync(path.join(artifacts, name), sanitizeGitDiagnostic(content), { mode: 0o600 });
+    const artifact = (name, content) => fs.writeFileSync(path.join(artifacts, name), sanitize(content), { mode: 0o600 });
     const progress = message => {
         const line = new Date().toISOString() + ' ' + message;
         console.log(line);
@@ -198,20 +237,30 @@ async function main(rawOptions) {
         assert.equal(exists(path.dirname(copiedSkill(folders.prune, removedSkill))), false, 'Verified missing skill was not pruned');
         assert.deepEqual(JSON.parse(fs.readFileSync(manifestPath(folders.prune), 'utf8'))[0].skills, []);
     };
+    // The update is one owned child with a retained handle, bounded byte counts and a bounded deadline. No process
+    // group, signal or name search exists: a command that does not settle leaves its fixtures and is reported unsettled.
     const executePass = async label => {
         progress(`Running ${label}: actual outer ploinky update all in the dedicated workspace.`);
         unsafeToClean = true;
-        const command = await runOuterUpdate({ ploinky, workspace, args: ['update', 'all', scenarioRoot], timeoutMs,
-            progress, artifact: (name, bytes) => artifact(`${label}-${name}`, bytes) });
-        unsafeToClean = command.timedOut || command.signal !== null;
-        const output = command.stdout + '\n' + command.stderr;
-        const result = { exitCode: command.code, signal: command.signal, timedOut: command.timedOut,
-            durationMs: command.durationMs, unverified: unverifiedRecords(output),
+        const budget = Math.min(timeoutMs, overallDeadline - monotonicNow() - restorationReserveMs);
+        assert.ok(budget >= 1_000, 'The restoration reserve would be consumed; refusing the update (' + label + ')');
+        let command;
+        try {
+            command = await runOwnedCommand({ operation: `continuation-${label}`, kind: 'mutation', argv: [ploinky, 'update', 'all', scenarioRoot], cwd: workspace, env: admission.env,
+                deadlineMs: budget, allowedExitCodes: [1] }, { ...admission.deps, register: admission.deps.register, current: admission.deps.current });
+        } catch (error) {
+            observations.passes[label] = { uncertain: true, reason: String(error.code || 'update-failed'), retained: error.retained ?? null };
+            writeObservations();
+            throw error;
+        }
+        // The command settled with exactly the expected exit status; unexpected results above keep every fixture in place.
+        unsafeToClean = false;
+        const output = sanitize(command.stdout.toString('utf8')) + '\n' + sanitize(command.stderr.toString('utf8'));
+        artifact(`${label}-stdout.log`, command.stdout.toString('utf8')); artifact(`${label}-stderr.log`, command.stderr.toString('utf8'));
+        const result = { exitCode: command.code, durationMs: command.durationMs, stdoutBytes: command.stdoutBytes, stderrBytes: command.stderrBytes, unverified: unverifiedRecords(output),
             caches: Object.fromEntries(names.map(name => [name, snapshot(cachePaths[name])])) };
         observations.passes[label] = result;
         writeObservations();
-        assert.equal(command.timedOut, false, 'Outer update timed out; leave fixtures until writer termination is proven');
-        assert.equal(command.signal, null, 'Outer update did not exit normally');
         assert.equal(command.code, 1, 'Actual failures must produce a truthful nonzero exit status');
         assertSafety();
         return { ...result, output };
@@ -305,8 +354,11 @@ async function main(rawOptions) {
         const errors = optional.unverified.filter(record => ['failed', 'uncertain'].includes(record.outcome));
         assert.deepEqual(errors.map(record => record.id).sort(), [cacheNames.collision, folders.bad].sort(), 'Unexpected core error invalidates this live run');
         assert.match(optional.output, /Update partially failed \(exit status 1\):/);
-        assert.match(optional.output, /Activation: the workspace graph was restarted and the Router health check passed\.|Activation not required; no configured running workspace required a restart\./);
-        assert.doesNotMatch(optional.output, /Activation was blocked by:/);
+        assertOptionalActivationText(optional.output);
+        const afterOptional = await admission.live.observe();
+        assertOptionalFailureActivation({ exitCode: optional.exitCode, beforeGeneration: admission.generation, afterGeneration: afterOptional.activeGeneration, activation: 'restarted',
+            graphReady: afterOptional.graph.every(row => row.ready === true && row.running === true), writerQuiescent: afterOptional.recoveryBarrier === false });
+        observations.passes['optional-errors'].generation = { before: admission.generation, after: afterOptional.activeGeneration, graphReady: true };
 
         progress('Injecting an unreadable active skill-scope manifest and advancing the safe checkout again.');
         await locked(() => {
@@ -342,19 +394,23 @@ async function main(rawOptions) {
         assert.match(unknown.output, /Activation deferred; the running workspace graph was not restarted\./);
         assert.match(unknown.output, /Activation was blocked by:/);
         assert.doesNotMatch(unknown.output, /Activation: the workspace graph was restarted/);
+        const afterUnknown = await admission.live.observe();
+        assertDeferredFailure({ exitCode: unknown.exitCode, beforeGeneration: afterOptional.activeGeneration, afterGeneration: afterUnknown.activeGeneration, activation: 'deferred',
+            pending: afterUnknown.pendingActivation === true, writerQuiescent: afterUnknown.recoveryBarrier === false });
+        observations.passes['unknown-required-scope'].generation = { before: afterOptional.activeGeneration, after: afterUnknown.activeGeneration, pendingActivation: true };
         const pending = hostState.read('update-pending', identity.instance);
         assert.equal(pending?.workspaceRoot, workspace);
         assert.ok(pending.entries.at(-1).blockedBy.some(record => record.id === cacheNames.detached));
         observations.passes['unknown-required-scope'].pendingActivation = { reason: pending.reason, lastEntry: pending.entries.at(-1) };
         const graphScope = path.join(workspace, '.ploinky', 'graph-skill-scope.json');
         assert.equal(exists(graphScope) ? digest(fs.readFileSync(graphScope)) : null, observations.before.graphScopeDigest, 'Blocked update changed the admitted graph skill scope');
-        observations.result = 'passed';
+        observations.result = 'passed'; observations.coverage = 'continuation-only';
         progress('Real update continuation, preservation, pruning, exit status, and activation checks passed.');
     } catch (error) {
         runError = error;
         observations.result = 'failed';
-        observations.error = sanitizeGitDiagnostic(error.stack || error.message);
-        progress('E2E failed: ' + sanitizeGitDiagnostic(error.message));
+        observations.error = sanitize(error.stack || error.message);
+        progress('E2E failed: ' + sanitize(error.message));
     } finally {
         writeObservations();
         try {
@@ -404,76 +460,31 @@ async function main(rawOptions) {
             });
         } catch (error) {
             observations.cleanup.result = 'failed';
-            observations.cleanup.error = sanitizeGitDiagnostic(error.message);
-            progress('Cleanup stopped at an ownership, quiescence, or lock guard: ' + sanitizeGitDiagnostic(error.message));
+            observations.cleanup.error = sanitize(error.message);
+            progress('Cleanup stopped at an ownership, quiescence, or lock guard: ' + sanitize(error.message));
             runError ||= error;
         }
         writeObservations();
     }
-    if (runError) throw new Error('Update E2E failed; evidence: ' + artifacts + '\n' + sanitizeGitDiagnostic(runError.message));
+    if (runError) throw new Error('Update E2E failed; evidence: ' + artifacts + '\n' + sanitize(runError.message));
     progress('PASS. Evidence: ' + artifacts);
 }
 
-function runOuterUpdate({ ploinky, workspace, args, timeoutMs, progress, artifact }) {
-    return new Promise((resolve, reject) => {
-        const started = Date.now();
-        let stdout = '';
-        let stderr = '';
-        let timedOut = false;
-        let failure;
-        let killTimer;
-        const child = spawn(ploinky, args, {
-            cwd: workspace, detached: true, stdio: ['ignore', 'pipe', 'pipe'],
-            env: { ...process.env, PLOINKY_WORKSPACE_ROOT: workspace, LC_ALL: 'C', GIT_TERMINAL_PROMPT: '0' },
-        });
-        const signalGroup = signal => {
-            if (!child.pid) return;
-            try { process.kill(-child.pid, signal); } catch (error) { if (error.code !== 'ESRCH') failure ||= error; }
-        };
-        const stop = () => {
-            signalGroup('SIGTERM');
-            killTimer ||= setTimeout(() => signalGroup('SIGKILL'), 5_000);
-        };
-        const append = (channel, data) => {
-            if (failure) return;
-            const remaining = 64 * 1024 * 1024 - stdout.length - stderr.length;
-            const accepted = data.slice(0, Math.max(remaining, 0));
-            if (channel === 'stdout') stdout += accepted;
-            else stderr += accepted;
-            if (data.length > remaining) {
-                failure ||= new Error('Outer update exceeded the 64 MiB evidence limit');
-                stop();
-            }
-        };
-        child.stdout.setEncoding('utf8');
-        child.stderr.setEncoding('utf8');
-        child.stdout.on('data', data => append('stdout', data));
-        child.stderr.on('data', data => append('stderr', data));
-        child.on('error', error => { failure = error; });
-        const timer = setTimeout(() => { timedOut = true; progress('Outer update timed out; terminating its host process group.'); stop(); }, timeoutMs);
-        const heartbeat = setInterval(() => {
-            progress('Outer update is still running (' + Math.round((Date.now() - started) / 1000) + ' seconds).');
-            artifact('stdout.log', stdout);
-            artifact('stderr.log', stderr);
-        }, 30_000);
-        child.on('close', (code, signal) => {
-            clearTimeout(timer);
-            clearTimeout(killTimer);
-            clearInterval(heartbeat);
-            artifact('stdout.log', stdout);
-            artifact('stderr.log', stderr);
-            if (failure) reject(failure);
-            else resolve({ code, signal, timedOut, stdout: sanitizeGitDiagnostic(stdout),
-                stderr: sanitizeGitDiagnostic(stderr), durationMs: Date.now() - started });
-        });
-    });
+// The first pass must actually have restarted the graph. The earlier alternative that also accepted "no configured
+// running workspace required a restart" passed a deployment that was not live at all, so it is gone.
+function assertOptionalActivationText(output) {
+    assert.match(output, /Activation: the workspace graph was restarted and the Router health check passed\./);
+    assert.doesNotMatch(output, /Activation was blocked by:|Activation not required/);
 }
 
-try {
-    const options = parseArgs(process.argv.slice(2));
-    if (options) await main(options);
-    else console.log(usage);
-} catch (error) {
-    console.error(sanitizeGitDiagnostic(error.message));
-    process.exitCode = 1;
+export { parseArgs, validatePaths, admitLive, unverifiedRecords, assertOptionalActivationText };
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+    try {
+        const options = parseArgs(process.argv.slice(2));
+        if (options) await main(options);
+        else console.log(usage);
+    } catch (error) {
+        console.error(sanitize(error.message));
+        process.exitCode = 1;
+    }
 }

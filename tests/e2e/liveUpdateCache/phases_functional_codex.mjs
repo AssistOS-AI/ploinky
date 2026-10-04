@@ -102,7 +102,13 @@ export function createFunctionalPhases(ctx) {
         async U5() {
             const [aliasA, aliasB] = names.aliases, gc = await retainedReaderProof(ctx, aliasA, aliasB); return gc;
         },
-        async U6() { return ports.negative.run({ expectedUpdate, observeAgain: options => observeAgain(ctx, options), check: ctx.check }); },
+        async U6() {
+            const evidence = await ports.negative.run({ generation: state.generation, check: ctx.check });
+            // The required-membership case deliberately leaves its truthful pending activation for the settling update.
+            const observed = await ports.observer.observe();
+            need(observed.pendingActivation === true && observed.recoveryBarrier === false, 'continuation-pending-missing'); state.generation = observed.activeGeneration;
+            return evidence;
+        },
         async U7() {
             // Restoration, removal and the settling update are permitted only while every owned command has settled normally.
             need(ctx.latchClean(), 'writers-not-quiescent');

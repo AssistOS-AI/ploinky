@@ -58,6 +58,10 @@ test('U5: skipped collection, a lost reader or object, an unreadable marker or i
     await failsAt({ freshObjectPerAlias: true }, 'U5', 'aliases-not-identical'); await failsAt({ noReceipt: true }, 'U3', 'cache-a-unproven');
 });
 
+test('U6: a continuation run that leaves no pending activation is refused before any settlement', async () => {
+    await failsAt({ noPending: true }, 'U6', 'continuation-pending-missing');
+});
+
 test('U7 and U7b: a changed public primary configuration or a dirty run blocks settlement, freezing and cleanup', async () => {
     await failsAt({ configChanges: true }, 'U7', 'public-config-changed');
     for (const phase of ['U7', 'U7b']) {
