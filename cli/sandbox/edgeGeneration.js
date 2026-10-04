@@ -34,6 +34,12 @@ import {
     selectedRouterHostPort,
 } from './routerPort.js';
 import { compileHardwareAvailability, validateAvailabilityProjection } from '../server/hardwareAvailability.mjs';
+import {
+    inspectHardwareAvailabilityStore,
+    installHardwareAvailabilityStore,
+    restoreHardwareAvailabilityWitness,
+    sweepHardwareAvailabilityTemps,
+} from './hardwareAvailabilityStore.mjs';
 
 export const EDGE_GENERATION_SCHEMA_VERSION = 1;
 export const EDGE_TOPOLOGY_CONTAINER_DIR = '/run/ploinky-edge-topology';
@@ -197,6 +203,9 @@ export function resolveEdgeGenerationPaths({ workspaceRoot } = {}) {
         activeSelectorFile: path.join(edgeDir, 'active.json'),
         applyLockFile: path.join(edgeDir, 'apply.lock'),
         preparationLeaseFile: path.join(edgeDir, 'preparation-lease.json'),
+        availabilityWitnessFile: path.join(edgeDir, 'hardware-availability.witness.json'),
+        availabilityStoreDir: path.join(edgeDir, 'hardware-availability'),
+        availabilityPolicyFile: path.join(edgeDir, 'hardware-availability', 'policy.json'),
         topologyDir,
         topologyGenerationsDir: path.join(topologyDir, 'generations'),
         topologyCurrentFile: path.join(topologyDir, 'current.json'),
@@ -257,9 +266,51 @@ function discardEmptyDestroyTombstone(paths, present) {
     return true;
 }
 
+const AVAILABILITY_OPERATOR_RESET = 'Operator reset: run `ploinky stop`, remove both '
+    + '.ploinky/data/edge-routing/hardware-availability.witness.json and '
+    + '.ploinky/data/edge-routing/hardware-availability/, then run `ploinky start` '
+    + '(all committed hardware denials are discarded); or restore both from a backup with a matching storeId.';
+
+// The hardware-availability store of one workspace, decided under the apply
+// lock by the witness and the store directory (D1.4). `complete` says the four
+// edge sources are all present (an upgrade), not absent (a fresh workspace).
+// A present witness or directory never gets replaced or emptied: any missing
+// or invalid member refuses with EDGE_GENERATION_SOURCE_UNAVAILABLE.
+function reconcileHardwareAvailabilityStore(paths, { complete, assertApplyLock, testHooks }) {
+    const store = { paths, assertApplyLock, fsApi: testHooks?.fsApi, faults: testHooks?.faults };
+    sweepHardwareAvailabilityTemps(store);
+    const { witness, directory } = inspectHardwareAvailabilityStore(store);
+    const refuse = (detail) => {
+        throw edgeError(
+            `hardware availability store is unavailable: ${detail}; ${AVAILABILITY_OPERATOR_RESET}`,
+            'EDGE_GENERATION_SOURCE_UNAVAILABLE',
+        );
+    };
+    if (witness.state === 'invalid') refuse(`witness '${paths.availabilityWitnessFile}' ${witness.problem}`);
+    if (directory.state === 'invalid') refuse(`store '${paths.availabilityStoreDir}' ${directory.problem}`);
+    if (directory.state === 'absent') {
+        if (witness.state === 'valid') {
+            refuse(`store '${paths.availabilityStoreDir}' is missing although witness '${paths.availabilityWitnessFile}' records its initialization`);
+        }
+        installHardwareAvailabilityStore({ ...store, initializedBy: complete ? 'upgrade' : 'fresh' });
+        return complete ? 'installed-upgrade' : 'installed-fresh';
+    }
+    if (witness.state === 'valid') {
+        if (witness.document.storeId !== directory.document.storeId) {
+            refuse(`store '${paths.availabilityStoreDir}' does not match witness '${paths.availabilityWitnessFile}'`);
+        }
+        return 'kept';
+    }
+    restoreHardwareAvailabilityWitness(store);
+    return 'witness-restored';
+}
+
 export function initializeFreshEdgeRoutingSources(options = {}) {
     const paths = resolveEdgeGenerationPaths(options);
     const release = acquireApplyLock(paths, options);
+    // Process-local proof that this init holds the apply lock, for the store.
+    const applyLockCapability = Object.freeze({});
+    APPLY_LOCK_CAPABILITIES.set(applyLockCapability, paths.applyLockFile);
     try {
         const sources = [
             ['routing.json', paths.routingFile, EMPTY_ROUTING_BYTES, 0o600],
@@ -275,8 +326,8 @@ export function initializeFreshEdgeRoutingSources(options = {}) {
         if (discardEmptyDestroyTombstone(paths, present)) {
             present = sources.map(([, file]) => fs.existsSync(file));
         }
-        if (present.every(Boolean)) return Object.freeze({ initialized: false, paths });
-        if (present.some(Boolean) || hasPersistedGenerationEvidence(paths)) {
+        const complete = present.every(Boolean);
+        if (!complete && (present.some(Boolean) || hasPersistedGenerationEvidence(paths))) {
             const missing = sources
                 .filter((_, index) => !present[index])
                 .map(([label]) => label)
@@ -287,14 +338,27 @@ export function initializeFreshEdgeRoutingSources(options = {}) {
                 'EDGE_GENERATION_SOURCE_UNAVAILABLE',
             );
         }
+        // Either all four sources or none (with no generation evidence): the
+        // availability store is installed, kept or restored before any source.
+        const hardwareAvailability = reconcileHardwareAvailabilityStore(paths, {
+            complete,
+            assertApplyLock: () => {
+                if (!hasApplyLockCapability(paths, applyLockCapability)) {
+                    throw edgeError('hardware availability mutation requires the live apply lock', 'EDGE_GENERATION_CAPABILITY_REQUIRED');
+                }
+            },
+            testHooks: options.testHooks?.hardwareAvailability,
+        });
+        if (complete) return Object.freeze({ initialized: false, paths, hardwareAvailability });
         for (const [label, file, bytes, mode] of sources) {
             installImmutableDurable(file, bytes, mode, {
                 conflictMessage: `${label} appeared during fresh edge initialization`,
                 conflictCode: 'EDGE_GENERATION_SOURCE_UNAVAILABLE',
             });
         }
-        return Object.freeze({ initialized: true, paths });
+        return Object.freeze({ initialized: true, paths, hardwareAvailability });
     } finally {
+        APPLY_LOCK_CAPABILITIES.delete(applyLockCapability);
         release();
     }
 }
@@ -3063,6 +3127,20 @@ export function captureEdgeRoutingCandidateGeneration(options = {}) {
         );
     }
     return collectCapturedSources(paths).generation;
+}
+
+/**
+ * Assert that the caller holds the exact live apply lock for this workspace.
+ * The hardware-availability store's mutations are made only under it.
+ */
+export function assertEdgeGenerationApplyLockCapability(options = {}) {
+    const paths = resolveEdgeGenerationPaths(options);
+    if (!hasApplyLockCapability(paths, options.applyLockCapability)) {
+        throw edgeError(
+            'hardware availability mutation requires the exact live apply-lock capability',
+            'EDGE_GENERATION_CAPABILITY_REQUIRED',
+        );
+    }
 }
 
 /**
