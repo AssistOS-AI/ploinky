@@ -70,8 +70,9 @@ test('U6 launches the tightened runner once with exact arguments and projects on
     const h = negativeHarness(); const evidence = await h.port.run({ generation: h.generation, check() {} });
     assert.deepEqual(evidence, { phase: 'U6', optional: { exit: 1, activation: 'restarted', graphReady: true, generationChanged: true }, required: { exit: 1, activation: 'deferred', generationPreserved: true, pendingActivation: true }, cleanup: 'passed', coverage: 'continuation-only' });
     const [launch] = h.host.log; assert.equal(launch.bin, h.manifest.host.node.path); assert.deepEqual(launch.args, [path.join(h.manifest.candidate.root, 'tests/e2e/updateContinueOnError/run.mjs'), '--workspace', h.manifest.workspace.path,
-        '--manifest', path.join(h.manifest.evidence.root, 'manifest_codex.json'), '--artifacts', path.join(h.manifest.evidence.root, 'continuation'), '--ploinky', h.manifest.candidate.cliPath]);
+        '--manifest', path.join(h.manifest.evidence.root, 'manifest_codex.json'), '--artifacts', path.join(h.manifest.evidence.root, 'continuation'), '--ploinky', h.manifest.candidate.cliPath, '--generation', h.generation]);
     assert.doesNotMatch(JSON.stringify(evidence), /PRIVATE/); await rejects(h.port.run({ generation: h.generation, check() {} }), 'negative-already-run');
+    for (const bad of [undefined, '', 'has space', 'a\nb']) { const fresh = negativeHarness(); await rejects(fresh.port.run({ generation: bad, check() {} }), 'negative-already-run'); assert.equal(fresh.host.log.length, 0, 'no runner launches without an admitted generation'); }
 });
 
 test('U6 rejects a continuation record that is not a passed, restarted, then deferred, truthful pair', async () => {

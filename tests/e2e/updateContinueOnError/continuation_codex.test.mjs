@@ -15,9 +15,10 @@ after(() => fs.rmSync(parent, { recursive: true, force: true }));
 
 test('the manifest is a mandatory argument and every other option stays exact', () => {
     const base = ['--workspace', '/w', '--artifacts', '/a', '--manifest', '/m_codex.json'];
-    assert.deepEqual(parseArgs(base), { workspace: '/w', artifacts: '/a', manifest: '/m_codex.json', ploinky: path.join(here, '../../../bin/ploinky'), timeoutMs: 1_200_000 });
+    assert.deepEqual(parseArgs(base), { workspace: '/w', artifacts: '/a', manifest: '/m_codex.json', generation: null, ploinky: path.join(here, '../../../bin/ploinky'), timeoutMs: 1_200_000 });
+    assert.equal(parseArgs([...base, '--generation', 'sha256:abc']).generation, 'sha256:abc');
     assert.equal(parseArgs(['--help']), null); assert.equal(parseArgs([...base, '--timeout-ms', '5000']).timeoutMs, 5000);
-    for (const bad of [[], ['--workspace', '/w', '--artifacts', '/a'], [...base, '--manifest', '/n'], [...base, '--bogus', 'x'], [...base, '--timeout-ms', '10'], [...base, '--timeout-ms', '99999999'], ['--workspace', '--artifacts', '/a', '--manifest', '/m']]) {
+    for (const bad of [[], ['--workspace', '/w', '--artifacts', '/a'], [...base, '--manifest', '/n'], [...base, '--bogus', 'x'], [...base, '--generation', 'bad value'], [...base, '--generation', '--timeout-ms'], [...base, '--timeout-ms', '10'], [...base, '--timeout-ms', '99999999'], ['--workspace', '--artifacts', '/a', '--manifest', '/m']]) {
         assert.throws(() => parseArgs(bad), error => /Usage:|--timeout-ms/.test(error.message));
     }
 });
@@ -59,4 +60,5 @@ test('source no longer contains detached process groups, signals or the not-live
     for (const forbidden of ['detached: true', 'process.kill', "'SIGKILL'", "'SIGTERM'", '-child.pid', "|Activation not required; no configured running workspace required a restart", 'spawn(ploinky']) assert.equal(source.includes(forbidden), false, forbidden);
     assert.match(source, /admitLive\(options\)[\s\S]*loadProduct\(cliRoot\)/, 'live admission precedes the product helper import and every fixture');
     assert.match(source, /allowedExitCodes: \[1\]/);
+    assert.match(source, /live\.admit\(options\.generation \? \{ activeGeneration: options\.generation \} : \{\}\)/, 'admission uses the parent-admitted generation, not the manifest\'s pre-update one');
 });

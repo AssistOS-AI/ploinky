@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import http from 'node:http';
 import { isDeepStrictEqual } from 'node:util';
-import { AcceptanceError, need, LIMITS } from './manifest_codex.mjs';
+import { AcceptanceError, need, LIMITS, word } from './manifest_codex.mjs';
 import { assertLiveBefore } from './contracts_codex.mjs';
 import { runOwnedCommand, buildCommandEnvironment } from './host_command_codex.mjs';
 import { boxInspectArgs, parseBoxInspect, engineInfoArgs, parseEngineInfo, engineIdentityOf, gpuWiringIdentityOf, publicationsId, mountsId,
@@ -134,6 +134,12 @@ export function createLiveObserver({ manifest, deps, statusProof, httpGet = http
                 publicConfig: probed.publicConfig, activation: { generation: probed.selector.generation, activationId: probed.selector.activationId } };
         },
         // The admission is positive only when the independently observed deployment matches the manifest-derived expectation.
-        async admit() { const observed = await this.observe(); assertLiveBefore({ expected: expectedLiveFromManifest(manifest), observed }); return Object.freeze({ phase: 'U0', admitted: true, activeGeneration: observed.activeGeneration, runtimes: observed.graph.length }); },
+        // Only the edge generation may legitimately differ from the manifest after earlier mutations of the same run; a caller
+        // that passes the generation it has itself admitted keeps every other binding exact.
+        async admit(overrides = {}) {
+            need(overrides && Object.getPrototypeOf(overrides) === Object.prototype && Object.keys(overrides).every(key => key === 'activeGeneration')
+                && (overrides.activeGeneration === undefined || word(overrides.activeGeneration)), 'live-admission-override');
+            const expected = expectedLiveFromManifest(manifest); if (overrides.activeGeneration !== undefined) expected.activeGeneration = overrides.activeGeneration;
+            const observed = await this.observe(); assertLiveBefore({ expected, observed }); return Object.freeze({ phase: 'U0', admitted: true, activeGeneration: observed.activeGeneration, runtimes: observed.graph.length }); },
     });
 }

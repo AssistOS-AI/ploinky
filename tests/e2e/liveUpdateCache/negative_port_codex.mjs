@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { AcceptanceError, LIMITS, need, parseStrictJson } from './manifest_codex.mjs';
+import { AcceptanceError, LIMITS, need, parseStrictJson, word } from './manifest_codex.mjs';
 import { PHASE_CAPS_MS } from './contracts_codex.mjs';
 import { runOwnedCommand } from './host_command_codex.mjs';
 import { readBoundedRegularFile } from './worker_codex.mjs';
@@ -31,9 +31,10 @@ export function createNegativePort({ manifest, manifestPath, deps, env, io = fs 
     return Object.freeze({
         artifacts,
         async run({ generation, check }) {
-            need(!ran, 'negative-already-run'); ran = true; check();
+            // The manifest's generation predates U4; the runner must admit against the generation this run has itself admitted.
+            need(!ran && word(generation), 'negative-already-run'); ran = true; check();
             await runOwnedCommand({ operation: 'continuation-run', kind: 'continuation', cwd: manifest.workspace.path, env, deadlineMs: PHASE_CAPS_MS.U6 - 60000, collect: false, tap: { push: () => true, end() {} },
-                argv: [manifest.host.node.path, runner, '--workspace', manifest.workspace.path, '--manifest', manifestPath, '--artifacts', artifacts, '--ploinky', manifest.candidate.cliPath] }, deps);
+                argv: [manifest.host.node.path, runner, '--workspace', manifest.workspace.path, '--manifest', manifestPath, '--artifacts', artifacts, '--ploinky', manifest.candidate.cliPath, '--generation', generation] }, deps);
             check();
             let parsed; try { parsed = parseStrictJson(readBoundedRegularFile(path.join(artifacts, 'observations_codex.json'), OBSERVATION_BYTES, io), OBSERVATION_BYTES); } catch (error) { throw new AcceptanceError('continuation-observations'); }
             return validateObservations(parsed, manifest, { generation });

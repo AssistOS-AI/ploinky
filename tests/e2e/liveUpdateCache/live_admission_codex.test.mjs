@@ -135,6 +135,20 @@ test('every deviation in the live deployment refuses admission with a fixed code
     }
 });
 
+test('after a legitimate generation change the same predicate admits only the generation the caller itself admitted', async () => {
+    const moved = build((m, s) => { s.probe.selector.generation = 'generation-after-update'; s.probe.graph.forEach(row => { row.graphGeneration = 'generation-after-update'; }); });
+    await rejects(moved.observer.admit(), 'workspace-not-live');                                           // the manifest's pre-update generation no longer matches
+    assert.equal((await moved.observer.admit({ activeGeneration: 'generation-after-update' })).activeGeneration, 'generation-after-update');
+    await rejects(moved.observer.admit({ activeGeneration: 'some-other-generation' }), 'workspace-not-live');
+    for (const bad of [{ activeGeneration: 'bad value' }, { activeGeneration: 7 }, { activeGeneration: '' }, { box: { id: 'x' } }, { activeGeneration: 'generation-after-update', startedAt: 'x' }, null]) await rejects(moved.observer.admit(bad), 'live-admission-override');
+    // Every other binding stays exact under the override: a moved Box start, an unready runtime or a drifted repository still refuse.
+    for (const [mutate, code] of [[(m, s) => { s.box.startedAt = '2026-10-04T11:59:49Z'; }, 'live-box-start-epoch'], [(m, s) => { s.probe.graph[0].ready = false; }, 'graph-not-ready'], [(m, s) => { s.status.pendingActivation = true; }, 'workspace-not-live'],
+        [(m, s) => { s.repos[m.candidate.repositories[1].path].dirty = ' M x\n'; }, 'repository-not-pinned']]) {
+        const h = build((m, s) => { s.probe.selector.generation = 'generation-after-update'; s.probe.graph.forEach(row => { row.graphGeneration = 'generation-after-update'; }); mutate(m, s); });
+        await rejects(h.observer.admit({ activeGeneration: 'generation-after-update' }), code);
+    }
+});
+
 test('a non-Linux or foreign-uid host refuses before any command is launched', async () => {
     const h = build(); const other = createLiveObserver({ manifest: h.manifest, deps: h.fake.deps, statusProof: async () => h.state.status, hostFacts: { platform: 'darwin', uid } });
     await rejects(other.admit(), 'runtime-host-unqualified'); assert.equal(h.fake.log.length, 0);

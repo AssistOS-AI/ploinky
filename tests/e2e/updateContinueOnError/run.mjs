@@ -18,14 +18,14 @@ import { readBoundedRegularFile } from '../liveUpdateCache/worker_codex.mjs';
 
 const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const expectedWorkspace = path.join(os.homedir(), 'work', 'testExplorerFresh');
-const usage = 'Usage: node tests/e2e/updateContinueOnError/run.mjs --workspace ~/work/testExplorerFresh --manifest /absolute/manifest_codex.json --artifacts /absolute/new/artifact-directory [--ploinky /absolute/candidate/bin/ploinky] [--timeout-ms 1200000]';
+const usage = 'Usage: node tests/e2e/updateContinueOnError/run.mjs --workspace ~/work/testExplorerFresh --manifest /absolute/manifest_codex.json --artifacts /absolute/new/artifact-directory [--ploinky /absolute/candidate/bin/ploinky] [--generation <admitted edge generation>] [--timeout-ms 1200000]';
 
 function parseArgs(args) {
     if (args.length === 1 && args[0] === '--help') return null;
     const values = {};
     for (let index = 0; index < args.length; index += 2) {
         const name = args[index];
-        if (!['--workspace', '--artifacts', '--ploinky', '--timeout-ms', '--manifest'].includes(name)
+        if (!['--workspace', '--artifacts', '--ploinky', '--timeout-ms', '--manifest', '--generation'].includes(name)
             || Object.hasOwn(values, name) || !args[index + 1] || args[index + 1].startsWith('--')) {
             throw new Error(usage);
         }
@@ -36,7 +36,8 @@ function parseArgs(args) {
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 3_600_000) {
         throw new Error('--timeout-ms must be an integer between 1000 and 3600000.');
     }
-    return { workspace: values['--workspace'], artifacts: values['--artifacts'], manifest: values['--manifest'],
+    if (values['--generation'] !== undefined && !/^[A-Za-z0-9][A-Za-z0-9_.:/@+-]{0,511}$/.test(values['--generation'])) throw new Error(usage);
+    return { workspace: values['--workspace'], artifacts: values['--artifacts'], manifest: values['--manifest'], generation: values['--generation'] ?? null,
         ploinky: values['--ploinky'] || path.join(sourceRoot, 'bin', 'ploinky'), timeoutMs };
 }
 
@@ -127,7 +128,8 @@ async function admitLive(options) {
     const deps = { latch, custody, runId: manifest.runId, register: observer.register, current: observer.current };
     const workerHost = createWorkerHost({ manifest, deps });
     const live = createLiveObserver({ manifest, deps, statusProof: () => workerHost.status() });
-    const receipt = await live.admit();
+    // After U4 the edge generation has legitimately moved; the parent passes the one it admitted, every other binding stays exact.
+    const receipt = await live.admit(options.generation ? { activeGeneration: options.generation } : {});
     return { manifest, live, deps, latch, custody, receipt, env: buildCommandEnvironment(process.env, { PLOINKY_WORKSPACE_ROOT: manifest.workspace.path }) };
 }
 
