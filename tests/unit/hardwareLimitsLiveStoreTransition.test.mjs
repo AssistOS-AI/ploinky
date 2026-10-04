@@ -13,7 +13,7 @@ import { stopPloinkyLocalByContainerId } from '../../ploinky-box/lifecycle/conta
 import { BEHAVIOR_FAILURES, DRIVER_BOUNDS, DriverAssertion, OLD_STOP_PATH, classifyRun, oldStopArgv, runDriver, validateDriverParams } from '../hardware-limits/liveStoreTransition.mjs';
 import { PRODUCT_MUTANTS, ROOT, TRANSITION, applyPatches, describeMutation } from '../hardware-limits/c5Mutation.mjs';
 import { C5_DRIVER_SCHEMA, productEngineDigest, validateDriverReceipt } from '../hardware-limits/liveBoxTransitionCustody.mjs';
-import { REPOSITORY, intentFor, standalone } from '../hardware-limits/c5DriverWorld.mjs';
+import { ENGINE_HOST, REPOSITORY, intentFor, standalone } from '../hardware-limits/c5DriverWorld.mjs';
 import { fakeEngineInfo } from '../hardware-limits/fakeLiveEngine.mjs';
 import { engineIdentityDigest } from '../hardware-limits/liveCommon.mjs';
 import { scratch } from '../hardware-limits/executorWorld.mjs';
@@ -69,8 +69,8 @@ test('X5.c5-driver-stop-matcher-is-structural-and-equals-the-products-own-argv',
     assert.equal(classifyRun('podman', ['container', 'ps', '--all'], { workspaceRoot }).mutation, false);
 });
 
-test('X5.c5-driver-parameters-are-validated-bounded-and-bound-to-the-frozen-intent', () => {
-    const context = standalone();
+test('X5.c5-driver-parameters-are-validated-bounded-and-bound-to-the-frozen-intent', t => {
+    const context = standalone({}, t);
     const good = () => JSON.parse(JSON.stringify({
         schema: 1, mode: 'destroy', runId: context.runId, bounds: DRIVER_BOUNDS, agentRef: null, expectedToken: null, expectedContainerId: HEX64, intent: null, receiptPath: null,
         profile: { host: { home: context.home }, workspace: context.workspace, box: context.profile.box, source: context.profile.source, engine: context.profile.engine, cases: ['LIVE-C5'] },
@@ -126,7 +126,7 @@ test('X5.c5-driver-runs-the-real-writers-at-the-production-stop-boundary-then-de
     assert.equal(receipt.schema, C5_DRIVER_SCHEMA);
     assert.equal(receipt.phase, 'settled');
     assert.equal(receipt.productOperationId, summary.operationId);
-    const info = fakeEngineInfo({ arch: 'test', os: 'linux', hostname: 'fake-engine', id: 'engine-1' });
+    const info = fakeEngineInfo(ENGINE_HOST);
     assert.equal(summary.engine.product, productEngineDigest(info));
     assert.equal(summary.engine.harness, engineIdentityDigest(info, null));
     assert.equal(receipt.productEngineIdentity, summary.engine.product);
@@ -137,6 +137,16 @@ test('X5.c5-driver-runs-the-real-writers-at-the-production-stop-boundary-then-de
     assert.equal(summary.mutations.map(entry => entry.kind).join(','), 'graph-stop,box-stop,box-remove,box-create,box-start');
 });
 
+test('X5.c5-driver-passes-with-an-engine-that-reports-a-host-id-as-well-as-with-one-that-does-not', t => {
+    const host = { arch: 'test', os: 'linux', hostname: 'fake-engine', id: 'engine-1' };
+    const withId = runWorld(t, 'transition', { options: { world: { engineHost: host } } });
+    assert.equal(withId.result.exitCode, 0, JSON.stringify(withId.result.summary.primaryFailure));
+    assert.equal(withId.result.summary.engine.product, productEngineDigest(fakeEngineInfo(host)));
+    const without = runWorld(t, 'transition');
+    assert.equal(without.result.summary.engine.product, productEngineDigest(fakeEngineInfo(ENGINE_HOST)));
+    assert.notEqual(withId.result.summary.engine.product, without.result.summary.engine.product);
+});
+
 test('X5.c5-driver-binds-the-product-operation-durably-before-the-old-box-is-stopped', t => {
     const { result } = runWorld(t, 'transition');
     const receipt = result.receipt;
@@ -144,7 +154,7 @@ test('X5.c5-driver-binds-the-product-operation-durably-before-the-old-box-is-sto
     const delegated = receipt.events.find(event => event.kind === 'delegated-graph-stop');
     assert.ok(bound && delegated && bound.sequence < delegated.sequence, 'the binding event precedes the delegated stop in the receipt');
     // The settled receipt validates against the frozen intent, and an altered binding is refused.
-    const world = standalone();
+    const world = standalone({}, t);
     const intent = intentFor(world);
     assert.throws(() => validateDriverReceipt({ ...receipt, binding: { ...receipt.binding, rootBoxId: 'c'.repeat(64) } }, intent, world.profile), /invalid driver receipt or binding/);
     assert.throws(() => validateDriverReceipt({ ...receipt, phase: 'bound', productOperationId: null }, intent, world.profile), /./);
@@ -170,7 +180,7 @@ test('X5.c5-driver-writer-first-is-refused-with-the-typed-error-before-any-lifec
 
 test('X5.c5-driver-refuses-a-lifecycle-mutation-in-the-writer-first-order-itself', async t => {
     // A product that did NOT refuse (a broken one) would reach the engine runner; the decoration refuses every mutation before it is delegated.
-    const context = standalone();
+    const context = standalone({}, t);
     const calls = [];
     const base = { query: () => ({ ok: true, status: 0, stdout: '', stderr: '' }), run(command, args) { calls.push([command, args]); return Buffer.from(''); }, stream: async () => ({ ok: true }) };
     const { driverParams } = await import('../hardware-limits/liveStoreTransition.mjs');
@@ -229,15 +239,24 @@ test('X5.c5-driver-a-production-rollback-after-an-engine-failure-keeps-the-reque
 });
 
 test('X5.c5-driver-a-boundary-past-its-ceiling-is-a-setup-failure-never-a-kill-or-a-refusal', t => {
-    const { result } = runWorld(t, 'transition', { options: { bounds: { boundaryMs: 1 } } });
+    // Deterministic: a stepping clock advances 60 s at every reading, so the 150 s ceiling expires after a fixed number of readings, never by wall time.
+    const { result } = runWorld(t, 'transition', { options: { steppingClockMs: 60000 } });
     const failure = result.summary.primaryFailure;
     assert.equal(failure.kind, 'setup');
     assert.match(failure.message, /exceeded its ceiling/);
     assert.equal(BEHAVIOR_FAILURES.includes(failure.kind), false);
     assert.equal(result.summary.outcome.state, 'failed');
-    assert.equal(result.summary.outcome.rolledBack, true, 'the product rolled the gate-on Box back');
     assert.equal(result.summary.boundary, null, 'no boundary was reached, so no writer ran');
     assert.equal(result.adminCalls.length, 0);
+    // The product rolled the gate-on Box back by itself, judged from the world and its own journal (not from the clock): the original Box runs, the gate is
+    // on, no transition is pending, no barrier is left, and the stop was never delegated.
+    assert.deepEqual(result.transitions, []);
+    assert.deepEqual(result.containers.map(entry => [entry.id, entry.running, entry.gateOn]), [[result.boxId, true, true]]);
+    assert.equal(result.gate, true);
+    assert.equal(result.store.barrier, null);
+    assert.equal(result.engineEvents.filter(event => !event.startsWith('stderr:') && event !== 'prepare').includes('graph-stop'), false);
+    assert.equal(result.summary.outcome.errorCode, 'PLOINKY_BOX_HARDWARE_TRANSITION_ROLLED_BACK');
+    assert.equal(result.summary.unboundTransitionIds.length + (result.summary.operationId ? 1 : 0), 1, 'the one product transition is named, bound or not');
 });
 
 test('X5.c5-driver-a-changed-engine-identity-or-a-missing-journal-is-a-setup-failure-with-no-writer-run', t => {

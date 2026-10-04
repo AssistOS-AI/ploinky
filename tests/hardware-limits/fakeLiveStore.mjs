@@ -146,7 +146,7 @@ export function createFakeStore({ base, workspace, home, faults = {}, lifecycle 
         const state = worldState();
         const record = boxRecord(state);
         const world = createDowngradeWorld({ root: path.join(home, '.c5-model'), workspace: { path: workspace }, home, identity, boxId: record.id, created: record.created,
-            hostPort: lifecycle.ports.tcp, mediaHostPort: lifecycle.ports.udp, repositoryRoot: lifecycle.source, linkProduct: false, faults: lifecycle.world ?? {},
+            hostPort: lifecycle.ports.tcp, mediaHostPort: lifecycle.ports.udp, repositoryRoot: lifecycle.source, linkProduct: false, faults: lifecycle.world ?? {}, ...(lifecycle.engineHost ? { engineHost: lifecycle.engineHost } : {}),
             ...(options?.env?.PLOINKY_BOX_IMAGE ? { imageRef: options.env.PLOINKY_BOX_IMAGE } : {}) });
         world.restoreHome();
         Object.assign(record, engineRecordFromHandle(world.oldHandle, { created: record.created }), { name: identity.instance, imageName: record.imageName });
@@ -184,6 +184,7 @@ export function createFakeStore({ base, workspace, home, faults = {}, lifecycle 
         const after = { params, summary, receiptPath: params.receiptPath, statePath: base.statePath, store: context() };
         if (faults.afterDriver) await faults.afterDriver(params.mode, after);
         if (faults.driverTimeout === params.mode) return ok(`${JSON.stringify(summary)}\n`, { status: null, signal: 'SIGTERM', timedOut: true });
+        if (faults.driverCancelled === params.mode) return ok(`${JSON.stringify(summary)}\n`, { status: null, signal: 'SIGTERM', cancelled: true, settlementForced: faults.driverForcedSettlement === params.mode });
         if (faults.driverForcedSettlement === params.mode) return ok(`${JSON.stringify(summary)}\n`, { status: null, signal: 'SIGKILL', settlementForced: true });
         return ok(`${JSON.stringify(after.summary)}\n`, { status: after.exitCode ?? run.exitCode });
     }

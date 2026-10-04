@@ -9,7 +9,7 @@ import path from 'node:path';
 import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { normalizeContainerRuntime, validateContainerConfiguration } from '../../ploinky-box/contract/container.mjs';
 import { digestOf, validateJournal } from '../../ploinky-box/hardwareLimitsTransition.mjs';
-import { writePrivateJson } from './fixtures.mjs';
+import { fsyncDirectory, writePrivateJson } from './fixtures.mjs';
 import { HASH, ID, RUN_ID, absolute, assertWorkspace, bounded, canonicalDigest, digest, jsonDigest, keys } from './liveCommon.mjs';
 
 export const C5_INTENT_SCHEMA = 'ploinky.hwl-c5-invocation/v1';
@@ -27,13 +27,16 @@ const problem = message => Object.assign(new Error(`C5 custody: ${message}`), { 
 const normalizeImage = value => String(value ?? '').replace(/^sha256:/, '');
 export const sameImage = (left, right) => normalizeImage(left) !== '' && normalizeImage(left) === normalizeImage(right);
 
-// The product's own engine identity (engine/discovery.mjs engineIdentity): sha256 over ['podman', host.id, store.graphRoot, store.runRoot,
-// version.APIVersion]. It is built differently from the harness's engine digest; both are computed from ONE fresh `info` document.
+// The product's own engine identity, constructed exactly as engine/discovery.mjs engineIdentity does: sha256 over
+// JSON.stringify(['podman', host.id, store.graphRoot, store.runRoot, version.APIVersion]) where each value is the first of its two spellings that is
+// not undefined, and an absent one is serialized as null. A podman 5.7 `info` has no host.id, so absent MUST be null here, never a refusal: the
+// product accepts that engine and writes the journal's identity from it. It is built differently from the harness's engine digest; both are
+// computed from ONE fresh `info` document.
+const firstDefined = (...values) => values.find(value => value !== undefined);
 export function productEngineDigest(info) {
-    const values = [info?.host?.id ?? info?.Host?.ID, info?.store?.graphRoot ?? info?.Store?.GraphRoot,
-        info?.store?.runRoot ?? info?.Store?.RunRoot, info?.version?.APIVersion ?? info?.Version?.APIVersion];
-    if (values.some(value => typeof value !== 'string' || !value || value.length > 1024)) throw problem('incomplete product engine identity');
-    return crypto.createHash('sha256').update(JSON.stringify(['podman', ...values])).digest('hex');
+    const values = [firstDefined(info?.host?.id, info?.Host?.ID), firstDefined(info?.store?.graphRoot, info?.Store?.GraphRoot),
+        firstDefined(info?.store?.runRoot, info?.Store?.RunRoot), firstDefined(info?.version?.APIVersion, info?.Version?.APIVersion)];
+    return crypto.createHash('sha256').update(Buffer.from(JSON.stringify(['podman', ...values]))).digest('hex');
 }
 
 // Whether the owned transport proves the driver's whole process group ended: its manifest operation was observed (a command is observed only
@@ -140,8 +143,7 @@ export function readPrivateC5File(target, { json = true, missing = false, maxByt
         const bytes = fs.readFileSync(fd);
         if (sync) {
             fs.fsyncSync(fd);
-            const directory = fs.openSync(path.dirname(target), fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
-            try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+            fsyncDirectory(path.dirname(target));
         }
         return json ? JSON.parse(bytes.toString('utf8')) : bytes;
     } finally { fs.closeSync(fd); }
@@ -282,7 +284,8 @@ export function c5ChainIds(run, profile) {
 //   driver         the validated driver receipt, or null when none exists
 //   driverSettled  the owned transport's own proof that the driver's process group ended (the manifest operation is `observed`); saved PIDs are
 //                  never used and nothing is signalled
-//   engineIdentity the product's engine digest from the SAME fresh observation the harness digest was checked against
+//   engineIdentity the product's engine digest from the SAME fresh observation the harness digest was checked against, or a function that computes it
+//                  (called only where a bound journal needs it)
 //   ids            every container ID the engine lists now; unrelatedIds the pre-run inventory
 //   inspect(id)    the full `container inspect` document of one exact ID
 // Returns { ids: every chain ID, current: the receipt of the one live generation (or null), journal, unbound }.
@@ -305,6 +308,7 @@ export async function reconcileC5Custody({ run, profile, driver, driverSettled, 
     }
     validateDriverReceipt(driver, intent, profile);
     if (JSON.stringify(newIds) !== JSON.stringify([driver.productOperationId])) throw problem('unexpected product transitions');
+    engineIdentity = typeof engineIdentity === 'function' ? engineIdentity() : engineIdentity;
     const journal = validateBoundJournal(readC5ProductJournal(profile, driver.productOperationId), intent, driver, profile, engineIdentity);
     readC5Snapshot(profile, journal.old.configurationRef);
     readC5Snapshot(profile, journal.desired.configurationRef);

@@ -11,6 +11,8 @@ import { requireTransport } from './liveProcess.mjs';
 import { LIMITS_HASH_LABEL } from '../../cli/sandbox/hardwareLimits/resolve.mjs';
 
 export const ID = /^[a-f0-9]{64}$/;
+// One cleanup proof per action: the live run's own cleanup and the standalone cleanup action never write the same file.
+export const c5CleanupProofName = action => `c5-cleanup-proof-${action}`;
 export const HASH = /^sha256:[a-f0-9]{64}$/;
 export const RUN_ID = /^[a-f0-9]{32}$/;
 export const OWNER_MARKER = '.ploinky-hwl-owner';

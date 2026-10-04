@@ -10,8 +10,8 @@ import path from 'node:path';
 import { LIVE_CASES, executeCleanupRun, executeLiveRun, validateProfile } from '../hardware-limits/liveHarness.mjs';
 import { provisionRun } from '../hardware-limits/liveFixture.mjs';
 import { createFakeStore } from '../hardware-limits/fakeLiveStore.mjs';
-import { world, free } from '../hardware-limits/executorWorld.mjs';
-import { artifactPathFor } from '../hardware-limits/liveCommon.mjs';
+import { ENGINE_HOST, world, free } from '../hardware-limits/executorWorld.mjs';
+import { artifactPathFor, c5CleanupProofName } from '../hardware-limits/liveCommon.mjs';
 import { C5_BOX_SCHEMA, C5_DRIVER_NAME, c5IntentOf, validateC5BoxReceipts } from '../hardware-limits/liveBoxTransitionCustody.mjs';
 import { WRITER_FIRST_CODE, assertWriterFirstRefusal, parseDriverSummary, transportProblem } from '../hardware-limits/liveStoreLifecycle.mjs';
 import { C5_CLEANUP_PROOF, C5_LIVE_ARTIFACTS, c5CleanupProofProblem, c5RequiredArtifacts } from '../hardware-limits/liveStage.mjs';
@@ -30,7 +30,7 @@ async function liveWorld(t, { faults = {}, lifecycleFaults = {} } = {}) {
     const w = world(t, { block: BLOCK, extraSource: { 'ploinky-box/seccomp/podman-nested-pid-fallback.json': SECCOMP } });
     const workspace = w.run.target.execution.provision.workspace.path;
     const fake = createFakeStore({ base: { provider: w.engineProvider, node: w.node, statePath: w.statePath }, workspace, home: w.home, faults,
-        lifecycle: { source: w.run.target.execution.source.root, ports: w.run.ports, world: lifecycleFaults } });
+        lifecycle: { source: w.run.target.execution.source.root, ports: w.run.ports, world: lifecycleFaults, engineHost: ENGINE_HOST } });
     const report = await provisionRun({ run: w.run, persist: w.persist, processProvider: fake.provider, portProbe: free, hostIdentity: w.hostIdentity, remoteArrival: w.remote, validateProfile });
     assert.equal(report.verdict, 'PASS', JSON.stringify(report.limitations));
     return { w, fake, workspace };
@@ -109,7 +109,7 @@ test('X5.c5-lifecycle-restart-on-writer-first-and-transition-first-pass-over-the
     assert.doesNotThrow(() => validateProfile(w.run, { partial: true }));
     // Cleanup left nothing: no Box, and the proof of this action names the whole chain absent.
     assert.deepEqual(boxIds(context), []);
-    const proof = result.artifacts.get(C5_CLEANUP_PROOF);
+    const proof = result.artifacts.get(c5CleanupProofName('live'));
     assert.deepEqual([proof.action, proof.chain, proof.absent, proof.remaining], ['live', [original, transition.final.id], [original, transition.final.id], []]);
     assert.equal(proof.destroyedThrough, 'exact-id driver');
 });
@@ -148,7 +148,7 @@ test('X5.c5-lifecycle-a-production-rollback-fails-the-requested-transition-and-c
     const modes = outcome.context.fake.model.driverRuns;
     assert.deepEqual(modes.map(entry => entry.mode), ['writer-first', 'transition', 'destroy']);
     assert.equal(modes[2].expectedContainerId, linked[0].id);
-    const proof = outcome.artifacts.get(C5_CLEANUP_PROOF);
+    const proof = outcome.artifacts.get(c5CleanupProofName('live'));
     assert.equal(proof.chain.length, 2);
     assert.equal(proof.chain[1], linked[0].id);
 });
@@ -178,6 +178,20 @@ test('X5.c5-lifecycle-a-writer-first-refusal-that-moved-the-stamp-the-policy-or-
         for (const box of Object.values(file.boxes)) box.pid = 4242;
         fs.writeFileSync(statePath, JSON.stringify(file));
     } } }, /The refused writer-first restart changed the Box, the policy, the stamp, the gate or the transitions/);
+});
+
+test('X5.c5-lifecycle-a-cancelled-driver-records-how-it-ended-so-a-proved-exit-is-cleaned-and-a-forced-one-is-preserved', async t => {
+    // The block timer or an abort cancels the driver: the process group ended (its exit was proved), so the replacement the product committed is
+    // followed by cleanup; the case itself is never a pass.
+    const cancelled = await fails(t, { faults: { driverCancelled: 'transition' } }, /gate-off lifecycle driver was cancelled; that is neither a refusal nor a pass/);
+    const intent = c5IntentOf(cancelled.context.w.run);
+    assert.deepEqual([intent.state, intent.driverResult.cancelled, intent.driverResult.settlementForced], ['observed', true, false]);
+    assert.deepEqual(boxIds(cancelled.context), [], 'cleanup destroyed the proven replacement');
+    // A cancellation that needed a forced settlement does not prove the group ended: cleanup preserves everything.
+    const forced = await fails(t, { faults: { driverCancelled: 'transition', driverForcedSettlement: 'transition' } }, /was cancelled/, { cleanup: 'failed' });
+    assert.match(forced.report.cleanup.failures.join(' '), /not proven settled by the owned transport/);
+    assert.equal(c5IntentOf(forced.context.w.run).driverResult.settlementForced, true);
+    assert.equal(boxIds(forced.context).length, 1, 'the replacement is preserved');
 });
 
 test('X5.c5-lifecycle-the-drivers-primary-assertion-failure-stays-the-answer-and-a-missing-or-altered-receipt-is-refused', async t => {

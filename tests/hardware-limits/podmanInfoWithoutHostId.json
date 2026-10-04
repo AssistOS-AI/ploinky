@@ -1,0 +1,34 @@
+{
+  "host": {
+    "arch": "amd64",
+    "cgroupManager": "systemd",
+    "cgroupVersion": "v2",
+    "kernel": "7.0.0-34-generic",
+    "os": "linux",
+    "remoteSocket": {
+      "path": "/run/user/1000/podman/podman.sock",
+      "exists": true
+    },
+    "rootlessNetworkCmd": "pasta",
+    "serviceIsRemote": false,
+    "ociRuntime": {
+      "name": "crun",
+      "package": "crun_1.21-1ubuntu3_amd64",
+      "path": "/usr/bin/crun",
+      "version": "crun version 1.21\ncommit: 10269840aa07fb7e6b7e1acff6198692d8ff5c88\nrundir: /run/user/1000/crun\nspec: 1.0.0\n+SYSTEMD +SELINUX +APPARMOR +CAP +SECCOMP +EBPF +CRIU +WASM:wasmedge +YAJL"
+    },
+    "variant": "",
+    "hostname": "apparatus-redacted",
+    "security": {
+      "rootless": true
+    }
+  },
+  "store": {
+    "graphRoot": "/home/skutner/.local/share/containers/storage",
+    "runRoot": "/run/user/1000/containers"
+  },
+  "version": {
+    "APIVersion": "5.7.0",
+    "Version": "5.7.0"
+  }
+}

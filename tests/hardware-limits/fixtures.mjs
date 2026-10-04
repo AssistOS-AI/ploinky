@@ -656,6 +656,7 @@ export function buildRequiredCaseManifest() {
             'X5.c5-driver-parameters-are-validated-bounded-and-bound-to-the-frozen-intent',
             'X5.c5-driver-runs-the-real-writers-at-the-production-stop-boundary-then-delegates-the-stop-once-and-commits-gate-off',
             'X5.c5-driver-binds-the-product-operation-durably-before-the-old-box-is-stopped',
+            'X5.c5-driver-passes-with-an-engine-that-reports-a-host-id-as-well-as-with-one-that-does-not',
             'X5.c5-driver-writer-first-is-refused-with-the-typed-error-before-any-lifecycle-mutation',
             'X5.c5-driver-refuses-a-lifecycle-mutation-in-the-writer-first-order-itself',
             'X5.c5-driver-destroy-guards-the-exact-id-and-delegates-the-products-own-destroy-unchanged',
@@ -675,6 +676,7 @@ export function buildRequiredCaseManifest() {
             'X5.c5-lifecycle-a-gate-off-restart-that-is-not-refused-in-the-writer-first-order-is-a-failure-and-no-mutation-reaches-the-engine',
             'X5.c5-lifecycle-a-production-rollback-fails-the-requested-transition-and-cleanup-follows-the-rollback-generation-exactly',
             'X5.c5-lifecycle-a-timeout-is-never-a-pass-and-a-forced-settlement-preserves-the-chain-for-a-later-cleanup',
+            'X5.c5-lifecycle-a-cancelled-driver-records-how-it-ended-so-a-proved-exit-is-cleaned-and-a-forced-one-is-preserved',
             'X5.c5-lifecycle-a-writer-first-refusal-that-moved-the-stamp-the-policy-or-the-box-is-a-failure-naming-what-changed',
             'X5.c5-lifecycle-the-drivers-primary-assertion-failure-stays-the-answer-and-a-missing-or-altered-receipt-is-refused',
             'X5.c5-lifecycle-the-final-proof-of-the-replacement-names-what-is-wrong-with-it',
@@ -690,6 +692,8 @@ export function buildRequiredCaseManifest() {
             'X5.c5-cleanup-base-refuses-the-valid-live-replacement-as-foreign-and-the-candidate-reconciles-and-destroys-only-it',
             'X5.c5-cleanup-proves-every-id-of-the-chain-absent-not-only-the-original-and-never-by-label-alone',
             'X5.c5-private-json-writes-fsync-the-file-and-then-the-containing-directory-after-the-rename-so-custody-survives-a-crash',
+            'X5.c5-private-json-directory-fsync-tolerates-exactly-the-products-unsupported-platform-codes-and-throws-on-anything-else',
+            'X5.c5-engine-identity-of-a-real-podman-5-7-capture-without-a-host-id-equals-the-products-own-and-is-never-a-refusal',
             'X5.c5-cleanup-crash-row-journal-and-barrier-exist-but-the-binding-was-never-persisted-is-resolved-from-the-products-records-and-leaves-nothing',
             'X5.c5-cleanup-crash-row-bound-before-the-old-graph-is-stopped-is-resolved-from-the-products-records-and-leaves-nothing',
             'X5.c5-cleanup-crash-row-old-box-stopped-and-removed-with-no-candidate-is-resolved-from-the-products-records-and-leaves-nothing',
@@ -1644,6 +1648,22 @@ export function validateReport(value) {
     return value;
 }
 
+// Directory fsync, tolerating exactly the product's unsupported-platform codes (cli/sandbox/edgeGeneration.js fsyncDirectory): a host filesystem that
+// cannot fsync a directory keeps file fsync and the atomic rename authoritative. Any other failure (EIO, EACCES, ENOSPC...) is thrown, because a
+// custody write that may not be durable must not look durable.
+export const DIRECTORY_FSYNC_UNSUPPORTED = Object.freeze(['EINVAL', 'ENOTSUP', 'EISDIR', 'EBADF']);
+export function fsyncDirectory(directory) {
+    let fd;
+    try {
+        fd = fs.openSync(directory, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+        fs.fsyncSync(fd);
+    } catch (error) {
+        if (!DIRECTORY_FSYNC_UNSUPPORTED.includes(error?.code)) throw error;
+    } finally {
+        if (fd !== undefined) fs.closeSync(fd);
+    }
+}
+
 // No-follow private atomic JSON write into an owned output directory.
 export function writePrivateJson(target, value) {
     const directory = path.dirname(target);
@@ -1671,7 +1691,6 @@ export function writePrivateJson(target, value) {
         if (error?.code !== 'ENOENT') throw error;
     }
     fs.renameSync(temporary, target);
-    const directoryFd = fs.openSync(directory, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
-    try { fs.fsyncSync(directoryFd); } finally { fs.closeSync(directoryFd); }
+    fsyncDirectory(directory);
     return target;
 }

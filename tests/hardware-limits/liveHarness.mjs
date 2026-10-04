@@ -249,7 +249,7 @@ export function createLiveAdapter(profile, {
     // `journal: false` is for read-only observations that a case repeats many
     // times (the journal is bounded); every mutation stays journaled. `abort`
     // adds one more cancellation to the block's own (a monitored probe).
-    async function command(kind, binary, args, { deadlineMs = 30000, stress = false, cleanup = false, gate = null, tolerate = false, capture = null, journal = true, abort = null, maxBytes = 65536 } = {}) {
+    async function command(kind, binary, args, { deadlineMs = 30000, stress = false, cleanup = false, gate = null, tolerate = false, capture = null, journal = true, abort = null, maxBytes = 65536, tolerateCancel = false } = {}) {
         assertWorkspace(profile);
         if (['pressure', 'destroy-box'].includes(kind) && liveSourceDigest(profile.source.root) !== profile.source.digest) throw new Error('Candidate source changed');
         let op = null;
@@ -272,7 +272,8 @@ export function createLiveAdapter(profile, {
             catch (error) { if (op) op.artifactError = String(error?.message || error).slice(0, 256); }
             if (op) persist();
         }
-        if (tolerate && !result.cancelled) return result;
+        // `tolerateCancel` (LIVE-C5's transition driver only): a cancelled command still returns, so the caller records how it ended before it fails.
+        if (tolerate && (!result.cancelled || tolerateCancel)) return result;
         requireTransport(result, { stress });
         return result;
     }

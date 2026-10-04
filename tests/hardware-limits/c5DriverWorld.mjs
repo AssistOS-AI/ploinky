@@ -42,7 +42,8 @@ import { INSPECT, OWNER_MARKER, engineIdentityDigest, jsonDigest, liveSourceDige
 export const REPOSITORY = fs.realpathSync(new URL('../..', import.meta.url).pathname);
 const AGENT_REF = `${FIXTURE_REPOSITORY}/s`;
 const ENVELOPE = Object.freeze({ memoryBytes: 8 * 1024 ** 3, cpus: 4 });
-const ENGINE_HOST = Object.freeze({ arch: 'test', os: 'linux', hostname: 'fake-engine', id: 'engine-1' });
+// podman 5.7 reports no host.id (every retained apparatus capture); the product accepts that engine and its identity holds null in that place.
+export const ENGINE_HOST = Object.freeze({ arch: 'test', os: 'linux', hostname: 'fake-engine' });
 const hex = value => crypto.createHash('sha256').update(String(value)).digest('hex');
 
 // ---- the Box as the product's own contract validators see it (shaped like the gate tests' fixture) ----
@@ -358,8 +359,11 @@ export function reloadWorld(root, { faults = {} } = {}) {
     return { meta, world, profile: meta.profile };
 }
 
-export function standalone(scenarioOptions = {}) {
+// `t` (a node test context) removes the scratch world, and restores HOME, when the test ends.
+export function standalone(scenarioOptions = {}, t = null) {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(process.env.C5_WORLD_TMP || os.tmpdir(), 'c5w-')));
+    const home0 = process.env.HOME;
+    t?.after(() => { process.env.HOME = home0; fs.rmSync(root, { recursive: true, force: true }); });
     const runId = crypto.randomBytes(16).toString('hex');
     const workspace = createWorkspace(root, runId);
     const home = path.join(root, 'home');
@@ -405,7 +409,10 @@ export async function runScenario(name, options = {}) {
     fs.writeFileSync(path.join(context.root, 'world_meta.json'), JSON.stringify({ runId: context.runId, root: context.root, home: context.home, workspace: context.workspace, profile, run: { runId: context.runId },
         intent: params.intent, receiptPath, mode: name, hostPort: world.hostPort, mediaHostPort: world.mediaHostPort }));
     world.persistState();
-    const result = await runDriver(params, { baseRunner: world.runner, supervisor: world.makeSupervisor, programRoot: REPOSITORY, onStep: world.onStep });
+    // A stepping clock makes the boundary ceiling deterministic: every reading of the time advances it, wall time never matters.
+    let clock = 0;
+    const now = options.steppingClockMs ? () => (clock += options.steppingClockMs) : undefined;
+    const result = await runDriver(params, { baseRunner: world.runner, supervisor: world.makeSupervisor, programRoot: REPOSITORY, onStep: world.onStep, ...(now ? { now } : {}) });
     let receipt = null;
     if (name === 'transition') receipt = readPrivateC5File(receiptPath);
     const after = readStoreSnapshot({ paths: world.paths, identity: world.identity });

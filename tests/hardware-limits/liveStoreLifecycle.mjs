@@ -168,7 +168,7 @@ export function createLifecycle({ profile, run, command, engine, inspectBox, per
         // Write-ahead: the invocation is durable in the manifest (file and directory fsynced) before the driver, or anything it starts, can run.
         run.operations.push(intent); persist();
         const params = driverParams({ mode: 'transition', profile, run, intent, receiptPath, expectedToken: { epoch: token.epoch, revision: token.revision }, agentRef });
-        const result = await command(C5_DRIVER_NAME, profile.node.path, driverArgv(profile, params), { gate: 'off', deadlineMs: TRANSITION_BOUNDS.lifecycleMs, tolerate: true, capture: 'c5-transition-driver' });
+        const result = await command(C5_DRIVER_NAME, profile.node.path, driverArgv(profile, params), { gate: 'off', deadlineMs: TRANSITION_BOUNDS.lifecycleMs, tolerate: true, capture: 'c5-transition-driver', tolerateCancel: true });
         // The owned transport's own proof of how the driver ended, kept on the invocation: cleanup never trusts a saved PID.
         intent.state = 'observed';
         intent.driverResult = { status: result.status, signal: result.signal, timedOut: Boolean(result.timedOut), truncated: Boolean(result.truncated), cancelled: Boolean(result.cancelled),

@@ -389,11 +389,14 @@ export async function runDriver(rawParams, seams = {}) {
         });
         persistReceipt();
     }
+    const safeTransitionIds = () => { try { return productTransitionIds(profile); } catch { return []; } };
     const summary = {
         schema: DRIVER_SCHEMA, driver: C5_DRIVER_NAME, mode: params.mode, outcome, primaryFailure: primary, failures: state.failures.slice(0, 8),
         boundary: state.boundary, operationId: state.operationId, mutations: state.mutations.slice(0, 32), runCalls: state.runCalls,
         events: events.slice(0, MAX_EVENTS), stdoutTail: out.tail(), stderrTail: err.tail(),
         engine: state.engine ? { harness: state.engine.harness, product: state.engine.product } : null,
+        // Product transitions of this invocation that no binding names (a setup failure before the binding): evidence for cleanup, never adopted.
+        unboundTransitionIds: params.mode === 'transition' && !state.operationId ? safeTransitionIds().filter(id => !state.intent.priorTransitionIds.includes(id)) : [],
     };
     return { exitCode: outcome.state === 'success' ? 0 : 1, summary };
 }

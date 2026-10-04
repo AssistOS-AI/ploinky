@@ -12,7 +12,7 @@ import crypto from 'node:crypto';
 import { EXIT, validateRunManifest } from './fixtures.mjs';
 import { runBoundedProcess } from './liveProcess.mjs';
 import { assertLocalSshPins, dispatchRemoteRun, safePath, sshOptions, validateRemoteTarget } from './liveRemote.mjs';
-import { HASH, OWNER_MARKER, RUN_ID, artifactPathFor, digest, failureEvidenceNames, jsonDigest, keys } from './liveCommon.mjs';
+import { HASH, OWNER_MARKER, RUN_ID, artifactPathFor, c5CleanupProofName, digest, failureEvidenceNames, jsonDigest, keys } from './liveCommon.mjs';
 
 const WORD = /^[A-Za-z0-9_./:=,%+@-]+$/;
 export const REMOTE_PARENT = '.cache/ploinky-hwlimits';
@@ -175,7 +175,7 @@ const STAT_LINE = /^([a-z ]+):([0-9]+):([0-9]+):(\/[^\n]+)$/;
 // LIVE-C5 (the store block): the actual lifecycle section's evidence, each file written with a failure that throws, and the cleanup proof. A PASS
 // without them is not certified and the remote staging root is kept.
 export const C5_LIVE_ARTIFACTS = Object.freeze(['store-restart-on', 'store-writer-first', 'store-writer-first-clear', 'store-transition-first', 'store-final-generation', 'store-c5-receipt']);
-export const C5_CLEANUP_PROOF = 'c5-cleanup-proof';
+export const C5_CLEANUP_PROOF = c5CleanupProofName('cleanup');
 export function c5RequiredArtifacts({ profile, action, remoteReport, fetched = null }) {
     if (remoteReport?.verdict !== 'PASS') return [];
     if (action === 'cleanup') return [C5_CLEANUP_PROOF];
@@ -211,7 +211,7 @@ export function llmCleanupProofProblem(bytes, { runId }) {
     return null;
 }
 
-// Why a fetched `c5-cleanup-proof` does not certify THIS cleanup, or null: it must be this run's, written by a cleanup action (not by the live run),
+// Why a fetched `c5-cleanup-proof-cleanup` does not certify THIS cleanup, or null: it must be this run's, written by a cleanup action (not by the live run),
 // and name a chain of IDs that is entirely absent.
 export function c5CleanupProofProblem(bytes, { runId }) {
     let proof;

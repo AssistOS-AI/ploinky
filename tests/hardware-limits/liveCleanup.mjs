@@ -12,7 +12,7 @@ import { createTransitionStore } from '../../ploinky-box/hardwareLimitsTransitio
 import { requireTransport, runBoundedProcess } from './liveProcess.mjs';
 import {
     HOST_RECORD_DIRECTORIES, ID, INSPECT, OWNER_MARKER, assertOwnedDirectory, assertWorkspace, boxPsArgv, candidateEnv, checkedJson, commandTails, hostRecordPaths,
-    canonicalDigest, jsonDigest, liveSourceDigest, observeEngineFacts, quarantinePath,
+    c5CleanupProofName, canonicalDigest, jsonDigest, liveSourceDigest, observeEngineFacts, quarantinePath,
 } from './liveCommon.mjs';
 import { c5ChainIds, c5IntentOf, driverSettled, productEngineDigest, readDriverReceipt, reconcileC5Custody, sameImage } from './liveBoxTransitionCustody.mjs';
 import { driverArgv, driverParams } from './liveStoreTransition.mjs';
@@ -199,7 +199,7 @@ export async function runOwnedCleanup({ run, profile, persist = () => {}, proces
     if (profile.cases?.includes('LIVE-C5') && typeof artifacts === 'function' && proofAction) {
         // The proof this cleanup action ends with: every generation of the chain is absent and the owned records are gone. It is written by THIS
         // action for THIS run; the stager accepts no other.
-        artifacts('c5-cleanup-proof', { schema: 1, runId: run.runId, action: proofAction, at: Date.now(), invocationId: c5?.invocationId ?? null, chain: ownedIds(),
+        artifacts(c5CleanupProofName(proofAction), { schema: 1, runId: run.runId, action: proofAction, at: Date.now(), invocationId: c5?.invocationId ?? null, chain: ownedIds(),
             absent: ownedIds(), remaining: [], destroyedThrough: c5 ? 'exact-id driver' : 'candidate destroy', unrelatedInventory: 'unchanged' });
     }
 
@@ -233,7 +233,7 @@ export async function runOwnedCleanup({ run, profile, persist = () => {}, proces
         const entry = step('c5-custody') || begin('c5-custody');
         entry.state = 'intent'; persist();
         const custody = await reconcileC5Custody({
-            run, profile, driver, driverSettled: driverSettled(run), engineIdentity: productEngineDigest(engineFacts.info), ids,
+            run, profile, driver, driverSettled: driverSettled(run), engineIdentity: () => productEngineDigest(engineFacts.info), ids,
             unrelatedIds: (run.preInventory.containers || []).map(value => value.id),
             inspect: async id => {
                 const result = await engine('c5-inspect-generation', ['container', 'inspect', id], { maxBytes: 262144 });

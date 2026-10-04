@@ -4,17 +4,20 @@
 // process. The cleanup under test is the actual `runOwnedCleanup`; the engine behind it is the stub engine of that world. Nothing starts a container.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
 import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
+import { discoverBoxOwnership } from '../../ploinky-box/engine/discovery.mjs';
 import { readBarrier } from '../../cli/sandbox/hardwareLimits/store.mjs';
 import { REPOSITORY, engineRecordFromHandle, rawInspectFromHandle, reloadWorld, standalone } from '../hardware-limits/c5DriverWorld.mjs';
 import { runDriver } from '../hardware-limits/liveStoreTransition.mjs';
 import { evaluateTemplate, inspectModel, ok } from '../hardware-limits/fakeLiveEngine.mjs';
-import { INSPECT, OWNER_MARKER, jsonDigest } from '../hardware-limits/liveCommon.mjs';
+import { observeEngine } from '../hardware-limits/liveStoreTransition.mjs';
+import { INSPECT, OWNER_MARKER, engineIdentityDigest, jsonDigest } from '../hardware-limits/liveCommon.mjs';
 import {
     C5_BOX_PROVENANCE, C5_BOX_SCHEMA, C5_DRIVER_NAME, C5_DRIVER_SCHEMA, C5_INTENT_SCHEMA, c5ChainIds, c5IntentOf, createC5Intent, driverSettled, newDriverReceipt, productDirectory, productEngineDigest,
     productTransitionIds, readC5ProductJournal, readC5Snapshot, readDriverReceipt, reconcileC5Custody, sameImage, validateBoundJournal, validateC5BoxReceipts, validateC5Intent, validateDriverReceipt,
@@ -98,7 +101,7 @@ const steps = h => Object.fromEntries(h.run.cleanup.steps.map(step => [step.id, 
 // Schema
 
 test('X5.c5-custody-validates-the-intent-the-driver-receipt-and-the-linked-generations-and-refuses-every-altered-binding', t => {
-    const context = standalone();
+    const context = standalone({}, t);
     const { run, profile } = context;
     const intent = createC5Intent({ run, profile, driverReceiptName: `${C5_DRIVER_NAME}-${'1'.repeat(32)}`, argvDigest: jsonDigest(['x']), priorTransitionIds: ['a'.repeat(32)], invocationId: '1'.repeat(32) });
     assert.equal(intent.schema, C5_INTENT_SCHEMA);
@@ -157,7 +160,8 @@ test('X5.c5-custody-validates-the-intent-the-driver-receipt-and-the-linked-gener
     }
     assert.equal(driverSettled({ operations: [] }), false);
     assert.equal(productEngineDigest({ host: { id: 'a' }, store: { graphRoot: 'b', runRoot: 'c' }, version: { APIVersion: 'd' } }).length, 64);
-    assert.throws(() => productEngineDigest({ host: { id: 'a' } }), /incomplete product engine identity/);
+    // An absent value is null in the product's identity, never a refusal.
+    assert.equal(productEngineDigest({}), createHash('sha256').update(JSON.stringify(['podman', null, null, null, null])).digest('hex'));
 });
 
 // ---------------------------------------------------------------------------------------------------------------------------------------------
@@ -247,8 +251,8 @@ test('X5.c5-cleanup-intent-persisted-and-the-driver-never-began-destroys-the-ori
     assert.equal(h.run.cleanup.steps.every(step => step.state === 'complete'), true, JSON.stringify(steps(h)));
     assert.deepEqual(h.destroys.map(entry => entry.expected), [h.profile.box.id], 'the original anchor governs: exactly its ID was destroyed');
     assert.deepEqual(h.run.ownedBoxes.map(box => box.id), [h.profile.box.id], 'no linked generation exists');
-    assert.equal(h.artifacts.get('c5-cleanup-proof').action, 'cleanup');
-    assert.deepEqual(h.artifacts.get('c5-cleanup-proof').chain, [h.profile.box.id]);
+    assert.equal(h.artifacts.get('c5-cleanup-proof-cleanup').action, 'cleanup');
+    assert.deepEqual(h.artifacts.get('c5-cleanup-proof-cleanup').chain, [h.profile.box.id]);
     assert.equal(fs.existsSync(h.meta.workspace.path), false, 'the owned workspace is gone');
     assert.deepEqual(liveIds(h), [], 'the world holds nothing');
 });
@@ -269,7 +273,7 @@ for (const [name, killAt] of CRASH_ROWS) {
         assert.equal(h.destroys[0].barrierAfter, null, 'the barrier is gone');
         // What was destroyed is exactly what the product's records prove: the one live container, or nothing (the absence handling closes pending state).
         assert.equal(h.destroys[0].expected, beforeIds[0] ?? null);
-        const proof = h.artifacts.get('c5-cleanup-proof');
+        const proof = h.artifacts.get('c5-cleanup-proof-cleanup');
         assert.deepEqual([proof.action, proof.remaining], ['cleanup', []]);
         assert.equal(proof.chain[0], h.profile.box.id);
         assert.deepEqual(proof.absent, proof.chain);
@@ -332,7 +336,7 @@ test('X5.c5-cleanup-resumes-an-interrupted-destroy-in-a-fresh-call-and-verifies-
     await h.execute();
     assert.equal(h.run.cleanup.steps.every(step => step.state === 'complete'), true, JSON.stringify(steps(h)));
     assert.deepEqual(liveIds(h), []);
-    assert.deepEqual(h.artifacts.get('c5-cleanup-proof').absent, h.artifacts.get('c5-cleanup-proof').chain);
+    assert.deepEqual(h.artifacts.get('c5-cleanup-proof-cleanup').absent, h.artifacts.get('c5-cleanup-proof-cleanup').chain);
     // A third call after completion re-proves absence of the whole chain and changes nothing.
     await h.execute();
     assert.equal(h.destroys.length, 1);
@@ -372,7 +376,7 @@ test('X5.c5-cleanup-base-refuses-the-valid-live-replacement-as-foreign-and-the-c
     await candidateHarness.execute();
     assert.deepEqual(candidateHarness.destroys.map(entry => entry.expected), [candidateReplacement]);
     assert.deepEqual(liveIds(candidateHarness), []);
-    const proof = candidateHarness.artifacts.get('c5-cleanup-proof');
+    const proof = candidateHarness.artifacts.get('c5-cleanup-proof-cleanup');
     assert.deepEqual(proof.chain, [candidateHarness.profile.box.id, candidateReplacement]);
     assert.deepEqual(proof.absent, proof.chain);
     assert.equal(candidateHarness.unrelated.id, UNRELATED.id);
@@ -419,4 +423,61 @@ test('X5.c5-private-json-writes-fsync-the-file-and-then-the-containing-directory
     assert.deepEqual(kinds, ['fsync:temporary', 'rename:target', 'fsync:dir'], kinds.join(' '));
     assert.deepEqual(JSON.parse(fs.readFileSync(target, 'utf8')), { schema: 1 });
     assert.equal(fs.statSync(target).mode & 0o777, 0o600);
+});
+
+test('X5.c5-private-json-directory-fsync-tolerates-exactly-the-products-unsupported-platform-codes-and-throws-on-anything-else', t => {
+    const directory = scratch(t, 'hwl-c5fs2-');
+    const target = path.join(directory, 'receipt_claude.json');
+    const fsync = fs.fsyncSync;
+    const failDirectoryWith = code => {
+        fs.fsyncSync = fd => {
+            const stat = fs.fstatSync(fd);
+            if (stat.isDirectory()) throw Object.assign(new Error(code), { code });
+            return fsync(fd);
+        };
+    };
+    try {
+        // The product's own list: the write succeeds, and the file is still there and complete.
+        for (const code of ['EINVAL', 'ENOTSUP', 'EISDIR', 'EBADF']) {
+            failDirectoryWith(code);
+            fs.rmSync(target, { force: true });
+            assert.equal(writePrivateJson(target, { code }), target, code);
+            assert.deepEqual(JSON.parse(fs.readFileSync(target, 'utf8')), { code });
+        }
+        // Anything else is a custody write that may not be durable: it throws, and no directory descriptor is leaked.
+        for (const code of ['EIO', 'EACCES', 'ENOSPC', 'EPERM']) {
+            failDirectoryWith(code);
+            const before = fs.readdirSync('/dev/fd').length;
+            assert.throws(() => writePrivateJson(target, { code }), error => error.code === code, code);
+            assert.equal(fs.readdirSync('/dev/fd').length <= before + 1, true, 'the directory descriptor was closed');
+        }
+        // A FILE fsync failure is never tolerated.
+        fs.fsyncSync = fd => { if (fs.fstatSync(fd).isFile()) throw Object.assign(new Error('EINVAL'), { code: 'EINVAL' }); return fsync(fd); };
+        assert.throws(() => writePrivateJson(target, {}), error => error.code === 'EINVAL');
+    } finally { fs.fsyncSync = fsync; }
+});
+
+test('X5.c5-engine-identity-of-a-real-podman-5-7-capture-without-a-host-id-equals-the-products-own-and-is-never-a-refusal', async t => {
+    // A redacted copy of a retained apparatus capture (podman 5.7.0): `host` has no `id`. The product accepts that engine and builds its identity with
+    // null in that place; the harness must build the same identity, from the same document, and must not refuse the engine.
+    const info = JSON.parse(fs.readFileSync(path.join(REPOSITORY, 'tests/hardware-limits/podmanInfoWithoutHostId.json'), 'utf8'));
+    assert.equal(Object.hasOwn(info.host, 'id'), false);
+    assert.equal(info.version.APIVersion, '5.7.0');
+    const runner = { query: (_command, args) => (args[0] === 'info' ? { ok: true, status: 0, stdout: JSON.stringify(info), stderr: '' } : { ok: false, status: 1, stdout: '', stderr: 'no such container', error: null }) };
+    const marker = () => { throw Object.assign(new Error('absent'), { code: 'ENOENT' }); };
+    const discovered = discoverBoxOwnership({ instance: 'ploinky-box-x-000000000000', pathHash: '000000000000', workspaceRoot: '/x' }, { platform: 'linux', env: {}, runner, readMachineMarkerFile: marker });
+    assert.equal(discovered.state, 'absent', discovered.message);
+    assert.equal(discovered.engine.identity, 'fb20e894fbd16dbe440a307996c863f6df883fb2c0564b03543bc4030df3a061');
+    assert.equal(productEngineDigest(info), discovered.engine.identity, 'the harness builds the product\'s identity: absent is null');
+    // The driver's one fresh observation yields both digests from this document and does not refuse it.
+    const profile = { engine: { identityDigest: engineIdentityDigest(info, null) } };
+    const observed = observeEngine(runner, profile, { infoMs: 1000 });
+    assert.equal(observed.product, discovered.engine.identity);
+    assert.equal(observed.harness, profile.engine.identityDigest);
+    // Cleanup computes the product's identity only where a bound journal needs it: an unbound invocation never asks.
+    const context = standalone({}, t);
+    const intent = createC5Intent({ run: context.run, profile: context.profile, driverReceiptName: `${C5_DRIVER_NAME}-${'1'.repeat(32)}`, argvDigest: jsonDigest(['x']), priorTransitionIds: [], invocationId: '1'.repeat(32) });
+    context.run.operations.push(intent);
+    const unbound = await reconcileC5Custody({ run: context.run, profile: context.profile, driver: null, driverSettled: true, engineIdentity: () => { throw new Error('asked'); }, ids: [context.profile.box.id], inspect: async () => { throw new Error('no'); } });
+    assert.deepEqual(unbound.ids, [context.profile.box.id]);
 });

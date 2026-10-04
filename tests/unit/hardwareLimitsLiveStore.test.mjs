@@ -18,7 +18,7 @@ import {
     assertRefusedWrite, assertSameStore, assertValidStore, boxProgramWords, hostProgramWords, hostStoreRoot, parseProgramLines, sameLock, sameOwner, storeProgramParams, tokenKey,
 } from '../hardware-limits/liveStoreCommands.mjs';
 import { createFakeStore } from '../hardware-limits/fakeLiveStore.mjs';
-import { world, free, scratch } from '../hardware-limits/executorWorld.mjs';
+import { ENGINE_HOST, world, free, scratch } from '../hardware-limits/executorWorld.mjs';
 import { artifactPathFor } from '../hardware-limits/liveCommon.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { BOX_STORE_ROOT as PRODUCT_BOX_STORE_ROOT, hardwareStorePaths, initializeStore, setAgentLimits, readStoreSnapshot } from '../../cli/sandbox/hardwareLimits/store.mjs';
@@ -36,7 +36,7 @@ async function liveWorld(t, { faults = {}, block = BLOCK, lifecycleFaults = {} }
     const w = world(t, { block, extraSource: { 'ploinky-box/seccomp/podman-nested-pid-fallback.json': SECCOMP } });
     const workspace = w.run.target.execution.provision.workspace.path;
     const fake = createFakeStore({ base: { provider: w.engineProvider, node: w.node, statePath: w.statePath }, workspace, home: w.home, faults,
-        lifecycle: { source: w.run.target.execution.source.root, ports: w.run.ports, world: lifecycleFaults } });
+        lifecycle: { source: w.run.target.execution.source.root, ports: w.run.ports, world: lifecycleFaults, engineHost: ENGINE_HOST } });
     const report = await provisionRun({ run: w.run, persist: w.persist, processProvider: fake.provider, portProbe: free, hostIdentity: w.hostIdentity, remoteArrival: w.remote, validateProfile });
     assert.equal(report.verdict, 'PASS', JSON.stringify(report.limitations));
     return { w, fake, workspace };
