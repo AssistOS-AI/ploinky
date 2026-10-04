@@ -30,7 +30,7 @@ function build(mutate = () => {}) {
             labels: { 'io.assistos.ploinky-box.agentlib-fingerprint': manifest.agentLib.fingerprint }, workdir: manifest.workspace.path, user: 'podman' },
         probe: null, repos: {} });
     for (const repo of manifest.candidate.repositories) state.repos[repo.path] = { commit: repo.commit, branch: repo.branch, upstream: repo.upstream, pushed: repo.commit, dirty: '' };
-    state.probe = { schema: 'live-update-cache-box-probe', version: 1, selector: { state: 'active', generation: manifest.box.activeGeneration, activationId: 'act-1', publicationState: 'ready' },
+    state.probe = { schema: 'live-update-cache-box-probe', version: 1, publicConfig: { staticAgent: 'explorer', staticPort: 8080 }, selector: { state: 'active', generation: manifest.box.activeGeneration, activationId: 'act-1', publicationState: 'ready' },
         graph: manifest.graph.map(entry => ({ name: entry.name, containerName: `ploinky_${entry.name.replace('/', '_')}`, runtimeId: H(`rt-${entry.name}`), instanceId: `inst-${entry.name}`, enableGeneration: 'enable-1',
             graphGeneration: manifest.box.activeGeneration, running: true, ready: true, noWaitState: entry.noWait ? 'running' : null, generationJoin: true, labelsEqual: true, imageId: H('agent-image') })) };
     mutate(manifest, state); validateManifest(manifest);
@@ -54,11 +54,12 @@ function build(mutate = () => {}) {
 
 test('admission binds the manifest to independently observed Box, engine, source, graph and Router health', async () => {
     const h = build();
+    const observedNow = await h.observer.observe(); assert.deepEqual(observedNow.publicConfig, { staticAgent: 'explorer', staticPort: 8080 }); assert.equal(observedNow.activation.activationId, 'act-1');
     const receipt = await h.observer.admit();
     assert.deepEqual(receipt, { phase: 'U0', admitted: true, activeGeneration: h.manifest.box.activeGeneration, runtimes: 2 });
     const operations = h.fake.log.map(row => `${row.options.stdio[0]}:${row.args.slice(0, 3).join(' ')}`);
-    assert.equal(h.fake.log.filter(row => row.bin === '/usr/bin/git').length, 4 * 5);
-    assert.deepEqual(h.requests, [{ url: 'http://127.0.0.1:8080/health', timeoutMs: 5000 }]);
+    assert.equal(h.fake.log.filter(row => row.bin === '/usr/bin/git').length, 4 * 5 * 2);
+    assert.deepEqual(h.requests, Array(2).fill({ url: 'http://127.0.0.1:8080/health', timeoutMs: 5000 }));
     const probe = h.fake.log.find(row => row.args.includes('-')), env = probe.options.env;
     assert.deepEqual(probe.args, ['container', 'exec', '--interactive', '--env', 'PLOINKY_ROUTER_HOST_PORT=8080', '--env', 'PLOINKY_MEDIA_HOST_PORT=7882', '--user', 'podman',
         '--workdir', h.manifest.workspace.path, h.manifest.box.id, '/usr/local/bin/node', '--input-type=module', '-']);
@@ -143,11 +144,12 @@ test('a non-Linux or foreign-uid host refuses before any command is launched', a
 
 test('probe, status and health parsers reject extra, missing, oversized and secret-bearing fields', async () => {
     const { value: manifest } = manifestFixture(); const input = probeInput(manifest);
-    const good = { schema: 'live-update-cache-box-probe', version: 1, selector: { state: 'active', generation: 'g', activationId: 'a', publicationState: 'ready' },
+    const good = { schema: 'live-update-cache-box-probe', version: 1, publicConfig: { staticAgent: 'explorer', staticPort: 8080 }, selector: { state: 'active', generation: 'g', activationId: 'a', publicationState: 'ready' },
         graph: [{ name: input.requiredRuntimes[0].name, containerName: 'c', runtimeId: 'r', instanceId: 'i', enableGeneration: 'e', graphGeneration: 'g', running: true, ready: true, noWaitState: null, generationJoin: true, labelsEqual: true, imageId: 'x' }] };
     assert.equal(parseProbeOutput(Buffer.from(JSON.stringify(good)), input).selector.generation, 'g');
     for (const bad of [{ ...good, extra: 'PRIVATE' }, { ...good, graph: [{ ...good.graph[0], env: 'PRIVATE' }] }, { ...good, graph: [] }, { ...good, graph: [{ ...good.graph[0], name: 'Other/agent' }] },
-        { ...good, graph: [{ ...good.graph[0], graphGeneration: 'h' }] }, { ...good, selector: { ...good.selector, state: 'inactive' } }]) {
+        { ...good, graph: [{ ...good.graph[0], graphGeneration: 'h' }] }, { ...good, selector: { ...good.selector, state: 'inactive' } }, { ...good, publicConfig: { staticAgent: 'e', staticPort: 8080, extra: 1 } },
+        { ...good, publicConfig: { staticAgent: 'e', staticPort: '8080' } }, { schema: good.schema, version: 1, selector: good.selector, graph: good.graph }]) {
         assert.throws(() => parseProbeOutput(Buffer.from(JSON.stringify(bad)), input), error => error.code === 'live-probe-output');
     }
     assert.throws(() => parseProbeOutput(Buffer.alloc(200000, 97), input), error => error.code === 'live-probe-output');

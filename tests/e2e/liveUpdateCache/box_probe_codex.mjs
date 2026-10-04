@@ -8,7 +8,7 @@ import { READER_INSPECT_FORMAT, parseReaderInspect } from './engine_codex.mjs';
 // to `container exec` through a fixed bootstrap. It calls only existing read-only product readers, never prepares,
 // repairs, applies or starts anything, and prints a single public JSON document or a fixed failure code.
 export const PROBE_SCHEMA = 'live-update-cache-box-probe';
-export const PROBE_LIMITS = Object.freeze({ generationBytes: 8 * 1024 * 1024, requiredRuntimes: 256, inspectBytes: 1024 * 1024, inspectMs: 30000 });
+export const PROBE_LIMITS = Object.freeze({ generationBytes: 8 * 1024 * 1024, requiredRuntimes: 256, inspectBytes: 1024 * 1024, inspectMs: 30000, configBytes: 1024 * 1024 });
 const hex64 = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const text = value => typeof value === 'string' && value.length > 0 && value.length <= 512 && !/[\0\r\n]/.test(value);
 export class ProbeFailure extends Error { constructor(code) { super(code); this.code = code; } }
@@ -76,6 +76,23 @@ function selectRecords(registry, requiredRuntimes) {
 }
 
 // `apis`: the existing readers. `io`: lstat for the generation fence. Both are replaceable only by the focused controls.
+// The primary/static agent and its port are the only public configuration fields compared across the run.
+export function readPublicConfig(workspaceRoot, io = fs) {
+    const file = path.join(workspaceRoot, '.ploinky', 'routing.json'); let fd;
+    try { fd = io.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK); } catch { throw new ProbeFailure('probe-config-unreadable'); }
+    try {
+        const stat = io.fstatSync(fd); need(stat.isFile() && stat.size <= PROBE_LIMITS.configBytes, 'probe-config-bound');
+        const buffer = Buffer.alloc(PROBE_LIMITS.configBytes + 1); let offset = 0;
+        for (;;) { const count = io.readSync(fd, buffer, offset, buffer.length - offset, null); if (!count) break; offset += count; need(offset <= PROBE_LIMITS.configBytes, 'probe-config-bound'); }
+        let value; try { value = JSON.parse(buffer.subarray(0, offset).toString('utf8')); } catch { throw new ProbeFailure('probe-config-unreadable'); }
+        const agent = value?.static?.agent, port = value?.static?.port;
+        need(typeof agent === 'string' && text(agent), 'probe-config-unreadable');
+        const numericPort = typeof port === 'number' ? port : Number(port);
+        need(Number.isSafeInteger(numericPort) && numericPort > 0 && numericPort < 65536, 'probe-config-unreadable');
+        return { staticAgent: agent, staticPort: numericPort };
+    } finally { io.closeSync(fd); }
+}
+
 export async function runBoxProbe(input, { workspaceRoot, apis, io = fs, inspect = inspectNestedContainers } = {}) {
     validateProbeInput(input);
     need(typeof workspaceRoot === 'string' && path.isAbsolute(workspaceRoot) && apis, 'probe-environment');
@@ -110,7 +127,7 @@ export async function runBoxProbe(input, { workspaceRoot, apis, io = fs, inspect
     let after; try { after = apis.readAgentRegistrySnapshot({ workspaceRoot }); } catch { throw new ProbeFailure('probe-registry-unreadable'); }
     const projection = records => selectRecords(records, input.requiredRuntimes).map(row => [row.containerName, row.record.containerId, row.record.instanceId, row.record.enableGeneration]);
     need(digest(projection(after)) === digest(projection(registry)), 'probe-registry-changed');
-    return { schema: PROBE_SCHEMA, version: 1, selector: selectorTuple(active.selector), graph };
+    return { schema: PROBE_SCHEMA, version: 1, selector: selectorTuple(active.selector), graph, publicConfig: readPublicConfig(workspaceRoot, io) };
 }
 
 export async function probeMain({ input, workspaceRoot = process.env.PLOINKY_WORKSPACE_ROOT, write = value => process.stdout.write(`${JSON.stringify(value)}\n`), load = loadProductApis } = {}) {

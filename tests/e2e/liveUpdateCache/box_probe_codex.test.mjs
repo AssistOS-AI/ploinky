@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { installPureGuards, H } from './test_support_codex.mjs';
-import { runBoxProbe, probeMain, inspectNestedContainers, validateProbeInput, PROBE_LIMITS, PROBE_SCHEMA } from './box_probe_codex.mjs';
+import { createMemoryFs } from './fake_fs_support_codex.mjs';
+import { runBoxProbe, probeMain, inspectNestedContainers, validateProbeInput, readPublicConfig, PROBE_LIMITS, PROBE_SCHEMA } from './box_probe_codex.mjs';
 import { READER_INSPECT_FORMAT } from './engine_codex.mjs';
 installPureGuards();
 
@@ -25,7 +26,8 @@ function scenario(mutate = () => {}) {
         collectAgentRuntimeStates: options => { state.calls.push(['collect', options]); return options.liveContainers.map(entry => ({ containerName: entry.containerName, state: { running: entry.state.running, status: entry.state.status } })); },
         applyRuntimeReadinessProjection: (entries, registry) => { state.calls.push(['readiness', registry]); return entries.map(entry => ({ ...entry, state: { ...entry.state, ...(state.readiness[entry.containerName] ?? {}) } })); },
     };
-    const io = { lstatSync: () => { state.stats = (state.stats ?? 0) + 1; return state.statSequence ? state.statSequence(state.stats) : state.stat; } };
+    const memory = createMemoryFs({ [`${workspaceRoot}/.ploinky/routing.json`]: state.routing ?? JSON.stringify({ static: { agent: 'explorer', port: '8080' }, secret: 'PRIVATE' }) });
+    const io = { ...memory, lstatSync: file => { if (!file.startsWith('/g/')) return memory.lstatSync(file); state.stats = (state.stats ?? 0) + 1; return state.statSequence ? state.statSequence(state.stats) : state.stat; } };
     const inspect = ids => { state.calls.push(['inspect', ids]); if (state.inspectError) throw Object.assign(new Error('PRIVATE'), { code: 'probe-container-inspect' });
         return new Map(ids.map(id => { const [containerName, record] = Object.entries(state.registry).find(([, item]) => item.containerId === id);
             return [id, { id, name: state.nameOverride?.[containerName] ?? containerName, running: state.running[id], imageId: H('image'), instanceId: state.labelOverride?.[containerName] ?? record.instanceId, enableGeneration: record.enableGeneration, mounts: [] }]; })); };
@@ -34,7 +36,7 @@ function scenario(mutate = () => {}) {
 
 test('probe projects only public nonsecret membership using read-only product readers and supplied exact rows', async () => {
     const s = scenario(); const result = await s.run();
-    assert.deepEqual(Object.keys(result).sort(), ['graph', 'schema', 'selector', 'version']); assert.equal(result.schema, PROBE_SCHEMA);
+    assert.deepEqual(Object.keys(result).sort(), ['graph', 'publicConfig', 'schema', 'selector', 'version']); assert.deepEqual(result.publicConfig, { staticAgent: 'explorer', staticPort: 8080 }); assert.equal(result.schema, PROBE_SCHEMA);
     assert.deepEqual(result.selector, { state: 'active', generation, activationId: 'act-1', publicationState: 'ready' });
     assert.deepEqual(result.graph.map(row => [row.name, row.running, row.ready, row.noWaitState, row.generationJoin, row.labelsEqual]),
         [['AssistOSExplorer/explorer', true, true, null, true, true], ['AssistOSExplorer/dpuAgent', true, true, 'running', true, true]]);
@@ -79,6 +81,11 @@ test('selector, generation file, registry and membership changes refuse with fix
     await failure(scenario(state => { state.registry.ploinky_explorer.runtime = 'docker'; }).run(), 'probe-runtime-identity');
     await failure(scenario(state => { state.registryAfter = { ...state.registry, ploinky_explorer: { ...state.registry.ploinky_explorer, instanceId: 'rotated' } }; }).run(), 'probe-registry-changed');
     await failure(scenario(state => { state.inspectError = true; }).run(), 'probe-container-inspect');
+    for (const routing of ['{}', 'not json', JSON.stringify({ static: { agent: 'explorer', port: 'x' } }), JSON.stringify({ static: { agent: '', port: 8080 } }), JSON.stringify({ static: { agent: 'a\nb', port: 8080 } }), JSON.stringify({ static: { agent: 'explorer', port: 70000 } })]) {
+        await failure(scenario(state => { state.routing = routing; }).run(), 'probe-config-unreadable');
+    }
+    await failure(scenario(state => { state.routing = JSON.stringify({ static: { agent: 'x'.repeat(PROBE_LIMITS.configBytes + 1), port: 1 } }); }).run(), 'probe-config-bound');
+    assert.throws(() => readPublicConfig('/nowhere', createMemoryFs({})), error => error.code === 'probe-config-unreadable');
 });
 
 test('probe input validation refuses unknown fields, duplicates and malformed names', () => {

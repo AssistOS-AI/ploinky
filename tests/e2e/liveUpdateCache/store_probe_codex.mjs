@@ -22,7 +22,9 @@ export function validateStoreProbeInput(input) {
     const labels = new Set();
     for (const target of input.targets) {
         need(target && keys(target) === ['alias', 'agentName', 'label', 'markerFile', 'packageName', 'repoName'].sort().join() && component(target.label) && !labels.has(target.label)
-            && component(target.repoName) && component(target.agentName) && (target.alias === null || component(target.alias)) && /^[a-z0-9][a-z0-9._-]{0,100}$/.test(target.packageName) && component(target.markerFile), 'store-probe-input');
+            && component(target.repoName) && component(target.agentName) && (target.alias === null || component(target.alias))
+            // Identity mode (both null) covers runtimes whose package is not the fixture's, e.g. the declared graph.
+            && ((target.packageName === null && target.markerFile === null) || (typeof target.packageName === 'string' && /^[a-z0-9][a-z0-9._-]{0,100}$/.test(target.packageName) && component(target.markerFile))), 'store-probe-input');
         labels.add(target.label);
     }
     need(input.objects.every(id => objectIdOf(id)) && new Set(input.objects).size === input.objects.length, 'store-probe-input');
@@ -64,12 +66,22 @@ function inspectObject(storeRoot, objectId, { apis, io, withTree = true }) {
 function projectTarget(target, { workspaceRoot, registry, rows, apis, io, storeRoot }) {
     const matches = Object.entries(registry).filter(([, record]) => record?.type === 'agent' && record.repoName === target.repoName && record.agentName === target.agentName && (record.alias ?? null) === target.alias);
     need(matches.length === 1, matches.length ? 'store-probe-ambiguous' : 'store-probe-missing');
-    const [containerName, record] = matches[0], dependencies = record.dependencies;
+    const [containerName, record] = matches[0], dependencies = record.dependencies, identityOnly = target.packageName === null;
+    const identity = row => ({ label: target.label, containerName, runtimeId: row.id, instanceId: record.instanceId, enableGeneration: record.enableGeneration, running: row.running === true,
+        labelsEqual: row.instanceId === record.instanceId && row.enableGeneration === record.enableGeneration && row.name === containerName });
+    if (identityOnly && dependencies?.mode === 'none') {
+        need(hex64(String(record.containerId || '').toLowerCase()) && record.runtime === 'podman' && record.instanceId && record.enableGeneration, 'store-probe-record');
+        return { ...identity(rows.get(String(record.containerId).toLowerCase())), objectId: null, selectorId: null, payloadSha256: null, storeMode: 'none' };
+    }
     need(dependencies?.mode === 'store' && objectIdOf(dependencies.objectId) && hex64(dependencies.generationId) && hex64(String(record.containerId || '').toLowerCase()) && record.runtime === 'podman'
         && typeof record.instanceId === 'string' && record.instanceId && typeof record.enableGeneration === 'string' && record.enableGeneration, 'store-probe-record');
     const object = inspectObject(storeRoot, dependencies.objectId, { apis, io });
     need(object.present && object.treeMatches, 'store-probe-object');
     need(path.resolve(String(dependencies.payloadPath || '')) === path.join(object.dir, 'payload'), 'store-probe-record');
+    if (identityOnly) {
+        const row = rows.get(String(record.containerId).toLowerCase());
+        return { ...identity(row), objectId: dependencies.objectId, selectorId: dependencies.generationId, payloadSha256: object.payloadSha256, storeMode: 'store' };
+    }
     const provenance = (Array.isArray(object.manifest.provenance) ? object.manifest.provenance : []).find(entry => entry?.name === target.packageName);
     need(provenance && /^[a-f0-9]{40}$/.test(provenance.commit ?? ''), 'store-probe-provenance');
     const nodeModules = path.join(object.dir, 'payload', 'node_modules');

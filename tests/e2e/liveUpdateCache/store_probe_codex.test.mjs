@@ -80,3 +80,16 @@ test('probe input validation and public main refuse unknown, oversized or secret
     out.length = 0; assert.equal(await storeProbeMain({ input: input(), workspaceRoot: ws, write: value => out.push(value), load: async () => { throw new Error('PRIVATE-DETAIL'); } }), 1);
     assert.deepEqual(out, [{ schema: STORE_PROBE_SCHEMA, version: 1, failure: 'store-probe-failed' }]);
 });
+
+test('identity mode reports only runtime and object identity for graph runtimes, including those without a store object', async () => {
+    const identity = { label: 'graph', repoName: 'UcProbe', agentName: 'probe', alias: null, packageName: null, markerFile: null };
+    const h = build(); const [row] = (await h.run({ targets: [identity], objects: [] })).targets;
+    assert.deepEqual(row, { label: 'graph', containerName: 'ploinky_probe', runtimeId: H('c0'), instanceId: 'inst-1', enableGeneration: 'en-1', running: true, labelsEqual: true,
+        objectId: object, selectorId: H('generation'), payloadSha256: treeHash, storeMode: 'store' });
+    const none = build(s => { s.record = { dependencies: { schema: 1, mode: 'none', reason: 'no-dependencies' } }; });
+    assert.deepEqual((await none.run({ targets: [identity], objects: [] })).targets[0], { label: 'graph', containerName: 'ploinky_probe', runtimeId: H('c0'), instanceId: 'inst-1', enableGeneration: 'en-1', running: true, labelsEqual: true,
+        objectId: null, selectorId: null, payloadSha256: null, storeMode: 'none' });
+    await fails(build().run({ targets: [{ ...identity, markerFile: 'index.js' }], objects: [] }), 'store-probe-input');
+    await fails(build(s => { s.tree = H('changed'); }).run({ targets: [identity], objects: [] }), 'store-probe-object');
+    await fails(build().run({ targets: [{ ...target(), packageName: 'uc-moving-probe' }], objects: [] }).then(() => build(s => { s.record = { dependencies: { mode: 'none' } }; }).run()), 'store-probe-record');
+});
