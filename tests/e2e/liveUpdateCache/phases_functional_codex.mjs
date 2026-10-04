@@ -2,6 +2,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { AcceptanceError, need } from './manifest_codex.mjs';
 import { assertLiveBefore, assertWarmReuse, assertDependencyReplacement, assertRetainedReader } from './contracts_codex.mjs';
 import { expectedLiveFromManifest } from './live_admission_codex.mjs';
+import { ownedRegistration } from './owned_ids_codex.mjs';
 
 // U0-U7b: the functional epoch. Every phase is a function of explicit ports (observer, worker host, cache ports,
 // Git fixture, browser, negative fixture, owned files) so each can be exercised with fabricated adapters and run
@@ -86,7 +87,10 @@ export function createFunctionalPhases(ctx) {
             return { phase: 'U3', commit: A.commit, version: row.version, readOnlyMount: true, installer: row.installerKind, runtimeMarker: 'A' };
         },
         async U4() {
-            const previous = state.generation, A = state.A, B = await ports.fixture.publishPackage('B', `B-${names.suffix}`);
+            const previous = state.generation, A = state.A;
+            // The update's expected record ids rest on a derivation of the owned registration; it must match what runs.
+            need(A.row.containerName === ownedRegistration(manifest).containerName, 'owned-registration-derivation');
+            const B = await ports.fixture.publishPackage('B', `B-${names.suffix}`);
             need(B.commit !== A.commit && B.markerSha256 !== A.markerSha256, 'fixture-replacement-invalid');
             const proof = await ports.workerHost.update('normal-update', expectedUpdate('normal-update'));
             need(proof.fulfilled === true && proof.returnedCode === 0 && proof.result.activation.outcome === 'restarted', 'update-not-restarted');

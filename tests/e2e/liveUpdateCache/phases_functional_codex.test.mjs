@@ -52,6 +52,13 @@ test('U4: an update that keeps the object, does not restart, keeps the generatio
     const absent = await run({ removePredecessor: true }, 'U4'); assert.equal(absent.evidence.U4.predecessorRetained, false, 'a collected predecessor is accepted without a retained-reader claim');
 });
 
+test('U4: an update whose expectation omits the owned repository or pin record, or a registration name that is not the derived one, refuses', async () => {
+    await failsAt({ wrongContainerName: true }, 'U4', 'owned-registration-derivation');
+    const h = createWorld(); for (const name of ['U0', 'U1', 'U2', 'U3']) await h.phases[name]();
+    h.ctx.inputs.expectedUpdates['normal-update'] = { errors: [], blockedBy: [], recordIds: ['workspace-graph'] };
+    await assert.rejects(h.phases.U4(), error => error.code === 'update-records-incomplete');
+});
+
 test('U5: skipped collection, a lost reader or object, an unreadable marker or identical-object violation never pass the retained-reader claim', async () => {
     await failsAt({ gcSkipped: true }, 'U5', 'ordinary-gc-not-proven'); await failsAt({ removeReaderObject: true }, 'U5', 'ordinary-gc-not-proven'); await failsAt({ noRetainedReason: true }, 'U5', 'ordinary-gc-not-proven');
     await failsAt({ readerDies: true }, 'U5', /reader-changed-during-gc|reader-not-live/); await failsAt({ readerUnreadable: true }, 'U5', /reader-not-live|reader-changed-during-gc/);

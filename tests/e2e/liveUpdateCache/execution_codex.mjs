@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
+import { ownedRegistration } from './owned_ids_codex.mjs';
 import { AcceptanceError, need, exact, LIMITS, word, absolute, validateManifest, readBoundedDescriptor, parseStrictJson } from './manifest_codex.mjs';
 
 export const OPERATIONS = Object.freeze(['normal-update', 'optional-negative', 'required-negative', 'settling-update']);
@@ -16,6 +17,8 @@ export function validateExpectation(expected, manifest) {
     const ids = new Set(['ploinky', 'achillesAgentLib', 'workspace-graph', 'update', 'update-transaction', 'host-ploinky',
         manifest.candidate.root, manifest.workspace.path, ...manifest.candidate.repositories.flatMap(repo => [repo.name, repo.path]),
         ...manifest.graph.map(entry => entry.name)]);
+    // The run's own repository record and the Git-pin record of its one dependency are expected in every real update.
+    const owned = ownedRegistration(manifest); ids.add(owned.repoName); ids.add(owned.pinId);
     const scenario = manifest.negativeScopes.optional;
     for (const name of ['10-bad', '20-branch', '30-origin', '40-prune', '90-good']) ids.add(path.join(scenario, name));
     for (const [index, name] of ['detached', 'staged', 'unstaged', 'diverged', 'collision', 'branch', 'origin', 'later'].entries()) {

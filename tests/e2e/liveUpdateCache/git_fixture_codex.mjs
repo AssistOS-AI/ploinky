@@ -4,6 +4,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { AcceptanceError, need, LIMITS } from './manifest_codex.mjs';
 import { runOwnedCommand, buildCommandEnvironment } from './host_command_codex.mjs';
 import { boxExecArgs } from './engine_codex.mjs';
+import { runSuffix, fixtureNames } from './owned_ids_codex.mjs';
 
 // The strictly owned Git source for the cache phases: two bare repositories (the dependency package and the probe
 // agent) served over dumb HTTP by one run-owned rootless BusyBox container on the selected engine, outside the Box.
@@ -15,9 +16,7 @@ const ROLE = 'update-cache-git-fixture';
 const sha = bytes => createHash('sha256').update(bytes).digest('hex');
 const hex64 = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 
-export const runSuffix = runId => { const match = /-([a-f0-9]{8})_codex$/.exec(runId); need(match, 'fixture-run-id'); return match[1]; };
-export const fixtureNames = runId => { const suffix = runSuffix(runId); return Object.freeze({ suffix, packageName: `uc-probe-${suffix}`, repoName: `UcProbe${suffix}`, agentName: 'probe', aliases: Object.freeze([`uc-${suffix}-a`, `uc-${suffix}-b`]),
-    container: `uc-git-${suffix}`, relative: `${runId}` }); };
+export { runSuffix, fixtureNames };
 
 export function createGitFixture({ manifest, deps, probeAgentImage, env = buildCommandEnvironment(process.env), io = fs, gitBin = '/usr/bin/git', random = randomBytes }) {
     need(manifest && deps && typeof probeAgentImage === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,300}@sha256:[a-f0-9]{64}$/.test(probeAgentImage), 'fixture-inputs');

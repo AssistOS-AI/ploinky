@@ -2,6 +2,8 @@ import { manifestFixture, H } from './test_support_codex.mjs';
 import { expectedLiveFromManifest } from './live_admission_codex.mjs';
 import { fixtureNames } from './git_fixture_codex.mjs';
 import { createFunctionalPhases } from './phases_functional_codex.mjs';
+import { ownedRegistration } from './owned_ids_codex.mjs';
+import { validateExpectation } from './execution_codex.mjs';
 
 // Test-only simulation of the product behaviours the functional phases depend on. It is the control's stand-in for the
 // runtime, never a runtime path: faults flip single behaviours so each refusal can be shown to trigger.
@@ -14,7 +16,7 @@ export function createWorld(faults = {}) {
     const graphObject = addObject('graph');
     world.runtimes.set('g0', { repoName: 'AssistOSExplorer', agentName: 'explorer', alias: null, runtimeId: H('graph-runtime'), instanceId: 'g-inst', enableGeneration: 'g-en', objectId: graphObject, selectorId: H('graph-sel'), running: true });
     const bump = () => { world.generation = `gen-${world.counter++}`; };
-    const full = runtime => ({ label: runtime.alias ?? 'primary', containerName: `ploinky_${runtime.alias ?? 'primary'}`, runtimeId: runtime.runtimeId, instanceId: runtime.instanceId, enableGeneration: runtime.enableGeneration, running: runtime.running, labelsEqual: true,
+    const full = runtime => ({ label: runtime.alias ?? 'primary', containerName: runtime.alias ? `ploinky_alias_${runtime.alias}` : (faults.wrongContainerName ? 'ploinky_other' : ownedRegistration(manifest).containerName), runtimeId: runtime.runtimeId, instanceId: runtime.instanceId, enableGeneration: runtime.enableGeneration, running: runtime.running, labelsEqual: true,
         objectId: runtime.objectId, selectorId: runtime.selectorId, version: '1.0.0', sourceCommit: runtime.commit, provenanceCommit: runtime.commit, lockCommit: runtime.commit, markerSha256: runtime.markerSha256, payloadSha256: world.objects.get(runtime.objectId).payloadSha256,
         treeMatchesManifest: true, installerKind: 'container-npm', verification: 'remote-verified', readerReceipt: faults.noReceipt ? null : { runtimeId: runtime.runtimeId, instanceId: runtime.instanceId, enableGeneration: runtime.enableGeneration, objectId: runtime.objectId },
         receiptCount: 1, mountSource: `/ws/.ploinky/deps/store/objects/${runtime.objectId}/payload/node_modules`, mountReadOnly: true });
@@ -38,7 +40,12 @@ export function createWorld(faults = {}) {
                     graph: manifest.graph.map(entry => ({ name: entry.name, graphGeneration: world.generation, running: true, runtimeId: 'rt', instanceId: 'inst', enableGeneration: 'en', ready: faults.graphNotReady !== true, externalHealth: true, noWaitState: null })),
                     publicConfig: faults.configChanges && world.generation !== 'gen-1' ? { staticAgent: 'other', staticPort: 8080 } : { ...world.publicConfig }, activation: { generation: world.generation, activationId: 'act' } }; } },
         browser: { async createMarker() { world.calls.push('browser-create'); return { phase: 'U1', uploaded: true, previewed: true, storageProved: true }; }, async verifyMarker() { world.calls.push('browser-verify'); return { phase: 'U7', storageProved: true, previewed: true }; } },
-        workerHost: { async update(operation) { world.calls.push(`update:${operation}`);
+        workerHost: { async update(operation, expected) { world.calls.push(`update:${operation}`);
+            // A real update emits the owned repository record and, with its registration enabled, the Git-pin record; the
+            // expectation must name exactly those ids (and none else), or the update would be refused as incomplete.
+            validateExpectation(expected, manifest); const owned = ownedRegistration(manifest);
+            const produced = ['workspace-graph', owned.repoName, ...(world.runtimes.has('primary') ? [owned.pinId] : [])];
+            if (JSON.stringify([...produced].sort()) !== JSON.stringify([...expected.recordIds].sort()) || expected.errors.length || expected.blockedBy.length) { const error = new Error('x'); error.code = 'update-records-incomplete'; throw error; }
             if (operation === 'normal-update') { const runtime = world.runtimes.get('primary'), B = world.commits.B; const old = runtime.objectId; if (!faults.updateKeepsObject) { runtime.objectId = addObject('pkg-B-updated'); runtime.selectorId = H(`sel-${world.counter++}`); }
                 if (!faults.noRestart) runtime.runtimeId = id('rt-primary-B'); runtime.commit = faults.wrongCommit ? H('wrong').slice(0, 40) : B.commit; runtime.markerSha256 = B.markerSha256; runtime.marker = B.marker; if (faults.mutatePredecessor) world.objects.get(old).treeMatches = false; if (faults.removePredecessor) world.objects.get(old).present = false; if (!faults.noGenerationChange) bump(); }
             else if (!faults.noGenerationChange) bump();
@@ -65,7 +72,8 @@ export function createWorld(faults = {}) {
         negative: { async run() { world.calls.push('negative-run'); if (!faults.noPending) world.pending = true; return { phase: 'U6', optional: 'passed', required: 'passed' }; }, async restore() { world.calls.push('negative-restore'); } },
         cleanup: { async run({ writersQuiescent }) { world.calls.push(`cleanup:${writersQuiescent}`); return { repo: 'uninstalled', server: 'removed', files: 'removed', marker: 'removed' }; } },
     };
-    const state = {}, inputs = { expectedUpdates: { 'normal-update': {}, 'settling-update': {} } };
+    const owned = ownedRegistration(manifest);
+    const state = {}, inputs = { expectedUpdates: { 'normal-update': { errors: [], blockedBy: [], recordIds: ['workspace-graph', owned.repoName, owned.pinId] }, 'settling-update': { errors: [], blockedBy: [], recordIds: ['workspace-graph', owned.repoName] } } };
     const ctx = { manifest, inputs, ports, state, check() {}, latchClean: () => faults.latchDirty !== true };
     return { world, ctx, phases: createFunctionalPhases(ctx), ports };
 }
