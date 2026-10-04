@@ -112,3 +112,20 @@ test('copying admitted own __proto__ attributes preserves the cache key', () => 
     assert.equal(Object.getPrototypeOf(result.importAttributes), Object.prototype);
     assert.equal(hooks.load(API, { format: 'module', importAttributes: result.importAttributes }, forbidden).source, content.get(API).toString());
 });
+test('a package file whose resolver format is undetermined is bound to the catalog format at load, never to another URL', () => {
+    const hooks = createVerifiedImportHooks(catalog(), { readSource: row => content.get(row.url), check() {} });
+    for (const unset of [undefined, null]) {
+        const next = createVerifiedImportHooks(catalog(), { readSource: row => content.get(row.url), check() {} });
+        assert.equal(next.resolve(API, context, () => ({ url: API, format: unset })).url, API);
+        assert.equal(next.load(API, { format: unset }, forbidden).format, 'module');
+    }
+    assert.throws(() => hooks.resolve(API, context, () => ({ url: DEP, format: undefined })), { code: 'import-resolution-changed' });
+    const other = createVerifiedImportHooks(catalog(), { readSource: row => content.get(row.url), check() {} });
+    assert.throws(() => other.resolve(API, context, () => ({ url: API, format: 'json' })), { code: 'import-resolution-changed' });
+});
+test('an own importAttributes key with an undefined value is the observed native shape and carries no attributes', () => {
+    const hooks = createVerifiedImportHooks(catalog(), { readSource: row => content.get(row.url), check() {} });
+    assert.equal(hooks.resolve(API, context, () => ({ url: API, format: 'module', importAttributes: undefined })).url, API);
+    const next = createVerifiedImportHooks(catalog(), { readSource: row => content.get(row.url), check() {} });
+    assert.throws(() => next.resolve(API, context, () => ({ url: API, format: 'module', importAttributes: null })), { code: 'import-attributes' });
+});

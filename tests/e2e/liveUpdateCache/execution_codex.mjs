@@ -11,7 +11,7 @@ const PHASES = new Set(['host-ploinky', 'workspace-ploinky', 'agentlib', 'regist
 const OUTCOMES = new Set(['changed', 'unchanged', 'skipped', 'deferred', 'failed', 'uncertain']);
 const tuple = record => ({ phase: record.phase, id: record.id, outcome: record.outcome, required: record.required, code: record.code });
 const sorted = rows => [...rows].sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
-function validateExpectation(expected, manifest) {
+export function validateExpectation(expected, manifest) {
     exact(expected, ['errors', 'blockedBy', 'recordIds']);
     const ids = new Set(['ploinky', 'achillesAgentLib', 'workspace-graph', 'update', 'update-transaction', 'host-ploinky',
         manifest.candidate.root, manifest.workspace.path, ...manifest.candidate.repositories.flatMap(repo => [repo.name, repo.path]),
@@ -182,10 +182,17 @@ export async function superviseOwnedUpdate({ manifest, operation, workerPath, wo
         while ((!closed || !Object.values(streams).every(value => value.ended && value.closed)) && now() < closeDeadline) { await delay(10); checkDeadline(); }
         checkDeadline();
         need(closed && Object.values(streams).every(value => value.ended && value.closed), 'worker-close-unproven');
-        need(current(registration) === null && signal === null && [0, 1].includes(code), 'worker-incarnation-unsettled');
+        need(current(registration) === null && signal === null && [0, 1, 2].includes(code), 'worker-incarnation-unsettled');
         checkDeadline();
         need(!firstFailure && !latch.snapshot().uncertain, firstFailure ?? 'worker-uncertain');
         let frame; try { frame = parseStrictJson(control, LIMITS.controlBytes); } catch { throw new AcceptanceError('worker-control-json'); }
+        if (frame?.type === 'WORKER_FAILURE') {
+            // A settled worker may report one fixed lowercase reason; it is never a pass and keeps the run latched.
+            exact(frame, ['type', 'runId', 'operation', 'reason'], 'worker-result-binding');
+            need(code === 2 && frame.runId === manifest.runId && frame.operation === operation && typeof frame.reason === 'string' && /^[a-z][a-z0-9-]{0,63}$/.test(frame.reason), 'worker-result-binding');
+            throw new AcceptanceError(`worker-${frame.reason}`);
+        }
+        need([0, 1].includes(code), 'worker-incarnation-unsettled');
         exact(frame, ['type', 'runId', 'operation', 'proof']);
         need(frame.type === 'UPDATE_RESULT' && frame.runId === manifest.runId && frame.operation === operation
             && frame.proof?.fulfilled === true && frame.proof.callbackCount === 1 && frame.proof.returnedCode === code
@@ -233,6 +240,7 @@ export function validatePublicWorkerProof(proof, { operation, returnedCode, expe
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-    // Physical observer/handshake and every phase adapter are unqualified in this first scaffold.
-    process.stderr.write('{"status":"UNQUALIFIED","reason":"owned-worker-adapters-unimplemented"}\n'); process.exitCode = 1;
+    // The owned worker entry: all runtime proof and the hooked product import live in worker_codex.mjs.
+    const { workerMain } = await import('./worker_codex.mjs');
+    process.exitCode = await workerMain(process.argv.slice(2));
 }

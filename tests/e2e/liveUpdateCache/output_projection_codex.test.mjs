@@ -88,3 +88,11 @@ test('closed or unknown channels reject subsequent data without retaining it', (
     const unknown = createGcOutputProjection(); unknown.push('PRIVATE_SENTINEL', success);
     assert.equal(unknown.snapshot().failure, 'gc-output-channel-invalid');
 });
+
+test('the nested Podman runtime reader kind is a known retained reason while an invented kind stays refused', () => {
+    const accept = text => { const projection = createGcOutputProjection(); projection.push('stdout', Buffer.from(text)); projection.end('stdout'); projection.end('stderr'); return projection.snapshot(); };
+    const known = accept('[DEBUG] [deps-gc] removed 0 object(s); retained bytes by reason {"admitted-record":10,"container-mount":10,"reader:container":10}\n');
+    assert.deepEqual(known.summary, { outcome: 'collected', removedCount: 0, retainedBytesByReason: { 'admitted-record': 10, 'container-mount': 10, 'reader:container': 10 } });
+    const invented = accept('[DEBUG] [deps-gc] removed 0 object(s); retained bytes by reason {"reader:made-up":10}\n');
+    assert.equal(invented.failure, 'gc-summary-unknown-field'); assert.equal(invented.summary, null);
+});

@@ -3,7 +3,9 @@ import { TextDecoder } from 'node:util';
 const REASONS = new Set(['admitted-record', 'registry-bind', 'container-mount', 'rebuild-request',
     'build-writer-unproven', 'build-receipt-unowned', 'unknown-entry', 'unpublished-unproven',
     'receipt-writer-unproven', 'seed-index', 'reader:service', 'reader:attachment',
-    'reader:seed-copy', 'reader:candidate', 'reader:unknown']);
+    'reader:seed-copy', 'reader:candidate', 'reader:unknown',
+    // The consumer kinds the runtimes actually publish: the nested Podman runtime writes `container`.
+    'reader:container', 'reader:bwrap-service', 'reader:bwrap-attachment', 'reader:seatbelt-service', 'reader:seatbelt-attachment']);
 
 export function createGcOutputProjection({ maxBytes = 16 * 1024 * 1024, maxLineBytes = 64 * 1024 } = {}) {
     if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 16 * 1024 * 1024

@@ -85,8 +85,11 @@ export function createVerifiedImportHooks(catalog, { readSource, check }) {
             need(expected, 'import-edge-unqualified');
             const result = nextResolve(specifier, context);
             const builtinWithoutFormat = expected.format === 'builtin' && builtins.has(expected.url) && result?.format === undefined;
-            need(result?.url === expected.url && (result.format === expected.format || builtinWithoutFormat), 'import-resolution-changed');
-            if (Object.hasOwn(result, 'importAttributes')) {
+            // Node leaves a package .js file's format undetermined at resolution; its format is then fixed by the catalog row at load.
+            const formatlessFile = expected.format !== 'builtin' && result?.format == null;
+            need(result?.url === expected.url && (result.format === expected.format || builtinWithoutFormat || formatlessFile), 'import-resolution-changed');
+            // Node may return the key with an undefined value; only a present attribute object is compared and copied.
+            if (Object.hasOwn(result, 'importAttributes') && result.importAttributes !== undefined) {
                 need(JSON.stringify(attributes(result.importAttributes)) === JSON.stringify(expected.attributeRows), 'import-resolution-changed');
                 // Node accepts null-prototype data attributes; keep their prototype and privately copy the admitted values.
                 const copied = Object.create(Object.getPrototypeOf(result.importAttributes));

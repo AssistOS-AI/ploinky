@@ -150,7 +150,7 @@ export function readBoundedDescriptor(fd, cap, io) {
 }
 
 export function parseStrictJson(bytes, cap = LIMITS.manifestBytes) {
-    need(Number.isSafeInteger(cap) && cap > 0 && cap <= LIMITS.manifestBytes && Buffer.isBuffer(bytes) && bytes.length <= cap, 'manifest-byte-limit');
+    need(Number.isSafeInteger(cap) && cap > 0 && cap <= LIMITS.readBytes && Buffer.isBuffer(bytes) && bytes.length <= cap, 'manifest-byte-limit');
     let parsed, text; try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes); parsed = JSON.parse(text); } catch { throw new AcceptanceError('manifest-json'); }
     const tokens = text.match(/"(?:\\.|[^"\\])*"|[{}\[\]:,]|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null/g) ?? [];
     let index = 0;
