@@ -481,3 +481,54 @@ test('X5.c5-engine-identity-of-a-real-podman-5-7-capture-without-a-host-id-equal
     const unbound = await reconcileC5Custody({ run: context.run, profile: context.profile, driver: null, driverSettled: true, engineIdentity: () => { throw new Error('asked'); }, ids: [context.profile.box.id], inspect: async () => { throw new Error('no'); } });
     assert.deepEqual(unbound.ids, [context.profile.box.id]);
 });
+
+// The product's engine identity is computed from one `podman info` document by its own discovery. The harness's productEngineDigest must equal it for every
+// shape of that document the product accepts: each of the four fields is the first of its two spellings that is not undefined (null counts as a value),
+// and a spelling under a non-object parent is skipped.
+const REAL_INFO = () => JSON.parse(fs.readFileSync(path.join(REPOSITORY, 'tests/hardware-limits/podmanInfoWithoutHostId.json'), 'utf8'));
+const IDENTITY_SHAPES = Object.freeze({
+    'the-real-redacted-capture-which-has-no-host-id': (info) => info,
+    'a-host-id-present': (info) => { info.host.id = 'host-id-lower'; return info; },
+    'uppercase-only-spellings': (info) => {
+        delete info.store.graphRoot; delete info.store.runRoot; delete info.version.APIVersion;
+        info.Host = { ID: 'HOST-ID-UPPER' }; info.Store = { GraphRoot: '/upper/graph', RunRoot: '/upper/run' }; info.Version = { APIVersion: '9.9.9' };
+        return info;
+    },
+    'both-spellings-with-different-values-the-lowercase-one-wins': (info) => {
+        info.host.id = 'host-id-lower'; info.Host = { ID: 'HOST-ID-UPPER' };
+        info.Store = { GraphRoot: '/upper/graph', RunRoot: '/upper/run' }; info.Version = { APIVersion: '9.9.9' };
+        return info;
+    },
+    'null-precedence-a-null-lowercase-value-hides-the-uppercase-one': (info) => {
+        info.host.id = null; info.Host = { ID: 'HOST-ID-UPPER' };
+        info.store.runRoot = null; info.Store = { RunRoot: '/upper/run' };
+        return info;
+    },
+    'a-non-object-lowercase-host': (info) => {
+        const rootless = info.host.security.rootless;
+        info.Host = { ID: 'HOST-ID-UPPER', Security: { Rootless: rootless } }; info.host = 'not-an-object';
+        return info;
+    },
+    'a-null-lowercase-host': (info) => {
+        const rootless = info.host.security.rootless;
+        info.Host = { ID: 'HOST-ID-UPPER', Security: { Rootless: rootless } }; info.host = null;
+        return info;
+    },
+});
+for (const [shape, build] of Object.entries(IDENTITY_SHAPES)) {
+    test(`X5.c5-product-engine-digest-equals-the-products-own-engine-identity-for-${shape}`, () => {
+        const info = build(REAL_INFO());
+        const runner = { query: (_command, args) => (args[0] === 'info' ? { ok: true, status: 0, stdout: JSON.stringify(info), stderr: '' } : { ok: false, status: 1, stdout: '', stderr: 'no such container', error: null }) };
+        const marker = () => { throw Object.assign(new Error('absent'), { code: 'ENOENT' }); };
+        const discovered = discoverBoxOwnership({ instance: 'ploinky-box-x-000000000000', pathHash: '000000000000', workspaceRoot: '/x' }, { platform: 'linux', env: {}, runner, readMachineMarkerFile: marker });
+        assert.equal(discovered.state, 'absent', discovered.message);
+        assert.match(discovered.engine.identity, /^[a-f0-9]{64}$/);
+        assert.equal(productEngineDigest(info), discovered.engine.identity);
+    });
+}
+
+test('X5.c5-product-engine-digest-shapes-give-distinct-identities-so-the-parametrized-equality-is-not-vacuous', () => {
+    const digests = Object.values(IDENTITY_SHAPES).map((build) => productEngineDigest(build(REAL_INFO())));
+    assert.equal(digests[0], 'fb20e894fbd16dbe440a307996c863f6df883fb2c0564b03543bc4030df3a061');
+    assert.equal(new Set(digests).size >= 5, true, JSON.stringify(digests));
+});
