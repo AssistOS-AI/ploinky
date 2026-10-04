@@ -20,7 +20,7 @@ function releaseManifestFrom(manifest) {
 }
 
 function build(faults = {}, { files = {} } = {}) {
-    const h = createWorld(faults), { manifest } = h.world; manifest.grant.endsAtMs += 7200000; const release = releaseManifestFrom(manifest), time = { t: 0 }, io = createMemoryFs(files), closes = [], wallBase = Date.parse('2026-10-04T12:30:30Z');
+    const h = createWorld(faults), { manifest } = h.world; manifest.grant.endsAtMs += 7200000; const release = releaseManifestFrom(manifest), time = { t: 0 }, io = createMemoryFs({ [`${manifest.evidence.root}/.keep`]: '', ...files }), closes = [], wallBase = Date.parse('2026-10-04T12:30:30Z'); io.setMode(manifest.evidence.root, 0o040700);
     const clock = { mono: () => time.t, wall: () => wallBase + time.t + (faults.wallLate ?? 0), delay: async ms => { time.t += ms; } };
     const observedFor = m => { const expected = expectedLiveFromManifest(m);
         return { hostPlatform: 'linux', engine: 'podman', rootless: true, running: true, initialized: true, activeGeneration: 'g-1', pendingActivation: false, recoveryBarrier: false, workspace: { ...expected.workspace }, box: { ...expected.box }, candidate: structuredClone(expected.candidate),
@@ -94,6 +94,15 @@ test('the run refuses before any adapter exists on an unqualified host, with an 
         const h = forge(patch); await assert.rejects(h.run(), error => error.code === 'functional-receipt-invalid', label); assert.equal(h.createdPorts(), 0, label);
     }
     const resealed = forge(file => { file.receipts[2].status = 'SKIP'; }); await assert.rejects(resealed.run(), error => error.code === 'functional-receipt-invalid');
+});
+
+test('an absent, shared or foreign evidence root refuses before any adapter exists', async () => {
+    const missing = build(); missing.io.files.delete(`${missing.manifest.evidence.root}/.keep`); await assert.rejects(missing.run(), error => error.code === 'evidence-root-missing'); assert.equal(missing.createdPorts(), 0);
+    const loose = build(); loose.io.setMode(loose.manifest.evidence.root, 0o040755); await assert.rejects(loose.run(), error => error.code === 'evidence-root-unprivate'); assert.equal(loose.createdPorts(), 0);
+    const foreign = build(), original = foreign.io.lstatSync; foreign.io.lstatSync = name => (name === foreign.manifest.evidence.root ? { ...original(name), uid: 0 } : original(name));
+    await assert.rejects(foreign.run(), error => error.code === 'evidence-root-unprivate'); assert.equal(foreign.createdPorts(), 0);
+    const link = build(), linkOriginal = link.io.lstatSync; link.io.lstatSync = name => (name === link.manifest.evidence.root ? { ...linkOriginal(name), isSymbolicLink: () => true } : linkOriginal(name));
+    await assert.rejects(link.run(), error => error.code === 'evidence-root-unprivate'); assert.equal(link.createdPorts(), 0);
 });
 
 test('stage caps are the plan caps and the whole schedule is their exact sum', () => {

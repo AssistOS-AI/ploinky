@@ -2,15 +2,15 @@ import nodeFs from 'node:fs';
 // Test-only in-memory filesystem with the small synchronous surface the probes and readers use.
 export function createMemoryFs(initial = {}) {
     const files = new Map(Object.entries(initial).map(([name, value]) => [name, Buffer.from(value)])), open = new Map(); let next = 100, inode = 10;
-    const overrideLinks = new Map(); const inodes = new Map(); const ino = name => { if (!inodes.has(name)) inodes.set(name, inode++); return inodes.get(name); };
+    const modes = new Map(); const overrideLinks = new Map(); const inodes = new Map(); const ino = name => { if (!inodes.has(name)) inodes.set(name, inode++); return inodes.get(name); };
     const missing = () => Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
     const isDir = name => [...files.keys()].some(file => file.startsWith(`${name}/`));
     const stat = name => {
         if (files.has(name)) { const bytes = files.get(name); return { isFile: () => true, isDirectory: () => false, isSymbolicLink: () => false, size: bytes.length, dev: 1, ino: ino(name), uid: 1000, mode: 0o100644, nlink: overrideLinks.get(name) ?? 1 }; }
-        if (isDir(name)) return { isFile: () => false, isDirectory: () => true, isSymbolicLink: () => false, size: 0, dev: 1, ino: ino(name), mode: 0o040755, nlink: 2 };
+        if (isDir(name)) return { isFile: () => false, isDirectory: () => true, isSymbolicLink: () => false, size: 0, dev: 1, ino: ino(name), uid: 1000, mode: modes.get(name) ?? 0o040755, nlink: 2 };
         throw missing();
     };
-    return { files, overrideLinks, replaceInode: name => { inodes.set(name, inode++); }, lstatSync: stat, statSync: stat, unlinkSync: name => { if (!files.has(name)) throw missing(); files.delete(name); }, setFile: (name, value) => { files.set(name, Buffer.from(value)); },
+    return { files, overrideLinks, setMode: (name, mode) => { modes.set(name, mode); }, replaceInode: name => { inodes.set(name, inode++); }, lstatSync: stat, statSync: stat, unlinkSync: name => { if (!files.has(name)) throw missing(); files.delete(name); }, setFile: (name, value) => { files.set(name, Buffer.from(value)); },
         openSync: (name, flags = 0) => {
             // Write-create with O_EXCL refuses an existing file exactly as the real exclusive create does.
             const { O_WRONLY, O_RDWR, O_CREAT, O_EXCL } = nodeFs.constants;

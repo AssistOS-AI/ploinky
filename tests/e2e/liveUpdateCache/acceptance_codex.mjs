@@ -44,6 +44,9 @@ export async function executeAcceptance({ manifest, inputs, createPorts, io = fs
     const monoStart = clock.mono(); let offsetMs = 0;
     const timeline = () => offsetMs + (clock.mono() - monoStart);
     const receipts = [], runId = manifest.runId;
+    // The evidence root is operator-provisioned and private; it is never created or adopted by the run.
+    let root; try { root = io.lstatSync(manifest.evidence.root); } catch { throw new AcceptanceError('evidence-root-missing'); }
+    need(root.isDirectory() && !root.isSymbolicLink() && (root.mode & 0o077) === 0 && root.uid === hostFacts.uid, 'evidence-root-unprivate');
     need(!exists(io, manifest.evidence.receipt), 'receipt-exists');
     let resume = null;
     if (exists(io, manifest.evidence.functional)) resume = verifyFunctionalFile(parseStrictJson(readBoundedRegularFile(manifest.evidence.functional, LIMITS.readBytes, io), LIMITS.readBytes), manifest);
