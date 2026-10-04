@@ -44,6 +44,15 @@ test('U3: unreachable fixture, failed registration or enable and a wrong install
     await failsAt({ noReceipt: true }, 'U3', 'cache-a-unproven');
 });
 
+test('U3 records the owned server and the registration intent before the commands that could half-succeed', async () => {
+    const h = await run({}, 'U3'); assert.deepEqual(h.world.recovered.map(row => row.label), ['fixture-server', 'registration-intent']);
+    assert.ok(h.world.calls.indexOf('recovery:fixture-server') < h.world.calls.findIndex(call => call.startsWith('cli:add repo')) && h.world.calls.indexOf('recovery:registration-intent') < h.world.calls.findIndex(call => call.startsWith('cli:add repo')));
+    assert.equal(h.world.recovered[0].value.container.id.length, 64); assert.deepEqual(h.world.recovered[1].value.aliases, h.world.names.aliases);
+    const failed = createWorld({ enableExit: 1, unreachable: false }); failed.ports.cache.cli = async (operation, args) => { if (args[0] === 'add') throw Object.assign(new Error('x'), { code: 'command-exit-unexpected' }); return { code: 0 }; };
+    for (const name of ['U0', 'U1', 'U2']) await failed.phases[name](); await assert.rejects(failed.phases.U3(), error => error.code === 'command-exit-unexpected');
+    assert.equal(failed.ctx.state.registered, true, 'a failed add is still treated as possibly registered, so cleanup checks the exact key');
+});
+
 test('U4: an update that keeps the object, does not restart, keeps the generation, changes the wrong commit or mutates the predecessor refuses', async () => {
     await failsAt({ updateKeepsObject: true }, 'U4', /replacement-not-observed|cache-b-unproven/);
     await failsAt({ noRestart: true }, 'U4', 'runtime-not-restarted'); await failsAt({ noGenerationChange: true }, 'U4', 'generation-not-fresh');

@@ -13,7 +13,7 @@ import { readBoundedRegularFile } from './worker_codex.mjs';
 const FUNCTIONAL = Object.freeze(['U0', 'U1', 'U2', 'U3', 'U4', 'U5', 'U6', 'U7', 'U7b']);
 const RELEASE = Object.freeze(['U7c', 'U8', 'U9']);
 const sha = value => createHash('sha256').update(canonicalJson(value)).digest('hex');
-const publicReason = error => error instanceof AcceptanceError && /^[a-z][a-z0-9-]{0,63}$/.test(error.code) ? error.code : (typeof error?.code === 'string' && /^[a-z][a-z0-9-]{0,63}$/.test(error.code) ? error.code : 'acceptance-failed');
+export const publicReason = error => error instanceof AcceptanceError && /^[a-z][a-z0-9-]{0,63}$/.test(error.code) ? error.code : (typeof error?.code === 'string' && /^[a-z][a-z0-9-]{0,63}$/.test(error.code) ? error.code : 'acceptance-failed');
 
 export function writeExclusive(io, file, text) {
     const fd = io.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
@@ -80,12 +80,20 @@ export async function executeAcceptance({ manifest, inputs, createPorts, io = fs
         if (!resume) for (const name of FUNCTIONAL) await run(name);
         if (!exists(io, manifest.evidence.release)) awaiting = true;
         else for (const name of RELEASE) await run(name);
-    } catch (error) { failure = { phase: REQUIRED_PHASES.find(name => !receipts.some(row => row.phase === name)) ?? 'U9', reason: publicReason(error), retained: error?.retained ?? null }; }
+    } catch (error) {
+        failure = { phase: REQUIRED_PHASES.find(name => !receipts.some(row => row.phase === name)) ?? 'U9', reason: publicReason(error), retained: error?.retained ?? null, recovery: null };
+        // The failure and every owned identity needed to recover by hand are persisted, exclusively and privately, before any close.
+        try {
+            const owned = ports.fixture?.state?.();
+            failure.recovery = ports.recovery.record('failure', { failedPhase: failure.phase, reason: failure.reason, elapsedMs: timeline(), withinDeadline: timeline() <= TOTAL_CAP_MS, passedPhases: receipts.map(row => row.phase),
+                unsettledCommands: custody.snapshot().filter(row => !row.settled), uncertain: latch.snapshot().uncertain, fixture: owned?.prepared || owned?.container ? ports.fixture.recoverySnapshot() : null });
+        } catch { failure.recovery = null; }
+    }
     finally { try { await ports.close?.(); } catch { failure ??= { phase: 'U9', reason: 'close-unproven', retained: null }; } }
     const projected = REQUIRED_PHASES.map(name => { const row = receipts.find(item => item.phase === name);
         return row ? { phase: name, status: 'PASS', qualified: true, startedMs: row.startedMs, finishedMs: row.finishedMs, evidenceSha256: row.evidenceSha256 } : { phase: name, status: failure?.phase === name ? 'FAIL' : 'UNRUN', qualified: false }; });
     const base = { schemaVersion: 1, runId, scope: 'live-update-cache-acceptance', executionInterface: 'outer-cli-api', phases: projected, budget: { totalCapMs: TOTAL_CAP_MS, elapsedMs: timeline() } };
-    if (failure) return Object.freeze({ ...base, acceptance: 'FAIL', status: 'FAILED', exitCode: 1, reason: failure.reason, failedPhase: failure.phase, resourceDisposition: latch.snapshot().uncertain ? 'HANDOFF_REQUIRED' : 'OWNED_RESOURCES_RETAINED_FOR_REVIEW', retained: custody.snapshot().filter(row => !row.settled) });
+    if (failure) return Object.freeze({ ...base, acceptance: 'FAIL', status: 'FAILED', exitCode: 1, reason: failure.reason, failedPhase: failure.phase, resourceDisposition: latch.snapshot().uncertain ? 'HANDOFF_REQUIRED' : 'OWNED_RESOURCES_RETAINED_FOR_REVIEW', retained: custody.snapshot().filter(row => !row.settled), recoveryRecord: failure.recovery });
     if (awaiting) return Object.freeze({ ...base, acceptance: 'UNQUALIFIED', status: 'AWAITING_RELEASE_FIXTURE', exitCode: 3, reason: 'release-fixture-absent', resourceDisposition: 'FUNCTIONAL_EPOCH_SETTLED' });
     assertPhaseReceipts({ runId, receipts });
     const receipt = { ...base, acceptance: 'PASS', status: 'PASSED', exitCode: 0, gates: state.gates.map(gate => ({ name: gate.name, runId: gate.runId, discovered: gate.discovered, passed: gate.passed, skipped: gate.skipped, retries: gate.retries, ignoredErrors: gate.ignoredErrors })),

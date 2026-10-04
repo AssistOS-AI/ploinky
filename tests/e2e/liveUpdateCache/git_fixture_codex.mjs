@@ -21,7 +21,7 @@ export { runSuffix, fixtureNames };
 export function createGitFixture({ manifest, deps, probeAgentImage, env = buildCommandEnvironment(process.env), io = fs, gitBin = '/usr/bin/git', random = randomBytes }) {
     need(manifest && deps && typeof probeAgentImage === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,300}@sha256:[a-f0-9]{64}$/.test(probeAgentImage), 'fixture-inputs');
     const names = fixtureNames(manifest.runId), endpoint = manifest.fixtureEndpoint, engine = manifest.engine.path;
-    const root = path.join(manifest.evidence.root, 'fixture'), serveRoot = path.join(root, 'serve'), served = path.join(serveRoot, names.relative), work = path.join(root, 'work'), marker = path.join(root, '.owner');
+    const root = path.join(manifest.evidence.root, 'fixture'), serveRoot = path.join(root, 'serve'), served = path.join(serveRoot, names.relative), work = path.join(root, 'work'), marker = path.join(root, '.owner'), cidfile = path.join(root, 'server.cid');
     const url = repo => `http://${endpoint.installerIP}:${endpoint.port}/${names.relative}/${repo}.git`;
     const state = { token: null, rootStat: null, container: null, commits: {}, started: false, prepared: false };
     const run = (operation, kind, argv, extra = {}) => runOwnedCommand({ operation, kind, argv, cwd: extra.cwd ?? manifest.evidence.root, env, deadlineMs: extra.deadlineMs ?? (kind === 'git' ? 30000 : 120000), ...extra }, deps);
@@ -78,11 +78,21 @@ export function createGitFixture({ manifest, deps, probeAgentImage, env = buildC
         },
         async startServer() {
             assertOwnedRoot(); need(!state.started && state.container === null, 'fixture-server-started');
-            const created = await run('fixture-server-run', 'mutation', [engine, 'run', '--detach', '--init', '--pull=never', '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges',
-                `--network=${endpoint.networkMode}`, '--name', names.container, '--label', `${OWNER_LABEL}=${manifest.runId}`, '--label', `${ROLE_LABEL}=${ROLE}`,
-                '--publish', `${endpoint.bindIP}:${endpoint.port}:${endpoint.internalPort}/tcp`, '--volume', `${serveRoot}:/srv:ro`, endpoint.imageId,
-                'httpd', '-f', '-v', '-p', String(endpoint.internalPort), '-h', '/srv'], { deadlineMs: 120000, maxStdoutBytes: 4096 });
-            const id = text(created); need(hex64(id), 'fixture-server-id'); state.container = id; state.started = true;   // recorded before any further fallible step
+            // --cidfile lives in the private fixture root: even when the launch command fails or its output is lost, the exact
+            // container ID is recoverable and recorded before anything else can fail.
+            let created = null, runError = null;
+            try {
+                created = await run('fixture-server-run', 'mutation', [engine, 'run', '--detach', '--init', '--pull=never', '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges',
+                    `--network=${endpoint.networkMode}`, '--name', names.container, '--cidfile', cidfile, '--label', `${OWNER_LABEL}=${manifest.runId}`, '--label', `${ROLE_LABEL}=${ROLE}`,
+                    '--publish', `${endpoint.bindIP}:${endpoint.port}:${endpoint.internalPort}/tcp`, '--volume', `${serveRoot}:/srv:ro`, endpoint.imageId,
+                    'httpd', '-f', '-v', '-p', String(endpoint.internalPort), '-h', '/srv'], { deadlineMs: 120000, maxStdoutBytes: 4096 });
+            } catch (error) { runError = error; }
+            let recorded = null; try { const value = io.readFileSync(cidfile, 'utf8').trim(); recorded = hex64(value) ? value : null; } catch { recorded = null; }
+            if (recorded) { state.container = recorded; state.started = true; }
+            if (runError) throw runError;
+            const id = text(created);
+            if (!recorded && hex64(id)) { state.container = id; state.started = true; }                   // output without a cidfile is still recorded before refusing
+            need(hex64(id) && id === recorded, 'fixture-server-id');
             const inspected = await run('fixture-server-inspect', 'read', [engine, 'container', 'inspect', '--format', '{{json .Id}}\n{{json .Image}}\n{{json .Config.Labels}}\n{{json .HostConfig.PortBindings}}\n{{json .HostConfig.NetworkMode}}', id], { maxStdoutBytes: 65536 });
             const [rawId, rawImage, rawLabels, rawPorts, rawNetwork] = text(inspected).split('\n').map(line => JSON.parse(line));
             const bindings = rawPorts?.[`${endpoint.internalPort}/tcp`];
@@ -97,6 +107,12 @@ export function createGitFixture({ manifest, deps, probeAgentImage, env = buildC
             const result = await run('fixture-box-reach', 'read', boxExecArgs({ engineBin: engine, boxId: manifest.box.id, workspace: manifest.workspace.path, routerHostPort: manifest.publications[0].hostPort,
                 mediaHostPort: manifest.publications[1].hostPort, argv: ['/usr/local/bin/node', '-e', script] }), { maxStdoutBytes: 65536 });
             return new RegExp(`^200 ${expectedCommit}\\s+refs/heads/main`).test(text(result));
+        },
+        // Nonsecret identities sufficient for guarded manual recovery; the private marker's content is never included.
+        recoverySnapshot() {
+            need(state.prepared, 'fixture-not-prepared'); let markerIdentity = null; try { const stat = io.lstatSync(marker); markerIdentity = { path: marker, dev: stat.dev, ino: stat.ino }; } catch { markerIdentity = { path: marker, dev: null, ino: null }; }
+            return { runId: manifest.runId, container: { id: state.container, labels: { [OWNER_LABEL]: manifest.runId, [ROLE_LABEL]: ROLE }, cidfile, image: endpoint.imageId, publication: `${endpoint.bindIP}:${endpoint.port}` },
+                fixtureRoot: { path: root, ...state.rootStat }, marker: markerIdentity, repository: { key: names.repoName, url: url('agent') }, aliases: [...names.aliases] };
         },
         async cleanup({ writersQuiescent }) {
             need(writersQuiescent === true, 'fixture-cleanup-not-quiescent');

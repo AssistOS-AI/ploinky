@@ -23,6 +23,7 @@ export function createWorld(faults = {}) {
     const fixture = { names, url: repo => `http://x/${repo}`, packageUrl: 'git+http://x/pkg', agentUrl: 'http://x/agent', async prepare() { world.calls.push('fixture-prepare'); },
         async publishPackage(label, marker) { const commit = H(`commit-${label}`).slice(0, 40); world.commits[label] = { commit, markerSha256: H(`marker-${label}`), marker }; return world.commits[label]; },
         async publishAgent() { return H('agent-commit').slice(0, 40); }, async startServer() { world.calls.push('fixture-start'); return H('server'); }, async reachableFromBox() { return faults.unreachable !== true; },
+        recoverySnapshot() { return { runId: manifest.runId, container: { id: H('server') }, repository: { key: names.repoName, url: 'http://x/agent' }, aliases: [...names.aliases] }; }, state: () => ({ prepared: world.calls.includes('fixture-prepare') && !world.calls.includes('fixture-cleanup'), container: world.calls.includes('fixture-start') && !world.calls.includes('fixture-cleanup') ? H('server') : null }),
         async cleanup() { world.calls.push('fixture-cleanup'); return { server: 'removed', files: 'removed' }; } };
     const runtimeFor = alias => [...world.runtimes.values()].find(runtime => runtime.alias === alias && runtime.repoName === names.repoName);
     const enable = alias => { const label = alias ? 'B' : (world.commits.B ? 'B' : 'A'), commit = world.commits[label];
@@ -30,7 +31,9 @@ export function createWorld(faults = {}) {
         const objectId = alias ? (faults.freshObjectPerAlias ? addObject(`alias-${alias}`) : world.runtimes.get('primary').objectId) : addObject(`pkg-${label}`);
         world.runtimes.set(alias ?? 'primary', { repoName: names.repoName, agentName: names.agentName, alias, runtimeId: id(`rt-${alias ?? 'primary'}`), instanceId: `inst-${world.counter++}`, enableGeneration: `en-${world.counter++}`,
             objectId, selectorId: H(`sel-${world.counter++}`), running: true, commit: commit.commit, markerSha256: commit.markerSha256, marker: commit.marker }); bump(); };
+    world.recovered = [];
     const ports = {
+        recovery: { record(label, value) { world.calls.push(`recovery:${label}`); world.recovered.push({ label, value }); return `recovery_${world.recovered.length}_${label}_codex.json`; } },
         clock: { delay: async ms => { world.delays += 1; } },
         fixture,
         observer: { async admit() { return { phase: 'U0', admitted: true, activeGeneration: world.generation, runtimes: 1 }; },
@@ -72,7 +75,7 @@ export function createWorld(faults = {}) {
                 if (!faults.noSummaryCallback) onChunk?.({ summary }); return { code: 0, summary, bytes: 100, discardedLines: 1 }; },
         },
         negative: { async run() { world.calls.push('negative-run'); if (!faults.noPending) world.pending = true; return { phase: 'U6', optional: 'passed', required: 'passed' }; }, async restore() { world.calls.push('negative-restore'); } },
-        cleanup: { async run({ writersQuiescent }) { world.calls.push(`cleanup:${writersQuiescent}`); return { repo: 'uninstalled', server: 'removed', files: 'removed', marker: 'removed' }; } },
+        cleanup: { async run({ writersQuiescent }) { world.calls.push(`cleanup:${writersQuiescent}`); await fixture.cleanup({ writersQuiescent }); return { repo: 'uninstalled', server: 'removed', files: 'removed', marker: 'removed' }; } },
     };
     const owned = ownedRegistration(manifest);
     const state = {}, inputs = { expectedUpdates: { 'normal-update': { errors: [], blockedBy: [], recordIds: ['workspace-graph', owned.repoName, owned.pinId] }, 'settling-update': { errors: [], blockedBy: [], recordIds: ['workspace-graph', owned.repoName] } } };

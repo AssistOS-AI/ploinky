@@ -39,7 +39,11 @@ Exit codes: 0 only with the explicit PASS verdict, 1 for a failed stage, 3 for `
 
 ## Two-invocation flow
 
-The first invocation runs U0-U7b. Cleanup completes, then the receipts and settled-epoch record are frozen into `functional_codex.json`. With no `release_codex.json` yet, it reports `AWAITING_RELEASE_FIXTURE` (exit 3) and creates no final receipt. After the operator has recreated the canonical fixture under the release grant and written the release manifest, a second invocation of the same command verifies the frozen file (run ID, order, hashes, no gate credit) and resumes at U7c through U9. The operator's wait is not counted against the schedule; the remaining suffix is re-admitted against the grant window.
+The first invocation runs U0-U7b. Cleanup completes, then the receipts and settled-epoch record are frozen into `functional_codex.json`. With no `release_codex.json` yet, it reports `AWAITING_RELEASE_FIXTURE` (exit 3) and creates no final receipt. After the operator has recreated the canonical fixture under the release grant and written the release manifest, a second invocation of the same command verifies the frozen file (run ID, order, hashes, no gate credit) and resumes at U7c through U9. The operator's wait is not counted against the schedule. The entrypoint only requires the manifest's grant to be open; the run itself admits the whole schedule from U0 on a fresh start and only the remaining U7c-U9 suffix (4,200,000 ms) on a resume, against the grant window and the release manifest's own grant.
+
+## Operational constraint: outer Box age at the canonical gates
+
+Before each gate the harness admits the remaining validity of the outer Box against the 30-minute generation clamp and the four-hour image limit. At the start of Copilot the remaining gate work is Copilot 540,000 ms plus OnlyOffice 840,000 ms plus WebMeet 120,000 ms plus a 30,000 ms settlement allowance per gate, 1,590,000 ms in total. The Box's StartedAt therefore cannot be more than 210,000 ms (3.5 minutes) old when Copilot begins, and the three gates must follow the fresh deployment's admission closely; an older Box refuses with `box-freshness-insufficient` and must be recreated. Re-reading metadata or restarting a nested agent never renews StartedAt. The 216-minute schedule does not widen either limit.
 
 ## Runtime prerequisites
 
@@ -51,11 +55,17 @@ Fixed public codes only. Examples: `runtime-host-unqualified`, `acceptance-input
 
 ## Recovery limits
 
+Private, append-only recovery records `recovery_<NNN>_<label>_codex.json` are written exclusively into the evidence root: the owned server's exact container ID and labels, the fixture directory and marker inodes (never the marker's content), the repository key and URL and the alias names, the registration intent before the commands that could half-succeed, and, on failure, the failed stage, reason, passed stages, unsettled commands and elapsed time. The server is launched with `--cidfile <evidence>/fixture/server.cid`, so its exact ID is recoverable even if the launch command fails. These records, not guesses, name what to remove by hand.
+
 The first refusal stops the run and nothing is cleaned up by guesswork. The failure receipt names the failed stage and lists any unsettled retained command. Owned resources that may remain: the fixture directory `<evidence>/fixture` and its private marker, the BusyBox server container (exact ID recorded in memory only, label `io.assistos.ploinky-test.owner=<runId>`), the repository key and `.ploinky/repos/UcProbe<suffix>`, the aliases `uc-<suffix>-a|b`, the marker `update-persistence-<runId stem>_codex.txt` in the workspace, and the continuation fixtures `UpdateE2E-<runId>` and `.update-e2e-<runId>` with a possible `active-scope-restore_codex.json`. Remove them only with the same ownership proofs the harness uses (marker, inode, exact ID and labels, exact key and URL). A timeout, signal, overflow or unknown writer leaves recovery to the operator; the harness never signals a child, never kills a process group and never retries an update.
 
 ## Borrowed assertions
 
 The September 25 donor scripts are assertion sources only and are not imported. Their SHA-256 values as pinned in the plan's source bindings: `warm-start_claude.mjs` c45b99ba255092b8ecc5937f150830b98b253e69638cab1fb1ee8b2ac436cee4, `moving-git-package_claude.mjs` a9dd891bf2b170e6dc54db12e18248a213ca0578d5d42300c3430fa6c4acddda, `alias-reinstall_claude.mjs` f965e21780cb3a6a8b6cb8ca2602c45fc44261364d84c623b4fc7948051d7490, `postflight_claude.mjs` ee53216bc6211b7a32d54fa2ae7dc853cefbf61abf1f5717b5f563fb668654f7.
+
+## Update expectations and the continuation runner
+
+The expected record set of `normal-update` and `settling-update` must name the run-owned repository record (`UcProbe<suffix>`) and, for `normal-update`, the Git-pin record of the owned registration, whose id is derived exactly as the product derives it (`owned_ids_codex.mjs`, compared in its control with the product's own container-name and pin-id functions). The continuation runner (U6) still judges its two updates from the outer CLI's output wording plus the product's own recovery state, not from the structured worker, because a structured proof needs the exact full record inventory of those updates, which only an observed run can supply. It clears its retain-fixtures guard only for a proven normal return (normal activation wording, no exception-path output, no recovery barrier, readable update state), and it admits against the generation the parent has itself admitted, passed with `--generation`.
 
 ## Not yet qualified on the selected host
 

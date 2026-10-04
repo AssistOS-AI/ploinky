@@ -29,6 +29,32 @@ test('invalid argc/Node/manifest refuses before runtime work and public errors c
     assert.equal(await acceptanceMain(['--acceptance', '/owned/manifest_codex.json'], { read, write }), 64); assert.equal(reads, 1);
     assert.equal(JSON.stringify(outputs).includes('PRIVATE'), false);
 });
+test('the grant need only be open at the entrypoint: the stage window is admitted by the run, so a resume near the end is not refused up front', async () => {
+    const { value, nowMs } = manifestFixture(), seen = []; const hostFacts = { platform: 'linux', uid: 1000 };
+    const run = async manifest => { seen.push(manifest.runId); return { exitCode: 3, acceptance: 'UNQUALIFIED' }; };
+    for (const at of [value.grant.endsAtMs - 1, value.grant.endsAtMs - 3000000]) assert.equal(await acceptanceMain(['--acceptance', '/owned/manifest_codex.json'], { nowMs: at, read: () => Buffer.from(JSON.stringify(value)), write() {}, run }), 3);
+    assert.equal(seen.length, 2);
+    const outputs = []; for (const at of [value.grant.endsAtMs, value.grant.startsAtMs - 1]) {
+        assert.equal(await acceptanceMain(['--acceptance', '/owned/manifest_codex.json'], { nowMs: at, read: () => Buffer.from(JSON.stringify(value)), write: row => outputs.push(row), run }), 64); assert.equal(outputs.at(-1).reason, 'resource-window');
+    }
+    assert.equal(seen.length, 2, 'an expired or not-yet-open grant never reaches the run');
+});
+
+test('an exception after a command was launched is a failed run needing hand-off, not a refusal before the runtime', async () => {
+    const { value } = manifestFixture(), { createRunEnvironment } = await import('./real_adapters_codex.mjs'); const { runAcceptance } = await import('./run_codex.mjs');
+    const hostFacts = { platform: 'linux', uid: 1000 };
+    const { expectationFixture } = await import('./test_support_codex.mjs'); const { expected } = expectationFixture(value);
+    const file = `${value.evidence.root}/inputs_codex.json`, bytes = Buffer.from(JSON.stringify({ schemaVersion: 1, runId: value.runId, probeAgentImage: `docker.io/library/node@sha256:${'a'.repeat(64)}`, releaseManifest: '/home/skutner/work/release/m_codex.json', expectedUpdates: { 'normal-update': expected, 'settling-update': expected } }));
+    const { createMemoryFs } = await import('./fake_fs_support_codex.mjs'); const io = createMemoryFs({ [file]: bytes });
+    const launched = createRunEnvironment(); const child = { pid: 77 }; 
+    const afterLaunch = await runAcceptance(value, { manifestPath: '/m_codex.json', io, hostFacts, environment: launched, execute: async () => { launched.custody.retain(child, { operation: 'x', runId: value.runId }); throw Object.assign(new Error('PRIVATE'), { code: 'phase-budget-expired' }); } });
+    assert.equal(afterLaunch.acceptance, 'FAIL'); assert.equal(afterLaunch.exitCode, 1); assert.equal(afterLaunch.reason, 'phase-budget-expired'); assert.equal(afterLaunch.resourceDisposition, 'HANDOFF_REQUIRED'); assert.deepEqual(afterLaunch.retained.map(row => row.pid), [77]); assert.doesNotMatch(JSON.stringify(afterLaunch), /PRIVATE/);
+    const dirty = createRunEnvironment(); dirty.latch.stop('worker-error');
+    assert.equal((await runAcceptance(value, { manifestPath: '/m_codex.json', io, hostFacts, environment: dirty, execute: async () => { throw new Error('x'); } })).acceptance, 'FAIL');
+    const nothing = createRunEnvironment(); await assert.rejects(runAcceptance(value, { manifestPath: '/m_codex.json', io, hostFacts, environment: nothing, execute: async () => { throw Object.assign(new Error('x'), { code: 'receipt-exists' }); } }), error => error.code === 'receipt-exists');
+    const outputs = []; assert.equal(await acceptanceMain(['--acceptance', '/owned/manifest_codex.json'], { nowMs: value.grant.startsAtMs, read: () => Buffer.from(JSON.stringify(value)), write: row => outputs.push(row), run: async () => afterLaunch }), 1);
+});
+
 test('only an explicit PASS verdict with exit 0 is success; other receipts and exceptions are nonzero', async () => {
     const { value, nowMs } = manifestFixture(), outputs = [];
     const run = receipt => async () => receipt;

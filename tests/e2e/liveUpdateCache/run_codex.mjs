@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { AcceptanceError, LIMITS, need, parseAcceptanceArguments, parseManifestBytes, validateManifest, readBoundedDescriptor } from './manifest_codex.mjs';
 import { REQUIRED_PHASES } from './contracts_codex.mjs';
 import { loadInputs } from './inputs_codex.mjs';
-import { executeAcceptance } from './acceptance_codex.mjs';
+import { executeAcceptance, publicReason } from './acceptance_codex.mjs';
 import { createRunEnvironment, createRealPorts } from './real_adapters_codex.mjs';
 
 // All twelve required stages have a real adapter wired into this entrypoint. Wiring is not qualification: no stage
@@ -29,7 +29,14 @@ export async function runAcceptance(manifest, { manifestPath, io = fs, hostFacts
     // The host is qualified before the inputs file, the evidence root or any adapter is touched.
     need(hostFacts.platform === 'linux' && hostFacts.uid === manifest.host.uid, 'runtime-host-unqualified');
     const inputs = loadInputs(manifest, io);
-    return execute({ manifest, inputs, createPorts, io, clock: environment.clock, hostFacts, latch: environment.latch, custody: environment.custody, write });
+    try {
+        return await execute({ manifest, inputs, createPorts, io, clock: environment.clock, hostFacts, latch: environment.latch, custody: environment.custody, write });
+    } catch (error) {
+        // An error after any command was launched is a failed run that needs hand-off, never a refusal before the runtime.
+        if (environment.custody.snapshot().length === 0 && !environment.latch.snapshot().uncertain) throw error;
+        return Object.freeze({ scope: 'live-update-cache-acceptance', runId: manifest.runId, acceptance: 'FAIL', status: 'FAILED', exitCode: 1, reason: publicReason(error), resourceDisposition: 'HANDOFF_REQUIRED',
+            retained: environment.custody.snapshot().filter(row => !row.settled) });
+    }
 }
 
 export async function acceptanceMain(argv, { read = readManifestFile, write = value => process.stdout.write(JSON.stringify(value) + '\n'), nodeVersion = process.version, nowMs = Date.now(), io = fs,
@@ -37,7 +44,10 @@ export async function acceptanceMain(argv, { read = readManifestFile, write = va
     try {
         const { manifestPath } = parseAcceptanceArguments(argv);
         need(/^v(?:2[2-9]|[3-9]\d|\d{3,})\./.test(nodeVersion), 'node-22-required');
-        const manifest = parseManifestBytes(read(manifestPath), { nowMs });
+        // The window is checked per stage by the run itself (the full suffix from U0, only the remaining suffix on resume); here the grant
+        // need only be open now.
+        const manifest = parseManifestBytes(read(manifestPath));
+        need(manifest.grant.startsAtMs <= nowMs && nowMs < manifest.grant.endsAtMs, 'resource-window');
         const receipt = await run(manifest, { manifestPath, io, write: event => write({ progress: event }), ...(hostFacts ? { hostFacts } : {}) });
         write(receipt);
         // Success needs the explicit PASS verdict as well as exit 0; anything else is a nonzero exit.

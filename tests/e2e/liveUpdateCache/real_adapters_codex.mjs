@@ -14,6 +14,8 @@ import { createCleanupPort } from './cleanup_port_codex.mjs';
 import { createGatePort } from './gates_codex.mjs';
 import { applicationMarker } from './application_marker_codex.mjs';
 import { readBoundedRegularFile } from './worker_codex.mjs';
+import { admitRemainingSchedule } from './contracts_codex.mjs';
+import { createRecoveryLog } from './recovery_codex.mjs';
 
 // The one place real adapters are assembled. Nothing here is a mock: every port launches the real engine, Git, outer CLI,
 // worker, browser or smoke entrypoint through the owned command runner or its own retained handle.
@@ -40,7 +42,9 @@ export function createRealPorts({ manifestPath, latch, custody, clock, io = fs, 
         const release = {
             async load() {
                 const bytes = readBoundedRegularFile(manifest.evidence.release, LIMITS.manifestBytes, io);
-                const releaseManifest = validateManifest(parseStrictJson(bytes, LIMITS.manifestBytes), { nowMs: clock.wall() });
+                const releaseManifest = validateManifest(parseStrictJson(bytes, LIMITS.manifestBytes));
+                // Its own grant must be open and cover the stages still to run, not the whole schedule again.
+                need(releaseManifest.grant.startsAtMs <= clock.wall(), 'resource-window'); admitRemainingSchedule({ firstPhase: 'U7c', remainingMs: releaseManifest.grant.endsAtMs - clock.wall() });
                 // The gates run only against the release manifest that has just been loaded and validated.
                 gatePort = createGatePort({ manifest: releaseManifest, inputs, deps, processEnv, io });
                 return releaseManifest;
@@ -50,7 +54,8 @@ export function createRealPorts({ manifestPath, latch, custody, clock, io = fs, 
                 return createLiveObserver({ manifest: releaseManifest, deps, statusProof: () => releaseHost.status(), env: buildCommandEnvironment(processEnv, { PLOINKY_WORKSPACE_ROOT: releaseManifest.workspace.path }) });
             },
         };
+        const recovery = createRecoveryLog({ root: manifest.evidence.root, runId: manifest.runId, io });
         const gates = { async run(gate) { need(gatePort, 'gate-port-unavailable'); return gatePort.run(gate); } };
-        return Object.freeze({ clock, custody, observer, workerHost, cache, fixture, browser, negative, cleanup, release, gates, async close() { await browser.close(); } });
+        return Object.freeze({ recovery, clock, custody, observer, workerHost, cache, fixture, browser, negative, cleanup, release, gates, async close() { await browser.close(); } });
     };
 }

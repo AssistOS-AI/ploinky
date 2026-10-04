@@ -78,9 +78,12 @@ export function createFunctionalPhases(ctx) {
         },
         async U3() {
             const fixture = ports.fixture; await fixture.prepare();
-            const A = await fixture.publishPackage('A', `A-${names.suffix}`), agentCommit = await fixture.publishAgent(); await fixture.startServer();
+            const A = await fixture.publishPackage('A', `A-${names.suffix}`), agentCommit = await fixture.publishAgent();
+            try { await fixture.startServer(); } finally { if (fixture.state().container) ports.recovery.record('fixture-server', fixture.recoverySnapshot()); }
             need(await fixture.reachableFromBox('pkg', A.commit) && await fixture.reachableFromBox('agent', agentCommit), 'fixture-unreachable-from-box');
-            need((await ports.cache.cli('fixture-add-repo', ['add', 'repo', fixture.agentUrl, names.repoName, 'main'])).code === 0, 'fixture-registration-failed'); state.registered = true;
+            // Intent is recorded, and ownership claimed, before the command can half-succeed: cleanup then checks the exact key and URL.
+            ports.recovery.record('registration-intent', { repository: { key: names.repoName, url: fixture.agentUrl }, primary: `${names.repoName}/${names.agentName}`, aliases: [...names.aliases] }); state.registered = true;
+            need((await ports.cache.cli('fixture-add-repo', ['add', 'repo', fixture.agentUrl, names.repoName, 'main'])).code === 0, 'fixture-registration-failed');
             need((await ports.cache.cli('fixture-enable-primary', ['enable', 'agent', `${names.repoName}/${names.agentName}`, 'global'])).code === 0, 'fixture-enable-failed'); state.primaryEnabled = true;
             const row = await probeRow(ctx, targetFor(names, null), A.marker); assertInstalled(row, A, 'cache-a-unproven');
             const observed = await observeAgain(ctx); state.generation = observed.activeGeneration; state.A = { ...A, row };
@@ -142,8 +145,8 @@ export function createFunctionalPhases(ctx) {
 // product collection that follows a reinstall of alias A actually reports success.
 async function retainedReaderProof(ctx, aliasA, aliasB) {
     const { manifest, ports, state } = ctx, names = ports.fixture.names, B = state.B;
+    state.aliasesEnabled = true;                                  // claimed before the commands that could half-succeed
     for (const alias of [aliasA, aliasB]) need((await ports.cache.cli('fixture-enable-alias', ['enable', 'agent', `${names.repoName}/${names.agentName}`, 'global', 'as', alias])).code === 0, 'fixture-enable-failed');
-    state.aliasesEnabled = true;
     const rowA0 = await probeRow(ctx, targetFor(names, aliasA), B.marker), rowB0 = await probeRow(ctx, targetFor(names, aliasB), B.marker);
     assertInstalled(rowA0, B, 'cache-alias-unproven'); assertInstalled(rowB0, B, 'cache-alias-unproven');
     need(rowA0.objectId === rowB0.objectId && rowA0.runtimeId !== rowB0.runtimeId, 'aliases-not-identical');

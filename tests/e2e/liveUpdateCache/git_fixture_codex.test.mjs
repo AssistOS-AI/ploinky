@@ -28,7 +28,7 @@ function build(mutate = () => {}) {
         // A real clone creates its working directory; the fake does the same so the module's own file writes land in it.
         { match: (bin, args) => bin === '/usr/bin/git' && args.includes('clone'), reply: ({ args, options }) => { fs.mkdirSync(path.join(options.cwd, args.at(-1))); return {}; } },
         { match: (bin, args) => bin === '/usr/bin/git', reply: () => ({}) },
-        { match: (bin, args) => args[0] === 'run', reply: () => ({ stdout: `${state.id}\n` }) },
+        { match: (bin, args) => args[0] === 'run', reply: ({ args }) => { const index = args.indexOf('--cidfile'); if (!state.noCidfile) fs.writeFileSync(args[index + 1], state.cidContent ?? state.id, { flag: 'wx' }); return state.runExit ? { code: state.runExit } : { stdout: `${state.stdoutId ?? state.id}\n` }; } },
         { match: (bin, args) => args[0] === 'container' && args[1] === 'inspect' && args.includes('{{json .Id}}\n{{json .Image}}\n{{json .Config.Labels}}\n{{json .HostConfig.PortBindings}}\n{{json .HostConfig.NetworkMode}}'),
             reply: () => ({ stdout: [JSON.stringify(state.id), JSON.stringify(`sha256:${state.image}`), JSON.stringify(state.labels ?? { [OWNER_LABEL]: manifest.runId, [ROLE_LABEL]: 'update-cache-git-fixture' }),
                 JSON.stringify({ [`${manifest.fixtureEndpoint.internalPort}/tcp`]: [{ HostIp: state.hostIp, HostPort: state.port }] }), '"bridge"'].join('\n') + '\n' }) },
@@ -87,6 +87,27 @@ test('the server is a rootless read-only init container on the exact approved pu
         const bad = build(mutate); await bad.fixture.prepare(); await assert.rejects(bad.fixture.startServer(), error => error.code === 'fixture-server-contract', label);
         assert.equal(bad.fixture.state().container, H('server'), `${label}: the created ID stays recorded for owned cleanup`);
     }
+});
+
+test('the exact container ID is recovered from the private cidfile even when the launch command fails or its output disagrees', async () => {
+    const ok = build(); await ok.fixture.prepare(); await ok.fixture.startServer();
+    const [run] = argsOf(ok, (bin, args) => args[0] === 'run'); assert.equal(run.args[run.args.indexOf('--cidfile') + 1], path.join(ok.evidence, 'fixture', 'server.cid')); assert.equal(fs.readFileSync(path.join(ok.evidence, 'fixture', 'server.cid'), 'utf8'), H('server'));
+    const failed = build((m, s) => { s.runExit = 125; }); await failed.fixture.prepare();
+    await assert.rejects(failed.fixture.startServer(), error => error.code === 'command-exit-unexpected'); assert.equal(failed.fixture.state().container, H('server'), 'a container created before the command failed stays recorded for owned cleanup');
+    const disagree = build((m, s) => { s.stdoutId = H('other'); }); await disagree.fixture.prepare();
+    await assert.rejects(disagree.fixture.startServer(), error => error.code === 'fixture-server-id'); assert.equal(disagree.fixture.state().container, H('server'));
+    const noCid = build((m, s) => { s.noCidfile = true; }); await noCid.fixture.prepare();
+    await assert.rejects(noCid.fixture.startServer(), error => error.code === 'fixture-server-id'); assert.equal(noCid.fixture.state().container, H('server'), 'output without a cidfile is still recorded before refusing');
+    const garbage = build((m, s) => { s.cidContent = 'not-an-id'; }); await garbage.fixture.prepare(); await assert.rejects(garbage.fixture.startServer(), error => error.code === 'fixture-server-id');
+});
+
+test('the recovery snapshot names the exact owned identities and never the private marker content', async () => {
+    const h = build(); assert.throws(() => h.fixture.recoverySnapshot(), error => error.code === 'fixture-not-prepared'); await h.fixture.prepare(); await h.fixture.startServer();
+    const snapshot = h.fixture.recoverySnapshot(), root = path.join(h.evidence, 'fixture');
+    assert.equal(snapshot.runId, h.manifest.runId); assert.equal(snapshot.container.id, H('server')); assert.deepEqual(snapshot.container.labels, { [OWNER_LABEL]: h.manifest.runId, [ROLE_LABEL]: 'update-cache-git-fixture' });
+    assert.equal(snapshot.fixtureRoot.path, root); assert.equal(snapshot.fixtureRoot.ino, fs.lstatSync(root).ino); assert.equal(snapshot.marker.ino, fs.lstatSync(path.join(root, '.owner')).ino);
+    assert.deepEqual(snapshot.aliases, h.fixture.names.aliases); assert.equal(snapshot.repository.key, h.fixture.names.repoName); assert.equal(snapshot.repository.url, h.fixture.agentUrl);
+    assert.equal(JSON.stringify(snapshot).includes(fs.readFileSync(path.join(root, '.owner'), 'utf8')), false);
 });
 
 test('Box reachability asks the Box itself and accepts only the exact published commit', async () => {

@@ -31,7 +31,7 @@ function build(faults = {}, { files = {} } = {}) {
     if (faults.slowAdmit) { const original = ports.observer.admit; ports.observer.admit = async () => { time.t += PHASE_CAPS_MS.U0 + 1; return original(); }; }
     if (faults.silentLatch) { const original = ports.cache.cli; ports.cache.cli = async (...args) => { latch.stop('worker-error'); return original(...args); }; }
     if (faults.slowPhase) { const original = ports.fixture.prepare; ports.fixture.prepare = async () => { time.t += PHASE_CAPS_MS[faults.slowPhase] + 1; return original(); }; }
-    Object.assign(ports, { custody, browser: { ...ports.browser, async close() { closes.push('close'); return { closed: true }; }, openContexts: () => 0 }, fixture: { ...ports.fixture, state: () => ({ prepared: false, container: null }) },
+    Object.assign(ports, { custody, browser: { ...ports.browser, async close() { closes.push('close'); return { closed: true }; }, openContexts: () => 0 }, 
         release: { async load() { return release; }, observerFor: m => ({ admit: async () => ({ phase: 'U0', admitted: true, activeGeneration: 'g-1', runtimes: 1 }), observe: async () => observedFor(m) }) },
         gates: { async run(gate) { wallAtGate += 1000; const wall = clock.wall() + wallAtGate; time.t += faults.gateMs ?? 0; return { name: gate, runId: `r-${gate}`, discovered: 1, passed: faults.skipGate === gate ? 0 : 1, failed: 0, skipped: faults.skipGate === gate ? 1 : 0, retries: 0, ignoredErrors: 0, closed: true, startedAt: new Date(wall).toISOString(), finishedAt: new Date(wall + 500).toISOString() }; } }, close: async () => { closes.push('ports-close'); } });
     const inputs = { probeAgentImage: 'x', releaseManifest: '/r.json', expectedUpdates: h.ctx.inputs.expectedUpdates };
@@ -69,6 +69,17 @@ test('the first refusal stops the run: later phases are unrun, nothing is cleane
     assert.deepEqual(h.closes, ['ports-close']); assert.equal(receipt.resourceDisposition, 'OWNED_RESOURCES_RETAINED_FOR_REVIEW');
 });
 
+test('a failure persists a recovery record naming the owned identities before anything is closed', async () => {
+    const h = build({ updateKeepsObject: true }); const order = []; const record = h.ports.recovery.record; h.ports.recovery.record = (label, value) => { order.push(`record:${label}`); return record(label, value); };
+    const close = h.ports.close; h.ports.close = async () => { order.push('close'); return close(); };
+    const receipt = await h.run(); assert.equal(receipt.failedPhase, 'U4'); assert.match(receipt.recoveryRecord, /^recovery_\d+_failure_codex\.json$/);
+    assert.ok(order.indexOf('record:failure') >= 0 && order.indexOf('record:failure') < order.indexOf('close'), 'recorded before the ports are closed');
+    const failure = h.world.recovered.find(row => row.label === 'failure').value; assert.deepEqual(failure.passedPhases, ['U0', 'U1', 'U2', 'U3']); assert.equal(failure.failedPhase, 'U4'); assert.equal(failure.withinDeadline, true);
+    assert.equal(failure.fixture.container.id, H('server'), 'the exact owned container is named for manual recovery'); assert.deepEqual(failure.fixture.aliases.length, 2);
+    const failing = build({ updateKeepsObject: true }); failing.ports.recovery.record = () => { throw new Error('PRIVATE'); }; const survived = await failing.run();
+    assert.equal(survived.acceptance, 'FAIL'); assert.equal(survived.recoveryRecord, null); assert.doesNotMatch(JSON.stringify(survived), /PRIVATE/);
+});
+
 test('a phase that exceeds its own cap is a failed phase even when its work succeeded', async () => {
     const h = build({ slowPhase: 'U3' }); const receipt = await h.run(); assert.equal(receipt.acceptance, 'FAIL'); assert.equal(receipt.failedPhase, 'U3'); assert.equal(receipt.reason, 'phase-budget-expired');
 });
@@ -94,6 +105,14 @@ test('the run refuses before any adapter exists on an unqualified host, with an 
         const h = forge(patch); await assert.rejects(h.run(), error => error.code === 'functional-receipt-invalid', label); assert.equal(h.createdPorts(), 0, label);
     }
     const resealed = forge(file => { file.receipts[2].status = 'SKIP'; }); await assert.rejects(resealed.run(), error => error.code === 'functional-receipt-invalid');
+});
+
+test('a resume admits only the remaining U7c-U9 suffix of the grant window, not the whole schedule again', async () => {
+    const suffix = PHASE_CAPS_MS.U7c + PHASE_CAPS_MS.U8 + PHASE_CAPS_MS.U9;
+    const fits = build(); await fits.run(); fits.setRelease(); fits.manifest.grant.endsAtMs = fits.clock.wall() + suffix;
+    const passed = await fits.run(); assert.equal(passed.acceptance, 'PASS', `${passed.failedPhase}:${passed.reason}`); assert.ok(suffix < TOTAL_CAP_MS);
+    const short = build(); await short.run(); short.setRelease(); short.manifest.grant.endsAtMs = short.clock.wall() + suffix - 1;
+    await assert.rejects(short.run(), error => error.code === 'schedule-insufficient'); assert.equal(short.world.calls.some(call => call.startsWith('gate:')) || short.io.files.has(short.manifest.evidence.receipt), false);
 });
 
 test('an absent, shared or foreign evidence root refuses before any adapter exists', async () => {
