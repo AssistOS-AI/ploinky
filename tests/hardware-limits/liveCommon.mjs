@@ -244,12 +244,16 @@ export function engineIdentityFacts(info, connections = null) {
     return facts;
 }
 export const engineIdentityDigest = (info, connections = null) => jsonDigest(engineIdentityFacts(info, connections));
-// Observe the identity through one bounded command runner `run(kind, argv)`.
-export async function observeEngineIdentity(run) {
+// Observe the identity through one bounded command runner `run(kind, argv)`. `info` is the one fresh engine document the digest was
+// computed from, so a caller that needs the product's own engine identity binds it to the SAME observation.
+export async function observeEngineFacts(run) {
     const info = checkedJson(await run('engine-identity', [...ENGINE_INFO_ARGV]));
     // The facts check below fails closed when the locality is not reported.
     const connections = info?.host?.serviceIsRemote === true ? checkedJson(await run('engine-connection', [...ENGINE_CONNECTIONS_ARGV])) : null;
-    return engineIdentityDigest(info, connections);
+    return { info, connections, digest: engineIdentityDigest(info, connections) };
+}
+export async function observeEngineIdentity(run) {
+    return (await observeEngineFacts(run)).digest;
 }
 
 // Unix socket paths are bounded by the kernel's sun_path: 108 bytes on Linux,

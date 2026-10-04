@@ -1,5 +1,7 @@
-// C5 replacement custody is rooted in the original fixture receipt. A name or
-// path-hash label can reject a foreign container, but can never admit one.
+// C5 replacement custody. The original fixture Box receipt (`profile.box`) stays the immutable anchor; a gate-on to gate-off restart may replace
+// that Box, and a replacement (or a rollback generation) is admitted only through the PRODUCT's own durable records: the bound product operation,
+// its precreation attempt record, its digest-addressed configuration snapshot, the exact CID file the engine wrote and a fresh full-ID inspect.
+// A name, a label or a path hash can reject a foreign container; it can never admit one. Test-only; nothing here starts a process.
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -14,13 +16,19 @@ export const C5_INTENT_SCHEMA = 'ploinky.hwl-c5-invocation/v1';
 export const C5_DRIVER_SCHEMA = 'ploinky.hwl-c5-driver/v1';
 export const C5_BOX_SCHEMA = 'ploinky.hwl-c5-box/v1';
 export const C5_DRIVER_NAME = 'c5-transition-driver';
+export const C5_INTENT_KIND = 'c5-downgrade';
+export const C5_BOX_PROVENANCE = 'product-attempt-cid-full-id-inspect';
 const REF = /^sha256-[a-f0-9]{64}$/;
 const PRODUCT_ENGINE = /^[a-f0-9]{64}$/;
 const MAX_BYTES = 256 * 1024;
 const BINDING_KEYS = ['runId', 'caseId', 'invocationId', 'sourceDigest', 'engineIdentityDigest', 'workspaceReceiptDigest',
     'rootBoxId', 'expectedFrom', 'expectedTo', 'driverReceiptName', 'argvDigest', 'priorTransitionIds'];
-const problem = message => new Error(`C5 custody: ${message}`);
+const problem = message => Object.assign(new Error(`C5 custody: ${message}`), { c5Custody: true });
+const normalizeImage = value => String(value ?? '').replace(/^sha256:/, '');
+export const sameImage = (left, right) => normalizeImage(left) !== '' && normalizeImage(left) === normalizeImage(right);
 
+// The product's own engine identity (engine/discovery.mjs engineIdentity): sha256 over ['podman', host.id, store.graphRoot, store.runRoot,
+// version.APIVersion]. It is built differently from the harness's engine digest; both are computed from ONE fresh `info` document.
 export function productEngineDigest(info) {
     const values = [info?.host?.id ?? info?.Host?.ID, info?.store?.graphRoot ?? info?.Store?.GraphRoot,
         info?.store?.runRoot ?? info?.Store?.RunRoot, info?.version?.APIVersion ?? info?.Version?.APIVersion];
@@ -29,14 +37,14 @@ export function productEngineDigest(info) {
 }
 
 export function c5IntentOf(run) {
-    const intents = run.operations.filter(op => op.kind === 'c5-downgrade');
+    const intents = run.operations.filter(op => op?.kind === C5_INTENT_KIND);
     if (intents.length > 1) throw problem('more than one downgrade invocation');
     return intents[0] || null;
 }
 
 export function createC5Intent({ run, profile, driverReceiptName, argvDigest, priorTransitionIds, invocationId = crypto.randomBytes(16).toString('hex') }) {
     if (c5IntentOf(run)) throw problem('automatic downgrade retry is forbidden');
-    const intent = { schema: C5_INTENT_SCHEMA, id: invocationId, kind: 'c5-downgrade', state: 'intent',
+    const intent = { schema: C5_INTENT_SCHEMA, id: invocationId, kind: C5_INTENT_KIND, state: 'intent',
         runId: run.runId, caseId: 'LIVE-C5', invocationId, sourceDigest: profile.source.digest,
         engineIdentityDigest: profile.engine.identityDigest, workspaceReceiptDigest: jsonDigest(profile.workspace),
         rootBoxId: profile.box.id, expectedFrom: 'on', expectedTo: 'off', driverReceiptName, argvDigest, priorTransitionIds,
@@ -47,7 +55,7 @@ export function createC5Intent({ run, profile, driverReceiptName, argvDigest, pr
 
 export function validateC5Intent(intent, run, profile) {
     keys(intent, ['schema', 'id', 'kind', 'state', ...BINDING_KEYS, 'resourceIds'], 'C5 invocation');
-    if (intent.schema !== C5_INTENT_SCHEMA || intent.kind !== 'c5-downgrade' || !['intent', 'observed'].includes(intent.state)
+    if (intent.schema !== C5_INTENT_SCHEMA || intent.kind !== C5_INTENT_KIND || !['intent', 'observed'].includes(intent.state)
         || intent.id !== intent.invocationId || !RUN_ID.test(intent.invocationId) || intent.caseId !== 'LIVE-C5'
         || intent.runId !== run.runId || !profile.cases.includes('LIVE-C5') || intent.rootBoxId !== profile.box.id
         || intent.sourceDigest !== profile.source.digest || intent.engineIdentityDigest !== profile.engine.identityDigest
@@ -96,7 +104,7 @@ export function validateDriverReceipt(value, intent, profile) {
     return value;
 }
 
-function assertPrivateParents(target) {
+function assertRealDirectories(target) {
     if (!absolute(target)) throw problem('unsafe private receipt path');
     let directory = path.dirname(target);
     while (directory !== path.dirname(directory)) {
@@ -106,14 +114,16 @@ function assertPrivateParents(target) {
     }
 }
 
-export function readPrivateC5File(target, { json = true, missing = false, maxBytes = MAX_BYTES, sync = false } = {}) {
-    assertPrivateParents(target);
+// One bounded regular file, never followed, owned by this user. `fileMode: false` is for the engine's own CID file (the engine writes it with
+// its umask); its confinement is the product's private 0700 transition directory, which `productDirectory` proves separately.
+export function readPrivateC5File(target, { json = true, missing = false, maxBytes = MAX_BYTES, sync = false, fileMode = true } = {}) {
+    assertRealDirectories(target);
     let fd;
     try { fd = fs.openSync(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW); }
     catch (error) { if (missing && error.code === 'ENOENT') return null; throw error; }
     try {
         const stat = fs.fstatSync(fd);
-        if (!stat.isFile() || stat.nlink !== 1 || stat.size < 1 || stat.size > maxBytes || (stat.mode & 0o077) !== 0
+        if (!stat.isFile() || stat.nlink !== 1 || stat.size < 1 || stat.size > maxBytes || (fileMode && (stat.mode & 0o077) !== 0)
             || (typeof process.getuid === 'function' && stat.uid !== process.getuid())) throw problem('receipt is not one bounded private regular file');
         const bytes = fs.readFileSync(fd);
         if (sync) {
@@ -130,14 +140,25 @@ export function persistDriverReceipt(target, receipt, intent, profile) {
     return writePrivateJson(target, receipt);
 }
 
+export function readDriverReceipt(target, intent, profile) {
+    const value = readPrivateC5File(target, { missing: true });
+    return value === null ? null : validateDriverReceipt(value, intent, profile);
+}
+
+// The product's transition directory of this instance, proved a real private directory of this user before anything in it is read.
 export function productDirectory(profile) {
-    return path.join(profile.host.home, '.ploinky-box', 'hardware-limits', profile.box.instance, 'transitions');
+    const directory = path.join(profile.host.home, '.ploinky-box', 'hardware-limits', profile.box.instance, 'transitions');
+    assertRealDirectories(path.join(directory, 'probe'));
+    let stat;
+    try { stat = fs.lstatSync(directory); } catch (error) { if (error.code === 'ENOENT') return directory; throw error; }
+    if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0
+        || (typeof process.getuid === 'function' && stat.uid !== process.getuid())) throw problem('the product transition directory is not private');
+    return directory;
 }
 
 export function productTransitionIds(profile) {
     const directory = productDirectory(profile);
     try {
-        assertPrivateParents(path.join(directory, 'probe'));
         const names = fs.readdirSync(directory).filter(name => /^[a-f0-9]{32}\.json$/.test(name)).sort();
         if (names.length > 32) throw problem('too many product transitions');
         return names.map(name => name.slice(0, 32));
@@ -156,7 +177,7 @@ export function readC5Snapshot(profile, ref) {
     if (digestOf(value) !== ref) throw problem('configuration snapshot digest changed');
     if (value.identity?.workspaceRoot !== profile.workspace.path || value.identity?.instance !== profile.box.instance
         || value.identity?.pathHash !== profile.box.pathHash || value.repositoryRoot !== profile.source.root
-        || value.imageId !== profile.box.image || value.hostKind !== 'native-linux') throw problem('configuration belongs to another fixture');
+        || !sameImage(value.imageId, profile.box.image) || value.hostKind !== 'native-linux') throw problem('configuration belongs to another fixture');
     return value;
 }
 
@@ -175,10 +196,20 @@ export function validateBoundJournal(journal, intent, receipt, profile, engineId
     return journal;
 }
 
+// The inspect document of one exact container as the product's own normalizer reads it. The full ID must be the one asked for.
 export function exactContainerHandle(raw, id, engineIdentity) {
     if (!raw || (raw.Id ?? raw.ID) !== id || !ID.test(id)) throw problem('inspect did not return the exact full ID');
-    return { id, name: String(raw.Name ?? '').replace(/^\//, ''), labels: raw.Config?.Labels || {},
-        engine: 'podman', engineIdentity, runtime: normalizeContainerRuntime(raw) };
+    return { kind: 'container', engine: 'podman', engineIdentity, id, name: String(raw.Name ?? '').replace(/^\//, ''),
+        labels: raw.Config?.Labels || {}, runtime: normalizeContainerRuntime(raw), pathHash: raw.Config?.Labels?.[BOX_LABELS.pathHash] };
+}
+
+// The CID file of one create attempt: the engine's own record of the immutable ID it created. Null when absent.
+export function readAttemptCid(profile, attempt) {
+    const bytes = readPrivateC5File(path.join(productDirectory(profile), `${attempt.attemptId}.cid`), { json: false, maxBytes: 128, missing: true, fileMode: false });
+    if (!bytes) return null;
+    const id = bytes.toString('utf8').trim();
+    if (!ID.test(id)) throw problem('the CID receipt is not one full container ID');
+    return { id, bytes };
 }
 
 export function generationReceipt({ intent, driver, journal, attempt, profile, raw, engineIdentity }) {
@@ -188,22 +219,26 @@ export function generationReceipt({ intent, driver, journal, attempt, profile, r
     const configuration = readC5Snapshot(profile, ref);
     if (attempt.configurationRef !== ref || attempt.contractHash !== digestOf(configuration)
         || (attempt.stage === 'candidate' ? configuration.hardware !== null : !configuration.hardware)) throw problem('attempt configuration mismatch');
-    const bytes = readPrivateC5File(path.join(productDirectory(profile), `${attempt.attemptId}.cid`), { json: false, maxBytes: 128, sync: true });
-    const id = bytes.toString('utf8').trim();
-    if (!ID.test(id) || (attempt.observedId !== null && attempt.observedId !== id)) throw problem('missing or conflicting immutable CID');
-    const handle = exactContainerHandle(raw, id, engineIdentity);
+    const cid = readAttemptCid(profile, attempt);
+    if (!cid || (attempt.observedId !== null && attempt.observedId !== cid.id)) throw problem('missing or conflicting immutable CID');
+    const handle = exactContainerHandle(raw, cid.id, engineIdentity);
     if (handle.name !== profile.box.instance || handle.labels[BOX_LABELS.pathHash] !== profile.box.pathHash
         || handle.labels[BOX_LABELS.role] !== 'box') throw problem('replacement identity disagrees with its operation');
-    validateContainerConfiguration(handle, configuration);
-    if (!bounded(raw.Created, 128)) throw problem('replacement creation identity missing');
-    return { schema: C5_BOX_SCHEMA, id, created: raw.Created, image: handle.runtime.imageId,
+    try { validateContainerConfiguration(handle, configuration); }
+    catch (error) { throw problem(`replacement does not match its recorded configuration (${String(error?.message || error).slice(0, 160)})`); }
+    if (!bounded(raw.Created, 128) || !sameImage(handle.runtime.imageId, profile.box.image)) throw problem('replacement creation or image identity missing');
+    return { schema: C5_BOX_SCHEMA, id: cid.id, created: raw.Created, image: handle.runtime.imageId,
         contractDigest: jsonDigest({ labels: handle.labels, mounts: raw.Mounts }), instance: profile.box.instance, pathHash: profile.box.pathHash,
         predecessorId: profile.box.id, invocationId: intent.invocationId, productOperationId: journal.operationId,
-        attemptId: attempt.attemptId, stage: attempt.stage, configurationRef: ref, cidDigest: digest(bytes), provenance: 'product-attempt-cid-full-id-inspect' };
+        attemptId: attempt.attemptId, stage: attempt.stage, configurationRef: ref, cidDigest: digest(cid.bytes), provenance: C5_BOX_PROVENANCE };
+}
+
+export function linkedBoxesOf(run, profile) {
+    return run.ownedBoxes.filter(box => box.id !== profile.box.id);
 }
 
 export function validateC5BoxReceipts(run, profile) {
-    const extra = run.ownedBoxes.filter(box => box.id !== profile.box.id);
+    const extra = linkedBoxesOf(run, profile);
     const intent = c5IntentOf(run);
     if (!extra.length) return;
     if (!intent || extra.length > 2) throw problem('additional Box without one C5 invocation');
@@ -213,54 +248,70 @@ export function validateC5BoxReceipts(run, profile) {
         keys(box, ['schema', 'id', 'created', 'image', 'contractDigest', 'instance', 'pathHash', 'predecessorId', 'invocationId',
             'productOperationId', 'attemptId', 'stage', 'configurationRef', 'cidDigest', 'provenance'], 'linked C5 Box');
         if (box.schema !== C5_BOX_SCHEMA || !ID.test(box.id) || ids.has(box.id) || !bounded(box.created, 128)
-            || box.image !== profile.box.image || !HASH.test(box.contractDigest) || !HASH.test(box.cidDigest)
+            || !sameImage(box.image, profile.box.image) || !HASH.test(box.contractDigest) || !HASH.test(box.cidDigest)
             || box.instance !== profile.box.instance || box.pathHash !== profile.box.pathHash || box.predecessorId !== profile.box.id
             || box.invocationId !== intent.invocationId || !RUN_ID.test(box.productOperationId) || !RUN_ID.test(box.attemptId)
             || !['candidate', 'rollback'].includes(box.stage) || stages.has(box.stage) || !REF.test(box.configurationRef)
-            || box.provenance !== 'product-attempt-cid-full-id-inspect') throw problem('invalid linked immutable generation');
+            || box.provenance !== C5_BOX_PROVENANCE) throw problem('invalid linked immutable generation');
         ids.add(box.id); stages.add(box.stage);
     }
 }
 
-// Resolve every eligible ID before cleanup mutates anything. The caller must
-// separately prove the owned driver transport settled; saved PIDs are never used.
-export async function reconcileC5Custody({ run, profile, driver, engineIdentity, ids, inspect, persist = () => {} }) {
+// Every ID cleanup must prove absent: the original anchor and every linked generation.
+export function c5ChainIds(run, profile) {
+    return [profile.box.id, ...linkedBoxesOf(run, profile).map(box => box.id)];
+}
+
+// Resolve every eligible ID BEFORE cleanup mutates anything.
+//   run, profile   the manifest and its profile (the original receipt is `profile.box`)
+//   driver         the validated driver receipt, or null when none exists
+//   driverSettled  the owned transport's own proof that the driver's process group ended (the manifest operation is `observed`); saved PIDs are
+//                  never used and nothing is signalled
+//   engineIdentity the product's engine digest from the SAME fresh observation the harness digest was checked against
+//   ids            every container ID the engine lists now; unrelatedIds the pre-run inventory
+//   inspect(id)    the full `container inspect` document of one exact ID
+// Returns { ids: every chain ID, current: the receipt of the one live generation (or null), journal, unbound }.
+export async function reconcileC5Custody({ run, profile, driver, driverSettled, engineIdentity, ids, unrelatedIds = [], inspect, persist = () => {} }) {
     const intent = c5IntentOf(run);
-    if (!intent) return { ids: [profile.box.id], current: ids.includes(profile.box.id) ? profile.box : null, journal: null };
+    const original = profile.box;
+    const live = id => ids.includes(id);
+    if (!intent) return { ids: [original.id], current: live(original.id) ? original : null, journal: null, unbound: [] };
     validateC5Intent(intent, run, profile);
+    const driverStarted = run.operations.some(op => op?.kind === C5_DRIVER_NAME);
+    if (driverStarted && !driverSettled) throw problem('the driver is not proven settled by the owned transport; a late create is possible, preserving resources');
     const newIds = productTransitionIds(profile).filter(id => !intent.priorTransitionIds.includes(id));
-    if (!driver) {
-        if (newIds.length || run.operations.some(op => op.kind === C5_DRIVER_NAME)) throw problem('driver settlement or binding missing; preserving resources');
-        return { ids: [profile.box.id], current: ids.includes(profile.box.id) ? profile.box : null, journal: null };
+    const unexplained = known => ids.filter(id => !known.includes(id) && !unrelatedIds.includes(id));
+    if (!driver || driver.productOperationId === null) {
+        // No product operation was bound: no replacement is admitted. The original may be destroyed only when it is still the one live
+        // container this run knows, so nothing unattributed can be in flight.
+        if (newIds.length && !live(original.id)) throw problem('an unattributed product transition exists and the original Box is gone; preserving resources');
+        if (unexplained([original.id]).length) throw problem('a container this run does not own is live; preserving resources');
+        return { ids: [original.id], current: live(original.id) ? original : null, journal: null, unbound: newIds };
     }
     validateDriverReceipt(driver, intent, profile);
-    if (driver.phase !== 'settled') throw problem('driver is not proven settled; a late create is possible');
-    if (!driver.productOperationId) {
-        if (newIds.length) throw problem('unattributed product transition');
-        return { ids: [profile.box.id], current: ids.includes(profile.box.id) ? profile.box : null, journal: null };
-    }
     if (JSON.stringify(newIds) !== JSON.stringify([driver.productOperationId])) throw problem('unexpected product transitions');
     const journal = validateBoundJournal(readC5ProductJournal(profile, driver.productOperationId), intent, driver, profile, engineIdentity);
-    const chain = [profile.box.id];
+    readC5Snapshot(profile, journal.old.configurationRef);
+    readC5Snapshot(profile, journal.desired.configurationRef);
+    const chain = [original.id];
     for (const attempt of journal.attempts) {
-        const bytes = readPrivateC5File(path.join(productDirectory(profile), `${attempt.attemptId}.cid`), { json: false, maxBytes: 128, missing: true });
-        if (!bytes) {
-            // A create intent without a durable receipt cannot establish whether
-            // an engine-side create completed. Never discover its replacement.
-            throw problem('create attempt has no durable CID; preserving resources');
-        }
-        const id = bytes.toString('utf8').trim();
-        if (!ID.test(id) || (attempt.observedId !== null && attempt.observedId !== id) || chain.includes(id)) throw problem('conflicting attempt CID');
-        chain.push(id);
-        if (!ids.includes(id)) continue;
-        const observed = generationReceipt({ intent, driver, journal, attempt, profile, raw: await inspect(id), engineIdentity });
-        const recorded = run.ownedBoxes.find(box => box.id === id);
+        const cid = readAttemptCid(profile, attempt);
+        // A create intent without a durable CID: the engine may or may not have created. Nothing is adopted by name; the unexplained-container
+        // check below preserves everything if any container appeared.
+        if (!cid) continue;
+        if ((attempt.observedId !== null && attempt.observedId !== cid.id) || chain.includes(cid.id)) throw problem('conflicting attempt CID');
+        chain.push(cid.id);
+        if (!live(cid.id)) continue;
+        const observed = generationReceipt({ intent, driver, journal, attempt, profile, raw: await inspect(cid.id), engineIdentity });
+        const recorded = run.ownedBoxes.find(box => box.id === cid.id);
         if (recorded && jsonDigest(recorded) !== jsonDigest(observed)) throw problem('immutable generation receipt changed');
         if (!recorded) { run.ownedBoxes.push(observed); persist(); }
     }
-    const live = chain.filter(id => ids.includes(id));
-    if (live.length > 1) throw problem('multiple current generations');
+    if (unexplained(chain).length) throw problem('a container outside the bound product operation is live; preserving resources');
+    const liveChain = chain.filter(live);
+    if (liveChain.length > 1) throw problem('multiple current generations');
     if (journal.commitIntent && !chain.includes(journal.commitIntent.finalContainerId)) throw problem('commit selects an unreceipted generation');
     validateC5BoxReceipts(run, profile);
-    return { ids: chain, current: live.length ? (live[0] === profile.box.id ? profile.box : run.ownedBoxes.find(box => box.id === live[0])) : null, journal };
+    const current = liveChain.length ? (liveChain[0] === original.id ? original : run.ownedBoxes.find(box => box.id === liveChain[0])) : null;
+    return { ids: chain, current, journal, unbound: [] };
 }
