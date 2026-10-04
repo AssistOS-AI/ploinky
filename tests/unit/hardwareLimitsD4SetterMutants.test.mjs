@@ -24,6 +24,7 @@ const CALL = '            admitProposed({ agentRef, entry: validated.entry, agen
 const WIRING = ', admitProposed: ({ agentRef, agents }) => refuseUnenforceableProposal({ agentRef, agents, context, getInstalled, getRegistry, admit }) })';
 const LOOP = 'for (const record of [{}, ...records]) {\n        let admission;';
 const COMMIT_RETURN = '        return committedResult(result, { effective: validated });';
+const HIDDEN_ENVELOPE = { file: CONTROLS, pattern: 'D4S\\.an-unknown-envelope-does-not-hide-d4' };
 const MAIN = { file: CONTROLS, pattern: 'D4S\\.a-host-network-nested-podman-agent-is-refused' };
 
 export const D4_MUTANTS = Object.freeze({
@@ -51,6 +52,30 @@ export const D4_MUTANTS = Object.freeze({
         kill: { file: CONTROLS, pattern: 'D4S\\.a-record-that-cannot-be-admitted-is-skipped' }, patches: [
             { from: 'catch (_) { continue; }', to: 'catch (error) { throw error; }' },
         ] },
+    'route-stops-at-the-first-record-that-cannot-be-admitted': { name: 'route-stops-at-the-first-record-that-cannot-be-admitted', file: ROUTES,
+        kill: { file: CONTROLS, pattern: 'D4S\\.a-later-record-refused-by-d4-still-refuses' }, patches: [
+            { from: 'catch (_) { continue; }', to: 'catch (_) { return; }' },
+        ] },
+    'route-reads-the-registry-before-the-lock': { name: 'route-reads-the-registry-before-the-lock', file: ROUTES,
+        kill: { file: CONTROLS, pattern: 'D4S\\.the-facts-are-read-fresh-under-the-lock' }, patches: [
+            { from: 'context, getInstalled, getRegistry, admit }) })', to: 'context, getInstalled, getRegistry: () => registry, admit }) })' },
+        ] },
+    'route-never-raises-d4-behind-another-refusal': { name: 'route-never-raises-d4-behind-another-refusal', file: ROUTES, kill: HIDDEN_ENVELOPE, patches: [
+        { from: 'proposalRequest.length) {', to: 'proposalRequest.length && false) {' },
+    ] },
+    'route-lets-an-unknown-envelope-hide-d4': { name: 'route-lets-an-unknown-envelope-hide-d4', file: ROUTES, kill: HIDDEN_ENVELOPE, patches: [
+        { from: 'if (refusal && admission.runtimeKind', to: "if (refusal && refusal.reasonCode !== 'envelope_unknown' && admission.runtimeKind" },
+    ] },
+    'route-lets-a-declaration-conflict-hide-d4': { name: 'route-lets-a-declaration-conflict-hide-d4', file: ROUTES,
+        kill: { file: CONTROLS, pattern: 'D4S\\.a-declaration-conflict-does-not-hide-d4' }, patches: [
+            { from: 'if (refusal && admission.runtimeKind', to: "if (refusal && refusal.reasonCode !== 'declaration_conflict' && admission.runtimeKind" },
+        ] },
+    'route-raises-d4-without-nested-podman': { name: 'route-raises-d4-without-nested-podman', file: ROUTES, kill: HIDDEN_ENVELOPE, patches: [
+        { from: ' && capabilities?.nestedPodman === true', to: '' },
+    ] },
+    'route-raises-d4-without-host-network': { name: 'route-raises-d4-without-host-network', file: ROUTES, kill: HIDDEN_ENVELOPE, patches: [
+        { from: ' && capabilities?.hostNetwork === true', to: '' },
+    ] },
 });
 
 function runTest(tmp, { file, pattern }, mutation) {

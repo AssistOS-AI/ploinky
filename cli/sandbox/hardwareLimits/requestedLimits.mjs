@@ -29,6 +29,15 @@ const LAYERS = Object.freeze([
     ['settings', 'overridePolicy'],
 ]);
 
+// D4: the limited host-network + nestedPodman combination is not supported in
+// this release; an unlimited instance is unaffected. Shared by the runtime's
+// eligibility decision and the policy setter's write-time check.
+export const HOST_NETWORK_NESTED_PODMAN_REFUSAL = Object.freeze({
+    reasonCode: 'host_network_nested_podman',
+    reason: 'This release cannot enforce this hardware limit for host networking with nestedPodman.',
+    fix: 'Use managed networking, remove nestedPodman capability, or remove the requested limit at its source.',
+});
+
 export const DELEGATION_COMMANDS = Object.freeze([
     'sudo mkdir -p /etc/systemd/system/user@.service.d',
     "printf '[Service]\\nDelegate=cpu memory pids\\n' | sudo tee /etc/systemd/system/user@.service.d/delegate.conf",
@@ -322,13 +331,7 @@ export function evaluateHardwareEligibility(descriptor, context, { helper = fals
                 fix: 'On the host run PLOINKY_BOX_HARDWARE_LIMITS=on ploinky restart, or remove the declared limit.',
             };
         } else if (hostNetwork && nestedPodman) {
-            // D4: the limited host-network + nestedPodman combination is not
-            // supported in this release; an unlimited instance is unaffected.
-            refusal = {
-                reasonCode: 'host_network_nested_podman',
-                reason: 'This release cannot enforce this hardware limit for host networking with nestedPodman.',
-                fix: 'Use managed networking, remove nestedPodman capability, or remove the requested limit at its source.',
-            };
+            refusal = { ...HOST_NETWORK_NESTED_PODMAN_REFUSAL };
         } else if (!context.prepared || !context.backendReady) {
             refusal = unpreparedRefusal(context);
         } else {

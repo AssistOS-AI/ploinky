@@ -17,6 +17,8 @@ import { readRoutingConfig } from '../routingFile.js';
 import { findHardwareOutcome, validateHardwareOutcome, HardwareLimitsError } from '../../sandbox/hardwareLimits/errors.mjs';
 import { readAppliedObservation } from '../../sandbox/hardwareLimits/runtimeState.mjs';
 import { deprecatedDeclarationNote } from '../../sandbox/hardwareLimits/declaredLimits.mjs';
+import { HOST_NETWORK_NESTED_PODMAN_REFUSAL, buildDirectRefusal } from '../../sandbox/hardwareLimits/requestedLimits.mjs';
+import { storedRequestedLimits } from '../../sandbox/hardwareLimits/resolve.mjs';
 import { runHardwareLimitsApplyWorker, hardwareApplyFlight } from '../hardwareLimitsApplyWorker.mjs';
 import { workspaceMetricsMonitor } from '../workspaceMetrics.js';
 import { resolveManifestRuntimeProfile } from '../../utils/runtime/profileService.js';
@@ -105,17 +107,29 @@ export function qualifyHardwareGpuTarget(agent, records, context, limits, { insp
 // own predicate (evaluateHardwareEligibility, through metadata admission) with
 // fresh manifest, profile and registry facts to the default record and to every
 // registry instance of the agent, and propagates only the D4 refusal: any other
-// reason keeps its existing write-time or launch-time handling.
+// reason keeps its existing write-time or launch-time handling. The runtime's
+// decision returns one reason, and D4 ranks after the conflict, store, stored
+// override (an unknown envelope) and gate reasons; those would hide D4 here, so
+// the D4 outcome is also raised when another reason refused an admitted
+// host-network nestedPodman container for which the proposal carries a limit.
 export function refuseUnenforceableProposal({ agentRef, agents, context, getInstalled, getRegistry, admit }) {
     const agent = getInstalled().find((candidate) => candidate.ref === agentRef);
     if (!agent) return;
     const proposed = { ...context, overrides: agents };
+    const proposalRequest = storedRequestedLimits(agents.get(agentRef));
     const records = Object.entries(getRegistry()).filter(([, record]) => record?.type === 'agent' && `${record.repoName}/${record.agentName}` === agentRef).map(([key, record]) => ({ ...record, key }));
     for (const record of [{}, ...records]) {
         let admission;
         try { admission = admit(agent, record, proposed); } catch (_) { continue; }
         const refusal = hardwareRefusalOf(admission);
         if (refusal?.reasonCode === 'host_network_nested_podman') throw new HardwareLimitsError(refusal);
+        const capabilities = admission?.descriptor?.capabilities;
+        if (refusal && admission.runtimeKind === 'container' && capabilities?.hostNetwork === true && capabilities?.nestedPodman === true && proposalRequest.length) {
+            throw new HardwareLimitsError(buildDirectRefusal({
+                key: refusal.key, ref: refusal.ref, alias: refusal.alias, inputFingerprint: refusal.inputFingerprint,
+                refusalParts: { ...HOST_NETWORK_NESTED_PODMAN_REFUSAL, requested: refusal.requested.length ? refusal.requested : proposalRequest },
+            }));
+        }
     }
 }
 

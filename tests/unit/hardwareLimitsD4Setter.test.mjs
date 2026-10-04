@@ -22,7 +22,7 @@ const { hardwareStorePaths, initializeStore, readStoreSnapshot, setAgentLimits }
 const { acquireStoreLock } = await import('../../cli/sandbox/hardwareLimits/storeLock.mjs');
 const { buildWorkspaceIdentity } = await import('../../ploinky-box/identity.mjs');
 const { mintAdminCsrfToken, verifyAdminMutationRequest } = await import('../../cli/server/adminControlSecurity.js');
-const { admitManifestRuntimeCapabilities } = await import('../../cli/sandbox/runtimeCapabilities.js');
+const { admitManifestRuntimeCapabilities, hardwareRefusalOf } = await import('../../cli/sandbox/runtimeCapabilities.js');
 const { resolveManifestRuntimeProfile } = await import('../../cli/utils/runtime/profileService.js');
 
 const D4_CODE = 'PLOINKY_HARDWARE_LIMITS_UNENFORCEABLE';
@@ -67,7 +67,8 @@ function world(t, manifest, { records = {}, context = {} } = {}) {
         ensureAdmin: async (req) => req.user?.roles?.includes('admin') === true,
         verifyMutation: verifyAdminMutationRequest, getContext,
         getInstalled: () => [{ ref: 'demo/worker', manifestPath }],
-        getRegistry: () => registry, getRouting: () => ({ routes: {} }), getMetrics: () => null,
+        // A fresh copy per call: a reader that kept an earlier call's result does not see what the registry gained since.
+        getRegistry: () => structuredClone(registry), getRouting: () => ({ routes: {} }), getMetrics: () => null,
         refreshMetrics: async () => ({ fresh: true }),
         admit: (agent, record, admissionContext) => { admitted.push(record?.key || 'default'); return realAdmit(agent, record, admissionContext); },
     };
@@ -270,6 +271,82 @@ test('D4S.a-record-that-cannot-be-admitted-is-skipped-and-never-turns-into-a-ref
     const result = await post(w, setBody(w), { admit: () => { throw new Error('manifest unreadable'); } });
     assert.equal(result.status, 200);
     assert.deepEqual(storedOf(w).get('demo/worker'), { cpus: 1 });
+});
+
+test('D4S.a-later-record-refused-by-d4-still-refuses-the-set-and-names-it-after-an-earlier-record-failed-admission', async (t) => {
+    const manifest = { ...BASE, ...NESTED, profiles: { default: {}, hostnet: { network: { mode: 'host' } } } };
+    const w = world(t, manifest, { records: { one: {}, edge: { profile: 'hostnet' } } });
+    const before = snapshotOf(w);
+    const failed = [];
+    const result = await post(w, setBody(w), {
+        admit: (agent, record, admissionContext) => {
+            if (record?.key === 'one') { failed.push('one'); throw new Error('manifest unreadable'); }
+            return realAdmit(agent, record, admissionContext);
+        },
+    });
+    assert.deepEqual(failed, ['one'], 'the earlier record was admitted, and failed, before the later one');
+    assert.equal(result.status, 422);
+    assert.equal(result.body.error, D4_CODE);
+    assert.equal(result.body.hardwareOutcome.reasonCode, 'host_network_nested_podman');
+    assert.equal(result.body.hardwareOutcome.key, 'edge');
+    assertNothingCommitted(w, before);
+});
+
+// The runtime's decision returns one reason, and an earlier-ranked one hides D4 there. Each control proves, from the admission itself (the first one the
+// setter makes under the lock), that the other reason really is the one the runtime would return, and then that the set is still refused as D4 with the policy, the token and the audit untouched.
+function hiddenBy() {
+    const reasons = [];
+    return { reasons, admit: (agent, record, admissionContext) => { const admission = realAdmit(agent, record, admissionContext); reasons.push(hardwareRefusalOf(admission)?.reasonCode ?? null); return admission; } };
+}
+
+test('D4S.an-unknown-envelope-does-not-hide-d4-and-only-d4-is-raised', async (t) => {
+    const w = world(t, { ...BASE, ...NESTED, ...HOST }, { context: { envelope: null } });
+    const before = snapshotOf(w);
+    const probe = hiddenBy();
+    const result = await post(w, setBody(w), { admit: probe.admit });
+    assert.equal(probe.reasons[0], 'envelope_unknown', 'the runtime reports the unknown envelope, not D4, for this agent');
+    assert.equal(result.status, 422);
+    assert.equal(result.body.error, D4_CODE);
+    assert.equal(result.body.hardwareOutcome.state, 'refused');
+    assert.equal(result.body.hardwareOutcome.reasonCode, 'host_network_nested_podman');
+    assert.equal(result.body.hardwareOutcome.ref, 'demo/worker');
+    assert.deepEqual(result.body.hardwareOutcome.requested, [{ field: 'cpus', value: '1', source: 'settings' }]);
+    assert.match(result.body.message, /host networking with nestedPodman/);
+    assert.match(result.body.fix, /managed networking, remove nestedPodman/);
+    assert.equal(Object.hasOwn(result.body, 'token'), false);
+    assertNothingCommitted(w, before);
+    assert.match(auditEvents(w)[0].reason, /host networking with nestedPodman/);
+    // Only D4 is raised: the same unknown envelope does not refuse an agent that is not host-network + nestedPodman.
+    for (const manifest of [{ ...BASE, ...NESTED }, { ...BASE, ...HOST }, BASE]) {
+        const other = world(t, manifest, { context: { envelope: null } });
+        const seen = hiddenBy();
+        const accepted = await post(other, setBody(other), { admit: seen.admit });
+        assert.equal(seen.reasons[0], 'envelope_unknown', 'the other agent is refused by the same reason in the runtime and is still accepted by the setter');
+        assert.equal(accepted.status, 200, JSON.stringify(accepted.body));
+        assert.deepEqual(storedOf(other).get('demo/worker'), { cpus: 1 });
+    }
+});
+
+test('D4S.a-declaration-conflict-does-not-hide-d4-and-only-d4-is-raised', async (t) => {
+    const conflict = { hardwareLimits: { pidsLimit: 64 }, llmRuntime: { runtimePolicy: { resources: { pidsLimit: 32 } } } };
+    const w = world(t, { ...BASE, ...NESTED, ...HOST, ...conflict });
+    const before = snapshotOf(w);
+    const probe = hiddenBy();
+    const result = await post(w, setBody(w), { admit: probe.admit });
+    assert.equal(probe.reasons[0], 'declaration_conflict', 'the runtime reports the conflict, not D4, for this agent');
+    assert.equal(result.status, 422);
+    assert.equal(result.body.error, D4_CODE);
+    assert.equal(result.body.hardwareOutcome.reasonCode, 'host_network_nested_podman');
+    assert.equal(result.body.hardwareOutcome.ref, 'demo/worker');
+    assert.ok(result.body.hardwareOutcome.requested.some((entry) => entry.field === 'cpus' && entry.value === '1' && entry.source === 'settings'));
+    assertNothingCommitted(w, before);
+    // Only D4 is raised: the same conflict does not refuse a managed agent.
+    const managed = world(t, { ...BASE, ...NESTED, ...conflict });
+    const seen = hiddenBy();
+    const accepted = await post(managed, setBody(managed), { admit: seen.admit });
+    assert.equal(seen.reasons[0], 'declaration_conflict');
+    assert.equal(accepted.status, 200, JSON.stringify(accepted.body));
+    assert.deepEqual(storedOf(managed).get('demo/worker'), { cpus: 1 });
 });
 
 test('D4S.the-store-runs-the-admission-under-its-lock-with-the-locked-snapshot-plus-the-proposed-entry-and-a-throw-commits-nothing', (t) => {
