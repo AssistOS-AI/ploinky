@@ -1616,5 +1616,7 @@ export function writePrivateJson(target, value) {
         if (error?.code !== 'ENOENT') throw error;
     }
     fs.renameSync(temporary, target);
+    const directoryFd = fs.openSync(directory, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+    try { fs.fsyncSync(directoryFd); } finally { fs.closeSync(directoryFd); }
     return target;
 }
