@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
-import { assertLiveAdmission } from './contracts_codex.mjs';
-import { need } from './manifest_codex.mjs';
+import { assertLiveBefore } from './contracts_codex.mjs';
+import { AcceptanceError, need } from './manifest_codex.mjs';
 
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 export function applicationMarker(manifest) {
@@ -14,7 +14,8 @@ export function applicationMarker(manifest) {
 // Use the ordinary Explorer controls. The runner owns the actual browser context and exact-ID storage observer.
 export async function createApplicationMarker({ manifest, live, expected, page, openExplorer, assertExplorerDirectory,
     readMarker, retainMarker, check, actionTimeoutMs }) {
-    assertLiveAdmission(live, expected);
+    // U1 creates a fixture only against the independently observed live deployment that U0 bound.
+    assertLiveBefore({ expected, observed: live });
     manifest = structuredClone(manifest);
     need([openExplorer, assertExplorerDirectory, readMarker, retainMarker, check].every(value => typeof value === 'function')
         && page?.locator && page?.waitForResponse && page?.waitForFunction
@@ -35,7 +36,8 @@ export async function createApplicationMarker({ manifest, live, expected, page, 
     // Retain the pending observer immediately, including when the browser operation fails.
     const observed = response.then(value => ({ value }), () => ({ failed: true }));
     check();
-    await page.locator('file-exp #fileUploadInput').setInputFiles({ name: marker.name, mimeType: 'text/plain', buffer: marker.bytes }, { timeout: actionTimeoutMs });
+    try { await page.locator('file-exp #fileUploadInput').setInputFiles({ name: marker.name, mimeType: 'text/plain', buffer: marker.bytes }, { timeout: actionTimeoutMs }); }
+    catch { await observed; throw new AcceptanceError('application-marker-browser'); }
     const upload = await observed; check();
     need(upload.value && upload.value.status() >= 200 && upload.value.status() < 300, 'application-marker-upload');
     await page.waitForFunction(({ path, markerText }) => {
