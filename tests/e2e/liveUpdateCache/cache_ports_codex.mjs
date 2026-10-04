@@ -3,6 +3,7 @@ import { runOwnedCommand, buildCommandEnvironment } from './host_command_codex.m
 import { boxExecArgs } from './engine_codex.mjs';
 import { createGcOutputProjection } from './output_projection_codex.mjs';
 import { STORE_PROBE_SCHEMA, STORE_PROBE_LIMITS, validateStoreProbeInput } from './store_probe_codex.mjs';
+import { PIN_PROBE_SCHEMA, PIN_PROBE_LIMITS } from './pin_probe_codex.mjs';
 
 // Host-side ports for the cache phases: the in-Box store probe, bounded reads inside one exact reader container,
 // exact-ID container logs, and the supported outer CLI (including the debug reinstall whose GC summary is projected).
@@ -15,6 +16,22 @@ const shortText = value => typeof value === 'string' && value.length > 0 && valu
 
 export function storeProbeBootstrap(input) {
     return Buffer.from(`const { storeProbeMain } = await import(${JSON.stringify(STORE_BOOTSTRAP_PATH)});\nprocess.exitCode = await storeProbeMain({ input: ${JSON.stringify(input)} });\n`);
+}
+
+export const PIN_BOOTSTRAP_PATH = '/opt/ploinky/tests/e2e/liveUpdateCache/pin_probe_codex.mjs';
+export const pinProbeBootstrap = () => Buffer.from(`const { pinProbeMain } = await import(${JSON.stringify(PIN_BOOTSTRAP_PATH)});\nprocess.exitCode = await pinProbeMain({ input: {} });\n`);
+
+export function parsePinProbeOutput(bytes) {
+    need(Buffer.isBuffer(bytes) && bytes.length > 0 && bytes.length <= LIMITS.controlBytes, 'pin-output');
+    let value; try { value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)); } catch { throw new AcceptanceError('pin-output'); }
+    need(value && value.schema === PIN_PROBE_SCHEMA && value.version === 1, 'pin-output');
+    if (Object.hasOwn(value, 'failure')) { need(typeof value.failure === 'string' && /^pin-probe-[a-z-]{1,40}$/.test(value.failure) && Object.keys(value).length === 3, 'pin-output'); throw new AcceptanceError(`live-${value.failure}`); }
+    need(Object.keys(value).sort().join() === ['gitPinRecordIds', 'registrations', 'repositories', 'schema', 'version'].sort().join(), 'pin-output');
+    const ids = /^[A-Za-z0-9][A-Za-z0-9_.:/@+-]{0,200}$/, names = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+    for (const [key, pattern, cap] of [['gitPinRecordIds', ids, PIN_PROBE_LIMITS.ids], ['registrations', ids, PIN_PROBE_LIMITS.ids], ['repositories', names, PIN_PROBE_LIMITS.repositories]]) {
+        need(Array.isArray(value[key]) && value[key].length <= cap && value[key].every(item => typeof item === 'string' && pattern.test(item)) && new Set(value[key]).size === value[key].length, 'pin-output');
+    }
+    return Object.freeze({ gitPinRecordIds: value.gitPinRecordIds, registrations: value.registrations, repositories: value.repositories });
 }
 
 export function parseStoreProbeOutput(bytes, input) {
@@ -53,6 +70,11 @@ export function createCachePorts({ manifest, deps, env = buildCommandEnvironment
             const result = await run('cache-store-probe', 'read', boxExec(['/usr/local/bin/node', '--input-type=module', '-'], { interactive: true }),
                 { input: storeProbeBootstrap(input), maxStdoutBytes: LIMITS.controlBytes, allowedExitCodes: [0, 1] });
             const parsed = parseStoreProbeOutput(result.stdout, input); need(result.code === 0, 'store-output'); return parsed;
+        },
+        // The record vocabulary the next update will emit for registrations, observed offline through the product's own pin refresh.
+        async observeAdmissibleIds() {
+            const result = await run('cache-pin-probe', 'read', boxExec(['/usr/local/bin/node', '--input-type=module', '-'], { interactive: true }), { input: pinProbeBootstrap(), maxStdoutBytes: LIMITS.controlBytes, allowedExitCodes: [0, 1] });
+            const parsed = parsePinProbeOutput(result.stdout); need(result.code === 0, 'pin-output'); return parsed;
         },
         // One bounded read inside the exact reader: the installed marker file's hash, never its content.
         async readerMarkerSha256(containerId, packageName, markerFile) {

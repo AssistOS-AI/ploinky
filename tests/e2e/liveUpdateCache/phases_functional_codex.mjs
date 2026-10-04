@@ -53,6 +53,15 @@ function assertInstalled(row, expected, code) {
 export function createFunctionalPhases(ctx) {
     const { manifest, inputs, ports, state } = ctx; const names = ports.fixture.names;
     const expectedUpdate = operation => { const expected = inputs.expectedUpdates[operation]; need(expected, 'expectations-missing'); return expected; };
+    // The update's record vocabulary is observed in the live deployment immediately before it runs: the Git-pin ids the
+    // product derives for every enabled registration (owned or not), their registration keys and the registered
+    // repositories. Those ids are admitted and the pin ids join the expected set; the operator's errors and blockers and every
+    // other id stay exactly as stated, so the update must still produce precisely the set expected.
+    const boundExpectation = async operation => {
+        const base = expectedUpdate(operation), observed = await ports.cache.observeAdmissibleIds();
+        const admitted = [...new Set([...observed.gitPinRecordIds, ...observed.registrations, ...observed.repositories])];
+        return { observed, admitted, expected: { ...base, recordIds: [...new Set([...base.recordIds, ...observed.gitPinRecordIds])] } };
+    };
     return {
         async U0() { const receipt = await ports.observer.admit(); const observed = await ports.observer.observe(); state.baseline = { generation: observed.activeGeneration, publicConfig: observed.publicConfig, boxId: observed.box.id };
             state.generation = observed.activeGeneration; return receipt; },
@@ -95,7 +104,10 @@ export function createFunctionalPhases(ctx) {
             need(A.row.containerName === ownedRegistration(manifest).containerName, 'owned-registration-derivation');
             const B = await ports.fixture.publishPackage('B', `B-${names.suffix}`);
             need(B.commit !== A.commit && B.markerSha256 !== A.markerSha256, 'fixture-replacement-invalid');
-            const proof = await ports.workerHost.update('normal-update', expectedUpdate('normal-update'));
+            const bound = await boundExpectation('normal-update'), owned = ownedRegistration(manifest);
+            // The owned pin as the product itself derives it from the enabled registration, observed before the update.
+            need(bound.observed.gitPinRecordIds.includes(owned.pinId) && bound.observed.registrations.includes(owned.containerName), 'owned-pin-not-observed');
+            const proof = await ports.workerHost.update('normal-update', bound.expected, bound.admitted);
             need(proof.fulfilled === true && proof.returnedCode === 0 && proof.result.activation.outcome === 'restarted', 'update-not-restarted');
             const observed = await observeAgain(ctx, { mustChange: true, previous }); state.generation = observed.activeGeneration;
             const row = await probeRow(ctx, targetFor(names, null), B.marker); assertInstalled(row, B, 'cache-b-unproven'); need(row.runtimeId !== A.row.runtimeId, 'runtime-not-restarted');
@@ -122,7 +134,8 @@ export function createFunctionalPhases(ctx) {
             await ports.negative.restore({ writersQuiescent: true });
             for (const target of [...names.aliases, `${names.repoName}/${names.agentName}`]) need((await ports.cache.cli('fixture-disable-agent', ['disable', 'agent', target])).code === 0, 'fixture-disable-failed');
             state.primaryEnabled = false;
-            const proof = await ports.workerHost.update('settling-update', expectedUpdate('settling-update'));
+            const bound = await boundExpectation('settling-update');
+            const proof = await ports.workerHost.update('settling-update', bound.expected, bound.admitted);
             need(proof.fulfilled === true && proof.returnedCode === 0 && proof.result.activation.outcome === 'restarted', 'settling-update-not-restarted');
             const observed = await observeAgain(ctx); state.generation = observed.activeGeneration;
             need(isDeepStrictEqual(observed.publicConfig, state.baseline.publicConfig), 'public-config-changed');

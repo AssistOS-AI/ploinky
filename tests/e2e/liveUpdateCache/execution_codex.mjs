@@ -12,11 +12,17 @@ const PHASES = new Set(['host-ploinky', 'workspace-ploinky', 'agentlib', 'regist
 const OUTCOMES = new Set(['changed', 'unchanged', 'skipped', 'deferred', 'failed', 'uncertain']);
 const tuple = record => ({ phase: record.phase, id: record.id, outcome: record.outcome, required: record.required, code: record.code });
 const sorted = rows => [...rows].sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
-export function validateExpectation(expected, manifest) {
+const ADMITTED_ID = /^[A-Za-z0-9][A-Za-z0-9_.:/@+-]{0,200}$/;
+// `admitted` is the vocabulary observed in the live deployment immediately before the update (git-pin ids, enabled
+// registration keys, registered repository names); `lenient` checks only the shape of an operator file read before that
+// observation exists. Neither relaxes exactness: the record set must still equal the update's records, with the
+// expected errors and blockers exactly as stated.
+export function validateExpectation(expected, manifest, { admitted = [], lenient = false } = {}) {
     exact(expected, ['errors', 'blockedBy', 'recordIds']);
+    need(Array.isArray(admitted) && admitted.length <= 4096 && admitted.every(id => typeof id === 'string' && ADMITTED_ID.test(id)), 'update-expectation');
     const ids = new Set(['ploinky', 'achillesAgentLib', 'workspace-graph', 'update', 'update-transaction', 'host-ploinky',
         manifest.candidate.root, manifest.workspace.path, ...manifest.candidate.repositories.flatMap(repo => [repo.name, repo.path]),
-        ...manifest.graph.map(entry => entry.name)]);
+        ...manifest.graph.map(entry => entry.name), ...admitted]);
     // The run's own repository record and the Git-pin record of its one dependency are expected in every real update.
     const owned = ownedRegistration(manifest); ids.add(owned.repoName); ids.add(owned.pinId);
     const scenario = manifest.negativeScopes.optional;
@@ -28,7 +34,7 @@ export function validateExpectation(expected, manifest) {
     const skillsPair = id => { const match = /^([A-Za-z0-9][A-Za-z0-9._-]*)->([A-Za-z0-9][A-Za-z0-9._-]*)$/.exec(id); return Boolean(match) && ids.has(match[1]) && ids.has(match[2]); };
     need(Array.isArray(expected.errors) && Array.isArray(expected.blockedBy) && Array.isArray(expected.recordIds)
         && expected.recordIds.length > 0 && expected.recordIds.length <= 1024 && new Set(expected.recordIds).size === expected.recordIds.length
-        && expected.recordIds.every(id => ((word(id) || absolute(id)) && ids.has(id)) || skillsPair(id)), 'update-expectation');
+        && expected.recordIds.every(id => ((word(id) || absolute(id)) && (ids.has(id) || (lenient && (ADMITTED_ID.test(id) || absolute(id))))) || skillsPair(id) || (lenient && /^[A-Za-z0-9][A-Za-z0-9._-]*->[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id))), 'update-expectation');
     for (const row of [...expected.errors, ...expected.blockedBy]) {
         exact(row, ['phase', 'id', 'outcome', 'required', 'code']);
         need(PHASES.has(row.phase) && expected.recordIds.includes(row.id) && OUTCOMES.has(row.outcome) && row.outcome !== 'uncertain'
@@ -66,9 +72,9 @@ export function createDiscardOutput(maxBytes = LIMITS.outputBytes) {
     return { output: { write }, errorOutput: { write }, snapshot: () => ({ bytes, failure }) };
 }
 
-export function projectNormalUpdate(observation, { manifest, operation, returnedCode, expected }) {
+export function projectNormalUpdate(observation, { manifest, operation, returnedCode, expected, admitted = [] }) {
     need(observation && !Object.hasOwn(observation, 'error') && observation.result, 'update-callback-error');
-    validateExpectation(expected, manifest);
+    validateExpectation(expected, manifest, { admitted });
     const result = observation.result;
     need(result.schema === 'ploinky-update-result' && result.version === 1 && Array.isArray(result.records)
         && result.records.length > 0 && result.records.length <= 1024 && isDeepStrictEqual(result.command, updateArguments(manifest, operation)), 'update-result-shape');
@@ -109,9 +115,9 @@ export function projectNormalUpdate(observation, { manifest, operation, returned
             activation: { outcome }, context: { workspaceEqual: true, requestEqual: true, scopeEqual: true, boxEqual: true, engineEqual: true, imageEqual: true } } };
 }
 
-export async function invokeOuterApi({ manifest, operation, expected }, { runOuterCli, output = createDiscardOutput(), latch = createStopLatch() }) {
-    validateManifest(manifest); validateExpectation(expected, manifest); updateArguments(manifest, operation); latch.assertMayLaunch();
-    manifest = structuredClone(manifest); expected = structuredClone(expected);
+export async function invokeOuterApi({ manifest, operation, expected, admitted = [] }, { runOuterCli, output = createDiscardOutput(), latch = createStopLatch() }) {
+    validateManifest(manifest); validateExpectation(expected, manifest, { admitted }); updateArguments(manifest, operation); latch.assertMayLaunch();
+    manifest = structuredClone(manifest); expected = structuredClone(expected); admitted = structuredClone(admitted);
     need(typeof runOuterCli === 'function', 'runtime-adapters-unqualified');
     let count = 0, observation;
     const onUpdateResult = value => { count++; if (count === 1) observation = value; else latch.stop('update-callback-duplicate'); };
@@ -120,7 +126,7 @@ export async function invokeOuterApi({ manifest, operation, expected }, { runOut
         const boundedStream = stream => ({ write(chunk) { const accepted = stream.write(chunk); if (output.snapshot().failure) latch.stop('output-overflow'); return accepted; } });
         const returnedCode = await runOuterCli(updateArguments(manifest, operation), { output: boundedStream(output.output), errorOutput: boundedStream(output.errorOutput), onUpdateResult });
         need(count === 1, count > 1 ? 'update-callback-duplicate' : 'update-callback-missing'); need(!output.snapshot().failure, 'output-overflow'); latch.assertMayLaunch();
-        return { ...projectNormalUpdate(observation, { manifest, operation, returnedCode, expected }), output: output.snapshot() };
+        return { ...projectNormalUpdate(observation, { manifest, operation, returnedCode, expected, admitted }), output: output.snapshot() };
     } catch (error) { const code = error instanceof AcceptanceError ? error.code : 'update-api-exception'; latch.stop(code); throw new AcceptanceError(code); }
     finally { observation = null; }
 }
@@ -147,8 +153,8 @@ function immutableSnapshot(value) {
     freeze(copy); return copy;
 }
 
-export async function superviseOwnedUpdate({ manifest, operation, workerPath, workerInputPath, expected }, adapters) {
-    validateManifest(manifest); updateArguments(manifest, operation); validateExpectation(expected, manifest);
+export async function superviseOwnedUpdate({ manifest, operation, workerPath, workerInputPath, expected, admitted = [] }, adapters) {
+    validateManifest(manifest); updateArguments(manifest, operation); validateExpectation(expected, manifest, { admitted });
     manifest = immutableSnapshot(manifest); expected = immutableSnapshot(expected);
     need(workerPath === path.join(manifest.candidate.root, 'tests/e2e/liveUpdateCache/execution_codex.mjs')
         && workerInputPath === path.join(manifest.evidence.root, `${operation}_input_codex.json`), 'worker-fixed-paths');

@@ -32,6 +32,8 @@ export function createWorld(faults = {}) {
         world.runtimes.set(alias ?? 'primary', { repoName: names.repoName, agentName: names.agentName, alias, runtimeId: id(`rt-${alias ?? 'primary'}`), instanceId: `inst-${world.counter++}`, enableGeneration: `en-${world.counter++}`,
             objectId, selectorId: H(`sel-${world.counter++}`), running: true, commit: commit.commit, markerSha256: commit.markerSha256, marker: commit.marker }); bump(); };
     world.recovered = [];
+    // A non-owned graph registration (e.g. a no-wait agent with a Git dependency) also gets a Git-pin record in every real update.
+    const nonOwnedPin = '9'.repeat(64), nonOwnedRegistration = 'ploinky_AssistOSExplorer_soplangAgent_testExplorerFresh_1f39122c';
     const ports = {
         recovery: { record(label, value) { world.calls.push(`recovery:${label}`); world.recovered.push({ label, value }); return `recovery_${world.recovered.length}_${label}_codex.json`; } },
         clock: { delay: async ms => { world.delays += 1; } },
@@ -43,11 +45,11 @@ export function createWorld(faults = {}) {
                     graph: manifest.graph.map(entry => ({ name: entry.name, graphGeneration: world.generation, running: true, runtimeId: 'rt', instanceId: 'inst', enableGeneration: 'en', ready: faults.graphNotReady !== true, externalHealth: true, noWaitState: null })),
                     publicConfig: faults.configChanges && world.generation !== 'gen-1' ? { staticAgent: 'other', staticPort: 8080 } : { ...world.publicConfig }, activation: { generation: world.generation, activationId: 'act' } }; } },
         browser: { async createMarker() { world.calls.push('browser-create'); return { phase: 'U1', uploaded: true, previewed: true, storageProved: true }; }, async verifyMarker() { world.calls.push('browser-verify'); return { phase: 'U7', storageProved: true, previewed: true }; } },
-        workerHost: { async update(operation, expected) { world.calls.push(`update:${operation}`);
+        workerHost: { async update(operation, expected, admitted = []) { world.calls.push(`update:${operation}`);
             // A real update emits the owned repository record and, with its registration enabled, the Git-pin record; the
             // expectation must name exactly those ids (and none else), or the update would be refused as incomplete.
-            validateExpectation(expected, manifest); const owned = ownedRegistration(manifest);
-            const produced = ['workspace-graph', owned.repoName, ...(world.runtimes.has('primary') ? [owned.pinId] : [])];
+            validateExpectation(expected, manifest, { admitted }); const owned = ownedRegistration(manifest);
+            const produced = ['workspace-graph', owned.repoName, nonOwnedPin, ...(world.runtimes.has('primary') ? [owned.pinId] : [])];
             if (JSON.stringify([...produced].sort()) !== JSON.stringify([...expected.recordIds].sort()) || expected.errors.length || expected.blockedBy.length) { const error = new Error('x'); error.code = 'update-records-incomplete'; throw error; }
             if (operation === 'normal-update') { const runtime = world.runtimes.get('primary'), B = world.commits.B; const old = runtime.objectId; if (!faults.updateKeepsObject) { runtime.objectId = addObject('pkg-B-updated'); runtime.selectorId = H(`sel-${world.counter++}`); }
                 if (!faults.noRestart) runtime.runtimeId = id('rt-primary-B'); runtime.commit = faults.wrongCommit ? H('wrong').slice(0, 40) : B.commit; runtime.markerSha256 = B.markerSha256; runtime.marker = B.marker; if (faults.mutatePredecessor) world.objects.get(old).treeMatches = false; if (faults.removePredecessor) world.objects.get(old).present = false; if (!faults.noGenerationChange) bump(); }
@@ -59,6 +61,8 @@ export function createWorld(faults = {}) {
                 return { targets: targets.map(target => { if (target.packageName === null) { const runtime = world.runtimes.get(`g${targets.indexOf(target)}`) ?? world.runtimes.get('g0'); return { label: target.label, containerName: 'ploinky_g', runtimeId: runtime.runtimeId, instanceId: runtime.instanceId, enableGeneration: runtime.enableGeneration, running: runtime.running, labelsEqual: true, objectId: faults.graphNoStore ? null : runtime.objectId, selectorId: faults.graphNoStore ? null : runtime.selectorId, payloadSha256: faults.graphNoStore ? null : world.objects.get(runtime.objectId).payloadSha256, storeMode: faults.graphNoStore ? 'none' : 'store' }; }
                     const runtime = target.alias ? runtimeFor(target.alias) : world.runtimes.get('primary'); if (!runtime) { const error = new Error('x'); error.code = 'live-store-probe-missing'; throw error; } return full(runtime); }),
                 objects: objects.map(objectId => ({ objectId, ...(world.objects.get(objectId) ?? { present: false, treeMatches: false, payloadSha256: null }) })) }; },
+            async observeAdmissibleIds() { const owned = ownedRegistration(manifest), primary = world.runtimes.has('primary');
+                return { gitPinRecordIds: [...(faults.pinNotObserved ? [] : [nonOwnedPin]), ...(primary && !faults.ownedPinNotObserved ? [owned.pinId] : [])].sort(), registrations: [nonOwnedRegistration, ...(primary ? [owned.containerName] : [])].sort(), repositories: ['AssistOSExplorer', owned.repoName] }; },
             async containerLogs(runtimeId) { const runtime = [...world.runtimes.values()].find(item => item.runtimeId === runtimeId); return runtime?.marker ? `UC_MARKER ${runtime.marker}\n` : ''; },
             async readerMarkerSha256(runtimeId) { world.readerReads = (world.readerReads ?? 0) + 1; if (faults.readerUnreadable || faults.readerUnreadableCall === world.readerReads) return null; return [...world.runtimes.values()].find(item => item.runtimeId === runtimeId)?.markerSha256 ?? null; },
             async cli(operation, args) { world.calls.push(`cli:${args.slice(0, 3).join(' ')}`);

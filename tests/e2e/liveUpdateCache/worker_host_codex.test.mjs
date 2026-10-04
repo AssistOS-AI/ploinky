@@ -59,7 +59,7 @@ test('update writes one exclusive input, supervises the exact worker child and r
     assert.deepEqual(launch.args, [worker(h.manifest), '--owned-update', path.join(h.manifest.evidence.root, 'normal-update_input_codex.json'), 'normal-update']);
     assert.deepEqual(launch.options.stdio, ['ignore', 'pipe', 'pipe', 'pipe']); assert.equal(Object.hasOwn(launch.options.env, 'NODE_OPTIONS'), false); assert.equal(launch.options.env.SECRET, undefined);
     const input = JSON.parse(h.fsIo.files.get(path.join(h.manifest.evidence.root, 'normal-update_input_codex.json')));
-    assert.deepEqual(Object.keys(input), ['schemaVersion', 'kind', 'runId', 'operation', 'manifest', 'expected']); assert.deepEqual(input.expected, expected);
+    assert.deepEqual(Object.keys(input), ['schemaVersion', 'kind', 'runId', 'operation', 'manifest', 'expected', 'admitted']); assert.deepEqual(input.expected, expected);
     assert.equal(h.fake.latch.snapshot().uncertain, true); await assert.rejects(h.host.update('normal-update', expected));
     assert.equal(h.fake.log.length, 1, 'no second launch after the first operation latched the run');
     await assert.rejects(build().host.update('unknown-op', expected), error => error.code === 'update-operation');
@@ -67,6 +67,14 @@ test('update writes one exclusive input, supervises the exact worker child and r
     const again = build(); again.fsIo.files.set(path.join(again.manifest.evidence.root, 'normal-update_input_codex.json'), Buffer.from('x'));
     await assert.rejects(again.host.update('normal-update', expected), error => error.code === 'worker-input-conflict' || error.code === 'worker-input-write');
     assert.equal(again.fake.log.length, 0);
+});
+
+test('the observed vocabulary is written into the worker input and a hidden id never launches the worker', async () => {
+    const { value } = manifestFixture(), { expected } = expectationFixture(value), pin = 'e'.repeat(64), withPin = { ...expected, recordIds: [...expected.recordIds, pin] };
+    const h = build([{ match: byArgs('--owned-update'), reply: () => ({ control: JSON.stringify({ type: 'WORKER_FAILURE', runId: value.runId, operation: 'normal-update', reason: 'x' }), code: 2 }) }]);
+    await assert.rejects(h.host.update('normal-update', withPin, [pin]));
+    const input = JSON.parse(h.fsIo.files.get(path.join(h.manifest.evidence.root, 'normal-update_input_codex.json'))); assert.deepEqual(input.admitted, [pin]); assert.ok(input.expected.recordIds.includes(pin));
+    const hidden = build(); await assert.rejects(hidden.host.update('normal-update', withPin), error => error.code === 'update-expectation'); assert.equal(hidden.fake.log.length, 0); assert.equal(hidden.fsIo.files.size, 0);
 });
 
 test('input files are created exclusively and an existing file must be byte-identical and private', () => {

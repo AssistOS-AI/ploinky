@@ -20,7 +20,7 @@ export function parseInputs(bytes, manifest) {
     const protectedRoots = [manifest.workspace.path, manifest.candidate.root, ...manifest.candidate.repositories.map(repo => repo.path)];
     need(protectedRoots.every(root => !value.releaseManifest.startsWith(`${root}/`) && value.releaseManifest !== root), 'acceptance-inputs');
     exact(value.expectedUpdates, [...INPUT_OPERATIONS], 'acceptance-inputs');
-    for (const operation of INPUT_OPERATIONS) validateExpectation(value.expectedUpdates[operation], manifest);
+    for (const operation of INPUT_OPERATIONS) validateExpectation(value.expectedUpdates[operation], manifest, { lenient: true });
     return Object.freeze({ probeAgentImage: value.probeAgentImage, releaseManifest: value.releaseManifest, expectedUpdates: Object.freeze({ ...value.expectedUpdates }) });
 }
 

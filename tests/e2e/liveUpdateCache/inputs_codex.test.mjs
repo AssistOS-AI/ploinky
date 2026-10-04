@@ -20,8 +20,13 @@ test('inputs bind one run, a digest-pinned probe image, an outside release manif
     for (const [label, change] of [['other run', v => { v.runId = 'other'; }], ['floating image tag', v => { v.probeAgentImage = 'docker.io/library/node:latest'; }], ['uppercase digest', v => { v.probeAgentImage = `x@sha256:${'A'.repeat(64)}`; }],
         ['relative release manifest', v => { v.releaseManifest = 'release.json'; }], ['release manifest inside the workspace', (v, m) => { v.releaseManifest = `${m.workspace.path}/release.json`; }],
         ['release manifest inside the candidate', (v, m) => { v.releaseManifest = `${m.candidate.root}/release.json`; }], ['extra field', v => { v.extra = 1; }], ['missing operation', v => { delete v.expectedUpdates['settling-update']; }],
-        ['extra operation', v => { v.expectedUpdates['optional-negative'] = v.expectedUpdates['normal-update']; }], ['unknown record id', v => { v.expectedUpdates['normal-update'] = { errors: [], blockedBy: [], recordIds: ['not-a-known-id'] }; }],
+        ['extra operation', v => { v.expectedUpdates['optional-negative'] = v.expectedUpdates['normal-update']; }], ['malformed record id', v => { v.expectedUpdates['normal-update'] = { errors: [], blockedBy: [], recordIds: ['bad id with spaces'] }; }], ['control character in a record id', v => { v.expectedUpdates['normal-update'] = { errors: [], blockedBy: [], recordIds: ['PRIVATE\nid'] }; }],
         ['schema version', v => { v.schemaVersion = 2; }]]) assert.throws(mutate(change), error => /acceptance-inputs|update-expectation|manifest-schema/.test(error.code), label);
+});
+
+test('the operator file is shape-checked only; the observed vocabulary decides at update time', () => {
+    const h = good(); h.value.expectedUpdates['normal-update'] = { errors: [], blockedBy: [], recordIds: ['workspace-graph', 'SomeDeployedRepo', 'a'.repeat(64)] };
+    assert.doesNotThrow(() => parseInputs(h.bytes(), h.manifest), 'ids not known before the live observation are not refused at load');
 });
 
 test('a missing, oversized, group-writable or foreign file refuses before any mutation', () => {

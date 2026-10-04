@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { manifestFixture, installPureGuards, H } from './test_support_codex.mjs';
 import { createFakeHost, byArgs } from './fake_host_support_codex.mjs';
-import { createCachePorts, parseStoreProbeOutput, storeProbeBootstrap, STORE_BOOTSTRAP_PATH } from './cache_ports_codex.mjs';
+import { createCachePorts, parseStoreProbeOutput, storeProbeBootstrap, STORE_BOOTSTRAP_PATH, parsePinProbeOutput, pinProbeBootstrap, PIN_BOOTSTRAP_PATH } from './cache_ports_codex.mjs';
+import { PIN_PROBE_SCHEMA } from './pin_probe_codex.mjs';
 import { STORE_PROBE_SCHEMA } from './store_probe_codex.mjs';
 installPureGuards();
 
@@ -75,4 +76,17 @@ test('debug reinstall projects only the known GC summary and refuses skipped, du
         const bad = build([{ match: byArgs('reinstall'), reply: () => reply }]); await assert.rejects(bad.ports.reinstallWithGcSummary('uc-a'), error => error.code === code, JSON.stringify(reply).slice(0, 40));
     }
     await assert.rejects(ok.ports.reinstallWithGcSummary('bad alias'), error => error.code === 'cli-arguments');
+});
+
+const pinDocument = (extra = {}) => ({ schema: PIN_PROBE_SCHEMA, version: 1, gitPinRecordIds: ['a'.repeat(64), 'ploinky_X_x'], registrations: ['ploinky_X_x'], repositories: ['RepoX'], ...extra });
+test('the pin probe runs through the exact Box with a fixed bootstrap and its output is strict', async () => {
+    const h = build([{ match: byArgs('-'), reply: () => ({ stdout: JSON.stringify(pinDocument()) + '\n' }) }]);
+    assert.deepEqual(await h.ports.observeAdmissibleIds(), { gitPinRecordIds: ['a'.repeat(64), 'ploinky_X_x'], registrations: ['ploinky_X_x'], repositories: ['RepoX'] });
+    const [launch] = h.fake.log; assert.deepEqual(launch.args.slice(0, 3), ['container', 'exec', '--interactive']); assert.ok(launch.args.includes(h.manifest.box.id)); assert.equal(launch.child.writes[0].toString(), pinProbeBootstrap().toString()); assert.ok(pinProbeBootstrap().toString().includes(PIN_BOOTSTRAP_PATH));
+    for (const bad of [pinDocument({ extra: 1 }), pinDocument({ gitPinRecordIds: ['bad id'] }), pinDocument({ gitPinRecordIds: ['a', 'a'] }), pinDocument({ repositories: ['../x'] }), pinDocument({ registrations: 'x' }), { ...pinDocument(), schema: 'other' },
+        pinDocument({ gitPinRecordIds: new Array(5000).fill(0).map((_, i) => `p${i}`) }), { schema: PIN_PROBE_SCHEMA, version: 1, failure: 'pin-probe-refresh', extra: 1 }]) assert.throws(() => parsePinProbeOutput(Buffer.from(JSON.stringify(bad))), error => error.code === 'pin-output', JSON.stringify(bad).slice(0, 40));
+    assert.throws(() => parsePinProbeOutput(Buffer.from(JSON.stringify({ schema: PIN_PROBE_SCHEMA, version: 1, failure: 'pin-probe-refresh' }))), error => error.code === 'live-pin-probe-refresh');
+    assert.throws(() => parsePinProbeOutput(Buffer.alloc(0)), error => error.code === 'pin-output'); assert.throws(() => parsePinProbeOutput(Buffer.from('\xff')), error => error.code === 'pin-output');
+    const exit1 = build([{ match: byArgs('-'), reply: () => ({ stdout: JSON.stringify(pinDocument()), code: 1 }) }]); await assert.rejects(exit1.ports.observeAdmissibleIds(), error => error.code === 'pin-output');
+    const refusal = build([{ match: byArgs('-'), reply: () => ({ stdout: JSON.stringify({ schema: PIN_PROBE_SCHEMA, version: 1, failure: 'pin-probe-registry' }), code: 1 }) }]); await assert.rejects(refusal.ports.observeAdmissibleIds(), error => error.code === 'live-pin-probe-registry');
 });

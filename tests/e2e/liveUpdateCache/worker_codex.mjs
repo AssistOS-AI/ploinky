@@ -41,10 +41,10 @@ export function hashRuntimeBinary(filename, io = fs) {
 }
 
 export function validateWorkerInput(value, kind, operation) {
-    exact(value, kind === '--owned-update' ? ['schemaVersion', 'kind', 'runId', 'operation', 'manifest', 'expected'] : ['schemaVersion', 'kind', 'runId', 'operation', 'manifest']);
+    exact(value, kind === '--owned-update' ? ['schemaVersion', 'kind', 'runId', 'operation', 'manifest', 'expected', 'admitted'] : ['schemaVersion', 'kind', 'runId', 'operation', 'manifest']);
     need(value.schemaVersion === 1 && value.kind === (kind === '--owned-update' ? 'update' : 'status') && value.operation === operation, 'worker-input');
     validateManifest(value.manifest); need(value.runId === value.manifest.runId, 'worker-input');
-    if (kind === '--owned-update') { need(OPERATIONS.includes(operation), 'worker-input'); validateExpectation(value.expected, value.manifest); } else need(operation === 'status', 'worker-input');
+    if (kind === '--owned-update') { need(OPERATIONS.includes(operation), 'worker-input'); validateExpectation(value.expected, value.manifest, { admitted: value.admitted }); } else need(operation === 'status', 'worker-input');
     return value;
 }
 
@@ -107,7 +107,7 @@ export async function workerMain(argv, { io = fs, now = () => Math.floor(perform
         const { runOuterCli } = await loadVerifiedOuterApi({ catalog, roots: [manifest.candidate.root], check, registerHooks, io, importer });
         if (kind === '--owned-update') {
             const latch = createStopLatch();
-            const proof = await invokeOuterApi({ manifest, operation, expected: input.expected }, { runOuterCli, output: createDiscardOutput(), latch });
+            const proof = await invokeOuterApi({ manifest, operation, expected: input.expected, admitted: input.admitted }, { runOuterCli, output: createDiscardOutput(), latch });
             check(); write({ type: 'UPDATE_RESULT', runId, operation, proof });
             return proof.returnedCode;
         }

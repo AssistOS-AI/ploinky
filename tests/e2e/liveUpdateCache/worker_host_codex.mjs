@@ -57,11 +57,11 @@ export function createWorkerHost({ manifest, deps, io = fs, spawn = childProcess
             need(result.code === 0 && isDeepStrictEqual(Object.keys(frame ?? {}), ['type', 'runId', 'proof']) && frame.type === 'STATUS_RESULT' && frame.runId === manifest.runId, 'worker-result-binding');
             return parseStatusProof(frame.proof);
         },
-        async update(operation, expected) {
-            need(OPERATIONS.includes(operation), 'update-operation'); validateExpectation(expected, manifest);
+        async update(operation, expected, admitted = []) {
+            need(OPERATIONS.includes(operation), 'update-operation'); validateExpectation(expected, manifest, { admitted });
             const file = inputPath(operation);
-            need(writeInputOnce(io, file, Buffer.from(JSON.stringify({ schemaVersion: 1, kind: 'update', runId: manifest.runId, operation, manifest, expected }))), 'worker-input-reused');
-            const result = await superviseOwnedUpdate({ manifest, operation, workerPath, workerInputPath: file, expected }, { launch: workerLaunch, register, current, now, delay, latch, custody });
+            need(writeInputOnce(io, file, Buffer.from(JSON.stringify({ schemaVersion: 1, kind: 'update', runId: manifest.runId, operation, manifest, expected, admitted }))), 'worker-input-reused');
+            const result = await superviseOwnedUpdate({ manifest, operation, workerPath, workerInputPath: file, expected, admitted }, { launch: workerLaunch, register, current, now, delay, latch, custody });
             if (result.passed === false || result.uncertain) { const error = new AcceptanceError(result.reason ?? 'worker-uncertain'); error.retained = result.retained; throw error; }
             return result;
         },

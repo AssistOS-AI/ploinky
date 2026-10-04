@@ -68,6 +68,19 @@ test('U4: an update whose expectation omits the owned repository or pin record, 
     await assert.rejects(h.phases.U4(), error => error.code === 'update-records-incomplete');
 });
 
+test('U4 and U7: a Git-pin record for a non-owned graph registration is admitted only when observed before the update, and the owned pin must be observed', async () => {
+    const h = await run({}, 'U4'); assert.ok(h.world.calls.indexOf('update:normal-update') >= 0);
+    // The unobserved non-owned pin is emitted by the update but was not seen beforehand: the update is refused, not absorbed.
+    await failsAt({ pinNotObserved: true }, 'U4', 'update-records-incomplete'); await failsAt({ ownedPinNotObserved: true }, 'U4', 'owned-pin-not-observed');
+    // An operator-listed id that was never observed is not admitted either.
+    const stray = createWorld(); for (const name of ['U0', 'U1', 'U2', 'U3']) await stray.phases[name]();
+    stray.ctx.inputs.expectedUpdates['normal-update'].recordIds.push('8'.repeat(64));
+    await assert.rejects(stray.phases.U4(), error => error.code === 'update-expectation');
+    // The settling update observes again after the owned registrations were disabled and still expects the non-owned pin exactly.
+    const full = await run({}, 'U7'); const settling = full.world.calls.filter(call => call.startsWith('update:')); assert.deepEqual(settling, ['update:normal-update', 'update:settling-update']);
+    await failsAt({ pinNotObserved: true }, 'U4', 'update-records-incomplete');
+});
+
 test('U5: skipped collection, a lost reader or object, an unreadable marker or identical-object violation never pass the retained-reader claim', async () => {
     await failsAt({ gcSkipped: true }, 'U5', 'ordinary-gc-not-proven'); await failsAt({ removeReaderObject: true }, 'U5', 'ordinary-gc-not-proven'); await failsAt({ noRetainedReason: true }, 'U5', 'ordinary-gc-not-proven');
     await failsAt({ readerDies: true }, 'U5', /reader-changed-during-gc|reader-not-live/);

@@ -27,8 +27,9 @@ function memoryIo(files) {
         closeSync: fd => { open.delete(fd); }, writeSync: (fd, bytes, offset, length) => { writes.push({ fd, text: Buffer.from(bytes.subarray(offset, offset + length)).toString() }); return length; } };
 }
 
-function scenario({ operation = 'normal-update', kind = '--owned-update', mutateManifest = () => {}, mutateCatalog = () => {}, runOuterCli } = {}) {
+function scenario({ operation = 'normal-update', kind = '--owned-update', mutateManifest = () => {}, mutateCatalog = () => {}, runOuterCli, extraPin = null, admit = true } = {}) {
     const { value: manifest } = manifestFixture(), { expected, records } = expectationFixture(manifest, operation);
+    if (extraPin) { expected.recordIds.push(extraPin); records.push({ phase: 'git-pin', id: extraPin, outcome: 'changed', required: true, code: 'git-pin-verified' }); }
     const apiBytes = Buffer.from('export const runOuterCli = () => {};\n'), supervisorBytes = Buffer.from('export const createBoxSupervisor = () => {};\n');
     manifest.candidate.apiSha256 = sha(apiBytes); mutateManifest(manifest);
     const apiURL = pathToFileURL(manifest.candidate.apiPath).href, supervisorURL = pathToFileURL(path.join(manifest.candidate.root, 'ploinky-box/supervisor.mjs')).href;
@@ -37,7 +38,7 @@ function scenario({ operation = 'normal-update', kind = '--owned-update', mutate
         edges: [apiURL, supervisorURL].map(url => ({ specifier: url, parentURL: entryParentURL, conditions: ['node', 'import'], attributes: {}, url, format: 'module' })), initialModules: [apiURL] };
     mutateCatalog(catalog);
     const inputName = kind === '--owned-update' ? `${operation}_input_codex.json` : 'status_input_codex.json', inputPath = path.join(manifest.evidence.root, inputName);
-    const input = { schemaVersion: 1, kind: kind === '--owned-update' ? 'update' : 'status', runId: manifest.runId, operation: kind === '--owned-update' ? operation : 'status', manifest, ...(kind === '--owned-update' ? { expected } : {}) };
+    const input = { schemaVersion: 1, kind: kind === '--owned-update' ? 'update' : 'status', runId: manifest.runId, operation: kind === '--owned-update' ? operation : 'status', manifest, ...(kind === '--owned-update' ? { expected, admitted: extraPin && admit ? [extraPin] : [] } : {}) };
     const files = new Map([[inputPath, Buffer.from(JSON.stringify(input))], [manifest.evidence.sourceManifest, Buffer.from(JSON.stringify(catalog))],
         [manifest.candidate.apiPath, apiBytes], [path.join(manifest.candidate.root, 'ploinky-box/supervisor.mjs'), supervisorBytes]]);
     const io = memoryIo(files), registered = [], frames = [];
@@ -66,6 +67,12 @@ test('update worker proves its runtime, registers hooks before the product impor
     const [frame] = s.frames; assert.deepEqual(Object.keys(frame), ['type', 'runId', 'operation', 'proof']); assert.equal(frame.type, 'UPDATE_RESULT');
     assert.equal(validatePublicWorkerProof(frame.proof, { operation: 'normal-update', returnedCode: 0, expected: s.expected }), frame.proof);
     assert.equal(frame.proof.callbackCount, 1); assert.equal(frame.proof.executionInterface, 'outer-cli-api'); assert.doesNotMatch(JSON.stringify(frame), /PRIVATE|nonce|token/);
+});
+
+test('an observed non-owned Git-pin id reaches the worker through its input and is admitted there, and only there', async () => {
+    const pin = 'd'.repeat(64), ok = scenario({ extraPin: pin }); assert.equal(await ok.run(), 0);
+    assert.ok(ok.frames[0].proof.result.records.some(row => row.id === pin && row.phase === 'git-pin'));
+    const missing = scenario({ extraPin: pin, admit: false }); assert.equal(await missing.run(), 2, 'an id the parent did not observe is refused before the product is imported'); assert.equal(missing.registered.length, 0);
 });
 
 test('expected negative update outcomes keep their exact exit code and activation', async () => {
