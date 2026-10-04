@@ -14,7 +14,7 @@ import { admitManifestRuntimeCapabilities, hardwareLimitsHashOf, hardwareRefusal
 import { readAgentRegistrySnapshot } from '../../utils/agentRegistrySnapshot.js';
 import { collectAgentsSummary } from '../../utils/status.js';
 import { readRoutingConfig } from '../routingFile.js';
-import { findHardwareOutcome, validateHardwareOutcome } from '../../sandbox/hardwareLimits/errors.mjs';
+import { findHardwareOutcome, validateHardwareOutcome, HardwareLimitsError } from '../../sandbox/hardwareLimits/errors.mjs';
 import { readAppliedObservation } from '../../sandbox/hardwareLimits/runtimeState.mjs';
 import { deprecatedDeclarationNote } from '../../sandbox/hardwareLimits/declaredLimits.mjs';
 import { runHardwareLimitsApplyWorker, hardwareApplyFlight } from '../hardwareLimitsApplyWorker.mjs';
@@ -98,6 +98,25 @@ export function qualifyHardwareGpuTarget(agent, records, context, limits, { insp
         qualified = qualify({ image, networkMode: profile.network?.mode || 'default', agentRef: agent.ref, gpuShare: limits.gpu, workspaceRoot: context.identity?.workspaceRoot, status: context.gpu }, { inspectImage: (target) => inspectImage(target, { runtime }) });
     }
     return qualified;
+}
+
+// D4 write-time admission, run by setAgentLimits under the store lock with the
+// locked snapshot's overrides plus the proposed entry. It applies the runtime's
+// own predicate (evaluateHardwareEligibility, through metadata admission) with
+// fresh manifest, profile and registry facts to the default record and to every
+// registry instance of the agent, and propagates only the D4 refusal: any other
+// reason keeps its existing write-time or launch-time handling.
+export function refuseUnenforceableProposal({ agentRef, agents, context, getInstalled, getRegistry, admit }) {
+    const agent = getInstalled().find((candidate) => candidate.ref === agentRef);
+    if (!agent) return;
+    const proposed = { ...context, overrides: agents };
+    const records = Object.entries(getRegistry()).filter(([, record]) => record?.type === 'agent' && `${record.repoName}/${record.agentName}` === agentRef).map(([key, record]) => ({ ...record, key }));
+    for (const record of [{}, ...records]) {
+        let admission;
+        try { admission = admit(agent, record, proposed); } catch (_) { continue; }
+        const refusal = hardwareRefusalOf(admission);
+        if (refusal?.reasonCode === 'host_network_nested_podman') throw new HardwareLimitsError(refusal);
+    }
 }
 
 export function buildHardwareLimitsState({ context, installed, registry, routing = {}, metrics = null, admit = defaultAdmission, readApplied = readAppliedObservation, readDeclarationNote = defaultDeclarationNote }) {
@@ -268,7 +287,7 @@ export async function handleHardwareLimitsRoutes(req, res, parsedUrl, {
                 ? qualifyGpu(installed.find((agent) => agent.ref === body.agentRef), Object.values(registry).filter((record) => record?.type === 'agent' && `${record.repoName}/${record.agentName}` === body.agentRef), context, body.limits) : context.gpu;
             const capabilities = { gate: context.gate, controllers: context.backendReady ? context.controllers : [], gpu };
             const result = body.action === 'set_agent_limits'
-                ? set({ paths: context.paths, identity: context.identity, expectedToken: body.expectedToken, agentRef: body.agentRef, limits: body.limits, installedRefs: new Set(installed.map((agent) => agent.ref)), capabilities, envelope: context.envelope, actor, beforeCommit: authorize })
+                ? set({ paths: context.paths, identity: context.identity, expectedToken: body.expectedToken, agentRef: body.agentRef, limits: body.limits, installedRefs: new Set(installed.map((agent) => agent.ref)), capabilities, envelope: context.envelope, actor, beforeCommit: authorize, admitProposed: ({ agentRef, agents }) => refuseUnenforceableProposal({ agentRef, agents, context, getInstalled, getRegistry, admit }) })
                 : clear({ paths: context.paths, identity: context.identity, expectedToken: body.expectedToken, agentRef: body.agentRef, actor, beforeCommit: authorize });
             send(200, { ...state(), token: result.token, committed: result.committed, affectedInstances: Object.entries(registry).filter(([, record]) => record?.type === 'agent' && `${record.repoName}/${record.agentName}` === body.agentRef).map(([key]) => key) });
         }

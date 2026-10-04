@@ -758,22 +758,25 @@ function prepareMutation({ paths, identity, expectedToken, fsApi, now }) {
 export function setAgentLimits({
     paths, identity, expectedToken, agentRef, limits, actor = null,
     installedRefs, capabilities, envelope, fsApi = fs, faults = {}, now = () => new Date(), lockOptions: lockOverrides,
-    beforeCommit = () => true,
+    beforeCommit = () => true, admitProposed = () => {},
 } = {}) {
     const lock = acquireStoreLock(lockOptions(paths, 'set_agent_limits', { lockOptions: lockOverrides }));
     try {
         const snapshot = prepareMutation({ paths, identity, expectedToken, fsApi, now });
         if (beforeCommit() !== true) fail('The authenticated authority changed while waiting for the policy lock.', { code: 'identity_changed' });
         let validated;
+        const agents = new Map(snapshot.agents);
         try {
             validated = validateAgentLimits({ agentRef, limits, installedRefs, capabilities, envelope });
+            agents.set(agentRef, validated.entry);
+            // D4: the caller's admission of the locked snapshot plus this proposed
+            // entry; a throw refuses (and audits) before anything commits.
+            admitProposed({ agentRef, entry: validated.entry, agents: new Map(agents) });
         } catch (error) {
             recordRefusedAttempt({ paths, fsApi, now, actor, action: 'set', ref: typeof agentRef === 'string' ? agentRef.slice(0, 257) : null, reason: error.message });
             throw error;
         }
-        const agents = new Map(snapshot.agents);
-        const before = agents.get(agentRef) || null;
-        agents.set(agentRef, validated.entry);
+        const before = snapshot.agents.get(agentRef) || null;
         const event = auditEvent({ action: 'set', ref: agentRef, before, after: validated.entry, actor, now, result: 'committed' });
         const result = commitPolicy({ paths, snapshot, agents, event, fsApi, faults, now });
         return committedResult(result, { effective: validated });
