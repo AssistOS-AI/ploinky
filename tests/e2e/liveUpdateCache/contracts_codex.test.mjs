@@ -67,7 +67,7 @@ function live() {
         publications: 'router-media-only', sourceMounts: 'read-only-source', engineIdentity: 'selected-engine', activeGeneration: 'generation-1' };
     const observed = { ...copies(expected), hostPlatform: 'linux', engine: 'podman', rootless: true,
         running: true, initialized: true, activeGeneration: 'generation-1', pendingActivation: false, recoveryBarrier: false,
-        graph: ['router', 'probe'].map(name => ({ name, ready: true, runtimeId: `${name}-runtime`,
+        graph: ['router', 'probe'].map(name => ({ name, ready: true, running: true, runtimeId: `${name}-runtime`,
             instanceId: `${name}-instance`, enableGeneration: 'enabled-1', graphGeneration: 'generation-1', externalHealth: true })) };
     return { expected, observed };
 }
@@ -241,7 +241,7 @@ test('no-wait requires the expected declaration and every runtime joins the sele
     const spoof = live(); spoof.observed.graph[0].ready = false; spoof.observed.graph[0].terminal = 'declared-no-wait';
     rejects(() => assertLiveBefore(spoof), 'graph-not-ready');
     const declared = live(); declared.expected.requiredGraph[1].noWait = true;
-    declared.observed.graph[1].ready = false; declared.observed.graph[1].terminal = 'declared-no-wait';
+    declared.observed.graph[1].noWaitState = 'running';
     assertLiveBefore(declared);
     const old = live(); old.observed.graph[1].graphGeneration = 'previous-generation';
     rejects(() => assertLiveBefore(old), 'graph-not-ready');
@@ -266,4 +266,18 @@ test('nested candidate accessors are rejected before comparing the Box image', (
     Object.defineProperty(proof.expected.candidate, 'imageId', { get() { reads += 1; throw new Error('PRIVATE_SENTINEL'); }, enumerable: true });
     rejects(() => assertLiveBefore(proof), 'candidate-invalid');
     assert.equal(reads, 0);
+});
+
+test('declared no-wait terminal failure or absent physical runtime never becomes readiness success', () => {
+    const proof = live(); proof.expected.requiredGraph[1].noWait = true;
+    proof.observed.graph[1].noWaitState = 'running';
+    assertLiveBefore(proof);
+    for (const state of ['failed', 'starting', 'unreadable', undefined]) {
+        const failed = copies(proof); failed.observed.graph[1].noWaitState = state;
+        rejects(() => assertLiveBefore(failed), 'graph-not-ready');
+    }
+    const stopped = copies(proof); stopped.observed.graph[1].running = false;
+    rejects(() => assertLiveBefore(stopped), 'graph-not-ready');
+    const missingTuple = copies(proof); delete missingTuple.observed.graph[1].runtimeId;
+    rejects(() => assertLiveBefore(missingTuple), 'graph-not-ready');
 });

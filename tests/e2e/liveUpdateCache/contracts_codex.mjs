@@ -149,10 +149,10 @@ export function assertLiveBefore({ expected, observed }) {
     }
     for (const policy of expected.requiredGraph) {
         const entry = observed.graph.find(item => item.name === policy.name);
-        need(entry && entry.graphGeneration === expected.activeGeneration
-            && (!policy.externalHealthRequired || entry.externalHealth === true) && (entry.ready === true
-            ? word(entry.runtimeId) && word(entry.instanceId) && word(entry.enableGeneration)
-            : policy.noWait && entry.terminal === 'declared-no-wait'), 'graph-not-ready');
+        need(entry && entry.graphGeneration === expected.activeGeneration && entry.running === true
+            && word(entry.runtimeId) && word(entry.instanceId) && word(entry.enableGeneration)
+            && (!policy.externalHealthRequired || entry.externalHealth === true) && entry.ready === true
+            && (!policy.noWait || entry.noWaitState === 'running'), 'graph-not-ready');
     }
     return true;
 }
