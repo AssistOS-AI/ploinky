@@ -343,11 +343,22 @@ export function buildRequiredCaseManifest() {
             'NW1.D1-entry-byte-and-text-bounds-refuse-without-a-partial-write',
             'NW1.D1-a-missing-witness-beside-a-valid-store-is-read-as-valid-and-restored-by-init',
         ]),
+        ...leaves(P, 'p0', unit('noWaitLateOutcomeActivation.test.mjs'), [
+            'NW1.D2-failed-status-writes-are-fsynced-and-the-run-scoped-rename-commits',
+            'NW1.D2-terminal-timestamps-are-validated',
+            'NW1.D2-a-failed-run-scoped-directory-fsync-leaves-the-status-visible-and-reports-it-not-durable',
+            'NW1.S-a-failed-canonical-write-does-not-suppress-the-run-scoped-terminal-write',
+            'NW1.D2-sigkill-before-the-run-scoped-commit-leaves-no-typed-denial',
+            'NW1.D2-sigkill-between-the-canonical-and-run-scoped-renames-is-not-a-terminal-commit',
+        ]),
         ...leaves(P, 'p0', unit('noWaitAvailabilitySlots.test.mjs'), [
             'NW1.S-frozen-v1-slot-schema-and-cross-field-rules-refuse-without-a-partial-write',
         ]),
         ...leaves(P, 'p0', unit('hardwareAvailabilityMutants.test.mjs'), [
             ...[
+                'm1a-the-temp-fsync-is-dropped-from-durable-failed-writes', 'm1b-the-directory-fsync-is-dropped-from-durable-failed-writes',
+                'm2-the-run-scoped-file-is-written-before-the-canonical-file', 'm18-a-finished-at-that-is-not-the-iso-of-its-milliseconds-is-accepted',
+                'ms15-a-canonical-failure-suppresses-the-run-scoped-write',
                 'm13-an-incomplete-store-is-read-as-absent', 'm14-the-reader-returns-empty-on-an-unreadable-store',
                 'm15-install-over-an-emptied-directory', 'm16-the-sweep-ignores-the-owner-pid',
                 'm17-a-post-rename-fsync-failure-rolls-back', 'm23-the-revision-includes-a-write-time',

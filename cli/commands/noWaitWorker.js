@@ -137,7 +137,30 @@ function statusPathFor(containerName, { runningDir = RUNNING_DIR } = {}) {
     return path.join(runningDir, 'no-wait', `${containerName}.json`);
 }
 
-function writeStatusFile(target, payload, { runningDir = RUNNING_DIR } = {}) {
+const NO_WAIT_STATUS_DIRECTORY_FSYNC_IGNORED_CODES = Object.freeze(['EINVAL', 'ENOTSUP', 'EISDIR', 'EBADF']);
+
+function fsyncStatusDirectory(directory, fsApi) {
+    let descriptor;
+    try {
+        descriptor = fsApi.openSync(directory, fsApi.constants.O_RDONLY);
+        fsApi.fsyncSync(descriptor);
+    } catch (error) {
+        // Directory fsync is not supported by every host filesystem. File fsync
+        // and atomic rename remain authoritative on those platforms.
+        if (!NO_WAIT_STATUS_DIRECTORY_FSYNC_IGNORED_CODES.includes(error?.code)) throw error;
+    } finally {
+        if (descriptor !== undefined) {
+            try { fsApi.closeSync(descriptor); } catch (_) {}
+        }
+    }
+}
+
+// A durable write (terminal `failed` documents) fsyncs the temp file before the
+// rename and the directory after it. The rename is the visibility point; the
+// directory fsync is the durability point. A directory fsync failure throws
+// NO_WAIT_STATUS_DURABILITY_UNCONFIRMED with `visible: true`: the status is
+// already visible and cannot be undone. Other writes keep their exact calls.
+function writeStatusFile(target, payload, { runningDir = RUNNING_DIR, durable = false, fsApi = fs } = {}) {
     const statusDirectory = ensureVerifiedProducerDirectory({
         trustedRoot: runningDir,
         relativeSegments: ['no-wait'],
@@ -154,13 +177,44 @@ function writeStatusFile(target, payload, { runningDir = RUNNING_DIR } = {}) {
     assertSafeRelativeSegment(path.basename(resolvedTarget), 'no-wait status filename');
     const temporary = `${resolvedTarget}.${process.pid}.${randomUUID()}.tmp`;
     try {
-        fs.writeFileSync(temporary, JSON.stringify(payload, null, 2), {
-            flag: 'wx',
-            mode: 0o600,
-        });
-        fs.renameSync(temporary, resolvedTarget);
+        if (durable) {
+            const descriptor = fsApi.openSync(
+                temporary,
+                fsApi.constants.O_WRONLY | fsApi.constants.O_CREAT | fsApi.constants.O_EXCL,
+                0o600,
+            );
+            try {
+                fsApi.writeFileSync(descriptor, JSON.stringify(payload, null, 2));
+                fsApi.fsyncSync(descriptor);
+            } finally {
+                fsApi.closeSync(descriptor);
+            }
+        } else {
+            fsApi.writeFileSync(temporary, JSON.stringify(payload, null, 2), {
+                flag: 'wx',
+                mode: 0o600,
+            });
+        }
+        fsApi.renameSync(temporary, resolvedTarget);
+        const visibleAtMs = Date.now();
+        if (!durable) return { visibleAtMs };
+        try {
+            fsyncStatusDirectory(path.dirname(resolvedTarget), fsApi);
+        } catch (cause) {
+            const failure = new Error(
+                `no-wait status '${path.basename(resolvedTarget)}' is visible but its directory fsync failed (${cause?.code || 'error'})`,
+            );
+            failure.code = 'NO_WAIT_STATUS_DURABILITY_UNCONFIRMED';
+            failure.fsCode = cause?.code || 'UNKNOWN';
+            failure.visible = true;
+            failure.durable = false;
+            failure.visibleAtMs = visibleAtMs;
+            failure.cause = cause;
+            throw failure;
+        }
+        return { visibleAtMs, durableAtMs: Date.now() };
     } finally {
-        try { fs.unlinkSync(temporary); } catch (error) {
+        try { fsApi.unlinkSync(temporary); } catch (error) {
             if (error?.code !== 'ENOENT') throw error;
         }
     }
@@ -177,6 +231,7 @@ export function writeNoWaitWorkerStatus(containerName, payload, {
     waveIndex,
     statusFile,
     runningDir = RUNNING_DIR,
+    fsApi = fs,
 } = {}) {
     const normalizedRunId = exactRunId(runId);
     if (runId !== normalizedRunId) {
@@ -210,9 +265,45 @@ export function writeNoWaitWorkerStatus(containerName, payload, {
     // view first so a completed wave barrier never exposes an older canonical
     // phase to monitors, then release the run-scoped coordination file last as
     // the final barrier handoff.
-    writeStatusFile(canonicalStatusFile, document, { runningDir });
-    writeStatusFile(coordinationStatusFile, document, { runningDir });
-    return document;
+    if (document.state !== 'failed') {
+        writeStatusFile(canonicalStatusFile, document, { runningDir, fsApi });
+        writeStatusFile(coordinationStatusFile, document, { runningDir, fsApi });
+        return document;
+    }
+
+    // A terminal `failed` document is durable. The run-scoped file is the
+    // authoritative artifact: a canonical write failure (temp, rename or
+    // directory fsync) is logged and never suppresses it, and only a failure of
+    // the run-scoped rename throws. A directory fsync failure after that rename
+    // leaves the status visible and is reported, not thrown.
+    try {
+        writeStatusFile(canonicalStatusFile, document, { runningDir, durable: true, fsApi });
+    } catch (error) {
+        console.error(sanitizeDiagnosticText(
+            `[no-wait] ${containerName}: the canonical failed status could not be written durably; `
+            + `the run-scoped terminal status is still written: ${sanitizeDiagnosticText(error)}`,
+            { singleLine: true },
+        ));
+    }
+    let written;
+    try {
+        written = writeStatusFile(coordinationStatusFile, document, { runningDir, durable: true, fsApi });
+    } catch (error) {
+        if (error?.visible !== true) throw error;
+        written = { visibleAtMs: error.visibleAtMs, durabilityError: error.fsCode };
+        console.error(sanitizeDiagnosticText(
+            `[no-wait] ${containerName}: the run-scoped terminal status is visible but not durable: ${sanitizeDiagnosticText(error)}`,
+            { singleLine: true },
+        ));
+    }
+    return {
+        finishedAtMs: document.finishedAtMs ?? null,
+        visibleAtMs: written.visibleAtMs,
+        ...(written.durableAtMs === undefined
+            ? { durabilityError: written.durabilityError }
+            : { durableAtMs: written.durableAtMs }),
+        statusFile: document.statusFile,
+    };
 }
 
 function sleep(ms) {
@@ -1643,7 +1734,7 @@ async function main() {
         const finishedAtMs = Date.now();
         const finishedAt = new Date(finishedAtMs).toISOString();
         try {
-            publishStatus({
+            const terminal = publishStatus({
                 containerName,
                 shortAgent,
                 repoName,
@@ -1663,6 +1754,7 @@ async function main() {
                 finishedAtMs,
                 error: noWaitFailureError(failure, { message: sanitizeDiagnosticText(failure) }),
             });
+            console.log(`[no-wait] ${shortAgent}: terminal status ${JSON.stringify(terminal)}`);
         } catch (publishFailure) {
             console.error(sanitizeDiagnosticText(
                 `[no-wait] ${shortAgent}: could not publish the pre-start failure status: ${sanitizeDiagnosticText(publishFailure)}`,
@@ -2042,13 +2134,14 @@ async function main() {
             ...(failure.readinessDetail ? { readinessDetail: failure.readinessDetail } : {}),
             ...(failure.runtimeLogTail ? { runtimeLogTail: failure.runtimeLogTail } : {}),
         }, { key: containerName, ref: `${repoName}/${shortAgent}`, alias: alias || null });
-        publishStatus({
+        const terminal = publishStatus({
             ...baseStatus,
             state: 'failed',
             finishedAt,
             finishedAtMs,
             error
         });
+        console.log(`[no-wait] ${shortAgent}: terminal status ${JSON.stringify(terminal)}`);
         if (failure.readinessDetail) {
             console.error(`[no-wait] ${shortAgent}: readiness output:\n${failure.readinessDetail}`);
         }

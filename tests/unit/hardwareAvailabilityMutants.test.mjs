@@ -22,11 +22,33 @@ const REGISTER = href('tests/hardware-limits/c5MutationRegister.mjs');
 const STORE = 'cli/sandbox/hardwareAvailabilityStore.mjs';
 const STORE_TEST = 'tests/unit/hardwareAvailabilityStore.test.mjs';
 const SLOTS_TEST = 'tests/unit/noWaitAvailabilitySlots.test.mjs';
+const WORKER = 'cli/commands/noWaitWorker.js';
+const PROTOCOL = 'cli/commands/noWaitProtocol.js';
+const WORKER_TEST = 'tests/unit/noWaitLateOutcomeActivation.test.mjs';
 const kill = (file, pattern) => ({ file, pattern });
 const MISSING_POLICY = "directory = { state: 'invalid', problem: 'policy.json is missing from an existing store directory' };";
 const WITNESS_CALL = '        writeWitness({ paths, fsApi, run, state, storeId, initializedBy, now });\n';
 
 export const AVAILABILITY_MUTANTS = Object.freeze({
+    'm1a-the-temp-fsync-is-dropped-from-durable-failed-writes': { name: 'm1a-the-temp-fsync-is-dropped-from-durable-failed-writes', file: WORKER,
+        kill: kill(WORKER_TEST, 'NW1\\.D2-failed-status-writes-are-fsynced'),
+        patches: [{ from: '                fsApi.fsyncSync(descriptor);\n            } finally {\n                fsApi.closeSync(descriptor);', to: '            } finally {\n                fsApi.closeSync(descriptor);' }] },
+    'm1b-the-directory-fsync-is-dropped-from-durable-failed-writes': { name: 'm1b-the-directory-fsync-is-dropped-from-durable-failed-writes', file: WORKER,
+        kill: kill(WORKER_TEST, 'NW1\\.D2-failed-status-writes-are-fsynced'),
+        patches: [{ from: '            fsyncStatusDirectory(path.dirname(resolvedTarget), fsApi);\n', to: '' }] },
+    'm2-the-run-scoped-file-is-written-before-the-canonical-file': { name: 'm2-the-run-scoped-file-is-written-before-the-canonical-file', file: WORKER,
+        kill: kill(WORKER_TEST, 'NW1\\.D2-sigkill-between-the-canonical'),
+        patches: [
+            { from: 'writeStatusFile(canonicalStatusFile, document, { runningDir, durable: true, fsApi });', to: 'writeStatusFile(coordinationStatusFile, document, { runningDir, durable: true, fsApi });' },
+            { from: 'written = writeStatusFile(coordinationStatusFile, document, { runningDir, durable: true, fsApi });', to: 'written = writeStatusFile(canonicalStatusFile, document, { runningDir, durable: true, fsApi });' },
+        ] },
+    'm18-a-finished-at-that-is-not-the-iso-of-its-milliseconds-is-accepted': { name: 'm18-a-finished-at-that-is-not-the-iso-of-its-milliseconds-is-accepted', file: PROTOCOL,
+        kill: kill(WORKER_TEST, 'NW1\\.D2-terminal-timestamps-are-validated'),
+        patches: [{ from: "if (typeof iso !== 'string' || expected === null || iso !== expected) {", to: 'if (false) {' }] },
+    'ms15-a-canonical-failure-suppresses-the-run-scoped-write': { name: 'ms15-a-canonical-failure-suppresses-the-run-scoped-write', file: WORKER,
+        kill: kill(WORKER_TEST, 'NW1\\.S-a-failed-canonical-write'),
+        patches: [{ from: '    } catch (error) {\n        console.error(sanitizeDiagnosticText(\n            `[no-wait] ${containerName}: the canonical failed status could not be written durably; `',
+            to: '    } catch (error) {\n        throw error;\n        console.error(sanitizeDiagnosticText(\n            `[no-wait] ${containerName}: the canonical failed status could not be written durably; `' }] },
     'm13-an-incomplete-store-is-read-as-absent': { name: 'm13-an-incomplete-store-is-read-as-absent', file: STORE,
         kill: kill(STORE_TEST, 'NW1\\.D1-missing-emptied-or-corrupt-store'),
         patches: [{ from: MISSING_POLICY, to: "directory = { state: 'absent' };" }] },

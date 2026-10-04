@@ -40,6 +40,64 @@ export function noWaitTerminalHardwareOutcome(status, validateOutcome) {
     return outcome;
 }
 
+export const NO_WAIT_TERMINAL_TIMESTAMP_INVALID = 'NO_WAIT_TERMINAL_TIMESTAMP_INVALID';
+const TERMINAL_MAX_FUTURE_SKEW_MS = 1000;
+
+function ownProperty(object, key) {
+    return Object.prototype.hasOwnProperty.call(object, key) ? object[key] : undefined;
+}
+
+/**
+ * Validate the timestamps of a terminal (`failed`) no-wait status and return
+ * `{ finishedAtMs }`. Never substitutes a time: invalid evidence is rejected,
+ * not re-stamped. Only own properties count.
+ *
+ *   T1 finishedAtMs, startedAtMs, sequencePhaseStartedAtMs, runStartedAtMs are safe integers > 0
+ *   T2 finishedAt, startedAt, sequencePhaseStartedAt equal toISOString() of their ms value
+ *   T3 runStartedAtMs <= startedAtMs <= sequencePhaseStartedAtMs <= finishedAtMs
+ *   T4 finishedAtMs <= nowMs + maxFutureSkewMs
+ */
+export function validateNoWaitTerminalTimestamps(status, {
+    nowMs = Date.now(),
+    maxFutureSkewMs = TERMINAL_MAX_FUTURE_SKEW_MS,
+} = {}) {
+    const invalid = (detail) => {
+        const error = new Error(`no-wait terminal status timestamps are invalid: ${detail}`);
+        error.code = NO_WAIT_TERMINAL_TIMESTAMP_INVALID;
+        return error;
+    };
+    if (!status || typeof status !== 'object' || Array.isArray(status)) throw invalid('status is not an object');
+    const ms = {};
+    for (const field of ['runStartedAtMs', 'startedAtMs', 'sequencePhaseStartedAtMs', 'finishedAtMs']) {
+        const value = ownProperty(status, field);
+        if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
+            throw invalid(`${field} must be a safe integer greater than zero`);
+        }
+        ms[field] = value;
+    }
+    for (const [isoField, msField] of [
+        ['finishedAt', 'finishedAtMs'],
+        ['startedAt', 'startedAtMs'],
+        ['sequencePhaseStartedAt', 'sequencePhaseStartedAtMs'],
+    ]) {
+        const iso = ownProperty(status, isoField);
+        let expected;
+        try { expected = new Date(ms[msField]).toISOString(); } catch (_) { expected = null; }
+        if (typeof iso !== 'string' || expected === null || iso !== expected) {
+            throw invalid(`${isoField} does not equal its ${msField}`);
+        }
+    }
+    if (!(ms.runStartedAtMs <= ms.startedAtMs
+        && ms.startedAtMs <= ms.sequencePhaseStartedAtMs
+        && ms.sequencePhaseStartedAtMs <= ms.finishedAtMs)) {
+        throw invalid('timestamps are not ordered runStartedAtMs <= startedAtMs <= sequencePhaseStartedAtMs <= finishedAtMs');
+    }
+    if (!Number.isFinite(nowMs) || ms.finishedAtMs > nowMs + maxFutureSkewMs) {
+        throw invalid('finishedAtMs is in the future');
+    }
+    return Object.freeze({ finishedAtMs: ms.finishedAtMs });
+}
+
 export function boundedNoWaitTimeoutInput(value, { fallback, minimum, maximum }) {
     const parsed = Number.parseInt(String(value ?? ''), 10);
     return Number.isSafeInteger(parsed)
