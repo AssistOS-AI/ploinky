@@ -1,3 +1,4 @@
+import nodeFs from 'node:fs';
 // Test-only in-memory filesystem with the small synchronous surface the probes and readers use.
 export function createMemoryFs(initial = {}) {
     const files = new Map(Object.entries(initial).map(([name, value]) => [name, Buffer.from(value)])), open = new Map(); let next = 100, inode = 10;
@@ -10,7 +11,13 @@ export function createMemoryFs(initial = {}) {
         throw missing();
     };
     return { files, overrideLinks, replaceInode: name => { inodes.set(name, inode++); }, lstatSync: stat, statSync: stat, unlinkSync: name => { if (!files.has(name)) throw missing(); files.delete(name); }, setFile: (name, value) => { files.set(name, Buffer.from(value)); },
-        openSync: name => { if (!files.has(name)) throw missing(); const fd = next++; open.set(fd, { name, offset: 0 }); return fd; },
+        openSync: (name, flags = 0) => {
+            // Write-create with O_EXCL refuses an existing file exactly as the real exclusive create does.
+            const { O_WRONLY, O_RDWR, O_CREAT, O_EXCL } = nodeFs.constants;
+            if ((flags & (O_WRONLY | O_RDWR)) !== 0 && (flags & O_CREAT) !== 0) { if (files.has(name) && (flags & O_EXCL) !== 0) throw Object.assign(new Error('EEXIST'), { code: 'EEXIST' }); if (!files.has(name)) files.set(name, Buffer.alloc(0)); }
+            else if (!files.has(name)) throw missing();
+            const fd = next++; open.set(fd, { name, offset: 0 }); return fd; },
+        writeSync: (fd, bytes, offset, length) => { const state = open.get(fd); files.set(state.name, Buffer.concat([files.get(state.name), Buffer.from(bytes.subarray(offset, offset + length))])); return length; },
         fstatSync: fd => stat(open.get(fd).name),
         readSync: (fd, buffer, start, length) => { const state = open.get(fd), bytes = files.get(state.name), count = Math.min(length, bytes.length - state.offset); bytes.copy(buffer, start, state.offset, state.offset + count); state.offset += count; return count; },
         closeSync: fd => { open.delete(fd); },

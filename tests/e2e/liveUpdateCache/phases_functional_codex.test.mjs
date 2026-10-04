@@ -25,7 +25,7 @@ test('the functional epoch runs U0-U7b in order against a coherent deployment an
     const calls = h.world.calls;
     const startAt = calls.findIndex(call => call.startsWith('cli:start')); assert.ok(calls.indexOf('browser-create') < startAt && startAt < calls.indexOf('fixture-prepare'), 'U1 precedes U2 precedes U3'); assert.ok(calls.indexOf('fixture-prepare') < calls.indexOf('update:normal-update'));
     assert.ok(calls.indexOf('update:normal-update') < calls.findIndex(call => call.startsWith('reinstall:')) && calls.findIndex(call => call.startsWith('reinstall:')) < calls.indexOf('negative-run'));
-    assert.ok(calls.indexOf('negative-restore') < calls.indexOf('update:settling-update') && calls.indexOf('update:settling-update') < calls.indexOf('browser-verify') && calls.indexOf('browser-verify') < calls.indexOf('freeze') && calls.indexOf('freeze') < calls.indexOf('cleanup:true'));
+    assert.ok(calls.indexOf('negative-restore') < calls.indexOf('update:settling-update') && calls.indexOf('update:settling-update') < calls.indexOf('browser-verify') && calls.indexOf('browser-verify') < calls.indexOf('cleanup:true'));
     assert.deepEqual(h.evidence.U2, { phase: 'U2', exit: 0, runtimes: 1, comparedObjects: 1, generationChanged: false });
     assert.deepEqual(h.evidence.U5.gc, { outcome: 'collected', removedCount: 1, retainedReasons: ['admitted-record', 'container-mount', 'reader:container'] }); assert.equal(h.evidence.U5.readerUnchanged, true);
     assert.equal(h.evidence.U4.predecessorRetained, true); assert.equal(h.evidence.U7.publicConfigEqual, true); assert.equal(h.evidence.U7b.cleanup.files, 'removed');

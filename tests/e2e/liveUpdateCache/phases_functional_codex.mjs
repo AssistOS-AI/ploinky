@@ -124,10 +124,12 @@ export function createFunctionalPhases(ctx) {
         },
         async U7b() {
             need(ctx.latchClean(), 'writers-not-quiescent');
-            const frozen = await ctx.freezeFunctional();
+            // Receipts are frozen by the orchestrator once this phase's own receipt exists; cleanup comes first so a
+            // half-cleaned functional epoch can never be resumed from.
             const cleanup = await ports.cleanup.run({ writersQuiescent: true, names, state });
             const observed = await observeAgain(ctx); need(isDeepStrictEqual(observed.publicConfig, state.baseline.publicConfig), 'public-config-changed');
-            return { phase: 'U7b', functionalReceiptSha256: frozen.sha256, cleanup, publicConfigEqual: true };
+            state.finalObserved = observed;
+            return { phase: 'U7b', cleanup, publicConfigEqual: true };
         },
     };
 }

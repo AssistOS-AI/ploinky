@@ -66,6 +66,6 @@ export function createWorld(faults = {}) {
         cleanup: { async run({ writersQuiescent }) { world.calls.push(`cleanup:${writersQuiescent}`); return { repo: 'uninstalled', server: 'removed', files: 'removed', marker: 'removed' }; } },
     };
     const state = {}, inputs = { expectedUpdates: { 'normal-update': {}, 'settling-update': {} } };
-    const ctx = { manifest, inputs, ports, state, check() {}, latchClean: () => faults.latchDirty !== true, async freezeFunctional() { world.calls.push('freeze'); return { sha256: H('frozen') }; } };
+    const ctx = { manifest, inputs, ports, state, check() {}, latchClean: () => faults.latchDirty !== true };
     return { world, ctx, phases: createFunctionalPhases(ctx), ports };
 }
