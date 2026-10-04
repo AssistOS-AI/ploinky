@@ -8,7 +8,7 @@ import { STORE_PROBE_SCHEMA, STORE_PROBE_LIMITS, validateStoreProbeInput } from 
 // exact-ID container logs, and the supported outer CLI (including the debug reinstall whose GC summary is projected).
 export const STORE_BOOTSTRAP_PATH = '/opt/ploinky/tests/e2e/liveUpdateCache/store_probe_codex.mjs';
 const hex64 = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
-const FULL_KEYS = ['label', 'containerName', 'runtimeId', 'instanceId', 'enableGeneration', 'running', 'labelsEqual', 'objectId', 'selectorId', 'version', 'sourceCommit', 'provenanceCommit', 'lockCommit',
+const FULL_KEYS = ['label', 'containerName', 'runtimeId', 'startedAt', 'instanceId', 'enableGeneration', 'running', 'labelsEqual', 'objectId', 'selectorId', 'version', 'sourceCommit', 'provenanceCommit', 'lockCommit',
     'markerSha256', 'payloadSha256', 'treeMatchesManifest', 'installerKind', 'verification', 'readerReceipt', 'receiptCount', 'mountSource', 'mountReadOnly'].sort().join();
 const IDENTITY_KEYS = ['label', 'containerName', 'runtimeId', 'instanceId', 'enableGeneration', 'running', 'labelsEqual', 'objectId', 'selectorId', 'payloadSha256', 'storeMode'].sort().join();
 const shortText = value => typeof value === 'string' && value.length > 0 && value.length <= 512 && !/[\0\r\n]/.test(value);
@@ -30,7 +30,7 @@ export function parseStoreProbeOutput(bytes, input) {
             && shortText(row.instanceId) && shortText(row.enableGeneration) && typeof row.running === 'boolean' && typeof row.labelsEqual === 'boolean'
             && (row.objectId === null || /^[a-f0-9-]{36}$/.test(row.objectId)) && (row.payloadSha256 === null || hex64(row.payloadSha256)) && (row.selectorId === null || hex64(row.selectorId)), 'store-output');
         if (identity) { need(['store', 'none'].includes(row.storeMode) && (row.storeMode === 'store') === (row.objectId !== null), 'store-output'); return; }
-        need(typeof row.version === 'string' && row.version.length <= 64 && [row.sourceCommit, row.provenanceCommit, row.lockCommit].every(item => /^[a-f0-9]{40}$/.test(item)) && hex64(row.markerSha256)
+        need(shortText(row.startedAt) && Number.isFinite(Date.parse(row.startedAt)) && typeof row.version === 'string' && row.version.length <= 64 && [row.sourceCommit, row.provenanceCommit, row.lockCommit].every(item => /^[a-f0-9]{40}$/.test(item)) && hex64(row.markerSha256)
             && row.treeMatchesManifest === true && Number.isSafeInteger(row.receiptCount) && row.receiptCount >= 0 && typeof row.mountReadOnly === 'boolean' && (row.mountSource === null || shortText(row.mountSource))
             && (row.installerKind === null || shortText(row.installerKind)) && (row.verification === null || shortText(row.verification))
             && (row.readerReceipt === null || (Object.keys(row.readerReceipt).sort().join() === ['enableGeneration', 'instanceId', 'objectId', 'runtimeId'].join() && row.readerReceipt.runtimeId === row.runtimeId

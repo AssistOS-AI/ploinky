@@ -7,7 +7,7 @@ import { STORE_PROBE_SCHEMA } from './store_probe_codex.mjs';
 installPureGuards();
 
 const object = '00000000-0000-4000-8000-000000000001';
-const fullRow = (label, extra = {}) => ({ label, containerName: 'ploinky_probe', runtimeId: H('c0'), instanceId: 'i', enableGeneration: 'e', running: true, labelsEqual: true, objectId: object, selectorId: H('g'), version: '1.0.0',
+const fullRow = (label, extra = {}) => ({ label, containerName: 'ploinky_probe', runtimeId: H('c0'), startedAt: '2026-10-04T12:00:00.5Z', instanceId: 'i', enableGeneration: 'e', running: true, labelsEqual: true, objectId: object, selectorId: H('g'), version: '1.0.0',
     sourceCommit: 'a'.repeat(40), provenanceCommit: 'a'.repeat(40), lockCommit: 'a'.repeat(40), markerSha256: H('m'), payloadSha256: H('t'), treeMatchesManifest: true, installerKind: 'container-npm', verification: 'remote-verified',
     readerReceipt: { runtimeId: H('c0'), instanceId: 'i', enableGeneration: 'e', objectId: object }, receiptCount: 1, mountSource: '/s', mountReadOnly: true, ...extra });
 const idRow = (label, extra = {}) => ({ label, containerName: 'ploinky_x', runtimeId: H('c1'), instanceId: 'i', enableGeneration: 'e', running: true, labelsEqual: true, objectId: null, selectorId: null, payloadSha256: null, storeMode: 'none', ...extra });
@@ -22,7 +22,7 @@ test('store probe output is strict for both full and identity targets and refuse
     const bad = [[fullRow('primary', { extra: 1 }), idRow('graph')], [fullRow('other'), idRow('graph')], [fullRow('primary', { sourceCommit: 'short' }), idRow('graph')], [fullRow('primary', { treeMatchesManifest: false }), idRow('graph')],
         [fullRow('primary', { readerReceipt: { runtimeId: H('zz'), instanceId: 'i', enableGeneration: 'e', objectId: object } }), idRow('graph')], [fullRow('primary', { runtimeId: 'short' }), idRow('graph')],
         [fullRow('primary', { readerReceipt: { runtimeId: H('c0'), instanceId: 'i', enableGeneration: 'e', objectId: '00000000-0000-4000-8000-0000000000bb' } }), idRow('graph')],
-        [fullRow('primary'), idRow('graph', { storeMode: 'store' })], [fullRow('primary'), { ...idRow('graph'), version: '1' }], [fullRow('primary')], [fullRow('primary', { mountSource: 'a\nb' }), idRow('graph')]];
+        [fullRow('primary'), idRow('graph', { storeMode: 'store' })], [fullRow('primary'), { ...idRow('graph'), version: '1' }], [fullRow('primary')], [fullRow('primary', { mountSource: 'a\nb' }), idRow('graph')], [fullRow('primary', { startedAt: 'not-a-time' }), idRow('graph')], [fullRow('primary', { startedAt: '' }), idRow('graph')]];
     for (const targets of bad) assert.throws(() => parseStoreProbeOutput(wrap(targets, [{ objectId: object, present: true, treeMatches: true, payloadSha256: null }]), input), error => error.code === 'store-output');
     assert.throws(() => parseStoreProbeOutput(wrap([fullRow('primary'), idRow('graph')], [{ objectId: '00000000-0000-4000-8000-0000000000aa', present: true, treeMatches: true, payloadSha256: null }]), input), error => error.code === 'store-output');
     assert.throws(() => parseStoreProbeOutput(Buffer.from(JSON.stringify({ schema: STORE_PROBE_SCHEMA, version: 1, failure: 'store-probe-object' })), input), error => error.code === 'live-store-probe-object');

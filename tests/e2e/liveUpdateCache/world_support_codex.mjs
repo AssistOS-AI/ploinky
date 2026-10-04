@@ -16,7 +16,7 @@ export function createWorld(faults = {}) {
     const graphObject = addObject('graph');
     world.runtimes.set('g0', { repoName: 'AssistOSExplorer', agentName: 'explorer', alias: null, runtimeId: H('graph-runtime'), instanceId: 'g-inst', enableGeneration: 'g-en', objectId: graphObject, selectorId: H('graph-sel'), running: true });
     const bump = () => { world.generation = `gen-${world.counter++}`; };
-    const full = runtime => ({ label: runtime.alias ?? 'primary', containerName: runtime.alias ? `ploinky_alias_${runtime.alias}` : (faults.wrongContainerName ? 'ploinky_other' : ownedRegistration(manifest).containerName), runtimeId: runtime.runtimeId, instanceId: runtime.instanceId, enableGeneration: runtime.enableGeneration, running: runtime.running, labelsEqual: true,
+    const full = runtime => ({ label: runtime.alias ?? 'primary', containerName: runtime.alias ? `ploinky_alias_${runtime.alias}` : (faults.wrongContainerName ? 'ploinky_other' : ownedRegistration(manifest).containerName), runtimeId: runtime.runtimeId, startedAt: runtime.startedAt ?? '2026-10-04T12:00:00Z', instanceId: runtime.instanceId, enableGeneration: runtime.enableGeneration, running: runtime.running, labelsEqual: true,
         objectId: runtime.objectId, selectorId: runtime.selectorId, version: '1.0.0', sourceCommit: runtime.commit, provenanceCommit: runtime.commit, lockCommit: runtime.commit, markerSha256: runtime.markerSha256, payloadSha256: world.objects.get(runtime.objectId).payloadSha256,
         treeMatchesManifest: true, installerKind: 'container-npm', verification: 'remote-verified', readerReceipt: faults.noReceipt ? null : { runtimeId: runtime.runtimeId, instanceId: runtime.instanceId, enableGeneration: runtime.enableGeneration, objectId: runtime.objectId },
         receiptCount: 1, mountSource: `/ws/.ploinky/deps/store/objects/${runtime.objectId}/payload/node_modules`, mountReadOnly: true });
@@ -52,22 +52,24 @@ export function createWorld(faults = {}) {
             world.pending = false;
             return { fulfilled: true, returnedCode: faults.updateExit ?? 0, result: { activation: { outcome: faults.activation ?? 'restarted' } } }; } },
         cache: {
-            async probeStore({ targets, objects }) { return { targets: targets.map(target => { if (target.packageName === null) { const runtime = world.runtimes.get(`g${targets.indexOf(target)}`) ?? world.runtimes.get('g0'); return { label: target.label, containerName: 'ploinky_g', runtimeId: runtime.runtimeId, instanceId: runtime.instanceId, enableGeneration: runtime.enableGeneration, running: runtime.running, labelsEqual: true, objectId: faults.graphNoStore ? null : runtime.objectId, selectorId: faults.graphNoStore ? null : runtime.selectorId, payloadSha256: faults.graphNoStore ? null : world.objects.get(runtime.objectId).payloadSha256, storeMode: faults.graphNoStore ? 'none' : 'store' }; }
+            async probeStore({ targets, objects }) { if (faults.readerRestartsAfterReinstall && world.reinstalled && targets.some(target => target.alias === names.aliases[0])) world.runtimes.get(names.aliases[1]).startedAt = '2026-10-04T12:05:00Z';
+                return { targets: targets.map(target => { if (target.packageName === null) { const runtime = world.runtimes.get(`g${targets.indexOf(target)}`) ?? world.runtimes.get('g0'); return { label: target.label, containerName: 'ploinky_g', runtimeId: runtime.runtimeId, instanceId: runtime.instanceId, enableGeneration: runtime.enableGeneration, running: runtime.running, labelsEqual: true, objectId: faults.graphNoStore ? null : runtime.objectId, selectorId: faults.graphNoStore ? null : runtime.selectorId, payloadSha256: faults.graphNoStore ? null : world.objects.get(runtime.objectId).payloadSha256, storeMode: faults.graphNoStore ? 'none' : 'store' }; }
                     const runtime = target.alias ? runtimeFor(target.alias) : world.runtimes.get('primary'); if (!runtime) { const error = new Error('x'); error.code = 'live-store-probe-missing'; throw error; } return full(runtime); }),
                 objects: objects.map(objectId => ({ objectId, ...(world.objects.get(objectId) ?? { present: false, treeMatches: false, payloadSha256: null }) })) }; },
             async containerLogs(runtimeId) { const runtime = [...world.runtimes.values()].find(item => item.runtimeId === runtimeId); return runtime?.marker ? `UC_MARKER ${runtime.marker}\n` : ''; },
-            async readerMarkerSha256(runtimeId) { if (faults.readerUnreadable) return null; return [...world.runtimes.values()].find(item => item.runtimeId === runtimeId)?.markerSha256 ?? null; },
+            async readerMarkerSha256(runtimeId) { world.readerReads = (world.readerReads ?? 0) + 1; if (faults.readerUnreadable || faults.readerUnreadableCall === world.readerReads) return null; return [...world.runtimes.values()].find(item => item.runtimeId === runtimeId)?.markerSha256 ?? null; },
             async cli(operation, args) { world.calls.push(`cli:${args.slice(0, 3).join(' ')}`);
                 if (args[0] === 'start') { if (faults.warmReplacesRuntime) world.runtimes.get('g0').runtimeId = id('graph-replaced'); if (faults.warmReplacesObject) world.runtimes.get('g0').objectId = addObject('graph-new'); return { code: faults.startExit ?? 0 }; }
                 if (args[0] === 'add') { world.registered = true; return { code: 0 }; }
                 if (args[0] === 'enable') { enable(args.includes('as') ? args.at(-1) : null); return { code: faults.enableExit ?? 0 }; }
                 if (args[0] === 'disable') { world.runtimes.delete(args[2].includes('/') ? 'primary' : args[2]); bump(); return { code: 0 }; }
                 return { code: 0 }; },
-            async reinstallWithGcSummary(alias, { onChunk } = {}) { world.calls.push(`reinstall:${alias}`); const runtime = runtimeFor(alias), readerObject = world.runtimes.get(names.aliases[1])?.objectId;
+            async reinstallWithGcSummary(alias, { onChunk } = {}) { world.calls.push(`reinstall:${alias}`); world.reinstalled = true; const runtime = runtimeFor(alias), readerObject = world.runtimes.get(names.aliases[1])?.objectId;
                 runtime.objectId = addObject(`reinstalled-${alias}`); runtime.selectorId = H(`sel-${world.counter++}`); runtime.runtimeId = id(`rt-${alias}-reinstalled`); if (faults.removeReaderObject) world.objects.get(readerObject).present = false;
                 if (faults.readerDies) world.runtimes.get(names.aliases[1]).running = false;
+                if (faults.readerRestartsDuringGc) world.runtimes.get(names.aliases[1]).startedAt = '2026-10-04T12:05:00Z';
                 const summary = faults.gcSkipped ? { outcome: 'skipped' } : { outcome: 'collected', removedCount: 1, retainedBytesByReason: faults.noRetainedReason ? {} : { 'admitted-record': 4, 'container-mount': 4, 'reader:container': 4 } };
-                onChunk?.({ summary }); return { code: 0, summary, bytes: 100, discardedLines: 1 }; },
+                if (!faults.noSummaryCallback) onChunk?.({ summary }); return { code: 0, summary, bytes: 100, discardedLines: 1 }; },
         },
         negative: { async run() { world.calls.push('negative-run'); if (!faults.noPending) world.pending = true; return { phase: 'U6', optional: 'passed', required: 'passed' }; }, async restore() { world.calls.push('negative-restore'); } },
         cleanup: { async run({ writersQuiescent }) { world.calls.push(`cleanup:${writersQuiescent}`); return { repo: 'uninstalled', server: 'removed', files: 'removed', marker: 'removed' }; } },

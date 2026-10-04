@@ -93,7 +93,7 @@ function projectTarget(target, { workspaceRoot, registry, rows, apis, io, storeR
     const mount = row.mounts.find(item => item.source === path.join(object.dir, 'payload', 'node_modules') || item.source === path.join(object.dir, 'payload') || item.source.startsWith(`${object.dir}/`));
     const key = `container:${containerName}:${record.instanceId}:${record.enableGeneration}`;
     const receipts = readReceipts(storeRoot, io).filter(receipt => receipt.objectId === dependencies.objectId && receipt.consumer?.kind === 'container' && receipt.consumer.key === key && receipt.generationId === dependencies.generationId);
-    return { label: target.label, containerName, runtimeId: row.id, instanceId: record.instanceId, enableGeneration: record.enableGeneration, running: row.running === true,
+    return { label: target.label, containerName, runtimeId: row.id, startedAt: row.startedAt, instanceId: record.instanceId, enableGeneration: record.enableGeneration, running: row.running === true,
         labelsEqual: row.instanceId === record.instanceId && row.enableGeneration === record.enableGeneration && row.name === containerName,
         objectId: dependencies.objectId, selectorId: dependencies.generationId, version: installed.version, sourceCommit: provenance.commit, provenanceCommit: provenance.commit, lockCommit: resolved.slice(resolved.lastIndexOf('#') + 1),
         markerSha256: sha(marker), payloadSha256: object.payloadSha256, treeMatchesManifest: true, installerKind: typeof object.manifest.resolution?.installer?.kind === 'string' ? object.manifest.resolution.installer.kind : null,

@@ -106,7 +106,7 @@ test('probe main prints one public document or a fixed failure code and never an
 
 test('nested inspection uses a fixed template, exact container IDs and a private environment', () => {
     const calls = [];
-    const spawnSync = (bin, args, options) => { calls.push({ bin, args, options }); return { status: 0, stdout: Buffer.from(`id=${JSON.stringify(H('c0'))}\nname="/ploinky_x"\nrunning=true\nimage="sha256:${H('i')}"\ninstanceId="i"\nenableGeneration="g"\nmounts=[]\n`) }; };
+    const spawnSync = (bin, args, options) => { calls.push({ bin, args, options }); return { status: 0, stdout: Buffer.from(`id=${JSON.stringify(H('c0'))}\nname="/ploinky_x"\nrunning=true\nstartedAt="2026-10-04T12:00:00Z"\nimage="sha256:${H('i')}"\ninstanceId="i"\nenableGeneration="g"\nmounts=[]\n`) }; };
     const result = inspectNestedContainers([H('c0')], { spawnSync, env: { PATH: '/usr/bin', SECRET_TOKEN: 'PRIVATE-SENTINEL', HOME: '/home/podman' } });
     assert.equal(result.get(H('c0')).name, 'ploinky_x');
     assert.deepEqual(calls[0].args, ['container', 'inspect', '--format', READER_INSPECT_FORMAT, H('c0')]); assert.equal(calls[0].options.shell, false);

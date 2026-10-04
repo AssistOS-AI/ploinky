@@ -147,29 +147,38 @@ async function retainedReaderProof(ctx, aliasA, aliasB) {
     const rowA0 = await probeRow(ctx, targetFor(names, aliasA), B.marker), rowB0 = await probeRow(ctx, targetFor(names, aliasB), B.marker);
     assertInstalled(rowA0, B, 'cache-alias-unproven'); assertInstalled(rowB0, B, 'cache-alias-unproven');
     need(rowA0.objectId === rowB0.objectId && rowA0.runtimeId !== rowB0.runtimeId, 'aliases-not-identical');
+    // One reader observation. startedAt binds the exact container incarnation; it is compared here and is not part of the
+    // contract object, which has a fixed shape.
     const observeReader = async () => {
         const result = await ports.cache.probeStore({ targets: [targetFor(names, aliasB)], objects: [] }), row = result.targets[0];
         const read = await ports.cache.readerMarkerSha256(row.runtimeId, names.packageName, 'index.js');
         need(row.readerReceipt !== null, 'reader-receipt-missing');
-        return { live: row.running === true && row.labelsEqual === true && read === row.markerSha256 && read === B.markerSha256, runtimeId: row.runtimeId, instanceId: row.instanceId, enableGeneration: row.enableGeneration,
+        return { startedAt: row.startedAt, live: row.running === true && row.labelsEqual === true && read === row.markerSha256 && read === B.markerSha256, runtimeId: row.runtimeId, instanceId: row.instanceId, enableGeneration: row.enableGeneration,
             objectId: row.objectId, mountSource: row.mountSource, mountReadOnly: row.mountReadOnly, readerReceipt: row.readerReceipt, payloadSha256: row.payloadSha256 };
     };
-    const before = await observeReader(); need(before.objectId === rowB0.objectId && before.mountSource !== null, 'reader-not-mounted');
-    const during = []; let pending = null, failure = null; const sample = () => { const task = observeReader().then(value => { during.push(value); }, error => { failure ??= error; }); pending = pending ? pending.then(() => task) : task; };
+    const contract = ({ startedAt: _startedAt, afterSummary: _afterSummary, ...rest }) => rest;
+    const before = await observeReader(); need(before.live === true && before.objectId === rowB0.objectId && before.mountSource !== null, 'reader-not-mounted');
+    const during = []; let pending = null, failure = null;
+    const sample = afterSummary => { const task = observeReader().then(value => { during.push({ ...value, afterSummary }); }, error => { failure ??= error; }); pending = pending ? pending.then(() => task) : task; };
     let done = false, summarySeen = false;
-    const monitor = (async () => { while (!done) { sample(); await ports.clock.delay(READER_POLL_MS); } })();
+    const monitor = (async () => { while (!done) { sample(false); await ports.clock.delay(READER_POLL_MS); } })();
     let run; try {
-        run = await ports.cache.reinstallWithGcSummary(aliasA, { onChunk: snapshot => { if (snapshot.summary && !summarySeen) { summarySeen = true; sample(); } } });
+        run = await ports.cache.reinstallWithGcSummary(aliasA, { onChunk: snapshot => { if (snapshot.summary && !summarySeen) { summarySeen = true; sample(true); } } });
     } finally { done = true; await monitor; if (pending) await pending; }
     if (failure) throw failure;
     need(run.code === 0 && run.summary.outcome === 'collected' && during.length > 0, 'ordinary-gc-not-proven');
+    // The reader predicate holds for every sample taken while the command ran, at least one sample started after the
+    // collection summary was printed, and the same container incarnation answered every time.
+    need(during.some(sample => sample.afterSummary === true), 'reader-not-observed-after-gc-summary');
+    for (const sample of during) need(sample.live === true && isDeepStrictEqual({ ...sample, afterSummary: undefined }, { ...before, afterSummary: undefined }), 'reader-changed-during-gc');
     const rowA1 = await probeRow(ctx, targetFor(names, aliasA), B.marker); const after = await observeReader();
+    need(after.startedAt === before.startedAt, 'reader-changed-during-gc');
     need(rowA1.objectId !== rowA0.objectId && rowA1.selectorId !== rowA0.selectorId && rowA1.runtimeId !== rowA0.runtimeId, 'reinstall-not-replaced');
     const retained = Object.entries(run.summary.retainedBytesByReason).filter(([, bytes]) => bytes > 0).map(([reason]) => reason);
     const object = (await ports.cache.probeStore({ targets: [], objects: [before.objectId] })).objects[0];
     const gc = { outcome: 'collected', engineKnown: true, registryKnown: true, writersKnown: true, selectedReaderProtected: object.present && object.treeMatches && retained.some(reason => ['container-mount', 'reader:container', 'admitted-record'].includes(reason)),
         selectedObjectId: before.objectId, retainedCount: retained.length };
-    assertRetainedReader({ before, during: during.at(-1), after, gc });
+    assertRetainedReader({ before: contract(before), during: contract(during.at(-1)), after: contract(after), gc });
     const observed = await observeAgain(ctx); state.generation = observed.activeGeneration;
     return { phase: 'U5', gc: { outcome: gc.outcome, removedCount: run.summary.removedCount, retainedReasons: retained }, readerUnchanged: true, duringObservations: during.length, aliasReplaced: true };
 }

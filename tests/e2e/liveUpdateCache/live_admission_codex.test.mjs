@@ -76,9 +76,10 @@ test('the engine templates select named nonsecret fields and never Config.Env or
     assert.deepEqual(nestedInspectArgs('/usr/bin/podman', H('b'), H('c')).slice(0, 7), ['/usr/bin/podman', 'exec', H('b'), 'podman', 'container', 'inspect', '--format']);
     assert.throws(() => nestedInspectArgs('/usr/bin/podman', H('b'), 'name'), error => error.code === 'engine-argument');
     assert.throws(() => boxExecArgs({ engineBin: 'podman', boxId: H('b'), workspace: '/w', routerHostPort: 1, mediaHostPort: 2, argv: ['x'] }), error => error.code === 'engine-argument');
-    const row = parseReaderInspect(Buffer.from(lines([['id', H('c')], ['name', '/ploinky_x'], ['running', true], ['image', `sha256:${H('i')}`], ['instanceId', 'i'], ['enableGeneration', 'g'], ['mounts', [{ Source: '/s', Destination: '/d', RW: false }]]])), H('c'));
-    assert.deepEqual(row.mounts, [{ source: '/s', destination: '/d', readOnly: true }]); assert.equal(row.name, 'ploinky_x');
-    assert.throws(() => parseReaderInspect(Buffer.from(lines([['id', H('d')], ['name', 'n'], ['running', true], ['image', 'x'], ['instanceId', 'i'], ['enableGeneration', 'g'], ['mounts', []]])), H('c')), error => error.code === 'reader-inspect-shape');
+    const row = parseReaderInspect(Buffer.from(lines([['id', H('c')], ['name', '/ploinky_x'], ['running', true], ['startedAt', '2026-10-04T12:00:00.5Z'], ['image', `sha256:${H('i')}`], ['instanceId', 'i'], ['enableGeneration', 'g'], ['mounts', [{ Source: '/s', Destination: '/d', RW: false }]]])), H('c'));
+    assert.deepEqual(row.mounts, [{ source: '/s', destination: '/d', readOnly: true }]); assert.equal(row.name, 'ploinky_x'); assert.equal(row.startedAt, '2026-10-04T12:00:00.5Z');
+    for (const startedAt of ['', 'yesterday', 'x'.repeat(65)]) assert.throws(() => parseReaderInspect(Buffer.from(lines([['id', H('c')], ['name', '/n'], ['running', true], ['startedAt', startedAt], ['image', 'x'], ['instanceId', 'i'], ['enableGeneration', 'g'], ['mounts', []]])), H('c')), error => error.code === 'reader-inspect-shape');
+    assert.throws(() => parseReaderInspect(Buffer.from(lines([['id', H('d')], ['name', 'n'], ['running', true], ['startedAt', '2026-10-04T12:00:00.5Z'], ['image', 'x'], ['instanceId', 'i'], ['enableGeneration', 'g'], ['mounts', []]])), H('c')), error => error.code === 'reader-inspect-shape');
     assert.deepEqual(parsePortBindings({ '7882/udp': [{ HostIp: '', HostPort: '7882' }], '8080/tcp': [{ HostIp: '127.0.0.1', HostPort: '8080' }] }),
         [{ protocol: 'tcp', hostIP: '127.0.0.1', hostPort: 8080, containerPort: 8080 }, { protocol: 'udp', hostIP: '0.0.0.0', hostPort: 7882, containerPort: 7882 }]);
     assert.throws(() => parseEngineInfo(Buffer.from('rootless=true\n')), error => error.code === 'engine-info-shape');

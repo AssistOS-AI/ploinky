@@ -27,7 +27,7 @@ function build(mutate = () => {}) {
     const registry = { ploinky_probe: record }, calls = [];
     const apis = { readAgentRegistrySnapshot: options => { calls.push(['registry', options]); return state.registryAfter && calls.length > 1 ? state.registryAfter : registry; },
         hashInstalledTree: (root, options) => { calls.push(['tree', root, options]); if (state.treeThrows) throw new Error('PRIVATE'); return { hash: state.tree }; } };
-    const inspect = ids => new Map(ids.map(id => [id, { id, name: state.name ?? 'ploinky_probe', running: state.running ?? true, imageId: H('img'), instanceId: state.rowInstance ?? 'inst-1', enableGeneration: 'en-1',
+    const inspect = ids => new Map(ids.map(id => [id, { id, name: state.name ?? 'ploinky_probe', running: state.running ?? true, startedAt: state.startedAt ?? '2026-10-04T12:00:00.5Z', imageId: H('img'), instanceId: state.rowInstance ?? 'inst-1', enableGeneration: 'en-1',
         mounts: state.mounts ?? [{ source: `${store}/objects/${state.objectId}/payload/node_modules`, destination: '/code/node_modules', readOnly: true }] }]));
     return { state, io, apis, inspect, registry, calls, run: (probeInput = input()) => runStoreProbe(probeInput, { workspaceRoot: ws, apis, io, inspect }) };
 }
@@ -37,7 +37,7 @@ test('store probe projects exact object, provenance, lock, marker, receipt and m
     const h = build(); const result = await h.run(input({ objects: [object, other] }));
     assert.deepEqual(Object.keys(result).sort(), ['objects', 'schema', 'targets', 'version']); assert.equal(result.schema, STORE_PROBE_SCHEMA);
     const [row] = result.targets;
-    assert.deepEqual({ ...row, markerSha256: undefined }, { label: 'primary', containerName: 'ploinky_probe', runtimeId: H('c0'), instanceId: 'inst-1', enableGeneration: 'en-1', running: true, labelsEqual: true, objectId: object, selectorId: H('generation'),
+    assert.deepEqual({ ...row, markerSha256: undefined }, { label: 'primary', containerName: 'ploinky_probe', runtimeId: H('c0'), startedAt: '2026-10-04T12:00:00.5Z', instanceId: 'inst-1', enableGeneration: 'en-1', running: true, labelsEqual: true, objectId: object, selectorId: H('generation'),
         version: '1.0.0', sourceCommit: sha, provenanceCommit: sha, lockCommit: sha, markerSha256: undefined, payloadSha256: treeHash, treeMatchesManifest: true, installerKind: 'container-npm', verification: 'remote-verified',
         readerReceipt: { runtimeId: H('c0'), instanceId: 'inst-1', enableGeneration: 'en-1', objectId: object }, receiptCount: 1, mountSource: `${store}/objects/${object}/payload/node_modules`, mountReadOnly: true });
     assert.equal(row.markerSha256.length, 64); assert.deepEqual(result.objects, [{ objectId: object, present: true, treeMatches: true, payloadSha256: treeHash }, { objectId: other, present: true, treeMatches: false, payloadSha256: H('other-tree') }]);

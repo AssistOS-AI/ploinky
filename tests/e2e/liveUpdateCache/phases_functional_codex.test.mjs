@@ -61,7 +61,9 @@ test('U4: an update whose expectation omits the owned repository or pin record, 
 
 test('U5: skipped collection, a lost reader or object, an unreadable marker or identical-object violation never pass the retained-reader claim', async () => {
     await failsAt({ gcSkipped: true }, 'U5', 'ordinary-gc-not-proven'); await failsAt({ removeReaderObject: true }, 'U5', 'ordinary-gc-not-proven'); await failsAt({ noRetainedReason: true }, 'U5', 'ordinary-gc-not-proven');
-    await failsAt({ readerDies: true }, 'U5', /reader-changed-during-gc|reader-not-live/); await failsAt({ readerUnreadable: true }, 'U5', /reader-not-live|reader-changed-during-gc/);
+    await failsAt({ readerDies: true }, 'U5', /reader-changed-during-gc|reader-not-live/);
+    // Reader predicate on every during sample, a sample after the summary, and the same container incarnation throughout.
+    await failsAt({ readerUnreadableCall: 2 }, 'U5', 'reader-changed-during-gc'); await failsAt({ noSummaryCallback: true }, 'U5', 'reader-not-observed-after-gc-summary'); await failsAt({ readerRestartsDuringGc: true }, 'U5', 'reader-changed-during-gc'); await failsAt({ readerRestartsAfterReinstall: true }, 'U5', 'reader-changed-during-gc'); await failsAt({ readerUnreadable: true }, 'U5', 'reader-not-mounted');
     await failsAt({ freshObjectPerAlias: true }, 'U5', 'aliases-not-identical'); await failsAt({ noReceipt: true }, 'U3', 'cache-a-unproven');
 });
 

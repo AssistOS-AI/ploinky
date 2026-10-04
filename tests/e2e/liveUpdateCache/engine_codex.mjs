@@ -87,7 +87,7 @@ export const publicationsId = rows => `pub:${sha256Hex(canonical([...rows].sort(
 export const mountsId = rows => `mnt:${sha256Hex(canonical([...rows].sort((a, b) => canonical(a).localeCompare(canonical(b)))))}`;
 
 // Nested engine reads through the exact Box ID. The format never selects Config.Env.
-const READER_FIELDS = [['id', '.Id'], ['name', '.Name'], ['running', '.State.Running'], ['image', '.Image'], ['instanceId', `(index .Config.Labels "io.assistos.ploinky.instance-id")`],
+const READER_FIELDS = [['id', '.Id'], ['name', '.Name'], ['running', '.State.Running'], ['startedAt', '.State.StartedAt'], ['image', '.Image'], ['instanceId', `(index .Config.Labels "io.assistos.ploinky.instance-id")`],
     ['enableGeneration', `(index .Config.Labels "io.assistos.ploinky.enable-generation")`], ['mounts', '.Mounts']];
 export const READER_INSPECT_FORMAT = template(READER_FIELDS);
 export function nestedInspectArgs(engineBin, boxId, containerId) {
@@ -97,10 +97,11 @@ export function nestedInspectArgs(engineBin, boxId, containerId) {
 export function parseReaderInspect(bytes, containerId) {
     const raw = keyedLines(bytes, READER_FIELDS.map(([key]) => key), 'reader-inspect-shape');
     need(raw.id === containerId && typeof raw.running === 'boolean' && typeof raw.name === 'string' && typeof raw.image === 'string'
-        && typeof raw.instanceId === 'string' && typeof raw.enableGeneration === 'string' && Array.isArray(raw.mounts), 'reader-inspect-shape');
+        && typeof raw.instanceId === 'string' && typeof raw.enableGeneration === 'string' && Array.isArray(raw.mounts)
+        && typeof raw.startedAt === 'string' && raw.startedAt.length > 0 && raw.startedAt.length <= 64 && Number.isFinite(Date.parse(raw.startedAt)), 'reader-inspect-shape');
     const mounts = raw.mounts.map(mount => { need(mount && typeof mount.Source === 'string' && typeof mount.Destination === 'string' && typeof mount.RW === 'boolean', 'reader-inspect-shape');
         return { source: mount.Source, destination: mount.Destination, readOnly: mount.RW === false }; });
-    return Object.freeze({ id: raw.id, name: raw.name.replace(/^\//, ''), running: raw.running, imageId: raw.image.replace(/^sha256:/, ''),
+    return Object.freeze({ id: raw.id, name: raw.name.replace(/^\//, ''), running: raw.running, startedAt: raw.startedAt, imageId: raw.image.replace(/^sha256:/, ''),
         instanceId: raw.instanceId, enableGeneration: raw.enableGeneration, mounts });
 }
 
