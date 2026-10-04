@@ -127,3 +127,17 @@ test('linux observer parses /proc stat with hostile command names and distinguis
     assert.throws(() => broken.current({ pid: 5, boot: '47ec5b32-52bc-489c-ae6b-4bad94022abb', startTicks: '1' }), error => error.code === 'observer-unreadable');
     assert.equal(broken.register({ pid: 5 }).unreadableAtRegistration, true);
 });
+
+test('an optional private control descriptor is a fourth bounded pipe whose bytes are returned separately', async () => {
+    const h = harness({ child: () => { const child = fakeChild(); child.stdio = [null, child.stdout, child.stderr, new EventEmitter()];
+        queueMicrotask(() => { child.stdio[3].emit('data', Buffer.from('{"frame":1}')); child.stdout.emit('data', Buffer.from('ordinary')); for (const stream of [child.stdout, child.stderr, child.stdio[3]]) { stream.emit('end'); stream.emit('close'); } child.emit('close', 0, null); }); return child; } });
+    const result = await runOwnedCommand(spec({ controlBytes: 64 }), h.deps);
+    assert.deepEqual(h.launches[0].launchOptions.stdio, ['ignore', 'pipe', 'pipe', 'pipe']); assert.equal(result.control.toString(), '{"frame":1}'); assert.equal(result.stdout.toString(), 'ordinary');
+    const over = harness({ child: () => { const child = fakeChild(); child.stdio = [null, child.stdout, child.stderr, new EventEmitter()]; queueMicrotask(() => child.stdio[3].emit('data', Buffer.alloc(65))); return child; } });
+    await assert.rejects(runOwnedCommand(spec({ controlBytes: 64 }), over.deps), error => error.code === 'command-output-overflow');
+    const missing = harness({ child: () => fakeChild() });
+    await assert.rejects(runOwnedCommand(spec({ controlBytes: 64 }), missing.deps), error => error.code === 'command-channel-missing');
+    const unclosed = harness({ child: () => { const child = fakeChild(); child.stdio = [null, child.stdout, child.stderr, new EventEmitter()]; queueMicrotask(() => child.finish(0)); return child; } });
+    await assert.rejects(runOwnedCommand(spec({ controlBytes: 64, deadlineMs: 500 }), unclosed.deps), error => error.code === 'command-close-unproven');
+    await assert.rejects(runOwnedCommand(spec({ controlBytes: 1 << 30 }), harness().deps), error => error.code === 'command-control-cap');
+});

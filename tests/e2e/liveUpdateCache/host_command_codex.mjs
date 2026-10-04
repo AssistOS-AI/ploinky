@@ -37,6 +37,7 @@ function validateSpec(spec) {
     const exits = spec.allowedExitCodes ?? [0];
     need(Array.isArray(exits) && exits.length > 0 && exits.length <= 4 && exits.every(code => Number.isInteger(code) && code >= 0 && code <= 255), 'command-exit-codes');
     need(spec.collect === undefined || typeof spec.collect === 'boolean', 'command-collect');
+    need(spec.controlBytes === undefined || (Number.isSafeInteger(spec.controlBytes) && spec.controlBytes > 0 && spec.controlBytes <= LIMITS.controlBytes), 'command-control-cap');
     need(spec.tap === undefined || (typeof spec.tap?.push === 'function' && typeof spec.tap.end === 'function'), 'command-tap');
     need(spec.env && Object.getPrototypeOf(spec.env) === Object.prototype, 'command-environment');
     return { stdoutCap, stderrCap, exits, collect: spec.collect !== false };
@@ -51,30 +52,32 @@ export async function runOwnedCommand(spec, deps) {
     const started = now(), deadline = started + spec.deadlineMs;
     let child, registration = null, closed = false, code = null, signal = null, failure = null;
     const streams = { stdout: { ended: false, closed: false, bytes: 0, chunks: [] }, stderr: { ended: false, closed: false, bytes: 0, chunks: [] } };
+    if (spec.controlBytes !== undefined) streams.control = { ended: false, closed: false, bytes: 0, chunks: [] };
     const fail = reason => { failure ??= reason; latch.stop(reason); };
     const retained = () => ({ pid: child?.pid ?? null, registered: registration !== null, childClosed: closed,
         pipesClosed: Object.values(streams).every(value => value.ended && value.closed) });
     const unsettled = reason => { const error = new AcceptanceError(reason); error.retained = retained(); return error; };
     try {
         child = launch(spec.argv[0], spec.argv.slice(1), { cwd: spec.cwd, env: spec.env, shell: false, detached: false, windowsHide: true,
-            stdio: [spec.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'] });
+            stdio: [spec.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe', ...(spec.controlBytes === undefined ? [] : ['pipe'])] });
         // The returned handle and every observer exist before any fallible step.
         custody.retain(child, { operation: spec.operation, runId });
         child.on('error', () => fail('command-error'));
         child.on('close', (exitCode, exitSignal) => { closed = true; code = exitCode; signal = exitSignal; });
-        for (const [name, stream] of [['stdout', child.stdout], ['stderr', child.stderr]]) {
+        const channels = [['stdout', child.stdout], ['stderr', child.stderr], ...(spec.controlBytes === undefined ? [] : [['control', child.stdio?.[3]]])];
+        for (const [name, stream] of channels) {
             need(stream?.on, 'command-channel-missing');
-            const state = streams[name], cap = name === 'stdout' ? stdoutCap : stderrCap;
+            const state = streams[name], cap = name === 'stdout' ? stdoutCap : name === 'stderr' ? stderrCap : spec.controlBytes;
             stream.on('error', () => fail('command-pipe-error'));
-            stream.on('end', () => { state.ended = true; if (spec.tap && !failure) spec.tap.end(name); });
+            stream.on('end', () => { state.ended = true; if (name !== 'control' && spec.tap && !failure) spec.tap.end(name); });
             stream.on('close', () => { state.closed = true; });
             stream.on('data', chunk => {
                 const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
                 state.bytes = Math.min(Number.MAX_SAFE_INTEGER, state.bytes + buffer.length);
                 if (state.bytes > cap) { state.chunks.length = 0; fail('command-output-overflow'); return; }
                 if (failure) return;
-                if (spec.tap && spec.tap.push(name, buffer) === false) { state.chunks.length = 0; fail('command-output-rejected'); return; }
-                if (collect) state.chunks.push(buffer);
+                if (name !== 'control' && spec.tap && spec.tap.push(name, buffer) === false) { state.chunks.length = 0; fail('command-output-rejected'); return; }
+                if (collect || name === 'control') state.chunks.push(buffer);
             });
         }
         if (spec.input !== undefined) {
@@ -100,7 +103,7 @@ export async function runOwnedCommand(spec, deps) {
         latch.assertMayLaunch();
         custody.settled(child);
         return Object.freeze({ code, durationMs: now() - started, stdout: Buffer.concat(streams.stdout.chunks), stderr: Buffer.concat(streams.stderr.chunks),
-            stdoutBytes: streams.stdout.bytes, stderrBytes: streams.stderr.bytes });
+            stdoutBytes: streams.stdout.bytes, stderrBytes: streams.stderr.bytes, control: streams.control ? Buffer.concat(streams.control.chunks) : Buffer.alloc(0) });
     } catch (error) {
         const reason = error instanceof AcceptanceError ? error.code : 'command-setup-failed';
         fail(reason);

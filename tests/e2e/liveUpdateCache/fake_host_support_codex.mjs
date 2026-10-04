@@ -7,13 +7,15 @@ export function createFakeHost(routes = []) {
     const launch = (bin, args, options) => {
         const child = new EventEmitter(); child.pid = ++pid; child.stdout = new EventEmitter(); child.stderr = new EventEmitter(); child.writes = [];
         if (options.stdio?.[0] === 'pipe') { child.stdin = new EventEmitter(); child.stdin.end = value => { child.writes.push(Buffer.from(value)); }; }
+        if (options.stdio?.length === 4) { child.control = new EventEmitter(); child.stdio = [null, child.stdout, child.stderr, child.control]; }
         const entry = { bin, args, options, child }; log.push(entry);
         queueMicrotask(() => {
             const route = routes.find(row => row.match(bin, args, options, entry));
             const reply = route ? route.reply({ bin, args, options, child, input: Buffer.concat(child.writes) }) : { code: 127, stderr: 'no-route' };
             if (reply.stdout !== undefined) child.stdout.emit('data', Buffer.from(reply.stdout));
             if (reply.stderr !== undefined) child.stderr.emit('data', Buffer.from(reply.stderr));
-            for (const stream of [child.stdout, child.stderr]) { stream.emit('end'); stream.emit('close'); }
+            if (reply.control !== undefined && child.control) child.control.emit('data', Buffer.from(reply.control));
+            for (const stream of [child.stdout, child.stderr, ...(child.control ? [child.control] : [])]) { stream.emit('end'); stream.emit('close'); }
             child.emit('close', reply.code ?? 0, null);
         });
         return child;
