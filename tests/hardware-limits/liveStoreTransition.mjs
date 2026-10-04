@@ -114,9 +114,11 @@ export function classifyRun(command, args, { workspaceRoot }) {
 // ---------------------------------------------------------------------------------------------------------------------------------------
 
 const clip = (value, max = 400) => redactDiagnostic(String(value ?? '')).slice(0, max);
+// A bounded rolling tail. The product's progress output goes here, never to this child's own streams: the harness bounds a command's whole output
+// and a restart prints far more than its summary.
 function sink() {
     let text = '';
-    return { write(chunk) { if (text.length < 16384) text += String(chunk); return true; }, tail: () => text.slice(-2048), isTTY: false };
+    return { write(chunk) { text = (text + String(chunk)).slice(-16384); return true; }, tail: () => text.slice(-2048), isTTY: false };
 }
 
 // One engine observation: ONE fresh `info` document, from which the harness digest (checked against the pinned one) and the product's own engine
@@ -336,7 +338,8 @@ export async function runDriver(rawParams, seams = {}) {
         },
     };
 
-    const makeSupervisor = seams.supervisor ?? (runner => production.createBoxSupervisor({ runner, env: process.env, launchCwd: process.cwd() }));
+    const out = sink(); const err = sink();
+    const makeSupervisor = seams.supervisor ?? (runner => production.createBoxSupervisor({ runner, env: process.env, launchCwd: process.cwd(), stdout: out, stderr: err }));
     const real = makeSupervisor(decorated);
     // The supervisor is frozen: a new delegating wrapper, never an assignment to its methods.
     const wrapper = Object.freeze({
@@ -352,7 +355,6 @@ export async function runDriver(rawParams, seams = {}) {
         } : {}),
     });
 
-    const out = sink(); const err = sink();
     let cliError = null; let exitCode = null;
     try {
         exitCode = await cli(params.mode === 'destroy' ? ['destroy', '--delete-cache'] : ['restart'], {

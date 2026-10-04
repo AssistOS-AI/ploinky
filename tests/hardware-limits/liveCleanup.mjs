@@ -12,7 +12,7 @@ import { createTransitionStore } from '../../ploinky-box/hardwareLimitsTransitio
 import { requireTransport, runBoundedProcess } from './liveProcess.mjs';
 import {
     HOST_RECORD_DIRECTORIES, ID, INSPECT, OWNER_MARKER, assertOwnedDirectory, assertWorkspace, boxPsArgv, candidateEnv, checkedJson, commandTails, hostRecordPaths,
-    jsonDigest, liveSourceDigest, observeEngineFacts, quarantinePath,
+    canonicalDigest, jsonDigest, liveSourceDigest, observeEngineFacts, quarantinePath,
 } from './liveCommon.mjs';
 import { c5ChainIds, c5IntentOf, driverSettled, productEngineDigest, readDriverReceipt, reconcileC5Custody, sameImage } from './liveBoxTransitionCustody.mjs';
 import { driverArgv, driverParams } from './liveStoreTransition.mjs';
@@ -221,7 +221,7 @@ export async function runOwnedCleanup({ run, profile, persist = () => {}, proces
         const identity = assertWorkspace(profile);
         if (box.id !== receipt.id || box.created !== receipt.created || !(receipt === profile.box ? box.image === receipt.image : sameImage(box.image, receipt.image))
             || box.labels?.[BOX_LABELS.pathHash] !== identity.pathHash || box.labels?.[BOX_LABELS.role] !== 'box'
-            || jsonDigest({ labels: box.labels, mounts: box.mounts }) !== receipt.contractDigest) throw new Error('Box identity/contract changed');
+            || (receipt === profile.box ? jsonDigest : canonicalDigest)({ labels: box.labels, mounts: box.mounts }) !== receipt.contractDigest) throw new Error('Box identity/contract changed');
     }
 
     // Every eligible generation is resolved from the product's own durable records BEFORE the first mutation. The interrupted driver's settlement is

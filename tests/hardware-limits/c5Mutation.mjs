@@ -54,3 +54,34 @@ export const PRODUCT_MUTANTS = Object.freeze({
     // The barrier is lost at the forward precreation boundary, after the old Box is gone and before the replacement is created.
     'loss-before-replacement': { name: 'loss-before-replacement', file: TRANSITION, patches: [{ from: PRECREATE, to: `    if (stage === 'candidate') ${REMOVE_OWN}\n${PRECREATE}` }] },
 });
+
+// ---- the harness: each mutant removes one guard of the LIVE-C5 lifecycle, custody or cleanup code. `kill` names the offline test that must fail ----
+const LIFECYCLE = 'tests/hardware-limits/liveStoreLifecycle.mjs';
+const CUSTODY = 'tests/hardware-limits/liveBoxTransitionCustody.mjs';
+const CLEANUP = 'tests/hardware-limits/liveCleanup.mjs';
+export const HARNESS_MUTANTS = Object.freeze({
+    // A writer-first restart refused with some OTHER error (or none) is accepted as the typed refusal.
+    'wrong-typed-refusal-accepted': { name: 'wrong-typed-refusal-accepted', file: LIFECYCLE, patches: [{ from: 'if (outcome?.errorCode !== WRITER_FIRST_CODE) return', to: 'if (false) return' }],
+        kill: { file: 'tests/unit/hardwareLimitsLiveStoreLifecycle.test.mjs', pattern: 'evaluators-accept-only-the-typed-refusal' } },
+    // The writer-first order is not required to leave the Box, the policy, the stamp, the gate and the transitions exactly as captured.
+    'unchanged-state-check-dropped': { name: 'unchanged-state-check-dropped', file: LIFECYCLE, patches: [{ from: 'if (!sameState(before, after))', to: 'if (false)' }],
+        kill: { file: 'tests/unit/hardwareLimitsLiveStoreLifecycle.test.mjs', pattern: 'writer-first-refusal-that-moved-the-stamp' } },
+    // The gate-on restart is never run: the case believes in a restart that did not happen.
+    'actual-restart-skipped': { name: 'actual-restart-skipped', file: LIFECYCLE, patches: [{
+        from: "const result = await command('c5-restart-on', profile.node.path, [profile.candidate.path, 'restart'], { gate: 'on', deadlineMs: startDeadline(), tolerate: true, capture: 'c5-restart-on' });",
+        to: "const result = { status: 0, signal: null, timedOut: false, truncated: false, cancelled: false, errorCode: null, settlementForced: false, stdout: '', stderr: '' };" }],
+        kill: { file: 'tests/unit/hardwareLimitsLiveStoreLifecycle.test.mjs', pattern: 'restart-on-writer-first-and-transition-first-pass' } },
+    // A create attempt without its CID receipt adopts whatever live container is not the original: adoption by name, never by the product's record.
+    'name-only-replacement-adoption': { name: 'name-only-replacement-adoption', file: CUSTODY, patches: [{ from: '        if (!cid) continue;',
+        to: '        if (!cid) { const byName = ids.find(candidate => candidate !== original.id); if (byName) chain.push(byName); continue; }' }],
+        kill: { file: 'tests/unit/hardwareLimitsLiveTransitionCustody.test.mjs', pattern: 'admits-a-replacement-only-through-the-bound' } },
+    // A missing or conflicting CID is ignored and a live container the chain does not explain is not noticed.
+    'missing-or-conflicting-cid-ignored': { name: 'missing-or-conflicting-cid-ignored', file: CUSTODY, patches: [
+        { from: 'const unexplained = known => ids.filter(id => !known.includes(id) && !unrelatedIds.includes(id));', to: 'const unexplained = () => [];' },
+        { from: "if ((attempt.observedId !== null && attempt.observedId !== cid.id) || chain.includes(cid.id)) throw problem('conflicting attempt CID');", to: "if (false) throw problem('conflicting attempt CID');" }],
+        kill: { file: 'tests/unit/hardwareLimitsLiveTransitionCustody.test.mjs', pattern: 'admits-a-replacement-only-through-the-bound' } },
+    // Cleanup proves only the original ID absent.
+    'cleanup-checks-only-the-original-id': { name: 'cleanup-checks-only-the-original-id', file: CLEANUP, patches: [{
+        from: 'const ownedIds = () => (chain ? [...chain] : c5ChainIds(run, profile).filter(Boolean));', to: 'const ownedIds = () => [profile.box.id];' }],
+        kill: { file: 'tests/unit/hardwareLimitsLiveTransitionCustody.test.mjs', pattern: 'proves-every-id-of-the-chain-absent' } },
+});

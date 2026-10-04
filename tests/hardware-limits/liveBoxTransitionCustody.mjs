@@ -10,7 +10,7 @@ import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { normalizeContainerRuntime, validateContainerConfiguration } from '../../ploinky-box/contract/container.mjs';
 import { digestOf, validateJournal } from '../../ploinky-box/hardwareLimitsTransition.mjs';
 import { writePrivateJson } from './fixtures.mjs';
-import { HASH, ID, RUN_ID, absolute, assertWorkspace, bounded, digest, jsonDigest, keys } from './liveCommon.mjs';
+import { HASH, ID, RUN_ID, absolute, assertWorkspace, bounded, canonicalDigest, digest, jsonDigest, keys } from './liveCommon.mjs';
 
 export const C5_INTENT_SCHEMA = 'ploinky.hwl-c5-invocation/v1';
 export const C5_DRIVER_SCHEMA = 'ploinky.hwl-c5-driver/v1';
@@ -37,10 +37,13 @@ export function productEngineDigest(info) {
 }
 
 // Whether the owned transport proves the driver's whole process group ended: its manifest operation was observed (a command is observed only
-// after its group is gone) and was not a forced settlement. Saved PIDs are never used and nothing is signalled.
+// after its group is gone) and the parent recorded on the invocation intent that the settlement was not forced. A parent that died between the
+// two leaves the settlement unproved. Saved PIDs are never used and nothing is signalled.
 export function driverSettled(run) {
     const op = [...run.operations].reverse().find(entry => entry?.kind === C5_DRIVER_NAME);
-    return Boolean(op && op.state === 'observed' && op.result && !op.result.settlementForced && !op.result.errorCode);
+    const intent = c5IntentOf(run);
+    const result = intent?.driverResult;
+    return Boolean(op && op.state === 'observed' && intent?.state === 'observed' && result && !result.settlementForced && !result.errorCode);
 }
 
 export function c5IntentOf(run) {
@@ -61,7 +64,7 @@ export function createC5Intent({ run, profile, driverReceiptName, argvDigest, pr
 }
 
 export function validateC5Intent(intent, run, profile) {
-    keys(intent, ['schema', 'id', 'kind', 'state', ...BINDING_KEYS, 'resourceIds'], 'C5 invocation');
+    keys(intent, ['schema', 'id', 'kind', 'state', ...BINDING_KEYS, 'resourceIds'], 'C5 invocation', ['driverResult']);
     if (intent.schema !== C5_INTENT_SCHEMA || intent.kind !== C5_INTENT_KIND || !['intent', 'observed'].includes(intent.state)
         || intent.id !== intent.invocationId || !RUN_ID.test(intent.invocationId) || intent.caseId !== 'LIVE-C5'
         || intent.runId !== run.runId || !profile.cases.includes('LIVE-C5') || intent.rootBoxId !== profile.box.id
@@ -240,7 +243,7 @@ export function generationReceipt({ intent, driver, journal, attempt, profile, r
     catch (error) { throw problem(`replacement does not match its recorded configuration (${String(error?.message || error).slice(0, 160)})`); }
     if (!bounded(raw.Created, 128) || !sameImage(handle.runtime.imageId, profile.box.image)) throw problem('replacement creation or image identity missing');
     return { schema: C5_BOX_SCHEMA, id: cid.id, created: raw.Created, image: handle.runtime.imageId,
-        contractDigest: jsonDigest({ labels: handle.labels, mounts: raw.Mounts }), instance: profile.box.instance, pathHash: profile.box.pathHash,
+        contractDigest: canonicalDigest({ labels: handle.labels, mounts: raw.Mounts }), instance: profile.box.instance, pathHash: profile.box.pathHash,
         predecessorId: profile.box.id, invocationId: intent.invocationId, productOperationId: journal.operationId,
         attemptId: attempt.attemptId, stage: attempt.stage, configurationRef: ref, cidDigest: digest(cid.bytes), provenance: C5_BOX_PROVENANCE };
 }

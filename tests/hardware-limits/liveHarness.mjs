@@ -264,7 +264,7 @@ export function createLiveAdapter(profile, {
             op.state = 'observed';
             // Only fixed observation commands return persisted output. Candidate
             // diagnostics may contain credentials; retain status flags alone.
-            op.result = { status: result.status, signal: result.signal, timedOut: result.timedOut, truncated: result.truncated, cancelled: result.cancelled, errorCode: result.errorCode, settlementForced: Boolean(result.settlementForced) };
+            op.result = { status: result.status, signal: result.signal, timedOut: result.timedOut, truncated: result.truncated, cancelled: result.cancelled, errorCode: result.errorCode };
             persist();
         }
         if (capture) {

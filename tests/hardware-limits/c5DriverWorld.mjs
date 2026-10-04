@@ -37,7 +37,7 @@ import { evaluateTemplate, fakeEngineInfo, inspectModel } from './fakeLiveEngine
 import { C5_INTENT_KIND, createC5Intent, exactContainerHandle, productEngineDigest, readPrivateC5File } from './liveBoxTransitionCustody.mjs';
 import { DRIVER_BOUNDS, driverParams, runDriver } from './liveStoreTransition.mjs';
 import { describeMutation } from './c5Mutation.mjs';
-import { INSPECT, OWNER_MARKER, engineIdentityDigest, jsonDigest } from './liveCommon.mjs';
+import { INSPECT, OWNER_MARKER, engineIdentityDigest, jsonDigest, liveSourceDigest } from './liveCommon.mjs';
 
 export const REPOSITORY = fs.realpathSync(new URL('../..', import.meta.url).pathname);
 const AGENT_REF = `${FIXTURE_REPOSITORY}/s`;
@@ -175,7 +175,9 @@ export function createDowngradeWorld({
     if (!reuseState) containers.set(old.id, { handle: old, created, graphRunning: boxRunning && graphRunning, logs: '' });
     // A world reloaded after a crash holds the containers the dead process left, rebuilt from their inspect documents.
     for (const entry of reuseState?.containers ?? []) {
-        const handle = exactContainerHandle(entry.raw, entry.id, engine.identity);
+        const frozen = exactContainerHandle(entry.raw, entry.id, engine.identity);
+        // The product's normalizer freezes the runtime; the stub engine moves a container between running and stopped.
+        const handle = { ...frozen, labels: { ...frozen.labels }, runtime: { ...frozen.runtime } };
         containers.set(entry.id, { handle, created: entry.created, graphRunning: entry.graphRunning, logs: '' });
     }
     // A crash test ends the process at a named point, after persisting what the process had done (the durable product records are on disk already).
@@ -334,7 +336,7 @@ export function createDowngradeWorld({
 }
 
 // The profile the harness would hold over this world.
-export function worldProfile(world, { runId, workspace, sourceDigest = `sha256:${'a'.repeat(64)}` }) {
+export function worldProfile(world, { runId, workspace, sourceDigest = liveSourceDigest(world.box.root) }) {
     const record = engineRecordFromHandle(world.oldHandle, { created: world.created });
     return {
         cases: ['LIVE-C5'], host: { home: world.home }, workspace, source: { root: world.box.root, digest: sourceDigest },
@@ -385,6 +387,12 @@ export async function runScenario(name, options = {}) {
     let params;
     if (name === 'transition') {
         params = driverParams({ mode: 'transition', profile, run, intent: intentFor(context), receiptPath, expectedToken: { epoch: token.epoch, revision: token.revision + (options.tokenRevisionOffset ?? 0) }, agentRef: AGENT_REF, bounds });
+    } else if (name === 'prepared') {
+        // The world exactly as the harness leaves it after it wrote the invocation intent and before any driver ran.
+        fs.writeFileSync(path.join(context.root, 'world_meta.json'), JSON.stringify({ runId: context.runId, root: context.root, home: context.home, workspace: context.workspace, profile, run: { runId: context.runId },
+            intent: intentFor(context), receiptPath, mode: name, hostPort: world.hostPort, mediaHostPort: world.mediaHostPort }));
+        world.persistState();
+        return { scenario: name, root: context.root, boxId: world.boxId, exitCode: 0, summary: { events: [] }, containers: [], store: {}, transitions: [], adminCalls: [], engineEvents: [] };
     } else if (name === 'writer-first') {
         const set = world.admin('POST', JSON.stringify({ action: 'set_agent_limits', expectedToken: token, agentRef: AGENT_REF, limits: { memoryPercent: 10 } }));
         if (JSON.parse(set.text).committed !== true) throw new Error('the writer-first policy was not committed');

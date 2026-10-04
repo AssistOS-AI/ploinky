@@ -181,7 +181,7 @@ export function createFakeStore({ base, workspace, home, faults = {}, lifecycle 
         const run = await world.withHome(() => runDriver(params, { baseRunner: world.runner, supervisor: world.makeSupervisor, programRoot: REPOSITORY }));
         syncEngineFromWorld();
         const summary = { ...run.summary };
-        const after = { params, summary, receiptPath: params.receiptPath, statePath: base.statePath };
+        const after = { params, summary, receiptPath: params.receiptPath, statePath: base.statePath, store: context() };
         if (faults.afterDriver) await faults.afterDriver(params.mode, after);
         if (faults.driverTimeout === params.mode) return ok(`${JSON.stringify(summary)}\n`, { status: null, signal: 'SIGTERM', timedOut: true });
         if (faults.driverForcedSettlement === params.mode) return ok(`${JSON.stringify(summary)}\n`, { status: null, signal: 'SIGKILL', settlementForced: true });

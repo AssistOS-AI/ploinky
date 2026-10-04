@@ -21,6 +21,10 @@ export const IMAGE_REF = /^[a-z0-9][a-z0-9.-]*(?::[0-9]+)?\/[a-z0-9._/-]+@sha256
 
 export const digest = value => `sha256:${crypto.createHash('sha256').update(value).digest('hex')}`;
 export const jsonDigest = value => digest(JSON.stringify(value));
+const canonical = value => (Array.isArray(value) ? value.map(canonical) : value && typeof value === 'object'
+    ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value);
+// The digest of a value independent of object key order (arrays keep theirs).
+export const canonicalDigest = value => digest(JSON.stringify(canonical(value)));
 
 export function keys(value, required, label, optional = []) {
     if (!value || Object.getPrototypeOf(value) !== Object.prototype

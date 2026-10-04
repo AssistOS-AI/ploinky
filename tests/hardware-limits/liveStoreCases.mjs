@@ -37,7 +37,7 @@ const sleepMs = milliseconds => new Promise(resolve => setTimeout(resolve, milli
 const processIsDead = pid => { try { process.kill(pid, 0); return false; } catch (error) { return error?.code === 'ESRCH'; } };
 
 export function createStoreCases({
-    profile, run, command, engine, inspectBox, safeArtifact, requireArtifact = () => {}, persist = () => {}, artifactPath = null, http = httpProbe, sleep = sleepMs, polling = storePolling, isDead = processIsDead, now = () => Date.now(),
+    profile, run, command, engine, inspectBox, safeArtifact, requireArtifact = () => {}, persist = () => {}, artifactPath = null, http = httpProbe, sleep = sleepMs, polling = storePolling, routerPolling = polling, isDead = processIsDead, now = () => Date.now(),
 }) {
     const agentRef = `${FIXTURE_REPOSITORY}/s`;
     const fail = (message, evidence = null) => Object.assign(new Error(message), evidence ? { evidence } : {});
@@ -309,7 +309,7 @@ export function createStoreCases({
 
             // ---- 8 to 10 the actual lifecycle ----------------------------------------------------------------------------------------------
             if (typeof artifactPath !== 'function') throw blocked('LIVE-C5 needs the runner\'s artifact-path factory for the lifecycle driver receipt');
-            const lifecycle = createLifecycle({ profile, run, command, engine, inspectBox, persist, artifactPath, http, sleep, polling, fail, adminState, setLimits, hostClear, view, agentRef });
+            const lifecycle = createLifecycle({ profile, run, command, engine, inspectBox, persist, artifactPath, http, sleep, polling, routerPolling, fail, adminState, setLimits, hostClear, view, agentRef });
             must('restart-on', await lifecycle.restartOn());
             const writerFirst = await lifecycle.writerFirst();
             must('writer-first', writerFirst);

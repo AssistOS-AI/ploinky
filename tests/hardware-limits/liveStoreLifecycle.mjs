@@ -11,7 +11,7 @@ import path from 'node:path';
 
 import { BOX_HARDWARE_MARKER_PATH, BOX_HARDWARE_STORE_PATH, BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { createHardwareGateStore } from '../../ploinky-box/hardwareLimitsGate.mjs';
-import { BOX_CONTRACT_INSPECT, ID, INSPECT, assertWorkspace, checkedJson, jsonDigest, observeEngineFacts } from './liveCommon.mjs';
+import { BOX_CONTRACT_INSPECT, ID, INSPECT, assertWorkspace, canonicalDigest, checkedJson, jsonDigest, observeEngineFacts } from './liveCommon.mjs';
 import {
     C5_DRIVER_NAME, createC5Intent, driverSettled, productEngineDigest, productTransitionIds, readDriverReceipt, reconcileC5Custody, sameImage,
 } from './liveBoxTransitionCustody.mjs';
@@ -55,7 +55,7 @@ export function assertWriterFirstRefusal(result, summary) {
     return null;
 }
 
-export function createLifecycle({ profile, run, command, engine, inspectBox, persist, artifactPath, http, sleep, polling, fail, adminState, setLimits, hostClear, view, agentRef }) {
+export function createLifecycle({ profile, run, command, engine, inspectBox, persist, artifactPath, http, sleep, polling, routerPolling = polling, fail, adminState, setLimits, hostClear, view, agentRef }) {
     const identity = () => assertWorkspace(profile);
     const gateEnabled = () => createHardwareGateStore({ homeDirectory: profile.host.home }).read(identity())?.enabled ?? null;
     const startDeadline = () => (Number.isInteger(run.deadlines?.startMs) ? run.deadlines.startMs : 1200000);
@@ -105,8 +105,8 @@ export function createLifecycle({ profile, run, command, engine, inspectBox, per
         const started = Date.now(); let last = null;
         for (;;) {
             try { return await adminState(); } catch (error) { last = error; }
-            if (Date.now() - started >= polling.deadlineMs) throw fail(`${label}: the Router's administrator route never answered`, { last: String(last?.message || last).slice(0, 200) });
-            await sleep(polling.intervalMs);
+            if (Date.now() - started >= routerPolling.deadlineMs) throw fail(`${label}: the Router's administrator route never answered`, { last: String(last?.message || last).slice(0, 200) });
+            await sleep(routerPolling.intervalMs);
         }
     }
 
@@ -169,7 +169,11 @@ export function createLifecycle({ profile, run, command, engine, inspectBox, per
         run.operations.push(intent); persist();
         const params = driverParams({ mode: 'transition', profile, run, intent, receiptPath, expectedToken: { epoch: token.epoch, revision: token.revision }, agentRef });
         const result = await command(C5_DRIVER_NAME, profile.node.path, driverArgv(profile, params), { gate: 'off', deadlineMs: TRANSITION_BOUNDS.lifecycleMs, tolerate: true, capture: 'c5-transition-driver' });
-        intent.state = 'observed'; persist();
+        // The owned transport's own proof of how the driver ended, kept on the invocation: cleanup never trusts a saved PID.
+        intent.state = 'observed';
+        intent.driverResult = { status: result.status, signal: result.signal, timedOut: Boolean(result.timedOut), truncated: Boolean(result.truncated), cancelled: Boolean(result.cancelled),
+            errorCode: result.errorCode ?? null, settlementForced: Boolean(result.settlementForced) };
+        persist();
         const summary = summaryOf(result);
         let receipt;
         try { receipt = readDriverReceipt(receiptPath, intent, profile); }
@@ -190,13 +194,13 @@ export function createLifecycle({ profile, run, command, engine, inspectBox, per
         const custody = await reconcileC5Custody({ run, profile, driver: receipt, driverSettled: driverSettled(run), engineIdentity: facts.product, ids, unrelatedIds: preInventory(), inspect: inspectFull, persist });
         const current = custody.current;
         if (!current || current.id !== receipt.finalContainerId || current.stage !== 'candidate' || custody.ids.length !== 2) throw fail('The committed final generation is not the one linked candidate generation of the bound product operation', { current, chain: custody.ids });
-        const final = await finalGeneration({ current, ids });
+        const final = await finalGeneration({ current, ids, token });
         return { invocationId, productOperationId: receipt.productOperationId, replies: summary.boundary?.replies ?? null, boundary: { reached: summary.boundary?.reached === true, events: summary.events.filter(event => /^(writer|retention|bound|boundary)/.test(event.kind)).map(({ kind, sequence, status, error, held, stage }) => ({ kind, sequence, status, error, held, stage })) },
             attempts: receipt.attempts, finalContainerId: receipt.finalContainerId, token, final, generations: run.ownedBoxes.filter(box => box.id !== profile.box.id), engine: { harness: facts.digest, product: facts.product } };
     }
 
     // ---- the replacement, inspected on its own ----
-    async function finalGeneration({ current, ids }) {
+    async function finalGeneration({ current, ids, token }) {
         if (ids.includes(profile.box.id)) throw fail('The old immutable Box ID is still present after the committed transition', { old: profile.box.id });
         const box = await inspectExact(current.id);
         const contract = checkedJson(await engine('c5-generation-contract', ['container', 'inspect', '--format', BOX_CONTRACT_INSPECT, current.id]));
@@ -208,7 +212,7 @@ export function createLifecycle({ profile, run, command, engine, inspectBox, per
             created: box.created === current.created,
             image: sameImage(box.image, profile.box.image) && sameImage(current.image, profile.box.image),
             owned: labels[BOX_LABELS.pathHash] === profile.box.pathHash && labels[BOX_LABELS.role] === 'box',
-            contract: jsonDigest({ labels, mounts }) === current.contractDigest,
+            contract: canonicalDigest({ labels, mounts }) === current.contractDigest,
             running: box.running === true,
             gateRecordOff: gateEnabled() === false,
             noHardwareLabel: !Object.hasOwn(labels, BOX_LABELS.hardwareLimits),
@@ -227,6 +231,7 @@ export function createLifecycle({ profile, run, command, engine, inspectBox, per
         if (login?.status !== 200) throw fail('The replacement Box\'s Router does not answer /auth/login with HTTP 200', { status: login?.status ?? null, error: login?.error ?? null });
         const host = await view(identity(), 'host', 'after the committed transition');
         if (host.count !== 0 || host.barrier || host.lock) throw fail('The store is not empty and free after the committed transition', { count: host.count, barrier: host.barrier, lock: host.lock });
+        if (tokenKey(host.token) !== tokenKey(token)) throw fail('The host store is not at the stamp T after the committed transition', { stamp: token, now: host.token });
         return { id: current.id, created: current.created, checks, router: login.status, gate: false, store: { token: host.token, count: host.count, barrier: null }, publications: contract.publications };
     }
 

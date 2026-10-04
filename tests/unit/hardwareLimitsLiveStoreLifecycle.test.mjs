@@ -16,13 +16,14 @@ import { C5_BOX_SCHEMA, C5_DRIVER_NAME, c5IntentOf, validateC5BoxReceipts } from
 import { WRITER_FIRST_CODE, assertWriterFirstRefusal, parseDriverSummary, transportProblem } from '../hardware-limits/liveStoreLifecycle.mjs';
 import { C5_CLEANUP_PROOF, C5_LIVE_ARTIFACTS, c5CleanupProofProblem, c5RequiredArtifacts } from '../hardware-limits/liveStage.mjs';
 import { writePrivateJson } from '../hardware-limits/fixtures.mjs';
-import { clearAgentLimits } from '../../cli/sandbox/hardwareLimits/store.mjs';
+import { clearAgentLimits, readStoreSnapshot, setAgentLimits } from '../../cli/sandbox/hardwareLimits/store.mjs';
+import { OVERRIDES } from '../hardware-limits/liveStoreCommands.mjs';
 
 const BLOCK = 'apparatus-store';
 const REPOSITORY = fs.realpathSync(new URL('../..', import.meta.url).pathname);
 const SECCOMP = fs.readFileSync(path.join(REPOSITORY, 'ploinky-box/seccomp/podman-nested-pid-fallback.json'));
 const real = ms => new Promise(resolve => setTimeout(resolve, ms));
-const SEAMS = { sleep: real, polling: { deadlineMs: 600, intervalMs: 20 }, http: async () => ({ status: 200, contentType: 'text/html', body: '' }) };
+const SEAMS = { sleep: real, polling: { deadlineMs: 15000, intervalMs: 20 }, routerPolling: { deadlineMs: 15000, intervalMs: 20 }, http: async () => ({ status: 200, contentType: 'text/html', body: '' }) };
 const LIFECYCLE_KEYS = ['restart-on', 'writer-first', 'writer-first-clear', 'transition-first', 'final-generation', 'c5-receipt'];
 
 async function liveWorld(t, { faults = {}, lifecycleFaults = {} } = {}) {
@@ -90,7 +91,8 @@ test('X5.c5-lifecycle-restart-on-writer-first-and-transition-first-pass-over-the
     const intent = c5IntentOf(w.run);
     const driverOp = operations.find(op => op.kind === C5_DRIVER_NAME);
     assert.ok(operations.indexOf(intent) >= 0 && operations.indexOf(intent) < operations.indexOf(driverOp), 'the intent is durable before the driver runs');
-    assert.deepEqual([intent.state, driverOp.state, driverOp.result.status, driverOp.result.settlementForced], ['observed', 'observed', 0, false]);
+    assert.deepEqual([intent.state, driverOp.state, driverOp.result.status, intent.driverResult.settlementForced], ['observed', 'observed', 0, false]);
+    assert.deepEqual(Object.keys(driverOp.result).sort(), ['cancelled', 'errorCode', 'signal', 'status', 'timedOut', 'truncated'], 'the journaled operation still keeps status flags only, never output')
     // The case installed and removed no barrier of its own in the new section: the only helper barrier calls are the diagnostic step 6.
     const programs = fake.model.programs.map(program => program.mode);
     assert.equal(programs.filter(mode => mode === 'barrier-begin').length, 1);
@@ -118,7 +120,7 @@ test('X5.c5-lifecycle-the-gate-on-restart-must-keep-the-original-box-and-answer-
     assert.match(replaced.report.cleanup.failures.join(' '), /Foreign replacement Box occupies workspace/);
     assert.equal(boxIds(replaced.context).length, 1);
     await fails(t, { faults: { restartExit: 1 } }, /The whole restart with the gate on: did not exit 0/);
-    await fails(t, { faults: { adminDownAfterRestart: true }, seams: { ...SEAMS, polling: { deadlineMs: 150, intervalMs: 20 } } }, /Router's administrator route never answered/);
+    await fails(t, { faults: { adminDownAfterRestart: true }, seams: { ...SEAMS, routerPolling: { deadlineMs: 150, intervalMs: 20 } } }, /Router's administrator route never answered/);
 });
 
 test('X5.c5-lifecycle-a-gate-off-restart-that-is-not-refused-in-the-writer-first-order-is-a-failure-and-no-mutation-reaches-the-engine', async t => {
@@ -158,6 +160,24 @@ test('X5.c5-lifecycle-a-timeout-is-never-a-pass-and-a-forced-settlement-preserve
     const forced = await fails(t, { faults: { driverForcedSettlement: 'transition' } }, /needed a forced settlement/, { cleanup: 'failed' });
     assert.match(forced.report.cleanup.failures.join(' '), /not proven settled by the owned transport/);
     assert.equal(boxIds(forced.context).length, 1, 'the replacement is preserved');
+});
+
+test('X5.c5-lifecycle-a-writer-first-refusal-that-moved-the-stamp-the-policy-or-the-box-is-a-failure-naming-what-changed', async t => {
+    const stamp = { faults: { afterDriver: (mode, { store }) => {
+        if (mode !== 'writer-first') return;
+        const snapshot = readStoreSnapshot({ paths: store.hostPaths, identity: store.identity });
+        setAgentLimits({ paths: store.hostPaths, identity: store.identity, expectedToken: snapshot.token, agentRef: 'hwlfixture/s', limits: OVERRIDES.high, installedRefs: new Set(['hwlfixture/s']),
+            capabilities: { gate: 'on', controllers: ['cpu', 'memory', 'pids'] }, envelope: { memoryBytes: 8 * 1024 ** 3, cpus: 4 }, actor: { id: 'test', name: 'test' }, lockOptions: { deadlineMs: 250 }, beforeCommit: () => true });
+    } } };
+    const moved = await fails(t, stamp, /The refused writer-first restart changed the Box, the policy, the stamp, the gate or the transitions/);
+    assert.deepEqual(moved.context.fake.model.driverRuns.map(entry => entry.mode), ['writer-first']);
+    // A Box whose process changed behind the refusal is a change as well, even though the typed refusal itself was right.
+    await fails(t, { faults: { afterDriver: (mode, { statePath }) => {
+        if (mode !== 'writer-first') return;
+        const file = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+        for (const box of Object.values(file.boxes)) box.pid = 4242;
+        fs.writeFileSync(statePath, JSON.stringify(file));
+    } } }, /The refused writer-first restart changed the Box, the policy, the stamp, the gate or the transitions/);
 });
 
 test('X5.c5-lifecycle-the-drivers-primary-assertion-failure-stays-the-answer-and-a-missing-or-altered-receipt-is-refused', async t => {
