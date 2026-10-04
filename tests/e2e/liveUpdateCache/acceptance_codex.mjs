@@ -96,7 +96,8 @@ export async function executeAcceptance({ manifest, inputs, createPorts, io = fs
     if (failure) return Object.freeze({ ...base, acceptance: 'FAIL', status: 'FAILED', exitCode: 1, reason: failure.reason, failedPhase: failure.phase, resourceDisposition: latch.snapshot().uncertain ? 'HANDOFF_REQUIRED' : 'OWNED_RESOURCES_RETAINED_FOR_REVIEW', retained: custody.snapshot().filter(row => !row.settled), recoveryRecord: failure.recovery });
     if (awaiting) return Object.freeze({ ...base, acceptance: 'UNQUALIFIED', status: 'AWAITING_RELEASE_FIXTURE', exitCode: 3, reason: 'release-fixture-absent', resourceDisposition: 'FUNCTIONAL_EPOCH_SETTLED' });
     assertPhaseReceipts({ runId, receipts });
-    const receipt = { ...base, acceptance: 'PASS', status: 'PASSED', exitCode: 0, gates: state.gates.map(gate => ({ name: gate.name, runId: gate.runId, discovered: gate.discovered, passed: gate.passed, skipped: gate.skipped, retries: gate.retries, ignoredErrors: gate.ignoredErrors })),
+    const receipt = { ...base, acceptance: 'PASS', status: 'PASSED', exitCode: 0, gates: state.gates.map(gate => ({ name: gate.name, runId: gate.runId, discovered: gate.discovered, passed: gate.passed, skipped: gate.skipped, retries: gate.retries, ignoredErrors: gate.ignoredErrors,
+            before: { generation: gate.before.generation, runtimes: gate.before.runtimes }, after: { generation: gate.after.generation, runtimes: gate.after.runtimes } })),
         candidate: { commit: manifest.candidate.commit, imageId: manifest.box.imageId }, resourceDisposition: 'OWNED_RESOURCES_CLOSED' };
     // A late finalization can never publish PASS: the budget is re-checked against the whole schedule before writing.
     if (timeline() > TOTAL_CAP_MS) return Object.freeze({ ...base, acceptance: 'FAIL', status: 'FAILED', exitCode: 1, reason: 'acceptance-budget-expired', failedPhase: 'U9', resourceDisposition: 'OWNED_RESOURCES_CLOSED' });

@@ -8,6 +8,7 @@ import { remainingGateWorkMs } from './gates_codex.mjs';
 // then created under its own grant. This module never deploys, destroys or recreates anything: it verifies that the
 // deployment now running is a different Box over a recreated workspace with the identical pushed commit map and
 // immutable image, admits it from scratch, and only then runs the three gates against it, in the fixed order.
+export const ONLYOFFICE_AGENT = 'onlyOffice';
 const identityOf = observed => `${observed.workspace.dev}:${observed.workspace.ino}`;
 const candidateOf = (observed, imageId) => ({ imageId, repositories: observed.candidate.repositories });
 
@@ -27,6 +28,11 @@ export function createReleasePhases(ctx) {
             generation: observed.activeGeneration, runtimes: observed.graph.map(row => [row.name, row.runtimeId, row.instanceId, row.enableGeneration]) });
     }
     const sameState = (left, right) => left.generation === right.generation && isDeepStrictEqual(left.runtimes, right.runtimes);
+    // The OnlyOffice gate restarts only the OnlyOffice agent (`ploinky restart onlyOffice`). Inside that window the edge
+    // generation and the row(s) identifying that agent may change; every other required runtime must be exactly as before.
+    const onlyOfficeRow = row => row[0].split('/').at(-1) === ONLYOFFICE_AGENT;
+    const restartWindowOk = (left, right) => left.runtimes.length === right.runtimes.length
+        && left.runtimes.every((row, index) => row[0] === right.runtimes[index][0] && (onlyOfficeRow(row) || isDeepStrictEqual(row, right.runtimes[index])));
     return {
         async U7c() {
             const functional = state.functional; need(functional, 'functional-epoch-missing');
@@ -54,12 +60,13 @@ export function createReleasePhases(ctx) {
                 // gate starts from an observed, refreshed epoch. Copilot and WebMeet must leave the epoch exactly as they found it.
                 let after;
                 if (gate === 'OnlyOffice') {
-                    after = await epoch(observer, release); const refreshed = await epoch(observer, release, { generation: after.generation }); need(sameState(refreshed, after), 'canonical-epoch-changed');
+                    after = await epoch(observer, release); need(restartWindowOk(before, after), 'canonical-epoch-changed'); const refreshed = await epoch(observer, release, { generation: after.generation }); need(sameState(refreshed, after), 'canonical-epoch-changed');
                 } else { after = await epoch(observer, release, { generation: known.generation }); need(sameState(after, before), 'canonical-epoch-changed'); }
                 known = after; gates.push({ ...row, before, after });
             }
             assertCanonicalGateResults({ release: state.release, gates }); state.gates = gates;
-            return { phase: 'U8', gates: gates.map(gate => ({ name: gate.name, runId: gate.runId, discovered: gate.discovered, passed: gate.passed, skipped: gate.skipped, retries: gate.retries, ignoredErrors: gate.ignoredErrors })) };
+            return { phase: 'U8', gates: gates.map(gate => ({ name: gate.name, runId: gate.runId, discovered: gate.discovered, passed: gate.passed, skipped: gate.skipped, retries: gate.retries, ignoredErrors: gate.ignoredErrors,
+                before: { generation: gate.before.generation, runtimes: gate.before.runtimes }, after: { generation: gate.after.generation, runtimes: gate.after.runtimes } })) };
         },
         async U9() {
             need(ctx.latchClean(), 'writers-not-quiescent');

@@ -54,7 +54,8 @@ test('a second invocation with the fresh fixture resumes at U7c, runs the gates 
     const h = build(); await h.run(); h.setRelease();
     const receipt = await h.run();
     assert.equal(receipt.acceptance, 'PASS', `${receipt.failedPhase}:${receipt.reason}`); assert.equal(receipt.exitCode, 0); assert.deepEqual(receipt.phases.map(row => row.phase), REQUIRED_PHASES); assert.ok(receipt.phases.every(row => row.status === 'PASS' && row.qualified === true));
-    assert.deepEqual(receipt.gates.map(gate => gate.name), ['Copilot', 'OnlyOffice', 'WebMeet']); assert.ok(receipt.gates.every(gate => gate.discovered === 1 && gate.passed === 1 && gate.skipped === 0 && gate.retries === 0));
+    assert.deepEqual(receipt.gates.map(gate => gate.name), ['Copilot', 'OnlyOffice', 'WebMeet']); assert.ok(receipt.gates.every(gate => gate.before.generation === 'g-1' && gate.after.generation === 'g-1' && gate.before.runtimes.length === 1 && gate.after.runtimes[0].length === 4), 'each gate\'s generation and runtime tuples are in the receipt');
+    assert.deepEqual(JSON.parse(h.io.files.get(h.manifest.evidence.receipt)).gates.map(gate => gate.before.generation), ['g-1', 'g-1', 'g-1']); assert.ok(receipt.gates.every(gate => gate.discovered === 1 && gate.passed === 1 && gate.skipped === 0 && gate.retries === 0));
     assert.equal(h.io.files.has(h.manifest.evidence.receipt), true); assert.equal(JSON.parse(h.io.files.get(h.manifest.evidence.receipt)).acceptance, 'PASS');
     assert.equal(h.world.calls.filter(call => call.startsWith('update:')).length, 2, 'the resumed run performs no second functional update');
     assert.ok(receipt.budget.elapsedMs <= TOTAL_CAP_MS); assert.doesNotMatch(JSON.stringify(receipt), /PRIVATE|\/ws\//);

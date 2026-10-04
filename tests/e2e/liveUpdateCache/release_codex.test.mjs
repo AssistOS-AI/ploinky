@@ -16,18 +16,20 @@ function releaseManifestFrom(manifest, patch = () => {}) {
     patch(release); return validateManifest(release);
 }
 
-function build({ faults = {}, patch } = {}) {
-    const { value: manifest } = manifestFixture(), release = releaseManifestFrom(manifest, patch), calls = []; let wall = Date.parse('2026-10-04T12:30:30Z');
-    const observedFor = (m, generation = 'g-1', tag = 0) => { const expected = expectedLiveFromManifest(m);
+function build({ faults = {}, patch, withOnlyOffice = true } = {}) {
+    const { value: manifest } = manifestFixture(); if (withOnlyOffice) manifest.graph.push({ name: 'OnlyOfficeAgent/onlyOffice', repository: 'AssistOSExplorer', noWait: false, externalHealthRequired: false, declaredEnableFlags: [], manifestSha256: H('onlyoffice-manifest') });
+    const release = releaseManifestFrom(manifest, patch), calls = []; let wall = Date.parse('2026-10-04T12:30:30Z');
+    const observedFor = (m, generation = 'g-1', tag = 0, rowTags = {}) => { const expected = expectedLiveFromManifest(m);
         return { hostPlatform: 'linux', engine: 'podman', rootless: true, running: true, initialized: true, activeGeneration: generation, pendingActivation: false, recoveryBarrier: false, workspace: { ...expected.workspace }, box: { ...expected.box },
             candidate: structuredClone(expected.candidate), publications: expected.publications, sourceMounts: expected.sourceMounts, engineIdentity: expected.engineIdentity,
-            graph: m.graph.map(entry => ({ name: entry.name, graphGeneration: generation, running: true, runtimeId: `r${tag}`, instanceId: 'i', enableGeneration: 'e', ready: faults.notReady !== true, externalHealth: true, noWaitState: null })) }; };
+            graph: m.graph.map(entry => ({ name: entry.name, graphGeneration: generation, running: true, runtimeId: `r${tag + (rowTags[entry.name] ?? 0)}`, instanceId: 'i', enableGeneration: 'e', ready: faults.notReady !== true, externalHealth: true, noWaitState: null })) }; };
     let gateIndex = 0, observeCalls = 0;
     const ports = { release: { async load() { calls.push('load'); return release; },
             observerFor: m => ({ admit: async () => { calls.push('admit'); return { phase: 'U0', admitted: true, activeGeneration: 'g-1', runtimes: 1 }; },
                 observe: async () => { calls.push('observe'); observeCalls += 1;
                     const generation = faults.driftOnObserve === observeCalls ? 'g-drift' : `g-${1 + (faults.generationMoves ?? []).filter(n => n <= gateIndex).length}`;
-                    const observed = observedFor(m, generation, (faults.runtimeReplacedAfter ?? []).filter(n => n <= gateIndex).length + (faults.runtimeDriftOnObserve === observeCalls ? 100 : 0)); if (faults.boxChangesAfterGate !== undefined && gateIndex === faults.boxChangesAfterGate) observed.box.id = H('other-box'); return observed; } }) },
+                    const rowTags = {}; for (const entry of faults.runtimeReplacedRows ?? []) if (entry.after <= gateIndex) for (const name of entry.rows) rowTags[name] = (rowTags[name] ?? 0) + 1;
+                    const observed = observedFor(m, generation, (faults.runtimeReplacedAfter ?? []).filter(n => n <= gateIndex).length + (faults.runtimeDriftOnObserve === observeCalls ? 100 : 0), rowTags); if (faults.boxChangesAfterGate !== undefined && gateIndex === faults.boxChangesAfterGate) observed.box.id = H('other-box'); return observed; } }) },
         gates: { async run(gate) { calls.push(`gate:${gate}`); gateIndex += 1; wall += 1000; const base = { name: gate, runId: `r-${gate}`, discovered: 1, passed: 1, failed: 0, skipped: 0, retries: 0, ignoredErrors: 0, closed: true, startedAt: new Date(wall).toISOString(), finishedAt: new Date(wall + 500).toISOString() };
             return faults.skipGate === gate ? { ...base, passed: 0, skipped: 1 } : base; } },
         browser: { async close() { calls.push('browser-close'); return { closed: true }; }, openContexts: () => faults.openContext ? 1 : 0 }, custody: { snapshot: () => [{ settled: faults.unsettled !== true }] },
@@ -77,10 +79,24 @@ test('release gates refuse an unready fixture, a changed outer Box, a skipped ga
 test('the epoch may move only inside the OnlyOffice bracket: generation and runtime tuples hold across Copilot, between gates and across WebMeet', async () => {
     const run = async faults => { const h = build({ faults }); await h.phases.U7c(); await h.phases.U8(); return h; };
     // Observation order after U7c: Copilot before(2) after(3); OnlyOffice before(4) after(5) refresh(6); WebMeet before(7) after(8).
-    const allowed = await run({ generationMoves: [2], runtimeReplacedAfter: [2] });
+    const OO = 'OnlyOfficeAgent/onlyOffice', EX = 'AssistOSExplorer/explorer';
+    const allowed = await run({ generationMoves: [2], runtimeReplacedRows: [{ after: 2, rows: [OO] }] });
     assert.deepEqual(allowed.state.gates.map(gate => [gate.before.generation, gate.after.generation]), [['g-1', 'g-1'], ['g-1', 'g-2'], ['g-2', 'g-2']]);
-    assert.notEqual(allowed.state.gates[1].after.runtimes[0][1], allowed.state.gates[1].before.runtimes[0][1], 'the targeted restart replaced the runtime inside its bracket');
-    assert.equal(allowed.state.gates[2].before.runtimes[0][1], allowed.state.gates[1].after.runtimes[0][1], 'WebMeet starts from the refreshed epoch');
+    const rowOf = (gate, side, name) => allowed.state.gates[gate][side].runtimes.find(row => row[0] === name);
+    assert.notEqual(rowOf(1, 'after', OO)[1], rowOf(1, 'before', OO)[1], 'the targeted restart replaced the OnlyOffice runtime inside its bracket'); assert.deepEqual(rowOf(1, 'after', EX), rowOf(1, 'before', EX), 'no other runtime moved');
+    assert.deepEqual(rowOf(2, 'before', OO), rowOf(1, 'after', OO), 'WebMeet starts from the refreshed epoch');
+    // Each gate's generation and tuples are persisted in the phase evidence.
+    const evidence = await (async () => { const h = build({ faults: { generationMoves: [2], runtimeReplacedRows: [{ after: 2, rows: [OO] }] } }); await h.phases.U7c(); return h.phases.U8(); })();
+    assert.deepEqual(evidence.gates.map(gate => [gate.name, gate.before.generation, gate.after.generation]), [['Copilot', 'g-1', 'g-1'], ['OnlyOffice', 'g-1', 'g-2'], ['WebMeet', 'g-2', 'g-2']]);
+    assert.ok(evidence.gates.every(gate => gate.before.runtimes.length === 2 && gate.after.runtimes.every(row => row.length === 4)));
+    // A generation change alone (a restart that replaced no runtime) is still inside the window.
+    await run({ generationMoves: [2] });
+    for (const [label, faults, options] of [['non-OnlyOffice runtime replaced in the OnlyOffice window', { runtimeReplacedRows: [{ after: 2, rows: [EX] }] }], ['every runtime replaced in the OnlyOffice window', { runtimeReplacedAfter: [2] }],
+        ['OnlyOffice and another runtime replaced together', { runtimeReplacedRows: [{ after: 2, rows: [OO, EX] }] }], ['OnlyOffice runtime replaced during Copilot', { runtimeReplacedRows: [{ after: 1, rows: [OO] }] }],
+        ['OnlyOffice runtime replaced during WebMeet', { runtimeReplacedRows: [{ after: 3, rows: [OO] }] }], ['a restart in a graph without an OnlyOffice agent', { runtimeReplacedRows: [{ after: 2, rows: [EX] }] }, { withOnlyOffice: false }],
+        ['a runtime replaced when no OnlyOffice agent is required', { runtimeReplacedAfter: [2] }, { withOnlyOffice: false }]]) {
+        const h = build({ faults, ...(options ?? {}) }); await h.phases.U7c(); await assert.rejects(h.phases.U8(), error => /canonical-epoch-changed|workspace-not-live|live-binding-mismatch/.test(error.code), label);
+    }
     for (const [label, faults] of [['generation moves during Copilot', { generationMoves: [1] }], ['generation moves during WebMeet', { generationMoves: [3] }], ['runtime replaced during Copilot', { runtimeReplacedAfter: [1] }], ['runtime replaced during WebMeet', { runtimeReplacedAfter: [3] }],
         ['drift before OnlyOffice', { driftOnObserve: 4 }], ['unstable refresh after OnlyOffice', { driftOnObserve: 6 }], ['drift before WebMeet', { driftOnObserve: 7 }], ['drift after WebMeet', { driftOnObserve: 8 }], ['drift before Copilot', { driftOnObserve: 2 }],
         ['runtime-only drift in the OnlyOffice refresh', { runtimeDriftOnObserve: 6 }], ['runtime-only drift before WebMeet', { runtimeDriftOnObserve: 7 }], ['runtime-only drift before OnlyOffice', { runtimeDriftOnObserve: 4 }]]) {
