@@ -31,7 +31,7 @@ function build(faults = {}, { files = {} } = {}) {
     if (faults.slowAdmit) { const original = ports.observer.admit; ports.observer.admit = async () => { time.t += PHASE_CAPS_MS.U0 + 1; return original(); }; }
     if (faults.silentLatch) { const original = ports.cache.cli; ports.cache.cli = async (...args) => { latch.stop('worker-error'); return original(...args); }; }
     if (faults.slowPhase) { const original = ports.fixture.prepare; ports.fixture.prepare = async () => { time.t += PHASE_CAPS_MS[faults.slowPhase] + 1; return original(); }; }
-    Object.assign(ports, { custody, browser: { ...ports.browser, async close() { closes.push('close'); return { closed: true }; }, openContexts: () => 0 }, 
+    Object.assign(ports, { custody, browser: { ...ports.browser, async close() { closes.push('close'); return { closed: true }; }, openContexts: () => 0 },
         release: { async load() { return release; }, observerFor: m => ({ admit: async () => ({ phase: 'U0', admitted: true, activeGeneration: 'g-1', runtimes: 1 }), observe: async () => observedFor(m) }) },
         gates: { async run(gate) { wallAtGate += 1000; const wall = clock.wall() + wallAtGate; time.t += faults.gateMs ?? 0; return { name: gate, runId: `r-${gate}`, discovered: 1, passed: faults.skipGate === gate ? 0 : 1, failed: 0, skipped: faults.skipGate === gate ? 1 : 0, retries: 0, ignoredErrors: 0, closed: true, startedAt: new Date(wall).toISOString(), finishedAt: new Date(wall + 500).toISOString() }; } }, close: async () => { closes.push('ports-close'); } });
     const inputs = { probeAgentImage: 'x', releaseManifest: '/r.json', expectedUpdates: h.ctx.inputs.expectedUpdates };

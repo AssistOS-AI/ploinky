@@ -46,7 +46,7 @@ test('an exception after a command was launched is a failed run needing hand-off
     const { expectationFixture } = await import('./test_support_codex.mjs'); const { expected } = expectationFixture(value);
     const file = `${value.evidence.root}/inputs_codex.json`, bytes = Buffer.from(JSON.stringify({ schemaVersion: 1, runId: value.runId, probeAgentImage: `docker.io/library/node@sha256:${'a'.repeat(64)}`, releaseManifest: '/home/skutner/work/release/m_codex.json', expectedUpdates: { 'normal-update': expected, 'settling-update': expected } }));
     const { createMemoryFs } = await import('./fake_fs_support_codex.mjs'); const io = createMemoryFs({ [file]: bytes });
-    const launched = createRunEnvironment(); const child = { pid: 77 }; 
+    const launched = createRunEnvironment(); const child = { pid: 77 };
     const afterLaunch = await runAcceptance(value, { manifestPath: '/m_codex.json', io, hostFacts, environment: launched, execute: async () => { launched.custody.retain(child, { operation: 'x', runId: value.runId }); throw Object.assign(new Error('PRIVATE'), { code: 'phase-budget-expired' }); } });
     assert.equal(afterLaunch.acceptance, 'FAIL'); assert.equal(afterLaunch.exitCode, 1); assert.equal(afterLaunch.reason, 'phase-budget-expired'); assert.equal(afterLaunch.resourceDisposition, 'HANDOFF_REQUIRED'); assert.deepEqual(afterLaunch.retained.map(row => row.pid), [77]); assert.doesNotMatch(JSON.stringify(afterLaunch), /PRIVATE/);
     const dirty = createRunEnvironment(); dirty.latch.stop('worker-error');
