@@ -34,7 +34,7 @@ import { ADMIN_REQUEST } from './liveGpuCommands.mjs';
 import { BOX_PRODUCT_ROOT, STORE_PROGRAM } from './liveStoreCommands.mjs';
 import { FIXTURE_REPOSITORY } from './liveFixture.mjs';
 import { evaluateTemplate, fakeEngineInfo, inspectModel } from './fakeLiveEngine.mjs';
-import { C5_INTENT_KIND, createC5Intent, productEngineDigest, readPrivateC5File } from './liveBoxTransitionCustody.mjs';
+import { C5_INTENT_KIND, createC5Intent, exactContainerHandle, productEngineDigest, readPrivateC5File } from './liveBoxTransitionCustody.mjs';
 import { DRIVER_BOUNDS, driverParams, runDriver } from './liveStoreTransition.mjs';
 import { describeMutation } from './c5Mutation.mjs';
 import { INSPECT, OWNER_MARKER, engineIdentityDigest, jsonDigest } from './liveCommon.mjs';
@@ -46,16 +46,18 @@ const ENGINE_HOST = Object.freeze({ arch: 'test', os: 'linux', hostname: 'fake-e
 const hex = value => crypto.createHash('sha256').update(String(value)).digest('hex');
 
 // ---- the Box as the product's own contract validators see it (shaped like the gate tests' fixture) ----
-export function completeBoxFixture({ root, identity }) {
+export function completeBoxFixture({ root, identity, linkProduct = true }) {
     const seccomp = nestedPodmanSeccompProfilePath(root);
+    const profile = fs.readFileSync(new URL('../../ploinky-box/seccomp/podman-nested-pid-fallback.json', import.meta.url));
     fs.mkdirSync(path.dirname(seccomp), { recursive: true });
-    fs.copyFileSync(new URL('../../ploinky-box/seccomp/podman-nested-pid-fallback.json', import.meta.url), seccomp);
+    // A source tree that already carries the profile (a frozen fixture source) is left byte for byte as it is.
+    if (!fs.existsSync(seccomp) || !fs.readFileSync(seccomp).equals(profile)) fs.writeFileSync(seccomp, profile);
     // The host store program loads the product's own modules from this root.
-    if (!fs.existsSync(path.join(root, 'cli'))) fs.symlinkSync(path.join(REPOSITORY, 'cli'), path.join(root, 'cli'));
+    if (linkProduct && !fs.existsSync(path.join(root, 'cli'))) fs.symlinkSync(path.join(REPOSITORY, 'cli'), path.join(root, 'cli'));
     return { root, identity, agentLib: agentLibFixture(identity.workspaceRoot) };
 }
 
-export function completeHandle(box, hardware, { id = 'e'.repeat(64), imageId = 'd'.repeat(64), running = true, hostPort = 8090 } = {}) {
+export function completeHandle(box, hardware, { id = 'e'.repeat(64), imageId = 'd'.repeat(64), running = true, hostPort = 8090, mediaHostPort = 7882, imageRef = BOX_IMAGE_REFERENCE } = {}) {
     return {
         kind: 'container', engine: 'podman', engineIdentity: 'engine', name: box.identity.instance, pathHash: box.identity.pathHash,
         id,
@@ -63,9 +65,9 @@ export function completeHandle(box, hardware, { id = 'e'.repeat(64), imageId = '
             ...agentLibFixtureLabels(box.agentLib),
             [BOX_LABELS.pathHash]: box.identity.pathHash,
             [BOX_LABELS.role]: 'box',
-            [BOX_LABELS.imageRef]: BOX_IMAGE_REFERENCE,
+            [BOX_LABELS.imageRef]: imageRef,
             [BOX_LABELS.routerHostPort]: String(hostPort),
-            [BOX_LABELS.mediaHostPort]: '7882',
+            [BOX_LABELS.mediaHostPort]: String(mediaHostPort),
             [BOX_LABELS.seccompFingerprint]: nestedPodmanSeccompProfileContract(box.root).fingerprint,
             [BOX_LABELS.dependenciesFingerprint]: 'd'.repeat(64),
             [BOX_LABELS.imagesFingerprint]: 'f'.repeat(64),
@@ -85,7 +87,7 @@ export function completeHandle(box, hardware, { id = 'e'.repeat(64), imageId = '
                 PLOINKY_ROUTER_HEALTH_SOCKET: BOX_ROUTER_HEALTH_SOCKET, HOSTNAME: id.slice(0, 12),
             },
             publications: [
-                { containerPort: '7882', protocol: 'udp', hostIp: '0.0.0.0', hostPort: '7882' },
+                { containerPort: '7882', protocol: 'udp', hostIp: '0.0.0.0', hostPort: String(mediaHostPort) },
                 { containerPort: '8080', protocol: 'tcp', hostIp: '127.0.0.1', hostPort: String(hostPort) },
             ],
             running, status: running ? 'running' : 'exited', init: true, usernsMode: 'private', privileged: false,
@@ -150,26 +152,38 @@ export function createWorkspace(root, runId) {
 
 export function createDowngradeWorld({
     root, workspace, home, identity: givenIdentity = null, runId, boxId = 'e'.repeat(64), created = '2026-10-04T00:00:00.000000000Z', boxRunning = true, graphRunning = true,
-    faults = {}, engineHost = ENGINE_HOST, hostPort = 8090,
+    faults = {}, engineHost = ENGINE_HOST, hostPort = 8090, mediaHostPort = 7882, repositoryRoot = null, linkProduct = true, imageRef = BOX_IMAGE_REFERENCE, killAt = null, reuseState = null,
 } = {}) {
+    fs.mkdirSync(root, { recursive: true });
     const identity = givenIdentity ?? buildWorkspaceIdentity(workspace.path);
     const previousHome = process.env.HOME;
     process.env.HOME = home;
     const gateStore = createHardwareGateStore({ homeDirectory: home });
     const lockFor = { assertHeld: instance => { if (instance !== identity.instance) throw new Error('lock instance'); } };
-    gateStore.write(identity, true, lockFor);
+    if (!reuseState) gateStore.write(identity, true, lockFor);
     const wiring = resolveDesiredHardwareWiring({ identity, enabled: true, homeDirectory: home, initializeStore });
-    const boxRoot = path.join(root, 'repository');
+    const boxRoot = repositoryRoot ?? path.join(root, 'repository');
     fs.mkdirSync(boxRoot, { recursive: true });
-    const box = completeBoxFixture({ root: boxRoot, identity });
-    writeGraphSkillScope(identity, buildHostSkillScope(identity.workspaceRoot, identity.workspaceRoot), lockFor);
+    const box = completeBoxFixture({ root: boxRoot, identity, linkProduct });
+    if (!reuseState) writeGraphSkillScope(identity, buildHostSkillScope(identity.workspaceRoot, identity.workspaceRoot), lockFor);
     const info = fakeEngineInfo(engineHost);
     const engine = { name: 'podman', identity: productEngineDigest(info), hostKind: 'native-linux' };
     const containers = new Map();
     const events = [];
-    const old = completeHandle(box, wiring, { id: boxId, running: boxRunning, hostPort });
+    const old = completeHandle(box, wiring, { id: boxId, running: boxRunning, hostPort, mediaHostPort, imageRef });
     old.engineIdentity = engine.identity;
-    containers.set(old.id, { handle: old, created, graphRunning: boxRunning && graphRunning, logs: '' });
+    if (!reuseState) containers.set(old.id, { handle: old, created, graphRunning: boxRunning && graphRunning, logs: '' });
+    // A world reloaded after a crash holds the containers the dead process left, rebuilt from their inspect documents.
+    for (const entry of reuseState?.containers ?? []) {
+        const handle = exactContainerHandle(entry.raw, entry.id, engine.identity);
+        containers.set(entry.id, { handle, created: entry.created, graphRunning: entry.graphRunning, logs: '' });
+    }
+    // A crash test ends the process at a named point, after persisting what the process had done (the durable product records are on disk already).
+    const persistState = () => fs.writeFileSync(path.join(root, 'world_state.json'), JSON.stringify({
+        containers: [...containers].map(([id, entry]) => ({ id, created: entry.created, graphRunning: entry.graphRunning, raw: rawInspectFromHandle(entry.handle, { created: entry.created }) })), events,
+    }));
+    const die = () => { persistState(); process.kill(process.pid, 'SIGKILL'); };
+    const onStep = name => { if (killAt === `step:${name}`) die(); };
     const paths = hardwareStorePaths({ identity, homeDirectory: home });
     const adminCalls = [];
     let createFailed = false;
@@ -201,16 +215,26 @@ export function createDowngradeWorld({
     function storeProgram(args) {
         const at = args.length - 1;
         const params = JSON.parse(args[at]);
-        if (params.domain === 'box') { params.root = box.root; params.storeRoot = paths.storeRoot; }
+        if (params.domain === 'box') { params.root = REPOSITORY; params.storeRoot = paths.storeRoot; }
         const words = [...args.slice(args.indexOf('--input-type=module'), at), JSON.stringify(params)];
         const result = spawnSync(process.execPath, words, { cwd: identity.workspaceRoot, env: { PATH: process.env.PATH, HOME: home, TMPDIR: process.env.TMPDIR ?? '/tmp' }, encoding: 'utf8' });
         return { ok: result.status === 0, status: result.status ?? 1, stdout: result.stdout, stderr: result.stderr, error: null, signal: result.signal };
     }
 
     const running = id => containers.get(id)?.handle.runtime.running === true;
+    const kindOf = args => (args.includes('/opt/ploinky/bin/ploinky-local') ? 'graph-stop' : args[0] === 'container' && args[1] === 'stop' ? 'box-stop' : args[0] === 'container' && args[1] === 'rm' ? 'box-remove'
+        : args.includes('--cidfile') ? 'box-create' : args[0] === 'container' && args[1] === 'start' ? 'box-start' : null);
     const runner = {
         run(_command, args) {
             const id = args[args.length - 1];
+            const kind = kindOf(args);
+            if (kind && killAt === `${kind}:before`) die();
+            const result = runner.perform(id, args);
+            if (kind) persistState();
+            if (kind && killAt === `${kind}:after`) die();
+            return result;
+        },
+        perform(id, args) {
             if (faults.failFirstGateOffCreate && args.includes('--cidfile') && !createFailed && !args.some(arg => String(arg).startsWith(`${BOX_LABELS.hardwareLimits}=`))) {
                 createFailed = true;
                 throw Object.assign(new Error('injected engine failure: container create'), { code: 'EINJECTED' });
@@ -234,7 +258,7 @@ export function createDowngradeWorld({
                 const newId = faults.createdId ?? crypto.randomBytes(32).toString('hex');
                 fs.writeFileSync(args[args.indexOf('--cidfile') + 1], `${newId}\n`);
                 const gateOn = args.some(arg => String(arg).startsWith(`${BOX_LABELS.hardwareLimits}=`));
-                const handle = completeHandle(box, gateOn ? wiring : null, { id: newId, running: false, hostPort });
+                const handle = completeHandle(box, gateOn ? wiring : null, { id: newId, running: false, hostPort, mediaHostPort, imageRef });
                 handle.engineIdentity = engine.identity;
                 containers.set(newId, { handle, created: `2026-10-04T00:00:${String(containers.size + 10).padStart(2, '0')}.000000000Z`, graphRunning: false, logs: '' });
                 events.push(`box-create:${gateOn ? 'gate-on' : 'gate-off'}`);
@@ -287,7 +311,7 @@ export function createDowngradeWorld({
             env: { PLOINKY_BOX_HARDWARE_LIMITS: 'off' }, resolveIdentity: () => identity, launchCwd: identity.workspaceRoot, repositoryRoot: box.root,
             lockManager: lockManager(), discover: () => ownership(), runner: decorated,
             selectAgentLib: async () => ({ selection: box.agentLib, mode: 'local' }),
-            reconcile: async () => ({ action: 'reused', ownership: ownership(), hostPort, mediaHostPort: 7882, hardware: null }),
+            reconcile: async () => ({ action: 'reused', ownership: ownership(), hostPort, mediaHostPort, hardware: null }),
             captureCoreStartArgv: () => ['start', 'explorer', String(hostPort)],
             readEdgeDesired: () => null, resolveHostReachableIpv4: async () => '192.168.1.12',
             runCoreCommand: async (_engine, containerId, argv) => { const entry = containers.get(containerId); entry.graphRunning = true; events.push(`core:${argv.join(' ')}`); },
@@ -301,8 +325,10 @@ export function createDowngradeWorld({
     }
     return {
         root, identity, home, box, wiring, engine, info, containers, events, adminCalls, paths, gateStore, runner, makeSupervisor, admin, running,
-        boxId, created, restoreHome: () => { process.env.HOME = previousHome; },
-        engineIdentityDigest: engineIdentityDigest(info, null), oldHandle: old,
+        boxId, created, hostPort, mediaHostPort, restoreHome: () => { process.env.HOME = previousHome; },
+        // The product resolves host state from HOME; an in-process caller sets it only while the world runs.
+        async withHome(fn) { const before = process.env.HOME; process.env.HOME = home; try { return await fn(); } finally { process.env.HOME = before; } },
+        engineIdentityDigest: engineIdentityDigest(info, null), oldHandle: old, onStep, persistState,
         transitionIds: () => createTransitionStore({ identity, homeDirectory: home }).listPending().map(journal => journal.operationId),
     };
 }
@@ -320,13 +346,23 @@ export function worldProfile(world, { runId, workspace, sourceDigest = `sha256:$
 
 // ---- standalone scenarios ----
 
+// The world a crashed scenario left behind, reloaded in THIS process: the durable product records on disk and the containers the dead process had.
+export function reloadWorld(root, { faults = {} } = {}) {
+    const meta = JSON.parse(fs.readFileSync(path.join(root, 'world_meta.json'), 'utf8'));
+    const reuseState = JSON.parse(fs.readFileSync(path.join(root, 'world_state.json'), 'utf8'));
+    const world = createDowngradeWorld({ root, workspace: meta.workspace, home: meta.home, runId: meta.runId, boxId: meta.profile.box.id, created: meta.profile.box.created,
+        hostPort: meta.hostPort, mediaHostPort: meta.mediaHostPort, linkProduct: false, faults, reuseState });
+    world.restoreHome();
+    return { meta, world, profile: meta.profile };
+}
+
 export function standalone(scenarioOptions = {}) {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(process.env.C5_WORLD_TMP || os.tmpdir(), 'c5w-')));
     const runId = crypto.randomBytes(16).toString('hex');
     const workspace = createWorkspace(root, runId);
     const home = path.join(root, 'home');
     fs.mkdirSync(home, { mode: 0o700 });
-    const world = createDowngradeWorld({ root, workspace, home, runId, ...scenarioOptions });
+    const world = createDowngradeWorld({ root, workspace, home, runId, linkProduct: false, ...scenarioOptions });
     const profile = worldProfile(world, { runId, workspace });
     const run = { runId, operations: [], ownedBoxes: [], target: { execution: profile } };
     return { root, runId, workspace, home, world, profile, run };
@@ -357,7 +393,11 @@ export async function runScenario(name, options = {}) {
         params = driverParams({ mode: 'destroy', profile, run, expectedContainerId: options.expectedContainerId === undefined ? world.boxId : options.expectedContainerId, bounds });
     } else throw new Error(`unknown scenario ${name}`);
     const before = { ids: [...world.containers.keys()], transitions: world.transitionIds(), adminCalls: world.adminCalls.length };
-    const result = await runDriver(params, { baseRunner: world.runner, supervisor: world.makeSupervisor });
+    // Meta for a test that reloads this world after a crash: everything the harness would hold about it.
+    fs.writeFileSync(path.join(context.root, 'world_meta.json'), JSON.stringify({ runId: context.runId, root: context.root, home: context.home, workspace: context.workspace, profile, run: { runId: context.runId },
+        intent: params.intent, receiptPath, mode: name, hostPort: world.hostPort, mediaHostPort: world.mediaHostPort }));
+    world.persistState();
+    const result = await runDriver(params, { baseRunner: world.runner, supervisor: world.makeSupervisor, programRoot: REPOSITORY, onStep: world.onStep });
     let receipt = null;
     if (name === 'transition') receipt = readPrivateC5File(receiptPath);
     const after = readStoreSnapshot({ paths: world.paths, identity: world.identity });

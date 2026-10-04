@@ -18,6 +18,7 @@
 // from the n-th host clear on, the quarantined locks are removed), stopExit (the host stop exits with that status), hostIgnoresBarrier (the host clear does not see the
 // barrier), rejectPost (n: the n-th in-Box write is answered 422), stopKeepsBoxRunning (the stop returns but the Box keeps running).
 import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
@@ -25,6 +26,8 @@ import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { HardwareStoreError, assertPolicyWritesAllowed, clearAgentLimits, hardwareStorePaths, initializeStore, readStoreSnapshot, setAgentLimits } from '../../cli/sandbox/hardwareLimits/store.mjs';
 import { withStaleStoreLockRecovery } from '../../cli/sandbox/hardwareLimits/storeLock.mjs';
 import { ADMIN_REQUEST } from './liveGpuCommands.mjs';
+import { createDowngradeWorld, engineRecordFromHandle, rawInspectFromHandle, REPOSITORY } from './c5DriverWorld.mjs';
+import { runDriver } from './liveStoreTransition.mjs';
 import { tokenKey } from './liveStoreCommands.mjs';
 import { FIXTURE_REPOSITORY } from './liveFixture.mjs';
 import { STORE_PROGRAM } from './liveStoreCommands.mjs';
@@ -34,7 +37,12 @@ const failed = (stderr, status = 1) => ok('', { status, stderr });
 const REPOSITORY_ROOT = fs.realpathSync(new URL('../..', import.meta.url).pathname);
 const ENVELOPE = Object.freeze({ memoryBytes: 8 * 1024 ** 3, cpus: 4 });
 
-export function createFakeStore({ base, workspace, home, faults = {} }) {
+// `lifecycle` (optional) turns on the actual-lifecycle model: { source, ports }. The Box the fake engine creates at `start` then carries the labels and
+// mounts the product's own contract validators accept, and the driver (liveStoreTransition.mjs) runs for real, in-process, over the product's REAL
+// supervisor, transition and store with a stub engine behind the supervisor's runner (c5DriverWorld.mjs). The fake engine's container table follows
+// that world's after every driver run. Faults: lifecycle.world (faults of the stub engine), restartExit, restartReplacesBox, adminDownAfterRestart,
+// beforeDriver(mode, context) and afterDriver(mode, context), driverTimeout (a mode), driverForcedSettlement (a mode).
+export function createFakeStore({ base, workspace, home, faults = {}, lifecycle = null }) {
     // The workspace exists only once provisioning created it, so the identity and the paths are derived on first use.
     let derived = null;
     const context = () => {
@@ -46,7 +54,7 @@ export function createFakeStore({ base, workspace, home, faults = {} }) {
         return derived;
     };
     const agentRef = `${FIXTURE_REPOSITORY}/s`;
-    const model = { children: new Set(), counts: new Map(), posts: 0, clears: 0, calls: [], programs: [], boxChildren: new Set(), stops: 0, initialized: false, adminCalls: [] };
+    const model = { children: new Set(), counts: new Map(), posts: 0, clears: 0, calls: [], programs: [], boxChildren: new Set(), stops: 0, initialized: false, adminCalls: [], restarts: [], driverRuns: [], world: null };
     const lockDeadlineMs = faults.lockDeadlineMs ?? 250;
 
     // The host created the real store at the first gate-on start; the fake engine only wrote a stub in its place.
@@ -128,6 +136,58 @@ export function createFakeStore({ base, workspace, home, faults = {} }) {
         } catch (error) { return failed(`${String(error?.message || error)}\n`); }
     }
 
+    // ---- the actual lifecycle ----
+    const saveState = state => fs.writeFileSync(base.statePath, JSON.stringify(state));
+    // The Box the fake engine just created, as the product's own contract validators see it. Called after a successful `start`.
+    function adoptBox(options) {
+        if (!lifecycle || model.world) return;
+        ensureStore();
+        const { identity } = context();
+        const state = worldState();
+        const record = boxRecord(state);
+        const world = createDowngradeWorld({ root: path.join(home, '.c5-model'), workspace: { path: workspace }, home, identity, boxId: record.id, created: record.created,
+            hostPort: lifecycle.ports.tcp, mediaHostPort: lifecycle.ports.udp, repositoryRoot: lifecycle.source, linkProduct: false, faults: lifecycle.world ?? {},
+            ...(options?.env?.PLOINKY_BOX_IMAGE ? { imageRef: options.env.PLOINKY_BOX_IMAGE } : {}) });
+        world.restoreHome();
+        Object.assign(record, engineRecordFromHandle(world.oldHandle, { created: record.created }), { name: identity.instance, imageName: record.imageName });
+        saveState(state);
+        model.world = world;
+    }
+    // The world's container follows the fake engine's running state, and the engine follows the world's table.
+    function syncWorldFromEngine() {
+        const record = boxRecord(worldState());
+        for (const entry of model.world.containers.values()) {
+            const on = record?.running === true;
+            entry.handle.runtime.running = on; entry.handle.runtime.status = on ? 'running' : 'exited';
+            if (!on) entry.graphRunning = false;
+        }
+    }
+    function syncEngineFromWorld() {
+        const { identity } = context();
+        const state = worldState();
+        for (const [id, box] of Object.entries(state.boxes)) if (box.labels?.[BOX_LABELS.pathHash] === identity.pathHash) delete state.boxes[id];
+        for (const [id, entry] of model.world.containers) {
+            state.boxes[id] = { ...engineRecordFromHandle(entry.handle, { created: entry.created }), name: identity.instance, running: entry.handle.runtime.running };
+        }
+        saveState(state);
+    }
+    async function runLifecycleDriver(args, options) {
+        if (!model.world) return failed('The lifecycle model has no Box to run over', 1);
+        const params = JSON.parse(args[1]);
+        syncWorldFromEngine();
+        model.driverRuns.push({ mode: params.mode, expectedContainerId: params.expectedContainerId ?? null });
+        const world = model.world;
+        if (faults.beforeDriver) await faults.beforeDriver(params.mode, { world, context: context() });
+        const run = await world.withHome(() => runDriver(params, { baseRunner: world.runner, supervisor: world.makeSupervisor, programRoot: REPOSITORY }));
+        syncEngineFromWorld();
+        const summary = { ...run.summary };
+        const after = { params, summary, receiptPath: params.receiptPath, statePath: base.statePath };
+        if (faults.afterDriver) await faults.afterDriver(params.mode, after);
+        if (faults.driverTimeout === params.mode) return ok(`${JSON.stringify(summary)}\n`, { status: null, signal: 'SIGTERM', timedOut: true });
+        if (faults.driverForcedSettlement === params.mode) return ok(`${JSON.stringify(summary)}\n`, { status: null, signal: 'SIGKILL', settlementForced: true });
+        return ok(`${JSON.stringify(after.summary)}\n`, { status: after.exitCode ?? run.exitCode });
+    }
+
     // ---- the reviewed program, for real ----
     function runProgram(domain, args, options) {
         const at = args.length - 1;
@@ -160,8 +220,16 @@ export function createFakeStore({ base, workspace, home, faults = {} }) {
     async function provider(binary, args, options = {}) {
         model.calls.push({ binary, args, cwd: options.cwd });
         const isBoxExec = args[0] === 'container' && args[1] === 'exec';
+        // The full inspect document of one exact generation (no --format): what the product's own normalizer reads.
+        if (lifecycle && model.world && args[0] === 'container' && args[1] === 'inspect' && !args.includes('--format') && args.length === 3) {
+            const entry = model.world.containers.get(args[2]);
+            const record = Object.values(worldState().boxes).find(box => box.id === args[2]);
+            if (!entry || !record) return failed('no such container', 125);
+            syncWorldFromEngine();
+            return ok(JSON.stringify([rawInspectFromHandle(entry.handle, { created: entry.created })]));
+        }
         if (isBoxExec && args.includes(ADMIN_REQUEST)) {
-            if (!boxRunning() || faults.adminDown) return failed('Error: container is not running', 125);
+            if (!boxRunning() || faults.adminDown || (faults.adminDownAfterRestart && model.restarts.length)) return failed('Error: container is not running', 125);
             const at = args.indexOf(ADMIN_REQUEST);
             return ok(JSON.stringify(admin(args[at + 1], args[at + 2])));
         }
@@ -174,10 +242,29 @@ export function createFakeStore({ base, workspace, home, faults = {} }) {
         if (binary === base.node && /ploinky-box\.mjs$/.test(args[0] ?? '')) {
             if (args[1] === 'limits' && args[2] === 'clear') return hostClear(args);
             if (args[1] === 'stop') { stopBox(); return faults.stopExit ? failed('The stop failed (model).\n', faults.stopExit) : ok('The Box was stopped.\n'); }
+            if (lifecycle && args.includes('start') && !args.includes('restart')) {
+                const result = await base.provider(binary, args, options);
+                if (result.status === 0) adoptBox(options);
+                return result;
+            }
+            if (lifecycle && args[1] === 'restart') {
+                model.restarts.push({ gate: options.env?.PLOINKY_BOX_HARDWARE_LIMITS ?? null });
+                if (faults.restartExit) return failed('The restart failed (model).\n', faults.restartExit);
+                const state = worldState();
+                const record = boxRecord(state);
+                if (faults.restartReplacesBox) {
+                    const id = crypto.createHash('sha256').update(`replaced-${record.id}`).digest('hex');
+                    delete state.boxes[record.id];
+                    state.boxes[id] = { ...record, id, created: '2026-10-04T09:09:09Z', running: true };
+                } else if (record) record.running = true;
+                saveState(state);
+                return ok('The workspace restarted.\n');
+            }
         }
+        if (lifecycle && binary === base.node && /\/tests\/hardware-limits\/liveStoreTransition\.mjs$/.test(args[0] ?? '')) return runLifecycleDriver(args, options);
         return base.provider(binary, args, options);
     }
-    return { provider, model, context, ensureStore, boxRunning, agentRef };
+    return { provider, model, context, ensureStore, boxRunning, agentRef, admin };
 }
 
 export { HardwareStoreError };

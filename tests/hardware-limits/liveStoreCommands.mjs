@@ -24,6 +24,12 @@ export const STORE_BOUNDS = Object.freeze({
     programMs: 60000, hostClearMs: 120000, stopMs: 120000, adminMs: 60000,
 });
 export const storePolling = Object.freeze({ deadlineMs: STORE_BOUNDS.visibleMs, intervalMs: STORE_BOUNDS.visibleIntervalMs });
+// The actual lifecycle section (restart on, writer first, transition first, cleanup). Hard ceilings, never retries: each whole on/off lifecycle
+// invocation, including any production rollback, has ten minutes; the synchronous boundary at the old-Box stop (the observation and both
+// administrator calls) has 150 s; one administrator or program call has 60 s. The block is 45 minutes and cleanup has its own five minutes.
+export const TRANSITION_BOUNDS = Object.freeze({ lifecycleMs: 10 * 60 * 1000, boundaryMs: 150000, adminMs: 60000, programMs: 60000, infoMs: 30000, destroyMs: 5 * 60 * 1000 });
+export const C5_BLOCK_MS = 45 * 60 * 1000;
+export const C5_CLEANUP_MS = 5 * 60 * 1000;
 
 // Product text the evaluators recognise (imported, so a wording change shows up in the tests).
 export const BARRIER_MESSAGE = 'A gate-on to gate-off transition is pending';

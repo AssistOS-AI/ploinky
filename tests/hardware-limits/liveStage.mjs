@@ -172,9 +172,21 @@ export const ARTIFACT_LIMITS = Object.freeze({ files: 512, bytes: 8 * 1024 * 102
 const ARTIFACT_DENIED = /^(?:authorization|secret|token|credential|key|password|cookie|identity)/;
 const STAT_LINE = /^([a-z ]+):([0-9]+):([0-9]+):(\/[^\n]+)$/;
 
+// LIVE-C5 (the store block): the actual lifecycle section's evidence, each file written with a failure that throws, and the cleanup proof. A PASS
+// without them is not certified and the remote staging root is kept.
+export const C5_LIVE_ARTIFACTS = Object.freeze(['store-restart-on', 'store-writer-first', 'store-writer-first-clear', 'store-transition-first', 'store-final-generation', 'store-c5-receipt']);
+export const C5_CLEANUP_PROOF = 'c5-cleanup-proof';
+export function c5RequiredArtifacts({ profile, action, remoteReport, fetched = null }) {
+    if (remoteReport?.verdict !== 'PASS') return [];
+    if (action === 'cleanup') return [C5_CLEANUP_PROOF];
+    if (action !== 'live') return [];
+    const intent = fetched?.operations?.find(op => op?.kind === 'c5-downgrade');
+    return [...C5_LIVE_ARTIFACTS, ...(typeof intent?.driverReceiptName === 'string' ? [intent.driverReceiptName] : ['c5-transition-driver-missing-invocation'])];
+}
+
 // What a run must have left for its PASS to be certified: the proof each action ends with.
-export function requiredArtifacts({ profile, action, remoteReport }) {
-    if (!profile?.gpu) return [];
+export function requiredArtifacts({ profile, action, remoteReport, fetched = null }) {
+    if (!profile?.gpu) return profile?.cases?.includes('LIVE-C5') ? c5RequiredArtifacts({ profile, action, remoteReport, fetched }) : [];
     // A failed or blocked MPS case that ran left its failure evidence (the daemon's state and logs, the Router and
     // Watchdog tails, the Apply response) before the Box was destroyed; a missing item is reported with the run.
     if (remoteReport?.verdict !== 'PASS') {
@@ -196,6 +208,20 @@ export function llmCleanupProofProblem(bytes, { runId }) {
     if (proof.action !== 'cleanup') return `the LLM cleanup proof was written by the ${String(proof.action).slice(0, 20)} action, not by this cleanup`;
     if (!Number.isSafeInteger(proof.at) || proof.at <= 0) return 'the LLM cleanup proof has no time';
     if (!Array.isArray(proof.remaining) || proof.remaining.length) return 'the LLM cleanup proof lists model data that remains';
+    return null;
+}
+
+// Why a fetched `c5-cleanup-proof` does not certify THIS cleanup, or null: it must be this run's, written by a cleanup action (not by the live run),
+// and name a chain of IDs that is entirely absent.
+export function c5CleanupProofProblem(bytes, { runId }) {
+    let proof;
+    try { proof = JSON.parse(Buffer.from(bytes).toString('utf8')); } catch { return 'the C5 cleanup proof is not JSON'; }
+    if (!proof || typeof proof !== 'object' || proof.schema !== 1) return 'the C5 cleanup proof has an unknown shape';
+    if (proof.runId !== runId) return 'the C5 cleanup proof belongs to another run';
+    if (proof.action !== 'cleanup') return `the C5 cleanup proof was written by the ${String(proof.action).slice(0, 20)} action, not by this cleanup`;
+    if (!Number.isSafeInteger(proof.at) || proof.at <= 0) return 'the C5 cleanup proof has no time';
+    if (!Array.isArray(proof.chain) || !proof.chain.length || proof.chain.length > 3 || proof.chain.some(id => !/^[a-f0-9]{64}$/.test(String(id)))) return 'the C5 cleanup proof names no valid chain of Box IDs';
+    if (JSON.stringify(proof.absent) !== JSON.stringify(proof.chain) || !Array.isArray(proof.remaining) || proof.remaining.length) return 'the C5 cleanup proof does not show every Box of the chain absent';
     return null;
 }
 
@@ -330,12 +356,17 @@ export async function stageAndDispatch({ run, bytes, authorizationBytes, action,
         if (jsonDigest(JSON.parse(reportText)) !== jsonDigest(remoteReport)) throw new Error('Fetched remote report differs from the dispatched result');
         writePrivateBytes(path.join(runDirectory, `report_${action}_remote_${suffix}.json`), Buffer.from(reportText, 'utf8'));
         // The side artifacts, with digest proof, before anything can be removed.
-        const artifacts = await fetchArtifacts({ required: requiredFor({ profile, action, remoteReport }) });
+        const artifacts = await fetchArtifacts({ required: requiredFor({ profile, action, remoteReport, fetched }) });
         // A cleanup's LLM proof must be this action's own, for this run, with nothing remaining.
         const proofEntry = action === 'cleanup' ? artifacts.fetched.find(entry => entry.name === 'llm-cleanup-proof') : null;
         if (proofEntry) {
             const problem = llmCleanupProofProblem(fs.readFileSync(path.join(runDirectory, proofEntry.file)), { runId: run.runId });
             if (problem) { artifacts.failures.push({ name: 'llm-cleanup-proof', reason: problem }); artifacts.complete = false; }
+        }
+        const c5Entry = action === 'cleanup' && profile.cases?.includes('LIVE-C5') && !profile.gpu ? artifacts.fetched.find(entry => entry.name === C5_CLEANUP_PROOF) : null;
+        if (c5Entry) {
+            const problem = c5CleanupProofProblem(fs.readFileSync(path.join(runDirectory, c5Entry.file)), { runId: run.runId });
+            if (problem) { artifacts.failures.push({ name: C5_CLEANUP_PROOF, reason: problem }); artifacts.complete = false; }
         }
         const result = judgeArtifacts(remoteReport, artifacts);
         let removed = false;

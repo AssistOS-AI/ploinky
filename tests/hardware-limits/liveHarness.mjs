@@ -14,6 +14,7 @@ import {
     observeEngineIdentity, receipt, foreignGuardInput, foreignWorkspaceProblem,
 } from './liveCommon.mjs';
 import { recordHostRecords, runOwnedCleanup } from './liveCleanup.mjs';
+import { validateC5BoxReceipts } from './liveBoxTransitionCustody.mjs';
 import { FIXTURE_REPOSITORY, fixtureContainerName, provisionRun, validateProvisionPlan } from './liveFixture.mjs';
 import { stageAndDispatch } from './liveStage.mjs';
 import {
@@ -123,13 +124,17 @@ export function validateProfile(run, { partial = false } = {}) {
         if (profile.cases.includes('LIVE-C5') && [...roles].join(',') !== C5_AGENTS.join(',')) throw new Error('LIVE-C5 requires the owned fixture agent s alone');
         if (profile.provision && (profile.agents.length !== profile.provision.agents.length
             || profile.provision.agents.some(agent => !roles.has(agent.role)))) throw new Error('Provisioned agents differ from the fixture plan');
-        if (run.ownedBoxes.length !== 1) throw new Error('Only one immutable owned Box is supported');
+        // The original fixture Box receipt is the one immutable anchor. Linked generations exist only for the declared LIVE-C5 invocation, each
+        // proved through the product's own durable records (liveBoxTransitionCustody.mjs).
+        if (run.ownedBoxes.filter(box => box.id === profile.box.id).length !== 1) throw new Error('Only one immutable owned Box is supported');
+        validateC5BoxReceipts(run, profile);
         keys(run.preInventory, ['containers'], 'before inventory');
         if (!run.ownedBoxes.some(box => box.id === profile.box.id && box.created === profile.box.created)) throw new Error('Missing Box receipt');
         if (!run.operations.some(op => op.id === 'fixture-created' && op.state === 'observed'
             && op.resourceIds?.includes(profile.box.id))) throw new Error('Missing durable fixture creation receipt');
     } else {
-        if (run.ownedBoxes.length > 1) throw new Error('Only one immutable owned Box is supported');
+        if (profile.box) validateC5BoxReceipts(run, profile);
+        else if (run.ownedBoxes.length > 1) throw new Error('Only one immutable owned Box is supported');
         keys(run.preInventory, [], 'before inventory', ['containers']);
     }
     if (run.preInventory.containers !== undefined && (!Array.isArray(run.preInventory.containers) || run.preInventory.containers.length > 256
@@ -234,7 +239,7 @@ export const postExitObservation = { windowMs: 2000, intervalMs: 100 };
 export const POST_EXIT_VANISHED = 'The same-leaf cgroup vanished or could not be observed after the pressure process exited, so no post-exit counter evidence exists (the kernel may have killed the agent main process rather than the pressure process)';
 
 export function createLiveAdapter(profile, {
-    processProvider = runBoundedProcess, signal, cleanupSignal, persist = () => {}, run, artifacts = () => {}, hostProc, gpuTimings, availabilitySeams = {}, storeSeams = {},
+    processProvider = runBoundedProcess, signal, cleanupSignal, persist = () => {}, run, artifacts = () => {}, artifactPath = null, hostProc, gpuTimings, availabilitySeams = {}, storeSeams = {},
 } = {}) {
     const env = candidateEnv(profile);
     // `tolerate` returns a finished command whatever its status, for evidence
@@ -244,7 +249,7 @@ export function createLiveAdapter(profile, {
     // `journal: false` is for read-only observations that a case repeats many
     // times (the journal is bounded); every mutation stays journaled. `abort`
     // adds one more cancellation to the block's own (a monitored probe).
-    async function command(kind, binary, args, { deadlineMs = 30000, stress = false, cleanup = false, gate = null, tolerate = false, capture = null, journal = true, abort = null } = {}) {
+    async function command(kind, binary, args, { deadlineMs = 30000, stress = false, cleanup = false, gate = null, tolerate = false, capture = null, journal = true, abort = null, maxBytes = 65536 } = {}) {
         assertWorkspace(profile);
         if (['pressure', 'destroy-box'].includes(kind) && liveSourceDigest(profile.source.root) !== profile.source.digest) throw new Error('Candidate source changed');
         let op = null;
@@ -254,12 +259,12 @@ export function createLiveAdapter(profile, {
             run.operations.push(op); persist();
         }
         const callSignal = cleanup ? cleanupSignal : (abort ? (signal ? AbortSignal.any([signal, abort]) : abort) : signal);
-        const result = await processProvider(binary, args, { cwd: profile.workspace.path, env: gate === null ? env : { ...env, PLOINKY_BOX_HARDWARE_LIMITS: gate }, deadlineMs, maxBytes: 65536, signal: callSignal });
+        const result = await processProvider(binary, args, { cwd: profile.workspace.path, env: gate === null ? env : { ...env, PLOINKY_BOX_HARDWARE_LIMITS: gate }, deadlineMs, maxBytes, signal: callSignal });
         if (op) {
             op.state = 'observed';
             // Only fixed observation commands return persisted output. Candidate
             // diagnostics may contain credentials; retain status flags alone.
-            op.result = { status: result.status, signal: result.signal, timedOut: result.timedOut, truncated: result.truncated, cancelled: result.cancelled, errorCode: result.errorCode };
+            op.result = { status: result.status, signal: result.signal, timedOut: result.timedOut, truncated: result.truncated, cancelled: result.cancelled, errorCode: result.errorCode, settlementForced: Boolean(result.settlementForced) };
             persist();
         }
         if (capture) {
@@ -564,7 +569,7 @@ export function createLiveAdapter(profile, {
     // The availability cases (LIVE-C3 and LIVE-C3V) of their own fixtures.
     const availability = profile.fixtures?.availability ? createAvailabilityCases({ profile, run, command, engine, core, nested, inspectBox, safeArtifact, persist, ...availabilitySeams }) : null;
     // The store case (LIVE-C5): the host and the in-Box writers of the policy store, its lock and its barrier.
-    const store = profile.fixtures?.store ? createStoreCases({ profile, run, command, inspectBox, safeArtifact, ...storeSeams }) : null;
+    const store = profile.fixtures?.store ? createStoreCases({ profile, run, command, engine, inspectBox, safeArtifact, requireArtifact: artifacts, persist, artifactPath, ...storeSeams }) : null;
     async function cleanup() {
         // The GPU block first stops its own helpers by exact identity, then the
         // product cleanup runs, and last the GPU must show none of our processes
@@ -582,7 +587,7 @@ export function createLiveAdapter(profile, {
             } catch (error) { entry.state = 'failed'; run.cleanup.failures.push(`GPU pre-cleanup: ${String(error?.message || error).slice(0, 200)}`); }
             persist();
         }
-        await runOwnedCleanup({ run, profile, persist, processProvider, signal: cleanupSignal });
+        await runOwnedCleanup({ run, profile, persist, processProvider, signal: cleanupSignal, artifacts, artifactPath, proofAction: 'live' });
         if (hooks) await hooks.afterCleanup();
     }
     return { cpuCase, coreCase, swapCase, helperCase, cleanup, inspectBox, gpu, llm, availability, store };
@@ -617,7 +622,7 @@ function pinProblem(run, profile, hostIdentity, remoteArrival) {
 
 // Standalone cleanup resumes from the manifest alone, including after an
 // interrupted provisioning that never recorded a Box or workspace receipt.
-export async function executeCleanupRun({ run, persist = () => {}, processProvider = runBoundedProcess, signal, remoteArrival = false, hostIdentity = defaultHostIdentity(), hostProc, artifacts = () => {} } = {}) {
+export async function executeCleanupRun({ run, persist = () => {}, processProvider = runBoundedProcess, signal, remoteArrival = false, hostIdentity = defaultHostIdentity(), hostProc, artifacts = () => {}, artifactPath = null } = {}) {
     const cases = LIVE_CASES[run.block].map(id => ({ id, result: 'blocked', reason: UNSUPPORTED[id] || 'Cleanup only' }));
     const report = { schema: 1, runId: run.runId, action: 'cleanup', verdict: 'BLOCKED', exitCode: EXIT.BLOCKED, cases, cleanup: run.cleanup, limitations: [] };
     // The foreign-workspace guard speaks first, over whatever the manifest names, before the profile is even validated.
@@ -638,7 +643,7 @@ export async function executeCleanupRun({ run, persist = () => {}, processProvid
         if (profile.gpu && !run.cleanup.steps.some(value => value.id === 'gpu-stop-owned-helpers')) {
             run.cleanup.steps.push({ id: 'gpu-stop-owned-helpers', state: 'skipped', artifact: null, reason: 'no helper is registered in this process; the nested containers go with the Box' }); persist();
         }
-        await runOwnedCleanup({ run, profile, persist, processProvider, signal: scope });
+        await runOwnedCleanup({ run, profile, persist, processProvider, signal: scope, artifacts, artifactPath, proofAction: 'cleanup' });
         // A GPU block is certified clean only after a SUCCESSFUL final GPU observation, here
         // as in the live run; the registered processes are the manifest's own records, so a
         // resumed run proves the same thing. Without it the cleanup stays failed and retryable.
@@ -660,10 +665,10 @@ export async function executeCleanupRun({ run, persist = () => {}, processProvid
 }
 
 export async function executeLiveRun({ run, action = 'live', persist = () => {}, processProvider = runBoundedProcess, signal,
-    remoteArrival = false, artifacts = () => {},
+    remoteArrival = false, artifacts = () => {}, artifactPath = null,
     hostIdentity = defaultHostIdentity(), hostProc, gpuTimings, availabilitySeams, storeSeams,
 } = {}) {
-    if (action === 'cleanup') return executeCleanupRun({ run, persist, processProvider, signal, remoteArrival, hostIdentity, hostProc, artifacts });
+    if (action === 'cleanup') return executeCleanupRun({ run, persist, processProvider, signal, remoteArrival, hostIdentity, hostProc, artifacts, artifactPath });
     const selected = run.target.execution?.cases || LIVE_CASES[run.block];
     const cases = LIVE_CASES[run.block].map(id => ({ id, result: 'blocked', reason: UNSUPPORTED[id] || 'Not selected or no completed enforcement evidence' }));
     const report = { schema: 1, runId: run.runId, action, verdict: 'BLOCKED', exitCode: EXIT.BLOCKED, cases, cleanup: run.cleanup, limitations: [] };
@@ -686,7 +691,7 @@ export async function executeLiveRun({ run, action = 'live', persist = () => {},
     const blockMs = Number.isInteger(run.deadlines?.blockMs) && run.deadlines.blockMs >= 60000 && run.deadlines.blockMs <= 16_200_000 ? run.deadlines.blockMs : 20 * 60 * 1000;
     const blockTimer = setTimeout(() => blockController.abort(), blockMs);
     const blockSignal = signal ? AbortSignal.any([signal, blockController.signal]) : blockController.signal;
-    const adapter = createLiveAdapter(profile, { processProvider, signal: blockSignal, cleanupSignal: cleanupController.signal, persist, run, artifacts, hostProc, gpuTimings, availabilitySeams, storeSeams });
+    const adapter = createLiveAdapter(profile, { processProvider, signal: blockSignal, cleanupSignal: cleanupController.signal, persist, run, artifacts, artifactPath, hostProc, gpuTimings, availabilitySeams, storeSeams });
     let attempted = false; let activeCase = null;
     try {
         if (action !== 'cleanup') {
@@ -749,7 +754,7 @@ export async function runLiveCommand({
     // Bounded evidence beside the run manifest, one private file per name.
     const artifacts = (name, value) => writePrivateJson(artifactPathFor(runPath, name), value);
     try {
-        const local = { persist, artifacts, processProvider, signal: controller.signal, remoteArrival: remoteLocal !== null, ...(hostIdentity ? { hostIdentity } : {}) };
+        const local = { persist, artifacts, artifactPath: name => artifactPathFor(runPath, name), processProvider, signal: controller.signal, remoteArrival: remoteLocal !== null, ...(hostIdentity ? { hostIdentity } : {}) };
         const report = run.target.ssh && remoteLocal === null
             ? await stageAndDispatch({ run, bytes, authorizationBytes, action, runPath, processProvider, signal: controller.signal })
             : action === 'provision'

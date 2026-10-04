@@ -26,7 +26,7 @@ import { hardwareStorePaths, readBarrier } from '../../cli/sandbox/hardwareLimit
 import { ADMIN_REQUEST } from './liveGpuCommands.mjs';
 import { parseAdminReply } from './liveAvailabilityCommands.mjs';
 import {
-    OVERRIDES, STORE_PROGRAM, assertSameStore, assertValidStore, boxProgramWords, hostProgramWords, parseProgramLines, storeProgramParams, tokenKey,
+    OVERRIDES, STORE_PROGRAM, TRANSITION_BOUNDS, assertSameStore, assertValidStore, boxProgramWords, hostProgramWords, parseProgramLines, storeProgramParams, tokenKey,
 } from './liveStoreCommands.mjs';
 import {
     C5_DRIVER_NAME, newDriverReceipt, persistDriverReceipt, productEngineDigest, productTransitionIds, readC5ProductJournal, readC5Snapshot, validateC5Intent,
@@ -39,7 +39,7 @@ export const DRIVER_FILE = 'tests/hardware-limits/liveStoreTransition.mjs';
 export const OLD_STOP_PATH = '/opt/ploinky/bin/ploinky-local';
 // Hard ceilings, not retries. The whole lifecycle invocation (the parent's own deadline on this child), the synchronous boundary section, and each
 // single in-Box call inside it.
-export const DRIVER_BOUNDS = Object.freeze({ lifecycleMs: 10 * 60 * 1000, boundaryMs: 150000, adminMs: 60000, programMs: 60000, infoMs: 30000, destroyMs: 5 * 60 * 1000 });
+export const DRIVER_BOUNDS = TRANSITION_BOUNDS;
 // The failure kinds that are product behaviour. Anything else (setup, identity, channel, timeout, order) is never a kill and never a refusal.
 export const BEHAVIOR_FAILURES = Object.freeze(['writer-outcome', 'barrier-state', 'store-changed', 'barrier-retention']);
 export const LIFECYCLE_MUTATIONS = Object.freeze(['graph-stop', 'box-stop', 'box-remove', 'box-create', 'box-start']);
@@ -157,6 +157,8 @@ export async function runDriver(rawParams, seams = {}) {
     const state = { boundary: null, bound: null, failures: [], mutations: [], runCalls: 0, queryCalls: 0, operationId: null, receipt: null, intent: null, stage: 'pre', engine: null };
     const identity = () => assertWorkspace(profile);
     const paths = () => hardwareStorePaths({ identity: identity(), homeDirectory });
+    // `onStep` is a test seam only: a named point of the driver, so a crash test can end the process exactly there.
+    const step = name => seams.onStep?.(name);
     const record = (kind, data = {}) => {
         if (events.length >= MAX_EVENTS) return;
         events.push({ kind, sequence: events.length + 1, atMs: Math.max(0, now() - startedAt), ...data });
@@ -198,6 +200,7 @@ export async function runDriver(rawParams, seams = {}) {
             return left;
         };
         record('boundary-begin');
+        step('boundary-begin');
         identity();
         const engine = observeEngine(base, profile, { infoMs: Math.min(bounds.infoMs, remaining()) });
         state.engine = engine;
@@ -222,10 +225,16 @@ export async function runDriver(rawParams, seams = {}) {
         Object.assign(state.receipt, { phase: 'bound', productOperationId: journal.operationId, productEngineIdentity: engine.product,
             oldConfigurationRef: journal.old.configurationRef, desiredConfigurationRef: journal.desired.configurationRef });
         record('bound', { productOperationId: journal.operationId });
+        step('before-bind');
         persistReceipt();
+        step('bound');
 
         const storeIdentity = identity();
-        const programParams = domain => storeProgramParams({ profile: { host: profile.host, source: profile.source }, identity: storeIdentity, domain, mode: 'inspect' });
+        // `programRoot` is a test seam only: where the host program finds the product modules when the profile's source root is a stand-in.
+        const programParams = domain => {
+            const params = storeProgramParams({ profile: { host: profile.host, source: profile.source }, identity: storeIdentity, domain, mode: 'inspect' });
+            return domain === 'host' && seams.programRoot ? { ...params, root: seams.programRoot } : params;
+        };
         const hostView = () => {
             const hostResult = spawnSync(process.execPath, hostProgramWords(programParams('host')), { env: { PATH: process.env.PATH, HOME: homeDirectory }, encoding: 'utf8', timeout: Math.min(bounds.programMs, remaining()) });
             const lines = hostResult.status === 0 ? parseProgramLines(hostResult.stdout) : null;
@@ -273,6 +282,7 @@ export async function runDriver(rawParams, seams = {}) {
             || tokenKey(after.box.token) !== tokenKey(before.host.token) || after.box.count !== 0) {
             problems.push(fail('store-changed', 'The store identity, stamp or entries changed during the boundary', { before: { token: before.host.token, count: before.host.count }, after: { token: after.host.token, count: after.host.count } }));
         }
+        step('after-writers');
         state.boundary = { reached: true, operationId: journal.operationId, replies: { set: { status: set.status, error: set.body?.error ?? null }, clear: { status: cleared.status, error: cleared.body?.error ?? null } } };
         persistReceipt();
         if (problems.length) throw problems[0];

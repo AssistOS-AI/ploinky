@@ -36,6 +36,13 @@ export function productEngineDigest(info) {
     return crypto.createHash('sha256').update(JSON.stringify(['podman', ...values])).digest('hex');
 }
 
+// Whether the owned transport proves the driver's whole process group ended: its manifest operation was observed (a command is observed only
+// after its group is gone) and was not a forced settlement. Saved PIDs are never used and nothing is signalled.
+export function driverSettled(run) {
+    const op = [...run.operations].reverse().find(entry => entry?.kind === C5_DRIVER_NAME);
+    return Boolean(op && op.state === 'observed' && op.result && !op.result.settlementForced && !op.result.errorCode);
+}
+
 export function c5IntentOf(run) {
     const intents = run.operations.filter(op => op?.kind === C5_INTENT_KIND);
     if (intents.length > 1) throw problem('more than one downgrade invocation');
@@ -107,8 +114,10 @@ export function validateDriverReceipt(value, intent, profile) {
 function assertRealDirectories(target) {
     if (!absolute(target)) throw problem('unsafe private receipt path');
     let directory = path.dirname(target);
+    // Every existing ancestor is a real directory; a missing one has nothing below it, so the read itself reports the absence.
     while (directory !== path.dirname(directory)) {
-        const stat = fs.lstatSync(directory);
+        let stat;
+        try { stat = fs.lstatSync(directory); } catch (error) { if (error.code === 'ENOENT') { directory = path.dirname(directory); continue; } throw error; }
         if (!stat.isDirectory() || stat.isSymbolicLink()) throw problem('private receipt has a symlinked parent');
         directory = path.dirname(directory);
     }
@@ -175,9 +184,12 @@ export function readC5Snapshot(profile, ref) {
     if (!REF.test(ref)) throw problem('invalid configuration reference');
     const value = readPrivateC5File(path.join(productDirectory(profile), `${ref}.json`), { maxBytes: 1024 * 1024 });
     if (digestOf(value) !== ref) throw problem('configuration snapshot digest changed');
-    if (value.identity?.workspaceRoot !== profile.workspace.path || value.identity?.instance !== profile.box.instance
-        || value.identity?.pathHash !== profile.box.pathHash || value.repositoryRoot !== profile.source.root
-        || !sameImage(value.imageId, profile.box.image) || value.hostKind !== 'native-linux') throw problem('configuration belongs to another fixture');
+    const wrong = Object.entries({
+        workspaceRoot: value.identity?.workspaceRoot === profile.workspace.path, instance: value.identity?.instance === profile.box.instance,
+        pathHash: value.identity?.pathHash === profile.box.pathHash, repositoryRoot: value.repositoryRoot === profile.source.root,
+        imageId: sameImage(value.imageId, profile.box.image), hostKind: value.hostKind === 'native-linux',
+    }).filter(([, ok]) => !ok).map(([name]) => name);
+    if (wrong.length) throw problem(`configuration belongs to another fixture (${wrong.join(', ')})`);
     return value;
 }
 

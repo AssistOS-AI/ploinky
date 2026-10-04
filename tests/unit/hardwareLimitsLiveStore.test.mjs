@@ -14,11 +14,12 @@ import { CASE_PASS_CONDITIONS, CONCRETE_BLOCKS, renderSummary, validatePins } fr
 import { LIVE_CASES, UNSUPPORTED, executeLiveRun, validateProfile } from '../hardware-limits/liveHarness.mjs';
 import { fixturePlan, provisionRun, validateProvisionPlan } from '../hardware-limits/liveFixture.mjs';
 import {
-    BARRIER_MESSAGE, BOX_PRODUCT_ROOT, BOX_STORE_ROOT, C5_AGENTS, OVERRIDES, RECOVERY_REFUSALS, STORE_BOUNDS, STORE_LOCK_DEADLINE_MS, STORE_PROGRAM, assertCommitted, assertHolderReleased, assertHostClearRefused, assertLockNotStolen,
+    BARRIER_MESSAGE, BOX_PRODUCT_ROOT, BOX_STORE_ROOT, C5_AGENTS, C5_BLOCK_MS, C5_CLEANUP_MS, TRANSITION_BOUNDS, OVERRIDES, RECOVERY_REFUSALS, STORE_BOUNDS, STORE_LOCK_DEADLINE_MS, STORE_PROGRAM, assertCommitted, assertHolderReleased, assertHostClearRefused, assertLockNotStolen,
     assertRefusedWrite, assertSameStore, assertValidStore, boxProgramWords, hostProgramWords, hostStoreRoot, parseProgramLines, sameLock, sameOwner, storeProgramParams, tokenKey,
 } from '../hardware-limits/liveStoreCommands.mjs';
 import { createFakeStore } from '../hardware-limits/fakeLiveStore.mjs';
 import { world, free, scratch } from '../hardware-limits/executorWorld.mjs';
+import { artifactPathFor } from '../hardware-limits/liveCommon.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { BOX_STORE_ROOT as PRODUCT_BOX_STORE_ROOT, hardwareStorePaths, initializeStore, setAgentLimits, readStoreSnapshot } from '../../cli/sandbox/hardwareLimits/store.mjs';
 import { STORE_BUSY_MESSAGE, recoverStaleStoreLock } from '../../cli/sandbox/hardwareLimits/storeLock.mjs';
@@ -29,10 +30,13 @@ const real = ms => new Promise(resolve => setTimeout(resolve, ms));
 const SEAMS = { sleep: real, polling: { deadlineMs: 15000, intervalMs: 20 } };
 const CASE_KEYS = ['baseline', 'visibility', 'cas-race', 'stale-setter', 'host-box-race', 'lock-host-held', 'lock-box-held', 'barrier', 'stale-box-lock', 'stale-host-live', 'stale-host-dead', 'final'];
 
-async function liveWorld(t, { faults = {}, block = BLOCK } = {}) {
-    const w = world(t, { block });
+// The product's seccomp profile is part of the frozen fixture source, so the Box the lifecycle model reports satisfies the product's own contract.
+const SECCOMP = fs.readFileSync(path.join(REPOSITORY, 'ploinky-box/seccomp/podman-nested-pid-fallback.json'));
+async function liveWorld(t, { faults = {}, block = BLOCK, lifecycleFaults = {} } = {}) {
+    const w = world(t, { block, extraSource: { 'ploinky-box/seccomp/podman-nested-pid-fallback.json': SECCOMP } });
     const workspace = w.run.target.execution.provision.workspace.path;
-    const fake = createFakeStore({ base: { provider: w.engineProvider, node: w.node, statePath: w.statePath }, workspace, home: w.home, faults });
+    const fake = createFakeStore({ base: { provider: w.engineProvider, node: w.node, statePath: w.statePath }, workspace, home: w.home, faults,
+        lifecycle: { source: w.run.target.execution.source.root, ports: w.run.ports, world: lifecycleFaults } });
     const report = await provisionRun({ run: w.run, persist: w.persist, processProvider: fake.provider, portProbe: free, hostIdentity: w.hostIdentity, remoteArrival: w.remote, validateProfile });
     assert.equal(report.verdict, 'PASS', JSON.stringify(report.limitations));
     return { w, fake, workspace };
@@ -42,7 +46,8 @@ async function liveRun(context, { mutate = null, seams = SEAMS } = {}) {
     const artifacts = new Map();
     const provider = mutate ? async (binary, args, options) => { mutate(args); return fake.provider(binary, args, options); } : fake.provider;
     const report = await executeLiveRun({ run: w.run, hostIdentity: w.hostIdentity, processProvider: provider, persist: w.persist, remoteArrival: true,
-        artifacts: (name, value) => artifacts.set(name, structuredClone(value)), storeSeams: seams });
+        artifacts: (name, value) => artifacts.set(name, structuredClone(value)), artifactPath: name => artifactPathFor(w.runPath, name),
+        storeSeams: { http: async () => ({ status: 200, contentType: 'text/html', body: '' }), ...seams } });
     return { report, artifacts, case: report.cases.find(entry => entry.id === 'LIVE-C5') };
 }
 const failsWith = async (t, faults, pattern, { result = 'fail', seams } = {}) => {
@@ -66,7 +71,8 @@ test('X5.c5-block-fixture-pins-and-deadlines-are-wired', t => {
     const w = world(t, { block: BLOCK });
     assert.doesNotThrow(() => validateProvisionPlan(w.run.target.execution.provision, w.run));
     assert.equal(w.run.target.execution.fixtures.store.ref, 'hwlfixture/s');
-    assert.equal(w.run.deadlines.blockMs, 30 * 60 * 1000);
+    assert.equal(w.run.deadlines.blockMs, 45 * 60 * 1000, 'the C5 block with the actual lifecycle is 45 minutes');
+    assert.equal(C5_BLOCK_MS, 45 * 60 * 1000); assert.equal(C5_CLEANUP_MS, 5 * 60 * 1000);
     assert.doesNotThrow(() => validatePins(w.pins, BLOCK));
     // The profile is consistent: LIVE-C5 needs the owned agent s alone.
     const profile = structuredClone(w.run); profile.target.execution.cases = ['LIVE-C5'];
@@ -79,17 +85,26 @@ test('X5.c5-manifest-and-summary-name-the-spec-row-the-writers-the-program-every
     const sha = crypto.createHash('sha256').update(STORE_PROGRAM).digest('hex');
     for (const text of ['| LIVE-C5 | spec 15.4 LIVE-C5 (:1326', '## Store fixture', '## Foreign-workspace guard', 'limits clear --agent hwlfixture/s', "the Router's administrator route", sha, 'STORE_PROGRAM in tests/hardware-limits/liveStoreCommands.mjs',
         BOX_STORE_ROOT, BOX_PRODUCT_ROOT, hostStoreRoot(w.run.target.execution.host.home, w.run.workspace.instance), `${STORE_BOUNDS.holdMs} ms`, `${STORE_BOUNDS.staleHoldMs} ms`,
-        `${STORE_BOUNDS.raceRounds} race rounds`, 'STOPPED by `ploinky stop`', 'destroys it with `destroy --delete-cache`', 'keep-id mapping', 'never deleted by the runner', 'C5-hold-host', 'C5-hold-box', 'C5-abandon-host-lock',
+        `${STORE_BOUNDS.raceRounds} race rounds`, 'STOPPED by `ploinky stop`', 'exact-ID destroy', 'destroy --delete-cache', 'keep-id mapping', 'never deleted by the runner', 'C5-hold-host', 'C5-hold-box', 'C5-abandon-host-lock',
         'C5-barrier-begin', 'C5-gate-off-check', 'C5-stop', '<STORE_PROGRAM>', 'One conflicting mutation wins and the other conflicts', 'No lost clear', 'No live lock theft', 'a gate-off start is refused stored_limits_present']) {
         assert.ok(summary.includes(text), text);
     }
     // The pass condition carries the spec's four clauses, unchanged.
     const passes = CASE_PASS_CONDITIONS['LIVE-C5'].passes;
     for (const clause of ['One conflicting mutation wins and the other conflicts', 'No lost clear', 'no gate-off Box with newly committed policy', 'No live lock theft']) assert.ok(passes.toLowerCase().includes(clause.toLowerCase()) || summary.toLowerCase().includes(clause.toLowerCase()), clause);
+    // The wording states exactly what is performed: step 6 is a diagnostic of the helper-installed barrier, the actual lifecycle is run by the driver,
+    // custody and the bounds are declared, and the superseded "not performed" sentence is gone.
+    for (const text of ['DIAGNOSTIC of the store barrier', 'Lifecycle driver', 'tests/hardware-limits/liveStoreTransition.mjs', 'Custody', 'C5-restart-on', 'C5-writer-first', 'C5-transition-driver', 'C5-host-clear-after-refusal',
+        'C5-inspect-generation', `${TRANSITION_BOUNDS.lifecycleMs} ms`, `${TRANSITION_BOUNDS.boundaryMs} ms`, `${C5_CLEANUP_MS} ms`, `block ${C5_BLOCK_MS} ms`, 'or a mutant kill', 'C4, the complete stored-policy fixture matrix, remains unsupported']) {
+        assert.ok(summary.includes(text), text);
+    }
+    assert.equal(summary.includes('A real gate-off restart is not performed'), false);
+    for (const text of ['WRITER FIRST', 'TRANSITION FIRST', 'PLOINKY_BOX_HARDWARE_LIMITS_STORED', 'DIAGNOSTIC of the store barrier']) assert.ok(CASE_PASS_CONDITIONS['LIVE-C5'].procedure.includes(text) || CASE_PASS_CONDITIONS['LIVE-C5'].passes.includes(text.replace('WRITER FIRST', 'WRITER FIRST')), text);
     const operations = candidateOperationsOf(w.run);
     assert.ok(operations.length >= 2);
     for (const operation of operations) assert.equal(candidateArgvProblem(operation.argv), null, operation.argv.join(' '));
     assert.ok(operations.some(entry => entry.argv[1] === 'stop') && operations.some(entry => entry.argv[1] === 'limits' && entry.argv[2] === 'clear'));
+    assert.ok(operations.some(entry => entry.argv[1] === 'restart'), 'the gate-on restart is a planned candidate command');
     assert.equal(summary.includes(w.pins.ssh.identityFile ?? 'no-identity'), false);
 });
 

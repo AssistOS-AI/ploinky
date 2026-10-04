@@ -11,14 +11,23 @@
 //                        the barrier is gone and a policy is committed, a gate-off start is refused (stored_limits_present): no gate-off Box with new policy.
 //   7  stale recovery    a Box holder whose Box is STOPPED while it holds, a live host holder with the Box stopped, and a dead host holder with the Box
 //                        stopped: the host clear recovers only the first and the last (the stale lock is quarantined, never deleted) and never the live one.
+//   Then the ACTUAL lifecycle (liveStoreLifecycle.mjs, the driver liveStoreTransition.mjs), after the diagnostic steps above:
+//   8  restart on        the whole restart with the gate on keeps the original immutable outer Box, its Router, one store and no lock or barrier.
+//   9  writer first      a committed policy through the administrator API; the REAL gate-off restart is refused with the typed
+//                        PLOINKY_BOX_HARDWARE_LIMITS_STORED before any lifecycle mutation, and nothing changed; the host clear that ends it gives the stamp T.
+//   10 transition first  the REAL gate-off restart; at the production old-Box stop boundary the real administrator setter and clear (with T) run
+//                        synchronously inside the old Box and are refused hardware_limits_transition by the PRODUCT's own barrier; the committed
+//                        replacement is proved on its own (old ID absent, gate off, no hardware label, marker or store bind, publications, Router).
+//   Step 6 stays a diagnostic of the store barrier (the helper installs it itself); it earns no credit for the actual lifecycle.
 // Pass conditions are the spec's, unchanged: one conflicting mutation wins and the other conflicts; no lost clear; no gate-off Box with newly
 // committed policy; no live lock theft. A check that cannot be made is BLOCKED (a prerequisite), never passed.
 
 import crypto from 'node:crypto';
-import { assertWorkspace, blocked } from './liveCommon.mjs';
+import { assertWorkspace, blocked, jsonDigest } from './liveCommon.mjs';
 import { ADMIN_REQUEST } from './liveGpuCommands.mjs';
 import { FIXTURE_REPOSITORY } from './liveFixture.mjs';
-import { parseAdminReply } from './liveAvailabilityCommands.mjs';
+import { httpProbe, parseAdminReply } from './liveAvailabilityCommands.mjs';
+import { createLifecycle } from './liveStoreLifecycle.mjs';
 import {
     BARRIER_MESSAGE, OVERRIDES, RECOVERY_REFUSALS, STORE_BOUNDS, STORE_BUSY_TEXT, assertCommitted, assertExitZero, assertHolderReleased, assertHostClearRefused, assertLockNotStolen, assertNoLockNoBarrier,
     assertRefusedWrite, assertSameStore, assertValidStore, boxProgramWords, hostProgramWords, parseProgramLines, revisionOf, sameLock, sameOwner, storePolling, storeProgramParams, tokenKey,
@@ -27,7 +36,9 @@ import {
 const sleepMs = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 const processIsDead = pid => { try { process.kill(pid, 0); return false; } catch (error) { return error?.code === 'ESRCH'; } };
 
-export function createStoreCases({ profile, run, command, inspectBox, safeArtifact, sleep = sleepMs, polling = storePolling, isDead = processIsDead, now = () => Date.now() }) {
+export function createStoreCases({
+    profile, run, command, engine, inspectBox, safeArtifact, requireArtifact = () => {}, persist = () => {}, artifactPath = null, http = httpProbe, sleep = sleepMs, polling = storePolling, isDead = processIsDead, now = () => Date.now(),
+}) {
     const agentRef = `${FIXTURE_REPOSITORY}/s`;
     const fail = (message, evidence = null) => Object.assign(new Error(message), evidence ? { evidence } : {});
     let captureCounter = 0;
@@ -105,6 +116,8 @@ export function createStoreCases({ profile, run, command, inspectBox, safeArtifa
         if (box.running !== true) throw blocked('The owned Box is not running');
         const evidence = { agent: agentRef, box: profile.box.id };
         const record = (name, value) => { evidence[name] = value; safeArtifact(`store-${name}`, value); };
+        // The lifecycle evidence is required: a write that fails throws, and the stager refuses to certify a run without it.
+        const must = (name, value) => { evidence[name] = value; requireArtifact(`store-${name}`, value); };
         try {
             await steps();
         } finally {
@@ -293,6 +306,24 @@ export function createStoreCases({ profile, run, command, inspectBox, safeArtifa
             if (afterRecoveredHost.quarantined.length !== 2 || !afterRecoveredHost.quarantined.some(entry => entry.ownerToken === abandoned.token)) throw fail('The abandoned host lock was not preserved as a quarantined lock', { quarantined: afterRecoveredHost.quarantined });
             record('stale-host-dead', { lock: deadSeen.lock, pid: abandoned.pid, quarantined: afterRecoveredHost.quarantined, token: afterRecoveredHost.token });
             record('final', { boxStopped: true, quarantined: afterRecoveredHost.quarantined.length, holders: holders.length });
+
+            // ---- 8 to 10 the actual lifecycle ----------------------------------------------------------------------------------------------
+            if (typeof artifactPath !== 'function') throw blocked('LIVE-C5 needs the runner\'s artifact-path factory for the lifecycle driver receipt');
+            const lifecycle = createLifecycle({ profile, run, command, engine, inspectBox, persist, artifactPath, http, sleep, polling, fail, adminState, setLimits, hostClear, view, agentRef });
+            must('restart-on', await lifecycle.restartOn());
+            const writerFirst = await lifecycle.writerFirst();
+            must('writer-first', writerFirst);
+            const refusalClear = await lifecycle.clearAfterRefusal();
+            must('writer-first-clear', refusalClear);
+            const transition = await lifecycle.transitionFirst(refusalClear.token);
+            must('transition-first', transition);
+            must('final-generation', transition.final);
+            must('c5-receipt', {
+                schema: 1, runId: run.runId, caseId: 'LIVE-C5', source: profile.source.digest, engine: transition.engine, originalBox: profile.box.id, stamp: refusalClear.token,
+                writerFirst: { refusal: writerFirst.refusal, unchangedDigest: jsonDigest(writerFirst.unchanged) },
+                transitionFirst: { invocationId: transition.invocationId, productOperationId: transition.productOperationId, replies: transition.replies, attempts: transition.attempts, finalContainerId: transition.finalContainerId },
+                generations: transition.generations, finalGeneration: { id: transition.final.id, checks: transition.final.checks, gate: false, publications: transition.final.publications },
+            });
         }
     }
 

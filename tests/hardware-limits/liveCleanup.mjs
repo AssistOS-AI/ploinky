@@ -8,11 +8,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
+import { createTransitionStore } from '../../ploinky-box/hardwareLimitsTransition.mjs';
 import { requireTransport, runBoundedProcess } from './liveProcess.mjs';
 import {
     HOST_RECORD_DIRECTORIES, ID, INSPECT, OWNER_MARKER, assertOwnedDirectory, assertWorkspace, boxPsArgv, candidateEnv, checkedJson, commandTails, hostRecordPaths,
-    jsonDigest, liveSourceDigest, observeEngineIdentity, quarantinePath,
+    jsonDigest, liveSourceDigest, observeEngineFacts, quarantinePath,
 } from './liveCommon.mjs';
+import { c5ChainIds, c5IntentOf, driverSettled, productEngineDigest, readDriverReceipt, reconcileC5Custody, sameImage } from './liveBoxTransitionCustody.mjs';
+import { driverArgv, driverParams } from './liveStoreTransition.mjs';
 
 // One journaled command: the intent is persisted before the process starts and
 // the observed status after it ends. Output stays out of the journal; a command
@@ -89,7 +92,10 @@ export function recordHostRecords(run, profile, instance) {
     return changed;
 }
 
-export async function runOwnedCleanup({ run, profile, persist = () => {}, processProvider = runBoundedProcess, signal, platform = profile.host.platform }) {
+// `artifacts` and `artifactPath` are the runner's evidence writer and its exact-name path factory; `proofAction` names the action whose cleanup this
+// is. A LIVE-C5 run follows the replacement the actual gate-off restart may have left (resolved from the product's own durable records before any
+// mutation) and ends with a proof that every generation of the chain is gone.
+export async function runOwnedCleanup({ run, profile, persist = () => {}, processProvider = runBoundedProcess, signal, platform = profile.host.platform, artifacts = null, artifactPath = null, proofAction = null }) {
     const journaled = createJournal({ run, persist, processProvider, signal });
     const env = candidateEnv(profile);
     const engine = (kind, args, options = {}) => journaled(kind, profile.engine.path, args, { cwd: profile.host.home, env, ...options });
@@ -113,24 +119,46 @@ export async function runOwnedCleanup({ run, profile, persist = () => {}, proces
     // the proof is journaled: a failed proof leaves the step at 'intent' and nothing after it runs.
     const revalidation = step('revalidate-identity') || begin('revalidate-identity');
     if (revalidation.state !== 'intent') { revalidation.state = 'intent'; persist(); }
-    if (await observeEngineIdentity((kind, argv) => engine(kind, argv)) !== profile.engine.identityDigest) throw new Error('Engine service identity changed');
+    // The fresh engine document the harness digest is checked against; the product's own engine identity (the downgrade journal's) comes from this
+    // same observation.
+    const engineFacts = await observeEngineFacts((kind, argv) => engine(kind, argv));
+    if (engineFacts.digest !== profile.engine.identityDigest) throw new Error('Engine service identity changed');
     const workspace = classifyWorkspace();
     complete(revalidation);
+
+    // The chain of Box IDs this run may have owned: the original anchor and, for LIVE-C5, every linked generation the product's records prove.
+    const c5 = c5IntentOf(run);
+    let chain = null;
+    const ownedIds = () => (chain ? [...chain] : c5ChainIds(run, profile).filter(Boolean));
 
     // 4. Destroy with the candidate, then prove the exact Box absent.
     const destroyStep = step('destroy-box');
     if (destroyStep?.state !== 'complete') {
         const ids = await listIds('cleanup-inventory');
-        const target = await findOwnedBox(ids, workspace);
+        let custody = null;
+        if (c5 && profile.box?.id) {
+            custody = await resolveC5Custody(ids);
+            chain = custody.ids;
+        }
+        const target = custody ? (custody.current ? { id: custody.current.id, recorded: true, receipt: custody.current } : null) : await findOwnedBox(ids, workspace);
         const entry = destroyStep || begin('destroy-box');
         if (target) {
             if (workspace.state !== 'present') throw new Error('An owned Box exists but its workspace is not proven; preserving everything');
-            if (target.recorded) await inspectRecordedBox();
+            if (target.recorded) await inspectRecordedBox(target.receipt);
             assertWorkspace(profile);
             if (liveSourceDigest(profile.source.root) !== profile.source.digest) throw new Error('Candidate source changed');
-            await journaled('destroy-box', profile.node.path, [profile.candidate.path, 'destroy', '--delete-cache'], {
-                cwd: profile.workspace.path, env, deadlineMs: deadline('destroyMs', 300000), resourceIds: [target.id],
-            });
+            if (custody) await destroyThroughDriver(target.id);
+            else {
+                await journaled('destroy-box', profile.node.path, [profile.candidate.path, 'destroy', '--delete-cache'], {
+                    cwd: profile.workspace.path, env, deadlineMs: deadline('destroyMs', 300000), resourceIds: [target.id],
+                });
+            }
+        } else if (custody && workspace.state === 'present' && pendingTransitions()) {
+            // The Box is already absent but a product transition is still pending: the product's own destroy/absence handling closes it. No
+            // compensating restart is launched.
+            assertWorkspace(profile);
+            if (liveSourceDigest(profile.source.root) !== profile.source.digest) throw new Error('Candidate source changed');
+            await destroyThroughDriver(null);
         }
         await proveBoxAbsent();
         complete(entry);
@@ -159,7 +187,7 @@ export async function runOwnedCleanup({ run, profile, persist = () => {}, proces
     // 7. Nothing owned remains.
     const verify = step('verify-absent') || begin('verify-absent');
     const remaining = await listIds('final-inventory');
-    if (profile.box?.id && remaining.includes(profile.box.id)) throw new Error('Exact Box absence not proved at final verification');
+    if (profile.box?.id && ownedIds().some(id => remaining.includes(id))) throw new Error('Exact Box absence not proved at final verification');
     if (Array.isArray(run.preInventory.containers)
         && jsonDigest([...remaining].sort()) !== jsonDigest(run.preInventory.containers.map(value => value.id).sort())) {
         throw new Error('Unrelated container inventory changed at final verification; preserve evidence and do not undo it');
@@ -168,6 +196,12 @@ export async function runOwnedCleanup({ run, profile, persist = () => {}, proces
         ...(instance ? hostRecordPaths(profile.host.home, instance) : [])].filter(Boolean).filter(target => lstatOrNull(target));
     if (leftovers.length) throw new Error(`Owned paths remain after cleanup: ${leftovers.map(value => path.basename(value)).join(', ')}`);
     complete(verify);
+    if (profile.cases?.includes('LIVE-C5') && typeof artifacts === 'function' && proofAction) {
+        // The proof this cleanup action ends with: every generation of the chain is absent and the owned records are gone. It is written by THIS
+        // action for THIS run; the stager accepts no other.
+        artifacts('c5-cleanup-proof', { schema: 1, runId: run.runId, action: proofAction, at: Date.now(), invocationId: c5?.invocationId ?? null, chain: ownedIds(),
+            absent: ownedIds(), remaining: [], destroyedThrough: c5 ? 'exact-id driver' : 'candidate destroy', unrelatedInventory: 'unchanged' });
+    }
 
     function deadline(name, fallback) {
         const value = run.deadlines?.[name];
@@ -181,12 +215,48 @@ export async function runOwnedCleanup({ run, profile, persist = () => {}, proces
         return ids;
     }
 
-    async function inspectRecordedBox() {
-        const box = checkedJson(await engine('inspect-box', ['container', 'inspect', '--format', INSPECT, profile.box.id]));
+    // The recorded Box: the original receipt, or a linked generation's (the same fields: id, created, image, contract digest).
+    async function inspectRecordedBox(receipt = profile.box) {
+        const box = checkedJson(await engine('inspect-box', ['container', 'inspect', '--format', INSPECT, receipt.id]));
         const identity = assertWorkspace(profile);
-        if (box.id !== profile.box.id || box.created !== profile.box.created || box.image !== profile.box.image
+        if (box.id !== receipt.id || box.created !== receipt.created || !(receipt === profile.box ? box.image === receipt.image : sameImage(box.image, receipt.image))
             || box.labels?.[BOX_LABELS.pathHash] !== identity.pathHash || box.labels?.[BOX_LABELS.role] !== 'box'
-            || jsonDigest({ labels: box.labels, mounts: box.mounts }) !== profile.box.contractDigest) throw new Error('Box identity/contract changed');
+            || jsonDigest({ labels: box.labels, mounts: box.mounts }) !== receipt.contractDigest) throw new Error('Box identity/contract changed');
+    }
+
+    // Every eligible generation is resolved from the product's own durable records BEFORE the first mutation. The interrupted driver's settlement is
+    // proved through the owned transport (its manifest operation was observed), never by a saved PID.
+    async function resolveC5Custody(ids) {
+        if (typeof artifactPath !== 'function') throw new Error('LIVE-C5 cleanup needs the artifact-path factory to read the driver receipt; preserving everything');
+        if (workspace.state !== 'present') throw new Error('The LIVE-C5 custody cannot be resolved without the proven workspace; preserving everything');
+        const driver = readDriverReceipt(artifactPath(c5.driverReceiptName), c5, profile);
+        const entry = step('c5-custody') || begin('c5-custody');
+        entry.state = 'intent'; persist();
+        const custody = await reconcileC5Custody({
+            run, profile, driver, driverSettled: driverSettled(run), engineIdentity: productEngineDigest(engineFacts.info), ids,
+            unrelatedIds: (run.preInventory.containers || []).map(value => value.id),
+            inspect: async id => {
+                const result = await engine('c5-inspect-generation', ['container', 'inspect', id], { maxBytes: 262144 });
+                return JSON.parse(result.stdout)[0];
+            },
+            persist,
+        });
+        Object.assign(entry, { chain: custody.ids, current: custody.current?.id ?? null, unbound: custody.unbound });
+        complete(entry);
+        return custody;
+    }
+
+    function pendingTransitions() {
+        const identity = assertWorkspace(profile);
+        return createTransitionStore({ identity, homeDirectory: profile.host.home }).listPending().length > 0;
+    }
+
+    // The exact-ID destruction: the driver runs the real CLI's destroy with its selected ID required to equal the ID cleanup just proved.
+    async function destroyThroughDriver(expectedContainerId) {
+        const params = driverParams({ mode: 'destroy', profile, run, expectedContainerId });
+        await journaled('destroy-box', profile.node.path, driverArgv(profile, params), {
+            cwd: profile.workspace.path, env, deadlineMs: deadline('destroyMs', 300000), resourceIds: expectedContainerId ? [expectedContainerId] : [],
+        });
     }
 
     // The recorded Box; or, when start was attempted but the Box receipt was
@@ -222,7 +292,7 @@ export async function runOwnedCleanup({ run, profile, persist = () => {}, proces
     // unrelated immutable inventory without altering it.
     async function proveBoxAbsent() {
         const ids = await listIds('remaining-containers');
-        if (profile.box?.id && ids.includes(profile.box.id)) throw new Error('Exact Box absence not proved');
+        if (profile.box?.id && ownedIds().some(id => ids.includes(id))) throw new Error('Exact Box absence not proved');
         const owned = workspacePath ? [workspacePath, quarantinePath(workspacePath, run.runId)] : [];
         const unrelated = [];
         for (const id of ids) {
