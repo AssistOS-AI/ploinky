@@ -130,7 +130,7 @@ async function admitLive(options) {
     const live = createLiveObserver({ manifest, deps, statusProof: () => workerHost.status() });
     // After U4 the edge generation has legitimately moved; the parent passes the one it admitted, every other binding stays exact.
     const receipt = await live.admit(options.generation ? { activeGeneration: options.generation } : {});
-    return { manifest, live, deps, latch, custody, receipt, env: buildCommandEnvironment(process.env, { PLOINKY_WORKSPACE_ROOT: manifest.workspace.path }) };
+    return { manifest, live, workerHost, deps, latch, custody, receipt, env: buildCommandEnvironment(process.env, { PLOINKY_WORKSPACE_ROOT: manifest.workspace.path }) };
 }
 
 function unverifiedRecords(output) {
@@ -255,14 +255,19 @@ async function main(rawOptions) {
             writeObservations();
             throw error;
         }
-        // The command settled with exactly the expected exit status; unexpected results above keep every fixture in place.
-        unsafeToClean = false;
         const output = sanitize(command.stdout.toString('utf8')) + '\n' + sanitize(command.stderr.toString('utf8'));
+        // Exit status 1 alone does not prove a normal return: the product's exception path also exits 1 with its in-Box
+        // writers unproven. Fixtures stay in place unless the normal-return wording is present, the exception-path output is
+        // absent and the product reports no recovery barrier and readable update state.
+        let status; try { status = await admission.workerHost.status(); } catch { status = { owned: false, recoveryBarrier: true, stateReadErrors: 1 }; }
+        const classification = classifyUpdateReturn({ label, output, status });
+        unsafeToClean = !classification.normal;
         artifact(`${label}-stdout.log`, command.stdout.toString('utf8')); artifact(`${label}-stderr.log`, command.stderr.toString('utf8'));
         const result = { exitCode: command.code, durationMs: command.durationMs, stdoutBytes: command.stdoutBytes, stderrBytes: command.stderrBytes, unverified: unverifiedRecords(output),
             caches: Object.fromEntries(names.map(name => [name, snapshot(cachePaths[name])])) };
-        observations.passes[label] = result;
+        observations.passes[label] = { ...result, normalReturn: classification.normal, unsettledReasons: classification.reasons };
         writeObservations();
+        assert.equal(classification.normal, true, 'Exit status 1 is not proven to be a normal return (' + classification.reasons.join(', ') + '); fixtures are retained for recovery');
         assert.equal(command.code, 1, 'Actual failures must produce a truthful nonzero exit status');
         assertSafety();
         return { ...result, output };
@@ -416,7 +421,7 @@ async function main(rawOptions) {
     } finally {
         writeObservations();
         try {
-            if (unsafeToClean) throw new Error('The outer command timed out or was signalled; retain fixtures until the owning in-Box writer is proven terminated.');
+            if (unsafeToClean) throw new Error('The outer command did not settle, or its exit status is not proven a normal return with no recovery barrier; retain fixtures until the owning in-Box writer is proven terminated.');
             await locked(() => {
                 if (activeManifestBackup) {
                     const stat = fs.lstatSync(activeManifest);
@@ -479,7 +484,21 @@ function assertOptionalActivationText(output) {
     assert.doesNotMatch(output, /Activation was blocked by:|Activation not required/);
 }
 
-export { parseArgs, validatePaths, admitLive, unverifiedRecords, assertOptionalActivationText };
+const EXCEPTION_PATH_OUTPUT = [/update-transaction/, /Update failed before a new graph was activated/, /Update failed; reconstruction of the previous Box/, /Update failed and the previous workspace state could not be fully reconstructed/,
+    /Update did not start in this workspace/, /Update failed; the activation outcome could not be determined/];
+const NORMAL_RETURN_WORDING = Object.freeze({ 'optional-errors': /Activation: the workspace graph was restarted and the Router health check passed\./,
+    'unknown-required-scope': /Activation deferred; the running workspace graph was not restarted\./ });
+// Only the product's normal return prints its activation wording; its exception path prints a failed update-transaction
+// record and one of the failure wordings instead.
+function classifyUpdateReturn({ label, output, status }) {
+    const reasons = [];
+    if (!NORMAL_RETURN_WORDING[label]?.test(output)) reasons.push('normal-return-wording-absent');
+    if (EXCEPTION_PATH_OUTPUT.some(pattern => pattern.test(output))) reasons.push('exception-path-output');
+    if (status?.owned !== true || status.recoveryBarrier !== false || status.stateReadErrors !== 0) reasons.push('recovery-barrier-or-unreadable-state');
+    return Object.freeze({ normal: reasons.length === 0, reasons });
+}
+
+export { parseArgs, validatePaths, admitLive, unverifiedRecords, assertOptionalActivationText, classifyUpdateReturn };
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
     try {
         const options = parseArgs(process.argv.slice(2));
