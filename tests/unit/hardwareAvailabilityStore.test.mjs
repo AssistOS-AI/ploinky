@@ -242,6 +242,14 @@ function reseal(document) {
 }
 const MARKER = 'SECRET-MARKER-DO-NOT-ECHO';
 
+// A required case is one leaf test; a failing variant is named in its message.
+const inVariantAsync = async (label, run) => {
+    try { return await run(); } catch (error) {
+        if (error instanceof Error) error.message = `[${label}] ${error.message}`;
+        throw error;
+    }
+};
+
 test('NW1.D1-missing-emptied-or-corrupt-store-refuses-init-and-fails-the-reader-closed', async (t) => {
     const variants = {
         'a deleted policy.json': ({ paths }) => { fs.rmSync(paths.availabilityPolicyFile); fs.writeFileSync(path.join(paths.availabilityStoreDir, 'stray'), 'x'); },
@@ -278,7 +286,7 @@ test('NW1.D1-missing-emptied-or-corrupt-store-refuses-init-and-fails-the-reader-
         'n2 witness with an extra key': ({ paths }) => { fs.writeFileSync(paths.availabilityWitnessFile, JSON.stringify({ ...readJson(paths.availabilityWitnessFile), extra: MARKER })); },
     };
     for (const [label, damage] of Object.entries(variants)) {
-        await t.test(label, () => {
+        await inVariantAsync(label, () => {
             const workspace = initWithEntries(t, 'alpha', 'beta');
             damage(workspace);
             const before = snapshotTree(workspace.paths.ploinkyDir);
@@ -510,9 +518,9 @@ const INSTALL_POINTS = [
 
 test('NW1.D1-sigkill-at-each-install-point-never-leaves-a-witness-without-a-store', async (t) => {
     for (const [point, expected] of INSTALL_POINTS) {
-        await t.test(point, async (subtest) => {
-            const workspace = makeWorkspace(subtest);
-            await killAt(subtest, 'init', workspace.root, {}, point);
+        await inVariantAsync(point, async () => {
+            const workspace = makeWorkspace(t);
+            await killAt(t, 'init', workspace.root, {}, point);
             const { paths } = workspace;
             const witness = fs.existsSync(paths.availabilityWitnessFile);
             const directory = fs.existsSync(paths.availabilityStoreDir);
