@@ -18,7 +18,8 @@ const leaseSource = source.slice(start, end).replace('export function', 'functio
 
 test('R.owned-generation-chain-does-not-self-refuse', async () => {
     let current = selector('a');
-    const original = new Function('loadActiveEdgeRoutingGeneration', `${leaseSource}\nreturn captureEdgeRoutingLease();`)(() => ({ selector: current, generation: {} }));
+    // The lease also captures the resolver's effective availability (M-NW-01); this test is about the selector chain only, so it sees a constant one.
+    const original = new Function('loadActiveEdgeRoutingGeneration', 'resolveLeaseEffective', `${leaseSource}\nreturn captureEdgeRoutingLease();`)(() => ({ selector: current, generation: {} }), () => ({ revision: 'sha256:fixture-effective' }));
     const authority = createHardwareApplyAuthority({ verifyInitial: () => original.commit(), readSelection: () => ({ selector: current, paths: { activeSelectorFile: selectorFile } }) });
     const record = { type: 'agent', repoName: 'demo', agentName: 'worker', instanceId: 'instance', enableGeneration: 'generation', containerId: 'f'.repeat(64) };
     const registry = { exact: record };
