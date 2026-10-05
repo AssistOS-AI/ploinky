@@ -23,7 +23,7 @@ import { HttpRouteAccessPath } from './policy/HttpRouteAccessPath.js';
 import { normalizeManifestHttpRouteAccess } from './policy/HttpRouteProviders.js';
 import { compileProxyLimits } from './proxy/limits.js';
 import { createRoutePlan } from './proxy/RoutePlan.js';
-import { routeHardwareAvailability } from './hardwareAvailability.mjs';
+import { leaseRouteHardwareAvailability } from './hardwareAvailability.mjs';
 
 const LOCAL_CONTROL_HOSTS = new Set(['localhost', '127.0.0.1', '::1', 'router.localhost']);
 const MANAGED_ROUTER_HOST = 'host.containers.internal';
@@ -229,7 +229,7 @@ function agentPortPlan({
     }
     // A refused or blocked instance is unavailable on every transport,
     // including the private relay target path (plan §9.4).
-    const hardwareAvailability = routeHardwareAvailability(snapshot, selected.routeKey);
+    const hardwareAvailability = leaseRouteHardwareAvailability(lease, selected.routeKey);
     if (hardwareAvailability) {
         return deny(503, 'AGENT_HARDWARE_UNAVAILABLE', {
             matched: true,
@@ -652,7 +652,7 @@ function agentRootPlan({
         snapshot,
         transport,
     };
-    const hardwareAvailability = routeHardwareAvailability(snapshot, agent.routeKey);
+    const hardwareAvailability = leaseRouteHardwareAvailability(lease, agent.routeKey);
     if (hardwareAvailability) {
         // The logical route stays resolvable; only a terminal unavailable
         // answer is possible. Non-HTTP transports are denied outright.

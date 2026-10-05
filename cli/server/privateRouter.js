@@ -10,7 +10,7 @@ import {
 import { readSecretsFile } from '../utils/security/encryptedSecretsFile.js';
 import { derivePrivateAgentRequestSecret } from '../utils/security/masterKey.js';
 import { commitRoutePlan } from './edgeRoutePlan.js';
-import { identityHardwareUnavailable } from './hardwareAvailability.mjs';
+import { identityHardwareUnavailable, identityLeaseHardwareUnavailable } from './hardwareAvailability.mjs';
 
 const PRIVATE_ASSERTION_HEADER = 'ploinky-agent-assertion';
 const PRIVATE_BODY_MAX_BYTES = 10 * 1024 * 1024;
@@ -173,7 +173,9 @@ export function authorizePrivateRoutePlan({ req, plan, body = Buffer.alloc(0), a
     const current = currentEnabledAgentIdentity(plan.snapshot, agentId);
     if (!current || !current.enableGeneration) throw unauthorized('private assertion caller is not currently enabled');
     // A refused or blocked caller keeps no relay authority (plan §9.4).
-    if (identityHardwareUnavailable(plan.snapshot, current)) {
+    if (plan.lease?.effective
+        ? identityLeaseHardwareUnavailable(plan.lease, current)
+        : identityHardwareUnavailable(plan.snapshot, current)) {
         throw forbidden('private assertion caller is unavailable under hardware limits', 'PRIVATE_CALLER_HARDWARE_UNAVAILABLE');
     }
     if (String(untrusted?.instanceId || '') !== current.instanceId

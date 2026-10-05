@@ -25,6 +25,7 @@ import { resolveManifestRuntimeProfile } from '../../utils/runtime/profileServic
 import { resolveLlmRuntimeAdmissionContext } from '../../sandbox/docker/llmRuntimeIntegration.js';
 import { isSessionRevoked } from '../auth/sessionRevocations.js';
 import { createHardwareApplyAuthority } from '../hardwareLimitsApplyAuthority.mjs';
+import { readStoreAvailabilityProjections } from '../hardwareAvailabilityProjections.mjs';
 
 export const HARDWARE_HELP = Object.freeze({
     authority: 'Workspace-capable agents may read the workspace master key and forge administrator cookie/CSRF requests. This exposure is accepted for v1.',
@@ -133,7 +134,7 @@ export function refuseUnenforceableProposal({ agentRef, agents, context, getInst
     }
 }
 
-export function buildHardwareLimitsState({ context, installed, registry, routing = {}, metrics = null, admit = defaultAdmission, readApplied = readAppliedObservation, readDeclarationNote = defaultDeclarationNote }) {
+export function buildHardwareLimitsState({ context, installed, registry, routing = {}, storeProjections = null, metrics = null, admit = defaultAdmission, readApplied = readAppliedObservation, readDeclarationNote = defaultDeclarationNote }) {
     const entries = new Map(installed.map((agent) => [agent.ref, agent]));
     for (const ref of context.overrides?.keys() || []) if (!entries.has(ref)) entries.set(ref, { ref, orphaned: true });
     const agents = [];
@@ -151,7 +152,12 @@ export function buildHardwareLimitsState({ context, installed, registry, routing
         for (const [key, record] of Object.entries(registry)) {
             if (record?.type !== 'agent' || `${record.repoName}/${record.agentName}` !== agent.ref) continue;
             const route = Object.values(routing.routes || {}).find((value) => value?.container === key);
-            const projection = route?.hardwareAvailability;
+            let projection = route?.hardwareAvailability;
+            if (!projection && storeProjections) {
+                for (const candidate of storeProjections.values()) {
+                    if (candidate.key === key) { projection = candidate; break; }
+                }
+            }
             let problem = null;
             if (projection && projection.key === key && projection.instanceId === record.instanceId && projection.enableGeneration === record.enableGeneration) {
                 try { problem = validateHardwareOutcome(projection.problem); } catch (_) {}
@@ -240,7 +246,7 @@ function readBody(req) {
 
 export async function handleHardwareLimitsRoutes(req, res, parsedUrl, {
     ensureAdmin, verifyMutation, getContext = defaultContext, getInstalled = installedAgents,
-    getRegistry = readAgentRegistrySnapshot, getRouting = readRoutingConfig,
+    getRegistry = readAgentRegistrySnapshot, getRouting = readRoutingConfig, getStoreProjections = readStoreAvailabilityProjections,
     getMetrics = () => workspaceMetricsMonitor.latest, apply = runHardwareLimitsApplyWorker, readApplied = readAppliedObservation,
     refreshMetrics = (since) => workspaceMetricsMonitor.reconcileAfter(since),
     set = setAgentLimits, clear = clearAgentLimits, admit = defaultAdmission, verifyLease = () => true,
@@ -260,7 +266,7 @@ export async function handleHardwareLimitsRoutes(req, res, parsedUrl, {
         const context = getContext({ refreshBackend: method === 'POST' });
         const installed = getInstalled();
         const registry = getRegistry();
-        const state = () => ({ ...buildHardwareLimitsState({ context: getContext(), installed, registry: getRegistry(), routing: getRouting(), metrics: getMetrics(), admit, readApplied }), apply: hardwareApplyFlight() });
+        const state = () => ({ ...buildHardwareLimitsState({ context: getContext(), installed, registry: getRegistry(), routing: getRouting(), storeProjections: getStoreProjections(), metrics: getMetrics(), admit, readApplied }), apply: hardwareApplyFlight() });
         if (method === 'GET') {
             const result = state();
             if (context.storeState === 'unreadable') send(503, { ...result, ok: false, error: 'store_unreadable', message: context.storeDetail || 'The hardware store is unreadable.' });

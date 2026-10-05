@@ -11,7 +11,8 @@ import { AppliedLimitsCache, parseMemoryUsage, limitsUsage } from './workspaceMe
 import { readAppliedObservation } from '../sandbox/hardwareLimits/runtimeState.mjs';
 import { readBoxHardwareContext } from '../sandbox/hardwareLimits/context.mjs';
 import { readRoutingConfig } from './routingFile.js';
-import { metricHardwareAvailability } from './workspaceMetricsAvailability.mjs';
+import { availabilityForcesNotReady, metricHardwareAvailability } from './workspaceMetricsAvailability.mjs';
+import { readStoreAvailabilityProjections } from './hardwareAvailabilityProjections.mjs';
 
 const RECONCILE_INTERVAL_MS = 5_000;
 // How long a successful Apply waits for a metrics reconcile that started after it: the reconcile re-inspects every running container in
@@ -71,7 +72,7 @@ function publicRuntimeEntry(entry, metrics) {
 
 export class WorkspaceMetricsMonitor extends EventEmitter {
   // The readers default to the real ones; tests inject only what the engine and the host would answer.
-  constructor({ readRegistry = getAgentsRegistry, collectContainers = null, runtimeStateOptions = {}, readHardwareContext = readBoxHardwareContext, readRouting = readRoutingConfig, containerStats = true } = {}) {
+  constructor({ readRegistry = getAgentsRegistry, collectContainers = null, runtimeStateOptions = {}, readHardwareContext = readBoxHardwareContext, readRouting = readRoutingConfig, readStoreProjections = readStoreAvailabilityProjections, containerStats = true } = {}) {
     super();
     this.readRegistry = readRegistry;
     // Strict by default: an engine read that fails rejects, so the reconcile fails instead of publishing "no container".
@@ -80,6 +81,7 @@ export class WorkspaceMetricsMonitor extends EventEmitter {
     this.runtimeStateOptions = runtimeStateOptions;
     this.readHardwareContext = readHardwareContext;
     this.readRouting = readRouting;
+    this.readStoreProjections = readStoreProjections;
     this.containerStats = containerStats;
     this.reconcilePromise = null;
     this.completedReconcileStartedAt = 0;
@@ -183,7 +185,8 @@ export class WorkspaceMetricsMonitor extends EventEmitter {
       this.hardwareEnabled = this.readHardwareContext().gate === 'on';
       if (this.hardwareEnabled) {
         const routing = this.readRouting();
-        this.hardwareAvailability = new Map(this.states.map((entry) => [entry.containerName, metricHardwareAvailability(entry, registry[entry.containerName], routing)]));
+        const storeProjections = this.readStoreProjections();
+        this.hardwareAvailability = new Map(this.states.map((entry) => [entry.containerName, metricHardwareAvailability(entry, registry[entry.containerName], routing, storeProjections)]));
       }
       if (this.hardwareEnabled) await this.appliedLimits.reconcile(this.states.map((entry) => ({
         ...entry,
@@ -312,7 +315,7 @@ export class WorkspaceMetricsMonitor extends EventEmitter {
       const hardware = this.hardwareEnabled ? this.hardwareAvailability.get(entry.containerName) : null;
       if (hardware) {
         Object.assign(projected, hardware);
-        if (['refused', 'blocked', 'failed', 'stopped'].includes(hardware.availability)) projected.state.ready = false;
+        if (availabilityForcesNotReady(hardware.availability)) projected.state.ready = false;
       }
       return projected;
     });

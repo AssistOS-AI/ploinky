@@ -158,6 +158,36 @@ export function identityHardwareUnavailable(snapshot, identity) {
     return null;
 }
 
+// The effective denial of a route for a captured lease: the compiled parent
+// projection first, else the durable store's denial for that route (M-NW-01).
+// The store contributes only validated `active` evidence and gated committed
+// entries, and only for a target-less route, so a route with a target never
+// carries one.
+export function leaseRouteHardwareAvailability(lease, routeKey) {
+    const parent = routeHardwareAvailability(lease?.snapshot, routeKey);
+    if (parent) return parent;
+    const denials = lease?.effective?.denials;
+    if (!(denials instanceof Map)) return null;
+    return denials.get(String(routeKey || '')) || null;
+}
+
+// A caller identity is also unavailable when a store-derived denial names its
+// exact instance or generation, or its route key.
+export function identityLeaseHardwareUnavailable(lease, identity) {
+    const parent = identityHardwareUnavailable(lease?.snapshot, identity);
+    if (parent) return parent;
+    const denials = lease?.effective?.denials;
+    if (!(denials instanceof Map) || !identity) return null;
+    if (identity.routeKey && denials.has(identity.routeKey)) return denials.get(identity.routeKey);
+    for (const entry of denials.values()) {
+        if ((identity.instanceId && entry.instanceId === identity.instanceId)
+            || (identity.enableGeneration && entry.enableGeneration === identity.enableGeneration)) {
+            return entry;
+        }
+    }
+    return null;
+}
+
 function safeText(value, max) {
     return String(value || '').replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, max);
 }

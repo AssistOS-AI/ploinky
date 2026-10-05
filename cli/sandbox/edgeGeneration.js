@@ -40,6 +40,7 @@ import {
     restoreHardwareAvailabilityWitness,
     sweepHardwareAvailabilityTemps,
 } from './hardwareAvailabilityStore.mjs';
+import { resolveEffectiveHardwareAvailability } from '../server/hardwareAvailabilityResolver.mjs';
 
 export const EDGE_GENERATION_SCHEMA_VERSION = 1;
 export const EDGE_TOPOLOGY_CONTAINER_DIR = '/run/ploinky-edge-topology';
@@ -1579,6 +1580,19 @@ function loadGenerationById(paths, generationId) {
         generation: generationId,
         publicationState: 'error',
     });
+}
+
+/**
+ * Read-only: one generation of this workspace by id, selected or not. It exists
+ * for the hardware-availability evidence probe, which evaluates the resolver
+ * lock-free against the generation the selector names; only tests import it.
+ */
+export function loadEdgeRoutingGenerationForEvidence(generationId, options = {}) {
+    const id = String(generationId || '');
+    if (!/^sha256:[a-f0-9]{64}$/.test(id)) {
+        throw edgeError('edge routing generation evidence requires one exact generation id', 'EDGE_GENERATION_INVALID');
+    }
+    return loadGenerationById(resolveEdgeGenerationPaths(options), id);
 }
 
 function selectedPreviousGeneration(paths, selector) {
@@ -3168,6 +3182,18 @@ export function readEdgeRoutingPreparationOwner(options = {}) {
     return lease ? deepFreeze({ pid: lease.pid, reason: lease.reason, mode: lease.mode }) : null;
 }
 
+// The hardware-availability resolver's output for one captured generation
+// (M-NW-01 D2-S). Both lease families capture it and fence commit()/isCurrent()
+// on its revision; a store that cannot be read fails the capture and the fence.
+function resolveLeaseEffective(generation, options = {}) {
+    return resolveEffectiveHardwareAvailability({
+        generation,
+        paths: resolveEdgeGenerationPaths(options),
+        ...(options.runningDir ? { runningDir: options.runningDir } : {}),
+        ...(options.fsApi ? { fsApi: options.fsApi } : {}),
+    });
+}
+
 export function captureEdgeRoutingLease(options = {}) {
     const active = loadActiveEdgeRoutingGeneration(options);
     const generationId = active.selector.generation;
@@ -3178,27 +3204,25 @@ export function captureEdgeRoutingLease(options = {}) {
             mismatchMessage: 'active Router attestation owner does not match its immutable generation record',
         })
         : null;
+    const effective = resolveLeaseEffective(active.generation, options);
+    const isCurrent = () => {
+        try {
+            const current = loadActiveEdgeRoutingGeneration(options);
+            return current.selector.generation === generationId
+                && current.selector.activationId === activationId
+                && resolveLeaseEffective(active.generation, options).revision === effective.revision;
+        } catch (_) {
+            return false;
+        }
+    };
     return Object.freeze({
         id: generationId,
         activationId,
         snapshot: active.generation,
+        effective,
         ...(owner ? { owner } : {}),
-        commit() {
-            try {
-                const current = loadActiveEdgeRoutingGeneration(options);
-                return current.selector.generation === generationId && current.selector.activationId === activationId;
-            } catch (_) {
-                return false;
-            }
-        },
-        isCurrent() {
-            try {
-                const current = loadActiveEdgeRoutingGeneration(options);
-                return current.selector.generation === generationId && current.selector.activationId === activationId;
-            } catch (_) {
-                return false;
-            }
-        },
+        commit: isCurrent,
+        isCurrent,
     });
 }
 
@@ -3264,7 +3288,7 @@ export function captureEdgeRoutingObservationLease({ expectedGeneration, ...opti
                 'EDGE_GENERATION_RUNTIME_MISMATCH',
             );
         }
-        return { selector, generation, preparationTransactionId };
+        return { selector, generation, preparationTransactionId, effective: resolveLeaseEffective(generation, options) };
     };
     const initial = capture();
     const isCurrent = () => {
@@ -3275,7 +3299,8 @@ export function captureEdgeRoutingObservationLease({ expectedGeneration, ...opti
                 && current.selector.activationId === initial.selector.activationId
                 && current.selector.selectorDigest === initial.selector.selectorDigest
                 && current.generation.generation === initial.generation.generation
-                && current.preparationTransactionId === initial.preparationTransactionId;
+                && current.preparationTransactionId === initial.preparationTransactionId
+                && current.effective.revision === initial.effective.revision;
         } catch (_) {
             return false;
         }
@@ -3284,6 +3309,7 @@ export function captureEdgeRoutingObservationLease({ expectedGeneration, ...opti
         id: expected,
         activationId: initial.selector.activationId,
         snapshot: initial.generation,
+        effective: initial.effective,
         commit: isCurrent,
         isCurrent,
     });
