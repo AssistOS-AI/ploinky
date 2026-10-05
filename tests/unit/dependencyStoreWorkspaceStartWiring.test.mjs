@@ -25,6 +25,7 @@ import { summarizeStartResult } from '../../cli/sandbox/hardwareLimits/outcomes.
 import { tempRoot } from './dependencyStoreFixtures.mjs';
 import { containerOf, entryFor, makeWorld } from './hardwareAvailabilityResolverFixtures.mjs';
 import { runRetirementDriver } from './hardwareAvailabilityRetirementHarness.mjs';
+import { stageNoWaitAvailabilitySlots } from '../../cli/commands/noWaitAvailabilitySlots.js';
 import {
     CONTAINER,
     driveWiring,
@@ -364,6 +365,18 @@ test('NW1.S-slots-are-committed-before-any-marker-or-spawn-and-a-failed-slot-com
         assert.equal(options.schedule.flat()[0], fixture.entry, 'the bound schedule of this run');
         assert.equal(options.isParentKnown(fixture.entry), false);
     }
+    // The REAL staging entry point on a workspace whose store was never initialized: the start's error names the slot commit.
+    {
+        const emptyRoot = tempRoot(t, 'depstore-staging-empty-');
+        const fixture = noWaitStart(t, {});
+        fixture.collaborators.stageNoWaitAvailabilitySlots = async (options) => {
+            fixture.calls.push(['stageSlots', options]);
+            return stageNoWaitAvailabilitySlots({ ...options, workspaceRoot: emptyRoot });
+        };
+        await assert.rejects(sandbox(fixture.collaborators)('repo/demo', '8080', {}), /start \(workspace\) failed: no-wait availability slot commit failed: .*not initialized/);
+        const names = fixture.calls.map(([name]) => name);
+        for (const forbidden of ['spawn', 'spawnFailureStatus']) assert.equal(names.includes(forbidden), false, `${forbidden} must not run after a failed slot commit`);
+    }
     // A failed slot commit aborts the start naming the commit; no worker, no marker, no status for the run.
     {
         let fail = true;
@@ -509,6 +522,7 @@ test('NW1.S-same-tuple-ready-publication-retires-entries-at-its-commit-point', a
         const failedApply = runRetirementDriver(targeted.world, 'site-t', { routeKey: 'alpha', container: containerOf('alpha'), registryRecord: targeted.record('alpha'), failure: 'apply' });
         assert.match(failedApply.commitError.message, /the successor publication failed/);
         assert.deepEqual(failedApply.entriesAfter, ['alpha'], 'T with the apply failing keeps the entry');
+        assert.equal(failedApply.selectorAfter.state, 'inactive', 'and the coordinated merge left the selector inactive');
         assert.deepEqual(failedApply.witnesses, []);
         const unverified = retirementWorld(t);
         const failedVerify = runRetirementDriver(unverified.world, 'site-t', { routeKey: 'alpha', container: containerOf('alpha'), registryRecord: unverified.record('alpha'), failure: 'verify' });

@@ -175,7 +175,13 @@ async function run() {
                 const dependencies = {
                     retireEntriesAfterApply: spyAfterApply,
                     retireCandidate: () => {},
-                    ...(argument.failure === 'apply' ? { mergeRouting: () => { throw new Error('the successor publication failed'); } } : {}),
+                    // The real merge inactivates the selector and runs the mutator; the publication then fails before its apply completes.
+                    ...(argument.failure === 'apply'
+                        ? { mergeRouting: (mutator, options) => routing.mergeRoutingConfig((current, capabilities) => {
+                            mutator(current, capabilities);
+                            throw new Error('the successor publication failed');
+                        }, options) }
+                        : {}),
                     ...(argument.failure === 'verify'
                         ? { loadActive: (() => {
                             let calls = 0;

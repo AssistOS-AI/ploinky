@@ -25,13 +25,14 @@ function quiet(t) {
 }
 
 // Start the probe, THEN stage the run (so polling begins before the run started) and write the worker's terminal status.
-async function scenario(t, world, { fsApi, beforeWrite, afterWrite, probeOptions } = {}) {
+async function scenario(t, world, { fsApi, beforeWrite, afterWrite, probeOptions, lateByMs } = {}) {
     const probe = await startProbe(t, world, probeOptions);
     const runStartedAtMs = Date.now();
     const slot = world.stageSlot('alpha', { runStartedAtMs });
     if (beforeWrite) beforeWrite(slot);
-    await sleep(30);   // finishedAtMs must follow the run's sequence phase
-    const finishedAtMs = Date.now();
+    // `lateByMs`: the worker finished at runStartedAtMs + 30 but its durable rename comes this much later.
+    await sleep(lateByMs ? lateByMs : 30);   // finishedAtMs must follow the run's sequence phase
+    const finishedAtMs = lateByMs ? runStartedAtMs + 30 : Date.now();
     const report = world.writeWorker('alpha', slot, { kind: 'hardware', finishedAtMs, ...(fsApi ? { fsApi } : {}) });
     // The worker's own return value is the receipt's log line; nothing is hand-built.
     const delivered = afterWrite ? afterWrite(report) : report;
@@ -197,6 +198,16 @@ test('NW1.S-durable-activation-is-proved-without-http-against-the-named-generati
         assert.ok(Math.abs(run.receipt.status.ctimeMs - run.receipt.worker.visibleAtMs) > CTIME_TOLERANCE_MS);
         assert.equal(run.receipt.checks.ctimeMatchesVisible, false);
         assert.equal(run.receipt.credited, false, 'a ctime mismatch voids the receipt');
+    }
+    // ---- an end-to-end observation outside the window: the run finished at T_f, but the worker's durable rename comes 5.3 s later
+    {
+        const world = makeWorld(t);
+        const run = await scenario(t, world, { lateByMs: CREDIT_WINDOW_MS + 300 });
+        assert.equal(run.receipt.observed, true);
+        assert.equal(run.receipt.status.finishedAtMs, run.finishedAtMs, 'T_f is the status file\'s validated finish time');
+        assert.ok(run.receipt.clock.firstActiveObservedAtMs > run.finishedAtMs + CREDIT_WINDOW_MS + run.receipt.clock.pollIntervalMs, 'the first typed observation is past T_f + 5000 + P');
+        assert.equal(run.receipt.checks.observedInWindow, false);
+        assert.equal(run.receipt.credited, false, 'a late activation is not credited');
     }
     // ---- a forged worker line: T_f comes from the status file's validated finishedAtMs, so a line claiming another finish voids the receipt
     {

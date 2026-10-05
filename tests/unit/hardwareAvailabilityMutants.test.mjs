@@ -235,7 +235,10 @@ export const AVAILABILITY_MUTANTS = Object.freeze({
         { from: '!entry.identity || isParentKnown(entry)) continue;', to: '!entry.identity) continue;' }]),
     'ms21-257-slots-are-accepted': { name: 'ms21-257-slots-are-accepted', file: STORE,
         kill: kill(SLOTS_TEST, 'NW1\\.S-frozen-v1-slot-schema'),
-        patches: [{ from: 'Object.keys(nextSlots).length > MAX_HARDWARE_AVAILABILITY_SLOTS) {', to: 'Object.keys(nextSlots).length > MAX_HARDWARE_AVAILABILITY_SLOTS + 1) {' }] },
+        patches: [
+            { from: 'Object.keys(nextSlots).length > MAX_HARDWARE_AVAILABILITY_SLOTS) {', to: 'Object.keys(nextSlots).length > MAX_HARDWARE_AVAILABILITY_SLOTS + 1) {' },
+            { from: "shape(Object.keys(document.slots).length <= MAX_HARDWARE_AVAILABILITY_SLOTS, 'policy has too many slots');", to: "shape(Object.keys(document.slots).length <= MAX_HARDWARE_AVAILABILITY_SLOTS + 1, 'policy has too many slots');" },
+        ] },
     'ms32-resolving-a-newer-slot-keeps-the-older-same-tuple-entry': slotsMutant('ms32-resolving-a-newer-slot-keeps-the-older-same-tuple-entry', 'NW1\\.S-staging-and-latch-resolution', [
         { from: "            supersedeEntry(routeKey, slot);\n            resolutions.push({ routeKey, runId: slot.runId, resolution: 'retired', evidenceClass", to: "            resolutions.push({ routeKey, runId: slot.runId, resolution: 'retired', evidenceClass" }]),
     'ms39a-a-resolve-commit-latches-the-cause-on-the-wrong-route': slotsMutant('ms39a-a-resolve-commit-latches-the-cause-on-the-wrong-route', 'NW1\\.S-a-resolve-commit-never-changes', [
