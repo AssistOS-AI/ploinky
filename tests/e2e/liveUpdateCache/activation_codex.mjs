@@ -137,8 +137,8 @@ export async function runActivationPhase({ release, known, u7dFinishedAt, epoch,
     const place = await port.start(release); check();
     const run = await port.execute(release, place); check();
     await port.finish(release, place, run);
-    const receipt = await port.verify({ release, place, u7dFinishedAt, postObservedAt: wallNow() }); check();
+    const receipt = await port.verify({ release2: release, place, u7dFinishedAt, postObservedAt: wallNow() }); check();
     const first = await epoch({ addedGraph: true }), after = await epoch({ addedGraph: true, generation: first.generation });
     need(sameState(first, after), 'canonical-epoch-changed'); assertActivationWindow({ before, after }); check();
-    return { before, after, place, receipt, install, admission: { boxAgeMs: wallNow() - Date.parse(release.box.startedAt) } };
+    return { before, after, place, receipt, install };
 }

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { manifestFixture, installPureGuards, H } from './test_support_codex.mjs';
+import { manifestFixture, installPureGuards, OPTIONAL_GRAPH, H } from './test_support_codex.mjs';
 import { createFakeHost, byArgs } from './fake_host_support_codex.mjs';
 import { validateManifest } from './manifest_codex.mjs';
 import { buildCommandEnvironment } from './host_command_codex.mjs';
@@ -162,6 +162,30 @@ test('the Box name is read from the same exact-ID inspect, with or without the l
     assert.equal(parseBoxInspect(Buffer.from(boxLines({ name: '/n1' }))).name, 'n1'); assert.equal(parseBoxInspect(Buffer.from(boxLines({ name: 'n1' }))).name, 'n1');
     assert.equal(parseBoxInspect(Buffer.from(boxLines({ labels: { 'io.assistos.ploinky-box.gpu-grant': 'zz' } }))).gpuGrantLabelPresent, true); assert.equal(parseBoxInspect(Buffer.from(boxLines({ labels: {} }))).gpuGrantLabelPresent, false);
     assert.throws(() => parseBoxInspect(Buffer.from(boxLines({ name: 7 }))), error => error.code === 'box-inspect-shape');
+});
+
+test('R2 after the activation: the declared optional runtimes extend the probe input, the required graph and the readiness count, and nothing else may be added', async () => {
+    const withActivation = (m, s) => { m.activation = structuredClone(OPTIONAL_GRAPH); };
+    const h = build(withActivation); const names = h.manifest.graph.map(entry => entry.name);
+    // Before the activation the observer is exactly as before: the probe names only the default graph.
+    assert.deepEqual(probeInput(h.manifest).requiredRuntimes.map(row => row.name), names); assert.equal(expectedLiveFromManifest(h.manifest).requiredGraph.length, names.length);
+    const extended = [...names, ...OPTIONAL_GRAPH.map(entry => entry.name)];
+    assert.deepEqual(probeInput(h.manifest, h.manifest.activation).requiredRuntimes.map(row => row.name), extended); assert.deepEqual(expectedLiveFromManifest(h.manifest, h.manifest.activation).requiredGraph.map(row => row.name), extended);
+    // The in-Box probe answers for the extended list; the observed graph then has the three added rows, running and ready.
+    h.state.probe.graph.push(...OPTIONAL_GRAPH.map(entry => ({ name: entry.name, containerName: `ploinky_${entry.name.replace('/', '_')}`, runtimeId: H(`rt-${entry.name}`), instanceId: `inst-${entry.name}`, enableGeneration: 'enable-1', graphGeneration: h.manifest.box.activeGeneration, running: true, ready: true, noWaitState: null, generationJoin: true, labelsEqual: true, imageId: H('agent-image') })));
+    h.state.status.runningAgents = extended.length;
+    const observed = await h.observer.observe({ addedGraph: h.manifest.activation }); assert.deepEqual(observed.graph.map(row => row.name), extended);
+    const probeRun = h.fake.log.filter(row => row.args.includes('-')).at(-1); assert.deepEqual(JSON.parse(/probeMain\(\{ input: (.*) \}\)/.exec(probeRun.child.writes[0].toString())[1]).requiredRuntimes.map(row => row.name), extended);
+    assert.equal((await h.observer.admit({ addedGraph: h.manifest.activation })).runtimes, extended.length);
+    // Only the manifest's own declaration is accepted; every other binding stays exact.
+    for (const bad of [[], OPTIONAL_GRAPH.slice(0, 2), [...OPTIONAL_GRAPH, { ...OPTIONAL_GRAPH[0], name: 'AssistOSExplorer/extra' }], [{ ...OPTIONAL_GRAPH[0], name: 'AssistOSExplorer/other' }, ...OPTIONAL_GRAPH.slice(1)], null, 'x']) {
+        await rejects(h.observer.observe({ addedGraph: bad }), 'live-admission-override'); await rejects(h.observer.admit({ addedGraph: bad }), 'live-admission-override');
+    }
+    const plain = build(); await rejects(plain.observer.observe({ addedGraph: OPTIONAL_GRAPH }), 'live-admission-override'); await rejects(plain.observer.admit({ addedGraph: OPTIONAL_GRAPH }), 'live-admission-override');
+    const notReady = build(withActivation); notReady.state.probe.graph.push(...OPTIONAL_GRAPH.map(entry => ({ name: entry.name, containerName: 'c', runtimeId: H(entry.name), instanceId: 'i', enableGeneration: 'e', graphGeneration: notReady.manifest.box.activeGeneration, running: true, ready: entry.name.endsWith('webmeetStt') ? false : true, noWaitState: null, generationJoin: true, labelsEqual: true, imageId: H('i') })));
+    notReady.state.status.runningAgents = extended.length; await rejects(notReady.observer.admit({ addedGraph: notReady.manifest.activation }), 'graph-not-ready');
+    const drift = build(withActivation); drift.state.probe.graph.push(...OPTIONAL_GRAPH.map(entry => ({ name: entry.name, containerName: 'c', runtimeId: H(entry.name), instanceId: 'i', enableGeneration: 'e', graphGeneration: drift.manifest.box.activeGeneration, running: true, ready: true, noWaitState: null, generationJoin: true, labelsEqual: true, imageId: H('i') })));
+    drift.state.status.runningAgents = extended.length; drift.state.box.startedAt = '2026-10-04T11:59:49Z'; await rejects(drift.observer.admit({ addedGraph: drift.manifest.activation }), 'live-box-start-epoch');
 });
 
 test('after a legitimate generation change the same predicate admits only the generation the caller itself admitted', async () => {
