@@ -30,7 +30,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-import { AGENTS_FILE, DEPS_DIR, PLOINKY_WORKSPACE_ROOT } from '../../config.js';
+import { AGENTS_FILE, DEPS_DIR, PLOINKY_WORKSPACE_ROOT, isDebugMode } from '../../config.js';
 import { assertWorkspaceMutationLease } from '../../runtime/maintenanceLocks.js';
 import { probeContainerRuntime } from '../../../sandbox/docker/common.js';
 import { readEdgeRoutingSelection } from '../../../sandbox/edgeGeneration.js';
@@ -395,7 +395,7 @@ export function collectDependencyObjectsAfterAdmission({ lease, reason = 'admiss
 
 /** One debug line summarizing a collection (removed, skipped, retained bytes by reason). */
 export function reportDependencyCollection(result, log = (message) => {
-    if (process.env.PLOINKY_DEBUG === '1') console.log(`[DEBUG] ${message}`);
+    if (isDebugMode() || process.env.PLOINKY_DEBUG === '1') console.log(`[DEBUG] ${message}`);
 }) {
     if (!result) return result;
     const summary = result.skipped

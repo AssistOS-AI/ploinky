@@ -1,12 +1,15 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { assertArtifactRoot, assertExplorerSmokeDirectory, assertMarketplacePrerequisite } from './deployed-prerequisites.mjs';
+import { createOwnedSettingsTarget, defaultSettingsEvidence, ownedSettingsLaunchURL,
+    settingsCleanupBudget, settingsPolicyEvidence } from './deployed-settings-target.mjs';
 
 const repo = process.env.SMOKE_EXPLORER_REPO;
 assert.ok(repo && path.isAbsolute(repo), 'SMOKE_EXPLORER_REPO must name the fresh Explorer checkout.');
@@ -17,6 +20,8 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const artifactBase = await assertArtifactRoot(process.env.SMOKE_ARTIFACT_DIR,
     [path.resolve(here, '../../..'), repo, prerequisite.workspaceRoot]);
 const smoke = await assertExplorerSmokeDirectory(repo, prerequisite);
+const cleanupRuntimeSource = await readFile(path.resolve(here, '../../../cli/server/handlers/webchat/runtimeState.js'), 'utf8');
+const cleanupBudget = settingsCleanupBudget(cleanupRuntimeSource);
 const baseURL = new URL(prerequisite.baseURL);
 const runId = `conversation-skills-${Date.now()}-${randomUUID().slice(0, 8)}`;
 const output = path.join(artifactBase, runId);
@@ -33,7 +38,7 @@ const { chromium, expect } = playwright;
 // This check drives RoboTeam's Conversation skills page through the Explorer smoke helper that ships with the deployment.
 const load = name => import(pathToFileURL(path.join(smoke, 'lib', `${name}.mjs`)).href);
 const { openExplorer } = await load('explorer');
-const { createDirectory, deleteDirectoryIfPresent, directoryRow, openCopilotForDirectory } = await load('copilot');
+const { createDirectory, deleteDirectoryIfPresent, directoryRow } = await load('copilot');
 const { waitForWebchatIdle } = await load('webchat');
 const { callAgentToolViaRouter } = await load('mcp');
 const { createRedactor } = await load('security');
@@ -56,10 +61,11 @@ const identity = `${repositoryName}/${skillName}`;
 const invalidLinkText = 'The conversation skills link is invalid. Open Conversation skills from the chat menu again.';
 const evidence = { kind: 'deployed-conversation-skills-page', runId, baseURL: baseURL.origin, prerequisite,
     directoryPath, repositoryName, identity, fixtureDescriptorSha256: hash(descriptor),
+    cleanupBudget, cleanupRuntimeSourceSha256: hash(cleanupRuntimeSource),
     playwrightVersion: require('@playwright/test/package.json').version,
     result: 'running', cleanup: 'not-started', conversationApiRequests: [], roboTeamPageMcpRequests: 0, probes: {} };
-// What this run created and must remove. Both stay in place, and are reported, when the run fails.
-const created = { registeredRepository: null, folder: null };
+// Never guess ownership after a failed write. A failed run retains every remaining fixture resource.
+const created = { folderCreationAttempted: false, folder: null };
 const browser = await chromium.launch({ headless: true });
 const context = await browser.newContext({ baseURL: baseURL.origin, viewport: { width: 1440, height: 1000 } });
 context.setDefaultTimeout(30_000);
@@ -68,7 +74,17 @@ const page = await context.newPage();
 let dashboard;
 let copilotPage;
 let settingsPage;
+let ownedTarget;
+let existingDefaultId;
 let phase = 'setup';
+const deadline = new AbortController();
+const expire = label => {
+    evidence.deadlineExceeded = label;
+    deadline.abort(new Error(`C3 ${label} deadline exceeded; retain remaining fixture resources.`));
+    context.close().catch(() => {});
+};
+const operationTimer = setTimeout(() => expire('operation'), cleanupBudget.operationTimeoutMs);
+let cleanupTimer;
 
 function hash(value) { return createHash('sha256').update(typeof value === 'string' ? value : JSON.stringify(value)).digest('hex'); }
 async function receipt() {
@@ -86,24 +102,37 @@ function observeRequest(request) {
     } catch { return; }
     if (!fromSkillsPage) return;
     if (url.pathname.endsWith('/mcp') && request.method() === 'POST') evidence.roboTeamPageMcpRequests += 1;
-    if (!/\/api\/robots\/[^/]+\/conversations\/[^/]+\/skills$/.test(url.pathname)) return;
+    const target = url.pathname.match(/\/api\/robots\/([^/]+)\/conversations\/([^/]+)\/skills$/);
+    if (!target) return;
     let bodyKeys = null;
     if (request.method() === 'PATCH') {
         try { bodyKeys = Object.keys(request.postDataJSON()).sort(); } catch { bodyKeys = ['unparseable']; }
     }
     // Headers and tokens are never recorded; only whether the browser mutation proof was sent.
-    evidence.conversationApiRequests.push({ phase, method: request.method(), search: url.search, bodyKeys,
+    evidence.conversationApiRequests.push({ phase, robotId: target[1], sessionId: target[2], method: request.method(), search: url.search, bodyKeys,
         csrfHeaderPresent: Boolean(request.headers()['x-ploinky-browser-csrf-token']) });
 }
 context.on('request', observeRequest);
 
-async function defaults() {
+async function defaults(robotName) {
+    const catalog = await callAgentToolViaRouter(page, { agent: 'roboTeamAgent', tool: 'list_achilles_skills', args: { robot: robotName } });
+    return settingsPolicyEvidence(catalog, robotName);
+}
+async function defaultPreservation() {
+    const robots = await roboTeamApi(dashboard, { path: 'api/robots' });
+    assert.equal(robots.status, 200);
+    const matches = robots.payload.robots.filter(robot => robot.id === existingDefaultId || robot.name === 'default');
+    assert.equal(matches.length, 1, 'The existing default robot identity must stay unambiguous.');
+    assert.equal(matches[0].id, existingDefaultId);
     const catalog = await callAgentToolViaRouter(page, { agent: 'roboTeamAgent', tool: 'list_achilles_skills', args: { robot: 'default' } });
-    assert.equal(catalog.scope, 'defaults');
-    return { policyVersion: catalog.policyVersion, policySha256: hash(catalog.policy) };
+    return defaultSettingsEvidence(matches[0], catalog);
 }
 async function conversation(sessionId) {
-    return callAgentToolViaRouter(page, { agent: 'roboTeamAgent', tool: 'list_achilles_skills', args: { robot: 'default', sessionId } });
+    await ownedTarget.current();
+    const { robotName } = ownedTarget.identity();
+    const catalog = await callAgentToolViaRouter(page, { agent: 'roboTeamAgent', tool: 'list_achilles_skills', args: { robot: robotName, sessionId } });
+    settingsPolicyEvidence(catalog, robotName, sessionId);
+    return catalog;
 }
 function selectedItem(catalog) {
     const items = catalog.skills.filter(item => item.identity === identity);
@@ -122,6 +151,7 @@ try {
     const allowedRoots = String(roots.rawText || '').split('\n').filter(line => line.startsWith('/'));
     assert.ok(allowedRoots.length, 'Explorer must report its actual filesystem root.');
     const filesystemRoot = allowedRoots[0].replace(/\/+$/, '');
+    assert.equal(filesystemRoot, prerequisite.workspaceRoot, 'Explorer must use the selected canonical workspace root.');
     evidence.fixtureFilesystemPath = `${filesystemRoot}/${descriptorPath}`;
 
     // Registering a repository is an administrator action. Refuse before any write when the user cannot do it.
@@ -131,17 +161,28 @@ try {
     const robots = await roboTeamApi(dashboard, { path: 'api/robots' });
     assert.equal(robots.status, 200);
     assert.ok(robots.payload.canAdmin === true, 'The signed-in user must be a RoboTeam administrator to register the run-owned repository.');
-    const robotId = await roboTeamRobotId(dashboard, 'default');
-    evidence.robotId = robotId;
+    existingDefaultId = await roboTeamRobotId(dashboard, 'default');
 
     phase = 'defaults-before';
-    const defaultsBefore = await defaults();
+    const existingDefaultBefore = await defaultPreservation();
+    evidence.existingDefaultBefore = existingDefaultBefore;
+    phase = 'owned-robot-creation';
+    ownedTarget = createOwnedSettingsTarget({ runId, repositoryName, workspaceRoot: filesystemRoot,
+        api: input => { deadline.signal.throwIfAborted(); return roboTeamApi(dashboard, input); } });
+    const owned = await ownedTarget.create();
+    const { robotId, robotName } = owned;
+    evidence.ownedTarget = owned;
+    evidence.robotId = robotId;
+    const defaultsBefore = await defaults(robotName);
     evidence.defaultsBefore = defaultsBefore;
 
     phase = 'conversation-launch';
+    await expect(directoryRow(page, directoryPath)).toHaveCount(0);
+    created.folderCreationAttempted = true;
     await createDirectory(page, directoryName, directoryPath);
     created.folder = directoryPath;
-    copilotPage = await openCopilotForDirectory(page, directoryPath);
+    copilotPage = await context.newPage();
+    await copilotPage.goto(ownedSettingsLaunchURL(baseURL.origin, owned), { waitUntil: 'domcontentloaded' });
     await expect(copilotPage.locator('#cmd')).toBeEditable({ timeout: 60_000 });
     await waitForWebchatIdle(copilotPage, 60_000);
 
@@ -154,10 +195,7 @@ try {
     assert.match(written.rawText || '', /^Successfully wrote to /);
     const readBack = await callAgentToolViaRouter(page, { agent: 'explorer', tool: 'read_file', args: { path: descriptorPath } });
     assert.equal(readBack.rawText, descriptor);
-    const registered = await roboTeamApi(dashboard, { method: 'POST', path: `api/robots/${robotId}/skillsets`,
-        body: { name: repositoryName, source: `${filesystemRoot}/${repositoryDirectory}` } });
-    assert.equal(registered.status, 200);
-    created.registeredRepository = repositoryName;
+    await ownedTarget.register();
 
     phase = 'conversation-settings-open';
     settingsPage = await openConversationSkills(copilotPage);
@@ -167,6 +205,7 @@ try {
     const current = await conversationSkillsState(settingsPage);
     assert.equal(current.robotId, robotId);
     assert.equal(current.sessionId, target.sessionId);
+    assert.equal(current.policyVersion, (await conversation(target.sessionId)).policyVersion);
     const initial = rowOf(current);
     assert.equal(initial.enabled, false, 'A newly registered repository is not selected until the user enables it.');
     assert.equal(initial.state, 'available');
@@ -209,6 +248,8 @@ try {
     const patches = calls.filter(call => call.method === 'PATCH');
     assert.ok(patches.length >= 2, 'Enabling and disabling must each send one PATCH.');
     for (const call of calls) {
+        assert.equal(call.robotId, robotId, 'Every conversation API request must name the owned robot.');
+        assert.equal(call.sessionId, target.sessionId, 'Every conversation API request must name the opened conversation.');
         assert.ok(['GET', 'PATCH'].includes(call.method), `Unexpected method ${call.method} on the conversation API.`);
         assert.equal(call.search, '', 'The conversation API takes no query parameters.');
     }
@@ -237,35 +278,50 @@ try {
     evidence.probes = { staleStatus: stale.status, invalidLinkApiRequests: invalidApiRequests.length };
 
     phase = 'defaults-after';
-    const defaultsAfter = await defaults();
+    const defaultsAfter = await defaults(robotName);
     assert.deepEqual(defaultsAfter, defaultsBefore, 'Conversation changes must not alter the robot defaults.');
     evidence.defaultsAfter = { ...defaultsAfter, unchanged: true };
+    assert.deepEqual(await defaultPreservation(), existingDefaultBefore,
+        'C3 must preserve the existing default configuration, policy and repository registrations.');
+    evidence.existingDefaultAfter = { ...existingDefaultBefore, unchanged: true };
     evidence.result = 'checks-passed';
     await receipt();
 
-    // Remove what this run created: the repository first, then the folder.
+    // Close the owned pages, drain the candidate's disconnect grace, then unregister, delete the robot and folder.
     phase = 'cleanup';
+    cleanupTimer = setTimeout(() => expire('cleanup'), cleanupBudget.cleanupTimeoutMs);
     await settingsPage.close();
     await copilotPage.close();
-    const removed = await roboTeamApi(dashboard, { method: 'DELETE', path: `api/robots/${robotId}/skillsets?name=${repositoryName}` });
-    assert.equal(removed.status, 200);
-    created.registeredRepository = null;
-    await page.reload({ waitUntil: 'load' });
-    await expect(directoryRow(page, directoryPath)).toHaveCount(1);
-    await deleteDirectoryIfPresent(page, directoryPath);
-    created.folder = null;
-    evidence.cleanup = 'owned-repository-and-folder-deleted';
+    evidence.cleanupPagesClosed = true;
+    await ownedTarget.cleanup({ pagesClosed: evidence.cleanupPagesClosed,
+        waitForDisconnect: () => delay(cleanupBudget.disconnectGraceMs + cleanupBudget.disconnectDrainMs, undefined, { signal: deadline.signal }),
+        removeFolder: async () => {
+            await page.reload({ waitUntil: 'load' });
+            await expect(directoryRow(page, directoryPath)).toHaveCount(1);
+            await deleteDirectoryIfPresent(page, directoryPath);
+            created.folder = null;
+        } });
+    assert.deepEqual(await defaultPreservation(), existingDefaultBefore,
+        'Owned cleanup must preserve the existing default configuration, policy and repository registrations.');
+    evidence.existingDefaultAfterCleanup = { ...existingDefaultBefore, unchanged: true };
+    deadline.signal.throwIfAborted();
+    evidence.cleanup = ownedTarget.state.cleanup;
     evidence.result = 'passed';
 } catch (error) {
     evidence.result = 'failed';
     evidence.failedPhase = phase;
-    evidence.error = redact(error.message);
+    evidence.error = redact(deadline.signal.aborted ? deadline.signal.reason.message : error.message);
     evidence.cleanup = 'failed-fixture-retained-for-diagnosis';
-    evidence.retained = { registeredRepository: created.registeredRepository, folder: created.folder };
+    evidence.retained = { target: ownedTarget?.retained() || null, ...created };
     process.exitCode = 1;
 } finally {
-    await receipt();
-    await context.close();
-    await browser.close();
+    clearTimeout(operationTimer);
+    clearTimeout(cleanupTimer);
+    evidence.ownedTargetState = ownedTarget?.state || null;
+    try { await receipt(); }
+    finally {
+        try { await context.close(); }
+        finally { await browser.close(); }
+    }
 }
 console.log(JSON.stringify({ result: evidence.result, artifactDirectory: output, cleanup: evidence.cleanup }));

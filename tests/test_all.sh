@@ -11,6 +11,14 @@ set -euo pipefail
 
 TESTS_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PLOINKY_REPO_ROOT=$(cd -- "$TESTS_DIR/.." && pwd)
+if (( $# > 0 )); then
+    if [[ $# -ne 2 || "$1" != "--acceptance" || "$2" != /*_codex.json || "$2" == *$'\n'* || "$2" == *$'\r'* ]]; then
+        echo '[test] Refused: use --acceptance /absolute/manifest_codex.json.' >&2
+        exit 64
+    fi
+    exec node "$TESTS_DIR/e2e/liveUpdateCache/run_codex.mjs" --acceptance "$2"
+fi
+echo '[test] Coverage scope: component-only; live update/cache and release acceptance are UNRUN.'
 
 # Load branch configuration if present
 if [[ -f "$TESTS_DIR/branch_config.sh" ]]; then
@@ -335,8 +343,8 @@ set -e
 stage_header "TEST SUMMARY"
 
 if (( TOTAL_ERRORS == 0 )); then
-  pass_message "All tests passed!"
-  log_result "[PASS] All tests passed!"
+  pass_message "Component tests passed; live update/cache and release acceptance are UNRUN."
+  log_result "[PASS] Component tests passed; live update/cache and release acceptance are UNRUN."
   echo "Full report available in: $FAST_RESULTS_FILE"
   exit 0
 else
