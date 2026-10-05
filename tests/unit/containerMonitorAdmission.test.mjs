@@ -249,7 +249,7 @@ test('watchdog restart attempt preserves its staged successor across monitor syn
     monitor.mergeRoutingConfig = async (mutator, options) => {
         assert.deepEqual(options, { coordinate: false });
         const routingFile = path.join(ploinkyDir, 'routing.json');
-        const next = await mutator(JSON.parse(fs.readFileSync(routingFile, 'utf8')));
+        const next = await mutator(JSON.parse(fs.readFileSync(routingFile, 'utf8')), { applyLockCapability: undefined, networkLifecycleCapability: undefined });
         fs.writeFileSync(routingFile, JSON.stringify(next, null, 2));
         events.push('route-save');
     };

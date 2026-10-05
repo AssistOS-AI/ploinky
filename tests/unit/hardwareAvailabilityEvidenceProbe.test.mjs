@@ -25,13 +25,14 @@ function quiet(t) {
 }
 
 // Start the probe, THEN stage the run (so polling begins before the run started) and write the worker's terminal status.
-async function scenario(t, world, { fsApi, beforeWrite, afterWrite, probeOptions } = {}) {
+async function scenario(t, world, { fsApi, beforeWrite, afterWrite, probeOptions, lateByMs } = {}) {
     const probe = await startProbe(t, world, probeOptions);
     const runStartedAtMs = Date.now();
     const slot = world.stageSlot('alpha', { runStartedAtMs });
     if (beforeWrite) beforeWrite(slot);
-    await sleep(30);   // finishedAtMs must follow the run's sequence phase
-    const finishedAtMs = Date.now();
+    // `lateByMs`: the worker finished at runStartedAtMs + 30 but its durable rename comes this much later.
+    await sleep(lateByMs ? lateByMs : 30);   // finishedAtMs must follow the run's sequence phase
+    const finishedAtMs = lateByMs ? runStartedAtMs + 30 : Date.now();
     const report = world.writeWorker('alpha', slot, { kind: 'hardware', finishedAtMs, ...(fsApi ? { fsApi } : {}) });
     // The worker's own return value is the receipt's log line; nothing is hand-built.
     const delivered = afterWrite ? afterWrite(report) : report;
@@ -66,19 +67,42 @@ function assertReceipt(world, receipt, { slot, report, finishedAtMs }, { selecto
     });
     // The ctime cross-check: T_vis from the worker against the file's ctime.
     assert.ok(Math.abs(receipt.status.ctimeMs - report.visibleAtMs) <= CTIME_TOLERANCE_MS, `ctime ${receipt.status.ctimeMs} vs T_vis ${report.visibleAtMs}`);
-    // The SAME evaluation's readiness and administrator projections.
-    assert.deepEqual(receipt.readiness, { availability: 'refused', ready: false });
-    assert.equal(receipt.admin.availability, 'refused');
-    assert.equal(receipt.admin.code, receipt.evaluation.denial.code);
-    assert.equal(receipt.admin.reasonCode, 'gate_off');
-    assert.match(receipt.admin.cause, CAUSE);
-    assert.equal(receipt.evaluation.denial.reason, receipt.admin.cause, 'the admin cause is the denial\'s cause');
+    // T_f is the status file's own validated finishedAtMs, and it is recorded.
+    assert.equal(receipt.status.finishedAtMs, finishedAtMs);
+    assert.equal(receipt.checks.workerFinishMatchesStatus, true);
+    // The SAME evaluation's projections are MIRRORS, labelled as such: they cannot fail, so they credit nothing.
+    assert.equal(receipt.mirrorLabel, 'mirrored-from-the-observed-evaluation-not-the-real-readers');
+    assert.deepEqual(receipt.mirroredReadiness, { availability: 'refused', ready: false });
+    assert.equal(receipt.mirroredAdmin.availability, 'refused');
+    assert.equal(receipt.mirroredAdmin.code, receipt.evaluation.denial.code);
+    assert.equal(receipt.mirroredAdmin.reasonCode, 'gate_off');
+    assert.match(receipt.mirroredAdmin.cause, CAUSE);
+    assert.equal(receipt.evaluation.denial.reason, receipt.mirroredAdmin.cause, 'the admin cause is the denial\'s cause');
+    // The REAL readers (metrics and the administrator handler's default store reader) are recorded as they answered.
+    assert.equal(receipt.realReaders.reader, 'readStoreAvailabilityProjections');
+    if (selectorState === 'active') {
+        assert.equal(receipt.realReaders.returned, 'projections');
+        assert.equal(receipt.realReaders.projectionForRoute, true);
+        assert.deepEqual(receipt.realReaders.readiness, { availability: 'refused', ready: false });
+        assert.equal(receipt.realReaders.admin.availability, 'refused');
+        assert.equal(receipt.realReaders.admin.code, receipt.evaluation.denial.code);
+        assert.match(receipt.realReaders.admin.cause, CAUSE);
+        assert.equal(receipt.adminReadinessCredited, true);
+    } else {
+        // The default reader answers null for an inactive selector: the Router denies on that basis, and the real
+        // readers show NO typed denial, which must be recorded as such and never credited.
+        assert.equal(receipt.realReaders.returned, 'null');
+        assert.equal(receipt.realReaders.projectionForRoute, false);
+        assert.equal(receipt.realReaders.admin.code, null);
+        assert.equal(receipt.realReaders.readiness.availability === 'refused', false);
+        assert.equal(receipt.adminReadinessCredited, false, 'no admin or readiness credit from the mirror');
+    }
 }
 
 test('NW1.S-durable-activation-is-proved-without-http-against-the-named-generation', async (t) => {
     quiet(t);
     // ---- the pure credit rule: every boundary
-    const base = { pollingStartedAtMs: 1000, runStartedAtMs: 1000, tFinMs: 2000, tVisMs: 2001, durableAtMs: 2002, ctimeMs: 2001, firstActiveObservedAtMs: 2010, pollIntervalMs: P };
+    const base = { pollingStartedAtMs: 1000, runStartedAtMs: 1000, tFinMs: 2000, workerFinishedAtMs: 2000, tVisMs: 2001, durableAtMs: 2002, ctimeMs: 2001, firstActiveObservedAtMs: 2010, pollIntervalMs: P };
     const credit = (change) => creditReceipt({ ...base, ...change });
     assert.equal(credit({}).credited, true);
     assert.equal(credit({ firstActiveObservedAtMs: 2000 + CREDIT_WINDOW_MS + P }).credited, true, 'exactly T_f + 5000 + P');
@@ -91,6 +115,10 @@ test('NW1.S-durable-activation-is-proved-without-http-against-the-named-generati
     assert.equal(credit({ ctimeMs: Number.NaN }).credited, false);
     assert.equal(credit({ pollingStartedAtMs: 2001, runStartedAtMs: 3000 }).checks.pollingStartedBeforeFinish, false, 'polling after T_f');
     assert.equal(credit({ pollingStartedAtMs: 1500, runStartedAtMs: 1400 }).checks.pollingStartedBeforeRun, false, 'polling after the run started');
+    assert.equal(credit({ workerFinishedAtMs: 2001 }).credited, false, 'a worker line whose finishedAtMs differs from the status file\'s');
+    assert.equal(credit({ workerFinishedAtMs: 2001 }).checks.workerFinishMatchesStatus, false);
+    assert.equal(credit({ workerFinishedAtMs: undefined }).credited, false, 'no worker finish is not credited');
+    assert.equal(credit({ tFinMs: Number.NaN, workerFinishedAtMs: Number.NaN }).credited, false);
     assert.equal(credit({ durableAtMs: 2000 + CREDIT_WINDOW_MS }).credited, true);
     assert.equal(credit({ durableAtMs: 2000 + CREDIT_WINDOW_MS + 1 }).credited, false);
     assert.equal(credit({ durableAtMs: undefined, durabilityError: 'EIO' }).credited, false, 'a recorded durability error is not credited');
@@ -171,13 +199,26 @@ test('NW1.S-durable-activation-is-proved-without-http-against-the-named-generati
         assert.equal(run.receipt.checks.ctimeMatchesVisible, false);
         assert.equal(run.receipt.credited, false, 'a ctime mismatch voids the receipt');
     }
-    // ---- an observation outside the window is not credited: the worker line claims a finish far in the past
+    // ---- an end-to-end observation outside the window: the run finished at T_f, but the worker's durable rename comes 5.3 s later
+    {
+        const world = makeWorld(t);
+        const run = await scenario(t, world, { lateByMs: CREDIT_WINDOW_MS + 300 });
+        assert.equal(run.receipt.observed, true);
+        assert.equal(run.receipt.status.finishedAtMs, run.finishedAtMs, 'T_f is the status file\'s validated finish time');
+        assert.ok(run.receipt.clock.firstActiveObservedAtMs > run.finishedAtMs + CREDIT_WINDOW_MS + run.receipt.clock.pollIntervalMs, 'the first typed observation is past T_f + 5000 + P');
+        assert.equal(run.receipt.checks.observedInWindow, false);
+        assert.equal(run.receipt.credited, false, 'a late activation is not credited');
+    }
+    // ---- a forged worker line: T_f comes from the status file's validated finishedAtMs, so a line claiming another finish voids the receipt
     {
         const world = makeWorld(t);
         const run = await scenario(t, world, { afterWrite: (report) => ({ ...report, finishedAtMs: report.finishedAtMs - 60_000 }) });
         assert.equal(run.receipt.observed, true);
-        assert.equal(run.receipt.checks.observedInWindow, false);
-        assert.equal(run.receipt.credited, false, 'observed after T_f + 5000 + P');
+        assert.equal(run.receipt.status.finishedAtMs, run.finishedAtMs, 'T_f is the status file\'s');
+        assert.equal(run.receipt.worker.finishedAtMs, run.finishedAtMs - 60_000);
+        assert.equal(run.receipt.checks.workerFinishMatchesStatus, false);
+        assert.equal(run.receipt.checks.observedInWindow, true, 'the window is measured from the status file\'s T_f, not the forged line');
+        assert.equal(run.receipt.credited, false, 'a forged worker finish voids the receipt');
     }
     // ---- no activation: an honest negative receipt
     {

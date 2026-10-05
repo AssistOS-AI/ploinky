@@ -28,7 +28,8 @@ export const CTIME_TOLERANCE_MS = 50;
 
 /**
  * The credit rule of D2S.8 assertion (1), kept pure so it is testable alone.
- * Credited only when polling began at or before the run started and before T_f,
+ * `tFinMs` is the status file's validated finishedAtMs; `workerFinishedAtMs` is the worker log
+ * line's, and the two must be equal. Credited only when polling began at or before the run started and before T_f,
  * the first typed observation is within T_f + 5000 + P, the
  * status file's ctime (read through the probe's own descriptor) agrees with the
  * worker's T_vis within 50 ms and is not after the observation, and the
@@ -36,10 +37,12 @@ export const CTIME_TOLERANCE_MS = 50;
  * no skipped directory fsync (an unsupported fsync made nothing durable).
  */
 export function creditReceipt({
-    firstActiveObservedAtMs, tFinMs, tVisMs, durableAtMs, durabilityError, durabilitySkipped, ctimeMs, pollIntervalMs,
+    firstActiveObservedAtMs, tFinMs, workerFinishedAtMs, tVisMs, durableAtMs, durabilityError, durabilitySkipped, ctimeMs, pollIntervalMs,
     pollingStartedAtMs, runStartedAtMs, windowMs = CREDIT_WINDOW_MS, ctimeToleranceMs = CTIME_TOLERANCE_MS,
 }) {
     const checks = {
+        // T_f is the status file's own validated finishedAtMs (E-2); the worker's log line must agree with it.
+        workerFinishMatchesStatus: Number.isFinite(tFinMs) && Number.isFinite(workerFinishedAtMs) && workerFinishedAtMs === tFinMs,
         pollingStartedBeforeFinish: Number.isFinite(pollingStartedAtMs) && pollingStartedAtMs <= tFinMs,
         pollingStartedBeforeRun: Number.isFinite(pollingStartedAtMs) && Number.isFinite(runStartedAtMs) && pollingStartedAtMs <= runStartedAtMs,
         observedInWindow: Number.isFinite(firstActiveObservedAtMs) && firstActiveObservedAtMs <= tFinMs + windowMs + pollIntervalMs,
@@ -67,6 +70,8 @@ async function main(options) {
     const { resolveEffectiveHardwareAvailability, createHardwareAvailabilityResolverCache } = await cli('server/hardwareAvailabilityResolver.mjs');
     const { readHardwareAvailabilityPolicy } = await cli('sandbox/hardwareAvailabilityStore.mjs');
     const { buildHardwareLimitsState } = await cli('server/authHandlers/hardwareLimitsRoutes.mjs');
+    const { readStoreAvailabilityProjections } = await cli('server/hardwareAvailabilityProjections.mjs');
+    const { validateNoWaitTerminalTimestamps } = await cli('commands/noWaitProtocol.js');
     const { metricHardwareAvailability, availabilityForcesNotReady } = await cli('server/workspaceMetricsAvailability.mjs');
 
     const { workspaceRoot, routeKey } = options;
@@ -129,34 +134,64 @@ async function main(options) {
     receipt.clock.firstActiveObservedAtMs = observation.wallMs;
     receipt.clock.firstActiveObservedMonoMs = observation.monoMs;
 
-    // The readiness and administrator projections come from this SAME evaluation.
+    // Readiness and administrator projections of a given set of store projections, by the observers' shared functions.
     const key = observation.evaluation.denials.get(routeKey).key;
     const record = observation.generation.agents[key];
     const routing = { routes: observation.generation.routing.routes };
-    const readiness = metricHardwareAvailability({ containerName: key, state: { status: 'unknown', ready: true, running: false } }, record, routing, observation.evaluation.projections);
-    receipt.readiness = { availability: readiness.availability, ready: !availabilityForcesNotReady(readiness.availability) };
-    const admin = buildHardwareLimitsState({
-        context: { overrides: new Map(), gate: 'on', prepared: true },
-        installed: [{ ref: `${record.repoName}/${record.agentName}`, manifestPath: '/none' }],
-        registry: observation.generation.agents,
-        routing,
-        storeProjections: observation.evaluation.projections,
-        admit: () => ({ descriptor: {} }),
-        readApplied: () => null,
-        readDeclarationNote: () => null,
-    }).agents[0].containers.find((container) => container.key === key);
-    const problem = admin?.problem || null;
-    receipt.admin = admin ? {
-        availability: admin.availability,
-        code: problem?.code ?? null,
-        reasonCode: problem?.reasonCode ?? null,
-        cause: problem ? (problem.state === 'refused' ? problem.reason : problem.rootCause?.reason) : null,
-    } : null;
+    const project = (storeProjections) => {
+        const readiness = metricHardwareAvailability({ containerName: key, state: { status: 'unknown', ready: true, running: false } }, record, routing, storeProjections);
+        const admin = buildHardwareLimitsState({
+            context: { overrides: new Map(), gate: 'on', prepared: true },
+            installed: [{ ref: `${record.repoName}/${record.agentName}`, manifestPath: '/none' }],
+            registry: observation.generation.agents,
+            routing,
+            storeProjections,
+            admit: () => ({ descriptor: {} }),
+            readApplied: () => null,
+            readDeclarationNote: () => null,
+        }).agents[0].containers.find((container) => container.key === key);
+        const problem = admin?.problem || null;
+        return {
+            readiness: { availability: readiness.availability, ready: !availabilityForcesNotReady(readiness.availability) },
+            admin: admin ? {
+                availability: admin.availability,
+                code: problem?.code ?? null,
+                reasonCode: problem?.reasonCode ?? null,
+                cause: problem ? (problem.state === 'refused' ? problem.reason : problem.rootCause?.reason) : null,
+            } : null,
+        };
+    };
+    // MIRRORED: computed from the very evaluation that was observed, so it cannot disagree with it. It is labelled as
+    // such and is never the basis of an administrator or readiness credit.
+    const mirrored = project(observation.evaluation.projections);
+    receipt.mirrorLabel = 'mirrored-from-the-observed-evaluation-not-the-real-readers';
+    receipt.mirroredReadiness = mirrored.readiness;
+    receipt.mirroredAdmin = mirrored.admin;
+    // REAL readers: the default store reader that workspace metrics and the administrator handler both use, evaluated
+    // now against the ACTIVE generation. While the selector is inactive it answers null (the Router denies on that
+    // basis itself) and what the readers then show is recorded as it is, not as a denial.
+    let realProjections;
+    let realReaderError = null;
+    try { realProjections = readStoreAvailabilityProjections(edgeOptions); } catch (error) { realProjections = null; realReaderError = String(error?.code || error?.message || error); }
+    const real = project(realProjections);
+    receipt.realReaders = {
+        reader: 'readStoreAvailabilityProjections',
+        returned: realProjections === null ? 'null' : 'projections',
+        projectionForRoute: Boolean(realProjections && [...realProjections.values()].some((projection) => projection?.key === key)),
+        readerError: realReaderError,
+        readiness: real.readiness,
+        admin: real.admin,
+    };
+    receipt.adminReadinessCredited = receipt.realReaders.projectionForRoute === true
+        && receipt.realReaders.readiness.ready === false
+        && receipt.realReaders.admin?.availability === 'refused'
+        && receipt.realReaders.admin?.code === observation.evaluation.denials.get(routeKey).code;
 
     // The status evidence, through this process's own descriptor.
     const store = readHardwareAvailabilityPolicy({ paths });
     const statusFile = (store.slots[routeKey] || store.entries[routeKey]?.source)?.statusFile;
     let ctimeMs = null;
+    let statusFinishedAtMs = null;
     if (statusFile) {
         const file = path.join(runningDir, 'no-wait', statusFile);
         const descriptor = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
@@ -166,7 +201,14 @@ async function main(options) {
             fs.readSync(descriptor, bytes, 0, bytes.length, 0);
             ctimeMs = stat.ctimeMs;
             const status = JSON.parse(bytes.toString('utf8'));
+            // T_f is the status file's own finishedAtMs, after the T1-T4 validation the resolver applies.
+            try {
+                statusFinishedAtMs = validateNoWaitTerminalTimestamps(status, { nowMs: Date.now() }).finishedAtMs;
+            } catch (_) {
+                statusFinishedAtMs = null;
+            }
             receipt.status = {
+                finishedAtMs: statusFinishedAtMs,
                 file: statusFile,
                 sha256: sha256(bytes),
                 ctimeMs,
@@ -194,7 +236,8 @@ async function main(options) {
     if (report) {
         const credit = creditReceipt({
             firstActiveObservedAtMs: observation.wallMs,
-            tFinMs: report.finishedAtMs,
+            tFinMs: statusFinishedAtMs,
+            workerFinishedAtMs: report.finishedAtMs,
             tVisMs: report.visibleAtMs,
             durableAtMs: report.durableAtMs,
             durabilityError: report.durabilityError,

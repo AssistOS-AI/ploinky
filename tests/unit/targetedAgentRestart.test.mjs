@@ -64,7 +64,7 @@ function restartFixture() {
     });
     const mergeRouting = async (mutator, options) => {
         const candidate = structuredClone(routing);
-        routing = await mutator(candidate) || candidate;
+        routing = await mutator(candidate, { applyLockCapability: Object.freeze({ fixture: 'apply' }), networkLifecycleCapability: options?.networkLifecycleCapability }) || candidate;
         select();
         return routing;
     };

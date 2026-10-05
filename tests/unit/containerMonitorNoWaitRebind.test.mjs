@@ -282,7 +282,7 @@ function fixture(t, { additive = false, distinct = false, readinessOk = true } =
     monitor.startProbeWorker = () => {};
     monitor.withEdgeGenerationApplyLock = (callback) => callback(capability);
     monitor.saveAgents = (next) => { state.registry = structuredClone(next); };
-    monitor.mergeRoutingConfig = async (mutator) => { state.routing = await mutator(structuredClone(state.routing)); };
+    monitor.mergeRoutingConfig = async (mutator) => { state.routing = await mutator(structuredClone(state.routing), { applyLockCapability: undefined, networkLifecycleCapability: undefined }); };
     monitor.applyEdgeRoutingGeneration = (options) => {
         options.testHooks.beforeSelectorCommit();
         state.selector.state = 'active';

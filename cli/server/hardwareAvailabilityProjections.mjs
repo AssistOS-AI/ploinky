@@ -11,9 +11,14 @@
 import crypto from 'node:crypto';
 
 import { loadActiveEdgeRoutingGeneration } from '../sandbox/edgeGeneration.js';
+import { HARDWARE_AVAILABILITY_UNREADABLE } from '../sandbox/hardwareAvailabilityStore.mjs';
 import { buildDirectRefusal } from '../sandbox/hardwareLimits/requestedLimits.mjs';
 import { buildAvailabilityProjection } from './hardwareAvailability.mjs';
 import { resolveEffectiveHardwareAvailability } from './hardwareAvailabilityResolver.mjs';
+
+const SELECTOR_OR_GENERATION_UNAVAILABLE = Object.freeze([
+    'EDGE_GENERATION_INACTIVE', 'EDGE_GENERATION_CORRUPT', 'EDGE_GENERATION_RUNTIME_MISMATCH',
+]);
 
 const STORE_UNREADABLE_PARTS = Object.freeze({
     reasonCode: 'store_unreadable',
@@ -52,12 +57,16 @@ export function readStoreAvailabilityProjections(options = {}) {
     let active;
     try {
         active = loadActiveEdgeRoutingGeneration(options);
-    } catch (_) {
-        return null;
+    } catch (error) {
+        // Only the outcomes loadActiveEdgeRoutingGeneration reports for an inactive selector or an unusable generation
+        // mean "the Router denies on that basis itself"; anything else is a programming error and is not hidden.
+        if (SELECTOR_OR_GENERATION_UNAVAILABLE.includes(error?.code)) return null;
+        throw error;
     }
     try {
         return resolveEffectiveHardwareAvailability({ generation: active.generation, paths: active.paths }).projections;
-    } catch (_) {
-        return storeUnreadableProjections(active.generation);
+    } catch (error) {
+        if (error?.code === HARDWARE_AVAILABILITY_UNREADABLE) return storeUnreadableProjections(active.generation);
+        throw error;
     }
 }

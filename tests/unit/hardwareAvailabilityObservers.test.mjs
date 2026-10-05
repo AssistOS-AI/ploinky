@@ -384,3 +384,31 @@ test('NW1.S-an-unreadable-or-invalid-store-is-reported-by-admin-and-readiness-ne
         assert.equal(observerState(world, 'alpha').readyForced, false);
     }
 });
+
+// A lease that carries no effective availability cannot prove a caller available, and the projection readers hide only the
+// expected "selector or generation unavailable" outcomes, never a programming error.
+test('NW1.S-a-lease-without-effective-availability-denies-the-private-caller-and-the-projection-reader-rethrows-programming-errors', (t) => {
+    quiet(t);
+    const world = makeWorld(t);
+    const plan = resolveEdgeRoutePlan({ req: privateRequest('beta'), listener: 'private' });
+    assert.equal(plan.ok, true, plan.code);
+    assert.ok(plan.lease?.effective, 'a captured lease carries its effective availability');
+    const req = {
+        method: 'GET',
+        headers: { 'ploinky-agent-assertion': token({ iss: 'agent:fixtures/beta', instanceId: 'beta-instance', enableGeneration: 'beta-generation' }) },
+    };
+    const codeOf = (candidate) => {
+        try { authorizePrivateRoutePlan({ req, plan: { ...candidate, access: { access: 'authenticated' } } }); return null; } catch (error) { return error.code || null; }
+    };
+    assert.notEqual(codeOf(plan), 'PRIVATE_CALLER_HARDWARE_UNAVAILABLE', 'control: a healthy caller on an effective lease passes the hardware check');
+    assert.equal(codeOf({ ...plan, lease: { ...plan.lease, effective: undefined } }), 'PRIVATE_CALLER_HARDWARE_UNAVAILABLE');
+    assert.equal(codeOf({ ...plan, lease: { ...plan.lease, effective: null } }), 'PRIVATE_CALLER_HARDWARE_UNAVAILABLE');
+    // The projection reader: an unavailable selector is the expected null; a programming error is not swallowed.
+    const inactive = makeWorld(t);
+    fs.writeFileSync(inactive.paths.activeSelectorFile, '{}');
+    assert.equal(readStoreAvailabilityProjections(inactive.options), null);
+    assert.throws(() => readStoreAvailabilityProjections({ get workspaceRoot() { throw new TypeError('a programming error'); } }), { name: 'TypeError', message: 'a programming error' });
+    // An unrelated EDGE_ code (a capability or preparation error) is not "selector unavailable" either.
+    assert.throws(() => readStoreAvailabilityProjections({ get workspaceRoot() { throw Object.assign(new Error('capability'), { code: 'EDGE_GENERATION_CAPABILITY_REQUIRED' }); } }), { code: 'EDGE_GENERATION_CAPABILITY_REQUIRED' });
+    assert.ok(world.options);
+});

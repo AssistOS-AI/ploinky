@@ -174,7 +174,7 @@ for (const mode of ['host', 'none', 'default', 'bridge']) {
                     events.push('commit-registry');
                 },
                 async mergeRoutingConfig(mutator) {
-                    routing = await mutator(structuredClone(routing));
+                    routing = await mutator(structuredClone(routing), { applyLockCapability: undefined, networkLifecycleCapability: undefined });
                     events.push('commit-route');
                 },
                 applyEdgeRoutingGeneration(options) {

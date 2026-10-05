@@ -127,7 +127,7 @@ test('MI.real route withdrawal preserves exact predecessor identity for MPS drai
     const routing = { routes: { a: { container: 'a', repo: 'demo', agent: 'a' } } };
     const active = { selector: { state: 'active', generation: 'gen', activationId: 'activate', selectorDigest: 'digest' }, generation: { agents: { a: record }, routing, compiled: { hosts: {} } } };
     const before = clone(record);
-    const transition = await prepareTargetedAgentRestart({ containerName: 'a', routeKey: 'a', record }, { mergeRouting: async (mutate) => mutate(routing), loadActive: () => active, loadAgents: () => ({ a: record }) });
+    const transition = await prepareTargetedAgentRestart({ containerName: 'a', routeKey: 'a', record }, { mergeRouting: async (mutate) => mutate(routing, { applyLockCapability: Object.freeze({ fixture: 'apply' }), networkLifecycleCapability: Object.freeze({ fixture: 'network' }) }), loadActive: () => active, loadAgents: () => ({ a: record }) });
     assert.deepEqual(record, before); assert.deepEqual(transition.identity, { instanceId: 'i', enableGeneration: 'g' });
     assert.equal(routing.routes.a.draining, true); assert.equal(transition.targetedRestart.assertSelectorsInactive({ containerName: 'a', affectedSelectors: transition.targetedRestart.affectedSelectors }), true);
 });
