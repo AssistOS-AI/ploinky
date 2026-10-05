@@ -52,7 +52,7 @@ export const AVAILABILITY_MUTANTS = Object.freeze({
         patches: [{ from: '                fsApi.fsyncSync(descriptor);\n            } finally {\n                fsApi.closeSync(descriptor);', to: '            } finally {\n                fsApi.closeSync(descriptor);' }] },
     'm1b-the-directory-fsync-is-dropped-from-durable-failed-writes': { name: 'm1b-the-directory-fsync-is-dropped-from-durable-failed-writes', file: WORKER,
         kill: kill(WORKER_TEST, 'NW1\\.D2-failed-status-writes-are-fsynced'),
-        patches: [{ from: '            fsyncStatusDirectory(path.dirname(resolvedTarget), fsApi);\n', to: '' }] },
+        patches: [{ from: '            directory = fsyncStatusDirectory(path.dirname(resolvedTarget), fsApi);\n', to: '            directory = {};\n' }] },
     'm2-the-run-scoped-file-is-written-before-the-canonical-file': { name: 'm2-the-run-scoped-file-is-written-before-the-canonical-file', file: WORKER,
         kill: kill(WORKER_TEST, 'NW1\\.D2-sigkill-between-the-canonical'),
         patches: [
