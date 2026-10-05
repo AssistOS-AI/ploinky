@@ -1,3 +1,4 @@
+// Old-vs-current differential proof (failing-before) lives in evidence/lane-update-cache/execution_checkpoint_20261004_codex/ (untracked, outside the repository).
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
@@ -8,9 +9,6 @@ import { LIMITS, parseManifestBytes } from './manifest_codex.mjs';
 import { readManifestFile } from './run_codex.mjs';
 import { buildUpdateResult } from '../../../cli/commands/updateOutcome.js';
 installPureGuards();
-const oldRoot = new URL('../../../../../evidence/lane-update-cache/execution_checkpoint_20261004_codex/candidate/tests/e2e/liveUpdateCache/', import.meta.url);
-const old = await import(new URL('execution_codex.mjs', oldRoot));
-const oldRunner = await import(new URL('run_codex.mjs', oldRoot));
 
 async function baseProof() {
     const { value } = manifestFixture(), { expected, records } = expectationFixture(value);
@@ -45,9 +43,8 @@ test('corrupted FD3 omits/duplicates success or carries hex-like code: exact old
         if (corruption === 'duplicate') altered.result.records.push({ ...altered.result.records[0] });
         if (corruption === 'hex') altered.result.records[0].code = 'abcdef0123456789abcdef01';
         const text = JSON.stringify({ type: 'UPDATE_RESULT', runId: fixture.value.runId, operation: 'normal-update', proof: altered });
-        const before = worker(old, fixture, { text }), after = worker(current, fixture, { text });
-        const oldReceipt = await old.superviseOwnedUpdate(before.input, before.adapters), receipt = await current.superviseOwnedUpdate(after.input, after.adapters);
-        assert.equal(oldReceipt.fulfilled, true); assert.equal(before.adapters.custody.snapshot()[0].settled, true);
+        const after = worker(current, fixture, { text });
+        const receipt = await current.superviseOwnedUpdate(after.input, after.adapters);
         assert.equal(receipt.resourceDisposition, 'HANDOFF_REQUIRED'); assert.equal(receipt.uncertain, true); assert.equal(after.adapters.custody.snapshot()[0].settled, false);
         await assert.rejects(current.superviseOwnedUpdate(after.input, after.adapters)); assert.equal(after.launches(), 1);
         assert.equal(JSON.stringify(receipt).includes('abcdef0123456789abcdef01'), false);
@@ -56,20 +53,17 @@ test('corrupted FD3 omits/duplicates success or carries hex-like code: exact old
 test('duplicate and escaped-equivalent FD3 keys cannot overwrite an invalid value into a valid proof', async () => {
     const fixture = await baseProof(), normal = JSON.stringify({ type: 'UPDATE_RESULT', runId: fixture.value.runId, operation: 'normal-update', proof: fixture.proof });
     for (const replacement of ['"fulfilled":false,"fulfilled":true', '"fulfilled":false,"fulfill\\u0065d":true']) {
-        const text = normal.replace('"fulfilled":true', replacement), before = worker(old, fixture, { text }), after = worker(current, fixture, { text });
-        assert.equal((await old.superviseOwnedUpdate(before.input, before.adapters)).fulfilled, true);
+        const text = normal.replace('"fulfilled":true', replacement), after = worker(current, fixture, { text });
         const receipt = await current.superviseOwnedUpdate(after.input, after.adapters);
         assert.equal(receipt.reason, 'worker-control-json'); assert.equal(after.adapters.custody.snapshot()[0].settled, false); assert.equal(receipt.uncertain, true);
     }
 });
 test('valid close/proof delivered after command deadline or slow existing incarnation read cannot settle success', async () => {
     for (const options of [{ delayedClose: true }, { slowCurrent: true }]) {
-        const fixture = await baseProof(), before = worker(old, fixture, options), after = worker(current, fixture, options);
-        assert.equal((await old.superviseOwnedUpdate(before.input, before.adapters)).fulfilled, true);
+        const fixture = await baseProof(), after = worker(current, fixture, options);
         const receipt = await current.superviseOwnedUpdate(after.input, after.adapters);
         assert.equal(receipt.reason, 'worker-deadline'); assert.equal(receipt.retained.childClosed, true); assert.equal(receipt.retained.pipesClosed, true);
         assert.equal(after.adapters.custody.snapshot()[0].settled, false); assert.equal(receipt.resourceDisposition, 'HANDOFF_REQUIRED');
-        if (options.slowCurrent) assert.equal(after.reads(), before.reads());
         await assert.rejects(current.superviseOwnedUpdate(after.input, after.adapters)); assert.equal(after.launches(), 1);
     }
 });
@@ -85,23 +79,21 @@ function growingIO(cap) {
 }
 test('post-stat growth bounds actual descriptor requests at cap+1, closes once and imports no API', async () => {
     const fixture = manifestFixture();
-    for (const subject of [old, current]) {
+    {
         const grown = growingIO(LIMITS.readBytes); let imports = 0;
-        await assert.rejects(subject.loadPinnedOuterApi(fixture.value, { io: grown.io, importModule: async () => { imports++; return {}; } }));
+        await assert.rejects(current.loadPinnedOuterApi(fixture.value, { io: grown.io, importModule: async () => { imports++; return {}; } }));
         assert.equal(imports, 0); assert.equal(grown.facts().closes, 1);
-        if (subject === current) { assert.equal(grown.facts().wholeRead, false); assert(grown.facts().requested <= LIMITS.readBytes + 1); }
-        else { assert.equal(grown.facts().wholeRead, true); assert(grown.facts().requested > LIMITS.readBytes + 1); }
+        assert.equal(grown.facts().wholeRead, false); assert(grown.facts().requested <= LIMITS.readBytes + 1);
     }
-    for (const fn of [oldRunner.readManifestFile, readManifestFile]) {
-        const grown = growingIO(LIMITS.manifestBytes); assert.throws(() => fn('/owned/manifest_codex.json', grown.io)); assert.equal(grown.facts().closes, 1);
-        if (fn === readManifestFile) { assert.equal(grown.facts().wholeRead, false); assert(grown.facts().requested <= LIMITS.manifestBytes + 1); }
-        else assert(grown.facts().requested > LIMITS.manifestBytes + 1);
+    {
+        const grown = growingIO(LIMITS.manifestBytes); assert.throws(() => readManifestFile('/owned/manifest_codex.json', grown.io)); assert.equal(grown.facts().closes, 1);
+        assert.equal(grown.facts().wholeRead, false); assert(grown.facts().requested <= LIMITS.manifestBytes + 1);
     }
 });
 test('complete timely proof and unchanged bounded manifest/API source preserve normal success', async () => {
-    const fixture = await baseProof(), before = worker(old, fixture), after = worker(current, fixture);
-    const baseline = await old.superviseOwnedUpdate(before.input, before.adapters), receipt = await current.superviseOwnedUpdate(after.input, after.adapters);
-    assert.equal(receipt.fulfilled, baseline.fulfilled); assert.equal(after.adapters.custody.snapshot()[0].settled, true); assert.equal(after.reads(), before.reads());
+    const fixture = await baseProof(), after = worker(current, fixture);
+    const receipt = await current.superviseOwnedUpdate(after.input, after.adapters);
+    assert.equal(receipt.fulfilled, true); assert.equal(after.adapters.custody.snapshot()[0].settled, true);
     assert.deepEqual(parseManifestBytes(Buffer.from(JSON.stringify(fixture.value))), fixture.value);
     const ioFor = bytes => { let offset = 0, closed = 0;
         const io = { realpathSync: file => file, openSync: () => 1,

@@ -1,3 +1,4 @@
+// Old-vs-current differential proof (failing-before) lives in evidence/lane-update-cache/execution_checkpoint_20261004_codex/ (untracked, outside the repository).
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
@@ -7,15 +8,12 @@ import * as current from './execution_codex.mjs';
 import { validateManifest } from './manifest_codex.mjs';
 import { buildUpdateResult } from '../../../cli/commands/updateOutcome.js';
 installPureGuards();
-const oldRoot = new URL('../../../../../evidence/lane-update-cache/execution_checkpoint_20261004_codex/review_delta1_codex/candidate/tests/e2e/liveUpdateCache/', import.meta.url);
-const old = await import(new URL('execution_codex.mjs', oldRoot));
-const oldManifest = await import(new URL('manifest_codex.mjs', oldRoot));
 
 test('ancestor evidence root or individually protected evidence destinations cannot launder source/workspace ownership', () => {
     for (const protectedTree of ['candidate', 'workspace']) {
         const { value } = manifestFixture(); value.evidence.root = '/home/skutner/work';
         value.evidence.receipt = path.join(protectedTree === 'candidate' ? value.candidate.root : value.workspace.path, 'receipt_codex.json');
-        assert.equal(oldManifest.validateManifest(value), value); assert.throws(() => validateManifest(value), error => error.code === 'evidence-root' || error.code === 'evidence-files');
+        assert.throws(() => validateManifest(value), error => error.code === 'evidence-root' || error.code === 'evidence-files');
     }
     const { value } = manifestFixture(); assert.equal(validateManifest(value), value);
     value.evidence.sourceManifest = path.join(value.candidate.repositories[3].path, 'source_codex.json'); assert.throws(() => validateManifest(value));
@@ -44,8 +42,7 @@ async function asyncBinding(subject, mutate, cancel = false) {
     return { receipt, custody, launches: () => launches, again: () => subject.superviseOwnedUpdate({ ...input, manifest: initial }, adapters) };
 }
 test('sealed per-launch run/expectation binding rejects later-mutated caller identity and preserves normal/cancelled outcomes', async () => {
-    const before = await asyncBinding(old, true), after = await asyncBinding(current, true);
-    assert.equal(before.receipt.fulfilled, true); assert.equal(before.custody.snapshot()[0].runId.includes('1234abcd'), true);
+    const after = await asyncBinding(current, true);
     assert.equal(after.receipt.reason, 'worker-result-binding'); assert.equal(after.receipt.resourceDisposition, 'HANDOFF_REQUIRED'); assert.equal(after.custody.snapshot()[0].settled, false);
     await assert.rejects(after.again()); assert.equal(after.launches(), 1);
     const normal = await asyncBinding(current, false); assert.equal(normal.receipt.fulfilled, true); assert.equal(normal.custody.snapshot()[0].settled, true);
@@ -60,8 +57,7 @@ function pathIO(replace) {
     return { io, importModule: async () => { imports++; return { runOuterCli: swapped ? bad : good }; }, bad, facts: () => ({ closed, imports }) };
 }
 test('verified descriptor cannot authorize unchecked ESM path re-open; replacement and unchanged paths refuse before import', async () => {
-    const { value } = manifestFixture(), before = pathIO(true);
-    assert.equal(await old.loadPinnedOuterApi(value, before), before.bad); assert.deepEqual(before.facts(), { closed: 1, imports: 1 });
+    const { value } = manifestFixture();
     for (const replace of [true, false]) {
         const after = pathIO(replace);
         await assert.rejects(current.loadPinnedOuterApi(value, after), error => error.code === 'runtime-import-binding-unproven');
