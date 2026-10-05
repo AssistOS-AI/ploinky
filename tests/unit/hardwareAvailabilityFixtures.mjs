@@ -109,7 +109,7 @@ export function slotFor(routeKey = 'alpha', {
 }
 
 export function lockAssertion(root, capability) {
-    return () => assertEdgeGenerationApplyLockCapability({ workspaceRoot: root, applyLockCapability: capability });
+    return (storePaths) => assertEdgeGenerationApplyLockCapability({ workspaceRoot: root, applyLockCapability: capability, storePaths });
 }
 
 /** Run `callback({ capability, assertApplyLock })` under the real edge apply lock. */

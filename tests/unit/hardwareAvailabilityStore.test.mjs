@@ -12,6 +12,7 @@ import { pathToFileURL } from 'node:url';
 import { initializeFreshEdgeRoutingSources } from '../../cli/sandbox/edgeGeneration.js';
 import {
     MAX_HARDWARE_AVAILABILITY_POLICY_BYTES,
+    commitHardwareAvailabilityPolicy,
     computeHardwareAvailabilityRevision,
     installHardwareAvailabilityStore,
     readHardwareAvailabilityPolicy,
@@ -27,6 +28,7 @@ import {
     entryFor,
     fsError,
     inode,
+    lockAssertion,
     makeWorkspace,
     sha256,
     spyFs,
@@ -649,4 +651,83 @@ test('NW1.D1-a-missing-witness-beside-a-valid-store-is-read-as-valid-and-restore
     // The restore never rewrites a witness that already exists.
     assert.throws(() => underApplyLock(workspace.root, ({ assertApplyLock }) => restoreHardwareAvailabilityWitness({ paths, assertApplyLock })), /requires a valid store with no witness/);
     assert.throws(() => underApplyLock(workspace.root, ({ assertApplyLock }) => installHardwareAvailabilityStore({ paths, assertApplyLock, initializedBy: 'fresh' })), /already exists/);
+});
+
+// Each mutation proves the apply lock before its first write, and the proof is bound to the store being written:
+// a missing or non-callable assertion, one that throws, a released capability and another workspace's lock all
+// refuse, by their own error, with the edge directory byte-identical.
+test('NW1.D1-every-mutation-refuses-with-zero-bytes-written-when-the-apply-lock-assertion-is-missing-throws-is-released-or-foreign', (t) => {
+    const OPERATIONS = {
+        commit: {
+            prepare(ws) {
+                init(ws.root);
+                ws.revision = readStore(ws.paths).revision;
+                ws.temp = path.join(ws.paths.availabilityStoreDir, `.policy.json.${deadPid()}.${uuid()}.tmp`);
+                fs.writeFileSync(ws.temp, 'x');
+            },
+            call: (ws, assertApplyLock) => commitHardwareAvailabilityPolicy({ paths: ws.paths, assertApplyLock, expectedRevision: ws.revision, entries: entriesOf('alpha') }),
+            done: (ws) => assert.deepEqual(Object.keys(readStore(ws.paths).entries), ['alpha']),
+        },
+        install: {
+            prepare: (ws) => fs.mkdirSync(ws.paths.edgeDir, { recursive: true }),
+            call: (ws, assertApplyLock) => installHardwareAvailabilityStore({ paths: ws.paths, assertApplyLock, initializedBy: 'fresh' }),
+            done: (ws) => assert.equal(readStore(ws.paths).state, 'valid'),
+        },
+        restore: {
+            prepare(ws) {
+                init(ws.root);
+                fs.rmSync(ws.paths.availabilityWitnessFile);
+            },
+            call: (ws, assertApplyLock) => restoreHardwareAvailabilityWitness({ paths: ws.paths, assertApplyLock }),
+            done: (ws) => assert.equal(fs.existsSync(ws.paths.availabilityWitnessFile), true),
+        },
+        sweep: {
+            prepare(ws) {
+                init(ws.root);
+                ws.temp = path.join(ws.paths.availabilityStoreDir, `.policy.json.${deadPid()}.${uuid()}.tmp`);
+                fs.writeFileSync(ws.temp, 'x');
+            },
+            call: (ws, assertApplyLock) => sweepHardwareAvailabilityTemps({ paths: ws.paths, assertApplyLock }),
+            done: (ws) => assert.equal(fs.existsSync(ws.temp), false),
+        },
+    };
+    const CASES = {
+        missing: { code: 'HARDWARE_AVAILABILITY_POLICY_INVALID', message: /requires an apply-lock assertion/ },
+        'not-callable': { code: 'HARDWARE_AVAILABILITY_POLICY_INVALID', message: /requires an apply-lock assertion/ },
+        throws: { code: 'TEST_LOCK_NOT_HELD', message: /lock not held/ },
+        released: { code: 'EDGE_GENERATION_CAPABILITY_REQUIRED', message: /exact live apply-lock capability/ },
+        foreign: { code: 'EDGE_GENERATION_CAPABILITY_REQUIRED', message: /outside the workspace that holds the apply lock/ },
+    };
+    for (const [operation, spec] of Object.entries(OPERATIONS)) {
+        const ws = makeWorkspace(t);
+        spec.prepare(ws);
+        const before = snapshotTree(ws.paths.edgeDir);
+        for (const [kind, expected] of Object.entries(CASES)) {
+            const label = `${operation}/${kind}`;
+            let attempt;
+            if (kind === 'missing') attempt = () => spec.call(ws, undefined);
+            else if (kind === 'not-callable') attempt = () => spec.call(ws, 'held');
+            else if (kind === 'throws') {
+                attempt = () => spec.call(ws, () => { throw Object.assign(new Error('lock not held'), { code: 'TEST_LOCK_NOT_HELD' }); });
+            } else if (kind === 'released') {
+                let held;
+                underApplyLock(ws.root, ({ capability }) => { held = capability; });
+                attempt = () => spec.call(ws, lockAssertion(ws.root, held));
+            } else {
+                // A live lock of ANOTHER workspace, with an assertion that is valid for that workspace.
+                const other = makeWorkspace(t);
+                attempt = () => underApplyLock(other.root, ({ assertApplyLock }) => spec.call(ws, assertApplyLock));
+            }
+            assert.throws(attempt, (error) => {
+                assert.equal(error.code, expected.code, `${label}: ${error.code} ${error.message}`);
+                assert.match(error.message, expected.message, label);
+                return true;
+            }, label);
+            assert.deepEqual(snapshotTree(ws.paths.edgeDir), before, `${label}: zero bytes written`);
+        }
+        // The control: the same call under the workspace's own live lock does write, so the refusals above are not vacuous.
+        underApplyLock(ws.root, ({ assertApplyLock }) => spec.call(ws, assertApplyLock));
+        assert.notDeepEqual(snapshotTree(ws.paths.edgeDir), before, `${operation}: the lawful call writes`);
+        spec.done(ws);
+    }
 });

@@ -342,6 +342,7 @@ export function buildRequiredCaseManifest() {
             'NW1.D1-sigkill-after-the-policy-rename-keeps-the-new-policy',
             'NW1.D1-entry-byte-and-text-bounds-refuse-without-a-partial-write',
             'NW1.D1-a-missing-witness-beside-a-valid-store-is-read-as-valid-and-restored-by-init',
+            'NW1.D1-every-mutation-refuses-with-zero-bytes-written-when-the-apply-lock-assertion-is-missing-throws-is-released-or-foreign',
         ]),
         ...leaves(P, 'p0', unit('noWaitLateOutcomeActivation.test.mjs'), [
             'NW1.D2-failed-status-writes-are-fsynced-and-the-run-scoped-rename-commits',
@@ -388,6 +389,8 @@ export function buildRequiredCaseManifest() {
                 'm17-a-post-rename-fsync-failure-rolls-back', 'm23-the-revision-includes-a-write-time',
                 'm28-a-witness-without-its-directory-is-read-as-absent', 'm33-the-witness-is-written-before-the-directory-rename',
                 'm34-a-missing-witness-beside-a-valid-store-is-unreadable',
+                'ms51a-the-apply-lock-assertion-need-not-be-a-function', 'ms51b-the-apply-lock-assertion-is-never-called', 'ms51c-the-apply-lock-assertions-throw-is-swallowed',
+                'ms51d-the-apply-lock-is-not-bound-to-the-store-paths',
                 'ms36-the-validator-accepts-a-shared-run-id-and-a-missing-startup-grace',
                 'ms1-the-resolver-reads-the-canonical-status-file',
                 'ms2-the-resolver-lists-the-no-wait-directory',

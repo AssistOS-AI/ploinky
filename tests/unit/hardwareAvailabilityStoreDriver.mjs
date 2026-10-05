@@ -46,9 +46,10 @@ async function run() {
         const faults = options.pauseAt === 'afterRename' ? { afterRename: () => pause('afterRename') } : {};
         const hooks = options.pauseAt === 'beforeRename' ? { beforeRename: () => pause('beforeRename') } : {};
         return edge.withEdgeGenerationApplyLock((capability) => {
-            const assertApplyLock = () => edge.assertEdgeGenerationApplyLockCapability({
+            const assertApplyLock = (storePaths) => edge.assertEdgeGenerationApplyLockCapability({
                 workspaceRoot: workspace,
                 applyLockCapability: capability,
+                storePaths,
             });
             const current = store.readHardwareAvailabilityPolicy({ paths });
             return store.commitHardwareAvailabilityPolicy({

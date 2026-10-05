@@ -156,6 +156,20 @@ export const AVAILABILITY_MUTANTS = Object.freeze({
     'ms50b-the-probe-skips-the-ctime-cross-check': { name: 'ms50b-the-probe-skips-the-ctime-cross-check', file: PROBE,
         kill: kill(PROBE_TEST, 'NW1\\.S-durable-activation-is-proved'),
         patches: [{ from: 'ctimeMatchesVisible: Number.isFinite(ctimeMs) && Number.isFinite(tVisMs) && Math.abs(ctimeMs - tVisMs) <= ctimeToleranceMs,', to: 'ctimeMatchesVisible: true,' }] },
+    // The apply-lock guard of every store mutation: its typeof check, its call, and its throw.
+    'ms51a-the-apply-lock-assertion-need-not-be-a-function': { name: 'ms51a-the-apply-lock-assertion-need-not-be-a-function', file: STORE,
+        kill: kill(STORE_TEST, 'NW1\\.D1-every-mutation-refuses-with-zero-bytes'),
+        patches: [{ from: "    if (typeof assertApplyLock !== 'function') {\n        throw availabilityError('hardware availability mutation requires an apply-lock assertion', HARDWARE_AVAILABILITY_INVALID);\n    }\n", to: '' }] },
+    'ms51b-the-apply-lock-assertion-is-never-called': { name: 'ms51b-the-apply-lock-assertion-is-never-called', file: STORE,
+        kill: kill(STORE_TEST, 'NW1\\.D1-every-mutation-refuses-with-zero-bytes'),
+        patches: [{ from: '    assertApplyLock(paths);\n}', to: '}' }] },
+    'ms51c-the-apply-lock-assertions-throw-is-swallowed': { name: 'ms51c-the-apply-lock-assertions-throw-is-swallowed', file: STORE,
+        kill: kill(STORE_TEST, 'NW1\\.D1-every-mutation-refuses-with-zero-bytes'),
+        patches: [{ from: '    assertApplyLock(paths);\n}', to: '    try { assertApplyLock(paths); } catch (_) {}\n}' }] },
+    // The assertion is bound to the store written: another workspace's live lock is accepted for these paths.
+    'ms51d-the-apply-lock-is-not-bound-to-the-store-paths': { name: 'ms51d-the-apply-lock-is-not-bound-to-the-store-paths', file: 'cli/sandbox/edgeGeneration.js',
+        kill: kill(STORE_TEST, 'NW1\\.D1-every-mutation-refuses-with-zero-bytes'),
+        patches: [{ from: "    if (!storePaths || typeof storePaths !== 'object' || !STORE_BINDING_KEYS.every((key) => storePaths[key] === lockPaths[key])) {", to: '    if (false) {' }] },
     'ms36-the-validator-accepts-a-shared-run-id-and-a-missing-startup-grace': { name: 'ms36-the-validator-accepts-a-shared-run-id-and-a-missing-startup-grace', file: STORE,
         kill: kill(SLOTS_TEST, 'NW1\\.S-frozen-v1-slot-schema'),
         patches: [

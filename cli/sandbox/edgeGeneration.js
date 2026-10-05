@@ -343,11 +343,7 @@ export function initializeFreshEdgeRoutingSources(options = {}) {
         // availability store is installed, kept or restored before any source.
         const hardwareAvailability = reconcileHardwareAvailabilityStore(paths, {
             complete,
-            assertApplyLock: () => {
-                if (!hasApplyLockCapability(paths, applyLockCapability)) {
-                    throw edgeError('hardware availability mutation requires the live apply lock', 'EDGE_GENERATION_CAPABILITY_REQUIRED');
-                }
-            },
+            assertApplyLock: (storePaths) => assertStorePathsUnderApplyLock(paths, applyLockCapability, storePaths),
             testHooks: options.testHooks?.hardwareAvailability,
         });
         if (complete) return Object.freeze({ initialized: false, paths, hardwareAvailability });
@@ -3143,18 +3139,35 @@ export function captureEdgeRoutingCandidateGeneration(options = {}) {
     return collectCapturedSources(paths).generation;
 }
 
-/**
- * Assert that the caller holds the exact live apply lock for this workspace.
- * The hardware-availability store's mutations are made only under it.
- */
-export function assertEdgeGenerationApplyLockCapability(options = {}) {
-    const paths = resolveEdgeGenerationPaths(options);
-    if (!hasApplyLockCapability(paths, options.applyLockCapability)) {
+// The store paths a mutation is about to write must be exactly those of the
+// workspace whose live apply lock the capability proves.
+const STORE_BINDING_KEYS = Object.freeze([
+    'root', 'edgeDir', 'applyLockFile', 'availabilityWitnessFile', 'availabilityStoreDir', 'availabilityPolicyFile',
+]);
+
+function assertStorePathsUnderApplyLock(lockPaths, capability, storePaths) {
+    if (!hasApplyLockCapability(lockPaths, capability)) {
         throw edgeError(
             'hardware availability mutation requires the exact live apply-lock capability',
             'EDGE_GENERATION_CAPABILITY_REQUIRED',
         );
     }
+    if (!storePaths || typeof storePaths !== 'object' || !STORE_BINDING_KEYS.every((key) => storePaths[key] === lockPaths[key])) {
+        throw edgeError(
+            'hardware availability mutation targets a store outside the workspace that holds the apply lock',
+            'EDGE_GENERATION_CAPABILITY_REQUIRED',
+        );
+    }
+}
+
+/**
+ * Assert that the caller holds the exact live apply lock for this workspace
+ * and that `storePaths`, the resolved paths the store is about to write, are
+ * under that same workspace. The hardware-availability store's mutations are
+ * made only under it and call this as `assertApplyLock(paths)`.
+ */
+export function assertEdgeGenerationApplyLockCapability(options = {}) {
+    assertStorePathsUnderApplyLock(resolveEdgeGenerationPaths(options), options.applyLockCapability, options.storePaths);
 }
 
 /**

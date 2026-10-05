@@ -7,7 +7,7 @@
 // This module is mechanism only: it reads and validates, installs, restores
 // the witness, commits one rename and sweeps dead-owner temporaries. It
 // authorizes nothing. Every mutation requires the caller to prove the edge
-// apply lock (`assertApplyLock`), and only `initializeFreshEdgeRoutingSources`
+// apply lock (`assertApplyLock(paths)`), and only `initializeFreshEdgeRoutingSources`
 // may install or restore. It takes already-resolved edge generation `paths`
 // and imports nothing from edgeGeneration.js, so there is no import cycle.
 //
@@ -430,11 +430,13 @@ function removeIfPresent(fsApi, file) {
     }
 }
 
-function requireApplyLock(assertApplyLock) {
+// The assertion receives the store's resolved paths so it can prove that the
+// lock it holds belongs to the workspace those paths are under.
+function requireApplyLock(assertApplyLock, paths) {
     if (typeof assertApplyLock !== 'function') {
         throw availabilityError('hardware availability mutation requires an apply-lock assertion', HARDWARE_AVAILABILITY_INVALID);
     }
-    assertApplyLock();
+    assertApplyLock(paths);
 }
 
 function ownerDead(pid, killImpl) {
@@ -477,7 +479,7 @@ function removeStagingDirectory(fsApi, directory) {
  * Runs under the apply lock.
  */
 export function sweepHardwareAvailabilityTemps({ paths, assertApplyLock, fsApi = fs, killImpl = process.kill } = {}) {
-    requireApplyLock(assertApplyLock);
+    requireApplyLock(assertApplyLock, paths);
     const removed = [];
     const scan = (directory, matchers) => {
         let names;
@@ -591,7 +593,7 @@ export function installHardwareAvailabilityStore({
     now = () => new Date(),
     killImpl = process.kill,
 } = {}) {
-    requireApplyLock(assertApplyLock);
+    requireApplyLock(assertApplyLock, paths);
     if (initializedBy !== 'fresh' && initializedBy !== 'upgrade') {
         throw availabilityError('hardware availability install requires a fresh or upgrade origin', HARDWARE_AVAILABILITY_INVALID);
     }
@@ -650,7 +652,7 @@ export function restoreHardwareAvailabilityWitness({
     faults = {},
     now = () => new Date(),
 } = {}) {
-    requireApplyLock(assertApplyLock);
+    requireApplyLock(assertApplyLock, paths);
     const { witness, directory } = inspectHardwareAvailabilityStore({ paths, fsApi });
     if (witness.state !== 'absent' || directory.state !== 'valid') {
         throw availabilityError(
@@ -693,7 +695,7 @@ export function commitHardwareAvailabilityPolicy({
     faults = {},
     killImpl = process.kill,
 } = {}) {
-    requireApplyLock(assertApplyLock);
+    requireApplyLock(assertApplyLock, paths);
     const snapshot = readHardwareAvailabilityPolicy({ paths, fsApi });
     if (snapshot.state !== 'valid') {
         throw unreadable(paths.availabilityStoreDir, 'the store is not initialized; commits require a valid store');
