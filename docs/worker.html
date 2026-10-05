@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Ploinky Worker turns repeatable LLM work into efficient, observable pipelines across local, cloud, and shared model infrastructure.">
+    <title>Ploinky Worker — Efficient LLM pipelines</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="partials-loader.js" defer></script>
+</head>
+<body class="worker-page" data-page="worker">
+    <div data-include="partials/header.html"></div>
+
+    <main>
+        <section class="worker-hero">
+            <div class="worker-hero__inner">
+                <div>
+                    <span class="worker-kicker">Open source · CLI + library</span>
+                    <h1><span class="worker-hero__title-line">More useful work</span> <span class="worker-hero__title-line">from <em>every model call.</em></span></h1>
+                    <p class="worker-hero__lead">Ploinky Worker turns repeatable LLM jobs into small, deliberate pipelines. Match every step with the right-sized model, run against local or remote infrastructure, and keep throughput, cost, and results visible.</p>
+                    <div class="worker-actions">
+                        <a class="worker-button worker-button--primary" href="https://assistos-ai.github.io/Ploinky-Worker/" target="_blank" rel="noopener noreferrer">Explore the open source project&nbsp; ↗</a>
+                        <a class="worker-button" href="#how-it-works">See how it works</a>
+                    </div>
+                </div>
+
+                <div class="worker-terminal" aria-label="Example Ploinky Worker task">
+                    <div class="worker-terminal__bar" aria-hidden="true"><i></i><i></i><i></i></div>
+                    <pre><span class="worker-terminal__muted"># queue a repeatable LLM task</span>
+<span class="worker-terminal__prompt">$</span> pworker run ./profile.mjs \
+    --input '{"page":"report.html"}' \
+    --async
+
+{
+  "status": <span class="worker-terminal__value">"queued"</span>,
+  "phase":  <span class="worker-terminal__value">"extract"</span>
+}
+
+<span class="worker-terminal__muted"># inspect it without holding the process</span>
+<span class="worker-terminal__prompt">$</span> pworker --status 9f3…
+{
+  "status": <span class="worker-terminal__value">"running"</span>,
+  "phase":  <span class="worker-terminal__value">"classify"</span>
+}</pre>
+                </div>
+            </div>
+        </section>
+
+        <div class="worker-proof" aria-label="Ploinky Worker highlights">
+            <div class="worker-proof__inner">
+                <div><strong>Right-sized models</strong><span>Choose capability per pipeline phase</span></div>
+                <div><strong>Local or remote</strong><span>Use local servers and cloud providers</span></div>
+                <div><strong>Batch-aware</strong><span>Combine compatible repetitive requests</span></div>
+                <div><strong>Observable</strong><span>Track status, limits, traffic, and results</span></div>
+            </div>
+        </div>
+
+        <section class="worker-section" id="use-cases">
+            <div class="worker-section__heading">
+                <span class="worker-kicker">Built for agentic workloads</span>
+                <h2>Repeatable work deserves a repeatable system.</h2>
+                <p>Use Ploinky Worker when the shape of the task is known but the inputs keep changing. Each run follows an inspectable flow instead of starting an open-ended agent loop.</p>
+            </div>
+            <div class="worker-card-grid">
+                <article class="worker-card">
+                    <span class="worker-card__icon" aria-hidden="true">✦</span>
+                    <h3>Synthetic data</h3>
+                    <p>Generate, transform, validate, and refine datasets through explicit stages with separate quality checks.</p>
+                </article>
+                <article class="worker-card">
+                    <span class="worker-card__icon" aria-hidden="true">✓</span>
+                    <h3>Tests and evaluations</h3>
+                    <p>Run LLM-backed test suites and evals as background jobs, then inspect the current phase and persisted result.</p>
+                </article>
+                <article class="worker-card">
+                    <span class="worker-card__icon" aria-hidden="true">◎</span>
+                    <h3>Marketing profiling</h3>
+                    <p>Extract signals, segment audiences, compare messages, and produce structured profiles across many inputs.</p>
+                </article>
+                <article class="worker-card">
+                    <span class="worker-card__icon" aria-hidden="true">▤</span>
+                    <h3>Large-page analysis</h3>
+                    <p>Break long documents or pages into controlled extraction, classification, synthesis, and validation steps.</p>
+                </article>
+                <article class="worker-card">
+                    <span class="worker-card__icon" aria-hidden="true">⇢</span>
+                    <h3>Bulk processing</h3>
+                    <p>Queue many independent jobs, group compatible requests, and route each answer back to the correct task.</p>
+                </article>
+                <article class="worker-card">
+                    <span class="worker-card__icon" aria-hidden="true">◇</span>
+                    <h3>File workflows</h3>
+                    <p>Mix model calls with JavaScript steps that read, transform, and write files in a caller-selected directory.</p>
+                </article>
+            </div>
+        </section>
+
+        <div class="worker-band" id="how-it-works">
+            <section class="worker-section worker-split">
+                <div class="worker-split__copy">
+                    <span class="worker-kicker">Small pipelines, precise models</span>
+                    <h2>Spend intelligence where it matters.</h2>
+                    <p>A task is a readable sequence of phases. Each phase can request a logical capability tier, perform a deterministic JavaScript operation, or finish with a structured result. The actual model behind a tier is configured once and can point to a remote provider or local endpoint.</p>
+                    <p>This lets routine extraction stay on a small model while nuanced synthesis or validation moves to a stronger one—without hard-coding a provider into every task.</p>
+                </div>
+                <div class="worker-pipeline" aria-label="Example model-sized pipeline">
+                    <div class="worker-pipeline__step">
+                        <span class="worker-pipeline__number">01</span>
+                        <div><strong>Split and prepare</strong><small>Deterministic JavaScript</small></div>
+                        <span class="worker-pipeline__tier">no model</span>
+                    </div>
+                    <div class="worker-pipeline__step">
+                        <span class="worker-pipeline__number">02</span>
+                        <div><strong>Extract signals</strong><small>Fast, repeated model work</small></div>
+                        <span class="worker-pipeline__tier">tiny tier</span>
+                    </div>
+                    <div class="worker-pipeline__step">
+                        <span class="worker-pipeline__number">03</span>
+                        <div><strong>Classify and score</strong><small>Structured model output</small></div>
+                        <span class="worker-pipeline__tier">small tier</span>
+                    </div>
+                    <div class="worker-pipeline__step">
+                        <span class="worker-pipeline__number">04</span>
+                        <div><strong>Synthesize the result</strong><small>Nuanced final reasoning</small></div>
+                        <span class="worker-pipeline__tier">good tier</span>
+                    </div>
+                    <div class="worker-pipeline__step">
+                        <span class="worker-pipeline__number">05</span>
+                        <div><strong>Persist and report</strong><small>Structured result + files</small></div>
+                        <span class="worker-pipeline__tier">no model</span>
+                    </div>
+                </div>
+            </section>
+        </div>
+
+        <section class="worker-section">
+            <div class="worker-section__heading">
+                <span class="worker-kicker">Infrastructure efficiency</span>
+                <h2>Feed the hardware, not the overhead.</h2>
+                <p>Ploinky Worker is designed to keep useful work flowing through the model infrastructure you already have—from a developer machine to cloud or shared GPU-backed endpoints.</p>
+            </div>
+            <div class="worker-outcomes">
+                <article class="worker-outcome">
+                    <strong>Batch compatible work</strong>
+                    <p>Pack eligible phase requests together while keeping every task ID, result, and continuation independent.</p>
+                </article>
+                <article class="worker-outcome">
+                    <strong>Respect provider limits</strong>
+                    <p>Route by tier, throttle requests, cache complete repeats, and observe request counts and transferred bytes.</p>
+                </article>
+                <article class="worker-outcome">
+                    <strong>Keep capacity busy</strong>
+                    <p>Queue repeatable jobs so capable local or remote schedulers have a steady stream of appropriately sized work.</p>
+                </article>
+            </div>
+            <p class="worker-caution"><strong>Clear boundary:</strong> prompt batching can reduce repetitive requests, but token savings, latency gains, and GPU saturation depend on the selected model server, provider, scheduler, and workload. Ploinky Worker supplies the task, queue, tier, and dispatch structure needed to optimize them deliberately.</p>
+        </section>
+
+        <div class="worker-band">
+            <section class="worker-section">
+                <div class="worker-section__heading">
+                    <span class="worker-kicker">Control and visibility</span>
+                    <h2>Know what is running—and why.</h2>
+                    <p>Submit work synchronously or return a task ID immediately. Check the active phase later, retrieve the final result, and tune the pipeline using observable runtime behavior.</p>
+                </div>
+                <div class="worker-card-grid">
+                    <article class="worker-card"><span class="worker-card__icon" aria-hidden="true">◷</span><h3>Persistent background tasks</h3><p>Queued work can continue independently while clients poll for status, completion, or a bounded error.</p></article>
+                    <article class="worker-card"><span class="worker-card__icon" aria-hidden="true">⌁</span><h3>Provider flexibility</h3><p>Connect provider APIs, OpenAI-compatible endpoints, or configured local models behind the same task format.</p></article>
+                    <article class="worker-card"><span class="worker-card__icon" aria-hidden="true">▦</span><h3>Inspectability by design</h3><p>Readable task files and explicit phase transitions make workflows easier to review, test, and improve.</p></article>
+                </div>
+            </section>
+        </div>
+
+        <section class="worker-section">
+            <div class="worker-cta">
+                <span class="worker-kicker">Open source, with help when you need it</span>
+                <h2>Start with the code. Scale with a workload-specific design.</h2>
+                <p>Ploinky Worker is open source. Explore the task format, CLI, provider routing, local models, batching, monitoring, and background execution today. For advanced deployments, the team offers consulting on pipeline design, provider topology, batching strategy, shared GPU infrastructure, and local inference integration.</p>
+                <div class="worker-actions">
+                    <a class="worker-button worker-button--primary" href="https://assistos-ai.github.io/Ploinky-Worker/" target="_blank" rel="noopener noreferrer">Open Ploinky Worker&nbsp; ↗</a>
+                    <a class="worker-button" href="index.html">Back to Ploinky</a>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <div data-include="partials/footer.html"></div>
+</body>
+</html>
