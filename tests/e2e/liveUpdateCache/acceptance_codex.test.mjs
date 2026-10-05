@@ -88,6 +88,25 @@ test('invocation 2 runs R1 (U7c, U8a) once, creates release1_codex.json exclusiv
     await rejects(h.run(), 'release2-fixture-absent'); assert.equal(h.createdPorts(), ports, 'no adapter was created'); assert.equal(h.gateLog().length, gates); assert.equal(h.io.files.get(h.manifest.evidence.release1Record).toString(), before, 'release1_codex.json is never rewritten');
 });
 
+test('N-B: invocation 2 always ends after U8a with AWAITING_SECOND_RELEASE_FIXTURE, even when release2_codex.json appears while it runs', async () => {
+    const h = build(); await h.invocation1(); h.setRelease();
+    const run = h.ports.gates.run; h.ports.gates.run = async gate => { const row = await run(gate); h.io.setFile(h.manifest.evidence.release2, JSON.stringify(h.release2)); return row; };   // the operator's second fixture lands during the Copilot gate
+    const receipt = await h.run();
+    assert.equal(receipt.status, 'AWAITING_SECOND_RELEASE_FIXTURE'); assert.equal(receipt.exitCode, 3); assert.equal(receipt.acceptance, 'UNQUALIFIED'); assert.deepEqual(receipt.phases.map(row => row.status), STATUSES(11));
+    assert.deepEqual(h.loads, ['R1'], 'R2 was never loaded'); assert.deepEqual(h.activation, [], 'no activation ran'); assert.deepEqual(h.gateLog(), ['Copilot']); assert.equal(h.io.files.has(h.manifest.evidence.release1Record), true); assert.equal(h.io.files.has(h.manifest.evidence.receipt), false);
+    // Invocation 3 then continues from exactly that state.
+    h.setRelease2(); const final = await h.run(); assert.equal(final.acceptance, 'UC_STAGE_PASS', `${final.failedPhase}:${final.reason}`); assert.deepEqual(h.loads, ['R1', 'R2']);
+});
+
+test('N-B: release2_codex.json without release1_codex.json is refused at startup before any adapter exists', async () => {
+    for (const withFunctional of [false, true]) {
+        const h = build(); if (withFunctional) { await h.invocation1(); h.setRelease(); } h.setRelease2();
+        const created = h.createdPorts(); await rejects(h.run(), 'release2-fixture-premature', String(withFunctional)); assert.equal(h.createdPorts(), created, 'no adapter was created'); assert.deepEqual(h.gateLog(), []); assert.deepEqual(h.loads, []);
+    }
+    const fresh = build(); fresh.setRelease2(); await rejects(fresh.run(), 'release2-fixture-premature'); assert.equal(fresh.createdPorts(), 0);
+    const fine = build(); await fine.invocation1(); await fine.invocation2(); fine.setRelease2(); assert.equal((await fine.run()).acceptance, 'UC_STAGE_PASS');
+});
+
 test('invocation 3 runs R2 (U7d, UA, U8b, U9) and completes the UC STAGE only: UC_STAGE_PASS with overall acceptance OPEN and AC-L4 G-BASE pending', async () => {
     const h = build(); await h.invocation1(); await h.invocation2(); const receipt = await h.invocation3();
     assert.equal(receipt.acceptance, 'UC_STAGE_PASS', `${receipt.failedPhase}:${receipt.reason}`); assert.equal(receipt.exitCode, 0); assert.equal(receipt.ucOverallAcceptance, 'OPEN'); assert.deepEqual(receipt.pendingRequirements, ['AC-L4-G-BASE']); assert.equal(receipt.status, 'UC_STAGE_COMPLETE');

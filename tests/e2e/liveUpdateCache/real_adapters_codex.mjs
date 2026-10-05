@@ -26,9 +26,9 @@ export function createRunEnvironment({ nowWall = () => Date.now() } = {}) {
     return { latch, custody, clock };
 }
 
-export function createRealPorts({ manifestPath, latch, custody, clock, io = fs, processEnv = process.env }) {
+export function createRealPorts({ manifestPath, latch, custody, clock, io = fs, processEnv = process.env, createProcessObserver = createLinuxProcessObserver }) {
     return async function createPorts({ manifest, inputs, check }) {
-        const observerLinux = createLinuxProcessObserver();
+        const observerLinux = createProcessObserver();
         const deps = { latch, custody, runId: manifest.runId, register: observerLinux.register, current: observerLinux.current, now: clock.mono, delay: clock.delay };
         const env = buildCommandEnvironment(processEnv, { PLOINKY_WORKSPACE_ROOT: manifest.workspace.path });
         const workerHost = createWorkerHost({ manifest, deps, io, processEnv });

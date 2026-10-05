@@ -77,6 +77,8 @@ export async function executeAcceptance({ manifest, inputs, createPorts, io = fs
     let resume = null, resume1 = null;
     const hasFunctional = exists(io, manifest.evidence.functional), hasRelease1 = exists(io, manifest.evidence.release1Record);
     need(hasFunctional || !hasRelease1, 'release-epoch1-invalid');
+    // The second fixture is created only after the Copilot gate has finished, so it cannot exist before the R1 record does.
+    need(hasRelease1 || !exists(io, manifest.evidence.release2), 'release2-fixture-premature');
     if (hasFunctional) resume = verifyFunctionalFile(parseStrictJson(readBoundedRegularFile(manifest.evidence.functional, LIMITS.readBytes, io), LIMITS.readBytes), manifest);
     if (hasRelease1) resume1 = verifyRelease1File(parseStrictJson(readBoundedRegularFile(manifest.evidence.release1Record, LIMITS.readBytes, io), LIMITS.readBytes), manifest, resume);
     // Once R1 is settled, invocation 2 is done: it is never repeated, and invocation 3 needs the second fixture. Neither launches anything.
@@ -128,7 +130,8 @@ export async function executeAcceptance({ manifest, inputs, createPorts, io = fs
         else {
             if (!resume1) {
                 if (!exists(io, manifest.evidence.release)) awaiting = 'AWAITING_RELEASE_FIXTURE';
-                else { for (const name of RELEASE1) await run(name); if (!exists(io, manifest.evidence.release2)) awaiting = 'AWAITING_SECOND_RELEASE_FIXTURE'; }
+                // Invocation 2 always ends here: R2 is never started in the same process, whatever files exist by now.
+                else { for (const name of RELEASE1) await run(name); awaiting = 'AWAITING_SECOND_RELEASE_FIXTURE'; }
             }
             if (!awaiting) for (const name of RELEASE2) await run(name);
         }
