@@ -4,13 +4,14 @@ import path from 'node:path';
 import { manifestFixture, installPureGuards } from './test_support_codex.mjs';
 import { createBrowserPort, smokeEnvironment } from './browser_codex.mjs';
 import { applicationMarker } from './application_marker_codex.mjs';
+import { smokeOrigin } from './manifest_codex.mjs';
 installPureGuards();
 
 function build(overrides = {}) {
     const { value: manifest } = manifestFixture(), marker = applicationMarker(manifest), processEnv = {}, events = [];
-    const origin = `http://${manifest.publications[0].hostIP}:${manifest.publications[0].hostPort}`;
-    const makePage = () => ({ url: () => `${origin}/`, waitForResponse: () => Promise.resolve({ url: () => `${origin}/upload?path=${encodeURIComponent(marker.applicationPath)}`, request: () => ({ method: () => 'POST' }), status: () => 200 }),
-        waitForFunction: async () => {}, setDefaultTimeout: value => events.push(`timeout:${value}`), locator: () => ({ setInputFiles: async () => {}, click: async () => {}, textContent: async () => marker.text }) });
+    // The fake page reports the origin the smoke helper would sign in on: the one read from processEnv.SMOKE_BASE_URL when the page is created.
+    const makePage = () => { const origin = overrides.pageOrigin ?? processEnv.SMOKE_BASE_URL; return {  url: () => `${origin}/`, waitForResponse: () => Promise.resolve({ url: () => `${origin}/upload?path=${encodeURIComponent(marker.applicationPath)}`, request: () => ({ method: () => 'POST' }), status: () => 200 }),
+        waitForFunction: async () => {}, setDefaultTimeout: value => events.push(`timeout:${value}`), locator: () => ({ setInputFiles: async () => {}, click: async () => {}, textContent: async () => marker.text }) }; };
     const chromium = { launch: async options => { events.push(`launch:${JSON.stringify(options)}`); return { newContext: async () => { const id = events.filter(event => event === 'context').length; events.push('context');
         return { newPage: async () => makePage(), close: async () => { events.push(`close-context:${id}`); if (overrides.contextCloseFails) throw new Error('PRIVATE'); } }; }, close: async () => { events.push('close-browser'); if (overrides.browserCloseFails) throw new Error('PRIVATE'); } }; } };
     const imports = []; const importModule = async specifier => { imports.push({ specifier, env: { ...processEnv } }); return { openExplorer: async (_page, options) => { events.push(`open:${options.hash}`); }, assertExplorerDirectory: async () => { events.push('dir'); } }; };
@@ -33,6 +34,14 @@ test('smoke environment is set before the first smoke import and only names the 
     assert.equal(receipt.phase, 'U1'); assert.equal(h.imports.length, 1); assert.equal(h.imports[0].env.SMOKE_BASE_URL, 'http://localhost:8080'); assert.ok(h.imports[0].specifier.endsWith('/tests/smoke/lib/explorer.mjs'));
     assert.ok(h.events.includes('launch:{"headless":true}')); assert.equal(h.port.openContexts(), 1); assert.equal(h.processEnv.SMOKE_WORKSPACE_ROOT, h.manifest.workspace.path);
     assert.deepEqual(Object.keys(h.processEnv).sort(), ['SMOKE_ARTIFACT_DIR', 'SMOKE_BASE_URL', 'SMOKE_RUN_ID', 'SMOKE_WORKSPACE_ROOT']);
+});
+
+test('U1 refuses a page on the 127.0.0.1 origin of the same publication: the smoke origin is localhost and the marker check is bound to it', async () => {
+    const h = build({ pageOrigin: 'http://127.0.0.1:8080' }); const { expected, observed } = expectedLive(h.manifest);
+    await assert.rejects(h.port.createMarker({ live: observed, expected }), error => error.code === 'application-marker-origin');
+    const wrongPort = build({ pageOrigin: 'http://localhost:8081' }); await assert.rejects(wrongPort.port.createMarker({ live: expectedLive(wrongPort.manifest).observed, expected: expectedLive(wrongPort.manifest).expected }), error => error.code === 'application-marker-origin');
+    // The page follows whatever SMOKE_BASE_URL the port exported: it is the shared smoke origin.
+    const ok = build(); await ok.port.createMarker({ live: expectedLive(ok.manifest).observed, expected: expectedLive(ok.manifest).expected }); assert.equal(ok.processEnv.SMOKE_BASE_URL, smokeOrigin(ok.manifest.publications[0]));
 });
 
 test('verification uses a fresh context and requires the created marker; close is reverse-ordered and proven', async () => {

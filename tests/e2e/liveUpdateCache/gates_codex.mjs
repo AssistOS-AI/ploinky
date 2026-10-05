@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { AcceptanceError, LIMITS, need, parseStrictJson, boxName } from './manifest_codex.mjs';
+import { AcceptanceError, LIMITS, need, parseStrictJson, boxName, smokeOrigin } from './manifest_codex.mjs';
 import { gpuWiringIdentityOf } from './engine_codex.mjs';
 import { runOwnedCommand, buildCommandEnvironment } from './host_command_codex.mjs';
 import { readBoundedRegularFile } from './worker_codex.mjs';
@@ -33,7 +33,7 @@ export function boxEnvironment(manifest) {
     need(typeof box.imageRef === 'string' && box.imageRef !== '' && typeof box.imageId === 'string' && HEX64.test(box.imageId), 'gate-box-binding');
     need(publication && Number.isSafeInteger(publication.hostPort) && publication.hostPort > 0 && publication.hostPort < 65536, 'gate-box-binding');
     need(typeof grant === 'string' && HEX64.test(grant), 'gate-box-binding');
-    const env = { SMOKE_PLOINKY_BOX_CONTAINER: box.name, SMOKE_BOX_BASE_URL: `http://127.0.0.1:${publication.hostPort}`, SMOKE_BASE_URL: `http://localhost:${publication.hostPort}`,
+    const env = { SMOKE_PLOINKY_BOX_CONTAINER: box.name, SMOKE_BOX_BASE_URL: `http://127.0.0.1:${publication.hostPort}`, SMOKE_BASE_URL: smokeOrigin(publication),
         SMOKE_EXPECT_BOX_IMAGE_REF: box.imageRef, SMOKE_EXPECT_BOX_IMAGE_ID: `sha256:${box.imageId}` };
     if (grant !== gpuWiringIdentityOf({})) env.SMOKE_BOX_GPU_GRANT = grant;
     return env;

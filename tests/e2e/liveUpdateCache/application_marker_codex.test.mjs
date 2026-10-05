@@ -25,7 +25,7 @@ function liveFixture(manifest) {
 
 function harness(manifest, overrides = {}) {
     const calls = [], retained = [];
-    const origin = `http://${manifest.publications[0].hostIP}:${manifest.publications[0].hostPort}`;
+    const origin = `http://localhost:${manifest.publications[0].hostPort}`;
     const marker = applicationMarker(manifest);
     const state = { stored: null, predicate: null, inputFiles: null, pageOrigin: origin, uploadStatus: 200, uploadFails: false };
     Object.assign(state, overrides.state);
@@ -97,6 +97,9 @@ test('existing marker, wrong origin, browser failure and storage mismatch fail c
     let h = harness(manifest, { state: { stored: { exists: true } } });
     await rejects(createApplicationMarker({ manifest, live: observed, expected, ...h.adapters }), 'application-marker-already-present');
     assert.deepEqual(h.retained, []);
+    h = harness(manifest, { state: { pageOrigin: `http://${manifest.publications[0].hostIP}:${manifest.publications[0].hostPort}` } });
+    await rejects(createApplicationMarker({ manifest, live: observed, expected, ...h.adapters }), 'application-marker-origin');
+    assert.equal(h.calls.some(name => name.startsWith('setInputFiles')), false);
     h = harness(manifest, { state: { pageOrigin: 'http://127.0.0.1:9' } });
     await rejects(createApplicationMarker({ manifest, live: observed, expected, ...h.adapters }), 'application-marker-origin');
     assert.equal(h.retained.length, 1); assert.equal(h.retained[0].ownership, 'CREATION_PENDING_AFTER_PROVEN_ABSENCE');

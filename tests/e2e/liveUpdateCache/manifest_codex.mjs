@@ -19,6 +19,9 @@ export const digest = (value, length = 64) => typeof value === 'string' && new R
 export const absolute = value => typeof value === 'string' && value.length <= 4096 && path.isAbsolute(value)
     && path.normalize(value) === value && !/[\0\r\n]/.test(value) && !placeholder.test(value)
     && !/(?:^|\/)(?:\.codex|\.ssh|\.secrets|\.env)(?:\/|$)/.test(value);
+// The one browser origin of a Box's Router publication: loopback sign-in is canonicalized to `localhost`, so every smoke
+// page (U1/U7 and the gates) runs on, and is checked against, this origin. The host-side `/health` probe stays on 127.0.0.1.
+export const smokeOrigin = publication => `http://localhost:${publication.hostPort}`;
 // The exact outer Box container name (never its 64-hex ID), as observed by the same exact-ID inspect that bound the ID.
 export const BOX_NAME_PATTERN = /^ploinky-box-[a-z0-9][a-z0-9-]{0,200}$/;
 export const boxName = value => typeof value === 'string' && BOX_NAME_PATTERN.test(value);
