@@ -55,7 +55,7 @@ export async function executeAcceptance({ manifest, inputs, createPorts, io = fs
     if (resume) { receipts.push(...resume.receipts); offsetMs = resume.receipts.at(-1).finishedMs; }
     const state = { functional: resume ? { ...resume.record } : null }; let currentCheck = () => {};
     const ports = await createPorts({ manifest, inputs, check: () => currentCheck() });
-    const ctx = { manifest, inputs, ports, state, check: () => currentCheck(), wallNow: clock.wall, latchClean: () => !latch.snapshot().uncertain };
+    const ctx = { manifest, inputs, ports, state, check: () => currentCheck(), wallNow: clock.wall, latchClean: () => !latch.snapshot().uncertain, stop: code => latch.stop(code) };
     const phases = { ...createFunctionalPhases(ctx), ...createReleasePhases(ctx) };
     const finalizers = { async U7b(receipt) {
         const record = functionalRecord({ manifest, observed: state.finalObserved, finishedAt: new Date(clock.wall()).toISOString(), frozen: true, cleanupComplete: true });

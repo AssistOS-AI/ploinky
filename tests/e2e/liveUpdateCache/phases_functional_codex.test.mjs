@@ -89,6 +89,16 @@ test('U5: skipped collection, a lost reader or object, an unreadable marker or i
     await failsAt({ freshObjectPerAlias: true }, 'U5', 'aliases-not-identical'); await failsAt({ noReceipt: true }, 'U3', 'cache-a-unproven');
 });
 
+test('U5 with a reinstall that settles on a later macrotask is judged correctly, and a reinstall that never settles fails the phase as uncertain instead of hanging', async () => {
+    const deferred = await run({ reinstallDeferred: true }, 'U5'); assert.equal(deferred.evidence.U5.readerUnchanged, true); assert.ok(deferred.evidence.U5.duringObservations > 0);
+    await failsAt({ reinstallDeferred: true, gcSkipped: true }, 'U5', 'ordinary-gc-not-proven'); await failsAt({ reinstallDeferred: true, readerRestartsDuringGc: true }, 'U5', 'reader-changed-during-gc');
+    await failsAt({ reinstallDeferred: true, noSummaryCallback: true }, 'U5', 'reader-not-observed-after-gc-summary');
+    const hung = await failsAt({ reinstallNever: true }, 'U5', 'reader-monitor-budget-expired'); assert.deepEqual(hung.world.stopped, ['reader-monitor-budget-expired'], 'the run is latched uncertain, never passed');
+    const expired = createWorld({ reinstallNever: true }); for (const name of ['U0', 'U1', 'U2', 'U3', 'U4']) await expired.phases[name]();
+    let checks = 0; expired.ctx.check = () => { if (++checks > 3) throw Object.assign(new Error('x'), { code: 'phase-budget-expired' }); };
+    await assert.rejects(expired.phases.U5(), error => error.code === 'phase-budget-expired'); assert.deepEqual(expired.world.stopped, ['phase-budget-expired'], 'the phase deadline stops the monitor and latches the run');
+});
+
 test('U6: a continuation run that leaves no pending activation is refused before any settlement', async () => {
     await failsAt({ noPending: true }, 'U6', 'continuation-pending-missing');
 });

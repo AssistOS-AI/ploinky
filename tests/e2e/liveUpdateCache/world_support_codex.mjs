@@ -36,7 +36,9 @@ export function createWorld(faults = {}) {
     const nonOwnedPin = '9'.repeat(64), nonOwnedRegistration = 'ploinky_AssistOSExplorer_soplangAgent_testExplorerFresh_1f39122c';
     const ports = {
         recovery: { record(label, value) { world.calls.push(`recovery:${label}`); world.recovered.push({ label, value }); return `recovery_${world.recovered.length}_${label}_codex.json`; } },
-        clock: { delay: async ms => { world.delays += 1; } },
+        // A real delay is a timer: it yields to the macrotask queue and takes real time, so a polling loop cannot starve the event
+        // loop or outrun a command that settles on a timer. Virtual time is not modelled; one millisecond stands for one interval.
+        clock: { delay: async ms => { world.delays += 1; await new Promise(resolve => setTimeout(resolve, 1)); } },
         fixture,
         observer: { async admit() { return { phase: 'U0', admitted: true, activeGeneration: world.generation, runtimes: 1 }; },
             async observe() { const expected = expectedLiveFromManifest(manifest);
@@ -71,7 +73,9 @@ export function createWorld(faults = {}) {
                 if (args[0] === 'enable') { enable(args.includes('as') ? args.at(-1) : null); return { code: faults.enableExit ?? 0 }; }
                 if (args[0] === 'disable') { world.runtimes.delete(args[2].includes('/') ? 'primary' : args[2]); bump(); return { code: 0 }; }
                 return { code: 0 }; },
-            async reinstallWithGcSummary(alias, { onChunk } = {}) { world.calls.push(`reinstall:${alias}`); world.reinstalled = true; const runtime = runtimeFor(alias), readerObject = world.runtimes.get(names.aliases[1])?.objectId;
+            async reinstallWithGcSummary(alias, { onChunk } = {}) { world.calls.push(`reinstall:${alias}`); world.reinstalled = true;
+                // A real command settles on a later macrotask (process exit, pipes); a hung one never settles.
+                if (faults.reinstallNever) return new Promise(() => {}); if (faults.reinstallDeferred) await new Promise(resolve => setTimeout(resolve, 15)); const runtime = runtimeFor(alias), readerObject = world.runtimes.get(names.aliases[1])?.objectId;
                 runtime.objectId = addObject(`reinstalled-${alias}`); runtime.selectorId = H(`sel-${world.counter++}`); runtime.runtimeId = id(`rt-${alias}-reinstalled`); if (faults.removeReaderObject) world.objects.get(readerObject).present = false;
                 if (faults.readerDies) world.runtimes.get(names.aliases[1]).running = false;
                 if (faults.readerRestartsDuringGc) world.runtimes.get(names.aliases[1]).startedAt = '2026-10-04T12:05:00Z';
@@ -83,6 +87,6 @@ export function createWorld(faults = {}) {
     };
     const owned = ownedRegistration(manifest);
     const state = {}, inputs = { expectedUpdates: { 'normal-update': { errors: [], blockedBy: [], recordIds: ['workspace-graph', owned.repoName, owned.pinId] }, 'settling-update': { errors: [], blockedBy: [], recordIds: ['workspace-graph', owned.repoName] } } };
-    const ctx = { manifest, inputs, ports, state, check() {}, latchClean: () => faults.latchDirty !== true };
+    const ctx = { manifest, inputs, ports, state, check() {}, latchClean: () => faults.latchDirty !== true, stop(code) { world.stopped = [...(world.stopped ?? []), code]; } };
     return { world, ctx, phases: createFunctionalPhases(ctx), ports };
 }

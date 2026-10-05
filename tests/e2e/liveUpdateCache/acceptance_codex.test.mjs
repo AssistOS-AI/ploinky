@@ -21,7 +21,7 @@ function releaseManifestFrom(manifest) {
 
 function build(faults = {}, { files = {} } = {}) {
     const h = createWorld(faults), { manifest } = h.world; manifest.grant.endsAtMs += 7200000; const release = releaseManifestFrom(manifest), time = { t: 0 }, io = createMemoryFs({ [`${manifest.evidence.root}/.keep`]: '', ...files }), closes = [], wallBase = Date.parse('2026-10-04T12:30:30Z'); io.setMode(manifest.evidence.root, 0o040700);
-    const clock = { mono: () => time.t, wall: () => wallBase + time.t + (faults.wallLate ?? 0), delay: async ms => { time.t += ms; } };
+    const clock = { mono: () => time.t, wall: () => wallBase + time.t + (faults.wallLate ?? 0), delay: async ms => { time.t += ms; await new Promise(resolve => setTimeout(resolve, 1)); } };
     const observedFor = m => { const expected = expectedLiveFromManifest(m);
         return { hostPlatform: 'linux', engine: 'podman', rootless: true, running: true, initialized: true, activeGeneration: 'g-1', pendingActivation: false, recoveryBarrier: false, workspace: { ...expected.workspace }, box: { ...expected.box }, candidate: structuredClone(expected.candidate),
             publications: expected.publications, sourceMounts: expected.sourceMounts, engineIdentity: expected.engineIdentity, graph: m.graph.map(entry => ({ name: entry.name, graphGeneration: 'g-1', running: true, runtimeId: 'r', instanceId: 'i', enableGeneration: 'e', ready: true, externalHealth: true, noWaitState: null })) }; };

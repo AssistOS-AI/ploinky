@@ -1,6 +1,6 @@
 import { isDeepStrictEqual } from 'node:util';
 import { AcceptanceError, need } from './manifest_codex.mjs';
-import { assertLiveBefore, assertWarmReuse, assertDependencyReplacement, assertRetainedReader } from './contracts_codex.mjs';
+import { assertLiveBefore, assertWarmReuse, assertDependencyReplacement, assertRetainedReader, PHASE_CAPS_MS } from './contracts_codex.mjs';
 import { expectedLiveFromManifest } from './live_admission_codex.mjs';
 import { ownedRegistration } from './owned_ids_codex.mjs';
 
@@ -176,11 +176,20 @@ async function retainedReaderProof(ctx, aliasA, aliasB) {
     const before = await observeReader(); need(before.live === true && before.objectId === rowB0.objectId && before.mountSource !== null, 'reader-not-mounted');
     const during = []; let pending = null, failure = null;
     const sample = afterSummary => { const task = observeReader().then(value => { during.push({ ...value, afterSummary }); }, error => { failure ??= error; }); pending = pending ? pending.then(() => task) : task; };
-    let done = false, summarySeen = false;
-    const monitor = (async () => { while (!done) { sample(false); await ports.clock.delay(READER_POLL_MS); } })();
+    let done = false, summarySeen = false, iterations = 0;
+    // The monitor polls under the same discipline as every other loop: the phase deadline is checked each iteration, and an
+    // iteration cap equal to the phase cap in polling intervals bounds it even if a clock or check were ever inert. A monitor
+    // that stops, or a reinstall that never settles, fails the phase and latches the run uncertain; it can never pass.
+    const maxIterations = Math.ceil(PHASE_CAPS_MS.U5 / READER_POLL_MS) + 1;
+    let abandonMonitor, monitorError = null; const monitorStopped = new Promise((_, reject) => { abandonMonitor = reject; }); monitorStopped.catch(() => {});
+    const monitor = (async () => {
+        try { while (!done) { ctx.check(); need(++iterations <= maxIterations, 'reader-monitor-budget-expired'); sample(false); await ports.clock.delay(READER_POLL_MS); } }
+        catch (error) { monitorError = error; abandonMonitor(error); }
+    })();
     let run; try {
-        run = await ports.cache.reinstallWithGcSummary(aliasA, { onChunk: snapshot => { if (snapshot.summary && !summarySeen) { summarySeen = true; sample(true); } } });
-    } finally { done = true; await monitor; if (pending) await pending; }
+        run = await Promise.race([ports.cache.reinstallWithGcSummary(aliasA, { onChunk: snapshot => { if (snapshot.summary && !summarySeen) { summarySeen = true; sample(true); } } }), monitorStopped]);
+    } catch (error) { if (error === monitorError) ctx.stop?.(error?.code ?? 'reader-monitor-failed'); throw error; }
+    finally { done = true; await monitor; if (pending) await pending; }
     if (failure) throw failure;
     need(run.code === 0 && run.summary.outcome === 'collected' && during.length > 0, 'ordinary-gc-not-proven');
     // The reader predicate holds for every sample taken while the command ran, at least one sample started after the
