@@ -16,6 +16,10 @@ import { buildDirectRefusal } from '../sandbox/hardwareLimits/requestedLimits.mj
 import { buildAvailabilityProjection } from './hardwareAvailability.mjs';
 import { resolveEffectiveHardwareAvailability } from './hardwareAvailabilityResolver.mjs';
 
+const SELECTOR_OR_GENERATION_UNAVAILABLE = Object.freeze([
+    'EDGE_GENERATION_INACTIVE', 'EDGE_GENERATION_CORRUPT', 'EDGE_GENERATION_RUNTIME_MISMATCH',
+]);
+
 const STORE_UNREADABLE_PARTS = Object.freeze({
     reasonCode: 'store_unreadable',
     reason: 'The hardware availability store cannot be read safely, so no agent of this workspace can be proven available.',
@@ -54,8 +58,9 @@ export function readStoreAvailabilityProjections(options = {}) {
     try {
         active = loadActiveEdgeRoutingGeneration(options);
     } catch (error) {
-        // Only the selector/generation-unavailable codes mean "the Router denies on that basis itself".
-        if (typeof error?.code === 'string' && error.code.startsWith('EDGE_')) return null;
+        // Only the outcomes loadActiveEdgeRoutingGeneration reports for an inactive selector or an unusable generation
+        // mean "the Router denies on that basis itself"; anything else is a programming error and is not hidden.
+        if (SELECTOR_OR_GENERATION_UNAVAILABLE.includes(error?.code)) return null;
         throw error;
     }
     try {

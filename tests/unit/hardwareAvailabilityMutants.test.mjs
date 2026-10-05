@@ -202,7 +202,7 @@ export const AVAILABILITY_MUTANTS = Object.freeze({
     // The projection reader swallows a programming error as "selector unavailable".
     'ms58-the-projection-reader-swallows-programming-errors': { name: 'ms58-the-projection-reader-swallows-programming-errors', file: PROJECTIONS,
         kill: kill(OBSERVERS_TEST, 'NW1\\.S-a-lease-without-effective'),
-        patches: [{ from: "        if (typeof error?.code === 'string' && error.code.startsWith('EDGE_')) return null;\n        throw error;", to: '        return null;' }] },
+        patches: [{ from: "        if (SELECTOR_OR_GENERATION_UNAVAILABLE.includes(error?.code)) return null;\n        throw error;", to: '        return null;' }] },
     'ms36-the-validator-accepts-a-shared-run-id-and-a-missing-startup-grace': { name: 'ms36-the-validator-accepts-a-shared-run-id-and-a-missing-startup-grace', file: STORE,
         kill: kill(SLOTS_TEST, 'NW1\\.S-frozen-v1-slot-schema'),
         patches: [

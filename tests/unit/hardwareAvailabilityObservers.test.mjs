@@ -408,5 +408,7 @@ test('NW1.S-a-lease-without-effective-availability-denies-the-private-caller-and
     fs.writeFileSync(inactive.paths.activeSelectorFile, '{}');
     assert.equal(readStoreAvailabilityProjections(inactive.options), null);
     assert.throws(() => readStoreAvailabilityProjections({ get workspaceRoot() { throw new TypeError('a programming error'); } }), { name: 'TypeError', message: 'a programming error' });
+    // An unrelated EDGE_ code (a capability or preparation error) is not "selector unavailable" either.
+    assert.throws(() => readStoreAvailabilityProjections({ get workspaceRoot() { throw Object.assign(new Error('capability'), { code: 'EDGE_GENERATION_CAPABILITY_REQUIRED' }); } }), { code: 'EDGE_GENERATION_CAPABILITY_REQUIRED' });
     assert.ok(world.options);
 });
