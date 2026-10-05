@@ -128,7 +128,7 @@ export function refuseUnenforceableProposal({ agentRef, agents, context, getInst
         if (refusal && admission.runtimeKind === 'container' && capabilities?.hostNetwork === true && capabilities?.nestedPodman === true && proposalRequest.length) {
             throw new HardwareLimitsError(buildDirectRefusal({
                 key: refusal.key, ref: refusal.ref, alias: refusal.alias, inputFingerprint: refusal.inputFingerprint,
-                refusalParts: { ...HOST_NETWORK_NESTED_PODMAN_REFUSAL, requested: refusal.requested.length ? refusal.requested : proposalRequest },
+                refusalParts: { ...HOST_NETWORK_NESTED_PODMAN_REFUSAL, requested: [...(refusal.requested || []).filter((entry) => !proposalRequest.some((own) => own.field === entry.field)), ...proposalRequest] },
             }));
         }
     }

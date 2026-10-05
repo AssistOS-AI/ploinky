@@ -660,6 +660,7 @@ export function buildRequiredCaseManifest() {
             'D4S.a-later-record-refused-by-d4-still-refuses-the-set-and-names-it-after-an-earlier-record-failed-admission',
             'D4S.an-unknown-envelope-does-not-hide-d4-and-only-d4-is-raised',
             'D4S.a-declaration-conflict-does-not-hide-d4-and-only-d4-is-raised',
+            'D4S.a-hidden-d4-refusal-lists-the-proposed-limit-replacing-the-manifest-value-of-the-same-field',
             'D4S.the-store-runs-the-admission-under-its-lock-with-the-locked-snapshot-plus-the-proposed-entry-and-a-throw-commits-nothing',
         ]),
         ...leaves(P, 'p2', unit('hardwareLimitsD4SetterMutants.test.mjs'), [

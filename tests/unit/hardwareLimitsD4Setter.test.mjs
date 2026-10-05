@@ -349,6 +349,22 @@ test('D4S.a-declaration-conflict-does-not-hide-d4-and-only-d4-is-raised', async 
     assert.deepEqual(storedOf(managed).get('demo/worker'), { cpus: 1 });
 });
 
+test('D4S.a-hidden-d4-refusal-lists-the-proposed-limit-replacing-the-manifest-value-of-the-same-field', async (t) => {
+    // A conflict ranks above the stored override, so with an unknown envelope the runtime's own reason lists only the manifest's declarations (cpus 2).
+    const conflict = { hardwareLimits: { pidsLimit: 64, cpus: 2 }, llmRuntime: { runtimePolicy: { resources: { pidsLimit: 32 } } } };
+    const w = world(t, { ...BASE, ...NESTED, ...HOST, ...conflict }, { context: { envelope: null } });
+    const before = snapshotOf(w);
+    const probe = hiddenBy();
+    const result = await post(w, setBody(w), { admit: probe.admit });
+    assert.equal(probe.reasons[0], 'declaration_conflict', 'the runtime reports the conflict, not D4, for this agent');
+    assert.equal(result.status, 422);
+    assert.equal(result.body.hardwareOutcome.reasonCode, 'host_network_nested_podman');
+    const requested = result.body.hardwareOutcome.requested;
+    assert.deepEqual(requested.filter((entry) => entry.field === 'cpus'), [{ field: 'cpus', value: '1', source: 'settings' }], 'the proposed limit once, never the manifest value');
+    assert.ok(requested.some((entry) => entry.field === 'pidsLimit'), 'the other declared field is kept');
+    assertNothingCommitted(w, before);
+});
+
 test('D4S.the-store-runs-the-admission-under-its-lock-with-the-locked-snapshot-plus-the-proposed-entry-and-a-throw-commits-nothing', (t) => {
     const w = world(t, BASE);
     const capabilities = { gate: 'on', controllers: ['cpu', 'memory', 'pids'] };
