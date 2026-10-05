@@ -54,7 +54,7 @@ test('R.ordinary-ready-repair-clears-availability', async () => {
     let saved;
     await activatePreparedRuntimeAfterReadiness({ result, routeKey: 'worker', repoName: 'demo', shortAgentName: 'worker', agentPath: '/fixture' }, {
         loadAgents: () => ({}), saveAgents: (value) => { saved = value; },
-        mergeRouting: (callback) => callback(routing), retireCandidate: () => {},
+        mergeRouting: (callback) => callback(routing, { applyLockCapability: Object.freeze({ fixture: 'apply' }), networkLifecycleCapability: Object.freeze({ fixture: 'network' }) }), retireCandidate: () => {},
     });
     assert.equal(routing.routes.worker.hardwareAvailability, undefined);
     assert.equal(saved[result.containerName].instanceId, result.registryRecord.instanceId);

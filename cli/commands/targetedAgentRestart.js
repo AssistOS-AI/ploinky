@@ -9,6 +9,7 @@ import {
   mergeRuntimeRoute,
 } from '../server/routingFile.js';
 import * as workspaceSvc from '../utils/workspace.js';
+import { retireSameTupleAfterApply } from './hardwareAvailabilityRetirement.js';
 
 function text(value) {
   return String(value || '').trim();
@@ -181,6 +182,7 @@ export async function commitTargetedAgentRestart({
   loadAgents = workspaceSvc.loadAgents,
   saveAgents = workspaceSvc.saveAgents,
   retireCandidate = retireRuntimeCandidate,
+  retireEntriesAfterApply = retireSameTupleAfterApply,
   reportRetirementFailure = (error) => console.warn(`[edge] published targeted restart candidate receipt could not be retired: ${error?.message || error}`),
 } = {}) {
   if (!transition || !result?.containerName || !result?.registryRecord) {
@@ -233,6 +235,18 @@ export async function commitTargetedAgentRestart({
       !== text(result.registryRecord.containerId)) {
     throw new Error('targeted agent restart successor was not published exactly');
   }
+  // D2S.13 site T: the successor is applied and verified exactly. Retire the entries of the published tuple under a
+  // fresh apply lock; failure keeps them, is logged, and does not undo the publication.
+  await retireEntriesAfterApply({
+    site: 'targeted-restart',
+    networkLifecycleCapability,
+    published: [{
+      routeKey: transition.routeKey,
+      key: transition.containerName,
+      instanceId: text(result.registryRecord.instanceId),
+      enableGeneration: text(result.registryRecord.enableGeneration),
+    }],
+  });
   if (result.durableCandidate) {
     try {
       retireCandidate(result.durableCandidate);

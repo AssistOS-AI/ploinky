@@ -33,6 +33,7 @@ import * as inputState from './inputState.js';
 import { MAX_NO_WAIT_BARRIER_ENTRIES, MAX_NO_WAIT_WAVE_INDEX } from './noWaitWorker.js';
 import { resolveNoWaitBarrierTimeouts } from './noWaitProtocol.js';
 import { stageNoWaitAvailabilitySlots } from './noWaitAvailabilitySlots.js';
+import { retireSameTupleAfterApply, retireSameTupleHardwareEntries, retireStartReadyPublications } from './hardwareAvailabilityRetirement.js';
 import {
   noWaitRunScopedLogPath,
   noWaitRunScopedStatusPath,
@@ -2566,6 +2567,8 @@ async function activatePreparedRuntimeAfterReadiness({
   readRouting = readRoutingConfig,
   commitAdditive = commitAdditiveEdgeRoutingGeneration,
   withApplyLock = withEdgeGenerationApplyLock,
+  retireEntries = retireSameTupleHardwareEntries,
+  retireEntriesAfterApply = retireSameTupleAfterApply,
   retirePredecessor = dockerSvc.retireExactAgentRuntimePredecessor,
   reportRetirementFailure = (predecessor, error) => console.warn(
     `[edge] active replacement committed, but exact predecessor '${predecessor?.containerName || '<unknown>'}' retirement failed: ${error?.message || error}`,
@@ -2580,6 +2583,12 @@ async function activatePreparedRuntimeAfterReadiness({
   if (!result?.preparationLease) {
     throw new Error('runtime replacement activation requires its exact preparation lease');
   }
+  const publishedTuple = [{
+    routeKey,
+    key: result.containerName,
+    instanceId: result.registryRecord.instanceId,
+    enableGeneration: result.registryRecord.enableGeneration,
+  }];
   const retirePublishedCandidate = () => {
     if (!result.durableCandidate) return;
     try { retireCandidate(result.durableCandidate); } catch (error) {
@@ -2611,11 +2620,20 @@ async function activatePreparedRuntimeAfterReadiness({
           ...(alias ? { alias } : {}),
         }, { hostPort: result.hostPort || 0 });
         delete routing.routes[routeKey].hardwareAvailability;
-        return commitAdditive(result.preparationLease, {
+        const committed = commitAdditive(result.preparationLease, {
           agents,
           routing,
           applyLockCapability,
         });
+        // D2S.13 site A: the selector has switched to the new generation. Retire the entries of the published
+        // tuple in the same apply-lock hold; a commit that threw never reaches here and keeps its entry.
+        retireEntries({
+          site: 'additive',
+          applyLockCapability,
+          networkLifecycleCapability,
+          published: publishedTuple,
+        });
+        return committed;
       }, { preparationLease: result.preparationLease });
       if (result.replacementPredecessor) {
         try {
@@ -2648,6 +2666,13 @@ async function activatePreparedRuntimeAfterReadiness({
     }, {
       reason: 'runtime-replacement-ready',
       preparationLease: result.preparationLease,
+    });
+    // D2S.13 site R: the replacement generation is applied. Retire the entries of the published tuple under a fresh
+    // apply lock; failure keeps them, is logged, and does not undo the activation.
+    await retireEntriesAfterApply({
+      site: 'replacement',
+      networkLifecycleCapability,
+      published: publishedTuple,
     });
     retirePublishedCandidate();
     if (result.mpsReadiness) await acknowledgeMpsRuntimeReady(result);
@@ -3402,8 +3427,18 @@ async function startWorkspace(staticAgentArg, portArg, {
     // remains exact. Persist it once, after all capability-sensitive launches
     // have completed, so one wave cannot invalidate the selector-bound host
     // launch token needed by a later wave.
-    await mergeRoutingConfig((current) => {
+    await mergeRoutingConfig((current, { applyLockCapability, networkLifecycleCapability: mergeNetworkLifecycleCapability } = {}) => {
       workspaceSvc.saveAgents(reg, { coordinate: false });
+      // D2S.13 site S: the blocking runtimes this start verified ready publish their registry tuple here, before
+      // start's apply while the selector is still inactive, so no capture can see the new route beside a stale
+      // entry. Only this start's ready agents, and only an entry of exactly the published tuple; asynchronous
+      // agents publish later. A failure keeps the entries and is logged; the apply is unaffected.
+      retireStartReadyPublications({
+        current,
+        registry: reg,
+        readyAgentKeys,
+        capabilities: { applyLockCapability, networkLifecycleCapability: mergeNetworkLifecycleCapability },
+      });
       return current;
     }, {
       reason: 'workspace-runtime-graph-ready',

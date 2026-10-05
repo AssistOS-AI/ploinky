@@ -799,7 +799,7 @@ test('prepared runtime records and routes commit together before activation, inc
     );
     assert.match(
         routingFileSource,
-        /withEdgeGenerationApplyLock\(async \(applyLockCapability\)[\s\S]*await mutate\(applyLockCapability\)[\s\S]*applyEdgeRoutingGeneration\([\s\S]*applyLockCapability/,
+        /withEdgeGenerationApplyLock\(async \(applyLockCapability\)[\s\S]*await mutate\(applyLockCapability, liveNetworkLifecycleCapability\)[\s\S]*applyEdgeRoutingGeneration\([\s\S]*applyLockCapability/,
         'route mutation and publication must retain one edge apply capability through commit',
     );
     assert.match(

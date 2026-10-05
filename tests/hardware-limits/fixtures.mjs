@@ -363,6 +363,8 @@ export function buildRequiredCaseManifest() {
         ...leaves(P, 'p0', unit('dependencyStoreWorkspaceStartWiring.test.mjs'), [
             'NW1.S-start-status-clearing-touches-only-canonical-and-this-runs-fresh-paths',
             'NW1.S-slots-are-committed-before-any-marker-or-spawn-and-a-failed-slot-commit-aborts-the-start',
+            'NW1.S-same-tuple-ready-publication-retires-entries-at-its-commit-point',
+            'NW1.S-no-retirement-site-uses-an-uncoordinated-merge-and-retirement-stays-inside-its-modules',
         ]),
         ...leaves(P, 'p0', unit('hardwareAvailabilityResolver.test.mjs'), [
             'NW1.S-activation-is-the-run-scoped-rename',
@@ -431,6 +433,12 @@ export function buildRequiredCaseManifest() {
                 'ms32-resolving-a-newer-slot-keeps-the-older-same-tuple-entry',
                 'ms39a-a-resolve-commit-latches-the-cause-on-the-wrong-route', 'ms39b-the-resolve-invariant-check-is-skipped',
                 'ms59-stale-entries-are-not-retired-by-staging', 'ms60-a-published-target-does-not-retire-the-superseded-entry',
+                'ms40a-the-additive-and-replacement-publications-keep-the-entry', 'ms40b-the-targeted-restart-publication-keeps-the-entry',
+                'ms40c-the-start-publication-keeps-the-entry', 'ms41-site-s-retires-after-starts-apply-instead-of-inside-the-merge-mutator',
+                'ms47a-start-retires-agents-outside-its-ready-set', 'ms47b-start-retires-an-entry-whose-tuple-is-not-the-published-one',
+                'ms48a-the-replacement-publication-retires-before-the-apply', 'ms48b-the-targeted-restart-publication-retires-before-the-apply-and-verification',
+                'ms49-the-additive-publication-retires-before-the-selector-switch', 'ms61-the-merge-hands-its-mutator-no-capabilities',
+                'ms62-a-retirement-failure-is-fatal',
                 'ms54-a-failed-store-read-is-cached-under-the-unchanged-key',
                 'ms55-the-probe-takes-the-finish-time-from-the-worker-line',
                 'ms56-the-probe-credits-admin-and-readiness-from-the-mirror',

@@ -109,7 +109,7 @@ async function mergeRoutingConfig(mutator, {
     captureExpectedGeneration,
     networkLifecycleCapability,
 } = {}) {
-    const mutate = async (applyLockCapability = undefined) => {
+    const mutate = async (applyLockCapability = undefined, liveNetworkLifecycleCapability = undefined) => {
         let validatedActiveGeneration;
         if (coordinate && typeof validateActiveGeneration === 'function') {
             validatedActiveGeneration = await validateActiveGeneration();
@@ -118,7 +118,10 @@ async function mergeRoutingConfig(mutator, {
             inactivateEdgeRoutingGeneration(reason, { applyLockCapability });
         }
         const current = readRoutingConfig();
-        const next = await mutator(current) || current;
+        // The live capabilities a coordinated merge holds are handed to the mutator so that a ready
+        // publication can retire its availability entries under them. A `coordinate: false` merge holds
+        // neither lock, so it passes both undefined and nothing may use them there.
+        const next = await mutator(current, { applyLockCapability, networkLifecycleCapability: liveNetworkLifecycleCapability }) || current;
         writeRoutingConfig(next, { coordinate: false });
         const expectedGeneration = coordinate
             ? (typeof captureExpectedGeneration === 'function'
@@ -132,7 +135,7 @@ async function mergeRoutingConfig(mutator, {
         try {
             if (!coordinate) return (await mutate()).next;
             return await withEdgeGenerationApplyLock(async (applyLockCapability) => {
-                const { next, expectedGeneration } = await mutate(applyLockCapability);
+                const { next, expectedGeneration } = await mutate(applyLockCapability, liveNetworkLifecycleCapability);
                 await applyEdgeRoutingGeneration({
                     reason,
                     preparationLease,

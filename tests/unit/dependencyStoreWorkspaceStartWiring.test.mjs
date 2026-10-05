@@ -23,6 +23,8 @@ import {
 } from '../../cli/commands/workspaceUtil.js';
 import { summarizeStartResult } from '../../cli/sandbox/hardwareLimits/outcomes.mjs';
 import { tempRoot } from './dependencyStoreFixtures.mjs';
+import { containerOf, entryFor, makeWorld } from './hardwareAvailabilityResolverFixtures.mjs';
+import { runRetirementDriver } from './hardwareAvailabilityRetirementHarness.mjs';
 import {
     CONTAINER,
     driveWiring,
@@ -50,6 +52,7 @@ function startFixture(t) {
     // The lease start binds as its operation's own, for nested reuse.
     let boundLease = null;
     const networkCapability = Object.freeze({ tag: 'network-capability' });
+    const applyCapability = Object.freeze({ tag: 'apply-capability' });
     const stalledNoWaitRuns = [];
     const preparedRecord = Object.freeze({ ...registration(), instanceId: 'prepared-instance', enableGeneration: 'prepared-generation' });
     const staticNode = { id: 'repo/demo', repoName: 'repo', shortAgentName: 'demo', manifestPath, agentPath, isStatic: true };
@@ -142,7 +145,11 @@ function startFixture(t) {
         waitForReadinessEntries: async (entries) => calls.push(['readiness', entries.length]),
         mergeRoutingConfig: async (mutate, options = {}) => {
             calls.push(['mergeRoutingConfig', options]);
-            routing = mutate(structuredClone(routing));
+            // A coordinated merge hands its mutator the live capabilities; a `coordinate: false` merge holds neither lock.
+            routing = mutate(structuredClone(routing), options.coordinate === false
+                ? { applyLockCapability: undefined, networkLifecycleCapability: undefined }
+                : { applyLockCapability: applyCapability, networkLifecycleCapability: networkCapability });
+            calls.push(['mutatorReturned', options.reason || null]);
             return routing;
         },
         partitionAdditionalStartupAgents: () => ({ inactiveManual: [], activeManual: [], automatic: [] }),
@@ -176,10 +183,12 @@ function startFixture(t) {
         // Start's no-wait availability slot staging (M-NW-01 D2-S): recorded here, exercised against the real store in noWaitAvailabilitySlots.test.mjs.
         stageNoWaitAvailabilitySlots: async (options) => { calls.push(['stageSlots', options]); },
         resolveNoWaitBarrierTimeouts: () => ({ startupGraceMs: 7000 }),
+        // D2S.13 site S: recorded here, exercised against the real store and real locks in hardwareAvailabilityRetirement.test.mjs.
+        retireStartReadyPublications: (options) => { calls.push(['retireStartPublications', options]); return { retired: [] }; },
         summarizeStartResult,
         printStartResultSummary: () => {},
     };
-    return { collaborators, calls, earlyLease, postProviderLease, workspaceLease, networkCapability, preparedRecord, ensureResult, stalledNoWaitRuns, registry: () => registry };
+    return { collaborators, calls, earlyLease, postProviderLease, workspaceLease, networkCapability, applyCapability, preparedRecord, ensureResult, stalledNoWaitRuns, registry: () => registry };
 }
 
 test('workspace start settles an abandoned graph preparation under its leases before replacing the selector', async (t) => {
@@ -369,4 +378,220 @@ test('NW1.S-slots-are-committed-before-any-marker-or-spawn-and-a-failed-slot-com
         await sandbox(fixture.collaborators)('repo/demo', '8080', {});
         assert.ok(fixture.calls.some(([name]) => name === 'spawn'), 'the next start spawns');
     }
+});
+
+
+// ---------------------------------------------------------------- M-NW-01 D2S.13: same-tuple ready publications retire same-tuple entries
+
+const SRC = (relative) => fs.readFileSync(new URL(`../../${relative}`, import.meta.url), 'utf8');
+const NEW_ENTRY = 'hardware_availability_entry_retirement_failed';
+const failureLogs = (value) => value.logs.filter((line) => line.type === NEW_ENTRY);
+
+function retirementWorld(t, { routes = { alpha: {} }, entries = ['alpha'], rotated = [] } = {}) {
+    const world = makeWorld(t, { routes: Object.fromEntries(Object.keys(routes).map((key) => [key, routes[key]])) });
+    world.commitStore({ entries: Object.fromEntries([
+        ...entries.map((key) => [key, entryFor(key)]),
+        ...rotated.map((key) => [key, entryFor(key, { instanceId: 'rotated-instance' })]),
+    ]) });
+    const agents = world.readAgents();
+    return { world, agents, before: world.selection(), record: (key) => agents[containerOf(key)] };
+}
+
+test('NW1.S-same-tuple-ready-publication-retires-entries-at-its-commit-point', async (t) => {
+    // ---- site S, in start's own code: the call is inside the post-readiness merge mutator, before the apply
+    {
+        const fixture = startFixture(t);
+        await sandbox(fixture.collaborators)('repo/demo', '8080', {});
+        const names = fixture.calls.map(([name]) => name);
+        const retireIndex = names.indexOf('retireStartPublications');
+        assert.equal(names.filter((name) => name === 'retireStartPublications').length, 1, 'start retires once, in the graph-ready merge only');
+        const mergeIndex = fixture.calls.findIndex(([name, options]) => name === 'mergeRoutingConfig' && options?.reason === 'workspace-runtime-graph-ready');
+        const returnedIndex = fixture.calls.findIndex(([name, reason]) => name === 'mutatorReturned' && reason === 'workspace-runtime-graph-ready');
+        assert.ok(mergeIndex >= 0 && retireIndex > mergeIndex, 'retirement belongs to the graph-ready merge');
+        assert.ok(retireIndex < returnedIndex, 'and runs inside its mutator, before start\'s apply');
+        assert.ok(names.indexOf('readiness') < retireIndex, 'after readiness');
+        const [, options] = fixture.calls[retireIndex];
+        assert.equal(options.capabilities.applyLockCapability, fixture.applyCapability, 'the apply-lock capability comes from the coordinated merge');
+        assert.equal(options.capabilities.networkLifecycleCapability, fixture.networkCapability);
+        assert.deepEqual([...options.readyAgentKeys], [CONTAINER], 'only the agents this start verified ready');
+        assert.equal(options.registry[CONTAINER].instanceId, fixture.ensureResult.registryRecord.instanceId);
+        // The merges that commit results hold neither lock: no retirement may happen there.
+        const uncoordinated = fixture.calls.filter(([name, merge]) => name === 'mergeRoutingConfig' && merge?.coordinate === false);
+        assert.ok(uncoordinated.length >= 1, 'start has uncoordinated merges');
+    }
+    // ---- what a coordinated and a coordinate:false merge hand their mutators, from the real mergeRoutingConfig under real locks
+    {
+        const { world } = retirementWorld(t);
+        const seen = runRetirementDriver(world, 'merge-capabilities');
+        assert.deepEqual(seen.coordinated, { applyLockLive: true, networkLive: true }, 'a coordinated merge hands over the live apply-lock and network capabilities');
+        assert.deepEqual(seen.uncoordinated, { applyLockCapability: null, networkLifecycleCapability: null }, 'a coordinate:false merge hands over neither');
+    }
+    // ---- site S through the real mergeRoutingConfig, real lease, network lock and apply lock
+    {
+        const { world, record } = retirementWorld(t, { routes: { alpha: {}, gamma: {}, delta: {} }, entries: ['alpha', 'gamma'], rotated: ['delta'] });
+        const ready = [containerOf('alpha'), containerOf('delta')];
+        const run = runRetirementDriver(world, 'site-s', { ready });
+        assert.deepEqual(failureLogs(run), [], 'no retirement failure');
+        assert.deepEqual(run.retired.retired, ['alpha'], 'only a ready agent whose entry has exactly the published tuple');
+        assert.deepEqual(run.entriesAfter, ['delta', 'gamma'], 'gamma is not ready and delta\'s entry names another tuple: both are kept');
+        assert.equal(run.witnesses.length, 1);
+        assert.equal(run.witnesses[0].selector.state, 'inactive', 'retired inside the mutator, while the selector is inactive');
+        assert.deepEqual(run.witnesses[0].entries, ['alpha', 'delta', 'gamma'], 'the entry was still there when retirement started');
+        assert.equal(run.selectorAfter.state, 'active', 'the merge then applies');
+        assert.ok(record('alpha'));
+        // The apply fails after the mutator: start fails with the selector inactive; ready agents\' entries are already retired.
+        const failing = retirementWorld(t, { routes: { alpha: {}, gamma: {} }, entries: ['alpha', 'gamma'] });
+        const failed = runRetirementDriver(failing.world, 'site-s', { ready: [containerOf('alpha')], failure: 'apply' });
+        assert.match(failed.mergeError.message, /the apply failed after the mutator/);
+        assert.deepEqual(failed.entriesAfter, ['gamma']);
+        assert.equal(failed.selectorAfter.state, 'inactive');
+        // A retirement-commit failure: the publication stands, the entry is kept, the failure is logged.
+        const broken = retirementWorld(t);
+        const brokenRun = runRetirementDriver(broken.world, 'site-s', { ready: [containerOf('alpha')], breakCommit: true });
+        assert.equal(brokenRun.mergeError, null, 'the apply still succeeded');
+        assert.equal(brokenRun.selectorAfter.state, 'active');
+        assert.deepEqual(brokenRun.entriesAfter, ['alpha'], 'the entry is kept');
+        assert.equal(failureLogs(brokenRun).length, 1);
+        assert.equal(failureLogs(brokenRun)[0].site, 'start');
+        // Uncoordinated capabilities (undefined) are refused by the helper: never a hidden success.
+        const bare = retirementWorld(t);
+        const bareRun = runRetirementDriver(bare.world, 'site-s', { ready: [containerOf('alpha')], noCapabilities: true });
+        assert.deepEqual(bareRun.entriesAfter, ['alpha']);
+        assert.equal(failureLogs(bareRun)[0].code, 'PLOINKY_NETWORK_LIFECYCLE_CAPABILITY_REQUIRED');
+    }
+    // ---- sites A, R and T: each with a target-less and a targeted successor, under real locks
+    for (const [label, hostPort] of [['target-less', 0], ['targeted', 43111]]) {
+        // A: after the selector switch, in the same apply-lock hold.
+        {
+            const { world, record, before } = retirementWorld(t);
+            const run = runRetirementDriver(world, 'site-a', { routeKey: 'alpha', container: containerOf('alpha'), registryRecord: record('alpha'), hostPort });
+            assert.equal(run.activationError, null, `${label} A: ${JSON.stringify(run.activationError)}`);
+            assert.equal(run.activated, true);
+            assert.deepEqual(failureLogs(run), [], `${label} A: no retirement failure`);
+            assert.deepEqual(run.entriesAfter, [], `${label} A: the entry is gone from the store`);
+            assert.equal(run.witnesses[0].selector.state, 'active');
+            assert.notEqual(run.witnesses[0].selector.activationId, before.activationId, `${label} A: retirement ran after the selector switch`);
+            assert.deepEqual(run.witnesses[0].entries, ['alpha'], `${label} A: the entry was present until the switch`);
+        }
+        // R: after the replacement generation is applied, under a fresh apply lock.
+        {
+            const { world, record, before } = retirementWorld(t);
+            const run = runRetirementDriver(world, 'site-r', { routeKey: 'alpha', container: containerOf('alpha'), registryRecord: record('alpha'), hostPort });
+            assert.equal(run.activationError, null, `${label} R: ${JSON.stringify(run.activationError)}`);
+            assert.equal(run.activated, true);
+            assert.deepEqual(failureLogs(run), [], `${label} R: no retirement failure`);
+            assert.deepEqual(run.entriesAfter, [], `${label} R: the entry is gone from the store`);
+            assert.equal(run.witnesses[0].selector.state, 'active', `${label} R: retirement ran after the apply`);
+            assert.notEqual(run.witnesses[0].selector.activationId, before.activationId);
+        }
+        // T: after the exact publication is verified, under a fresh apply lock.
+        {
+            const { world, record, before } = retirementWorld(t);
+            const run = runRetirementDriver(world, 'site-t', { routeKey: 'alpha', container: containerOf('alpha'), registryRecord: record('alpha'), hostPort });
+            assert.equal(run.commitError, null, `${label} T: ${JSON.stringify(run.commitError)}`);
+            assert.equal(run.committed, true);
+            assert.deepEqual(failureLogs(run), [], `${label} T: no retirement failure`);
+            assert.deepEqual(run.entriesAfter, [], `${label} T: the entry is gone from the store`);
+            assert.equal(run.witnesses[0].selector.state, 'active', `${label} T: retirement ran after the publication`);
+            assert.notEqual(run.witnesses[0].selector.activationId, before.activationId);
+        }
+    }
+    // ---- post-failure: the apply fails, the entry is kept
+    {
+        const r = retirementWorld(t);
+        const argument = (extra = {}) => ({ routeKey: 'alpha', container: containerOf('alpha'), registryRecord: r.record('alpha'), hostPort: 0, ...extra });
+        const replacement = runRetirementDriver(r.world, 'site-r', argument({ failure: 'apply' }));
+        assert.match(replacement.activationError.message, /the replacement apply failed/);
+        assert.deepEqual(replacement.entriesAfter, ['alpha'], 'R with the apply failing keeps the entry');
+        assert.equal(replacement.selectorAfter.state, 'inactive', 'and the selector stays inactive');
+        assert.deepEqual(replacement.witnesses, [], 'retirement never started');
+        const targeted = retirementWorld(t);
+        const failedApply = runRetirementDriver(targeted.world, 'site-t', { routeKey: 'alpha', container: containerOf('alpha'), registryRecord: targeted.record('alpha'), failure: 'apply' });
+        assert.match(failedApply.commitError.message, /the successor publication failed/);
+        assert.deepEqual(failedApply.entriesAfter, ['alpha'], 'T with the apply failing keeps the entry');
+        assert.deepEqual(failedApply.witnesses, []);
+        const unverified = retirementWorld(t);
+        const failedVerify = runRetirementDriver(unverified.world, 'site-t', { routeKey: 'alpha', container: containerOf('alpha'), registryRecord: unverified.record('alpha'), failure: 'verify' });
+        assert.match(failedVerify.commitError.message, /not .*exact|no longer selects its exact registered owner/);
+        assert.deepEqual(failedVerify.entriesAfter, ['alpha'], 'T with the verification failing keeps the entry');
+        assert.deepEqual(failedVerify.witnesses, []);
+        // A: the additive commit throws: the predecessor stays selected and the entry is kept.
+        const additive = retirementWorld(t);
+        const failedCommit = runRetirementDriver(additive.world, 'site-a', { routeKey: 'alpha', container: containerOf('alpha'), registryRecord: additive.record('alpha'), hostPort: 0, failure: 'commit' });
+        assert.match(failedCommit.activationError.message, /the additive commit failed/);
+        assert.deepEqual(failedCommit.entriesAfter, ['alpha'], 'A with the commit throwing keeps the entry');
+        assert.equal(failedCommit.selectorAfter.activationId, additive.before.activationId, 'the predecessor stays selected');
+        assert.deepEqual(failedCommit.witnesses, []);
+        // A retirement-commit failure at A, R and T: the publication stands, the entry is kept, the failure is logged once.
+        for (const [phase, field] of [['site-a', 'activated'], ['site-r', 'activated'], ['site-t', 'committed']]) {
+            const x = retirementWorld(t);
+            const run = runRetirementDriver(x.world, phase, { routeKey: 'alpha', container: containerOf('alpha'), registryRecord: x.record('alpha'), hostPort: 0, breakCommit: true });
+            assert.equal(run[field], true, `${phase}: the publication stands`);
+            assert.deepEqual(run.entriesAfter, ['alpha'], `${phase}: the entry is kept`);
+            assert.equal(run.selectorAfter.state, 'active', `${phase}: no false readiness change`);
+            assert.equal(failureLogs(run).length, 1, `${phase}: the failure is logged`);
+        }
+    }
+});
+
+test('NW1.S-no-retirement-site-uses-an-uncoordinated-merge-and-retirement-stays-inside-its-modules', () => {
+    // S2-style source checks. The retirement call sites are in the three reviewed modules only.
+    const callers = new Map();
+    const walk = (directory) => {
+        for (const entry of fs.readdirSync(new URL(`../../${directory}`, import.meta.url), { withFileTypes: true })) {
+            const relative = `${directory}/${entry.name}`;
+            if (entry.isDirectory()) walk(relative);
+            else if (/\.(m?js)$/.test(entry.name)) {
+                const text = SRC(relative);
+                for (const name of ['commitHardwareAvailabilityPolicy(', 'retireSameTupleHardwareEntries(', 'retireSameTupleAfterApply(', 'retireStartReadyPublications(']) {
+                    if (text.includes(name)) callers.set(`${relative}:${name}`, true);
+                }
+            }
+        }
+    };
+    walk('cli');
+    const files = [...callers.keys()].map((key) => key.split(':')[0]);
+    const allowed = new Set([
+        'cli/sandbox/hardwareAvailabilityStore.mjs', 'cli/commands/noWaitAvailabilitySlots.js', 'cli/commands/hardwareAvailabilityRetirement.js',
+        'cli/commands/workspaceUtil.js', 'cli/commands/targetedAgentRestart.js',
+    ]);
+    for (const file of files) assert.ok(allowed.has(file), `${file} must not retire entries or commit the store`);
+    assert.ok(files.includes('cli/commands/workspaceUtil.js'));
+    assert.match(SRC('cli/commands/targetedAgentRestart.js'), /await retireEntriesAfterApply\(/);
+    // No retirement call sits inside a `coordinate: false` mutator: the text of every merge call (balanced parentheses) that holds a
+    // retirement call is coordinated, and the retirement calls of the other modules sit outside any merge call.
+    const spans = (text, name) => {
+        const found = [];
+        for (let at = text.indexOf(`${name}(`); at !== -1; at = text.indexOf(`${name}(`, at + 1)) {
+            let depth = 0;
+            let end = at + name.length;
+            for (; end < text.length; end += 1) {
+                if (text[end] === '(') depth += 1;
+                else if (text[end] === ')') { depth -= 1; if (depth === 0) break; }
+            }
+            found.push(text.slice(at, end + 1));
+        }
+        return found;
+    };
+    const RETIREMENT = /retireStartReadyPublications\(|retireSameTuple\w*\(|retireEntries\w*\(/;
+    for (const file of ['cli/commands/workspaceUtil.js', 'cli/commands/targetedAgentRestart.js']) {
+        const text = SRC(file);
+        for (const merge of [...spans(text, 'mergeRoutingConfig'), ...spans(text, 'mergeRouting')]) {
+            if (RETIREMENT.test(merge)) assert.doesNotMatch(merge, /\},\s*\{[^}]*coordinate:\s*false/, `${file}: a retirement call inside a coordinate:false merge`);
+        }
+        assert.ok(spans(text, 'mergeRoutingConfig').some((merge) => /\},\s*\{[^}]*coordinate:\s*false/.test(merge)) || file.endsWith('targetedAgentRestart.js'), `${file}: the scan sees the uncoordinated merges`);
+    }
+    assert.ok(spans(SRC('cli/commands/workspaceUtil.js'), 'mergeRoutingConfig').some((merge) => RETIREMENT.test(merge)), 'the scan sees the graph-ready merge that retires');
+    // The graph-ready merge is coordinated and its mutator takes the capabilities from its second argument.
+    const start = SRC('cli/commands/workspaceUtil.js');
+    const mergeFrom = start.indexOf("await mergeRoutingConfig((current, { applyLockCapability");
+    assert.ok(mergeFrom > 0);
+    const mergeText = start.slice(mergeFrom, start.indexOf('workspacePreparationLease = null;', mergeFrom));
+    assert.match(mergeText, /retireStartReadyPublications\(/);
+    assert.match(mergeText, /reason: 'workspace-runtime-graph-ready'/);
+    assert.doesNotMatch(mergeText, /\},\s*\{[^}]*coordinate:\s*false/);
+    // The helper refuses missing capabilities rather than falling back to anything else.
+    const helper = SRC('cli/commands/hardwareAvailabilityRetirement.js');
+    assert.match(helper, /assertNetworkLifecycleCapability\(networkLifecycleCapability\)/);
+    assert.match(helper, /assertEdgeGenerationApplyLockCapability\(\{ workspaceRoot, applyLockCapability, storePaths \}\)/);
 });

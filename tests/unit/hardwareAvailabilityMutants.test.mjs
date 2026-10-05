@@ -35,6 +35,15 @@ const PRIVATE_ROUTER = 'cli/server/privateRouter.js';
 const SLOTS = 'cli/commands/noWaitAvailabilitySlots.js';
 const START = 'cli/commands/workspaceUtil.js';
 const WIRING_TEST = 'tests/unit/dependencyStoreWorkspaceStartWiring.test.mjs';
+const RETIREMENT = 'cli/commands/hardwareAvailabilityRetirement.js';
+const TARGETED = 'cli/commands/targetedAgentRestart.js';
+const ROUTING_FILE = 'cli/server/routingFile.js';
+const SAME_TUPLE_LEAF = 'NW1\\.S-same-tuple-ready-publication-retires-entries';
+const SITE_S_CALL = "      retireStartReadyPublications({\n        current,\n        registry: reg,\n        readyAgentKeys,\n        capabilities: { applyLockCapability, networkLifecycleCapability: mergeNetworkLifecycleCapability },\n      });\n";
+const SITE_A_CALL = "        retireEntries({\n          site: 'additive',\n          applyLockCapability,\n          networkLifecycleCapability,\n          published: publishedTuple,\n        });\n";
+const SITE_R_CALL = "    await retireEntriesAfterApply({\n      site: 'replacement',\n      networkLifecycleCapability,\n      published: publishedTuple,\n    });\n";
+const SITE_T_CALL = "  await retireEntriesAfterApply({\n    site: 'targeted-restart',\n    networkLifecycleCapability,\n    published: [{\n      routeKey: transition.routeKey,\n      key: transition.containerName,\n      instanceId: text(result.registryRecord.instanceId),\n      enableGeneration: text(result.registryRecord.enableGeneration),\n    }],\n  });\n";
+const retireMutant = (name, file, patches) => ({ name, file, kill: kill(WIRING_TEST, SAME_TUPLE_LEAF), patches });
 const STAGING_BLOCK = "    // Stage this run's availability slots in ONE store commit, after the statuses are cleared and before any\n    // marker or worker exists: earlier terminal slots are resolved, superseded slots and stale entries are retired,\n    // and each run about to be spawned gets its slot. Parent-known nodes get none. A failure aborts the start here.\n    await stageNoWaitAvailabilitySlots({\n      schedule: noWaitSchedule,\n      isParentKnown: (entry) => Boolean(unavailableOutcome(entry.node.id)),\n      workspaceRoot: PLOINKY_WORKSPACE_ROOT,\n      startupGraceMs: resolveNoWaitBarrierTimeouts().startupGraceMs,\n    });\n";
 const slotsMutant = (name, killLeaf, patches, killFile = SLOTS_TEST) => ({ name, file: SLOTS, kill: kill(killFile, killLeaf), patches });
 const PROBE = 'tests/unit/hardwareAvailabilityEvidenceProbe.mjs';
@@ -237,6 +246,30 @@ export const AVAILABILITY_MUTANTS = Object.freeze({
         { from: '            if (!tupleIsCurrent(entryTuple(entries[routeKey]), generation)) {', to: '            if (false) {' }]),
     'ms60-a-published-target-does-not-retire-the-superseded-entry': slotsMutant('ms60-a-published-target-does-not-retire-the-superseded-entry', 'NW1\\.S-staging-and-latch-resolution', [
         { from: '                if (routeNowTargeted(slot, routeKey, generation)) supersedeEntry(routeKey, slot);\n', to: '' }]),
+    // D2S.13: where a ready publication retires the entries of its tuple (sites S, A, R and T), and what it retires.
+    'ms40a-the-additive-and-replacement-publications-keep-the-entry': retireMutant('ms40a-the-additive-and-replacement-publications-keep-the-entry', START, [{ from: SITE_A_CALL, to: '' }, { from: SITE_R_CALL, to: '' }]),
+    'ms40b-the-targeted-restart-publication-keeps-the-entry': retireMutant('ms40b-the-targeted-restart-publication-keeps-the-entry', TARGETED, [{ from: SITE_T_CALL, to: '' }]),
+    'ms40c-the-start-publication-keeps-the-entry': retireMutant('ms40c-the-start-publication-keeps-the-entry', START, [{ from: SITE_S_CALL, to: '' }]),
+    'ms41-site-s-retires-after-starts-apply-instead-of-inside-the-merge-mutator': retireMutant('ms41-site-s-retires-after-starts-apply-instead-of-inside-the-merge-mutator', START, [
+        { from: SITE_S_CALL, to: '' },
+        { from: '    workspacePreparationLease = null;\n    for (const runtimeResult of workspaceMpsRuntimes) {', to: '    workspacePreparationLease = null;\n    retireStartReadyPublications({ current: readRoutingConfig(), registry: reg, readyAgentKeys, capabilities: undefined });\n    for (const runtimeResult of workspaceMpsRuntimes) {' }]),
+    'ms47a-start-retires-agents-outside-its-ready-set': retireMutant('ms47a-start-retires-agents-outside-its-ready-set', RETIREMENT, [
+        { from: "const record = (readyAgentKeys || []).includes(route?.container) ? registry?.[route.container] : null;", to: 'const record = registry?.[route?.container];' }]),
+    'ms47b-start-retires-an-entry-whose-tuple-is-not-the-published-one': retireMutant('ms47b-start-retires-an-entry-whose-tuple-is-not-the-published-one', RETIREMENT, [
+        { from: 'if (entry && sameTuple(entryTuple(entry), tuple)) {', to: 'if (entry) {' }]),
+    'ms48a-the-replacement-publication-retires-before-the-apply': retireMutant('ms48a-the-replacement-publication-retires-before-the-apply', START, [
+        { from: SITE_R_CALL, to: '' },
+        { from: '    await mergeRouting((cfg) => {\n      const agents = loadAgents();\n      agents[result.containerName] = result.registryRecord;', to: `${SITE_R_CALL}    await mergeRouting((cfg) => {\n      const agents = loadAgents();\n      agents[result.containerName] = result.registryRecord;` }]),
+    'ms48b-the-targeted-restart-publication-retires-before-the-apply-and-verification': retireMutant('ms48b-the-targeted-restart-publication-retires-before-the-apply-and-verification', TARGETED, [
+        { from: SITE_T_CALL, to: '' },
+        { from: '  await mergeRouting((routing) => {\n    routing.routes = routing.routes || {};\n    const drainingRoute', to: `${SITE_T_CALL}  await mergeRouting((routing) => {\n    routing.routes = routing.routes || {};\n    const drainingRoute` }]),
+    'ms49-the-additive-publication-retires-before-the-selector-switch': retireMutant('ms49-the-additive-publication-retires-before-the-selector-switch', START, [
+        { from: SITE_A_CALL, to: '' },
+        { from: '        const committed = commitAdditive(result.preparationLease, {', to: `${SITE_A_CALL}        const committed = commitAdditive(result.preparationLease, {` }]),
+    'ms61-the-merge-hands-its-mutator-no-capabilities': retireMutant('ms61-the-merge-hands-its-mutator-no-capabilities', ROUTING_FILE, [
+        { from: 'const next = await mutator(current, { applyLockCapability, networkLifecycleCapability: liveNetworkLifecycleCapability }) || current;', to: 'const next = await mutator(current) || current;' }]),
+    'ms62-a-retirement-failure-is-fatal': retireMutant('ms62-a-retirement-failure-is-fatal', RETIREMENT, [
+        { from: '        return { retired };\n    } catch (error) {\n', to: '        return { retired };\n    } catch (error) {\n        throw error;\n' }]),
     'ms36-the-validator-accepts-a-shared-run-id-and-a-missing-startup-grace': { name: 'ms36-the-validator-accepts-a-shared-run-id-and-a-missing-startup-grace', file: STORE,
         kill: kill(SLOTS_TEST, 'NW1\\.S-frozen-v1-slot-schema'),
         patches: [
