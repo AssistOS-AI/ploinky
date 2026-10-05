@@ -364,6 +364,7 @@ export function buildRequiredCaseManifest() {
             'NW1.S-start-status-clearing-touches-only-canonical-and-this-runs-fresh-paths',
             'NW1.S-slots-are-committed-before-any-marker-or-spawn-and-a-failed-slot-commit-aborts-the-start',
             'NW1.S-same-tuple-ready-publication-retires-entries-at-its-commit-point',
+            'NW1.S-shell-activation-retires-under-the-workspace-lease-and-logs-no-failure',
             'NW1.S-no-retirement-site-uses-an-uncoordinated-merge-and-retirement-stays-inside-its-modules',
         ]),
         ...leaves(P, 'p0', unit('hardwareAvailabilityResolver.test.mjs'), [
@@ -447,6 +448,7 @@ export function buildRequiredCaseManifest() {
                 'ms46-the-observer-derives-a-hardware-result-from-a-slotted-runs-status',
                 'ms50a-the-probe-credits-an-observation-outside-the-window',
                 'ms50b-the-probe-skips-the-ctime-cross-check',
+                'ms64-the-shell-lifecycle-runs-without-the-workspace-lease',
             ].map((name) => `NW1M.${name}-is-killed-by-the-leaf-that-guards-it-never-by-a-setup-failure`),
             'NW1M.every-patch-text-matches-the-real-source-exactly-once-and-an-unmatched-patch-is-not-a-kill',
         ]),

@@ -72,6 +72,7 @@ import {
   releaseWorkspaceMutationLease,
   releaseWorkspaceStartLock,
   runWithWorkspaceMutationLease,
+  withHeldOrAcquiredWorkspaceMutationLease,
   withMaintenanceLock,
   withWorkspaceMutationLease,
 } from '../utils/runtime/maintenanceLocks.js';
@@ -4036,6 +4037,74 @@ async function runCli(agentName, args) {
   });
 }
 
+// `shell` prepares, verifies and activates the agent runtime before it attaches. That lifecycle work runs under
+// the workspace mutation lease (reused when the caller already holds it), taken before the network lifecycle
+// lock, as every restart does (`withRestartLocks`). The activation's same-tuple entry retirement (D2S.13 sites A
+// and R) asserts that lease; without it the retirement always fails. The interactive attach is not part of it.
+async function runShellLifecycle({
+  shortAgentName,
+  manifest,
+  agentDir,
+  repoName,
+  registryRecord,
+  registeredContainerName,
+  routerEndpoint,
+  directAdmission,
+}, {
+  ensureAgentService = dockerSvc.ensureAgentService,
+  waitForReadiness = waitForManifestReadiness,
+  activateAfterReadiness = activatePreparedRuntimeAfterReadiness,
+  cleanupFailedRuntime = cleanupFailedPreparedRuntime,
+} = {}) {
+  return withHeldOrAcquiredWorkspaceMutationLease(
+    { operation: `shell:${registeredContainerName}` },
+    () => withNetworkLifecycleLock(async (networkLifecycleCapability) => {
+      let result = null;
+      try {
+        result = await ensureAgentService(shortAgentName, manifest, agentDir, {
+          containerName: registeredContainerName,
+          alias: registryRecord?.record?.alias,
+          routerEndpoint,
+          runtimeAdmission: directAdmission.runtimeAdmission,
+          networkLifecycleCapability,
+          expectedPredecessor: registeredRuntimeTuple(registryRecord?.record),
+        });
+        const exactContainerName = result?.containerName || registeredContainerName;
+        const shellReadinessRoute = buildRelayReadinessRoute({
+          route: {
+            container: exactContainerName,
+            hostPort: result?.hostPort || 0,
+          },
+          manifest,
+          runtimeResult: result,
+          networkMode: routerEndpoint?.mode || '',
+          generationDigest: result?.preparationLease?.preparedGeneration || '',
+        });
+        await waitForReadiness({
+          key: `shell:${shortAgentName}`,
+          label: shortAgentName,
+          kind: 'dependency',
+          manifest,
+          route: shellReadinessRoute,
+        });
+        await activateAfterReadiness({
+          result,
+          routeKey: registryRecord?.record?.alias || shortAgentName,
+          repoName,
+          shortAgentName,
+          agentPath: agentDir,
+          alias: registryRecord?.record?.alias || '',
+          networkLifecycleCapability,
+        });
+        return { containerInfo: result, containerName: exactContainerName };
+      } catch (error) {
+        cleanupFailedRuntime(result, error);
+        throw error;
+      }
+    }),
+  );
+}
+
 async function runShell(agentName) {
   if (!agentName) { throw new Error('Usage: shell <agentName>'); }
   let registryRecord = null;
@@ -4059,53 +4128,19 @@ async function runShell(agentName) {
     persistedProfileName: registryRecord?.record?.profile,
     path: `manifest(${manifestLookup})`,
   });
-  const { ensureAgentService, attachInteractive, getConfiguredProjectPath, getAgentContainerName } = dockerSvc;
+  const { attachInteractive, getConfiguredProjectPath, getAgentContainerName } = dockerSvc;
   const agentDir = path.dirname(manifestPath);
   const repoName = resolveAgentRepositoryName(agentDir);
   const registeredContainerName = registryRecord?.containerName || getAgentContainerName(shortAgentName, repoName);
-  const { containerInfo, containerName } = await withNetworkLifecycleLock(async (networkLifecycleCapability) => {
-    let result = null;
-    try {
-      result = await ensureAgentService(shortAgentName, manifest, agentDir, {
-        containerName: registeredContainerName,
-        alias: registryRecord?.record?.alias,
-        routerEndpoint,
-        runtimeAdmission: directAdmission.runtimeAdmission,
-        networkLifecycleCapability,
-        expectedPredecessor: registeredRuntimeTuple(registryRecord?.record),
-      });
-      const exactContainerName = result?.containerName || registeredContainerName;
-      const shellReadinessRoute = buildRelayReadinessRoute({
-        route: {
-          container: exactContainerName,
-          hostPort: result?.hostPort || 0,
-        },
-        manifest,
-        runtimeResult: result,
-        networkMode: routerEndpoint?.mode || '',
-        generationDigest: result?.preparationLease?.preparedGeneration || '',
-      });
-      await waitForManifestReadiness({
-        key: `shell:${shortAgentName}`,
-        label: shortAgentName,
-        kind: 'dependency',
-        manifest,
-        route: shellReadinessRoute,
-      });
-      await activatePreparedRuntimeAfterReadiness({
-        result,
-        routeKey: registryRecord?.record?.alias || shortAgentName,
-        repoName,
-        shortAgentName,
-        agentPath: agentDir,
-        alias: registryRecord?.record?.alias || '',
-        networkLifecycleCapability,
-      });
-      return { containerInfo: result, containerName: exactContainerName };
-    } catch (error) {
-      cleanupFailedPreparedRuntime(result, error);
-      throw error;
-    }
+  const { containerInfo, containerName } = await runShellLifecycle({
+    shortAgentName,
+    manifest,
+    agentDir,
+    repoName,
+    registryRecord,
+    registeredContainerName,
+    routerEndpoint,
+    directAdmission,
   });
   const cmd = '/bin/sh';
   const projPath = getConfiguredProjectPath(shortAgentName, repoName, registryRecord?.record?.alias);
@@ -4377,6 +4412,7 @@ export {
   resolveGraphNodeExecutionRecord,
   resolveRetainedGraphNodeExecutionRecord,
   retireAbandonedStartPreparationBeforeStop,
+  runShellLifecycle,
   settleWorkspaceBeforeRestart,
   waitForRouterReady,
   waitForManifestReadiness,

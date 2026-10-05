@@ -273,6 +273,10 @@ export const AVAILABILITY_MUTANTS = Object.freeze({
         { from: 'const next = await mutator(current, { applyLockCapability, networkLifecycleCapability: liveNetworkLifecycleCapability }) || current;', to: 'const next = await mutator(current) || current;' }]),
     'ms62-a-retirement-failure-is-fatal': retireMutant('ms62-a-retirement-failure-is-fatal', RETIREMENT, [
         { from: '        return { retired };\n    } catch (error) {\n', to: '        return { retired };\n    } catch (error) {\n        throw error;\n' }]),
+    // `ploinky shell` activates a prepared runtime: its lifecycle work needs the workspace lease the retirement asserts.
+    'ms64-the-shell-lifecycle-runs-without-the-workspace-lease': { name: 'ms64-the-shell-lifecycle-runs-without-the-workspace-lease', file: START,
+        kill: kill(WIRING_TEST, 'NW1\\.S-shell-activation-retires'),
+        patches: [{ from: '  return withHeldOrAcquiredWorkspaceMutationLease(\n    { operation: `shell:${registeredContainerName}` },', to: '  return ((_options, work) => work())(\n    { operation: `shell:${registeredContainerName}` },' }] },
     'ms36-the-validator-accepts-a-shared-run-id-and-a-missing-startup-grace': { name: 'ms36-the-validator-accepts-a-shared-run-id-and-a-missing-startup-grace', file: STORE,
         kill: kill(SLOTS_TEST, 'NW1\\.S-frozen-v1-slot-schema'),
         patches: [
