@@ -46,6 +46,23 @@ export function parseReceiptInspect(bytes) {
     return value;
 }
 
+// The release-manifest writer's two extra read-only lookups: the Box's identity by its NAME (to prove name and ID belong to one
+// container) and the image's own ID and creation time.
+const IDENTITY_FIELDS = [['id', '.Id'], ['name', '.Name']], IMAGE_FIELDS = [['id', '.Id'], ['created', '.Created']];
+export const BOX_IDENTITY_FORMAT = template(IDENTITY_FIELDS), IMAGE_INSPECT_FORMAT = template(IMAGE_FIELDS);
+export const boxIdentityArgs = (engineBin, name) => { need(absolute(engineBin) && typeof name === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,254}$/.test(name), 'engine-argument'); return [engineBin, 'container', 'inspect', '--format', BOX_IDENTITY_FORMAT, name]; };
+export function parseBoxIdentity(bytes) {
+    const raw = keyedLines(bytes, IDENTITY_FIELDS.map(([key]) => key), 'box-identity-shape');
+    need(hex64(raw.id) && typeof raw.name === 'string' && /^\/?[^\s/][^\s]{0,254}$/.test(raw.name), 'box-identity-shape');
+    return Object.freeze({ id: raw.id, name: raw.name.replace(/^\//, '') });
+}
+export const imageInspectArgs = (engineBin, imageId) => { need(absolute(engineBin) && hex64(imageId), 'engine-argument'); return [engineBin, 'image', 'inspect', '--format', IMAGE_INSPECT_FORMAT, imageId]; };
+export function parseImageInspect(bytes) {
+    const raw = keyedLines(bytes, IMAGE_FIELDS.map(([key]) => key), 'image-inspect-shape');
+    need(typeof raw.id === 'string' && /^(?:sha256:)?[a-f0-9]{64}$/.test(raw.id) && typeof raw.created === 'string' && Number.isFinite(Date.parse(raw.created)), 'image-inspect-shape');
+    return Object.freeze({ id: raw.id.replace(/^sha256:/, ''), createdAt: new Date(Date.parse(raw.created)).toISOString() });
+}
+
 const LABELS = Object.freeze({ gpuGrant: 'io.assistos.ploinky-box.gpu-grant', routerHostPort: 'io.assistos.ploinky-box.router-host-port',
     mediaHostPort: 'io.assistos.ploinky-box.media-host-port', routerBindAddress: 'io.assistos.ploinky-box.router-bind-address',
     agentLibFingerprint: 'io.assistos.ploinky-box.agentlib-fingerprint', imageRef: 'io.assistos.ploinky-box.image-ref' });
