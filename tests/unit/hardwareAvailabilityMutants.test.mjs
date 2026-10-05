@@ -25,7 +25,16 @@ const SLOTS_TEST = 'tests/unit/noWaitAvailabilitySlots.test.mjs';
 const WORKER = 'cli/commands/noWaitWorker.js';
 const PROTOCOL = 'cli/commands/noWaitProtocol.js';
 const WORKER_TEST = 'tests/unit/noWaitLateOutcomeActivation.test.mjs';
+const RESOLVER = 'cli/server/hardwareAvailabilityResolver.mjs';
+const RESOLVER_TEST = 'tests/unit/hardwareAvailabilityResolver.test.mjs';
 const kill = (file, pattern) => ({ file, pattern });
+// A denial that is not derived from validated active evidence: the old hardware-coded fail-closed object.
+const HARDWARE_CODED = "Object.freeze({ state: 'refused', code: 'PLOINKY_HARDWARE_LIMITS_UNENFORCEABLE', reasonCode: 'unprepared', key: '', instanceId: '', enableGeneration: '', reason: 'The hardware availability record is invalid.', fix: 'On the host run ploinky limits status.', rootKey: '' })";
+const SLOT_RECORDED = "        slots.set(routeKey, Object.freeze({ runId: slot.runId, evidenceClass: evidence.evidenceClass }));\n";
+const denyClasses = (...classes) => ({ from: SLOT_RECORDED,
+    to: `${SLOT_RECORDED}        if (${classes.map((name) => `evidence.evidenceClass === '${name}'`).join(' || ')}) denials.set(routeKey, ${HARDWARE_CODED});\n` });
+const IDENTITY_RETURN = '    return identity.containerName === slot.key\n        && identity.instanceId === slot.instanceId\n        && identity.enableGeneration === slot.enableGeneration\n        && identity.routeKey === routeKey\n        && identity.runId === slot.runId\n        && identity.runStartedAtMs === slot.runStartedAtMs\n        && identity.waveIndex === slot.waveIndex\n        && identity.statusFile === slot.statusFile;\n';
+const resolverMutant = (name, killLeaf, patches) => ({ name, file: RESOLVER, kill: kill(RESOLVER_TEST, killLeaf), patches });
 const MISSING_POLICY = "directory = { state: 'invalid', problem: 'policy.json is missing from an existing store directory' };";
 const WITNESS_CALL = '        writeWitness({ paths, fsApi, run, state, storeId, initializedBy, now });\n';
 
@@ -89,6 +98,34 @@ export const AVAILABILITY_MUTANTS = Object.freeze({
     'm34-a-missing-witness-beside-a-valid-store-is-unreadable': { name: 'm34-a-missing-witness-beside-a-valid-store-is-unreadable', file: STORE,
         kill: kill(STORE_TEST, 'NW1\\.D1-a-missing-witness-beside-a-valid-store'),
         patches: [{ from: '    const { document } = directory;\n', to: "    const { document } = directory;\n    if (witness.state === 'absent') throw unreadable(paths.availabilityStoreDir, 'the witness is missing');\n" }] },
+    'ms1-the-resolver-reads-the-canonical-status-file': resolverMutant('ms1-the-resolver-reads-the-canonical-status-file', 'NW1\\.S-manifest-drift-and-restoration', [
+        { from: '    const read = readEvidence(fsApi, file);\n', to: '    readEvidence(fsApi, path.join(path.dirname(file), `${slot.key}.json`));\n    const read = readEvidence(fsApi, file);\n' }]),
+    'ms2-the-resolver-lists-the-no-wait-directory': resolverMutant('ms2-the-resolver-lists-the-no-wait-directory', 'NW1\\.S-only-validated-active-evidence-yields', [
+        { from: '        named.add(file);\n', to: '        named.add(file);\n        fsApi.readdirSync(path.join(runningDir, NO_WAIT_DIR_NAME));\n' }]),
+    'ms3-pid-less-evidence-yields-a-denial': resolverMutant('ms3-pid-less-evidence-yields-a-denial', 'NW1\\.S-pid-less-or-invalid-evidence', [
+        { from: "    const hasPid = Object.prototype.hasOwnProperty.call(status, 'pid');\n", to: '    const hasPid = true;\n' },
+        { from: '    if (hasPid && !(Number.isSafeInteger(status.pid) && status.pid > 0)) return invalid;\n', to: '' }]),
+    'ms4-slot-identity-equality-is-skipped': resolverMutant('ms4-slot-identity-equality-is-skipped', 'NW1\\.S-(only-validated-active-evidence-yields|obsolete-run-and-superseded)', [
+        { from: IDENTITY_RETURN, to: '    return Boolean(identity);\n' }]),
+    'ms5-the-target-less-rule-is-dropped': resolverMutant('ms5-the-target-less-rule-is-dropped', 'NW1\\.S-(slots-apply-only|entries-apply-only)', [
+        { from: '    const hostPort = Number(route.hostPort);\n    if (Number.isSafeInteger(hostPort) && hostPort >= 1 && hostPort <= 65535) return false;\n', to: '' }]),
+    'ms6-tuple-currentness-is-dropped': resolverMutant('ms6-tuple-currentness-is-dropped', 'NW1\\.S-(slots-apply-only|entries-apply-only)', [
+        { from: '    return Boolean(agent && route)\n        && agent.instanceId === instanceId\n        && agent.enableGeneration === enableGeneration\n        && route.container === key', to: '    return Boolean(agent && route)\n        && route.container === key' }]),
+    'ms9-the-evidence-cache-never-invalidates': resolverMutant('ms9-the-evidence-cache-never-invalidates', 'NW1\\.S-per-capture-cost', [
+        { from: '    if (cached && cached.key === key && cached.signature === signature) return cached.result;', to: '    if (cached && cached.signature === signature) return cached.result;' }]),
+    'ms10-unchanged-evidence-is-re-read-every-capture': resolverMutant('ms10-unchanged-evidence-is-re-read-every-capture', 'NW1\\.S-per-capture-cost', [
+        { from: '    if (cached && cached.key === key && cached.signature === signature) return cached.result;', to: '    if (false) return cached.result;' }]),
+    'ms18-invalid-slotted-evidence-yields-a-hardware-coded-denial': resolverMutant('ms18-invalid-slotted-evidence-yields-a-hardware-coded-denial', 'NW1\\.S-only-validated-active-evidence-yields', [denyClasses('invalid')]),
+    'ms19-the-resolver-copies-message-text-into-the-denial': resolverMutant('ms19-the-resolver-copies-message-text-into-the-denial', 'NW1\\.S-the-resolver-discloses-only', [
+        { from: '        compiled: Object.freeze(compileAvailabilityProjection(projection)),', to: "        compiled: Object.freeze({ ...compileAvailabilityProjection(projection), message: String(status.error?.message ?? '') })," }]),
+    'ms26-missing-evidence-yields-a-hardware-coded-denial': resolverMutant('ms26-missing-evidence-yields-a-hardware-coded-denial', 'NW1\\.S-(an-unlatched-activation-whose|no-store-denial-arises)', [denyClasses('missing')]),
+    'ms27-unowned-evidence-yields-a-hardware-coded-denial': resolverMutant('ms27-unowned-evidence-yields-a-hardware-coded-denial', 'NW1\\.S-pid-less-or-invalid-evidence', [denyClasses('unowned')]),
+    'ms28-an-unlatched-activation-keeps-its-denial-after-its-status-disappears': resolverMutant('ms28-an-unlatched-activation-keeps-its-denial-after-its-status-disappears', 'NW1\\.S-an-unlatched-activation-whose', [
+        { from: "        if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') {\n            const result = { evidenceClass: 'missing' };", to: "        if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') {\n            const result = evidenceCache.get(file)?.result?.evidenceClass === 'active' ? evidenceCache.get(file).result : { evidenceClass: 'missing' };" }]),
+    'ms33-a-non-active-own-pid-class-yields-a-denial': resolverMutant('ms33-a-non-active-own-pid-class-yields-a-denial', 'NW1\\.S-no-store-denial-arises', [denyClasses('pending', 'succeeded', 'failed-generic')]),
+    'ms38-a-slot-without-a-validated-outcome-yields-a-hardware-coded-denial': resolverMutant('ms38-a-slot-without-a-validated-outcome-yields-a-hardware-coded-denial', 'NW1\\.S-(only-validated-active-evidence-yields|no-store-denial-arises)', [
+        { from: '        outcome = noWaitTerminalHardwareOutcome(status, validateHardwareOutcome);\n    } catch (_) {\n        return invalid;\n    }', to: "        outcome = noWaitTerminalHardwareOutcome(status, validateHardwareOutcome);\n    } catch (_) {\n        return { evidenceClass: 'invalid', unvalidated: true };\n    }" },
+        { from: SLOT_RECORDED, to: `${SLOT_RECORDED}        if (evidence.unvalidated) denials.set(routeKey, ${HARDWARE_CODED});\n` }]),
     'ms36-the-validator-accepts-a-shared-run-id-and-a-missing-startup-grace': { name: 'ms36-the-validator-accepts-a-shared-run-id-and-a-missing-startup-grace', file: STORE,
         kill: kill(SLOTS_TEST, 'NW1\\.S-frozen-v1-slot-schema'),
         patches: [

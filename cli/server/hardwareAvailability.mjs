@@ -83,6 +83,23 @@ export function clearRouteHardwareAvailability(route) {
     return next;
 }
 
+// The compiled (consumer-facing) form of one validated projection. The parent
+// route source and the durable store (M-NW-01) compile through this one function.
+export function compileAvailabilityProjection(value) {
+    const projection = validateAvailabilityProjection(value);
+    return {
+        state: projection.state,
+        code: projection.problem.code,
+        reasonCode: projection.problem.reasonCode,
+        key: projection.key,
+        instanceId: projection.instanceId,
+        enableGeneration: projection.enableGeneration,
+        reason: projection.problem.state === 'refused' ? projection.problem.reason : projection.problem.rootCause.reason,
+        fix: projection.problem.state === 'refused' ? projection.problem.fix : projection.problem.rootCause.fix,
+        rootKey: projection.problem.rootCause.key,
+    };
+}
+
 // Compile the unavailable identities of a routing source into the generation.
 // Returns null when no route is unavailable, so ordinary generations keep
 // their exact compiled bytes.
@@ -97,17 +114,7 @@ export function compileHardwareAvailability(routing) {
         if (String(route.container || '') !== projection.key) {
             fail(`route '${routeKey}' availability does not belong to its exact container`);
         }
-        entries[routeKey] = {
-            state: projection.state,
-            code: projection.problem.code,
-            reasonCode: projection.problem.reasonCode,
-            key: projection.key,
-            instanceId: projection.instanceId,
-            enableGeneration: projection.enableGeneration,
-            reason: projection.problem.state === 'refused' ? projection.problem.reason : projection.problem.rootCause.reason,
-            fix: projection.problem.state === 'refused' ? projection.problem.fix : projection.problem.rootCause.fix,
-            rootKey: projection.problem.rootCause.key,
-        };
+        entries[routeKey] = compileAvailabilityProjection(projection);
     }
     return Object.keys(entries).length ? entries : null;
 }
