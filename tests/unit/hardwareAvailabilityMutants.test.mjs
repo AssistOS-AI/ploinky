@@ -156,6 +156,14 @@ export const AVAILABILITY_MUTANTS = Object.freeze({
     'ms50b-the-probe-skips-the-ctime-cross-check': { name: 'ms50b-the-probe-skips-the-ctime-cross-check', file: PROBE,
         kill: kill(PROBE_TEST, 'NW1\\.S-durable-activation-is-proved'),
         patches: [{ from: 'ctimeMatchesVisible: Number.isFinite(ctimeMs) && Number.isFinite(tVisMs) && Math.abs(ctimeMs - tVisMs) <= ctimeToleranceMs,', to: 'ctimeMatchesVisible: true,' }] },
+    // A directory fsync skipped for an unsupported filesystem is credited with a durability time (the old behaviour).
+    'ms52a-a-skipped-directory-fsync-is-credited-as-durable': { name: 'ms52a-a-skipped-directory-fsync-is-credited-as-durable', file: WORKER,
+        kill: kill(WORKER_TEST, 'NW1\\.D2-a-directory-fsync-skipped-for-an-unsupported-filesystem'),
+        patches: [{ from: '        if (directory.skipped !== undefined) return { visibleAtMs, durabilitySkipped: directory.skipped };\n', to: '' }] },
+    // The probe credits a write whose directory fsync was skipped.
+    'ms52b-the-probe-credits-a-skipped-directory-fsync': { name: 'ms52b-the-probe-credits-a-skipped-directory-fsync', file: PROBE,
+        kill: kill(PROBE_TEST, 'NW1\\.S-durable-activation-is-proved'),
+        patches: [{ from: 'durable: !durabilityError && !durabilitySkipped && Number.isFinite', to: 'durable: !durabilityError && Number.isFinite' }] },
     // The apply-lock guard of every store mutation: its typeof check, its call, and its throw.
     'ms51a-the-apply-lock-assertion-need-not-be-a-function': { name: 'ms51a-the-apply-lock-assertion-need-not-be-a-function', file: STORE,
         kill: kill(STORE_TEST, 'NW1\\.D1-every-mutation-refuses-with-zero-bytes'),

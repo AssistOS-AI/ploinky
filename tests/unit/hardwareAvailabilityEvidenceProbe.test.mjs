@@ -95,6 +95,8 @@ test('NW1.S-durable-activation-is-proved-without-http-against-the-named-generati
     assert.equal(credit({ durableAtMs: 2000 + CREDIT_WINDOW_MS + 1 }).credited, false);
     assert.equal(credit({ durableAtMs: undefined, durabilityError: 'EIO' }).credited, false, 'a recorded durability error is not credited');
     assert.equal(credit({ durabilityError: 'EIO' }).checks.durable, false);
+    assert.equal(credit({ durableAtMs: undefined, durabilitySkipped: 'EINVAL' }).credited, false, 'a skipped directory fsync is not credited');
+    assert.equal(credit({ durabilitySkipped: 'EINVAL' }).checks.durable, false, 'even beside a durability time');
     // namedGeneration: the selector's own field, even while inactive.
     assert.deepEqual(namedGeneration({ generation: 'sha256:a', previousGeneration: 'sha256:b' }), { id: 'sha256:a', source: 'selector.generation' });
     assert.deepEqual(namedGeneration({ generation: '', previousGeneration: 'sha256:b' }), { id: 'sha256:b', source: 'selector.previousGeneration' });

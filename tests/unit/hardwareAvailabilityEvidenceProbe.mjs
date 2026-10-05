@@ -14,7 +14,7 @@
 //            startedFile?, reportFile?, routerPid?, source? }
 //   startedFile  written once polling has begun
 //   reportFile   the worker log line ({ finishedAtMs, visibleAtMs, durableAtMs |
-//                durabilityError, statusFile }); read after the first active
+//                durabilityError | durabilitySkipped, statusFile }); read after the first active
 //                observation, polled for until the deadline
 
 import crypto from 'node:crypto';
@@ -32,10 +32,11 @@ export const CTIME_TOLERANCE_MS = 50;
  * the first typed observation is within T_f + 5000 + P, the
  * status file's ctime (read through the probe's own descriptor) agrees with the
  * worker's T_vis within 50 ms and is not after the observation, and the
- * durability point is within T_f + 5000 with no recorded durability error.
+ * durability point is within T_f + 5000 with no recorded durability error and
+ * no skipped directory fsync (an unsupported fsync made nothing durable).
  */
 export function creditReceipt({
-    firstActiveObservedAtMs, tFinMs, tVisMs, durableAtMs, durabilityError, ctimeMs, pollIntervalMs,
+    firstActiveObservedAtMs, tFinMs, tVisMs, durableAtMs, durabilityError, durabilitySkipped, ctimeMs, pollIntervalMs,
     pollingStartedAtMs, runStartedAtMs, windowMs = CREDIT_WINDOW_MS, ctimeToleranceMs = CTIME_TOLERANCE_MS,
 }) {
     const checks = {
@@ -44,7 +45,7 @@ export function creditReceipt({
         observedInWindow: Number.isFinite(firstActiveObservedAtMs) && firstActiveObservedAtMs <= tFinMs + windowMs + pollIntervalMs,
         ctimeMatchesVisible: Number.isFinite(ctimeMs) && Number.isFinite(tVisMs) && Math.abs(ctimeMs - tVisMs) <= ctimeToleranceMs,
         ctimeBeforeObservation: Number.isFinite(ctimeMs) && Math.floor(ctimeMs) <= firstActiveObservedAtMs,
-        durable: !durabilityError && Number.isFinite(durableAtMs) && durableAtMs <= tFinMs + windowMs,
+        durable: !durabilityError && !durabilitySkipped && Number.isFinite(durableAtMs) && durableAtMs <= tFinMs + windowMs,
     };
     return { checks, credited: Object.values(checks).every(Boolean) };
 }
@@ -197,6 +198,7 @@ async function main(options) {
             tVisMs: report.visibleAtMs,
             durableAtMs: report.durableAtMs,
             durabilityError: report.durabilityError,
+            durabilitySkipped: report.durabilitySkipped,
             ctimeMs,
             pollIntervalMs,
             pollingStartedAtMs: started.wallMs,

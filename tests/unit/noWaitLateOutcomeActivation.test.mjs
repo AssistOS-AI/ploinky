@@ -10,8 +10,6 @@ import path from 'node:path';
 import test from 'node:test';
 import { pathToFileURL } from 'node:url';
 
-import { initializeFreshEdgeRoutingSources } from '../../cli/sandbox/edgeGeneration.js';
-import { readHardwareAvailabilityPolicy } from '../../cli/sandbox/hardwareAvailabilityStore.mjs';
 import { NO_WAIT_TERMINAL_TIMESTAMP_INVALID, validateNoWaitTerminalTimestamps } from '../../cli/commands/noWaitProtocol.js';
 import { writeNoWaitWorkerStatus } from '../../cli/commands/noWaitWorker.js';
 import { fsError, spyFs } from './hardwareAvailabilityFixtures.mjs';
@@ -231,6 +229,31 @@ test('NW1.D2-a-failed-run-scoped-directory-fsync-leaves-the-status-visible-and-r
     assert.equal(Object.hasOwn(durable, 'durabilityError'), false);
 });
 
+test('NW1.D2-a-directory-fsync-skipped-for-an-unsupported-filesystem-credits-no-durability-time', (t) => {
+    silence(t);
+    for (const code of ['EINVAL', 'ENOTSUP', 'EISDIR', 'EBADF']) {
+        const layout = runningRoot(t);
+        let lastRename = null;
+        const spy = spyFs({
+            renameSync: (from, to) => { lastRename = to; return fs.renameSync(from, to); },
+            fsyncSync: (descriptor, resolved) => {
+                if (resolved === layout.statusDir && lastRename === layout.runScoped) throw fsError(code);
+                return fs.fsyncSync(descriptor);
+            },
+        });
+        const report = write(layout, failedPayload(), { fsApi: spy.api });
+        // The status is visible and the write succeeds, but nothing proves it durable.
+        assert.equal(readJson(layout.runScoped).state, 'failed', code);
+        assert.deepEqual(Object.keys(report).sort(), ['durabilitySkipped', 'finishedAtMs', 'statusFile', 'visibleAtMs'], code);
+        assert.equal(report.durabilitySkipped, code);
+        assert.equal(Object.hasOwn(report, 'durableAtMs'), false, `${code}: a skipped fsync records no durableAtMs`);
+        assert.equal(Object.hasOwn(report, 'durabilityError'), false, code);
+        assert.ok(Number.isSafeInteger(report.visibleAtMs), code);
+        assert.deepEqual(leftovers(layout), [], code);
+        t.mock.restoreAll();
+    }
+});
+
 test('NW1.S-a-failed-canonical-write-does-not-suppress-the-run-scoped-terminal-write', (t) => {
     const cases = {
         'the canonical rename fails': (layout) => ({ renameSync: (from, to) => { if (to === layout.canonical) throw fsError('EIO'); return fs.renameSync(from, to); } }),
@@ -298,20 +321,13 @@ async function killWorkerAt(t, layout, pauseAt) {
     assert.equal((await exited).signal, 'SIGKILL');
 }
 
-// There is no resolver or reconciler in this slice: the invariant is on the statuses and the policy.
-function policyOf(t) {
-    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'nw1-ws-')));
-    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-    const { paths } = initializeFreshEdgeRoutingSources({ workspaceRoot: root });
-    return { read: () => readHardwareAvailabilityPolicy({ paths }) };
-}
+// The worker under test publishes only statuses and has no connection to an availability store, so the invariant of these two
+// leaves is stated on the statuses alone: a kill short of the run-scoped rename leaves no terminal run-scoped document.
 
 test('NW1.D2-sigkill-before-the-run-scoped-commit-leaves-no-typed-denial', async (t) => {
     // The worker is killed after the run-scoped temp is fsynced, strictly before its renameSync.
     const layout = runningRoot(t);
     write(layout, { state: 'running', sequencePhase: 'active', pid: process.pid });
-    const policy = policyOf(t);
-    const before = policy.read();
     await killWorkerAt(t, layout, 'beforeRunScopedRename');
     assert.equal(readJson(layout.runScoped).state, 'running', 'the run-scoped name still holds the non-terminal status');
     assert.equal(readJson(layout.canonical).state, 'failed');
@@ -319,8 +335,6 @@ test('NW1.D2-sigkill-before-the-run-scoped-commit-leaves-no-typed-denial', async
     assert.equal(temps.length, 1);
     assert.ok(temps[0].startsWith(`${CONTAINER}.${RUN_ID}.json.`), 'only the run-scoped temp is left, under no status name');
     assert.equal(readJson(path.join(layout.statusDir, temps[0])).state, 'failed', 'the fsynced temp is not a commit');
-    assert.deepEqual(policy.read(), before);
-    assert.deepEqual(policy.read().entries, {});
 
     // Before the canonical rename nothing at all is terminal.
     const early = runningRoot(t);
@@ -333,12 +347,8 @@ test('NW1.D2-sigkill-before-the-run-scoped-commit-leaves-no-typed-denial', async
 test('NW1.D2-sigkill-between-the-canonical-and-run-scoped-renames-is-not-a-terminal-commit', async (t) => {
     const layout = runningRoot(t);
     write(layout, { state: 'running', sequencePhase: 'active', pid: process.pid });
-    const policy = policyOf(t);
-    const before = policy.read();
     await killWorkerAt(t, layout, 'betweenRenames');
     assert.equal(readJson(layout.canonical).state, 'failed', 'the canonical file is renamed first and is only diagnostic');
     assert.equal(readJson(layout.runScoped).state, 'running', 'the run-scoped file is the authoritative one and is not terminal');
     assert.deepEqual(leftovers(layout), []);
-    assert.deepEqual(policy.read(), before);
-    assert.deepEqual(policy.read().entries, {});
 });

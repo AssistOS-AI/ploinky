@@ -139,8 +139,12 @@ function statusPathFor(containerName, { runningDir = RUNNING_DIR } = {}) {
 
 const NO_WAIT_STATUS_DIRECTORY_FSYNC_IGNORED_CODES = Object.freeze(['EINVAL', 'ENOTSUP', 'EISDIR', 'EBADF']);
 
+// Returns `{ skipped: <code> }` when the filesystem does not support a
+// directory fsync (an ignored error code): nothing was made durable, so the
+// caller must not credit a durability time. Any other failure throws.
 function fsyncStatusDirectory(directory, fsApi) {
     let descriptor;
+    let skipped;
     try {
         descriptor = fsApi.openSync(directory, fsApi.constants.O_RDONLY);
         fsApi.fsyncSync(descriptor);
@@ -148,11 +152,13 @@ function fsyncStatusDirectory(directory, fsApi) {
         // Directory fsync is not supported by every host filesystem. File fsync
         // and atomic rename remain authoritative on those platforms.
         if (!NO_WAIT_STATUS_DIRECTORY_FSYNC_IGNORED_CODES.includes(error?.code)) throw error;
+        skipped = error.code;
     } finally {
         if (descriptor !== undefined) {
             try { fsApi.closeSync(descriptor); } catch (_) {}
         }
     }
+    return skipped === undefined ? {} : { skipped };
 }
 
 // A durable write (terminal `failed` documents) fsyncs the temp file before the
@@ -198,8 +204,9 @@ function writeStatusFile(target, payload, { runningDir = RUNNING_DIR, durable = 
         fsApi.renameSync(temporary, resolvedTarget);
         const visibleAtMs = Date.now();
         if (!durable) return { visibleAtMs };
+        let directory;
         try {
-            fsyncStatusDirectory(path.dirname(resolvedTarget), fsApi);
+            directory = fsyncStatusDirectory(path.dirname(resolvedTarget), fsApi);
         } catch (cause) {
             const failure = new Error(
                 `no-wait status '${path.basename(resolvedTarget)}' is visible but its directory fsync failed (${cause?.code || 'error'})`,
@@ -212,6 +219,7 @@ function writeStatusFile(target, payload, { runningDir = RUNNING_DIR, durable = 
             failure.cause = cause;
             throw failure;
         }
+        if (directory.skipped !== undefined) return { visibleAtMs, durabilitySkipped: directory.skipped };
         return { visibleAtMs, durableAtMs: Date.now() };
     } finally {
         try { fsApi.unlinkSync(temporary); } catch (error) {
@@ -299,9 +307,11 @@ export function writeNoWaitWorkerStatus(containerName, payload, {
     return {
         finishedAtMs: document.finishedAtMs ?? null,
         visibleAtMs: written.visibleAtMs,
-        ...(written.durableAtMs === undefined
-            ? { durabilityError: written.durabilityError }
-            : { durableAtMs: written.durableAtMs }),
+        ...(written.durableAtMs !== undefined
+            ? { durableAtMs: written.durableAtMs }
+            : written.durabilitySkipped !== undefined
+                ? { durabilitySkipped: written.durabilitySkipped }
+                : { durabilityError: written.durabilityError }),
         statusFile: document.statusFile,
     };
 }
