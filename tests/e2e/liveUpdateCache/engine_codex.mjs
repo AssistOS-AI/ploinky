@@ -33,6 +33,19 @@ const BOX_FIELDS = [['id', '.Id'], ['name', '.Name'], ['image', '.Image'], ['run
 export const BOX_INSPECT_FORMAT = template(BOX_FIELDS);
 export const boxInspectArgs = (engineBin, boxId) => { need(absolute(engineBin) && hex64(boxId), 'engine-argument'); return [engineBin, 'container', 'inspect', '--format', BOX_INSPECT_FORMAT, boxId]; };
 
+// The safe subset of a Box inspection the Marketplace receipt helper reads (identity, start, workspace bind, Router publication).
+// It never selects Config.Env, labels or any other field.
+export const RECEIPT_INSPECT_FORMAT = '{"Id":{{json .Id}},"State":{"Running":{{json .State.Running}},"StartedAt":{{json .State.StartedAt}}},"Mounts":{{json .Mounts}},'
+    + '"NetworkSettings":{"Ports":{{json .NetworkSettings.Ports}}},"HostConfig":{"PortBindings":{{json .HostConfig.PortBindings}}}}';
+export const receiptInspectArgs = (engineBin, container) => { need(absolute(engineBin) && typeof container === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,254}$/.test(container), 'engine-argument');
+    return [engineBin, 'container', 'inspect', '--format', RECEIPT_INSPECT_FORMAT, container]; };
+export function parseReceiptInspect(bytes) {
+    need(Buffer.isBuffer(bytes) && bytes.length > 0 && bytes.length <= 1024 * 1024, 'receipt-inspect-shape');
+    let value; try { value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)); } catch { throw new AcceptanceError('receipt-inspect-shape'); }
+    need(value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).sort().join() === 'HostConfig,Id,Mounts,NetworkSettings,State', 'receipt-inspect-shape');
+    return value;
+}
+
 const LABELS = Object.freeze({ gpuGrant: 'io.assistos.ploinky-box.gpu-grant', routerHostPort: 'io.assistos.ploinky-box.router-host-port',
     mediaHostPort: 'io.assistos.ploinky-box.media-host-port', routerBindAddress: 'io.assistos.ploinky-box.router-bind-address',
     agentLibFingerprint: 'io.assistos.ploinky-box.agentlib-fingerprint', imageRef: 'io.assistos.ploinky-box.image-ref' });

@@ -4,7 +4,7 @@ import path from 'node:path';
 import { manifestFixture, installPureGuards } from './test_support_codex.mjs';
 import { createFakeHost } from './fake_host_support_codex.mjs';
 import { createMemoryFs } from './fake_fs_support_codex.mjs';
-import { GATE_SPECS, gateEnvironment, boxEnvironment, projectReport, createGatePort, remainingGateWorkMs, GATE_WRAPPER_ALLOWANCE_MS } from './gates_codex.mjs';
+import { GATE_SPECS, gateEnvironment, boxEnvironment, activationEnvironment, projectReport, createGatePort, remainingGateWorkMs, GATE_WRAPPER_ALLOWANCE_MS } from './gates_codex.mjs';
 import { gpuWiringIdentityOf, sha256Hex } from './engine_codex.mjs';
 installPureGuards();
 
@@ -53,6 +53,11 @@ test('AC-13: every gate environment carries the complete Box contract for a labe
         const manifest = fabricated(labelled);
         for (const gate of Object.keys(GATE_SPECS)) boxContract(gateEnvironment({ manifest, inputs, gate, runId: `r-${gate}`, artifactDir: `/e/${gate}`, processEnv }), manifest, { labelled });
         boxContract(boxEnvironment(manifest), manifest, { labelled });
+        // UA-1 carries the same complete Box contract plus the activation flag, and the login settings only by allowlist.
+        const activation = activationEnvironment({ manifest, runId: 'r-ua', artifactDir: '/e/ua', processEnv: { ...processEnv, SMOKE_USERNAME: 'admin', OTHER_SECRET: 'PRIVATE' } });
+        boxContract(activation, manifest, { labelled }); assert.equal(activation.SMOKE_OPTIONAL_AGENTS, '1'); assert.equal(activation.SMOKE_USERNAME, 'admin'); assert.equal(activation.OTHER_SECRET, undefined); assert.equal(activation.SMOKE_ARTIFACT_DIR, '/e/ua');
+        assert.throws(() => activationEnvironment({ manifest, runId: 'r', artifactDir: '/e', processEnv: { ...processEnv, SMOKE_ALLOW_BROWSER_ERRORS: '1' } }), error => error.code === 'gate-browser-errors-allowed');
+        assert.throws(() => activationEnvironment({ manifest, runId: 'r', artifactDir: '/e', processEnv: { ...processEnv, SMOKE_TEST_TIMEOUT_MS: '9' } }), error => error.code === 'gate-timeout-override');
     }
     // A different port is carried through to both origins.
     const moved = fabricated(false); moved.publications[0].hostPort = 18443; boxContract(gateEnvironment({ manifest: moved, inputs, gate: 'OnlyOffice', runId: 'r', artifactDir: '/e', processEnv }), moved, { labelled: false });

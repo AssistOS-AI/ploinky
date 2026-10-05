@@ -46,17 +46,31 @@ export function boxEnvironment(manifest) {
     return env;
 }
 
-export function gateEnvironment({ manifest, inputs, gate, runId, artifactDir, processEnv }) {
-    const spec = GATE_SPECS[gate]; need(spec, 'gate-unknown');
-    const extra = { ...boxEnvironment(manifest), SMOKE_RUN_ID: runId, SMOKE_ARTIFACT_DIR: artifactDir,
-        SMOKE_WORKSPACE_ROOT: manifest.workspace.path, ...spec.flags };
-    if (gate === 'Copilot') Object.assign(extra, { SMOKE_RELEASE_MANIFEST: inputs.releaseManifest, SMOKE_SOURCE_VERIFICATION: 'release' });
-    if (gate === 'OnlyOffice') Object.assign(extra, { SMOKE_DEPLOYMENT_MODE: 'box', SMOKE_PLOINKY_BIN: manifest.candidate.cliPath });
+// The environment every smoke command of one generation shares (the three gates and the UA-1 activation): the Box contract,
+// the run identity, the allowlisted login settings and the two guards. Only explicit extras reach the child.
+function smokeEnvironment({ manifest, runId, artifactDir, processEnv, flags }) {
+    const extra = { ...boxEnvironment(manifest), SMOKE_RUN_ID: runId, SMOKE_ARTIFACT_DIR: artifactDir, SMOKE_WORKSPACE_ROOT: manifest.workspace.path, ...flags };
+    return { extra, finish: () => finishEnvironment(extra, processEnv) };
+}
+function finishEnvironment(extra, processEnv) {
     for (const name of PASSTHROUGH) if (typeof processEnv?.[name] === 'string' && processEnv[name] !== '' && !/[\0\r\n]/.test(processEnv[name])) extra[name] = processEnv[name];
     // The browser-error guard must stay on and no timeout is widened by an environment override.
     need(processEnv?.SMOKE_ALLOW_BROWSER_ERRORS === undefined || processEnv.SMOKE_ALLOW_BROWSER_ERRORS === '', 'gate-browser-errors-allowed');
     for (const name of Object.keys(processEnv ?? {})) need(!/^SMOKE_[A-Z_]*TIMEOUT[A-Z_]*$|^SMOKE_WEBMEET_REFRESH_MAX_WAIT_MS$/.test(name), 'gate-timeout-override');
     return buildCommandEnvironment(processEnv, extra);
+}
+
+export function gateEnvironment({ manifest, inputs, gate, runId, artifactDir, processEnv }) {
+    const spec = GATE_SPECS[gate]; need(spec, 'gate-unknown');
+    const { extra, finish } = smokeEnvironment({ manifest, runId, artifactDir, processEnv, flags: spec.flags });
+    if (gate === 'Copilot') Object.assign(extra, { SMOKE_RELEASE_MANIFEST: inputs.releaseManifest, SMOKE_SOURCE_VERIFICATION: 'release' });
+    if (gate === 'OnlyOffice') Object.assign(extra, { SMOKE_DEPLOYMENT_MODE: 'box', SMOKE_PLOINKY_BIN: manifest.candidate.cliPath });
+    return finish();
+}
+
+// UA-1 runs the canonical Marketplace command from the workspace checkout with the same Box contract plus the activation flag.
+export function activationEnvironment({ manifest, runId, artifactDir, processEnv }) {
+    return smokeEnvironment({ manifest, runId, artifactDir, processEnv, flags: { SMOKE_OPTIONAL_AGENTS: '1' } }).finish();
 }
 
 // Strictly project the Playwright JSON report: counts only, never titles, errors, attachments or output.
