@@ -82,6 +82,19 @@ export function assertActivationWindow({ before, after }) {
     return true;
 }
 
+// The complete agent set the registry holds must be exactly the default graph, plus the three declared optional agents once the
+// activation has run. The probe's graph rows only cover the names asked for, so this registry set is what exposes an optional agent
+// on R1, an R2 that was activated before UA, or a fourth runtime appearing during UA.
+export function assertRegistryMembership({ registryAgents, release, afterActivation }) {
+    need(Array.isArray(registryAgents) && registryAgents.every(name => typeof name === 'string'), 'live-probe-output');
+    const expected = [...release.graph.map(entry => entry.name), ...(afterActivation ? release.activation.map(entry => entry.name) : [])].sort(), observed = [...registryAgents].sort();
+    if (isDeepStrictEqual(observed, expected)) return true;
+    const optional = new Set(OPTIONAL_ACTIVATION.agents);
+    // R1 (no activation declaration) must never carry an optional agent at all.
+    need(!(release.activation === null && observed.some(name => optional.has(name.split('/').at(-1)))), 'release-graph-activated');
+    throw new AcceptanceError('activation-epoch-changed');
+}
+
 export function createActivationPort({ deps, io = fs, processEnv = process.env, now = () => Date.now(), helper = prerequisites }) {
     need(deps, 'activation-port-adapters');
     const paths = release2 => { const stem = release2.runId.replace(/_codex$/, ''), runId = `${stem}-ua`.replace(/[^A-Za-z0-9_-]/g, '-');

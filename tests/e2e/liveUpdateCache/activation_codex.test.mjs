@@ -4,12 +4,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
-import { manifestFixture, installPureGuards, H } from './test_support_codex.mjs';
+import { manifestFixture, installPureGuards, OPTIONAL_GRAPH, H } from './test_support_codex.mjs';
 import { createFakeHost } from './fake_host_support_codex.mjs';
 import { createMemoryFs } from './fake_fs_support_codex.mjs';
 import { gpuWiringIdentityOf, sha256Hex, RECEIPT_INSPECT_FORMAT, receiptInspectArgs, parseReceiptInspect } from './engine_codex.mjs';
 import { OPTIONAL_ACTIVATION } from './contracts_codex.mjs';
-import { prepareWorkspaceSmoke, workspaceSmoke, assertActivationWindow, assertActivationReceipt, createActivationPort, runActivationPhase, sameState } from './activation_codex.mjs';
+import { prepareWorkspaceSmoke, workspaceSmoke, assertActivationWindow, assertRegistryMembership, assertActivationReceipt, createActivationPort, runActivationPhase, sameState } from './activation_codex.mjs';
 installPureGuards();
 
 const codeIs = code => error => error.code === code;
@@ -243,4 +243,16 @@ test('the UA phase refuses a moved epoch, an unstable post-activation epoch, an 
     const replaced = rows(); replaced[1][1] = 'replaced'; const changedDefault = phaseWorld({ afterRows: [...replaced, ...added()] }); await rejects(changedDefault.run(), 'activation-epoch-changed');
     const reserve = phaseWorld({ imageAgeMs: 14400000 - 1620000 + 1 - 100000 }); await rejects(reserve.run(), 'campaign-image-window-insufficient'); assert.deepEqual(reserve.log.filter(row => ['start', 'execute'].includes(row)), [], 'B3 refuses before UA-1');
     assert.ok((await phaseWorld({ imageAgeMs: 14400000 - 1620000 - 100000 - 30000 }).run()).receipt, 'B3 accepts at its limit (the image ages with the install)');
+});
+
+test('N-A: registry membership is the exact default graph, plus exactly the three declared agents after the activation', () => {
+    const { value } = manifestFixture(), release = { graph: value.graph, activation: null }, r2 = { graph: value.graph, activation: OPTIONAL_GRAPH };
+    const base = value.graph.map(entry => entry.name), three = OPTIONAL_GRAPH.map(entry => entry.name);
+    assert.equal(assertRegistryMembership({ registryAgents: [...base].reverse(), release, afterActivation: false }), true, 'order is irrelevant');
+    assert.equal(assertRegistryMembership({ registryAgents: base, release: r2, afterActivation: false }), true); assert.equal(assertRegistryMembership({ registryAgents: [...base, ...three], release: r2, afterActivation: true }), true);
+    const refuse = (registryAgents, subject, afterActivation, code) => assert.throws(() => assertRegistryMembership({ registryAgents, release: subject, afterActivation }), codeIs(code), JSON.stringify([registryAgents, afterActivation]));
+    for (const agents of [[...base, three[0]], [...base, ...three], [...base, 'Elsewhere/optional'], base.slice(1), [...base, base[0]]]) refuse(agents, release, false, agents.some(name => ['onlyOffice', 'webmeetScribeAgent', 'webmeetStt'].includes(name.split('/').at(-1))) ? 'release-graph-activated' : 'activation-epoch-changed');
+    refuse([...base, three[0]], r2, false, 'activation-epoch-changed'); refuse([...base, ...three], r2, false, 'activation-epoch-changed');
+    refuse(base, r2, true, 'activation-epoch-changed'); refuse([...base, ...three.slice(0, 2)], r2, true, 'activation-epoch-changed'); refuse([...base, ...three, 'Elsewhere/fourth'], r2, true, 'activation-epoch-changed'); refuse([...base, ...three, three[0]], r2, true, 'activation-epoch-changed');
+    for (const bad of [undefined, 'x', [1]]) assert.throws(() => assertRegistryMembership({ registryAgents: bad, release, afterActivation: false }), codeIs('live-probe-output'));
 });

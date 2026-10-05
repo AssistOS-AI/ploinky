@@ -9,7 +9,7 @@ import { REQUIRED_GATES, RELEASE_GENERATIONS } from './contracts_codex.mjs';
 installPureGuards();
 
 const R1_START = Date.parse('2026-10-04T12:29:50Z'), R2_START = Date.parse('2026-10-04T12:50:00Z');
-const OO = 'AssistOSExplorer/onlyOffice', EX = 'AssistOSExplorer/explorer';
+const OO = 'AssistOSExplorer/onlyOffice', EX = 'AssistOSExplorer/explorer', OPTIONAL_NAMES = ['onlyOffice', 'webmeetScribeAgent', 'webmeetStt'].map(agent => `AssistOSExplorer/${agent}`);
 const refusal = /canonical-epoch-changed|workspace-not-live|live-binding-mismatch/;
 
 // A fabricated pair of release generations. `faults` flips single behaviours; observation numbers (per generation) are, for R1:
@@ -23,7 +23,11 @@ function build({ faults = {}, patch1, patch2, patchBase } = {}) {
     const observedFor = (m, addedGraph, id) => { const expected = expectedLiveFromManifest(m, addedGraph), n = ++stage.observed[id];
         const generation = faults.driftOnObserve?.[id] === n ? 'g-drift' : `g-${1 + moves.filter(hit).length}`;
         const rowTag = name => (faults.replacedRows ?? []).filter(entry => hit(entry.after) && entry.rows.includes(name)).length + (faults.runtimeDriftOnObserve?.[id] === n ? 100 : 0);
-        const observed = { hostPlatform: 'linux', engine: 'podman', rootless: true, running: true, initialized: true, activeGeneration: generation, pendingActivation: false, recoveryBarrier: false, workspace: { ...expected.workspace }, box: { ...expected.box },
+        // The registry set is what the product actually holds: the default graph, plus the three optional agents once the activation ran,
+        // plus whatever a fault adds. It is independent of which rows the observer is asked to project.
+        const optionalNames = (m.activation ?? []).map(entry => entry.name), registry = [...m.graph.map(entry => entry.name), ...(id === 'R2' && (hit('UA') || faults.preActivated) ? optionalNames : []),
+            ...(id === 'R1' ? (faults.r1Optional ?? []) : []), ...((faults.registryExtra?.[id] ?? []).filter(row => row.when === undefined || hit(row.when)).map(row => row.name))];
+        const observed = { registryAgents: registry, hostPlatform: 'linux', engine: 'podman', rootless: true, running: true, initialized: true, activeGeneration: generation, pendingActivation: false, recoveryBarrier: false, workspace: { ...expected.workspace }, box: { ...expected.box },
             candidate: structuredClone(expected.candidate), publications: expected.publications, sourceMounts: expected.sourceMounts, engineIdentity: expected.engineIdentity,
             graph: expected.requiredGraph.map(entry => ({ name: entry.name, graphGeneration: generation, running: true, runtimeId: `r${rowTag(entry.name)}`, instanceId: 'i', enableGeneration: 'e', ready: faults.notReady?.[id] !== true, externalHealth: true, noWaitState: null })) };
         if (faults.boxChangesAfter?.[id] && hit(faults.boxChangesAfter[id])) observed.box.id = H('other-box'); return observed; };
@@ -182,6 +186,26 @@ test('the epoch may move only inside the declared windows: R1 and WebMeet hold e
         const h = build({ faults }); await assert.rejects(async () => { await throughUA(h); await h.phases.U8b(); }, error => refusal.test(error.code), label); assert.ok(phase);
         if (/Copilot/.test(label)) assert.equal(h.calls.includes('load:R2'), false, label);
     }
+});
+
+test('N-A: agents outside the probed rows are observed through the registry set: R1 never carries an optional agent, R2 is not activated before UA and gains exactly three agents during it', async () => {
+    const optional = ['AssistOSExplorer/onlyOffice'], all3 = OPTIONAL_NAMES;
+    // R1 with an optional agent running is refused at admission, and when it appears later it is refused before the Copilot gate.
+    const early = build({ faults: { r1Optional: optional } }); await assert.rejects(early.phases.U7c(), codeIs('release-graph-activated')); assert.equal(early.calls.some(call => call.startsWith('gate:')), false);
+    const allOptional = build({ faults: { r1Optional: all3 } }); await assert.rejects(allOptional.phases.U7c(), codeIs('release-graph-activated'));
+    const later = build({ faults: { registryExtra: { R1: [{ name: optional[0], when: 'between' }] } } }); await later.phases.U7c(); later.stage.done.add('between'); await assert.rejects(later.phases.U8a(), codeIs('release-graph-activated')); assert.equal(later.calls.includes('gate:Copilot'), false);
+    // An unrelated extra agent on R1 is still an epoch change, not an activation.
+    const stray = build({ faults: { registryExtra: { R1: [{ name: 'Elsewhere/stray' }] } } }); await assert.rejects(stray.phases.U7c(), codeIs('activation-epoch-changed'));
+    // R2 already activated before UA (all three, or only one) is refused at admission and UA never launches.
+    for (const faults of [{ preActivated: true }, { registryExtra: { R2: [{ name: optional[0] }] } }]) {
+        const h = build({ faults }); await throughR1(h); await assert.rejects(h.phases.U7d(), codeIs('activation-epoch-changed')); assert.equal(h.calls.some(call => call.startsWith('ua:')), false);
+    }
+    const sticky = build({ faults: { registryExtra: { R2: [{ name: optional[0], when: 'between' }] } } }); await throughR1(sticky); await sticky.phases.U7d(); sticky.stage.done.add('between'); await assert.rejects(sticky.phases.UA(), codeIs('activation-epoch-changed')); assert.equal(sticky.calls.includes('ua:execute'), false, 'an R2 that became activated between U7d and UA is refused before UA-1');
+    // A fourth runtime appearing during UA, or after it, is refused; the exact three are accepted.
+    const fourth = build({ faults: { registryExtra: { R2: [{ name: 'AssistOSExplorer/webmeetFourth', when: 'UA' }] } } }); await throughR1(fourth); await fourth.phases.U7d(); await assert.rejects(fourth.phases.UA(), codeIs('activation-epoch-changed')); assert.equal(fourth.calls.includes('ua:verify'), true); assert.equal(fourth.state.activation, undefined, 'no activation proof is recorded');
+    const duringGate = build({ faults: { registryExtra: { R2: [{ name: 'AssistOSExplorer/webmeetFourth', when: 'OnlyOffice' }] } } }); await throughUA(duringGate); await assert.rejects(duringGate.phases.U8b(), codeIs('activation-epoch-changed')); assert.equal(duringGate.calls.includes('gate:WebMeet'), false);
+    const afterUA = build({ faults: { registryExtra: { R2: [{ name: 'AssistOSExplorer/webmeetFourth', when: 'UA' }] } } }); await assert.rejects(throughUA(afterUA), codeIs('activation-epoch-changed'));
+    const exact = await all({}); assert.equal(exact.state.gates.length, 3, 'exactly the default graph, then exactly three more, is accepted');
 });
 
 test('U9 refuses any unsettled owned command, open browser context, remaining fixture or dirty run', async () => {

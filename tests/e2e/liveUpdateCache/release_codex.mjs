@@ -4,7 +4,7 @@ import { CAMPAIGN_RESERVES_MS, REQUIRED_GATES, RELEASE_GENERATIONS, admitCanonic
     assertCanonicalGateResults, assertLiveBefore, assertSameCandidate } from './contracts_codex.mjs';
 import { expectedLiveFromManifest } from './live_admission_codex.mjs';
 import { remainingGenerationWorkMs } from './gates_codex.mjs';
-import { runActivationPhase, sameState } from './activation_codex.mjs';
+import { runActivationPhase, sameState, assertRegistryMembership } from './activation_codex.mjs';
 import { gpuWiringIdentityOf } from './engine_codex.mjs';
 
 // U7c-U9: the release epoch is two fresh generations. R1 (never activated) runs the baseline-graph Copilot gate; R2 is
@@ -31,6 +31,8 @@ export function createReleasePhases(ctx) {
         const added = addedGraph ? release.activation : undefined;
         const observed = await observer.observe({ addedGraph: added }), expected = expectedLiveFromManifest(release, added); expected.activeGeneration = generation ?? observed.activeGeneration;
         assertLiveBefore({ expected, observed });
+        // The whole registry must be exactly the expected agent set: this is the only observation of agents outside the probed rows.
+        assertRegistryMembership({ registryAgents: observed.registryAgents, release, afterActivation: Boolean(addedGraph) });
         return Object.freeze({ boxId: observed.box.id, startedAt: observed.box.startedAt, workspaceIdentity: identityOf(observed), candidate: candidateOf(observed, release.box.imageId),
             generation: observed.activeGeneration, runtimes: observed.graph.map(row => [row.name, row.runtimeId, row.instanceId, row.enableGeneration]) });
     }

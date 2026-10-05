@@ -8,7 +8,7 @@ import { READER_INSPECT_FORMAT, parseReaderInspect } from './engine_codex.mjs';
 // to `container exec` through a fixed bootstrap. It calls only existing read-only product readers, never prepares,
 // repairs, applies or starts anything, and prints a single public JSON document or a fixed failure code.
 export const PROBE_SCHEMA = 'live-update-cache-box-probe';
-export const PROBE_LIMITS = Object.freeze({ generationBytes: 8 * 1024 * 1024, requiredRuntimes: 256, inspectBytes: 1024 * 1024, inspectMs: 30000, configBytes: 1024 * 1024 });
+export const PROBE_LIMITS = Object.freeze({ generationBytes: 8 * 1024 * 1024, requiredRuntimes: 256, inspectBytes: 1024 * 1024, inspectMs: 30000, configBytes: 1024 * 1024, registryAgents: 256 });
 const hex64 = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const text = value => typeof value === 'string' && value.length > 0 && value.length <= 512 && !/[\0\r\n]/.test(value);
 export class ProbeFailure extends Error { constructor(code) { super(code); this.code = code; } }
@@ -60,6 +60,14 @@ export async function loadProductApis(root = '/opt/ploinky') {
     return { readAgentRegistrySnapshot: registry.readAgentRegistrySnapshot, readEdgeRoutingSelection: edge.readEdgeRoutingSelection,
         loadActiveEdgeRoutingGeneration: edge.loadActiveEdgeRoutingGeneration, collectAgentRuntimeStates: states.collectAgentRuntimeStates,
         applyRuntimeReadinessProjection: readiness.applyRuntimeReadinessProjection };
+}
+
+// Every agent the registry records, as sorted `repoName/agentName` (a multiset: an aliased enable of one agent appears twice). The
+// requested rows alone cannot show an agent nobody asked about, so this is what makes an unexpected or early activation observable.
+export function registryAgentNames(registry) {
+    const names = Object.values(registry ?? {}).filter(record => record?.type === 'agent').map(record => `${record.repoName}/${record.agentName}`);
+    need(names.length <= PROBE_LIMITS.registryAgents && names.every(name => text(name)), 'probe-registry-unreadable');
+    return names.sort();
 }
 
 function selectRecords(registry, requiredRuntimes) {
@@ -127,7 +135,9 @@ export async function runBoxProbe(input, { workspaceRoot, apis, io = fs, inspect
     let after; try { after = apis.readAgentRegistrySnapshot({ workspaceRoot }); } catch { throw new ProbeFailure('probe-registry-unreadable'); }
     const projection = records => selectRecords(records, input.requiredRuntimes).map(row => [row.containerName, row.record.containerId, row.record.instanceId, row.record.enableGeneration]);
     need(digest(projection(after)) === digest(projection(registry)), 'probe-registry-changed');
-    return { schema: PROBE_SCHEMA, version: 1, selector: selectorTuple(active.selector), graph, publicConfig: readPublicConfig(workspaceRoot, io) };
+    const registryAgents = registryAgentNames(registry);
+    need(digest(registryAgentNames(after)) === digest(registryAgents), 'probe-registry-changed');
+    return { schema: PROBE_SCHEMA, version: 1, selector: selectorTuple(active.selector), graph, registryAgents, publicConfig: readPublicConfig(workspaceRoot, io) };
 }
 
 export async function probeMain({ input, workspaceRoot = process.env.PLOINKY_WORKSPACE_ROOT, write = value => process.stdout.write(`${JSON.stringify(value)}\n`), load = loadProductApis } = {}) {

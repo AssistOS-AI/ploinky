@@ -34,7 +34,7 @@ function build(mutate = () => {}) {
             labels: { 'io.assistos.ploinky-box.agentlib-fingerprint': manifest.agentLib.fingerprint }, workdir: manifest.workspace.path, user: 'podman' },
         probe: null, repos: {} });
     for (const repo of manifest.candidate.repositories) state.repos[repo.path] = { commit: repo.commit, branch: repo.branch, upstream: repo.upstream, pushed: repo.commit, dirty: '' };
-    state.probe = { schema: 'live-update-cache-box-probe', version: 1, publicConfig: { staticAgent: 'explorer', staticPort: 8080 }, selector: { state: 'active', generation: manifest.box.activeGeneration, activationId: 'act-1', publicationState: 'ready' },
+    state.probe = { schema: 'live-update-cache-box-probe', version: 1, registryAgents: manifest.graph.map(entry => entry.name).sort(), publicConfig: { staticAgent: 'explorer', staticPort: 8080 }, selector: { state: 'active', generation: manifest.box.activeGeneration, activationId: 'act-1', publicationState: 'ready' },
         graph: manifest.graph.map(entry => ({ name: entry.name, containerName: `ploinky_${entry.name.replace('/', '_')}`, runtimeId: H(`rt-${entry.name}`), instanceId: `inst-${entry.name}`, enableGeneration: 'enable-1',
             graphGeneration: manifest.box.activeGeneration, running: true, ready: true, noWaitState: entry.noWait ? 'running' : null, generationJoin: true, labelsEqual: true, imageId: H('agent-image') })) };
     mutate(manifest, state); validateManifest(manifest);
@@ -173,8 +173,8 @@ test('R2 after the activation: the declared optional runtimes extend the probe i
     assert.deepEqual(probeInput(h.manifest, h.manifest.activation).requiredRuntimes.map(row => row.name), extended); assert.deepEqual(expectedLiveFromManifest(h.manifest, h.manifest.activation).requiredGraph.map(row => row.name), extended);
     // The in-Box probe answers for the extended list; the observed graph then has the three added rows, running and ready.
     h.state.probe.graph.push(...OPTIONAL_GRAPH.map(entry => ({ name: entry.name, containerName: `ploinky_${entry.name.replace('/', '_')}`, runtimeId: H(`rt-${entry.name}`), instanceId: `inst-${entry.name}`, enableGeneration: 'enable-1', graphGeneration: h.manifest.box.activeGeneration, running: true, ready: true, noWaitState: null, generationJoin: true, labelsEqual: true, imageId: H('agent-image') })));
-    h.state.status.runningAgents = extended.length;
-    const observed = await h.observer.observe({ addedGraph: h.manifest.activation }); assert.deepEqual(observed.graph.map(row => row.name), extended);
+    h.state.status.runningAgents = extended.length; h.state.probe.registryAgents = [...extended].sort();
+    const observed = await h.observer.observe({ addedGraph: h.manifest.activation }); assert.deepEqual(observed.registryAgents, [...extended].sort(), 'the observation carries the whole registry set'); assert.deepEqual(observed.graph.map(row => row.name), extended);
     const probeRun = h.fake.log.filter(row => row.args.includes('-')).at(-1); assert.deepEqual(JSON.parse(/probeMain\(\{ input: (.*) \}\)/.exec(probeRun.child.writes[0].toString())[1]).requiredRuntimes.map(row => row.name), extended);
     assert.equal((await h.observer.admit({ addedGraph: h.manifest.activation })).runtimes, extended.length);
     // Only the manifest's own declaration is accepted; every other binding stays exact.
@@ -211,12 +211,13 @@ test('a non-Linux or foreign-uid host refuses before any command is launched', a
 
 test('probe, status and health parsers reject extra, missing, oversized and secret-bearing fields', async () => {
     const { value: manifest } = manifestFixture(); const input = probeInput(manifest);
-    const good = { schema: 'live-update-cache-box-probe', version: 1, publicConfig: { staticAgent: 'explorer', staticPort: 8080 }, selector: { state: 'active', generation: 'g', activationId: 'a', publicationState: 'ready' },
+    const good = { schema: 'live-update-cache-box-probe', version: 1, registryAgents: ['R/a'], publicConfig: { staticAgent: 'explorer', staticPort: 8080 }, selector: { state: 'active', generation: 'g', activationId: 'a', publicationState: 'ready' },
         graph: [{ name: input.requiredRuntimes[0].name, containerName: 'c', runtimeId: 'r', instanceId: 'i', enableGeneration: 'e', graphGeneration: 'g', running: true, ready: true, noWaitState: null, generationJoin: true, labelsEqual: true, imageId: 'x' }] };
     assert.equal(parseProbeOutput(Buffer.from(JSON.stringify(good)), input).selector.generation, 'g');
     for (const bad of [{ ...good, extra: 'PRIVATE' }, { ...good, graph: [{ ...good.graph[0], env: 'PRIVATE' }] }, { ...good, graph: [] }, { ...good, graph: [{ ...good.graph[0], name: 'Other/agent' }] },
         { ...good, graph: [{ ...good.graph[0], graphGeneration: 'h' }] }, { ...good, selector: { ...good.selector, state: 'inactive' } }, { ...good, publicConfig: { staticAgent: 'e', staticPort: 8080, extra: 1 } },
-        { ...good, publicConfig: { staticAgent: 'e', staticPort: '8080' } }, { schema: good.schema, version: 1, selector: good.selector, graph: good.graph }]) {
+        { ...good, publicConfig: { staticAgent: 'e', staticPort: '8080' } }, { schema: good.schema, version: 1, selector: good.selector, graph: good.graph }, { ...good, registryAgents: undefined }, { ...good, registryAgents: 'R/a' }, { ...good, registryAgents: [7] },
+        { ...good, registryAgents: Array(257).fill('R/a') }, { ...good, registryAgents: [''] }]) {
         assert.throws(() => parseProbeOutput(Buffer.from(JSON.stringify(bad)), input), error => error.code === 'live-probe-output');
     }
     assert.throws(() => parseProbeOutput(Buffer.alloc(200000, 97), input), error => error.code === 'live-probe-output');

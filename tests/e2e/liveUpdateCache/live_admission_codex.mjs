@@ -40,10 +40,11 @@ export function parseProbeOutput(bytes, input) {
     let value; try { value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)); } catch { throw new AcceptanceError('live-probe-output'); }
     need(value && value.schema === PROBE_SCHEMA && value.version === 1, 'live-probe-output');
     if (Object.hasOwn(value, 'failure')) { need(typeof value.failure === 'string' && /^probe-[a-z-]{1,48}$/.test(value.failure) && Object.keys(value).length === 3, 'live-probe-output'); throw new AcceptanceError(`live-${value.failure}`); }
-    need(Object.keys(value).sort().join() === ['graph', 'publicConfig', 'schema', 'selector', 'version'].sort().join() && Array.isArray(value.graph) && value.graph.length === input.requiredRuntimes.length
+    need(Object.keys(value).sort().join() === ['graph', 'publicConfig', 'registryAgents', 'schema', 'selector', 'version'].sort().join() && Array.isArray(value.graph) && value.graph.length === input.requiredRuntimes.length
         && value.selector && Object.keys(value.selector).sort().join() === ['activationId', 'generation', 'publicationState', 'state'].sort().join() && value.selector.state === 'active', 'live-probe-output');
     need(value.publicConfig && Object.keys(value.publicConfig).sort().join() === ['staticAgent', 'staticPort'].join() && typeof value.publicConfig.staticAgent === 'string'
         && value.publicConfig.staticAgent.length <= 512 && Number.isSafeInteger(value.publicConfig.staticPort), 'live-probe-output');
+    need(Array.isArray(value.registryAgents) && value.registryAgents.length <= PROBE_LIMITS.registryAgents && value.registryAgents.every(name => typeof name === 'string' && name.length > 0 && name.length <= 512), 'live-probe-output');
     const keys = ['containerName', 'enableGeneration', 'generationJoin', 'graphGeneration', 'imageId', 'instanceId', 'labelsEqual', 'name', 'noWaitState', 'ready', 'runtimeId', 'running'].sort().join();
     value.graph.forEach((row, index) => {
         need(row && Object.keys(row).sort().join() === keys && row.name === input.requiredRuntimes[index].name && typeof row.ready === 'boolean' && typeof row.running === 'boolean'
@@ -139,7 +140,7 @@ export function createLiveObserver({ manifest, deps, statusProof, httpGet = http
                     runtimeId: row.runtimeId, instanceId: row.instanceId, enableGeneration: row.enableGeneration, ready: row.ready,
                     externalHealth: graph[index].externalHealthRequired ? routerHealthy : true, noWaitState: row.noWaitState })),
                 // Not part of the live contract: kept for the cross-phase equality checks.
-                publicConfig: probed.publicConfig, activation: { generation: probed.selector.generation, activationId: probed.selector.activationId } };
+                registryAgents: probed.registryAgents, publicConfig: probed.publicConfig, activation: { generation: probed.selector.generation, activationId: probed.selector.activationId } };
         },
         // The admission is positive only when the independently observed deployment matches the manifest-derived expectation.
         // Only the edge generation may legitimately differ from the manifest after earlier mutations of the same run; a caller

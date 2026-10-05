@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { installPureGuards, H } from './test_support_codex.mjs';
 import { createMemoryFs } from './fake_fs_support_codex.mjs';
-import { runBoxProbe, probeMain, inspectNestedContainers, validateProbeInput, readPublicConfig, PROBE_LIMITS, PROBE_SCHEMA } from './box_probe_codex.mjs';
+import { runBoxProbe, registryAgentNames, probeMain, inspectNestedContainers, validateProbeInput, readPublicConfig, PROBE_LIMITS, PROBE_SCHEMA } from './box_probe_codex.mjs';
 import { READER_INSPECT_FORMAT } from './engine_codex.mjs';
 installPureGuards();
 
@@ -36,7 +36,7 @@ function scenario(mutate = () => {}) {
 
 test('probe projects only public nonsecret membership using read-only product readers and supplied exact rows', async () => {
     const s = scenario(); const result = await s.run();
-    assert.deepEqual(Object.keys(result).sort(), ['graph', 'publicConfig', 'schema', 'selector', 'version']); assert.deepEqual(result.publicConfig, { staticAgent: 'explorer', staticPort: 8080 }); assert.equal(result.schema, PROBE_SCHEMA);
+    assert.deepEqual(Object.keys(result).sort(), ['graph', 'publicConfig', 'registryAgents', 'schema', 'selector', 'version']); assert.deepEqual(result.registryAgents, ['AssistOSExplorer/dpuAgent', 'AssistOSExplorer/explorer']); assert.deepEqual(result.publicConfig, { staticAgent: 'explorer', staticPort: 8080 }); assert.equal(result.schema, PROBE_SCHEMA);
     assert.deepEqual(result.selector, { state: 'active', generation, activationId: 'act-1', publicationState: 'ready' });
     assert.deepEqual(result.graph.map(row => [row.name, row.running, row.ready, row.noWaitState, row.generationJoin, row.labelsEqual]),
         [['AssistOSExplorer/explorer', true, true, null, true, true], ['AssistOSExplorer/dpuAgent', true, true, 'running', true, true]]);
@@ -115,4 +115,16 @@ test('nested inspection uses a fixed template, exact container IDs and a private
     assert.throws(() => inspectNestedContainers([H('c0')], { spawnSync: () => ({ status: 1, stdout: Buffer.alloc(0) }) }), error => error.code === 'probe-container-inspect');
     assert.throws(() => inspectNestedContainers([H('c0')], { spawnSync: () => ({ status: 0, stdout: Buffer.from('garbage') }) }), error => error.code === 'probe-container-inspect');
     assert.throws(() => inspectNestedContainers([H('c0')], { spawnSync: () => ({ status: 0, error: new Error('x'), stdout: Buffer.alloc(0) }) }), error => error.code === 'probe-container-inspect');
+});
+
+test('the probe reports every agent the registry holds, including agents nobody asked about, and refuses a registry that changes under it', async () => {
+    const extra = { type: 'agent', repoName: 'AssistOSExplorer', agentName: 'onlyOffice', runtime: 'podman', containerId: H('cx'), instanceId: 'i-x', enableGeneration: 'e-x' };
+    const s = scenario(state => { state.registry.ploinky_onlyOffice = extra; state.registry.not_an_agent = { type: 'volume', repoName: 'R', agentName: 'v' }; });
+    const result = await s.run(); assert.deepEqual(result.registryAgents, ['AssistOSExplorer/dpuAgent', 'AssistOSExplorer/explorer', 'AssistOSExplorer/onlyOffice']);
+    assert.deepEqual(result.graph.map(row => row.name), rows.map(row => row.name), 'the probed rows are still only the requested ones');
+    assert.deepEqual(registryAgentNames({ a: { type: 'agent', repoName: 'R', agentName: 'x' }, b: { type: 'agent', repoName: 'R', agentName: 'x' } }), ['R/x', 'R/x'], 'an aliased enable of one agent appears twice');
+    assert.deepEqual(registryAgentNames({}), []); assert.deepEqual(registryAgentNames(null), []);
+    const grows = scenario(state => { state.registryAfter = { ...state.registry, ploinky_extra: { ...extra, agentName: 'webmeetStt' } }; });
+    await failure(grows.run(), 'probe-registry-changed');
+    assert.throws(() => registryAgentNames(Object.fromEntries(Array.from({ length: PROBE_LIMITS.registryAgents + 1 }, (_, index) => [`c${index}`, { type: 'agent', repoName: 'R', agentName: `a${index}` }]))), error => error.code === 'probe-registry-unreadable');
 });
