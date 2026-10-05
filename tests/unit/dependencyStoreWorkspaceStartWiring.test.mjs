@@ -606,8 +606,13 @@ test('NW1.S-no-retirement-site-uses-an-uncoordinated-merge-and-retirement-stays-
     const allowed = new Set([
         'cli/sandbox/hardwareAvailabilityStore.mjs', 'cli/commands/noWaitAvailabilitySlots.js', 'cli/commands/hardwareAvailabilityRetirement.js',
         'cli/commands/workspaceUtil.js', 'cli/commands/targetedAgentRestart.js',
+        // D2S.11: the Router-process latcher writes the resolve commit; it never retires a publication's entries (below).
+        'cli/server/hardwareAvailabilityLatcher.mjs',
     ]);
     for (const file of files) assert.ok(allowed.has(file), `${file} must not retire entries or commit the store`);
+    for (const name of ['retireSameTupleHardwareEntries(', 'retireSameTupleAfterApply(', 'retireStartReadyPublications(']) {
+        assert.equal(callers.has(`cli/server/hardwareAvailabilityLatcher.mjs:${name}`), false, `the latcher must not call ${name}`);
+    }
     assert.ok(files.includes('cli/commands/workspaceUtil.js'));
     assert.match(SRC('cli/commands/targetedAgentRestart.js'), /await retireEntriesAfterApply\(/);
     // No retirement call sits inside a `coordinate: false` mutator: the text of every merge call (balanced parentheses) that holds a
