@@ -355,6 +355,14 @@ export function buildRequiredCaseManifest() {
         ]),
         ...leaves(P, 'p0', unit('noWaitAvailabilitySlots.test.mjs'), [
             'NW1.S-frozen-v1-slot-schema-and-cross-field-rules-refuse-without-a-partial-write',
+            'NW1.S-staging-and-latch-resolution-follow-newer-run-precedence',
+            'NW1.S-parent-known-nodes-get-no-slot-and-pid-less-statuses-never-activate',
+            'NW1.S-a-resolve-commit-never-changes-the-effective-revision',
+            'NW1.S-marker-retirement-box-cleanup-and-watchdog-documents-never-erase-an-activation',
+        ]),
+        ...leaves(P, 'p0', unit('dependencyStoreWorkspaceStartWiring.test.mjs'), [
+            'NW1.S-start-status-clearing-touches-only-canonical-and-this-runs-fresh-paths',
+            'NW1.S-slots-are-committed-before-any-marker-or-spawn-and-a-failed-slot-commit-aborts-the-start',
         ]),
         ...leaves(P, 'p0', unit('hardwareAvailabilityResolver.test.mjs'), [
             'NW1.S-activation-is-the-run-scoped-rename',
@@ -417,6 +425,12 @@ export function buildRequiredCaseManifest() {
                 'ms8-the-effective-revision-includes-non-denial-classes',
                 'ms44-durability-is-credited-at-the-rename-despite-a-failed-fsync',
                 'ms45-the-evidence-probe-evaluates-a-different-generation-than-the-selector-names',
+                'ms11-the-slot-commit-runs-after-the-spawn-loop', 'ms12-start-spawns-despite-a-failed-slot-commit',
+                'ms13-an-active-slot-is-retired-without-a-latch', 'ms14-latch-and-retire-are-two-commits',
+                'ms17-a-parent-known-node-gets-a-slot', 'ms21-257-slots-are-accepted',
+                'ms32-resolving-a-newer-slot-keeps-the-older-same-tuple-entry',
+                'ms39a-a-resolve-commit-latches-the-cause-on-the-wrong-route', 'ms39b-the-resolve-invariant-check-is-skipped',
+                'ms59-stale-entries-are-not-retired-by-staging', 'ms60-a-published-target-does-not-retire-the-superseded-entry',
                 'ms54-a-failed-store-read-is-cached-under-the-unchanged-key',
                 'ms55-the-probe-takes-the-finish-time-from-the-worker-line',
                 'ms56-the-probe-credits-admin-and-readiness-from-the-mirror',

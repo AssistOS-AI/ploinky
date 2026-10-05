@@ -32,6 +32,11 @@ const OBSERVERS_TEST = 'tests/unit/hardwareAvailabilityObservers.test.mjs';
 const OBSERVER = 'cli/server/noWaitAgentStartupState.js';
 const PROJECTIONS = 'cli/server/hardwareAvailabilityProjections.mjs';
 const PRIVATE_ROUTER = 'cli/server/privateRouter.js';
+const SLOTS = 'cli/commands/noWaitAvailabilitySlots.js';
+const START = 'cli/commands/workspaceUtil.js';
+const WIRING_TEST = 'tests/unit/dependencyStoreWorkspaceStartWiring.test.mjs';
+const STAGING_BLOCK = "    // Stage this run's availability slots in ONE store commit, after the statuses are cleared and before any\n    // marker or worker exists: earlier terminal slots are resolved, superseded slots and stale entries are retired,\n    // and each run about to be spawned gets its slot. Parent-known nodes get none. A failure aborts the start here.\n    await stageNoWaitAvailabilitySlots({\n      schedule: noWaitSchedule,\n      isParentKnown: (entry) => Boolean(unavailableOutcome(entry.node.id)),\n      workspaceRoot: PLOINKY_WORKSPACE_ROOT,\n      startupGraceMs: resolveNoWaitBarrierTimeouts().startupGraceMs,\n    });\n";
+const slotsMutant = (name, killLeaf, patches, killFile = SLOTS_TEST) => ({ name, file: SLOTS, kill: kill(killFile, killLeaf), patches });
 const PROBE = 'tests/unit/hardwareAvailabilityEvidenceProbe.mjs';
 const PROBE_TEST = 'tests/unit/hardwareAvailabilityEvidenceProbe.test.mjs';
 const REVISION = '        revision: computeEffectiveRevision(denials),\n';
@@ -203,6 +208,35 @@ export const AVAILABILITY_MUTANTS = Object.freeze({
     'ms58-the-projection-reader-swallows-programming-errors': { name: 'ms58-the-projection-reader-swallows-programming-errors', file: PROJECTIONS,
         kill: kill(OBSERVERS_TEST, 'NW1\\.S-a-lease-without-effective'),
         patches: [{ from: "        if (SELECTOR_OR_GENERATION_UNAVAILABLE.includes(error?.code)) return null;\n        throw error;", to: '        return null;' }] },
+    // Staging (D2S.4): where start commits slots, and how the shared planner resolves and retires them.
+    'ms11-the-slot-commit-runs-after-the-spawn-loop': { name: 'ms11-the-slot-commit-runs-after-the-spawn-loop', file: START,
+        kill: kill(WIRING_TEST, 'NW1\\.S-slots-are-committed-before-any-marker-or-spawn'),
+        patches: [
+            { from: STAGING_BLOCK, to: '' },
+            { from: "    console.log(`[start] Watchdog will automatically restart the server if it crashes.`);", to: `${STAGING_BLOCK}    console.log(\`[start] Watchdog will automatically restart the server if it crashes.\`);` },
+        ] },
+    'ms12-start-spawns-despite-a-failed-slot-commit': { name: 'ms12-start-spawns-despite-a-failed-slot-commit', file: START,
+        kill: kill(WIRING_TEST, 'NW1\\.S-slots-are-committed-before-any-marker-or-spawn'),
+        patches: [{ from: '      startupGraceMs: resolveNoWaitBarrierTimeouts().startupGraceMs,\n    });\n', to: '      startupGraceMs: resolveNoWaitBarrierTimeouts().startupGraceMs,\n    }).catch(() => {});\n' }] },
+    'ms13-an-active-slot-is-retired-without-a-latch': slotsMutant('ms13-an-active-slot-is-retired-without-a-latch', 'NW1\\.S-staging-and-latch-resolution', [
+        { from: "        if (evidence.evidenceClass === 'active') {\n            const projection", to: "        if (false) {\n            const projection" }]),
+    'ms14-latch-and-retire-are-two-commits': slotsMutant('ms14-latch-and-retire-are-two-commits', 'NW1\\.S-staging-and-latch-resolution', [
+        { from: '    commit = commitHardwareAvailabilityPolicy,\n    log = appendLog,\n} = {}) {\n    const edgeOptions', to: '    commit = (args) => { const first = commitHardwareAvailabilityPolicy({ ...args, slots: {} }); return commitHardwareAvailabilityPolicy({ ...args, expectedRevision: first.revision }); },\n    log = appendLog,\n} = {}) {\n    const edgeOptions' }]),
+    'ms17-a-parent-known-node-gets-a-slot': slotsMutant('ms17-a-parent-known-node-gets-a-slot', 'NW1\\.S-parent-known-nodes-get-no-slot', [
+        { from: '!entry.identity || isParentKnown(entry)) continue;', to: '!entry.identity) continue;' }]),
+    'ms21-257-slots-are-accepted': { name: 'ms21-257-slots-are-accepted', file: STORE,
+        kill: kill(SLOTS_TEST, 'NW1\\.S-frozen-v1-slot-schema'),
+        patches: [{ from: 'Object.keys(nextSlots).length > MAX_HARDWARE_AVAILABILITY_SLOTS) {', to: 'Object.keys(nextSlots).length > MAX_HARDWARE_AVAILABILITY_SLOTS + 1) {' }] },
+    'ms32-resolving-a-newer-slot-keeps-the-older-same-tuple-entry': slotsMutant('ms32-resolving-a-newer-slot-keeps-the-older-same-tuple-entry', 'NW1\\.S-staging-and-latch-resolution', [
+        { from: "            supersedeEntry(routeKey, slot);\n            resolutions.push({ routeKey, runId: slot.runId, resolution: 'retired', evidenceClass", to: "            resolutions.push({ routeKey, runId: slot.runId, resolution: 'retired', evidenceClass" }]),
+    'ms39a-a-resolve-commit-latches-the-cause-on-the-wrong-route': slotsMutant('ms39a-a-resolve-commit-latches-the-cause-on-the-wrong-route', 'NW1\\.S-a-resolve-commit-never-changes', [
+        { from: '            entries[routeKey] = {\n                projection: structuredClone(projection),', to: "            entries[`${routeKey}-x`] = {\n                projection: structuredClone(projection)," }]),
+    'ms39b-the-resolve-invariant-check-is-skipped': slotsMutant('ms39b-the-resolve-invariant-check-is-skipped', 'NW1\\.S-a-resolve-commit-never-changes', [
+        { from: '    if (after.revision !== evaluation.revision) {', to: '    if (false) {' }]),
+    'ms59-stale-entries-are-not-retired-by-staging': slotsMutant('ms59-stale-entries-are-not-retired-by-staging', 'NW1\\.S-staging-and-latch-resolution', [
+        { from: '            if (!tupleIsCurrent(entryTuple(entries[routeKey]), generation)) {', to: '            if (false) {' }]),
+    'ms60-a-published-target-does-not-retire-the-superseded-entry': slotsMutant('ms60-a-published-target-does-not-retire-the-superseded-entry', 'NW1\\.S-staging-and-latch-resolution', [
+        { from: '                if (routeNowTargeted(slot, routeKey, generation)) supersedeEntry(routeKey, slot);\n', to: '' }]),
     'ms36-the-validator-accepts-a-shared-run-id-and-a-missing-startup-grace': { name: 'ms36-the-validator-accepts-a-shared-run-id-and-a-missing-startup-grace', file: STORE,
         kill: kill(SLOTS_TEST, 'NW1\\.S-frozen-v1-slot-schema'),
         patches: [

@@ -116,7 +116,7 @@ function storeSnapshot(paths, fsApi, cache) {
 
 // ---------------------------------------------------------------- applicability
 
-function routeIsTargetLess(route) {
+export function routeIsTargetLess(route) {
     if (!route || typeof route !== 'object') return false;
     const hostPort = Number(route.hostPort);
     if (Number.isSafeInteger(hostPort) && hostPort >= 1 && hostPort <= 65535) return false;
@@ -127,7 +127,7 @@ function routeIsTargetLess(route) {
 
 // The captured generation names the identity's exact tuple on the route's own
 // container, and that route carries no runtime target.
-function identityApplies({ key, instanceId, enableGeneration }, routeKey, generation) {
+export function identityApplies({ key, instanceId, enableGeneration }, routeKey, generation) {
     const agent = generation?.agents?.[key];
     const route = generation?.routing?.routes?.[routeKey];
     return Boolean(agent && route)
@@ -299,7 +299,25 @@ export function resolveEffectiveHardwareAvailability({
     fsApi = fs,
     cache = DEFAULT_CACHE,
 } = {}) {
-    const store = storeSnapshot(paths, fsApi, cache);
+    return evaluateHardwareAvailabilityOfStore({
+        store: storeSnapshot(paths, fsApi, cache), generation, paths, runningDir, nowMs, fsApi, cache,
+    });
+}
+
+/**
+ * The pure evaluation of one given store snapshot (`{ state, revision, entries, slots }`) against one
+ * generation. The resolver is this evaluation of the snapshot it reads; the staging planner evaluates the
+ * snapshot it read and the one it plans to commit with the same code, so applicability is never forked.
+ */
+export function evaluateHardwareAvailabilityOfStore({
+    store,
+    generation,
+    paths,
+    runningDir = path.join(paths.ploinkyDir, 'running'),
+    nowMs = Date.now(),
+    fsApi = fs,
+    cache = DEFAULT_CACHE,
+} = {}) {
     const denials = new Map();
     const projections = new Map();
     const slots = new Map();

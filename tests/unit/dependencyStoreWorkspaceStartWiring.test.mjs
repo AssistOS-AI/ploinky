@@ -173,6 +173,9 @@ function startFixture(t) {
         verifyMpsRuntimeReady: async () => {},
         acknowledgeMpsRuntimeReady: async () => {},
         writeNoWaitHardwareOutcome: () => {},
+        // Start's no-wait availability slot staging (M-NW-01 D2-S): recorded here, exercised against the real store in noWaitAvailabilitySlots.test.mjs.
+        stageNoWaitAvailabilitySlots: async (options) => { calls.push(['stageSlots', options]); },
+        resolveNoWaitBarrierTimeouts: () => ({ startupGraceMs: 7000 }),
         summarizeStartResult,
         printStartResultSummary: () => {},
     };
@@ -285,4 +288,85 @@ test('ensureAgentService keeps a prepared registry record only when asked to pre
     assert.equal(rotated.start.ok, false, JSON.stringify(rotated.start));
     assert.equal(rotated.start.code, 'EDGE_PREPARATION_BUSY', rotated.start.message);
     assert.deepEqual(Object.keys(other.engine.state().containers), [], 'no runtime was launched');
+});
+
+
+// ---------------------------------------------------------------- M-NW-01 D2-S: where start stages its availability slots
+
+// A start with one deferred (no-wait) run. Real files in the no-wait directory; every collaborator that would create a worker is a recorder.
+function noWaitStart(t, { stage } = {}) {
+    const fixture = startFixture(t);
+    const { collaborators, calls } = fixture;
+    const runId = '11111111-2222-4333-8444-555555555555';
+    const noWaitDir = path.join(collaborators.RUNNING_DIR, 'no-wait');
+    const canonical = path.join(noWaitDir, `${CONTAINER}.json`);
+    const freshStatus = path.join(noWaitDir, `${CONTAINER}.${runId}.json`);
+    const entry = {
+        node: { id: 'repo/demo' }, registryName: CONTAINER, waveIndex: 0, runId, runStartedAtMs: 1_700_000_000_000,
+        statusFile: freshStatus,
+        identity: { containerName: CONTAINER, routeKey: 'demo', runId, statusFile: path.basename(freshStatus) },
+    };
+    const recording = { ...fs, unlinkSync: (target) => { calls.push(['unlink', target]); return fs.unlinkSync(target); } };
+    Object.assign(collaborators, {
+        fs: recording,
+        buildNoWaitLaunchSchedule: () => [[entry]],
+        ensureVerifiedProducerDirectory: ({ trustedRoot, relativeSegments }) => { fs.mkdirSync(path.join(trustedRoot, ...relativeSegments), { recursive: true }); },
+        spawnNoWaitWorker: async (options) => { calls.push(['spawn', options.statusFile]); return { pid: 4242, logFile: '/log', statusFile: options.statusFile }; },
+        writeNoWaitSpawnFailure: () => { calls.push(['spawnFailureStatus']); },
+        sanitizeDiagnosticText: (value) => String(value),
+        stageNoWaitAvailabilitySlots: async (options) => { calls.push(['stageSlots', options]); if (stage) await stage(options); },
+    });
+    fs.mkdirSync(noWaitDir, { recursive: true });
+    return { ...fixture, entry, noWaitDir, canonical, freshStatus, runId, calls };
+}
+
+test('NW1.S-start-status-clearing-touches-only-canonical-and-this-runs-fresh-paths', async (t) => {
+    const fixture = noWaitStart(t);
+    const olderRun = '99999999-8888-4777-a666-555555555555';
+    const keep = {
+        olderRunStatus: path.join(fixture.noWaitDir, `${CONTAINER}.${olderRun}.json`),
+        otherCanonical: path.join(fixture.noWaitDir, 'ploinky_repo_other.json'),
+        marker: path.join(fixture.noWaitDir, `${CONTAINER}.current.json`),
+        log: path.join(fixture.noWaitDir, `${CONTAINER}.log`),
+    };
+    for (const file of Object.values(keep)) fs.writeFileSync(file, `keep ${path.basename(file)}`);
+    fs.writeFileSync(fixture.canonical, 'canonical');
+    fs.writeFileSync(fixture.freshStatus, 'fresh');
+    await sandbox(fixture.collaborators)('repo/demo', '8080', {});
+    const unlinked = fixture.calls.filter(([name]) => name === 'unlink').map(([, target]) => target).sort();
+    assert.deepEqual(unlinked, [fixture.canonical, fixture.freshStatus].sort(), 'start unlinks exactly the canonical status and this run\'s fresh path');
+    assert.equal(fs.existsSync(fixture.canonical) || fs.existsSync(fixture.freshStatus), false);
+    for (const [label, file] of Object.entries(keep)) assert.equal(fs.readFileSync(file, 'utf8'), `keep ${path.basename(file)}`, `${label} is untouched`);
+});
+
+test('NW1.S-slots-are-committed-before-any-marker-or-spawn-and-a-failed-slot-commit-aborts-the-start', async (t) => {
+    // Ordering: after the statuses are cleared, before the first spawn; with the identity the store needs.
+    {
+        const fixture = noWaitStart(t);
+        await sandbox(fixture.collaborators)('repo/demo', '8080', {});
+        const names = fixture.calls.map(([name]) => name);
+        assert.ok(names.includes('unlink') && names.includes('stageSlots') && names.includes('spawn'));
+        assert.ok(names.lastIndexOf('unlink') < names.indexOf('stageSlots'), 'slots are staged after the statuses are cleared');
+        assert.ok(names.indexOf('stageSlots') < names.indexOf('spawn'), 'and before any worker is spawned');
+        assert.equal(names.filter((name) => name === 'stageSlots').length, 1, 'one staging commit per start');
+        const [, options] = fixture.calls.find(([name]) => name === 'stageSlots');
+        assert.equal(options.workspaceRoot, fixture.collaborators.PLOINKY_WORKSPACE_ROOT);
+        assert.equal(options.startupGraceMs, 7000, 'startupGraceMs comes from the start process\'s barrier timeouts');
+        assert.equal(options.schedule.flat()[0], fixture.entry, 'the bound schedule of this run');
+        assert.equal(options.isParentKnown(fixture.entry), false);
+    }
+    // A failed slot commit aborts the start naming the commit; no worker, no marker, no status for the run.
+    {
+        let fail = true;
+        const fixture = noWaitStart(t, { stage: async () => { if (fail) throw new Error('store is full'); } });
+        await assert.rejects(sandbox(fixture.collaborators)('repo/demo', '8080', {}), /start \(workspace\) failed: store is full/);
+        const names = fixture.calls.map(([name]) => name);
+        assert.ok(names.includes('stageSlots'));
+        for (const forbidden of ['spawn', 'spawnFailureStatus']) assert.equal(names.includes(forbidden), false, `${forbidden} must not run after a failed slot commit`);
+        // The next start succeeds.
+        fail = false;
+        fixture.calls.length = 0;
+        await sandbox(fixture.collaborators)('repo/demo', '8080', {});
+        assert.ok(fixture.calls.some(([name]) => name === 'spawn'), 'the next start spawns');
+    }
 });

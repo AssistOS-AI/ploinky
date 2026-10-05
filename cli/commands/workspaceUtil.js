@@ -31,6 +31,8 @@ import { inspectExactContainer, removeExactRegisteredContainer } from '../sandbo
 import { observeSandboxRuntime, registeredRuntimeTuple } from '../sandbox/bwrap/bwrapFleet.js';
 import * as inputState from './inputState.js';
 import { MAX_NO_WAIT_BARRIER_ENTRIES, MAX_NO_WAIT_WAVE_INDEX } from './noWaitWorker.js';
+import { resolveNoWaitBarrierTimeouts } from './noWaitProtocol.js';
+import { stageNoWaitAvailabilitySlots } from './noWaitAvailabilitySlots.js';
 import {
   noWaitRunScopedLogPath,
   noWaitRunScopedStatusPath,
@@ -3448,6 +3450,15 @@ async function startWorkspace(staticAgentArg, portArg, {
         }
       }
     }
+    // Stage this run's availability slots in ONE store commit, after the statuses are cleared and before any
+    // marker or worker exists: earlier terminal slots are resolved, superseded slots and stale entries are retired,
+    // and each run about to be spawned gets its slot. Parent-known nodes get none. A failure aborts the start here.
+    await stageNoWaitAvailabilitySlots({
+      schedule: noWaitSchedule,
+      isParentKnown: (entry) => Boolean(unavailableOutcome(entry.node.id)),
+      workspaceRoot: PLOINKY_WORKSPACE_ROOT,
+      startupGraceMs: resolveNoWaitBarrierTimeouts().startupGraceMs,
+    });
     for (const wave of noWaitSchedule) {
       for (const entry of wave) {
         const { node, registryName } = entry;
