@@ -4,7 +4,8 @@
 //   configure     record exact candidate/baseline identities and write a config
 //   self-test     run the harness self-tests (no container or network activity)
 //   baseline      run scoped existing suites against the baseline staging copies
-//   offline       run one phase's required tests and affected regressions
+//   offline       run one phase's required tests and affected regressions, one
+//                 child per test file with a per-file deadline (fileDeadlineMs)
 //   prepare-live  write a proposed run manifest for one live block (no engine
 //                 or SSH); mac-cpu, apparatus-cpu, apparatus-core, apparatus-authority,
 //                 apparatus-availability, apparatus-router-controls (its own port pair, 18090/17892),
@@ -58,6 +59,27 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLOINKY_ROOT = path.resolve(HERE, '..', '..');
 const REPORTER = path.join(HERE, 'reporter.mjs');
 const DEFAULT_SUITE_DEADLINE_MS = 20 * 60 * 1000;
+// Offline runs execute one test file per child, serially, each under its own
+// deadline: FILE_BASE_DEADLINE_MS + (registered required cases of that file) *
+// PER_CASE_DEADLINE_MS, capped at MAX_CHILD_DEADLINE_MS. The base equals the
+// former whole-run deadline, so no file gets less time than the whole suite
+// once did. A required case may spawn its guarded leaf twice under a 240 s
+// timeout each (measured mean about 38 s per case), so 300 s per case keeps a
+// margin over that spawn timeout. The cap is the 5 hour limit that
+// runBoundedProcess enforces (liveProcess.mjs). Files run one at a time
+// (concurrency 1): a leaf that measures event-loop gaps must not compete with
+// a parallel file for the CPU.
+export const FILE_BASE_DEADLINE_MS = 20 * 60 * 1000;
+export const PER_CASE_DEADLINE_MS = 300 * 1000;
+export const MAX_CHILD_DEADLINE_MS = 18_000_000;
+export const DEFAULT_DEADLINE_POLICY = Object.freeze({
+    baseMs: FILE_BASE_DEADLINE_MS, perCaseMs: PER_CASE_DEADLINE_MS, maxMs: MAX_CHILD_DEADLINE_MS,
+});
+
+export function fileDeadlineMs(requiredCount, policy = DEFAULT_DEADLINE_POLICY) {
+    if (!Number.isInteger(requiredCount) || requiredCount < 0) throw new Error(`invalid required case count ${requiredCount}`);
+    return Math.min(policy.maxMs, policy.baseMs + requiredCount * policy.perCaseMs);
+}
 const PLAN_PINS = Object.freeze({
     ploinky: '5b3a94a94b4f8fb0ffca4a09a6653ffd3c31aeca',
     explorer: '5867fb66fdb23da88496e2f7e4bcfa7e9d6dd7ba',
@@ -493,6 +515,94 @@ export async function runSuite({
     return { ...evaluation, exitCode: run.exitCode, signal: run.signal, stderrTail: run.stderr.slice(-4096) };
 }
 
+// Run each file in its own child, serially, each with its own events stream
+// and its own deadline (fileDeadlineMs of that file's registered required
+// cases), and aggregate the per-child evaluations into one suite result.
+// Every child is evaluated exactly as a whole-suite run was: a missing,
+// duplicate, failed, skipped or todo required leaf, an incomplete stream, a
+// signal or a deadline in any child fails the aggregate. A file that times out
+// leaves its required leaves 'missing' and the remaining files still run.
+// Required cases whose file is not among `files` are reported 'missing'.
+export async function runSuitePerFile({
+    root,
+    files,
+    runId,
+    childId,
+    eventsPathFor,
+    agentLibDir,
+    extraEnv = {},
+    required = [],
+    baseline = null,
+    knownBaselineFailures = new Map(),
+    preload = null,
+    deadlinePolicy = DEFAULT_DEADLINE_POLICY,
+    run = runSuite,
+    now = () => new Date(),
+    log = null,
+}) {
+    const children = [];
+    const outcomes = new Map();
+    for (const [index, file] of files.entries()) {
+        const fileRequired = required.filter((entry) => entry.file === file);
+        const deadlineMs = fileDeadlineMs(fileRequired.length, deadlinePolicy);
+        const fileChildId = `${childId}.${String(index + 1).padStart(2, '0')}`;
+        const eventsPath = eventsPathFor(file, index);
+        // A stale stream from an earlier run must never stand in for this child's.
+        fs.rmSync(eventsPath, { force: true });
+        const fileBaseline = baseline ? new Map([...baseline].filter(([testId]) => testId.startsWith(`${file}::`))) : null;
+        const startedAt = now();
+        log?.(`[offline] ${fileChildId} start ${file} (${fileRequired.length} required, deadline ${deadlineMs} ms)`);
+        const result = await run({
+            root, files: [file], runId, childId: fileChildId, eventsPath, agentLibDir, extraEnv, deadlineMs,
+            required: fileRequired, baseline: fileBaseline, knownBaselineFailures, preload,
+        });
+        const endedAt = now();
+        log?.(`[offline] ${fileChildId} end ${file} ${result.verdict} signal=${result.signal ?? 'none'} exit=${result.exitCode} after ${endedAt - startedAt} ms`);
+        fileRequired.forEach((entry, position) => outcomes.set(entry, result.cases[position]));
+        children.push({ file, childId: fileChildId, eventsPath, result, record: {
+            file,
+            childId: fileChildId,
+            eventsPath,
+            requiredCases: fileRequired.length,
+            requiredPassed: result.cases.filter((entry) => entry.result === 'pass').length,
+            deadlineMs,
+            startedAt: startedAt.toISOString(),
+            endedAt: endedAt.toISOString(),
+            elapsedMs: endedAt - startedAt,
+            verdict: result.verdict,
+            exitCode: result.exitCode,
+            signal: result.signal,
+            streamComplete: result.streamComplete,
+            discovered: result.discovered,
+            completed: result.completed,
+            problems: result.problems.slice(0, 50),
+        } });
+    }
+    const results = children.map((child) => child.result);
+    const cases = required.map((entry) => outcomes.get(entry)
+        ?? { id: entry.id, file: entry.file, name: entry.name, result: 'missing', reason: 'required leaf was not discovered' });
+    const failedChild = children.find((child) => child.result.exitCode !== 0);
+    return {
+        verdict: results.length > 0 && results.every((result) => result.verdict === 'PASS')
+            && cases.every((entry) => entry.result === 'pass') ? 'PASS' : 'FAIL',
+        streamComplete: results.length > 0 && results.every((result) => result.streamComplete),
+        problems: children.flatMap((child) => child.result.problems.map((problem) => `${child.file}: ${problem}`)),
+        cases,
+        newFailures: results.flatMap((result) => result.newFailures),
+        baselineFailures: results.flatMap((result) => result.baselineFailures),
+        failureSignatures: new Map(results.flatMap((result) => [...result.failureSignatures])),
+        removed: results.flatMap((result) => result.removed),
+        newlySkipped: results.flatMap((result) => result.newlySkipped),
+        discovered: results.reduce((sum, result) => sum + result.discovered, 0),
+        completed: results.reduce((sum, result) => sum + result.completed, 0),
+        inventory: new Map(results.flatMap((result) => [...result.inventory])),
+        exitCode: failedChild ? failedChild.result.exitCode : 0,
+        signal: children.find((child) => child.result.signal)?.result.signal ?? null,
+        children: children.map((child) => child.record),
+        eventsPaths: children.map((child) => child.eventsPath),
+    };
+}
+
 // Explorer's tests import Ploinky as the sibling '../ploinky' of the Explorer
 // root (for example explorer/tests/unit/hardwareLimitsPanel.test.js). Run them
 // in place only when that sibling is exactly the configured Ploinky candidate;
@@ -601,6 +711,7 @@ function buildReport({ runId, command, phase, suites, cases, sources, verdict })
             exitCode: suite.exitCode,
             signal: suite.signal,
             streamComplete: suite.streamComplete,
+            ...(suite.children ? { children: suite.children } : {}),
             discovered: suite.discovered,
             completed: suite.completed,
             problems: suite.problems.slice(0, 200),
@@ -611,7 +722,7 @@ function buildReport({ runId, command, phase, suites, cases, sources, verdict })
         })),
         streamComplete: suites.length > 0 && suites.every((suite) => suite.streamComplete),
         cleanup: { state: 'complete', steps: [], failures: [] },
-        artifacts: suites.map((suite) => suite.eventsPath),
+        artifacts: suites.flatMap((suite) => suite.eventsPaths || [suite.eventsPath]),
     });
 }
 
@@ -699,19 +810,21 @@ async function offlineCommand(options) {
         } catch (error) {
             if (error?.code !== 'ENOENT') throw error;
         }
-        const eventsPath = path.join(config.evidenceRoot, `offline-${phase}-events-${repo}.jsonl`);
+        const eventsPathFor = (file, index) => path.join(config.evidenceRoot,
+            `offline-${phase}-events-${repo}.${String(index + 1).padStart(2, '0')}-${path.basename(file).replace(/[^A-Za-z0-9.-]/g, '-')}.jsonl`);
         const result = existing.length
-            ? await runSuite({
+            ? await runSuitePerFile({
                 root,
                 files: existing,
                 runId: config.runId,
                 childId: `offline-${phase}-${repo}`,
-                eventsPath,
+                eventsPathFor,
                 agentLibDir: repo === 'ploinky' ? agentLibFor(config) : '',
                 required,
                 baseline: inventory,
                 knownBaselineFailures,
                 preload: repo === 'ploinky' ? engineSpawnGuardFor(root) : null,
+                log: (line) => console.error(line),
             })
             : evaluateSuiteRun({ exitCode: 1, eventText: '', files: [], required });
         // The staged Explorer layout is a runner-owned copy; the events file
@@ -721,7 +834,7 @@ async function offlineCommand(options) {
         verifiedSources = verifyCandidateSources(config);
         for (const file of missing) result.problems.push(`required test file is missing: ${file}`);
         if (missing.length) result.verdict = 'FAIL';
-        suites.push({ ...result, repo, files: existing, eventsPath });
+        suites.push({ ...result, repo, files: existing, eventsPaths: result.eventsPaths || [] });
         allCases.push(...result.cases);
     }
     verifiedSources = verifyCandidateSources(config);
