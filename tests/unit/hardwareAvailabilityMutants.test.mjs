@@ -31,6 +31,7 @@ const LEASES_TEST = 'tests/unit/hardwareAvailabilityLeases.test.mjs';
 const OBSERVERS_TEST = 'tests/unit/hardwareAvailabilityObservers.test.mjs';
 const OBSERVER = 'cli/server/noWaitAgentStartupState.js';
 const PROJECTIONS = 'cli/server/hardwareAvailabilityProjections.mjs';
+const PRIVATE_ROUTER = 'cli/server/privateRouter.js';
 const PROBE = 'tests/unit/hardwareAvailabilityEvidenceProbe.mjs';
 const PROBE_TEST = 'tests/unit/hardwareAvailabilityEvidenceProbe.test.mjs';
 const REVISION = '        revision: computeEffectiveRevision(denials),\n';
@@ -71,7 +72,7 @@ export const AVAILABILITY_MUTANTS = Object.freeze({
         patches: [{ from: MISSING_POLICY, to: "directory = { state: 'absent' };" }] },
     'm14-the-reader-returns-empty-on-an-unreadable-store': { name: 'm14-the-reader-returns-empty-on-an-unreadable-store', file: STORE,
         kill: kill(STORE_TEST, 'NW1\\.D1-missing-emptied-or-corrupt-store'),
-        patches: [{ from: "if (directory.state === 'invalid') throw unreadable(paths.availabilityStoreDir, directory.problem);",
+        patches: [{ from: "if (directory.state === 'invalid') throw unreadable(paths.availabilityStoreDir, directory.problem, { transient: directory.io === true });",
             to: "if (directory.state === 'invalid') return deepFreeze({ state: 'absent', revision: HARDWARE_AVAILABILITY_ABSENT_REVISION, entries: {}, slots: {} });" }] },
     'm15-install-over-an-emptied-directory': { name: 'm15-install-over-an-emptied-directory', file: STORE,
         kill: kill(STORE_TEST, 'NW1\\.D1-missing-emptied-or-corrupt-store'),
@@ -168,7 +169,7 @@ export const AVAILABILITY_MUTANTS = Object.freeze({
     // The projection reader fails open again: an unreadable store shows admin and readiness no denial while the Router refuses.
     'ms53-an-unreadable-store-projects-no-denial-to-admin-and-readiness': { name: 'ms53-an-unreadable-store-projects-no-denial-to-admin-and-readiness', file: PROJECTIONS,
         kill: kill(OBSERVERS_TEST, 'NW1\\.S-an-unreadable-or-invalid-store-is-reported'),
-        patches: [{ from: '        return storeUnreadableProjections(active.generation);', to: '        return null;' }] },
+        patches: [{ from: '        if (error?.code === HARDWARE_AVAILABILITY_UNREADABLE) return storeUnreadableProjections(active.generation);', to: '        if (error?.code === HARDWARE_AVAILABILITY_UNREADABLE) return null;' }] },
     // The apply-lock guard of every store mutation: its typeof check, its call, and its throw.
     'ms51a-the-apply-lock-assertion-need-not-be-a-function': { name: 'ms51a-the-apply-lock-assertion-need-not-be-a-function', file: STORE,
         kill: kill(STORE_TEST, 'NW1\\.D1-every-mutation-refuses-with-zero-bytes'),
@@ -183,6 +184,25 @@ export const AVAILABILITY_MUTANTS = Object.freeze({
     'ms51d-the-apply-lock-is-not-bound-to-the-store-paths': { name: 'ms51d-the-apply-lock-is-not-bound-to-the-store-paths', file: 'cli/sandbox/edgeGeneration.js',
         kill: kill(STORE_TEST, 'NW1\\.D1-every-mutation-refuses-with-zero-bytes'),
         patches: [{ from: "    if (!storePaths || typeof storePaths !== 'object' || !STORE_BINDING_KEYS.every((key) => storePaths[key] === lockPaths[key])) {", to: '    if (false) {' }] },
+    // A transient failure of the store read (EMFILE, EIO) is cached under the unchanged store key again.
+    'ms54-a-failed-store-read-is-cached-under-the-unchanged-key': resolverMutant('ms54-a-failed-store-read-is-cached-under-the-unchanged-key', 'NW1\\.S-a-transient-store-read-failure', [
+        { from: "        if (error?.transient === true) cache.stores.delete(paths.availabilityPolicyFile);\n        else cache.stores.set(", to: '        cache.stores.set(' }]),
+    // The probe takes T_f from the worker's log line instead of the status file's validated finishedAtMs.
+    'ms55-the-probe-takes-the-finish-time-from-the-worker-line': { name: 'ms55-the-probe-takes-the-finish-time-from-the-worker-line', file: PROBE,
+        kill: kill(PROBE_TEST, 'NW1\\.S-durable-activation-is-proved'),
+        patches: [{ from: '            tFinMs: statusFinishedAtMs,\n', to: '            tFinMs: report.finishedAtMs,\n' }] },
+    // Administrator and readiness credit comes from the mirror of the observed evaluation, not from the real readers.
+    'ms56-the-probe-credits-admin-and-readiness-from-the-mirror': { name: 'ms56-the-probe-credits-admin-and-readiness-from-the-mirror', file: PROBE,
+        kill: kill(PROBE_TEST, 'NW1\\.S-durable-activation-is-proved'),
+        patches: [{ from: '    receipt.adminReadinessCredited = receipt.realReaders.projectionForRoute === true\n', to: '    receipt.adminReadinessCredited = receipt.mirroredReadiness.ready === false || receipt.realReaders.projectionForRoute === true\n' }] },
+    // A private caller on a lease with no effective availability falls back to the snapshot-only check.
+    'ms57-a-lease-without-effective-availability-falls-back-to-the-snapshot-check': { name: 'ms57-a-lease-without-effective-availability-falls-back-to-the-snapshot-check', file: PRIVATE_ROUTER,
+        kill: kill(OBSERVERS_TEST, 'NW1\\.S-a-lease-without-effective'),
+        patches: [{ from: '    if (plan.lease && !plan.lease.effective) {', to: '    if (false) {' }] },
+    // The projection reader swallows a programming error as "selector unavailable".
+    'ms58-the-projection-reader-swallows-programming-errors': { name: 'ms58-the-projection-reader-swallows-programming-errors', file: PROJECTIONS,
+        kill: kill(OBSERVERS_TEST, 'NW1\\.S-a-lease-without-effective'),
+        patches: [{ from: "        if (typeof error?.code === 'string' && error.code.startsWith('EDGE_')) return null;\n        throw error;", to: '        return null;' }] },
     'ms36-the-validator-accepts-a-shared-run-id-and-a-missing-startup-grace': { name: 'ms36-the-validator-accepts-a-shared-run-id-and-a-missing-startup-grace', file: STORE,
         kill: kill(SLOTS_TEST, 'NW1\\.S-frozen-v1-slot-schema'),
         patches: [

@@ -106,7 +106,10 @@ function storeSnapshot(paths, fsApi, cache) {
         cache.stores.set(paths.availabilityPolicyFile, { key, snapshot });
         return snapshot;
     } catch (error) {
-        cache.stores.set(paths.availabilityPolicyFile, { key, error: { message: String(error?.message || error), code: error?.code } });
+        // Only deterministic content failures are cached under the unchanged key. A failed read (EMFILE, EIO, a
+        // file replaced mid-read) must be read again by the next capture, as the evidence path does.
+        if (error?.transient === true) cache.stores.delete(paths.availabilityPolicyFile);
+        else cache.stores.set(paths.availabilityPolicyFile, { key, error: { message: String(error?.message || error), code: error?.code } });
         throw error;
     }
 }

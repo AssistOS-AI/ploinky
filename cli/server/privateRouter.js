@@ -173,7 +173,12 @@ export function authorizePrivateRoutePlan({ req, plan, body = Buffer.alloc(0), a
     const current = currentEnabledAgentIdentity(plan.snapshot, agentId);
     if (!current || !current.enableGeneration) throw unauthorized('private assertion caller is not currently enabled');
     // A refused or blocked caller keeps no relay authority (plan §9.4).
-    if (plan.lease?.effective
+    // A lease that carries no effective availability cannot prove the caller available: deny. The
+    // snapshot-only check applies only to a plan that has no lease at all.
+    if (plan.lease && !plan.lease.effective) {
+        throw forbidden('private assertion caller cannot be proven available under hardware limits', 'PRIVATE_CALLER_HARDWARE_UNAVAILABLE');
+    }
+    if (plan.lease
         ? identityLeaseHardwareUnavailable(plan.lease, current)
         : identityHardwareUnavailable(plan.snapshot, current)) {
         throw forbidden('private assertion caller is unavailable under hardware limits', 'PRIVATE_CALLER_HARDWARE_UNAVAILABLE');

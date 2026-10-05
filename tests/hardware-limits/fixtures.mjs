@@ -369,6 +369,7 @@ export function buildRequiredCaseManifest() {
             'NW1.S-no-store-denial-arises-without-validated-active-evidence-or-a-committed-entry',
             'NW1.S-entries-apply-only-to-current-target-less-routes-and-yield-to-a-newer-applicable-slot',
             'NW1.S-visible-but-not-durable-evidence-activates',
+            'NW1.S-a-transient-store-read-failure-is-not-cached-under-the-unchanged-store-key',
         ]),
         ...leaves(P, 'p0', unit('hardwareAvailabilityLeases.test.mjs'), [
             'NW1.S-both-lease-families-capture-and-fence-the-effective-revision',
@@ -377,6 +378,7 @@ export function buildRequiredCaseManifest() {
         ...leaves(P, 'p0', unit('hardwareAvailabilityObservers.test.mjs'), [
             'NW1.S-observers-and-transports-agree-in-typed-and-generic-cases',
             'NW1.S-an-unreadable-or-invalid-store-is-reported-by-admin-and-readiness-never-as-no-denials',
+            'NW1.S-a-lease-without-effective-availability-denies-the-private-caller-and-the-projection-reader-rethrows-programming-errors',
         ]),
         ...leaves(P, 'p0', unit('hardwareAvailabilityEvidenceProbe.test.mjs'), [
             'NW1.S-durable-activation-is-proved-without-http-against-the-named-generation',
@@ -415,6 +417,11 @@ export function buildRequiredCaseManifest() {
                 'ms8-the-effective-revision-includes-non-denial-classes',
                 'ms44-durability-is-credited-at-the-rename-despite-a-failed-fsync',
                 'ms45-the-evidence-probe-evaluates-a-different-generation-than-the-selector-names',
+                'ms54-a-failed-store-read-is-cached-under-the-unchanged-key',
+                'ms55-the-probe-takes-the-finish-time-from-the-worker-line',
+                'ms56-the-probe-credits-admin-and-readiness-from-the-mirror',
+                'ms57-a-lease-without-effective-availability-falls-back-to-the-snapshot-check',
+                'ms58-the-projection-reader-swallows-programming-errors',
                 'ms46-the-observer-derives-a-hardware-result-from-a-slotted-runs-status',
                 'ms50a-the-probe-credits-an-observation-outside-the-window',
                 'ms50b-the-probe-skips-the-ctime-cross-check',

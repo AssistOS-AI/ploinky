@@ -129,9 +129,10 @@ test('NW1.S-activation-is-the-run-scoped-rename', (t) => {
     assert.equal(seen.observed, true);
     assert.equal(seen.evaluation.slot.evidenceClass, 'active');
     assertTypedFrom(seen.evaluation.denial, outcome);
-    assert.equal(seen.admin.code, outcome.code);
-    assert.equal(seen.admin.cause, outcome.reason);
-    assert.equal(seen.readiness.ready, false);
+    assert.equal(seen.realReaders.admin.code, outcome.code);
+    assert.equal(seen.realReaders.admin.cause, outcome.reason);
+    assert.equal(seen.realReaders.readiness.ready, false);
+    assert.equal(seen.mirroredAdmin.code, outcome.code);
     // ... and before the rename it saw none: a run staged but not yet activated (nothing written) yields no denial from another process either.
     const quietWorld = makeWorld(t);
     quietWorld.stageSlot('alpha');
@@ -693,4 +694,38 @@ test('NW1.S-visible-but-not-durable-evidence-activates', (t) => {
     const got = evaluate(world);
     assert.equal(got.evidenceClass, 'active');
     assertTypedFrom(got.denial, alphaOutcome());
+});
+
+test('NW1.S-a-transient-store-read-failure-is-not-cached-under-the-unchanged-store-key', (t) => {
+    quiet(t);
+    const world = makeWorld(t);
+    const slot = staged(world);
+    world.writeWorker('alpha', slot, { kind: 'hardware' });
+    const { paths } = world;
+    let failures = 1;
+    const api = { ...fs, constants: fs.constants };
+    api.openSync = (target, flags, mode) => {
+        if (target === paths.availabilityPolicyFile && failures > 0) {
+            failures -= 1;
+            throw fsError('EMFILE', 'too many open files');
+        }
+        return fs.openSync(target, flags, mode);
+    };
+    const cache = fresh();
+    // One EMFILE on policy.json: that capture fails closed with the unreadable code ...
+    assert.throws(() => world.resolve({ cache, fsApi: api }), (error) => error.code === 'HARDWARE_AVAILABILITY_POLICY_UNREADABLE' && error.transient === true);
+    assert.equal(failures, 0, 'the injected failure was consumed');
+    // ... and the next capture, with the same cache and the unchanged store, reads again and gets the normal typed result.
+    const next = world.resolve({ cache, fsApi: api });
+    assert.equal(next.slots.get('alpha').evidenceClass, 'active');
+    assert.equal(next.denials.size, 1);
+    assert.equal(next.store.state, 'valid');
+    // A deterministic content failure is still cached under its key (one read, however many captures).
+    fs.writeFileSync(paths.availabilityPolicyFile, '{"not":"a policy"}');
+    let reads = 0;
+    const counting = { ...fs, constants: fs.constants, openSync: (target, flags, mode) => { if (target === paths.availabilityPolicyFile) reads += 1; return fs.openSync(target, flags, mode); } };
+    for (let index = 0; index < 3; index += 1) {
+        assert.throws(() => world.resolve({ cache, fsApi: counting }), (error) => error.code === 'HARDWARE_AVAILABILITY_POLICY_UNREADABLE' && error.transient !== true);
+    }
+    assert.equal(reads, 1, 'invalid content is read once and its failure cached');
 });

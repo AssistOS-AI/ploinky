@@ -11,6 +11,7 @@
 import crypto from 'node:crypto';
 
 import { loadActiveEdgeRoutingGeneration } from '../sandbox/edgeGeneration.js';
+import { HARDWARE_AVAILABILITY_UNREADABLE } from '../sandbox/hardwareAvailabilityStore.mjs';
 import { buildDirectRefusal } from '../sandbox/hardwareLimits/requestedLimits.mjs';
 import { buildAvailabilityProjection } from './hardwareAvailability.mjs';
 import { resolveEffectiveHardwareAvailability } from './hardwareAvailabilityResolver.mjs';
@@ -52,12 +53,15 @@ export function readStoreAvailabilityProjections(options = {}) {
     let active;
     try {
         active = loadActiveEdgeRoutingGeneration(options);
-    } catch (_) {
-        return null;
+    } catch (error) {
+        // Only the selector/generation-unavailable codes mean "the Router denies on that basis itself".
+        if (typeof error?.code === 'string' && error.code.startsWith('EDGE_')) return null;
+        throw error;
     }
     try {
         return resolveEffectiveHardwareAvailability({ generation: active.generation, paths: active.paths }).projections;
-    } catch (_) {
-        return storeUnreadableProjections(active.generation);
+    } catch (error) {
+        if (error?.code === HARDWARE_AVAILABILITY_UNREADABLE) return storeUnreadableProjections(active.generation);
+        throw error;
     }
 }

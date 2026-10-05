@@ -69,10 +69,13 @@ function availabilityError(message, code, extra = {}) {
     return error;
 }
 
-function unreadable(target, detail) {
+// `transient` marks a failure of the read itself (an I/O error, a file replaced mid-read), as opposed to
+// content that was read and judged invalid: only the latter is deterministic, so only it may be cached.
+function unreadable(target, detail, { transient = false } = {}) {
     return availabilityError(
         `hardware availability store '${target}' is unreadable: ${detail}`,
         HARDWARE_AVAILABILITY_UNREADABLE,
+        transient ? { transient: true } : {},
     );
 }
 
@@ -257,7 +260,7 @@ function readBoundedFile(fsApi, file, maxBytes) {
         stat = fsApi.lstatSync(file);
     } catch (error) {
         if (error?.code === 'ENOENT') return { missing: true };
-        return { problem: `cannot be inspected (${error?.code || 'error'})` };
+        return { problem: `cannot be inspected (${error?.code || 'error'})`, io: true };
     }
     if (stat.isSymbolicLink() || !stat.isFile()) return { problem: 'is not a regular non-symlink file' };
     if (stat.size > maxBytes) return { problem: `exceeds ${maxBytes} bytes` };
@@ -266,7 +269,7 @@ function readBoundedFile(fsApi, file, maxBytes) {
         descriptor = fsApi.openSync(file, fsApi.constants.O_RDONLY | fsApi.constants.O_NOFOLLOW);
         const opened = fsApi.fstatSync(descriptor);
         if (!opened.isFile() || opened.dev !== stat.dev || opened.ino !== stat.ino) {
-            return { problem: 'was replaced while it was read' };
+            return { problem: 'was replaced while it was read', io: true };
         }
         if (opened.size > maxBytes) return { problem: `exceeds ${maxBytes} bytes` };
         const bytes = Buffer.alloc(opened.size);
@@ -276,10 +279,10 @@ function readBoundedFile(fsApi, file, maxBytes) {
             if (count <= 0) break;
             offset += count;
         }
-        if (offset !== bytes.length) return { problem: 'changed size while it was read' };
+        if (offset !== bytes.length) return { problem: 'changed size while it was read', io: true };
         return { bytes, stat: opened };
     } catch (error) {
-        return { problem: `cannot be read (${error?.code || 'error'})` };
+        return { problem: `cannot be read (${error?.code || 'error'})`, io: true };
     } finally {
         if (descriptor !== undefined) {
             try { fsApi.closeSync(descriptor); } catch (_) {}
@@ -302,7 +305,7 @@ function inspectDirectoryKind(fsApi, directory) {
         stat = fsApi.lstatSync(directory);
     } catch (error) {
         if (error?.code === 'ENOENT') return { state: 'absent' };
-        return { state: 'invalid', problem: `cannot be inspected (${error?.code || 'error'})` };
+        return { state: 'invalid', problem: `cannot be inspected (${error?.code || 'error'})`, io: true };
     }
     if (stat.isSymbolicLink() || !stat.isDirectory()) return { state: 'invalid', problem: 'is not a real directory' };
     return { state: 'present' };
@@ -318,7 +321,7 @@ export function inspectHardwareAvailabilityStore({ paths, fsApi = fs } = {}) {
     if (witnessRead.missing) {
         witness = { state: 'absent' };
     } else if (witnessRead.problem) {
-        witness = { state: 'invalid', problem: witnessRead.problem };
+        witness = { state: 'invalid', problem: witnessRead.problem, ...(witnessRead.io ? { io: true } : {}) };
     } else {
         const parsed = parseJson(witnessRead.bytes);
         try {
@@ -339,7 +342,7 @@ export function inspectHardwareAvailabilityStore({ paths, fsApi = fs } = {}) {
         if (policyRead.missing) {
             directory = { state: 'invalid', problem: 'policy.json is missing from an existing store directory' };
         } else if (policyRead.problem) {
-            directory = { state: 'invalid', problem: `policy.json ${policyRead.problem}` };
+            directory = { state: 'invalid', problem: `policy.json ${policyRead.problem}`, ...(policyRead.io ? { io: true } : {}) };
         } else {
             const parsed = parseJson(policyRead.bytes);
             try {
@@ -363,8 +366,8 @@ export function inspectHardwareAvailabilityStore({ paths, fsApi = fs } = {}) {
 export function readHardwareAvailabilityPolicy({ paths, fsApi = fs } = {}) {
     const inspected = inspectHardwareAvailabilityStore({ paths, fsApi });
     const { witness, directory } = inspected;
-    if (witness.state === 'invalid') throw unreadable(paths.availabilityWitnessFile, `witness ${witness.problem}`);
-    if (directory.state === 'invalid') throw unreadable(paths.availabilityStoreDir, directory.problem);
+    if (witness.state === 'invalid') throw unreadable(paths.availabilityWitnessFile, `witness ${witness.problem}`, { transient: witness.io === true });
+    if (directory.state === 'invalid') throw unreadable(paths.availabilityStoreDir, directory.problem, { transient: directory.io === true });
     if (directory.state === 'absent') {
         if (witness.state === 'absent') {
             return deepFreeze({ state: 'absent', revision: HARDWARE_AVAILABILITY_ABSENT_REVISION, entries: {}, slots: {} });
