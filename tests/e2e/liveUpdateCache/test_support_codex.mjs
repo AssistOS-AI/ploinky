@@ -42,7 +42,7 @@ export function manifestFixture() {
         candidate: { root, cliPath: `${root}/bin/ploinky`, apiPath: `${root}/ploinky-box/bin/ploinky-box.mjs`, apiSha256: H('api-source-bytes'),
             branch: 'repair/integrated-20261002', upstream: 'origin/repair/integrated-20261002', commit: candidateCommit, pushedCommit: candidateCommit,
             tree: H('tree').slice(0, 40), clean: true, detached: false, deploymentBranch: 'repair/integrated-20261002', repositories },
-        box: { id: H('box'), imageId: H('box-image'), startedAt: '2026-10-04T11:59:50Z', imageCreatedAt: '2026-10-04T11:00:00Z', activeGeneration: 'current-generation',
+        box: { id: H('box'), name: 'ploinky-box-testexplorerfresh-5c1d9a7e03b2', imageId: H('box-image'), imageRef: 'docker.io/assistos/ploinky-box:candidate-20261004', startedAt: '2026-10-04T11:59:50Z', imageCreatedAt: '2026-10-04T11:00:00Z', activeGeneration: 'current-generation',
             running: true, initialized: true, pendingActivation: false, recoveryBarrier: false },
         engine: { kind: 'podman', path: '/usr/bin/podman', identity: H('engine'), uid, rootless: true, init: true, privileged: false, dockerExcluded: true, gpuWiringIdentity: H('gpu-wiring') },
         graph: [{ name: 'AssistOSExplorer/explorer', repository: 'AssistOSExplorer', noWait: false, externalHealthRequired: true, declaredEnableFlags: [], manifestSha256: H('explorer-manifest') }],

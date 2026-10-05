@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { AcceptanceError, LIMITS, need, parseStrictJson } from './manifest_codex.mjs';
+import { AcceptanceError, LIMITS, need, parseStrictJson, boxName } from './manifest_codex.mjs';
+import { gpuWiringIdentityOf } from './engine_codex.mjs';
 import { runOwnedCommand, buildCommandEnvironment } from './host_command_codex.mjs';
 import { readBoundedRegularFile } from './worker_codex.mjs';
 
@@ -21,9 +22,26 @@ const REPORT_BYTES = LIMITS.readBytes;
 
 export const remainingGateWorkMs = names => names.reduce((sum, name) => sum + GATE_SPECS[name].budgetMs + GATE_WRAPPER_ALLOWANCE_MS, 0);
 
+// The Box contract the repository's own smoke checks need, bound to the manifest of the Box the gate runs against.
+// The Router loopback sign-in is canonicalized to `localhost`, so the browser origin is `localhost`; the host-side Box evidence
+// (`SMOKE_BOX_BASE_URL`) is the exact `127.0.0.1` loopback. SMOKE_PLOINKY_BOX_CONTAINER is the exact container name, never the ID.
+// The GPU-grant expectation is exported only when the manifest binds an actual grant fingerprint (the Box then carries the label).
+const HEX64 = /^[a-f0-9]{64}$/;
+export function boxEnvironment(manifest) {
+    const box = manifest?.box, publication = manifest?.publications?.[0], grant = manifest?.engine?.gpuWiringIdentity;
+    need(box && boxName(box.name) && !HEX64.test(box.name) && box.name !== box.id, 'gate-box-binding');
+    need(typeof box.imageRef === 'string' && box.imageRef !== '' && typeof box.imageId === 'string' && HEX64.test(box.imageId), 'gate-box-binding');
+    need(publication && Number.isSafeInteger(publication.hostPort) && publication.hostPort > 0 && publication.hostPort < 65536, 'gate-box-binding');
+    need(typeof grant === 'string' && HEX64.test(grant), 'gate-box-binding');
+    const env = { SMOKE_PLOINKY_BOX_CONTAINER: box.name, SMOKE_BOX_BASE_URL: `http://127.0.0.1:${publication.hostPort}`, SMOKE_BASE_URL: `http://localhost:${publication.hostPort}`,
+        SMOKE_EXPECT_BOX_IMAGE_REF: box.imageRef, SMOKE_EXPECT_BOX_IMAGE_ID: `sha256:${box.imageId}` };
+    if (grant !== gpuWiringIdentityOf({})) env.SMOKE_BOX_GPU_GRANT = grant;
+    return env;
+}
+
 export function gateEnvironment({ manifest, inputs, gate, runId, artifactDir, processEnv }) {
     const spec = GATE_SPECS[gate]; need(spec, 'gate-unknown');
-    const publication = manifest.publications[0], extra = { SMOKE_BASE_URL: `http://${publication.hostIP}:${publication.hostPort}`, SMOKE_RUN_ID: runId, SMOKE_ARTIFACT_DIR: artifactDir,
+    const extra = { ...boxEnvironment(manifest), SMOKE_RUN_ID: runId, SMOKE_ARTIFACT_DIR: artifactDir,
         SMOKE_WORKSPACE_ROOT: manifest.workspace.path, ...spec.flags };
     if (gate === 'Copilot') Object.assign(extra, { SMOKE_RELEASE_MANIFEST: inputs.releaseManifest, SMOKE_SOURCE_VERIFICATION: 'release' });
     if (gate === 'OnlyOffice') Object.assign(extra, { SMOKE_DEPLOYMENT_MODE: 'box', SMOKE_PLOINKY_BIN: manifest.candidate.cliPath });

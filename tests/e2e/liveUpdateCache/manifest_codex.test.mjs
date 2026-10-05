@@ -18,6 +18,15 @@ test('unknown/missing fields, placeholder identities, uniform fake pins and omit
         const { value } = manifestFixture(); mutate(value); assert.throws(() => validateManifest(value));
     }
 });
+test('the Box carries its exact container name and image reference: missing, ID-shaped, malformed or extra values refuse', () => {
+    const { value: good } = manifestFixture(); assert.match(good.box.name, /^ploinky-box-[a-z0-9][a-z0-9-]{0,200}$/); validateManifest(structuredClone(good));
+    const edge = structuredClone(good); edge.box.name = `ploinky-box-${'a'.repeat(201)}`; validateManifest(edge);
+    for (const mutate of [v => { delete v.box.name; }, v => { v.box.name = v.box.id; }, v => { v.box.name = `/${good.box.name}`; }, v => { v.box.name = 'ploinky-box-'; }, v => { v.box.name = 'ploinky-box--x'; },
+        v => { v.box.name = good.box.name.toUpperCase(); }, v => { v.box.name = `${good.box.name}\n`; }, v => { v.box.name = `ploinky-box-${'a'.repeat(202)}`; }, v => { v.box.name = 'testExplorerFresh'; }, v => { v.box.name = null; },
+        v => { delete v.box.imageRef; }, v => { v.box.imageRef = ''; }, v => { v.box.imageRef = 'x y'; }, v => { v.box.imageRef = 5; }, v => { v.box.extra = 'x'; }]) {
+        const { value } = manifestFixture(); mutate(value); assert.throws(() => validateManifest(value), error => error.code === 'manifest-schema' || error.code === 'live-inputs');
+    }
+});
 test('unpushed/source-map/default fallback laundering, writable source and third publication refuse', () => {
     for (const mutate of [v => { v.candidate.pushedCommit = '0'.repeat(40); }, v => { v.candidate.repositories[0].commit = v.candidate.repositories[1].commit; },
         v => { v.candidate.repositories[1].branch = 'other'; v.candidate.repositories[1].upstream = 'origin/other'; },

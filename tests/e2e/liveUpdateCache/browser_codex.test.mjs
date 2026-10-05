@@ -28,9 +28,9 @@ const expectedLive = manifest => { const candidate = { imageId: manifest.box.ima
 
 test('smoke environment is set before the first smoke import and only names the bound origin, run, artifacts and workspace', async () => {
     const h = build(); const { expected, observed } = expectedLive(h.manifest);
-    assert.deepEqual(smokeEnvironment(h.manifest, 'stem'), { SMOKE_BASE_URL: 'http://127.0.0.1:8080', SMOKE_RUN_ID: 'stem-browser', SMOKE_ARTIFACT_DIR: path.join(h.manifest.evidence.root, 'browser'), SMOKE_WORKSPACE_ROOT: h.manifest.workspace.path });
+    assert.deepEqual(smokeEnvironment(h.manifest, 'stem'), { SMOKE_BASE_URL: 'http://localhost:8080', SMOKE_RUN_ID: 'stem-browser', SMOKE_ARTIFACT_DIR: path.join(h.manifest.evidence.root, 'browser'), SMOKE_WORKSPACE_ROOT: h.manifest.workspace.path });
     const receipt = await h.port.createMarker({ live: observed, expected });
-    assert.equal(receipt.phase, 'U1'); assert.equal(h.imports.length, 1); assert.equal(h.imports[0].env.SMOKE_BASE_URL, 'http://127.0.0.1:8080'); assert.ok(h.imports[0].specifier.endsWith('/tests/smoke/lib/explorer.mjs'));
+    assert.equal(receipt.phase, 'U1'); assert.equal(h.imports.length, 1); assert.equal(h.imports[0].env.SMOKE_BASE_URL, 'http://localhost:8080'); assert.ok(h.imports[0].specifier.endsWith('/tests/smoke/lib/explorer.mjs'));
     assert.ok(h.events.includes('launch:{"headless":true}')); assert.equal(h.port.openContexts(), 1); assert.equal(h.processEnv.SMOKE_WORKSPACE_ROOT, h.manifest.workspace.path);
     assert.deepEqual(Object.keys(h.processEnv).sort(), ['SMOKE_ARTIFACT_DIR', 'SMOKE_BASE_URL', 'SMOKE_RUN_ID', 'SMOKE_WORKSPACE_ROOT']);
 });

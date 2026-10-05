@@ -4,7 +4,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { AcceptanceError, need, LIMITS, word } from './manifest_codex.mjs';
 import { assertLiveBefore } from './contracts_codex.mjs';
 import { runOwnedCommand, buildCommandEnvironment } from './host_command_codex.mjs';
-import { boxInspectArgs, parseBoxInspect, engineInfoArgs, parseEngineInfo, engineIdentityOf, gpuWiringIdentityOf, publicationsId, mountsId,
+import { boxInspectArgs, parseBoxInspect, engineInfoArgs, parseEngineInfo, engineIdentityOf, gpuWiringIdentityOf, gpuGrantLabelValid, publicationsId, mountsId,
     boxExecArgs } from './engine_codex.mjs';
 import { PROBE_SCHEMA, PROBE_LIMITS } from './box_probe_codex.mjs';
 
@@ -101,7 +101,9 @@ export function createLiveObserver({ manifest, deps, statusProof, httpGet = http
             // The Box is created with /dev/fuse and /dev/net/tun; GPU devices appear only under an active grant wiring.
             const gpuWired = gpuWiringIdentityOf({}) !== manifest.engine.gpuWiringIdentity;
             const devicePaths = box.devices.map(device => device?.PathOnHost).sort();
-            need(box.id === manifest.box.id && box.running === true && box.privileged === false && box.init === true && box.user === 'podman' && box.capAdd.length === 0
+            // The container name is read from the same exact-ID inspect and must equal the manifest's, so a gate's SMOKE_PLOINKY_BOX_CONTAINER
+            // names this Box and no other. A present but malformed gpu-grant label is refused rather than read as the absent wiring.
+            need(box.id === manifest.box.id && box.name === manifest.box.name && gpuGrantLabelValid(box) && box.running === true && box.privileged === false && box.init === true && box.user === 'podman' && box.capAdd.length === 0
                 && ['/dev/fuse', '/dev/net/tun'].every(device => devicePaths.includes(device))
                 && devicePaths.every(device => typeof device === 'string' && (['/dev/fuse', '/dev/net/tun'].includes(device) || (gpuWired && /^\/dev\/nvidia[A-Za-z0-9_-]*$/.test(device))))
                 && gpuWiringIdentityOf(box.labels) === manifest.engine.gpuWiringIdentity && box.labels.agentLibFingerprint === manifest.agentLib.fingerprint, 'live-box-contract');

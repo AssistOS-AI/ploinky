@@ -4,7 +4,8 @@ import path from 'node:path';
 import { manifestFixture, installPureGuards } from './test_support_codex.mjs';
 import { createFakeHost } from './fake_host_support_codex.mjs';
 import { createMemoryFs } from './fake_fs_support_codex.mjs';
-import { GATE_SPECS, gateEnvironment, projectReport, createGatePort, remainingGateWorkMs, GATE_WRAPPER_ALLOWANCE_MS } from './gates_codex.mjs';
+import { GATE_SPECS, gateEnvironment, boxEnvironment, projectReport, createGatePort, remainingGateWorkMs, GATE_WRAPPER_ALLOWANCE_MS } from './gates_codex.mjs';
+import { gpuWiringIdentityOf, sha256Hex } from './engine_codex.mjs';
 installPureGuards();
 
 const inputs = { releaseManifest: '/home/skutner/work/release/manifest_codex.json', probeAgentImage: 'x', expectedUpdates: {} };
@@ -22,13 +23,52 @@ test('the three gates are the exact canonical entries with fixed budgets and the
 test('gate environments carry exactly the bound origin, run, flags and allowlisted login settings, and refuse timeout or error overrides', () => {
     const { value: manifest } = manifestFixture(), processEnv = { PATH: '/usr/bin', HOME: '/home/skutner', SMOKE_USERNAME: 'admin', SMOKE_TOTP_SECRET: 'PRIVATE-SENTINEL', NODE_OPTIONS: '--require x', OTHER_SECRET: 'PRIVATE', XDG_RUNTIME_DIR: '/run/user/1000' };
     const env = gate => gateEnvironment({ manifest, inputs, gate, runId: `r-${gate}`, artifactDir: `/e/${gate}`, processEnv });
-    const copilot = env('Copilot'); assert.equal(copilot.SMOKE_RELEASE_MANIFEST, inputs.releaseManifest); assert.equal(copilot.SMOKE_SOURCE_VERIFICATION, 'release'); assert.equal(copilot.SMOKE_BASE_URL, 'http://127.0.0.1:8080');
+    const copilot = env('Copilot'); assert.equal(copilot.SMOKE_RELEASE_MANIFEST, inputs.releaseManifest); assert.equal(copilot.SMOKE_SOURCE_VERIFICATION, 'release'); assert.equal(copilot.SMOKE_BASE_URL, 'http://localhost:8080');
     assert.equal(copilot.SMOKE_USERNAME, 'admin'); assert.equal(copilot.SMOKE_TOTP_SECRET, 'PRIVATE-SENTINEL', 'login settings pass through to the child only'); assert.equal(copilot.NODE_OPTIONS, undefined); assert.equal(copilot.OTHER_SECRET, undefined);
     assert.equal(env('OnlyOffice').SMOKE_ONLYOFFICE, '1'); assert.equal(env('OnlyOffice').SMOKE_PLOINKY_BIN, manifest.candidate.cliPath); assert.equal(env('OnlyOffice').SMOKE_DEPLOYMENT_MODE, 'box');
     const webmeet = env('WebMeet'); assert.equal(webmeet.SMOKE_WEBMEET_HEADLESS, '1'); assert.equal(webmeet.SMOKE_WEBMEET_MEDIA, '1'); assert.equal(webmeet.SMOKE_RELEASE_MANIFEST, undefined);
     for (const name of ['SMOKE_MEDIA_TIMEOUT_MS', 'SMOKE_TEST_TIMEOUT_MS', 'SMOKE_ACTION_TIMEOUT_MS', 'SMOKE_WEBMEET_REFRESH_MAX_WAIT_MS', 'SMOKE_RELAY_TIMEOUT_MS']) assert.throws(() => gateEnvironment({ manifest, inputs, gate: 'WebMeet', runId: 'r', artifactDir: '/e', processEnv: { ...processEnv, [name]: '999999' } }), error => error.code === 'gate-timeout-override', name);
     assert.throws(() => gateEnvironment({ manifest, inputs, gate: 'WebMeet', runId: 'r', artifactDir: '/e', processEnv: { ...processEnv, SMOKE_ALLOW_BROWSER_ERRORS: '1' } }), error => error.code === 'gate-browser-errors-allowed');
     assert.throws(() => gateEnvironment({ manifest, inputs, gate: 'Unknown', runId: 'r', artifactDir: '/e', processEnv }), error => error.code === 'gate-unknown');
+});
+
+// AC-13: the complete Box environment of every gate, for a labelled (active GPU wiring) and an unlabelled Box. One predicate, applied to
+// every gate environment; each mutant of gateEnvironment/boxEnvironment must break it.
+const HEX64 = /^[a-f0-9]{64}$/, LABEL = sha256Hex('fabricated-gpu-grant-fingerprint');
+function boxContract(env, manifest, { labelled }) {
+    const port = manifest.publications[0].hostPort;
+    assert.equal(env.SMOKE_BASE_URL, `http://localhost:${port}`, 'SMOKE_BASE_URL');
+    assert.equal(env.SMOKE_BOX_BASE_URL, `http://127.0.0.1:${port}`, 'SMOKE_BOX_BASE_URL');
+    assert.equal(env.SMOKE_PLOINKY_BOX_CONTAINER, manifest.box.name, 'SMOKE_PLOINKY_BOX_CONTAINER is the container name');
+    assert.doesNotMatch(env.SMOKE_PLOINKY_BOX_CONTAINER, HEX64, 'SMOKE_PLOINKY_BOX_CONTAINER is not the 64-hex ID'); assert.notEqual(env.SMOKE_PLOINKY_BOX_CONTAINER, manifest.box.id);
+    if (labelled) { assert.equal(typeof env.SMOKE_BOX_GPU_GRANT, 'string', 'SMOKE_BOX_GPU_GRANT is set when the label is present'); assert.match(env.SMOKE_BOX_GPU_GRANT, HEX64); assert.equal(env.SMOKE_BOX_GPU_GRANT, LABEL, 'SMOKE_BOX_GPU_GRANT carries the label value'); }
+    else assert.equal(Object.hasOwn(env, 'SMOKE_BOX_GPU_GRANT'), false, 'no SMOKE_BOX_GPU_GRANT without the label');
+    assert.equal(env.SMOKE_EXPECT_BOX_IMAGE_REF, manifest.box.imageRef, 'image ref pin'); assert.equal(env.SMOKE_EXPECT_BOX_IMAGE_ID, `sha256:${manifest.box.imageId}`, 'image ID pin');
+}
+const fabricated = labelled => { const { value } = manifestFixture(); value.engine.gpuWiringIdentity = labelled ? LABEL : gpuWiringIdentityOf({}); return value; };
+
+test('AC-13: every gate environment carries the complete Box contract for a labelled and an unlabelled Box', () => {
+    const processEnv = { PATH: '/usr/bin', HOME: '/home/skutner' };
+    for (const labelled of [true, false]) {
+        const manifest = fabricated(labelled);
+        for (const gate of Object.keys(GATE_SPECS)) boxContract(gateEnvironment({ manifest, inputs, gate, runId: `r-${gate}`, artifactDir: `/e/${gate}`, processEnv }), manifest, { labelled });
+        boxContract(boxEnvironment(manifest), manifest, { labelled });
+    }
+    // A different port is carried through to both origins.
+    const moved = fabricated(false); moved.publications[0].hostPort = 18443; boxContract(gateEnvironment({ manifest: moved, inputs, gate: 'OnlyOffice', runId: 'r', artifactDir: '/e', processEnv }), moved, { labelled: false });
+    // The operator's own environment can neither supply nor override any Box binding.
+    const hostile = { ...processEnv, SMOKE_PLOINKY_BOX_CONTAINER: 'other', SMOKE_BOX_GPU_GRANT: LABEL, SMOKE_BOX_BASE_URL: 'http://evil:1', SMOKE_EXPECT_BOX_IMAGE_ID: 'x' }, plain = fabricated(false);
+    boxContract(gateEnvironment({ manifest: plain, inputs, gate: 'Copilot', runId: 'r', artifactDir: '/e', processEnv: hostile }), plain, { labelled: false });
+});
+
+test('AC-13: a missing, ID-shaped, malformed or ID-equal Box name refuses with gate-box-binding and so do malformed pins', () => {
+    const refuse = mutate => { const manifest = fabricated(false); mutate(manifest); assert.throws(() => gateEnvironment({ manifest, inputs, gate: 'Copilot', runId: 'r', artifactDir: '/e', processEnv: { PATH: '/usr/bin' } }), error => error.code === 'gate-box-binding'); };
+    refuse(m => { delete m.box.name; }); refuse(m => { m.box.name = undefined; }); refuse(m => { m.box.name = m.box.id; }); refuse(m => { m.box.name = sha256Hex('a'); });
+    refuse(m => { m.box.name = 'ploinky-box-'; }); refuse(m => { m.box.name = 'Ploinky-Box-x'; }); refuse(m => { m.box.name = '/ploinky-box-x1'; }); refuse(m => { m.box.name = `ploinky-box-${'a'.repeat(202)}`; });
+    refuse(m => { m.box.name = 'workspace-box'; }); refuse(m => { m.box.name = 7; });
+    refuse(m => { delete m.box.imageRef; }); refuse(m => { m.box.imageRef = ''; }); refuse(m => { m.box.imageId = 'sha256:abc'; });
+    refuse(m => { m.engine.gpuWiringIdentity = 'not-hex'; }); refuse(m => { m.publications = []; }); refuse(m => { m.publications[0].hostPort = 0; });
+    const edge = fabricated(false); edge.box.name = `ploinky-box-${'a'.repeat(201)}`; assert.equal(boxEnvironment(edge).SMOKE_PLOINKY_BOX_CONTAINER, edge.box.name);
 });
 
 test('report projection counts exactly one passed test and never exposes titles, errors or attachments', () => {

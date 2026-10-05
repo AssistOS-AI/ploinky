@@ -19,6 +19,9 @@ export const digest = (value, length = 64) => typeof value === 'string' && new R
 export const absolute = value => typeof value === 'string' && value.length <= 4096 && path.isAbsolute(value)
     && path.normalize(value) === value && !/[\0\r\n]/.test(value) && !placeholder.test(value)
     && !/(?:^|\/)(?:\.codex|\.ssh|\.secrets|\.env)(?:\/|$)/.test(value);
+// The exact outer Box container name (never its 64-hex ID), as observed by the same exact-ID inspect that bound the ID.
+export const BOX_NAME_PATTERN = /^ploinky-box-[a-z0-9][a-z0-9-]{0,200}$/;
+export const boxName = value => typeof value === 'string' && BOX_NAME_PATTERN.test(value);
 const integer = value => Number.isSafeInteger(value) && value >= 0;
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(value);
 const ipv4 = value => typeof value === 'string' && /^(?:\d{1,3}\.){3}\d{1,3}$/.test(value)
@@ -65,8 +68,8 @@ export function validateManifest(value, { nowMs } = {}) {
         if (repo.name === 'ploinky') need(repo.path === c.root && repo.commit === c.commit && repo.upstream === c.upstream, 'ploinky-map-mismatch');
     }
     need(['ploinky', 'AssistOSExplorer', 'AchillesCLI', 'achillesAgentLib'].every(name => names.has(name)), 'repository-map-incomplete');
-    exact(value.box, ['id', 'imageId', 'startedAt', 'imageCreatedAt', 'activeGeneration', 'running', 'initialized', 'pendingActivation', 'recoveryBarrier']);
-    need(digest(value.box.id) && digest(value.box.imageId) && iso(value.box.startedAt) && iso(value.box.imageCreatedAt)
+    exact(value.box, ['id', 'name', 'imageId', 'imageRef', 'startedAt', 'imageCreatedAt', 'activeGeneration', 'running', 'initialized', 'pendingActivation', 'recoveryBarrier']);
+    need(digest(value.box.id) && boxName(value.box.name) && digest(value.box.imageId) && word(value.box.imageRef) && value.box.imageRef.length <= 256 && iso(value.box.startedAt) && iso(value.box.imageCreatedAt)
         && word(value.box.activeGeneration) && value.box.running === true && value.box.initialized === true
         && value.box.pendingActivation === false && value.box.recoveryBarrier === false, 'live-inputs');
     exact(value.engine, ['kind', 'path', 'identity', 'uid', 'rootless', 'init', 'privileged', 'dockerExcluded', 'gpuWiringIdentity']);
