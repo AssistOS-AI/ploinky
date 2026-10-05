@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { assertArtifactRoot, assertExplorerSmokeDirectory, assertMarketplacePrerequisite, inspectDeploymentTarget } from './deployed-prerequisites.mjs';
 
-async function fixture(t) {
+async function fixture(t, { origin = 'http://127.0.0.1:8080' } = {}) {
     const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'deployed-prerequisite-')));
     t.after(() => fs.rm(root, { recursive: true, force: true }));
     const workspace = path.join(root, 'workspace');
@@ -39,7 +39,7 @@ async function fixture(t) {
     const receipt = { gate: 'optional', runId: 'optional-run', directory, cwd,
         command: ['npm', 'run', 'test:optional-agents', '--', '--workers=1', '--retries=0'],
         boxId: box.Id, boxStartedAt: box.State.StartedAt, workspaceRoot: workspace,
-        baseURL: 'http://127.0.0.1:8080', publication: { containerPort: '8080/tcp', hostIp: '127.0.0.1', hostPort: '8080' },
+        baseURL: origin, publication: { containerPort: '8080/tcp', hostIp: '127.0.0.1', hostPort: '8080' },
         startedAt: '2026-09-10T13:01:00.000Z', finishedAt: '2026-09-10T13:01:05.000Z',
         result: 'passed', exitCode: 0, stats };
     const env = { SMOKE_WORKSPACE_ROOT: workspace, SMOKE_BASE_URL: receipt.baseURL,
@@ -56,18 +56,26 @@ async function fixture(t) {
     return { root, workspace, artifacts, cwd, box, report, receipt, env, options, save };
 }
 
-test('completed exact Marketplace proof returns only safe metadata for the current Box', async t => {
-    const f = await fixture(t);
-    f.box.Config = { Env: ['SECRET=must-not-appear'] };
-    const target = await inspectDeploymentTarget(f.options);
-    assert.deepEqual(Object.keys(target).sort(), ['baseURL', 'boxId', 'boxStartedAt', 'publication', 'workspaceRoot']);
-    const proof = await assertMarketplacePrerequisite(f.options);
-    assert.equal(proof.boxId, f.box.Id);
-    assert.equal(proof.receiptPath, f.env.SMOKE_OPTIONAL_GATE_RECEIPT);
-    assert.equal(proof.runId, f.receipt.runId);
-    assert.equal(proof.workspaceRoot, f.workspace);
-    assert.equal(JSON.stringify(proof).includes('must-not-appear'), false);
-});
+const origins = ['http://127.0.0.1:8080', 'http://localhost:8080'];
+const originLabel = origin => `[${new URL(origin).hostname}]`;
+
+for (const origin of origins) {
+    test(`${originLabel(origin)} completed exact Marketplace proof returns only safe metadata for the current Box`, async t => {
+        const f = await fixture(t, { origin });
+        f.box.Config = { Env: ['SECRET=must-not-appear'] };
+        const target = await inspectDeploymentTarget(f.options);
+        assert.deepEqual(Object.keys(target).sort(), ['baseURL', 'boxId', 'boxStartedAt', 'publication', 'workspaceRoot']);
+        assert.equal(target.baseURL, origin);
+        assert.deepEqual(target.publication, { containerPort: '8080/tcp', hostIp: '127.0.0.1', hostPort: '8080' });
+        const proof = await assertMarketplacePrerequisite(f.options);
+        assert.equal(proof.baseURL, origin);
+        assert.equal(proof.boxId, f.box.Id);
+        assert.equal(proof.receiptPath, f.env.SMOKE_OPTIONAL_GATE_RECEIPT);
+        assert.equal(proof.runId, f.receipt.runId);
+        assert.equal(proof.workspaceRoot, f.workspace);
+        assert.equal(JSON.stringify(proof).includes('must-not-appear'), false);
+    });
+}
 
 const invalidProofs = [
     ['in-progress receipt', f => { f.receipt.result = 'running'; delete f.receipt.finishedAt; }, /incomplete or failed/],
@@ -93,6 +101,15 @@ const invalidProofs = [
     ['wrong workspace mount', f => { f.box.Mounts[0].Source = f.artifacts; }, /different workspace/],
     ['wrong receipt workspace', f => { f.receipt.workspaceRoot = f.artifacts; }, /different workspaceRoot/],
     ['wildcard Router publication', f => { f.box.NetworkSettings.Ports['8080/tcp'][0].HostIp = '0.0.0.0'; }, /loopback Router/],
+    ['second live Router binding', f => { f.box.NetworkSettings.Ports['8080/tcp'].push({ HostIp: '::1', HostPort: '8080' }); }, /loopback Router/],
+    ['empty-HostIp (all-interfaces) publication', f => {
+        f.box.NetworkSettings.Ports['8080/tcp'][0].HostIp = '';
+        f.box.HostConfig.PortBindings['8080/tcp'][0].HostIp = '';
+    }, /loopback Router/],
+    ['IPv6-only loopback publication', f => {
+        f.box.NetworkSettings.Ports['8080/tcp'][0].HostIp = '::1';
+        f.box.HostConfig.PortBindings['8080/tcp'][0].HostIp = '::1';
+    }, /loopback Router/],
     ['configured publication differs', f => { f.box.HostConfig.PortBindings['8080/tcp'][0].HostPort = '8089'; }, /loopback Router/],
     ['receipt publication differs', f => { f.receipt.publication.hostPort = '8089'; }, /different publication/],
     ['missing completion time', f => { delete f.receipt.finishedAt; }, /valid timestamp/],
@@ -102,13 +119,15 @@ const invalidProofs = [
     ['missing report duration', f => { delete f.report.stats.duration; delete f.receipt.stats.duration; }, /duration is invalid/],
     ['legacy boolean guard without bound target', f => { delete f.receipt.boxStartedAt; }, /different boxStartedAt/],
 ];
-for (const [name, change, expected] of invalidProofs) {
-    test(`rejects ${name}`, async t => {
-        const f = await fixture(t);
-        change(f);
-        await f.save();
-        await assert.rejects(assertMarketplacePrerequisite(f.options), expected);
-    });
+for (const origin of origins) {
+    for (const [name, change, expected] of invalidProofs) {
+        test(`${originLabel(origin)} rejects ${name}`, async t => {
+            const f = await fixture(t, { origin });
+            change(f);
+            await f.save();
+            await assert.rejects(assertMarketplacePrerequisite(f.options), expected);
+        });
+    }
 }
 
 test('missing receipt is an error before any Box inspection', async t => {
@@ -187,4 +206,64 @@ test('invalid prerequisite stops the real entrypoint before loading Playwright o
     await assert.rejects(fs.access(marker), { code: 'ENOENT' });
     assert.deepEqual(await fs.readdir(f.artifacts), before);
     assert.deepEqual(await fs.readdir(f.workspace), ['.ploinky']);
+});
+
+const rejectedOrigins = ['http://example.com:8080', 'http://127.0.0.2:8080', 'http://[::1]:8080', 'http://0.0.0.0:8080',
+    'http://localhost.:8080', 'http://sub.localhost:8080', 'https://localhost:8080', 'https://127.0.0.1:8080',
+    'http://localhost', 'http://localhost:80', 'http://127.0.0.1', 'http://user:secret@localhost:8080',
+    'http://:secret@localhost:8080', 'http://user@127.0.0.1:8080', 'http://localhost:8080/x', 'http://localhost:8080/?q=1',
+    'http://localhost:8080/#f', 'localhost:8080'];
+for (const value of rejectedOrigins) {
+    test(`[origin] rejects SMOKE_BASE_URL ${value} before Box inspection`, async t => {
+        const f = await fixture(t);
+        let inspected = false;
+        await assert.rejects(inspectDeploymentTarget({ env: { ...f.env, SMOKE_BASE_URL: value },
+            inspectBox: () => { inspected = true; } }), err => {
+            assert.match(err.message, /exact credential-free HTTP loopback origin/);
+            assert.equal(err.message.includes('secret'), false);
+            return true;
+        });
+        assert.equal(inspected, false);
+    });
+}
+
+test('[origin] rejects an unparseable SMOKE_BASE_URL', async t => {
+    const f = await fixture(t);
+    await assert.rejects(inspectDeploymentTarget({ env: { ...f.env, SMOKE_BASE_URL: 'http://' },
+        inspectBox: () => assert.fail('Box inspected') }), /Set a valid SMOKE_BASE_URL/);
+});
+
+for (const origin of origins.map(value => value.replace(':8080', ':8089'))) {
+    test(`${originLabel(origin)} rejects a requested port that the Box does not publish`, async t => {
+        const f = await fixture(t, { origin });
+        f.receipt.publication.hostPort = '8089';
+        await f.save();
+        await assert.rejects(assertMarketplacePrerequisite(f.options), /loopback Router/);
+    });
+}
+
+test('[cross-origin] rejects a localhost receipt under a 127.0.0.1 preflight', async t => {
+    const f = await fixture(t, { origin: 'http://localhost:8080' });
+    f.env.SMOKE_BASE_URL = 'http://127.0.0.1:8080';
+    await assert.rejects(assertMarketplacePrerequisite(f.options), /different baseURL/);
+});
+
+test('[cross-origin] rejects a 127.0.0.1 receipt under a localhost preflight', async t => {
+    const f = await fixture(t, { origin: 'http://127.0.0.1:8080' });
+    f.env.SMOKE_BASE_URL = 'http://localhost:8080';
+    await assert.rejects(assertMarketplacePrerequisite(f.options), /different baseURL/);
+});
+
+test('[cross-origin] rejects a receipt origin with a trailing slash', async t => {
+    const f = await fixture(t, { origin: 'http://localhost:8080' });
+    f.receipt.baseURL = 'http://localhost:8080/';
+    await f.save();
+    await assert.rejects(assertMarketplacePrerequisite(f.options), /different baseURL/);
+});
+
+test('[cross-origin] rejects a receipt origin in another letter case', async t => {
+    const f = await fixture(t, { origin: 'http://localhost:8080' });
+    f.receipt.baseURL = 'http://LOCALHOST:8080';
+    await f.save();
+    await assert.rejects(assertMarketplacePrerequisite(f.options), /different baseURL/);
 });

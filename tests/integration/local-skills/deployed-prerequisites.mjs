@@ -53,7 +53,7 @@ export async function inspectDeploymentTarget({ env = process.env, inspectBox = 
     const workspaceRoot = await directory(required(env, 'SMOKE_WORKSPACE_ROOT'), 'SMOKE_WORKSPACE_ROOT');
     let url;
     try { url = new URL(required(env, 'SMOKE_BASE_URL')); } catch { throw new Error('Set a valid SMOKE_BASE_URL.'); }
-    assert.ok(url.protocol === 'http:' && url.hostname === '127.0.0.1' && url.port
+    assert.ok(url.protocol === 'http:' && ['127.0.0.1', 'localhost'].includes(url.hostname) && url.port
         && !url.username && !url.password && url.pathname === '/' && !url.search && !url.hash,
     'SMOKE_BASE_URL must be an exact credential-free HTTP loopback origin with an explicit port.');
     const container = required(env, 'SMOKE_PLOINKY_BOX_CONTAINER');
