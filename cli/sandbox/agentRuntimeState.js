@@ -152,6 +152,7 @@ function collectAgentRuntimeStates(options = {}) {
             const pid = processRunning ? Number(sandboxPid(containerName, tuple) || record.pid || 0) : 0;
             states.push({
                 ...stoppedRuntimeEntry(containerName, record, runtime),
+                engineRunning: processRunning,
                 state: usableRuntimeState({
                     status: processRunning ? 'running' : 'stopped',
                     running: processRunning,
@@ -165,6 +166,9 @@ function collectAgentRuntimeStates(options = {}) {
             matchedContainers.add(containerName);
             states.push({
                 ...liveEntry,
+                // The engine's own running bit, kept apart from `state.running` (which also needs an active route) and from any later
+                // projection of the state: a reader that must tell a stopped container from one still starting needs it.
+                engineRunning: Boolean(liveEntry.state?.running),
                 agentName: String(record.agentName || liveEntry.agentName || '-'),
                 repoName: String(record.repoName || liveEntry.repoName || '-'),
                 runtime,
@@ -180,7 +184,7 @@ function collectAgentRuntimeStates(options = {}) {
             continue;
         }
 
-        states.push(stoppedRuntimeEntry(containerName, record, runtime));
+        states.push({ ...stoppedRuntimeEntry(containerName, record, runtime), engineRunning: false });
     }
 
     for (const liveEntry of liveContainers) {
@@ -188,6 +192,7 @@ function collectAgentRuntimeStates(options = {}) {
         if (!containerName || matchedContainers.has(containerName)) continue;
         states.push({
             ...liveEntry,
+            engineRunning: Boolean(liveEntry.state?.running),
             runtime: 'container',
             enabled: false,
             state: usableRuntimeState(liveEntry.state, routes, containerName, liveEntry, { ...runtimeContext, liveEntry }),

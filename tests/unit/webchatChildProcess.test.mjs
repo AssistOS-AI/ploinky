@@ -2,6 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createLocalTTYFactory } from '../../cli/server/webchat/tty.js';
 
+// This file runs real login shells on purpose (production `sh -lc` code under test): it opts in to the unit-test spawn guard's name-only login-shell reading.
+process.env.PLOINKY_ENGINE_GUARD_ALLOW_LOGIN_SHELLS = '1';
+
 // global.processKill is normally installed by RoutingServer; provide a no-op so
 // the handle's kill()/dispose() paths don't throw when run in isolation.
 if (typeof global.processKill !== 'function') {

@@ -79,9 +79,18 @@ import {
 import {
     admitManifestRuntimeCapabilities,
     assertRuntimeAdmissionCurrent,
+    createHardwareLaunchGuard,
+    limitsHashReuseReason,
     renderContainerSecurityArgs,
     renderRuntimePolicyArgs,
 } from '../runtimeCapabilities.js';
+import {
+    formatReplacementReason,
+    hashMismatchDetail,
+    limitsHashDetail,
+    logRuntimeReplacement,
+    shortenHashes,
+} from '../runtimeReplacementLog.js';
 import { DEFAULT_AGENT_ENTRY, launchAgentSidecar, readManifestAgentCommand, readManifestStartCommand, splitCommandArgs } from './agentCommands.js';
 import { hasExactAgentHomeLayout, resolveAgentHomeLayout } from './agentHomeLayout.js';
 import { buildAgentShellArgs } from './agentShell.js';
@@ -104,6 +113,14 @@ import {
 } from '../../utils/runtime/controllerStateGuards.js';
 import { deriveAgentPrincipalId } from '../../utils/security/agentIdentity.js';
 import { ensureSharedHostDir, runPostinstallHook } from './agentHooks.js';
+import {
+    authorityHelperPlacementFromContext,
+    cleanupStaleLeaves,
+} from '../hardwareLimits/delegation.mjs';
+import { captureHardwareContext } from '../hardwareLimits/requestedLimits.mjs';
+import { LIMITS_HASH_LABEL } from '../hardwareLimits/resolve.mjs';
+import { readAppliedObservation } from '../hardwareLimits/runtimeState.mjs';
+import { hasMpsLaunch, readMpsLaunch, verifyMpsLaunch, mpsLaunchArgs } from '../hardwareLimits/mpsLaunch.mjs';
 import { bwrapDependencyReuseProblem, ensureBwrapService } from '../bwrap/bwrapServiceManager.js';
 import {
     clearBwrapPidIfExact,
@@ -770,6 +787,24 @@ function buildDefaultPodmanNetworkArgs(platform = process.platform) {
     ];
 }
 
+// Remove only empty libpod-ID leaves under the two owned cgroup parents whose
+// full IDs the engine no longer lists. Without a complete live-ID listing
+// nothing is removed; nonempty or foreign leftovers are reported, never killed.
+function removeStaleHardwareLeaves(runtime) {
+    const listed = spawnSync(runtime, ['ps', '-a', '--no-trunc', '--format', '{{.ID}}'], { encoding: 'utf8', timeout: 10_000 });
+    if (listed.status !== 0 || listed.error) {
+        debugLog('[hardware-limits] stale leaf cleanup skipped: the engine container list is unavailable');
+        return;
+    }
+    try {
+        const liveIds = new Set(String(listed.stdout || '').split(/\s+/).filter((id) => /^[a-f0-9]{64}$/.test(id)));
+        const { retained } = cleanupStaleLeaves({ liveIds });
+        for (const entry of retained) debugLog(`[hardware-limits] stale leaf ${entry.leaf} retained: ${entry.reason}`);
+    } catch (error) {
+        debugLog(`[hardware-limits] stale leaf cleanup failed: ${error?.message || error}`);
+    }
+}
+
 function buildBoxPodmanHostArgs({
     fsApi = fs,
     markerPath,
@@ -1179,6 +1214,47 @@ function manifestUsesHealthProbeBroker(manifest) {
     ));
 }
 
+// The managed control inputs a container is created with. They are part of the
+// environment hash, so every producer (creation, adoption) and every consumer
+// (service reuse, graph reuse) must take them from here.
+function buildManagedControlEnv(manifest) {
+    return Object.freeze({
+        PLOINKY_HEALTH_PROBE_BROKER: manifestUsesHealthProbeBroker(manifest) ? '1' : '0',
+    });
+}
+
+// The ONE construction of a container's environment hash. The label written at
+// creation, the hash expected at managed adoption, the service-level reuse
+// check and the graph reuse check all call it, so they cannot hash different
+// inputs. `runtimeRouterEnv` is the Router endpoint env of an unmanaged start;
+// `generatedRouter` ({ payload, principalId, instanceId, enableGeneration })
+// adds the signed semantic descriptor and identity of a managed network.
+// Security inputs (identity, principal, descriptor semantics and everything
+// computeEnvHash reads from the manifest, profile and secrets) stay in the hash.
+function computeAgentEnvHash(manifest, profileConfig, {
+    agentName,
+    repoName,
+    runtimeNetworkPlan,
+    runtimeRouterEnv = {},
+    generatedRouter = null,
+}, computeEnvHashImpl = computeEnvHash) {
+    const payload = generatedRouter?.payload;
+    return computeEnvHashImpl(manifest, profileConfig, {
+        ...(generatedRouter ? {} : runtimeRouterEnv),
+        ...runtimeNetworkPlan.hashEnv,
+        ...buildManagedControlEnv(manifest),
+        ...(generatedRouter ? {
+            PLOINKY_ROUTER_SEMANTIC_TOPOLOGY_DIGEST: payload.semanticTopologyDigest,
+            PLOINKY_ROUTER_DESCRIPTOR_SCHEMA: payload.schema,
+            PLOINKY_ROUTER_TRANSPORT_VERSION: payload.transportVersion,
+            PLOINKY_ROUTER_LOCAL_STREAMING: payload.localStreaming,
+            PLOINKY_AGENT_PRINCIPAL: generatedRouter.principalId,
+            PLOINKY_AGENT_INSTANCE_ID: generatedRouter.instanceId,
+            PLOINKY_AGENT_ENABLE_GENERATION: generatedRouter.enableGeneration,
+        } : {}),
+    }, { agentName, repoName });
+}
+
 function inspectImageEntrypoint(runtime, image, spawn = spawnSync) {
     const result = spawn(runtime, [
         'image', 'inspect', '--format', '{{json .Config.Entrypoint}}', image,
@@ -1383,17 +1459,87 @@ function containerDependencyReuseProblem({
     }, deps);
 }
 
+/**
+ * The hardware order of one managed agent launch (plan §8.1, §8.3), shared by
+ * every startAgentContainer path: each create argv goes through the launch
+ * guard (hardware input recheck, then the engine prefix) immediately before
+ * the engine create, stale leaves are removed for a hardware-placed agent,
+ * and once `launch` returns the launched (or adopted) runtime, its actual
+ * leaf is read back and the inputs are rechecked before the candidate can be
+ * returned. `launch` receives the guarded create for the managed transaction
+ * or the host/none create.
+ */
+export function runHardwareGuardedLaunch(hardwareLaunch, {
+    placed = false,
+    removeStaleLeaves = () => {},
+    buildCreateArgs,
+    spawnCreate,
+    launch,
+    beforeMutation = () => {},
+}) {
+    const createContainer = (plan, launchState, createOptions) => {
+        beforeMutation();
+        const guarded = hardwareLaunch.createArgs(buildCreateArgs(plan, launchState));
+        if (placed) removeStaleLeaves();
+        return spawnCreate(guarded, launchState, createOptions);
+    };
+    const launched = launch(createContainer);
+    hardwareLaunch.afterLaunch({ containerId: launched.containerId, adopted: launched.adopted === true });
+    return launched;
+}
+
+export function verifyReusableHardwareRuntime(runtimeAdmission, {
+    containerName, containerId, runtime, network, record, key, ref, alias = null, mpsLaunch,
+}, {
+    createGuard = createHardwareLaunchGuard,
+    inactivate = inactivateEdgeRoutingGeneration,
+    removeExact = removeExactGenerationCandidate,
+    query = (command, args) => {
+        const result = spawnSync(command, args, { encoding: 'utf8', timeout: 10_000 });
+        return { ok: result.status === 0 && !result.error, stdout: String(result.stdout || '') };
+    },
+} = {}) {
+    try {
+        createGuard(runtimeAdmission, { key, observationKey: containerName, ref, alias, runtime, query, instanceId: record.instanceId, enableGeneration: record.enableGeneration, mpsLaunch }).afterLaunch({ containerId, adopted: true });
+    } catch (error) {
+        // A reused runtime is still an affected runtime. Revoke authorization
+        // before removing only its captured immutable identity.
+        try { inactivate('hardware-reuse-readback-failed', { preserveSelectedGeneration: true }); } catch (cleanupError) {
+            appendExactCleanupFailure(error, `routing inactivation: ${cleanupError.message}`);
+            throw error;
+        }
+        let exactCleanupPerformed = false;
+        try {
+            const cleanup = removeExact({ containerName, containerId, network, record });
+            exactCleanupPerformed = cleanup?.removed === true || cleanup?.state === 'absent';
+            if (!exactCleanupPerformed) throw new Error('exact reused-runtime removal was not proven');
+        } catch (cleanupError) {
+            appendExactCleanupFailure(error, cleanupError.message);
+        }
+        throw attachRestartCandidate(error, {
+            containerName, containerId, runtimeNetwork: structuredClone(network),
+            registryRecord: structuredClone(record), exactCleanupPerformed,
+        });
+    }
+}
+
 // This private handoff is created only by ensureAgentService and is usable
 // under its still-live lock. Independent service calls get a fresh adapter.
 const SERVICE_NETWORK_LIFECYCLE = Symbol('serviceNetworkLifecycle');
 
+/**
+ * The image a launch creates its container from, and the image identity the dependency installer records. A GPU share
+ * launch creates from the prepared image's immutable ID (the hardware launch capability); the installer identity is the
+ * resolved reference either way.
+ */
+export function selectLaunchImages({ resolvedImage, launch = null } = {}) {
+    return Object.freeze({ image: launch ? launch.imageId : resolvedImage, installerImage: resolvedImage });
+}
+
 function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const repoName = resolveAgentRepositoryName(agentPath);
     const containerName = options.containerName || getAgentContainerName(agentName, repoName);
-    const useHealthProbeBroker = manifestUsesHealthProbeBroker(manifest);
-    const managedControlEnv = Object.freeze({
-        PLOINKY_HEALTH_PROBE_BROKER: useHealthProbeBroker ? '1' : '0',
-    });
+    const managedControlEnv = buildManagedControlEnv(manifest);
     const agentSnapshot = loadAgentsMap();
     const existingRecord = agentSnapshot[containerName] || {};
     const preservePreparedRegistryRecord = assertPreparedRegistryRecordPreservation(
@@ -1409,6 +1555,10 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         throw new Error(`startAgentContainer(${agentName}) requires an exact instanceId and enableGeneration`);
     }
     const adoptManagedRuntimeOnly = options.adoptManagedRuntimeOnly === true;
+    // Hardware refusals name the exact admitted instance (the registry key a
+    // staged candidate belongs to) and its alias, as graph admission does.
+    const hardwareInstanceKey = String(options.hardwareInstanceKey || '') || admittedInstanceKeyFor(containerName);
+    const hardwareAlias = String(options.alias || launchRecord.alias || '');
     // Resolve profile and network as one selection. Explicit CLI and persisted
     // profile names fail closed; only a missing global profile falls back to
     // this manifest's default profile.
@@ -1442,6 +1592,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         profileConfig,
         network: manifestNetwork,
         runtimeKind: 'container',
+        instanceKey: hardwareInstanceKey,
+        alias: hardwareAlias,
     });
     const runtime = getRuntime();
     const llmAdmissionContext = resolveLlmRuntimeAdmissionContext({
@@ -1463,6 +1615,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         runtimeKind: 'container',
         catalogPolicy: llmAdmissionContext.catalogPolicy,
         catalogIdentity: llmAdmissionContext.catalogIdentity,
+        instanceKey: hardwareInstanceKey,
+        alias: hardwareAlias,
     });
     if (options.runtimeAdmission) {
         assertRuntimeAdmissionCurrent(options.runtimeAdmission, {
@@ -1472,6 +1626,20 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             descriptor: runtimeAdmission.descriptor,
         });
     }
+    const hardwareLaunch = createHardwareLaunchGuard(runtimeAdmission, {
+        key: hardwareInstanceKey,
+        observationKey: containerName,
+        mpsLaunch: options.mpsLaunch,
+        ref: `${repoName}/${agentName}`,
+        alias: hardwareAlias || null,
+        runtime,
+        instanceId: runtimeIdentity.instanceId,
+        enableGeneration: runtimeIdentity.enableGeneration,
+        query: (command, queryArgs) => {
+            const result = spawnSync(command, queryArgs, { encoding: 'utf8', timeout: 10_000 });
+            return { ok: result.status === 0 && !result.error, stdout: String(result.stdout || '') };
+        },
+    });
     const instanceName = options.alias || launchRecord.alias || agentName;
     const { raw: explicitAgentCmd } = readManifestAgentCommand(manifest);
     const startCmd = readManifestStartCommand(manifest);
@@ -1537,11 +1705,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         routerPort: options.routerPort,
         networkMode: runtimeNetworkPlan.mode,
     });
-    const envHash = computeEnvHash(manifest, profileConfig, {
-        ...runtimeRouterEnv,
-        ...runtimeNetworkPlan.hashEnv,
-        ...managedControlEnv,
-    }, { agentName, repoName });
+    const envHash = computeAgentEnvHash(manifest, profileConfig, {
+        agentName, repoName, runtimeNetworkPlan, runtimeRouterEnv,
+    });
 
     // LLM runtime opt-in: catalog-driven image, hardware-aware policy, reuse hash.
     // Resolved BEFORE dependency cache prep so the cache uses the selected image.
@@ -1581,6 +1747,15 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     if (!image) {
         throw new Error(`[image] ${agentName}: no container image resolved (manifest container unresolved and no catalog image selected).`);
     }
+
+    // The container is created from the immutable image ID of a GPU share launch; the dependency installer's identity
+    // (runtime-key probe and cache stamp) stays the resolved image reference in every path, so a recreate by ID is not an
+    // "installer image changed" for the cache the reference start prepared.
+    const { image: launchImage, installerImage } = selectLaunchImages({
+        resolvedImage: image,
+        launch: runtimeAdmission.descriptor.hardwareGpu ? readMpsLaunch(options.mpsLaunch, hardwareInstanceKey, runtimeAdmission.descriptor.hardwareGpu) : null,
+    });
+    image = launchImage;
 
     // Get profile mount modes (profile overrides default if provided)
     const {
@@ -1623,7 +1798,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         const admittedDependencies = adoptManagedRuntimeOnly ? admittedDependencyRecord(launchRecord) : null;
         const runtimeKey = adoptManagedRuntimeOnly
             ? (admittedDependencies?.runtimeKey || NO_NODE_RUNTIME_KEY)
-            : detectRuntimeKeyForAgent(manifest, repoName, agentName, profileConfig, image);
+            : detectRuntimeKeyForAgent(manifest, repoName, agentName, profileConfig, installerImage);
         const dependencyPlan = resolveDependencyCachePreparation({
             needsCoreDeps,
             agentHasPackageJson,
@@ -1635,7 +1810,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         }
         if (adoptManagedRuntimeOnly) {
             const problem = containerDependencyReuseProblem({
-                agentName, manifest, profileConfig, record: launchRecord, runtime, image, containerName,
+                agentName, manifest, profileConfig, record: launchRecord, runtime, image: installerImage, containerName,
             });
             if (problem) throw managedAdoptionMismatch(`dependency generation drifted (${problem})`);
             dependencyRecord = admittedDependencies;
@@ -1649,7 +1824,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 family: 'container',
                 runtimeKey,
                 engine: runtime,
-                image,
+                image: installerImage,
                 agentCodePath,
                 registration: containerName,
                 admittedRecord: launchRecord,
@@ -1674,7 +1849,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             dependencyRecord = noCacheDependencyRecord(dependencyPlan.reason, {
                 family: 'container',
                 runtimeKey,
-                imageId: inspectContainerImageId(runtime, image),
+                imageId: inspectContainerImageId(runtime, installerImage),
             });
         }
     } else {
@@ -2050,6 +2225,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     // NODE_PATH is needed because AgentServer.mjs runs from /Agent/server/, not /code/
     // Node.js module resolution walks up from script location, so it won't find /code/node_modules
     args.push('-e', `NODE_PATH=/code/node_modules`);
+    if (runtimeAdmission.descriptor.hardwareGpu) args.push(...mpsLaunchArgs(options.mpsLaunch, hardwareInstanceKey, runtimeAdmission.descriptor.hardwareGpu));
 
     let entrySummary = DEFAULT_AGENT_ENTRY;
     if (!adoptManagedRuntimeOnly) {
@@ -2113,17 +2289,17 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     }
 
     const principalId = deriveAgentPrincipalId(repoName, agentName);
-    const computeSemanticEnvHash = (payload) => computeEnvHash(manifest, profileConfig, {
-        ...runtimeNetworkPlan.hashEnv,
-        ...managedControlEnv,
-        PLOINKY_ROUTER_SEMANTIC_TOPOLOGY_DIGEST: payload.semanticTopologyDigest,
-        PLOINKY_ROUTER_DESCRIPTOR_SCHEMA: payload.schema,
-        PLOINKY_ROUTER_TRANSPORT_VERSION: payload.transportVersion,
-        PLOINKY_ROUTER_LOCAL_STREAMING: payload.localStreaming,
-        PLOINKY_AGENT_PRINCIPAL: principalId,
-        PLOINKY_AGENT_INSTANCE_ID: runtimeIdentity.instanceId,
-        PLOINKY_AGENT_ENABLE_GENERATION: runtimeIdentity.enableGeneration,
-    }, { agentName, repoName });
+    const computeSemanticEnvHash = (payload) => computeAgentEnvHash(manifest, profileConfig, {
+        agentName,
+        repoName,
+        runtimeNetworkPlan,
+        generatedRouter: {
+            payload,
+            principalId,
+            instanceId: runtimeIdentity.instanceId,
+            enableGeneration: runtimeIdentity.enableGeneration,
+        },
+    });
     const prepareGeneratedRouterAttestation = (plan) => {
         if (runtime !== 'podman' || !['default', 'bridge'].includes(plan?.mode)) {
             throw new Error('generated-local Router credentials require the exact verified managed Podman transaction');
@@ -2163,6 +2339,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 nonce,
                 registerObservation,
                 consumeObservation,
+                placement: authorityHelperPlacementFromContext(
+                    captureHardwareContext({ insideBox: isInsideBox(), runtimeKind: 'container' }),
+                ),
             }),
         });
         // The first commit is owned by attestRouterAuthority immediately after
@@ -2391,7 +2570,11 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     if (!adoptManagedRuntimeOnly) {
         console.log(`[start] ${agentName}: ${runtime} create (cwd='${cwd}') -> ${entrySummary}`);
     }
-    const createContainer = (plan, launch, { recordCreatedId = () => {} } = {}) => {
+    // The create argv of one candidate (managed launch state included) and its
+    // create-attempted receipt. runHardwareGuardedLaunch passes it through the
+    // hardware guard before spawnCreate runs the engine create.
+    const buildCreateArgs = (plan, launch) => {
+        if (runtimeAdmission.descriptor.hardwareGpu) verifyMpsLaunch(options.mpsLaunch, hardwareInstanceKey, runtimeAdmission.descriptor.hardwareGpu);
         const createArgs = [...args];
         if (plan?.args?.length) createArgs.splice(1, 0, ...plan.args);
         if (launch) {
@@ -2420,6 +2603,10 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             state: 'preserved-ambiguous',
             inspectionComplete: false,
         });
+        return createArgs;
+    };
+    // The engine create of an argv the hardware guard already produced.
+    const spawnCreate = (createArgs, launch, { recordCreatedId = () => {} } = {}) => {
         // Creation is reached only after the exact predecessor is gone (or was
         // proved absent). Retire its two fixed control-plane artifacts here so
         // shared-filesystem socket projection cannot leak across generations.
@@ -2546,82 +2733,102 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         ensureImagePresent(ROUTER_AUTHORITY_HELPER_IMAGE, { runtime });
     }
     try {
-    if (runtimeNetworkPlan.requiresManagedNetwork) {
-        // Resolve both the target and fixed probe images before the network
-        // transaction. The helper never pulls and never executes target-image
-        // entrypoints, including start-only images without Node.js.
-        if (!adoptManagedRuntimeOnly) ensureImagePresent(image, { runtime });
-        const transaction = {
-            network: manifestNetwork,
-            canonicalAgentId: agentName,
-            instanceKey: effectiveInstanceKey(repoName, agentName, options.alias || ''),
-            containerName,
-            runtimeIdentity,
-            inspectAdoption: inspectGeneratedRouterAdoption,
-            networkLockWaitMs: options.networkLockWaitMs,
-            networkLifecycleCapability: options.networkLifecycleCapability,
-        };
-        const launched = adoptManagedRuntimeOnly
-            ? networkLifecycle.adoptManagedContainerTransaction(transaction)
-            : networkLifecycle.runManagedContainerTransaction({
-                ...transaction,
-                createContainer,
-                prepareLaunch: prepareGeneratedRouterLaunch,
-                preStartLaunch: preStartGeneratedRouterLaunch,
-                postStartLaunch: cleanupGuardMountpointsAfterStart,
-                finalizeLaunch: finalizeGeneratedRouterLaunch,
-                onContainerCreated: recordCreatedIdentity,
-            });
-        if (adoptManagedRuntimeOnly && launched?.adopted !== true) {
-            const mismatch = new Error(
-                `managed candidate '${containerName}' failed exact active-generation adoption: ${String(launched?.reason || 'mismatch')}`,
-            );
-            mismatch.code = 'PLOINKY_SEMANTIC_ADOPTION_MISMATCH';
-            throw mismatch;
-        }
-        launchedContainerId = String(launched?.containerId || '');
-        generatedLaunch = launched?.launch || launched?.adoption?.launch || null;
-        adoptedExistingRuntime = launched?.adopted === true;
-        if (!adoptManagedRuntimeOnly) clearLivenessState(containerName);
-    } else {
-        // All manifest/profile/port/image/mount validation above is complete.
-        // Only now is the old host/none container deliberately replaced.
-        cleanupReceipt = advanceCandidateLifecycle(cleanupReceipt, {
-            phase: 'predecessor-inspected',
-            inspectionComplete: true,
-            ownershipProof: { predecessorRegistryIdentity: true },
-        });
-        // A coordinated same-name replacement rotates the registered tuple
-        // before launch while the container still carries its predecessor's
-        // labels. Prove ownership with the exact pre-rotation record that
-        // ensureAgentService observed, and only for that same container ID.
-        const predecessorRecord = selectPredecessorRemovalRecord(existingRecord, options.predecessorRegistryRecord);
-        const predecessorRemoval = removeContainerForRecreate(
-            runtime,
-            containerName,
-            `startAgentContainer:${agentName}`,
-            predecessorRecord,
-        );
-        cleanupReceipt = advanceCandidateLifecycle(cleanupReceipt, {
-            phase: 'predecessor-removed',
-            predecessorId: String(existingRecord.containerId || ''),
-            ownershipProof: { predecessorRegistryIdentity: true, predecessorRemoved: predecessorRemoval.state },
-        });
-        launchedContainerId = withNetworkLifecycleLock(() => {
-            const createdId = createContainer(unmanagedNetworkLifecyclePlan);
-            return String(networkLifecycle.finalizeContainer(containerName, unmanagedNetworkLifecyclePlan, {
-                network: manifestNetwork,
-                runtimeIdentity,
-                expectedContainerId: createdId,
-                onCreated: recordCreatedIdentity,
-                beforeStart: prepareGuardMountpointCleanupBeforeStart,
-                afterStart: cleanupGuardMountpointsAfterStart,
-            }) || '');
-        }, { waitMs: 15 * 60 * 1000 });
-    }
-    if (!launchedContainerId) {
-        throw new Error(`startAgentContainer(${agentName}) did not capture an immutable container ID`);
-    }
+    // Every create passes through the hardware guard (input recheck, then the
+    // engine prefix) immediately before the engine create; afterwards the
+    // actual leaf is read back (an adopted runtime too) and the inputs are
+    // rechecked before the candidate can be returned for route publication.
+    // A refusal or a stale admission removes this candidate in the cleanup
+    // below.
+    runHardwareGuardedLaunch(hardwareLaunch, {
+        beforeMutation: options.beforeHardwareMutation,
+        placed: Boolean(runtimeAdmission.descriptor.hardwarePlacement),
+        removeStaleLeaves: () => removeStaleHardwareLeaves(runtime),
+        buildCreateArgs,
+        spawnCreate,
+        launch: (createContainer) => {
+            if (runtimeNetworkPlan.requiresManagedNetwork) {
+                // Resolve both the target and fixed probe images before the network
+                // transaction. The helper never pulls and never executes target-image
+                // entrypoints, including start-only images without Node.js.
+                if (!adoptManagedRuntimeOnly) ensureImagePresent(image, { runtime });
+                const transaction = {
+                    network: manifestNetwork,
+                    canonicalAgentId: agentName,
+                    instanceKey: effectiveInstanceKey(repoName, agentName, options.alias || ''),
+                    containerName,
+                    runtimeIdentity,
+                    inspectAdoption: inspectGeneratedRouterAdoption,
+                    networkLockWaitMs: options.networkLockWaitMs,
+                        networkLifecycleCapability: options.networkLifecycleCapability,
+                        beforeDestructiveWork: options.beforeHardwareMutation,
+                };
+                const launched = adoptManagedRuntimeOnly
+                    ? networkLifecycle.adoptManagedContainerTransaction(transaction)
+                    : networkLifecycle.runManagedContainerTransaction({
+                        ...transaction,
+                        createContainer,
+                        prepareLaunch: prepareGeneratedRouterLaunch,
+                        preStartLaunch: preStartGeneratedRouterLaunch,
+                        postStartLaunch: cleanupGuardMountpointsAfterStart,
+                        finalizeLaunch: finalizeGeneratedRouterLaunch,
+                        onContainerCreated: recordCreatedIdentity,
+                        commandPrefix: hardwareLaunch.commandPrefix(),
+                    });
+                if (adoptManagedRuntimeOnly && launched?.adopted !== true) {
+                    const mismatch = new Error(
+                        `managed candidate '${containerName}' failed exact active-generation adoption: ${String(launched?.reason || 'mismatch')}`,
+                    );
+                    mismatch.code = 'PLOINKY_SEMANTIC_ADOPTION_MISMATCH';
+                    throw mismatch;
+                }
+                launchedContainerId = String(launched?.containerId || '');
+                generatedLaunch = launched?.launch || launched?.adoption?.launch || null;
+                adoptedExistingRuntime = launched?.adopted === true;
+                if (!adoptManagedRuntimeOnly) clearLivenessState(containerName);
+            } else {
+                // All manifest/profile/port/image/mount validation above is complete.
+                // Only now is the old host/none container deliberately replaced.
+                options.beforeHardwareMutation?.();
+                cleanupReceipt = advanceCandidateLifecycle(cleanupReceipt, {
+                    phase: 'predecessor-inspected',
+                    inspectionComplete: true,
+                    ownershipProof: { predecessorRegistryIdentity: true },
+                });
+                // A coordinated same-name replacement rotates the registered tuple
+                // before launch while the container still carries its predecessor's
+                // labels. Prove ownership with the exact pre-rotation record that
+                // ensureAgentService observed, and only for that same container ID.
+                const predecessorRecord = selectPredecessorRemovalRecord(existingRecord, options.predecessorRegistryRecord);
+                const predecessorRemoval = removeContainerForRecreate(
+                    runtime,
+                    containerName,
+                    `startAgentContainer:${agentName}`,
+                    predecessorRecord,
+                );
+                cleanupReceipt = advanceCandidateLifecycle(cleanupReceipt, {
+                    phase: 'predecessor-removed',
+                    predecessorId: String(existingRecord.containerId || ''),
+                    ownershipProof: { predecessorRegistryIdentity: true, predecessorRemoved: predecessorRemoval.state },
+                });
+                launchedContainerId = withNetworkLifecycleLock(() => {
+                    const createdId = createContainer(unmanagedNetworkLifecyclePlan);
+                    return String(networkLifecycle.finalizeContainer(containerName, unmanagedNetworkLifecyclePlan, {
+                        network: manifestNetwork,
+                        runtimeIdentity,
+                        expectedContainerId: createdId,
+                        onCreated: recordCreatedIdentity,
+                        beforeStart: prepareGuardMountpointCleanupBeforeStart,
+                        afterStart: cleanupGuardMountpointsAfterStart,
+                        commandPrefix: hardwareLaunch.commandPrefix(),
+                    }) || '');
+                }, { waitMs: 15 * 60 * 1000 });
+            }
+            if (!launchedContainerId) {
+                throw new Error(`startAgentContainer(${agentName}) did not capture an immutable container ID`);
+            }
+            return { containerId: launchedContainerId, adopted: adoptedExistingRuntime };
+        },
+    });
     } catch (error) {
         let exactCleanupPerformed = error?.ploinkyContainerTransaction?.exactCleanupPerformed === true;
         launchedContainerId ||= String(error?.ploinkyContainerTransaction?.containerId || '');
@@ -3086,13 +3293,20 @@ function mintReplacementRuntimeIdentity(existingRecord, uuid = randomUUID) {
     return Object.freeze({ instanceId, enableGeneration });
 }
 
+// The exact admitted instance key behind a runtime container name: a staged
+// replacement candidate (NAME__candidate_<12 hex>) belongs to NAME, the
+// registry key graph admission recorded.
+export function admittedInstanceKeyFor(containerName) {
+    return String(containerName || '').trim().replace(/__candidate_[a-f0-9]{12}$/i, '');
+}
+
 export function replacementCandidateContainerName(containerName, instanceId) {
     const exactContainerName = String(containerName || '').trim();
     const exactInstanceId = String(instanceId || '').trim();
     if (!exactContainerName || !exactInstanceId) {
         throw new Error('replacement candidate naming requires an exact predecessor name and instanceId');
     }
-    const stableBase = exactContainerName.replace(/__candidate_[a-f0-9]{12}$/i, '');
+    const stableBase = admittedInstanceKeyFor(exactContainerName);
     const suffix = createHash('sha256').update(exactInstanceId).digest('hex').slice(0, 12);
     return `${stableBase}__candidate_${suffix}`;
 }
@@ -3346,14 +3560,63 @@ export function assertAgentServiceNotDraining(containerName, {
     }
 }
 
-function ensureAgentService(agentName, manifest, agentPath, options = {}) {
-    if (!options || typeof options !== 'object'
-        || !Object.prototype.hasOwnProperty.call(options, 'routerEndpoint')
-        || options.routerEndpoint === undefined) {
-        const error = new Error('ensureAgentService requires a validated routerEndpoint; pass explicit null for network mode none');
-        error.code = 'PLOINKY_ROUTER_ENDPOINT_REQUIRED';
-        throw error;
-    }
+/**
+ * ensureAgentService's LLM runtime reuse decision (plan §8.3): the reuse probe
+ * receives the same admitted policy (stored overrides included) and the same
+ * resolved selection/hardware as creation, so a limited LLM agent is not
+ * replaced on every start. Returns 'llmReuseHashChanged' or ''.
+ */
+export function serviceLlmReuseReason({
+    runtime,
+    manifest,
+    profileConfig,
+    agentName,
+    alias,
+    containerName,
+    envHash,
+    serviceAdmission,
+    serviceLlmAdmissionContext,
+    env = process.env,
+    agentWorkDirRoot = AGENTS_DATA_DIR,
+    prepareLlmStartupImpl = prepareLlmStartup,
+    getContainerLabelImpl = getContainerLabel,
+}) {
+    const probe = prepareLlmStartupImpl({
+        runtime,
+        manifest,
+        profileConfig,
+        agentName,
+        alias,
+        env,
+        agentWorkDirRoot,
+        manifestEnvNames: [
+            ...getManifestEnvNames(manifest, profileConfig, { forRuntime: true }),
+            ...getExposedNames(manifest, profileConfig, { forRuntime: true }),
+        ],
+        envHash,
+        effectiveNetwork: profileConfig?.network ?? manifest?.network ?? null,
+        writeState: false,
+        createDirectories: false,
+        // Same admitted policy and resolved selection/hardware as creation,
+        // so reuse agrees with it.
+        resolvedSelection: serviceLlmAdmissionContext?.startup?.selection,
+        resolvedHardware: serviceLlmAdmissionContext?.startup?.hardware,
+        admittedRuntimePolicy: serviceAdmission.descriptor.runtimePolicy,
+    });
+    if (!probe.enabled) return '';
+    const currentReuse = getContainerLabelImpl(containerName, 'ploinky.reusehash');
+    return probe.reuseHash && probe.reuseHash !== currentReuse ? 'llmReuseHashChanged' : '';
+}
+
+/**
+ * ensureAgentService's strict admission before any backend selection, lock or
+ * runtime mutation. It takes the exact options ensureAgentService receives;
+ * `admissionContext` (Box marker and hardware context) is supplied only where
+ * the caller already captured them, as graph admission does. A hardware
+ * refusal raised here carries the exact admitted instance key and alias, so
+ * the start contains it like a metadata refusal.
+ */
+export function admitAgentServicePreflight(agentName, manifest, agentPath, options = {}, admissionContext = {}) {
     const preflightRepoName = resolveAgentRepositoryName(agentPath);
     const preflightManifestPath = path.join(agentPath, 'manifest.json');
     const preflightManifestBytes = fs.existsSync(preflightManifestPath)
@@ -3377,6 +3640,12 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         && options.preparedRegistryRecord
         ? options.preparedRegistryRecord
         : mutablePreflightRecord;
+    // Every refusal this admission raises names the exact admitted instance:
+    // the registry key (a staged replacement candidate belongs to it) and
+    // the instance alias, as graph admission records them.
+    const hardwareInstanceKey = String(options.hardwareInstanceKey || '')
+        || (mutablePreflightRecord.type === 'agent' ? preflightContainerName : admittedInstanceKeyFor(preflightContainerName));
+    const hardwareAlias = String(options.alias || preflightRecord.alias || '');
     const preflightProfile = resolveManifestRuntimeProfile(manifest, {
         agentName: `${preflightRepoName}/${agentName}`,
         profileName: options.profileName,
@@ -3394,6 +3663,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         profileConfig: preflightProfile.profileConfig,
         network: preflightProfile.network,
         runtimeKind: 'container',
+        instanceKey: hardwareInstanceKey,
+        alias: hardwareAlias,
+        ...admissionContext,
     });
     const preflightAgentRuntime = getRuntimeForAgent(manifest);
     const preflightRuntimeKind = isSandboxRuntime(preflightAgentRuntime)
@@ -3420,6 +3692,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         runtimeKind: preflightRuntimeKind,
         catalogPolicy: preflightLlmAdmissionContext.catalogPolicy,
         catalogIdentity: preflightLlmAdmissionContext.catalogIdentity,
+        instanceKey: hardwareInstanceKey,
+        alias: hardwareAlias,
+        ...admissionContext,
     });
     if (options.runtimeAdmission) {
         assertRuntimeAdmissionCurrent(options.runtimeAdmission, {
@@ -3428,6 +3703,41 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             runtimeKind: preflightRuntimeKind,
             descriptor: preflightAdmission.descriptor,
         });
+    }
+    return Object.freeze({
+        preflightRepoName,
+        preflightManifestPath,
+        preflightManifestBytes,
+        preflightProfile,
+        preflightAgentRuntime,
+        preflightRuntimeKind,
+        preflightAdmission,
+        hardwareInstanceKey,
+        hardwareAlias,
+    });
+}
+
+function ensureAgentService(agentName, manifest, agentPath, options = {}) {
+    if (!options || typeof options !== 'object'
+        || !Object.prototype.hasOwnProperty.call(options, 'routerEndpoint')
+        || options.routerEndpoint === undefined) {
+        const error = new Error('ensureAgentService requires a validated routerEndpoint; pass explicit null for network mode none');
+        error.code = 'PLOINKY_ROUTER_ENDPOINT_REQUIRED';
+        throw error;
+    }
+    const {
+        preflightRepoName,
+        preflightManifestPath,
+        preflightManifestBytes,
+        preflightAgentRuntime,
+        preflightRuntimeKind,
+        preflightAdmission,
+        hardwareInstanceKey,
+    } = admitAgentServicePreflight(agentName, manifest, agentPath, options);
+    const mpsRecord = loadAgentsMap()[options.containerName || getAgentContainerName(agentName, preflightRepoName)];
+    const appliedMps = mpsRecord?.containerId ? readAppliedObservation(options.containerName || getAgentContainerName(agentName, preflightRepoName), mpsRecord.containerId) : null;
+    if (!hasMpsLaunch(options.mpsLaunch) && (preflightAdmission.descriptor.hardwareGpu || appliedMps?.mpsGeneration)) {
+        return import('../hardwareLimits/mpsLifecycle.mjs').then(({ ensureMpsAgentService }) => ensureMpsAgentService(agentName, manifest, agentPath, options));
     }
     const targetedRestart = normalizeTargetedRestart(options.targetedRestart);
     if (!options.networkLifecycleCapability) {
@@ -3459,6 +3769,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     forceRecreate = options.forceRecreate === true
         || (preflightAgentRuntime === 'seatbelt'
             && Boolean(dependencyRefreshOperation()) && hasAgentPackageJson(agentPath));
+    const forceRecreateCause = options.forceRecreate === true
+        ? String(options.forceRecreateReason || 'requested by the caller')
+        : (forceRecreate ? 'dependency refresh of an agent with a package.json' : '');
     profileNameOverride = options.profileName;
     routerEndpointOverride = options.routerEndpoint;
     if (Object.prototype.hasOwnProperty.call(options, 'routerHost')) {
@@ -3516,6 +3829,8 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         runtimeKind: 'container',
         catalogPolicy: serviceLlmAdmissionContext.catalogPolicy,
         catalogIdentity: serviceLlmAdmissionContext.catalogIdentity,
+        instanceKey: hardwareInstanceKey,
+        alias: aliasOverride || '',
     });
     if (options.runtimeAdmission && preflightRuntimeKind === 'container') {
         assertRuntimeAdmissionCurrent(options.runtimeAdmission, {
@@ -3550,6 +3865,8 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             profileConfig,
             network: manifestNetwork,
             runtimeKind: agentRuntime,
+            instanceKey: hardwareInstanceKey,
+            alias: aliasOverride || '',
         });
     }
     if (agentRuntime === 'bwrap' || agentRuntime === 'seatbelt') {
@@ -3609,6 +3926,14 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                     { agentName, manifest, record: existingRecord, containerName },
                 )) {
                 sandboxRecreateReason = 'dependencyGenerationChanged';
+            }
+            if (anyRuntimeRunning && sandboxRecreateReason) {
+                logRuntimeReplacement(`${repoName}/${agentName}`, formatReplacementReason(
+                    sandboxRecreateReason,
+                    sandboxRecreateReason === 'envHashChanged'
+                        ? hashMismatchDetail('envHash', currentEnvHash, desiredEnvHash)
+                        : (sandboxRecreateReason === 'forceRecreate' ? forceRecreateCause : ''),
+                ));
             }
             const requiresEdgeActivation = Boolean(existingRecord?.type === 'agent' && sandboxRecreateReason);
             if (sandboxRecreateReason && anyRuntimeRunning) {
@@ -3809,11 +4134,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         networkMode: manifestNetwork.mode,
     });
     const runtimeNetworkPlan = buildRuntimeNetworkPlan(runtime, manifestNetwork);
-    const envHashExtra = {
-        ...runtimeRouterEnv,
-        ...runtimeNetworkPlan.hashEnv,
-        PLOINKY_HEALTH_PROBE_BROKER: manifestUsesHealthProbeBroker(manifest) ? '1' : '0',
-    };
+    const computeContainerEnvHash = () => computeAgentEnvHash(manifest, profileConfig, {
+        agentName, repoName, runtimeNetworkPlan, runtimeRouterEnv,
+    });
 
     const { publishArgs: manifestPorts, portMappings } = parseManifestPorts(manifest, profileConfig);
     assertHostPortContract(runtimeNetworkPlan.mode, portMappings);
@@ -3841,6 +4164,8 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     const startCmd = readManifestStartCommand(manifest);
     const withParallelAgent = Boolean(startCmd && explicitAgentCmd);
     let recreateReason = targetedRestart ? 'targetedRestart' : (forceRecreate ? 'forceRecreate' : null);
+    // Secret-free detail for the one replacement line printed below.
+    let recreateDetail = targetedRestart ? '' : forceRecreateCause;
     const requestedEnableGeneration = String(options.enableGeneration || existingRecord.enableGeneration || randomUUID());
     const requestedInstanceId = String(options.instanceId || existingRecord.instanceId || '');
     if (existingRuntimeAtEntry && (!existingRecord.instanceId || !existingRecord.enableGeneration)) {
@@ -3854,10 +4179,11 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     }
 
     if (existingRuntimeAtEntry && !runtimeNetworkPlan.requiresManagedNetwork) {
-        const desired = computeEnvHash(manifest, profileConfig, envHashExtra, { agentName, repoName });
+        const desired = computeContainerEnvHash();
         const current = getContainerLabel(containerName, 'ploinky.envhash');
         if (desired && desired !== current) {
             debugLog(`[ensureAgentService] ${agentName}: env hash changed (current=${current || '<none>'}, desired=${desired.slice(0, 12)}…), recreating container`);
+            if (!recreateReason) recreateDetail = hashMismatchDetail('envHash', current, desired);
             recreateReason ||= 'envHashChanged';
         }
     }
@@ -3869,6 +4195,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         const agentLibProblem = agentLibReuseProblem(existingRecord, agentLibGrant('container'));
         if (agentLibProblem) {
             debugLog(`[ensureAgentService] ${agentName}: ${agentLibProblem}, recreating container`);
+            if (!recreateReason) recreateDetail = shortenHashes(agentLibProblem);
             recreateReason ||= 'agentLibSelectionChanged';
         }
     }
@@ -3894,34 +4221,36 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         }
     }
 
+    // Hardware limits: creation, adoption and reuse compare one admitted
+    // descriptor's limits hash (empty without hardware placement).
+    if (existingRuntimeAtEntry) {
+        const limitsReason = limitsHashReuseReason(serviceAdmission.descriptor, getContainerLabel(containerName, LIMITS_HASH_LABEL));
+        if (limitsReason) {
+            debugLog(`[ensureAgentService] ${agentName}: hardware limits changed, recreating container`);
+            if (!recreateReason) {
+                recreateDetail = limitsHashDetail(serviceAdmission.descriptor, getContainerLabel(containerName, LIMITS_HASH_LABEL));
+            }
+            recreateReason ||= limitsReason;
+        }
+    }
+
     // LLM runtime: include architecture/catalog/digest/policy in reuse comparison.
     if (existingRuntimeAtEntry && isLlmRuntimeManifest(manifest, profileConfig)) {
         try {
-            const desiredEnvHash = computeEnvHash(manifest, profileConfig, envHashExtra, { agentName, repoName });
-            const effectiveNetworkForLlm = profileConfig?.network ?? manifest?.network ?? null;
-            const probe = prepareLlmStartup({
+            const llmReuseReason = serviceLlmReuseReason({
                 runtime,
                 manifest,
                 profileConfig,
                 agentName,
                 alias: aliasOverride,
-                env: process.env,
-                agentWorkDirRoot: AGENTS_DATA_DIR,
-                manifestEnvNames: [
-                    ...getManifestEnvNames(manifest, profileConfig, { forRuntime: true }),
-                    ...getExposedNames(manifest, profileConfig, { forRuntime: true }),
-                ],
-                envHash: desiredEnvHash,
-                effectiveNetwork: effectiveNetworkForLlm,
-                writeState: false,
-                createDirectories: false,
+                containerName,
+                envHash: computeContainerEnvHash(),
+                serviceAdmission,
+                serviceLlmAdmissionContext,
             });
-            if (probe.enabled) {
-                const currentReuse = getContainerLabel(containerName, 'ploinky.reusehash');
-                if (probe.reuseHash && probe.reuseHash !== currentReuse) {
-                    debugLog(`[ensureAgentService] ${agentName}: LLM reuse hash changed (current=${currentReuse || '<none>'}, desired=${probe.reuseHash.slice(0, 12)}…), recreating container`);
-                    recreateReason ||= 'llmReuseHashChanged';
-                }
+            if (llmReuseReason) {
+                debugLog(`[ensureAgentService] ${agentName}: LLM reuse hash changed, recreating container`);
+                recreateReason ||= llmReuseReason;
             }
         } catch (err) {
             debugLog(`[ensureAgentService] ${agentName}: LLM reuse-hash check skipped: ${err?.message || err}`);
@@ -4025,6 +4354,12 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             if (!canReuseExisting) debugLog(`[ensureAgentService] ${agentName}: host/none reuse rejected (${recreateReason})`);
         }
         if (canReuseExisting) {
+            verifyReusableHardwareRuntime(serviceAdmission, {
+                containerName, containerId: reuseInspection.id, runtime,
+                network: manifestNetwork,
+                record: { ...existingRecord, containerId: reuseInspection.id },
+                key: hardwareInstanceKey, ref: `${repoName}/${agentName}`, alias: aliasOverride || null, mpsLaunch: options.mpsLaunch,
+            });
             debugLog(`[ensureAgentService] ${agentName}: returning early (container exists)`);
             if (runtimeNetworkPlan.mode === 'host') {
                 assertHostModeGenerationCapability({
@@ -4057,6 +4392,11 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     }
     if (existingRuntimeAtEntry && !containerExists(containerName)) {
         recreateReason ||= 'runtimeDisappearedAfterInspection';
+    }
+    // Every replacement of an existing runtime says why, once, before the
+    // predecessor is touched. A fresh create (nothing to replace) is silent.
+    if (existingRuntimeAtEntry && recreateReason) {
+        logRuntimeReplacement(`${repoName}/${agentName}`, formatReplacementReason(recreateReason, recreateDetail));
     }
 
     let additionalPorts = [];
@@ -4127,6 +4467,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         try {
             return ensureAgentService(agentName, manifest, agentPath, {
                 ...options,
+                hardwareInstanceKey,
                 containerName: runtimeIdentity.candidateContainerName,
                 forceRecreate: true,
                 preservePreparedRegistryRecord: true,
@@ -4174,6 +4515,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     }
 
     if (targetedRestart) {
+        options.beforeHardwareMutation?.();
         const drainOptions = {
             runtime,
             reason: `coordinated-targeted-restart:${containerName}`,
@@ -4197,6 +4539,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             publish: additionalPorts,
             publishMappings: additionalPortMappings,
             containerName,
+            hardwareInstanceKey,
             alias: aliasOverride,
             profileName: activeProfile,
             profileResolution,
@@ -4210,6 +4553,8 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             reuseStagedMounts: existingRuntimeAtEntry && !recreateReason,
             networkLifecycleCapability: options.networkLifecycleCapability,
             runtimeAdmission: options.runtimeAdmission || serviceAdmission,
+            beforeHardwareMutation: options.beforeHardwareMutation,
+            mpsLaunch: options.mpsLaunch,
             preparedRegistryRecord: launchRecord,
             preservePreparedRegistryRecord,
             preparationLease: options.preparationLease,
@@ -4378,6 +4723,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             });
             return ensureAgentService(agentName, manifest, agentPath, {
                 ...options,
+                hardwareInstanceKey,
                 forceRecreate: true,
                 containerName: rotated.candidateContainerName,
                 preservePreparedRegistryRecord: true,
@@ -4398,37 +4744,25 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 semanticAdoptionRetry: true,
             });
         }
-        let exactCleanupPerformed = error?.ploinkyRestartCandidate?.exactCleanupPerformed === true;
-        const cleanupReceipt = started?.cleanupReceipt
-            || error?.ploinkyRestartCandidate?.cleanupReceipt;
-        const candidateId = String(started?.containerId || error?.ploinkyRestartCandidate?.containerId || '');
-        const candidateRecord = started?.registryRecord || error?.ploinkyRestartCandidate?.registryRecord || {
-            type: 'agent',
-            agentName,
-            repoName,
-            ...(aliasOverride ? { alias: aliasOverride } : {}),
-            instanceId: runtimeIdentity.instanceId,
-            enableGeneration: runtimeIdentity.enableGeneration,
-        };
-        if (!exactCleanupPerformed && candidateId) {
-            try {
-                const cleanup = removeExactGenerationCandidate({
-                    containerName,
-                    containerId: candidateId,
-                    network: manifestNetwork,
-                    record: candidateRecord,
-                });
-                exactCleanupPerformed = cleanup.removed === true || cleanup.state === 'absent';
-            } catch (cleanupError) {
-                appendExactCleanupFailure(error, cleanupError?.message || cleanupError);
-            }
-        }
-        const durableCandidate = started?.durableCandidate || error?.ploinkyRestartCandidate?.durableCandidate;
-        if (exactCleanupPerformed && durableCandidate) {
-            try { retireRuntimeCandidate(durableCandidate); } catch (cleanupError) {
-                appendExactCleanupFailure(error, cleanupError.message);
-            }
-        }
+        const {
+            exactCleanupPerformed,
+            cleanupReceipt,
+            candidateId,
+            candidateRecord,
+            durableCandidate,
+        } = cleanupFailedServiceCandidate(error, {
+            started,
+            containerName,
+            network: manifestNetwork,
+            fallbackRecord: {
+                type: 'agent',
+                agentName,
+                repoName,
+                ...(aliasOverride ? { alias: aliasOverride } : {}),
+                instanceId: runtimeIdentity.instanceId,
+                enableGeneration: runtimeIdentity.enableGeneration,
+            },
+        });
         throw attachRestartCandidate(error, {
             containerName,
             durableCandidate,
@@ -4675,7 +5009,78 @@ export function cleanupExactAgentRuntimeCandidate(candidate) {
 function appendExactCleanupFailure(error, detail) {
     if (error && typeof error === 'object') {
         error.message = `${error.message}; exact candidate cleanup failed: ${detail}`;
+        // Also recorded structurally, so a contained hardware refusal can
+        // never hide a candidate that was left behind.
+        const prior = Array.isArray(error.exactCleanupFailures) ? error.exactCleanupFailures : [];
+        Object.defineProperty(error, 'exactCleanupFailures', {
+            configurable: true,
+            enumerable: false,
+            writable: true,
+            value: [...prior, String(detail)],
+        });
     }
+}
+
+/**
+ * A failed exact-candidate cleanup recorded on a launch error (or its cause
+ * chain): the details and the candidate left behind, or null.
+ */
+export function exactCleanupFailureOf(error) {
+    let current = error;
+    for (let depth = 0; current && typeof current === 'object' && depth < 8; depth += 1) {
+        if (Array.isArray(current.exactCleanupFailures) && current.exactCleanupFailures.length) {
+            const candidate = current.ploinkyRestartCandidate || {};
+            return Object.freeze({
+                details: [...current.exactCleanupFailures],
+                containerName: String(candidate.containerName || ''),
+                containerId: String(candidate.containerId || ''),
+            });
+        }
+        current = current.cause;
+    }
+    return null;
+}
+
+/**
+ * ensureAgentService's cleanup of a failed launch: any candidate the launch
+ * created and did not remove itself (a post-launch refusal of a managed
+ * network candidate, which startAgentContainer leaves to this caller) is
+ * removed through its exact ownership checks, and its durable record is
+ * retired. A failed removal is appended to the error, never dropped.
+ */
+export function cleanupFailedServiceCandidate(error, {
+    started = null,
+    containerName,
+    network,
+    fallbackRecord,
+    removeCandidate = removeExactGenerationCandidate,
+    retireCandidate = retireRuntimeCandidate,
+} = {}) {
+    let exactCleanupPerformed = error?.ploinkyRestartCandidate?.exactCleanupPerformed === true;
+    const cleanupReceipt = started?.cleanupReceipt
+        || error?.ploinkyRestartCandidate?.cleanupReceipt;
+    const candidateId = String(started?.containerId || error?.ploinkyRestartCandidate?.containerId || '');
+    const candidateRecord = started?.registryRecord || error?.ploinkyRestartCandidate?.registryRecord || fallbackRecord;
+    if (!exactCleanupPerformed && candidateId) {
+        try {
+            const cleanup = removeCandidate({
+                containerName,
+                containerId: candidateId,
+                network,
+                record: candidateRecord,
+            });
+            exactCleanupPerformed = cleanup.removed === true || cleanup.state === 'absent';
+        } catch (cleanupError) {
+            appendExactCleanupFailure(error, cleanupError?.message || cleanupError);
+        }
+    }
+    const durableCandidate = started?.durableCandidate || error?.ploinkyRestartCandidate?.durableCandidate;
+    if (exactCleanupPerformed && durableCandidate) {
+        try { retireCandidate(durableCandidate); } catch (cleanupError) {
+            appendExactCleanupFailure(error, cleanupError.message);
+        }
+    }
+    return { exactCleanupPerformed, cleanupReceipt, candidateId, candidateRecord, durableCandidate };
 }
 
 function restartGenerationCapabilityRuntime({
@@ -4841,9 +5246,11 @@ export {
     buildBoxPodmanHostArgs,
     buildDefaultPodmanNetworkArgs,
     buildPodmanStagedTargetMounts,
+    buildManagedControlEnv,
     buildRuntimeNetworkPlan,
     buildRuntimeRouterEnv,
     codeRelativeMountPath,
+    computeAgentEnvHash,
     collectManifestVolumeEntries,
     ensureAgentService,
     ensureManifestVolumeHostPath,

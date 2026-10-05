@@ -81,7 +81,10 @@ test('dependency store lease order: a nested lifecycle call reuses the held leas
 test('dependency store lease order: restart, enable and reinstall take the workspace lease before any maintenance lock', () => {
     const cli = fs.readFileSync(path.join(ROOT, 'cli/commands/cli.js'), 'utf8');
     assert.match(cli, /function withRestartLocks\(containerName, lockOptions, fn\) \{\s*return withHeldOrAcquiredWorkspaceMutationLease\([\s\S]*?\(\) => withMaintenanceLock\(containerName, lockOptions, fn\)/);
-    assert.equal((cli.match(/await withRestartLocks\(containerName, \{/g) || []).length, 3, 'every restart dispatch path');
+    // Two dispatch paths take the restart locks; the exact-instance restart of a container runtime takes the held-or-acquired workspace
+    // lease around the hardware reconcile, which takes the maintenance lock only inside it.
+    assert.equal((cli.match(/await withRestartLocks\(containerName, \{/g) || []).length, 2, 'every other restart dispatch path');
+    assert.match(cli, /await withHeldOrAcquiredWorkspaceMutationLease\(\{ operation: 'exact-agent-restart' \}, \(\) => reconcileExactHardwareInstance\(/);
     assert.equal((cli.match(/withMaintenanceLock\(/g) || []).length, 1, 'no other maintenance lock is taken directly');
     const agents = fs.readFileSync(path.join(ROOT, 'cli/utils/agents.js'), 'utf8');
     const enable = agents.slice(agents.indexOf('export async function enableAgent('));

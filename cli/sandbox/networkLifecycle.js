@@ -18,6 +18,7 @@ import {
     physicalNetworkName,
     workspaceNetworkIdentity,
 } from './networkIdentity.js';
+import { engineCommandArgs } from './hardwareLimits/runtimeCommand.mjs';
 
 export { NETWORK_LABELS, physicalNetworkName, workspaceNetworkIdentity } from './networkIdentity.js';
 
@@ -982,6 +983,9 @@ export function createNetworkLifecycleAdapter({
         beforeStart = null,
         afterStart = null,
         onCreated = null,
+        // Engine-level prefix for a hardware-placed agent's start; empty for
+        // every other container so its command form is unchanged.
+        commandPrefix = [],
     } = {}) {
         const exactLabels = expectedLabels || (network && runtimeIdentity
             ? expectedAgentLabels(identity.hash, networkContractHash(network), runtimeIdentity)
@@ -1021,7 +1025,7 @@ export function createNetworkLifecycleAdapter({
             if (beforeStart) beforeStart({ plan, containerId: ownedContainerId, record: configured });
             let started;
             try {
-                started = execute(['start', ownedContainerId], { inherit: true });
+                started = run(runtime, engineCommandArgs(commandPrefix, ['start', ownedContainerId]), { inherit: true });
             } finally {
                 if (afterStart) afterStart({ plan, containerId: ownedContainerId, record: configured });
             }
@@ -1067,6 +1071,8 @@ export function createNetworkLifecycleAdapter({
         onContainerCreated = null,
         networkLockWaitMs = NETWORK_LOCK_WAIT_MS,
         networkLifecycleCapability,
+        commandPrefix = [],
+        beforeDestructiveWork = null,
     }) {
         if (typeof createContainer !== 'function') throw new Error('managed container transaction requires createContainer');
         if (inspectAdoption !== null && typeof inspectAdoption !== 'function') {
@@ -1105,6 +1111,7 @@ export function createNetworkLifecycleAdapter({
             let plan = null;
             let launch = null;
             try {
+                beforeDestructiveWork?.({ kind: 'prepare-network', containerName });
                 plan = prepareFromPreflight(checked);
                 if (previous && inspectAdoption
                     && hasRequiredLabels(labelsOf(previous), agentLabels)
@@ -1143,6 +1150,7 @@ export function createNetworkLifecycleAdapter({
                     assertRequiredLabels(containerName, labelsOf(current), ownershipLabels);
                     const previousDescriptor = captureGeneratedRouterDescriptorArtifact(current);
                     if (previous?.State?.Running === true || previous?.State?.Status === 'running') {
+                        beforeDestructiveWork?.({ kind: 'stop', containerName, containerId: previousId });
                         const stopped = execute(['stop', previousId]);
                         if (!stopped.ok) {
                             const reconciled = inspectContainer(previousId);
@@ -1163,6 +1171,7 @@ export function createNetworkLifecycleAdapter({
                             );
                         }
                     }
+                    beforeDestructiveWork?.({ kind: 'remove', containerName, containerId: previousId });
                     const removed = execute(['rm', '-f', previousId]);
                     if (!removed.ok && !missing(removed)) {
                         throw new Error(`cannot remove predecessor '${containerName}' for managed replacement: ${failure(removed)}`);
@@ -1205,6 +1214,7 @@ export function createNetworkLifecycleAdapter({
                 const containerId = finalizeContainer(containerName, plan, {
                     expectedContainerId: candidateId,
                     expectedLabels: agentLabels,
+                    commandPrefix,
                     beforeStart: preStartLaunch
                         ? (context) => preStartLaunch({ ...context, launch })
                         : null,
@@ -1482,6 +1492,41 @@ export function createNetworkLifecycleAdapter({
         };
     }
 
+    // The exact recorded runtime without its manifest: the immutable ID, this
+    // workspace's agent ownership labels bound to the container's own network
+    // contract hash, the recorded instance identity labels and the init
+    // reaper. Used where the manifest that would rebuild the expected network
+    // contract can no longer be resolved; anything unproven is not 'exact'.
+    function inspectRecordedAgentRuntime(containerId, { instanceId = '', enableGeneration = '' } = {}) {
+        const exactId = String(containerId || '').trim();
+        if (!/^[a-f0-9]{64}$/.test(exactId)) throw new Error('recorded runtime inspection requires an immutable container ID');
+        const record = inspectContainer(exactId);
+        if (!record) return { state: 'absent', id: null };
+        let id;
+        try { id = containerRecordId(record, exactId); } catch (_) { return { state: 'foreign', id: null }; }
+        if (id !== exactId) return { state: 'foreign', id, reason: 'immutable-id-mismatch' };
+        const labels = labelsOf(record);
+        const contractHash = String(labels?.[NETWORK_LABELS.contract] || '');
+        if (!/^[a-f0-9]{64}$/.test(contractHash) || !hasRequiredLabels(labels, expectedAgentOwnershipLabels(identity.hash, contractHash))) {
+            return { state: 'foreign', id, reason: 'ownership-labels' };
+        }
+        const expectedInstanceId = String(instanceId || '').trim();
+        const expectedEnableGeneration = String(enableGeneration || '').trim();
+        if (!expectedInstanceId || !expectedEnableGeneration
+            || String(labels?.[NETWORK_LABELS.instanceId] || '') !== expectedInstanceId
+            || String(labels?.[NETWORK_LABELS.enableGeneration] || '') !== expectedEnableGeneration) {
+            return { state: 'owned-drift', id, reason: 'runtime-identity' };
+        }
+        if (record?.HostConfig?.Init !== true) return { state: 'owned-drift', id, reason: 'init-reaper' };
+        return {
+            state: 'exact',
+            id,
+            contractHash,
+            labels: { ...labels },
+            running: record.State?.Running === true || record.State?.Status === 'running',
+        };
+    }
+
     function verifyContainerContract(containerName, network, canonicalAgentId, options = {}) {
         return inspectContainerContract(containerName, network, canonicalAgentId, options).state === 'exact';
     }
@@ -1582,6 +1627,7 @@ export function createNetworkLifecycleAdapter({
         runManagedContainerTransaction,
         adoptManagedContainerTransaction,
         inspectContainerContract,
+        inspectRecordedAgentRuntime,
         verifyContainerContract,
         agentIdentityLabelArgs,
         removeExactContainer,

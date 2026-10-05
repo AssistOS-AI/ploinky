@@ -52,6 +52,7 @@ const {
 const { applyManifestDirectives, parseEnableDirective } = bootstrapModule;
 const { computeEnvHash } = await import('../../cli/sandbox/docker/common.js');
 const {
+    buildManagedControlEnv,
     buildRuntimeNetworkPlan,
     buildRuntimeRouterEnv,
 } = await import('../../cli/sandbox/docker/agentServiceManager.js');
@@ -521,7 +522,7 @@ test('blocking none-mode launches pass explicit null without forwarding a raw ro
     }), null);
 
     const source = startWorkspace.toString();
-    const launchStart = source.indexOf('const runtimeResult = ensureAgentService');
+    const launchStart = source.indexOf('const runtimeResult = await ensureAgentService');
     const launchEnd = source.indexOf('const executionMode = resolveAgentExecutionMode', launchStart);
     assert.ok(launchStart >= 0 && launchEnd > launchStart, 'blocking service launch must remain discoverable');
     const launch = source.slice(launchStart, launchEnd);
@@ -1318,6 +1319,9 @@ test('managed runtime hash reconstruction uses the retained signed semantic topo
         profile: {},
         extraEnv: {
             PLOINKY_NETWORK_MODE: 'default',
+            // The shared construction's managed control input, which the
+            // creation label carries (see hardwareLimitsEnvHashConsistency).
+            ...buildManagedControlEnv(node.manifest),
             PLOINKY_HEALTH_PROBE_BROKER: '0',
             PLOINKY_ROUTER_SEMANTIC_TOPOLOGY_DIGEST: 'sha256:semantic-topology',
             PLOINKY_ROUTER_DESCRIPTOR_SCHEMA: 'ploinky.generated-local-router.v1',
@@ -3111,4 +3115,57 @@ fast_graph_cleanup_latched_workspace "$2"
 
     assert.equal(probe.status, 0, probe.stderr || probe.stdout);
     assert.equal(fs.existsSync(workspace), false);
+});
+
+// The product persists the RESOLVED profile on every agent record, which is 'default' for a manifest that declares no
+// profiles, and hands it back as an explicit root profile (hardware Apply does). The graph must resolve it exactly as
+// the profile service does, and keep refusing every other name it does not know.
+test('resolveWorkspaceDependencyGraph resolves an explicit default profile on a manifest that declares no profiles', () => {
+    writeManifest('implicitDefault', 'plain', { container: 'node:20-alpine' });
+    writeManifest('implicitDefault', 'emptyProfiles', { container: 'node:20-alpine', profiles: {} });
+    for (const agent of ['plain', 'emptyProfiles']) {
+        const ref = `implicitDefault/${agent}`;
+        for (const rootProfile of ['default', 'DEFAULT', ' default ']) {
+            const graph = resolveWorkspaceDependencyGraph({ staticAgentRef: ref, rootProfile });
+            assert.equal(graph.nodes.get(ref).profile, 'default', `${agent} with '${rootProfile}'`);
+        }
+        assert.equal(resolveWorkspaceDependencyGraph({ staticAgentRef: ref }).nodes.get(ref).profile, 'default', `${agent}: no profile asked`);
+        // Any other explicit name on such a manifest is still refused, with the same message.
+        assert.throws(() => resolveWorkspaceDependencyGraph({ staticAgentRef: ref, rootProfile: 'gpu' }), new RegExp(`profile 'gpu' is not defined by ${ref}; available profiles: \\(none\\)`));
+    }
+});
+
+test('resolveWorkspaceDependencyGraph keeps refusing an undeclared explicit profile of a manifest that declares profiles', () => {
+    writeManifest('declaredProfiles', 'app', { container: 'node:20-alpine', profiles: { default: {}, dev: {} } });
+    assert.equal(resolveWorkspaceDependencyGraph({ staticAgentRef: 'declaredProfiles/app', rootProfile: 'dev' }).nodes.get('declaredProfiles/app').profile, 'dev');
+    assert.equal(resolveWorkspaceDependencyGraph({ staticAgentRef: 'declaredProfiles/app', rootProfile: 'default' }).nodes.get('declaredProfiles/app').profile, 'default');
+    assert.throws(() => resolveWorkspaceDependencyGraph({ staticAgentRef: 'declaredProfiles/app', rootProfile: 'gpu' }), /profile 'gpu' is not defined by declaredProfiles\/app; available profiles: default, dev/);
+    // Declared profiles without 'default' do not make 'default' implicit.
+    writeManifest('declaredProfiles', 'noDefault', { container: 'node:20-alpine', profiles: { dev: {} } });
+    assert.throws(() => resolveWorkspaceDependencyGraph({ staticAgentRef: 'declaredProfiles/noDefault', rootProfile: 'default' }), /profile 'default' is not defined by declaredProfiles\/noDefault; available profiles: dev/);
+});
+
+test('resolveWorkspaceDependencyGraph resolves an explicit default on a profile-less dependency and refuses another name', () => {
+    writeManifest('depDefault', 'leaf', { container: 'node:20-alpine' });
+    writeManifest('depDefault', 'app', { container: 'node:20-alpine', enable: [{ agent: 'depDefault/leaf', profile: 'default' }] });
+    const graph = resolveWorkspaceDependencyGraph({ staticAgentRef: 'depDefault/app' });
+    assert.equal(graph.nodes.get('depDefault/leaf').profile, 'default');
+    writeManifest('depDefault', 'strict', { container: 'node:20-alpine', enable: [{ agent: 'depDefault/leaf', profile: 'gpu' }] });
+    assert.throws(() => resolveWorkspaceDependencyGraph({ staticAgentRef: 'depDefault/strict' }), /profile 'gpu' is not defined by depDefault\/leaf; available profiles: \(none\)/);
+    // The same dependency reached again with an explicit default agrees with its first resolution (no profile conflict).
+    writeManifest('depDefault', 'twice', { container: 'node:20-alpine', enable: ['depDefault/leaf', { agent: 'depDefault/leaf', profile: 'default' }] });
+    assert.equal(resolveWorkspaceDependencyGraph({ staticAgentRef: 'depDefault/twice' }).nodes.get('depDefault/leaf').profile, 'default');
+});
+
+// The live fixture's shape: a profile-less root that enables two profile-less agents, every registry record carrying the
+// resolved profile 'default' (what the product persists), the root's handed back as an explicit root profile (Apply).
+test('resolveWorkspaceDependencyGraph resolves a profile-less root and the two profile-less agents it enables to default from registry records', () => {
+    for (const name of ['probe', 'peer', 'cpu']) writeManifest('liveShape', name, { container: 'node:20-alpine', ...(name === 'probe' ? { enable: ['liveShape/peer', 'liveShape/cpu'] } : {}) });
+    const record = (name, index) => ({ type: 'agent', repoName: 'liveShape', agentName: name, instanceId: `i-${name}`, enableGeneration: `g-${name}`, containerId: String(index + 1).repeat(64), profile: 'default' });
+    const registry = Object.fromEntries(['probe', 'peer', 'cpu'].map((name, index) => [`ploinky_liveShape_${name}`, record(name, index)]));
+    for (const rootProfile of ['default', '']) {
+        const graph = resolveWorkspaceDependencyGraph({ staticAgentRef: 'liveShape/probe', registry, rootAlias: '', rootProfile });
+        assert.deepEqual([...graph.nodes.keys()].sort(), ['liveShape/cpu', 'liveShape/peer', 'liveShape/probe'], `root profile '${rootProfile}'`);
+        for (const node of graph.nodes.values()) assert.equal(node.profile, 'default', `${node.agentRef} with root profile '${rootProfile}'`);
+    }
 });

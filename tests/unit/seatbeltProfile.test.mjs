@@ -12,6 +12,9 @@ import {
 import { initializeWorkspaceMasterKey } from '../../ploinky-box/entrypoint/initialize-workspace.mjs';
 import { agentLibFixture } from '../helpers/agentlibFixture.mjs';
 
+// This file runs real login shells on purpose (production `sh -lc` code under test): it opts in to the unit-test spawn guard's name-only login-shell reading.
+process.env.PLOINKY_ENGINE_GUARD_ALLOW_LOGIN_SHELLS = '1';
+
 // Every seatbelt profile is generated for one selected achillesAgentLib source:
 // with no mount namespace, the read grant and the overriding write denial are
 // what confine it.

@@ -1,3 +1,4 @@
+import '../helpers/isolatedWorkspaceRoot.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -185,6 +186,10 @@ test('static HOME layout retains opaque controller state under the project proje
 });
 
 test('container runtimes append final read-only opacity guards for broad workspace mounts', () => {
+    // The guards need the workspace's `.ploinky` directory to exist. This test
+    // used to find it only as residue written by other tests into the checkout;
+    // it now creates it in its own private workspace root.
+    fs.mkdirSync(path.join(PLOINKY_WORKSPACE_ROOT, '.ploinky'), { recursive: true });
     for (const runtime of ['docker', 'podman']) {
         const args = ['-v', `${PLOINKY_WORKSPACE_ROOT}:/workspace${runtime === 'podman' ? ':z' : ''}`];
         const targets = appendControllerStateGuards(args, runtime);

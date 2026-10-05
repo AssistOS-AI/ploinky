@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { discoverMpsTools, MPS_TOOL_PATHS } from '../../ploinky-box/lib/mpsTools.mjs';
 
 import { runOuterCli } from '../../ploinky-box/bin/ploinky-box.mjs';
 import { parseOuterArguments } from '../../ploinky-box/command/parse.mjs';
@@ -58,6 +59,7 @@ import {
     agentLibFixtureLabels,
     agentLibFixtureMounts,
 } from '../helpers/agentlibFixture.mjs';
+import { fakeRestartCore, fakeUpdateCore } from '../helpers/fakeUpdateCore.mjs';
 
 const DRIVER = '595.91.07';
 // Each fixture host names its architecture, so discovery never depends on the
@@ -1129,6 +1131,32 @@ test('a failed replacement restores the old Box with its own GPU wiring', async 
     assert.equal(h.current().labels[BOX_LABELS.gpuGrant], wiring.fingerprint);
 });
 
+test('MPS enabled Box wiring is observed exactly and preserves both tools during rollback', async (t) => {
+    const state = boxFixture(t);
+    const host = fakeHost(); useFakeHostFiles(t, host);
+    t.mock.method(os, 'homedir', () => state.home);
+    const toolsRoot = path.join(state.root, 'tools'); fs.mkdirSync(toolsRoot);
+    for (const destination of Object.values(MPS_TOOL_PATHS)) fs.writeFileSync(path.join(toolsRoot, path.basename(destination)), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const mps = discoverMpsTools({ directories: [toolsRoot] });
+    const wiring = buildGpuWiring({ identity: state.identity, grant: GRANT, discovery: host.discover(), mps, homeDirectory: state.home });
+    state.store.materialize(state.identity, wiring, state.lock);
+    const old = containerHandle(state, { gpu: wiring });
+    assert.doesNotThrow(() => validateContainerConfiguration(old, desiredFor(state, undefined)));
+    assert.deepEqual(observeContainerGpuWiring(old, { identity: state.identity }).mps, mps);
+    for (const destination of Object.values(MPS_TOOL_PATHS)) {
+        const missing = structuredClone(old); missing.runtime.mounts = missing.runtime.mounts.filter((mount) => mount.destination !== destination);
+        assert.throws(() => observeContainerGpuWiring(missing, { identity: state.identity }), /both tools/);
+        const writable = structuredClone(old); writable.runtime.mounts.find((mount) => mount.destination === destination).rw = true;
+        assert.throws(() => validateContainerConfiguration(writable, desiredFor(state, wiring)), /incompatible/);
+    }
+    const h = harness(state, { initial: old, failCandidateReady: true });
+    await assert.rejects(() => reconcileBoxContainer(reconcileArguments(state, h, old, { gpu: null }), h.seams), (error) => error.boxRollback?.action === 'restored' && error.boxRollback.gpu.mps.control.sha256 === mps.control.sha256);
+    const restore = h.calls.filter((call) => call[3] === 'create')[1];
+    for (const tool of Object.values(mps)) assert(optionValues(restore, '--volume').includes(`${tool.source}:${tool.destination}:ro`));
+    fs.writeFileSync(mps.control.source, '#!/bin/sh\nexit 1\n');
+    assert.throws(() => state.store.materialize(state.identity, wiring, state.lock), /MPS tools changed/);
+});
+
 // ---------------------------------------------------------------------------
 // Supervisor lifecycle: grant, repeat, revoke, driver change, rollback
 // ---------------------------------------------------------------------------
@@ -1225,7 +1253,7 @@ function gpuSupervisor(box, events, overrides = {}) {
         gpuGrantStore: memoryGpuStore(events),
         discoverGpuDevices: () => fakeHost().discover(),
         routerBindingStore: { read: () => null, write: () => assert.fail('GPU grants never save a Router binding'), restore() {} },
-        resolveHostReachableIpv4: async () => '127.0.0.1',
+        resolveHostReachableIpv4: async () => '192.168.1.12',
         selectAgentLib: async () => assert.fail('a GPU grant keeps the mounted AgentLib generation'),
         commitAgentLibSelection: () => assert.fail('a GPU grant must not advance AgentLib state'),
         stdout: { write() {} },
@@ -2380,4 +2408,237 @@ test('D14 first start: no-wait launches that outlast the bound, or cannot be cou
         assert.equal(store.value, null, 'no GPU grant record is written');
         assert.deepEqual(events.filter((event) => event.startsWith('grant-')), []);
     }
+});
+
+// ---------------------------------------------------------------------------
+// Hardware limits: every gate-on generation a GPU grant, revoke or internal
+// GPU reapply creates or replaces is prepared before its graph (U11, §6.5).
+
+test('G.every-final-generation-gpu', async (t) => {
+    const probe = boxFixture(t);
+    const home = useTempHome(t, probe.root);
+    useFakeHostFiles(t, fakeHost());
+    const { createHardwareGateStore, resolveDesiredHardwareWiring } = await import('../../ploinky-box/hardwareLimitsGate.mjs');
+    const { initializeStore } = await import('../../cli/sandbox/hardwareLimits/store.mjs');
+    const scenario = async (label, { gpu = null, overrides = {}, invoke, generations }) => {
+        const box = graphBox(t, { gpu });
+        const gateStore = createHardwareGateStore({ homeDirectory: home });
+        gateStore.write(box.identity, true, box.lock);
+        const wiring = resolveDesiredHardwareWiring({ identity: box.identity, enabled: true, homeDirectory: home, initializeStore });
+        const events = [];
+        let replacements = 0;
+        const supervisor = gpuSupervisor(box, events, {
+            gpuGrantStore: memoryGpuStore(events),
+            hardwareGateStore: gateStore,
+            async reconcile(options) {
+                events.push('reconcile');
+                replacements += 1;
+                // An existing Box keeps its observed hardware wiring.
+                return { ...prepared(box, replacements === 1 && label === 'reapply' ? 'reused' : 'replaced', options.gpu, events), hardware: options.hardware ?? wiring };
+            },
+            async startCore() { events.push('start-core'); },
+            async healthCheck() { events.push('health'); },
+            prepareHardwareGeneration: async ({ hardware }) => {
+                events.push(`prepare:${hardware.fingerprint.slice(0, 8)}`);
+                return { structurallyPrepared: true };
+            },
+            ...overrides,
+        });
+        await invoke(supervisor);
+        const prepares = events.filter((event) => event.startsWith('prepare:'));
+        const starts = events.filter((event) => event === 'start-core');
+        assert.equal(prepares.length, generations, `${label}: ${events.join(' ')}`);
+        assert.equal(starts.length, generations, `${label}: ${events.join(' ')}`);
+        // Each start of graph work follows its own generation's preparation.
+        let pending = 0;
+        for (const event of events) {
+            if (event.startsWith('prepare:')) pending += 1;
+            if (event === 'start-core') {
+                assert.ok(pending > 0, `${label}: graph work before preparation: ${events.join(' ')}`);
+                pending -= 1;
+            }
+        }
+    };
+    await scenario('grant', { invoke: (supervisor) => supervisor.runGpuGrantTransaction({ vendor: 'nvidia', agents: [AGENT] }), generations: 1 });
+    await scenario('revoke', {
+        gpu: (state) => activeWiring(state.identity),
+        invoke: (supervisor) => supervisor.runGpuRevokeTransaction({}),
+        generations: 1,
+    });
+    // The start's own generation, then one internal GPU reapply replacement.
+    let scans = 0;
+    await scenario('reapply', {
+        overrides: {
+            scanGpuAgents: () => (scans++ === 0 ? [] : [AGENT]),
+            selectAgentLib: async () => ({ selection: probe.agentLib }),
+            commitAgentLibSelection: () => {},
+            revalidateAgentLibSource: () => {},
+            countNoWaitWorkers: () => 0,
+            waitDelay: async () => {},
+        },
+        invoke: (supervisor) => supervisor.runStartTransaction(['start', 'explorer', '8080']),
+        generations: 2,
+    });
+});
+
+// A gate requested only through the environment (saved gate off) must wire
+// the MPS tools into the replacement Box for restart and update exactly as
+// start does; the saved gate would build a Box without them.
+for (const [operation, invoke] of [
+    ['restart', (supervisor) => supervisor.runRestartTransaction(['restart'])],
+    ['update', (supervisor) => supervisor.runUpdateTransaction(['update'], { restartAfterUpdate: true })],
+]) {
+    test(`M6.${operation}-wires-mps-from-requested-gate`, async (t) => {
+        const box = graphBox(t);
+        const home = useTempHome(t, box.root);
+        useFakeHostFiles(t, fakeHost());
+        const { createHardwareGateStore } = await import('../../ploinky-box/hardwareLimitsGate.mjs');
+        const gateStore = createHardwareGateStore({ homeDirectory: home });
+        gateStore.write(box.identity, false, box.lock);
+        const toolsRoot = path.join(box.root, 'mps-tools'); fs.mkdirSync(toolsRoot);
+        for (const destination of Object.values(MPS_TOOL_PATHS)) fs.writeFileSync(path.join(toolsRoot, path.basename(destination)), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+        const tools = discoverMpsTools({ directories: [toolsRoot] });
+        const events = [];
+        const requested = [];
+        const supervisor = gpuSupervisor(box, events, {
+            env: { PLOINKY_BOX_HARDWARE_LIMITS: 'on' },
+            gpuGrantStore: memoryGpuStore(events, Object.freeze({ vendor: 'nvidia', agents: [AGENT], admitted: null })),
+            hardwareGateStore: gateStore,
+            discoverGpuMpsTools: () => tools,
+            selectAgentLib: async () => ({ selection: box.agentLib, mode: 'local' }),
+            updateAgentLib: async () => ({ selection: box.agentLib, changed: false, previous: null }),
+            updateWorkspacePloinky: async () => ({ found: false }),
+            commitAgentLibSelection: () => {},
+            revalidateAgentLibSource: () => {},
+            captureCoreStartArgv: () => ['start', 'explorer', '8080'],
+            runCoreCommand: async () => { events.push('core'); },
+            // The restart and update of the Box run through master's bounded runners; the same recorder plays the in-Box core.
+            runRestartCore: fakeRestartCore(async () => { events.push('core'); }),
+            runUpdateCore: fakeUpdateCore({ onCall: ({ engine, containerId, argv, hostPort, mediaHostPort, options }) => (async () => { events.push('core'); })(engine, containerId, argv, hostPort, mediaHostPort, null, options) }),
+            validateExistingImage: () => ({ immutableId: `sha256:${'b'.repeat(64)}` }),
+            validateContainer: () => {},
+            async reconcile(options) {
+                requested.push(options.gpu);
+                return { ...prepared(box, 'replaced', options.gpu, events), hardware: options.hardware };
+            },
+            async startCore() { events.push('start-core'); },
+            async healthCheck() { events.push('health'); },
+            prepareHardwareGeneration: async () => ({ structurallyPrepared: true }),
+        });
+        await invoke(supervisor);
+        assert.ok(requested.length >= 1, `${operation}: ${events.join(' ')}`);
+        for (const gpu of requested) assert.deepEqual(gpu?.mps, tools, `${operation} wires both MPS tools from the requested gate`);
+    });
+}
+
+// The real apparatus-mps LIVE-P1 sequence: the gate requested through the
+// environment, the host's wiring written by a real restart, the Box reading
+// its mounted marker and then the GPU through the bound nvidia-smi. The Box
+// image has no loader path for the bound driver libraries, so the observation
+// works only when it names them itself; and when the host's MPS tools were not
+// wired, the status says why instead of a generic refusal.
+async function restartedMarker(t, discoverGpuMpsTools, { toolsRoot = null } = {}) {
+    const box = graphBox(t);
+    const home = useTempHome(t, box.root);
+    useFakeHostFiles(t, fakeHost());
+    const { createHardwareGateStore } = await import('../../ploinky-box/hardwareLimitsGate.mjs');
+    const gateStore = createHardwareGateStore({ homeDirectory: home });
+    gateStore.write(box.identity, false, box.lock);
+    const events = [];
+    const requested = [];
+    const supervisor = gpuSupervisor(box, events, {
+        env: { PLOINKY_BOX_HARDWARE_LIMITS: 'on' },
+        gpuGrantStore: memoryGpuStore(events, Object.freeze({ vendor: 'nvidia', agents: [AGENT], admitted: null })),
+        hardwareGateStore: gateStore,
+        discoverGpuMpsTools,
+        selectAgentLib: async () => ({ selection: box.agentLib, mode: 'local' }),
+        updateAgentLib: async () => ({ selection: box.agentLib, changed: false, previous: null }),
+        updateWorkspacePloinky: async () => ({ found: false }),
+        commitAgentLibSelection: () => {},
+        revalidateAgentLibSource: () => {},
+        captureCoreStartArgv: () => ['start', 'explorer', '8080'],
+        runCoreCommand: async () => { events.push('core'); },
+        // The restart and update of the Box run through master's bounded runners; the same recorder plays the in-Box core.
+        runRestartCore: fakeRestartCore(async () => { events.push('core'); }),
+        runUpdateCore: fakeUpdateCore({ onCall: ({ engine, containerId, argv, hostPort, mediaHostPort, options }) => (async () => { events.push('core'); })(engine, containerId, argv, hostPort, mediaHostPort, null, options) }),
+        validateExistingImage: () => ({ immutableId: `sha256:${'b'.repeat(64)}` }),
+        validateContainer: () => {},
+        async reconcile(options) {
+            requested.push(options.gpu);
+            return { ...prepared(box, 'replaced', options.gpu, events), hardware: options.hardware };
+        },
+        async startCore() { events.push('start-core'); },
+        async healthCheck() { events.push('health'); },
+        prepareHardwareGeneration: async () => ({ structurallyPrepared: true }),
+    });
+    await supervisor.runRestartTransaction(['restart']);
+    const wiring = requested.at(-1);
+    assert.ok(wiring, events.join(' '));
+    // The files the host mounts into the Box, as the Box would read them.
+    for (const file of wiring.files) {
+        fs.mkdirSync(path.dirname(file.path), { recursive: true });
+        fs.writeFileSync(file.path, file.content, { mode: 0o600 });
+    }
+    const byDestination = Object.fromEntries(wiring.mounts.map((mount) => [mount.destination, mount.source]));
+    // The Box sees the bound tools under their destination; the test's stand-in is the host source directory.
+    const remap = (target) => (toolsRoot && String(target).startsWith('/usr/local/nvidia/bin/') ? path.join(toolsRoot, path.basename(target)) : target);
+    const fsApi = { ...fs, realpathSync: (target, ...rest) => fs.realpathSync(remap(target), ...rest), accessSync: (target, ...rest) => fs.accessSync(remap(target), ...rest) };
+    const grant = readBoxGpuGrant({ workspaceRoot: box.identity.workspaceRoot, markerPath: byDestination[BOX_GPU_MARKER_PATH], specPath: byDestination[BOX_GPU_CDI_SPEC_PATH], fsApi });
+    return { box, wiring, grant };
+}
+
+test('P1X.restart-wires-mps-and-the-box-observes-the-gpu-with-the-loader-path', async (t) => {
+    const { readMpsStatus } = await import('../../cli/sandbox/hardwareLimits/mpsStatus.mjs');
+    const { observeMpsGpu } = await import('../../cli/sandbox/hardwareLimits/mpsEligibility.mjs');
+    const toolsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'p1x-tools-'));
+    t.after(() => fs.rmSync(toolsRoot, { recursive: true, force: true }));
+    for (const destination of Object.values(MPS_TOOL_PATHS)) fs.writeFileSync(path.join(toolsRoot, path.basename(destination)), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const tools = discoverMpsTools({ directories: [toolsRoot] });
+    const { box, wiring, grant } = await restartedMarker(t, () => tools, { toolsRoot });
+    assert.deepEqual(wiring.mps, tools);
+    assert.equal(grant.valid, true, grant.problem); assert.equal(grant.state, 'active'); assert.deepEqual(grant.mps, tools);
+    const calls = [];
+    // The bound nvidia-smi fails exactly as it does in the Box image unless it is told where its libraries are.
+    const query = (command, args, options) => {
+        calls.push({ command, env: options?.env });
+        const loadable = String(options?.env?.LD_LIBRARY_PATH || '').split(':').includes('/usr/local/nvidia/lib64');
+        return loadable
+            ? { status: 0, stdout: '0, GPU-11111111-2222-3333-4444-555555555555, NVIDIA RTX PRO 6000 Blackwell, 97887, 580.95.05\n' }
+            : { status: 127, stdout: '', stderr: 'nvidia-smi: error while loading shared libraries: libnvidia-ml.so.1: cannot open shared object file' };
+    };
+    const status = readMpsStatus({ workspaceRoot: box.identity.workspaceRoot, readGrant: () => grant, observeGpu: () => observeMpsGpu({ query }), readState: () => null });
+    assert.equal(status.eligible, true, JSON.stringify({ reason: status.reason, code: status.code }));
+    assert.equal(status.mode, 'mps-shared'); assert.equal(status.deviceUuid, 'GPU-11111111-2222-3333-4444-555555555555');
+    assert.equal(calls.length, 1); assert.equal(calls[0].command, '/usr/local/nvidia/bin/nvidia-smi');
+});
+
+test('P1X.a-failing-observation-names-its-cause-instead-of-a-generic-refusal', async (t) => {
+    const { readMpsStatus } = await import('../../cli/sandbox/hardwareLimits/mpsStatus.mjs');
+    const { observeMpsGpu } = await import('../../cli/sandbox/hardwareLimits/mpsEligibility.mjs');
+    const toolsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'p1x-tools-'));
+    t.after(() => fs.rmSync(toolsRoot, { recursive: true, force: true }));
+    for (const destination of Object.values(MPS_TOOL_PATHS)) fs.writeFileSync(path.join(toolsRoot, path.basename(destination)), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const tools = discoverMpsTools({ directories: [toolsRoot] });
+    const { box, grant } = await restartedMarker(t, () => tools, { toolsRoot });
+    const status = readMpsStatus({
+        workspaceRoot: box.identity.workspaceRoot,
+        readGrant: () => grant,
+        observeGpu: () => observeMpsGpu({ query: () => ({ status: 127, stdout: '', stderr: 'libnvidia-ml.so.1: cannot open shared object file\u0000' }) }),
+        readState: () => null,
+    });
+    assert.equal(status.eligible, false); assert.equal(status.code, 'gpu_sharing_unavailable');
+    assert.match(status.reason, /exit 127/); assert.match(status.reason, /libnvidia-ml\.so\.1: cannot open shared object file/);
+    assert.ok(status.reason.length <= 600); assert.doesNotMatch(status.reason, /[\u0000-\u001f]/);
+});
+
+test('P1X.control-mps-tool-discovery-failure-reaches-the-box-status-with-its-cause', async (t) => {
+    const { readMpsStatus } = await import('../../cli/sandbox/hardwareLimits/mpsStatus.mjs');
+    const { box, wiring, grant } = await restartedMarker(t, () => { throw new Error('nvidia-cuda-mps-server is not an executable file'); });
+    assert.equal(wiring.mps, undefined);
+    assert.equal(grant.valid, true, grant.problem); assert.equal(grant.state, 'active'); assert.equal(grant.mps, undefined);
+    assert.match(grant.mpsDiscoveryProblem, /nvidia-cuda-mps-server is not an executable file/);
+    const status = readMpsStatus({ workspaceRoot: box.identity.workspaceRoot, readGrant: () => grant, observeGpu: () => assert.fail('no observation without wired tools') });
+    assert.equal(status.eligible, false); assert.equal(status.code, 'gpu_sharing_unavailable');
+    assert.match(status.reason, /nvidia-cuda-mps-server is not an executable file/);
+    assert.match(status.reason, /were not wired when the Box was created/);
 });

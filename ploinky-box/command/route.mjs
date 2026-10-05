@@ -201,6 +201,18 @@ export function routeOuterCommand(parsed, options = {}) {
             agents: parsed.gpu.agents,
         });
     }
+    // Hardware-limits status and clear are host-owned recovery paths; status
+    // is read-only and clear needs no router. Neither prepares a Box.
+    if (parsed.command === 'limits') {
+        if (parsed.dryRun) {
+            throw routeError('limits has no --dry-run; use `ploinky limits status` to inspect without changes');
+        }
+        return Object.freeze({
+            kind: `limits-${parsed.limits.action}`,
+            agentRef: parsed.limits.agentRef,
+            all: parsed.limits.all,
+        });
+    }
     if (!parsed.command) {
         return Object.freeze({ kind: parsed.dryRun ? 'dry-run' : 'repl', coreArgv: parsed.forwardingArgv });
     }

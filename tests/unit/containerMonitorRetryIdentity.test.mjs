@@ -318,6 +318,25 @@ test('successive failed replacements reach the circuit breaker instead of resett
     assert.equal(state.physical.size, 0);
 });
 
+// The failure counterpart of acknowledging readiness: a failed restart ends its
+// launching operation, so its GPU share (or share-less readiness) owner must not
+// stay live in the Router process for as long as it runs.
+test('MON.a-failed-restart-releases-the-launching-mps-owner-of-its-result', async t => {
+    const { mpsLaunchOwner, mpsOwnerState } = await import('../../cli/sandbox/hardwareLimits/mpsInventory.mjs');
+    const { state, monitor, target } = fixture(t);
+    const owner = mpsLaunchOwner();
+    const ensure = monitor.ensureAgentService;
+    monitor.ensureAgentService = (...args) => {
+        const result = ensure(...args);
+        result.mpsReadiness = { shareless: true, client: { owner } };
+        return result;
+    };
+    assert.equal(mpsOwnerState(owner), 'live');
+    await assert.rejects(performContainerRestart(monitor, target, 'not_running', attemptFor(target)), /readiness script failed/);
+    assert.ok(state.result.mpsReadiness, 'the launch result carried its owner');
+    assert.equal(mpsOwnerState(owner), 'gone', 'the failed restart released its launching operation');
+});
+
 test('failed additive replacement retains its authorized predecessor without retiring it', async t => {
     const { state, monitor, target, originalName, originalRecord } = fixture(t, { additive: true });
     seedBudget(target);
@@ -846,7 +865,7 @@ test('the recursive service launch failure carries the actual staged authority a
     const run = new Function(
         'runtimeIdentity', 'containerName', 'inspectedContainerId', 'existingRecord',
         'manifestNetwork', 'runtime', 'ensureAgentService', 'agentName', 'manifest',
-        'agentPath', 'options', 'attachRestartCandidate',
+        'agentPath', 'options', 'attachRestartCandidate', 'hardwareInstanceKey',
         source.slice(branchStart, branchEnd),
     );
     const original = {
@@ -867,7 +886,7 @@ test('the recursive service launch failure carries the actual staged authority a
     failure.ploinkyRestartCandidate = { cleanupReceipt, exactCleanupPerformed: true };
     assert.throws(() => run(
         identity, 'predecessor', original.containerId, original, { mode: 'default' }, 'podman',
-        () => { throw failure; }, 'sample', {}, '/fixture/sample', {}, attach,
+        () => { throw failure; }, 'sample', {}, '/fixture/sample', {}, attach, 'predecessor',
     ), error => {
         assert.equal(error, failure);
         const candidate = error.ploinkyRestartCandidate;
@@ -1018,3 +1037,46 @@ for (const additive of [false, true]) {
         )), true);
     });
 }
+
+test('MON.unrelated-write-no-rearm', async () => {
+    const { BOX_MARKER_CONTENT } = await import('../../ploinky-box/constants.mjs');
+    const { HARDWARE_UNENFORCEABLE } = await import('../../cli/sandbox/hardwareLimits/errors.mjs');
+    const ploinkyDir = path.join(workspace, '.ploinky');
+    const markerPath = path.join(workspace, 'hw-box-marker');
+    fs.writeFileSync(markerPath, BOX_MARKER_CONTENT);
+    const writeAgent = (agentName, manifest) => {
+        const agentDir = path.join(ploinkyDir, 'repos', 'demo', agentName);
+        fs.mkdirSync(agentDir, { recursive: true });
+        fs.writeFileSync(path.join(agentDir, 'manifest.json'), JSON.stringify(manifest));
+    };
+    writeAgent('hwNeedy', { container: 'node:20-alpine', llmRuntime: { runtimePolicy: { resources: { memory: '256m' } } } });
+    writeAgent('hwOther', { container: 'node:20-alpine' });
+    const record = (agentName) => ({
+        type: 'agent', repoName: 'demo', agentName, runtime: 'container',
+        instanceId: `${agentName}-instance`, enableGeneration: `${agentName}-generation`,
+    });
+    fs.mkdirSync(path.join(ploinkyDir, 'running'), { recursive: true });
+    fs.writeFileSync(path.join(ploinkyDir, 'agents.json'), JSON.stringify({
+        hwNeedy_runtime: record('hwNeedy'),
+        hwOther_runtime: record('hwOther'),
+    }, null, 2));
+    fs.writeFileSync(path.join(ploinkyDir, 'routing.json'), JSON.stringify({ routes: {
+        hwNeedy: { repo: 'demo', agent: 'hwNeedy', container: 'hwNeedy_runtime' },
+        hwOther: { repo: 'demo', agent: 'hwOther', container: 'hwOther_runtime' },
+    } }, null, 2));
+    const monitor = createContainerMonitor({ terminalLedgerFile: path.join(ploinkyDir, 'running', 'hw-unrelated-ledger.json') });
+    monitor.boxMarkerOptions = { markerPath };
+    syncManagedContainers(monitor);
+    const terminal = monitor.terminalLedger.get('hwNeedy_runtime');
+    assert.equal(terminal?.code, HARDWARE_UNENFORCEABLE);
+    // An unrelated agent's declaration and registry change.
+    writeAgent('hwOther', { container: 'node:22-alpine', env: { UNRELATED: '1' } });
+    fs.writeFileSync(path.join(ploinkyDir, 'agents.json'), JSON.stringify({
+        hwNeedy_runtime: record('hwNeedy'),
+        hwOther_runtime: { ...record('hwOther'), enableGeneration: 'hwOther-generation-2' },
+    }, null, 2));
+    syncManagedContainers(monitor);
+    assert.deepEqual(monitor.terminalLedger.get('hwNeedy_runtime'), terminal, 'an unrelated write does not re-arm the refused agent');
+    assert.equal(monitor.targets.has('hwNeedy_runtime'), false);
+    stopContainerMonitor(monitor);
+});

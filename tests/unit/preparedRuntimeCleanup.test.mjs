@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { readAppliedObservation, writeAppliedObservation } from '../../cli/sandbox/hardwareLimits/runtimeState.mjs';
 
 import {
     activatePreparedRuntimeAfterReadiness,
@@ -20,6 +24,41 @@ function preparedRuntime(mode = 'replacement') {
         preparationLease: { mode, transactionId: 'prepared-runtime-lease' },
     };
 }
+
+test('R.promoted-ready-zero-port-clears-availability-and-keeps-proof', async (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-promoted-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const key = 'worker__candidate_012345abcdef';
+    const result = { ...preparedRuntime('additive'), containerName: key, hostPort: 0 };
+    const previous = { container: 'worker', hardwareAvailability: { schema: 1, key: 'worker', state: 'blocked' } };
+    const agents = {};
+    const routing = { routes: { worker: previous } };
+    writeAppliedObservation({ key, containerId: result.containerId, limitsHash: 'b'.repeat(64), instanceId: result.registryRecord.instanceId, enableGeneration: result.registryRecord.enableGeneration, cpus: 0.5, memoryBytes: 64 * 1024 ** 2 }, { root });
+    await activatePreparedRuntimeAfterReadiness({ result, routeKey: 'worker', repoName: 'demo', shortAgentName: 'worker', agentPath: '/fixture' }, {
+        loadAgents: () => agents, readRouting: () => routing,
+        withApplyLock: (callback) => callback({}),
+        commitAdditive: (_lease, value) => { Object.assign(agents, value.agents); Object.assign(routing, value.routing); },
+        retireCandidate: () => {},
+    });
+    assert.equal(routing.routes.worker.container, key);
+    assert.equal(routing.routes.worker.hardwareAvailability, undefined);
+    const proof = readAppliedObservation(key, result.containerId, { root });
+    assert.equal(proof.instanceId, agents[key].instanceId);
+    assert.equal(proof.enableGeneration, agents[key].enableGeneration);
+    assert.equal(readAppliedObservation('worker', result.containerId, { root }), null);
+});
+
+test('R.ordinary-ready-repair-clears-availability', async () => {
+    const result = { ...preparedRuntime(), hostPort: 0 };
+    const routing = { routes: { worker: { container: result.containerName, hardwareAvailability: { state: 'refused' } } } };
+    let saved;
+    await activatePreparedRuntimeAfterReadiness({ result, routeKey: 'worker', repoName: 'demo', shortAgentName: 'worker', agentPath: '/fixture' }, {
+        loadAgents: () => ({}), saveAgents: (value) => { saved = value; },
+        mergeRouting: (callback) => callback(routing), retireCandidate: () => {},
+    });
+    assert.equal(routing.routes.worker.hardwareAvailability, undefined);
+    assert.equal(saved[result.containerName].instanceId, result.registryRecord.instanceId);
+});
 
 test('additive activation atomically supplies final runtime locators without prewriting mutable sources', async () => {
     const result = preparedRuntime('additive');

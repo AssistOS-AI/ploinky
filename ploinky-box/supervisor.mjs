@@ -86,6 +86,28 @@ import {
     isUsableHostIpv4,
 } from './hostNetwork.mjs';
 import { resolveWorkspaceIdentity } from './identity.mjs';
+import {
+    GENERIC_INSPECT_ONLY_MESSAGE,
+    createHardwareGateStore,
+    observeContainerHardwareWiring,
+    observeHostLimitsFacts,
+    parseHardwareGateValue,
+    readHardwareStateClass,
+    readLimitsStatus,
+    resolveDesiredHardwareWiring,
+    runLimitsClear,
+    selectHardwareGate,
+    HARDWARE_GATE_ENV,
+    TARGETED_UPDATE_OPERATION,
+} from './hardwareLimitsGate.mjs';
+import {
+    assertGateOffStoreEmpty,
+    assertHardwareStateConfined,
+    hardwareStorePaths,
+    initializeStore as initializeHardwareStore,
+    peekGateOffStoreEmpty,
+} from '../cli/sandbox/hardwareLimits/store.mjs';
+import { withStaleStoreLockRecovery } from '../cli/sandbox/hardwareLimits/storeLock.mjs';
 import { retireDestroyedBoxNoWaitMarkers } from './noWaitCleanup.mjs';
 import { createMutationLockManager, withWorkspaceMutationLock } from './locks.mjs';
 import { parseHostPort } from './ports.mjs';
@@ -93,10 +115,20 @@ import { stripBranchPolicyArgs } from '../agentlib/branchPolicy.mjs';
 import { buildEngineProcessEnvironment, createProcessRunner } from './process.mjs';
 import { updateWorkspacePloinkySource } from './command/hostUpdate.mjs';
 import {
+    containerCreateArgs,
     removeContainerById,
+    startContainerAndWaitReady,
     stopPloinkyLocalByContainerId,
 } from './lifecycle/container.mjs';
-import { reconcileBoxContainer } from './lifecycle/transactions.mjs';
+import { observeBoxConfiguration, reconcileBoxContainer } from './lifecycle/transactions.mjs';
+import { prepareBoxGeneration, verifyBoxRuntime } from './hardwareLimits/status.mjs';
+import {
+    abortHardwareDowngradesForDestroy,
+    createTransitionStore,
+    downgradeRecoveryAdvice,
+    recoverHardwareDowngrades,
+    runHardwareDowngrade,
+} from './hardwareLimitsTransition.mjs';
 import { listUnresolvedAdmissions, runJournaledAdmission } from './update/admission.mjs';
 import { updateHostStateForLockManager } from './update/hostState.mjs';
 import { IN_BOX_NONCE_PROBE_SCRIPT, IN_BOX_OPERATION_WRITERS_PROBE_SCRIPT, runUpdateExec } from './update/coreRunner.mjs';
@@ -296,6 +328,8 @@ function revalidateMountedAgentLibSource(selection, context) {
 const NO_WAIT_WORKER_SCRIPT = '/opt/ploinky/cli/commands/noWaitWorker.js';
 const NO_WAIT_SETTLE_TIMEOUT_MS = 31 * 60 * 1000;
 const NO_WAIT_POLL_MS = 5000;
+// Engine statuses that name a stopped Box container (no process can run).
+const STOPPED_BOX_STATUSES = new Set(['exited', 'stopped', 'created', 'configured', 'initialized', 'dead']);
 
 export function createBoxSupervisor({
     runner = createProcessRunner({ env: buildEngineProcessEnvironment() }),
@@ -342,7 +376,19 @@ export function createBoxSupervisor({
     routerBindingStore = createRouterBindingStore(),
     updateHostState = updateHostStateForLockManager(lockManager),
     gpuGrantStore = createGpuGrantStore(),
+    hardwareGateStore = createHardwareGateStore(),
+    // Bounded, idempotent preparation of each created/restored/restarted
+    // gate-on generation before graph work (plan U5/U11, §7).
+    prepareHardwareGeneration = async ({ identity, engine, containerId, runner: preparationRunner }) => prepareBoxGeneration({
+        engine,
+        containerId,
+        runner: preparationRunner,
+        repositoryRoot,
+        writableSources: [identity.workspaceRoot, ...Object.values(identity.dataPaths || {})],
+    }),
     discoverGpuDevices = discoverGpu,
+    // MPS tool discovery for gate-on GPU wiring; the GPU module's default.
+    discoverGpuMpsTools = undefined,
     scanGpuAgents = declaredGpuAgents,
     countNoWaitWorkers = null,
     waitDelay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
@@ -421,14 +467,16 @@ export function createBoxSupervisor({
     // start, restart and update rediscovers the host driver, so a driver update
     // replaces the Box with regenerated wiring, and a failed discovery wires
     // only a stale-grant marker instead of stopping the whole workspace.
-    function selectSavedGpuWiring(identity) {
+    function selectSavedGpuWiring(identity, mpsEnabled = hardwareGateStore.read(identity)?.enabled === true) {
         const saved = gpuGrantStore.read(identity);
         // D14: manifests of the installed repos may declare GPU access; the
         // operator's grants and denies apply on top.
         const declared = scanGpuAgents(identity.workspaceRoot);
         const desired = resolveDesiredGpuWiring(identity, saved, declared, {
             discover: discoverGpuDevices,
+            ...(discoverGpuMpsTools ? { discoverMps: discoverGpuMpsTools } : {}),
             homeDirectory: gpuGrantStore.homeDirectory,
+                mpsEnabled,
         });
         if (desired?.state === 'stale') {
             stderr?.write?.(
@@ -446,6 +494,246 @@ export function createBoxSupervisor({
             }
         }
         return Object.freeze({ saved, desired, declared });
+    }
+
+    // The saved hardware-limits gate (plan §6.1). An environment value is
+    // parsed before any mutation; only start/restart/update apply it. A
+    // gate-off create, replacement or start first proves that no hardware
+    // limit is stored (U9): unknown or unreadable contents refuse too.
+    function selectHardwareGateForOperation(identity, operation, lock = null) {
+        const gate = selectHardwareGate({ identity, gateStore: hardwareGateStore, env, operation });
+        if (gate.note) stderr?.write?.(`[ploinky] Note: ${gate.note}\n`);
+        if (!gate.enabled) {
+            const paths = hardwareStorePaths({ identity, homeDirectory: hardwareGateStore.homeDirectory });
+            try {
+                // A stale store lock is recovered only with its holder proven
+                // dead and this Box observed stopped or absent (§5.2).
+                withStaleStoreLockRecovery(() => assertGateOffStoreEmpty({ paths, identity }), {
+                    storeRoot: paths.storeRoot, hostLock: lock, instance: identity.instance,
+                    inspectBox: () => observeBoxState(identity),
+                });
+            } catch (error) {
+                throw supervisorError(error.message, error.code === 'stored_limits_present'
+                    ? 'PLOINKY_BOX_HARDWARE_LIMITS_STORED'
+                    : error.code === 'store_busy' ? 'PLOINKY_BOX_HARDWARE_STORE_BUSY' : 'PLOINKY_BOX_HARDWARE_STATE_INVALID');
+            }
+        } else {
+            assertHardwareStateConfined({
+                workspaceRoot: identity.workspaceRoot,
+                dataPaths: identity.dataPaths,
+                homeDirectory: hardwareGateStore.homeDirectory,
+            });
+        }
+        return gate;
+    }
+
+    // The exact wiring for the selected gate; null for gate off. Gate-on
+    // initializes the host store before the first gate-on Box exists.
+    function hardwareWiringFor(identity, enabled, ownership) {
+        return resolveDesiredHardwareWiring({
+            identity,
+            enabled,
+            hostKind: ownership?.engine?.hostKind || 'native-linux',
+            homeDirectory: hardwareGateStore.homeDirectory,
+            initializeStore: initializeHardwareStore,
+        });
+    }
+
+    // The exact Box's observed state for stale-lock recovery: absent, stopped,
+    // paused or running. A paused Box is not stopped: a writer inside it may
+    // still hold the lock (§5.2). Anything not positively owned, and any
+    // engine status that does not name a stopped container, is unknown.
+    function observeBoxState(identity) {
+        const observed = inspect(identity);
+        if (observed?.state === 'absent') return Object.freeze({ state: 'absent' });
+        const container = observed?.state === 'owned' ? observed.handles?.container : null;
+        if (!container) return Object.freeze({ state: 'unknown' });
+        const runtime = container.runtime || {};
+        const status = String(runtime.status || '').trim().toLowerCase();
+        if (runtime.running === true || status === 'running') return Object.freeze({ state: 'running', id: container.id });
+        if (status === 'paused') return Object.freeze({ state: 'paused', id: container.id });
+        if (STOPPED_BOX_STATUSES.has(status)) return Object.freeze({ state: 'stopped', id: container.id });
+        return Object.freeze({ state: 'unknown', id: container.id });
+    }
+
+    // A pending gate-on to gate-off transition must be recovered (by the next
+    // start/restart/update) before any other outer state-changing operation;
+    // bind and GPU grant/revoke refuse instead of mutating (§6.3 line 420).
+    // The advice follows the journal's real phase.
+    function assertNoPendingHardwareTransition(identity, operation) {
+        const pending = createTransitionStore({ identity, homeDirectory: hardwareGateStore.homeDirectory }).listPending();
+        if (!pending.length) return;
+        const [journal] = pending;
+        const advice = journal.phase === 'recovery-blocked'
+            ? `${downgradeRecoveryAdvice(journal)} Then retry ploinky ${operation}.`
+            : `Run ploinky restart on the host to complete recovery, then retry ploinky ${operation}.`;
+        throw supervisorError(
+            `A gate-on to gate-off hardware transition is pending (operation ${journal.operationId}, phase ${journal.phase}). `
+            + `${advice} No Box mutation was performed.`,
+            'PLOINKY_BOX_HARDWARE_TRANSITION_PENDING',
+        );
+    }
+
+    // Observed in-Box graph state: true/false, or null when the running Box's
+    // status cannot be read.
+    function observeGraphRunning(identity, engine, containerId) {
+        const inbox = readInboxStatus(engine, containerId, identity.workspaceRoot);
+        if (!inbox) return null;
+        return inbox.initialized === true && inbox.routingConfigured === true
+            && Number.isSafeInteger(inbox.runningAgents) && inbox.runningAgents > 0;
+    }
+
+    function observedHardwareWiring(identity, ownership) {
+        const container = ownership?.handles?.container || null;
+        return container ? observeContainerHardwareWiring(container, { identity, homeDirectory: hardwareGateStore.homeDirectory }) : null;
+    }
+
+    // Saved-state wiring for bind and GPU grant/revoke, which never apply an
+    // environment value: a replacement keeps the saved gate.
+    function savedHardwareWiring(identity, ownership, lock = null) {
+        const gate = selectHardwareGateForOperation(identity, 'saved', lock);
+        return { gate, hardware: hardwareWiringFor(identity, gate.enabled, ownership) };
+    }
+
+    // Every gate-on generation is prepared before graph work: each created,
+    // replaced, restored or reused-and-restarted Box. A failed preparation is
+    // not fatal to the core: limited agents are refused and unrelated agents
+    // still start (plan §7.2).
+    async function prepareGateOnGeneration(identity, engine, containerId, hardware) {
+        if (!hardware) return null;
+        try {
+            const result = await prepareHardwareGeneration({ identity, engine, containerId, runner, hardware, stderr });
+            if (result?.structurallyPrepared !== true) {
+                stderr?.write?.(`[ploinky] Hardware limits: this Box is not prepared (${result?.reason || 'unknown reason'}); `
+                    + 'agents requesting limits will be refused. Run `ploinky limits status`.\n');
+            }
+            return result;
+        } catch (error) {
+            stderr?.write?.(`[ploinky] Hardware limits: Box preparation failed (${error.message}); agents requesting limits will be refused.\n`);
+            return Object.freeze({ structurallyPrepared: false, reason: error.message });
+        }
+    }
+
+    // Real engine effects for the durable downgrade (plan §6.3). Every action
+    // names an exact immutable container ID.
+    function downgradeEffects(identity, lock, engine) {
+        const handleOf = (id) => {
+            const observed = inspect(identity);
+            const container = observed?.state === 'owned' ? observed.handles?.container : null;
+            return container && container.id === id ? container : null;
+        };
+        return {
+            engineIdentity: engine.identity,
+            hostKind: engine.hostKind || 'native-linux',
+            inspectBox() {
+                const observed = inspect(identity);
+                const container = observed?.state === 'owned' ? observed.handles?.container : null;
+                return container ? { id: container.id, running: container.runtime?.running === true } : null;
+            },
+            stopGraph(id) { stopPloinkyLocalByContainerId(engine, id, runner, { workspaceRoot: identity.workspaceRoot }); },
+            stopBox(id) { runner.run(engine.name, ['container', 'stop', '--time', '30', id]); },
+            removeBox(id) { removeContainerById(engine, id, runner); },
+            createBox(configuration, { receiptPath }) {
+                runner.run(engine.name, containerCreateArgs({
+                    ...configuration,
+                    identity,
+                    cidfile: receiptPath,
+                    imageId: configuration.imageId,
+                }));
+            },
+            async startBox(id) { await startContainerAndWaitReady(engine, id, runner, { stdout, stderr }); },
+            async prepareBox(id, configuration) { await prepareGateOnGeneration(identity, engine, id, configuration.hardware); },
+            async startGraph(id, graph) {
+                const container = handleOf(id);
+                const configuration = container ? observeBoxConfiguration(identity, inspect(identity), repositoryRoot, engine) : null;
+                if (!configuration) throw supervisorError('The downgrade candidate is not the exact owned Box');
+                if (!Array.isArray(graph.coreArgv) || !graph.coreArgv.length) {
+                    throw supervisorError('The prior graph start configuration was not captured, so it cannot be restored');
+                }
+                await ensureBoxDependencies(engine, id, runner, { workspaceRoot: identity.workspaceRoot, stdout, stderr });
+                await restorePriorGraph({
+                    identity, engine, containerId: id, hostPort: configuration.hostPort, mediaHostPort: configuration.mediaHostPort,
+                    agentLib: configuration.agentLib, routerBinding: configuration.routerBinding,
+                    coreArgv: graph.coreArgv, skillScopeEnv: graph.skillScopeEnv || null,
+                });
+                // Ready only when observed: the in-Box status must show the graph.
+                const running = observeGraphRunning(identity, engine, id);
+                return { state: running === true ? 'ready' : 'starting', optionalPendingKeys: [] };
+            },
+            graphRunning(id) {
+                // A stopped or recreated, not yet started Box runs no graph.
+                if (handleOf(id)?.runtime?.running !== true) return false;
+                const running = observeGraphRunning(identity, engine, id);
+                if (running === null) {
+                    throw supervisorError(`The running Box ${String(id).slice(0, 12)} status could not be read, so its graph state is unknown; retry the host command`);
+                }
+                return running;
+            },
+            verifyBox(id, configuration) {
+                const container = handleOf(id);
+                if (!container) return false;
+                try {
+                    validateContainer(container, { ...configuration, identity });
+                    return true;
+                } catch {
+                    return false;
+                }
+            },
+            readHostRecord(name) { return name === 'gate' ? hardwareGateStore.read(identity)?.enabled === true : undefined; },
+            writeHostRecord(name, value) { if (name === 'gate') hardwareGateStore.write(identity, value, lock); },
+        };
+    }
+
+    // Recover any pending downgrade first, then journal an actual gate-on to
+    // gate-off downgrade. First enable and on-to-on use no barrier.
+    async function settleHardwareTransitions(identity, lock, ownership, gate, operation) {
+        const homeDirectory = hardwareGateStore.homeDirectory;
+        const store = createTransitionStore({ identity, homeDirectory });
+        if (store.listPending().length) {
+            const engine = ownership.engine;
+            const results = await recoverHardwareDowngrades({ identity, homeDirectory, transitionStore: store, effects: downgradeEffects(identity, lock, engine) });
+            const blocked = results.find((result) => result.phase === 'recovery-blocked');
+            if (blocked) {
+                throw supervisorError(`A gate-on to gate-off transition needs manual recovery (${blocked.operationId}): ${blocked.error || 'recovery-blocked'}. `
+                    + 'Its journal and barrier were preserved; inspect `ploinky limits status`.', 'PLOINKY_BOX_HARDWARE_RECOVERY_BLOCKED');
+            }
+            ownership = inspect(identity);
+        }
+        if (gate.enabled || !observedHardwareWiring(identity, ownership)) return ownership;
+        const container = ownership.handles.container;
+        const engine = ownership.engine;
+        const observed = observeBoxConfiguration(identity, ownership, repositoryRoot, engine);
+        const { running: _running, ...oldConfiguration } = observed;
+        const coreArgv = captureCoreStartArgv(identity);
+        // Restore the graph afterwards only if it is observed running now.
+        const oldWasRunning = container.runtime?.running === true;
+        let oldGraphRunning = false;
+        if (oldWasRunning) {
+            oldGraphRunning = observeGraphRunning(identity, engine, container.id);
+            if (oldGraphRunning === null) {
+                throw supervisorError('The running gate-on Box status could not be read, so its graph state cannot be restored after '
+                    + 'the gate-off transition; retry when the Box has finished starting', 'PLOINKY_BOX_HARDWARE_TRANSITION_STATUS_UNAVAILABLE');
+            }
+            if (oldGraphRunning && !coreArgv) {
+                throw supervisorError('The running graph start configuration was not captured, so it cannot be restored after the '
+                    + 'gate-off transition', 'PLOINKY_BOX_HARDWARE_TRANSITION_STATUS_UNAVAILABLE');
+            }
+        }
+        stderr?.write?.('[ploinky] Turning hardware limits off: replacing the gate-on Box through a recoverable transition...\n');
+        await runHardwareDowngrade({
+            identity,
+            operation,
+            oldContainerId: container.id,
+            oldConfiguration: JSON.parse(JSON.stringify(oldConfiguration)),
+            desiredConfiguration: JSON.parse(JSON.stringify({ ...oldConfiguration, hardware: null, gpu: selectSavedGpuWiring(identity, false).desired })),
+            graphSnapshot: { schema: 1, coreArgv: coreArgv ? [...coreArgv] : [], skillScopeEnv: readGraphSkillScope(identity) || null },
+            oldWasRunning,
+            oldGraphRunning,
+            hostRecords: [{ name: 'gate', old: true, next: false }],
+            homeDirectory,
+            effects: downgradeEffects(identity, lock, engine),
+        });
+        return inspect(identity);
     }
 
     // The admitted record always comes from the desired wiring that was passed
@@ -522,6 +810,25 @@ export function createBoxSupervisor({
         });
     }
 
+    async function reconcileSafely(options) {
+        return reconcile({
+            ...options,
+            assertGateOffRestore: () => {
+                const { identity, lock } = options;
+                lock.assertHeld(identity.instance);
+                const state = observeBoxState(identity);
+                if (state.state !== 'absent') {
+                    throw supervisorError('Cannot restore gate-off wiring until candidate Box writers are proven absent. Run PLOINKY_BOX_HARDWARE_LIMITS=on ploinky restart.', 'PLOINKY_BOX_HARDWARE_ROLLBACK_BLOCKED');
+                }
+                const paths = hardwareStorePaths({ identity, homeDirectory: hardwareGateStore.homeDirectory });
+                return withStaleStoreLockRecovery(() => assertGateOffStoreEmpty({ paths, identity }), {
+                    storeRoot: paths.storeRoot, hostLock: lock, instance: identity.instance,
+                    inspectBox: () => observeBoxState(identity),
+                });
+            },
+        });
+    }
+
     async function prepareBoxForCommand({
         explicitPort,
         explicitMediaPort,
@@ -529,6 +836,20 @@ export function createBoxSupervisor({
         imageRef = resolveBoxImageReference(env),
     } = {}) {
         return lockedMutation(async (identity, lock, ownership) => {
+            // U16: with hardware state (saved on gate, initialized store or
+            // stored entries, or unknown metadata) a generic command only uses
+            // an already-running compatible Box; it never creates, starts,
+            // repairs or replaces one. Other workspaces keep today's behavior.
+            if (env?.[HARDWARE_GATE_ENV] !== undefined && String(env[HARDWARE_GATE_ENV]).trim() !== '') {
+                parseHardwareGateValue(env[HARDWARE_GATE_ENV]);
+                stderr?.write?.(`[ploinky] Note: ${HARDWARE_GATE_ENV} is set; only start, restart and update apply it\n`);
+            }
+            const hardwareState = readHardwareStateClass({
+                identity, gateStore: hardwareGateStore, homeDirectory: hardwareGateStore.homeDirectory,
+            });
+            if (hardwareState.hasHardwareState) {
+                return inspectOnlyGenericBox(identity, ownership, hardwareState);
+            }
             // An existing Box keeps its publication for ad hoc commands; only a
             // Box created here needs the saved binding.
             const routerBinding = ownership.handles?.container
@@ -547,7 +868,7 @@ export function createBoxSupervisor({
                 branchPolicy,
                 loadImageBundle: imageBundleLoader(ownership, imageRef),
             });
-            const prepared = await reconcile({
+            const prepared = await reconcileSafely({
                 identity,
                 ownership,
                 engine: ownership.engine,
@@ -579,6 +900,39 @@ export function createBoxSupervisor({
                     restoreGraph: false,
                 });
             }
+        });
+    }
+
+    // Adopt only an already-running, compatible, initialized Box for a
+    // generic command in a workspace with hardware state (plan U16).
+    function inspectOnlyGenericBox(identity, ownership, hardwareState) {
+        const status = inspectBoxStatus();
+        const container = status.ownership?.handles?.container;
+        const engine = status.ownership?.engine;
+        if (status.identity?.instance !== identity.instance
+            || status.state !== 'running-initialized'
+            || !container?.id || !engine?.name
+            || ownership.handles?.container?.id !== container.id
+            || ownership.engine?.identity !== engine.identity) {
+            throw supervisorError(
+                `${GENERIC_INSPECT_ONLY_MESSAGE} (state: ${status.state || 'unknown'}; ${hardwareState.reason})`,
+                'PLOINKY_BOX_HARDWARE_INSPECT_ONLY',
+            );
+        }
+        const selection = agentLibContractFromContainer(container);
+        const hostPort = Number(container.labels?.[BOX_LABELS.routerHostPort]);
+        const mediaHostPort = Number(container.labels?.[BOX_LABELS.mediaHostPort]);
+        return Object.freeze({
+            identity,
+            action: 'adopted',
+            ownership: status.ownership,
+            containerId: container.id,
+            engine,
+            hostPort,
+            mediaHostPort,
+            routerBinding: Object.freeze({ ...observeContainerRouterBinding(container), hostPort }),
+            agentLib: selection,
+            hardware: observedHardwareWiring(identity, status.ownership),
         });
     }
 
@@ -667,6 +1021,9 @@ export function createBoxSupervisor({
         let stoppedBoxRestored = false;
         if (restoreGraph && outerRollback?.agentLib && failures.length === 0) {
             try {
+                // A restored gate-on generation is prepared before its graph
+                // is restored (§6.5 Rollback restoration, U11).
+                await prepareGateOnGeneration(identity, ownership.engine, outerRollback.containerId, outerRollback.hardware ?? null);
                 await restorePriorGraph({
                     identity,
                     engine: ownership.engine,
@@ -729,6 +1086,17 @@ export function createBoxSupervisor({
         throw error;
     }
 
+    // The journal item of the selected hardware gate: its prior record (or absence) is restored only while the saved value is still this
+    // transaction's candidate.
+    function hardwareGateItem(identity, lock, hardwareGate) {
+        return {
+            name: 'hardware-gate',
+            read: () => hardwareGateStore.read(identity),
+            write: () => hardwareGateStore.write(identity, hardwareGate.enabled, lock),
+            restore: prior => hardwareGateStore.restore(identity, prior, lock),
+        };
+    }
+
     /**
      * Admit a ready candidate graph. Health and exact AgentLib identity are
      * proven first; the metadata writes then happen inside the journaled error
@@ -748,6 +1116,7 @@ export function createBoxSupervisor({
         source = null,
         activated = true,
         gpuGrantUpdate = null,
+        hardwareGate = null,
     }) {
         if (requireHealth) await healthCheck(prepared.hostPort, { routerBinding: prepared.routerBinding });
         revalidateAgentLibSource(selection, {
@@ -787,6 +1156,9 @@ export function createBoxSupervisor({
                 restore: prior => gpuGrantStore.restore(identity, prior, lock),
             });
         }
+        // The selected gate is recorded inside the journaled boundary, last, so a failing write is rolled back with the
+        // other candidate metadata before settlement and can never reach a rollback after it.
+        if (hardwareGate?.persist) items.push(hardwareGateItem(identity, lock, hardwareGate));
         const admitted = await runJournaledAdmission({
             identity,
             store: updateHostState,
@@ -836,7 +1208,7 @@ export function createBoxSupervisor({
     async function reconcileConfiguredGraph(options, { priorCoreStartArgv, priorSkillScopeEnv, priorGraphActive = false }) {
         const priorRunning = options.ownership.handles?.container?.runtime?.running === true;
         try {
-            return await reconcile(options);
+            return await reconcileSafely(options);
         } catch (error) {
             await recoverFailedGraphReconcile({
                 identity: options.identity,
@@ -855,6 +1227,9 @@ export function createBoxSupervisor({
     async function runStartTransaction(coreArgs = [], options = {}) {
         return lockedMutation(async (identity, lock, ownership) => {
             await assertNoUpdateRecoveryBarrier(identity, ownership);
+            const hardwareGate = selectHardwareGateForOperation(identity, 'start', lock);
+            ownership = await settleHardwareTransitions(identity, lock, ownership, hardwareGate, 'start');
+            const hardware = hardwareWiringFor(identity, hardwareGate.enabled, ownership);
             const skillScopeEnv = buildHostSkillScope(identity.workspaceRoot, launchCwd);
             const priorCoreStartArgv = captureCoreStartArgv(identity);
             const priorSkillScopeEnv = readGraphSkillScope(identity);
@@ -862,7 +1237,7 @@ export function createBoxSupervisor({
                 identity,
                 options.explicitPort,
             );
-            const { saved: savedGpuGrant, desired: gpu } = selectSavedGpuWiring(identity);
+            const { saved: savedGpuGrant, desired: gpu } = selectSavedGpuWiring(identity, hardwareGate.enabled);
             const { selection } = await selectAgentLib({
                 workspaceRoot: identity.workspaceRoot,
                 branchPolicy: options.branchPolicy || null,
@@ -880,6 +1255,7 @@ export function createBoxSupervisor({
                 explicitMediaPort: options.explicitMediaPort,
                 routerBinding,
                 gpu,
+                hardware,
                 imageRef: options.imageRef || resolveBoxImageReference(env),
                 platform,
                 env,
@@ -890,6 +1266,7 @@ export function createBoxSupervisor({
             let graphMutated = false;
             let admission = null;
             try {
+                await prepareGateOnGeneration(identity, ownership.engine, containerId, prepared.hardware);
                 await ensureBoxDependencies(ownership.engine, containerId, runner, { workspaceRoot: identity.workspaceRoot, stdout, stderr });
                 const edgeDesired = readEdgeDesired(identity);
                 if (edgeDesired) {
@@ -925,6 +1302,7 @@ export function createBoxSupervisor({
                     routerBindingUpdate: savedRouterBindingUpdate(savedBinding, prepared),
                     gpuGrantUpdate: savedGpuGrantUpdate(savedGpuGrant, gpu, prepared),
                     operation: 'start',
+                    hardwareGate,
                 });
             } catch (error) {
                 await rollbackPreparedGraph({
@@ -953,11 +1331,14 @@ export function createBoxSupervisor({
     async function runRestartTransaction(coreArgs = ['restart'], options = {}) {
         return lockedMutation(async (identity, lock, ownership) => {
             await assertNoUpdateRecoveryBarrier(identity, ownership);
+            const hardwareGate = selectHardwareGateForOperation(identity, 'restart', lock);
+            ownership = await settleHardwareTransitions(identity, lock, ownership, hardwareGate, 'restart');
+            const hardware = hardwareWiringFor(identity, hardwareGate.enabled, ownership);
             const skillScopeEnv = buildHostSkillScope(identity.workspaceRoot, launchCwd);
             const priorCoreStartArgv = captureCoreStartArgv(identity);
             const priorSkillScopeEnv = readGraphSkillScope(identity);
             const { desired: routerBinding } = selectSavedRouterBinding(identity);
-            const { saved: savedGpuGrant, desired: gpu } = selectSavedGpuWiring(identity);
+            const { saved: savedGpuGrant, desired: gpu } = selectSavedGpuWiring(identity, hardwareGate.enabled);
             const { selection } = await selectAgentLib({
                 workspaceRoot: identity.workspaceRoot,
                 branchPolicy: options.branchPolicy || null,
@@ -973,6 +1354,7 @@ export function createBoxSupervisor({
                 agentLib: selection,
                 routerBinding,
                 gpu,
+                hardware,
                 imageRef: options.imageRef || resolveBoxImageReference(env),
                 platform,
                 env,
@@ -983,6 +1365,7 @@ export function createBoxSupervisor({
             let graphMutated = false;
             let admission = null;
             try {
+                await prepareGateOnGeneration(identity, ownership.engine, containerId, prepared.hardware);
                 await ensureBoxDependencies(ownership.engine, containerId, runner, { workspaceRoot: identity.workspaceRoot, stdout, stderr });
                 const effectiveArgs = prepared.action === 'replaced' && coreArgs.length > 1
                     ? ['restart']
@@ -998,6 +1381,7 @@ export function createBoxSupervisor({
                 admission = await completeGraphAdmission({
                     identity, lock, prepared, selection, skillScopeEnv, operation: 'restart',
                     gpuGrantUpdate: savedGpuGrantUpdate(savedGpuGrant, gpu, prepared),
+                    hardwareGate,
                 });
             } catch (error) {
                 // A Box whose restart writer may still run is never rolled back.
@@ -1032,6 +1416,20 @@ export function createBoxSupervisor({
                 'Targeted restart requires `restart AGENT`',
                 'PLOINKY_BOX_ARGUMENT_INVALID',
             );
+        }
+        // A gate request that differs from the running Box's wiring needs the
+        // outer reconciliation; it is announced and runs as a whole restart
+        // with the U9 guard. The same gate keeps the exact Box.
+        const requestedGate = parseHardwareGateValue(env?.[HARDWARE_GATE_ENV]);
+        if (requestedGate !== undefined) {
+            const identity = resolveIdentity();
+            const observed = inspect(identity);
+            const boxGateOn = Boolean(observedHardwareWiring(identity, observed));
+            if (boxGateOn !== requestedGate) {
+                stderr?.write?.(`[ploinky] ${HARDWARE_GATE_ENV}=${requestedGate ? 'on' : 'off'} changes the Box hardware-limits gate; `
+                    + 'reconciling the outer Box, so the whole workspace graph restarts instead of only the named agent.\n');
+                return runRestartTransaction(['restart']);
+            }
         }
         return lockedMutation(async (identity, lock, ownership) => {
             await assertNoUpdateRecoveryBarrier(identity, ownership);
@@ -1072,6 +1470,8 @@ export function createBoxSupervisor({
                     'PLOINKY_BOX_TARGETED_RESTART_UNAVAILABLE',
                 );
             }
+            // Revalidate (idempotently) the preparation of a gate-on Box.
+            await prepareGateOnGeneration(identity, engine, container.id, observedHardwareWiring(identity, status.ownership));
             const hostReachableIpv4 = await resolveHostReachableIpv4({ platform });
             await runCoreCommand(
                 engine,
@@ -1684,12 +2084,20 @@ export function createBoxSupervisor({
         const plan = updatePlan(coreArgs, options);
         return lockedMutation(async (identity, lock, ownership) => {
             const barrierWarnings = await assertNoUpdateRecoveryBarrier(identity, ownership);
+            // The folder is re-resolved under the lock before anything is settled or changed, as master does: a scope that
+            // fails here must not leave a settled gate-on to gate-off transition behind.
             const scope = lockedUpdateScope(identity, plan);
+            // The update-recovery barrier comes first, then the hardware-limits gate. The full form applies the gate request and
+            // settles a pending or requested gate-on to gate-off transition (it reconciles the Box); the targeted forms never
+            // replace a Box, so they follow the saved gate and refuse while a downgrade is pending.
+            const hardwareGate = selectHardwareGateForOperation(identity, plan.request.kind === 'all' ? 'update' : TARGETED_UPDATE_OPERATION, lock);
+            if (plan.request.kind === 'all') ownership = await settleHardwareTransitions(identity, lock, ownership, hardwareGate, 'update');
+            else assertNoPendingHardwareTransition(identity, 'update');
             const coreArgv = updateCoreArgv(plan, scope);
             const priorCoreStartArgv = captureCoreStartArgv(identity);
             const activity = sampleGraphActivity(identity, ownership);
             const unresolvedAdmissions = listUnresolvedAdmissions(updateHostState, identity);
-            const context = { identity, lock, ownership, plan, scope, coreArgv, priorCoreStartArgv, activity };
+            const context = { identity, lock, ownership, plan, scope, coreArgv, priorCoreStartArgv, activity, hardwareGate };
             // Locks that an interrupted host exclusion refresh left are
             // released, when provably its own, before the in-Box step meets them.
             const exclusionRecovery = recoverHostExclusions({ intent: exclusionsIntent(identity), identity, env });
@@ -1717,11 +2125,12 @@ export function createBoxSupervisor({
         });
     }
 
-    async function runFullUpdate({ identity, lock, ownership, plan, scope, coreArgv, priorCoreStartArgv, activity }) {
+    async function runFullUpdate({ identity, lock, ownership, plan, scope, coreArgv, priorCoreStartArgv, activity, hardwareGate }) {
         const skillScopeEnv = buildHostSkillScope(identity.workspaceRoot, launchCwd);
         const priorSkillScopeEnv = readGraphSkillScope(identity);
+        const hardware = hardwareWiringFor(identity, hardwareGate.enabled, ownership);
         const { desired: routerBinding } = selectSavedRouterBinding(identity);
-        const { saved: savedGpuGrant, desired: gpu } = selectSavedGpuWiring(identity);
+        const { saved: savedGpuGrant, desired: gpu } = selectSavedGpuWiring(identity, hardwareGate.enabled);
         let workspacePloinky;
         try {
             workspacePloinky = await updateWorkspacePloinky({
@@ -1762,6 +2171,7 @@ export function createBoxSupervisor({
             agentLib: selection,
             routerBinding,
             gpu,
+            hardware,
             imageRef: plan.imageRef,
             platform,
             env,
@@ -1803,6 +2213,7 @@ export function createBoxSupervisor({
         let decision;
         let outcome;
         try {
+            await prepareGateOnGeneration(identity, ownership.engine, containerId, prepared.hardware);
             await ensureBoxDependencies(ownership.engine, containerId, runner, { workspaceRoot: identity.workspaceRoot, stdout, stderr });
             core = await executeCoreUpdate({
                 identity,
@@ -1872,7 +2283,25 @@ export function createBoxSupervisor({
                 }
             } else if (blocked) {
                 lock.assertHeld(identity.instance);
-                prepared.finalize?.();
+                if (hardwareGate.persist) {
+                    // The Box this transaction keeps carries the requested gate's wiring, so the request is saved with it (U1): as a
+                    // gate-only journaled admission whose settlement is the Box's own, so nothing after settlement can restore anything.
+                    const settled = await runJournaledAdmission({
+                        identity,
+                        store: updateHostState,
+                        operation: 'update',
+                        source: { containerId: prepared.ownership.handles.container.id, boxAction: prepared.action || null, deferred: true },
+                        items: [hardwareGateItem(identity, lock, hardwareGate)],
+                        validate: async () => lock.assertHeld(identity.instance),
+                        settle: async () => {
+                            lock.assertHeld(identity.instance);
+                            prepared.finalize?.();
+                        },
+                    });
+                    warnings.push(...settled.warnings);
+                } else {
+                    prepared.finalize?.();
+                }
                 outcome = 'deferred';
             } else {
                 if (restart) {
@@ -1897,6 +2326,7 @@ export function createBoxSupervisor({
                     source: { coreArgv: [...coreArgv], ...sourceSnapshot },
                     // Without a restart there is no health proof to record against.
                     gpuGrantUpdate: restart ? savedGpuGrantUpdate(savedGpuGrant, gpu, prepared) : null,
+                    hardwareGate,
                 });
                 outcome = restart ? 'restarted' : (activity.undetermined ? 'deferred' : 'not-required');
             }
@@ -1957,7 +2387,7 @@ export function createBoxSupervisor({
         };
     }
 
-    async function runTargetedUpdate({ identity, lock, ownership, plan, scope, coreArgv, priorCoreStartArgv, activity }) {
+    async function runTargetedUpdate({ identity, lock, ownership, plan, scope, coreArgv, priorCoreStartArgv, activity, hardwareGate }) {
         const skillScopeEnv = buildHostSkillScope(identity.workspaceRoot, launchCwd);
         const priorSkillScopeEnv = readGraphSkillScope(identity);
         // Only a Box created here needs the saved binding; an existing Box keeps
@@ -1967,7 +2397,7 @@ export function createBoxSupervisor({
             : selectSavedRouterBinding(identity).desired;
         const gpu = ownership.handles?.container
             ? undefined
-            : selectSavedGpuWiring(identity).desired;
+            : selectSavedGpuWiring(identity, hardwareGate.enabled).desired;
         const { selection } = await selectAgentLib({
             workspaceRoot: identity.workspaceRoot,
             branchPolicy: null,
@@ -1986,6 +2416,8 @@ export function createBoxSupervisor({
             agentLib: selection,
             routerBinding,
             gpu,
+            // An existing Box keeps its hardware-limits wiring; a Box created here takes the saved gate.
+            hardware: ownership.handles?.container ? undefined : hardwareWiringFor(identity, hardwareGate.enabled, ownership),
             imageRef: plan.imageRef,
             allowReplacement: false,
             platform,
@@ -2007,6 +2439,7 @@ export function createBoxSupervisor({
         }
         const containerId = prepared.ownership.handles.container.id;
         try {
+            await prepareGateOnGeneration(identity, ownership.engine, containerId, prepared.hardware);
             await ensureBoxDependencies(ownership.engine, containerId, runner, { workspaceRoot: identity.workspaceRoot, stdout, stderr });
             prepared.finalize?.();
         } catch (error) {
@@ -2092,8 +2525,17 @@ export function createBoxSupervisor({
         const engine = ownership.engine;
         const failures = [];
         let recoveredContainerId = '';
+        // The recovered generation's hardware-limits wiring, and whether that
+        // generation has already been prepared here (§6.5, U11).
+        let recoveredHardware = null;
+        let recoveredPrepared = false;
+        // The outcome carries the previous Box's own wiring: null only for a
+        // gate-off Box. Without the field, undefined keeps the Box's own
+        // wiring; it is never replaced by a gate-off Box here (U9).
+        const previousHardware = outcome && Object.hasOwn(outcome, 'hardware') ? outcome.hardware : undefined;
         if (outcome?.action === 'restored') {
             recoveredContainerId = outcome.containerId;
+            recoveredHardware = previousHardware ?? null;
         } else if (outcome?.action === 'preserved' && (outcome.oldStopAttempted || outcome.oldStartAttempted)) {
             // The graceful stop or removal failed part way. Bring the exact
             // previous Box back through the normal reuse lifecycle.
@@ -2114,8 +2556,9 @@ export function createBoxSupervisor({
                         stopPloinkyLocalByContainerId(engine, handle.id, runner, { workspaceRoot: identity.workspaceRoot });
                     }
                     recoveredContainerId = handle.id;
+                    recoveredHardware = observedHardwareWiring(identity, observed);
                 } else {
-                    const restarted = await reconcile({
+                    const restarted = await reconcileSafely({
                         identity,
                         ownership: observed,
                         engine,
@@ -2124,8 +2567,10 @@ export function createBoxSupervisor({
                         repositoryRoot,
                         agentLib: outcome.agentLib,
                         routerBinding: outcome.routerBinding,
-                        // Bring the previous Box back with its own GPU wiring.
+                        // Bring the previous Box back with its own GPU and
+                        // hardware-limits wiring.
                         gpu: outcome.gpu,
+                        hardware: previousHardware,
                         imageRef: String(handle.labels?.[BOX_LABELS.imageRef] || ''),
                         imagePolicy: 'preserve',
                         platform,
@@ -2135,6 +2580,10 @@ export function createBoxSupervisor({
                     });
                     restarted.finalize?.();
                     recoveredContainerId = restarted.ownership.handles.container.id;
+                    recoveredHardware = restarted.hardware ?? null;
+                    // A restored gate-on generation is prepared before its graph.
+                    await prepareGateOnGeneration(identity, engine, recoveredContainerId, recoveredHardware);
+                    recoveredPrepared = true;
                 }
             } catch (recoverError) {
                 failures.push(`previous Box recovery: ${recoverError.message}`);
@@ -2142,6 +2591,9 @@ export function createBoxSupervisor({
         }
         if (recoveredContainerId && priorGraphRunning) {
             try {
+                // A restored or restarted gate-on generation is prepared
+                // before its graph is restored (§6.5 Rollback restoration).
+                if (!recoveredPrepared) await prepareGateOnGeneration(identity, engine, recoveredContainerId, recoveredHardware);
                 await restorePriorGraph({
                     identity,
                     engine,
@@ -2203,6 +2655,8 @@ export function createBoxSupervisor({
         return lockedMutation(async (identity, lock, ownership) => {
             await assertNoUpdateRecoveryBarrier(identity, ownership);
             // Every rejection happens before the Box, graph, or preference changes.
+            assertNoPendingHardwareTransition(identity, 'bind');
+            selectHardwareGateForOperation(identity, 'bind', lock);
             const priorCoreStartArgv = captureCoreStartArgv(identity);
             if (!priorCoreStartArgv) {
                 throw supervisorError(
@@ -2258,7 +2712,7 @@ export function createBoxSupervisor({
             );
             let prepared;
             try {
-                prepared = await reconcile({
+                prepared = await reconcileSafely({
                     identity,
                     ownership,
                     engine,
@@ -2270,6 +2724,8 @@ export function createBoxSupervisor({
                     // Bind changes only the publication: an existing Box keeps
                     // its GPU wiring, and only a new Box takes the saved grant.
                     gpu: container ? undefined : selectSavedGpuWiring(identity).desired,
+                    // Likewise the hardware-limits wiring follows the saved gate.
+                    hardware: container ? undefined : savedHardwareWiring(identity, ownership, lock).hardware,
                     imageRef,
                     imagePolicy: 'preserve',
                     platform,
@@ -2295,6 +2751,7 @@ export function createBoxSupervisor({
             let bindingWriteAttempted = false;
             try {
                 if (!graphAlreadyRunning) {
+                    await prepareGateOnGeneration(identity, engine, containerId, prepared.hardware);
                     await ensureBoxDependencies(engine, containerId, runner, { workspaceRoot: identity.workspaceRoot, stdout, stderr });
                     const hostReachableIpv4 = await resolveHostReachableIpv4({ platform });
                     graphMutated = true;
@@ -2590,7 +3047,7 @@ export function createBoxSupervisor({
         );
         let prepared;
         try {
-            prepared = await reconcile({
+            prepared = await reconcileSafely({
                 identity,
                 ownership,
                 engine,
@@ -2601,6 +3058,8 @@ export function createBoxSupervisor({
                 // An existing Box keeps its publication and ports.
                 routerBinding: null,
                 gpu,
+                // A GPU change keeps the Box's hardware-limits wiring.
+                hardware: container ? undefined : savedHardwareWiring(identity, ownership, lock).hardware,
                 imageRef,
                 imagePolicy: 'preserve',
                 platform,
@@ -2626,6 +3085,7 @@ export function createBoxSupervisor({
         let recordWriteAttempted = false;
         try {
             if (!graphAlreadyRunning) {
+                await prepareGateOnGeneration(identity, engine, containerId, prepared.hardware);
                 await ensureBoxDependencies(engine, containerId, runner, { workspaceRoot: identity.workspaceRoot, stdout, stderr });
                 const hostReachableIpv4 = await resolveHostReachableIpv4({ platform });
                 graphMutated = true;
@@ -2704,6 +3164,8 @@ export function createBoxSupervisor({
     async function runGpuGrantTransaction({ vendor, agents = [] } = {}) {
         return lockedMutation(async (identity, lock, ownership) => {
             await assertNoUpdateRecoveryBarrier(identity, ownership);
+            assertNoPendingHardwareTransition(identity, 'gpu grant');
+            selectHardwareGateForOperation(identity, 'gpu-grant', lock);
             const saved = gpuGrantStore.read(identity);
             const requestedVendor = normalizeGpuVendor(vendor ?? saved?.vendor ?? defaultGpuVendor());
             const requested = normalizeGpuAgentSelectors(agents);
@@ -2722,7 +3184,9 @@ export function createBoxSupervisor({
             const declared = scanGpuAgents(identity.workspaceRoot);
             const gpu = resolveDesiredGpuWiring(identity, next, declared, {
                 discover: discoverGpuDevices,
+                ...(discoverGpuMpsTools ? { discoverMps: discoverGpuMpsTools } : {}),
                 homeDirectory: gpuGrantStore.homeDirectory,
+                mpsEnabled: hardwareGateStore.read(identity)?.enabled === true,
                 strict: true,
             });
             return applyGpuGrantChange({ identity, lock, ownership, saved, next, gpu, verb: 'grant', declared });
@@ -2738,6 +3202,8 @@ export function createBoxSupervisor({
     async function runGpuRevokeTransaction({ agents = [] } = {}) {
         return lockedMutation(async (identity, lock, ownership) => {
             await assertNoUpdateRecoveryBarrier(identity, ownership);
+            assertNoPendingHardwareTransition(identity, 'gpu revoke');
+            selectHardwareGateForOperation(identity, 'gpu-revoke', lock);
             const saved = gpuGrantStore.read(identity);
             const selectors = normalizeGpuAgentSelectors(agents);
             const next = normalizeGpuDecision(selectors.length ? {
@@ -2754,7 +3220,9 @@ export function createBoxSupervisor({
             const declared = scanGpuAgents(identity.workspaceRoot);
             const gpu = resolveDesiredGpuWiring(identity, next, declared, {
                 discover: discoverGpuDevices,
+                ...(discoverGpuMpsTools ? { discoverMps: discoverGpuMpsTools } : {}),
                 homeDirectory: gpuGrantStore.homeDirectory,
+                mpsEnabled: hardwareGateStore.read(identity)?.enabled === true,
             });
             // A per-agent revoke must not strip GPU wiring that a lost record
             // left on the Box for other agents. Wiring that the manifests alone
@@ -2765,7 +3233,9 @@ export function createBoxSupervisor({
                 try {
                     return resolveDesiredGpuWiring(identity, null, declared, {
                         discover: discoverGpuDevices,
+                        ...(discoverGpuMpsTools ? { discoverMps: discoverGpuMpsTools } : {}),
                         homeDirectory: gpuGrantStore.homeDirectory,
+                mpsEnabled: hardwareGateStore.read(identity)?.enabled === true,
                     });
                 } catch {
                     return null;
@@ -2816,7 +3286,9 @@ export function createBoxSupervisor({
         const access = effectiveGpuAccess(saved, declared);
         const desired = resolveDesiredGpuWiring(identity, saved, declared, {
             discover: discoverGpuDevices,
+            ...(discoverGpuMpsTools ? { discoverMps: discoverGpuMpsTools } : {}),
             homeDirectory: gpuGrantStore.homeDirectory,
+                mpsEnabled: hardwareGateStore.read(identity)?.enabled === true,
         });
         return Object.freeze({
             identity,
@@ -2830,6 +3302,79 @@ export function createBoxSupervisor({
             desired,
             pendingReplacement: Boolean(container) && !boxProblem && !sameGpuWiring(boxGpu, desired),
         });
+    }
+
+    /**
+     * Before any outer mutation of `update` (including the host source update
+     * and relaunch): parse the gate and run the U9 stored-limits check
+     * (§3 Gate parsing, §6.1). This check is lock-free and read-only (one
+     * consistent store snapshot), so it never takes the store lock without
+     * the host workspace lock first (§5.2 host order). The update transaction
+     * repeats the authoritative check under the workspace lock, with the same
+     * stale-lock recovery as start and restart, before any Box mutation.
+     */
+    function preflightHardwareGate(operation = 'update') {
+        const identity = resolveIdentity();
+        const gate = selectHardwareGate({ identity, gateStore: hardwareGateStore, env, operation });
+        if (!gate.enabled) {
+            const paths = hardwareStorePaths({ identity, homeDirectory: hardwareGateStore.homeDirectory });
+            try {
+                peekGateOffStoreEmpty({ paths, identity });
+            } catch (error) {
+                throw supervisorError(error.message, error.code === 'stored_limits_present'
+                    ? 'PLOINKY_BOX_HARDWARE_LIMITS_STORED'
+                    : 'PLOINKY_BOX_HARDWARE_STATE_INVALID');
+            }
+        } else {
+            assertHardwareStateConfined({
+                workspaceRoot: identity.workspaceRoot,
+                dataPaths: identity.dataPaths,
+                homeDirectory: hardwareGateStore.homeDirectory,
+            });
+        }
+        return Object.freeze({ enabled: gate.enabled, source: gate.source });
+    }
+
+    /** Read-only hardware-limits status; never initializes state or prepares a Box. */
+    function inspectLimitsStatus() {
+        const identity = resolveIdentity();
+        const ownership = inspect(identity);
+        const container = ownership?.handles?.container || null;
+        return readLimitsStatus({
+            identity,
+            gateStore: hardwareGateStore,
+            env,
+            // The host's own read-only engine and exact-Box runtime checks.
+            hostFacts: observeHostLimitsFacts({
+                engine: ownership?.engine,
+                containerId: container?.id || null,
+                query: typeof runner?.query === 'function' ? runner.query.bind(runner) : null,
+                verifyRuntime: verifyBoxRuntime,
+            }),
+            observedBox: container
+                ? {
+                    state: container.runtime?.running ? 'running' : 'stopped',
+                    wiring: container.labels?.[BOX_LABELS.hardwareLimits] || null,
+                    // A stopped Box has no prepared generation; a running
+                    // one's in-Box preparation is not observable from here.
+                    prepared: container.runtime?.running ? null : false,
+                    preparedReason: container.runtime?.running
+                        ? 'in-Box preparation is not observed from the host'
+                        : 'the Box is not running',
+                }
+                : { state: 'absent', wiring: null, prepared: false, preparedReason: 'no Box exists' },
+        });
+    }
+
+    /** Host recovery: clear one agent's stored limits or every entry. No router needed. */
+    async function runLimitsClearTransaction({ agentRef = null, all = false } = {}) {
+        return lockedMutation(async (identity, lock) => {
+            const result = runLimitsClear({
+                identity, lock, agentRef, all, homeDirectory: hardwareGateStore.homeDirectory,
+                inspectBox: () => observeBoxState(identity),
+            });
+            return Object.freeze({ identity, agentRef, all, ...result });
+        }, (ownership) => ownership);
     }
 
     async function runStopTransaction() {
@@ -2861,6 +3406,18 @@ export function createBoxSupervisor({
         });
     }
 
+    // An explicit destroy settles a pending downgrade only after the owned Box
+    // is proven gone (removed here, or already absent): record
+    // aborted-by-destroy and remove its barrier. The saved gate and policy
+    // follow destroy's contract.
+    function closePendingDowngradesAfterDestroy(identity) {
+        try {
+            abortHardwareDowngradesForDestroy({ identity, homeDirectory: hardwareGateStore.homeDirectory });
+        } catch (error) {
+            stderr?.write?.(`[ploinky] A pending hardware transition could not be closed (${error.message}); its journal was kept for recovery.\n`);
+        }
+    }
+
     async function runDestroyTransaction(expectedContainerId, { deleteCache = false } = {}) {
         return lockedMutation(async (identity, lock, ownership) => {
             const container = ownership.handles?.container;
@@ -2869,6 +3426,7 @@ export function createBoxSupervisor({
             }
             if (!container && !deleteCache) {
                 retireDestroyedMarkers({ identity, lock });
+                closePendingDowngradesAfterDestroy(identity);
                 return Object.freeze({ identity, action: 'absent' });
             }
             if (container && (!expectedContainerId || container.id !== expectedContainerId)) {
@@ -2912,6 +3470,7 @@ export function createBoxSupervisor({
                 removeContainerById(ownership.engine, container.id, runner);
             }
             retireDestroyedMarkers({ identity, lock });
+            closePendingDowngradesAfterDestroy(identity);
             // Cache deletion is explicit and runs only after the outer Box is
             // proven gone, so a failed stop or removal always retains the data.
             const deletedPaths = deleteCache
@@ -3149,6 +3708,9 @@ export function createBoxSupervisor({
         runGpuGrantTransaction,
         runGpuRevokeTransaction,
         inspectGpuGrant,
+        inspectLimitsStatus,
+        preflightHardwareGate,
+        runLimitsClearTransaction,
         runStopTransaction,
         runDestroyTransaction,
         inspectBoxStatus,

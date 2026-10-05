@@ -44,7 +44,29 @@ export const AGENT_STARTUP_BROWSER_COPY = Object.freeze({
         state: 'retry',
         code: 'edge_generation_changed',
     }),
+    // Terminal hardware outcomes. The message is replaced by the validated
+    // non-secret reason and fix of the exact refusal or block.
+    hardware_refused: Object.freeze({
+        state: 'unavailable',
+        code: 'hardware_refused',
+        title: 'Agent refused by hardware limits',
+        message: 'This agent requests a hardware limit that cannot be enforced.',
+    }),
+    hardware_blocked: Object.freeze({
+        state: 'unavailable',
+        code: 'hardware_blocked',
+        title: 'Agent blocked by a required dependency',
+        message: 'A required dependency of this agent was refused by hardware limits.',
+    }),
 });
+
+const HARDWARE_STARTUP_CODES = new Set(['hardware_refused', 'hardware_blocked']);
+
+function hardwareMessage(presentation, reason, fix) {
+    if (!HARDWARE_STARTUP_CODES.has(presentation?.code)) return presentation?.message || '';
+    const text = [String(reason || ''), String(fix || '')].map((part) => part.trim()).filter(Boolean).join(' ');
+    return (text || presentation.message).replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 4096);
+}
 
 function headerEntry(req, name) {
     const headers = req?.headers;
@@ -186,6 +208,9 @@ export function agentStartupBrowserPresentation(state, code = '') {
     if (state === 'unavailable' && code === 'route_unavailable') {
         return AGENT_STARTUP_BROWSER_COPY.route_unavailable;
     }
+    if (state === 'unavailable' && HARDWARE_STARTUP_CODES.has(code)) {
+        return AGENT_STARTUP_BROWSER_COPY[code];
+    }
     if (state === 'retry' && code === 'edge_generation_changed') {
         return AGENT_STARTUP_BROWSER_COPY.edge_generation_changed;
     }
@@ -213,7 +238,7 @@ function responseWithBody(kind, statusCode, headers, body) {
     });
 }
 
-export function buildAgentStartupProbeResponse({ state, generation = '', code = '' } = {}) {
+export function buildAgentStartupProbeResponse({ state, generation = '', code = '', reason = '', fix = '' } = {}) {
     let statusCode;
     let payload;
     if (state === 'starting') {
@@ -238,7 +263,7 @@ export function buildAgentStartupProbeResponse({ state, generation = '', code = 
             : {
                 state: presentation.state,
                 code: presentation.code,
-                message: presentation.message,
+                message: hardwareMessage(presentation, reason, fix),
             };
     }
     return responseWithBody('probe', statusCode, {
@@ -287,7 +312,9 @@ export function createAgentStartupSettlingState({
         && (terminalCode === 'startup_failed' || terminalCode === 'startup_timed_out')
         ? terminalCode
         : safeTerminalState === 'unavailable'
-            ? 'route_unavailable'
+            ? (terminalCode === 'hardware_refused' || terminalCode === 'hardware_blocked'
+                ? terminalCode
+                : 'route_unavailable')
             : '';
     return Object.freeze({
         candidateGeneration: '',
@@ -440,6 +467,13 @@ function browserScript({ initialState, initialCode }) {
         retry.hidden = true;
       };
       const showTerminal = (terminalState) => {
+        if (settling.terminalCode === 'hardware_refused' || settling.terminalCode === 'hardware_blocked') {
+          // Keep the server-rendered reason and fix; nothing to retry.
+          root.setAttribute('data-ploinky-agent-startup-page', 'unavailable');
+          spinner.hidden = true;
+          retry.hidden = true;
+          return;
+        }
         const presentation = terminalState === 'unavailable' ? copy.unavailable : copy.failed;
         root.setAttribute('data-ploinky-agent-startup-page', presentation.state);
         title.textContent = presentation.title;
@@ -557,6 +591,8 @@ export function renderAgentStartupPage({
     state = 'starting',
     code = '',
     routeLabel = '',
+    reason = '',
+    fix = '',
     nonce = createCspNonce(),
 } = {}) {
     const presentation = agentStartupBrowserPresentation(state, code);
@@ -569,8 +605,11 @@ export function renderAgentStartupPage({
     const label = safeRouteLabel(routeLabel);
     const safeLabel = escapeHtml(label);
     const safeTitle = escapeHtml(presentation.title);
-    const safeMessage = escapeHtml(presentation.message);
+    const safeMessage = escapeHtml(hardwareMessage(presentation, reason, fix));
     const terminal = presentation.state !== 'starting';
+    // A hardware refusal/block is terminal until the operator repairs it; no
+    // retry loop is offered.
+    const hardware = HARDWARE_STARTUP_CODES.has(presentation.code);
     const script = browserScript({
         initialState: presentation.state,
         initialCode: presentation.code || '',
@@ -612,7 +651,7 @@ export function renderAgentStartupPage({
       <p id="agent-startup-message">${safeMessage}</p>
       ${label ? `<p class="route-label">Opening <strong>${safeLabel}</strong></p>` : ''}
     </div>
-    <button id="agent-startup-retry" type="button"${terminal ? '' : ' hidden'}>Retry</button>
+    <button id="agent-startup-retry" type="button"${terminal && !hardware ? '' : ' hidden'}>Retry</button>
   </main>
   <script nonce="${nonce}">
     ${script}

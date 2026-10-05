@@ -263,6 +263,7 @@ function scriptedEnginePath(w, mode) {
     fs.writeFileSync(path.join(dir, 'podman'), `#!${process.execPath}
 const [command, sub] = process.argv.slice(2);
 if (${JSON.stringify(mode)} === 'hang' && command === 'container' && sub === 'inspect') setTimeout(() => {}, 60000);
+else if (${JSON.stringify(mode)} === 'missing') { process.stderr.write('podman: command not found\\n'); process.exit(127); }
 else { process.stderr.write('Error: unable to connect to Podman socket: connection refused\\n'); process.exit(125); }
 `, { mode: 0o755 });
     return [dir, w.env.PATH].join(path.delimiter);
@@ -273,9 +274,8 @@ test('an unknown engine answer never retires a launch receipt; only an exact mis
     w.drive('setup');
     const ensured = w.drive('worker-ensure');
     const staged = JSON.parse(fs.readFileSync(path.join(w.ws, '.ploinky', 'agents.json'), 'utf8'))[CONTAINER];
-    const withoutEngine = w.env.PATH.split(path.delimiter)
-        .filter((dir) => dir && !fs.existsSync(path.join(dir, 'podman')) && !fs.existsSync(path.join(dir, 'docker')))
-        .join(path.delimiter);
+    // No engine answers: a test-owned `podman` that is not found (the engine-spawn guard allows no other engine, not even an absent one).
+    const withoutEngine = scriptedEnginePath(w, 'missing');
     // The name probe reports every failure as "no container", so the receipt
     // branch is reached while the runtime still exists.
     for (const [label, PATH] of [

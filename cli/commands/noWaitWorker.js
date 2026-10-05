@@ -1,3 +1,4 @@
+import { acknowledgeMpsRuntimeReady, verifyMpsRuntimeReady } from '../sandbox/hardwareLimits/mpsLifecycle.mjs';
 import { retireRuntimeCandidate } from '../sandbox/runtimeCandidateStore.js';
 // Detached helper that boots a single `no-wait` dependency in the background
 // after `startWorkspace` has finished gating on its blocking dependencies.
@@ -74,6 +75,12 @@ import { effectiveInstanceKey } from '../utils/workspaceDependencyGraph.js';
 import { withWorkspaceMutationLease } from '../utils/runtime/maintenanceLocks.js';
 import { sanitizeDiagnosticText } from '../utils/diagnosticText.js';
 import {
+    HardwareLimitsError,
+    findHardwareOutcome,
+    validateHardwareOutcome,
+} from '../sandbox/hardwareLimits/errors.mjs';
+import { blockedByProducerOutcome } from '../sandbox/hardwareLimits/outcomes.mjs';
+import {
     assertSafeRelativeSegment,
     ensureVerifiedProducerDirectory,
 } from '../utils/verifiedReadOnlyFile.js';
@@ -111,11 +118,55 @@ export {
     resolveRunScopedObservation,
 } from './noWaitProtocol.js';
 
+// A failed terminal status keeps the bounded typed hardware outcome (and its
+// code) beside the redacted message, so observers never parse text.
+export function noWaitFailureError(failure, error, consumerIdentity = null) {
+    let outcome = findHardwareOutcome(failure);
+    if (!outcome && failure?.producerHardwareOutcome && consumerIdentity?.key && consumerIdentity?.ref) {
+        outcome = blockedByProducerOutcome({
+            key: consumerIdentity.key,
+            ref: consumerIdentity.ref,
+            alias: consumerIdentity.alias || null,
+            producer: failure.producerHardwareOutcome,
+        });
+    }
+    return outcome ? { ...error, code: outcome.code, hardwareOutcome: outcome } : error;
+}
+
 function statusPathFor(containerName, { runningDir = RUNNING_DIR } = {}) {
     return path.join(runningDir, 'no-wait', `${containerName}.json`);
 }
 
-function writeStatusFile(target, payload, { runningDir = RUNNING_DIR } = {}) {
+const NO_WAIT_STATUS_DIRECTORY_FSYNC_IGNORED_CODES = Object.freeze(['EINVAL', 'ENOTSUP', 'EISDIR', 'EBADF']);
+
+// Returns `{ skipped: <code> }` when the filesystem does not support a
+// directory fsync (an ignored error code): nothing was made durable, so the
+// caller must not credit a durability time. Any other failure throws.
+function fsyncStatusDirectory(directory, fsApi) {
+    let descriptor;
+    let skipped;
+    try {
+        descriptor = fsApi.openSync(directory, fsApi.constants.O_RDONLY);
+        fsApi.fsyncSync(descriptor);
+    } catch (error) {
+        // Directory fsync is not supported by every host filesystem. File fsync
+        // and atomic rename remain authoritative on those platforms.
+        if (!NO_WAIT_STATUS_DIRECTORY_FSYNC_IGNORED_CODES.includes(error?.code)) throw error;
+        skipped = error.code;
+    } finally {
+        if (descriptor !== undefined) {
+            try { fsApi.closeSync(descriptor); } catch (_) {}
+        }
+    }
+    return skipped === undefined ? {} : { skipped };
+}
+
+// A durable write (terminal `failed` documents) fsyncs the temp file before the
+// rename and the directory after it. The rename is the visibility point; the
+// directory fsync is the durability point. A directory fsync failure throws
+// NO_WAIT_STATUS_DURABILITY_UNCONFIRMED with `visible: true`: the status is
+// already visible and cannot be undone. Other writes keep their exact calls.
+function writeStatusFile(target, payload, { runningDir = RUNNING_DIR, durable = false, fsApi = fs } = {}) {
     const statusDirectory = ensureVerifiedProducerDirectory({
         trustedRoot: runningDir,
         relativeSegments: ['no-wait'],
@@ -132,13 +183,46 @@ function writeStatusFile(target, payload, { runningDir = RUNNING_DIR } = {}) {
     assertSafeRelativeSegment(path.basename(resolvedTarget), 'no-wait status filename');
     const temporary = `${resolvedTarget}.${process.pid}.${randomUUID()}.tmp`;
     try {
-        fs.writeFileSync(temporary, JSON.stringify(payload, null, 2), {
-            flag: 'wx',
-            mode: 0o600,
-        });
-        fs.renameSync(temporary, resolvedTarget);
+        if (durable) {
+            const descriptor = fsApi.openSync(
+                temporary,
+                fsApi.constants.O_WRONLY | fsApi.constants.O_CREAT | fsApi.constants.O_EXCL,
+                0o600,
+            );
+            try {
+                fsApi.writeFileSync(descriptor, JSON.stringify(payload, null, 2));
+                fsApi.fsyncSync(descriptor);
+            } finally {
+                fsApi.closeSync(descriptor);
+            }
+        } else {
+            fsApi.writeFileSync(temporary, JSON.stringify(payload, null, 2), {
+                flag: 'wx',
+                mode: 0o600,
+            });
+        }
+        fsApi.renameSync(temporary, resolvedTarget);
+        const visibleAtMs = Date.now();
+        if (!durable) return { visibleAtMs };
+        let directory;
+        try {
+            directory = fsyncStatusDirectory(path.dirname(resolvedTarget), fsApi);
+        } catch (cause) {
+            const failure = new Error(
+                `no-wait status '${path.basename(resolvedTarget)}' is visible but its directory fsync failed (${cause?.code || 'error'})`,
+            );
+            failure.code = 'NO_WAIT_STATUS_DURABILITY_UNCONFIRMED';
+            failure.fsCode = cause?.code || 'UNKNOWN';
+            failure.visible = true;
+            failure.durable = false;
+            failure.visibleAtMs = visibleAtMs;
+            failure.cause = cause;
+            throw failure;
+        }
+        if (directory.skipped !== undefined) return { visibleAtMs, durabilitySkipped: directory.skipped };
+        return { visibleAtMs, durableAtMs: Date.now() };
     } finally {
-        try { fs.unlinkSync(temporary); } catch (error) {
+        try { fsApi.unlinkSync(temporary); } catch (error) {
             if (error?.code !== 'ENOENT') throw error;
         }
     }
@@ -155,6 +239,7 @@ export function writeNoWaitWorkerStatus(containerName, payload, {
     waveIndex,
     statusFile,
     runningDir = RUNNING_DIR,
+    fsApi = fs,
 } = {}) {
     const normalizedRunId = exactRunId(runId);
     if (runId !== normalizedRunId) {
@@ -188,9 +273,47 @@ export function writeNoWaitWorkerStatus(containerName, payload, {
     // view first so a completed wave barrier never exposes an older canonical
     // phase to monitors, then release the run-scoped coordination file last as
     // the final barrier handoff.
-    writeStatusFile(canonicalStatusFile, document, { runningDir });
-    writeStatusFile(coordinationStatusFile, document, { runningDir });
-    return document;
+    if (document.state !== 'failed') {
+        writeStatusFile(canonicalStatusFile, document, { runningDir, fsApi });
+        writeStatusFile(coordinationStatusFile, document, { runningDir, fsApi });
+        return document;
+    }
+
+    // A terminal `failed` document is durable. The run-scoped file is the
+    // authoritative artifact: a canonical write failure (temp, rename or
+    // directory fsync) is logged and never suppresses it, and only a failure of
+    // the run-scoped rename throws. A directory fsync failure after that rename
+    // leaves the status visible and is reported, not thrown.
+    try {
+        writeStatusFile(canonicalStatusFile, document, { runningDir, durable: true, fsApi });
+    } catch (error) {
+        console.error(sanitizeDiagnosticText(
+            `[no-wait] ${containerName}: the canonical failed status could not be written durably; `
+            + `the run-scoped terminal status is still written: ${sanitizeDiagnosticText(error)}`,
+            { singleLine: true },
+        ));
+    }
+    let written;
+    try {
+        written = writeStatusFile(coordinationStatusFile, document, { runningDir, durable: true, fsApi });
+    } catch (error) {
+        if (error?.visible !== true) throw error;
+        written = { visibleAtMs: error.visibleAtMs, durabilityError: error.fsCode };
+        console.error(sanitizeDiagnosticText(
+            `[no-wait] ${containerName}: the run-scoped terminal status is visible but not durable: ${sanitizeDiagnosticText(error)}`,
+            { singleLine: true },
+        ));
+    }
+    return {
+        finishedAtMs: document.finishedAtMs ?? null,
+        visibleAtMs: written.visibleAtMs,
+        ...(written.durableAtMs !== undefined
+            ? { durableAtMs: written.durableAtMs }
+            : written.durabilitySkipped !== undefined
+                ? { durabilitySkipped: written.durabilitySkipped }
+                : { durabilityError: written.durabilityError }),
+        statusFile: document.statusFile,
+    };
 }
 
 function sleep(ms) {
@@ -347,6 +470,7 @@ export async function waitForRunScopedStatus(entry, {
                     targetWaveIndex: target.waveIndex,
                     timeouts,
                     nowMs,
+                    validateTerminalOutcome: validateHardwareOutcome,
                 });
             } catch (error) {
                 throw new Error(
@@ -354,7 +478,9 @@ export async function waitForRunScopedStatus(entry, {
                 );
             }
             if (observation.terminal) {
-                return Object.freeze({ state: observation.terminal });
+                return Object.freeze(observation.hardwareOutcome
+                    ? { state: observation.terminal, hardwareOutcome: observation.hardwareOutcome }
+                    : { state: observation.terminal });
             }
             deadline = observation.queued ? queuedDeadline : observation.deadline;
             if (!Number.isSafeInteger(observation.workerPid) || observation.workerPid <= 0) {
@@ -405,6 +531,7 @@ export async function waitForNoWaitStatusBarrier(entries, {
     runningDir = RUNNING_DIR,
     waitFn = waitForRunScopedStatus,
     waitOptions = {},
+    consumerIdentity = null,
 } = {}) {
     const barrier = Array.isArray(entries) ? entries : [];
     if (!barrier.length) return Object.freeze([]);
@@ -444,14 +571,37 @@ export async function waitForNoWaitStatusBarrier(entries, {
         error.cause = firstInvalid.error;
         throw error;
     }
-    const failedDependency = settled.find(({ entry, status }) => (
+    const failedDependencies = settled.filter(({ entry, status }) => (
         entry.directDependency && status?.state === 'failed'
     ));
+    // A waited-on producer's terminal hardware refusal or block makes this
+    // consumer blocked with the producer's root cause (plan §9.1, U14/U15).
+    const hardwareFailure = failedDependencies
+        .filter(({ status }) => status?.hardwareOutcome)
+        .sort((left, right) => statusIdentity(left.entry).localeCompare(statusIdentity(right.entry)))[0];
+    if (hardwareFailure && consumerIdentity?.key && consumerIdentity?.ref) {
+        const outcome = blockedByProducerOutcome({
+            key: consumerIdentity.key,
+            ref: consumerIdentity.ref,
+            alias: consumerIdentity.alias || null,
+            producer: hardwareFailure.status.hardwareOutcome,
+        });
+        throw new HardwareLimitsError({
+            ...outcome,
+            additionalCauseCount: outcome.additionalCauseCount + failedDependencies.length - 1,
+        });
+    }
+    const failedDependency = failedDependencies[0];
     if (failedDependency) {
         const error = new Error(
             `no-wait direct dependency '${statusIdentity(failedDependency.entry)}' failed in this run`,
         );
         error.code = 'PLOINKY_NO_WAIT_DIRECT_DEPENDENCY_FAILED';
+        // The producer's own outcome is kept separately: it describes the
+        // producer, and the publishing consumer converts it to its own block.
+        if (failedDependency.status?.hardwareOutcome) {
+            error.producerHardwareOutcome = failedDependency.status.hardwareOutcome;
+        }
         throw error;
     }
     return Object.freeze(settled.map(({ entry, status }) => Object.freeze({ entry, status })));
@@ -1594,7 +1744,7 @@ async function main() {
         const finishedAtMs = Date.now();
         const finishedAt = new Date(finishedAtMs).toISOString();
         try {
-            publishStatus({
+            const terminal = publishStatus({
                 containerName,
                 shortAgent,
                 repoName,
@@ -1612,8 +1762,9 @@ async function main() {
                 sequencePhaseStartedAtMs: finishedAtMs,
                 finishedAt,
                 finishedAtMs,
-                error: { message: sanitizeDiagnosticText(failure) },
+                error: noWaitFailureError(failure, { message: sanitizeDiagnosticText(failure) }),
             });
+            console.log(`[no-wait] ${shortAgent}: terminal status ${JSON.stringify(terminal)}`);
         } catch (publishFailure) {
             console.error(sanitizeDiagnosticText(
                 `[no-wait] ${shortAgent}: could not publish the pre-start failure status: ${sanitizeDiagnosticText(publishFailure)}`,
@@ -1657,6 +1808,8 @@ async function main() {
             runtimeKind: admittedRuntimeKind,
             catalogPolicy: llmAdmissionContext.catalogPolicy,
             catalogIdentity: llmAdmissionContext.catalogIdentity,
+            instanceKey: containerName,
+            alias: alias || '',
         });
         assertRuntimeAdmissionCurrent(runtimeAdmission, {
             manifestBytes: fs.readFileSync(manifestPath),
@@ -1850,6 +2003,7 @@ async function main() {
                     profileResolution: context.profileResolution,
                     routerEndpoint: context.routerEndpoint,
                     forceRecreate: args.forceRecreate === '1',
+                    forceRecreateReason: 'runtime identity rotated earlier in this start',
                     preservePreparedRegistryRecord: true,
                     instanceId: lifecycle.record.instanceId,
                     enableGeneration: lifecycle.record.enableGeneration,
@@ -1929,6 +2083,7 @@ async function main() {
                 const routedHostPort = context.profileResolution.network.mode === 'none'
                     ? null
                     : hostPort || null;
+                await verifyMpsRuntimeReady(result);
                 if (!context.adopted) {
                     await upsertRoute(routeKey, {
                         container: resolvedContainerName,
@@ -1951,6 +2106,7 @@ async function main() {
                     });
                 }
                 onCommitted();
+                await acknowledgeMpsRuntimeReady(result);
                 if (result?.durableCandidate) {
                     try { retireRuntimeCandidate(result.durableCandidate); } catch (error) {
                         console.warn(`[no-wait] ${shortAgent}: runtime committed; candidate receipt retained: ${error.message}`);
@@ -1982,19 +2138,20 @@ async function main() {
         // Carry the readiness probe's own output and the runtime log tail into
         // the terminal status. Cleanup has already removed the container by
         // now, so this is the only surviving explanation of the failure.
-        const error = {
+        const error = noWaitFailureError(failure, {
             message: redactFailure(failure.message),
             stack: failure.stack ? redactFailure(failure.stack) : null,
             ...(failure.readinessDetail ? { readinessDetail: failure.readinessDetail } : {}),
             ...(failure.runtimeLogTail ? { runtimeLogTail: failure.runtimeLogTail } : {}),
-        };
-        publishStatus({
+        }, { key: containerName, ref: `${repoName}/${shortAgent}`, alias: alias || null });
+        const terminal = publishStatus({
             ...baseStatus,
             state: 'failed',
             finishedAt,
             finishedAtMs,
             error
         });
+        console.log(`[no-wait] ${shortAgent}: terminal status ${JSON.stringify(terminal)}`);
         if (failure.readinessDetail) {
             console.error(`[no-wait] ${shortAgent}: readiness output:\n${failure.readinessDetail}`);
         }

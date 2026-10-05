@@ -13,7 +13,15 @@ import vm from 'node:vm';
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { startWorkspace } from '../../cli/commands/workspaceUtil.js';
+import {
+    createStartLaunchContainment,
+    graphNodeRuntimeReplacementReason,
+    launchAdditionalRuntimes,
+    launchWorkspaceGraphWaves,
+    recordMpsGraphPreparation,
+    startWorkspace,
+} from '../../cli/commands/workspaceUtil.js';
+import { summarizeStartResult } from '../../cli/sandbox/hardwareLimits/outcomes.mjs';
 import { tempRoot } from './dependencyStoreFixtures.mjs';
 import {
     CONTAINER,
@@ -148,6 +156,25 @@ function startFixture(t) {
         collectDependencyObjectsAfterAdmission: (options) => { calls.push(['collect', options.lease === workspaceLease, options.reason]); return {}; },
         reportDependencyCollection: (value) => value,
         abortEdgeRoutingPreparation: (lease, options) => calls.push(['abortPreparation', lease, options]),
+        // The hardware-limits collaborators of the start. The graph carries no GPU share and no refusal, so the tracker reports every
+        // node eligible and the MPS graph preparation is empty; the launch containment and the wave launchers are the real ones.
+        createGraphAvailabilityTracker: () => ({
+            outcomeForNode: () => null, outcomeForKey: () => null, unavailableEntries: () => [], recordLaunchRefusal: () => [],
+        }),
+        prepareMpsGraph: async () => ({ refusals: [], replacedKeys: new Set(), graphPreparationId: null }),
+        recordMpsGraphPreparation,
+        graphNodeRegistryKey: () => CONTAINER,
+        graphNodeRuntimeReplacementReason,
+        createStartLaunchContainment,
+        launchWorkspaceGraphWaves,
+        launchAdditionalRuntimes,
+        markRouteHardwareUnavailable: (route) => route,
+        finalizeMpsGraph: async () => {},
+        verifyMpsRuntimeReady: async () => {},
+        acknowledgeMpsRuntimeReady: async () => {},
+        writeNoWaitHardwareOutcome: () => {},
+        summarizeStartResult,
+        printStartResultSummary: () => {},
     };
     return { collaborators, calls, earlyLease, postProviderLease, workspaceLease, networkCapability, preparedRecord, ensureResult, stalledNoWaitRuns, registry: () => registry };
 }

@@ -6,6 +6,9 @@ import { handleRuntimeRoute } from '../../cli/server/handlers/webchat/runtimeRou
 import { createNetwork } from '../../cli/server/webchat/network.js';
 import { CLI_OUTPUT_BOUNDARY } from '../../cli/server/webchat/startupOutput.js';
 
+// This file runs real login shells on purpose (production `sh -lc` code under test): it opts in to the unit-test spawn guard's name-only login-shell reading.
+process.env.PLOINKY_ENGINE_GUARD_ALLOW_LOGIN_SHELLS = '1';
+
 const quote = (value) => `'${value.replace(/'/g, `'\\''`)}'`;
 
 async function runChild(script) {

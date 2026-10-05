@@ -18,6 +18,9 @@
 
 export const RESERVED_AGENT_REGISTRY_KEYS = Object.freeze(new Set(['_config']));
 
+// The alias spelling the registry accepts (see normalizeAlias in agents.js).
+export const AGENT_ALIAS_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
+
 // The log grammar reserves this literal for Router logs, so it is never offered
 // as a bare agent completion even when an agent or alias uses the spelling.
 export const RESERVED_LOG_TARGET = 'router';

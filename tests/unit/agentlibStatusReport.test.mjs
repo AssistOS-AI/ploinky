@@ -12,6 +12,7 @@ import test from 'node:test';
 
 import { buildImageSelection, buildSelection, writeActiveDescriptor } from '../../agentlib/source.mjs';
 import { OUTER_IMAGE_ID_FIXTURE, writeAgentLibCheckout } from '../helpers/agentlibFixture.mjs';
+import { installFakeEngine } from './dependencyStoreFakeEngine.mjs';
 
 const repoRoot = path.resolve(import.meta.dirname, '../..');
 const PROVENANCE = {
@@ -119,9 +120,11 @@ test('native status reaches that report through its read-only bootstrap; other n
     fs.writeFileSync(descriptor, previousShape);
     fs.writeFileSync(path.join(root, '.ploinky', 'routing.json'), '{"port":8080}\n');
 
+    // A test-owned engine answers the status command's engine probes (a real engine is never asked).
+    const engine = installFakeEngine(root, { engines: ['podman'] });
     const result = spawnSync(process.execPath, [path.join(repoRoot, 'cli/index.js'), 'status'], {
         cwd: root, encoding: 'utf8',
-        env: { ...process.env, PATH: '/usr/bin:/bin', PLOINKY_WORKSPACE_ROOT: root, NO_COLOR: '1', FORCE_COLOR: '' },
+        env: { ...process.env, ...engine.env, PLOINKY_WORKSPACE_ROOT: root, NO_COLOR: '1', FORCE_COLOR: '' },
     });
     assert.equal(result.status, 0, result.stderr);
     assert.ok(result.stdout.includes(descriptor), 'status names the unsupported file');

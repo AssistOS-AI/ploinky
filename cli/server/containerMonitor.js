@@ -1,4 +1,7 @@
 import fs from 'fs';
+import { readMpsStatus } from '../sandbox/hardwareLimits/mpsStatus.mjs';
+import { releaseMpsRuntimeOwner } from '../sandbox/hardwareLimits/mpsLifecycle.mjs';
+import { readAppliedObservation } from '../sandbox/hardwareLimits/runtimeState.mjs';
 import { resolveAgentRepositoryPath } from '../utils/agentRepositorySource.mjs';
 import crypto from 'node:crypto';
 import path from 'path';
@@ -51,6 +54,11 @@ import {
     withEdgeGenerationApplyLock,
 } from '../sandbox/edgeGeneration.js';
 import {
+    HARDWARE_DEPENDENCY_BLOCKED,
+    HARDWARE_UNENFORCEABLE,
+    findHardwareOutcome,
+} from '../sandbox/hardwareLimits/errors.mjs';
+import {
     NO_WAIT_STATE_BYTE_LIMIT,
     createNoWaitRunBinding,
     readNoWaitRunMarker,
@@ -87,6 +95,10 @@ const TERMINAL_POLICY_CODES = new Set([
     'PLOINKY_BOX_MARKER_INVALID',
     'PLOINKY_BWRAP_CAPABILITY_UNAVAILABLE',
     'PLOINKY_OPEN_INTERPRETER_BOX_UNAVAILABLE',
+    // Hardware refusal and dependency block are terminal policy outcomes:
+    // no retry or readiness probe until their relevant inputs change.
+    HARDWARE_UNENFORCEABLE,
+    HARDWARE_DEPENDENCY_BLOCKED,
 ]);
 const TERMINAL_LEDGER_SCHEMA_VERSION = 1;
 // Terminal blockers survive monitor restarts while their registry entry is
@@ -237,6 +249,7 @@ function recordTerminalFailure(monitor, info, error, restartInputDigest) {
         repoName: info.repoName,
         agentName: info.agentName,
         restartInputDigest,
+        mpsFingerprint: info.mpsFingerprint || null,
         blockerFingerprint,
         code,
         classification: classifyTerminalFailure(error) || 'policy',
@@ -304,6 +317,8 @@ function createContainerTarget(info, monitor) {
         probeConcurrencyDeferred: false,
         attemptEpoch: 0,
         restartInputDigest: info.restartInputDigest,
+        mpsFingerprint: info.mpsFingerprint || null,
+        mpsPending: info.mpsPending === true,
         runtimeAdmission: info.runtimeAdmission,
         restartSnapshot: info.restartSnapshot,
         terminalState: null,
@@ -353,6 +368,12 @@ function resolveWatchdogRestartInput(record, info, monitor) {
         runtimeKind,
         catalogPolicy: llmAdmissionContext.catalogPolicy,
         catalogIdentity: llmAdmissionContext.catalogIdentity,
+        instanceKey: info.containerName,
+        alias: info.alias || '',
+        ...(monitor.hardwareContext !== undefined ? { hardwareContext: monitor.hardwareContext } : {}),
+        ...(monitor.boxMarkerOptions !== undefined ? { boxMarkerOptions: monitor.boxMarkerOptions } : {}),
+        ...(monitor.gpuGrantOptions !== undefined ? { gpuGrantOptions: monitor.gpuGrantOptions } : {}),
+        ...(monitor.workspaceRoot !== undefined ? { workspaceRoot: monitor.workspaceRoot } : {}),
     });
     const stat = fs.statSync(info.manifestPath, { bigint: true });
     const restartInputDigest = digestValue({
@@ -1101,6 +1122,29 @@ export function syncManagedContainers(monitor) {
     )));
     pruneTerminalLedger(monitorRef, presentRegistryNames);
 
+    let mpsStatus;
+    const observeMpsTarget = (containerName, record, descriptor) => {
+        let applied = null;
+        try { applied = (monitorRef.readAppliedObservation || readAppliedObservation)(containerName, record.containerId); } catch (_) {}
+        const exact = applied && applied.containerId === record.containerId && applied.instanceId === record.instanceId && applied.enableGeneration === record.enableGeneration;
+        const desiredShare = Boolean(descriptor?.hardwareGpu);
+        const appliedShare = Boolean(applied?.mpsGeneration) && (exact || desiredShare);
+        if (!desiredShare && !appliedShare) return { mpsFingerprint: null, mpsPending: false };
+        if (mpsStatus === undefined) {
+            try { mpsStatus = (monitorRef.readMpsStatus || readMpsStatus)() || {}; } catch (_) { mpsStatus = { daemonStatus: 'unknown', mpsGeneration: null }; }
+        }
+        const generation = typeof mpsStatus?.mpsGeneration === 'string' ? mpsStatus.mpsGeneration.slice(0, 257) : null;
+        const daemonStatus = String(mpsStatus?.daemonStatus || 'unknown').slice(0, 32);
+        // Only applied-share facts restart a running instance: an exact share
+        // client whose daemon is lost, or a client whose share is still
+        // desired and whose applied identity is stale or whose applied
+        // generation differs. Saving a new share or clearing one changes
+        // desired policy only; Apply, start and restart reconcile it (§3, §5.3).
+        return {
+            mpsFingerprint: digestValue({ generation, daemonStatus }),
+            mpsPending: appliedShare && (!exact || daemonStatus !== 'ready' || (desiredShare && applied.mpsGeneration !== generation)),
+        };
+    };
     const desired = new Map();
     const readRouting = monitorRef.readRoutingConfig || readRoutingConfig;
     const routing = readRouting();
@@ -1158,6 +1202,9 @@ export function syncManagedContainers(monitor) {
                 runtime: record.runtime || 'container',
                 instanceId: String(record.instanceId || ''),
                 enableGeneration: String(record.enableGeneration || ''),
+                // Only this agent's own hardware inputs re-arm it; unrelated
+                // policy writes leave the fingerprint unchanged.
+                hardwareFingerprint: findHardwareOutcome(error)?.inputFingerprint || '',
             });
             if (terminal) {
                 const info = {
@@ -1166,9 +1213,10 @@ export function syncManagedContainers(monitor) {
                     repoName,
                     instanceId: String(record.instanceId || '').trim() || null,
                     enableGeneration: String(record.enableGeneration || '').trim() || null,
+                    ...observeMpsTarget(containerName, record, { hardwareGpu: findHardwareOutcome(error)?.requested?.some((entry) => entry.field === 'gpu') === true }),
                 };
                 const existing = monitorRef.terminalLedger?.get(containerName);
-                if (existing?.restartInputDigest !== fallbackDigest) {
+                if (existing?.restartInputDigest !== fallbackDigest || (existing?.mpsFingerprint || null) !== info.mpsFingerprint) {
                     recordTerminalFailure(monitorRef, info, error, fallbackDigest);
                 }
                 const target = monitorRef.targets.get(containerName);
@@ -1208,10 +1256,11 @@ export function syncManagedContainers(monitor) {
             restartInputDigest: restartInput.restartInputDigest,
             runtimeAdmission: restartInput.runtimeAdmission,
             restartSnapshot: restartInput.restartSnapshot,
+            ...observeMpsTarget(containerName, record, restartInput.runtimeAdmission.descriptor),
         };
         monitorRef.terminalLedger ||= loadTerminalLedger(monitorRef);
         const terminal = monitorRef.terminalLedger.get(containerName);
-        if (terminal?.restartInputDigest === restartInput.restartInputDigest) {
+        if (terminal?.restartInputDigest === restartInput.restartInputDigest && (terminal?.mpsFingerprint || null) === info.mpsFingerprint) {
             continue;
         }
         if (terminal) {
@@ -1242,7 +1291,7 @@ export function syncManagedContainers(monitor) {
             // rejects it before publication; the next tick adopts state only
             // after that attempt has finished or failed stale.
             if (target.isRestarting) continue;
-            if (target.restartInputDigest !== restartInput.restartInputDigest) {
+            if (target.restartInputDigest !== restartInput.restartInputDigest || (target.mpsFingerprint || null) !== info.mpsFingerprint) {
                 target.attemptEpoch += 1;
                 if (target.pendingRestartTimer) clearTimeout(target.pendingRestartTimer);
                 target.pendingRestartTimer = null;
@@ -1263,6 +1312,8 @@ export function syncManagedContainers(monitor) {
             target.restartInputDigest = restartInput.restartInputDigest;
             target.runtimeAdmission = restartInput.runtimeAdmission;
             target.restartSnapshot = restartInput.restartSnapshot;
+            target.mpsFingerprint = info.mpsFingerprint;
+            target.mpsPending = info.mpsPending;
         }
     }
 
@@ -2131,13 +2182,15 @@ export async function performContainerRestart(monitor, target, reason, attempt =
         }
         noWaitLineage = captureNoWaitRebindLineage(monitor, target, restartRecord);
         result = await Promise.resolve(ensureAgentServiceImpl(target.agentName, manifest, agentDir, {
+            hardwareInstanceKey: target.containerName,
             containerName: target.containerName,
             commandHint: `ploinky restart ${target.alias || target.agentName}`,
             networkLockWaitMs: 0,
             profileName: profileResolution.resolvedProfileName,
             profileResolution,
             routerEndpoint,
-            forceRecreate: reason === 'semantic_probe_failed',
+            forceRecreate: reason === 'semantic_probe_failed' || reason === 'mps_generation_changed',
+            forceRecreateReason: `monitor restart (${reason})`,
             // The registry record captured with this restart attempt is the
             // only runtime it may replace.
             expectedPredecessor: registeredRuntimeTuple(restartRecord),
@@ -2271,6 +2324,10 @@ export async function performContainerRestart(monitor, target, reason, attempt =
         // A retained transaction has already handled its exact abort/cleanup.
         // Its failure must not be processed again as a newly launched result.
         const failedResult = retryingPreparation ? null : result || error?.ploinkyRestartCandidate || null;
+        // The launching operation is over: a GPU share or share-less readiness
+        // owner must not stay live in this process (the failure counterpart of
+        // acknowledging readiness).
+        releaseMpsRuntimeOwner(failedResult);
         const expectedRegistryRecord = registryCandidateCommitted
             ? failedResult?.registryRecord || null
             : preActivationRegistryRecord(failedResult, attempt);
@@ -2606,6 +2663,11 @@ export function monitorTick(monitor) {
                 stopProbeWorker(target);
                 continue;
             }
+            if (target.mpsPending) {
+                stopProbeWorker(target);
+                scheduleContainerRestart(monitor, target, 'mps_generation_changed');
+                continue;
+            }
             const continuousProbeIntervalMs = positiveInteger(
                 monitor?.config?.CONTINUOUS_PROBE_INTERVAL_MS
                     ?? process.env.PLOINKY_CONTAINER_MONITOR_CONTINUOUS_PROBE_INTERVAL_MS,
@@ -2630,16 +2692,18 @@ export function monitorTick(monitor) {
         }
 
         stopProbeWorker(target);
-        scheduleContainerRestart(monitor, target, 'not_running');
+        scheduleContainerRestart(monitor, target, target.mpsPending ? 'mps_generation_changed' : 'not_running');
     }
 }
 
-export function createContainerMonitor({ config, log, isShuttingDown, terminalLedgerFile: ledgerFile } = {}) {
+export function createContainerMonitor({ config, log, isShuttingDown, terminalLedgerFile: ledgerFile, readMpsStatus: observeMps, readAppliedObservation: observeApplied } = {}) {
     const monitor = {
         config: config || {},
         log,
         isShuttingDown: typeof isShuttingDown === 'function' ? isShuttingDown : () => false,
         targets: new Map(),
+        ...(observeMps ? { readMpsStatus: observeMps } : {}),
+        ...(observeApplied ? { readAppliedObservation: observeApplied } : {}),
         timer: null,
         runtimeSnapshotFailures: 0,
         runtimeSnapshotRetryNotBefore: 0,
@@ -2699,3 +2763,7 @@ export function clearContainerTargets(monitor) {
     monitor.runtimeSnapshotTakenAt = 0;
     monitor.runtimeSnapshotFreshForTick = false;
 }
+
+export const __testables = Object.freeze({
+    classifyTerminalFailure,
+});

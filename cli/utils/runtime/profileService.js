@@ -6,6 +6,7 @@ import { validateSecrets } from '../security/secretInjector.js';
 import { collectManifestEnv, validateManifestEnvProfileCompleteness } from '../security/secretVars.js';
 import { debugLog, findAgent } from '../utils.js';
 import { effectiveManifestNetwork, validateManifestNetworks } from '../../sandbox/networkContract.js';
+import { mergeProfileHardwareLimits } from '../../sandbox/hardwareLimits/declaredLimits.mjs';
 
 // Discover all valid profile names from installed agent manifests.
 // Any profile name declared in a manifest's "profiles" section is valid.
@@ -133,6 +134,8 @@ function mergeEnv(defaultEnv, activeEnv) {
  * - Hooks: active overrides default (not concatenate)
  * - Secrets: concatenate (active adds to default)
  * - Mounts: deep merge (active overrides default)
+ * - Hardware limits (memory, cpus, pidsLimit): per key, active overrides
+ *   default; each profile's own conflict is kept so admission refuses it
  *
  * @param {object} defaultProfile - The default profile configuration
  * @param {object} activeProfile - The active profile configuration
@@ -183,7 +186,10 @@ export function mergeProfiles(defaultProfile, activeProfile) {
         merged.configProviders = activeProfile.configProviders;
     }
 
-    return merged;
+    // Declared hardware limits from either profile, including the deprecated
+    // llmRuntime.runtimePolicy.resources keys; other llmRuntime fields keep
+    // the default profile's value.
+    return mergeProfileHardwareLimits(merged, defaultProfile, activeProfile);
 }
 
 /**

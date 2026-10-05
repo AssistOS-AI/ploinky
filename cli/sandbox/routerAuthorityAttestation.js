@@ -392,10 +392,10 @@ function resolveAuthorityCommandRunner(commandRunner) {
     });
 }
 
-function runBounded(commandRunner, command, args, { timeout = HELPER_TIMEOUT_MS, operation } = {}) {
+function runBounded(commandRunner, command, args, { timeout = HELPER_TIMEOUT_MS, operation, enginePrefix = [] } = {}) {
     let result;
     try {
-        result = commandRunner.run(command, args, {
+        result = commandRunner.run(command, enginePrefix.length ? [...enginePrefix, ...args] : args, {
             encoding: 'utf8',
             timeout,
             maxBuffer: MAX_OUTPUT_BYTES,
@@ -727,8 +727,17 @@ export function runContainerAuthorityProbe({
     registerObservation,
     consumeObservation,
     commandRunner: commandRunnerInput,
+    // Hardware placement for the helper: /ploinky/system only when cpu,
+    // memory and pids are all enforceable; otherwise none. The helper's
+    // recorded --pids-limit/--memory/--cpus flags are always kept.
+    placement = null,
+    // Test/acceptance seam: observe the helper after its completed probe and
+    // before cleanup (for example its final memory.peak).
+    observeCompletedProbe = null,
 } = {}) {
     if (runtime !== 'podman') fail('PLOINKY_ROUTER_ATTESTATION_UNSUPPORTED', 'container attestation requires verified Podman');
+    const enginePrefix = placement?.enforced ? [...placement.enginePrefix] : [];
+    const placementArgs = placement?.enforced ? [...placement.args] : [];
     if (typeof registerObservation !== 'function' || typeof consumeObservation !== 'function') {
         fail('PLOINKY_ROUTER_ATTESTATION_INVALID', 'container attestation requires an exact observation lifecycle');
     }
@@ -776,11 +785,13 @@ export function runContainerAuthorityProbe({
     let primaryError;
     try {
         helperId = runBounded(commandRunner, runtime, [
+            ...enginePrefix,
             'create', '--name', helperName,
             '--label', `${AUTHORITY_HELPER_LABEL}=${nonce}`,
             '--init',
             '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges',
             '--pids-limit', '32', '--memory', '64m', '--cpus', '0.25',
+            ...placementArgs,
             '--user', AUTHORITY_HELPER_USER,
             '--entrypoint', 'node',
             ...(plan?.args || []),
@@ -795,7 +806,7 @@ export function runContainerAuthorityProbe({
         // idle helper before registration, then execute only the confined live
         // observations inside that window. The probe independently verifies
         // its zero capability bounding/effective sets and no-new-privileges.
-        runBounded(commandRunner, runtime, ['start', helperId], { operation: 'start authority helper (podman start)' });
+        runBounded(commandRunner, runtime, ['start', helperId], { operation: 'start authority helper (podman start)', enginePrefix });
         const running = inspectAuthorityHelper(commandRunner, runtime, helperId);
         proveAuthorityHelperIdentity(running, { ...expectedIdentity, expectedId: helperId });
         if (running.running !== true || running.status !== 'running') {
@@ -803,11 +814,15 @@ export function runContainerAuthorityProbe({
         }
         registerObservation();
         const output = runBounded(commandRunner, runtime, [
+            ...enginePrefix,
             'exec', '--user', AUTHORITY_HELPER_USER,
             helperId, 'node', '-e', PROBE_SCRIPT,
             intent.physicalOrigin, firstHost, secondHost, nonce,
         ], { operation: 'probe router authority (podman exec)' });
         consumeObservation();
+        // After the completed workload and before any cleanup can remove the
+        // helper's leaf.
+        if (typeof observeCompletedProbe === 'function') observeCompletedProbe({ helperId, placement: placement?.status || 'recorded, not enforced' });
         let external;
         try { external = JSON.parse(output); } catch (error) { fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'helper probe output was malformed', error); }
         if (!Array.isArray(external) || external.length !== 2) fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'helper did not produce exactly two observations');

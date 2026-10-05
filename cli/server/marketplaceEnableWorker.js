@@ -1,6 +1,7 @@
 import { Worker } from 'node:worker_threads';
 import { randomUUID } from 'node:crypto';
 import { resolveNoWaitBarrierTimeouts } from '../commands/noWaitProtocol.js';
+import { validateHardwareOutcome } from '../sandbox/hardwareLimits/errors.mjs';
 import { retainWorkspaceMutationLeaseForRecovery } from '../utils/runtime/maintenanceLocks.js';
 
 const MARKETPLACE_ENABLE_WORKER_URL = new URL('./marketplaceEnableWorkerThread.js', import.meta.url);
@@ -13,10 +14,22 @@ function boundedMessage(value, fallback) {
     return (message || fallback).slice(0, 512);
 }
 
-function deserializeWorkerError(payload, depth = 0) {
+export function deserializeWorkerError(payload, depth = 0) {
     const error = new Error(boundedMessage(payload?.message, 'Marketplace agent activation failed.'));
     if (typeof payload?.code === 'string' && payload.code) error.code = payload.code;
     if (Number.isInteger(payload?.status)) error.status = payload.status;
+    if (depth === 0 && payload?.hardwareOutcome !== undefined) {
+        // An invalid outcome is rejected rather than degraded to text.
+        try {
+            error.hardwareOutcome = validateHardwareOutcome(payload.hardwareOutcome);
+        } catch (cause) {
+            const invalid = new Error('Marketplace enable worker returned an invalid typed outcome.', { cause });
+            invalid.code = 'PLOINKY_MARKETPLACE_ENABLE_WORKER_FAILED';
+            return invalid;
+        }
+        error.code = error.hardwareOutcome.code;
+        if (!Number.isInteger(error.status)) error.status = error.hardwareOutcome.state === 'blocked' ? 424 : 422;
+    }
     if (depth < 4 && payload?.cause && typeof payload.cause === 'object') {
         error.cause = deserializeWorkerError(payload.cause, depth + 1);
     }

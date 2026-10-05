@@ -426,3 +426,41 @@ test('Marketplace mapping preserves its detailed operator-facing response shape'
     });
     assert.equal(mapNoWaitObservationForMarketplace(null), null);
 });
+
+test('NW.bounded-invalid-status', async () => {
+    const { resolveRunScopedObservation, resolveNoWaitBarrierTimeouts } = await import('../../cli/commands/noWaitProtocol.js');
+    const { validateHardwareOutcome } = await import('../../cli/sandbox/hardwareLimits/errors.mjs');
+    const runId = '12345678-1234-4234-8234-1234567890ab';
+    const runStartedAtMs = 1_700_000_000_000;
+    const base = {
+        state: 'failed', sequencePhase: 'active', runId, runStartedAtMs, waveIndex: 0,
+    };
+    const observe = (error) => resolveRunScopedObservation({ ...base, error }, {
+        expectedRunId: runId, runStartedAtMs, targetWaveIndex: 0, timeouts: resolveNoWaitBarrierTimeouts(), nowMs: runStartedAtMs + 10,
+        validateTerminalOutcome: validateHardwareOutcome,
+    });
+    // An ordinary failure without a subtype stays a generic failure.
+    assert.deepEqual(observe({ message: 'boom' }), { terminal: 'failed' });
+    // An observer without the shared validator cannot accept a subtype.
+    assert.throws(() => resolveRunScopedObservation({ ...base, error: { message: 'x', hardwareOutcome: {} } }, {
+        expectedRunId: runId, runStartedAtMs, targetWaveIndex: 0, timeouts: resolveNoWaitBarrierTimeouts(), nowMs: runStartedAtMs + 10,
+    }), /cannot be validated/);
+    // A present but invalid subtype invalidates the status instead of being
+    // parsed from text or silently dropped.
+    for (const hardwareOutcome of [
+        { state: 'refused' },
+        { state: 'refused', code: 'PLOINKY_HARDWARE_LIMITS_UNENFORCEABLE', extra: true },
+        'x'.repeat(20000),
+        null,
+    ]) {
+        assert.throws(() => observe({ message: 'bad', hardwareOutcome }), /hardware outcome/);
+    }
+    const observation = { state: 'failed', status: { ...base, error: { message: 'bad', hardwareOutcome: { state: 'refused' } } }, record: { instanceId: 'i' } };
+    const result = resolveNoWaitAgentStartupState({ lease: { commit: () => true } }, {
+        inspectPublication: () => ({ ok: true, containerName: 'c', record: { instanceId: 'i' } }),
+        readRunMarker: () => ({}),
+        createRunBinding: () => ({}),
+        observeRun: () => observation,
+    });
+    assert.equal(result.state, 'unverified');
+});

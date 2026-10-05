@@ -1,6 +1,8 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import { observeContainerHardwareWiring, sameHardwareWiring } from '../hardwareLimitsGate.mjs';
 import { isDeepStrictEqual } from 'node:util';
+import { assertGateOffStoreEmpty, hardwareStorePaths, readStoreSnapshot } from '../../cli/sandbox/hardwareLimits/store.mjs';
 
 import {
     BOX_DATA_FINGERPRINT_LABELS,
@@ -82,6 +84,12 @@ function samePublication(left, right) {
         && JSON.stringify(left.hosts) === JSON.stringify(right.hosts);
 }
 
+// The exact create contract of an observed owned Box, validated against its
+// own labels and mounts (used to snapshot a downgrade's restore target).
+export function observeBoxConfiguration(identity, ownership, repositoryRoot, engine) {
+    return oldDesired(identity, ownership, repositoryRoot, engine);
+}
+
 function oldDesired(identity, ownership, repositoryRoot, engine) {
     // The AgentLib contract is reconstructed from the observed mount plus the
     // Box labels, never from the caller's new selection: an existing Box has to
@@ -102,12 +110,14 @@ function oldDesired(identity, ownership, repositoryRoot, engine) {
     // mounts, never from a fresh discovery, so a driver change can replace
     // (and a failure can restore) exactly the Box that exists.
     const gpu = observeContainerGpuWiring(container, { identity });
+    const hardware = observeContainerHardwareWiring(container, { identity });
     const desired = {
         identity,
         hostPort,
         mediaHostPort,
         routerBinding,
         gpu,
+        hardware,
         imageRef,
         imageId,
         repositoryRoot,
@@ -164,6 +174,7 @@ async function createAndStart({
     mediaHostPort,
     routerBinding,
     gpu = null,
+    hardware = null,
     repositoryRoot,
     agentLib,
     runner,
@@ -211,6 +222,7 @@ async function createAndStart({
         hostKind: engine.hostKind,
         networkMode,
         gpu,
+        hardware,
     }));
     let containerId;
     try {
@@ -236,6 +248,7 @@ async function createAndStart({
         mediaHostPort,
         routerBinding,
         gpu,
+        hardware,
         imageId: image.immutableId,
         imageRef,
         repositoryRoot,
@@ -275,6 +288,7 @@ async function restoreOldContainer({
             );
         }
     }
+    if (!old.hardware) await dependencies.assertGateOffRestore({ identity, lock, engine, runner });
     return createAndStart({
         engine,
         identity,
@@ -285,6 +299,7 @@ async function restoreOldContainer({
         mediaHostPort: old.mediaHostPort,
         routerBinding: old.routerBinding,
         gpu: old.gpu,
+        hardware: old.hardware ?? null,
         repositoryRoot: old.repositoryRoot,
         agentLib: old.agentLib,
         restoring: true,
@@ -318,6 +333,10 @@ export async function reconcileBoxContainer({
     // undefined keeps an existing Box's own GPU wiring (a new Box gets none);
     // null or a wiring from `resolveGpuWiring` selects it exactly.
     gpu = undefined,
+    // Same for the hardware-limits wiring: undefined keeps the Box's own,
+    // null selects gate off, a wiring selects gate on exactly.
+    hardware = undefined,
+    assertGateOffRestore = null,
     imageRef = BOX_IMAGE_REFERENCE,
     imagePolicy = 'pull',
     allowReplacement = true,
@@ -360,6 +379,15 @@ export async function reconcileBoxContainer({
         }),
         fsApi: seams.fsApi || fs,
         token: seams.token || (() => crypto.randomBytes(12).toString('hex')),
+        assertGateOffRestore: assertGateOffRestore || (({ identity: selectedIdentity, lock: selectedLock }) => {
+            selectedLock.assertHeld(selectedIdentity.instance);
+            const paths = hardwareStorePaths({ identity: selectedIdentity });
+            if (readStoreSnapshot({ paths, identity: selectedIdentity }).status !== 'absent-never-initialized') {
+                const observed = dependencies.discover(selectedIdentity, { runner });
+                if (observed?.state !== 'absent') throw transactionError('Cannot restore gate-off wiring until candidate Box writers are proven absent; run PLOINKY_BOX_HARDWARE_LIMITS=on ploinky restart');
+            }
+            return assertGateOffStoreEmpty({ paths, identity: selectedIdentity });
+        }),
     };
     function validateFinalOwnership(containerId, desired) {
         lock.assertHeld(identity.instance);
@@ -390,6 +418,7 @@ export async function reconcileBoxContainer({
     const currentContainer = ownership.handles?.container || null;
     const old = currentContainer ? oldDesired(identity, ownership, repositoryRoot, engine) : null;
     const desiredGpu = gpu === undefined ? (old?.gpu ?? null) : gpu;
+    const desiredHardware = hardware === undefined ? (old?.hardware ?? null) : hardware;
     let oldImage = null;
     if (old) {
         oldImage = dependencies.validateExistingImage(engine.name, old.imageId, old.imageRef, runner);
@@ -428,6 +457,9 @@ export async function reconcileBoxContainer({
         // A new or revoked grant, changed agents, or a driver update changes
         // the devices and binds, which Podman cannot change in place.
         || !sameGpuWiring(old.gpu, desiredGpu)
+        // Turning the gate on or off, or replacing the store directory,
+        // changes the hardware-limits binds and label.
+        || !sameHardwareWiring(old.hardware, desiredHardware)
         || old.imageRef !== imageRef
         || dataPathsChanged
         // A changed source directory, mode, identity, or fingerprint must never
@@ -488,6 +520,9 @@ export async function reconcileBoxContainer({
                 mediaHostPort: old.mediaHostPort,
                 routerBinding: routerBindingResult(old.routerBinding, old.hostPort),
                 gpu: old.gpu,
+                // The Box's own hardware-limits wiring (null only for a
+                // gate-off Box), so recovery never brings it back gate-off.
+                hardware: old.hardware ?? null,
                 agentLib: old.agentLib,
             });
             throw failure;
@@ -500,9 +535,11 @@ export async function reconcileBoxContainer({
             mediaHostPort: old.mediaHostPort,
             routerBinding: reusedBinding,
             gpu: old.gpu,
+            hardware: old.hardware ?? null,
             previousAgentLib: old.agentLib,
             previousRouterBinding: reusedBinding,
             previousGpu: old.gpu,
+            previousHardware: old.hardware ?? null,
             // Non-settling proof of the exact reused Box, for use immediately
             // before a graph mutation or admission write.
             validate() { validateFinalOwnership(currentContainer.id, old); },
@@ -605,6 +642,7 @@ export async function reconcileBoxContainer({
             mediaHostPort: portPlan.mediaHostPort,
             routerBinding: desiredBinding,
             gpu: desiredGpu,
+            hardware: desiredHardware,
             repositoryRoot,
             agentLib: desiredAgentLib,
             runner,
@@ -680,6 +718,7 @@ export async function reconcileBoxContainer({
                 mediaHostPort: old.mediaHostPort,
                 routerBinding: routerBindingResult(old.routerBinding, old.hostPort),
                 gpu: old.gpu,
+                hardware: old.hardware ?? null,
                 agentLib: old.agentLib,
             } : { action: 'candidate-removed' });
         };
@@ -690,6 +729,8 @@ export async function reconcileBoxContainer({
             mediaHostPort: portPlan.mediaHostPort,
             routerBinding: desiredBinding,
             gpu: desiredGpu,
+            hardware: desiredHardware,
+            previousHardware: old ? (old.hardware ?? null) : null,
             imageId: image.immutableId,
             previousAgentLib: old?.agentLib || null,
             previousRouterBinding: old ? routerBindingResult(old.routerBinding, old.hostPort) : null,
@@ -754,6 +795,9 @@ export async function reconcileBoxContainer({
                 mediaHostPort: old.mediaHostPort,
                 routerBinding: routerBindingResult(old.routerBinding, old.hostPort),
                 gpu: old.gpu,
+                // The old Box's own hardware-limits wiring (null only for a
+                // gate-off Box), so recovery never brings it back gate-off.
+                hardware: old.hardware ?? null,
                 agentLib: old.agentLib,
             } : {}),
         });

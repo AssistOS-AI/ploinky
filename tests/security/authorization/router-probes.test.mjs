@@ -11,7 +11,10 @@ test('Router inventory identities are unique and every source reference is a rea
   for (const row of routerInventory) {
     const [file, line] = row.source.split(':');
     const source = fs.readFileSync(fileURLToPath(new URL(`../../../${file}`, import.meta.url)), 'utf8');
-    assert.ok(Number(line) > 0 && Number(line) <= source.split('\n').length, row.source);
+    assert.ok(/^\d+$/.test(String(line)) && Number(line) > 0 && Number(line) <= source.split('\n').length, row.source);
+    // A row that names its handler statement must still point at it after
+    // unrelated insertions shift the file.
+    if (row.anchor) assert.ok(source.split('\n')[Number(line) - 1].includes(row.anchor), `${row.source} no longer contains ${row.anchor}`);
     assert.deepEqual(Object.keys(row.expected).sort(), ['admin', 'anonymous', 'selfRegistered', 'user']);
   }
 });

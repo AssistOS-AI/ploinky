@@ -73,8 +73,26 @@ function validateResources(resources, label) {
     if (resources.memory !== undefined && !SIZE_RE.test(String(resources.memory))) {
         throw new RuntimePolicyError(`${label}.memory: invalid size value`);
     }
+    // A limit is a representable, non-zero amount: an overflowing or zero
+    // value must never read as "no limit" downstream.
+    if (resources.memory !== undefined) {
+        const bytes = sizeBytes(resources.memory);
+        if (!Number.isSafeInteger(bytes) || bytes < 1) {
+            throw new RuntimePolicyError(`${label}.memory: must be a size from 1 byte to ${Number.MAX_SAFE_INTEGER} bytes`);
+        }
+    }
     if (resources.cpus !== undefined && !CPU_RE.test(String(resources.cpus))) {
         throw new RuntimePolicyError(`${label}.cpus: invalid CPU value`);
+    }
+    if (resources.cpus !== undefined) {
+        // Base validation keeps its representability rule and never rounds up:
+        // the quota the engine derives truncates. The two-decimal rule of
+        // plan §8.1 and amendment A3 applies only where limits are placed
+        // under hardware limits (hardware eligibility), not on every path.
+        const quota = Math.floor(Number(resources.cpus) * 100000);
+        if (!Number.isFinite(Number(resources.cpus)) || !Number.isSafeInteger(quota) || quota < 1) {
+            throw new RuntimePolicyError(`${label}.cpus: must be a positive CPU count of at least 0.00001 with a representable quota`);
+        }
     }
     if (resources.shmSize !== undefined) {
         const bytes = sizeBytes(resources.shmSize);
@@ -103,6 +121,32 @@ function validateResources(resources, label) {
         }
     }
     return resources;
+}
+
+const HARDWARE_LIMIT_KEYS = new Set(['memory', 'cpus', 'pidsLimit']);
+const GPU_SHARE_KEY_RE = /gpu|vram|^sm(percent)?$/i;
+
+// An agent's neutral `hardwareLimits` declaration: only memory, cpus and
+// pidsLimit, each validated exactly as the same key of `resources`. A GPU
+// share is administrator-only and never declarable.
+function validateHardwareLimitsShape(value, label) {
+    if (value === undefined) return null;
+    const code = 'PLOINKY_HARDWARE_LIMITS_DECLARATION_INVALID';
+    try {
+        ensurePlainObject(value, label);
+        for (const key of Object.keys(value)) {
+            if (HARDWARE_LIMIT_KEYS.has(key)) continue;
+            const shown = key.slice(0, 64);
+            if (GPU_SHARE_KEY_RE.test(key)) {
+                throw new RuntimePolicyError(`${label}: '${shown}' cannot be declared; GPU shares are administrator-only and are set in Explorer Settings → Hardware limits`);
+            }
+            throw new RuntimePolicyError(`${label}: unknown field '${shown}' (allowed: memory, cpus, pidsLimit)`);
+        }
+        return validateResources(value, label);
+    } catch (error) {
+        if (error instanceof RuntimePolicyError) error.code = code;
+        throw error;
+    }
 }
 
 function validateDevices(devices, label, options = {}) {
@@ -338,5 +382,6 @@ export {
     emitRunArgs,
     mergePolicy,
     policyDefaults,
+    validateHardwareLimitsShape,
     validatePolicyShape,
 };

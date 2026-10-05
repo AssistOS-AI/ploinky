@@ -30,7 +30,8 @@ import {
     prepareTargetedAgentRestart,
 } from './targetedAgentRestart.js';
 import { withHeldOrAcquiredWorkspaceMutationLease, withMaintenanceLock } from '../utils/runtime/maintenanceLocks.js';
-
+import { reconcileExactHardwareInstance } from '../sandbox/hardwareLimits/reconcile.mjs';
+import { wrapPreservingHardwareCause } from '../sandbox/hardwareLimits/errors.mjs';
 import { printComponentAccess } from '../server/utils/routerEnv.js';
 import {
     getAgentContainerName,
@@ -487,6 +488,8 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                     manifestBytes,
                     agentId: `${registryRecord?.record?.repoName || resolved.repo}/${resolved.shortAgentName}`,
                     profileName: profileResolution.resolvedProfileName,
+                    instanceKey: registryRecord?.containerName,
+                    alias: registryRecord?.record?.alias || '',
                 });
                 const routerEndpoint = resolveRouterEndpoint(profileResolution.network.mode);
 
@@ -518,7 +521,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                                     repo: resolved.repo,
                                 },
                             }, async () => withNetworkLifecycleLock(async (networkLifecycleCapability) => {
-                                const result = ensureAgentService(resolved.shortAgentName, manifest, path.dirname(resolved.manifestPath), {
+                                const result = await ensureAgentService(resolved.shortAgentName, manifest, path.dirname(resolved.manifestPath), {
                                     containerName,
                                     alias: registryRecord?.record?.alias,
                                     profileName: profileResolution.resolvedProfileName,
@@ -571,10 +574,11 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                             },
                         }, async () => withNetworkLifecycleLock(async (networkLifecycleCapability) => {
                             const agentPath = path.dirname(resolved.manifestPath);
-                            const restartResult = ensureAgentService(resolved.shortAgentName, manifest, agentPath, {
+                            const restartResult = await ensureAgentService(resolved.shortAgentName, manifest, agentPath, {
                                 containerName,
                                 alias: registryRecord?.record?.alias,
                                 forceRecreate: true,
+                                forceRecreateReason: 'restart command',
                                 profileName: profileResolution.resolvedProfileName,
                                 profileResolution,
                                 routerEndpoint,
@@ -615,87 +619,33 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
 
                         console.log(`✓ Agent restarted (${agentRuntime}).`);
                     } catch (e) {
-                        throw new Error(
+                        throw wrapPreservingHardwareCause(
                             `Failed to restart agent '${agentName}' via ${agentRuntime}: ${e.message}`,
-                            { cause: e },
+                            e,
                         );
                     }
                 } else {
-                    // Recreate through the managed transaction so a manual
-                    // restart cannot bypass endpoint, bridge, or ownership
-                    // validation on a stopped container.
+                    // Restart is the feature's exact-instance reconcile (it recreates through the managed transaction with the
+                    // hardware guard), under the workspace lease this operation already holds or acquires (before any maintenance lock).
                     const containerRunning = isContainerRunning(containerName);
                     const containerPresent = containerRunning || containerExists(containerName) || Boolean(registryRecord?.containerName);
                     if (!containerPresent) {
                         throw new Error(`Agent '${agentName}' has no existing container. Run 'ploinky reinstall ${agentName}'.`);
                     }
+                    if (!registryRecord) throw new Error('Restart requires one exact registered agent.');
 
                     const runtimeAction = 'restart';
                     console.log(`Restarting (${getRuntime()}) agent '${agentName}'...`);
                     try {
-                        await withRestartLocks(containerName, {
-                            operation: runtimeAction,
-                            metadata: {
-                                agent: resolved.shortAgentName,
-                                repo: resolved.repo,
-                            },
-                        }, async () => withNetworkLifecycleLock(async (networkLifecycleCapability) => {
-                            const agentPath = path.dirname(resolved.manifestPath);
-                            const routeKey = registryRecord?.record?.alias || resolved.shortAgentName;
-                            const transition = await prepareTargetedAgentRestart({
-                                containerName,
-                                routeKey,
-                                repoName: registryRecord?.record?.repoName || resolved.repo,
-                                shortAgentName: resolved.shortAgentName,
-                                record: registryRecord.record,
-                                networkLifecycleCapability,
-                            });
-                            let result = null;
-                            try {
-                                result = ensureAgentService(resolved.shortAgentName, manifest, agentPath, {
-                                    containerName,
-                                    alias: registryRecord?.record?.alias,
-                                    forceRecreate: true,
-                                    instanceId: transition.identity.instanceId,
-                                    enableGeneration: transition.identity.enableGeneration,
-                                    targetedRestart: transition.targetedRestart,
-                                    profileName: profileResolution.resolvedProfileName,
-                                    profileResolution,
-                                    routerEndpoint,
-                                    runtimeAdmission: directAdmission.runtimeAdmission,
-                                    networkLifecycleCapability,
-                                });
-                                try {
-                                    await waitForManifestReadiness({
-                                        key: `restart:${resolved.shortAgentName}`,
-                                        label: resolved.shortAgentName,
-                                        kind: 'reinstall',
-                                        manifest,
-                                        route: {
-                                            container: result?.containerName || containerName,
-                                            hostPort: result?.hostPort || 0,
-                                        },
-                                    });
-                                    await commitTargetedAgentRestart({
-                                        transition,
-                                        result,
-                                        agentPath,
-                                        alias: registryRecord?.record?.alias || '',
-                                        networkLifecycleCapability,
-                                    });
-                                } catch (error) {
-                                    cleanupFailedTargetedAgentRestart(result, error);
-                                    throw error;
-                                }
-                            } catch (routeError) {
-                                throw new Error(`managed restart failed: ${routeError?.message || routeError}`);
-                            }
-                        }));
+                        await withHeldOrAcquiredWorkspaceMutationLease({ operation: 'exact-agent-restart' }, () => reconcileExactHardwareInstance({
+                            key: registryRecord.containerName,
+                            record: structuredClone(registryRecord.record),
+                        }, { origin: 'cli' }));
                         console.log('✓ Agent restarted.');
                     } catch (e) {
-                        throw new Error(
+                        throw wrapPreservingHardwareCause(
                             `Failed to ${runtimeAction} container ${containerName}: ${e.message}`,
-                            { cause: e },
+                            e,
                         );
                     }
                 }

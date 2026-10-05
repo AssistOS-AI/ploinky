@@ -22,7 +22,8 @@ import {
 import {
   buildRuntimeNetworkPlan,
   buildRuntimeRouterEnv,
-  manifestUsesHealthProbeBroker,
+  computeAgentEnvHash,
+  exactCleanupFailureOf,
   removeExactSandboxPredecessor,
   resolvePublishedPortMappings,
 } from '../sandbox/docker/agentServiceManager.js';
@@ -136,7 +137,33 @@ import { networkContractHash } from '../sandbox/networkContract.js';
 import {
   admitManifestRuntimeCapabilities,
   assertRuntimeAdmissionCurrent,
+  limitsHashReuseReason,
+  hardwareRefusalOf,
 } from '../sandbox/runtimeCapabilities.js';
+import {
+  formatReplacementReason,
+  formatRuntimeReplacementLine,
+  hashMismatchDetail,
+  limitsHashDetail,
+} from '../sandbox/runtimeReplacementLog.js';
+import { LIMITS_HASH_LABEL } from '../sandbox/hardwareLimits/resolve.mjs';
+import { prepareMpsGraph } from '../sandbox/hardwareLimits/mpsGraph.mjs';
+import { acknowledgeMpsRuntimeReady, finalizeMpsGraph, releaseMpsRuntimeOwner, verifyMpsRuntimeReady } from '../sandbox/hardwareLimits/mpsLifecycle.mjs';
+import {
+  blockingEdgesFromGraph,
+  classifyAvailability,
+  summarizeStartResult,
+} from '../sandbox/hardwareLimits/outcomes.mjs';
+import {
+  HardwareLimitsError,
+  findHardwareOutcome,
+  formatHardwareOutcome,
+  validateHardwareOutcome,
+} from '../sandbox/hardwareLimits/errors.mjs';
+import {
+  buildAvailabilityProjection,
+  markRouteHardwareUnavailable,
+} from '../server/hardwareAvailability.mjs';
 import { getAgentDataDir } from '../utils/workspaceStructure.js';
 import {
   formatAgentAttachmentBanner,
@@ -429,6 +456,7 @@ export function buildNoWaitLaunchSchedule(deferredNoWaitWaves, {
       // the observed status and to size its cumulative queued budget.
       statusByNodeId.set(entry.node.id, Object.freeze({
         nodeId: entry.node.id,
+        producerKey: entry.registryName,
         path: statusPath,
         runId,
         waveIndex,
@@ -445,7 +473,7 @@ export function buildNoWaitLaunchSchedule(deferredNoWaitWaves, {
     const scheduled = entries.map((entry) => {
       const directDependencyIds = new Set(entry.node?.dependencies || []);
       const references = new Map();
-      const addReference = (reference, directDependency) => {
+      const addReference = (reference, directDependency, relation = 'blocking') => {
         if (!reference) return;
         // The worker rejects a barrier entry that does not name a strictly
         // earlier wave, exiting before it can publish a status while the parent
@@ -466,10 +494,19 @@ export function buildNoWaitLaunchSchedule(deferredNoWaitWaves, {
         references.set(reference.path, {
           ...reference,
           directDependency: Boolean(directDependency || existing?.directDependency),
+          relation: existing?.relation === 'blocking' ? 'blocking' : relation,
         });
       };
+      // Only blocking edges synthesize a waiting relation (plan §9.1, U15).
+      // An optional no-wait edge neither delays nor blocks its consumer; a
+      // duplicate blocking declaration already won in the graph's edge map.
       for (const dependencyId of directDependencyIds) {
-        addReference(statusByNodeId.get(dependencyId), true);
+        if (entry.node?.dependencyEdges?.get?.(dependencyId)?.noWait === true) continue;
+        addReference(statusByNodeId.get(dependencyId), true, 'blocking');
+      }
+      // Independently explicit status waits supplied by the scheduler.
+      for (const dependencyId of entry.explicitStatusWaitNodeIds || []) {
+        addReference(statusByNodeId.get(dependencyId), true, 'explicit-status-wait');
       }
       // The worker rejects a barrier larger than this, and would exit during
       // argument parsing without publishing a terminal status while the parent
@@ -583,7 +620,17 @@ function writeNoWaitRunMarker(entry) {
   });
 }
 
-export function writeNoWaitSpawnFailure(entry, error) {
+// Publish a terminal hardware outcome for a no-wait instance whose refusal or
+// block is already known from graph metadata. No worker or runtime is created;
+// consumers that wait on this producer observe the typed subtype.
+export function writeNoWaitHardwareOutcome(entry, outcome) {
+  // The run marker binds observers (status, startup page, Marketplace) to
+  // this exact run before the terminal status is published.
+  writeNoWaitRunMarker({ identity: entry?.identity, statusFile: entry?.statusFile });
+  writeNoWaitSpawnFailure(entry, new HardwareLimitsError(outcome), { phase: 'admission' });
+}
+
+export function writeNoWaitSpawnFailure(entry, error, { phase = 'spawn' } = {}) {
   const finishedAtMs = Date.now();
   // This runs inside the spawn loop's catch. Without an exact coordination
   // path there is nothing to publish, and throwing here would replace the
@@ -600,17 +647,20 @@ export function writeNoWaitSpawnFailure(entry, error) {
   // A spawn failure has to be a valid terminal member of a wave barrier so a
   // dependent worker can make a deterministic dependency decision instead of
   // stalling on a status that never arrives.
+  const hardwareOutcome = findHardwareOutcome(error);
   const payload = {
     state: 'failed',
     sequencePhase: 'active',
-    phase: 'spawn',
+    phase,
     startedAt: new Date(finishedAtMs).toISOString(),
     startedAtMs: finishedAtMs,
     sequencePhaseStartedAt: new Date(finishedAtMs).toISOString(),
     sequencePhaseStartedAtMs: finishedAtMs,
     finishedAt: new Date(finishedAtMs).toISOString(),
     finishedAtMs,
-    error: { message: sanitizeDiagnosticText(error) },
+    error: hardwareOutcome
+      ? { message: sanitizeDiagnosticText(error), code: hardwareOutcome.code, hardwareOutcome }
+      : { message: sanitizeDiagnosticText(error) },
     ...identity,
   };
   const canonical = path.join(RUNNING_DIR, 'no-wait', `${identity.containerName}.json`);
@@ -909,16 +959,46 @@ function resolveRetainedGraphNodeExecutionRecord(node, record, {
   return { runMode, projectPath, develRepo };
 }
 
-function executionRecordDiffers(record, expected) {
+function executionRecordDifferences(record, expected) {
   const currentProjectPath = String(record?.projectPath || '').trim();
   const expectedProjectPath = String(expected.projectPath || '').trim();
   const sameProjectPath = currentProjectPath
     && expectedProjectPath
     && path.resolve(currentProjectPath) === path.resolve(expectedProjectPath);
+  const currentDevelRepo = String(record?.develRepo || '').trim();
   const sameDevelRepo = expected.runMode === 'devel'
-    ? String(record?.develRepo || '').trim() === expected.develRepo
-    : !String(record?.develRepo || '').trim();
-  return record?.runMode !== expected.runMode || !sameProjectPath || !sameDevelRepo;
+    ? currentDevelRepo === expected.develRepo
+    : !currentDevelRepo;
+  const differences = [];
+  if (record?.runMode !== expected.runMode) {
+    differences.push(`runMode ${record?.runMode || 'none'} -> ${expected.runMode || 'none'}`);
+  }
+  if (!sameProjectPath) {
+    differences.push(`projectPath ${currentProjectPath || 'none'} -> ${expectedProjectPath || 'none'}`);
+  }
+  if (!sameDevelRepo) {
+    differences.push(`develRepo ${currentDevelRepo || 'none'} -> ${String(expected.develRepo || '') || 'none'}`);
+  }
+  return differences;
+}
+
+function executionRecordDiffers(record, expected) {
+  return executionRecordDifferences(record, expected).length > 0;
+}
+
+// The one start-graph line for a changed plan: every reason that applies.
+function graphReplacementLine(plan) {
+  const reasons = [];
+  if (plan.executionChanged) {
+    reasons.push(`execution changed: ${(plan.executionDifferences || []).join(', ') || 'unknown'}`);
+  }
+  if (plan.profileChanged) {
+    reasons.push(`profile changed: ${plan.existing.rec.profile || 'none'} -> ${plan.node.profile}`);
+  }
+  if (plan.runtimeReason) {
+    reasons.push(formatReplacementReason(plan.runtimeReason, plan.runtimeReasonDetail));
+  }
+  return formatRuntimeReplacementLine(plan.node.id, reasons.join('; '));
 }
 
 function mintChangedRuntimeIdentityPair(record, uuid) {
@@ -984,17 +1064,18 @@ function computeRetainedManagedEnvHash(node, record, profileConfig, runtimeNetwo
         || payload?.generationId !== String(record.enableGeneration || '')) {
       return '';
     }
-    return computeEnvHashImpl(node.manifest, profileConfig, {
-      ...runtimeNetworkPlan.hashEnv,
-      PLOINKY_HEALTH_PROBE_BROKER: manifestUsesHealthProbeBroker(node.manifest) ? '1' : '0',
-      PLOINKY_ROUTER_SEMANTIC_TOPOLOGY_DIGEST: payload.semanticTopologyDigest,
-      PLOINKY_ROUTER_DESCRIPTOR_SCHEMA: payload.schema,
-      PLOINKY_ROUTER_TRANSPORT_VERSION: payload.transportVersion,
-      PLOINKY_ROUTER_LOCAL_STREAMING: payload.localStreaming,
-      PLOINKY_AGENT_PRINCIPAL: principalId,
-      PLOINKY_AGENT_INSTANCE_ID: record.instanceId,
-      PLOINKY_AGENT_ENABLE_GENERATION: record.enableGeneration,
-    }, { agentName: node.shortAgentName, repoName: node.repoName });
+    // The same construction the creation label and managed adoption use.
+    return computeAgentEnvHash(node.manifest, profileConfig, {
+      agentName: node.shortAgentName,
+      repoName: node.repoName,
+      runtimeNetworkPlan,
+      generatedRouter: {
+        payload,
+        principalId,
+        instanceId: record.instanceId,
+        enableGeneration: record.enableGeneration,
+      },
+    }, computeEnvHashImpl);
   } catch (_) {
     return '';
   }
@@ -1186,7 +1267,7 @@ function isGraphSandboxRuntimeRunning(runtimeKey, expectedIdentity, {
   return observed.state === 'live-exact';
 }
 
-function graphNodeRuntimeReplacementReason(plan, {
+export function graphNodeRuntimeReplacementReason(plan, {
   containerExistsImpl = dockerSvc.containerExists,
   isContainerRunningImpl = dockerSvc.isContainerRunning,
   isSandboxRunningImpl = isGraphSandboxRuntimeRunning,
@@ -1202,6 +1283,7 @@ function graphNodeRuntimeReplacementReason(plan, {
   getExposedNamesImpl = getExposedNames,
   computeRetainedManagedEnvHashImpl = computeRetainedManagedEnvHash,
   retainedManagedEnvHashOptions,
+  admitRuntimeImpl = admitGraphNodeHardwareDescriptor,
 } = {}) {
   const { node, existing } = plan;
   const record = existing.rec;
@@ -1239,7 +1321,10 @@ function graphNodeRuntimeReplacementReason(plan, {
       routerEndpoint?.env || {},
       { agentName: node.shortAgentName, repoName: node.repoName },
     );
-    if (desired && desired !== String(record.envHash || '')) return 'envHashChanged';
+    if (desired && desired !== String(record.envHash || '')) {
+      plan.runtimeReasonDetail = hashMismatchDetail('envHash', record.envHash, desired);
+      return 'envHashChanged';
+    }
     return '';
   }
 
@@ -1252,16 +1337,12 @@ function graphNodeRuntimeReplacementReason(plan, {
     routerEndpoint,
     networkMode: profileResolution.network.mode,
   });
-  const baseEnvHash = computeEnvHashImpl(
-    node.manifest,
-    profileResolution.profileConfig,
-    {
-      ...runtimeRouterEnv,
-      ...runtimeNetworkPlan.hashEnv,
-      PLOINKY_HEALTH_PROBE_BROKER: manifestUsesHealthProbeBroker(node.manifest) ? '1' : '0',
-    },
-    { agentName: node.shortAgentName, repoName: node.repoName },
-  );
+  const baseEnvHash = computeAgentEnvHash(node.manifest, profileResolution.profileConfig, {
+    agentName: node.shortAgentName,
+    repoName: node.repoName,
+    runtimeNetworkPlan,
+    runtimeRouterEnv,
+  }, computeEnvHashImpl);
   const desiredEnvHash = runtimeNetworkPlan.requiresManagedNetwork
     ? computeRetainedManagedEnvHashImpl(
         node,
@@ -1274,8 +1355,21 @@ function graphNodeRuntimeReplacementReason(plan, {
   if (runtimeNetworkPlan.requiresManagedNetwork && !desiredEnvHash) {
     return 'managedRouterDescriptorDrift';
   }
-  if (desiredEnvHash && desiredEnvHash !== getContainerLabelImpl(existing.key, 'ploinky.envhash')) {
+  const observedEnvHash = desiredEnvHash ? getContainerLabelImpl(existing.key, 'ploinky.envhash') : '';
+  if (desiredEnvHash && desiredEnvHash !== observedEnvHash) {
+    plan.runtimeReasonDetail = hashMismatchDetail('envHash', observedEnvHash, desiredEnvHash);
     return 'envHashChanged';
+  }
+  // The same admitted descriptor drives creation, adoption and reuse: its
+  // limits hash (empty without hardware placement) must match the runtime.
+  const admitted = admitRuntimeImpl(node, profileResolution, { runtime, recordAlias: record.alias || '', key: existing.key });
+  const admittedDescriptor = admitted?.descriptor || null;
+  const limitsReason = admittedDescriptor
+    ? limitsHashReuseReason(admittedDescriptor, getContainerLabelImpl(existing.key, LIMITS_HASH_LABEL))
+    : null;
+  if (limitsReason) {
+    plan.runtimeReasonDetail = limitsHashDetail(admittedDescriptor, getContainerLabelImpl(existing.key, LIMITS_HASH_LABEL));
+    return limitsReason;
   }
   if (isLlmRuntimeManifestImpl(node.manifest, profileResolution.profileConfig)) {
     const probe = prepareLlmStartupImpl({
@@ -1293,10 +1387,21 @@ function graphNodeRuntimeReplacementReason(plan, {
       envHash: baseEnvHash,
       effectiveNetwork: profileResolution.profileConfig?.network ?? node.manifest?.network ?? null,
       writeState: false,
+      // Reuse uses the same admitted policy as creation (stored overrides
+      // included); otherwise a limited LLM agent would restart on every start.
+      ...(admittedDescriptor ? { admittedRuntimePolicy: admittedDescriptor.runtimePolicy } : {}),
+      ...(admitted?.llmStartup ? {
+        resolvedSelection: admitted.llmStartup.selection,
+        resolvedHardware: admitted.llmStartup.hardware,
+      } : {}),
     });
+    const observedReuseHash = probe.enabled && probe.reuseHash
+      ? getContainerLabelImpl(existing.key, 'ploinky.reusehash')
+      : '';
     if (probe.enabled
         && probe.reuseHash
-        && probe.reuseHash !== getContainerLabelImpl(existing.key, 'ploinky.reusehash')) {
+        && probe.reuseHash !== observedReuseHash) {
+      plan.runtimeReasonDetail = hashMismatchDetail('reuseHash', observedReuseHash, probe.reuseHash);
       return 'llmReuseHashChanged';
     }
   }
@@ -1322,6 +1427,44 @@ function graphNodeRuntimeReplacementReason(plan, {
       : 'networkContractDrift';
   }
   return '';
+}
+
+// A metadata admission of a graph node's current inputs, used only to compare
+// reuse against creation; it never authorizes rendering.
+function admitGraphNodeHardwareDescriptor(node, profileResolution, { runtime, recordAlias, key }) {
+  try {
+    const manifestPath = node.manifestPath || (node.agentPath ? path.join(node.agentPath, 'manifest.json') : '');
+    if (!manifestPath || !fs.existsSync(manifestPath)) return null;
+    const manifestBytes = fs.readFileSync(manifestPath);
+    const manifest = JSON.parse(manifestBytes.toString('utf8'));
+    const llmAdmissionContext = resolveLlmRuntimeAdmissionContext({
+      runtime,
+      manifest,
+      profileConfig: profileResolution.profileConfig,
+      agentName: node.shortAgentName,
+      alias: node.alias || recordAlias,
+      env: process.env,
+    });
+    const { descriptor } = admitManifestRuntimeCapabilities(manifest, {
+      manifestBytes,
+      manifestPath,
+      agentId: `${node.repoName}/${node.shortAgentName}`,
+      profileName: profileResolution.resolvedProfileName,
+      profileConfig: profileResolution.profileConfig,
+      network: profileResolution.network,
+      runtime,
+      runtimeKind: 'container',
+      catalogPolicy: llmAdmissionContext.catalogPolicy,
+      catalogIdentity: llmAdmissionContext.catalogIdentity,
+      hardwareAdmission: 'metadata',
+      instanceKey: key,
+      alias: node.alias || recordAlias || '',
+    });
+    return { descriptor, llmStartup: llmAdmissionContext.startup || null };
+  } catch (_) {
+    // Admission errors surface on the launch path itself.
+    return null;
+  }
 }
 
 function resolveExtraEnabledRuntimeNodes(graph, reg, getAgentContainerName = dockerSvc.getAgentContainerName) {
@@ -1378,8 +1521,24 @@ export function isRegistryRuntimeRunning(containerName, record, {
   return dockerSvc.isContainerRunning(containerName);
 }
 
+// The exact registry containerName a graph node will use: its retained record
+// or the conventional name staging will create.
+function graphNodeRegistryKey(node, registry, getAgentContainerName = dockerSvc.getAgentContainerName) {
+  if (String(node?.id || '').startsWith('extra:')) return node.id.slice('extra:'.length);
+  const existing = findRegistryEntryForGraphNode(registry || {}, node, getAgentContainerName);
+  return existing?.key || getAgentContainerName(node.alias || node.shortAgentName, node.repoName);
+}
+
+// Graph-wide admission is metadata-only for hardware eligibility (plan §9.1):
+// a hardware refusal is recorded in the admission record, every other
+// capability error stays strict, and no record can authorize argument
+// rendering.
 export function admitWorkspaceGraphRuntimeCapabilities(graph, {
   additionalNodes = [],
+  registry = null,
+  hardwareContext,
+  boxMarkerOptions,
+  getAgentContainerName = dockerSvc.getAgentContainerName,
 } = {}) {
   const nodes = [
     ...Array.from(graph?.nodes?.values?.() || []),
@@ -1416,6 +1575,7 @@ export function admitWorkspaceGraphRuntimeCapabilities(graph, {
         env: process.env,
       })
       : { catalogPolicy: null, catalogIdentity: null };
+    const key = graphNodeRegistryKey(node, registry, getAgentContainerName);
     const admission = admitManifestRuntimeCapabilities(manifest, {
       manifestBytes,
       manifestPath: manifestPath || `manifest(${node.repoName}/${node.shortAgentName})`,
@@ -1427,20 +1587,28 @@ export function admitWorkspaceGraphRuntimeCapabilities(graph, {
       runtimeKind,
       catalogPolicy: llmAdmissionContext.catalogPolicy,
       catalogIdentity: llmAdmissionContext.catalogIdentity,
+      hardwareAdmission: 'metadata',
+      ...(hardwareContext !== undefined ? { hardwareContext } : {}),
+      ...(boxMarkerOptions !== undefined ? { boxMarkerOptions } : {}),
+      instanceKey: key,
+      alias: node.alias || '',
     });
     admissions.push(Object.freeze({
       nodeId: node.id,
+      key,
+      alias: node.alias || '',
       manifestPath: hasExactManifestFile ? manifestPath : '',
       manifestBytesBase64: Buffer.from(manifestBytes).toString('base64'),
       profileName: profileResolution.resolvedProfileName,
       runtimeKind,
       admission,
+      hardwareRefusal: hardwareRefusalOf(admission),
     }));
   }
   return Object.freeze(admissions);
 }
 
-export function assertWorkspaceGraphAdmissionsCurrent(admissions) {
+export function assertWorkspaceGraphAdmissionsCurrent(admissions, { hardwareContext, boxMarkerOptions } = {}) {
   for (const record of admissions || []) {
     const manifestBytes = record.manifestPath
       ? fs.readFileSync(record.manifestPath)
@@ -1449,9 +1617,343 @@ export function assertWorkspaceGraphAdmissionsCurrent(admissions) {
       manifestBytes,
       profileName: record.profileName,
       runtimeKind: record.runtimeKind,
+      ...(hardwareContext !== undefined ? { hardwareContext } : {}),
+      ...(boxMarkerOptions !== undefined ? { boxMarkerOptions } : {}),
     });
   }
   return admissions;
+}
+
+// Classify every admitted graph node as eligible, refused or blocked through
+// the U15 blocking relation. Keys are exact registry containerNames.
+export function classifyWorkspaceGraphAvailability(graph, admissions, { explicitWaits = [] } = {}) {
+  const keyByNodeId = new Map((admissions || []).map((record) => [record.nodeId, record.key]));
+  const nodes = (admissions || []).map((record) => ({
+    key: record.key,
+    ref: record.admission.agentId,
+    alias: record.alias || null,
+    refusal: record.hardwareRefusal || null,
+  }));
+  const edges = blockingEdgesFromGraph(graph, (nodeId) => keyByNodeId.get(nodeId), { explicitWaits });
+  const classified = classifyAvailability({ nodes, edges });
+  const byNodeId = new Map();
+  for (const record of admissions || []) byNodeId.set(record.nodeId, classified.get(record.key));
+  return Object.freeze({ byKey: classified, byNodeId, edges });
+}
+
+// A direct refusal re-keyed to the exact admitted instance it belongs to (its
+// own key and root cause are that instance).
+function rekeyHardwareRefusal(refusal, key) {
+  return validateHardwareOutcome({
+    ...refusal,
+    key,
+    rootCause: { ...refusal.rootCause, key },
+    causalPath: [key],
+  });
+}
+
+/**
+ * The start's current availability: graph metadata outcomes plus hardware
+ * refusals raised at launch (a readback refusal or the strict admission
+ * recheck). A launch refusal is contained like a metadata one (U10/U14/U15,
+ * §9.4): it is recorded, and its blocking and explicit-status-wait consumers
+ * are reclassified as blocked so they are never launched.
+ */
+export function createGraphAvailabilityTracker(graph, admissions, { explicitWaits = [] } = {}) {
+  const launchRefusals = new Map();
+  let current = classifyWorkspaceGraphAvailability(graph, admissions, { explicitWaits });
+  const admittedKeys = new Set((admissions || []).map((record) => record.key));
+  const unavailable = (entry) => Boolean(entry && entry.state !== 'eligible');
+  const unavailableEntries = () => [...current.byNodeId]
+    .filter(([, entry]) => unavailable(entry))
+    .map(([nodeId, entry]) => ({ nodeId, key: entry.outcome.key, outcome: entry.outcome }));
+  return Object.freeze({
+    outcomeForNode(nodeId) {
+      const entry = current.byNodeId.get(nodeId);
+      return unavailable(entry) ? entry.outcome : null;
+    },
+    outcomeForKey(key) {
+      if (!admittedKeys.has(key)) return launchRefusals.get(key) || null;
+      const entry = current.byKey.get(key);
+      return unavailable(entry) ? entry.outcome : null;
+    },
+    unavailableEntries,
+    // Record one launch-time refusal; returns every exact instance that
+    // became unavailable because of it (the refused one first). A refusal
+    // whose key is not an admitted key but whose ref matches an admitted
+    // instance is mapped to that instance by ref and alias, or fails
+    // loudly; it is never treated as an unrelated extra.
+    recordLaunchRefusal(outcome) {
+      let refusal = validateHardwareOutcome(outcome);
+      if (!admittedKeys.has(refusal.key)) {
+        const sameRef = (admissions || []).filter((record) => record.admission?.agentId === refusal.ref);
+        if (sameRef.length) {
+          const sameAlias = sameRef.filter((record) => (record.alias || null) === (refusal.alias || null));
+          if (sameAlias.length !== 1) {
+            throw new Error(`start: hardware refusal for '${refusal.key}' (${refusal.ref}, alias ${refusal.alias || 'none'}) `
+              + `matches the admitted instances ${sameRef.map((record) => record.key).join(', ')} but not exactly one by alias; `
+              + 'it cannot be contained as an unrelated agent');
+          }
+          refusal = rekeyHardwareRefusal(refusal, sameAlias[0].key);
+        }
+      }
+      if (!admittedKeys.has(refusal.key)) {
+        // An enabled extra outside the admitted graph: contained by itself.
+        const known = launchRefusals.has(refusal.key);
+        launchRefusals.set(refusal.key, refusal);
+        return known ? [] : [{ nodeId: null, key: refusal.key, outcome: refusal }];
+      }
+      const before = new Set(unavailableEntries().map((entry) => entry.key));
+      launchRefusals.set(refusal.key, refusal);
+      const amended = (admissions || []).map((record) => (launchRefusals.has(record.key)
+        ? { ...record, hardwareRefusal: launchRefusals.get(record.key) }
+        : record));
+      current = classifyWorkspaceGraphAvailability(graph, amended, { explicitWaits });
+      return unavailableEntries()
+        .filter((entry) => !before.has(entry.key))
+        .sort((left, right) => {
+          if (left.key === refusal.key) return -1;
+          if (right.key === refusal.key) return 1;
+          return left.key.localeCompare(right.key);
+        });
+    },
+  });
+}
+
+/**
+ * Fold one MPS graph preparation into the start's availability: a contained
+ * preparation failure refuses only the graph's GPU-share agents (U10, §9.1),
+ * whose nodes are then excluded from launch while every other node starts.
+ */
+export function recordMpsGraphPreparation(prepared, { availability, unavailableNodeIds, warn = (line) => console.warn(line) }) {
+  if (prepared.diagnostic) warn(`[hardware-limits] ${prepared.diagnostic.message}. ${prepared.diagnostic.fix}`);
+  for (const refusal of prepared.refusals || []) availability.recordLaunchRefusal(refusal);
+  for (const entry of availability.unavailableEntries()) unavailableNodeIds.add(entry.nodeId);
+  return prepared;
+}
+
+/**
+ * The availability projection for each unavailable exact instance that has a
+ * registry record: its logical route key and the validated projection that
+ * removes every runtime target (§9.2, §9.4).
+ */
+export function unavailableRouteProjections(entries, { registry = {}, registryNameByNodeId = new Map() } = {}) {
+  const projections = [];
+  for (const { nodeId, key: outcomeKey, outcome } of entries || []) {
+    const key = (nodeId && registryNameByNodeId.get(nodeId))
+      || (nodeId?.startsWith('extra:') ? nodeId.slice('extra:'.length) : '')
+      || (nodeId ? '' : outcomeKey);
+    const record = key ? registry[key] : null;
+    if (!record) continue;
+    if (key !== outcome.key) {
+      throw new Error(`start: hardware outcome for '${nodeId || outcomeKey}' does not match its staged registry identity`);
+    }
+    projections.push({
+      routeKey: record.alias || record.agentName,
+      projection: buildAvailabilityProjection({
+        outcome,
+        instanceId: record.instanceId,
+        enableGeneration: record.enableGeneration,
+      }),
+    });
+  }
+  return projections;
+}
+
+/**
+ * Launch one batch of route targets. A typed hardware outcome raised by the
+ * launch is a contained refusal: it is handed to onHardwareRefusal and never
+ * counted as an ordinary failure. Every other failure keeps the baseline
+ * semantics: it throws "N agent(s) failed to start", or with allowFailures is
+ * returned in failedAgents.
+ */
+export async function launchRouteTargets(targetNames, {
+  launchTarget,
+  commitResults = async () => {},
+  onHardwareRefusal = async () => {},
+  allowFailures = false,
+  log = console,
+} = {}) {
+  if (!Array.isArray(targetNames) || !targetNames.length) {
+    return { failedAgents: [], routeResults: [], hardwareRefusals: [] };
+  }
+  const settled = await Promise.all(targetNames.map(async (name) => {
+    try {
+      return await launchTarget(name);
+    } catch (agentErr) {
+      const outcome = findHardwareOutcome(agentErr);
+      const shortAgentName = agentErr?.shortAgentName || name;
+      // A refusal never hides a refused candidate that could not be removed:
+      // that is an ordinary, fatal failure naming the leftover container.
+      const leftover = outcome ? exactCleanupFailureOf(agentErr) : null;
+      if (!outcome) {
+        log.error(`[start] Failed to start agent '${shortAgentName}': ${agentErr?.message}`);
+      } else if (leftover) {
+        const container = `${leftover.containerName || name}${leftover.containerId ? ` (${leftover.containerId.slice(0, 12)})` : ''}`;
+        log.error(`[start] Failed to start agent '${shortAgentName}': ${agentErr?.message}; the refused candidate container `
+          + `${container} was not removed; remove it, then run start again`);
+      }
+      return { ok: false, name, shortAgentName, hardwareOutcome: leftover ? null : outcome };
+    }
+  }));
+  const routeResults = settled.filter((result) => result?.ok);
+  const failedAgents = settled.filter((result) => result && !result.ok && !result.hardwareOutcome)
+    .map((result) => result.shortAgentName);
+  const hardwareRefusals = settled.filter((result) => result && !result.ok && result.hardwareOutcome);
+  await commitResults(settled);
+  for (const refused of hardwareRefusals) await onHardwareRefusal(refused.hardwareOutcome, refused.name);
+  if (failedAgents.length > 0) {
+    const message = `${failedAgents.length} agent(s) failed to start: ${failedAgents.join(', ')}`;
+    if (allowFailures) {
+      log.warn(`[start] ${message}`);
+      return { failedAgents, routeResults, hardwareRefusals };
+    }
+    throw new Error(message);
+  }
+  return { failedAgents, routeResults, hardwareRefusals };
+}
+
+/**
+ * The start's hardware containment, shared by startWorkspace and its tests
+ * (U10/U14/U15, §9.4). It reports each refused or blocked exact instance once,
+ * projects unavailable instances onto their logical routes (no runtime
+ * target), and launches route targets so that a typed hardware outcome raised
+ * at launch is recorded in `availability`, projected, and its blocking and
+ * explicit-status-wait consumers become blocked; unrelated agents continue.
+ * `registry` is a getter for the live registry; `applyUnavailableRoutes`
+ * writes [{routeKey, projection}] to the routing configuration.
+ */
+export function createStartLaunchContainment({
+  availability,
+  registry,
+  registryNameByNodeId = new Map(),
+  applyUnavailableRoutes,
+  log = console,
+}) {
+  const hardwareOutcomes = { refused: [], blocked: [] };
+  const recordedOutcomeKeys = new Set();
+  const reportOutcome = (outcome) => {
+    if (!outcome || recordedOutcomeKeys.has(outcome.key)) return;
+    recordedOutcomeKeys.add(outcome.key);
+    hardwareOutcomes[outcome.state === 'refused' ? 'refused' : 'blocked'].push(outcome);
+    log.warn(`[start] ${formatHardwareOutcome(outcome)}`);
+  };
+  // Refused/blocked instances keep their logical routes but lose every
+  // runtime target; the unavailable state is compiled into the generation.
+  const markUnavailable = async (entries) => {
+    const unavailableRoutes = unavailableRouteProjections(entries, { registry: registry(), registryNameByNodeId });
+    if (!unavailableRoutes.length) return;
+    await applyUnavailableRoutes(unavailableRoutes);
+  };
+  const containLaunchRefusal = async (outcome) => {
+    const affected = availability.recordLaunchRefusal(outcome);
+    await markUnavailable(affected);
+    for (const entry of affected) reportOutcome(entry.outcome);
+  };
+  const launchTargets = (targetNames, { launchOne, commitResults, allowFailures = false }) => launchRouteTargets(targetNames, {
+    launchTarget: async (name) => {
+      try {
+        return await launchOne(name);
+      } catch (agentErr) {
+        // launchRouteTargets reports it: a typed hardware outcome is a
+        // contained refusal, anything else an ordinary failure.
+        try { agentErr.shortAgentName = registry()?.[name]?.agentName || name; } catch (_) { /* reported by registry name */ }
+        throw agentErr;
+      }
+    },
+    allowFailures,
+    commitResults,
+    onHardwareRefusal: containLaunchRefusal,
+    log,
+  });
+  return Object.freeze({ hardwareOutcomes, reportOutcome, markUnavailable, containLaunchRefusal, launchTargets });
+}
+
+/**
+ * Launch the blocking members of every dependency wave, as startWorkspace
+ * does. Refused or blocked instances (from graph metadata or refused at
+ * launch) get no runtime create, readiness probe or start hook; unrelated
+ * agents continue. Ordinary failures stay fatal exactly as before.
+ */
+export async function launchWorkspaceGraphWaves({
+  graphWaves = [],
+  nodes = new Map(),
+  noWaitNodeIds = new Set(),
+  registryNameByNodeId = new Map(),
+  availability,
+  launch,
+  readinessEntryFor,
+  waitForReadiness,
+  reportOutcome,
+  formatLabel = (node) => node.id,
+  log = console.log,
+}) {
+  const readyAgentKeys = [];
+  const deferredNoWaitWaves = [];
+  for (let waveIndex = 0; waveIndex < graphWaves.length; waveIndex += 1) {
+    const waveNodes = graphWaves[waveIndex].map((nodeId) => nodes.get(nodeId)).filter(Boolean);
+    if (!waveNodes.length) continue;
+    // Blocking nodes follow the wave-by-wave start/readiness path. Defer
+    // detached no-wait workers until every coordinated blocking launch is
+    // complete so their independent route applies cannot transiently
+    // inactivate an exact host-generation capability during process create.
+    const blockingNodes = [];
+    const noWaitWaveNodes = [];
+    for (const node of waveNodes) {
+      if (noWaitNodeIds.has(node.id)) {
+        noWaitWaveNodes.push({ node, registryName: registryNameByNodeId.get(node.id) });
+      } else if (availability.outcomeForNode(node.id)) {
+        // Refused or blocked: no runtime create, readiness probe or start
+        // hook; the route stays target-less and unavailable.
+        reportOutcome(availability.outcomeForNode(node.id));
+      } else {
+        blockingNodes.push(node);
+      }
+    }
+    const blockingLabel = blockingNodes.length ? blockingNodes.map(formatLabel).join(', ') : '<none>';
+    const noWaitLabel = noWaitWaveNodes.map(({ node }) => formatLabel(node)).join(', ');
+    log(`[start] Dependency wave ${waveIndex + 1}/${graphWaves.length}: ${noWaitLabel ? `${blockingLabel} (no-wait: ${noWaitLabel})` : blockingLabel}`);
+    if (noWaitWaveNodes.length) deferredNoWaitWaves.push(noWaitWaveNodes);
+    const blockingNames = blockingNodes.map((node) => registryNameByNodeId.get(node.id)).filter(Boolean);
+    const blockingLaunch = blockingNames.length ? await launch(blockingNames) : { routeResults: [] };
+    // A member refused at launch is excluded from readiness waits.
+    const launchedNodes = blockingNodes.filter((node) => !availability.outcomeForNode(node.id));
+    if (!launchedNodes.length) continue;
+    await waitForReadiness(launchedNodes.map((node) => readinessEntryFor(node, blockingLaunch)));
+    readyAgentKeys.push(...launchedNodes.map((node) => registryNameByNodeId.get(node.id)).filter(Boolean));
+  }
+  return { readyAgentKeys, deferredNoWaitWaves };
+}
+
+/**
+ * Launch the enabled agents outside the dependency graph. A hardware refusal
+ * (known from metadata or raised at launch) is contained; any other failure
+ * keeps the baseline error that leaves edge selectors inactive.
+ */
+export async function launchAdditionalRuntimes({
+  additionalNames = [],
+  availability,
+  launch,
+  readinessEntryFor,
+  waitForReadiness,
+  reportOutcome,
+}) {
+  const readyAgentKeys = [];
+  for (const name of additionalNames) {
+    const outcome = availability.outcomeForKey(name);
+    if (outcome) reportOutcome(outcome);
+  }
+  const launchable = additionalNames.filter((name) => !availability.outcomeForKey(name));
+  if (launchable.length) {
+    const extra = await launch(launchable, { allowFailures: true });
+    if (extra.failedAgents.length !== 0) {
+      throw new Error('additional runtime failure left edge selectors inactive; repair and run start again');
+    }
+    const launched = extra.routeResults.filter((result) => !availability.outcomeForKey(result.containerName));
+    await waitForReadiness(launched.map((result) => readinessEntryFor(result)));
+    readyAgentKeys.push(...launched.map((result) => result.containerName));
+  }
+  return { readyAgentKeys };
 }
 
 // Match on every immutable field, never on the container name alone: only the
@@ -1483,6 +1985,10 @@ function ensureGraphNodesEnabled(graph, reg, {
   runtimeReplacementOptions,
   executionRecordOptions,
   additionalNodes = [],
+  hardwareContext,
+  boxMarkerOptions,
+  unavailableNodeIds = new Set(),
+  logLine = (line) => console.log(line),
   supersededNoWaitRuns = [],
   readRuntimePredecessorImpl = readRuntimePredecessor,
   writeRuntimePredecessorImpl = writeRuntimePredecessor,
@@ -1502,7 +2008,13 @@ function ensureGraphNodesEnabled(graph, reg, {
 
   // Keep the physical preparation boundary independently fail-closed even
   // though startWorkspace performs the same complete-graph gate before locks.
-  admitWorkspaceGraphRuntimeCapabilities(graph, { additionalNodes });
+  // Hardware eligibility is metadata here: a refusal is staged, not thrown.
+  admitWorkspaceGraphRuntimeCapabilities(graph, {
+    additionalNodes,
+    registry: reg,
+    ...(hardwareContext !== undefined ? { hardwareContext } : {}),
+    ...(boxMarkerOptions !== undefined ? { boxMarkerOptions } : {}),
+  });
 
   for (const node of nodes) {
     const existing = findRegistryEntryForGraphNode(reg, node, dockerSvc.getAgentContainerName);
@@ -1518,6 +2030,9 @@ function ensureGraphNodesEnabled(graph, reg, {
       : resolveRetainedGraphNodeExecutionRecord(node, existing.rec, executionRecordOptions);
     const executionChanged = executionRecordDiffers(existing.rec, expectedExecution);
     const profileChanged = Boolean(node.profile && existing.rec.profile !== node.profile);
+    const executionDifferences = executionChanged
+      ? executionRecordDifferences(existing.rec, expectedExecution)
+      : [];
     const predecessorBackend = resolvePredecessorBackend(node, existing, {
       observeImpl: observeSandboxRuntimeImpl,
       readReceiptImpl: readRuntimePredecessorImpl,
@@ -1530,11 +2045,17 @@ function ensureGraphNodesEnabled(graph, reg, {
     // identity and would resume under any generation that carries it again, so
     // the identity always rotates and its unpublished runtime is removed.
     const superseded = supersededNoWaitRunFor(supersededNoWaitRuns, existing.key, existing.rec);
+    // A refused or blocked instance keeps no authority: an existing runtime is
+    // revoked by identity rotation and removed through exact ownership checks.
+    const hardwareUnavailable = unavailableNodeIds.has(node.id)
+      && (runtimeReplacementOptions?.containerExistsImpl || dockerSvc.containerExists)(existing.key);
     let runtimeReason = '';
     if (!executionChanged && !profileChanged) {
-      runtimeReason = superseded
-        ? 'noWaitRunSuperseded'
-        : String(runtimeReplacementReason(preliminary, runtimeReplacementOptions) || '');
+      runtimeReason = hardwareUnavailable
+        ? 'hardwareUnavailable'
+        : superseded
+          ? 'noWaitRunSuperseded'
+          : String(runtimeReplacementReason(preliminary, runtimeReplacementOptions) || '');
     }
     // A start that stopped after persisting this record's rotated tuple but
     // before removing its predecessor left that predecessor's own tuple in a
@@ -1574,6 +2095,7 @@ function ensureGraphNodesEnabled(graph, reg, {
     if (isSandboxRuntime(predecessorRecord.runtime)) delete predecessorRecord.process;
     existingPlans.push({
       ...preliminary,
+      executionDifferences,
       runtimeReason,
       registryRecord: structuredClone(existing.rec),
       priorPredecessorReceipt,
@@ -1589,6 +2111,8 @@ function ensureGraphNodesEnabled(graph, reg, {
     .filter((plan) => plan.executionChanged || plan.profileChanged || plan.runtimeReason)
     .sort((left, right) => left.node.id.localeCompare(right.node.id));
   const changedContainers = changedPlans.map((plan) => plan.existing.key);
+  // Say why each runtime is replaced before anything is revoked or removed.
+  for (const plan of changedPlans) logLine(graphReplacementLine(plan));
   // Every retained route must be target-less in the prelaunch generation,
   // including a healthy blocking runtime that can later be reused. Keeping a
   // predecessor's resolved hostPort here would make the topology
@@ -1692,6 +2216,9 @@ function ensureGraphNodesEnabled(graph, reg, {
   })), {
     reason: 'workspace-graph-enable-prelaunch',
     availabilityMode: 'replacement',
+    hardwareAdmission: 'metadata',
+    ...(hardwareContext !== undefined ? { hardwareContext } : {}),
+    ...(boxMarkerOptions !== undefined ? { boxMarkerOptions } : {}),
   });
   if (prepared?.preparedGeneration?.selector
       && prepared.preparedGeneration.selector.state !== 'inactive') {
@@ -1928,6 +2455,9 @@ async function waitForReadinessEntries(readinessEntries, options = {}) {
   }
 
   await Promise.all(readinessEntries.map(async (entry) => {
+    if (options.beforeProbe) options.beforeProbe();
+    const remainingMs = options.deadline === undefined ? null : Math.max(0, options.deadline - Date.now());
+    if (remainingMs === 0) throw new Error('Readiness deadline expired.');
     if (entry.protocol === 'none') {
       readinessProgress.set(entry.key, {
         elapsedMs: 0,
@@ -1943,7 +2473,8 @@ async function waitForReadinessEntries(readinessEntries, options = {}) {
       const result = await Promise.resolve(runContainerScriptReadinessImpl(
         entry.label,
         entry.route.container,
-        entry.scriptProbe
+        remainingMs === null ? entry.scriptProbe : { ...entry.scriptProbe, timeout: Math.min(entry.scriptProbe.timeout, remainingMs / 1000) },
+        { beforeProbe: options.beforeProbe, deadline: options.deadline },
       ));
       if (result?.status !== 'success') {
         const reason = result?.reason || 'unknown failure';
@@ -1962,10 +2493,11 @@ async function waitForReadinessEntries(readinessEntries, options = {}) {
       return;
     }
     const ready = await waitForAgentReadyImpl(entry.route, {
-      timeoutMs: entry.timeoutMs,
+      timeoutMs: remainingMs === null ? entry.timeoutMs : Math.min(entry.timeoutMs, remainingMs),
       intervalMs: entry.intervalMs,
       probeTimeoutMs: entry.probeTimeoutMs,
       protocol: entry.protocol,
+      beforeProbe: options.beforeProbe,
       onProgress: (progress) => {
         readinessProgress.set(entry.key, {
           ...progress,
@@ -2028,6 +2560,7 @@ async function activatePreparedRuntimeAfterReadiness({
   mergeRouting = mergeRoutingConfig,
   mergeRoute = mergeRuntimeRoute,
   loadAgents = workspaceSvc.loadAgents,
+  saveAgents = workspaceSvc.saveAgents,
   readRouting = readRoutingConfig,
   commitAdditive = commitAdditiveEdgeRoutingGeneration,
   withApplyLock = withEdgeGenerationApplyLock,
@@ -2052,6 +2585,7 @@ async function activatePreparedRuntimeAfterReadiness({
     }
   };
   try {
+    if (result.mpsReadiness) await verifyMpsRuntimeReady(result);
     if (result.preparationLease.mode === 'additive') {
       await withApplyLock((applyLockCapability) => {
         const agents = loadAgents();
@@ -2074,6 +2608,7 @@ async function activatePreparedRuntimeAfterReadiness({
           agent: shortAgentName,
           ...(alias ? { alias } : {}),
         }, { hostPort: result.hostPort || 0 });
+        delete routing.routes[routeKey].hardwareAvailability;
         return commitAdditive(result.preparationLease, {
           agents,
           routing,
@@ -2088,12 +2623,13 @@ async function activatePreparedRuntimeAfterReadiness({
         }
       }
       retirePublishedCandidate();
+      if (result.mpsReadiness) await acknowledgeMpsRuntimeReady(result);
       return true;
     }
     await mergeRouting((cfg) => {
-      const agents = workspaceSvc.loadAgents();
+      const agents = loadAgents();
       agents[result.containerName] = result.registryRecord;
-      workspaceSvc.saveAgents(agents, { coordinate: false });
+      saveAgents(agents, { coordinate: false });
       cfg.routes = cfg.routes || {};
       cfg.routes[routeKey] = {
         ...(cfg.routes[routeKey] || {}),
@@ -2105,12 +2641,14 @@ async function activatePreparedRuntimeAfterReadiness({
         ...(result.hostPort ? { hostPort: result.hostPort } : {}),
       };
       if (!result.hostPort) delete cfg.routes[routeKey].hostPort;
+      delete cfg.routes[routeKey].hardwareAvailability;
       return cfg;
     }, {
       reason: 'runtime-replacement-ready',
       preparationLease: result.preparationLease,
     });
     retirePublishedCandidate();
+    if (result.mpsReadiness) await acknowledgeMpsRuntimeReady(result);
     return true;
   } catch (error) {
     cleanupFailure(
@@ -2136,6 +2674,9 @@ export function cleanupFailedPreparedRuntime(
 ) {
   const failedResult = result || error?.ploinkyRestartCandidate || null;
   if (!failedResult) return;
+  // The launching operation is over: a GPU share or share-less readiness
+  // owner must not stay live in this process.
+  releaseMpsRuntimeOwner(failedResult);
   // The activation helper and its lifecycle caller see the same prepared
   // runtime. A launch failure can instead surface the exact candidate only on
   // the error, before the caller receives a result. Cleanup receipts are
@@ -2214,7 +2755,7 @@ function buildRouterUrl(staticPort, env = process.env) {
     : `http://127.0.0.1:${staticPort}`;
 }
 
-export function preflightWorkspaceStartRuntimeCapabilities(staticAgentArg) {
+export function preflightWorkspaceStartRuntimeCapabilities(staticAgentArg, { hardwareContext, boxMarkerOptions } = {}) {
   const configured = workspaceSvc.getConfig()?.static?.agent || '';
   let staticAgent = String(staticAgentArg || configured || '').trim();
   if (!staticAgent) {
@@ -2241,8 +2782,29 @@ export function preflightWorkspaceStartRuntimeCapabilities(staticAgentArg) {
     registry,
     dockerSvc.getAgentContainerName,
   );
-  const admissions = admitWorkspaceGraphRuntimeCapabilities(graph, { additionalNodes });
+  const admissions = admitWorkspaceGraphRuntimeCapabilities(graph, {
+    additionalNodes,
+    registry,
+    ...(hardwareContext !== undefined ? { hardwareContext } : {}),
+    ...(boxMarkerOptions !== undefined ? { boxMarkerOptions } : {}),
+  });
   return Object.freeze({ graph, registry, additionalNodes, admissions });
+}
+
+// Exact refusal/block counts and the overall state; never "all ready" while
+// optional work is pending or the graph is degraded (plan §9.4).
+export function printStartResultSummary(result, { log = console.log } = {}) {
+  const refused = result.refusedAgents.count;
+  const blocked = result.blockedAgents.count;
+  const pending = result.asynchronousAgents.count;
+  if (result.state === 'degraded') {
+    log(`[start] Workspace started degraded: ${refused} agent(s) refused and ${blocked} blocked by hardware limits; `
+      + `${pending} no-wait agent(s) still starting in the background. See the reasons and fixes above, or run ploinky limits status on the host.`);
+  } else if (result.state === 'starting') {
+    log(`[start] Required agents are ready; ${pending} no-wait agent(s) are still starting in the background.`);
+  } else {
+    log('[start] All selected agents are ready.');
+  }
 }
 
 async function startWorkspace(staticAgentArg, portArg, {
@@ -2285,6 +2847,7 @@ async function startWorkspace(staticAgentArg, portArg, {
   const workspaceStartLock = await acquireSettledWorkspaceMutationLease({ operation: 'workspace-start' });
   let workspacePreparationLease = null;
   const workspaceRuntimeCandidates = [];
+  const workspaceMpsRuntimes = [];
   try {
   // Everything below is this start's own work: nested lifecycle code reuses
   // this lease, and nothing else in the process can. A rollback start can
@@ -2303,6 +2866,11 @@ async function startWorkspace(staticAgentArg, portArg, {
       .map(({ containerName, pid }) => `${containerName} (${pid ? `pid ${pid}` : 'pid not yet published'})`).join(', ')}`);
   }
   const lockedStart = preflightWorkspaceStartRuntimeCapabilities(staticAgentArg);
+  // Hardware refusals are recorded per exact instance; blocking and explicit
+  // waiting consumers become blocked, unrelated agents start (plan §9.1).
+  // A refusal raised later at launch is recorded in the same tracker.
+  const graphAvailability = createGraphAvailabilityTracker(lockedStart.graph, lockedStart.admissions);
+  const unavailableNodeIds = new Set(graphAvailability.unavailableEntries().map((entry) => entry.nodeId));
   const workspaceConfigForAuth = workspaceSvc.getConfig() || {};
   const graphSsoConfig = resolveWorkspaceGraphSsoConfig(lockedStart.graph, workspaceConfigForAuth.sso);
   initializeFreshEdgeRoutingSources({ workspaceRoot: PLOINKY_WORKSPACE_ROOT });
@@ -2464,10 +3032,22 @@ async function startWorkspace(staticAgentArg, portArg, {
 
     const waitClassification = classifyDependencyGraphWaitMode(dependencyGraph);
     const extraRuntimeNodes = lockedStart.additionalNodes;
+    const mpsGraphNodes = () => [...dependencyGraph.nodes.values(), ...extraRuntimeNodes].map((node) => {
+      return { key: graphNodeRegistryKey(node, reg, dockerSvc.getAgentContainerName), node };
+    });
+    const prepareGraphMps = async () => recordMpsGraphPreparation(
+      await prepareMpsGraph({ nodes: mpsGraphNodes(), networkLifecycleCapability }),
+      { availability: graphAvailability, unavailableNodeIds },
+    );
+    let mpsGraphPreparation = await prepareGraphMps();
+    const mpsReplacementReason = (plan, options) => mpsGraphPreparation.replacedKeys.has(plan.existing.key)
+      ? 'mpsCohortTransition' : graphNodeRuntimeReplacementReason(plan, options);
     let preparedGraph = ensureGraphNodesEnabled(dependencyGraph, reg, {
       deferredNodeIds: waitClassification.noWait,
       additionalNodes: extraRuntimeNodes,
+      unavailableNodeIds,
       supersededNoWaitRuns,
+      runtimeReplacementReason: mpsReplacementReason,
     });
     workspacePreparationLease = preparedGraph?.preparedGeneration?.preparationLease || null;
     if (preparedGraph?.preparedGeneration?.selector?.state !== 'inactive') {
@@ -2535,6 +3115,7 @@ async function startWorkspace(staticAgentArg, portArg, {
     // re-preparation; otherwise they would be mistaken for missing a second
     // time instead of retaining their already-fresh, never-launched tuple.
     reg = deduplicateAgentRegistry(workspaceSvc.loadAgents(), getAgentContainerName);
+    mpsGraphPreparation = await prepareGraphMps();
     const postProviderPreparation = reprepareGraphAfterStartupProviders(
       dependencyGraph,
       reg,
@@ -2542,7 +3123,8 @@ async function startWorkspace(staticAgentArg, portArg, {
       {
         deferredNodeIds: waitClassification.noWait,
         additionalNodes: extraRuntimeNodes,
-        graphEnableOptions: { supersededNoWaitRuns },
+        graphEnableOptions: { unavailableNodeIds, supersededNoWaitRuns },
+        runtimeReplacementReason: mpsReplacementReason,
       },
     );
     preparedGraph = postProviderPreparation.preparedGraph;
@@ -2575,6 +3157,9 @@ async function startWorkspace(staticAgentArg, portArg, {
       });
       console.log(`[start] No-wait dependencies (background launch): ${labels.join(', ')}`);
     }
+    const unavailableOutcome = (nodeId) => graphAvailability.outcomeForNode(nodeId);
+    const readyAgentKeys = [];
+    const asynchronousAgentKeys = [];
 
     const staticNode = dependencyGraph.nodes.get(dependencyGraph.staticNodeId);
     const staticContainer = resolveStaticRouterContainerName({
@@ -2590,18 +3175,36 @@ async function startWorkspace(staticAgentArg, portArg, {
         || cfg.static?.container !== staticContainer) {
       throw new Error('start: prepared routing generation does not contain the exact static Router identity');
     }
+    // The shared hardware containment: refused/blocked instances keep their
+    // logical routes but lose every runtime target, and a typed hardware
+    // outcome raised at launch is recorded, projected, and its blocking and
+    // explicit-wait consumers become blocked and are skipped; unrelated
+    // agents continue (U10/U14, §9.4).
+    const hardwareContainment = createStartLaunchContainment({
+      availability: graphAvailability,
+      registry: () => reg,
+      registryNameByNodeId,
+      applyUnavailableRoutes: async (unavailableRoutes) => {
+        cfg = await mergeRoutingConfig((current) => {
+          current.routes = current.routes || {};
+          for (const { routeKey, projection } of unavailableRoutes) {
+            current.routes[routeKey] = markRouteHardwareUnavailable(current.routes[routeKey], projection);
+            if (cfg.routes?.[routeKey]) cfg.routes[routeKey] = current.routes[routeKey];
+          }
+          return current;
+        }, { coordinate: false });
+      },
+    });
+    const { hardwareOutcomes, reportOutcome: reportHardwareOutcome } = hardwareContainment;
+    await hardwareContainment.markUnavailable(graphAvailability.unavailableEntries());
     const updateRoutes = async (targetNames = [], { allowFailures = false } = {}) => {
-      if (!Array.isArray(targetNames) || !targetNames.length) {
-        return { failedAgents: [], routeResults: [] };
-      }
       cfg.routes = cfg.routes || {};
-      const failedAgents = [];
-      const routeResults = await Promise.all(targetNames.map(async (name) => {
-        const rec = reg[name];
-        if (!rec || !rec.agentName) return null;
-        const shortAgentName = rec.agentName;
-        const manifestRef = rec.repoName ? `${rec.repoName}/${shortAgentName}` : shortAgentName;
-        try {
+      return hardwareContainment.launchTargets(targetNames, {
+        launchOne: async (name) => {
+          const rec = reg[name];
+          if (!rec || !rec.agentName) return null;
+          const shortAgentName = rec.agentName;
+          const manifestRef = rec.repoName ? `${rec.repoName}/${shortAgentName}` : shortAgentName;
           const manifestPath0 = findAgentManifest(manifestRef);
           const manifest = JSON.parse(fs.readFileSync(manifestPath0, 'utf8'));
           const agentPath = path.dirname(manifestPath0);
@@ -2626,8 +3229,9 @@ async function startWorkspace(staticAgentArg, portArg, {
                 containerName: name,
               })
             : undefined;
-          const runtimeResult = ensureAgentService(shortAgentName, manifest, agentPath, {
+          const runtimeResult = await ensureAgentService(shortAgentName, manifest, agentPath, {
             containerName: name,
+            hardwareInstanceKey: name,
             alias: rec.alias,
             routerEndpoint,
             profileName: rec.profile || undefined,
@@ -2637,11 +3241,13 @@ async function startWorkspace(staticAgentArg, portArg, {
             // The graph removal step already removed every changed
             // predecessor, so the slot holds nothing or the exact successor.
             expectedPredecessor: null,
+            forceRecreateReason: 'runtime identity rotated earlier in this start',
             preservePreparedRegistryRecord: true,
             preparationLease: workspacePreparationLease,
             preparedHostModeCapability,
             networkLifecycleCapability,
           });
+          workspaceMpsRuntimes.push(runtimeResult);
           if (runtimeResult?.requiresEdgeActivation === true
               && runtimeResult?.preparationLease
               && runtimeResult?.containerId) {
@@ -2669,6 +3275,8 @@ async function startWorkspace(staticAgentArg, portArg, {
             ...(resolvedHostPort ? { hostPort: resolvedHostPort } : {}),
           };
           if (!resolvedHostPort) delete nextRoute.hostPort;
+          // A freshly admitted launch supersedes any earlier unavailable state.
+          delete nextRoute.hardwareAvailability;
           const readinessRoute = buildRelayReadinessRoute({
             route: nextRoute,
             manifest,
@@ -2686,109 +3294,56 @@ async function startWorkspace(staticAgentArg, portArg, {
             readinessRoute,
             manifest,
           };
-        } catch (agentErr) {
-          console.error(`[start] Failed to start agent '${shortAgentName}': ${agentErr.message}`);
-          return {
-            ok: false,
-            shortAgentName
-          };
-        }
-      }));
-      for (const result of routeResults) {
-        if (!result) continue;
-        if (!result.ok) {
-          failedAgents.push(result.shortAgentName);
-          continue;
-        }
-        cfg.routes[result.routeKey] = result.route;
-      }
-      cfg = await mergeRoutingConfig((current) => {
-        for (const result of routeResults) {
-          if (!result?.ok) continue;
-          reg[result.containerName] = result.registryRecord;
-        }
-        const next = {
-          ...current,
-          ...cfg,
-          routes: {
-            ...(cfg.routes || {}),
-            ...(current.routes || {})
+        },
+        allowFailures,
+        commitResults: async (routeResults) => {
+          for (const result of routeResults) {
+            if (!result?.ok) continue;
+            cfg.routes[result.routeKey] = result.route;
           }
-        };
-        for (const result of routeResults) {
-          if (!result?.ok) continue;
-          next.routes[result.routeKey] = result.route;
-        }
-        return next;
-      }, { coordinate: false });
-      if (failedAgents.length > 0) {
-        const message = `${failedAgents.length} agent(s) failed to start: ${failedAgents.join(', ')}`;
-        if (allowFailures) {
-          console.warn(`[start] ${message}`);
-          return { failedAgents, routeResults: routeResults.filter((result) => result?.ok) };
-        }
-        throw new Error(message);
-      }
-      return { failedAgents, routeResults: routeResults.filter((result) => result?.ok) };
+          cfg = await mergeRoutingConfig((current) => {
+            for (const result of routeResults) {
+              if (!result?.ok) continue;
+              reg[result.containerName] = result.registryRecord;
+            }
+            const next = {
+              ...current,
+              ...cfg,
+              routes: {
+                ...(cfg.routes || {}),
+                ...(current.routes || {})
+              }
+            };
+            for (const result of routeResults) {
+              if (!result?.ok) continue;
+              next.routes[result.routeKey] = result.route;
+            }
+            return next;
+          }, { coordinate: false });
+        },
+      });
     };
 
-    const deferredNoWaitWaves = [];
-    for (let waveIndex = 0; waveIndex < graphWaves.length; waveIndex += 1) {
-      const waveNodeIds = graphWaves[waveIndex];
-      const waveNodes = waveNodeIds
-        .map((nodeId) => dependencyGraph.nodes.get(nodeId))
-        .filter(Boolean);
-      if (!waveNodes.length) continue;
-
-      // Blocking nodes follow the wave-by-wave start/readiness path. Defer
-      // detached no-wait workers until every coordinated blocking launch is
-      // complete so their independent route applies cannot transiently
-      // inactivate an exact host-generation capability during process create.
-      const blockingNodes = [];
-      const blockingNames = [];
-      const noWaitWaveNodes = [];
-      for (const node of waveNodes) {
-        const registryName = registryNameByNodeId.get(node.id);
-        if (noWaitNodeIds.has(node.id)) {
-          noWaitWaveNodes.push({ node, registryName });
-        } else {
-          blockingNodes.push(node);
-          if (registryName) blockingNames.push(registryName);
-        }
-      }
-
-      const blockingLabel = blockingNodes.length
-        ? blockingNodes.map((node) => formatGraphNodeLabel(node, staticAgent)).join(', ')
-        : '<none>';
-      const noWaitLabel = noWaitWaveNodes.length
-        ? noWaitWaveNodes.map(({ node }) => formatGraphNodeLabel(node, staticAgent)).join(', ')
-        : '';
-      const waveSummary = noWaitLabel
-        ? `${blockingLabel}${noWaitLabel ? ` (no-wait: ${noWaitLabel})` : ''}`
-        : blockingLabel;
-      console.log(`[start] Dependency wave ${waveIndex + 1}/${graphWaves.length}: ${waveSummary}`);
-
-      if (noWaitWaveNodes.length) {
-        deferredNoWaitWaves.push(noWaitWaveNodes);
-      }
-
-      const blockingLaunch = blockingNames.length
-        ? await updateRoutes(blockingNames)
-        : { routeResults: [] };
-
-      if (!blockingNodes.length) continue;
-
-      const readinessEntries = blockingNodes.map((node) => {
+    const { readyAgentKeys: graphReadyKeys, deferredNoWaitWaves } = await launchWorkspaceGraphWaves({
+      graphWaves,
+      nodes: dependencyGraph.nodes,
+      noWaitNodeIds,
+      registryNameByNodeId,
+      availability: graphAvailability,
+      launch: (names) => updateRoutes(names),
+      readinessEntryFor: (node, blockingLaunch) => {
         const registryName = registryNameByNodeId.get(node.id);
         const registryRecord = registryName ? reg[registryName] : null;
         const routeKey = registryRecord?.alias || node.alias || node.shortAgentName;
         const launchResult = blockingLaunch.routeResults.find((result) => result.routeKey === routeKey);
         const route = launchResult?.readinessRoute || cfg.routes?.[routeKey] || null;
         return buildBlockingReadinessEntryFromNode(node, route, staticAgent);
-      });
-
-      await waitForReadinessEntries(readinessEntries);
-    }
+      },
+      waitForReadiness: waitForReadinessEntries,
+      reportOutcome: reportHardwareOutcome,
+      formatLabel: (node) => formatGraphNodeLabel(node, staticAgent),
+    });
+    readyAgentKeys.push(...graphReadyKeys);
 
     const additionalStartup = partitionAdditionalStartupAgents({
       registry: reg,
@@ -2820,21 +3375,26 @@ async function startWorkspace(staticAgentArg, portArg, {
     if (activeManualNames.length) {
       console.log(`[start] Retaining ${activeManualNames.length} explicitly active manual agent(s): ${activeManualNames.join(', ')}`);
     }
-    const additionalNames = [...additionalStartup.automatic, ...activeManualNames];
-    if (additionalNames.length) {
-      const extra = await updateRoutes(additionalNames, { allowFailures: true });
-      if (extra.failedAgents.length === 0) {
-        const extraReadiness = extra.routeResults.map((result) => buildBlockingReadinessEntryFromNode({
-          id: `extra:${result.routeKey}`,
-          shortAgentName: result.shortAgentName,
-          isStatic: false,
-          manifest: result.manifest,
-        }, result.readinessRoute || result.route, result.shortAgentName));
-        await waitForReadinessEntries(extraReadiness);
-      } else {
-        throw new Error('additional runtime failure left edge selectors inactive; repair and run start again');
-      }
+    const additional = await launchAdditionalRuntimes({
+      additionalNames: [...additionalStartup.automatic, ...activeManualNames],
+      availability: graphAvailability,
+      launch: (names, options) => updateRoutes(names, options),
+      readinessEntryFor: (result) => buildBlockingReadinessEntryFromNode({
+        id: `extra:${result.routeKey}`,
+        shortAgentName: result.shortAgentName,
+        isStatic: false,
+        manifest: result.manifest,
+      }, result.readinessRoute || result.route, result.shortAgentName),
+      waitForReadiness: waitForReadinessEntries,
+      reportOutcome: reportHardwareOutcome,
+    });
+    readyAgentKeys.push(...additional.readyAgentKeys);
+
+    for (const runtimeResult of workspaceMpsRuntimes) {
+      if (readyAgentKeys.includes(runtimeResult?.containerName)) await verifyMpsRuntimeReady(runtimeResult);
     }
+
+    if (mpsGraphPreparation.graphPreparationId) await finalizeMpsGraph({ networkLifecycleCapability });
 
     // Runtime-only registry metadata may change while the lifecycle binding
     // remains exact. Persist it once, after all capability-sensitive launches
@@ -2848,6 +3408,10 @@ async function startWorkspace(staticAgentArg, portArg, {
       preparationLease: workspacePreparationLease,
     });
     workspacePreparationLease = null;
+    for (const runtimeResult of workspaceMpsRuntimes) {
+      if (readyAgentKeys.includes(runtimeResult?.containerName)) await acknowledgeMpsRuntimeReady(runtimeResult);
+    }
+    workspaceMpsRuntimes.length = 0;
     for (const candidate of workspaceRuntimeCandidates) {
       if (!candidate.durableCandidate) continue;
       try { retireRuntimeCandidate(candidate.durableCandidate); } catch (error) {
@@ -2891,6 +3455,21 @@ async function startWorkspace(staticAgentArg, portArg, {
           console.warn(`[start] no-wait node '${formatGraphNodeLabel(node, staticAgent)}' missing registry entry; skipping background launch.`);
           continue;
         }
+        const knownOutcome = unavailableOutcome(node.id);
+        if (knownOutcome) {
+          // Cheap metadata already settled this optional instance: publish
+          // its terminal typed outcome without creating a worker or runtime.
+          try {
+            writeNoWaitHardwareOutcome(entry, knownOutcome);
+          } catch (publishErr) {
+            console.error(sanitizeDiagnosticText(
+              `[start] no-wait hardware outcome for '${formatGraphNodeLabel(node, staticAgent)}' could not be published: ${sanitizeDiagnosticText(publishErr)}`,
+              { singleLine: true },
+            ));
+          }
+          reportHardwareOutcome(knownOutcome);
+          continue;
+        }
         try {
           const { pid, logFile, statusFile } = await spawnNoWaitWorker({
             node,
@@ -2901,6 +3480,7 @@ async function startWorkspace(staticAgentArg, portArg, {
             waitForStatuses: entry.waitForStatuses,
           });
           console.log(`[start] ${formatGraphNodeLabel(node, staticAgent)}: no-wait wave ${entry.waveIndex + 1}/${noWaitSchedule.length} launch started (pid ${pid}). log=${logFile} status=${statusFile}`);
+          asynchronousAgentKeys.push(registryName);
         } catch (spawnErr) {
           // Publishing the terminal status is best-effort here. Letting it
           // throw would replace the real spawn failure with a publication
@@ -2926,6 +3506,14 @@ async function startWorkspace(staticAgentArg, portArg, {
     console.log(`[start] Watchdog logs: ${path.join(LOGS_DIR, 'watchdog.log')}`);
     console.log(`[start] Router: ${buildRouterUrl(staticPort)}`);
     reportDependencyCollection(collectDependencyObjectsAfterAdmission({ lease: workspaceStartLock, reason: 'workspace-start' }));
+    const startResult = summarizeStartResult({
+      readyAgents: readyAgentKeys.map((key) => ({ key })),
+      asynchronousAgents: asynchronousAgentKeys.map((key) => ({ key })),
+      refusedAgents: hardwareOutcomes.refused,
+      blockedAgents: hardwareOutcomes.blocked,
+    });
+    printStartResultSummary(startResult);
+    return startResult;
   } catch (e) {
     const cleanedCandidateIds = new Set();
     for (const candidate of workspaceRuntimeCandidates.reverse()) {
@@ -3053,6 +3641,8 @@ export function admitDirectAgentRuntimeManifest(manifest, {
   agentId = '',
   profileName,
   persistedProfileName,
+  instanceKey,
+  alias,
 } = {}) {
   const exactBytes = manifestBytes === undefined
     ? (manifestPath && fs.existsSync(manifestPath)
@@ -3087,6 +3677,8 @@ export function admitDirectAgentRuntimeManifest(manifest, {
     manifestBytes: exactBytes,
     manifestPath,
     agentId,
+    instanceKey,
+    alias,
     profileName: profileResolution.resolvedProfileName,
     profileConfig: profileResolution.profileConfig,
     network: profileResolution.network,
@@ -3261,7 +3853,7 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
       }
       let result = null;
       try {
-        result = ensureAgentService(shortAgentName, manifest, agentDir, {
+        result = await ensureAgentService(shortAgentName, manifest, agentDir, {
           containerName: registryRecord?.containerName,
           alias: registryRecord?.record?.alias,
           routerEndpoint,
@@ -3428,7 +4020,7 @@ async function runShell(agentName) {
   const { containerInfo, containerName } = await withNetworkLifecycleLock(async (networkLifecycleCapability) => {
     let result = null;
     try {
-      result = ensureAgentService(shortAgentName, manifest, agentDir, {
+      result = await ensureAgentService(shortAgentName, manifest, agentDir, {
         containerName: registeredContainerName,
         alias: registryRecord?.record?.alias,
         routerEndpoint,
@@ -3629,6 +4221,7 @@ async function reinstallAgent(agentName) {
                 containerName,
                 alias: registryRecord?.record?.alias,
                 forceRecreate: true,
+                forceRecreateReason: 'reinstall command',
                 routerEndpoint,
                 runtimeAdmission: directAdmission.runtimeAdmission,
                 networkLifecycleCapability,

@@ -1,0 +1,319 @@
+import fs from 'node:fs';
+import { readMpsStatus, inspectMpsTargetEligibility, inspectPreparedMpsImage } from '../../sandbox/hardwareLimits/mpsStatus.mjs';
+import { resolveManifestImage } from '../../utils/security/secretVars.js';
+import { validateHardwareRequest } from './hardwareLimitsRequest.mjs';
+export { validateHardwareRequest } from './hardwareLimitsRequest.mjs';
+import { readBoxHardwareMarker } from '../../../ploinky-box/lib/hardwareLimitsMarker.mjs';
+import { isInsideBox } from '../../../ploinky-box/lib/boxMarker.mjs';
+import { readBoxHardwareContext } from '../../sandbox/hardwareLimits/context.mjs';
+import {
+    HardwareStoreError, hardwareStorePaths, readStoreSnapshot, setAgentLimits, clearAgentLimits,
+    assertPolicyWritesAllowed, parseLimitsRequestBody, validateStoreToken, MAX_REQUEST_BYTES,
+} from '../../sandbox/hardwareLimits/store.mjs';
+import { admitManifestRuntimeCapabilities, hardwareLimitsHashOf, hardwareRefusalOf } from '../../sandbox/runtimeCapabilities.js';
+import { readAgentRegistrySnapshot } from '../../utils/agentRegistrySnapshot.js';
+import { collectAgentsSummary } from '../../utils/status.js';
+import { readRoutingConfig } from '../routingFile.js';
+import { findHardwareOutcome, validateHardwareOutcome, HardwareLimitsError } from '../../sandbox/hardwareLimits/errors.mjs';
+import { readAppliedObservation } from '../../sandbox/hardwareLimits/runtimeState.mjs';
+import { deprecatedDeclarationNote } from '../../sandbox/hardwareLimits/declaredLimits.mjs';
+import { HOST_NETWORK_NESTED_PODMAN_REFUSAL, buildDirectRefusal } from '../../sandbox/hardwareLimits/requestedLimits.mjs';
+import { storedRequestedLimits } from '../../sandbox/hardwareLimits/resolve.mjs';
+import { runHardwareLimitsApplyWorker, hardwareApplyFlight } from '../hardwareLimitsApplyWorker.mjs';
+import { workspaceMetricsMonitor } from '../workspaceMetrics.js';
+import { resolveManifestRuntimeProfile } from '../../utils/runtime/profileService.js';
+import { resolveLlmRuntimeAdmissionContext } from '../../sandbox/docker/llmRuntimeIntegration.js';
+import { isSessionRevoked } from '../auth/sessionRevocations.js';
+import { createHardwareApplyAuthority } from '../hardwareLimitsApplyAuthority.mjs';
+import { readStoreAvailabilityProjections } from '../hardwareAvailabilityProjections.mjs';
+
+export const HARDWARE_HELP = Object.freeze({
+    authority: 'Workspace-capable agents may read the workspace master key and forge administrator cookie/CSRF requests. This exposure is accepted for v1.',
+    gpu: [
+        'GPU shares use NVIDIA MPS and are best-effort, not a security boundary.',
+        'Share clients use the same Box user as the MPS daemon. They can issue control commands, widen settings, stop the daemon and alter its writable pipe-directory entries.',
+        'A process that drops the MPS environment can use the GPU outside MPS in DEFAULT compute mode.',
+        'The MPS device-memory limit applies to each CUDA process, not to the sum of every process in an agent.',
+        'A RAM cgroup limit does not cap dedicated GPU memory.',
+        'Only the host operator may choose EXCLUSIVE_PROCESS. It affects other CUDA users and workspaces. Ploinky never changes compute mode.',
+    ],
+});
+
+function fail(code, message, status = 400) { throw new HardwareStoreError(message, { code, status }); }
+
+export function hasHardwareBearer(req) {
+    const values = Object.entries(req.headers || {}).filter(([key]) => key.toLowerCase() === 'authorization').flatMap(([, value]) => Array.isArray(value) ? value : [value]);
+    for (let index = 0; index < (req.rawHeaders || []).length; index += 2) {
+        if (String(req.rawHeaders[index]).toLowerCase() === 'authorization') values.push(req.rawHeaders[index + 1]);
+    }
+    return values.some((value) => /(?:^|,)\s*bearer(?:\s|$)/i.test(String(value)));
+}
+
+
+function defaultContext({ refreshBackend = false } = {}) {
+    if (!isInsideBox()) fail('not_in_box', 'Hardware administration requires this workspace\'s Ploinky Box.', 409);
+    const marker = readBoxHardwareMarker();
+    const context = readBoxHardwareContext({ refreshBackend });
+    if (context.gate !== 'on') return { ...context, identity: null, paths: null };
+    if (!marker.valid) fail('store_unreadable', 'The hardware wiring marker cannot be read safely.', 503);
+    const identity = { instance: marker.marker.instance, pathHash: marker.marker.pathHash, workspaceRoot: marker.marker.workspaceRoot };
+    return { ...context, gpu: readMpsStatus({ workspaceRoot: identity.workspaceRoot }), identity, paths: hardwareStorePaths({ identity, context: 'box' }) };
+}
+
+function installedAgents() {
+    return collectAgentsSummary({ includeInactive: true }).flatMap((repo) => (repo.agents || []).map((agent) => ({ ref: `${agent.repo}/${agent.name}`, manifestPath: agent.manifestPath })));
+}
+
+function defaultAdmission(agent, record = {}, context) {
+    const bytes = fs.readFileSync(agent.manifestPath);
+    const manifest = JSON.parse(bytes.toString('utf8'));
+    const profile = resolveManifestRuntimeProfile(manifest, { agentName: agent.ref, profileName: record.profile || undefined });
+    const llm = resolveLlmRuntimeAdmissionContext({ runtime: record.runtime || 'podman', manifest, profileConfig: profile.profileConfig, agentName: agent.ref.split('/')[1], alias: record.alias, env: process.env });
+    return admitManifestRuntimeCapabilities(manifest, {
+        manifestPath: agent.manifestPath, manifestBytes: bytes, agentId: agent.ref,
+        profileName: profile.resolvedProfileName, profileConfig: profile.profileConfig, network: profile.network, runtime: record.runtime || 'podman',
+        catalogPolicy: llm.catalogPolicy, catalogIdentity: llm.catalogIdentity,
+        instanceKey: record.key || agent.ref, alias: record.alias || '',
+        hardwareAdmission: 'metadata', hardwareContext: context,
+    });
+}
+
+// A bounded note when the agent's manifest still declares limits under the
+// deprecated llmRuntime.runtimePolicy.resources path; null otherwise.
+function defaultDeclarationNote(agent) {
+    try {
+        return deprecatedDeclarationNote(JSON.parse(fs.readFileSync(agent.manifestPath, 'utf8')));
+    } catch (_) {
+        return null;
+    }
+}
+
+export function qualifyHardwareGpuTarget(agent, records, context, limits, { inspectImage = inspectPreparedMpsImage, qualify = inspectMpsTargetEligibility } = {}) {
+    if (!agent) fail('unknown_agent', 'The selected agent is not installed.', 404);
+    const manifest = JSON.parse(fs.readFileSync(agent.manifestPath, 'utf8'));
+    const [repoName, agentName] = agent.ref.split('/');
+    let qualified;
+    for (const record of [{}, ...records]) {
+        const runtime = record.runtime || 'podman';
+        const profile = resolveManifestRuntimeProfile(manifest, { agentName: agent.ref, profileName: record.profile || undefined });
+        const llm = resolveLlmRuntimeAdmissionContext({ runtime, manifest, profileConfig: profile.profileConfig, agentName, alias: record.alias, env: process.env });
+        const image = llm.startup?.imageRef || resolveManifestImage(manifest, profile.profileConfig, { agentName, repoName });
+        qualified = qualify({ image, networkMode: profile.network?.mode || 'default', agentRef: agent.ref, gpuShare: limits.gpu, workspaceRoot: context.identity?.workspaceRoot, status: context.gpu }, { inspectImage: (target) => inspectImage(target, { runtime }) });
+    }
+    return qualified;
+}
+
+// D4 write-time admission, run by setAgentLimits under the store lock with the
+// locked snapshot's overrides plus the proposed entry. It applies the runtime's
+// own predicate (evaluateHardwareEligibility, through metadata admission) with
+// fresh manifest, profile and registry facts to the default record and to every
+// registry instance of the agent, and propagates only the D4 refusal: any other
+// reason keeps its existing write-time or launch-time handling. The runtime's
+// decision returns one reason, and D4 ranks after the conflict, store, stored
+// override (an unknown envelope) and gate reasons; those would hide D4 here, so
+// the D4 outcome is also raised when another reason refused an admitted
+// host-network nestedPodman container for which the proposal carries a limit.
+export function refuseUnenforceableProposal({ agentRef, agents, context, getInstalled, getRegistry, admit }) {
+    const agent = getInstalled().find((candidate) => candidate.ref === agentRef);
+    if (!agent) return;
+    const proposed = { ...context, overrides: agents };
+    const proposalRequest = storedRequestedLimits(agents.get(agentRef));
+    const records = Object.entries(getRegistry()).filter(([, record]) => record?.type === 'agent' && `${record.repoName}/${record.agentName}` === agentRef).map(([key, record]) => ({ ...record, key }));
+    for (const record of [{}, ...records]) {
+        let admission;
+        try { admission = admit(agent, record, proposed); } catch (_) { continue; }
+        const refusal = hardwareRefusalOf(admission);
+        if (refusal?.reasonCode === 'host_network_nested_podman') throw new HardwareLimitsError(refusal);
+        const capabilities = admission?.descriptor?.capabilities;
+        if (refusal && admission.runtimeKind === 'container' && capabilities?.hostNetwork === true && capabilities?.nestedPodman === true && proposalRequest.length) {
+            throw new HardwareLimitsError(buildDirectRefusal({
+                key: refusal.key, ref: refusal.ref, alias: refusal.alias, inputFingerprint: refusal.inputFingerprint,
+                refusalParts: { ...HOST_NETWORK_NESTED_PODMAN_REFUSAL, requested: [...(refusal.requested || []).filter((entry) => !proposalRequest.some((own) => own.field === entry.field)), ...proposalRequest] },
+            }));
+        }
+    }
+}
+
+export function buildHardwareLimitsState({ context, installed, registry, routing = {}, storeProjections = null, metrics = null, admit = defaultAdmission, readApplied = readAppliedObservation, readDeclarationNote = defaultDeclarationNote }) {
+    const entries = new Map(installed.map((agent) => [agent.ref, agent]));
+    for (const ref of context.overrides?.keys() || []) if (!entries.has(ref)) entries.set(ref, { ref, orphaned: true });
+    const agents = [];
+    for (const agent of entries.values()) {
+        let admission = null;
+        let declared = {};
+        const deprecatedDeclaration = agent.orphaned ? null : readDeclarationNote(agent);
+        if (!agent.orphaned) {
+            try {
+                declared = admit(agent, {}, { ...context, overrides: new Map() }).descriptor?.runtimePolicy?.resources || {};
+                admission = admit(agent, {}, context);
+            } catch (_) {}
+        }
+        const containers = [];
+        for (const [key, record] of Object.entries(registry)) {
+            if (record?.type !== 'agent' || `${record.repoName}/${record.agentName}` !== agent.ref) continue;
+            const route = Object.values(routing.routes || {}).find((value) => value?.container === key);
+            let projection = route?.hardwareAvailability;
+            if (!projection && storeProjections) {
+                for (const candidate of storeProjections.values()) {
+                    if (candidate.key === key) { projection = candidate; break; }
+                }
+            }
+            let problem = null;
+            if (projection && projection.key === key && projection.instanceId === record.instanceId && projection.enableGeneration === record.enableGeneration) {
+                try { problem = validateHardwareOutcome(projection.problem); } catch (_) {}
+            }
+            let desired = null;
+            try { desired = admit(agent, { ...record, key }, context); } catch (_) {}
+            const observed = readApplied(key, record.containerId);
+            const matchingObservation = observed && observed.instanceId === record.instanceId && observed.enableGeneration === record.enableGeneration ? observed : null;
+            const snapshotRuntime = metrics?.runtimes?.find((value) => value.containerName === key);
+            // A snapshot is only a statement about the container it read. When the current instance has an applied observation (written
+            // when it was created) that is newer than the snapshot, or the snapshot's entry names another container, or has no entry
+            // for it, the snapshot predates the instance: it says nothing about it, and the instance is starting, never stopped.
+            const entryId = snapshotRuntime?.containerId || '';
+            const currentId = /^[a-f0-9]{64}$/.test(record.containerId || '') ? record.containerId : '';
+            // Freshness is judged by when the engine read STARTED, not when it was published; a read that started in the same millisecond as the observation is stale too (`<=`).
+            // reconcileAfter accepts only a reconcile that started strictly after the Apply ended, and the Apply writes its observations first: an accepted one never predates.
+            const sampledAt = Date.parse(metrics?.readStartedAt ?? metrics?.sampledAt);
+            const observedAt = Date.parse(matchingObservation?.observedAt);
+            const predates = Number.isFinite(sampledAt) && Number.isFinite(observedAt) && sampledAt <= observedAt;
+            // After an engine read that FAILED the snapshot only keeps the last good read's runtimes: none of them is a statement about now,
+            // so every instance is judged stale (never `ready`, never a stop read from a past moment).
+            const readFailed = metrics?.readFailed === true;
+            const staleSnapshot = Boolean(metrics) && !projection
+                && (readFailed || (Boolean(matchingObservation) && (entryId ? Boolean(currentId) && entryId !== currentId : predates)));
+            const runtime = staleSnapshot ? null : snapshotRuntime;
+            const ready = runtime?.state?.ready === true;
+            // The engine runs it but no route is active yet (agentRuntimeState status `starting`): starting, not stopped.
+            // Only a container the ENGINE reports running can be starting: the no-wait projection marks any pending run `starting`,
+            // including one whose container has exited and is not listed at all.
+            const engineStarting = runtime?.state?.status === 'starting' && runtime?.engineRunning === true;
+            const running = runtime?.state?.running === true || engineStarting;
+            const availability = problem?.state || (projection || runtime?.state?.status === 'failed' ? 'failed' : ready ? 'ready' : running || staleSnapshot ? 'starting' : 'stopped');
+            const desiredMps = desired?.descriptor?.hardwareGpu;
+            const generationMatches = !desiredMps || (context.gpu?.daemonStatus === 'ready' && matchingObservation?.mpsGeneration === context.gpu.mpsGeneration);
+            const desiredHash = hardwareLimitsHashOf(desired?.descriptor);
+            let limitsState;
+            if (projection || (!running && !staleSnapshot)) limitsState = 'unavailable';
+            else if (!desiredHash) {
+                // No hardware placement is desired (unprepared Box, unlimited
+                // D4 instance, sandbox runtime). Apply's unchanged predicate
+                // decides: no request or refusal and no placed runtime is
+                // applied; a request that cannot be placed is unavailable.
+                if (!desired || hardwareRefusalOf(desired) || desired.descriptor?.hardwareRequest?.length) limitsState = 'unavailable';
+                else limitsState = matchingObservation?.limitsHash ? 'pending' : 'applied';
+            } else limitsState = matchingObservation && generationMatches && matchingObservation.limitsHash === desiredHash ? 'applied' : 'pending';
+            containers.push({
+                key, alias: record.alias || null, instanceId: record.instanceId || null, enableGeneration: record.enableGeneration || null,
+                availability, limitsState, problem, mpsGeneration: matchingObservation?.mpsGeneration || null, ...(runtime?.limits ? { limits: runtime.limits } : {}),
+                effective: { ...(desired?.descriptor?.hardwareResolved || desired?.descriptor?.hardwarePlacement?.expected || {}), ...(desiredMps ? { gpu: desiredMps } : {}) },
+                usage: runtime?.metrics?.available ? { cpuPercent: runtime.metrics.cpuPercent, memoryBytes: runtime.metrics.memoryBytes } : null,
+            });
+        }
+        agents.push({ ref: agent.ref, configured: context.overrides?.get(agent.ref) || {}, declared, effective: { ...(admission?.descriptor?.hardwarePlacement?.expected || {}), ...(admission?.descriptor?.hardwareGpu ? { gpu: admission.descriptor.hardwareGpu } : {}) }, containers, ...(deprecatedDeclaration ? { deprecatedDeclaration } : {}), ...(agent.orphaned ? { orphaned: true } : {}) });
+    }
+    return {
+        ok: true, token: context.storeToken || null, metricsSampledAt: metrics?.sampledAt || null, metricsReadStartedAt: metrics?.readStartedAt || null, metricsReadFailed: metrics?.readFailed === true,
+        gate: { state: context.gate, prepared: context.prepared === true, backendReady: context.backendReady === true, controllers: context.controllers || [] },
+        envelope: context.envelope || null, gpu: context.gpu || { eligible: false, mode: 'unavailable', assurance: 'best-effort', reason: 'GPU sharing is not qualified in this Box.' },
+        help: HARDWARE_HELP, agents: agents.sort((a, b) => a.ref.localeCompare(b.ref)),
+    };
+}
+
+export function hardwareHttpError(error) {
+    const hardwareOutcome = findHardwareOutcome(error);
+    if (hardwareOutcome) return { status: hardwareOutcome.state === 'blocked' ? 424 : 422, body: { ok: false, error: hardwareOutcome.code, message: hardwareOutcome.state === 'blocked' ? hardwareOutcome.rootCause.reason : hardwareOutcome.reason, fix: hardwareOutcome.rootCause.fix, hardwareOutcome } };
+    const allowed = new Set(['not_in_box', 'invalid_json', 'invalid_limits', 'unknown_action', 'unknown_agent', 'unknown_container', 'revision_conflict', 'identity_changed', 'identity_unrepresentable', 'store_busy', 'hardware_limits_transition', 'apply_in_progress', 'apply_timeout', 'hardware_cleanup_failed', 'apply_recovery_required', 'hardware_limits_off', 'controller_unavailable', 'gpu_sharing_unavailable', 'image_preparation_required', 'exceeds_envelope', 'store_unreadable', 'audit_pending']);
+    const code = allowed.has(error?.code) ? error.code : 'store_unreadable';
+    return { status: Number.isInteger(error?.status) ? error.status : 503, body: { ok: false, error: code, message: allowed.has(error?.code) ? String(error.message).slice(0, 2048) : 'Hardware limits are unavailable. Inspect host hardware status.', ...(error?.committed === true ? { committed: true, token: error.token } : {}) } };
+}
+
+function readBody(req) {
+    return new Promise((resolve, reject) => {
+        let size = 0;
+        const chunks = [];
+        req.on('data', (chunk) => {
+            const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+            size += bytes.length;
+            if (size > MAX_REQUEST_BYTES) reject(new HardwareStoreError('Request exceeds 16 KiB.', { code: 'invalid_limits', status: 400 }));
+            else chunks.push(bytes);
+        });
+        req.on('end', () => { try { resolve(parseLimitsRequestBody(Buffer.concat(chunks))); } catch (error) { reject(error); } });
+        req.on('error', reject);
+        req.on('aborted', () => reject(new Error('request aborted')));
+    });
+}
+
+export async function handleHardwareLimitsRoutes(req, res, parsedUrl, {
+    ensureAdmin, verifyMutation, getContext = defaultContext, getInstalled = installedAgents,
+    getRegistry = readAgentRegistrySnapshot, getRouting = readRoutingConfig, getStoreProjections = readStoreAvailabilityProjections,
+    getMetrics = () => workspaceMetricsMonitor.latest, apply = runHardwareLimitsApplyWorker, readApplied = readAppliedObservation,
+    refreshMetrics = (since) => workspaceMetricsMonitor.reconcileAfter(since),
+    set = setAgentLimits, clear = clearAgentLimits, admit = defaultAdmission, verifyLease = () => true,
+    readSelection = null, qualifyGpu = qualifyHardwareGpuTarget,
+} = {}) {
+    const send = (status, body) => { res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(body)); };
+    if (hasHardwareBearer(req)) { send(403, { ok: false, error: 'agent_forbidden' }); return true; }
+    const method = String(req.method || 'GET').toUpperCase();
+    if (!['GET', 'POST'].includes(method)) { send(405, { ok: false, error: 'method_not_allowed' }); return true; }
+    if (typeof ensureAdmin !== 'function' || !await ensureAdmin(req, res, parsedUrl)) return true;
+    if (method === 'POST') {
+        const decision = typeof verifyMutation === 'function' ? await verifyMutation(req) : { ok: false };
+        if (!decision.ok) { send(403, { ok: false, error: String(decision.code || 'csrf_invalid').toLowerCase() }); return true; }
+    }
+    try {
+        const body = method === 'POST' ? validateHardwareRequest(await readBody(req)) : null;
+        const context = getContext({ refreshBackend: method === 'POST' });
+        const installed = getInstalled();
+        const registry = getRegistry();
+        const state = () => ({ ...buildHardwareLimitsState({ context: getContext(), installed, registry: getRegistry(), routing: getRouting(), storeProjections: getStoreProjections(), metrics: getMetrics(), admit, readApplied }), apply: hardwareApplyFlight() });
+        if (method === 'GET') {
+            const result = state();
+            if (context.storeState === 'unreadable') send(503, { ...result, ok: false, error: 'store_unreadable', message: context.storeDetail || 'The hardware store is unreadable.' });
+            else send(200, result);
+            return true;
+        }
+        if (!verifyLease()) fail('identity_changed', 'The routing generation changed before mutation.', 409);
+        if (!context.paths || context.gate !== 'on') fail('hardware_limits_off', 'On the host run PLOINKY_BOX_HARDWARE_LIMITS=on ploinky restart.', 409);
+        assertPolicyWritesAllowed({ paths: context.paths });
+        const actor = { id: String(req.user?.id || '').slice(0, 256), name: String(req.user?.username || req.user?.name || '').slice(0, 256) };
+        const authority = body.action === 'apply' && readSelection ? createHardwareApplyAuthority({ readSelection, verifyInitial: verifyLease }) : null;
+        const authorize = () => {
+            const signed = req.session?._jwtPayload;
+            if ((req.session?.expiresAt && Date.now() >= req.session.expiresAt) || (signed?.exp && Date.now() / 1000 >= signed.exp)
+                || isSessionRevoked({ sid: signed?.sid || req.sessionId, jti: signed?.jti })) return false;
+            return (authority ? authority.isCurrent() : verifyLease() === true) && verifyMutation(req)?.ok === true;
+        };
+        if (body.action === 'apply') {
+            const result = await apply({ expectedToken: body.expectedToken, containers: body.containers }, {
+                onOwnedSelection: (receipt) => authority?.accept(receipt) === true,
+                authorize: async () => {
+                    if (!authorize()) return false;
+                    const silentResponse = { writeHead() {}, end() {} };
+                    return await ensureAdmin(req, silentResponse, parsedUrl) === true && authorize();
+                },
+            });
+            // A successful Apply changed containers: the next status read must not see the snapshot of before. Wait, bounded, for a metrics
+            // reconcile that started after the Apply ended; if the bound passes the answer still goes out and says the status may lag.
+            let statusFresh = null; let statusWaitMs = null;
+            if (result?.ok !== false && (result?.status || 200) < 400) {
+                const waitStartedAt = Date.now();
+                try { statusFresh = (await refreshMetrics(waitStartedAt))?.fresh === true; } catch (_) { statusFresh = false; }
+                statusWaitMs = Date.now() - waitStartedAt;
+            }
+            send(result?.status || 200, { ok: result?.ok !== false, ...result, ...(statusFresh === null ? {} : { statusFresh, statusWaitMs, ...(statusFresh ? {} : { statusNote: 'The workspace metrics snapshot may lag this Apply by a few seconds.' }) }) });
+        } else {
+            const gpu = body.action === 'set_agent_limits' && body.limits?.gpu
+                ? qualifyGpu(installed.find((agent) => agent.ref === body.agentRef), Object.values(registry).filter((record) => record?.type === 'agent' && `${record.repoName}/${record.agentName}` === body.agentRef), context, body.limits) : context.gpu;
+            const capabilities = { gate: context.gate, controllers: context.backendReady ? context.controllers : [], gpu };
+            const result = body.action === 'set_agent_limits'
+                ? set({ paths: context.paths, identity: context.identity, expectedToken: body.expectedToken, agentRef: body.agentRef, limits: body.limits, installedRefs: new Set(installed.map((agent) => agent.ref)), capabilities, envelope: context.envelope, actor, beforeCommit: authorize, admitProposed: ({ agentRef, agents }) => refuseUnenforceableProposal({ agentRef, agents, context, getInstalled, getRegistry, admit }) })
+                : clear({ paths: context.paths, identity: context.identity, expectedToken: body.expectedToken, agentRef: body.agentRef, actor, beforeCommit: authorize });
+            send(200, { ...state(), token: result.token, committed: result.committed, affectedInstances: Object.entries(registry).filter(([, record]) => record?.type === 'agent' && `${record.repoName}/${record.agentName}` === body.agentRef).map(([key]) => key) });
+        }
+    } catch (error) {
+        const response = hardwareHttpError(error);
+        send(response.status, response.body);
+    }
+    return true;
+}

@@ -1,0 +1,452 @@
+// Shared hardware-limit request predicate and exact refusal construction.
+//
+// A request is any effective memory, cpus or pidsLimit value, whatever layer
+// declared it (through the neutral hardwareLimits field or the deprecated
+// llmRuntime.runtimePolicy.resources) and whether or not llmRuntime.enabled
+// is set. Inside a Box the nested runtime enforces such a value only when the
+// Box is hardware-prepared; a lite sandbox never can. An unenforceable request
+// refuses the agent instead of silently dropping the limit. Outside a Box the
+// container engine enforces the flags and behavior is unchanged.
+
+import crypto from 'node:crypto';
+
+import {
+    HARDWARE_FIELDS,
+    HARDWARE_UNENFORCEABLE,
+    OUTCOME_BOUNDS,
+    validateHardwareOutcome,
+} from './errors.mjs';
+import { readBoxHardwareContext } from './context.mjs';
+import { declarationConflictRefusal, declaredLayerPolicy } from './declaredLimits.mjs';
+import { resolveStoredOverride, storedRequestedLimits } from './resolve.mjs';
+import { parseAdmittedCpus } from './cpuQuota.mjs';
+
+export const HARDWARE_RESOURCE_FIELDS = Object.freeze(['memory', 'cpus', 'pidsLimit']);
+const LAYERS = Object.freeze([
+    ['manifest', 'manifestPolicy'],
+    ['catalog', 'catalogPolicy'],
+    ['profile', 'profilePolicy'],
+    ['settings', 'overridePolicy'],
+]);
+
+// D4: the limited host-network + nestedPodman combination is not supported in
+// this release; an unlimited instance is unaffected. Shared by the runtime's
+// eligibility decision and the policy setter's write-time check.
+export const HOST_NETWORK_NESTED_PODMAN_REFUSAL = Object.freeze({
+    reasonCode: 'host_network_nested_podman',
+    reason: 'This release cannot enforce this hardware limit for host networking with nestedPodman.',
+    fix: 'Use managed networking, remove nestedPodman capability, or remove the requested limit at its source.',
+});
+
+export const DELEGATION_COMMANDS = Object.freeze([
+    'sudo mkdir -p /etc/systemd/system/user@.service.d',
+    "printf '[Service]\\nDelegate=cpu memory pids\\n' | sudo tee /etc/systemd/system/user@.service.d/delegate.conf",
+    'sudo systemctl daemon-reload',
+]);
+
+function resourceValue(policy, field) {
+    const value = policy?.resources?.[field];
+    if (value === undefined || value === null || value === '' || value === 0) return undefined;
+    return String(value);
+}
+
+// The exact effective request with the last declaring layer as its source.
+// Layer order matches buildEffectivePolicy: manifest, catalog, profile, then
+// the operator's stored settings.
+export function requestedHardwareLimits(sources = {}) {
+    const requested = [];
+    for (const field of HARDWARE_RESOURCE_FIELDS) {
+        let entry = null;
+        for (const [source, key] of LAYERS) {
+            const value = resourceValue(sources[key], field);
+            if (value !== undefined) entry = { field, value, source };
+        }
+        if (entry) requested.push(Object.freeze(entry));
+    }
+    return Object.freeze(requested);
+}
+
+export function hasHardwareRequest(requested) {
+    return Array.isArray(requested) && requested.length > 0;
+}
+
+function canonical(value) {
+    if (Array.isArray(value)) return value.map(canonical);
+    if (value && typeof value === 'object') {
+        return Object.keys(value).sort().reduce((out, key) => {
+            out[key] = canonical(value[key]);
+            return out;
+        }, {});
+    }
+    return value;
+}
+
+export function hex64(value) {
+    return crypto.createHash('sha256').update(JSON.stringify(canonical(value))).digest('hex');
+}
+
+// Hardware facts that admission depends on. The provider is replaced in a
+// hardware-prepared Box; the default inside a Box is gate off, which makes
+// every declared limit unenforceable (nested cgroups are disabled).
+const DEFAULT_CONTEXT_PROVIDER = ({ insideBox }) => (insideBox
+    ? readBoxHardwareContext()
+    : { gate: 'none', prepared: false, backendReady: false, controllers: [], storeState: 'none' });
+let contextProvider = DEFAULT_CONTEXT_PROVIDER;
+
+export function setHardwareContextProvider(provider) {
+    contextProvider = typeof provider === 'function' ? provider : DEFAULT_CONTEXT_PROVIDER;
+}
+
+export function normalizeHardwareContext(raw, { insideBox, runtimeKind }) {
+    const value = raw && typeof raw === 'object' ? raw : {};
+    const controllers = Array.isArray(value.controllers)
+        ? [...new Set(value.controllers.filter((entry) => ['cpu', 'memory', 'pids'].includes(entry)))].sort()
+        : [];
+    return Object.freeze({
+        insideBox: Boolean(insideBox),
+        runtimeKind: String(runtimeKind || 'container'),
+        gate: ['on', 'off', 'none'].includes(value.gate) ? value.gate : (insideBox ? 'off' : 'none'),
+        prepared: value.prepared === true,
+        backendReady: value.backendReady === true,
+        controllers: Object.freeze(controllers),
+        hostKind: typeof value.hostKind === 'string' ? value.hostKind : '',
+        unpreparedDetail: typeof value.unpreparedDetail === 'string' ? value.unpreparedDetail : '',
+        unpreparedKind: typeof value.unpreparedKind === 'string' ? value.unpreparedKind : '',
+        runtimeObserved: typeof value.runtimeObserved === 'string' ? value.runtimeObserved : '',
+        storeState: ['none', 'valid', 'unreadable'].includes(value.storeState) ? value.storeState : 'none',
+        storeDetail: typeof value.storeDetail === 'string' ? value.storeDetail : '',
+        storeToken: value.storeToken && typeof value.storeToken === 'object'
+            ? Object.freeze({ epoch: String(value.storeToken.epoch || ''), revision: Number(value.storeToken.revision) || 0 })
+            : null,
+        // Per-agent stored overrides and the visible envelope; consulted for
+        // resolution. The envelope reaches an agent's fingerprint only through
+        // that agent's own declared-cpus decision (declaredCpusEnvelopeState).
+        overrides: value.overrides instanceof Map ? value.overrides : new Map(),
+        gpu: value.gpu || null,
+        envelope: value.envelope && typeof value.envelope === 'object' ? value.envelope : null,
+    });
+}
+
+export function captureHardwareContext({ insideBox = false, runtimeKind = 'container', hardwareContext } = {}) {
+    const raw = hardwareContext !== undefined
+        ? hardwareContext
+        : contextProvider({ insideBox: Boolean(insideBox), runtimeKind });
+    return normalizeHardwareContext(raw, { insideBox, runtimeKind });
+}
+
+const CONTROLLER_BY_FIELD = Object.freeze({ memory: 'memory', cpus: 'cpu', pidsLimit: 'pids' });
+
+function liteSandboxRefusal(requested) {
+    const fields = requested.map((entry) => entry.field).join(', ');
+    return {
+        reasonCode: 'lite_sandbox',
+        reason: `This runtime cannot apply ${fields}.`,
+        fix: 'Use the managed container lifecycle, or remove the limit. For host lite sandboxes, disable the lite sandbox before starting the container runtime.',
+    };
+}
+
+function unpreparedRefusal(context) {
+    if (context.unpreparedKind === 'cgroup') {
+        return {
+            reasonCode: 'cgroup_unsupported',
+            reason: 'The Box needs writable cgroup v2 with nsdelegate.',
+            fix: "Configure the host's unified delegated hierarchy and restart the Box; Ploinky will not change host mounts or boot settings.",
+        };
+    }
+    if (context.unpreparedKind === 'runtime') {
+        return {
+            reasonCode: 'runtime_unverified',
+            reason: `Hardware limits require verified crun and nested cgroupfs. Observed: ${context.runtimeObserved || 'unknown/unknown/unknown/unknown'}.`,
+            fix: 'For the outer engine, set runtime="crun" in the [engine] section of that engine user\'s '
+                + '~/.config/containers/containers.conf, then run ploinky restart. On macOS do this inside the Podman machine. '
+                + 'A nested failure requires the supported immutable Box image and working podman --cgroup-manager=cgroupfs '
+                + 'invocation; inspect ploinky diagnose before retrying.',
+        };
+    }
+    if (context.unpreparedKind === 'parents') {
+        return {
+            reasonCode: 'backend_unavailable',
+            reason: `This Box is not prepared for hardware limits: ${context.unpreparedDetail || 'the agent cgroup parents could not be created'}.`,
+            fix: 'On the host run ploinky limits status, repair the reported prerequisite, then ploinky restart.',
+        };
+    }
+    return {
+        reasonCode: 'unprepared',
+        reason: `This Box is not prepared for hardware limits: ${context.unpreparedDetail || 'preparation was not proved'}.`,
+        fix: 'On the host run ploinky limits status, repair the reported prerequisite, then ploinky restart.',
+    };
+}
+
+function controllerRefusal(controller, context) {
+    if (context.hostKind === 'macos') {
+        return {
+            reasonCode: 'controller_unavailable',
+            reason: `The host does not delegate ${controller} to rootless Podman.`,
+            fix: 'Apply the delegation commands inside podman machine ssh, then restart that Podman machine and run '
+                + `ploinky restart on macOS. ${DELEGATION_COMMANDS.join(' ; ')}`,
+        };
+    }
+    return {
+        reasonCode: 'controller_unavailable',
+        reason: `The host does not delegate ${controller} to rootless Podman.`,
+        fix: 'Apply the delegation commands below on the Linux host, log out and back in, then run ploinky restart. '
+            + `${DELEGATION_COMMANDS.join(' ; ')} (daemon-reload alone does not change an existing session)`,
+    };
+}
+
+// The Box CPU envelope as one number, or null when it is unknown.
+function envelopeCpusOf(context) {
+    const envelopeCpus = Number(context.envelope?.cpus);
+    return Number.isFinite(envelopeCpus) && envelopeCpus > 0 ? envelopeCpus : null;
+}
+
+// The declared cpus entry of one agent (a stored value was checked when its
+// entry was resolved), or null.
+const declaredCpusOf = (requested) => requested.find((entry) => entry.field === 'cpus' && entry.source !== 'settings') || null;
+
+// This agent's own envelope decision for its declared cpus value, placed under
+// hardware limits only: 'invalid' (not a two-decimal value), 'unknown' (the Box
+// reports no envelope), 'exceeds' or 'within'. It is part of this agent's input
+// fingerprint and of no other agent's, so a Box that grows or shrinks re-arms
+// or invalidates exactly the agents whose declared value moved across the
+// envelope, and one that changes without crossing it changes nothing.
+function declaredCpusEnvelopeState(requested, context) {
+    if (context.gate !== 'on' || !context.prepared || !context.backendReady) return null;
+    const entry = declaredCpusOf(requested);
+    if (!entry) return null;
+    const admitted = parseAdmittedCpus(entry.value);
+    if (!admitted.ok) return 'invalid';
+    const envelopeCpus = envelopeCpusOf(context);
+    if (envelopeCpus === null) return 'unknown';
+    return Number(admitted.canonical) > envelopeCpus ? 'exceeds' : 'within';
+}
+
+// Plan §8.1 and amendment A3: a cpus value placed under hardware limits is a
+// decimal with at most two places (never rounded) and does not exceed the
+// envelope. A declared value is never admitted against an unknown envelope:
+// like a stored value it is refused as envelope_unknown, because the envelope
+// is the only bound on it.
+function cpuAdmissionRefusal(requested, context) {
+    for (const entry of requested) {
+        if (entry.field !== 'cpus' || entry.source === 'settings') continue;
+        const admitted = parseAdmittedCpus(entry.value);
+        if (!admitted.ok) {
+            return {
+                reasonCode: 'exceeds_envelope',
+                reason: `The cpus value ${String(entry.value).slice(0, 64)} declared in the ${entry.source} ${admitted.reason}, so its CPU quota cannot be read back exactly.`,
+                fix: `Declare cpus as a decimal from 0.01 with at most two decimal places (for example 0.29) in the ${entry.source}, or remove the limit.`,
+            };
+        }
+        const envelopeCpus = envelopeCpusOf(context);
+        if (envelopeCpus === null) {
+            return {
+                reasonCode: 'envelope_unknown',
+                reason: `The Box CPU envelope is unknown, so the cpus value ${admitted.canonical} declared in the ${entry.source} cannot be checked against it.`,
+                fix: `On the host run ploinky limits status, repair the reported prerequisite, then ploinky restart; or remove the declared cpus limit in the ${entry.source}.`,
+            };
+        }
+        if (Number(admitted.canonical) > envelopeCpus) {
+            return {
+                reasonCode: 'exceeds_envelope',
+                reason: `The cpus value ${admitted.canonical} declared in the ${entry.source} exceeds the Box CPU envelope of ${envelopeCpus}.`,
+                fix: `Declare at most ${envelopeCpus} CPUs in the ${entry.source}, or remove the limit.`,
+            };
+        }
+    }
+    return null;
+}
+
+function storeRefusal(context) {
+    return {
+        reasonCode: 'store_unreadable',
+        reason: `The hardware policy store cannot be read safely: ${context.storeDetail || 'unreadable'}.`,
+        fix: 'On the host run ploinky limits clear --all to reset it, or restore a valid private store, then ploinky restart.',
+    };
+}
+
+// Decide hardware eligibility for one admitted descriptor. Returns
+// {applicable:false} outside the hardware boundary, otherwise
+// {applicable:true, state:'eligible'|'refused', refusalParts, inputFingerprint}.
+export function evaluateHardwareEligibility(descriptor, context, { helper = false, overrideProblem = null } = {}) {
+    const requested = Array.isArray(descriptor?.hardwareRequest) ? descriptor.hardwareRequest : [];
+    const runtimeKind = context.runtimeKind;
+    const conflicts = Array.isArray(descriptor?.hardwareDeclarationConflicts) ? descriptor.hardwareDeclarationConflicts : [];
+    // Internal helpers are never refused by hardware admission.
+    if (helper) return Object.freeze({ applicable: false });
+    // A conflicting declaration refuses the agent everywhere; otherwise a
+    // container outside a Box is outside the hardware boundary.
+    if (runtimeKind === 'container' && !context.insideBox && !conflicts.length) return Object.freeze({ applicable: false });
+    const hostNetwork = descriptor?.capabilities?.hostNetwork === true;
+    const nestedPodman = descriptor?.capabilities?.nestedPodman === true;
+    const declaredEnvelope = declaredCpusEnvelopeState(requested, context);
+    const inputFingerprint = hex64({
+        schema: 1,
+        agentId: String(descriptor?.agentId || ''),
+        profileName: String(descriptor?.profileName || ''),
+        runtimeKind,
+        requested,
+        hostNetwork,
+        nestedPodman,
+        overrideProblem,
+        ...(conflicts.length ? { declarationConflicts: conflicts } : {}),
+        // Only an agent that declares cpus carries its envelope decision.
+        ...(declaredEnvelope ? { declaredCpusEnvelope: declaredEnvelope } : {}),
+        context: {
+            insideBox: context.insideBox,
+            gate: context.gate,
+            prepared: context.prepared,
+            backendReady: context.backendReady,
+            controllers: context.controllers,
+            hostKind: context.hostKind,
+            unpreparedKind: context.unpreparedKind,
+            unpreparedDetail: context.unpreparedDetail,
+            runtimeObserved: context.runtimeObserved,
+            storeState: context.storeState,
+            ...(descriptor?.hardwareGpu ? { gpu: { deviceUuid: context.gpu?.deviceUuid, driverVersion: context.gpu?.driverVersion, wiringFingerprint: context.gpu?.wiringFingerprint, eligible: context.gpu?.eligible } } : {}),
+        },
+    });
+    let refusal = null;
+    if (conflicts.length) {
+        refusal = declarationConflictRefusal(conflicts);
+    } else if (runtimeKind !== 'container') {
+        if (hasHardwareRequest(requested)) refusal = liteSandboxRefusal(requested);
+    } else if (context.storeState === 'unreadable') {
+        // No non-helper agent can prove the absence of stored limits.
+        refusal = storeRefusal(context);
+    } else if (overrideProblem) {
+        // The stored entry itself cannot be enforced (outside the current
+        // envelope, or a GPU share this release cannot apply): refused with
+        // its own reason and fix, never ignored or clamped.
+        refusal = {
+            reasonCode: overrideProblem.reasonCode,
+            reason: overrideProblem.reason,
+            fix: overrideProblem.fix,
+            extraRequested: overrideProblem.requested || [],
+        };
+    } else if (hasHardwareRequest(requested)) {
+        if (context.gate !== 'on') {
+            refusal = {
+                reasonCode: 'gate_off',
+                reason: 'Hardware limits are off for this workspace.',
+                fix: 'On the host run PLOINKY_BOX_HARDWARE_LIMITS=on ploinky restart, or remove the declared limit.',
+            };
+        } else if (hostNetwork && nestedPodman) {
+            refusal = { ...HOST_NETWORK_NESTED_PODMAN_REFUSAL };
+        } else if (!context.prepared || !context.backendReady) {
+            refusal = unpreparedRefusal(context);
+        } else {
+            for (const entry of requested) {
+                const controller = CONTROLLER_BY_FIELD[entry.field];
+                if (controller && !context.controllers.includes(controller)) {
+                    refusal = controllerRefusal(controller, context);
+                    break;
+                }
+            }
+            if (!refusal) refusal = cpuAdmissionRefusal(requested, context);
+        }
+    }
+    let refusalParts = null;
+    if (refusal) {
+        // A refused stored entry replaces the declared value of the same field
+        // (the stored layer wins), so each field is listed once.
+        const { extraRequested = [], ...parts } = refusal;
+        const merged = [
+            ...requested.filter((entry) => !extraRequested.some((extra) => extra.field === entry.field)),
+            ...extraRequested,
+        ];
+        refusalParts = Object.freeze({ ...parts, requested: merged });
+    }
+    return Object.freeze({
+        applicable: true,
+        state: refusal ? 'refused' : 'eligible',
+        refusalParts,
+        inputFingerprint,
+    });
+}
+
+function orderedRequested(requested) {
+    return [...requested].sort((left, right) => HARDWARE_FIELDS.indexOf(left.field) - HARDWARE_FIELDS.indexOf(right.field));
+}
+
+// A requested value as an outcome carries it: unchanged within the outcome
+// bound, otherwise a UTF-8-safe prefix plus the digest of the whole value, so
+// an over-long declaration is still a typed refusal and stays identifiable.
+export function boundedRequestedValue(value) {
+    const text = String(value);
+    if (Buffer.byteLength(text) <= OUTCOME_BOUNDS.value) return text;
+    const suffix = `...sha256:${crypto.createHash('sha256').update(text).digest('hex').slice(0, 16)}`;
+    let prefix = '';
+    for (const character of text) {
+        if (Buffer.byteLength(prefix + character + suffix) > OUTCOME_BOUNDS.value) break;
+        prefix += character;
+    }
+    return `${prefix}${suffix}`;
+}
+
+// Build the validated direct-refusal outcome for an exact instance.
+export function buildDirectRefusal({ key, ref, alias = null, refusalParts, inputFingerprint }) {
+    return validateHardwareOutcome({
+        state: 'refused',
+        code: HARDWARE_UNENFORCEABLE,
+        reasonCode: refusalParts.reasonCode,
+        key,
+        ref,
+        alias: alias || null,
+        inputFingerprint,
+        reason: refusalParts.reason,
+        fix: refusalParts.fix,
+        requested: orderedRequested(refusalParts.requested || []).map((entry) => ({
+            field: entry.field, value: boundedRequestedValue(entry.value), source: entry.source,
+        })),
+        blockedBy: null,
+        rootCause: {
+            key,
+            ref,
+            field: orderedRequested(refusalParts.requested || [])[0]?.field || null,
+            reason: refusalParts.reason,
+            fix: refusalParts.fix,
+        },
+        causalPath: [key],
+        omittedPathCount: 0,
+        additionalCauseCount: 0,
+    });
+}
+
+/**
+ * Interactive create/reuse (plan §8.2): before either reusing or creating an
+ * interactive container, any requested or stored memory/cpus/pidsLimit is
+ * refused with the fix to use the managed lifecycle. Returns the validated
+ * refusal outcome or null.
+ */
+export function interactiveHardwareRefusal({ manifest, profileConfig = null, ref, key, alias = null, context = null }) {
+    const stored = context?.gate === 'on' && context.overrides instanceof Map ? context.overrides.get(ref) || null : null;
+    const declared = requestedHardwareLimits({
+        manifestPolicy: declaredLayerPolicy(manifest, 'manifest.hardwareLimits'),
+        profilePolicy: declaredLayerPolicy(profileConfig, 'profile.hardwareLimits'),
+    });
+    // Every stored field (a GPU share included) replaces its declared value.
+    const storedRequested = stored ? storedRequestedLimits(stored) : [];
+    const requested = [
+        ...declared.filter((entry) => !storedRequested.some((storedEntry) => storedEntry.field === entry.field)),
+        ...storedRequested,
+    ];
+    if (!requested.length) return null;
+    // A stored GPU share is refused with the same reason and fix as managed
+    // admission gives it; any other limit cannot be applied by this runtime.
+    const storedProblem = stored ? resolveStoredOverride(stored, context?.envelope, { ref }).problem : null;
+    const refusalParts = storedProblem?.reasonCode === 'gpu_sharing_unavailable'
+        ? { reasonCode: storedProblem.reasonCode, reason: storedProblem.reason, fix: storedProblem.fix, requested }
+        : {
+            reasonCode: 'interactive_runtime',
+            reason: `This runtime cannot apply ${orderedRequested(requested).map((entry) => entry.field).join(', ')}.`,
+            fix: 'Use the managed container lifecycle, or remove the limit. For host lite sandboxes, disable the lite sandbox before starting the container runtime.',
+            requested,
+        };
+    return buildDirectRefusal({
+        key,
+        ref,
+        alias,
+        refusalParts,
+        inputFingerprint: hex64({ schema: 1, interactive: true, ref, requested }),
+    });
+}

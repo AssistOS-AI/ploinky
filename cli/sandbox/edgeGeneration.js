@@ -5,6 +5,7 @@ import path from 'node:path';
 import { domainToASCII } from 'node:url';
 import { assertWorkspaceMutationLease } from '../utils/runtime/maintenanceLocks.js';
 import { assertNetworkLifecycleCapability } from './networkLifecycle.js';
+import { recordOwnedEdgeSelection } from './edgeSelectionMutations.mjs';
 
 import {
     AGENTS_FILE,
@@ -32,6 +33,14 @@ import {
     selectedMediaHostPort,
     selectedRouterHostPort,
 } from './routerPort.js';
+import { compileHardwareAvailability, validateAvailabilityProjection } from '../server/hardwareAvailability.mjs';
+import {
+    inspectHardwareAvailabilityStore,
+    installHardwareAvailabilityStore,
+    restoreHardwareAvailabilityWitness,
+    sweepHardwareAvailabilityTemps,
+} from './hardwareAvailabilityStore.mjs';
+import { resolveEffectiveHardwareAvailability } from '../server/hardwareAvailabilityResolver.mjs';
 
 export const EDGE_GENERATION_SCHEMA_VERSION = 1;
 export const EDGE_TOPOLOGY_CONTAINER_DIR = '/run/ploinky-edge-topology';
@@ -195,6 +204,9 @@ export function resolveEdgeGenerationPaths({ workspaceRoot } = {}) {
         activeSelectorFile: path.join(edgeDir, 'active.json'),
         applyLockFile: path.join(edgeDir, 'apply.lock'),
         preparationLeaseFile: path.join(edgeDir, 'preparation-lease.json'),
+        availabilityWitnessFile: path.join(edgeDir, 'hardware-availability.witness.json'),
+        availabilityStoreDir: path.join(edgeDir, 'hardware-availability'),
+        availabilityPolicyFile: path.join(edgeDir, 'hardware-availability', 'policy.json'),
         topologyDir,
         topologyGenerationsDir: path.join(topologyDir, 'generations'),
         topologyCurrentFile: path.join(topologyDir, 'current.json'),
@@ -255,9 +267,51 @@ function discardEmptyDestroyTombstone(paths, present) {
     return true;
 }
 
+const AVAILABILITY_OPERATOR_RESET = 'Operator reset: run `ploinky stop`, remove both '
+    + '.ploinky/data/edge-routing/hardware-availability.witness.json and '
+    + '.ploinky/data/edge-routing/hardware-availability/, then run `ploinky start` '
+    + '(all committed hardware denials are discarded); or restore both from a backup with a matching storeId.';
+
+// The hardware-availability store of one workspace, decided under the apply
+// lock by the witness and the store directory (D1.4). `complete` says the four
+// edge sources are all present (an upgrade), not absent (a fresh workspace).
+// A present witness or directory never gets replaced or emptied: any missing
+// or invalid member refuses with EDGE_GENERATION_SOURCE_UNAVAILABLE.
+function reconcileHardwareAvailabilityStore(paths, { complete, assertApplyLock, testHooks }) {
+    const store = { paths, assertApplyLock, fsApi: testHooks?.fsApi, faults: testHooks?.faults };
+    sweepHardwareAvailabilityTemps(store);
+    const { witness, directory } = inspectHardwareAvailabilityStore(store);
+    const refuse = (detail) => {
+        throw edgeError(
+            `hardware availability store is unavailable: ${detail}; ${AVAILABILITY_OPERATOR_RESET}`,
+            'EDGE_GENERATION_SOURCE_UNAVAILABLE',
+        );
+    };
+    if (witness.state === 'invalid') refuse(`witness '${paths.availabilityWitnessFile}' ${witness.problem}`);
+    if (directory.state === 'invalid') refuse(`store '${paths.availabilityStoreDir}' ${directory.problem}`);
+    if (directory.state === 'absent') {
+        if (witness.state === 'valid') {
+            refuse(`store '${paths.availabilityStoreDir}' is missing although witness '${paths.availabilityWitnessFile}' records its initialization`);
+        }
+        installHardwareAvailabilityStore({ ...store, initializedBy: complete ? 'upgrade' : 'fresh' });
+        return complete ? 'installed-upgrade' : 'installed-fresh';
+    }
+    if (witness.state === 'valid') {
+        if (witness.document.storeId !== directory.document.storeId) {
+            refuse(`store '${paths.availabilityStoreDir}' does not match witness '${paths.availabilityWitnessFile}'`);
+        }
+        return 'kept';
+    }
+    restoreHardwareAvailabilityWitness(store);
+    return 'witness-restored';
+}
+
 export function initializeFreshEdgeRoutingSources(options = {}) {
     const paths = resolveEdgeGenerationPaths(options);
     const release = acquireApplyLock(paths, options);
+    // Process-local proof that this init holds the apply lock, for the store.
+    const applyLockCapability = Object.freeze({});
+    APPLY_LOCK_CAPABILITIES.set(applyLockCapability, paths.applyLockFile);
     try {
         const sources = [
             ['routing.json', paths.routingFile, EMPTY_ROUTING_BYTES, 0o600],
@@ -273,8 +327,8 @@ export function initializeFreshEdgeRoutingSources(options = {}) {
         if (discardEmptyDestroyTombstone(paths, present)) {
             present = sources.map(([, file]) => fs.existsSync(file));
         }
-        if (present.every(Boolean)) return Object.freeze({ initialized: false, paths });
-        if (present.some(Boolean) || hasPersistedGenerationEvidence(paths)) {
+        const complete = present.every(Boolean);
+        if (!complete && (present.some(Boolean) || hasPersistedGenerationEvidence(paths))) {
             const missing = sources
                 .filter((_, index) => !present[index])
                 .map(([label]) => label)
@@ -285,14 +339,23 @@ export function initializeFreshEdgeRoutingSources(options = {}) {
                 'EDGE_GENERATION_SOURCE_UNAVAILABLE',
             );
         }
+        // Either all four sources or none (with no generation evidence): the
+        // availability store is installed, kept or restored before any source.
+        const hardwareAvailability = reconcileHardwareAvailabilityStore(paths, {
+            complete,
+            assertApplyLock: (storePaths) => assertStorePathsUnderApplyLock(paths, applyLockCapability, storePaths),
+            testHooks: options.testHooks?.hardwareAvailability,
+        });
+        if (complete) return Object.freeze({ initialized: false, paths, hardwareAvailability });
         for (const [label, file, bytes, mode] of sources) {
             installImmutableDurable(file, bytes, mode, {
                 conflictMessage: `${label} appeared during fresh edge initialization`,
                 conflictCode: 'EDGE_GENERATION_SOURCE_UNAVAILABLE',
             });
         }
-        return Object.freeze({ initialized: true, paths });
+        return Object.freeze({ initialized: true, paths, hardwareAvailability });
     } finally {
+        APPLY_LOCK_CAPABILITIES.delete(applyLockCapability);
         release();
     }
 }
@@ -770,6 +833,13 @@ function validateRoutingShape(routing, manifests) {
         if (!routeKey || RESERVED_OBJECT_KEYS.has(routeKey)) throw edgeError(`routing route key '${routeKey}' is invalid`);
         assertObject(route, `routing route '${routeKey}'`);
         if (route.hostPort !== undefined) normalizeServicePort(route.hostPort, `routing.routes.${routeKey}.hostPort`);
+        if (route.hardwareAvailability !== undefined) {
+            try {
+                validateAvailabilityProjection(route.hardwareAvailability);
+            } catch (error) {
+                throw edgeError(`routing.routes.${routeKey}.hardwareAvailability is invalid: ${error.message}`);
+            }
+        }
         if (route.draining !== undefined && typeof route.draining !== 'boolean') {
             throw edgeError(`routing.routes.${routeKey}.draining must be a boolean`);
         }
@@ -1106,6 +1176,15 @@ function compileGeneration({ routing, policy, desired, agents, manifests }) {
             ));
     }
 
+    // Refused/blocked instances keep their logical routes; the generation
+    // records their unavailable state so every transport denies them. The key
+    // is present only when an instance is unavailable.
+    let hardwareAvailability;
+    try {
+        hardwareAvailability = compileHardwareAvailability(routing);
+    } catch (error) {
+        throw edgeError(error.message);
+    }
     return {
         desired: normalizedDesired,
         compiled: {
@@ -1120,6 +1199,7 @@ function compileGeneration({ routing, policy, desired, agents, manifests }) {
                 turnCredentialConsumers,
             },
             publication: publicationDisposition(normalizedDesired),
+            ...(hardwareAvailability ? { hardwareAvailability } : {}),
         },
     };
 }
@@ -1498,6 +1578,19 @@ function loadGenerationById(paths, generationId) {
     });
 }
 
+/**
+ * Read-only: one generation of this workspace by id, selected or not. It exists
+ * for the hardware-availability evidence probe, which evaluates the resolver
+ * lock-free against the generation the selector names; only tests import it.
+ */
+export function loadEdgeRoutingGenerationForEvidence(generationId, options = {}) {
+    const id = String(generationId || '');
+    if (!/^sha256:[a-f0-9]{64}$/.test(id)) {
+        throw edgeError('edge routing generation evidence requires one exact generation id', 'EDGE_GENERATION_INVALID');
+    }
+    return loadGenerationById(resolveEdgeGenerationPaths(options), id);
+}
+
 function selectedPreviousGeneration(paths, selector) {
     const generationId = selector?.state === 'active'
         ? selector.generation
@@ -1592,7 +1685,7 @@ function selectInactiveCandidate(paths, expected, generationId, reason) {
         activationId: crypto.randomUUID(),
         changedAt: new Date().toISOString(),
     });
-    atomicWrite(paths.activeSelectorFile, Buffer.from(JSON.stringify(selector, null, 2)), { mode: 0o600 });
+    writeOwnedEdgeSelector(paths, selector);
     return deepFreeze(selector);
 }
 
@@ -1636,6 +1729,12 @@ export function prepareHostModeCapabilityForInactiveGeneration(owner, options = 
     return createPreparedHostModeCapability(paths, selector, generation, exact, preparationLease);
 }
 
+function writeOwnedEdgeSelector(paths, selector) {
+    const before = readSelector(paths);
+    atomicWrite(paths.activeSelectorFile, Buffer.from(JSON.stringify(selector, null, 2)), { mode: 0o600 });
+    recordOwnedEdgeSelection({ selectorFile: paths.activeSelectorFile, before, after: selector });
+}
+
 function sealSelector(selector) {
     return {
         ...selector,
@@ -1672,7 +1771,7 @@ export function inactivateEdgeRoutingGeneration(reason = 'candidate-change', opt
             activationId: crypto.randomUUID(),
             changedAt: new Date().toISOString(),
         });
-        atomicWrite(paths.activeSelectorFile, Buffer.from(JSON.stringify(selector, null, 2)), { mode: 0o600 });
+        writeOwnedEdgeSelector(paths, selector);
         return deepFreeze(selector);
     } finally {
         release();
@@ -1733,6 +1832,9 @@ function lifecycleRoutingProjection(routing) {
     for (const route of Object.values(projected?.routes || {})) {
         if (!isPlainObject(route)) continue;
         delete route.hostPort;
+        // Like a runtime target, availability is runtime state of a staged
+        // identity, not part of its lifecycle binding.
+        delete route.hardwareAvailability;
     }
     return projected;
 }
@@ -2644,7 +2746,7 @@ export function applyEdgeRoutingGeneration(options = {}) {
             throw edgeError('edge selector changed before authorization commit', 'EDGE_GENERATION_RACE');
         }
         if (preparationLease) removePreparationLease(paths, preparationLease);
-        atomicWrite(paths.activeSelectorFile, Buffer.from(JSON.stringify(selector, null, 2)), { mode: 0o600 });
+        writeOwnedEdgeSelector(paths, selector);
         return { selector: deepFreeze(selector), generation, topology, paths };
     } catch (error) {
         if (transactionStarted && applyLockHeld) {
@@ -2853,7 +2955,7 @@ export function commitAdditiveEdgeRoutingGeneration(preparationLease, options = 
             options.testHooks.afterBeforeSelectorCommit({ paths, generation, topology, selector });
         }
         assertPreparedSelectorStillSelected(paths, lease);
-        atomicWrite(paths.activeSelectorFile, Buffer.from(JSON.stringify(selector, null, 2)), { mode: 0o600 });
+        writeOwnedEdgeSelector(paths, selector);
         selectorCommitted = true;
         removePreparationLease(paths, lease);
         return { selector: deepFreeze(selector), generation, topology, paths };
@@ -3037,6 +3139,37 @@ export function captureEdgeRoutingCandidateGeneration(options = {}) {
     return collectCapturedSources(paths).generation;
 }
 
+// The store paths a mutation is about to write must be exactly those of the
+// workspace whose live apply lock the capability proves.
+const STORE_BINDING_KEYS = Object.freeze([
+    'root', 'edgeDir', 'applyLockFile', 'availabilityWitnessFile', 'availabilityStoreDir', 'availabilityPolicyFile',
+]);
+
+function assertStorePathsUnderApplyLock(lockPaths, capability, storePaths) {
+    if (!hasApplyLockCapability(lockPaths, capability)) {
+        throw edgeError(
+            'hardware availability mutation requires the exact live apply-lock capability',
+            'EDGE_GENERATION_CAPABILITY_REQUIRED',
+        );
+    }
+    if (!storePaths || typeof storePaths !== 'object' || !STORE_BINDING_KEYS.every((key) => storePaths[key] === lockPaths[key])) {
+        throw edgeError(
+            'hardware availability mutation targets a store outside the workspace that holds the apply lock',
+            'EDGE_GENERATION_CAPABILITY_REQUIRED',
+        );
+    }
+}
+
+/**
+ * Assert that the caller holds the exact live apply lock for this workspace
+ * and that `storePaths`, the resolved paths the store is about to write, are
+ * under that same workspace. The hardware-availability store's mutations are
+ * made only under it and call this as `assertApplyLock(paths)`.
+ */
+export function assertEdgeGenerationApplyLockCapability(options = {}) {
+    assertStorePathsUnderApplyLock(resolveEdgeGenerationPaths(options), options.applyLockCapability, options.storePaths);
+}
+
 /**
  * Return the validated selector even while authorization is inactive. This is
  * intentionally narrower than loading a generation: coordinators use it only
@@ -3062,6 +3195,18 @@ export function readEdgeRoutingPreparationOwner(options = {}) {
     return lease ? deepFreeze({ pid: lease.pid, reason: lease.reason, mode: lease.mode }) : null;
 }
 
+// The hardware-availability resolver's output for one captured generation
+// (M-NW-01 D2-S). Both lease families capture it and fence commit()/isCurrent()
+// on its revision; a store that cannot be read fails the capture and the fence.
+function resolveLeaseEffective(generation, options = {}) {
+    return resolveEffectiveHardwareAvailability({
+        generation,
+        paths: resolveEdgeGenerationPaths(options),
+        ...(options.runningDir ? { runningDir: options.runningDir } : {}),
+        ...(options.fsApi ? { fsApi: options.fsApi } : {}),
+    });
+}
+
 export function captureEdgeRoutingLease(options = {}) {
     const active = loadActiveEdgeRoutingGeneration(options);
     const generationId = active.selector.generation;
@@ -3072,27 +3217,25 @@ export function captureEdgeRoutingLease(options = {}) {
             mismatchMessage: 'active Router attestation owner does not match its immutable generation record',
         })
         : null;
+    const effective = resolveLeaseEffective(active.generation, options);
+    const isCurrent = () => {
+        try {
+            const current = loadActiveEdgeRoutingGeneration(options);
+            return current.selector.generation === generationId
+                && current.selector.activationId === activationId
+                && resolveLeaseEffective(active.generation, options).revision === effective.revision;
+        } catch (_) {
+            return false;
+        }
+    };
     return Object.freeze({
         id: generationId,
         activationId,
         snapshot: active.generation,
+        effective,
         ...(owner ? { owner } : {}),
-        commit() {
-            try {
-                const current = loadActiveEdgeRoutingGeneration(options);
-                return current.selector.generation === generationId && current.selector.activationId === activationId;
-            } catch (_) {
-                return false;
-            }
-        },
-        isCurrent() {
-            try {
-                const current = loadActiveEdgeRoutingGeneration(options);
-                return current.selector.generation === generationId && current.selector.activationId === activationId;
-            } catch (_) {
-                return false;
-            }
-        },
+        commit: isCurrent,
+        isCurrent,
     });
 }
 
@@ -3158,7 +3301,7 @@ export function captureEdgeRoutingObservationLease({ expectedGeneration, ...opti
                 'EDGE_GENERATION_RUNTIME_MISMATCH',
             );
         }
-        return { selector, generation, preparationTransactionId };
+        return { selector, generation, preparationTransactionId, effective: resolveLeaseEffective(generation, options) };
     };
     const initial = capture();
     const isCurrent = () => {
@@ -3169,7 +3312,8 @@ export function captureEdgeRoutingObservationLease({ expectedGeneration, ...opti
                 && current.selector.activationId === initial.selector.activationId
                 && current.selector.selectorDigest === initial.selector.selectorDigest
                 && current.generation.generation === initial.generation.generation
-                && current.preparationTransactionId === initial.preparationTransactionId;
+                && current.preparationTransactionId === initial.preparationTransactionId
+                && current.effective.revision === initial.effective.revision;
         } catch (_) {
             return false;
         }
@@ -3178,6 +3322,7 @@ export function captureEdgeRoutingObservationLease({ expectedGeneration, ...opti
         id: expected,
         activationId: initial.selector.activationId,
         snapshot: initial.generation,
+        effective: initial.effective,
         commit: isCurrent,
         isCurrent,
     });

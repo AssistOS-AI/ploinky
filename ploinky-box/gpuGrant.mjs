@@ -34,11 +34,18 @@ import {
 } from './constants.mjs';
 import { PloinkyBoxError } from './errors.mjs';
 import { assertRouterBindingStateConfined } from './routerBinding.mjs';
+import { discoverMpsTools, validateMpsTools, revalidateMpsTools, MPS_TOOL_PATHS } from './lib/mpsTools.mjs';
 import {
     GPU_GRANT_MARKER_KIND,
     GPU_GRANT_MARKER_VERSION,
     normalizeGpuAgentSelector,
 } from './lib/gpuGrantMarker.mjs';
+import {
+    assertPrivateDirectoryIfPresent as assertSharedPrivateDirectoryIfPresent,
+    ensurePrivateDirectory as ensureSharedPrivateDirectory,
+    readPrivateFile as readSharedPrivateFile,
+    writePrivateFileAtomically as writeSharedPrivateFileAtomically,
+} from './privateStateFiles.mjs';
 
 export { GPU_GRANT_STATE_DIRECTORY };
 export const GPU_GRANT_STATE_VERSION = 1;
@@ -456,6 +463,8 @@ export function buildGpuWiring({
     revoked = false,
     denied = [],
     workspaceDenied = false,
+    mps = null,
+    mpsFailure = null,
     homeDirectory = os.homedir(),
 }) {
     exactIdentity(identity);
@@ -484,7 +493,11 @@ export function buildGpuWiring({
         ...(workspaceDenied ? { workspaceDenied: true } : {}),
     };
     const state = revoked ? 'revoked' : discovery ? 'active' : 'stale';
+    if (mps) { validateMpsTools(mps); if (!discovery) throw grantError('MPS tools require active GPU wiring'); }
     const reason = discovery || revoked ? null : singleLine(failure?.message || failure);
+    // Why the host's MPS tools were not wired although the gate asked for them: kept in the marker (bounded, one
+    // line), so the Box's own status can say it instead of a generic refusal. Present only then.
+    const mpsProblem = discovery && !mps && mpsFailure ? singleLine(mpsFailure?.message || mpsFailure, 400) : null;
     // The fingerprint binds the exact workspace, the operator decision and the
     // discovered driver files, so it names one generation of one workspace.
     const fingerprint = sha256(canonicalJson({
@@ -501,6 +514,8 @@ export function buildGpuWiring({
         devices: discovery?.devices ?? [],
         libraries: discovery?.libraries ?? [],
         tools: discovery?.tools ?? [],
+        ...(mps ? { mps } : {}),
+        ...(mpsProblem ? { mpsProblem } : {}),
     }));
     const generation = gpuGenerationDirectory(identity, fingerprint, homeDirectory);
     const specText = discovery ? renderBoxCdiSpec(discovery) : null;
@@ -518,6 +533,8 @@ export function buildGpuWiring({
         cdiDevice: discovery ? BOX_GPU_CDI_DEVICE : null,
         specSha256: specText ? sha256(specText) : null,
         ...denials,
+        ...(mps ? { mps } : {}),
+        ...(mpsProblem ? { mpsProblem } : {}),
     }, null, 2)}\n`;
     const specPath = path.join(generation, 'box.json');
     const markerPath = path.join(generation, 'marker.json');
@@ -531,6 +548,7 @@ export function buildGpuWiring({
                 source: tool.source,
                 destination: path.posix.join(BOX_GPU_BIN_DIRECTORY, tool.name),
             })),
+            ...(mps ? Object.values(mps).map(({ source, destination }) => ({ source, destination })) : []),
             { source: specPath, destination: BOX_GPU_CDI_SPEC_PATH },
         ] : []),
         { source: markerPath, destination: BOX_GPU_MARKER_PATH },
@@ -544,6 +562,8 @@ export function buildGpuWiring({
         denied: deniedAgents,
         workspaceDenied: workspaceDenied === true,
         driverVersion: discovery?.driverVersion ?? null,
+        ...(mps ? { mps: Object.freeze(mps) } : {}),
+        ...(mpsProblem ? { mpsProblem } : {}),
         devices: Object.freeze((discovery?.devices ?? []).map((device) => device.path)),
         mounts: Object.freeze(mounts.map((mount) => Object.freeze(mount))),
         files: Object.freeze([
@@ -584,6 +604,8 @@ export function resolveDesiredGpuWiring(identity, decision, declared = [], {
     discover = discoverGpu,
     homeDirectory = os.homedir(),
     strict = false,
+    mpsEnabled = false,
+    discoverMps = discoverMpsTools,
 } = {}) {
     const access = effectiveGpuAccess(decision, declared);
     const denials = { denied: access.denied, workspaceDenied: access.workspaceDenied };
@@ -597,7 +619,13 @@ export function resolveDesiredGpuWiring(identity, decision, declared = [], {
             if (!access.operatorAgents.length) return null;
             return buildGpuWiring({ identity, grant, failure: error, ...denials, homeDirectory });
         }
-        return buildGpuWiring({ identity, grant, discovery, ...denials, homeDirectory });
+        let mps = null;
+        let mpsFailure = null;
+        if (mpsEnabled) {
+            try { mps = discoverMps(); validateMpsTools(mps); }
+            catch (error) { mps = null; mpsFailure = String(error?.message || error || 'MPS tool discovery failed'); }
+        }
+        return buildGpuWiring({ identity, grant, discovery, ...denials, mps, ...(mpsFailure ? { mpsFailure } : {}), homeDirectory });
     }
     if (access.denied.length || access.workspaceDenied) {
         return buildGpuWiring({ identity, grant: { vendor: access.vendor }, revoked: true, ...denials, homeDirectory });
@@ -733,6 +761,7 @@ export function enabledCdiRequestingAgents(workspaceRoot, {
 /** Container create arguments for a wiring: devices, read-only binds, label. */
 export function gpuWiringCreateArgs(wiring) {
     if (!wiring) return Object.freeze({ devices: [], volumes: [], labels: {} });
+    if (wiring.mps) revalidateMpsTools(wiring.mps);
     return Object.freeze({
         devices: wiring.devices.flatMap((device) => ['--device', device]),
         volumes: wiring.mounts.flatMap((mount) => ['--volume', `${mount.source}:${mount.destination}:ro`]),
@@ -804,7 +833,8 @@ export function observeContainerGpuWiring(containerHandle, { homeDirectory = os.
             throw wiringObservationError(`Owned Box GPU library mount ${destination} is invalid`);
         }
         if (destination.startsWith(`${BOX_GPU_BIN_DIRECTORY}/`)
-            && destination !== path.posix.join(BOX_GPU_BIN_DIRECTORY, 'nvidia-smi')) {
+            && destination !== path.posix.join(BOX_GPU_BIN_DIRECTORY, 'nvidia-smi')
+            && !Object.values(MPS_TOOL_PATHS).includes(destination)) {
             throw wiringObservationError(`Owned Box GPU tool mount ${destination} is invalid`);
         }
         if (generation && destination === BOX_GPU_MARKER_PATH && source !== path.join(generation, 'marker.json')) {
@@ -822,12 +852,23 @@ export function observeContainerGpuWiring(containerHandle, { homeDirectory = os.
     if (!active && (extraDevices.length || mounts.length !== 1)) {
         throw wiringObservationError('Owned Box stale GPU grant still has GPU devices or libraries');
     }
+    const mpsMounts = mounts.filter((mount) => Object.values(MPS_TOOL_PATHS).includes(mount.destination));
+    let mps = null;
+    if (mpsMounts.length) {
+        if (!generation || mpsMounts.length !== 2) throw wiringObservationError('Owned Box MPS wiring needs both tools and its generation marker');
+        try {
+            mps = JSON.parse(readPrivateFile(fs, path.join(generation, 'marker.json'), GPU_GRANT_STATE_MAX_BYTES, 'GPU wiring file').toString('utf8')).mps;
+            validateMpsTools(mps);
+            for (const value of Object.values(mps)) if (!mpsMounts.some((mount) => mount.source === value.source && mount.destination === value.destination)) throw new Error('MPS marker does not match both tool binds');
+        } catch (error) { throw wiringObservationError(`Owned Box MPS marker is invalid: ${error.message}`); }
+    }
     return Object.freeze({
         fingerprint,
         state: active ? 'active' : markerOnlyState(generation),
         instance,
         devices: Object.freeze(extraDevices),
         mounts: Object.freeze(mounts),
+        ...(mps ? { mps: Object.freeze(mps) } : {}),
     });
 }
 
@@ -855,105 +896,22 @@ function assertLock(identity, lock) {
     lock.assertHeld(identity.instance);
 }
 
+const GPU_STATE_FILES = Object.freeze({ subject: 'GPU grant state', stateError });
+
 function ensurePrivateDirectory(fsApi, target) {
-    try {
-        fsApi.mkdirSync(target, { mode: 0o700 });
-    } catch (error) {
-        if (error?.code !== 'EEXIST') throw stateError(`Unable to create GPU grant state directory: ${target}`, error);
-    }
-    const stat = fsApi.lstatSync(target);
-    if (stat.isSymbolicLink() || !stat.isDirectory()) {
-        throw stateError(`GPU grant state path is not a real directory: ${target}`);
-    }
-    const uid = currentUid();
-    if (uid !== null && stat.uid !== uid) {
-        throw stateError(`GPU grant state directory is not owned by the current user: ${target}`);
-    }
-    fsApi.chmodSync(target, 0o700);
+    return ensureSharedPrivateDirectory(fsApi, target, GPU_STATE_FILES);
 }
 
 function assertPrivateDirectoryIfPresent(fsApi, target) {
-    let stat;
-    try {
-        stat = fsApi.lstatSync(target);
-    } catch (error) {
-        if (error?.code === 'ENOENT') return false;
-        throw stateError(`Unable to inspect GPU grant state directory: ${target}`, error);
-    }
-    if (stat.isSymbolicLink() || !stat.isDirectory()) {
-        throw stateError(`GPU grant state path is not a real directory: ${target}`);
-    }
-    const uid = currentUid();
-    if (uid !== null && stat.uid !== uid) {
-        throw stateError(`GPU grant state directory is not owned by the current user: ${target}`);
-    }
-    if ((stat.mode & 0o022) !== 0) {
-        throw stateError(`GPU grant state directory must not be group- or world-writable: ${target}`);
-    }
-    return true;
+    return assertSharedPrivateDirectoryIfPresent(fsApi, target, GPU_STATE_FILES);
 }
 
 function readPrivateFile(fsApi, target, maxBytes, label) {
-    let descriptor;
-    try {
-        descriptor = fsApi.openSync(
-            target,
-            fsApi.constants.O_RDONLY | fsApi.constants.O_NOFOLLOW | fsApi.constants.O_NONBLOCK,
-        );
-    } catch (error) {
-        if (error?.code === 'ENOENT') return null;
-        throw stateError(`${label} must be a readable non-symlink file: ${target}`, error);
-    }
-    try {
-        const before = fsApi.fstatSync(descriptor);
-        if (!before.isFile() || before.nlink !== 1) {
-            throw stateError(`${label} must be one non-linked regular file: ${target}`);
-        }
-        const uid = currentUid();
-        if (uid !== null && before.uid !== uid) throw stateError(`${label} must be owned by the current user: ${target}`);
-        if ((before.mode & 0o077) !== 0) throw stateError(`${label} must be private to the current user (mode 0600): ${target}`);
-        if (before.size > maxBytes) throw stateError(`${label} exceeds ${maxBytes} bytes: ${target}`);
-        const bytes = fsApi.readFileSync(descriptor);
-        const after = fsApi.fstatSync(descriptor);
-        if (bytes.length !== before.size || after.size !== before.size
-            || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) {
-            throw stateError(`${label} changed while being read: ${target}`);
-        }
-        return bytes;
-    } finally {
-        fsApi.closeSync(descriptor);
-    }
+    return readSharedPrivateFile(fsApi, target, maxBytes, label, GPU_STATE_FILES);
 }
 
 function writePrivateFileAtomically(fsApi, directory, target, content, beforeRename) {
-    try {
-        const existing = fsApi.lstatSync(target);
-        if (!existing.isFile() || existing.isSymbolicLink()) {
-            throw stateError(`Refusing to replace a non-regular GPU grant state path: ${target}`);
-        }
-    } catch (error) {
-        if (error?.code !== 'ENOENT') throw error;
-    }
-    const temporary = path.join(directory, `.${path.basename(target)}.${crypto.randomUUID()}.tmp`);
-    let descriptor;
-    try {
-        descriptor = fsApi.openSync(
-            temporary,
-            fsApi.constants.O_WRONLY | fsApi.constants.O_CREAT | fsApi.constants.O_EXCL | fsApi.constants.O_NOFOLLOW,
-            0o600,
-        );
-        fsApi.writeFileSync(descriptor, content);
-        fsApi.fsyncSync(descriptor);
-        fsApi.closeSync(descriptor);
-        descriptor = undefined;
-        beforeRename();
-        fsApi.renameSync(temporary, target);
-    } finally {
-        if (descriptor !== undefined) fsApi.closeSync(descriptor);
-        try { fsApi.unlinkSync(temporary); } catch (error) {
-            if (error?.code !== 'ENOENT') throw error;
-        }
-    }
+    return writeSharedPrivateFileAtomically(fsApi, directory, target, content, beforeRename, GPU_STATE_FILES);
 }
 
 /**
@@ -1107,6 +1065,9 @@ export function createGpuGrantStore({
      * instead of removing the old Box and then failing to create the new one.
      */
     function assertKeptHostSources(wiring) {
+        if (wiring.mps) {
+            try { revalidateMpsTools(wiring.mps, { fsApi }); } catch (error) { throw stateError(`MPS tools changed: ${error.message}`); }
+        }
         const changed = (item, detail) => stateError(
             `GPU wiring ${wiring.fingerprint} binds ${item}, which ${detail}; the host driver changed. `
             + 'Run `ploinky restart` to rediscover the driver and regenerate the wiring.',
@@ -1145,6 +1106,7 @@ export function createGpuGrantStore({
         exactIdentity(identity);
         assertLock(identity, lock);
         assertConfined(identity);
+        if (wiring.mps) assertKeptHostSources(wiring);
         const generation = gpuGenerationDirectory(identity, wiring.fingerprint, homeDirectory);
         if (!Array.isArray(wiring.files)) {
             for (const mount of wiring.mounts) {

@@ -1,6 +1,7 @@
 import { parentPort, workerData } from 'node:worker_threads';
 
 import { enableAgent } from '../utils/agents.js';
+import { findHardwareOutcome } from '../sandbox/hardwareLimits/errors.mjs';
 import { withHeldOrAcquiredWorkspaceMutationLease } from '../utils/runtime/maintenanceLocks.js';
 
 function boundedString(value, fallback = '') {
@@ -8,17 +9,21 @@ function boundedString(value, fallback = '') {
     return (text || fallback).slice(0, 512);
 }
 
-function serializeError(error, depth = 0) {
+export function serializeError(error, depth = 0) {
     const serialized = {
         message: boundedString(error?.message, 'Marketplace agent activation failed.'),
     };
     if (typeof error?.code === 'string' && error.code) serialized.code = error.code;
     if (Number.isInteger(error?.status)) serialized.status = error.status;
+    // The typed hardware outcome travels as validated bounded fields, never
+    // as text to be parsed back (plan §9.2).
+    const hardwareOutcome = depth === 0 ? findHardwareOutcome(error) : null;
+    if (hardwareOutcome) serialized.hardwareOutcome = hardwareOutcome;
     if (depth < 4 && error?.cause) serialized.cause = serializeError(error.cause, depth + 1);
     return serialized;
 }
 
-try {
+if (parentPort) try {
     const agentRef = boundedString(workerData?.agentRef);
     const mode = boundedString(workerData?.mode);
     const repoName = agentRef.split('/')[0] || '';

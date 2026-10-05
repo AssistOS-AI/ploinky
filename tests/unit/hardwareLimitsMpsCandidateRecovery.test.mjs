@@ -1,0 +1,491 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+import { writeAppliedObservation, readAppliedObservation } from '../../cli/sandbox/hardwareLimits/runtimeState.mjs';
+import { randomUUID } from 'node:crypto';
+import { Worker } from 'node:worker_threads';
+import { coordinateMpsLifecycle, trackMpsRuntimePending, acknowledgeMpsRuntimeReady, releaseMpsRuntimeOwner } from '../../cli/sandbox/hardwareLimits/mpsLifecycle.mjs';
+import { mpsOwnerState, mpsLaunchOwner, releaseMpsLaunchOwner, settleCreatedMpsCandidate } from '../../cli/sandbox/hardwareLimits/mpsInventory.mjs';
+import { prepareMpsGraph } from '../../cli/sandbox/hardwareLimits/mpsGraph.mjs';
+import { MpsError } from '../../cli/sandbox/hardwareLimits/mpsEligibility.mjs';
+import { resolveMpsServerDefault } from '../../cli/sandbox/hardwareLimits/mpsTransition.mjs';
+
+// Fix round 3, M1: a created share-client candidate whose readiness failed,
+// or whose process died before readiness, is settled through its own exact
+// tuple and immutable ID. The real coordinator, readiness tracking, runtime
+// state and graph preparation run here; only the engine and daemon are fakes,
+// and every cohort drain still passes the coordinator's registry check.
+const uuid = 'GPU-12345678-1234-1234-1234-123456789012';
+const share = (sm) => ({ smPercent: sm, vramPercent: sm, vramMiB: 1024 * sm / 25, memoryMiB: 1024 * sm / 25, memoryBytes: 1024 * sm / 25 * 1048576, deviceUuid: uuid, driverVersion: '595.91.07', wiringFingerprint: 'f'.repeat(64) });
+// The daemon default is the product's own: the largest share rounded up to a whole GiB, with the share it came from.
+const serverDefault = (sm) => resolveMpsServerDefault([{ share: share(sm) }]);
+const oldId = 'a'.repeat(64), newId = 'c'.repeat(64), cpuId = 'd'.repeat(64);
+
+function world(t, { policy = 50, journal = null } = {}) {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-candidate-')));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const applied = path.join(root, 'applied');
+    const X = { type: 'agent', repoName: 'repo', agentName: 'x', alias: '', instanceId: 'ix', enableGeneration: 'gx', containerId: oldId };
+    const CPU = { type: 'agent', repoName: 'repo', agentName: 'cpu', instanceId: 'ic', enableGeneration: 'gc', containerId: cpuId };
+    writeAppliedObservation({ key: 'x_key', containerId: oldId, instanceId: 'ix', enableGeneration: 'gx', limitsHash: 'e'.repeat(64), gpuShare: share(25), mpsGeneration: 'd0:c0' }, { root: applied });
+    let state = journal || { schema: 1, status: 'ready', daemon: { pid: 9, startTime: '1' }, daemonGeneration: 'd0', configurationGeneration: 'c0',
+        pipeDirectory: `/run/ploinky/mps/pipe-${'1'.repeat(32)}`, logDirectory: `/run/ploinky/mps/log-${'1'.repeat(32)}`, serverDefault: serverDefault(25), oldClients: [], pendingClients: [] };
+    let alive = true; let generation = 0;
+    const events = [];
+    const live = new Set([oldId, cpuId]);
+    const store = { read: () => structuredClone(state), write: (value) => { state = structuredClone(value); } };
+    const backend = {
+        observe: () => ({ state: alive ? 'owned' : 'gone', daemon: state.daemon }), verify: (value) => alive && Boolean(value?.daemon),
+        stop: () => { events.push('quit'); alive = false; }, cleanup: () => events.push('cleanup'),
+        start: (defaults, { onState }) => {
+            generation += 1; events.push('start');
+            const next = { ...state, daemon: { pid: 10 + generation, startTime: String(generation + 1) }, daemonGeneration: `d${generation}`, configurationGeneration: `c${generation}`, serverDefault: defaults,
+                pipeDirectory: `/run/ploinky/mps/pipe-${String(generation + 1).repeat(32)}`, logDirectory: `/run/ploinky/mps/log-${String(generation + 1).repeat(32)}` };
+            onState(next); alive = true; return { ...next, status: 'ready' };
+        },
+    };
+    const registry = { x_key: X, cpu_key: CPU };
+    // Engine fakes: an exact runtime is one that is live under its own ID.
+    const removed = [];
+    const exactById = (candidate) => (live.has(candidate.containerId) ? { state: 'exact', id: candidate.containerId, running: true } : { state: 'absent', id: null });
+    const deps = {
+        readContext: () => ({ gate: 'on', storeToken: null, overrides: new Map([['repo/x', { gpu: { smPercent: policy, vramPercent: policy } }]]), gpu: { grant: { mps: {} } } }),
+        loadRegistry: () => structuredClone(registry), readApplied: (key, containerId) => readAppliedObservation(key, containerId, { root: applied }),
+        loadPlan: () => ({ runtime: 'podman', image: 'img', profile: { network: { mode: 'default' } } }), prepareImage: () => {},
+        inspectImage: () => ({ Id: `sha256:${'e'.repeat(64)}`, Config: { User: '1000:1000' } }),
+        store, backend, network: async (callback) => callback({}), assertCapability: () => {}, observeClients: () => [], policyCheck: () => {},
+        resolveShare: (value) => share(value.smPercent),
+        // Called by the coordinator only after its registry identity check.
+        drainClient: async (client) => { events.push(`drain:${client.containerId.slice(0, 4)}`); live.delete(client.containerId); },
+        inspectCandidate: (candidate) => exactById(candidate),
+        removeCandidate: (candidate) => { removed.push(candidate.containerId); live.delete(candidate.containerId); return { removed: true, state: 'removed' }; },
+    };
+    const graphDeps = {
+        readContext: () => ({ gate: 'on', overrides: new Map([['repo/x', { gpu: { smPercent: policy, vramPercent: policy } }]]), storeToken: { epoch: '0'.repeat(32), revision: 1 }, gpu: {} }),
+        loadRegistry: () => structuredClone(registry), readApplied: deps.readApplied, store,
+        backend: { observe: () => ({ state: alive ? 'owned' : 'gone' }), verify: () => alive }, assertCapability: () => {}, observeClients: () => [],
+        readSelection: () => ({ selector: { state: 'inactive' } }), resolveShare: (value) => share(value.smPercent), runtime: () => 'podman',
+        inspect: (client) => exactById(client), inspectPresence: (client) => (live.has(client.containerId) ? { state: 'present', id: client.containerId } : { state: 'absent', id: null }),
+        removeCandidate: (candidate) => { removed.push(candidate.containerId); live.delete(candidate.containerId); return { removed: true, state: 'removed' }; },
+        drain: (key) => events.push(`graph-drain:${key}`),
+    };
+    const nodes = [{ key: 'x_key', node: { agentRef: 'repo/x', manifest: {} } }, { key: 'cpu_key', node: { agentRef: 'repo/cpu', manifest: {} } }];
+    const target = { key: 'x_key', record: X };
+    // The targeted reconcile: create (afterLaunch writes the per-key applied
+    // observation), journal readiness, wait; a failed readiness removes the
+    // candidate as cleanupFailedTargetedAgentRestart does.
+    const failingLaunch = ({ cleanup = true } = {}) => async (next) => {
+        live.add(newId);
+        const launch = next.mpsLaunch;
+        writeAppliedObservation({ key: 'x_key', containerId: newId, instanceId: 'ix', enableGeneration: 'gx', limitsHash: 'e'.repeat(64), gpuShare: share(policy), mpsGeneration: `d${generation}:c${generation}` }, { root: applied });
+        trackMpsRuntimePending({ containerName: 'x_key', containerId: newId, registryRecord: { ...X } }, { mpsLaunch: launch, key: 'x_key' }, { store });
+        if (cleanup) live.delete(newId);
+        throw new Error('Readiness deadline expired.');
+    };
+    const succeedingLaunch = async () => { events.push('launch'); return { state: 'applied', key: 'x_key' }; };
+    return { deps, graphDeps, nodes, target, events, removed, live, failingLaunch, succeedingLaunch, get state() { return state; }, registry, applied };
+}
+const run = (w, launchTarget) => coordinateMpsLifecycle({ target: w.target, options: { networkLifecycleCapability: {} }, launchTarget }, w.deps);
+const candidates = (state) => (state.pendingClients || []).filter((entry) => entry.containerId === newId);
+
+test('MC.readiness-failure-then-retry-succeeds', async (t) => {
+    const w = world(t);
+    await assert.rejects(run(w, w.failingLaunch()), /Readiness deadline expired/);
+    assert.equal(candidates(w.state).length, 1, 'the created candidate is journaled with its exact identity');
+    assert.equal(candidates(w.state)[0].phase, 'readiness');
+    await run(w, w.succeedingLaunch);
+    assert.equal(candidates(w.state).length, 0, 'the settled candidate leaves the journal');
+    assert.deepEqual(w.removed, [], 'an absent candidate needs no removal');
+    assert.equal(w.state.status, 'ready');
+    assert.equal(w.state.oldClients.length, 0);
+    // A further coordination is not wedged either.
+    await run(w, w.succeedingLaunch);
+    assert.equal(w.events.filter((value) => value === 'launch').length, 2);
+});
+
+test('MC.readiness-failure-leaving-the-candidate-removes-it-by-id', async (t) => {
+    const w = world(t);
+    await assert.rejects(run(w, w.failingLaunch({ cleanup: false })), /Readiness deadline expired/);
+    assert.ok(w.live.has(newId));
+    await run(w, w.succeedingLaunch);
+    assert.deepEqual(w.removed, [newId]);
+    assert.equal(w.live.has(newId), false);
+    assert.equal(candidates(w.state).length, 0);
+});
+
+test('MC.non-exact-candidate-is-refused-without-daemon-change', async (t) => {
+    const w = world(t);
+    await assert.rejects(run(w, w.failingLaunch({ cleanup: false })), /Readiness deadline expired/);
+    w.deps.inspectCandidate = (candidate) => ({ state: 'owned-drift', id: candidate.containerId, reason: 'runtime-identity' });
+    const before = w.events.length;
+    await assert.rejects(run(w, w.succeedingLaunch), { code: 'identity_changed' });
+    assert.equal(candidates(w.state).length, 1, 'the journal keeps the unsettled candidate');
+    assert.deepEqual(w.removed, []);
+    assert.equal(w.events.slice(before).some((value) => ['quit', 'start', 'cleanup', 'launch'].includes(value)), false);
+});
+
+test('MC.crash-during-readiness-then-recovery', async (t) => {
+    // The process died while the targeted candidate awaited readiness: the
+    // journal is mid-transition, the candidate is still running and the
+    // registry still names the predecessor.
+    const journal = { schema: 1, status: 'transitioning', transitionId: 't', daemon: { pid: 9, startTime: '1' }, daemonGeneration: 'd0', configurationGeneration: 'c0',
+        pipeDirectory: `/run/ploinky/mps/pipe-${'1'.repeat(32)}`, logDirectory: `/run/ploinky/mps/log-${'1'.repeat(32)}`, serverDefault: serverDefault(25),
+        oldClients: [], desiredClients: [], drainedClients: [], lastProblem: null,
+        pendingClients: [{ key: 'x_key', ref: 'repo/x', alias: '', instanceId: 'ix', enableGeneration: 'gx', containerId: newId, share: share(25), mpsGeneration: 'd0:c0', phase: 'readiness' }] };
+    for (const path of ['coordinator', 'graph']) {
+        const w = world(t, { policy: 25, journal: structuredClone(journal) });
+        w.live.add(newId);
+        writeAppliedObservation({ key: 'x_key', containerId: newId, instanceId: 'ix', enableGeneration: 'gx', limitsHash: 'e'.repeat(64), gpuShare: share(25), mpsGeneration: 'd0:c0' }, { root: w.applied });
+        if (path === 'coordinator') {
+            await run(w, w.succeedingLaunch);
+            assert.equal(w.state.status, 'ready');
+        } else {
+            const result = await prepareMpsGraph({ nodes: w.nodes, networkLifecycleCapability: {} }, w.graphDeps);
+            assert.equal(result.refusals, undefined, 'graph start is not refused');
+        }
+        assert.deepEqual(w.removed, [newId], `${path}: the exact candidate is removed by its ID`);
+        assert.equal(candidates(w.state).length, 0, `${path}: its journal entry is dropped`);
+    }
+});
+
+test('MC.graph-start-after-failed-apply-starts-cpu-agents', async (t) => {
+    const w = world(t);
+    await assert.rejects(run(w, w.failingLaunch()), /Readiness deadline expired/);
+    const result = await prepareMpsGraph({ nodes: w.nodes, networkLifecycleCapability: {} }, w.graphDeps);
+    assert.equal(result.refusals, undefined, JSON.stringify(result.refusals));
+    assert.ok(result.graphPreparationId, 'the graph prepared normally');
+    assert.equal(candidates(w.state).length, 0);
+    assert.equal(w.events.includes('graph-drain:cpu_key'), false, 'the CPU-only agent is untouched');
+});
+
+// Fix round 3, M2: every pre-mutation MPS graph failure is a typed refusal of
+// the graph's GPU-share agents only; CPU-only agents start, no daemon change.
+function graphWorld(t, mutate, { policy = 25 } = {}) {
+    const w = world(t, { policy });
+    let writes = 0;
+    const store = w.graphDeps.store;
+    w.graphDeps.store = { read: () => store.read(), write: (value) => { writes += 1; store.write(value); } };
+    w.graphDeps.backend = { observe: () => ({ state: 'owned' }), verify: () => true, stop: () => assert.fail('no daemon change'), start: () => assert.fail('no daemon change') };
+    mutate(w);
+    return { w, writes: () => writes };
+}
+const refusedOnlyGpu = async (label, g) => {
+    const result = await prepareMpsGraph({ nodes: g.w.nodes, networkLifecycleCapability: {} }, g.w.graphDeps);
+    assert.deepEqual(result.refusals.map((value) => value.key), ['x_key'], label);
+    const refusal = result.refusals[0];
+    assert.equal(refusal.code, 'PLOINKY_HARDWARE_LIMITS_UNENFORCEABLE', label);
+    assert.ok(refusal.reason && refusal.fix, `${label}: reason and fix`);
+    assert.equal(g.writes(), 0, `${label}: no journal or daemon change`);
+    return result;
+};
+test('MG2.inventory-query-failure', async (t) => {
+    await refusedOnlyGpu('inventory', graphWorld(t, (w) => { w.graphDeps.observeClients = () => { throw new MpsError('The complete MPS client inventory is unavailable'); }; }));
+});
+test('MG2.unknown-labelled-container', async (t) => {
+    await refusedOnlyGpu('unknown label', graphWorld(t, (w) => { w.graphDeps.observeClients = () => { throw new MpsError('An MPS client is outside the exact registry and transition journal. Recover this Box on the host before changing its daemon.'); }; }));
+});
+test('MG2.journaled-non-member', async (t) => {
+    const outsider = { key: 'gone_key', ref: 'repo/gone', alias: '', instanceId: 'ig', enableGeneration: 'gg', containerId: 'b'.repeat(64), share: share(25), mpsGeneration: 'd0:c0' };
+    // Still running outside the graph: refused, never drained.
+    const running = graphWorld(t, (w) => { w.live.add(outsider.containerId); const state = w.graphDeps.store.read(); w.graphDeps.store.write({ ...state, oldClients: [outsider] }); });
+    await refusedOnlyGpu('non-member running', { w: running.w, writes: () => running.writes() - 1 });
+    // Proven absent: drained, and the graph prepares normally.
+    const absent = graphWorld(t, (w) => { const state = w.graphDeps.store.read(); w.graphDeps.store.write({ ...state, oldClients: [outsider] }); });
+    const result = await prepareMpsGraph({ nodes: absent.w.nodes, networkLifecycleCapability: {} }, absent.w.graphDeps);
+    assert.equal(result.refusals, undefined); assert.ok(result.graphPreparationId);
+    // Already drained by an exact receipt: no inspection at all.
+    const drained = graphWorld(t, (w) => { w.graphDeps.inspectPresence = () => assert.fail('a drained receipt needs no inspection'); const state = w.graphDeps.store.read(); w.graphDeps.store.write({ ...state, oldClients: [outsider], drainedClients: [[outsider.key, outsider.instanceId, outsider.enableGeneration, outsider.containerId].join('\0')] }); });
+    assert.equal((await prepareMpsGraph({ nodes: drained.w.nodes, networkLifecycleCapability: {} }, drained.w.graphDeps)).refusals, undefined);
+});
+test('MG2.registry-drift', async (t) => {
+    // The journal names x_key with an identity the registry no longer has,
+    // and a changed default needs that predecessor drained.
+    const g = graphWorld(t, (w) => { const state = w.graphDeps.store.read(); w.graphDeps.store.write({ ...state, oldClients: [{ key: 'x_key', ref: 'repo/x', alias: '', instanceId: 'stale', enableGeneration: 'stale', containerId: 'b'.repeat(64), share: share(25), mpsGeneration: 'd0:c0' }] }); }, { policy: 50 });
+    const result = await refusedOnlyGpu('registry drift', { w: g.w, writes: () => g.writes() - 1 });
+    assert.match(result.refusals[0].reason, /registry changed/);
+});
+test('MG2.alias-mismatch', async (t) => {
+    const g = graphWorld(t, (w) => { const state = w.graphDeps.store.read(); w.graphDeps.store.write({ ...state, oldClients: [{ key: 'x_key', ref: 'repo/x', alias: 'other', instanceId: 'ix', enableGeneration: 'gx', containerId: oldId, share: share(25), mpsGeneration: 'd0:c0' }] }); });
+    const result = await refusedOnlyGpu('alias mismatch', { w: g.w, writes: () => g.writes() - 1 });
+    assert.equal(result.diagnostic.code, 'identity_changed');
+});
+test('MG2.transaction-checks-still-fail-the-start', async (t) => {
+    const g = graphWorld(t, (w) => { w.graphDeps.readSelection = () => ({ selector: { state: 'active' } }); });
+    await assert.rejects(prepareMpsGraph({ nodes: g.w.nodes, networkLifecycleCapability: {} }, g.w.graphDeps), /inactive selector/);
+});
+
+// A no-wait GPU child launched through the coordinator waits for readiness
+// after releasing the lifecycle locks; its readiness entry names its launching
+// operation. Other coordinations and graph preparation never remove it while
+// that operation is live; a crashed launcher's leftover is still settled.
+const lId = 'e'.repeat(64), zId = '1'.repeat(64), lOldId = '9'.repeat(64);
+function inflightWorld(t, { owner = undefined, zPolicy = 25, lShareCleared = false } = {}) {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-inflight-')));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const applied = path.join(root, 'applied');
+    const Z = { type: 'agent', repoName: 'repo', agentName: 'z', alias: '', instanceId: 'iz', enableGeneration: 'gz', containerId: zId };
+    // lShareCleared: L was a GPU share client and its share was cleared, so it
+    // is recreated WITHOUT a share (plan 11.3, host/API clear then start).
+    const L = { type: 'agent', repoName: 'repo', agentName: 'l', alias: '', instanceId: 'il', enableGeneration: 'gl', ...(lShareCleared ? { containerId: lOldId } : {}) };
+    const CPU = { type: 'agent', repoName: 'repo', agentName: 'cpu', instanceId: 'ic', enableGeneration: 'gc', containerId: cpuId };
+    writeAppliedObservation({ key: 'z_key', containerId: zId, instanceId: 'iz', enableGeneration: 'gz', limitsHash: 'e'.repeat(64), gpuShare: share(25), mpsGeneration: 'd0:c0' }, { root: applied });
+    if (lShareCleared) writeAppliedObservation({ key: 'l_key', containerId: lOldId, instanceId: 'il', enableGeneration: 'gl', limitsHash: 'e'.repeat(64), gpuShare: share(25), mpsGeneration: 'd0:c0' }, { root: applied });
+    const registry = { z_key: Z, l_key: L, cpu_key: CPU };
+    let state = { schema: 1, status: 'ready', daemon: { pid: 9, startTime: '1' }, daemonGeneration: 'd0', configurationGeneration: 'c0',
+        pipeDirectory: `/run/ploinky/mps/pipe-${'1'.repeat(32)}`, logDirectory: `/run/ploinky/mps/log-${'1'.repeat(32)}`, serverDefault: serverDefault(25), oldClients: [], pendingClients: [], drainedClients: [] };
+    if (owner !== undefined) state.pendingClients = [{ key: 'l_key', ref: 'repo/l', alias: '', instanceId: 'il', enableGeneration: 'gl', containerId: lId, share: share(25), mpsGeneration: 'd0:c0', phase: 'readiness', ...(owner ? { owner } : {}) }];
+    const live = new Set([zId, cpuId, ...(owner !== undefined ? [lId] : []), ...(lShareCleared ? [lOldId] : [])]);
+    const events = []; const removed = [];
+    const policies = () => new Map([['repo/z', { gpu: { smPercent: w.zPolicy, vramPercent: w.zPolicy } }], ...(lShareCleared ? [] : [['repo/l', { gpu: { smPercent: 25, vramPercent: 25 } }]])]);
+    const exactById = (candidate) => (live.has(candidate.containerId) ? { state: 'exact', id: candidate.containerId, running: true } : { state: 'absent', id: null });
+    const store = { read: () => structuredClone(state), write: (value) => { state = structuredClone(value); events.push(`journal:${value.status}`); } };
+    const remove = (candidate) => { removed.push(candidate.containerId); live.delete(candidate.containerId); return { state: 'removed' }; };
+    const w = { zPolicy, registry, live, events, removed, store, get state() { return state; } };
+    w.deps = {
+        readContext: () => ({ gate: 'on', storeToken: null, overrides: policies(), gpu: { grant: { mps: {} } } }),
+        loadRegistry: () => structuredClone(registry), readApplied: (key, containerId) => readAppliedObservation(key, containerId, { root: applied }),
+        loadPlan: () => ({ runtime: 'podman', image: 'img', profile: { network: { mode: 'default' } } }), prepareImage: () => {},
+        inspectImage: () => ({ Id: `sha256:${'e'.repeat(64)}`, Config: { User: '1000:1000' } }), store,
+        backend: { observe: () => ({ state: 'owned', daemon: state.daemon }), verify: (value) => Boolean(value?.daemon), stop: () => events.push('quit'), cleanup: () => events.push('cleanup'),
+            start: () => { events.push('start'); throw new Error('no daemon restart expected'); } },
+        network: async (callback) => callback({}), assertCapability: () => {}, observeClients: () => [], policyCheck: () => {},
+        resolveShare: (value) => ({ ...share(25), smPercent: value.smPercent, vramPercent: value.smPercent }),
+        drainClient: async (client) => { events.push(`drain:${client.key}`); live.delete(client.containerId); },
+        reconcile: async (captured) => { events.push(`recreate:${captured.key}`); return { key: captured.key, state: 'applied' }; },
+        inspectCandidate: (candidate) => exactById(candidate), removeCandidate: remove, markUnavailable: async () => {},
+    };
+    w.graphDeps = {
+        readContext: () => ({ gate: 'on', overrides: policies(), storeToken: { epoch: '0'.repeat(32), revision: 1 }, gpu: {} }),
+        loadRegistry: () => structuredClone(registry), readApplied: w.deps.readApplied, store,
+        backend: { observe: () => ({ state: 'owned' }), verify: () => true }, assertCapability: () => {}, observeClients: () => [],
+        readSelection: () => ({ selector: { state: 'inactive' } }), resolveShare: (value) => ({ ...share(25), smPercent: value.smPercent, vramPercent: value.smPercent }), runtime: () => 'podman',
+        inspect: (client) => exactById(client), inspectPresence: (client) => (live.has(client.containerId) ? { state: 'present', id: client.containerId } : { state: 'absent', id: null }),
+        removeCandidate: remove, drain: (key) => events.push(`graph-drain:${key}`),
+    };
+    w.nodes = ['z', 'l', 'cpu'].map((name) => ({ key: `${name}_key`, node: { agentRef: `repo/${name}`, manifest: {} } }));
+    w.coordinate = (key, launchTarget = async () => { events.push(`launch:${key}`); return { state: 'applied', key }; }) => coordinateMpsLifecycle({ target: { key, record: structuredClone(registry[key]) }, options: { networkLifecycleCapability: {} }, launchTarget }, w.deps);
+    w.launchNoWaitChild = () => coordinateMpsLifecycle({ target: { key: 'l_key', record: structuredClone(L) }, options: { preservePreparedRegistryRecord: true, networkLifecycleCapability: {} },
+        launchTarget: async () => { live.add(lId); return { containerName: 'l_key', containerId: lId, registryRecord: { ...L, containerId: lId } }; } }, w.deps);
+    return w;
+}
+const lEntries = (state) => (state.pendingClients || []).filter((entry) => entry.containerId === lId && entry.phase === 'readiness');
+
+test('MC.inflight-nowait-child-survives-apply-watchdog-and-graph', async (t) => {
+    const w = inflightWorld(t);
+    const started = await w.launchNoWaitChild();
+    assert.ok(started.mpsReadiness, 'the child waits for readiness after the coordination returned');
+    assert.equal(lEntries(w.state).length, 1);
+    assert.equal(mpsOwnerState(lEntries(w.state)[0].owner), 'live');
+    // Apply of another GPU agent: an own-share change recreates that agent only.
+    w.zPolicy = 20;
+    await w.coordinate('z_key');
+    assert.ok(w.events.includes('drain:z_key'));
+    // Watchdog restart of that agent (not running), unchanged share.
+    await w.coordinate('z_key');
+    // A cohort restart (default change) would drain the starting child: refused before any drain.
+    w.zPolicy = 50;
+    const before = w.events.length;
+    await assert.rejects(w.coordinate('z_key'), { code: 'hardware_limits_transition' });
+    assert.deepEqual(w.events.slice(before), [], 'no journal write, drain or daemon change');
+    // Graph preparation refuses only the GPU agents and leaves the child alone.
+    const graph = await prepareMpsGraph({ nodes: w.nodes, networkLifecycleCapability: {} }, w.graphDeps);
+    assert.deepEqual(graph.refusals.map((value) => value.key).sort(), ['l_key', 'z_key']);
+    assert.ok(graph.refusals.every((value) => value.reason && value.fix));
+    assert.match(graph.diagnostic.message, /still starting/);
+    assert.deepEqual(w.removed, [], 'the starting child is never removed');
+    assert.ok(w.live.has(lId));
+    assert.equal(lEntries(w.state).length, 1, 'its readiness entry stays journaled');
+    assert.equal(w.events.includes('quit') || w.events.includes('start'), false);
+    // The child becomes ready and is acknowledged: its operation is released.
+    w.registry.l_key = { ...w.registry.l_key, containerId: lId };
+    await acknowledgeMpsRuntimeReady(started, { store: w.store, backend: { verify: () => true }, loadRegistry: () => structuredClone(w.registry) });
+    assert.equal(lEntries(w.state).length, 0);
+    assert.equal(mpsOwnerState(started.mpsReadiness.client.owner), 'gone');
+});
+
+// O5 (§11.3 host/API clear, then start/restart): a no-wait launch recreated
+// WITHOUT a share is journaled as a starting entry; it names its owner like a
+// share client, so no concurrent coordination removes it while it is starting.
+test('MC.shareless-nowait-target-survives-a-concurrent-apply-watchdog-and-graph', async (t) => {
+    const w = inflightWorld(t, { lShareCleared: true });
+    const started = await w.launchNoWaitChild();
+    assert.ok(w.events.includes('drain:l_key'), 'the old share client was drained');
+    assert.equal(started.mpsReadiness?.shareless, true, 'the caller waits for readiness after the coordination returned');
+    assert.equal(lEntries(w.state).length, 1);
+    const [entry] = lEntries(w.state);
+    assert.equal(entry.share ?? null, null, 'the entry is share-less');
+    assert.equal(mpsOwnerState(entry.owner), 'live', 'its launching operation owns it');
+    // Apply of another GPU agent (its share unchanged: the daemon default
+    // stays), then a watchdog restart of it.
+    await w.coordinate('z_key');
+    await w.coordinate('z_key');
+    assert.equal(w.events.includes('quit') || w.events.includes('start'), false);
+    assert.deepEqual(w.removed, [], 'the starting runtime is never removed by a coordination');
+    assert.ok(w.live.has(lId));
+    // Graph preparation leaves it alone as well.
+    const graph = await prepareMpsGraph({ nodes: w.nodes, networkLifecycleCapability: {} }, w.graphDeps);
+    assert.deepEqual(w.removed, [], 'nor by graph preparation');
+    assert.ok(w.live.has(lId));
+    assert.equal(lEntries(w.state).length, 1, 'its readiness entry stays journaled');
+    assert.ok(graph, 'graph preparation completed');
+    // Normal completion: the caller acknowledges readiness, which releases the
+    // launching operation and drops the entry.
+    w.registry.l_key = { ...w.registry.l_key, containerId: lId };
+    assert.deepEqual(await acknowledgeMpsRuntimeReady(started, { store: w.store, backend: { verify: () => true }, loadRegistry: () => structuredClone(w.registry) }), { acknowledged: true });
+    assert.equal(lEntries(w.state).length, 0);
+    assert.equal(mpsOwnerState(entry.owner), 'gone', 'the owner is released after a normal share-less launch completes');
+});
+
+test('MC.shareless-target-owner-is-released-when-the-launch-fails', async (t) => {
+    const w = inflightWorld(t, { lShareCleared: true });
+    const started = await w.launchNoWaitChild();
+    const owner = started.mpsReadiness.client.owner;
+    assert.equal(mpsOwnerState(owner), 'live');
+    // The failure cleanup of the caller releases it, so a later coordination
+    // settles the failed candidate instead of leaving it forever "in flight".
+    releaseMpsRuntimeOwner(started);
+    assert.equal(mpsOwnerState(owner), 'gone');
+    await w.coordinate('z_key');
+    assert.deepEqual(w.removed, [lId], 'the failed share-less candidate is removed by its immutable ID');
+    assert.equal(lEntries(w.state).length, 0);
+});
+
+test('MC.shareless-crashed-launcher-leftover-is-still-settled', async (t) => {
+    const dead = { pid: 4194305, startTime: null, processToken: randomUUID(), operationId: randomUUID() };
+    const w = inflightWorld(t, { lShareCleared: true, owner: dead });
+    assert.equal(lEntries(w.state).length, 1);
+    await w.coordinate('z_key');
+    assert.deepEqual(w.removed, [lId], 'the leftover of a crashed launcher is removed by its immutable ID');
+    assert.equal(lEntries(w.state).length, 0);
+});
+
+// O7: how a launch owner is judged. The Router runs Apply and Marketplace
+// enable in worker threads: each thread has its own module instance, so a live
+// operation of a sibling thread has another token under the same PID. It is
+// never judged gone from here; only a different process start time proves an
+// earlier incarnation of the PID.
+const ownerOf = (extra) => ({ pid: process.pid, startTime: null, processToken: randomUUID(), operationId: randomUUID(), ...extra });
+
+// A worker's lifecycle: wait for its ready message (posted after its module graph
+// finished evaluating), then send 'done' and wait for its natural `exit`.
+// Terminating a worker while its ES module evaluation is still completing
+// asynchronously crashed the test process with a native SIGTRAP under load
+// (V8 `SourceTextModule::AsyncModuleExecutionFulfilled`); `terminate()` is only
+// the fallback for a worker that never exits.
+const WORKER_EXIT_TIMEOUT_MS = 10_000;
+function startWorker(file) {
+    const worker = new Worker(new URL(file, import.meta.url));
+    const exited = new Promise((resolve) => worker.once('exit', resolve));
+    const stop = async () => {
+        worker.postMessage('done');
+        let timer;
+        const fallback = new Promise((resolve) => { timer = setTimeout(() => resolve(worker.terminate()), WORKER_EXIT_TIMEOUT_MS); });
+        try { await Promise.race([exited, fallback]); } finally { clearTimeout(timer); }
+        await exited;
+    };
+    return { worker, stop };
+}
+
+test('MC.owner-in-a-worker-thread-of-this-process-is-live-for-every-thread', async () => {
+    const { worker, stop } = startWorker('../helpers/mpsOwnerWorker.mjs');
+    try {
+        const message = await new Promise((resolve, reject) => { worker.once('message', resolve); worker.once('error', reject); });
+        assert.equal(message.type, 'ready');
+        assert.equal(message.owner.pid, process.pid, 'same PID as this thread');
+        assert.equal(message.selfView, 'live', 'the owning thread sees its operation live');
+        assert.equal(mpsOwnerState(message.owner), 'live', 'another thread of the process never judges it gone');
+    } finally { await stop(); }
+});
+
+// The release of a worker thread's operation reaches every other thread of the
+// process: a candidate whose container remains (a failed cleanup) is in flight
+// only while its launching operation runs, not for the process's lifetime.
+test('MC.a-released-owner-of-a-worker-thread-is-gone-for-every-thread', async () => {
+    const { worker, stop } = startWorker('../helpers/mpsOwnerReleaseWorker.mjs');
+    const next = (type) => new Promise((resolve, reject) => {
+        const onMessage = (message) => { if (message.type === type) { worker.off('message', onMessage); resolve(message); } };
+        worker.on('message', onMessage); worker.once('error', reject);
+    });
+    try {
+        const created = await next('created');
+        const owner = created.owner;
+        const candidate = { key: 'z', ref: 'demo/z', alias: '', instanceId: 'i-z', enableGeneration: 'g-z', containerId: 'f'.repeat(64), owner };
+        const settle = () => settleCreatedMpsCandidate(candidate, { inspect: () => ({ state: 'exact', id: candidate.containerId }), remove: () => ({ state: 'removed' }) });
+        assert.equal(created.selfView, 'live');
+        assert.equal(mpsOwnerState(owner), 'live', 'running in the worker: live for this thread');
+        assert.equal(settle(), 'in-flight', 'a coordination here must not settle a candidate that is still launching');
+        const released = next('released');
+        worker.postMessage('release');
+        assert.equal((await released).selfView, 'gone');
+        assert.equal(mpsOwnerState(owner), 'gone', 'released in the worker: gone for this thread too');
+        assert.equal(settle(), 'removed', 'the remaining candidate is settled instead of blocking for the process lifetime');
+        assert.equal(mpsOwnerState({ ...owner, operationId: randomUUID() }), 'live', 'an owner this process never recorded as released proves nothing');
+    } finally { await stop(); }
+});
+
+test('MC.owner-with-this-pid-and-another-token-is-gone-only-when-the-start-time-differs', () => {
+    assert.equal(mpsOwnerState(ownerOf({ startTime: '100' }), { readStartTime: () => '200' }), 'gone', 'an earlier incarnation of this PID');
+    assert.equal(mpsOwnerState(ownerOf({ startTime: '100' }), { readStartTime: () => '100' }), 'live', 'the same process (another thread)');
+    assert.equal(mpsOwnerState(ownerOf({ startTime: null }), { readStartTime: () => '100' }), 'live', 'no recorded start time proves nothing');
+    assert.equal(mpsOwnerState(ownerOf({ startTime: '100' }), { readStartTime: () => null }), 'live', 'an unreadable own start time proves nothing');
+});
+
+test('MC.owner-whose-pid-was-reused-is-gone-by-start-time', () => {
+    const kill = () => {};
+    const other = process.pid + 1;
+    assert.equal(mpsOwnerState(ownerOf({ pid: other, startTime: '100' }), { kill, readStartTime: () => '200' }), 'gone', 'the PID now belongs to another process incarnation');
+    assert.equal(mpsOwnerState(ownerOf({ pid: other, startTime: '100' }), { kill, readStartTime: () => '100' }), 'live', 'the same incarnation is still running');
+    assert.equal(mpsOwnerState(ownerOf({ pid: other, startTime: '100' }), { kill, readStartTime: () => null }), 'live', 'an unreadable start time proves nothing');
+    assert.equal(mpsOwnerState(ownerOf({ pid: other, startTime: null }), { kill, readStartTime: () => '200' }), 'live', 'no recorded start time proves nothing');
+    assert.equal(mpsOwnerState(ownerOf({ pid: other, startTime: '100' }), { kill: () => { throw Object.assign(new Error('no such process'), { code: 'ESRCH' }); }, readStartTime: () => '100' }), 'gone', 'no such process');
+    // A PID-reusing leftover is still settled by the coordinator.
+});
+
+test('MC.crashed-launcher-leftover-is-still-settled', async (t) => {
+    const dead = { pid: 4194305, startTime: null, processToken: randomUUID(), operationId: randomUUID() };
+    const released = mpsLaunchOwner(); releaseMpsLaunchOwner(released);
+    for (const [label, owner] of [['dead launcher process', dead], ['released operation in this process', released], ['no recorded owner', null]]) {
+        const w = inflightWorld(t, { owner });
+        await w.coordinate('z_key');
+        assert.deepEqual(w.removed, [lId], `${label}: the leftover is removed by its immutable ID`);
+        assert.equal(lEntries(w.state).length, 0, `${label}: its journal entry is dropped`);
+        const g = inflightWorld(t, { owner });
+        const graph = await prepareMpsGraph({ nodes: g.nodes, networkLifecycleCapability: {} }, g.graphDeps);
+        assert.equal(graph.refusals, undefined, `${label}: graph prepares normally`);
+        assert.deepEqual(g.removed, [lId]);
+    }
+});
+
+// A journaled old client whose agent was disabled (no registry record) is
+// drained by proof that its immutable container is absent; a present one is
+// still refused.
+test('MC.disabled-journaled-client-absent-completes-present-refuses', async (t) => {
+    const X = { key: 'x_old', ref: 'repo/xold', alias: '', instanceId: 'ixo', enableGeneration: 'gxo', containerId: 'f'.repeat(64), share: share(25), mpsGeneration: 'd0:c0' };
+    for (const present of [false, true]) {
+        const w = world(t, { policy: 25, journal: { schema: 1, status: 'pending', daemon: { pid: 9, startTime: '1' }, daemonGeneration: 'd0', configurationGeneration: 'c0',
+            pipeDirectory: `/run/ploinky/mps/pipe-${'1'.repeat(32)}`, logDirectory: `/run/ploinky/mps/log-${'1'.repeat(32)}`, serverDefault: serverDefault(25), oldClients: [X], drainedClients: [], pendingClients: [], lastProblem: null } });
+        if (present) w.live.add(X.containerId);
+        if (present) {
+            await assert.rejects(run(w, w.succeedingLaunch), { code: 'identity_changed' });
+            assert.equal(w.events.includes('quit'), false, 'nothing is stopped');
+        } else {
+            await run(w, w.succeedingLaunch);
+            assert.equal(w.state.status, 'ready');
+            assert.equal(w.state.oldClients.length, 0);
+            assert.ok(w.events.includes('launch'));
+        }
+    }
+});
+
+// Graph preparation drops a present candidate's journal entry only after its
+// exact removal succeeded.
+test('MC.graph-keeps-candidate-entry-until-its-removal-is-proven', async (t) => {
+    const w = world(t);
+    await assert.rejects(run(w, w.failingLaunch({ cleanup: false })), /Readiness deadline expired/);
+    w.graphDeps.removeCandidate = () => { throw new Error('engine removal failed'); };
+    await assert.rejects(prepareMpsGraph({ nodes: w.nodes, networkLifecycleCapability: {} }, w.graphDeps), /engine removal failed/);
+    assert.equal(candidates(w.state).length, 1, 'the unremoved candidate stays journaled');
+    assert.ok(w.live.has(newId));
+});

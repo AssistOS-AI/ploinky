@@ -104,12 +104,19 @@ test('status renders terminal color intent without changing workspace state', (t
             projectPath: '/workspace',
         },
     }));
+    // The status child lists live containers through `podman` by name. A
+    // test-owned fake first on its PATH answers "no containers" without ever
+    // reaching a real engine (a host with /usr/bin/podman would otherwise be
+    // asked), which is also what a host without podman reports.
+    const fakeBin = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-status-fake-bin-'));
+    t.after(() => fs.rmSync(fakeBin, { recursive: true, force: true }));
+    fs.writeFileSync(path.join(fakeBin, 'podman'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
     const invokeStatus = (environmentOverrides = {}, statusArgs = []) => {
         const environment = { ...process.env };
         delete environment.NO_COLOR;
         delete environment.PLOINKY_COLOR;
         Object.assign(environment, environmentOverrides, {
-            PATH: '/usr/bin:/bin',
+            PATH: `${fakeBin}:/usr/bin:/bin`,
             PLOINKY_WORKSPACE_ROOT: root,
         });
         const before = treeHash(root);

@@ -54,8 +54,15 @@ system prerequisites, with the effective paths read from `podman info`.
 Rootless UID/GID helpers, namespace mappings, seccomp, and FUSE/TUN device access
 are surveyed by the explicit `ploinky diagnose` and `ploinky repair` commands. Normal deployment
 does not run this general host preflight. Host cgroup versions and controller
-delegation are not prerequisites for the current Box runtime, which disables
-nested cgroups and sets no outer CPU quota. Installation and
+delegation are not prerequisites for the default Box runtime, which disables
+nested cgroups and sets no outer CPU quota. Hardware-enabled execution requires
+the verified cgroup-v2/runtime setup and each requested resource's delegated
+controller. `ploinky diagnose` reports missing prerequisites and their manual
+fixes. Unenforceable CPU, memory or process requests refuse the affected agent
+rather than silently dropping the limit. Hardware limits add no native `flock`,
+npm or production Python dependency: the store lock, preparation program and
+cgroup readers use Node.js built-ins, and the nested runtime uses the existing
+Podman and crun. Installation and
 configuration guidance is in [README.md](README.md#prerequisites) and in each
 failure message. These checks neither install packages nor alter host settings.
 The host's configured packages retain their distribution/upstream licensing;
@@ -133,3 +140,58 @@ compatibility is implemented in that source's `utils/uuid.mjs` and used by
 `webSkel.js`; ESM and UMD outputs are regenerated with WebSkel's existing locked
 Vite build. Refresh the generated files together after its source/build tests.
 This adds no Ploinky runtime dependency or build-tool installation.
+
+## Optional NVIDIA MPS support
+
+GPU shares reuse the operator-installed NVIDIA driver tools
+`nvidia-cuda-mps-control` and `nvidia-cuda-mps-server`, bound read-only from the
+host into `/usr/local/nvidia/bin`. No npm packages or downloaded driver code are
+added. The exact installed driver version and both tool fingerprints are
+recorded and revalidated; the tool pair must match the host driver. Missing or
+changed tools refuse sharing while ordinary GPU access remains available.
+
+These tools are NVIDIA proprietary driver components. No copies or license
+files are redistributed in this repository. License terms and supported
+versions must be checked against the operator's installed driver distribution;
+a universal tool version or license grant is not asserted here. Source and
+updates are provided by NVIDIA at <https://developer.nvidia.com/deploy/mps>.
+Install or update through the host's existing NVIDIA driver installation, then
+restart the Box to rebuild its fingerprints and read-only binds. A Node.js
+implementation cannot replace the driver daemon or CUDA control protocol.
+Remove the optional dependency by clearing GPU shares; CPU/RAM limits do not
+require MPS. Ploinky performs no package installation.
+
+The optional live GPU probe uses the existing Python 3 standard library ctypes
+to call the installed CUDA driver API. It needs no Python packages and is not a
+runtime dependency. Its driver observations require an authorized isolated GPU
+fixture. Python is PSF-licensed and operator-provided; no interpreter is bundled.
+
+The test-only live verification runner (`tests/hardware-limits/verify.mjs`
+`prepare-live`, `provision`, `live` and `cleanup`) adds no package dependency.
+It uses the operator's existing Podman, `git` to freeze the committed
+candidate and, for apparatus blocks, the system OpenSSH client with a pinned
+known-hosts file; on the remote host it runs only the pinned Node.js and
+`mkdir`, `dd`, `chmod`, `stat`, `cat`, `ls`, `sha256sum`, `tar` and `rm`. After every
+dispatch, and before the owned staging root can be removed, it lists the remote run
+directory and fetches only the run artifacts named in its own artifact form, as
+bounded regular files verified by `sha256sum`. The
+`apparatus-mps` block additionally runs the pinned host `nvidia-smi` as a
+read-only XML query (the GPU idle gate) and reads the host's `/proc` and cgroup
+tree; it never changes the compute mode and signals only the one MPS daemon of
+its own Box, after proving it. Each action needs its own separate
+execution-time authorization binding.
+
+The `apparatus-local-llm` and `apparatus-vllm` blocks add no package dependency to
+Ploinky. They run the committed local-llm candidate from its own pinned immutable
+image, and drive it only through its MCP tools and the administrator route. While
+the model generates they read the agent's cgroup interface files (`cpu.stat`,
+`cpu.max`, `memory.*`) and the pinned host `nvidia-smi` XML query. The local-llm
+repository's calibration tool (`local-llm/tools/vllm_mps_calibration.mjs`) uses
+only Node.js built-ins and the vLLM installation the product itself makes from its
+own pinned runner lock: the lock entry (wheels, about 3.9 GB for the pinned vLLM
+version) is downloaded by the agent's own installer inside the owned Box and is
+removed with the owned workspace. Nothing is installed on the host and nothing
+unpinned is ever installed; a missing lock entry, driver, toolchain or disk is
+reported as BLOCKED with the missing prerequisite. The Playground is not a
+dependency: no browser or Playwright runtime is provisioned, and the cases call the
+same MCP tool through the Router.

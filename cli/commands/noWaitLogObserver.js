@@ -32,6 +32,7 @@ import {
 import { proveWorkerProcessIdentity } from '../sandbox/processIdentity.js';
 import { readVerifiedJsonObject } from '../utils/verifiedReadOnlyFile.js';
 import { sanitizeControlDiagnosticText } from '../utils/diagnosticText.js';
+import { validateHardwareOutcome } from '../sandbox/hardwareLimits/errors.mjs';
 
 export const NO_WAIT_STATE_BYTE_LIMIT = 256 * 1024;
 const NO_WAIT_FAILURE_PHASES = Object.freeze(['admission', 'spawn', 'launch', 'readiness']);
@@ -234,6 +235,7 @@ export function observeBoundNoWaitRun(binding, {
                 targetWaveIndex: boundMarker.waveIndex,
                 timeouts,
                 nowMs: observationNowMs,
+                validateTerminalOutcome: validateHardwareOutcome,
             });
         } catch (error) {
             throw noWaitObservationError(error?.message || String(error));

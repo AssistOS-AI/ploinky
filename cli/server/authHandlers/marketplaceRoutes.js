@@ -32,6 +32,9 @@ import { createTokenReplayCache } from '../security/tokens/JwsCodec.js';
 import { runMarketplaceEnableWorker } from '../marketplaceEnableWorker.js';
 import { authService, LOCAL_AUTH_COOKIE_NAME, parseCookies, sendJson, sessionTokenService, SSO_AUTH_COOKIE_NAME } from './shared.js';
 import { localSessionAllowedForRoutePlan } from './authContext.js';
+import { findHardwareOutcome, formatHardwareOutcome } from '../../sandbox/hardwareLimits/errors.mjs';
+import { handleHardwareLimitsRoutes } from './hardwareLimitsRoutes.mjs';
+import { readEdgeRoutingSelection } from '../../sandbox/edgeGeneration.js';
 
 export const MARKETPLACE_PATH = '/api/marketplace';
 export const MARKETPLACE_AGENT_TARGET = 'ploinky-router';
@@ -81,6 +84,18 @@ function safeLifecycleCause(error) {
 }
 
 function sendLifecycleError(res, error) {
+    // A hardware refusal (422) or dependency block (424) carries its bounded
+    // typed outcome; no stack, body or environment is returned.
+    const hardwareOutcome = findHardwareOutcome(error);
+    if (hardwareOutcome) {
+        sendJson(res, hardwareOutcome.state === 'blocked' ? 424 : 422, {
+            ok: false,
+            error: hardwareOutcome.code,
+            message: formatHardwareOutcome(hardwareOutcome),
+            hardwareOutcome,
+        });
+        return true;
+    }
     const code = String(error?.code || '');
     const contract = SAFE_LIFECYCLE_ERRORS.get(code);
     if (!contract) return false;
@@ -391,7 +406,7 @@ function buildMarketplaceAgents(user = null, options = {}) {
     const enabledByRef = new Map(enabledAgents.map(record => [`${record.repoName}/${record.agentName}`, record]));
     const runtimeEntries = Object.hasOwn(options, 'runtimeEntries')
         ? (options.runtimeEntries || [])
-        : collectAgentRuntimeStates({ registry: agentsRegistry });
+        : collectAgentRuntimeStates({ registry: agentsRegistry, ...(Object.hasOwn(options, 'liveContainers') ? { liveContainers: options.liveContainers } : {}) });
     const noWaitStates = Object.hasOwn(options, 'noWaitStates')
         ? (options.noWaitStates || new Map())
         : collectMarketplaceNoWaitStates(agentsRegistry);
@@ -542,6 +557,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
             }
         },
     }),
+    agentListOptions = {}, // a test's listing observes its own live containers
     uninstallRepositoryAction = (body) => uninstallMarketplaceRepository(body),
 } = {}) {
     const route = parseMarketplacePath(parsedUrl.pathname || '/');
@@ -553,6 +569,20 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
     }
 
     const method = (req.method || 'GET').toUpperCase();
+
+    if (route.resource === 'hardware-limits') {
+        return handleHardwareLimitsRoutes(req, res, parsedUrl, {
+            ensureAdmin: (request, response, url) => ensureAdmin(request, response, url, { routePlan }),
+            verifyMutation: (request) => {
+                const publicContext = publicMarketplaceAuthContext(routePlan);
+                return publicContext
+                    ? verifyBrowserMutationRequest(request, { routePlan, authContext: publicContext, sessionId: request.sessionId })
+                    : verifyAdminMutationRequest(request, request.sessionId);
+            },
+            verifyLease: () => !routePlan?.lease?.commit || routePlan.lease.commit() === true,
+            readSelection: readEdgeRoutingSelection,
+        });
+    }
 
     const authorizeRead = async () => {
         if (readAuthorizationBearer(req)) {
@@ -567,7 +597,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
         return authResult.ok;
     };
     const agentsMarketplace = () => ({
-        ...buildMarketplaceAgents(req.user),
+        ...buildMarketplaceAgents(req.user, agentListOptions),
         permissions: {
             canManage: isAdminUser(req.user)
                 && Boolean(publicMarketplaceAuthContext(routePlan) || canonicalControlOrigin(req)),

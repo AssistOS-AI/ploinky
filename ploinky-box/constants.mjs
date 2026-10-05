@@ -33,6 +33,9 @@ export const BOX_LABELS = Object.freeze({
     // Present only for a workspace with a `ploinky gpu grant`: the fingerprint
     // of the exact GPU wiring (devices, driver binds, CDI spec, grant marker).
     gpuGrant: 'io.assistos.ploinky-box.gpu-grant',
+    // Present only for a gate-on Box: the fingerprint of the exact
+    // hardware-limits wiring (read-only marker and the private store bind).
+    hardwareLimits: 'io.assistos.ploinky-box.hardware-limits',
 });
 
 // GPU grant wiring inside the Box. Driver libraries are bound read-only under
@@ -46,6 +49,13 @@ export const BOX_GPU_CDI_DEVICE = 'ploinky.local/gpu=all';
 export const BOX_GPU_MARKER_PATH = '/etc/ploinky-box-gpu-grant.json';
 // Host-only record and generation directory under `~/.ploinky-box`.
 export const GPU_GRANT_STATE_DIRECTORY = 'gpu-grants';
+
+// Hardware-limits wiring inside a gate-on Box: a read-only identity marker
+// and the read-write private policy store bind. The host-only gate record and
+// store live under `~/.ploinky-box/hardware-limits`.
+export const BOX_HARDWARE_MARKER_PATH = '/etc/ploinky-box-hardware-limits.json';
+export const BOX_HARDWARE_STORE_PATH = '/run/ploinky/hardware-limits';
+export const HARDWARE_LIMITS_STATE_DIRECTORY = 'hardware-limits';
 
 // achillesAgentLib is direct-mounted from the one selected workspace source.
 // The Box never installs its own copy. `/opt/ploinky/node_modules` is the

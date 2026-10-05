@@ -26,9 +26,14 @@ Run `ploinky diagnose` from the workspace to check the host environment:
 | Networking | The configured `pasta` (provided by `passt`) or `slirp4netns` executable, and the selected Netavark executable when applicable |
 | Storage | The configured overlay mount helper, if one is selected; native overlay does not require host `fuse-overlayfs` |
 
-The current Box runs nested Podman with cgroups disabled and sets no outer CPU
-quota. Startup therefore does not require a particular host cgroup version or
-delegated `cpu`, `memory`, or `pids` controllers.
+By default, the Box runs nested Podman with cgroups disabled and sets no outer
+CPU quota. An agent requesting CPU, memory or process limits is refused when
+those limits cannot be enforced. With `PLOINKY_BOX_HARDWARE_LIMITS=on`,
+nested-agent limits require writable delegated cgroup v2 with `nsdelegate`, the
+verified runtime configuration, and the controller needed by each requested
+resource. A missing controller refuses the affected agent; it does not prevent
+unrelated agents from starting. See
+[Hardware limits for agents](#hardware-limits-for-agents).
 
 The general host prerequisite survey runs when `ploinky diagnose` or
 `ploinky repair` is requested. Commands such as `ploinky start explorer` attempt their deployment
@@ -276,6 +281,10 @@ A matching folder named after the registered repository takes priority; otherwis
 | `ploinky gpu grant [--agent REPO/AGENT] [--vendor VENDOR]` | Let the named agents use the host NVIDIA GPU and lift their denies; without `--agent`, lift a workspace-wide revoke so manifest-declared agents get the GPU again; recreate the Box with the device nodes and read-only driver libraries and restart the configured graph when the wiring changes |
 | `ploinky gpu revoke [--agent REPO/AGENT]` | Deny the named agents, overriding their manifests; without `--agent`, withdraw every grant and turn manifest-declared GPU access off for the whole workspace |
 | `ploinky gpu status` | Show the saved grant, host GPU discovery, and the Box's GPU wiring without mutation |
+| `PLOINKY_BOX_HARDWARE_LIMITS=on ploinky start` (or `restart`, `update`) | Turn hardware limits on for this workspace and save the gate; the Box is recreated with the hardware wiring and prepared before graph work |
+| `PLOINKY_BOX_HARDWARE_LIMITS=off ploinky restart` (or `start`, `update`) | Turn hardware limits off and save the gate; refused while agents still have stored limits |
+| `ploinky limits status` | Show the saved gate, hardware state, transition, Box state, host engine facts and stored per-agent limits without mutation; unobserved in-Box facts print as `unknown` |
+| `ploinky limits clear --agent REPO/AGENT` / `ploinky limits clear --all` | Remove one agent's stored limits, or reset the whole policy store, on the host without a running Router |
 | `ploinky status` | Inspect outer configuration/publishes/health and running core status without mutation |
 | `ploinky diagnose [--json]` | Run host prerequisite/settings checks and isolated deployment command probes; report failures, commands, and actions labelled by privilege and automation eligibility |
 | `ploinky repair [--dry-run] [--json]` | Apply supported normal-user fixes, verify with diagnostics, and list remaining manual and sudo-required actions; `--dry-run` only inspects and previews |
@@ -285,6 +294,15 @@ A matching folder named after the registered repository takes priority; otherwis
 | `ploinky destroy` | Without prompting, stop nested agents and remove the outer container; retain the host workspace and `.ploinky/box` |
 | `ploinky destroy --delete-cache` | Remove the outer container without prompting, then delete only `.ploinky/box/dependencies` and `.ploinky/box/images` |
 | REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |
+
+Workspaces that have never enabled hardware limits retain the existing
+generic-command behavior, including creating or starting the Box. A saved off
+record alone, with no initialized store and no stored entries, retains that
+behavior. A saved on gate, an initialized hardware store, or proven stored
+entries restrict generic commands to an already-running compatible Box;
+otherwise run `ploinky start` first. Invalid or unreadable hardware metadata is
+not treated as a never-enabled workspace: repair it before an operation that
+would create or replace the Box.
 
 When REPL input is not a Ploinky command, Ploinky attempts that executable
 directly using the runtime `PATH`; it does not depend on a separate `which`
@@ -640,6 +658,173 @@ rule: Router traffic is plain HTTP without TLS, so restrict who can reach the
 port with the host firewall or a trusted network. Bind does not change firewall
 rules, DNS, tunnels, or authentication settings, and it does not rewrite callback
 URLs registered with an SSO provider.
+
+## Hardware limits for agents
+
+Explorer administrators edit CPU cores, RAM percentage and eligible NVIDIA GPU
+shares in Settings → Hardware limits. A policy belongs to `REPO/AGENT` and
+applies to every alias instance. Save records desired policy; Apply reconciles
+selected exact registry keys, drains and recreates changed instances, waits for
+their required readiness and publishes fresh routes. Unchanged instances are
+left running. Repaired blocking dependants are included in dependency order;
+the response lists that expansion and each applied, refused, blocked or pending
+identity. CPU and memory usage is shown against applied kernel limits.
+
+The Router owns `GET` and `POST /api/marketplace/hardware-limits`. Reads require
+an administrator session. Mutations also require exact Origin, current CSRF
+proof and a policy epoch/revision token; Bearer requests are rejected before
+body parsing. Concurrent changes return a conflict instead of overwriting
+newer policy. Partial Apply results retain completed identities. Its bounded
+deadline cancels cooperatively so runtime cleanup and lifecycle lease release
+finish before another Apply starts. An unexpected worker exit requires host
+restart recovery. Administration remains a separate navigation tab.
+
+Hardware limits are off by default. Turn them on for a workspace with
+`PLOINKY_BOX_HARDWARE_LIMITS=on ploinky start` (or `restart`, `update`); the
+choice is saved on the host in `~/.ploinky-box/hardware-limits` and later
+commands reuse it. Only `start`, `restart` and `update` apply the variable.
+Turning the gate off while agents still have stored limits is refused with:
+
+    N agents have stored hardware limits. Turn the gate on with PLOINKY_BOX_HARDWARE_LIMITS=on ploinky restart, or run ploinky limits clear --agent REPO/AGENT or ploinky limits clear --all on the host. No Box mutation was performed.
+
+`ploinky limits status` shows, without changing anything, the saved gate, the
+hardware state, any interrupted gate-off transition, the Box's state and
+wiring, the host engine's cgroup version, OCI runtime and controllers, the
+running Box's recorded OCI runtime, and each agent's stored limits. Facts the
+host cannot observe, such as the Box's in-Box preparation, cgroup mount and
+nested backend, are printed as `unknown` with the reason; it lists no
+per-instance availability it has not observed. `ploinky limits clear --agent REPO/AGENT` and
+`ploinky limits clear --all` remove stored limits on the host and work without a
+running Router.
+
+When the gate is on, every created, restarted or restored Box generation is
+prepared before graph work: a fixed program running as the Box's
+user-namespace root moves the Box's own tasks into `/ploinky/core`, enables the
+available delegated `cpu`, `memory` and `pids` controllers and delegates only
+`/ploinky` to the Box user. Agents with limits then run under
+`/ploinky/agents` in a private cgroup namespace, and their applied values are
+read back from the kernel before they are declared ready. `ploinky diagnose`
+lists missing prerequisites and their manual fixes; Ploinky never changes host
+mounts, boot settings or systemd delegation itself.
+
+CPU quotas and memory limits use the kernel's cgroup controllers. A rendered
+agent memory limit also sets an equal memory-and-swap limit, preventing swap
+from extending the cap. Existing declared process-count limits remain
+supported. Internal authority helpers are never refused because a resource
+controller is absent: they retain their recorded flags and receive enforced
+placement only when all required controllers are available.
+
+An unenforceable limit refuses that agent. Blocking dependencies and consumers
+explicitly waiting on a no-wait result propagate BLOCKED with the originating
+reason; an optional no-wait child does not block its parent. Unrelated agents
+continue starting. Refused and blocked agents are never ready. If a required
+dependency blocks Explorer itself, `ploinky limits status` and
+`ploinky limits clear` on the host remain the recovery path.
+
+Store files are outside agent-visible workspace mounts, but administrator
+authority is not protected from every workspace-capable agent: eligible agents
+may read the workspace master key and forge administrator cookie/CSRF requests.
+This exposure is accepted for v1. Bearer rejection and direct store isolation do
+not remove it.
+
+A host-network agent that also requests nested Podman is refused for this
+unsupported combination only when it requests or stores a hardware limit. An
+unlimited instance retains existing behavior. Ordinary host-network agents
+remain eligible for CPU/RAM limits when their backend is verified. Such an
+unlimited capable instance keeps the baseline cgroup behavior: the private
+namespace proof does not cover it, so other agents' limits do not isolate them
+from it.
+
+CPU/RAM maxima are not reservations: host or ancestor memory pressure can still
+kill a process below its own cap. Dependency installation, diagnose and
+image-verification work is maintenance outside agent budgets.
+
+### Declaring limits in a manifest
+
+Any agent, whether or not it uses the LLM runtime, declares its own limits with
+a top-level `hardwareLimits` object in its manifest or in a profile:
+
+```json
+{
+  "container": "node:20-alpine",
+  "hardwareLimits": { "memory": "512m", "cpus": "0.5", "pidsLimit": 128 },
+  "profiles": {
+    "default": {},
+    "dev": { "hardwareLimits": { "cpus": "1" } }
+  }
+}
+```
+
+Only `memory`, `cpus` and `pidsLimit` are accepted, each with the same rules as
+before; any other key is refused, and GPU shares stay administrator-only in
+Settings → Hardware limits. The manifest root is one layer and the resolved
+profile is another. The selected profile overrides the default profile key by
+key and inherits the keys it leaves out. Precedence is unchanged: built-in
+defaults, the manifest, the LLM catalog, the profile, and finally the
+administrator's stored limits, which override every declaration.
+
+Declaring `memory`, `cpus` or `pidsLimit` under
+`llmRuntime.runtimePolicy.resources` still works but is deprecated: each
+command or Router start prints one warning per agent naming the deprecated
+paths and `hardwareLimits`, and the administrator read reports a
+`deprecatedDeclaration` note. A key declared in both places of the same manifest
+root or profile with different values refuses that agent with a fix that names
+the manifest root or the profile; equal values are accepted, compared by meaning
+(`1g` equals `1024m`, `1.0` equals `1`). Moving a declaration to `hardwareLimits`,
+or writing an equal value in another spelling, leaves the limits hash unchanged,
+so nothing restarts; the rendered arguments follow the declaration's own
+spelling (`--memory 1g` versus `--memory 1024m`). The other `llmRuntime.runtimePolicy` settings (`shmSize`, `ulimits`,
+`devices`, `ipc` and the rest) are not deprecated.
+
+Upgrade note: earlier releases dropped a selected non-default profile's
+`llmRuntime` settings, so `memory`, `cpus` or `pidsLimit` declared under
+`llmRuntime.runtimePolicy.resources` in such a profile were silently ignored.
+They now apply. On the next start or Apply that agent can be recreated with the
+new limits, or, where limits cannot be enforced (hardware limits off or an
+unprepared Box), refused with a fix for the declared limit. Remove or move the
+declaration before upgrading if that is not wanted.
+
+### GPU share limits
+
+GPU shares use NVIDIA MPS and are best-effort, not a security boundary.
+Share clients use the same Box user as the MPS daemon. They can issue control commands, widen settings, stop the daemon and alter its writable pipe-directory entries.
+A process that drops the MPS environment can use the GPU outside MPS in DEFAULT compute mode.
+The MPS device-memory limit applies to each CUDA process, not to the sum of every process in an agent.
+A RAM cgroup limit does not cap dedicated GPU memory.
+Only the host operator may choose EXCLUSIVE_PROCESS. It affects other CUDA users and workspaces. Ploinky never changes compute mode.
+
+The operator command is `sudo nvidia-smi -i 0 -c EXCLUSIVE_PROCESS`; undo it
+with `sudo nvidia-smi -i 0 -c DEFAULT`. These commands affect the whole selected
+GPU. They are manual choices and are never run by Ploinky's tests.
+
+Sharing requires GPU index 0 with a known dedicated memory model, a current GPU
+grant for the exact agent, and both matching host driver MPS tools. Unified
+GPUs, including GB10, and unknown memory models refuse a configured share.
+SM and VRAM percentages are integers from 1 to 100. VRAM resolves against
+dedicated device memory, rounded down to MiB, with a 512 MiB minimum.
+Each share client keeps its exact share in `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE`
+and `CUDA_MPS_PINNED_DEVICE_MEM_LIMIT`. The daemon-wide default is the largest
+SM share and the largest memory share rounded up to the next whole GiB, because
+the driver reports its memory default in whole GiB (the captured driver 595.91.07
+read back a configured 1044M as `1G`). The configured default is always a whole
+GiB, so the readback is compared exactly, with no tolerance. A client value can
+only tighten the default, and a process that drops its own variables can reach
+the rounded default. The administrator status reports `vramMiB` (the configured
+default) and `shareMemoryMiB` (the largest share it came from).
+
+Prepare the selected image through normal agent startup before saving a GPU
+share. Save inspects the canonical image and registered alias profiles without
+pulling images or starting MPS. Images require an explicit nonroot numeric
+UID:GID and managed default or bridge networking. Changing the process UID
+later may make its MPS connection fail.
+
+The administrator endpoint reports observed daemon status, verified defaults,
+and the applied MPS generation. A lost daemon makes its clients pending even
+when their policy hash is unchanged. Metrics label GPU values best-effort only
+when the exact container's applied observation matches its generation label.
+A default change can expand Apply to the old share-client cohort. Live GPU
+behavior and the selected driver's control-reply format require separate
+hardware qualification; offline checks do not establish those properties.
 
 ## GPU access for agents
 

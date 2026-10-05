@@ -1,3 +1,4 @@
+import '../helpers/isolatedWorkspaceRoot.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -227,7 +228,9 @@ test('runtime creation cleans fixed control artifacts only after predecessor han
         new URL('../../cli/sandbox/docker/agentServiceManager.js', import.meta.url),
         'utf8',
     );
-    const createStart = source.indexOf('const createContainer = (plan, launch,');
+    // The engine create runs in spawnCreate, after the hardware guard of the
+    // shared launch seam (runHardwareGuardedLaunch).
+    const createStart = source.indexOf('const spawnCreate = (createArgs, launch,');
     const cleanup = source.indexOf('prepareHealthProbeHostDirForLaunch(containerName);', createStart);
     const runtimeCreate = source.indexOf('const res = spawnSync(runtime, createArgs', createStart);
     assert.ok(createStart >= 0);
@@ -403,7 +406,8 @@ test('managed Docker identity derivation is a fail-closed launch precondition', 
     assert.doesNotMatch(source, /could not set agent identity/);
     assert.match(source, /Only non-secret principal fields exist before topology attestation/);
     assert.match(source, /generationLease\.checkpoint\('pre-credentials'\)[\s\S]*?signGeneratedRouterDescriptorEnvelope\(payload\)[\s\S]*?buildAgentCredentialEnv\(principalId, runtimeIdentity\)/);
-    assert.match(source, /computeSemanticEnvHash[\s\S]*PLOINKY_ROUTER_SEMANTIC_TOPOLOGY_DIGEST[\s\S]*PLOINKY_AGENT_ENABLE_GENERATION/);
+    // One shared construction carries the semantic inputs; the managed creation label and adoption call it.
+    assert.match(source, /PLOINKY_ROUTER_SEMANTIC_TOPOLOGY_DIGEST[\s\S]*PLOINKY_AGENT_ENABLE_GENERATION[\s\S]*const computeSemanticEnvHash = \(payload\) => computeAgentEnvHash\(/);
     assert.match(source, /canReuseExisting && runtimeNetworkPlan\.requiresManagedNetwork[\s\S]*adoptManagedRuntimeOnly = !managedReconciliationPreparationLease/);
     assert.match(source, /createRouterAttestationGenerationLease\(\{[\s\S]*expectedOwner:/);
 });

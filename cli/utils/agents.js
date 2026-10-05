@@ -4,6 +4,7 @@ import { execSync } from 'child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'url';
 import { loadAgents, saveAgents } from './workspace.js';
+import { readAgentRegistrySnapshot } from './agentRegistrySnapshot.js';
 import {
     getAgentContainerName,
     parseManifestPorts,
@@ -76,6 +77,7 @@ import {
     getAgentDataDir
 } from './workspaceStructure.js';
 import {
+    AGENT_ALIAS_PATTERN,
     RESERVED_AGENT_REGISTRY_KEYS,
     parseQualifiedAgentReference,
     resolveEnabledAgentRecordFromMap,
@@ -88,7 +90,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 export const AGENT_LIB_PATH = path.resolve(__dirname, '../../Agent');
 const RESERVED_AGENT_KEYS = RESERVED_AGENT_REGISTRY_KEYS;
-const ALIAS_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
+const ALIAS_PATTERN = AGENT_ALIAS_PATTERN;
 const AUTH_MODES = new Set(['none', 'sso', 'guest']);
 export const DEFAULT_ENABLE_AGENT_MODE = 'isolated';
 export const ENABLE_AGENT_MODES = Object.freeze(['isolated', 'global', 'devel']);
@@ -361,8 +363,13 @@ function resolveAgentEnableInput({
     agentName,
     mode,
     repoNameParam,
+    aliasParam,
     authOptions = {},
-}) {
+}, {
+    hardwareAdmission = 'strict',
+    hardwareContext,
+    boxMarkerOptions,
+} = {}) {
     const normalized = normalizeEnableArgs(agentName, mode, repoNameParam);
     const { manifestPath, repo: repoName, shortAgentName } = findAgent(normalized.agentName);
     const manifestBytes = fs.readFileSync(manifestPath);
@@ -377,6 +384,9 @@ function resolveAgentEnableInput({
         profileName: profile || undefined,
         path: `manifest(${repoName}/${shortAgentName})`,
     });
+    // Graph staging admits hardware eligibility as metadata so a refused
+    // agent is recorded rather than aborting unrelated staging (plan §9.1).
+    const instanceAlias = normalizeAlias(aliasParam);
     const admissionOptions = {
         manifestBytes,
         manifestPath,
@@ -384,6 +394,11 @@ function resolveAgentEnableInput({
         profileName: profileResolution.resolvedProfileName,
         profileConfig: profileResolution.profileConfig,
         network: profileResolution.network,
+        hardwareAdmission,
+        ...(hardwareContext !== undefined ? { hardwareContext } : {}),
+        ...(boxMarkerOptions !== undefined ? { boxMarkerOptions } : {}),
+        instanceKey: getAgentContainerName(instanceAlias || shortAgentName, repoName),
+        alias: instanceAlias || '',
     };
     admitManifestRuntimeCapabilities(manifest, admissionOptions);
     const selectedRuntime = getRuntimeForAgent(manifest);
@@ -637,6 +652,9 @@ export function prepareAgentEnableBatch(requests, {
     reason = 'agent-enable-batch-prelaunch',
     availabilityMode = 'additive',
     retireNoWaitMarkers = retireNoWaitRunMarkers,
+    hardwareAdmission = 'strict',
+    hardwareContext,
+    boxMarkerOptions,
 } = {}) {
     if (!Array.isArray(requests)) {
         throw new Error('prepare agent enable batch: requests must be an array');
@@ -646,7 +664,7 @@ export function prepareAgentEnableBatch(requests, {
         if (!request || typeof request !== 'object' || Array.isArray(request)) {
             throw new Error('prepare agent enable batch: each enable batch request must be an object');
         }
-        return { request, input: resolveAgentEnableInput(request) };
+        return { request, input: resolveAgentEnableInput(request, { hardwareAdmission, hardwareContext, boxMarkerOptions }) };
     });
 
     for (const { input } of resolvedRequests) {
@@ -654,6 +672,8 @@ export function prepareAgentEnableBatch(requests, {
         assertRuntimeAdmissionCurrent(input.runtimeAdmission, {
             manifestBytes: currentBytes,
             profileName: input.profileResolution.resolvedProfileName,
+            ...(hardwareContext !== undefined ? { hardwareContext } : {}),
+            ...(boxMarkerOptions !== undefined ? { boxMarkerOptions } : {}),
         });
     }
     const initialized = initializeFreshEdgeRoutingSources({ workspaceRoot: PLOINKY_WORKSPACE_ROOT });
@@ -702,6 +722,8 @@ export function prepareAgentEnableBatch(requests, {
                 assertRuntimeAdmissionCurrent(input.runtimeAdmission, {
                     manifestBytes: currentBytes,
                     profileName: input.profileResolution.resolvedProfileName,
+                    ...(hardwareContext !== undefined ? { hardwareContext } : {}),
+                    ...(boxMarkerOptions !== undefined ? { boxMarkerOptions } : {}),
                 });
             }
             const policy = bootstrapPreparedMcpToolPolicy(routing.routes);
@@ -772,11 +794,40 @@ export function prepareAgentEnableBatch(requests, {
     };
 }
 
+/** Validate enable arguments on detached desired state before cohort changes.
+ * No prepared generation, workspace structure, or registry write is produced. */
+export function previewAgentEnable(request, {
+    readRegistry = readAgentRegistrySnapshot, readRouting = loadRoutingConfig,
+    resolveInput = resolveAgentEnableInput,
+} = {}) {
+    const registry = readRegistry();
+    const plan = planAgentEnable(request, structuredClone(registry), structuredClone(readRouting()), resolveInput(request));
+    return { plan, predecessor: registry[plan.containerName] || null };
+}
+
+/** Coordinate existing GPU peers before enable captures its additive lease. */
+export async function withMpsEnablePreparation(request, stage, {
+    network = withNetworkLifecycleLock, preview = previewAgentEnable,
+    loadMps = () => import('../sandbox/hardwareLimits/mpsLifecycle.mjs'),
+} = {}) {
+    return network(async (networkLifecycleCapability) => {
+        const { plan, predecessor } = preview(request);
+        const mps = await loadMps();
+        const mpsLaunch = await mps.prepareMpsClientLaunch({ key: plan.containerName, record: predecessor || plan.record }, {
+            desiredRecord: plan.record, networkLifecycleCapability,
+        });
+        return stage({ mps, mpsLaunch, preview: plan }, networkLifecycleCapability);
+    });
+}
+
 export async function enableAgent(agentName, mode, repoNameParam, aliasParam, authModeParam, authOptions = {}) {
     // Enabling mutates the registry and admits a runtime: hold the workspace
     // mutation lease (reusing one this process already holds) for the whole
-    // operation, before any runtime lock.
+    // operation, before any runtime lock. The GPU peers are coordinated (under
+    // the network lifecycle lock) only after the lease is held.
     return withHeldOrAcquiredWorkspaceMutationLease({ operation: 'agent-enable' }, async () => {
+    const request = { agentName, mode, repoNameParam, aliasParam, authModeParam, authOptions };
+    return withMpsEnablePreparation(request, async ({ mps, mpsLaunch }) => {
     let prepared;
     try {
         prepared = prepareAgentEnableBatch([{
@@ -816,7 +867,7 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
     try {
         return await withNetworkLifecycleLock(async (networkLifecycleCapability) => {
             console.log(`Starting agent '${shortAgentName}' from repo '${repoName}'...`);
-            started = ensureAgentService(shortAgentName, manifest, agentPath, {
+            started = await ensureAgentService(shortAgentName, manifest, agentPath, {
                 containerName,
                 alias: alias || undefined,
                 preferredHostPort,
@@ -826,6 +877,7 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
                 instanceId,
                 enableGeneration,
                 forceRecreate: true,
+                forceRecreateReason: 'agent enable',
                 // The record this enable replaces, captured before the batch
                 // rotated the registry, is the only runtime it may stop.
                 expectedPredecessor: registeredRuntimeTuple(prepared.previousAgents?.[containerName]),
@@ -835,7 +887,9 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
                 preparedHostModeCapability: plan.preparedHostModeCapability,
                 networkLifecycleCapability,
                 runtimeAdmission,
+                ...(mpsLaunch ? { mpsLaunch } : {}),
             });
+            mps.trackMpsRuntimePending(started, { mpsLaunch, key: containerName });
             verifyEnabledAgentStarted(shortAgentName, started?.containerName || containerName, {
                 runtime: started?.runtime || started?.registryRecord?.runtime || 'container',
             });
@@ -863,6 +917,7 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
             }, { hostPort });
             const finalLease = started?.preparationLease
                 || prepared.preparedGeneration?.preparationLease;
+            await mps.verifyMpsRuntimeReady(started);
             withEdgeGenerationApplyLock((applyLockCapability) => {
                 if (finalLease?.mode === 'additive') {
                     commitAdditiveEdgeRoutingGeneration(finalLease, {
@@ -886,6 +941,7 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
                 });
             }, { preparationLease: finalLease });
 
+            await mps.acknowledgeMpsRuntimeReady(started);
             if (started?.durableCandidate) {
                 try { retireRuntimeCandidate(started.durableCandidate); } catch (error) {
                     console.warn(`[enable] ${shortAgentName}: runtime committed; candidate receipt retained: ${error.message}`);
@@ -919,6 +975,7 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
             error,
         );
     }
+    });
     });
 }
 

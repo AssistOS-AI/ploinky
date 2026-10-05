@@ -3,12 +3,22 @@ import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 
 import { collectAgentRuntimeStatesAsync } from '../sandbox/agentRuntimeState.js';
-import { getAgentsRegistry } from '../sandbox/docker/containerRegistry.js';
+import { collectLiveAgentContainersStrictAsync, getAgentsRegistry } from '../sandbox/docker/containerRegistry.js';
 import { getRuntime } from '../sandbox/docker/common.js';
 import { applyRuntimeReadinessProjection } from '../utils/noWaitReadiness.js';
 import { aggregateProcessTreeMetrics } from './workspaceProcessMetrics.js';
+import { AppliedLimitsCache, parseMemoryUsage, limitsUsage } from './workspaceMetricsLimits.mjs';
+import { readAppliedObservation } from '../sandbox/hardwareLimits/runtimeState.mjs';
+import { readBoxHardwareContext } from '../sandbox/hardwareLimits/context.mjs';
+import { readRoutingConfig } from './routingFile.js';
+import { availabilityForcesNotReady, metricHardwareAvailability } from './workspaceMetricsAvailability.mjs';
+import { readStoreAvailabilityProjections } from './hardwareAvailabilityProjections.mjs';
 
 const RECONCILE_INTERVAL_MS = 5_000;
+// How long a successful Apply waits for a metrics reconcile that started after it: the reconcile re-inspects every running container in
+// sequence, each with a 5 s limit (workspaceMetricsLimits.mjs), so a nested Box can need several seconds.
+export const POST_APPLY_STATUS_WAIT_MS = 10_000;
+export const RECONCILE_FAILURE_BACKOFF_MS = 250;
 const SAMPLE_INTERVAL_MS = 2_000;
 const execFileAsync = promisify(execFile);
 
@@ -43,6 +53,10 @@ function publicRuntimeEntry(entry, metrics) {
   const running = Boolean(entry?.state?.running);
   return {
     containerName: String(entry?.containerName || ''),
+    // The container this state was read from: a reader of the snapshot can tell the current container from an earlier one of the same name.
+    containerId: /^[a-f0-9]{64}$/.test(String(entry?.containerId || '')) ? String(entry.containerId) : '',
+    // The engine's own running bit, whatever the readiness projection says of the state.
+    engineRunning: entry?.engineRunning === true,
     agentName: String(entry?.agentName || '-'),
     repoName: String(entry?.repoName || '-'),
     runtime: String(entry?.runtime || 'container'),
@@ -56,9 +70,25 @@ function publicRuntimeEntry(entry, metrics) {
   };
 }
 
-class WorkspaceMetricsMonitor extends EventEmitter {
-  constructor() {
+export class WorkspaceMetricsMonitor extends EventEmitter {
+  // The readers default to the real ones; tests inject only what the engine and the host would answer.
+  constructor({ readRegistry = getAgentsRegistry, collectContainers = null, runtimeStateOptions = {}, readHardwareContext = readBoxHardwareContext, readRouting = readRoutingConfig, readStoreProjections = readStoreAvailabilityProjections, containerStats = true } = {}) {
     super();
+    this.readRegistry = readRegistry;
+    // Strict by default: an engine read that fails rejects, so the reconcile fails instead of publishing "no container".
+    this.collectContainers = collectContainers;
+    this.liveCollector = collectContainers || collectLiveAgentContainersStrictAsync;
+    this.runtimeStateOptions = runtimeStateOptions;
+    this.readHardwareContext = readHardwareContext;
+    this.readRouting = readRouting;
+    this.readStoreProjections = readStoreProjections;
+    this.containerStats = containerStats;
+    this.reconcilePromise = null;
+    this.completedReconcileStartedAt = 0;
+    this.lastReconcileOk = null;
+    // When the engine read behind `states` STARTED (epoch ms; 0 before the first). A snapshot says nothing about what happened after that,
+    // however late it is published.
+    this.statesReadStartedAt = 0;
     this.setMaxListeners(0);
     this.states = [];
     this.containerMetrics = new Map();
@@ -70,12 +100,35 @@ class WorkspaceMetricsMonitor extends EventEmitter {
     this.latest = null;
     this.reconcileInFlight = false;
     this.sampleInFlight = false;
+    this.hardwareEnabled = false;
+    this.hardwareAvailability = new Map();
+    this.appliedLimits = new AppliedLimitsCache({
+      inspect: async (target) => {
+        const { stdout } = await execFileAsync(getRuntime(), ['container', 'inspect', target], { encoding: 'utf8', timeout: 5_000, maxBuffer: 1024 * 1024 });
+        const records = JSON.parse(stdout);
+        if (!Array.isArray(records) || records.length !== 1) throw new Error('ambiguous metrics identity');
+        return records[0];
+      },
+      readVerified: readAppliedObservation,
+    });
+    this.sampleTimer = null;
+    this.reconcileTimer = null;
+  }
+
+  // Observation starts explicitly (the Router at boot) or with the first
+  // subscriber, never on import: importing a module that reads the latest
+  // snapshot must not query the container engine or arm timers.
+  start() {
+    if (this.reconcileTimer) return this;
     void this.reconcile();
     this.sampleTimer = setInterval(() => void this.sample(), SAMPLE_INTERVAL_MS);
     this.reconcileTimer = setInterval(() => void this.reconcile(), RECONCILE_INTERVAL_MS);
     this.sampleTimer.unref?.();
     this.reconcileTimer.unref?.();
+    return this;
   }
+
+  get started() { return Boolean(this.reconcileTimer); }
 
   runningContainerNames() {
     return this.states
@@ -86,25 +139,79 @@ class WorkspaceMetricsMonitor extends EventEmitter {
   }
 
   async reconcile() {
-    if (this.reconcileInFlight) return;
+    if (this.reconcileInFlight) return this.reconcilePromise;
     this.reconcileInFlight = true;
+    const startedAt = Date.now();
+    this.reconcilePromise = this.runReconcile(startedAt);
+    return this.reconcilePromise;
+  }
+
+  // Resolves once a reconcile that STARTED strictly after `since` (epoch ms) has completed and published, or `boundMs` has passed. One
+  // already in flight that began earlier does not count: it may have read the engine before the change the caller made.
+  //
+  // It never occupies the event loop: every turn yields a macrotask (timers, I/O and the interval reconcile keep running), and after a
+  // reconcile that failed the next attempt waits RECONCILE_FAILURE_BACKOFF_MS instead of starting at once (a reconcile that fails before
+  // any I/O settles in microtasks, and would otherwise be repeated, and published, as fast as the CPU allows).
+  async reconcileAfter(since, boundMs = POST_APPLY_STATUS_WAIT_MS) {
+    const deadline = Date.now() + boundMs;
+    const waitFor = (promise, ms) => new Promise((resolve) => { const timer = setTimeout(resolve, ms); Promise.resolve(promise).finally(() => { clearTimeout(timer); resolve(); }); });
+    // At most this many reconciles are started for one wait, so the snapshot is published a bounded number of times.
+    const maxAttempts = 2 + Math.ceil(boundMs / RECONCILE_FAILURE_BACKOFF_MS); let attempts = 0;
+    const pause = (ms) => new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.min(ms, deadline - Date.now()))));
+    while (Date.now() < deadline) {
+      if (this.completedReconcileStartedAt > since) return { fresh: true };
+      const failedBefore = this.lastReconcileOk === false;
+      if (this.reconcileInFlight) await waitFor(this.reconcilePromise, Math.max(1, deadline - Date.now()));
+      else {
+        // The previous reconcile failed: let the interval or the backoff come before another attempt.
+        if (failedBefore || attempts >= maxAttempts) await pause(RECONCILE_FAILURE_BACKOFF_MS);
+        if (Date.now() >= deadline || this.completedReconcileStartedAt > since) continue;
+        if (attempts >= maxAttempts) continue;
+        attempts += 1;
+        await waitFor(this.reconcile(), Math.max(1, deadline - Date.now()));
+      }
+      await pause(0);
+    }
+    return { fresh: this.completedReconcileStartedAt > since };
+  }
+
+  async runReconcile(startedAt) {
+    let completed = false;
     try {
-      const registry = getAgentsRegistry() || {};
-      const states = await collectAgentRuntimeStatesAsync({ registry });
+      const registry = this.readRegistry() || {};
+      const states = await collectAgentRuntimeStatesAsync({ registry, ...this.runtimeStateOptions, collectContainers: this.liveCollector });
       this.states = applyRuntimeReadinessProjection(states, registry);
+      this.statesReadStartedAt = startedAt;
+      this.hardwareEnabled = this.readHardwareContext().gate === 'on';
+      if (this.hardwareEnabled) {
+        const routing = this.readRouting();
+        const storeProjections = this.readStoreProjections();
+        this.hardwareAvailability = new Map(this.states.map((entry) => [entry.containerName, metricHardwareAvailability(entry, registry[entry.containerName], routing, storeProjections)]));
+      }
+      if (this.hardwareEnabled) await this.appliedLimits.reconcile(this.states.map((entry) => ({
+        ...entry,
+        containerId: entry.containerId || entry.state?.containerId || '',
+        registryContainerId: registry[entry.containerName]?.containerId || '',
+        instanceId: registry[entry.containerName]?.instanceId,
+        enableGeneration: registry[entry.containerName]?.enableGeneration,
+      })));
+      completed = true;
     } catch (_) {
+      this.lastReconcileOk = false;
       this.publish();
       return;
     } finally {
       this.reconcileInFlight = false;
     }
+    this.lastReconcileOk = true;
     const names = this.runningContainerNames();
     const key = names.join('\0');
     if (key !== this.activeContainerKey) this.statsUnsupportedKey = '';
-    if (this.statsUnsupportedKey !== key && (key !== this.activeContainerKey || (!this.statsProcess && names.length))) {
+    if (this.containerStats && this.statsUnsupportedKey !== key && (key !== this.activeContainerKey || (!this.statsProcess && names.length))) {
       this.startContainerStats(names);
     }
     this.publish();
+    if (completed) this.completedReconcileStartedAt = startedAt;
   }
 
   async sample() {
@@ -149,6 +256,7 @@ class WorkspaceMetricsMonitor extends EventEmitter {
             available: true,
             cpuPercent: parsePercent(value.CPUPerc || value.CPU),
             memoryBytes: parseBytes(value.MemUsage || value.Mem),
+            ...(this.hardwareEnabled ? { memoryLimitBytes: parseMemoryUsage(value.MemUsage || value.Mem).memoryLimitBytes } : {}),
           });
         } catch (_) {}
       }
@@ -198,7 +306,18 @@ class WorkspaceMetricsMonitor extends EventEmitter {
           || unavailable;
       }
       if (['bwrap', 'seatbelt'].includes(entry.runtime) && entry.state?.running) metrics = this.hostMetrics.get(Number(entry.state.pid)) || unavailable;
-      return publicRuntimeEntry(entry, metrics);
+      const projected = publicRuntimeEntry(entry, metrics);
+      const limits = this.hardwareEnabled ? this.appliedLimits.values.get(entry.containerName) : null;
+      if (limits) {
+        projected.limits = limits;
+        projected.metrics = limitsUsage(metrics, limits);
+      }
+      const hardware = this.hardwareEnabled ? this.hardwareAvailability.get(entry.containerName) : null;
+      if (hardware) {
+        Object.assign(projected, hardware);
+        if (availabilityForcesNotReady(hardware.availability)) projected.state.ready = false;
+      }
+      return projected;
     });
     const total = runtimes.reduce((sum, entry) => ({
       cpuPercent: sum.cpuPercent + (entry.metrics.available ? entry.metrics.cpuPercent : 0),
@@ -207,6 +326,9 @@ class WorkspaceMetricsMonitor extends EventEmitter {
     this.latest = {
       ok: true,
       sampledAt: new Date().toISOString(),
+      // The last engine read failed: `runtimes` are those of the last read that succeeded, kept and not replaced by an empty set.
+      readFailed: this.lastReconcileOk === false,
+      readStartedAt: this.statesReadStartedAt ? new Date(this.statesReadStartedAt).toISOString() : null,
       router: { status: 'running', pid: process.pid, metrics: routerMetrics },
       runtimes,
       total,
@@ -215,6 +337,7 @@ class WorkspaceMetricsMonitor extends EventEmitter {
   }
 
   subscribe(listener) {
+    this.start();
     const safeListener = (snapshot) => {
       try { listener(snapshot); } catch (_) {}
     };

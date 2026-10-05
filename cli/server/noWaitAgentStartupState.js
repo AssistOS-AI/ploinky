@@ -14,6 +14,9 @@ import {
 } from '../commands/noWaitLogObserver.js';
 import { readAgentRegistrySnapshot } from '../utils/agentRegistrySnapshot.js';
 import { resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
+import { noWaitTerminalHardwareOutcome } from '../commands/noWaitProtocol.js';
+import { hardwareStartupResult } from './hardwareAvailability.mjs';
+import { validateHardwareOutcome } from '../sandbox/hardwareLimits/errors.mjs';
 
 const UNVERIFIED_RESULT = Object.freeze({ state: 'unverified' });
 const GENERATION_CHANGED_RESULT = Object.freeze({ state: 'generation_changed' });
@@ -41,6 +44,13 @@ function immutableRecordMatches(left, right) {
         && String(left.agentName || '') === String(right.agentName || '')
         && String(left.alias || '') === String(right.alias || '')
         && String(left.profile || '') === String(right.profile || '');
+}
+
+function slottedRun(plan, marker) {
+    const slot = plan?.lease?.effective?.slots instanceof Map
+        ? plan.lease.effective.slots.get(plan.routeKey)
+        : null;
+    return Boolean(slot && marker?.runId && slot.runId === marker.runId);
 }
 
 function commitCapturedLease(plan, commitLease) {
@@ -180,6 +190,19 @@ export function mapNoWaitObservationForMarketplace(observation, {
         };
     }
     if (observation.state === 'failed') {
+        let hardwareOutcome = null;
+        try {
+            hardwareOutcome = noWaitTerminalHardwareOutcome(observation.status, validateHardwareOutcome);
+        } catch (_) {
+            hardwareOutcome = null;
+        }
+        if (hardwareOutcome) {
+            return {
+                status: 'failed',
+                detail: summarizeFailure(observation.status),
+                hardwareOutcome,
+            };
+        }
         return {
             status: 'failed',
             detail: summarizeFailure(observation.status),
@@ -264,7 +287,23 @@ export function resolveNoWaitAgentStartupState(plan, {
     if (observation.state === 'starting') {
         return Object.freeze({ state: 'starting', queued: observation.queued === true });
     }
-    if (observation.state === 'failed') return STARTUP_FAILED_RESULT;
+    if (observation.state === 'failed') {
+        // A slotted run (the captured effective availability holds a slot of this
+        // route for this very run) never derives a hardware result from its status:
+        // the resolver is the only attribution rule, and a typed denial reaches the
+        // dispatcher as the plan's hardware entry before this observer runs. This
+        // feed lacks the resolver's own-pid, key and timestamp checks.
+        if (slottedRun(plan, marker)) return STARTUP_FAILED_RESULT;
+        // A refused or blocked background result is terminal and carries its
+        // non-secret reason and fix; any other failure stays opaque.
+        let hardwareOutcome = null;
+        try {
+            hardwareOutcome = noWaitTerminalHardwareOutcome(observation.status, validateHardwareOutcome);
+        } catch (_) {
+            return UNVERIFIED_RESULT;
+        }
+        return hardwareOutcome ? hardwareStartupResult(hardwareOutcome) : STARTUP_FAILED_RESULT;
+    }
     if (observation.state === 'running') {
         return publication.canPublishHttp
             ? GENERATION_CHANGED_RESULT

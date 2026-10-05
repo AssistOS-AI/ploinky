@@ -17,8 +17,35 @@ import {
     buildEffectivePolicy,
     canonicalize,
     emitRunArgs,
+    validateHardwareLimitsShape,
     validatePolicyShape,
 } from './docker/containerRuntimePolicy.js';
+import { HardwareLimitsError } from './hardwareLimits/errors.mjs';
+import {
+    declaredLayerPolicy,
+    hardwareDeclarationConflicts,
+    warnDeprecatedHardwareDeclarations,
+} from './hardwareLimits/declaredLimits.mjs';
+import {
+    buildDirectRefusal,
+    captureHardwareContext,
+    evaluateHardwareEligibility,
+    hasHardwareRequest,
+    requestedHardwareLimits,
+} from './hardwareLimits/requestedLimits.mjs';
+import {
+    AGENT_PLACEMENT,
+    LIMITS_HASH_LABEL,
+    declaredMemoryBytes,
+    limitsHash,
+    resolveStoredOverride,
+} from './hardwareLimits/resolve.mjs';
+import { verifyLaunchedHardwareLimits } from './hardwareLimits/delegation.mjs';
+import { parseAdmittedCpus, cpuMaxMatches } from './hardwareLimits/cpuQuota.mjs';
+import { engineCommandArgs } from './hardwareLimits/runtimeCommand.mjs';
+import { writeAppliedObservation } from './hardwareLimits/runtimeState.mjs';
+import { verifyMpsLaunch } from './hardwareLimits/mpsLaunch.mjs';
+import { verifyMpsRuntimeObservation } from './hardwareLimits/mpsRuntimeObservation.mjs';
 
 export const RUNTIME_CAPABILITY_POLICY_VERSION = 'ploinky-runtime-capabilities-v1';
 const ADMITTED_DESCRIPTORS = new WeakSet();
@@ -316,6 +343,7 @@ export function validateManifestRuntimeCapabilities(manifest, {
     rejectDirectCapabilityFields(manifest, path, context);
     const containerSecurity = validateContainerSecurityBlock(manifest.containerSecurity, context);
     validateLlmRuntimeBlock(manifest.llmRuntime, `${path}.llmRuntime`, context);
+    validateHardwareLimitsShape(manifest.hardwareLimits, `${path}.hardwareLimits`);
     validateVolumesBlock(manifest.volumes, `${path}.volumes`, context);
     for (const [profileName, profile] of profileEntries(manifest)) {
         if (!isPlainObject(profile)) {
@@ -339,6 +367,7 @@ export function validateManifestRuntimeCapabilities(manifest, {
             `${path}.profiles.${profileName}.llmRuntime`,
             { ...context, profileName },
         );
+        validateHardwareLimitsShape(profile.hardwareLimits, `${path}.profiles.${profileName}.hardwareLimits`);
         validateVolumesBlock(
             profile.volumes,
             `${path}.profiles.${profileName}.volumes`,
@@ -411,12 +440,21 @@ export function resolveEffectiveRuntimeCapabilities(manifest, {
         agentId,
         path: agentId ? `manifest(${agentId})` : 'manifest',
     });
-    let runtimePolicy = buildEffectivePolicy({
-        manifestPolicy: manifest?.llmRuntime?.runtimePolicy || null,
+    // The neutral hardwareLimits declaration joins its own layer (manifest or
+    // profile); the deprecated llmRuntime.runtimePolicy.resources keys are
+    // read in the same layer, so the effective policy does not depend on
+    // which field declared a value.
+    const policySources = {
+        manifestPolicy: declaredLayerPolicy(manifest, 'manifest.hardwareLimits'),
         catalogPolicy,
-        profilePolicy: profileConfig?.llmRuntime?.runtimePolicy || null,
+        profilePolicy: declaredLayerPolicy(profileConfig, 'profile.hardwareLimits'),
         overridePolicy,
-    }, { runtime });
+    };
+    let runtimePolicy = buildEffectivePolicy(policySources, { runtime });
+    // The exact memory/cpus/pidsLimit request and its declaring layer, kept
+    // whether or not llmRuntime.enabled is set (plan §8.1, R10).
+    const hardwareRequest = requestedHardwareLimits(policySources);
+    const declarationConflicts = hardwareDeclarationConflicts({ manifest, profileConfig, profileName });
     // `containerSecurity.shmSize` sizes the agent's own /dev/shm. The
     // operator's runtime policy wins: a size it sets, and host IPC, where a
     // size cannot apply (outside a Box; a Box refuses host IPC).
@@ -489,7 +527,48 @@ export function resolveEffectiveRuntimeCapabilities(manifest, {
     const gpuGrant = evaluateGpuGrant(gpuGrantContext, runtimePolicy, descriptor.agentId, { declared: declaresGpu });
     if (gpuGrant) descriptor.gpuGrant = canonicalize(gpuGrant);
     if (gpuAttach) descriptor.gpuAttach = canonicalize(gpuAttach);
+    // Present only when a hardware limit is requested, so the descriptors of
+    // every unlimited agent are unchanged.
+    if (hardwareRequest.length) descriptor.hardwareRequest = canonicalize(hardwareRequest);
+    // Present only for a conflicting declaration, which refuses the agent.
+    if (declarationConflicts.length) descriptor.hardwareDeclarationConflicts = canonicalize(declarationConflicts);
     return deepFreeze(descriptor);
+}
+
+function hardwareRefusalIdentity(descriptor, { instanceKey, alias }) {
+    return {
+        key: String(instanceKey || descriptor.agentId || ''),
+        ref: descriptor.agentId,
+        alias: alias ? String(alias) : null,
+    };
+}
+
+// Hardware eligibility for an admitted descriptor (plan §9.1). Strict
+// admission throws a typed refusal; metadata admission records it so graph
+// staging can continue for unrelated agents. Outside the hardware boundary
+// (a container outside a Box, or an internal helper) nothing is recorded.
+function admitHardwareEligibility(descriptor, {
+    context,
+    instanceKey,
+    alias,
+    helper,
+    overrideProblem = null,
+}) {
+    const eligibility = evaluateHardwareEligibility(descriptor, context, { helper, overrideProblem });
+    if (!eligibility.applicable) return null;
+    const refusal = eligibility.state === 'refused'
+        ? buildDirectRefusal({
+            ...hardwareRefusalIdentity(descriptor, { instanceKey, alias }),
+            refusalParts: eligibility.refusalParts,
+            inputFingerprint: eligibility.inputFingerprint,
+        })
+        : null;
+    return deepFreeze({
+        schema: 1,
+        state: eligibility.state,
+        inputFingerprint: eligibility.inputFingerprint,
+        refusal,
+    });
 }
 
 function unsupportedDimensions(descriptor, runtimeKind, box = false) {
@@ -576,7 +655,17 @@ export function admitManifestRuntimeCapabilities(manifest, {
     insideBox,
     gpuGrantOptions,
     workspaceRoot = PLOINKY_WORKSPACE_ROOT,
+    hardwareAdmission = 'strict',
+    hardwareContext,
+    instanceKey = '',
+    alias = '',
+    helper = false,
 } = {}) {
+    if (hardwareAdmission !== 'strict' && hardwareAdmission !== 'metadata') {
+        throw new RuntimeCapabilityError(`unsupported hardware admission mode '${hardwareAdmission}'`, {
+            code: 'PLOINKY_RUNTIME_INPUT_CHANGED',
+        });
+    }
     let exactManifest = manifest;
     if (manifestBytes !== undefined) {
         try {
@@ -599,7 +688,23 @@ export function admitManifestRuntimeCapabilities(manifest, {
         ? stableDigest(exactManifest)
         : manifestBytesDigest(manifestBytes);
     const boxContext = captureBoxContext({ boxMarkerOptions, insideBox });
-    const descriptor = resolveEffectiveRuntimeCapabilities(exactManifest, {
+    const hardwareFacts = captureHardwareContext({ insideBox: boxContext.insideBox, runtimeKind, hardwareContext });
+    // A stored administrator override is the final policy layer (plan §3
+    // Overrides): its fields replace the declared ones; unspecified fields keep
+    // their declared values.
+    let effectiveOverride = overridePolicy;
+    let overrideProblem = null;
+    let hardwareGpu = null;
+    const storedOverride = effectiveOverride === null && !helper && hardwareFacts.gate === 'on'
+        ? hardwareFacts.overrides.get(String(agentId || '')) || null
+        : null;
+    if (storedOverride) {
+        const resolved = resolveStoredOverride(storedOverride, hardwareFacts.envelope, { ref: String(agentId || 'REPO/AGENT'), gpu: hardwareFacts.gpu });
+        hardwareGpu = resolved.gpu || null;
+        if (resolved.problem) overrideProblem = resolved.problem;
+        else effectiveOverride = hardwareGpu ? { ...(resolved.policy || {}), devices: [{ type: 'cdi', value: BOX_GPU_CDI_DEVICE }] } : resolved.policy;
+    }
+    let descriptor = resolveEffectiveRuntimeCapabilities(exactManifest, {
         agentId,
         profileName,
         profileConfig,
@@ -607,7 +712,7 @@ export function admitManifestRuntimeCapabilities(manifest, {
         runtime,
         catalogPolicy,
         catalogIdentity,
-        overridePolicy,
+        overridePolicy: effectiveOverride,
         manifestDigest: exactDigest,
         workspaceRoot,
         boxContext,
@@ -617,11 +722,39 @@ export function admitManifestRuntimeCapabilities(manifest, {
             gpuGrantOptions,
         }),
     });
+    // Once per agent and process: the deprecated declaration path.
+    warnDeprecatedHardwareDeclarations(exactManifest, agentId);
+    if (hardwareGpu) descriptor = deepFreeze({ ...descriptor, hardwareGpu, hardwareRequest: [...(descriptor.hardwareRequest || []), { field: 'gpu', value: `${hardwareGpu.smPercent}/${hardwareGpu.vramPercent} percent`, source: 'settings' }] });
+    // Every non-hardware capability error stays strict in both modes.
     assertRuntimeCapabilitiesAllowed(descriptor, {
         runtimeKind,
         insideBox: boxContext.insideBox,
     });
-    ADMITTED_DESCRIPTORS.add(descriptor);
+    const hardwareEligibility = admitHardwareEligibility(descriptor, {
+        context: hardwareFacts,
+        instanceKey,
+        alias,
+        helper,
+        overrideProblem,
+    });
+    if (hardwareEligibility?.state === 'refused' && hardwareAdmission === 'strict') {
+        throw new HardwareLimitsError(hardwareEligibility.refusal);
+    }
+    const placement = hardwareEligibility?.state === 'eligible'
+        ? hardwarePlacementFor(descriptor, hardwareFacts, runtimeKind)
+        : null;
+    if (placement || storedOverride) {
+        descriptor = deepFreeze({
+            ...descriptor,
+            // The exact stored entry this admission used: a later change to
+            // this agent's own override makes the admission stale.
+            ...(storedOverride ? { hardwareOverride: canonicalize({ ...storedOverride }) } : {}),
+            ...(placement ? { hardwarePlacement: canonicalize(placement) } : {}),
+        });
+    }
+    // Only strict admission grants launch authority. A metadata descriptor can
+    // be checked for currentness but can never render runtime arguments.
+    if (hardwareAdmission === 'strict') ADMITTED_DESCRIPTORS.add(descriptor);
     return deepFreeze({
         schemaVersion: 1,
         manifestPath: String(manifestPath || ''),
@@ -630,6 +763,148 @@ export function admitManifestRuntimeCapabilities(manifest, {
         profileName: String(profileName || ''),
         runtimeKind,
         descriptor,
+        ...(hardwareEligibility ? { hardwareEligibility } : {}),
+    });
+}
+
+/**
+ * Prepared gate-on agents run under /ploinky/agents in a private cgroup
+ * namespace with enabled cgroups; the unlimited D4 combination (host network
+ * plus nestedPodman) and every unprepared Box keep the baseline argv.
+ */
+function hardwarePlacementFor(descriptor, context, runtimeKind) {
+    if (runtimeKind !== 'container' || context.gate !== 'on' || !context.prepared || !context.backendReady) return null;
+    const requested = Array.isArray(descriptor.hardwareRequest) ? descriptor.hardwareRequest : [];
+    if (descriptor.capabilities?.hostNetwork && descriptor.capabilities?.nestedPodman && !hasHardwareRequest(requested)) return null;
+    const resources = descriptor.runtimePolicy?.resources || {};
+    const resolved = {
+        // Canonical decimal: 0.5 and 0.50 are the same rendered quota.
+        cpus: resources.cpus === undefined ? null : (parseAdmittedCpus(String(resources.cpus)).canonical ?? String(Number(resources.cpus))),
+        memoryBytes: resources.memory === undefined ? null : declaredMemoryBytes(resources.memory),
+        pidsLimit: resources.pidsLimit === undefined ? null : Number(resources.pidsLimit),
+    };
+    return {
+        ...AGENT_PLACEMENT,
+        enginePrefix: ['--cgroup-manager=cgroupfs'],
+        hardSwap: true,
+        expected: resolved,
+        limitsHash: limitsHash({ resolved, placement: AGENT_PLACEMENT, hardSwap: true, gpu: descriptor.hardwareGpu || null }),
+    };
+}
+
+// The engine-level prefix for create/start/exec of a hardware-placed agent;
+// empty for every other invocation so its command form is unchanged.
+export function hardwareCommandPrefix(descriptor) {
+    const prefix = descriptor?.hardwarePlacement?.enginePrefix;
+    return Array.isArray(prefix) ? [...prefix] : [];
+}
+
+export function hardwareLimitsHashOf(descriptor) {
+    return String(descriptor?.hardwarePlacement?.limitsHash || '');
+}
+
+// The one limits-hash comparison shared by managed adoption, host/none reuse
+// and graph reuse: 'limitsHashChanged' when the runtime's label differs from
+// the admitted descriptor's hash (both empty without hardware placement).
+export function limitsHashReuseReason(descriptor, observedLabel) {
+    return hardwareLimitsHashOf(descriptor) === String(observedLabel || '') ? null : 'limitsHashChanged';
+}
+
+// The refusal recorded by a metadata admission, or null.
+export function hardwareRefusalOf(admission) {
+    return admission?.hardwareEligibility?.state === 'refused' ? admission.hardwareEligibility.refusal : null;
+}
+
+// The cpus value an applied record reports: the admitted canonical decimal when
+// the verified readback matches it, otherwise the observed ratio.
+function appliedCpus(expected, cpuMax) {
+    if (expected !== null && expected !== undefined && cpuMaxMatches(cpuMax.join(' '), expected)) return Number(expected);
+    return Number(cpuMax[0]) / Number(cpuMax[1]);
+}
+
+/**
+ * The hardware steps of one managed agent launch, in their required order
+ * (plan §8.1, §8.3): immediately before create, recheck the admission's
+ * hardware inputs and add the engine prefix; after create/start, read the
+ * actual leaf back (an observed mismatch is a typed refusal; a process that
+ * is not running is an ordinary failure) and recheck the inputs again before
+ * the candidate can be returned for route publication. The caller's existing
+ * catch removes the candidate through its exact ownership checks.
+ */
+export function createHardwareLaunchGuard(runtimeAdmission, {
+    key,
+    ref,
+    alias = null,
+    runtime = 'podman',
+    query,
+    hardwareContext,
+    fsApi,
+    cgroupRoot,
+    procRoot,
+    instanceId,
+    enableGeneration,
+    recordApplied = writeAppliedObservation,
+    observationKey = key,
+    mpsLaunch,
+    mpsVerification,
+} = {}) {
+    const descriptor = runtimeAdmission.descriptor;
+    const recheck = () => assertHardwareAdmissionCurrent(runtimeAdmission, { hardwareContext });
+    return Object.freeze({
+        createArgs(args) {
+            recheck();
+            return engineCommandArgs(hardwareCommandPrefix(descriptor), args);
+        },
+        commandPrefix() {
+            return hardwareCommandPrefix(descriptor);
+        },
+        // An adopted runtime is read back too: a leftover container carrying
+        // a matching limits-hash label is never proof that its leaf holds the
+        // admitted limits (plan §8.1: an inspect field alone is not proof).
+        afterLaunch({ containerId }) {
+            let readback = null;
+            if (descriptor.hardwarePlacement) {
+                readback = verifyLaunchedHardwareLimits({
+                    descriptor,
+                    containerId,
+                    runtime,
+                    query,
+                    ...(fsApi ? { fsApi } : {}),
+                    ...(cgroupRoot ? { cgroupRoot } : {}),
+                    ...(procRoot ? { procRoot } : {}),
+                    refuse: (detail, parts = null) => new HardwareLimitsError(buildDirectRefusal({
+                        key,
+                        ref,
+                        alias,
+                        refusalParts: {
+                            reasonCode: parts?.reasonCode || 'unprepared',
+                            reason: parts?.reason || `This Box is not prepared for hardware limits: ${detail}.`,
+                            fix: parts?.fix || 'On the host run ploinky limits status, repair the reported prerequisite, then ploinky restart.',
+                            requested: descriptor.hardwareRequest || [],
+                        },
+                        inputFingerprint: runtimeAdmission.hardwareEligibility?.inputFingerprint || '0'.repeat(64),
+                    })),
+                });
+            }
+            recheck();
+            const mps = descriptor.hardwareGpu ? verifyMpsLaunch(mpsLaunch, key, descriptor.hardwareGpu, mpsVerification) : null;
+            if (mps) verifyMpsRuntimeObservation({ containerId, imageId: mps.imageId, share: descriptor.hardwareGpu, state: mps.state, runtime, ...(query ? { query } : {}) });
+            if (readback && instanceId && enableGeneration) {
+                const cpu = String(readback.observed['cpu.max'] || '').split(/\s+/);
+                recordApplied({
+                    key: observationKey, containerId, instanceId, enableGeneration,
+                    limitsHash: descriptor.hardwarePlacement.limitsHash,
+                    // The admitted canonical value, never the engine's truncated
+                    // quota ratio (28999/100000 for 0.29); the raw observation
+                    // stays available as evidence.
+                    cpus: cpu.length === 2 && cpu[0] !== 'max' ? appliedCpus(descriptor.hardwarePlacement.expected?.cpus, cpu) : null,
+                    ...(cpu.length === 2 && cpu[0] !== 'max' ? { cpuMax: cpu.join(' ') } : {}),
+                    memoryBytes: readback.observed['memory.max'] && readback.observed['memory.max'] !== 'max' ? Number(readback.observed['memory.max']) : null,
+                    cgroupNamespace: readback.cgroupNamespace, leaf: readback.leaf,
+                    ...(mps ? { imageId: mps.imageId, gpuShare: descriptor.hardwareGpu, mpsGeneration: `${mps.state.daemonGeneration}:${mps.state.configurationGeneration}` } : {}),
+                });
+            }
+        },
     });
 }
 
@@ -640,6 +915,7 @@ export function assertRuntimeAdmissionCurrent(admission, {
     descriptor,
     boxMarkerOptions,
     gpuGrantOptions,
+    hardwareContext,
 } = {}) {
     if (!admission || admission.schemaVersion !== 1 || !admission.descriptor) {
         throw new RuntimeCapabilityError('runtime admission is missing or invalid', {
@@ -703,6 +979,46 @@ export function assertRuntimeAdmissionCurrent(admission, {
             });
         }
     }
+    assertHardwareAdmissionCurrent(admission, { hardwareContext });
+    return admission;
+}
+
+/**
+ * The hardware part of currentness, rechecked immediately before create and
+ * again before a launched candidate can be published. A refused record is as
+ * current-checkable as an eligible one: any change to the hardware inputs
+ * (gate, preparation, controllers, this agent's stored entry or the request
+ * itself) makes the admission stale. Another agent's policy revision does not.
+ */
+export function assertHardwareAdmissionCurrent(admission, { hardwareContext } = {}) {
+    const admittedHardware = admission?.hardwareEligibility;
+    if (admittedHardware) {
+        const freshContext = captureHardwareContext({
+            insideBox: admission.descriptor.boxContext?.insideBox === true,
+            runtimeKind: admission.runtimeKind,
+            hardwareContext,
+        });
+        const freshOverride = freshContext.gate === 'on' ? freshContext.overrides.get(admission.descriptor.agentId) || null : null;
+        // Recompute the admission's override problem from the same inputs so a
+        // refused over-envelope entry stays current while nothing changed.
+        const overrideProblem = freshOverride
+            ? resolveStoredOverride(freshOverride, freshContext.envelope, { ref: String(admission.descriptor.agentId || 'REPO/AGENT'), gpu: freshContext.gpu }).problem
+            : null;
+        const current = evaluateHardwareEligibility(admission.descriptor, freshContext, { overrideProblem });
+        const admittedOverride = admission.descriptor.hardwareOverride || null;
+        if (stableDigest(freshOverride ? canonicalize({ ...freshOverride }) : null) !== stableDigest(admittedOverride)) {
+            throw new RuntimeCapabilityError('this agent\'s stored hardware limits changed after admission', {
+                code: 'PLOINKY_RUNTIME_INPUT_CHANGED',
+                context: { agentId: admission.agentId },
+            });
+        }
+        if (!current.applicable || current.inputFingerprint !== admittedHardware.inputFingerprint) {
+            throw new RuntimeCapabilityError('hardware-limit inputs changed after admission', {
+                code: 'PLOINKY_RUNTIME_INPUT_CHANGED',
+                context: { agentId: admission.agentId },
+            });
+        }
+    }
     return admission;
 }
 
@@ -733,6 +1049,19 @@ export function renderRuntimePolicyArgs(descriptor, { runtime } = {}) {
         });
     }
     const args = emitRunArgs(descriptor.runtimePolicy, { runtime });
+    const placement = descriptor.hardwarePlacement;
+    if (placement) {
+        // Every rendered agent memory limit has an equal memory-and-swap
+        // limit so swap cannot extend the cap (leaf memory.swap.max = 0).
+        const memoryIndex = args.indexOf('--memory');
+        if (memoryIndex >= 0) args.splice(memoryIndex + 2, 0, '--memory-swap', args[memoryIndex + 1]);
+        args.push(
+            `--cgroups=${placement.cgroups}`,
+            `--cgroupns=${placement.cgroupns}`,
+            `--cgroup-parent=${placement.cgroupParent}`,
+            '--label', `${LIMITS_HASH_LABEL}=${placement.limitsHash}`,
+        );
+    }
     // A manifest-declared GPU agent learns whether it got the device and, if
     // not, what to run on the host (D14).
     if (descriptor.gpuAttach) {

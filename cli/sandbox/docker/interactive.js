@@ -6,7 +6,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { getExposedNames, getManifestEnvNames, formatEnvFlag } from '../../utils/security/secretVars.js';
 import { debugLog } from '../../utils/utils.js';
-import { getActiveProfile, getProfileConfig } from '../../utils/runtime/profileService.js';
+import { getActiveProfile, getProfileConfig, resolveManifestRuntimeProfile } from '../../utils/runtime/profileService.js';
 import {
     CONTAINER_CONFIG_PATH,
     PLOINKY_MANAGED_LABEL,
@@ -43,6 +43,9 @@ import {
     agentLibGrant,
     agentLibGrantEnv,
 } from '../agentLibGrant.js';
+import { isInsideBox } from '../../../ploinky-box/lib/boxMarker.mjs';
+import { HardwareLimitsError } from '../hardwareLimits/errors.mjs';
+import { captureHardwareContext, interactiveHardwareRefusal } from '../hardwareLimits/requestedLimits.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -175,9 +178,33 @@ function buildInteractiveAgentCreateCommand({
     ]);
 }
 
+// The profile managed admission resolves for this agent (the active profile
+// merged over the default, hardware-limit keys included), so the interactive
+// guard refuses exactly the declarations admission refuses.
+export function resolveInteractiveProfileConfig(manifest, { agentName, repoName } = {}) {
+    return resolveManifestRuntimeProfile(manifest, { agentName: `${repoName}/${agentName}` }).profileConfig;
+}
+
+// Refuse requested or stored hardware limits before reuse or create: an
+// interactive container is outside the managed, hardware-placed lifecycle.
+export function assertInteractiveHardwareLimitsAbsent(manifest, {
+    agentName, repoName, containerName, profileConfig = null, insideBox = isInsideBox(), hardwareContext,
+}) {
+    const refusal = interactiveHardwareRefusal({
+        manifest,
+        profileConfig,
+        ref: `${repoName}/${agentName}`,
+        key: containerName,
+        context: captureHardwareContext({ insideBox, runtimeKind: 'container', hardwareContext }),
+    });
+    if (refusal) throw new HardwareLimitsError(refusal);
+}
+
 function runCommandInContainer(agentName, repoName, manifest, command, interactive = false) {
-    const runtime = getRuntime();
     const containerName = getAgentContainerName(agentName, repoName);
+    assertInteractiveHardwareLimitsAbsent(manifest, { agentName, repoName, containerName,
+        profileConfig: resolveInteractiveProfileConfig(manifest, { agentName, repoName }) });
+    const runtime = getRuntime();
     let agents = loadAgentsMap();
     const projectDir = getConfiguredProjectPath(agentName, repoName);
     const homeDir = getAgentWorkDir(agentName);
@@ -402,6 +429,8 @@ function ensureAgentContainer(agentName, repoName, manifest) {
     const profileConfig = hasProfileConfig
         ? getProfileConfig(`${repoName}/${agentName}`, activeProfile)
         : null;
+    assertInteractiveHardwareLimitsAbsent(manifest, { agentName, repoName, containerName,
+        profileConfig: resolveInteractiveProfileConfig(manifest, { agentName, repoName }) });
 
     if (containerExists(containerName)) {
         const desired = computeEnvHash(manifest, profileConfig, {}, { agentName, repoName });

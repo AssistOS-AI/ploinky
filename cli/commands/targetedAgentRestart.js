@@ -216,6 +216,7 @@ export async function commitTargetedAgentRestart({
       ...(alias ? { alias } : {}),
     }, { hostPort: result.hostPort || 0 });
     delete restored.draining;
+    delete restored.hardwareAvailability;
     routing.routes[transition.routeKey] = restored;
     return routing;
   }, {

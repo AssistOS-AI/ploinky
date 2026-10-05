@@ -162,8 +162,9 @@ export function assertLinuxHostPrerequisites({
     if (host.security?.rootless !== true) add('Rootless Podman', 'The selected engine is not rootless.', 'Use a regular login account and run podman info without sudo.');
     if (host.serviceIsRemote !== false || host.os !== 'linux') add('Native Podman', 'The selected engine is not a verified local Linux engine.', 'Select a native Linux Podman installation; remote connections are unsupported for this workspace.');
     if (host.security?.seccompEnabled !== true) add('Seccomp', 'Podman does not report seccomp support.', 'Install the distribution Podman and OCI runtime packages with seccomp support enabled.');
-    // The Box runs nested Podman with cgroups disabled and sets no outer CPU
-    // quota. Host cgroup versions and controller delegation are not prerequisites.
+    // Default Box startup does not require delegated resource controllers.
+    // Hardware-enabled execution checks cgroup/runtime prerequisites separately;
+    // admission refuses each limit that the selected backend cannot enforce.
 
     const requireSelectedBinary = (label, selected, packages) => {
         if (typeof selected !== 'string' || !path.isAbsolute(selected) || !executable(fsApi, selected)) {
