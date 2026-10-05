@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { AcceptanceError, LIMITS, need, parseStrictJson, boxName, smokeOrigin } from './manifest_codex.mjs';
 import { gpuWiringIdentityOf } from './engine_codex.mjs';
+import { RELEASE_GENERATIONS } from './contracts_codex.mjs';
 import { runOwnedCommand, buildCommandEnvironment } from './host_command_codex.mjs';
 import { readBoundedRegularFile } from './worker_codex.mjs';
 
@@ -20,6 +21,12 @@ const PASSTHROUGH = Object.freeze(['SMOKE_USERNAME', 'SMOKE_PASSWORD', 'SMOKE_LO
     'SMOKE_SECONDARY_TOTP_SECRET', 'SMOKE_AUTH_AGENT', 'SMOKE_WEBCHAT_AGENT', 'SMOKE_DPU_DATA_ROOT']);
 const REPORT_BYTES = LIMITS.readBytes;
 
+// CA-2: the Box-age work still to run is counted inside the gate's own generation, never across the generation change.
+export const remainingGenerationWorkMs = (generationId, fromGate) => {
+    const generation = RELEASE_GENERATIONS.find(row => row.id === generationId), index = generation?.gates.indexOf(fromGate) ?? -1;
+    need(index >= 0, 'gate-unknown');
+    return generation.gates.slice(index).reduce((sum, name) => sum + GATE_SPECS[name].budgetMs + GATE_WRAPPER_ALLOWANCE_MS, 0);
+};
 export const remainingGateWorkMs = names => names.reduce((sum, name) => sum + GATE_SPECS[name].budgetMs + GATE_WRAPPER_ALLOWANCE_MS, 0);
 
 // The Box contract the repository's own smoke checks need, bound to the manifest of the Box the gate runs against.
