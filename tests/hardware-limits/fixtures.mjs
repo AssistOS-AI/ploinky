@@ -376,6 +376,7 @@ export function buildRequiredCaseManifest() {
         ]),
         ...leaves(P, 'p0', unit('hardwareAvailabilityObservers.test.mjs'), [
             'NW1.S-observers-and-transports-agree-in-typed-and-generic-cases',
+            'NW1.S-an-unreadable-or-invalid-store-is-reported-by-admin-and-readiness-never-as-no-denials',
         ]),
         ...leaves(P, 'p0', unit('hardwareAvailabilityEvidenceProbe.test.mjs'), [
             'NW1.S-durable-activation-is-proved-without-http-against-the-named-generation',
@@ -390,6 +391,7 @@ export function buildRequiredCaseManifest() {
                 'm17-a-post-rename-fsync-failure-rolls-back', 'm23-the-revision-includes-a-write-time',
                 'm28-a-witness-without-its-directory-is-read-as-absent', 'm33-the-witness-is-written-before-the-directory-rename',
                 'm34-a-missing-witness-beside-a-valid-store-is-unreadable',
+                'ms53-an-unreadable-store-projects-no-denial-to-admin-and-readiness',
                 'ms52a-a-skipped-directory-fsync-is-credited-as-durable', 'ms52b-the-probe-credits-a-skipped-directory-fsync',
                 'ms51a-the-apply-lock-assertion-need-not-be-a-function', 'ms51b-the-apply-lock-assertion-is-never-called', 'ms51c-the-apply-lock-assertions-throw-is-swallowed',
                 'ms51d-the-apply-lock-is-not-bound-to-the-store-paths',

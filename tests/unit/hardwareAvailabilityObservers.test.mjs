@@ -4,6 +4,7 @@
 // Real workspace, real edge generations, real durable store, real route plans
 // and dispatcher; statuses are written by the real worker writer.
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import test from 'node:test';
 
 import { dispatchAgentStartupAfterRouterSurfaces } from '../../cli/server/agentStartupDispatch.js';
@@ -337,3 +338,49 @@ async function slottedForgeries(t) {
         assert.deepEqual([control.state, control.code], ['unavailable', 'hardware_refused'], `${label}: non-slotted control`);
     }
 }
+
+// An unreadable or invalid store is not "no denials": the Router refuses to capture a lease then, so the administrator
+// view and the readiness must show it, and no agent may be reported ready. A store that was never created is empty.
+test('NW1.S-an-unreadable-or-invalid-store-is-reported-by-admin-and-readiness-never-as-no-denials', async (t) => {
+    quiet(t);
+    const arrangements = {
+        'a corrupt policy file': (world) => fs.writeFileSync(world.paths.availabilityPolicyFile, '{ this is not json'),
+        'a missing policy file in an existing store directory': (world) => fs.rmSync(world.paths.availabilityPolicyFile),
+        'a missing store directory beside its witness': (world) => fs.rmSync(world.paths.availabilityStoreDir, { recursive: true }),
+        'an invalid witness': (world) => fs.writeFileSync(world.paths.availabilityWitnessFile, '{ this is not json'),
+    };
+    // The control: an initialized, empty store has no denials and every agent is ready.
+    {
+        const world = makeWorld(t);
+        assert.equal(readStoreAvailabilityProjections(world.options).size, 0);
+        for (const routeKey of ['alpha', 'beta', 'gamma']) assert.equal(observerState(world, routeKey).readyForced, false, routeKey);
+    }
+    for (const [label, arrange] of Object.entries(arrangements)) {
+        const world = makeWorld(t);
+        arrange(world);
+        assert.throws(() => world.lease(), { code: 'HARDWARE_AVAILABILITY_POLICY_UNREADABLE' }, `${label}: the Router cannot capture a lease`);
+        const projections = readStoreAvailabilityProjections(world.options);
+        assert.ok(projections instanceof Map, `${label}: a projection set, not null`);
+        for (const routeKey of ['alpha', 'beta', 'gamma']) {
+            const key = containerOf(routeKey);
+            const state = observerState(world, routeKey);
+            assert.equal(state.readiness.availability, 'refused', `${label}: readiness of ${routeKey}`);
+            assert.equal(state.readyForced, true, `${label}: ${routeKey} is not ready`);
+            const admin = await adminAgent(world, routeKey);
+            assert.equal(admin.availability, 'refused', `${label}: admin of ${routeKey}`);
+            assert.equal(admin.problem.reasonCode, 'store_unreadable', label);
+            assert.match(admin.problem.reason, /availability store cannot be read safely/, label);
+            assert.equal(projections.get(key).key, key);
+            assert.doesNotMatch(JSON.stringify(projections.get(key)), /this is not json|\/hardware-availability/, `${label}: no file path or content is disclosed`);
+        }
+    }
+    // A store that was never created (witness and directory both absent) is empty, as in the store's own reader.
+    {
+        const world = makeWorld(t);
+        fs.rmSync(world.paths.availabilityWitnessFile);
+        fs.rmSync(world.paths.availabilityStoreDir, { recursive: true });
+        assert.equal(world.store().state, 'absent');
+        assert.equal(readStoreAvailabilityProjections(world.options).size, 0);
+        assert.equal(observerState(world, 'alpha').readyForced, false);
+    }
+});

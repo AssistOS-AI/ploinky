@@ -30,6 +30,7 @@ const RESOLVER_TEST = 'tests/unit/hardwareAvailabilityResolver.test.mjs';
 const LEASES_TEST = 'tests/unit/hardwareAvailabilityLeases.test.mjs';
 const OBSERVERS_TEST = 'tests/unit/hardwareAvailabilityObservers.test.mjs';
 const OBSERVER = 'cli/server/noWaitAgentStartupState.js';
+const PROJECTIONS = 'cli/server/hardwareAvailabilityProjections.mjs';
 const PROBE = 'tests/unit/hardwareAvailabilityEvidenceProbe.mjs';
 const PROBE_TEST = 'tests/unit/hardwareAvailabilityEvidenceProbe.test.mjs';
 const REVISION = '        revision: computeEffectiveRevision(denials),\n';
@@ -164,6 +165,10 @@ export const AVAILABILITY_MUTANTS = Object.freeze({
     'ms52b-the-probe-credits-a-skipped-directory-fsync': { name: 'ms52b-the-probe-credits-a-skipped-directory-fsync', file: PROBE,
         kill: kill(PROBE_TEST, 'NW1\\.S-durable-activation-is-proved'),
         patches: [{ from: 'durable: !durabilityError && !durabilitySkipped && Number.isFinite', to: 'durable: !durabilityError && Number.isFinite' }] },
+    // The projection reader fails open again: an unreadable store shows admin and readiness no denial while the Router refuses.
+    'ms53-an-unreadable-store-projects-no-denial-to-admin-and-readiness': { name: 'ms53-an-unreadable-store-projects-no-denial-to-admin-and-readiness', file: PROJECTIONS,
+        kill: kill(OBSERVERS_TEST, 'NW1\\.S-an-unreadable-or-invalid-store-is-reported'),
+        patches: [{ from: '        return storeUnreadableProjections(active.generation);', to: '        return null;' }] },
     // The apply-lock guard of every store mutation: its typeof check, its call, and its throw.
     'ms51a-the-apply-lock-assertion-need-not-be-a-function': { name: 'ms51a-the-apply-lock-assertion-need-not-be-a-function', file: STORE,
         kill: kill(STORE_TEST, 'NW1\\.D1-every-mutation-refuses-with-zero-bytes'),
