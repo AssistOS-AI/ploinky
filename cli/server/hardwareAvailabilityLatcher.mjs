@@ -83,6 +83,7 @@ export function createHardwareAvailabilityLatcher({
         applyLock: withEdgeGenerationApplyLock,
     },
     hooks = {},
+    planner,
 } = {}) {
     const edgeOptions = { workspaceRoot };
     const cache = createHardwareAvailabilityResolverCache();
@@ -216,8 +217,9 @@ export function createHardwareAvailabilityLatcher({
                         workspaceRoot,
                         applyLockCapability,
                         ...(runningDir ? { runningDir } : {}),
-                        log,
+                        log: (type, data) => log(type, { ...data, recovery: true }),
                         cache,
+                        ...(planner ? { plan: planner } : {}),
                         commit: (args) => {
                             try {
                                 return commitHardwareAvailabilityPolicy({
@@ -252,7 +254,7 @@ export function createHardwareAvailabilityLatcher({
                 return { outcome: 'unchanged' };
             }
             blockedUntil = 0;
-            logResolutions({ plan: committed.plan, store, durability });
+            logResolutions({ plan: committed.plan, store: committed.store, durability });
             return { outcome: 'committed', resolutions: committed.plan.resolutions, revision: committed.result.revision };
         } catch (error) {
             return fail(error);

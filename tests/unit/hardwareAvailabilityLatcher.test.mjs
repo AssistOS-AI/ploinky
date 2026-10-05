@@ -16,6 +16,7 @@ import { performance } from 'node:perf_hooks';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { prepareAdditiveEdgeRoutingGeneration, withEdgeGenerationApplyLock } from '../../cli/sandbox/edgeGeneration.js';
+import { planNoWaitAvailabilitySlots } from '../../cli/commands/noWaitAvailabilitySlots.js';
 import { createHardwareAvailabilityLatcher } from '../../cli/server/hardwareAvailabilityLatcher.mjs';
 import { createHardwareAvailabilityResolverCache } from '../../cli/server/hardwareAvailabilityResolver.mjs';
 import { applyPatches } from '../hardware-limits/c5Mutation.mjs';
@@ -210,6 +211,8 @@ test('NW1.S-the-latcher-resolves-terminal-slots-fail-fast-in-one-rename-with-fen
         assert.equal(probe.latcher.attempt().outcome, 'committed');
         assert.deepEqual(Object.keys(world.store().slots).sort(), ['alpha', 'delta', 'epsilon', 'gamma', 'zeta'], 'only the succeeded run was resolved');
         assert.deepEqual(Object.keys(world.store().entries), [], 'and nothing was latched');
+        const retired = probe.logs.find((line) => line.type === LATCHED && line.routeKey === 'eta');
+        assert.deepEqual([retired.resolution, retired.key, retired.runStartedAtMs, retired.recovery], ['retired', containerOf('eta'), RUN_STARTED_AT_MS, true], 'a retired slot is logged with its identity');
     }
 
     // ---- every busy lock defers, never fails, never stops the latcher
@@ -308,15 +311,32 @@ test('NW1.S-the-latcher-resolves-terminal-slots-fail-fast-in-one-rename-with-fen
         assert.equal(probe.calls.length, count, 'a stopped latcher ignores signals');
     }
 
+    // ---- the resolve invariant: an aborted plan keeps the state and its log line is labelled as recovery too
+    {
+        const world = makeWorld(t);
+        terminalAlpha(world);
+        const bytes = policyBytes(world);
+        const logs = [];
+        const dropsTheDenial = (input) => ({ ...planNoWaitAvailabilitySlots(input), resolved: { entries: {}, slots: {} } });
+        const latcher = createHardwareAvailabilityLatcher({
+            workspaceRoot: world.root, runningDir: world.runningDir, log: (type, data) => logs.push({ type, ...data }), planner: dropsTheDenial,
+            locks: { createLease: () => ({}), releaseLease: () => true, runWithLease: (lease, fn) => fn(), networkLock: (callback) => callback({}), applyLock: withEdgeGenerationApplyLock },
+        });
+        assert.equal(latcher.attempt().outcome, 'failed');
+        assert.equal(policyBytes(world), bytes, 'nothing was committed');
+        const aborted = logs.find((line) => line.type === 'hardware_availability_resolve_aborted');
+        assert.ok(aborted, 'the abort is logged');
+        assert.equal(aborted.recovery, true, 'and labelled as recovery');
+    }
+
     // ---- bounds: 256 slots in one commit, in scheduled synchronous sections that each stay within 200 ms
     {
         const names = Array.from({ length: 256 }, (_, index) => `r${String(index).padStart(3, '0')}`);
         const world = makeWorld(t, { routes: Object.fromEntries(names.map((name) => [name, {}])) });
-        // Each synchronous section the latcher schedules (the unlocked read and evaluation, then the locked commit) is
-        // measured, and a heartbeat watches the event loop while they run. The gate is the CPU time of the longest
-        // section: on a shared machine the wall-clock gap of a unit test follows the machine's load, while the work a
-        // section does does not. A run is measured up to three times and passes with its best, so a transient load spike
-        // does not fail it while a section that really is too long fails all three. The wall gap is reported every time.
+        // A heartbeat watches the event loop while the latcher resolves 256 slots, and the gate is its largest gap
+        // (wall clock, so a blocking wait inside the locked commit is seen as well as CPU work). Each scheduled
+        // synchronous section is also measured; its CPU time is reported only. A run is measured up to three times and
+        // passes with its best, so a transient load spike does not fail it while a gap that really is too long fails all three.
         const measurements = [];
         for (let round = 0; round < 3; round += 1) {
             world.commitStore({ entries: {}, slots: Object.fromEntries(names.map((name) => [name, slotFor(name, { key: containerOf(name), runStartedAtMs: RUN_STARTED_AT_MS })])) });
@@ -347,10 +367,10 @@ test('NW1.S-the-latcher-resolves-terminal-slots-fail-fast-in-one-rename-with-fen
                 wallMs: Math.max(...sections.map((section) => section.wallMs)),
                 gapMs,
             });
-            if (measurements.at(-1).cpuMs <= 200) break;
+            if (measurements.at(-1).gapMs <= 200) break;
         }
-        t.diagnostic(`256 slots: ${measurements.map((m) => `longest section ${m.cpuMs.toFixed(1)} ms CPU / ${m.wallMs.toFixed(1)} ms wall, heartbeat gap ${m.gapMs.toFixed(1)} ms`).join('; ')}; load average ${os.loadavg()[0].toFixed(1)} on ${os.cpus().length} CPUs`);
-        assert.ok(measurements.some((m) => m.cpuMs <= 200), `every 256-slot run had a synchronous section over 200 ms of CPU: ${measurements.map((m) => m.cpuMs.toFixed(1)).join(', ')}`);
+        t.diagnostic(`256 slots: ${measurements.map((m) => `longest section ${m.cpuMs.toFixed(1)} ms CPU / ${m.wallMs.toFixed(1)} ms wall, heartbeat gap ${m.gapMs.toFixed(1)} ms (gated)`).join('; ')}; load average ${os.loadavg()[0].toFixed(1)} on ${os.cpus().length} CPUs`);
+        assert.ok(measurements.some((m) => m.gapMs <= 200), `every 256-slot run blocked the event loop for more than 200 ms (heartbeat gaps ${measurements.map((m) => m.gapMs.toFixed(1)).join(', ')} ms)`);
     }
 
     // ---- the same fail-fast behavior with the REAL workspace lease, network lock and apply lock

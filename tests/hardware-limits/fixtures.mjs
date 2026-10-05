@@ -460,6 +460,7 @@ export function buildRequiredCaseManifest() {
                 'ms35b-the-latcher-stop-is-not-the-first-statement-of-before-close',
                 'ms42-a-latcher-attempt-runs-inline-inside-a-capture', 'ms43-recovery-required-or-network-busy-stops-the-latcher',
                 'ms63-a-scheduled-attempt-inherits-the-signalling-captures-context',
+                'ms65-the-locked-commit-blocks-the-event-loop-with-a-wait',
                 'ms64-the-shell-lifecycle-runs-without-the-workspace-lease',
             ].map((name) => `NW1M.${name}-is-killed-by-the-leaf-that-guards-it-never-by-a-setup-failure`),
             'NW1M.every-patch-text-matches-the-real-source-exactly-once-and-an-unmatched-patch-is-not-a-kill',

@@ -302,6 +302,9 @@ export const AVAILABILITY_MUTANTS = Object.freeze({
     'ms63-a-scheduled-attempt-inherits-the-signalling-captures-context': latcherMutant('ms63-a-scheduled-attempt-inherits-the-signalling-captures-context', [
         { from: '        timer = origin.runInAsyncScope(() => timers.setTimeout(() => {\n            timer = null;\n            runScheduled();\n        }, delayMs));', to: '        timer = timers.setTimeout(() => {\n            timer = null;\n            runScheduled();\n        }, delayMs);' },
         { from: '            lockedTimer = origin.runInAsyncScope(() => timers.setTimeout(() => {\n                lockedTimer = null;\n                if (started) lockedAttempt(store);\n            }, 0));', to: '            lockedTimer = timers.setTimeout(() => {\n                lockedTimer = null;\n                if (started) lockedAttempt(store);\n            }, 0);' }]),
+    // A blocking wait inside the locked commit blocks the event loop without using CPU: only the wall-clock gap sees it.
+    'ms65-the-locked-commit-blocks-the-event-loop-with-a-wait': latcherMutant('ms65-the-locked-commit-blocks-the-event-loop-with-a-wait', [
+        { from: '                        commit: (args) => {\n                            try {', to: '                        commit: (args) => {\n                            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400);\n                            try {' }]),
     // `ploinky shell` activates a prepared runtime: its lifecycle work needs the workspace lease the retirement asserts.
     'ms64-the-shell-lifecycle-runs-without-the-workspace-lease': { name: 'ms64-the-shell-lifecycle-runs-without-the-workspace-lease', file: START,
         kill: kill(WIRING_TEST, 'NW1\\.S-shell-activation-retires'),

@@ -207,7 +207,7 @@ export function commitNoWaitAvailabilitySlotPlan({
             ...(fsApi ? { fsApi } : {}),
         })
         : { committed: false, revision: store.revision };
-    return { plan, result, effectiveRevision: { before: evaluation.revision, after: after.revision } };
+    return { plan, result, store, effectiveRevision: { before: evaluation.revision, after: after.revision } };
 }
 
 /**
