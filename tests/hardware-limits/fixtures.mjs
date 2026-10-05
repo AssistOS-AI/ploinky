@@ -368,6 +368,16 @@ export function buildRequiredCaseManifest() {
             'NW1.S-entries-apply-only-to-current-target-less-routes-and-yield-to-a-newer-applicable-slot',
             'NW1.S-visible-but-not-durable-evidence-activates',
         ]),
+        ...leaves(P, 'p0', unit('hardwareAvailabilityLeases.test.mjs'), [
+            'NW1.S-both-lease-families-capture-and-fence-the-effective-revision',
+            'NW1.S-inactive-selector-applies-the-activation-at-the-first-capture-after-reactivation',
+        ]),
+        ...leaves(P, 'p0', unit('hardwareAvailabilityObservers.test.mjs'), [
+            'NW1.S-observers-and-transports-agree-in-typed-and-generic-cases',
+        ]),
+        ...leaves(P, 'p0', unit('hardwareAvailabilityEvidenceProbe.test.mjs'), [
+            'NW1.S-durable-activation-is-proved-without-http-against-the-named-generation',
+        ]),
         ...leaves(P, 'p0', unit('hardwareAvailabilityMutants.test.mjs'), [
             ...[
                 'm1a-the-temp-fsync-is-dropped-from-durable-failed-writes', 'm1b-the-directory-fsync-is-dropped-from-durable-failed-writes',
@@ -394,6 +404,13 @@ export function buildRequiredCaseManifest() {
                 'ms28-an-unlatched-activation-keeps-its-denial-after-its-status-disappears',
                 'ms33-a-non-active-own-pid-class-yields-a-denial',
                 'ms38-a-slot-without-a-validated-outcome-yields-a-hardware-coded-denial',
+                'ms7-the-effective-revision-omits-activations',
+                'ms8-the-effective-revision-includes-non-denial-classes',
+                'ms44-durability-is-credited-at-the-rename-despite-a-failed-fsync',
+                'ms45-the-evidence-probe-evaluates-a-different-generation-than-the-selector-names',
+                'ms46-the-observer-derives-a-hardware-result-from-a-slotted-runs-status',
+                'ms50a-the-probe-credits-an-observation-outside-the-window',
+                'ms50b-the-probe-skips-the-ctime-cross-check',
             ].map((name) => `NW1M.${name}-is-killed-by-the-leaf-that-guards-it-never-by-a-setup-failure`),
             'NW1M.every-patch-text-matches-the-real-source-exactly-once-and-an-unmatched-patch-is-not-a-kill',
         ]),

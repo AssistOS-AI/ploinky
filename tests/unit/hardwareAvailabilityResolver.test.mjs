@@ -26,6 +26,7 @@ import {
     entryFor,
     makeWorld,
     refusalOutcome,
+    runProbeSync,
     uuid,
 } from './hardwareAvailabilityResolverFixtures.mjs';
 
@@ -121,6 +122,23 @@ test('NW1.S-activation-is-the-run-scoped-rename', (t) => {
     assert.equal(after.projection.observedAt, new Date(finishedAtMs).toISOString(), 'observedAt is the validated finish time');
     assert.ok(report.visibleAtMs - report.finishedAtMs < 5000, `T_vis - T_f = ${report.visibleAtMs - report.finishedAtMs} ms`);
     assert.ok(report.durableAtMs >= report.visibleAtMs);
+    // The cross-process half: another process, with no lease and no HTTP, reads the typed denial with its cause fields after the rename.
+    const probeOptions = { workspaceRoot: world.root, routeKey: 'alpha', pollIntervalMs: 20, deadlineMs: 5000, routerPid: process.pid };
+    const seen = runProbeSync(probeOptions);
+    assert.notEqual(seen.pid, process.pid, 'read from another process');
+    assert.equal(seen.observed, true);
+    assert.equal(seen.evaluation.slot.evidenceClass, 'active');
+    assertTypedFrom(seen.evaluation.denial, outcome);
+    assert.equal(seen.admin.code, outcome.code);
+    assert.equal(seen.admin.cause, outcome.reason);
+    assert.equal(seen.readiness.ready, false);
+    // ... and before the rename it saw none: a run staged but not yet activated (nothing written) yields no denial from another process either.
+    const quietWorld = makeWorld(t);
+    quietWorld.stageSlot('alpha');
+    const unseen = runProbeSync({ ...probeOptions, workspaceRoot: quietWorld.root, deadlineMs: 300 });
+    assert.equal(unseen.observed, false);
+    assert.equal(unseen.evaluation.slot.evidenceClass, 'missing');
+    assert.equal(unseen.evaluation.denial, null);
 });
 
 test('NW1.S-only-validated-active-evidence-yields-a-typed-denial', (t) => {

@@ -4,6 +4,8 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawn, spawnSync } from 'node:child_process';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
     applyEdgeRoutingGeneration,
@@ -185,4 +187,62 @@ export function countingFs() {
         count: (op, matcher = () => true) => calls.filter((call) => call.op === op && matcher(call.target)).length,
         reset: () => { calls.length = 0; },
     };
+}
+
+// ---------------------------------------------------------------- the separate-process evidence probe
+
+const PROBE_ROOT = fs.realpathSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..'));
+const hrefOf = (relative) => pathToFileURL(path.join(PROBE_ROOT, relative)).href;
+export const PROBE_FILE = path.join(PROBE_ROOT, 'tests/unit/hardwareAvailabilityEvidenceProbe.mjs');
+
+function probeArgs(options) {
+    // The same contract and spawn guard every test process runs under; the mutation loader only when a mutant run asked for it.
+    return [
+        '--import', hrefOf('tests/helpers/agentlibTestContract.mjs'),
+        '--import', hrefOf('tests/helpers/engineSpawnGuard.mjs'),
+        ...(process.env.C5_MUTATION ? ['--import', hrefOf('tests/hardware-limits/c5MutationRegister.mjs')] : []),
+        PROBE_FILE, JSON.stringify(options),
+    ];
+}
+
+function parseReceipt(stdout, stderr, status) {
+    const line = stdout.trim().split('\n').filter(Boolean).pop();
+    if (!line) throw new Error(`the probe wrote no receipt (exit ${status}): ${String(stderr).slice(-800)}`);
+    return JSON.parse(line);
+}
+
+/** Run the probe to completion and return its receipt (no concurrent writer). */
+export function runProbeSync(options) {
+    const child = spawnSync(process.execPath, probeArgs(options), { cwd: PROBE_ROOT, env: { ...process.env, NODE_TEST_CONTEXT: undefined }, encoding: 'utf8', timeout: 60_000 });
+    return parseReceipt(child.stdout, child.stderr, child.status);
+}
+
+/**
+ * Start the probe and wait until it is polling (its startedFile exists). `done` resolves to the receipt.
+ * The child is killed when the test ends, whatever happened.
+ */
+export async function startProbe(t, world, options) {
+    const startedFile = path.join(world.root, 'probe.started');
+    const reportFile = path.join(world.root, 'probe.report.json');
+    const full = { workspaceRoot: world.root, routeKey: 'alpha', pollIntervalMs: 20, deadlineMs: 20_000, routerPid: process.pid, startedFile, reportFile, ...options };
+    const env = { ...process.env };
+    delete env.NODE_TEST_CONTEXT;
+    const child = spawn(process.execPath, probeArgs(full), { cwd: PROBE_ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    t.after(() => { if (child.exitCode === null) child.kill('SIGKILL'); });
+    const done = new Promise((resolve, reject) => {
+        child.on('error', reject);
+        child.on('close', (status) => {
+            try { resolve(parseReceipt(stdout, stderr, status)); } catch (error) { reject(error); }
+        });
+    });
+    const waitUntil = Date.now() + 15_000;
+    while (!fs.existsSync(startedFile)) {
+        if (Date.now() > waitUntil || child.exitCode !== null) throw new Error(`the probe did not start polling: ${stderr.slice(-800)}`);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    return { child, done, reportFile, startedFile };
 }

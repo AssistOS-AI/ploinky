@@ -27,6 +27,12 @@ const PROTOCOL = 'cli/commands/noWaitProtocol.js';
 const WORKER_TEST = 'tests/unit/noWaitLateOutcomeActivation.test.mjs';
 const RESOLVER = 'cli/server/hardwareAvailabilityResolver.mjs';
 const RESOLVER_TEST = 'tests/unit/hardwareAvailabilityResolver.test.mjs';
+const LEASES_TEST = 'tests/unit/hardwareAvailabilityLeases.test.mjs';
+const OBSERVERS_TEST = 'tests/unit/hardwareAvailabilityObservers.test.mjs';
+const OBSERVER = 'cli/server/noWaitAgentStartupState.js';
+const PROBE = 'tests/unit/hardwareAvailabilityEvidenceProbe.mjs';
+const PROBE_TEST = 'tests/unit/hardwareAvailabilityEvidenceProbe.test.mjs';
+const REVISION = '        revision: computeEffectiveRevision(denials),\n';
 const kill = (file, pattern) => ({ file, pattern });
 // A denial that is not derived from validated active evidence: the old hardware-coded fail-closed object.
 const HARDWARE_CODED = "Object.freeze({ state: 'refused', code: 'PLOINKY_HARDWARE_LIMITS_UNENFORCEABLE', reasonCode: 'unprepared', key: '', instanceId: '', enableGeneration: '', reason: 'The hardware availability record is invalid.', fix: 'On the host run ploinky limits status.', rootKey: '' })";
@@ -34,7 +40,8 @@ const SLOT_RECORDED = "        slots.set(routeKey, Object.freeze({ runId: slot.r
 const denyClasses = (...classes) => ({ from: SLOT_RECORDED,
     to: `${SLOT_RECORDED}        if (${classes.map((name) => `evidence.evidenceClass === '${name}'`).join(' || ')}) denials.set(routeKey, ${HARDWARE_CODED});\n` });
 const IDENTITY_RETURN = '    return identity.containerName === slot.key\n        && identity.instanceId === slot.instanceId\n        && identity.enableGeneration === slot.enableGeneration\n        && identity.routeKey === routeKey\n        && identity.runId === slot.runId\n        && identity.runStartedAtMs === slot.runStartedAtMs\n        && identity.waveIndex === slot.waveIndex\n        && identity.statusFile === slot.statusFile;\n';
-const resolverMutant = (name, killLeaf, patches) => ({ name, file: RESOLVER, kill: kill(RESOLVER_TEST, killLeaf), patches });
+const LEASES_KILL = 'NW1\\.S-both-lease-families';
+const resolverMutant = (name, killLeaf, patches) => ({ name, file: RESOLVER, kill: kill(killLeaf === LEASES_KILL ? LEASES_TEST : RESOLVER_TEST, killLeaf), patches });
 const MISSING_POLICY = "directory = { state: 'invalid', problem: 'policy.json is missing from an existing store directory' };";
 const WITNESS_CALL = '        writeWitness({ paths, fsApi, run, state, storeId, initializedBy, now });\n';
 
@@ -126,6 +133,29 @@ export const AVAILABILITY_MUTANTS = Object.freeze({
     'ms38-a-slot-without-a-validated-outcome-yields-a-hardware-coded-denial': resolverMutant('ms38-a-slot-without-a-validated-outcome-yields-a-hardware-coded-denial', 'NW1\\.S-(only-validated-active-evidence-yields|no-store-denial-arises)', [
         { from: '        outcome = noWaitTerminalHardwareOutcome(status, validateHardwareOutcome);\n    } catch (_) {\n        return invalid;\n    }', to: "        outcome = noWaitTerminalHardwareOutcome(status, validateHardwareOutcome);\n    } catch (_) {\n        return { evidenceClass: 'invalid', unvalidated: true };\n    }" },
         { from: SLOT_RECORDED, to: `${SLOT_RECORDED}        if (evidence.unvalidated) denials.set(routeKey, ${HARDWARE_CODED});\n` }]),
+    // The effective revision (the lease fence) covers exactly the store-derived denials.
+    'ms7-the-effective-revision-omits-activations': resolverMutant('ms7-the-effective-revision-omits-activations', LEASES_KILL, [
+        { from: REVISION, to: '        revision: computeEffectiveRevision(new Map([...denials].filter(([routeKey]) => !slots.has(routeKey)))),\n' }]),
+    'ms8-the-effective-revision-includes-non-denial-classes': resolverMutant('ms8-the-effective-revision-includes-non-denial-classes', LEASES_KILL, [
+        { from: REVISION, to: '        revision: computeEffectiveRevision(new Map([...denials, ...[...slots].map(([routeKey, slot]) => [`${routeKey}#slot`, slot.evidenceClass])])),\n' }]),
+    // A visible-but-not-durable terminal status is credited with a durability time.
+    'ms44-durability-is-credited-at-the-rename-despite-a-failed-fsync': { name: 'ms44-durability-is-credited-at-the-rename-despite-a-failed-fsync', file: WORKER,
+        kill: kill(PROBE_TEST, 'NW1\\.S-durable-activation-is-proved'),
+        patches: [{ from: '{ visibleAtMs: error.visibleAtMs, durabilityError: error.fsCode }', to: '{ visibleAtMs: error.visibleAtMs, durableAtMs: error.visibleAtMs }' }] },
+    // The probe (a separate process, patched through the same loader) follows a stale selector read instead of the generation the selector names.
+    'ms45-the-evidence-probe-evaluates-a-different-generation-than-the-selector-names': { name: 'ms45-the-evidence-probe-evaluates-a-different-generation-than-the-selector-names', file: PROBE,
+        kill: kill(PROBE_TEST, 'NW1\\.S-durable-activation-is-proved'),
+        patches: [{ from: '            const selector = edge.readEdgeRoutingSelection(edgeOptions).selector;\n', to: '            const selector = (globalThis.__firstSelector ??= edge.readEdgeRoutingSelection(edgeOptions).selector);\n' }] },
+    // A slotted run's navigation/probe observer takes its hardware result from the status feed, which lacks the resolver's checks.
+    'ms46-the-observer-derives-a-hardware-result-from-a-slotted-runs-status': { name: 'ms46-the-observer-derives-a-hardware-result-from-a-slotted-runs-status', file: OBSERVER,
+        kill: kill(OBSERVERS_TEST, 'NW1\\.S-observers-and-transports-agree'),
+        patches: [{ from: '        if (slottedRun(plan, marker)) return STARTUP_FAILED_RESULT;\n', to: '' }] },
+    'ms50a-the-probe-credits-an-observation-outside-the-window': { name: 'ms50a-the-probe-credits-an-observation-outside-the-window', file: PROBE,
+        kill: kill(PROBE_TEST, 'NW1\\.S-durable-activation-is-proved'),
+        patches: [{ from: 'observedInWindow: Number.isFinite(firstActiveObservedAtMs) && firstActiveObservedAtMs <= tFinMs + windowMs + pollIntervalMs,', to: 'observedInWindow: Number.isFinite(firstActiveObservedAtMs),' }] },
+    'ms50b-the-probe-skips-the-ctime-cross-check': { name: 'ms50b-the-probe-skips-the-ctime-cross-check', file: PROBE,
+        kill: kill(PROBE_TEST, 'NW1\\.S-durable-activation-is-proved'),
+        patches: [{ from: 'ctimeMatchesVisible: Number.isFinite(ctimeMs) && Number.isFinite(tVisMs) && Math.abs(ctimeMs - tVisMs) <= ctimeToleranceMs,', to: 'ctimeMatchesVisible: true,' }] },
     'ms36-the-validator-accepts-a-shared-run-id-and-a-missing-startup-grace': { name: 'ms36-the-validator-accepts-a-shared-run-id-and-a-missing-startup-grace', file: STORE,
         kill: kill(SLOTS_TEST, 'NW1\\.S-frozen-v1-slot-schema'),
         patches: [
