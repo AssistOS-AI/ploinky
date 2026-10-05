@@ -1805,7 +1805,8 @@ body {
     display: flex;
     flex-direction: column;
     gap: 6px;
-    max-width: min(420px, 72vw);
+    min-width: 0;
+    max-width: 100%;
 }
 
 .wa-typing-heading {
@@ -1825,10 +1826,15 @@ body {
 }
 
 .wa-typing-label {
+    /* The bubble grows with one status line and wraps a long one. */
     min-width: 0;
     overflow: hidden;
-    white-space: nowrap;
-    text-overflow: ellipsis;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 3;
+    line-clamp: 3;
 }
 
 .wa-typing-dots {
