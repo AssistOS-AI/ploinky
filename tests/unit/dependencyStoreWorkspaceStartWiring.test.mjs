@@ -548,6 +548,44 @@ test('NW1.S-same-tuple-ready-publication-retires-entries-at-its-commit-point', a
     }
 });
 
+test('NW1.S-shell-activation-retires-under-the-workspace-lease-and-logs-no-failure', (t) => {
+    // `ploinky shell` activates a prepared runtime through the additive path, whose entry retirement asserts the
+    // workspace mutation lease. The shell's lifecycle work runs under it, and the attach after it does not.
+    const argumentFor = (fixture, extra = {}) => ({
+        routeKey: 'alpha', container: containerOf('alpha'), registryRecord: fixture.record('alpha'), hostPort: 0, ...extra,
+    });
+    for (const [label, hostPort] of [['target-less', 0], ['targeted', 43111]]) {
+        const fixture = retirementWorld(t);
+        const run = runRetirementDriver(fixture.world, 'shell-lifecycle', argumentFor(fixture, { hostPort }));
+        assert.equal(run.lifecycleError, null, `${label}: ${JSON.stringify(run.lifecycleError)}`);
+        assert.equal(run.shell.containerName, containerOf('alpha'));
+        assert.deepEqual(failureLogs(run), [], `${label}: no retirement failure is logged`);
+        assert.deepEqual(run.entriesAfter, [], `${label}: the entry is retired`);
+        assert.equal(run.leaseAtActivation, `shell:${containerOf('alpha')}`, `${label}: the activation runs under the shell's own lease`);
+        assert.equal(run.witnesses.length, 1);
+        assert.equal(run.witnesses[0].lease, `shell:${containerOf('alpha')}`, `${label}: retirement started under that lease`);
+        assert.equal(run.witnesses[0].selector.state, 'active');
+        assert.notEqual(run.witnesses[0].selector.activationId, fixture.before.activationId, `${label}: after the selector switch`);
+    }
+    // A caller that already holds the lease keeps it: the shell reuses it and takes no second one.
+    {
+        const fixture = retirementWorld(t);
+        const run = runRetirementDriver(fixture.world, 'shell-lifecycle', argumentFor(fixture, { hold: true }));
+        assert.equal(run.lifecycleError, null);
+        assert.deepEqual(failureLogs(run), []);
+        assert.deepEqual(run.entriesAfter, []);
+        assert.equal(run.witnesses[0].lease, 'outer-holder', 'the held lease is reused');
+    }
+    // The command reaches that lifecycle through runShellLifecycle, and the lease wraps the whole lifecycle.
+    const source = SRC('cli/commands/workspaceUtil.js');
+    const lifecycle = /async function runShellLifecycle\([\s\S]*?\n\}\n/.exec(source)?.[0] || '';
+    assert.match(lifecycle, /return withHeldOrAcquiredWorkspaceMutationLease\(\s*\{ operation: `shell:\$\{registeredContainerName\}` \},\s*\(\) => withNetworkLifecycleLock\(/, 'the lease is taken before the network lock');
+    assert.match(lifecycle, /await activateAfterReadiness\(/);
+    const shell = /async function runShell\(agentName\) \{[\s\S]*?\n\}\n/.exec(source)?.[0] || '';
+    assert.match(shell, /await runShellLifecycle\(\{/);
+    assert.doesNotMatch(shell, /activatePreparedRuntimeAfterReadiness|withNetworkLifecycleLock\(/, 'runShell itself no longer activates outside the lease');
+});
+
 test('NW1.S-no-retirement-site-uses-an-uncoordinated-merge-and-retirement-stays-inside-its-modules', () => {
     // S2-style source checks. The retirement call sites are in the three reviewed modules only.
     const callers = new Map();
@@ -568,8 +606,13 @@ test('NW1.S-no-retirement-site-uses-an-uncoordinated-merge-and-retirement-stays-
     const allowed = new Set([
         'cli/sandbox/hardwareAvailabilityStore.mjs', 'cli/commands/noWaitAvailabilitySlots.js', 'cli/commands/hardwareAvailabilityRetirement.js',
         'cli/commands/workspaceUtil.js', 'cli/commands/targetedAgentRestart.js',
+        // D2S.11: the Router-process latcher writes the resolve commit; it never retires a publication's entries (below).
+        'cli/server/hardwareAvailabilityLatcher.mjs',
     ]);
     for (const file of files) assert.ok(allowed.has(file), `${file} must not retire entries or commit the store`);
+    for (const name of ['retireSameTupleHardwareEntries(', 'retireSameTupleAfterApply(', 'retireStartReadyPublications(']) {
+        assert.equal(callers.has(`cli/server/hardwareAvailabilityLatcher.mjs:${name}`), false, `the latcher must not call ${name}`);
+    }
     assert.ok(files.includes('cli/commands/workspaceUtil.js'));
     assert.match(SRC('cli/commands/targetedAgentRestart.js'), /await retireEntriesAfterApply\(/);
     // No retirement call sits inside a `coordinate: false` mutator: the text of every merge call (balanced parentheses) that holds a

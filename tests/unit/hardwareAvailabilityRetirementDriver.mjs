@@ -10,6 +10,7 @@
 //   site-a  the additive activation: the real activatePreparedRuntimeAfterReadiness, the real apply lock; the selector switch is a real apply
 //   site-r  the replacement activation: the real function and the real mergeRoutingConfig under an inactive selector
 //   site-t  the targeted restart: the real prepare and commit and the real mergeRoutingConfig
+//   shell-lifecycle  the `shell` command's lifecycle work (runShellLifecycle) around the real additive activation; `hold` makes the caller hold the workspace lease first
 //   merge-capabilities  what a coordinated and a `coordinate: false` merge hand their mutators
 //
 // Argument fields: { routeKey, container, registryRecord, hostPort, ready, failure, breakCommit, noCapabilities }
@@ -48,7 +49,7 @@ async function run() {
     const entryKeys = () => Object.keys(store.readHardwareAvailabilityPolicy({ paths }).entries).sort();
     // The real helper; the spy records the selector and the store at the moment retirement STARTS.
     const spyRetire = (options) => {
-        witnesses.push({ site: options.site, selector: selection(), entries: entryKeys() });
+        witnesses.push({ site: options.site, selector: selection(), entries: entryKeys(), lease: locks.heldWorkspaceMutationLease()?.operation ?? null });
         return retirement.retireSameTupleHardwareEntries({
             ...options,
             log,
@@ -133,6 +134,44 @@ async function run() {
             });
         } catch (error) { activationError = failure(error); }
         return result({ activated, activationError });
+    }
+
+    if (phase === 'shell-lifecycle') {
+        const container = argument.container;
+        const agentPath = path.join(root, '.ploinky', 'repos', 'fixtures', argument.routeKey);
+        let shell = null;
+        let lifecycleError = null;
+        let leaseAtActivation = null;
+        const lifecycle = () => workspaceUtil.runShellLifecycle({
+            shortAgentName: argument.routeKey, manifest: {}, agentDir: agentPath, repoName: 'fixtures',
+            registryRecord: { containerName: container, record: record() }, registeredContainerName: container,
+            routerEndpoint: { mode: 'default' }, directAdmission: { runtimeAdmission: {} },
+        }, {
+            ensureAgentService: async () => ({ requiresEdgeActivation: true, containerName: container, registryRecord: successorRecord(), hostPort: argument.hostPort || 0, preparationLease: { mode: 'additive' } }),
+            waitForReadiness: async () => {},
+            cleanupFailedRuntime: () => {},
+            activateAfterReadiness: (options) => {
+                leaseAtActivation = locks.heldWorkspaceMutationLease()?.operation ?? null;
+                return workspaceUtil.activatePreparedRuntimeAfterReadiness(options, {
+                    withApplyLock: (callback) => edge.withEdgeGenerationApplyLock(callback, { workspaceRoot: root }),
+                    commitAdditive: (lease, { agents, routing: nextRouting, applyLockCapability }) => {
+                        fs.writeFileSync(agentsFile, JSON.stringify(agents, null, 2));
+                        fs.writeFileSync(routingFile, JSON.stringify(nextRouting, null, 2));
+                        return coordinated.applyEdgeRoutingGeneration({ workspaceRoot: root, reason: 'additive-switch', publicationState: 'ready', applyLockCapability });
+                    },
+                    retireEntries: spyRetire,
+                    retirePredecessor: () => {},
+                    retireCandidate: () => {},
+                    cleanupFailure: () => {},
+                });
+            },
+        });
+        try {
+            shell = argument.hold
+                ? await locks.withWorkspaceMutationLease({ operation: 'outer-holder' }, lifecycle)
+                : await lifecycle();
+        } catch (error) { lifecycleError = failure(error); }
+        return result({ shell: shell ? { containerName: shell.containerName } : null, lifecycleError, leaseAtActivation });
     }
 
     if (phase === 'site-r') {

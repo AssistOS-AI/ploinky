@@ -7,6 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { handleWebChat } from './handlers/webchat/index.js';
 import { handleStatus, streamWorkspaceMetrics } from './handlers/status.js';
 import { workspaceMetricsMonitor } from './workspaceMetrics.js';
+import { hardwareAvailabilityLatcher } from './hardwareAvailabilityLatcher.mjs';
 import { executeWorkspaceLogOperation } from './workspaceLogFiles.js';
 import { handleBlobs, handleWorkspaceUpload } from './handlers/blobs.js';
 import { handleWebtty } from './handlers/webtty.js';
@@ -1080,6 +1081,7 @@ const lifecycle = setupProcessLifecycle(
     agentSessionStore,
     {
         beforeClose: [async () => {
+            hardwareAvailabilityLatcher.stop();
             await webttySessionManager.closeAll();
             runtimeRelayManager.close();
             await cloudflaredRouterIntegration.stop();
@@ -1164,6 +1166,9 @@ healthServer.listen(detailedHealthSocket, () => {
 
 // Workspace metrics observe the engine for the Router's whole lifetime.
 workspaceMetricsMonitor.start();
+
+// Recovery only: resolves slots whose run already reached a terminal status. Never a source of activation.
+hardwareAvailabilityLatcher.start();
 
 // Start server
 server.listen(port, '0.0.0.0', () => {

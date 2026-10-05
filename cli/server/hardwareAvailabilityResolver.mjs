@@ -47,6 +47,26 @@ export const EVIDENCE_CLASSES = Object.freeze([
     'missing', 'pending', 'succeeded', 'succeeded-unowned', 'unowned', 'failed-generic', 'invalid', 'active',
 ]);
 
+// The classes a committed slot can be resolved from: the run reached its own terminal status.
+export const TERMINAL_SLOT_EVIDENCE_CLASSES = Object.freeze(['active', 'succeeded', 'failed-generic']);
+
+// In-process observers of captures that saw a terminal applicable slot (the Router-process latcher). A listener
+// is only told; it must not do work in the capture's call stack, and its failure never reaches the capture.
+const terminalSlotListeners = new Set();
+export function subscribeHardwareAvailabilityTerminalSlots(listener) {
+    terminalSlotListeners.add(listener);
+    return () => { terminalSlotListeners.delete(listener); };
+}
+function notifyTerminalSlots(slots) {
+    for (const { evidenceClass } of slots.values()) {
+        if (!TERMINAL_SLOT_EVIDENCE_CLASSES.includes(evidenceClass)) continue;
+        for (const listener of [...terminalSlotListeners]) {
+            try { listener(); } catch (_) { /* an observer never fails a capture */ }
+        }
+        return;
+    }
+}
+
 /** A fresh cache. Tests pass their own so a leaf never sees another leaf's reads. */
 export function createHardwareAvailabilityResolverCache() {
     return { stores: new Map(), evidence: new Map() };
@@ -289,6 +309,7 @@ function evidenceFor({ fsApi, file, routeKey, slot, evidenceCache }) {
  *   slots        Map<routeKey, { runId, evidenceClass }> for every applicable slot
  *   diagnostics  [{ routeKey, evidenceClass, label? }] informational only
  *
+ * `observe: false` evaluates without telling the terminal-slot listeners.
  * Throws HARDWARE_AVAILABILITY_POLICY_UNREADABLE when the store is unreadable.
  */
 export function resolveEffectiveHardwareAvailability({
@@ -298,10 +319,13 @@ export function resolveEffectiveHardwareAvailability({
     nowMs = Date.now(),
     fsApi = fs,
     cache = DEFAULT_CACHE,
+    observe = true,
 } = {}) {
-    return evaluateHardwareAvailabilityOfStore({
+    const effective = evaluateHardwareAvailabilityOfStore({
         store: storeSnapshot(paths, fsApi, cache), generation, paths, runningDir, nowMs, fsApi, cache,
     });
+    if (observe && terminalSlotListeners.size > 0) notifyTerminalSlots(effective.slots);
+    return effective;
 }
 
 /**

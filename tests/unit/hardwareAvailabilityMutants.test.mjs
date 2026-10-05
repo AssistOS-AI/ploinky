@@ -38,6 +38,11 @@ const WIRING_TEST = 'tests/unit/dependencyStoreWorkspaceStartWiring.test.mjs';
 const RETIREMENT = 'cli/commands/hardwareAvailabilityRetirement.js';
 const TARGETED = 'cli/commands/targetedAgentRestart.js';
 const ROUTING_FILE = 'cli/server/routingFile.js';
+const LATCHER = 'cli/server/hardwareAvailabilityLatcher.mjs';
+const LATCHER_TEST = 'tests/unit/hardwareAvailabilityLatcher.test.mjs';
+const ROUTER = 'cli/server/RoutingServer.js';
+const LATCHER_LEAF = 'NW1\\.S-the-latcher-resolves-terminal-slots';
+const latcherMutant = (name, patches, { file = LATCHER, leaf = LATCHER_LEAF, killFile = LATCHER_TEST } = {}) => ({ name, file, kill: kill(killFile, leaf), patches });
 const SAME_TUPLE_LEAF = 'NW1\\.S-same-tuple-ready-publication-retires-entries';
 const SITE_S_CALL = "      retireStartReadyPublications({\n        current,\n        registry: reg,\n        readyAgentKeys,\n        capabilities: { applyLockCapability, networkLifecycleCapability: mergeNetworkLifecycleCapability },\n      });\n";
 const SITE_A_CALL = "        retireEntries({\n          site: 'additive',\n          applyLockCapability,\n          networkLifecycleCapability,\n          published: publishedTuple,\n        });\n";
@@ -273,6 +278,37 @@ export const AVAILABILITY_MUTANTS = Object.freeze({
         { from: 'const next = await mutator(current, { applyLockCapability, networkLifecycleCapability: liveNetworkLifecycleCapability }) || current;', to: 'const next = await mutator(current) || current;' }]),
     'ms62-a-retirement-failure-is-fatal': retireMutant('ms62-a-retirement-failure-is-fatal', RETIREMENT, [
         { from: '        return { retired };\n    } catch (error) {\n', to: '        return { retired };\n    } catch (error) {\n        throw error;\n' }]),
+    // The Router-process latcher (D2S.11): recovery only, fail-fast, one rename, never inside a capture.
+    'ms22-the-latcher-waits-on-a-busy-network-lock': latcherMutant('ms22-the-latcher-waits-on-a-busy-network-lock', [
+        { from: '                ), { waitMs: 0 }));', to: '                ), { waitMs: 50 }));' }]),
+    'ms23a-the-latch-keeps-the-slot': latcherMutant('ms23a-the-latch-keeps-the-slot', [
+        { from: '                                    ...args,\n                                    ...(hooks.beforeRename', to: '                                    ...args,\n                                    slots: store.slots,\n                                    ...(hooks.beforeRename' }]),
+    'ms23b-the-latch-uses-two-commits': latcherMutant('ms23b-the-latch-uses-two-commits', [
+        { from: '                                return commitHardwareAvailabilityPolicy({\n                                    ...args,\n', to: '                                const first = commitHardwareAvailabilityPolicy({ ...args, entries: store.entries, ...(hooks.beforeRename ? { beforeRename: hooks.beforeRename } : {}) });\n                                return commitHardwareAvailabilityPolicy({\n                                    ...args,\n                                    expectedRevision: first.revision,\n' }]),
+    'ms24-the-latcher-resolves-unowned-and-invalid-evidence': latcherMutant('ms24-the-latcher-resolves-unowned-and-invalid-evidence', [
+        { from: 'export const SLOT_TERMINAL_CLASSES = TERMINAL_SLOT_EVIDENCE_CLASSES;', to: "export const SLOT_TERMINAL_CLASSES = Object.freeze([...TERMINAL_SLOT_EVIDENCE_CLASSES, 'unowned', 'invalid', 'missing', 'pending']);" }], { file: SLOTS }),
+    'ms25-the-latcher-skips-the-pre-filter': latcherMutant('ms25-the-latcher-skips-the-pre-filter', [
+        { from: '            const filtered = prefilter();\n            if (filtered.result) return filtered.result;\n            return lockedAttempt(filtered.store);', to: '            return lockedAttempt(readHardwareAvailabilityPolicy({ paths: resolveEdgeGenerationPaths(edgeOptions) }));' }]),
+    'ms34-the-latcher-start-is-removed-from-the-router': latcherMutant('ms34-the-latcher-start-is-removed-from-the-router', [
+        { from: 'hardwareAvailabilityLatcher.start();\n', to: '' }], { file: ROUTER, leaf: 'NW1\\.S-the-latcher-is-wired' }),
+    'ms35a-the-latcher-stop-is-removed-from-the-router': latcherMutant('ms35a-the-latcher-stop-is-removed-from-the-router', [
+        { from: '            hardwareAvailabilityLatcher.stop();\n', to: '' }], { file: ROUTER, leaf: 'NW1\\.S-the-latcher-is-wired' }),
+    'ms35b-the-latcher-stop-is-not-the-first-statement-of-before-close': latcherMutant('ms35b-the-latcher-stop-is-not-the-first-statement-of-before-close', [
+        { from: '            hardwareAvailabilityLatcher.stop();\n            await webttySessionManager.closeAll();\n', to: '            await webttySessionManager.closeAll();\n            hardwareAvailabilityLatcher.stop();\n' }], { file: ROUTER, leaf: 'NW1\\.S-the-latcher-is-wired' }),
+    'ms42-a-latcher-attempt-runs-inline-inside-a-capture': latcherMutant('ms42-a-latcher-attempt-runs-inline-inside-a-capture', [
+        { from: '        if (!started || now() < blockedUntil) return;\n        schedule(0);', to: '        if (!started || now() < blockedUntil) return;\n        attempt();' }]),
+    'ms43-recovery-required-or-network-busy-stops-the-latcher': latcherMutant('ms43-recovery-required-or-network-busy-stops-the-latcher', [
+        { from: '    function defer(reason, detail = {}) {\n        blockedUntil = now() + retryMs;\n', to: "    function defer(reason, detail = {}) {\n        blockedUntil = now() + retryMs;\n        if (reason === 'PLOINKY_NETWORK_LIFECYCLE_BUSY' || reason === 'PLOINKY_WORKSPACE_MUTATION_RECOVERY_REQUIRED') { stop(); return { outcome: 'deferred', reason }; }\n" }]),
+    'ms63-a-scheduled-attempt-inherits-the-signalling-captures-context': latcherMutant('ms63-a-scheduled-attempt-inherits-the-signalling-captures-context', [
+        { from: '        timer = origin.runInAsyncScope(() => timers.setTimeout(() => {\n            timer = null;\n            runScheduled();\n        }, delayMs));', to: '        timer = timers.setTimeout(() => {\n            timer = null;\n            runScheduled();\n        }, delayMs);' },
+        { from: '            lockedTimer = origin.runInAsyncScope(() => timers.setTimeout(() => {\n                lockedTimer = null;\n                if (started) lockedAttempt(store);\n            }, 0));', to: '            lockedTimer = timers.setTimeout(() => {\n                lockedTimer = null;\n                if (started) lockedAttempt(store);\n            }, 0);' }]),
+    // A blocking wait inside the locked commit blocks the event loop without using CPU: only the wall-clock gap sees it.
+    'ms65-the-locked-commit-blocks-the-event-loop-with-a-wait': latcherMutant('ms65-the-locked-commit-blocks-the-event-loop-with-a-wait', [
+        { from: '                        commit: (args) => {\n                            try {', to: '                        commit: (args) => {\n                            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400);\n                            try {' }]),
+    // `ploinky shell` activates a prepared runtime: its lifecycle work needs the workspace lease the retirement asserts.
+    'ms64-the-shell-lifecycle-runs-without-the-workspace-lease': { name: 'ms64-the-shell-lifecycle-runs-without-the-workspace-lease', file: START,
+        kill: kill(WIRING_TEST, 'NW1\\.S-shell-activation-retires'),
+        patches: [{ from: '  return withHeldOrAcquiredWorkspaceMutationLease(\n    { operation: `shell:${registeredContainerName}` },', to: '  return ((_options, work) => work())(\n    { operation: `shell:${registeredContainerName}` },' }] },
     'ms36-the-validator-accepts-a-shared-run-id-and-a-missing-startup-grace': { name: 'ms36-the-validator-accepts-a-shared-run-id-and-a-missing-startup-grace', file: STORE,
         kill: kill(SLOTS_TEST, 'NW1\\.S-frozen-v1-slot-schema'),
         patches: [

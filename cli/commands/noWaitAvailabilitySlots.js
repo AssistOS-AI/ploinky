@@ -22,6 +22,7 @@ import {
     readHardwareAvailabilityPolicy,
 } from '../sandbox/hardwareAvailabilityStore.mjs';
 import {
+    TERMINAL_SLOT_EVIDENCE_CLASSES,
     createHardwareAvailabilityResolverCache,
     evaluateHardwareAvailabilityOfStore,
     routeIsTargetLess,
@@ -29,7 +30,7 @@ import {
 import { appendLog } from '../server/utils/logger.js';
 
 export const HARDWARE_AVAILABILITY_RESOLVE_REVISION_CHANGED = 'HARDWARE_AVAILABILITY_RESOLVE_REVISION_CHANGED';
-export const SLOT_TERMINAL_CLASSES = Object.freeze(['active', 'succeeded', 'failed-generic']);
+export const SLOT_TERMINAL_CLASSES = TERMINAL_SLOT_EVIDENCE_CLASSES;
 export const APPLY_LOCK_BUSY_RETRY_MS = 2000;
 const APPLY_LOCK_BUSY_POLL_MS = 25;
 
@@ -159,6 +160,8 @@ function evaluateHypothetical({ store, content, generation, paths, runningDir, n
  * Reads the store, evaluates it against the active generation, plans, proves the resolve invariant (the
  * effective revision is equal before and after the terminal resolutions) and writes ONE commit. Any failure
  * throws with the store unchanged.
+ * `cache` is an evidence cache the caller may share (the latcher hands over the one its own read just warmed);
+ * evidence is re-read whenever its file's stat identity changed, so a shared cache never serves stale evidence.
  */
 export function commitNoWaitAvailabilitySlotPlan({
     mode,
@@ -169,6 +172,7 @@ export function commitNoWaitAvailabilitySlotPlan({
     nowMs = Date.now(),
     runningDir,
     fsApi,
+    cache = createHardwareAvailabilityResolverCache(),
     plan: planner = planNoWaitAvailabilitySlots,
     commit = commitHardwareAvailabilityPolicy,
     log = appendLog,
@@ -182,7 +186,6 @@ export function commitNoWaitAvailabilitySlotPlan({
         throw error;
     }
     const { generation } = loadActiveEdgeRoutingGeneration(edgeOptions);
-    const cache = createHardwareAvailabilityResolverCache();
     const evaluationOptions = { generation, paths, runningDir, nowMs, ...(fsApi ? { fsApi } : {}), cache };
     const evaluation = evaluateHardwareAvailabilityOfStore({ store, ...evaluationOptions });
     const plan = planner({ mode, store, generation, evaluation, spawned, startupGraceMs });
@@ -204,7 +207,7 @@ export function commitNoWaitAvailabilitySlotPlan({
             ...(fsApi ? { fsApi } : {}),
         })
         : { committed: false, revision: store.revision };
-    return { plan, result, effectiveRevision: { before: evaluation.revision, after: after.revision } };
+    return { plan, result, store, effectiveRevision: { before: evaluation.revision, after: after.revision } };
 }
 
 /**
