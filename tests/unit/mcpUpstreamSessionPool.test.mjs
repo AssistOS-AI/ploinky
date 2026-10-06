@@ -500,7 +500,7 @@ test('B5-5: beforeDial other than true raises EDGE_GENERATION_CHANGED with no up
         beforeDial: () => { checks += 1; return false; },
     }), (error) => error.code === 'EDGE_GENERATION_CHANGED');
     assert.equal(checks, 1);
-    assert.equal(upstream.log.length, warm, 'warm key: nothing sent');
+    assert.equal(count(upstream.log.slice(warm), (row) => row.httpMethod === 'POST'), 0, 'warm key: no POST sent');
     assert.equal(mints, 1, 'no mint after a failed generation check');
     let partialChecks = 0;
     const coldKey = keyFor({ port: upstream.port, lease: 'lease-cold' });
@@ -1147,4 +1147,97 @@ test('closeAll lets calls in flight finish before it DELETEs their session', asy
     const deleteRow = upstream.log.find((row) => row.httpMethod === 'DELETE');
     assert.ok(deleteRow.at >= repliedAt, 'DELETE after the in-flight reply');
     assert.deepEqual(pool.snapshot().entries, []);
+});
+
+// ---------------------------------------------------------------------------
+// Readiness cache (liveness only): dropped on any upstream failure and on any
+// generation change.
+
+test('readiness: every upstream failure drops the readiness entry', async (t) => {
+    let mode = 'ok';
+    const upstream = await startFakeUpstream(t, {
+        onRpc: async ({ req, res, message }) => {
+            if (message?.method !== 'tools/call' || mode === 'ok') return false;
+            if (mode === 'reset') { req.socket.destroy(); return true; }
+            if (mode === 'missing-session') {
+                res.writeHead(404, { 'content-type': 'application/json' });
+                res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32001, message: 'Session not found' } }));
+                return true;
+            }
+            if (mode === 'http-500') {
+                res.writeHead(500, { 'content-type': 'application/json' });
+                res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32603, message: 'Internal server error' } }));
+                return true;
+            }
+            if (mode === 'mismatch') {
+                res.writeHead(200, { 'content-type': 'application/json' });
+                res.end(JSON.stringify({ jsonrpc: '2.0', id: 'other', result: {} }));
+                return true;
+            }
+            if (mode === 'timeout') {
+                await new Promise((resolve) => setTimeout(resolve, 400));
+                res.writeHead(200, { 'content-type': 'application/json' });
+                res.end(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: {} }));
+                return true;
+            }
+            return false;
+        },
+    });
+    const pool = newPool(t);
+    const key = keyFor({ port: upstream.port });
+    const call = () => pool.request({
+        key, hostPort: upstream.port, method: 'tools/call', params: { name: 'x', arguments: {} },
+        headers: { authorization: 'Bearer test-token' }, beforeDial: () => true, timeoutMs: 200,
+    });
+    for (const failure of ['reset', 'missing-session', 'http-500', 'mismatch', 'timeout']) {
+        mode = 'ok';
+        await call();
+        assert.equal(pool.isReady(key), true, `ready before ${failure}`);
+        mode = failure;
+        await assert.rejects(call(), (error) => error.code === 'UPSTREAM_TRANSPORT' || error.code === 'UPSTREAM_SESSION_LOST', failure);
+        assert.equal(pool.isReady(key), false, `readiness dropped after ${failure}`);
+        // The fallback mark from 'mismatch' would hide later keys; clear it.
+        pool.invalidate(key);
+    }
+});
+
+test('readiness: a generation change drops the readiness entry and the session', async (t) => {
+    const upstream = await startFakeUpstream(t);
+    const pool = newPool(t);
+    const key = keyFor({ port: upstream.port, lease: 'lease-1' });
+    const call = (callKey, beforeDial = () => true) => pool.request({
+        key: callKey, hostPort: upstream.port, method: 'tools/call', params: { name: 'x', arguments: {} },
+        headers: { authorization: 'Bearer test-token' }, beforeDial,
+    });
+    await call(key);
+    assert.equal(pool.isReady(key), true);
+    await assert.rejects(call(key, () => false), (error) => error.code === 'EDGE_GENERATION_CHANGED');
+    assert.equal(pool.isReady(key), false, 'a failed generation check drops readiness');
+    assert.equal(pool.snapshot().entries.length, 0, 'and the session of the stale lease');
+    await call(key);
+    assert.equal(count(upstream.log, (row) => row.rpc === 'initialize'), 2, 'the next call opens a new session');
+    assert.equal(pool.isReady(key), true);
+    await call(keyFor({ port: upstream.port, lease: 'lease-2' }));
+    assert.equal(pool.isReady(key), false, 'a new lease for the route drops the old key');
+});
+
+test('readiness (proxy): after a generation change the next call probes again', async (t) => {
+    const { proxy, audience, secret } = await loadProxyFixture();
+    const { forwarder } = await startEchoAgentBehindForwarder(t, { secret, audience });
+    const pool = newPool(t);
+    const readiness = readinessSpy(true);
+    const { route, routePlan, key } = proxyRoute(forwarder.port, 'lease-readiness-generation');
+    const sessionId = openRouterSession(proxy);
+    const call = (label, beforeDial = () => true) => proxyCall(proxy, {
+        route, routePlan, sessionId, pool, waitForAgentReady: readiness.fn, body: toolsCall(label), beforeDial,
+    });
+    proxyToolPayload((await call('first')).json);
+    proxyToolPayload((await call('cached')).json);
+    assert.equal(readiness.calls, 1);
+    assert.equal(pool.isReady(key), true);
+    const stale = await call('stale', () => false);
+    assert.match(stale.json.error?.message || '', /edge routing generation changed/);
+    assert.equal(pool.isReady(key), false);
+    proxyToolPayload((await call('after')).json);
+    assert.equal(readiness.calls, 2, 'the call after a generation change runs the readiness probe');
 });

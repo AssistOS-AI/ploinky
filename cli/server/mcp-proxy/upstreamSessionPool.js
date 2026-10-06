@@ -540,9 +540,9 @@ export function createUpstreamSessionPool({
             return;
         }
         if (error?.code === EDGE_GENERATION_CHANGED) {
-            // A half-open session is useless; a ready entry stays for the
-            // current lease's other requests (each runs its own check).
-            if (!entry.sessionId || entry.opening) evict(entry);
+            // The key's lease is no longer active: drop its readiness and its
+            // session (DELETE after any call in flight finishes).
+            evict(entry);
             return;
         }
         evict(entry);
