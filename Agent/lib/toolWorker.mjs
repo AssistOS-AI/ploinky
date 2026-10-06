@@ -2,10 +2,16 @@
 //
 // An agent opts in by declaring a worker command whose script imports this
 // module (its absolute path arrives in PLOINKY_TOOL_WORKER_MODULE) and calls
-// `serveToolWorker(handler)`. The pool talks to the worker over fd 3, a private
-// socketpair carrying newline-delimited JSON frames:
+// `serveToolWorker(handler)`.
 //
-//   worker -> pool  {"v":1,"type":"ready","pid"}
+// Channel. fd 3 carries only a one-time bootstrap token. The worker reads it,
+// connects to the pool's private Unix socket (PLOINKY_TOOL_WORKER_SOCKET),
+// proves itself with the token and closes fd 3. libuv creates the connected
+// socket close-on-exec, so no tool child inherits the channel, reads later
+// calls' frames (which can carry invocation tokens) or forges replies. Frames
+// are newline-delimited JSON:
+//
+//   worker -> pool  {"v":1,"type":"hello","token"}, then {"v":1,"type":"ready","pid"}
 //   pool -> worker  {"v":1,"type":"call","id","toolName","toolEnv","envelope"}
 //   worker -> pool  {"v":1,"type":"result","id","exitCode","stdout","stderr","rssBytes","recycle"}
 //
@@ -21,6 +27,7 @@ export const TOOL_WORKER_PROTOCOL_VERSION = 1;
 export const TOOL_WORKER_EXIT_OUTSIDE_CALL = 70;
 
 const EXIT_FLUSH_TIMEOUT_MS = 1000;
+const BOOTSTRAP_MAX_BYTES = 1024;
 
 const callStorage = new AsyncLocalStorage();
 
@@ -60,8 +67,40 @@ function errorMessage(error) {
     return String(error);
 }
 
+function readBootstrapToken() {
+    return new Promise((resolve, reject) => {
+        const boot = new net.Socket({ fd: 3, readable: true, writable: false });
+        let text = '';
+        const onData = (chunk) => {
+            text += chunk;
+            const newline = text.indexOf('\n');
+            if (newline !== -1) {
+                boot.removeListener('data', onData);
+                resolve({ token: text.slice(0, newline), boot });
+            } else if (text.length > BOOTSTRAP_MAX_BYTES) {
+                reject(new Error('tool worker bootstrap token is too long'));
+            }
+        };
+        boot.setEncoding('utf8');
+        boot.on('data', onData);
+        boot.on('error', reject);
+        boot.once('end', () => reject(new Error('tool worker bootstrap channel closed before the token')));
+    });
+}
+
+function connectChannel(socketPath) {
+    return new Promise((resolve, reject) => {
+        const socket = net.createConnection(socketPath);
+        socket.once('connect', () => {
+            socket.removeListener('error', reject);
+            resolve(socket);
+        });
+        socket.once('error', reject);
+    });
+}
+
 /**
- * Serve tool calls on fd 3 until the pool closes the channel.
+ * Serve tool calls until the pool closes the channel.
  *
  * @param {(call: { toolName: string, toolEnv: object, envelope: object, stdout: Writable, stderr: Writable }) => any} handler
  *   Runs one call. Output goes to the given streams or to process.stdout/stderr
@@ -79,7 +118,17 @@ export async function serveToolWorker(handler) {
         throw new Error('serveToolWorker must run under a Ploinky tool worker pool (PLOINKY_TOOL_WORKER_PROTOCOL is not 1)');
     }
 
-    const channel = new net.Socket({ fd: 3, readable: true, writable: true });
+    const socketPath = process.env.PLOINKY_TOOL_WORKER_SOCKET;
+    if (!socketPath) {
+        throw new Error('serveToolWorker requires PLOINKY_TOOL_WORKER_SOCKET');
+    }
+    const { token, boot } = await readBootstrapToken();
+    const channel = await connectChannel(socketPath);
+    channel.write(`${JSON.stringify({ v: TOOL_WORKER_PROTOCOL_VERSION, type: 'hello', token })}\n`);
+    // The channel is now a close-on-exec socket: drop fd 3 so no tool child
+    // can inherit any path to the pool.
+    boot.destroy();
+    delete process.env.PLOINKY_TOOL_WORKER_SOCKET;
     const originalStdoutWrite = process.stdout.write;
     const originalStderrWrite = process.stderr.write;
     const strayPrefix = Buffer.from(`[toolWorker pid=${process.pid}] `);
@@ -301,6 +350,7 @@ export async function serveToolWorker(handler) {
         if (start < chunk.length) pending.push(chunk.subarray(start));
     });
     channel.on('end', () => exitHostGone());
+    channel.on('close', () => exitHostGone());
     channel.on('error', () => exitHostGone());
 
     envSnapshot = snapshotEnv();

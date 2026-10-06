@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -453,6 +454,44 @@ test('timeouts above the 2^31-1 ms timer limit are clamped instead of firing at 
     assert.equal(perCall.code, 0, perCall.stderr);
     await sleep(100);
     assert.equal(pool.stats().workers, 1, 'the idle timer must not fire at once');
+});
+
+test('tool children cannot reach the worker channel through fd 3', async (t) => {
+    const dir = makeDir(t);
+    const { pool, logs } = makePool(t, dir, { size: 1 });
+    const firstPid = await echoPid(pool);
+    const probe = await callTool(pool, { mode: 'probeFd3' });
+    assert.equal(probe.code, 0, probe.stderr);
+    const seen = JSON.parse(probe.stdout);
+    for (const [label, report] of Object.entries(seen)) {
+        assert.notEqual(report.fstat, 'socket', `${label}: fd 3 of a tool child is a socket: ${JSON.stringify(report)}`);
+        assert.notEqual(report.write, 'ok', `${label}: a tool child wrote to fd 3: ${JSON.stringify(report)}`);
+    }
+    assert.equal(await echoPid(pool), firstPid, 'the worker was not disturbed');
+    assert.ok(!logs.some((line) => line.includes('protocol error')), JSON.stringify(logs));
+});
+
+test('the handshake socket rejects a peer without the bootstrap token', async (t) => {
+    const dir = makeDir(t);
+    const { pool } = makePool(t, dir, { size: 1, env: { FIXTURE_DELAY_BEFORE_SERVE_MS: '400' } });
+    const pending = callTool(pool, { mode: 'echo' }, { timeoutMs: 10_000 });
+    const starting = [...pool.workers][0];
+    assert.ok(await waitUntil(() => starting.child && starting.socketPath, 3000));
+    const socketPath = starting.socketPath;
+    assert.equal(fs.statSync(path.dirname(socketPath)).mode & 0o777, 0o700);
+    const intruder = net.createConnection(socketPath);
+    intruder.on('error', () => {});
+    await new Promise((resolve) => intruder.once('connect', resolve));
+    intruder.write(`${JSON.stringify({ v: 1, type: 'hello', token: 'f'.repeat(64) })}\n`);
+    const closed = await Promise.race([
+        new Promise((resolve) => intruder.once('close', () => resolve(true))),
+        sleep(2000).then(() => false),
+    ]);
+    assert.equal(closed, true, 'the pool kept a peer that failed the handshake');
+    const result = await pending;
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(JSON.parse(result.stdout).pid, starting.pid);
+    assert.equal(fs.existsSync(path.dirname(socketPath)), false, 'the socket directory is removed after the handshake');
 });
 
 test('T15: SIGKILL of the host process ends its workers within 2 s', async (t) => {

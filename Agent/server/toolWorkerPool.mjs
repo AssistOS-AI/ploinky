@@ -2,14 +2,22 @@
 //
 // An agent declares `toolWorkers.<pool>` in its MCP config; tools that name
 // that pool can run in a warm worker instead of a fresh process per call. Each
-// worker is spawned detached (it leads its own process group), gets
-// /dev/null on stdin and talks to the pool over fd 3 with newline-delimited
-// JSON frames (see Agent/lib/toolWorker.mjs). Pools never retry a call, never
+// worker is spawned detached (it leads its own process group) and gets
+// /dev/null on stdin. fd 3 carries only a one-time bootstrap token; frames
+// (newline-delimited JSON, see Agent/lib/toolWorker.mjs) travel over a private
+// Unix socket the worker connects to and proves itself on with that token. The
+// worker's end of that socket is close-on-exec and fd 3 is closed after the
+// handshake, so tool children cannot reach the channel. Pools never retry a call, never
 // log frames (they can carry invocation tokens) and never leave a worker
 // process group behind: timeouts, crashes, recycling and shutdown all end with
 // a SIGKILL to the worker's process group.
 
 import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import net from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const TOOL_WORKER_MODULE_PATH = fileURLToPath(new URL('../lib/toolWorker.mjs', import.meta.url));
@@ -39,6 +47,9 @@ const EXIT_SETTLE_MS = 1000;
 // flushing); give it this long before the pool kills it.
 const CHANNEL_END_GRACE_MS = 500;
 const MAX_LOG_PARTIAL_CHARS = 64 * 1024;
+const HELLO_MAX_BYTES = 4096;
+// sockaddr_un.sun_path is 104 bytes on macOS and 108 on Linux.
+const MAX_SOCKET_PATH_BYTES = 100;
 
 const registeredPools = new Set();
 
@@ -55,6 +66,30 @@ function timerDelay(value, fallback) {
 
 function nonNegativeInteger(value, fallback) {
     return Number.isInteger(value) && value >= 0 ? value : fallback;
+}
+
+// A fresh 0700 directory per worker for its handshake socket. The socket is
+// removed as soon as the worker has connected.
+function createSocketPath() {
+    for (const base of [os.tmpdir(), '/tmp']) {
+        let dir;
+        try {
+            dir = fs.mkdtempSync(path.join(base, 'ptw-'));
+        } catch (_) {
+            continue;
+        }
+        const socketPath = path.join(dir, 's');
+        if (Buffer.byteLength(socketPath) <= MAX_SOCKET_PATH_BYTES) return { dir, socketPath };
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+    throw new Error('no directory with a short enough path for a tool worker socket');
+}
+
+function tokensEqual(received, expected) {
+    if (typeof received !== 'string') return false;
+    const a = Buffer.from(received);
+    const b = Buffer.from(expected);
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
 function failureResult(message) {
@@ -345,6 +380,84 @@ export class ToolWorkerPool {
     }
 
     spawnWorker() {
+        this.counters.spawned += 1;
+        const worker = {
+            child: null,
+            pid: null,
+            channel: null,
+            server: null,
+            socketDir: null,
+            socketPath: null,
+            token: crypto.randomBytes(32).toString('hex'),
+            state: 'starting',
+            calls: 0,
+            call: null,
+            idleTimer: null,
+            readyTimer: null,
+            gone: false,
+        };
+        this.workers.add(worker);
+        worker.readyTimer = setTimeout(() => {
+            if (worker.state !== 'starting') return;
+            this.log(`${this.prefix(worker)} not ready after ${this.readyTimeoutMs}ms; killing it`);
+            this.retire(worker);
+            if (!worker.child) this.abandonStart(worker);
+        }, this.readyTimeoutMs);
+
+        try {
+            const { dir, socketPath } = createSocketPath();
+            worker.socketDir = dir;
+            worker.socketPath = socketPath;
+        } catch (error) {
+            this.log(`[toolWorkerPool:${this.name}] cannot create a worker socket: ${error?.message || error}`);
+            setImmediate(() => this.abandonStart(worker));
+            return true;
+        }
+        const server = net.createServer();
+        worker.server = server;
+        server.on('connection', (socket) => this.onHandshakeConnection(worker, socket));
+        server.on('error', (error) => {
+            this.log(`[toolWorkerPool:${this.name}] worker socket error: ${error?.message || error}`);
+            if (!worker.child) this.abandonStart(worker);
+            else this.retire(worker);
+        });
+        server.listen(worker.socketPath, () => this.launchWorker(worker));
+        return true;
+    }
+
+    prefix(worker) {
+        return `[toolWorker:${this.name} pid=${worker.pid ?? '?'}]`;
+    }
+
+    // A worker that never got a process (socket setup failed, or it was
+    // retired before its listener was ready).
+    abandonStart(worker) {
+        if (worker.gone || worker.child) return;
+        this.onWorkerGone(worker, { code: null, signal: null });
+    }
+
+    closeServer(worker) {
+        const server = worker.server;
+        worker.server = null;
+        if (server) {
+            try {
+                server.close();
+            } catch (_) {
+                // Already closed.
+            }
+        }
+        if (worker.socketDir) {
+            fs.rmSync(worker.socketDir, { recursive: true, force: true });
+            worker.socketDir = null;
+        }
+    }
+
+    launchWorker(worker) {
+        if (worker.gone) return;
+        if (worker.state !== 'starting' || this.shuttingDown) {
+            this.abandonStart(worker);
+            return;
+        }
         let child;
         try {
             child = spawn(this.command, this.args, {
@@ -354,45 +467,34 @@ export class ToolWorkerPool {
                     ...this.env,
                     PLOINKY_TOOL_WORKER_PROTOCOL: String(TOOL_WORKER_PROTOCOL_VERSION),
                     PLOINKY_TOOL_WORKER_MODULE: TOOL_WORKER_MODULE_PATH,
+                    PLOINKY_TOOL_WORKER_SOCKET: worker.socketPath,
                 },
                 stdio: ['ignore', 'pipe', 'pipe', 'pipe'],
                 detached: true,
             });
         } catch (error) {
             this.log(`[toolWorkerPool:${this.name}] spawn failed: ${error?.message || error}`);
-            this.recordPreReadyDeath();
-            return false;
+            this.abandonStart(worker);
+            return;
         }
-        this.counters.spawned += 1;
-        const worker = {
-            child,
-            pid: child.pid,
-            channel: child.stdio[3],
-            state: 'starting',
-            calls: 0,
-            call: null,
-            idleTimer: null,
-            readyTimer: null,
-            gone: false,
-        };
-        this.workers.add(worker);
+        worker.child = child;
+        worker.pid = child.pid;
 
-        const prefix = () => `[toolWorker:${this.name} pid=${worker.pid ?? '?'}]`;
         const forward = (stream) => {
             let partial = '';
             stream.setEncoding('utf8');
             stream.on('data', (text) => {
                 const lines = (partial + text).split('\n');
                 partial = lines.pop();
-                for (const line of lines) if (line) this.log(`${prefix()} ${line}`);
+                for (const line of lines) if (line) this.log(`${this.prefix(worker)} ${line}`);
                 // Output without newlines (e.g. from a tool child) is not held forever.
                 if (partial.length > MAX_LOG_PARTIAL_CHARS) {
-                    this.log(`${prefix()} ${partial}`);
+                    this.log(`${this.prefix(worker)} ${partial}`);
                     partial = '';
                 }
             });
             stream.on('end', () => {
-                if (partial) this.log(`${prefix()} ${partial}`);
+                if (partial) this.log(`${this.prefix(worker)} ${partial}`);
                 partial = '';
             });
             stream.on('error', () => {});
@@ -400,38 +502,84 @@ export class ToolWorkerPool {
         forward(child.stdout);
         forward(child.stderr);
 
-        const decoder = new FrameDecoder(
-            this.maxFrameBytes,
-            (frame) => this.onFrame(worker, frame),
-            (reason) => this.onProtocolError(worker, reason),
-        );
-        if (worker.channel) {
-            worker.channel.on('data', (chunk) => decoder.push(chunk));
-            worker.channel.on('error', () => {});
-            // A worker that closes its channel can no longer answer: end it.
-            worker.channel.on('end', () => {
-                if (worker.gone) return;
-                worker.endTimer = setTimeout(() => this.retire(worker), CHANNEL_END_GRACE_MS);
-                worker.endTimer.unref?.();
-            });
+        // fd 3: the bootstrap token, then EOF. Nothing else ever travels there.
+        const boot = child.stdio[3];
+        if (boot) {
+            boot.on('error', () => {});
+            boot.on('data', () => {});
+            boot.end(`${worker.token}\n`);
         }
 
-        worker.readyTimer = setTimeout(() => {
-            if (worker.state !== 'starting') return;
-            this.log(`${prefix()} not ready after ${this.readyTimeoutMs}ms; killing it`);
-            this.retire(worker);
-        }, this.readyTimeoutMs);
-
         child.on('error', (error) => {
-            this.log(`${prefix()} process error: ${error?.message || error}`);
+            this.log(`${this.prefix(worker)} process error: ${error?.message || error}`);
             if (!child.pid) this.onWorkerGone(worker, { code: null, signal: null, spawnError: true });
         });
         child.on('exit', (code, signal) => this.onWorkerExit(worker, { code, signal }));
         child.on('close', () => {
             worker.stdioClosed = true;
-            if (worker.exitInfo) this.onWorkerGone(worker, worker.exitInfo);
+            this.maybeGone(worker);
         });
-        return true;
+    }
+
+    // Accept the worker's channel only from a peer that presents its token.
+    onHandshakeConnection(worker, socket) {
+        socket.on('error', () => {});
+        if (worker.channel || worker.state !== 'starting') {
+            socket.destroy();
+            return;
+        }
+        let buffered = Buffer.alloc(0);
+        const onData = (chunk) => {
+            buffered = Buffer.concat([buffered, chunk]);
+            const newline = buffered.indexOf(0x0a);
+            if (newline === -1) {
+                if (buffered.length > HELLO_MAX_BYTES) socket.destroy();
+                return;
+            }
+            socket.removeListener('data', onData);
+            let hello = null;
+            try {
+                hello = JSON.parse(buffered.subarray(0, newline).toString('utf8'));
+            } catch (_) {
+                hello = null;
+            }
+            if (!hello || hello.v !== TOOL_WORKER_PROTOCOL_VERSION || hello.type !== 'hello'
+                || !tokensEqual(hello.token, worker.token) || worker.channel || worker.state !== 'starting') {
+                socket.destroy();
+                return;
+            }
+            this.adoptChannel(worker, socket, buffered.subarray(newline + 1));
+        };
+        socket.on('data', onData);
+    }
+
+    adoptChannel(worker, socket, rest) {
+        worker.channel = socket;
+        worker.token = null;
+        this.closeServer(worker);
+        const decoder = new FrameDecoder(
+            this.maxFrameBytes,
+            (frame) => this.onFrame(worker, frame),
+            (reason) => this.onProtocolError(worker, reason),
+        );
+        socket.on('data', (chunk) => decoder.push(chunk));
+        // A worker that closes its channel can no longer answer: end it.
+        socket.on('end', () => {
+            if (worker.gone) return;
+            worker.endTimer = setTimeout(() => this.retire(worker), CHANNEL_END_GRACE_MS);
+            worker.endTimer.unref?.();
+        });
+        socket.on('close', () => {
+            worker.channelClosed = true;
+            this.maybeGone(worker);
+        });
+        if (rest.length) decoder.push(rest);
+    }
+
+    maybeGone(worker) {
+        if (worker.exitInfo && worker.stdioClosed && (!worker.channel || worker.channelClosed)) {
+            this.onWorkerGone(worker, worker.exitInfo);
+        }
     }
 
     onFrame(worker, frame) {
@@ -586,11 +734,8 @@ export class ToolWorkerPool {
         if (worker.gone || worker.exitInfo) return;
         worker.exitInfo = exitInfo;
         killWorkerGroup(worker.child);
-        if (worker.stdioClosed) {
-            this.onWorkerGone(worker, exitInfo);
-            return;
-        }
         worker.settleTimer = setTimeout(() => this.onWorkerGone(worker, exitInfo), EXIT_SETTLE_MS);
+        this.maybeGone(worker);
     }
 
     onWorkerGone(worker, { code, signal }) {
@@ -607,6 +752,7 @@ export class ToolWorkerPool {
         worker.idleTimer = null;
         worker.readyTimer = null;
         this.workers.delete(worker);
+        this.closeServer(worker);
         // Tool children may outlive the leader; end the whole group.
         killWorkerGroup(worker.child);
         try {

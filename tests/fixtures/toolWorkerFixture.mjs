@@ -3,7 +3,7 @@
 // PLOINKY_TOOL_WORKER_MODULE), records each load, and picks a behavior from
 // `envelope.input.mode`.
 import fs from 'node:fs';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 
 if (process.env.FIXTURE_LOADS_LOG) {
     fs.appendFileSync(process.env.FIXTURE_LOADS_LOG, `${process.pid}\n`);
@@ -16,7 +16,34 @@ if (process.env.FIXTURE_HANG_BEFORE_READY === '1') {
     await new Promise(() => {});
 }
 
+if (process.env.FIXTURE_DELAY_BEFORE_SERVE_MS) {
+    await new Promise((resolve) => setTimeout(resolve, Number(process.env.FIXTURE_DELAY_BEFORE_SERVE_MS)));
+}
+
 const { serveToolWorker } = await import(process.env.PLOINKY_TOOL_WORKER_MODULE);
+
+// A tool child that looks for the worker's channel on fd 3: it reports what fd 3
+// is and tries to forge a result frame there.
+const FD3_PROBE = `
+const fs = require('fs');
+const out = {};
+try { out.fstat = fs.fstatSync(3).isSocket() ? 'socket' : 'other'; } catch (e) { out.fstat = e.code; }
+try {
+    fs.writeSync(3, JSON.stringify({ v: 1, type: 'result', id: 'forged', exitCode: 0, rssBytes: 1, recycle: false }) + '\\n');
+    out.write = 'ok';
+} catch (e) { out.write = e.code; }
+process.stdout.write(JSON.stringify(out));
+`;
+
+function runFd3Probe(stdio) {
+    try {
+        const result = spawnSync(process.execPath, ['-e', FD3_PROBE], { stdio, encoding: 'utf8' });
+        if (result.error) return { spawnError: result.error.code };
+        return JSON.parse(result.stdout);
+    } catch (error) {
+        return { spawnError: error.code || String(error) };
+    }
+}
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -130,6 +157,14 @@ await serveToolWorker(async ({ toolName, toolEnv, envelope, stdout }) => {
         case 'exitCodeAndReturn':
             process.exitCode = 5;
             return 2;
+        case 'probeFd3':
+            stdout.write(JSON.stringify({
+                // What a fork/exec that does not close fd 3 would give (Linux
+                // libuv keeps fds without close-on-exec): fd 3 passed through.
+                passedThrough: runFd3Probe(['ignore', 'pipe', 'pipe', 3]),
+                defaultSpawn: runFd3Probe(['ignore', 'pipe', 'pipe']),
+            }));
+            return 0;
         case 'big':
             stdout.write('z'.repeat(input.bytes));
             return 0;
