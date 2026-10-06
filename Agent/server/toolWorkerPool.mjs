@@ -32,6 +32,7 @@ import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
 import { fileURLToPath } from 'node:url';
 import { toolWorkerEndMarker } from '../lib/toolWorker.mjs';
 
@@ -544,6 +545,8 @@ export class ToolWorkerPool {
         worker.pid = child.pid;
 
         worker.strayPartial = { stdout: '', stderr: '' };
+        // Multibyte characters can be split across pipe chunks.
+        worker.strayDecoder = { stdout: new StringDecoder('utf8'), stderr: new StringDecoder('utf8') };
         for (const streamName of ['stdout', 'stderr']) {
             const stream = child[streamName];
             stream.on('data', (chunk) => this.onPipeData(worker, streamName, chunk));
@@ -621,7 +624,7 @@ export class ToolWorkerPool {
     // the call.
     onStrayOutput(worker, streamName, chunk) {
         if (worker.state === 'retiring' || worker.gone) return;
-        this.logStray(worker, streamName, chunk.toString('utf8'));
+        this.logStray(worker, streamName, worker.strayDecoder[streamName].write(chunk));
         if (worker.state === 'idle') {
             this.log(`${this.prefix(worker)} output outside a call; replacing the worker`);
             this.counters.recycled += 1;
@@ -640,6 +643,8 @@ export class ToolWorkerPool {
     }
 
     flushStray(worker, streamName) {
+        const tail = worker.strayDecoder?.[streamName]?.end() || '';
+        if (tail) worker.strayPartial[streamName] += tail;
         const partial = worker.strayPartial?.[streamName];
         if (partial) this.log(`${this.prefix(worker)} ${partial}`);
         if (worker.strayPartial) worker.strayPartial[streamName] = '';

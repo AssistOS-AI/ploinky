@@ -634,6 +634,14 @@ test('fresh code: a failing codeIdentity hook sends calls to the spawn fallback'
     assert.ok(logs.some((line) => line.includes('codeIdentity failed (tool command missing)')));
 });
 
+test('stray output split inside a multibyte character is logged intact', async (t) => {
+    const dir = makeDir(t);
+    const { pool, logs } = makePool(t, dir, { size: 1, env: { FIXTURE_SPLIT_UTF8_BEFORE_SERVE: '1' } });
+    assert.equal((await callTool(pool, { mode: 'echo' })).code, 0);
+    assert.ok(logs.some((line) => line.endsWith(' caf\u00e9-\u00e9')), JSON.stringify(logs));
+    assert.ok(!logs.some((line) => line.includes('\ufffd')), JSON.stringify(logs));
+});
+
 test('T15: SIGKILL of the host process ends its workers within 2 s', async (t) => {
     const dir = makeDir(t);
     const pidDir = path.join(dir, 'pids');

@@ -16,6 +16,12 @@ if (process.env.FIXTURE_HANG_BEFORE_READY === '1') {
     await new Promise(() => {});
 }
 
+if (process.env.FIXTURE_SPLIT_UTF8_BEFORE_SERVE === '1') {
+    // Stray output before `ready` with a two-byte character split across writes.
+    process.stdout.write(Buffer.from([0x63, 0x61, 0x66, 0xc3]));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    process.stdout.write(Buffer.from([0xa9, 0x2d, 0xc3, 0xa9, 0x0a]));
+}
 if (process.env.FIXTURE_DELAY_BEFORE_SERVE_MS) {
     await new Promise((resolve) => setTimeout(resolve, Number(process.env.FIXTURE_DELAY_BEFORE_SERVE_MS)));
 }
