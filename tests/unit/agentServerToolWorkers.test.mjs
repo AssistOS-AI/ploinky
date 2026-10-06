@@ -463,3 +463,43 @@ test('maxParallelSyncCalls bounds sync calls that run as fresh processes; absent
     const unlimitedSpans = readLines(fx.files.spans).map((line) => line.split(' ').map(Number));
     assert.ok(maxOverlap(unlimitedSpans) >= 4, `spans: ${JSON.stringify(unlimitedSpans)}`);
 });
+
+test('the agentic tool loop runs opted-in tools in their pool and other tools as fresh processes', async (t) => {
+    const fx = await createFixtureAgent(t);
+    const config = {
+        toolWorkers: { fx: workerPool(fx) },
+        tools: [tool(fx, 'pid_worker', 'pid', { worker: 'fx' }), tool(fx, 'pid_spawn', 'pid')],
+    };
+    await fs.writeFile(fx.files.config, JSON.stringify(config));
+    const saved = { config: process.env.PLOINKY_AGENT_CONFIG, workers: process.env.PLOINKY_TOOL_WORKERS };
+    process.env.PLOINKY_AGENT_CONFIG = fx.files.config;
+    delete process.env.PLOINKY_TOOL_WORKERS;
+    globalThis[Symbol.for(IDENTITY_SYMBOL)] = () => readFileSync(fx.files.identity, 'utf8');
+    const { shutdownToolWorkerPools } = await import('../../Agent/server/toolWorkerPool.mjs');
+    t.after(async () => {
+        await shutdownToolWorkerPools({ timeoutMs: 5000 });
+        if (saved.config === undefined) delete process.env.PLOINKY_AGENT_CONFIG;
+        else process.env.PLOINKY_AGENT_CONFIG = saved.config;
+        if (saved.workers !== undefined) process.env.PLOINKY_TOOL_WORKERS = saved.workers;
+        delete globalThis[Symbol.for(IDENTITY_SYMBOL)];
+    });
+    const { __buildAgenticCompletion } = await import(`${new URL('../../Agent/server/AgentServer.mjs', import.meta.url).href}?agentic`);
+    const outputs = await __buildAgenticCompletion({
+        body: { messages: [{ role: 'user', content: 'hi' }] },
+        manifest: {},
+        config,
+        agentId: 'agent:test',
+        runResponder: async ({ toolsMap }) => {
+            const worker = [];
+            const spawned = [];
+            for (let i = 0; i < 3; i += 1) worker.push(Number(await toolsMap.pid_worker.handler(null, '{}')));
+            for (let i = 0; i < 3; i += 1) spawned.push(Number(await toolsMap.pid_spawn.handler(null, '{}')));
+            return { worker, spawned };
+        },
+    });
+    const loads = workerLoads(fx);
+    assert.equal(loads.length, 1);
+    assert.deepEqual(new Set(outputs.worker), new Set(loads), 'opted-in loop calls ran in the warm worker');
+    assert.equal(new Set(outputs.spawned).size, 3);
+    for (const pid of outputs.spawned) assert.ok(!loads.includes(pid));
+});

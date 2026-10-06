@@ -411,11 +411,25 @@ export { resolveOpenAiModelsKind };
 // Testable core: build the OpenAI completion via the agentic loop. `runResponder`
 // is injectable for tests; production passes runOpenAiAgenticResponse.
 export async function __buildAgenticCompletion({ body, manifest, config, agentId, runResponder = runOpenAiAgenticResponse }) {
+    const defaultCwd = process.env.PLOINKY_CODE_DIR || '/code';
+    // The loop's tool map is keyed by name (the last entry wins), so the
+    // routing is too.
+    const poolsByToolName = new Map();
+    for (const tool of Array.isArray(config?.tools) ? config.tools : []) {
+        if (!tool || typeof tool !== 'object' || typeof tool.name !== 'string') continue;
+        const pool = resolveToolWorkerPool(tool, buildCommandSpec(tool, defaultCwd));
+        if (pool) poolsByToolName.set(tool.name, pool);
+        else poolsByToolName.delete(tool.name);
+    }
     const toolsMap = buildLoopToolsFromMcp({
         tools: config?.tools,
-        defaultCwd: process.env.PLOINKY_CODE_DIR || '/code',
+        defaultCwd,
         buildCommandSpec,
-        runTool: executeShell,
+        runTool: (commandSpec, payload) => {
+            const pool = poolsByToolName.get(payload?.tool);
+            if (!pool) return executeShell(commandSpec, payload);
+            return callToolWorker(pool, commandSpec, payload, () => executeShell(commandSpec, payload));
+        },
     });
     return runResponder({
         toolsMap,
