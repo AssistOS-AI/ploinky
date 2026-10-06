@@ -127,6 +127,7 @@ function startHeartbeat() {
         max = Math.max(max, now - last);
         last = now;
     }, 1);
+    // Idempotent: a failing assertion must not leave the 1 ms timer running (it would keep the test process alive).
     return { stop() { clearInterval(timer); return Math.max(max, performance.now() - last); } };
 }
 
@@ -356,11 +357,16 @@ test('the event loop keeps running during a slow inventory (injected collector)'
     // Warm the listing path so the measurement sees only the inventory wait.
     await get({ agentListOptions: { summaries, liveContainers: [] } }).res.ended;
     const { best, gaps } = await bestEventLoopGap(async () => {
+        let gap;
         const heartbeat = startHeartbeat();
-        const request = get({ collectContainers: async () => { await sleep(300); return []; }, agentListOptions: { summaries } });
-        await request.res.ended;
-        assert.equal(request.res.status, 200);
-        return heartbeat.stop();
+        try {
+            const request = get({ collectContainers: async () => { await sleep(300); return []; }, agentListOptions: { summaries } });
+            await request.res.ended;
+            assert.equal(request.res.status, 200);
+        } finally {
+            gap = heartbeat.stop();
+        }
+        return gap;
     });
     assert.ok(best < 20, `event loop gaps ${gaps.map(gap => gap.toFixed(1)).join(', ')} ms`);
 });
@@ -370,14 +376,19 @@ test('the event loop keeps running while a real podman child takes 0.3 s (stub p
     try {
         await get({ agentListOptions: { summaries, liveContainers: [] } }).res.ended;
         const { best, gaps } = await bestEventLoopGap(async () => {
+            let gap;
             const heartbeat = startHeartbeat();
             const startedAt = performance.now();
-            const request = get({ agentListOptions: { summaries } });
-            await request.res.ended;
-            const elapsed = performance.now() - startedAt;
-            assert.equal(request.res.status, 200);
-            assert.ok(elapsed >= 250, `the stub child must really have run (elapsed ${elapsed.toFixed(0)} ms)`);
-            return heartbeat.stop();
+            try {
+                const request = get({ agentListOptions: { summaries } });
+                await request.res.ended;
+                const elapsed = performance.now() - startedAt;
+                assert.equal(request.res.status, 200);
+                assert.ok(elapsed >= 250, `the stub child must really have run (elapsed ${elapsed.toFixed(0)} ms)`);
+            } finally {
+                gap = heartbeat.stop();
+            }
+            return gap;
         });
         assert.ok(best < 20, `event loop gaps ${gaps.map(gap => gap.toFixed(1)).join(', ')} ms`);
     } finally {
