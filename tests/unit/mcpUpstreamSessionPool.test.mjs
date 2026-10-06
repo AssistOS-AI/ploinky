@@ -788,16 +788,21 @@ function loadProxyFixture() {
 
 function proxyRoute(port, lease) {
     const route = { repo: 'PoolTest', agent: 'echoAgent', container: PROXY_CONTAINER, hostPort: port };
+    const snapshot = {
+        routing: { routes: { echoAgent: route } },
+        agents: { [PROXY_CONTAINER]: {
+            type: 'agent', repoName: 'PoolTest', agentName: 'echoAgent',
+            containerId: 'd'.repeat(64), instanceId: 'proxy-instance', enableGeneration: 'proxy-enable',
+        } },
+    };
     const routePlan = {
         ok: true,
         kind: 'agent-root',
         routeKey: 'echoAgent',
-        lease: { id: lease },
+        lease: { id: lease, snapshot },
         target: { hostname: '127.0.0.1', hostPort: port },
         route,
-        snapshot: { agents: { [PROXY_CONTAINER]: {
-            containerId: 'd'.repeat(64), instanceId: 'proxy-instance', enableGeneration: 'proxy-enable',
-        } } },
+        snapshot,
     };
     return { route, routePlan, key: poolKeyForRoutePlan(routePlan) };
 }
@@ -1242,7 +1247,7 @@ test('readiness (proxy): after a generation change the next call probes again', 
     assert.equal(readiness.calls, 2, 'the call after a generation change runs the readiness probe');
 });
 
-test('provider principal: the route key resolves to the same target with or without a lease snapshot', async () => {
+test('provider principal: the supplied lease snapshot determines the target and an empty snapshot refuses', async () => {
     const { proxy, audience } = await loadProxyFixture();
     const { getAgentDescriptorByPrincipal } = await import('../../cli/utils/agentRegistry.js');
     const { deriveAgentPrincipalId } = await import('../../cli/utils/security/agentIdentity.js');
@@ -1255,11 +1260,48 @@ test('provider principal: the route key resolves to the same target with or with
     const mint = (extra) => proxy.buildInvocationContextForProviderCall({
         req: { user: PROXY_USER }, agentName: 'echoAgent', toolName: 'actor', toolArgs: { label: 'x' }, ...extra,
     }).payload;
-    for (const extra of [{}, { snapshot: undefined }, { snapshot: { agents: {}, routing: { routes: {} } } }]) {
+    const { routePlan } = proxyRoute(7401, 'principal-snapshot');
+    for (const extra of [{}, { snapshot: undefined }, { snapshot: routePlan.lease.snapshot }]) {
         const payload = mint(extra);
         assert.equal(payload.aud, expected);
         assert.equal(payload.sub, 'user:alice');
         assert.equal(payload.tool, 'actor');
+    }
+    assert.throws(() => mint({ snapshot: { agents: {}, routing: { routes: {} } } }),
+        /could not resolve provider 'echoAgent'/);
+    const otherSnapshot = {
+        agents: {},
+        routing: { routes: { echoAgent: { repo: 'LeaseTarget', agent: 'echoAgent' } } },
+    };
+    assert.equal(mint({ snapshot: otherSnapshot }).aud, deriveAgentPrincipalId('LeaseTarget', 'echoAgent'),
+        'the supplied lease decides even when the active generation routes the name elsewhere');
+});
+
+test('provider principal (proxy): pooled and SDK calls refuse an empty lease snapshot before dispatch', async (t) => {
+    const { proxy, audience, secret } = await loadProxyFixture();
+    const { forwarder } = await startEchoAgentBehindForwarder(t, { secret, audience });
+    const pool = newPool(t);
+    const readiness = readinessSpy(true);
+    const previous = process.env.PLOINKY_MCP_UPSTREAM_POOL;
+    t.after(() => {
+        if (previous === undefined) delete process.env.PLOINKY_MCP_UPSTREAM_POOL;
+        else process.env.PLOINKY_MCP_UPSTREAM_POOL = previous;
+    });
+    for (const mode of ['pooled', 'sdk']) {
+        if (mode === 'sdk') process.env.PLOINKY_MCP_UPSTREAM_POOL = '0';
+        else delete process.env.PLOINKY_MCP_UPSTREAM_POOL;
+        const { route, routePlan } = proxyRoute(forwarder.port, `lease-snapshot-${mode}`);
+        const sessionId = openRouterSession(proxy);
+        const call = (label) => proxyCall(proxy, {
+            route, routePlan, sessionId, pool, waitForAgentReady: readiness.fn, body: toolsCall(label),
+        });
+        assert.deepEqual(proxyToolPayload((await call(`${mode}-valid`)).json).actor, PROXY_ACTOR);
+        const callsBefore = count(forwarder.log, (row) => row.rpc === 'tools/call');
+        routePlan.lease = { ...routePlan.lease, snapshot: { agents: {}, routing: { routes: {} } } };
+        const refused = await call(`${mode}-empty`);
+        assert.match(refused.json.error?.message || '', /could not resolve provider 'echoAgent'/);
+        assert.equal(count(forwarder.log, (row) => row.rpc === 'tools/call'), callsBefore,
+            `${mode}: an empty lease snapshot cannot fall back to the active generation`);
     }
 });
 
