@@ -10,6 +10,9 @@ const TOOL_NAME_RE = /^[A-Za-z0-9._-]{1,160}$/;
 const DETAILS_URL_RE = /^\/(?!\/)[A-Za-z0-9\-._~%!$&'()*+,;=:@/?]*$/;
 const DETAILS_LABEL_MAX = 80;
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled']);
+const DEFAULT_PERSIST_DEBOUNCE_MS = 100;
+const DEFAULT_TERMINAL_RETENTION_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_MAX_TERMINAL_TASKS = 500;
 
 function parsePositiveInt(value, fallback) {
     const parsed = Number.parseInt(value, 10);
@@ -17,6 +20,43 @@ function parsePositiveInt(value, fallback) {
         return parsed;
     }
     return fallback;
+}
+
+function parseNonNegativeInt(value, fallback) {
+    const parsed = Number.parseInt(value, 10);
+    if (Number.isFinite(parsed) && parsed >= 0) {
+        return parsed;
+    }
+    return fallback;
+}
+
+function taskTimestamp(task) {
+    const updated = Date.parse(task?.updatedAt || '');
+    if (Number.isFinite(updated)) return updated;
+    const created = Date.parse(task?.createdAt || '');
+    return Number.isFinite(created) ? created : 0;
+}
+
+// The on-disk queue only lets the status, cancel and continuation endpoints
+// answer for tasks that finished before a restart; restored tasks never run
+// again. It therefore stores this allowlist and never the command spec or the
+// payload, which carries the raw invocation token, request headers, auth info
+// and tool input.
+function persistableTask(task) {
+    return {
+        id: task.id,
+        toolName: task.toolName,
+        status: task.status,
+        timeoutMs: task.timeoutMs,
+        createdAt: task.createdAt,
+        updatedAt: task.updatedAt,
+        error: task.error,
+        logRetention: task.logRetention,
+        continuationTool: task.continuationTool,
+        taskMessageTool: task.taskMessageTool,
+        liveContinuation: task.liveContinuation,
+        details: task.details,
+    };
 }
 
 function normalizeContinuation(raw) {
@@ -65,6 +105,9 @@ export class TaskQueue {
         executor,
         maxLogTailBytes = DEFAULT_MAX_LOG_TAIL_BYTES,
         cancelGraceMs = DEFAULT_CANCEL_GRACE_MS,
+        persistDebounceMs = DEFAULT_PERSIST_DEBOUNCE_MS,
+        terminalRetentionMs = DEFAULT_TERMINAL_RETENTION_MS,
+        maxTerminalTasks = DEFAULT_MAX_TERMINAL_TASKS,
     }) {
         if (typeof executor !== 'function') {
             throw new Error('TaskQueue requires an executor function');
@@ -74,6 +117,12 @@ export class TaskQueue {
         this.executor = executor;
         this.maxLogTailBytes = parsePositiveInt(maxLogTailBytes, DEFAULT_MAX_LOG_TAIL_BYTES);
         this.cancelGraceMs = parsePositiveInt(cancelGraceMs, DEFAULT_CANCEL_GRACE_MS);
+        this.persistDebounceMs = parseNonNegativeInt(persistDebounceMs, DEFAULT_PERSIST_DEBOUNCE_MS);
+        this.terminalRetentionMs = parsePositiveInt(terminalRetentionMs, DEFAULT_TERMINAL_RETENTION_MS);
+        this.maxTerminalTasks = parsePositiveInt(maxTerminalTasks, DEFAULT_MAX_TERMINAL_TASKS);
+        this.persistDirty = false;
+        this.persistTimer = null;
+        this.persistWrite = null;
         this.tasks = new Map();
         this.taskLogs = new Map();
         this.pending = [];
@@ -134,18 +183,11 @@ export class TaskQueue {
                     if (!entry || typeof entry !== 'object' || typeof entry.id !== 'string') {
                         continue;
                     }
-                    const commandSpec = entry.commandSpec || {};
+                    // Legacy files also carry commandSpec and payload. Restored
+                    // tasks never execute, so those fields are dropped here.
                     const task = {
                         id: entry.id,
                         toolName: entry.toolName,
-                        commandSpec: {
-                            command: commandSpec.command,
-                            args: Array.isArray(commandSpec.args) ? [...commandSpec.args] : [],
-                            cwd: commandSpec.cwd,
-                            env: commandSpec.env ? { ...(commandSpec.env) } : {},
-                            timeoutMs: commandSpec.timeoutMs,
-                        },
-                        payload: entry.payload,
                         status: entry.status || 'pending',
                         timeoutMs: entry.timeoutMs ?? null,
                         logRetention: entry.logRetention === 'full' ? 'full' : 'bounded',
@@ -165,6 +207,9 @@ export class TaskQueue {
                     };
                     this.tasks.set(task.id, task);
                 }
+                // Rewrite the file promptly so a legacy queue file that still
+                // holds tokens or headers does not outlive this restart.
+                this.persistTasks();
             }
         } catch (err) {
             if (err?.code !== 'ENOENT') {
@@ -173,31 +218,100 @@ export class TaskQueue {
         }
     }
 
-    persistTasks({ required = false } = {}) {
+    // Marks the persisted queue stale and schedules a debounced write.
+    persistTasks() {
         if (!this.storagePath) {
             return;
         }
+        this.persistDirty = true;
+        this.armPersistTimer();
+    }
+
+    armPersistTimer() {
+        if (this.persistTimer || this.persistWrite || !this.persistDirty) {
+            return;
+        }
+        this.persistTimer = setTimeout(() => {
+            this.persistTimer = null;
+            if (this.persistWrite) return;
+            this.startPersistWrite().then((error) => {
+                // A failed background write is retried by the next state
+                // change or by flushPersist, not in a tight timer loop.
+                if (!error) this.armPersistTimer();
+            });
+        }, this.persistDebounceMs);
+    }
+
+    // Starts the single in-flight write. Resolves to null on success or to the
+    // write error; it never rejects.
+    startPersistWrite() {
+        this.persistDirty = false;
+        const write = this.writeSnapshot().then(() => null, (error) => {
+            this.persistDirty = true;
+            console.error('[AgentServer/MCP] Failed to persist task queue:', error);
+            return error;
+        });
+        this.persistWrite = write;
+        write.then(() => {
+            if (this.persistWrite === write) this.persistWrite = null;
+        });
+        return write;
+    }
+
+    // Writes every pending change now, after any write already in flight.
+    // With required: true a persistence failure rejects.
+    async flushPersist({ required = false } = {}) {
+        if (!this.storagePath) {
+            return;
+        }
+        if (this.persistTimer) {
+            clearTimeout(this.persistTimer);
+            this.persistTimer = null;
+        }
+        for (;;) {
+            if (this.persistWrite) {
+                await this.persistWrite;
+                continue;
+            }
+            if (!this.persistDirty) {
+                return;
+            }
+            const error = await this.startPersistWrite();
+            if (error) {
+                if (required) throw error;
+                return;
+            }
+        }
+    }
+
+    pruneTerminalTasks(now = Date.now()) {
+        const terminal = [];
+        for (const task of this.tasks.values()) {
+            if (!TERMINAL_STATUSES.has(task.status)) continue;
+            if (this.running.has(task.id) || this.activeChildren.has(task.id)) continue;
+            terminal.push(task);
+        }
+        if (terminal.length === 0) return;
+        terminal.sort((a, b) => taskTimestamp(b) - taskTimestamp(a));
+        terminal.forEach((task, index) => {
+            if (index < this.maxTerminalTasks && now - taskTimestamp(task) <= this.terminalRetentionMs) {
+                return;
+            }
+            this.tasks.delete(task.id);
+            this.taskLogs.delete(task.id);
+        });
+    }
+
+    async writeSnapshot() {
+        this.pruneTerminalTasks();
+        const json = JSON.stringify([...this.tasks.values()].map(persistableTask));
+        const tmpPath = `${this.storagePath}.tmp-${process.pid}-${randomBytes(6).toString('hex')}`;
         try {
-            const snapshot = [...this.tasks.values()].map(task => ({
-                id: task.id,
-                toolName: task.toolName,
-                commandSpec: task.commandSpec,
-                payload: task.payload,
-                status: task.status,
-                timeoutMs: task.timeoutMs,
-                createdAt: task.createdAt,
-                updatedAt: task.updatedAt,
-                error: task.error,
-                logRetention: task.logRetention,
-                continuationTool: task.continuationTool,
-                taskMessageTool: task.taskMessageTool,
-                liveContinuation: task.liveContinuation,
-                details: task.details,
-            }));
-            fs.writeFileSync(this.storagePath, JSON.stringify(snapshot, null, 2));
+            await fs.promises.writeFile(tmpPath, json, { mode: 0o600, flag: 'wx' });
+            await fs.promises.rename(tmpPath, this.storagePath);
         } catch (err) {
-            if (required) throw err;
-            console.error('[AgentServer/MCP] Failed to persist task queue:', err);
+            await fs.promises.rm(tmpPath, { force: true }).catch(() => {});
+            throw err;
         }
     }
 
@@ -500,7 +614,7 @@ export class TaskQueue {
             }
             const cancellationFailure = this.cancellationFailures.values().next().value;
             if (cancellationFailure) throw cancellationFailure;
-            this.persistTasks({ required: true });
+            await this.flushPersist({ required: true });
             return Object.freeze({ state: 'drained' });
         })();
         return this.shutdownPromise;
