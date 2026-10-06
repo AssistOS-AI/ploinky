@@ -11,6 +11,8 @@ import {
     releaseExactPublicationLease,
     startCloudflarePublicationRuntime,
 } from '../../ploinky-box/cloudflared/runtime.mjs';
+import * as edgeGeneration from '../../cli/sandbox/edgeGeneration.js';
+import { makeWorld } from './hardwareAvailabilityResolverFixtures.mjs';
 
 const GENERATION = `sha256:${'a'.repeat(64)}`;
 
@@ -1139,3 +1141,65 @@ test('a newer selected activation cancels an older scheduled publication retry',
     assert.deepEqual(activationInputs, [GENERATION, newerGeneration]);
     await runtime.stop();
 });
+
+// R1: the verified-generation cache must not hide a generation file that is
+// damaged after warm-up. This drives the scan against the real loader.
+for (const damage of ['corrupted in place', 'deleted']) {
+    test(`a warm generation cache does not hide a generation file ${damage} from the publication scan`, async (t) => {
+        t.mock.method(console, 'error', () => {});
+        t.mock.method(console, 'log', () => {});
+        const world = makeWorld(t);
+        const generation = world.selection().generation;
+        const file = path.join(world.paths.generationsDir, `${generation.replace(/^sha256:/, '')}.json`);
+        edgeGeneration.__testables.resetActiveGenerationCache();
+        edgeGeneration.loadActiveEdgeRoutingGeneration(world.options);
+        assert.equal(edgeGeneration.__testables.activeGenerationCacheStats().size, 1, 'the cache is warm');
+        const warmReconstructs = edgeGeneration.__testables.activeGenerationCacheStats().reconstructs;
+        edgeGeneration.loadActiveEdgeRoutingGeneration(world.options);
+        assert.equal(edgeGeneration.__testables.activeGenerationCacheStats().reconstructs, warmReconstructs);
+
+        if (damage === 'deleted') fs.unlinkSync(file);
+        else fs.writeFileSync(file, '{"schemaVersion":1,"truncated":');
+
+        let heldLease = null;
+        const invalidations = [];
+        const auditEvents = [];
+        const runtime = startCloudflarePublicationRuntime({
+            workspaceRoot: world.root,
+            statusFile: path.join(world.root, 'status.json'),
+            pollIntervalMs: 60_000,
+            createWorkspaceLease: ({ operation }) => {
+                assert.equal(heldLease, null);
+                heldLease = { token: 'lease-warm-cache', operation };
+                return heldLease;
+            },
+            releaseWorkspaceLease: (lease) => {
+                assert.equal(lease, heldLease);
+                heldLease = null;
+                return true;
+            },
+            inactivateInvalidGeneration: (reason, options) => {
+                assert.ok(heldLease, 'invalid-generation inactivation must run inside the workspace lease');
+                invalidations.push({ reason, workspaceRoot: options?.workspaceRoot });
+            },
+            routeCoordinatorFactory: () => ({ inactivate() {}, commit() {} }),
+            controllerFactory: () => ({
+                reconcile: async () => assert.fail('a damaged generation must not reconcile'),
+                getStatus: () => ({ state: 'fixture' }),
+                stop: async () => {},
+            }),
+            probeHostname: async () => ({ ok: true }),
+            audit: (event, value) => auditEvents.push({ event, value }),
+        });
+        await runtime.scan();
+        // The runtime also scans once at start, so one or more invalidations are expected.
+        assert.ok(invalidations.length >= 1);
+        for (const invalidation of invalidations) {
+            assert.deepEqual(invalidation, { reason: 'publication-generation-invalid', workspaceRoot: world.root });
+        }
+        assert.ok(auditEvents.some(({ event, value }) => event === 'cloudflare-generation-load-error'
+            && value.code === 'EDGE_GENERATION_CORRUPT'));
+        assert.equal(heldLease, null);
+        await runtime.stop();
+    });
+}
