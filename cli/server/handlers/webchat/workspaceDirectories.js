@@ -3,6 +3,7 @@ import path from 'path';
 import { setImmediate } from 'node:timers/promises';
 
 import { readJsonBody } from '../common.js';
+import { sortWorkspaceEntriesAsync } from '../../utils/workspacePaths.js';
 import {
     resolveWorkspaceDirectory,
     sanitizeUploadDirectoryPath,
@@ -50,14 +51,14 @@ export async function listWorkspaceDirectory(context, relativePath = '') {
             kind: entry.isDirectory() ? 'folder' : 'file',
         });
     }
-    entries.sort((left, right) => {
+    const sortedEntries = await sortWorkspaceEntriesAsync(entries, (left, right) => {
         if (left.kind !== right.kind) return left.kind === 'folder' ? -1 : 1;
         return collator.compare(left.name, right.name);
     });
     return {
         path: directory.relativePath,
         parentPath: directoryParent(directory.relativePath),
-        entries,
+        entries: sortedEntries,
     };
 }
 

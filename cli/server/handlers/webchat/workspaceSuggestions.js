@@ -5,7 +5,8 @@ import { setImmediate } from 'node:timers/promises';
 import {
     getWorkspaceRoot,
     resolveWorkspacePath,
-    resolveWorkspacePathAsync
+    resolveWorkspacePathAsync,
+    sortWorkspaceEntriesAsync
 } from '../../utils/workspacePaths.js';
 const RESERVED_SECRET_PATH_RE = /(^|\/)\.secrets$|\.secrets$/i;
 const MAX_SUGGESTION_RESULTS = 30;
@@ -129,8 +130,7 @@ function listImmediateWorkspaceSuggestions({ safeRoot, safeBase, scanDir, leafLo
     return sortWorkspaceSuggestions(candidates, leafLower).slice(0, limit);
 }
 
-function suggestionSortKey(item, query) {
-    const displayPath = String(item.displayPath || item.path || item.label || '');
+function suggestionSortKey(displayPath, kind, query) {
     const normalizedPath = displayPath.toLowerCase();
     const segments = displayPath.split('/').filter(Boolean);
     let rank = 0;
@@ -140,7 +140,7 @@ function suggestionSortKey(item, query) {
         else if (segments.some((segment) => segment.toLowerCase().startsWith(query))) rank = 2;
         else rank = normalizedPath.includes(query) ? 3 : 4;
     }
-    return { rank, kind: item.kind, segments };
+    return { rank, kind, segments };
 }
 
 function compareSuggestionKeys(left, right) {
@@ -176,13 +176,14 @@ async function readSuggestionStatAsync(absolute, safeRoot) {
     }
 }
 
-async function readSuggestionBatch(candidates, safeRoot) {
+async function readSuggestionBatch(candidates, safeRoot, scanDir) {
     const stats = new Array(candidates.length);
     let next = 0;
     await Promise.all(Array.from({ length: Math.min(8, candidates.length) }, async () => {
         while (next < candidates.length) {
             const index = next++;
-            stats[index] = await readSuggestionStatAsync(candidates[index].absolute, safeRoot);
+            const absolute = path.join(scanDir, candidates[index].name);
+            stats[index] = await readSuggestionStatAsync(absolute, safeRoot);
         }
     }));
     return stats;
@@ -196,42 +197,48 @@ async function listImmediateWorkspaceSuggestionsAsync({ safeRoot, safeBase, scan
         return [];
     }
     const candidates = [];
+    const rootPrefix = path.relative(safeRoot, scanDir).replace(/\\+/g, '/');
+    const basePrefix = path.relative(safeBase, scanDir).replace(/\\+/g, '/');
     for (let index = 0; index < entries.length; index += 1) {
         // Bound preprocessing work even on a large, unsorted directory.
         if (index > 0 && index % 128 === 0) await setImmediate();
         const entry = entries[index];
         if (shouldSkipSuggestionEntry(entry.name)) continue;
         if (leafLower && !entry.name.toLowerCase().includes(leafLower)) continue;
-        const absolute = path.join(scanDir, entry.name);
-        const item = buildWorkspaceSuggestion({ safeRoot, safeBase, absolute, name: entry.name, stat: entry });
-        if (!item) continue;
-        candidates.push({ absolute, item, key: suggestionSortKey(item, leafLower) });
+        const namePath = entry.name.replace(/\\+/g, '/');
+        const workspacePath = rootPrefix ? `${rootPrefix}/${namePath}` : namePath;
+        const displayPath = basePrefix ? `${basePrefix}/${namePath}` : namePath;
+        if (!isRelativeInside(workspacePath) || !isRelativeInside(displayPath)) continue;
+        if (isReservedSecretPath(workspacePath) || isReservedSecretPath(displayPath)) continue;
+        const kind = entry.isDirectory() ? 'folder' : 'file';
+        const candidate = suggestionSortKey(displayPath, kind, leafLower);
+        candidate.name = entry.name;
+        candidates.push(candidate);
     }
-    candidates.sort((left, right) => compareSuggestionKeys(left.key, right.key));
+    const sortedCandidates = await sortWorkspaceEntriesAsync(candidates, compareSuggestionKeys);
 
     const accepted = [];
     let kindChanged = false;
     const batchSize = Math.max(1, Math.floor(limit));
-    for (let offset = 0; offset < candidates.length && accepted.length < limit; offset += batchSize) {
-        const batch = candidates.slice(offset, offset + batchSize);
-        const stats = await readSuggestionBatch(batch, safeRoot);
+    for (let offset = 0; offset < sortedCandidates.length && accepted.length < limit; offset += batchSize) {
+        const batch = sortedCandidates.slice(offset, offset + batchSize);
+        const stats = await readSuggestionBatch(batch, safeRoot, scanDir);
         for (let index = 0; index < batch.length && accepted.length < limit; index += 1) {
             const stat = stats[index];
             if (!stat) continue;
-            const item = {
-                ...batch[index].item,
-                kind: stat.isDirectory() ? 'folder' : 'file',
-                size: !stat.isDirectory() && Number.isFinite(stat.size) ? stat.size : null,
-                mtimeMs: Number.isFinite(stat.mtimeMs) ? stat.mtimeMs : null
-            };
-            if (item.kind !== batch[index].item.kind) kindChanged = true;
+            const item = buildWorkspaceSuggestion({ safeRoot, safeBase,
+                absolute: path.join(scanDir, batch[index].name), name: batch[index].name, stat });
+            if (!item) continue;
+            if (item.kind !== batch[index].kind) kindChanged = true;
             accepted.push(item);
         }
     }
     if (kindChanged) {
-        const ranked = accepted.map((item) => ({ item, key: suggestionSortKey(item, leafLower) }));
-        ranked.sort((left, right) => compareSuggestionKeys(left.key, right.key));
-        return ranked.map(({ item }) => item);
+        const ranked = accepted.map((item) => ({ item,
+            key: suggestionSortKey(item.displayPath, item.kind, leafLower) }));
+        const sorted = await sortWorkspaceEntriesAsync(ranked,
+            (left, right) => compareSuggestionKeys(left.key, right.key));
+        return sorted.map(({ item }) => item);
     }
     return accepted;
 }

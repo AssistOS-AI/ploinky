@@ -94,6 +94,30 @@ function forbidSyncPathReads(t) {
     }
 }
 
+test('workspace sorting yields during comparisons and preserves comparator ties and array boundaries', async (t) => {
+    const sortAsync = paths.sortWorkspaceEntriesAsync || (async (items, compare) => items.sort(compare));
+    assert.deepEqual(await sortAsync([], () => 0), []);
+    const single = [{ key: 0, ordinal: 0 }];
+    assert.deepEqual(await sortAsync(single, () => 0), single);
+    const input = Array.from({ length: 20000 }, (_, ordinal) => ({ key: ordinal % 7, ordinal }));
+    const expected = [...input].sort((left, right) => left.key - right.key);
+    let ticks = 0;
+    let comparedAfterYield = false;
+    let pending;
+    function tick() {
+        ticks += 1;
+        pending = setImmediate(tick);
+    }
+    pending = setImmediate(tick);
+    t.after(() => clearImmediate(pending));
+    const sorted = await sortAsync(input, (left, right) => {
+        if (ticks > 0) comparedAfterYield = true;
+        return left.key - right.key;
+    });
+    assert.deepEqual(sorted, expected);
+    assert.equal(comparedAfterYield, true, 'a large sort must yield before its comparisons finish');
+});
+
 test('async directory listing matches the 5000-entry shuffled oracle without per-entry lstat', async (t) => {
     const root = fixture(t, 'directories-large');
     for (let index = 0; index < 5000; index += 1) {
@@ -190,9 +214,13 @@ test('async suggestions match twelve folder/leaf queries with bounded stat work 
     assert.equal(count.sync, 0, 'the suggestion reader must not lstat synchronously');
     assert.ok(count.maxInFlight <= 8, `observed ${count.maxInFlight} in flight`);
     const before = count.async;
+    let relativeCalls = 0;
+    const relative = path.relative;
+    t.mock.method(path, 'relative', (...args) => { relativeCalls += 1; return relative(...args); });
     const result = await suggestAsync({ workspaceRoot: root, base: root, leaf: 'file', limit: 30 });
     assert.equal(result.items.length, 30);
     assert.ok(count.async - before <= 60, `observed ${count.async - before} stats for 30 results`);
+    assert.ok(relativeCalls <= 70, `observed ${relativeCalls} path computations for 30 accepted results`);
 });
 
 test('async suggestions retain default Unicode, case and accent ordering rather than base sensitivity', async (t) => {
