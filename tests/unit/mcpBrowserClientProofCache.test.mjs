@@ -31,6 +31,7 @@ async function startRouter(t, { routeKey = 'dpuAgent', onToolCall, onTaskStatus 
         mutations: [],
         rejected: 0,
         unauthorizedOnce: false,
+        proofFailures: 0,
     };
     const server = http.createServer(async (req, res) => {
         const url = new URL(req.url || '/', `http://${req.headers.host}`);
@@ -39,6 +40,11 @@ async function startRouter(t, { routeKey = 'dpuAgent', onToolCall, onTaskStatus 
             assert.equal(url.searchParams.get('mutationRoute'), routeKey);
             // Delay so that concurrent callers overlap with one in-flight fetch.
             await new Promise((resolve) => setTimeout(resolve, 20));
+            if (state.proofFailures > 0) {
+                state.proofFailures -= 1;
+                sendJson(res, 500, { error: 'proof_unavailable' });
+                return;
+            }
             sendJson(res, 200, {
                 ok: true,
                 browserMutation: {
@@ -170,6 +176,25 @@ test('a 401 and close() both drop the shared proof', async (t) => {
     const next = createAgentClient(endpoint);
     await next.connect();
     assert.equal(state.proofRequests, 3);
+});
+
+test('a failed proof fetch is shared by concurrent callers but never cached', async (t) => {
+    const { state, endpoint } = await startRouter(t);
+    state.proofFailures = 1;
+    const first = createAgentClient(endpoint);
+    const second = createAgentClient(endpoint);
+
+    const results = await Promise.allSettled([first.connect(), second.connect()]);
+    assert.deepEqual(results.map((entry) => entry.status), ['rejected', 'rejected']);
+    for (const entry of results) assert.match(String(entry.reason?.message), /Browser mutation proof failed: proof_unavailable/);
+    assert.equal(state.proofRequests, 1);
+    assert.equal(state.mutations.length, 0);
+
+    const third = createAgentClient(endpoint);
+    await third.connect();
+    assert.equal(state.proofRequests, 2);
+    assert.ok(state.mutations.length >= 2);
+    assert.ok(state.mutations.every((entry) => entry.csrf === 'v1.generation-1'));
 });
 
 test('proofs are never shared across origins for the same route', async (t) => {
