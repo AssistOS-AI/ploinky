@@ -128,7 +128,10 @@ test('providers can mutate nested configuration during beginLogin and remote val
     const snapshot = workspaceApi.getConfigSnapshot();
     assert.equal(Object.isFrozen(snapshot.sso.providerConfig.nested.items), true);
     const login = await bridge.beginLogin({ baseUrl: 'http://localhost:8080' });
-    assert.equal(login.redirectUrl, 'https://identity.test/2');
+    const redirect = new URL(login.redirectUrl);
+    assert.equal(redirect.origin, 'https://identity.test');
+    assert.equal(redirect.pathname, '/2');
+    assert.equal(redirect.searchParams.get('state'), login.state);
     const callback = await bridge.handleCallback({
         code: 'fixture-code', state: login.state, browserBinding: login.browserBinding,
         baseUrl: 'http://localhost:8080',

@@ -25,7 +25,13 @@ export function createValidatedJsonFileReader({ fsApi = fs, maxEntries = 16 } = 
 
     function read(absPath) {
         try {
-            const stat = fsApi.statSync(absPath, { bigint: true, throwIfNoEntry: false });
+            let stat;
+            try {
+                stat = fsApi.statSync(absPath, { bigint: true, throwIfNoEntry: false });
+            } catch (error) {
+                // Older supported runtimes do not suppress ENOTDIR here.
+                if (error?.code !== 'ENOTDIR') throw error;
+            }
             if (!stat) {
                 entries.delete(absPath);
                 misses += 1;

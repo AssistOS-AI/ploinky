@@ -178,6 +178,39 @@ test('missing paths and open-time ENOENT discard entries, then creation is read 
     assert.equal(reader.read('/fixture').hit, false);
 });
 
+test('stat-time ENOTDIR is absent, evicts a warmed entry and recovers without stale bytes', () => {
+    const { fsApi, state } = injected();
+    const reader = createValidatedJsonFileReader({ fsApi });
+    assert.equal(reader.read('/fixture').value.value, 'a');
+    assert.equal(reader.read('/fixture').hit, true);
+    const stat = fsApi.statSync;
+    fsApi.statSync = () => { throw Object.assign(new Error('not a directory'), { code: 'ENOTDIR' }); };
+    for (let index = 0; index < 2; index += 1) {
+        assert.deepEqual(reader.read('/fixture'), { exists: false });
+        assert.equal(reader.stats().size, 0);
+    }
+    assert.equal(state.reads, 1);
+    fsApi.statSync = stat;
+    state.text = '{"value":"b"}';
+    const recovered = reader.read('/fixture');
+    assert.equal(recovered.hit, false);
+    assert.equal(recovered.value.value, 'b');
+    assert.equal(state.reads, 2);
+});
+
+for (const operation of ['openSync', 'readFileSync']) {
+    test(`${operation} ENOTDIR still throws and evicts a warmed entry`, () => {
+        const { fsApi, state } = injected();
+        const reader = createValidatedJsonFileReader({ fsApi });
+        reader.read('/fixture');
+        state.pathStat = stamp({ ino: 2n });
+        fsApi[operation] = () => { throw Object.assign(new Error('not a directory'), { code: 'ENOTDIR' }); };
+        assert.throws(() => reader.read('/fixture'), { code: 'ENOTDIR' });
+        assert.equal(reader.stats().size, 0);
+        assert.equal(state.closes, operation === 'openSync' ? 1 : 2);
+    });
+}
+
 test('empty, null and four-megabyte JSON retain load semantics; directories never leak handles', (t) => {
     const { file, reader, calls } = fixture(t);
     assert.deepEqual(reader.read(file), { exists: false });
