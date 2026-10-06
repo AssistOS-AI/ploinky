@@ -127,7 +127,13 @@ export class McpToolPolicy {
 
     // Decide whether `caller` may invoke `agent`/`tool`. Fail-closed.
     evaluate({ agent, tool, caller }) {
-        const entry = this._repo.getMcpToolEntry(agent, tool);
+        return this._decide(this._repo.getMcpToolEntry(agent, tool), { agent, tool, caller });
+    }
+
+    // The decision for an already-resolved policy entry (`null` = no entry,
+    // `{ corrupt: true }` = unreadable policy). Shared by `evaluate` and
+    // `filterTools` so both apply exactly the same rules.
+    _decide(entry, { tool, caller }) {
         if (entry && entry.corrupt) {
             return { allow: false, code: 'POLICY_PERSISTENCE_ERROR', status: 500 };
         }
@@ -181,11 +187,19 @@ export class McpToolPolicy {
     }
 
     // Keep only the tools the caller is allowed to invoke (for tools/list).
+    // The policy is loaded once per call (one store version check), and every
+    // tool in this response is decided against that same view. A corrupt
+    // policy yields `{ corrupt: true }` for every tool, so all are denied.
     filterTools(agent, tools, caller) {
-        if (!Array.isArray(tools)) return [];
+        if (!Array.isArray(tools) || !tools.length) return [];
+        const loaded = this._repo.snapshot();
         return tools.filter((tool) => {
             const name = typeof tool?.name === 'string' ? tool.name : '';
-            return name ? this.evaluate({ agent, tool: name, caller }).allow : false;
+            if (!name) return false;
+            const entry = loaded.ok
+                ? (loaded.index.mcp.get(`${String(agent)} ${String(name)}`) || null)
+                : { corrupt: true };
+            return this._decide(entry, { agent, tool: name, caller }).allow;
         });
     }
 }
