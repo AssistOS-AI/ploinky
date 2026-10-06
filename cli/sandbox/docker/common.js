@@ -99,8 +99,9 @@ function isRuntimeInstalled(runtime) {
     for (const dir of pathValue.split(path.delimiter)) {
         if (!dir) continue;
         try {
-            fs.accessSync(path.join(dir, runtime), fs.constants.X_OK);
-            return true;
+            const candidate = path.join(dir, runtime);
+            fs.accessSync(candidate, fs.constants.X_OK);
+            if (fs.statSync(candidate).isFile()) return true;
         } catch (_) {}
     }
     return false;
