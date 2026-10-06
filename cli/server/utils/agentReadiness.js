@@ -161,6 +161,28 @@ function postJson(host, port, targetPath, payload, timeoutMs = 700, extraHeaders
     });
 }
 
+// Best-effort cleanup of the probe's MCP session so readiness probes do not leave sessions behind.
+function deleteMcpSession(port, sessionId, timeoutMs) {
+    if (!sessionId) return Promise.resolve();
+    return new Promise((resolve) => {
+        const req = http.request({
+            host: '127.0.0.1',
+            port,
+            path: '/mcp',
+            method: 'DELETE',
+            headers: { 'mcp-session-id': sessionId },
+            timeout: timeoutMs
+        }, (res) => {
+            res.resume();
+            res.on('end', resolve);
+            res.on('error', resolve);
+        });
+        req.on('timeout', () => req.destroy(new Error('timeout')));
+        req.on('error', () => resolve());
+        req.end();
+    });
+}
+
 async function probeAgentMcp(port, timeoutMs = 700) {
     const initializeResponse = await postJson('127.0.0.1', port, '/mcp', {
         jsonrpc: '2.0',
@@ -195,6 +217,7 @@ async function probeAgentMcp(port, timeoutMs = 700) {
         method: 'notifications/initialized'
     }, timeoutMs, normalizedSessionId ? { 'mcp-session-id': normalizedSessionId } : {});
     if (!initAck || (initAck.statusCode !== 204 && (initAck.statusCode < 200 || initAck.statusCode >= 300))) {
+        await deleteMcpSession(port, normalizedSessionId, timeoutMs);
         return false;
     }
 
@@ -229,6 +252,7 @@ async function probeAgentMcp(port, timeoutMs = 700) {
         req.on('error', () => resolve(null));
         req.end(body);
     });
+    await deleteMcpSession(port, normalizedSessionId, timeoutMs);
     if (!toolsResponse || toolsResponse.statusCode < 200 || toolsResponse.statusCode >= 300) {
         return false;
     }

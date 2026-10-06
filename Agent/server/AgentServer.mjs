@@ -1180,6 +1180,8 @@ async function registerFromConfig(server, config, helpers) {
     }
 }
 
+let configLoadLogged = false;
+
 async function createServerInstance() {
     const { McpServer, ResourceTemplate, McpError, ErrorCode } = await loadSdkDeps();
     const server = new McpServer({ name: 'ploinky-agent-mcp', version: '1.0.0' });
@@ -1187,10 +1189,13 @@ async function createServerInstance() {
     const configResult = getConfigResult();
     const config = configResult ? configResult.config : {};
 
-    if (configResult) {
-        console.log(`[AgentServer/MCP] Loaded config from ${configResult.source}`);
-    } else {
-        console.log('[AgentServer/MCP] No configuration file found; starting with an empty configuration.');
+    if (!configLoadLogged) {
+        configLoadLogged = true;
+        if (configResult) {
+            console.log(`[AgentServer/MCP] Loaded config from ${configResult.source}`);
+        } else {
+            console.log('[AgentServer/MCP] No configuration file found; starting with an empty configuration.');
+        }
     }
     await registerFromConfig(server, config, { ResourceTemplate, McpError, ErrorCode });
 
