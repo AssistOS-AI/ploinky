@@ -295,9 +295,14 @@ test('a response already closed before it reaches the limiter never starts an in
     res.closed = true;
     res.destroyed = true;
     const request = get({ res, collectContainers: collector.collect, agentListOptions: { summaries } });
+    await sleep(100);
+    try {
+        assert.equal(collector.started, 0);
+        assert.equal(res.writableEnded, false);
+    } finally {
+        collector.releaseAll();
+    }
     await request.done;
-    assert.equal(collector.started, 0);
-    assert.equal(res.writableEnded, false);
 });
 
 test('a close event after the response ended does not cancel queued work', async () => {
