@@ -97,11 +97,38 @@ test('timeout kills a TERM-ignoring child, joins it and lets queued paths procee
     const { root, directories } = fixture(t, 4);
     const git = installGitFixture(t, { hangName: 'repo-0', value: 'https://example.test/survivor.git' });
     const start = Date.now();
-    await runWithRepositoryResolutionScope(async () => {
+    const cleanupErrors = [];
+    const reapOwnedChildren = async () => {
+        // These ChildProcess objects belong only to this fixture's spawn wrapper.
+        const results = await Promise.allSettled([...git.live].map(child => new Promise((resolve, reject) => {
+            child.once('close', resolve);
+            try {
+                if (!child.kill('SIGKILL') && child.exitCode === null && child.signalCode === null) reject(new Error('Could not kill owned origin fixture child.'));
+            } catch (error) { reject(error); }
+        })));
+        cleanupErrors.push(...results.filter(result => result.status === 'rejected').map(result => result.reason));
+    };
+    let watchdogFired = false;
+    let watchdogCleanup = Promise.resolve();
+    const watchdog = setTimeout(() => {
+        watchdogFired = true;
+        watchdogCleanup = reapOwnedChildren();
+    }, 6000);
+    const run = runWithRepositoryResolutionScope(async () => {
         await prefetchWorkspaceRepositoryOrigins(root);
         assert.equal(repositoryOrigin(directories[0]), '');
         directories.slice(1).forEach(directory => assert.equal(repositoryOrigin(directory), 'example.test/survivor'));
     });
+    let failure;
+    try { await run; } catch (error) { failure = error; }
+    finally {
+        clearTimeout(watchdog);
+        await watchdogCleanup;
+        await reapOwnedChildren();
+    }
+    if (cleanupErrors.length) throw new AggregateError([...(failure ? [failure] : []), ...cleanupErrors], 'Origin fixture cleanup failed.');
+    if (failure) throw failure;
+    assert.equal(watchdogFired, false, 'production termination must finish before the fixture watchdog');
     assert.ok(Date.now() - start < 5000, '2000ms child timeout plus 3000ms harness margin');
     assert.equal(git.started.length, 4);
     assert.equal(git.live.size, 0);
@@ -147,9 +174,12 @@ test('pending values never escape sync reads or overwrite an already resolved id
     await runWithRepositoryResolutionScope(async () => {
         const preparation = prefetchRepositoryReads('origins', ['path'], () => new Promise(resolve => { release = resolve; }));
         await Promise.resolve();
-        assert.equal(memoizeRepositoryRead('origins', 'path', () => 'sync-authority'), 'sync-authority');
-        release('late-preparation');
-        await preparation;
+        try {
+            assert.equal(memoizeRepositoryRead('origins', 'path', () => 'sync-authority'), 'sync-authority');
+        } finally {
+            release('late-preparation');
+            await preparation;
+        }
         assert.equal(memoizeRepositoryRead('origins', 'path', () => assert.fail('cached')), 'sync-authority');
     });
 });
