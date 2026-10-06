@@ -5,6 +5,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { TaskQueue } from './TaskQueue.mjs';
+import { createToolWorkerPools, shutdownToolWorkerPools } from './toolWorkerPool.mjs';
 import { preserveJsonSchemaToolListings } from './inputSchema.mjs';
 import { getConfiguredToolInputSchema } from './toolInputSchemaCache.mjs';
 import {
@@ -979,6 +980,142 @@ const taskQueue = new TaskQueue({
     executor: executeShell
 });
 
+// Warm tool workers (opt-in through `toolWorkers` in the MCP config, see
+// toolWorkerPool.mjs). Pools are built once from the startup config, never per
+// MCP session. A pool needs a code identity source: workers are replaced when
+// the identity changes, so they never run code older than a fresh process
+// would load. Without one, every tool keeps running as a fresh process.
+const TOOL_CODE_IDENTITY_OVERRIDE = Symbol.for('ploinky.agentServer.toolCodeIdentity');
+
+function resolveToolCodeIdentity() {
+    const override = globalThis[TOOL_CODE_IDENTITY_OVERRIDE];
+    if (typeof override === 'function') return override;
+    return null;
+}
+
+function toolWorkersDisabled() {
+    return String(process.env.PLOINKY_TOOL_WORKERS ?? '').trim() === '0';
+}
+
+function buildToolWorkerPools(config) {
+    const declarations = config && typeof config === 'object' ? config.toolWorkers : null;
+    if (!declarations || typeof declarations !== 'object' || Array.isArray(declarations)
+        || Object.keys(declarations).length === 0) {
+        return new Map();
+    }
+    if (toolWorkersDisabled()) {
+        console.warn('[AgentServer/MCP] PLOINKY_TOOL_WORKERS=0: tool workers are disabled; every tool runs as a fresh process');
+        return new Map();
+    }
+    const codeIdentity = resolveToolCodeIdentity();
+    if (!codeIdentity) {
+        console.warn('[AgentServer/MCP] toolWorkers are declared but no tool code identity source is available; every tool runs as a fresh process');
+        return new Map();
+    }
+    try {
+        return createToolWorkerPools(config, {
+            buildCommandSpec,
+            defaultCwd: process.env.PLOINKY_CODE_DIR || '/code',
+            log: (line) => console.warn(line),
+            codeIdentity,
+        });
+    } catch (error) {
+        console.warn(`[AgentServer/MCP] cannot build tool worker pools (${error?.message || error}); every tool runs as a fresh process`);
+        return new Map();
+    }
+}
+
+const toolWorkerPools = buildToolWorkerPools(initialConfig);
+const loggedToolRouteWarnings = new Set();
+
+// The routing rule: a tool runs in a pool only if its `worker` names an
+// available pool, it is not async, its command cwd equals the pool's cwd and
+// PLOINKY_TOOL_WORKERS is not 0. Any other tool that names a worker logs one
+// warning and keeps running as a fresh process.
+function resolveToolWorkerPool(tool, commandSpec) {
+    if (!tool || typeof tool !== 'object' || tool.worker === undefined || tool.worker === null) return null;
+    if (toolWorkersDisabled()) return null;
+    const poolName = typeof tool.worker === 'string' ? tool.worker.trim() : '';
+    const pool = poolName ? toolWorkerPools.get(poolName) : null;
+    let reason = null;
+    if (!poolName) reason = 'its worker field does not name a pool';
+    else if (!pool) reason = `tool worker pool '${poolName}' is not available`;
+    else if (tool.async === true) reason = 'async tools run through the task queue';
+    else if (!commandSpec || commandSpec.cwd !== pool.cwd) reason = `its cwd differs from the cwd of tool worker pool '${poolName}'`;
+    if (!reason) return pool;
+    const name = typeof tool.name === 'string' ? tool.name : '';
+    const key = `${name}\u0000${reason}`;
+    if (!loggedToolRouteWarnings.has(key)) {
+        loggedToolRouteWarnings.add(key);
+        console.warn(`[AgentServer/MCP] tool '${name}' runs as a fresh process: ${reason}`);
+    }
+    return null;
+}
+
+// Report routing problems once at startup rather than at the first session.
+for (const tool of Array.isArray(initialConfig?.tools) ? initialConfig.tools : []) {
+    if (tool && typeof tool === 'object') {
+        resolveToolWorkerPool(tool, buildCommandSpec(tool, process.env.PLOINKY_CODE_DIR || '/code'));
+    }
+}
+
+// Optional `maxParallelSyncCalls`: bounds sync tool calls that run as a fresh
+// process. Absent (or invalid) means unlimited, as before.
+function resolveMaxParallelSyncCalls(config) {
+    const value = config && typeof config === 'object' ? config.maxParallelSyncCalls : undefined;
+    if (value === undefined || value === null) return null;
+    if (Number.isInteger(value) && value > 0) return value;
+    console.warn('[AgentServer/MCP] ignoring maxParallelSyncCalls: it must be a positive integer');
+    return null;
+}
+
+function createSpawnLimiter(limit) {
+    if (!limit) return { run: (fn) => fn() };
+    let active = 0;
+    const waiting = [];
+    const release = () => {
+        active -= 1;
+        const next = waiting.shift();
+        if (next) next();
+    };
+    return {
+        run(fn) {
+            return new Promise((resolve, reject) => {
+                const start = () => {
+                    active += 1;
+                    Promise.resolve().then(fn).then(resolve, reject).finally(release);
+                };
+                if (active < limit) start();
+                else waiting.push(start);
+            });
+        },
+    };
+}
+
+const syncSpawnLimiter = createSpawnLimiter(resolveMaxParallelSyncCalls(initialConfig));
+
+function callToolWorker(pool, commandSpec, payload, fallback) {
+    return pool.call({
+        toolName: typeof payload?.tool === 'string' ? payload.tool : '',
+        toolEnv: commandSpec.env,
+        payload,
+        timeoutMs: commandSpec.timeoutMs,
+        fallback,
+    });
+}
+
+// Runs one sync tool call in its pool or as a fresh process. `trace.mode`
+// records where it actually ran (a pool can hand a call to the spawn fallback).
+function runSyncTool(pool, commandSpec, payload, trace = {}) {
+    const spawnCall = () => {
+        trace.mode = 'spawn';
+        return syncSpawnLimiter.run(() => executeShell(commandSpec, payload));
+    };
+    if (!pool) return spawnCall();
+    trace.mode = `worker:${pool.name}`;
+    return callToolWorker(pool, commandSpec, payload, spawnCall);
+}
+
 function extractTemplateParams(template) {
     const params = {};
     const regex = /\{([^}]+)\}/g;
@@ -1019,7 +1156,8 @@ async function registerFromConfig(server, config, helpers) {
             const continuationTool = typeof tool.continuationTool === 'string'
                 ? tool.continuationTool.trim()
                 : '';
-            const runInvocation = async (...cbArgs) => {
+            const toolWorkerPool = resolveToolWorkerPool(tool, commandSpec);
+            const runInvocation = async (trace, ...cbArgs) => {
                 let args = cbArgs[0] ?? {};
                 let context = cbArgs[1] ?? {};
                 if (cbArgs.length === 1 && typeof args === 'object' && args !== null && args.requestId) {
@@ -1075,7 +1213,7 @@ async function registerFromConfig(server, config, helpers) {
                         }
                     };
                 }
-                const result = await executeShell(commandSpec, payload);
+                const result = await runSyncTool(toolWorkerPool, commandSpec, payload, trace);
                 if (result.code !== 0) {
                     const message = describeShellFailure(result);
                     if (helpers && helpers.McpError && helpers.ErrorCode) {
@@ -1093,14 +1231,15 @@ async function registerFromConfig(server, config, helpers) {
 
             const invocation = async (...cbArgs) => {
                 const startedAt = Date.now();
+                const trace = { mode: 'spawn' };
                 let outcome = 'ok';
                 try {
-                    return await runInvocation(...cbArgs);
+                    return await runInvocation(trace, ...cbArgs);
                 } catch (error) {
                     outcome = 'error';
                     throw error;
                 } finally {
-                    console.log(`[AgentServer/MCP] tool=${name} mode=spawn ms=${Date.now() - startedAt} outcome=${outcome}`);
+                    console.log(`[AgentServer/MCP] tool=${name} mode=${trace.mode} ms=${Date.now() - startedAt} outcome=${outcome}`);
                 }
             };
 
