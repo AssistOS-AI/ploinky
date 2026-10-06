@@ -525,6 +525,10 @@ export async function streamAdmittedUpload(req, {
         try { await callback?.(value); } catch (_) { /* A response callback cannot change the committed result. */ }
     };
     const cleanupFailure = async error => {
+        // Rejected awaits skip their following check; cancellation still wins before commit.
+        if (!committing) {
+            try { check(); } catch (cancellation) { error = cancellation; }
+        }
         completed = true;
         detach();
         if (handle && !output) await handle.close().catch(() => {});
