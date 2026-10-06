@@ -6,6 +6,7 @@ import { readBoxWorkspaceRoot } from '../../../ploinky-box/contract/workspace-ro
 import {
     assertNoRetiredControllerSecrets,
     readWorkspaceMasterKey,
+    workspaceMasterKeyPath,
 } from '../../../ploinky-box/entrypoint/initialize-workspace.mjs';
 import { isInsideBox } from '../../../ploinky-box/lib/boxMarker.mjs';
 
@@ -13,6 +14,10 @@ const MASTER_KEY_VAR = 'PLOINKY_MASTER_KEY';
 const GENERATED_MASTER_KEY_FILE = 'master-key';
 
 let generatedFallbackWarningEmitted = false;
+// The Box marker is image content and never disappears at runtime, so a
+// positive result is kept for the process. A negative result is re-checked,
+// which keeps resolution outside the Box exactly as it was.
+let boxMarkerObserved = false;
 
 function parseKeyValueText(raw = '') {
     const result = {};
@@ -173,8 +178,15 @@ function warnGeneratedFallback({ purpose, source, filePath }) {
     );
 }
 
+function insideBoxForProcess() {
+    if (boxMarkerObserved) return true;
+    const inside = isInsideBox();
+    if (inside === true) boxMarkerObserved = true;
+    return inside;
+}
+
 function usesManagedWorkspaceMasterKey(managedBox) {
-    return managedBox === undefined ? isInsideBox() : Boolean(managedBox);
+    return managedBox === undefined ? insideBoxForProcess() : Boolean(managedBox);
 }
 
 function sanitizeManagedMasterKeyEnvironment(environment, { managedBox } = {}) {
@@ -226,15 +238,162 @@ function resolveMasterKey({
 // rotating one purpose (by bumping its version segment) cannot collide with
 // another. Empty salt is fine because the master key is already a
 // SHA-256 digest of the resolved workspace seed.
-function deriveSubkey(purpose, length = 32) {
-    const trimmedPurpose = String(purpose || '').trim();
-    if (!trimmedPurpose) {
-        throw new Error('deriveSubkey: purpose is required');
+//
+// Inside the Box the master key file is read through every check of
+// readWorkspaceMasterKey only when the cache misses or the key's stamp
+// changes. The stamp covers the workspace root, the key file's lstat and the
+// three state directories readWorkspaceMasterKey fingerprints, and it is
+// re-checked at most once per revalidateMs. The master key itself is never
+// retained: the IKM exists only while a missing subkey is computed and is
+// zero-filled afterwards. Outside the Box nothing is cached, because the
+// environment and .env seeds may change between calls.
+function directoryStamp(target, fsApi, { physical = false } = {}) {
+    const stat = physical ? fsApi.lstatSync(target) : fsApi.statSync(target);
+    return `${stat.dev}:${stat.ino}:${stat.mode}`;
+}
+
+function managedMasterKeyStamp(workspaceRoot, fsApi) {
+    const keyPath = workspaceMasterKeyPath(workspaceRoot);
+    const controllerStateDirectory = path.dirname(keyPath);
+    const stateDirectory = path.dirname(controllerStateDirectory);
+    // Same inspection as readWorkspaceMasterKey: stat for the workspace root
+    // and .ploinky, lstat for the controller-state directory and the key.
+    const parts = [
+        workspaceRoot,
+        directoryStamp(workspaceRoot, fsApi),
+        directoryStamp(stateDirectory, fsApi),
+        directoryStamp(controllerStateDirectory, fsApi, { physical: true }),
+    ];
+    const key = fsApi.lstatSync(keyPath);
+    parts.push([key.dev, key.ino, key.size, key.mode, key.mtimeMs, key.ctimeMs].join(':'));
+    // readWorkspaceMasterKey refuses retired secrets next to the key on every
+    // read; keep refusing them while subkeys are served from the cache.
+    assertNoRetiredControllerSecrets(workspaceRoot, fsApi);
+    return JSON.stringify(parts);
+}
+
+function createSubkeyDeriver({
+    isManaged,
+    workspaceRoot,
+    fsApi = fs,
+    revalidateMs = 1000,
+    maxEntries = 256,
+    now = Date.now,
+} = {}) {
+    const cache = new Map();
+    let stamp = null;
+    let checkedAt = 0;
+
+    function clear() {
+        for (const subkey of cache.values()) subkey.fill(0);
+        cache.clear();
+        stamp = null;
     }
-    const ikm = resolveMasterKey({ purpose: `subkey:${trimmedPurpose}` });
-    const salt = Buffer.alloc(0);
-    const info = Buffer.from(`ploinky/${trimmedPurpose}/v1`, 'utf8');
-    return Buffer.from(crypto.hkdfSync('sha256', ikm, salt, info, length));
+
+    function managed() {
+        if (typeof isManaged === 'function') return Boolean(isManaged());
+        return usesManagedWorkspaceMasterKey(isManaged);
+    }
+
+    function currentStamp() {
+        const root = workspaceRoot || readBoxWorkspaceRoot(process.env);
+        try {
+            return { root, value: managedMasterKeyStamp(root, fsApi) };
+        } catch (error) {
+            // Fail with the error a fresh read reports (its result is discarded).
+            readWorkspaceMasterKey({ workspaceRoot: root, fsApi });
+            throw error;
+        }
+    }
+
+    function adopt(next) {
+        if (next.value !== stamp) {
+            clear();
+            stamp = next.value;
+        }
+        checkedAt = now();
+    }
+
+    function revalidateIfDue() {
+        const current = now();
+        if (stamp !== null && current >= checkedAt && current - checkedAt < revalidateMs) return;
+        try {
+            adopt(currentStamp());
+        } catch (error) {
+            clear();
+            throw error;
+        }
+    }
+
+    function remember(cacheKey, subkey) {
+        while (cache.size >= Math.max(1, maxEntries)) {
+            const [oldestKey, oldest] = cache.entries().next().value;
+            oldest.fill(0);
+            cache.delete(oldestKey);
+        }
+        cache.set(cacheKey, Buffer.from(subkey));
+    }
+
+    function deriveManaged(trimmedPurpose, length, info) {
+        revalidateIfDue();
+        const cacheable = Number.isSafeInteger(length);
+        const cacheKey = `${trimmedPurpose}|${length}`;
+        const cached = cacheable ? cache.get(cacheKey) : undefined;
+        if (cached) {
+            cache.delete(cacheKey);
+            cache.set(cacheKey, cached);
+            return Buffer.from(cached);
+        }
+
+        let ikm;
+        let stable = false;
+        try {
+            const before = currentStamp();
+            adopt(before);
+            const seed = readWorkspaceMasterKey({ workspaceRoot: before.root, fsApi }).key;
+            ikm = crypto.createHash('sha256').update(seed, 'utf8').digest();
+            stable = currentStamp().value === before.value;
+            // A key replaced while it was read: serve this result once, cache nothing.
+            if (!stable) clear();
+        } catch (error) {
+            ikm?.fill(0);
+            clear();
+            throw error;
+        }
+        try {
+            const subkey = Buffer.from(crypto.hkdfSync('sha256', ikm, Buffer.alloc(0), info, length));
+            if (cacheable && stable) remember(cacheKey, subkey);
+            return subkey;
+        } finally {
+            ikm.fill(0);
+        }
+    }
+
+    function derive(purpose, length = 32) {
+        const trimmedPurpose = String(purpose || '').trim();
+        if (!trimmedPurpose) {
+            throw new Error('deriveSubkey: purpose is required');
+        }
+        const info = Buffer.from(`ploinky/${trimmedPurpose}/v1`, 'utf8');
+        if (managed()) {
+            return deriveManaged(trimmedPurpose, length, info);
+        }
+        const ikm = resolveMasterKey({ purpose: `subkey:${trimmedPurpose}`, managedBox: false });
+        const salt = Buffer.alloc(0);
+        return Buffer.from(crypto.hkdfSync('sha256', ikm, salt, info, length));
+    }
+
+    return Object.freeze({
+        derive,
+        clear,
+        cacheSize: () => cache.size,
+    });
+}
+
+const defaultSubkeyDeriver = createSubkeyDeriver();
+
+function deriveSubkey(purpose, length = 32) {
+    return defaultSubkeyDeriver.derive(purpose, length);
 }
 
 function normalizeDerivationPart(value, fallback = 'default') {
@@ -350,6 +509,7 @@ function deriveWorkspaceSecret({
 }
 
 export {
+    createSubkeyDeriver,
     deriveAgentRequestSecret,
     derivePrivateAgentRequestSecret,
     deriveAgentSecret,
