@@ -159,3 +159,69 @@ test('agent static dispatch refuses a stale generation before opening a file', a
     assert.equal(res.statusCode, 503);
     assert.match(res.body, /edge_generation_changed/);
 });
+
+function streamingCapture() {
+    const res = new PassThrough();
+    res.statusCode = 0;
+    res.headers = {};
+    res.bodyText = '';
+    res.writeHead = (statusCode, headers = {}) => {
+        res.statusCode = statusCode;
+        res.headers = { ...headers };
+        res.headersSent = true;
+        return res;
+    };
+    res.setEncoding('utf8');
+    res.on('data', (chunk) => { res.bodyText += chunk; });
+    res.done = new Promise((resolve) => { res.on('end', resolve); });
+    return res;
+}
+
+async function requestAgentStatic(root, file, { headers = {}, beforeRead } = {}) {
+    const res = streamingCapture();
+    const handled = await serveAgentStaticRequest({
+        method: 'GET',
+        url: `/captured/${file}`,
+        headers: { host: 'localhost', ...headers },
+    }, res, { routeKey: 'captured', hostPath: root, beforeRead });
+    assert.equal(handled, true);
+    await res.done;
+    return res;
+}
+
+test('agent static serves validators with private caching and revalidates to 304 only after the lease check', async (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-edge-static-etag-'));
+    fs.writeFileSync(path.join(root, 'app.js'), 'export default 1;\n');
+    fs.writeFileSync(path.join(root, 'style.css'), 'body{}');
+    fs.writeFileSync(path.join(root, 'index.html'), '<h1>captured</h1>');
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+    let leaseChecks = 0;
+    const beforeRead = () => { leaseChecks += 1; return true; };
+
+    const fresh = await requestAgentStatic(root, 'app.js', { beforeRead });
+    assert.equal(fresh.statusCode, 200);
+    assert.equal(fresh.bodyText, 'export default 1;\n');
+    assert.equal(fresh.headers['Content-Length'], Buffer.byteLength('export default 1;\n'));
+    assert.match(fresh.headers.ETag, /^W\/"\d+-\d+-\d+"$/);
+    assert.match(fresh.headers['Cache-Control'], /^private, max-age=300$/);
+    assert.match((await requestAgentStatic(root, 'style.css', { beforeRead })).headers['Cache-Control'], /^private, /);
+    assert.equal((await requestAgentStatic(root, 'index.html', { beforeRead })).headers['Cache-Control'], 'no-store');
+
+    leaseChecks = 0;
+    const revalidated = await requestAgentStatic(root, 'app.js', {
+        headers: { 'if-none-match': `"x", ${fresh.headers.ETag}` },
+        beforeRead,
+    });
+    assert.equal(revalidated.statusCode, 304);
+    assert.equal(revalidated.bodyText, '');
+    assert.equal(leaseChecks, 1, 'the lease is checked before the 304');
+
+    const stale = await requestAgentStatic(root, 'app.js', {
+        headers: { 'if-none-match': fresh.headers.ETag },
+        beforeRead: () => false,
+    });
+    assert.equal(stale.statusCode, 503);
+    assert.match(stale.bodyText, /edge_generation_changed/);
+    assert.equal(stale.headers.ETag, undefined);
+});

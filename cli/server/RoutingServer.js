@@ -730,7 +730,7 @@ async function processRequest(req, res) {
         return handleWorkspaceUpload(req, res);
     } else if (isRouteMount(pathname, '/blobs')) {
         return handleBlobs(req, res);
-    } else if (staticSrv.serveWorkspaceFileRequest(req, res)) {
+    } else if (staticSrv.isWorkspaceFileRequest(req) && await staticSrv.serveWorkspaceFileRequest(req, res)) {
         return;
     } else if (routedAggregateAgentCard) {
         return handleRoutedAggregateAgentCard(req, res, routePlan);
