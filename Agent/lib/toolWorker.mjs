@@ -12,8 +12,20 @@
 // are newline-delimited JSON:
 //
 //   worker -> pool  {"v":1,"type":"hello","token"}, then {"v":1,"type":"ready","pid"}
-//   pool -> worker  {"v":1,"type":"call","id","toolName","toolEnv","envelope"}
-//   worker -> pool  {"v":1,"type":"result","id","exitCode","stdout","stderr","rssBytes","recycle"}
+//   pool -> worker  {"v":1,"type":"call","id","marker","toolName","toolEnv","envelope"}
+//   worker -> pool  {"v":1,"type":"result","id","exitCode","rssBytes","recycle"}
+//   worker -> pool  {"v":1,"type":"log","stream","text"}      output of no open call
+//   worker -> pool  {"v":1,"type":"exiting","startedCallId"}  fatal error outside a call
+//
+// Output. A call's output, from the handler and from tool children that
+// inherit fd 1/2, flows through the worker's stdout/stderr pipes, and the pool
+// attributes it to the busy call. After the handler finishes, the worker
+// writes the call's end marker (`toolWorkerEndMarker(marker)`, with a random
+// per-call marker id from the call frame) to both streams, ordered after the
+// call's own writes, and only then sends the result frame; the pool resolves
+// the call once it has the frame and both markers, and strips the markers.
+// In-process writes from code whose call has ended travel as `log` frames,
+// never through the pipes, so they cannot land in another call.
 //
 // One call runs at a time. Frames can carry invocation tokens, so this module
 // never logs frame contents. stdin is /dev/null, so a handler that reads stdin
@@ -30,6 +42,15 @@ const EXIT_FLUSH_TIMEOUT_MS = 1000;
 const BOOTSTRAP_MAX_BYTES = 1024;
 
 const callStorage = new AsyncLocalStorage();
+
+/** End-of-call marker written to stdout and stderr for a call's marker id. */
+export function toolWorkerEndMarker(marker) {
+    return `\u0000PLOINKY_TOOL_WORKER_END:${marker}\u0000`;
+}
+
+function countChildProcesses() {
+    return process.getActiveResourcesInfo().filter((name) => name === 'ProcessWrap').length;
+}
 
 function toBuffer(chunk, encoding) {
     if (Buffer.isBuffer(chunk)) return chunk;
@@ -103,11 +124,12 @@ function connectChannel(socketPath) {
  * Serve tool calls until the pool closes the channel.
  *
  * @param {(call: { toolName: string, toolEnv: object, envelope: object, stdout: Writable, stderr: Writable }) => any} handler
- *   Runs one call. Output goes to the given streams or to process.stdout/stderr
- *   (both are captured per call). The exit code is the returned number (or
- *   `{ exitCode }`), default 0, except that a non-zero `process.exitCode` set
- *   during the call becomes the call's exit code (the CLI convention). A throw
- *   ends the call with exit code 1 and the error message on stderr.
+ *   Runs one call. Output goes to the given streams, to process.stdout/stderr,
+ *   or to fd 1/2 inherited by tool children; all of it is the call's output.
+ *   The exit code is the returned number (or `{ exitCode }`), default 0,
+ *   except that a non-zero `process.exitCode` set during the call becomes the
+ *   call's exit code (the CLI convention). A throw ends the call with exit
+ *   code 1 and the error message on stderr.
  * @returns {Promise<void>} resolves once the worker has announced `ready`.
  */
 export async function serveToolWorker(handler) {
@@ -131,29 +153,24 @@ export async function serveToolWorker(handler) {
     delete process.env.PLOINKY_TOOL_WORKER_SOCKET;
     const originalStdoutWrite = process.stdout.write;
     const originalStderrWrite = process.stderr.write;
-    const strayPrefix = Buffer.from(`[toolWorker pid=${process.pid}] `);
+    const originals = {
+        stdout: (chunk, encoding, cb) => originalStdoutWrite.call(process.stdout, chunk, encoding, cb),
+        stderr: (chunk, encoding, cb) => originalStderrWrite.call(process.stderr, chunk, encoding, cb),
+    };
 
-    // Output that belongs to no open call goes to the worker's own stderr,
-    // which the pool forwards to the host log. It never enters another call.
-    // Each stray chunk becomes complete lines so the pool forwards it at once.
-    function writeStray(buffer) {
+    // Output that belongs to no open call: forwarded to the host log through
+    // the channel, never through the pipes the pool attributes to calls.
+    function writeStray(stream, buffer) {
         if (!buffer.length) return;
-        const parts = [strayPrefix, buffer];
-        if (buffer[buffer.length - 1] !== 0x0a) parts.push(Buffer.from('\n'));
-        originalStderrWrite.call(process.stderr, Buffer.concat(parts));
+        sendFrame({ v: TOOL_WORKER_PROTOCOL_VERSION, type: 'log', stream, text: buffer.toString('utf8') });
     }
 
-    function captureWrite(target) {
+    function captureWrite(stream) {
         return function captured(chunk, encoding, callback) {
-            const cb = typeof encoding === 'function' ? encoding : callback;
-            const enc = typeof encoding === 'function' ? undefined : encoding;
-            const buffer = toBuffer(chunk, enc);
             const call = callStorage.getStore();
-            if (call && !call.closed) {
-                call[target].push(buffer);
-            } else {
-                writeStray(buffer);
-            }
+            if (call && !call.closed) return originals[stream](chunk, encoding, callback);
+            const cb = typeof encoding === 'function' ? encoding : callback;
+            writeStray(stream, toBuffer(chunk, typeof encoding === 'function' ? undefined : encoding));
             if (typeof cb === 'function') process.nextTick(cb);
             return true;
         };
@@ -162,20 +179,29 @@ export async function serveToolWorker(handler) {
     process.stdout.write = captureWrite('stdout');
     process.stderr.write = captureWrite('stderr');
 
-    function callStream(call, target) {
+    function callStream(call, stream) {
         return new Writable({
             write(chunk, encoding, callback) {
-                const buffer = toBuffer(chunk, encoding);
-                if (!call.closed) call[target].push(buffer);
-                else writeStray(buffer);
+                if (!call.closed) {
+                    originals[stream](chunk, undefined, () => callback());
+                    return;
+                }
+                writeStray(stream, toBuffer(chunk, encoding));
                 callback();
             },
+        });
+    }
+
+    function writeMarker(stream, marker) {
+        return new Promise((resolve) => {
+            originals[stream](toolWorkerEndMarker(marker), undefined, () => resolve());
         });
     }
 
     let activeCall = null;
     let envSnapshot = null;
     let cwdSnapshot = null;
+    let baselineChildren = 0;
     let poisoned = false;
     let exiting = false;
 
@@ -195,7 +221,7 @@ export async function serveToolWorker(handler) {
         sendFrame({
             v: TOOL_WORKER_PROTOCOL_VERSION,
             type: 'exiting',
-            startedCallId: activeCall && !activeCall.closed ? activeCall.id : null,
+            startedCallId: activeCall && !activeCall.replied ? activeCall.id : null,
         });
         const flushed = new Promise((resolve) => channel.end(resolve));
         const bound = new Promise((resolve) => setTimeout(resolve, EXIT_FLUSH_TIMEOUT_MS));
@@ -218,9 +244,8 @@ export async function serveToolWorker(handler) {
 
     function finishCall(call, { exitCode, failure, forceRecycle }) {
         if (call.closed) return;
-        if (failure) call.stderr.push(Buffer.from(`${failure}\n`));
         call.closed = true;
-        if (activeCall === call) activeCall = null;
+        if (failure) originals.stderr(`${failure}\n`);
 
         const pendingExitCode = process.exitCode;
         process.exitCode = undefined;
@@ -244,16 +269,22 @@ export async function serveToolWorker(handler) {
             }
         }
 
-        sendFrame({
-            v: TOOL_WORKER_PROTOCOL_VERSION,
-            type: 'result',
-            id: call.id,
-            exitCode: code,
-            stdout: Buffer.concat(call.stdout).toString('utf8'),
-            stderr: Buffer.concat(call.stderr).toString('utf8'),
-            rssBytes: process.memoryUsage.rss(),
-            recycle,
-        });
+        // Child processes still running could write into a later call's output.
+        if (countChildProcesses() > baselineChildren) recycle = true;
+
+        call.finalizing = (async () => {
+            await Promise.all([writeMarker('stdout', call.marker), writeMarker('stderr', call.marker)]);
+            sendFrame({
+                v: TOOL_WORKER_PROTOCOL_VERSION,
+                type: 'result',
+                id: call.id,
+                exitCode: code,
+                rssBytes: process.memoryUsage.rss(),
+                recycle: recycle || poisoned,
+            });
+            call.replied = true;
+            if (activeCall === call) activeCall = null;
+        })();
     }
 
     function failFromProcessEvent(kind, error) {
@@ -270,14 +301,14 @@ export async function serveToolWorker(handler) {
             return;
         }
         const message = Buffer.from(`${kind} outside a call: ${errorMessage(error)}\n`);
-        if (activeCall && !activeCall.closed) {
-            // A late failure from an ended call while another call runs: leave
-            // that call alone, and recycle the worker after its reply.
+        if (activeCall && !activeCall.replied) {
+            // A late failure from an ended call while another call runs (or is
+            // replying): leave that call alone, recycle after its reply.
             poisoned = true;
-            writeStray(message);
+            writeStray('stderr', message);
             return;
         }
-        writeStray(message);
+        writeStray('stderr', message);
         exitAfterFlush(TOOL_WORKER_EXIT_OUTSIDE_CALL);
     }
 
@@ -292,15 +323,21 @@ export async function serveToolWorker(handler) {
 
     function startCall(frame) {
         if (activeCall) {
-            writeStray(Buffer.from('protocol error: call frame while a call is active\n'));
+            writeStray('stderr', Buffer.from('protocol error: call frame while a call is active\n'));
+            exitAfterFlush(TOOL_WORKER_EXIT_OUTSIDE_CALL);
+            return;
+        }
+        if (typeof frame.marker !== 'string' || !/^[0-9a-f]{32,128}$/.test(frame.marker)) {
+            writeStray('stderr', Buffer.from('protocol error: call frame without a valid marker\n'));
             exitAfterFlush(TOOL_WORKER_EXIT_OUTSIDE_CALL);
             return;
         }
         const call = {
             id: frame.id,
-            stdout: [],
-            stderr: [],
+            marker: frame.marker,
             closed: false,
+            replied: false,
+            finalizing: null,
         };
         activeCall = call;
         process.exitCode = undefined;
@@ -340,7 +377,7 @@ export async function serveToolWorker(handler) {
             }
             if (!frame || frame.v !== TOOL_WORKER_PROTOCOL_VERSION || frame.type !== 'call') {
                 // Never echo the frame: it can carry credentials.
-                writeStray(Buffer.from('protocol error: unreadable frame\n'));
+                writeStray('stderr', Buffer.from('protocol error: unreadable frame\n'));
                 exitAfterFlush(TOOL_WORKER_EXIT_OUTSIDE_CALL);
                 return;
             }
@@ -355,5 +392,6 @@ export async function serveToolWorker(handler) {
 
     envSnapshot = snapshotEnv();
     cwdSnapshot = process.cwd();
+    baselineChildren = countChildProcesses();
     sendFrame({ v: TOOL_WORKER_PROTOCOL_VERSION, type: 'ready', pid: process.pid });
 }

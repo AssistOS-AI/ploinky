@@ -7,7 +7,14 @@
 // (newline-delimited JSON, see Agent/lib/toolWorker.mjs) travel over a private
 // Unix socket the worker connects to and proves itself on with that token. The
 // worker's end of that socket is close-on-exec and fd 3 is closed after the
-// handshake, so tool children cannot reach the channel. Pools never retry a call, never
+// handshake, so tool children cannot reach the channel.
+//
+// A call's output is what arrives on the busy worker's stdout/stderr pipes
+// (the handler's writes and those of tool children that inherit fd 1/2), up to
+// the call's random end marker on each stream; the call resolves once its
+// result frame and both markers have arrived. Pipe output outside a call goes
+// to the host log, never into a call; an idle worker that still produces it
+// is replaced. Pools never retry a call, never
 // log frames (they can carry invocation tokens) and never leave a worker
 // process group behind: timeouts, crashes, recycling and shutdown all end with
 // a SIGKILL to the worker's process group.
@@ -19,6 +26,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { toolWorkerEndMarker } from '../lib/toolWorker.mjs';
 
 export const TOOL_WORKER_MODULE_PATH = fileURLToPath(new URL('../lib/toolWorker.mjs', import.meta.url));
 export const TOOL_WORKER_PROTOCOL_VERSION = 1;
@@ -279,10 +287,12 @@ export class ToolWorkerPool {
             return this.runFallback(fallback);
         }
         const effectiveTimeoutMs = timerDelay(callTimeoutMs, this.callTimeoutMs);
+        const marker = crypto.randomBytes(16).toString('hex');
         const frame = {
             v: TOOL_WORKER_PROTOCOL_VERSION,
             type: 'call',
             id: `${this.name}-${this.nextCallId++}`,
+            marker,
             toolName: typeof toolName === 'string' ? toolName : '',
             toolEnv: toolEnv && typeof toolEnv === 'object' ? toolEnv : {},
             envelope: payload ?? {},
@@ -303,9 +313,16 @@ export class ToolWorkerPool {
         }
 
         return new Promise((resolve) => {
+            const markerBytes = Buffer.from(toolWorkerEndMarker(marker), 'utf8');
             const call = {
                 id: frame.id,
                 encoded,
+                output: {
+                    stdout: { marker: markerBytes, chunks: [], carry: null, done: false },
+                    stderr: { marker: markerBytes, chunks: [], carry: null, done: false },
+                },
+                outputBytes: 0,
+                resultFrame: null,
                 fallback,
                 timeoutMs: effectiveTimeoutMs,
                 worker: null,
@@ -480,27 +497,13 @@ export class ToolWorkerPool {
         worker.child = child;
         worker.pid = child.pid;
 
-        const forward = (stream) => {
-            let partial = '';
-            stream.setEncoding('utf8');
-            stream.on('data', (text) => {
-                const lines = (partial + text).split('\n');
-                partial = lines.pop();
-                for (const line of lines) if (line) this.log(`${this.prefix(worker)} ${line}`);
-                // Output without newlines (e.g. from a tool child) is not held forever.
-                if (partial.length > MAX_LOG_PARTIAL_CHARS) {
-                    this.log(`${this.prefix(worker)} ${partial}`);
-                    partial = '';
-                }
-            });
-            stream.on('end', () => {
-                if (partial) this.log(`${this.prefix(worker)} ${partial}`);
-                partial = '';
-            });
+        worker.strayPartial = { stdout: '', stderr: '' };
+        for (const streamName of ['stdout', 'stderr']) {
+            const stream = child[streamName];
+            stream.on('data', (chunk) => this.onPipeData(worker, streamName, chunk));
+            stream.on('end', () => this.flushStray(worker, streamName));
             stream.on('error', () => {});
-        };
-        forward(child.stdout);
-        forward(child.stderr);
+        }
 
         // fd 3: the bootstrap token, then EOF. Nothing else ever travels there.
         const boot = child.stdio[3];
@@ -522,6 +525,108 @@ export class ToolWorkerPool {
     }
 
     // Accept the worker's channel only from a peer that presents its token.
+    // Attribute pipe bytes to the busy call up to its end marker (matched
+    // anywhere, also across chunks, and never passed on); everything else is
+    // stray output.
+    onPipeData(worker, streamName, chunk) {
+        const call = worker.call;
+        const sink = call && !call.settled ? call.output[streamName] : null;
+        if (!sink || sink.done) {
+            this.onStrayOutput(worker, streamName, chunk);
+            return;
+        }
+        const data = sink.carry ? Buffer.concat([sink.carry, chunk]) : chunk;
+        sink.carry = null;
+        const index = data.indexOf(sink.marker);
+        if (index !== -1) {
+            if (!this.commitOutput(worker, call, sink, data.subarray(0, index))) return;
+            sink.done = true;
+            const rest = data.subarray(index + sink.marker.length);
+            if (rest.length) this.onStrayOutput(worker, streamName, rest);
+            this.maybeCompleteCall(worker, call);
+            return;
+        }
+        // Keep a possible marker prefix until the next chunk.
+        const keep = Math.min(data.length, sink.marker.length - 1);
+        if (!this.commitOutput(worker, call, sink, data.subarray(0, data.length - keep))) return;
+        sink.carry = Buffer.from(data.subarray(data.length - keep));
+    }
+
+    commitOutput(worker, call, sink, bytes) {
+        if (!bytes.length) return true;
+        call.outputBytes += bytes.length;
+        if (call.outputBytes > this.maxFrameBytes) {
+            const message = `tool worker output exceeds maxFrameBytes (${this.maxFrameBytes})`;
+            this.log(`${this.prefix(worker)} ${message}; recycling`);
+            this.failBusyCall(worker, message);
+            this.counters.recycled += 1;
+            this.retire(worker);
+            this.pump();
+            return false;
+        }
+        sink.chunks.push(Buffer.from(bytes));
+        return true;
+    }
+
+    // Output that belongs to no call: logged, never attributed. A worker
+    // being retired is ignored. Output while idle means something outlived its
+    // call (e.g. a background tool child), so the worker is replaced before it
+    // can write into a later call; output after a marker recycles it after
+    // the call.
+    onStrayOutput(worker, streamName, chunk) {
+        if (worker.state === 'retiring' || worker.gone) return;
+        this.logStray(worker, streamName, chunk.toString('utf8'));
+        if (worker.state === 'idle') {
+            this.log(`${this.prefix(worker)} output outside a call; replacing the worker`);
+            this.counters.recycled += 1;
+            this.retire(worker);
+            this.pump();
+        } else if (worker.state === 'busy') {
+            worker.dirty = true;
+        }
+    }
+
+    logStray(worker, streamName, text) {
+        const lines = (worker.strayPartial[streamName] + text).split('\n');
+        worker.strayPartial[streamName] = lines.pop();
+        for (const line of lines) if (line) this.log(`${this.prefix(worker)} ${line}`);
+        if (worker.strayPartial[streamName].length > MAX_LOG_PARTIAL_CHARS) this.flushStray(worker, streamName);
+    }
+
+    flushStray(worker, streamName) {
+        const partial = worker.strayPartial?.[streamName];
+        if (partial) this.log(`${this.prefix(worker)} ${partial}`);
+        if (worker.strayPartial) worker.strayPartial[streamName] = '';
+    }
+
+    maybeCompleteCall(worker, call) {
+        if (worker.call !== call || call.settled) return;
+        const frame = call.resultFrame;
+        if (!frame || !call.output.stdout.done || !call.output.stderr.done) return;
+        worker.call = null;
+        worker.calls += 1;
+        this.counters.completed += 1;
+        this.settle(call, {
+            code: Number.isInteger(frame.exitCode) ? frame.exitCode : 1,
+            signal: null,
+            stdout: Buffer.concat(call.output.stdout.chunks).toString('utf8'),
+            stderr: Buffer.concat(call.output.stderr.chunks).toString('utf8'),
+        });
+        const rss = Number(frame.rssBytes);
+        const recycle = frame.recycle === true
+            || worker.dirty === true
+            || worker.calls >= this.maxCallsPerWorker
+            || (Number.isFinite(rss) && rss > this.maxRssBytes);
+        if (recycle) {
+            this.counters.recycled += 1;
+            this.retire(worker);
+            this.pump();
+            return;
+        }
+        worker.state = 'idle';
+        this.becomeIdle(worker);
+    }
+
     onHandshakeConnection(worker, socket) {
         socket.on('error', () => {});
         if (worker.channel || worker.state !== 'starting') {
@@ -602,29 +707,15 @@ export class ToolWorkerPool {
             this.becomeIdle(worker);
             return;
         }
-        if (frame.type === 'result' && worker.state === 'busy' && worker.call && frame.id === worker.call.id) {
-            const call = worker.call;
-            worker.call = null;
-            worker.calls += 1;
-            this.counters.completed += 1;
-            this.settle(call, {
-                code: Number.isInteger(frame.exitCode) ? frame.exitCode : 1,
-                signal: null,
-                stdout: typeof frame.stdout === 'string' ? frame.stdout : '',
-                stderr: typeof frame.stderr === 'string' ? frame.stderr : '',
-            });
-            const rss = Number(frame.rssBytes);
-            const recycle = frame.recycle === true
-                || worker.calls >= this.maxCallsPerWorker
-                || (Number.isFinite(rss) && rss > this.maxRssBytes);
-            if (recycle) {
-                this.counters.recycled += 1;
-                this.retire(worker);
-                this.pump();
-                return;
-            }
-            worker.state = 'idle';
-            this.becomeIdle(worker);
+        if (frame.type === 'result' && worker.state === 'busy' && worker.call
+            && frame.id === worker.call.id && !worker.call.resultFrame) {
+            worker.call.resultFrame = frame;
+            this.maybeCompleteCall(worker, worker.call);
+            return;
+        }
+        if (frame.type === 'log') {
+            const text = typeof frame.text === 'string' ? frame.text : '';
+            for (const line of text.split('\n')) if (line) this.log(`${this.prefix(worker)} ${line}`);
             return;
         }
         this.onProtocolError(worker, 'unexpected frame');
@@ -695,8 +786,8 @@ export class ToolWorkerPool {
             worker.readyTimer = null;
         }
         worker.state = worker.state === 'starting' ? 'starting-retiring' : 'retiring';
-        // Kill before closing fd 3 so the group kill, not the worker's own
-        // EOF handling, decides what ends.
+        // Kill before closing the channel so the group kill, not the worker's
+        // own EOF handling, decides what ends.
         killWorkerGroup(worker.child);
         try {
             worker.channel?.destroy();
@@ -721,6 +812,13 @@ export class ToolWorkerPool {
         if (sent && !sent.settled && sent.id !== startedCallId) {
             worker.call = null;
             sent.worker = null;
+            sent.resultFrame = null;
+            sent.outputBytes = 0;
+            for (const sink of Object.values(sent.output)) {
+                sink.chunks = [];
+                sink.carry = null;
+                sink.done = false;
+            }
             this.queue.unshift(sent);
         }
         worker.endTimer = setTimeout(() => killWorkerGroup(worker.child), CHANNEL_END_GRACE_MS);

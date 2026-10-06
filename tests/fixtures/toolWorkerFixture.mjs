@@ -70,8 +70,11 @@ await serveToolWorker(async ({ toolName, toolEnv, envelope, stdout }) => {
             stdout.write(input.text ?? describe(toolName, toolEnv, input));
             return 0;
         case 'spawnChild': {
-            // Leaves a tool child running in the worker's group after the call ends.
+            // Leaves a silent tool child running in the worker's group after the
+            // call ends; unref'd, so the worker does not count it as a running
+            // child (like a detached background job).
             const child = spawn('sleep', ['30'], { stdio: 'ignore' });
+            child.unref();
             fs.writeFileSync(input.pidFile, `${process.pid} ${child.pid}\n`);
             stdout.write(describe(toolName, toolEnv, input));
             return 0;
@@ -157,6 +160,22 @@ await serveToolWorker(async ({ toolName, toolEnv, envelope, stdout }) => {
         case 'exitCodeAndReturn':
             process.exitCode = 5;
             return 2;
+        case 'inheritChild':
+            console.log('before');
+            spawnSync('sh', ['-c', 'echo CHILD-STDOUT; echo CHILD-STDERR-SECRET >&2'], { stdio: 'inherit' });
+            console.log('after');
+            return 0;
+        case 'bgTrackedChild':
+            // A tracked (ref'd) child that writes after its call has ended.
+            spawn('sh', ['-c', 'sleep 0.2; echo BG-TRACKED-LATE'], { stdio: 'inherit' });
+            stdout.write(describe(toolName, toolEnv, input));
+            return 0;
+        case 'bgUntrackedChild':
+            // The shell exits at once; its background job writes later and is
+            // not a child the worker can see.
+            spawnSync('sh', ['-c', '(sleep 0.2; echo BG-UNTRACKED-LATE) &'], { stdio: 'inherit' });
+            stdout.write(describe(toolName, toolEnv, input));
+            return 0;
         case 'probeFd3':
             stdout.write(JSON.stringify({
                 // What a fork/exec that does not close fd 3 would give (Linux

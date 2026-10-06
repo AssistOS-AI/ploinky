@@ -91,13 +91,18 @@ function makePool(t, dir, options = {}) {
     return { pool, logs };
 }
 
-function callTool(pool, input, { toolEnv, ...extra } = {}) {
-    return pool.call({
+async function callTool(pool, input, { toolEnv, ...extra } = {}) {
+    const result = await pool.call({
         toolName: 'fixture_tool',
         toolEnv: toolEnv || { TOOL_NAME: 'fixture_tool' },
         payload: { tool: 'fixture_tool', input, metadata: {} },
         ...extra,
     });
+    // End-of-call markers are stripped from every result.
+    for (const stream of ['stdout', 'stderr']) {
+        assert.ok(!String(result[stream]).includes('PLOINKY_TOOL_WORKER_END'), `${stream} carries a marker`);
+    }
+    return result;
 }
 
 function loads(dir) {
@@ -314,9 +319,16 @@ test('a reply sent just before a fatal error outside a call is still delivered',
         assert.equal(result.code, 0, `call ${index}: ${result.stderr}`);
         assert.equal(result.stdout.length, 200_000);
     }
-    // The worker exits 70 after each error outside a call (not SIGKILL).
-    assert.ok(await waitUntil(() => logs.some((line) => line.includes('exited unexpectedly (code 70, signal null)')), 2000),
-        JSON.stringify(logs.slice(-5)));
+});
+
+test('a fatal error outside any call exits the worker with code 70', async (t) => {
+    const dir = makeDir(t);
+    const { pool, logs } = makePool(t, dir, { size: 1 });
+    const result = await callTool(pool, { mode: 'lateThrow' });
+    assert.equal(result.code, 0, result.stderr);
+    assert.ok(await waitUntil(() => logs.some((line) => line.includes('exited unexpectedly (code 70, signal null)')), 3000),
+        JSON.stringify(logs));
+    assert.ok(logs.some((line) => line.includes('uncaught exception outside a call: late from A')));
 });
 
 test('a non-zero process.exitCode becomes the call exit code over the returned code', async (t) => {
@@ -454,6 +466,40 @@ test('timeouts above the 2^31-1 ms timer limit are clamped instead of firing at 
     assert.equal(perCall.code, 0, perCall.stderr);
     await sleep(100);
     assert.equal(pool.stats().workers, 1, 'the idle timer must not fire at once');
+});
+
+test('F3: output of tool children that inherit fd 1/2 belongs to the call, not the log', async (t) => {
+    const dir = makeDir(t);
+    const { pool, logs } = makePool(t, dir, { size: 1 });
+    const result = await callTool(pool, { mode: 'inheritChild' });
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(result.stdout, 'before\nCHILD-STDOUT\nafter\n');
+    assert.equal(result.stderr, 'CHILD-STDERR-SECRET\n');
+    await sleep(100);
+    assert.ok(!logs.some((line) => line.includes('CHILD-')), JSON.stringify(logs));
+});
+
+test('F3: a tracked background child of an ended call never writes into the next call', async (t) => {
+    const dir = makeDir(t);
+    const { pool } = makePool(t, dir, { size: 1 });
+    const a = await callTool(pool, { mode: 'bgTrackedChild' });
+    assert.equal(a.code, 0, a.stderr);
+    const b = await callTool(pool, { mode: 'slow', ms: 500, text: 'B' });
+    assert.equal(b.stdout, 'B');
+    assert.equal(b.stderr, '');
+    assert.notEqual(JSON.parse((await callTool(pool, { mode: 'echo' })).stdout).pid, JSON.parse(a.stdout).pid,
+        'a call that leaves child processes running is recycled');
+});
+
+test('F3: output that arrives while a worker is idle is logged and the worker replaced', async (t) => {
+    const dir = makeDir(t);
+    const { pool, logs } = makePool(t, dir, { size: 1 });
+    const a = await callTool(pool, { mode: 'bgUntrackedChild' });
+    assert.equal(a.code, 0, a.stderr);
+    assert.ok(await waitUntil(() => logs.some((line) => line.includes('BG-UNTRACKED-LATE')), 3000), JSON.stringify(logs));
+    const b = await callTool(pool, { mode: 'echo' });
+    assert.ok(!b.stdout.includes('BG-UNTRACKED-LATE'));
+    assert.notEqual(JSON.parse(b.stdout).pid, JSON.parse(a.stdout).pid, 'the idle worker that produced output was replaced');
 });
 
 test('tool children cannot reach the worker channel through fd 3', async (t) => {
