@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { readOriginFromGitConfig } from './repositoryOriginConfig.mjs';
+import { memoizeRepositoryRead } from './repositoryResolutionScope.mjs';
 
 export function repositoryEntries(root) {
     try { return fs.readdirSync(root, { withFileTypes: true }); }
@@ -17,17 +18,15 @@ export function repositoryIdentity(value) {
 }
 
 export function repositoryOrigin(candidate) {
-    if (!fs.existsSync(path.join(candidate, '.git'))) return '';
-    try { return repositoryIdentity(execFileSync('git', ['-C', candidate, 'config', '--get', 'remote.origin.url'], {
-        encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000,
-    })); } catch { return ''; }
+    return memoizeRepositoryRead('origins', candidate, () => repositoryIdentity(readOriginFromGitConfig(candidate)));
 }
 
-export function workspaceRepositories(root, accept = () => true) {
-    return repositoryEntries(root).filter(entry => !entry.name.startsWith('.') && entry.name !== 'node_modules'
+const acceptRepository = () => true;
+export function workspaceRepositories(root, accept = acceptRepository) {
+    const entries = memoizeRepositoryRead('workspaceRepos', root, () => repositoryEntries(root).filter(entry => !entry.name.startsWith('.') && entry.name !== 'node_modules'
         && (entry.isDirectory() || entry.isSymbolicLink()))
-        .map(entry => ({ name: entry.name, directory: path.join(root, entry.name) }))
-        .filter(entry => accept(entry.directory));
+        .map(entry => ({ name: entry.name, directory: path.join(root, entry.name) })));
+    return entries.filter(entry => accept(entry.directory));
 }
 
 export function workspaceRepositoryPath(name, { workspaceRoot, url = '', accept = candidate => fs.existsSync(path.join(candidate, '.git')) } = {}) {

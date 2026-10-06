@@ -7,7 +7,7 @@ import { installRepositoryLinks, removeRepositoryLinks } from '../../utils/repos
 
 import * as reposSvc from '../../utils/repos.js';
 import { resolveSkillRepositorySource } from '../../utils/skillRepositorySource.js';
-import { listAgentRepositoryNames, workspaceAgentRepositoryPath } from '../../utils/agentRepositorySource.mjs';
+import { listAgentRepositoryNames, workspaceAgentRepositoryPath, runWithRepositoryResolutionScope } from '../../utils/agentRepositorySource.mjs';
 import * as agentsSvc from '../../utils/agents.js';
 import * as workspaceSvc from '../../utils/workspace.js';
 import { collectAgentRuntimeStates } from '../../sandbox/agentRuntimeState.js';
@@ -626,7 +626,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
     const method = (req.method || 'GET').toUpperCase();
 
     if (route.resource === 'hardware-limits') {
-        return handleHardwareLimitsRoutes(req, res, parsedUrl, {
+        const handleHardware = () => handleHardwareLimitsRoutes(req, res, parsedUrl, {
             ensureAdmin: (request, response, url) => ensureAdmin(request, response, url, { routePlan }),
             verifyMutation: (request) => {
                 const publicContext = publicMarketplaceAuthContext(routePlan);
@@ -637,6 +637,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
             verifyLease: () => !routePlan?.lease?.commit || routePlan.lease.commit() === true,
             readSelection: readEdgeRoutingSelection,
         });
+        return method === 'GET' ? runWithRepositoryResolutionScope(handleHardware) : handleHardware();
     }
 
     const authorizeRead = async () => {
@@ -689,7 +690,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
             return true;
         }
         if (!await authorizeRead()) return true;
-        sendJson(res, 200, { ok: true, repositories: reposSvc.listRepositorySources() });
+        sendJson(res, 200, { ok: true, repositories: runWithRepositoryResolutionScope(() => reposSvc.listRepositorySources()) });
         return true;
     }
 
@@ -699,7 +700,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
     }
 
     const isRepos = route.resource === 'repos';
-    const marketplacePayload = async () => (isRepos ? buildMarketplaceRepositories() : agentsMarketplace());
+    const marketplacePayload = async () => runWithRepositoryResolutionScope(() => (isRepos ? buildMarketplaceRepositories() : agentsMarketplace()));
 
     if (method === 'GET') {
         if (!await authorizeRead()) return true;
