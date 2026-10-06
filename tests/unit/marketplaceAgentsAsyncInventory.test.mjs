@@ -184,23 +184,27 @@ test('GET repos is still served', async () => {
     assert.ok(Array.isArray(request.res.body.marketplace.repositories));
 });
 
-test('POST enable and disable return a marketplace whose agents array has the GET shape', async () => {
+test('POST enable and disable return a marketplace whose agents array has the GET shape', async (t) => {
     const getRequest = get({ agentListOptions: { summaries, liveContainers: [runningWorker] } });
     await getRequest.res.ended;
     for (const action of ['enable_agent', 'disable_agent']) {
-        const request = startRequest({
-            method: 'POST',
-            body: { action, agentRef: 'repo/worker', mode: 'global' },
-            agentListOptions: { summaries, liveContainers: [runningWorker] },
-            enableAgentAction: async () => ({ result: { status: 'enabled' } }),
-        });
-        await request.res.ended;
-        if (action === 'disable_agent') assert.equal(request.res.status, 409, 'disable of a never-enabled agent is blocked before a payload exists');
-        else {
+        await t.test(action, async () => {
+            const calls = [];
+            const request = startRequest({
+                method: 'POST',
+                body: { action, agentRef: 'repo/worker', mode: 'global' },
+                agentListOptions: { summaries, liveContainers: [runningWorker] },
+                enableAgentAction: async () => ({ result: { status: 'enabled' } }),
+                disableAgentAction: async (ref) => { calls.push(ref); return { status: 'removed' }; },
+            });
+            await request.res.ended;
+            await request.done;
             assert.equal(request.res.status, 200, JSON.stringify(request.res.body));
+            assert.equal(request.res.body.action, action);
+            assert.deepEqual(calls, action === 'disable_agent' ? ['repo/worker'] : []);
             assert.ok(Array.isArray(request.res.body.marketplace.agents), 'marketplace.agents must be an array');
             assert.deepEqual(request.res.body.marketplace, getRequest.res.body.marketplace);
-        }
+        });
     }
 });
 
@@ -342,107 +346,100 @@ test('the limiter runs queued jobs in order and reports a cancelled job as skipp
     assert.deepEqual(order, ['first', 'third']);
 });
 
-// A blocked event loop shows as a gap of at least the blocking time on EVERY attempt (the synchronous base blocks for the whole child run),
-// while a loaded CI machine adds only occasional scheduler spikes. The best of three attempts is therefore compared with the 20 ms bound.
-async function bestEventLoopGap(attempt) {
-    const gaps = [];
-    for (let index = 0; index < 3; index += 1) {
-        gaps.push(await attempt());
-        if (gaps[index] < 20) break;
-    }
-    return { best: Math.min(...gaps), gaps };
-}
-
 test('the event loop keeps running during a slow inventory (injected collector)', async () => {
     // Warm the listing path so the measurement sees only the inventory wait.
     await get({ agentListOptions: { summaries, liveContainers: [] } }).res.ended;
-    const { best, gaps } = await bestEventLoopGap(async () => {
-        let gap;
-        const heartbeat = startHeartbeat();
-        try {
-            const request = get({ collectContainers: async () => { await sleep(300); return []; }, agentListOptions: { summaries } });
-            await request.res.ended;
-            assert.equal(request.res.status, 200);
-        } finally {
-            gap = heartbeat.stop();
-        }
-        return gap;
-    });
-    assert.ok(best < 20, `event loop gaps ${gaps.map(gap => gap.toFixed(1)).join(', ')} ms`);
+    let gap;
+    const heartbeat = startHeartbeat();
+    try {
+        const request = get({ collectContainers: async () => { await sleep(300); return []; }, agentListOptions: { summaries } });
+        await request.res.ended;
+        assert.equal(request.res.status, 200);
+    } finally {
+        gap = heartbeat.stop();
+    }
+    assert.ok(gap < 20, `maximum event loop gap ${gap.toFixed(1)} ms`);
 });
 
 test('the event loop keeps running while a real podman child takes 0.3 s (stub podman on PATH)', async () => {
     const stub = installStubPodman('exec sleep 0.3');
     try {
         await get({ agentListOptions: { summaries, liveContainers: [] } }).res.ended;
-        const { best, gaps } = await bestEventLoopGap(async () => {
-            let gap;
-            const heartbeat = startHeartbeat();
-            const startedAt = performance.now();
-            try {
-                const request = get({ agentListOptions: { summaries } });
-                await request.res.ended;
-                const elapsed = performance.now() - startedAt;
-                assert.equal(request.res.status, 200);
-                assert.ok(elapsed >= 250, `the stub child must really have run (elapsed ${elapsed.toFixed(0)} ms)`);
-            } finally {
-                gap = heartbeat.stop();
-            }
-            return gap;
-        });
-        assert.ok(best < 20, `event loop gaps ${gaps.map(gap => gap.toFixed(1)).join(', ')} ms`);
-    } finally {
-        stub.restore();
-        killRecordedPids(stub.dir);
-    }
-});
-
-test('a hung podman is killed at the timeout, the request completes with no containers, and the slot is freed', async () => {
-    // The first two podman invocations hang; any later one answers at once with no containers.
-    const stub = installStubPodman('if mkdir "$DIR/s1" 2>/dev/null || mkdir "$DIR/s2" 2>/dev/null; then echo $$ >> "$DIR/pids"; exec sleep 60; fi\nexit 0');
-    try {
+        let gap;
+        const heartbeat = startHeartbeat();
         const startedAt = performance.now();
-        const requests = [get({ agentListOptions: { summaries } }), get({ agentListOptions: { summaries } }), get({ agentListOptions: { summaries } })];
-        const finished = await Promise.race([
-            Promise.all(requests.map(request => request.res.ended)).then(() => 'done'),
-            sleep(8000).then(() => 'late'),
-        ]);
-        const elapsed = performance.now() - startedAt;
-        assert.equal(finished, 'done', 'all three requests must complete within the 5 s timeout plus a margin (a hung child must not hold the slot)');
-        assert.ok(elapsed >= 4500, `the hung children end by timeout, not earlier (elapsed ${elapsed.toFixed(0)} ms)`);
-        for (const request of requests) {
+        try {
+            const request = get({ agentListOptions: { summaries } });
+            await request.res.ended;
+            const elapsed = performance.now() - startedAt;
             assert.equal(request.res.status, 200);
-            assert.equal(request.res.body.marketplace.agents[0].containerName, '');
+            assert.ok(elapsed >= 250, `the stub child must really have run (elapsed ${elapsed.toFixed(0)} ms)`);
+        } finally {
+            gap = heartbeat.stop();
         }
-        const pids = fs.readFileSync(path.join(stub.dir, 'pids'), 'utf8').split('\n').map(Number).filter(Boolean);
-        assert.equal(pids.length, 2);
-        assert.deepEqual(pids.filter(processAlive), [], 'the timed-out children were killed');
+        assert.ok(gap < 20, `maximum event loop gap ${gap.toFixed(1)} ms`);
     } finally {
         stub.restore();
         killRecordedPids(stub.dir);
     }
 });
 
-test('the collectors map a hung engine to an empty list (default) or ENGINE_READ_FAILED (strict) within the timeout', async () => {
-    const stub = installStubPodman('if mkdir "$DIR/s1" 2>/dev/null || mkdir "$DIR/s2" 2>/dev/null; then echo $$ >> "$DIR/pids"; exec sleep 60; fi\nexit 0');
-    try {
-        const startedAt = performance.now();
-        const outcome = await Promise.race([
-            Promise.allSettled([collectLiveAgentContainersAsync(), collectLiveAgentContainersStrictAsync()]),
-            sleep(8000).then(() => 'late'),
-        ]);
-        assert.notEqual(outcome, 'late', 'a hung engine must not hold the collectors past the timeout plus a margin');
-        assert.ok(performance.now() - startedAt >= 4500);
-        const results = new Map([[0, outcome[0]], [1, outcome[1]]]);
-        // Which collector got which hung child is a race; each one saw a hung child or the fast path, never a hang.
-        for (const settled of results.values()) {
-            if (settled.status === 'fulfilled') assert.deepEqual(settled.value, []);
-            else assert.equal(settled.reason.code, 'ENGINE_READ_FAILED');
+function hungEngineScript(stage) {
+    // The first two invocations at the selected stage hang; later ones return an empty inventory.
+    const emptyOutput = stage === 'inspect' ? "echo '[]'\n" : '';
+    const hang = `if mkdir "$DIR/s1" 2>/dev/null || mkdir "$DIR/s2" 2>/dev/null; then echo $$ >> "$DIR/pids"; exec sleep 60; fi\n${emptyOutput}exit 0`;
+    // For an inspect timeout, ps must first return a matching live-container name.
+    return stage === 'inspect'
+        ? `if [ "$1" = ps ]; then echo '${runningWorker.containerName}'; exit 0; fi\n${hang}`
+        : hang;
+}
+
+for (const stage of ['list', 'inspect']) {
+    test(`a hung podman ${stage} is killed at the timeout, the request completes with no containers, and the slot is freed`, async () => {
+        const stub = installStubPodman(hungEngineScript(stage));
+        try {
+            const startedAt = performance.now();
+            const requests = [get({ agentListOptions: { summaries } }), get({ agentListOptions: { summaries } }), get({ agentListOptions: { summaries } })];
+            const finished = await Promise.race([
+                Promise.all(requests.map(request => request.res.ended)).then(() => 'done'),
+                sleep(8000).then(() => 'late'),
+            ]);
+            const elapsed = performance.now() - startedAt;
+            assert.equal(finished, 'done', 'all three requests must complete within the 5 s timeout plus a margin (a hung child must not hold the slot)');
+            assert.ok(elapsed >= 4500, `the hung children end by timeout, not earlier (elapsed ${elapsed.toFixed(0)} ms)`);
+            for (const request of requests) {
+                assert.equal(request.res.status, 200);
+                assert.equal(request.res.body.marketplace.agents[0].containerName, '');
+            }
+            const pids = fs.readFileSync(path.join(stub.dir, 'pids'), 'utf8').split('\n').map(Number).filter(Boolean);
+            assert.equal(pids.length, 2);
+            assert.deepEqual(pids.filter(processAlive), [], 'the timed-out children were killed');
+        } finally {
+            stub.restore();
+            killRecordedPids(stub.dir);
         }
-        assert.equal(results.get(0).status, 'fulfilled');
-        assert.deepEqual(results.get(0).value, []);
-    } finally {
-        stub.restore();
-        killRecordedPids(stub.dir);
-    }
-});
+    });
+
+    test(`the collectors map a hung engine ${stage} to an empty list (default) or ENGINE_READ_FAILED (strict) within the timeout`, async () => {
+        const stub = installStubPodman(hungEngineScript(stage));
+        try {
+            const startedAt = performance.now();
+            const outcome = await Promise.race([
+                Promise.allSettled([collectLiveAgentContainersAsync(), collectLiveAgentContainersStrictAsync()]),
+                sleep(8000).then(() => 'late'),
+            ]);
+            assert.notEqual(outcome, 'late', 'a hung engine must not hold the collectors past the timeout plus a margin');
+            assert.ok(performance.now() - startedAt >= 4500);
+            assert.equal(outcome[0].status, 'fulfilled');
+            assert.deepEqual(outcome[0].value, []);
+            assert.equal(outcome[1].status, 'rejected', 'the strict collector must distinguish a timeout from an empty inventory');
+            assert.equal(outcome[1].reason.code, 'ENGINE_READ_FAILED');
+            const pids = fs.readFileSync(path.join(stub.dir, 'pids'), 'utf8').split('\n').map(Number).filter(Boolean);
+            assert.equal(pids.length, 2, 'both collectors reached the hung engine stage');
+            assert.deepEqual(pids.filter(processAlive), [], 'both timed-out children were killed');
+        } finally {
+            stub.restore();
+            killRecordedPids(stub.dir);
+        }
+    });
+}

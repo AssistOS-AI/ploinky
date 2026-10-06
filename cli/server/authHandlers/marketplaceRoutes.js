@@ -610,6 +610,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
             }
         },
     }),
+    disableAgentAction = (ref) => agentsSvc.disableAgent(ref),
     agentListOptions = {}, // a test's listing observes its own live containers
     collectContainers = collectLiveAgentContainersAsync,
     uninstallRepositoryAction = (body) => uninstallMarketplaceRepository(body),
@@ -780,7 +781,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
                 ({ result } = await enableAgentAction(body));
             } else if (action === 'disable_agent') {
                 const ref = normalizeMarketplaceAgentRef(body?.agentRef);
-                result = await agentsSvc.disableAgent(ref);
+                result = await disableAgentAction(ref);
                 if (result?.status && result.status !== 'removed' && result.status !== 'static-removed') {
                     sendMarketplaceError(res, 409, 'agent_disable_blocked', result.status);
                     return true;
