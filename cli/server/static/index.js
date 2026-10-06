@@ -468,7 +468,15 @@ function ifNoneMatchMatches(headerValue, etag) {
 // stream from that same handle so headers and body describe the same file.
 // Callers run any generation/lease check before calling this, so neither a 200
 // nor a 304 is produced for a stale generation.
+// A client that resets the connection while the request is awaiting I/O leaves
+// a destroyed response whose 'close' event has already fired; nothing may be
+// written to it and every handle opened for it must still be closed.
+function responseGone(res) {
+    return Boolean(res?.destroyed || res?.writableEnded);
+}
+
 async function sendOpenedFile(req, res, filePath, { authenticated = false, extraHeaders = {} } = {}) {
+    if (responseGone(res)) return true;
     let handle;
     try {
         handle = await fs.promises.open(filePath, 'r');
@@ -479,6 +487,9 @@ async function sendOpenedFile(req, res, filePath, { authenticated = false, extra
     try {
         const stat = await handle.stat({ bigint: true });
         if (!stat.isFile()) return false;
+        // Last await is behind us: a gone client is handled here, and the
+        // finally block closes the handle because no stream was started.
+        if (responseGone(res)) return true;
         const size = Number(stat.size);
         const etag = `W/"${stat.size}-${stat.mtimeNs}-${stat.ino}"`;
         const lastModified = new Date(Number(stat.mtimeNs / 1000000n)).toUTCString();
@@ -514,6 +525,10 @@ async function sendOpenedFile(req, res, filePath, { authenticated = false, extra
             else res.end();
         });
         if (typeof res.on === 'function') res.on('close', () => stream.destroy());
+        if (responseGone(res)) {
+            stream.destroy();
+            return true;
+        }
         stream.pipe(res);
         return true;
     } catch (_) {
