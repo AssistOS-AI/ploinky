@@ -100,6 +100,36 @@ await serveToolWorker(async ({ toolName, toolEnv, envelope, stdout }) => {
             return 0;
         case 'throw':
             throw new Error('fixture handler failure');
+        case 'lateThrow':
+            // Fails 50 ms after this call has replied.
+            setTimeout(() => {
+                throw new Error('late from A');
+            }, 50);
+            stdout.write(describe(toolName, toolEnv, input));
+            return 0;
+        case 'fireAndForget':
+            (async () => {
+                await sleep(50);
+                throw new Error('background rejection from A');
+            })();
+            stdout.write(describe(toolName, toolEnv, input));
+            return 0;
+        case 'slowWrite':
+            fs.appendFileSync(input.runsFile, 'r');
+            fs.writeFileSync(input.file, 'part1');
+            await sleep(input.ms || 300);
+            fs.appendFileSync(input.file, '+part2');
+            stdout.write(describe(toolName, toolEnv, input));
+            return 0;
+        case 'throwAfterReply':
+            setImmediate(() => {
+                throw new Error('after reply');
+            });
+            stdout.write('X'.repeat(input.bytes || 10));
+            return 0;
+        case 'exitCodeAndReturn':
+            process.exitCode = 5;
+            return 2;
         case 'big':
             stdout.write('z'.repeat(input.bytes));
             return 0;

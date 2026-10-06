@@ -286,6 +286,45 @@ test('T10b: an uncaught exception inside a call fails it and recycles the worker
     assert.notEqual(await echoPid(pool), firstPid);
 });
 
+for (const [mode, label] of [['lateThrow', 'uncaught exception'], ['fireAndForget', 'unhandled rejection']]) {
+    test(`F1: a late ${label} from an ended call never kills the call that is running`, async (t) => {
+        const dir = makeDir(t);
+        const { pool, logs } = makePool(t, dir, { size: 1 });
+        const file = path.join(dir, 'b.txt');
+        const runsFile = path.join(dir, 'b.runs');
+        const a = await callTool(pool, { mode });
+        assert.equal(a.code, 0, a.stderr);
+        const b = await callTool(pool, { mode: 'slowWrite', ms: 300, file, runsFile });
+        assert.equal(b.code, 0, b.stderr);
+        assert.equal(fs.readFileSync(file, 'utf8'), 'part1+part2', 'B ran to completion');
+        assert.equal(fs.readFileSync(runsFile, 'utf8'), 'r', 'B ran exactly once');
+        const aPid = JSON.parse(a.stdout).pid;
+        assert.equal(JSON.parse(b.stdout).pid, aPid, 'B ran in the worker that A used');
+        assert.ok(logs.some((line) => line.includes(`${label} outside a call`)), JSON.stringify(logs));
+        assert.notEqual(await echoPid(pool), aPid, 'the worker is recycled after B');
+    });
+}
+
+test('a reply sent just before a fatal error outside a call is still delivered', async (t) => {
+    const dir = makeDir(t);
+    const { pool, logs } = makePool(t, dir, { size: 1 });
+    for (let index = 0; index < 20; index += 1) {
+        const result = await callTool(pool, { mode: 'throwAfterReply', bytes: 200_000 });
+        assert.equal(result.code, 0, `call ${index}: ${result.stderr}`);
+        assert.equal(result.stdout.length, 200_000);
+    }
+    // The worker exits 70 after each error outside a call (not SIGKILL).
+    assert.ok(await waitUntil(() => logs.some((line) => line.includes('exited unexpectedly (code 70, signal null)')), 2000),
+        JSON.stringify(logs.slice(-5)));
+});
+
+test('a non-zero process.exitCode becomes the call exit code over the returned code', async (t) => {
+    const dir = makeDir(t);
+    const { pool } = makePool(t, dir, { size: 1 });
+    const result = await callTool(pool, { mode: 'exitCodeAndReturn' });
+    assert.equal(result.code, 5);
+});
+
 test('a handler throw fails only that call and keeps the worker', async (t) => {
     const dir = makeDir(t);
     const { pool } = makePool(t, dir, { size: 1 });

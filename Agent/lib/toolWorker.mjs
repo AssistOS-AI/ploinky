@@ -20,6 +20,8 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 export const TOOL_WORKER_PROTOCOL_VERSION = 1;
 export const TOOL_WORKER_EXIT_OUTSIDE_CALL = 70;
 
+const EXIT_FLUSH_TIMEOUT_MS = 1000;
+
 const callStorage = new AsyncLocalStorage();
 
 function toBuffer(chunk, encoding) {
@@ -63,8 +65,9 @@ function errorMessage(error) {
  *
  * @param {(call: { toolName: string, toolEnv: object, envelope: object, stdout: Writable, stderr: Writable }) => any} handler
  *   Runs one call. Output goes to the given streams or to process.stdout/stderr
- *   (both are captured per call). A returned number, or `{ exitCode }`, sets the
- *   exit code; a non-zero `process.exitCode` set during the call wins. A throw
+ *   (both are captured per call). The exit code is the returned number (or
+ *   `{ exitCode }`), default 0, except that a non-zero `process.exitCode` set
+ *   during the call becomes the call's exit code (the CLI convention). A throw
  *   ends the call with exit code 1 and the error message on stderr.
  * @returns {Promise<void>} resolves once the worker has announced `ready`.
  */
@@ -124,15 +127,36 @@ export async function serveToolWorker(handler) {
     let activeCall = null;
     let envSnapshot = null;
     let cwdSnapshot = null;
+    let poisoned = false;
     let exiting = false;
 
     function sendFrame(frame) {
+        if (channel.destroyed || !channel.writable) return;
         channel.write(`${JSON.stringify(frame)}\n`);
     }
 
-    // Leave nothing behind: the worker leads its own process group (the pool
-    // spawns it detached), so killing the group also ends tool children.
-    function exitWorker(code) {
+    // A fatal error outside any call: announce the exit (the pool then knows a
+    // call frame already on its way was never started), deliver the frames
+    // already written (a reply sent just before) within a short bound, then
+    // exit 70. The pool kills the worker's process group once it sees the exit.
+    function exitAfterFlush(code) {
+        if (exiting) return;
+        exiting = true;
+        // Name a started call (normally none) so the pool never re-runs it.
+        sendFrame({
+            v: TOOL_WORKER_PROTOCOL_VERSION,
+            type: 'exiting',
+            startedCallId: activeCall && !activeCall.closed ? activeCall.id : null,
+        });
+        const flushed = new Promise((resolve) => channel.end(resolve));
+        const bound = new Promise((resolve) => setTimeout(resolve, EXIT_FLUSH_TIMEOUT_MS));
+        Promise.race([flushed, bound]).finally(() => process.exit(code));
+    }
+
+    // The pool is gone (EOF on the channel): end the worker's whole process
+    // group, tool children included. The pool spawns the worker detached, so
+    // it leads its own group.
+    function exitHostGone() {
         if (exiting) return;
         exiting = true;
         try {
@@ -140,7 +164,7 @@ export async function serveToolWorker(handler) {
         } catch (_) {
             // Not a group leader (or not POSIX): fall through to a plain exit.
         }
-        process.exit(code);
+        process.exit(0);
     }
 
     function finishCall(call, { exitCode, failure, forceRecycle }) {
@@ -152,9 +176,9 @@ export async function serveToolWorker(handler) {
         const pendingExitCode = process.exitCode;
         process.exitCode = undefined;
         let code = exitCode;
-        if (Number.isInteger(pendingExitCode) && pendingExitCode !== 0 && code === 0) code = pendingExitCode;
+        if (Number.isInteger(pendingExitCode) && pendingExitCode !== 0) code = pendingExitCode;
 
-        let recycle = forceRecycle === true;
+        let recycle = forceRecycle === true || poisoned;
         if (restoreEnv(envSnapshot)) recycle = true;
         let cwdNow = null;
         try {
@@ -187,17 +211,25 @@ export async function serveToolWorker(handler) {
         const store = callStorage.getStore();
         // The ALS store identifies the call whose async work failed. A failure
         // with no store while a call is open is attributed to that call.
-        const call = store || activeCall;
-        if (call && !call.closed) {
-            finishCall(call, {
+        const target = store || activeCall;
+        if (target && !target.closed) {
+            finishCall(target, {
                 exitCode: 1,
                 failure: `tool worker: ${kind} during call: ${errorMessage(error)}`,
                 forceRecycle: true,
             });
             return;
         }
-        writeStray(Buffer.from(`${kind} outside a call: ${errorMessage(error)}\n`));
-        exitWorker(TOOL_WORKER_EXIT_OUTSIDE_CALL);
+        const message = Buffer.from(`${kind} outside a call: ${errorMessage(error)}\n`);
+        if (activeCall && !activeCall.closed) {
+            // A late failure from an ended call while another call runs: leave
+            // that call alone, and recycle the worker after its reply.
+            poisoned = true;
+            writeStray(message);
+            return;
+        }
+        writeStray(message);
+        exitAfterFlush(TOOL_WORKER_EXIT_OUTSIDE_CALL);
     }
 
     process.on('uncaughtException', (error) => failFromProcessEvent('uncaught exception', error));
@@ -212,7 +244,7 @@ export async function serveToolWorker(handler) {
     function startCall(frame) {
         if (activeCall) {
             writeStray(Buffer.from('protocol error: call frame while a call is active\n'));
-            exitWorker(TOOL_WORKER_EXIT_OUTSIDE_CALL);
+            exitAfterFlush(TOOL_WORKER_EXIT_OUTSIDE_CALL);
             return;
         }
         const call = {
@@ -240,6 +272,8 @@ export async function serveToolWorker(handler) {
 
     let pending = [];
     channel.on('data', (chunk) => {
+        // A worker that has decided to exit starts no further call.
+        if (exiting) return;
         let start = 0;
         let newline = chunk.indexOf(0x0a, start);
         while (newline !== -1) {
@@ -258,15 +292,16 @@ export async function serveToolWorker(handler) {
             if (!frame || frame.v !== TOOL_WORKER_PROTOCOL_VERSION || frame.type !== 'call') {
                 // Never echo the frame: it can carry credentials.
                 writeStray(Buffer.from('protocol error: unreadable frame\n'));
-                exitWorker(TOOL_WORKER_EXIT_OUTSIDE_CALL);
+                exitAfterFlush(TOOL_WORKER_EXIT_OUTSIDE_CALL);
                 return;
             }
             startCall(frame);
+            if (exiting) return;
         }
         if (start < chunk.length) pending.push(chunk.subarray(start));
     });
-    channel.on('end', () => exitWorker(0));
-    channel.on('error', () => exitWorker(0));
+    channel.on('end', () => exitHostGone());
+    channel.on('error', () => exitHostGone());
 
     envSnapshot = snapshotEnv();
     cwdSnapshot = process.cwd();

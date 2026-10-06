@@ -32,6 +32,12 @@ export const TOOL_WORKER_DEFAULTS = Object.freeze({
 const PRE_READY_DEATH_LIMIT = 3;
 const DEGRADED_MS = 60_000;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 20_000;
+// After a worker exits, frames and output it wrote just before can still be
+// unread; wait for its stdio to close, up to this long, before judging the call.
+const EXIT_SETTLE_MS = 1000;
+// A worker that closes its channel is about to exit (e.g. exit 70 after
+// flushing); give it this long before the pool kills it.
+const CHANNEL_END_GRACE_MS = 500;
 const MAX_LOG_PARTIAL_CHARS = 64 * 1024;
 
 const registeredPools = new Set();
@@ -403,7 +409,11 @@ export class ToolWorkerPool {
             worker.channel.on('data', (chunk) => decoder.push(chunk));
             worker.channel.on('error', () => {});
             // A worker that closes its channel can no longer answer: end it.
-            worker.channel.on('end', () => this.retire(worker));
+            worker.channel.on('end', () => {
+                if (worker.gone) return;
+                worker.endTimer = setTimeout(() => this.retire(worker), CHANNEL_END_GRACE_MS);
+                worker.endTimer.unref?.();
+            });
         }
 
         worker.readyTimer = setTimeout(() => {
@@ -416,7 +426,11 @@ export class ToolWorkerPool {
             this.log(`${prefix()} process error: ${error?.message || error}`);
             if (!child.pid) this.onWorkerGone(worker, { code: null, signal: null, spawnError: true });
         });
-        child.on('exit', (code, signal) => this.onWorkerGone(worker, { code, signal }));
+        child.on('exit', (code, signal) => this.onWorkerExit(worker, { code, signal }));
+        child.on('close', () => {
+            worker.stdioClosed = true;
+            if (worker.exitInfo) this.onWorkerGone(worker, worker.exitInfo);
+        });
         return true;
     }
 
@@ -426,6 +440,10 @@ export class ToolWorkerPool {
         if (worker.gone || worker.state === 'retiring' || worker.state === 'starting-retiring') return;
         if (!frame || frame.v !== TOOL_WORKER_PROTOCOL_VERSION) {
             this.onProtocolError(worker, 'unsupported frame');
+            return;
+        }
+        if (frame.type === 'exiting') {
+            this.onWorkerExiting(worker, frame.startedCallId ?? null);
             return;
         }
         if (frame.type === 'ready' && worker.state === 'starting') {
@@ -539,12 +557,53 @@ export class ToolWorkerPool {
         }
     }
 
+    // The worker announced that it exits (a fatal error outside any call). A
+    // call sent to it that it reports as not started was never started (the
+    // worker starts no call after the announcement, and frames are ordered),
+    // so it goes back to the queue head. A started call is never re-run: it
+    // fails when the worker exits.
+    onWorkerExiting(worker, startedCallId) {
+        worker.announcedExit = true;
+        clearTimeout(worker.idleTimer);
+        worker.idleTimer = null;
+        clearTimeout(worker.readyTimer);
+        worker.readyTimer = null;
+        const sent = worker.call;
+        worker.state = 'retiring';
+        if (sent && !sent.settled && sent.id !== startedCallId) {
+            worker.call = null;
+            sent.worker = null;
+            this.queue.unshift(sent);
+        }
+        worker.endTimer = setTimeout(() => killWorkerGroup(worker.child), CHANNEL_END_GRACE_MS);
+        worker.endTimer.unref?.();
+        this.pump();
+    }
+
+    // The leader exited. Kill the rest of its group so the pipes close, then
+    // finish once its stdio has closed (frames already written still count).
+    onWorkerExit(worker, exitInfo) {
+        if (worker.gone || worker.exitInfo) return;
+        worker.exitInfo = exitInfo;
+        killWorkerGroup(worker.child);
+        if (worker.stdioClosed) {
+            this.onWorkerGone(worker, exitInfo);
+            return;
+        }
+        worker.settleTimer = setTimeout(() => this.onWorkerGone(worker, exitInfo), EXIT_SETTLE_MS);
+    }
+
     onWorkerGone(worker, { code, signal }) {
         if (worker.gone) return;
         const wasStarting = worker.state === 'starting' || worker.state === 'starting-retiring';
+        if (worker.state === 'idle' || worker.state === 'busy' || worker.announcedExit) {
+            this.log(`[toolWorker:${this.name} pid=${worker.pid ?? '?'}] exited unexpectedly (code ${code}, signal ${signal})`);
+        }
         worker.gone = true;
         clearTimeout(worker.idleTimer);
         clearTimeout(worker.readyTimer);
+        clearTimeout(worker.settleTimer);
+        clearTimeout(worker.endTimer);
         worker.idleTimer = null;
         worker.readyTimer = null;
         this.workers.delete(worker);
