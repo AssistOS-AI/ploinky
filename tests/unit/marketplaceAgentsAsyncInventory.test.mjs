@@ -74,15 +74,17 @@ function startRequest({ method = 'GET', resource = 'agents', body, res = mockRes
 const get = (options) => startRequest({ method: 'GET', ...options });
 
 // A collector that tracks how many inventories are in flight. `release(n)` finishes the n-th started collection (1-based), after which it
-// answers with `containers`.
+// answers with `containers`. `releaseAll()` drains current gates and any started later by queued requests.
 function trackedCollector(containers = []) {
     const state = { started: 0, inFlight: 0, maxInFlight: 0, gates: [] };
+    let draining = false;
     state.collect = async () => {
         const index = ++state.started;
         state.inFlight += 1;
         state.maxInFlight = Math.max(state.maxInFlight, state.inFlight);
         const gate = deferred();
         state.gates[index] = gate;
+        if (draining) gate.resolve();
         try {
             await gate.promise;
             return containers;
@@ -91,8 +93,17 @@ function trackedCollector(containers = []) {
         }
     };
     state.release = (index) => state.gates[index]?.resolve();
-    state.releaseAll = () => state.gates.forEach(gate => gate?.resolve());
+    state.releaseAll = () => {
+        draining = true;
+        state.gates.forEach(gate => gate?.resolve());
+    };
     return state;
+}
+
+async function waitForRequestHandlers(requests) {
+    const results = await Promise.allSettled(requests.map(request => request.done));
+    const errors = results.filter(result => result.status === 'rejected').map(result => result.reason);
+    if (errors.length) throw new AggregateError(errors, 'Marketplace request handlers failed during cleanup');
 }
 
 async function until(predicate, label, timeoutMs = 3000) {
@@ -143,20 +154,25 @@ test.after(() => {
 test('GET agents with an injected collector equals the listing built from the same container list', async () => {
     const collector = trackedCollector([runningWorker]);
     const request = get({ collectContainers: collector.collect, agentListOptions: { summaries } });
-    await until(() => collector.started === 1, 'the inventory to start');
-    collector.release(1);
-    await request.res.ended;
-    await request.done;
-    assert.equal(request.res.status, 200);
-    const reference = get({ agentListOptions: { summaries, liveContainers: [runningWorker] } });
-    await reference.res.ended;
-    assert.deepEqual(request.res.body, reference.res.body);
-    const [row] = request.res.body.marketplace.agents;
-    assert.equal(row.ref, 'repo/worker');
-    assert.equal(row.containerName, runningWorker.containerName, 'the collected container was matched to the agent');
-    const control = get({ agentListOptions: { summaries, liveContainers: [] } });
-    await control.res.ended;
-    assert.equal(control.res.body.marketplace.agents[0].containerName, '', 'a different container list gives a different listing');
+    try {
+        await until(() => collector.started === 1, 'the inventory to start');
+        collector.release(1);
+        await request.res.ended;
+        await request.done;
+        assert.equal(request.res.status, 200);
+        const reference = get({ agentListOptions: { summaries, liveContainers: [runningWorker] } });
+        await reference.res.ended;
+        assert.deepEqual(request.res.body, reference.res.body);
+        const [row] = request.res.body.marketplace.agents;
+        assert.equal(row.ref, 'repo/worker');
+        assert.equal(row.containerName, runningWorker.containerName, 'the collected container was matched to the agent');
+        const control = get({ agentListOptions: { summaries, liveContainers: [] } });
+        await control.res.ended;
+        assert.equal(control.res.body.marketplace.agents[0].containerName, '', 'a different container list gives a different listing');
+    } finally {
+        collector.releaseAll();
+        await request.done;
+    }
 });
 
 test('GET agents never collects when the caller supplies runtimeEntries or liveContainers', async () => {
@@ -216,31 +232,41 @@ test('POST enable builds its response through the inventory collector too', asyn
         collectContainers: collector.collect,
         agentListOptions: { summaries },
     });
-    await until(() => collector.started === 1, 'the post-mutation inventory to start');
-    collector.release(1);
-    await request.res.ended;
-    assert.equal(request.res.status, 200);
-    assert.equal(request.res.body.marketplace.agents[0].containerName, runningWorker.containerName);
+    try {
+        await until(() => collector.started === 1, 'the post-mutation inventory to start');
+        collector.release(1);
+        await request.res.ended;
+        assert.equal(request.res.status, 200);
+        assert.equal(request.res.body.marketplace.agents[0].containerName, runningWorker.containerName);
+    } finally {
+        collector.releaseAll();
+        await request.done;
+    }
 });
 
 test('5 concurrent GETs run at most 2 inventories at once and each collects for itself', async () => {
     const collector = trackedCollector([runningWorker]);
     const requests = Array.from({ length: 5 }, () => get({ collectContainers: collector.collect, agentListOptions: { summaries } }));
-    await until(() => collector.started >= 2, 'two inventories to start');
-    await sleep(50);
-    assert.equal(collector.started, 2, 'only two inventories start while both slots are busy');
-    collector.release(1);
-    await until(() => collector.started === 3, 'a queued request to start its own inventory');
-    for (let index = 2; index <= 5; index += 1) {
-        await until(() => collector.started >= index, `inventory ${index}`);
-        collector.release(index);
-    }
-    await Promise.all(requests.map(request => request.res.ended));
-    assert.equal(collector.maxInFlight, 2);
-    assert.equal(collector.started, 5, 'one inventory per request: nothing is shared');
-    for (const request of requests) {
-        assert.equal(request.res.status, 200);
-        assert.equal(request.res.body.marketplace.agents[0].containerName, runningWorker.containerName);
+    try {
+        await until(() => collector.started >= 2, 'two inventories to start');
+        await sleep(50);
+        assert.equal(collector.started, 2, 'only two inventories start while both slots are busy');
+        collector.release(1);
+        await until(() => collector.started === 3, 'a queued request to start its own inventory');
+        for (let index = 2; index <= 5; index += 1) {
+            await until(() => collector.started >= index, `inventory ${index}`);
+            collector.release(index);
+        }
+        await Promise.all(requests.map(request => request.res.ended));
+        assert.equal(collector.maxInFlight, 2);
+        assert.equal(collector.started, 5, 'one inventory per request: nothing is shared');
+        for (const request of requests) {
+            assert.equal(request.res.status, 200);
+            assert.equal(request.res.body.marketplace.agents[0].containerName, runningWorker.containerName);
+        }
+    } finally {
+        collector.releaseAll();
+        await waitForRequestHandlers(requests);
     }
 });
 
@@ -248,34 +274,47 @@ test('a queued inventory starts in the async context of its own request', async 
     const als = new AsyncLocalStorage();
     const seen = [];
     const gates = [];
+    let draining = false;
     const requests = ['request-a', 'request-b', 'request-c'].map(id => als.run(id, () => get({
         agentListOptions: { summaries },
         collectContainers: async () => {
             const gate = deferred();
             seen.push({ expected: id, actual: als.getStore() });
             gates.push(gate);
+            if (draining) gate.resolve();
             await gate.promise;
             return [];
         },
     })));
-    await until(() => seen.length === 2, 'two inventories to start');
-    gates[0].resolve();
-    await until(() => seen.length === 3, 'the queued inventory to start');
-    gates[1].resolve();
-    gates[2].resolve();
-    await Promise.all(requests.map(request => request.res.ended));
-    assert.deepEqual(seen.map(entry => entry.actual), seen.map(entry => entry.expected));
-    assert.deepEqual(seen.map(entry => entry.expected).sort(), ['request-a', 'request-b', 'request-c']);
+    try {
+        await until(() => seen.length === 2, 'two inventories to start');
+        gates[0].resolve();
+        await until(() => seen.length === 3, 'the queued inventory to start');
+        gates[1].resolve();
+        gates[2].resolve();
+        await Promise.all(requests.map(request => request.res.ended));
+        assert.deepEqual(seen.map(entry => entry.actual), seen.map(entry => entry.expected));
+        assert.deepEqual(seen.map(entry => entry.expected).sort(), ['request-a', 'request-b', 'request-c']);
+    } finally {
+        draining = true;
+        gates.forEach(gate => gate.resolve());
+        await waitForRequestHandlers(requests);
+    }
 });
 
 test('a request that closes while queued never starts an inventory, and the others finish', async () => {
     const collector = trackedCollector([]);
+    const requests = [];
     try {
         const first = get({ collectContainers: collector.collect, agentListOptions: { summaries } });
+        requests.push(first);
         const second = get({ collectContainers: collector.collect, agentListOptions: { summaries } });
+        requests.push(second);
         await until(() => collector.started === 2, 'both slots to be busy');
         const aborted = get({ collectContainers: collector.collect, agentListOptions: { summaries } });
+        requests.push(aborted);
         const survivor = get({ collectContainers: collector.collect, agentListOptions: { summaries } });
+        requests.push(survivor);
         await sleep(30);
         aborted.res.emit('close');
         collector.release(1);
@@ -291,6 +330,7 @@ test('a request that closes while queued never starts an inventory, and the othe
         assert.equal(survivor.res.status, 200);
     } finally {
         collector.releaseAll();
+        await waitForRequestHandlers(requests);
     }
 });
 
@@ -300,31 +340,40 @@ test('a response already closed before it reaches the limiter never starts an in
     res.closed = true;
     res.destroyed = true;
     const request = get({ res, collectContainers: collector.collect, agentListOptions: { summaries } });
-    await sleep(100);
     try {
+        await sleep(100);
         assert.equal(collector.started, 0);
         assert.equal(res.writableEnded, false);
     } finally {
         collector.releaseAll();
+        await request.done;
     }
-    await request.done;
 });
 
 test('a close event after the response ended does not cancel queued work', async () => {
     const collector = trackedCollector([]);
+    const requests = [];
     const first = get({ collectContainers: collector.collect, agentListOptions: { summaries } });
+    requests.push(first);
     const second = get({ collectContainers: collector.collect, agentListOptions: { summaries } });
-    await until(() => collector.started === 2, 'both slots to be busy');
-    const queued = get({ collectContainers: collector.collect, agentListOptions: { summaries } });
-    await sleep(30);
-    queued.res.writableEnded = true;
-    queued.res.emit('close');
-    queued.res.writableEnded = false;
-    collector.release(1);
-    await until(() => collector.started === 3, 'the queued inventory to start');
-    collector.releaseAll();
-    await Promise.all([first.res.ended, second.res.ended, queued.res.ended]);
-    assert.equal(queued.res.status, 200);
+    requests.push(second);
+    try {
+        await until(() => collector.started === 2, 'both slots to be busy');
+        const queued = get({ collectContainers: collector.collect, agentListOptions: { summaries } });
+        requests.push(queued);
+        await sleep(30);
+        queued.res.writableEnded = true;
+        queued.res.emit('close');
+        queued.res.writableEnded = false;
+        collector.release(1);
+        await until(() => collector.started === 3, 'the queued inventory to start');
+        collector.releaseAll();
+        await Promise.all([first.res.ended, second.res.ended, queued.res.ended]);
+        assert.equal(queued.res.status, 200);
+    } finally {
+        collector.releaseAll();
+        await waitForRequestHandlers(requests);
+    }
 });
 
 test('the limiter releases its slot when a job throws or rejects', async () => {
