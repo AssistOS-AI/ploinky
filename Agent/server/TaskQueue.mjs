@@ -233,7 +233,7 @@ export class TaskQueue {
         }
         this.persistTimer = setTimeout(() => {
             this.persistTimer = null;
-            if (this.persistWrite) return;
+            if (this.persistWrite || !this.persistDirty) return;
             this.startPersistWrite().then((error) => {
                 // A failed background write is retried by the next state
                 // change or by flushPersist, not in a tight timer loop.
@@ -243,8 +243,15 @@ export class TaskQueue {
     }
 
     // Starts the single in-flight write. Resolves to null on success or to the
-    // write error; it never rejects.
+    // write error; it never rejects. The write snapshots all current state, so
+    // it supersedes any armed debounce timer; clearing it here keeps a timer
+    // re-armed by an earlier background write from writing again after a
+    // flush (and therefore after shutdown) has completed.
     startPersistWrite() {
+        if (this.persistTimer) {
+            clearTimeout(this.persistTimer);
+            this.persistTimer = null;
+        }
         this.persistDirty = false;
         const write = this.writeSnapshot().then(() => null, (error) => {
             this.persistDirty = true;

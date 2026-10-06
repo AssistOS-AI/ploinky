@@ -805,3 +805,38 @@ test('TaskQueue rewrites a legacy queue file without secrets after restore and s
     assert.equal(queue.cancelTask('legacy-done')?.status, 'completed');
     assert.equal(queue.getTask('legacy-running')?.status, 'failed');
 });
+
+test('TaskQueue shutdown leaves no debounced write behind when it starts during a background write (P5)', async (t) => {
+    const storagePath = makeTempStorage(t);
+    const originalWriteFile = fs.promises.writeFile;
+    let releaseFirstWrite;
+    const firstWriteGate = new Promise((resolve) => { releaseFirstWrite = resolve; });
+    let writeCalls = 0;
+    t.mock.method(fs.promises, 'writeFile', async (...args) => {
+        writeCalls += 1;
+        if (writeCalls === 1) await firstWriteGate;
+        return originalWriteFile.apply(fs.promises, args);
+    });
+    const renames = t.mock.method(fs.promises, 'rename');
+    const queue = new TaskQueue({
+        storagePath,
+        persistDebounceMs: 20,
+        executor: async () => ({ code: 0, stdout: 'ok', stderr: '' }),
+    });
+    const { id } = queue.enqueueTask(dummyTaskConfig());
+    await waitFor(() => queue.getTask(id)?.status === 'completed');
+    await waitFor(() => writeCalls === 1, 2000, 5);
+
+    // shutdown marks the queue dirty and flushes while the timer-started write is in flight.
+    const drained = queue.shutdown({ timeoutMs: 1_000, pollMs: 5 });
+    releaseFirstWrite();
+    assert.deepEqual(await drained, { state: 'drained' });
+
+    const writesAtDrain = writeCalls;
+    const renamesAtDrain = renames.mock.callCount();
+    assert.ok(renamesAtDrain >= 1);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(writeCalls, writesAtDrain, 'no write may start after shutdown resolved');
+    assert.equal(renames.mock.callCount(), renamesAtDrain, 'no rename may happen after shutdown resolved');
+    assert.equal(JSON.parse(readFileSync(storagePath, 'utf8')).find((entry) => entry.id === id)?.status, 'completed');
+});
