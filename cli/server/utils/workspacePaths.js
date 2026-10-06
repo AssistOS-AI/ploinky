@@ -138,3 +138,34 @@ export function resolveWorkspacePath(inputPath, {
 
     return canonicalPath;
 }
+
+export async function resolveWorkspacePathAsync(inputPath, {
+    workspaceRoot = getWorkspaceRoot(),
+    leadingSlashIsWorkspaceRelative = true
+} = {}) {
+    if (typeof inputPath !== 'string' || !inputPath.trim()) {
+        throw new Error('Missing path.');
+    }
+    if (inputPath.includes('\0')) {
+        throw new Error('Invalid path.');
+    }
+
+    const candidate = inputPath.trim();
+    const treatAsWorkspaceRelative = leadingSlashIsWorkspaceRelative && candidate.startsWith('/');
+    const resolvedPath = treatAsWorkspaceRelative
+        ? path.resolve(workspaceRoot, candidate.replace(/^\/+/, ''))
+        : path.isAbsolute(candidate)
+            ? path.resolve(candidate)
+            : path.resolve(workspaceRoot, candidate);
+
+    if (!await isPathWithinRootsAsync([workspaceRoot], resolvedPath, { allowMissing: true })) {
+        throw new Error(`Access denied for "${inputPath}".`);
+    }
+
+    const canonicalPath = await resolveCanonicalPathAsync(resolvedPath);
+    if (!canonicalPath || !await isPathWithinRootsAsync([workspaceRoot], canonicalPath, { allowMissing: true })) {
+        throw new Error(`Symlink escape denied for "${inputPath}".`);
+    }
+
+    return canonicalPath;
+}

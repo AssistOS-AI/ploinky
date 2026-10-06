@@ -160,7 +160,7 @@ test('direct upload targets reject symlink components', (t) => {
     }
 });
 
-test('directory explorer lists folders first and hides runtime, dependency, secret, and symlink entries', (t) => {
+test('directory explorer lists folders first and hides runtime, dependency, secret, and symlink entries', async (t) => {
     const workspace = makeTempDir('webchat-directories');
     const cwd = path.join(workspace, 'project');
     fs.mkdirSync(cwd);
@@ -178,7 +178,7 @@ test('directory explorer lists folders first and hides runtime, dependency, secr
             if (error.code !== 'EPERM' && error.code !== 'EACCES') throw error;
             t.diagnostic('symlinks unavailable');
         }
-        const listing = listWorkspaceDirectory({ cwd, workspaceRoot: workspace }, '');
+        const listing = await listWorkspaceDirectory({ cwd, workspaceRoot: workspace }, '');
         assert.deepEqual(listing.entries.map(({ name, kind }) => ({ name, kind })), [
             { name: '.git', kind: 'folder' },
             { name: 'docs', kind: 'folder' },
