@@ -120,7 +120,16 @@ test('timeout kills a TERM-ignoring child, joins it and lets queued paths procee
         directories.slice(1).forEach(directory => assert.equal(repositoryOrigin(directory), 'example.test/survivor'));
     });
     let failure;
-    try { await run; } catch (error) { failure = error; }
+    try {
+        await run;
+        assert.equal(watchdogFired, false, 'production termination must finish before the fixture watchdog');
+        assert.ok(Date.now() - start < 5000, '2000ms child timeout plus 3000ms harness margin');
+        assert.equal(git.started.length, 4);
+        assert.equal(git.live.size, 0);
+        const hung = git.started.find(entry => entry.directory === directories[0]).child;
+        assert.equal(hung.signalCode, 'SIGKILL');
+        assert.throws(() => process.kill(hung.pid, 0), { code: 'ESRCH' });
+    } catch (error) { failure = error; }
     finally {
         clearTimeout(watchdog);
         await watchdogCleanup;
@@ -128,13 +137,6 @@ test('timeout kills a TERM-ignoring child, joins it and lets queued paths procee
     }
     if (cleanupErrors.length) throw new AggregateError([...(failure ? [failure] : []), ...cleanupErrors], 'Origin fixture cleanup failed.');
     if (failure) throw failure;
-    assert.equal(watchdogFired, false, 'production termination must finish before the fixture watchdog');
-    assert.ok(Date.now() - start < 5000, '2000ms child timeout plus 3000ms harness margin');
-    assert.equal(git.started.length, 4);
-    assert.equal(git.live.size, 0);
-    const hung = git.started.find(entry => entry.directory === directories[0]).child;
-    assert.equal(hung.signalCode, 'SIGKILL');
-    assert.throws(() => process.kill(hung.pid, 0), { code: 'ESRCH' });
 });
 
 test('cancellation stops queued paths and joins active children before scope settles', async t => {
