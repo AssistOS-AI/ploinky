@@ -464,6 +464,35 @@ test('maxParallelSyncCalls bounds sync calls that run as fresh processes; absent
     assert.ok(maxOverlap(unlimitedSpans) >= 4, `spans: ${JSON.stringify(unlimitedSpans)}`);
 });
 
+test('S6: SIGTERM shuts the pools down, fails the in-flight worker call and exits 0 with no worker left', async (t) => {
+    const fx = await createFixtureAgent(t);
+    const server = await startServer(t, fx, {
+        toolWorkers: { fx: workerPool(fx, { size: 2 }) },
+        tools: [tool(fx, 'pid_worker', 'pid', { worker: 'fx' }), tool(fx, 'sleep_worker', 'sleep', { worker: 'fx' })],
+    });
+    await Promise.all([callTool(server, 'pid_worker'), callTool(server, 'pid_worker')]);
+    const inFlight = callTool(server, 'sleep_worker').catch((error) => ({ transportError: String(error) }));
+    await waitFor(() => readLines(fx.files.calls).some((line) => line.endsWith(' sleep_worker')), { message: 'the slow call to start' });
+    const workers = workerLoads(fx);
+    assert.ok(workers.length >= 1);
+    for (const pid of workers) assert.ok(groupAlive(pid), `worker ${pid} should be running before SIGTERM`);
+
+    const exited = once(server.child, 'exit');
+    server.child.kill('SIGTERM');
+    let exitTimer;
+    const [code, signal] = await Promise.race([
+        exited,
+        new Promise((resolve) => { exitTimer = setTimeout(() => resolve(['no exit within 30 s', null]), 30_000); }),
+    ]);
+    clearTimeout(exitTimer);
+    assert.equal(code, 0, server.output());
+    assert.equal(signal, null);
+    // Checked at once: the server itself killed and awaited every worker group.
+    for (const pid of workers) assert.equal(groupAlive(pid), false, `worker group ${pid} outlived the AgentServer`);
+    await inFlight;
+    assert.doesNotMatch(server.output(), /tool worker processes were still present/);
+});
+
 test('the agentic tool loop runs opted-in tools in their pool and other tools as fresh processes', async (t) => {
     const fx = await createFixtureAgent(t);
     const config = {

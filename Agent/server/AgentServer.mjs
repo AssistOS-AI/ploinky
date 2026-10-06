@@ -1647,6 +1647,12 @@ async function main() {
             );
             const rejectedTransport = transportResults.find((result) => result.status === 'rejected');
             if (rejectedTransport) throw rejectedTransport.reason;
+            // Fails queued and in-flight worker calls and kills every worker
+            // process group before the task queue drains.
+            const workerShutdown = await shutdownToolWorkerPools({ timeoutMs: 20_000, pools: toolWorkerPools });
+            if (!workerShutdown.clean) {
+                console.warn('[AgentServer/MCP] tool worker processes were still present when the shutdown wait ended');
+            }
             await taskQueue.shutdown({ timeoutMs: 20_000, pollMs: 10 });
             await listenerClosed;
             process.exitCode = 0;
