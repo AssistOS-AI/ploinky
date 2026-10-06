@@ -172,7 +172,10 @@ export function listSsoProviders() {
 
 // The agent directory of one repo/agent: the active route's hostPath when the
 // snapshot routes that exact repo and agent, else the agent under its one
-// repository path. Only that single repository is resolved.
+// repository path. A route's repo is canonical by construction; without a
+// route the repository must be a canonical repository name, as the installed
+// index keys it, because a workspace checkout's folder name also resolves to
+// a path but is not a principal name.
 function resolveAgentDirectory(repoName, agentName, snapshot) {
     if (snapshot) {
         try {
@@ -183,6 +186,7 @@ function resolveAgentDirectory(repoName, agentName, snapshot) {
         }
     }
     try {
+        if (!listAgentRepositoryNames().includes(repoName)) return '';
         return path.join(resolveAgentRepositoryPath(repoName), agentName);
     } catch (_) {
         return '';

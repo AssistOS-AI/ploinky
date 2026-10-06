@@ -1,6 +1,6 @@
 import { deriveAgentRequestSecret } from '../../utils/security/masterKey.js';
 import { deriveAgentPrincipalId } from '../../utils/security/agentIdentity.js';
-import { resolveAgentDescriptor } from '../../utils/agentRegistry.js';
+import { describeAgent } from '../../utils/agentRegistry.js';
 import { parseQualifiedAgentReference } from '../../utils/agentRegistryResolver.js';
 import { AGENT_TARGET_AMBIGUOUS, resolveAgentTargetFromSnapshot } from '../../utils/agentTargetResolver.js';
 import { loadActiveRoutingState } from '../routingState.js';
@@ -55,7 +55,8 @@ function unresolvedProvider(providerAgentRef, cause) {
  * one the active generation is loaded. No installed-repository scan runs.
  * A bare reference that resolves to no route or enabled record, or only to an
  * agent alias instance, is refused; a qualified reference without a route or
- * record falls back to that one agent's installed manifest.
+ * record falls back to that one agent's installed manifest, by the exact
+ * parsed repo/agent pair (never re-read as a bare name).
  */
 export function resolveProviderPrincipal({ providerAgentRef, providerPrincipal, snapshot } = {}) {
     if (providerPrincipal) return String(providerPrincipal).trim();
@@ -77,7 +78,7 @@ export function resolveProviderPrincipal({ providerAgentRef, providerPrincipal, 
     }
     const qualification = parseQualifiedAgentReference(ref);
     if (qualification.qualified && !qualification.malformed) {
-        const descriptor = resolveAgentDescriptor(ref, { snapshot: activeSnapshot });
+        const descriptor = describeAgent(qualification.repoName, qualification.agentName, { snapshot: activeSnapshot });
         if (descriptor?.principalId) return descriptor.principalId;
     }
     throw unresolvedProvider(providerAgentRef);
