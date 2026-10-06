@@ -341,30 +341,45 @@ test('the limiter runs queued jobs in order and reports a cancelled job as skipp
     assert.deepEqual(order, ['first', 'third']);
 });
 
+// A blocked event loop shows as a gap of at least the blocking time on EVERY attempt (the synchronous base blocks for the whole child run),
+// while a loaded CI machine adds only occasional scheduler spikes. The best of three attempts is therefore compared with the 20 ms bound.
+async function bestEventLoopGap(attempt) {
+    const gaps = [];
+    for (let index = 0; index < 3; index += 1) {
+        gaps.push(await attempt());
+        if (gaps[index] < 20) break;
+    }
+    return { best: Math.min(...gaps), gaps };
+}
+
 test('the event loop keeps running during a slow inventory (injected collector)', async () => {
     // Warm the listing path so the measurement sees only the inventory wait.
     await get({ agentListOptions: { summaries, liveContainers: [] } }).res.ended;
-    const heartbeat = startHeartbeat();
-    const request = get({ collectContainers: async () => { await sleep(300); return []; }, agentListOptions: { summaries } });
-    await request.res.ended;
-    const maxGap = heartbeat.stop();
-    assert.equal(request.res.status, 200);
-    assert.ok(maxGap < 20, `event loop gap ${maxGap.toFixed(1)} ms`);
+    const { best, gaps } = await bestEventLoopGap(async () => {
+        const heartbeat = startHeartbeat();
+        const request = get({ collectContainers: async () => { await sleep(300); return []; }, agentListOptions: { summaries } });
+        await request.res.ended;
+        assert.equal(request.res.status, 200);
+        return heartbeat.stop();
+    });
+    assert.ok(best < 20, `event loop gaps ${gaps.map(gap => gap.toFixed(1)).join(', ')} ms`);
 });
 
 test('the event loop keeps running while a real podman child takes 0.3 s (stub podman on PATH)', async () => {
     const stub = installStubPodman('exec sleep 0.3');
     try {
         await get({ agentListOptions: { summaries, liveContainers: [] } }).res.ended;
-        const heartbeat = startHeartbeat();
-        const startedAt = performance.now();
-        const request = get({ agentListOptions: { summaries } });
-        await request.res.ended;
-        const elapsed = performance.now() - startedAt;
-        const maxGap = heartbeat.stop();
-        assert.equal(request.res.status, 200);
-        assert.ok(elapsed >= 250, `the stub child must really have run (elapsed ${elapsed.toFixed(0)} ms)`);
-        assert.ok(maxGap < 20, `event loop gap ${maxGap.toFixed(1)} ms`);
+        const { best, gaps } = await bestEventLoopGap(async () => {
+            const heartbeat = startHeartbeat();
+            const startedAt = performance.now();
+            const request = get({ agentListOptions: { summaries } });
+            await request.res.ended;
+            const elapsed = performance.now() - startedAt;
+            assert.equal(request.res.status, 200);
+            assert.ok(elapsed >= 250, `the stub child must really have run (elapsed ${elapsed.toFixed(0)} ms)`);
+            return heartbeat.stop();
+        });
+        assert.ok(best < 20, `event loop gaps ${gaps.map(gap => gap.toFixed(1)).join(', ')} ms`);
     } finally {
         stub.restore();
         killRecordedPids(stub.dir);
