@@ -19,10 +19,24 @@ const HOST_FIXTURE = path.join(FIXTURES, 'toolWorkerPoolHost.mjs');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+const dirCleanups = new Map();
+
+// One ordered cleanup per test: stop every pool first (so no worker still
+// runs in or writes to the directory), then remove the directory.
 function makeDir(t) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tool-worker-pool-'));
-    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const cleanups = [];
+    dirCleanups.set(dir, cleanups);
+    t.after(async () => {
+        for (const cleanup of cleanups) await cleanup();
+        dirCleanups.delete(dir);
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    });
     return dir;
+}
+
+function onCleanup(dir, cleanup) {
+    dirCleanups.get(dir).push(cleanup);
 }
 
 function pidAlive(pid) {
@@ -72,7 +86,7 @@ function makePool(t, dir, options = {}) {
         log: (line) => logs.push(line),
         ...rest,
     });
-    t.after(() => pool.shutdown({ timeoutMs: 5000 }));
+    onCleanup(dir, () => pool.shutdown({ timeoutMs: 5000 }));
     return { pool, logs };
 }
 
@@ -447,7 +461,7 @@ test('createToolWorkerPools builds declared pools and shutdownToolWorkerPools en
             broken: { size: 1 },
         },
     }, { buildCommandSpec, defaultCwd: dir, log: (line) => logs.push(line) });
-    t.after(() => shutdownToolWorkerPools({ timeoutMs: 5000 }));
+    onCleanup(dir, () => shutdownToolWorkerPools({ timeoutMs: 5000 }));
     assert.deepEqual([...pools.keys()], ['fixture']);
     assert.ok(logs.some((line) => line.includes("'broken'")));
     assert.ok(path.isAbsolute(TOOL_WORKER_MODULE_PATH) && fs.existsSync(TOOL_WORKER_MODULE_PATH));
