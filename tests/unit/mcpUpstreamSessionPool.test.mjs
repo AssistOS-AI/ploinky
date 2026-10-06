@@ -209,6 +209,7 @@ async function startFakeUpstream(t, { onRpc = null, keepAliveTimeout = null } = 
                 id: message?.id,
                 sessionId: req.headers['mcp-session-id'] || '',
                 authorization: req.headers.authorization || '',
+                at: Date.now(),
             });
             if (req.method === 'DELETE') {
                 res.writeHead(200);
@@ -1108,4 +1109,42 @@ test('queue: a queued tools/list times out on its own deadline without sending a
     // FIFO queue still works: a 10th request after the slow batch is served.
     const after = await call('after');
     assert.equal(after.result.content[0].text, 'after');
+});
+
+test('closeAll lets calls in flight finish before it DELETEs their session', async (t) => {
+    let repliedAt = 0;
+    const upstream = await startFakeUpstream(t, {
+        onRpc: async ({ res, message }) => {
+            if (message?.method !== 'tools/call' || message?.params?.name !== 'slow') return false;
+            await new Promise((resolve) => setTimeout(resolve, 400));
+            const data = Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { content: [{ type: 'text', text: 'slow-done' }] } }));
+            res.writeHead(200, { 'content-type': 'application/json', 'content-length': data.length });
+            res.end(data);
+            repliedAt = Date.now();
+            return true;
+        },
+    });
+    const idle = await startFakeUpstream(t);
+    const pool = newPool(t);
+    const busyKey = keyFor({ port: upstream.port, routeKey: 'busyAgent' });
+    const idleKey = keyFor({ port: idle.port, routeKey: 'idleAgent' });
+    const call = (key, port, name) => pool.request({
+        key, hostPort: port, method: 'tools/call', params: { name, arguments: {} },
+        headers: { authorization: 'Bearer test-token' }, beforeDial: () => true,
+    });
+    await call(idleKey, idle.port, 'x');
+    await call(busyKey, upstream.port, 'warm');
+    const busySession = pool.snapshot().entries.find((entry) => entry.key === busyKey).sessionId;
+    const idleSession = pool.snapshot().entries.find((entry) => entry.key === idleKey).sessionId;
+    const slow = call(busyKey, upstream.port, 'slow');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await pool.closeAll();
+    assert.ok(idle.log.some((row) => row.httpMethod === 'DELETE' && row.sessionId === idleSession), 'idle session DELETEd at once');
+    assert.equal(upstream.log.some((row) => row.httpMethod === 'DELETE'), false, 'busy session not DELETEd while a call runs');
+    const result = await slow;
+    assert.equal(result.result.content[0].text, 'slow-done', 'the running call gets its reply');
+    assert.ok(await waitFor(() => upstream.log.some((row) => row.httpMethod === 'DELETE' && row.sessionId === busySession)));
+    const deleteRow = upstream.log.find((row) => row.httpMethod === 'DELETE');
+    assert.ok(deleteRow.at >= repliedAt, 'DELETE after the in-flight reply');
+    assert.deepEqual(pool.snapshot().entries, []);
 });

@@ -293,15 +293,15 @@ export function createUpstreamSessionPool({
         readyUntil.delete(key);
     }
 
-    function evict(entry, { immediate = false } = {}) {
+    function evict(entry, { retryWaiters = true } = {}) {
         forgetKey(entry.key);
         if (entries.get(entry.key) === entry) entries.delete(entry.key);
         if (entry.closed) return;
         entry.closed = true;
         counters.evictions += 1;
-        rejectWaiters(entry);
+        rejectWaiters(entry, retryWaiters);
         // In-flight requests on the entry finish first; the DELETE follows the last one.
-        if (immediate || entry.inflight === 0) {
+        if (entry.inflight === 0) {
             finishClose(entry);
         } else {
             entry.closeWhenIdle = true;
@@ -345,13 +345,13 @@ export function createUpstreamSessionPool({
         }
     }
 
-    function rejectWaiters(entry) {
+    function rejectWaiters(entry, retryable) {
         for (const waiter of entry.waiters.splice(0)) {
             if (waiter.done) continue;
             waiter.done = true;
             clearTimeout(waiter.timer);
             waiter.reject(poolError(UPSTREAM_SESSION_LOST, 'upstream MCP session closed before dispatch', {
-                retryable: true,
+                retryable,
             }));
         }
     }
@@ -702,8 +702,11 @@ export function createUpstreamSessionPool({
             clearInterval(sweepTimer);
             sweepTimer = null;
         }
+        // Idle entries are DELETEd now. Entries with calls in flight are DELETEd
+        // after their last call finishes, so a running tool's reply is never cut
+        // off by the shutdown; queued requests that sent nothing are rejected.
         for (const entry of [...entries.values()]) {
-            evict(entry, { immediate: true });
+            evict(entry, { retryWaiters: false });
         }
         entries.clear();
         slots.clear();
