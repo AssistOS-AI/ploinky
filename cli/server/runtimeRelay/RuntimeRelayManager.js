@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -433,11 +433,23 @@ class RuntimeRelayCheckout {
 }
 
 function defaultInspect(runtime, containerId) {
-    return JSON.parse(execFileSync(runtime, ['inspect', containerId], {
-        encoding: 'utf8',
-        timeout: 5_000,
-        maxBuffer: 4 * 1024 * 1024,
-    }));
+    return new Promise((resolve, reject) => {
+        execFile(runtime, ['inspect', containerId], {
+            encoding: 'utf8',
+            timeout: 5_000,
+            maxBuffer: 4 * 1024 * 1024,
+        }, (error, stdout) => {
+            if (error) {
+                reject(error);
+                return;
+            }
+            try {
+                resolve(JSON.parse(stdout));
+            } catch (parseError) {
+                reject(parseError);
+            }
+        });
+    });
 }
 
 export class RuntimeRelayManager {
