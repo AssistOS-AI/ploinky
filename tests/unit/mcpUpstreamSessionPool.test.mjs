@@ -1241,3 +1241,24 @@ test('readiness (proxy): after a generation change the next call probes again', 
     proxyToolPayload((await call('after')).json);
     assert.equal(readiness.calls, 2, 'the call after a generation change runs the readiness probe');
 });
+
+test('provider principal: the route key resolves to the same target with or without a lease snapshot', async () => {
+    const { proxy, audience } = await loadProxyFixture();
+    const { getAgentDescriptorByPrincipal } = await import('../../cli/utils/agentRegistry.js');
+    const { deriveAgentPrincipalId } = await import('../../cli/utils/security/agentIdentity.js');
+    const expected = deriveAgentPrincipalId('PoolTest', 'echoAgent');
+    assert.equal(audience, expected);
+    // The removed lookup asked the registry for `agent:<routeKey>`; real
+    // principals are `agent:<repo>/<agent>`, so it never matched.
+    assert.equal(getAgentDescriptorByPrincipal('agent:echoAgent'), null);
+    assert.equal(getAgentDescriptorByPrincipal(expected)?.principalId, expected);
+    const mint = (extra) => proxy.buildInvocationContextForProviderCall({
+        req: { user: PROXY_USER }, agentName: 'echoAgent', toolName: 'actor', toolArgs: { label: 'x' }, ...extra,
+    }).payload;
+    for (const extra of [{}, { snapshot: undefined }, { snapshot: { agents: {}, routing: { routes: {} } } }]) {
+        const payload = mint(extra);
+        assert.equal(payload.aud, expected);
+        assert.equal(payload.sub, 'user:alice');
+        assert.equal(payload.tool, 'actor');
+    }
+});

@@ -18,7 +18,6 @@ import { buildMcpDelegationsForUserCall } from './mcpDelegations.js';
 import { computeRchTool } from '../../../Agent/lib/requestHash.mjs';
 import { createTokenReplayCache } from '../security/tokens/JwsCodec.js';
 import { sanitizeArgumentsForTool } from './toolArguments.js';
-import { getAgentDescriptorByPrincipal } from '../../utils/agentRegistry.js';
 import { policy } from '../policy/index.js';
 import { deriveSubkey } from '../../utils/security/masterKey.js';
 import { verifyUserDelegationGrant } from './userDelegationGrant.js';
@@ -66,16 +65,6 @@ function isSecureWireEnabled() {
     const flag = String(process.env.PLOINKY_SECURE_WIRE || '').trim().toLowerCase();
     if (flag === '0' || flag === 'false' || flag === 'off') return false;
     return true;
-}
-
-function resolveProviderAgentRef(agentName) {
-    // agentName is typically the short route name. Find the full repo/agent
-    // reference so the agent registry can resolve the provider principal.
-    try {
-        const descriptor = getAgentDescriptorByPrincipal(`agent:${agentName}`);
-        if (descriptor) return descriptor.agentRef;
-    } catch (_) {}
-    return agentName;
 }
 
 // Agent-to-agent calls arrive at /<agent>/mcp carrying an Agent Assertion as
@@ -401,7 +390,17 @@ export async function cancelAuthenticatedAgentTask({ req, route, agentName, task
     });
 }
 
-export function buildInvocationContextForProviderCall({ req, agentName, toolName, toolArgs, method = 'POST', path = '/mcp' }) {
+// `snapshot` is the request's edge-routing lease snapshot, when the caller has
+// one; the route key (`agentName`) is resolved to its provider principal.
+export function buildInvocationContextForProviderCall({
+    req,
+    agentName,
+    toolName,
+    toolArgs,
+    method = 'POST',
+    path = '/mcp',
+    snapshot = undefined,
+}) {
     if (!isSecureWireEnabled()) return null;
     const canonicalArgs = toolArgs && typeof toolArgs === 'object' && !Array.isArray(toolArgs) ? toolArgs : {};
     // rch binds the token to exactly the {method, path, tool, arguments} the
@@ -419,7 +418,7 @@ export function buildInvocationContextForProviderCall({ req, agentName, toolName
     if (delegated) {
         const caller = String(delegated.callerPrincipal || '');
         const targetAgentId = String(delegated.userDelegation?.delegation?.targetAgentId || '').trim()
-            || resolveProviderPrincipal({ providerAgentRef: resolveProviderAgentRef(agentName) });
+            || resolveProviderPrincipal({ providerAgentRef: agentName, snapshot });
         sub = caller;
         actor = { kind: 'agent', id: caller, roles: [] };
         const callerInfo = { kind: 'agent', id: caller, roles: ['agent'] };
@@ -438,7 +437,7 @@ export function buildInvocationContextForProviderCall({ req, agentName, toolName
         });
         return { token, payload, rch };
     } else {
-        const targetAgentId = resolveProviderPrincipal({ providerAgentRef: resolveProviderAgentRef(agentName) });
+        const targetAgentId = resolveProviderPrincipal({ providerAgentRef: agentName, snapshot });
         const user = extractDelegatedUser(req);
         sub = user?.id ? `user:${user.id}` : '';
         actor = { kind: actorKindForRequestUser(req.user), id: sub, roles: user?.roles || [] };
@@ -464,6 +463,7 @@ export function verifyDelegatedAgentToolCall({
     toolName,
     rawArgs = {},
     assertionCache = assertionReplayCache,
+    snapshot = undefined,
 }) {
     const rch = computeRchTool({ method: 'POST', path: '/mcp', tool: toolName, arguments: rawArgs });
     const verifiedAgent = verifyAgentAssertion({
@@ -479,7 +479,7 @@ export function verifyDelegatedAgentToolCall({
     if (!delegationToken) {
         return { ...verifiedAgent, userDelegation: null };
     }
-    const targetAgentId = resolveProviderPrincipal({ providerAgentRef: resolveProviderAgentRef(agentName) });
+    const targetAgentId = resolveProviderPrincipal({ providerAgentRef: agentName, snapshot });
     const userDelegation = verifyUserDelegationGrant({
         signingSecret: resolveUserDelegationSigningSecret(),
         token: delegationToken,
@@ -624,6 +624,7 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, {
     pool = null,
     poolKey = null,
     ensureReady = null,
+    snapshot = undefined,
 } = {}) {
     const isBatch = Array.isArray(payload);
     const messages = isBatch ? payload : [payload];
@@ -690,7 +691,8 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, {
             req,
             agentName,
             toolName,
-            toolArgs: toolArgs || {}
+            toolArgs: toolArgs || {},
+            snapshot,
         });
         if (ctx?.token) {
             return { authorization: `Bearer ${ctx.token}` };
@@ -870,6 +872,7 @@ async function handleAgentMcpRequest(req, res, route, agentName, {
                     toolName,
                     rawArgs,
                     assertionCache: assertionReplayCache,
+                    snapshot: routePlan?.lease?.snapshot,
                 });
             } catch (error) {
                 res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -947,6 +950,7 @@ async function handleAgentMcpRequest(req, res, route, agentName, {
                     pool: poolKey ? pool : null,
                     poolKey,
                     ensureReady: probeReadiness,
+                    snapshot: routePlan?.lease?.snapshot,
                 });
                 return;
             }
