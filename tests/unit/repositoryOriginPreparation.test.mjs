@@ -116,8 +116,10 @@ test('cancellation stops queued paths and joins active children before scope set
     const controller = new AbortController();
     const run = runWithRepositoryResolutionScope(() => prefetchWorkspaceRepositoryOrigins(root), { signal: controller.signal });
     await until(() => git.events().length === 2, 'both children started');
+    const cancelledAt = Date.now();
     controller.abort();
     await run;
+    assert.ok(Date.now() - cancelledAt < 1000, 'cancellation joins promptly rather than waiting for the 2000ms timeout');
     assert.equal(git.started.length, 2);
     assert.equal(git.live.size, 0);
     for (const { child } of git.started) assert.throws(() => process.kill(child.pid, 0), { code: 'ESRCH' });
