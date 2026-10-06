@@ -11,6 +11,10 @@ if (process.env.FIXTURE_LOADS_LOG) {
 if (process.env.FIXTURE_DIE_BEFORE_READY === '1') {
     process.exit(9);
 }
+if (process.env.FIXTURE_HANG_BEFORE_READY === '1') {
+    setInterval(() => {}, 1000);
+    await new Promise(() => {});
+}
 
 const { serveToolWorker } = await import(process.env.PLOINKY_TOOL_WORKER_MODULE);
 

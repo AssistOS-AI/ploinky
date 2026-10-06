@@ -349,6 +349,32 @@ test('T14: three deaths before ready degrade the pool to the spawn fallback', as
     assert.match(noFallback.stderr, /degraded/);
 });
 
+test('T14b: workers that hang until readyTimeoutMs still degrade the pool (fake clock)', async (t) => {
+    const dir = makeDir(t);
+    // 1 real ms = 150 pool ms: readyTimeoutMs 100 (a real timer) spans 15 s of
+    // pool time, the plan default, so three hangs take 45 s of pool time.
+    const t0 = Date.now();
+    const now = () => t0 + (Date.now() - t0) * 150;
+    const { pool } = makePool(t, dir, { size: 1, readyTimeoutMs: 100, now, env: { FIXTURE_HANG_BEFORE_READY: '1' } });
+    let fallbacks = 0;
+    const fallback = async () => {
+        fallbacks += 1;
+        return { code: 0, signal: null, stdout: 'from-spawn-fallback', stderr: '' };
+    };
+    const first = await callTool(pool, { mode: 'echo' }, { fallback, timeoutMs: 10_000 });
+    assert.equal(first.stdout, 'from-spawn-fallback', JSON.stringify(first));
+    assert.equal(pool.stats().spawned, 3);
+    assert.equal(pool.stats().degraded, true);
+    assert.equal(fallbacks, 1);
+
+    // Degraded mode ends after 60 s of pool time; the pool then spawns again.
+    assert.ok(await waitUntil(() => !pool.isDegraded(), 3000), 'degraded mode never ended');
+    const again = await callTool(pool, { mode: 'echo' }, { fallback, timeoutMs: 10_000 });
+    assert.equal(again.stdout, 'from-spawn-fallback');
+    assert.equal(pool.stats().spawned, 6);
+    assert.equal(fallbacks, 2);
+});
+
 test('T15: SIGKILL of the host process ends its workers within 2 s', async (t) => {
     const dir = makeDir(t);
     const pidDir = path.join(dir, 'pids');

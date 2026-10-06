@@ -26,8 +26,10 @@ export const TOOL_WORKER_DEFAULTS = Object.freeze({
     maxFrameBytes: 256 * 1024 * 1024,
 });
 
+// Consecutive deaths before `ready` (no worker became ready in between) that
+// mark the command broken. Counting consecutive deaths, not deaths inside a
+// fixed time window, also catches workers that hang until readyTimeoutMs.
 const PRE_READY_DEATH_LIMIT = 3;
-const PRE_READY_DEATH_WINDOW_MS = 30_000;
 const DEGRADED_MS = 60_000;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 20_000;
 const MAX_LOG_PARTIAL_CHARS = 64 * 1024;
@@ -168,7 +170,7 @@ export class ToolWorkerPool {
         this.workers = new Set();
         this.queue = [];
         this.nextCallId = 1;
-        this.preReadyDeaths = [];
+        this.preReadyDeaths = 0;
         this.degradedUntil = 0;
         this.shuttingDown = false;
         this.shutdownPromise = null;
@@ -419,7 +421,7 @@ export class ToolWorkerPool {
             clearTimeout(worker.readyTimer);
             worker.readyTimer = null;
             worker.state = 'idle';
-            this.preReadyDeaths = [];
+            this.preReadyDeaths = 0;
             this.becomeIdle(worker);
             return;
         }
@@ -558,13 +560,11 @@ export class ToolWorkerPool {
     }
 
     recordPreReadyDeath() {
-        const now = this.now();
-        this.preReadyDeaths = this.preReadyDeaths.filter((at) => now - at < PRE_READY_DEATH_WINDOW_MS);
-        this.preReadyDeaths.push(now);
-        if (this.preReadyDeaths.length >= PRE_READY_DEATH_LIMIT) {
-            this.preReadyDeaths = [];
-            this.degradedUntil = now + DEGRADED_MS;
-            this.log(`[toolWorkerPool:${this.name}] ${PRE_READY_DEATH_LIMIT} workers died before ready within ${PRE_READY_DEATH_WINDOW_MS}ms; degraded for ${DEGRADED_MS}ms (spawn fallback)`);
+        this.preReadyDeaths += 1;
+        if (this.preReadyDeaths >= PRE_READY_DEATH_LIMIT) {
+            this.preReadyDeaths = 0;
+            this.degradedUntil = this.now() + DEGRADED_MS;
+            this.log(`[toolWorkerPool:${this.name}] ${PRE_READY_DEATH_LIMIT} consecutive workers died before ready; degraded for ${DEGRADED_MS}ms (spawn fallback)`);
             this.drainQueueToFallback();
         }
     }
