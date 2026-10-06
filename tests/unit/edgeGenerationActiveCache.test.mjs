@@ -271,3 +271,59 @@ test('11: 1000 warm loads perform one lstat each and no read of the generation f
     assert.equal(lstats.length, 1000);
     assert.equal(reads.length, 0);
 });
+
+// The stamp is (dev, ino, size, mtimeNs, ctimeNs). Each of the next two cases
+// leaves size and mtime equal to the cached values, so only the remaining
+// stamp fields can notice the change.
+function sameSizeTamper(original) {
+    const tampered = Buffer.from(original);
+    const at = tampered.indexOf(Buffer.from('"schemaVersion"')) + 1;
+    tampered[at] = tampered[at] === 0x53 ? 0x54 : 0x53;
+    assert.equal(tampered.length, original.length);
+    assert.notDeepEqual(tampered, original);
+    return tampered;
+}
+
+test('12a: an in-place rewrite that keeps size, inode and mtime is detected through ctime', (t) => {
+    quiet(t);
+    const world = makeWorld(t);
+    const file = generationPath(world);
+    const original = fs.readFileSync(file);
+    const pinned = new Date(1_700_000_000_000);
+    fs.utimesSync(file, pinned, pinned);
+    const warm = fs.lstatSync(file, { bigint: true });
+    load(world.options);
+
+    fs.writeFileSync(file, sameSizeTamper(original));
+    fs.utimesSync(file, pinned, pinned);
+    const after = fs.lstatSync(file, { bigint: true });
+    assert.equal(after.ino, warm.ino, 'same inode');
+    assert.equal(after.dev, warm.dev);
+    assert.equal(after.size, warm.size, 'same size');
+    assert.equal(after.mtimeNs, warm.mtimeNs, 'same mtime');
+    assert.notEqual(after.ctimeNs, warm.ctimeNs, 'ctime is the only field that moved');
+    assert.throws(() => load(world.options), { code: 'EDGE_GENERATION_CORRUPT' });
+    assert.throws(() => world.lease(), { code: 'EDGE_GENERATION_CORRUPT' });
+});
+
+test('12b: a same-size, same-mtime replacement by rename is detected through the new inode', (t) => {
+    quiet(t);
+    const world = makeWorld(t);
+    const file = generationPath(world);
+    const original = fs.readFileSync(file);
+    const pinned = new Date(1_700_000_000_000);
+    fs.utimesSync(file, pinned, pinned);
+    const warm = fs.lstatSync(file, { bigint: true });
+    load(world.options);
+
+    const beside = `${file}.replacement`;
+    fs.writeFileSync(beside, sameSizeTamper(original));
+    fs.utimesSync(beside, pinned, pinned);
+    fs.renameSync(beside, file);
+    const after = fs.lstatSync(file, { bigint: true });
+    assert.notEqual(after.ino, warm.ino, 'a new inode');
+    assert.equal(after.size, warm.size, 'same size');
+    assert.equal(after.mtimeNs, warm.mtimeNs, 'same mtime');
+    assert.throws(() => load(world.options), { code: 'EDGE_GENERATION_CORRUPT' });
+    assert.throws(() => world.lease(), { code: 'EDGE_GENERATION_CORRUPT' });
+});
