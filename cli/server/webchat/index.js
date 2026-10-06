@@ -641,7 +641,7 @@ refocusComposerAfterIcon(attachmentBtn);
 initMessageToolbar();
 createHeaderMenu({ button: settingsBtn, panel: settingsPanel });
 createResponsiveHeaderActions({
-    actions: [tasksBtn, sessionsBtn, logoutBtn],
+    actions: [sessionsBtn, logoutBtn],
     desktopContainer: headerActions,
     mobileContainer: settingsActionSlot,
     mobileSection: settingsMobileActions,
