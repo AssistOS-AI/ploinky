@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { AsyncResource } from 'node:async_hooks';
 import { withWorkspaceMutationLease } from '../../utils/runtime/maintenanceLocks.js';
 import { uninstallRepositoryUnderLease } from '../../utils/repositoryUninstall.mjs';
 import { installRepositoryLinks, removeRepositoryLinks } from '../../utils/repositoryInstall.mjs';
@@ -10,6 +11,8 @@ import { listAgentRepositoryNames, workspaceAgentRepositoryPath } from '../../ut
 import * as agentsSvc from '../../utils/agents.js';
 import * as workspaceSvc from '../../utils/workspace.js';
 import { collectAgentRuntimeStates } from '../../sandbox/agentRuntimeState.js';
+import { collectLiveAgentContainersAsync } from '../../sandbox/docker/containerRegistry.js';
+import { debugLog } from '../../utils/utils.js';
 import { readAgentRegistrySnapshot } from '../../utils/agentRegistrySnapshot.js';
 import {
     createNoWaitRunBinding,
@@ -55,6 +58,56 @@ const SAFE_LIFECYCLE_ERRORS = new Map([
     ['PLOINKY_AGENT_ENABLE_MODE_UNSUPPORTED', { status: 422, message: 'The agent does not support the selected run mode.' }],
     ['PLOINKY_MANIFEST_ENABLE_MODES_INVALID', { status: 422, message: 'The agent manifest declares invalid enable modes.' }],
 ]);
+// The agent listing reads the container engine (two child processes). At most this many inventories run at once; every other request waits for
+// a slot and then collects for itself, so no inventory result is ever shared between requests.
+const MARKETPLACE_INVENTORY_MAX_IN_FLIGHT = 2;
+const MARKETPLACE_INVENTORY_SKIPPED = Symbol('marketplace.inventory.skipped');
+const MARKETPLACE_REQUEST_CLOSED = Symbol('marketplace.request.closed');
+
+// Runs `job` with at most `maxInFlight` jobs active. A job resolves to its own result, or to MARKETPLACE_INVENTORY_SKIPPED when
+// `isCancelled()` was true at the moment its turn came (it never starts). The job runs in the async context of the caller that enqueued it,
+// not in the context of whichever job released the slot.
+function createInventoryLimiter(maxInFlight = MARKETPLACE_INVENTORY_MAX_IN_FLIGHT) {
+    let inFlight = 0;
+    const queue = [];
+    const drain = () => {
+        while (inFlight < maxInFlight && queue.length) {
+            const entry = queue.shift();
+            if (entry.isCancelled()) {
+                entry.resolve(MARKETPLACE_INVENTORY_SKIPPED);
+                continue;
+            }
+            inFlight += 1;
+            let running;
+            try {
+                running = Promise.resolve(entry.job());
+            } catch (error) {
+                running = Promise.reject(error);
+            }
+            running.then(entry.resolve, entry.reject).finally(() => {
+                inFlight -= 1;
+                drain();
+            });
+        }
+    };
+    return (job, { isCancelled = () => false } = {}) => new Promise((resolve, reject) => {
+        queue.push({ job: AsyncResource.bind(job), isCancelled, resolve, reject });
+        drain();
+    });
+}
+const inventoryLimiter = createInventoryLimiter();
+
+// "Closed" is the response's own close without a completed end: the request's close event can also fire once its body has been consumed.
+function watchResponseClose(res) {
+    let closed = false;
+    const onClose = () => { if (!res.writableEnded) closed = true; };
+    if (typeof res?.once === 'function') res.once('close', onClose);
+    return {
+        isClosed: () => closed || (!res?.writableEnded && (res?.closed === true || res?.destroyed === true)),
+        stop: () => { if (typeof res?.removeListener === 'function') res.removeListener('close', onClose); },
+    };
+}
+
 const marketplaceEnableFlights = new Map();
 let marketplaceEnableQueue = Promise.resolve();
 
@@ -557,7 +610,9 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
             }
         },
     }),
+    disableAgentAction = (ref) => agentsSvc.disableAgent(ref),
     agentListOptions = {}, // a test's listing observes its own live containers
+    collectContainers = collectLiveAgentContainersAsync,
     uninstallRepositoryAction = (body) => uninstallMarketplaceRepository(body),
 } = {}) {
     const route = parseMarketplacePath(parsedUrl.pathname || '/');
@@ -596,13 +651,35 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
         const authResult = await ensureMarketplaceUser(req, res, { routePlan });
         return authResult.ok;
     };
-    const agentsMarketplace = () => ({
-        ...buildMarketplaceAgents(req.user, agentListOptions),
-        permissions: {
-            canManage: isAdminUser(req.user)
-                && Boolean(publicMarketplaceAuthContext(routePlan) || canonicalControlOrigin(req)),
-        },
-    });
+    // Resolves to MARKETPLACE_REQUEST_CLOSED when the client went away while the inventory waited for a slot: nothing is built or sent then.
+    const agentsMarketplace = async () => {
+        let options = agentListOptions;
+        if (!Object.hasOwn(agentListOptions, 'runtimeEntries') && !Object.hasOwn(agentListOptions, 'liveContainers')) {
+            const watch = watchResponseClose(res);
+            let liveContainers;
+            try {
+                liveContainers = await inventoryLimiter(async () => {
+                    try {
+                        return (await collectContainers()) || [];
+                    } catch (error) {
+                        debugLog(`marketplace agent inventory: ${error?.message || error}`);
+                        return [];
+                    }
+                }, { isCancelled: watch.isClosed });
+            } finally {
+                watch.stop();
+            }
+            if (liveContainers === MARKETPLACE_INVENTORY_SKIPPED) return MARKETPLACE_REQUEST_CLOSED;
+            options = { ...agentListOptions, liveContainers };
+        }
+        return {
+            ...buildMarketplaceAgents(req.user, options),
+            permissions: {
+                canManage: isAdminUser(req.user)
+                    && Boolean(publicMarketplaceAuthContext(routePlan) || canonicalControlOrigin(req)),
+            },
+        };
+    };
 
     // Raw repository source listing for the repository client.
     if (route.resource === 'list-repos') {
@@ -622,11 +699,13 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
     }
 
     const isRepos = route.resource === 'repos';
-    const marketplacePayload = () => (isRepos ? buildMarketplaceRepositories() : agentsMarketplace());
+    const marketplacePayload = async () => (isRepos ? buildMarketplaceRepositories() : agentsMarketplace());
 
     if (method === 'GET') {
         if (!await authorizeRead()) return true;
-        sendJson(res, 200, { ok: true, marketplace: marketplacePayload() });
+        const marketplace = await marketplacePayload();
+        if (marketplace === MARKETPLACE_REQUEST_CLOSED) return true;
+        sendJson(res, 200, { ok: true, marketplace });
         return true;
     }
 
@@ -702,13 +781,15 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
                 ({ result } = await enableAgentAction(body));
             } else if (action === 'disable_agent') {
                 const ref = normalizeMarketplaceAgentRef(body?.agentRef);
-                result = await agentsSvc.disableAgent(ref);
+                result = await disableAgentAction(ref);
                 if (result?.status && result.status !== 'removed' && result.status !== 'static-removed') {
                     sendMarketplaceError(res, 409, 'agent_disable_blocked', result.status);
                     return true;
                 }
             }
-            sendJson(res, 200, { ok: true, action, result, marketplace: marketplacePayload() });
+            const marketplace = await marketplacePayload();
+            if (marketplace === MARKETPLACE_REQUEST_CLOSED) return true;
+            sendJson(res, 200, { ok: true, action, result, marketplace });
             return true;
         } catch (error) {
             if (sendLifecycleError(res, error)) return true;
@@ -722,6 +803,8 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
     return true;
 }
 export const __testables = {
+    createInventoryLimiter,
+    MARKETPLACE_INVENTORY_SKIPPED,
     buildMarketplaceState,
     collectMarketplaceNoWaitStates,
     normalizeMarketplaceAgentStatus,
