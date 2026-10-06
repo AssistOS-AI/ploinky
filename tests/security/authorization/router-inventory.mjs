@@ -38,8 +38,8 @@ add('users-create', 'POST', '/api/agents/:agent/users', 'cli/server/authHandlers
 add('users-update', 'PATCH', '/api/agents/:agent/users/:userId', 'cli/server/authHandlers/userAdminRoutes.js:327', 'admin', 'Can change username/name/displayName/email/roles as supported by provider. Non-admin role spoof and horizontal target must fail before mutation.', { gap: 'Requires valid disposable existing user, positive control and persisted after-check.' });
 add('users-delete', 'DELETE', '/api/agents/:agent/users/:userId', 'cli/server/authHandlers/userAdminRoutes.js:352', 'admin', 'Provider delete; admin.users.manage, CSRF, lease. Never delete a non-fixture account.', { gap: 'Fixture cleanup only; no broad deletion.' });
 add('removed-settings', '*', '/api/agents/:agent/settings', 'cli/server/authHandlers/userAdminRoutes.js:173', 'private', 'Reserved removed route returns 404 before session resolution; provider settings live in UserPersisto.');
-add('marketplace-repos-read', 'GET', '/api/marketplace/repos', 'cli/server/authHandlers/marketplaceRoutes.js:701', 'session', 'All authenticated roles can discover the repository catalog. Assertion callers require bound marketplace-read authority. Audit skillSource.source/origin separately from catalog access.', { anchor: 'const marketplacePayload = async () =>' });
-add('marketplace-agents-read', 'GET', '/api/marketplace/agents', 'cli/server/authHandlers/marketplaceRoutes.js:675', 'session', 'All authenticated roles can read agent runtime state and their own identity; canManage derives from real administrator. Audit manifestPath, pid and containerName separately from agent access.', { anchor: '...buildMarketplaceAgents(req.user, options),' });
+add('marketplace-repos-read', 'GET', '/api/marketplace/repos', 'cli/server/authHandlers/marketplaceRoutes.js:702', 'session', 'All authenticated roles can discover the repository catalog. Assertion callers require bound marketplace-read authority. Audit skillSource.source/origin separately from catalog access.', { anchor: 'const marketplacePayload = async () =>' });
+add('marketplace-agents-read', 'GET', '/api/marketplace/agents', 'cli/server/authHandlers/marketplaceRoutes.js:676', 'session', 'All authenticated roles can read agent runtime state and their own identity; canManage derives from real administrator. Audit manifestPath, pid and containerName separately from agent access.', { anchor: '...buildMarketplaceAgents(req.user, options),' });
 add('hardware-limits-read', 'GET', '/api/marketplace/hardware-limits', 'cli/server/authHandlers/hardwareLimitsRoutes.mjs:231', 'admin', 'Administrator cookie session only; every Bearer form is rejected before body or store access. Workspace-master-key cookie/CSRF forgery remains an accepted v1 exposure.', { anchor: "if (method === 'GET') {" });
 for (const [action, line, anchor] of [
   ['set_agent_limits', 270, "const result = body.action === 'set_agent_limits'"],
@@ -49,10 +49,10 @@ for (const [action, line, anchor] of [
   add(`hardware-limits-${action}`, 'POST', '/api/marketplace/hardware-limits', `cli/server/authHandlers/hardwareLimitsRoutes.mjs:${line}`, 'admin', 'Administrator session, exact Origin/current CSRF proof, routing authority and CAS token. Apply uses exact registry keys and checks policy/barrier before destructive work and create. No pool action.', { body: { action }, anchor, gap: 'Live mutations require a selected disposable Box; offline authorization and exact-identity cases are mandatory.' });
 }
 for (const [action, path, line] of [
-  ['install_repo', '/api/marketplace/repos', 772],
-  ['uninstall_repo', '/api/marketplace/repos', 777],
-  ['enable_agent', '/api/marketplace/agents', 779],
-  ['disable_agent', '/api/marketplace/agents', 781],
+  ['install_repo', '/api/marketplace/repos', 773],
+  ['uninstall_repo', '/api/marketplace/repos', 778],
+  ['enable_agent', '/api/marketplace/agents', 780],
+  ['disable_agent', '/api/marketplace/agents', 782],
 ]) {
   add(`marketplace-${action}`, 'POST', path, `cli/server/authHandlers/marketplaceRoutes.js:${line}`, 'admin', `Body action=${action}. Browser admin + Origin/CSRF. A verified agent may only mutate installed repositories or enable installed agents with dedicated assertion.`, { body: { action }, anchor: `action === '${action}'`, gap: 'Lifecycle/global repository operations require valid disposable ownership and positive control; never run against a business runtime.' });
 }
