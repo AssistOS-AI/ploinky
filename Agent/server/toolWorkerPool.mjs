@@ -40,6 +40,13 @@ function positiveInteger(value, fallback) {
     return Number.isInteger(value) && value > 0 ? value : fallback;
 }
 
+// setTimeout fires at once for delays above 2^31-1 ms; clamp instead.
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
+function timerDelay(value, fallback) {
+    return Math.min(positiveInteger(value, fallback), MAX_TIMER_MS);
+}
+
 function nonNegativeInteger(value, fallback) {
     return Number.isInteger(value) && value >= 0 ? value : fallback;
 }
@@ -158,11 +165,11 @@ export class ToolWorkerPool {
         this.env = options.env && typeof options.env === 'object' ? { ...options.env } : {};
         this.size = positiveInteger(options.size, TOOL_WORKER_DEFAULTS.size);
         this.maxQueue = nonNegativeInteger(options.maxQueue, TOOL_WORKER_DEFAULTS.maxQueue);
-        this.callTimeoutMs = positiveInteger(options.callTimeoutMs, TOOL_WORKER_DEFAULTS.callTimeoutMs);
-        this.readyTimeoutMs = positiveInteger(options.readyTimeoutMs, TOOL_WORKER_DEFAULTS.readyTimeoutMs);
+        this.callTimeoutMs = timerDelay(options.callTimeoutMs, TOOL_WORKER_DEFAULTS.callTimeoutMs);
+        this.readyTimeoutMs = timerDelay(options.readyTimeoutMs, TOOL_WORKER_DEFAULTS.readyTimeoutMs);
         this.maxCallsPerWorker = positiveInteger(options.maxCallsPerWorker, TOOL_WORKER_DEFAULTS.maxCallsPerWorker);
         this.maxRssBytes = positiveInteger(options.maxRssBytes, TOOL_WORKER_DEFAULTS.maxRssBytes);
-        this.idleTimeoutMs = positiveInteger(options.idleTimeoutMs, TOOL_WORKER_DEFAULTS.idleTimeoutMs);
+        this.idleTimeoutMs = timerDelay(options.idleTimeoutMs, TOOL_WORKER_DEFAULTS.idleTimeoutMs);
         this.maxFrameBytes = positiveInteger(options.maxFrameBytes, TOOL_WORKER_DEFAULTS.maxFrameBytes);
         this.log = typeof options.log === 'function' ? options.log : defaultLog;
         this.now = typeof options.now === 'function' ? options.now : Date.now;
@@ -223,14 +230,14 @@ export class ToolWorkerPool {
      * reason on stderr. A call is never retried. While the pool is degraded
      * the call runs through `fallback()` instead (when given).
      */
-    async call({ toolName, toolEnv, payload, timeoutMs, fallback } = {}) {
+    async call({ toolName, toolEnv, payload, timeoutMs: callTimeoutMs, fallback } = {}) {
         if (this.shuttingDown) {
             return failureResult(`tool worker pool '${this.name}' is shutting down`);
         }
         if (this.isDegraded()) {
             return this.runFallback(fallback);
         }
-        const effectiveTimeoutMs = positiveInteger(timeoutMs, this.callTimeoutMs);
+        const effectiveTimeoutMs = timerDelay(callTimeoutMs, this.callTimeoutMs);
         const frame = {
             v: TOOL_WORKER_PROTOCOL_VERSION,
             type: 'call',
@@ -240,7 +247,8 @@ export class ToolWorkerPool {
             envelope: payload ?? {},
         };
         const encoded = Buffer.from(`${JSON.stringify(frame)}\n`, 'utf8');
-        if (encoded.length > this.maxFrameBytes) {
+        // maxFrameBytes bounds a frame without its newline, as the decoder counts it.
+        if (encoded.length - 1 > this.maxFrameBytes) {
             return failureResult(`tool worker call frame exceeds maxFrameBytes (${this.maxFrameBytes})`);
         }
 
@@ -253,7 +261,7 @@ export class ToolWorkerPool {
             return failureResult(`tool worker pool '${this.name}' is saturated (maxQueue ${this.maxQueue})`);
         }
 
-        return new Promise((resolve, reject) => {
+        return new Promise((resolve) => {
             const call = {
                 id: frame.id,
                 encoded,
@@ -263,7 +271,6 @@ export class ToolWorkerPool {
                 settled: false,
                 timer: null,
                 resolve,
-                reject,
             };
             // Queue wait counts toward the call timeout.
             call.timer = setTimeout(() => this.onCallTimeout(call), effectiveTimeoutMs);
@@ -277,7 +284,11 @@ export class ToolWorkerPool {
             return failureResult(`tool worker pool '${this.name}' is degraded and no spawn fallback was supplied`);
         }
         this.counters.fallbacks += 1;
-        return fallback();
+        try {
+            return await fallback();
+        } catch (error) {
+            return failureResult(`spawn fallback failed: ${error?.message || error}`);
+        }
     }
 
     settle(call, result) {
@@ -578,7 +589,7 @@ export class ToolWorkerPool {
             call.settled = true;
             Promise.resolve()
                 .then(() => this.runFallback(call.fallback))
-                .then(call.resolve, call.reject);
+                .then(call.resolve);
         }
     }
 
@@ -607,7 +618,7 @@ export class ToolWorkerPool {
             this.retire(worker);
         }
         this.shutdownPromise = (async () => {
-            const deadline = Date.now() + positiveInteger(timeoutMs, DEFAULT_SHUTDOWN_TIMEOUT_MS);
+            const deadline = Date.now() + timerDelay(timeoutMs, DEFAULT_SHUTDOWN_TIMEOUT_MS);
             if (this.workers.size > 0) {
                 await new Promise((resolve) => {
                     const timer = setTimeout(resolve, Math.max(0, deadline - Date.now()));

@@ -389,6 +389,33 @@ test('T14b: workers that hang until readyTimeoutMs still degrade the pool (fake 
     assert.equal(fallbacks, 2);
 });
 
+test('a throwing spawn fallback resolves as a failed call instead of rejecting', async (t) => {
+    const dir = makeDir(t);
+    const { pool } = makePool(t, dir, { size: 1, env: { FIXTURE_DIE_BEFORE_READY: '1' } });
+    const fallback = async () => {
+        throw new Error('spawn failed: ENOENT');
+    };
+    const queued = await callTool(pool, { mode: 'echo' }, { fallback });
+    assert.equal(queued.code, 1);
+    assert.match(queued.stderr, /spawn fallback failed: spawn failed: ENOENT/);
+    assert.equal(pool.stats().degraded, true);
+    const direct = await callTool(pool, { mode: 'echo' }, { fallback });
+    assert.equal(direct.code, 1);
+    assert.match(direct.stderr, /spawn fallback failed/);
+});
+
+test('timeouts above the 2^31-1 ms timer limit are clamped instead of firing at once', async (t) => {
+    const dir = makeDir(t);
+    const { pool } = makePool(t, dir, { size: 1, callTimeoutMs: 2 ** 32, idleTimeoutMs: 2 ** 32, readyTimeoutMs: 2 ** 32 });
+    assert.equal(pool.callTimeoutMs, 2 ** 31 - 1);
+    const first = await callTool(pool, { mode: 'slow', ms: 50, text: 'ok' });
+    assert.equal(first.code, 0, first.stderr);
+    const perCall = await callTool(pool, { mode: 'slow', ms: 50, text: 'ok' }, { timeoutMs: 2 ** 40 });
+    assert.equal(perCall.code, 0, perCall.stderr);
+    await sleep(100);
+    assert.equal(pool.stats().workers, 1, 'the idle timer must not fire at once');
+});
+
 test('T15: SIGKILL of the host process ends its workers within 2 s', async (t) => {
     const dir = makeDir(t);
     const pidDir = path.join(dir, 'pids');
