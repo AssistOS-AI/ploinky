@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { AcceptanceError, LIMITS, need, parseAcceptanceArguments, parseManifestBytes, validateManifest, readBoundedDescriptor } from './manifest_codex.mjs';
 import { REQUIRED_PHASES } from './contracts_codex.mjs';
 import { loadInputs } from './inputs_codex.mjs';
-import { executeAcceptance, publicReason } from './acceptance_codex.mjs';
+import { executeAcceptance, publicReason, PENDING_REQUIREMENTS } from './acceptance_codex.mjs';
 import { createRunEnvironment, createRealPorts } from './real_adapters_codex.mjs';
 
 // All twelve required stages have a real adapter wired into this entrypoint. Wiring is not qualification: no stage
@@ -50,8 +50,12 @@ export async function acceptanceMain(argv, { read = readManifestFile, write = va
         need(manifest.grant.startsAtMs <= nowMs && nowMs < manifest.grant.endsAtMs, 'resource-window');
         const receipt = await run(manifest, { manifestPath, io, write: event => write({ progress: event }), ...(hostFacts ? { hostFacts } : {}) });
         write(receipt);
-        // Success needs the explicit PASS verdict as well as exit 0; anything else is a nonzero exit.
-        return receipt?.acceptance === 'PASS' && receipt.exitCode === 0 ? 0 : (Number.isInteger(receipt?.exitCode) && receipt.exitCode > 0 ? receipt.exitCode : 1);
+        // Exit 0 means only that the UC stage U0-U9 completed: it needs the explicit stage verdict, exit 0, the overall verdict still OPEN and the
+        // AC-L4 G-BASE requirement still pending. Every other shape, including any receipt that claims a plain PASS, is a nonzero exit.
+        const stageComplete = receipt?.acceptance === 'UC_STAGE_PASS' && receipt.exitCode === 0 && receipt.ucOverallAcceptance === 'OPEN'
+            && Array.isArray(receipt.pendingRequirements) && receipt.pendingRequirements.length === PENDING_REQUIREMENTS.length && receipt.pendingRequirements.every((item, index) => item === PENDING_REQUIREMENTS[index]);
+        if (stageComplete) write({ summary: 'UC stage complete; overall UC acceptance OPEN (pending AC-L4 G-BASE)' });
+        return stageComplete ? 0 : (Number.isInteger(receipt?.exitCode) && receipt.exitCode > 0 ? receipt.exitCode : 1);
     } catch (error) {
         const reason = error instanceof AcceptanceError ? error.code : 'manifest-read-failed';
         write({ scope: 'live-update-cache-acceptance', status: 'REFUSED', acceptance: 'UNQUALIFIED', reason, resourceDisposition: 'NO_RUNTIME_LAUNCHED' });

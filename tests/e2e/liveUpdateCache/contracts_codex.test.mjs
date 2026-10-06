@@ -50,8 +50,10 @@ const {
     assertRequiredPhases, assertPhaseReceipts, admitRemainingSchedule, admitCanonicalFreshness,
     assertSameCandidate, assertLiveBefore, assertWarmReuse, assertDependencyReplacement,
     assertRetainedReader, assertOptionalFailureActivation, assertDeferredFailure,
-    assertFunctionalToReleaseBoundary, assertCanonicalGateResults,
+    assertFunctionalToReleaseBoundary, assertCanonicalGateResults, assertReleaseGenerations, admitActivationStart, admitCampaignImageReserve,
+    RELEASE_GENERATIONS, OPTIONAL_ACTIVATION, CAMPAIGN_RESERVES_MS, BOX_MAX_AGE_MS, IMAGE_MAX_AGE_MS,
 } = await import('./contracts_codex.mjs');
+const { GATE_SPECS, GATE_WRAPPER_ALLOWANCE_MS, remainingGenerationWorkMs } = await import('./gates_codex.mjs');
 
 function candidate() {
     return { imageId: hash('a'), repositories: [
@@ -73,7 +75,11 @@ function live() {
 }
 
 test('aggregate requires every phase, rejects individual skips and earlier-run receipts', () => {
-    assert.equal(TOTAL_CAP_MS, 12960000);
+    assert.equal(TOTAL_CAP_MS, 14640000); assert.equal(REQUIRED_PHASES.length, 15);
+    assert.deepEqual(REQUIRED_PHASES.slice(9), ['U7c', 'U8a', 'U7d', 'UA', 'U8b', 'U9']);
+    assert.deepEqual([PHASE_CAPS_MS.U7c, PHASE_CAPS_MS.U8a, PHASE_CAPS_MS.U7d, PHASE_CAPS_MS.UA, PHASE_CAPS_MS.U8b, PHASE_CAPS_MS.U9], [1800000, 600000, 300000, 1380000, 1200000, 600000]);
+    assert.equal(PHASE_CAPS_MS.UA, 120000 + 1200000 + 60000, 'UA = UA-0 + UA-1 + post-activation observations');
+    assert.equal(PHASE_CAPS_MS.U7d + PHASE_CAPS_MS.UA + PHASE_CAPS_MS.U8b + PHASE_CAPS_MS.U9, 3480000, 'invocation 3 needs a remaining grant of 3,480,000 ms');
     assertRequiredPhases([...REQUIRED_PHASES]);
     rejects(() => assertRequiredPhases(REQUIRED_PHASES.filter(phase => phase !== 'U4')), 'required-phases-invalid');
     const receipts = REQUIRED_PHASES.map((phase, index) => ({ phase, runId: 'current_codex', status: 'PASS', closed: true,
@@ -88,8 +94,10 @@ test('aggregate requires every phase, rejects individual skips and earlier-run r
 test('schedule admits the exact full suffix and refuses one millisecond short', () => {
     assert.equal(admitRemainingSchedule({ firstPhase: 'U0', remainingMs: TOTAL_CAP_MS }), TOTAL_CAP_MS);
     rejects(() => admitRemainingSchedule({ firstPhase: 'U0', remainingMs: TOTAL_CAP_MS - 1 }), 'schedule-insufficient');
-    const suffix = PHASE_CAPS_MS.U8 + PHASE_CAPS_MS.U9 + 5000;
-    assert.equal(admitRemainingSchedule({ firstPhase: 'U8', remainingMs: suffix, finalReserveMs: 5000 }), suffix);
+    const suffix = PHASE_CAPS_MS.U8b + PHASE_CAPS_MS.U9 + 5000;
+    assert.equal(admitRemainingSchedule({ firstPhase: 'U8b', remainingMs: suffix, finalReserveMs: 5000 }), suffix);
+    assert.equal(admitRemainingSchedule({ firstPhase: 'U7d', remainingMs: 3480000 }), 3480000); rejects(() => admitRemainingSchedule({ firstPhase: 'U7d', remainingMs: 3479999 }), 'schedule-insufficient');
+    rejects(() => admitRemainingSchedule({ firstPhase: 'U8', remainingMs: TOTAL_CAP_MS }), 'schedule-invalid');
     rejects(() => admitRemainingSchedule({ firstPhase: 'skip-update', remainingMs: TOTAL_CAP_MS }), 'schedule-invalid');
 });
 
@@ -217,24 +225,106 @@ test('fresh release boundary requires settled functional cleanup and identical c
     rejects(() => assertFunctionalToReleaseBoundary(changed), 'candidate-epoch-mismatch');
 });
 
+function releases() {
+    const { release: r1 } = boundary(), r2 = { ...copies(r1), boxId: 'release2-box', workspaceIdentity: 'release2-inode', startedAt: iso(now + 10) };
+    return { R1: r1, R2: r2 };
+}
+const gateRows = ({ R1, R2 }) => REQUIRED_GATES.map((name, index) => { const epoch = name === 'Copilot' ? R1 : R2;
+    return { name, runId: `gate-${index}`, discovered: 1, passed: 1, failed: 0, skipped: 0, retries: 0, ignoredErrors: 0, closed: true, before: copies(epoch), after: copies(epoch),
+        startedAt: iso(now + 12 + index * 10), finishedAt: iso(now + 19 + index * 10) }; });
+
 test('canonical gate aggregate rejects stale epochs, duplicate runs, skips and changed outer bindings', () => {
-    const { release } = boundary();
-    const gates = REQUIRED_GATES.map((name, index) => ({ name, runId: `gate-${index}`, discovered: 1, passed: 1,
-        failed: 0, skipped: 0, retries: 0, ignoredErrors: 0, closed: true, before: copies(release), after: copies(release),
-        startedAt: iso(now + 2 + index * 10), finishedAt: iso(now + 9 + index * 10) }));
-    assertCanonicalGateResults({ release, gates });
+    const both = releases(), gates = gateRows(both);
+    assertCanonicalGateResults({ releases: both, gates });
     const skipped = copies(gates); skipped[1].skipped = 1;
-    rejects(() => assertCanonicalGateResults({ release, gates: skipped }), 'canonical-gate-invalid');
+    rejects(() => assertCanonicalGateResults({ releases: both, gates: skipped }), 'canonical-gate-invalid');
     const old = copies(gates); old[0].before.boxId = 'prior-box';
-    rejects(() => assertCanonicalGateResults({ release, gates: old }), 'canonical-gate-stale');
+    rejects(() => assertCanonicalGateResults({ releases: both, gates: old }), 'canonical-gate-stale');
     const changed = copies(gates); changed[1].after.startedAt = iso(now + 50);
-    rejects(() => assertCanonicalGateResults({ release, gates: changed }), 'canonical-gate-stale');
+    rejects(() => assertCanonicalGateResults({ releases: both, gates: changed }), 'canonical-gate-stale');
     const reused = copies(gates); reused[2].runId = reused[0].runId;
-    rejects(() => assertCanonicalGateResults({ release, gates: reused }), 'canonical-gate-invalid');
+    rejects(() => assertCanonicalGateResults({ releases: both, gates: reused }), 'canonical-gate-invalid');
     const overlap = copies(gates); overlap[1].startedAt = overlap[0].startedAt;
-    rejects(() => assertCanonicalGateResults({ release, gates: overlap }), 'canonical-gate-stale');
+    rejects(() => assertCanonicalGateResults({ releases: both, gates: overlap }), 'canonical-gate-stale');
     const reversed = copies(gates); reversed[2].startedAt = iso(now + 2); reversed[2].finishedAt = iso(now + 3);
-    rejects(() => assertCanonicalGateResults({ release, gates: reversed }), 'canonical-gate-stale');
+    rejects(() => assertCanonicalGateResults({ releases: both, gates: reversed }), 'canonical-gate-stale');
+    rejects(() => assertCanonicalGateResults({ releases: { R1: both.R1 }, gates }), 'canonical-gates-incomplete');
+});
+
+test('AC-8: each gate carries only its own generation epoch', () => {
+    const both = releases(), gates = gateRows(both);
+    const copilotOnR2 = copies(gates); copilotOnR2[0].before = copies(both.R2); copilotOnR2[0].after = copies(both.R2);
+    rejects(() => assertCanonicalGateResults({ releases: both, gates: copilotOnR2 }), 'canonical-gate-stale');
+    const onlyOfficeOnR1 = copies(gates); onlyOfficeOnR1[1].before = copies(both.R1); onlyOfficeOnR1[1].after = copies(both.R1);
+    rejects(() => assertCanonicalGateResults({ releases: both, gates: onlyOfficeOnR1 }), 'canonical-gate-stale');
+    const webMeetOnR1 = copies(gates); webMeetOnR1[2].after = copies(both.R1);
+    rejects(() => assertCanonicalGateResults({ releases: both, gates: webMeetOnR1 }), 'canonical-gate-stale');
+    const swapped = { R1: both.R2, R2: both.R1 }; rejects(() => assertCanonicalGateResults({ releases: swapped, gates }), 'canonical-gate-stale');
+    assert.deepEqual(RELEASE_GENERATIONS.map(row => [row.id, row.gates]), [['R1', ['Copilot']], ['R2', ['OnlyOffice', 'WebMeet']]]);
+    assert.equal(RELEASE_GENERATIONS[1].activation, true); assert.equal(Object.isFrozen(RELEASE_GENERATIONS[1].gates), true);
+});
+
+function generations() {
+    const { functional } = boundary(), candidateValue = functional.candidate;
+    return { functional, r1: { boxId: 'release-box', workspaceIdentity: 'release-inode', startedAt: iso(now + 1), candidate: candidate() },
+        r2: { boxId: 'release2-box', workspaceIdentity: 'release2-inode', startedAt: iso(now + 100), candidate: candidate() }, copilotFinishedAt: iso(now + 50), candidateValue };
+}
+
+test('AC-9: release generations are three distinct Boxes and workspaces in time order', () => {
+    assert.equal(assertReleaseGenerations(generations()), true);
+    for (const [label, patch] of [['R1 reuses the functional Box', g => { g.r1.boxId = g.functional.boxId; }], ['R2 reuses the functional Box', g => { g.r2.boxId = g.functional.boxId; }], ['R2 reuses R1', g => { g.r2.boxId = g.r1.boxId; }],
+        ['R1 reuses the functional workspace', g => { g.r1.workspaceIdentity = g.functional.workspaceIdentity; }], ['R2 reuses R1 workspace', g => { g.r2.workspaceIdentity = g.r1.workspaceIdentity; }], ['R2 reuses the functional workspace', g => { g.r2.workspaceIdentity = g.functional.workspaceIdentity; }],
+        ['R2 starts at Copilot finish', g => { g.r2.startedAt = g.copilotFinishedAt; }], ['R2 starts before Copilot finish', g => { g.r2.startedAt = iso(now + 49); }], ['R1 starts before the functional epoch ended', g => { g.r1.startedAt = g.functional.finishedAt; }],
+        ['missing Box ID', g => { delete g.r2.boxId; }]]) {
+        const g = generations(); patch(g); rejects(() => assertReleaseGenerations(g), 'release-fixture-not-fresh'); assert.ok(label);
+    }
+});
+
+test('AC-10: a different image or one different repository commit in either generation is a release-candidate-mismatch', () => {
+    for (const side of ['r1', 'r2']) {
+        const image = generations(); image[side].candidate.imageId = hash('9'); rejects(() => assertReleaseGenerations(image), 'release-candidate-mismatch');
+        const moved = generations(); moved[side].candidate.repositories[1].commit = commit('e'); moved[side].candidate.repositories[1].pushedCommit = commit('e'); rejects(() => assertReleaseGenerations(moved), 'release-candidate-mismatch');
+    }
+    const between = generations(); between.r1.candidate.repositories[0].commit = commit('f'); between.r1.candidate.repositories[0].pushedCommit = commit('f'); between.r2.candidate = copies(between.r1.candidate);
+    rejects(() => assertReleaseGenerations(between), 'release-candidate-mismatch');
+});
+
+test('AC-2/AC-3/AC-4: the single-generation shape stays refused and the per-generation bounds are exact', () => {
+    const start = iso(now), image = iso(now - 60000), admit = (ageMs, remainingWorkMs) => admitCanonicalFreshness({ nowMs: now + ageMs, boxStartedAt: start, imageCreatedAt: image, remainingWorkMs });
+    // AC-2: Copilot, a 487,000 ms activation, OnlyOffice and WebMeet in one generation at age 0 (regression guard).
+    const oneGeneration = 570000 + 487000 + 870000 + 150000; assert.equal(oneGeneration, 2077000); rejects(() => admit(0, oneGeneration), 'box-freshness-insufficient');
+    // AC-3: R1 Copilot.
+    assert.equal(remainingGenerationWorkMs('R1', 'Copilot'), 570000); assert.equal(admit(1230000, remainingGenerationWorkMs('R1', 'Copilot')), true);
+    rejects(() => admit(1230001, remainingGenerationWorkMs('R1', 'Copilot')), 'box-freshness-insufficient');
+    // AC-4: R2.
+    assert.equal(remainingGenerationWorkMs('R2', 'OnlyOffice'), 1020000); assert.equal(remainingGenerationWorkMs('R2', 'WebMeet'), 150000);
+    assert.equal(admit(780000, remainingGenerationWorkMs('R2', 'OnlyOffice')), true); rejects(() => admit(780001, remainingGenerationWorkMs('R2', 'OnlyOffice')), 'box-freshness-insufficient');
+    assert.equal(admit(1650000, remainingGenerationWorkMs('R2', 'WebMeet')), true); rejects(() => admit(1650001, remainingGenerationWorkMs('R2', 'WebMeet')), 'box-freshness-insufficient');
+    rejects(() => admit(-1, 1), 'box-freshness-insufficient');
+    for (const [generation, gate] of [['R1', 'OnlyOffice'], ['R2', 'Copilot'], ['R3', 'Copilot'], ['R1', 'Nope']]) assert.throws(() => remainingGenerationWorkMs(generation, gate), error => error.code === 'gate-unknown');
+});
+
+test('AC-5: the activation guards accept at their limit and refuse one millisecond later', () => {
+    const start = iso(now), at = (ageMs, includeInstall) => admitActivationStart({ nowMs: now + ageMs, boxStartedAt: start, includeInstall });
+    assert.equal(at(150000, true), true); rejects(() => at(150001, true), 'activation-window-insufficient');
+    assert.equal(at(180000, false), true); rejects(() => at(180001, false), 'activation-window-insufficient');
+    rejects(() => at(-1, false), 'activation-window-insufficient');
+    assert.equal(OPTIONAL_ACTIVATION.guardMs + OPTIONAL_ACTIVATION.postMs + 870000 + 150000 + 180000, BOX_MAX_AGE_MS); assert.equal(OPTIONAL_ACTIVATION.install.budgetMs, 30000);
+    assert.throws(() => admitActivationStart({ nowMs: now, boxStartedAt: start }), error => error.code === 'freshness-input-invalid');
+});
+
+test('AC-12: B1, B2 and B3 accept at their limit and refuse one millisecond later', () => {
+    assert.deepEqual({ ...CAMPAIGN_RESERVES_MS }, { B1: 6150000, B2: 4200000, B3: 1620000 });
+    for (const [name, reserveMs] of Object.entries(CAMPAIGN_RESERVES_MS)) {
+        const at = ageMs => admitCampaignImageReserve({ nowMs: now + ageMs, imageCreatedAt: iso(now), reserveMs });
+        assert.equal(at(IMAGE_MAX_AGE_MS - reserveMs), true, name); rejects(() => at(IMAGE_MAX_AGE_MS - reserveMs + 1), 'campaign-image-window-insufficient'); rejects(() => at(-1), 'campaign-image-window-insufficient');
+    }
+});
+
+test('AC-14 (unit part): the gate budgets are the pinned Explorer ones and the activation guard derives from them', () => {
+    assert.deepEqual([GATE_SPECS.Copilot.budgetMs, GATE_SPECS.OnlyOffice.budgetMs, GATE_SPECS.WebMeet.budgetMs], [540000, 840000, 120000]);
+    const onlyOfficeLimit = BOX_MAX_AGE_MS - (GATE_SPECS.OnlyOffice.budgetMs + GATE_WRAPPER_ALLOWANCE_MS) - (GATE_SPECS.WebMeet.budgetMs + GATE_WRAPPER_ALLOWANCE_MS);
+    assert.equal(onlyOfficeLimit, 780000); assert.equal(onlyOfficeLimit - 60000 - 90000 - 30000 - 60000, 540000); assert.equal(OPTIONAL_ACTIVATION.guardMs, 540000);
 });
 
 test('no-wait requires the expected declaration and every runtime joins the selected active generation', () => {

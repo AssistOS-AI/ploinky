@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { assertLiveBefore } from './contracts_codex.mjs';
-import { AcceptanceError, need } from './manifest_codex.mjs';
+import { AcceptanceError, need, smokeOrigin } from './manifest_codex.mjs';
 
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 export function applicationMarker(manifest) {
@@ -27,7 +27,7 @@ export async function createApplicationMarker({ manifest, live, expected, page, 
     await assertExplorerDirectory(page, '/'); check();
     const origin = new URL(page.url()).origin;
     const publication = manifest.publications.find(row => row.protocol === 'tcp' && row.containerPort === 8080);
-    need(publication && origin === `http://${publication.hostIP}:${publication.hostPort}`, 'application-marker-origin');
+    need(publication && origin === smokeOrigin(publication), 'application-marker-origin');
     const response = page.waitForResponse(value => {
         const url = new URL(value.url());
         return url.origin === origin && url.pathname === '/upload' && url.searchParams.get('path') === marker.applicationPath

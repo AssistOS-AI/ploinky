@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
-import { REQUIRED_PHASES, REQUIRED_GATES, PHASE_CAPS_MS, TOTAL_CAP_MS, BOX_MAX_AGE_MS, IMAGE_MAX_AGE_MS } from './contracts_codex.mjs';
+import { REQUIRED_PHASES, REQUIRED_GATES, PHASE_CAPS_MS, TOTAL_CAP_MS, BOX_MAX_AGE_MS, IMAGE_MAX_AGE_MS, RELEASE_GENERATIONS, OPTIONAL_ACTIVATION } from './contracts_codex.mjs';
 
 export const MODE = 'live-update-cache-acceptance';
 export const LIMITS = Object.freeze({ manifestBytes: 256 * 1024, outputBytes: 16 * 1024 * 1024, controlBytes: 128 * 1024,
@@ -19,6 +19,12 @@ export const digest = (value, length = 64) => typeof value === 'string' && new R
 export const absolute = value => typeof value === 'string' && value.length <= 4096 && path.isAbsolute(value)
     && path.normalize(value) === value && !/[\0\r\n]/.test(value) && !placeholder.test(value)
     && !/(?:^|\/)(?:\.codex|\.ssh|\.secrets|\.env)(?:\/|$)/.test(value);
+// The one browser origin of a Box's Router publication: loopback sign-in is canonicalized to `localhost`, so every smoke
+// page (U1/U7 and the gates) runs on, and is checked against, this origin. The host-side `/health` probe stays on 127.0.0.1.
+export const smokeOrigin = publication => `http://localhost:${publication.hostPort}`;
+// The exact outer Box container name (never its 64-hex ID), as observed by the same exact-ID inspect that bound the ID.
+export const BOX_NAME_PATTERN = /^ploinky-box-[a-z0-9][a-z0-9-]{0,200}$/;
+export const boxName = value => typeof value === 'string' && BOX_NAME_PATTERN.test(value);
 const integer = value => Number.isSafeInteger(value) && value >= 0;
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(value);
 const ipv4 = value => typeof value === 'string' && /^(?:\d{1,3}\.){3}\d{1,3}$/.test(value)
@@ -35,7 +41,7 @@ export function parseAcceptanceArguments(argv) {
 
 export function validateManifest(value, { nowMs } = {}) {
     exact(value, ['schemaVersion', 'mode', 'runId', 'phases', 'gates', 'host', 'workspace', 'candidate', 'box', 'engine', 'graph',
-        'sourceMounts', 'publications', 'agentLib', 'fixtureEndpoint', 'evidence', 'grant', 'epochs', 'negativeScopes', 'limits']);
+        'sourceMounts', 'publications', 'agentLib', 'fixtureEndpoint', 'evidence', 'grant', 'epochs', 'activation', 'negativeScopes', 'limits']);
     need(value.schemaVersion === 1 && value.mode === MODE && /^update-cache-[0-9TZ]{8,32}-[a-f0-9]{8}_codex$/.test(value.runId), 'manifest-identity');
     need(isDeepStrictEqual(value.phases, REQUIRED_PHASES) && isDeepStrictEqual(value.gates, REQUIRED_GATES), 'mandatory-stages');
     exact(value.host, ['target', 'hostname', 'address', 'boot', 'uid', 'user', 'platform', 'arch', 'node']);
@@ -65,8 +71,8 @@ export function validateManifest(value, { nowMs } = {}) {
         if (repo.name === 'ploinky') need(repo.path === c.root && repo.commit === c.commit && repo.upstream === c.upstream, 'ploinky-map-mismatch');
     }
     need(['ploinky', 'AssistOSExplorer', 'AchillesCLI', 'achillesAgentLib'].every(name => names.has(name)), 'repository-map-incomplete');
-    exact(value.box, ['id', 'imageId', 'startedAt', 'imageCreatedAt', 'activeGeneration', 'running', 'initialized', 'pendingActivation', 'recoveryBarrier']);
-    need(digest(value.box.id) && digest(value.box.imageId) && iso(value.box.startedAt) && iso(value.box.imageCreatedAt)
+    exact(value.box, ['id', 'name', 'imageId', 'imageRef', 'startedAt', 'imageCreatedAt', 'activeGeneration', 'running', 'initialized', 'pendingActivation', 'recoveryBarrier']);
+    need(digest(value.box.id) && boxName(value.box.name) && digest(value.box.imageId) && word(value.box.imageRef) && value.box.imageRef.length <= 256 && iso(value.box.startedAt) && iso(value.box.imageCreatedAt)
         && word(value.box.activeGeneration) && value.box.running === true && value.box.initialized === true
         && value.box.pendingActivation === false && value.box.recoveryBarrier === false, 'live-inputs');
     exact(value.engine, ['kind', 'path', 'identity', 'uid', 'rootless', 'init', 'privileged', 'dockerExcluded', 'gpuWiringIdentity']);
@@ -108,7 +114,7 @@ export function validateManifest(value, { nowMs } = {}) {
         && word(endpoint.license) && absolute(endpoint.noticesPath) && endpoint.engineIdentity === value.engine.identity && endpoint.uid === host.uid
         && endpoint.rootless === true && endpoint.init === true && endpoint.readOnly === true && endpoint.pullPolicy === 'never'
         && endpoint.networkMode === 'bridge' && isDeepStrictEqual(endpoint.capabilities, []) && isDeepStrictEqual(endpoint.devices, []), 'fixture-endpoint');
-    exact(value.evidence, ['root', 'functional', 'release', 'receipt', 'sourceManifest']);
+    exact(value.evidence, ['root', 'functional', 'release', 'release2', 'release1Record', 'receipt', 'sourceManifest']);
     const protectedTrees = [value.workspace.path, c.root, ...c.repositories.map(repo => repo.path)];
     const disjoint = file => protectedTrees.every(root => !inside(root, file) && !inside(file, root));
     need(absolute(value.evidence.root) && disjoint(value.evidence.root), 'evidence-root');
@@ -127,10 +133,23 @@ export function validateManifest(value, { nowMs } = {}) {
     need(value.epochs.functional.boxId === value.box.id && value.epochs.functional.generation === value.box.activeGeneration
         && value.epochs.functional.startedAt === value.box.startedAt && value.epochs.functional.candidateCommit === c.commit
         && value.epochs.functional.imageId === value.box.imageId, 'functional-epoch');
-    exact(value.epochs.release, ['freshRequired', 'sameCandidateCommit', 'sameImageId', 'boxMaxAgeMs', 'imageMaxAgeMs', 'gateOrder']);
+    exact(value.epochs.release, ['freshRequired', 'sameCandidateCommit', 'sameImageId', 'boxMaxAgeMs', 'imageMaxAgeMs', 'gateOrder', 'generations', 'activation']);
     need(value.epochs.release.freshRequired === true && value.epochs.release.sameCandidateCommit === c.commit && value.epochs.release.sameImageId === value.box.imageId
         && value.epochs.release.boxMaxAgeMs === BOX_MAX_AGE_MS && value.epochs.release.imageMaxAgeMs === IMAGE_MAX_AGE_MS
-        && isDeepStrictEqual(value.epochs.release.gateOrder, REQUIRED_GATES), 'release-epoch');
+        && isDeepStrictEqual(value.epochs.release.gateOrder, REQUIRED_GATES) && isDeepStrictEqual(value.epochs.release.generations, RELEASE_GENERATIONS)
+        && isDeepStrictEqual(value.epochs.release.activation, OPTIONAL_ACTIVATION), 'release-epoch');
+    // R2's declaration of the three optional runtimes that the runner-owned activation adds (null for every other generation).
+    if (value.activation !== null) {
+        need(Array.isArray(value.activation) && value.activation.length === OPTIONAL_ACTIVATION.agents.length, 'activation-declaration');
+        const declared = new Set(value.graph.map(entry => entry.name)), addedNames = new Set();
+        for (const entry of value.activation) {
+            exact(entry, ['name', 'repository', 'noWait', 'externalHealthRequired', 'declaredEnableFlags', 'manifestSha256'], 'activation-declaration');
+            need(word(entry.name) && !declared.has(entry.name) && !addedNames.has(entry.name) && names.has(entry.repository) && typeof entry.noWait === 'boolean' && typeof entry.externalHealthRequired === 'boolean'
+                && digest(entry.manifestSha256) && Array.isArray(entry.declaredEnableFlags) && entry.declaredEnableFlags.length <= 16 && entry.declaredEnableFlags.every(word)
+                && entry.noWait === entry.declaredEnableFlags.includes('no-wait'), 'activation-declaration'); addedNames.add(entry.name);
+        }
+        need(isDeepStrictEqual([...addedNames].map(name => name.split('/').at(-1)).sort(), [...OPTIONAL_ACTIVATION.agents].sort()), 'activation-declaration');
+    }
     exact(value.negativeScopes, ['optional', 'required']);
     const scenario = path.join(value.workspace.path, `UpdateE2E-${value.runId}`);
     need(value.negativeScopes.optional === scenario && value.negativeScopes.required === scenario, 'negative-scope');

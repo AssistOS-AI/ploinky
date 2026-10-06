@@ -3,13 +3,28 @@ import { isDeepStrictEqual } from 'node:util';
 export const PHASE_CAPS_MS = Object.freeze({
     U0: 300000, U1: 180000, U2: 300000, U3: 600000,
     U4: 1320000, U5: 840000, U6: 3300000, U7: 1320000,
-    U7b: 600000, U7c: 1800000, U8: 1800000, U9: 600000,
+    U7b: 600000, U7c: 1800000, U8a: 600000, U7d: 300000, UA: 1380000, U8b: 1200000, U9: 600000,
 });
 export const REQUIRED_PHASES = Object.freeze(Object.keys(PHASE_CAPS_MS));
 export const REQUIRED_GATES = Object.freeze(['Copilot', 'OnlyOffice', 'WebMeet']);
 export const TOTAL_CAP_MS = Object.values(PHASE_CAPS_MS).reduce((sum, value) => sum + value, 0);
 export const BOX_MAX_AGE_MS = 1800000;
 export const IMAGE_MAX_AGE_MS = 14400000;
+// CA-1: the release epoch is two fresh generations of the identical candidate and image. R1 is never activated and runs the
+// baseline-graph Copilot gate; R2 is activated by the runner-owned UA phase and runs OnlyOffice and WebMeet.
+export const RELEASE_GENERATIONS = deepFreeze([{ id: 'R1', gates: ['Copilot'] }, { id: 'R2', gates: ['OnlyOffice', 'WebMeet'], activation: true }]);
+export const generationOf = gate => RELEASE_GENERATIONS.find(generation => generation.gates.includes(gate))?.id;
+// CA-3: the one optional-agent activation. UA-0 is the owned workspace `npm ci`; the command is the canonical Marketplace one.
+export const OPTIONAL_ACTIVATION = deepFreeze({ agents: ['onlyOffice', 'webmeetScribeAgent', 'webmeetStt'],
+    install: { argv: ['npm', 'ci', '--ignore-scripts', '--no-audit', '--no-fund'], deadlineMs: 120000, budgetMs: 30000 },
+    command: ['npm', 'run', 'test:optional-agents', '--', '--workers=1', '--retries=0'], guardMs: 540000, postMs: 60000, deadlineMs: 1200000 });
+// Campaign-wide image reserves: the image age plus the work that still has to fit behind each checkpoint.
+export const CAMPAIGN_RESERVES_MS = deepFreeze({ B1: 6150000, B2: 4200000, B3: 1620000 });
+
+function deepFreeze(value) {
+    if (value && typeof value === 'object') { Object.values(value).forEach(deepFreeze); Object.freeze(value); }
+    return value;
+}
 
 function need(condition, code) {
     if (!condition) {
@@ -88,6 +103,23 @@ export function admitCanonicalFreshness({ nowMs, boxStartedAt, imageCreatedAt, r
         const imageAge = nowMs - date(imageCreatedAt);
         need(imageAge >= 0 && imageAge + remainingWorkMs <= IMAGE_MAX_AGE_MS, 'image-freshness-insufficient');
     }
+    return true;
+}
+
+// UA guards. The activation (guard 540 s), the post-activation observations (60 s) and the two later R2 gates (1,020 s) must all
+// still fit inside the unchanged 30-minute Box clamp; the pre-guard additionally covers the owned install (30 s).
+export const ACTIVATION_TAIL_MS = 540000 + 60000 + 1020000;
+export function admitActivationStart({ nowMs, boxStartedAt, includeInstall }) {
+    need(integer(nowMs) && typeof includeInstall === 'boolean', 'freshness-input-invalid');
+    const boxAge = nowMs - date(boxStartedAt);
+    need(boxAge >= 0 && boxAge + (includeInstall ? OPTIONAL_ACTIVATION.install.budgetMs : 0) + ACTIVATION_TAIL_MS <= BOX_MAX_AGE_MS, 'activation-window-insufficient');
+    return true;
+}
+
+export function admitCampaignImageReserve({ nowMs, imageCreatedAt, reserveMs }) {
+    need(integer(nowMs) && integer(reserveMs), 'freshness-input-invalid');
+    const imageAge = nowMs - date(imageCreatedAt);
+    need(imageAge >= 0 && imageAge + reserveMs <= IMAGE_MAX_AGE_MS, 'campaign-image-window-insufficient');
     return true;
 }
 
@@ -232,6 +264,17 @@ export function assertFunctionalToReleaseBoundary({ functional, release }) {
     return true;
 }
 
+// R1, R2 and the functional epoch are three distinct Boxes over three distinct workspace identities, in time order, with the
+// identical pushed commit map and image. A candidate difference has its own fixed code.
+export function assertReleaseGenerations({ functional, r1, r2, copilotFinishedAt }) {
+    for (const row of [functional, r1, r2]) need(word(row?.boxId) && word(row.workspaceIdentity), 'release-fixture-not-fresh');
+    need(new Set([functional.boxId, r1.boxId, r2.boxId]).size === 3 && new Set([functional.workspaceIdentity, r1.workspaceIdentity, r2.workspaceIdentity]).size === 3
+        && date(r1.startedAt) > date(functional.finishedAt) && date(r2.startedAt) > date(copilotFinishedAt) && date(r2.startedAt) > date(r1.startedAt), 'release-fixture-not-fresh');
+    try { assertSameCandidate(functional.candidate, r1.candidate); assertSameCandidate(functional.candidate, r2.candidate); assertSameCandidate(r1.candidate, r2.candidate); }
+    catch (error) { throw Object.assign(new Error('release-candidate-mismatch'), { code: 'release-candidate-mismatch', cause: error }); }
+    return true;
+}
+
 function assertReleaseEpoch(expected, observed) {
     need(word(expected?.boxId) && word(expected.workspaceIdentity), 'release-epoch-invalid');
     date(expected.startedAt);
@@ -240,19 +283,20 @@ function assertReleaseEpoch(expected, observed) {
     assertSameCandidate(expected.candidate, observed.candidate);
 }
 
-export function assertCanonicalGateResults({ release, gates }) {
-    need(Array.isArray(gates) && gates.length === REQUIRED_GATES.length, 'canonical-gates-incomplete');
+// Each gate is bound to the epoch of the generation that owns it: Copilot to R1, OnlyOffice and WebMeet to R2.
+export function assertCanonicalGateResults({ releases, gates }) {
+    need(Array.isArray(gates) && gates.length === REQUIRED_GATES.length && RELEASE_GENERATIONS.every(generation => releases?.[generation.id]), 'canonical-gates-incomplete');
     const runIds = new Set();
-    let previousFinish = date(release?.startedAt);
+    let previousFinish = date(releases.R1.startedAt);
     for (let index = 0; index < gates.length; index += 1) {
-        const gate = gates[index];
+        const gate = gates[index], release = releases[generationOf(REQUIRED_GATES[index])];
         need(gate?.name === REQUIRED_GATES[index] && word(gate.runId) && !runIds.has(gate.runId)
             && gate.discovered === 1 && gate.passed === 1 && gate.failed === 0 && gate.skipped === 0
             && gate.retries === 0 && gate.ignoredErrors === 0 && gate.closed === true,
         'canonical-gate-invalid');
         assertReleaseEpoch(release, gate.before);
         assertReleaseEpoch(release, gate.after);
-        need(date(gate.startedAt) >= previousFinish && date(gate.finishedAt) >= date(gate.startedAt),
+        need(date(gate.startedAt) >= previousFinish && date(gate.startedAt) >= date(release.startedAt) && date(gate.finishedAt) >= date(gate.startedAt),
             'canonical-gate-stale');
         previousFinish = date(gate.finishedAt);
         runIds.add(gate.runId);

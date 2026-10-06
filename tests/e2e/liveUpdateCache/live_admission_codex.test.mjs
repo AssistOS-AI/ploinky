@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { manifestFixture, installPureGuards, H } from './test_support_codex.mjs';
+import { manifestFixture, installPureGuards, OPTIONAL_GRAPH, H } from './test_support_codex.mjs';
 import { createFakeHost, byArgs } from './fake_host_support_codex.mjs';
 import { validateManifest } from './manifest_codex.mjs';
 import { buildCommandEnvironment } from './host_command_codex.mjs';
@@ -15,6 +15,10 @@ const info = { rootless: true, version: '5.2.0', graphRoot: '/home/skutner/.loca
 const lines = rows => rows.map(([key, value]) => `${key}=${JSON.stringify(value)}`).join('\n') + '\n';
 const infoText = value => lines([['rootless', value.rootless], ['version', value.version], ['graphRoot', value.graphRoot], ['runRoot', value.runRoot]]);
 
+const boxLines = (over = {}) => { const b = { id: H('d'), name: '/n', image: `sha256:${H('i')}`, running: true, status: 'running', startedAt: '2026-10-04T11:59:50Z', privileged: false, init: true, capAdd: null, securityOpt: null,
+    devices: null, networkMode: 'pasta', ports: {}, mounts: [], labels: {}, workdir: '/w', user: 'podman', ...over };
+    return lines(['id', 'name', 'image', 'running', 'status', 'startedAt', 'privileged', 'init', 'capAdd', 'securityOpt', 'devices', 'networkMode', 'ports', 'mounts', 'labels', 'workdir', 'user'].map(key => [key, b[key]])); };
+
 function build(mutate = () => {}) {
     const { value: manifest } = manifestFixture(), state = {};
     manifest.engine.identity = engineIdentityOf({ info, path: manifest.engine.path, uid }); manifest.endpointEngine = undefined; delete manifest.endpointEngine;
@@ -23,21 +27,21 @@ function build(mutate = () => {}) {
         { name: 'AssistOSExplorer/dpuAgent', repository: 'AssistOSExplorer', noWait: true, externalHealthRequired: false, declaredEnableFlags: ['no-wait'], manifestSha256: H('m2') }];
     Object.assign(state, { info: { ...info }, health: 200, status: { state: 'running-initialized', owned: true, initialized: true, routingConfigured: true, trackedAgents: 2, runningAgents: 2,
         pendingActivation: false, recoveryBarrier: false, stateReadErrors: 0 }, workspace: { dev: manifest.workspace.dev, ino: manifest.workspace.ino, uid, directory: true },
-        box: { id: manifest.box.id, image: `sha256:${manifest.box.imageId}`, running: true, status: 'running', startedAt: '2026-10-04T11:59:50.123456789Z', privileged: false, init: true,
+        box: { id: manifest.box.id, name: `/${manifest.box.name}`, image: `sha256:${manifest.box.imageId}`, running: true, status: 'running', startedAt: '2026-10-04T11:59:50.123456789Z', privileged: false, init: true,
             capAdd: null, securityOpt: ['label=disable'], devices: [{ PathOnHost: '/dev/fuse' }, { PathOnHost: '/dev/net/tun' }], networkMode: 'pasta',
             ports: { '8080/tcp': [{ HostIp: '127.0.0.1', HostPort: '8080' }], '7882/udp': [{ HostIp: '', HostPort: '7882' }] },
             mounts: [{ Source: manifest.sourceMounts[0].source, Destination: '/opt/ploinky', RW: false }, { Source: manifest.workspace.path, Destination: manifest.workspace.path, RW: true }],
             labels: { 'io.assistos.ploinky-box.agentlib-fingerprint': manifest.agentLib.fingerprint }, workdir: manifest.workspace.path, user: 'podman' },
         probe: null, repos: {} });
     for (const repo of manifest.candidate.repositories) state.repos[repo.path] = { commit: repo.commit, branch: repo.branch, upstream: repo.upstream, pushed: repo.commit, dirty: '' };
-    state.probe = { schema: 'live-update-cache-box-probe', version: 1, publicConfig: { staticAgent: 'explorer', staticPort: 8080 }, selector: { state: 'active', generation: manifest.box.activeGeneration, activationId: 'act-1', publicationState: 'ready' },
+    state.probe = { schema: 'live-update-cache-box-probe', version: 1, registryAgents: manifest.graph.map(entry => entry.name).sort(), publicConfig: { staticAgent: 'explorer', staticPort: 8080 }, selector: { state: 'active', generation: manifest.box.activeGeneration, activationId: 'act-1', publicationState: 'ready' },
         graph: manifest.graph.map(entry => ({ name: entry.name, containerName: `ploinky_${entry.name.replace('/', '_')}`, runtimeId: H(`rt-${entry.name}`), instanceId: `inst-${entry.name}`, enableGeneration: 'enable-1',
             graphGeneration: manifest.box.activeGeneration, running: true, ready: true, noWaitState: entry.noWait ? 'running' : null, generationJoin: true, labelsEqual: true, imageId: H('agent-image') })) };
     mutate(manifest, state); validateManifest(manifest);
     const routes = [
         { match: byArgs('info', '--format'), reply: () => ({ stdout: infoText(state.info) }) },
         { match: (_b, args) => args[0] === 'container' && args[1] === 'inspect', reply: () => { const b = state.box;
-            return { stdout: lines([['id', b.id], ['image', b.image], ['running', b.running], ['status', b.status], ['startedAt', b.startedAt], ['privileged', b.privileged], ['init', b.init], ['capAdd', b.capAdd],
+            return { stdout: lines([['id', b.id], ['name', b.name], ['image', b.image], ['running', b.running], ['status', b.status], ['startedAt', b.startedAt], ['privileged', b.privileged], ['init', b.init], ['capAdd', b.capAdd],
                 ['securityOpt', b.securityOpt], ['devices', b.devices], ['networkMode', b.networkMode], ['ports', b.ports], ['mounts', b.mounts], ['labels', b.labels], ['workdir', b.workdir], ['user', b.user]]) }; } },
         { match: (_b, args) => args.includes('--interactive') && args.includes('-'), reply: ({ input }) => ({ stdout: JSON.stringify(state.probeOverride ?? state.probe) + '\n', stderr: undefined, code: state.probeExit ?? 0, input }) },
         { match: (bin, args) => bin === '/usr/bin/git', reply: ({ args }) => { const repo = state.repos[args[1]], git = args.slice(2).join(' ');
@@ -92,6 +96,17 @@ test('every deviation in the live deployment refuses admission with a fixed code
     const cases = [
         ['box start epoch changed', (m, s) => { s.box.startedAt = '2026-10-04T11:59:49Z'; }, 'live-box-start-epoch'],
         ['box image changed', (m, s) => { s.box.image = `sha256:${H('other-image')}`; }, 'live-binding-mismatch'],
+        ['box name differs while the ID matches', (m, s) => { s.box.name = '/ploinky-box-other-0123456789ab'; }, 'live-box-contract'],
+        ['box name is the ID', (m, s) => { s.box.name = s.box.id; }, 'live-box-contract'],
+        ['box name carries a prefix of the manifest name', (m, s) => { s.box.name = `/${m.box.name}x`; }, 'live-box-contract'],
+        ['gpu-grant label present but not hex while the manifest is unlabelled', (m, s) => { s.box.labels['io.assistos.ploinky-box.gpu-grant'] = 'not-a-fingerprint'; }, 'live-box-contract'],
+        ['gpu-grant label present but empty while the manifest is unlabelled', (m, s) => { s.box.labels['io.assistos.ploinky-box.gpu-grant'] = ''; }, 'live-box-contract'],
+        ['gpu-grant label upper-case hex while the manifest is unlabelled', (m, s) => { s.box.labels['io.assistos.ploinky-box.gpu-grant'] = H('a').toUpperCase(); }, 'live-box-contract'],
+        ['gpu-grant label 63 hex while the manifest is unlabelled', (m, s) => { s.box.labels['io.assistos.ploinky-box.gpu-grant'] = H('a').slice(1); }, 'live-box-contract'],
+        ['gpu-grant label oversized while the manifest is unlabelled', (m, s) => { s.box.labels['io.assistos.ploinky-box.gpu-grant'] = 'a'.repeat(300); }, 'live-box-contract'],
+        ['gpu-grant label a non-string while the manifest is unlabelled', (m, s) => { s.box.labels['io.assistos.ploinky-box.gpu-grant'] = 7; }, 'live-box-contract'],
+        ['gpu-grant label valid hex while the manifest is unlabelled', (m, s) => { s.box.labels['io.assistos.ploinky-box.gpu-grant'] = H('a'); }, 'live-box-contract'],
+        ['gpu-grant label absent while the manifest is labelled', (m, s) => { m.engine.gpuWiringIdentity = H('grant'); }, 'live-box-contract'],
         ['box stopped', (m, s) => { s.box.running = false; }, 'live-box-contract'],
         ['box privileged', (m, s) => { s.box.privileged = true; }, 'live-box-contract'],
         ['box without init', (m, s) => { s.box.init = false; }, 'live-box-contract'],
@@ -136,6 +151,43 @@ test('every deviation in the live deployment refuses admission with a fixed code
     }
 });
 
+test('the Box name is read from the same exact-ID inspect, with or without the leading slash, and a labelled Box admits only its exact 64-hex label', async () => {
+    const plain = build((m, s) => { s.box.name = m.box.name; }); assert.equal((await plain.observer.admit()).admitted, true);
+    const slashed = build(); assert.equal((await slashed.observer.admit()).admitted, true);
+    const inspect = slashed.fake.log.find(row => row.args[0] === 'container' && row.args[1] === 'inspect'); assert.deepEqual(inspect.args.slice(-1), [slashed.manifest.box.id]); assert.match(inspect.args.at(-2), /(?:^|\n)name=\{\{json \.Name\}\}\n/);
+    const grant = H('grant'), labelled = build((m, s) => { m.engine.gpuWiringIdentity = grant; s.box.labels['io.assistos.ploinky-box.gpu-grant'] = grant; });
+    assert.equal((await labelled.observer.admit()).admitted, true);
+    for (const bad of [H('other-grant'), 'xyz', '']) await rejects(build((m, s) => { m.engine.gpuWiringIdentity = grant; s.box.labels['io.assistos.ploinky-box.gpu-grant'] = bad; }).observer.admit(), 'live-box-contract');
+    for (const bad of ['', '/', '//x', 'a b', 'a\nb']) assert.throws(() => parseBoxInspect(Buffer.from(boxLines({ name: bad }))), error => error.code === 'box-inspect-shape');
+    assert.equal(parseBoxInspect(Buffer.from(boxLines({ name: '/n1' }))).name, 'n1'); assert.equal(parseBoxInspect(Buffer.from(boxLines({ name: 'n1' }))).name, 'n1');
+    assert.equal(parseBoxInspect(Buffer.from(boxLines({ labels: { 'io.assistos.ploinky-box.gpu-grant': 'zz' } }))).gpuGrantLabelPresent, true); assert.equal(parseBoxInspect(Buffer.from(boxLines({ labels: {} }))).gpuGrantLabelPresent, false);
+    assert.throws(() => parseBoxInspect(Buffer.from(boxLines({ name: 7 }))), error => error.code === 'box-inspect-shape');
+});
+
+test('R2 after the activation: the declared optional runtimes extend the probe input, the required graph and the readiness count, and nothing else may be added', async () => {
+    const withActivation = (m, s) => { m.activation = structuredClone(OPTIONAL_GRAPH); };
+    const h = build(withActivation); const names = h.manifest.graph.map(entry => entry.name);
+    // Before the activation the observer is exactly as before: the probe names only the default graph.
+    assert.deepEqual(probeInput(h.manifest).requiredRuntimes.map(row => row.name), names); assert.equal(expectedLiveFromManifest(h.manifest).requiredGraph.length, names.length);
+    const extended = [...names, ...OPTIONAL_GRAPH.map(entry => entry.name)];
+    assert.deepEqual(probeInput(h.manifest, h.manifest.activation).requiredRuntimes.map(row => row.name), extended); assert.deepEqual(expectedLiveFromManifest(h.manifest, h.manifest.activation).requiredGraph.map(row => row.name), extended);
+    // The in-Box probe answers for the extended list; the observed graph then has the three added rows, running and ready.
+    h.state.probe.graph.push(...OPTIONAL_GRAPH.map(entry => ({ name: entry.name, containerName: `ploinky_${entry.name.replace('/', '_')}`, runtimeId: H(`rt-${entry.name}`), instanceId: `inst-${entry.name}`, enableGeneration: 'enable-1', graphGeneration: h.manifest.box.activeGeneration, running: true, ready: true, noWaitState: null, generationJoin: true, labelsEqual: true, imageId: H('agent-image') })));
+    h.state.status.runningAgents = extended.length; h.state.probe.registryAgents = [...extended].sort();
+    const observed = await h.observer.observe({ addedGraph: h.manifest.activation }); assert.deepEqual(observed.registryAgents, [...extended].sort(), 'the observation carries the whole registry set'); assert.deepEqual(observed.graph.map(row => row.name), extended);
+    const probeRun = h.fake.log.filter(row => row.args.includes('-')).at(-1); assert.deepEqual(JSON.parse(/probeMain\(\{ input: (.*) \}\)/.exec(probeRun.child.writes[0].toString())[1]).requiredRuntimes.map(row => row.name), extended);
+    assert.equal((await h.observer.admit({ addedGraph: h.manifest.activation })).runtimes, extended.length);
+    // Only the manifest's own declaration is accepted; every other binding stays exact.
+    for (const bad of [[], OPTIONAL_GRAPH.slice(0, 2), [...OPTIONAL_GRAPH, { ...OPTIONAL_GRAPH[0], name: 'AssistOSExplorer/extra' }], [{ ...OPTIONAL_GRAPH[0], name: 'AssistOSExplorer/other' }, ...OPTIONAL_GRAPH.slice(1)], null, 'x']) {
+        await rejects(h.observer.observe({ addedGraph: bad }), 'live-admission-override'); await rejects(h.observer.admit({ addedGraph: bad }), 'live-admission-override');
+    }
+    const plain = build(); await rejects(plain.observer.observe({ addedGraph: OPTIONAL_GRAPH }), 'live-admission-override'); await rejects(plain.observer.admit({ addedGraph: OPTIONAL_GRAPH }), 'live-admission-override');
+    const notReady = build(withActivation); notReady.state.probe.graph.push(...OPTIONAL_GRAPH.map(entry => ({ name: entry.name, containerName: 'c', runtimeId: H(entry.name), instanceId: 'i', enableGeneration: 'e', graphGeneration: notReady.manifest.box.activeGeneration, running: true, ready: entry.name.endsWith('webmeetStt') ? false : true, noWaitState: null, generationJoin: true, labelsEqual: true, imageId: H('i') })));
+    notReady.state.status.runningAgents = extended.length; await rejects(notReady.observer.admit({ addedGraph: notReady.manifest.activation }), 'graph-not-ready');
+    const drift = build(withActivation); drift.state.probe.graph.push(...OPTIONAL_GRAPH.map(entry => ({ name: entry.name, containerName: 'c', runtimeId: H(entry.name), instanceId: 'i', enableGeneration: 'e', graphGeneration: drift.manifest.box.activeGeneration, running: true, ready: true, noWaitState: null, generationJoin: true, labelsEqual: true, imageId: H('i') })));
+    drift.state.status.runningAgents = extended.length; drift.state.box.startedAt = '2026-10-04T11:59:49Z'; await rejects(drift.observer.admit({ addedGraph: drift.manifest.activation }), 'live-box-start-epoch');
+});
+
 test('after a legitimate generation change the same predicate admits only the generation the caller itself admitted', async () => {
     const moved = build((m, s) => { s.probe.selector.generation = 'generation-after-update'; s.probe.graph.forEach(row => { row.graphGeneration = 'generation-after-update'; }); });
     await rejects(moved.observer.admit(), 'workspace-not-live');                                           // the manifest's pre-update generation no longer matches
@@ -159,12 +211,13 @@ test('a non-Linux or foreign-uid host refuses before any command is launched', a
 
 test('probe, status and health parsers reject extra, missing, oversized and secret-bearing fields', async () => {
     const { value: manifest } = manifestFixture(); const input = probeInput(manifest);
-    const good = { schema: 'live-update-cache-box-probe', version: 1, publicConfig: { staticAgent: 'explorer', staticPort: 8080 }, selector: { state: 'active', generation: 'g', activationId: 'a', publicationState: 'ready' },
+    const good = { schema: 'live-update-cache-box-probe', version: 1, registryAgents: ['R/a'], publicConfig: { staticAgent: 'explorer', staticPort: 8080 }, selector: { state: 'active', generation: 'g', activationId: 'a', publicationState: 'ready' },
         graph: [{ name: input.requiredRuntimes[0].name, containerName: 'c', runtimeId: 'r', instanceId: 'i', enableGeneration: 'e', graphGeneration: 'g', running: true, ready: true, noWaitState: null, generationJoin: true, labelsEqual: true, imageId: 'x' }] };
     assert.equal(parseProbeOutput(Buffer.from(JSON.stringify(good)), input).selector.generation, 'g');
     for (const bad of [{ ...good, extra: 'PRIVATE' }, { ...good, graph: [{ ...good.graph[0], env: 'PRIVATE' }] }, { ...good, graph: [] }, { ...good, graph: [{ ...good.graph[0], name: 'Other/agent' }] },
         { ...good, graph: [{ ...good.graph[0], graphGeneration: 'h' }] }, { ...good, selector: { ...good.selector, state: 'inactive' } }, { ...good, publicConfig: { staticAgent: 'e', staticPort: 8080, extra: 1 } },
-        { ...good, publicConfig: { staticAgent: 'e', staticPort: '8080' } }, { schema: good.schema, version: 1, selector: good.selector, graph: good.graph }]) {
+        { ...good, publicConfig: { staticAgent: 'e', staticPort: '8080' } }, { schema: good.schema, version: 1, selector: good.selector, graph: good.graph }, { ...good, registryAgents: undefined }, { ...good, registryAgents: 'R/a' }, { ...good, registryAgents: [7] },
+        { ...good, registryAgents: Array(257).fill('R/a') }, { ...good, registryAgents: [''] }]) {
         assert.throws(() => parseProbeOutput(Buffer.from(JSON.stringify(bad)), input), error => error.code === 'live-probe-output');
     }
     assert.throws(() => parseProbeOutput(Buffer.alloc(200000, 97), input), error => error.code === 'live-probe-output');

@@ -4,7 +4,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { AcceptanceError, need, LIMITS, word } from './manifest_codex.mjs';
 import { assertLiveBefore } from './contracts_codex.mjs';
 import { runOwnedCommand, buildCommandEnvironment } from './host_command_codex.mjs';
-import { boxInspectArgs, parseBoxInspect, engineInfoArgs, parseEngineInfo, engineIdentityOf, gpuWiringIdentityOf, publicationsId, mountsId,
+import { boxInspectArgs, parseBoxInspect, engineInfoArgs, parseEngineInfo, engineIdentityOf, gpuWiringIdentityOf, gpuGrantLabelValid, publicationsId, mountsId,
     boxExecArgs } from './engine_codex.mjs';
 import { PROBE_SCHEMA, PROBE_LIMITS } from './box_probe_codex.mjs';
 
@@ -14,19 +14,23 @@ import { PROBE_SCHEMA, PROBE_LIMITS } from './box_probe_codex.mjs';
 export const PROBE_BOOTSTRAP_PATH = '/opt/ploinky/tests/e2e/liveUpdateCache/box_probe_codex.mjs';
 const HEALTH_BYTES = 64 * 1024;
 
-export function expectedLiveFromManifest(manifest) {
+// R2 only: the three declared optional runtimes appended to the required graph once the runner-owned activation has added them.
+const graphOf = (manifest, added) => (added === undefined ? manifest.graph : [...manifest.graph, ...added]);
+const addedAllowed = (manifest, added) => added === undefined || (Array.isArray(manifest.activation) && isDeepStrictEqual(added, manifest.activation));
+
+export function expectedLiveFromManifest(manifest, added) {
     const repositories = manifest.candidate.repositories.map(repo => ({ name: repo.name, commit: repo.commit, pushedCommit: repo.pushedCommit,
         branch: repo.branch, upstream: repo.upstream, clean: true, detached: false }));
     return { workspace: { path: manifest.workspace.path, dev: manifest.workspace.dev, ino: manifest.workspace.ino, uid: manifest.workspace.uid },
         box: { id: manifest.box.id, imageId: manifest.box.imageId, startedAt: manifest.box.startedAt },
         candidate: { imageId: manifest.box.imageId, repositories },
-        requiredGraph: manifest.graph.map(entry => ({ name: entry.name, noWait: entry.noWait, externalHealthRequired: entry.externalHealthRequired })),
+        requiredGraph: graphOf(manifest, added).map(entry => ({ name: entry.name, noWait: entry.noWait, externalHealthRequired: entry.externalHealthRequired })),
         publications: publicationsId(manifest.publications),
         sourceMounts: mountsId(manifest.sourceMounts.map(mount => ({ source: mount.source, destination: mount.destination, readOnly: true }))),
         engineIdentity: manifest.engine.identity, activeGeneration: manifest.box.activeGeneration };
 }
 
-export const probeInput = manifest => ({ requiredRuntimes: manifest.graph.map(entry => ({ name: entry.name, noWait: entry.noWait })) });
+export const probeInput = (manifest, added) => ({ requiredRuntimes: graphOf(manifest, added).map(entry => ({ name: entry.name, noWait: entry.noWait })) });
 export function probeBootstrap(input) {
     return Buffer.from(`const { probeMain } = await import(${JSON.stringify(PROBE_BOOTSTRAP_PATH)});\nprocess.exitCode = await probeMain({ input: ${JSON.stringify(input)} });\n`);
 }
@@ -36,10 +40,11 @@ export function parseProbeOutput(bytes, input) {
     let value; try { value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)); } catch { throw new AcceptanceError('live-probe-output'); }
     need(value && value.schema === PROBE_SCHEMA && value.version === 1, 'live-probe-output');
     if (Object.hasOwn(value, 'failure')) { need(typeof value.failure === 'string' && /^probe-[a-z-]{1,48}$/.test(value.failure) && Object.keys(value).length === 3, 'live-probe-output'); throw new AcceptanceError(`live-${value.failure}`); }
-    need(Object.keys(value).sort().join() === ['graph', 'publicConfig', 'schema', 'selector', 'version'].sort().join() && Array.isArray(value.graph) && value.graph.length === input.requiredRuntimes.length
+    need(Object.keys(value).sort().join() === ['graph', 'publicConfig', 'registryAgents', 'schema', 'selector', 'version'].sort().join() && Array.isArray(value.graph) && value.graph.length === input.requiredRuntimes.length
         && value.selector && Object.keys(value.selector).sort().join() === ['activationId', 'generation', 'publicationState', 'state'].sort().join() && value.selector.state === 'active', 'live-probe-output');
     need(value.publicConfig && Object.keys(value.publicConfig).sort().join() === ['staticAgent', 'staticPort'].join() && typeof value.publicConfig.staticAgent === 'string'
         && value.publicConfig.staticAgent.length <= 512 && Number.isSafeInteger(value.publicConfig.staticPort), 'live-probe-output');
+    need(Array.isArray(value.registryAgents) && value.registryAgents.length <= PROBE_LIMITS.registryAgents && value.registryAgents.every(name => typeof name === 'string' && name.length > 0 && name.length <= 512), 'live-probe-output');
     const keys = ['containerName', 'enableGeneration', 'generationJoin', 'graphGeneration', 'imageId', 'instanceId', 'labelsEqual', 'name', 'noWaitState', 'ready', 'runtimeId', 'running'].sort().join();
     value.graph.forEach((row, index) => {
         need(row && Object.keys(row).sort().join() === keys && row.name === input.requiredRuntimes[index].name && typeof row.ready === 'boolean' && typeof row.running === 'boolean'
@@ -90,7 +95,9 @@ export function createLiveObserver({ manifest, deps, statusProof, httpGet = http
     const run = (operation, kind, argv, extra = {}) => runOwnedCommand({ operation, kind, argv, cwd: manifest.workspace.path, env, deadlineMs: extra.deadlineMs ?? (kind === 'git' ? 30000 : 60000), ...extra }, deps);
     const git = (repoPath, args, allowedExitCodes = [0]) => runOwnedCommand({ operation: 'live-git-read', kind: 'git', argv: [gitBin, '-C', repoPath, ...args], cwd: repoPath, env, deadlineMs: 30000, allowedExitCodes }, deps);
     return Object.freeze({
-        async observe() {
+        async observe({ addedGraph } = {}) {
+            need(addedAllowed(manifest, addedGraph), 'live-admission-override');
+            const graph = graphOf(manifest, addedGraph);
             need(hostFacts.platform === 'linux' && hostFacts.uid === manifest.host.uid, 'runtime-host-unqualified');
             const bin = manifest.engine.path;
             const info = parseEngineInfo((await run('live-engine-info', 'read', engineInfoArgs(bin))).stdout);
@@ -101,7 +108,9 @@ export function createLiveObserver({ manifest, deps, statusProof, httpGet = http
             // The Box is created with /dev/fuse and /dev/net/tun; GPU devices appear only under an active grant wiring.
             const gpuWired = gpuWiringIdentityOf({}) !== manifest.engine.gpuWiringIdentity;
             const devicePaths = box.devices.map(device => device?.PathOnHost).sort();
-            need(box.id === manifest.box.id && box.running === true && box.privileged === false && box.init === true && box.user === 'podman' && box.capAdd.length === 0
+            // The container name is read from the same exact-ID inspect and must equal the manifest's, so a gate's SMOKE_PLOINKY_BOX_CONTAINER
+            // names this Box and no other. A present but malformed gpu-grant label is refused rather than read as the absent wiring.
+            need(box.id === manifest.box.id && box.name === manifest.box.name && gpuGrantLabelValid(box) && box.running === true && box.privileged === false && box.init === true && box.user === 'podman' && box.capAdd.length === 0
                 && ['/dev/fuse', '/dev/net/tun'].every(device => devicePaths.includes(device))
                 && devicePaths.every(device => typeof device === 'string' && (['/dev/fuse', '/dev/net/tun'].includes(device) || (gpuWired && /^\/dev\/nvidia[A-Za-z0-9_-]*$/.test(device))))
                 && gpuWiringIdentityOf(box.labels) === manifest.engine.gpuWiringIdentity && box.labels.agentLibFingerprint === manifest.agentLib.fingerprint, 'live-box-contract');
@@ -109,10 +118,10 @@ export function createLiveObserver({ manifest, deps, statusProof, httpGet = http
                 return found ? { source: found.source, destination: found.destination, readOnly: found.readOnly } : { source: '', destination: mount.destination, readOnly: false }; });
             need(box.publications.length === 2 && box.publications.every((row, index) => isDeepStrictEqual(row, [publication, media][index])), 'live-box-publications');
             const status = parseStatusProof(await statusProof());
-            need(status.owned === true && status.state === 'running-initialized' && status.runningAgents >= manifest.graph.length, 'live-status-not-running');
+            need(status.owned === true && status.state === 'running-initialized' && status.runningAgents >= graph.length, 'live-status-not-running');
             const stat = io.lstatSync(manifest.workspace.path);
             need(stat.isDirectory() && !stat.isSymbolicLink() && io.realpathSync(manifest.workspace.path) === manifest.workspace.path, 'live-workspace-alias');
-            const input = probeInput(manifest);
+            const input = probeInput(manifest, addedGraph);
             // The probe exits 1 only together with one fixed public failure code, which parseProbeOutput converts into the refusal.
             const probeResult = await run('live-box-probe', 'read', boxExecArgs({ engineBin: bin, boxId: manifest.box.id, workspace: manifest.workspace.path,
                 routerHostPort: publication.hostPort, mediaHostPort: media.hostPort, interactive: true, argv: ['/usr/local/bin/node', '--input-type=module', '-'] }),
@@ -129,17 +138,17 @@ export function createLiveObserver({ manifest, deps, statusProof, httpGet = http
                 candidate: { imageId: box.imageId, repositories }, publications: publicationsId(box.publications), sourceMounts: mountsId(mounts), engineIdentity: identity,
                 graph: probed.graph.map((row, index) => ({ name: row.name, graphGeneration: row.graphGeneration, running: row.running && row.generationJoin && row.labelsEqual,
                     runtimeId: row.runtimeId, instanceId: row.instanceId, enableGeneration: row.enableGeneration, ready: row.ready,
-                    externalHealth: manifest.graph[index].externalHealthRequired ? routerHealthy : true, noWaitState: row.noWaitState })),
+                    externalHealth: graph[index].externalHealthRequired ? routerHealthy : true, noWaitState: row.noWaitState })),
                 // Not part of the live contract: kept for the cross-phase equality checks.
-                publicConfig: probed.publicConfig, activation: { generation: probed.selector.generation, activationId: probed.selector.activationId } };
+                registryAgents: probed.registryAgents, publicConfig: probed.publicConfig, activation: { generation: probed.selector.generation, activationId: probed.selector.activationId } };
         },
         // The admission is positive only when the independently observed deployment matches the manifest-derived expectation.
         // Only the edge generation may legitimately differ from the manifest after earlier mutations of the same run; a caller
         // that passes the generation it has itself admitted keeps every other binding exact.
         async admit(overrides = {}) {
-            need(overrides && Object.getPrototypeOf(overrides) === Object.prototype && Object.keys(overrides).every(key => key === 'activeGeneration')
-                && (overrides.activeGeneration === undefined || word(overrides.activeGeneration)), 'live-admission-override');
-            const expected = expectedLiveFromManifest(manifest); if (overrides.activeGeneration !== undefined) expected.activeGeneration = overrides.activeGeneration;
-            const observed = await this.observe(); assertLiveBefore({ expected, observed }); return Object.freeze({ phase: 'U0', admitted: true, activeGeneration: observed.activeGeneration, runtimes: observed.graph.length }); },
+            need(overrides && Object.getPrototypeOf(overrides) === Object.prototype && Object.keys(overrides).every(key => key === 'activeGeneration' || key === 'addedGraph')
+                && (overrides.activeGeneration === undefined || word(overrides.activeGeneration)) && addedAllowed(manifest, overrides.addedGraph), 'live-admission-override');
+            const expected = expectedLiveFromManifest(manifest, overrides.addedGraph); if (overrides.activeGeneration !== undefined) expected.activeGeneration = overrides.activeGeneration;
+            const observed = await this.observe({ addedGraph: overrides.addedGraph }); assertLiveBefore({ expected, observed }); return Object.freeze({ phase: 'U0', admitted: true, activeGeneration: observed.activeGeneration, runtimes: observed.graph.length }); },
     });
 }

@@ -26,12 +26,42 @@ function keyedLines(bytes, keys, code) {
 }
 const template = keys => keys.map(([key, expression]) => `${key}={{json ${expression}}}`).join('\n');
 
-const BOX_FIELDS = [['id', '.Id'], ['image', '.Image'], ['running', '.State.Running'], ['status', '.State.Status'], ['startedAt', '.State.StartedAt'],
+const BOX_FIELDS = [['id', '.Id'], ['name', '.Name'], ['image', '.Image'], ['running', '.State.Running'], ['status', '.State.Status'], ['startedAt', '.State.StartedAt'],
     ['privileged', '.HostConfig.Privileged'], ['init', '.HostConfig.Init'], ['capAdd', '.HostConfig.CapAdd'], ['securityOpt', '.HostConfig.SecurityOpt'],
     ['devices', '.HostConfig.Devices'], ['networkMode', '.HostConfig.NetworkMode'], ['ports', '.HostConfig.PortBindings'], ['mounts', '.Mounts'],
     ['labels', '.Config.Labels'], ['workdir', '.Config.WorkingDir'], ['user', '.Config.User']];
 export const BOX_INSPECT_FORMAT = template(BOX_FIELDS);
 export const boxInspectArgs = (engineBin, boxId) => { need(absolute(engineBin) && hex64(boxId), 'engine-argument'); return [engineBin, 'container', 'inspect', '--format', BOX_INSPECT_FORMAT, boxId]; };
+
+// The safe subset of a Box inspection the Marketplace receipt helper reads (identity, start, workspace bind, Router publication).
+// It never selects Config.Env, labels or any other field.
+export const RECEIPT_INSPECT_FORMAT = '{"Id":{{json .Id}},"State":{"Running":{{json .State.Running}},"StartedAt":{{json .State.StartedAt}}},"Mounts":{{json .Mounts}},'
+    + '"NetworkSettings":{"Ports":{{json .NetworkSettings.Ports}}},"HostConfig":{"PortBindings":{{json .HostConfig.PortBindings}}}}';
+export const receiptInspectArgs = (engineBin, container) => { need(absolute(engineBin) && typeof container === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,254}$/.test(container), 'engine-argument');
+    return [engineBin, 'container', 'inspect', '--format', RECEIPT_INSPECT_FORMAT, container]; };
+export function parseReceiptInspect(bytes) {
+    need(Buffer.isBuffer(bytes) && bytes.length > 0 && bytes.length <= 1024 * 1024, 'receipt-inspect-shape');
+    let value; try { value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)); } catch { throw new AcceptanceError('receipt-inspect-shape'); }
+    need(value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).sort().join() === 'HostConfig,Id,Mounts,NetworkSettings,State', 'receipt-inspect-shape');
+    return value;
+}
+
+// The release-manifest writer's two extra read-only lookups: the Box's identity by its NAME (to prove name and ID belong to one
+// container) and the image's own ID and creation time.
+const IDENTITY_FIELDS = [['id', '.Id'], ['name', '.Name']], IMAGE_FIELDS = [['id', '.Id'], ['created', '.Created']];
+export const BOX_IDENTITY_FORMAT = template(IDENTITY_FIELDS), IMAGE_INSPECT_FORMAT = template(IMAGE_FIELDS);
+export const boxIdentityArgs = (engineBin, name) => { need(absolute(engineBin) && typeof name === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,254}$/.test(name), 'engine-argument'); return [engineBin, 'container', 'inspect', '--format', BOX_IDENTITY_FORMAT, name]; };
+export function parseBoxIdentity(bytes) {
+    const raw = keyedLines(bytes, IDENTITY_FIELDS.map(([key]) => key), 'box-identity-shape');
+    need(hex64(raw.id) && typeof raw.name === 'string' && /^\/?[^\s/][^\s]{0,254}$/.test(raw.name), 'box-identity-shape');
+    return Object.freeze({ id: raw.id, name: raw.name.replace(/^\//, '') });
+}
+export const imageInspectArgs = (engineBin, imageId) => { need(absolute(engineBin) && hex64(imageId), 'engine-argument'); return [engineBin, 'image', 'inspect', '--format', IMAGE_INSPECT_FORMAT, imageId]; };
+export function parseImageInspect(bytes) {
+    const raw = keyedLines(bytes, IMAGE_FIELDS.map(([key]) => key), 'image-inspect-shape');
+    need(typeof raw.id === 'string' && /^(?:sha256:)?[a-f0-9]{64}$/.test(raw.id) && typeof raw.created === 'string' && Number.isFinite(Date.parse(raw.created)), 'image-inspect-shape');
+    return Object.freeze({ id: raw.id.replace(/^sha256:/, ''), createdAt: new Date(Date.parse(raw.created)).toISOString() });
+}
 
 const LABELS = Object.freeze({ gpuGrant: 'io.assistos.ploinky-box.gpu-grant', routerHostPort: 'io.assistos.ploinky-box.router-host-port',
     mediaHostPort: 'io.assistos.ploinky-box.media-host-port', routerBindAddress: 'io.assistos.ploinky-box.router-bind-address',
@@ -54,7 +84,7 @@ export function parsePortBindings(ports) {
 
 export function parseBoxInspect(bytes) {
     const raw = keyedLines(bytes, BOX_FIELDS.map(([key]) => key), 'box-inspect-shape');
-    need(hex64(raw.id) && typeof raw.image === 'string' && /^(?:sha256:)?[a-f0-9]{64}$/.test(raw.image) && typeof raw.running === 'boolean'
+    need(hex64(raw.id) && typeof raw.name === 'string' && /^\/?[^\s/][^\s]{0,254}$/.test(raw.name) && typeof raw.image === 'string' && /^(?:sha256:)?[a-f0-9]{64}$/.test(raw.image) && typeof raw.running === 'boolean'
         && typeof raw.status === 'string' && typeof raw.startedAt === 'string' && typeof raw.privileged === 'boolean'
         && typeof raw.networkMode === 'string' && raw.labels && typeof raw.labels === 'object' && !Array.isArray(raw.labels)
         && Array.isArray(raw.mounts ?? []) && ['boolean', 'object'].includes(typeof raw.init), 'box-inspect-shape');
@@ -63,7 +93,8 @@ export function parseBoxInspect(bytes) {
     const mounts = (raw.mounts ?? []).map(mount => { need(mount && typeof mount.Source === 'string' && typeof mount.Destination === 'string' && typeof mount.RW === 'boolean', 'box-mounts-shape');
         return { source: mount.Source, destination: mount.Destination, readOnly: mount.RW === false }; }).sort((a, b) => a.destination.localeCompare(b.destination));
     const list = value => { need(value === null || (Array.isArray(value) && value.length <= 256 && value.every(item => typeof item === 'string' || (item && typeof item === 'object'))), 'box-inspect-shape'); return value ?? []; };
-    return Object.freeze({ id: raw.id, imageId: raw.image.replace(/^sha256:/, ''), running: raw.running, status: raw.status, startedAt: raw.startedAt,
+    // Podman reports the container name with a leading slash; the manifest and SMOKE_PLOINKY_BOX_CONTAINER carry it without.
+    return Object.freeze({ id: raw.id, name: raw.name.replace(/^\//, ''), imageId: raw.image.replace(/^sha256:/, ''), gpuGrantLabelPresent: Object.hasOwn(raw.labels, LABELS.gpuGrant), running: raw.running, status: raw.status, startedAt: raw.startedAt,
         privileged: raw.privileged, init: raw.init === true, capAdd: list(raw.capAdd), securityOpt: list(raw.securityOpt), devices: list(raw.devices),
         networkMode: raw.networkMode, publications: parsePortBindings(raw.ports ?? {}), mounts, labels, workdir: raw.workdir, user: raw.user });
 }
@@ -82,6 +113,8 @@ export function engineIdentityOf({ info, path, uid }) {
     return sha256Hex(canonical({ kind: 'podman', path, uid, version: info.version, graphRoot: info.graphRoot, runRoot: info.runRoot, rootless: info.rootless }));
 }
 // The Box label is the existing fingerprint of the exact GPU wiring; absence is its own stable value.
+// A present gpu-grant label must be exactly 64 lowercase hex characters; gpuWiringIdentityOf alone would map any other value to the absent sentinel.
+export const gpuGrantLabelValid = box => !box.gpuGrantLabelPresent || hex64(box.labels?.gpuGrant);
 export const gpuWiringIdentityOf = labels => hex64(labels?.gpuGrant) ? labels.gpuGrant : sha256Hex('ploinky-box-gpu-wiring:absent');
 export const publicationsId = rows => `pub:${sha256Hex(canonical([...rows].sort((a, b) => canonical(a).localeCompare(canonical(b)))))}`;
 export const mountsId = rows => `mnt:${sha256Hex(canonical([...rows].sort((a, b) => canonical(a).localeCompare(canonical(b)))))}`;

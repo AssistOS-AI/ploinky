@@ -55,13 +55,15 @@ test('an exception after a command was launched is a failed run needing hand-off
     const outputs = []; assert.equal(await acceptanceMain(['--acceptance', '/owned/manifest_codex.json'], { nowMs: value.grant.startsAtMs, read: () => Buffer.from(JSON.stringify(value)), write: row => outputs.push(row), run: async () => afterLaunch }), 1);
 });
 
-test('only an explicit PASS verdict with exit 0 is success; other receipts and exceptions are nonzero', async () => {
+test('AC-17: only the UC stage verdict with exit 0, overall acceptance OPEN and AC-L4 G-BASE pending is success; a plain PASS, an overall PASS, other receipts and exceptions are nonzero', async () => {
     const { value, nowMs } = manifestFixture(), outputs = [];
-    const run = receipt => async () => receipt;
-    assert.equal(await acceptanceMain(['--acceptance', '/owned/manifest_codex.json'], { nowMs, read: () => Buffer.from(JSON.stringify(value)), write: row => outputs.push(row), run: run({ exitCode: 0, acceptance: 'PASS' }) }), 0);
-    assert.equal(await acceptanceMain(['--acceptance', '/owned/manifest_codex.json'], { nowMs, read: () => Buffer.from(JSON.stringify(value)), write: row => outputs.push(row), run: run({ exitCode: 3, acceptance: 'UNQUALIFIED' }) }), 3);
-    for (const receipt of [{ exitCode: 0, acceptance: 'FAIL' }, { exitCode: 0 }, {}, { exitCode: -1, acceptance: 'PASS' }, { exitCode: 0, acceptance: 'UNQUALIFIED' }]) {
-        assert.equal(await acceptanceMain(['--acceptance', '/owned/manifest_codex.json'], { nowMs, read: () => Buffer.from(JSON.stringify(value)), write: row => outputs.push(row), run: run(receipt) }), 1, JSON.stringify(receipt));
+    const stage = { exitCode: 0, acceptance: 'UC_STAGE_PASS', ucOverallAcceptance: 'OPEN', pendingRequirements: ['AC-L4-G-BASE'] };
+    const run = receipt => async () => receipt, main = receipt => acceptanceMain(['--acceptance', '/owned/manifest_codex.json'], { nowMs, read: () => Buffer.from(JSON.stringify(value)), write: row => outputs.push(row), run: run(receipt) });
+    assert.equal(await main(stage), 0); assert.deepEqual(outputs.at(-1), { summary: 'UC stage complete; overall UC acceptance OPEN (pending AC-L4 G-BASE)' }); assert.doesNotMatch(JSON.stringify(outputs), /"PASS"|"acceptance":"PASS"/);
+    assert.equal(await main({ exitCode: 3, acceptance: 'UNQUALIFIED' }), 3); assert.equal(outputs.at(-1).acceptance, 'UNQUALIFIED', 'a non-zero outcome prints no stage summary');
+    for (const receipt of [{ ...stage, acceptance: 'PASS' }, { ...stage, ucOverallAcceptance: 'PASS' }, { ...stage, ucOverallAcceptance: 'CLOSED' }, { ...stage, ucOverallAcceptance: undefined }, { ...stage, pendingRequirements: [] }, { ...stage, pendingRequirements: undefined },
+        { ...stage, pendingRequirements: ['AC-L4-G-BASE', 'extra'] }, { ...stage, pendingRequirements: ['other'] }, { ...stage, exitCode: -1 }, { ...stage, exitCode: 2 }, { exitCode: 0, acceptance: 'PASS' }, { exitCode: 0, acceptance: 'FAIL' }, { exitCode: 0 }, {}, { exitCode: -1, acceptance: 'PASS' }, { exitCode: 0, acceptance: 'UNQUALIFIED' }]) {
+        const before = outputs.length, code = await main(receipt); assert.notEqual(code, 0, JSON.stringify(receipt)); assert.equal(outputs.slice(before).some(row => row.summary !== undefined), false, JSON.stringify(receipt));
     }
     assert.equal(await acceptanceMain(['--acceptance', '/owned/manifest_codex.json'], { nowMs, read: () => Buffer.from(JSON.stringify(value)), write: row => outputs.push(row), run: async () => { throw new Error('PRIVATE'); } }), 64);
     assert.equal(outputs.at(-1).resourceDisposition, 'NO_RUNTIME_LAUNCHED'); assert.equal(JSON.stringify(outputs.at(-1)).includes('PRIVATE'), false);

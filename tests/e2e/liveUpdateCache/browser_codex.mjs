@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
-import { AcceptanceError, need } from './manifest_codex.mjs';
+import { AcceptanceError, need, smokeOrigin } from './manifest_codex.mjs';
 import { applicationMarker, createApplicationMarker, verifyApplicationMarker } from './application_marker_codex.mjs';
 
 // U1/U7 browser port. It drives the repository's own Explorer smoke helpers (ordinary provisioned-account login, the
@@ -11,7 +11,8 @@ const ACTION_TIMEOUT_MS = 20000;
 
 export function smokeEnvironment(manifest, runStem) {
     const publication = manifest.publications[0];
-    return { SMOKE_BASE_URL: `http://${publication.hostIP}:${publication.hostPort}`, SMOKE_RUN_ID: `${runStem}-browser`.replace(/[^A-Za-z0-9_-]/g, '-'),
+    // Loopback sign-in is canonicalized to `localhost` and the smoke helper refuses an origin change, so the origin is `localhost` (as in the gates).
+    return { SMOKE_BASE_URL: smokeOrigin(publication), SMOKE_RUN_ID: `${runStem}-browser`.replace(/[^A-Za-z0-9_-]/g, '-'),
         SMOKE_ARTIFACT_DIR: path.join(manifest.evidence.root, 'browser'), SMOKE_WORKSPACE_ROOT: manifest.workspace.path };
 }
 
