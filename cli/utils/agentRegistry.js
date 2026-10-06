@@ -7,6 +7,7 @@ import * as reposSvc from './repos.js';
 import { REPOS_DIR } from './config.js';
 import { findAgent } from './utils.js';
 import { deriveAgentPrincipalId } from './security/agentIdentity.js';
+import { readEdgeRoutingSelection } from '../sandbox/edgeGeneration.js';
 
 /**
  * agentRegistry.js
@@ -144,7 +145,29 @@ function collectInstalledAgents() {
     return out;
 }
 
-export function buildAgentIndex() {
+// The index is rebuilt by scanning every installed manifest, which is far too
+// costly to repeat per request. It is memoized for AGENT_INDEX_TTL_MS and the
+// memo is dropped early when the active edge generation changes (enabling or
+// disabling an agent changes the generation). Residual staleness: a manifest
+// edited in place under an unchanged generation is seen after at most one TTL.
+// The memo only feeds descriptor lookups and SSO provider listing; routing stays
+// gated by the generation lease.
+const AGENT_INDEX_TTL_MS = 1000;
+let agentIndexMemo = null;
+
+// A selector read (one small file) is the cheapest accessor for the active
+// generation id; loading the generation itself is deliberately avoided. Any
+// failure maps to null so an unreadable selector is simply "a different id".
+function readActiveGenerationId() {
+    try {
+        const { selector } = readEdgeRoutingSelection();
+        return `${selector.state}:${selector.generation || ''}`;
+    } catch (_) {
+        return null;
+    }
+}
+
+function scanAgentIndex() {
     const agents = new Map();
     const byPrincipal = new Map();
     const ssoProviders = [];
@@ -159,6 +182,24 @@ export function buildAgentIndex() {
         }
     }
     return { agents, byPrincipal, ssoProviders };
+}
+
+export function buildAgentIndex() {
+    const now = Date.now();
+    const generationId = readActiveGenerationId();
+    if (agentIndexMemo
+        && agentIndexMemo.generationId === generationId
+        && now >= agentIndexMemo.builtAt
+        && now - agentIndexMemo.builtAt < AGENT_INDEX_TTL_MS) {
+        return agentIndexMemo.index;
+    }
+    const index = scanAgentIndex();
+    agentIndexMemo = { builtAt: now, generationId, index };
+    return index;
+}
+
+function clearAgentIndexMemo() {
+    agentIndexMemo = null;
 }
 
 export function listSsoProviders() {
@@ -210,4 +251,6 @@ export const __internal = {
     splitRepoAgent,
     canonicalJsonStringify,
     isSsoProviderManifest,
+    clearAgentIndexMemo,
+    AGENT_INDEX_TTL_MS,
 };

@@ -3,11 +3,15 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 
 const originalCwd = process.cwd();
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-agents-'));
 
-function writeManifest(repoName, agentName, manifest) {
+function writeManifest(repoName, agentName, manifest, { clearMemo = true } = {}) {
+    // The agent index is memoized; fixtures that expect to see their own writes
+    // clear it. The memo tests below pass clearMemo: false to observe it.
+    if (clearMemo) registryModule?.__internal?.clearAgentIndexMemo();
     const agentDir = path.join(tempDir, '.ploinky', 'repos', repoName, agentName);
     fs.mkdirSync(agentDir, { recursive: true });
     fs.writeFileSync(
@@ -16,6 +20,8 @@ function writeManifest(repoName, agentName, manifest) {
     );
 }
 
+const originalWorkspaceRoot = process.env.PLOINKY_WORKSPACE_ROOT;
+process.env.PLOINKY_WORKSPACE_ROOT = tempDir;
 process.chdir(tempDir);
 
 const moduleSuffix = `?test=${Date.now()}`;
@@ -27,10 +33,13 @@ const {
     getAgentDescriptorByPrincipal,
     isSsoProviderManifest,
     canonicalJsonHash,
+    __internal,
 } = registryModule;
 
 test.after(() => {
     process.chdir(originalCwd);
+    if (originalWorkspaceRoot === undefined) delete process.env.PLOINKY_WORKSPACE_ROOT;
+    else process.env.PLOINKY_WORKSPACE_ROOT = originalWorkspaceRoot;
     fs.rmSync(tempDir, { recursive: true, force: true });
 });
 
@@ -94,4 +103,66 @@ test('buildAgentIndex skips entries whose names fail agentIdentity validation', 
     assert.equal(index.agents.has('gitTest/good agent'), false);
     assert.ok(index.agents.has('dpu/dpuAgent'));
     assert.ok(index.agents.has('basic/keycloak'));
+});
+
+function stable(value) {
+    if (Array.isArray(value)) return value.map(stable);
+    if (value && typeof value === 'object') {
+        return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stable(value[key])]));
+    }
+    return value;
+}
+
+function writeActiveSelector(generationChar) {
+    const body = {
+        schemaVersion: 1,
+        state: 'active',
+        generation: `sha256:${generationChar.repeat(64)}`,
+        publicationState: 'published',
+        activationId: `activation-${generationChar}`,
+        activatedAt: '2026-10-06T00:00:00.000Z',
+    };
+    const selectorDigest = `sha256:${crypto.createHash('sha256')
+        .update(Buffer.from(JSON.stringify(stable(body)))).digest('hex')}`;
+    const edgeDir = path.join(tempDir, '.ploinky', 'data', 'edge-routing');
+    fs.mkdirSync(edgeDir, { recursive: true });
+    fs.writeFileSync(path.join(edgeDir, 'active.json'), JSON.stringify({ ...body, selectorDigest }));
+}
+
+test('agent index memo bounds staleness to its TTL for principal lookup and SSO providers', (t) => {
+    writeActiveSelector('a');
+    writeManifest('memo', 'baseline', { about: 'seeds the memo' });
+    const realNow = Date.now();
+    let now = realNow;
+    t.mock.method(Date, 'now', () => now);
+
+    const first = buildAgentIndex();
+    assert.equal(buildAgentIndex(), first, 'second call inside the TTL reuses the index');
+
+    writeManifest('memo', 'lateSso', { ssoProvider: true }, { clearMemo: false });
+    assert.equal(getAgentDescriptorByPrincipal('agent:memo/lateSso'), null, 'in-place add stays hidden inside the TTL');
+    assert.equal(listSsoProviders().some((d) => d.agentRef === 'memo/lateSso'), false);
+
+    now = realNow + __internal.AGENT_INDEX_TTL_MS - 1;
+    assert.equal(getAgentDescriptorByPrincipal('agent:memo/lateSso'), null, 'still hidden 1 ms before the TTL');
+
+    now = realNow + __internal.AGENT_INDEX_TTL_MS;
+    assert.equal(getAgentDescriptorByPrincipal('agent:memo/lateSso')?.agentRef, 'memo/lateSso');
+    assert.equal(listSsoProviders().some((d) => d.agentRef === 'memo/lateSso'), true);
+});
+
+test('a change of the active generation clears the agent index memo before the TTL', (t) => {
+    writeActiveSelector('b');
+    writeManifest('memo', 'seed', { about: 'seeds the memo' });
+    t.mock.method(Date, 'now', () => 1_000_000);
+
+    const first = buildAgentIndex();
+    writeManifest('memo', 'afterGeneration', { ssoProvider: true }, { clearMemo: false });
+    assert.equal(getAgentDescriptorByPrincipal('agent:memo/afterGeneration'), null);
+    assert.equal(buildAgentIndex(), first);
+
+    writeActiveSelector('c');
+    assert.equal(getAgentDescriptorByPrincipal('agent:memo/afterGeneration')?.agentRef, 'memo/afterGeneration');
+    assert.equal(listSsoProviders().some((d) => d.agentRef === 'memo/afterGeneration'), true);
+    assert.notEqual(buildAgentIndex(), first);
 });
