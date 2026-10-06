@@ -95,19 +95,30 @@ function getConfiguredProjectPath(agentName, repoName, alias) {
 }
 
 function isRuntimeInstalled(runtime) {
-    try {
-        execSync(`command -v ${runtime}`, { stdio: 'ignore' });
-        return true;
-    } catch (_) {
-        return false;
+    const pathValue = process.env.PATH || '';
+    for (const dir of pathValue.split(path.delimiter)) {
+        if (!dir) continue;
+        try {
+            fs.accessSync(path.join(dir, runtime), fs.constants.X_OK);
+            return true;
+        } catch (_) {}
     }
+    return false;
 }
 
 let containerRuntime = null;
+// Only a positive Box probe is cached; a missing podman must keep failing closed on every call.
+const boxRuntimeCache = new Map();
 
 function probeContainerRuntime(boxMarkerPath) {
     if (isPloinkyBoxRuntime(boxMarkerPath)) {
+        const cacheKey = boxMarkerPath || PLOINKY_BOX_MARKER_PATH;
+        if (boxRuntimeCache.has(cacheKey)) {
+            containerRuntime = boxRuntimeCache.get(cacheKey);
+            return containerRuntime;
+        }
         if (isRuntimeInstalled('podman')) {
+            boxRuntimeCache.set(cacheKey, 'podman');
             containerRuntime = 'podman';
             return containerRuntime;
         }
