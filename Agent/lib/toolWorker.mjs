@@ -15,7 +15,8 @@
 //   pool -> worker  {"v":1,"type":"call","id","marker","toolName","toolEnv","envelope"}
 //   worker -> pool  {"v":1,"type":"result","id","exitCode","rssBytes","recycle"}
 //   worker -> pool  {"v":1,"type":"log","stream","text"}      output of no open call
-//   worker -> pool  {"v":1,"type":"exiting","startedCallId"}  fatal error outside a call
+//   worker -> pool  {"v":1,"type":"exiting","startedCallId"}  fatal error outside a call;
+//                   startedCallId is the last call this worker started (replied or not)
 //
 // Output. A call's output, from the handler and from tool children that
 // inherit fd 1/2, flows through the worker's stdout/stderr pipes, and the pool
@@ -202,6 +203,7 @@ export async function serveToolWorker(handler) {
     let envSnapshot = null;
     let cwdSnapshot = null;
     let baselineChildren = 0;
+    let lastStartedCallId = null;
     let poisoned = false;
     let exiting = false;
 
@@ -217,11 +219,13 @@ export async function serveToolWorker(handler) {
     function exitAfterFlush(code) {
         if (exiting) return;
         exiting = true;
-        // Name a started call (normally none) so the pool never re-runs it.
+        // Name the last call this worker started, replied or not, so the pool
+        // never runs it again: calls run one at a time, so any other call the
+        // pool sent was never started.
         sendFrame({
             v: TOOL_WORKER_PROTOCOL_VERSION,
             type: 'exiting',
-            startedCallId: activeCall && !activeCall.replied ? activeCall.id : null,
+            startedCallId: lastStartedCallId,
         });
         const flushed = new Promise((resolve) => channel.end(resolve));
         const bound = new Promise((resolve) => setTimeout(resolve, EXIT_FLUSH_TIMEOUT_MS));
@@ -340,6 +344,7 @@ export async function serveToolWorker(handler) {
             finalizing: null,
         };
         activeCall = call;
+        lastStartedCallId = call.id;
         process.exitCode = undefined;
         const toolEnv = frame.toolEnv && typeof frame.toolEnv === 'object' ? { ...frame.toolEnv } : {};
         const envelope = frame.envelope && typeof frame.envelope === 'object' ? frame.envelope : {};

@@ -20,6 +20,20 @@ if (process.env.FIXTURE_DELAY_BEFORE_SERVE_MS) {
     await new Promise((resolve) => setTimeout(resolve, Number(process.env.FIXTURE_DELAY_BEFORE_SERVE_MS)));
 }
 
+if (process.env.FIXTURE_DELAY_STDOUT_MS) {
+    // Models the pool reading socket frames before pipe bytes (Node orders
+    // nothing across fds): stdout bytes reach the pipe later than the write
+    // callback reports.
+    const delayMs = Number(process.env.FIXTURE_DELAY_STDOUT_MS);
+    const realWrite = process.stdout.write.bind(process.stdout);
+    process.stdout.write = (chunk, encoding, callback) => {
+        const cb = typeof encoding === 'function' ? encoding : callback;
+        setTimeout(() => realWrite(chunk), delayMs);
+        if (typeof cb === 'function') process.nextTick(cb);
+        return true;
+    };
+}
+
 const { serveToolWorker } = await import(process.env.PLOINKY_TOOL_WORKER_MODULE);
 
 // A tool child that looks for the worker's channel on fd 3: it reports what fd 3
@@ -156,6 +170,17 @@ await serveToolWorker(async ({ toolName, toolEnv, envelope, stdout }) => {
                 throw new Error('after reply');
             });
             stdout.write('X'.repeat(input.bytes || 10));
+            return 0;
+        case 'countThenLateThrowOnce':
+            // Counts handler runs; the first run fails 10 ms after replying.
+            fs.appendFileSync(input.runsFile, 'r');
+            if (!fs.existsSync(`${input.runsFile}.thrown`)) {
+                fs.writeFileSync(`${input.runsFile}.thrown`, '1');
+                setTimeout(() => {
+                    throw new Error('late after reply');
+                }, 10);
+            }
+            stdout.write('done');
             return 0;
         case 'exitCodeAndReturn':
             process.exitCode = 5;

@@ -612,6 +612,11 @@ export class ToolWorkerPool {
             stdout: Buffer.concat(call.output.stdout.chunks).toString('utf8'),
             stderr: Buffer.concat(call.output.stderr.chunks).toString('utf8'),
         });
+        // A worker that announced its exit is already on its way out.
+        if (worker.announcedExit) {
+            this.pump();
+            return;
+        }
         const rss = Number(frame.rssBytes);
         const recycle = frame.recycle === true
             || worker.dirty === true
@@ -796,11 +801,12 @@ export class ToolWorkerPool {
         }
     }
 
-    // The worker announced that it exits (a fatal error outside any call). A
-    // call sent to it that it reports as not started was never started (the
-    // worker starts no call after the announcement, and frames are ordered),
-    // so it goes back to the queue head. A started call is never re-run: it
-    // fails when the worker exits.
+    // The worker announced that it exits (a fatal error outside any call). It
+    // names the last call it started; it starts no call after the
+    // announcement, and frames are ordered. A sent call that is not the named
+    // one and has no result frame was therefore never started, and goes back
+    // to the queue head. Any other call is never run again: it completes from
+    // its result frame and end markers, or fails when the worker's exit settles.
     onWorkerExiting(worker, startedCallId) {
         worker.announcedExit = true;
         clearTimeout(worker.idleTimer);
@@ -809,7 +815,7 @@ export class ToolWorkerPool {
         worker.readyTimer = null;
         const sent = worker.call;
         worker.state = 'retiring';
-        if (sent && !sent.settled && sent.id !== startedCallId) {
+        if (sent && !sent.settled && sent.id !== startedCallId && !sent.resultFrame) {
             worker.call = null;
             sent.worker = null;
             sent.resultFrame = null;

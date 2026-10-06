@@ -331,6 +331,20 @@ test('a fatal error outside any call exits the worker with code 70', async (t) =
     assert.ok(logs.some((line) => line.includes('uncaught exception outside a call: late from A')));
 });
 
+test('D1: a call that already replied never runs again when its worker exits before its markers arrive', async (t) => {
+    const dir = makeDir(t);
+    const { pool } = makePool(t, dir, { size: 1, env: { FIXTURE_DELAY_STDOUT_MS: '50' } });
+    const runsFile = path.join(dir, 'runs');
+    const result = await callTool(pool, { mode: 'countThenLateThrowOnce', runsFile }, { timeoutMs: 10_000 });
+    await sleep(300);
+    assert.equal(fs.readFileSync(runsFile, 'utf8'), 'r', `handler runs for one call; result ${JSON.stringify(result)}`);
+    // The worker exited before its end markers reached the pipe, so the call
+    // cannot be completed; it fails instead of running a second time.
+    assert.notEqual(result.code, 0);
+    assert.match(result.stderr, /worker exited/);
+    assert.equal(pool.stats().spawned, 1);
+});
+
 test('a non-zero process.exitCode becomes the call exit code over the returned code', async (t) => {
     const dir = makeDir(t);
     const { pool } = makePool(t, dir, { size: 1 });
