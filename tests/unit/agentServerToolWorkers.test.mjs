@@ -271,8 +271,12 @@ test('S1: an opted-in tool reuses at most `size` warm workers; a tool without a 
     const spawnPids = [];
     for (let i = 0; i < 20; i += 1) spawnPids.push(Number(okText(await callTool(server, 'pid_spawn'))));
     assert.equal(new Set(spawnPids).size, 20, 'every spawn-mode call runs in its own process');
-    for (const pid of spawnPids) assert.ok(!loads.includes(pid));
-    assert.equal(workerLoads(fx).length, loads.length, 'spawn-mode calls start no worker');
+    // A second worker the pool started for the parallel batches may finish
+    // loading only now, so compare against the final load list.
+    const finalLoads = workerLoads(fx);
+    assert.ok(finalLoads.length <= 2, `worker loads: ${finalLoads.join(',')}`);
+    for (const pid of spawnPids) assert.ok(!finalLoads.includes(pid), `spawn-mode pid ${pid} is a worker`);
+    assert.equal(readLines(fx.files.calls).length, 20, 'no spawn-mode call ran in a worker');
 });
 
 test('S2: a call without a valid invocation token never reaches a worker', async (t) => {
