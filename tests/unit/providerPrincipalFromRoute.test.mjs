@@ -45,6 +45,8 @@ const keycloakDir = writeAgent(path.join(reposDir, 'basic', 'keycloak'), { ssoPr
 const postgresDir = writeAgent(path.join(reposDir, 'basic', 'postgres'), { about: 'postgres' });
 // The same bare agent name in a second installed repository.
 writeAgent(path.join(reposDir, 'otherRepo', 'dpuAgent'), { about: 'other dpu' });
+// Installed but neither routed nor enabled.
+writeAgent(path.join(reposDir, 'otherRepo', 'otherOnly'), { about: 'not routed' });
 
 function route(repo, agent, container, hostPath, extra = {}) {
     return { repo, agent, container, hostPath, hostPort: 7400 + Object.keys(ROUTES).length, ...extra };
@@ -100,6 +102,7 @@ const fsCounter = installFsCallCounter();
 const { applyEdgeRoutingGeneration } = await import('../../cli/sandbox/edgeGeneration.js');
 const { loadActiveRoutingState } = await import('../../cli/server/routingState.js');
 const { resolveProviderPrincipal } = await import('../../cli/server/mcp-proxy/invocationMinter.js');
+const { getAgentDescriptorByPrincipal, resolveAgentDescriptor } = await import('../../cli/utils/agentRegistry.js');
 const { AGENT_TARGET_AMBIGUOUS, resolveAgentTargetFromSnapshot } = await import('../../cli/utils/agentTargetResolver.js');
 const { deriveAgentPrincipalId } = await import('../../cli/utils/security/agentIdentity.js');
 const legacy = await import('./fixtures/legacyProviderPrincipal00c95dcc/invocationMinter.mjs');
@@ -295,6 +298,56 @@ test('Q4: the resolver reads deep-frozen snapshots without mutating them', () =>
     assert.throws(() => resolveAgentTargetFromSnapshot('dup', snapshot), { code: AGENT_TARGET_AMBIGUOUS });
     assert.equal(resolveProviderPrincipal({ providerAgentRef: 'soloAgent', snapshot }), 'agent:tools/soloAgent');
     assert.deepEqual(snapshot, pristine, 'the snapshot is unchanged');
+});
+
+test('F1: a qualified ref naming the checkout folder, not the canonical repository, is refused as at 00c95dcc', () => {
+    activateGeneration();
+    const legacyOutcome = (ref) => {
+        legacyRegistry.__internal.clearAgentIndexMemo();
+        return outcome(() => legacy.resolveProviderPrincipal({ providerAgentRef: ref }));
+    };
+    const legacyDescriptor = (ref) => {
+        legacyRegistry.__internal.clearAgentIndexMemo();
+        return legacyRegistry.resolveAgentDescriptor(ref);
+    };
+    const legacyByPrincipal = (principal) => {
+        legacyRegistry.__internal.clearAgentIndexMemo();
+        return legacyRegistry.getAgentDescriptorByPrincipal(principal);
+    };
+    // The checkout folder resolves to a repository path, but it is not a
+    // principal name: both implementations refuse every spelling.
+    assert.ok(fs.existsSync(path.join(checkout, 'explorer', 'manifest.json')));
+    for (const ref of ['AssistOSExplorer/explorer', 'AssistOSExplorer:gitAgent', 'AssistOSExplorer/dpuAgent']) {
+        assert.equal(legacyDescriptor(ref), null, `00c95dcc descriptor ${ref}`);
+        assert.equal(resolveAgentDescriptor(ref), null, `descriptor ${ref}`);
+        assert.equal(resolveAgentDescriptor(ref, { snapshot: loadActiveRoutingState().snapshot }), null, `routed descriptor ${ref}`);
+        assert.equal(legacyOutcome(ref), 'refused', `00c95dcc principal ${ref}`);
+        assert.equal(outcome(() => resolveProviderPrincipal({ providerAgentRef: ref })), 'refused', `principal ${ref}`);
+    }
+    for (const principal of ['agent:AssistOSExplorer/explorer', 'agent:AssistOSExplorer/gitAgent']) {
+        assert.equal(legacyByPrincipal(principal), null, `00c95dcc ${principal}`);
+        assert.equal(getAgentDescriptorByPrincipal(principal), null, principal);
+    }
+    // The canonical spelling of the same agents still resolves in both.
+    for (const ref of ['AchillesIDE/explorer', 'AchillesIDE/gitAgent']) {
+        const expected = `agent:${ref}`;
+        assert.equal(legacyDescriptor(ref)?.principalId, expected);
+        assert.equal(resolveAgentDescriptor(ref)?.principalId, expected);
+        assert.equal(getAgentDescriptorByPrincipal(expected)?.principalId, expected);
+        assert.equal(legacyOutcome(ref), expected);
+        assert.equal(resolveProviderPrincipal({ providerAgentRef: ref }), expected);
+    }
+});
+
+test('a dot-prefixed qualified ref never falls back to a bare-name lookup', () => {
+    activateGeneration();
+    // At 00c95dcc the './' prefix was stripped and the bare name searched
+    // every repository; the minter now keeps the parsed repo '.'.
+    legacyRegistry.__internal.clearAgentIndexMemo();
+    assert.equal(legacy.resolveProviderPrincipal({ providerAgentRef: './otherOnly' }), 'agent:otherRepo/otherOnly');
+    for (const ref of ['./otherOnly', './explorer', './explorer2', '.:otherOnly']) {
+        assert.equal(outcome(() => resolveProviderPrincipal({ providerAgentRef: ref })), 'refused', ref);
+    }
 });
 
 const SOURCE_AGENT = 'agent:OnlyOfficeAgent/onlyOffice';
