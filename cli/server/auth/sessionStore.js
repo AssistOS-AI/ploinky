@@ -6,6 +6,22 @@ const DEFAULT_PENDING_TTL_MS = 5 * 60 * 1000;
 function createSessionStore({ sessionTtlMs = DEFAULT_SESSION_TTL_MS, pendingTtlMs = DEFAULT_PENDING_TTL_MS } = {}) {
     const sessions = new Map();
     const pending = new Map();
+    let sweepIterator = null;
+
+    function sweepStep(limit) {
+        const now = Date.now();
+        if (!sweepIterator) sweepIterator = sessions.entries();
+        for (let examined = 0; examined < limit; examined += 1) {
+            let next = sweepIterator.next();
+            if (next.done) {
+                sweepIterator = sessions.entries();
+                next = sweepIterator.next();
+                if (next.done) break;
+            }
+            const [sid, session] = next.value;
+            if (session.expiresAt && now > session.expiresAt) sessions.delete(sid);
+        }
+    }
 
     function cleanupPending() {
         const now = Date.now();
@@ -42,7 +58,7 @@ function createSessionStore({ sessionTtlMs = DEFAULT_SESSION_TTL_MS, pendingTtlM
     }
 
     function createSession(record) {
-        cleanupSessions();
+        sweepStep(8);
         const sid = randomId(24);
         const now = Date.now();
         const expiresAt = record.expiresAt || (now + sessionTtlMs);
@@ -62,7 +78,7 @@ function createSessionStore({ sessionTtlMs = DEFAULT_SESSION_TTL_MS, pendingTtlM
 
     function getSession(sessionId) {
         if (!sessionId) return null;
-        cleanupSessions();
+        sweepStep(8);
         const session = sessions.get(sessionId);
         if (!session) return null;
         if (session.expiresAt && Date.now() > session.expiresAt) {
@@ -126,7 +142,8 @@ function createSessionStore({ sessionTtlMs = DEFAULT_SESSION_TTL_MS, pendingTtlM
         updateSession,
         deleteSession,
         deleteSessionsWhere,
-        getAllSessions
+        getAllSessions,
+        __testables: { size: () => sessions.size },
     };
 }
 

@@ -2,6 +2,10 @@ import fs from 'fs';
 import path from 'path';
 import { PLOINKY_DIR } from './config.js';
 import { inactivateEdgeRoutingGeneration } from '../sandbox/edgeGeneration.js';
+import { createValidatedJsonFileReader } from './validatedJsonFile.js';
+
+const agentsReader = createValidatedJsonFileReader();
+const emptySnapshot = Object.freeze({});
 
 function resolveWorkspaceRoot() {
     const explicitRoot = String(process.env.PLOINKY_WORKSPACE_ROOT || '').trim();
@@ -48,6 +52,7 @@ export function saveAgents(map, {
     const temporary = `${target}.${process.pid}.${Date.now()}.tmp`;
     fs.writeFileSync(temporary, JSON.stringify(map || {}, null, 2), { mode: 0o600 });
     fs.renameSync(temporary, target);
+    agentsReader.invalidate(target);
     if (coordinate) {
         inactivateEdgeRoutingGeneration('agents-candidate-change', {
             workspaceRoot: resolveWorkspaceRoot(),
@@ -80,6 +85,23 @@ export function removeAgent(containerName) {
 export function getConfig() {
     const map = loadAgents();
     return map._config || {};
+}
+
+export function readAgentsSnapshot() {
+    try {
+        const result = agentsReader.read(resolveAgentsFile());
+        if (result.exists) return result.value;
+        ensureDirs();
+        return emptySnapshot;
+    } catch (error) {
+        const wrapped = new Error(`agents registry is unreadable or corrupt: ${error?.message || error}`);
+        wrapped.code = 'EDGE_GENERATION_INVALID';
+        throw wrapped;
+    }
+}
+
+export function getConfigSnapshot() {
+    return readAgentsSnapshot()._config || emptySnapshot;
 }
 
 export function setConfig(cfg) {
