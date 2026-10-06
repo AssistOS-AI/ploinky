@@ -693,21 +693,21 @@ test('workspace upload reports filesystem capacity exhaustion as 507', async (t)
         chunks: ['x'],
     });
     const response = new MockResponse();
-    const originalOpenSync = fs.openSync;
-    fs.openSync = (...args) => {
+    const originalOpen = fs.promises.open;
+    fs.promises.open = async (...args) => {
         if (String(args[0]).includes('.ploinky-upload-')) {
             const error = new Error('No space left on device');
             error.code = 'ENOSPC';
             throw error;
         }
-        return originalOpenSync(...args);
+        return originalOpen(...args);
     };
 
     try {
         handleWorkspaceUpload(request, response, { workspaceRoot: root });
         await responseFinished(response);
     } finally {
-        fs.openSync = originalOpenSync;
+        fs.promises.open = originalOpen;
     }
 
     assert.equal(response.statusCode, 507);
