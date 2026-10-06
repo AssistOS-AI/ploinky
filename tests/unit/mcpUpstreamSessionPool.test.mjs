@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
-import { once } from 'node:events';
+import { EventEmitter, once } from 'node:events';
 import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 import http from 'node:http';
@@ -1261,4 +1261,110 @@ test('provider principal: the route key resolves to the same target with or with
         assert.equal(payload.sub, 'user:alice');
         assert.equal(payload.tool, 'actor');
     }
+});
+
+// ---------------------------------------------------------------------------
+// Deadline at dispatch: a request whose deadline passed before it could be sent
+// is not generation-checked, minted or sent.
+
+test('deadline: a session open that uses up the deadline sends and mints nothing', async (t) => {
+    const upstream = await startFakeUpstream(t, {
+        onRpc: async ({ res, message, state }) => {
+            if (message?.method === 'initialize') {
+                await new Promise((resolve) => setTimeout(resolve, 150));
+                res.writeHead(200, { 'content-type': 'application/json', 'mcp-session-id': `${state.sessionId}-slow` });
+                res.end(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { protocolVersion: '2025-06-18' } }));
+                return true;
+            }
+            if (message?.method === 'notifications/initialized') {
+                await new Promise((resolve) => setTimeout(resolve, 100));
+                res.writeHead(202);
+                res.end();
+                return true;
+            }
+            return false;
+        },
+    });
+    const pool = newPool(t);
+    const key = keyFor({ port: upstream.port });
+    let mints = 0;
+    const startedAt = Date.now();
+    const outcome = await pool.request({
+        key, hostPort: upstream.port, method: 'tools/list', params: {}, timeoutMs: 200,
+        headers: () => { mints += 1; return { authorization: 'Bearer late' }; },
+        beforeDial: () => true,
+    }).then(() => null, (error) => error);
+    assert.ok(Date.now() - startedAt >= 200, 'the session open took longer than the deadline');
+    assert.equal(mints, 0, 'never minted');
+    assert.equal(upstream.log.some((row) => row.rpc === 'tools/list'), false, 'never sent');
+    assert.ok(outcome?.code === 'UPSTREAM_TRANSPORT' && outcome?.timedOut === true, `timed out: ${outcome?.message}`);
+    assert.equal(pool.isReady(key), false);
+});
+
+test('deadline: a queued request granted after its deadline sends and mints nothing', async () => {
+    // Fake transport so the slot release and the stall happen in one macrotask.
+    const sent = [];
+    const held = [];
+    const respond = (req, status, headers, body) => {
+        const res = new EventEmitter();
+        res.statusCode = status;
+        res.headers = headers;
+        res.resume = () => {};
+        req.emit('response', res);
+        if (body !== undefined) res.emit('data', Buffer.from(JSON.stringify(body)));
+        res.emit('end');
+    };
+    const httpImpl = {
+        Agent: class { destroy() {} },
+        request(options) {
+            const req = new EventEmitter();
+            req.destroy = (error) => { req.destroyed = true; if (error) setImmediate(() => req.emit('error', error)); };
+            req.end = (payload) => {
+                const body = payload ? JSON.parse(payload.toString()) : null;
+                sent.push({ method: options.method, rpc: body?.method, name: body?.params?.name, timeout: options.timeout });
+                if (options.method === 'DELETE') return setImmediate(() => respond(req, 200, {}, undefined));
+                if (body.method === 'initialize') {
+                    return setImmediate(() => respond(req, 200, { 'content-type': 'application/json', 'mcp-session-id': 's1' },
+                        { jsonrpc: '2.0', id: body.id, result: { protocolVersion: '2025-06-18' } }));
+                }
+                if (body.method === 'notifications/initialized') return setImmediate(() => respond(req, 202, {}, undefined));
+                const reply = () => respond(req, 200, { 'content-type': 'application/json' },
+                    { jsonrpc: '2.0', id: body.id, result: { content: [{ type: 'text', text: String(body.params?.name) }] } });
+                if (body.params?.name === 'slow') { held.push(reply); return undefined; }
+                return setImmediate(() => { if (!req.destroyed) reply(); });
+            };
+            return req;
+        },
+    };
+    const pool = createUpstreamSessionPool({ httpImpl });
+    const key = keyFor({ port: 7001 });
+    const call = (name, extra = {}) => pool.request({
+        key, hostPort: 7001, method: 'tools/call', params: { name, arguments: {} },
+        headers: { authorization: 'Bearer x' }, beforeDial: () => true, timeoutMs: 10_000, ...extra,
+    });
+    await call('warm');
+    const slow = Array.from({ length: 8 }, () => call('slow'));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const deadline = Date.now() + 200;
+    let checks = 0;
+    let mints = 0;
+    const ninth = call('ninth', {
+        timeoutMs: 200,
+        beforeDial: () => { checks += 1; return true; },
+        headers: () => { mints += 1; return { authorization: 'Bearer ninth' }; },
+    });
+    setTimeout(() => {
+        // An event-loop stall crosses the deadline, then a slot is released in
+        // the same macrotask, before the queue timer can run.
+        while (Date.now() < deadline + 60) { /* stall */ }
+        held.shift()();
+    }, 100);
+    const outcome = await ninth.then(() => null, (error) => error);
+    assert.equal(mints, 0, 'never minted');
+    assert.equal(sent.some((row) => row.name === 'ninth'), false, 'never sent');
+    assert.equal(checks, 0, 'no generation check');
+    assert.ok(outcome?.code === 'UPSTREAM_TRANSPORT' && outcome?.timedOut === true, `timed out: ${outcome?.message}`);
+    for (const reply of held.splice(0)) reply();
+    for (const result of await Promise.allSettled(slow)) assert.equal(result.status, 'fulfilled');
+    await pool.closeAll();
 });

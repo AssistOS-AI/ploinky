@@ -308,6 +308,15 @@ export function createUpstreamSessionPool({
         }
     }
 
+    // Raised when a request's deadline passes before it is dispatched; nothing
+    // was checked, minted or sent for it.
+    function deadlineExpired() {
+        return poolError(UPSTREAM_TRANSPORT, 'MCP error -32001: Request timed out', {
+            timedOut: true,
+            queued: true,
+        });
+    }
+
     // Requests beyond MAX_INFLIGHT_PER_ENTRY wait here, before their generation
     // check and mint; the wait is bounded by the request's own deadline and a
     // timed-out or rejected waiter has sent nothing.
@@ -323,10 +332,7 @@ export function createUpstreamSessionPool({
                 waiter.done = true;
                 const index = entry.waiters.indexOf(waiter);
                 if (index >= 0) entry.waiters.splice(index, 1);
-                reject(poolError(UPSTREAM_TRANSPORT, 'MCP error -32001: Request timed out', {
-                    timedOut: true,
-                    queued: true,
-                }));
+                reject(deadlineExpired());
             }, Math.max(0, deadline - Date.now()));
             waiter.timer.unref?.();
             entry.waiters.push(waiter);
@@ -593,6 +599,10 @@ export function createUpstreamSessionPool({
             const waiting = takeSlot(entry, deadline);
             if (waiting) await waiting;
             holdsSlot = true;
+            // A slow session open, or a slot granted late (for example after an
+            // event-loop stall), can use up the deadline: fail before the
+            // generation check, the mint and the POST.
+            if (Date.now() >= deadline) throw deadlineExpired();
             if (entry.closed || !entry.sessionId) {
                 throw poolError(UPSTREAM_SESSION_LOST, 'upstream MCP session closed before dispatch', { retryable: true });
             }
