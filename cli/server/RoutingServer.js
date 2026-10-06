@@ -2,7 +2,7 @@ import http from 'http';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 
 import { handleWebChat } from './handlers/webchat/index.js';
 import { handleStatus, streamWorkspaceMetrics } from './handlers/status.js';
@@ -1218,16 +1218,18 @@ server.listen(port, '0.0.0.0', () => {
     // CRITICAL: Process count monitoring to prevent spawn leaks
     const PROCESS_MONITOR_INTERVAL = 60 * 1000; // 1 minute
     const MAX_SAFE_NODE_PROCESSES = 15;
+    let processMonitorInFlight = false;
     const processMonitor = setInterval(() => {
         if (lifecycle.isShuttingDown()) return;
+        if (processMonitorInFlight) return;
+        processMonitorInFlight = true;
 
+        execFile('ps', ['aux'], { encoding: 'utf8', timeout: 5000, maxBuffer: 8 * 1024 * 1024 }, (psError, psOutput) => {
+        processMonitorInFlight = false;
+        if (psError || lifecycle.isShuttingDown()) return;
         try {
-            const { execSync } = require('child_process');
-            const output = execSync('ps aux | grep -E "node|startFlow" | grep -v grep | wc -l', {
-                encoding: 'utf8',
-                timeout: 5000
-            }).trim();
-            const nodeProcessCount = parseInt(output, 10);
+            const nodeProcessCount = String(psOutput || '').split('\n')
+                .filter((line) => /node|startFlow/.test(line) && !line.includes('grep')).length;
 
             if (nodeProcessCount > MAX_SAFE_NODE_PROCESSES) {
                 const warning = {
@@ -1264,6 +1266,7 @@ server.listen(port, '0.0.0.0', () => {
         } catch (err) {
             // Silently fail - don't crash if ps command fails
         }
+        });
     }, PROCESS_MONITOR_INTERVAL);
 
     // Clean up intervals on shutdown
