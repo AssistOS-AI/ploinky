@@ -6,7 +6,7 @@ import { fileURLToPath, pathToFileURL } from 'url';
 import { createSessionStore } from './sessionStore.js';
 import { randomId } from './utils.js';
 import { resolveVarValue } from '../../utils/security/secretVars.js';
-import { getConfig as getWorkspaceConfig } from '../../utils/workspace.js';
+import { getConfig as getWorkspaceConfig, getConfigSnapshot } from '../../utils/workspace.js';
 import { resolveAgentDescriptor } from '../../utils/agentRegistry.js';
 import { findAgent } from '../../utils/utils.js';
 import { emitAuthenticationSessionInvalidated } from './sessionEvents.js';
@@ -80,7 +80,7 @@ async function loadProviderModule(providerAgentRef) {
 
 function readSsoConfig() {
     let workspaceConfig;
-    try { workspaceConfig = getWorkspaceConfig(); } catch (_) { workspaceConfig = {}; }
+    try { workspaceConfig = getConfigSnapshot(); } catch (_) { workspaceConfig = {}; }
     return workspaceConfig?.sso && typeof workspaceConfig.sso === 'object' ? workspaceConfig.sso : {};
 }
 

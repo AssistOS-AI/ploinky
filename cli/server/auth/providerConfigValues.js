@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import { resolveAgentManifestLocation } from '../../utils/agentRegistry.js';
-import { loadAgents } from '../../utils/workspace.js';
+import { readAgentsSnapshot } from '../../utils/workspace.js';
 import { loadActiveRoutingState } from '../routingState.js';
 import { resolveManifestRuntimeProfile } from '../../utils/runtime/profileService.js';
 import { buildEnvMap, getManifestEnvSpecs } from '../../utils/security/secretVars.js';
@@ -26,7 +26,7 @@ export function createProviderConfigReader(providerAgentRef, readExplicitValue, 
     if (!located) throw new Error(`Agent '${providerAgentRef}' not found.`);
     const resolved = { manifestPath: located.manifestPath, repo: located.repo, shortAgentName: located.agent };
     const manifest = JSON.parse(fs.readFileSync(resolved.manifestPath, 'utf8'));
-    const record = Object.values(loadAgents()).find((entry) => entry?.type === 'agent'
+    const record = Object.values(readAgentsSnapshot()).find((entry) => entry?.type === 'agent'
         && entry.repoName === resolved.repo && entry.agentName === resolved.shortAgentName && !entry.alias);
     const { profileConfig } = resolveManifestRuntimeProfile(manifest, {
         agentName: `${resolved.repo}/${resolved.shortAgentName}`,
