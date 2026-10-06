@@ -14,7 +14,14 @@
 // the call's random end marker on each stream; the call resolves once its
 // result frame and both markers have arrived. Pipe output outside a call goes
 // to the host log, never into a call; an idle worker that still produces it
-// is replaced. Pools never retry a call, never
+// is replaced.
+//
+// Fresh code. With a `codeIdentity()` hook (a stamp of the agent's code,
+// manifest and generation), every worker records the identity it was spawned
+// under, and the pool reads the hook before every dispatch: a worker whose
+// identity differs never gets another call and is replaced. Nothing is cached
+// by time. If the hook fails, the call runs through the spawn fallback, which
+// always loads current code. Pools never retry a call, never
 // log frames (they can carry invocation tokens) and never leave a worker
 // process group behind: timeouts, crashes, recycling and shutdown all end with
 // a SIGKILL to the worker's process group.
@@ -225,6 +232,7 @@ export class ToolWorkerPool {
         this.maxFrameBytes = positiveInteger(options.maxFrameBytes, TOOL_WORKER_DEFAULTS.maxFrameBytes);
         this.log = typeof options.log === 'function' ? options.log : defaultLog;
         this.now = typeof options.now === 'function' ? options.now : Date.now;
+        this.codeIdentity = typeof options.codeIdentity === 'function' ? options.codeIdentity : null;
 
         this.workers = new Set();
         this.queue = [];
@@ -340,9 +348,9 @@ export class ToolWorkerPool {
         });
     }
 
-    async runFallback(fallback) {
+    async runFallback(fallback, reason = 'is degraded') {
         if (typeof fallback !== 'function') {
-            return failureResult(`tool worker pool '${this.name}' is degraded and no spawn fallback was supplied`);
+            return failureResult(`tool worker pool '${this.name}' ${reason} and no spawn fallback was supplied`);
         }
         this.counters.fallbacks += 1;
         try {
@@ -372,12 +380,46 @@ export class ToolWorkerPool {
         return null;
     }
 
+    // The current code identity, read from the hook on every use (no caching).
+    readIdentity() {
+        if (!this.codeIdentity) return { ok: true, value: null };
+        try {
+            return { ok: true, value: String(this.codeIdentity()) };
+        } catch (error) {
+            this.log(`[toolWorkerPool:${this.name}] codeIdentity failed (${error?.message || error}); using the spawn fallback`);
+            return { ok: false, value: undefined };
+        }
+    }
+
+    // Before every dispatch: retire idle workers spawned under another code
+    // identity and pick a current one.
+    takeCurrentWorker() {
+        const identity = this.readIdentity();
+        if (!identity.ok) return { identityError: true, worker: null };
+        let found = null;
+        for (const worker of [...this.workers]) {
+            if (worker.state !== 'idle') continue;
+            if (worker.identity !== identity.value) {
+                this.log(`${this.prefix(worker)} tool code changed; replacing the worker`);
+                this.counters.recycled += 1;
+                this.retire(worker);
+                continue;
+            }
+            if (!found) found = worker;
+        }
+        return { identityError: false, worker: found };
+    }
+
     pump() {
         if (this.shuttingDown) return;
         while (this.queue.length) {
-            const worker = this.findIdleWorker();
-            if (!worker) break;
-            this.dispatch(worker, this.queue.shift());
+            const pick = this.takeCurrentWorker();
+            if (pick.identityError) {
+                this.runQueuedOnFallback(this.queue.shift(), 'tool code identity could not be read');
+                continue;
+            }
+            if (!pick.worker) break;
+            this.dispatch(pick.worker, this.queue.shift());
         }
         // Workers being retired still count toward `size` until they exit.
         while (this.queue.length > this.countWorkers('starting') && this.workers.size < this.size) {
@@ -415,6 +457,7 @@ export class ToolWorkerPool {
             idleTimer: null,
             readyTimer: null,
             gone: false,
+            identity: this.readIdentity().value,
         };
         this.workers.add(worker);
         worker.readyTimer = setTimeout(() => {
@@ -746,11 +789,9 @@ export class ToolWorkerPool {
             this.retire(worker);
             return;
         }
-        const next = this.queue.shift();
-        if (next) {
-            this.dispatch(worker, next);
-            return;
-        }
+        // Queued calls go through pump(), which validates the code identity.
+        if (this.queue.length) this.pump();
+        if (worker.state !== 'idle') return;
         clearTimeout(worker.idleTimer);
         worker.idleTimer = setTimeout(() => {
             if (worker.state !== 'idle') return;
@@ -911,16 +952,17 @@ export class ToolWorkerPool {
     }
 
     drainQueueToFallback() {
-        const waiting = this.queue.splice(0);
-        for (const call of waiting) {
-            if (call.settled) continue;
-            clearTimeout(call.timer);
-            call.timer = null;
-            call.settled = true;
-            Promise.resolve()
-                .then(() => this.runFallback(call.fallback))
-                .then(call.resolve);
-        }
+        for (const call of this.queue.splice(0)) this.runQueuedOnFallback(call, 'is degraded');
+    }
+
+    runQueuedOnFallback(call, reason) {
+        if (!call || call.settled) return;
+        clearTimeout(call.timer);
+        call.timer = null;
+        call.settled = true;
+        Promise.resolve()
+            .then(() => this.runFallback(call.fallback, reason === 'is degraded' ? reason : `cannot run the call (${reason})`))
+            .then(call.resolve);
     }
 
     notifyExitWaiters() {
@@ -985,10 +1027,12 @@ export class ToolWorkerPool {
  * `shutdownToolWorkerPools`.
  *
  * @param {object} config agent MCP config
- * @param {{ buildCommandSpec: Function, defaultCwd?: string, log?: Function }} deps
+ * @param {{ buildCommandSpec: Function, defaultCwd?: string, log?: Function, codeIdentity?: (poolName: string) => string }} deps
+ *   `codeIdentity(poolName)` returns a stamp of the pool's tool code, manifest
+ *   and generation; it is read before every dispatch (see ToolWorkerPool).
  * @returns {Map<string, ToolWorkerPool>}
  */
-export function createToolWorkerPools(config, { buildCommandSpec, defaultCwd, log } = {}) {
+export function createToolWorkerPools(config, { buildCommandSpec, defaultCwd, log, codeIdentity } = {}) {
     const pools = new Map();
     const declarations = config && typeof config === 'object' ? config.toolWorkers : null;
     if (!declarations || typeof declarations !== 'object' || Array.isArray(declarations)) return pools;
@@ -1020,6 +1064,7 @@ export function createToolWorkerPools(config, { buildCommandSpec, defaultCwd, lo
             idleTimeoutMs: declaration.idleTimeoutMs,
             maxFrameBytes: declaration.maxFrameBytes,
             log: logLine,
+            codeIdentity: typeof codeIdentity === 'function' ? () => codeIdentity(name) : undefined,
         });
         pools.set(name, pool);
         registeredPools.add(pool);

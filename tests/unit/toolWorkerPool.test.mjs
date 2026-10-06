@@ -575,6 +575,65 @@ test('D2: workers that fail right after ready degrade the pool within a bounded 
     assert.equal(fallbacks, 1);
 });
 
+function codeStamp(file) {
+    const stat = fs.statSync(file, { bigint: true });
+    return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+}
+
+function codeVersion(result) {
+    assert.equal(result.code, 0, result.stderr);
+    return JSON.parse(result.stdout);
+}
+
+test('fresh code: a change to the tool code is visible on the very next call', async (t) => {
+    const dir = makeDir(t);
+    const codeFile = path.join(dir, 'tool-code.txt');
+    fs.writeFileSync(codeFile, 'v1');
+    const { pool, logs } = makePool(t, dir, { size: 1, env: { FIXTURE_CODE_FILE: codeFile }, codeIdentity: () => codeStamp(codeFile) });
+    const first = codeVersion(await callTool(pool, { mode: 'codeVersion' }));
+    assert.equal(first.version, 'v1');
+    assert.equal(codeVersion(await callTool(pool, { mode: 'codeVersion' })).pid, first.pid, 'unchanged code keeps the warm worker');
+
+    fs.writeFileSync(codeFile, 'v2');
+    const second = codeVersion(await callTool(pool, { mode: 'codeVersion' }));
+    assert.equal(second.version, 'v2');
+    assert.notEqual(second.pid, first.pid);
+    assert.ok(logs.some((line) => line.includes('tool code changed; replacing the worker')));
+});
+
+test('fresh code: a worker that is busy when the code changes is replaced after its call', async (t) => {
+    const dir = makeDir(t);
+    const codeFile = path.join(dir, 'tool-code.txt');
+    fs.writeFileSync(codeFile, 'v1');
+    const { pool } = makePool(t, dir, { size: 1, env: { FIXTURE_CODE_FILE: codeFile }, codeIdentity: () => codeStamp(codeFile) });
+    const busy = callTool(pool, { mode: 'codeVersion', ms: 400 });
+    assert.ok(await waitUntil(() => pool.stats().busy === 1, 5000));
+    const queued = callTool(pool, { mode: 'codeVersion' });
+    fs.writeFileSync(codeFile, 'v2-longer');
+    const busyResult = codeVersion(await busy);
+    assert.equal(busyResult.version, 'v1', 'the running call finishes on the code it started with');
+    const next = codeVersion(await queued);
+    assert.equal(next.version, 'v2-longer');
+    assert.notEqual(next.pid, busyResult.pid);
+});
+
+test('fresh code: a failing codeIdentity hook sends calls to the spawn fallback', async (t) => {
+    const dir = makeDir(t);
+    const { pool, logs } = makePool(t, dir, {
+        size: 1,
+        codeIdentity: () => {
+            throw new Error('tool command missing');
+        },
+    });
+    const fallback = async () => ({ code: 0, signal: null, stdout: 'from-spawn-fallback', stderr: '' });
+    const result = await callTool(pool, { mode: 'echo' }, { fallback });
+    assert.equal(result.stdout, 'from-spawn-fallback');
+    const noFallback = await callTool(pool, { mode: 'echo' });
+    assert.notEqual(noFallback.code, 0);
+    assert.match(noFallback.stderr, /code identity could not be read/);
+    assert.ok(logs.some((line) => line.includes('codeIdentity failed (tool command missing)')));
+});
+
 test('T15: SIGKILL of the host process ends its workers within 2 s', async (t) => {
     const dir = makeDir(t);
     const pidDir = path.join(dir, 'pids');

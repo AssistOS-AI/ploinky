@@ -36,6 +36,11 @@ if (process.env.FIXTURE_DELAY_STDOUT_MS) {
 
 const { serveToolWorker } = await import(process.env.PLOINKY_TOOL_WORKER_MODULE);
 
+// Stands in for the tool's code: read once, when the worker loads.
+const loadedCodeVersion = process.env.FIXTURE_CODE_FILE
+    ? fs.readFileSync(process.env.FIXTURE_CODE_FILE, 'utf8')
+    : null;
+
 // A tool child that looks for the worker's channel on fd 3: it reports what fd 3
 // is and tries to forge a result frame there.
 const FD3_PROBE = `
@@ -181,6 +186,10 @@ await serveToolWorker(async ({ toolName, toolEnv, envelope, stdout }) => {
                 }, 10);
             }
             stdout.write('done');
+            return 0;
+        case 'codeVersion':
+            await sleep(input.ms || 0);
+            stdout.write(JSON.stringify({ version: loadedCodeVersion, pid: process.pid }));
             return 0;
         case 'exitCodeAndReturn':
             process.exitCode = 5;
