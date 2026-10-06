@@ -217,3 +217,10 @@ await serveToolWorker(async ({ toolName, toolEnv, envelope, stdout }) => {
             return 2;
     }
 });
+
+if (process.env.FIXTURE_THROW_AFTER_READY === '1') {
+    // A module-level failure right after `ready` (e.g. a failing warm-up).
+    setImmediate(() => {
+        throw new Error('module-level failure after ready');
+    });
+}

@@ -42,10 +42,13 @@ export const TOOL_WORKER_DEFAULTS = Object.freeze({
     maxFrameBytes: 256 * 1024 * 1024,
 });
 
-// Consecutive deaths before `ready` (no worker became ready in between) that
-// mark the command broken. Counting consecutive deaths, not deaths inside a
-// fixed time window, also catches workers that hang until readyTimeoutMs.
-const PRE_READY_DEATH_LIMIT = 3;
+// Consecutive workers that died before completing any call (before `ready`,
+// or after it without the pool ending them), with no call completed in
+// between, mark the command broken. Counting consecutive deaths, not deaths
+// inside a fixed time window, also catches workers that hang until
+// readyTimeoutMs; counting deaths after `ready` catches workers that fail
+// right after announcing it.
+const UNPRODUCTIVE_DEATH_LIMIT = 3;
 const DEGRADED_MS = 60_000;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 20_000;
 // After a worker exits, frames and output it wrote just before can still be
@@ -226,7 +229,7 @@ export class ToolWorkerPool {
         this.workers = new Set();
         this.queue = [];
         this.nextCallId = 1;
-        this.preReadyDeaths = 0;
+        this.unproductiveDeaths = 0;
         this.degradedUntil = 0;
         this.shuttingDown = false;
         this.shutdownPromise = null;
@@ -606,6 +609,7 @@ export class ToolWorkerPool {
         worker.call = null;
         worker.calls += 1;
         this.counters.completed += 1;
+        this.unproductiveDeaths = 0;
         this.settle(call, {
             code: Number.isInteger(frame.exitCode) ? frame.exitCode : 1,
             signal: null,
@@ -675,7 +679,7 @@ export class ToolWorkerPool {
         socket.on('data', (chunk) => decoder.push(chunk));
         // A worker that closes its channel can no longer answer: end it.
         socket.on('end', () => {
-            if (worker.gone) return;
+            if (worker.gone || worker.endTimer) return;
             worker.endTimer = setTimeout(() => this.retire(worker), CHANNEL_END_GRACE_MS);
             worker.endTimer.unref?.();
         });
@@ -708,7 +712,6 @@ export class ToolWorkerPool {
             clearTimeout(worker.readyTimer);
             worker.readyTimer = null;
             worker.state = 'idle';
-            this.preReadyDeaths = 0;
             this.becomeIdle(worker);
             return;
         }
@@ -784,6 +787,7 @@ export class ToolWorkerPool {
     // counting toward `size` until its exit is observed.
     retire(worker) {
         if (worker.gone) return;
+        worker.retiredByPool = true;
         clearTimeout(worker.idleTimer);
         worker.idleTimer = null;
         if (worker.state !== 'starting') {
@@ -817,6 +821,15 @@ export class ToolWorkerPool {
         worker.state = 'retiring';
         if (sent && !sent.settled && sent.id !== startedCallId && !sent.resultFrame) {
             worker.call = null;
+            if (sent.requeued) {
+                // Bounded: a call is put back once. A second unstarted loss
+                // fails it (it never ran, so failing is safe).
+                this.settle(sent, failureResult('tool worker exited twice before starting the call'));
+                this.scheduleExitKill(worker);
+                this.pump();
+                return;
+            }
+            sent.requeued = true;
             sent.worker = null;
             sent.resultFrame = null;
             sent.outputBytes = 0;
@@ -827,9 +840,17 @@ export class ToolWorkerPool {
             }
             this.queue.unshift(sent);
         }
-        worker.endTimer = setTimeout(() => killWorkerGroup(worker.child), CHANNEL_END_GRACE_MS);
-        worker.endTimer.unref?.();
+        this.scheduleExitKill(worker);
         this.pump();
+    }
+
+    // Give a worker that announced its exit a short grace, then kill its group.
+    scheduleExitKill(worker) {
+        clearTimeout(worker.endTimer);
+        worker.endTimer = setTimeout(() => {
+            if (!worker.gone) killWorkerGroup(worker.child);
+        }, CHANNEL_END_GRACE_MS);
+        worker.endTimer.unref?.();
     }
 
     // The leader exited. Kill the rest of its group so the pipes close, then
@@ -868,8 +889,8 @@ export class ToolWorkerPool {
             this.counters.crashes += 1;
             this.failBusyCall(worker, `tool worker exited (code ${code}, signal ${signal}) during the call`);
         }
-        if (wasStarting && !this.shuttingDown) {
-            this.recordPreReadyDeath();
+        if (!this.shuttingDown && (wasStarting || (worker.calls === 0 && !worker.retiredByPool))) {
+            this.recordUnproductiveDeath();
         }
         this.notifyExitWaiters();
         if (this.isDegraded()) {
@@ -879,12 +900,12 @@ export class ToolWorkerPool {
         this.pump();
     }
 
-    recordPreReadyDeath() {
-        this.preReadyDeaths += 1;
-        if (this.preReadyDeaths >= PRE_READY_DEATH_LIMIT) {
-            this.preReadyDeaths = 0;
+    recordUnproductiveDeath() {
+        this.unproductiveDeaths += 1;
+        if (this.unproductiveDeaths >= UNPRODUCTIVE_DEATH_LIMIT) {
+            this.unproductiveDeaths = 0;
             this.degradedUntil = this.now() + DEGRADED_MS;
-            this.log(`[toolWorkerPool:${this.name}] ${PRE_READY_DEATH_LIMIT} consecutive workers died before ready; degraded for ${DEGRADED_MS}ms (spawn fallback)`);
+            this.log(`[toolWorkerPool:${this.name}] ${UNPRODUCTIVE_DEATH_LIMIT} consecutive workers exited before completing a call; degraded for ${DEGRADED_MS}ms (spawn fallback)`);
             this.drainQueueToFallback();
         }
     }

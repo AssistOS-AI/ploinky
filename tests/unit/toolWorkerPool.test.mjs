@@ -554,6 +554,27 @@ test('the handshake socket rejects a peer without the bootstrap token', async (t
     assert.equal(fs.existsSync(path.dirname(socketPath)), false, 'the socket directory is removed after the handshake');
 });
 
+test('D2: workers that fail right after ready degrade the pool within a bounded number of spawns', async (t) => {
+    const dir = makeDir(t);
+    const { pool } = makePool(t, dir, { size: 1, env: { FIXTURE_THROW_AFTER_READY: '1' } });
+    let fallbacks = 0;
+    const fallback = async () => {
+        fallbacks += 1;
+        return { code: 0, signal: null, stdout: 'from-spawn-fallback', stderr: '' };
+    };
+    // Put back once after the first worker died, then failed: it never ran.
+    const first = await callTool(pool, { mode: 'echo' }, { fallback, timeoutMs: 10_000 });
+    assert.notEqual(first.code, 0, JSON.stringify(first));
+    assert.match(first.stderr, /exited twice before starting the call/);
+    assert.equal(pool.stats().spawned, 2);
+    // The third worker that exits without completing a call degrades the pool.
+    const second = await callTool(pool, { mode: 'echo' }, { fallback, timeoutMs: 10_000 });
+    assert.equal(second.stdout, 'from-spawn-fallback', JSON.stringify(second));
+    assert.equal(pool.stats().degraded, true);
+    assert.equal(pool.stats().spawned, 3);
+    assert.equal(fallbacks, 1);
+});
+
 test('T15: SIGKILL of the host process ends its workers within 2 s', async (t) => {
     const dir = makeDir(t);
     const pidDir = path.join(dir, 'pids');
