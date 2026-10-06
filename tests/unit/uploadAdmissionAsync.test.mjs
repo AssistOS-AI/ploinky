@@ -699,50 +699,63 @@ test('1000-blob inventory workload has strict event-loop maximum below 5ms and b
     let maximum = 0;
     let calls = 0;
     const syncCalls = {};
-    for (const name of ['realpathSync', 'lstatSync', 'readdirSync', 'openSync', 'closeSync',
-        'renameSync', 'linkSync', 'unlinkSync']) {
-        const originalSync = fs[name];
-        const wrapped = (...args) => {
-            syncCalls[name] = (syncCalls[name] || 0) + 1;
-            return originalSync(...args);
-        };
-        const native = originalSync.native;
-        t.mock.method(fs, name, wrapped);
-        if (native) t.mock.method(fs[name], 'native', (...args) => {
-            syncCalls[`${name}.native`] = (syncCalls[`${name}.native`] || 0) + 1;
-            return native(...args);
+    const restore = [];
+    const replace = (object, name, implementation) => {
+        const original = object[name];
+        object[name] = implementation;
+        restore.push(() => { object[name] = original; });
+    };
+    let histogram;
+    // Call-history mocks retain every stat result and stack inside the timing window.
+    try {
+        for (const name of ['realpathSync', 'lstatSync', 'readdirSync', 'openSync', 'closeSync',
+            'renameSync', 'linkSync', 'unlinkSync']) {
+            const originalSync = fs[name];
+            const wrapped = (...args) => {
+                syncCalls[name] = (syncCalls[name] || 0) + 1;
+                return originalSync(...args);
+            };
+            const native = originalSync.native;
+            if (native) wrapped.native = (...args) => {
+                syncCalls[`${name}.native`] = (syncCalls[`${name}.native`] || 0) + 1;
+                return native(...args);
+            };
+            replace(fs, name, wrapped);
+        }
+        const original = fs.promises.lstat;
+        replace(fs.promises, 'lstat', async (...args) => {
+            active += 1;
+            calls += 1;
+            maximum = Math.max(maximum, active);
+            try { return await original(...args); } finally { active -= 1; }
         });
+        histogram = monitorEventLoopDelay({ resolution: 1 });
+        histogram.enable();
+        await delay(3);
+        histogram.reset();
+        const latencies = [];
+        for (let i = 0; i < 10; i += 1) {
+            const started = performance.now();
+            const item = upload(root, `new-${i}`, {
+                policy: { ...policy, maxFiles: 1024, maxStorageBytes: 100000, timeoutMs: 120000 },
+                includeEntry: ({ relativePath }) => !relativePath.endsWith('.json'),
+            });
+            assert.equal((await item.accepted).accepted, true);
+            latencies.push(performance.now() - started);
+            item.req.end('x');
+            assert.equal((await item.done).ok, true);
+        }
+        histogram.disable();
+        latencies.sort((a, b) => a - b);
+        t.diagnostic(JSON.stringify({ reservationP50Ms: latencies[5], reservationP99Ms: latencies[9],
+            eventLoopMaxMs: histogram.max / 1e6, eventLoopP99Ms: histogram.percentile(99) / 1e6,
+            lstatCalls: calls, maximumLstatConcurrency: maximum, syncCalls }));
+        assert.ok(maximum <= 16);
+        assert.ok(calls >= 40000);
+        assert.deepEqual(syncCalls, { lstatSync: 20, 'realpathSync.native': 10 });
+        assert.ok(histogram.max / 1e6 < 5, `event-loop max ${histogram.max / 1e6}ms must be <5ms`);
+    } finally {
+        histogram?.disable();
+        while (restore.length) restore.pop()();
     }
-    const original = fs.promises.lstat;
-    t.mock.method(fs.promises, 'lstat', async (...args) => {
-        active += 1;
-        calls += 1;
-        maximum = Math.max(maximum, active);
-        try { return await original(...args); } finally { active -= 1; }
-    });
-    const histogram = monitorEventLoopDelay({ resolution: 1 });
-    histogram.enable();
-    await delay(3);
-    histogram.reset();
-    const latencies = [];
-    for (let i = 0; i < 10; i += 1) {
-        const started = performance.now();
-        const item = upload(root, `new-${i}`, {
-            policy: { ...policy, maxFiles: 1024, maxStorageBytes: 100000, timeoutMs: 120000 },
-            includeEntry: ({ relativePath }) => !relativePath.endsWith('.json'),
-        });
-        assert.equal((await item.accepted).accepted, true);
-        latencies.push(performance.now() - started);
-        item.req.end('x');
-        assert.equal((await item.done).ok, true);
-    }
-    histogram.disable();
-    latencies.sort((a, b) => a - b);
-    t.diagnostic(JSON.stringify({ reservationP50Ms: latencies[5], reservationP99Ms: latencies[9],
-        eventLoopMaxMs: histogram.max / 1e6, eventLoopP99Ms: histogram.percentile(99) / 1e6,
-        lstatCalls: calls, maximumLstatConcurrency: maximum, syncCalls }));
-    assert.ok(maximum <= 16);
-    assert.ok(calls >= 40000);
-    assert.deepEqual(syncCalls, { lstatSync: 20, 'realpathSync.native': 10 });
-    assert.ok(histogram.max / 1e6 < 5, `event-loop max ${histogram.max / 1e6}ms must be <5ms`);
 });
