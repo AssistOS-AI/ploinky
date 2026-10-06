@@ -9,6 +9,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 
 import { signHmacJwt } from '../../Agent/lib/jwtSign.mjs';
@@ -42,7 +43,9 @@ function isolatedAgentServerEnv() {
             || name.startsWith('PLOINKY_ROUTER_')
             || name.startsWith('PLOINKY_ENV_SOURCE_PLOINKY_')
             || name === 'PLOINKY_INTERNAL_ROUTER_URL'
-            || name === 'PLOINKY_EDGE_TOPOLOGY_FILE') {
+            || name === 'PLOINKY_EDGE_TOPOLOGY_FILE'
+            || name === 'PLOINKY_MASTER_KEY'
+            || name === 'PLOINKY_WORKSPACE_ROOT') {
             delete env[name];
         }
     }
@@ -219,9 +222,10 @@ async function startFakeUpstream(t, { onRpc = null, keepAliveTimeout = null } = 
                 res.end(data);
             };
             if (message?.method === 'initialize') {
+                state.sessions = (state.sessions || 0) + 1;
                 json({ jsonrpc: '2.0', id: message.id, result: {
                     protocolVersion: '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'fake', version: '1' },
-                } }, { 'mcp-session-id': state.sessionId });
+                } }, { 'mcp-session-id': `${state.sessionId}-${state.sessions}` });
                 return;
             }
             if (message?.method === 'notifications/initialized') {
@@ -309,11 +313,10 @@ async function waitFor(predicate, timeoutMs = 3000) {
     return predicate();
 }
 
-async function startEchoAgentBehindForwarder(t, { port = null } = {}) {
+async function startEchoAgentBehindForwarder(t, { port = null, secret = crypto.randomBytes(32), audience = AUDIENCE } = {}) {
     const tmp = await createTempDir(t);
     const { configPath, invocations } = await writeEchoAgentConfig(tmp);
-    const secret = crypto.randomBytes(32);
-    const agent = await startAgentServer(t, { tmp, configPath, secret, port });
+    const agent = await startAgentServer(t, { tmp, configPath, secret, port, audience });
     const forwarder = await startForwarder(t, agent.port);
     return { tmp, configPath, invocations, secret, agent, forwarder };
 }
@@ -657,6 +660,39 @@ test('B5-12 (pool): non-JSON or mismatched answers evict the entry and mark the 
     assert.ok(await waitFor(() => sse.log.some((row) => row.httpMethod === 'DELETE' && row.sessionId === 'sse-session')));
 });
 
+test('idle sessions, LRU overflow and closeAll evict entries with a best-effort DELETE', async (t) => {
+    const upstream = await startFakeUpstream(t);
+    let clock = 1_000_000;
+    const pool = newPool(t, { maxEntries: 2, now: () => clock });
+    const call = (routeKey) => pool.request({
+        key: keyFor({ port: upstream.port, routeKey }), hostPort: upstream.port, method: 'tools/call',
+        params: { name: 'x', arguments: {} }, headers: { authorization: 'Bearer test-token' }, beforeDial: () => true,
+    });
+    const sessionOf = (routeKey) => pool.snapshot().entries
+        .find((entry) => entry.key === keyFor({ port: upstream.port, routeKey }))?.sessionId;
+    const deleted = (sessionId) => upstream.log.some((row) => row.httpMethod === 'DELETE' && row.sessionId === sessionId);
+
+    await call('agentA');
+    const idleSession = sessionOf('agentA');
+    clock += 60_001;
+    await call('agentA');
+    assert.ok(await waitFor(() => deleted(idleSession)), 'idle > 60 s: DELETE');
+    assert.notEqual(sessionOf('agentA'), idleSession);
+    assert.equal(count(upstream.log, (row) => row.rpc === 'initialize'), 2);
+
+    const lruVictim = sessionOf('agentA');
+    await call('agentB');
+    await call('agentC');
+    assert.ok(await waitFor(() => deleted(lruVictim)), 'LRU overflow: DELETE of the least recently used entry');
+    assert.deepEqual(pool.snapshot().entries.map((entry) => JSON.parse(entry.key)[0]), ['agentB', 'agentC']);
+
+    const remaining = pool.snapshot().entries.map((entry) => entry.sessionId);
+    await pool.closeAll();
+    for (const sessionId of remaining) assert.equal(deleted(sessionId), true, `closeAll: DELETE ${sessionId}`);
+    assert.deepEqual(pool.snapshot().entries, []);
+    assert.equal(pool.snapshot().counters.deletes, 4);
+});
+
 test('B5-13: the unit-test MCP SDK is the commit the Box image provides', async () => {
     const entry = fileURLToPath(import.meta.resolve('mcp-sdk'));
     const packageDir = path.dirname(entry);
@@ -683,4 +719,302 @@ test('B5-13: the unit-test MCP SDK is the commit the Box image provides', async 
     if (BOX_IMAGE_MCP_SDK.indexSha256) {
         assert.equal(indexSha256, BOX_IMAGE_MCP_SDK.indexSha256, `MCP SDK bytes differ from the Box image: ${JSON.stringify(record)}`);
     }
+});
+
+// ---------------------------------------------------------------------------
+// Proxy integration (cli/server/mcp-proxy/index.js) through handleAgentMcpRequest:
+// readiness cache, kill switch, SDK fallback and the generation check.
+
+const PROXY_CONTAINER = 'pool-echo-agent-container';
+const PROXY_USER = { id: 'alice', username: 'alice', roles: ['user'] };
+const PROXY_ACTOR = { kind: 'user', id: 'user:alice', roles: ['user'] };
+let proxyFixturePromise = null;
+const originalCwd = process.cwd();
+const originalEnv = Object.fromEntries(['PLOINKY_MASTER_KEY', 'PLOINKY_WORKSPACE_ROOT', 'PLOINKY_ROUTER_HOST_PORT', 'PLOINKY_MCP_UPSTREAM_POOL']
+    .map((name) => [name, process.env[name]]));
+
+test.after(async () => {
+    if (!proxyFixturePromise) return;
+    const { workspace, proxy } = await proxyFixturePromise;
+    await proxy.agentUpstreamSessionPool.closeAll();
+    process.chdir(originalCwd);
+    for (const [name, value] of Object.entries(originalEnv)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+    }
+    fsSync.rmSync(workspace, { recursive: true, force: true });
+});
+
+function loadProxyFixture() {
+    if (proxyFixturePromise) return proxyFixturePromise;
+    proxyFixturePromise = (async () => {
+        const workspace = fsSync.mkdtempSync(path.join(os.tmpdir(), 'mcp-pool-proxy-'));
+        const ploinkyDir = path.join(workspace, '.ploinky');
+        const agentDir = path.join(ploinkyDir, 'repos', 'PoolTest', 'echoAgent');
+        fsSync.mkdirSync(agentDir, { recursive: true });
+        fsSync.writeFileSync(path.join(agentDir, 'manifest.json'), JSON.stringify({ about: 'pool proxy fixture' }));
+        fsSync.writeFileSync(path.join(ploinkyDir, 'routing.json'), JSON.stringify({ routes: { echoAgent: {
+            repo: 'PoolTest', agent: 'echoAgent', container: PROXY_CONTAINER, hostPath: agentDir, hostPort: 7401,
+        } } }));
+        fsSync.writeFileSync(path.join(ploinkyDir, 'agents.json'), JSON.stringify({ [PROXY_CONTAINER]: {
+            type: 'agent', repoName: 'PoolTest', agentName: 'echoAgent',
+            instanceId: 'proxy-instance', enableGeneration: 'proxy-enable', auth: { mode: 'none' },
+        } }));
+        fsSync.mkdirSync(path.join(ploinkyDir, 'data', 'edge-routing'), { recursive: true });
+        fsSync.mkdirSync(path.join(ploinkyDir, 'data', 'router-security'), { recursive: true });
+        fsSync.writeFileSync(path.join(ploinkyDir, 'data', 'edge-routing', 'desired.json'), JSON.stringify({ hosts: {} }));
+        fsSync.writeFileSync(path.join(ploinkyDir, 'data', 'router-security', 'policy-state.json'), JSON.stringify({
+            schema: 'router-policy',
+            httpRoutes: [],
+            mcpTools: [{ agent: 'echoAgent', tool: 'actor', access: 'authenticated', enabled: true }],
+        }));
+        process.chdir(workspace);
+        process.env.PLOINKY_MASTER_KEY = '7'.repeat(64);
+        process.env.PLOINKY_WORKSPACE_ROOT = workspace;
+        process.env.PLOINKY_ROUTER_HOST_PORT = '18080';
+        const { applyEdgeRoutingGeneration } = await import('../../cli/sandbox/edgeGeneration.js');
+        applyEdgeRoutingGeneration({ workspaceRoot: workspace, reason: 'mcp-upstream-pool-test-fixture' });
+        const proxy = await import('../../cli/server/mcp-proxy/index.js');
+        const { deriveAgentRequestSecret } = await import('../../cli/utils/security/masterKey.js');
+        const audience = proxy.buildInvocationContextForProviderCall({
+            req: { user: PROXY_USER }, agentName: 'echoAgent', toolName: 'actor', toolArgs: {},
+        }).payload.aud;
+        assert.match(audience, /^agent:/);
+        return { workspace, proxy, audience, secret: deriveAgentRequestSecret(audience) };
+    })();
+    return proxyFixturePromise;
+}
+
+function proxyRoute(port, lease) {
+    const route = { repo: 'PoolTest', agent: 'echoAgent', container: PROXY_CONTAINER, hostPort: port };
+    const routePlan = {
+        ok: true,
+        kind: 'agent-root',
+        routeKey: 'echoAgent',
+        lease: { id: lease },
+        target: { hostname: '127.0.0.1', hostPort: port },
+        route,
+        snapshot: { agents: { [PROXY_CONTAINER]: {
+            containerId: 'd'.repeat(64), instanceId: 'proxy-instance', enableGeneration: 'proxy-enable',
+        } } },
+    };
+    return { route, routePlan, key: poolKeyForRoutePlan(routePlan) };
+}
+
+function openRouterSession(proxy) {
+    const sessionId = crypto.randomUUID();
+    proxy.agentSessionStore.set(sessionId, { agentName: 'echoAgent', baseUrl: 'http://127.0.0.1/mcp' });
+    return sessionId;
+}
+
+function readinessSpy(result = true) {
+    const spy = { calls: 0, result };
+    spy.fn = async () => { spy.calls += 1; return spy.result; };
+    return spy;
+}
+
+let proxyRpcId = 0;
+function toolsCall(label) {
+    proxyRpcId += 1;
+    return { jsonrpc: '2.0', id: proxyRpcId, method: 'tools/call', params: { name: 'actor', arguments: { label } } };
+}
+
+async function proxyCall(proxy, { route, routePlan, sessionId, body, pool, waitForAgentReady, beforeDial = () => true }) {
+    const req = Readable.from([Buffer.from(JSON.stringify(body), 'utf8')]);
+    req.method = 'POST';
+    req.url = '/echoAgent/mcp';
+    req.headers = { host: 'localhost', 'content-type': 'application/json', 'mcp-session-id': sessionId };
+    req.user = PROXY_USER;
+    let finish;
+    const done = new Promise((resolve) => { finish = resolve; });
+    const res = {
+        statusCode: 0,
+        body: '',
+        writeHead(statusCode) { this.statusCode = statusCode; },
+        end(chunk = '') { this.body += String(chunk); finish(); },
+    };
+    await proxy.handleAgentMcpRequest(req, res, route, 'echoAgent', { beforeDial, routePlan, pool, waitForAgentReady });
+    await done;
+    return { status: res.statusCode, json: JSON.parse(res.body) };
+}
+
+function proxyToolPayload(json) {
+    assert.equal(json.error, undefined, JSON.stringify(json));
+    assert.equal(json.result?.isError, undefined, JSON.stringify(json));
+    return JSON.parse(json.result.content[0].text);
+}
+
+test('B5-8: the readiness cache skips the probe while pooled calls succeed and is cleared by ECONNREFUSED', async (t) => {
+    const { proxy, audience, secret } = await loadProxyFixture();
+    const { forwarder } = await startEchoAgentBehindForwarder(t, { secret, audience });
+    const pool = newPool(t);
+    const readiness = readinessSpy(true);
+    const { route, routePlan, key } = proxyRoute(forwarder.port, 'lease-b5-8');
+    const sessionId = openRouterSession(proxy);
+    const call = (label) => proxyCall(proxy, { route, routePlan, sessionId, pool, waitForAgentReady: readiness.fn, body: toolsCall(label) });
+    const startedAt = Date.now();
+    for (let index = 0; index < 10; index += 1) {
+        const verified = proxyToolPayload((await call(`b5-8-${index}`)).json);
+        assert.deepEqual(verified.actor, PROXY_ACTOR);
+        assert.deepEqual(verified.input, { label: `b5-8-${index}` });
+    }
+    assert.ok(Date.now() - startedAt < 10_000, 'the 10 calls ran inside the 10 s readiness TTL');
+    assert.equal(readiness.calls, 1, '10 calls -> 1 readiness probe');
+    assert.equal(count(forwarder.log, (row) => row.rpc === 'initialize'), 1);
+    assert.equal(count(forwarder.log, (row) => row.rpc === 'tools/call'), 10);
+    const listed = await proxyCall(proxy, { route, routePlan, sessionId, pool, waitForAgentReady: readiness.fn,
+        body: { jsonrpc: '2.0', id: 'list', method: 'tools/list', params: {} } });
+    assert.deepEqual(listed.json.result.tools.map((tool) => tool.name), ['actor']);
+    assert.equal(readiness.calls, 1);
+    assert.equal(count(forwarder.log, (row) => row.rpc === 'initialize'), 1);
+    assert.equal(pool.isReady(key), true);
+
+    await forwarder.close();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    readiness.result = false;
+    const requestsBefore = pool.snapshot().counters.requests;
+    const refused = await call('b5-8-refused');
+    assert.match(refused.json.error?.message || '', /still starting/);
+    assert.equal(readiness.calls, 2, 'cache hit, then one readiness check before the single retry');
+    assert.equal(pool.snapshot().counters.requests, requestsBefore + 1, 'one refused attempt');
+    assert.equal(pool.isReady(key), false);
+    const next = await call('b5-8-next');
+    assert.equal(readiness.calls, 3, 'the next call probes again');
+    assert.match(next.json.error?.message || '', /still starting/);
+    assert.equal(pool.snapshot().counters.requests, requestsBefore + 1, 'no upstream request without readiness');
+});
+
+test('B5-10: PLOINKY_MCP_UPSTREAM_POOL=0 restores one upstream initialize per call; unset pools again', async (t) => {
+    const { proxy, audience, secret } = await loadProxyFixture();
+    const { forwarder } = await startEchoAgentBehindForwarder(t, { secret, audience });
+    const pool = newPool(t);
+    const readiness = readinessSpy(true);
+    const { route, routePlan } = proxyRoute(forwarder.port, 'lease-b5-10');
+    const sessionId = openRouterSession(proxy);
+    const prior = process.env.PLOINKY_MCP_UPSTREAM_POOL;
+    t.after(() => {
+        if (prior === undefined) delete process.env.PLOINKY_MCP_UPSTREAM_POOL;
+        else process.env.PLOINKY_MCP_UPSTREAM_POOL = prior;
+    });
+    const initializes = () => count(forwarder.log, (row) => row.rpc === 'initialize');
+    const callFive = async (phase) => {
+        for (let index = 0; index < 5; index += 1) {
+            const verified = proxyToolPayload((await proxyCall(proxy, {
+                route, routePlan, sessionId, pool, waitForAgentReady: readiness.fn, body: toolsCall(`${phase}-${index}`),
+            })).json);
+            assert.deepEqual(verified.actor, PROXY_ACTOR);
+        }
+    };
+    delete process.env.PLOINKY_MCP_UPSTREAM_POOL;
+    await callFive('pooled');
+    assert.equal(initializes(), 1, 'pooled: one initialize for five calls');
+    assert.equal(readiness.calls, 1);
+    const pooledRequests = pool.snapshot().counters.requests;
+
+    process.env.PLOINKY_MCP_UPSTREAM_POOL = '0';
+    await callFive('kill-switch');
+    assert.equal(initializes(), 1 + 5, 'kill switch: one initialize per call');
+    assert.equal(readiness.calls, 1 + 5, 'kill switch: one readiness probe per call');
+    assert.equal(pool.snapshot().counters.requests, pooledRequests, 'kill switch: the pool is not used');
+
+    delete process.env.PLOINKY_MCP_UPSTREAM_POOL;
+    await callFive('pooled-again');
+    assert.equal(initializes(), 1 + 5, 'pooled again: the existing session is reused');
+});
+
+test('B5-12 (proxy): a non-JSON upstream is served through the SDK path; a dispatched call is never re-sent', async (t) => {
+    const { proxy } = await loadProxyFixture();
+    const sse = await startFakeUpstream(t, {
+        onRpc: ({ req, res, message, state }) => {
+            if (req.method === 'GET') {
+                res.writeHead(405);
+                res.end();
+                return true;
+            }
+            if (message?.method === 'notifications/initialized') {
+                res.writeHead(202);
+                res.end();
+                return true;
+            }
+            let result = {};
+            if (message?.method === 'initialize') {
+                result = { protocolVersion: '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'sse-fake', version: '1' } };
+            } else if (message?.method === 'tools/list') {
+                result = { tools: [{ name: 'actor', inputSchema: { type: 'object' } }] };
+            } else if (message?.method === 'tools/call') {
+                result = { content: [{ type: 'text', text: 'sse-ok' }] };
+            }
+            res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', 'mcp-session-id': state.sessionId });
+            res.end(`event: message\ndata: ${JSON.stringify({ jsonrpc: '2.0', id: message?.id, result })}\n\n`);
+            return true;
+        },
+    });
+    const plain = await startFakeUpstream(t, {
+        onRpc: ({ res }) => {
+            res.writeHead(200, { 'content-type': 'text/plain' });
+            res.end('ok');
+            return true;
+        },
+    });
+    const wrongId = await startFakeUpstream(t, {
+        onRpc: ({ res, message }) => {
+            if (message?.method !== 'tools/call') return false;
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ jsonrpc: '2.0', id: 'not-the-sent-id', result: {} }));
+            return true;
+        },
+    });
+    const sessionId = openRouterSession(proxy);
+    const readiness = readinessSpy(true);
+    const run = async (upstream, lease, pool) => {
+        const { route, routePlan, key } = proxyRoute(upstream.port, lease);
+        const response = await proxyCall(proxy, { route, routePlan, sessionId, pool, waitForAgentReady: readiness.fn, body: toolsCall(lease) });
+        return { response, key };
+    };
+
+    const ssePool = newPool(t);
+    const sseRun = await run(sse, 'lease-sse', ssePool);
+    assert.equal(sseRun.response.json.result?.content?.[0]?.text, 'sse-ok', JSON.stringify(sseRun.response.json));
+    assert.equal(ssePool.snapshot().counters.fallbacks, 1, 'fallback counter increments');
+    assert.equal(ssePool.usesFallback(sseRun.key), true);
+    assert.ok(count(sse.log, (row) => row.rpc === 'initialize') >= 2, 'pool initialize, then the SDK client');
+    assert.equal(count(sse.log, (row) => row.rpc === 'tools/call'), 1);
+    const poolRequests = ssePool.snapshot().counters.requests;
+    const again = await run(sse, 'lease-sse', ssePool);
+    assert.equal(again.response.json.result?.content?.[0]?.text, 'sse-ok');
+    assert.equal(ssePool.snapshot().counters.requests, poolRequests, 'a fallback key skips the pool');
+    assert.equal(ssePool.snapshot().counters.fallbacks, 1);
+
+    const plainPool = newPool(t);
+    const plainRun = await run(plain, 'lease-plain', plainPool);
+    assert.match(plainRun.response.json.error?.message || '', /content type/i, JSON.stringify(plainRun.response.json));
+    assert.doesNotMatch(plainRun.response.json.error.message, /not poolable/, 'the error comes from the SDK path');
+    assert.equal(plainPool.snapshot().counters.fallbacks, 1);
+    assert.ok(count(plain.log, (row) => row.rpc === 'initialize') >= 2, 'pool initialize, then the SDK client');
+
+    const wrongPool = newPool(t);
+    const wrongRun = await run(wrongId, 'lease-wrong-id', wrongPool);
+    assert.match(wrongRun.response.json.error?.message || '', /not poolable/);
+    assert.equal(count(wrongId.log, (row) => row.rpc === 'tools/call'), 1, 'the dispatched call is not re-sent');
+    assert.equal(wrongPool.usesFallback(wrongRun.key), true);
+    assert.equal(wrongPool.snapshot().counters.fallbacks, 1);
+});
+
+test('proxy: a generation change before the pooled POST fails closed and sends no call', async (t) => {
+    const { proxy, audience, secret } = await loadProxyFixture();
+    const { forwarder } = await startEchoAgentBehindForwarder(t, { secret, audience });
+    const pool = newPool(t);
+    const readiness = readinessSpy(true);
+    const { route, routePlan } = proxyRoute(forwarder.port, 'lease-generation');
+    const sessionId = openRouterSession(proxy);
+    proxyToolPayload((await proxyCall(proxy, { route, routePlan, sessionId, pool, waitForAgentReady: readiness.fn, body: toolsCall('warm') })).json);
+    const callsBefore = count(forwarder.log, (row) => row.rpc === 'tools/call');
+    let checks = 0;
+    const stale = await proxyCall(proxy, {
+        route, routePlan, sessionId, pool, waitForAgentReady: readiness.fn, body: toolsCall('stale'),
+        beforeDial: () => { checks += 1; return false; },
+    });
+    assert.match(stale.json.error?.message || '', /edge routing generation changed/);
+    assert.ok(checks >= 1);
+    assert.equal(count(forwarder.log, (row) => row.rpc === 'tools/call'), callsBefore);
 });
