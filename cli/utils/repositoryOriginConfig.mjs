@@ -1,91 +1,52 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 
-// null means Git must interpret the config. Validate all lines, not just origin:
-// Git rejects a bad escape or malformed section even after a valid origin URL.
-function parseOrigin(config) {
-    const text = config.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n');
-    if (text.includes('\0')) return null;
-    let section = '';
-    let subsection = '';
-    let origin = null;
-    const lines = text.split('\n');
-    for (let index = 0; index < lines.length; index += 1) {
-        let line = lines[index].replace(/^[ \t]+/, '');
-        if (!line || /^[#;]/.test(line)) continue;
-        if (line.startsWith('[')) {
-            const header = /^\[([A-Za-z0-9.-]+)(?:[ \t]+"((?:[^"\\]|\\.)*)")?[ \t]*\]/.exec(line);
-            if (!header) return null;
-            section = header[1].toLowerCase();
-            subsection = header[2] === undefined ? '' : header[2].replace(/\\(.)/g, '$1');
-            if (header[2] === undefined && section.includes('.')) {
-                const dot = section.indexOf('.');
-                subsection = section.slice(dot + 1);
-                section = section.slice(0, dot);
-            }
-            if (section === 'include' || section === 'includeif') return null;
-            line = line.slice(header[0].length).replace(/^[ \t]+/, '');
-            if (!line || /^[#;]/.test(line)) continue;
-        }
-        if (!section) return null;
-        const variable = /^([A-Za-z][A-Za-z0-9-]*)[ \t]*(?:=(.*)|([#;].*)?)$/.exec(line);
-        if (!variable) return null;
-        const key = variable[1].toLowerCase();
-        if (section === 'extensions' && !subsection && key === 'worktreeconfig') return null;
-        let value = '';
-        let pendingSpace = '';
-        let quoted = false;
-        let input = variable[2] ?? '';
-        for (let cursor = 0; cursor < input.length; cursor += 1) {
-            const char = input[cursor];
-            if (!quoted && (char === '#' || char === ';')) break;
-            if (char === '\\') {
-                if (cursor + 1 === input.length) {
-                    if (++index === lines.length) return null;
-                    input += lines[index];
-                    continue;
-                }
-                const escaped = input[++cursor];
-                const escapes = { n: '\n', t: '\t', b: '\b', '"': '"', '\\': '\\' };
-                if (!Object.hasOwn(escapes, escaped)) return null;
-                value += pendingSpace + escapes[escaped];
-                pendingSpace = '';
-            } else if (char === '"') {
-                value += pendingSpace;
-                pendingSpace = '';
-                quoted = !quoted;
-            } else if (!quoted && (char === ' ' || char === '\t')) {
-                if (value) pendingSpace += char;
-            } else {
-                value += pendingSpace + char;
-                pendingSpace = '';
-            }
-        }
-        if (quoted) return null;
-        if (section === 'remote' && subsection === 'origin' && key === 'url') origin = value;
-    }
-    return origin;
-}
+const ORIGIN_TIMEOUT_MS = 2000;
+const ORIGIN_MAX_BYTES = 1024 * 1024;
+const originArgs = directory => ['-C', directory, 'config', '--get', 'remote.origin.url'];
 
+// Git owns repository discovery, safe.directory and the complete effective config.
 export function readOriginFromGitConfig(directory) {
-    const gitDirectory = path.join(directory, '.git');
-    if (!fs.existsSync(gitDirectory)) return '';
+    if (!fs.existsSync(path.join(directory, '.git'))) return '';
     try {
-        // Ownership refusal must remain Git's decision, including safe.directory.
-        const uid = process.geteuid?.();
-        const repository = fs.lstatSync(directory);
-        const git = fs.lstatSync(gitDirectory);
-        const overridden = Object.keys(process.env).some(key => key === 'GIT_DIR' || key === 'GIT_CONFIG' || key.startsWith('GIT_CONFIG_'));
-        if (!overridden && uid !== undefined && repository.isDirectory() && git.isDirectory()
-            && repository.uid === uid && git.uid === uid) {
-            const origin = parseOrigin(fs.readFileSync(path.join(gitDirectory, 'config'), 'utf8'));
-            if (origin !== null) return origin;
-        }
-    } catch { /* Git preserves the existing failure and special-checkout behavior. */ }
-    try {
-        return execFileSync('git', ['-C', directory, 'config', '--get', 'remote.origin.url'], {
-            encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000,
+        return execFileSync('git', originArgs(directory), {
+            encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: ORIGIN_TIMEOUT_MS,
         }).replace(/\n$/, '');
     } catch { return ''; }
+}
+
+export function readOriginFromGitConfigAsync(directory, { signal } = {}) {
+    if (signal?.aborted || !fs.existsSync(path.join(directory, '.git'))) return Promise.resolve('');
+    return new Promise(resolve => {
+        let child;
+        try { child = spawn('git', originArgs(directory), { stdio: ['ignore', 'pipe', 'ignore'] }); }
+        catch { resolve(''); return; }
+        let failed = false;
+        let bytes = 0;
+        const chunks = [];
+        const terminate = () => {
+            failed = true;
+            chunks.length = 0;
+            child.kill('SIGKILL');
+        };
+        const timer = setTimeout(terminate, ORIGIN_TIMEOUT_MS);
+        const onAbort = () => terminate();
+        signal?.addEventListener('abort', onAbort, { once: true });
+        child.on('error', () => { failed = true; });
+        child.stdout.on('error', terminate);
+        child.stdout.on('data', chunk => {
+            if (failed) return;
+            bytes += chunk.length;
+            if (bytes > ORIGIN_MAX_BYTES) terminate();
+            else chunks.push(chunk);
+        });
+        // Resolve on close, never on exit/error: the direct child and pipes are settled.
+        child.once('close', code => {
+            clearTimeout(timer);
+            signal?.removeEventListener('abort', onAbort);
+            resolve(!failed && !signal?.aborted && code === 0 ? Buffer.concat(chunks).toString('utf8').replace(/\n$/, '') : '');
+        });
+        if (signal?.aborted) terminate();
+    });
 }

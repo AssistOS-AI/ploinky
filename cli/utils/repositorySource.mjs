@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { readOriginFromGitConfig } from './repositoryOriginConfig.mjs';
-import { memoizeRepositoryRead } from './repositoryResolutionScope.mjs';
+import { readOriginFromGitConfig, readOriginFromGitConfigAsync } from './repositoryOriginConfig.mjs';
+import { memoizeRepositoryRead, prefetchRepositoryReads, repositoryReadScopeCancelled } from './repositoryResolutionScope.mjs';
 
 export function repositoryEntries(root) {
     try { return fs.readdirSync(root, { withFileTypes: true }); }
@@ -27,6 +27,14 @@ export function workspaceRepositories(root, accept = acceptRepository) {
         && (entry.isDirectory() || entry.isSymbolicLink()))
         .map(entry => ({ name: entry.name, directory: path.join(root, entry.name) })));
     return entries.filter(entry => accept(entry.directory));
+}
+
+export async function prefetchWorkspaceRepositoryOrigins(roots, { signal } = {}) {
+    if (signal?.aborted || repositoryReadScopeCancelled()) return;
+    const directories = [...new Set(Array.isArray(roots) ? roots : [roots])]
+        .flatMap(root => workspaceRepositories(root).map(entry => entry.directory));
+    await prefetchRepositoryReads('origins', directories, async (directory, ownedSignal) =>
+        repositoryIdentity(await readOriginFromGitConfigAsync(directory, { signal: ownedSignal })), { signal });
 }
 
 export function workspaceRepositoryPath(name, { workspaceRoot, url = '', accept = candidate => fs.existsSync(path.join(candidate, '.git')) } = {}) {
