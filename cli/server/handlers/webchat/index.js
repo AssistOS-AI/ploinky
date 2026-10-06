@@ -109,7 +109,7 @@ export async function handleWebChat(req, res, appConfig, appState) {
     if (pathname.startsWith('/assets/')) {
         const rel = pathname.substring('/assets/'.length);
         const assetPath = staticSrv.resolveAssetPath(appName, fallbackAppPath, rel);
-        if (assetPath && staticSrv.sendFile(res, assetPath)) return;
+        if (assetPath && await staticSrv.sendFile(res, assetPath, { req })) return;
     }
 
     if (req.user) {

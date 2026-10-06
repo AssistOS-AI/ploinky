@@ -40,8 +40,17 @@ fs.writeFileSync(path.join(gitRepoDir, 'mcp-config.json'), JSON.stringify({
         { name: 'git_status' },
     ],
 }, null, 2));
+// The provider principal comes from the active route, so the delegated
+// target is routed and enabled like any agent an MCP call can reach.
 fs.writeFileSync(path.join(tempDir, '.ploinky', 'routing.json'), JSON.stringify({
     routes: {
+        dpuAgent: {
+            repo: 'AssistOSExplorer',
+            agent: 'dpuAgent',
+            container: 'dpu-agent-container',
+            hostPath: repoDir,
+            hostPort: 7402,
+        },
         gitAgent: {
             repo: 'AssistOSExplorer',
             agent: 'gitAgent',
@@ -52,6 +61,14 @@ fs.writeFileSync(path.join(tempDir, '.ploinky', 'routing.json'), JSON.stringify(
     },
 }, null, 2));
 fs.writeFileSync(path.join(ploinkyDir, 'agents.json'), JSON.stringify({
+    'dpu-agent-container': {
+        type: 'agent',
+        repoName: 'AssistOSExplorer',
+        agentName: 'dpuAgent',
+        instanceId: 'dpu-agent-instance',
+        enableGeneration: 'dpu-agent-enable-generation',
+        auth: { mode: 'none' },
+    },
     'git-agent-container': {
         type: 'agent',
         repoName: 'AssistOSExplorer',

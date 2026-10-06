@@ -59,6 +59,55 @@ export function isPathWithinRoots(allowedRoots, targetPath, { allowMissing = fal
     return false;
 }
 
+// Async siblings of the realpath helpers above for request hot paths. Results
+// are never cached: a cached realpath would widen the window between the
+// containment check and the open.
+export async function toRealPathSafeAsync(value) {
+    try {
+        return await fs.promises.realpath(value);
+    } catch (_) {
+        return null;
+    }
+}
+
+export async function resolveCanonicalPathAsync(targetPath) {
+    const normalizedTarget = path.resolve(targetPath);
+    try {
+        return await fs.promises.realpath(normalizedTarget);
+    } catch (_) {
+        let current = path.dirname(normalizedTarget);
+        while (true) {
+            try {
+                const realCurrent = await fs.promises.realpath(current);
+                const suffix = path.relative(current, normalizedTarget);
+                return path.resolve(realCurrent, suffix);
+            } catch (_) {
+                const parent = path.dirname(current);
+                if (parent === current) {
+                    return null;
+                }
+                current = parent;
+            }
+        }
+    }
+}
+
+export async function isPathWithinRootsAsync(allowedRoots, targetPath, { allowMissing = false } = {}) {
+    const resolvedTarget = allowMissing
+        ? await resolveCanonicalPathAsync(targetPath)
+        : await toRealPathSafeAsync(targetPath);
+    if (!resolvedTarget) return false;
+
+    for (const root of allowedRoots || []) {
+        const resolvedRoot = (await toRealPathSafeAsync(root)) || path.resolve(root);
+        if (!resolvedRoot) continue;
+        if (resolvedTarget === resolvedRoot || resolvedTarget.startsWith(resolvedRoot + path.sep)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 export function resolveWorkspacePath(inputPath, {
     workspaceRoot = getWorkspaceRoot(),
     leadingSlashIsWorkspaceRelative = true
