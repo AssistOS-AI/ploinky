@@ -15,7 +15,7 @@ PROBE_OUTPUT_BLOCK_COUNT=256
 PROBE_REQUEST_FILE='request'
 PROBE_CLAIM_DIR='claimed'
 PROBE_BROKER_READY_DIR='.broker-ready'
-PROBE_BROKER_POLL_SECONDS='0.05'
+PROBE_BROKER_POLL_SECONDS='0.2'
 
 fail() {
     printf '%s\n' "ploinky health probe runner: $*" >&2

@@ -730,7 +730,7 @@ async function processRequest(req, res) {
         return handleWorkspaceUpload(req, res);
     } else if (isRouteMount(pathname, '/blobs')) {
         return handleBlobs(req, res);
-    } else if (staticSrv.serveWorkspaceFileRequest(req, res)) {
+    } else if (staticSrv.isWorkspaceFileRequest(req) && await staticSrv.serveWorkspaceFileRequest(req, res)) {
         return;
     } else if (routedAggregateAgentCard) {
         return handleRoutedAggregateAgentCard(req, res, routePlan);
@@ -1221,60 +1221,8 @@ server.listen(port, '0.0.0.0', () => {
         }
     }, MEMORY_LOG_INTERVAL);
 
-    // CRITICAL: Process count monitoring to prevent spawn leaks
-    const PROCESS_MONITOR_INTERVAL = 60 * 1000; // 1 minute
-    const MAX_SAFE_NODE_PROCESSES = 15;
-    const processMonitor = setInterval(() => {
-        if (lifecycle.isShuttingDown()) return;
-
-        try {
-            const { execSync } = require('child_process');
-            const output = execSync('ps aux | grep -E "node|startFlow" | grep -v grep | wc -l', {
-                encoding: 'utf8',
-                timeout: 5000
-            }).trim();
-            const nodeProcessCount = parseInt(output, 10);
-
-            if (nodeProcessCount > MAX_SAFE_NODE_PROCESSES) {
-                const warning = {
-                    level: 'warning',
-                    type: 'process_count_alert',
-                    nodeProcesses: nodeProcessCount,
-                    maxSafe: MAX_SAFE_NODE_PROCESSES,
-                    message: 'High number of node processes detected - possible process spawn leak'
-                };
-                appendLog('process_count_alert', warning);
-                console.warn(`[ALERT] ${nodeProcessCount} node processes running (max safe: ${MAX_SAFE_NODE_PROCESSES})`);
-
-                // Log active sessions for debugging
-                let totalTabs = globalState.webchat?.runtimes instanceof Map
-                    ? globalState.webchat.runtimes.size
-                    : 0;
-                for (const state of Object.values(globalState)) {
-                    if (state === globalState.webchat) continue;
-                    if (state.sessions instanceof Map) {
-                        for (const session of state.sessions.values()) {
-                            if (session.tabs instanceof Map) {
-                                totalTabs += session.tabs.size;
-                            }
-                        }
-                    }
-                }
-                console.warn(`[DEBUG] Active tabs: ${totalTabs}, Sessions: ${globalState.webchat?.sessions.size || 0}`);
-            }
-
-            // Log normal process count periodically for trending
-            if (nodeProcessCount > 5) {
-                appendLog('process_count', { count: nodeProcessCount });
-            }
-        } catch (err) {
-            // Silently fail - don't crash if ps command fails
-        }
-    }, PROCESS_MONITOR_INTERVAL);
-
     // Clean up intervals on shutdown
     process.on('beforeExit', () => {
         clearInterval(memoryMonitor);
-        clearInterval(processMonitor);
     });
 });

@@ -5,6 +5,7 @@ import { waitForAgentReady } from '../utils/agentReadiness.js';
 import {
     getWorkspaceRoot,
     isPathWithinRoots,
+    isPathWithinRootsAsync,
     sanitizeRelativeRequestPath,
     toRealPathSafe
 } from '../utils/workspacePaths.js';
@@ -123,16 +124,37 @@ function isPathWithinAllowedRoots(allowedRoots, targetPath, options = {}) {
     return isPathWithinRoots(allowedRoots, targetPath, options);
 }
 
+function isPathWithinAllowedRootsAsync(allowedRoots, targetPath, options = {}) {
+    return isPathWithinRootsAsync(allowedRoots, targetPath, options);
+}
+
+async function pathExists(target) {
+    try {
+        await fs.promises.access(target);
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
+
+async function directoryOrNull(hostPath) {
+    try {
+        const abs = path.resolve(hostPath);
+        if ((await fs.promises.stat(abs)).isDirectory()) return abs;
+    } catch (_) { }
+    return null;
+}
+
 function getStaticAllowedRoots() {
     const staticRoot = getStaticHostPath();
     if (!staticRoot) return [];
     return [staticRoot, path.resolve(staticRoot, '..')];
 }
 
-function getAgentAllowedRoots(agentName, options = {}) {
+async function getAgentAllowedRoots(agentName, options = {}) {
     const agentRoot = Object.prototype.hasOwnProperty.call(options, 'hostPath')
-        ? normalizeAgentHostPath(options.hostPath)
-        : getAgentHostPath(agentName);
+        ? await normalizeAgentHostPath(options.hostPath)
+        : await getAgentHostPath(agentName);
     if (!agentRoot) return [];
     return [agentRoot, path.resolve(agentRoot, '..')];
 }
@@ -299,7 +321,7 @@ async function serveStaticRequest(req, res) {
         const parsed = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
         const pathname = decodeURIComponent(parsed.pathname || '/');
         if (pathname === MCP_BROWSER_CLIENT_URL) {
-            if (sendFile(res, MCP_BROWSER_CLIENT_FILE)) return true;
+            if (await sendFile(res, MCP_BROWSER_CLIENT_FILE, { req })) return true;
             return false;
         }
 
@@ -340,7 +362,7 @@ async function serveStaticRequest(req, res) {
 
         const rel = pathname.replace(/^\/+/, '');
         const target = resolveStaticFile(rel || '');
-        if (target && sendFile(res, target)) return true;
+        if (target && await sendFile(res, target, { req })) return true;
     } catch (_) { }
     return false;
 }
@@ -398,7 +420,7 @@ function getMimeType(filePath) {
     return map[ext] || 'application/octet-stream';
 }
 
-function getCacheControl(filePath) {
+function getCacheControl(filePath, { authenticated = false } = {}) {
     const ext = path.extname(filePath).toLowerCase();
     // HTML documents are application entry points behind session and capability
     // checks. A cached copy would let a browser reopen a shell the Router has
@@ -406,65 +428,137 @@ function getCacheControl(filePath) {
     if (ext === '.html' || ext === '.htm') {
         return 'no-store';
     }
+    // Authenticated surfaces (agent static, workspace files) must never be kept
+    // by a shared cache, so they are `private`; public assets stay `public`.
+    const scope = authenticated ? 'private' : 'public';
     if (ext === '.woff2' || ext === '.woff' || ext === '.ttf' || ext === '.otf' || ext === '.eot') {
-        return 'public, max-age=31536000, immutable';
+        return `${scope}, max-age=31536000, immutable`;
     }
     if (ext === '.png' || ext === '.jpg' || ext === '.jpeg' || ext === '.gif' || ext === '.ico' || ext === '.svg') {
-        return 'public, max-age=86400';
+        return `${scope}, max-age=86400`;
     }
     if (ext === '.js' || ext === '.mjs' || ext === '.css') {
-        return 'public, max-age=300';
+        return `${scope}, max-age=300`;
     }
-    return 'public, max-age=60';
+    return `${scope}, max-age=60`;
 }
 
-function sendFile(res, filePath) {
+function normalizeEntityTag(tag) {
+    return tag.startsWith('W/') ? tag.slice(2) : tag;
+}
+
+// If-None-Match: comma-separated entity tags or `*`, compared weakly.
+function ifNoneMatchMatches(headerValue, etag) {
+    const raw = Array.isArray(headerValue) ? headerValue.join(',') : headerValue;
+    if (typeof raw !== 'string' || !raw.trim()) return false;
+    const current = normalizeEntityTag(etag);
+    const tagPattern = /\s*(\*|(?:W\/)?"[^"]*")\s*(?:,|$)/y;
+    let offset = 0;
+    while (offset < raw.length) {
+        tagPattern.lastIndex = offset;
+        const match = tagPattern.exec(raw);
+        if (!match) return false;
+        if (match[1] === '*' || normalizeEntityTag(match[1]) === current) return true;
+        offset = tagPattern.lastIndex;
+    }
+    return false;
+}
+
+// Open the file once, take validators from the open handle (fstat), then
+// stream from that same handle so headers and body describe the same file.
+// Callers run any generation/lease check before calling this, so neither a 200
+// nor a 304 is produced for a stale generation.
+// A client that resets the connection while the request is awaiting I/O leaves
+// a destroyed response whose 'close' event has already fired; nothing may be
+// written to it and every handle opened for it must still be closed.
+function responseGone(res) {
+    return Boolean(res?.destroyed || res?.writableEnded);
+}
+
+async function sendOpenedFile(req, res, filePath, { authenticated = false, extraHeaders = {} } = {}) {
+    if (responseGone(res)) return true;
+    let handle;
     try {
-        const mime = getMimeType(filePath);
-        const headers = {
-            'Content-Type': mime,
-            'Cache-Control': getCacheControl(filePath)
-        };
-        res.writeHead(200, headers);
-        const stream = fs.createReadStream(filePath);
-        stream.on('error', () => {
-            if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'text/plain' });
-            res.end('Internal Server Error');
-        });
-        stream.pipe(res);
-        return true;
-    } catch (err) {
+        handle = await fs.promises.open(filePath, 'r');
+    } catch (_) {
         return false;
     }
-}
-
-function sendFileStream(res, filePath) {
+    let streamStarted = false;
     try {
-        res.writeHead(200, getWorkspaceFileHeaders(filePath));
-        const stream = fs.createReadStream(filePath);
-        stream.on('error', () => {
-            if (!res.headersSent) {
-                res.writeHead(500, { 'Content-Type': 'text/plain' });
-            }
-            res.end('Internal Server Error');
+        const stat = await handle.stat({ bigint: true });
+        if (!stat.isFile()) return false;
+        // Last await is behind us: a gone client is handled here, and the
+        // finally block closes the handle because no stream was started.
+        if (responseGone(res)) return true;
+        const size = Number(stat.size);
+        const etag = `W/"${stat.size}-${stat.mtimeNs}-${stat.ino}"`;
+        const lastModified = new Date(Number(stat.mtimeNs / 1000000n)).toUTCString();
+        const cacheControl = getCacheControl(filePath, { authenticated });
+        const method = String(req?.method || 'GET').toUpperCase();
+        if ((method === 'GET' || method === 'HEAD')
+            && ifNoneMatchMatches(req?.headers?.['if-none-match'], etag)) {
+            res.writeHead(304, {
+                'Cache-Control': cacheControl,
+                ETag: etag,
+                'Last-Modified': lastModified,
+            });
+            res.end();
+            return true;
+        }
+        res.writeHead(200, {
+            'Content-Type': getMimeType(filePath),
+            'Cache-Control': cacheControl,
+            'Content-Length': size,
+            ETag: etag,
+            'Last-Modified': lastModified,
+            ...extraHeaders,
         });
+        if (size === 0) {
+            res.end();
+            return true;
+        }
+        // `end` caps the body at the fstat size so it cannot exceed Content-Length.
+        const stream = handle.createReadStream({ start: 0, end: size - 1, autoClose: true });
+        streamStarted = true;
+        stream.on('error', () => {
+            if (typeof res.destroy === 'function') res.destroy();
+            else res.end();
+        });
+        if (typeof res.on === 'function') res.on('close', () => stream.destroy());
+        if (responseGone(res)) {
+            stream.destroy();
+            return true;
+        }
         stream.pipe(res);
         return true;
     } catch (_) {
         return false;
+    } finally {
+        if (!streamStarted) await handle.close().catch(() => { });
     }
+}
+
+async function sendFile(res, filePath, { req = null, authenticated = false } = {}) {
+    return sendOpenedFile(req, res, filePath, { authenticated });
+}
+
+async function sendFileStream(req, res, filePath) {
+    return sendOpenedFile(req, res, filePath, {
+        authenticated: true,
+        extraHeaders: getWorkspaceFileHeaders(filePath),
+    });
 }
 
 function getWorkspaceFileHeaders(filePath) {
     return {
         'Content-Type': getMimeType(filePath),
-        'Cache-Control': getCacheControl(filePath),
+        'Cache-Control': getCacheControl(filePath, { authenticated: true }),
         'Content-Disposition': 'inline',
         'X-Content-Type-Options': 'nosniff',
     };
 }
 
-function resolveWorkspaceFile(requestPath) {
+async function resolveWorkspaceFile(requestPath) {
     const workspaceRoot = getWorkspaceRoot();
     if (!workspaceRoot) {
         return { status: 'unavailable', filePath: null };
@@ -487,29 +581,32 @@ function resolveWorkspaceFile(requestPath) {
             if (selectedRoots.length > 1) return { status: 'denied', filePath: null };
             const sourceRoot = selectedRoots[0] || path.join(resolveAgentRepositoryPath(repo), agent);
             const managedRoot = path.join(workspaceRoot, '.ploinky', 'repos', repo, agent);
-            if (selectedRoots.length || fs.existsSync(path.join(sourceRoot, 'manifest.json'))
-                || fs.existsSync(path.join(managedRoot, 'manifest.json'))) {
+            if (selectedRoots.length || await pathExists(path.join(sourceRoot, 'manifest.json'))
+                || await pathExists(path.join(managedRoot, 'manifest.json'))) {
                 // Legacy agent asset URLs follow the admitted source, never a
                 // second copy. Ordinary workspace file paths remain literal.
-                if (!isPathWithinAllowedRoots([workspaceRoot], sourceRoot, { allowMissing: true })) {
+                if (!await isPathWithinAllowedRootsAsync([workspaceRoot], sourceRoot, { allowMissing: true })) {
                     return { status: 'denied', filePath: null };
                 }
                 candidate = path.join(sourceRoot, ...asset);
                 allowedRoots = [sourceRoot];
             }
         }
-        if (!isPathWithinAllowedRoots(allowedRoots, candidate, { allowMissing: true })) {
+        if (!await isPathWithinAllowedRootsAsync(allowedRoots, candidate, { allowMissing: true })) {
             return { status: 'denied', filePath: null };
         }
-        const stat = fs.statSync(candidate);
+        const stat = await fs.promises.stat(candidate);
         if (stat.isDirectory()) {
             const indexFiles = ['index.html', 'index.htm', 'default.html'];
             for (const name of indexFiles) {
                 const idx = path.join(candidate, name);
-                if (fs.existsSync(idx)
-                    && fs.statSync(idx).isFile()
-                    && isPathWithinAllowedRoots(allowedRoots, idx)) {
-                    return { status: 'ok', filePath: idx };
+                try {
+                    if ((await fs.promises.stat(idx)).isFile()
+                        && await isPathWithinAllowedRootsAsync(allowedRoots, idx)) {
+                        return { status: 'ok', filePath: idx };
+                    }
+                } catch (_) {
+                    continue;
                 }
             }
             return { status: 'not_found', filePath: null };
@@ -524,7 +621,18 @@ function resolveWorkspaceFile(requestPath) {
     return { status: 'not_found', filePath: null };
 }
 
-function serveWorkspaceFileRequest(req, res) {
+// Synchronous prefix check so the Router can decide dispatch without awaiting.
+function isWorkspaceFileRequest(req) {
+    try {
+        const parsed = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+        const pathname = decodeURIComponent(parsed.pathname || '/');
+        return pathname === '/workspace-files' || pathname.startsWith(WORKSPACE_FILES_URL_PREFIX);
+    } catch (_) {
+        return false;
+    }
+}
+
+async function serveWorkspaceFileRequest(req, res) {
     try {
         const parsed = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
         const pathname = decodeURIComponent(parsed.pathname || '/');
@@ -539,7 +647,7 @@ function serveWorkspaceFileRequest(req, res) {
         }
 
         const rel = pathname.slice(WORKSPACE_FILES_URL_PREFIX.length);
-        const resolved = resolveWorkspaceFile(rel);
+        const resolved = await resolveWorkspaceFile(rel);
         if (resolved.status === 'denied') {
             res.writeHead(403, { 'Content-Type': 'text/plain' });
             res.end('Access denied');
@@ -550,7 +658,7 @@ function serveWorkspaceFileRequest(req, res) {
             res.end('Not Found');
             return true;
         }
-        if (sendFileStream(res, resolved.filePath)) {
+        if (await sendFileStream(req, res, resolved.filePath)) {
             return true;
         }
         res.writeHead(500, { 'Content-Type': 'text/plain' });
@@ -561,7 +669,7 @@ function serveWorkspaceFileRequest(req, res) {
     }
 }
 
-function serveWebLibRequest(req, res) {
+async function serveWebLibRequest(req, res) {
     try {
         const parsed = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
         const pathname = decodeURIComponent(parsed.pathname || '/');
@@ -592,7 +700,7 @@ function serveWebLibRequest(req, res) {
 
         try {
             const stat = fs.statSync(target);
-            if (stat.isFile() && sendFile(res, target)) return true;
+            if (stat.isFile() && await sendFile(res, target, { req })) return true;
         } catch (_) { }
 
         res.writeHead(404, { 'Content-Type': 'text/plain' });
@@ -611,6 +719,7 @@ export {
     resolveAssetPath,
     resolveFirstAvailable,
     sendFile,
+    isWorkspaceFileRequest,
     serveWorkspaceFileRequest,
     serveWebLibRequest,
     serveStaticRequest,
@@ -619,24 +728,16 @@ export {
 };
 
 // --- Agent-specific static routing ---
-function getAgentHostPath(agentName) {
+async function getAgentHostPath(agentName) {
     const cfg = readRouting();
     const rec = cfg && cfg.routes ? cfg.routes[agentName] : null;
     if (!rec || !rec.hostPath) return null;
-    try {
-        const abs = path.resolve(rec.hostPath);
-        if (fs.existsSync(abs) && fs.statSync(abs).isDirectory()) return abs;
-    } catch (_) { }
-    return null;
+    return directoryOrNull(rec.hostPath);
 }
 
-function normalizeAgentHostPath(hostPath) {
+async function normalizeAgentHostPath(hostPath) {
     if (typeof hostPath !== 'string' || !hostPath.trim()) return null;
-    try {
-        const abs = path.resolve(hostPath);
-        if (fs.existsSync(abs) && fs.statSync(abs).isDirectory()) return abs;
-    } catch (_) { }
-    return null;
+    return directoryOrNull(hostPath);
 }
 
 function safeJoin(base, rel) {
@@ -652,14 +753,14 @@ function safeJoin(base, rel) {
 async function resolveAgentStaticFile(agentName, agentRelPath, options = {}) {
     const capturedHostPath = Object.prototype.hasOwnProperty.call(options, 'hostPath');
     const root = capturedHostPath
-        ? normalizeAgentHostPath(options.hostPath)
-        : getAgentHostPath(agentName);
+        ? await normalizeAgentHostPath(options.hostPath)
+        : await getAgentHostPath(agentName);
     if (!root) return null;
-    const allowedRoots = getAgentAllowedRoots(agentName, capturedHostPath ? { hostPath: root } : {});
+    const allowedRoots = await getAgentAllowedRoots(agentName, capturedHostPath ? { hostPath: root } : {});
     const candidate = safeJoin(root, agentRelPath);
     if (!candidate) return null;
     try {
-        if (!isPathWithinAllowedRoots(allowedRoots, candidate)) {
+        if (!await isPathWithinAllowedRootsAsync(allowedRoots, candidate)) {
             return null;
         }
         const stat = await fs.promises.stat(candidate);
@@ -669,7 +770,7 @@ async function resolveAgentStaticFile(agentName, agentRelPath, options = {}) {
                 const idx = path.join(candidate, name);
                 try {
                     const idxStat = await fs.promises.stat(idx);
-                    if (idxStat.isFile() && isPathWithinAllowedRoots(allowedRoots, idx)) return idx;
+                    if (idxStat.isFile() && await isPathWithinAllowedRootsAsync(allowedRoots, idx)) return idx;
                 } catch (_) {
                     continue;
                 }
@@ -704,7 +805,7 @@ async function serveAgentStaticRequest(req, res, {
                 res.end(JSON.stringify({ error: 'edge_generation_changed' }));
                 return true;
             }
-            if (sendFile(res, target)) return true;
+            if (await sendFile(res, target, { req, authenticated: true })) return true;
         }
     } catch (_) { }
     return false;
@@ -732,13 +833,13 @@ async function servePublicAssetRequest(req, res) {
             const agent = parts[0];
             const rest = parts.slice(1).join('/');
             const target = await resolveAgentStaticFile(agent, rest);
-            if (target && sendFile(res, target)) return true;
+            if (target && await sendFile(res, target, { req })) return true;
         }
 
         const root = getStaticHostPath();
         if (root) {
             const target = resolveStaticFile(pathname.replace(/^\/+/, ''));
-            if (target && sendFile(res, target)) return true;
+            if (target && await sendFile(res, target, { req })) return true;
         }
     } catch (_) { }
     return false;

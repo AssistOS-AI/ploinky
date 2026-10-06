@@ -16,6 +16,8 @@ function writeManifest(repoName, agentName, manifest) {
     );
 }
 
+const originalWorkspaceRoot = process.env.PLOINKY_WORKSPACE_ROOT;
+process.env.PLOINKY_WORKSPACE_ROOT = tempDir;
 process.chdir(tempDir);
 
 const moduleSuffix = `?test=${Date.now()}`;
@@ -27,10 +29,13 @@ const {
     getAgentDescriptorByPrincipal,
     isSsoProviderManifest,
     canonicalJsonHash,
+    __internal,
 } = registryModule;
 
 test.after(() => {
     process.chdir(originalCwd);
+    if (originalWorkspaceRoot === undefined) delete process.env.PLOINKY_WORKSPACE_ROOT;
+    else process.env.PLOINKY_WORKSPACE_ROOT = originalWorkspaceRoot;
     fs.rmSync(tempDir, { recursive: true, force: true });
 });
 
@@ -94,4 +99,31 @@ test('buildAgentIndex skips entries whose names fail agentIdentity validation', 
     assert.equal(index.agents.has('gitTest/good agent'), false);
     assert.ok(index.agents.has('dpu/dpuAgent'));
     assert.ok(index.agents.has('basic/keycloak'));
+});
+
+test('a manifest edit or addition is visible on the immediately following call', () => {
+    writeManifest('fresh', 'baseline', { about: 'present before the first call' });
+    assert.equal(getAgentDescriptorByPrincipal('agent:fresh/baseline')?.agentRef, 'fresh/baseline');
+    assert.equal(buildAgentIndex().agents.has('fresh/lateSso'), false);
+    assert.equal(getAgentDescriptorByPrincipal('agent:fresh/lateSso'), null);
+
+    // Addition: no clock movement and no cache reset between write and read.
+    writeManifest('fresh', 'lateSso', { ssoProvider: true });
+    assert.equal(getAgentDescriptorByPrincipal('agent:fresh/lateSso')?.agentRef, 'fresh/lateSso');
+    assert.equal(resolveAgentDescriptor('fresh/lateSso')?.ssoProvider, true);
+    assert.equal(listSsoProviders().some((d) => d.agentRef === 'fresh/lateSso'), true);
+    assert.equal(buildAgentIndex().agents.has('fresh/lateSso'), true);
+
+    // Edit: the SSO marker flips on the very next call of every accessor.
+    writeManifest('fresh', 'lateSso', { ssoProvider: false });
+    assert.equal(getAgentDescriptorByPrincipal('agent:fresh/lateSso')?.ssoProvider, false);
+    assert.equal(resolveAgentDescriptor('fresh/lateSso')?.ssoProvider, false);
+    assert.equal(listSsoProviders().some((d) => d.agentRef === 'fresh/lateSso'), false);
+    assert.equal(buildAgentIndex().agents.get('fresh/lateSso')?.ssoProvider, false);
+});
+
+test('agent registry keeps no cross-request index state', () => {
+    assert.equal(Object.hasOwn(__internal, 'clearAgentIndexMemo'), false);
+    assert.equal(Object.hasOwn(__internal, 'AGENT_INDEX_TTL_MS'), false);
+    assert.notEqual(buildAgentIndex(), buildAgentIndex(), 'each call scans afresh');
 });

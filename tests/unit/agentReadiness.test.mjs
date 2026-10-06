@@ -467,3 +467,39 @@ test('runCli resolves the router endpoint before auto-enable mutation', async ()
     );
     assert.deepEqual(harness.events, []);
 });
+
+test('an MCP readiness probe deletes its own MCP session exactly once', async () => {
+    const http = await import('node:http');
+    const requests = [];
+    const server = http.createServer((req, res) => {
+        let raw = '';
+        req.on('data', (chunk) => { raw += chunk; });
+        req.on('end', () => {
+            requests.push({ method: req.method, sessionId: req.headers['mcp-session-id'], body: raw });
+            if (req.method === 'DELETE') { res.writeHead(200); res.end(); return; }
+            const message = JSON.parse(raw);
+            if (message.method === 'initialize') {
+                res.writeHead(200, { 'content-type': 'application/json', 'mcp-session-id': 'probe-session-1' });
+                res.end(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { protocolVersion: '2025-06-18' } }));
+            } else if (message.method === 'tools/list') {
+                res.writeHead(200, { 'content-type': 'application/json' });
+                res.end(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { tools: [] } }));
+            } else {
+                res.writeHead(204); res.end();
+            }
+        });
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+        const ready = await waitForAgentReady({ hostPort: server.address().port }, {
+            timeoutMs: 3000, intervalMs: 20, probeTimeoutMs: 1000, protocol: 'mcp',
+        });
+        assert.equal(ready, true);
+        const deletes = requests.filter((r) => r.method === 'DELETE');
+        assert.equal(deletes.length, 1);
+        assert.equal(deletes[0].sessionId, 'probe-session-1');
+        assert.equal(requests.at(-1).method, 'DELETE', 'the DELETE follows tools/list');
+    } finally {
+        await new Promise((resolve) => server.close(resolve));
+    }
+});

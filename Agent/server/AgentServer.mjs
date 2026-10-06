@@ -1019,7 +1019,7 @@ async function registerFromConfig(server, config, helpers) {
             const continuationTool = typeof tool.continuationTool === 'string'
                 ? tool.continuationTool.trim()
                 : '';
-            const invocation = async (...cbArgs) => {
+            const runInvocation = async (...cbArgs) => {
                 let args = cbArgs[0] ?? {};
                 let context = cbArgs[1] ?? {};
                 if (cbArgs.length === 1 && typeof args === 'object' && args !== null && args.requestId) {
@@ -1040,10 +1040,15 @@ async function registerFromConfig(server, config, helpers) {
                     context,
                     helpers
                 });
-                console.log(`[AgentServer/MCP] Tool '${name}' args:`, sanitizeValueForLog(args));
-                console.log(`[AgentServer/MCP] Tool '${name}' context:`, sanitizeContextForLog(context));
+                const debugToolLogs = process.env.PLOINKY_AGENT_TOOL_DEBUG_LOGS === '1';
+                if (debugToolLogs) {
+                    console.log(`[AgentServer/MCP] Tool '${name}' args:`, sanitizeValueForLog(args));
+                    console.log(`[AgentServer/MCP] Tool '${name}' context:`, sanitizeContextForLog(context));
+                }
                 const payload = { tool: name, input: args, metadata: context };
-                console.log(`[AgentServer/MCP] Tool '${name}' payload:`, JSON.stringify(sanitizePayloadForLog(payload)));
+                if (debugToolLogs) {
+                    console.log(`[AgentServer/MCP] Tool '${name}' payload:`, JSON.stringify(sanitizePayloadForLog(payload)));
+                }
                 if (isAsync) {
                     const enqueued = taskQueue.enqueueTask({
                         toolName: name,
@@ -1084,6 +1089,19 @@ async function registerFromConfig(server, config, helpers) {
                     content.push({ type: 'text', text: `stderr:\n${result.stderr}` });
                 }
                 return { content, metadata: { agent: process.env.AGENT_NAME || name } };
+            };
+
+            const invocation = async (...cbArgs) => {
+                const startedAt = Date.now();
+                let outcome = 'ok';
+                try {
+                    return await runInvocation(...cbArgs);
+                } catch (error) {
+                    outcome = 'error';
+                    throw error;
+                } finally {
+                    console.log(`[AgentServer/MCP] tool=${name} mode=spawn ms=${Date.now() - startedAt} outcome=${outcome}`);
+                }
             };
 
             const compiled = getConfiguredToolInputSchema(config, tool);
@@ -1180,6 +1198,8 @@ async function registerFromConfig(server, config, helpers) {
     }
 }
 
+let configLoadLogged = false;
+
 async function createServerInstance() {
     const { McpServer, ResourceTemplate, McpError, ErrorCode } = await loadSdkDeps();
     const server = new McpServer({ name: 'ploinky-agent-mcp', version: '1.0.0' });
@@ -1187,10 +1207,13 @@ async function createServerInstance() {
     const configResult = getConfigResult();
     const config = configResult ? configResult.config : {};
 
-    if (configResult) {
-        console.log(`[AgentServer/MCP] Loaded config from ${configResult.source}`);
-    } else {
-        console.log('[AgentServer/MCP] No configuration file found; starting with an empty configuration.');
+    if (!configLoadLogged) {
+        configLoadLogged = true;
+        if (configResult) {
+            console.log(`[AgentServer/MCP] Loaded config from ${configResult.source}`);
+        } else {
+            console.log('[AgentServer/MCP] No configuration file found; starting with an empty configuration.');
+        }
     }
     await registerFromConfig(server, config, { ResourceTemplate, McpError, ErrorCode });
 

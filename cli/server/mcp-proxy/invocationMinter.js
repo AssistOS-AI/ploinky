@@ -1,5 +1,9 @@
 import { deriveAgentRequestSecret } from '../../utils/security/masterKey.js';
+import { deriveAgentPrincipalId } from '../../utils/security/agentIdentity.js';
 import { resolveAgentDescriptor } from '../../utils/agentRegistry.js';
+import { parseQualifiedAgentReference } from '../../utils/agentRegistryResolver.js';
+import { AGENT_TARGET_AMBIGUOUS, resolveAgentTargetFromSnapshot } from '../../utils/agentTargetResolver.js';
+import { loadActiveRoutingState } from '../routingState.js';
 import {
     AgentAssertionService,
     RouterRequestTokenService,
@@ -28,13 +32,55 @@ const agentAssertionService = new AgentAssertionService({
     resolveAgentSecret: (sourceAgentId) => deriveAgentRequestSecret(sourceAgentId, { encoding: 'buffer' }),
 });
 
-export function resolveProviderPrincipal({ providerAgentRef, providerPrincipal }) {
-    if (providerPrincipal) return String(providerPrincipal).trim();
-    const descriptor = resolveAgentDescriptor(providerAgentRef);
-    if (!descriptor) {
-        throw new Error(`invocationMinter: could not resolve provider '${providerAgentRef}'`);
+// The active generation's snapshot, or null when no generation is active.
+function tryLoadActiveSnapshot() {
+    try {
+        return loadActiveRoutingState().snapshot || null;
+    } catch (_) {
+        return null;
     }
-    return descriptor.principalId;
+}
+
+function unresolvedProvider(providerAgentRef, cause) {
+    const suffix = cause?.code === AGENT_TARGET_AMBIGUOUS ? `: ${cause.message}` : '';
+    const error = new Error(`invocationMinter: could not resolve provider '${providerAgentRef}'${suffix}`);
+    if (cause?.code) error.code = cause.code;
+    return error;
+}
+
+/**
+ * The provider principal comes from the active route: the generation the
+ * Router routes with names the target's repo/agent, which is the identity the
+ * agent was launched with. `snapshot` is the caller's lease snapshot; without
+ * one the active generation is loaded. No installed-repository scan runs.
+ * A bare reference that resolves to no route or enabled record, or only to an
+ * agent alias instance, is refused; a qualified reference without a route or
+ * record falls back to that one agent's installed manifest.
+ */
+export function resolveProviderPrincipal({ providerAgentRef, providerPrincipal, snapshot } = {}) {
+    if (providerPrincipal) return String(providerPrincipal).trim();
+    const ref = typeof providerAgentRef === 'string' ? providerAgentRef.trim() : '';
+    if (!ref) throw unresolvedProvider(providerAgentRef);
+    const activeSnapshot = snapshot ?? tryLoadActiveSnapshot();
+    let target;
+    try {
+        target = resolveAgentTargetFromSnapshot(ref, activeSnapshot);
+    } catch (error) {
+        throw unresolvedProvider(providerAgentRef, error);
+    }
+    if (target) {
+        try {
+            return deriveAgentPrincipalId(target.repo, target.agent);
+        } catch (_) {
+            throw unresolvedProvider(providerAgentRef);
+        }
+    }
+    const qualification = parseQualifiedAgentReference(ref);
+    if (qualification.qualified && !qualification.malformed) {
+        const descriptor = resolveAgentDescriptor(ref, { snapshot: activeSnapshot });
+        if (descriptor?.principalId) return descriptor.principalId;
+    }
+    throw unresolvedProvider(providerAgentRef);
 }
 
 /**
