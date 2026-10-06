@@ -13,8 +13,16 @@
 //   shell-lifecycle  the `shell` command's lifecycle work (runShellLifecycle) around the real additive activation; `hold` makes the caller hold the workspace lease first
 //   merge-capabilities  what a coordinated and a `coordinate: false` merge hand their mutators
 //
-// Argument fields: { routeKey, container, registryRecord, hostPort, ready, failure, breakCommit, noCapabilities }
+// Argument fields: { routeKey, container, registryRecord, hostPort, ready, failure, breakCommit, noCapabilities,
+//                    countCommits, countLoader, breakGeneration, fsyncFails, killAtRetire, noLease }
 //   failure: 'apply' (the merge or switch throws) | 'verify' (targeted restart: the published route is not the exact owner) | 'commit' (additive switch throws)
+//   countCommits     record every retirement commit call (`commits`: the entry and slot keys it writes, `slots: null` when it passes none)
+//   countLoader      count the helper's generation loads (`loaderCalls`); the load itself is the real one
+//   breakGeneration  the helper's generation load throws (counted as well)
+//   fsyncFails       the real commit, whose directory fsync of the store fails after the rename (committed, durability unconfirmed)
+//   killAtRetire     the real commit, and this process SIGKILLs itself just before the rename, holding every lock it took;
+//                    it first writes `KILL_MARKER` in the workspace with its pid
+//   noLease          the site runs under the network-lifecycle lock only, as `ploinky cli <agent>` does (no workspace lease)
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -26,6 +34,7 @@ const cli = (relative) => import(new URL(`../../cli/${relative}`, import.meta.ur
 const readJson = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));
 const agentsFile = path.join(root, '.ploinky', 'agents.json');
 const routingFile = path.join(root, '.ploinky', 'routing.json');
+const KILL_MARKER = 'retirement-killed-before-rename.json';
 
 async function run() {
     const locks = await cli('utils/runtime/maintenanceLocks.js');
@@ -47,18 +56,80 @@ async function run() {
         return { state: selector.state, generation: selector.generation || '', previousGeneration: selector.previousGeneration || '', activationId: selector.activationId || '' };
     };
     const entryKeys = () => Object.keys(store.readHardwareAvailabilityPolicy({ paths }).entries).sort();
+    const slotKeys = () => Object.keys(store.readHardwareAvailabilityPolicy({ paths }).slots).sort();
+    const commits = [];
+    const returns = [];
+    let loaderCalls = 0;
+    const describeCommit = (args) => ({
+        entries: Object.keys(args.entries || {}).sort(),
+        slots: Object.prototype.hasOwnProperty.call(args, 'slots') ? Object.keys(args.slots || {}).sort() : null,
+        expectedRevision: args.expectedRevision ?? null,
+    });
+    // An fs facade whose fsync of the store directory fails (EIO): the store throws only after its rename.
+    const fsyncFailingFs = () => {
+        const directories = new Set();
+        return {
+            ...fs,
+            constants: fs.constants,
+            openSync: (target, flags, mode) => {
+                const descriptor = fs.openSync(target, flags, mode);
+                if (String(target) === paths.availabilityStoreDir) directories.add(descriptor);
+                else directories.delete(descriptor);
+                return descriptor;
+            },
+            closeSync: (descriptor) => { directories.delete(descriptor); return fs.closeSync(descriptor); },
+            fsyncSync: (descriptor) => {
+                if (directories.has(descriptor)) throw Object.assign(new Error('EIO: the fixture failed the store directory fsync'), { code: 'EIO' });
+                return fs.fsyncSync(descriptor);
+            },
+        };
+    };
+    const retirementCommit = () => {
+        if (argument.breakCommit) return { commit: (args) => { commits.push(describeCommit(args)); throw new Error('the retirement commit failed'); } };
+        if (argument.fsyncFails) return { commit: (args) => { commits.push(describeCommit(args)); return store.commitHardwareAvailabilityPolicy({ ...args, fsApi: fsyncFailingFs() }); } };
+        if (argument.killAtRetire) {
+            return { commit: (args) => {
+                commits.push(describeCommit(args));
+                return store.commitHardwareAvailabilityPolicy({ ...args, beforeRename: () => {
+                    fs.writeFileSync(path.join(root, KILL_MARKER), JSON.stringify({ pid: process.pid, commit: describeCommit(args) }));
+                    process.kill(process.pid, 'SIGKILL');
+                } });
+            } };
+        }
+        if (argument.countCommits) return { commit: (args) => { commits.push(describeCommit(args)); return store.commitHardwareAvailabilityPolicy(args); } };
+        return {};
+    };
+    const generationLoader = () => ((argument.countLoader || argument.breakGeneration)
+        ? { loadGeneration: (options) => {
+            loaderCalls += 1;
+            if (argument.breakGeneration) throw Object.assign(new Error('the fixture broke the generation load'), { code: 'FIXTURE_GENERATION_LOAD_FAILED' });
+            return edge.loadActiveEdgeRoutingGeneration(options).generation;
+        } }
+        : {});
     // The real helper; the spy records the selector and the store at the moment retirement STARTS.
     const spyRetire = (options) => {
-        witnesses.push({ site: options.site, selector: selection(), entries: entryKeys(), lease: locks.heldWorkspaceMutationLease()?.operation ?? null });
-        return retirement.retireSameTupleHardwareEntries({
+        witnesses.push({
+            site: options.site, selector: selection(), entries: entryKeys(), slots: slotKeys(),
+            revision: store.readHardwareAvailabilityPolicy({ paths }).revision,
+            lease: locks.heldWorkspaceMutationLease()?.operation ?? null,
+        });
+        const value = retirement.retireSameTupleHardwareEntries({
             ...options,
             log,
-            ...(argument.breakCommit ? { commit: () => { throw new Error('the retirement commit failed'); } } : {}),
+            ...retirementCommit(),
+            ...generationLoader(),
         });
+        returns.push(value);
+        return value;
     };
     const spyAfterApply = (options) => retirement.retireSameTupleAfterApply({ ...options, retire: spyRetire, log });
-    const underStartLocks = (operation, callback) => locks.withWorkspaceMutationLease({ operation }, () => network.withNetworkLifecycleLock(callback));
-    const result = (extra = {}) => ({ phase, witnesses, logs, entriesAfter: entryKeys(), selectorAfter: selection(), ...extra });
+    const underStartLocks = (operation, callback) => (argument.noLease
+        ? network.withNetworkLifecycleLock(callback)
+        : locks.withWorkspaceMutationLease({ operation }, () => network.withNetworkLifecycleLock(callback)));
+    const result = (extra = {}) => ({
+        phase, witnesses, logs, entriesAfter: entryKeys(), slotsAfter: slotKeys(), selectorAfter: selection(),
+        commits, returns, loaderCalls, ...extra,
+    });
     const failure = (error) => ({ code: error?.code || null, message: String(error?.message || error).slice(0, 300) });
     const record = () => structuredClone(argument.registryRecord);
     const successorRecord = () => ({ ...record(), ...(argument.hostPort ? { runtime: 'podman', containerId: 'c'.repeat(64) } : {}) });

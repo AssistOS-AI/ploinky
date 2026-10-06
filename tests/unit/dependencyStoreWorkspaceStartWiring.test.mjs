@@ -12,6 +12,8 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import fs from 'node:fs';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
     createStartLaunchContainment,
@@ -23,9 +25,12 @@ import {
 } from '../../cli/commands/workspaceUtil.js';
 import { summarizeStartResult } from '../../cli/sandbox/hardwareLimits/outcomes.mjs';
 import { tempRoot } from './dependencyStoreFixtures.mjs';
-import { containerOf, entryFor, makeWorld } from './hardwareAvailabilityResolverFixtures.mjs';
-import { runRetirementDriver } from './hardwareAvailabilityRetirementHarness.mjs';
+import { RUN_STARTED_AT_MS, containerOf, entryFor, makeWorld } from './hardwareAvailabilityResolverFixtures.mjs';
+import { DRIVER as RETIREMENT_DRIVER, runRetirementDriver } from './hardwareAvailabilityRetirementHarness.mjs';
 import { stageNoWaitAvailabilitySlots } from '../../cli/commands/noWaitAvailabilitySlots.js';
+import { withEdgeGenerationApplyLock } from '../../cli/sandbox/edgeGeneration.js';
+import { createHardwareAvailabilityResolverCache } from '../../cli/server/hardwareAvailabilityResolver.mjs';
+import { createHardwareAvailabilityLatcher } from '../../cli/server/hardwareAvailabilityLatcher.mjs';
 import {
     CONTAINER,
     driveWiring,
@@ -410,6 +415,86 @@ function retirementWorld(t, { routes = { alpha: {} }, entries = ['alpha'], rotat
     return { world, agents, before: world.selection(), record: (key) => agents[containerOf(key)] };
 }
 
+// ---- D2S.13a: a same-tuple ready publication also retires the published route's terminal slot of that tuple
+const SUPERSEDED = 'hardware_availability_slot_superseded';
+const DURABILITY = 'hardware_availability_entry_retirement_durability_unconfirmed';
+const LATCHED = 'hardware_availability_latched';
+const KILL_MARKER = 'retirement-killed-before-rename.json';
+const linesOf = (run, type) => run.logs.filter((line) => line.type === type);
+const SITE = Object.freeze({
+    S: { phase: 'site-s', name: 'start', error: 'mergeError', field: null },
+    A: { phase: 'site-a', name: 'additive', error: 'activationError', field: 'activated' },
+    R: { phase: 'site-r', name: 'replacement', error: 'activationError', field: 'activated' },
+    T: { phase: 'site-t', name: 'targeted-restart', error: 'commitError', field: 'committed' },
+});
+// What every fresh capture of the active generation denies on a route (a fresh cache: nothing is served from an earlier read).
+const denialNow = (world, routeKey = 'alpha') => world.resolve({ cache: createHardwareAvailabilityResolverCache() }).denials.get(routeKey) || null;
+const classOf = (world, routeKey = 'alpha') => world.resolve({ cache: createHardwareAvailabilityResolverCache() }).slots.get(routeKey)?.evidenceClass ?? null;
+// Stage alpha's slot for its current tuple, as start would, and let the real worker writer give it `kind` evidence (none: missing).
+function stagedSlot(world, { kind = 'hardware', reason = 'R1 refused', routeKey = 'alpha' } = {}) {
+    const slot = world.stageSlot(routeKey);
+    if (kind) world.writeWorker(routeKey, slot, { kind, ...(kind === 'hardware' ? { reason } : {}) });
+    return slot;
+}
+function slotWorld(t, { kind, reason, entries = ['alpha'], routes } = {}) {
+    const fixture = retirementWorld(t, { entries, ...(routes ? { routes } : {}) });
+    const slot = stagedSlot(fixture.world, { kind, reason });
+    return { ...fixture, slot, revision: fixture.world.store().revision };
+}
+// One publication of alpha's tuple at a site, through the driver; it must stand whatever retirement does.
+function publish(site, fixture, extra = {}) {
+    const { phase, error, field } = SITE[site];
+    const argument = site === 'S'
+        ? { ready: [containerOf('alpha')], ...extra }
+        : { routeKey: 'alpha', container: containerOf('alpha'), registryRecord: fixture.record('alpha'), hostPort: 0, ...extra };
+    const run = runRetirementDriver(fixture.world, phase, argument);
+    assert.equal(run[error], null, `${site}: the publication stands: ${JSON.stringify(run[error])}`);
+    if (field) assert.equal(run[field], true, `${site}: published`);
+    assert.equal(run.selectorAfter.state, 'active', `${site}: the published generation is active`);
+    return run;
+}
+// A latcher over the world with the real apply lock; the workspace lease and network lock are stand-ins (they live under the
+// process-wide workspace root), as in the latcher's own in-process leaves.
+function stubLatcher(world) {
+    const logs = [];
+    const latcher = createHardwareAvailabilityLatcher({
+        workspaceRoot: world.root,
+        runningDir: world.runningDir,
+        log: (type, data) => logs.push({ type, ...data }),
+        locks: {
+            createLease: (options) => ({ token: 'stub-lease', operation: options?.operation }),
+            releaseLease: () => true,
+            runWithLease: (_lease, work) => work(),
+            networkLock: (callback) => callback({}),
+            applyLock: (callback, options) => withEdgeGenerationApplyLock(callback, options),
+        },
+        retryMs: 20,
+        pollMs: 60_000,
+    });
+    return { attempt: () => latcher.attempt(), logs };
+}
+// A driver child whose exit is observed, not parsed (the crash case), under the loaders every test process runs with.
+const ROOT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+const LATCHER_DRIVER = path.join(ROOT_DIR, 'tests/unit/hardwareAvailabilityLatcherDriver.mjs');
+function spawnDriver(world, script, phase, argument) {
+    const env = { ...process.env, PLOINKY_WORKSPACE_ROOT: world.root, PLOINKY_ROUTER_HOST_PORT: '18080', PLOINKY_MEDIA_HOST_PORT: '17891' };
+    delete env.NODE_TEST_CONTEXT;
+    const hrefIn = (relative) => pathToFileURL(path.join(ROOT_DIR, relative)).href;
+    return spawnSync(process.execPath, [
+        '--import', hrefIn('tests/helpers/agentlibTestContract.mjs'),
+        '--import', hrefIn('tests/helpers/engineSpawnGuard.mjs'),
+        ...(process.env.C5_MUTATION ? ['--import', hrefIn('tests/hardware-limits/c5MutationRegister.mjs')] : []),
+        script, phase, JSON.stringify(argument),
+    ], { cwd: ROOT_DIR, env, encoding: 'utf8', timeout: 120_000 });
+}
+const lastJsonLine = (child, what) => {
+    const line = String(child.stdout).trim().split('\n').filter(Boolean).pop();
+    if (!line) throw new Error(`${what} wrote no result (exit ${child.status}, signal ${child.signal}): ${String(child.stderr).slice(-800)}`);
+    const value = JSON.parse(line);
+    if (value.driverError) throw new Error(`${what} failed: ${value.driverError.slice(0, 1500)}`);
+    return value;
+};
+
 test('NW1.S-same-tuple-ready-publication-retires-entries-at-its-commit-point', async (t) => {
     // ---- site S, in start's own code: the call is inside the post-readiness merge mutator, before the apply
     {
@@ -509,31 +594,39 @@ test('NW1.S-same-tuple-ready-publication-retires-entries-at-its-commit-point', a
             assert.notEqual(run.witnesses[0].selector.activationId, before.activationId);
         }
     }
-    // ---- post-failure: the apply fails, the entry is kept
+    // ---- post-failure: the apply fails, the entry is kept. L12 (D2S.13a): each world also holds alpha's active slot, which is kept too.
     {
         const r = retirementWorld(t);
+        stagedSlot(r.world);
         const argument = (extra = {}) => ({ routeKey: 'alpha', container: containerOf('alpha'), registryRecord: r.record('alpha'), hostPort: 0, ...extra });
         const replacement = runRetirementDriver(r.world, 'site-r', argument({ failure: 'apply' }));
         assert.match(replacement.activationError.message, /the replacement apply failed/);
         assert.deepEqual(replacement.entriesAfter, ['alpha'], 'R with the apply failing keeps the entry');
+        assert.deepEqual(replacement.slotsAfter, ['alpha'], 'L12 R: and the slot');
         assert.equal(replacement.selectorAfter.state, 'inactive', 'and the selector stays inactive');
         assert.deepEqual(replacement.witnesses, [], 'retirement never started');
         const targeted = retirementWorld(t);
+        stagedSlot(targeted.world);
         const failedApply = runRetirementDriver(targeted.world, 'site-t', { routeKey: 'alpha', container: containerOf('alpha'), registryRecord: targeted.record('alpha'), failure: 'apply' });
         assert.match(failedApply.commitError.message, /the successor publication failed/);
         assert.deepEqual(failedApply.entriesAfter, ['alpha'], 'T with the apply failing keeps the entry');
+        assert.deepEqual(failedApply.slotsAfter, ['alpha'], 'L12 T: and the slot');
         assert.equal(failedApply.selectorAfter.state, 'inactive', 'and the coordinated merge left the selector inactive');
         assert.deepEqual(failedApply.witnesses, []);
         const unverified = retirementWorld(t);
+        stagedSlot(unverified.world);
         const failedVerify = runRetirementDriver(unverified.world, 'site-t', { routeKey: 'alpha', container: containerOf('alpha'), registryRecord: unverified.record('alpha'), failure: 'verify' });
         assert.match(failedVerify.commitError.message, /not .*exact|no longer selects its exact registered owner/);
         assert.deepEqual(failedVerify.entriesAfter, ['alpha'], 'T with the verification failing keeps the entry');
+        assert.deepEqual(failedVerify.slotsAfter, ['alpha'], 'L12 T (verify): and the slot');
         assert.deepEqual(failedVerify.witnesses, []);
         // A: the additive commit throws: the predecessor stays selected and the entry is kept.
         const additive = retirementWorld(t);
+        stagedSlot(additive.world);
         const failedCommit = runRetirementDriver(additive.world, 'site-a', { routeKey: 'alpha', container: containerOf('alpha'), registryRecord: additive.record('alpha'), hostPort: 0, failure: 'commit' });
         assert.match(failedCommit.activationError.message, /the additive commit failed/);
         assert.deepEqual(failedCommit.entriesAfter, ['alpha'], 'A with the commit throwing keeps the entry');
+        assert.deepEqual(failedCommit.slotsAfter, ['alpha'], 'L12 A: and the slot');
         assert.equal(failedCommit.selectorAfter.activationId, additive.before.activationId, 'the predecessor stays selected');
         assert.deepEqual(failedCommit.witnesses, []);
         // A retirement-commit failure at A, R and T: the publication stands, the entry is kept, the failure is logged once.
@@ -545,6 +638,221 @@ test('NW1.S-same-tuple-ready-publication-retires-entries-at-its-commit-point', a
             assert.equal(run.selectorAfter.state, 'active', `${phase}: no false readiness change`);
             assert.equal(failureLogs(run).length, 1, `${phase}: the failure is logged`);
         }
+    }
+    // ---- D2S.13a: the same commit also retires the published route's same-tuple slot when it applies to the published
+    // generation and its evidence is terminal. Each case names the row of the reviewed design (L1-L15).
+    // L1: an unlatched active slot of the published tuple is retired with the entry, in ONE commit, at every site.
+    for (const site of ['S', 'A', 'R', 'T']) {
+        const fixture = slotWorld(t);
+        assert.equal(denialNow(fixture.world)?.reason, 'R1 refused', `L1 ${site}: the active slot denies before the publication`);
+        const run = publish(site, fixture, { countCommits: true });
+        assert.deepEqual(failureLogs(run), [], `L1 ${site}: no retirement failure`);
+        assert.deepEqual([run.entriesAfter, run.slotsAfter], [[], []], `L1 ${site}: alpha is gone from the entries and the slots`);
+        assert.deepEqual(run.commits, [{ entries: [], slots: [], expectedRevision: fixture.revision }], `L1 ${site}: one commit carries both deletions`);
+        assert.equal(run.witnesses.length, 1);
+        assert.equal(run.witnesses[0].revision, fixture.revision, `L1 ${site}: nothing was committed between the publication and the retirement`);
+        assert.deepEqual(run.witnesses[0].slots, ['alpha'], `L1 ${site}: the slot was there when retirement started`);
+        assert.deepEqual(linesOf(run, SUPERSEDED), [{
+            type: SUPERSEDED, site: SITE[site].name, routeKey: 'alpha', key: containerOf('alpha'), runId: fixture.slot.runId, evidenceClass: 'active', recovery: false,
+        }], `L1 ${site}: one superseded line, not recovery`);
+        assert.deepEqual(run.returns.map((value) => [value.retired, value.retiredSlots, value.durabilityUnconfirmed]), [[['alpha'], ['alpha'], undefined]]);
+        assert.equal(denialNow(fixture.world), null, `L1 ${site}: no denial after the publication`);
+        const latcher = stubLatcher(fixture.world);
+        assert.notEqual(latcher.attempt().outcome, 'committed', `L1 ${site}: the latcher finds nothing to latch`);
+        await stageNoWaitAvailabilitySlots({ schedule: [[]], workspaceRoot: fixture.world.root });
+        assert.equal(denialNow(fixture.world), null, `L1 ${site}: the next staging leaves no denial`);
+    }
+    // L2: an older latched entry of the tuple beside a newer active slot: exactly ONE commit with both deletions.
+    for (const site of ['A', 'T']) {
+        const fixture = retirementWorld(t, { entries: [] });
+        fixture.world.commitStore({ entries: { alpha: entryFor('alpha', {
+            runStartedAtMs: RUN_STARTED_AT_MS - 120_000, finishedAtMs: RUN_STARTED_AT_MS - 119_000, reason: 'E1 older cause',
+        }) } });
+        const slot = stagedSlot(fixture.world, { reason: 'S2 newer cause' });
+        const revision = fixture.world.store().revision;
+        assert.equal(denialNow(fixture.world)?.reason, 'S2 newer cause', `L2 ${site}: the newer active slot decides`);
+        const run = publish(site, fixture, { countCommits: true });
+        assert.equal(run.commits.length, 1, `L2 ${site}: exactly one commit`);
+        assert.deepEqual(run.commits[0], { entries: [], slots: [], expectedRevision: revision }, `L2 ${site}: its entries lack alpha and its slots lack alpha`);
+        assert.deepEqual([run.entriesAfter, run.slotsAfter], [[], []]);
+        assert.deepEqual(failureLogs(run), [], `L2 ${site}: no retirement failure`);
+        assert.deepEqual(linesOf(run, SUPERSEDED).map((line) => [line.runId, line.evidenceClass]), [[slot.runId, 'active']]);
+        assert.equal(denialNow(fixture.world), null, `L2 ${site}: no denial`);
+    }
+    // L3: succeeded and failed-generic are terminal too: the slot is retired.
+    for (const [kind, evidenceClass] of [['running', 'succeeded'], ['generic', 'failed-generic']]) {
+        const fixture = slotWorld(t, { kind });
+        assert.equal(classOf(fixture.world), evidenceClass, `L3 ${evidenceClass}: the fixture's evidence class`);
+        const run = publish('A', fixture);
+        assert.deepEqual(failureLogs(run), [], `L3 ${evidenceClass}: no retirement failure`);
+        assert.deepEqual([run.entriesAfter, run.slotsAfter], [[], []], `L3 ${evidenceClass}: the slot is retired with the entry`);
+        assert.deepEqual(linesOf(run, SUPERSEDED).map((line) => [line.evidenceClass, line.recovery]), [[evidenceClass, false]]);
+        assert.equal(denialNow(fixture.world), null, `L3 ${evidenceClass}: no denial`);
+    }
+    // L4: a pending (still live) run keeps its slot; its later refusal still activates against the published successor.
+    for (const site of ['A', 'R', 'T']) {
+        const fixture = slotWorld(t, { kind: 'starting' });
+        assert.equal(classOf(fixture.world), 'pending');
+        const run = publish(site, fixture, { countCommits: true });
+        assert.deepEqual(failureLogs(run), [], `L4 ${site}: no retirement failure`);
+        assert.deepEqual(run.slotsAfter, ['alpha'], `L4 ${site}: the pending slot is kept`);
+        assert.deepEqual(run.entriesAfter, [], `L4 ${site}: the entry of the tuple is retired as before`);
+        assert.deepEqual(run.commits, [{ entries: [], slots: null, expectedRevision: fixture.revision }], `L4 ${site}: an entries-only commit, as at the base`);
+        assert.deepEqual(linesOf(run, SUPERSEDED), [], `L4 ${site}: nothing superseded`);
+        assert.equal(denialNow(fixture.world), null, `L4 ${site}: no denial while the run is pending`);
+        fixture.world.writeWorker('alpha', fixture.slot, { kind: 'hardware', reason: 'R1 refused' });
+        assert.equal(denialNow(fixture.world)?.reason, 'R1 refused', `L4 ${site}: the run's later refusal still denies`);
+    }
+    // L5: missing, unowned and invalid evidence is not terminal: the slot is kept, nothing is superseded, nothing denies.
+    for (const [label, prepare] of [
+        ['missing', () => {}],
+        ['unowned', (world, slot) => {
+            world.writeWorker('alpha', slot, { kind: 'starting' });
+            world.rewriteStatus(slot, (document) => { delete document.pid; });
+        }],
+        ['invalid', (world, slot) => {
+            world.writeWorker('alpha', slot, { kind: 'hardware', reason: 'R1 refused' });
+            world.rewriteStatus(slot, (document) => { document.runId = 'not-this-run'; });
+        }],
+    ]) {
+        const fixture = slotWorld(t, { kind: null });
+        prepare(fixture.world, fixture.slot);
+        assert.equal(classOf(fixture.world), label, `L5 ${label}: the fixture's evidence class`);
+        const run = publish('T', fixture);
+        assert.deepEqual(failureLogs(run), [], `L5 ${label}: no retirement failure`);
+        assert.deepEqual(run.slotsAfter, ['alpha'], `L5 ${label}: the slot is kept`);
+        assert.deepEqual(linesOf(run, SUPERSEDED), [], `L5 ${label}: nothing superseded`);
+        assert.equal(denialNow(fixture.world), null, `L5 ${label}: no denial`);
+    }
+    // L6: a terminal slot of a route that was not published is not touched, and no generation is loaded for it.
+    {
+        const fixture = retirementWorld(t, { routes: { alpha: {}, gamma: {} }, entries: ['alpha'] });
+        const gamma = stagedSlot(fixture.world, { routeKey: 'gamma', reason: 'gamma refused' });
+        assert.equal(denialNow(fixture.world, 'gamma')?.reason, 'gamma refused');
+        const run = publish('A', fixture, { countLoader: true });
+        assert.deepEqual(failureLogs(run), []);
+        assert.deepEqual([run.entriesAfter, run.slotsAfter], [[], ['gamma']], 'L6: alpha\'s entry is retired, gamma\'s slot is kept');
+        assert.deepEqual(linesOf(run, SUPERSEDED), [], 'L6: nothing superseded');
+        assert.equal(run.loaderCalls, 0, 'L6: no published route holds a same-tuple slot: no generation is loaded');
+        assert.equal(denialNow(fixture.world, 'gamma')?.reason, 'gamma refused', 'L6: gamma still denies');
+        assert.equal(fixture.world.store().slots.gamma.runId, gamma.runId);
+    }
+    // L7: a targeted successor: the slot does not apply to the published generation and is kept; staging later retires it.
+    for (const site of ['A', 'R', 'T']) {
+        const fixture = slotWorld(t);
+        const run = publish(site, fixture, { hostPort: 43111 });
+        assert.deepEqual(failureLogs(run), [], `L7 ${site}: no retirement failure`);
+        assert.deepEqual(run.slotsAfter, ['alpha'], `L7 ${site}: the slot of a targeted successor is kept`);
+        assert.deepEqual(linesOf(run, SUPERSEDED), [], `L7 ${site}: nothing superseded`);
+        assert.equal(denialNow(fixture.world), null, `L7 ${site}: a targeted route carries no store denial`);
+        await stageNoWaitAvailabilitySlots({ schedule: [[]], workspaceRoot: fixture.world.root });
+        assert.deepEqual(Object.keys(fixture.world.store().slots), [], `L7 ${site}: staging retires it`);
+    }
+    // L8: the retirement commit fails: the publication stands, the entry AND the slot are kept, one failure line, one
+    // commit attempt and no retry; the denial persists and the latcher later latches it, as recovery.
+    for (const site of ['S', 'A', 'R', 'T']) {
+        const fixture = slotWorld(t);
+        const run = publish(site, fixture, { breakCommit: true });
+        assert.deepEqual([run.entriesAfter, run.slotsAfter], [['alpha'], ['alpha']], `L8 ${site}: the entry and the slot are kept`);
+        assert.equal(failureLogs(run).length, 1, `L8 ${site}: one failure line`);
+        assert.equal(failureLogs(run)[0].site, SITE[site].name);
+        assert.equal(run.commits.length, 1, `L8 ${site}: one commit attempt, never retried`);
+        assert.deepEqual(linesOf(run, SUPERSEDED), [], `L8 ${site}: nothing superseded`);
+        assert.equal(denialNow(fixture.world)?.reason, 'R1 refused', `L8 ${site}: the denial persists`);
+        const latcher = stubLatcher(fixture.world);
+        assert.equal(latcher.attempt().outcome, 'committed', `L8 ${site}: the latcher resolves the kept slot`);
+        assert.ok(latcher.logs.some((line) => line.type === LATCHED && line.resolution === 'latched' && line.recovery === true), `L8 ${site}: as recovery`);
+        assert.equal(fixture.world.store().entries.alpha.source.runId, fixture.slot.runId);
+    }
+    // L9: the generation load fails: one failure line, the entry and the slot are kept, nothing is committed.
+    {
+        const fixture = slotWorld(t);
+        const run = publish('R', fixture, { breakGeneration: true, countCommits: true });
+        assert.equal(failureLogs(run).length, 1, 'L9: one failure line');
+        assert.equal(failureLogs(run)[0].code, 'FIXTURE_GENERATION_LOAD_FAILED');
+        assert.deepEqual([run.entriesAfter, run.slotsAfter], [['alpha'], ['alpha']], 'L9: the entry and the slot are kept');
+        assert.equal(run.loaderCalls, 1);
+        assert.deepEqual(run.commits, [], 'L9: nothing is committed');
+    }
+    // L10: the rename happened and only the directory fsync failed: the deletion stands and is logged as committed,
+    // durability unconfirmed, never as a failure; with (i) a slot and an entry and (ii) an entry only.
+    for (const [label, withSlot] of [['(i) slot and entry', true], ['(ii) entry only', false]]) {
+        const fixture = withSlot ? slotWorld(t) : retirementWorld(t);
+        const revision = fixture.world.store().revision;
+        const run = publish('A', fixture, { fsyncFails: true });
+        const onDisk = fixture.world.store();
+        assert.notEqual(onDisk.revision, revision, `L10 ${label}: the rename happened`);
+        assert.deepEqual([run.entriesAfter, run.slotsAfter], [[], []], `L10 ${label}: the retired items are gone on disk`);
+        assert.deepEqual(failureLogs(run), [], `L10 ${label}: no failure line`);
+        assert.deepEqual(linesOf(run, DURABILITY), [{ type: DURABILITY, site: 'additive', routeKeys: ['alpha'], revision: onDisk.revision }], `L10 ${label}: one durability line`);
+        assert.deepEqual(linesOf(run, SUPERSEDED).map((line) => [line.routeKey, line.durabilityUnconfirmed, line.recovery]),
+            withSlot ? [['alpha', true, false]] : [], `L10 ${label}: the superseded line carries durabilityUnconfirmed`);
+        assert.equal(run.returns.length, 1);
+        assert.equal(run.returns[0].durabilityUnconfirmed, true, `L10 ${label}: the result says durability is unconfirmed`);
+        assert.equal(run.returns[0].failed, undefined, `L10 ${label}: and not failed`);
+        assert.deepEqual(run.commits.map((commit) => commit.slots), [withSlot ? [] : null], `L10 ${label}: one commit`);
+    }
+    // L11: no published route holds a same-tuple slot: the entry is retired exactly as at the base, and no generation is loaded.
+    {
+        const fixture = retirementWorld(t);
+        const revision = fixture.world.store().revision;
+        const run = publish('R', fixture, { breakGeneration: true, countCommits: true });
+        assert.equal(run.loaderCalls, 0, 'L11: no generation load');
+        assert.deepEqual(failureLogs(run), [], 'L11: no failure line');
+        assert.deepEqual(run.entriesAfter, [], 'L11: the entry is retired');
+        assert.deepEqual(run.commits, [{ entries: [], slots: null, expectedRevision: revision }], 'L11: the base commit, with no slots key');
+    }
+    // L13: a crash after the publication and before the rename (T, inside its fresh apply lock): everything is kept, the dead
+    // owner's locks are reclaimed by the existing rules, and the latcher then latches the kept slot as recovery.
+    {
+        const fixture = slotWorld(t);
+        const storeDir = fixture.world.paths.availabilityStoreDir;
+        const policyBefore = fs.readFileSync(fixture.world.paths.availabilityPolicyFile, 'utf8');
+        const child = spawnDriver(fixture.world, RETIREMENT_DRIVER, SITE.T.phase, {
+            routeKey: 'alpha', container: containerOf('alpha'), registryRecord: fixture.record('alpha'), hostPort: 0, killAtRetire: true,
+        });
+        assert.equal(child.signal, 'SIGKILL', `L13: the driver died at the retirement rename: ${String(child.stderr).slice(-800)}`);
+        const marker = JSON.parse(fs.readFileSync(path.join(fixture.world.root, KILL_MARKER), 'utf8'));
+        assert.equal(marker.pid, child.pid, 'L13: the kill happened at the retirement commit, before its rename');
+        assert.equal(fs.readFileSync(fixture.world.paths.availabilityPolicyFile, 'utf8'), policyBefore, 'L13: the policy is byte-identical');
+        assert.deepEqual([Object.keys(fixture.world.store().entries), Object.keys(fixture.world.store().slots)], [['alpha'], ['alpha']], 'L13: the entry and the slot are kept');
+        assert.ok(fs.readdirSync(storeDir).some((name) => name.startsWith(`.policy.json.${child.pid}.`)), 'L13: the dead owner left its temp');
+        assert.equal(JSON.parse(fs.readFileSync(fixture.world.paths.applyLockFile, 'utf8')).pid, child.pid, 'L13: the dead owner still names the apply lock');
+        assert.equal(fixture.world.selection().state, 'active', 'L13: the publication had completed');
+        assert.equal(denialNow(fixture.world)?.reason, 'R1 refused', 'L13: the denial persists');
+        // The real latcher, under the real workspace lease, network lock and apply lock of the workspace, reclaims the
+        // dead owner's locks (the network lock after its stale-owner grace) and latches the kept slot.
+        const recovered = lastJsonLine(spawnDriver(fixture.world, LATCHER_DRIVER, 'recover', { timeoutMs: 40_000 }), 'the latcher driver');
+        assert.deepEqual([recovered.snapshot.entries, recovered.snapshot.slots], [['alpha'], []], 'L13: the latcher latched the kept slot');
+        assert.ok(recovered.logs.some((line) => line.type === LATCHED && line.resolution === 'latched' && line.recovery === true), 'L13: as recovery');
+        assert.equal(fixture.world.store().entries.alpha.source.runId, fixture.slot.runId);
+        assert.deepEqual(fs.readdirSync(storeDir).sort(), ['policy.json'], 'L13: the dead owner\'s temp is swept');
+        assert.equal(fs.existsSync(fixture.world.paths.applyLockFile), false, 'L13: the reclaimed apply lock is released');
+        assert.equal(denialNow(fixture.world)?.reason, 'R1 refused', 'L13: the same cause, now from the latched entry');
+    }
+    // L14: replay: the same publication again commits nothing and logs nothing.
+    {
+        const fixture = slotWorld(t);
+        const first = publish('A', fixture);
+        assert.deepEqual(first.entriesAfter, [], 'L14: the first publication retired the entry');
+        const afterFirst = fixture.world.store().revision;
+        const second = publish('A', fixture, { countCommits: true, countLoader: true });
+        assert.deepEqual(second.commits, [], 'L14: no second commit');
+        assert.deepEqual(second.logs, [], 'L14: no line');
+        assert.equal(second.loaderCalls, 0, 'L14: no generation load');
+        assert.equal(fixture.world.store().revision, afterFirst, 'L14: the replay leaves the store unchanged');
+    }
+    // L15: a caller without the workspace lease (today `ploinky cli <agent>`) fails closed: the publication stands, one
+    // failure line, the entry and the slot are kept, and no generation is loaded.
+    {
+        const fixture = slotWorld(t);
+        const run = publish('A', fixture, { noLease: true, countLoader: true });
+        assert.equal(run.witnesses[0].lease, null, 'L15: the site ran without the workspace lease');
+        assert.equal(failureLogs(run).length, 1, 'L15: one failure line');
+        assert.equal(failureLogs(run)[0].code, 'PLOINKY_WORKSPACE_MUTATION_CAPABILITY_REQUIRED');
+        assert.deepEqual([run.entriesAfter, run.slotsAfter], [['alpha'], ['alpha']], 'L15: the entry and the slot are kept');
+        assert.equal(run.loaderCalls, 0, 'L15: no generation load');
+        assert.equal(denialNow(fixture.world)?.reason, 'R1 refused', 'L15: the denial persists (the recorded residual)');
     }
 });
 
@@ -651,4 +959,14 @@ test('NW1.S-no-retirement-site-uses-an-uncoordinated-merge-and-retirement-stays-
     const helper = SRC('cli/commands/hardwareAvailabilityRetirement.js');
     assert.match(helper, /assertNetworkLifecycleCapability\(networkLifecycleCapability\)/);
     assert.match(helper, /assertEdgeGenerationApplyLockCapability\(\{ workspaceRoot, applyLockCapability, storePaths \}\)/);
+    // D2S.13a. SC1: terminal evidence is the resolver's own class list, imported, never restated.
+    assert.match(helper, /import \{[^}]*\bTERMINAL_SLOT_EVIDENCE_CLASSES\b[^}]*\} from '\.\.\/server\/hardwareAvailabilityResolver\.mjs';/, 'SC1');
+    // SC2: no raw evidence class, no resolve planner or resolve commit, no raw status read.
+    const lines = helper.split('\n');
+    const offending = (pattern) => lines.filter((line) => pattern.test(line));
+    assert.deepEqual(offending(/'(active|succeeded|failed-generic|pending|missing|unowned|invalid)'|planNoWaitAvailabilitySlots|commitNoWaitAvailabilitySlotPlan|readFileSync|openSync/), [], 'SC2');
+    // SC3: the helper only deletes: it never assigns an entry or a slot.
+    assert.deepEqual(offending(/(entries|slots)\[[^\]]+\]\s*=[^=]/), [], 'SC3');
+    // SC4: one commit call, so entries and slots go in one rename.
+    assert.equal(offending(/\bcommit\(\{/).length, 1, 'SC4');
 });

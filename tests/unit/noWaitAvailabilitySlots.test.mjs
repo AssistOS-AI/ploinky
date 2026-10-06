@@ -42,6 +42,14 @@ function newStore(t, entries = { alpha: entryFor('alpha') }) {
     return workspace;
 }
 
+// A required case is one leaf test; a failing variant is named in its message.
+const inVariant = (label, run) => {
+    try { return run(); } catch (error) {
+        if (error instanceof Error) error.message = `[${label}] ${error.message}`;
+        throw error;
+    }
+};
+
 test('NW1.S-frozen-v1-slot-schema-and-cross-field-rules-refuse-without-a-partial-write', async (t) => {
     // Accepted: the full frozen shape, with the revision over {schema, storeId, entries, slots}.
     const ok = newStore(t);
@@ -85,7 +93,7 @@ test('NW1.S-frozen-v1-slot-schema-and-cross-field-rules-refuse-without-a-partial
         'a slot that is not an object': [() => ({ beta: 'slot' })],
     };
     for (const [label, [build, code = 'HARDWARE_AVAILABILITY_POLICY_INVALID']] of Object.entries(refused)) {
-        await t.test(label, () => {
+        inVariant(label, () => {
             const workspace = newStore(t);
             const bytes = sha256(workspace.paths.availabilityPolicyFile);
             assert.throws(() => commit(workspace.root, workspace.paths, { expectedRevision: readStore(workspace.paths).revision, slots: build() }), (error) => error.code === code, label);
@@ -94,7 +102,7 @@ test('NW1.S-frozen-v1-slot-schema-and-cross-field-rules-refuse-without-a-partial
         });
     }
 
-    await t.test('an entry and a slot of one route sharing a run id', () => {
+    inVariant('an entry and a slot of one route sharing a run id', () => {
         const sharedRun = uuid();
         const workspace = newStore(t, { alpha: entryFor('alpha', { runId: sharedRun }) });
         const bytes = sha256(workspace.paths.availabilityPolicyFile);
@@ -107,7 +115,7 @@ test('NW1.S-frozen-v1-slot-schema-and-cross-field-rules-refuse-without-a-partial
     });
 
     // A policy file edited by hand is judged by the same rules, even with a recomputed revision.
-    await t.test('the reader refuses hand-written violations with a valid revision', () => {
+    inVariant('the reader refuses hand-written violations with a valid revision', () => {
         for (const damage of [
             (document) => { delete document.slots.beta.startupGraceMs; },
             (document) => { document.slots.beta.startupGraceMs = 300001; },

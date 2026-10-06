@@ -2,16 +2,27 @@
 // committed hardware-availability entries, through one D1 commit, at the commit points
 // of start (site S), the additive and replacement activations (sites A and R) and a
 // targeted restart (site T). Retirement failure is non-fatal and never retried.
+//
+// D2S.13a: the same commit also retires the published route's slot of exactly the published tuple when that slot
+// applies to the generation being published and its evidence, classified under the same locks by the resolver's
+// own code, is terminal. Non-terminal slots are kept. Nothing is latched, created or attributed as recovery.
 
 import {
     assertEdgeGenerationApplyLockCapability,
+    loadActiveEdgeRoutingGeneration,
     resolveEdgeGenerationPaths,
 } from '../sandbox/edgeGeneration.js';
 import { assertNetworkLifecycleCapability } from '../sandbox/networkLifecycle.js';
 import {
+    HARDWARE_AVAILABILITY_DURABILITY_UNCONFIRMED,
     commitHardwareAvailabilityPolicy,
     readHardwareAvailabilityPolicy,
 } from '../sandbox/hardwareAvailabilityStore.mjs';
+import {
+    TERMINAL_SLOT_EVIDENCE_CLASSES,
+    createHardwareAvailabilityResolverCache,
+    evaluateHardwareAvailabilityOfStore,
+} from '../server/hardwareAvailabilityResolver.mjs';
 import { appendLog } from '../server/utils/logger.js';
 import { withBoundedApplyLock } from './noWaitAvailabilitySlots.js';
 import { assertWorkspaceMutationLease, heldWorkspaceMutationLease } from '../utils/runtime/maintenanceLocks.js';
@@ -25,14 +36,54 @@ const entryTuple = (entry) => ({
     enableGeneration: entry.projection.enableGeneration,
 });
 
+// D2S.13a. Classify the candidate slots (each names exactly a published tuple) against the generation being
+// published, with the resolver's own evaluation, and return those whose evidence is terminal for the slot's own run.
+function terminalCandidateSlots({ store, candidates, generation, paths }) {
+    const candidateSlots = Object.fromEntries(candidates.map(({ routeKey }) => [routeKey, store.slots[routeKey]]));
+    const evaluation = evaluateHardwareAvailabilityOfStore({
+        store: { ...store, entries: {}, slots: candidateSlots },
+        generation,
+        paths,
+        cache: createHardwareAvailabilityResolverCache(),
+    });
+    const terminal = [];
+    for (const [routeKey, slot] of Object.entries(candidateSlots)) {
+        const evidence = evaluation.slots.get(routeKey);
+        if (!evidence || evidence.runId !== slot.runId || !TERMINAL_SLOT_EVIDENCE_CLASSES.includes(evidence.evidenceClass)) continue;
+        terminal.push({ routeKey, key: slot.key, runId: slot.runId, evidenceClass: evidence.evidenceClass });
+    }
+    return terminal;
+}
+
+// After the rename: one line per superseded slot (never recovery) and, when the directory fsync failed, one line for
+// the retired entries. A failing log line never turns a committed retirement into a failure.
+function reportRetirement({ site, retired, superseded, durabilityUnconfirmed, log }) {
+    const unconfirmed = durabilityUnconfirmed ? { durabilityUnconfirmed: true } : {};
+    try {
+        for (const slot of superseded) {
+            log('hardware_availability_slot_superseded', { site, ...slot, ...unconfirmed, recovery: false });
+        }
+        if (durabilityUnconfirmed && retired.length > 0) {
+            log('hardware_availability_entry_retirement_durability_unconfirmed', { site, routeKeys: retired, revision: durabilityUnconfirmed.revision });
+        }
+    } catch (_) { /* the commit stands */ }
+    return { retired, retiredSlots: superseded.map(({ routeKey }) => routeKey), ...unconfirmed };
+}
+
 /**
- * D2S.13. Retire the committed entries whose routeKey and tuple equal a tuple a ready publication just
- * published, through one D1 commit. `published` is [{ routeKey, key, instanceId, enableGeneration }].
+ * D2S.13 and D2S.13a. Retire the committed entries whose routeKey and tuple equal a tuple a ready publication just
+ * published and, in the same D1 commit, each published route's slot of exactly that tuple whose evidence is terminal
+ * against the generation being published. `published` is [{ routeKey, key, instanceId, enableGeneration }].
+ *
+ * The generation being published is `generation` when the caller has it (site S, before its apply), and otherwise
+ * the active one, loaded under the apply lock the caller holds (sites A, R and T). It is loaded and evaluated only
+ * when a published route holds a slot of the published tuple; otherwise the commit is the entries-only one.
  *
  * It asserts the workspace lease (held and live), the live network-lifecycle capability and the live apply-lock
  * capability bound to the store it writes. A failure is NON-FATAL by design: it is logged as
- * `hardware_availability_entry_retirement_failed`, the publication stands and the entry is kept (fail-closed);
- * there is no retry. It never throws.
+ * `hardware_availability_entry_retirement_failed`, the publication stands and the entries and slots are kept
+ * (fail-closed); there is no retry. Only the store's own post-rename directory fsync failure is not a failure: the
+ * deletion stands and is reported with `durabilityUnconfirmed`. It never throws.
  */
 export function retireSameTupleHardwareEntries({
     site,
@@ -40,6 +91,8 @@ export function retireSameTupleHardwareEntries({
     applyLockCapability,
     networkLifecycleCapability,
     published,
+    generation,
+    loadGeneration = (options) => loadActiveEdgeRoutingGeneration(options).generation,
     commit = commitHardwareAvailabilityPolicy,
     log = appendLog,
     assertLease = () => {
@@ -68,14 +121,30 @@ export function retireSameTupleHardwareEntries({
                 retired.push(tuple.routeKey);
             }
         }
+        // D2S.13a. Only a published route whose slot names exactly the published tuple is a candidate. Without one,
+        // no generation is loaded or evaluated, and the commit below is the entries-only one.
+        const candidates = (published || []).filter((tuple) => sameTuple(store.slots[tuple.routeKey], tuple));
+        const superseded = candidates.length > 0
+            ? terminalCandidateSlots({ store, candidates, generation: generation || loadGeneration({ workspaceRoot }), paths })
+            : [];
+        const slots = { ...store.slots };
+        for (const { routeKey } of superseded) delete slots[routeKey];
         const assertApplyLock = (storePaths) => assertEdgeGenerationApplyLockCapability({ workspaceRoot, applyLockCapability, storePaths });
-        if (retired.length === 0) {
+        if (retired.length === 0 && superseded.length === 0) {
             // Nothing to write, but the capability is still proved: a wrong one must never pass silently.
             assertApplyLock(paths);
-            return { retired };
+            return { retired, retiredSlots: [] };
         }
-        commit({ paths, assertApplyLock, expectedRevision: store.revision, entries });
-        return { retired };
+        let durabilityUnconfirmed = null;
+        try {
+            // ONE commit: the entries and the superseded slots go in one rename, or not at all.
+            commit({ paths, assertApplyLock, expectedRevision: store.revision, entries, ...(superseded.length > 0 ? { slots } : {}) });
+        } catch (error) {
+            // The rename happened and only the directory fsync failed: the deletion stands and is never retried.
+            if (error?.code !== HARDWARE_AVAILABILITY_DURABILITY_UNCONFIRMED || error.committed !== true) throw error;
+            durabilityUnconfirmed = error;
+        }
+        return reportRetirement({ site, retired, superseded, durabilityUnconfirmed, log });
     } catch (error) {
         log('hardware_availability_entry_retirement_failed', {
             site,
@@ -83,7 +152,7 @@ export function retireSameTupleHardwareEntries({
             code: error?.code || null,
             message: String(error?.message || error).slice(0, 300),
         });
-        return { retired: [], failed: error?.code || 'error' };
+        return { retired: [], retiredSlots: [], failed: error?.code || 'error' };
     }
 }
 
@@ -152,6 +221,8 @@ export function retireStartReadyPublications({
         applyLockCapability: capabilities?.applyLockCapability,
         networkLifecycleCapability: capabilities?.networkLifecycleCapability,
         published,
+        // D2S.13a: the generation start is about to apply (the selector is still inactive here).
+        generation: { agents: registry, routing: current },
         log,
     });
 }

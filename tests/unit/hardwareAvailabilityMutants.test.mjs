@@ -49,6 +49,10 @@ const SITE_A_CALL = "        retireEntries({\n          site: 'additive',\n     
 const SITE_R_CALL = "    await retireEntriesAfterApply({\n      site: 'replacement',\n      networkLifecycleCapability,\n      published: publishedTuple,\n    });\n";
 const SITE_T_CALL = "  await retireEntriesAfterApply({\n    site: 'targeted-restart',\n    networkLifecycleCapability,\n    published: [{\n      routeKey: transition.routeKey,\n      key: transition.containerName,\n      instanceId: text(result.registryRecord.instanceId),\n      enableGeneration: text(result.registryRecord.enableGeneration),\n    }],\n  });\n";
 const retireMutant = (name, file, patches) => ({ name, file, kill: kill(WIRING_TEST, SAME_TUPLE_LEAF), patches });
+const RETIRE_REPORT = '        return reportRetirement({ site, retired, superseded, durabilityUnconfirmed, log });\n';
+const SUPERSEDED_SLOTS = '        const superseded = candidates.length > 0\n            ? terminalCandidateSlots({ store, candidates, generation: generation || loadGeneration({ workspaceRoot }), paths })\n            : [];\n';
+const RETIRE_COMMIT = '            commit({ paths, assertApplyLock, expectedRevision: store.revision, entries, ...(superseded.length > 0 ? { slots } : {}) });\n';
+const RETIRE_DURABILITY_RULE = '            if (error?.code !== HARDWARE_AVAILABILITY_DURABILITY_UNCONFIRMED || error.committed !== true) throw error;\n';
 const STAGING_BLOCK = "    // Stage this run's availability slots in ONE store commit, after the statuses are cleared and before any\n    // marker or worker exists: earlier terminal slots are resolved, superseded slots and stale entries are retired,\n    // and each run about to be spawned gets its slot. Parent-known nodes get none. A failure aborts the start here.\n    await stageNoWaitAvailabilitySlots({\n      schedule: noWaitSchedule,\n      isParentKnown: (entry) => Boolean(unavailableOutcome(entry.node.id)),\n      workspaceRoot: PLOINKY_WORKSPACE_ROOT,\n      startupGraceMs: resolveNoWaitBarrierTimeouts().startupGraceMs,\n    });\n";
 const slotsMutant = (name, killLeaf, patches, killFile = SLOTS_TEST) => ({ name, file: SLOTS, kill: kill(killFile, killLeaf), patches });
 const PROBE = 'tests/unit/hardwareAvailabilityEvidenceProbe.mjs';
@@ -277,7 +281,27 @@ export const AVAILABILITY_MUTANTS = Object.freeze({
     'ms61-the-merge-hands-its-mutator-no-capabilities': retireMutant('ms61-the-merge-hands-its-mutator-no-capabilities', ROUTING_FILE, [
         { from: 'const next = await mutator(current, { applyLockCapability, networkLifecycleCapability: liveNetworkLifecycleCapability }) || current;', to: 'const next = await mutator(current) || current;' }]),
     'ms62-a-retirement-failure-is-fatal': retireMutant('ms62-a-retirement-failure-is-fatal', RETIREMENT, [
-        { from: '        return { retired };\n    } catch (error) {\n', to: '        return { retired };\n    } catch (error) {\n        throw error;\n' }]),
+        { from: `${RETIRE_REPORT}    } catch (error) {\n`, to: `${RETIRE_REPORT}    } catch (error) {\n        throw error;\n` }]),
+    // D2S.13a: the same commit also retires the published route's terminal slot of exactly the published tuple.
+    'ms66-a-ready-publication-keeps-the-terminal-slot-of-its-tuple': retireMutant('ms66-a-ready-publication-keeps-the-terminal-slot-of-its-tuple', RETIREMENT, [
+        { from: SUPERSEDED_SLOTS, to: '        const superseded = [];\n' }]),
+    'ms67-a-ready-publication-retires-non-terminal-slots': retireMutant('ms67-a-ready-publication-retires-non-terminal-slots', RETIREMENT, [
+        { from: ' || !TERMINAL_SLOT_EVIDENCE_CLASSES.includes(evidence.evidenceClass)) continue;', to: ') continue;' }]),
+    'ms68-a-ready-publication-retires-terminal-slots-of-routes-it-did-not-publish': retireMutant('ms68-a-ready-publication-retires-terminal-slots-of-routes-it-did-not-publish', RETIREMENT, [
+        { from: '        const candidates = (published || []).filter((tuple) => sameTuple(store.slots[tuple.routeKey], tuple));\n',
+            to: '        const candidates = Object.keys(store.slots).map((routeKey) => ({ routeKey, ...store.slots[routeKey] }));\n' }]),
+    'ms69-the-slot-retirement-is-a-second-commit': retireMutant('ms69-the-slot-retirement-is-a-second-commit', RETIREMENT, [
+        { from: RETIRE_COMMIT, to: '            const first = commit({ paths, assertApplyLock, expectedRevision: store.revision, entries });\n            if (superseded.length > 0) commit({ paths, assertApplyLock, expectedRevision: first.revision, entries, slots });\n' }]),
+    'ms70-a-superseded-slot-is-logged-as-recovery': retireMutant('ms70-a-superseded-slot-is-logged-as-recovery', RETIREMENT, [
+        { from: '{ site, ...slot, ...unconfirmed, recovery: false }', to: '{ site, ...slot, ...unconfirmed, recovery: true }' }]),
+    'ms71-site-s-passes-no-published-generation': retireMutant('ms71-site-s-passes-no-published-generation', RETIREMENT, [
+        { from: '        generation: { agents: registry, routing: current },\n', to: '' }]),
+    'ms72-a-failed-retirement-commit-is-retried-once': retireMutant('ms72-a-failed-retirement-commit-is-retried-once', RETIREMENT, [
+        { from: `${RETIRE_DURABILITY_RULE}`, to: `            if (error?.code !== HARDWARE_AVAILABILITY_DURABILITY_UNCONFIRMED || error.committed !== true) {\n    ${RETIRE_COMMIT}                ${RETIRE_REPORT.trimStart()}            }\n` }]),
+    'ms73-the-generation-is-loaded-without-a-candidate-slot': retireMutant('ms73-the-generation-is-loaded-without-a-candidate-slot', RETIREMENT, [
+        { from: '        const superseded = candidates.length > 0\n', to: '        const superseded = true\n' }]),
+    'ms74-a-committed-retirement-with-unconfirmed-durability-is-logged-as-a-failure': retireMutant('ms74-a-committed-retirement-with-unconfirmed-durability-is-logged-as-a-failure', RETIREMENT, [
+        { from: `${RETIRE_DURABILITY_RULE}            durabilityUnconfirmed = error;\n`, to: '            throw error;\n' }]),
     // The Router-process latcher (D2S.11): recovery only, fail-fast, one rename, never inside a capture.
     'ms22-the-latcher-waits-on-a-busy-network-lock': latcherMutant('ms22-the-latcher-waits-on-a-busy-network-lock', [
         { from: '                ), { waitMs: 0 }));', to: '                ), { waitMs: 50 }));' }]),
