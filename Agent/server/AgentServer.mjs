@@ -428,8 +428,7 @@ export async function __buildAgenticCompletion({ body, manifest, config, agentId
         buildCommandSpec,
         runTool: (commandSpec, payload) => {
             const pool = poolsByToolName.get(payload?.tool);
-            if (!pool) return executeShell(commandSpec, payload);
-            return callToolWorker(pool, commandSpec, payload, () => executeShell(commandSpec, payload));
+            return runSyncTool(pool, commandSpec, payload);
         },
     });
     return runResponder({
@@ -1664,11 +1663,13 @@ async function main() {
             // Fails queued and in-flight worker calls and kills every worker
             // process group before the task queue drains.
             const workerShutdown = await shutdownToolWorkerPools({ timeoutMs: 20_000, pools: toolWorkerPools });
-            if (!workerShutdown.clean) {
-                console.warn('[AgentServer/MCP] tool worker processes were still present when the shutdown wait ended');
-            }
             await taskQueue.shutdown({ timeoutMs: 20_000, pollMs: 10 });
             await listenerClosed;
+            // Exit zero acknowledges the complete drain to targeted lifecycle
+            // consumers. Preserve worker failure after the other drains finish.
+            if (!workerShutdown.clean) {
+                throw new Error('Tool worker processes were still present when the shutdown wait ended');
+            }
             process.exitCode = 0;
         })().catch((error) => {
             process.exitCode = 1;

@@ -150,7 +150,7 @@ async function freePort() {
     return port;
 }
 
-async function startServer(t, fx, config, { env = {}, identity = true } = {}) {
+async function startServer(t, fx, config, { env = {}, identity = true, ipc = false } = {}) {
     await fs.writeFile(fx.files.config, JSON.stringify(config));
     const secret = crypto.randomBytes(32);
     const audience = 'agent:tool-workers-test';
@@ -163,7 +163,7 @@ async function startServer(t, fx, config, { env = {}, identity = true } = {}) {
             PLOINKY_AGENT_CONFIG: fx.files.config, PLOINKY_AGENT_SECRET: secret.toString('hex'),
             PLOINKY_AGENT_ID: audience, AGENT_NAME: 'fixture-agent', PLOINKY_CODE_DIR: fx.code, ...env,
         },
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: ipc ? ['ignore', 'pipe', 'pipe', 'ipc'] : ['ignore', 'pipe', 'pipe'],
     });
     let output = '';
     child.stdout.on('data', (chunk) => { output += chunk.toString('utf8'); });
@@ -480,6 +480,127 @@ function maxOverlap(spans) {
     return max;
 }
 
+// Exercise the real loop tool bridge in the same module instance as the MCP
+// listener. Only the responder is replaced; no model/inference is invoked.
+async function addLoopPreload(fx) {
+    await fs.appendFile(fx.files.preload, `
+const { __buildAgenticCompletion } = await import(${JSON.stringify(AGENT_SERVER)});
+const config = JSON.parse(fs.readFileSync(${JSON.stringify(fx.files.config)}, 'utf8'));
+process.on('message', async ({ id, toolName, count }) => {
+    try {
+        const results = await Promise.all(Array.from({ length: count }, () => __buildAgenticCompletion({
+            body: { messages: [] }, manifest: {}, config, agentId: 'agent:test',
+            runResponder: ({ toolsMap }) => toolsMap[toolName].handler(null, '{}'),
+        })));
+        process.send({ id, results });
+    } catch (error) {
+        process.send({ id, error: String(error) });
+    }
+});
+process.channel.unref();
+`);
+}
+
+function callLoopTools(server, toolName, count) {
+    const id = server.nextId++;
+    return new Promise((resolve, reject) => {
+        const cleanup = () => {
+            clearTimeout(timer);
+            server.child.off('message', onMessage);
+            server.child.off('exit', onExit);
+        };
+        const onMessage = (message) => {
+            if (message.id !== id) return;
+            cleanup();
+            if (message.error) reject(new Error(message.error));
+            else resolve(message.results);
+        };
+        const onExit = () => { cleanup(); reject(new Error('AgentServer exited before loop completion')); };
+        const timer = setTimeout(() => {
+            cleanup();
+            reject(new Error('AgentServer loop did not complete within 30 s'));
+        }, 30_000);
+        server.child.on('message', onMessage);
+        server.child.once('exit', onExit);
+        server.child.send({ id, toolName, count }, (error) => {
+            if (error) { cleanup(); reject(error); }
+        });
+    });
+}
+
+async function terminateServer(server) {
+    const exited = once(server.child, 'exit');
+    server.child.kill('SIGTERM');
+    let timer;
+    try {
+        return await Promise.race([
+            exited,
+            new Promise((_, reject) => {
+                timer = setTimeout(() => reject(new Error('AgentServer did not exit within 30 s')), 30_000);
+            }),
+        ]);
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+for (const route of ['spawn', 'identity fallback', 'degraded fallback']) {
+    for (const limit of [2, undefined]) {
+        test(`A4: mixed MCP/loop ${route} calls share the spawn limit (${limit ?? 'unset'})`, async (t) => {
+            const fx = await createFixtureAgent(t);
+            await addLoopPreload(fx);
+            const useWorker = route !== 'spawn';
+            if (route === 'degraded fallback') {
+                // Three real pre-ready exits put the pool into degradation.
+                await fs.writeFile(fx.files.worker, 'process.exit(1);\n');
+            }
+            const server = await startServer(t, fx, {
+                ...(limit === undefined ? {} : { maxParallelSyncCalls: limit }),
+                toolWorkers: useWorker ? { fx: workerPool(fx, { size: 1 }) } : {},
+                tools: [
+                    tool(fx, 'slow_tool', 'slow', useWorker ? { worker: 'fx' } : {}),
+                    tool(fx, 'pid_worker', 'pid', { worker: 'fx' }),
+                ],
+            }, { ipc: true });
+            let workers = [];
+            if (route === 'identity fallback') {
+                const pid = Number(okText(await callTool(server, 'pid_worker')));
+                workers = workerLoads(fx);
+                assert.deepEqual(workers, [pid], 'positive control warmed the pool before identity failure');
+                await fs.rm(fx.files.identity);
+            } else if (route === 'degraded fallback') {
+                assert.ok(Number(okText(await callTool(server, 'pid_worker'))) > 0);
+                assert.match(server.output(), /3 consecutive workers exited.*degraded/);
+            }
+
+            const otherSession = await initSession(server);
+            const [loopResults, mcpResults] = await Promise.all([
+                callLoopTools(server, 'slow_tool', 3),
+                Promise.all(Array.from({ length: 3 }, (_, index) => callTool(server, 'slow_tool', {
+                    sessionId: index % 2 ? otherSession : server.sessionId,
+                }))),
+            ]);
+            assert.equal(loopResults.length, 3);
+            const pids = [...loopResults, ...mcpResults.map(okText)].map(Number);
+            assert.ok(pids.every((pid) => Number.isInteger(pid) && pid > 0), 'every call completed successfully');
+            assert.equal(new Set(pids).size, 6, 'every call used its own spawn process exactly once');
+            assert.ok(pids.every((pid) => !workers.includes(pid)), 'fallback did not run in the warm worker');
+            const spans = readLines(fx.files.spans).map((line) => line.split(' ').map(Number));
+            assert.equal(spans.length, 6, 'one execution span per loop/MCP call');
+            if (limit === undefined) {
+                assert.ok(maxOverlap(spans) >= 4, `unset limit must allow overlap above two: ${JSON.stringify(spans)}`);
+            } else {
+                assert.equal(maxOverlap(spans), 2, `aggregate loop/MCP overlap: ${JSON.stringify(spans)}`);
+            }
+            assert.equal(readLines(fx.files.calls).filter((line) => line.endsWith(' slow_tool')).length, 0);
+            const [code, signal] = await terminateServer(server);
+            assert.equal(code, 0, server.output());
+            assert.equal(signal, null);
+            for (const pid of workers) assert.equal(groupAlive(pid), false, `worker group ${pid} leaked`);
+        });
+    }
+}
+
 test('maxParallelSyncCalls bounds sync calls that run as fresh processes; absent means unlimited', async (t) => {
     const fx = await createFixtureAgent(t);
     const tools = [tool(fx, 'slow_spawn', 'slow')];
@@ -524,6 +645,59 @@ test('S6: SIGTERM shuts the pools down, fails the in-flight worker call and exit
     for (const pid of workers) assert.equal(groupAlive(pid), false, `worker group ${pid} outlived the AgentServer`);
     await inFlight;
     assert.doesNotMatch(server.output(), /tool worker processes were still present/);
+});
+
+test('S6b: unclean worker shutdown exits nonzero after TaskQueue and listener cleanup', async (t) => {
+    const fx = await createFixtureAgent(t);
+    const cleanupLog = path.join(fx.tmp, 'cleanup.log');
+    await fs.appendFile(fx.files.preload, `
+import http from 'node:http';
+import { ToolWorkerPool } from ${JSON.stringify(path.join(REPO_ROOT, 'Agent/server/toolWorkerPool.mjs'))};
+import { TaskQueue } from ${JSON.stringify(path.join(REPO_ROOT, 'Agent/server/TaskQueue.mjs'))};
+const record = (event) => fs.appendFileSync(${JSON.stringify(cleanupLog)}, event + '\\n');
+const shutdownPool = ToolWorkerPool.prototype.shutdown;
+ToolWorkerPool.prototype.shutdown = async function (options) {
+    const result = await shutdownPool.call(this, options);
+    if (!result.clean) throw new Error('Fixture worker cleanup actually failed');
+    record('workers-cleaned');
+    return { clean: false };
+};
+const shutdownQueue = TaskQueue.prototype.shutdown;
+TaskQueue.prototype.shutdown = async function (options) {
+    record('queue-started');
+    const result = await shutdownQueue.call(this, options);
+    record('queue-finished');
+    return result;
+};
+const closeListener = http.Server.prototype.close;
+http.Server.prototype.close = function (callback) {
+    return closeListener.call(this, (error) => {
+        record(error ? 'listener-failed' : 'listener-closed');
+        callback?.(error);
+    });
+};
+`);
+    const server = await startServer(t, fx, {
+        toolWorkers: { fx: workerPool(fx) },
+        tools: [tool(fx, 'pid_worker', 'pid', { worker: 'fx' })],
+    });
+    const pid = Number(okText(await callTool(server, 'pid_worker')));
+    assert.deepEqual(workerLoads(fx), [pid]);
+    assert.ok(groupAlive(pid));
+    const [code, signal] = await terminateServer(server);
+    // Check cleanup before the exit assertion so an early throw cannot pass.
+    const events = readLines(cleanupLog);
+    assert.ok(events.includes('workers-cleaned'), JSON.stringify(events));
+    assert.ok(events.indexOf('queue-started') > events.indexOf('workers-cleaned'), JSON.stringify(events));
+    assert.ok(events.indexOf('queue-finished') > events.indexOf('queue-started'), JSON.stringify(events));
+    assert.ok(events.includes('listener-closed'), JSON.stringify(events));
+    assert.ok(!events.includes('listener-failed'), JSON.stringify(events));
+    assert.deepEqual(JSON.parse(await fs.readFile(path.join(fx.tmp, '.tasksQueue'), 'utf8')), []);
+    assert.equal(groupAlive(pid), false, `worker group ${pid} outlived the AgentServer`);
+    assert.equal(signal, null);
+    assert.equal(code, 1, server.output());
+    assert.match(server.output(), /graceful SIGTERM shutdown failed/);
+    assert.match(server.output(), /[Tt]ool worker processes were still present/);
 });
 
 test('the agentic tool loop runs opted-in tools in their pool and other tools as fresh processes', async (t) => {
