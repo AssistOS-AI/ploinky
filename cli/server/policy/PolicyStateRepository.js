@@ -116,6 +116,15 @@ export class PolicyStateRepository {
         return this._load().ok === false;
     }
 
+    // One consistent view of the policy for a caller that makes several
+    // decisions in one request (e.g. MCP tools/list). Every call re-checks the
+    // store version, so the view is never older than the source at call time.
+    // Returns { ok:true, state, index } or { ok:false, corrupt:true }; the
+    // returned objects are shared with the cache and must not be mutated.
+    snapshot() {
+        return this._load();
+    }
+
     getMcpToolEntry(agent, tool) {
         const loaded = this._load();
         if (!loaded.ok) return { corrupt: true };
