@@ -10,7 +10,7 @@ import { getConfig as getWorkspaceConfig } from '../../utils/workspace.js';
 import { resolveAgentDescriptor } from '../../utils/agentRegistry.js';
 import { findAgent } from '../../utils/utils.js';
 import { emitAuthenticationSessionInvalidated } from './sessionEvents.js';
-import { createProviderConfigReader } from './providerConfigValues.js';
+import { createProviderConfigReader, tryLoadActiveSnapshot } from './providerConfigValues.js';
 import { validateCanonicalLoginOrigin } from './canonicalLoginOrigin.mjs';
 
 /**
@@ -48,7 +48,9 @@ function readConfigValue(names, fallback) {
 }
 
 function resolveProviderAgentPath(providerAgentRef) {
-    const descriptor = resolveAgentDescriptor(providerAgentRef);
+    // One provider manifest, under the active route's hostPath when the
+    // generation routes the provider; no installed-repository scan.
+    const descriptor = resolveAgentDescriptor(providerAgentRef, { snapshot: tryLoadActiveSnapshot() });
     if (descriptor?.manifestPath) {
         return path.dirname(descriptor.manifestPath);
     }
