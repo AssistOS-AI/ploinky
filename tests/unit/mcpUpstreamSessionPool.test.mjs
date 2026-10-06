@@ -1018,3 +1018,94 @@ test('proxy: a generation change before the pooled POST fails closed and sends n
     assert.ok(checks >= 1);
     assert.equal(count(forwarder.log, (row) => row.rpc === 'tools/call'), callsBefore);
 });
+
+// ---------------------------------------------------------------------------
+// Pool-owned queue: at most 8 requests in flight per entry; a queued request
+// runs its generation check and mint only when granted, and its wait is bounded.
+
+async function startHoldingUpstream(t, holdMs) {
+    const stats = { concurrentCalls: 0, maxConcurrentCalls: 0 };
+    const upstream = await startFakeUpstream(t, {
+        onRpc: async ({ res, message }) => {
+            if (message?.method !== 'tools/call' && message?.method !== 'tools/list') return false;
+            stats.concurrentCalls += 1;
+            stats.maxConcurrentCalls = Math.max(stats.maxConcurrentCalls, stats.concurrentCalls);
+            const hold = message?.params?.name === 'slow' ? holdMs : 0;
+            await new Promise((resolve) => setTimeout(resolve, hold));
+            stats.concurrentCalls -= 1;
+            const data = Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: {
+                content: [{ type: 'text', text: message?.params?.name || message.method }],
+                tools: [],
+            } }));
+            res.writeHead(200, { 'content-type': 'application/json', 'content-length': data.length });
+            res.end(data);
+            return true;
+        },
+    });
+    return { upstream, stats };
+}
+
+test('queue: a request granted after a generation change is never sent or minted', async (t) => {
+    const { upstream, stats } = await startHoldingUpstream(t, 600);
+    const pool = newPool(t);
+    const key = keyFor({ port: upstream.port });
+    const call = (name, extra = {}) => pool.request({
+        key, hostPort: upstream.port, method: 'tools/call', params: { name, arguments: {} },
+        headers: { authorization: 'Bearer test-token' }, beforeDial: () => true, ...extra,
+    });
+    await call('warm');
+    const slow = Array.from({ length: 8 }, () => call('slow'));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    let generationActive = true;
+    const checks = [];
+    let mints = 0;
+    const ninth = call('ninth', {
+        headers: () => { mints += 1; return { authorization: 'Bearer ninth' }; },
+        beforeDial: () => { checks.push(generationActive); return generationActive; },
+    });
+    let tenthMints = 0;
+    const tenth = call('tenth', { headers: () => { tenthMints += 1; return { authorization: 'Bearer tenth' }; } });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.deepEqual(checks, [], 'no generation check while queued');
+    generationActive = false;
+    await assert.rejects(ninth, (error) => error.code === 'EDGE_GENERATION_CHANGED');
+    for (const result of await Promise.allSettled(slow)) assert.equal(result.status, 'fulfilled');
+    assert.deepEqual(checks, [false], 'checked once, when granted, after the generation change');
+    assert.equal(mints, 0, 'never minted');
+    assert.equal(upstream.log.some((row) => row.authorization === 'Bearer ninth'), false, 'never sent');
+    assert.ok(stats.maxConcurrentCalls <= 8, `at most 8 in flight, saw ${stats.maxConcurrentCalls}`);
+    // A queued request whose own generation check passes still goes out, minted once.
+    const tenthResult = await tenth;
+    assert.equal(tenthResult.result.content[0].text, 'tenth');
+    assert.equal(tenthMints, 1);
+});
+
+test('queue: a queued tools/list times out on its own deadline without sending anything', async (t) => {
+    const { upstream, stats } = await startHoldingUpstream(t, 1500);
+    const pool = newPool(t);
+    const key = keyFor({ port: upstream.port });
+    const call = (name) => pool.request({
+        key, hostPort: upstream.port, method: 'tools/call', params: { name, arguments: {} },
+        headers: { authorization: 'Bearer test-token' }, beforeDial: () => true,
+    });
+    await call('warm');
+    const slow = Array.from({ length: 8 }, () => call('slow'));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    let checks = 0;
+    const startedAt = Date.now();
+    await assert.rejects(pool.request({
+        key, hostPort: upstream.port, method: 'tools/list', params: {}, headers: null, timeoutMs: 300,
+        beforeDial: () => { checks += 1; return true; },
+    }), (error) => error.code === 'UPSTREAM_TRANSPORT' && error.timedOut === true && error.queued === true);
+    const elapsed = Date.now() - startedAt;
+    assert.ok(elapsed >= 250 && elapsed < 1000, `timed out after ${elapsed} ms, expected about 300 ms`);
+    assert.equal(checks, 0);
+    assert.equal(pool.isReady(key), false, 'a queue timeout drops readiness');
+    for (const result of await Promise.allSettled(slow)) assert.equal(result.status, 'fulfilled');
+    assert.equal(upstream.log.some((row) => row.rpc === 'tools/list'), false, 'the timed-out request was never sent');
+    assert.ok(stats.maxConcurrentCalls <= 8);
+    assert.equal(pool.snapshot().entries.length, 1, 'the busy session itself is kept');
+    // FIFO queue still works: a 10th request after the slow batch is served.
+    const after = await call('after');
+    assert.equal(after.result.content[0].text, 'after');
+});

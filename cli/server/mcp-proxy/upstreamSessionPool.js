@@ -38,7 +38,11 @@ const DEFAULT_MAX_ENTRIES = 64;
 const DEFAULT_READY_TTL_MS = 10_000;
 // Below Node's default 5 s server keepAliveTimeout, which AgentServer keeps.
 const FREE_SOCKET_IDLE_MS = 2_000;
-const MAX_SOCKETS_PER_ENTRY = 8;
+// The pool, not http.Agent, bounds concurrency: at most 8 requests in flight
+// per entry. The agent itself is uncapped so a granted request is bound to a
+// socket synchronously inside http.request, right after its generation check.
+const MAX_INFLIGHT_PER_ENTRY = 8;
+const MAX_FREE_SOCKETS_PER_ENTRY = 8;
 const DELETE_TIMEOUT_MS = 1_000;
 
 function parsePositiveInt(value, fallback) {
@@ -188,7 +192,11 @@ export function createUpstreamSessionPool({
     let sweepTimer = null;
 
     function createAgent() {
-        const agent = new httpImpl.Agent({ keepAlive: true, maxSockets: MAX_SOCKETS_PER_ENTRY });
+        const agent = new httpImpl.Agent({
+            keepAlive: true,
+            maxSockets: Infinity,
+            maxFreeSockets: MAX_FREE_SOCKETS_PER_ENTRY,
+        });
         const keepSocketAlive = typeof agent.keepSocketAlive === 'function'
             ? agent.keepSocketAlive.bind(agent)
             : null;
@@ -213,6 +221,8 @@ export function createUpstreamSessionPool({
             protocolVersion: DEFAULT_PROTOCOL_VERSION,
             nextId: 1,
             inflight: 0,
+            active: 0,
+            waiters: [],
             lastUsedAt: now(),
             agent: createAgent(),
             opening: null,
@@ -289,11 +299,60 @@ export function createUpstreamSessionPool({
         if (entry.closed) return;
         entry.closed = true;
         counters.evictions += 1;
+        rejectWaiters(entry);
         // In-flight requests on the entry finish first; the DELETE follows the last one.
         if (immediate || entry.inflight === 0) {
             finishClose(entry);
         } else {
             entry.closeWhenIdle = true;
+        }
+    }
+
+    // Requests beyond MAX_INFLIGHT_PER_ENTRY wait here, before their generation
+    // check and mint; the wait is bounded by the request's own deadline and a
+    // timed-out or rejected waiter has sent nothing.
+    function takeSlot(entry, deadline) {
+        if (entry.active < MAX_INFLIGHT_PER_ENTRY && entry.waiters.length === 0) {
+            entry.active += 1;
+            return null;
+        }
+        return new Promise((resolve, reject) => {
+            const waiter = { resolve, reject, timer: null, done: false };
+            waiter.timer = setTimeout(() => {
+                if (waiter.done) return;
+                waiter.done = true;
+                const index = entry.waiters.indexOf(waiter);
+                if (index >= 0) entry.waiters.splice(index, 1);
+                reject(poolError(UPSTREAM_TRANSPORT, 'MCP error -32001: Request timed out', {
+                    timedOut: true,
+                    queued: true,
+                }));
+            }, Math.max(0, deadline - Date.now()));
+            waiter.timer.unref?.();
+            entry.waiters.push(waiter);
+        });
+    }
+
+    function releaseSlot(entry) {
+        entry.active = Math.max(0, entry.active - 1);
+        while (entry.waiters.length > 0 && entry.active < MAX_INFLIGHT_PER_ENTRY) {
+            const waiter = entry.waiters.shift();
+            if (waiter.done) continue;
+            waiter.done = true;
+            clearTimeout(waiter.timer);
+            entry.active += 1;
+            waiter.resolve();
+        }
+    }
+
+    function rejectWaiters(entry) {
+        for (const waiter of entry.waiters.splice(0)) {
+            if (waiter.done) continue;
+            waiter.done = true;
+            clearTimeout(waiter.timer);
+            waiter.reject(poolError(UPSTREAM_SESSION_LOST, 'upstream MCP session closed before dispatch', {
+                retryable: true,
+            }));
         }
     }
 
@@ -400,7 +459,9 @@ export function createUpstreamSessionPool({
                     : poolError(UPSTREAM_TRANSPORT, error?.message || 'upstream transport error', { cause: error }));
             };
             const timedOut = () => {
-                request.destroy(poolError(UPSTREAM_TRANSPORT, 'MCP error -32001: Request timed out', { timedOut: true }));
+                const error = poolError(UPSTREAM_TRANSPORT, 'MCP error -32001: Request timed out', { timedOut: true });
+                settle(reject, error);
+                request.destroy(error);
             };
             timer = setTimeout(timedOut, timeoutMs);
             timer.unref?.();
@@ -473,6 +534,11 @@ export function createUpstreamSessionPool({
         // Errors raised by the caller (for example a failed mint) are not
         // upstream failures and leave the session alone.
         if (!POOL_ERROR_CODE_SET.has(error?.code)) return;
+        if (error?.queued) {
+            // Saturated, not broken: nothing was sent. Drop readiness only.
+            forgetKey(entry.key);
+            return;
+        }
         if (error?.code === EDGE_GENERATION_CHANGED) {
             // A half-open session is useless; a ready entry stays for the
             // current lease's other requests (each runs its own check).
@@ -519,11 +585,19 @@ export function createUpstreamSessionPool({
     }
 
     async function attempt({ key, hostPort, method, params, headers, beforeDial, timeoutMs }) {
+        const deadline = Date.now() + timeoutMs;
         const entry = await acquire(key, hostPort, beforeDial, Math.min(timeoutMs, DEFAULT_REQUEST_TIMEOUT_MS));
         entry.inflight += 1;
+        let holdsSlot = false;
         try {
-            // Generation check, then the per-attempt mint, then the POST, with no
-            // asynchronous gap in between.
+            const waiting = takeSlot(entry, deadline);
+            if (waiting) await waiting;
+            holdsSlot = true;
+            if (entry.closed || !entry.sessionId) {
+                throw poolError(UPSTREAM_SESSION_LOST, 'upstream MCP session closed before dispatch', { retryable: true });
+            }
+            // From here to http.request everything is synchronous: generation
+            // check, per-attempt mint, timer start and socket binding.
             if (beforeDial() !== true) throw generationChanged();
             const supplied = typeof headers === 'function' ? headers() : headers;
             const authorization = typeof supplied?.authorization === 'string' ? supplied.authorization : '';
@@ -532,7 +606,7 @@ export function createUpstreamSessionPool({
             const response = await post(entry, { jsonrpc: '2.0', id, method, params: params ?? {} }, {
                 sessionId: entry.sessionId,
                 authorization,
-                timeoutMs,
+                timeoutMs: Math.max(1, deadline - Date.now()),
             });
             const message = interpretRpcResponse(response, id, { dispatched: true });
             entry.lastUsedAt = now();
@@ -542,6 +616,7 @@ export function createUpstreamSessionPool({
             handleFailure(entry, error);
             throw error;
         } finally {
+            if (holdsSlot) releaseSlot(entry);
             release(entry);
         }
     }
