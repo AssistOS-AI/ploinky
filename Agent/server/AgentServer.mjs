@@ -6,6 +6,7 @@ import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { TaskQueue } from './TaskQueue.mjs';
 import { createToolWorkerPools, shutdownToolWorkerPools } from './toolWorkerPool.mjs';
+import { createAgentServerCodeIdentity } from './toolCodeIdentity.mjs';
 import { preserveJsonSchemaToolListings } from './inputSchema.mjs';
 import { getConfiguredToolInputSchema } from './toolInputSchemaCache.mjs';
 import {
@@ -998,13 +999,26 @@ const taskQueue = new TaskQueue({
 // toolWorkerPool.mjs). Pools are built once from the startup config, never per
 // MCP session. A pool needs a code identity source: workers are replaced when
 // the identity changes, so they never run code older than a fresh process
-// would load. Without one, every tool keeps running as a fresh process.
+// would load. The source is the tree stamp of toolCodeIdentity.mjs; tests can
+// inject their own through the global symbol below. Without a source, every
+// tool keeps running as a fresh process.
 const TOOL_CODE_IDENTITY_OVERRIDE = Symbol.for('ploinky.agentServer.toolCodeIdentity');
 
 function resolveToolCodeIdentity() {
     const override = globalThis[TOOL_CODE_IDENTITY_OVERRIDE];
     if (typeof override === 'function') return override;
-    return null;
+    try {
+        return createAgentServerCodeIdentity({
+            codeDir: process.env.PLOINKY_CODE_DIR || '/code',
+            configPath: initialConfigResult?.source || null,
+            manifestPath: getManifestResult()?.source || null,
+            // Read at call time: the pools exist by then.
+            poolCommand: (poolName) => toolWorkerPools.get(poolName)?.command,
+        });
+    } catch (error) {
+        console.warn(`[AgentServer/MCP] cannot create the tool code identity (${error?.message || error})`);
+        return null;
+    }
 }
 
 function toolWorkersDisabled() {

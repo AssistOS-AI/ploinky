@@ -55,16 +55,22 @@ test.after(() => {
 // worker calls are logged so tests can tell the modes apart.
 async function createFixtureAgent(t) {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'agent-tool-workers-'));
+    // Tool code lives in code/ (the agent code directory); logs, config and
+    // HOME stay outside it, so writing them never changes the code identity.
+    const code = path.join(tmp, 'code');
+    const logs = path.join(tmp, 'logs');
+    await fs.mkdir(code);
+    await fs.mkdir(logs);
     const files = {
-        impl: path.join(tmp, 'impl.mjs'),
-        cli: path.join(tmp, 'cli.mjs'),
-        worker: path.join(tmp, 'worker.mjs'),
+        impl: path.join(code, 'impl.mjs'),
+        cli: path.join(code, 'cli.mjs'),
+        worker: path.join(code, 'worker.mjs'),
         preload: path.join(tmp, 'identity-preload.mjs'),
         identity: path.join(tmp, 'identity.txt'),
-        loads: path.join(tmp, 'loads.log'),
-        calls: path.join(tmp, 'calls.log'),
-        marks: path.join(tmp, 'marks.log'),
-        spans: path.join(tmp, 'spans.log'),
+        loads: path.join(logs, 'loads.log'),
+        calls: path.join(logs, 'calls.log'),
+        marks: path.join(logs, 'marks.log'),
+        spans: path.join(logs, 'spans.log'),
         config: path.join(tmp, 'mcp-config.json'),
     };
     await fs.writeFile(files.impl, `
@@ -118,7 +124,7 @@ globalThis[Symbol.for(${JSON.stringify(IDENTITY_SYMBOL)})] = () => fs.readFileSy
     t.after(async () => {
         await fs.rm(tmp, { recursive: true, force: true });
     });
-    return { tmp, files };
+    return { tmp, code, files, createdAt: Date.now() };
 }
 
 function tool(fx, name, mode, extra = {}) {
@@ -126,14 +132,14 @@ function tool(fx, name, mode, extra = {}) {
         name,
         command: process.execPath,
         args: [fx.files.cli],
-        cwd: fx.tmp,
+        cwd: fx.code,
         env: { FIXTURE_MODE: mode },
         ...extra,
     };
 }
 
 function workerPool(fx, extra = {}) {
-    return { command: process.execPath, args: [fx.files.worker], cwd: fx.tmp, size: 2, ...extra };
+    return { command: process.execPath, args: [fx.files.worker], cwd: fx.code, size: 2, ...extra };
 }
 
 async function freePort() {
@@ -155,7 +161,7 @@ async function startServer(t, fx, config, { env = {}, identity = true } = {}) {
         env: {
             ...isolatedAgentServerEnv(), HOME: fx.tmp, PORT: String(port), PLOINKY_AGENT_BIND_HOST: '127.0.0.1',
             PLOINKY_AGENT_CONFIG: fx.files.config, PLOINKY_AGENT_SECRET: secret.toString('hex'),
-            PLOINKY_AGENT_ID: audience, AGENT_NAME: 'fixture-agent', ...env,
+            PLOINKY_AGENT_ID: audience, AGENT_NAME: 'fixture-agent', PLOINKY_CODE_DIR: fx.code, ...env,
         },
         stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -428,16 +434,39 @@ test('identity: a failing identity hook sends the call to a fresh process', asyn
     assert.match(lines[2], / mode=spawn /);
 });
 
-test('identity: without a code identity source, declared pools are not built and tools spawn', async (t) => {
+test('default identity: new or edited tool code runs as a fresh process until it settles, then in a new worker', async (t) => {
     const fx = await createFixtureAgent(t);
     const server = await startServer(t, fx, {
-        toolWorkers: { fx: workerPool(fx) },
+        toolWorkers: { fx: workerPool(fx, { size: 1, idleTimeoutMs: 600000, maxCallsPerWorker: 10000 }) },
         tools: [tool(fx, 'pid_worker', 'pid', { worker: 'fx' })],
     }, { identity: false });
-    const pids = [Number(okText(await callTool(server, 'pid_worker'))), Number(okText(await callTool(server, 'pid_worker')))];
-    assert.equal(new Set(pids).size, 2);
-    assert.deepEqual(workerLoads(fx), []);
-    assert.match(server.output(), /toolWorkers are declared but no tool code identity source is available/);
+    const settle = async (since) => {
+        const wait = since + 2300 - Date.now();
+        if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+    };
+    const pid = async () => Number(okText(await callTool(server, 'pid_worker')));
+
+    if (Date.now() - fx.createdAt < 1500) {
+        const early = await pid();
+        assert.ok(!workerLoads(fx).includes(early), 'code written moments ago runs as a fresh process');
+    }
+    await settle(fx.createdAt);
+    const original = await pid();
+    assert.deepEqual(workerLoads(fx), [original], 'settled code runs in a warm worker');
+    assert.equal(await pid(), original);
+
+    await fs.appendFile(fx.files.impl, '// edited\n');
+    const editedAt = Date.now();
+    const duringWindow = await pid();
+    assert.notEqual(duringWindow, original);
+    assert.ok(!workerLoads(fx).includes(duringWindow), 'inside the racy window the call runs as a fresh process');
+    await settle(editedAt);
+    assert.ok(groupAlive(original), 'the original worker is still alive after the window');
+    const replaced = await pid();
+    assert.notEqual(replaced, original, 'the worker loaded before the edit served a call');
+    assert.deepEqual(workerLoads(fx), [original, replaced]);
+    assert.match(server.output(), /tool code changed; replacing the worker/);
+    await waitFor(() => !groupAlive(original), { message: 'the retired worker to exit' });
 });
 
 function maxOverlap(spans) {
