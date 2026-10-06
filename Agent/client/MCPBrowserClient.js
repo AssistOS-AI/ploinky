@@ -26,6 +26,36 @@ const TASK_POLL_INTERVAL_MS = (() => {
     }
     return DEFAULT_TASK_POLL_INTERVAL_MS;
 })();
+// Early task polls back off from 250 ms to TASK_POLL_INTERVAL_MS and restart
+// whenever the task status changes.
+const ADAPTIVE_TASK_POLL_DELAYS_MS = [250, 500, 1000, 2000];
+
+// Browser mutation proofs shared by every client on the page, keyed by
+// `origin|routeKey`. The Router's proof is a deterministic MAC over the
+// session, origin, active generation and host route, so one fetched proof is
+// valid for every mutation until one of those changes; the Router then
+// answers 403 browser_csrf_invalid and the client refreshes once. An entry
+// holds either the settled proof or the single in-flight fetch for its key.
+const browserMutationProofs = new Map();
+
+function browserMutationProofKey(origin, routeKey) {
+    return `${origin}|${routeKey}`;
+}
+
+function dropBrowserMutationProof(key) {
+    browserMutationProofs.delete(key);
+}
+
+function dropBrowserMutationProofsForOrigin(origin) {
+    const prefix = `${origin}|`;
+    for (const key of [...browserMutationProofs.keys()]) {
+        if (key.startsWith(prefix)) browserMutationProofs.delete(key);
+    }
+}
+
+export function clearBrowserMutationProofs() {
+    browserMutationProofs.clear();
+}
 
 
 const RECOVERABLE_ERROR_PATTERNS = [
@@ -195,7 +225,6 @@ function createAgentClient(baseUrl, options = {}) {
     let streamUnsupported = disableSseProbe;
     let connectPromise = null;
     let messageId = 0;
-    let browserMutationProofPromise = null;
     const requestControllers = new Set();
 
     const pending = new Map();
@@ -237,39 +266,74 @@ function createAgentClient(baseUrl, options = {}) {
         return headers;
     }
 
-    async function loadBrowserMutationProof({ refresh = false } = {}) {
-        if (!browserAgentRouteKey) return '';
-        if (!refresh && browserMutationProofPromise) return browserMutationProofPromise;
+    function currentBrowserOrigin() {
+        return typeof window !== 'undefined'
+            ? String(window.location?.origin || new URL(window.location?.href || endpoint).origin)
+            : '';
+    }
 
-        browserMutationProofPromise = (async () => {
-            const proofUrl = new URL('/auth/token', endpoint);
-            proofUrl.searchParams.set('mutationRoute', browserAgentRouteKey);
-            const response = await fetch(proofUrl.toString(), {
-                method: 'GET',
-                credentials: 'include',
-                cache: 'no-store',
-                headers: { accept: 'application/json' },
-            });
-            const payload = await response.json().catch(() => ({}));
-            const proof = payload?.browserMutation;
-            const browserOrigin = typeof window !== 'undefined'
-                ? String(window.location?.origin || new URL(window.location?.href || endpoint).origin)
-                : '';
-            if (!response.ok
-                || !proof?.csrfToken
-                || proof.routeKey !== browserAgentRouteKey
-                || proof.origin !== browserOrigin) {
-                const detail = payload?.error || `HTTP ${response.status}`;
-                throw new Error(`Browser mutation proof failed: ${detail}`);
-            }
-            return proof.csrfToken;
-        })();
-
-        try {
-            return await browserMutationProofPromise;
-        } finally {
-            browserMutationProofPromise = null;
+    async function fetchBrowserMutationProof(browserOrigin) {
+        const proofUrl = new URL('/auth/token', endpoint);
+        proofUrl.searchParams.set('mutationRoute', browserAgentRouteKey);
+        const response = await fetch(proofUrl.toString(), {
+            method: 'GET',
+            credentials: 'include',
+            cache: 'no-store',
+            headers: { accept: 'application/json' },
+        });
+        const payload = await response.json().catch(() => ({}));
+        const proof = payload?.browserMutation;
+        if (!response.ok
+            || !proof?.csrfToken
+            || proof.routeKey !== browserAgentRouteKey
+            || proof.origin !== browserOrigin) {
+            const detail = payload?.error || `HTTP ${response.status}`;
+            throw new Error(`Browser mutation proof failed: ${detail}`);
         }
+        return Object.freeze({
+            csrfToken: String(proof.csrfToken),
+            generation: String(proof.generation || ''),
+            origin: browserOrigin,
+            routeKey: browserAgentRouteKey,
+        });
+    }
+
+    // Returns the shared proof for this origin and route. `rejectedToken` is
+    // the proof the Router just refused: a cached or in-flight proof equal to
+    // it is replaced by a new fetch, while a different one is already newer.
+    async function loadBrowserMutationProof({ rejectedToken = '' } = {}) {
+        if (!browserAgentRouteKey) return '';
+        const browserOrigin = currentBrowserOrigin();
+        const key = browserMutationProofKey(browserOrigin, browserAgentRouteKey);
+
+        // Join the settled or in-flight proof; a concurrent caller may already
+        // have replaced a rejected one, so look once more before fetching.
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+            const existing = browserMutationProofs.get(key);
+            if (!existing) break;
+            const proof = existing.proof || await existing.pending;
+            if (!rejectedToken || proof.csrfToken !== rejectedToken) return proof.csrfToken;
+            if (browserMutationProofs.get(key) === existing) dropBrowserMutationProof(key);
+        }
+
+        const entry = { proof: null, pending: null };
+        entry.pending = fetchBrowserMutationProof(browserOrigin).then((proof) => {
+            if (browserMutationProofs.get(key) === entry) {
+                entry.proof = proof;
+                entry.pending = null;
+            }
+            return proof;
+        }, (error) => {
+            if (browserMutationProofs.get(key) === entry) dropBrowserMutationProof(key);
+            throw error;
+        });
+        browserMutationProofs.set(key, entry);
+        return (await entry.pending).csrfToken;
+    }
+
+    function dropOwnBrowserMutationProof() {
+        if (!browserAgentRouteKey) return;
+        dropBrowserMutationProof(browserMutationProofKey(currentBrowserOrigin(), browserAgentRouteKey));
     }
 
     async function isBrowserMutationProofRejection(response) {
@@ -281,9 +345,9 @@ function createAgentClient(baseUrl, options = {}) {
     }
 
     async function sendMutationRequest({ method, body, signal }) {
-        const request = async (refreshProof = false) => {
-            const mutationToken = await loadBrowserMutationProof({ refresh: refreshProof });
-            return fetch(endpoint, {
+        const request = async (rejectedToken = '') => {
+            const mutationToken = await loadBrowserMutationProof({ rejectedToken });
+            const response = await fetch(endpoint, {
                 method,
                 headers: buildHeaders({
                     includeContentType: method === 'POST',
@@ -293,11 +357,17 @@ function createAgentClient(baseUrl, options = {}) {
                 credentials: 'include',
                 signal,
             });
+            return { response, mutationToken };
         };
 
-        let response = await request(false);
+        let { response, mutationToken } = await request();
         if (await isBrowserMutationProofRejection(response)) {
-            response = await request(true);
+            // Refresh once: the rejected proof is replaced, then the request is retried.
+            ({ response } = await request(mutationToken || ''));
+        }
+        if (response.status === 401 && browserAgentRouteKey) {
+            // The session is gone; no proof minted for it on this origin is reusable.
+            dropBrowserMutationProofsForOrigin(currentBrowserOrigin());
         }
         return response;
     }
@@ -511,6 +581,9 @@ function createAgentClient(baseUrl, options = {}) {
                 const isTerminal = status === 'completed' || status === 'failed';
                 const statusChanged = poller.lastStatus !== status;
                 const logChanged = poller.lastLogSeq !== logSeq;
+                if (statusChanged) {
+                    poller.pollDelayIndex = 0;
+                }
                 if (statusChanged || logChanged) {
                     poller.lastStatus = status;
                     poller.lastLogSeq = logSeq;
@@ -528,12 +601,19 @@ function createAgentClient(baseUrl, options = {}) {
         if (taskPollers.has(taskId)) {
             const timer = setTimeout(() => {
                 void pollTaskStatus(taskId, callback);
-            }, TASK_POLL_INTERVAL_MS);
+            }, nextTaskPollDelay(poller));
             const pollerRef = taskPollers.get(taskId);
             if (pollerRef) {
                 pollerRef.timer = timer;
             }
         }
+    }
+
+    function nextTaskPollDelay(poller) {
+        const index = poller.pollDelayIndex || 0;
+        poller.pollDelayIndex = index + 1;
+        const step = ADAPTIVE_TASK_POLL_DELAYS_MS[index] ?? TASK_POLL_INTERVAL_MS;
+        return Math.min(step, TASK_POLL_INTERVAL_MS);
     }
 
     function startTaskPolling(taskId, callback, options = {}) {
@@ -545,6 +625,7 @@ function createAgentClient(baseUrl, options = {}) {
             lastStatus: null,
             lastLogSeq: null,
             lastError: null,
+            pollDelayIndex: 0,
             statusPath: options.statusPath || null
         });
         void pollTaskStatus(taskId, callback);
@@ -904,6 +985,9 @@ function createAgentClient(baseUrl, options = {}) {
         } catch {
             // Ignore close errors
         }
+        // close() ends this client's use of the shared proof (for example after
+        // a logout); the next client for the route fetches a fresh one.
+        dropOwnBrowserMutationProof();
 
         for (const { reject } of pending.values()) {
             reject(new Error('MCP client closed'));
