@@ -215,6 +215,8 @@ async function listImmediateWorkspaceSuggestionsAsync({ safeRoot, safeBase, scan
         candidate.name = entry.name;
         candidates.push(candidate);
     }
+    // Retain only the candidate keys across the sorting and stat awaits.
+    entries.length = 0;
     const sortedCandidates = await sortWorkspaceEntriesAsync(candidates, compareSuggestionKeys);
 
     const accepted = [];

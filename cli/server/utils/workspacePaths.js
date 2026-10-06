@@ -5,7 +5,10 @@ import { setImmediate } from 'node:timers/promises';
 
 import { PLOINKY_WORKSPACE_ROOT } from '../../utils/config.js';
 
-const WORKSPACE_SORT_SLICE_MS = 0.5;
+// Several requests can resume in the same check phase. Reserve most of that
+// turn for response encoding, I/O callbacks and collection, rather than
+// allowing each runnable sort to consume half a millisecond.
+const WORKSPACE_SORT_SLICE_MS = 0.125;
 
 export function getWorkspaceRoot() {
     return path.resolve(PLOINKY_WORKSPACE_ROOT);

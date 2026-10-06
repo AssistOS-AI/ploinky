@@ -6,6 +6,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { Readable } from 'node:stream';
+import { performance } from 'node:perf_hooks';
 
 import * as suggestions from '../../cli/server/handlers/webchat/workspaceSuggestions.js';
 import { listWorkspaceDirectory, handleWorkspaceDirectoriesGet,
@@ -116,6 +117,32 @@ test('workspace sorting yields during comparisons and preserves comparator ties 
     });
     assert.deepEqual(sorted, expected);
     assert.equal(comparedAfterYield, true, 'a large sort must yield before its comparisons finish');
+});
+
+test('workspace sorting reserves CPU time for peer requests while preserving the stable result', async (t) => {
+    const sortAsync = paths.sortWorkspaceEntriesAsync || (async (items, compare) => items.sort(compare));
+    const input = Array.from({ length: 8192 }, (_, ordinal) => ({ key: ordinal % 11, ordinal }));
+    const expected = [...input].sort((left, right) => left.key - right.key);
+    let cpuMs = 0;
+    let previousCpuMs = 0;
+    const intervals = [];
+    let pending;
+    t.mock.method(performance, 'now', () => cpuMs);
+    function tick() {
+        intervals.push(cpuMs - previousCpuMs);
+        previousCpuMs = cpuMs;
+        pending = setImmediate(tick);
+    }
+    pending = setImmediate(tick);
+    t.after(() => clearImmediate(pending));
+    const sorted = await sortAsync(input, (left, right) => {
+        cpuMs += 0.001;
+        return left.key - right.key;
+    });
+    assert.deepEqual(sorted, expected);
+    assert.ok(intervals.length > 0, 'CPU work must yield before finishing');
+    assert.ok(Math.max(...intervals) <= 0.25,
+        `a compute slice consumed ${Math.max(...intervals)}ms of simulated CPU time`);
 });
 
 test('async directory listing matches the 5000-entry shuffled oracle without per-entry lstat', async (t) => {

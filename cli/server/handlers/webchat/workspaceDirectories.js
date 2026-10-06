@@ -51,6 +51,8 @@ export async function listWorkspaceDirectory(context, relativePath = '') {
             kind: entry.isDirectory() ? 'folder' : 'file',
         });
     }
+    // Raw Dirents are request-owned and no longer needed during sorting.
+    directoryEntries.length = 0;
     const sortedEntries = await sortWorkspaceEntriesAsync(entries, (left, right) => {
         if (left.kind !== right.kind) return left.kind === 'folder' ? -1 : 1;
         return collator.compare(left.name, right.name);
