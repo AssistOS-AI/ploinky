@@ -227,7 +227,7 @@ export function createRepositoryProcessObserver({ fsApi = fs, procRoot = '/proc'
             && !sameProcess(record, router) && !sameProcess(record, coordinator));
         return { complete: !incomplete, records: observed, members, writers };
     }
-    async function signal(record, signalName, { coordinator = null, group = false, kill = process.kill } = {}) {
+    async function signal(record, signalName, { coordinator = null, group = false, kill = process.kill, isAllowed = () => true } = {}) {
         if (!['SIGTERM', 'SIGKILL'].includes(signalName)) return false;
         try {
             const current = await read(record.pid, { executable: group });
@@ -235,6 +235,7 @@ export function createRepositoryProcessObserver({ fsApi = fs, procRoot = '/proc'
             if (group && (!sameProcess(record, coordinator) || current.group !== record.pid
                 || current.session !== record.pid || current.exe !== coordinator.exe
                 || JSON.stringify(current.argv) !== JSON.stringify(coordinator.argv))) return false;
+            if (!isAllowed()) return false;
             kill(group ? -current.group : current.pid, signalName);
             return true;
         } catch (_) { return false; }

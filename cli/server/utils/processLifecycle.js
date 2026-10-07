@@ -106,7 +106,7 @@ function closeWebchatSessions(globalState) {
     }
 }
 
-function createGracefulShutdown(server, globalState, agentSessionStore, { beforeClose = [] } = {}) {
+function createGracefulShutdown(server, globalState, agentSessionStore, { beforeClose = [], requiredBeforeClose = [] } = {}) {
     const servers = Array.isArray(server) ? server.filter(Boolean) : [server].filter(Boolean);
     const primaryServer = servers[0];
     return function gracefulShutdown(signal, exitCode = 0) {
@@ -132,6 +132,7 @@ function createGracefulShutdown(server, globalState, agentSessionStore, { before
         closeWebchatSessions(globalState);
         let remaining = servers.length;
         let firstError = null;
+        let requiredCleanupFailed = false;
         const afterClose = (err) => {
             if (err && !firstError) firstError = err;
             remaining -= 1;
@@ -148,6 +149,8 @@ function createGracefulShutdown(server, globalState, agentSessionStore, { before
             if (firstError) {
                 console.error('[SHUTDOWN] Error during server close:', firstError.message);
                 logShutdown('server_close_error', 1, { error: firstError.message, originalReason: shutdownReason });
+            } else if (requiredCleanupFailed) {
+                console.error(`[SHUTDOWN] Server closed with required cleanup failure (exit ${exitCode}).`);
             } else {
                 console.log('[SHUTDOWN] Server closed successfully');
             }
@@ -156,7 +159,8 @@ function createGracefulShutdown(server, globalState, agentSessionStore, { before
                 port: port ?? null,
                 signal: signal || null,
                 pid: process.pid,
-                uptime: process.uptime()
+                uptime: process.uptime(),
+                ...(requiredCleanupFailed ? { requiredCleanupFailed: true, effectiveExitCode: exitCode } : {}),
             };
             appendLog('server_stop', stopPayload);
 
@@ -185,18 +189,31 @@ function createGracefulShutdown(server, globalState, agentSessionStore, { before
             for (const entry of servers) entry.unref();
         };
         const callbacks = Array.isArray(beforeClose) ? beforeClose.filter((entry) => typeof entry === 'function') : [];
-        if (!callbacks.length) {
+        const required = Array.isArray(requiredBeforeClose) ? requiredBeforeClose : [];
+        if (!callbacks.length && !required.length) {
             closeServers();
             return;
         }
-        void Promise.allSettled(callbacks.map((callback) => Promise.resolve().then(callback)))
+        void Promise.allSettled([...callbacks, ...required].map((callback) => Promise.resolve().then(() => callback())))
             .then((results) => {
-                for (const result of results) {
+                for (const result of results.slice(0, callbacks.length)) {
                     if (result.status === 'rejected') {
                         appendLog('shutdown_preclose_error', {
                             error: result.reason?.message || String(result.reason),
                         });
                     }
+                }
+                for (const result of results.slice(callbacks.length)) {
+                    if (result.status === 'fulfilled' && result.value?.ok === true) continue;
+                    requiredCleanupFailed = true;
+                    if (exitCode === 0) exitCode = 1;
+                    const candidateCode = result.status === 'fulfilled' ? result.value?.code : null;
+                    const code = typeof candidateCode === 'string'
+                        && /^PLOINKY_MARKETPLACE_REPOSITORY_[A-Z_]{1,64}$/.test(candidateCode)
+                        ? candidateCode : 'PLOINKY_REQUIRED_CLEANUP_FAILED';
+                    console.error(`[SHUTDOWN] Required cleanup failed: ${code} (exit ${exitCode}).`);
+                    appendLog('shutdown_required_cleanup_failed', { code, effectiveExitCode: exitCode, recoveryRequired: true });
+                    logShutdown('required_cleanup_failed', exitCode, { code, originalReason: shutdownReason });
                 }
             })
             .finally(closeServers);

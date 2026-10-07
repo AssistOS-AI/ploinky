@@ -1100,6 +1100,10 @@ const lifecycle = setupProcessLifecycle(
             const { agentUpstreamSessionPool } = await import('./mcp-proxy/index.js');
             await agentUpstreamSessionPool.closeAll();
         }],
+        requiredBeforeClose: [async () => {
+            const { shutdownMarketplaceRepositoryWorkers } = await import('./marketplaceRepositoryWorker.mjs');
+            return shutdownMarketplaceRepositoryWorkers();
+        }],
     },
 );
 

@@ -35,6 +35,7 @@ import { computeRchHttp, sha256RawBodyHash } from '../../../Agent/lib/requestHas
 import { verifyAgentAssertion } from '../mcp-proxy/invocationMinter.js';
 import { createTokenReplayCache } from '../security/tokens/JwsCodec.js';
 import { runMarketplaceEnableWorker } from '../marketplaceEnableWorker.js';
+import { repositoryWorkerEligible, runMarketplaceRepositoryWorker } from '../marketplaceRepositoryWorker.mjs';
 import { authService, LOCAL_AUTH_COOKIE_NAME, parseCookies, sendJson, sessionTokenService, SSO_AUTH_COOKIE_NAME } from './shared.js';
 import { localSessionAllowedForRoutePlan } from './authContext.js';
 import { findHardwareOutcome, formatHardwareOutcome } from '../../sandbox/hardwareLimits/errors.mjs';
@@ -48,6 +49,7 @@ export const MARKETPLACE_ENABLE_TOOL = 'marketplace.enable_agent';
 const marketplaceAssertionReplayCache = createTokenReplayCache({ maxSize: 4096 });
 
 const SAFE_LIFECYCLE_ERRORS = new Map([
+    ['PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED', { status: 503, message: 'Repository operation requires workspace recovery. Stop the exact Box from its host workspace, then start it again.' }],
     ['EDGE_GENERATION_CHANGED', { status: 503, message: 'The routing generation changed. Refresh Marketplace before retrying.' }],
     ['PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED', { status: 422, message: 'The requested runtime capability is unavailable in Ploinky Box.' }],
     ['PLOINKY_MANIFEST_SECURITY_INVALID', { status: 422, message: 'The agent manifest contains invalid runtime security settings.' }],
@@ -642,6 +644,8 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
     agentListOptions = {}, // a test's listing observes its own live containers
     collectContainers = collectLiveAgentContainersAsync,
     uninstallRepositoryAction = (body) => uninstallMarketplaceRepository(body),
+    repositoryWorker = runMarketplaceRepositoryWorker,
+    repositoryWorkerEligibility = repositoryWorkerEligible,
 } = {}) {
     const route = parseMarketplacePath(parsedUrl.pathname || '/');
     if (!route) return false;
@@ -792,6 +796,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
             })) return true;
         }
 
+        let mutationWatch;
         try {
             let result;
             if (action === 'install') {
@@ -801,13 +806,26 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
                 });
             } else if (action === 'remove') {
                 result = await withWorkspaceMutationLease({ operation: 'repositories-remove' }, () => removeRepositoryLinks(body?.paths));
-            } else if (action === 'install_repo') {
-                const url = normalizeMarketplaceUrl(body?.url);
-                const name = normalizeOptionalMarketplaceRepoName(body?.name);
-                const branch = String(body?.branch || '').trim() || null;
-                result = await withWorkspaceMutationLease({ operation: 'repositories-prepare' }, () => reposSvc.installRepo(url, name, branch, { stdio: 'pipe' }));
-            } else if (action === 'uninstall_repo') {
-                result = await uninstallRepositoryAction(body);
+            } else if (action === 'install_repo' || action === 'uninstall_repo') {
+                const operation = action === 'install_repo'
+                    ? { action, url: normalizeMarketplaceUrl(body?.url), name: normalizeOptionalMarketplaceRepoName(body?.name),
+                        branch: String(body?.branch || '').trim() || null }
+                    : { action, target: String(body?.target || body?.name || '').trim() };
+                if (repositoryWorkerEligibility()) {
+                    mutationWatch = watchResponseClose(res);
+                    if (mutationWatch.isClosed()) return true;
+                    const rawBodyBytes = rawBody.byteLength;
+                    rawBody = undefined;
+                    body = undefined;
+                    const originalLease = routePlan?.lease;
+                    result = await repositoryWorker({ operation, rawBodyBytes, cwd: process.cwd(),
+                        workspaceRoot: PLOINKY_WORKSPACE_ROOT, response: res,
+                        authorize: () => !originalLease?.commit || originalLease.commit() === true });
+                } else if (action === 'install_repo') {
+                    result = await withWorkspaceMutationLease({ operation: 'repositories-prepare' }, () => (
+                        reposSvc.installRepo(operation.url, operation.name, operation.branch, { stdio: 'pipe' })
+                    ));
+                } else result = await uninstallRepositoryAction(body);
             } else if (action === 'enable_agent') {
                 ({ result } = await enableAgentAction(body));
             } else if (action === 'disable_agent') {
@@ -818,14 +836,22 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
                     return true;
                 }
             }
+            if (mutationWatch?.isClosed()) return true;
             const marketplace = await marketplacePayload();
             if (marketplace === MARKETPLACE_REQUEST_CLOSED) return true;
             sendJson(res, 200, { ok: true, action, result, marketplace });
             return true;
         } catch (error) {
+            if (mutationWatch?.isClosed()) return true;
+            if (error?.code === 'marketplace_repository_busy') {
+                sendMarketplaceError(res, 429, 'marketplace_repository_busy', 'Repository operation queue is full. Retry later.');
+                return true;
+            }
             if (sendLifecycleError(res, error)) return true;
             sendMarketplaceError(res, 400, 'marketplace_action_failed', error?.message || 'Marketplace action failed.');
             return true;
+        } finally {
+            mutationWatch?.stop();
         }
     }
 

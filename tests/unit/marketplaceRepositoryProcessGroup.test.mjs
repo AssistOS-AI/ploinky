@@ -245,3 +245,12 @@ test('a parent disappearing during the fresh child observation cannot establish 
     assert.deepEqual(sent, []);
     assert.equal(fixture.handles(), 0);
 });
+
+test('an expired cleanup budget prevents a signal after identity validation completes', async () => {
+    const { observer, options } = await initialized();
+    const sent = [];
+    assert.equal(await observer.signal(options.coordinator, 'SIGKILL', {
+        coordinator: options.coordinator, group: true, isAllowed: () => false, kill: (...args) => sent.push(args),
+    }), false);
+    assert.deepEqual(sent, []);
+});

@@ -20,6 +20,7 @@ export function startRepositorySupervisor({
     let terminal;
     let workerExited = false;
     let observing = false;
+    let observationPromise;
     let poll;
     let cancelTimer;
     let remembered = [];
@@ -40,17 +41,23 @@ export function startRepositorySupervisor({
         // condition, never loss of identities that might still be writers.
         if (union.size > 8_192) { void cancel(); return; }
         remembered = [...union.values()];
-        send({ type: 'cohort', members: remembered });
+        send({ type: 'cohort', members: remembered.map(({ pid, birth, namespace, uids, parent, group, session, state }) => (
+            { pid, birth, namespace, uids, parent, group, session, state }
+        )) });
     };
-    async function observe() {
-        if (!options || observing || state === 'closed') return null;
+    function observe() {
+        if (!options || state === 'closed') return Promise.resolve(null);
+        if (observationPromise) return observationPromise;
         observing = true;
-        try {
-            const observation = await observer.scan(snapshotOptions());
-            remember(observation);
-            if (state === 'settlement-barrier' && observation.writers.length) void cancel();
-            return observation;
-        } finally { observing = false; }
+        observationPromise = (async () => {
+            try {
+                const observation = await observer.scan(snapshotOptions());
+                remember(observation);
+                if (state === 'settlement-barrier' && observation.writers.length) void cancel();
+                return observation;
+            } finally { observing = false; observationPromise = null; }
+        })();
+        return observationPromise;
     }
     async function cancel() {
         if (state === 'closed') return;
@@ -60,22 +67,31 @@ export function startRepositorySupervisor({
         retainExact();
         send({ type: 'recovery', code: 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED' });
         const started = performance.now();
+        const signalDescendants = async (signal, deadline, members = remembered) => {
+            const targets = members.filter((entry) => !sameProcess(entry, options?.router)
+                && !sameProcess(entry, options?.coordinator));
+            let cursor = 0;
+            const allowed = () => performance.now() < deadline;
+            await Promise.allSettled(Array.from({ length: 8 }, async () => {
+                while (cursor < targets.length && allowed()) await observer.signal(targets[cursor++], signal, { isAllowed: allowed });
+            }));
+        };
         // The Router owns final group KILL while connected. Without it, the
         // supervisor must kill its own group, leaving the retained fence for
         // external Box recovery; it cannot claim post-death proof.
         cancelTimer = setTimeout(async () => {
             retainExact();
             if (!channel.connected && options?.coordinator) {
-                await Promise.allSettled(remembered.filter((entry) => !sameProcess(entry, options.coordinator))
-                    .map((entry) => observer.signal(entry, 'SIGKILL')));
-                await observer.signal(options.coordinator, 'SIGKILL', { coordinator: options.coordinator, group: true });
+                await signalDescendants('SIGKILL', started + 6_000);
+                await observer.signal(options.coordinator, 'SIGKILL', { coordinator: options.coordinator, group: true,
+                    isAllowed: () => performance.now() < started + 8_000 });
                 process.exitCode = 1;
             }
         }, 3_000);
-        const observation = await observe();
+        let observation;
+        try { observation = await observe(); } catch (_) { /* retention and escalation still apply */ }
         if (performance.now() - started < 3_000 && observation) {
-            await Promise.allSettled(observation.members.filter((entry) => !sameProcess(entry, options.router))
-                .map((entry) => observer.signal(entry, 'SIGTERM')));
+            await signalDescendants('SIGTERM', started + 3_000, observation.members);
         }
         // Lease acquisition can finish between cancellation and termination.
         // The same-PID operation lookup is repeated before and after exit.
@@ -112,6 +128,7 @@ export function startRepositorySupervisor({
     async function handleMessage(message) {
         if (message?.operationId !== operationId) { await cancel(); return; }
         if (message.type === 'cancel') { await cancel(); return; }
+        if (message.type === 'expire') return; // worker and ownership use the one original deadline
         if (state === 'cancelling') return;
         if (message.type === 'ownership' && state === 'inert') {
             state = 'ownership';
@@ -124,14 +141,15 @@ export function startRepositorySupervisor({
             }
             if (state !== 'ownership') return;
             options = { coordinator: own, router: data.router, baseline: data.baseline, operationId };
-            if (Date.now() >= data.deadline) {
+            if (Date.now() >= data.deadline || data.unusedError) {
                 // Ownership was acknowledged but no thread or lease exists.
                 // This is an unused admission failure, not a failed mutation.
                 send({ type: 'barrier' });
                 send({ type: 'release-granted' });
                 state = 'release-granted';
-                terminal = { ok: false, error: { code: 'workspace_mutation_lock_timeout',
-                    message: 'Timed out waiting for repository operation admission.' } };
+                terminal = { ok: false, error: Date.now() >= data.deadline
+                    ? { code: 'workspace_mutation_lock_timeout', message: 'Timed out waiting for repository operation admission.' }
+                    : data.unusedError };
                 workerExited = true;
                 finish();
                 return;
@@ -156,7 +174,10 @@ export function startRepositorySupervisor({
             // Expiry is still checked again in the worker immediately before
             // service entry. An admitted Git call has no normal time limit.
             state = 'running';
-            worker.postMessage({ ...message, ok: message.ok === true && Date.now() < data.deadline });
+            worker.postMessage(Date.now() >= data.deadline
+                ? { type: 'authorization', operationId, ok: false, error: { code: 'workspace_mutation_lock_timeout',
+                    message: 'Timed out waiting for repository operation admission.' } }
+                : message);
         } else await cancel();
     }
     async function workerMessage(message) {
@@ -176,6 +197,7 @@ export function startRepositorySupervisor({
             await settle();
         } else if (message.type === 'terminal' && state === 'release-granted' && !terminal
             && typeof message.ok === 'boolean') {
+            if (message.error?.code === 'workspace_mutation_lock_release_failed') { await cancel(); return; }
             terminal = message.ok ? { ok: true, result: message.result } : { ok: false, error: message.error };
             finish();
         } else await cancel();
