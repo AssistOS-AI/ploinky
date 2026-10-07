@@ -134,6 +134,28 @@ test('diagnostic faults and floods carry no authority; strict control errors sti
     assert.deepEqual(h.runner.diagnostics(), terminalState, 'finished tickets remain terminal');
 });
 
+for (const key of ['constructor', '__proto__', 'toString', 'hasOwnProperty']) {
+    test(`diagnostic prototype key ${key} only records loss and preserves the live transaction`, async (t) => {
+        const h = harness(t);
+        const pending = h.run(); await flush();
+        const [child] = h.children;
+        const before = h.runner.snapshot();
+        h.message(child, 'diagnostic', { payload: Object.fromEntries([[key, 'SECRET_CANARY']]) });
+        h.message(child, 'diagnostic', { payload: { unknowns: [Object.fromEntries([[key, 'SECRET_CANARY']])] } });
+        await flush();
+        assert.deepEqual(h.runner.snapshot(), before);
+        assert.equal(h.runner.diagnostics().loss, 2);
+        assert.equal(h.runner.diagnostics().firstCause, null);
+        assert.deepEqual(h.signals, []);
+        assert.equal(child.messages.length, 0);
+        assert.doesNotMatch(JSON.stringify(h.runner.diagnostics()), /SECRET_CANARY/);
+        await h.hello(child); await h.authorize(child); h.terminal(child);
+        assert.equal((await pending).status, 'cloned');
+        assert.equal(h.runner.snapshot().accepting, true);
+        assert.equal(h.runner.snapshot().chargedBytes, 0);
+    });
+}
+
 test('wrong diagnostic operation identity cancels, and a pre-hello exit is distinct from an ownership mismatch', async (t) => {
     for (const mode of ['wrong-id', 'pre-hello', 'ownership']) {
         const h = harness(t, { diagnosticSink: () => { throw new Error('SECRET_CANARY'); } });

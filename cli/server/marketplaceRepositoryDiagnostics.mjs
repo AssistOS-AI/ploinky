@@ -33,7 +33,7 @@ export function diagnosticPayload(value, depth = 0) {
     if (keys.length > 32) return null;
     for (const key of keys) {
         const entry = value[key];
-        if (enums[key]?.includes(entry)) output[key] = entry;
+        if (Object.hasOwn(enums, key) && enums[key].includes(entry)) output[key] = entry;
         else if (numbers.has(key) && Number.isSafeInteger(entry) && entry >= 0) output[key] = entry;
         else if (booleans.has(key) && typeof entry === 'boolean') output[key] = entry;
         else if (hashes.has(key) && typeof entry === 'string' && /^[a-f0-9]{64}$/.test(entry)) output[key] = entry;
