@@ -12,6 +12,35 @@ const fingerprint = createHash('sha256').update('ploinky:repository-process-subj
 const subject = { category: 'permission', field: 'environment', errno: 'EACCES',
     basis: 'prior-stable-identity', subjectFingerprint: fingerprint };
 
+test('guard predicates and bounded observation counts remain a closed diagnostic schema', () => {
+    const predicates = ['claim-unresolved', 'claim-expired', 'scan-incomplete', 'flight-expired',
+        'flight-stale', 'remembered-invalid', 'cohort-capacity'];
+    for (const predicate of predicates) {
+        const payload = { predicate, claims: 8192, unresolvedPresent: 8192, unresolvedUnobserved: 8192,
+            observationMs: 2147483647, observationBudgetMs: 1000 };
+        assert.deepEqual(diagnosticPayload(payload), payload);
+    }
+    for (const key of ['claims', 'unresolvedPresent', 'unresolvedUnobserved', 'observationMs', 'observationBudgetMs']) {
+        const limit = key === 'observationMs' ? 2147483647 : key === 'observationBudgetMs' ? 1000 : 8192;
+        assert.deepEqual(diagnosticPayload({ [key]: 0 }), { [key]: 0 });
+        for (const value of [-1, 0.5, NaN, Infinity, limit + 1, 'SECRET_CANARY']) {
+            assert.equal(diagnosticPayload({ [key]: value }), null);
+        }
+    }
+    const diagnostics = createRepositoryDiagnostics({ sink() { throw Error('SECRET_CANARY'); } });
+    assert.equal(diagnostics.retain(id, { predicate: 'claim-unresolved', claims: 1 }, true), true);
+    for (const payload of [{ predicate: 'SECRET_CANARY' }, { predicate: 'absence-unconfirmed' },
+        { predicate: 'claim-unresolved', pid: 50_001 }, { retiredClaims: 1 },
+        { unknowns: [{ predicate: 'claim-unresolved' }] }]) {
+        assert.equal(diagnostics.retain(id, payload, true), false);
+    }
+    for (let i = 0; i < 100; i += 1) diagnostics.retain(id, { predicate: 'flight-expired' }, true);
+    diagnostics.emit();
+    assert.equal(diagnostics.snapshot().firstCause.predicate, 'claim-unresolved');
+    assert.equal(diagnostics.snapshot().recent.length, 32);
+    assert.doesNotMatch(JSON.stringify(diagnostics.snapshot()), /SECRET_CANARY|50001/);
+});
+
 test('process fingerprint uses only individually validated canonical identity fields', () => {
     const hash = diagnosticModule.diagnosticProcessFingerprint;
     assert.equal(typeof hash, 'function');

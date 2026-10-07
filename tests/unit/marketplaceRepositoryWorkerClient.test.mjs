@@ -654,6 +654,9 @@ test('a stalled cohort validation has a bounded deadline and cannot delay cancel
     h.terminal(h.children[0]);
     await h.advance(1_000);
     assert.equal(h.runner.snapshot().accepting, false, 'the bounded validation deadline closes admission');
+    assert.equal(h.runner.diagnostics().firstCause.predicate, 'claim-expired');
+    assert.equal(h.runner.diagnostics().firstCause.observationMs, 1_000);
+    assert.equal(h.runner.diagnostics().firstCause.observationBudgetMs, 1_000);
     const shutdown = h.runner.shutdown();
     await h.advance(8_000);
     await expectSettledRejection(pending, 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED');
@@ -801,6 +804,7 @@ test('the incremental proven-plus-pending identity union is bounded without evic
     assert.equal(observations.flights.length, 1);
     h.message(h.children[0], 'cohort', { members: claims.slice(8_191) });
     assert.equal(h.runner.snapshot().accepting, false, 'the 8193rd distinct identity refuses without eviction');
+    assert.equal(h.runner.diagnostics().firstCause.predicate, 'cohort-capacity');
     await observations.flights[0].resolve(); await h.advance(8_000);
     await expectSettledRejection(pending, 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED');
     assert.equal(h.signals.some((entry) => entry.pid >= 60_000), false, 'unproved overflow claims never become history');
@@ -907,10 +911,112 @@ test('an incomplete observation can preserve positive cleanup identities but nev
     h.message(h.children[0], 'cohort', { members: [owned] }); h.terminal(h.children[0]);
     await h.advance(300);
     assert.equal(h.runner.snapshot().accepting, false, 'partial positive evidence cannot make an incomplete pass successful');
+    assert.equal(h.runner.diagnostics().firstCause.predicate, 'scan-incomplete');
     h.message(h.children[0], 'cohort', { members: [owned] });
     await h.advance(8_000);
     await expectSettledRejection(pending, 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED');
     assert.ok(h.signals.some((entry) => entry.pid === owned.pid && entry.name === 'SIGKILL'));
     assert.equal(h.runner.snapshot().recoveryDebt, true, 'later frames cannot erase the failed observation');
     assert.equal(observations.flights.length, 1, 'unknown results do not create busy-loop scans');
+});
+
+test('cumulative unobserved and foreign claims retain recovery with a precise unresolved predicate', async (t) => {
+    const h = harness(t, { diagnosticSink() { throw Error('SECRET_CANARY'); } });
+    const pending = h.run(); await flush(); await h.hello(h.children[0]); await h.authorize(h.children[0]);
+    const live = sentinelRecord();
+    const unobserved = anotherRecord(50_002);
+    const foreign = anotherRecord(50_003);
+    const scan = h.observer.scan;
+    const histories = [];
+    h.observer.scan = async (options) => {
+        histories.push([...(options?.remembered || [])]);
+        const base = await scan(options);
+        return { ...base, records: [...base.records, live, { ...foreign, birth: '999' }],
+            members: [live], writers: [live], diagnostic: { unknowns: [] } };
+    };
+    h.message(h.children[0], 'cohort', { members: [live] }); await flush();
+    const queued = h.run();
+    h.message(h.children[0], 'cohort', { members: [live, unobserved, foreign] });
+    await h.advance(8_000);
+    await expectSettledRejection(pending, 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED');
+    await expectSettledRejection(queued, 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED');
+    const cause = h.runner.diagnostics().firstCause;
+    assert.equal(cause.phase, 'observation');
+    assert.equal(cause.reason, 'unknown');
+    assert.equal(cause.category, 'io');
+    assert.equal(cause.field, 'identity');
+    assert.equal(cause.errno, 'OTHER');
+    assert.equal(cause.predicate, 'claim-unresolved');
+    assert.equal(cause.claims, 2);
+    assert.equal(cause.unresolvedPresent, 1, 'numeric PID presence does not prove the claimed birth identity');
+    assert.equal(cause.unresolvedUnobserved, 1, 'not observed is not confirmed absence');
+    assert.equal(cause.observationMs, 0);
+    assert.equal(cause.observationBudgetMs, 1_000);
+    assert.equal(h.runner.snapshot().recoveryDebt, true);
+    assert.equal(h.runner.snapshot().accepting, false);
+    assert.equal(h.children.length, 1);
+    assert.equal(histories.some(records => records.some(entry => entry.pid === unobserved.pid || entry.pid === foreign.pid)), false);
+    assert.equal(h.signals.some(entry => entry.pid === unobserved.pid || entry.pid === foreign.pid), false);
+    assert.doesNotMatch(JSON.stringify(h.runner.diagnostics()), /SECRET_CANARY|50002|50003/);
+});
+
+for (const [label, members, predicate] of [
+    ['non-array', null, 'remembered-invalid'],
+    ['invalid identity', [{ ...sentinelRecord(), birth: 'SECRET_CANARY' }], 'remembered-invalid'],
+    ['oversized members', Array.from({ length: 8_193 }, (_, index) => anotherRecord(60_000 + index)), 'cohort-capacity'],
+]) {
+    test(`the ${label} observation guard keeps the refusal and identifies ${predicate}`, async (t) => {
+        const h = harness(t);
+        const pending = h.run(); await flush(); await h.hello(h.children[0]); await h.authorize(h.children[0]);
+        const queued = h.run();
+        h.observer.scan = async () => ({ complete: true, records: [], members, writers: [] });
+        h.message(h.children[0], 'cohort', { members: [sentinelRecord()] });
+        await h.advance(8_000);
+        await expectSettledRejection(pending, 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED');
+        await expectSettledRejection(queued, 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED');
+        assert.equal(h.runner.diagnostics().firstCause.predicate, predicate);
+        assert.equal(h.runner.diagnostics().firstCause.claims, 1);
+        assert.equal(h.children.length, 1);
+        assert.equal(h.signals.some(entry => !entry.group), false);
+        assert.equal(h.runner.snapshot().recoveryDebt, true);
+        assert.doesNotMatch(JSON.stringify(h.runner.diagnostics()), /SECRET_CANARY/);
+    });
+}
+
+test('an observer rejection keeps its field and errno without inventing a synthetic predicate', async (t) => {
+    const h = harness(t);
+    const pending = h.run(); await flush(); await h.hello(h.children[0]); await h.authorize(h.children[0]);
+    const queued = h.run();
+    h.observer.scan = async () => { throw Object.assign(Error('SECRET_CANARY'), {
+        code: 'EACCES', diagnostic: { category: 'permission', field: 'stat', errno: 'EACCES' },
+    }); };
+    h.message(h.children[0], 'cohort', { members: [sentinelRecord()] });
+    await h.advance(8_000);
+    await expectSettledRejection(pending, 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED');
+    await expectSettledRejection(queued, 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED');
+    const cause = h.runner.diagnostics().firstCause;
+    assert.equal(cause.category, 'permission');
+    assert.equal(cause.field, 'stat');
+    assert.equal(cause.errno, 'EACCES');
+    assert.equal(Object.hasOwn(cause, 'predicate'), false);
+    assert.equal(h.signals.some(entry => entry.pid === 50_001), false);
+    assert.equal(h.children.length, 1);
+    assert.doesNotMatch(JSON.stringify(h.runner.diagnostics()), /SECRET_CANARY/);
+});
+
+test('a cancellation census timeout identifies the flight limit without replacing the earlier shutdown cause', async (t) => {
+    const h = harness(t);
+    const pending = h.run(); await flush(); await h.hello(h.children[0]); await h.authorize(h.children[0]);
+    h.observer.scan = () => new Promise(() => {});
+    const shutdown = h.runner.shutdown();
+    await h.advance(1_000);
+    const expired = h.runner.diagnostics().recent.find(entry => entry.predicate === 'flight-expired');
+    assert.equal(expired.claims, 0);
+    assert.equal(expired.observationMs, 1_000);
+    assert.equal(expired.observationBudgetMs, 1_000);
+    assert.equal(h.runner.diagnostics().firstCause.reason, 'shutdown');
+    await h.advance(7_000);
+    await expectSettledRejection(pending, 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED');
+    assert.equal((await shutdown).ok, false);
+    assert.equal(h.runner.snapshot().recoveryDebt, true);
 });

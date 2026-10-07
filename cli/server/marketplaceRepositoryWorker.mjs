@@ -67,11 +67,26 @@ export function createMarketplaceRepositoryRunner({
     function cause(ticket, phase, reason, details = {}) {
         ticket.cause ||= { phase, reason, ...details };
     }
+    function guardFailure(ticket, predicate, reason = 'unknown', counts = {}) {
+        const error = recovery();
+        try {
+            const flight = ticket.cohortFlight;
+            const details = { ...processDiagnostic(error), predicate, claims: ticket.cohortClaims.size, ...counts,
+                ...(flight ? {
+                    observationMs: Math.min(2_147_483_647, Math.max(0, Math.floor(time.monotonic() - flight.started))),
+                    observationBudgetMs: Math.min(PROC_LIMITS.timeoutMs, Math.max(0, Math.floor(flight.deadline - flight.started))),
+                } : {}) };
+            record(ticket, { phase: 'observation', reason, ...details });
+            cause(ticket, 'observation', reason, details);
+        } catch (_) { /* Diagnostic failure cannot change the existing refusal. */ }
+        return error;
+    }
     function observationRecord(ticket, observation, phase) {
         const details = { phase, reason: observation.complete ? 'received' : 'incomplete',
             complete: observation.complete === true, records: observation.records?.length || 0,
             members: observation.members?.length || 0, writers: observation.writers?.length || 0,
-            ...(diagnosticPayload(observation.diagnostic) || {}) };
+            ...(diagnosticPayload(observation.diagnostic) || {}),
+            ...(!observation.complete ? { predicate: 'scan-incomplete', claims: ticket.cohortClaims.size } : {}) };
         record(ticket, details);
         if (!observation.complete) cause(ticket, phase, 'incomplete', details);
     }
@@ -136,12 +151,13 @@ export function createMarketplaceRepositoryRunner({
     const options = (ticket) => ({ baseline: ticket.baseline, coordinator: ticket.coordinator,
         router: ticket.router, operationId: ticket.operationId, remembered: ticket.remembered });
     function prepareRemembered(ticket, records) {
-        if (!Array.isArray(records) || records.length > 8_192) throw recovery();
+        if (!Array.isArray(records)) throw guardFailure(ticket, 'remembered-invalid');
+        if (records.length > 8_192) throw guardFailure(ticket, 'cohort-capacity');
         const normalized = records.map((entry) => Object.fromEntries(COHORT_FIELDS.map((field) => [field, entry?.[field]])));
-        if (normalized.some((entry) => !validCohortRecord(entry))) throw recovery();
+        if (normalized.some((entry) => !validCohortRecord(entry))) throw guardFailure(ticket, 'remembered-invalid');
         const union = new Map(ticket.remembered.map((entry) => [identityKey(entry), entry]));
         for (const entry of normalized) union.set(identityKey(entry), entry);
-        if (new Set([...union.keys(), ...ticket.cohortClaims.keys()]).size > PROC_LIMITS.entries) throw recovery();
+        if (new Set([...union.keys(), ...ticket.cohortClaims.keys()]).size > PROC_LIMITS.entries) throw guardFailure(ticket, 'cohort-capacity');
         return [...union.values()];
     }
     function failCohort(ticket) {
@@ -162,14 +178,19 @@ export function createMarketplaceRepositoryRunner({
         ticket.cohortTimerDeadline = deadline;
         if (!Number.isFinite(deadline) || ticket.finished) return;
         ticket.cohortTimer = time.setTimeout(() => {
-            if (!ticket.finished && earliestClaim(ticket) <= time.monotonic()) failCohort(ticket);
+            if (!ticket.finished && earliestClaim(ticket) <= time.monotonic()) {
+                guardFailure(ticket, 'claim-expired', 'cohort');
+                failCohort(ticket);
+            }
         }, Math.max(0, deadline - time.monotonic()));
     }
     function registerCohort(ticket, records) {
         const receivedAt = time.monotonic();
         if (!ticket.ownershipAcknowledged || !['acquiring', 'awaiting-admission', 'running',
             'settlement-barrier', 'release-granted', 'cancelling'].includes(ticket.state)
-            || !Array.isArray(records) || records.length > 8_192 || records.some((entry) => !validCohortRecord(entry))) throw recovery();
+            || !Array.isArray(records)) throw recovery();
+        if (records.length > 8_192) throw guardFailure(ticket, 'cohort-capacity', 'cohort');
+        if (records.some((entry) => !validCohortRecord(entry))) throw recovery();
         const known = new Set(ticket.remembered.map(identityKey));
         const claims = new Map(ticket.cohortClaims);
         for (const entry of records) {
@@ -178,31 +199,34 @@ export function createMarketplaceRepositoryRunner({
             claims.set(key, { record: { ...entry }, sequence: ++ticket.cohortSequence,
                 deadline: receivedAt + PROC_LIMITS.timeoutMs });
         }
-        if (new Set([...known, ...claims.keys()]).size > PROC_LIMITS.entries) throw recovery();
+        if (new Set([...known, ...claims.keys()]).size > PROC_LIMITS.entries) throw guardFailure(ticket, 'cohort-capacity', 'cohort');
         ticket.cohortClaims = claims;
         scheduleClaimExpiry(ticket);
         if (ticket.cancelling && claims.size) ticket.cancelWake?.();
     }
     function observationPass(ticket, cutoff = Infinity) {
         if (ticket.cohortFlight) return ticket.cohortFlight.promise;
-        if (ticket.finished || ticket.observationUncertain) return Promise.reject(recovery());
-        const deadline = Math.min(time.monotonic() + PROC_LIMITS.timeoutMs, earliestClaim(ticket), cutoff);
+        if (ticket.finished || ticket.observationUncertain) return Promise.reject(guardFailure(ticket, 'flight-stale'));
+        const started = time.monotonic();
+        const deadline = Math.min(started + PROC_LIMITS.timeoutMs, earliestClaim(ticket), cutoff);
         if (time.monotonic() >= deadline) {
             ticket.cohortFailed = true;
             ticket.observationUncertain = true;
-            return Promise.reject(recovery());
+            return Promise.reject(guardFailure(ticket, earliestClaim(ticket) <= time.monotonic() ? 'claim-expired' : 'flight-expired'));
         }
-        const flight = { deadline, watermark: ticket.cohortSequence };
+        const flight = { deadline, started, watermark: ticket.cohortSequence };
         ticket.cohortFlight = flight;
         flight.promise = (async () => {
             let timer;
             try {
                 const observation = await Promise.race([
                     observer.scan(options(ticket)),
-                    new Promise((_, reject) => { timer = time.setTimeout(() => reject(recovery()), deadline - time.monotonic()); }),
+                    new Promise((_, reject) => { timer = time.setTimeout(() => reject(guardFailure(ticket, 'flight-expired')), deadline - time.monotonic()); }),
                 ]);
                 observationRecord(ticket, observation, 'observation');
-                if (ticket.finished || ticket.cohortFlight !== flight || time.monotonic() >= deadline) throw recovery();
+                if (ticket.finished || ticket.cohortFlight !== flight || time.monotonic() >= deadline) {
+                    throw guardFailure(ticket, ticket.finished || ticket.cohortFlight !== flight ? 'flight-stale' : 'flight-expired');
+                }
                 // Only a timely local observation can establish history. A
                 // partial positive cohort may assist recovery, never success.
                 const remembered = prepareRemembered(ticket, observation.members);
@@ -213,9 +237,22 @@ export function createMarketplaceRepositoryRunner({
                     if (proven.has(key)) remaining.delete(key);
                     else if (claim.sequence <= flight.watermark) missing = true;
                 }
-                if (ticket.finished || ticket.cohortFlight !== flight || time.monotonic() >= deadline) throw recovery();
+                if (ticket.finished || ticket.cohortFlight !== flight || time.monotonic() >= deadline) {
+                    throw guardFailure(ticket, ticket.finished || ticket.cohortFlight !== flight ? 'flight-stale' : 'flight-expired');
+                }
                 ticket.remembered = remembered;
-                if (missing) throw recovery();
+                if (missing) {
+                    const counts = {};
+                    try {
+                        const pids = new Set(observation.records.map(entry => entry.pid));
+                        counts.unresolvedPresent = 0;
+                        counts.unresolvedUnobserved = 0;
+                        for (const claim of remaining.values()) if (claim.sequence <= flight.watermark) {
+                            counts[pids.has(claim.record.pid) ? 'unresolvedPresent' : 'unresolvedUnobserved'] += 1;
+                        }
+                    } catch (_) { /* Counts use only the existing census and carry no authority. */ }
+                    throw guardFailure(ticket, observation.complete ? 'claim-unresolved' : 'scan-incomplete', 'unknown', counts);
+                }
                 ticket.cohortClaims = remaining;
                 scheduleClaimExpiry(ticket);
                 return observation;

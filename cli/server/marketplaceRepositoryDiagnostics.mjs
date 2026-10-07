@@ -12,10 +12,13 @@ const enums = {
     category: ['permission', 'io', 'unstable', 'disappearance-unconfirmed', 'malformed', 'truncated', 'deadline', 'reader-saturation', 'entry-overflow', 'lineage', 'overlap', 'unknown'],
     field: ['stat', 'namespace', 'status', 'environment', 'argv', 'executable', 'directory', 'identity', 'birth', 'parent', 'group', 'session', 'none'],
     errno: ['EACCES', 'EPERM', 'ENOENT', 'ESRCH', 'EIO', 'EMFILE', 'ENFILE', 'OTHER'],
+    predicate: ['claim-unresolved', 'claim-expired', 'scan-incomplete', 'flight-expired', 'flight-stale', 'remembered-invalid', 'cohort-capacity'],
     mismatch: ['pid', 'birth', 'namespace', 'uids', 'group', 'session', 'executable', 'argv', 'router-missing', 'unknown'],
     signal: ['SIGTERM', 'SIGKILL', 'SIGINT', 'SIGABRT', 'SIGSEGV', 'OTHER'],
 };
 const numbers = new Set(['deadline', 'elapsedMs', 'receivedAt', 'routerElapsedMs', 'graphReadyAt', 'closedAt', 'exitCode', 'records', 'members', 'writers', 'count', 'unknownLoss']);
+const boundedNumbers = { claims: 8_192, unresolvedPresent: 8_192, unresolvedUnobserved: 8_192,
+    observationMs: 2_147_483_647, observationBudgetMs: 1_000 };
 const booleans = new Set(['routeLease', 'complete', 'connected', 'admitted']);
 const hashes = new Set(['workspace', 'generation']);
 const increment = value => Math.min(2_147_483_647, value + 1);
@@ -71,6 +74,7 @@ export function diagnosticPayload(value, depth = 0) {
     for (const key of keys) {
         const entry = value[key];
         if (Object.hasOwn(enums, key) && enums[key].includes(entry)) output[key] = entry;
+        else if (Object.hasOwn(boundedNumbers, key) && Number.isSafeInteger(entry) && entry >= 0 && entry <= boundedNumbers[key]) output[key] = entry;
         else if (numbers.has(key) && Number.isSafeInteger(entry) && entry >= 0) output[key] = entry;
         else if (booleans.has(key) && typeof entry === 'boolean') output[key] = entry;
         else if (hashes.has(key) && typeof entry === 'string' && /^[a-f0-9]{64}$/.test(entry)) output[key] = entry;
