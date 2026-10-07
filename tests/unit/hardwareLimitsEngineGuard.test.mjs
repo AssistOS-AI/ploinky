@@ -18,13 +18,22 @@ import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import { runSuite } from '../hardware-limits/verify.mjs';
 
 const REPO = fileURLToPath(new URL('../..', import.meta.url));
-const GUARD = path.join(REPO, 'tests', 'helpers', 'engineSpawnGuard.mjs');
+const repositoryGuard = path.join(REPO, 'tests', 'helpers', 'engineSpawnGuard.mjs');
+const inheritedGuard = String(process.env.NODE_OPTIONS || '').match(/(?:^|\s)--import=(\S*engineSpawnGuard\.mjs)(?:\s|$)/)?.[1];
+const GUARD = inheritedGuard
+    ? (inheritedGuard.startsWith('file:') ? fileURLToPath(inheritedGuard) : inheritedGuard)
+    : repositoryGuard;
+// Loading byte-identical guards at two URLs patches child_process twice and
+// rewrites the inner canary PATH again. Exercise one verified guard instance.
+const guardDigest = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+assert.equal(guardDigest(GUARD), guardDigest(repositoryGuard), 'inherited guard bytes must match the tested guard');
 const CANARY = 'ploinky-guard-canary';
 const REFUSED = 'PLOINKY_TEST_ENGINE_SPAWN';
 

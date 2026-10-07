@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
+import { historicalGitFixture } from '../helpers/historicalGitFixture_codex.mjs';
 
 const BASE_SHA = 'c8f38927dd2741da9635debe61c64c39358aa8f9';
 const repositoryRoot = path.resolve(import.meta.dirname, '../..');
@@ -42,9 +43,10 @@ function controlledNodeFixture(root) {
     };
 }
 
-test('package metadata preserves the exact bin map, immutable postinstall and local skill test entry point', () => {
+test('package metadata preserves the exact bin map, immutable postinstall and local skill test entry point', (t) => {
+    const historical = historicalGitFixture(t, BASE_SHA);
     const current = JSON.parse(fs.readFileSync(path.join(repositoryRoot, 'package.json'), 'utf8'));
-    const baseline = JSON.parse(run('git', ['show', `${BASE_SHA}:package.json`]).stdout);
+    const baseline = JSON.parse(run('git', ['-C', historical.root, 'show', `${historical.ref}:package.json`]).stdout);
     const { bin: currentBin, ...currentRest } = current;
     const { bin: baselineBin, ...baselineRest } = baseline;
     const expectedRest = structuredClone(baselineRest);
@@ -84,8 +86,9 @@ const AGENTLIB_GATE_REPLACEMENT = [
     '',
 ].join('\n');
 
-test('packaging binaries preserve baseline bytes apart from the removed AgentLib gate', () => {
-    const baseline = run('git', ['show', `${BASE_SHA}:bin/ploinky`], { encoding: 'utf8' }).stdout;
+test('packaging binaries preserve baseline bytes apart from the removed AgentLib gate', (t) => {
+    const historical = historicalGitFixture(t, BASE_SHA);
+    const baseline = run('git', ['-C', historical.root, 'show', `${historical.ref}:bin/ploinky`], { encoding: 'utf8' }).stdout;
     assert.ok(baseline.includes(REMOVED_AGENTLIB_GATE), 'the baseline launcher must contain the retired gate');
     const expected = baseline.replace(REMOVED_AGENTLIB_GATE, AGENTLIB_GATE_REPLACEMENT);
     assert.equal(
@@ -95,7 +98,7 @@ test('packaging binaries preserve baseline bytes apart from the removed AgentLib
     for (const name of ['p-cli', 'ploinky-shell']) {
         assert.deepEqual(
             fs.readFileSync(path.join(repositoryRoot, 'bin', name)),
-            Buffer.from(run('git', ['show', `${BASE_SHA}:bin/${name}`], { encoding: null }).stdout),
+            Buffer.from(run('git', ['-C', historical.root, 'show', `${historical.ref}:bin/${name}`], { encoding: null }).stdout),
         );
     }
     for (const name of [

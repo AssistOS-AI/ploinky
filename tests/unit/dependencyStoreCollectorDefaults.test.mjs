@@ -23,11 +23,15 @@ const LIVE_ID = 'a'.repeat(64);
 // A `podman` in front of the fake engine that can simulate an engine that is
 // down or whose listing and inspection disagree (a container listed by `ps`
 // that `inspect` cannot report).
-const WRAPPER = `#!/bin/sh
-mode=$(cat "$WRAP_MODE_FILE" 2>/dev/null)
-if [ "$mode" = down ]; then echo "Error: cannot connect to the engine" >&2; exit 125; fi
-if [ "$mode" = phantom ] && [ "$1" = ps ]; then "$REAL_PODMAN" "$@"; status=$?; echo phantom0000; exit $status; fi
-exec "$REAL_PODMAN" "$@"
+const WRAPPER = `#!NODE_EXECUTABLE
+const fs = require('node:fs');
+const cp = require('node:child_process');
+const mode = fs.readFileSync(process.env.WRAP_MODE_FILE, 'utf8');
+if (mode === 'down') { process.stderr.write('Error: cannot connect to the engine\\n'); process.exit(125); }
+const result = cp.spawnSync(process.env.REAL_PODMAN, process.argv.slice(2), { stdio: 'inherit' });
+if (mode === 'phantom' && process.argv[2] === 'ps') process.stdout.write('phantom0000\\n');
+if (result.error || result.signal) process.exit(126);
+process.exit(result.status);
 `;
 
 function workspace(t, { engine: withEngine = true } = {}) {
@@ -37,15 +41,18 @@ function workspace(t, { engine: withEngine = true } = {}) {
     const engine = installFakeEngine(root, { engines: ['podman'] });
     const wrapDir = path.join(root, 'wrap-bin');
     fs.mkdirSync(wrapDir);
-    fs.writeFileSync(path.join(wrapDir, 'podman'), WRAPPER, { mode: 0o755 });
+    fs.writeFileSync(path.join(wrapDir, 'podman'), WRAPPER.replace('NODE_EXECUTABLE', process.execPath), { mode: 0o755 });
     const modeFile = path.join(root, 'engine-mode');
     const enginePath = [wrapDir, engine.env.PATH].join(path.delimiter);
     const bareDirs = String(process.env.PATH || '').split(path.delimiter).filter((dir) => dir
         && !['podman', 'docker'].some((name) => fs.existsSync(path.join(dir, name))));
+    const nodeOnly = path.join(root, 'node-only-bin');
+    fs.mkdirSync(nodeOnly);
+    fs.symlinkSync(process.execPath, path.join(nodeOnly, 'node'));
     const env = {
         ...process.env,
         ...engine.env,
-        PATH: withEngine ? enginePath : [path.dirname(process.execPath), ...bareDirs].join(path.delimiter),
+        PATH: withEngine ? enginePath : [nodeOnly, ...bareDirs].join(path.delimiter),
         REAL_PODMAN: path.join(engine.binDir, 'podman'),
         WRAP_MODE_FILE: modeFile,
         PLOINKY_WORKSPACE_ROOT: ws,

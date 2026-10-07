@@ -51,7 +51,7 @@ test('host-owned edge desired state is optional and captured by exact digest', (
 test('host-owned edge desired state rejects unsafe or malformed authority files', (t) => {
     const fixture = workspaceFixture(t);
 
-    fs.writeFileSync(fixture.candidatePath, '{');
+    fs.writeFileSync(fixture.candidatePath, '{', { mode: 0o600 });
     assert.throws(
         () => readWorkspaceEdgeDesired(fixture.identity),
         /must contain valid JSON/,

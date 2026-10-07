@@ -1,3 +1,4 @@
+import { historicalGitFixture } from '../helpers/historicalGitFixture_codex.mjs';
 // LIVE-C5 replacement custody and cleanup, offline, over the PRODUCT's own durable records. A scenario of c5DriverWorld.mjs runs the real driver over the
 // real supervisor, transition and store in a child process, optionally ending (SIGKILL) at a named point; this file reloads what the dead process left
 // (its journal, snapshots, CID files and receipt on disk, its containers from the persisted engine table) and judges custody and cleanup in a fresh
@@ -351,7 +352,8 @@ test('X5.c5-cleanup-base-refuses-the-valid-live-replacement-as-foreign-and-the-c
     fs.mkdirSync(path.join(scratchRoot, 'tests/hardware-limits'), { recursive: true });
     fs.symlinkSync(path.join(REPOSITORY, 'ploinky-box'), path.join(scratchRoot, 'ploinky-box'));
     for (const name of ['liveCommon.mjs', 'liveProcess.mjs']) fs.symlinkSync(path.join(REPOSITORY, 'tests/hardware-limits', name), path.join(scratchRoot, 'tests/hardware-limits', name));
-    const shown = spawnSync('git', ['-C', REPOSITORY, 'show', `${BASE_REVISION}:tests/hardware-limits/liveCleanup.mjs`], { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
+    const historical = historicalGitFixture(t, BASE_REVISION);
+    const shown = spawnSync('git', ['-C', historical.root, 'show', `${historical.ref}:tests/hardware-limits/liveCleanup.mjs`], { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
     assert.equal(shown.status, 0, shown.stderr);
     fs.writeFileSync(path.join(scratchRoot, 'tests/hardware-limits/liveCleanup.mjs'), shown.stdout);
     const base = await import(pathToFileURL(path.join(scratchRoot, 'tests/hardware-limits/liveCleanup.mjs')).href);
