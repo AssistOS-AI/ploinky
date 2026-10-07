@@ -1,12 +1,14 @@
 import fs from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
+import { createUnknownSummary, processDiagnostic } from './marketplaceRepositoryDiagnostics.mjs';
 
 export const REPOSITORY_OPERATION_MARKER = 'PLOINKY_MARKETPLACE_REPOSITORY_OPERATION';
 export const PROC_LIMITS = Object.freeze({ bytes: 65_536, entries: 8_192, readers: 8, timeoutMs: 1_000 });
 
-function unknown() {
+function unknown(category = 'unknown', field = 'identity') {
     return Object.assign(new Error('Repository process ownership is unproven.'), {
         code: 'PLOINKY_MARKETPLACE_REPOSITORY_PROCESS_UNKNOWN',
+        diagnostic: { category, field },
     });
 }
 
@@ -22,17 +24,17 @@ function parseStat(raw, pid) {
     const close = raw.lastIndexOf(')');
     const fields = raw.slice(close + 1).trim().split(/\s+/);
     if (open < 1 || close <= open || Number(raw.slice(0, open).trim()) !== pid
-        || fields.length < 20 || !/^[A-Z]$/.test(fields[0]) || !/^[1-9][0-9]*$/.test(fields[19])) throw unknown();
+        || fields.length < 20 || !/^[A-Z]$/.test(fields[0]) || !/^[1-9][0-9]*$/.test(fields[19])) throw unknown('malformed', 'stat');
     const numbers = fields.slice(1, 4).map(Number);
-    if (numbers.some((value) => !Number.isSafeInteger(value) || value < 0)) throw unknown();
+    if (numbers.some((value) => !Number.isSafeInteger(value) || value < 0)) throw unknown('malformed', 'stat');
     return { pid, state: fields[0], parent: numbers[0], group: numbers[1], session: numbers[2], birth: fields[19] };
 }
 
-function nulFields(bytes) {
+function nulFields(bytes, field) {
     if (!bytes.length) return [];
-    if (bytes.at(-1) !== 0) throw unknown();
+    if (bytes.at(-1) !== 0) throw unknown('truncated', field);
     const text = bytes.toString('utf8');
-    if (!Buffer.from(text).equals(bytes)) throw unknown();
+    if (!Buffer.from(text).equals(bytes)) throw unknown('malformed', field);
     return text.slice(0, -1).split('\0');
 }
 
@@ -41,8 +43,18 @@ function nulFields(bytes) {
 export function createRepositoryProcessObserver({ fsApi = fs, procRoot = '/proc', now = () => performance.now() } = {}) {
     let readers = 0;
     let scanning = false;
-    const check = (deadline) => { if (now() >= deadline) throw unknown(); };
-    async function field(file, deadline) {
+    const check = (deadline) => { if (now() >= deadline) throw unknown('deadline', 'none'); };
+    const fieldName = file => ({ stat: 'stat', status: 'status', environ: 'environment', cmdline: 'argv', exe: 'executable', pid: 'namespace' })[file.split('/').at(-1)] || 'identity';
+    async function tagged(field, job) {
+        try { return await job(); }
+        catch (error) {
+            if (!error.diagnostic) error.diagnostic = processDiagnostic(error, field);
+            throw error;
+        }
+    }
+    const link = file => tagged(fieldName(file), () => fsApi.readlink(file));
+    const field = (file, deadline) => tagged(fieldName(file), () => readField(file, deadline));
+    async function readField(file, deadline) {
         check(deadline);
         const handle = await fsApi.open(file, 'r');
         try {
@@ -55,7 +67,7 @@ export function createRepositoryProcessObserver({ fsApi = fs, procRoot = '/proc'
                 if (!bytesRead) break;
                 offset += bytesRead;
             }
-            if (offset > PROC_LIMITS.bytes) throw unknown();
+            if (offset > PROC_LIMITS.bytes) throw unknown('truncated', fieldName(file));
             return bytes.subarray(0, offset);
         } finally {
             await handle.close();
@@ -66,39 +78,43 @@ export function createRepositoryProcessObserver({ fsApi = fs, procRoot = '/proc'
         const root = `${procRoot}/${pid}`;
         const stat = async () => parseStat((await field(`${root}/stat`, deadline)).toString('utf8'), pid);
         const before = await stat();
-        const namespace = await fsApi.readlink(`${root}/ns/pid`);
+        const namespace = await link(`${root}/ns/pid`);
         check(deadline);
-        if (!/^pid:\[[1-9][0-9]*\]$/.test(namespace)) throw unknown();
+        if (!/^pid:\[[1-9][0-9]*\]$/.test(namespace)) throw unknown('malformed', 'namespace');
         const status = (await field(`${root}/status`, deadline)).toString('utf8');
         const uidLine = status.split('\n').find((line) => line.startsWith('Uid:'));
         const uidFields = uidLine?.slice(4).trim().split(/\s+/) || [];
-        if (uidFields.length !== 4 || uidFields.some((value) => !/^\d+$/.test(value))) throw unknown();
+        if (uidFields.length !== 4 || uidFields.some((value) => !/^\d+$/.test(value))) throw unknown('malformed', 'status');
         const argv = await field(`${root}/cmdline`, deadline);
         const env = environment ? await field(`${root}/environ`, deadline) : null;
-        const exe = executable ? await fsApi.readlink(`${root}/exe`) : null;
+        const exe = executable ? await link(`${root}/exe`) : null;
         check(deadline);
         const argvAfter = await field(`${root}/cmdline`, deadline);
         const statusAfter = (await field(`${root}/status`, deadline)).toString('utf8');
-        const namespaceAfter = await fsApi.readlink(`${root}/ns/pid`);
-        const exeAfter = executable ? await fsApi.readlink(`${root}/exe`) : null;
+        const namespaceAfter = await link(`${root}/ns/pid`);
+        const exeAfter = executable ? await link(`${root}/exe`) : null;
         const after = await stat();
-        if (before.birth !== after.birth || namespace !== namespaceAfter || exe !== exeAfter || !argv.equals(argvAfter)
-            || uidLine !== statusAfter.split('\n').find((line) => line.startsWith('Uid:'))
-            || before.parent !== after.parent || before.group !== after.group || before.session !== after.session) throw unknown();
-        return { ...after, namespace, uids: uidFields.join(':'), argv: nulFields(argv), exe,
-            ...(env ? { environment: nulFields(env) } : {}) };
+        const unstable = [
+            ['birth', before.birth !== after.birth], ['namespace', namespace !== namespaceAfter],
+            ['executable', exe !== exeAfter], ['argv', !argv.equals(argvAfter)],
+            ['status', uidLine !== statusAfter.split('\n').find((line) => line.startsWith('Uid:'))],
+            ['parent', before.parent !== after.parent], ['group', before.group !== after.group], ['session', before.session !== after.session],
+        ].find(([, changed]) => changed);
+        if (unstable) throw unknown('unstable', unstable[0]);
+        return { ...after, namespace, uids: uidFields.join(':'), argv: nulFields(argv, 'argv'), exe,
+            ...(env ? { environment: nulFields(env, 'environment') } : {}) };
     }
     async function bounded(job, deadline) {
         check(deadline);
         let timer;
         try {
             return await Promise.race([job(), new Promise((_, reject) => {
-                timer = setTimeout(() => reject(unknown()), Math.max(1, deadline - now()));
+                timer = setTimeout(() => reject(unknown('deadline', 'none')), Math.max(1, deadline - now()));
             })]);
         } finally { clearTimeout(timer); }
     }
     async function read(pid, options = {}) {
-        if (readers >= PROC_LIMITS.readers) throw unknown();
+        if (readers >= PROC_LIMITS.readers) throw unknown('reader-saturation', 'none');
         const deadline = now() + PROC_LIMITS.timeoutMs;
         return bounded(async () => {
             readers += 1;
@@ -107,7 +123,9 @@ export function createRepositoryProcessObserver({ fsApi = fs, procRoot = '/proc'
         }, deadline);
     }
     async function scan({ baseline = [], coordinator = null, router = null, operationId = null, remembered = [] } = {}) {
-        if (scanning) return { complete: false, records: [], members: [], writers: [] };
+        if (scanning) return { complete: false, records: [], members: [], writers: [],
+            diagnostic: { unknowns: [{ category: 'overlap', field: 'none', count: 1 }] } };
+        const summary = createUnknownSummary();
         const deadline = now() + PROC_LIMITS.timeoutMs;
         const records = [];
         const cohort = new Map();
@@ -116,24 +134,24 @@ export function createRepositoryProcessObserver({ fsApi = fs, procRoot = '/proc'
         const known = new Map(remembered.map((entry) => [entry.pid, entry]));
         const marker = `${REPOSITORY_OPERATION_MARKER}=${operationId}`;
         const task = async () => {
-            const directory = await fsApi.opendir(procRoot);
+            const directory = await tagged('directory', () => fsApi.opendir(procRoot));
             const pids = [];
             try {
                 // read(), rather than async iteration, leaves closure to this
                 // finally even when an observation runs out of time.
                 for (;;) {
                     check(deadline);
-                    const entry = await directory.read();
+                    const entry = await tagged('directory', () => directory.read());
                     check(deadline);
                     if (!entry) break;
                     if (!/^[1-9][0-9]*$/.test(entry.name)) continue;
-                    if (pids.length === PROC_LIMITS.entries) throw unknown();
+                    if (pids.length === PROC_LIMITS.entries) throw unknown('entry-overflow', 'directory');
                     pids.push(Number(entry.name));
                 }
             } finally { await directory.close(); }
             let cursor = 0;
             async function consume() {
-                if (readers >= PROC_LIMITS.readers) { incomplete = true; return; }
+                if (readers >= PROC_LIMITS.readers) { incomplete = true; summary.add({ category: 'reader-saturation', field: 'none' }); return; }
                 readers += 1;
                 try {
                     while (cursor < pids.length) {
@@ -155,18 +173,23 @@ export function createRepositoryProcessObserver({ fsApi = fs, procRoot = '/proc'
                             // Confirm absence a second time. A reused PID is
                             // unknown, even if its replacement is readable.
                             if (error?.code === 'ENOENT' || error?.code === 'ESRCH') {
-                                try { await field(`${procRoot}/${pid}/stat`, deadline); incomplete = true; }
+                                try { await field(`${procRoot}/${pid}/stat`, deadline); incomplete = true;
+                                    summary.add({ category: 'disappearance-unconfirmed', field: 'stat' }); }
                                 catch (confirmation) {
-                                    if (confirmation?.code !== 'ENOENT' && confirmation?.code !== 'ESRCH') incomplete = true;
+                                    if (confirmation?.code !== 'ENOENT' && confirmation?.code !== 'ESRCH') {
+                                        incomplete = true;
+                                        summary.add({ category: 'disappearance-unconfirmed', field: 'stat' });
+                                        summary.add(processDiagnostic(confirmation));
+                                    }
                                 }
-                            } else incomplete = true;
+                            } else { incomplete = true; summary.add(processDiagnostic(error)); }
                         }
                     }
                 } finally { readers -= 1; }
             }
             await Promise.all(Array.from({ length: Math.min(PROC_LIMITS.readers, pids.length) }, consume));
             check(deadline);
-            if (cursor !== pids.length) incomplete = true;
+            if (cursor !== pids.length) { incomplete = true; summary.add({ category: 'reader-saturation', field: 'none' }); }
             await classify();
         };
         async function classify() {
@@ -183,7 +206,7 @@ export function createRepositoryProcessObserver({ fsApi = fs, procRoot = '/proc'
                 // part of that identity; equality with the coordinator does not.
                 if (anchoredGroup || record.tagged || sameProcess(known.get(record.pid), record)) cohort.set(record.pid, record);
             }
-            if (readers >= PROC_LIMITS.readers) throw unknown();
+            if (readers >= PROC_LIMITS.readers) throw unknown('reader-saturation', 'none');
             readers += 1;
             const attempted = new Set();
             try {
@@ -201,31 +224,33 @@ export function createRepositoryProcessObserver({ fsApi = fs, procRoot = '/proc'
                             // of a fresh stable child observation, inside this
                             // pass's original time and reader limits.
                             const parentBefore = await identity(parent.pid, deadline);
-                            if (!sameProcess(parentBefore, parent)) throw unknown();
+                            if (!sameProcess(parentBefore, parent)) throw unknown('lineage', 'parent');
                             const child = await identity(record.pid, deadline);
                             const parentAfter = await identity(parent.pid, deadline);
                             if (!sameProcess(parentAfter, parent) || !sameProcess(child, record)
-                                || child.parent !== parent.pid) throw unknown();
+                                || child.parent !== parent.pid) throw unknown('lineage', 'parent');
                             cohort.set(record.pid, record);
                             changed = true;
-                        } catch (_) { incomplete = true; }
+                        } catch (error) { incomplete = true; summary.add({ category: 'lineage', field: 'parent' }); summary.add(processDiagnostic(error)); }
                     }
                 }
             } finally { readers -= 1; }
             if (operationId && records.some((record) => !cohort.has(record.pid)
-                && !sameProcess(prior.get(record.pid), record) && !record.inspectedEnvironment)) incomplete = true;
+                && !sameProcess(prior.get(record.pid), record) && !record.inspectedEnvironment)) {
+                incomplete = true; summary.add({ category: 'unknown', field: 'environment' });
+            }
         }
         scanning = true;
         try {
             await bounded(async () => { try { await task(); } finally { scanning = false; } }, deadline);
-        } catch (_) { incomplete = true; }
+        } catch (error) { incomplete = true; summary.add(processDiagnostic(error)); }
         // Snapshot completed reads and classifications. Late I/O may finish
         // closing handles, but cannot change an already returned proof.
         const observed = records.slice();
         const members = [...cohort.values()];
         const writers = members.filter((record) => record.state !== 'Z'
             && !sameProcess(record, router) && !sameProcess(record, coordinator));
-        return { complete: !incomplete, records: observed, members, writers };
+        return { complete: !incomplete, records: observed, members, writers, diagnostic: summary.snapshot() };
     }
     async function signal(record, signalName, { coordinator = null, group = false, kill = process.kill, isAllowed = () => true } = {}) {
         if (!['SIGTERM', 'SIGKILL'].includes(signalName)) return false;
