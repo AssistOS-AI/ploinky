@@ -148,22 +148,22 @@ test('workspace file MIME types keep text content inline and typed', () => {
     assert.equal(getMimeType('manual.pdf'), 'application/pdf');
     assert.deepEqual(getWorkspaceFileHeaders('README.md'), {
         'Content-Type': 'text/markdown; charset=utf-8',
-        'Cache-Control': 'public, max-age=60',
+        'Cache-Control': 'private, max-age=60',
         'Content-Disposition': 'inline',
         'X-Content-Type-Options': 'nosniff',
     });
 });
 
-test('HTML documents are never cacheable while assets keep bounded public caching', () => {
+test('HTML documents are never cacheable while assets keep bounded private caching', () => {
     // Regression: a demoted or logged-out browser reused a cached Explorer shell for 60 seconds
     // instead of receiving the Router's capability-denied redirect on the next document navigation.
     for (const document of ['index.html', 'explorer/index.html', 'article.HTML', 'legacy.htm']) {
         assert.equal(getWorkspaceFileHeaders(document)['Cache-Control'], 'no-store', document);
     }
-    assert.equal(getWorkspaceFileHeaders('README.md')['Cache-Control'], 'public, max-age=60');
-    assert.equal(getWorkspaceFileHeaders('main.js')['Cache-Control'], 'public, max-age=300');
-    assert.equal(getWorkspaceFileHeaders('logo.png')['Cache-Control'], 'public, max-age=86400');
-    assert.equal(getWorkspaceFileHeaders('font.woff2')['Cache-Control'], 'public, max-age=31536000, immutable');
+    assert.equal(getWorkspaceFileHeaders('README.md')['Cache-Control'], 'private, max-age=60');
+    assert.equal(getWorkspaceFileHeaders('main.js')['Cache-Control'], 'private, max-age=300');
+    assert.equal(getWorkspaceFileHeaders('logo.png')['Cache-Control'], 'private, max-age=86400');
+    assert.equal(getWorkspaceFileHeaders('font.woff2')['Cache-Control'], 'private, max-age=31536000, immutable');
 });
 
 test('workspace file enhancement replaces assistant text candidates with preview links', () => {

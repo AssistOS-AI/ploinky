@@ -358,7 +358,7 @@ test('folder selection keeps the caret and slash in sync through backspace and r
     assert.equal(afterRetypingSlash, '@docs/');
 });
 
-test('handleSuggestionsFiles scopes results to workspace-dir and emits cwd-relative paths', () => {
+test('handleSuggestionsFiles scopes results to workspace-dir and emits cwd-relative paths', async () => {
     const root = makeWorkspace('handler');
     try {
         const project = path.join(root, 'project');
@@ -379,7 +379,7 @@ test('handleSuggestionsFiles scopes results to workspace-dir and emits cwd-relat
                 this.body = body || '';
             }
         };
-        handleSuggestionsFiles({}, response, parsed, { workspaceRoot: root });
+        await handleSuggestionsFiles({}, response, parsed, { workspaceRoot: root });
         assert.equal(response.status, 200);
         const payload = JSON.parse(response.body);
         assert.deepEqual(payload.items.map((entry) => entry.path), ['src', 'README.md']);

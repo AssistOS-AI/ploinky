@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { PLOINKY_DIR } from './config.js';
+import { memoizeRepositoryRead } from './repositoryResolutionScope.mjs';
 
 const registrationFile = path.join(PLOINKY_DIR, 'unregistered_agent_repos.json');
 
@@ -20,7 +21,7 @@ function unregisteredRepositories() {
 }
 
 export function isAgentRepositoryUnregistered(name) {
-    return unregisteredRepositories().has(name);
+    return memoizeRepositoryRead('unregistered', registrationFile, unregisteredRepositories).has(name);
 }
 
 export function setAgentRepositoryRegistered(name, registered) {

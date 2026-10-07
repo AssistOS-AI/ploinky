@@ -3038,6 +3038,88 @@ function routerPublicHostsMatchRuntime(generation) {
     }
 }
 
+// Verified active-generation cache. A generation id is a content digest and
+// every field reconstructGeneration() returns is bound to that digest or copied
+// from the selector's generation and publicationState, so one verified object
+// serves every later call for the same (generationsDir, id, publicationState).
+// Each call still reads and validates the selector, compares the generation
+// file's lstat stamp (a deleted, replaced or rewritten file is re-verified
+// exactly as before) and re-checks the runtime bindings. Errors are never
+// cached, and the activationId is not part of the key: lease holders compare it
+// against a freshly read selector.
+const ACTIVE_GENERATION_CACHE_LIMIT = 4;
+const activeGenerationCache = new Map();
+const activeGenerationCacheCounters = { hits: 0, misses: 0, reconstructs: 0 };
+
+function generationFileStamp(stat) {
+    return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+}
+
+function activeGenerationCacheStats() {
+    return {
+        size: activeGenerationCache.size,
+        limit: ACTIVE_GENERATION_CACHE_LIMIT,
+        hits: activeGenerationCacheCounters.hits,
+        misses: activeGenerationCacheCounters.misses,
+        reconstructs: activeGenerationCacheCounters.reconstructs,
+    };
+}
+
+function resetActiveGenerationCache() {
+    activeGenerationCache.clear();
+    activeGenerationCacheCounters.hits = 0;
+    activeGenerationCacheCounters.misses = 0;
+    activeGenerationCacheCounters.reconstructs = 0;
+}
+
+function readVerifiedGenerationDocument(file, selector) {
+    let document;
+    try {
+        document = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch (error) {
+        throw edgeError(`active edge routing generation is corrupt: ${error?.message || error}`, 'EDGE_GENERATION_CORRUPT');
+    }
+    activeGenerationCacheCounters.reconstructs += 1;
+    try {
+        return reconstructGeneration(document, selector);
+    } catch (error) {
+        if (error?.code === 'EDGE_GENERATION_CORRUPT') throw error;
+        throw edgeError(`active edge routing generation is corrupt: ${error?.message || error}`, 'EDGE_GENERATION_CORRUPT');
+    }
+}
+
+function loadVerifiedActiveGeneration(paths, selector) {
+    const file = generationFile(paths, selector.generation);
+    const key = `${paths.generationsDir}\0${selector.generation}\0${selector.publicationState}`;
+    let stamp = null;
+    try {
+        const stat = fs.lstatSync(file, { bigint: true });
+        // A symlink or other non-regular file is never cached: its stamp does
+        // not describe the bytes a read would return.
+        if (stat.isFile()) stamp = generationFileStamp(stat);
+    } catch (error) {
+        activeGenerationCache.delete(key);
+        throw edgeError(`active edge routing generation is corrupt: ${error?.message || error}`, 'EDGE_GENERATION_CORRUPT');
+    }
+    const cached = activeGenerationCache.get(key);
+    if (cached && stamp !== null && cached.stamp === stamp) {
+        activeGenerationCache.delete(key);
+        activeGenerationCache.set(key, cached);
+        activeGenerationCacheCounters.hits += 1;
+        return cached.generation;
+    }
+    if (cached) activeGenerationCache.delete(key);
+    activeGenerationCacheCounters.misses += 1;
+    const generation = deepFreeze(readVerifiedGenerationDocument(file, selector));
+    if (stamp !== null) {
+        activeGenerationCache.set(key, { stamp, generation });
+        while (activeGenerationCache.size > ACTIVE_GENERATION_CACHE_LIMIT) {
+            activeGenerationCache.delete(activeGenerationCache.keys().next().value);
+        }
+    }
+    return generation;
+}
+
 export function loadActiveEdgeRoutingGeneration(options = {}) {
     const paths = resolveEdgeGenerationPaths(options);
     const selector = readSelector(paths);
@@ -3045,19 +3127,7 @@ export function loadActiveEdgeRoutingGeneration(options = {}) {
         || !TOPOLOGY_STATES.has(selector.publicationState)) {
         throw edgeError('edge routing generation is inactive', 'EDGE_GENERATION_INACTIVE');
     }
-    let document;
-    try {
-        document = JSON.parse(fs.readFileSync(generationFile(paths, selector.generation), 'utf8'));
-    } catch (error) {
-        throw edgeError(`active edge routing generation is corrupt: ${error?.message || error}`, 'EDGE_GENERATION_CORRUPT');
-    }
-    let generation;
-    try {
-        generation = reconstructGeneration(document, selector);
-    } catch (error) {
-        if (error?.code === 'EDGE_GENERATION_CORRUPT') throw error;
-        throw edgeError(`active edge routing generation is corrupt: ${error?.message || error}`, 'EDGE_GENERATION_CORRUPT');
-    }
+    const generation = loadVerifiedActiveGeneration(paths, selector);
     if (generation.routerHostPort !== selectedRouterHostPort()) {
         throw edgeError(
             'active edge routing generation was compiled for a different physical Router host port; coordinated apply is required',
@@ -3076,7 +3146,9 @@ export function loadActiveEdgeRoutingGeneration(options = {}) {
             'EDGE_GENERATION_RUNTIME_MISMATCH',
         );
     }
-    return deepFreeze({ selector, generation, paths });
+    // The cached generation is already deeply frozen; only the per-call parts
+    // are frozen here, because deepFreeze() has no already-frozen shortcut.
+    return Object.freeze({ selector: deepFreeze(selector), generation, paths: deepFreeze(paths) });
 }
 
 /**
@@ -3598,6 +3670,11 @@ export function currentEnabledAgentIdentity(snapshot, agentId) {
 export function defaultEdgeDesiredStateBytes() {
     return Buffer.from(EMPTY_DESIRED_BYTES);
 }
+
+export const __testables = Object.freeze({
+    activeGenerationCacheStats,
+    resetActiveGenerationCache,
+});
 
 export default {
     abortEdgeRoutingPreparation,

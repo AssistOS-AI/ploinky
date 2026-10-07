@@ -4,17 +4,19 @@ import path from 'node:path';
 import { repositoryEntries, repositoryIdentity, repositoryOrigin, workspaceRepositoryPath, workspaceRepositories as discoverWorkspaceRepositories } from './repositorySource.mjs';
 import { PLOINKY_WORKSPACE_ROOT, REPOS_DIR } from './config.js';
 import { getPredefinedRepos, getRepoSources } from './repos.js';
+import { memoizeRepositoryRead } from './repositoryResolutionScope.mjs';
+export { runWithRepositoryResolutionScope } from './repositoryResolutionScope.mjs';
 
 const directoryEntries = repositoryEntries;
 function hasAgents(candidate) {
-    return directoryEntries(candidate).some(entry => entry.isDirectory() && !entry.name.startsWith('.')
-        && fs.existsSync(path.join(candidate, entry.name, 'manifest.json')));
+    return memoizeRepositoryRead('hasAgents', candidate, () => directoryEntries(candidate).some(entry => entry.isDirectory() && !entry.name.startsWith('.')
+        && fs.existsSync(path.join(candidate, entry.name, 'manifest.json'))));
 }
 const originIdentity = repositoryOrigin;
 
 // Read lazily: repos.js also uses this module to choose installation sources.
 function registeredSources() {
-    return { ...getPredefinedRepos(), ...getRepoSources() };
+    return memoizeRepositoryRead('sources', PLOINKY_WORKSPACE_ROOT, () => ({ ...getPredefinedRepos(), ...getRepoSources() }));
 }
 
 function workspaceRepositories() {
@@ -35,6 +37,10 @@ export function resolveAgentRepositoryPath(name) {
 }
 
 export function listAgentRepositoryNames() {
+    return [...memoizeRepositoryRead('names', PLOINKY_WORKSPACE_ROOT, readAgentRepositoryNames)];
+}
+
+function readAgentRepositoryNames() {
     const names = new Set(directoryEntries(REPOS_DIR)
         .filter(entry => entry.isDirectory() || entry.isSymbolicLink())
         .map(entry => entry.name));

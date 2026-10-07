@@ -239,7 +239,9 @@ test('browser agent-first MCP mutations use an exact route-scoped proof', async 
     const proofRequests = seen.filter((entry) => entry.method === 'GET');
     const mutationRequests = seen.filter((entry) => entry.method !== 'GET');
     assert.ok(seen.filter((entry) => entry.method === 'POST').length >= 2);
-    assert.equal(proofRequests.length, mutationRequests.length);
+    // One proof serves every mutation of the route (initialize, initialized, DELETE).
+    assert.equal(proofRequests.length, 1);
+    assert.ok(mutationRequests.length >= 3);
     assert.ok(mutationRequests
         .every((entry) => entry.csrf === 'v1.route-scoped-proof'));
 });

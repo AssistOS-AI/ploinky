@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { resolveWebchatCommandsForAgent } from '../../webchat/commandResolver.js';
+import { resolveWebchatCommandsForAgentAsync } from '../../webchat/commandResolver.js';
 import * as staticSrv from '../../static/index.js';
 import {
     handleWebchatUploadPost,
@@ -13,11 +13,11 @@ import {
 } from './workspaceDirectories.js';
 import {
     buildWebchatQuery,
-    resolveWebchatLaunchOptions
+    resolveWebchatLaunchOptionsAsync
 } from './launchOptions.js';
 import {
     handleSuggestionsFiles,
-    resolveWebchatWorkspaceBase
+    resolveWebchatWorkspaceBaseAsync
 } from './workspaceSuggestions.js';
 import {
     authorized,
@@ -44,10 +44,10 @@ function escapeHtmlAttribute(value) {
         .replace(/>/g, '&gt;');
 }
 
-function renderTemplate(filenames, replacements) {
-    const target = staticSrv.resolveFirstAvailable(appName, fallbackAppPath, filenames);
+async function renderTemplate(filenames, replacements) {
+    const target = await staticSrv.resolveFirstAvailableAsync(appName, fallbackAppPath, filenames);
     if (!target) return null;
-    const html = fs.readFileSync(target, 'utf8');
+    const html = await fs.promises.readFile(target, 'utf8');
     // Values can themselves contain template-looking directory names. Only
     // replace placeholders from the original template, never inserted values.
     return html.replace(/__[A-Z_]+__/g, (key) => (
@@ -56,26 +56,35 @@ function renderTemplate(filenames, replacements) {
 }
 
 export async function handleWebChat(req, res, appConfig, appState) {
+    if (req.destroyed || res.destroyed) return;
     const parsedUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     const pathname = parsedUrl.pathname.substring(`/${appName}`.length) || '/';
     const agentOverrideRaw = parsedUrl.searchParams.get('agent') || '';
     const agentOverride = agentOverrideRaw.trim();
     let launchOptions, workspaceBase;
     try {
-        workspaceBase = resolveWebchatWorkspaceBase(parsedUrl);
-        launchOptions = resolveWebchatLaunchOptions(parsedUrl);
+        workspaceBase = await resolveWebchatWorkspaceBaseAsync(parsedUrl);
+        if (req.destroyed || res.destroyed) return;
+        launchOptions = await resolveWebchatLaunchOptionsAsync(parsedUrl, { workspaceBase });
+        if (req.destroyed || res.destroyed) return;
     } catch (_) {
+        if (req.destroyed || res.destroyed) return;
         res.writeHead(400, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
         res.end('Invalid WebChat workspace directory.');
         return;
+    }
+    if (typeof appConfig === 'function') {
+        appConfig = await appConfig({ req, res, workspaceBase, launchOptions });
+        if (req.destroyed || res.destroyed) return;
     }
     let effectiveConfig = appConfig;
     let agentQuery = buildWebchatQuery(parsedUrl);
 
     if (agentOverride) {
-        const overrideCommands = resolveWebchatCommandsForAgent(agentOverride, {
+        const overrideCommands = await resolveWebchatCommandsForAgentAsync(agentOverride, {
             cliArgs: launchOptions.cliArgs
         });
+        if (req.destroyed || res.destroyed) return;
         if (!overrideCommands) {
             res.writeHead(404, { 'Content-Type': 'text/plain' });
             res.end('Agent not found or not enabled.');
@@ -108,8 +117,10 @@ export async function handleWebChat(req, res, appConfig, appState) {
 
     if (pathname.startsWith('/assets/')) {
         const rel = pathname.substring('/assets/'.length);
-        const assetPath = staticSrv.resolveAssetPath(appName, fallbackAppPath, rel);
-        if (assetPath && staticSrv.sendFile(res, assetPath)) return;
+        const assetPath = await staticSrv.resolveAssetPathAsync(appName, fallbackAppPath, rel);
+        if (req.destroyed || res.destroyed) return;
+        if (assetPath && await staticSrv.sendFile(res, assetPath, { req })) return;
+        if (req.destroyed || res.destroyed) return;
     }
 
     if (req.user) {
@@ -133,6 +144,7 @@ export async function handleWebChat(req, res, appConfig, appState) {
             '__ASSET_BASE__': `/${appName}/assets`,
         }),
     })) return;
+    if (req.destroyed || res.destroyed) return;
 
     if (pathname === '/suggestions/files' && (req.method === 'GET' || req.method === 'HEAD')) {
         return handleSuggestionsFiles(req, res, parsedUrl);
@@ -168,7 +180,7 @@ export async function handleWebChat(req, res, appConfig, appState) {
     }
 
     if (pathname === '/' || pathname === '/index.html') {
-        const html = renderTemplate(['chat.html', 'index.html'], {
+        const html = await renderTemplate(['chat.html', 'index.html'], {
             '__ASSET_BASE__': `/${appName}/assets`,
             '__AGENT_NAME__': effectiveConfig.agentName || '',
             '__DISPLAY_NAME__': effectiveConfig.displayName || effectiveConfig.agentName || 'WebChat',
@@ -179,6 +191,7 @@ export async function handleWebChat(req, res, appConfig, appState) {
             '__WORKSPACE_ROOT__': escapeHtmlAttribute(workspaceBase.root),
             '__WORKSPACE_BASE__': encodeURIComponent(workspaceBase.relativeBase || ''),
         });
+        if (req.destroyed || res.destroyed) return;
         if (html) {
             res.writeHead(200, {
                 'Content-Type': 'text/html',

@@ -11,6 +11,9 @@ const defaultExecFileAsync = execFileAsync;
 const LIST_ARGS = Object.freeze(['ps', '--format', '{{.Names}}']);
 const LIST_MAX_BUFFER_BYTES = 4 * 1024 * 1024;
 const INSPECT_MAX_BUFFER_BYTES = 32 * 1024 * 1024;
+// A hung engine must not hold an inventory forever: the child is killed (SIGKILL) at the limit and the read counts as a failure.
+const ENGINE_READ_TIMEOUT_MS = 5000;
+const ENGINE_READ_KILL_SIGNAL = 'SIGKILL';
 
 function parseAgentInfoFromMounts(mounts = []) {
     let repoName = '-';
@@ -142,14 +145,24 @@ async function collectLiveAgentContainersStrictAsync({ runtime = probeContainerR
     if (!runtime) return [];
     let names;
     try {
-        const { stdout = '' } = await execFileAsync(runtime, LIST_ARGS, { encoding: 'utf8', maxBuffer: LIST_MAX_BUFFER_BYTES });
+        const { stdout = '' } = await execFileAsync(runtime, LIST_ARGS, {
+            encoding: 'utf8',
+            maxBuffer: LIST_MAX_BUFFER_BYTES,
+            timeout: ENGINE_READ_TIMEOUT_MS,
+            killSignal: ENGINE_READ_KILL_SIGNAL,
+        });
         names = parseLiveContainerNames(stdout);
     } catch (error) {
         throw Object.assign(new Error(`the container list could not be read: ${error?.message || error}`), { code: 'ENGINE_READ_FAILED', cause: error });
     }
     if (!names.length) return [];
     try {
-        const { stdout = '' } = await execFileAsync(runtime, ['inspect', ...names], { encoding: 'utf8', maxBuffer: INSPECT_MAX_BUFFER_BYTES });
+        const { stdout = '' } = await execFileAsync(runtime, ['inspect', ...names], {
+            encoding: 'utf8',
+            maxBuffer: INSPECT_MAX_BUFFER_BYTES,
+            timeout: ENGINE_READ_TIMEOUT_MS,
+            killSignal: ENGINE_READ_KILL_SIGNAL,
+        });
         return projectInspectOutput(stdout, names);
     } catch (error) {
         throw Object.assign(new Error(`the containers could not be inspected: ${error?.message || error}`), { code: 'ENGINE_READ_FAILED', cause: error });

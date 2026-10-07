@@ -250,7 +250,7 @@ export async function handleHardwareLimitsRoutes(req, res, parsedUrl, {
     getMetrics = () => workspaceMetricsMonitor.latest, apply = runHardwareLimitsApplyWorker, readApplied = readAppliedObservation,
     refreshMetrics = (since) => workspaceMetricsMonitor.reconcileAfter(since),
     set = setAgentLimits, clear = clearAgentLimits, admit = defaultAdmission, verifyLease = () => true,
-    readSelection = null, qualifyGpu = qualifyHardwareGpuTarget,
+    readSelection = null, qualifyGpu = qualifyHardwareGpuTarget, runReadScope = read => read(),
 } = {}) {
     const send = (status, body) => { res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(body)); };
     if (hasHardwareBearer(req)) { send(403, { ok: false, error: 'agent_forbidden' }); return true; }
@@ -263,16 +263,23 @@ export async function handleHardwareLimitsRoutes(req, res, parsedUrl, {
     }
     try {
         const body = method === 'POST' ? validateHardwareRequest(await readBody(req)) : null;
-        const context = getContext({ refreshBackend: method === 'POST' });
-        const installed = getInstalled();
-        const registry = getRegistry();
-        const state = () => ({ ...buildHardwareLimitsState({ context: getContext(), installed, registry: getRegistry(), routing: getRouting(), storeProjections: getStoreProjections(), metrics: getMetrics(), admit, readApplied }), apply: hardwareApplyFlight() });
+        const read = () => {
+            const context = getContext({ refreshBackend: method === 'POST' });
+            const installed = getInstalled();
+            const registry = getRegistry();
+            const state = () => ({ ...buildHardwareLimitsState({ context: getContext(), installed, registry: getRegistry(), routing: getRouting(), storeProjections: getStoreProjections(), metrics: getMetrics(), admit, readApplied }), apply: hardwareApplyFlight() });
+            return { context, installed, registry, state };
+        };
         if (method === 'GET') {
-            const result = state();
-            if (context.storeState === 'unreadable') send(503, { ...result, ok: false, error: 'store_unreadable', message: context.storeDetail || 'The hardware store is unreadable.' });
-            else send(200, result);
+            await runReadScope(() => {
+                const { context, state } = read();
+                const result = state();
+                if (context.storeState === 'unreadable') send(503, { ...result, ok: false, error: 'store_unreadable', message: context.storeDetail || 'The hardware store is unreadable.' });
+                else send(200, result);
+            });
             return true;
         }
+        const { context, installed, registry, state } = read();
         if (!verifyLease()) fail('identity_changed', 'The routing generation changed before mutation.', 409);
         if (!context.paths || context.gate !== 'on') fail('hardware_limits_off', 'On the host run PLOINKY_BOX_HARDWARE_LIMITS=on ploinky restart.', 409);
         assertPolicyWritesAllowed({ paths: context.paths });

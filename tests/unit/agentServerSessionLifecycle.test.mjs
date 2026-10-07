@@ -386,8 +386,8 @@ test('AgentServer persists restart state in writable HOME when its code cwd is r
         payload: { source: 'restart-regression' },
         status: 'failed',
         timeoutMs: null,
-        createdAt: '2026-01-01T00:00:00.000Z',
-        updatedAt: '2026-01-01T00:00:01.000Z',
+        createdAt: new Date(Date.now() - 2000).toISOString(),
+        updatedAt: new Date(Date.now() - 1000).toISOString(),
         error: 'expected persisted failure',
         logRetention: 'bounded',
         continuationTool: '',
@@ -413,9 +413,10 @@ test('AgentServer persists restart state in writable HOME when its code cwd is r
             const [code, signal] = await once(child, 'exit');
             assert.equal(signal, null, output());
             assert.equal(code, 0, output());
-            const persisted = JSON.parse(
-                await fs.readFile(path.join(homeDir, '.tasksQueue'), 'utf8'),
-            );
+            const persistedRaw = await fs.readFile(path.join(homeDir, '.tasksQueue'), 'utf8');
+            // The legacy seed carries commandSpec and payload; the rewrite must drop them.
+            assert.doesNotMatch(persistedRaw, /"payload"|"commandSpec"|restart-regression/);
+            const persisted = JSON.parse(persistedRaw);
             assert.equal(persisted.length, 1);
             assert.equal(persisted[0].id, persistedTask.id);
             assert.equal(persisted[0].status, 'failed');

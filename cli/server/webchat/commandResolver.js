@@ -58,8 +58,7 @@ function extractManifestWebchatOptions(manifest) {
     };
 }
 
-function resolveStaticAgentDetails(routingFilePath) {
-    const cfg = readRoutingConfig(routingFilePath);
+function resolveStaticAgentDetails(routingFilePath, cfg = readRoutingConfig(routingFilePath)) {
     if (!cfg || !cfg.static) {
         return { agentName: '', hostPath: '', containerName: '', alias: '' };
     }
@@ -187,9 +186,67 @@ function resolveWebchatCommandsForAgent(agentRef, options = {}) {
     };
 }
 
+async function readRoutingConfigAsync(routingFilePath) {
+    try {
+        return JSON.parse(await fs.promises.readFile(routingFilePath, 'utf8'));
+    } catch (_) {
+        return null;
+    }
+}
+
+async function readManifestCommandsAsync(manifestPath) {
+    try {
+        const manifest = JSON.parse(await fs.promises.readFile(manifestPath, 'utf8'));
+        return { manifestCli: extractManifestCli(manifest), ...extractManifestWebchatOptions(manifest) };
+    } catch (_) {
+        return { manifestCli: '', forwardEnvelope: false };
+    }
+}
+
+async function resolveWebchatCommandsAsync(options = {}) {
+    const routingFilePath = options.routingFilePath || ROUTING_FILE;
+    const routing = await readRoutingConfigAsync(routingFilePath);
+    const { agentName, hostPath, containerName, alias } = resolveStaticAgentDetails(routingFilePath, routing);
+    if (!agentName || !hostPath) return { host: '', container: '', source: 'unset', agentName: '' };
+    const { manifestCli, ...webchatOptions } = await readManifestCommandsAsync(
+        options.manifestPathOverride || path.join(hostPath, 'manifest.json')
+    );
+    if (!manifestCli) return { host: '', container: '', source: 'unset', agentName, ...webchatOptions };
+    const cliTarget = resolveCliTarget({ alias, container: containerName }, agentName);
+    return {
+        host: buildHostCliCommand(cliTarget, options), container: manifestCli, source: 'manifest',
+        agentName, cliTarget, ...webchatOptions, cacheKey: 'webchat'
+    };
+}
+
+async function resolveWebchatCommandsForAgentAsync(agentRef, options = {}) {
+    const routing = await readRoutingConfigAsync(options.routingFilePath || ROUTING_FILE);
+    if (!routing) return null;
+    const routes = routing.routes || {};
+    let record = routes[agentRef];
+    if (!record) {
+        const staticAgent = trimCommand(routing.static?.agent);
+        if (staticAgent && staticAgent === agentRef) {
+            const shortAgentName = staticAgent.includes('/') ? staticAgent.split('/').pop() : staticAgent;
+            record = routes[staticAgent] || routes[shortAgentName] || routing.static;
+        }
+    }
+    if (!record || !record.hostPath) return null;
+    const { manifestCli, ...webchatOptions } = await readManifestCommandsAsync(path.join(record.hostPath, 'manifest.json'));
+    const cliTarget = resolveCliTarget(record, agentRef);
+    const cacheSuffix = normalizeCliArgs(options.cliArgs).join('\u0000');
+    return {
+        host: buildHostCliCommand(cliTarget, options), container: manifestCli, source: 'manifest',
+        agentName: agentRef, cliTarget, ...webchatOptions,
+        cacheKey: cacheSuffix ? `webchat:${agentRef}:${cacheSuffix}` : `webchat:${agentRef}`
+    };
+}
+
 export {
     resolveWebchatCommands,
     resolveWebchatCommandsForAgent,
+    resolveWebchatCommandsAsync,
+    resolveWebchatCommandsForAgentAsync,
     extractManifestCli,
     extractManifestWebchatOptions,
     trimCommand

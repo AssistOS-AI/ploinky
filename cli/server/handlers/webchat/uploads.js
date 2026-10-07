@@ -9,6 +9,7 @@ import {
 import {
     streamAdmittedUpload,
     UPLOAD_ROUTE_POLICIES,
+    UploadAdmissionError,
 } from '../uploadAdmission.js';
 
 function readHeader(req, name) {
@@ -64,9 +65,9 @@ export function resolveWebchatUploadContext({ workspaceBase } = {}) {
     };
 }
 
-function inspectExistingTarget(targetPath) {
+async function inspectExistingTarget(targetPath) {
     try {
-        const stat = fs.lstatSync(targetPath);
+        const stat = await fs.promises.lstat(targetPath);
         if (stat.isSymbolicLink()) return { error: 'invalid_target' };
         if (!stat.isFile()) return { error: 'target_type_conflict' };
         return { exists: true };
@@ -84,7 +85,7 @@ function isAdmissibleWorkspaceEntry({ relativePath } = {}) {
     return sanitizeUploadRelativePath(relativePath, '') !== null;
 }
 
-export function handleWebchatUploadPost(req, res, parsedUrl, context, { policy, timers } = {}) {
+export async function handleWebchatUploadPost(req, res, parsedUrl, context, { policy, timers } = {}) {
     if (!context) return writeJson(res, 400, { ok: false, error: 'invalid_workspace' });
 
     const filenameHeader = decodeOptionalHeader(readHeader(req, 'x-file-name'));
@@ -105,42 +106,36 @@ export function handleWebchatUploadPost(req, res, parsedUrl, context, { policy, 
     });
     if (!target) return writeJson(res, 400, { ok: false, error: 'invalid_target' });
 
-    const initialTarget = inspectExistingTarget(target.absolutePath);
-    if (initialTarget.error) return writeJson(res, 409, { ok: false, error: initialTarget.error });
-    if (initialTarget.exists && !overwrite) {
-        return writeJson(res, 409, {
-            ok: false,
-            error: 'target_exists',
-            localPath: target.relativePath,
-        });
-    }
-
-    try {
-        fs.mkdirSync(path.dirname(target.absolutePath), { recursive: true });
-    } catch (_) {
-        return writeJson(res, 500, { ok: false, error: 'mkdir_failed' });
-    }
-
-    target = resolveUploadTarget({
-        cwd: context.cwd,
-        workspaceRoot: context.workspaceRoot,
-        destinationPath: destinationHeader,
-        relativePath,
-    });
-    if (!target) return writeJson(res, 400, { ok: false, error: 'invalid_target' });
-
-    const latestTarget = inspectExistingTarget(target.absolutePath);
-    if (latestTarget.error) return writeJson(res, 409, { ok: false, error: latestTarget.error });
-    if (latestTarget.exists && !overwrite) {
-        return writeJson(res, 409, {
-            ok: false,
-            error: 'target_exists',
-            localPath: target.relativePath,
-        });
-    }
-
     let responseDetails = null;
-    return streamAdmittedUpload(req, {
+    return await streamAdmittedUpload(req, {
+        res,
+        prepare: async check => {
+            const inspect = async () => {
+                const existing = await inspectExistingTarget(target.absolutePath);
+                check();
+                if (existing.error) throw new UploadAdmissionError(409, existing.error);
+                if (existing.exists && !overwrite) throw new UploadAdmissionError(409, 'target_exists');
+            };
+            await inspect();
+            check();
+            try {
+                await fs.promises.mkdir(path.dirname(target.absolutePath), { recursive: true });
+            } catch (_) {
+                check();
+                throw new UploadAdmissionError(500, 'mkdir_failed');
+            }
+            check();
+            target = resolveUploadTarget({
+                cwd: context.cwd,
+                workspaceRoot: context.workspaceRoot,
+                destinationPath: destinationHeader,
+                relativePath,
+            });
+            if (!target) throw new UploadAdmissionError(400, 'invalid_target');
+            await inspect();
+            check();
+            return { targetPath: target.absolutePath };
+        },
         storageRoot: context.uploadRoot || context.cwd,
         targetPath: target.absolutePath,
         policy: policy || UPLOAD_ROUTE_POLICIES.webchat,
@@ -170,6 +165,7 @@ export function handleWebchatUploadPost(req, res, parsedUrl, context, { policy, 
                 writeJson(res, error.status || 500, {
                     ok: false,
                     error: publicUploadError(error.code || 'upload_failed'),
+                    ...(error.code === 'target_exists' ? { localPath: target.relativePath } : {}),
                 });
             }
         },

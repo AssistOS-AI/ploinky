@@ -1,11 +1,15 @@
 import fs from 'fs';
 import path from 'path';
+import { setImmediate } from 'node:timers/promises';
 
 import { readJsonBody } from '../common.js';
+import { sortWorkspaceEntriesAsync } from '../../utils/workspacePaths.js';
 import {
     resolveWorkspaceDirectory,
     sanitizeUploadDirectoryPath,
 } from '../../webchat/uploadPaths.js';
+
+const collator = new Intl.Collator(undefined, { sensitivity: 'base' });
 
 function writeJson(res, status, payload) {
     res.writeHead(status, {
@@ -22,7 +26,7 @@ function directoryParent(relativePath) {
     return parent === '.' ? '' : parent;
 }
 
-export function listWorkspaceDirectory(context, relativePath = '') {
+export async function listWorkspaceDirectory(context, relativePath = '') {
     const directory = resolveWorkspaceDirectory({
         cwd: context?.cwd,
         workspaceRoot: context?.workspaceRoot,
@@ -30,42 +34,40 @@ export function listWorkspaceDirectory(context, relativePath = '') {
     });
     if (!directory) return null;
     const entries = [];
-    for (const entry of fs.readdirSync(directory.absolutePath, { withFileTypes: true })) {
+    const directoryEntries = await fs.promises.readdir(directory.absolutePath, { withFileTypes: true });
+    for (let index = 0; index < directoryEntries.length; index += 1) {
+        if (index > 0 && index % 128 === 0) await setImmediate();
+        const entry = directoryEntries[index];
         const entryPath = directory.relativePath
             ? `${directory.relativePath}/${entry.name}`
             : entry.name;
         const safePath = sanitizeUploadDirectoryPath(entryPath);
         if (safePath === null) continue;
-        const absolute = path.join(directory.absolutePath, entry.name);
-        let stat;
-        try {
-            stat = fs.lstatSync(absolute);
-        } catch (_) {
-            continue;
-        }
-        if (stat.isSymbolicLink()) continue;
-        if (!stat.isDirectory() && !stat.isFile()) continue;
+        if (entry.isSymbolicLink()) continue;
+        if (!entry.isDirectory() && !entry.isFile()) continue;
         entries.push({
             name: entry.name,
             path: safePath,
-            kind: stat.isDirectory() ? 'folder' : 'file',
+            kind: entry.isDirectory() ? 'folder' : 'file',
         });
     }
-    entries.sort((left, right) => {
+    // Raw Dirents are request-owned and no longer needed during sorting.
+    directoryEntries.length = 0;
+    const sortedEntries = await sortWorkspaceEntriesAsync(entries, (left, right) => {
         if (left.kind !== right.kind) return left.kind === 'folder' ? -1 : 1;
-        return left.name.localeCompare(right.name, undefined, { sensitivity: 'base' });
+        return collator.compare(left.name, right.name);
     });
     return {
         path: directory.relativePath,
         parentPath: directoryParent(directory.relativePath),
-        entries,
+        entries: sortedEntries,
     };
 }
 
-export function handleWorkspaceDirectoriesGet(req, res, parsedUrl, context) {
+export async function handleWorkspaceDirectoriesGet(req, res, parsedUrl, context) {
     if (!context) return writeJson(res, 400, { ok: false, error: 'invalid_workspace' });
     const requestedPath = parsedUrl?.searchParams?.get('path') || '';
-    const listing = listWorkspaceDirectory(context, requestedPath);
+    const listing = await listWorkspaceDirectory(context, requestedPath);
     if (!listing) return writeJson(res, 400, { ok: false, error: 'invalid_directory' });
     return writeJson(res, 200, { ok: true, ...listing });
 }
@@ -95,7 +97,7 @@ export async function handleWorkspaceDirectoriesPost(req, res, context) {
     });
     if (!parent) return writeJson(res, 400, { ok: false, error: 'invalid_parent' });
     try {
-        fs.mkdirSync(target.absolutePath);
+        await fs.promises.mkdir(target.absolutePath);
     } catch (error) {
         if (error?.code === 'EEXIST') {
             return writeJson(res, 409, { ok: false, error: 'directory_exists' });

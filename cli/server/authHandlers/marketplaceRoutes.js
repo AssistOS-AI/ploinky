@@ -1,15 +1,20 @@
 import fs from 'fs';
 import path from 'path';
+import { AsyncResource } from 'node:async_hooks';
 import { withWorkspaceMutationLease } from '../../utils/runtime/maintenanceLocks.js';
 import { uninstallRepositoryUnderLease } from '../../utils/repositoryUninstall.mjs';
 import { installRepositoryLinks, removeRepositoryLinks } from '../../utils/repositoryInstall.mjs';
 
 import * as reposSvc from '../../utils/repos.js';
 import { resolveSkillRepositorySource } from '../../utils/skillRepositorySource.js';
-import { listAgentRepositoryNames, workspaceAgentRepositoryPath } from '../../utils/agentRepositorySource.mjs';
+import { listAgentRepositoryNames, workspaceAgentRepositoryPath, runWithRepositoryResolutionScope } from '../../utils/agentRepositorySource.mjs';
+import { prefetchWorkspaceRepositoryOrigins } from '../../utils/repositorySource.mjs';
+import { PLOINKY_WORKSPACE_ROOT } from '../../utils/config.js';
 import * as agentsSvc from '../../utils/agents.js';
 import * as workspaceSvc from '../../utils/workspace.js';
 import { collectAgentRuntimeStates } from '../../sandbox/agentRuntimeState.js';
+import { collectLiveAgentContainersAsync } from '../../sandbox/docker/containerRegistry.js';
+import { debugLog } from '../../utils/utils.js';
 import { readAgentRegistrySnapshot } from '../../utils/agentRegistrySnapshot.js';
 import {
     createNoWaitRunBinding,
@@ -30,6 +35,7 @@ import { computeRchHttp, sha256RawBodyHash } from '../../../Agent/lib/requestHas
 import { verifyAgentAssertion } from '../mcp-proxy/invocationMinter.js';
 import { createTokenReplayCache } from '../security/tokens/JwsCodec.js';
 import { runMarketplaceEnableWorker } from '../marketplaceEnableWorker.js';
+import { repositoryWorkerEligible, runMarketplaceRepositoryWorker } from '../marketplaceRepositoryWorker.mjs';
 import { authService, LOCAL_AUTH_COOKIE_NAME, parseCookies, sendJson, sessionTokenService, SSO_AUTH_COOKIE_NAME } from './shared.js';
 import { localSessionAllowedForRoutePlan } from './authContext.js';
 import { findHardwareOutcome, formatHardwareOutcome } from '../../sandbox/hardwareLimits/errors.mjs';
@@ -43,6 +49,7 @@ export const MARKETPLACE_ENABLE_TOOL = 'marketplace.enable_agent';
 const marketplaceAssertionReplayCache = createTokenReplayCache({ maxSize: 4096 });
 
 const SAFE_LIFECYCLE_ERRORS = new Map([
+    ['PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED', { status: 503, message: 'Repository operation requires workspace recovery. Stop the exact Box from its host workspace, then start it again.' }],
     ['EDGE_GENERATION_CHANGED', { status: 503, message: 'The routing generation changed. Refresh Marketplace before retrying.' }],
     ['PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED', { status: 422, message: 'The requested runtime capability is unavailable in Ploinky Box.' }],
     ['PLOINKY_MANIFEST_SECURITY_INVALID', { status: 422, message: 'The agent manifest contains invalid runtime security settings.' }],
@@ -55,6 +62,82 @@ const SAFE_LIFECYCLE_ERRORS = new Map([
     ['PLOINKY_AGENT_ENABLE_MODE_UNSUPPORTED', { status: 422, message: 'The agent does not support the selected run mode.' }],
     ['PLOINKY_MANIFEST_ENABLE_MODES_INVALID', { status: 422, message: 'The agent manifest declares invalid enable modes.' }],
 ]);
+// The agent listing reads the container engine (two child processes). At most this many inventories run at once; every other request waits for
+// a slot and then collects for itself, so no inventory result is ever shared between requests.
+const MARKETPLACE_INVENTORY_MAX_IN_FLIGHT = 2;
+const MARKETPLACE_INVENTORY_SKIPPED = Symbol('marketplace.inventory.skipped');
+const MARKETPLACE_REQUEST_CLOSED = Symbol('marketplace.request.closed');
+
+// Runs `job` with at most `maxInFlight` jobs active. A job resolves to its own result, or to MARKETPLACE_INVENTORY_SKIPPED when
+// `isCancelled()` was true at the moment its turn came (it never starts). The job runs in the async context of the caller that enqueued it,
+// not in the context of whichever job released the slot.
+function createInventoryLimiter(maxInFlight = MARKETPLACE_INVENTORY_MAX_IN_FLIGHT) {
+    let inFlight = 0;
+    const queue = [];
+    const drain = () => {
+        while (inFlight < maxInFlight && queue.length) {
+            const entry = queue.shift();
+            if (entry.isCancelled()) {
+                entry.resolve(MARKETPLACE_INVENTORY_SKIPPED);
+                continue;
+            }
+            inFlight += 1;
+            let running;
+            try {
+                running = Promise.resolve(entry.job());
+            } catch (error) {
+                running = Promise.reject(error);
+            }
+            running.then(entry.resolve, entry.reject).finally(() => {
+                inFlight -= 1;
+                drain();
+            });
+        }
+    };
+    return (job, { isCancelled = () => false } = {}) => new Promise((resolve, reject) => {
+        queue.push({ job: AsyncResource.bind(job), isCancelled, resolve, reject });
+        drain();
+    });
+}
+const inventoryLimiter = createInventoryLimiter();
+
+// "Closed" is the response's own close without a completed end: the request's close event can also fire once its body has been consumed.
+function watchResponseClose(res) {
+    let closed = false;
+    const onClose = () => { if (!res.writableEnded) closed = true; };
+    if (typeof res?.once === 'function') res.once('close', onClose);
+    return {
+        isClosed: () => closed || (!res?.writableEnded && (res?.closed === true || res?.destroyed === true)),
+        stop: () => { if (typeof res?.removeListener === 'function') res.removeListener('close', onClose); },
+    };
+}
+
+async function runPreparedRepositoryRead(res, build, { catalog = false } = {}) {
+    const watch = watchResponseClose(res);
+    const controller = new AbortController();
+    const onClose = () => { if (watch.isClosed()) controller.abort(); };
+    res.once?.('close', onClose);
+    try {
+        if (watch.isClosed()) return MARKETPLACE_REQUEST_CLOSED;
+        return await runWithRepositoryResolutionScope(async () => {
+            const roots = [PLOINKY_WORKSPACE_ROOT];
+            // Skill catalog resolution uses the canonical spelling. Query both
+            // exact spellings in one pool; neither identity substitutes for the other.
+            if (catalog) roots.push(fs.realpathSync(PLOINKY_WORKSPACE_ROOT));
+            await prefetchWorkspaceRepositoryOrigins(roots, { signal: controller.signal });
+            if (watch.isClosed()) return MARKETPLACE_REQUEST_CLOSED;
+            const result = await build();
+            return watch.isClosed() ? MARKETPLACE_REQUEST_CLOSED : result;
+        }, { signal: controller.signal });
+    } catch (error) {
+        if (watch.isClosed()) return MARKETPLACE_REQUEST_CLOSED;
+        throw error;
+    } finally {
+        watch.stop();
+        res.removeListener?.('close', onClose);
+    }
+}
+
 const marketplaceEnableFlights = new Map();
 let marketplaceEnableQueue = Promise.resolve();
 
@@ -557,8 +640,12 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
             }
         },
     }),
+    disableAgentAction = (ref) => agentsSvc.disableAgent(ref),
     agentListOptions = {}, // a test's listing observes its own live containers
+    collectContainers = collectLiveAgentContainersAsync,
     uninstallRepositoryAction = (body) => uninstallMarketplaceRepository(body),
+    repositoryWorker = runMarketplaceRepositoryWorker,
+    repositoryWorkerEligibility = repositoryWorkerEligible,
 } = {}) {
     const route = parseMarketplacePath(parsedUrl.pathname || '/');
     if (!route) return false;
@@ -581,6 +668,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
             },
             verifyLease: () => !routePlan?.lease?.commit || routePlan.lease.commit() === true,
             readSelection: readEdgeRoutingSelection,
+            runReadScope: build => runPreparedRepositoryRead(res, build),
         });
     }
 
@@ -596,13 +684,35 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
         const authResult = await ensureMarketplaceUser(req, res, { routePlan });
         return authResult.ok;
     };
-    const agentsMarketplace = () => ({
-        ...buildMarketplaceAgents(req.user, agentListOptions),
-        permissions: {
-            canManage: isAdminUser(req.user)
-                && Boolean(publicMarketplaceAuthContext(routePlan) || canonicalControlOrigin(req)),
-        },
-    });
+    // Resolves to MARKETPLACE_REQUEST_CLOSED when the client went away while the inventory waited for a slot: nothing is built or sent then.
+    const agentsMarketplace = async () => {
+        let options = agentListOptions;
+        if (!Object.hasOwn(agentListOptions, 'runtimeEntries') && !Object.hasOwn(agentListOptions, 'liveContainers')) {
+            const watch = watchResponseClose(res);
+            let liveContainers;
+            try {
+                liveContainers = await inventoryLimiter(async () => {
+                    try {
+                        return (await collectContainers()) || [];
+                    } catch (error) {
+                        debugLog(`marketplace agent inventory: ${error?.message || error}`);
+                        return [];
+                    }
+                }, { isCancelled: watch.isClosed });
+            } finally {
+                watch.stop();
+            }
+            if (liveContainers === MARKETPLACE_INVENTORY_SKIPPED || watch.isClosed()) return MARKETPLACE_REQUEST_CLOSED;
+            options = { ...agentListOptions, liveContainers };
+        }
+        return {
+            ...buildMarketplaceAgents(req.user, options),
+            permissions: {
+                canManage: isAdminUser(req.user)
+                    && Boolean(publicMarketplaceAuthContext(routePlan) || canonicalControlOrigin(req)),
+            },
+        };
+    };
 
     // Raw repository source listing for the repository client.
     if (route.resource === 'list-repos') {
@@ -612,7 +722,9 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
             return true;
         }
         if (!await authorizeRead()) return true;
-        sendJson(res, 200, { ok: true, repositories: reposSvc.listRepositorySources() });
+        const repositories = await runPreparedRepositoryRead(res, () => reposSvc.listRepositorySources(), { catalog: true });
+        if (repositories === MARKETPLACE_REQUEST_CLOSED) return true;
+        sendJson(res, 200, { ok: true, repositories });
         return true;
     }
 
@@ -622,11 +734,13 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
     }
 
     const isRepos = route.resource === 'repos';
-    const marketplacePayload = () => (isRepos ? buildMarketplaceRepositories() : agentsMarketplace());
+    const marketplacePayload = async () => runPreparedRepositoryRead(res, () => (isRepos ? buildMarketplaceRepositories() : agentsMarketplace()), { catalog: isRepos });
 
     if (method === 'GET') {
         if (!await authorizeRead()) return true;
-        sendJson(res, 200, { ok: true, marketplace: marketplacePayload() });
+        const marketplace = await marketplacePayload();
+        if (marketplace === MARKETPLACE_REQUEST_CLOSED) return true;
+        sendJson(res, 200, { ok: true, marketplace });
         return true;
     }
 
@@ -682,6 +796,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
             })) return true;
         }
 
+        let mutationWatch;
         try {
             let result;
             if (action === 'install') {
@@ -691,29 +806,52 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
                 });
             } else if (action === 'remove') {
                 result = await withWorkspaceMutationLease({ operation: 'repositories-remove' }, () => removeRepositoryLinks(body?.paths));
-            } else if (action === 'install_repo') {
-                const url = normalizeMarketplaceUrl(body?.url);
-                const name = normalizeOptionalMarketplaceRepoName(body?.name);
-                const branch = String(body?.branch || '').trim() || null;
-                result = await withWorkspaceMutationLease({ operation: 'repositories-prepare' }, () => reposSvc.installRepo(url, name, branch, { stdio: 'pipe' }));
-            } else if (action === 'uninstall_repo') {
-                result = await uninstallRepositoryAction(body);
+            } else if (action === 'install_repo' || action === 'uninstall_repo') {
+                const operation = action === 'install_repo'
+                    ? { action, url: normalizeMarketplaceUrl(body?.url), name: normalizeOptionalMarketplaceRepoName(body?.name),
+                        branch: String(body?.branch || '').trim() || null }
+                    : { action, target: String(body?.target || body?.name || '').trim() };
+                if (repositoryWorkerEligibility()) {
+                    mutationWatch = watchResponseClose(res);
+                    if (mutationWatch.isClosed()) return true;
+                    const rawBodyBytes = rawBody.byteLength;
+                    rawBody = undefined;
+                    body = undefined;
+                    const originalLease = routePlan?.lease;
+                    result = await repositoryWorker({ operation, rawBodyBytes, cwd: process.cwd(),
+                        workspaceRoot: PLOINKY_WORKSPACE_ROOT, response: res,
+                        authorize: () => !originalLease?.commit || originalLease.commit() === true });
+                } else if (action === 'install_repo') {
+                    result = await withWorkspaceMutationLease({ operation: 'repositories-prepare' }, () => (
+                        reposSvc.installRepo(operation.url, operation.name, operation.branch, { stdio: 'pipe' })
+                    ));
+                } else result = await uninstallRepositoryAction(body);
             } else if (action === 'enable_agent') {
                 ({ result } = await enableAgentAction(body));
             } else if (action === 'disable_agent') {
                 const ref = normalizeMarketplaceAgentRef(body?.agentRef);
-                result = await agentsSvc.disableAgent(ref);
+                result = await disableAgentAction(ref);
                 if (result?.status && result.status !== 'removed' && result.status !== 'static-removed') {
                     sendMarketplaceError(res, 409, 'agent_disable_blocked', result.status);
                     return true;
                 }
             }
-            sendJson(res, 200, { ok: true, action, result, marketplace: marketplacePayload() });
+            if (mutationWatch?.isClosed()) return true;
+            const marketplace = await marketplacePayload();
+            if (marketplace === MARKETPLACE_REQUEST_CLOSED) return true;
+            sendJson(res, 200, { ok: true, action, result, marketplace });
             return true;
         } catch (error) {
+            if (mutationWatch?.isClosed()) return true;
+            if (error?.code === 'marketplace_repository_busy') {
+                sendMarketplaceError(res, 429, 'marketplace_repository_busy', 'Repository operation queue is full. Retry later.');
+                return true;
+            }
             if (sendLifecycleError(res, error)) return true;
             sendMarketplaceError(res, 400, 'marketplace_action_failed', error?.message || 'Marketplace action failed.');
             return true;
+        } finally {
+            mutationWatch?.stop();
         }
     }
 
@@ -722,6 +860,8 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
     return true;
 }
 export const __testables = {
+    createInventoryLimiter,
+    MARKETPLACE_INVENTORY_SKIPPED,
     buildMarketplaceState,
     collectMarketplaceNoWaitStates,
     normalizeMarketplaceAgentStatus,

@@ -43,6 +43,42 @@ export function loadServersConfig() {
     };
 }
 
+export async function loadServersConfigAsync() {
+    try {
+        return JSON.parse(await fs.promises.readFile(SERVERS_CONFIG_FILE, 'utf8'));
+    } catch (error) {
+        if (error.code !== 'ENOENT') console.warn('Error loading servers config:', error.message);
+    }
+    return { webchat: { port: null, command: null } };
+}
+
+export async function isServerRunningAsync(pidFile) {
+    try {
+        const pid = parseInt((await fs.promises.readFile(path.join(RUNNING_DIR, pidFile), 'utf8')).trim(), 10);
+        if (pid && !Number.isNaN(pid)) {
+            try {
+                process.kill(pid, 0);
+                return { running: true, pid };
+            } catch (_) {
+                return { running: false, pid };
+            }
+        }
+    } catch (_) { }
+    return { running: false, pid: null };
+}
+
+export async function getAllServerStatusesAsync() {
+    const config = await loadServersConfigAsync();
+    const cfg = config.webchat || {};
+    const status = await isServerRunningAsync('webchat.pid');
+    return {
+        webchat: {
+            displayName: 'WebChat', running: status.running, pid: status.pid,
+            port: cfg.port, command: cfg.command, agent: cfg.agent
+        }
+    };
+}
+
 export function saveServersConfig(config) {
     try {
         fs.mkdirSync(path.dirname(SERVERS_CONFIG_FILE), { recursive: true });

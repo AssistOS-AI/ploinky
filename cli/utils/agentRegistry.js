@@ -7,6 +7,8 @@ import * as reposSvc from './repos.js';
 import { REPOS_DIR } from './config.js';
 import { findAgent } from './utils.js';
 import { deriveAgentPrincipalId } from './security/agentIdentity.js';
+import { parseQualifiedAgentReference } from './agentRegistryResolver.js';
+import { resolveAgentTargetFromSnapshot } from './agentTargetResolver.js';
 
 /**
  * agentRegistry.js
@@ -144,6 +146,9 @@ function collectInstalledAgents() {
     return out;
 }
 
+// buildAgentIndex() scans every installed manifest on each call and keeps no
+// state between calls. It serves CLI listings; request paths resolve one agent
+// through describeAgent() instead, so no Router request pays for a full scan.
 export function buildAgentIndex() {
     const agents = new Map();
     const byPrincipal = new Map();
@@ -165,27 +170,110 @@ export function listSsoProviders() {
     return buildAgentIndex().ssoProviders;
 }
 
-export function resolveAgentDescriptor(agentRef) {
-    const canonical = canonicalizeAgentRef(agentRef);
-    if (!canonical) return null;
-    const index = buildAgentIndex();
-    if (index.agents.has(canonical)) return index.agents.get(canonical);
+// The agent directory of one repo/agent: the active route's hostPath when the
+// snapshot routes that exact repo and agent, else the agent under its one
+// repository path. A route's repo is canonical by construction; without a
+// route the repository must be a canonical repository name, as the installed
+// index keys it, because a workspace checkout's folder name also resolves to
+// a path but is not a principal name.
+function resolveAgentDirectory(repoName, agentName, snapshot) {
+    if (snapshot) {
+        try {
+            const target = resolveAgentTargetFromSnapshot(`${repoName}/${agentName}`, snapshot);
+            if (target?.hostPath) return target.hostPath;
+        } catch (_) {
+            // Ambiguous routes: fall back to the repository path.
+        }
+    }
     try {
-        const resolved = findAgent(canonical);
-        const repoName = resolved.repo;
-        const shortName = resolved.shortAgentName;
-        const full = `${repoName}/${shortName}`;
-        return index.agents.get(full) || null;
+        if (!listAgentRepositoryNames().includes(repoName)) return '';
+        return path.join(resolveAgentRepositoryPath(repoName), agentName);
+    } catch (_) {
+        return '';
+    }
+}
+
+// Locate one agent's manifest without reading it: a directory stat and a
+// manifest existence check under that agent's directory.
+export function locateAgentManifest(repoName, agentName, { snapshot = null, agentDir = '' } = {}) {
+    const repo = toNonEmptyString(repoName);
+    const agent = toNonEmptyString(agentName);
+    if (!repo || !agent) return null;
+    const agentPath = toNonEmptyString(agentDir) || resolveAgentDirectory(repo, agent, snapshot);
+    if (!agentPath) return null;
+    const manifestPath = path.join(agentPath, 'manifest.json');
+    try {
+        if (!fs.statSync(agentPath).isDirectory()) return null;
+        if (!fs.existsSync(manifestPath)) return null;
+    } catch (_) {
+        return null;
+    }
+    return { repo, agent, agentPath, manifestPath };
+}
+
+// One agent's descriptor, read fresh from that agent's manifest on every call.
+export function describeAgent(repoName, agentName, { snapshot = null, agentDir = '' } = {}) {
+    const located = locateAgentManifest(repoName, agentName, { snapshot, agentDir });
+    if (!located) return null;
+    const manifest = readManifest(located.manifestPath);
+    try {
+        return { ...buildAgentDescriptor(located.repo, located.agent, manifest), manifestPath: located.manifestPath };
     } catch (_) {
         return null;
     }
 }
 
-export function getAgentDescriptorByPrincipal(principalId) {
+// Resolve one agent reference to its repo/agent pair without reading any
+// manifest. A qualified reference names the pair; a bare reference resolves
+// through the snapshot's routes and records. Without a snapshot, or when the
+// snapshot has no target for a bare reference, the CLI's findAgent() lookup
+// applies (Router callers pass a snapshot or qualified references).
+function resolveAgentRefTarget(agentRef, snapshot) {
+    const canonical = canonicalizeAgentRef(agentRef);
+    if (!canonical) return null;
+    const qualification = parseQualifiedAgentReference(canonical);
+    if (qualification.qualified && !qualification.malformed) {
+        return { repo: qualification.repoName, agent: qualification.agentName, agentDir: '' };
+    }
+    if (!qualification.qualified && snapshot) {
+        let target = null;
+        try {
+            target = resolveAgentTargetFromSnapshot(canonical, snapshot);
+        } catch (_) {
+            return null;
+        }
+        if (target) return { repo: target.repo, agent: target.agent, agentDir: target.hostPath };
+    }
+    try {
+        const resolved = findAgent(canonical);
+        return { repo: resolved.repo, agent: resolved.shortAgentName, agentDir: '' };
+    } catch (_) {
+        return null;
+    }
+}
+
+export function resolveAgentDescriptor(agentRef, { snapshot = null } = {}) {
+    const target = resolveAgentRefTarget(agentRef, snapshot);
+    if (!target) return null;
+    return describeAgent(target.repo, target.agent, { snapshot, agentDir: target.agentDir });
+}
+
+export function resolveAgentManifestLocation(agentRef, { snapshot = null } = {}) {
+    const target = resolveAgentRefTarget(agentRef, snapshot);
+    if (!target) return null;
+    return locateAgentManifest(target.repo, target.agent, { snapshot, agentDir: target.agentDir });
+}
+
+// Principals are always `agent:<repo>/<agent>`; anything else names no agent
+// and is answered without I/O.
+const AGENT_PRINCIPAL_PATTERN = /^agent:([^/:\s]+)\/([^/:\s]+)$/;
+
+export function getAgentDescriptorByPrincipal(principalId, { snapshot = null } = {}) {
     const clean = toNonEmptyString(principalId);
     if (!clean) return null;
-    const index = buildAgentIndex();
-    return index.byPrincipal.get(clean) || null;
+    const match = AGENT_PRINCIPAL_PATTERN.exec(clean);
+    if (!match) return null;
+    return describeAgent(match[1], match[2], { snapshot });
 }
 
 export function canonicalJsonHash(obj) {

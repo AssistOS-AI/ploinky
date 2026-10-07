@@ -761,6 +761,60 @@ test('Ploinky box never falls back to Docker when nested Podman is missing', () 
     }
 });
 
+test('Ploinky box probe fails closed without podman and caches only a positive result per marker', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-sandbox-box-cache-'));
+    try {
+        const emptyBin = path.join(root, 'empty');
+        fs.mkdirSync(emptyBin);
+        const podmanBin = makeFakeRuntimeBin(root, 'podman');
+        const markerA = path.join(root, 'box-a');
+        const markerB = path.join(root, 'box-b');
+        fs.writeFileSync(markerA, BOX_MARKER_CONTENT);
+        fs.writeFileSync(markerB, BOX_MARKER_CONTENT);
+        const script = `
+            const { probeContainerRuntime } = await import(${JSON.stringify(dockerCommonUrl)});
+            const out = {};
+            process.env.PATH = ${JSON.stringify(emptyBin)};
+            out.missing = probeContainerRuntime(${JSON.stringify(markerA)});
+            process.env.PATH = ${JSON.stringify(podmanBin)};
+            out.found = probeContainerRuntime(${JSON.stringify(markerA)});
+            process.env.PATH = ${JSON.stringify(emptyBin)};
+            out.cachedSameMarker = probeContainerRuntime(${JSON.stringify(markerA)});
+            out.otherMarkerStillFailsClosed = probeContainerRuntime(${JSON.stringify(markerB)});
+            console.log(JSON.stringify(out));
+        `;
+        const result = runModuleScript({ cwd: root, env: { PATH: emptyBin }, script });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        assert.deepEqual(parseLastJsonLine(result.stdout), {
+            missing: null,
+            found: 'podman',
+            cachedSameMarker: 'podman',
+            otherMarkerStillFailsClosed: null,
+        });
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('Ploinky box probe ignores a directory named podman on PATH', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-sandbox-box-dir-'));
+    try {
+        const binDir = path.join(root, 'bin');
+        fs.mkdirSync(path.join(binDir, 'podman'), { recursive: true });
+        const marker = path.join(root, 'ploinky-box');
+        fs.writeFileSync(marker, BOX_MARKER_CONTENT);
+        const script = `
+            const { probeContainerRuntime } = await import(${JSON.stringify(dockerCommonUrl)});
+            console.log(JSON.stringify({ runtime: probeContainerRuntime(${JSON.stringify(marker)}) }));
+        `;
+        const result = runModuleScript({ cwd: root, env: { PATH: binDir }, script });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        assert.deepEqual(parseLastJsonLine(result.stdout), { runtime: null });
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
 // ------------------------------------------------------------------
 // The dispatcher in front of both native managers (Seatbelt, with a fake
 // sandbox-exec on macOS): it observes the runtime key before it rotates any
