@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { routerInventory } from './router-inventory.mjs';
+import { routerInventory, routerInventoryBaseline } from './router-inventory.mjs';
+import { resolveRouterSourceReference, assertRouterInventoryObligations, assertRouterReferenceMaps } from './router-source-references.mjs';
 import { inspectMarketplaceAuthorization, routerProbes, runRouterProbes, validateRouterAllowedResponse, validateRouterPrincipal } from './router-probes.mjs';
 import { markerCommand, terminalFixtureNames } from './stream-probes.mjs';
 
@@ -17,6 +18,50 @@ test('Router inventory identities are unique and every source reference is a rea
     if (row.anchor) assert.ok(source.split('\n')[Number(line) - 1].includes(row.anchor), `${row.source} no longer contains ${row.anchor}`);
     assert.deepEqual(Object.keys(row.expected).sort(), ['admin', 'anonymous', 'selfRegistered', 'user']);
   }
+});
+
+test('Router source references reject stale metadata, wrong anchors, unknown blobs and unmapped identities', () => {
+  for (const row of routerInventory) {
+    const baseline = routerInventoryBaseline.find(candidate => candidate.id === row.id);
+    const { source, anchor, sourceBlobSha256, ...contract } = row;
+    const { source: originalSource, anchor: originalAnchor, ...originalContract } = baseline;
+    assert.deepEqual(contract, originalContract, `${row.id} authority and coverage contract`);
+  }
+  for (const id of ['hardware-limits-read.get', 'marketplace-install_repo.post']) {
+    const row = routerInventoryBaseline.find(candidate => candidate.id === id);
+    const [file, line] = row.source.split(':');
+    const bytes = fs.readFileSync(new URL(`../../../${file}`, import.meta.url));
+    const resolved = resolveRouterSourceReference(row, bytes);
+    assert.ok(resolved.sourceBlobSha256);
+    assert.throws(() => resolveRouterSourceReference({ ...row, source: `${file}:${Number(line) - 1}` }, bytes), /STALE_ROUTER_REFERENCE/);
+    assert.throws(() => resolveRouterSourceReference({ ...row, anchor: 'wrong_dispatch' }, bytes), /MISMATCHED_ROUTER_ANCHOR/);
+    assert.throws(() => resolveRouterSourceReference({ ...row, id: 'unknown.get' }, bytes), /UNMAPPED_ROUTER_REFERENCE/);
+    // Even an insertion preserving the reviewed dispatch statement requires a
+    // new blob review. Do not search for the first convenient matching anchor.
+    assert.throws(() => resolveRouterSourceReference(row, Buffer.concat([bytes, Buffer.from('\n')])), /UNREVIEWED_ROUTER_SOURCE/);
+    const broken = Buffer.from(bytes.toString().replace(resolved.anchor, 'wrong_dispatch'));
+    assert.throws(() => resolveRouterSourceReference(row, broken), /UNREVIEWED_ROUTER_SOURCE/);
+  }
+});
+
+test('Router inventory retains the complete union of both prior inventories and refuses lost candidate anchors', () => {
+  const snapshot = JSON.parse(fs.readFileSync(new URL('./router-reference-obligations_codex.json', import.meta.url)));
+  assert.equal(snapshot.priorInventories.baseline.rows.length, 128);
+  assert.equal(snapshot.priorInventories.candidate.rows.length, 128);
+  assert.equal(snapshot.priorInventories.candidate.rows.filter(row => row.anchor).length, 43);
+  assert.equal(routerInventory.filter(row => row.anchor).length, 43);
+  assert.equal(assertRouterReferenceMaps(snapshot), true);
+  assert.equal(assertRouterInventoryObligations(routerInventory), true);
+  const id = 'webchat-directories-create.post';
+  assert.throws(() => assertRouterInventoryObligations(routerInventory.filter(row => row.id !== id)), /MISSING_ROUTER_OBLIGATION/);
+  assert.throws(() => assertRouterInventoryObligations(routerInventory.map(row => row.id === id ? { ...row, anchor: undefined } : row)), /MISSING_UNION_ROUTER_ANCHOR/);
+  const lost = structuredClone(snapshot);
+  lost.canonical[id].anchor = null;
+  assert.throws(() => assertRouterReferenceMaps(lost), /MISSING_UNION_ROUTER_ANCHOR/);
+  const weakened = structuredClone(snapshot);
+  const file = 'cli/server/static/index.js';
+  weakened.files[file].blobs[weakened.files[file].candidate]['web-libs.get'].anchor = 'function serveWebLibRequest';
+  assert.throws(() => assertRouterReferenceMaps(weakened), /PRIOR_ROUTER_ANCHOR_CHANGED/);
 });
 
 test('A redirect, missing endpoint, or 200 error cannot satisfy authorized positive control', () => {

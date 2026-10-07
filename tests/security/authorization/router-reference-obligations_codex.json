@@ -1,0 +1,2889 @@
+{
+  "schema": 1,
+  "priorInventories": {
+    "baseline": {
+      "revision": "2df5bca9b8ec105d6d7a0e43a1d98151e154e979",
+      "sourceSha256": "7225b0edaeda9520e2fd02904416d23c4b71c6b8a1d4619a72199b8c6596f221",
+      "rows": [
+        {
+          "id": "root.get",
+          "source": "cli/server/RoutingServer.js:771",
+          "anchor": null,
+          "contractSha256": "1f85394ea014f0f8efef6333f896a7893f5661a409e08bd90f947d092af88b1e"
+        },
+        {
+          "id": "root-index.get",
+          "source": "cli/server/RoutingServer.js:771",
+          "anchor": null,
+          "contractSha256": "0088a59947e639ff20b84ef775611452f4a2ad3f829292a8f18a763a0535cbdf"
+        },
+        {
+          "id": "auth-login.get",
+          "source": "cli/server/authHandlers/authRoutes.js:172",
+          "anchor": null,
+          "contractSha256": "7e22bc645f1eb455ce731fc7a9a0802439a9df8ca968dbe9ae81dcf0eab32ccc"
+        },
+        {
+          "id": "auth-callback.get",
+          "source": "cli/server/authHandlers/authRoutes.js:223",
+          "anchor": null,
+          "contractSha256": "42a366c216250c636de7c87b9520cfdac926e6eeddcbb0a7739169283ac8f513"
+        },
+        {
+          "id": "auth-logged-out.get",
+          "source": "cli/server/authHandlers/authRoutes.js:160",
+          "anchor": null,
+          "contractSha256": "0ac9f92739fb25b934d551a568fef53d4e69300776ebfa757f2c828d62f06030"
+        },
+        {
+          "id": "auth-logout-confirmation.get",
+          "source": "cli/server/authHandlers/authRoutes.js:280",
+          "anchor": null,
+          "contractSha256": "cd7512c9115bad4310cc884e32bd6adb371feba1e0c75af813dce41cad7a3355"
+        },
+        {
+          "id": "auth-logout.post",
+          "source": "cli/server/authHandlers/authRoutes.js:280",
+          "anchor": null,
+          "contractSha256": "13867c0fcbcf62de91d458fcfe89ccfe7892be421f0defbaae7f805dc9fe9d6f"
+        },
+        {
+          "id": "auth-token.get",
+          "source": "cli/server/authHandlers/authRoutes.js:383",
+          "anchor": null,
+          "contractSha256": "5a35d62d603b4c0521301c96458957506b16319ee131525d2240be29aede58e4"
+        },
+        {
+          "id": "auth-token-refresh.post",
+          "source": "cli/server/authHandlers/authRoutes.js:417",
+          "anchor": null,
+          "contractSha256": "af63d6bad5eb765d4c12d6d7c05e19f934a892412c1e21eff885b17aac2a3332"
+        },
+        {
+          "id": "removed-auth-account.*",
+          "source": "cli/server/authHandlers/authRoutes.js:205",
+          "anchor": null,
+          "contractSha256": "c36940be7d5cca68596105dff41d17fb67da6d4d43068f54e712e30c1f448f44"
+        },
+        {
+          "id": "removed-auth-local-users.*",
+          "source": "cli/server/authHandlers/authRoutes.js:210",
+          "anchor": null,
+          "contractSha256": "d5c2d0daecbe47a9e497a06161a7b1ca9402b1c548f6fe62f0ca14e1f123d0c5"
+        },
+        {
+          "id": "removed-auth-github.*",
+          "source": "cli/server/authHandlers/authRoutes.js:219",
+          "anchor": null,
+          "contractSha256": "5368ac459864ae9badf448adb0f88157aa8b6c5c4aba83e17b5d3da8d7f859f1"
+        },
+        {
+          "id": "removed-auth-agent-token.post",
+          "source": "cli/server/authHandlers/authRoutes.js:501",
+          "anchor": null,
+          "contractSha256": "ec835072c608ed590d2a111a6fe9101bb9ba55d535ad6835f31ce56cb4dcd414"
+        },
+        {
+          "id": "users-list.get",
+          "source": "cli/server/authHandlers/userAdminRoutes.js:259",
+          "anchor": null,
+          "contractSha256": "ea67e44ffcad9a3747c32da59f412fd0debf4db92420f35b2cc3e00942de5672"
+        },
+        {
+          "id": "users-create.post",
+          "source": "cli/server/authHandlers/userAdminRoutes.js:304",
+          "anchor": null,
+          "contractSha256": "e3b8de988e7b3957e63dd3ddddd56e3b10af1ff17bb04c5122edc3e226604321"
+        },
+        {
+          "id": "users-update.patch",
+          "source": "cli/server/authHandlers/userAdminRoutes.js:327",
+          "anchor": null,
+          "contractSha256": "6de54090674d0ee7816ec3b23ad4050b604f01cddeb188040c16a2dd6663f1b6"
+        },
+        {
+          "id": "users-delete.delete",
+          "source": "cli/server/authHandlers/userAdminRoutes.js:352",
+          "anchor": null,
+          "contractSha256": "6d6b693f1171f1505360835535888ff30474c8f15779ee9cdb2606e756afef60"
+        },
+        {
+          "id": "removed-settings.*",
+          "source": "cli/server/authHandlers/userAdminRoutes.js:173",
+          "anchor": null,
+          "contractSha256": "3b66b83df9e40c7e1a61720389551063f342e60f8ca23bccb688c46eab745d51"
+        },
+        {
+          "id": "marketplace-repos-read.get",
+          "source": "cli/server/authHandlers/marketplaceRoutes.js:625",
+          "anchor": "const marketplacePayload = () =>",
+          "contractSha256": "f1ae6cdf5941958c6d8a482c1f20fca0e12dccc4042b64c122f7c87e3918f970"
+        },
+        {
+          "id": "marketplace-agents-read.get",
+          "source": "cli/server/authHandlers/marketplaceRoutes.js:600",
+          "anchor": "...buildMarketplaceAgents(req.user, agentListOptions),",
+          "contractSha256": "0d3bf70709d0f62788e4936d97a2f2baca206dd24d52bec4d36cb372e3444fb7"
+        },
+        {
+          "id": "hardware-limits-read.get",
+          "source": "cli/server/authHandlers/hardwareLimitsRoutes.mjs:231",
+          "anchor": "if (method === 'GET') {",
+          "contractSha256": "e60fef83c497ecae5986f2d76c2e3313ad50cc64e111deae7d79e167ae02adf4"
+        },
+        {
+          "id": "hardware-limits-set_agent_limits.post",
+          "source": "cli/server/authHandlers/hardwareLimitsRoutes.mjs:270",
+          "anchor": "const result = body.action === 'set_agent_limits'",
+          "contractSha256": "4992c7cb06a7314cba424816c285ebbf4c79658ddc5fecad26d993503b46c6b0"
+        },
+        {
+          "id": "hardware-limits-clear_agent_limits.post",
+          "source": "cli/server/authHandlers/hardwareLimitsRoutes.mjs:270",
+          "anchor": "const result = body.action === 'set_agent_limits'",
+          "contractSha256": "4ed93c1fe2263e81999d5747574d7bc8b11bbcb55059883a6753bc620cb18f50"
+        },
+        {
+          "id": "hardware-limits-apply.post",
+          "source": "cli/server/authHandlers/hardwareLimitsRoutes.mjs:248",
+          "anchor": "if (body.action === 'apply') {",
+          "contractSha256": "9bf93d9734e41039e3d99421ca9ece1ef6adacd59858275969e2cfb9a2adb449"
+        },
+        {
+          "id": "marketplace-install_repo.post",
+          "source": "cli/server/authHandlers/marketplaceRoutes.js:694",
+          "anchor": "action === 'install_repo'",
+          "contractSha256": "a0b4c15152e6b1788a669518fabb16c0e6b3c6f220478d11c60aec55bbe27176"
+        },
+        {
+          "id": "marketplace-uninstall_repo.post",
+          "source": "cli/server/authHandlers/marketplaceRoutes.js:699",
+          "anchor": "action === 'uninstall_repo'",
+          "contractSha256": "88143386946127a634c68899adfa77152b3b6dae53f1ed340e4cc12bd13dbeb9"
+        },
+        {
+          "id": "marketplace-enable_agent.post",
+          "source": "cli/server/authHandlers/marketplaceRoutes.js:701",
+          "anchor": "action === 'enable_agent'",
+          "contractSha256": "b3b976d0000a4af24b3e4bf8a086cdc0f5a7fab4969c469176157c8a10cfcc9b"
+        },
+        {
+          "id": "marketplace-disable_agent.post",
+          "source": "cli/server/authHandlers/marketplaceRoutes.js:703",
+          "anchor": "action === 'disable_agent'",
+          "contractSha256": "dccd9d06d2f1c656ea88bd847298e6f04c2a61d3f294bfe168ad4509b822c161"
+        },
+        {
+          "id": "policy-http.route.list.post",
+          "source": "cli/server/policy/PolicyCommandInvoker.js:39",
+          "anchor": null,
+          "contractSha256": "7b922b21b4ec727b740aa2b4e259195ef5d69699043633268b12e9894e14328f"
+        },
+        {
+          "id": "policy-http.route.check.post",
+          "source": "cli/server/policy/PolicyCommandInvoker.js:39",
+          "anchor": null,
+          "contractSha256": "01f0041ef8c197fa76686b9e266e875616818c7ba98a66eaabf3928054c12636"
+        },
+        {
+          "id": "policy-http.route.set.post",
+          "source": "cli/server/policy/PolicyCommandInvoker.js:39",
+          "anchor": null,
+          "contractSha256": "b713a516b28a95c9046a6cada8bee7c721f8b7495a8b3327db4d0d96e1c6d902"
+        },
+        {
+          "id": "policy-http.route.remove.post",
+          "source": "cli/server/policy/PolicyCommandInvoker.js:39",
+          "anchor": null,
+          "contractSha256": "902fbf0b2d28e7508e29f631a246a7be47932324fc591fb3b5f1ffe560a0794f"
+        },
+        {
+          "id": "policy-mcp.policy.list.post",
+          "source": "cli/server/policy/PolicyCommandInvoker.js:39",
+          "anchor": null,
+          "contractSha256": "edf735e4f50985aa9d8cc0e55fc8be66c6ee9a2cf78f0464ad77f11d6afec6dc"
+        },
+        {
+          "id": "policy-mcp.policy.get.post",
+          "source": "cli/server/policy/PolicyCommandInvoker.js:39",
+          "anchor": null,
+          "contractSha256": "912fca34139498c2fd3836360c62d23afeea3ae210fa18630c73167072114a97"
+        },
+        {
+          "id": "policy-mcp.policy.set.post",
+          "source": "cli/server/policy/PolicyCommandInvoker.js:39",
+          "anchor": null,
+          "contractSha256": "bd2a6a6b8e9baf4edc8bb410789b901e9cf328b75f1f8d119520ad8c370eac82"
+        },
+        {
+          "id": "health.get",
+          "source": "cli/server/RoutingServer.js:644",
+          "anchor": null,
+          "contractSha256": "a49a2b29468bc169becdcee5edf5f10ff1e5678c07a074c06e8c6a0e1c2d7b88"
+        },
+        {
+          "id": "status.*",
+          "source": "cli/server/handlers/status.js:80",
+          "anchor": null,
+          "contractSha256": "d8520c118c35fe23bf88a36786be4fa19c1db5b926695cc5b2439b1ee8e1a623"
+        },
+        {
+          "id": "status-follow.get",
+          "source": "cli/server/handlers/status.js:94",
+          "anchor": null,
+          "contractSha256": "af245a4dc2230c1cf88ef7ec77ad74e0d8ced37041ef358eb98a56562b79dcc6"
+        },
+        {
+          "id": "identity-user-key.post",
+          "source": "cli/server/userIdentityKeyRoute.js:21",
+          "anchor": null,
+          "contractSha256": "1f94e1d8ac6075fd3b20afae5aae749cb7e91a0bf1111a8295c719e27f2201b2"
+        },
+        {
+          "id": "openai-agent-discovery.get",
+          "source": "cli/server/openAiAgentDiscovery.js:194",
+          "anchor": null,
+          "contractSha256": "92c8b04e5782d1770cf17670cdde908cd43e29c895f5db935db8d89e0ca0874e"
+        },
+        {
+          "id": "agent-card.get",
+          "source": "cli/server/RoutingServer.js:332",
+          "anchor": null,
+          "contractSha256": "d3fa2b6aa08b0fd84def3f8e63b2332e7d075c119404b7aacb2b27ee818b7167"
+        },
+        {
+          "id": "agent-card-slash.get",
+          "source": "cli/server/RoutingServer.js:332",
+          "anchor": null,
+          "contractSha256": "a2f3e48ec3cf6665f28638f06a47315d6c635b16a396f760813d5e61dd03c129"
+        },
+        {
+          "id": "mcp-browser-client.get",
+          "source": "cli/server/RoutingServer.js:466",
+          "anchor": null,
+          "contractSha256": "5f72e000254eb0226e039ec91cad5abf63d2a2555b9a826c3f9d32d2cc974740"
+        },
+        {
+          "id": "mcp-browser-client.head",
+          "source": "cli/server/RoutingServer.js:466",
+          "anchor": null,
+          "contractSha256": "a6861641d5f21c0944201d1f4a38c548b45ca5188a02dc0ef9cee858c1d1f303"
+        },
+        {
+          "id": "web-libs.get",
+          "source": "cli/server/static/index.js:544",
+          "anchor": null,
+          "contractSha256": "757172316715f286c2c0ad0316bd97c55031a21c153095fe98190625202bbab1"
+        },
+        {
+          "id": "web-libs.head",
+          "source": "cli/server/static/index.js:544",
+          "anchor": null,
+          "contractSha256": "2da02bb82e756a675af3e8312092d4078ea15b5ed67a683a9db28ef75a8c1874"
+        },
+        {
+          "id": "mcp-rpc-initialize.post",
+          "source": "cli/server/routerHandlers.js:1037",
+          "anchor": null,
+          "contractSha256": "d476c325cc0cd2d1647a0b056d7c8619282dd4f010767ccf6d2cc17ba04445fb"
+        },
+        {
+          "id": "mcp-rpc-notifications/initialized.post",
+          "source": "cli/server/routerHandlers.js:1037",
+          "anchor": null,
+          "contractSha256": "7487826be5a4c9d8bd8ae468db560d0aea08f8f8d62dddc84ca0cdf0581b2478"
+        },
+        {
+          "id": "mcp-rpc-tools/list.post",
+          "source": "cli/server/routerHandlers.js:1037",
+          "anchor": null,
+          "contractSha256": "c00bbd95640dd7007659c20d802bc6147699465ee810ba7fc8e31409c0144a21"
+        },
+        {
+          "id": "mcp-rpc-tools/call.post",
+          "source": "cli/server/routerHandlers.js:1037",
+          "anchor": null,
+          "contractSha256": "23005835c1e2235e0cc8e8504bfa016aa97e929630218437095cdfc2b78ce4a9"
+        },
+        {
+          "id": "mcp-rpc-resources/list.post",
+          "source": "cli/server/routerHandlers.js:1037",
+          "anchor": null,
+          "contractSha256": "f65888abc6547aeec6ffdde39184471cf7ce7e460ddc2d5db017587aa3c959c4"
+        },
+        {
+          "id": "mcp-rpc-resources/read.post",
+          "source": "cli/server/routerHandlers.js:1037",
+          "anchor": null,
+          "contractSha256": "7b20a9c82fe5f420135aeef2b338d2b643a43023ad2fc93e1f7696d53f9f2952"
+        },
+        {
+          "id": "mcp-rpc-ping.post",
+          "source": "cli/server/routerHandlers.js:1037",
+          "anchor": null,
+          "contractSha256": "6e1988f060008a60b2354c4a541ad84614cd30301cc095bd4f13bd2119453ad9"
+        },
+        {
+          "id": "mcp-legacy-methods.post",
+          "source": "cli/server/routerHandlers.js:753",
+          "anchor": null,
+          "contractSha256": "659aee4fdf792dcbd6322a4c704bdde44a241fa3fe02e1d2ea17a1313f8ce4d3"
+        },
+        {
+          "id": "mcp-legacy-list_tools.post",
+          "source": "cli/server/routerHandlers.js:753",
+          "anchor": null,
+          "contractSha256": "15a4ec6ef5cbb6c9711c0d10a09bb6432ea4042443443ab87bb4df0c20f6e82a"
+        },
+        {
+          "id": "mcp-legacy-tools.post",
+          "source": "cli/server/routerHandlers.js:753",
+          "anchor": null,
+          "contractSha256": "f8ff557a83d8dc5bae0c1ed001a594f0113b8663c647a0f6fe83021ad4f426de"
+        },
+        {
+          "id": "mcp-legacy-list_resources.post",
+          "source": "cli/server/routerHandlers.js:753",
+          "anchor": null,
+          "contractSha256": "a4dba4bcb7c59ba76939bbef45a7baf000f702bd50c923eed1326027ac375eba"
+        },
+        {
+          "id": "mcp-legacy-resources.post",
+          "source": "cli/server/routerHandlers.js:753",
+          "anchor": null,
+          "contractSha256": "566890a08778277db2a1d35422ec1154dc62867870fc3f84311f28429f2123e8"
+        },
+        {
+          "id": "mcp-legacy-tool.post",
+          "source": "cli/server/routerHandlers.js:753",
+          "anchor": null,
+          "contractSha256": "8292279e9d5cd6b822ab2fad45cf2dc244bab4190ecd663dd700b588ef4ee429"
+        },
+        {
+          "id": "mcp-legacy-resources/read.post",
+          "source": "cli/server/routerHandlers.js:753",
+          "anchor": null,
+          "contractSha256": "36d09cd24f60311435a24f7d96f8e8d70901fd37f6e3e0dd48bfb743ef0269df"
+        },
+        {
+          "id": "mcp-legacy-status.post",
+          "source": "cli/server/routerHandlers.js:753",
+          "anchor": null,
+          "contractSha256": "fe1d43a117e2cacedc47911d32ea967da33700f3a561c9375cc2445a5bc14c38"
+        },
+        {
+          "id": "mcp-legacy-ping.post",
+          "source": "cli/server/routerHandlers.js:753",
+          "anchor": null,
+          "contractSha256": "00d3c478a0ef1c008ad3bb56e4e74ce46199ab636ce6580efb20429d720efc01"
+        },
+        {
+          "id": "mcp-session-delete.delete",
+          "source": "cli/server/routerHandlers.js:1210",
+          "anchor": null,
+          "contractSha256": "bad665b743d3fbdaebb44e08cc88c05abe2927410cdba353dd1989229aad144b"
+        },
+        {
+          "id": "mcp-sse-unsupported.get",
+          "source": "cli/server/routerHandlers.js:1204",
+          "anchor": null,
+          "contractSha256": "12d4c03d26396e3fcc3a6d443fe70ce290313160891b0fd930be7f4d797ef2ee"
+        },
+        {
+          "id": "webtty-ui.get",
+          "source": "cli/server/handlers/webtty.js:196",
+          "anchor": null,
+          "contractSha256": "5eebe9c471a8822438a8d689755b5b6b75223a9cae8b38351ecdbade7ce26576"
+        },
+        {
+          "id": "webtty-ui-slash.get",
+          "source": "cli/server/handlers/webtty.js:196",
+          "anchor": null,
+          "contractSha256": "a31a2f47face80fd7fc206bb53e261adc603e19d50718423963d360df3fb35ec"
+        },
+        {
+          "id": "webtty-assets.get",
+          "source": "cli/server/handlers/webtty.js:207",
+          "anchor": null,
+          "contractSha256": "26c0e04ec4e7d73609fc564ab37b957823cfedf14ea5b2e5074c99f27ab9cf5b"
+        },
+        {
+          "id": "webtty-discover.post",
+          "source": "cli/server/handlers/webtty.js:225",
+          "anchor": null,
+          "contractSha256": "03473ee1cd959e386865bc8202ee07cb9792abcc41af0a825eec393480e26fd6"
+        },
+        {
+          "id": "webtty-discovery-delete.delete",
+          "source": "cli/server/handlers/webtty.js:250",
+          "anchor": null,
+          "contractSha256": "4796e3e42ebb077d66dd5235dd1d468e0a3debaba25c333f641290b35fe204e3"
+        },
+        {
+          "id": "webtty-create.post",
+          "source": "cli/server/handlers/webtty.js:268",
+          "anchor": null,
+          "contractSha256": "fcb35a21c045fae35ae3fadee2e207caad3224b6c9c2092654c32bb2270e37bf"
+        },
+        {
+          "id": "webtty-stream.get",
+          "source": "cli/server/handlers/webtty.js:304",
+          "anchor": null,
+          "contractSha256": "6d29464d7aa3cd5b912cd4269eec67e1a9aecfe94d420198207796b7719de996"
+        },
+        {
+          "id": "webtty-input.post",
+          "source": "cli/server/handlers/webtty.js:326",
+          "anchor": null,
+          "contractSha256": "71a868692118b19b3adf9192b79a3638ebc4aa1291a67469527038210ad3854c"
+        },
+        {
+          "id": "webtty-resize.post",
+          "source": "cli/server/handlers/webtty.js:351",
+          "anchor": null,
+          "contractSha256": "8354ac5771b342a4603b78329a9c04e60edfe8f720c47a41c3655202d9e3cbf0"
+        },
+        {
+          "id": "webtty-delete.delete",
+          "source": "cli/server/handlers/webtty.js:375",
+          "anchor": null,
+          "contractSha256": "54625d114bd794c42ee87c134ca3f131abd68460dbe784a6832e3d670dc73e5b"
+        },
+        {
+          "id": "webchat-ui.get",
+          "source": "cli/server/handlers/webchat/index.js:151",
+          "anchor": null,
+          "contractSha256": "b1636f3bfe3d3a03d92ed0d8535e8f8e815c6cf46142cb784c84e38bd2a8946a"
+        },
+        {
+          "id": "webchat-ui-no-slash.get",
+          "source": "cli/server/handlers/webchat/index.js:151",
+          "anchor": null,
+          "contractSha256": "a2be03c6f9bcf62b0135cb50be84c37c87cbad066b579a8429f6451fa3ca81ef"
+        },
+        {
+          "id": "webchat-index.get",
+          "source": "cli/server/handlers/webchat/index.js:151",
+          "anchor": null,
+          "contractSha256": "f5087207339d52efbf1ec80adb4261d25598e6b067c45013b1927e72553212cb"
+        },
+        {
+          "id": "webchat-assets.get",
+          "source": "cli/server/handlers/webchat/index.js:89",
+          "anchor": null,
+          "contractSha256": "2ae514d233e2d4568ae19a177e70108abbcc03510c469057fc1acfba1b1d26f0"
+        },
+        {
+          "id": "webchat-removed-token-auth.post",
+          "source": "cli/server/handlers/webchat/index.js:79",
+          "anchor": null,
+          "contractSha256": "caab1ad11c0dae056c05a558773aeedb88d4f5bf53eb0268e8fc6c51d764a929"
+        },
+        {
+          "id": "webchat-logout.post",
+          "source": "cli/server/handlers/webchat/index.js:87",
+          "anchor": null,
+          "contractSha256": "6d8a807d6c5cc7365869ba1a5375fdf615ff842e17c297e32ef04d6dc94dd638"
+        },
+        {
+          "id": "webchat-suggestions.get",
+          "source": "cli/server/handlers/webchat/index.js:118",
+          "anchor": null,
+          "contractSha256": "6ba69d21e189c222baf0e546b8e7ddf198d9e63cc98f2d1fea731f14b68b9786"
+        },
+        {
+          "id": "webchat-suggestions.head",
+          "source": "cli/server/handlers/webchat/index.js:118",
+          "anchor": null,
+          "contractSha256": "fcea16b585041766a5074a2c6287845b8ede3b13de414683030965182afa6d3c"
+        },
+        {
+          "id": "webchat-upload.post",
+          "source": "cli/server/handlers/webchat/index.js:122",
+          "anchor": null,
+          "contractSha256": "a92eb6f78b4b666faa080853e4e549c3b3d9d90910ed46dd5ad518f5fc4f7cef"
+        },
+        {
+          "id": "webchat-upload.put",
+          "source": "cli/server/handlers/webchat/index.js:122",
+          "anchor": null,
+          "contractSha256": "d2440103d46843f240c303bac8905e73666924fe1915b0600e4cb38d14a6c839"
+        },
+        {
+          "id": "webchat-directories-list.get",
+          "source": "cli/server/handlers/webchat/index.js:135",
+          "anchor": null,
+          "contractSha256": "83fb5699afcbe7071b7444a90309129ff3b53fa39b6606eccbd1d76a5328877c"
+        },
+        {
+          "id": "webchat-directories-list.head",
+          "source": "cli/server/handlers/webchat/index.js:135",
+          "anchor": null,
+          "contractSha256": "0ab1dcdf84c35a37e0fd1a984416b9c36dcdd414dc272eeb7b598794897468d3"
+        },
+        {
+          "id": "webchat-directories-create.post",
+          "source": "cli/server/handlers/webchat/index.js:140",
+          "anchor": null,
+          "contractSha256": "cdb191c8756976c703283d12e327ca94433ef48069b5ff5306e9fd274fb40e9d"
+        },
+        {
+          "id": "webchat-task-view.get",
+          "source": "cli/server/handlers/webchat/taskRoutes.js:11",
+          "anchor": null,
+          "contractSha256": "b450d1a5a3679b0721d939893a9b055edcd738079867c9db1d3a6b770d55066c"
+        },
+        {
+          "id": "webchat-stream.get",
+          "source": "cli/server/handlers/webchat/runtimeRoutes.js:73",
+          "anchor": null,
+          "contractSha256": "3b9100fe9c64fdb06ab7645163eab57ffb837e0e5c8e000ce53593574622e0db"
+        },
+        {
+          "id": "webchat-input.post",
+          "source": "cli/server/handlers/webchat/runtimeRoutes.js:243",
+          "anchor": null,
+          "contractSha256": "290a838231b05478acf6e61089a30391f2be59dfbbfded786c12405c22221e70"
+        },
+        {
+          "id": "webchat-control.post",
+          "source": "cli/server/handlers/webchat/runtimeRoutes.js:319",
+          "anchor": null,
+          "contractSha256": "b5c7233a4db6b78ecf26428227fe2e8d6ae813fd63897099587854c88a1d86e8"
+        },
+        {
+          "id": "webchat-interaction.post",
+          "source": "cli/server/handlers/webchat/runtimeRoutes.js:348",
+          "anchor": null,
+          "contractSha256": "81da960eacf59bf6df0b6d1ad38fb8fa6fe58fbe215a4a7a00d64a3cde365a30"
+        },
+        {
+          "id": "workspace-upload.post",
+          "source": "cli/server/handlers/blobs.js:396",
+          "anchor": null,
+          "contractSha256": "a8f8f3f9736e8f2744d414bc398b71fe087bdcd61efb042948007b6449db9f7c"
+        },
+        {
+          "id": "workspace-upload.put",
+          "source": "cli/server/handlers/blobs.js:396",
+          "anchor": null,
+          "contractSha256": "dba01b3e5056f7fcd12717721a7936dd61612f0d04acfe618deacdd78b35b524"
+        },
+        {
+          "id": "blob-shared-create.post",
+          "source": "cli/server/handlers/blobs.js:450",
+          "anchor": null,
+          "contractSha256": "c2a7f61bde815a4214ba222f5acb79b525950e2948223c72bec35e1679a1d5fb"
+        },
+        {
+          "id": "blob-agent-create.post",
+          "source": "cli/server/handlers/blobs.js:459",
+          "anchor": null,
+          "contractSha256": "80d66006c8c937493235004afb88ee9a51206506a52cd71734e9bed0972f17aa"
+        },
+        {
+          "id": "blob-shared-read.get",
+          "source": "cli/server/handlers/blobs.js:474",
+          "anchor": null,
+          "contractSha256": "25ef8d8474825f7084cd2b8116a5b79aa8f87288a35d50c3468811a5b5a0cae7"
+        },
+        {
+          "id": "blob-shared-read.head",
+          "source": "cli/server/handlers/blobs.js:474",
+          "anchor": null,
+          "contractSha256": "bc4625868f1e487c2950d422815f71763901ff825bb42c9ee77e4de1fa190508"
+        },
+        {
+          "id": "blob-agent-read.get",
+          "source": "cli/server/handlers/blobs.js:484",
+          "anchor": null,
+          "contractSha256": "5e07cf66c6c756b0f4daac5f90c297a91a5aea134a5998d64fbe43e0f3a00baa"
+        },
+        {
+          "id": "blob-agent-read.head",
+          "source": "cli/server/handlers/blobs.js:484",
+          "anchor": null,
+          "contractSha256": "4edcd522b51d4864f83c751f2455bf35b2ac3032ebe5ee84fdffc252a5eaa0b9"
+        },
+        {
+          "id": "workspace-file-read.get",
+          "source": "cli/server/static/index.js:507",
+          "anchor": null,
+          "contractSha256": "924b13629dfaa95dd8f9fd1778a8d912fbc49165d5186c8d54a525cc3d95ce4f"
+        },
+        {
+          "id": "workspace-file-read.head",
+          "source": "cli/server/static/index.js:507",
+          "anchor": null,
+          "contractSha256": "c3f50954fb7b734848fd6e5abae4f8b7e0a445e7f619ea40c5fc94c0ddf1742d"
+        },
+        {
+          "id": "agent-root-proxy.*",
+          "source": "cli/server/RoutingServer.js:433",
+          "anchor": null,
+          "contractSha256": "e269075c170865004cff4bee3e76a305466d0b81cec00cd71c2e9d9f01c3e5a0"
+        },
+        {
+          "id": "agent-static.get",
+          "source": "cli/server/static/index.js:668",
+          "anchor": null,
+          "contractSha256": "45fa59c0f9cb986f183c30852914261dcbf1bd8e21fb3fb41369247683d22922"
+        },
+        {
+          "id": "agent-static.head",
+          "source": "cli/server/static/index.js:668",
+          "anchor": null,
+          "contractSha256": "d2f17bde405ce5e1e4d141d6972fd7ccb16c05f9b237f6dc70e8f3ec36a4bb0a"
+        },
+        {
+          "id": "agent-mcp.post",
+          "source": "cli/server/RoutingServer.js:742",
+          "anchor": null,
+          "contractSha256": "2e4abd686ec49b82b4e66dc6c92ea45f9efbae23ca4a0d850c6252a84c4618ed"
+        },
+        {
+          "id": "agent-mcp.delete",
+          "source": "cli/server/RoutingServer.js:742",
+          "anchor": null,
+          "contractSha256": "559a1569a3cf0b58585cd5b994e64ea9530da8d54a5c8d23d5a79457c63c6bb6"
+        },
+        {
+          "id": "agent-mcp.get",
+          "source": "cli/server/RoutingServer.js:742",
+          "anchor": null,
+          "contractSha256": "4e668bb9710fc9f983bc9a52230b4d1ea4fdcac43f723fd3c0dde3e2e91ba33d"
+        },
+        {
+          "id": "agent-task-status.get",
+          "source": "cli/server/RoutingServer.js:604",
+          "anchor": null,
+          "contractSha256": "f025e54a2f385f7fb87aa33950d1012a0702b70f111dcf3fbe36726d743ebfef"
+        },
+        {
+          "id": "agent-task-status-alias.get",
+          "source": "cli/server/RoutingServer.js:604",
+          "anchor": null,
+          "contractSha256": "dda2f0a713d3c1dda46c1e82924875e1968bc8c8328b8e4b04e3e0751f8c276a"
+        },
+        {
+          "id": "agent-task-cancel.post",
+          "source": "cli/server/RoutingServer.js:546",
+          "anchor": null,
+          "contractSha256": "c37bdee0939a02774efa6087788ec341d3db296592d3da400f760eee11d59d91"
+        },
+        {
+          "id": "agent-openai.post",
+          "source": "cli/server/RoutingServer.js:589",
+          "anchor": null,
+          "contractSha256": "a9e566b4e53119df31eefb510ac820116caa9bb9815207c5d65b2b93997285c2"
+        },
+        {
+          "id": "agent-additional-http.*",
+          "source": "cli/server/edgeRoutePlan.js:195",
+          "anchor": "function agentPortPlan({",
+          "contractSha256": "192ac0ea390a7d6a8d3e4251c43cd04c9f00efc5ebdb7f2620754b03a093e9b3"
+        },
+        {
+          "id": "agent-startup-probe.get",
+          "source": "cli/server/agentStartupPage.js:180",
+          "anchor": "headerEntry(req, AGENT_STARTUP_PROBE_HEADER)",
+          "contractSha256": "d54e6cc1e368d9d067974f87283dc0c9fae2c75d656ce2ca8799f480f0fda955"
+        },
+        {
+          "id": "agent-root-websocket.get",
+          "source": "cli/server/RoutingServer.js:955",
+          "anchor": null,
+          "contractSha256": "a449776a8a9bb18f7759541384dba07d5ce58198523c3f801e053c8198425e74"
+        },
+        {
+          "id": "agent-additional-websocket.get",
+          "source": "cli/server/RoutingServer.js:982",
+          "anchor": null,
+          "contractSha256": "ac7b78158e1c37907548e6e3c9f8de4f54e700ae67c40dd0c32496a648bde22f"
+        },
+        {
+          "id": "internal-agent-control.*",
+          "source": "cli/server/RoutingServer.js:481",
+          "anchor": null,
+          "contractSha256": "82757c796c4bed63e3014ee87ac27ce32b7e3cdbc226822a5a9780bbbb3f49ce"
+        },
+        {
+          "id": "private-workspace-logs.post",
+          "source": "cli/server/edgeRoutePlan.js:757",
+          "anchor": "pathname === '/api/edge/workspace-logs'",
+          "contractSha256": "9fd2d51917b996d7f6c12820b3cfcfc838011f863c491409078da6beab011e11"
+        },
+        {
+          "id": "private-workspace-metrics.get",
+          "source": "cli/server/edgeRoutePlan.js:775",
+          "anchor": "pathname === '/api/edge/workspace-metrics'",
+          "contractSha256": "55adae3e57592fff3b156d101d224018ae05accb9ff327d9d00d825c76d84df4"
+        },
+        {
+          "id": "private-runtime-origins.get",
+          "source": "cli/server/edgeRoutePlan.js:793",
+          "anchor": "pathname === '/api/edge/runtime-origins'",
+          "contractSha256": "5b00f710ef552fa3738975aec8a1c5170cf9017c9776cc003c36ec9c96e12280"
+        },
+        {
+          "id": "private-turn-credentials.post",
+          "source": "cli/server/edgeRoutePlan.js:814",
+          "anchor": "pathname === '/api/edge/turn-credentials'",
+          "contractSha256": "fe2af0f1777d6ecefcb1040ba1bb9946cfc0f9ea3cc0d6f2de7c3d572aed2998"
+        },
+        {
+          "id": "reserved--metrics.*",
+          "source": "cli/server/RoutingServer.js:251",
+          "anchor": null,
+          "contractSha256": "ba782da4ccd4f0ec444994ab6209b1da43a7cee5f26ea9069cf4f00fcc6aa989"
+        },
+        {
+          "id": "reserved--health-internal.*",
+          "source": "cli/server/RoutingServer.js:251",
+          "anchor": null,
+          "contractSha256": "bc3d628714675b124e94ef84a71ec0c53e9cf9a45b48ca3d06b5c13e7ab65287"
+        },
+        {
+          "id": "reserved--admin.*",
+          "source": "cli/server/RoutingServer.js:251",
+          "anchor": null,
+          "contractSha256": "a91ead652b809898b5b90da6fd5188168ae26aa592a6e4928a171f7c5f09ab5e"
+        },
+        {
+          "id": "reserved--admin-*.*",
+          "source": "cli/server/RoutingServer.js:251",
+          "anchor": null,
+          "contractSha256": "271355f5ff8716e29bc20a280bc3994807c323d805339086825b5737c43ca3bf"
+        },
+        {
+          "id": "unix-health.get",
+          "source": "cli/server/RoutingServer.js:926",
+          "anchor": null,
+          "contractSha256": "ea9f0e688585317a5b46fe688e50dc5e4ecf00803b9e224ae65f0cf27c11f457"
+        },
+        {
+          "id": "unix-authority-create.post",
+          "source": "cli/server/routerAuthorityAttestationRegistry.js:275",
+          "anchor": null,
+          "contractSha256": "a4a673ee8f302eb6d1a022d370dcd6290890c5902e9bd8b9841e9367b9fbea76"
+        },
+        {
+          "id": "unix-authority-read.get",
+          "source": "cli/server/routerAuthorityAttestationRegistry.js:317",
+          "anchor": null,
+          "contractSha256": "e739888f28173040f8244a4f8b9a64d5f78bd744e222befd84ad1865bc35c38b"
+        }
+      ]
+    },
+    "candidate": {
+      "revision": "7336ed34d7123d2e764611582be25c4e5bb011c3",
+      "sourceSha256": "4a7b8872ceb7ad2bb16ace506b663a7ff3bbabec11f24245a58e258f06bef3d6",
+      "rows": [
+        {
+          "id": "root.get",
+          "source": "cli/server/RoutingServer.js:771",
+          "anchor": null,
+          "contractSha256": "1f85394ea014f0f8efef6333f896a7893f5661a409e08bd90f947d092af88b1e"
+        },
+        {
+          "id": "root-index.get",
+          "source": "cli/server/RoutingServer.js:771",
+          "anchor": null,
+          "contractSha256": "0088a59947e639ff20b84ef775611452f4a2ad3f829292a8f18a763a0535cbdf"
+        },
+        {
+          "id": "auth-login.get",
+          "source": "cli/server/authHandlers/authRoutes.js:172",
+          "anchor": null,
+          "contractSha256": "7e22bc645f1eb455ce731fc7a9a0802439a9df8ca968dbe9ae81dcf0eab32ccc"
+        },
+        {
+          "id": "auth-callback.get",
+          "source": "cli/server/authHandlers/authRoutes.js:223",
+          "anchor": null,
+          "contractSha256": "42a366c216250c636de7c87b9520cfdac926e6eeddcbb0a7739169283ac8f513"
+        },
+        {
+          "id": "auth-logged-out.get",
+          "source": "cli/server/authHandlers/authRoutes.js:160",
+          "anchor": null,
+          "contractSha256": "0ac9f92739fb25b934d551a568fef53d4e69300776ebfa757f2c828d62f06030"
+        },
+        {
+          "id": "auth-logout-confirmation.get",
+          "source": "cli/server/authHandlers/authRoutes.js:280",
+          "anchor": null,
+          "contractSha256": "cd7512c9115bad4310cc884e32bd6adb371feba1e0c75af813dce41cad7a3355"
+        },
+        {
+          "id": "auth-logout.post",
+          "source": "cli/server/authHandlers/authRoutes.js:280",
+          "anchor": null,
+          "contractSha256": "13867c0fcbcf62de91d458fcfe89ccfe7892be421f0defbaae7f805dc9fe9d6f"
+        },
+        {
+          "id": "auth-token.get",
+          "source": "cli/server/authHandlers/authRoutes.js:383",
+          "anchor": null,
+          "contractSha256": "5a35d62d603b4c0521301c96458957506b16319ee131525d2240be29aede58e4"
+        },
+        {
+          "id": "auth-token-refresh.post",
+          "source": "cli/server/authHandlers/authRoutes.js:417",
+          "anchor": null,
+          "contractSha256": "af63d6bad5eb765d4c12d6d7c05e19f934a892412c1e21eff885b17aac2a3332"
+        },
+        {
+          "id": "removed-auth-account.*",
+          "source": "cli/server/authHandlers/authRoutes.js:205",
+          "anchor": null,
+          "contractSha256": "c36940be7d5cca68596105dff41d17fb67da6d4d43068f54e712e30c1f448f44"
+        },
+        {
+          "id": "removed-auth-local-users.*",
+          "source": "cli/server/authHandlers/authRoutes.js:210",
+          "anchor": null,
+          "contractSha256": "d5c2d0daecbe47a9e497a06161a7b1ca9402b1c548f6fe62f0ca14e1f123d0c5"
+        },
+        {
+          "id": "removed-auth-github.*",
+          "source": "cli/server/authHandlers/authRoutes.js:219",
+          "anchor": null,
+          "contractSha256": "5368ac459864ae9badf448adb0f88157aa8b6c5c4aba83e17b5d3da8d7f859f1"
+        },
+        {
+          "id": "removed-auth-agent-token.post",
+          "source": "cli/server/authHandlers/authRoutes.js:501",
+          "anchor": null,
+          "contractSha256": "ec835072c608ed590d2a111a6fe9101bb9ba55d535ad6835f31ce56cb4dcd414"
+        },
+        {
+          "id": "users-list.get",
+          "source": "cli/server/authHandlers/userAdminRoutes.js:259",
+          "anchor": null,
+          "contractSha256": "ea67e44ffcad9a3747c32da59f412fd0debf4db92420f35b2cc3e00942de5672"
+        },
+        {
+          "id": "users-create.post",
+          "source": "cli/server/authHandlers/userAdminRoutes.js:304",
+          "anchor": null,
+          "contractSha256": "e3b8de988e7b3957e63dd3ddddd56e3b10af1ff17bb04c5122edc3e226604321"
+        },
+        {
+          "id": "users-update.patch",
+          "source": "cli/server/authHandlers/userAdminRoutes.js:327",
+          "anchor": null,
+          "contractSha256": "6de54090674d0ee7816ec3b23ad4050b604f01cddeb188040c16a2dd6663f1b6"
+        },
+        {
+          "id": "users-delete.delete",
+          "source": "cli/server/authHandlers/userAdminRoutes.js:352",
+          "anchor": null,
+          "contractSha256": "6d6b693f1171f1505360835535888ff30474c8f15779ee9cdb2606e756afef60"
+        },
+        {
+          "id": "removed-settings.*",
+          "source": "cli/server/authHandlers/userAdminRoutes.js:173",
+          "anchor": null,
+          "contractSha256": "3b66b83df9e40c7e1a61720389551063f342e60f8ca23bccb688c46eab745d51"
+        },
+        {
+          "id": "marketplace-repos-read.get",
+          "source": "cli/server/authHandlers/marketplaceRoutes.js:737",
+          "anchor": "const marketplacePayload = async () =>",
+          "contractSha256": "f1ae6cdf5941958c6d8a482c1f20fca0e12dccc4042b64c122f7c87e3918f970"
+        },
+        {
+          "id": "marketplace-agents-read.get",
+          "source": "cli/server/authHandlers/marketplaceRoutes.js:709",
+          "anchor": "...buildMarketplaceAgents(req.user, options),",
+          "contractSha256": "0d3bf70709d0f62788e4936d97a2f2baca206dd24d52bec4d36cb372e3444fb7"
+        },
+        {
+          "id": "hardware-limits-read.get",
+          "source": "cli/server/authHandlers/hardwareLimitsRoutes.mjs:273",
+          "anchor": "if (method === 'GET') {",
+          "contractSha256": "e60fef83c497ecae5986f2d76c2e3313ad50cc64e111deae7d79e167ae02adf4"
+        },
+        {
+          "id": "hardware-limits-set_agent_limits.post",
+          "source": "cli/server/authHandlers/hardwareLimitsRoutes.mjs:316",
+          "anchor": "const result = body.action === 'set_agent_limits'",
+          "contractSha256": "4992c7cb06a7314cba424816c285ebbf4c79658ddc5fecad26d993503b46c6b0"
+        },
+        {
+          "id": "hardware-limits-clear_agent_limits.post",
+          "source": "cli/server/authHandlers/hardwareLimitsRoutes.mjs:316",
+          "anchor": "const result = body.action === 'set_agent_limits'",
+          "contractSha256": "4ed93c1fe2263e81999d5747574d7bc8b11bbcb55059883a6753bc620cb18f50"
+        },
+        {
+          "id": "hardware-limits-apply.post",
+          "source": "cli/server/authHandlers/hardwareLimitsRoutes.mjs:294",
+          "anchor": "if (body.action === 'apply') {",
+          "contractSha256": "9bf93d9734e41039e3d99421ca9ece1ef6adacd59858275969e2cfb9a2adb449"
+        },
+        {
+          "id": "marketplace-install_repo.post",
+          "source": "cli/server/authHandlers/marketplaceRoutes.js:809",
+          "anchor": "action === 'install_repo'",
+          "contractSha256": "a0b4c15152e6b1788a669518fabb16c0e6b3c6f220478d11c60aec55bbe27176"
+        },
+        {
+          "id": "marketplace-uninstall_repo.post",
+          "source": "cli/server/authHandlers/marketplaceRoutes.js:809",
+          "anchor": "action === 'uninstall_repo'",
+          "contractSha256": "88143386946127a634c68899adfa77152b3b6dae53f1ed340e4cc12bd13dbeb9"
+        },
+        {
+          "id": "marketplace-enable_agent.post",
+          "source": "cli/server/authHandlers/marketplaceRoutes.js:829",
+          "anchor": "action === 'enable_agent'",
+          "contractSha256": "b3b976d0000a4af24b3e4bf8a086cdc0f5a7fab4969c469176157c8a10cfcc9b"
+        },
+        {
+          "id": "marketplace-disable_agent.post",
+          "source": "cli/server/authHandlers/marketplaceRoutes.js:831",
+          "anchor": "action === 'disable_agent'",
+          "contractSha256": "dccd9d06d2f1c656ea88bd847298e6f04c2a61d3f294bfe168ad4509b822c161"
+        },
+        {
+          "id": "policy-http.route.list.post",
+          "source": "cli/server/policy/PolicyCommandInvoker.js:39",
+          "anchor": null,
+          "contractSha256": "7b922b21b4ec727b740aa2b4e259195ef5d69699043633268b12e9894e14328f"
+        },
+        {
+          "id": "policy-http.route.check.post",
+          "source": "cli/server/policy/PolicyCommandInvoker.js:39",
+          "anchor": null,
+          "contractSha256": "01f0041ef8c197fa76686b9e266e875616818c7ba98a66eaabf3928054c12636"
+        },
+        {
+          "id": "policy-http.route.set.post",
+          "source": "cli/server/policy/PolicyCommandInvoker.js:39",
+          "anchor": null,
+          "contractSha256": "b713a516b28a95c9046a6cada8bee7c721f8b7495a8b3327db4d0d96e1c6d902"
+        },
+        {
+          "id": "policy-http.route.remove.post",
+          "source": "cli/server/policy/PolicyCommandInvoker.js:39",
+          "anchor": null,
+          "contractSha256": "902fbf0b2d28e7508e29f631a246a7be47932324fc591fb3b5f1ffe560a0794f"
+        },
+        {
+          "id": "policy-mcp.policy.list.post",
+          "source": "cli/server/policy/PolicyCommandInvoker.js:39",
+          "anchor": null,
+          "contractSha256": "edf735e4f50985aa9d8cc0e55fc8be66c6ee9a2cf78f0464ad77f11d6afec6dc"
+        },
+        {
+          "id": "policy-mcp.policy.get.post",
+          "source": "cli/server/policy/PolicyCommandInvoker.js:39",
+          "anchor": null,
+          "contractSha256": "912fca34139498c2fd3836360c62d23afeea3ae210fa18630c73167072114a97"
+        },
+        {
+          "id": "policy-mcp.policy.set.post",
+          "source": "cli/server/policy/PolicyCommandInvoker.js:39",
+          "anchor": null,
+          "contractSha256": "bd2a6a6b8e9baf4edc8bb410789b901e9cf328b75f1f8d119520ad8c370eac82"
+        },
+        {
+          "id": "health.get",
+          "source": "cli/server/RoutingServer.js:644",
+          "anchor": null,
+          "contractSha256": "a49a2b29468bc169becdcee5edf5f10ff1e5678c07a074c06e8c6a0e1c2d7b88"
+        },
+        {
+          "id": "status.*",
+          "source": "cli/server/handlers/status.js:77",
+          "anchor": "pathname === '/data'",
+          "contractSha256": "d8520c118c35fe23bf88a36786be4fa19c1db5b926695cc5b2439b1ee8e1a623"
+        },
+        {
+          "id": "status-follow.get",
+          "source": "cli/server/handlers/status.js:89",
+          "anchor": "streamWorkspaceMetrics(res, { decorate })",
+          "contractSha256": "af245a4dc2230c1cf88ef7ec77ad74e0d8ced37041ef358eb98a56562b79dcc6"
+        },
+        {
+          "id": "identity-user-key.post",
+          "source": "cli/server/userIdentityKeyRoute.js:21",
+          "anchor": null,
+          "contractSha256": "1f94e1d8ac6075fd3b20afae5aae749cb7e91a0bf1111a8295c719e27f2201b2"
+        },
+        {
+          "id": "openai-agent-discovery.get",
+          "source": "cli/server/openAiAgentDiscovery.js:194",
+          "anchor": null,
+          "contractSha256": "92c8b04e5782d1770cf17670cdde908cd43e29c895f5db935db8d89e0ca0874e"
+        },
+        {
+          "id": "agent-card.get",
+          "source": "cli/server/RoutingServer.js:332",
+          "anchor": null,
+          "contractSha256": "d3fa2b6aa08b0fd84def3f8e63b2332e7d075c119404b7aacb2b27ee818b7167"
+        },
+        {
+          "id": "agent-card-slash.get",
+          "source": "cli/server/RoutingServer.js:332",
+          "anchor": null,
+          "contractSha256": "a2f3e48ec3cf6665f28638f06a47315d6c635b16a396f760813d5e61dd03c129"
+        },
+        {
+          "id": "mcp-browser-client.get",
+          "source": "cli/server/RoutingServer.js:477",
+          "anchor": "pathname === '/MCPBrowserClient.js'",
+          "contractSha256": "5f72e000254eb0226e039ec91cad5abf63d2a2555b9a826c3f9d32d2cc974740"
+        },
+        {
+          "id": "mcp-browser-client.head",
+          "source": "cli/server/RoutingServer.js:477",
+          "anchor": "pathname === '/MCPBrowserClient.js'",
+          "contractSha256": "a6861641d5f21c0944201d1f4a38c548b45ca5188a02dc0ef9cee858c1d1f303"
+        },
+        {
+          "id": "web-libs.get",
+          "source": "cli/server/static/index.js:721",
+          "anchor": "async function serveWebLibRequest(req, res) {",
+          "contractSha256": "757172316715f286c2c0ad0316bd97c55031a21c153095fe98190625202bbab1"
+        },
+        {
+          "id": "web-libs.head",
+          "source": "cli/server/static/index.js:721",
+          "anchor": "async function serveWebLibRequest(req, res) {",
+          "contractSha256": "2da02bb82e756a675af3e8312092d4078ea15b5ed67a683a9db28ef75a8c1874"
+        },
+        {
+          "id": "mcp-rpc-initialize.post",
+          "source": "cli/server/routerHandlers.js:1037",
+          "anchor": null,
+          "contractSha256": "d476c325cc0cd2d1647a0b056d7c8619282dd4f010767ccf6d2cc17ba04445fb"
+        },
+        {
+          "id": "mcp-rpc-notifications/initialized.post",
+          "source": "cli/server/routerHandlers.js:1037",
+          "anchor": null,
+          "contractSha256": "7487826be5a4c9d8bd8ae468db560d0aea08f8f8d62dddc84ca0cdf0581b2478"
+        },
+        {
+          "id": "mcp-rpc-tools/list.post",
+          "source": "cli/server/routerHandlers.js:1037",
+          "anchor": null,
+          "contractSha256": "c00bbd95640dd7007659c20d802bc6147699465ee810ba7fc8e31409c0144a21"
+        },
+        {
+          "id": "mcp-rpc-tools/call.post",
+          "source": "cli/server/routerHandlers.js:1037",
+          "anchor": null,
+          "contractSha256": "23005835c1e2235e0cc8e8504bfa016aa97e929630218437095cdfc2b78ce4a9"
+        },
+        {
+          "id": "mcp-rpc-resources/list.post",
+          "source": "cli/server/routerHandlers.js:1037",
+          "anchor": null,
+          "contractSha256": "f65888abc6547aeec6ffdde39184471cf7ce7e460ddc2d5db017587aa3c959c4"
+        },
+        {
+          "id": "mcp-rpc-resources/read.post",
+          "source": "cli/server/routerHandlers.js:1037",
+          "anchor": null,
+          "contractSha256": "7b20a9c82fe5f420135aeef2b338d2b643a43023ad2fc93e1f7696d53f9f2952"
+        },
+        {
+          "id": "mcp-rpc-ping.post",
+          "source": "cli/server/routerHandlers.js:1037",
+          "anchor": null,
+          "contractSha256": "6e1988f060008a60b2354c4a541ad84614cd30301cc095bd4f13bd2119453ad9"
+        },
+        {
+          "id": "mcp-legacy-methods.post",
+          "source": "cli/server/routerHandlers.js:753",
+          "anchor": null,
+          "contractSha256": "659aee4fdf792dcbd6322a4c704bdde44a241fa3fe02e1d2ea17a1313f8ce4d3"
+        },
+        {
+          "id": "mcp-legacy-list_tools.post",
+          "source": "cli/server/routerHandlers.js:753",
+          "anchor": null,
+          "contractSha256": "15a4ec6ef5cbb6c9711c0d10a09bb6432ea4042443443ab87bb4df0c20f6e82a"
+        },
+        {
+          "id": "mcp-legacy-tools.post",
+          "source": "cli/server/routerHandlers.js:753",
+          "anchor": null,
+          "contractSha256": "f8ff557a83d8dc5bae0c1ed001a594f0113b8663c647a0f6fe83021ad4f426de"
+        },
+        {
+          "id": "mcp-legacy-list_resources.post",
+          "source": "cli/server/routerHandlers.js:753",
+          "anchor": null,
+          "contractSha256": "a4dba4bcb7c59ba76939bbef45a7baf000f702bd50c923eed1326027ac375eba"
+        },
+        {
+          "id": "mcp-legacy-resources.post",
+          "source": "cli/server/routerHandlers.js:753",
+          "anchor": null,
+          "contractSha256": "566890a08778277db2a1d35422ec1154dc62867870fc3f84311f28429f2123e8"
+        },
+        {
+          "id": "mcp-legacy-tool.post",
+          "source": "cli/server/routerHandlers.js:753",
+          "anchor": null,
+          "contractSha256": "8292279e9d5cd6b822ab2fad45cf2dc244bab4190ecd663dd700b588ef4ee429"
+        },
+        {
+          "id": "mcp-legacy-resources/read.post",
+          "source": "cli/server/routerHandlers.js:753",
+          "anchor": null,
+          "contractSha256": "36d09cd24f60311435a24f7d96f8e8d70901fd37f6e3e0dd48bfb743ef0269df"
+        },
+        {
+          "id": "mcp-legacy-status.post",
+          "source": "cli/server/routerHandlers.js:753",
+          "anchor": null,
+          "contractSha256": "fe1d43a117e2cacedc47911d32ea967da33700f3a561c9375cc2445a5bc14c38"
+        },
+        {
+          "id": "mcp-legacy-ping.post",
+          "source": "cli/server/routerHandlers.js:753",
+          "anchor": null,
+          "contractSha256": "00d3c478a0ef1c008ad3bb56e4e74ce46199ab636ce6580efb20429d720efc01"
+        },
+        {
+          "id": "mcp-session-delete.delete",
+          "source": "cli/server/routerHandlers.js:1210",
+          "anchor": null,
+          "contractSha256": "bad665b743d3fbdaebb44e08cc88c05abe2927410cdba353dd1989229aad144b"
+        },
+        {
+          "id": "mcp-sse-unsupported.get",
+          "source": "cli/server/routerHandlers.js:1204",
+          "anchor": null,
+          "contractSha256": "12d4c03d26396e3fcc3a6d443fe70ce290313160891b0fd930be7f4d797ef2ee"
+        },
+        {
+          "id": "webtty-ui.get",
+          "source": "cli/server/handlers/webtty.js:196",
+          "anchor": "pathname === '/webtty'",
+          "contractSha256": "5eebe9c471a8822438a8d689755b5b6b75223a9cae8b38351ecdbade7ce26576"
+        },
+        {
+          "id": "webtty-ui-slash.get",
+          "source": "cli/server/handlers/webtty.js:196",
+          "anchor": "pathname === '/webtty'",
+          "contractSha256": "a31a2f47face80fd7fc206bb53e261adc603e19d50718423963d360df3fb35ec"
+        },
+        {
+          "id": "webtty-assets.get",
+          "source": "cli/server/handlers/webtty.js:208",
+          "anchor": "pathname.startsWith('/webtty/assets/')",
+          "contractSha256": "26c0e04ec4e7d73609fc564ab37b957823cfedf14ea5b2e5074c99f27ab9cf5b"
+        },
+        {
+          "id": "webtty-discover.post",
+          "source": "cli/server/handlers/webtty.js:225",
+          "anchor": null,
+          "contractSha256": "03473ee1cd959e386865bc8202ee07cb9792abcc41af0a825eec393480e26fd6"
+        },
+        {
+          "id": "webtty-discovery-delete.delete",
+          "source": "cli/server/handlers/webtty.js:250",
+          "anchor": null,
+          "contractSha256": "4796e3e42ebb077d66dd5235dd1d468e0a3debaba25c333f641290b35fe204e3"
+        },
+        {
+          "id": "webtty-create.post",
+          "source": "cli/server/handlers/webtty.js:268",
+          "anchor": null,
+          "contractSha256": "fcb35a21c045fae35ae3fadee2e207caad3224b6c9c2092654c32bb2270e37bf"
+        },
+        {
+          "id": "webtty-stream.get",
+          "source": "cli/server/handlers/webtty.js:304",
+          "anchor": null,
+          "contractSha256": "6d29464d7aa3cd5b912cd4269eec67e1a9aecfe94d420198207796b7719de996"
+        },
+        {
+          "id": "webtty-input.post",
+          "source": "cli/server/handlers/webtty.js:326",
+          "anchor": null,
+          "contractSha256": "71a868692118b19b3adf9192b79a3638ebc4aa1291a67469527038210ad3854c"
+        },
+        {
+          "id": "webtty-resize.post",
+          "source": "cli/server/handlers/webtty.js:351",
+          "anchor": null,
+          "contractSha256": "8354ac5771b342a4603b78329a9c04e60edfe8f720c47a41c3655202d9e3cbf0"
+        },
+        {
+          "id": "webtty-delete.delete",
+          "source": "cli/server/handlers/webtty.js:375",
+          "anchor": null,
+          "contractSha256": "54625d114bd794c42ee87c134ca3f131abd68460dbe784a6832e3d670dc73e5b"
+        },
+        {
+          "id": "webchat-ui.get",
+          "source": "cli/server/handlers/webchat/index.js:182",
+          "anchor": "pathname === '/'",
+          "contractSha256": "b1636f3bfe3d3a03d92ed0d8535e8f8e815c6cf46142cb784c84e38bd2a8946a"
+        },
+        {
+          "id": "webchat-ui-no-slash.get",
+          "source": "cli/server/handlers/webchat/index.js:182",
+          "anchor": "pathname === '/'",
+          "contractSha256": "a2be03c6f9bcf62b0135cb50be84c37c87cbad066b579a8429f6451fa3ca81ef"
+        },
+        {
+          "id": "webchat-index.get",
+          "source": "cli/server/handlers/webchat/index.js:182",
+          "anchor": "pathname === '/'",
+          "contractSha256": "f5087207339d52efbf1ec80adb4261d25598e6b067c45013b1927e72553212cb"
+        },
+        {
+          "id": "webchat-assets.get",
+          "source": "cli/server/handlers/webchat/index.js:118",
+          "anchor": "pathname.startsWith('/assets/')",
+          "contractSha256": "2ae514d233e2d4568ae19a177e70108abbcc03510c469057fc1acfba1b1d26f0"
+        },
+        {
+          "id": "webchat-removed-token-auth.post",
+          "source": "cli/server/handlers/webchat/index.js:108",
+          "anchor": "pathname === '/auth'",
+          "contractSha256": "caab1ad11c0dae056c05a558773aeedb88d4f5bf53eb0268e8fc6c51d764a929"
+        },
+        {
+          "id": "webchat-logout.post",
+          "source": "cli/server/handlers/webchat/index.js:116",
+          "anchor": "pathname === '/logout'",
+          "contractSha256": "6d8a807d6c5cc7365869ba1a5375fdf615ff842e17c297e32ef04d6dc94dd638"
+        },
+        {
+          "id": "webchat-suggestions.get",
+          "source": "cli/server/handlers/webchat/index.js:149",
+          "anchor": "pathname === '/suggestions/files'",
+          "contractSha256": "6ba69d21e189c222baf0e546b8e7ddf198d9e63cc98f2d1fea731f14b68b9786"
+        },
+        {
+          "id": "webchat-suggestions.head",
+          "source": "cli/server/handlers/webchat/index.js:149",
+          "anchor": "pathname === '/suggestions/files'",
+          "contractSha256": "fcea16b585041766a5074a2c6287845b8ede3b13de414683030965182afa6d3c"
+        },
+        {
+          "id": "webchat-upload.post",
+          "source": "cli/server/handlers/webchat/index.js:153",
+          "anchor": "pathname === '/uploads'",
+          "contractSha256": "a92eb6f78b4b666faa080853e4e549c3b3d9d90910ed46dd5ad518f5fc4f7cef"
+        },
+        {
+          "id": "webchat-upload.put",
+          "source": "cli/server/handlers/webchat/index.js:153",
+          "anchor": "pathname === '/uploads'",
+          "contractSha256": "d2440103d46843f240c303bac8905e73666924fe1915b0600e4cb38d14a6c839"
+        },
+        {
+          "id": "webchat-directories-list.get",
+          "source": "cli/server/handlers/webchat/index.js:166",
+          "anchor": "pathname === '/directories'",
+          "contractSha256": "83fb5699afcbe7071b7444a90309129ff3b53fa39b6606eccbd1d76a5328877c"
+        },
+        {
+          "id": "webchat-directories-list.head",
+          "source": "cli/server/handlers/webchat/index.js:166",
+          "anchor": "pathname === '/directories'",
+          "contractSha256": "0ab1dcdf84c35a37e0fd1a984416b9c36dcdd414dc272eeb7b598794897468d3"
+        },
+        {
+          "id": "webchat-directories-create.post",
+          "source": "cli/server/handlers/webchat/index.js:172",
+          "anchor": "return handleWorkspaceDirectoriesPost(req, res, directoryContext)",
+          "contractSha256": "cdb191c8756976c703283d12e327ca94433ef48069b5ff5306e9fd274fb40e9d"
+        },
+        {
+          "id": "webchat-task-view.get",
+          "source": "cli/server/handlers/webchat/taskRoutes.js:12",
+          "anchor": "const viewMatch =",
+          "contractSha256": "b450d1a5a3679b0721d939893a9b055edcd738079867c9db1d3a6b770d55066c"
+        },
+        {
+          "id": "webchat-stream.get",
+          "source": "cli/server/handlers/webchat/runtimeRoutes.js:73",
+          "anchor": null,
+          "contractSha256": "3b9100fe9c64fdb06ab7645163eab57ffb837e0e5c8e000ce53593574622e0db"
+        },
+        {
+          "id": "webchat-input.post",
+          "source": "cli/server/handlers/webchat/runtimeRoutes.js:243",
+          "anchor": null,
+          "contractSha256": "290a838231b05478acf6e61089a30391f2be59dfbbfded786c12405c22221e70"
+        },
+        {
+          "id": "webchat-control.post",
+          "source": "cli/server/handlers/webchat/runtimeRoutes.js:319",
+          "anchor": null,
+          "contractSha256": "b5c7233a4db6b78ecf26428227fe2e8d6ae813fd63897099587854c88a1d86e8"
+        },
+        {
+          "id": "webchat-interaction.post",
+          "source": "cli/server/handlers/webchat/runtimeRoutes.js:348",
+          "anchor": null,
+          "contractSha256": "81da960eacf59bf6df0b6d1ad38fb8fa6fe58fbe215a4a7a00d64a3cde365a30"
+        },
+        {
+          "id": "workspace-upload.post",
+          "source": "cli/server/handlers/blobs.js:437",
+          "anchor": null,
+          "contractSha256": "a8f8f3f9736e8f2744d414bc398b71fe087bdcd61efb042948007b6449db9f7c"
+        },
+        {
+          "id": "workspace-upload.put",
+          "source": "cli/server/handlers/blobs.js:437",
+          "anchor": null,
+          "contractSha256": "dba01b3e5056f7fcd12717721a7936dd61612f0d04acfe618deacdd78b35b524"
+        },
+        {
+          "id": "blob-shared-create.post",
+          "source": "cli/server/handlers/blobs.js:498",
+          "anchor": null,
+          "contractSha256": "c2a7f61bde815a4214ba222f5acb79b525950e2948223c72bec35e1679a1d5fb"
+        },
+        {
+          "id": "blob-agent-create.post",
+          "source": "cli/server/handlers/blobs.js:507",
+          "anchor": null,
+          "contractSha256": "80d66006c8c937493235004afb88ee9a51206506a52cd71734e9bed0972f17aa"
+        },
+        {
+          "id": "blob-shared-read.get",
+          "source": "cli/server/handlers/blobs.js:522",
+          "anchor": null,
+          "contractSha256": "25ef8d8474825f7084cd2b8116a5b79aa8f87288a35d50c3468811a5b5a0cae7"
+        },
+        {
+          "id": "blob-shared-read.head",
+          "source": "cli/server/handlers/blobs.js:522",
+          "anchor": null,
+          "contractSha256": "bc4625868f1e487c2950d422815f71763901ff825bb42c9ee77e4de1fa190508"
+        },
+        {
+          "id": "blob-agent-read.get",
+          "source": "cli/server/handlers/blobs.js:532",
+          "anchor": null,
+          "contractSha256": "5e07cf66c6c756b0f4daac5f90c297a91a5aea134a5998d64fbe43e0f3a00baa"
+        },
+        {
+          "id": "blob-agent-read.head",
+          "source": "cli/server/handlers/blobs.js:532",
+          "anchor": null,
+          "contractSha256": "4edcd522b51d4864f83c751f2455bf35b2ac3032ebe5ee84fdffc252a5eaa0b9"
+        },
+        {
+          "id": "workspace-file-read.get",
+          "source": "cli/server/static/index.js:684",
+          "anchor": "async function serveWorkspaceFileRequest(req, res) {",
+          "contractSha256": "924b13629dfaa95dd8f9fd1778a8d912fbc49165d5186c8d54a525cc3d95ce4f"
+        },
+        {
+          "id": "workspace-file-read.head",
+          "source": "cli/server/static/index.js:684",
+          "anchor": "async function serveWorkspaceFileRequest(req, res) {",
+          "contractSha256": "c3f50954fb7b734848fd6e5abae4f8b7e0a445e7f619ea40c5fc94c0ddf1742d"
+        },
+        {
+          "id": "agent-root-proxy.*",
+          "source": "cli/server/RoutingServer.js:433",
+          "anchor": null,
+          "contractSha256": "e269075c170865004cff4bee3e76a305466d0b81cec00cd71c2e9d9f01c3e5a0"
+        },
+        {
+          "id": "agent-static.get",
+          "source": "cli/server/static/index.js:840",
+          "anchor": "async function serveAgentStaticRequest(req, res, {",
+          "contractSha256": "45fa59c0f9cb986f183c30852914261dcbf1bd8e21fb3fb41369247683d22922"
+        },
+        {
+          "id": "agent-static.head",
+          "source": "cli/server/static/index.js:840",
+          "anchor": "async function serveAgentStaticRequest(req, res, {",
+          "contractSha256": "d2f17bde405ce5e1e4d141d6972fd7ccb16c05f9b237f6dc70e8f3ec36a4bb0a"
+        },
+        {
+          "id": "agent-mcp.post",
+          "source": "cli/server/RoutingServer.js:742",
+          "anchor": null,
+          "contractSha256": "2e4abd686ec49b82b4e66dc6c92ea45f9efbae23ca4a0d850c6252a84c4618ed"
+        },
+        {
+          "id": "agent-mcp.delete",
+          "source": "cli/server/RoutingServer.js:742",
+          "anchor": null,
+          "contractSha256": "559a1569a3cf0b58585cd5b994e64ea9530da8d54a5c8d23d5a79457c63c6bb6"
+        },
+        {
+          "id": "agent-mcp.get",
+          "source": "cli/server/RoutingServer.js:742",
+          "anchor": null,
+          "contractSha256": "4e668bb9710fc9f983bc9a52230b4d1ea4fdcac43f723fd3c0dde3e2e91ba33d"
+        },
+        {
+          "id": "agent-task-status.get",
+          "source": "cli/server/RoutingServer.js:604",
+          "anchor": null,
+          "contractSha256": "f025e54a2f385f7fb87aa33950d1012a0702b70f111dcf3fbe36726d743ebfef"
+        },
+        {
+          "id": "agent-task-status-alias.get",
+          "source": "cli/server/RoutingServer.js:604",
+          "anchor": null,
+          "contractSha256": "dda2f0a713d3c1dda46c1e82924875e1968bc8c8328b8e4b04e3e0751f8c276a"
+        },
+        {
+          "id": "agent-task-cancel.post",
+          "source": "cli/server/RoutingServer.js:546",
+          "anchor": null,
+          "contractSha256": "c37bdee0939a02774efa6087788ec341d3db296592d3da400f760eee11d59d91"
+        },
+        {
+          "id": "agent-openai.post",
+          "source": "cli/server/RoutingServer.js:589",
+          "anchor": null,
+          "contractSha256": "a9e566b4e53119df31eefb510ac820116caa9bb9815207c5d65b2b93997285c2"
+        },
+        {
+          "id": "agent-additional-http.*",
+          "source": "cli/server/edgeRoutePlan.js:195",
+          "anchor": "function agentPortPlan({",
+          "contractSha256": "192ac0ea390a7d6a8d3e4251c43cd04c9f00efc5ebdb7f2620754b03a093e9b3"
+        },
+        {
+          "id": "agent-startup-probe.get",
+          "source": "cli/server/agentStartupPage.js:180",
+          "anchor": "headerEntry(req, AGENT_STARTUP_PROBE_HEADER)",
+          "contractSha256": "d54e6cc1e368d9d067974f87283dc0c9fae2c75d656ce2ca8799f480f0fda955"
+        },
+        {
+          "id": "agent-root-websocket.get",
+          "source": "cli/server/RoutingServer.js:955",
+          "anchor": null,
+          "contractSha256": "a449776a8a9bb18f7759541384dba07d5ce58198523c3f801e053c8198425e74"
+        },
+        {
+          "id": "agent-additional-websocket.get",
+          "source": "cli/server/RoutingServer.js:982",
+          "anchor": null,
+          "contractSha256": "ac7b78158e1c37907548e6e3c9f8de4f54e700ae67c40dd0c32496a648bde22f"
+        },
+        {
+          "id": "internal-agent-control.*",
+          "source": "cli/server/RoutingServer.js:481",
+          "anchor": null,
+          "contractSha256": "82757c796c4bed63e3014ee87ac27ce32b7e3cdbc226822a5a9780bbbb3f49ce"
+        },
+        {
+          "id": "private-workspace-logs.post",
+          "source": "cli/server/edgeRoutePlan.js:757",
+          "anchor": "pathname === '/api/edge/workspace-logs'",
+          "contractSha256": "9fd2d51917b996d7f6c12820b3cfcfc838011f863c491409078da6beab011e11"
+        },
+        {
+          "id": "private-workspace-metrics.get",
+          "source": "cli/server/edgeRoutePlan.js:775",
+          "anchor": "pathname === '/api/edge/workspace-metrics'",
+          "contractSha256": "55adae3e57592fff3b156d101d224018ae05accb9ff327d9d00d825c76d84df4"
+        },
+        {
+          "id": "private-runtime-origins.get",
+          "source": "cli/server/edgeRoutePlan.js:793",
+          "anchor": "pathname === '/api/edge/runtime-origins'",
+          "contractSha256": "5b00f710ef552fa3738975aec8a1c5170cf9017c9776cc003c36ec9c96e12280"
+        },
+        {
+          "id": "private-turn-credentials.post",
+          "source": "cli/server/edgeRoutePlan.js:814",
+          "anchor": "pathname === '/api/edge/turn-credentials'",
+          "contractSha256": "fe2af0f1777d6ecefcb1040ba1bb9946cfc0f9ea3cc0d6f2de7c3d572aed2998"
+        },
+        {
+          "id": "reserved--metrics.*",
+          "source": "cli/server/RoutingServer.js:251",
+          "anchor": null,
+          "contractSha256": "ba782da4ccd4f0ec444994ab6209b1da43a7cee5f26ea9069cf4f00fcc6aa989"
+        },
+        {
+          "id": "reserved--health-internal.*",
+          "source": "cli/server/RoutingServer.js:251",
+          "anchor": null,
+          "contractSha256": "bc3d628714675b124e94ef84a71ec0c53e9cf9a45b48ca3d06b5c13e7ab65287"
+        },
+        {
+          "id": "reserved--admin.*",
+          "source": "cli/server/RoutingServer.js:251",
+          "anchor": null,
+          "contractSha256": "a91ead652b809898b5b90da6fd5188168ae26aa592a6e4928a171f7c5f09ab5e"
+        },
+        {
+          "id": "reserved--admin-*.*",
+          "source": "cli/server/RoutingServer.js:251",
+          "anchor": null,
+          "contractSha256": "271355f5ff8716e29bc20a280bc3994807c323d805339086825b5737c43ca3bf"
+        },
+        {
+          "id": "unix-health.get",
+          "source": "cli/server/RoutingServer.js:926",
+          "anchor": null,
+          "contractSha256": "ea9f0e688585317a5b46fe688e50dc5e4ecf00803b9e224ae65f0cf27c11f457"
+        },
+        {
+          "id": "unix-authority-create.post",
+          "source": "cli/server/routerAuthorityAttestationRegistry.js:275",
+          "anchor": null,
+          "contractSha256": "a4a673ee8f302eb6d1a022d370dcd6290890c5902e9bd8b9841e9367b9fbea76"
+        },
+        {
+          "id": "unix-authority-read.get",
+          "source": "cli/server/routerAuthorityAttestationRegistry.js:317",
+          "anchor": null,
+          "contractSha256": "e739888f28173040f8244a4f8b9a64d5f78bd744e222befd84ad1865bc35c38b"
+        }
+      ]
+    }
+  },
+  "canonical": {
+    "root.get": {
+      "source": "cli/server/RoutingServer.js:771",
+      "anchor": null
+    },
+    "root-index.get": {
+      "source": "cli/server/RoutingServer.js:771",
+      "anchor": null
+    },
+    "auth-login.get": {
+      "source": "cli/server/authHandlers/authRoutes.js:172",
+      "anchor": null
+    },
+    "auth-callback.get": {
+      "source": "cli/server/authHandlers/authRoutes.js:223",
+      "anchor": null
+    },
+    "auth-logged-out.get": {
+      "source": "cli/server/authHandlers/authRoutes.js:160",
+      "anchor": null
+    },
+    "auth-logout-confirmation.get": {
+      "source": "cli/server/authHandlers/authRoutes.js:280",
+      "anchor": null
+    },
+    "auth-logout.post": {
+      "source": "cli/server/authHandlers/authRoutes.js:280",
+      "anchor": null
+    },
+    "auth-token.get": {
+      "source": "cli/server/authHandlers/authRoutes.js:383",
+      "anchor": null
+    },
+    "auth-token-refresh.post": {
+      "source": "cli/server/authHandlers/authRoutes.js:417",
+      "anchor": null
+    },
+    "removed-auth-account.*": {
+      "source": "cli/server/authHandlers/authRoutes.js:205",
+      "anchor": null
+    },
+    "removed-auth-local-users.*": {
+      "source": "cli/server/authHandlers/authRoutes.js:210",
+      "anchor": null
+    },
+    "removed-auth-github.*": {
+      "source": "cli/server/authHandlers/authRoutes.js:219",
+      "anchor": null
+    },
+    "removed-auth-agent-token.post": {
+      "source": "cli/server/authHandlers/authRoutes.js:501",
+      "anchor": null
+    },
+    "users-list.get": {
+      "source": "cli/server/authHandlers/userAdminRoutes.js:259",
+      "anchor": null
+    },
+    "users-create.post": {
+      "source": "cli/server/authHandlers/userAdminRoutes.js:304",
+      "anchor": null
+    },
+    "users-update.patch": {
+      "source": "cli/server/authHandlers/userAdminRoutes.js:327",
+      "anchor": null
+    },
+    "users-delete.delete": {
+      "source": "cli/server/authHandlers/userAdminRoutes.js:352",
+      "anchor": null
+    },
+    "removed-settings.*": {
+      "source": "cli/server/authHandlers/userAdminRoutes.js:173",
+      "anchor": null
+    },
+    "marketplace-repos-read.get": {
+      "source": "cli/server/authHandlers/marketplaceRoutes.js:625",
+      "anchor": "const marketplacePayload = () =>"
+    },
+    "marketplace-agents-read.get": {
+      "source": "cli/server/authHandlers/marketplaceRoutes.js:600",
+      "anchor": "...buildMarketplaceAgents(req.user, agentListOptions),"
+    },
+    "hardware-limits-read.get": {
+      "source": "cli/server/authHandlers/hardwareLimitsRoutes.mjs:270",
+      "anchor": "if (method === 'GET') {"
+    },
+    "hardware-limits-set_agent_limits.post": {
+      "source": "cli/server/authHandlers/hardwareLimitsRoutes.mjs:309",
+      "anchor": "const result = body.action === 'set_agent_limits'"
+    },
+    "hardware-limits-clear_agent_limits.post": {
+      "source": "cli/server/authHandlers/hardwareLimitsRoutes.mjs:309",
+      "anchor": "const result = body.action === 'set_agent_limits'"
+    },
+    "hardware-limits-apply.post": {
+      "source": "cli/server/authHandlers/hardwareLimitsRoutes.mjs:287",
+      "anchor": "if (body.action === 'apply') {"
+    },
+    "marketplace-install_repo.post": {
+      "source": "cli/server/authHandlers/marketplaceRoutes.js:694",
+      "anchor": "action === 'install_repo'"
+    },
+    "marketplace-uninstall_repo.post": {
+      "source": "cli/server/authHandlers/marketplaceRoutes.js:699",
+      "anchor": "action === 'uninstall_repo'"
+    },
+    "marketplace-enable_agent.post": {
+      "source": "cli/server/authHandlers/marketplaceRoutes.js:701",
+      "anchor": "action === 'enable_agent'"
+    },
+    "marketplace-disable_agent.post": {
+      "source": "cli/server/authHandlers/marketplaceRoutes.js:703",
+      "anchor": "action === 'disable_agent'"
+    },
+    "policy-http.route.list.post": {
+      "source": "cli/server/policy/PolicyCommandInvoker.js:39",
+      "anchor": null
+    },
+    "policy-http.route.check.post": {
+      "source": "cli/server/policy/PolicyCommandInvoker.js:39",
+      "anchor": null
+    },
+    "policy-http.route.set.post": {
+      "source": "cli/server/policy/PolicyCommandInvoker.js:39",
+      "anchor": null
+    },
+    "policy-http.route.remove.post": {
+      "source": "cli/server/policy/PolicyCommandInvoker.js:39",
+      "anchor": null
+    },
+    "policy-mcp.policy.list.post": {
+      "source": "cli/server/policy/PolicyCommandInvoker.js:39",
+      "anchor": null
+    },
+    "policy-mcp.policy.get.post": {
+      "source": "cli/server/policy/PolicyCommandInvoker.js:39",
+      "anchor": null
+    },
+    "policy-mcp.policy.set.post": {
+      "source": "cli/server/policy/PolicyCommandInvoker.js:39",
+      "anchor": null
+    },
+    "health.get": {
+      "source": "cli/server/RoutingServer.js:644",
+      "anchor": null
+    },
+    "status.*": {
+      "source": "cli/server/handlers/status.js:76",
+      "anchor": "pathname === '/data'"
+    },
+    "status-follow.get": {
+      "source": "cli/server/handlers/status.js:84",
+      "anchor": "streamWorkspaceMetrics(res, { decorate })"
+    },
+    "identity-user-key.post": {
+      "source": "cli/server/userIdentityKeyRoute.js:21",
+      "anchor": null
+    },
+    "openai-agent-discovery.get": {
+      "source": "cli/server/openAiAgentDiscovery.js:194",
+      "anchor": null
+    },
+    "agent-card.get": {
+      "source": "cli/server/RoutingServer.js:332",
+      "anchor": null
+    },
+    "agent-card-slash.get": {
+      "source": "cli/server/RoutingServer.js:332",
+      "anchor": null
+    },
+    "mcp-browser-client.get": {
+      "source": "cli/server/RoutingServer.js:471",
+      "anchor": "pathname === '/MCPBrowserClient.js'"
+    },
+    "mcp-browser-client.head": {
+      "source": "cli/server/RoutingServer.js:471",
+      "anchor": "pathname === '/MCPBrowserClient.js'"
+    },
+    "web-libs.get": {
+      "source": "cli/server/static/index.js:564",
+      "anchor": "function serveWebLibRequest(req, res) {"
+    },
+    "web-libs.head": {
+      "source": "cli/server/static/index.js:564",
+      "anchor": "function serveWebLibRequest(req, res) {"
+    },
+    "mcp-rpc-initialize.post": {
+      "source": "cli/server/routerHandlers.js:1037",
+      "anchor": null
+    },
+    "mcp-rpc-notifications/initialized.post": {
+      "source": "cli/server/routerHandlers.js:1037",
+      "anchor": null
+    },
+    "mcp-rpc-tools/list.post": {
+      "source": "cli/server/routerHandlers.js:1037",
+      "anchor": null
+    },
+    "mcp-rpc-tools/call.post": {
+      "source": "cli/server/routerHandlers.js:1037",
+      "anchor": null
+    },
+    "mcp-rpc-resources/list.post": {
+      "source": "cli/server/routerHandlers.js:1037",
+      "anchor": null
+    },
+    "mcp-rpc-resources/read.post": {
+      "source": "cli/server/routerHandlers.js:1037",
+      "anchor": null
+    },
+    "mcp-rpc-ping.post": {
+      "source": "cli/server/routerHandlers.js:1037",
+      "anchor": null
+    },
+    "mcp-legacy-methods.post": {
+      "source": "cli/server/routerHandlers.js:753",
+      "anchor": null
+    },
+    "mcp-legacy-list_tools.post": {
+      "source": "cli/server/routerHandlers.js:753",
+      "anchor": null
+    },
+    "mcp-legacy-tools.post": {
+      "source": "cli/server/routerHandlers.js:753",
+      "anchor": null
+    },
+    "mcp-legacy-list_resources.post": {
+      "source": "cli/server/routerHandlers.js:753",
+      "anchor": null
+    },
+    "mcp-legacy-resources.post": {
+      "source": "cli/server/routerHandlers.js:753",
+      "anchor": null
+    },
+    "mcp-legacy-tool.post": {
+      "source": "cli/server/routerHandlers.js:753",
+      "anchor": null
+    },
+    "mcp-legacy-resources/read.post": {
+      "source": "cli/server/routerHandlers.js:753",
+      "anchor": null
+    },
+    "mcp-legacy-status.post": {
+      "source": "cli/server/routerHandlers.js:753",
+      "anchor": null
+    },
+    "mcp-legacy-ping.post": {
+      "source": "cli/server/routerHandlers.js:753",
+      "anchor": null
+    },
+    "mcp-session-delete.delete": {
+      "source": "cli/server/routerHandlers.js:1210",
+      "anchor": null
+    },
+    "mcp-sse-unsupported.get": {
+      "source": "cli/server/routerHandlers.js:1204",
+      "anchor": null
+    },
+    "webtty-ui.get": {
+      "source": "cli/server/handlers/webtty.js:196",
+      "anchor": "pathname === '/webtty'"
+    },
+    "webtty-ui-slash.get": {
+      "source": "cli/server/handlers/webtty.js:196",
+      "anchor": "pathname === '/webtty'"
+    },
+    "webtty-assets.get": {
+      "source": "cli/server/handlers/webtty.js:207",
+      "anchor": "pathname.startsWith('/webtty/assets/')"
+    },
+    "webtty-discover.post": {
+      "source": "cli/server/handlers/webtty.js:225",
+      "anchor": null
+    },
+    "webtty-discovery-delete.delete": {
+      "source": "cli/server/handlers/webtty.js:250",
+      "anchor": null
+    },
+    "webtty-create.post": {
+      "source": "cli/server/handlers/webtty.js:268",
+      "anchor": null
+    },
+    "webtty-stream.get": {
+      "source": "cli/server/handlers/webtty.js:304",
+      "anchor": null
+    },
+    "webtty-input.post": {
+      "source": "cli/server/handlers/webtty.js:326",
+      "anchor": null
+    },
+    "webtty-resize.post": {
+      "source": "cli/server/handlers/webtty.js:351",
+      "anchor": null
+    },
+    "webtty-delete.delete": {
+      "source": "cli/server/handlers/webtty.js:375",
+      "anchor": null
+    },
+    "webchat-ui.get": {
+      "source": "cli/server/handlers/webchat/index.js:170",
+      "anchor": "pathname === '/'"
+    },
+    "webchat-ui-no-slash.get": {
+      "source": "cli/server/handlers/webchat/index.js:170",
+      "anchor": "pathname === '/'"
+    },
+    "webchat-index.get": {
+      "source": "cli/server/handlers/webchat/index.js:170",
+      "anchor": "pathname === '/'"
+    },
+    "webchat-assets.get": {
+      "source": "cli/server/handlers/webchat/index.js:109",
+      "anchor": "pathname.startsWith('/assets/')"
+    },
+    "webchat-removed-token-auth.post": {
+      "source": "cli/server/handlers/webchat/index.js:99",
+      "anchor": "pathname === '/auth'"
+    },
+    "webchat-logout.post": {
+      "source": "cli/server/handlers/webchat/index.js:107",
+      "anchor": "pathname === '/logout'"
+    },
+    "webchat-suggestions.get": {
+      "source": "cli/server/handlers/webchat/index.js:137",
+      "anchor": "pathname === '/suggestions/files'"
+    },
+    "webchat-suggestions.head": {
+      "source": "cli/server/handlers/webchat/index.js:137",
+      "anchor": "pathname === '/suggestions/files'"
+    },
+    "webchat-upload.post": {
+      "source": "cli/server/handlers/webchat/index.js:141",
+      "anchor": "pathname === '/uploads'"
+    },
+    "webchat-upload.put": {
+      "source": "cli/server/handlers/webchat/index.js:141",
+      "anchor": "pathname === '/uploads'"
+    },
+    "webchat-directories-list.get": {
+      "source": "cli/server/handlers/webchat/index.js:154",
+      "anchor": "pathname === '/directories'"
+    },
+    "webchat-directories-list.head": {
+      "source": "cli/server/handlers/webchat/index.js:154",
+      "anchor": "pathname === '/directories'"
+    },
+    "webchat-directories-create.post": {
+      "source": "cli/server/handlers/webchat/index.js:160",
+      "anchor": "return handleWorkspaceDirectoriesPost(req, res, directoryContext)"
+    },
+    "webchat-task-view.get": {
+      "source": "cli/server/handlers/webchat/taskRoutes.js:12",
+      "anchor": "const viewMatch ="
+    },
+    "webchat-stream.get": {
+      "source": "cli/server/handlers/webchat/runtimeRoutes.js:73",
+      "anchor": null
+    },
+    "webchat-input.post": {
+      "source": "cli/server/handlers/webchat/runtimeRoutes.js:243",
+      "anchor": null
+    },
+    "webchat-control.post": {
+      "source": "cli/server/handlers/webchat/runtimeRoutes.js:319",
+      "anchor": null
+    },
+    "webchat-interaction.post": {
+      "source": "cli/server/handlers/webchat/runtimeRoutes.js:348",
+      "anchor": null
+    },
+    "workspace-upload.post": {
+      "source": "cli/server/handlers/blobs.js:395",
+      "anchor": null
+    },
+    "workspace-upload.put": {
+      "source": "cli/server/handlers/blobs.js:395",
+      "anchor": null
+    },
+    "blob-shared-create.post": {
+      "source": "cli/server/handlers/blobs.js:450",
+      "anchor": null
+    },
+    "blob-agent-create.post": {
+      "source": "cli/server/handlers/blobs.js:459",
+      "anchor": null
+    },
+    "blob-shared-read.get": {
+      "source": "cli/server/handlers/blobs.js:474",
+      "anchor": null
+    },
+    "blob-shared-read.head": {
+      "source": "cli/server/handlers/blobs.js:474",
+      "anchor": null
+    },
+    "blob-agent-read.get": {
+      "source": "cli/server/handlers/blobs.js:484",
+      "anchor": null
+    },
+    "blob-agent-read.head": {
+      "source": "cli/server/handlers/blobs.js:484",
+      "anchor": null
+    },
+    "workspace-file-read.get": {
+      "source": "cli/server/static/index.js:527",
+      "anchor": "function serveWorkspaceFileRequest(req, res) {"
+    },
+    "workspace-file-read.head": {
+      "source": "cli/server/static/index.js:527",
+      "anchor": "function serveWorkspaceFileRequest(req, res) {"
+    },
+    "agent-root-proxy.*": {
+      "source": "cli/server/RoutingServer.js:433",
+      "anchor": null
+    },
+    "agent-static.get": {
+      "source": "cli/server/static/index.js:684",
+      "anchor": "async function serveAgentStaticRequest(req, res, {"
+    },
+    "agent-static.head": {
+      "source": "cli/server/static/index.js:684",
+      "anchor": "async function serveAgentStaticRequest(req, res, {"
+    },
+    "agent-mcp.post": {
+      "source": "cli/server/RoutingServer.js:742",
+      "anchor": null
+    },
+    "agent-mcp.delete": {
+      "source": "cli/server/RoutingServer.js:742",
+      "anchor": null
+    },
+    "agent-mcp.get": {
+      "source": "cli/server/RoutingServer.js:742",
+      "anchor": null
+    },
+    "agent-task-status.get": {
+      "source": "cli/server/RoutingServer.js:604",
+      "anchor": null
+    },
+    "agent-task-status-alias.get": {
+      "source": "cli/server/RoutingServer.js:604",
+      "anchor": null
+    },
+    "agent-task-cancel.post": {
+      "source": "cli/server/RoutingServer.js:546",
+      "anchor": null
+    },
+    "agent-openai.post": {
+      "source": "cli/server/RoutingServer.js:589",
+      "anchor": null
+    },
+    "agent-additional-http.*": {
+      "source": "cli/server/edgeRoutePlan.js:195",
+      "anchor": "function agentPortPlan({"
+    },
+    "agent-startup-probe.get": {
+      "source": "cli/server/agentStartupPage.js:180",
+      "anchor": "headerEntry(req, AGENT_STARTUP_PROBE_HEADER)"
+    },
+    "agent-root-websocket.get": {
+      "source": "cli/server/RoutingServer.js:955",
+      "anchor": null
+    },
+    "agent-additional-websocket.get": {
+      "source": "cli/server/RoutingServer.js:982",
+      "anchor": null
+    },
+    "internal-agent-control.*": {
+      "source": "cli/server/RoutingServer.js:481",
+      "anchor": null
+    },
+    "private-workspace-logs.post": {
+      "source": "cli/server/edgeRoutePlan.js:757",
+      "anchor": "pathname === '/api/edge/workspace-logs'"
+    },
+    "private-workspace-metrics.get": {
+      "source": "cli/server/edgeRoutePlan.js:775",
+      "anchor": "pathname === '/api/edge/workspace-metrics'"
+    },
+    "private-runtime-origins.get": {
+      "source": "cli/server/edgeRoutePlan.js:793",
+      "anchor": "pathname === '/api/edge/runtime-origins'"
+    },
+    "private-turn-credentials.post": {
+      "source": "cli/server/edgeRoutePlan.js:814",
+      "anchor": "pathname === '/api/edge/turn-credentials'"
+    },
+    "reserved--metrics.*": {
+      "source": "cli/server/RoutingServer.js:251",
+      "anchor": null
+    },
+    "reserved--health-internal.*": {
+      "source": "cli/server/RoutingServer.js:251",
+      "anchor": null
+    },
+    "reserved--admin.*": {
+      "source": "cli/server/RoutingServer.js:251",
+      "anchor": null
+    },
+    "reserved--admin-*.*": {
+      "source": "cli/server/RoutingServer.js:251",
+      "anchor": null
+    },
+    "unix-health.get": {
+      "source": "cli/server/RoutingServer.js:926",
+      "anchor": null
+    },
+    "unix-authority-create.post": {
+      "source": "cli/server/routerAuthorityAttestationRegistry.js:275",
+      "anchor": null
+    },
+    "unix-authority-read.get": {
+      "source": "cli/server/routerAuthorityAttestationRegistry.js:317",
+      "anchor": null
+    }
+  },
+  "files": {
+    "cli/server/RoutingServer.js": {
+      "baseline": "d79de70162e698f12723a2dacc2327f3a62b8a066a77de6c3d433356ef9da93c",
+      "blobs": {
+        "d79de70162e698f12723a2dacc2327f3a62b8a066a77de6c3d433356ef9da93c": {
+          "root.get": {
+            "line": 771,
+            "anchor": null,
+            "statement": "beforeDial: () => commitRoutePlan(routePlan),"
+          },
+          "root-index.get": {
+            "line": 771,
+            "anchor": null,
+            "statement": "beforeDial: () => commitRoutePlan(routePlan),"
+          },
+          "health.get": {
+            "line": 644,
+            "anchor": null,
+            "statement": "}"
+          },
+          "agent-card.get": {
+            "line": 332,
+            "anchor": null,
+            "statement": "if (routeRef === staticAgent) return routeName;"
+          },
+          "agent-card-slash.get": {
+            "line": 332,
+            "anchor": null,
+            "statement": "if (routeRef === staticAgent) return routeName;"
+          },
+          "mcp-browser-client.get": {
+            "line": 471,
+            "anchor": "pathname === '/MCPBrowserClient.js'",
+            "statement": "if (pathname === '/MCPBrowserClient.js') {"
+          },
+          "mcp-browser-client.head": {
+            "line": 471,
+            "anchor": "pathname === '/MCPBrowserClient.js'",
+            "statement": "if (pathname === '/MCPBrowserClient.js') {"
+          },
+          "agent-root-proxy.*": {
+            "line": 433,
+            "anchor": null,
+            "statement": "}"
+          },
+          "agent-mcp.post": {
+            "line": 742,
+            "anchor": null,
+            "statement": "if (!route.hostPort) {"
+          },
+          "agent-mcp.delete": {
+            "line": 742,
+            "anchor": null,
+            "statement": "if (!route.hostPort) {"
+          },
+          "agent-mcp.get": {
+            "line": 742,
+            "anchor": null,
+            "statement": "if (!route.hostPort) {"
+          },
+          "agent-task-status.get": {
+            "line": 604,
+            "anchor": null,
+            "statement": "}"
+          },
+          "agent-task-status-alias.get": {
+            "line": 604,
+            "anchor": null,
+            "statement": "}"
+          },
+          "agent-task-cancel.post": {
+            "line": 546,
+            "anchor": null,
+            "statement": "const authResult = await ensureAuthenticated(req, res, parsedUrl, { routePlan });"
+          },
+          "agent-openai.post": {
+            "line": 589,
+            "anchor": null,
+            "statement": "} else if (agentName && isAgentMcpRoute) {"
+          },
+          "agent-root-websocket.get": {
+            "line": 955,
+            "anchor": null,
+            "statement": "healthServer.requestTimeout = 3_000;"
+          },
+          "agent-additional-websocket.get": {
+            "line": 982,
+            "anchor": null,
+            "statement": "req.ploinkyListenerClass = listener;"
+          },
+          "internal-agent-control.*": {
+            "line": 481,
+            "anchor": null,
+            "statement": "// (e.g. the share authorizer). The router reaches those itself over a direct"
+          },
+          "reserved--metrics.*": {
+            "line": 251,
+            "anchor": null,
+            "statement": "const agentName = decodePathSegment(parts[0]).trim();"
+          },
+          "reserved--health-internal.*": {
+            "line": 251,
+            "anchor": null,
+            "statement": "const agentName = decodePathSegment(parts[0]).trim();"
+          },
+          "reserved--admin.*": {
+            "line": 251,
+            "anchor": null,
+            "statement": "const agentName = decodePathSegment(parts[0]).trim();"
+          },
+          "reserved--admin-*.*": {
+            "line": 251,
+            "anchor": null,
+            "statement": "const agentName = decodePathSegment(parts[0]).trim();"
+          },
+          "unix-health.get": {
+            "line": 926,
+            "anchor": null,
+            "statement": "memory: {"
+          }
+        },
+        "27fb848deaa7824177c9fb16cc265da2b9bb9cc919021fcaacb18580026596a9": {
+          "root.get": {
+            "line": 771,
+            "anchor": null,
+            "statement": "}"
+          },
+          "root-index.get": {
+            "line": 771,
+            "anchor": null,
+            "statement": "}"
+          },
+          "health.get": {
+            "line": 644,
+            "anchor": null,
+            "statement": "Number.isInteger(error?.status) ? error.status : 502,"
+          },
+          "agent-card.get": {
+            "line": 332,
+            "anchor": null,
+            "statement": "if (!staticAgent) return null;"
+          },
+          "agent-card-slash.get": {
+            "line": 332,
+            "anchor": null,
+            "statement": "if (!staticAgent) return null;"
+          },
+          "mcp-browser-client.get": {
+            "line": 477,
+            "anchor": "pathname === '/MCPBrowserClient.js'",
+            "statement": "if (pathname === '/MCPBrowserClient.js') {"
+          },
+          "mcp-browser-client.head": {
+            "line": 477,
+            "anchor": "pathname === '/MCPBrowserClient.js'",
+            "statement": "if (pathname === '/MCPBrowserClient.js') {"
+          },
+          "agent-root-proxy.*": {
+            "line": 433,
+            "anchor": null,
+            "statement": "res,"
+          },
+          "agent-mcp.post": {
+            "line": 742,
+            "anchor": null,
+            "statement": "return handleRoutedAggregateAgentCard(req, res, routePlan);"
+          },
+          "agent-mcp.delete": {
+            "line": 742,
+            "anchor": null,
+            "statement": "return handleRoutedAggregateAgentCard(req, res, routePlan);"
+          },
+          "agent-mcp.get": {
+            "line": 742,
+            "anchor": null,
+            "statement": "return handleRoutedAggregateAgentCard(req, res, routePlan);"
+          },
+          "agent-task-status.get": {
+            "line": 604,
+            "anchor": null,
+            "statement": "// One authorization path for transparent agent routes and agent-port relays."
+          },
+          "agent-task-status-alias.get": {
+            "line": 604,
+            "anchor": null,
+            "statement": "// One authorization path for transparent agent routes and agent-port relays."
+          },
+          "agent-task-cancel.post": {
+            "line": 546,
+            "anchor": null,
+            "statement": "});"
+          },
+          "agent-openai.post": {
+            "line": 589,
+            "anchor": null,
+            "statement": "sendJsonResponse(res, 401, {"
+          },
+          "agent-root-websocket.get": {
+            "line": 955,
+            "anchor": null,
+            "statement": "sendJsonResponse(res, 200, detailedHealthData(), { 'Cache-Control': 'no-store' });"
+          },
+          "agent-additional-websocket.get": {
+            "line": 982,
+            "anchor": null,
+            "statement": "return;"
+          },
+          "internal-agent-control.*": {
+            "line": 481,
+            "anchor": null,
+            "statement": ""
+          },
+          "reserved--metrics.*": {
+            "line": 251,
+            "anchor": null,
+            "statement": "}"
+          },
+          "reserved--health-internal.*": {
+            "line": 251,
+            "anchor": null,
+            "statement": "}"
+          },
+          "reserved--admin.*": {
+            "line": 251,
+            "anchor": null,
+            "statement": "}"
+          },
+          "reserved--admin-*.*": {
+            "line": 251,
+            "anchor": null,
+            "statement": "}"
+          },
+          "unix-health.get": {
+            "line": 926,
+            "anchor": null,
+            "statement": "return {"
+          }
+        }
+      },
+      "candidate": "27fb848deaa7824177c9fb16cc265da2b9bb9cc919021fcaacb18580026596a9"
+    },
+    "cli/server/authHandlers/marketplaceRoutes.js": {
+      "baseline": "b6a1ed207ecfdeef15b97994e9bf6fd3039c98f197f3126b5086a6282fa5d01d",
+      "blobs": {
+        "b6a1ed207ecfdeef15b97994e9bf6fd3039c98f197f3126b5086a6282fa5d01d": {
+          "marketplace-repos-read.get": {
+            "line": 625,
+            "anchor": "const marketplacePayload = () =>",
+            "statement": "const marketplacePayload = () => (isRepos ? buildMarketplaceRepositories() : agentsMarketplace());"
+          },
+          "marketplace-agents-read.get": {
+            "line": 600,
+            "anchor": "...buildMarketplaceAgents(req.user, agentListOptions),",
+            "statement": "...buildMarketplaceAgents(req.user, agentListOptions),"
+          },
+          "marketplace-install_repo.post": {
+            "line": 694,
+            "anchor": "action === 'install_repo'",
+            "statement": "} else if (action === 'install_repo') {"
+          },
+          "marketplace-uninstall_repo.post": {
+            "line": 699,
+            "anchor": "action === 'uninstall_repo'",
+            "statement": "} else if (action === 'uninstall_repo') {"
+          },
+          "marketplace-enable_agent.post": {
+            "line": 701,
+            "anchor": "action === 'enable_agent'",
+            "statement": "} else if (action === 'enable_agent') {"
+          },
+          "marketplace-disable_agent.post": {
+            "line": 703,
+            "anchor": "action === 'disable_agent'",
+            "statement": "} else if (action === 'disable_agent') {"
+          }
+        },
+        "8c99918602620aa560b8dc0cf08d99c1aa69902c6e2c8a5606dc13a9965480f1": {
+          "marketplace-repos-read.get": {
+            "line": 740,
+            "anchor": "const marketplacePayload = async () =>",
+            "statement": "const marketplacePayload = async () => runPreparedRepositoryRead(res, () => (isRepos ? buildMarketplaceRepositories() : agentsMarketplace()), { catalog: isRepos });"
+          },
+          "marketplace-agents-read.get": {
+            "line": 712,
+            "anchor": "...buildMarketplaceAgents(req.user, options),",
+            "statement": "...buildMarketplaceAgents(req.user, options),"
+          },
+          "marketplace-install_repo.post": {
+            "line": 812,
+            "anchor": "action === 'install_repo'",
+            "statement": "} else if (action === 'install_repo' || action === 'uninstall_repo') {"
+          },
+          "marketplace-uninstall_repo.post": {
+            "line": 812,
+            "anchor": "action === 'uninstall_repo'",
+            "statement": "} else if (action === 'install_repo' || action === 'uninstall_repo') {"
+          },
+          "marketplace-enable_agent.post": {
+            "line": 838,
+            "anchor": "action === 'enable_agent'",
+            "statement": "} else if (action === 'enable_agent') {"
+          },
+          "marketplace-disable_agent.post": {
+            "line": 840,
+            "anchor": "action === 'disable_agent'",
+            "statement": "} else if (action === 'disable_agent') {"
+          }
+        }
+      },
+      "candidate": "8c99918602620aa560b8dc0cf08d99c1aa69902c6e2c8a5606dc13a9965480f1"
+    },
+    "cli/server/authHandlers/hardwareLimitsRoutes.mjs": {
+      "baseline": "329186b30aa4e1bed8ed02eeeaead4f6bee29054e4585ae86f2f4a47f949e138",
+      "blobs": {
+        "329186b30aa4e1bed8ed02eeeaead4f6bee29054e4585ae86f2f4a47f949e138": {
+          "hardware-limits-read.get": {
+            "line": 270,
+            "anchor": "if (method === 'GET') {",
+            "statement": "if (method === 'GET') {"
+          },
+          "hardware-limits-set_agent_limits.post": {
+            "line": 309,
+            "anchor": "const result = body.action === 'set_agent_limits'",
+            "statement": "const result = body.action === 'set_agent_limits'"
+          },
+          "hardware-limits-clear_agent_limits.post": {
+            "line": 309,
+            "anchor": "const result = body.action === 'set_agent_limits'",
+            "statement": "const result = body.action === 'set_agent_limits'"
+          },
+          "hardware-limits-apply.post": {
+            "line": 287,
+            "anchor": "if (body.action === 'apply') {",
+            "statement": "if (body.action === 'apply') {"
+          }
+        },
+        "126e6e8e6fd81c82671eacc947ddd2a5842415abb440a43f7345ebdcfbb4f08d": {
+          "hardware-limits-read.get": {
+            "line": 273,
+            "anchor": "if (method === 'GET') {",
+            "statement": "if (method === 'GET') {"
+          },
+          "hardware-limits-set_agent_limits.post": {
+            "line": 316,
+            "anchor": "const result = body.action === 'set_agent_limits'",
+            "statement": "const result = body.action === 'set_agent_limits'"
+          },
+          "hardware-limits-clear_agent_limits.post": {
+            "line": 316,
+            "anchor": "const result = body.action === 'set_agent_limits'",
+            "statement": "const result = body.action === 'set_agent_limits'"
+          },
+          "hardware-limits-apply.post": {
+            "line": 294,
+            "anchor": "if (body.action === 'apply') {",
+            "statement": "if (body.action === 'apply') {"
+          }
+        }
+      },
+      "candidate": "126e6e8e6fd81c82671eacc947ddd2a5842415abb440a43f7345ebdcfbb4f08d"
+    },
+    "cli/server/handlers/status.js": {
+      "baseline": "3d1c315df7bb0f4c84d05961d27e4b41023b225e6397aa615d8281842c959118",
+      "blobs": {
+        "3d1c315df7bb0f4c84d05961d27e4b41023b225e6397aa615d8281842c959118": {
+          "status.*": {
+            "line": 76,
+            "anchor": "pathname === '/data'",
+            "statement": "if (pathname === '/data') {"
+          },
+          "status-follow.get": {
+            "line": 84,
+            "anchor": "streamWorkspaceMetrics(res, { decorate })",
+            "statement": "streamWorkspaceMetrics(res, { decorate });"
+          }
+        },
+        "4adf72b76d57456be94a6dff0581f228a0b35675306e11c4d627c11348f92747": {
+          "status.*": {
+            "line": 77,
+            "anchor": "pathname === '/data'",
+            "statement": "if (pathname === '/data') {"
+          },
+          "status-follow.get": {
+            "line": 89,
+            "anchor": "streamWorkspaceMetrics(res, { decorate })",
+            "statement": "streamWorkspaceMetrics(res, { decorate });"
+          }
+        }
+      },
+      "candidate": "4adf72b76d57456be94a6dff0581f228a0b35675306e11c4d627c11348f92747"
+    },
+    "cli/server/static/index.js": {
+      "baseline": "5e216d427980d32755489a26605d07ee4511be90379ce5d3551dfb92a33564b6",
+      "blobs": {
+        "5e216d427980d32755489a26605d07ee4511be90379ce5d3551dfb92a33564b6": {
+          "web-libs.get": {
+            "line": 564,
+            "anchor": "function serveWebLibRequest(req, res) {",
+            "statement": "function serveWebLibRequest(req, res) {"
+          },
+          "web-libs.head": {
+            "line": 564,
+            "anchor": "function serveWebLibRequest(req, res) {",
+            "statement": "function serveWebLibRequest(req, res) {"
+          },
+          "workspace-file-read.get": {
+            "line": 527,
+            "anchor": "function serveWorkspaceFileRequest(req, res) {",
+            "statement": "function serveWorkspaceFileRequest(req, res) {"
+          },
+          "workspace-file-read.head": {
+            "line": 527,
+            "anchor": "function serveWorkspaceFileRequest(req, res) {",
+            "statement": "function serveWorkspaceFileRequest(req, res) {"
+          },
+          "agent-static.get": {
+            "line": 684,
+            "anchor": "async function serveAgentStaticRequest(req, res, {",
+            "statement": "async function serveAgentStaticRequest(req, res, {"
+          },
+          "agent-static.head": {
+            "line": 684,
+            "anchor": "async function serveAgentStaticRequest(req, res, {",
+            "statement": "async function serveAgentStaticRequest(req, res, {"
+          }
+        },
+        "c347aa275550b2eeb89299fd187f4d739d0bfa6fddc32a4a9062f0cdd263479a": {
+          "web-libs.get": {
+            "line": 721,
+            "anchor": "async function serveWebLibRequest(req, res) {",
+            "statement": "async function serveWebLibRequest(req, res) {"
+          },
+          "web-libs.head": {
+            "line": 721,
+            "anchor": "async function serveWebLibRequest(req, res) {",
+            "statement": "async function serveWebLibRequest(req, res) {"
+          },
+          "workspace-file-read.get": {
+            "line": 684,
+            "anchor": "async function serveWorkspaceFileRequest(req, res) {",
+            "statement": "async function serveWorkspaceFileRequest(req, res) {"
+          },
+          "workspace-file-read.head": {
+            "line": 684,
+            "anchor": "async function serveWorkspaceFileRequest(req, res) {",
+            "statement": "async function serveWorkspaceFileRequest(req, res) {"
+          },
+          "agent-static.get": {
+            "line": 840,
+            "anchor": "async function serveAgentStaticRequest(req, res, {",
+            "statement": "async function serveAgentStaticRequest(req, res, {"
+          },
+          "agent-static.head": {
+            "line": 840,
+            "anchor": "async function serveAgentStaticRequest(req, res, {",
+            "statement": "async function serveAgentStaticRequest(req, res, {"
+          }
+        }
+      },
+      "candidate": "c347aa275550b2eeb89299fd187f4d739d0bfa6fddc32a4a9062f0cdd263479a"
+    },
+    "cli/server/handlers/webtty.js": {
+      "baseline": "3058bf7aefe36011af1f3909f8ca6dba6d914a1341854e2ee34b3dfa989d7bc8",
+      "blobs": {
+        "3058bf7aefe36011af1f3909f8ca6dba6d914a1341854e2ee34b3dfa989d7bc8": {
+          "webtty-ui.get": {
+            "line": 196,
+            "anchor": "pathname === '/webtty'",
+            "statement": "if ((pathname === '/webtty' || pathname === '/webtty/') && method === 'GET') {"
+          },
+          "webtty-ui-slash.get": {
+            "line": 196,
+            "anchor": "pathname === '/webtty'",
+            "statement": "if ((pathname === '/webtty' || pathname === '/webtty/') && method === 'GET') {"
+          },
+          "webtty-assets.get": {
+            "line": 207,
+            "anchor": "pathname.startsWith('/webtty/assets/')",
+            "statement": "if (pathname.startsWith('/webtty/assets/') && method === 'GET') {"
+          },
+          "webtty-discover.post": {
+            "line": 225,
+            "anchor": null,
+            "statement": "if (pathname === '/webtty/target-discoveries' && method === 'POST') {"
+          },
+          "webtty-discovery-delete.delete": {
+            "line": 250,
+            "anchor": null,
+            "statement": "const selectedDiscovery = discoveryPath(pathname);"
+          },
+          "webtty-create.post": {
+            "line": 268,
+            "anchor": null,
+            "statement": "if (pathname === '/webtty/sessions' && method === 'POST') {"
+          },
+          "webtty-stream.get": {
+            "line": 304,
+            "anchor": null,
+            "statement": "if (selected.operation === 'stream' && method === 'GET') {"
+          },
+          "webtty-input.post": {
+            "line": 326,
+            "anchor": null,
+            "statement": "if (!verifyMutationBeforeBody(req, res, routePlan)) return true;"
+          },
+          "webtty-resize.post": {
+            "line": 351,
+            "anchor": null,
+            "statement": "let body;"
+          },
+          "webtty-delete.delete": {
+            "line": 375,
+            "anchor": null,
+            "statement": "try { closed = await manager.closeOwned(req, routePlan, selected.id); }"
+          }
+        },
+        "0c0d70d80e8113db35b46432e17a50aaf6372fedeadcff9cd19c83ad4d5070f6": {
+          "webtty-ui.get": {
+            "line": 196,
+            "anchor": "pathname === '/webtty'",
+            "statement": "if ((pathname === '/webtty' || pathname === '/webtty/') && method === 'GET') {"
+          },
+          "webtty-ui-slash.get": {
+            "line": 196,
+            "anchor": "pathname === '/webtty'",
+            "statement": "if ((pathname === '/webtty' || pathname === '/webtty/') && method === 'GET') {"
+          },
+          "webtty-assets.get": {
+            "line": 208,
+            "anchor": "pathname.startsWith('/webtty/assets/')",
+            "statement": "if (pathname.startsWith('/webtty/assets/') && method === 'GET') {"
+          },
+          "webtty-discover.post": {
+            "line": 225,
+            "anchor": null,
+            "statement": "}"
+          },
+          "webtty-discovery-delete.delete": {
+            "line": 250,
+            "anchor": null,
+            "statement": "}"
+          },
+          "webtty-create.post": {
+            "line": 268,
+            "anchor": null,
+            "statement": "}"
+          },
+          "webtty-stream.get": {
+            "line": 304,
+            "anchor": null,
+            "statement": "}"
+          },
+          "webtty-input.post": {
+            "line": 326,
+            "anchor": null,
+            "statement": ""
+          },
+          "webtty-resize.post": {
+            "line": 351,
+            "anchor": null,
+            "statement": "if (selected.operation === 'resize' && method === 'POST') {"
+          },
+          "webtty-delete.delete": {
+            "line": 375,
+            "anchor": null,
+            "statement": "if (!commitMutation(routePlan, res)) return true;"
+          }
+        }
+      },
+      "candidate": "0c0d70d80e8113db35b46432e17a50aaf6372fedeadcff9cd19c83ad4d5070f6"
+    },
+    "cli/server/handlers/webchat/index.js": {
+      "baseline": "5ea7c55379c8299c129a2ce626391eb35214e36b15d3d6512dc0859424852532",
+      "blobs": {
+        "5ea7c55379c8299c129a2ce626391eb35214e36b15d3d6512dc0859424852532": {
+          "webchat-ui.get": {
+            "line": 170,
+            "anchor": "pathname === '/'",
+            "statement": "if (pathname === '/' || pathname === '/index.html') {"
+          },
+          "webchat-ui-no-slash.get": {
+            "line": 170,
+            "anchor": "pathname === '/'",
+            "statement": "if (pathname === '/' || pathname === '/index.html') {"
+          },
+          "webchat-index.get": {
+            "line": 170,
+            "anchor": "pathname === '/'",
+            "statement": "if (pathname === '/' || pathname === '/index.html') {"
+          },
+          "webchat-assets.get": {
+            "line": 109,
+            "anchor": "pathname.startsWith('/assets/')",
+            "statement": "if (pathname.startsWith('/assets/')) {"
+          },
+          "webchat-removed-token-auth.post": {
+            "line": 99,
+            "anchor": "pathname === '/auth'",
+            "statement": "if (pathname === '/auth' && req.method === 'POST') {"
+          },
+          "webchat-logout.post": {
+            "line": 107,
+            "anchor": "pathname === '/logout'",
+            "statement": "if (pathname === '/logout' && req.method === 'POST') return handleLogout(req, res, appState, agentQuery);"
+          },
+          "webchat-suggestions.get": {
+            "line": 137,
+            "anchor": "pathname === '/suggestions/files'",
+            "statement": "if (pathname === '/suggestions/files' && (req.method === 'GET' || req.method === 'HEAD')) {"
+          },
+          "webchat-suggestions.head": {
+            "line": 137,
+            "anchor": "pathname === '/suggestions/files'",
+            "statement": "if (pathname === '/suggestions/files' && (req.method === 'GET' || req.method === 'HEAD')) {"
+          },
+          "webchat-upload.post": {
+            "line": 141,
+            "anchor": "pathname === '/uploads'",
+            "statement": "if (pathname === '/uploads') {"
+          },
+          "webchat-upload.put": {
+            "line": 141,
+            "anchor": "pathname === '/uploads'",
+            "statement": "if (pathname === '/uploads') {"
+          },
+          "webchat-directories-list.get": {
+            "line": 154,
+            "anchor": "pathname === '/directories'",
+            "statement": "if (pathname === '/directories') {"
+          },
+          "webchat-directories-list.head": {
+            "line": 154,
+            "anchor": "pathname === '/directories'",
+            "statement": "if (pathname === '/directories') {"
+          },
+          "webchat-directories-create.post": {
+            "line": 160,
+            "anchor": "return handleWorkspaceDirectoriesPost(req, res, directoryContext)",
+            "statement": "return handleWorkspaceDirectoriesPost(req, res, directoryContext);"
+          }
+        },
+        "2874a4e81aec3efb6527338dec777dedd997ec7ec0c4980e6fc118161b6fd45d": {
+          "webchat-ui.get": {
+            "line": 182,
+            "anchor": "pathname === '/'",
+            "statement": "if (pathname === '/' || pathname === '/index.html') {"
+          },
+          "webchat-ui-no-slash.get": {
+            "line": 182,
+            "anchor": "pathname === '/'",
+            "statement": "if (pathname === '/' || pathname === '/index.html') {"
+          },
+          "webchat-index.get": {
+            "line": 182,
+            "anchor": "pathname === '/'",
+            "statement": "if (pathname === '/' || pathname === '/index.html') {"
+          },
+          "webchat-assets.get": {
+            "line": 118,
+            "anchor": "pathname.startsWith('/assets/')",
+            "statement": "if (pathname.startsWith('/assets/')) {"
+          },
+          "webchat-removed-token-auth.post": {
+            "line": 108,
+            "anchor": "pathname === '/auth'",
+            "statement": "if (pathname === '/auth' && req.method === 'POST') {"
+          },
+          "webchat-logout.post": {
+            "line": 116,
+            "anchor": "pathname === '/logout'",
+            "statement": "if (pathname === '/logout' && req.method === 'POST') return handleLogout(req, res, appState, agentQuery);"
+          },
+          "webchat-suggestions.get": {
+            "line": 149,
+            "anchor": "pathname === '/suggestions/files'",
+            "statement": "if (pathname === '/suggestions/files' && (req.method === 'GET' || req.method === 'HEAD')) {"
+          },
+          "webchat-suggestions.head": {
+            "line": 149,
+            "anchor": "pathname === '/suggestions/files'",
+            "statement": "if (pathname === '/suggestions/files' && (req.method === 'GET' || req.method === 'HEAD')) {"
+          },
+          "webchat-upload.post": {
+            "line": 153,
+            "anchor": "pathname === '/uploads'",
+            "statement": "if (pathname === '/uploads') {"
+          },
+          "webchat-upload.put": {
+            "line": 153,
+            "anchor": "pathname === '/uploads'",
+            "statement": "if (pathname === '/uploads') {"
+          },
+          "webchat-directories-list.get": {
+            "line": 166,
+            "anchor": "pathname === '/directories'",
+            "statement": "if (pathname === '/directories') {"
+          },
+          "webchat-directories-list.head": {
+            "line": 166,
+            "anchor": "pathname === '/directories'",
+            "statement": "if (pathname === '/directories') {"
+          },
+          "webchat-directories-create.post": {
+            "line": 172,
+            "anchor": "return handleWorkspaceDirectoriesPost(req, res, directoryContext)",
+            "statement": "return handleWorkspaceDirectoriesPost(req, res, directoryContext);"
+          }
+        }
+      },
+      "candidate": "2874a4e81aec3efb6527338dec777dedd997ec7ec0c4980e6fc118161b6fd45d"
+    },
+    "cli/server/handlers/webchat/taskRoutes.js": {
+      "baseline": "6bd8c52aa7f52344ade4b4feb3c40de82b9ffe0c60a6acaf9160c4c34aac6ed3",
+      "blobs": {
+        "6bd8c52aa7f52344ade4b4feb3c40de82b9ffe0c60a6acaf9160c4c34aac6ed3": {
+          "webchat-task-view.get": {
+            "line": 12,
+            "anchor": "const viewMatch =",
+            "statement": "const viewMatch = /^\\/tasks\\/(task_[0-9a-f]{24})\\/view$/.exec(pathname);"
+          }
+        },
+        "b3131356bcb528308756c714678094ef68a7b56270531c5143358ab175e3de30": {
+          "webchat-task-view.get": {
+            "line": 12,
+            "anchor": "const viewMatch =",
+            "statement": "const viewMatch = /^\\/tasks\\/(task_[0-9a-f]{24})\\/view$/.exec(pathname);"
+          }
+        }
+      },
+      "candidate": "b3131356bcb528308756c714678094ef68a7b56270531c5143358ab175e3de30"
+    },
+    "cli/server/handlers/blobs.js": {
+      "baseline": "0ffbfdeac49063e092a056b859d9a1cd699d5ee4fa827102303a08299d12fb12",
+      "blobs": {
+        "0ffbfdeac49063e092a056b859d9a1cd699d5ee4fa827102303a08299d12fb12": {
+          "workspace-upload.post": {
+            "line": 395,
+            "anchor": null,
+            "statement": "function handleWorkspaceUpload(req, res, { policy, timers, workspaceRoot } = {}) {"
+          },
+          "workspace-upload.put": {
+            "line": 395,
+            "anchor": null,
+            "statement": "function handleWorkspaceUpload(req, res, { policy, timers, workspaceRoot } = {}) {"
+          },
+          "blob-shared-create.post": {
+            "line": 450,
+            "anchor": null,
+            "statement": "if (req.method === 'POST' && segments.length === 1) {"
+          },
+          "blob-agent-create.post": {
+            "line": 459,
+            "anchor": null,
+            "statement": "if (req.method === 'POST' && segments.length === 2) {"
+          },
+          "blob-shared-read.get": {
+            "line": 474,
+            "anchor": null,
+            "statement": "if ((req.method === 'GET' || req.method === 'HEAD') && segments.length === 2) {"
+          },
+          "blob-shared-read.head": {
+            "line": 474,
+            "anchor": null,
+            "statement": "if ((req.method === 'GET' || req.method === 'HEAD') && segments.length === 2) {"
+          },
+          "blob-agent-read.get": {
+            "line": 484,
+            "anchor": null,
+            "statement": "if ((req.method === 'GET' || req.method === 'HEAD') && segments.length === 3) {"
+          },
+          "blob-agent-read.head": {
+            "line": 484,
+            "anchor": null,
+            "statement": "if ((req.method === 'GET' || req.method === 'HEAD') && segments.length === 3) {"
+          }
+        },
+        "4fdb5efcb5d77cffb8c28dc94b06bd243e84c58afe32f9ba79271109501d3f62": {
+          "workspace-upload.post": {
+            "line": 437,
+            "anchor": null,
+            "statement": "async function handleWorkspaceUpload(req, res, { policy, timers, workspaceRoot } = {}) {"
+          },
+          "workspace-upload.put": {
+            "line": 437,
+            "anchor": null,
+            "statement": "async function handleWorkspaceUpload(req, res, { policy, timers, workspaceRoot } = {}) {"
+          },
+          "blob-shared-create.post": {
+            "line": 498,
+            "anchor": null,
+            "statement": "if (req.method === 'POST' && segments.length === 1) {"
+          },
+          "blob-agent-create.post": {
+            "line": 507,
+            "anchor": null,
+            "statement": "if (req.method === 'POST' && segments.length === 2) {"
+          },
+          "blob-shared-read.get": {
+            "line": 522,
+            "anchor": null,
+            "statement": "if ((req.method === 'GET' || req.method === 'HEAD') && segments.length === 2) {"
+          },
+          "blob-shared-read.head": {
+            "line": 522,
+            "anchor": null,
+            "statement": "if ((req.method === 'GET' || req.method === 'HEAD') && segments.length === 2) {"
+          },
+          "blob-agent-read.get": {
+            "line": 532,
+            "anchor": null,
+            "statement": "if ((req.method === 'GET' || req.method === 'HEAD') && segments.length === 3) {"
+          },
+          "blob-agent-read.head": {
+            "line": 532,
+            "anchor": null,
+            "statement": "if ((req.method === 'GET' || req.method === 'HEAD') && segments.length === 3) {"
+          }
+        }
+      },
+      "candidate": "4fdb5efcb5d77cffb8c28dc94b06bd243e84c58afe32f9ba79271109501d3f62"
+    }
+  }
+}
