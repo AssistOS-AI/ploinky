@@ -22,6 +22,10 @@ export const ROUTER_AUTHORITY_HELPER_MAX_LIFETIME_MS = 60_000;
 const AUTHORITY_HELPER_STALE_GRACE_MS = 15_000;
 const AUTHORITY_HELPER_RECONCILE_ATTEMPTS = 5;
 const AUTHORITY_HELPER_RECONCILE_DELAY_MS = 250;
+// Bounds each cleanup command. `podman stop --time 2` alone can exceed 4 s while
+// a no-wait wave saturates a small host; four sequential steps stay well inside
+// the 60 s network lifecycle lock wait.
+const AUTHORITY_HELPER_CLEANUP_TIMEOUT_MS = 10_000;
 const AUTHORITY_HELPER_IDLE_SCRIPT = `setTimeout(() => process.exit(0), ${ROUTER_AUTHORITY_HELPER_MAX_LIFETIME_MS});`;
 export const ROUTER_AUTHORITY_HELPER_IMAGE = 'docker.io/library/node:24-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d';
 export const ROUTER_AUTHORITY_ATTESTATION_MAX_ATTEMPTS = 3;
@@ -613,7 +617,7 @@ function removeProvenAuthorityHelper(commandRunner, runtime, expected) {
     });
     if (inspected.running === true || inspected.status === 'running') {
         runBounded(commandRunner, runtime, ['stop', '--time', '2', identity.id], {
-            timeout: 4_000, operation: 'stop authority helper (podman stop)',
+            timeout: AUTHORITY_HELPER_CLEANUP_TIMEOUT_MS, operation: 'stop authority helper (podman stop)',
         });
         inspected = inspectAuthorityHelper(commandRunner, runtime, identity.id);
         proveAuthorityHelperIdentity(inspected, {
@@ -626,9 +630,9 @@ function removeProvenAuthorityHelper(commandRunner, runtime, expected) {
         }
     }
     runBounded(commandRunner, runtime, ['rm', identity.id], {
-        timeout: 4_000, operation: 'remove authority helper (podman rm)',
+        timeout: AUTHORITY_HELPER_CLEANUP_TIMEOUT_MS, operation: 'remove authority helper (podman rm)',
     });
-    const existenceOptions = { timeout: 4_000, operation: 'verify authority helper removal (podman container exists)' };
+    const existenceOptions = { timeout: AUTHORITY_HELPER_CLEANUP_TIMEOUT_MS, operation: 'verify authority helper removal (podman container exists)' };
     const exists = runStatusBounded(commandRunner, runtime, ['container', 'exists', identity.id], existenceOptions);
     const nameExists = runStatusBounded(commandRunner, runtime, ['container', 'exists', expected.expectedName], existenceOptions);
     if (exists.status !== 1 || nameExists.status !== 1) {
@@ -646,13 +650,13 @@ function reconcileAuthorityHelperByName(commandRunner, runtime, helperName) {
             commandRunner,
             runtime,
             ['container', 'exists', helperName],
-            { timeout: 4_000, operation: 'reconcile authority helper (podman container exists)' },
+            { timeout: AUTHORITY_HELPER_CLEANUP_TIMEOUT_MS, operation: 'reconcile authority helper (podman container exists)' },
         );
         if (named.status === 0) return inspectAuthorityHelper(commandRunner, runtime, helperName);
         if (named.status !== 1) {
             fail('PLOINKY_ROUTER_ATTESTATION_CLEANUP', authorityCommandFailure(
                 'reconcile authority helper (podman container exists)', named,
-                { timeout: 4_000, sensitiveValues: commandRunner.diagnosticSecrets },
+                { timeout: AUTHORITY_HELPER_CLEANUP_TIMEOUT_MS, sensitiveValues: commandRunner.diagnosticSecrets },
             ));
         }
         if (attempt + 1 < AUTHORITY_HELPER_RECONCILE_ATTEMPTS) {
@@ -683,7 +687,7 @@ function reapStaleAuthorityHelpers(commandRunner, runtime, helperImageId) {
         'ps', '-a', '--no-trunc',
         '--filter', `label=${AUTHORITY_HELPER_LABEL}`,
         '--format', '{{.ID}}',
-    ], { timeout: 4_000, operation: 'list stale authority helpers (podman ps)' });
+    ], { timeout: AUTHORITY_HELPER_CLEANUP_TIMEOUT_MS, operation: 'list stale authority helpers (podman ps)' });
     const ids = raw.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
     for (const id of ids) {
         if (!/^[a-f0-9]{64}$/.test(id)) {
