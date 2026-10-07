@@ -6,7 +6,10 @@ import { createMarketplaceRepositoryRunner, repositoryWorkerEligible, REPOSITORY
     runMarketplaceRepositoryWorker, shutdownMarketplaceRepositoryWorkers } from '../../cli/server/marketplaceRepositoryWorker.mjs';
 
 const flush = async () => { for (let i = 0; i < 40; i += 1) await Promise.resolve(); };
-const operation = { action: 'install_repo', url: '../source.git', name: 'fixture', branch: 'fixture-branch' };
+// The historical cohort contract remains the uninstall path. Contained install
+// sequencing is exercised separately below with independent namespace handles.
+const operation = { action: 'uninstall_repo', target: 'fixture' };
+const containedOperation = { action: 'install_repo', url: '../source.git', name: 'fixture', branch: 'fixture-branch' };
 const operationBytes = Buffer.byteLength(JSON.stringify(operation));
 async function expectSettledRejection(promise, code) {
     let rejected;
@@ -1019,4 +1022,115 @@ test('a cancellation census timeout identifies the flight limit without replacin
     await expectSettledRejection(pending, 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED');
     assert.equal((await shutdown).ok, false);
     assert.equal(h.runner.snapshot().recoveryDebt, true);
+});
+
+function containedHarness(t, { attest, barrier, terminated } = {}) {
+    const calls = [];
+    const handle = {
+        async proveBarrier() { calls.push('barrier'); await barrier?.(); },
+        async proveTerminated() { calls.push('terminated'); await terminated?.(); },
+        async signal(name) { calls.push(name); return true; },
+        async close() { calls.push('close'); },
+    };
+    const h = harness(t, { namespaceObserver: { async attest(options) {
+        calls.push('attest'); await attest?.(options); return handle;
+    } } });
+    return { ...h, calls,
+        runInstall: options => h.run({ ...options, operation: containedOperation }),
+        async prepare(child) { h.message(child, 'install-ready', { launcherPid: 40_100, initPid: 40_101 }); await flush(); },
+        async settle(child) {
+            h.message(child, 'install-barrier'); await flush();
+            h.message(child, 'install-ended'); await flush();
+            h.terminal(child); await flush();
+        } };
+}
+
+test('contained install attestation precedes authorization and private termination precedes queue advancement', async (t) => {
+    let grantTermination;
+    const termination = new Promise(resolve => { grantTermination = resolve; });
+    const h = containedHarness(t, { terminated: () => termination });
+    const pending = h.runInstall({ authorize: () => { h.calls.push('authorize'); return true; } });
+    await flush(); const child = h.children[0]; await h.hello(child);
+    assert.equal(child.messages.find(frame => frame.type === 'ownership').contained, true);
+    await h.prepare(child); await h.authorize(child);
+    assert.deepEqual(h.calls, ['attest', 'authorize']);
+    const queued = h.run();
+    h.message(child, 'install-barrier'); await flush();
+    assert.ok(child.messages.some(frame => frame.type === 'install-release'));
+    h.message(child, 'install-ended'); await flush();
+    assert.equal(child.messages.some(frame => frame.type === 'install-settled'), false);
+    assert.equal(h.children.length, 1);
+    assert.equal(h.runner.snapshot().pending, 1);
+    grantTermination(); await flush();
+    assert.ok(child.messages.some(frame => frame.type === 'install-settled'));
+    h.terminal(child); await flush();
+    assert.equal((await pending).status, 'cloned');
+    assert.equal(h.children.length, 2);
+    await h.hello(h.children[1]); await h.authorize(h.children[1]); h.terminal(h.children[1]); await queued;
+    assert.equal(h.runner.snapshot().recoveryDebt, false);
+});
+
+for (const phase of ['attest', 'barrier', 'terminated']) {
+    test(`contained ${phase} refusal holds recovery and prevents queued launch`, async (t) => {
+        const h = containedHarness(t, { [phase]: () => { throw Error('fixture refusal'); } });
+        const pending = h.runInstall(); await flush(); const child = h.children[0]; await h.hello(child);
+        const queued = h.run();
+        await h.prepare(child);
+        if (phase !== 'attest') {
+            await h.authorize(child); h.message(child, 'install-barrier'); await flush();
+            if (phase === 'terminated') { h.message(child, 'install-ended'); await flush(); }
+        }
+        await h.advance(8_000);
+        await expectSettledRejection(pending, 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED');
+        await expectSettledRejection(queued, 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED');
+        assert.equal(h.children.length, 1);
+        assert.equal(h.runner.snapshot().recoveryDebt, true);
+        if (phase === 'attest') assert.equal(h.calls.includes('SIGKILL'), false, 'no namespace handle grants authority on failed attestation');
+    });
+}
+
+for (const frame of ['cohort', 'authorize', 'install-ended', 'release-granted']) {
+    test(`contained mode rejects premature ${frame} rather than accepting peer-selected authority`, async (t) => {
+        const h = containedHarness(t);
+        const pending = h.runInstall(); await flush(); await h.hello(h.children[0]);
+        h.message(h.children[0], frame, { members: [], contained: false });
+        await h.advance(8_000);
+        await expectSettledRejection(pending, 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED');
+        assert.equal(h.runner.snapshot().recoveryDebt, true);
+        assert.equal(h.calls.includes('attest'), false);
+    });
+}
+
+test('closed contained admission waits for unused private unit termination without authorizing a mutation', async (t) => {
+    const h = containedHarness(t);
+    const response = new EventEmitter();
+    let authorizationCalls = 0;
+    const pending = h.runInstall({ response, authorize: () => { authorizationCalls += 1; return true; } });
+    await flush(); const child = h.children[0]; await h.hello(child); await h.prepare(child);
+    response.emit('close');
+    await h.authorize(child);
+    const authorization = child.messages.find(frame => frame.type === 'authorization');
+    assert.equal(authorization.ok, false);
+    assert.equal(authorizationCalls, 0);
+    h.message(child, 'install-barrier'); await flush();
+    h.message(child, 'install-ended'); await flush();
+    h.terminal(child, { ok: false, error: authorization.error });
+    await expectSettledRejection(pending, 'PLOINKY_MARKETPLACE_REPOSITORY_REQUEST_CLOSED');
+    assert.deepEqual(h.calls.slice(0, 3), ['attest', 'barrier', 'terminated']);
+    assert.equal(h.runner.snapshot().recoveryDebt, false);
+});
+
+test('cancellation during namespace attestation cannot adopt or signal a late handle', async (t) => {
+    let resolve;
+    const wait = new Promise(yes => { resolve = yes; });
+    const h = containedHarness(t, { attest: () => wait });
+    const pending = h.runInstall(); await flush(); const child = h.children[0]; await h.hello(child);
+    await h.prepare(child);
+    const shutdown = h.runner.shutdown(); await h.advance(8_000);
+    await expectSettledRejection(pending, 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED');
+    resolve(); await flush();
+    assert.equal(h.calls.includes('SIGKILL'), false);
+    assert.equal(h.calls.includes('close'), true);
+    assert.equal(child.messages.some(frame => frame.type === 'install-attested'), false);
+    assert.equal((await shutdown).ok, false);
 });

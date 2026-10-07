@@ -4,12 +4,16 @@ import { performance } from 'node:perf_hooks';
 import { retainWorkspaceMutationLeaseForRecovery } from '../utils/runtime/maintenanceLocks.js';
 import { createRepositoryProcessObserver, proveRepositoryQuiescence, REPOSITORY_OPERATION_MARKER, sameProcess } from './marketplaceRepositoryProcessGroup.mjs';
 import { diagnosticPayload, processDiagnostic } from './marketplaceRepositoryDiagnostics.mjs';
+import { createRepositoryInstallUnit, installUnitError } from './marketplaceRepositoryInstallUnit.mjs';
+import { createRepositoryNamespaceObserver } from './marketplaceRepositoryNamespace.mjs';
 
 const THREAD_URL = new URL('./marketplaceRepositoryWorkerThread.mjs', import.meta.url);
 
 export function startRepositorySupervisor({
     channel = process, observer = createRepositoryProcessObserver(), WorkerClass = Worker,
     retain = retainWorkspaceMutationLeaseForRecovery,
+    createInstallUnit = createRepositoryInstallUnit,
+    namespaceObserver = createRepositoryNamespaceObserver({ outer: observer }),
 } = {}) {
     const operationId = process.env[REPOSITORY_OPERATION_MARKER];
     const operation = `marketplace-repository:${operationId}`;
@@ -27,6 +31,14 @@ export function startRepositorySupervisor({
     let remembered = [];
     let lastObservation;
     let firstCause;
+    let contained = false;
+    let unit;
+    let unitNamespace;
+    let unitStage;
+    let unitOutcome;
+    let unitUnused = false;
+    let installOperation;
+    let installAuthorized = false;
     const cause = (phase, reason, details = {}) => { firstCause ||= { phase, reason, ...details }; };
     const diagnostic = (payload) => {
         const safe = diagnosticPayload(payload);
@@ -87,6 +99,22 @@ export function startRepositorySupervisor({
             ...(firstCause || { phase: 'cancellation', reason: 'recovery' }) });
         send({ type: 'recovery', code: 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED' });
         const started = performance.now();
+        if (contained) {
+            if (worker) void worker.terminate().then(() => retainExact(), () => retainExact());
+            try {
+                await unitNamespace?.signal('SIGKILL', () => performance.now() < started + 8_000);
+            } finally {
+                unit?.close();
+                await unitNamespace?.close();
+                retainExact();
+            }
+            // The Router still owns outer supervisor termination. If its
+            // channel is lost, retain the fence and terminate only this group.
+            if (!channel.connected && options?.coordinator) await observer.signal(options.coordinator, 'SIGKILL', {
+                coordinator: options.coordinator, group: true, isAllowed: () => performance.now() < started + 8_000,
+            });
+            return;
+        }
         const signalDescendants = async (signal, deadline, members = remembered) => {
             const targets = members.filter((entry) => !sameProcess(entry, options?.router)
                 && !sameProcess(entry, options?.coordinator));
@@ -122,6 +150,13 @@ export function startRepositorySupervisor({
         state = 'settlement-barrier';
         send({ type: 'barrier' });
         clearInterval(poll);
+        if (contained) {
+            if (unit && unitStage !== 'settled') { await cancel(); return; }
+            state = 'release-granted';
+            send({ type: 'release-granted' });
+            worker.postMessage({ type: 'release', operationId });
+            return;
+        }
         // Wait for the bounded current pass before taking the two independent
         // barrier observations; overlap would make both observations unknown.
         while (observing && state === 'settlement-barrier') await new Promise((resolve) => setTimeout(resolve, 5));
@@ -146,6 +181,8 @@ export function startRepositorySupervisor({
         state = 'closed';
         clearInterval(poll);
         clearTimeout(cancelTimer);
+        unit?.close();
+        void unitNamespace?.close();
         send({ type: 'terminal', ...terminal });
         channel.disconnect();
     }
@@ -157,9 +194,30 @@ export function startRepositorySupervisor({
         if (message.type === 'cancel') { await cancel(); return; }
         if (message.type === 'expire') return; // worker and ownership use the one original deadline
         if (state === 'cancelling') return;
+        if (contained && message.type === 'install-attested' && state === 'acquiring' && unitStage === 'attesting') {
+            unitStage = 'ready';
+            worker.postMessage({ type: 'install-prepared', operationId });
+            return;
+        }
+        if (contained && message.type === 'install-release' && unitStage === 'barrier') {
+            unitStage = 'releasing';
+            await boundedUnit(() => unit.release());
+            if (state === 'cancelling') return;
+            unitStage = 'ended'; send({ type: 'install-ended' }); return;
+        }
+        if (contained && message.type === 'install-settled' && unitStage === 'ended') {
+            unitStage = 'settled';
+            await unitNamespace.close(); unit.close();
+            worker.postMessage(unitUnused ? { type: 'install-disposed', operationId }
+                : { type: 'install-result', operationId, outcome: unitOutcome });
+            return;
+        }
         if (message.type === 'ownership' && state === 'inert') {
             state = 'ownership';
             data = message;
+            contained = data.contained === true;
+            if (contained && data.operation && data.operation.action !== 'install_repo') { await cancel(); return; }
+            installOperation = contained ? data.operation : null;
             if (!Number.isSafeInteger(data.deadline)) { await cancel(); return; }
             const own = await observer.read(process.pid, { executable: true });
             if (!sameProcess(own, data.coordinator) || own.group !== process.pid || own.session !== process.pid
@@ -186,7 +244,8 @@ export function startRepositorySupervisor({
             }
             state = 'acquiring';
             worker = new WorkerClass(THREAD_URL, {
-                workerData: { operationId, operation: data.operation, deadline: data.deadline }, stdout: true, stderr: true,
+                workerData: { operationId, operation: data.operation, deadline: data.deadline, contained },
+                stdout: true, stderr: true, execArgv: [],
             });
             data.operation = null;
             worker.stdout?.resume();
@@ -199,16 +258,23 @@ export function startRepositorySupervisor({
                 else if (code !== 0 || !terminal) { cause('exit', 'worker-failed', Number.isSafeInteger(code) && code >= 0 ? { exitCode: code } : {}); void cancel(); }
                 else finish();
             });
-            poll = setInterval(() => { void observe().catch(error => { cause('observation', 'unknown', processDiagnostic(error)); return cancel(); }); }, 100);
+            if (!contained) poll = setInterval(() => { void observe().catch(error => { cause('observation', 'unknown', processDiagnostic(error)); return cancel(); }); }, 100);
         } else if (message.type === 'authorization' && state === 'awaiting-admission') {
             // Expiry is still checked again in the worker immediately before
             // service entry. An admitted Git call has no normal time limit.
             state = 'running';
+            installAuthorized = message.ok === true && Date.now() < data.deadline;
             worker.postMessage(Date.now() >= data.deadline
                 ? { type: 'authorization', operationId, ok: false, error: { code: 'workspace_mutation_lock_timeout',
                     message: 'Timed out waiting for repository operation admission.' } }
                 : message);
         } else { cause('ipc', 'protocol'); await cancel(); }
+    }
+    async function boundedUnit(job) {
+        let timer;
+        try {
+            return await Promise.race([job(), new Promise((_, reject) => { timer = setTimeout(() => reject(installUnitError()), 1_000); })]);
+        } finally { clearTimeout(timer); }
     }
     async function workerMessage(message) {
         if (message?.operationId !== operationId) { cause('ipc', 'protocol'); await cancel(); return; }
@@ -220,7 +286,30 @@ export function startRepositorySupervisor({
             return;
         }
         if (state === 'cancelling') return;
-        if (message.type === 'authorize' && state === 'acquiring' && token) {
+        if (contained && message.type === 'prepare-install' && state === 'acquiring' && token && !unitStage) {
+            unitStage = 'preparing';
+            unit = createInstallUnit({ operationId, workspaceRoot: data.workspaceRoot, cwd: data.cwd,
+                onFailure: () => { cause('observation', 'unknown'); void cancel(); } });
+            const hint = await boundedUnit(() => unit.ready);
+            const handle = await namespaceObserver.attest({ ...hint, coordinator: options.coordinator, operationId,
+                workspaceRoot: data.workspaceRoot, cwd: data.cwd });
+            if (state === 'cancelling') { await handle.close(); return; }
+            unitNamespace = handle; unitStage = 'attesting';
+            send({ type: 'install-ready', ...hint }); return;
+        }
+        if (contained && message.type === 'run-install' && state === 'running' && unitStage === 'ready' && installAuthorized) {
+            unitStage = 'running';
+            unitOutcome = await unit.run(installOperation, process.env);
+            installOperation = null;
+            if (state === 'cancelling') return;
+            unitStage = 'barrier'; send({ type: 'install-barrier' }); return;
+        }
+        if (contained && message.type === 'dispose-install' && ['acquiring', 'running'].includes(state)) {
+            if (unitStage === 'settled') { worker.postMessage({ type: 'install-disposed', operationId }); return; }
+            if (unitStage !== 'ready') throw installUnitError();
+            unitUnused = true; unitStage = 'barrier'; send({ type: 'install-barrier' }); return;
+        }
+        if (message.type === 'authorize' && state === 'acquiring' && token && (!contained || unitStage === 'ready')) {
             state = 'awaiting-admission';
             send({ type: 'authorize' });
         } else if (message.type === 'barrier' && ['acquiring', 'running'].includes(state)) {

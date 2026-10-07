@@ -8,6 +8,7 @@ import { sanitizeGitDiagnostic } from '../utils/gitCommand.js';
 import { createRepositoryProcessObserver, proveRepositoryQuiescence, REPOSITORY_OPERATION_MARKER, PROC_LIMITS, sameProcess } from './marketplaceRepositoryProcessGroup.mjs';
 import { appendLog } from './utils/logger.js';
 import { createRepositoryDiagnostics, diagnosticIdentity, diagnosticPayload, processDiagnostic } from './marketplaceRepositoryDiagnostics.mjs';
+import { createRepositoryNamespaceObserver } from './marketplaceRepositoryNamespace.mjs';
 
 const SUPERVISOR_PATH = fileURLToPath(new URL('./marketplaceRepositorySupervisor.mjs', import.meta.url));
 export const REPOSITORY_QUEUE_LIMITS = Object.freeze({ pending: 16, bytes: 8 * 1024 * 1024, admissionMs: 600_000 });
@@ -46,6 +47,7 @@ export function createMarketplaceRepositoryRunner({
     executablePath = process.execPath, resolveExecutable = realpath,
     proveQuiescence = proveRepositoryQuiescence,
     diagnosticSink = appendLog,
+    namespaceObserver = createRepositoryNamespaceObserver({ outer: observer }),
 } = {}) {
     const diagnostics = createRepositoryDiagnostics({ now: time.monotonic, sink: diagnosticSink });
     const pending = [];
@@ -103,6 +105,7 @@ export function createMarketplaceRepositoryRunner({
         time.clearTimeout(ticket.expiryGrace);
         time.clearTimeout(ticket.cohortTimer);
         ticket.cohortClaims.clear();
+        void ticket.installNamespace?.close();
         ticket.response?.removeListener?.('close', ticket.onClose);
         if (ticket.response && !ticket.response.closed && !ticket.response.destroyed) {
             // The HTTP response can close after worker settlement. Keep only
@@ -333,6 +336,18 @@ export function createMarketplaceRepositoryRunner({
         send(ticket, { type: 'cancel' }); // same-PID retention precedes supervisor signals
         void (async () => {
             try {
+                if (ticket.contained) {
+                    await ticket.installNamespace?.signal('SIGKILL', () => !ticket.finished && time.monotonic() < deadline);
+                    if (!ticket.coordinator) {
+                        try { await captureCoordinator(ticket); } catch (_) { /* No signal without independent identity. */ }
+                    }
+                    if (!ticket.finished) await signalMembers(ticket, 'SIGKILL', deadline);
+                    while (ticket.installNamespace && !ticket.finished && time.monotonic() < started + 6_000) {
+                        try { await ticket.installNamespace.proveTerminated(); break; }
+                        catch (_) { await delay(25); }
+                    }
+                    return;
+                }
                 // Cancellation is the sole observer scheduler from here. Join
                 // the existing bounded flight instead of causing a busy scan.
                 let preKillCensusDone = Boolean(ticket.cohortFlight);
@@ -401,6 +416,7 @@ export function createMarketplaceRepositoryRunner({
             return;
         }
         if (message.type === 'cohort') {
+            if (ticket.contained) { cause(ticket, 'ipc', 'protocol'); void cancel(ticket); return; }
             ticket.processingCohortFrames += 1;
             try { registerCohort(ticket, message.members); }
             catch (_) { failCohort(ticket); }
@@ -416,6 +432,33 @@ export function createMarketplaceRepositoryRunner({
             void cancel(ticket); return;
         }
         if (ticket.cancelling) return;
+        if (ticket.contained && message.type === 'install-ready' && ticket.state === 'acquiring' && !ticket.installStage) {
+            ticket.installStage = 'attesting';
+            const handle = await namespaceObserver.attest({ launcherPid: message.launcherPid, initPid: message.initPid,
+                coordinator: ticket.coordinator, operationId: ticket.operationId,
+                workspaceRoot: ticket.workspaceRoot, cwd: ticket.cwd, executable: executablePath });
+            if (ticket.finished || ticket.cancelling) { await handle.close(); return; }
+            ticket.installNamespace = handle; ticket.installStage = 'ready';
+            if (!send(ticket, { type: 'install-attested' })) void cancel(ticket);
+            return;
+        }
+        if (ticket.contained && message.type === 'install-barrier'
+            && ['acquiring', 'running'].includes(ticket.state) && ticket.installStage === 'ready') {
+            ticket.installStage = 'barrier';
+            await ticket.installNamespace.proveBarrier();
+            if (ticket.finished || ticket.cancelling) return;
+            ticket.installStage = 'releasing';
+            if (!send(ticket, { type: 'install-release' })) void cancel(ticket);
+            return;
+        }
+        if (ticket.contained && message.type === 'install-ended' && ticket.installStage === 'releasing') {
+            ticket.installStage = 'proving';
+            await ticket.installNamespace.proveTerminated();
+            if (ticket.finished || ticket.cancelling) return;
+            ticket.installStage = 'settled';
+            if (!send(ticket, { type: 'install-settled' })) void cancel(ticket);
+            return;
+        }
         if (message.type === 'hello' && ticket.state === 'launched' && message.pid === ticket.child.pid) {
             ticket.state = 'ownership';
             ticket.helloReceived = true;
@@ -426,11 +469,13 @@ export function createMarketplaceRepositoryRunner({
             // and starts no worker. It still closes through its protocol.
             const unusedError = expired(ticket) ? timeout() : ticket.isClosed() ? closed() : null;
             ticket.ownershipAcknowledged = send(ticket, { type: 'ownership', ...options(ticket), deadline: ticket.deadline,
+                contained: ticket.contained, workspaceRoot: ticket.workspaceRoot, cwd: ticket.cwd,
                 operation: unusedError ? null : ticket.operation,
                 unusedError: unusedError && { code: unusedError.code, message: unusedError.message } });
             if (!ticket.ownershipAcknowledged) void cancel(ticket);
             ticket.operation = null;
-        } else if (message.type === 'authorize' && ticket.state === 'acquiring') {
+        } else if (message.type === 'authorize' && ticket.state === 'acquiring'
+            && (!ticket.contained || ticket.installStage === 'ready')) {
             ticket.state = 'awaiting-admission';
             let error;
             try {
@@ -447,6 +492,9 @@ export function createMarketplaceRepositoryRunner({
             if (!send(ticket, { type: 'authorization', ok: !error,
                 error: error && { code: error.code, message: sanitizeGitDiagnostic(error.message).slice(0, 8_192) } })) void cancel(ticket);
         } else if (message.type === 'barrier' && ['acquiring', 'running'].includes(ticket.state)) {
+            if (ticket.contained && (ticket.installStage ? ticket.installStage !== 'settled' : ticket.admitted)) {
+                cause(ticket, 'ipc', 'protocol'); void cancel(ticket); return;
+            }
             ticket.state = 'settlement-barrier';
         } else if (message.type === 'release-granted' && ticket.state === 'settlement-barrier') {
             ticket.state = 'release-granted';
@@ -525,6 +573,7 @@ export function createMarketplaceRepositoryRunner({
             }
             let done;
             const ticket = { operation, bytes, cwd, workspaceRoot, authorize, response, resolve, reject,
+                contained: operation?.action === 'install_repo',
                 started: time.monotonic(),
                 diagnosticContext: { ...(diagnosticPayload(diagnosticContext) || {}),
                     ...(diagnosticIdentity(workspaceRoot) ? { workspace: diagnosticIdentity(workspaceRoot) } : {}),

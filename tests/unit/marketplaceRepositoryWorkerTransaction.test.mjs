@@ -100,3 +100,27 @@ test('errors preserve short typed fields and redact credentials without transpor
     assert.doesNotMatch(result.message, /user:secret|private|hidden/);
     assert.deepEqual(Object.keys(result).sort(), ['code', 'message', 'status']);
 });
+
+test('contained preparation is inside the outer lease and before authorization, with expired units disposed before release', async () => {
+    for (const refusal of ['none', 'expiry', 'authorization']) {
+        const fixture = transactionFixture();
+        fixture.dependencies.prepareInstall = async () => {
+            fixture.calls.push('prepared');
+            if (refusal === 'expiry') fixture.data.deadline = Date.now();
+        };
+        fixture.dependencies.disposeInstall = async () => { fixture.calls.push('disposed'); };
+        if (refusal === 'authorization') fixture.dependencies.authorize = async () => {
+            fixture.calls.push('authorized'); throw Error('generation changed');
+        };
+        const pending = executeRepositoryTransaction(fixture.data, fixture.dependencies);
+        await fixture.barrier;
+        assert.deepEqual(fixture.calls.slice(0, 3), ['acquired', 'lease', 'prepared']);
+        if (refusal !== 'none') {
+            assert.equal(fixture.calls.includes('install'), false);
+            assert.equal(fixture.calls.at(-2), 'disposed');
+        } else assert.ok(fixture.calls.indexOf('prepared') < fixture.calls.indexOf('authorized'));
+        assert.equal(fixture.calls.includes('released'), false);
+        fixture.grantRelease(); await pending;
+        assert.equal(fixture.calls.at(-1), 'released');
+    }
+});

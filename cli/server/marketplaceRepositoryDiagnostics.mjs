@@ -12,7 +12,8 @@ const enums = {
     category: ['permission', 'io', 'unstable', 'disappearance-unconfirmed', 'malformed', 'truncated', 'deadline', 'reader-saturation', 'entry-overflow', 'lineage', 'overlap', 'unknown'],
     field: ['stat', 'namespace', 'status', 'environment', 'argv', 'executable', 'directory', 'identity', 'birth', 'parent', 'group', 'session', 'none'],
     errno: ['EACCES', 'EPERM', 'ENOENT', 'ESRCH', 'EIO', 'EMFILE', 'ENFILE', 'OTHER'],
-    predicate: ['claim-unresolved', 'claim-expired', 'scan-incomplete', 'flight-expired', 'flight-stale', 'remembered-invalid', 'cohort-capacity'],
+    predicate: ['claim-unresolved', 'claim-expired', 'scan-incomplete', 'flight-expired', 'flight-stale', 'remembered-invalid', 'cohort-capacity',
+        'install-protocol', 'namespace-attestation', 'namespace-writer', 'namespace-incomplete', 'namespace-termination'],
     mismatch: ['pid', 'birth', 'namespace', 'uids', 'group', 'session', 'executable', 'argv', 'router-missing', 'unknown'],
     signal: ['SIGTERM', 'SIGKILL', 'SIGINT', 'SIGABRT', 'SIGSEGV', 'OTHER'],
 };

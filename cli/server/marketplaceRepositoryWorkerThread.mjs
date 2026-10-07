@@ -36,6 +36,8 @@ export async function executeRepositoryTransaction(data, {
     assertLease = assertWorkspaceMutationLease,
     install = installRepo,
     uninstall = uninstallRepositoryUnderLease,
+    prepareInstall,
+    disposeInstall,
 } = {}) {
     let outcome;
     let reachedBarrier = false;
@@ -51,10 +53,17 @@ export async function executeRepositoryTransaction(data, {
         await withLease({ operation: `marketplace-repository:${data.operationId}`,
             requireQuiescenceOnOwnerDeath: true, waitTimeoutMs: remaining }, async (lease) => {
             send({ type: 'lease', token: lease.token });
+            let prepared = false;
+            let installed = false;
             try {
                 // acquireWorkspaceMutationLease tries acquisition before its
                 // elapsed-time check; an expired acquired lease stays unused.
                 checkRepositoryDeadline(data.deadline);
+                if (data.operation.action === 'install_repo' && prepareInstall) {
+                    await prepareInstall();
+                    prepared = true;
+                    checkRepositoryDeadline(data.deadline);
+                }
                 await authorize();
                 checkRepositoryDeadline(data.deadline);
                 assertLease(lease);
@@ -62,7 +71,8 @@ export async function executeRepositoryTransaction(data, {
                 const operation = data.operation;
                 let result;
                 if (operation.action === 'install_repo') {
-                    result = install(operation.url, operation.name, operation.branch, { stdio: 'pipe' });
+                    result = await install(operation.url, operation.name, operation.branch, { stdio: 'pipe' });
+                    installed = true;
                 } else if (operation.action === 'uninstall_repo') {
                     result = await uninstall(operation.target, {
                         withLease: (_options, callback) => callback(assertLease(lease)), stdio: 'pipe',
@@ -70,6 +80,7 @@ export async function executeRepositoryTransaction(data, {
                 } else throw new Error('Invalid repository operation.');
                 outcome = { ok: true, result: safeResult(result) };
             } catch (error) { outcome = { ok: false, error: serializeRepositoryError(error) }; }
+            if (prepared && !installed) await disposeInstall();
             // No service or mutation path exists beyond this point. The lease
             // callback does not return until the supervisor proves quiescence.
             await barrier();
@@ -85,11 +96,23 @@ if (parentPort) {
     const operationId = workerData?.operationId;
     let admission;
     let release;
+    let unitReply;
     let state = 'acquiring';
     const send = (message) => parentPort.postMessage({ ...message, operationId });
     parentPort.on('message', (message) => {
         if (message?.operationId !== operationId) { send({ type: 'protocol-error' }); return; }
-        if (message.type === 'authorization' && state === 'awaiting-admission') {
+        if (message.type === 'install-prepared' && state === 'preparing-install') {
+            state = 'acquiring'; unitReply.resolve(); unitReply = null;
+        } else if (message.type === 'install-result' && state === 'installing') {
+            state = 'running';
+            if (message.outcome?.ok === true) unitReply.resolve(message.outcome.result);
+            else unitReply.reject(Object.assign(new Error(message.outcome?.error?.message || 'Repository installation failed.'), {
+                code: message.outcome?.error?.code,
+            }));
+            unitReply = null;
+        } else if (message.type === 'install-disposed' && state === 'disposing-install') {
+            state = 'running'; unitReply.resolve(); unitReply = null;
+        } else if (message.type === 'authorization' && state === 'awaiting-admission') {
             state = 'running';
             if (message.ok === true) admission.resolve();
             else admission.reject(Object.assign(new Error(message.error?.message || 'Repository admission refused.'), {
@@ -104,6 +127,17 @@ if (parentPort) {
         if (!/^[0-9a-f-]{36}$/.test(operationId || '')) throw new Error('Invalid repository operation identity.');
         const outcome = await executeRepositoryTransaction(workerData, {
             send,
+            ...(workerData.contained ? {
+                prepareInstall: () => new Promise((resolve, reject) => {
+                    unitReply = { resolve, reject }; state = 'preparing-install'; send({ type: 'prepare-install' });
+                }),
+                install: () => new Promise((resolve, reject) => {
+                    unitReply = { resolve, reject }; state = 'installing'; send({ type: 'run-install' });
+                }),
+                disposeInstall: () => new Promise((resolve, reject) => {
+                    unitReply = { resolve, reject }; state = 'disposing-install'; send({ type: 'dispose-install' });
+                }),
+            } : {}),
             authorize: () => new Promise((resolve, reject) => {
                 admission = { resolve, reject };
                 state = 'awaiting-admission';

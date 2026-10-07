@@ -7,7 +7,7 @@ import { REPOSITORY_OPERATION_MARKER } from '../../cli/server/marketplaceReposit
 const flush = async () => { for (let i = 0; i < 40; i += 1) await Promise.resolve(); };
 const operationId = '01234567-89ab-cdef-0123-456789abcdef';
 
-function harness(t) {
+function harness(t, overrides = {}) {
     t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
     const previous = process.env[REPOSITORY_OPERATION_MARKER];
     process.env[REPOSITORY_OPERATION_MARKER] = operationId;
@@ -27,11 +27,11 @@ function harness(t) {
     let worker;
     class FakeWorker extends EventEmitter {
         constructor() { super(); worker = this; }
-        postMessage() {}
+        postMessage(message) { trace.push({ workerMessage: message }); }
         async terminate() { this.emit('exit', 1); }
     }
     const supervisor = startRepositorySupervisor({ channel, observer, WorkerClass: FakeWorker,
-        retain: () => { trace.push({ retained: true }); return true; } });
+        retain: () => { trace.push({ retained: true }); return true; }, ...overrides });
     t.after(async () => {
         await supervisor.cancel();
         for (const [name, original] of listeners) for (const listener of process.listeners(name)) {
@@ -42,8 +42,8 @@ function harness(t) {
     });
     const send = async (target, type, details = {}) => { target.emit('message', { type, operationId, ...details }); await flush(); };
     return { trace, channel, observer, own, supervisor, send, worker: () => worker,
-        start: () => send(channel, 'ownership', { coordinator: own, router: own, baseline: [own],
-            deadline: Date.now() + 600000, operation: { action: 'install_repo', url: 'SECRET_CANARY' } }) };
+        start: (extra = {}) => send(channel, 'ownership', { coordinator: own, router: own, baseline: [own],
+            deadline: Date.now() + 600000, operation: { action: 'install_repo', url: 'SECRET_CANARY' }, ...extra }) };
 }
 
 test('release failure retains the lease before sending a safe, specific diagnostic and unchanged recovery frame', async (t) => {
@@ -107,4 +107,35 @@ test('prior subject passes diagnostic IPC while settlement keeps its recovery an
     assert.equal(h.trace.some(entry => entry.type === 'release'), false);
     assert.equal(h.supervisor.state(), 'cancelling');
     assert.doesNotMatch(JSON.stringify(diagnostic), /SECRET_CANARY/);
+});
+
+test('contained supervisor waits for Router attestation and termination grants while keeping the outer worker lease', async (t) => {
+    const steps = [];
+    const h = harness(t, {
+        createInstallUnit: () => ({ ready: Promise.resolve({ launcherPid: 20, initPid: 21 }),
+            async run() { steps.push('run'); return { ok: true, result: { status: 'cloned' } }; },
+            async release() { steps.push('release'); }, close() { steps.push('close-unit'); } }),
+        namespaceObserver: { async attest() { steps.push('attest'); return {
+            async close() { steps.push('close-handle'); }, async signal() { steps.push('signal'); },
+        }; } },
+    });
+    await h.start({ contained: true, workspaceRoot: '/workspace', cwd: '/workspace' });
+    await h.send(h.worker(), 'lease', { token: 'SECRET_CANARY' });
+    await h.send(h.worker(), 'prepare-install');
+    assert.ok(h.trace.some(entry => entry.type === 'install-ready'));
+    assert.equal(h.trace.some(entry => entry.workerMessage?.type === 'install-prepared'), false);
+    await h.send(h.channel, 'install-attested');
+    await h.send(h.worker(), 'authorize'); await h.send(h.channel, 'authorization', { ok: true });
+    await h.send(h.worker(), 'run-install');
+    assert.deepEqual(steps, ['attest', 'run']);
+    assert.equal(h.trace.some(entry => entry.workerMessage?.type === 'install-result'), false);
+    await h.send(h.channel, 'install-release');
+    assert.ok(h.trace.some(entry => entry.type === 'install-ended'));
+    assert.equal(h.trace.some(entry => entry.workerMessage?.type === 'install-result'), false);
+    await h.send(h.channel, 'install-settled');
+    assert.ok(h.trace.some(entry => entry.workerMessage?.type === 'install-result'));
+    await h.send(h.worker(), 'barrier');
+    assert.equal(h.supervisor.state(), 'release-granted');
+    assert.equal(h.trace.some(entry => entry.type === 'cohort'), false);
+    assert.equal(h.trace.some(entry => entry.retained), false);
 });
