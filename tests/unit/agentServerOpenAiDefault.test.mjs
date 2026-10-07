@@ -23,6 +23,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
+import http from 'node:http';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -103,14 +104,30 @@ function getFreePort() {
     });
 }
 
-async function waitForHealth(port, timeoutMs = 8000) {
+async function waitForHealth(port, child, startup, timeoutMs = 8000) {
     const deadline = Date.now() + timeoutMs;
+    const requireLiveChild = () => {
+        if (startup.error || child.exitCode !== null || child.signalCode !== null
+            || startup.stderr.includes('EADDRINUSE')) {
+            throw new Error('Owned AgentServer failed before readiness');
+        }
+    };
+    const listenLine = `[AgentServer/MCP] Streamable HTTP listening on 127.0.0.1:${port} (/mcp)`;
     while (Date.now() < deadline) {
-        try {
-            const res = await fetch(`http://127.0.0.1:${port}/health`);
-            if (res.ok) return true;
-        } catch (_) {
-            // server not up yet
+        requireLiveChild();
+        // The port reservation was released before spawn. Health alone can
+        // belong to a different fixture that acquired that port first.
+        if (startup.stdout.split('\n').includes(listenLine)) {
+            let healthy = false;
+            try {
+                const res = await fetch(`http://127.0.0.1:${port}/health`);
+                healthy = res.ok;
+                await res.arrayBuffer();
+            } catch (_) {
+                // Retry while this owned listener remains alive.
+            }
+            requireLiveChild();
+            if (healthy) return true;
         }
         await new Promise(r => setTimeout(r, 100));
     }
@@ -121,13 +138,13 @@ async function waitForHealth(port, timeoutMs = 8000) {
  * Boot an AgentServer child against a fresh temp dir holding the given manifest
  * and mcp-config. Returns { port, stop } where stop() kills the child.
  */
-async function startServer({ manifest, mcpConfig, agentId, extraEnv = {} }) {
+async function startServer({ manifest, mcpConfig, agentId, extraEnv = {}, port: requestedPort, onChild }) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentsrv-'));
     fs.writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify(manifest, null, 2));
     if (mcpConfig) {
         fs.writeFileSync(path.join(dir, 'mcp-config.json'), JSON.stringify(mcpConfig, null, 2));
     }
-    const port = await getFreePort();
+    const port = requestedPort ?? await getFreePort();
     const env = {
         ...isolatedAgentServerEnv(),
         PORT: String(port),
@@ -145,20 +162,91 @@ async function startServer({ manifest, mcpConfig, agentId, extraEnv = {} }) {
         stdio: ['ignore', 'pipe', 'pipe']
     });
     const logs = [];
-    child.stdout.on('data', c => logs.push(c.toString()));
-    child.stderr.on('data', c => logs.push(c.toString()));
-    const healthy = await waitForHealth(port);
-    if (!healthy) {
-        child.kill('SIGKILL');
-        throw new Error(`AgentServer did not become healthy. Logs:\n${logs.join('')}`);
-    }
-    const stop = () => new Promise(resolve => {
-        child.once('exit', () => resolve());
-        child.kill('SIGTERM');
-        setTimeout(() => { try { child.kill('SIGKILL'); } catch (_) {} resolve(); }, 1500);
+    const startup = { stdout: '', stderr: '', error: null };
+    child.stdout.on('data', c => {
+        const text = c.toString();
+        logs.push(text);
+        startup.stdout += text;
     });
+    child.stderr.on('data', c => {
+        const text = c.toString();
+        logs.push(text);
+        startup.stderr += text;
+    });
+    child.once('error', error => { startup.error = error; });
+    const closed = new Promise(resolve => child.once('close', resolve));
+    let stopPromise;
+    const stop = () => stopPromise ??= (async () => {
+        if (child.exitCode !== null || child.signalCode !== null) {
+            await closed;
+            return;
+        }
+        let timer;
+        child.kill('SIGTERM');
+        try {
+            await Promise.race([closed, new Promise(resolve => { timer = setTimeout(resolve, 1500); })]);
+            if (child.exitCode === null && child.signalCode === null) {
+                child.kill('SIGKILL');
+                await closed;
+            }
+        } finally {
+            clearTimeout(timer);
+        }
+    })();
+    try {
+        if (onChild) onChild(child);
+        const healthy = await waitForHealth(port, child, startup);
+        if (!healthy) throw new Error('Owned AgentServer did not become healthy');
+    } catch (error) {
+        await stop();
+        throw new Error(`${error.message}. Logs:\n${logs.join('')}`);
+    }
     return { port, stop, dir, logs };
 }
+
+test('AgentServer fixture rejects a port collision with a foreign healthy listener', async () => {
+    let healthRequests = 0;
+    let completionRequests = 0;
+    const foreign = http.createServer((req, res) => {
+        if (req.url === '/health') healthRequests += 1;
+        if (req.url === OPENAI_PATH) completionRequests += 1;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, foreign: true }));
+    });
+    await new Promise((resolve, reject) => {
+        foreign.once('error', reject);
+        foreign.listen(0, '127.0.0.1', resolve);
+    });
+    const { port } = foreign.address();
+    let ownedChild;
+    let unexpectedServer;
+    try {
+        // This is exactly the former health-only readiness predicate.
+        const oldProbe = await fetch(`http://127.0.0.1:${port}/health`);
+        assert.equal(oldProbe.ok, true, 'the old predicate accepts a foreign listener');
+        assert.equal((await oldProbe.json()).foreign, true);
+        const healthBeforeStartup = healthRequests;
+        await assert.rejects(async () => {
+            unexpectedServer = await startServer({
+                manifest: { name: 'collisionFixture', endpoints: { chatCompletions: { model: 'none' } } },
+                port,
+                onChild: child => { ownedChild = child; },
+            });
+            const completion = await fetch(`http://127.0.0.1:${port}${OPENAI_PATH}`, { method: 'POST', body: '{}' });
+            await completion.arrayBuffer();
+        }, /Owned AgentServer failed before readiness[\s\S]*EADDRINUSE/);
+        assert.ok(ownedChild.exitCode !== null || ownedChild.signalCode !== null,
+            'the failed owned child has been reaped');
+        assert.equal(healthRequests, healthBeforeStartup, 'readiness never probes the foreign listener');
+        assert.equal(completionRequests, 0, 'no completion reaches the foreign listener');
+        assert.equal(foreign.listening, true, 'owned-child cleanup leaves the foreign listener alive');
+        const stillHealthy = await fetch(`http://127.0.0.1:${port}/health`);
+        assert.equal((await stillHealthy.json()).foreign, true);
+    } finally {
+        if (unexpectedServer) await unexpectedServer.stop();
+        await new Promise(resolve => foreign.close(resolve));
+    }
+});
 
 const TOOL_CONFIG = {
     tools: [
