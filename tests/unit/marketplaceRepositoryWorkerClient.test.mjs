@@ -406,3 +406,67 @@ test('locally corroborated late cancellation members remain remembered after the
     assert.ok(h.signals.some((entry) => entry.pid === owned.pid && entry.name === 'SIGKILL' && entry.group === false),
         'a legitimate late owned member is not lost when cancellation starts');
 });
+
+for (const corroborated of [false, true]) {
+    test(`terminal and clean closure await ${corroborated ? 'valid' : 'failed'} delayed cohort corroboration before delivery or queue progress`, async (t) => {
+        const h = harness(t);
+        const pending = h.run(); await flush(); await h.hello(h.children[0]); await h.authorize(h.children[0]);
+        const queued = h.run();
+        let outcome = 'pending';
+        pending.then(() => { outcome = 'success'; }, () => { outcome = 'failure'; });
+        const claim = sentinelRecord();
+        let resolveObservation;
+        const observation = new Promise((resolve) => { resolveObservation = resolve; });
+        const scan = h.observer.scan;
+        let deferred = false;
+        h.observer.scan = async (options) => {
+            if (!deferred) { deferred = true; return observation; }
+            return scan(options);
+        };
+        h.message(h.children[0], 'cohort', { members: [claim] }); await flush();
+        assert.equal(deferred, true, 'cohort validation reached its deferred observation');
+        h.terminal(h.children[0]); await flush();
+        assert.equal(outcome, 'pending', 'terminal and close cannot bypass pending ownership validation');
+        assert.equal(h.runner.snapshot().active, true);
+        assert.equal(h.runner.snapshot().pending, 1);
+        assert.equal(h.children.length, 1, 'no later supervisor launches while validation is pending');
+        resolveObservation({ complete: true, records: [claim], members: corroborated ? [claim] : [], writers: [] });
+        await flush();
+        if (corroborated) {
+            assert.equal((await pending).status, 'cloned');
+            assert.equal(outcome, 'success');
+            assert.equal(h.children.length, 2, 'a validated result releases the queue slot');
+            assert.equal(h.runner.snapshot().recoveryDebt, false);
+            await h.hello(h.children[1]); await h.authorize(h.children[1]); h.terminal(h.children[1]);
+            await queued;
+        } else {
+            await h.advance(8_000);
+            await expectSettledRejection(pending, 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED');
+            await expectSettledRejection(queued, 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED');
+            assert.equal(outcome, 'failure');
+            assert.equal(h.children.length, 1, 'failed corroboration never drains into a later launch');
+            assert.equal(h.signals.some((entry) => entry.pid === claim.pid), false, 'unproven identity never gains signal authority');
+            assert.equal(h.runner.snapshot().recoveryDebt, true);
+        }
+    });
+}
+
+test('a stalled cohort validation has a bounded deadline and cannot delay cancellation or turn closure into success', async (t) => {
+    const h = harness(t);
+    const pending = h.run(); await flush(); await h.hello(h.children[0]); await h.authorize(h.children[0]);
+    const scan = h.observer.scan;
+    let deferred = false;
+    h.observer.scan = async (options) => {
+        if (!deferred) { deferred = true; return new Promise(() => {}); }
+        return scan(options);
+    };
+    h.message(h.children[0], 'cohort', { members: [sentinelRecord()] });
+    h.terminal(h.children[0]);
+    await h.advance(1_000);
+    assert.equal(h.runner.snapshot().accepting, false, 'the bounded validation deadline closes admission');
+    const shutdown = h.runner.shutdown();
+    await h.advance(8_000);
+    await expectSettledRejection(pending, 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED');
+    assert.equal((await shutdown).ok, false);
+    assert.equal(h.runner.snapshot().active, false, 'cancellation does not await a stalled validation promise');
+});

@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
 import { isInsideBox } from '../../ploinky-box/lib/boxMarker.mjs';
 import { sanitizeGitDiagnostic } from '../utils/gitCommand.js';
-import { createRepositoryProcessObserver, proveRepositoryQuiescence, REPOSITORY_OPERATION_MARKER, sameProcess } from './marketplaceRepositoryProcessGroup.mjs';
+import { createRepositoryProcessObserver, proveRepositoryQuiescence, REPOSITORY_OPERATION_MARKER, PROC_LIMITS, sameProcess } from './marketplaceRepositoryProcessGroup.mjs';
 
 const SUPERVISOR_PATH = fileURLToPath(new URL('./marketplaceRepositorySupervisor.mjs', import.meta.url));
 export const REPOSITORY_QUEUE_LIMITS = Object.freeze({ pending: 16, bytes: 8 * 1024 * 1024, admissionMs: 600_000 });
@@ -69,6 +69,17 @@ export function createMarketplaceRepositoryRunner({
         ticket.done();
         if (error) ticket.reject(error); else ticket.resolve(result);
         drain();
+    }
+    function completeNormally(ticket) {
+        if (ticket.finished || ticket.cancelling || !ticket.childClosed || !ticket.terminal
+            || ticket.state !== 'released' || ticket.pendingCohortValidations) return;
+        const terminal = ticket.terminal;
+        if (terminal.ok) finish(ticket, null, terminal.result);
+        else {
+            const error = failure(terminal.error.code, sanitizeGitDiagnostic(terminal.error.message).slice(0, 8_192));
+            if (Number.isInteger(terminal.error.status)) error.status = terminal.error.status;
+            finish(ticket, error);
+        }
     }
     function send(ticket, message) {
         if (!ticket.child?.connected) return false;
@@ -189,7 +200,24 @@ export function createMarketplaceRepositoryRunner({
     async function handleMessage(ticket, message) {
         if (ticket.finished) return;
         if (message?.operationId !== ticket.operationId) { void cancel(ticket); return; }
-        if (message.type === 'cohort') { await acceptCohort(ticket, message.members); return; }
+        if (message.type === 'cohort') {
+            if (ticket.pendingCohortValidations >= PROC_LIMITS.readers) { void cancel(ticket); return; }
+            // Register synchronously, before even shape validation can reject:
+            // terminal/close messages may arrive before its promise settles.
+            ticket.pendingCohortValidations += 1;
+            let timer;
+            try {
+                await Promise.race([acceptCohort(ticket, message.members), new Promise((_, reject) => {
+                    timer = time.setTimeout(() => reject(recovery()), PROC_LIMITS.timeoutMs);
+                })]);
+            } catch (_) { void cancel(ticket); }
+            finally {
+                time.clearTimeout(timer);
+                ticket.pendingCohortValidations -= 1;
+                completeNormally(ticket);
+            }
+            return;
+        }
         if (message.type === 'recovery') { void cancel(ticket); return; }
         if (ticket.cancelling) return;
         if (message.type === 'hello' && ticket.state === 'launched' && message.pid === ticket.child.pid) {
@@ -262,13 +290,7 @@ export function createMarketplaceRepositoryRunner({
                 ticket.childClosed = true;
                 if (ticket.finished || ticket.cancelling) return;
                 if (code !== 0 || signal || !ticket.terminal || ticket.state !== 'released') { void cancel(ticket); return; }
-                const terminal = ticket.terminal;
-                if (terminal.ok) finish(ticket, null, terminal.result);
-                else {
-                    const error = failure(terminal.error.code, sanitizeGitDiagnostic(terminal.error.message).slice(0, 8_192));
-                    if (Number.isInteger(terminal.error.status)) error.status = terminal.error.status;
-                    finish(ticket, error);
-                }
+                completeNormally(ticket);
             });
         } catch (error) {
             if (error.code === 'workspace_mutation_lock_timeout' || error.code === closed().code) finish(ticket, error);
@@ -294,7 +316,8 @@ export function createMarketplaceRepositoryRunner({
             let done;
             const ticket = { operation, bytes, cwd, workspaceRoot, authorize, response, resolve, reject,
                 deadline: time.now() + REPOSITORY_QUEUE_LIMITS.admissionMs, operationId: randomUUID(),
-                state: 'pending', remembered: [], done: () => done(), settled: new Promise((settle) => { done = settle; }) };
+                state: 'pending', remembered: [], pendingCohortValidations: 0,
+                done: () => done(), settled: new Promise((settle) => { done = settle; }) };
             let responseClosed = false;
             ticket.isClosed = () => responseClosed || (!response?.writableEnded && (response?.closed === true || response?.destroyed === true));
             ticket.onClose = () => {
