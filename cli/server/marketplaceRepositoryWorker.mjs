@@ -12,6 +12,7 @@ export const REPOSITORY_QUEUE_LIMITS = Object.freeze({ pending: 16, bytes: 8 * 1
 const RECOVERY_CODE = 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED';
 const clock = { now: () => Date.now(), monotonic: () => performance.now(), setTimeout, clearTimeout };
 const COHORT_FIELDS = ['pid', 'birth', 'namespace', 'uids', 'parent', 'group', 'session', 'state'];
+const identityKey = (record) => JSON.stringify([record.pid, record.birth, record.namespace, record.uids]);
 
 function validCohortRecord(record) {
     if (!record || typeof record !== 'object' || Array.isArray(record)
@@ -57,8 +58,11 @@ export function createMarketplaceRepositoryRunner({
     function finish(ticket, error, result) {
         if (ticket.finished) return;
         ticket.finished = true;
+        ticket.cancelWake?.();
         time.clearTimeout(ticket.timer);
         time.clearTimeout(ticket.expiryGrace);
+        time.clearTimeout(ticket.cohortTimer);
+        ticket.cohortClaims.clear();
         ticket.response?.removeListener?.('close', ticket.onClose);
         const index = pending.indexOf(ticket);
         if (index >= 0) pending.splice(index, 1);
@@ -72,7 +76,8 @@ export function createMarketplaceRepositoryRunner({
     }
     function completeNormally(ticket) {
         if (ticket.finished || ticket.cancelling || !ticket.childClosed || !ticket.terminal
-            || ticket.state !== 'released' || ticket.pendingCohortValidations) return;
+            || ticket.state !== 'released' || ticket.cohortFailed || ticket.processingCohortFrames
+            || ticket.cohortClaims.size || ticket.cohortFlight) return;
         const terminal = ticket.terminal;
         if (terminal.ok) finish(ticket, null, terminal.result);
         else {
@@ -92,29 +97,120 @@ export function createMarketplaceRepositoryRunner({
     }
     const options = (ticket) => ({ baseline: ticket.baseline, coordinator: ticket.coordinator,
         router: ticket.router, operationId: ticket.operationId, remembered: ticket.remembered });
-    function remember(ticket, records) {
+    function prepareRemembered(ticket, records) {
         if (!Array.isArray(records) || records.length > 8_192) throw recovery();
         const normalized = records.map((entry) => Object.fromEntries(COHORT_FIELDS.map((field) => [field, entry?.[field]])));
         if (normalized.some((entry) => !validCohortRecord(entry))) throw recovery();
-        const union = new Map(ticket.remembered.map((entry) => [`${entry.pid}:${entry.birth}`, entry]));
-        for (const entry of normalized) union.set(`${entry.pid}:${entry.birth}`, entry);
-        if (union.size > 8_192) throw recovery();
-        ticket.remembered = [...union.values()];
+        const union = new Map(ticket.remembered.map((entry) => [identityKey(entry), entry]));
+        for (const entry of normalized) union.set(identityKey(entry), entry);
+        if (new Set([...union.keys(), ...ticket.cohortClaims.keys()]).size > PROC_LIMITS.entries) throw recovery();
+        return [...union.values()];
     }
-    async function acceptCohort(ticket, records) {
+    function failCohort(ticket) {
+        if (ticket.finished) return;
+        ticket.cohortFailed = true;
+        void cancel(ticket);
+    }
+    function earliestClaim(ticket) {
+        let deadline = Infinity;
+        for (const claim of ticket.cohortClaims.values()) deadline = Math.min(deadline, claim.deadline);
+        return deadline;
+    }
+    function scheduleClaimExpiry(ticket) {
+        const deadline = earliestClaim(ticket);
+        if (deadline === ticket.cohortTimerDeadline) return;
+        time.clearTimeout(ticket.cohortTimer);
+        ticket.cohortTimerDeadline = deadline;
+        if (!Number.isFinite(deadline) || ticket.finished) return;
+        ticket.cohortTimer = time.setTimeout(() => {
+            if (!ticket.finished && earliestClaim(ticket) <= time.monotonic()) failCohort(ticket);
+        }, Math.max(0, deadline - time.monotonic()));
+    }
+    function registerCohort(ticket, records) {
+        const receivedAt = time.monotonic();
         if (!ticket.ownershipAcknowledged || !['acquiring', 'awaiting-admission', 'running',
             'settlement-barrier', 'release-granted', 'cancelling'].includes(ticket.state)
             || !Array.isArray(records) || records.length > 8_192 || records.some((entry) => !validCohortRecord(entry))) throw recovery();
-        const unproven = records.filter((entry) => !ticket.remembered.some((known) => sameProcess(known, entry)));
-        if (!unproven.length) return;
-        // A peer's stable PID identity is not signal authority. Corroborate
-        // new claims using only the Router's already-proven cohort as history.
-        // Supervisor-only history that has lost all local ownership evidence
-        // remains unknown; it cannot seed its own proof through IPC.
-        const observation = await observer.scan(options(ticket));
-        if (ticket.finished) return;
-        if (unproven.some((entry) => !observation.members.some((owned) => sameProcess(owned, entry)))) throw recovery();
-        remember(ticket, observation.members);
+        const known = new Set(ticket.remembered.map(identityKey));
+        const claims = new Map(ticket.cohortClaims);
+        for (const entry of records) {
+            const key = identityKey(entry);
+            if (known.has(key) || claims.has(key)) continue;
+            claims.set(key, { record: { ...entry }, sequence: ++ticket.cohortSequence,
+                deadline: receivedAt + PROC_LIMITS.timeoutMs });
+        }
+        if (new Set([...known, ...claims.keys()]).size > PROC_LIMITS.entries) throw recovery();
+        ticket.cohortClaims = claims;
+        scheduleClaimExpiry(ticket);
+        if (ticket.cancelling && claims.size) ticket.cancelWake?.();
+    }
+    function observationPass(ticket, cutoff = Infinity) {
+        if (ticket.cohortFlight) return ticket.cohortFlight.promise;
+        if (ticket.finished || ticket.observationUncertain) return Promise.reject(recovery());
+        const deadline = Math.min(time.monotonic() + PROC_LIMITS.timeoutMs, earliestClaim(ticket), cutoff);
+        if (time.monotonic() >= deadline) {
+            ticket.cohortFailed = true;
+            ticket.observationUncertain = true;
+            return Promise.reject(recovery());
+        }
+        const flight = { deadline, watermark: ticket.cohortSequence };
+        ticket.cohortFlight = flight;
+        flight.promise = (async () => {
+            let timer;
+            try {
+                const observation = await Promise.race([
+                    observer.scan(options(ticket)),
+                    new Promise((_, reject) => { timer = time.setTimeout(() => reject(recovery()), deadline - time.monotonic()); }),
+                ]);
+                if (ticket.finished || ticket.cohortFlight !== flight || time.monotonic() >= deadline) throw recovery();
+                // Only a timely local observation can establish history. A
+                // partial positive cohort may assist recovery, never success.
+                const remembered = prepareRemembered(ticket, observation.members);
+                const proven = new Set(observation.members.map(identityKey));
+                const remaining = new Map(ticket.cohortClaims);
+                let missing = !observation.complete;
+                for (const [key, claim] of ticket.cohortClaims) {
+                    if (proven.has(key)) remaining.delete(key);
+                    else if (claim.sequence <= flight.watermark) missing = true;
+                }
+                if (ticket.finished || ticket.cohortFlight !== flight || time.monotonic() >= deadline) throw recovery();
+                ticket.remembered = remembered;
+                if (missing) throw recovery();
+                ticket.cohortClaims = remaining;
+                scheduleClaimExpiry(ticket);
+                return observation;
+            } catch (error) {
+                if (!ticket.finished) {
+                    ticket.cohortFailed = true;
+                    ticket.observationUncertain = true;
+                }
+                throw error;
+            } finally {
+                time.clearTimeout(timer);
+                if (ticket.cohortFlight === flight) ticket.cohortFlight = null;
+            }
+        })();
+        return flight.promise;
+    }
+    function pumpCohort(ticket) {
+        if (ticket.finished || ticket.cancelling || ticket.cohortFailed || ticket.cohortFlight || !ticket.cohortClaims.size) return;
+        void observationPass(ticket).then(() => {
+            if (ticket.cancelling || ticket.finished) return;
+            if (ticket.cohortClaims.size) pumpCohort(ticket);
+            else completeNormally(ticket);
+        }, () => failCohort(ticket));
+    }
+    function waitForCancellationWork(ticket, until) {
+        return new Promise((resolve) => {
+            let timer;
+            const wake = () => {
+                time.clearTimeout(timer);
+                if (ticket.cancelWake === wake) ticket.cancelWake = null;
+                resolve();
+            };
+            ticket.cancelWake = wake;
+            timer = time.setTimeout(wake, Math.max(0, until - time.monotonic()));
+        });
     }
     async function captureCoordinator(ticket) {
         const record = await observer.read(ticket.child.pid, { executable: true });
@@ -151,30 +247,40 @@ export function createMarketplaceRepositoryRunner({
         if (!ticket.child) { finish(ticket, error); return ticket.settled; }
         const started = time.monotonic();
         const deadline = started + 8_000;
-        send(ticket, { type: 'cancel' }); // same-PID retention precedes supervisor signals
         const hardStop = time.setTimeout(() => finish(ticket, error), 8_000);
+        send(ticket, { type: 'cancel' }); // same-PID retention precedes supervisor signals
         void (async () => {
             try {
+                // Cancellation is the sole observer scheduler from here. Join
+                // the existing bounded flight instead of causing a busy scan.
+                let preKillCensusDone = Boolean(ticket.cohortFlight);
+                if (ticket.cohortFlight) {
+                    try { await ticket.cohortFlight.promise; } catch (_) { /* genuine uncertainty */ }
+                }
                 if (!ticket.coordinator) {
                     try { await captureCoordinator(ticket); } catch (_) { /* no unvalidated group signal */ }
                 }
-                if (!ticket.finished) {
-                    try {
-                        const observation = await observer.scan(options(ticket));
-                        remember(ticket, observation.members);
-                    } catch (_) { /* retain known identities for best-effort escalation */ }
-                }
                 // Begin the final validated group KILL at two seconds: its
                 // identity read has a one-second ceiling, inside the 3s grace.
-                await delay(started + 2_000 - time.monotonic());
+                while (!ticket.finished && time.monotonic() < started + 2_000) {
+                    if (!ticket.observationUncertain && (!preKillCensusDone || ticket.cohortClaims.size)) {
+                        try { await observationPass(ticket, started + 2_000); }
+                        catch (_) { /* retain known identities for best-effort escalation */ }
+                        preKillCensusDone = true;
+                    } else await waitForCancellationWork(ticket, started + 2_000);
+                }
                 if (!ticket.finished) await signalMembers(ticket, 'SIGKILL', deadline);
-                while (!ticket.finished && time.monotonic() < started + 6_000) {
+                while (!ticket.finished && !ticket.observationUncertain && time.monotonic() < started + 6_000) {
                     try {
-                        const observation = await observer.scan(options(ticket));
-                        remember(ticket, observation.members);
-                        if (ticket.childClosed) {
-                            const proof = await proveQuiescence(observer, options(ticket), { barrier: true });
-                            if (proof.ok && time.monotonic() < deadline) {
+                        await observationPass(ticket, started + 6_000);
+                        if (ticket.childClosed && ticket.cohortFailed) {
+                            await signalMembers(ticket, 'SIGKILL', deadline);
+                            break; // failed ownership cannot become successful cleanup
+                        }
+                        if (ticket.childClosed && !ticket.cohortFailed && !ticket.cohortClaims.size) {
+                            const proof = await proveQuiescence({ scan: () => observationPass(ticket, deadline) }, options(ticket), { barrier: true });
+                            if (proof.ok && !ticket.cohortFailed && !ticket.cohortClaims.size
+                                && !ticket.processingCohortFrames && !ticket.cohortFlight && time.monotonic() < deadline) {
                                 ticket.quiescent = true;
                                 break;
                             }
@@ -183,9 +289,11 @@ export function createMarketplaceRepositoryRunner({
                     await signalMembers(ticket, 'SIGKILL', deadline);
                     await delay(25);
                 }
-                if (!ticket.finished && ticket.childClosed && !ticket.quiescent && time.monotonic() < deadline) {
-                    const proof = await proveQuiescence(observer, options(ticket), { barrier: true });
-                    ticket.quiescent = proof.ok && time.monotonic() < deadline;
+                if (!ticket.finished && !ticket.observationUncertain && !ticket.cohortFailed && !ticket.cohortClaims.size
+                    && ticket.childClosed && !ticket.quiescent && time.monotonic() < deadline) {
+                    const proof = await proveQuiescence({ scan: () => observationPass(ticket, deadline) }, options(ticket), { barrier: true });
+                    ticket.quiescent = proof.ok && !ticket.cohortFailed && !ticket.cohortClaims.size
+                        && !ticket.processingCohortFrames && !ticket.cohortFlight && time.monotonic() < deadline;
                 }
             } catch (_) {
                 // Failed observations never become successful cleanup. The
@@ -201,19 +309,12 @@ export function createMarketplaceRepositoryRunner({
         if (ticket.finished) return;
         if (message?.operationId !== ticket.operationId) { void cancel(ticket); return; }
         if (message.type === 'cohort') {
-            if (ticket.pendingCohortValidations >= PROC_LIMITS.readers) { void cancel(ticket); return; }
-            // Register synchronously, before even shape validation can reject:
-            // terminal/close messages may arrive before its promise settles.
-            ticket.pendingCohortValidations += 1;
-            let timer;
-            try {
-                await Promise.race([acceptCohort(ticket, message.members), new Promise((_, reject) => {
-                    timer = time.setTimeout(() => reject(recovery()), PROC_LIMITS.timeoutMs);
-                })]);
-            } catch (_) { void cancel(ticket); }
+            ticket.processingCohortFrames += 1;
+            try { registerCohort(ticket, message.members); }
+            catch (_) { failCohort(ticket); }
             finally {
-                time.clearTimeout(timer);
-                ticket.pendingCohortValidations -= 1;
+                ticket.processingCohortFrames -= 1;
+                pumpCohort(ticket);
                 completeNormally(ticket);
             }
             return;
@@ -316,7 +417,8 @@ export function createMarketplaceRepositoryRunner({
             let done;
             const ticket = { operation, bytes, cwd, workspaceRoot, authorize, response, resolve, reject,
                 deadline: time.now() + REPOSITORY_QUEUE_LIMITS.admissionMs, operationId: randomUUID(),
-                state: 'pending', remembered: [], pendingCohortValidations: 0,
+                state: 'pending', remembered: [], processingCohortFrames: 0, cohortClaims: new Map(),
+                cohortSequence: 0, cohortFailed: false,
                 done: () => done(), settled: new Promise((settle) => { done = settle; }) };
             let responseClosed = false;
             ticket.isClosed = () => responseClosed || (!response?.writableEnded && (response?.closed === true || response?.destroyed === true));

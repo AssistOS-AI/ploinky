@@ -470,3 +470,257 @@ test('a stalled cohort validation has a bounded deadline and cannot delay cancel
     assert.equal((await shutdown).ok, false);
     assert.equal(h.runner.snapshot().active, false, 'cancellation does not await a stalled validation promise');
 });
+
+// Like the production observer, refuse a second census while outstanding I/O
+// owns all eight reader slots. A timeout does not make those slots disappear.
+function exclusiveObservations(h, { delayMs = 300, snapshot = () => ({ members: [], writers: [] }) } = {}) {
+    const scan = h.observer.scan;
+    const signal = h.observer.signal;
+    const flights = [];
+    const signalRecords = [];
+    let busy = false;
+    let overlappingScans = 0;
+    let busySignalAttempts = 0;
+    h.observer.scan = (options) => {
+        if (busy) {
+            overlappingScans += 1;
+            return Promise.resolve({ complete: false, records: [], members: [], writers: [] });
+        }
+        busy = true;
+        const captured = snapshot(options);
+        let resolve;
+        let reject;
+        const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+        const flight = {
+            at: h.time.monotonic(), history: [...(options?.remembered || [])], finished: false,
+            async resolve(value = captured) {
+                if (this.finished) return;
+                this.finished = true;
+                const base = await scan(options);
+                busy = false;
+                resolve({ ...base, ...value });
+            },
+            reject(error = new Error('late observation rejection')) {
+                if (this.finished) return;
+                this.finished = true; busy = false; reject(error);
+            },
+        };
+        flights.push(flight);
+        const wait = typeof delayMs === 'function' ? delayMs(flights.length) : delayMs;
+        if (wait !== null) h.time.setTimeout(() => { void flight.resolve(); }, wait);
+        return promise;
+    };
+    h.observer.signal = async (record, name, options) => {
+        if (busy) { busySignalAttempts += 1; return false; }
+        signalRecords.push({ ...record });
+        return signal(record, name, options);
+    };
+    return { flights, signalRecords, overlappingScans: () => overlappingScans,
+        busySignalAttempts: () => busySignalAttempts, busy: () => busy };
+}
+
+function anotherRecord(pid) {
+    return { ...sentinelRecord(), pid, birth: String(pid * 10), group: pid, session: pid };
+}
+
+test('cumulative valid frames every 100ms share one production-exclusive 300ms census', async (t) => {
+    const h = harness(t);
+    const pending = h.run(); await flush(); await h.hello(h.children[0]); await h.authorize(h.children[0]);
+    const owned = sentinelRecord();
+    const observations = exclusiveObservations(h, { snapshot: () => ({ members: [owned], writers: [] }) });
+    h.message(h.children[0], 'cohort', { members: [owned] });
+    await h.advance(100); h.message(h.children[0], 'cohort', { members: [owned] });
+    await h.advance(100); h.message(h.children[0], 'cohort', { members: [owned] });
+    h.terminal(h.children[0]);
+    await h.advance(100);
+    assert.equal(observations.overlappingScans(), 0, 'cumulative frames share the production-exclusive census');
+    assert.equal(observations.flights.length, 1, 'duplicates create no jobs');
+    assert.equal(h.runner.snapshot().recoveryDebt, false);
+    assert.equal((await pending).status, 'cloned');
+});
+
+test('absence of a later claim waits for a subsequent serialized pass within its first-arrival deadline', async (t) => {
+    const h = harness(t);
+    const pending = h.run(); await flush(); await h.hello(h.children[0]); await h.authorize(h.children[0]);
+    const a = sentinelRecord(); const b = anotherRecord(50_002);
+    let visible = [a];
+    const observations = exclusiveObservations(h, { snapshot: () => ({ members: [...visible], writers: [] }) });
+    h.message(h.children[0], 'cohort', { members: [a] });
+    await h.advance(100); visible = [a, b]; h.message(h.children[0], 'cohort', { members: [a, b] });
+    h.terminal(h.children[0]);
+    await h.advance(200);
+    assert.equal(h.runner.snapshot().accepting, true, 'earlier-pass absence does not reject a later arrival');
+    assert.equal(observations.flights.length, 2);
+    assert.deepEqual(observations.flights.map((entry) => entry.at), [0, 300]);
+    await h.advance(300);
+    assert.equal(observations.overlappingScans(), 0);
+    assert.equal((await pending).status, 'cloned');
+});
+
+test('a foreign first claim cannot disappear when a later cumulative frame omits it', async (t) => {
+    const h = harness(t);
+    const pending = h.run(); await flush(); await h.hello(h.children[0]); await h.authorize(h.children[0]);
+    const queued = h.run();
+    const owned = sentinelRecord(); const foreign = anotherRecord(50_003);
+    const observations = exclusiveObservations(h, { snapshot: () => ({ members: [owned], writers: [] }) });
+    h.message(h.children[0], 'cohort', { members: [owned, foreign] });
+    await h.advance(100); h.message(h.children[0], 'cohort', { members: [owned] });
+    h.terminal(h.children[0]);
+    await h.advance(200);
+    assert.equal(h.runner.snapshot().accepting, false, 'an omitted earlier ownership obligation still fails');
+    await h.advance(8_000);
+    await expectSettledRejection(pending, 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED');
+    await expectSettledRejection(queued, 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED');
+    assert.equal(h.children.length, 1);
+    assert.equal(h.signals.some((entry) => entry.pid === foreign.pid), false);
+    assert.equal(observations.overlappingScans(), 0);
+});
+
+test('duplicates do not renew a claim deadline while it waits behind an earlier observation', async (t) => {
+    const h = harness(t);
+    const pending = h.run(); await flush(); await h.hello(h.children[0]); await h.authorize(h.children[0]);
+    const a = sentinelRecord(); const b = anotherRecord(50_002);
+    let visible = [a];
+    const observations = exclusiveObservations(h, { delayMs: (index) => index === 1 ? 900 : 300,
+        snapshot: () => ({ members: [...visible], writers: [] }) });
+    h.message(h.children[0], 'cohort', { members: [a] });
+    for (let tick = 1; tick <= 10; tick += 1) {
+        await h.advance(100); visible = [a, b]; h.message(h.children[0], 'cohort', { members: [b] });
+    }
+    h.terminal(h.children[0]);
+    await h.advance(100);
+    assert.equal(h.runner.snapshot().accepting, false, 'B expires at first arrival 100ms plus 1s, despite duplicates');
+    assert.deepEqual(observations.flights.map((entry) => entry.at), [0, 900]);
+    await h.advance(8_000);
+    await expectSettledRejection(pending, 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED');
+    assert.equal(observations.overlappingScans(), 0);
+});
+
+test('the incremental proven-plus-pending identity union is bounded without evicting earlier claims', async (t) => {
+    const h = harness(t);
+    const pending = h.run(); await flush(); await h.hello(h.children[0]); await h.authorize(h.children[0]);
+    const owned = sentinelRecord();
+    const scan = h.observer.scan;
+    h.observer.scan = async (options) => ({ ...await scan(options), members: [owned], writers: [] });
+    h.message(h.children[0], 'cohort', { members: [owned] }); await flush();
+    const observations = exclusiveObservations(h, { delayMs: null });
+    const claims = Array.from({ length: 8_192 }, (_, index) => anotherRecord(60_000 + index));
+    h.message(h.children[0], 'cohort', { members: claims.slice(0, 4_096) });
+    h.message(h.children[0], 'cohort', { members: claims.slice(4_096, 8_191) });
+    assert.equal(h.runner.snapshot().accepting, true, 'one proven plus 8191 pending identities fits');
+    assert.equal(observations.flights.length, 1);
+    h.message(h.children[0], 'cohort', { members: claims.slice(8_191) });
+    assert.equal(h.runner.snapshot().accepting, false, 'the 8193rd distinct identity refuses without eviction');
+    await observations.flights[0].resolve(); await h.advance(8_000);
+    await expectSettledRejection(pending, 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED');
+    assert.equal(h.signals.some((entry) => entry.pid >= 60_000), false, 'unproved overflow claims never become history');
+});
+
+test('cancellation joins a 300ms census, observes late members serially and reserves KILL plus two fresh post-close passes', async (t) => {
+    let proofs = 0;
+    const h = harness(t, { proveQuiescence: async (view, options) => {
+        proofs += 1;
+        const first = await view.scan(options);
+        await new Promise((resolve) => h.time.setTimeout(resolve, 25));
+        const second = await view.scan(options);
+        return { ok: first.complete && second.complete && !first.writers.length && !second.writers.length };
+    } });
+    const pending = h.run(); await flush(); await h.hello(h.children[0]); await h.authorize(h.children[0]);
+    const a = sentinelRecord(); const b = anotherRecord(50_002);
+    let visible = [a];
+    const observations = exclusiveObservations(h, { snapshot: () => ({ members: [...visible], writers: [] }) });
+    h.message(h.children[0], 'cohort', { members: [a] });
+    await h.advance(100);
+    const shutdown = h.runner.shutdown();
+    visible = [a, b]; h.message(h.children[0], 'cohort', { members: [b] });
+    assert.equal(observations.flights.length, 1, 'shutdown and late frames join existing census');
+    await h.advance(500);
+    visible = [];
+    h.message(h.children[0], 'cohort', { members: [{ ...b, parent: 123, group: 123, session: 123 }] });
+    await h.advance(1_500);
+    assert.ok(h.signals.some((entry) => entry.group && entry.name === 'SIGKILL' && entry.at === 2_100));
+    assert.equal(observations.busySignalAttempts(), 0, 'healthy scans never overlap signal reads');
+    assert.equal(observations.signalRecords.find((entry) => entry.pid === b.pid)?.group, b.group,
+        'peer topology cannot overwrite Router-proven history');
+    await h.advance(1_000);
+    await expectSettledRejection(pending, 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED');
+    assert.equal((await shutdown).ok, false);
+    assert.equal(proofs, 1);
+    assert.equal(observations.overlappingScans(), 0);
+    assert.ok(observations.flights.slice(-2).every((entry) => entry.at > 2_100), 'quiescence uses two fresh post-close censuses');
+});
+
+for (const ending of ['resolve', 'reject']) {
+    test(`a still-busy expired flight cannot regain authority on late ${ending} after bounded cancellation`, async (t) => {
+        let proofCalls = 0;
+        const h = harness(t, { proveQuiescence: async () => { proofCalls += 1; return { ok: true }; } });
+        const pending = h.run(); await flush(); await h.hello(h.children[0]); await h.authorize(h.children[0]);
+        const observations = exclusiveObservations(h, { delayMs: null });
+        h.message(h.children[0], 'cohort', { members: [sentinelRecord()] });
+        await h.advance(1_000);
+        assert.equal(h.runner.snapshot().accepting, false);
+        await h.advance(8_000);
+        await expectSettledRejection(pending, 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED');
+        assert.equal(h.runner.snapshot().active, false, 'underlying busy I/O cannot extend the cleanup deadline');
+        assert.equal(observations.flights.length, 1, 'uncertainty does not start replacement/busy-loop scans');
+        assert.equal(observations.overlappingScans(), 0);
+        const signals = h.signals.length;
+        let identityReads = 0;
+        const late = new Proxy(sentinelRecord(), { get(target, key) { identityReads += 1; return target[key]; } });
+        if (ending === 'resolve') await observations.flights[0].resolve({ members: [late], writers: [] });
+        else observations.flights[0].reject();
+        await flush(); await h.advance(1_000);
+        assert.equal(identityReads, 0, 'a late result is not read into authority/history');
+        assert.equal(h.signals.length, signals);
+        assert.equal(proofCalls, 0);
+        assert.equal(h.children.length, 1);
+        assert.equal(h.runner.snapshot().recoveryDebt, true);
+    });
+}
+
+for (const corroborated of [false, true]) {
+    test(`ordinary error delivery also waits for ${corroborated ? 'valid' : 'failed'} cohort corroboration`, async (t) => {
+        const h = harness(t);
+        const pending = h.run(); await flush(); await h.hello(h.children[0]); await h.authorize(h.children[0]);
+        let outcome = 'pending';
+        pending.then(() => { outcome = 'success'; }, (error) => { outcome = error.code; });
+        const owned = sentinelRecord();
+        const observations = exclusiveObservations(h, { snapshot: () => ({ members: corroborated ? [owned] : [], writers: [] }) });
+        h.message(h.children[0], 'cohort', { members: [owned] });
+        h.terminal(h.children[0], { ok: false, error: { code: 'ORDINARY_FIXTURE_ERROR', message: 'ordinary failure' } });
+        await flush();
+        assert.equal(outcome, 'pending', 'ordinary errors also wait for ownership validation');
+        await h.advance(300);
+        if (!corroborated) await h.advance(8_000);
+        await expectSettledRejection(pending, corroborated ? 'ORDINARY_FIXTURE_ERROR' : 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED');
+        assert.equal(observations.overlappingScans(), 0);
+    });
+}
+
+test('a timely pass may positively prove a later-arriving claim without an unnecessary second census', async (t) => {
+    const h = harness(t);
+    const pending = h.run(); await flush(); await h.hello(h.children[0]); await h.authorize(h.children[0]);
+    const a = sentinelRecord(); const b = anotherRecord(50_002);
+    const observations = exclusiveObservations(h, { snapshot: () => ({ members: [a, b], writers: [] }) });
+    h.message(h.children[0], 'cohort', { members: [a] });
+    await h.advance(100); h.message(h.children[0], 'cohort', { members: [b] });
+    h.terminal(h.children[0]); await h.advance(200);
+    assert.equal(observations.flights.length, 1);
+    assert.equal((await pending).status, 'cloned');
+});
+
+test('an incomplete observation can preserve positive cleanup identities but never complete an operation', async (t) => {
+    const h = harness(t);
+    const pending = h.run(); await flush(); await h.hello(h.children[0]); await h.authorize(h.children[0]);
+    const owned = sentinelRecord();
+    const observations = exclusiveObservations(h, { snapshot: () => ({ complete: false, members: [owned], writers: [] }) });
+    h.message(h.children[0], 'cohort', { members: [owned] }); h.terminal(h.children[0]);
+    await h.advance(300);
+    assert.equal(h.runner.snapshot().accepting, false, 'partial positive evidence cannot make an incomplete pass successful');
+    h.message(h.children[0], 'cohort', { members: [owned] });
+    await h.advance(8_000);
+    await expectSettledRejection(pending, 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED');
+    assert.ok(h.signals.some((entry) => entry.pid === owned.pid && entry.name === 'SIGKILL'));
+    assert.equal(h.runner.snapshot().recoveryDebt, true, 'later frames cannot erase the failed observation');
+    assert.equal(observations.flights.length, 1, 'unknown results do not create busy-loop scans');
+});
