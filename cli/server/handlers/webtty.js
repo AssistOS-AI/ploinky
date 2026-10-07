@@ -194,7 +194,8 @@ export async function handleWebtty(req, res, parsedUrl, {
     const method = String(req.method || 'GET').toUpperCase();
 
     if ((pathname === '/webtty' || pathname === '/webtty/') && method === 'GET') {
-        const body = fs.readFileSync(path.join(WEBTTY_ROOT, 'webtty.html'));
+        const body = await fs.promises.readFile(path.join(WEBTTY_ROOT, 'webtty.html'));
+        if (req.destroyed || res.destroyed) return true;
         res.writeHead(200, {
             ...SECURITY_HEADERS,
             'Content-Type': 'text/html; charset=utf-8',
@@ -209,7 +210,8 @@ export async function handleWebtty(req, res, parsedUrl, {
         if (!Object.hasOwn(ASSETS, name)) { sendError(res, 404, 'not_found'); return true; }
         const asset = ASSETS[name];
         try {
-            const body = fs.readFileSync(asset.path);
+            const body = await fs.promises.readFile(asset.path);
+            if (req.destroyed || res.destroyed) return true;
             res.writeHead(200, {
                 ...SECURITY_HEADERS,
                 'Content-Type': asset.type,

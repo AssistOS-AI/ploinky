@@ -193,6 +193,7 @@ globalState.webtty.sessions = webttySessionManager.sessions;
  * Serve MCP Browser Client
  */
 function serveMcpBrowserClient(req, res) {
+    if (req.destroyed || res.destroyed) return;
     let stats;
     try {
         stats = fs.statSync(MCP_BROWSER_CLIENT_PATH);
@@ -217,8 +218,13 @@ function serveMcpBrowserClient(req, res) {
     }
 
     const stream = fs.createReadStream(MCP_BROWSER_CLIENT_PATH);
+    const cleanup = () => stream.destroy();
+    res.once('close', cleanup);
+    stream.once('close', () => res.removeListener('close', cleanup));
     stream.on('error', err => {
+        stream.destroy();
         appendLog('mcp_client_stream_error', { error: err?.message || String(err) });
+        if (res.destroyed) return;
         if (!res.headersSent) {
             res.writeHead(500, { 'Content-Type': 'text/plain' });
         }
@@ -723,7 +729,7 @@ async function processRequest(req, res) {
 
     // Route to appropriate handler
     if (isRouteMount(pathname, '/webchat')) {
-        return handleWebChat(req, res, config.webchat, globalState.webchat);
+        return handleWebChat(req, res, options => config.resolveWebchatForRequest(options), globalState.webchat);
     } else if (isRouteMount(pathname, '/status')) {
         return handleStatus(req, res, config.status, globalState.status);
     } else if (pathname === '/upload') {

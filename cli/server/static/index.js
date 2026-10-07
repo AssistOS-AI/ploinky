@@ -120,6 +120,55 @@ function getBaseDirs(appName, fallbackDir) {
     return dedupe(dirs);
 }
 
+async function getBaseDirsAsync(appName, fallbackDir) {
+    let cfg;
+    try {
+        cfg = JSON.parse(await fs.promises.readFile(ROUTING_FILE, 'utf8'));
+    } catch (_) { }
+    const staticRoot = cfg?.static?.hostPath ? await directoryOrNull(cfg.static.hostPath) : null;
+    const dirs = [];
+    if (staticRoot) {
+        for (const variant of new Set([appName, appName.toLowerCase()])) {
+            for (const parent of ['web', 'apps', 'static', 'assets', '']) {
+                dirs.push(path.join(staticRoot, parent, variant));
+            }
+        }
+        dirs.push(staticRoot);
+    }
+    dirs.push(PROJECT_WEB_LIBS, fallbackDir);
+    const unique = [...new Set(dirs.filter(Boolean).map(dir => path.resolve(dir)))];
+    return (await Promise.all(unique.map(directoryOrNull))).filter(Boolean);
+}
+
+async function resolveAssetFromBasesAsync(bases, relPath) {
+    const sanitized = sanitizeRelativeRequestPath(relPath);
+    if (!sanitized) return null;
+    for (const base of bases) {
+        const allowedRoots = [base, path.resolve(base, '..')];
+        for (const candidate of [path.join(base, sanitized), path.join(base, 'assets', sanitized)]) {
+            try {
+                if ((await fs.promises.stat(candidate)).isFile()
+                    && await isPathWithinAllowedRootsAsync(allowedRoots, candidate)) return candidate;
+            } catch (_) { }
+        }
+    }
+    return null;
+}
+
+async function resolveAssetPathAsync(appName, fallbackDir, relPath) {
+    if (!sanitizeRelativeRequestPath(relPath)) return null;
+    return resolveAssetFromBasesAsync(await getBaseDirsAsync(appName, fallbackDir), relPath);
+}
+
+async function resolveFirstAvailableAsync(appName, fallbackDir, filenames) {
+    const bases = await getBaseDirsAsync(appName, fallbackDir);
+    for (const name of Array.isArray(filenames) ? filenames : [filenames]) {
+        const target = await resolveAssetFromBasesAsync(bases, name);
+        if (target) return target;
+    }
+    return null;
+}
+
 function isPathWithinAllowedRoots(allowedRoots, targetPath, options = {}) {
     return isPathWithinRoots(allowedRoots, targetPath, options);
 }
@@ -692,14 +741,17 @@ async function serveWebLibRequest(req, res) {
         }
 
         const target = path.join(PROJECT_WEB_LIBS, sanitized);
-        if (!isPathWithinAllowedRoots([PROJECT_WEB_LIBS], target)) {
+        const confined = await isPathWithinAllowedRootsAsync([PROJECT_WEB_LIBS], target);
+        if (req.destroyed || res.destroyed) return true;
+        if (!confined) {
             res.writeHead(403, { 'Content-Type': 'text/plain' });
             res.end('Forbidden');
             return true;
         }
 
         try {
-            const stat = fs.statSync(target);
+            const stat = await fs.promises.stat(target);
+            if (req.destroyed || res.destroyed) return true;
             if (stat.isFile() && await sendFile(res, target, { req })) return true;
         } catch (_) { }
 
@@ -718,6 +770,9 @@ export {
     getStaticAgentName,
     resolveAssetPath,
     resolveFirstAvailable,
+    getBaseDirsAsync,
+    resolveAssetPathAsync,
+    resolveFirstAvailableAsync,
     sendFile,
     isWorkspaceFileRequest,
     serveWorkspaceFileRequest,

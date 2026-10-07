@@ -11,7 +11,8 @@ function sendHtml(res, status, html) {
 export async function handleTaskRoute({ pathname, req, res, renderTaskView }) {
     const viewMatch = /^\/tasks\/(task_[0-9a-f]{24})\/view$/.exec(pathname);
     if (!viewMatch || req.method !== 'GET') return false;
-    const html = typeof renderTaskView === 'function' ? renderTaskView(viewMatch[1]) : '';
+    const html = typeof renderTaskView === 'function' ? await renderTaskView(viewMatch[1]) : '';
+    if (req.destroyed || res.destroyed) return true;
     if (!html) {
         sendHtml(res, 404, 'Task view unavailable.');
         return true;

@@ -3,23 +3,23 @@ import fs from 'fs';
 import path from 'path';
 import { requireAdminControlRequest } from '../adminControlSecurity.js';
 import { ROUTING_FILE, PLOINKY_WORKSPACE_ROOT } from '../../utils/config.js';
-import { getAllServerStatuses } from '../serverManager.js';
+import { getAllServerStatusesAsync } from '../serverManager.js';
 import { workspaceMetricsMonitor } from '../workspaceMetrics.js';
 import { cleanupWhenResponseCloses } from '../streamLifecycle.js';
 
 const appName = 'status';
 
-function collectServerStatuses() {
+async function collectServerStatusesAsync() {
     try {
-        return getAllServerStatuses();
+        return await getAllServerStatusesAsync();
     } catch (_) {
         return {};
     }
 }
 
-function collectStaticInfo() {
+async function collectStaticInfoAsync() {
     try {
-        const routing = JSON.parse(fs.readFileSync(ROUTING_FILE, 'utf8')) || {};
+        const routing = JSON.parse(await fs.promises.readFile(ROUTING_FILE, 'utf8')) || {};
         const staticAgent = routing?.static?.agent || null;
         const shortAgentName = typeof staticAgent === 'string' && staticAgent.includes('/')
             ? staticAgent.split('/').pop()
@@ -67,17 +67,22 @@ export function streamWorkspaceMetrics(res, {
     cleanupWhenResponseCloses(res, unsubscribe);
 }
 
-function handleStatus(req, res) {
+async function handleStatus(req, res) {
+    if (req.destroyed || res.destroyed) return;
     const parsedUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     const pathname = parsedUrl.pathname.substring(`/${appName}`.length) || '/';
 
     if (!requireAdminControlRequest(req, res)) return;
 
     if (pathname === '/data') {
+        const servers = await collectServerStatusesAsync();
+        if (req.destroyed || res.destroyed) return;
+        const staticInfo = await collectStaticInfoAsync();
+        if (req.destroyed || res.destroyed) return;
         const requestBase = {
             workspace: path.basename(PLOINKY_WORKSPACE_ROOT),
-            servers: collectServerStatuses(),
-            static: collectStaticInfo(),
+            servers,
+            static: staticInfo,
         };
         const decorate = (snapshot) => ({ ...requestBase, ...snapshot });
         if (parsedUrl.searchParams.get('follow') === '1') {
