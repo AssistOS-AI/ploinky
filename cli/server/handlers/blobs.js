@@ -2,24 +2,21 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 
-import { loadAgents } from '../../utils/workspace.js';
+import { readAgentsSnapshot } from '../../utils/workspace.js';
 import { SHARED_DIR } from '../../utils/config.js';
 import {
     assertCanonicalAgentDataPath,
-    ensureAgentDataDirectory,
     resolveAgentDataPath,
+    assertCanonicalAgentDataPathAsync,
+    ensureAgentDataDirectoryAsync,
+    resolveAgentDataPathAsync,
+    validateAgentDataKey,
 } from '../../utils/runtime/agentDataPathPolicy.js';
 import { getWorkspaceRoot, resolveWorkspacePath } from '../utils/workspacePaths.js';
 import {
     streamAdmittedUpload,
     UPLOAD_ROUTE_POLICIES,
 } from './uploadAdmission.js';
-
-function ensureSharedHostDir() {
-    const dir = SHARED_DIR;
-    ensureAgentDataDirectory(dir);
-    return dir;
-}
 
 function newId() { return crypto.randomBytes(24).toString('hex'); }
 
@@ -51,7 +48,7 @@ export function resolveAgentBlobStorage(record, { workspaceRoot } = {}) {
     });
 }
 
-export function resolveAgentRecord(agentSegment, { agentMap, workspaceRoot } = {}) {
+function selectAgentRecord(agentSegment, { agentMap } = {}) {
     const name = normalizeAgentSegment(agentSegment);
     if (!name) {
         return { ok: false, status: 400, message: 'Missing agent name in path.' };
@@ -71,7 +68,7 @@ export function resolveAgentRecord(agentSegment, { agentMap, workspaceRoot } = {
     let map = agentMap;
     if (!map) {
         try {
-            map = loadAgents() || {};
+            map = readAgentsSnapshot() || {};
         } catch (_) {
             map = {};
         }
@@ -103,28 +100,45 @@ export function resolveAgentRecord(agentSegment, { agentMap, workspaceRoot } = {
         }
     }
 
-    const record = matches[0];
-    const projectPath = path.resolve(record.projectPath);
-    const { blobsDir } = resolveAgentBlobStorage(record, {
-        ...(workspaceRoot ? { workspaceRoot } : {}),
-    });
+    return { ok: true, record: matches[0] };
+}
 
+function agentRecordResult(agentSegment, record, blobsDir, workspaceRoot) {
     return {
         ok: true,
         agent: {
             requestSegment: agentSegment,
             canonicalName: record.agentName,
             repoName: record.repoName || null,
-            projectPath,
+            projectPath: path.resolve(record.projectPath),
             blobsDir,
             ...(workspaceRoot ? { workspaceRoot } : {}),
-            isShared: false
-        }
+            isShared: false,
+        },
     };
 }
 
+export function resolveAgentRecord(agentSegment, { agentMap, workspaceRoot } = {}) {
+    const selected = selectAgentRecord(agentSegment, { agentMap });
+    if (!selected.ok) return selected;
+    const { blobsDir } = resolveAgentBlobStorage(selected.record, { workspaceRoot });
+    return agentRecordResult(agentSegment, selected.record, blobsDir, workspaceRoot);
+}
+
+async function resolveAgentRecordAsync(agentSegment, { agentMap, workspaceRoot, check = () => {} } = {}) {
+    const selected = selectAgentRecord(agentSegment, { agentMap });
+    if (!selected.ok) return selected;
+    const agentDataDir = await resolveAgentDataPathAsync(selected.record.agentName, {
+        workspaceRoot, label: 'blob agent name', check,
+    });
+    check();
+    const blobsDir = await assertCanonicalAgentDataPathAsync(path.join(agentDataDir, 'blobs'), { workspaceRoot, check });
+    check();
+    return agentRecordResult(agentSegment, selected.record, blobsDir, workspaceRoot);
+}
+
 function resolveSharedRecord() {
-    const sharedDir = ensureSharedHostDir();
+    const sharedDir = SHARED_DIR;
     return {
         ok: true,
         agent: {
@@ -133,9 +147,19 @@ function resolveSharedRecord() {
             repoName: null,
             projectPath: sharedDir,
             blobsDir: sharedDir,
+            workspaceRoot: getWorkspaceRoot(),
             isShared: true
         }
     };
+}
+
+function resolveAgentRecordForUpload(agentSegment) {
+    const selected = selectAgentRecord(agentSegment);
+    if (!selected.ok) return selected;
+    const workspaceRoot = getWorkspaceRoot();
+    const key = validateAgentDataKey(selected.record.agentName, { label: 'blob agent name' });
+    return agentRecordResult(agentSegment, selected.record,
+        path.join(workspaceRoot, '.data', key, 'blobs'), workspaceRoot);
 }
 
 function getRouteUrl(agent, id) {
@@ -154,17 +178,26 @@ function getLocalPath(agent, id) {
     return `.data/${agent.canonicalName}/blobs/${id}`;
 }
 
-function ensureAgentBlobsDir(agent) {
+async function ensureAgentBlobsDirAsync(agent, check) {
     if (agent?.isShared) {
-        try { fs.mkdirSync(agent.blobsDir, { recursive: true }); } catch (_) { }
+        if (agent.workspaceRoot) {
+            await ensureAgentDataDirectoryAsync(agent.blobsDir, { workspaceRoot: agent.workspaceRoot, check });
+            check();
+            return;
+        }
+        await fs.promises.mkdir(agent.blobsDir, { recursive: true });
+        check();
         return;
     }
-    const agentDataDir = path.dirname(agent.blobsDir);
-    const pathOptions = agent.workspaceRoot ? { workspaceRoot: agent.workspaceRoot } : {};
-    ensureAgentDataDirectory(agentDataDir, pathOptions);
-    assertCanonicalAgentDataPath(agent.blobsDir, pathOptions);
-    fs.mkdirSync(agent.blobsDir, { recursive: true });
-    assertCanonicalAgentDataPath(agent.blobsDir, pathOptions);
+    const pathOptions = { workspaceRoot: agent.workspaceRoot, check };
+    await ensureAgentDataDirectoryAsync(path.dirname(agent.blobsDir), pathOptions);
+    check();
+    await assertCanonicalAgentDataPathAsync(agent.blobsDir, pathOptions);
+    check();
+    await fs.promises.mkdir(agent.blobsDir, { recursive: true });
+    check();
+    await assertCanonicalAgentDataPathAsync(agent.blobsDir, pathOptions);
+    check();
 }
 
 function getAgentPaths(agent, id) {
@@ -175,30 +208,21 @@ function getAgentPaths(agent, id) {
     return { filePath, metaPath, id: safe };
 }
 
-function readMeta(agent, id) {
-    ensureAgentBlobsDir(agent);
-    const paths = getAgentPaths(agent, id);
-    if (!paths) return null;
-    try { return JSON.parse(fs.readFileSync(paths.metaPath, 'utf8')); } catch (_) { return null; }
-}
-
-function writeMeta(agent, id, meta) {
-    ensureAgentBlobsDir(agent);
+async function writeMeta(agent, id, meta) {
+    await ensureAgentBlobsDirAsync(agent, () => {});
     const paths = getAgentPaths(agent, id);
     if (!paths) return false;
     const temporaryPath = `${paths.metaPath}.${process.pid}.${crypto.randomBytes(8).toString('hex')}.tmp`;
     let committed = false;
     try {
-        fs.writeFileSync(temporaryPath, JSON.stringify(meta || {}, null, 2), { flag: 'wx' });
-        fs.linkSync(temporaryPath, paths.metaPath);
+        await fs.promises.writeFile(temporaryPath, JSON.stringify(meta || {}, null, 2), { flag: 'wx' });
+        await fs.promises.link(temporaryPath, paths.metaPath);
         committed = true;
-        fs.unlinkSync(temporaryPath);
+        await fs.promises.unlink(temporaryPath);
         return true;
     } catch (_) {
-        try { fs.unlinkSync(temporaryPath); } catch (_) { /* ignore */ }
-        if (committed) {
-            try { fs.unlinkSync(paths.metaPath); } catch (_) { /* ignore */ }
-        }
+        await fs.promises.unlink(temporaryPath).catch(() => {});
+        if (committed) await fs.promises.unlink(paths.metaPath).catch(() => {});
         return false;
     }
 }
@@ -277,22 +301,23 @@ function buildBlobUploadDetails(req, agent, id, originalName) {
     };
 }
 
-function handlePost(req, res, agent, { policy, timers } = {}) {
+async function handlePost(req, res, agent, { policy, timers } = {}) {
     try {
         const mime = req.headers['x-mime-type'] || req.headers['content-type'] || 'application/octet-stream';
         const id = newId();
-        ensureAgentBlobsDir(agent);
         const paths = getAgentPaths(agent, id);
         if (!paths) { res.writeHead(400); return res.end('Bad id'); }
         const originalName = parseUploadFilename(req);
         const details = buildBlobUploadDetails(req, agent, id, originalName);
-        return streamAdmittedUpload(req, {
+        return await streamAdmittedUpload(req, {
+            res,
+            prepare: check => ensureAgentBlobsDirAsync(agent, check),
             storageRoot: agent.blobsDir,
             targetPath: paths.filePath,
             policy: policy || UPLOAD_ROUTE_POLICIES.blobs,
             includeEntry: isBlobStorageEntry,
             timers,
-            finalize: ({ size }) => {
+            finalize: async ({ size }) => {
                 const meta = {
                     id,
                     mime,
@@ -304,11 +329,12 @@ function handlePost(req, res, agent, { policy, timers } = {}) {
                     localPath: details.localPath,
                     downloadUrl: details.absoluteUrl
                 };
-                if (!writeMeta(agent, id, meta)) {
+                if (!await writeMeta(agent, id, meta)) {
                     throw new Error('Unable to persist blob metadata.');
                 }
             },
             onSuccess: ({ size }) => {
+                if (res.headersSent || res.destroyed) return;
                 res.writeHead(201, { 'Content-Type': 'application/json', 'X-Content-Type-Options': 'nosniff' });
                 res.end(JSON.stringify({
                     id,
@@ -323,65 +349,81 @@ function handlePost(req, res, agent, { policy, timers } = {}) {
             onFailure: error => writeBlobUploadError(res, error),
         });
     } catch (e) {
-        res.writeHead(500); res.end('Upload error');
+        if (!res.headersSent && !res.destroyed) { res.writeHead(500); res.end('Upload error'); }
     }
 }
 
-function streamRange(req, res, filePath, meta) {
+async function handleGetHead(req, res, agent, id, isHead = false) {
+    let handle;
+    let streamStarted = false;
+    const gone = () => res.destroyed || res.writableEnded || req.aborted || req.readableAborted;
     try {
-        const stat = fs.statSync(filePath);
-        const size = stat.size;
-        const range = req.headers['range'];
-        if (range && /^bytes=/.test(range)) {
-            const m = range.match(/bytes=(\d+)-(\d+)?/);
-            if (m) {
-                const start = parseInt(m[1], 10);
-                const end = m[2] ? parseInt(m[2], 10) : size - 1;
-                if (start <= end && start < size) {
-                    res.writeHead(206, {
-                        'Content-Type': meta?.mime || 'application/octet-stream',
-                        'Content-Length': (end - start + 1),
-                        'Content-Range': `bytes ${start}-${end}/${size}`,
-                        'Accept-Ranges': 'bytes',
-                        'X-Content-Type-Options': 'nosniff'
-                    });
-                    return fs.createReadStream(filePath, { start, end }).pipe(res);
-                }
-            }
+        if (gone()) return;
+        const paths = getAgentPaths(agent, id);
+        if (!paths) { res.writeHead(400); return res.end('Bad id'); }
+        if (!agent.isShared || agent.workspaceRoot) {
+            await assertCanonicalAgentDataPathAsync(agent.blobsDir, {
+                workspaceRoot: agent.workspaceRoot,
+                check: () => { if (gone()) throw new Error('Download disconnected'); },
+            });
+            if (gone()) return;
         }
-        // Full response
-        res.writeHead(200, {
+        let meta = {};
+        try { meta = JSON.parse(await fs.promises.readFile(paths.metaPath, 'utf8')); } catch (_) { /* optional */ }
+        if (gone()) return;
+        handle = await fs.promises.open(paths.filePath, 'r');
+        if (gone()) return;
+        const stat = await handle.stat();
+        if (gone()) return;
+        if (!stat.isFile()) { res.writeHead(404); return res.end('Not Found'); }
+        const size = stat.size;
+        let start = 0;
+        let end = size - 1;
+        let status = 200;
+        const headers = {
             'Content-Type': meta?.mime || 'application/octet-stream',
             'Content-Length': size,
             'Accept-Ranges': 'bytes',
-            'X-Content-Type-Options': 'nosniff'
-        });
-        fs.createReadStream(filePath).pipe(res);
-    } catch (e) {
-        res.writeHead(500); res.end('Read error');
-    }
-}
-
-function handleGetHead(req, res, agent, id, isHead = false) {
-    try {
-        ensureAgentBlobsDir(agent);
-        const paths = getAgentPaths(agent, id);
-        if (!paths) { res.writeHead(400); return res.end('Bad id'); }
-        const meta = readMeta(agent, id) || {};
-        if (!fs.existsSync(paths.filePath)) { res.writeHead(404); return res.end('Not Found'); }
-        if (req.method === 'HEAD' || isHead) {
-            const stat = fs.statSync(paths.filePath);
-            res.writeHead(200, {
-                'Content-Type': meta?.mime || 'application/octet-stream',
-                'Content-Length': stat.size,
-                'Accept-Ranges': 'bytes',
-                'X-Content-Type-Options': 'nosniff'
-            });
-            return res.end();
+            'X-Content-Type-Options': 'nosniff',
+        };
+        if (!isHead && req.method !== 'HEAD') {
+            const range = req.headers?.range;
+            const match = range && /^bytes=/.test(range) && range.match(/bytes=(\d+)-(\d+)?/);
+            if (match) {
+                start = Number(match[1]);
+                end = match[2] ? Math.min(Number(match[2]), size - 1) : size - 1;
+                if (start >= size) {
+                    res.writeHead(416, { 'Content-Range': `bytes */${size}` });
+                    return res.end();
+                }
+                if (start <= end) {
+                    status = 206;
+                    headers['Content-Length'] = end - start + 1;
+                    headers['Content-Range'] = `bytes ${start}-${end}/${size}`;
+                } else {
+                    start = 0;
+                    end = size - 1;
+                }
+            }
         }
-        return streamRange(req, res, paths.filePath, meta);
-    } catch (e) {
-        res.writeHead(500); res.end('Error');
+        if (gone()) return;
+        res.writeHead(status, headers);
+        if (isHead || req.method === 'HEAD' || size === 0) return res.end();
+        const stream = handle.createReadStream({ start, end, autoClose: true });
+        streamStarted = true;
+        const onClose = () => stream.destroy();
+        res.on('close', onClose);
+        stream.once('close', () => res.off('close', onClose));
+        stream.on('error', () => res.destroy());
+        if (gone()) stream.destroy();
+        else stream.pipe(res);
+    } catch (error) {
+        if (!gone() && !res.headersSent) {
+            res.writeHead(error?.code === 'ENOENT' || error?.code === 'ENOTDIR' ? 404 : 500);
+            res.end(error?.code === 'ENOENT' || error?.code === 'ENOTDIR' ? 'Not Found' : 'Error');
+        }
+    } finally {
+        if (handle && !streamStarted) await handle.close().catch(() => {});
     }
 }
 
@@ -392,7 +434,7 @@ function resolveWorkspaceUploadPath(inputPath, workspaceRoot = getWorkspaceRoot(
     });
 }
 
-function handleWorkspaceUpload(req, res, { policy, timers, workspaceRoot } = {}) {
+async function handleWorkspaceUpload(req, res, { policy, timers, workspaceRoot } = {}) {
     if (req.method !== 'POST' && req.method !== 'PUT') {
         res.writeHead(405, { 'Content-Type': 'application/json', Allow: 'POST, PUT' });
         res.end(JSON.stringify({ ok: false, error: 'Method not allowed' }));
@@ -404,14 +446,20 @@ function handleWorkspaceUpload(req, res, { policy, timers, workspaceRoot } = {})
         const quotaRoot = path.resolve(workspaceRoot || getWorkspaceRoot());
         const targetPath = resolveWorkspaceUploadPath(u.searchParams.get('path') || '', quotaRoot);
         const parentDir = path.dirname(targetPath);
-        fs.mkdirSync(parentDir, { recursive: true });
-        return streamAdmittedUpload(req, {
+        return await streamAdmittedUpload(req, {
+            res,
+            prepare: async check => {
+                await fs.promises.mkdir(parentDir, { recursive: true });
+                check();
+                return { targetPath: resolveWorkspaceUploadPath(u.searchParams.get('path') || '', quotaRoot) };
+            },
             storageRoot: quotaRoot,
             targetPath,
             policy: policy || UPLOAD_ROUTE_POLICIES.workspace,
             replaceExisting: true,
             timers,
             onSuccess: ({ size }) => {
+                if (res.headersSent || res.destroyed) return;
                 res.writeHead(200, { 'Content-Type': 'application/json', 'X-Content-Type-Options': 'nosniff' });
                 res.end(JSON.stringify({
                     ok: true,
@@ -439,7 +487,7 @@ function handleWorkspaceUpload(req, res, { policy, timers, workspaceRoot } = {})
     }
 }
 
-function handleBlobs(req, res, options = {}) {
+async function handleBlobs(req, res, options = {}) {
     const u = new URL(req.url || '/blobs', `http://${req.headers.host || 'localhost'}`);
     const pathname = u.pathname || '/blobs';
     const segments = pathname.split('/').filter(Boolean);
@@ -458,7 +506,7 @@ function handleBlobs(req, res, options = {}) {
 
     if (req.method === 'POST' && segments.length === 2) {
         const agentSegment = segments[1];
-        const resolver = options.agentRecordResolver || resolveAgentRecord;
+        const resolver = options.agentRecordResolver || resolveAgentRecordForUpload;
         const resolved = resolver(agentSegment);
         if (!resolved.ok) {
             res.writeHead(resolved.status, { 'Content-Type': 'text/plain' });
@@ -477,14 +525,29 @@ function handleBlobs(req, res, options = {}) {
         if (!safeId) {
             res.writeHead(400); return res.end('Bad id');
         }
-        const resolved = resolveSharedRecord();
+        const resolved = (options.sharedRecordResolver || resolveSharedRecord)();
         return handleGetHead(req, res, resolved.agent, safeId, req.method === 'HEAD');
     }
 
     if ((req.method === 'GET' || req.method === 'HEAD') && segments.length === 3) {
         const agentSegment = segments[1];
         const idSegment = segments[2];
-        const resolved = resolveAgentRecord(agentSegment);
+        if (res.destroyed || res.writableEnded) return;
+        let resolved;
+        try {
+            resolved = await (options.agentRecordResolver || resolveAgentRecordAsync)(agentSegment, {
+                check: () => {
+                    if (res.destroyed || res.writableEnded) throw new Error('Download disconnected');
+                },
+            });
+        } catch (_) {
+            if (!res.destroyed && !res.writableEnded && !res.headersSent) {
+                res.writeHead(500);
+                res.end('Error');
+            }
+            return;
+        }
+        if (res.destroyed || res.writableEnded) return;
         if (!resolved.ok) {
             res.writeHead(resolved.status, { 'Content-Type': 'text/plain' });
             res.end(resolved.message);

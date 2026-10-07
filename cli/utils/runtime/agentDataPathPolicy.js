@@ -144,6 +144,140 @@ export function ensureAgentDataDirectory(target, {
     return resolvedTarget;
 }
 
+async function pathEntryExistsAsync(target, check) {
+    try {
+        await fs.promises.lstat(target);
+        check();
+        return true;
+    } catch (error) {
+        check();
+        if (error?.code === 'ENOENT') return false;
+        throw error;
+    }
+}
+
+export async function projectedCanonicalPathAsync(target, { check = () => {} } = {}) {
+    const resolvedTarget = path.resolve(target);
+    let existing = resolvedTarget;
+    while (!await pathEntryExistsAsync(existing, check)) {
+        check();
+        const parent = path.dirname(existing);
+        if (parent === existing) {
+            throw policyError(`storage path '${resolvedTarget}' has no existing canonical ancestor`);
+        }
+        existing = parent;
+    }
+    check();
+    let canonicalExisting;
+    try {
+        canonicalExisting = await fs.promises.realpath(existing);
+    } catch (error) {
+        check();
+        throw policyError(`storage path '${resolvedTarget}' cannot be canonicalized`, {
+            target: resolvedTarget,
+            existing,
+            cause: String(error?.code || ''),
+        });
+    }
+    check();
+    const suffix = path.relative(existing, resolvedTarget);
+    return suffix ? path.resolve(canonicalExisting, suffix) : canonicalExisting;
+}
+
+async function rejectSymlinkComponentsAsync(root, target, check) {
+    const relative = path.relative(root, target);
+    const components = relative ? relative.split(path.sep).filter(Boolean) : [];
+    let cursor = root;
+    for (const component of ['', ...components]) {
+        if (component) cursor = path.join(cursor, component);
+        try {
+            const stat = await fs.promises.lstat(cursor);
+            check();
+            if (stat.isSymbolicLink()) {
+                throw policyError(`storage path '${target}' contains symlink component '${cursor}'`, {
+                    target,
+                    symlink: cursor,
+                });
+            }
+        } catch (error) {
+            check();
+            if (error?.code === 'ENOENT') break;
+            throw error;
+        }
+    }
+}
+
+export async function assertCanonicalAgentDataPathAsync(target, {
+    workspaceRoot,
+    allowDataRoot = false,
+    check = () => {},
+} = {}) {
+    const root = resolvePolicyWorkspaceRoot(workspaceRoot);
+    const dataRoot = path.join(root, '.data');
+    const resolvedTarget = path.resolve(target);
+    if (!isPathWithin(resolvedTarget, dataRoot) || (!allowDataRoot && resolvedTarget === dataRoot)) {
+        throw policyError(`agent storage path '${target}' must stay beneath '${dataRoot}'`, {
+            target: resolvedTarget,
+            dataRoot,
+        });
+    }
+    await rejectSymlinkComponentsAsync(dataRoot, resolvedTarget, check);
+    check();
+    const canonicalDataRoot = await projectedCanonicalPathAsync(dataRoot, { check });
+    check();
+    const canonicalTarget = await projectedCanonicalPathAsync(resolvedTarget, { check });
+    check();
+    if (!isPathWithin(canonicalTarget, canonicalDataRoot)
+        || (!allowDataRoot && canonicalTarget === canonicalDataRoot)) {
+        throw policyError(`agent storage path '${target}' escapes canonical data root '${dataRoot}'`, {
+            target: resolvedTarget,
+            canonicalTarget,
+            dataRoot,
+            canonicalDataRoot,
+        });
+    }
+    return resolvedTarget;
+}
+
+export async function resolveAgentDataPathAsync(key, {
+    workspaceRoot,
+    label = 'storage key',
+    check = () => {},
+} = {}) {
+    const safeKey = validateAgentDataKey(key, { label });
+    const root = resolvePolicyWorkspaceRoot(workspaceRoot);
+    return assertCanonicalAgentDataPathAsync(path.join(root, '.data', safeKey), {
+        workspaceRoot: root,
+        check,
+    });
+}
+
+export async function ensureAgentDataDirectoryAsync(target, {
+    workspaceRoot,
+    mode,
+    check = () => {},
+} = {}) {
+    const root = resolvePolicyWorkspaceRoot(workspaceRoot);
+    const resolvedTarget = await assertCanonicalAgentDataPathAsync(target, { workspaceRoot: root, check });
+    check();
+    const dataRoot = path.join(root, '.data');
+    await assertCanonicalAgentDataPathAsync(dataRoot, { workspaceRoot: root, allowDataRoot: true, check });
+    check();
+    await fs.promises.mkdir(dataRoot, { recursive: true });
+    check();
+    await assertCanonicalAgentDataPathAsync(resolvedTarget, { workspaceRoot: root, check });
+    check();
+    await fs.promises.mkdir(resolvedTarget, { recursive: true });
+    check();
+    await assertCanonicalAgentDataPathAsync(resolvedTarget, { workspaceRoot: root, check });
+    check();
+    if (typeof mode === 'number') {
+        await fs.promises.chmod(resolvedTarget, mode);
+        check();
+    }
+    return resolvedTarget;
+}
+
 function canonicalProtectedPath(root) {
     try {
         return projectedCanonicalPath(root);

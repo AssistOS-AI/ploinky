@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { projectedCanonicalPathAsync } from '../../utils/runtime/agentDataPathPolicy.js';
 const MEBIBYTE = 1024 * 1024;
 const GIBIBYTE = 1024 * MEBIBYTE;
 export const UPLOAD_ROUTE_POLICIES = Object.freeze({
@@ -186,9 +187,9 @@ function inspectStorage(storageRoot, {
     }
     return { files, bytes };
 }
-function readTargetState(targetPath, replaceExisting) {
+async function readTargetState(targetPath, replaceExisting) {
     try {
-        const stat = fs.lstatSync(targetPath);
+        const stat = await fs.promises.lstat(targetPath);
         if (!replaceExisting || !stat.isFile()) {
             throw uploadError(409, 'upload_target_exists');
         }
@@ -211,9 +212,9 @@ function readTargetState(targetPath, replaceExisting) {
         return { exists: false, bytes: 0, identity: null };
     }
 }
-function targetStillMatches(reservation) {
+async function targetStillMatches(reservation) {
     try {
-        const stat = fs.lstatSync(reservation.targetPath);
+        const stat = await fs.promises.lstat(reservation.targetPath);
         if (!reservation.targetState.exists || !stat.isFile()) return false;
         const expected = reservation.targetState.identity;
         return stat.dev === expected.dev
@@ -234,78 +235,128 @@ function assertQuota(policy, inventory, active, fileDelta, byteDelta) {
     }
 }
 
-function reserveUpload({
-    req,
-    storageRoot,
-    targetPath,
-    policy,
-    replaceExisting,
-    includeEntry,
-    includeDirectory,
-}) {
-    const normalizedPolicy = validatePolicy(policy);
-    let normalizedRoot;
+const tailsByStorageRoot = new Map();
+
+function captureStorageRootIdentity(storageRoot) {
+    const requestedRoot = path.resolve(storageRoot);
+    let ancestorRequested = requestedRoot;
     try {
-        normalizedRoot = fs.realpathSync(path.resolve(storageRoot));
+        while (true) {
+            try {
+                fs.lstatSync(ancestorRequested);
+                break;
+            } catch (error) {
+                if (error?.code !== 'ENOENT') throw error;
+                const parent = path.dirname(ancestorRequested);
+                if (parent === ancestorRequested) throw error;
+                ancestorRequested = parent;
+            }
+        }
+        const ancestorCanonical = fs.realpathSync.native(ancestorRequested);
+        const stat = fs.lstatSync(ancestorCanonical);
+        if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('Invalid storage ancestor');
+        const suffix = path.relative(ancestorRequested, requestedRoot);
+        return Object.freeze({
+            requestedRoot,
+            canonicalRoot: suffix ? path.resolve(ancestorCanonical, suffix) : ancestorCanonical,
+            ancestorRequested,
+            ancestorCanonical,
+            ancestorDev: stat.dev,
+            ancestorIno: stat.ino,
+        });
     } catch (_) {
         throw uploadError(507, 'storage_inventory_unavailable');
     }
-    let normalizedTarget;
+}
+
+async function verifyStorageRootIdentity(identity, { requireRoot, check }) {
     try {
-        const resolvedTarget = path.resolve(targetPath);
-        normalizedTarget = path.join(
-            fs.realpathSync(path.dirname(resolvedTarget)),
-            path.basename(resolvedTarget),
-        );
+        const ancestor = await fs.promises.realpath(identity.ancestorRequested);
+        check();
+        if (ancestor !== identity.ancestorCanonical) throw new Error('Storage ancestor changed');
+        const stat = await fs.promises.lstat(identity.ancestorCanonical);
+        check();
+        if (!stat.isDirectory() || stat.isSymbolicLink()
+            || stat.dev !== identity.ancestorDev || stat.ino !== identity.ancestorIno) {
+            throw new Error('Storage ancestor replaced');
+        }
+        const root = requireRoot
+            ? await fs.promises.realpath(identity.requestedRoot)
+            : await projectedCanonicalPathAsync(identity.requestedRoot, { check });
+        check();
+        if (root !== identity.canonicalRoot) throw new Error('Storage root changed');
     } catch (_) {
+        check();
         throw uploadError(507, 'storage_inventory_unavailable');
     }
-    const relativeTarget = path.relative(normalizedRoot, normalizedTarget);
-    if (!relativeTarget || relativeTarget.startsWith('..') || path.isAbsolute(relativeTarget)) {
-        throw uploadError(400, 'upload_target_outside_storage');
-    }
+}
 
-    const contentLength = readContentLength(req);
-    if (contentLength !== null && contentLength > normalizedPolicy.maxBytes) {
-        throw uploadError(413, 'upload_too_large');
-    }
+// Install the nonrejecting tail synchronously: arrival order survives every await.
+function withStorageRootLock(storageRoot, fn) {
+    const previous = tailsByStorageRoot.get(storageRoot) || Promise.resolve();
+    const result = previous.then(fn);
+    const tail = result.catch(() => {}).then(() => {
+        if (tailsByStorageRoot.get(storageRoot) === tail) tailsByStorageRoot.delete(storageRoot);
+    });
+    tailsByStorageRoot.set(storageRoot, tail);
+    return result;
+}
 
-    for (const active of activeByStorageRoot.get(normalizedRoot) || []) {
-        if (active.targetPath === normalizedTarget) {
-            throw uploadError(409, 'upload_target_busy');
+async function inspectStorageAsync(storageRoot, {
+    ignoredPaths, includeEntry, includeDirectory, policy, check = () => {},
+} = {}) {
+    let rootStat;
+    try {
+        rootStat = await fs.promises.lstat(storageRoot);
+    } catch (error) {
+        check();
+        if (error?.code === 'ENOENT') return { files: 0, bytes: 0 };
+        throw uploadError(507, 'storage_inventory_unavailable');
+    }
+    check();
+    if (!rootStat.isDirectory()) throw uploadError(507, 'storage_inventory_unavailable');
+    let files = 0;
+    let bytes = 0;
+    const stack = [storageRoot];
+    while (stack.length) {
+        const directory = stack.pop();
+        let names;
+        try { names = await fs.promises.readdir(directory); } catch (_) {
+            check();
+            throw uploadError(507, 'storage_inventory_unavailable');
+        }
+        check();
+        for (let offset = 0; offset < names.length; offset += 16) {
+            const entries = names.slice(offset, offset + 16)
+                .map(name => path.join(directory, name))
+                .filter(absolutePath => !ignoredPaths?.has(path.resolve(absolutePath)));
+            const results = await Promise.allSettled(entries.map(entry => fs.promises.lstat(entry)));
+            check();
+            // Fold in the original order, including errors, before visiting LIFO children.
+            for (let index = 0; index < entries.length; index += 1) {
+                const result = results[index];
+                if (result.status === 'rejected') throw uploadError(507, 'storage_inventory_unavailable');
+                const absolutePath = entries[index];
+                const stat = result.value;
+                const relativePath = path.relative(storageRoot, absolutePath);
+                if (stat.isDirectory() && !stat.isSymbolicLink()) {
+                    if (!includeDirectory || includeDirectory({ absolutePath, relativePath, stat })) {
+                        stack.push(absolutePath);
+                    }
+                    continue;
+                }
+                if (includeEntry && !includeEntry({ absolutePath, relativePath, stat })) continue;
+                files += 1;
+                bytes += stat.size;
+                if (!Number.isSafeInteger(bytes)) throw uploadError(507, 'storage_inventory_unavailable');
+                if (policy && files > policy.maxFiles) throw uploadError(507, 'upload_count_quota_exceeded');
+                if (policy && bytes > policy.maxStorageBytes) {
+                    throw uploadError(507, 'upload_storage_quota_exceeded');
+                }
+            }
         }
     }
-
-    const targetState = readTargetState(normalizedTarget, replaceExisting);
-    let fileDelta = 0;
-    let reservedBytes = 0;
-    if (hasStorageQuota(normalizedPolicy)) {
-        fileDelta = targetState.exists ? 0 : 1;
-        reservedBytes = contentLength === null ? normalizedPolicy.maxBytes : contentLength;
-        const active = activeTotals(normalizedRoot);
-        const inventory = inspectStorage(normalizedRoot, {
-            ignoredPaths: active.ignoredPaths,
-            includeEntry,
-            includeDirectory,
-            policy: normalizedPolicy,
-        });
-        assertQuota(normalizedPolicy, inventory, active, fileDelta, reservedBytes);
-    }
-
-    const reservation = {
-        storageRoot: normalizedRoot,
-        targetPath: normalizedTarget,
-        targetState,
-        fileDelta,
-        reservedBytes,
-        contentLength,
-        policy: normalizedPolicy,
-        includeEntry,
-        includeDirectory,
-        temporaryPath: null,
-    };
-    activeState(normalizedRoot).add(reservation);
-    return reservation;
+    return { files, bytes };
 }
 
 function makeTemporaryPath(targetPath) {
@@ -315,35 +366,92 @@ function makeTemporaryPath(targetPath) {
     );
 }
 
-function verifyFinalQuota(reservation, size) {
-    if (!targetStillMatches(reservation)) {
-        throw uploadError(409, 'upload_target_changed');
+async function reserveUpload({
+    req, storageRoot, targetPath, policy, replaceExisting, includeEntry, includeDirectory, check, rootIdentity,
+}) {
+    let normalizedRoot;
+    try { normalizedRoot = await fs.promises.realpath(storageRoot); } catch (_) {
+        check();
+        throw uploadError(507, 'storage_inventory_unavailable');
     }
+    check();
+    if (normalizedRoot !== storageRoot) throw uploadError(507, 'storage_inventory_unavailable');
+    const resolvedTarget = path.resolve(targetPath);
+    let parent;
+    try { parent = await fs.promises.realpath(path.dirname(resolvedTarget)); } catch (_) {
+        check();
+        throw uploadError(507, 'storage_inventory_unavailable');
+    }
+    check();
+    const normalizedTarget = path.join(parent, path.basename(resolvedTarget));
+    const relativeTarget = path.relative(normalizedRoot, normalizedTarget);
+    if (!relativeTarget || relativeTarget.startsWith('..') || path.isAbsolute(relativeTarget)) {
+        throw uploadError(400, 'upload_target_outside_storage');
+    }
+    const contentLength = readContentLength(req);
+    if (contentLength !== null && contentLength > policy.maxBytes) throw uploadError(413, 'upload_too_large');
+    for (const active of activeByStorageRoot.get(normalizedRoot) || []) {
+        if (active.targetPath === normalizedTarget) throw uploadError(409, 'upload_target_busy');
+    }
+    const targetState = await readTargetState(normalizedTarget, replaceExisting);
+    check();
+    let fileDelta = 0;
+    let reservedBytes = 0;
+    if (hasStorageQuota(policy)) {
+        fileDelta = targetState.exists ? 0 : 1;
+        reservedBytes = contentLength === null ? policy.maxBytes : contentLength;
+        const active = activeTotals(normalizedRoot);
+        const inventory = await inspectStorageAsync(normalizedRoot, {
+            ignoredPaths: active.ignoredPaths, includeEntry, includeDirectory, policy, check,
+        });
+        check();
+        assertQuota(policy, inventory, active, fileDelta, reservedBytes);
+    }
+    await verifyStorageRootIdentity(rootIdentity, { requireRoot: true, check });
+    check();
+    const reservation = {
+        storageRoot: normalizedRoot, targetPath: normalizedTarget, targetState,
+        fileDelta, reservedBytes, contentLength, policy, includeEntry, includeDirectory,
+        temporaryPath: makeTemporaryPath(normalizedTarget), linkedByThisUpload: false,
+    };
+    activeState(normalizedRoot).add(reservation);
+    return reservation;
+}
+
+async function verifyFinalQuota(reservation, size, check) {
+    const matches = await targetStillMatches(reservation);
+    check();
+    if (!matches) throw uploadError(409, 'upload_target_changed');
     if (!hasStorageQuota(reservation.policy)) return;
     const active = activeTotals(reservation.storageRoot, reservation);
-    const inventory = inspectStorage(reservation.storageRoot, {
+    const inventory = await inspectStorageAsync(reservation.storageRoot, {
         ignoredPaths: active.ignoredPaths,
         includeEntry: reservation.includeEntry,
         includeDirectory: reservation.includeDirectory,
         policy: reservation.policy,
+        check,
     });
+    check();
     assertQuota(reservation.policy, inventory, active, reservation.fileDelta, size);
+    // Inventory awaits let non-upload writers run; do not replace a changed target.
+    const stillMatches = await targetStillMatches(reservation);
+    check();
+    if (!stillMatches) throw uploadError(409, 'upload_target_changed');
 }
 
-function commitTemporary(reservation) {
+async function commitTemporary(reservation) {
     if (reservation.targetState.exists) {
-        fs.renameSync(reservation.temporaryPath, reservation.targetPath);
+        await fs.promises.rename(reservation.temporaryPath, reservation.targetPath);
         return;
     }
-    fs.linkSync(reservation.temporaryPath, reservation.targetPath);
     try {
-        fs.unlinkSync(reservation.temporaryPath);
+        await fs.promises.link(reservation.temporaryPath, reservation.targetPath);
     } catch (error) {
-        if (!removePartial(reservation.targetPath)) {
-            throw uploadError(500, 'upload_cleanup_failed');
-        }
+        if (error?.code === 'EEXIST') throw uploadError(409, 'upload_target_changed');
         throw error;
     }
+    reservation.linkedByThisUpload = true;
+    await fs.promises.unlink(reservation.temporaryPath);
 }
 
 function normalizeFailure(error) {
@@ -354,191 +462,202 @@ function normalizeFailure(error) {
     return uploadError(500, 'upload_write_failed');
 }
 
-function removePartial(filePath) {
+async function removePartial(filePath) {
     if (!filePath) return true;
-    try { fs.unlinkSync(filePath); } catch (error) {
+    try { await fs.promises.unlink(filePath); } catch (error) {
         return error?.code === 'ENOENT';
     }
     return true;
 }
 
-export function streamAdmittedUpload(req, {
-    storageRoot,
-    targetPath,
-    policy,
-    replaceExisting = false,
-    includeEntry,
-    includeDirectory,
-    timers = {},
-    finalize,
-    onSuccess,
-    onFailure,
+export async function streamAdmittedUpload(req, {
+    storageRoot, targetPath, policy, replaceExisting = false, includeEntry, includeDirectory,
+    timers = {}, prepare, finalize, onSuccess, onFailure, res,
 } = {}) {
-    const now = timers.now || Date.now;
-    const startedAt = now();
     let reservation;
-    try {
-        reservation = reserveUpload({
-            req,
-            storageRoot,
-            targetPath,
-            policy,
-            replaceExisting,
-            includeEntry,
-            includeDirectory,
-        });
-    } catch (error) {
-        try { req.resume?.(); } catch (_) { /* ignore */ }
-        onFailure?.(normalizeFailure(error));
-        return { accepted: false };
-    }
-
-    const setTimer = timers.setTimeout || globalThis.setTimeout;
-    const clearTimer = timers.clearTimeout || globalThis.clearTimeout;
-    reservation.temporaryPath = makeTemporaryPath(reservation.targetPath);
-
-    const elapsedMs = Math.max(0, now() - startedAt);
-    if (elapsedMs >= reservation.policy.timeoutMs) {
-        releaseReservation(reservation);
-        try { req.resume?.(); } catch (_) { /* ignore */ }
-        onFailure?.(uploadError(408, 'upload_timeout'));
-        return { accepted: false };
-    }
-
-    let fileDescriptor;
-    try {
-        fileDescriptor = fs.openSync(reservation.temporaryPath, 'wx');
-        if (reservation.targetState.exists) {
-            fs.fchmodSync(fileDescriptor, reservation.targetState.identity.mode & 0o777);
-        }
-    } catch (error) {
-        if (fileDescriptor !== undefined) {
-            try { fs.closeSync(fileDescriptor); } catch (_) { /* ignore */ }
-        }
-        const cleanupSucceeded = removePartial(reservation.temporaryPath);
-        releaseReservation(reservation);
-        try { req.resume?.(); } catch (_) { /* ignore */ }
-        onFailure?.(cleanupSucceeded
-            ? normalizeFailure(error)
-            : uploadError(500, 'upload_cleanup_failed'));
-        return { accepted: false };
-    }
-
+    let handle;
+    let output;
     let completed = false;
+    let committing = false;
     let terminalError = null;
     let streamFinished = false;
+    let bodyAttached = false;
+    let bodyEnded = false;
     let size = 0;
     let timeoutHandle = null;
-    const output = fs.createWriteStream(reservation.temporaryPath, {
-        fd: fileDescriptor,
-        autoClose: true,
-    });
-
-    const detachRequestListeners = () => {
-        req.off('data', onData);
-        req.off('end', onEnd);
-        req.off('aborted', onAborted);
-        req.off('error', onRequestError);
-        output.off('drain', onDrain);
-    };
+    const clearTimer = timers.clearTimeout || globalThis.clearTimeout;
+    const startedAt = (timers.now || Date.now)();
     const clearUploadTimer = () => {
         if (timeoutHandle !== null) clearTimer(timeoutHandle);
         timeoutHandle = null;
     };
-    const fail = (error) => {
-        if (completed || terminalError) return;
+    const fail = error => {
+        if (completed || committing || terminalError) return;
         terminalError = normalizeFailure(error);
         clearUploadTimer();
-        detachRequestListeners();
+        if (output) output.destroy();
+    };
+    const check = () => {
+        if (committing) return;
+        // IncomingMessage is destroyed after normal end on current Node versions.
+        if ((!bodyEnded && req.destroyed) || req.readableAborted || req.aborted || res?.destroyed) {
+            fail(uploadError(400, 'upload_aborted'));
+        }
+        if ((timers.now || Date.now)() - startedAt >= policy.timeoutMs) {
+            fail(uploadError(408, 'upload_timeout'));
+        }
+        if (terminalError) throw terminalError;
+    };
+    const onAborted = () => fail(uploadError(400, 'upload_aborted'));
+    const onEarlyClose = () => { if (!bodyAttached) onAborted(); };
+    const onDrain = () => { if (!terminalError && !completed) req.resume?.(); };
+    const detach = () => {
+        req.off('aborted', onAborted);
+        req.off('error', onAborted);
+        req.off('close', onEarlyClose);
+        req.off('data', onData);
+        req.off('end', onEnd);
+        res?.off?.('close', onAborted);
+        output?.off('drain', onDrain);
+        clearUploadTimer();
+    };
+    const notify = async (callback, value) => {
+        try { await callback?.(value); } catch (_) { /* A response callback cannot change the committed result. */ }
+    };
+    const cleanupFailure = async error => {
+        // Rejected awaits skip their following check; cancellation still wins before commit.
+        if (!committing) {
+            try { check(); } catch (cancellation) { error = cancellation; }
+        }
+        completed = true;
+        detach();
+        if (handle && !output) await handle.close().catch(() => {});
+        const targetClean = !reservation?.linkedByThisUpload || await removePartial(reservation.targetPath);
+        const tempClean = await removePartial(reservation?.temporaryPath);
+        if (reservation) releaseReservation(reservation);
         try { req.resume?.(); } catch (_) { /* ignore */ }
-        try { output.destroy(); } catch (_) { /* ignore */ }
+        return targetClean && tempClean
+            ? normalizeFailure(error) : uploadError(500, 'upload_cleanup_failed');
     };
-    const onDrain = () => {
-        if (!completed && !terminalError) req.resume?.();
+    const finish = async () => {
+        if (completed) return;
+        let failure;
+        try {
+            await withStorageRootLock(storageRoot, async () => {
+                try {
+                    check();
+                    if (!streamFinished) throw uploadError(500, 'upload_write_failed');
+                    await verifyFinalQuota(reservation, size, check);
+                    check();
+                    // From this point, a timeout/reset cannot race the atomic commit.
+                    committing = true;
+                    clearUploadTimer();
+                    await commitTemporary(reservation);
+                    await finalize?.({ size, targetPath: reservation.targetPath });
+                    releaseReservation(reservation);
+                } catch (error) {
+                    // Cleanup is also serialized: another inventory must not race unlink.
+                    failure = await cleanupFailure(error);
+                }
+            });
+            if (failure) {
+                await notify(onFailure, failure);
+                return;
+            }
+            completed = true;
+            detach();
+            await notify(onSuccess, { size, targetPath: reservation.targetPath });
+        } catch (error) {
+            failure = await withStorageRootLock(storageRoot, () => cleanupFailure(error));
+            await notify(onFailure, failure);
+        }
     };
-    const onData = (chunk) => {
+    const onData = chunk => {
         if (completed || terminalError) return;
-        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-        const nextSize = size + buffer.length;
-        if (!Number.isSafeInteger(nextSize) || nextSize > reservation.policy.maxBytes) {
-            fail(uploadError(413, 'upload_too_large'));
-            return;
-        }
-        if (reservation.contentLength !== null && nextSize > reservation.contentLength) {
-            fail(uploadError(400, 'content_length_mismatch'));
-            return;
-        }
-        size = nextSize;
-        if (!output.write(buffer)) {
-            req.pause?.();
-            output.once('drain', onDrain);
-        }
+        try {
+            check();
+            const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+            const nextSize = size + buffer.length;
+            if (!Number.isSafeInteger(nextSize) || nextSize > policy.maxBytes) {
+                throw uploadError(413, 'upload_too_large');
+            }
+            if (reservation.contentLength !== null && nextSize > reservation.contentLength) {
+                throw uploadError(400, 'content_length_mismatch');
+            }
+            size = nextSize;
+            if (!output.write(buffer)) {
+                req.pause?.();
+                output.once('drain', onDrain);
+            }
+        } catch (error) { fail(error); }
     };
     const onEnd = () => {
         if (completed || terminalError) return;
+        bodyEnded = true;
         if (reservation.contentLength !== null && size !== reservation.contentLength) {
             fail(uploadError(400, 'content_length_mismatch'));
             return;
         }
         output.end();
     };
-    const onAborted = () => fail(uploadError(400, 'upload_aborted'));
-    const onRequestError = () => fail(uploadError(400, 'upload_aborted'));
 
-    output.once('error', (error) => fail(error));
-    output.once('finish', () => {
-        streamFinished = true;
-    });
-    output.once('close', () => {
-        if (completed) return;
-        if (terminalError || !streamFinished) {
-            completed = true;
-            clearUploadTimer();
-            detachRequestListeners();
-            const cleanupSucceeded = removePartial(reservation.temporaryPath);
-            releaseReservation(reservation);
-            onFailure?.(cleanupSucceeded
-                ? terminalError || uploadError(500, 'upload_write_failed')
-                : uploadError(500, 'upload_cleanup_failed'));
-            return;
-        }
-        try {
-            verifyFinalQuota(reservation, size);
-            commitTemporary(reservation);
-            finalize?.({ size, targetPath: reservation.targetPath });
-        } catch (error) {
-            let targetCleanupSucceeded = true;
-            if (!reservation.targetState.exists) {
-                targetCleanupSucceeded = removePartial(reservation.targetPath);
-            }
-            completed = true;
-            clearUploadTimer();
-            detachRequestListeners();
-            const cleanupSucceeded = removePartial(reservation.temporaryPath);
-            releaseReservation(reservation);
-            onFailure?.(cleanupSucceeded && targetCleanupSucceeded
-                ? normalizeFailure(error)
-                : uploadError(500, 'upload_cleanup_failed'));
-            return;
-        }
-        completed = true;
-        clearUploadTimer();
-        detachRequestListeners();
-        releaseReservation(reservation);
-        onSuccess?.({ size, targetPath: reservation.targetPath });
-    });
-
-    req.on('data', onData);
-    req.once('end', onEnd);
     req.once('aborted', onAborted);
-    req.once('error', onRequestError);
-    timeoutHandle = setTimer(
-        () => fail(uploadError(408, 'upload_timeout')),
-        reservation.policy.timeoutMs - elapsedMs,
-    );
-
-    return {
-        accepted: true,
-        abort: () => fail(uploadError(400, 'upload_aborted')),
-    };
+    req.once('error', onAborted);
+    req.once('close', onEarlyClose);
+    res?.once?.('close', onAborted);
+    try {
+        policy = validatePolicy(policy);
+        timeoutHandle = (timers.setTimeout || globalThis.setTimeout)(
+            () => fail(uploadError(408, 'upload_timeout')), policy.timeoutMs,
+        );
+        check();
+        const rootIdentity = captureStorageRootIdentity(storageRoot);
+        storageRoot = rootIdentity.canonicalRoot;
+        // Taking this ticket must precede preparation and every asynchronous operation.
+        await withStorageRootLock(storageRoot, async () => {
+            check();
+            await verifyStorageRootIdentity(rootIdentity, { requireRoot: false, check });
+            check();
+            if (prepare) {
+                const prepared = await prepare(check);
+                check();
+                if (prepared?.targetPath) targetPath = prepared.targetPath;
+            }
+            await verifyStorageRootIdentity(rootIdentity, { requireRoot: true, check });
+            check();
+            reservation = await reserveUpload({
+                req, storageRoot, targetPath, policy, replaceExisting, includeEntry, includeDirectory, check, rootIdentity,
+            });
+            check();
+        });
+        check();
+        handle = await fs.promises.open(reservation.temporaryPath, 'wx');
+        check();
+        if (reservation.targetState.exists) {
+            await handle.chmod(reservation.targetState.identity.mode & 0o777);
+            check();
+        }
+        output = handle.createWriteStream({ autoClose: true });
+        output.once('error', fail);
+        output.once('finish', () => { streamFinished = true; });
+        output.once('close', () => {
+            finish().catch(error => { void notify(onFailure, normalizeFailure(error)); });
+        });
+        check();
+        bodyAttached = true;
+        req.on('data', onData);
+        req.once('end', onEnd);
+        return { accepted: true, abort: onAborted };
+    } catch (error) {
+        const failure = reservation
+            ? await withStorageRootLock(storageRoot, () => cleanupFailure(error))
+            : await cleanupFailure(error);
+        await notify(onFailure, failure);
+        return { accepted: false };
+    }
 }
+
+export const __testables = {
+    inspectStorage, inspectStorageAsync, withStorageRootLock, activeByStorageRoot, tailsByStorageRoot,
+    captureStorageRootIdentity, verifyStorageRootIdentity,
+};
