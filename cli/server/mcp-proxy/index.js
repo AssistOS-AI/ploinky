@@ -4,6 +4,12 @@ import { sendJson, ensureAuthenticated } from '../authHandlers/index.js';
 import { createAgentClient } from '../AgentClient.js';
 import { waitForAgentReady } from '../utils/agentReadiness.js';
 import {
+    createUpstreamSessionPool,
+    isUpstreamPoolEnabled,
+    poolKeyForRoutePlan,
+    upstreamTimeoutForMethod,
+} from './upstreamSessionPool.js';
+import {
     buildRouterRequest,
     resolveProviderPrincipal,
     verifyAgentAssertion
@@ -12,7 +18,6 @@ import { buildMcpDelegationsForUserCall } from './mcpDelegations.js';
 import { computeRchTool } from '../../../Agent/lib/requestHash.mjs';
 import { createTokenReplayCache } from '../security/tokens/JwsCodec.js';
 import { sanitizeArgumentsForTool } from './toolArguments.js';
-import { getAgentDescriptorByPrincipal } from '../../utils/agentRegistry.js';
 import { policy } from '../policy/index.js';
 import { deriveSubkey } from '../../utils/security/masterKey.js';
 import { verifyUserDelegationGrant } from './userDelegationGrant.js';
@@ -29,6 +34,13 @@ const assertionReplayCache = createTokenReplayCache({ maxSize: 4096 });
 // Session store for agent MCP connections
 const agentSessionStore = new Map();
 const agentToolSchemaCache = new Map();
+
+// Router -> agent MCP sessions, one per exact agent instance (see
+// upstreamSessionPool.js). Closed on Router shutdown.
+const agentUpstreamSessionPool = createUpstreamSessionPool();
+// Methods that may be sent again through the SDK path after a pool mismatch
+// was detected on an already dispatched request.
+const IDEMPOTENT_UPSTREAM_METHODS = new Set(['tools/list', 'resources/list', 'ping']);
 
 /**
  * Read MCP session ID from request headers
@@ -53,16 +65,6 @@ function isSecureWireEnabled() {
     const flag = String(process.env.PLOINKY_SECURE_WIRE || '').trim().toLowerCase();
     if (flag === '0' || flag === 'false' || flag === 'off') return false;
     return true;
-}
-
-function resolveProviderAgentRef(agentName) {
-    // agentName is typically the short route name. Find the full repo/agent
-    // reference so the agent registry can resolve the provider principal.
-    try {
-        const descriptor = getAgentDescriptorByPrincipal(`agent:${agentName}`);
-        if (descriptor) return descriptor.agentRef;
-    } catch (_) {}
-    return agentName;
 }
 
 // Agent-to-agent calls arrive at /<agent>/mcp carrying an Agent Assertion as
@@ -111,15 +113,111 @@ function resolveGuestInvocationScope(req) {
     return guestScope ? [guestScope] : undefined;
 }
 
-async function getToolSchemasForAgent(agentName, agentClient) {
+// `upstream` is an agent client or the pooled caller from
+// createUpstreamMcpCaller; both expose listTools().
+async function getToolSchemasForAgent(agentName, upstream) {
     const now = Date.now();
     const cached = agentToolSchemaCache.get(agentName);
     if (cached && now - cached.loadedAt < TOOL_SCHEMA_CACHE_TTL_MS) {
         return cached.tools;
     }
-    const tools = await agentClient.listTools();
+    const tools = await upstream.listTools();
     agentToolSchemaCache.set(agentName, { loadedAt: now, tools });
     return tools;
+}
+
+function resolveUpstreamPoolKey({ pool, routePlan, route, beforeDial }) {
+    if (!pool || typeof beforeDial !== 'function' || !isUpstreamPoolEnabled()) return null;
+    const key = poolKeyForRoutePlan(routePlan);
+    if (!key) return null;
+    // The proxy dials route.hostPort; only pool when the plan names that port.
+    if (Number(route?.hostPort) !== Number(routePlan?.target?.hostPort)) return null;
+    return key;
+}
+
+function upstreamRpcError(error) {
+    // Same message shape as the SDK client's McpError.
+    const failure = new Error(`MCP error ${error?.code}: ${error?.message || 'upstream error'}`);
+    failure.rpcCode = error?.code;
+    return failure;
+}
+
+/**
+ * Upstream MCP calls for one proxied request: the pooled session when a pool
+ * key exists, otherwise (or after a pool mismatch) today's per-call SDK client.
+ * `mintHeaders` is called once per attempt so every attempt carries a new token.
+ */
+function createUpstreamMcpCaller({ baseUrl, hostPort, beforeDial, pool, poolKey, ensureReady }) {
+    let sharedClient = null;
+    const sdkClientOptions = (headers) => ({
+        ...(headers ? { requestHeaders: headers } : {}),
+        ...(beforeDial ? { beforeConnect: beforeDial } : {}),
+    });
+    const shared = () => {
+        if (!sharedClient) sharedClient = createAgentClient(baseUrl, sdkClientOptions(null));
+        return sharedClient;
+    };
+    const usePool = () => Boolean(pool && poolKey && !pool.usesFallback(poolKey));
+
+    async function withPool(method, params, headers, sdkPath) {
+        if (usePool()) {
+            try {
+                const message = await pool.request({
+                    key: poolKey,
+                    hostPort: Number(hostPort),
+                    method,
+                    params,
+                    headers,
+                    beforeDial,
+                    timeoutMs: upstreamTimeoutForMethod(method),
+                    ensureReady,
+                });
+                if (message.error) throw upstreamRpcError(message.error);
+                return { pooled: true, result: message.result };
+            } catch (error) {
+                // A mismatch falls back only when nothing non-idempotent ran.
+                const replayable = error?.dispatched === false || IDEMPOTENT_UPSTREAM_METHODS.has(method);
+                if (!(error?.poolMismatch && replayable)) throw error;
+            }
+        }
+        return { pooled: false, result: await sdkPath() };
+    }
+
+    async function withToolClient(mintHeaders, run) {
+        const client = createAgentClient(baseUrl, sdkClientOptions(mintHeaders()));
+        try {
+            return await run(client);
+        } finally {
+            await client.close().catch(() => {});
+        }
+    }
+
+    return {
+        async listTools() {
+            const { pooled, result } = await withPool('tools/list', {}, null, () => shared().listTools());
+            return pooled ? (Array.isArray(result?.tools) ? result.tools : []) : result;
+        },
+        async listResources() {
+            const { pooled, result } = await withPool('resources/list', {}, null, () => shared().listResources());
+            return pooled ? (Array.isArray(result?.resources) ? result.resources : []) : result;
+        },
+        async ping() {
+            return (await withPool('ping', {}, null, () => shared().ping())).result;
+        },
+        async callTool(name, args, mintHeaders) {
+            return (await withPool('tools/call', { name, arguments: args || {} }, mintHeaders,
+                () => withToolClient(mintHeaders, (client) => client.callTool(name, args)))).result;
+        },
+        async readResource(uri, mintHeaders) {
+            const { pooled, result } = await withPool('resources/read', { uri }, mintHeaders,
+                () => withToolClient(mintHeaders, (client) => client.readResource(uri)));
+            return pooled ? (result?.resource ?? result) : result;
+        },
+        async close() {
+            if (sharedClient) await sharedClient.close().catch(() => {});
+            sharedClient = null;
+        },
+    };
 }
 
 async function canonicalizeToolArguments(agentName, agentClient, toolName, args) {
@@ -292,7 +390,17 @@ export async function cancelAuthenticatedAgentTask({ req, route, agentName, task
     });
 }
 
-export function buildInvocationContextForProviderCall({ req, agentName, toolName, toolArgs, method = 'POST', path = '/mcp' }) {
+// `snapshot` is the request's edge-routing lease snapshot, when the caller has
+// one; the route key (`agentName`) is resolved to its provider principal.
+export function buildInvocationContextForProviderCall({
+    req,
+    agentName,
+    toolName,
+    toolArgs,
+    method = 'POST',
+    path = '/mcp',
+    snapshot = undefined,
+}) {
     if (!isSecureWireEnabled()) return null;
     const canonicalArgs = toolArgs && typeof toolArgs === 'object' && !Array.isArray(toolArgs) ? toolArgs : {};
     // rch binds the token to exactly the {method, path, tool, arguments} the
@@ -310,7 +418,7 @@ export function buildInvocationContextForProviderCall({ req, agentName, toolName
     if (delegated) {
         const caller = String(delegated.callerPrincipal || '');
         const targetAgentId = String(delegated.userDelegation?.delegation?.targetAgentId || '').trim()
-            || resolveProviderPrincipal({ providerAgentRef: resolveProviderAgentRef(agentName) });
+            || resolveProviderPrincipal({ providerAgentRef: agentName, snapshot });
         sub = caller;
         actor = { kind: 'agent', id: caller, roles: [] };
         const callerInfo = { kind: 'agent', id: caller, roles: ['agent'] };
@@ -329,7 +437,7 @@ export function buildInvocationContextForProviderCall({ req, agentName, toolName
         });
         return { token, payload, rch };
     } else {
-        const targetAgentId = resolveProviderPrincipal({ providerAgentRef: resolveProviderAgentRef(agentName) });
+        const targetAgentId = resolveProviderPrincipal({ providerAgentRef: agentName, snapshot });
         const user = extractDelegatedUser(req);
         sub = user?.id ? `user:${user.id}` : '';
         actor = { kind: actorKindForRequestUser(req.user), id: sub, roles: user?.roles || [] };
@@ -355,6 +463,7 @@ export function verifyDelegatedAgentToolCall({
     toolName,
     rawArgs = {},
     assertionCache = assertionReplayCache,
+    snapshot = undefined,
 }) {
     const rch = computeRchTool({ method: 'POST', path: '/mcp', tool: toolName, arguments: rawArgs });
     const verifiedAgent = verifyAgentAssertion({
@@ -370,7 +479,7 @@ export function verifyDelegatedAgentToolCall({
     if (!delegationToken) {
         return { ...verifiedAgent, userDelegation: null };
     }
-    const targetAgentId = resolveProviderPrincipal({ providerAgentRef: resolveProviderAgentRef(agentName) });
+    const targetAgentId = resolveProviderPrincipal({ providerAgentRef: agentName, snapshot });
     const userDelegation = verifyUserDelegationGrant({
         signingSecret: resolveUserDelegationSigningSecret(),
         token: delegationToken,
@@ -510,7 +619,13 @@ export async function handleDelegatedAgentTaskCancel({
 /**
  * Handle JSON-RPC requests to agent MCP endpoints
  */
-async function handleAgentJsonRpc(req, res, route, agentName, payload, { beforeDial = null } = {}) {
+async function handleAgentJsonRpc(req, res, route, agentName, payload, {
+    beforeDial = null,
+    pool = null,
+    poolKey = null,
+    ensureReady = null,
+    snapshot = undefined,
+} = {}) {
     const isBatch = Array.isArray(payload);
     const messages = isBatch ? payload : [payload];
     if (messages.length !== 1) {
@@ -576,7 +691,8 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, { beforeD
             req,
             agentName,
             toolName,
-            toolArgs: toolArgs || {}
+            toolArgs: toolArgs || {},
+            snapshot,
         });
         if (ctx?.token) {
             return { authorization: `Bearer ${ctx.token}` };
@@ -584,12 +700,18 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, { beforeD
         return null;
     }
 
-    const clientOptions = beforeDial ? { beforeConnect: beforeDial } : undefined;
-    const agentClient = createAgentClient(baseUrl, clientOptions);
+    const upstream = createUpstreamMcpCaller({
+        baseUrl,
+        hostPort: route.hostPort,
+        beforeDial,
+        pool,
+        poolKey,
+        ensureReady,
+    });
     try {
         switch (message.method) {
             case 'tools/list': {
-                const tools = await agentClient.listTools();
+                const tools = await upstream.listTools();
                 // Cache the full schema set for argument canonicalization, but only
                 // advertise the tools this caller is permitted to invoke.
                 agentToolSchemaCache.set(agentName, { loadedAt: Date.now(), tools });
@@ -602,7 +724,7 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, { beforeD
                 // session caller sees them, an internal/agent or anonymous
                 // caller sees an empty list (mirrors tools/list filtering).
                 const listDecision = policy.mcpToolPolicy.evaluateResource({ caller: policy.resolveCaller(req) });
-                const resources = listDecision.allow ? await agentClient.listResources() : [];
+                const resources = listDecision.allow ? await upstream.listResources() : [];
                 sendResponse(200, { jsonrpc: '2.0', id: message.id ?? null, result: { resources } }, sessionIdHeader);
                 break;
             }
@@ -623,22 +745,13 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, { beforeD
                 const args = argPayload && typeof argPayload === 'object' && !Array.isArray(argPayload)
                     ? { ...argPayload }
                     : {};
-                const canonicalArgs = await canonicalizeToolArguments(agentName, agentClient, name, args);
+                const canonicalArgs = await canonicalizeToolArguments(agentName, upstream, name, args);
 
-                // Mint a router-signed invocation token scoped to this tool call
-                // and open a short-lived client with that token in the header.
-                const toolHeaders = buildRequestHeadersForToolCall(name, canonicalArgs);
-                const toolClient = createAgentClient(baseUrl, {
-                    ...(toolHeaders ? { requestHeaders: toolHeaders } : {}),
-                    ...(beforeDial ? { beforeConnect: beforeDial } : {}),
-                });
-
-                try {
-                    const result = await toolClient.callTool(name, canonicalArgs);
-                    sendResponse(200, { jsonrpc: '2.0', id: message.id ?? null, result }, sessionIdHeader);
-                } finally {
-                    await toolClient.close().catch(() => {});
-                }
+                // Mint a router-signed invocation token scoped to this tool call,
+                // once per upstream attempt, and send it only in that request.
+                const result = await upstream.callTool(name, canonicalArgs,
+                    () => buildRequestHeadersForToolCall(name, canonicalArgs));
+                sendResponse(200, { jsonrpc: '2.0', id: message.id ?? null, result }, sessionIdHeader);
                 break;
             }
             case 'resources/read': {
@@ -654,21 +767,13 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, { beforeD
                     sendResponse(200, { jsonrpc: '2.0', id: message.id ?? null, error: { code: -32003, message: 'Access denied', data: { code: readDecision.code } } }, sessionIdHeader);
                     break;
                 }
-                const resourceHeaders = buildRequestHeadersForToolCall('resources/read', { uri });
-                const resourceClient = createAgentClient(baseUrl, {
-                    ...(resourceHeaders ? { requestHeaders: resourceHeaders } : {}),
-                    ...(beforeDial ? { beforeConnect: beforeDial } : {}),
-                });
-                try {
-                    const result = await resourceClient.readResource(uri);
-                    sendResponse(200, { jsonrpc: '2.0', id: message.id ?? null, result }, sessionIdHeader);
-                } finally {
-                    await resourceClient.close().catch(() => {});
-                }
+                const result = await upstream.readResource(uri,
+                    () => buildRequestHeadersForToolCall('resources/read', { uri }));
+                sendResponse(200, { jsonrpc: '2.0', id: message.id ?? null, result }, sessionIdHeader);
                 break;
             }
             case 'ping': {
-                await agentClient.ping();
+                await upstream.ping();
                 sendResponse(200, { jsonrpc: '2.0', id: message.id ?? null, result: {} }, sessionIdHeader);
                 break;
             }
@@ -676,10 +781,12 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, { beforeD
                 sendResponse(200, { jsonrpc: '2.0', id: message.id ?? null, error: { code: -32601, message: `Method not found: ${message.method}` } }, sessionIdHeader);
         }
     } catch (err) {
-        const messageText = err && err.message ? err.message : String(err || 'unknown error');
+        const messageText = err?.notReady
+            ? `Agent '${agentName}' is still starting. Try again in a moment.`
+            : (err && err.message ? err.message : String(err || 'unknown error'));
         sendResponse(200, { jsonrpc: '2.0', id: message.id ?? null, error: { code: -32000, message: messageText } }, sessionIdHeader);
     } finally {
-        await agentClient.close().catch(() => { });
+        await upstream.close();
     }
 }
 
@@ -689,6 +796,8 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, { beforeD
 async function handleAgentMcpRequest(req, res, route, agentName, {
     beforeDial = null,
     routePlan = null,
+    pool = agentUpstreamSessionPool,
+    waitForAgentReady: waitForReady = waitForAgentReady,
 } = {}) {
     const method = (req.method || 'GET').toUpperCase();
     const isDelegatedAgentRequest = Boolean(readAuthorizationBearer(req));
@@ -763,6 +872,7 @@ async function handleAgentMcpRequest(req, res, route, agentName, {
                     toolName,
                     rawArgs,
                     assertionCache: assertionReplayCache,
+                    snapshot: routePlan?.lease?.snapshot,
                 });
             } catch (error) {
                 res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -801,12 +911,17 @@ async function handleAgentMcpRequest(req, res, route, agentName, {
             }
         }
 
-        const isReady = await waitForAgentReady(route, {
+        // Readiness cache (fails closed): a pooled key that answered within the
+        // last 10 s skips the probe; every pooled POST still runs beforeDial,
+        // and any pooled transport or session error clears the cache.
+        const poolKey = resolveUpstreamPoolKey({ pool, routePlan, route, beforeDial });
+        const probeReadiness = () => waitForReady(route, {
             timeoutMs: 5000,
             intervalMs: 125,
             probeTimeoutMs: 250,
             beforeProbe: beforeDial,
         });
+        const isReady = Boolean(poolKey && pool.isReady(poolKey)) || await probeReadiness();
         if (!isReady) {
             if (isJsonRpc) {
                 res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -830,7 +945,13 @@ async function handleAgentMcpRequest(req, res, route, agentName, {
 
         try {
             if (isJsonRpc) {
-                await handleAgentJsonRpc(req, res, route, agentName, payload, { beforeDial });
+                await handleAgentJsonRpc(req, res, route, agentName, payload, {
+                    beforeDial,
+                    pool: poolKey ? pool : null,
+                    poolKey,
+                    ensureReady: probeReadiness,
+                    snapshot: routePlan?.lease?.snapshot,
+                });
                 return;
             }
 
@@ -849,6 +970,7 @@ async function handleAgentMcpRequest(req, res, route, agentName, {
 
 export {
     agentSessionStore,
+    agentUpstreamSessionPool,
     handleAgentMcpRequest,
     readAgentSessionId,
     isJsonRpcPayload,

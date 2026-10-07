@@ -1093,6 +1093,12 @@ const lifecycle = setupProcessLifecycle(
             await cloudflaredRouterIntegration.stop();
             await interfaceClassifier.close();
             await privateListenerSet.close();
+        }, async () => {
+            // Pooled upstream MCP sessions: best-effort DELETE, then drop the
+            // keep-alive sockets. (Module already loaded; imported here so the
+            // shutdown change stays one hunk.)
+            const { agentUpstreamSessionPool } = await import('./mcp-proxy/index.js');
+            await agentUpstreamSessionPool.closeAll();
         }],
     },
 );
