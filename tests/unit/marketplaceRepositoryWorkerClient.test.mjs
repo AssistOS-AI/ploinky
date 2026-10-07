@@ -156,6 +156,60 @@ for (const key of ['constructor', '__proto__', 'toString', 'hasOwnProperty']) {
     });
 }
 
+test('nested subject IPC is bounded diagnostic data and cannot admit or register a process', async (t) => {
+    const h = harness(t);
+    const pending = h.run(); await flush();
+    const [child] = h.children;
+    const before = h.runner.snapshot();
+    const firstUnknownSubject = { category: 'permission', field: 'environment', errno: 'EACCES',
+        basis: 'prior-stable-identity', subjectFingerprint: 'a'.repeat(64) };
+    h.message(child, 'diagnostic', { payload: { phase: 'observation', reason: 'incomplete', firstUnknownSubject } });
+    await flush();
+    assert.deepEqual(h.runner.diagnostics().recent.at(-1)?.firstUnknownSubject, firstUnknownSubject);
+    const invalid = [null, {}, { ...firstUnknownSubject, subjectFingerprint: 'a'.repeat(10000) },
+        { ...firstUnknownSubject, pid: 50001 },
+        ...['constructor', '__proto__', 'toString', 'hasOwnProperty'].map(key => Object.fromEntries([...Object.entries(firstUnknownSubject), [key, 'SECRET_CANARY']]))];
+    for (let i = 0; i < 1000; i += 1) {
+        h.message(child, 'diagnostic', { payload: { firstUnknownSubject: invalid[i % invalid.length] } });
+        h.message(child, 'diagnostic', { payload: { firstUnknownSubject } });
+    }
+    await flush();
+    assert.deepEqual(h.runner.snapshot(), before);
+    assert.equal(h.runner.diagnostics().loss >= 1000, true);
+    assert.equal(h.runner.diagnostics().recent.length, 32);
+    assert.ok(h.runner.diagnostics().bytes <= 65536);
+    assert.deepEqual(child.messages, []);
+    assert.deepEqual(h.signals, []);
+    assert.doesNotMatch(JSON.stringify(h.runner.diagnostics()), /SECRET_CANARY/);
+    h.message(child, 'terminal', { ok: true, result: {} });
+    await h.advance(8000);
+    await assert.rejects(pending, { code: 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED' });
+    assert.equal(h.runner.diagnostics().firstCause.reason, 'protocol');
+});
+
+test('throwing nested diagnostic accessors count loss without cancelling a valid transaction', async (t) => {
+    const h = harness(t);
+    const pending = h.run(); await flush();
+    const [child] = h.children;
+    const before = h.runner.snapshot();
+    const subject = { category: 'permission', field: 'environment', errno: 'EACCES',
+        basis: 'prior-stable-identity', subjectFingerprint: 'a'.repeat(64) };
+    for (const key of Object.keys(subject)) {
+        const input = Object.defineProperty({ ...subject }, key, { enumerable: true,
+            get() { throw new Error('ACCESSOR_SECRET_CANARY'); } });
+        h.message(child, 'diagnostic', { payload: { firstUnknownSubject: input } });
+        await flush();
+    }
+    assert.deepEqual(h.runner.snapshot(), before);
+    assert.equal(h.runner.diagnostics().loss, Object.keys(subject).length);
+    assert.equal(h.runner.diagnostics().firstCause, null);
+    assert.deepEqual(child.messages, []);
+    assert.deepEqual(h.signals, []);
+    assert.doesNotMatch(JSON.stringify(h.runner.diagnostics()), /CANARY/);
+    await h.hello(child); await h.authorize(child); h.terminal(child);
+    assert.equal((await pending).status, 'cloned');
+});
+
 test('wrong diagnostic operation identity cancels, and a pre-hello exit is distinct from an ownership mismatch', async (t) => {
     for (const mode of ['wrong-id', 'pre-hello', 'ownership']) {
         const h = harness(t, { diagnosticSink: () => { throw new Error('SECRET_CANARY'); } });

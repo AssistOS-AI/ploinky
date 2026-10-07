@@ -1,6 +1,6 @@
 import fs from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
-import { createUnknownSummary, processDiagnostic } from './marketplaceRepositoryDiagnostics.mjs';
+import { createUnknownSummary, diagnosticProcessFingerprint, processDiagnostic } from './marketplaceRepositoryDiagnostics.mjs';
 
 export const REPOSITORY_OPERATION_MARKER = 'PLOINKY_MARKETPLACE_REPOSITORY_OPERATION';
 export const PROC_LIMITS = Object.freeze({ bytes: 65_536, entries: 8_192, readers: 8, timeoutMs: 1_000 });
@@ -157,12 +157,16 @@ export function createRepositoryProcessObserver({ fsApi = fs, procRoot = '/proc'
                     while (cursor < pids.length) {
                         check(deadline);
                         const pid = pids[cursor++];
+                        let priorFingerprint;
                         try {
                             let record = await identity(pid, deadline);
                             const preexisting = sameProcess(prior.get(pid), record);
                             const inGroup = coordinator && record.namespace === coordinator.namespace
                                 && (record.group === coordinator.group || record.session === coordinator.session);
                             if (operationId && !preexisting && !inGroup && !sameProcess(known.get(pid), record)) {
+                                // This labels the completed preceding observation, not
+                                // the identity at a later failed environment read.
+                                priorFingerprint = diagnosticProcessFingerprint(record);
                                 record = await identity(pid, deadline, { environment: true });
                             }
                             const tagged = record.environment?.includes(marker) === true;
@@ -182,7 +186,7 @@ export function createRepositoryProcessObserver({ fsApi = fs, procRoot = '/proc'
                                         summary.add(processDiagnostic(confirmation));
                                     }
                                 }
-                            } else { incomplete = true; summary.add(processDiagnostic(error)); }
+                            } else { incomplete = true; summary.add(processDiagnostic(error), priorFingerprint); }
                         }
                     }
                 } finally { readers -= 1; }

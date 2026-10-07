@@ -24,6 +24,43 @@ export function diagnosticIdentity(value) {
     return typeof value === 'string' && value ? createHash('sha256').update(value).digest('hex') : undefined;
 }
 
+export function diagnosticProcessFingerprint(record) {
+    try {
+        if (!record || typeof record !== 'object' || Array.isArray(record)) return undefined;
+        const pid = record.pid;
+        const birth = record.birth;
+        const namespace = record.namespace;
+        const uids = record.uids;
+        if (!Number.isSafeInteger(pid) || pid < 1 || pid > 2_147_483_647
+            || typeof birth !== 'string' || !/^[1-9][0-9]{0,19}$/.test(birth)
+            || typeof namespace !== 'string' || !/^pid:\[[1-9][0-9]{0,19}\]$/.test(namespace)
+            || typeof uids !== 'string' || !/^(?:0|[1-9][0-9]{0,9})(?::(?:0|[1-9][0-9]{0,9})){3}$/.test(uids)
+            || uids.split(':').some(value => Number(value) > 4_294_967_295)) return undefined;
+        return createHash('sha256').update('ploinky:repository-process-subject:v1\0')
+            .update(JSON.stringify([pid, birth, namespace, uids])).digest('hex');
+    } catch (_) { return undefined; }
+}
+
+function unknownSubject(value) {
+    try {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+        const required = ['category', 'field', 'basis', 'subjectFingerprint'];
+        const keys = Object.keys(value);
+        if (keys.length < 4 || keys.length > 5 || required.some(key => !Object.hasOwn(value, key))
+            || keys.some(key => ![...required, 'errno'].includes(key))) return null;
+        const category = value.category;
+        const field = value.field;
+        const basis = value.basis;
+        const subjectFingerprint = value.subjectFingerprint;
+        const hasErrno = Object.hasOwn(value, 'errno');
+        const errno = hasErrno ? value.errno : undefined;
+        if (!enums.category.includes(category) || field !== 'environment' || basis !== 'prior-stable-identity'
+            || typeof subjectFingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(subjectFingerprint)
+            || (hasErrno && !enums.errno.includes(errno))) return null;
+        return { category, field, ...(hasErrno ? { errno } : {}), basis, subjectFingerprint };
+    } catch (_) { return null; }
+}
+
 // A closed schema, not redaction of arbitrary strings. No request, path,
 // environment, exception text or child-supplied identity enters retained data.
 export function diagnosticPayload(value, depth = 0) {
@@ -37,7 +74,11 @@ export function diagnosticPayload(value, depth = 0) {
         else if (numbers.has(key) && Number.isSafeInteger(entry) && entry >= 0) output[key] = entry;
         else if (booleans.has(key) && typeof entry === 'boolean') output[key] = entry;
         else if (hashes.has(key) && typeof entry === 'string' && /^[a-f0-9]{64}$/.test(entry)) output[key] = entry;
-        else if (key === 'unknowns' && depth === 0 && Array.isArray(entry) && entry.length <= 24) {
+        else if (key === 'firstUnknownSubject' && depth === 0) {
+            const subject = unknownSubject(entry);
+            if (!subject) return null;
+            output[key] = subject;
+        } else if (key === 'unknowns' && depth === 0 && Array.isArray(entry) && entry.length <= 24) {
             const rows = entry.map(row => diagnosticPayload(row, 1));
             if (rows.some(row => !row || Object.keys(row).some(name => !['category', 'field', 'errno', 'count'].includes(name)))) return null;
             output[key] = rows;
@@ -56,15 +97,21 @@ export function processDiagnostic(error, field = 'identity') {
 export function createUnknownSummary() {
     const rows = [];
     let lost = 0;
+    let firstUnknownSubject = null;
     return {
-        add(value) {
+        add(value, subjectFingerprint) {
             const safe = diagnosticPayload(value) || { category: 'unknown', field: 'identity' };
+            if (!firstUnknownSubject && safe.field === 'environment') {
+                firstUnknownSubject = unknownSubject({ category: safe.category, field: safe.field,
+                    ...(safe.errno ? { errno: safe.errno } : {}), basis: 'prior-stable-identity', subjectFingerprint });
+            }
             const row = rows.find(entry => entry.category === safe.category && entry.field === safe.field && entry.errno === safe.errno);
             if (row) row.count = increment(row.count);
             else if (rows.length < 24) rows.push({ ...safe, count: 1 });
             else lost = increment(lost);
         },
-        snapshot: () => ({ unknowns: rows.map(row => ({ ...row })), ...(lost ? { unknownLoss: lost } : {}) }),
+        snapshot: () => ({ unknowns: rows.map(row => ({ ...row })), ...(lost ? { unknownLoss: lost } : {}),
+            ...(firstUnknownSubject ? { firstUnknownSubject: { ...firstUnknownSubject } } : {}) }),
     };
 }
 

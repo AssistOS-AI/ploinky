@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { createHash } from 'node:crypto';
 import {
     createRepositoryProcessObserver, proveRepositoryQuiescence, REPOSITORY_OPERATION_MARKER,
 } from '../../cli/server/marketplaceRepositoryProcessGroup.mjs';
 
 const operationId = '01234567-89ab-cdef-0123-456789abcdef';
+const subjectFingerprint = (pid, birth = `${pid}00`) => createHash('sha256').update('ploinky:repository-process-subject:v1\0')
+    .update(JSON.stringify([pid, birth, 'pid:[42]', '1000:1000:1000:1000'])).digest('hex');
 
 function procFixture() {
     const processes = new Map();
@@ -101,6 +104,74 @@ test('new unreadable environment and a truncated proc field stay unknown', async
     assert.equal(observed.complete, false);
     assert.equal(observed.diagnostic.unknowns[0].category, 'truncated');
     assert.equal(fixture.handles(), 0);
+});
+
+test('environment refusal correlates only the prior stable observation with no additional process reads', async () => {
+    const { fixture, observer, options } = await initialized();
+    fixture.add(30, { unreadable: 'environ', argv: ['ARGV_SECRET_CANARY'], env: ['ENV_SECRET_CANARY'] });
+    const reads = [];
+    fixture.setBeforeOpen((pid, name) => { if (pid === 30) reads.push(name); });
+    const observed = await observer.scan(options);
+    assert.equal(observed.complete, false);
+    assert.deepEqual(observed.diagnostic.firstUnknownSubject, { category: 'permission', field: 'environment', errno: 'EACCES',
+        basis: 'prior-stable-identity', subjectFingerprint: subjectFingerprint(30) });
+    assert.deepEqual(reads, ['stat', 'status', 'cmdline', 'cmdline', 'status', 'stat', 'stat', 'status', 'cmdline', 'environ']);
+    for (const key of ['records', 'members', 'writers']) assert.equal(observed[key].some(record => record.pid === 30), false);
+    assert.doesNotMatch(JSON.stringify(observed.diagnostic), /SECRET_CANARY|3000|pid:\[42\]|1000:1000/);
+    assert.equal(fixture.handles(), 0);
+});
+
+test('PID reuse during the environment read labels the preceding identity and cannot confer ownership', async () => {
+    const { fixture, observer, options } = await initialized();
+    fixture.add(30, { unreadable: 'environ' });
+    let stats = 0;
+    fixture.setBeforeOpen((pid, name) => {
+        if (pid === 30 && name === 'stat' && ++stats === 3) fixture.processes.get(30).birth = '3001';
+    });
+    const observed = await observer.scan(options);
+    assert.equal(observed.complete, false);
+    assert.equal(observed.diagnostic.firstUnknownSubject?.subjectFingerprint, subjectFingerprint(30));
+    assert.equal(observed.diagnostic.firstUnknownSubject?.basis, 'prior-stable-identity');
+    assert.notEqual(observed.diagnostic.firstUnknownSubject?.subjectFingerprint, subjectFingerprint(30, '3001'));
+    assert.equal(observed.records.some(record => record.pid === 30), false);
+    assert.equal(observed.members.some(record => record.pid === 30), false);
+});
+
+test('first identity and non-environment failures never invent a subject fingerprint', async () => {
+    for (const unreadable of ['stat', 'status', 'cmdline', 'ns/pid']) {
+        const { fixture, observer, options } = await initialized();
+        fixture.add(30, { unreadable });
+        const observed = await observer.scan(options);
+        assert.equal(observed.complete, false);
+        assert.equal(Object.hasOwn(observed.diagnostic, 'firstUnknownSubject'), false);
+    }
+    const { fixture, observer, options } = await initialized();
+    fixture.add(30);
+    let stats = 0;
+    fixture.setBeforeOpen((pid, name) => {
+        if (pid === 30 && name === 'stat' && ++stats === 3) fixture.processes.get(30).unreadable = 'stat';
+    });
+    const observed = await observer.scan(options);
+    assert.equal(observed.complete, false);
+    assert.equal(Object.hasOwn(observed.diagnostic, 'firstUnknownSubject'), false);
+});
+
+test('malformed prior fingerprint input leaves the original refusal and records unchanged', async () => {
+    for (const change of [{ birth: '1'.repeat(21) }, { namespace: `pid:[${'1'.repeat(21)}]` }, { uid: 4294967296 }]) {
+        const { fixture, observer, options } = await initialized();
+        fixture.add(30, { ...change, unreadable: 'environ' });
+        const observed = await observer.scan(options);
+        assert.equal(observed.complete, false);
+        assert.deepEqual(observed.diagnostic.unknowns, [{ category: 'permission', field: 'environment', errno: 'EACCES', count: 1 }]);
+        assert.equal(Object.hasOwn(observed.diagnostic, 'firstUnknownSubject'), false);
+        for (const key of ['records', 'members', 'writers']) assert.equal(observed[key].some(record => record.pid === 30), false);
+        assert.equal(fixture.handles(), 0);
+    }
+    const { fixture, observer, options } = await initialized();
+    fixture.add(30, { env: ['ENV_SECRET_CANARY'] });
+    const observed = await observer.scan(options);
+    assert.equal(observed.complete, true);
+    assert.equal(Object.hasOwn(observed.diagnostic, 'firstUnknownSubject'), false);
 });
 
 test('unstable birth, replaced coordinator and foreign replacement cannot authorize signals', async () => {

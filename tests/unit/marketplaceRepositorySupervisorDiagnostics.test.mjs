@@ -89,3 +89,22 @@ test('throwing diagnostic transport preserves the original recovery cancellation
     assert.ok(h.trace.some(entry => entry.retained));
     assert.ok(h.trace.some(entry => entry.type === 'recovery'));
 });
+
+test('prior subject passes diagnostic IPC while settlement keeps its recovery and lease behavior', async (t) => {
+    const h = harness(t);
+    await h.start();
+    await h.send(h.worker(), 'lease', { token: 'SECRET_CANARY' });
+    const firstUnknownSubject = { category: 'permission', field: 'environment', errno: 'EACCES',
+        basis: 'prior-stable-identity', subjectFingerprint: 'a'.repeat(64) };
+    h.observer.scan = async () => ({ complete: false, records: [], members: [], writers: [],
+        diagnostic: { unknowns: [{ category: 'permission', field: 'environment', errno: 'EACCES', count: 1 }], firstUnknownSubject } });
+    await h.send(h.worker(), 'barrier');
+    const diagnostic = h.trace.find(entry => entry.type === 'diagnostic');
+    assert.deepEqual(diagnostic?.payload.firstUnknownSubject, firstUnknownSubject);
+    assert.equal(diagnostic.payload.complete, false);
+    assert.ok(h.trace.findIndex(entry => entry.retained) < h.trace.indexOf(diagnostic));
+    assert.equal(h.trace.find(entry => entry.type === 'recovery').code, 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED');
+    assert.equal(h.trace.some(entry => entry.type === 'release'), false);
+    assert.equal(h.supervisor.state(), 'cancelling');
+    assert.doesNotMatch(JSON.stringify(diagnostic), /SECRET_CANARY/);
+});
