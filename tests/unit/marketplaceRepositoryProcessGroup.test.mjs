@@ -11,6 +11,7 @@ function procFixture() {
     let handles = 0;
     let opens = 0;
     let mutate = () => {};
+    let beforeOpen = async () => {};
     function add(pid, options = {}) {
         processes.set(pid, { pid, birth: `${pid}00`, parent: 1, group: pid, session: pid,
             state: 'S', namespace: 'pid:[42]', uid: 1000, argv: ['/node', '/supervisor.mjs'],
@@ -34,6 +35,7 @@ function procFixture() {
         },
         async open(file) {
             const [, pid, name] = file.match(/\/([0-9]+)\/(.+)$/);
+            await beforeOpen(Number(pid), name);
             const bytes = value(Number(pid), name);
             opens += 1;
             handles += 1;
@@ -51,10 +53,12 @@ function procFixture() {
             const [, pid, name] = file.match(/\/([0-9]+)\/(.+)$/);
             const record = processes.get(Number(pid));
             if (!record) throw Object.assign(new Error('absent'), { code: 'ENOENT' });
+            if (record.unreadable === name) throw Object.assign(new Error('unreadable'), { code: 'EACCES' });
             return name === 'exe' ? '/node' : record.namespace;
         },
     };
-    return { fsApi, processes, add, setMutate: (fn) => { mutate = fn; }, handles: () => handles, opens: () => opens };
+    return { fsApi, processes, add, setMutate: (fn) => { mutate = fn; },
+        setBeforeOpen: (fn) => { beforeOpen = fn; }, handles: () => handles, opens: () => opens };
 }
 
 async function initialized() {
@@ -151,4 +155,93 @@ test('only an unchanged executable/module/group anchor may authorize a group sig
         coordinator: options.coordinator, group: true, kill: (...args) => sent.push(args),
     }), false);
     assert.equal(sent.length, 1);
+});
+
+test('visible nested-namespace marker, remembered identity and validated lineage remain writers', async () => {
+    const { fixture, observer, options } = await initialized();
+    fixture.add(30, { namespace: 'pid:[99]', env: [`${REPOSITORY_OPERATION_MARKER}=${operationId}`] });
+    fixture.add(31, { parent: 30, namespace: 'pid:[100]' });
+    let observed = await observer.scan(options);
+    assert.equal(observed.complete, true);
+    assert.deepEqual(observed.writers.map((entry) => entry.pid).sort(), [30, 31]);
+    assert.equal((await proveRepositoryQuiescence(observer, options, { barrier: true })).ok, false);
+    fixture.processes.get(30).env = [];
+    observed = await observer.scan({ ...options, remembered: observed.members });
+    assert.equal(observed.complete, true);
+    assert.deepEqual(observed.writers.map((entry) => entry.pid).sort(), [30, 31]);
+    const sent = [];
+    for (const writer of observed.writers) await observer.signal(writer, 'SIGTERM', { kill: (...args) => sent.push(args) });
+    assert.deepEqual(sent.sort((left, right) => left[0] - right[0]), [[30, 'SIGTERM'], [31, 'SIGTERM']]);
+    assert.equal(fixture.handles(), 0);
+});
+
+test('mid-census parent PID reuse cannot adopt or signal an unrelated replacement child', async () => {
+    const { fixture, observer, options } = await initialized();
+    fixture.add(21, { parent: 20, group: 20, session: 20 });
+    fixture.add(30, { parent: 21 });
+    let parentStatReads = 0;
+    let parentCaptured;
+    let replaced = false;
+    const parentSnapshot = new Promise((resolve) => { parentCaptured = resolve; });
+    fixture.setMutate((pid, field) => {
+        // The second stat's bytes already contain A's birth identity. Its
+        // read can now finish even though B will replace it before C is read.
+        if (pid === 21 && field === 'stat' && ++parentStatReads === 2) parentCaptured();
+    });
+    fixture.setBeforeOpen(async (pid, field) => {
+        if (pid !== 30 || field !== 'stat' || replaced) return;
+        await parentSnapshot;
+        fixture.add(21, { birth: '9100' }); // B is unrelated, reusing A's PID.
+        fixture.add(30, { birth: '9300', parent: 21 }); // C belongs to B.
+        replaced = true;
+    });
+    const observed = await observer.scan(options);
+    assert.equal(replaced, true, 'the reuse occurred within this census');
+    assert.ok(observed.records.some((entry) => entry.pid === 21 && entry.birth === '2100'), 'census captured owned A');
+    assert.ok(observed.records.some((entry) => entry.pid === 30 && entry.birth === '9300'), 'census captured foreign C');
+    assert.equal(observed.complete, false, 'a replaced lineage anchor leaves unknown ownership');
+    assert.equal(observed.members.some((entry) => entry.pid === 30), false, 'numeric PPID does not establish ownership');
+    const sent = [];
+    for (const writer of observed.writers) await observer.signal(writer, 'SIGKILL', { kill: (...args) => sent.push(args) });
+    assert.deepEqual(sent, [], 'neither replacement B nor foreign C can be signaled');
+    assert.equal(fixture.handles(), 0);
+});
+
+test('protected preexisting namespace denial blocks baseline and later proof instead of classifying it as unrelated', async () => {
+    const fixture = procFixture();
+    fixture.add(10);
+    fixture.add(11, { unreadable: 'ns/pid' });
+    const observer = createRepositoryProcessObserver({ fsApi: fixture.fsApi });
+    const baseline = await observer.scan();
+    assert.equal(baseline.complete, false);
+    assert.equal(baseline.records.some((entry) => entry.pid === 11), false);
+    assert.equal((await observer.scan({ baseline: baseline.records })).complete, false);
+    assert.equal(fixture.handles(), 0);
+
+    const initializedFixture = await initialized();
+    initializedFixture.fixture.processes.get(11).unreadable = 'ns/pid';
+    const proof = await proveRepositoryQuiescence(initializedFixture.observer, initializedFixture.options, { barrier: true });
+    assert.equal(proof.ok, false);
+    assert.equal(proof.reason, 'unknown');
+    assert.equal(initializedFixture.fixture.handles(), 0);
+});
+
+test('a parent disappearing during the fresh child observation cannot establish lineage', async () => {
+    const { fixture, observer, options } = await initialized();
+    fixture.add(21, { parent: 20, group: 20, session: 20 });
+    fixture.add(30, { parent: 21 });
+    let childStatReads = 0;
+    fixture.setMutate((pid, field) => {
+        // Two ordinary and two environment-associated stat reads finish the
+        // census. The fifth starts the fresh child read between parent probes.
+        if (pid === 30 && field === 'stat' && ++childStatReads === 5) fixture.processes.delete(21);
+    });
+    const observed = await observer.scan(options);
+    assert.ok(childStatReads >= 5, 'the parent vanished during lineage validation');
+    assert.equal(observed.complete, false);
+    assert.equal(observed.members.some((entry) => entry.pid === 30), false);
+    const sent = [];
+    for (const writer of observed.writers) await observer.signal(writer, 'SIGKILL', { kill: (...args) => sent.push(args) });
+    assert.deepEqual(sent, []);
+    assert.equal(fixture.handles(), 0);
 });

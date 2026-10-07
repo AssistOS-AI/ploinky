@@ -110,6 +110,7 @@ export function createRepositoryProcessObserver({ fsApi = fs, procRoot = '/proc'
         if (scanning) return { complete: false, records: [], members: [], writers: [] };
         const deadline = now() + PROC_LIMITS.timeoutMs;
         const records = [];
+        const cohort = new Map();
         let incomplete = false;
         const prior = new Map(baseline.map((entry) => [entry.pid, entry]));
         const known = new Map(remembered.map((entry) => [entry.pid, entry]));
@@ -166,35 +167,61 @@ export function createRepositoryProcessObserver({ fsApi = fs, procRoot = '/proc'
             await Promise.all(Array.from({ length: Math.min(PROC_LIMITS.readers, pids.length) }, consume));
             check(deadline);
             if (cursor !== pids.length) incomplete = true;
+            await classify();
         };
+        async function classify() {
+            const anchor = records.some((record) => sameProcess(record, coordinator));
+            const groupAnchor = anchor || records.some((record) => sameProcess(known.get(record.pid), record)
+                && record.namespace === coordinator?.namespace && record.group === coordinator?.group);
+            const sessionAnchor = anchor || records.some((record) => sameProcess(known.get(record.pid), record)
+                && record.namespace === coordinator?.namespace && record.session === coordinator?.session);
+            if (coordinator) for (const record of records) {
+                const anchoredGroup = record.namespace === coordinator.namespace
+                    && ((groupAnchor && record.group === coordinator.group) || (sessionAnchor && record.session === coordinator.session));
+                // A visible nested-namespace process can retain the exact
+                // marker or a previously proven identity. Namespace remains
+                // part of that identity; equality with the coordinator does not.
+                if (anchoredGroup || record.tagged || sameProcess(known.get(record.pid), record)) cohort.set(record.pid, record);
+            }
+            if (readers >= PROC_LIMITS.readers) throw unknown();
+            readers += 1;
+            const attempted = new Set();
+            try {
+                let changed = true;
+                while (changed) {
+                    changed = false;
+                    for (const record of records) {
+                        check(deadline);
+                        const parent = cohort.get(record.parent);
+                        if (cohort.has(record.pid) || !parent || attempted.has(record.pid)) continue;
+                        attempted.add(record.pid);
+                        try {
+                            // Numeric PPID alone is not lineage evidence. Bind
+                            // the known parent's birth identity on both sides
+                            // of a fresh stable child observation, inside this
+                            // pass's original time and reader limits.
+                            const parentBefore = await identity(parent.pid, deadline);
+                            if (!sameProcess(parentBefore, parent)) throw unknown();
+                            const child = await identity(record.pid, deadline);
+                            const parentAfter = await identity(parent.pid, deadline);
+                            if (!sameProcess(parentAfter, parent) || !sameProcess(child, record)
+                                || child.parent !== parent.pid) throw unknown();
+                            cohort.set(record.pid, record);
+                            changed = true;
+                        } catch (_) { incomplete = true; }
+                    }
+                }
+            } finally { readers -= 1; }
+            if (operationId && records.some((record) => !cohort.has(record.pid)
+                && !sameProcess(prior.get(record.pid), record) && !record.inspectedEnvironment)) incomplete = true;
+        }
         scanning = true;
         try {
             await bounded(async () => { try { await task(); } finally { scanning = false; } }, deadline);
         } catch (_) { incomplete = true; }
-        // Snapshot the completed reads; late I/O may only finish closing its
-        // handles, and never changes an already returned proof.
+        // Snapshot completed reads and classifications. Late I/O may finish
+        // closing handles, but cannot change an already returned proof.
         const observed = records.slice();
-        const cohort = new Map();
-        const anchor = observed.some((record) => sameProcess(record, coordinator));
-        const groupAnchor = anchor || observed.some((record) => sameProcess(known.get(record.pid), record)
-            && record.namespace === coordinator?.namespace && record.group === coordinator?.group);
-        const sessionAnchor = anchor || observed.some((record) => sameProcess(known.get(record.pid), record)
-            && record.namespace === coordinator?.namespace && record.session === coordinator?.session);
-        if (coordinator) for (const record of observed) {
-            if (record.namespace === coordinator.namespace
-                && ((groupAnchor && record.group === coordinator.group) || (sessionAnchor && record.session === coordinator.session)
-                    || record.tagged || sameProcess(known.get(record.pid), record))) cohort.set(record.pid, record);
-        }
-        let changed = true;
-        while (changed) {
-            changed = false;
-            for (const record of observed) {
-                if (!cohort.has(record.pid) && record.namespace === coordinator?.namespace
-                    && cohort.has(record.parent)) { cohort.set(record.pid, record); changed = true; }
-            }
-        }
-        if (operationId && observed.some((record) => !cohort.has(record.pid)
-            && !sameProcess(prior.get(record.pid), record) && !record.inspectedEnvironment)) incomplete = true;
         const members = [...cohort.values()];
         const writers = members.filter((record) => record.state !== 'Z'
             && !sameProcess(record, router) && !sameProcess(record, coordinator));
