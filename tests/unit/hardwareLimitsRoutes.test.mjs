@@ -76,6 +76,29 @@ for (const [name, user, status] of [['anonymous', null, 401], ['nonadmin', { rol
     test(`R.${name}`, async (t) => { const result = await request(fixture(t), { user }); assert.equal(result.status, status); });
 }
 test('R.admin', async (t) => { const result = await request(fixture(t)); assert.equal(result.status, 200); assert.equal(result.body.agents[0].containers.length, 3); assert.match(result.body.help.authority, /master key/); });
+test('R.repository-preparation occurs only inside an authorized GET', async t => {
+    const f = fixture(t);
+    let preparations = 0;
+    let inside = false;
+    const dependencies = {
+        runReadScope: async read => {
+            preparations += 1;
+            inside = true;
+            try { return await read(); } finally { inside = false; }
+        },
+        getInstalled: () => { assert.equal(inside, true); return []; },
+    };
+    assert.equal((await request(f, { user: null, dependencies })).status, 401);
+    assert.equal((await request(f, { headers: { authorization: 'Bearer fixture' }, dependencies })).status, 403);
+    assert.equal(preparations, 0);
+    assert.equal((await request(f, { dependencies })).status, 200);
+    assert.equal(preparations, 1);
+    const mutation = await request(f, {
+        method: 'POST', body: setBody(f),
+        dependencies: { runReadScope: () => assert.fail('POST must not enter a prepared read scope') },
+    });
+    assert.equal(mutation.status, 200);
+});
 test('R.origin', async (t) => { const f = fixture(t); assert.equal((await request(f, { method: 'POST', body: setBody(f), headers: { origin: 'http://foreign.test' } })).status, 403); });
 test('R.csrf', async (t) => { const f = fixture(t); for (const headers of [{}, { 'x-ploinky-csrf-token': 'invalid' }]) assert.equal((await request(f, { method: 'POST', body: setBody(f), headers, proof: false })).status, 403); });
 test('R.cross-session-csrf', async (t) => { const f = fixture(t); const req = { headers: { host: '127.0.0.1:8080' }, socket: {}, sessionId: 'other-fixture-session' }; assert.equal((await request(f, { method: 'POST', body: setBody(f), headers: { 'x-ploinky-csrf-token': mintAdminCsrfToken({ req, sessionId: req.sessionId }) } })).status, 403); });

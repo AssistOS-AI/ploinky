@@ -7,7 +7,9 @@ import { installRepositoryLinks, removeRepositoryLinks } from '../../utils/repos
 
 import * as reposSvc from '../../utils/repos.js';
 import { resolveSkillRepositorySource } from '../../utils/skillRepositorySource.js';
-import { listAgentRepositoryNames, workspaceAgentRepositoryPath } from '../../utils/agentRepositorySource.mjs';
+import { listAgentRepositoryNames, workspaceAgentRepositoryPath, runWithRepositoryResolutionScope } from '../../utils/agentRepositorySource.mjs';
+import { prefetchWorkspaceRepositoryOrigins } from '../../utils/repositorySource.mjs';
+import { PLOINKY_WORKSPACE_ROOT } from '../../utils/config.js';
 import * as agentsSvc from '../../utils/agents.js';
 import * as workspaceSvc from '../../utils/workspace.js';
 import { collectAgentRuntimeStates } from '../../sandbox/agentRuntimeState.js';
@@ -106,6 +108,32 @@ function watchResponseClose(res) {
         isClosed: () => closed || (!res?.writableEnded && (res?.closed === true || res?.destroyed === true)),
         stop: () => { if (typeof res?.removeListener === 'function') res.removeListener('close', onClose); },
     };
+}
+
+async function runPreparedRepositoryRead(res, build, { catalog = false } = {}) {
+    const watch = watchResponseClose(res);
+    const controller = new AbortController();
+    const onClose = () => { if (watch.isClosed()) controller.abort(); };
+    res.once?.('close', onClose);
+    try {
+        if (watch.isClosed()) return MARKETPLACE_REQUEST_CLOSED;
+        return await runWithRepositoryResolutionScope(async () => {
+            const roots = [PLOINKY_WORKSPACE_ROOT];
+            // Skill catalog resolution uses the canonical spelling. Query both
+            // exact spellings in one pool; neither identity substitutes for the other.
+            if (catalog) roots.push(fs.realpathSync(PLOINKY_WORKSPACE_ROOT));
+            await prefetchWorkspaceRepositoryOrigins(roots, { signal: controller.signal });
+            if (watch.isClosed()) return MARKETPLACE_REQUEST_CLOSED;
+            const result = await build();
+            return watch.isClosed() ? MARKETPLACE_REQUEST_CLOSED : result;
+        }, { signal: controller.signal });
+    } catch (error) {
+        if (watch.isClosed()) return MARKETPLACE_REQUEST_CLOSED;
+        throw error;
+    } finally {
+        watch.stop();
+        res.removeListener?.('close', onClose);
+    }
 }
 
 const marketplaceEnableFlights = new Map();
@@ -636,6 +664,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
             },
             verifyLease: () => !routePlan?.lease?.commit || routePlan.lease.commit() === true,
             readSelection: readEdgeRoutingSelection,
+            runReadScope: build => runPreparedRepositoryRead(res, build),
         });
     }
 
@@ -669,7 +698,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
             } finally {
                 watch.stop();
             }
-            if (liveContainers === MARKETPLACE_INVENTORY_SKIPPED) return MARKETPLACE_REQUEST_CLOSED;
+            if (liveContainers === MARKETPLACE_INVENTORY_SKIPPED || watch.isClosed()) return MARKETPLACE_REQUEST_CLOSED;
             options = { ...agentListOptions, liveContainers };
         }
         return {
@@ -689,7 +718,9 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
             return true;
         }
         if (!await authorizeRead()) return true;
-        sendJson(res, 200, { ok: true, repositories: reposSvc.listRepositorySources() });
+        const repositories = await runPreparedRepositoryRead(res, () => reposSvc.listRepositorySources(), { catalog: true });
+        if (repositories === MARKETPLACE_REQUEST_CLOSED) return true;
+        sendJson(res, 200, { ok: true, repositories });
         return true;
     }
 
@@ -699,7 +730,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
     }
 
     const isRepos = route.resource === 'repos';
-    const marketplacePayload = async () => (isRepos ? buildMarketplaceRepositories() : agentsMarketplace());
+    const marketplacePayload = async () => runPreparedRepositoryRead(res, () => (isRepos ? buildMarketplaceRepositories() : agentsMarketplace()), { catalog: isRepos });
 
     if (method === 'GET') {
         if (!await authorizeRead()) return true;
