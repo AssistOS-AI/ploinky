@@ -90,6 +90,142 @@ function harness(t, overrides = {}) {
     return { runner, run, children, signals, advance, hello, authorize, terminal, message, scans: () => scans, time, observer };
 }
 
+test('incomplete baseline retains the first cause and re-emits it on a later rejection after initial log loss', async (t) => {
+    const logs = [];
+    const h = harness(t, { diagnosticSink: (_type, entry) => logs.push(entry) });
+    h.observer.scan = async () => ({ complete: false, records: [], members: [], writers: [],
+        diagnostic: { unknowns: [{ category: 'permission', field: 'namespace', errno: 'EACCES', count: 1 }] } });
+    await assert.rejects(h.run({ diagnosticContext: { caller: 'agent-assertion', routeLease: true } }), { code: 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED' });
+    assert.equal(h.children.length, 0);
+    const first = h.runner.diagnostics().firstCause;
+    assert.equal(first.phase, 'baseline');
+    assert.equal(first.unknowns[0].field, 'namespace');
+    assert.equal(first.caller, 'agent-assertion');
+    logs.length = 0;
+    await assert.rejects(h.run(), { code: 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED' });
+    assert.equal(logs.length, 0);
+    await h.advance(5000);
+    await assert.rejects(h.run(), { code: 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED' });
+    assert.deepEqual(logs[0].firstCause, first);
+    assert.equal(h.runner.snapshot().chargedBytes, 0);
+});
+
+test('diagnostic faults and floods carry no authority; strict control errors still cancel under a stalled sink', async (t) => {
+    const h = harness(t, { diagnosticSink: () => new Promise(() => {}) });
+    const pending = h.run(); await flush();
+    const [child] = h.children;
+    for (let i = 0; i < 1000; i += 1) {
+        h.message(child, 'diagnostic', { payload: { phase: 'ipc', reason: 'received', secret: 'SECRET_CANARY' } });
+        h.message(child, 'diagnostic', { payload: { phase: 'observation', reason: 'incomplete' } });
+    }
+    await flush();
+    assert.equal(child.messages.length, 0, 'diagnostics cannot grant ownership or admission');
+    assert.equal(h.runner.snapshot().accepting, true);
+    assert.equal(h.runner.diagnostics().recent.length, 32);
+    assert.ok(h.runner.diagnostics().loss >= 1000);
+    assert.doesNotMatch(JSON.stringify(h.runner.diagnostics()), /SECRET_CANARY/);
+    h.message(child, 'terminal', { ok: true, result: {} });
+    await h.advance(8000);
+    await assert.rejects(pending, { code: 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED' });
+    assert.equal(h.runner.diagnostics().firstCause.reason, 'protocol');
+    assert.equal(h.runner.snapshot().chargedBytes, 0);
+    const terminalState = h.runner.diagnostics();
+    h.message(child, 'diagnostic', { payload: { phase: 'ipc', reason: 'received' } });
+    assert.deepEqual(h.runner.diagnostics(), terminalState, 'finished tickets remain terminal');
+});
+
+for (const key of ['constructor', '__proto__', 'toString', 'hasOwnProperty']) {
+    test(`diagnostic prototype key ${key} only records loss and preserves the live transaction`, async (t) => {
+        const h = harness(t);
+        const pending = h.run(); await flush();
+        const [child] = h.children;
+        const before = h.runner.snapshot();
+        h.message(child, 'diagnostic', { payload: Object.fromEntries([[key, 'SECRET_CANARY']]) });
+        h.message(child, 'diagnostic', { payload: { unknowns: [Object.fromEntries([[key, 'SECRET_CANARY']])] } });
+        await flush();
+        assert.deepEqual(h.runner.snapshot(), before);
+        assert.equal(h.runner.diagnostics().loss, 2);
+        assert.equal(h.runner.diagnostics().firstCause, null);
+        assert.deepEqual(h.signals, []);
+        assert.equal(child.messages.length, 0);
+        assert.doesNotMatch(JSON.stringify(h.runner.diagnostics()), /SECRET_CANARY/);
+        await h.hello(child); await h.authorize(child); h.terminal(child);
+        assert.equal((await pending).status, 'cloned');
+        assert.equal(h.runner.snapshot().accepting, true);
+        assert.equal(h.runner.snapshot().chargedBytes, 0);
+    });
+}
+
+test('wrong diagnostic operation identity cancels, and a pre-hello exit is distinct from an ownership mismatch', async (t) => {
+    for (const mode of ['wrong-id', 'pre-hello', 'ownership']) {
+        const h = harness(t, { diagnosticSink: () => { throw new Error('SECRET_CANARY'); } });
+        const pending = h.run(); await flush();
+        const [child] = h.children;
+        if (mode === 'wrong-id') h.message(child, 'diagnostic', { operationId: 'wrong', payload: {} });
+        else if (mode === 'pre-hello') child.emit('close', 0, null);
+        else {
+            const read = h.observer.read;
+            h.observer.read = async (...args) => ({ ...await read(...args), exe: '/SECRET_CANARY' });
+            await h.hello(child);
+        }
+        await h.advance(8000);
+        await assert.rejects(pending, { code: 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED' });
+        const cause = h.runner.diagnostics().firstCause;
+        assert.equal(cause.reason, mode === 'wrong-id' ? 'protocol' : mode === 'pre-hello' ? 'pre-hello-exit' : 'mismatch');
+        assert.doesNotMatch(JSON.stringify(h.runner.diagnostics()), /SECRET_CANARY/);
+    }
+});
+
+test('supervisor cause survives secondary failures and a response close after cancellation settlement', async (t) => {
+    const response = new EventEmitter();
+    const h = harness(t);
+    const pending = h.run({ response }); await flush();
+    const [child] = h.children;
+    await h.hello(child);
+    h.message(child, 'diagnostic', { payload: { phase: 'release', reason: 'release-failed' } });
+    h.message(child, 'recovery');
+    h.message(child, 'invalid-control');
+    child.emit('close', 1, 'SIGTERM');
+    await h.advance(8000);
+    await assert.rejects(pending, { code: 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED' });
+    const first = h.runner.diagnostics().firstCause;
+    assert.equal(first.source, 'supervisor');
+    assert.equal(first.reason, 'release-failed');
+    response.emit('close');
+    assert.deepEqual(h.runner.diagnostics().firstCause, first);
+    const closure = h.runner.diagnostics().recent.at(-1);
+    assert.equal(closure.phase, 'closure');
+    assert.equal(closure.state, 'cancelling');
+    assert.equal(closure.closedAt, h.time.now());
+});
+
+test('normal admission expiry is observable without creating a first recovery cause', async (t) => {
+    const h = harness(t);
+    const active = h.run(); await flush();
+    await h.hello(h.children[0]); await h.authorize(h.children[0]);
+    const queued = h.run();
+    await h.advance(REPOSITORY_QUEUE_LIMITS.admissionMs);
+    await assert.rejects(queued, { code: 'workspace_mutation_lock_timeout' });
+    assert.equal(h.runner.diagnostics().firstCause, null);
+    assert.ok(h.runner.diagnostics().recent.some(entry => entry.reason === 'expired'));
+    h.terminal(h.children[0]); await active;
+});
+
+test('shutdown cause and post-hello crash retain distinct reasons under unchanged cancellation deadlines', async (t) => {
+    for (const mode of ['shutdown', 'crash']) {
+        const h = harness(t);
+        const pending = h.run(); await flush();
+        await h.hello(h.children[0]); await h.authorize(h.children[0]);
+        const closing = mode === 'shutdown' ? h.runner.shutdown() : null;
+        if (mode === 'crash') h.children[0].emit('close', 1, null);
+        await h.advance(8000);
+        await assert.rejects(pending, { code: 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED' });
+        if (closing) assert.equal((await closing).ok, false);
+        assert.equal(h.runner.diagnostics().firstCause.reason, mode === 'shutdown' ? 'shutdown' : 'abnormal-exit');
+        assert.equal(h.runner.snapshot().chargedBytes, 0);
+    }
+});
+
 test('eligibility uses the canonical marker only on Linux and preserves marker errors', () => {
     let calls = 0;
     const insideBox = () => { calls += 1; return false; };

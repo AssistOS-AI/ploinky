@@ -75,6 +75,34 @@ test('eligible route preserves normalized relative input, exact byte charge, ori
     assert.equal(received.workspaceRoot, workspace);
     assert.notEqual(received.cwd, received.workspaceRoot);
     assert.equal(received.response, res);
+    assert.equal(received.diagnosticContext.caller, 'browser-control');
+    assert.equal(received.diagnosticContext.routeLease, false);
+    assert.equal(received.diagnosticContext.graphReadiness, 'unavailable');
+    assert.ok(received.diagnosticContext.receivedAt <= Date.now());
+    assert.ok(received.diagnosticContext.routerElapsedMs >= 0);
+    assert.doesNotMatch(JSON.stringify(received.diagnosticContext), /source\.git|topic|fixture/);
+});
+
+test('verified agent prepare carries only authorized caller and hashed generation context', async () => {
+    const { signAgentHttpAssertion } = await import('../../Agent/lib/agentAssertion.mjs');
+    const { deriveAgentRequestSecret } = await import('../../cli/utils/security/masterKey.js');
+    const { MARKETPLACE_AGENT_TARGET } = await import('../../cli/server/authHandlers/marketplaceRoutes.js');
+    const caller = 'agent:repo/caller';
+    const body = { action: 'install_repo', url: '../SECRET_CANARY.git', name: 'fixture' };
+    const bearer = signAgentHttpAssertion({ method: 'POST', path: '/api/marketplace/repos', body: Buffer.from(JSON.stringify(body)),
+        targetAgent: MARKETPLACE_AGENT_TARGET, tool: 'repositories.prepare',
+        env: { PLOINKY_AGENT_ID: caller, PLOINKY_AGENT_SECRET: deriveAgentRequestSecret(caller) } });
+    let context;
+    const { res } = await request({ body, bearer, authenticated: false, proof: false,
+        routePlan: { lease: { id: 'generation-a', commit: () => true } },
+        repositoryWorkerEligibility: () => true, repositoryWorker: async ({ diagnosticContext }) => {
+            context = diagnosticContext; return { status: 'cloned' };
+        } });
+    assert.equal(res.status, 200);
+    assert.equal(context.caller, 'agent-assertion');
+    assert.equal(context.routeLease, true);
+    assert.match(context.generation, /^[a-f0-9]{64}$/);
+    assert.doesNotMatch(JSON.stringify(context), /SECRET_CANARY|generation-a|agent:repo/);
 });
 
 test('native fallback remains direct and invalid canonical marker never falls back', async () => {

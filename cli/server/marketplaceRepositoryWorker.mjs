@@ -6,6 +6,8 @@ import { performance } from 'node:perf_hooks';
 import { isInsideBox } from '../../ploinky-box/lib/boxMarker.mjs';
 import { sanitizeGitDiagnostic } from '../utils/gitCommand.js';
 import { createRepositoryProcessObserver, proveRepositoryQuiescence, REPOSITORY_OPERATION_MARKER, PROC_LIMITS, sameProcess } from './marketplaceRepositoryProcessGroup.mjs';
+import { appendLog } from './utils/logger.js';
+import { createRepositoryDiagnostics, diagnosticIdentity, diagnosticPayload, processDiagnostic } from './marketplaceRepositoryDiagnostics.mjs';
 
 const SUPERVISOR_PATH = fileURLToPath(new URL('./marketplaceRepositorySupervisor.mjs', import.meta.url));
 export const REPOSITORY_QUEUE_LIMITS = Object.freeze({ pending: 16, bytes: 8 * 1024 * 1024, admissionMs: 600_000 });
@@ -43,7 +45,9 @@ export function createMarketplaceRepositoryRunner({
     spawnProcess = spawn, observer = createRepositoryProcessObserver(), time = clock,
     executablePath = process.execPath, resolveExecutable = realpath,
     proveQuiescence = proveRepositoryQuiescence,
+    diagnosticSink = appendLog,
 } = {}) {
+    const diagnostics = createRepositoryDiagnostics({ now: time.monotonic, sink: diagnosticSink });
     const pending = [];
     let active = null;
     let chargedBytes = 0;
@@ -52,11 +56,32 @@ export function createMarketplaceRepositoryRunner({
     let shutdownPromise;
     const delay = (ms) => new Promise((resolve) => time.setTimeout(resolve, Math.max(0, ms)));
     const expired = (ticket) => time.now() >= ticket.deadline;
+    function diagnosticRecord(ticket, payload) {
+        return { ...ticket.diagnosticContext, state: ticket.state,
+            deadline: ticket.deadline, elapsedMs: Math.max(0, Math.floor(time.monotonic() - ticket.started)),
+            source: 'router', ...payload };
+    }
+    function record(ticket, payload, first = false) {
+        diagnostics.retain(ticket.operationId, diagnosticRecord(ticket, payload), first);
+    }
+    function cause(ticket, phase, reason, details = {}) {
+        ticket.cause ||= { phase, reason, ...details };
+    }
+    function observationRecord(ticket, observation, phase) {
+        const details = { phase, reason: observation.complete ? 'received' : 'incomplete',
+            complete: observation.complete === true, records: observation.records?.length || 0,
+            members: observation.members?.length || 0, writers: observation.writers?.length || 0,
+            ...(diagnosticPayload(observation.diagnostic) || {}) };
+        record(ticket, details);
+        if (!observation.complete) cause(ticket, phase, 'incomplete', details);
+    }
     function discardPending(error) {
         for (const ticket of [...pending]) finish(ticket, error);
     }
     function finish(ticket, error, result) {
         if (ticket.finished) return;
+        if (error && !ticket.cancelling) record(ticket, { phase: 'admission',
+            reason: error.code === 'workspace_mutation_lock_timeout' ? 'expired' : error.code === closed().code ? 'closed' : 'unknown' });
         ticket.finished = true;
         ticket.cancelWake?.();
         time.clearTimeout(ticket.timer);
@@ -64,6 +89,16 @@ export function createMarketplaceRepositoryRunner({
         time.clearTimeout(ticket.cohortTimer);
         ticket.cohortClaims.clear();
         ticket.response?.removeListener?.('close', ticket.onClose);
+        if (ticket.response && !ticket.response.closed && !ticket.response.destroyed) {
+            // The HTTP response can close after worker settlement. Keep only
+            // safe scalar context, never the ticket, input, lease or request.
+            const operationId = ticket.operationId;
+            const closure = diagnosticRecord(ticket, { phase: 'closure', reason: 'closed', admitted: ticket.admitted === true });
+            const started = ticket.started;
+            ticket.response.once?.('close', () => diagnostics.retain(operationId, {
+                ...closure, closedAt: time.now(), elapsedMs: Math.max(0, Math.floor(time.monotonic() - started)),
+            }));
+        }
         const index = pending.indexOf(ticket);
         if (index >= 0) pending.splice(index, 1);
         if (active === ticket) active = null;
@@ -90,10 +125,13 @@ export function createMarketplaceRepositoryRunner({
         if (!ticket.child?.connected) return false;
         try {
             ticket.child.send({ ...message, operationId: ticket.operationId }, (error) => {
-                if (error && !ticket.finished && !ticket.cancelling) void cancel(ticket);
+                if (error && !ticket.finished && !ticket.cancelling) {
+                    cause(ticket, 'ipc', 'ipc-failed', { connected: ticket.child.connected === true });
+                    void cancel(ticket);
+                }
             });
             return true;
-        } catch (_) { return false; }
+        } catch (_) { cause(ticket, 'ipc', 'ipc-failed'); return false; }
     }
     const options = (ticket) => ({ baseline: ticket.baseline, coordinator: ticket.coordinator,
         router: ticket.router, operationId: ticket.operationId, remembered: ticket.remembered });
@@ -108,6 +146,7 @@ export function createMarketplaceRepositoryRunner({
     }
     function failCohort(ticket) {
         if (ticket.finished) return;
+        cause(ticket, 'observation', 'cohort');
         ticket.cohortFailed = true;
         void cancel(ticket);
     }
@@ -162,6 +201,7 @@ export function createMarketplaceRepositoryRunner({
                     observer.scan(options(ticket)),
                     new Promise((_, reject) => { timer = time.setTimeout(() => reject(recovery()), deadline - time.monotonic()); }),
                 ]);
+                observationRecord(ticket, observation, 'observation');
                 if (ticket.finished || ticket.cohortFlight !== flight || time.monotonic() >= deadline) throw recovery();
                 // Only a timely local observation can establish history. A
                 // partial positive cohort may assist recovery, never success.
@@ -180,6 +220,7 @@ export function createMarketplaceRepositoryRunner({
                 scheduleClaimExpiry(ticket);
                 return observation;
             } catch (error) {
+                cause(ticket, 'observation', 'unknown', processDiagnostic(error));
                 if (!ticket.finished) {
                     ticket.cohortFailed = true;
                     ticket.observationUncertain = true;
@@ -214,9 +255,12 @@ export function createMarketplaceRepositoryRunner({
     }
     async function captureCoordinator(ticket) {
         const record = await observer.read(ticket.child.pid, { executable: true });
-        if (record.pid !== ticket.child.pid || record.group !== record.pid || record.session !== record.pid
-            || record.namespace !== ticket.router.namespace || record.uids !== ticket.router.uids
-            || record.exe !== ticket.executable || JSON.stringify(record.argv) !== JSON.stringify([executablePath, SUPERVISOR_PATH])) throw recovery();
+        const mismatch = [
+            ['pid', record.pid !== ticket.child.pid], ['group', record.group !== record.pid], ['session', record.session !== record.pid],
+            ['namespace', record.namespace !== ticket.router.namespace], ['uids', record.uids !== ticket.router.uids],
+            ['executable', record.exe !== ticket.executable], ['argv', JSON.stringify(record.argv) !== JSON.stringify([executablePath, SUPERVISOR_PATH])],
+        ].find(([, differs]) => differs);
+        if (mismatch) { cause(ticket, 'ownership', 'mismatch', { mismatch: mismatch[0] }); throw recovery(); }
         ticket.coordinator = record;
     }
     async function signalMembers(ticket, signal, deadline) {
@@ -235,6 +279,7 @@ export function createMarketplaceRepositoryRunner({
     }
     function cancel(ticket, error = recovery()) {
         if (ticket.cancelling || ticket.finished) return ticket.settled;
+        record(ticket, ticket.cause || { phase: 'cancellation', reason: 'recovery' }, true);
         ticket.cancelling = true;
         ticket.state = 'cancelling';
         accepting = false;
@@ -244,7 +289,7 @@ export function createMarketplaceRepositoryRunner({
         discardPending(recovery());
         time.clearTimeout(ticket.timer);
         time.clearTimeout(ticket.expiryGrace);
-        if (!ticket.child) { finish(ticket, error); return ticket.settled; }
+        if (!ticket.child) { finish(ticket, error); diagnostics.emit(); return ticket.settled; }
         const started = time.monotonic();
         const deadline = started + 8_000;
         const hardStop = time.setTimeout(() => finish(ticket, error), 8_000);
@@ -303,11 +348,21 @@ export function createMarketplaceRepositoryRunner({
                 finish(ticket, error);
             }
         })();
+        diagnostics.emit();
         return ticket.settled;
     }
     async function handleMessage(ticket, message) {
         if (ticket.finished) return;
-        if (message?.operationId !== ticket.operationId) { void cancel(ticket); return; }
+        if (message?.operationId !== ticket.operationId) { cause(ticket, 'ipc', 'protocol'); void cancel(ticket); return; }
+        if (message.type === 'diagnostic') {
+            const payload = Object.keys(message).length === 3 && diagnosticPayload(message.payload);
+            if (!payload) diagnostics.loss();
+            else {
+                record(ticket, { ...payload, source: 'supervisor' });
+                if (!ticket.remoteCause) ticket.remoteCause = payload;
+            }
+            return;
+        }
         if (message.type === 'cohort') {
             ticket.processingCohortFrames += 1;
             try { registerCohort(ticket, message.members); }
@@ -319,10 +374,14 @@ export function createMarketplaceRepositoryRunner({
             }
             return;
         }
-        if (message.type === 'recovery') { void cancel(ticket); return; }
+        if (message.type === 'recovery') {
+            cause(ticket, 'cancellation', 'recovery', ticket.remoteCause ? { ...ticket.remoteCause, source: 'supervisor' } : {});
+            void cancel(ticket); return;
+        }
         if (ticket.cancelling) return;
         if (message.type === 'hello' && ticket.state === 'launched' && message.pid === ticket.child.pid) {
             ticket.state = 'ownership';
+            ticket.helloReceived = true;
             await captureCoordinator(ticket);
             if (ticket.cancelling || ticket.finished) return;
             ticket.state = 'acquiring';
@@ -360,7 +419,7 @@ export function createMarketplaceRepositoryRunner({
                 : typeof message.error?.message === 'string')) {
             ticket.terminal = message;
             ticket.state = 'released';
-        } else void cancel(ticket);
+        } else { cause(ticket, 'ipc', 'protocol'); void cancel(ticket); }
     }
     async function launch(ticket) {
         try {
@@ -368,15 +427,17 @@ export function createMarketplaceRepositoryRunner({
             if (ticket.isClosed()) throw closed();
             const baseline = await observer.scan();
             if (ticket.finished) return;
+            observationRecord(ticket, baseline, 'baseline');
             if (!baseline.complete) throw recovery();
             ticket.baseline = baseline.records;
             ticket.router = baseline.records.find((entry) => entry.pid === process.pid);
-            if (!ticket.router) throw recovery();
+            if (!ticket.router) { cause(ticket, 'baseline', 'mismatch', { mismatch: 'router-missing' }); throw recovery(); }
             ticket.executable = await resolveExecutable(executablePath);
             if (ticket.finished) return;
             if (expired(ticket)) throw timeout();
             if (ticket.isClosed()) throw closed();
             ticket.state = 'launched';
+            ticket.spawnAttempted = true;
             ticket.child = spawnProcess(executablePath, [SUPERVISOR_PATH], {
                 cwd: ticket.cwd, shell: false, detached: true,
                 env: { ...process.env, PLOINKY_WORKSPACE_ROOT: ticket.workspaceRoot,
@@ -385,15 +446,26 @@ export function createMarketplaceRepositoryRunner({
             });
             ticket.child.stdout?.resume();
             ticket.child.stderr?.resume();
-            ticket.child.on('message', (message) => { void handleMessage(ticket, message).catch(() => cancel(ticket)); });
-            ticket.child.once('error', () => { void cancel(ticket); });
+            ticket.child.on('message', (message) => { void handleMessage(ticket, message).catch(error => {
+                cause(ticket, ticket.state === 'ownership' ? 'ownership' : 'ipc', 'unknown', processDiagnostic(error));
+                return cancel(ticket);
+            }); });
+            ticket.child.once('error', (error) => { cause(ticket, 'launch', 'spawn-failed', processDiagnostic(error)); void cancel(ticket); });
             ticket.child.once('close', (code, signal) => {
                 ticket.childClosed = true;
                 if (ticket.finished || ticket.cancelling) return;
-                if (code !== 0 || signal || !ticket.terminal || ticket.state !== 'released') { void cancel(ticket); return; }
+                if (code !== 0 || signal || !ticket.terminal || ticket.state !== 'released') {
+                    cause(ticket, 'exit', ticket.helloReceived ? 'abnormal-exit' : 'pre-hello-exit', {
+                        ...(Number.isSafeInteger(code) && code >= 0 ? { exitCode: code } : {}),
+                        ...(signal ? { signal: ['SIGTERM', 'SIGKILL', 'SIGINT', 'SIGABRT', 'SIGSEGV'].includes(signal) ? signal : 'OTHER' } : {}),
+                        connected: ticket.child.connected === true,
+                    });
+                    void cancel(ticket); return;
+                }
                 completeNormally(ticket);
             });
         } catch (error) {
+            cause(ticket, ticket.spawnAttempted ? 'launch' : 'baseline', ticket.spawnAttempted ? 'spawn-failed' : 'unknown', processDiagnostic(error));
             if (error.code === 'workspace_mutation_lock_timeout' || error.code === closed().code) finish(ticket, error);
             else void cancel(ticket);
         }
@@ -406,16 +478,21 @@ export function createMarketplaceRepositoryRunner({
         ticket.state = 'preparing';
         void launch(ticket);
     }
-    function run({ operation, rawBodyBytes, cwd, workspaceRoot, authorize = () => true, response } = {}) {
+    function run({ operation, rawBodyBytes, cwd, workspaceRoot, authorize = () => true, response, diagnosticContext = {} } = {}) {
         const bytes = rawBodyBytes + Buffer.byteLength(JSON.stringify(operation), 'utf8');
         return new Promise((resolve, reject) => {
-            if (!accepting) { reject(recovery()); return; }
+            if (!accepting) { reject(recovery()); diagnostics.emit(); return; }
             if (!Number.isSafeInteger(bytes) || bytes < 0) { reject(failure('PLOINKY_MARKETPLACE_REPOSITORY_INPUT_INVALID', 'Invalid repository input size.')); return; }
             if (pending.length >= REPOSITORY_QUEUE_LIMITS.pending || bytes > REPOSITORY_QUEUE_LIMITS.bytes - chargedBytes) {
                 reject(failure('marketplace_repository_busy', 'Repository operation queue is full. Retry later.')); return;
             }
             let done;
             const ticket = { operation, bytes, cwd, workspaceRoot, authorize, response, resolve, reject,
+                started: time.monotonic(),
+                diagnosticContext: { ...(diagnosticPayload(diagnosticContext) || {}),
+                    ...(diagnosticIdentity(workspaceRoot) ? { workspace: diagnosticIdentity(workspaceRoot) } : {}),
+                    action: ['install_repo', 'uninstall_repo'].includes(operation?.action) ? operation.action : 'unknown',
+                    caller: diagnosticPayload(diagnosticContext)?.caller || 'unknown' },
                 deadline: time.now() + REPOSITORY_QUEUE_LIMITS.admissionMs, operationId: randomUUID(),
                 state: 'pending', remembered: [], processingCohortFrames: 0, cohortClaims: new Map(),
                 cohortSequence: 0, cohortFailed: false,
@@ -423,11 +500,13 @@ export function createMarketplaceRepositoryRunner({
             let responseClosed = false;
             ticket.isClosed = () => responseClosed || (!response?.writableEnded && (response?.closed === true || response?.destroyed === true));
             ticket.onClose = () => {
+                record(ticket, { phase: 'closure', reason: 'closed', closedAt: time.now(), admitted: ticket.admitted === true });
                 if (!response?.writableEnded) responseClosed = true;
                 if (ticket.state === 'pending' && ticket.isClosed()) finish(ticket, closed());
             };
             response?.once?.('close', ticket.onClose);
             chargedBytes += bytes;
+            record(ticket, { phase: 'receipt', reason: 'received' });
             pending.push(ticket);
             if (ticket.isClosed()) { finish(ticket, closed()); return; }
             ticket.timer = time.setTimeout(() => {
@@ -438,7 +517,9 @@ export function createMarketplaceRepositoryRunner({
                     // Acquisition has its own remaining-time budget. Permit
                     // unused-lease settlement; a broken protocol must not hold
                     // admission forever. This never times an admitted Git call.
-                    ticket.expiryGrace = time.setTimeout(() => { if (!ticket.admitted) void cancel(ticket, timeout()); }, 4_000);
+                    ticket.expiryGrace = time.setTimeout(() => {
+                        if (!ticket.admitted) { cause(ticket, 'admission', 'expired'); void cancel(ticket, timeout()); }
+                    }, 4_000);
                 }
             }, Math.max(0, ticket.deadline - time.now()));
             drain();
@@ -450,12 +531,13 @@ export function createMarketplaceRepositoryRunner({
         discardPending(closed());
         const ticket = active;
         shutdownPromise = (async () => {
-            if (ticket) await cancel(ticket, ticket.child ? recovery() : closed());
+            if (ticket) { cause(ticket, 'shutdown', 'shutdown'); await cancel(ticket, ticket.child ? recovery() : closed()); }
             return recoveryDebt ? { ok: false, code: RECOVERY_CODE } : { ok: true };
         })();
         return shutdownPromise;
     }
-    return { run, shutdown, snapshot: () => ({ active: Boolean(active), pending: pending.length, chargedBytes, accepting, recoveryDebt }) };
+    return { run, shutdown, diagnostics: diagnostics.snapshot,
+        snapshot: () => ({ active: Boolean(active), pending: pending.length, chargedBytes, accepting, recoveryDebt }) };
 }
 
 let runner;

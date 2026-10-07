@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
 import { retainWorkspaceMutationLeaseForRecovery } from '../utils/runtime/maintenanceLocks.js';
 import { createRepositoryProcessObserver, proveRepositoryQuiescence, REPOSITORY_OPERATION_MARKER, sameProcess } from './marketplaceRepositoryProcessGroup.mjs';
+import { diagnosticPayload, processDiagnostic } from './marketplaceRepositoryDiagnostics.mjs';
 
 const THREAD_URL = new URL('./marketplaceRepositoryWorkerThread.mjs', import.meta.url);
 
@@ -24,6 +25,16 @@ export function startRepositorySupervisor({
     let poll;
     let cancelTimer;
     let remembered = [];
+    let lastObservation;
+    let firstCause;
+    const cause = (phase, reason, details = {}) => { firstCause ||= { phase, reason, ...details }; };
+    const diagnostic = (payload) => {
+        const safe = diagnosticPayload(payload);
+        if (!safe || !channel.connected) return;
+        // Observability has no authority and cannot recursively cancel on a
+        // failed sink. The following recovery frame retains its old contract.
+        try { channel.send({ type: 'diagnostic', operationId, payload: safe }, () => {}); } catch (_) { /* diagnostic loss */ }
+    };
     const send = (message) => {
         if (!channel.connected) return;
         try { channel.send({ ...message, operationId }, (error) => { if (error) void cancel(); }); }
@@ -39,7 +50,7 @@ export function startRepositorySupervisor({
         for (const entry of observation.members) union.set(`${entry.pid}:${entry.birth}`, entry);
         // No unbounded history during a long clone. Overflow is a recovery
         // condition, never loss of identities that might still be writers.
-        if (union.size > 8_192) { void cancel(); return; }
+        if (union.size > 8_192) { cause('observation', 'cohort', { category: 'entry-overflow', field: 'identity' }); void cancel(); return; }
         remembered = [...union.values()];
         send({ type: 'cohort', members: remembered.map(({ pid, birth, namespace, uids, parent, group, session, state }) => (
             { pid, birth, namespace, uids, parent, group, session, state }
@@ -52,8 +63,13 @@ export function startRepositorySupervisor({
         observationPromise = (async () => {
             try {
                 const observation = await observer.scan(snapshotOptions());
+                lastObservation = { complete: observation.complete === true, records: observation.records?.length || 0,
+                    members: observation.members.length, writers: observation.writers.length,
+                    ...(diagnosticPayload(observation.diagnostic) || {}) };
                 remember(observation);
-                if (state === 'settlement-barrier' && observation.writers.length) void cancel();
+                if (state === 'settlement-barrier' && observation.writers.length) {
+                    cause('settlement', 'writer', lastObservation); void cancel();
+                }
                 return observation;
             } finally { observing = false; observationPromise = null; }
         })();
@@ -62,9 +78,13 @@ export function startRepositorySupervisor({
     async function cancel() {
         if (state === 'closed') return;
         if (state === 'cancelling') { retainExact(); return; }
+        const previousState = state;
         state = 'cancelling';
         clearInterval(poll);
         retainExact();
+        diagnostic({ source: 'supervisor', state: previousState,
+            ...(lastObservation || {}),
+            ...(firstCause || { phase: 'cancellation', reason: 'recovery' }) });
         send({ type: 'recovery', code: 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED' });
         const started = performance.now();
         const signalDescendants = async (signal, deadline, members = remembered) => {
@@ -109,7 +129,14 @@ export function startRepositorySupervisor({
         const proof = await proveRepositoryQuiescence(observer, snapshotOptions(), { barrier: true });
         if (proof.observation) remember(proof.observation);
         if (state !== 'settlement-barrier') return;
-        if (!proof.ok) { await cancel(); return; }
+        if (!proof.ok) {
+            cause('settlement', proof.reason === 'writer' ? 'writer' : 'incomplete', {
+                ...(diagnosticPayload(proof.observation?.diagnostic) || {}), complete: proof.observation?.complete === true,
+                records: proof.observation?.records?.length || 0, members: proof.observation?.members?.length || 0,
+                writers: proof.observation?.writers?.length || 0,
+            });
+            await cancel(); return;
+        }
         state = 'release-granted';
         send({ type: 'release-granted' });
         worker.postMessage({ type: 'release', operationId });
@@ -123,10 +150,10 @@ export function startRepositorySupervisor({
         channel.disconnect();
     }
     channel.on('message', (message) => {
-        void handleMessage(message).catch(() => cancel());
+        void handleMessage(message).catch(error => { cause(state === 'ownership' ? 'ownership' : 'ipc', 'unknown', processDiagnostic(error)); return cancel(); });
     });
     async function handleMessage(message) {
-        if (message?.operationId !== operationId) { await cancel(); return; }
+        if (message?.operationId !== operationId) { cause('ipc', 'protocol'); await cancel(); return; }
         if (message.type === 'cancel') { await cancel(); return; }
         if (message.type === 'expire') return; // worker and ownership use the one original deadline
         if (state === 'cancelling') return;
@@ -137,6 +164,9 @@ export function startRepositorySupervisor({
             const own = await observer.read(process.pid, { executable: true });
             if (!sameProcess(own, data.coordinator) || own.group !== process.pid || own.session !== process.pid
                 || own.exe !== data.coordinator.exe || JSON.stringify(own.argv) !== JSON.stringify(data.coordinator.argv)) {
+                cause('ownership', 'mismatch', { mismatch: !sameProcess(own, data.coordinator) ? 'unknown'
+                    : own.group !== process.pid ? 'group' : own.session !== process.pid ? 'session'
+                        : own.exe !== data.coordinator.exe ? 'executable' : 'argv' });
                 await cancel(); return;
             }
             if (state !== 'ownership') return;
@@ -161,15 +191,15 @@ export function startRepositorySupervisor({
             data.operation = null;
             worker.stdout?.resume();
             worker.stderr?.resume();
-            worker.on('message', (entry) => { void workerMessage(entry).catch(() => cancel()); });
-            worker.once('error', () => { void cancel(); });
+            worker.on('message', (entry) => { void workerMessage(entry).catch(error => { cause('ipc', 'unknown', processDiagnostic(error)); return cancel(); }); });
+            worker.once('error', () => { cause('exit', 'worker-failed'); void cancel(); });
             worker.once('exit', (code) => {
                 workerExited = true;
                 if (state === 'cancelling') retainExact();
-                else if (code !== 0 || !terminal) void cancel();
+                else if (code !== 0 || !terminal) { cause('exit', 'worker-failed', Number.isSafeInteger(code) && code >= 0 ? { exitCode: code } : {}); void cancel(); }
                 else finish();
             });
-            poll = setInterval(() => { void observe().catch(() => cancel()); }, 100);
+            poll = setInterval(() => { void observe().catch(error => { cause('observation', 'unknown', processDiagnostic(error)); return cancel(); }); }, 100);
         } else if (message.type === 'authorization' && state === 'awaiting-admission') {
             // Expiry is still checked again in the worker immediately before
             // service entry. An admitted Git call has no normal time limit.
@@ -178,10 +208,10 @@ export function startRepositorySupervisor({
                 ? { type: 'authorization', operationId, ok: false, error: { code: 'workspace_mutation_lock_timeout',
                     message: 'Timed out waiting for repository operation admission.' } }
                 : message);
-        } else await cancel();
+        } else { cause('ipc', 'protocol'); await cancel(); }
     }
     async function workerMessage(message) {
-        if (message?.operationId !== operationId) { await cancel(); return; }
+        if (message?.operationId !== operationId) { cause('ipc', 'protocol'); await cancel(); return; }
         if (message.type === 'lease') {
             if (token || typeof message.token !== 'string' || !message.token) { await cancel(); return; }
             token = message.token;
@@ -197,14 +227,14 @@ export function startRepositorySupervisor({
             await settle();
         } else if (message.type === 'terminal' && state === 'release-granted' && !terminal
             && typeof message.ok === 'boolean') {
-            if (message.error?.code === 'workspace_mutation_lock_release_failed') { await cancel(); return; }
+            if (message.error?.code === 'workspace_mutation_lock_release_failed') { cause('release', 'release-failed'); await cancel(); return; }
             terminal = message.ok ? { ok: true, result: message.result } : { ok: false, error: message.error };
             finish();
-        } else await cancel();
+        } else { cause('ipc', 'protocol'); await cancel(); }
     }
-    channel.on('disconnect', () => { if (state !== 'closed') void cancel(); });
-    process.on('SIGTERM', () => { void cancel(); });
-    process.on('SIGINT', () => { void cancel(); });
+    channel.on('disconnect', () => { if (state !== 'closed') { cause('ipc', 'ipc-failed', { connected: false }); void cancel(); } });
+    process.on('SIGTERM', () => { cause('shutdown', 'shutdown', { signal: 'SIGTERM' }); void cancel(); });
+    process.on('SIGINT', () => { cause('shutdown', 'shutdown', { signal: 'SIGINT' }); void cancel(); });
     send({ type: 'hello', pid: process.pid });
     return { cancel, state: () => state };
 }

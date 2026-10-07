@@ -36,6 +36,7 @@ import { verifyAgentAssertion } from '../mcp-proxy/invocationMinter.js';
 import { createTokenReplayCache } from '../security/tokens/JwsCodec.js';
 import { runMarketplaceEnableWorker } from '../marketplaceEnableWorker.js';
 import { repositoryWorkerEligible, runMarketplaceRepositoryWorker } from '../marketplaceRepositoryWorker.mjs';
+import { diagnosticIdentity } from '../marketplaceRepositoryDiagnostics.mjs';
 import { authService, LOCAL_AUTH_COOKIE_NAME, parseCookies, sendJson, sessionTokenService, SSO_AUTH_COOKIE_NAME } from './shared.js';
 import { localSessionAllowedForRoutePlan } from './authContext.js';
 import { findHardwareOutcome, formatHardwareOutcome } from '../../sandbox/hardwareLimits/errors.mjs';
@@ -649,6 +650,8 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
 } = {}) {
     const route = parseMarketplacePath(parsedUrl.pathname || '/');
     if (!route) return false;
+    const receivedAt = Date.now();
+    const routerElapsedMs = Math.floor(process.uptime() * 1_000);
 
     if (routePlan?.lease?.commit && routePlan.lease.commit() !== true) {
         sendMarketplaceError(res, 503, 'edge_generation_changed');
@@ -820,6 +823,12 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
                     const originalLease = routePlan?.lease;
                     result = await repositoryWorker({ operation, rawBodyBytes, cwd: process.cwd(),
                         workspaceRoot: PLOINKY_WORKSPACE_ROOT, response: res,
+                        diagnosticContext: {
+                            caller: agentRequest ? 'agent-assertion' : publicMarketplaceAuthContext(routePlan) ? 'browser-public' : 'browser-control',
+                            routeLease: Boolean(originalLease), receivedAt, routerElapsedMs,
+                            graphReadiness: 'unavailable',
+                            ...(diagnosticIdentity(originalLease?.id) ? { generation: diagnosticIdentity(originalLease.id) } : {}),
+                        },
                         authorize: () => !originalLease?.commit || originalLease.commit() === true });
                 } else if (action === 'install_repo') {
                     result = await withWorkspaceMutationLease({ operation: 'repositories-prepare' }, () => (

@@ -28,7 +28,7 @@ authService.validateSession = async id => [admin, user].find(session => session.
 const snapshot = { generation: 'generation-a', agents: { shell: { type: 'agent', agentName: 'shell', repoName: 'repo', auth: policy } }, routing: { static: { agent: 'shell' }, routes: { shell: { agent: 'shell', repo: 'repo' } } }, manifests: {} };
 const plan = () => ({ ok: true, kind: 'router-surface', surface: 'marketplace-ui', listener: 'public', hostSelection: { kind: 'agent-root', record: { routeKey: 'shell' } }, forwarding: { protocol: 'https', authority: 'explorer.example.test' }, snapshot, lease: { id: snapshot.generation, snapshot, commit: () => true } });
 let enabled = 0;
-async function request({ resource = 'agents', who = admin, routePlan = plan(), origin = 'https://explorer.example.test', csrf = 'valid', method = 'POST', body = { action: 'enable_agent', agentRef: 'repo/worker', mode: 'global' }, mutate } = {}) {
+async function request({ resource = 'agents', who = admin, routePlan = plan(), origin = 'https://explorer.example.test', csrf = 'valid', method = 'POST', body = { action: 'enable_agent', agentRef: 'repo/worker', mode: 'global' }, mutate, repositoryWorker } = {}) {
     const req = Readable.from(method === 'GET' ? [] : [Buffer.from(JSON.stringify(body))]);
     req.method = method;
     req.headers = { host: 'explorer.example.test', origin, cookie: `${who === cli ? 'ploinky_jwt' : SSO_AUTH_COOKIE_NAME}=${who.sessionId}` };
@@ -41,7 +41,8 @@ async function request({ resource = 'agents', who = admin, routePlan = plan(), o
     if (mutate) mutate(req);
     const res = { status: 200, setHeader() {}, writeHead(code) { this.status = code; }, end(body) { this.body = JSON.parse(body); } };
     // No container engine in a unit test: the listing observes no live containers.
-    await handleMarketplaceRoutes(req, res, new URL('https://explorer.example.test/api/marketplace' + (resource ? `/${resource}` : '')), { routePlan, enableAgentAction: async () => { enabled++; return { result: { status: 'enabled' } }; }, agentListOptions: { liveContainers: [] } });
+    await handleMarketplaceRoutes(req, res, new URL('https://explorer.example.test/api/marketplace' + (resource ? `/${resource}` : '')), { routePlan, enableAgentAction: async () => { enabled++; return { result: { status: 'enabled' } }; }, agentListOptions: { liveContainers: [] },
+        ...(repositoryWorker ? { repositoryWorker, repositoryWorkerEligibility: () => true } : {}) });
     return res;
 }
 test.after(() => { authService.isConfigured = originalConfigured; authService.validateSession = originalValidate; process.chdir(previousCwd); if (previousKey === undefined) delete process.env.PLOINKY_MASTER_KEY; else process.env.PLOINKY_MASTER_KEY = previousKey; fs.rmSync(workspace, { recursive: true, force: true }); });
@@ -52,6 +53,20 @@ test('public Marketplace admits a selected-root admin using routed browser CSRF'
     assert.equal(res.status, 200, JSON.stringify(res.body));
     assert.equal(enabled, before + 1);
     assert.equal(res.body.action, 'enable_agent');
+});
+test('public repository diagnostics are created only after routed admin and CSRF authorization', async () => {
+    const calls = [];
+    const repositoryWorker = async ({ diagnosticContext }) => { calls.push(diagnosticContext); return { status: 'cloned' }; };
+    const options = { resource: 'repos', body: { action: 'install_repo', url: '../SECRET_CANARY.git' }, repositoryWorker };
+    assert.equal((await request({ ...options, csrf: 'missing' })).status, 403);
+    assert.equal((await request({ ...options, who: user })).status, 403);
+    assert.equal(calls.length, 0);
+    assert.equal((await request(options)).status, 200);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].caller, 'browser-public');
+    assert.equal(calls[0].routeLease, true);
+    assert.match(calls[0].generation, /^[a-f0-9]{64}$/);
+    assert.doesNotMatch(JSON.stringify(calls[0]), /SECRET_CANARY|admin-provider-session|generation-a/);
 });
 test('public Marketplace rejects non-admin and foreign provider sessions', async () => {
     const before = enabled;

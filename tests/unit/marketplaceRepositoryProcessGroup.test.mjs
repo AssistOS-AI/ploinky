@@ -93,11 +93,13 @@ test('new unreadable environment and a truncated proc field stay unknown', async
     fixture.add(30, { unreadable: 'environ' });
     let observed = await observer.scan(options);
     assert.equal(observed.complete, false);
+    assert.deepEqual(observed.diagnostic.unknowns[0], { category: 'permission', field: 'environment', errno: 'EACCES', count: 1 });
     assert.equal((await proveRepositoryQuiescence(observer, options, { barrier: true })).ok, false);
     fixture.processes.get(30).unreadable = null;
     fixture.processes.get(30).env = ['x'.repeat(65_537)];
     observed = await observer.scan(options);
     assert.equal(observed.complete, false);
+    assert.equal(observed.diagnostic.unknowns[0].category, 'truncated');
     assert.equal(fixture.handles(), 0);
 });
 
@@ -134,12 +136,16 @@ test('census overflow and observation timeout never become a complete empty list
     const fixture = procFixture();
     for (let pid = 1; pid <= 8_193; pid += 1) fixture.add(pid);
     const observer = createRepositoryProcessObserver({ fsApi: fixture.fsApi });
-    assert.equal((await observer.scan()).complete, false);
+    const overflow = await observer.scan();
+    assert.equal(overflow.complete, false);
+    assert.equal(overflow.diagnostic.unknowns[0].category, 'entry-overflow');
     assert.equal(fixture.opens(), 0, 'overflow is refused before process reads');
     assert.equal(fixture.handles(), 0);
     let clock = 0;
     const timed = createRepositoryProcessObserver({ fsApi: fixture.fsApi, now: () => { clock += 600; return clock; } });
-    assert.equal((await timed.scan()).complete, false);
+    const timeout = await timed.scan();
+    assert.equal(timeout.complete, false);
+    assert.equal(timeout.diagnostic.unknowns[0].category, 'deadline');
     assert.equal(fixture.handles(), 0);
 });
 
@@ -200,6 +206,7 @@ test('mid-census parent PID reuse cannot adopt or signal an unrelated replacemen
     assert.ok(observed.records.some((entry) => entry.pid === 21 && entry.birth === '2100'), 'census captured owned A');
     assert.ok(observed.records.some((entry) => entry.pid === 30 && entry.birth === '9300'), 'census captured foreign C');
     assert.equal(observed.complete, false, 'a replaced lineage anchor leaves unknown ownership');
+    assert.equal(observed.diagnostic.unknowns[0].category, 'lineage');
     assert.equal(observed.members.some((entry) => entry.pid === 30), false, 'numeric PPID does not establish ownership');
     const sent = [];
     for (const writer of observed.writers) await observer.signal(writer, 'SIGKILL', { kill: (...args) => sent.push(args) });
@@ -214,6 +221,7 @@ test('protected preexisting namespace denial blocks baseline and later proof ins
     const observer = createRepositoryProcessObserver({ fsApi: fixture.fsApi });
     const baseline = await observer.scan();
     assert.equal(baseline.complete, false);
+    assert.deepEqual(baseline.diagnostic.unknowns[0], { category: 'permission', field: 'namespace', errno: 'EACCES', count: 1 });
     assert.equal(baseline.records.some((entry) => entry.pid === 11), false);
     assert.equal((await observer.scan({ baseline: baseline.records })).complete, false);
     assert.equal(fixture.handles(), 0);
@@ -253,4 +261,74 @@ test('an expired cleanup budget prevents a signal after identity validation comp
         coordinator: options.coordinator, group: true, isAllowed: () => false, kill: (...args) => sent.push(args),
     }), false);
     assert.deepEqual(sent, []);
+});
+
+test('field failures report only category and errno, and malformed identities never expose contents', async () => {
+    for (const [rawField, field] of [['stat', 'stat'], ['status', 'status'], ['cmdline', 'argv'], ['ns/pid', 'namespace']]) {
+        const fixture = procFixture();
+        fixture.add(10, { unreadable: rawField });
+        const observer = createRepositoryProcessObserver({ fsApi: fixture.fsApi });
+        const result = await observer.scan();
+        assert.equal(result.complete, false);
+        assert.deepEqual(result.diagnostic.unknowns[0], { category: 'permission', field, errno: 'EACCES', count: 1 });
+    }
+    for (const [property, value, field] of [['birth', 'SECRET_CANARY', 'stat'], ['uid', 'SECRET_CANARY', 'status'], ['namespace', 'SECRET_CANARY', 'namespace']]) {
+        const fixture = procFixture(); fixture.add(10, { [property]: value });
+        const result = await createRepositoryProcessObserver({ fsApi: fixture.fsApi }).scan();
+        assert.equal(result.complete, false);
+        assert.deepEqual(result.diagnostic.unknowns[0], { category: 'malformed', field, count: 1 });
+        assert.doesNotMatch(JSON.stringify(result.diagnostic), /SECRET_CANARY/);
+    }
+});
+
+test('identity instability identifies the changing field without changing the unknown decision', async () => {
+    for (const [property, value, field] of [['birth', '999', 'birth'], ['namespace', 'pid:[99]', 'namespace'],
+        ['uid', 999, 'status'], ['parent', 999, 'parent'], ['group', 999, 'group'], ['session', 999, 'session'],
+        ['argv', ['SECRET_CANARY'], 'argv']]) {
+        const fixture = procFixture(); fixture.add(10);
+        fixture.setMutate((pid, name) => { if (name === 'cmdline') fixture.processes.get(pid)[property] = value; });
+        const result = await createRepositoryProcessObserver({ fsApi: fixture.fsApi }).scan();
+        assert.equal(result.complete, false);
+        assert.deepEqual(result.diagnostic.unknowns[0], { category: 'unstable', field, count: 1 });
+        assert.doesNotMatch(JSON.stringify(result.diagnostic), /SECRET_CANARY/);
+    }
+});
+
+test('confirmed disappearance is not an unknown while a readable replacement remains unconfirmed', async () => {
+    for (const replacement of [false, true]) {
+        const fixture = procFixture(); fixture.add(10);
+        let calls = 0;
+        const open = fixture.fsApi.open;
+        fixture.fsApi.open = async (...args) => {
+            if (++calls === 1 || !replacement) throw Object.assign(new Error('SECRET_CANARY'), { code: 'ENOENT' });
+            return open(...args);
+        };
+        const result = await createRepositoryProcessObserver({ fsApi: fixture.fsApi }).scan();
+        assert.equal(result.complete, !replacement);
+        assert.deepEqual(result.diagnostic.unknowns, replacement ? [{ category: 'disappearance-unconfirmed', field: 'stat', count: 1 }] : []);
+    }
+});
+
+test('overlap and reader saturation have separate bounded diagnostics', async () => {
+    const fixture = procFixture(); fixture.add(10);
+    let unblock;
+    const hold = new Promise(resolve => { unblock = resolve; });
+    fixture.setBeforeOpen(() => hold);
+    const observer = createRepositoryProcessObserver({ fsApi: fixture.fsApi });
+    const active = observer.scan();
+    await Promise.resolve();
+    const overlap = await observer.scan();
+    assert.equal(overlap.diagnostic.unknowns[0].category, 'overlap');
+    unblock(); await active;
+
+    let release;
+    const blocked = new Promise(resolve => { release = resolve; });
+    fixture.setBeforeOpen(() => blocked);
+    const reads = Array.from({ length: 8 }, () => observer.read(10));
+    await assert.rejects(observer.read(10), error => error.diagnostic.category === 'reader-saturation');
+    const saturated = await observer.scan();
+    assert.equal(saturated.complete, false);
+    assert.ok(saturated.diagnostic.unknowns.some(row => row.category === 'reader-saturation'));
+    release(); await Promise.all(reads);
+    assert.equal(fixture.handles(), 0);
 });
