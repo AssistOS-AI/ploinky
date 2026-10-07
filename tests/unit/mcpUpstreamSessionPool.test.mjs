@@ -1116,43 +1116,241 @@ test('queue: a queued tools/list times out on its own deadline without sending a
     assert.equal(after.result.content[0].text, 'after');
 });
 
-test('closeAll lets calls in flight finish before it DELETEs their session', async (t) => {
-    let repliedAt = 0;
-    const upstream = await startFakeUpstream(t, {
-        onRpc: async ({ res, message }) => {
-            if (message?.method !== 'tools/call' || message?.params?.name !== 'slow') return false;
-            await new Promise((resolve) => setTimeout(resolve, 400));
-            const data = Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { content: [{ type: 'text', text: 'slow-done' }] } }));
-            res.writeHead(200, { 'content-type': 'application/json', 'content-length': data.length });
-            res.end(data);
-            repliedAt = Date.now();
-            return true;
+// Each held response is an explicit barrier. No wall-clock delay decides when
+// a call has dispatched or a DELETE has been acknowledged.
+function shutdownHarness(t, hold = () => false) {
+    const log = [];
+    const agents = [];
+    const observers = [];
+    const mints = [];
+    let cleaning = false;
+    const httpImpl = {
+        Agent: class {
+            constructor() { this.destroys = 0; agents.push(this); }
+            destroy() { this.destroys += 1; }
         },
+        request(options) {
+            const req = new EventEmitter();
+            req.destroy = () => { req.destroyed = true; };
+            req.end = (payload) => {
+                const message = payload ? JSON.parse(payload.toString()) : null;
+                const row = { method: options.method, rpc: message?.method, name: message?.params?.name,
+                    sessionId: options.headers['mcp-session-id'], port: options.port, req, settled: false };
+                row.reply = ({ status = 200, body, headers = {} } = {}) => {
+                    if (row.settled) return;
+                    row.settled = true;
+                    const res = new EventEmitter();
+                    res.statusCode = status;
+                    res.headers = { 'content-type': 'application/json', ...headers };
+                    if (row.rpc === 'initialize') res.headers['mcp-session-id'] = `session-${options.port}`;
+                    res.resume = () => {};
+                    req.emit('response', res);
+                    const answer = body ?? { jsonrpc: '2.0', id: message?.id,
+                        result: { protocolVersion: '2025-06-18', content: [{ type: 'text', text: row.name }] } };
+                    if (row.method !== 'DELETE') res.emit('data', Buffer.from(JSON.stringify(answer)));
+                    res.emit('end');
+                };
+                row.fail = () => {
+                    if (row.settled) return;
+                    row.settled = true;
+                    req.emit('error', new Error('controlled transport failure'));
+                };
+                log.push(row);
+                for (const notify of [...observers]) notify();
+                if (cleaning || !hold(row)) queueMicrotask(() => row.reply());
+            };
+            return req;
+        },
+    };
+    const pool = createUpstreamSessionPool({ httpImpl });
+    const key = (port = 7001) => keyFor({ port, routeKey: `shutdown-${port}` });
+    const call = (name, extra = {}, port = 7001) => pool.request({
+        key: key(port), hostPort: port, method: 'tools/call', params: { name, arguments: {} },
+        beforeDial: () => true, headers: () => { mints.push(name); return null; }, timeoutMs: 2000, ...extra,
     });
-    const idle = await startFakeUpstream(t);
-    const pool = newPool(t);
-    const busyKey = keyFor({ port: upstream.port, routeKey: 'busyAgent' });
-    const idleKey = keyFor({ port: idle.port, routeKey: 'idleAgent' });
-    const call = (key, port, name) => pool.request({
-        key, hostPort: port, method: 'tools/call', params: { name, arguments: {} },
-        headers: { authorization: 'Bearer test-token' }, beforeDial: () => true,
+    const until = (predicate) => new Promise((resolve) => {
+        const notify = () => {
+            if (!predicate(log)) return;
+            const index = observers.indexOf(notify);
+            if (index >= 0) observers.splice(index, 1);
+            resolve();
+        };
+        observers.push(notify);
+        notify();
     });
-    await call(idleKey, idle.port, 'x');
-    await call(busyKey, upstream.port, 'warm');
-    const busySession = pool.snapshot().entries.find((entry) => entry.key === busyKey).sessionId;
-    const idleSession = pool.snapshot().entries.find((entry) => entry.key === idleKey).sessionId;
-    const slow = call(busyKey, upstream.port, 'slow');
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    await pool.closeAll();
-    assert.ok(idle.log.some((row) => row.httpMethod === 'DELETE' && row.sessionId === idleSession), 'idle session DELETEd at once');
-    assert.equal(upstream.log.some((row) => row.httpMethod === 'DELETE'), false, 'busy session not DELETEd while a call runs');
-    const result = await slow;
-    assert.equal(result.result.content[0].text, 'slow-done', 'the running call gets its reply');
-    assert.ok(await waitFor(() => upstream.log.some((row) => row.httpMethod === 'DELETE' && row.sessionId === busySession)));
-    const deleteRow = upstream.log.find((row) => row.httpMethod === 'DELETE');
-    assert.ok(deleteRow.at >= repliedAt, 'DELETE after the in-flight reply');
-    assert.deepEqual(pool.snapshot().entries, []);
+    t.after(async () => {
+        cleaning = true;
+        for (const row of log) row.reply();
+        await pool.closeAll();
+    });
+    return { pool, call, key, until, log, agents, mints };
+}
+
+const shutdownTurn = () => new Promise((resolve) => setImmediate(resolve));
+const shutdownError = (error) => error?.code === 'UPSTREAM_SESSION_LOST'
+    && error.retryable === false && !error.poolMismatch && /session closed/.test(error.message);
+
+test('shutdown: new work after close cannot mint or POST', { timeout: 5000 }, async (t) => {
+    const h = shutdownHarness(t);
+    await h.pool.closeAll();
+    const outcome = await h.call('forbidden').then(() => null, (error) => error);
+    assert.deepEqual(h.mints, [], 'no credential mint after shutdown');
+    assert.deepEqual(h.log, [], 'no initialization or tool POST after shutdown');
+    assert.ok(shutdownError(outcome));
+    assert.deepEqual(h.agents, [], 'no transport created after shutdown');
 });
+
+test('shutdown: closeAll waits for busy replies and DELETE acknowledgment, and closes idle entries promptly',
+    { timeout: 5000 }, async (t) => {
+        const h = shutdownHarness(t, (row) => row.name === 'slow' || (row.method === 'DELETE' && row.port === 7001));
+        await h.call('warm');
+        await h.call('idle', {}, 7002);
+        const slow = Array.from({ length: 8 }, () => h.call('slow'));
+        await h.until((log) => log.filter((row) => row.name === 'slow').length === 8);
+        const queued = Array.from({ length: 4 }, () => h.call('queued').catch((error) => error));
+        await shutdownTurn();
+        let completed = false;
+        const closing = h.pool.closeAll();
+        closing.then(() => { completed = true; });
+        await h.until((log) => log.some((row) => row.method === 'DELETE' && row.port === 7002));
+        await shutdownTurn();
+        assert.equal(completed, false, 'closeAll must remain pending while busy calls are held');
+        assert.equal(h.pool.closeAll(), closing, 'concurrent close calls share completion');
+        assert.equal(h.agents[1].destroys, 1, 'idle agent destroyed while busy replies are held');
+        assert.equal(h.log.some((row) => row.method === 'DELETE' && row.port === 7001), false);
+        for (const error of await Promise.all(queued)) assert.ok(shutdownError(error));
+        await assert.rejects(h.call('new'), shutdownError);
+        assert.equal(h.mints.includes('queued') || h.mints.includes('new'), false);
+        assert.equal(h.log.some((row) => row.name === 'queued' || row.name === 'new'), false);
+        for (const row of h.log.filter((row) => row.name === 'slow')) row.reply();
+        for (const result of await Promise.all(slow)) assert.equal(result.result.content[0].text, 'slow');
+        await h.until((log) => log.some((row) => row.method === 'DELETE' && row.port === 7001));
+        await shutdownTurn();
+        assert.equal(completed, false, 'closeAll must wait for the busy DELETE acknowledgment');
+        assert.equal(h.agents[0].destroys, 0);
+        h.log.find((row) => row.method === 'DELETE' && row.port === 7001).reply();
+        await closing;
+        assert.equal(h.pool.closeAll(), closing, 'completed closure remains idempotent');
+        assert.deepEqual(h.agents.map((agent) => agent.destroys), [1, 1]);
+        assert.equal(h.log.filter((row) => row.method === 'DELETE').length, 2);
+        assert.deepEqual(h.pool.snapshot().entries, []);
+        assert.equal(h.pool.isReady(h.key()), false);
+    });
+
+test('shutdown: closeAll includes previously retired busy entries', { timeout: 5000 }, async (t) => {
+    const h = shutdownHarness(t, (row) => row.name === 'slow' || row.method === 'DELETE');
+    await h.call('warm');
+    const slow = h.call('slow');
+    await h.until((log) => log.some((row) => row.name === 'slow'));
+    h.pool.invalidate(h.key());
+    assert.deepEqual(h.pool.snapshot().entries, []);
+    let completed = false;
+    const closing = h.pool.closeAll().then(() => { completed = true; });
+    await shutdownTurn();
+    assert.equal(completed, false, 'retirement remains owned after removal from the map');
+    h.log.find((row) => row.name === 'slow').reply();
+    assert.equal((await slow).result.content[0].text, 'slow');
+    await h.until((log) => log.some((row) => row.method === 'DELETE'));
+    await shutdownTurn();
+    assert.equal(completed, false);
+    h.log.find((row) => row.method === 'DELETE').reply();
+    await closing;
+    assert.equal(h.agents[0].destroys, 1);
+});
+
+for (const [phase, failure] of [
+    ['initialize', false], ['initialize', true],
+    ['notifications/initialized', false], ['notifications/initialized', true],
+]) {
+    test(`shutdown: delayed ${phase} ${failure ? 'failure' : 'success'} cannot continue or lose session cleanup`,
+        { timeout: 5000 }, async (t) => {
+            const h = shutdownHarness(t, (row) => row.rpc === phase || row.method === 'DELETE');
+            const request = h.call('undispatched').catch((error) => error);
+            await h.until((log) => log.some((row) => row.rpc === phase));
+            let completed = false;
+            const closing = h.pool.closeAll().then(() => { completed = true; });
+            await shutdownTurn();
+            assert.equal(completed, false, 'opening is still owned');
+            h.log.find((row) => row.rpc === phase).reply(failure ? { body: { invalid: true }, status: 500 } : {});
+            assert.ok(shutdownError(await request));
+            await h.until((log) => log.some((row) => row.method === 'DELETE'));
+            await shutdownTurn();
+            assert.equal(completed, false, 'the late session DELETE is still owned');
+            assert.deepEqual(h.mints, []);
+            assert.equal(h.log.some((row) => row.name === 'undispatched'), false);
+            if (phase === 'initialize') assert.equal(h.log.some((row) => row.rpc === 'notifications/initialized'), false);
+            const deletion = h.log.find((row) => row.method === 'DELETE');
+            assert.equal(deletion.sessionId, 'session-7001');
+            deletion.reply();
+            await closing;
+            assert.equal(h.agents[0].destroys, 1);
+        });
+}
+
+for (const outcome of ['ready', 'not-ready', 'failure']) {
+    test(`shutdown: suspended retry readiness ${outcome} cannot restart work`, { timeout: 5000 }, async (t) => {
+        const h = shutdownHarness(t, (row) => row.name === 'retry');
+        let finishReadiness;
+        let readinessStarted;
+        const entered = new Promise((resolve) => { readinessStarted = resolve; });
+        const ready = new Promise((resolve, reject) => {
+            finishReadiness = () => outcome === 'failure' ? reject(new Error('readiness failed')) : resolve(outcome === 'ready');
+        });
+        const request = h.call('retry', { ensureReady: () => { readinessStarted(); return ready; } })
+            .catch((error) => error);
+        await h.until((log) => log.some((row) => row.name === 'retry'));
+        h.log.find((row) => row.name === 'retry').reply({ status: 404 });
+        await entered;
+        await h.pool.closeAll();
+        const posts = h.log.filter((row) => row.method === 'POST').length;
+        finishReadiness();
+        assert.ok(shutdownError(await request));
+        assert.equal(h.log.filter((row) => row.method === 'POST').length, posts);
+        assert.deepEqual(h.mints, ['retry']);
+        assert.deepEqual(h.pool.snapshot().entries, []);
+        assert.deepEqual(h.pool.snapshot().fallbackKeys, []);
+    });
+}
+
+test('shutdown: late malformed response refuses SDK fallback and does not repopulate fallback state',
+    { timeout: 5000 }, async (t) => {
+        const h = shutdownHarness(t, (row) => row.name === 'malformed');
+        const request = h.call('malformed', { method: 'tools/list' }).catch((error) => error);
+        await h.until((log) => log.some((row) => row.name === 'malformed'));
+        const closing = h.pool.closeAll();
+        h.log.find((row) => row.name === 'malformed').reply({ body: { invalid: true } });
+        assert.ok(shutdownError(await request), 'no poolMismatch means the proxy cannot replay through the SDK');
+        await closing;
+        assert.deepEqual(h.pool.snapshot().fallbackKeys, []);
+        assert.equal(h.pool.isReady(h.key()), false);
+    });
+
+for (const outcome of ['error', 'timeout']) {
+    test(`shutdown: DELETE ${outcome} is bounded and destroys the agent once`, { timeout: 5000 }, async (t) => {
+        const h = shutdownHarness(t, (row) => row.method === 'DELETE');
+        await h.call('warm');
+        const started = Date.now();
+        const closing = h.pool.closeAll();
+        await h.until((log) => log.some((row) => row.method === 'DELETE'));
+        const deletion = h.log.find((row) => row.method === 'DELETE');
+        // Keep the fake transport alive while the production DELETE timer is unref'd.
+        const keepAlive = setInterval(() => {}, 100);
+        try {
+            if (outcome === 'error') deletion.fail();
+            await closing;
+        } finally {
+            clearInterval(keepAlive);
+        }
+        const elapsed = Date.now() - started;
+        if (outcome === 'timeout') {
+            assert.equal(deletion.req.destroyed, true);
+            assert.ok(elapsed >= 900 && elapsed < 3000, `bounded DELETE timeout: ${elapsed} ms`);
+        }
+        assert.equal(h.pool.closeAll(), closing);
+        assert.equal(h.agents[0].destroys, 1);
+        assert.equal(h.log.filter((row) => row.method === 'DELETE').length, 1);
+    });
+}
 
 // ---------------------------------------------------------------------------
 // Readiness cache (liveness only): dropped on any upstream failure and on any

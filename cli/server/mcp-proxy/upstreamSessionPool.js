@@ -190,6 +190,14 @@ export function createUpstreamSessionPool({
         fallbacks: 0,
     };
     let sweepTimer = null;
+    let closed = false;
+    let closePromise = null;
+
+    function assertOpen() {
+        if (closed) {
+            throw poolError(UPSTREAM_SESSION_LOST, 'upstream MCP session closed before dispatch', { retryable: false });
+        }
+    }
 
     function createAgent() {
         const agent = new httpImpl.Agent({
@@ -227,7 +235,9 @@ export function createUpstreamSessionPool({
             agent: createAgent(),
             opening: null,
             closed: false,
-            closeWhenIdle: false,
+            retirement: null,
+            finishRetirement: null,
+            cleanupStarted: false,
         };
     }
 
@@ -276,17 +286,19 @@ export function createUpstreamSessionPool({
     }
 
     function finishClose(entry) {
+        if (!entry.closed || entry.opening || entry.inflight > 0 || entry.cleanupStarted) return;
+        entry.cleanupStarted = true;
         const sessionId = entry.sessionId;
         entry.sessionId = '';
-        const closing = (sessionId
+        const done = () => {
+            try { entry.agent.destroy(); } catch (_) { }
+            pendingCloses.delete(entry.retirement);
+            entry.finishRetirement();
+        };
+        (sessionId
             ? sendDelete(entry.hostPort, sessionId, entry.protocolVersion)
             : Promise.resolve(false))
-            .finally(() => {
-                try { entry.agent.destroy(); } catch (_) { }
-                pendingCloses.delete(closing);
-            });
-        pendingCloses.add(closing);
-        return closing;
+            .then(done, done);
     }
 
     function forgetKey(key) {
@@ -298,14 +310,13 @@ export function createUpstreamSessionPool({
         if (entries.get(entry.key) === entry) entries.delete(entry.key);
         if (entry.closed) return;
         entry.closed = true;
+        // Register ownership now, including opening and busy entries removed
+        // from the pool before shutdown begins.
+        entry.retirement = new Promise((resolve) => { entry.finishRetirement = resolve; });
+        pendingCloses.add(entry.retirement);
         counters.evictions += 1;
         rejectWaiters(entry, retryWaiters);
-        // In-flight requests on the entry finish first; the DELETE follows the last one.
-        if (entry.inflight === 0) {
-            finishClose(entry);
-        } else {
-            entry.closeWhenIdle = true;
-        }
+        finishClose(entry);
     }
 
     // Raised when a request's deadline passes before it is dispatched; nothing
@@ -365,10 +376,7 @@ export function createUpstreamSessionPool({
     function release(entry) {
         entry.inflight = Math.max(0, entry.inflight - 1);
         entry.lastUsedAt = now();
-        if (entry.closed && entry.closeWhenIdle && entry.inflight === 0) {
-            entry.closeWhenIdle = false;
-            finishClose(entry);
-        }
+        finishClose(entry);
     }
 
     function stopSweepIfIdle() {
@@ -395,6 +403,7 @@ export function createUpstreamSessionPool({
     }
 
     function markFallback(key) {
+        if (closed) return;
         if (!fallbackKeys.has(key)) counters.fallbacks += 1;
         fallbackKeys.delete(key);
         fallbackKeys.set(key, now());
@@ -422,6 +431,7 @@ export function createUpstreamSessionPool({
     }
 
     function post(entry, body, { sessionId = '', authorization = '', timeoutMs }) {
+        assertOpen();
         return new Promise((resolve, reject) => {
             const payload = Buffer.from(JSON.stringify(body), 'utf8');
             const headers = {
@@ -490,6 +500,7 @@ export function createUpstreamSessionPool({
     }
 
     async function openSession(entry, beforeDial, timeoutMs) {
+        assertOpen();
         if (beforeDial() !== true) throw generationChanged();
         const initializeId = entry.nextId++;
         const initialized = await post(entry, {
@@ -504,6 +515,7 @@ export function createUpstreamSessionPool({
         }, { timeoutMs });
         const sessionId = readSessionIdHeader(initialized.headers);
         if (sessionId) entry.sessionId = sessionId;
+        assertOpen();
         const message = interpretRpcResponse(initialized, initializeId, { dispatched: false });
         if (message.error) {
             throw poolError(UPSTREAM_TRANSPORT,
@@ -522,6 +534,7 @@ export function createUpstreamSessionPool({
             sessionId,
             timeoutMs,
         });
+        assertOpen();
         if (isSessionLostResponse(ack)) {
             throw poolError(UPSTREAM_SESSION_LOST, `upstream MCP session lost (HTTP ${ack.statusCode})`, {
                 retryable: true,
@@ -557,6 +570,7 @@ export function createUpstreamSessionPool({
 
     async function acquire(key, hostPort, beforeDial, timeoutMs) {
         for (let round = 0; round < 3; round += 1) {
+            assertOpen();
             let entry = entries.get(key);
             if (entry && entry.inflight === 0 && !entry.opening && now() - entry.lastUsedAt > idleMs) {
                 evict(entry);
@@ -581,10 +595,14 @@ export function createUpstreamSessionPool({
                             handleFailure(target, error);
                             throw error;
                         })
-                        .finally(() => { target.opening = null; });
+                        .finally(() => {
+                            target.opening = null;
+                            finishClose(target);
+                        });
                 }
                 await entry.opening;
             }
+            assertOpen();
             if (!entry.closed && entry.sessionId) return entry;
         }
         throw poolError(UPSTREAM_SESSION_LOST, 'upstream MCP session could not be established', { retryable: false });
@@ -593,12 +611,14 @@ export function createUpstreamSessionPool({
     async function attempt({ key, hostPort, method, params, headers, beforeDial, timeoutMs }) {
         const deadline = Date.now() + timeoutMs;
         const entry = await acquire(key, hostPort, beforeDial, Math.min(timeoutMs, DEFAULT_REQUEST_TIMEOUT_MS));
+        assertOpen();
         entry.inflight += 1;
         let holdsSlot = false;
         try {
             const waiting = takeSlot(entry, deadline);
             if (waiting) await waiting;
             holdsSlot = true;
+            assertOpen();
             // A slow session open, or a slot granted late (for example after an
             // event-loop stall), can use up the deadline: fail before the
             // generation check, the mint and the POST.
@@ -609,6 +629,7 @@ export function createUpstreamSessionPool({
             // From here to http.request everything is synchronous: generation
             // check, per-attempt mint, timer start and socket binding.
             if (beforeDial() !== true) throw generationChanged();
+            assertOpen();
             const supplied = typeof headers === 'function' ? headers() : headers;
             const authorization = typeof supplied?.authorization === 'string' ? supplied.authorization : '';
             const id = entry.nextId++;
@@ -648,6 +669,7 @@ export function createUpstreamSessionPool({
         timeoutMs,
         ensureReady = null,
     } = {}) {
+        assertOpen();
         if (typeof key !== 'string' || !key) throw new TypeError('upstream pool request requires a key');
         if (typeof beforeDial !== 'function') throw new TypeError('upstream pool request requires beforeDial');
         const port = Number(hostPort);
@@ -657,6 +679,7 @@ export function createUpstreamSessionPool({
         const effectiveTimeoutMs = parsePositiveInt(timeoutMs, upstreamTimeoutForMethod(method));
         claimSlot(key);
         for (let attemptIndex = 0; ; attemptIndex += 1) {
+            assertOpen();
             try {
                 return await attempt({
                     key,
@@ -668,6 +691,7 @@ export function createUpstreamSessionPool({
                     timeoutMs: effectiveTimeoutMs,
                 });
             } catch (error) {
+                assertOpen();
                 if (!error?.retryable || attemptIndex >= 1) throw error;
                 counters.retries += 1;
                 if (typeof ensureReady === 'function') {
@@ -677,6 +701,7 @@ export function createUpstreamSessionPool({
                     } catch (_) {
                         ready = false;
                     }
+                    assertOpen();
                     if (!ready) {
                         throw poolError(UPSTREAM_SESSION_LOST, 'upstream agent is not ready', {
                             notReady: true,
@@ -707,7 +732,11 @@ export function createUpstreamSessionPool({
         fallbackKeys.delete(key);
     }
 
-    async function closeAll() {
+    function closeAll() {
+        if (closePromise) return closePromise;
+        closed = true;
+        let finishShutdown;
+        closePromise = new Promise((resolve) => { finishShutdown = resolve; });
         if (sweepTimer) {
             clearInterval(sweepTimer);
             sweepTimer = null;
@@ -722,7 +751,8 @@ export function createUpstreamSessionPool({
         slots.clear();
         readyUntil.clear();
         fallbackKeys.clear();
-        await Promise.allSettled([...pendingCloses]);
+        Promise.allSettled([...pendingCloses]).then(() => finishShutdown());
+        return closePromise;
     }
 
     function snapshot() {
