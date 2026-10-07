@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import fsPromises from 'node:fs/promises';
 import test from 'node:test';
-import { createMarketplaceRepositoryRunner, repositoryWorkerEligible, REPOSITORY_QUEUE_LIMITS } from '../../cli/server/marketplaceRepositoryWorker.mjs';
+import { createMarketplaceRepositoryRunner, repositoryWorkerEligible, REPOSITORY_QUEUE_LIMITS,
+    runMarketplaceRepositoryWorker, shutdownMarketplaceRepositoryWorkers } from '../../cli/server/marketplaceRepositoryWorker.mjs';
 
 const flush = async () => { for (let i = 0; i < 40; i += 1) await Promise.resolve(); };
 const operation = { action: 'install_repo', url: '../source.git', name: 'fixture', branch: 'fixture-branch' };
@@ -312,3 +314,95 @@ for (const kind of ['wrong-operation', 'malformed-cohort', 'success-without-admi
         await assert.rejects(h.run(), { code: 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED' });
     });
 }
+
+test('exported shutdown before singleton creation permanently rejects admission without process observation', async (t) => {
+    let observations = 0;
+    t.mock.method(fsPromises, 'opendir', async () => { observations += 1; throw new Error('unexpected census'); });
+    assert.deepEqual(await shutdownMarketplaceRepositoryWorkers(), { ok: true });
+    const options = { operation, rawBodyBytes: 20, cwd: process.cwd(), workspaceRoot: process.cwd() };
+    await expectSettledRejection(runMarketplaceRepositoryWorker(options), 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED');
+    await shutdownMarketplaceRepositoryWorkers();
+    await expectSettledRejection(runMarketplaceRepositoryWorker(options), 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED');
+    assert.equal(observations, 0, 'shutdown cannot lazily create a fresh accepting observer/runner');
+});
+
+function sentinelRecord() {
+    return { pid: 50_001, birth: '500010', namespace: 'pid:[1]', uids: '1000:1000:1000:1000',
+        parent: 1, group: 50_001, session: 50_001, state: 'S' };
+}
+
+for (const kind of ['pre-ownership', 'identity-only', 'well-formed-foreign']) {
+    test(`${kind} cohort claim cannot make an unrelated sentinel remembered or signalable`, async (t) => {
+        const h = harness(t);
+        const pending = h.run(); await flush();
+        const child = h.children[0];
+        if (kind !== 'pre-ownership') await h.hello(child);
+        const sentinel = sentinelRecord();
+        const claim = kind === 'identity-only'
+            ? { pid: sentinel.pid, birth: sentinel.birth, namespace: sentinel.namespace, uids: sentinel.uids }
+            : sentinel;
+        const scans = [];
+        const scan = h.observer.scan;
+        h.observer.scan = async (options) => {
+            scans.push({ remembered: [...(options?.remembered || [])], cancelling: child.messages.some((entry) => entry.type === 'cancel') });
+            const observation = await scan(options);
+            return { ...observation, records: [...observation.records, sentinel] };
+        };
+        h.message(child, 'cohort', { members: [claim] });
+        await h.advance(8_000);
+        await expectSettledRejection(pending, 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED');
+        assert.ok(scans.length > 0);
+        assert.equal(scans.some((entry) => entry.remembered.some((record) => record.pid === sentinel.pid)), false,
+            'an unproven IPC claim must never seed observer history');
+        assert.equal(h.signals.some((entry) => entry.pid === sentinel.pid), false, 'the unrelated sentinel is never signaled');
+        assert.equal(scans.filter((entry) => !entry.cancelling).length, kind === 'well-formed-foreign' ? 1 : 0,
+            'early or incomplete records fail before ownership observation; a complete claim still needs corroboration');
+    });
+}
+
+test('cohort fields must be complete and bounded before any claim can request ownership corroboration', async (t) => {
+    for (const patch of [
+        { parent: -1 }, { group: 0 }, { session: Number.MAX_SAFE_INTEGER }, { state: 'RUNNING' },
+        { birth: '9'.repeat(21) }, { namespace: `pid:[${'9'.repeat(21)}]` },
+        { uids: '4294967296:1000:1000:1000' }, { argv: ['unexpected-extra-field'] },
+    ]) {
+        const h = harness(t);
+        const pending = h.run(); await flush(); await h.hello(h.children[0]);
+        let preCancellationScans = 0;
+        const scan = h.observer.scan;
+        h.observer.scan = async (options) => {
+            if (!h.children[0].messages.some((entry) => entry.type === 'cancel')) preCancellationScans += 1;
+            return scan(options);
+        };
+        h.message(h.children[0], 'cohort', { members: [{ ...sentinelRecord(), ...patch }] });
+        await h.advance(8_000);
+        await expectSettledRejection(pending, 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED');
+        assert.equal(preCancellationScans, 0, JSON.stringify(patch));
+        assert.equal(h.signals.some((entry) => entry.pid === 50_001), false);
+    }
+});
+
+test('locally corroborated late cancellation members remain remembered after their visible ownership evidence disappears', async (t) => {
+    const h = harness(t);
+    const pending = h.run(); await flush(); await h.hello(h.children[0]); await h.authorize(h.children[0]);
+    const owned = sentinelRecord();
+    let visible = false;
+    const histories = [];
+    const scan = h.observer.scan;
+    h.observer.scan = async (options) => {
+        histories.push([...(options?.remembered || [])]);
+        const observation = await scan(options);
+        return { ...observation, members: visible ? [owned] : [], writers: visible ? [owned] : [] };
+    };
+    const shutdown = h.runner.shutdown(); await flush();
+    visible = true;
+    h.message(h.children[0], 'cohort', { members: [owned] }); await flush();
+    visible = false;
+    await h.advance(8_000);
+    await expectSettledRejection(pending, 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED');
+    assert.equal((await shutdown).ok, false);
+    assert.ok(histories.some((records) => records.some((entry) => entry.pid === owned.pid && entry.birth === owned.birth)),
+        'Router-proven ownership remains part of its cancellation history');
+    assert.ok(h.signals.some((entry) => entry.pid === owned.pid && entry.name === 'SIGKILL' && entry.group === false),
+        'a legitimate late owned member is not lost when cancellation starts');
+});

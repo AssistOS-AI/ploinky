@@ -11,6 +11,20 @@ const SUPERVISOR_PATH = fileURLToPath(new URL('./marketplaceRepositorySupervisor
 export const REPOSITORY_QUEUE_LIMITS = Object.freeze({ pending: 16, bytes: 8 * 1024 * 1024, admissionMs: 600_000 });
 const RECOVERY_CODE = 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED';
 const clock = { now: () => Date.now(), monotonic: () => performance.now(), setTimeout, clearTimeout };
+const COHORT_FIELDS = ['pid', 'birth', 'namespace', 'uids', 'parent', 'group', 'session', 'state'];
+
+function validCohortRecord(record) {
+    if (!record || typeof record !== 'object' || Array.isArray(record)
+        || Object.keys(record).length !== COHORT_FIELDS.length
+        || COHORT_FIELDS.some((field) => !Object.hasOwn(record, field))) return false;
+    const pid = (value, minimum = 1) => Number.isSafeInteger(value) && value >= minimum && value <= 2_147_483_647;
+    return pid(record.pid) && pid(record.parent, 0) && pid(record.group) && pid(record.session)
+        && typeof record.birth === 'string' && /^[1-9][0-9]{0,19}$/.test(record.birth)
+        && typeof record.namespace === 'string' && /^pid:\[[1-9][0-9]{0,19}\]$/.test(record.namespace)
+        && typeof record.uids === 'string' && /^(?:0|[1-9][0-9]{0,9})(?::(?:0|[1-9][0-9]{0,9})){3}$/.test(record.uids)
+        && record.uids.split(':').every((value) => Number(value) <= 4_294_967_295)
+        && typeof record.state === 'string' && /^[RSDZTWXKPI]$/.test(record.state);
+}
 
 function failure(code, message) { return Object.assign(new Error(message), { code }); }
 function timeout() { return failure('workspace_mutation_lock_timeout', 'Timed out waiting for repository operation admission.'); }
@@ -68,11 +82,28 @@ export function createMarketplaceRepositoryRunner({
     const options = (ticket) => ({ baseline: ticket.baseline, coordinator: ticket.coordinator,
         router: ticket.router, operationId: ticket.operationId, remembered: ticket.remembered });
     function remember(ticket, records) {
-        if (!Array.isArray(records) || records.length > 8_192 || records.some((entry) => !sameProcess(entry, entry))) throw recovery();
+        if (!Array.isArray(records) || records.length > 8_192) throw recovery();
+        const normalized = records.map((entry) => Object.fromEntries(COHORT_FIELDS.map((field) => [field, entry?.[field]])));
+        if (normalized.some((entry) => !validCohortRecord(entry))) throw recovery();
         const union = new Map(ticket.remembered.map((entry) => [`${entry.pid}:${entry.birth}`, entry]));
-        for (const entry of records) union.set(`${entry.pid}:${entry.birth}`, entry);
+        for (const entry of normalized) union.set(`${entry.pid}:${entry.birth}`, entry);
         if (union.size > 8_192) throw recovery();
         ticket.remembered = [...union.values()];
+    }
+    async function acceptCohort(ticket, records) {
+        if (!ticket.ownershipAcknowledged || !['acquiring', 'awaiting-admission', 'running',
+            'settlement-barrier', 'release-granted', 'cancelling'].includes(ticket.state)
+            || !Array.isArray(records) || records.length > 8_192 || records.some((entry) => !validCohortRecord(entry))) throw recovery();
+        const unproven = records.filter((entry) => !ticket.remembered.some((known) => sameProcess(known, entry)));
+        if (!unproven.length) return;
+        // A peer's stable PID identity is not signal authority. Corroborate
+        // new claims using only the Router's already-proven cohort as history.
+        // Supervisor-only history that has lost all local ownership evidence
+        // remains unknown; it cannot seed its own proof through IPC.
+        const observation = await observer.scan(options(ticket));
+        if (ticket.finished) return;
+        if (unproven.some((entry) => !observation.members.some((owned) => sameProcess(owned, entry)))) throw recovery();
+        remember(ticket, observation.members);
     }
     async function captureCoordinator(ticket) {
         const record = await observer.read(ticket.child.pid, { executable: true });
@@ -158,7 +189,7 @@ export function createMarketplaceRepositoryRunner({
     async function handleMessage(ticket, message) {
         if (ticket.finished) return;
         if (message?.operationId !== ticket.operationId) { void cancel(ticket); return; }
-        if (message.type === 'cohort') { remember(ticket, message.members); return; }
+        if (message.type === 'cohort') { await acceptCohort(ticket, message.members); return; }
         if (message.type === 'recovery') { void cancel(ticket); return; }
         if (ticket.cancelling) return;
         if (message.type === 'hello' && ticket.state === 'launched' && message.pid === ticket.child.pid) {
@@ -169,9 +200,10 @@ export function createMarketplaceRepositoryRunner({
             // An expired/closed inert supervisor receives no repository input
             // and starts no worker. It still closes through its protocol.
             const unusedError = expired(ticket) ? timeout() : ticket.isClosed() ? closed() : null;
-            if (!send(ticket, { type: 'ownership', ...options(ticket), deadline: ticket.deadline,
+            ticket.ownershipAcknowledged = send(ticket, { type: 'ownership', ...options(ticket), deadline: ticket.deadline,
                 operation: unusedError ? null : ticket.operation,
-                unusedError: unusedError && { code: unusedError.code, message: unusedError.message } })) void cancel(ticket);
+                unusedError: unusedError && { code: unusedError.code, message: unusedError.message } });
+            if (!ticket.ownershipAcknowledged) void cancel(ticket);
             ticket.operation = null;
         } else if (message.type === 'authorize' && ticket.state === 'acquiring') {
             ticket.state = 'awaiting-admission';
@@ -302,10 +334,13 @@ export function createMarketplaceRepositoryRunner({
 }
 
 let runner;
+let shutdownRequested = false;
 export function runMarketplaceRepositoryWorker(options) {
+    if (shutdownRequested) return Promise.reject(recovery());
     runner ||= createMarketplaceRepositoryRunner();
     return runner.run(options);
 }
 export function shutdownMarketplaceRepositoryWorkers() {
+    shutdownRequested = true;
     return runner ? runner.shutdown() : Promise.resolve({ ok: true });
 }
