@@ -119,3 +119,31 @@ test('agent static: 200 carries validators and private scope, 304 on matching va
     assert.equal(head.status, 200);
     assert.equal(head.headers.get('etag'), etag);
 });
+
+test('agent static: an edited file gets a new ETag and the old validator no longer yields 304', async (t) => {
+    const { base, code } = await startServer(t);
+    const file = path.join(code, 'app.js');
+
+    const first = await fetch(`${base}/app.js`);
+    const oldEtag = first.headers.get('etag');
+    const oldModified = first.headers.get('last-modified');
+    assert.equal(await first.text(), 'console.log(1);\n');
+
+    // Same size, different content, later mtime.
+    await fs.writeFile(file, 'console.log(2);\n');
+    const later = new Date(Date.now() + 60_000);
+    await fs.utimes(file, later, later);
+
+    const edited = await fetch(`${base}/app.js`, { headers: { 'if-none-match': oldEtag } });
+    assert.equal(edited.status, 200);
+    const newEtag = edited.headers.get('etag');
+    assert.notEqual(newEtag, oldEtag);
+    assert.equal(await edited.text(), 'console.log(2);\n');
+
+    const byDate = await fetch(`${base}/app.js`, { headers: { 'if-modified-since': oldModified } });
+    assert.equal(byDate.status, 200);
+    await byDate.arrayBuffer();
+
+    const again = await fetch(`${base}/app.js`, { headers: { 'if-none-match': newEtag } });
+    assert.equal(again.status, 304);
+});
