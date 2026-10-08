@@ -6,7 +6,8 @@ import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { TaskQueue } from './TaskQueue.mjs';
 import { createToolWorkerPools, shutdownToolWorkerPools } from './toolWorkerPool.mjs';
-import { createAgentServerCodeIdentity } from './toolCodeIdentity.mjs';
+import { agentServerIdentityInputs, createAgentServerCodeIdentity, formatIdentityMeasures } from './toolCodeIdentity.mjs';
+import { createAgentServerCodeIdentityThread } from './toolCodeIdentityThread.mjs';
 import { preserveJsonSchemaToolListings } from './inputSchema.mjs';
 import { getConfiguredToolInputSchema } from './toolInputSchemaCache.mjs';
 import {
@@ -1095,26 +1096,63 @@ const taskQueue = new TaskQueue({
 // toolWorkerPool.mjs). Pools are built once from the startup config, never per
 // MCP session. A pool needs a code identity source: workers are replaced when
 // the identity changes, so they never run code older than a fresh process
-// would load. The source is the tree stamp of toolCodeIdentity.mjs; tests can
-// inject their own through the global symbol below. Without a source, every
-// tool keeps running as a fresh process.
+// would load. The source is the tree stamp of toolCodeIdentity.mjs, walked on
+// a worker thread (PLOINKY_TOOL_IDENTITY_MODE=thread, the default) or on the
+// main thread (PLOINKY_TOOL_IDENTITY_MODE=sync); tests can inject their own
+// through the global symbol below. Without a source, every tool keeps running
+// as a fresh process.
 const TOOL_CODE_IDENTITY_OVERRIDE = Symbol.for('ploinky.agentServer.toolCodeIdentity');
+let toolCodeIdentityThread = null;
+
+function toolCodeIdentityMode() {
+    const mode = String(process.env.PLOINKY_TOOL_IDENTITY_MODE ?? '').trim().toLowerCase();
+    if (mode && mode !== 'sync' && mode !== 'thread') {
+        console.warn(`[AgentServer/MCP] unknown PLOINKY_TOOL_IDENTITY_MODE '${mode}'; using thread`);
+    }
+    return mode === 'sync' ? 'sync' : 'thread';
+}
 
 function resolveToolCodeIdentity() {
     const override = globalThis[TOOL_CODE_IDENTITY_OVERRIDE];
     if (typeof override === 'function') return override;
     try {
-        return createAgentServerCodeIdentity({
+        const inputs = {
             codeDir: process.env.PLOINKY_CODE_DIR || '/code',
             configPath: initialConfigResult?.source || null,
             manifestPath: getManifestResult()?.source || null,
+        };
+        if (toolCodeIdentityMode() === 'thread') {
+            toolCodeIdentityThread = createAgentServerCodeIdentityThread({
+                ...inputs,
+                // Resolved on this thread for every request: the pools exist by then.
+                poolCommand: (poolName) => toolWorkerPools.get(poolName)?.command,
+            });
+            toolCodeIdentityThread.start();
+            return toolCodeIdentityThread.codeIdentity;
+        }
+        const { labels } = agentServerIdentityInputs(inputs);
+        let measures = [];
+        const identity = createAgentServerCodeIdentity({
+            ...inputs,
             // Read at call time: the pools exist by then.
             poolCommand: (poolName) => toolWorkerPools.get(poolName)?.command,
+            onMeasure: (measure) => measures.push(measure),
         });
+        return (poolName) => {
+            measures = [];
+            const value = identity(poolName);
+            return { identity: value, roots: formatIdentityMeasures(measures, labels) };
+        };
     } catch (error) {
         console.warn(`[AgentServer/MCP] cannot create the tool code identity (${error?.message || error})`);
         return null;
     }
+}
+
+async function stopToolCodeIdentityThread() {
+    const thread = toolCodeIdentityThread;
+    toolCodeIdentityThread = null;
+    await thread?.terminate();
 }
 
 function toolWorkersDisabled() {
@@ -1137,14 +1175,17 @@ function buildToolWorkerPools(config) {
         return new Map();
     }
     try {
-        return createToolWorkerPools(config, {
+        const pools = createToolWorkerPools(config, {
             buildCommandSpec,
             defaultCwd: process.env.PLOINKY_CODE_DIR || '/code',
             log: (line) => console.warn(line),
             codeIdentity,
         });
+        if (pools.size === 0) void stopToolCodeIdentityThread();
+        return pools;
     } catch (error) {
         console.warn(`[AgentServer/MCP] cannot build tool worker pools (${error?.message || error}); every tool runs as a fresh process`);
+        void stopToolCodeIdentityThread();
         return new Map();
     }
 }
@@ -1760,6 +1801,7 @@ async function main() {
             // Fails queued and in-flight worker calls and kills every worker
             // process group before the task queue drains.
             const workerShutdown = await shutdownToolWorkerPools({ timeoutMs: 20_000, pools: toolWorkerPools });
+            await stopToolCodeIdentityThread();
             await taskQueue.shutdown({ timeoutMs: 20_000, pollMs: 10 });
             await listenerClosed;
             // Exit zero acknowledges the complete drain to targeted lifecycle

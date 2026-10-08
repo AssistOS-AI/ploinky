@@ -1,10 +1,11 @@
 // Code identity for warm tool workers (see toolWorkerPool.mjs).
 //
 // A warm worker must never run code older than what a fresh process would
-// load at request time. The pool reads this identity before every dispatch
-// and when it spawns a worker, and retires idle workers spawned under another
-// identity; when the identity cannot be read, the call runs as a fresh
-// process. The identity is derived from the code itself, never from a marker:
+// load at request time. The pool reads this identity in batches: a call is
+// dispatched only on a read that started after the call was enqueued, and a
+// worker is labelled with the read that decided its spawn. Idle workers
+// spawned under another identity are retired; when the identity cannot be
+// read, the call runs as a fresh process. The identity is derived from the code itself, never from a marker:
 // a sha256 over the sorted (path, stat stamp) list of every entry under the
 // code roots plus a few fixed files. A stamp is dev, ino, size, mtimeNs,
 // ctimeNs and mode (bigint stat), so an in-place rewrite, an atomic replace,
@@ -49,6 +50,10 @@ function stampOf(stat) {
  * @param {number} [options.maxEntries]
  * @param {() => number} [options.now] wall clock in ms
  * @param {object} [options.fsApi] `statSync`, `lstatSync`, `readdirSync`, `realpathSync` (tests)
+ * @param {(m: { index: number, root: string, ms: number, entries: number }) => void} [options.onMeasure]
+ *   called once per root (index into `roots`, staged-source walks included)
+ *   and once for the fixed files (index -1) of every read that gets that far;
+ *   it only observes, the stamped set is the same with or without it
  * @returns {(extraFiles?: string[]) => string}
  */
 export function createCodeIdentity({
@@ -58,6 +63,7 @@ export function createCodeIdentity({
     maxEntries = DEFAULT_MAX_ENTRIES,
     now = Date.now,
     fsApi = fs,
+    onMeasure = null,
 } = {}) {
     if (!Array.isArray(roots) || roots.length === 0) throw new TypeError('createCodeIdentity requires roots');
     const excluded = new Set(EXCLUDED_NAMES);
@@ -149,7 +155,18 @@ export function createCodeIdentity({
             return dirs.sort();
         };
 
-        for (const root of roots) {
+        const measure = typeof onMeasure === 'function'
+            ? (index, root, startedAt, linesBefore) => {
+                try {
+                    onMeasure({ index, root, ms: performance.now() - startedAt, entries: lines.length - linesBefore });
+                } catch (_) {
+                    // Measuring must never change the identity.
+                }
+            }
+            : null;
+        for (const [index, root] of roots.entries()) {
+            const startedAt = measure ? performance.now() : 0;
+            const linesBefore = lines.length;
             const rootStat = fsApi.statSync(root, { bigint: true });
             if (!rootStat.isDirectory()) throw new Error(`tool code root is not a directory: ${root}`);
             record(root, rootStat);
@@ -160,12 +177,16 @@ export function createCodeIdentity({
                 record(`${root}\u0000staged-source:${realDir}`, realStat);
                 walk(realDir, realStat);
             }
+            measure?.(index, root, startedAt, linesBefore);
         }
+        const filesStartedAt = measure ? performance.now() : 0;
+        const filesLinesBefore = lines.length;
         for (const file of [...extraFiles, ...callExtraFiles]) {
             const stat = statEntry(file);
             if (stat) record(file, stat);
             else lines.push(`${file}\u0000absent`);
         }
+        measure?.(-1, 'files', filesStartedAt, filesLinesBefore);
         if (racy) {
             throw new Error(`tool code changed less than ${settleMs} ms ago`);
         }
@@ -177,11 +198,54 @@ export function createCodeIdentity({
 export const AGENT_LIB_ROOT = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
 
 /**
- * The identity AgentServer passes to its pools: the agent code directory, the
- * Agent library (including linked repositories under `linked/`), the resolved
- * config and manifest, the edge topology file (one inode per generation), the
- * dependency sentinels, and per pool its command file. A non-image AgentLib
- * grant is walked as well. `poolCommand(poolName)` returns a pool's command.
+ * The inputs of the identity AgentServer passes to its pools: the agent code
+ * directory, the Agent library (including linked repositories under
+ * `linked/`), the resolved config and manifest, the edge topology file (one
+ * inode per generation) and the dependency sentinels. A non-image AgentLib
+ * grant is walked as well. `labels` names each root for timing lines.
+ */
+export function agentServerIdentityInputs({
+    codeDir,
+    agentLibRoot = AGENT_LIB_ROOT,
+    configPath = null,
+    manifestPath = null,
+    env = process.env,
+} = {}) {
+    const roots = [codeDir, agentLibRoot];
+    const labels = ['code', 'agent'];
+    const agentLibDir = String(env.PLOINKY_AGENTLIB_DIR || '').trim();
+    if (agentLibDir && env.PLOINKY_AGENTLIB_MODE !== 'image') {
+        roots.push(agentLibDir);
+        labels.push('agentlib');
+    }
+    const extraFiles = [
+        configPath,
+        manifestPath,
+        String(env.PLOINKY_EDGE_TOPOLOGY_FILE || '').trim() || null,
+        path.join(codeDir, 'node_modules'),
+        path.join(codeDir, 'node_modules', '.package-lock.json'),
+        path.join(agentLibRoot, 'node_modules'),
+    ].filter(Boolean);
+    return { roots, labels, extraFiles };
+}
+
+/** The per-pool file stamped with the identity: the pool's command, when it is an absolute path. */
+export function poolCommandFiles(command) {
+    return typeof command === 'string' && path.isAbsolute(command) ? [command] : [];
+}
+
+/** `code:12.3/456,agent:…,files:0.1/8` (ms/entries per root) for timing lines. */
+export function formatIdentityMeasures(measures = [], labels = []) {
+    return measures.map((m) => {
+        const label = m.index === -1 ? 'files' : (labels[m.index] || `root${m.index}`);
+        return `${label}:${Number(m.ms).toFixed(1)}/${m.entries}`;
+    }).join(',');
+}
+
+/**
+ * The identity AgentServer passes to its pools (see agentServerIdentityInputs),
+ * plus per pool its command file. `poolCommand(poolName)` returns a pool's
+ * command.
  */
 export function createAgentServerCodeIdentity({
     codeDir,
@@ -192,20 +256,7 @@ export function createAgentServerCodeIdentity({
     env = process.env,
     ...options
 } = {}) {
-    const roots = [codeDir, agentLibRoot];
-    const agentLibDir = String(env.PLOINKY_AGENTLIB_DIR || '').trim();
-    if (agentLibDir && env.PLOINKY_AGENTLIB_MODE !== 'image') roots.push(agentLibDir);
-    const extraFiles = [
-        configPath,
-        manifestPath,
-        String(env.PLOINKY_EDGE_TOPOLOGY_FILE || '').trim() || null,
-        path.join(codeDir, 'node_modules'),
-        path.join(codeDir, 'node_modules', '.package-lock.json'),
-        path.join(agentLibRoot, 'node_modules'),
-    ].filter(Boolean);
+    const { roots, extraFiles } = agentServerIdentityInputs({ codeDir, agentLibRoot, configPath, manifestPath, env });
     const identity = createCodeIdentity({ roots, extraFiles, ...options });
-    return (poolName) => {
-        const command = poolCommand(poolName);
-        return identity(typeof command === 'string' && path.isAbsolute(command) ? [command] : []);
-    };
+    return (poolName) => identity(poolCommandFiles(poolCommand(poolName)));
 }
