@@ -13,11 +13,8 @@
 // Nothing here signals a worker or changes lifecycle state.
 
 import fsDefault from 'node:fs';
-import pathDefault from 'node:path';
-import { fileURLToPath } from 'node:url';
 
 import { RUNNING_DIR } from '../utils/config.js';
-import { readVerifiedJsonObject } from '../utils/verifiedReadOnlyFile.js';
 import { proveWorkerProcessIdentity } from '../sandbox/processIdentity.js';
 import {
     assertActiveEdgeRoutingSourcesCurrent,
@@ -27,26 +24,16 @@ import {
     acquireWorkspaceMutationLease,
     releaseWorkspaceMutationLease,
 } from '../utils/runtime/maintenanceLocks.js';
-import { NO_WAIT_DIR_NAME } from './noWaitPaths.js';
-import { NO_WAIT_STATE_BYTE_LIMIT, readNoWaitRunMarker } from './noWaitLogObserver.js';
 import {
     boundedNoWaitTimeoutInput,
-    noWaitQueuedStatusDeadline,
     resolveNoWaitBarrierTimeouts,
-    resolveRunScopedObservation,
 } from './noWaitProtocol.js';
-import {
-    exactNoWaitImmutableIdentity,
-    parseNoWaitWorkerArgs,
-    sameNoWaitImmutableIdentity,
-} from './noWaitWorkerArgs.js';
+import { listMarkedContainers, observeMarkedWorker } from './noWaitWorkerLiveness.js';
 import { resolveNoWaitWorkerLifecycleSnapshot } from './noWaitWorker.js';
 
-const MARKER_SUFFIX = '.current.json';
 const DEFAULT_SETTLE_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_SETTLE_TIMEOUT_MS = 60 * 60 * 1000;
 const DEFAULT_POLL_INTERVAL_MS = 500;
-const WORKER_SCRIPT_PATH = fileURLToPath(new URL('./noWaitWorker.js', import.meta.url));
 
 export function resolveNoWaitSettleTimeoutMs(value = process.env.PLOINKY_NO_WAIT_SETTLE_TIMEOUT_MS) {
     return boundedNoWaitTimeoutInput(value, {
@@ -54,108 +41,6 @@ export function resolveNoWaitSettleTimeoutMs(value = process.env.PLOINKY_NO_WAIT
         minimum: 0,
         maximum: MAX_SETTLE_TIMEOUT_MS,
     });
-}
-
-function listMarkedContainers(runningDir, fsApi) {
-    let names;
-    try {
-        names = fsApi.readdirSync(pathDefault.join(runningDir, NO_WAIT_DIR_NAME));
-    } catch (error) {
-        if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return [];
-        throw error;
-    }
-    return names
-        .filter((name) => name.endsWith(MARKER_SUFFIX))
-        .map((name) => name.slice(0, -MARKER_SUFFIX.length))
-        .filter(Boolean)
-        .sort();
-}
-
-// The marker names the latest run of one container; its run-scoped status and
-// the worker's own process identity decide whether that worker is still live.
-function observeMarkedWorker(containerName, {
-    runningDir,
-    fsApi,
-    nowMs,
-    timeouts,
-    proveWorkerProcess,
-}) {
-    let marker;
-    let status;
-    try {
-        marker = readNoWaitRunMarker(containerName, { runningDir, fsApi });
-        if (!marker) return null;
-        status = readVerifiedJsonObject({
-            trustedRoot: runningDir,
-            relativeSegments: [NO_WAIT_DIR_NAME, marker.statusFile],
-            byteLimit: NO_WAIT_STATE_BYTE_LIMIT,
-            absent: null,
-            fsApi,
-        });
-    } catch (error) {
-        return { containerName, live: false, reason: `unverifiable: ${error?.message || error}` };
-    }
-    const base = { containerName, runId: marker.runId, marker };
-    if (!status) {
-        // A marker is published just before its worker is spawned. Only the
-        // startup grace can make a missing status plausible.
-        return nowMs > marker.runStartedAtMs + timeouts.startupGraceMs
-            ? { ...base, live: false, reason: 'never published a status' }
-            : { ...base, live: true, pid: null, agentPath: '', reason: 'publishing its first status' };
-    }
-    let observation;
-    try {
-        if (!sameNoWaitImmutableIdentity(exactNoWaitImmutableIdentity(status), marker)) {
-            throw new Error('the run-scoped status belongs to a different immutable identity');
-        }
-        observation = resolveRunScopedObservation(status, {
-            expectedRunId: marker.runId,
-            runStartedAtMs: marker.runStartedAtMs,
-            targetWaveIndex: marker.waveIndex,
-            timeouts,
-            nowMs,
-        });
-    } catch (error) {
-        return { ...base, live: false, reason: `unverifiable: ${error?.message || error}` };
-    }
-    // 'running' is published after the route commit and 'failed' after
-    // cleanup; the worker only releases its locks afterwards.
-    if (observation.terminal) return { ...base, live: false, reason: observation.terminal };
-    const pid = observation.workerPid;
-    try {
-        const proof = proveWorkerProcess({
-            pid,
-            executablePath: process.execPath,
-            workerScriptPath: WORKER_SCRIPT_PATH,
-            runningDir,
-            identity: marker,
-        });
-        const { agentPath } = parseNoWaitWorkerArgs(proof.argv.slice(2), { runningDir });
-        return { ...base, live: true, pid, agentPath, reason: 'running' };
-    } catch (error) {
-        if (error?.code === 'PROCESS_IDENTITY_STALE') {
-            return { ...base, live: false, pid, reason: 'stopped without a terminal status' };
-        }
-        if (error?.foreign) return { ...base, live: false, pid, reason: 'its pid now belongs to another process' };
-        // Alive, but not provably this worker (its arguments are unreadable, or
-        // it runs under another executable path): it cannot be proven stopped.
-        // Past its run-scoped deadline the worker protocol already treats the
-        // run as stale, so it is no longer waited for. That does not prove the
-        // worker exited: it stays in the live set, so the start supersedes it
-        // and it can neither resume nor keep its unpublished runtime.
-        const deadlineMs = observation.queued
-            ? noWaitQueuedStatusDeadline(marker.runStartedAtMs, marker.waveIndex, timeouts)
-            : observation.deadline;
-        const pastDeadline = Number.isSafeInteger(deadlineMs) && nowMs > deadlineMs;
-        return {
-            ...base,
-            live: true,
-            pid,
-            agentPath: String(status.agentPath || ''),
-            pastDeadline,
-            reason: pastDeadline ? 'running (unproven) past its run-scoped deadline' : 'running (unproven)',
-        };
-    }
 }
 
 // A live worker can make progress only while the active generation still
