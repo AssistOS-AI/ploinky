@@ -783,7 +783,10 @@ export function buildRuntimeKey(workspaceDirectory, effectiveConfig, agentQuery 
     return principal ? `${sharedKey}\0${principal}` : sharedKey;
 }
 
-export function broadcastWorkspaceTaskEvent(appState, workspaceDirectory, payload, sourceRuntimeKey = null) {
+export function broadcastWorkspaceTaskEvent(appState, workspaceDirectory, payload, sourceRuntimeKey = null, sourceTab = null) {
+    // A disposed runtime's key may already belong to its replacement; late
+    // events from the disposed process must not reach that replacement.
+    if (sourceTab?.disposed) return;
     for (const runtime of getRuntimeMap(appState).values()) {
         if (runtime.workspaceDirectory === workspaceDirectory && (!sourceRuntimeKey || runtime.runtimeKey === sourceRuntimeKey)) {
             writeOrBufferSseEvent(runtime, payload);
@@ -936,7 +939,7 @@ function routeCompleteOutputLine(appState, tab, line) {
                     ...(messageIndex !== null ? { messageIndex } : {}),
                 };
                 for (const payload of serializeTaskUpdateSseEvents(outgoing)) {
-                    broadcastWorkspaceTaskEvent(appState, tab.workspaceDirectory, payload, tab.runtimeKey);
+                    broadcastWorkspaceTaskEvent(appState, tab.workspaceDirectory, payload, tab.runtimeKey, tab);
                 }
                 return;
             }
@@ -948,6 +951,8 @@ function routeCompleteOutputLine(appState, tab, line) {
 }
 
 export function routeWorkspaceRuntimeOutput(appState, tab, data) {
+    // Output that a disposed (for example evicted) process emits late is dropped.
+    if (tab?.disposed) return;
     const text = String(data ?? '');
     if (!text) return;
     let pending = String(tab.taskProtocolBuffer || '') + text;

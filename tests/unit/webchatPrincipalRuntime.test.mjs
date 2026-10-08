@@ -394,6 +394,51 @@ test('runtime scope principal: a delayed close of an evicted runtime never unreg
     cleanup(appState);
 });
 
+test('runtime scope principal: late task output from an evicted runtime never reaches its replacement', () => {
+    const factory = createFakeFactory();
+    const effectiveConfig = makeConfig(factory, 'principal');
+    const appState = makeAppState();
+    const open = (resource) => openStream({
+        appState, effectiveConfig, user: USER_A,
+        agentQuery: `agent=dpuAgent&dpu-resource-id=${resource}`,
+        tabId: `tab-${resource}`, sid: 'sid-A',
+    });
+    open('a');
+    const b = open('b');
+    const c = open('c');
+    const [, oldB] = factory.created;
+    b.req.emit('close');
+    c.req.emit('close');
+    open('d');
+    assert.equal(oldB.disposed, true, 'the cap evicts the oldest idle runtime B');
+    const replacementB = open('b');
+    const replacement = factory.created.at(-1);
+    const taskLine = (id) => `${JSON.stringify({
+        __webchatTask: 1, version: 1, event: 'started', task: { id, status: 'ongoing' },
+    })}\n`;
+
+    oldB.emit(taskLine('task_aaaaaaaaaaaaaaaaaaaaaaaa'));
+    assert.doesNotMatch(replacementB.res.writes.join(''), /task_aaaaaaaaaaaaaaaaaaaaaaaa/,
+        'the evicted process\'s late task event is dropped');
+
+    replacement.emit(taskLine('task_bbbbbbbbbbbbbbbbbbbbbbbb'));
+    assert.match(replacementB.res.writes.join(''), /event: task-update[\s\S]*task_bbbbbbbbbbbbbbbbbbbbbbbb/,
+        'positive control: the live runtime\'s own task event still arrives');
+    cleanup(appState);
+});
+
+test('runtime scope shared: live task events still reach the runtime that emitted them', () => {
+    const factory = createFakeFactory();
+    const effectiveConfig = makeConfig(factory);
+    const appState = makeAppState();
+    const a = openStream({ appState, effectiveConfig, user: USER_A, tabId: 'tab-A', sid: 'sid-A' });
+    factory.created[0].emit(`${JSON.stringify({
+        __webchatTask: 1, version: 1, event: 'started', task: { id: 'task_cccccccccccccccccccccccc', status: 'ongoing' },
+    })}\n`);
+    assert.match(a.res.writes.join(''), /event: task-update[\s\S]*task_cccccccccccccccccccccccc/);
+    cleanup(appState);
+});
+
 test('runtime scope shared: the runtime key keeps the previous format byte for byte', () => {
     const effectiveConfig = { agentName: 'sharedAgent' };
     const query = 'agent=sharedAgent&forward-envelope=1';
