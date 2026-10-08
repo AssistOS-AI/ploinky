@@ -13,6 +13,7 @@ import { createRepositoryNamespaceObserver } from './marketplaceRepositoryNamesp
 const SUPERVISOR_PATH = fileURLToPath(new URL('./marketplaceRepositorySupervisor.mjs', import.meta.url));
 export const REPOSITORY_QUEUE_LIMITS = Object.freeze({ pending: 16, bytes: 8 * 1024 * 1024, admissionMs: 600_000 });
 const RECOVERY_CODE = 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED';
+const RETRY_CODE = 'PLOINKY_MARKETPLACE_REPOSITORY_RETRY';
 const clock = { now: () => Date.now(), monotonic: () => performance.now(), setTimeout, clearTimeout };
 const COHORT_FIELDS = ['pid', 'birth', 'namespace', 'uids', 'parent', 'group', 'session', 'state'];
 const identityKey = (record) => JSON.stringify([record.pid, record.birth, record.namespace, record.uids]);
@@ -37,6 +38,11 @@ function recovery() {
     return Object.assign(failure(RECOVERY_CODE,
         'Repository operation requires workspace recovery. Stop the exact Box from its host workspace, then start it again.'), { recoveryRequired: true });
 }
+// Only an incomplete census before any spawn attempt uses this code. Nothing
+// operation-owned exists yet, so the ticket alone fails and no debt remains.
+function retryable() {
+    return Object.assign(failure(RETRY_CODE, 'Repository process census was incomplete; no change was made. Retry.'), { retryable: true });
+}
 
 export function repositoryWorkerEligible({ platform = process.platform, insideBox = isInsideBox } = {}) {
     return platform === 'linux' && insideBox();
@@ -55,6 +61,7 @@ export function createMarketplaceRepositoryRunner({
     let chargedBytes = 0;
     let accepting = true;
     let recoveryDebt = false;
+    let rescanRequired = false;
     let shutdownPromise;
     const delay = (ms) => new Promise((resolve) => time.setTimeout(resolve, Math.max(0, ms)));
     const expired = (ticket) => time.now() >= ticket.deadline;
@@ -91,6 +98,7 @@ export function createMarketplaceRepositoryRunner({
             ...(!observation.complete ? { predicate: 'scan-incomplete', claims: ticket.cohortClaims.size } : {}) };
         record(ticket, details);
         if (!observation.complete) cause(ticket, phase, 'incomplete', details);
+        return details;
     }
     function discardPending(error) {
         for (const ticket of [...pending]) finish(ticket, error);
@@ -98,7 +106,8 @@ export function createMarketplaceRepositoryRunner({
     function finish(ticket, error, result) {
         if (ticket.finished) return;
         if (error && !ticket.cancelling) record(ticket, { phase: 'admission',
-            reason: error.code === 'workspace_mutation_lock_timeout' ? 'expired' : error.code === closed().code ? 'closed' : 'unknown' });
+            reason: error.code === 'workspace_mutation_lock_timeout' ? 'expired' : error.code === closed().code ? 'closed'
+                : error.code === RETRY_CODE ? 'retryable' : 'unknown' });
         ticket.finished = true;
         ticket.cancelWake?.();
         time.clearTimeout(ticket.timer);
@@ -512,11 +521,14 @@ export function createMarketplaceRepositoryRunner({
             if (ticket.isClosed()) throw closed();
             const baseline = await observer.scan();
             if (ticket.finished) return;
-            observationRecord(ticket, baseline, 'baseline');
-            if (!baseline.complete) throw recovery();
+            const baselineDetails = observationRecord(ticket, baseline, 'baseline');
+            if (!baseline.complete) { ticket.incompleteBaseline = baselineDetails; throw retryable(); }
             ticket.baseline = baseline.records;
             ticket.router = baseline.records.find((entry) => entry.pid === process.pid);
             if (!ticket.router) { cause(ticket, 'baseline', 'mismatch', { mismatch: 'router-missing' }); throw recovery(); }
+            // This ticket's own fresh census is complete. Later tickets still
+            // take their own baseline before any spawn.
+            rescanRequired = false;
             ticket.executable = await resolveExecutable(executablePath);
             if (ticket.finished) return;
             if (expired(ticket)) throw timeout();
@@ -551,6 +563,17 @@ export function createMarketplaceRepositoryRunner({
             });
         } catch (error) {
             cause(ticket, ticket.spawnAttempted ? 'launch' : 'baseline', ticket.spawnAttempted ? 'spawn-failed' : 'unknown', processDiagnostic(error));
+            // Before any spawn attempt the operation has only read /proc: no
+            // supervisor, worker, lease, Git call or operation marker exists.
+            // Every other failure, or any doubt, keeps the fail-closed latch.
+            if (error?.code === RETRY_CODE && ticket.incompleteBaseline && accepting && !ticket.spawnAttempted
+                && !ticket.child && !ticket.cancelling && !ticket.finished && !recoveryDebt && !shutdownPromise) {
+                rescanRequired = true;
+                const retry = diagnosticRecord(ticket, { ...ticket.incompleteBaseline, reason: 'retryable' });
+                finish(ticket, error);
+                try { diagnostics.emitRetryable(ticket.operationId, retry); } catch (_) { /* Diagnostics carry no authority. */ }
+                return;
+            }
             if (error.code === 'workspace_mutation_lock_timeout' || error.code === closed().code) finish(ticket, error);
             else void cancel(ticket);
         }
@@ -623,7 +646,7 @@ export function createMarketplaceRepositoryRunner({
         return shutdownPromise;
     }
     return { run, shutdown, diagnostics: diagnostics.snapshot,
-        snapshot: () => ({ active: Boolean(active), pending: pending.length, chargedBytes, accepting, recoveryDebt }) };
+        snapshot: () => ({ active: Boolean(active), pending: pending.length, chargedBytes, accepting, recoveryDebt, rescanRequired }) };
 }
 
 let runner;

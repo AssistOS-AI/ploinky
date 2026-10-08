@@ -4,7 +4,7 @@ export const DIAGNOSTIC_LIMITS = Object.freeze({ recordBytes: 4_096, records: 32
 const enums = {
     source: ['router', 'supervisor', 'worker'],
     phase: ['receipt', 'baseline', 'launch', 'ownership', 'admission', 'observation', 'settlement', 'release', 'ipc', 'exit', 'closure', 'shutdown', 'cancellation'],
-    reason: ['received', 'incomplete', 'unknown', 'mismatch', 'spawn-failed', 'pre-hello-exit', 'abnormal-exit', 'protocol', 'ipc-failed', 'expired', 'closed', 'shutdown', 'recovery', 'release-failed', 'worker-failed', 'writer', 'cohort', 'diagnostic-loss'],
+    reason: ['received', 'incomplete', 'unknown', 'mismatch', 'spawn-failed', 'pre-hello-exit', 'abnormal-exit', 'protocol', 'ipc-failed', 'expired', 'closed', 'shutdown', 'recovery', 'release-failed', 'worker-failed', 'writer', 'cohort', 'diagnostic-loss', 'retryable'],
     state: ['pending', 'preparing', 'launched', 'ownership', 'inert', 'acquiring', 'awaiting-admission', 'running', 'settlement-barrier', 'release-granted', 'released', 'cancelling', 'closed'],
     action: ['install_repo', 'uninstall_repo', 'unknown'],
     caller: ['browser-control', 'browser-public', 'agent-assertion', 'direct-cli', 'unknown'],
@@ -128,6 +128,9 @@ export function createRepositoryDiagnostics({ now = Date.now, sink = () => {} } 
     let suppressed = 0;
     let lastEmission = -Infinity;
     let sinkPending = false;
+    let retryableSuppressed = 0;
+    let lastRetryable = -Infinity;
+    let retryablePending = false;
     const retain = (operationId, value, first = false) => {
         const payload = diagnosticPayload(value);
         if (!/^[a-f0-9-]{36}$/.test(operationId || '') || !payload) { loss = increment(loss); return false; }
@@ -159,6 +162,24 @@ export function createRepositoryDiagnostics({ now = Date.now, sink = () => {} } 
                 if (result && typeof result.then === 'function') {
                     sinkPending = true;
                     Promise.resolve(result).then(() => { sinkPending = false; }, () => { sinkPending = false; loss = increment(loss); });
+                }
+            } catch (_) { loss = increment(loss); }
+        },
+        // A retryable pre-spawn refusal is not a latch cause: it has its own
+        // event and throttle and never writes firstCause.
+        emitRetryable(operationId, value) {
+            const payload = diagnosticPayload(value);
+            if (!/^[a-f0-9-]{36}$/.test(operationId || '') || !payload) { loss = increment(loss); return; }
+            if (retryablePending || now() - lastRetryable < DIAGNOSTIC_LIMITS.emitMs) { retryableSuppressed = increment(retryableSuppressed); return; }
+            lastRetryable = now();
+            try {
+                const result = sink('marketplace_repository_retryable', {
+                    cause: { operationId, ...payload }, diagnosticLoss: loss, suppressed: retryableSuppressed,
+                });
+                if (result === false) loss = increment(loss);
+                if (result && typeof result.then === 'function') {
+                    retryablePending = true;
+                    Promise.resolve(result).then(() => { retryablePending = false; }, () => { retryablePending = false; loss = increment(loss); });
                 }
             } catch (_) { loss = increment(loss); }
         },
