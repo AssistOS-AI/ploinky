@@ -3,7 +3,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-import { Client, TARGET, WORKSPACE, assertPrincipal, command, privateJson, writePrivate } from './core.mjs';
+import { randomBytes } from 'node:crypto';
+import { Client, TARGET, WORKSPACE, assertLoopbackPage, assertPrincipal, browserRequestDecision, command, isLoopbackTargetOrigin, privateJson, writePrivate } from './core.mjs';
 
 export const DASHBOARD = '/base-agent-additional-server/userPersistoAgent/7000/service/dashboard';
 
@@ -43,6 +44,44 @@ async function eventually(read, predicate, label) {
     throw new Error(`Timed out waiting for ${label}`);
 }
 
+/**
+ * Browser cookies can exist for both loopback names. The raw Client sends by
+ * path only, so keep one cookie per name/path, preferring the host on which the
+ * sign-in actually completed.
+ */
+export function preferHostCookies(cookies, hostname) {
+    const chosen = new Map();
+    for (const cookie of cookies) {
+        const key = `${cookie.name}\0${cookie.path || '/'}`;
+        const domain = String(cookie.domain || '').replace(/^\./, '');
+        const current = chosen.get(key);
+        if (!current || (domain === hostname && String(current.domain || '').replace(/^\./, '') !== hostname)) chosen.set(key, cookie);
+    }
+    return [...chosen.values()];
+}
+
+export const AUTH_SETUP = '/base-agent-additional-server/userPersistoAgent/7000/service/auth/setup';
+
+/**
+ * Choose the disposable-principal registration path from UserPersisto's public
+ * wizard configuration (userPersistoAgent/lib/auth/wizardConfig.mjs). Password
+ * sign-up is used when open email sign-up needs no verification; the emailed
+ * development code path is used when code delivery is available. Anything else
+ * fails closed: the suite never invents an account another way.
+ */
+export function selectRegistrationMethod(setup) {
+    assert.ok(setup && setup.ok === true, 'REGISTRATION_SETUP_UNAVAILABLE: public auth setup did not answer');
+    assert.equal(setup.setupComplete, true, 'REGISTRATION_BOOTSTRAP_OPEN: bootstrap must already be claimed');
+    if (setup.signup?.email === true && setup.methods?.password === true && setup.signup.verification === 'none') {
+        const min = Number(setup.passwordPolicy?.minLength) || 12;
+        const max = Number(setup.passwordPolicy?.maxLength) || 128;
+        assert.ok(min <= 64 && max >= Math.max(min, 32), 'REGISTRATION_PASSWORD_POLICY: unsupported password policy');
+        return { mode: 'password', length: Math.max(min, 32) };
+    }
+    if (setup.signup?.email === true && setup.methods?.emailCode === true) return { mode: 'email-code' };
+    assert.fail('REGISTRATION_UNAVAILABLE: neither password sign-up without verification nor email-code delivery is available');
+}
+
 export async function setupPrincipals(ctx, config) {
     const { chromium } = await import(pathToFileURL(config.playwrightModule).href);
     const pin = await ctx.guard();
@@ -67,22 +106,69 @@ export async function setupPrincipals(ctx, config) {
         const context = await browser.newContext({ baseURL: TARGET, ...(storageState ? { storageState } : {}) });
         // The browser is permitted to contact only the selected loopback deployment.
         await context.route('**/*', async route => {
-            const url = new URL(route.request().url());
-            if (url.origin !== TARGET) return route.abort('blockedbyclient');
+            if (browserRequestDecision(route.request().url()) !== 'continue') {
+                (ctx.report.blockedBrowserOrigins ||= []).push(String(new URL(route.request().url()).origin).slice(0, 120));
+                return route.abort('blockedbyclient');
+            }
             if (!['GET', 'HEAD', 'OPTIONS'].includes(route.request().method())) await ctx.guard();
             return route.continue();
         });
         contexts.push(context);
         return context;
     }
+    const setup = await ctx.request('anonymous', { path: AUTH_SETUP });
+    const registration = selectRegistrationMethod(setup.status === 200 ? setup.json : null);
+    ctx.report.registrationMethod = registration.mode;
+    const passwords = new Map();
+    const passwordFor = email => {
+        if (!passwords.has(email)) {
+            const value = `Az9-${randomBytes(48).toString('base64url')}`.slice(0, registration.length);
+            ctx.secrets.add(value);
+            passwords.set(email, value);
+        }
+        return passwords.get(email);
+    };
+    async function finishLogin(page, context) {
+        await page.waitForURL(url => isLoopbackTargetOrigin(url.origin) && (url.pathname.startsWith('/explorer/') || url.pathname === `${DASHBOARD}/` || url.pathname === '/'));
+        assertLoopbackPage(page.url(), 'Sign-in result');
+        const client = newClient(preferHostCookies(await context.cookies(), new URL(page.url()).hostname));
+        const token = await client.request({ path: '/auth/token?agent=explorer' });
+        assert.equal(token.status, 200, 'Fresh browser sign-in must yield Router session');
+        await page.close();
+        return { client, token };
+    }
+    async function passwordLogin(page, context, root, { email, fresh }) {
+        const signUp = root.getByRole('button', { name: 'Sign up', exact: true });
+        const passwordScreen = root.getByRole('heading', { name: 'Enter your password', exact: true });
+        await signUp.or(passwordScreen).first().waitFor();
+        if (fresh) assert.equal(await signUp.isVisible(), true, 'Fresh principal must use real public registration');
+        if (await signUp.isVisible()) {
+            assert.equal(fresh, true, 'An existing principal must not be re-registered');
+            await signUp.click();
+            await root.locator('input[name="password"]').fill(passwordFor(email));
+            await root.locator('input[name="passwordConfirmation"]').fill(passwordFor(email));
+            await root.getByRole('button', { name: 'Create account', exact: true }).click();
+        } else {
+            await root.locator('input[name="password"]').fill(passwordFor(email));
+            await root.getByRole('button', { name: 'Log in', exact: true }).click();
+        }
+        return finishLogin(page, context);
+    }
     async function login(context, { email, fresh = false } = {}) {
         await ctx.guard();
         const page = await context.newPage();
         page.setDefaultTimeout(45000);
         await page.goto(`${TARGET}/auth/login?agent=explorer&returnTo=%2Fexplorer%2Findex.html`);
+        // The Router may restart login on the canonical loopback name; any other origin fails here.
+        assertLoopbackPage(page.url(), 'Login navigation');
         const root = page.locator('#auth_content');
         await root.locator('input[name="email"]').waitFor();
         assert.equal(await root.getByText('The first completed sign-in becomes its administrator', { exact: false }).count(), 0, 'Bootstrap must remain claimed');
+        if (registration.mode === 'password') {
+            await root.locator('input[name="email"]').fill(email);
+            await root.getByRole('button', { name: 'Next', exact: true }).click();
+            return passwordLogin(page, context, root, { email, fresh });
+        }
         const offset = (await fs.stat(logPath)).size;
         await root.locator('input[name="email"]').fill(email);
         await root.getByRole('button', { name: 'Next', exact: true }).click();
@@ -106,12 +192,7 @@ export async function setupPrincipals(ctx, config) {
         ctx.secrets.add(code);
         await input.fill(code);
         await root.getByRole('button', { name: 'Verify', exact: true }).click();
-        await page.waitForURL(url => url.origin === TARGET && (url.pathname.startsWith('/explorer/') || url.pathname === `${DASHBOARD}/` || url.pathname === '/'));
-        const client = newClient(await context.cookies());
-        const token = await client.request({ path: '/auth/token?agent=explorer' });
-        assert.equal(token.status, 200, 'Fresh browser sign-in must yield Router session');
-        await page.close();
-        return { client, token };
+        return finishLogin(page, context);
     }
 
     const initial = await privateJson(path.join(config.credentials, 'admin-storage-state.json'));
@@ -119,7 +200,7 @@ export async function setupPrincipals(ctx, config) {
     const adminToken = await admin.request({ path: '/auth/token?agent=explorer' });
     ctx.clients.admin = admin;
     assert.equal(adminToken.status, 200,
-        'Administrator session is unavailable or expired. Sign in normally with Google or a verified email code and refresh the private admin-storage-state.json before running the suite.');
+        'Administrator session is unavailable or expired. Reuse the already-claimed task-owned administrator: refresh its private 0600 admin-storage-state.json through a normal sign-in (never a new first-run claim) before running the suite.');
     ctx.principals.admin = assertPrincipal(adminToken.json, 'admin');
     const adminProfile = await ctx.request('admin', { path: `${DASHBOARD}/api/profile` });
     assert.equal(adminProfile.status, 200);
@@ -164,7 +245,7 @@ export async function setupPrincipals(ctx, config) {
         assert.equal(profile.json.profile.user?.id, p.id, 'UserPersisto profile must match the Router principal');
         assert.deepEqual(profile.json.profile.roles.map(role => typeof role === 'string' ? role : role.name).sort(), [...p.roles].sort(), 'Profile and Router roles must agree');
     }
-    ctx.report.principals = Object.entries(ctx.principals).map(([name, p]) => ({ name, idHash: ctx.hash(p.id), roles: p.roles, source: name === 'admin' ? 'configured administrator session' : 'fresh verified public development email registration', authoritativeRoleVerified: true }));
+    ctx.report.principals = Object.entries(ctx.principals).map(([name, p]) => ({ name, idHash: ctx.hash(p.id), roles: p.roles, source: name === 'admin' ? 'configured administrator session' : registration.mode === 'password' ? 'fresh public password registration' : 'fresh verified public development email registration', authoritativeRoleVerified: true }));
     await writePrivate(path.join(config.privateRoot, 'principals.json'), ctx.principals);
     ctx.progress('All four authenticated principals are distinct and verified: administrator, selfRegistered, and two ordinary users.');
 }

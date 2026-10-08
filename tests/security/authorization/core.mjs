@@ -15,6 +15,30 @@ export const WORKSPACE = '/Users/danielsava/work/testExplorerFresh';
 export const digest = value => createHash('sha256').update(value).digest('hex');
 export const command = (exe, args) => execFileSync(exe, args, { encoding: 'utf8', timeout: 30000, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 
+/**
+ * The selected Router is one loopback deployment reachable under two loopback
+ * names. UserPersisto restarts login on its canonical login origin
+ * (cli/server/authHandlers/authRoutes.js:242-255), which on this fixture is
+ * http://localhost:8080. Both names are the same target; every other origin
+ * stays blocked. The raw Client still dials 127.0.0.1:8080 only.
+ */
+export const LOOPBACK_TARGET_ORIGINS = Object.freeze([TARGET, 'http://localhost:8080']);
+export function isLoopbackTargetOrigin(origin) {
+    return LOOPBACK_TARGET_ORIGINS.includes(String(origin));
+}
+/** Browser request decision: continue only for the loopback target origins. */
+export function browserRequestDecision(rawUrl) {
+    let url;
+    try { url = new URL(rawUrl); } catch { return 'abort'; }
+    return isLoopbackTargetOrigin(url.origin) ? 'continue' : 'abort';
+}
+/** A navigation that ended on any other origin (for example a followed redirect) fails setup. */
+export function assertLoopbackPage(rawUrl, label = 'Browser navigation') {
+    let origin = '';
+    try { origin = new URL(rawUrl).origin; } catch {}
+    assert.ok(isLoopbackTargetOrigin(origin), `${label} left the loopback target (landed on ${origin || 'an invalid URL'})`);
+}
+
 export function validateTarget(value) {
     assert.equal(value, TARGET, 'Only the explicitly selected loopback Router is authorized');
     return new URL(value);
