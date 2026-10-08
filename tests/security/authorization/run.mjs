@@ -33,7 +33,7 @@ const cleanups = [];
 let mutationLock;
 const ctx = {
     prefix: `authz-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`,
-    clients: {}, principals: {}, secrets: new Set(), hash: digest, finalizers: [],
+    clients: {}, principals: {}, secrets: new Set(), hash: digest, finalizers: [], capabilities: policy.capabilities || [],
     report: { startedAt: new Date().toISOString(), target: TARGET, checks: [], requests: [], gaps: [], cleanup: [] },
     progress: message => console.log(message),
     async guard() {
@@ -93,6 +93,8 @@ try {
     await runAgentProbes(ctx);
     const { runResourceProbes } = await import('./resource-probes.mjs');
     await runResourceProbes(ctx);
+    const { runCapabilityProbes } = await import('./capability-probes.mjs');
+    await runCapabilityProbes(ctx, { capabilities: ctx.capabilities });
     const { runTemplateProbes, runMarketplaceAdmissionProbes } = await import('./boundary-probes.mjs');
     await runTemplateProbes(ctx);
     await runMarketplaceAdmissionProbes(ctx);

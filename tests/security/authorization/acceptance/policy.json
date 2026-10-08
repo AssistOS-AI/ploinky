@@ -10,42 +10,303 @@
   ],
   "workspace": "/Users/danielsava/work/testExplorerFresh",
   "inventoryRepositories": [
-    { "name": "AchillesIDE", "path": ".ploinky/repos/AchillesIDE", "reason": "Root agent repository (cli/utils/repos.js:146 BOOT_REPO_NAMES)" },
-    { "name": "AchillesCLI", "path": ".ploinky/repos/AchillesCLI", "reason": "Boot repository (cli/utils/repos.js:146); roboTeamAgent is enabled by the Explorer manifest" },
-    { "name": "copilot-agents", "path": ".ploinky/repos/copilot-agents", "reason": "Boot repository (cli/utils/repos.js:146); no agent is enabled by the Explorer graph" },
-    { "name": "proxies", "path": ".ploinky/repos/proxies", "reason": "Installed by the explorer enable entry proxies/soul-gateway (bootstrapManifest.js ensurePrefixedRepoInstalled)" },
-    { "name": "UmamiAgent", "path": ".ploinky/repos/UmamiAgent", "reason": "Declared in explorer/manifest.json repos" },
-    { "name": "local-llms", "path": ".ploinky/repos/local-llms", "reason": "Declared in explorer/manifest.json repos; local-llms/local-llm is enabled" },
-    { "name": "OnlyOfficeAgent", "path": ".ploinky/repos/OnlyOfficeAgent", "reason": "Declared in explorer/manifest.json repos; onlyOffice is not enabled by the graph" },
-    { "name": "container-image-builds", "path": ".ploinky/repos/container-image-builds", "reason": "Declared in explorer/manifest.json repos; image-build dependency" },
-    { "name": "DocumentationSkills", "path": ".ploinky/repos/DocumentationSkills", "reason": "Skills repository installed by the workspace (cli/utils/repos.js:142)" }
+    {
+      "name": "AchillesIDE",
+      "path": ".ploinky/repos/AchillesIDE",
+      "reason": "Root agent repository (cli/utils/repos.js:146 BOOT_REPO_NAMES)"
+    },
+    {
+      "name": "AchillesCLI",
+      "path": ".ploinky/repos/AchillesCLI",
+      "reason": "Boot repository (cli/utils/repos.js:146); roboTeamAgent is enabled by the Explorer manifest"
+    },
+    {
+      "name": "copilot-agents",
+      "path": ".ploinky/repos/copilot-agents",
+      "reason": "Boot repository (cli/utils/repos.js:146); no agent is enabled by the Explorer graph"
+    },
+    {
+      "name": "proxies",
+      "path": ".ploinky/repos/proxies",
+      "reason": "Installed by the explorer enable entry proxies/soul-gateway (bootstrapManifest.js ensurePrefixedRepoInstalled)"
+    },
+    {
+      "name": "UmamiAgent",
+      "path": ".ploinky/repos/UmamiAgent",
+      "reason": "Declared in explorer/manifest.json repos"
+    },
+    {
+      "name": "local-llms",
+      "path": ".ploinky/repos/local-llms",
+      "reason": "Declared in explorer/manifest.json repos; local-llms/local-llm is enabled"
+    },
+    {
+      "name": "OnlyOfficeAgent",
+      "path": ".ploinky/repos/OnlyOfficeAgent",
+      "reason": "Declared in explorer/manifest.json repos; onlyOffice is not enabled by the graph"
+    },
+    {
+      "name": "container-image-builds",
+      "path": ".ploinky/repos/container-image-builds",
+      "reason": "Declared in explorer/manifest.json repos; image-build dependency"
+    },
+    {
+      "name": "DocumentationSkills",
+      "path": ".ploinky/repos/DocumentationSkills",
+      "reason": "Skills repository installed by the workspace (cli/utils/repos.js:142)"
+    }
   ],
   "excludedAgents": [
-    { "agent": "default-local-llm", "reason": "Retired agent distinct from local-llms/local-llm; exclusion retained (r2_decisions_codex.md Q2)" }
+    {
+      "agent": "default-local-llm",
+      "reason": "Retired agent distinct from local-llms/local-llm; exclusion retained (r2_decisions_codex.md Q2)"
+    }
   ],
   "box": {
     "user": "podman",
     "init": true,
     "privileged": false,
-    "ports": { "8080/tcp": [{ "HostIp": "127.0.0.1", "HostPort": "8080" }], "udpPort": "7882/udp" },
+    "ports": {
+      "8080/tcp": [
+        {
+          "HostIp": "127.0.0.1",
+          "HostPort": "8080"
+        }
+      ],
+      "udpPort": "7882/udp"
+    },
     "ploinkySourceDestination": "/opt/ploinky",
-    "agentLibModes": ["image", "local"],
+    "agentLibModes": [
+      "image",
+      "local"
+    ],
     "gpuWiring": false,
     "hardwareLimitsWiring": false
   },
   "changedBoundaryRows": {
-    "U3": ["agent-static.get", "agent-static.head"],
-    "U6": ["webchat-stream.get", "webchat-input.post", "webchat-control.post", "webchat-interaction.post"],
-    "U7": ["marketplace-install_repo.post", "marketplace-uninstall_repo.post", "marketplace-enable_agent.post", "marketplace-disable_agent.post"]
+    "U3": [
+      "agent-static.get",
+      "agent-static.head"
+    ],
+    "U6": [
+      "webchat-stream.get",
+      "webchat-input.post",
+      "webchat-control.post",
+      "webchat-interaction.post"
+    ],
+    "U7": [
+      "marketplace-install_repo.post",
+      "marketplace-uninstall_repo.post",
+      "marketplace-enable_agent.post",
+      "marketplace-disable_agent.post"
+    ]
   },
-  "boundaryRejectionStatuses": [404],
-  "verdictExitCodes": { "PASS": 0, "NO_FAILURES_WITH_GAPS": 2, "otherwise": 1 },
+  "boundaryRejectionStatuses": [
+    404
+  ],
+  "verdictExitCodes": {
+    "PASS": 0,
+    "NO_FAILURES_WITH_GAPS": 2,
+    "otherwise": 1
+  },
   "requiredRawVerdict": "NO_FAILURES_WITH_GAPS",
   "requiredRawExitCode": 2,
   "principals": {
-    "admin": ["admin"],
-    "selfRegistered": ["selfRegistered"],
-    "userA": ["user"],
-    "userB": ["user"]
-  }
+    "admin": [
+      "admin"
+    ],
+    "selfRegistered": [
+      "selfRegistered"
+    ],
+    "userA": [
+      "user"
+    ],
+    "userB": [
+      "user"
+    ]
+  },
+  "capabilities": [
+    {
+      "id": "D3-livekit-no-mcp",
+      "repo": "AchillesIDE",
+      "agent": "liveKitServerAgent",
+      "decision": "r2b_remediation_decisions_codex.md D3",
+      "summary": "Custom start, script readiness, host networking: Ploinky resolves start_only without an implicit AgentServer, the sidecar needs an explicit agent command, the start script never launches AgentServer, and the Router rejects a route without a primary port before MCP dispatch.",
+      "nonApplicable": [
+        "mcp-discovery:tools/list",
+        "mcp-discovery:resources/list",
+        "mcp-discovery:resources/templates/list",
+        "mcp-discovery:prompts/list",
+        "mcp-get-transport"
+      ],
+      "retainedControls": [
+        "capability:liveKitServerAgent:no-primary-port",
+        "capability:liveKitServerAgent:runtime-image",
+        "capability:liveKitServerAgent:signaling-route:anonymous",
+        "capability:liveKitServerAgent:twirp-route-deny:anonymous",
+        "capability:liveKitServerAgent:mcp-absent-corroboration:admin"
+      ],
+      "contract": {
+        "files": [
+          {
+            "repo": "AchillesIDE",
+            "path": "liveKitServerAgent/manifest.json",
+            "sha256": "c6e313130176f32089c2f97a385e2113d75fda99b34fa9c025634609c57250a0"
+          },
+          {
+            "repo": "AchillesIDE",
+            "path": "liveKitServerAgent/scripts/start-livekit-server-agent.sh",
+            "sha256": "1cdd921f9b9824cf31fabdec62c1d2cf3952e8491b9057557dbc3ce94e9b1bd2"
+          }
+        ],
+        "manifest": {
+          "start": "sh /code/scripts/start-livekit-server-agent.sh",
+          "agent": null,
+          "commandsRun": null,
+          "readinessProtocol": null,
+          "readinessScript": "healthcheck.sh",
+          "networkMode": "host",
+          "routes": [
+            {
+              "path": "/base-agent-additional-server/liveKitServerAgent/7880/*",
+              "access": "public"
+            },
+            {
+              "path": "/base-agent-additional-server/liveKitServerAgent/7880/twirp/livekit.RoomService/*",
+              "access": "authenticated"
+            },
+            {
+              "path": "/base-agent-additional-server/liveKitServerAgent/7880/twirp/livekit.AgentDispatchService/*",
+              "access": "authenticated"
+            }
+          ]
+        },
+        "absent": [
+          {
+            "repo": "AchillesIDE",
+            "path": "liveKitServerAgent/scripts/start-livekit-server-agent.sh",
+            "text": "AgentServer"
+          }
+        ],
+        "present": [
+          {
+            "repo": "ploinky",
+            "path": "cli/utils/runtime/startupReadiness.js",
+            "text": "type: 'start_only',"
+          },
+          {
+            "repo": "ploinky",
+            "path": "cli/sandbox/docker/agentServiceManager.js",
+            "text": "launchAgentSidecar({ containerName, agentCommand: explicitAgentCmd, agentName });"
+          },
+          {
+            "repo": "ploinky",
+            "path": "cli/sandbox/docker/agentCommands.js",
+            "text": "if (!command) return;"
+          },
+          {
+            "repo": "ploinky",
+            "path": "cli/server/RoutingServer.js",
+            "text": "if (!route.hostPort) {"
+          },
+          {
+            "repo": "ploinky",
+            "path": "cli/server/RoutingServer.js",
+            "text": "sendJsonResponse(res, 404, { error: 'agent_not_found', agent: agentName });"
+          }
+        ]
+      }
+    },
+    {
+      "id": "D4-soul-no-upstream-mcp",
+      "repo": "proxies",
+      "agent": "soul-gateway",
+      "decision": "r2b_remediation_decisions_codex.md D4",
+      "summary": "startup.sh executes the custom src/index.mjs whose core, public API and management routers serve health, /v1 and /management, never /mcp. Only the Router-forwarded tools/list and resources/list are not applicable; Router-local initialize, the -32601 default and the GET 405 contract stay asserted.",
+      "nonApplicable": [
+        "mcp-discovery:tools/list",
+        "mcp-discovery:resources/list"
+      ],
+      "retainedControls": [
+        "capability:soul-gateway:health:anonymous"
+      ],
+      "contract": {
+        "files": [
+          {
+            "repo": "proxies",
+            "path": "soul-gateway/manifest.json",
+            "sha256": "d655ad327921d1dff36c2d1e92aa19566cfd874e3fb0cc2ef4c99f279116a9e1"
+          },
+          {
+            "repo": "proxies",
+            "path": "soul-gateway/startup.sh",
+            "sha256": "09981225eed7f8a7a675facaf45eb23af602154db6f7a888df05eb7d419df7a0"
+          },
+          {
+            "repo": "proxies",
+            "path": "soul-gateway/src/bootstrap.mjs",
+            "sha256": "cf6acec366c26559a1ffbe6b74a4c785adc2d7ce4ffede5cd59cd244c100a08f"
+          },
+          {
+            "repo": "proxies",
+            "path": "soul-gateway/src/public-api/register-routes.mjs",
+            "sha256": "aef2bda141a48c29f933f4564a155d877e392f3a97976eca26b8e76da3e603f8"
+          },
+          {
+            "repo": "proxies",
+            "path": "soul-gateway/src/management/build-routes.mjs",
+            "sha256": "65e5b87b10c03657c0b2e7d020e97d6822c2e8990072988a0f081cd234fa861b"
+          }
+        ],
+        "manifest": {
+          "agent": "bash /code/startup.sh",
+          "readinessProtocol": "tcp"
+        },
+        "absent": [
+          {
+            "repo": "proxies",
+            "path": "soul-gateway/src/bootstrap.mjs",
+            "text": "/mcp"
+          },
+          {
+            "repo": "proxies",
+            "path": "soul-gateway/src/public-api/register-routes.mjs",
+            "text": "/mcp"
+          },
+          {
+            "repo": "proxies",
+            "path": "soul-gateway/src/management/build-routes.mjs",
+            "text": "/mcp"
+          }
+        ],
+        "present": [
+          {
+            "repo": "proxies",
+            "path": "soul-gateway/startup.sh",
+            "text": "exec node src/index.mjs"
+          },
+          {
+            "repo": "ploinky",
+            "path": "cli/server/mcp-proxy/index.js",
+            "text": "const tools = await upstream.listTools();"
+          },
+          {
+            "repo": "ploinky",
+            "path": "cli/server/mcp-proxy/index.js",
+            "text": "const resources = listDecision.allow ? await upstream.listResources() : [];"
+          },
+          {
+            "repo": "ploinky",
+            "path": "cli/server/mcp-proxy/index.js",
+            "text": "error: { code: -32601, message: `Method not found: ${message.method}` }"
+          },
+          {
+            "repo": "ploinky",
+            "path": "cli/server/mcp-proxy/index.js",
+            "text": "res.end(JSON.stringify({ error: 'event_stream_not_supported' }));"
+          }
+        ]
+      }
+    }
+  ]
 }
