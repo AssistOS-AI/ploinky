@@ -5,6 +5,7 @@ import { createComposer } from './composer.js';
 import { createNetwork } from './network.js';
 import { createUploader } from './upload.js';
 import { createComposerAutocomplete } from './composerAutocomplete.js';
+import { createStartupCatalogRefresh } from './startupCatalogRefresh.js';
 import { createSlashCommandsProvider } from './autocompleteProviders/slashCommands.js';
 import { createWorkspacePathsProvider } from './autocompleteProviders/workspacePaths.js';
 import { createAutocompleteState } from './autocompleteState.js';
@@ -117,6 +118,7 @@ const sidePanelApi = createSidePanel({
 
 let sessionController = null;
 let modelCatalogSessionKey = '';
+let startupCatalogRefresh = null;
 let taskController = null;
 let interactionController = null;
 let composerAutocomplete = null;
@@ -186,6 +188,7 @@ network = createNetwork({
             const key = `${selected}:${payload.session?.engine?.backend || ''}`;
             if (key !== modelCatalogSessionKey) {
                 modelCatalogSessionKey = key;
+                startupCatalogRefresh?.cancel();
                 void composerAutocomplete?.refresh().catch((error) => dlog(error));
             }
         }
@@ -753,6 +756,10 @@ document.addEventListener('keydown', (event) => {
 
 (() => {
     sessionController.bootstrap();
-    composerAutocomplete.refresh();
+    startupCatalogRefresh = createStartupCatalogRefresh({
+        refresh: () => composerAutocomplete.refresh().catch((error) => dlog(error)),
+        getSessionId: () => sessionController.getCurrentSession()?.sessionId || '',
+    });
+    startupCatalogRefresh.schedule();
     network.start();
 })();
