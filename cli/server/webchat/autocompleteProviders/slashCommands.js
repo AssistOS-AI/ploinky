@@ -34,12 +34,24 @@ function malformedCatalogError(message) {
     return catalogLoadError(message, { maxAttempts: MALFORMED_CATALOG_MAX_ATTEMPTS });
 }
 
-// The MCP session is gone (agent restarted, session expired); the next attempt
-// must initialize again instead of reusing it.
+// The Router's MCP proxy answers a session it does not hold (expired, or lost
+// on a Router restart) with HTTP 200 and this JSON-RPC error. Browser modules
+// cannot import cli/server/mcp-proxy/sessionErrors.js; a unit test keeps the
+// two equal.
+export const ROUTER_MCP_SESSION_INVALID_ERROR = Object.freeze({
+    code: -32000,
+    message: 'Missing or invalid MCP session',
+});
+
+// The MCP session is gone (agent or Router restarted, session expired); the
+// next attempt must initialize again instead of reusing it. -32000 alone is
+// also the Router's generic upstream failure, so the message must match too.
 function responseIsSessionFailure(response, body = null) {
     return response?.status === 404
         || body?.error?.code === -32001
-        || (response?.status === 400 && /session/i.test(String(body?.error?.message || '')));
+        || (response?.status === 400 && /session/i.test(String(body?.error?.message || '')))
+        || (body?.error?.code === ROUTER_MCP_SESSION_INVALID_ERROR.code
+            && body?.error?.message === ROUTER_MCP_SESSION_INVALID_ERROR.message);
 }
 
 function responseIsAccessDenied(response, body = null) {

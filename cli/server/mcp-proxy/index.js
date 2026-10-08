@@ -22,6 +22,7 @@ import { sanitizeArgumentsForTool } from './toolArguments.js';
 import { policy } from '../policy/index.js';
 import { deriveSubkey } from '../../utils/security/masterKey.js';
 import { verifyUserDelegationGrant } from './userDelegationGrant.js';
+import { MCP_SESSION_INVALID_ERROR } from './sessionErrors.js';
 
 const AGENT_PROXY_PROTOCOL_VERSION = '2025-06-18';
 const AGENT_PROXY_SERVER_INFO = { name: 'ploinky-router-proxy', version: '1.0.0' };
@@ -682,7 +683,7 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, {
         sendResponse(200, {
             jsonrpc: '2.0',
             id: message.id ?? null,
-            error: { code: -32000, message: 'Missing or invalid MCP session' }
+            error: { ...MCP_SESSION_INVALID_ERROR }
         }, null);
         return;
     }

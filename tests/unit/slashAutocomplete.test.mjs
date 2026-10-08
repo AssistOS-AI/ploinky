@@ -748,3 +748,54 @@ test('slash provider re-initializes only when the MCP session is reported invali
     const toolsCall = harness.calls.find((call) => call.method === 'tools/call');
     assert.equal(toolsCall.session, 'session-2');
 });
+
+// The browser talks to the Router's MCP proxy, which answers an unknown or
+// expired session (for example after a Router restart) with HTTP 200 and
+// JSON-RPC -32000 'Missing or invalid MCP session' instead of the agent's 404.
+const ROUTER_SESSION_ERROR = (payload) => Response.json({
+    jsonrpc: '2.0', id: payload?.id ?? null, error: { code: -32000, message: 'Missing or invalid MCP session' },
+});
+
+test('slash provider re-initializes when the Router proxy reports the session invalid at tools/list', async () => {
+    const harness = mcpHarness({
+        onToolsList: ({ sessionHeader }) => (sessionHeader === 'session-1' ? ROUTER_SESSION_ERROR({ id: 'wc-tools-1' }) : null),
+        onToolsCall: ({ payload }) => catalogResult(payload),
+    });
+    await withMcp(harness, async () => {
+        const provider = createSlashCommandsProvider({ agentName: 'achilles-cli', retryDelays: [0, 0], wait: async () => {} });
+        const commands = await provider.refresh();
+        assert.deepEqual(commands.map((c) => c.name), ['/model']);
+    });
+    assert.equal(harness.calls.filter((call) => call.method === 'initialize').length, 2);
+    assert.deepEqual(harness.calls.filter((call) => call.method === 'tools/list').map((call) => call.session), ['session-1', 'session-2']);
+    assert.equal(harness.calls.find((call) => call.method === 'tools/call').session, 'session-2');
+});
+
+test('slash provider re-initializes when the Router proxy reports the session invalid at tools/call', async () => {
+    const harness = mcpHarness({
+        onToolsCall: ({ payload, sessionHeader }) => (sessionHeader === 'session-1' ? ROUTER_SESSION_ERROR(payload) : catalogResult(payload)),
+    });
+    await withMcp(harness, async () => {
+        const provider = createSlashCommandsProvider({ agentName: 'achilles-cli', retryDelays: [0, 0], wait: async () => {} });
+        const commands = await provider.refresh();
+        assert.deepEqual(commands.map((c) => c.name), ['/model']);
+    });
+    assert.equal(harness.calls.filter((call) => call.method === 'initialize').length, 2);
+    assert.deepEqual(harness.calls.filter((call) => call.method === 'tools/call').map((call) => call.session), ['session-1', 'session-2']);
+});
+
+test('a Router -32000 that is not the session error keeps the session and retries', async () => {
+    let n = 0;
+    const harness = mcpHarness({
+        onToolsCall: ({ payload }) => (++n === 1
+            ? Response.json({ jsonrpc: '2.0', id: payload.id, error: { code: -32000, message: 'upstream agent unavailable' } })
+            : catalogResult(payload)),
+    });
+    await withMcp(harness, async () => {
+        const provider = createSlashCommandsProvider({ agentName: 'achilles-cli', retryDelays: [0, 0], wait: async () => {} });
+        const commands = await provider.refresh();
+        assert.deepEqual(commands.map((c) => c.name), ['/model']);
+    });
+    assert.equal(harness.calls.filter((call) => call.method === 'initialize').length, 1);
+    assert.equal(harness.calls.filter((call) => call.method === 'tools/call').length, 2);
+});
