@@ -13,6 +13,14 @@ export function buildWebchatQuery(parsedUrl, agentName = '') {
     return params.toString();
 }
 
+// Identity and runtime-scope inputs are owned by the router and the agent
+// manifest. A query string must never supply them as agent launch flags.
+const RESERVED_LAUNCH_KEY_RE = /^(?:sso-|webchat-runtime-scope$)/i;
+
+export function isReservedWebchatLaunchKey(key) {
+    return RESERVED_LAUNCH_KEY_RE.test(String(key || '').trim());
+}
+
 export function resolveWorkspaceScopedQueryPath(value) {
     const raw = String(value || '').trim();
     if (!raw || raw.includes('\0') || path.isAbsolute(raw)) {
@@ -34,7 +42,7 @@ export function resolveWebchatLaunchOptions(parsedUrl) {
     }
     for (const [rawKey, rawValue] of parsedUrl.searchParams.entries()) {
         const key = String(rawKey || '').trim();
-        if (!key || key === 'agent' || key === 'tabId' || key === 'sessionId') {
+        if (!key || key === 'agent' || key === 'tabId' || key === 'sessionId' || isReservedWebchatLaunchKey(key)) {
             continue;
         }
         if (directoryKeys.includes(key)) continue;
@@ -59,7 +67,8 @@ export async function resolveWebchatLaunchOptionsAsync(parsedUrl, { workspaceBas
     }
     for (const [rawKey, rawValue] of parsedUrl.searchParams.entries()) {
         const key = String(rawKey || '').trim();
-        if (!key || key === 'agent' || key === 'tabId' || key === 'sessionId' || directoryKeys.includes(key)) continue;
+        if (!key || key === 'agent' || key === 'tabId' || key === 'sessionId' || directoryKeys.includes(key)
+            || isReservedWebchatLaunchKey(key)) continue;
         if (key === 'workspace-skill-root' || key === 'workspaceSkillRoot') {
             const raw = String(rawValue || '').trim();
             if (!raw || raw.includes('\0') || path.isAbsolute(raw)) continue;

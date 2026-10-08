@@ -1866,3 +1866,88 @@ test('Router authentication failures never echo arbitrary error messages', async
         detail: 'SSO is not configured (no provider agent configured)',
     });
 });
+
+test('static-auth DPU WebChat admits only SSO users with Explorer access (G, NX, U, A)', async (t) => {
+    const { authHandlers, authService, createRoutePlan } = await withAuthModules(t, { staticAuthMode: 'sso' });
+    const sessions = {
+        'sso-nx': { id: 'sso:nx', username: 'nx', roles: ['user'], capabilities: [] },
+        'sso-u': { id: 'sso:member', username: 'member', roles: ['user'], capabilities: ['explorer.access'] },
+        'sso-a': { id: 'sso:administrator', username: 'administrator', roles: ['user', 'admin'], capabilities: ['explorer.access'] },
+    };
+    const sessionFor = (sessionId) => sessions[sessionId]
+        ? { user: { ...sessions[sessionId] }, tokens: null, expiresAt: Date.now() + 60_000 }
+        : null;
+    const originals = {
+        isConfigured: authService.isConfigured,
+        getSession: authService.getSession,
+        validateSession: authService.validateSession,
+    };
+    authService.isConfigured = () => true;
+    authService.getSession = sessionFor;
+    authService.validateSession = async (sessionId) => sessionFor(sessionId);
+    t.after(() => Object.assign(authService, originals));
+
+    const routePlanFor = () => {
+        const routePlan = createRoutePlan({ decision: { access: 'authenticated', routeKey: 'explorer' } });
+        routePlan.snapshot.manifests.explorer = {
+            routerAccess: {
+                requiredCapability: 'explorer.access',
+                capabilityDeniedRedirect: '/base-agent-additional-server/userPersistoAgent/7000/service/dashboard/',
+            },
+        };
+        routePlan.snapshot.manifests.dpuAgent = {
+            webchat: { auth: 'static', forwardEnvelope: true, runtimeScope: 'principal' },
+        };
+        return routePlan;
+    };
+    const attempt = async ({ url, cookie = '', accept = 'text/html', method = 'GET' }) => {
+        const req = makeRequest({ method, url, cookie, accept });
+        const res = new MockResponse();
+        const result = await authHandlers.ensureAuthenticated(req, res, new URL(req.url, 'http://localhost'), {
+            routePlan: routePlanFor(),
+        });
+        return { req, res, result };
+    };
+    const page = '/webchat?agent=dpuAgent&forward-envelope=1&workspace-dir=.';
+    const stream = '/webchat/stream?agent=dpuAgent&forward-envelope=1&workspace-dir=.&tabId=tab-1';
+
+    // G: an anonymous visitor or a WebMeet guest is sent to the Explorer login.
+    const guestMint = makeRequest({ method: 'POST', url: '/webAssist/mcp' });
+    await authHandlers.ensureAuthenticated(guestMint, new MockResponse(), new URL(guestMint.url, 'http://localhost'));
+    assert.equal(guestMint.authMode, 'guest');
+    for (const cookie of ['', `ploinky_guest=${guestMint.sessionId}`]) {
+        const pageAttempt = await attempt({ url: page, cookie });
+        assert.equal(pageAttempt.result.ok, false);
+        assert.equal(pageAttempt.res.statusCode, 302);
+        const location = new URL(String(pageAttempt.res.getHeader('location') || ''), 'http://localhost');
+        assert.equal(location.pathname, '/auth/login');
+        assert.equal(location.searchParams.get('agent'), 'explorer');
+        assert.equal(pageAttempt.req.user, undefined);
+        assert.doesNotMatch(String(pageAttempt.res.getHeader('set-cookie') || ''), /ploinky_guest=/);
+        const streamAttempt = await attempt({ url: stream, cookie, accept: 'text/event-stream' });
+        assert.equal(streamAttempt.result.ok, false);
+        assert.equal(streamAttempt.req.user, undefined);
+    }
+
+    // NX: an SSO user without explorer.access never reaches the DPU surface.
+    const nxPage = await attempt({ url: page, cookie: 'ploinky_sso=sso-nx' });
+    assert.equal(nxPage.result.ok, false);
+    assert.equal(nxPage.res.statusCode, 302);
+    assert.match(String(nxPage.res.getHeader('location') || ''), /userPersistoAgent\/7000\/service\/dashboard/);
+    const nxStream = await attempt({ url: stream, cookie: 'ploinky_sso=sso-nx', accept: 'text/event-stream' });
+    assert.equal(nxStream.result.ok, false);
+    assert.equal(nxStream.res.statusCode, 403);
+    assert.equal(JSON.parse(nxStream.res.body).error, 'required_capability_missing');
+
+    // U and A: their own SSO identity reaches the DPU WebChat surface.
+    for (const [cookie, userId] of [['ploinky_sso=sso-u', 'sso:member'], ['ploinky_sso=sso-a', 'sso:administrator']]) {
+        for (const [url, accept] of [[page, 'text/html'], [stream, 'text/event-stream']]) {
+            const allowed = await attempt({ url, cookie, accept });
+            assert.equal(allowed.result.ok, true, `${userId} ${url}`);
+            assert.equal(allowed.req.user.id, userId);
+            assert.equal(allowed.req.authMode, 'sso');
+            assert.equal(allowed.req.edgeAuthContext.routeKey, 'explorer');
+            assert.equal(allowed.req.edgeAuthContext.serviceRouteKey, 'dpuAgent');
+        }
+    }
+});
