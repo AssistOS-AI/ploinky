@@ -87,22 +87,119 @@ function nonNegativeInteger(value, fallback) {
     return Number.isInteger(value) && value >= 0 ? value : fallback;
 }
 
-// A fresh 0700 directory per worker for its handshake socket. The socket is
-// removed as soon as the worker has connected.
-function createSocketPath() {
-    for (const base of [os.tmpdir(), '/tmp']) {
-        let dir;
-        try {
-            dir = fs.mkdtempSync(path.join(base, 'ptw-'));
-        } catch (_) {
-            continue;
-        }
-        const socketPath = path.join(dir, 's');
-        if (Buffer.byteLength(socketPath) <= MAX_SOCKET_PATH_BYTES) return { dir, socketPath };
-        fs.rmSync(dir, { recursive: true, force: true });
-    }
-    throw new Error('no directory with a short enough path for a tool worker socket');
+const SOCKET_PROBE_TIMEOUT_MS = 2000;
+
+// Where worker handshake sockets may live, in order of preference. Some
+// filesystems accept a Unix socket but refuse to connect to it (a nested
+// Podman container's fuse-overlayfs /tmp answers EACCES), so each base is
+// proven by a probe before it is used.
+export function toolWorkerSocketBases(env = process.env) {
+    const bases = [];
+    const override = env?.PLOINKY_TOOL_WORKER_SOCKET_DIR;
+    if (typeof override === 'string' && path.isAbsolute(override)) bases.push(override);
+    bases.push(os.tmpdir(), '/dev/shm', '/tmp');
+    return [...new Set(bases.map((base) => path.resolve(base)))];
 }
+
+// A fresh 0700 directory (mkdtemp's mode) for one handshake socket.
+function createSocketPath(base, fsApi = fs) {
+    const dir = fsApi.mkdtempSync(path.join(base, 'ptw-'));
+    const socketPath = path.join(dir, 's');
+    if (Buffer.byteLength(socketPath) <= MAX_SOCKET_PATH_BYTES) return { dir, socketPath };
+    fsApi.rmSync(dir, { recursive: true, force: true });
+    throw new Error(`socket path under ${base} exceeds ${MAX_SOCKET_PATH_BYTES} bytes`);
+}
+
+// Listen on a probe socket under `base`, connect to it from this process,
+// then remove everything. Resolves `{ ok, reason }`; never rejects.
+function probeSocketBase(base, { fsApi, netApi, timeoutMs }) {
+    return new Promise((resolve) => {
+        let paths;
+        try {
+            paths = createSocketPath(base, fsApi);
+        } catch (error) {
+            resolve({ ok: false, reason: error?.code || error?.message || String(error) });
+            return;
+        }
+        let server = null;
+        let client = null;
+        let done = false;
+        let timer = null;
+        const finish = (result) => {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            try { client?.destroy(); } catch (_) { /* already closed */ }
+            try { server?.close(); } catch (_) { /* already closed */ }
+            try { fsApi.rmSync(paths.dir, { recursive: true, force: true }); } catch (_) { /* best effort */ }
+            resolve(result);
+        };
+        timer = setTimeout(() => finish({ ok: false, reason: `no connection within ${timeoutMs}ms` }), timeoutMs);
+        timer.unref?.();
+        try {
+            server = netApi.createServer((socket) => socket.destroy());
+            server.on('error', (error) => finish({ ok: false, reason: `listen ${error?.code || error?.message}` }));
+            server.listen(paths.socketPath, () => {
+                try {
+                    client = netApi.createConnection(paths.socketPath);
+                    client.on('connect', () => finish({ ok: true }));
+                    client.on('error', (error) => finish({ ok: false, reason: `connect ${error?.code || error?.message}` }));
+                } catch (error) {
+                    finish({ ok: false, reason: `connect ${error?.code || error?.message}` });
+                }
+            });
+        } catch (error) {
+            finish({ ok: false, reason: `listen ${error?.code || error?.message}` });
+        }
+    });
+}
+
+/**
+ * Chooses the directory for worker handshake sockets: the first base where a
+ * Unix socket can be listened on and connected to. The passing base is a
+ * capability remembered for this process (no content is cached); `invalidate`
+ * forgets it after a later mkdtemp or listen there fails, so the next worker
+ * probes again. A failed resolution is not remembered.
+ */
+export function createToolWorkerSocketDirectories({
+    bases = () => toolWorkerSocketBases(),
+    fsApi = fs,
+    netApi = net,
+    probeTimeoutMs = SOCKET_PROBE_TIMEOUT_MS,
+} = {}) {
+    let remembered = null;
+    let inFlight = null;
+    return {
+        current: () => remembered,
+        invalidate(base) {
+            if (remembered === base) remembered = null;
+        },
+        resolve() {
+            if (remembered) return Promise.resolve(remembered);
+            if (!inFlight) {
+                inFlight = (async () => {
+                    const tried = [];
+                    for (const base of bases()) {
+                        const result = await probeSocketBase(base, { fsApi, netApi, timeoutMs: probeTimeoutMs });
+                        if (result.ok) {
+                            remembered = base;
+                            return base;
+                        }
+                        tried.push(`${base} (${result.reason})`);
+                    }
+                    const error = new Error(`no directory where a tool worker socket can be connected; tried ${tried.join(', ') || 'no candidate'}`);
+                    error.code = 'TOOL_WORKER_SOCKET_UNAVAILABLE';
+                    throw error;
+                })().finally(() => {
+                    inFlight = null;
+                });
+            }
+            return inFlight;
+        },
+    };
+}
+
+const defaultSocketDirectories = createToolWorkerSocketDirectories();
 
 function tokensEqual(received, expected) {
     if (typeof received !== 'string') return false;
@@ -234,6 +331,7 @@ export class ToolWorkerPool {
         this.log = typeof options.log === 'function' ? options.log : defaultLog;
         this.now = typeof options.now === 'function' ? options.now : Date.now;
         this.codeIdentity = typeof options.codeIdentity === 'function' ? options.codeIdentity : null;
+        this.socketDirectories = options.socketDirectories || defaultSocketDirectories;
 
         this.workers = new Set();
         this.queue = [];
@@ -468,25 +566,60 @@ export class ToolWorkerPool {
             if (!worker.child) this.abandonStart(worker);
         }, this.readyTimeoutMs);
 
+        const base = this.socketDirectories.current();
+        if (base) {
+            this.openWorkerSocket(worker, base);
+            return true;
+        }
+        this.socketDirectories.resolve().then(
+            (resolved) => {
+                if (worker.gone) return;
+                if (this.shuttingDown || worker.state !== 'starting') {
+                    this.abandonStart(worker);
+                    return;
+                }
+                this.openWorkerSocket(worker, resolved);
+            },
+            (error) => this.onNoSocketDirectory(worker, error),
+        );
+        return true;
+    }
+
+    openWorkerSocket(worker, base) {
         try {
-            const { dir, socketPath } = createSocketPath();
+            const { dir, socketPath } = createSocketPath(base);
             worker.socketDir = dir;
             worker.socketPath = socketPath;
         } catch (error) {
+            this.socketDirectories.invalidate(base);
             this.log(`[toolWorkerPool:${this.name}] cannot create a worker socket: ${error?.message || error}`);
             setImmediate(() => this.abandonStart(worker));
-            return true;
+            return;
         }
         const server = net.createServer();
         worker.server = server;
         server.on('connection', (socket) => this.onHandshakeConnection(worker, socket));
         server.on('error', (error) => {
+            this.socketDirectories.invalidate(base);
             this.log(`[toolWorkerPool:${this.name}] worker socket error: ${error?.message || error}`);
             if (!worker.child) this.abandonStart(worker);
             else this.retire(worker);
         });
         server.listen(worker.socketPath, () => this.launchWorker(worker));
-        return true;
+    }
+
+    // No base can carry a connectable socket: no worker is spawned. The pool
+    // degrades at once with one line naming the bases tried, and calls use
+    // the spawn fallback; the next spawn after the degraded period probes again.
+    onNoSocketDirectory(worker, error) {
+        if (worker.gone) return;
+        worker.noSocketDirectory = true;
+        if (!this.shuttingDown && !this.isDegraded()) {
+            this.unproductiveDeaths = 0;
+            this.degradedUntil = this.now() + DEGRADED_MS;
+            this.log(`[toolWorkerPool:${this.name}] ${error?.message || error}; degraded for ${DEGRADED_MS}ms (spawn fallback)`);
+        }
+        this.abandonStart(worker);
     }
 
     prefix(worker) {
@@ -935,7 +1068,8 @@ export class ToolWorkerPool {
             this.counters.crashes += 1;
             this.failBusyCall(worker, `tool worker exited (code ${code}, signal ${signal}) during the call`);
         }
-        if (!this.shuttingDown && (wasStarting || (worker.calls === 0 && !worker.retiredByPool))) {
+        if (!this.shuttingDown && !worker.noSocketDirectory
+            && (wasStarting || (worker.calls === 0 && !worker.retiredByPool))) {
             this.recordUnproductiveDeath();
         }
         this.notifyExitWaiters();
