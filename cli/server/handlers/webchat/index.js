@@ -27,6 +27,7 @@ import {
 } from './browserSession.js';
 import { handleRuntimeRoute } from './runtimeRoutes.js';
 import { handleTaskRoute } from './taskRoutes.js';
+import { renderModulePreloadLinks } from './modulePreload.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -182,6 +183,7 @@ export async function handleWebChat(req, res, appConfig, appState) {
     if (pathname === '/' || pathname === '/index.html') {
         const html = await renderTemplate(['chat.html', 'index.html'], {
             '__ASSET_BASE__': `/${appName}/assets`,
+            '__MODULE_PRELOADS__': renderModulePreloadLinks(`/${appName}/assets`),
             '__AGENT_NAME__': effectiveConfig.agentName || '',
             '__DISPLAY_NAME__': effectiveConfig.displayName || effectiveConfig.agentName || 'WebChat',
             '__RUNTIME__': effectiveConfig.runtime || 'local',
