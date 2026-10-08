@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+    readExplicitReadinessProtocol,
     readManifestAgentCommand,
     readManifestStartCommand,
     resolveAgentExecutionMode,
@@ -117,4 +118,18 @@ test('manifests with both start and agent still default to MCP unless overridden
         start: 'service-start.sh',
         agent: 'sh /Agent/server/AgentServer.sh'
     }), 'mcp');
+});
+
+test('readExplicitReadinessProtocol returns only a declared, normalized protocol', () => {
+    assert.equal(readExplicitReadinessProtocol({ readiness: { protocol: ' TCP ' } }), 'tcp');
+    assert.equal(readExplicitReadinessProtocol({ readiness: { protocol: 'Mcp' } }), 'mcp');
+    assert.equal(readExplicitReadinessProtocol({ readiness: { protocol: 'none' } }), 'none');
+    for (const manifest of [null, undefined, {}, { readiness: {} }, { readiness: { protocol: 'tcpx' } },
+        { readiness: { protocol: 123 } }, { readiness: { protocol: null } }, { readiness: { protocol: '' } }]) {
+        assert.equal(readExplicitReadinessProtocol(manifest), '', JSON.stringify(manifest));
+    }
+    // Derived protocols are not explicit declarations.
+    assert.equal(readExplicitReadinessProtocol({ start: 'postgres' }), '');
+    assert.equal(readExplicitReadinessProtocol({ health: { readiness: { script: 'r.sh' } } }), '');
+    assert.equal(resolveAgentReadinessProtocol({ start: 'postgres' }), 'tcp');
 });

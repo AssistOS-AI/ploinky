@@ -6,6 +6,12 @@ function normalizeProtocol(value) {
     return '';
 }
 
+// Only what the manifest itself declares: '' when absent or unrecognized.
+// Unlike resolveAgentReadinessProtocol this never derives a protocol.
+function readExplicitReadinessProtocol(manifest) {
+    return normalizeProtocol(manifest?.readiness?.protocol);
+}
+
 function resolveAgentReadinessPort(manifest) {
     const value = manifest?.readiness?.port;
     if (value === undefined || value === null || value === '') return null;
@@ -138,6 +144,7 @@ function resolveManifestReadinessWaitOptions(manifest, fallbackTimeoutMs = 12000
 }
 
 export {
+    readExplicitReadinessProtocol,
     readManifestAgentCommand,
     readManifestReadinessScript,
     readManifestStartCommand,

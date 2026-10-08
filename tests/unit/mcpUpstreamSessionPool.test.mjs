@@ -786,7 +786,7 @@ function loadProxyFixture() {
     return proxyFixturePromise;
 }
 
-function proxyRoute(port, lease) {
+function proxyRoute(port, lease, manifest) {
     const route = { repo: 'PoolTest', agent: 'echoAgent', container: PROXY_CONTAINER, hostPort: port };
     const snapshot = {
         routing: { routes: { echoAgent: route } },
@@ -794,6 +794,7 @@ function proxyRoute(port, lease) {
             type: 'agent', repoName: 'PoolTest', agentName: 'echoAgent',
             containerId: 'd'.repeat(64), instanceId: 'proxy-instance', enableGeneration: 'proxy-enable',
         } },
+        ...(manifest === undefined ? {} : { manifests: { echoAgent: manifest } }),
     };
     const routePlan = {
         ok: true,
@@ -825,12 +826,13 @@ function toolsCall(label) {
     return { jsonrpc: '2.0', id: proxyRpcId, method: 'tools/call', params: { name: 'actor', arguments: { label } } };
 }
 
-async function proxyCall(proxy, { route, routePlan, sessionId, body, pool, waitForAgentReady, beforeDial = () => true }) {
-    const req = Readable.from([Buffer.from(JSON.stringify(body), 'utf8')]);
+async function proxyCall(proxy, { route, routePlan, sessionId, body, pool, waitForAgentReady, beforeDial = () => true, agent = null }) {
+    const req = Readable.from([Buffer.from(typeof body === 'string' ? body : JSON.stringify(body), 'utf8')]);
     req.method = 'POST';
     req.url = '/echoAgent/mcp';
     req.headers = { host: 'localhost', 'content-type': 'application/json', 'mcp-session-id': sessionId };
     req.user = PROXY_USER;
+    if (agent) req.agent = agent;
     let finish;
     const done = new Promise((resolve) => { finish = resolve; });
     const res = {
@@ -841,7 +843,7 @@ async function proxyCall(proxy, { route, routePlan, sessionId, body, pool, waitF
     };
     await proxy.handleAgentMcpRequest(req, res, route, 'echoAgent', { beforeDial, routePlan, pool, waitForAgentReady });
     await done;
-    return { status: res.statusCode, json: JSON.parse(res.body) };
+    return { status: res.statusCode, json: JSON.parse(res.body), sessionStoreSize: proxy.agentSessionStore.size };
 }
 
 function proxyToolPayload(json) {
@@ -1607,4 +1609,176 @@ test('deadline: a queued request granted after its deadline sends and mints noth
     for (const reply of held.splice(0)) reply();
     for (const result of await Promise.allSettled(slow)) assert.equal(result.status, 'fulfilled');
     await pool.closeAll();
+});
+
+
+// Explicit readiness.protocol in the committed lease manifest (SPEC C, user decision):
+// 'tcp' probes the port only and still forwards; 'none' answers without an MCP endpoint.
+function protocolSpy(result = true) {
+    const spy = { calls: 0, options: [], result };
+    spy.fn = async (_route, options) => { spy.calls += 1; spy.options.push(options); return spy.result; };
+    return spy;
+}
+
+test('explicit readiness.protocol tcp: the probe is a TCP probe and the request is still forwarded upstream', async (t) => {
+    const { proxy, audience, secret } = await loadProxyFixture();
+    const { forwarder } = await startEchoAgentBehindForwarder(t, { secret, audience });
+    for (const [lease, protocol] of [['lease-tcp', 'tcp'], ['lease-tcp-spaced', ' TCP ']]) {
+        const pool = newPool(t);
+        const readiness = protocolSpy(true);
+        const { route, routePlan, key } = proxyRoute(forwarder.port, lease, { readiness: { protocol } });
+        const sessionId = openRouterSession(proxy);
+        const result = await proxyCall(proxy, { route, routePlan, sessionId, pool, waitForAgentReady: readiness.fn, body: toolsCall('tcp') });
+        assert.equal(readiness.calls, 1);
+        assert.equal(readiness.options[0].protocol, 'tcp');
+        assert.equal(proxyToolPayload(result.json).input.label, 'tcp', 'forwarded to the upstream agent');
+        // Only the real upstream exchange marks the pooled key ready; the TCP probe itself created nothing.
+        assert.equal(pool.isReady(key), true);
+    }
+});
+
+test('explicit readiness.protocol tcp: a failed TCP probe gives the existing not-ready answer', async (t) => {
+    const { proxy } = await loadProxyFixture();
+    const readiness = protocolSpy(false);
+    const { route, routePlan } = proxyRoute(7409, 'lease-tcp-down', { readiness: { protocol: 'tcp' } });
+    const result = await proxyCall(proxy, { route, routePlan, sessionId: openRouterSession(proxy), pool: newPool(t), waitForAgentReady: readiness.fn, body: toolsCall('x') });
+    assert.equal(result.json.error.code, -32000);
+    assert.match(result.json.error.message, /still starting/);
+});
+
+for (const [name, manifest] of [
+    ['mcp', { readiness: { protocol: 'mcp' } }],
+    ['absent protocol', { readiness: {} }],
+    ['no readiness block', {}],
+    ['health.readiness.script only', { health: { readiness: { script: 'ready.sh' } } }],
+    ['start without explicit protocol', { start: 'postgres' }],
+    ['unknown value', { readiness: { protocol: 'tcpx' } }],
+    ['numeric value', { readiness: { protocol: 123 } }],
+    ['null value', { readiness: { protocol: null } }],
+    ['empty value', { readiness: { protocol: '' } }],
+    ['missing manifest', undefined],
+]) {
+    test(`readiness protocol (${name}): the default MCP probe and normal forwarding are unchanged`, async (t) => {
+        const { proxy, audience, secret } = await loadProxyFixture();
+        const { forwarder } = await startEchoAgentBehindForwarder(t, { secret, audience });
+        const readiness = protocolSpy(true);
+        const { route, routePlan } = proxyRoute(forwarder.port, `lease-default-${name.replace(/\W+/g, '-')}`, manifest);
+        const result = await proxyCall(proxy, { route, routePlan, sessionId: openRouterSession(proxy), pool: newPool(t), waitForAgentReady: readiness.fn, body: toolsCall('d') });
+        assert.equal(readiness.calls, 1);
+        assert.equal(Object.hasOwn(readiness.options[0], 'protocol'), false, 'no protocol override');
+        assert.equal(proxyToolPayload(result.json).input.label, 'd');
+    });
+}
+
+test('readiness protocol: a routeKey absent from snapshot.manifests keeps the default path', async (t) => {
+    const { proxy, audience, secret } = await loadProxyFixture();
+    const { forwarder } = await startEchoAgentBehindForwarder(t, { secret, audience });
+    const readiness = protocolSpy(true);
+    const { route, routePlan } = proxyRoute(forwarder.port, 'lease-orphan', { readiness: { protocol: 'none' } });
+    routePlan.lease.snapshot.manifests = { other: { readiness: { protocol: 'none' } } };
+    const result = await proxyCall(proxy, { route, routePlan, sessionId: openRouterSession(proxy), pool: newPool(t), waitForAgentReady: readiness.fn, body: toolsCall('o') });
+    assert.equal(readiness.calls, 1);
+    assert.equal(proxyToolPayload(result.json).input.label, 'o');
+});
+
+test('explicit readiness.protocol none: answers -32601 at once with no probe, session or dial', async (t) => {
+    const { proxy } = await loadProxyFixture();
+    for (const protocol of ['none', ' NONE ']) {
+        const readiness = protocolSpy(true);
+        const pool = newPool(t);
+        const { route, routePlan } = proxyRoute(7410, `lease-none-${protocol.trim()}`, { readiness: { protocol } });
+        const sessionsBefore = proxy.agentSessionStore.size;
+        for (const method of ['initialize', 'tools/list']) {
+            const started = Date.now();
+            const result = await proxyCall(proxy, {
+                route, routePlan, sessionId: openRouterSession(proxy), pool, waitForAgentReady: readiness.fn,
+                body: { jsonrpc: '2.0', id: 7, method },
+            });
+            assert.ok(Date.now() - started < 200);
+            assert.equal(result.status, 200);
+            assert.deepEqual(result.json, {
+                jsonrpc: '2.0', id: 7,
+                error: { code: -32601, message: "Agent 'echoAgent' does not provide an MCP endpoint." },
+            });
+        }
+        assert.equal(readiness.calls, 0);
+        assert.equal(pool.snapshot().entries.length, 0, 'no pool entry');
+        assert.equal(proxy.agentSessionStore.size, sessionsBefore + 2, 'only the two sessions this test opened itself');
+    }
+});
+
+test('explicit readiness.protocol none: a request without an id answers id null and 50 parallel requests are fast', async (t) => {
+    const { proxy } = await loadProxyFixture();
+    const readiness = protocolSpy(true);
+    const { route, routePlan } = proxyRoute(7411, 'lease-none-parallel', { readiness: { protocol: 'none' } });
+    const pool = newPool(t);
+    const started = Date.now();
+    const results = await Promise.all(Array.from({ length: 50 }, () => proxyCall(proxy, {
+        route, routePlan, sessionId: openRouterSession(proxy), pool, waitForAgentReady: readiness.fn,
+        body: { jsonrpc: '2.0', method: 'tools/list' },
+    })));
+    assert.ok(Date.now() - started < 500);
+    for (const result of results) assert.equal(result.json.id, null);
+    assert.equal(readiness.calls, 0);
+});
+
+test('explicit readiness.protocol none: a failed lease commit gives the existing not-ready answer', async (t) => {
+    const { proxy } = await loadProxyFixture();
+    const readiness = protocolSpy(true);
+    const { route, routePlan } = proxyRoute(7412, 'lease-none-stale', { readiness: { protocol: 'none' } });
+    const result = await proxyCall(proxy, {
+        route, routePlan, sessionId: openRouterSession(proxy), pool: newPool(t), waitForAgentReady: readiness.fn,
+        beforeDial: () => false, body: { jsonrpc: '2.0', id: 1, method: 'tools/list' },
+    });
+    assert.equal(result.json.error.code, -32000);
+    assert.match(result.json.error.message, /still starting/);
+    assert.equal(readiness.calls, 0);
+    const plain = await proxyCall(proxy, {
+        route, routePlan, sessionId: openRouterSession(proxy), pool: newPool(t), waitForAgentReady: readiness.fn,
+        beforeDial: () => false, body: 'not json',
+    });
+    assert.equal(plain.status, 503);
+    assert.equal(plain.json.error, 'agent_not_ready');
+});
+
+test('explicit readiness.protocol none: authorization precedes the short-circuit', async (t) => {
+    const { proxy } = await loadProxyFixture();
+    const readiness = protocolSpy(true);
+    let commits = 0;
+    const { route, routePlan } = proxyRoute(7413, 'lease-none-forbidden', { readiness: { protocol: 'none' } });
+    const result = await proxyCall(proxy, {
+        route, routePlan, sessionId: openRouterSession(proxy), pool: newPool(t), waitForAgentReady: readiness.fn,
+        agent: { name: 'caller', allowedTargets: ['someoneElse'] },
+        beforeDial: () => { commits += 1; return true; },
+        body: { jsonrpc: '2.0', id: 1, method: 'tools/list' },
+    });
+    assert.equal(result.status, 403);
+    assert.equal(result.json.error, 'forbidden');
+    assert.equal(commits, 0);
+});
+
+test('explicit readiness.protocol none: without a callable beforeDial the request keeps the existing path', async (t) => {
+    const { proxy } = await loadProxyFixture();
+    const readiness = protocolSpy(false);
+    const { route, routePlan } = proxyRoute(7414, 'lease-none-nocommit', { readiness: { protocol: 'none' } });
+    const result = await proxyCall(proxy, {
+        route, routePlan, sessionId: openRouterSession(proxy), pool: newPool(t), waitForAgentReady: readiness.fn,
+        beforeDial: null, body: { jsonrpc: '2.0', id: 1, method: 'tools/list' },
+    });
+    assert.equal(readiness.calls, 1, 'fails closed onto the readiness probe');
+    assert.equal(result.json.error.code, -32000);
+});
+
+test('explicit readiness.protocol none: a non-JSON-RPC body (and malformed JSON) gets 404 agent_mcp_unavailable', async (t) => {
+    const { proxy } = await loadProxyFixture();
+    const readiness = protocolSpy(true);
+    const { route, routePlan } = proxyRoute(7415, 'lease-none-plain', { readiness: { protocol: 'none' } });
+    for (const body of [{ hello: 'world' }, '{malformed']) {
+        const result = await proxyCall(proxy, {
+            route, routePlan, sessionId: openRouterSession(proxy), pool: newPool(t), waitForAgentReady: readiness.fn, body,
+        });
+        assert.equal(result.status, 404);
+        assert.deepEqual(result.json, { error: 'agent_mcp_unavailable', detail: "Agent 'echoAgent' does not provide an MCP endpoint." });
+    }
+    assert.equal(readiness.calls, 0);
 });

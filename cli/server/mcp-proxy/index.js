@@ -3,6 +3,7 @@ import http from 'node:http';
 import { sendJson, ensureAuthenticated } from '../authHandlers/index.js';
 import { createAgentClient } from '../AgentClient.js';
 import { waitForAgentReady } from '../utils/agentReadiness.js';
+import { readExplicitReadinessProtocol } from '../../utils/runtime/startupReadiness.js';
 import {
     createUpstreamSessionPool,
     isUpstreamPoolEnabled,
@@ -790,6 +791,26 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, {
     }
 }
 
+function sendAgentNotReady(res, { isJsonRpc, message, agentName }) {
+    if (isJsonRpc) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            jsonrpc: '2.0',
+            id: message?.id ?? null,
+            error: {
+                code: -32000,
+                message: `Agent '${agentName}' is still starting. Try again in a moment.`
+            }
+        }));
+        return;
+    }
+    res.writeHead(503, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+        error: 'agent_not_ready',
+        detail: `Agent '${agentName}' is still starting.`
+    }));
+}
+
 /**
  * Handle HTTP requests to agent MCP endpoints
  */
@@ -914,32 +935,46 @@ async function handleAgentMcpRequest(req, res, route, agentName, {
         // Readiness cache (fails closed): a pooled key that answered within the
         // last 10 s skips the probe; every pooled POST still runs beforeDial,
         // and any pooled transport or session error clears the cache.
-        const poolKey = resolveUpstreamPoolKey({ pool, routePlan, route, beforeDial });
-        const probeReadiness = () => waitForReady(route, {
-            timeoutMs: 5000,
-            intervalMs: 125,
-            probeTimeoutMs: 250,
-            beforeProbe: beforeDial,
-        });
-        const isReady = Boolean(poolKey && pool.isReady(poolKey)) || await probeReadiness();
-        if (!isReady) {
+        // Only the committed lease manifest's explicit readiness.protocol counts;
+        // derived protocols (start-only agents) and a missing manifest keep the
+        // MCP probe. 'none' means the agent serves no MCP endpoint, so answer
+        // now (authN/authZ are done) once the lease commit succeeds, without a
+        // session, pool entry or dial. A beforeDial that is not a function
+        // cannot commit, so it fails closed onto the existing path.
+        const leaseManifest = routePlan?.lease?.snapshot?.manifests?.[routePlan?.routeKey];
+        const declaredProtocol = leaseManifest ? readExplicitReadinessProtocol(leaseManifest) : '';
+        if (declaredProtocol === 'none' && typeof beforeDial === 'function') {
+            if (beforeDial() !== true) {
+                sendAgentNotReady(res, { isJsonRpc, message, agentName });
+                return;
+            }
+            const detail = `Agent '${agentName}' does not provide an MCP endpoint.`;
             if (isJsonRpc) {
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({
                     jsonrpc: '2.0',
                     id: message?.id ?? null,
-                    error: {
-                        code: -32000,
-                        message: `Agent '${agentName}' is still starting. Try again in a moment.`
-                    }
+                    error: { code: -32601, message: detail }
                 }));
                 return;
             }
-            res.writeHead(503, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({
-                error: 'agent_not_ready',
-                detail: `Agent '${agentName}' is still starting.`
-            }));
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'agent_mcp_unavailable', detail }));
+            return;
+        }
+        const poolKey = resolveUpstreamPoolKey({ pool, routePlan, route, beforeDial });
+        // 'tcp' is an explicit statement that the port is the readiness signal;
+        // the request is still forwarded upstream afterwards.
+        const probeReadiness = () => waitForReady(route, {
+            timeoutMs: 5000,
+            intervalMs: 125,
+            probeTimeoutMs: 250,
+            beforeProbe: beforeDial,
+            ...(declaredProtocol === 'tcp' ? { protocol: 'tcp' } : {}),
+        });
+        const isReady = Boolean(poolKey && pool.isReady(poolKey)) || await probeReadiness();
+        if (!isReady) {
+            sendAgentNotReady(res, { isJsonRpc, message, agentName });
             return;
         }
 
