@@ -162,7 +162,7 @@ export function validateRouterPrincipal(json, principal) {
  * Runner contract:
  * - ctx.request(actor,{method,path,body,headers}) -> {status,headers,json,text}.
  * - ctx.check(id,asyncFn) records assertion failures and continues.
- * - ctx.recordGap(id,reason), ctx.principals, ctx.report are mutable run context.
+ * - ctx.recordGap(id,reason,evidence) with typed scalar evidence; ctx.principals, ctx.report are mutable run context.
  * - HTTP request targets must stay raw and redirects must never be followed.
  * - 'user' expands to BOTH verified same-role actors userA and userB.
  * This module does not construct/print credentials, or write any response body.
@@ -175,8 +175,9 @@ export async function runRouterProbes(ctx, { probes: selectedProbes = routerProb
   const deny = concrete.filter(({ probe }) => probe.expect === 'deny');
   ctx.report.routerCoverage ||= [];
 
-  const record = (probe, actor, status) => ctx.report.routerCoverage.push({
+  const record = (probe, actor, status, httpStatus) => ctx.report.routerCoverage.push({
     inventoryId: probe.inventoryId, probeId: probe.id, actor, status,
+    ...(Number.isInteger(httpStatus) ? { httpStatus } : {}),
     ...(probe.positiveControl ? { positiveControl: probe.positiveControl } : {}),
   });
   const request = (probe, actor) => ctx.request(actor, {
@@ -200,7 +201,7 @@ export async function runRouterProbes(ctx, { probes: selectedProbes = routerProb
       success.set(probe.id, actors);
       passed = true;
     });
-    record(probe, actor, passed ? 'AUTHORIZED_CONTROL_PASSED' : 'AUTHORIZED_CONTROL_FAILED');
+    record(probe, actor, passed ? 'AUTHORIZED_CONTROL_PASSED' : 'AUTHORIZED_CONTROL_FAILED', response?.status);
     const marketplaceRead = probe.id === 'marketplace-repos.allow' || probe.id === 'marketplace-agents.allow';
     if (passed && marketplaceRead) {
       await ctx.check(`router:marketplace-sensitive-path-metadata:${actor}`, async () => {
@@ -224,13 +225,13 @@ export async function runRouterProbes(ctx, { probes: selectedProbes = routerProb
       }
     }
     if (passed && probe.id === 'agent-card.allow' && response.json.errors.length) {
-      ctx.recordGap(`router:${probe.id}:${actor}:fanout`, 'Aggregate card returned per-agent errors; this response is not full agent-card coverage.');
+      ctx.recordGap(`router:${probe.id}:${actor}:fanout`, 'Aggregate card returned per-agent errors; this response is not full agent-card coverage.', { kind: 'fanout-errors', probeId: probe.id, actor });
     }
   }
 
   for (const { probe, actor } of deny) {
     if (probe.positiveControl && !success.get(probe.positiveControl)?.size) {
-      ctx.recordGap(`router:${probe.id}:${actor}`, `Authorized control ${probe.positiveControl} failed; denied request cannot prove endpoint authorization.`);
+      ctx.recordGap(`router:${probe.id}:${actor}`, `Authorized control ${probe.positiveControl} failed; denied request cannot prove endpoint authorization.`, { kind: 'positive-unavailable', probeId: probe.id, actor });
       record(probe, actor, 'CONTROL_UNAVAILABLE');
       continue;
     }
@@ -247,8 +248,8 @@ export async function runRouterProbes(ctx, { probes: selectedProbes = routerProb
     }
     if (!received) continue;
     if (probe.boundaryRejectionStatuses?.includes(response.status)) {
-      ctx.recordGap(`router:${probe.id}:${actor}`, `Raw path rejected with HTTP ${response.status}; this is normalization boundary evidence, not authorization proof against the resource.`);
-      record(probe, actor, 'BOUNDARY_REJECTED_ONLY');
+      ctx.recordGap(`router:${probe.id}:${actor}`, `Raw path rejected with HTTP ${response.status}; this is normalization boundary evidence, not authorization proof against the resource.`, { kind: 'boundary-rejected', probeId: probe.id, actor, httpStatus: response.status });
+      record(probe, actor, 'BOUNDARY_REJECTED_ONLY', response.status);
       continue;
     }
     let passed = false;
@@ -261,7 +262,7 @@ export async function runRouterProbes(ctx, { probes: selectedProbes = routerProb
       for (const [key, value] of Object.entries(probe.denyJsonEquals ?? {})) assert.equal(response.json[key], value, `Denied response field ${key} differs from authorization contract`);
       passed = true;
     });
-    record(probe, actor, passed ? (probe.positiveControl ? 'AUTHORIZATION_DENIAL_PASSED' : 'NEGATIVE_ONLY_PASSED') : 'AUTHORIZATION_DENIAL_FAILED');
-    if (!probe.positiveControl && probe.gap) ctx.recordGap(`router:${probe.id}:${actor}:positive-control`, probe.gap);
+    record(probe, actor, passed ? (probe.positiveControl ? 'AUTHORIZATION_DENIAL_PASSED' : 'NEGATIVE_ONLY_PASSED') : 'AUTHORIZATION_DENIAL_FAILED', response.status);
+    if (!probe.positiveControl && probe.gap) ctx.recordGap(`router:${probe.id}:${actor}:positive-control`, probe.gap, { kind: 'negative-only-protocol', probeId: probe.id, actor });
   }
 }

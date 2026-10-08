@@ -246,27 +246,35 @@ export function createAgentSessions(ctx) {
 export async function discoverAgentMcp(ctx, mcp, catalog = agentCatalog) {
     ctx.report.discovery ||= [];
     for (const agent of catalog) {
-        if (!agent.enabled) { ctx.recordGap(`agent.${agent.agent}.disabled`, 'Manifest and tools inventoried; runtime disabled/on-demand. No functional positive control and agent was not enabled.'); continue; }
+        if (!agent.enabled) { ctx.recordGap(`agent.${agent.agent}.disabled`, 'Manifest and tools inventoried; runtime disabled/on-demand. No functional positive control and agent was not enabled.', { kind: 'agent-disabled', repo: agent.repo, agent: agent.agent }); continue; }
         for (const definition of agentDiscoveryMethods) {
             const id = `agent.${agent.agent}.discovery.${definition.method.replaceAll('/', '.')}`;
             let baseline;
             try {
                 baseline = await mcp.rpc('admin', agent.agent, definition.method);
                 if (baseline.response.json?.error?.code === -32601) {
-                    ctx.recordGap(id, 'Runtime explicitly does not support this MCP discovery method. No authorization or empty-list claim is made.');
+                    // Typed evidence: an initialization -32601 (stage 'initialize') can never
+                    // satisfy a reviewed discovery-method exclusion.
+                    ctx.recordGap(id, 'Runtime explicitly does not support this MCP discovery method. No authorization or empty-list claim is made.', {
+                        kind: 'rpc-method-unsupported', actor: 'admin', endpoint: `/${agent.agent}/mcp`, requestedMethod: definition.method,
+                        stage: baseline.stage, initialized: baseline.stage !== 'initialize', httpStatus: baseline.response.status, rpcCode: -32601,
+                    });
                     continue;
                 }
                 assert.ok(baseline.success);
                 requireNamedList(baseline.value, definition.field);
             } catch {
-                ctx.recordGap(id, 'Administrator discovery control unavailable or returned an unexpected response shape; inspect the private response artifact. No denial is counted.');
+                ctx.recordGap(id, 'Administrator discovery control unavailable or returned an unexpected response shape; inspect the private response artifact. No denial is counted.', {
+                    kind: 'positive-unavailable', actor: 'admin', endpoint: `/${agent.agent}/mcp`, requestedMethod: definition.method,
+                    stage: baseline?.stage, httpStatus: baseline?.response?.status, rpcCode: baseline?.response?.json?.error?.code,
+                });
                 continue;
             }
             const names = baseline.value[definition.field].map((item) => item.name).sort();
             const sourceNames = definition.field === 'tools' ? agent.tools : [];
             ctx.report.discovery.push({ agent: agent.agent, actor: 'admin', method: definition.method, stage: baseline.stage,
                 [definition.field]: names, sourceOnly: sourceNames.filter((n) => !names.includes(n)), runtimeOnly: names.filter((n) => !sourceNames.includes(n)) });
-            if (baseline.value.nextCursor) ctx.recordGap(`${id}.pagination`, 'Discovery returned a continuation cursor; only the bounded first page is inventoried.');
+            if (baseline.value.nextCursor) ctx.recordGap(`${id}.pagination`, 'Discovery returned a continuation cursor; only the bounded first page is inventoried.', { kind: 'pagination', actor: 'admin', requestedMethod: definition.method });
             await ctx.check(`${id}.positive`, async () => requireNamedList(baseline.value, definition.field));
             for (const actor of actors.filter((a) => a !== 'admin')) {
                 await ctx.check(`${id}.${actor}`, async () => {
@@ -277,15 +285,15 @@ export async function discoverAgentMcp(ctx, mcp, catalog = agentCatalog) {
                     if (actor === 'anonymous' || (actor === 'selfRegistered' && agent.agent === 'explorer')) assertAgentMcpDenied(result);
                     else if (!result.success) {
                         if (result.response.json?.error?.code === -32601) {
-                            ctx.recordGap(`${id}.${actor}.unsupported`, 'This principal received unsupported-method response despite a working administrator control. This is not an authorization denial.');
+                            ctx.recordGap(`${id}.${actor}.unsupported`, 'This principal received unsupported-method response despite a working administrator control. This is not an authorization denial.', { kind: 'actor-unsupported', actor, requestedMethod: definition.method, stage: result.stage, httpStatus: result.response.status, rpcCode: -32601 });
                             throw new Error('Unknown discovery authorization outcome: unsupported method for this principal');
                         }
                         assertAgentMcpDenied(result); // Explicit policy may hide discovery from authenticated roles.
                     } else {
                         requireNamedList(result.value, definition.field);
-                        if (result.value.nextCursor) ctx.recordGap(`${id}.${actor}.pagination`, 'Only the bounded first discovery page was read.');
+                        if (result.value.nextCursor) ctx.recordGap(`${id}.${actor}.pagination`, 'Only the bounded first discovery page was read.', { kind: 'pagination', actor, requestedMethod: definition.method });
                         // Listing metadata does not establish execution or resource-read permission.
-                        if (actor === 'selfRegistered' && agent.agent !== 'userPersistoAgent' && visible.length) ctx.recordGap(`${id}.selfRegistered.scope`, 'Workspace discovery metadata is visible to selfRegistered; tool calls and resource reads require separate authorization controls.');
+                        if (actor === 'selfRegistered' && agent.agent !== 'userPersistoAgent' && visible.length) ctx.recordGap(`${id}.selfRegistered.scope`, 'Workspace discovery metadata is visible to selfRegistered; tool calls and resource reads require separate authorization controls.', { kind: 'selfregistered-visible-tools', actor, endpoint: `/${agent.agent}/mcp`, requestedMethod: definition.method, stage: result.stage, httpStatus: result.response.status, visibleTools: visible });
                     }
                 });
             }
@@ -297,7 +305,7 @@ export async function discoverAgentMcp(ctx, mcp, catalog = agentCatalog) {
             if (session.failure) throw new Error('No administrator MCP session');
             stream = await ctx.request('admin', { path: `/${agent.agent}/mcp`, headers: { ...session.headers, accept: 'text/event-stream' }, stream: true });
         } catch {
-            ctx.recordGap(`agent.${agent.agent}.sse`, 'Administrator SSE preparation unavailable; no negative-only claim.');
+            ctx.recordGap(`agent.${agent.agent}.sse`, 'Administrator SSE preparation unavailable; no negative-only claim.', { kind: 'positive-unavailable', actor: 'admin' });
             continue;
         }
         if (stream.status === 200 && String(stream.headers['content-type']).includes('text/event-stream')) {
@@ -306,7 +314,7 @@ export async function discoverAgentMcp(ctx, mcp, catalog = agentCatalog) {
                 const response = await ctx.request(actor, { path: `/${agent.agent}/mcp`, headers: { 'mcp-session-id': session.headers['mcp-session-id'], 'mcp-protocol-version': session.headers['mcp-protocol-version'], accept: 'text/event-stream' }, stream: true });
                 assertDenied(response);
             });
-        } else ctx.recordGap(`agent.${agent.agent}.sse`, `Valid administrator session did not produce an SSE stream (HTTP ${stream.status}); no negative-only claim.`);
+        } else ctx.recordGap(`agent.${agent.agent}.sse`, `Valid administrator session did not produce an SSE stream (HTTP ${stream.status}); no negative-only claim.`, { kind: 'positive-unavailable', actor: 'admin', httpStatus: stream.status });
     }
 }
 
@@ -318,11 +326,11 @@ async function readTools(ctx, mcp) {
             positive = await mcp.rpc('admin', probe.agent, 'tools/call', { name: probe.tool, arguments: probe.args || {} });
             assertAgentReadPositive(probe, positive, ctx.principals.admin);
         } catch {
-            ctx.recordGap(`agent.tool.${probe.tool}`, 'Administrator read control unavailable or returned an unexpected response shape; inspect the private response artifact. No denial is counted.');
+            ctx.recordGap(`agent.tool.${probe.tool}`, 'Administrator read control unavailable or returned an unexpected response shape; inspect the private response artifact. No denial is counted.', { kind: 'positive-unavailable', actor: 'admin', requestedMethod: 'tools/call', stage: positive?.stage, httpStatus: positive?.response?.status });
             continue;
         }
         await ctx.check(`agent.tool.${probe.tool}.admin`, async () => assertAgentReadPositive(probe, positive, ctx.principals.admin));
-        if (probe.tool === 'workspace_monitor_snapshot_get' && !positive.value.available) ctx.recordGap('agent.tool.workspace_monitor_snapshot_get.data', 'Snapshot status works but no actual snapshot data is available; data-disclosure coverage remains incomplete.');
+        if (probe.tool === 'workspace_monitor_snapshot_get' && !positive.value.available) ctx.recordGap('agent.tool.workspace_monitor_snapshot_get.data', 'Snapshot status works but no actual snapshot data is available; data-disclosure coverage remains incomplete.', { kind: 'data-unavailable', actor: 'admin' });
         for (const actor of ['anonymous', 'selfRegistered', 'userA', 'userB']) await ctx.check(`agent.tool.${probe.tool}.${actor}`, async () => {
             const result = await mcp.rpc(actor, probe.agent, 'tools/call', { name: probe.tool, arguments: probe.args || {} });
             ctx.report.agentReadResults.push({ agent: probe.agent, tool: probe.tool, actor, stage: result.stage, status: result.response.status });
@@ -345,7 +353,7 @@ async function usernamePrivilegeProbe(ctx, mcp) {
         original = profile.json.profile.user.username;
         assert.equal(typeof original, 'string', 'Profile must contain persisted username before mutation');
     });
-    if (typeof original !== 'string') { ctx.recordGap('agent.username-admin', 'Could not capture existing disposable username; profile was not changed.'); return; }
+    if (typeof original !== 'string') { ctx.recordGap('agent.username-admin', 'Could not capture existing disposable username; profile was not changed.', { kind: 'positive-unavailable', actor: 'userA' }); return; }
     const restore = async () => {
         if (!changed) return;
         await ctx.guard();
@@ -370,7 +378,8 @@ async function usernamePrivilegeProbe(ctx, mcp) {
             const reserved = update.json?.error === 'username_taken' || update.json?.code === 'username_taken';
             ctx.recordGap(`agent.username-admin.${reserved ? 'reserved' : 'unavailable'}`, reserved
                 ? 'The disposable profile received the explicit username_taken rejection. The username shortcut was not exercised; this is not a confirmed exploit.'
-                : `Username update did not yield a working control (HTTP ${update.status}); reservation and privilege escalation remain unverified.`);
+                : `Username update did not yield a working control (HTTP ${update.status}); reservation and privilege escalation remain unverified.`,
+                { kind: reserved ? 'username-reserved' : 'positive-unavailable', actor: 'userA', httpStatus: update.status });
             return;
         }
         requireObject(update.json);
@@ -409,7 +418,7 @@ export async function runAgentProbes(ctx) {
     for (const probe of agentProbes) {
         let positive;
         try { positive = await ctx.request('admin', probe); assertAgentHttpPositive(probe, positive, ctx.principals.admin); }
-        catch { ctx.recordGap(probe.id, 'Administrator HTTP control unavailable or returned an unexpected response shape; negative responses are not counted.'); continue; }
+        catch { ctx.recordGap(probe.id, 'Administrator HTTP control unavailable or returned an unexpected response shape; negative responses are not counted.', { kind: 'positive-unavailable', actor: 'admin', httpStatus: positive?.status }); continue; }
         await ctx.check(`${probe.id}.admin`, async () => assertAgentHttpPositive(probe, positive, ctx.principals.admin));
         for (const actor of ['anonymous', 'selfRegistered', 'userA', 'userB']) await ctx.check(`${probe.id}.${actor}`, async () => {
             const response = await ctx.request(actor, probe);
@@ -425,5 +434,5 @@ export async function runAgentProbes(ctx) {
         ['agent.image-routes', 'OnlyOffice DocumentServer, LiveKit, Umami and disabled GPTResearcher expose image-owned dynamic route families. Wildcards remain explicit unresolved endpoint-inventory gaps.'],
         ['agent.inference', 'No inference, external provider/Git/OAuth, download acquisition, or costly compute invocation permitted by local-only target.'],
         ['agent.aliases', 'Canonical MCP and selected additional-server paths exercised. Live route keys reconciled separately; encoded/duplicate-slash/trailing-slash variants and complete additional-server path cross-products remain unexercised.'],
-    ]) ctx.recordGap(...gap);
+    ]) ctx.recordGap(...gap, { kind: 'declared-limitation' });
 }

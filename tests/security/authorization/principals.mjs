@@ -46,7 +46,9 @@ async function eventually(read, predicate, label) {
 export async function setupPrincipals(ctx, config) {
     const { chromium } = await import(pathToFileURL(config.playwrightModule).href);
     const pin = await ctx.guard();
-    const agentName = 'ploinky_AchillesIDE_userPersistoAgent_workspace_c52ddf65';
+    // The exact container name comes from the pinned capture (agents.json record), not a hardcoded fixture.
+    const agentName = pin.userPersistoContainer;
+    assert.match(String(agentName || ''), /^ploinky_AchillesIDE_userPersistoAgent_[A-Za-z0-9_.-]+$/, 'Captured UserPersisto container name is required');
     const inner = JSON.parse(command('podman', ['exec', pin.boxId, 'podman', 'inspect', agentName]))[0];
     assert.equal(inner.Name.replace(/^\//, ''), agentName);
     assert.equal(inner.State.Running, true);

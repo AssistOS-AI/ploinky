@@ -64,7 +64,7 @@ async function runWorkspaceSelectorProbes(ctx, fixture) {
     controls.add(actor);
   });
   if (!controls.has('admin') || !controls.has('userA') || !controls.has('userB')) {
-    ctx.recordGap('router:workspace-file-selector-bypass', 'Existing fixture read positive controls failed; no selector-bypass denial is credited.');
+    ctx.recordGap('router:workspace-file-selector-bypass', 'Existing fixture read positive controls failed; no selector-bypass denial is credited.', { kind: 'positive-unavailable' });
     return;
   }
   const selectors = ['', '?agent=authorization-suite-nonexistent', '?agent=userPersistoAgent'];
@@ -97,7 +97,7 @@ async function runWorkspaceSelectorProbes(ctx, fixture) {
       positive = true;
     });
     if (!positive) {
-      ctx.recordGap(`router:workspace-upload-selector-deny:${actor}:${index}`, 'Authorized upload to existing disposable file failed.');
+      ctx.recordGap(`router:workspace-upload-selector-deny:${actor}:${index}`, 'Authorized upload to existing disposable file failed.', { kind: 'positive-unavailable' });
       continue;
     }
     await ctx.check(`router:workspace-upload-selector-deny:${actor}:${index}`, async () => {
@@ -140,7 +140,7 @@ async function runTerminalProbes(ctx, fixture) {
   }
   await ctx.check('router:terminal-discovery-positive:admin', async () => {
     const response = await ctx.request('admin', { method: 'POST', path: '/webtty/target-discoveries', body: { dir: fixture.directory }, timeout: 30000 });
-    if (response.status === 503) ctx.recordGap('router:terminal-backend', 'Administrator discovery returned 503; unavailable terminal functionality cannot count as authorization denial.');
+    if (response.status === 503) ctx.recordGap('router:terminal-backend', 'Administrator discovery returned 503; unavailable terminal functionality cannot count as authorization denial.', { kind: 'positive-unavailable' });
     assert.equal(response.status, 201, 'Administrator must discover real terminal targets in the disposable directory');
     assert.equal(response.json?.ok, true);
     const discovery = response.json.discovery;
@@ -160,7 +160,7 @@ async function runTerminalProbes(ctx, fixture) {
     discoveryReady = true;
   });
   if (!discoveryReady) {
-    ctx.recordGap('router:terminal-session-probes', 'Positive target discovery did not complete; terminal stream/input/create denial coverage is unavailable.');
+    ctx.recordGap('router:terminal-session-probes', 'Positive target discovery did not complete; terminal stream/input/create denial coverage is unavailable.', { kind: 'positive-unavailable' });
     return;
   }
   for (const actor of deniedActors) await ctx.check(`router:terminal-discovery-deny:${actor}`, async () => {
@@ -177,7 +177,7 @@ async function runTerminalProbes(ctx, fixture) {
   let terminalReady = false;
   await ctx.check('router:terminal-create-positive:admin', async () => {
     const response = await ctx.request('admin', { method: 'POST', path: '/webtty/sessions', body: { launch, cols: 80, rows: 24 }, timeout: 30000 });
-    if (response.status === 503) ctx.recordGap('router:terminal-backend', 'Administrator session creation returned 503; native runtime is unavailable.');
+    if (response.status === 503) ctx.recordGap('router:terminal-backend', 'Administrator session creation returned 503; native runtime is unavailable.', { kind: 'positive-unavailable' });
     assert.equal(response.status, 201, 'Administrator must create the exact box terminal target');
     assert.equal(response.json?.ok, true);
     assert.equal(response.json?.session?.target?.kind, 'box');
@@ -193,7 +193,7 @@ async function runTerminalProbes(ctx, fixture) {
     terminalReady = true;
   });
   if (!terminalReady) {
-    ctx.recordGap('router:terminal-existing-session-probes', 'Positive session creation failed; no existing terminal is available to prove stream/input/resize/delete denials.');
+    ctx.recordGap('router:terminal-existing-session-probes', 'Positive session creation failed; no existing terminal is available to prove stream/input/resize/delete denials.', { kind: 'positive-unavailable' });
     return;
   }
   const streamPath = `/webtty/sessions/${terminalId}/stream`;
@@ -229,7 +229,7 @@ async function runTerminalProbes(ctx, fixture) {
       assertDenied(response);
     });
     if (!shellReady) {
-      ctx.recordGap(`router:terminal-input-deny:${actor}`, 'Shell marker positive failed; no command functionality control is available.');
+      ctx.recordGap(`router:terminal-input-deny:${actor}`, 'Shell marker positive failed; no command functionality control is available.', { kind: 'positive-unavailable' });
     } else await ctx.check(`router:terminal-input-deny:${actor}`, async () => {
       await livePositiveStream();
       const response = await ctx.request(actor, { method: 'POST', path: `/webtty/sessions/${terminalId}/input`, body: { data: markerCommand(ctx.prefix, `${ctx.prefix}-unauthorized`) } });
@@ -245,7 +245,7 @@ async function runTerminalProbes(ctx, fixture) {
       const response = await ctx.request(actor, { method: 'POST', path: `/webtty/sessions/${terminalId}/resize`, body: { cols: 80, rows: 24 } });
       assertDenied(response);
     });
-    else ctx.recordGap(`router:terminal-resize-deny:${actor}`, 'Administrator resize positive failed.');
+    else ctx.recordGap(`router:terminal-resize-deny:${actor}`, 'Administrator resize positive failed.', { kind: 'positive-unavailable' });
     await ctx.check(`router:terminal-delete-deny:${actor}`, async () => {
       await livePositiveStream();
       const response = await ctx.request(actor, { method: 'DELETE', path: `/webtty/sessions/${terminalId}` });
@@ -297,7 +297,7 @@ async function runMcpSessionOwnership(ctx) {
     ready.add(actor);
   });
   if (ready.size !== 2) {
-    ctx.recordGap('router:mcp-session-horizontal-delete', 'Two initialized MCP sessions with successful supported ping controls are required.');
+    ctx.recordGap('router:mcp-session-horizontal-delete', 'Two initialized MCP sessions with successful supported ping controls are required.', { kind: 'positive-unavailable' });
     for (const [actor, session] of sessions) await ctx.check(`router:mcp-session-setup-cleanup:${actor}`, async () => {
       const response = await ctx.request(actor, { method: 'DELETE', path: '/mcp', headers: { 'mcp-session-id': session } });
       assert.equal(response.status, 204);
@@ -327,7 +327,7 @@ async function runMcpSessionOwnership(ctx) {
     assertDenied(response);
     assertPing(after);
   });
-  else ctx.recordGap('router:mcp-session-horizontal-delete', 'Authorized own-session delete did not demonstrate the operation.');
+  else ctx.recordGap('router:mcp-session-horizontal-delete', 'Authorized own-session delete did not demonstrate the operation.', { kind: 'positive-unavailable' });
   // Complete cleanup now, before the later revocation probes invalidate users.
   for (const [actor, session] of sessions) if (!removed.has(actor)) await ctx.check(`router:mcp-session-cleanup:${actor}`, async () => {
     const response = await ctx.request(actor, { method: 'DELETE', path: '/mcp', headers: { 'mcp-session-id': session } });
@@ -341,5 +341,5 @@ export async function runStreamProbes(ctx) {
   await runTerminalProbes(ctx, fixture);
   await runWorkspaceSelectorProbes(ctx, fixture);
   await runMcpSessionOwnership(ctx);
-  ctx.recordGap('router:stream-revocation-continuation', 'Terminal SSE handshake and existing-session role checks were bounded at response headers; an already-open stream was not held across provider revocation.');
+  ctx.recordGap('router:stream-revocation-continuation', 'Terminal SSE handshake and existing-session role checks were bounded at response headers; an already-open stream was not held across provider revocation.', { kind: 'declared-limitation' });
 }
