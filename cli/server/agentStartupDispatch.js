@@ -92,6 +92,68 @@ function writeHardwareUnavailable(res, entry) {
     });
 }
 
+// The activation clock and its routing-mutation reader resolve workspace
+// paths. Load them only for a lease that carries an activation, so importing
+// this dispatcher never evaluates the workspace configuration. The Router's
+// route planner imports the same module instance and observes activations
+// early.
+let activationClock = null;
+
+async function loadActivationClock() {
+    try {
+        activationClock ??= await import('./edgeActivationClock.js');
+        return activationClock;
+    } catch (_) {
+        return null;
+    }
+}
+
+function carriesActivation(lease) {
+    return typeof lease?.activationId === 'string' && lease.activationId.length > 0;
+}
+
+async function readMutation(readMutationState) {
+    try {
+        return (await readMutationState()) === 'idle' ? 'idle' : 'busy';
+    } catch (_) {
+        return 'busy';
+    }
+}
+
+function readyWithoutActivation(routePlan) {
+    return buildAgentStartupProbeResponse({ state: 'ready', generation: routePlan.lease?.id });
+}
+
+async function writeReady(req, res, routePlan, requestKind, { commitPlan, readMutationState }) {
+    const clock = carriesActivation(routePlan.lease) ? await loadActivationClock() : null;
+    const activation = clock ? clock.observeEdgeActivation(routePlan.lease) : null;
+    if (!activation) {
+        writeAgentStartupResponse(res, readyWithoutActivation(routePlan), { method: req?.method });
+        return;
+    }
+    const mutation = await readMutation(readMutationState === undefined
+        ? clock.readRoutingMutationState
+        : readMutationState);
+    if (!commitPlan(routePlan)) {
+        writeGenerationChanged(req, res, requestKind);
+        return;
+    }
+    let response;
+    try {
+        response = buildAgentStartupProbeResponse({
+            state: 'ready',
+            generation: routePlan.lease.id,
+            activation: activation.activation,
+            activeForMs: activation.activeForMs,
+            mutation,
+        });
+    } catch (_) {
+        // Without valid activation fields a client runs its full forward check.
+        response = readyWithoutActivation(routePlan);
+    }
+    writeAgentStartupResponse(res, response, { method: req?.method });
+}
+
 /**
  * Handle the narrow same-route no-wait startup protocol.
  *
@@ -100,6 +162,12 @@ function writeHardwareUnavailable(res, entry) {
  * the only lifecycle observer and is deliberately called after authorization
  * and a successful first lease commit. This module performs the second commit
  * immediately before writing any lifecycle-derived response.
+ *
+ * A `ready` answer for a lease that carries an activation also reports the
+ * activation's opaque token and age and `readMutationState()` ('idle' or
+ * 'busy'; anything else, or a throw, is 'busy'; the default is the production
+ * readRoutingMutationState), behind a second commit so a reactivation between
+ * the reads answers `edge_generation_changed`.
  */
 export async function dispatchAgentStartupRequest({
     req,
@@ -111,6 +179,7 @@ export async function dispatchAgentStartupRequest({
     inspectPublication,
     resolveStartupState,
     commitPlan = (plan) => Boolean(plan?.ok && plan?.lease?.commit?.()),
+    readMutationState,
     onObservationError = () => {},
 } = {}) {
     if (!routePlan?.ok || !AGENT_ROOT_KINDS.has(routePlan.kind)) return false;
@@ -152,10 +221,7 @@ export async function dispatchAgentStartupRequest({
     }
 
     if (!pending) {
-        writeAgentStartupResponse(res, buildAgentStartupProbeResponse({
-            state: 'ready',
-            generation: routePlan.lease?.id,
-        }), { method: req?.method });
+        await writeReady(req, res, routePlan, requestKind, { commitPlan, readMutationState });
         return true;
     }
 
@@ -209,6 +275,7 @@ export async function dispatchAgentStartupAfterRouterSurfaces({
     inspectPublication,
     resolveStartupState,
     commitPlan,
+    readMutationState,
     onObservationError,
 } = {}) {
     if (!routePlan?.ok || !AGENT_ROOT_KINDS.has(routePlan.kind)) return false;
@@ -227,6 +294,7 @@ export async function dispatchAgentStartupAfterRouterSurfaces({
         inspectPublication,
         resolveStartupState,
         commitPlan,
+        readMutationState,
         onObservationError,
     });
     if (handled) return true;

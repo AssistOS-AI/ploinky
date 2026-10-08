@@ -6,6 +6,7 @@ import {
     captureEdgeRoutingLease,
     captureEdgeRoutingObservationLease,
 } from '../sandbox/edgeGeneration.js';
+import { observeEdgeActivation } from './edgeActivationClock.js';
 import { selectedRouterHostPort } from '../sandbox/routerPort.js';
 import { isTrustedPublicRouterHost } from '../utils/publicRouterHosts.mjs';
 import { deriveAgentPrincipalId } from '../utils/security/agentIdentity.js';
@@ -719,6 +720,12 @@ export function resolveEdgeRoutePlan({
             : captureEdgeRoutingLease();
     } catch (error) {
         return deny(503, error?.code || 'EDGE_GENERATION_INACTIVE');
+    }
+    if (!authorityObservationGeneration) {
+        // Start the activation clock on the first request of any kind that
+        // captures the active generation, not on the first startup probe.
+        // Memory only; observeEdgeActivation never throws.
+        try { observeEdgeActivation(lease); } catch (_) {}
     }
     const snapshot = lease.snapshot;
     const host = normalizeExactHost(req?.headers?.host);

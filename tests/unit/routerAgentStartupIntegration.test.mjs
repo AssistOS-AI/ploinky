@@ -179,6 +179,7 @@ function parseBody(res) {
 async function runStartup(req, {
     result = { state: 'starting' },
     commitPlan,
+    readMutationState,
     canPublishHttp = true,
 } = {}) {
     const routePlan = resolvePlan(req);
@@ -211,6 +212,7 @@ async function runStartup(req, {
             return result;
         },
         ...(commitPlan ? { commitPlan } : {}),
+        ...(readMutationState ? { readMutationState } : {}),
     });
     return { authCalls, handled, lifecycleReads, res, routePlan };
 }
@@ -288,20 +290,27 @@ test('real Router plans preserve host/surface/auth precedence through the produc
             code: 'edge_generation_changed',
         });
 
+        // The real lease carries an activation: the ready body reports its
+        // opaque token, its age and the (injected) routing mutation state.
         const active = await runStartup(requestFor({
             hostKind,
             routeKey: 'beta',
             probe: true,
-        }));
+        }), { readMutationState: () => 'idle' });
         assert.equal(active.routePlan.kind, 'agent-root');
         assert.equal(active.routePlan.routeKey, 'beta');
+        assert.equal(typeof active.routePlan.lease.activationId, 'string');
         assert.equal(active.authCalls, 1);
         assert.equal(active.lifecycleReads, 0);
         assert.equal(active.res.statusCode, 200);
-        assert.deepEqual(parseBody(active.res), {
-            state: 'ready',
-            generation,
-        });
+        const ready = parseBody(active.res);
+        assert.deepEqual(Object.keys(ready).sort(), ['activation', 'activeForMs', 'generation', 'mutation', 'state']);
+        assert.equal(ready.state, 'ready');
+        assert.equal(ready.generation, generation);
+        assert.match(ready.activation, /^[A-Za-z0-9_-]{12}\.[1-9][0-9]{0,15}$/);
+        assert.ok(Number.isSafeInteger(ready.activeForMs) && ready.activeForMs >= 0);
+        assert.equal(ready.mutation, 'idle');
+        assert.equal(active.res.body.includes(active.routePlan.lease.activationId), false);
     }
 
     for (const req of [

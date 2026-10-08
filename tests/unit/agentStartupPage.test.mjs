@@ -250,6 +250,54 @@ test('probe response construction rejects unknown codes and non-edge generation 
     }), /unsupported agent startup browser response/);
 });
 
+test('R-A12: ready probes carry validated activation fields or none, and other states ignore them', () => {
+    const token = 'AbC_dEf-1234.7';
+    const ready = buildAgentStartupProbeResponse({
+        state: 'ready', generation: GENERATION_ONE, activation: token, activeForMs: 2500, mutation: 'idle',
+    });
+    assert.equal(ready.statusCode, 200);
+    assert.equal(ready.body, JSON.stringify({
+        state: 'ready', generation: GENERATION_ONE, activation: token, activeForMs: 2500, mutation: 'idle',
+    }));
+    assert.equal(ready.headers['Content-Length'], String(Buffer.byteLength(ready.body)));
+    for (const [activeForMs, mutation] of [[0, 'busy'], [Number.MAX_SAFE_INTEGER, 'idle']]) {
+        assert.deepEqual(JSON.parse(buildAgentStartupProbeResponse({
+            state: 'ready', generation: GENERATION_ONE, activation: 'x'.repeat(12) + '.9007199254740991', activeForMs, mutation,
+        }).body).activeForMs, activeForMs);
+    }
+    // Without an activation the body is byte-identical to today's, whatever else is passed.
+    const legacy = JSON.stringify({ state: 'ready', generation: GENERATION_ONE });
+    assert.equal(buildAgentStartupProbeResponse({ state: 'ready', generation: GENERATION_ONE }).body, legacy);
+    assert.equal(buildAgentStartupProbeResponse({
+        state: 'ready', generation: GENERATION_ONE, activation: '', activeForMs: 5, mutation: 'idle',
+    }).body, legacy);
+
+    const valid = { state: 'ready', generation: GENERATION_ONE, activation: token, activeForMs: 10, mutation: 'busy' };
+    for (const activation of [null, 7, 'short.1', `${'a'.repeat(13)}.1`, 'AbC_dEf-1234.0', 'AbC_dEf-1234.01',
+        'AbC_dEf-1234.12345678901234567', 'AbC+dEf/1234.1', 'AbC_dEf-1234', ' AbC_dEf-1234.1', 'AbC_dEf-1234.1\n']) {
+        assert.throws(() => buildAgentStartupProbeResponse({ ...valid, activation }), TypeError, String(activation));
+    }
+    for (const activeForMs of [undefined, null, -1, 1.5, '3000', Number.NaN, Number.MAX_SAFE_INTEGER + 1, Infinity]) {
+        assert.throws(() => buildAgentStartupProbeResponse({ ...valid, activeForMs }), TypeError, String(activeForMs));
+    }
+    for (const mutation of [undefined, null, '', 'IDLE', 'unknown', true]) {
+        assert.throws(() => buildAgentStartupProbeResponse({ ...valid, mutation }), TypeError, String(mutation));
+    }
+    assert.throws(() => buildAgentStartupProbeResponse({ ...valid, generation: 'not-a-generation' }), /opaque edge generation/);
+
+    // Other states ignore the new arguments, valid or not.
+    const extras = { activation: 'bogus', activeForMs: -1, mutation: 'maybe' };
+    assert.deepEqual(JSON.parse(buildAgentStartupProbeResponse({ state: 'starting', generation: GENERATION_TWO, ...extras }).body), {
+        state: 'starting', generation: GENERATION_TWO, retryAfterMs: AGENT_STARTUP_POLL_INTERVAL_MS,
+    });
+    assert.deepEqual(JSON.parse(buildAgentStartupProbeResponse({ state: 'retry', code: 'edge_generation_changed', ...extras }).body), {
+        state: 'retry', code: 'edge_generation_changed',
+    });
+    assert.deepEqual(Object.keys(JSON.parse(buildAgentStartupProbeResponse({
+        state: 'failed', code: 'startup_failed', ...extras,
+    }).body)), ['state', 'code', 'message']);
+});
+
 test('document responses use a unique nonce-bound strict CSP and no external resources', () => {
     const first = buildAgentStartupDocumentResponse({ state: 'starting', routeLabel: 'Sample agent' });
     const second = buildAgentStartupDocumentResponse({ state: 'starting', routeLabel: 'Sample agent' });
