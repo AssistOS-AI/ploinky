@@ -27,21 +27,47 @@ test('Router source references reject stale metadata, wrong anchors, unknown blo
     const { source: originalSource, anchor: originalAnchor, ...originalContract } = baseline;
     assert.deepEqual(contract, originalContract, `${row.id} authority and coverage contract`);
   }
-  for (const id of ['hardware-limits-read.get', 'marketplace-install_repo.post']) {
-    const row = routerInventoryBaseline.find(candidate => candidate.id === id);
+  // The controls run for every row of every registered file family, so a family
+  // added to the reviewed registry cannot be left without them.
+  const registry = JSON.parse(fs.readFileSync(new URL('./router-reference-obligations_codex.json', import.meta.url)));
+  const covered = new Set();
+  for (const row of routerInventoryBaseline) {
     const [file, line] = row.source.split(':');
+    if (!Object.hasOwn(registry.files, file)) continue;
+    covered.add(file);
     const bytes = fs.readFileSync(new URL(`../../../${file}`, import.meta.url));
     const resolved = resolveRouterSourceReference(row, bytes);
-    assert.ok(resolved.sourceBlobSha256);
-    assert.throws(() => resolveRouterSourceReference({ ...row, source: `${file}:${Number(line) - 1}` }, bytes), /STALE_ROUTER_REFERENCE/);
-    assert.throws(() => resolveRouterSourceReference({ ...row, anchor: 'wrong_dispatch' }, bytes), /MISMATCHED_ROUTER_ANCHOR/);
-    assert.throws(() => resolveRouterSourceReference({ ...row, id: 'unknown.get' }, bytes), /UNMAPPED_ROUTER_REFERENCE/);
+    assert.ok(resolved.sourceBlobSha256, row.id);
+    assert.throws(() => resolveRouterSourceReference({ ...row, source: `${file}:${Number(line) - 1}` }, bytes), /STALE_ROUTER_REFERENCE/, row.id);
+    assert.throws(() => resolveRouterSourceReference({ ...row, anchor: 'wrong_dispatch' }, bytes), /MISMATCHED_ROUTER_ANCHOR/, row.id);
+    assert.throws(() => resolveRouterSourceReference({ ...row, id: 'unknown.get' }, bytes), /UNMAPPED_ROUTER_REFERENCE/, row.id);
     // Even an insertion preserving the reviewed dispatch statement requires a
     // new blob review. Do not search for the first convenient matching anchor.
-    assert.throws(() => resolveRouterSourceReference(row, Buffer.concat([bytes, Buffer.from('\n')])), /UNREVIEWED_ROUTER_SOURCE/);
-    const broken = Buffer.from(bytes.toString().replace(resolved.anchor, 'wrong_dispatch'));
-    assert.throws(() => resolveRouterSourceReference(row, broken), /UNREVIEWED_ROUTER_SOURCE/);
+    assert.throws(() => resolveRouterSourceReference(row, Buffer.concat([bytes, Buffer.from('\n')])), /UNREVIEWED_ROUTER_SOURCE/, row.id);
+    // Break the reviewed anchor; a row without an anchor breaks its reviewed
+    // statement instead, and a blank reviewed line is replaced as a whole. The
+    // mutation must change the bytes, or the control is vacuous.
+    const reference = registry.files[file].blobs[resolved.sourceBlobSha256][row.id];
+    const needle = resolved.anchor ?? reference.statement;
+    const sourceLines = bytes.toString().split('\n');
+    const reviewedLine = sourceLines[reference.line - 1];
+    assert.ok(!needle || reviewedLine.includes(needle), `${row.id} reviewed text is on its reviewed line`);
+    sourceLines[reference.line - 1] = needle ? reviewedLine.replace(needle, 'wrong_dispatch') : 'wrong_dispatch';
+    const broken = Buffer.from(sourceLines.join('\n'));
+    assert.notDeepEqual(broken, bytes, row.id);
+    assert.throws(() => resolveRouterSourceReference(row, broken), /UNREVIEWED_ROUTER_SOURCE/, row.id);
   }
+  assert.deepEqual([...covered].sort(), Object.keys(registry.files).sort(), 'every registered file family is exercised');
+  // Ratchet: reviewed entries whose statement is blank cannot prove that the
+  // dispatch line is the reviewed one. Two such entries predate the 2026-10-08
+  // additions (see router-reference-review-2026-10-08_claude.md); no new one may appear.
+  const blankStatements = Object.entries(registry.files).flatMap(([file, family]) => Object.entries(family.blobs)
+    .flatMap(([hash, rows]) => Object.entries(rows).filter(([, reference]) => !reference.statement.trim())
+      .map(([id]) => `${file} ${hash.slice(0, 8)} ${id}`)));
+  assert.deepEqual(blankStatements, [
+    'cli/server/RoutingServer.js 27fb848d internal-agent-control.*',
+    'cli/server/handlers/webtty.js 0c0d70d8 webtty-input.post',
+  ]);
 });
 
 test('Router inventory retains the complete union of both prior inventories and refuses lost candidate anchors', () => {
