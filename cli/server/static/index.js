@@ -469,13 +469,36 @@ function getMimeType(filePath) {
     return map[ext] || 'application/octet-stream';
 }
 
-function getCacheControl(filePath, { authenticated = false } = {}) {
+function isHtmlPath(filePath) {
+    const ext = path.extname(filePath).toLowerCase();
+    return ext === '.html' || ext === '.htm';
+}
+
+// A fetched template is a GET/HEAD whose Sec-Fetch-Dest is exactly `empty`
+// (fetch()/XHR). Absent, repeated (Node joins duplicates into one string with a
+// comma, or an array), `document`, `iframe` and anything else fail safe to the
+// navigation class.
+function isFetchedTemplateRequest(req) {
+    const method = String(req?.method || 'GET').toUpperCase();
+    if (method !== 'GET' && method !== 'HEAD') return false;
+    const dest = req?.headers?.['sec-fetch-dest'];
+    if (typeof dest !== 'string') return false;
+    return dest.trim().toLowerCase() === 'empty';
+}
+
+function getCacheControl(filePath, { authenticated = false, fetchedTemplate = false } = {}) {
     const ext = path.extname(filePath).toLowerCase();
     // HTML documents are application entry points behind session and capability
     // checks. A cached copy would let a browser reopen a shell the Router has
     // since denied (logout, demotion, block), so documents are never stored.
+    // The only exception is an authenticated agent-static template fetched by
+    // script (Sec-Fetch-Dest: empty): it is stored privately but must be
+    // revalidated, and revalidation only ever reaches this code after the
+    // session/capability gate has passed.
     if (ext === '.html' || ext === '.htm') {
-        return 'no-store';
+        return authenticated === true && fetchedTemplate === true
+            ? 'private, no-cache'
+            : 'no-store';
     }
     // Authenticated surfaces (agent static, workspace files) must never be kept
     // by a shared cache, so they are `private`; public assets stay `public`.
@@ -524,7 +547,24 @@ function responseGone(res) {
     return Boolean(res?.destroyed || res?.writableEnded);
 }
 
-async function sendOpenedFile(req, res, filePath, { authenticated = false, extraHeaders = {} } = {}) {
+// If-Modified-Since fallback for the template class only. Refuses a malformed
+// or future date, and any mtime inside the current second (a second-resolution
+// validator cannot distinguish two writes in that second).
+function templateNotModifiedSince(headerValue, mtimeMs, nowMs) {
+    if (typeof headerValue !== 'string') return false;
+    const since = Date.parse(headerValue);
+    if (!Number.isFinite(since) || since > nowMs) return false;
+    const mtimeSecond = Math.floor(mtimeMs / 1000);
+    if (mtimeSecond >= Math.floor(nowMs / 1000)) return false;
+    return mtimeSecond * 1000 <= since;
+}
+
+async function sendOpenedFile(req, res, filePath, {
+    authenticated = false,
+    extraHeaders = {},
+    templateAware = false,
+    fetchedTemplate = false,
+} = {}) {
     if (responseGone(res)) return true;
     let handle;
     try {
@@ -541,15 +581,44 @@ async function sendOpenedFile(req, res, filePath, { authenticated = false, extra
         if (responseGone(res)) return true;
         const size = Number(stat.size);
         const etag = `W/"${stat.size}-${stat.mtimeNs}-${stat.ino}"`;
-        const lastModified = new Date(Number(stat.mtimeNs / 1000000n)).toUTCString();
-        const cacheControl = getCacheControl(filePath, { authenticated });
+        const mtimeMs = Number(stat.mtimeNs / 1000000n);
+        const lastModified = new Date(mtimeMs).toUTCString();
+        const nowMs = Date.now();
+        // Agent-static HTML only: the response depends on Sec-Fetch-Dest.
+        const htmlVariant = templateAware === true && isHtmlPath(filePath);
+        const template = htmlVariant && authenticated === true && fetchedTemplate === true;
+        const cacheControl = getCacheControl(filePath, {
+            authenticated,
+            fetchedTemplate: template,
+        });
+        // A template mtime inside the current second is not advertised, so a
+        // client cannot pin a second-resolution validator to a moving file.
+        const advertiseLastModified = !template
+            || Math.floor(mtimeMs / 1000) < Math.floor(nowMs / 1000);
+        const validatorHeaders = {
+            ETag: etag,
+            ...(advertiseLastModified ? { 'Last-Modified': lastModified } : {}),
+            ...(htmlVariant ? { Vary: 'Sec-Fetch-Dest' } : {}),
+        };
         const method = String(req?.method || 'GET').toUpperCase();
-        if ((method === 'GET' || method === 'HEAD')
-            && ifNoneMatchMatches(req?.headers?.['if-none-match'], etag)) {
+        const conditionalAllowed = (method === 'GET' || method === 'HEAD')
+            // Agent-static navigations (and every other non-template HTML on
+            // this surface) ignore validators and always answer 200.
+            && (!htmlVariant || template);
+        let notModified = false;
+        if (conditionalAllowed) {
+            const ifNoneMatch = req?.headers?.['if-none-match'];
+            if (ifNoneMatch !== undefined) {
+                notModified = ifNoneMatchMatches(ifNoneMatch, etag);
+            } else if (template) {
+                notModified = templateNotModifiedSince(
+                    req?.headers?.['if-modified-since'], mtimeMs, nowMs);
+            }
+        }
+        if (notModified) {
             res.writeHead(304, {
                 'Cache-Control': cacheControl,
-                ETag: etag,
-                'Last-Modified': lastModified,
+                ...validatorHeaders,
             });
             res.end();
             return true;
@@ -558,8 +627,7 @@ async function sendOpenedFile(req, res, filePath, { authenticated = false, extra
             'Content-Type': getMimeType(filePath),
             'Cache-Control': cacheControl,
             'Content-Length': size,
-            ETag: etag,
-            'Last-Modified': lastModified,
+            ...validatorHeaders,
             ...extraHeaders,
         });
         if (size === 0) {
@@ -587,8 +655,13 @@ async function sendOpenedFile(req, res, filePath, { authenticated = false, extra
     }
 }
 
-async function sendFile(res, filePath, { req = null, authenticated = false } = {}) {
-    return sendOpenedFile(req, res, filePath, { authenticated });
+async function sendFile(res, filePath, {
+    req = null,
+    authenticated = false,
+    templateAware = false,
+    fetchedTemplate = false,
+} = {}) {
+    return sendOpenedFile(req, res, filePath, { authenticated, templateAware, fetchedTemplate });
 }
 
 async function sendFileStream(req, res, filePath) {
@@ -860,7 +933,12 @@ async function serveAgentStaticRequest(req, res, {
                 res.end(JSON.stringify({ error: 'edge_generation_changed' }));
                 return true;
             }
-            if (await sendFile(res, target, { req, authenticated: true })) return true;
+            if (await sendFile(res, target, {
+                req,
+                authenticated: true,
+                templateAware: true,
+                fetchedTemplate: isFetchedTemplateRequest(req),
+            })) return true;
         }
     } catch (_) { }
     return false;

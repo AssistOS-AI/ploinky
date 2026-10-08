@@ -249,12 +249,30 @@ function getStaticMimeType(filePath) {
     return types[ext] || 'application/octet-stream';
 }
 
-function getStaticCacheControl(filePath) {
+function isStaticHtml(filePath) {
+    const ext = path.extname(filePath).toLowerCase();
+    return ext === '.html' || ext === '.htm';
+}
+
+// Mirror of the router rule (cli/server/static): a GET/HEAD whose
+// Sec-Fetch-Dest is exactly `empty` is a fetched template. Anything else,
+// including a repeated header, fails safe to the navigation class.
+function isFetchedTemplateRequest(req) {
+    const method = String(req?.method || 'GET').toUpperCase();
+    if (method !== 'GET' && method !== 'HEAD') return false;
+    const dest = req?.headers?.['sec-fetch-dest'];
+    if (typeof dest !== 'string') return false;
+    return dest.trim().toLowerCase() === 'empty';
+}
+
+function getStaticCacheControl(filePath, { fetchedTemplate = false } = {}) {
     const ext = path.extname(filePath).toLowerCase();
     // HTML documents are application entry points; never store them (matches
-    // the router document policy in cli/server/static).
+    // the router document policy in cli/server/static). Fetched templates are
+    // stored privately but must be revalidated. Agent static is only reachable
+    // through the authenticated router.
     if (ext === '.html' || ext === '.htm') {
-        return 'no-store';
+        return fetchedTemplate ? 'private, no-cache' : 'no-store';
     }
     // Agent static is only reachable through the authenticated router, so a
     // shared cache must never keep it.
@@ -287,13 +305,21 @@ function staticIfNoneMatchMatches(headerValue, etag) {
     ));
 }
 
-function staticNotModified(req, etag, stat) {
+// `htmlVariant`: agent-static HTML. Navigations ignore validators (always 200);
+// fetched templates revalidate. `nowMs` is injected for the current-second rule.
+function staticNotModified(req, etag, stat, { htmlVariant = false, template = false, nowMs = Date.now() } = {}) {
+    if (htmlVariant && !template) return false;
     const ifNoneMatch = req.headers?.['if-none-match'];
     if (typeof ifNoneMatch === 'string' || Array.isArray(ifNoneMatch)) {
         return staticIfNoneMatchMatches(ifNoneMatch, etag);
     }
     const since = Date.parse(String(req.headers?.['if-modified-since'] || ''));
     if (!Number.isFinite(since)) return false;
+    if (template) {
+        // Template class: no future dates, no mtime inside the current second.
+        if (since > nowMs) return false;
+        if (Math.floor(stat.mtimeMs / 1000) >= Math.floor(nowMs / 1000)) return false;
+    }
     return Math.floor(stat.mtimeMs / 1000) * 1000 <= since;
 }
 
@@ -302,35 +328,62 @@ async function serveStaticFile(req, res, pathname) {
     if (method !== 'GET' && method !== 'HEAD') return false;
     const filePath = await resolveStaticFile(pathname);
     if (!filePath) return false;
-    const stat = await fs.promises.stat(filePath);
-    const etag = staticEntityTag(stat);
-    const lastModified = new Date(stat.mtimeMs).toUTCString();
-    const cacheControl = getStaticCacheControl(filePath);
-    if (staticNotModified(req, etag, stat)) {
-        res.writeHead(304, { 'Cache-Control': cacheControl, ETag: etag, 'Last-Modified': lastModified });
-        res.end();
-        return true;
+    // Open once: validators come from the open handle and the body streams from
+    // that same handle, so headers and body describe the same file.
+    let handle;
+    try {
+        handle = await fs.promises.open(filePath, 'r');
+    } catch (_) {
+        return false;
     }
-    res.writeHead(200, {
-        'Content-Type': getStaticMimeType(filePath),
-        'Content-Length': stat.size,
-        'Cache-Control': cacheControl,
-        ETag: etag,
-        'Last-Modified': lastModified
-    });
-    if (method === 'HEAD') {
-        res.end();
-        return true;
-    }
-    const stream = fs.createReadStream(filePath);
-    stream.on('error', () => {
-        if (!res.headersSent) {
-            res.writeHead(500, { 'Content-Type': 'text/plain' });
+    let streamStarted = false;
+    try {
+        const stat = await handle.stat();
+        if (!stat.isFile()) return false;
+        const nowMs = Date.now();
+        const htmlVariant = isStaticHtml(filePath);
+        const template = htmlVariant && isFetchedTemplateRequest(req);
+        const etag = staticEntityTag(stat);
+        const lastModified = new Date(stat.mtimeMs).toUTCString();
+        const cacheControl = getStaticCacheControl(filePath, { fetchedTemplate: template });
+        const advertiseLastModified = !template
+            || Math.floor(stat.mtimeMs / 1000) < Math.floor(nowMs / 1000);
+        const validators = {
+            ETag: etag,
+            ...(advertiseLastModified ? { 'Last-Modified': lastModified } : {}),
+            ...(htmlVariant ? { Vary: 'Sec-Fetch-Dest' } : {}),
+        };
+        if (staticNotModified(req, etag, stat, { htmlVariant, template, nowMs })) {
+            res.writeHead(304, { 'Cache-Control': cacheControl, ...validators });
+            res.end();
+            return true;
         }
-        res.end('Internal Server Error');
-    });
-    stream.pipe(res);
-    return true;
+        const size = stat.size;
+        res.writeHead(200, {
+            'Content-Type': getStaticMimeType(filePath),
+            'Content-Length': size,
+            'Cache-Control': cacheControl,
+            ...validators
+        });
+        if (method === 'HEAD' || size === 0) {
+            res.end();
+            return true;
+        }
+        // `end` caps the body at the fstat size so it cannot exceed Content-Length.
+        const stream = handle.createReadStream({ start: 0, end: size - 1, autoClose: true });
+        streamStarted = true;
+        stream.on('error', () => {
+            if (!res.headersSent) {
+                res.writeHead(500, { 'Content-Type': 'text/plain' });
+            }
+            res.end('Internal Server Error');
+        });
+        res.on('close', () => stream.destroy());
+        stream.pipe(res);
+        return true;
+    } finally {
+        if (!streamStarted) await handle.close().catch(() => { });
+    }
 }
 
 function resolveMaxConcurrent(config) {

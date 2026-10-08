@@ -147,3 +147,73 @@ test('agent static: an edited file gets a new ETag and the old validator no long
     const again = await fetch(`${base}/app.js`, { headers: { 'if-none-match': newEtag } });
     assert.equal(again.status, 304);
 });
+
+test('agent static: fetched templates revalidate privately, navigations stay no-store 200, concurrent edits keep body and headers consistent', async (t) => {
+    const { base, code } = await startServer(t);
+    const file = path.join(code, 'index.html');
+    const past = new Date(Date.now() - 60_000);
+    await fs.utimes(file, past, past);
+    const fetchHeaders = { 'sec-fetch-dest': 'empty', 'sec-fetch-mode': 'cors' };
+
+    const first = await fetch(`${base}/index.html`, { headers: fetchHeaders });
+    assert.equal(first.status, 200);
+    assert.equal(first.headers.get('cache-control'), 'private, no-cache');
+    assert.equal(first.headers.get('vary'), 'Sec-Fetch-Dest');
+    const etag = first.headers.get('etag');
+    const lastModified = first.headers.get('last-modified');
+    assert.match(etag, /^W\/"\d+-\d+-\d+"$/);
+    assert.equal(await first.text(), '<html></html>\n');
+
+    for (const [name, validators] of [
+        ['etag', { 'if-none-match': etag }],
+        ['star', { 'if-none-match': '*' }],
+        ['date', { 'if-modified-since': lastModified }],
+    ]) {
+        for (let i = 0; i < 2; i += 1) {
+            const r = await fetch(`${base}/index.html`, { headers: { ...fetchHeaders, ...validators } });
+            assert.equal(r.status, 304, name);
+            assert.equal(r.headers.get('cache-control'), 'private, no-cache');
+            assert.equal(r.headers.get('etag'), etag);
+            assert.equal(r.headers.get('vary'), 'Sec-Fetch-Dest');
+            assert.equal(await r.text(), '');
+        }
+    }
+    for (const dest of ['EMPTY', ' empty ']) {
+        const r = await fetch(`${base}/index.html`, { headers: { 'sec-fetch-dest': dest, 'if-none-match': etag } });
+        assert.equal(r.status, 304, dest);
+        assert.equal(r.headers.get('cache-control'), 'private, no-cache');
+    }
+    for (const dest of ['document', 'iframe', 'empty, document', undefined]) {
+        for (const validators of [{}, { 'if-none-match': etag }, { 'if-none-match': '*' }, { 'if-modified-since': lastModified }]) {
+            const headers = { ...validators, ...(dest ? { 'sec-fetch-dest': dest } : {}) };
+            const r = await fetch(`${base}/index.html`, { headers });
+            assert.equal(r.status, 200, JSON.stringify(headers));
+            assert.equal(r.headers.get('cache-control'), 'no-store');
+            assert.equal(r.headers.get('vary'), 'Sec-Fetch-Dest');
+            assert.equal(await r.text(), '<html></html>\n');
+        }
+    }
+    // Garbage, malformed, future and ancient validators do not 304.
+    for (const validators of [
+        { 'if-none-match': 'garbage' },
+        { 'if-modified-since': 'not a date' },
+        { 'if-modified-since': new Date(Date.now() + 3_600_000).toUTCString() },
+        { 'if-modified-since': new Date(0).toUTCString() },
+    ]) {
+        const r = await fetch(`${base}/index.html`, { headers: { ...fetchHeaders, ...validators } });
+        assert.equal(r.status, 200, JSON.stringify(validators));
+        await r.arrayBuffer();
+    }
+    // No HTML response is ever `public`.
+    assert.doesNotMatch(first.headers.get('cache-control'), /public/);
+
+    // Edit between requests: new ETag, and body and headers describe the same file.
+    await fs.writeFile(file, '<html>edited and longer</html>\n');
+    await fs.utimes(file, past, new Date(Date.now() - 30_000));
+    const edited = await fetch(`${base}/index.html`, { headers: { ...fetchHeaders, 'if-none-match': etag } });
+    assert.equal(edited.status, 200);
+    assert.notEqual(edited.headers.get('etag'), etag);
+    const body = await edited.text();
+    assert.equal(body, '<html>edited and longer</html>\n');
+    assert.equal(Number(edited.headers.get('content-length')), Buffer.byteLength(body));
+});
