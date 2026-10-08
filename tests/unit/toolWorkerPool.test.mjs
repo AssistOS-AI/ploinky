@@ -13,6 +13,7 @@ import {
     createToolWorkerPools,
     shutdownToolWorkerPools,
 } from '../../Agent/server/toolWorkerPool.mjs';
+import { createCodeIdentityThread } from '../../Agent/server/toolCodeIdentityThread.mjs';
 
 const FIXTURES = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'fixtures');
 const WORKER_FIXTURE = path.join(FIXTURES, 'toolWorkerFixture.mjs');
@@ -1040,4 +1041,25 @@ test('a failing walk sends every queued call to the spawn fallback at once', asy
     assert.ok(logs.some((line) => line.includes('codeIdentity failed (identity unavailable)')));
     // A later successful walk serves workers again.
     assert.equal(codeVersion(await callTool(pool, { mode: 'codeVersion' })).version, 'v1');
+});
+
+test('a crashed identity thread sends the call to the spawn fallback and the next walk serves a worker again', async (t) => {
+    const dir = makeDir(t);
+    const thread = createCodeIdentityThread({
+        roots: ['exit'],
+        threadUrl: new URL('../fixtures/toolCodeIdentityThreadFixture.mjs', import.meta.url),
+        timeoutMs: 5000,
+    });
+    t.after(() => thread.terminate());
+    // The fixture identity echoes the request id; label workers by the part after it.
+    const hook = () => thread.read().then((reply) => reply.identity.replace(/^fresh-\d+:/, ''));
+    const { pool, logs } = makePool(t, dir, { size: 1, codeIdentity: hook });
+    const fallback = async () => ({ code: 0, signal: null, stdout: 'from-spawn-fallback', stderr: '' });
+    assert.equal((await callTool(pool, { mode: 'echo' }, { fallback })).stdout, 'from-spawn-fallback');
+    assert.ok(logs.some((line) => line.includes('codeIdentity failed (identity thread exited (code 3))')), JSON.stringify(logs));
+    const served = await callTool(pool, { mode: 'echo' }, { fallback });
+    assert.equal(served.code, 0, served.stderr);
+    assert.equal(JSON.parse(served.stdout).pid, Number(loads(dir)[0]));
+    assert.equal(thread.stats().spawned, 2);
+    assert.equal(pool.stats().identityErrors, 1);
 });

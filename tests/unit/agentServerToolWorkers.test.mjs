@@ -739,3 +739,65 @@ test('the agentic tool loop runs opted-in tools in their pool and other tools as
     assert.equal(new Set(outputs.spawned).size, 3);
     for (const pid of outputs.spawned) assert.ok(!loads.includes(pid));
 });
+
+test('timing lines are off unless PLOINKY_TOOL_WORKER_TIMINGS=1', async (t) => {
+    const fx = await createFixtureAgent(t);
+    const server = await startServer(t, fx, {
+        toolWorkers: { fx: workerPool(fx, { size: 1 }) },
+        tools: [tool(fx, 'pid_worker', 'pid', { worker: 'fx' })],
+    });
+    const pid = Number(okText(await callTool(server, 'pid_worker')));
+    assert.equal(Number(okText(await callTool(server, 'pid_worker'))), pid);
+    await waitFor(() => completionLines(server).length >= 2, { message: 'two completion lines' });
+    assert.doesNotMatch(server.output(), / timing id=| identity walk /);
+});
+
+// AC7 and AC11: the real (unstubbed) identity, after the fixture code has
+// settled, on three warm workers. Walk and dispatch counts come from the
+// opt-in timing lines.
+for (const mode of ['thread', 'sync']) {
+    test(`AC7: a 12-call burst under the real ${mode} identity runs in workers with no more walks than dispatches`, async (t) => {
+        const fx = await createFixtureAgent(t);
+        const env = { PLOINKY_TOOL_WORKER_TIMINGS: '1', ...(mode === 'sync' ? { PLOINKY_TOOL_IDENTITY_MODE: 'sync' } : {}) };
+        const server = await startServer(t, fx, {
+            toolWorkers: { fx: workerPool(fx, { size: 3, idleTimeoutMs: 600000, maxCallsPerWorker: 10000 }) },
+            tools: [tool(fx, 'pid_worker', 'pid', { worker: 'fx' }), tool(fx, 'slow_worker', 'slow', { worker: 'fx' })],
+        }, { identity: false, env });
+        const wait = fx.createdAt + 2300 - Date.now();
+        if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+        // Three concurrent slow calls warm all three workers.
+        (await Promise.all([0, 1, 2].map(() => callTool(server, 'slow_worker')))).forEach(okText);
+        const warm = workerLoads(fx);
+        assert.equal(warm.length, 3);
+        const lines = () => server.output().split('\n');
+        const burstFrom = lines().length - 1;
+        const replies = await Promise.all(Array.from({ length: 12 }, () => callTool(server, 'pid_worker')));
+        const pids = replies.map((reply) => Number(okText(reply)));
+        for (const pid of pids) assert.ok(warm.includes(pid), `pid ${pid} is not a warm worker`);
+        await waitFor(() => completionLines(server).length >= 15, { message: 'fifteen completion lines' });
+        const completions = completionLines(server);
+        assert.equal(completions.filter((line) => / mode=worker:fx /.test(line)).length, 15, completions.join('\n'));
+        const walkLine = /^\[toolWorkerPool:fx\] identity walk seq=\d+ ms=\d+\.\d blockMs=(\d+\.\d) ok=true roots=code:\d+\.\d\/\d+,agent:\d+\.\d\/\d+,(agentlib:\d+\.\d\/\d+,)?files:\d+\.\d\/\d+$/;
+        const isWalk = (line) => line.startsWith('[toolWorkerPool:fx] identity walk ');
+        const isDispatch = (line) => /^\[toolWorkerPool:fx\] timing id=\S+ route=worker /.test(line);
+        const all = lines();
+        const walks = all.filter(isWalk);
+        for (const line of walks) assert.match(line, walkLine);
+        const burst = all.slice(burstFrom);
+        const burstWalks = burst.filter(isWalk).length;
+        const burstDispatches = burst.filter(isDispatch).length;
+        assert.equal(burstDispatches, 12);
+        assert.equal(workerLoads(fx).length, 3, 'no worker was replaced during the burst');
+        assert.ok(burstWalks >= 1 && burstWalks <= burstDispatches, `burst walks ${burstWalks} > dispatches ${burstDispatches}`);
+        const blockMs = walks.map((line) => Number(walkLine.exec(line)[1]));
+        if (mode === 'thread') {
+            // AC11: the walk itself never blocks the AgentServer's main thread.
+            for (const [index, line] of walks.entries()) assert.ok(blockMs[index] <= 1, line);
+        }
+        t.diagnostic(`AC7 ${mode} walks=${walks.length} dispatches=${all.filter(isDispatch).length} burstWalks=${burstWalks} burstDispatches=${burstDispatches} blockMs=${blockMs.join(',')} sample=${walks.at(-1)}`);
+        const [code, signal] = await terminateServer(server);
+        assert.equal(code, 0, server.output());
+        assert.equal(signal, null);
+        for (const pid of warm) assert.equal(groupAlive(pid), false, `worker group ${pid} leaked`);
+    });
+}
