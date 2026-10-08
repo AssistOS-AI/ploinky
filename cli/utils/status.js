@@ -179,19 +179,27 @@ export function collectAgentsSummary({ includeInactive = true } = {}) {
                 }
 
                 let about = '-';
+                let manifest = null;
                 try {
-                    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+                    manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
                     if (manifest && typeof manifest.about === 'string') {
                         about = manifest.about;
                     }
-                } catch (_) {}
+                } catch (_) {
+                    manifest = null;
+                }
 
-                record.agents.push({
+                const agent = {
                     repo,
                     name,
                     about,
                     manifestPath
-                });
+                };
+                // The manifest was already parsed for `about`; hand it to callers
+                // of this call (null when unreadable) so they need not read it
+                // again. Non-enumerable: it never reaches serialized summaries.
+                Object.defineProperty(agent, 'manifest', { value: manifest, enumerable: false });
+                record.agents.push(agent);
             }
         }
 

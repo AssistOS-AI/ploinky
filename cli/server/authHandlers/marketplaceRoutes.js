@@ -419,11 +419,22 @@ function normalizeMarketplaceAgentStatus({ active, runtimeState, noWaitState } =
 
 // Listing stays available when a manifest is unreadable or declares invalid
 // modes; enabling that agent reports the manifest error instead.
-function readMarketplaceEnableModes(manifestPath) {
+function defaultMarketplaceEnableModes() {
+    return { modes: [...agentsSvc.ENABLE_AGENT_MODES], defaultMode: agentsSvc.DEFAULT_ENABLE_AGENT_MODE };
+}
+
+// A summary entry from collectAgentsSummary carries the manifest it already
+// parsed (null when unreadable); an entry without it falls back to one read.
+function readMarketplaceEnableModes(agent) {
     try {
-        return agentsSvc.resolveManifestEnableModes(JSON.parse(fs.readFileSync(manifestPath, 'utf8')));
+        if (Object.hasOwn(agent, 'manifest')) {
+            return agent.manifest
+                ? agentsSvc.resolveManifestEnableModes(agent.manifest)
+                : defaultMarketplaceEnableModes();
+        }
+        return agentsSvc.resolveManifestEnableModes(JSON.parse(fs.readFileSync(agent.manifestPath, 'utf8')));
     } catch {
-        return { modes: [...agentsSvc.ENABLE_AGENT_MODES], defaultMode: agentsSvc.DEFAULT_ENABLE_AGENT_MODE };
+        return defaultMarketplaceEnableModes();
     }
 }
 
@@ -523,7 +534,7 @@ function buildMarketplaceAgents(user = null, options = {}) {
                     : noWaitStates[enabledRecord.containerName])
                 : null;
             const lifecycle = normalizeMarketplaceAgentStatus({ active, runtimeState, noWaitState });
-            const enableModes = readMarketplaceEnableModes(agent.manifestPath);
+            const enableModes = readMarketplaceEnableModes(agent);
             agents.push({
                 ref,
                 repo: agent.repo,
