@@ -267,6 +267,7 @@ export async function discoverAgentMcp(ctx, mcp, catalog = agentCatalog) {
                 ctx.recordGap(id, 'Administrator discovery control unavailable or returned an unexpected response shape; inspect the private response artifact. No denial is counted.', {
                     kind: 'positive-unavailable', actor: 'admin', endpoint: `/${agent.agent}/mcp`, requestedMethod: definition.method,
                     stage: baseline?.stage, httpStatus: baseline?.response?.status, rpcCode: baseline?.response?.json?.error?.code,
+                    errorCode: typeof baseline?.response?.json?.error === 'string' ? baseline.response.json.error : undefined,
                 });
                 continue;
             }
@@ -298,23 +299,28 @@ export async function discoverAgentMcp(ctx, mcp, catalog = agentCatalog) {
                 });
             }
         }
-        // Use a real initialized administrator session; no missing-session/404 evidence accepted.
+        // The public agent MCP route serves POST/DELETE only: GET returns 405
+        // event_stream_not_supported with Allow: POST, DELETE
+        // (cli/server/mcp-proxy/index.js:827-830). Record that exact transport
+        // contract as typed evidence from a real initialized administrator
+        // session; any other outcome (200, 404, 503, transport error) is typed
+        // differently and never matches the reviewed entry.
+        const transportId = `agent.${agent.agent}.mcp-get-transport`;
         let session, stream;
         try {
             session = await mcp.initialize('admin', agent.agent);
             if (session.failure) throw new Error('No administrator MCP session');
             stream = await ctx.request('admin', { path: `/${agent.agent}/mcp`, headers: { ...session.headers, accept: 'text/event-stream' }, stream: true });
         } catch {
-            ctx.recordGap(`agent.${agent.agent}.sse`, 'Administrator SSE preparation unavailable; no negative-only claim.', { kind: 'positive-unavailable', actor: 'admin' });
+            ctx.recordGap(transportId, 'Administrator MCP session unavailable; the GET transport contract was not observed.', { kind: 'positive-unavailable', actor: 'admin', endpoint: `/${agent.agent}/mcp` });
             continue;
         }
-        if (stream.status === 200 && String(stream.headers['content-type']).includes('text/event-stream')) {
-            await ctx.check(`agent.${agent.agent}.sse.positive`, async () => assert.equal(stream.status, 200));
-            for (const actor of ['anonymous', 'selfRegistered', 'userB']) await ctx.check(`agent.${agent.agent}.sse.cross-session.${actor}`, async () => {
-                const response = await ctx.request(actor, { path: `/${agent.agent}/mcp`, headers: { 'mcp-session-id': session.headers['mcp-session-id'], 'mcp-protocol-version': session.headers['mcp-protocol-version'], accept: 'text/event-stream' }, stream: true });
-                assertDenied(response);
-            });
-        } else ctx.recordGap(`agent.${agent.agent}.sse`, `Valid administrator session did not produce an SSE stream (HTTP ${stream.status}); no negative-only claim.`, { kind: 'positive-unavailable', actor: 'admin', httpStatus: stream.status });
+        const allow = String(stream.headers?.allow || '').replace(/\s+/g, '');
+        const unsupported = stream.status === 405 && stream.json?.error === 'event_stream_not_supported';
+        ctx.recordGap(transportId, unsupported
+            ? 'The public agent MCP route does not offer a GET event stream (405 event_stream_not_supported); POST/session ownership is asserted separately.'
+            : `Unexpected GET /mcp outcome (HTTP ${stream.status}); not the reviewed unsupported-transport contract.`,
+        { kind: unsupported ? 'unsupported-transport' : 'positive-unavailable', actor: 'admin', endpoint: `/${agent.agent}/mcp`, httpStatus: stream.status, errorCode: typeof stream.json?.error === 'string' ? stream.json.error : undefined, allow });
     }
 }
 

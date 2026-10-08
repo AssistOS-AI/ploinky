@@ -94,6 +94,7 @@ export function verifyBoxAgainstPins({ box, captured, pins, policy }) {
     assert.equal(box.State?.Running, true, 'BOX_NOT_RUNNING');
     assert.equal(box.State.StartedAt, pins.box.startedAt, 'BOX_GENERATION');
     assert.equal(`sha256:${String(box.Image).replace(/^sha256:/, '')}`, pins.box.imageId, 'BOX_IMAGE');
+    assert.equal(box.ImageDigest, pins.box.imageDigest, 'BOX_IMAGE_DIGEST: the running Box image digest differs from the pinned digest');
     for (const field of ['id', 'name', 'startedAt', 'imageId']) assert.equal(captured?.[field], pins.box[field], `BOX_CAPTURE_DRIFT: ${field}`);
     assertBoxConfinement(box, { workspace: pins.workspace, ploinkyCheckout: pins.ploinkyCheckout, agentLib: pins.agentlib, policy });
     return true;
@@ -119,7 +120,7 @@ export async function ownershipGuard(evidenceRoot, { sources = true, pins, polic
         assert.equal(git(['rev-parse', '--abbrev-ref', '@{upstream}']), repo.upstream);
         assert.equal(git(['status', '--porcelain']), '', `Deployment source is dirty: ${repo.name}`);
     }
-    return { boxId: box.Id, instance: pins.box.name, startedAt: box.State.StartedAt, image: { imageId: pins.box.imageId, imageDigest: pins.box.imageDigest }, repositories: pinned.map(({ name, branch, commit }) => ({ name, branch, commit })), userPersistoContainer: captured.userPersistoContainer };
+    return { boxId: box.Id, instance: pins.box.name, startedAt: box.State.StartedAt, image: { imageId: pins.box.imageId, imageDigest: pins.box.imageDigest }, repositories: pinned.map(({ name, branch, commit }) => ({ name, branch, commit })), userPersistoContainer: captured.userPersistoContainer, dpuContainer: captured.dpuContainer };
 }
 
 /** Live runtimes must equal the reviewed manifest-derived set exactly. */
@@ -142,7 +143,7 @@ export function assertRuntimeSet(live, expected) {
     return liveKeys.sort();
 }
 
-const GAP_EVIDENCE_KINDS = new Set(['agent-disabled', 'rpc-method-unsupported', 'positive-unavailable', 'selfregistered-visible-tools', 'actor-unsupported', 'pagination', 'declared-limitation', 'negative-only-protocol', 'boundary-rejected', 'data-unavailable', 'username-reserved', 'fanout-errors']);
+const GAP_EVIDENCE_KINDS = new Set(['unsupported-transport', 'agent-disabled', 'rpc-method-unsupported', 'positive-unavailable', 'selfregistered-visible-tools', 'actor-unsupported', 'pagination', 'declared-limitation', 'negative-only-protocol', 'boundary-rejected', 'data-unavailable', 'username-reserved', 'fanout-errors']);
 const GAP_ACTORS = new Set(['anonymous', 'selfRegistered', 'userA', 'userB', 'admin']);
 const GAP_METHODS = new Set(['initialize', 'tools/list', 'resources/list', 'resources/templates/list', 'prompts/list', 'tools/call']);
 const SAFE_NAME = /^[A-Za-z0-9_.:@-]{1,120}$/;
@@ -156,6 +157,8 @@ export function sanitizeGapEvidence(evidence) {
     for (const field of ['requestedMethod', 'stage']) if (GAP_METHODS.has(evidence[field])) out[field] = evidence[field];
     for (const field of ['httpStatus', 'rpcCode']) if (Number.isInteger(evidence[field])) out[field] = evidence[field];
     if (typeof evidence.initialized === 'boolean') out.initialized = evidence.initialized;
+    if (typeof evidence.errorCode === 'string' && /^[a-z][a-z0-9_]{1,60}$/.test(evidence.errorCode)) out.errorCode = evidence.errorCode;
+    if (typeof evidence.allow === 'string' && /^[A-Z]{3,7}(,[A-Z]{3,7}){0,6}$/.test(evidence.allow)) out.allow = evidence.allow;
     for (const field of ['repo', 'agent', 'probeId']) if (typeof evidence[field] === 'string' && SAFE_NAME.test(evidence[field])) out[field] = evidence[field];
     if (Array.isArray(evidence.visibleTools)) out.visibleTools = evidence.visibleTools.filter(n => typeof n === 'string' && SAFE_NAME.test(n)).sort();
     return out;

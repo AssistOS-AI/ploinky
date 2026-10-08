@@ -96,8 +96,8 @@ try {
     const { runTemplateProbes, runMarketplaceAdmissionProbes } = await import('./boundary-probes.mjs');
     await runTemplateProbes(ctx);
     await runMarketplaceAdmissionProbes(ctx);
-    const { runWebchatProbes, boxProcessInspector } = await import('./webchat-probes.mjs');
-    await runWebchatProbes(ctx, { inspectProcesses: boxProcessInspector(ctx.report.deployment.boxId) });
+    const { runWebchatProbes, dpuProcessInspector } = await import('./webchat-probes.mjs');
+    await runWebchatProbes(ctx, { inspectProcesses: dpuProcessInspector({ boxId: ctx.report.deployment.boxId, container: ctx.report.deployment.dpuContainer }) });
 } catch (error) {
     ctx.report.setupError = safeError(error, ctx.secrets);
     console.log(`ERROR: ${ctx.report.setupError}`);

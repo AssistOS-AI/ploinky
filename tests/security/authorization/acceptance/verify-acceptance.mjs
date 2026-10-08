@@ -22,12 +22,15 @@ import { agentInventory, inventoryBaseline } from '../agent-inventory.mjs';
 import { agentDiscoveryMethods } from '../agent-probes.mjs';
 import { ACCEPTANCE_DIR, policyDigest } from './digest.mjs';
 import { loadPins } from './pins.mjs';
+import { enumerateMandatoryChecks } from './mandatory-checks.mjs';
+import { deriveExpectedRuntimes, gitSource, repositoriesFromPins } from './expected-runtime-graph.mjs';
+import { LIVE_INTERACTION_LIMITATION } from '../webchat-probes.mjs';
 
 const sha256 = value => createHash('sha256').update(value).digest('hex');
 const key = (repo, agent) => `${repo}/${agent}`;
 
 export const GAP_CATEGORIES = Object.freeze(['intentional-disabled-agent', 'optional-disabled-agent', 'external-inference-provider-git', 'optional-backend-image-owned', 'static-unsupported-protocol', 'protocol-combination-outside-changed-paths']);
-export const ACCEPTABLE_GAP_KINDS = Object.freeze(['agent-disabled', 'rpc-method-unsupported', 'declared-limitation', 'negative-only-protocol', 'boundary-rejected', 'selfregistered-visible-tools']);
+export const ACCEPTABLE_GAP_KINDS = Object.freeze(['unsupported-transport', 'agent-disabled', 'rpc-method-unsupported', 'declared-limitation', 'negative-only-protocol', 'boundary-rejected', 'selfregistered-visible-tools']);
 /** Gap identities that always fail, whatever the gap file contains. */
 export const FORBIDDEN_GAP_IDS = Object.freeze([
     /\*/, /\.pagination$/, /\.unsupported$/, /\.sse$/, /:fanout$/, /^agent\.username-admin/, /^agent\.tool\./,
@@ -58,7 +61,7 @@ export function validateExpectedGaps(file, { policy, expectedRuntimes, routerIds
         if (!CITATION.test(String(entry.source))) err('GAP_SOURCE_UNCITED', id);
         const ev = entry.evidence || {};
         if (!ACCEPTABLE_GAP_KINDS.includes(ev.kind)) err('GAP_KIND_NOT_ACCEPTABLE', id, ev.kind);
-        if (!['required', 'boundary-or-denial-pass'].includes(entry.presence) || (entry.presence === 'boundary-or-denial-pass' && ev.kind !== 'boundary-rejected')) err('GAP_PRESENCE', id, entry.presence);
+        if (entry.presence !== 'required') err('GAP_PRESENCE', id, entry.presence);
         for (const obligation of entry.affectedObligations || []) {
             if (changed.has(obligation)) err('GAP_COVERS_CHANGED_BOUNDARY', id, obligation);
             else if (obligation.startsWith('router/')) { if (!routerIds.has(obligation.slice(7))) err('GAP_OBLIGATION_UNKNOWN', id, obligation); }
@@ -79,6 +82,10 @@ export function validateExpectedGaps(file, { policy, expectedRuntimes, routerIds
             if (!agentDiscoveryMethods.some(m => m.method === ev.requestedMethod)) err('GAP_DISCOVERY_METHOD', id);
             if (id !== `agent.${agent}.discovery.${String(ev.requestedMethod).replaceAll('/', '.')}`) err('GAP_ID_EVIDENCE', id);
             if (ev.actor !== 'admin' || ev.stage !== ev.requestedMethod || ev.initialized !== true || ev.httpStatus !== 200 || ev.rpcCode !== -32601) err('GAP_DISCOVERY_RULE', id, 'requires initialized admin session, stage == method, HTTP 200, RPC -32601');
+        } else if (ev.kind === 'unsupported-transport') {
+            const agent = String(ev.endpoint || '').replace(/^\//, '').replace(/\/mcp$/, '');
+            if (!enabled.has(agent) || id !== `agent.${agent}.mcp-get-transport`) err('GAP_ID_EVIDENCE', id);
+            if (ev.actor !== 'admin' || ev.httpStatus !== 405 || ev.errorCode !== 'event_stream_not_supported' || ev.allow !== 'POST,DELETE') err('GAP_TRANSPORT_RULE', id, 'requires admin GET 405 event_stream_not_supported with Allow POST,DELETE');
         } else if (ev.kind === 'negative-only-protocol') {
             const probe = probes.find(p => p.id === ev.probeId);
             if (!probe || probe.positiveControl || !probe.gap) err('GAP_NEGATIVE_ONLY_PROBE', id);
@@ -127,6 +134,9 @@ function matchGapEvidence(entry, gap, report, checks) {
             return null;
         case 'declared-limitation':
             return null;
+        case 'unsupported-transport':
+            for (const field of ['actor', 'endpoint', 'httpStatus', 'errorCode', 'allow']) if (ev[field] !== want[field]) return `${field} ${JSON.stringify(ev[field])} differs from reviewed ${JSON.stringify(want[field])}`;
+            return null;
         case 'negative-only-protocol':
             if (ev.probeId !== want.probeId || ev.actor !== want.actor) return 'probe/actor differs';
             if (coverage.length !== 1 || coverage[0].status !== 'NEGATIVE_ONLY_PASSED') return 'routerCoverage is not exactly one NEGATIVE_ONLY_PASSED row';
@@ -148,13 +158,19 @@ function matchGapEvidence(entry, gap, report, checks) {
     }
 }
 
-export function evaluateScopedAcceptance({ report, exitCode, mandatory, expectedGaps, expectedRuntimes, policy, offline = [], pins, pinsSha256, acceptanceDigest, baseline = inventoryBaseline }) {
+export function evaluateScopedAcceptance({ report, exitCode, mandatory, expectedGaps, expectedRuntimes, derivedRuntimes, policy, offline = [], pins, pinsSha256, acceptanceDigest, baseline = inventoryBaseline }) {
     const reasons = [];
     const reject = (code, detail = '') => reasons.push(`${code}${detail ? `: ${detail}` : ''}`);
     if (!report || typeof report !== 'object') return { decision: 'REJECT', reasons: ['REPORT_MISSING'] };
 
     // Policy files: gap rules and the mandatory/gap partition.
     for (const error of validateExpectedGaps(expectedGaps, { policy, expectedRuntimes })) reject('GAP_FILE', error);
+    // The comparator never trusts the committed derived files: it recomputes them.
+    try {
+        if (JSON.stringify(enumerateMandatoryChecks({ expectedRuntimes, expectedGaps })) !== JSON.stringify(mandatory)) reject('MANDATORY_FILE_DRIFT', 'mandatory-checks.json differs from the enumerator output');
+    } catch (error) { reject('MANDATORY_FILE_DRIFT', String(error?.message || error)); }
+    if (!derivedRuntimes) reject('RUNTIME_GRAPH_NOT_VERIFIED', 'expected runtimes were not re-derived from the pinned manifests');
+    else if (JSON.stringify(derivedRuntimes) !== JSON.stringify(expectedRuntimes)) reject('RUNTIME_GRAPH_DRIFT', 'expected-runtimes.json differs from the graph derived at the pinned commits');
     const expected = new Map((expectedGaps.gaps || []).map(g => [g.id, g]));
     const mandatoryLive = (mandatory.checks || []).filter(c => c.kind === 'live');
     const mandatoryIds = new Set((mandatory.checks || []).map(c => c.id));
@@ -257,14 +273,15 @@ export function evaluateScopedAcceptance({ report, exitCode, mandatory, expected
         const mismatch = matchGapEvidence(entry, gap, report, checks);
         if (mismatch) reject('GAP_EVIDENCE_MISMATCH', `${gap.id}: ${mismatch}`);
     }
-    for (const entry of expected.values()) {
-        if (seen.has(entry.id)) continue;
-        if (entry.presence === 'boundary-or-denial-pass') {
-            const id = `router:${entry.evidence.probeId}:${entry.evidence.actor}`;
-            const row = (report.routerCoverage || []).filter(r => r.probeId === entry.evidence.probeId && r.actor === entry.evidence.actor);
-            if (JSON.stringify(checks.get(id)) !== JSON.stringify(['PASS']) || row.length !== 1 || row[0].status !== 'AUTHORIZATION_DENIAL_PASSED') reject('GAP_MISSING', `${entry.id} (neither a reviewed boundary rejection nor a passing explicit denial)`);
-        } else reject('GAP_MISSING', entry.id);
+    for (const entry of expected.values()) if (!seen.has(entry.id)) reject('GAP_MISSING', entry.id);
+    // Explicit-denial raw-path checks must be linked to their exact request record.
+    for (const entry of mandatoryLive.filter(c => /^router:users-list\.path-/.test(c.id))) {
+        const [, probeId, actor] = entry.id.split(':');
+        const rows = (report.routerCoverage || []).filter(r => r.probeId === probeId && r.actor === actor);
+        if (rows.length !== 1 || rows[0].status !== 'AUTHORIZATION_DENIAL_PASSED' || ![401, 403].includes(rows[0].httpStatus)) reject('RAW_PATH_DENIAL_LINKAGE', entry.id);
     }
+    // The unexercised live interaction limitation must be recorded explicitly.
+    if (JSON.stringify(report.liveLimitations || []) !== JSON.stringify([LIVE_INTERACTION_LIMITATION])) reject('LIVE_LIMITATION_RECORD', 'the WebChat interaction limitation must be reported exactly');
     return { decision: reasons.length ? 'REJECT' : 'ACCEPT', reasons };
 }
 
@@ -284,7 +301,10 @@ export function verifyFromFiles({ reportFile, exitCodeFile, offlineDir, pinsFile
     const { pins, sha256: pinsHash } = loadPins(pinsFile, pinsSha256);
     const raw = JSON.parse(fs.readFileSync(exitCodeFile, 'utf8'));
     const report = JSON.parse(fs.readFileSync(reportFile, 'utf8'));
-    return evaluateScopedAcceptance({ report, exitCode: raw.exitCode, offline: readOfflineEvidence(offlineDir), pins, pinsSha256: pinsHash, ...loadAcceptanceInputs() });
+    const inputs = loadAcceptanceInputs();
+    let derivedRuntimes;
+    try { derivedRuntimes = deriveExpectedRuntimes({ policy: inputs.policy, source: gitSource(repositoriesFromPins(pins, inputs.policy)) }); } catch { derivedRuntimes = undefined; }
+    return evaluateScopedAcceptance({ report, exitCode: raw.exitCode, offline: readOfflineEvidence(offlineDir), pins, pinsSha256: pinsHash, derivedRuntimes, ...inputs });
 }
 
 function parseArgs(argv) {

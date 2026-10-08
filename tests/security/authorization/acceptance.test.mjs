@@ -10,14 +10,14 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { assertBoxConfinement, assertRuntimeSet, sanitizeGapEvidence, verifyBoxAgainstPins } from './core.mjs';
 import { evaluateScopedAcceptance, loadAcceptanceInputs, parseTap, validateExpectedGaps } from './acceptance/verify-acceptance.mjs';
-import { enumerateMandatoryChecks, INLINE_TEMPLATES } from './acceptance/mandatory-checks.mjs';
+import { enumerateMandatoryChecks, INLINE_TEMPLATES, D2_DENIAL_MATRIX } from './acceptance/mandatory-checks.mjs';
 import { deriveExpectedRuntimes, GraphError } from './acceptance/expected-runtime-graph.mjs';
 import { loadPins, verifyCandidate, PinError } from './acceptance/pins.mjs';
 import { capture } from './acceptance/evidence-capture.mjs';
 import { policyDigest } from './acceptance/digest.mjs';
 import { captureExitCode } from './acceptance/run-acceptance.mjs';
 import { runMarketplaceAdmissionProbes, runTemplateProbes, marketplaceProjection } from './boundary-probes.mjs';
-import { runWebchatProbes } from './webchat-probes.mjs';
+import { runWebchatProbes, dpuProcessInspector, DPU_UNSUPPORTED_REPLY, LIVE_INTERACTION_LIMITATION } from './webchat-probes.mjs';
 import { discoverAgentMcp } from './agent-probes.mjs';
 import { BOX_DATA_MOUNTS } from '../../../ploinky-box/constants.mjs';
 import { inventoryBaseline } from './agent-inventory.mjs';
@@ -56,6 +56,10 @@ function acceptedRun() {
     const gaps = [];
     const routerCoverage = [];
     for (const entry of mandatory.checks.filter(c => c.kind === 'live')) for (let i = 0; i < entry.count; i++) checks.push({ id: entry.id, status: 'PASS' });
+    for (const entry of mandatory.checks.filter(c => /^router:users-list\.path-/.test(c.id))) {
+        const [, probeId, actor] = entry.id.split(':');
+        routerCoverage.push({ probeId, actor, status: 'AUTHORIZATION_DENIAL_PASSED', httpStatus: actor === 'anonymous' ? 401 : 403 });
+    }
     for (const entry of expectedGaps.gaps) {
         const ev = entry.evidence;
         if (ev.kind === 'boundary-rejected') {
@@ -74,13 +78,14 @@ function acceptedRun() {
         deployment: { boxId: pins.box.id, startedAt: pins.box.startedAt, image: { imageId: pins.box.imageId }, repositories: pins.repositories.map(({ name, commit }) => ({ name, commit })) },
         principals: Object.entries(policy.principals).map(([name, roles], i) => ({ name, roles, idHash: String(i), authoritativeRoleVerified: true })),
         runtimes: expectedRuntimes.enabled.map(({ repo, agent }) => ({ repo, agent, enabled: true, running: true })),
+        liveLimitations: [{ ...LIVE_INTERACTION_LIMITATION }],
     };
     const offline = mandatory.checks.filter(c => c.kind === 'offline').map(entry => {
         const tap = tapFor(entry);
         const commit = entry.repo === 'ploinky' ? pins.ploinky.commit : pins.repositories.find(r => r.name === entry.repo).commit;
         return { sidecar: { repo: entry.repo, file: entry.file, commit, clean: true, exitCode: 0, tapSha256: sha(tap) }, tap };
     });
-    return { report, exitCode: 2, offline, pins, pinsSha256: 'f'.repeat(64), ...inputs };
+    return { report, exitCode: 2, offline, pins, pinsSha256: 'f'.repeat(64), derivedRuntimes: clone(expectedRuntimes), ...inputs };
 }
 
 const evaluate = run => evaluateScopedAcceptance(run);
@@ -116,36 +121,37 @@ test('REJECT: same discovery gap ID with a timeout, a 503, a malformed result or
 });
 
 test('REJECT: a raw-path boundary gap without BOUNDARY_REJECTED_ONLY or with an unreviewed status', () => {
-    const id = 'router:users-list.path-dot-segment:userA';
+    const probeId = 'users-list.path-duplicate-slash';
+    const id = `router:${probeId}:userA`;
     let run = acceptedRun();
-    run.report.routerCoverage.find(r => r.probeId === 'users-list.path-dot-segment' && r.actor === 'userA').status = 'CONTROL_UNAVAILABLE';
+    run.report.routerCoverage.find(r => r.probeId === probeId && r.actor === 'userA').status = 'CONTROL_UNAVAILABLE';
     expectReject(run, 'GAP_EVIDENCE_MISMATCH', 'coverage status');
+    for (const status of [400, 405, 421, 503]) {
+        run = acceptedRun();
+        run.report.gaps.find(g => g.id === id).evidence.httpStatus = status;
+        run.report.routerCoverage.find(r => r.probeId === probeId && r.actor === 'userA').httpStatus = status;
+        expectReject(run, 'GAP_EVIDENCE_MISMATCH', `ungrounded ${status}`);
+    }
     run = acceptedRun();
-    run.report.gaps.find(g => g.id === id).evidence.httpStatus = 503;
-    run.report.routerCoverage.find(r => r.probeId === 'users-list.path-dot-segment' && r.actor === 'userA').httpStatus = 503;
-    expectReject(run, 'GAP_EVIDENCE_MISMATCH', '503');
-    run = acceptedRun();
-    run.report.gaps.find(g => g.id === id).evidence = { kind: 'positive-unavailable', probeId: 'users-list.path-dot-segment', actor: 'userA' };
+    run.report.gaps.find(g => g.id === id).evidence = { kind: 'positive-unavailable', probeId, actor: 'userA' };
     expectReject(run, 'GAP_EVIDENCE_MISMATCH', 'positive control failed under the same ID');
 });
 
-test('a boundary entry may instead be an explicit passing denial, but not a missing or failed one', () => {
-    const probeId = 'users-list.path-encoded-slash';
-    const id = `router:${probeId}:selfRegistered`;
-    const run = acceptedRun();
-    run.report.gaps = run.report.gaps.filter(g => g.id !== id);
-    run.report.routerCoverage = run.report.routerCoverage.filter(r => !(r.probeId === probeId && r.actor === 'selfRegistered'));
-    run.report.routerCoverage.push({ probeId, actor: 'selfRegistered', status: 'AUTHORIZATION_DENIAL_PASSED', httpStatus: 403 });
-    run.report.checks.push({ id, status: 'PASS' });
-    run.report.counts.PASS += 1;
-    assert.equal(evaluate(run).decision, 'ACCEPT');
-    const failed = clone(run);
-    failed.report.routerCoverage.at(-1).status = 'AUTHORIZATION_DENIAL_FAILED';
-    expectReject(failed, 'GAP_MISSING', 'denial not passed');
-    const absent = clone(run);
-    absent.report.checks = absent.report.checks.filter(c => c.id !== id);
-    absent.report.counts.PASS -= 1;
-    expectReject(absent, 'GAP_MISSING', 'neither');
+test('D2 matrix: normalized families must be explicit denials linked to their exact request; a boundary gap there rejects', () => {
+    let run = acceptedRun();
+    run.report.checks = run.report.checks.filter(c => c.id !== 'router:users-list.path-dot-segment:userA');
+    run.report.counts.PASS = run.report.checks.length;
+    run.report.routerCoverage = run.report.routerCoverage.filter(r => !(r.probeId === 'users-list.path-dot-segment' && r.actor === 'userA'));
+    run.report.routerCoverage.push({ probeId: 'users-list.path-dot-segment', actor: 'userA', status: 'BOUNDARY_REJECTED_ONLY', httpStatus: 404 });
+    run.report.gaps.push({ id: 'router:users-list.path-dot-segment:userA', reason: 'r', evidence: { kind: 'boundary-rejected', probeId: 'users-list.path-dot-segment', actor: 'userA', httpStatus: 404 } });
+    expectReject(run, 'GAP_UNEXPECTED', 'normalized family as boundary');
+    assert.ok(evaluate(run).reasons.some(r => r.startsWith('MANDATORY_MISSING: router:users-list.path-dot-segment:userA')));
+    run = acceptedRun();
+    run.report.routerCoverage.find(r => r.probeId === 'users-list.path-encoded-owner' && r.actor === 'selfRegistered').httpStatus = 404;
+    expectReject(run, 'RAW_PATH_DENIAL_LINKAGE', 'denial linkage');
+    assert.ok(mandatory.checks.some(c => c.id === 'router:users-list.path-encoded-slash:anonymous'));
+    assert.ok(!expectedGaps.gaps.some(g => g.id === 'router:users-list.path-encoded-slash:anonymous'));
+    assert.deepEqual(policy.boundaryRejectionStatuses, [404]);
 });
 
 test('REJECT: unexpected, missing and duplicate gaps', () => {
@@ -169,10 +175,6 @@ test('selfRegistered visible-tool exclusion requires exact equality with the rev
     const run = acceptedRun();
     run.expectedGaps = clone(expectedGaps);
     run.expectedGaps.gaps.push(entry);
-    run.mandatory = clone(mandatory);
-    run.mandatory.checks = run.mandatory.checks.filter(c => c.id !== 'agent.dpuAgent.discovery.tools.list.selfRegistered');
-    run.report.checks = run.report.checks.filter(c => c.id !== 'agent.dpuAgent.discovery.tools.list.selfRegistered');
-    run.report.counts.PASS = run.report.checks.length;
     const gap = { id: entry.id, reason: 'r', evidence: { ...entry.evidence, httpStatus: 200 } };
     run.report.gaps.push(gap);
     assert.equal(evaluate(run).decision, 'ACCEPT');
@@ -278,7 +280,7 @@ function boxRecord(overrides = {}) {
         ...(overrides.extraMounts || []),
     ];
     return {
-        Id: 'c'.repeat(64), Name: 'ploinky-box-testExplorerFresh-123456789abc', Image: 'd'.repeat(64),
+        Id: 'c'.repeat(64), Name: 'ploinky-box-testExplorerFresh-123456789abc', Image: 'd'.repeat(64), ImageDigest: `sha256:${'e'.repeat(64)}`,
         State: { Running: true, StartedAt: '2026-10-09T00:00:00.000Z', Status: 'running' },
         Config: { User: 'podman', Image: 'x', Env: [] },
         HostConfig: { Privileged: false, Init: true, Tmpfs: { '/tmp': 'rw,exec,nosuid,nodev,mode=1777,rprivate' } },
@@ -314,6 +316,10 @@ test('REJECT mount negatives: writable /opt/ploinky, writable local agentlib, ch
     assert.throws(() => confinement(boxRecord({ extraMounts: localMounts })), /BOX_MOUNT_EXTRA/);
     assert.throws(() => confinement(boxRecord({ extraMounts: localMounts.slice(1) }), localLib), /BOX_MOUNT_MISSING_OR_DUPLICATE/);
     assert.throws(() => confinement(boxRecord({ mounts: m => m.map(x => x.Destination === '/tmp' ? { ...x, Type: 'bind', Source: '/private/tmp' } : x) })), /BOX_TMPFS_MOUNT/);
+    const digest = boxRecord(); digest.ImageDigest = `sha256:${'0'.repeat(64)}`;
+    assert.throws(() => verifyBoxAgainstPins({ box: digest, captured: { ...captured, observedMounts: [] }, pins, policy }), /BOX_IMAGE_DIGEST/);
+    const noDigest = boxRecord(); delete noDigest.ImageDigest;
+    assert.throws(() => verifyBoxAgainstPins({ box: noDigest, captured: { ...captured, observedMounts: [] }, pins, policy }), /BOX_IMAGE_DIGEST/);
     const privileged = boxRecord(); privileged.HostConfig.Privileged = true;
     assert.throws(() => confinement(privileged), /BOX_PRIVILEGED/);
 });
@@ -330,7 +336,7 @@ test('gap file load rules reject wildcards, missing fields, changed boundaries, 
     has(mutateFirst(g => g.id === 'agent.webmeetStt.disabled', g => { g.id = 'agent.dpuAgent.disabled'; g.evidence = { kind: 'agent-disabled', repo: 'AchillesIDE', agent: 'dpuAgent' }; g.affectedObligations = ['agent-inventory/AchillesIDE/dpuAgent']; }), 'GAP_DISABLED_AGENT_REQUIRED');
     has(mutateFirst(g => g.id === 'agent.dpuAgent.discovery.prompts.list', g => { g.evidence.stage = 'initialize'; }), 'GAP_DISCOVERY_RULE');
     has(mutateFirst(g => g.id === 'agent.dpuAgent.discovery.prompts.list', g => { g.evidence.kind = 'positive-unavailable'; }), 'GAP_KIND_NOT_ACCEPTABLE');
-    has(mutateFirst(g => g.id === 'router:users-list.path-dot-segment:userA', g => { g.evidence.httpStatuses = [404, 503]; }), 'GAP_BOUNDARY_STATUS');
+    has(mutateFirst(g => g.id === 'router:users-list.path-duplicate-slash:userA', g => { g.evidence.httpStatuses = [404, 400]; }), 'GAP_BOUNDARY_STATUS');
     has(mutateFirst(g => g.id === 'agent.inference', g => { g.source = 'no citation'; }), 'GAP_SOURCE_UNCITED');
     for (const id of ['agent.tool.dpu_whoami', 'agent.username-admin.reserved', 'agent.dpuAgent.discovery.tools.list.pagination', 'router:terminal-backend', 'resource.dpu.idor']) {
         has(mutateFirst(g => g.id === 'agent.inference', g => { g.id = id; }), 'GAP_FORBIDDEN_ID');
@@ -344,7 +350,7 @@ test('mandatory checks and expected gaps partition the discovery space and never
     expectReject(run, 'MANDATORY_GAP_OVERLAP', 'overlap');
     const partition = acceptedRun();
     partition.expectedGaps = clone(expectedGaps);
-    partition.expectedGaps.gaps = partition.expectedGaps.gaps.filter(g => g.id !== 'agent.tasksAgent.discovery.resources.list');
+    partition.expectedGaps.gaps = partition.expectedGaps.gaps.filter(g => g.id !== 'agent.tasksAgent.discovery.prompts.list');
     expectReject(partition, 'DISCOVERY_PARTITION', 'neither mandatory nor excluded');
 });
 
@@ -355,7 +361,10 @@ test('committed mandatory-checks.json equals the enumerator and every inline tem
         const literal = template.includes('${') ? `\`${template}\`` : `'${template}'`;
         assert.ok(text.includes(`ctx.check(${literal}`), `${module} has no ctx.check(${literal})`);
     }
-    assert.ok(!mandatory.checks.some(c => /^router:(users-list\.path-|openai-agent-discovery\.)/.test(c.id)), 'boundary and negative-only router probes are not mandatory');
+    assert.ok(!mandatory.checks.some(c => /^router:openai-agent-discovery\./.test(c.id)), 'negative-only router probes are not mandatory');
+    const rawPath = mandatory.checks.filter(c => /^router:users-list\.path-/.test(c.id)).map(c => c.id.split(':').slice(1).join(':')).sort();
+    assert.deepEqual(rawPath, Object.entries(D2_DENIAL_MATRIX).flatMap(([family, actors]) => actors.map(a => `users-list.path-${family}:${a}`)).sort(), 'raw-path denials follow the D2 matrix exactly');
+    assert.equal(rawPath.length, 24);
     assert.ok(mandatory.checks.some(c => c.id === 'router:users-list.allow:admin') && mandatory.checks.some(c => c.id === 'router:users-list.deny:userA'));
 });
 
@@ -462,7 +471,7 @@ function fakeCtx(handler) {
     const report = { checks: [], gaps: [], requests: [] };
     return {
         report, principals: { admin: { id: 'a' }, userA: { id: 'ua' }, userB: { id: 'ub' } }, secrets: new Set(), prefix: 'authz-test',
-        clients: {}, sequence: [], cleanup: () => {},
+        clients: {}, sequence: [], cleanups: [], cleanup(fn) { this.cleanups.push(fn); },
         async guard() { this.sequence.push('guard'); return {}; },
         recordGap: (id, reason, evidence) => report.gaps.push({ id, evidence: sanitizeGapEvidence(evidence) }),
         async request(actor, options) { if (String(options.path).startsWith('/webchat/stream')) this.sequence.push('stream'); report.requests.push({ actor, ...options }); return handler(actor, options); },
@@ -530,20 +539,172 @@ test('U3 probe: a denied principal that revalidates to 304 fails; exact bytes an
     assert.equal(bad.report.checks.find(c => c.id === 'u3:protected-template-deny:anonymous:etag').status, 'FAIL');
 });
 
-test('U6 WebChat probe: no isolation credit without own streams; a marker crossing to the other user fails', async () => {
-    const closedCtx = fakeCtx(() => json(200, {}));
-    await runWebchatProbes(closedCtx, { timing: { waitMs: 20, settleMs: 1, removalMs: 50, pollMs: 5 }, openStream: async () => ({ status: 409, contentType: 'text/plain', events: () => [], waitFor: async () => null, close() {} }), inspectProcesses: async () => [] });
-    assert.ok(closedCtx.report.checks.every(c => c.status === 'FAIL' && c.id.startsWith('u6:webchat-own-stream:')));
-    assert.ok(closedCtx.report.gaps.length > 10 && closedCtx.report.gaps.every(g => g.evidence.kind === 'positive-unavailable'));
-    // Streams open, but A's marker is visible on B's stream: the isolation check must FAIL.
-    const shared = [];
-    const stream = () => ({ status: 200, contentType: 'text/event-stream', events: () => [...shared], waitFor: async pred => shared.find(pred) || null, close() {} });
-    const ctx = fakeCtx((actor, { body }) => { if (body?.text) { shared.push({ event: 'user-message', data: JSON.stringify({ text: body.text }) }, { event: 'output', data: `unknown command ${body.text.slice(1)}` }); } return { status: 204, text: '', headers: {} }; });
-    await runWebchatProbes(ctx, { timing: { waitMs: 20, settleMs: 1, removalMs: 50, pollMs: 5 }, openStream: async () => { ctx.sequence.push('stream'); return stream(); }, inspectProcesses: async () => [{ pid: 1, args: '', environ: 'X=1' }, { pid: 2, args: '', environ: 'X=1' }] });
-    assert.equal(ctx.report.checks.find(c => c.id === 'u6:webchat-marker-isolation:userA-to-userB').status, 'FAIL');
-    // Every GET /stream (owned opens and the denial probes) is immediately preceded by the ownership guard.
-    const streams = ctx.sequence.map((e, i) => [e, ctx.sequence[i - 1]]).filter(([e]) => e === 'stream');
-    assert.ok(streams.length >= 9, `expected owned and denial stream requests, saw ${streams.length}`);
-    assert.ok(streams.every(([, previous]) => previous === 'guard'), 'a GET /stream was not guarded');
-    assert.equal(ctx.report.checks.find(c => c.id === 'u6:webchat-own-marker:userA').status, 'PASS');
+test('corrected discovery policy: resources/list and multimedia tools/list are mandatory positives, a -32601 for them rejects', () => {
+    for (const { agent } of expectedRuntimes.enabled) for (const method of ['tools.list', 'resources.list']) {
+        assert.ok(mandatory.checks.some(c => c.id === `agent.${agent}.discovery.${method}.positive`), `${agent} ${method} positive is mandatory`);
+        assert.ok(!expectedGaps.gaps.some(g => g.id === `agent.${agent}.discovery.${method}`), `${agent} ${method} is not excluded`);
+    }
+    let run = acceptedRun();
+    run.report.checks = run.report.checks.filter(c => !c.id.startsWith('agent.explorer.discovery.resources.list'));
+    run.report.counts.PASS = run.report.checks.length;
+    run.report.gaps.push({ id: 'agent.explorer.discovery.resources.list', reason: 'r', evidence: { kind: 'rpc-method-unsupported', actor: 'admin', endpoint: '/explorer/mcp', requestedMethod: 'resources/list', stage: 'resources/list', initialized: true, httpStatus: 200, rpcCode: -32601 } });
+    expectReject(run, 'GAP_UNEXPECTED', 'removed resources/list exclusion');
+    assert.ok(evaluate(run).reasons.some(r => r.startsWith('MANDATORY_MISSING: agent.explorer.discovery.resources.list.positive')));
+    run = acceptedRun();
+    run.report.checks.find(c => c.id === 'agent.multimedia.discovery.tools.list.positive').status = 'FAIL';
+    run.report.counts = { PASS: run.report.counts.PASS - 1, FAIL: 1, ERROR: 0 }; run.report.verdict = 'FAIL'; run.exitCode = 1;
+    expectReject(run, 'MANDATORY_NOT_PASS', 'multimedia tools/list positive must pass');
+    // Router-default exclusions cite the Router, not an absent AgentServer handler.
+    for (const g of expectedGaps.gaps.filter(g => g.evidence.kind === 'rpc-method-unsupported')) {
+        assert.ok(/mcp-proxy\/index\.js:.*:782-783 \(default branch/.test(g.source) && !/AgentServer\.mjs/.test(g.source), g.id);
+        assert.ok(['resources/templates/list', 'prompts/list'].includes(g.evidence.requestedMethod), g.id);
+    }
+});
+
+test('GET /<agent>/mcp is typed unsupported-transport evidence; 200, 404 or a different contract rejects', () => {
+    assert.ok(!mandatory.checks.some(c => /\.sse\.(positive|cross-session)/.test(c.id)), 'impossible SSE positives are gone');
+    const id = 'agent.dpuAgent.mcp-get-transport';
+    for (const [label, evidence] of [
+        ['stream 200', { kind: 'positive-unavailable', actor: 'admin', endpoint: '/dpuAgent/mcp', httpStatus: 200 }],
+        ['route 404', { kind: 'positive-unavailable', actor: 'admin', endpoint: '/dpuAgent/mcp', httpStatus: 404, errorCode: 'agent_not_found' }],
+        ['other allow', { kind: 'unsupported-transport', actor: 'admin', endpoint: '/dpuAgent/mcp', httpStatus: 405, errorCode: 'event_stream_not_supported', allow: 'POST' }],
+        ['other error', { kind: 'unsupported-transport', actor: 'admin', endpoint: '/dpuAgent/mcp', httpStatus: 405, errorCode: 'method_not_allowed', allow: 'POST,DELETE' }],
+    ]) {
+        const run = acceptedRun();
+        run.report.gaps.find(g => g.id === id).evidence = sanitizeGapEvidence(evidence);
+        expectReject(run, 'GAP_EVIDENCE_MISMATCH', label);
+    }
+});
+
+test('the comparator recomputes the mandatory list and the runtime graph instead of trusting committed files', () => {
+    // A mutation dropping U6 marker checks and the offline interaction test must not ACCEPT.
+    const run = acceptedRun();
+    run.mandatory = clone(mandatory);
+    run.mandatory.checks = run.mandatory.checks.filter(c => !/^u6:webchat-own-marker|webchatInteraction/.test(c.id + (c.file || '')));
+    expectReject(run, 'MANDATORY_FILE_DRIFT', 'dropped mandatory entries');
+    const noGraph = acceptedRun(); delete noGraph.derivedRuntimes;
+    expectReject(noGraph, 'RUNTIME_GRAPH_NOT_VERIFIED', 'graph not re-derived');
+    const drift = acceptedRun(); drift.derivedRuntimes.enabled.pop();
+    expectReject(drift, 'RUNTIME_GRAPH_DRIFT', 'graph drift');
+    const limitation = acceptedRun(); limitation.report.liveLimitations = [];
+    expectReject(limitation, 'LIVE_LIMITATION_RECORD', 'interaction limitation not reported');
+});
+
+const DPU_REPLY_DATA = JSON.stringify(DPU_UNSUPPORTED_REPLY);
+/** Fake Router + pinned DPU with the real protocol shapes: input emits a user-message plus the generic reply; control emits the reply only. */
+function webchatWorld({ copiedInputStatus = 204, copiedControlStatus = 204, reply = DPU_REPLY_DATA, forgedArgs = '', emptyProcesses = false, keepProcesses = false } = {}) {
+    const runtimes = new Map();
+    let next = 100;
+    const handles = new Map();
+    const ids = { userA: 'principal-A', userB: 'principal-B' };
+    const valueOf = p => new URLSearchParams(String(p).split('?')[1] || '').get('authz-probe');
+    const deliver = (actor, value, events) => { const list = (handles.get(`${actor}|${value}`) || []).filter(h => !h.closed); for (const e of events) list.at(-1)?.push(e); };
+    const ctx = fakeCtx((actor, { path: p, body }) => {
+        const route = p.split('?')[0];
+        if (['anonymous', 'selfRegistered'].includes(actor)) return json(actor === 'anonymous' ? 401 : 403, { ok: false, error: 'authentication required' });
+        const value = valueOf(p);
+        if (route === '/webchat/input') {
+            if (body.text.includes('B-copied') && copiedInputStatus !== 204) return { status: copiedInputStatus, text: 'Service Unavailable', headers: {} };
+            deliver(actor, value, [{ event: 'user-message', data: JSON.stringify({ sourceTabId: 't', message: { role: 'user', text: body.text } }) }, { event: 'message', data: reply }]);
+            return { status: 204, text: '', headers: {} };
+        }
+        if (route === '/webchat/control') {
+            if (body.includes('B-copied') && copiedControlStatus !== 204) return { status: copiedControlStatus, text: '', headers: {} };
+            deliver(actor, value, [{ event: 'message', data: reply }]);
+            return { status: 204, text: '', headers: {} };
+        }
+        return json(404, { error: 'not_found' });
+    });
+    Object.assign(ctx.principals, { userA: { id: ids.userA }, userB: { id: ids.userB } });
+    ctx.secrets.add('browser-session-cookie-value');
+    const openStream = async (_ctx, actor, p) => {
+        ctx.sequence.push('stream');
+        const value = valueOf(p);
+        if (value.endsWith(`slot-3`)) return { status: 429, contentType: 'text/plain', events: () => [], close() {} };
+        const key = `${actor}|${value}`;
+        if (!runtimes.has(key)) runtimes.set(key, { pid: next++, start: String(5000 + next), actor, value });
+        const events = [];
+        const handle = { status: 200, contentType: 'text/event-stream', events: () => [...events], push: e => events.push(e), closed: false,
+            close() { handle.closed = true; } };
+        handles.set(key, [...(handles.get(key) || []), handle]);
+        return handle;
+    };
+    // Like the Router's delayed disconnect cleanup: a runtime whose streams are all
+    // closed survives a reconnect and disappears by the time removal is polled.
+    const purge = () => { if (keepProcesses) return; for (const [key] of runtimes) if ((handles.get(key) || []).every(h => h.closed)) runtimes.delete(key); };
+    const inspectProcesses = async (value, { prefix = false } = {}) => { if (prefix) purge(); return emptyProcesses ? [] : [...runtimes.values()]
+        .filter(r => prefix ? r.value.startsWith(value) : r.value === value)
+        .map(r => ({ pid: r.pid, start: r.start, ssoUserId: ids[r.actor], args: `node /code/src/index.mjs --authz-probe=${r.value} --sso-user=${r.actor} --sso-user-id=${ids[r.actor]} --sso-roles=user${r.value.endsWith('-forged') ? forgedArgs : ''}`, environ: 'NODE_ENV=production' })); };
+    return { ctx, openStream, inspectProcesses };
+}
+const fast = { waitMs: 30, settleMs: 1, removalMs: 30, pollMs: 5 };
+const status = (ctx, id) => ctx.report.checks.find(c => c.id === id)?.status;
+
+test('U6 WebChat probe passes on the real DPU acknowledgement shape, guards every stream and records the interaction limitation', async () => {
+    const world = webchatWorld();
+    await runWebchatProbes(world.ctx, { ...world, timing: fast });
+    const u6 = world.ctx.report.checks.filter(c => c.id.startsWith('u6:'));
+    assert.deepEqual(u6.filter(c => c.status !== 'PASS'), [], JSON.stringify(u6.filter(c => c.status !== 'PASS')));
+    assert.deepEqual(u6.map(c => c.id).sort(), mandatory.checks.filter(c => c.id.startsWith('u6:')).map(c => c.id).sort());
+    assert.deepEqual(world.ctx.report.gaps, []);
+    assert.deepEqual(world.ctx.report.liveLimitations, [{ ...LIVE_INTERACTION_LIMITATION }]);
+    assert.ok(!world.ctx.report.checks.some(c => /interaction/.test(c.id)), 'no live interaction credit');
+    const streams = world.ctx.sequence.map((e, i) => [e, world.ctx.sequence[i - 1]]).filter(([e]) => e === 'stream');
+    assert.ok(streams.length >= 9 && streams.every(([, previous]) => previous === 'guard'), 'a GET /stream was not guarded');
+    for (const fn of world.ctx.cleanups) await fn();
+});
+
+test('REJECT (real shapes): copied-ID input 503 and copied-ID control 409 are never isolation evidence', async () => {
+    const world = webchatWorld({ copiedInputStatus: 503, copiedControlStatus: 409 });
+    await runWebchatProbes(world.ctx, { ...world, timing: fast });
+    assert.equal(status(world.ctx, 'u6:webchat-copied-ids-input:userB'), 'FAIL');
+    assert.equal(status(world.ctx, 'u6:webchat-copied-ids-control:userB'), 'FAIL');
+    assert.equal(status(world.ctx, 'u6:webchat-own-marker:userB'), 'PASS', 'the own positive still works');
+    const run = acceptedRun();
+    run.report.checks = run.report.checks.filter(c => !c.id.startsWith('u6:')).concat(world.ctx.report.checks.filter(c => c.id.startsWith('u6:')));
+    run.report.counts = { PASS: run.report.checks.filter(c => c.status === 'PASS').length, FAIL: run.report.checks.filter(c => c.status === 'FAIL').length, ERROR: run.report.checks.filter(c => c.status === 'ERROR').length };
+    run.report.verdict = 'FAIL'; run.exitCode = 1;
+    expectReject(run, 'MANDATORY_NOT_PASS', 'copied-ID failures');
+});
+
+test('U6 negative controls: an invented marker echo, a forged B identity, empty or unattributed process lists and leftover runtimes fail', async () => {
+    const echo = webchatWorld({ reply: JSON.stringify('unknown command authz-A-x\n') });
+    await runWebchatProbes(echo.ctx, { ...echo, timing: fast });
+    assert.equal(status(echo.ctx, 'u6:webchat-own-marker:userA'), 'FAIL', 'only the real DPU acknowledgement counts');
+    const forged = webchatWorld({ forgedArgs: ' --sso-user-id=principal-B' });
+    await runWebchatProbes(forged.ctx, { ...forged, timing: fast });
+    assert.equal(status(forged.ctx, 'u6:webchat-reserved-keys:userA'), 'FAIL');
+    const legit = webchatWorld();
+    await runWebchatProbes(legit.ctx, { ...legit, timing: fast });
+    assert.equal(status(legit.ctx, 'u6:webchat-reserved-keys:userA'), 'PASS', "A's router-issued --sso-* identity is legitimate");
+    const empty = webchatWorld({ emptyProcesses: true });
+    await runWebchatProbes(empty.ctx, { ...empty, timing: fast });
+    assert.equal(status(empty.ctx, 'u6:webchat-distinct-processes'), 'FAIL');
+    assert.equal(status(empty.ctx, 'u6:webchat-credential-confinement'), 'FAIL', 'an empty process list proves nothing');
+    const leftover = webchatWorld({ keepProcesses: true });
+    await runWebchatProbes(leftover.ctx, { ...leftover, timing: fast });
+    assert.equal(status(leftover.ctx, 'u6:webchat-runtimes-removed'), 'FAIL');
+    await assert.rejects(leftover.ctx.cleanups[0](), /remained after cleanup/, 'cleanup verifies removal on every path');
+    const closed = webchatWorld();
+    await runWebchatProbes(closed.ctx, { openStream: async () => ({ status: 409, contentType: 'text/plain', events: () => [], close() {} }), inspectProcesses: closed.inspectProcesses, timing: fast });
+    assert.ok(closed.ctx.report.gaps.length > 10 && closed.ctx.report.gaps.every(g => g.evidence.kind === 'positive-unavailable'));
+});
+
+test('DPU process inspector selects only the pinned DPU entry inside the DPU container, with start identity and principal', async () => {
+    const listing = [
+        `101\t555\tsh\x1f-c\x1fnode /code/src/index.mjs --authz-probe=v --sso-user-id=principal-A`,
+        `102\t556\tpodman\x1fexec\x1f-i\x1fdpu\x1fnode\x1f/code/src/index.mjs\x1f--authz-probe=v`,
+        `103\t557\tnode\x1f/code/src/index.mjs\x1f--authz-probe=v\x1f--sso-user-id=principal-A`,
+        `104\t558\tnode\x1f/code/src/index.mjs\x1f--authz-probe=v2\x1f--sso-user-id=principal-B`,
+    ].join('\n') + '\n';
+    const calls = [];
+    const run = args => { calls.push(args); return args.includes('sh') ? listing : 'HOME=/root\0'; };
+    const inspect = dpuProcessInspector({ boxId: 'c'.repeat(64), container: 'ploinky_AchillesIDE_dpuAgent_testExplorerFresh_d8f88a10', run });
+    const found = await inspect('v');
+    assert.deepEqual(found.map(p => [p.pid, p.start, p.ssoUserId]), [[103, '557', 'principal-A']]);
+    assert.deepEqual((await inspect('v', { prefix: true })).map(p => p.pid), [103, 104]);
+    assert.ok(calls.every(a => a[0] === 'exec' && a[2] === 'podman' && a[3] === 'exec' && a[4] === 'ploinky_AchillesIDE_dpuAgent_testExplorerFresh_d8f88a10'), 'only inside the DPU container');
+    const unreadable = dpuProcessInspector({ boxId: 'c'.repeat(64), container: 'ploinky_AchillesIDE_dpuAgent_x', run: args => args.includes('sh') ? listing : '' });
+    await assert.rejects(unreadable('v'), /environment must be readable/);
+    assert.throws(() => dpuProcessInspector({ boxId: 'c'.repeat(64), container: 'ploinky_AchillesIDE_userPersistoAgent_x', run }), /DPU container/);
 });

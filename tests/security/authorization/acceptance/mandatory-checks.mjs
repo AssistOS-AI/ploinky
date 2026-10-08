@@ -26,8 +26,27 @@ const actorsFor = role => role === 'user' ? ['userA', 'userB'] : [role];
 const nonAdmin = ['anonymous', 'selfRegistered', 'userA', 'userB'];
 
 /** Router probes excluded from the mandatory set, with the plan's reason. */
+/**
+ * D2 traced matrix (r2b_review_codex.md): raw users-list path family -> actors
+ * whose explicit 401/403 denial is mandatory. Dot/parent/encoded-parent
+ * normalize to user administration and encoded-owner is decoded by it, so all
+ * four denied actors get 401/403; the four families that miss user-admin
+ * dispatch are denied by normal authentication only for anonymous and
+ * selfRegistered (authorized ordinary users reach the reviewed 404 gap).
+ */
+export const D2_DENIAL_MATRIX = Object.freeze({
+    'dot-segment': ['anonymous', 'selfRegistered', 'userA', 'userB'],
+    'parent-segment': ['anonymous', 'selfRegistered', 'userA', 'userB'],
+    'encoded-parent': ['anonymous', 'selfRegistered', 'userA', 'userB'],
+    'encoded-owner': ['anonymous', 'selfRegistered', 'userA', 'userB'],
+    'duplicate-slash': ['anonymous', 'selfRegistered'],
+    'encoded-resource': ['anonymous', 'selfRegistered'],
+    'encoded-slash': ['anonymous', 'selfRegistered'],
+    'double-encoded-slash': ['anonymous', 'selfRegistered'],
+});
+
 export const NON_MANDATORY_ROUTER = Object.freeze([
-    { pattern: /^users-list\.path-/, reason: 'Raw-path normalization boundary evidence only (plan rev4 F2); canonical users-list allow/deny stay mandatory' },
+    { pattern: /^users-list\.path-/, reason: 'Raw-path probes are mandatory only through the D2 denial matrix; their boundary outcomes are typed gaps' },
     { pattern: /^openai-agent-discovery\./, reason: 'Negative-only: no positive signed-agent control (plan rev4 edit 5)' },
 ]);
 
@@ -90,7 +109,13 @@ export const OFFLINE = Object.freeze([
         'runtime scope principal: a delayed close of an evicted runtime never unregisters its live replacement',
         'runtime scope principal: late task output from an evicted runtime never reaches its replacement',
     ] },
-    { repo: 'ploinky', file: 'tests/unit/webchatInteraction.test.mjs', boundary: 'U6', tests: [] },
+    { repo: 'ploinky', file: 'tests/unit/webchatInteraction.test.mjs', boundary: 'U6', tests: [
+        'authenticated interaction responses use the control channel and reject replay',
+    ] },
+    { repo: 'ploinky', file: 'tests/security/authorization/webchat-interaction-isolation.test.mjs', boundary: 'U6', tests: [
+        'principal interaction: the owner resolves its own pending interaction with interactionId',
+        'principal interaction: another principal with copied tab, session and interaction IDs cannot resolve, inject or cancel',
+    ] },
     { repo: 'ploinky', file: 'tests/unit/webchatSlashCommandsSecurity.test.mjs', boundary: 'U6', tests: [] },
     { repo: 'AchillesIDE', file: 'dpuAgent/tests/webchat-sso-authorization.test.mjs', boundary: 'U6', tests: [] },
     { repo: 'ploinky', file: 'tests/unit/marketplaceRepositoryPrespawnRetry.test.mjs', boundary: 'U7', tests: [] },
@@ -132,6 +157,11 @@ export function enumerateMandatoryChecks({ expectedRuntimes, expectedGaps }) {
         }
     }
 
+    for (const [family, actors] of Object.entries(D2_DENIAL_MATRIX)) {
+        assert.ok(routerProbes.some(p => p.id === `users-list.path-${family}`), `unknown raw-path family ${family}`);
+        for (const actor of actors) add(`router:users-list.path-${family}:${actor}`, { boundary: 'router', source: 'router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)', positiveControlAnyOf: ['router:users-list.allow:admin'] });
+    }
+
     // Agent HTTP and MCP read probes (agent-probes.mjs agentProbes/agentReadTools).
     add('agent.registry.reconciliation', { boundary: 'agents', source: 'tests/security/authorization/agent-probes.mjs runAgentProbes' });
     for (const probe of agentProbes) {
@@ -151,8 +181,6 @@ export function enumerateMandatoryChecks({ expectedRuntimes, expectedGaps }) {
             add(`${id}.positive`, { boundary: 'agents', source: 'agent-probes.mjs discoverAgentMcp' });
             for (const actor of nonAdmin) add(`${id}.${actor}`, { boundary: 'agents', source: 'agent-probes.mjs discoverAgentMcp', positiveControlAnyOf: [`${id}.positive`] });
         }
-        add(`agent.${agent}.sse.positive`, { boundary: 'agents', source: 'agent-probes.mjs discoverAgentMcp (SSE)' });
-        for (const actor of ['anonymous', 'selfRegistered', 'userB']) add(`agent.${agent}.sse.cross-session.${actor}`, { boundary: 'agents', source: 'agent-probes.mjs discoverAgentMcp (SSE)', positiveControlAnyOf: [`agent.${agent}.sse.positive`] });
     }
     add('agent.username-admin.profile-positive', { boundary: 'agents', source: 'agent-probes.mjs usernamePrivilegeProbe' });
     for (const id of ['persisted-role', 'monitor-denial', 'webmeet-role']) add(`agent.username-admin.${id}`, { boundary: 'agents', source: 'agent-probes.mjs usernamePrivilegeProbe', positiveControlAnyOf: ['agent.username-admin.profile-positive'] });

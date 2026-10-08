@@ -1,17 +1,28 @@
 /**
- * Bounded live U6 WebChat controls (plan rev4 "WebChat", r2_decisions_codex.md Q3).
+ * Bounded live U6 WebChat controls (plan rev4 "WebChat", r2_decisions_codex.md
+ * Q3, r2b_review_codex.md).
  *
  * userA and userB open the per-user DPU WebChat with identical launch query and
- * tab values. Each user's own stream and marker are the positive controls; B
- * may legitimately reach B's own runtime with A's copied identifiers, but no
- * marker, input or control may cross to A. A 409 is recorded but never counts
- * as isolation evidence. Markers are slash commands, so no model, provider or
- * costly tool runs. Process identities and credential confinement are compared
- * privately and reported as booleans only.
+ * tab values. Each user's own stream, unique Router user-message marker and a
+ * fresh real DPU acknowledgement are the positive controls. The pinned DPU
+ * answers every visible unsupported slash command with the generic line
+ * DPU_UNSUPPORTED_REPLY (AchillesIDE dpuAgent/src/index.mjs:250-263) and never
+ * echoes the marker, so an acknowledgement is attributed by stream and by
+ * freshness (a new reply on the acting stream after the request, none on the
+ * other stream). B may reach B's own runtime with A's copied identifiers, but
+ * then B's operation must be acknowledged on B's stream and nothing may change
+ * on A. Unavailable (503), conflict (409), malformed (400) and missing-resource
+ * outcomes never supply isolation evidence. No pending interaction can be
+ * created without inference in the pinned DPU flow, so live interaction
+ * isolation is recorded as an explicit limitation and proven by the
+ * actual-module offline fixture (webchat-interaction-isolation.test.mjs).
+ * Process identity is the DPU node process inside the pinned DPU container,
+ * attributed to a principal by its router-issued --sso-user-id and identified
+ * by pid plus kernel start time; raw argv/environment stay private.
  *
  * Collaborators are injectable so the decision logic is unit-tested offline:
- *   openStream(ctx, actor, path) -> { status, contentType, events(), waitFor(pred, ms), close() }
- *   inspectProcesses(launchValue) -> [{ pid, args, environ }]   (raw values stay private)
+ *   openStream(ctx, actor, path) -> { status, contentType, events(), close() }
+ *   inspectProcesses(launchValue, { prefix }) -> [{ pid, start, ssoUserId, args, environ }]
  */
 import assert from 'node:assert/strict';
 import http from 'node:http';
@@ -24,6 +35,13 @@ export const webchatProbe = Object.freeze({
     cap: 3,
     waitMs: 15000,
     maxEventBytes: 256 * 1024,
+    dpuEntry: Object.freeze(['node', '/code/src/index.mjs']), // AchillesIDE dpuAgent/manifest.json:25 "cli"
+});
+export const DPU_UNSUPPORTED_REPLY = 'This command is not supported by DPU Research.\n';
+export const LIVE_INTERACTION_LIMITATION = Object.freeze({
+    id: 'u6:webchat-interaction',
+    reason: 'The pinned DPU WebChat creates pending interactions only during planning/tool approval, which requires inference; no harmless live pending interaction exists. Owner-positive and cross-user interaction isolation are mandatory offline evidence instead.',
+    offlineEvidence: 'tests/security/authorization/webchat-interaction-isolation.test.mjs',
 });
 
 const source = 'tests/security/authorization/webchat-probes.mjs runWebchatProbes';
@@ -32,21 +50,20 @@ const def = (id, positiveControlAnyOf = null) => ({ id, kind: 'live', boundary: 
 export function webchatCheckDefinitions() {
     const own = ['userA', 'userB'].map(a => `u6:webchat-own-stream:${a}`);
     const marker = ['userA', 'userB'].map(a => `u6:webchat-own-marker:${a}`);
+    const control = ['userA', 'userB'].map(a => `u6:webchat-own-control:${a}`);
     return [
         ...own.map(id => def(id)),
         def('u6:webchat-distinct-processes', own),
         ...marker.map(id => def(id, own)),
         def('u6:webchat-marker-isolation:userA-to-userB', marker),
         def('u6:webchat-marker-isolation:userB-to-userA', marker),
-        def('u6:webchat-copied-ids-input:userB', marker),
-        def('u6:webchat-copied-ids-control:userB', marker),
-        def('u6:webchat-copied-ids-interaction:userB', marker),
-        def('u6:webchat-own-control:userA', own),
-        def('u6:webchat-own-control:userB', own),
+        ...control.map(id => def(id, own)),
+        def('u6:webchat-copied-ids-input:userB', ['u6:webchat-own-marker:userB']),
+        def('u6:webchat-copied-ids-control:userB', ['u6:webchat-own-control:userB']),
         def('u6:webchat-reconnect-same-process:userA', own),
         def('u6:webchat-reserved-keys:userA', own),
-        def('u6:webchat-credential-confinement:userA', own),
-        ...['anonymous', 'selfRegistered'].flatMap(actor => ['stream', 'input'].map(op => def(`u6:webchat-deny:${actor}:${op}`, ['u6:webchat-own-stream:userA']))),
+        def('u6:webchat-credential-confinement', own),
+        ...['anonymous', 'selfRegistered'].flatMap(actor => ['stream', 'input'].map(op => def(`u6:webchat-deny:${actor}:${op}`, ['u6:webchat-own-marker:userA']))),
         def('u6:webchat-cap:userA', own),
         def('u6:webchat-idle-replacement:userA', ['u6:webchat-cap:userA']),
         def('u6:webchat-runtimes-removed', own),
@@ -106,27 +123,52 @@ export async function openEventStream(ctx, actor, requestPath, { maxBytes = webc
     });
 }
 
-const containsMarker = marker => event => String(event.data).includes(marker);
+const parseData = (data) => { try { return JSON.parse(data); } catch { return undefined; } };
+export const isDpuAck = event => event.event === 'message' && parseData(event.data) === DPU_UNSUPPORTED_REPLY;
+export const isUserMessage = marker => event => event.event === 'user-message' && parseData(event.data)?.message?.text === marker;
+const count = (handle, predicate) => handle.events().filter(predicate).length;
+
+async function waitForCount(handle, predicate, minimum, ms) {
+    const deadline = Date.now() + ms;
+    while (count(handle, predicate) < minimum) {
+        if (Date.now() >= deadline) return false;
+        await new Promise(r => setTimeout(r, Math.min(50, ms)));
+    }
+    return true;
+}
+
+/** Split a NUL-free argv dump (unit-separator joined) into tokens. */
+function argvOf(dump) { return String(dump).split('\x1f').filter(Boolean); }
 
 /**
- * In-Box process inspector: pids whose argv carries the launch value, with
- * argv and environment read privately. An unreadable environment is an error,
- * never an empty (trivially clean) result.
+ * In-Box inspector for the pinned DPU runtime: lists processes inside the DPU
+ * agent container only, selects exactly the DPU entry (argv[0] node,
+ * argv[1] /code/src/index.mjs) so shell and podman-exec wrappers never count,
+ * matches the launch value on the --authz-probe flag exactly (or by prefix for
+ * removal), and returns pid, kernel start time (/proc/<pid>/stat field 22) and
+ * the router-issued --sso-user-id. An unreadable environment is an error.
  */
-export function boxProcessInspector(boxId, { run = (args) => execFileSync('podman', args, { encoding: 'utf8', timeout: 30000, maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }) } = {}) {
-    assert.match(String(boxId), /^[a-f0-9]{64}$/);
-    return async (value) => {
-        const listing = run(['exec', boxId, 'ps', '-eo', 'pid=,args=']);
-        const matches = listing.split('\n').map(line => /^\s*(\d+)\s+(.*)$/.exec(line)).filter(Boolean)
-            .filter(([, , args]) => args.includes(`${webchatProbe.launchKey}=${value}`) || args.includes(`${webchatProbe.launchKey}=${encodeURIComponent(value)}`))
-            .filter(([, , args]) => !/\bps -eo\b/.test(args));
-        return matches.map(([, pid, args]) => {
-            const environ = run(['exec', boxId, 'cat', `/proc/${pid}/environ`]);
-            assert.ok(environ.length > 0, 'Process environment must be readable for confinement checks');
-            return { pid: Number(pid), args, environ };
-        });
+export function dpuProcessInspector({ boxId, container, run = (args) => execFileSync('podman', args, { encoding: 'utf8', timeout: 30000, maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }) }) {
+    assert.match(String(boxId), /^[a-f0-9]{64}$/, 'Pinned Box id required');
+    assert.match(String(container), /^ploinky_AchillesIDE_dpuAgent_[A-Za-z0-9_.-]+$/, 'Captured DPU container name required');
+    const inContainer = (...cmd) => run(['exec', boxId, 'podman', 'exec', container, ...cmd]);
+    const listing = 'for d in /proc/[0-9]*; do [ -r "$d/cmdline" ] || continue; printf "%s\\t%s\\t" "${d#/proc/}" "$(cut -d" " -f22 "$d/stat" 2>/dev/null)"; tr "\\000" "\\037" < "$d/cmdline"; printf "\\n"; done';
+    return async (value, { prefix = false } = {}) => {
+        const rows = inContainer('sh', '-c', listing).split('\n').map(line => line.split('\t')).filter(parts => parts.length === 3);
+        const flag = `--${webchatProbe.launchKey}=`;
+        return rows.map(([pid, start, dump]) => ({ pid: Number(pid), start: String(start).trim(), argv: argvOf(dump) }))
+            .filter(p => Number.isInteger(p.pid) && p.start && p.argv[0]?.split('/').pop() === webchatProbe.dpuEntry[0] && p.argv[1] === webchatProbe.dpuEntry[1])
+            .filter(p => p.argv.some(a => a.startsWith(flag) && (prefix ? a.slice(flag.length).startsWith(value) : a.slice(flag.length) === value)))
+            .map(p => {
+                const environ = inContainer('cat', `/proc/${p.pid}/environ`);
+                assert.ok(environ.length > 0, 'Process environment must be readable for confinement checks');
+                const ids = p.argv.filter(a => a.startsWith('--sso-user-id=')).map(a => a.slice('--sso-user-id='.length));
+                return { pid: p.pid, start: p.start, ssoUserId: ids.length === 1 ? ids[0] : null, args: p.argv.join(' '), environ };
+            });
     };
 }
+
+const identity = p => `${p.pid}@${p.start}`;
 
 export async function runWebchatProbes(ctx, { openStream = openEventStream, inspectProcesses = null, nonce = ctx.prefix, timing = {} } = {}) {
     const { agent, launchKey, cap } = webchatProbe;
@@ -135,9 +177,40 @@ export async function runWebchatProbes(ctx, { openStream = openEventStream, insp
     const tabId = `${nonce}-tab`;
     const query = (value = shared, extra = '') => `agent=${agent}&${launchKey}=${encodeURIComponent(value)}&tabId=${encodeURIComponent(tabId)}${extra}`;
     const streams = [];
-    const opened = new Set();
-    // Armed before any runtime exists: close every stream this probe opened.
-    ctx.cleanup(async () => { for (const s of streams) s.close(); });
+    const observe = (entry) => { (ctx.report.webchatObservations ||= []).push(entry); };
+    (ctx.report.liveLimitations ||= []).push({ ...LIVE_INTERACTION_LIMITATION });
+    const processes = async (value, options) => {
+        if (!inspectProcesses) throw new Error('Process inspection is unavailable; identity and confinement cannot be asserted');
+        return await inspectProcesses(value, options);
+    };
+    const principalOf = p => Object.entries(ctx.principals).find(([, principal]) => principal?.id && principal.id === p.ssoUserId)?.[0] || null;
+    const owned = async (value = shared) => {
+        const list = await processes(value);
+        const byPrincipal = {};
+        for (const p of list) {
+            const who = principalOf(p);
+            assert.ok(who === 'userA' || who === 'userB', 'A matching DPU process is not attributed to a test principal');
+            assert.ok(!byPrincipal[who], `More than one DPU process for ${who}`);
+            byPrincipal[who] = p;
+        }
+        return byPrincipal;
+    };
+    const waitRemoved = async () => {
+        const deadline = Date.now() + removalMs;
+        let remaining;
+        do {
+            remaining = (await processes(nonce, { prefix: true })).length;
+            if (!remaining) return 0;
+            await new Promise(r => setTimeout(r, pollMs));
+        } while (Date.now() < deadline);
+        return remaining;
+    };
+    // Armed before any runtime exists, so failure paths are verified too:
+    // close every owned stream, then require every test-owned runtime gone.
+    ctx.cleanup(async () => {
+        for (const s of streams) s.close();
+        assert.equal(await waitRemoved(), 0, 'Test-owned WebChat runtimes remained after cleanup');
+    });
     // Every GET /stream creates runtime state, so each one passes the ownership guard first.
     const open = async (actor, value, extra) => {
         await ctx.guard();
@@ -145,12 +218,8 @@ export async function runWebchatProbes(ctx, { openStream = openEventStream, insp
         streams.push(handle);
         return handle;
     };
-    const post = (actor, route, body, value = shared, extra = '') => ctx.request(actor, { method: 'POST', path: `/webchat/${route}?${query(value, extra)}`, body, headers: { 'content-type': 'application/json' } });
-    const observe = (entry) => { (ctx.report.webchatObservations ||= []).push(entry); };
-    const processes = async (value) => {
-        if (!inspectProcesses) throw new Error('Process inspection is unavailable; identity and confinement cannot be asserted');
-        return await inspectProcesses(value);
-    };
+    const envelope = text => ({ text, presentation: { visible: true } });
+    const post = (actor, route, body, value = shared) => ctx.request(actor, { method: 'POST', path: `/webchat/${route}?${query(value)}`, body, headers: { 'content-type': 'application/json' } });
 
     const own = {};
     for (const actor of ['userA', 'userB']) await ctx.check(`u6:webchat-own-stream:${actor}`, async () => {
@@ -158,125 +227,123 @@ export async function runWebchatProbes(ctx, { openStream = openEventStream, insp
         assert.equal(handle.status, 200, 'Own WebChat stream must open');
         assert.ok(handle.contentType.includes('text/event-stream'), 'Own WebChat stream must be an event stream');
         own[actor] = handle;
-        opened.add(actor);
     });
-    const ownReady = opened.has('userA') && opened.has('userB');
-    const gapAll = (ids, reason) => { for (const id of ids) ctx.recordGap(id, reason, { kind: 'positive-unavailable' }); };
-    if (!ownReady) {
-        gapAll(webchatCheckDefinitions().map(d => d.id).filter(id => !id.startsWith('u6:webchat-own-stream:')), 'Own WebChat streams did not open; isolation cannot be credited.');
+    if (!own.userA || !own.userB) {
+        for (const id of webchatCheckDefinitions().map(d => d.id).filter(id => !id.startsWith('u6:webchat-own-stream:'))) ctx.recordGap(id, 'Own WebChat streams did not open; isolation cannot be credited.', { kind: 'positive-unavailable' });
         return;
     }
+    const other = actor => actor === 'userA' ? 'userB' : 'userA';
 
+    let identities = {};
     await ctx.check('u6:webchat-distinct-processes', async () => {
-        const list = await processes(shared);
-        assert.equal(list.length, 2, 'Identical launch values must yield exactly one private runtime per principal');
-        assert.notEqual(list[0].pid, list[1].pid, 'Principals must not share a runtime process');
+        const byPrincipal = await owned();
+        assert.ok(byPrincipal.userA && byPrincipal.userB, 'Each principal needs its own attributed DPU process');
+        assert.notEqual(identity(byPrincipal.userA), identity(byPrincipal.userB));
+        identities = { userA: identity(byPrincipal.userA), userB: identity(byPrincipal.userB) };
     });
+
+    /** Run one operation and require a fresh DPU acknowledgement on `actor` only. */
+    const acknowledged = async (actor, send, { marker = null } = {}) => {
+        const before = { userA: count(own.userA, isDpuAck), userB: count(own.userB, isDpuAck) };
+        const response = await send();
+        assert.equal(response.status, 204, `Operation must be accepted (HTTP ${response.status} is not evidence)`);
+        if (marker) assert.ok(await waitForCount(own[actor], isUserMessage(marker), 1, waitMs), 'Router user-message event for the unique marker is required on the acting stream');
+        assert.ok(await waitForCount(own[actor], isDpuAck, before[actor] + 1, waitMs), 'A fresh DPU acknowledgement is required on the acting stream (a bare 204 is not enough)');
+        await new Promise(r => setTimeout(r, settleMs));
+        assert.equal(count(own[other(actor)], isDpuAck), before[other(actor)], 'An acknowledgement appeared on the other principal\'s stream');
+    };
 
     const markers = { userA: `/authz-A-${nonce}`, userB: `/authz-B-${nonce}` };
     const markerOk = new Set();
     for (const actor of ['userA', 'userB']) await ctx.check(`u6:webchat-own-marker:${actor}`, async () => {
-        const response = await post(actor, 'input', { text: markers[actor] });
-        assert.equal(response.status, 204, 'Own input must be accepted');
-        const routerEvent = await own[actor].waitFor(e => e.event === 'user-message' && containsMarker(markers[actor])(e), waitMs);
-        assert.ok(routerEvent, 'Router user-message event for the own marker is required');
-        const reply = await own[actor].waitFor(e => e.event !== 'user-message' && containsMarker(markers[actor].slice(1))(e), waitMs);
-        assert.ok(reply, 'DPU unsupported-command reply for the own marker is required (a bare 204 is not enough)');
+        await acknowledged(actor, () => post(actor, 'input', envelope(markers[actor])), { marker: markers[actor] });
         markerOk.add(actor);
     });
-    const markersReady = markerOk.size === 2;
-    if (!markersReady) {
-        gapAll(['u6:webchat-marker-isolation:userA-to-userB', 'u6:webchat-marker-isolation:userB-to-userA', 'u6:webchat-copied-ids-input:userB', 'u6:webchat-copied-ids-control:userB', 'u6:webchat-copied-ids-interaction:userB'], 'Own marker positive controls failed; isolation cannot be credited.');
-    } else {
-        await ctx.check('u6:webchat-marker-isolation:userA-to-userB', async () => {
-            assert.equal(own.userB.events().filter(containsMarker(markers.userA)).length, 0, "A's marker reached B's stream");
-        });
-        await ctx.check('u6:webchat-marker-isolation:userB-to-userA', async () => {
-            assert.equal(own.userA.events().filter(containsMarker(markers.userB)).length, 0, "B's marker reached A's stream");
-        });
-        const copied = `/authz-B-copied-${nonce}`;
-        await ctx.check('u6:webchat-copied-ids-input:userB', async () => {
-            const before = await processes(shared);
-            const response = await post('userB', 'input', { text: copied });
-            observe({ step: 'copied-input', status: response.status, conflictOnly: response.status === 409 });
-            if (response.status === 204) assert.ok(await own.userB.waitFor(containsMarker(copied), waitMs), "B's copied-ID input must land on B's own stream");
-            await new Promise(r => setTimeout(r, settleMs));
-            assert.equal(own.userA.events().filter(containsMarker(copied)).length, 0, "B's copied-ID input reached A's stream");
-            const after = await processes(shared);
-            assert.deepEqual(after.map(p => p.pid).sort(), before.map(p => p.pid).sort(), "A's process identity or liveness changed");
-        });
-        await ctx.check('u6:webchat-copied-ids-control:userB', async () => {
-            const before = await processes(shared);
-            const response = await ctx.request('userB', { method: 'POST', path: `/webchat/control?${query()}`, body: '\x1b', headers: { 'content-type': 'text/plain' } });
-            observe({ step: 'copied-control', status: response.status, conflictOnly: response.status === 409 });
-            const after = await processes(shared);
-            assert.deepEqual(after.map(p => p.pid).sort(), before.map(p => p.pid).sort(), "B's control altered A's process");
-            const probe = `/authz-A-alive-${nonce}`;
-            assert.equal((await post('userA', 'input', { text: probe })).status, 204, 'A must remain responsive after B control');
-            assert.ok(await own.userA.waitFor(containsMarker(probe), waitMs), 'A must still receive its own events after B control');
-        });
-        await ctx.check('u6:webchat-copied-ids-interaction:userB', async () => {
-            const response = await ctx.request('userB', { method: 'POST', path: `/webchat/interaction?${query()}`, body: { id: `${nonce}-interaction`, optionId: 'x' } });
-            observe({ step: 'copied-interaction', status: response.status, conflictOnly: response.status === 409 });
-            assert.ok(response.status !== 200 && response.status !== 204, 'A copied interaction must not resolve anything');
-            assert.equal(own.userA.events().filter(e => e.event === 'interaction-resolved').length, 0, "B's interaction resolved something on A's stream");
-        });
-    }
+    for (const [from, to] of [['userA', 'userB'], ['userB', 'userA']]) await ctx.check(`u6:webchat-marker-isolation:${from}-to-${to}`, async () => {
+        assert.ok(markerOk.has(from) && markerOk.has(to), 'Both own-marker positives are required');
+        assert.equal(count(own[to], isUserMessage(markers[from])), 0, `${from}'s marker reached ${to}'s stream`);
+        assert.ok(!own[to].events().some(e => String(e.data).includes(markers[from])), `${from}'s marker text reached ${to}'s stream`);
+    });
 
+    const controlOk = new Set();
     for (const actor of ['userA', 'userB']) await ctx.check(`u6:webchat-own-control:${actor}`, async () => {
-        const marker = `/authz-control-${actor}-${nonce}`;
-        const response = await ctx.request(actor, { method: 'POST', path: `/webchat/control?${query()}`, body: `${marker}\n`, headers: { 'content-type': 'text/plain' } });
-        assert.equal(response.status, 204);
-        assert.ok(await own[actor].waitFor(containsMarker(marker.slice(1)), waitMs), 'A harmless control line must produce a process response; a bare 204 is not enough');
-        const other = actor === 'userA' ? 'userB' : 'userA';
-        assert.equal(own[other].events().filter(containsMarker(marker.slice(1))).length, 0, 'Control output crossed principals');
+        const line = `${JSON.stringify(envelope(`/authz-control-${actor}-${nonce}`))}\n`;
+        await acknowledged(actor, () => ctx.request(actor, { method: 'POST', path: `/webchat/control?${query()}`, body: line, headers: { 'content-type': 'text/plain' } }));
+        controlOk.add(actor);
+    });
+
+    // B replays A's copied launch query and tab id. These resolve B's own
+    // principal runtime; the operation must be acknowledged on B and leave A untouched.
+    const unchangedA = async () => {
+        const now = await owned();
+        assert.ok(now.userA, "A's process disappeared");
+        assert.equal(identity(now.userA), identities.userA, "A's process identity changed");
+    };
+    await ctx.check('u6:webchat-copied-ids-input:userB', async () => {
+        assert.ok(markerOk.has('userB') && identities.userA, 'B own-marker positive and A identity are required');
+        const copied = `/authz-B-copied-${nonce}`;
+        await acknowledged('userB', () => post('userB', 'input', envelope(copied)), { marker: copied });
+        assert.equal(count(own.userA, isUserMessage(copied)), 0, "B's copied-ID input reached A's stream");
+        await unchangedA();
+    });
+    await ctx.check('u6:webchat-copied-ids-control:userB', async () => {
+        assert.ok(controlOk.has('userB') && identities.userA, 'B own-control positive and A identity are required');
+        const line = `${JSON.stringify(envelope(`/authz-B-copied-control-${nonce}`))}\n`;
+        await acknowledged('userB', () => ctx.request('userB', { method: 'POST', path: `/webchat/control?${query()}`, body: line, headers: { 'content-type': 'text/plain' } }));
+        await unchangedA();
+        await acknowledged('userA', () => post('userA', 'input', envelope(`/authz-A-alive-${nonce}`)), { marker: `/authz-A-alive-${nonce}` });
     });
 
     await ctx.check('u6:webchat-reconnect-same-process:userA', async () => {
-        const before = await processes(shared);
+        assert.ok(identities.userA, 'A identity is required');
         own.userA.close();
         const again = await open('userA', shared);
         assert.equal(again.status, 200);
         own.userA = again;
-        const after = await processes(shared);
-        assert.deepEqual(after.map(p => p.pid).sort(), before.map(p => p.pid).sort(), 'Same-user reconnect must attach to the same process');
+        await unchangedA();
     });
 
     await ctx.check('u6:webchat-reserved-keys:userA', async () => {
         const forged = `${nonce}-forged`;
-        const extra = `&webchat-runtime-scope=${encodeURIComponent(ctx.principals.userB.id)}&sso-user=${encodeURIComponent(ctx.principals.userB.id)}`;
+        const bId = ctx.principals.userB.id;
+        const extra = `&webchat-runtime-scope=${encodeURIComponent(bId)}&sso-user-id=${encodeURIComponent(bId)}&sso-user=${encodeURIComponent(bId)}`;
         const handle = await open('userA', forged, extra);
-        assert.ok([200, 400, 403].includes(handle.status), 'Reserved keys must be rejected or ignored');
-        if (handle.status === 200) {
+        try {
+            if (handle.status !== 200) { observe({ step: 'reserved-keys', rejected: true, status: handle.status }); assert.fail(`Reserved keys must be ignored by the pinned Router (HTTP ${handle.status})`); }
             const list = await processes(forged);
-            assert.equal(list.length, 1, 'One runtime for the forged-key request');
-            const leaked = list.some(p => String(p.args).includes(ctx.principals.userB.id) || String(p.environ).includes(ctx.principals.userB.id) || /webchat-runtime-scope|--sso-/.test(String(p.args)));
-            observe({ step: 'reserved-keys', forgedScopePresent: leaked });
-            assert.equal(leaked, false, 'Reserved runtime-scope or user keys reached the agent process');
-        }
-        handle.close();
+            assert.equal(list.length, 1, 'Exactly one DPU process for the forged-key request');
+            const [p] = list;
+            const legitimate = p.ssoUserId === ctx.principals.userA.id;
+            const forgedPresent = String(p.args).includes(bId) || String(p.environ).includes(bId) || /(^| )--webchat-runtime-scope(=| |$)/.test(String(p.args));
+            observe({ step: 'reserved-keys', legitimateIdentity: legitimate, forgedValuePresent: forgedPresent });
+            assert.equal(legitimate, true, "The process must carry A's router-issued identity");
+            assert.equal(forgedPresent, false, "B's identity or a query-selected runtime scope reached A's process");
+        } finally { handle.close(); }
     });
 
-    await ctx.check('u6:webchat-credential-confinement:userA', async () => {
-        const list = await processes(shared);
+    await ctx.check('u6:webchat-credential-confinement', async () => {
+        const byPrincipal = await owned();
+        const list = [byPrincipal.userA, byPrincipal.userB];
+        assert.ok(list.every(Boolean), 'Both attributed DPU processes are required; an empty list proves nothing');
         const secrets = [...ctx.secrets].filter(s => typeof s === 'string' && s.length >= 12);
         const present = list.some(p => secrets.some(s => String(p.args).includes(s) || String(p.environ).includes(s)));
-        observe({ step: 'credential-confinement', browserCredentialPresent: present });
+        const crossed = String(byPrincipal.userA.args + byPrincipal.userA.environ).includes(ctx.principals.userB.id)
+            || String(byPrincipal.userB.args + byPrincipal.userB.environ).includes(ctx.principals.userA.id);
+        observe({ step: 'credential-confinement', processes: list.length, browserCredentialPresent: present, crossPrincipalIdentityPresent: crossed });
         assert.equal(present, false, 'A browser credential reached a WebChat process');
+        assert.equal(crossed, false, "One principal's identity reached the other principal's process");
     });
 
     for (const actor of ['anonymous', 'selfRegistered']) {
         await ctx.check(`u6:webchat-deny:${actor}:stream`, async () => {
             await ctx.guard();
             const response = await ctx.request(actor, { path: `/webchat/stream?${query()}`, headers: { accept: 'application/json' }, stream: true });
-            assert.notEqual(response.status, 409, 'A 409 is not isolation evidence');
             assertDenied(response);
         });
         await ctx.check(`u6:webchat-deny:${actor}:input`, async () => {
-            const response = await post(actor, 'input', { text: `/authz-deny-${nonce}` });
-            assert.notEqual(response.status, 409, 'A 409 is not isolation evidence');
+            const response = await post(actor, 'input', envelope(`/authz-deny-${nonce}`));
             assertDenied(response);
-            assert.equal(own.userA.events().filter(containsMarker(`authz-deny-${nonce}`)).length, 0);
+            assert.ok(!own.userA.events().some(e => String(e.data).includes(`authz-deny-${nonce}`)));
         });
     }
 
@@ -295,29 +362,19 @@ export async function runWebchatProbes(ctx, { openStream = openEventStream, insp
         capped = true;
     });
     await ctx.check('u6:webchat-idle-replacement:userA', async () => {
-        assert.ok(capped, 'Cap control is required');
-        const bBefore = await processes(shared);
+        assert.ok(capped && identities.userB, 'Cap control and B identity are required');
         slots[0].close();
         await new Promise(r => setTimeout(r, settleMs));
         const replacement = await open('userA', `${nonce}-slot-replacement`);
         assert.equal(replacement.status, 200, 'An idle runtime must be replaced');
         slots.push(replacement);
-        const bAfter = await processes(shared);
-        assert.ok(bAfter.length >= 1 && bBefore.every(p => bAfter.some(q => q.pid === p.pid)), "The idle replacement must not touch B's runtime");
-        const probe = `/authz-B-after-cap-${nonce}`;
-        assert.equal((await post('userB', 'input', { text: probe })).status, 204);
-        assert.ok(await own.userB.waitFor(containsMarker(probe), waitMs), 'B must remain intact');
+        const now = await owned();
+        assert.equal(now.userB && identity(now.userB), identities.userB, "The idle replacement touched B's runtime");
+        await acknowledged('userB', () => post('userB', 'input', envelope(`/authz-B-after-cap-${nonce}`)), { marker: `/authz-B-after-cap-${nonce}` });
     });
 
     await ctx.check('u6:webchat-runtimes-removed', async () => {
         for (const s of streams) s.close();
-        const deadline = Date.now() + removalMs;
-        let remaining;
-        do {
-            remaining = (await processes(nonce)).length;
-            if (!remaining) break;
-            await new Promise(r => setTimeout(r, pollMs));
-        } while (Date.now() < deadline);
-        assert.equal(remaining, 0, 'Every test-owned WebChat runtime must be removed');
+        assert.equal(await waitRemoved(), 0, 'Every test-owned WebChat runtime must be removed');
     });
 }

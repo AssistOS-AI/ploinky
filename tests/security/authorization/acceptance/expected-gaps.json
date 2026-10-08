@@ -1,6 +1,6 @@
 {
   "schema": "authz-expected-gaps/1",
-  "note": "Exact gap identities with typed evidence rules. Unavailable positives, transport errors, timeouts, 503s, pagination, username-admin and admin-unavailable outcomes are never accepted. selfRegistered metadata-visibility gaps are not listed (no source-derived visible-tool list yet); any such gap rejects.",
+  "note": "Exact gap identities with typed evidence rules. Unavailable positives, transport errors, timeouts, 503s, pagination, username-admin and admin-unavailable outcomes are never accepted. selfRegistered metadata-visibility gaps are not listed (no source-derived visible-tool list yet); any such gap rejects. liveKitServerAgent has no MCP exclusion: its route has no host port, so its discovery and GET transport outcomes are not excluded.",
   "gaps": [
     {
       "id": "agent.GPTResearcher.disabled",
@@ -176,8 +176,8 @@
       "id": "agent.opencode-free.disabled",
       "category": "optional-disabled-agent",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:249 records agent.<X>.disabled for every catalog entry with enabled=false; AchillesIDE/explorer/manifest.json:11-29 (enable list at the pinned AchillesIDE commit); proxies/opencode-free/manifest.json exists at the pinned proxies commit; tests/security/authorization/acceptance/expected-runtimes.json (derived by expected-runtime-graph.mjs, profile default)",
-      "reason": "NOT IN THE CODEX-APPROVED LIST (Q6 named 7 + 3). The pinned proxies repository now contains opencode-free, which the Explorer graph does not enable. Requires explicit Codex classification before an acceptance run.",
+      "source": "tests/security/authorization/agent-probes.mjs:249 records agent.<X>.disabled for every catalog entry with enabled=false; AchillesIDE/explorer/manifest.json:11-29 (enable list at the pinned AchillesIDE commit); proxies/opencode-free/manifest.json exists at the pinned proxies commit; tests/security/authorization/acceptance/expected-runtimes.json (derived by expected-runtime-graph.mjs, profile default); r2b_review_codex.md D1",
+      "reason": "Optional surface: the pinned proxies repository contains opencode-free, which neither the Explorer graph nor Soul Gateway enables. Approved as optional-disabled by r2b_review_codex.md D1; obligations retained.",
       "affectedObligations": [
         "agent-inventory/proxies/opencode-free"
       ],
@@ -190,37 +190,15 @@
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
     },
     {
-      "id": "agent.explorer.discovery.resources.list",
-      "category": "static-unsupported-protocol",
-      "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest has no agent/commands.run/start, so cli/sandbox/docker/agentCommands.js:5,15-22 and agentServiceManager.js:2275-2282 run sh /Agent/server/AgentServer.sh; AchillesIDE/explorer/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/explorer registers no handler for resources/list; an initialized administrator session receives JSON-RPC -32601 at the resources/list stage. No authorization or empty-list claim is made.",
-      "affectedObligations": [
-        "agent-inventory/AchillesIDE/explorer:POST:/explorer/mcp:mcp-discovery"
-      ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
-      "evidence": {
-        "kind": "rpc-method-unsupported",
-        "actor": "admin",
-        "endpoint": "/explorer/mcp",
-        "requestedMethod": "resources/list",
-        "stage": "resources/list",
-        "initialized": true,
-        "httpStatus": 200,
-        "rpcCode": -32601
-      },
-      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
-    },
-    {
       "id": "agent.explorer.discovery.resources.templates.list",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest has no agent/commands.run/start, so cli/sandbox/docker/agentCommands.js:5,15-22 and agentServiceManager.js:2275-2282 run sh /Agent/server/AgentServer.sh; AchillesIDE/explorer/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/explorer registers no handler for resources/templates/list; an initialized administrator session receives JSON-RPC -32601 at the resources/templates/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs:255-260; cli/server/RoutingServer.js:746-756 (route with a host port dispatches to handleAgentMcpRequest); cli/server/mcp-proxy/index.js:936-990 (readiness gate; no manifest declares readiness.protocol none); :656-670 (Router-local initialize and session); :782-783 (default branch: HTTP 200, -32601 Method not found, no upstream call)",
+      "reason": "The public Router MCP proxy does not implement resources/templates/list; an initialized administrator session for AchillesIDE/explorer receives HTTP 200 JSON-RPC -32601 from the Router default branch at the resources/templates/list stage. No authorization or empty-list claim is made; tools/list and resources/list stay mandatory.",
       "affectedObligations": [
         "agent-inventory/AchillesIDE/explorer:POST:/explorer/mcp:mcp-discovery"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "Router MCP method support is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
         "kind": "rpc-method-unsupported",
         "actor": "admin",
@@ -237,12 +215,12 @@
       "id": "agent.explorer.discovery.prompts.list",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest has no agent/commands.run/start, so cli/sandbox/docker/agentCommands.js:5,15-22 and agentServiceManager.js:2275-2282 run sh /Agent/server/AgentServer.sh; AchillesIDE/explorer/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/explorer registers no handler for prompts/list; an initialized administrator session receives JSON-RPC -32601 at the prompts/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs:255-260; cli/server/RoutingServer.js:746-756 (route with a host port dispatches to handleAgentMcpRequest); cli/server/mcp-proxy/index.js:936-990 (readiness gate; no manifest declares readiness.protocol none); :656-670 (Router-local initialize and session); :782-783 (default branch: HTTP 200, -32601 Method not found, no upstream call)",
+      "reason": "The public Router MCP proxy does not implement prompts/list; an initialized administrator session for AchillesIDE/explorer receives HTTP 200 JSON-RPC -32601 from the Router default branch at the prompts/list stage. No authorization or empty-list claim is made; tools/list and resources/list stay mandatory.",
       "affectedObligations": [
         "agent-inventory/AchillesIDE/explorer:POST:/explorer/mcp:mcp-discovery"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "Router MCP method support is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
         "kind": "rpc-method-unsupported",
         "actor": "admin",
@@ -256,24 +234,22 @@
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
     },
     {
-      "id": "agent.gitAgent.discovery.resources.list",
+      "id": "agent.explorer.mcp-get-transport",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest has no agent/commands.run/start, so cli/sandbox/docker/agentCommands.js:5,15-22 and agentServiceManager.js:2275-2282 run sh /Agent/server/AgentServer.sh; AchillesIDE/gitAgent/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/gitAgent registers no handler for resources/list; an initialized administrator session receives JSON-RPC -32601 at the resources/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs (GET /<agent>/mcp with an initialized administrator session); cli/server/mcp-proxy/index.js:827-830 (GET returns 405 event_stream_not_supported, Allow: POST, DELETE)",
+      "reason": "The public agent MCP route for AchillesIDE/explorer offers no GET event stream. Supported POST/session ownership, MCP session deletion and the WebChat and terminal streams remain mandatory.",
       "affectedObligations": [
-        "agent-inventory/AchillesIDE/gitAgent:POST:/gitAgent/mcp:mcp-discovery"
+        "agent-inventory/AchillesIDE/explorer:GET:/explorer/mcp:sse"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "The agent MCP transport is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
-        "kind": "rpc-method-unsupported",
+        "kind": "unsupported-transport",
         "actor": "admin",
-        "endpoint": "/gitAgent/mcp",
-        "requestedMethod": "resources/list",
-        "stage": "resources/list",
-        "initialized": true,
-        "httpStatus": 200,
-        "rpcCode": -32601
+        "endpoint": "/explorer/mcp",
+        "httpStatus": 405,
+        "errorCode": "event_stream_not_supported",
+        "allow": "POST,DELETE"
       },
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
     },
@@ -281,12 +257,12 @@
       "id": "agent.gitAgent.discovery.resources.templates.list",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest has no agent/commands.run/start, so cli/sandbox/docker/agentCommands.js:5,15-22 and agentServiceManager.js:2275-2282 run sh /Agent/server/AgentServer.sh; AchillesIDE/gitAgent/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/gitAgent registers no handler for resources/templates/list; an initialized administrator session receives JSON-RPC -32601 at the resources/templates/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs:255-260; cli/server/RoutingServer.js:746-756 (route with a host port dispatches to handleAgentMcpRequest); cli/server/mcp-proxy/index.js:936-990 (readiness gate; no manifest declares readiness.protocol none); :656-670 (Router-local initialize and session); :782-783 (default branch: HTTP 200, -32601 Method not found, no upstream call)",
+      "reason": "The public Router MCP proxy does not implement resources/templates/list; an initialized administrator session for AchillesIDE/gitAgent receives HTTP 200 JSON-RPC -32601 from the Router default branch at the resources/templates/list stage. No authorization or empty-list claim is made; tools/list and resources/list stay mandatory.",
       "affectedObligations": [
         "agent-inventory/AchillesIDE/gitAgent:POST:/gitAgent/mcp:mcp-discovery"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "Router MCP method support is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
         "kind": "rpc-method-unsupported",
         "actor": "admin",
@@ -303,12 +279,12 @@
       "id": "agent.gitAgent.discovery.prompts.list",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest has no agent/commands.run/start, so cli/sandbox/docker/agentCommands.js:5,15-22 and agentServiceManager.js:2275-2282 run sh /Agent/server/AgentServer.sh; AchillesIDE/gitAgent/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/gitAgent registers no handler for prompts/list; an initialized administrator session receives JSON-RPC -32601 at the prompts/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs:255-260; cli/server/RoutingServer.js:746-756 (route with a host port dispatches to handleAgentMcpRequest); cli/server/mcp-proxy/index.js:936-990 (readiness gate; no manifest declares readiness.protocol none); :656-670 (Router-local initialize and session); :782-783 (default branch: HTTP 200, -32601 Method not found, no upstream call)",
+      "reason": "The public Router MCP proxy does not implement prompts/list; an initialized administrator session for AchillesIDE/gitAgent receives HTTP 200 JSON-RPC -32601 from the Router default branch at the prompts/list stage. No authorization or empty-list claim is made; tools/list and resources/list stay mandatory.",
       "affectedObligations": [
         "agent-inventory/AchillesIDE/gitAgent:POST:/gitAgent/mcp:mcp-discovery"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "Router MCP method support is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
         "kind": "rpc-method-unsupported",
         "actor": "admin",
@@ -322,24 +298,22 @@
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
     },
     {
-      "id": "agent.emailAgent.discovery.resources.list",
+      "id": "agent.gitAgent.mcp-get-transport",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest has no agent/commands.run/start, so cli/sandbox/docker/agentCommands.js:5,15-22 and agentServiceManager.js:2275-2282 run sh /Agent/server/AgentServer.sh; AchillesIDE/emailAgent/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/emailAgent registers no handler for resources/list; an initialized administrator session receives JSON-RPC -32601 at the resources/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs (GET /<agent>/mcp with an initialized administrator session); cli/server/mcp-proxy/index.js:827-830 (GET returns 405 event_stream_not_supported, Allow: POST, DELETE)",
+      "reason": "The public agent MCP route for AchillesIDE/gitAgent offers no GET event stream. Supported POST/session ownership, MCP session deletion and the WebChat and terminal streams remain mandatory.",
       "affectedObligations": [
-        "agent-inventory/AchillesIDE/emailAgent:POST:/emailAgent/mcp:mcp-discovery"
+        "agent-inventory/AchillesIDE/gitAgent:GET:/gitAgent/mcp:sse"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "The agent MCP transport is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
-        "kind": "rpc-method-unsupported",
+        "kind": "unsupported-transport",
         "actor": "admin",
-        "endpoint": "/emailAgent/mcp",
-        "requestedMethod": "resources/list",
-        "stage": "resources/list",
-        "initialized": true,
-        "httpStatus": 200,
-        "rpcCode": -32601
+        "endpoint": "/gitAgent/mcp",
+        "httpStatus": 405,
+        "errorCode": "event_stream_not_supported",
+        "allow": "POST,DELETE"
       },
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
     },
@@ -347,12 +321,12 @@
       "id": "agent.emailAgent.discovery.resources.templates.list",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest has no agent/commands.run/start, so cli/sandbox/docker/agentCommands.js:5,15-22 and agentServiceManager.js:2275-2282 run sh /Agent/server/AgentServer.sh; AchillesIDE/emailAgent/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/emailAgent registers no handler for resources/templates/list; an initialized administrator session receives JSON-RPC -32601 at the resources/templates/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs:255-260; cli/server/RoutingServer.js:746-756 (route with a host port dispatches to handleAgentMcpRequest); cli/server/mcp-proxy/index.js:936-990 (readiness gate; no manifest declares readiness.protocol none); :656-670 (Router-local initialize and session); :782-783 (default branch: HTTP 200, -32601 Method not found, no upstream call)",
+      "reason": "The public Router MCP proxy does not implement resources/templates/list; an initialized administrator session for AchillesIDE/emailAgent receives HTTP 200 JSON-RPC -32601 from the Router default branch at the resources/templates/list stage. No authorization or empty-list claim is made; tools/list and resources/list stay mandatory.",
       "affectedObligations": [
         "agent-inventory/AchillesIDE/emailAgent:POST:/emailAgent/mcp:mcp-discovery"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "Router MCP method support is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
         "kind": "rpc-method-unsupported",
         "actor": "admin",
@@ -369,12 +343,12 @@
       "id": "agent.emailAgent.discovery.prompts.list",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest has no agent/commands.run/start, so cli/sandbox/docker/agentCommands.js:5,15-22 and agentServiceManager.js:2275-2282 run sh /Agent/server/AgentServer.sh; AchillesIDE/emailAgent/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/emailAgent registers no handler for prompts/list; an initialized administrator session receives JSON-RPC -32601 at the prompts/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs:255-260; cli/server/RoutingServer.js:746-756 (route with a host port dispatches to handleAgentMcpRequest); cli/server/mcp-proxy/index.js:936-990 (readiness gate; no manifest declares readiness.protocol none); :656-670 (Router-local initialize and session); :782-783 (default branch: HTTP 200, -32601 Method not found, no upstream call)",
+      "reason": "The public Router MCP proxy does not implement prompts/list; an initialized administrator session for AchillesIDE/emailAgent receives HTTP 200 JSON-RPC -32601 from the Router default branch at the prompts/list stage. No authorization or empty-list claim is made; tools/list and resources/list stay mandatory.",
       "affectedObligations": [
         "agent-inventory/AchillesIDE/emailAgent:POST:/emailAgent/mcp:mcp-discovery"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "Router MCP method support is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
         "kind": "rpc-method-unsupported",
         "actor": "admin",
@@ -388,24 +362,22 @@
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
     },
     {
-      "id": "agent.dpuAgent.discovery.resources.list",
+      "id": "agent.emailAgent.mcp-get-transport",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest has no agent/commands.run/start, so cli/sandbox/docker/agentCommands.js:5,15-22 and agentServiceManager.js:2275-2282 run sh /Agent/server/AgentServer.sh; AchillesIDE/dpuAgent/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/dpuAgent registers no handler for resources/list; an initialized administrator session receives JSON-RPC -32601 at the resources/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs (GET /<agent>/mcp with an initialized administrator session); cli/server/mcp-proxy/index.js:827-830 (GET returns 405 event_stream_not_supported, Allow: POST, DELETE)",
+      "reason": "The public agent MCP route for AchillesIDE/emailAgent offers no GET event stream. Supported POST/session ownership, MCP session deletion and the WebChat and terminal streams remain mandatory.",
       "affectedObligations": [
-        "agent-inventory/AchillesIDE/dpuAgent:POST:/dpuAgent/mcp:mcp-discovery"
+        "agent-inventory/AchillesIDE/emailAgent:GET:/emailAgent/mcp:sse"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "The agent MCP transport is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
-        "kind": "rpc-method-unsupported",
+        "kind": "unsupported-transport",
         "actor": "admin",
-        "endpoint": "/dpuAgent/mcp",
-        "requestedMethod": "resources/list",
-        "stage": "resources/list",
-        "initialized": true,
-        "httpStatus": 200,
-        "rpcCode": -32601
+        "endpoint": "/emailAgent/mcp",
+        "httpStatus": 405,
+        "errorCode": "event_stream_not_supported",
+        "allow": "POST,DELETE"
       },
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
     },
@@ -413,12 +385,12 @@
       "id": "agent.dpuAgent.discovery.resources.templates.list",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest has no agent/commands.run/start, so cli/sandbox/docker/agentCommands.js:5,15-22 and agentServiceManager.js:2275-2282 run sh /Agent/server/AgentServer.sh; AchillesIDE/dpuAgent/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/dpuAgent registers no handler for resources/templates/list; an initialized administrator session receives JSON-RPC -32601 at the resources/templates/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs:255-260; cli/server/RoutingServer.js:746-756 (route with a host port dispatches to handleAgentMcpRequest); cli/server/mcp-proxy/index.js:936-990 (readiness gate; no manifest declares readiness.protocol none); :656-670 (Router-local initialize and session); :782-783 (default branch: HTTP 200, -32601 Method not found, no upstream call)",
+      "reason": "The public Router MCP proxy does not implement resources/templates/list; an initialized administrator session for AchillesIDE/dpuAgent receives HTTP 200 JSON-RPC -32601 from the Router default branch at the resources/templates/list stage. No authorization or empty-list claim is made; tools/list and resources/list stay mandatory.",
       "affectedObligations": [
         "agent-inventory/AchillesIDE/dpuAgent:POST:/dpuAgent/mcp:mcp-discovery"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "Router MCP method support is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
         "kind": "rpc-method-unsupported",
         "actor": "admin",
@@ -435,12 +407,12 @@
       "id": "agent.dpuAgent.discovery.prompts.list",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest has no agent/commands.run/start, so cli/sandbox/docker/agentCommands.js:5,15-22 and agentServiceManager.js:2275-2282 run sh /Agent/server/AgentServer.sh; AchillesIDE/dpuAgent/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/dpuAgent registers no handler for prompts/list; an initialized administrator session receives JSON-RPC -32601 at the prompts/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs:255-260; cli/server/RoutingServer.js:746-756 (route with a host port dispatches to handleAgentMcpRequest); cli/server/mcp-proxy/index.js:936-990 (readiness gate; no manifest declares readiness.protocol none); :656-670 (Router-local initialize and session); :782-783 (default branch: HTTP 200, -32601 Method not found, no upstream call)",
+      "reason": "The public Router MCP proxy does not implement prompts/list; an initialized administrator session for AchillesIDE/dpuAgent receives HTTP 200 JSON-RPC -32601 from the Router default branch at the prompts/list stage. No authorization or empty-list claim is made; tools/list and resources/list stay mandatory.",
       "affectedObligations": [
         "agent-inventory/AchillesIDE/dpuAgent:POST:/dpuAgent/mcp:mcp-discovery"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "Router MCP method support is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
         "kind": "rpc-method-unsupported",
         "actor": "admin",
@@ -454,24 +426,22 @@
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
     },
     {
-      "id": "agent.soplangAgent.discovery.resources.list",
+      "id": "agent.dpuAgent.mcp-get-transport",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest has no agent/commands.run/start, so cli/sandbox/docker/agentCommands.js:5,15-22 and agentServiceManager.js:2275-2282 run sh /Agent/server/AgentServer.sh; AchillesIDE/soplangAgent/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/soplangAgent registers no handler for resources/list; an initialized administrator session receives JSON-RPC -32601 at the resources/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs (GET /<agent>/mcp with an initialized administrator session); cli/server/mcp-proxy/index.js:827-830 (GET returns 405 event_stream_not_supported, Allow: POST, DELETE)",
+      "reason": "The public agent MCP route for AchillesIDE/dpuAgent offers no GET event stream. Supported POST/session ownership, MCP session deletion and the WebChat and terminal streams remain mandatory.",
       "affectedObligations": [
-        "agent-inventory/AchillesIDE/soplangAgent:POST:/soplangAgent/mcp:mcp-discovery"
+        "agent-inventory/AchillesIDE/dpuAgent:GET:/dpuAgent/mcp:sse"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "The agent MCP transport is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
-        "kind": "rpc-method-unsupported",
+        "kind": "unsupported-transport",
         "actor": "admin",
-        "endpoint": "/soplangAgent/mcp",
-        "requestedMethod": "resources/list",
-        "stage": "resources/list",
-        "initialized": true,
-        "httpStatus": 200,
-        "rpcCode": -32601
+        "endpoint": "/dpuAgent/mcp",
+        "httpStatus": 405,
+        "errorCode": "event_stream_not_supported",
+        "allow": "POST,DELETE"
       },
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
     },
@@ -479,12 +449,12 @@
       "id": "agent.soplangAgent.discovery.resources.templates.list",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest has no agent/commands.run/start, so cli/sandbox/docker/agentCommands.js:5,15-22 and agentServiceManager.js:2275-2282 run sh /Agent/server/AgentServer.sh; AchillesIDE/soplangAgent/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/soplangAgent registers no handler for resources/templates/list; an initialized administrator session receives JSON-RPC -32601 at the resources/templates/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs:255-260; cli/server/RoutingServer.js:746-756 (route with a host port dispatches to handleAgentMcpRequest); cli/server/mcp-proxy/index.js:936-990 (readiness gate; no manifest declares readiness.protocol none); :656-670 (Router-local initialize and session); :782-783 (default branch: HTTP 200, -32601 Method not found, no upstream call)",
+      "reason": "The public Router MCP proxy does not implement resources/templates/list; an initialized administrator session for AchillesIDE/soplangAgent receives HTTP 200 JSON-RPC -32601 from the Router default branch at the resources/templates/list stage. No authorization or empty-list claim is made; tools/list and resources/list stay mandatory.",
       "affectedObligations": [
         "agent-inventory/AchillesIDE/soplangAgent:POST:/soplangAgent/mcp:mcp-discovery"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "Router MCP method support is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
         "kind": "rpc-method-unsupported",
         "actor": "admin",
@@ -501,12 +471,12 @@
       "id": "agent.soplangAgent.discovery.prompts.list",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest has no agent/commands.run/start, so cli/sandbox/docker/agentCommands.js:5,15-22 and agentServiceManager.js:2275-2282 run sh /Agent/server/AgentServer.sh; AchillesIDE/soplangAgent/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/soplangAgent registers no handler for prompts/list; an initialized administrator session receives JSON-RPC -32601 at the prompts/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs:255-260; cli/server/RoutingServer.js:746-756 (route with a host port dispatches to handleAgentMcpRequest); cli/server/mcp-proxy/index.js:936-990 (readiness gate; no manifest declares readiness.protocol none); :656-670 (Router-local initialize and session); :782-783 (default branch: HTTP 200, -32601 Method not found, no upstream call)",
+      "reason": "The public Router MCP proxy does not implement prompts/list; an initialized administrator session for AchillesIDE/soplangAgent receives HTTP 200 JSON-RPC -32601 from the Router default branch at the prompts/list stage. No authorization or empty-list claim is made; tools/list and resources/list stay mandatory.",
       "affectedObligations": [
         "agent-inventory/AchillesIDE/soplangAgent:POST:/soplangAgent/mcp:mcp-discovery"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "Router MCP method support is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
         "kind": "rpc-method-unsupported",
         "actor": "admin",
@@ -520,24 +490,22 @@
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
     },
     {
-      "id": "agent.tasksAgent.discovery.resources.list",
+      "id": "agent.soplangAgent.mcp-get-transport",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest has no agent/commands.run/start, so cli/sandbox/docker/agentCommands.js:5,15-22 and agentServiceManager.js:2275-2282 run sh /Agent/server/AgentServer.sh; AchillesIDE/tasksAgent/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/tasksAgent registers no handler for resources/list; an initialized administrator session receives JSON-RPC -32601 at the resources/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs (GET /<agent>/mcp with an initialized administrator session); cli/server/mcp-proxy/index.js:827-830 (GET returns 405 event_stream_not_supported, Allow: POST, DELETE)",
+      "reason": "The public agent MCP route for AchillesIDE/soplangAgent offers no GET event stream. Supported POST/session ownership, MCP session deletion and the WebChat and terminal streams remain mandatory.",
       "affectedObligations": [
-        "agent-inventory/AchillesIDE/tasksAgent:POST:/tasksAgent/mcp:mcp-discovery"
+        "agent-inventory/AchillesIDE/soplangAgent:GET:/soplangAgent/mcp:sse"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "The agent MCP transport is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
-        "kind": "rpc-method-unsupported",
+        "kind": "unsupported-transport",
         "actor": "admin",
-        "endpoint": "/tasksAgent/mcp",
-        "requestedMethod": "resources/list",
-        "stage": "resources/list",
-        "initialized": true,
-        "httpStatus": 200,
-        "rpcCode": -32601
+        "endpoint": "/soplangAgent/mcp",
+        "httpStatus": 405,
+        "errorCode": "event_stream_not_supported",
+        "allow": "POST,DELETE"
       },
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
     },
@@ -545,12 +513,12 @@
       "id": "agent.tasksAgent.discovery.resources.templates.list",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest has no agent/commands.run/start, so cli/sandbox/docker/agentCommands.js:5,15-22 and agentServiceManager.js:2275-2282 run sh /Agent/server/AgentServer.sh; AchillesIDE/tasksAgent/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/tasksAgent registers no handler for resources/templates/list; an initialized administrator session receives JSON-RPC -32601 at the resources/templates/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs:255-260; cli/server/RoutingServer.js:746-756 (route with a host port dispatches to handleAgentMcpRequest); cli/server/mcp-proxy/index.js:936-990 (readiness gate; no manifest declares readiness.protocol none); :656-670 (Router-local initialize and session); :782-783 (default branch: HTTP 200, -32601 Method not found, no upstream call)",
+      "reason": "The public Router MCP proxy does not implement resources/templates/list; an initialized administrator session for AchillesIDE/tasksAgent receives HTTP 200 JSON-RPC -32601 from the Router default branch at the resources/templates/list stage. No authorization or empty-list claim is made; tools/list and resources/list stay mandatory.",
       "affectedObligations": [
         "agent-inventory/AchillesIDE/tasksAgent:POST:/tasksAgent/mcp:mcp-discovery"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "Router MCP method support is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
         "kind": "rpc-method-unsupported",
         "actor": "admin",
@@ -567,12 +535,12 @@
       "id": "agent.tasksAgent.discovery.prompts.list",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest has no agent/commands.run/start, so cli/sandbox/docker/agentCommands.js:5,15-22 and agentServiceManager.js:2275-2282 run sh /Agent/server/AgentServer.sh; AchillesIDE/tasksAgent/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/tasksAgent registers no handler for prompts/list; an initialized administrator session receives JSON-RPC -32601 at the prompts/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs:255-260; cli/server/RoutingServer.js:746-756 (route with a host port dispatches to handleAgentMcpRequest); cli/server/mcp-proxy/index.js:936-990 (readiness gate; no manifest declares readiness.protocol none); :656-670 (Router-local initialize and session); :782-783 (default branch: HTTP 200, -32601 Method not found, no upstream call)",
+      "reason": "The public Router MCP proxy does not implement prompts/list; an initialized administrator session for AchillesIDE/tasksAgent receives HTTP 200 JSON-RPC -32601 from the Router default branch at the prompts/list stage. No authorization or empty-list claim is made; tools/list and resources/list stay mandatory.",
       "affectedObligations": [
         "agent-inventory/AchillesIDE/tasksAgent:POST:/tasksAgent/mcp:mcp-discovery"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "Router MCP method support is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
         "kind": "rpc-method-unsupported",
         "actor": "admin",
@@ -586,24 +554,22 @@
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
     },
     {
-      "id": "agent.webAssist.discovery.resources.list",
+      "id": "agent.tasksAgent.mcp-get-transport",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest has no agent/commands.run/start, so cli/sandbox/docker/agentCommands.js:5,15-22 and agentServiceManager.js:2275-2282 run sh /Agent/server/AgentServer.sh; AchillesIDE/webAssist/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/webAssist registers no handler for resources/list; an initialized administrator session receives JSON-RPC -32601 at the resources/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs (GET /<agent>/mcp with an initialized administrator session); cli/server/mcp-proxy/index.js:827-830 (GET returns 405 event_stream_not_supported, Allow: POST, DELETE)",
+      "reason": "The public agent MCP route for AchillesIDE/tasksAgent offers no GET event stream. Supported POST/session ownership, MCP session deletion and the WebChat and terminal streams remain mandatory.",
       "affectedObligations": [
-        "agent-inventory/AchillesIDE/webAssist:POST:/webAssist/mcp:mcp-discovery"
+        "agent-inventory/AchillesIDE/tasksAgent:GET:/tasksAgent/mcp:sse"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "The agent MCP transport is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
-        "kind": "rpc-method-unsupported",
+        "kind": "unsupported-transport",
         "actor": "admin",
-        "endpoint": "/webAssist/mcp",
-        "requestedMethod": "resources/list",
-        "stage": "resources/list",
-        "initialized": true,
-        "httpStatus": 200,
-        "rpcCode": -32601
+        "endpoint": "/tasksAgent/mcp",
+        "httpStatus": 405,
+        "errorCode": "event_stream_not_supported",
+        "allow": "POST,DELETE"
       },
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
     },
@@ -611,12 +577,12 @@
       "id": "agent.webAssist.discovery.resources.templates.list",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest has no agent/commands.run/start, so cli/sandbox/docker/agentCommands.js:5,15-22 and agentServiceManager.js:2275-2282 run sh /Agent/server/AgentServer.sh; AchillesIDE/webAssist/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/webAssist registers no handler for resources/templates/list; an initialized administrator session receives JSON-RPC -32601 at the resources/templates/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs:255-260; cli/server/RoutingServer.js:746-756 (route with a host port dispatches to handleAgentMcpRequest); cli/server/mcp-proxy/index.js:936-990 (readiness gate; no manifest declares readiness.protocol none); :656-670 (Router-local initialize and session); :782-783 (default branch: HTTP 200, -32601 Method not found, no upstream call)",
+      "reason": "The public Router MCP proxy does not implement resources/templates/list; an initialized administrator session for AchillesIDE/webAssist receives HTTP 200 JSON-RPC -32601 from the Router default branch at the resources/templates/list stage. No authorization or empty-list claim is made; tools/list and resources/list stay mandatory.",
       "affectedObligations": [
         "agent-inventory/AchillesIDE/webAssist:POST:/webAssist/mcp:mcp-discovery"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "Router MCP method support is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
         "kind": "rpc-method-unsupported",
         "actor": "admin",
@@ -633,12 +599,12 @@
       "id": "agent.webAssist.discovery.prompts.list",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest has no agent/commands.run/start, so cli/sandbox/docker/agentCommands.js:5,15-22 and agentServiceManager.js:2275-2282 run sh /Agent/server/AgentServer.sh; AchillesIDE/webAssist/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/webAssist registers no handler for prompts/list; an initialized administrator session receives JSON-RPC -32601 at the prompts/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs:255-260; cli/server/RoutingServer.js:746-756 (route with a host port dispatches to handleAgentMcpRequest); cli/server/mcp-proxy/index.js:936-990 (readiness gate; no manifest declares readiness.protocol none); :656-670 (Router-local initialize and session); :782-783 (default branch: HTTP 200, -32601 Method not found, no upstream call)",
+      "reason": "The public Router MCP proxy does not implement prompts/list; an initialized administrator session for AchillesIDE/webAssist receives HTTP 200 JSON-RPC -32601 from the Router default branch at the prompts/list stage. No authorization or empty-list claim is made; tools/list and resources/list stay mandatory.",
       "affectedObligations": [
         "agent-inventory/AchillesIDE/webAssist:POST:/webAssist/mcp:mcp-discovery"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "Router MCP method support is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
         "kind": "rpc-method-unsupported",
         "actor": "admin",
@@ -652,46 +618,22 @@
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
     },
     {
-      "id": "agent.multimedia.discovery.tools.list",
+      "id": "agent.webAssist.mcp-get-transport",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest has no agent/commands.run/start, so cli/sandbox/docker/agentCommands.js:5,15-22 and agentServiceManager.js:2275-2282 run sh /Agent/server/AgentServer.sh; AchillesIDE/multimedia has no mcp-config.json, so AgentServer starts with an empty configuration and registers no tool, resource or prompt; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/multimedia registers no handler for tools/list; an initialized administrator session receives JSON-RPC -32601 at the tools/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs (GET /<agent>/mcp with an initialized administrator session); cli/server/mcp-proxy/index.js:827-830 (GET returns 405 event_stream_not_supported, Allow: POST, DELETE)",
+      "reason": "The public agent MCP route for AchillesIDE/webAssist offers no GET event stream. Supported POST/session ownership, MCP session deletion and the WebChat and terminal streams remain mandatory.",
       "affectedObligations": [
-        "agent-inventory/AchillesIDE/multimedia:POST:/multimedia/mcp:mcp-discovery"
+        "agent-inventory/AchillesIDE/webAssist:GET:/webAssist/mcp:sse"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "The agent MCP transport is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
-        "kind": "rpc-method-unsupported",
+        "kind": "unsupported-transport",
         "actor": "admin",
-        "endpoint": "/multimedia/mcp",
-        "requestedMethod": "tools/list",
-        "stage": "tools/list",
-        "initialized": true,
-        "httpStatus": 200,
-        "rpcCode": -32601
-      },
-      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
-    },
-    {
-      "id": "agent.multimedia.discovery.resources.list",
-      "category": "static-unsupported-protocol",
-      "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest has no agent/commands.run/start, so cli/sandbox/docker/agentCommands.js:5,15-22 and agentServiceManager.js:2275-2282 run sh /Agent/server/AgentServer.sh; AchillesIDE/multimedia has no mcp-config.json, so AgentServer starts with an empty configuration and registers no tool, resource or prompt; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/multimedia registers no handler for resources/list; an initialized administrator session receives JSON-RPC -32601 at the resources/list stage. No authorization or empty-list claim is made.",
-      "affectedObligations": [
-        "agent-inventory/AchillesIDE/multimedia:POST:/multimedia/mcp:mcp-discovery"
-      ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
-      "evidence": {
-        "kind": "rpc-method-unsupported",
-        "actor": "admin",
-        "endpoint": "/multimedia/mcp",
-        "requestedMethod": "resources/list",
-        "stage": "resources/list",
-        "initialized": true,
-        "httpStatus": 200,
-        "rpcCode": -32601
+        "endpoint": "/webAssist/mcp",
+        "httpStatus": 405,
+        "errorCode": "event_stream_not_supported",
+        "allow": "POST,DELETE"
       },
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
     },
@@ -699,12 +641,12 @@
       "id": "agent.multimedia.discovery.resources.templates.list",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest has no agent/commands.run/start, so cli/sandbox/docker/agentCommands.js:5,15-22 and agentServiceManager.js:2275-2282 run sh /Agent/server/AgentServer.sh; AchillesIDE/multimedia has no mcp-config.json, so AgentServer starts with an empty configuration and registers no tool, resource or prompt; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/multimedia registers no handler for resources/templates/list; an initialized administrator session receives JSON-RPC -32601 at the resources/templates/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs:255-260; cli/server/RoutingServer.js:746-756 (route with a host port dispatches to handleAgentMcpRequest); cli/server/mcp-proxy/index.js:936-990 (readiness gate; no manifest declares readiness.protocol none); :656-670 (Router-local initialize and session); :782-783 (default branch: HTTP 200, -32601 Method not found, no upstream call)",
+      "reason": "The public Router MCP proxy does not implement resources/templates/list; an initialized administrator session for AchillesIDE/multimedia receives HTTP 200 JSON-RPC -32601 from the Router default branch at the resources/templates/list stage. No authorization or empty-list claim is made; tools/list and resources/list stay mandatory.",
       "affectedObligations": [
         "agent-inventory/AchillesIDE/multimedia:POST:/multimedia/mcp:mcp-discovery"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "Router MCP method support is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
         "kind": "rpc-method-unsupported",
         "actor": "admin",
@@ -721,12 +663,12 @@
       "id": "agent.multimedia.discovery.prompts.list",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest has no agent/commands.run/start, so cli/sandbox/docker/agentCommands.js:5,15-22 and agentServiceManager.js:2275-2282 run sh /Agent/server/AgentServer.sh; AchillesIDE/multimedia has no mcp-config.json, so AgentServer starts with an empty configuration and registers no tool, resource or prompt; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/multimedia registers no handler for prompts/list; an initialized administrator session receives JSON-RPC -32601 at the prompts/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs:255-260; cli/server/RoutingServer.js:746-756 (route with a host port dispatches to handleAgentMcpRequest); cli/server/mcp-proxy/index.js:936-990 (readiness gate; no manifest declares readiness.protocol none); :656-670 (Router-local initialize and session); :782-783 (default branch: HTTP 200, -32601 Method not found, no upstream call)",
+      "reason": "The public Router MCP proxy does not implement prompts/list; an initialized administrator session for AchillesIDE/multimedia receives HTTP 200 JSON-RPC -32601 from the Router default branch at the prompts/list stage. No authorization or empty-list claim is made; tools/list and resources/list stay mandatory.",
       "affectedObligations": [
         "agent-inventory/AchillesIDE/multimedia:POST:/multimedia/mcp:mcp-discovery"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "Router MCP method support is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
         "kind": "rpc-method-unsupported",
         "actor": "admin",
@@ -740,24 +682,22 @@
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
     },
     {
-      "id": "agent.userPersistoAgent.discovery.resources.list",
+      "id": "agent.multimedia.mcp-get-transport",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest agent runs scripts/start.sh -> main.mjs, which spawns /Agent/server/AgentServer.mjs (AchillesIDE/userPersistoAgent/main.mjs:90-91); AchillesIDE/userPersistoAgent/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/userPersistoAgent registers no handler for resources/list; an initialized administrator session receives JSON-RPC -32601 at the resources/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs (GET /<agent>/mcp with an initialized administrator session); cli/server/mcp-proxy/index.js:827-830 (GET returns 405 event_stream_not_supported, Allow: POST, DELETE)",
+      "reason": "The public agent MCP route for AchillesIDE/multimedia offers no GET event stream. Supported POST/session ownership, MCP session deletion and the WebChat and terminal streams remain mandatory.",
       "affectedObligations": [
-        "agent-inventory/AchillesIDE/userPersistoAgent:POST:/userPersistoAgent/mcp:mcp-discovery"
+        "agent-inventory/AchillesIDE/multimedia:GET:/multimedia/mcp:sse"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "The agent MCP transport is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
-        "kind": "rpc-method-unsupported",
+        "kind": "unsupported-transport",
         "actor": "admin",
-        "endpoint": "/userPersistoAgent/mcp",
-        "requestedMethod": "resources/list",
-        "stage": "resources/list",
-        "initialized": true,
-        "httpStatus": 200,
-        "rpcCode": -32601
+        "endpoint": "/multimedia/mcp",
+        "httpStatus": 405,
+        "errorCode": "event_stream_not_supported",
+        "allow": "POST,DELETE"
       },
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
     },
@@ -765,12 +705,12 @@
       "id": "agent.userPersistoAgent.discovery.resources.templates.list",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest agent runs scripts/start.sh -> main.mjs, which spawns /Agent/server/AgentServer.mjs (AchillesIDE/userPersistoAgent/main.mjs:90-91); AchillesIDE/userPersistoAgent/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/userPersistoAgent registers no handler for resources/templates/list; an initialized administrator session receives JSON-RPC -32601 at the resources/templates/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs:255-260; cli/server/RoutingServer.js:746-756 (route with a host port dispatches to handleAgentMcpRequest); cli/server/mcp-proxy/index.js:936-990 (readiness gate; no manifest declares readiness.protocol none); :656-670 (Router-local initialize and session); :782-783 (default branch: HTTP 200, -32601 Method not found, no upstream call)",
+      "reason": "The public Router MCP proxy does not implement resources/templates/list; an initialized administrator session for AchillesIDE/userPersistoAgent receives HTTP 200 JSON-RPC -32601 from the Router default branch at the resources/templates/list stage. No authorization or empty-list claim is made; tools/list and resources/list stay mandatory.",
       "affectedObligations": [
         "agent-inventory/AchillesIDE/userPersistoAgent:POST:/userPersistoAgent/mcp:mcp-discovery"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "Router MCP method support is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
         "kind": "rpc-method-unsupported",
         "actor": "admin",
@@ -787,12 +727,12 @@
       "id": "agent.userPersistoAgent.discovery.prompts.list",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest agent runs scripts/start.sh -> main.mjs, which spawns /Agent/server/AgentServer.mjs (AchillesIDE/userPersistoAgent/main.mjs:90-91); AchillesIDE/userPersistoAgent/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/userPersistoAgent registers no handler for prompts/list; an initialized administrator session receives JSON-RPC -32601 at the prompts/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs:255-260; cli/server/RoutingServer.js:746-756 (route with a host port dispatches to handleAgentMcpRequest); cli/server/mcp-proxy/index.js:936-990 (readiness gate; no manifest declares readiness.protocol none); :656-670 (Router-local initialize and session); :782-783 (default branch: HTTP 200, -32601 Method not found, no upstream call)",
+      "reason": "The public Router MCP proxy does not implement prompts/list; an initialized administrator session for AchillesIDE/userPersistoAgent receives HTTP 200 JSON-RPC -32601 from the Router default branch at the prompts/list stage. No authorization or empty-list claim is made; tools/list and resources/list stay mandatory.",
       "affectedObligations": [
         "agent-inventory/AchillesIDE/userPersistoAgent:POST:/userPersistoAgent/mcp:mcp-discovery"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "Router MCP method support is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
         "kind": "rpc-method-unsupported",
         "actor": "admin",
@@ -806,24 +746,22 @@
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
     },
     {
-      "id": "agent.webmeetAgent.discovery.resources.list",
+      "id": "agent.userPersistoAgent.mcp-get-transport",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest agent runs scripts/startAgent.sh, which ends with exec sh /Agent/server/AgentServer.sh (AchillesIDE/webmeetAgent/scripts/startAgent.sh:52); AchillesIDE/webmeetAgent/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/webmeetAgent registers no handler for resources/list; an initialized administrator session receives JSON-RPC -32601 at the resources/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs (GET /<agent>/mcp with an initialized administrator session); cli/server/mcp-proxy/index.js:827-830 (GET returns 405 event_stream_not_supported, Allow: POST, DELETE)",
+      "reason": "The public agent MCP route for AchillesIDE/userPersistoAgent offers no GET event stream. Supported POST/session ownership, MCP session deletion and the WebChat and terminal streams remain mandatory.",
       "affectedObligations": [
-        "agent-inventory/AchillesIDE/webmeetAgent:POST:/webmeetAgent/mcp:mcp-discovery"
+        "agent-inventory/AchillesIDE/userPersistoAgent:GET:/userPersistoAgent/mcp:sse"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "The agent MCP transport is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
-        "kind": "rpc-method-unsupported",
+        "kind": "unsupported-transport",
         "actor": "admin",
-        "endpoint": "/webmeetAgent/mcp",
-        "requestedMethod": "resources/list",
-        "stage": "resources/list",
-        "initialized": true,
-        "httpStatus": 200,
-        "rpcCode": -32601
+        "endpoint": "/userPersistoAgent/mcp",
+        "httpStatus": 405,
+        "errorCode": "event_stream_not_supported",
+        "allow": "POST,DELETE"
       },
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
     },
@@ -831,12 +769,12 @@
       "id": "agent.webmeetAgent.discovery.resources.templates.list",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest agent runs scripts/startAgent.sh, which ends with exec sh /Agent/server/AgentServer.sh (AchillesIDE/webmeetAgent/scripts/startAgent.sh:52); AchillesIDE/webmeetAgent/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/webmeetAgent registers no handler for resources/templates/list; an initialized administrator session receives JSON-RPC -32601 at the resources/templates/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs:255-260; cli/server/RoutingServer.js:746-756 (route with a host port dispatches to handleAgentMcpRequest); cli/server/mcp-proxy/index.js:936-990 (readiness gate; no manifest declares readiness.protocol none); :656-670 (Router-local initialize and session); :782-783 (default branch: HTTP 200, -32601 Method not found, no upstream call)",
+      "reason": "The public Router MCP proxy does not implement resources/templates/list; an initialized administrator session for AchillesIDE/webmeetAgent receives HTTP 200 JSON-RPC -32601 from the Router default branch at the resources/templates/list stage. No authorization or empty-list claim is made; tools/list and resources/list stay mandatory.",
       "affectedObligations": [
         "agent-inventory/AchillesIDE/webmeetAgent:POST:/webmeetAgent/mcp:mcp-discovery"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "Router MCP method support is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
         "kind": "rpc-method-unsupported",
         "actor": "admin",
@@ -853,12 +791,12 @@
       "id": "agent.webmeetAgent.discovery.prompts.list",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest agent runs scripts/startAgent.sh, which ends with exec sh /Agent/server/AgentServer.sh (AchillesIDE/webmeetAgent/scripts/startAgent.sh:52); AchillesIDE/webmeetAgent/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/webmeetAgent registers no handler for prompts/list; an initialized administrator session receives JSON-RPC -32601 at the prompts/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs:255-260; cli/server/RoutingServer.js:746-756 (route with a host port dispatches to handleAgentMcpRequest); cli/server/mcp-proxy/index.js:936-990 (readiness gate; no manifest declares readiness.protocol none); :656-670 (Router-local initialize and session); :782-783 (default branch: HTTP 200, -32601 Method not found, no upstream call)",
+      "reason": "The public Router MCP proxy does not implement prompts/list; an initialized administrator session for AchillesIDE/webmeetAgent receives HTTP 200 JSON-RPC -32601 from the Router default branch at the prompts/list stage. No authorization or empty-list claim is made; tools/list and resources/list stay mandatory.",
       "affectedObligations": [
         "agent-inventory/AchillesIDE/webmeetAgent:POST:/webmeetAgent/mcp:mcp-discovery"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "Router MCP method support is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
         "kind": "rpc-method-unsupported",
         "actor": "admin",
@@ -872,24 +810,22 @@
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
     },
     {
-      "id": "agent.workspaceMonitorAgent.discovery.resources.list",
+      "id": "agent.webmeetAgent.mcp-get-transport",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest agent runs server/supervisor.mjs, which starts /Agent/server/AgentServer.sh (AchillesIDE/workspaceMonitorAgent/server/supervisor.mjs:42); AchillesIDE/workspaceMonitorAgent/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/workspaceMonitorAgent registers no handler for resources/list; an initialized administrator session receives JSON-RPC -32601 at the resources/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs (GET /<agent>/mcp with an initialized administrator session); cli/server/mcp-proxy/index.js:827-830 (GET returns 405 event_stream_not_supported, Allow: POST, DELETE)",
+      "reason": "The public agent MCP route for AchillesIDE/webmeetAgent offers no GET event stream. Supported POST/session ownership, MCP session deletion and the WebChat and terminal streams remain mandatory.",
       "affectedObligations": [
-        "agent-inventory/AchillesIDE/workspaceMonitorAgent:POST:/workspaceMonitorAgent/mcp:mcp-discovery"
+        "agent-inventory/AchillesIDE/webmeetAgent:GET:/webmeetAgent/mcp:sse"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "The agent MCP transport is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
-        "kind": "rpc-method-unsupported",
+        "kind": "unsupported-transport",
         "actor": "admin",
-        "endpoint": "/workspaceMonitorAgent/mcp",
-        "requestedMethod": "resources/list",
-        "stage": "resources/list",
-        "initialized": true,
-        "httpStatus": 200,
-        "rpcCode": -32601
+        "endpoint": "/webmeetAgent/mcp",
+        "httpStatus": 405,
+        "errorCode": "event_stream_not_supported",
+        "allow": "POST,DELETE"
       },
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
     },
@@ -897,12 +833,12 @@
       "id": "agent.workspaceMonitorAgent.discovery.resources.templates.list",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest agent runs server/supervisor.mjs, which starts /Agent/server/AgentServer.sh (AchillesIDE/workspaceMonitorAgent/server/supervisor.mjs:42); AchillesIDE/workspaceMonitorAgent/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/workspaceMonitorAgent registers no handler for resources/templates/list; an initialized administrator session receives JSON-RPC -32601 at the resources/templates/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs:255-260; cli/server/RoutingServer.js:746-756 (route with a host port dispatches to handleAgentMcpRequest); cli/server/mcp-proxy/index.js:936-990 (readiness gate; no manifest declares readiness.protocol none); :656-670 (Router-local initialize and session); :782-783 (default branch: HTTP 200, -32601 Method not found, no upstream call)",
+      "reason": "The public Router MCP proxy does not implement resources/templates/list; an initialized administrator session for AchillesIDE/workspaceMonitorAgent receives HTTP 200 JSON-RPC -32601 from the Router default branch at the resources/templates/list stage. No authorization or empty-list claim is made; tools/list and resources/list stay mandatory.",
       "affectedObligations": [
         "agent-inventory/AchillesIDE/workspaceMonitorAgent:POST:/workspaceMonitorAgent/mcp:mcp-discovery"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "Router MCP method support is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
         "kind": "rpc-method-unsupported",
         "actor": "admin",
@@ -919,12 +855,12 @@
       "id": "agent.workspaceMonitorAgent.discovery.prompts.list",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest agent runs server/supervisor.mjs, which starts /Agent/server/AgentServer.sh (AchillesIDE/workspaceMonitorAgent/server/supervisor.mjs:42); AchillesIDE/workspaceMonitorAgent/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesIDE/workspaceMonitorAgent registers no handler for prompts/list; an initialized administrator session receives JSON-RPC -32601 at the prompts/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs:255-260; cli/server/RoutingServer.js:746-756 (route with a host port dispatches to handleAgentMcpRequest); cli/server/mcp-proxy/index.js:936-990 (readiness gate; no manifest declares readiness.protocol none); :656-670 (Router-local initialize and session); :782-783 (default branch: HTTP 200, -32601 Method not found, no upstream call)",
+      "reason": "The public Router MCP proxy does not implement prompts/list; an initialized administrator session for AchillesIDE/workspaceMonitorAgent receives HTTP 200 JSON-RPC -32601 from the Router default branch at the prompts/list stage. No authorization or empty-list claim is made; tools/list and resources/list stay mandatory.",
       "affectedObligations": [
         "agent-inventory/AchillesIDE/workspaceMonitorAgent:POST:/workspaceMonitorAgent/mcp:mcp-discovery"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "Router MCP method support is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
         "kind": "rpc-method-unsupported",
         "actor": "admin",
@@ -938,24 +874,22 @@
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
     },
     {
-      "id": "agent.roboTeamAgent.discovery.resources.list",
+      "id": "agent.workspaceMonitorAgent.mcp-get-transport",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest agent runs scripts/startAgent.sh, which starts /Agent/server/AgentServer.sh (AchillesCLI/roboTeamAgent/scripts/startAgent.sh:15,19); AchillesCLI/roboTeamAgent/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesCLI/roboTeamAgent registers no handler for resources/list; an initialized administrator session receives JSON-RPC -32601 at the resources/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs (GET /<agent>/mcp with an initialized administrator session); cli/server/mcp-proxy/index.js:827-830 (GET returns 405 event_stream_not_supported, Allow: POST, DELETE)",
+      "reason": "The public agent MCP route for AchillesIDE/workspaceMonitorAgent offers no GET event stream. Supported POST/session ownership, MCP session deletion and the WebChat and terminal streams remain mandatory.",
       "affectedObligations": [
-        "agent-inventory/AchillesCLI/roboTeamAgent:POST:/roboTeamAgent/mcp:mcp-discovery"
+        "agent-inventory/AchillesIDE/workspaceMonitorAgent:GET:/workspaceMonitorAgent/mcp:sse"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "The agent MCP transport is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
-        "kind": "rpc-method-unsupported",
+        "kind": "unsupported-transport",
         "actor": "admin",
-        "endpoint": "/roboTeamAgent/mcp",
-        "requestedMethod": "resources/list",
-        "stage": "resources/list",
-        "initialized": true,
-        "httpStatus": 200,
-        "rpcCode": -32601
+        "endpoint": "/workspaceMonitorAgent/mcp",
+        "httpStatus": 405,
+        "errorCode": "event_stream_not_supported",
+        "allow": "POST,DELETE"
       },
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
     },
@@ -963,12 +897,12 @@
       "id": "agent.roboTeamAgent.discovery.resources.templates.list",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest agent runs scripts/startAgent.sh, which starts /Agent/server/AgentServer.sh (AchillesCLI/roboTeamAgent/scripts/startAgent.sh:15,19); AchillesCLI/roboTeamAgent/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesCLI/roboTeamAgent registers no handler for resources/templates/list; an initialized administrator session receives JSON-RPC -32601 at the resources/templates/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs:255-260; cli/server/RoutingServer.js:746-756 (route with a host port dispatches to handleAgentMcpRequest); cli/server/mcp-proxy/index.js:936-990 (readiness gate; no manifest declares readiness.protocol none); :656-670 (Router-local initialize and session); :782-783 (default branch: HTTP 200, -32601 Method not found, no upstream call)",
+      "reason": "The public Router MCP proxy does not implement resources/templates/list; an initialized administrator session for AchillesCLI/roboTeamAgent receives HTTP 200 JSON-RPC -32601 from the Router default branch at the resources/templates/list stage. No authorization or empty-list claim is made; tools/list and resources/list stay mandatory.",
       "affectedObligations": [
         "agent-inventory/AchillesCLI/roboTeamAgent:POST:/roboTeamAgent/mcp:mcp-discovery"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "Router MCP method support is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
         "kind": "rpc-method-unsupported",
         "actor": "admin",
@@ -985,12 +919,12 @@
       "id": "agent.roboTeamAgent.discovery.prompts.list",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest agent runs scripts/startAgent.sh, which starts /Agent/server/AgentServer.sh (AchillesCLI/roboTeamAgent/scripts/startAgent.sh:15,19); AchillesCLI/roboTeamAgent/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for AchillesCLI/roboTeamAgent registers no handler for prompts/list; an initialized administrator session receives JSON-RPC -32601 at the prompts/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs:255-260; cli/server/RoutingServer.js:746-756 (route with a host port dispatches to handleAgentMcpRequest); cli/server/mcp-proxy/index.js:936-990 (readiness gate; no manifest declares readiness.protocol none); :656-670 (Router-local initialize and session); :782-783 (default branch: HTTP 200, -32601 Method not found, no upstream call)",
+      "reason": "The public Router MCP proxy does not implement prompts/list; an initialized administrator session for AchillesCLI/roboTeamAgent receives HTTP 200 JSON-RPC -32601 from the Router default branch at the prompts/list stage. No authorization or empty-list claim is made; tools/list and resources/list stay mandatory.",
       "affectedObligations": [
         "agent-inventory/AchillesCLI/roboTeamAgent:POST:/roboTeamAgent/mcp:mcp-discovery"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "Router MCP method support is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
         "kind": "rpc-method-unsupported",
         "actor": "admin",
@@ -1004,24 +938,22 @@
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
     },
     {
-      "id": "agent.umamiAgent.discovery.resources.list",
+      "id": "agent.roboTeamAgent.mcp-get-transport",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest agent runs scripts/start-umami-agent.sh, which starts sh /Agent/server/AgentServer.sh (UmamiAgent/umamiAgent/scripts/start-umami-agent.sh:168); UmamiAgent/umamiAgent/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for UmamiAgent/umamiAgent registers no handler for resources/list; an initialized administrator session receives JSON-RPC -32601 at the resources/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs (GET /<agent>/mcp with an initialized administrator session); cli/server/mcp-proxy/index.js:827-830 (GET returns 405 event_stream_not_supported, Allow: POST, DELETE)",
+      "reason": "The public agent MCP route for AchillesCLI/roboTeamAgent offers no GET event stream. Supported POST/session ownership, MCP session deletion and the WebChat and terminal streams remain mandatory.",
       "affectedObligations": [
-        "agent-inventory/UmamiAgent/umamiAgent:POST:/umamiAgent/mcp:mcp-discovery"
+        "agent-inventory/AchillesCLI/roboTeamAgent:GET:/roboTeamAgent/mcp:sse"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "The agent MCP transport is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
-        "kind": "rpc-method-unsupported",
+        "kind": "unsupported-transport",
         "actor": "admin",
-        "endpoint": "/umamiAgent/mcp",
-        "requestedMethod": "resources/list",
-        "stage": "resources/list",
-        "initialized": true,
-        "httpStatus": 200,
-        "rpcCode": -32601
+        "endpoint": "/roboTeamAgent/mcp",
+        "httpStatus": 405,
+        "errorCode": "event_stream_not_supported",
+        "allow": "POST,DELETE"
       },
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
     },
@@ -1029,12 +961,12 @@
       "id": "agent.umamiAgent.discovery.resources.templates.list",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest agent runs scripts/start-umami-agent.sh, which starts sh /Agent/server/AgentServer.sh (UmamiAgent/umamiAgent/scripts/start-umami-agent.sh:168); UmamiAgent/umamiAgent/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for UmamiAgent/umamiAgent registers no handler for resources/templates/list; an initialized administrator session receives JSON-RPC -32601 at the resources/templates/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs:255-260; cli/server/RoutingServer.js:746-756 (route with a host port dispatches to handleAgentMcpRequest); cli/server/mcp-proxy/index.js:936-990 (readiness gate; no manifest declares readiness.protocol none); :656-670 (Router-local initialize and session); :782-783 (default branch: HTTP 200, -32601 Method not found, no upstream call)",
+      "reason": "The public Router MCP proxy does not implement resources/templates/list; an initialized administrator session for UmamiAgent/umamiAgent receives HTTP 200 JSON-RPC -32601 from the Router default branch at the resources/templates/list stage. No authorization or empty-list claim is made; tools/list and resources/list stay mandatory.",
       "affectedObligations": [
         "agent-inventory/UmamiAgent/umamiAgent:POST:/umamiAgent/mcp:mcp-discovery"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "Router MCP method support is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
         "kind": "rpc-method-unsupported",
         "actor": "admin",
@@ -1051,12 +983,12 @@
       "id": "agent.umamiAgent.discovery.prompts.list",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest agent runs scripts/start-umami-agent.sh, which starts sh /Agent/server/AgentServer.sh (UmamiAgent/umamiAgent/scripts/start-umami-agent.sh:168); UmamiAgent/umamiAgent/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for UmamiAgent/umamiAgent registers no handler for prompts/list; an initialized administrator session receives JSON-RPC -32601 at the prompts/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs:255-260; cli/server/RoutingServer.js:746-756 (route with a host port dispatches to handleAgentMcpRequest); cli/server/mcp-proxy/index.js:936-990 (readiness gate; no manifest declares readiness.protocol none); :656-670 (Router-local initialize and session); :782-783 (default branch: HTTP 200, -32601 Method not found, no upstream call)",
+      "reason": "The public Router MCP proxy does not implement prompts/list; an initialized administrator session for UmamiAgent/umamiAgent receives HTTP 200 JSON-RPC -32601 from the Router default branch at the prompts/list stage. No authorization or empty-list claim is made; tools/list and resources/list stay mandatory.",
       "affectedObligations": [
         "agent-inventory/UmamiAgent/umamiAgent:POST:/umamiAgent/mcp:mcp-discovery"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "Router MCP method support is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
         "kind": "rpc-method-unsupported",
         "actor": "admin",
@@ -1070,24 +1002,22 @@
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
     },
     {
-      "id": "agent.local-llm.discovery.resources.list",
+      "id": "agent.umamiAgent.mcp-get-transport",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest agent runs src/main.mjs, which spawns /Agent/server/AgentServer.mjs (local-llms/local-llm/src/main.mjs:90); local-llms/local-llm/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for local-llms/local-llm registers no handler for resources/list; an initialized administrator session receives JSON-RPC -32601 at the resources/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs (GET /<agent>/mcp with an initialized administrator session); cli/server/mcp-proxy/index.js:827-830 (GET returns 405 event_stream_not_supported, Allow: POST, DELETE)",
+      "reason": "The public agent MCP route for UmamiAgent/umamiAgent offers no GET event stream. Supported POST/session ownership, MCP session deletion and the WebChat and terminal streams remain mandatory.",
       "affectedObligations": [
-        "agent-inventory/local-llms/local-llm:POST:/local-llm/mcp:mcp-discovery"
+        "agent-inventory/UmamiAgent/umamiAgent:GET:/umamiAgent/mcp:sse"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "The agent MCP transport is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
-        "kind": "rpc-method-unsupported",
+        "kind": "unsupported-transport",
         "actor": "admin",
-        "endpoint": "/local-llm/mcp",
-        "requestedMethod": "resources/list",
-        "stage": "resources/list",
-        "initialized": true,
-        "httpStatus": 200,
-        "rpcCode": -32601
+        "endpoint": "/umamiAgent/mcp",
+        "httpStatus": 405,
+        "errorCode": "event_stream_not_supported",
+        "allow": "POST,DELETE"
       },
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
     },
@@ -1095,12 +1025,12 @@
       "id": "agent.local-llm.discovery.resources.templates.list",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest agent runs src/main.mjs, which spawns /Agent/server/AgentServer.mjs (local-llms/local-llm/src/main.mjs:90); local-llms/local-llm/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for local-llms/local-llm registers no handler for resources/templates/list; an initialized administrator session receives JSON-RPC -32601 at the resources/templates/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs:255-260; cli/server/RoutingServer.js:746-756 (route with a host port dispatches to handleAgentMcpRequest); cli/server/mcp-proxy/index.js:936-990 (readiness gate; no manifest declares readiness.protocol none); :656-670 (Router-local initialize and session); :782-783 (default branch: HTTP 200, -32601 Method not found, no upstream call)",
+      "reason": "The public Router MCP proxy does not implement resources/templates/list; an initialized administrator session for local-llms/local-llm receives HTTP 200 JSON-RPC -32601 from the Router default branch at the resources/templates/list stage. No authorization or empty-list claim is made; tools/list and resources/list stay mandatory.",
       "affectedObligations": [
         "agent-inventory/local-llms/local-llm:POST:/local-llm/mcp:mcp-discovery"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "Router MCP method support is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
         "kind": "rpc-method-unsupported",
         "actor": "admin",
@@ -1117,12 +1047,12 @@
       "id": "agent.local-llm.discovery.prompts.list",
       "category": "static-unsupported-protocol",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:255-256; manifest agent runs src/main.mjs, which spawns /Agent/server/AgentServer.mjs (local-llms/local-llm/src/main.mjs:90); local-llms/local-llm/mcp-config.json declares tools but no resources or prompts; node_modules/mcp-sdk/index.mjs:5353-5365 (Protocol._onrequest answers an unregistered method with ErrorCode.MethodNotFound -32601; McpServer registers resources/*, prompts/list and tools/list handlers only when a resource, prompt or tool is registered, index.mjs:14967,15122-15233,15409); Agent/server/AgentServer.mjs:1426-1500 registers resources and prompts only from config.resources/config.prompts; AgentServer.mjs:1703 enableJsonResponse returns the JSON-RPC error with HTTP 200",
-      "reason": "The pinned AgentServer for local-llms/local-llm registers no handler for prompts/list; an initialized administrator session receives JSON-RPC -32601 at the prompts/list stage. No authorization or empty-list claim is made.",
+      "source": "tests/security/authorization/agent-probes.mjs:255-260; cli/server/RoutingServer.js:746-756 (route with a host port dispatches to handleAgentMcpRequest); cli/server/mcp-proxy/index.js:936-990 (readiness gate; no manifest declares readiness.protocol none); :656-670 (Router-local initialize and session); :782-783 (default branch: HTTP 200, -32601 Method not found, no upstream call)",
+      "reason": "The public Router MCP proxy does not implement prompts/list; an initialized administrator session for local-llms/local-llm receives HTTP 200 JSON-RPC -32601 from the Router default branch at the prompts/list stage. No authorization or empty-list claim is made; tools/list and resources/list stay mandatory.",
       "affectedObligations": [
         "agent-inventory/local-llms/local-llm:POST:/local-llm/mcp:mcp-discovery"
       ],
-      "outsideChangedBehavior": "MCP discovery-method support is unchanged by the U3/U6/U7 candidate; tool invocation authorization remains separately mandatory.",
+      "outsideChangedBehavior": "Router MCP method support is unchanged by the U3/U6/U7 candidate.",
       "evidence": {
         "kind": "rpc-method-unsupported",
         "actor": "admin",
@@ -1132,6 +1062,90 @@
         "initialized": true,
         "httpStatus": 200,
         "rpcCode": -32601
+      },
+      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
+    },
+    {
+      "id": "agent.local-llm.mcp-get-transport",
+      "category": "static-unsupported-protocol",
+      "presence": "required",
+      "source": "tests/security/authorization/agent-probes.mjs (GET /<agent>/mcp with an initialized administrator session); cli/server/mcp-proxy/index.js:827-830 (GET returns 405 event_stream_not_supported, Allow: POST, DELETE)",
+      "reason": "The public agent MCP route for local-llms/local-llm offers no GET event stream. Supported POST/session ownership, MCP session deletion and the WebChat and terminal streams remain mandatory.",
+      "affectedObligations": [
+        "agent-inventory/local-llms/local-llm:GET:/local-llm/mcp:sse"
+      ],
+      "outsideChangedBehavior": "The agent MCP transport is unchanged by the U3/U6/U7 candidate.",
+      "evidence": {
+        "kind": "unsupported-transport",
+        "actor": "admin",
+        "endpoint": "/local-llm/mcp",
+        "httpStatus": 405,
+        "errorCode": "event_stream_not_supported",
+        "allow": "POST,DELETE"
+      },
+      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
+    },
+    {
+      "id": "agent.soul-gateway.discovery.resources.templates.list",
+      "category": "static-unsupported-protocol",
+      "presence": "required",
+      "source": "tests/security/authorization/agent-probes.mjs:255-260; cli/server/RoutingServer.js:746-756 (route with a host port dispatches to handleAgentMcpRequest); cli/server/mcp-proxy/index.js:936-990 (readiness gate; no manifest declares readiness.protocol none); :656-670 (Router-local initialize and session); :782-783 (default branch: HTTP 200, -32601 Method not found, no upstream call)",
+      "reason": "The public Router MCP proxy does not implement resources/templates/list; an initialized administrator session for proxies/soul-gateway receives HTTP 200 JSON-RPC -32601 from the Router default branch at the resources/templates/list stage. No authorization or empty-list claim is made; tools/list and resources/list stay mandatory.",
+      "affectedObligations": [
+        "agent-inventory/proxies/soul-gateway:POST:/soul-gateway/mcp:mcp-discovery"
+      ],
+      "outsideChangedBehavior": "Router MCP method support is unchanged by the U3/U6/U7 candidate.",
+      "evidence": {
+        "kind": "rpc-method-unsupported",
+        "actor": "admin",
+        "endpoint": "/soul-gateway/mcp",
+        "requestedMethod": "resources/templates/list",
+        "stage": "resources/templates/list",
+        "initialized": true,
+        "httpStatus": 200,
+        "rpcCode": -32601
+      },
+      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
+    },
+    {
+      "id": "agent.soul-gateway.discovery.prompts.list",
+      "category": "static-unsupported-protocol",
+      "presence": "required",
+      "source": "tests/security/authorization/agent-probes.mjs:255-260; cli/server/RoutingServer.js:746-756 (route with a host port dispatches to handleAgentMcpRequest); cli/server/mcp-proxy/index.js:936-990 (readiness gate; no manifest declares readiness.protocol none); :656-670 (Router-local initialize and session); :782-783 (default branch: HTTP 200, -32601 Method not found, no upstream call)",
+      "reason": "The public Router MCP proxy does not implement prompts/list; an initialized administrator session for proxies/soul-gateway receives HTTP 200 JSON-RPC -32601 from the Router default branch at the prompts/list stage. No authorization or empty-list claim is made; tools/list and resources/list stay mandatory.",
+      "affectedObligations": [
+        "agent-inventory/proxies/soul-gateway:POST:/soul-gateway/mcp:mcp-discovery"
+      ],
+      "outsideChangedBehavior": "Router MCP method support is unchanged by the U3/U6/U7 candidate.",
+      "evidence": {
+        "kind": "rpc-method-unsupported",
+        "actor": "admin",
+        "endpoint": "/soul-gateway/mcp",
+        "requestedMethod": "prompts/list",
+        "stage": "prompts/list",
+        "initialized": true,
+        "httpStatus": 200,
+        "rpcCode": -32601
+      },
+      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
+    },
+    {
+      "id": "agent.soul-gateway.mcp-get-transport",
+      "category": "static-unsupported-protocol",
+      "presence": "required",
+      "source": "tests/security/authorization/agent-probes.mjs (GET /<agent>/mcp with an initialized administrator session); cli/server/mcp-proxy/index.js:827-830 (GET returns 405 event_stream_not_supported, Allow: POST, DELETE)",
+      "reason": "The public agent MCP route for proxies/soul-gateway offers no GET event stream. Supported POST/session ownership, MCP session deletion and the WebChat and terminal streams remain mandatory.",
+      "affectedObligations": [
+        "agent-inventory/proxies/soul-gateway:GET:/soul-gateway/mcp:sse"
+      ],
+      "outsideChangedBehavior": "The agent MCP transport is unchanged by the U3/U6/U7 candidate.",
+      "evidence": {
+        "kind": "unsupported-transport",
+        "actor": "admin",
+        "endpoint": "/soul-gateway/mcp",
+        "httpStatus": 405,
+        "errorCode": "event_stream_not_supported",
+        "allow": "POST,DELETE"
       },
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
     },
@@ -1452,57 +1466,11 @@
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
     },
     {
-      "id": "router:users-list.path-duplicate-slash:anonymous",
-      "category": "protocol-combination-outside-changed-paths",
-      "presence": "boundary-or-denial-pass",
-      "source": "tests/security/authorization/router-probes.mjs:90-104 (boundaryRejectionStatuses [400,404,405,421]) and :249-252 (gap plus BOUNDARY_REJECTED_ONLY coverage)",
-      "reason": "Raw non-canonical path rejected before the resource; normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks stay mandatory. If the Router instead returns an explicit 401/403, no gap is recorded and the denial check must PASS.",
-      "affectedObligations": [
-        "router/users-list.get"
-      ],
-      "outsideChangedBehavior": "Router path normalization is unchanged by the U3/U6/U7 candidate.",
-      "evidence": {
-        "kind": "boundary-rejected",
-        "probeId": "users-list.path-duplicate-slash",
-        "actor": "anonymous",
-        "httpStatuses": [
-          400,
-          404,
-          405,
-          421
-        ]
-      },
-      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
-    },
-    {
-      "id": "router:users-list.path-duplicate-slash:selfRegistered",
-      "category": "protocol-combination-outside-changed-paths",
-      "presence": "boundary-or-denial-pass",
-      "source": "tests/security/authorization/router-probes.mjs:90-104 (boundaryRejectionStatuses [400,404,405,421]) and :249-252 (gap plus BOUNDARY_REJECTED_ONLY coverage)",
-      "reason": "Raw non-canonical path rejected before the resource; normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks stay mandatory. If the Router instead returns an explicit 401/403, no gap is recorded and the denial check must PASS.",
-      "affectedObligations": [
-        "router/users-list.get"
-      ],
-      "outsideChangedBehavior": "Router path normalization is unchanged by the U3/U6/U7 candidate.",
-      "evidence": {
-        "kind": "boundary-rejected",
-        "probeId": "users-list.path-duplicate-slash",
-        "actor": "selfRegistered",
-        "httpStatuses": [
-          400,
-          404,
-          405,
-          421
-        ]
-      },
-      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
-    },
-    {
       "id": "router:users-list.path-duplicate-slash:userA",
       "category": "protocol-combination-outside-changed-paths",
-      "presence": "boundary-or-denial-pass",
-      "source": "tests/security/authorization/router-probes.mjs:90-104 (boundaryRejectionStatuses [400,404,405,421]) and :249-252 (gap plus BOUNDARY_REJECTED_ONLY coverage)",
-      "reason": "Raw non-canonical path rejected before the resource; normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks stay mandatory. If the Router instead returns an explicit 401/403, no gap is recorded and the denial check must PASS.",
+      "presence": "required",
+      "source": "tests/security/authorization/router-probes.mjs:90-104,249-252; cli/server/RoutingServer.js:395,503-505,603-609,793-794 and cli/server/authHandlers/userAdminRoutes.js:112-126,191-203 (the raw path misses user-admin dispatch; an authorized ordinary user passes normal authentication and reaches the 404 fallthrough)",
+      "reason": "Raw non-canonical path misses user administration; an authorized ordinary user receives 404. Normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks and the anonymous/selfRegistered denials on this path stay mandatory.",
       "affectedObligations": [
         "router/users-list.get"
       ],
@@ -1512,10 +1480,7 @@
         "probeId": "users-list.path-duplicate-slash",
         "actor": "userA",
         "httpStatuses": [
-          400,
-          404,
-          405,
-          421
+          404
         ]
       },
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
@@ -1523,9 +1488,9 @@
     {
       "id": "router:users-list.path-duplicate-slash:userB",
       "category": "protocol-combination-outside-changed-paths",
-      "presence": "boundary-or-denial-pass",
-      "source": "tests/security/authorization/router-probes.mjs:90-104 (boundaryRejectionStatuses [400,404,405,421]) and :249-252 (gap plus BOUNDARY_REJECTED_ONLY coverage)",
-      "reason": "Raw non-canonical path rejected before the resource; normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks stay mandatory. If the Router instead returns an explicit 401/403, no gap is recorded and the denial check must PASS.",
+      "presence": "required",
+      "source": "tests/security/authorization/router-probes.mjs:90-104,249-252; cli/server/RoutingServer.js:395,503-505,603-609,793-794 and cli/server/authHandlers/userAdminRoutes.js:112-126,191-203 (the raw path misses user-admin dispatch; an authorized ordinary user passes normal authentication and reaches the 404 fallthrough)",
+      "reason": "Raw non-canonical path misses user administration; an authorized ordinary user receives 404. Normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks and the anonymous/selfRegistered denials on this path stay mandatory.",
       "affectedObligations": [
         "router/users-list.get"
       ],
@@ -1535,332 +1500,7 @@
         "probeId": "users-list.path-duplicate-slash",
         "actor": "userB",
         "httpStatuses": [
-          400,
-          404,
-          405,
-          421
-        ]
-      },
-      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
-    },
-    {
-      "id": "router:users-list.path-dot-segment:anonymous",
-      "category": "protocol-combination-outside-changed-paths",
-      "presence": "boundary-or-denial-pass",
-      "source": "tests/security/authorization/router-probes.mjs:90-104 (boundaryRejectionStatuses [400,404,405,421]) and :249-252 (gap plus BOUNDARY_REJECTED_ONLY coverage)",
-      "reason": "Raw non-canonical path rejected before the resource; normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks stay mandatory. If the Router instead returns an explicit 401/403, no gap is recorded and the denial check must PASS.",
-      "affectedObligations": [
-        "router/users-list.get"
-      ],
-      "outsideChangedBehavior": "Router path normalization is unchanged by the U3/U6/U7 candidate.",
-      "evidence": {
-        "kind": "boundary-rejected",
-        "probeId": "users-list.path-dot-segment",
-        "actor": "anonymous",
-        "httpStatuses": [
-          400,
-          404,
-          405,
-          421
-        ]
-      },
-      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
-    },
-    {
-      "id": "router:users-list.path-dot-segment:selfRegistered",
-      "category": "protocol-combination-outside-changed-paths",
-      "presence": "boundary-or-denial-pass",
-      "source": "tests/security/authorization/router-probes.mjs:90-104 (boundaryRejectionStatuses [400,404,405,421]) and :249-252 (gap plus BOUNDARY_REJECTED_ONLY coverage)",
-      "reason": "Raw non-canonical path rejected before the resource; normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks stay mandatory. If the Router instead returns an explicit 401/403, no gap is recorded and the denial check must PASS.",
-      "affectedObligations": [
-        "router/users-list.get"
-      ],
-      "outsideChangedBehavior": "Router path normalization is unchanged by the U3/U6/U7 candidate.",
-      "evidence": {
-        "kind": "boundary-rejected",
-        "probeId": "users-list.path-dot-segment",
-        "actor": "selfRegistered",
-        "httpStatuses": [
-          400,
-          404,
-          405,
-          421
-        ]
-      },
-      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
-    },
-    {
-      "id": "router:users-list.path-dot-segment:userA",
-      "category": "protocol-combination-outside-changed-paths",
-      "presence": "boundary-or-denial-pass",
-      "source": "tests/security/authorization/router-probes.mjs:90-104 (boundaryRejectionStatuses [400,404,405,421]) and :249-252 (gap plus BOUNDARY_REJECTED_ONLY coverage)",
-      "reason": "Raw non-canonical path rejected before the resource; normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks stay mandatory. If the Router instead returns an explicit 401/403, no gap is recorded and the denial check must PASS.",
-      "affectedObligations": [
-        "router/users-list.get"
-      ],
-      "outsideChangedBehavior": "Router path normalization is unchanged by the U3/U6/U7 candidate.",
-      "evidence": {
-        "kind": "boundary-rejected",
-        "probeId": "users-list.path-dot-segment",
-        "actor": "userA",
-        "httpStatuses": [
-          400,
-          404,
-          405,
-          421
-        ]
-      },
-      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
-    },
-    {
-      "id": "router:users-list.path-dot-segment:userB",
-      "category": "protocol-combination-outside-changed-paths",
-      "presence": "boundary-or-denial-pass",
-      "source": "tests/security/authorization/router-probes.mjs:90-104 (boundaryRejectionStatuses [400,404,405,421]) and :249-252 (gap plus BOUNDARY_REJECTED_ONLY coverage)",
-      "reason": "Raw non-canonical path rejected before the resource; normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks stay mandatory. If the Router instead returns an explicit 401/403, no gap is recorded and the denial check must PASS.",
-      "affectedObligations": [
-        "router/users-list.get"
-      ],
-      "outsideChangedBehavior": "Router path normalization is unchanged by the U3/U6/U7 candidate.",
-      "evidence": {
-        "kind": "boundary-rejected",
-        "probeId": "users-list.path-dot-segment",
-        "actor": "userB",
-        "httpStatuses": [
-          400,
-          404,
-          405,
-          421
-        ]
-      },
-      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
-    },
-    {
-      "id": "router:users-list.path-parent-segment:anonymous",
-      "category": "protocol-combination-outside-changed-paths",
-      "presence": "boundary-or-denial-pass",
-      "source": "tests/security/authorization/router-probes.mjs:90-104 (boundaryRejectionStatuses [400,404,405,421]) and :249-252 (gap plus BOUNDARY_REJECTED_ONLY coverage)",
-      "reason": "Raw non-canonical path rejected before the resource; normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks stay mandatory. If the Router instead returns an explicit 401/403, no gap is recorded and the denial check must PASS.",
-      "affectedObligations": [
-        "router/users-list.get"
-      ],
-      "outsideChangedBehavior": "Router path normalization is unchanged by the U3/U6/U7 candidate.",
-      "evidence": {
-        "kind": "boundary-rejected",
-        "probeId": "users-list.path-parent-segment",
-        "actor": "anonymous",
-        "httpStatuses": [
-          400,
-          404,
-          405,
-          421
-        ]
-      },
-      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
-    },
-    {
-      "id": "router:users-list.path-parent-segment:selfRegistered",
-      "category": "protocol-combination-outside-changed-paths",
-      "presence": "boundary-or-denial-pass",
-      "source": "tests/security/authorization/router-probes.mjs:90-104 (boundaryRejectionStatuses [400,404,405,421]) and :249-252 (gap plus BOUNDARY_REJECTED_ONLY coverage)",
-      "reason": "Raw non-canonical path rejected before the resource; normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks stay mandatory. If the Router instead returns an explicit 401/403, no gap is recorded and the denial check must PASS.",
-      "affectedObligations": [
-        "router/users-list.get"
-      ],
-      "outsideChangedBehavior": "Router path normalization is unchanged by the U3/U6/U7 candidate.",
-      "evidence": {
-        "kind": "boundary-rejected",
-        "probeId": "users-list.path-parent-segment",
-        "actor": "selfRegistered",
-        "httpStatuses": [
-          400,
-          404,
-          405,
-          421
-        ]
-      },
-      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
-    },
-    {
-      "id": "router:users-list.path-parent-segment:userA",
-      "category": "protocol-combination-outside-changed-paths",
-      "presence": "boundary-or-denial-pass",
-      "source": "tests/security/authorization/router-probes.mjs:90-104 (boundaryRejectionStatuses [400,404,405,421]) and :249-252 (gap plus BOUNDARY_REJECTED_ONLY coverage)",
-      "reason": "Raw non-canonical path rejected before the resource; normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks stay mandatory. If the Router instead returns an explicit 401/403, no gap is recorded and the denial check must PASS.",
-      "affectedObligations": [
-        "router/users-list.get"
-      ],
-      "outsideChangedBehavior": "Router path normalization is unchanged by the U3/U6/U7 candidate.",
-      "evidence": {
-        "kind": "boundary-rejected",
-        "probeId": "users-list.path-parent-segment",
-        "actor": "userA",
-        "httpStatuses": [
-          400,
-          404,
-          405,
-          421
-        ]
-      },
-      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
-    },
-    {
-      "id": "router:users-list.path-parent-segment:userB",
-      "category": "protocol-combination-outside-changed-paths",
-      "presence": "boundary-or-denial-pass",
-      "source": "tests/security/authorization/router-probes.mjs:90-104 (boundaryRejectionStatuses [400,404,405,421]) and :249-252 (gap plus BOUNDARY_REJECTED_ONLY coverage)",
-      "reason": "Raw non-canonical path rejected before the resource; normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks stay mandatory. If the Router instead returns an explicit 401/403, no gap is recorded and the denial check must PASS.",
-      "affectedObligations": [
-        "router/users-list.get"
-      ],
-      "outsideChangedBehavior": "Router path normalization is unchanged by the U3/U6/U7 candidate.",
-      "evidence": {
-        "kind": "boundary-rejected",
-        "probeId": "users-list.path-parent-segment",
-        "actor": "userB",
-        "httpStatuses": [
-          400,
-          404,
-          405,
-          421
-        ]
-      },
-      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
-    },
-    {
-      "id": "router:users-list.path-encoded-owner:anonymous",
-      "category": "protocol-combination-outside-changed-paths",
-      "presence": "boundary-or-denial-pass",
-      "source": "tests/security/authorization/router-probes.mjs:90-104 (boundaryRejectionStatuses [400,404,405,421]) and :249-252 (gap plus BOUNDARY_REJECTED_ONLY coverage)",
-      "reason": "Raw non-canonical path rejected before the resource; normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks stay mandatory. If the Router instead returns an explicit 401/403, no gap is recorded and the denial check must PASS.",
-      "affectedObligations": [
-        "router/users-list.get"
-      ],
-      "outsideChangedBehavior": "Router path normalization is unchanged by the U3/U6/U7 candidate.",
-      "evidence": {
-        "kind": "boundary-rejected",
-        "probeId": "users-list.path-encoded-owner",
-        "actor": "anonymous",
-        "httpStatuses": [
-          400,
-          404,
-          405,
-          421
-        ]
-      },
-      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
-    },
-    {
-      "id": "router:users-list.path-encoded-owner:selfRegistered",
-      "category": "protocol-combination-outside-changed-paths",
-      "presence": "boundary-or-denial-pass",
-      "source": "tests/security/authorization/router-probes.mjs:90-104 (boundaryRejectionStatuses [400,404,405,421]) and :249-252 (gap plus BOUNDARY_REJECTED_ONLY coverage)",
-      "reason": "Raw non-canonical path rejected before the resource; normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks stay mandatory. If the Router instead returns an explicit 401/403, no gap is recorded and the denial check must PASS.",
-      "affectedObligations": [
-        "router/users-list.get"
-      ],
-      "outsideChangedBehavior": "Router path normalization is unchanged by the U3/U6/U7 candidate.",
-      "evidence": {
-        "kind": "boundary-rejected",
-        "probeId": "users-list.path-encoded-owner",
-        "actor": "selfRegistered",
-        "httpStatuses": [
-          400,
-          404,
-          405,
-          421
-        ]
-      },
-      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
-    },
-    {
-      "id": "router:users-list.path-encoded-owner:userA",
-      "category": "protocol-combination-outside-changed-paths",
-      "presence": "boundary-or-denial-pass",
-      "source": "tests/security/authorization/router-probes.mjs:90-104 (boundaryRejectionStatuses [400,404,405,421]) and :249-252 (gap plus BOUNDARY_REJECTED_ONLY coverage)",
-      "reason": "Raw non-canonical path rejected before the resource; normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks stay mandatory. If the Router instead returns an explicit 401/403, no gap is recorded and the denial check must PASS.",
-      "affectedObligations": [
-        "router/users-list.get"
-      ],
-      "outsideChangedBehavior": "Router path normalization is unchanged by the U3/U6/U7 candidate.",
-      "evidence": {
-        "kind": "boundary-rejected",
-        "probeId": "users-list.path-encoded-owner",
-        "actor": "userA",
-        "httpStatuses": [
-          400,
-          404,
-          405,
-          421
-        ]
-      },
-      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
-    },
-    {
-      "id": "router:users-list.path-encoded-owner:userB",
-      "category": "protocol-combination-outside-changed-paths",
-      "presence": "boundary-or-denial-pass",
-      "source": "tests/security/authorization/router-probes.mjs:90-104 (boundaryRejectionStatuses [400,404,405,421]) and :249-252 (gap plus BOUNDARY_REJECTED_ONLY coverage)",
-      "reason": "Raw non-canonical path rejected before the resource; normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks stay mandatory. If the Router instead returns an explicit 401/403, no gap is recorded and the denial check must PASS.",
-      "affectedObligations": [
-        "router/users-list.get"
-      ],
-      "outsideChangedBehavior": "Router path normalization is unchanged by the U3/U6/U7 candidate.",
-      "evidence": {
-        "kind": "boundary-rejected",
-        "probeId": "users-list.path-encoded-owner",
-        "actor": "userB",
-        "httpStatuses": [
-          400,
-          404,
-          405,
-          421
-        ]
-      },
-      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
-    },
-    {
-      "id": "router:users-list.path-encoded-resource:anonymous",
-      "category": "protocol-combination-outside-changed-paths",
-      "presence": "boundary-or-denial-pass",
-      "source": "tests/security/authorization/router-probes.mjs:90-104 (boundaryRejectionStatuses [400,404,405,421]) and :249-252 (gap plus BOUNDARY_REJECTED_ONLY coverage)",
-      "reason": "Raw non-canonical path rejected before the resource; normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks stay mandatory. If the Router instead returns an explicit 401/403, no gap is recorded and the denial check must PASS.",
-      "affectedObligations": [
-        "router/users-list.get"
-      ],
-      "outsideChangedBehavior": "Router path normalization is unchanged by the U3/U6/U7 candidate.",
-      "evidence": {
-        "kind": "boundary-rejected",
-        "probeId": "users-list.path-encoded-resource",
-        "actor": "anonymous",
-        "httpStatuses": [
-          400,
-          404,
-          405,
-          421
-        ]
-      },
-      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
-    },
-    {
-      "id": "router:users-list.path-encoded-resource:selfRegistered",
-      "category": "protocol-combination-outside-changed-paths",
-      "presence": "boundary-or-denial-pass",
-      "source": "tests/security/authorization/router-probes.mjs:90-104 (boundaryRejectionStatuses [400,404,405,421]) and :249-252 (gap plus BOUNDARY_REJECTED_ONLY coverage)",
-      "reason": "Raw non-canonical path rejected before the resource; normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks stay mandatory. If the Router instead returns an explicit 401/403, no gap is recorded and the denial check must PASS.",
-      "affectedObligations": [
-        "router/users-list.get"
-      ],
-      "outsideChangedBehavior": "Router path normalization is unchanged by the U3/U6/U7 candidate.",
-      "evidence": {
-        "kind": "boundary-rejected",
-        "probeId": "users-list.path-encoded-resource",
-        "actor": "selfRegistered",
-        "httpStatuses": [
-          400,
-          404,
-          405,
-          421
+          404
         ]
       },
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
@@ -1868,9 +1508,9 @@
     {
       "id": "router:users-list.path-encoded-resource:userA",
       "category": "protocol-combination-outside-changed-paths",
-      "presence": "boundary-or-denial-pass",
-      "source": "tests/security/authorization/router-probes.mjs:90-104 (boundaryRejectionStatuses [400,404,405,421]) and :249-252 (gap plus BOUNDARY_REJECTED_ONLY coverage)",
-      "reason": "Raw non-canonical path rejected before the resource; normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks stay mandatory. If the Router instead returns an explicit 401/403, no gap is recorded and the denial check must PASS.",
+      "presence": "required",
+      "source": "tests/security/authorization/router-probes.mjs:90-104,249-252; cli/server/RoutingServer.js:395,503-505,603-609,793-794 and cli/server/authHandlers/userAdminRoutes.js:112-126,191-203 (the raw path misses user-admin dispatch; an authorized ordinary user passes normal authentication and reaches the 404 fallthrough)",
+      "reason": "Raw non-canonical path misses user administration; an authorized ordinary user receives 404. Normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks and the anonymous/selfRegistered denials on this path stay mandatory.",
       "affectedObligations": [
         "router/users-list.get"
       ],
@@ -1880,10 +1520,7 @@
         "probeId": "users-list.path-encoded-resource",
         "actor": "userA",
         "httpStatuses": [
-          400,
-          404,
-          405,
-          421
+          404
         ]
       },
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
@@ -1891,9 +1528,9 @@
     {
       "id": "router:users-list.path-encoded-resource:userB",
       "category": "protocol-combination-outside-changed-paths",
-      "presence": "boundary-or-denial-pass",
-      "source": "tests/security/authorization/router-probes.mjs:90-104 (boundaryRejectionStatuses [400,404,405,421]) and :249-252 (gap plus BOUNDARY_REJECTED_ONLY coverage)",
-      "reason": "Raw non-canonical path rejected before the resource; normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks stay mandatory. If the Router instead returns an explicit 401/403, no gap is recorded and the denial check must PASS.",
+      "presence": "required",
+      "source": "tests/security/authorization/router-probes.mjs:90-104,249-252; cli/server/RoutingServer.js:395,503-505,603-609,793-794 and cli/server/authHandlers/userAdminRoutes.js:112-126,191-203 (the raw path misses user-admin dispatch; an authorized ordinary user passes normal authentication and reaches the 404 fallthrough)",
+      "reason": "Raw non-canonical path misses user administration; an authorized ordinary user receives 404. Normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks and the anonymous/selfRegistered denials on this path stay mandatory.",
       "affectedObligations": [
         "router/users-list.get"
       ],
@@ -1903,148 +1540,7 @@
         "probeId": "users-list.path-encoded-resource",
         "actor": "userB",
         "httpStatuses": [
-          400,
-          404,
-          405,
-          421
-        ]
-      },
-      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
-    },
-    {
-      "id": "router:users-list.path-encoded-parent:anonymous",
-      "category": "protocol-combination-outside-changed-paths",
-      "presence": "boundary-or-denial-pass",
-      "source": "tests/security/authorization/router-probes.mjs:90-104 (boundaryRejectionStatuses [400,404,405,421]) and :249-252 (gap plus BOUNDARY_REJECTED_ONLY coverage)",
-      "reason": "Raw non-canonical path rejected before the resource; normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks stay mandatory. If the Router instead returns an explicit 401/403, no gap is recorded and the denial check must PASS.",
-      "affectedObligations": [
-        "router/users-list.get"
-      ],
-      "outsideChangedBehavior": "Router path normalization is unchanged by the U3/U6/U7 candidate.",
-      "evidence": {
-        "kind": "boundary-rejected",
-        "probeId": "users-list.path-encoded-parent",
-        "actor": "anonymous",
-        "httpStatuses": [
-          400,
-          404,
-          405,
-          421
-        ]
-      },
-      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
-    },
-    {
-      "id": "router:users-list.path-encoded-parent:selfRegistered",
-      "category": "protocol-combination-outside-changed-paths",
-      "presence": "boundary-or-denial-pass",
-      "source": "tests/security/authorization/router-probes.mjs:90-104 (boundaryRejectionStatuses [400,404,405,421]) and :249-252 (gap plus BOUNDARY_REJECTED_ONLY coverage)",
-      "reason": "Raw non-canonical path rejected before the resource; normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks stay mandatory. If the Router instead returns an explicit 401/403, no gap is recorded and the denial check must PASS.",
-      "affectedObligations": [
-        "router/users-list.get"
-      ],
-      "outsideChangedBehavior": "Router path normalization is unchanged by the U3/U6/U7 candidate.",
-      "evidence": {
-        "kind": "boundary-rejected",
-        "probeId": "users-list.path-encoded-parent",
-        "actor": "selfRegistered",
-        "httpStatuses": [
-          400,
-          404,
-          405,
-          421
-        ]
-      },
-      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
-    },
-    {
-      "id": "router:users-list.path-encoded-parent:userA",
-      "category": "protocol-combination-outside-changed-paths",
-      "presence": "boundary-or-denial-pass",
-      "source": "tests/security/authorization/router-probes.mjs:90-104 (boundaryRejectionStatuses [400,404,405,421]) and :249-252 (gap plus BOUNDARY_REJECTED_ONLY coverage)",
-      "reason": "Raw non-canonical path rejected before the resource; normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks stay mandatory. If the Router instead returns an explicit 401/403, no gap is recorded and the denial check must PASS.",
-      "affectedObligations": [
-        "router/users-list.get"
-      ],
-      "outsideChangedBehavior": "Router path normalization is unchanged by the U3/U6/U7 candidate.",
-      "evidence": {
-        "kind": "boundary-rejected",
-        "probeId": "users-list.path-encoded-parent",
-        "actor": "userA",
-        "httpStatuses": [
-          400,
-          404,
-          405,
-          421
-        ]
-      },
-      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
-    },
-    {
-      "id": "router:users-list.path-encoded-parent:userB",
-      "category": "protocol-combination-outside-changed-paths",
-      "presence": "boundary-or-denial-pass",
-      "source": "tests/security/authorization/router-probes.mjs:90-104 (boundaryRejectionStatuses [400,404,405,421]) and :249-252 (gap plus BOUNDARY_REJECTED_ONLY coverage)",
-      "reason": "Raw non-canonical path rejected before the resource; normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks stay mandatory. If the Router instead returns an explicit 401/403, no gap is recorded and the denial check must PASS.",
-      "affectedObligations": [
-        "router/users-list.get"
-      ],
-      "outsideChangedBehavior": "Router path normalization is unchanged by the U3/U6/U7 candidate.",
-      "evidence": {
-        "kind": "boundary-rejected",
-        "probeId": "users-list.path-encoded-parent",
-        "actor": "userB",
-        "httpStatuses": [
-          400,
-          404,
-          405,
-          421
-        ]
-      },
-      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
-    },
-    {
-      "id": "router:users-list.path-encoded-slash:anonymous",
-      "category": "protocol-combination-outside-changed-paths",
-      "presence": "boundary-or-denial-pass",
-      "source": "tests/security/authorization/router-probes.mjs:90-104 (boundaryRejectionStatuses [400,404,405,421]) and :249-252 (gap plus BOUNDARY_REJECTED_ONLY coverage)",
-      "reason": "Raw non-canonical path rejected before the resource; normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks stay mandatory. If the Router instead returns an explicit 401/403, no gap is recorded and the denial check must PASS.",
-      "affectedObligations": [
-        "router/users-list.get"
-      ],
-      "outsideChangedBehavior": "Router path normalization is unchanged by the U3/U6/U7 candidate.",
-      "evidence": {
-        "kind": "boundary-rejected",
-        "probeId": "users-list.path-encoded-slash",
-        "actor": "anonymous",
-        "httpStatuses": [
-          400,
-          404,
-          405,
-          421
-        ]
-      },
-      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
-    },
-    {
-      "id": "router:users-list.path-encoded-slash:selfRegistered",
-      "category": "protocol-combination-outside-changed-paths",
-      "presence": "boundary-or-denial-pass",
-      "source": "tests/security/authorization/router-probes.mjs:90-104 (boundaryRejectionStatuses [400,404,405,421]) and :249-252 (gap plus BOUNDARY_REJECTED_ONLY coverage)",
-      "reason": "Raw non-canonical path rejected before the resource; normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks stay mandatory. If the Router instead returns an explicit 401/403, no gap is recorded and the denial check must PASS.",
-      "affectedObligations": [
-        "router/users-list.get"
-      ],
-      "outsideChangedBehavior": "Router path normalization is unchanged by the U3/U6/U7 candidate.",
-      "evidence": {
-        "kind": "boundary-rejected",
-        "probeId": "users-list.path-encoded-slash",
-        "actor": "selfRegistered",
-        "httpStatuses": [
-          400,
-          404,
-          405,
-          421
+          404
         ]
       },
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
@@ -2052,9 +1548,9 @@
     {
       "id": "router:users-list.path-encoded-slash:userA",
       "category": "protocol-combination-outside-changed-paths",
-      "presence": "boundary-or-denial-pass",
-      "source": "tests/security/authorization/router-probes.mjs:90-104 (boundaryRejectionStatuses [400,404,405,421]) and :249-252 (gap plus BOUNDARY_REJECTED_ONLY coverage)",
-      "reason": "Raw non-canonical path rejected before the resource; normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks stay mandatory. If the Router instead returns an explicit 401/403, no gap is recorded and the denial check must PASS.",
+      "presence": "required",
+      "source": "tests/security/authorization/router-probes.mjs:90-104,249-252; cli/server/RoutingServer.js:395,503-505,603-609,793-794 and cli/server/authHandlers/userAdminRoutes.js:112-126,191-203 (the raw path misses user-admin dispatch; an authorized ordinary user passes normal authentication and reaches the 404 fallthrough)",
+      "reason": "Raw non-canonical path misses user administration; an authorized ordinary user receives 404. Normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks and the anonymous/selfRegistered denials on this path stay mandatory.",
       "affectedObligations": [
         "router/users-list.get"
       ],
@@ -2064,10 +1560,7 @@
         "probeId": "users-list.path-encoded-slash",
         "actor": "userA",
         "httpStatuses": [
-          400,
-          404,
-          405,
-          421
+          404
         ]
       },
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
@@ -2075,9 +1568,9 @@
     {
       "id": "router:users-list.path-encoded-slash:userB",
       "category": "protocol-combination-outside-changed-paths",
-      "presence": "boundary-or-denial-pass",
-      "source": "tests/security/authorization/router-probes.mjs:90-104 (boundaryRejectionStatuses [400,404,405,421]) and :249-252 (gap plus BOUNDARY_REJECTED_ONLY coverage)",
-      "reason": "Raw non-canonical path rejected before the resource; normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks stay mandatory. If the Router instead returns an explicit 401/403, no gap is recorded and the denial check must PASS.",
+      "presence": "required",
+      "source": "tests/security/authorization/router-probes.mjs:90-104,249-252; cli/server/RoutingServer.js:395,503-505,603-609,793-794 and cli/server/authHandlers/userAdminRoutes.js:112-126,191-203 (the raw path misses user-admin dispatch; an authorized ordinary user passes normal authentication and reaches the 404 fallthrough)",
+      "reason": "Raw non-canonical path misses user administration; an authorized ordinary user receives 404. Normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks and the anonymous/selfRegistered denials on this path stay mandatory.",
       "affectedObligations": [
         "router/users-list.get"
       ],
@@ -2087,56 +1580,7 @@
         "probeId": "users-list.path-encoded-slash",
         "actor": "userB",
         "httpStatuses": [
-          400,
-          404,
-          405,
-          421
-        ]
-      },
-      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
-    },
-    {
-      "id": "router:users-list.path-double-encoded-slash:anonymous",
-      "category": "protocol-combination-outside-changed-paths",
-      "presence": "boundary-or-denial-pass",
-      "source": "tests/security/authorization/router-probes.mjs:90-104 (boundaryRejectionStatuses [400,404,405,421]) and :249-252 (gap plus BOUNDARY_REJECTED_ONLY coverage)",
-      "reason": "Raw non-canonical path rejected before the resource; normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks stay mandatory. If the Router instead returns an explicit 401/403, no gap is recorded and the denial check must PASS.",
-      "affectedObligations": [
-        "router/users-list.get"
-      ],
-      "outsideChangedBehavior": "Router path normalization is unchanged by the U3/U6/U7 candidate.",
-      "evidence": {
-        "kind": "boundary-rejected",
-        "probeId": "users-list.path-double-encoded-slash",
-        "actor": "anonymous",
-        "httpStatuses": [
-          400,
-          404,
-          405,
-          421
-        ]
-      },
-      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
-    },
-    {
-      "id": "router:users-list.path-double-encoded-slash:selfRegistered",
-      "category": "protocol-combination-outside-changed-paths",
-      "presence": "boundary-or-denial-pass",
-      "source": "tests/security/authorization/router-probes.mjs:90-104 (boundaryRejectionStatuses [400,404,405,421]) and :249-252 (gap plus BOUNDARY_REJECTED_ONLY coverage)",
-      "reason": "Raw non-canonical path rejected before the resource; normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks stay mandatory. If the Router instead returns an explicit 401/403, no gap is recorded and the denial check must PASS.",
-      "affectedObligations": [
-        "router/users-list.get"
-      ],
-      "outsideChangedBehavior": "Router path normalization is unchanged by the U3/U6/U7 candidate.",
-      "evidence": {
-        "kind": "boundary-rejected",
-        "probeId": "users-list.path-double-encoded-slash",
-        "actor": "selfRegistered",
-        "httpStatuses": [
-          400,
-          404,
-          405,
-          421
+          404
         ]
       },
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
@@ -2144,9 +1588,9 @@
     {
       "id": "router:users-list.path-double-encoded-slash:userA",
       "category": "protocol-combination-outside-changed-paths",
-      "presence": "boundary-or-denial-pass",
-      "source": "tests/security/authorization/router-probes.mjs:90-104 (boundaryRejectionStatuses [400,404,405,421]) and :249-252 (gap plus BOUNDARY_REJECTED_ONLY coverage)",
-      "reason": "Raw non-canonical path rejected before the resource; normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks stay mandatory. If the Router instead returns an explicit 401/403, no gap is recorded and the denial check must PASS.",
+      "presence": "required",
+      "source": "tests/security/authorization/router-probes.mjs:90-104,249-252; cli/server/RoutingServer.js:395,503-505,603-609,793-794 and cli/server/authHandlers/userAdminRoutes.js:112-126,191-203 (the raw path misses user-admin dispatch; an authorized ordinary user passes normal authentication and reaches the 404 fallthrough)",
+      "reason": "Raw non-canonical path misses user administration; an authorized ordinary user receives 404. Normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks and the anonymous/selfRegistered denials on this path stay mandatory.",
       "affectedObligations": [
         "router/users-list.get"
       ],
@@ -2156,10 +1600,7 @@
         "probeId": "users-list.path-double-encoded-slash",
         "actor": "userA",
         "httpStatuses": [
-          400,
-          404,
-          405,
-          421
+          404
         ]
       },
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
@@ -2167,9 +1608,9 @@
     {
       "id": "router:users-list.path-double-encoded-slash:userB",
       "category": "protocol-combination-outside-changed-paths",
-      "presence": "boundary-or-denial-pass",
-      "source": "tests/security/authorization/router-probes.mjs:90-104 (boundaryRejectionStatuses [400,404,405,421]) and :249-252 (gap plus BOUNDARY_REJECTED_ONLY coverage)",
-      "reason": "Raw non-canonical path rejected before the resource; normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks stay mandatory. If the Router instead returns an explicit 401/403, no gap is recorded and the denial check must PASS.",
+      "presence": "required",
+      "source": "tests/security/authorization/router-probes.mjs:90-104,249-252; cli/server/RoutingServer.js:395,503-505,603-609,793-794 and cli/server/authHandlers/userAdminRoutes.js:112-126,191-203 (the raw path misses user-admin dispatch; an authorized ordinary user passes normal authentication and reaches the 404 fallthrough)",
+      "reason": "Raw non-canonical path misses user administration; an authorized ordinary user receives 404. Normalization boundary evidence only, never an authorization pass. The canonical users-list allow/deny checks and the anonymous/selfRegistered denials on this path stay mandatory.",
       "affectedObligations": [
         "router/users-list.get"
       ],
@@ -2179,10 +1620,7 @@
         "probeId": "users-list.path-double-encoded-slash",
         "actor": "userB",
         "httpStatuses": [
-          400,
-          404,
-          405,
-          421
+          404
         ]
       },
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"

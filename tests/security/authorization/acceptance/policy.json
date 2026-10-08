@@ -38,7 +38,7 @@
     "U6": ["webchat-stream.get", "webchat-input.post", "webchat-control.post", "webchat-interaction.post"],
     "U7": ["marketplace-install_repo.post", "marketplace-uninstall_repo.post", "marketplace-enable_agent.post", "marketplace-disable_agent.post"]
   },
-  "boundaryRejectionStatuses": [400, 404, 405, 421],
+  "boundaryRejectionStatuses": [404],
   "verdictExitCodes": { "PASS": 0, "NO_FAILURES_WITH_GAPS": 2, "otherwise": 1 },
   "requiredRawVerdict": "NO_FAILURES_WITH_GAPS",
   "requiredRawExitCode": 2,

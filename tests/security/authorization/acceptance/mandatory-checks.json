@@ -3,7 +3,7 @@
   "nonMandatoryRouter": [
     {
       "pattern": "^users-list\\.path-",
-      "reason": "Raw-path normalization boundary evidence only (plan rev4 F2); canonical users-list allow/deny stay mandatory"
+      "reason": "Raw-path probes are mandatory only through the D2 denial matrix; their boundary outcomes are typed gaps"
     },
     {
       "pattern": "^openai-agent-discovery\\.",
@@ -11,10 +11,58 @@
     }
   ],
   "counts": {
-    "live": 495,
-    "offline": 9
+    "live": 519,
+    "offline": 10
   },
   "checks": [
+    {
+      "id": "agent.dpuAgent.discovery.resources.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.dpuAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.dpuAgent.discovery.resources.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.dpuAgent.discovery.resources.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.dpuAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.dpuAgent.discovery.resources.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.dpuAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.dpuAgent.discovery.resources.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.dpuAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
     {
       "id": "agent.dpuAgent.discovery.tools.list.anonymous",
       "kind": "live",
@@ -64,42 +112,52 @@
       "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
-      "id": "agent.dpuAgent.sse.cross-session.anonymous",
+      "id": "agent.emailAgent.discovery.resources.list.anonymous",
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": [
-        "agent.dpuAgent.sse.positive"
+        "agent.emailAgent.discovery.resources.list.positive"
       ],
       "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
+      "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
-      "id": "agent.dpuAgent.sse.cross-session.selfRegistered",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.dpuAgent.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.dpuAgent.sse.cross-session.userB",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.dpuAgent.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.dpuAgent.sse.positive",
+      "id": "agent.emailAgent.discovery.resources.list.positive",
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": null,
       "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.emailAgent.discovery.resources.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.emailAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.emailAgent.discovery.resources.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.emailAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.emailAgent.discovery.resources.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.emailAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
       "id": "agent.emailAgent.discovery.tools.list.anonymous",
@@ -150,42 +208,52 @@
       "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
-      "id": "agent.emailAgent.sse.cross-session.anonymous",
+      "id": "agent.explorer.discovery.resources.list.anonymous",
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": [
-        "agent.emailAgent.sse.positive"
+        "agent.explorer.discovery.resources.list.positive"
       ],
       "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
+      "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
-      "id": "agent.emailAgent.sse.cross-session.selfRegistered",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.emailAgent.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.emailAgent.sse.cross-session.userB",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.emailAgent.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.emailAgent.sse.positive",
+      "id": "agent.explorer.discovery.resources.list.positive",
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": null,
       "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.explorer.discovery.resources.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.explorer.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.explorer.discovery.resources.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.explorer.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.explorer.discovery.resources.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.explorer.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
       "id": "agent.explorer.discovery.tools.list.anonymous",
@@ -236,42 +304,52 @@
       "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
-      "id": "agent.explorer.sse.cross-session.anonymous",
+      "id": "agent.gitAgent.discovery.resources.list.anonymous",
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": [
-        "agent.explorer.sse.positive"
+        "agent.gitAgent.discovery.resources.list.positive"
       ],
       "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
+      "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
-      "id": "agent.explorer.sse.cross-session.selfRegistered",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.explorer.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.explorer.sse.cross-session.userB",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.explorer.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.explorer.sse.positive",
+      "id": "agent.gitAgent.discovery.resources.list.positive",
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": null,
       "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.gitAgent.discovery.resources.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.gitAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.gitAgent.discovery.resources.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.gitAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.gitAgent.discovery.resources.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.gitAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
       "id": "agent.gitAgent.discovery.tools.list.anonymous",
@@ -320,44 +398,6 @@
       ],
       "boundary": "agents",
       "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.gitAgent.sse.cross-session.anonymous",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.gitAgent.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.gitAgent.sse.cross-session.selfRegistered",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.gitAgent.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.gitAgent.sse.cross-session.userB",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.gitAgent.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.gitAgent.sse.positive",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": null,
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
     },
     {
       "id": "agent.liveKitServerAgent.discovery.prompts.list.anonymous",
@@ -552,42 +592,52 @@
       "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
-      "id": "agent.liveKitServerAgent.sse.cross-session.anonymous",
+      "id": "agent.local-llm.discovery.resources.list.anonymous",
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": [
-        "agent.liveKitServerAgent.sse.positive"
+        "agent.local-llm.discovery.resources.list.positive"
       ],
       "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
+      "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
-      "id": "agent.liveKitServerAgent.sse.cross-session.selfRegistered",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.liveKitServerAgent.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.liveKitServerAgent.sse.cross-session.userB",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.liveKitServerAgent.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.liveKitServerAgent.sse.positive",
+      "id": "agent.local-llm.discovery.resources.list.positive",
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": null,
       "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.local-llm.discovery.resources.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.local-llm.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.local-llm.discovery.resources.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.local-llm.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.local-llm.discovery.resources.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.local-llm.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
       "id": "agent.local-llm.discovery.tools.list.anonymous",
@@ -638,80 +688,100 @@
       "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
-      "id": "agent.local-llm.sse.cross-session.anonymous",
+      "id": "agent.multimedia.discovery.resources.list.anonymous",
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": [
-        "agent.local-llm.sse.positive"
+        "agent.multimedia.discovery.resources.list.positive"
       ],
       "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
+      "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
-      "id": "agent.local-llm.sse.cross-session.selfRegistered",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.local-llm.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.local-llm.sse.cross-session.userB",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.local-llm.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.local-llm.sse.positive",
+      "id": "agent.multimedia.discovery.resources.list.positive",
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": null,
       "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
+      "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
-      "id": "agent.multimedia.sse.cross-session.anonymous",
+      "id": "agent.multimedia.discovery.resources.list.selfRegistered",
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": [
-        "agent.multimedia.sse.positive"
+        "agent.multimedia.discovery.resources.list.positive"
       ],
       "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
+      "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
-      "id": "agent.multimedia.sse.cross-session.selfRegistered",
+      "id": "agent.multimedia.discovery.resources.list.userA",
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": [
-        "agent.multimedia.sse.positive"
+        "agent.multimedia.discovery.resources.list.positive"
       ],
       "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
+      "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
-      "id": "agent.multimedia.sse.cross-session.userB",
+      "id": "agent.multimedia.discovery.resources.list.userB",
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": [
-        "agent.multimedia.sse.positive"
+        "agent.multimedia.discovery.resources.list.positive"
       ],
       "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
+      "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
-      "id": "agent.multimedia.sse.positive",
+      "id": "agent.multimedia.discovery.tools.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.multimedia.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.multimedia.discovery.tools.list.positive",
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": null,
       "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.multimedia.discovery.tools.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.multimedia.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.multimedia.discovery.tools.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.multimedia.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.multimedia.discovery.tools.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.multimedia.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
       "id": "agent.registry.reconciliation",
@@ -770,6 +840,54 @@
       "source": "agent-probes.mjs agentProbes"
     },
     {
+      "id": "agent.roboTeamAgent.discovery.resources.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboTeamAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.roboTeamAgent.discovery.resources.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.roboTeamAgent.discovery.resources.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboTeamAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.roboTeamAgent.discovery.resources.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboTeamAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.roboTeamAgent.discovery.resources.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboTeamAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
       "id": "agent.roboTeamAgent.discovery.tools.list.anonymous",
       "kind": "live",
       "count": 1,
@@ -818,42 +936,52 @@
       "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
-      "id": "agent.roboTeamAgent.sse.cross-session.anonymous",
+      "id": "agent.soplangAgent.discovery.resources.list.anonymous",
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": [
-        "agent.roboTeamAgent.sse.positive"
+        "agent.soplangAgent.discovery.resources.list.positive"
       ],
       "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
+      "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
-      "id": "agent.roboTeamAgent.sse.cross-session.selfRegistered",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.roboTeamAgent.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.roboTeamAgent.sse.cross-session.userB",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.roboTeamAgent.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.roboTeamAgent.sse.positive",
+      "id": "agent.soplangAgent.discovery.resources.list.positive",
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": null,
       "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.soplangAgent.discovery.resources.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.soplangAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.soplangAgent.discovery.resources.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.soplangAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.soplangAgent.discovery.resources.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.soplangAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
       "id": "agent.soplangAgent.discovery.tools.list.anonymous",
@@ -899,92 +1027,6 @@
       "count": 1,
       "positiveControlAnyOf": [
         "agent.soplangAgent.discovery.tools.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.soplangAgent.sse.cross-session.anonymous",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.soplangAgent.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.soplangAgent.sse.cross-session.selfRegistered",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.soplangAgent.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.soplangAgent.sse.cross-session.userB",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.soplangAgent.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.soplangAgent.sse.positive",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": null,
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.soul-gateway.discovery.prompts.list.anonymous",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.soul-gateway.discovery.prompts.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.soul-gateway.discovery.prompts.list.positive",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": null,
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.soul-gateway.discovery.prompts.list.selfRegistered",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.soul-gateway.discovery.prompts.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.soul-gateway.discovery.prompts.list.userA",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.soul-gateway.discovery.prompts.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.soul-gateway.discovery.prompts.list.userB",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.soul-gateway.discovery.prompts.list.positive"
       ],
       "boundary": "agents",
       "source": "agent-probes.mjs discoverAgentMcp"
@@ -1038,54 +1080,6 @@
       "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
-      "id": "agent.soul-gateway.discovery.resources.templates.list.anonymous",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.soul-gateway.discovery.resources.templates.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.soul-gateway.discovery.resources.templates.list.positive",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": null,
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.soul-gateway.discovery.resources.templates.list.selfRegistered",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.soul-gateway.discovery.resources.templates.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.soul-gateway.discovery.resources.templates.list.userA",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.soul-gateway.discovery.resources.templates.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.soul-gateway.discovery.resources.templates.list.userB",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.soul-gateway.discovery.resources.templates.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
       "id": "agent.soul-gateway.discovery.tools.list.anonymous",
       "kind": "live",
       "count": 1,
@@ -1132,44 +1126,6 @@
       ],
       "boundary": "agents",
       "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.soul-gateway.sse.cross-session.anonymous",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.soul-gateway.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.soul-gateway.sse.cross-session.selfRegistered",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.soul-gateway.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.soul-gateway.sse.cross-session.userB",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.soul-gateway.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.soul-gateway.sse.positive",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": null,
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
     },
     {
       "id": "agent.soul.management.me.admin",
@@ -1316,6 +1272,54 @@
       "source": "agent-probes.mjs agentProbes"
     },
     {
+      "id": "agent.tasksAgent.discovery.resources.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tasksAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.tasksAgent.discovery.resources.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.tasksAgent.discovery.resources.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tasksAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.tasksAgent.discovery.resources.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tasksAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.tasksAgent.discovery.resources.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tasksAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
       "id": "agent.tasksAgent.discovery.tools.list.anonymous",
       "kind": "live",
       "count": 1,
@@ -1362,44 +1366,6 @@
       ],
       "boundary": "agents",
       "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.tasksAgent.sse.cross-session.anonymous",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.tasksAgent.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.tasksAgent.sse.cross-session.selfRegistered",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.tasksAgent.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.tasksAgent.sse.cross-session.userB",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.tasksAgent.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.tasksAgent.sse.positive",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": null,
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
     },
     {
       "id": "agent.tool.dpu_whoami.admin",
@@ -2074,6 +2040,54 @@
       "source": "agent-probes.mjs agentReadTools"
     },
     {
+      "id": "agent.umamiAgent.discovery.resources.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.umamiAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.umamiAgent.discovery.resources.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.umamiAgent.discovery.resources.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.umamiAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.umamiAgent.discovery.resources.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.umamiAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.umamiAgent.discovery.resources.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.umamiAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
       "id": "agent.umamiAgent.discovery.tools.list.anonymous",
       "kind": "live",
       "count": 1,
@@ -2122,44 +2136,6 @@
       "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
-      "id": "agent.umamiAgent.sse.cross-session.anonymous",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.umamiAgent.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.umamiAgent.sse.cross-session.selfRegistered",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.umamiAgent.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.umamiAgent.sse.cross-session.userB",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.umamiAgent.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.umamiAgent.sse.positive",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": null,
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
       "id": "agent.username-admin.monitor-denial",
       "kind": "live",
       "count": 1,
@@ -2196,6 +2172,54 @@
       ],
       "boundary": "agents",
       "source": "agent-probes.mjs usernamePrivilegeProbe"
+    },
+    {
+      "id": "agent.userPersistoAgent.discovery.resources.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.userPersistoAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.userPersistoAgent.discovery.resources.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.userPersistoAgent.discovery.resources.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.userPersistoAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.userPersistoAgent.discovery.resources.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.userPersistoAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.userPersistoAgent.discovery.resources.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.userPersistoAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
       "id": "agent.userPersistoAgent.discovery.tools.list.anonymous",
@@ -2246,42 +2270,52 @@
       "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
-      "id": "agent.userPersistoAgent.sse.cross-session.anonymous",
+      "id": "agent.webAssist.discovery.resources.list.anonymous",
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": [
-        "agent.userPersistoAgent.sse.positive"
+        "agent.webAssist.discovery.resources.list.positive"
       ],
       "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
+      "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
-      "id": "agent.userPersistoAgent.sse.cross-session.selfRegistered",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.userPersistoAgent.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.userPersistoAgent.sse.cross-session.userB",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.userPersistoAgent.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.userPersistoAgent.sse.positive",
+      "id": "agent.webAssist.discovery.resources.list.positive",
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": null,
       "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.webAssist.discovery.resources.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.webAssist.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.webAssist.discovery.resources.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.webAssist.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.webAssist.discovery.resources.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.webAssist.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
       "id": "agent.webAssist.discovery.tools.list.anonymous",
@@ -2332,42 +2366,52 @@
       "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
-      "id": "agent.webAssist.sse.cross-session.anonymous",
+      "id": "agent.webmeetAgent.discovery.resources.list.anonymous",
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": [
-        "agent.webAssist.sse.positive"
+        "agent.webmeetAgent.discovery.resources.list.positive"
       ],
       "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
+      "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
-      "id": "agent.webAssist.sse.cross-session.selfRegistered",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.webAssist.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.webAssist.sse.cross-session.userB",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.webAssist.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.webAssist.sse.positive",
+      "id": "agent.webmeetAgent.discovery.resources.list.positive",
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": null,
       "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.webmeetAgent.discovery.resources.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.webmeetAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.webmeetAgent.discovery.resources.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.webmeetAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.webmeetAgent.discovery.resources.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.webmeetAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
       "id": "agent.webmeetAgent.discovery.tools.list.anonymous",
@@ -2418,42 +2462,52 @@
       "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
-      "id": "agent.webmeetAgent.sse.cross-session.anonymous",
+      "id": "agent.workspaceMonitorAgent.discovery.resources.list.anonymous",
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": [
-        "agent.webmeetAgent.sse.positive"
+        "agent.workspaceMonitorAgent.discovery.resources.list.positive"
       ],
       "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
+      "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
-      "id": "agent.webmeetAgent.sse.cross-session.selfRegistered",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.webmeetAgent.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.webmeetAgent.sse.cross-session.userB",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.webmeetAgent.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.webmeetAgent.sse.positive",
+      "id": "agent.workspaceMonitorAgent.discovery.resources.list.positive",
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": null,
       "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.workspaceMonitorAgent.discovery.resources.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.workspaceMonitorAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.workspaceMonitorAgent.discovery.resources.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.workspaceMonitorAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.workspaceMonitorAgent.discovery.resources.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.workspaceMonitorAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
       "id": "agent.workspaceMonitorAgent.discovery.tools.list.anonymous",
@@ -2504,44 +2558,6 @@
       "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
-      "id": "agent.workspaceMonitorAgent.sse.cross-session.anonymous",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.workspaceMonitorAgent.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.workspaceMonitorAgent.sse.cross-session.selfRegistered",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.workspaceMonitorAgent.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.workspaceMonitorAgent.sse.cross-session.userB",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.workspaceMonitorAgent.sse.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
-      "id": "agent.workspaceMonitorAgent.sse.positive",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": null,
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp (SSE)"
-    },
-    {
       "id": "dashboard.admin-role-escalation.selfRegistered",
       "kind": "live",
       "count": 1,
@@ -2582,6 +2598,20 @@
       "file": "tests/security/authorization/lease-readonly.test.mjs",
       "tests": [
         "request-path lease commit() writes nothing to the workspace"
+      ],
+      "source": "plan rev3 mandatory-check table (unchanged in rev4)"
+    },
+    {
+      "id": "offline:ploinky:tests/security/authorization/webchat-interaction-isolation.test.mjs",
+      "kind": "offline",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "U6",
+      "repo": "ploinky",
+      "file": "tests/security/authorization/webchat-interaction-isolation.test.mjs",
+      "tests": [
+        "principal interaction: the owner resolves its own pending interaction with interactionId",
+        "principal interaction: another principal with copied tab, session and interaction IDs cannot resolve, inject or cancel"
       ],
       "source": "plan rev3 mandatory-check table (unchanged in rev4)"
     },
@@ -2637,7 +2667,9 @@
       "boundary": "U6",
       "repo": "ploinky",
       "file": "tests/unit/webchatInteraction.test.mjs",
-      "tests": [],
+      "tests": [
+        "authenticated interaction responses use the control channel and reject replay"
+      ],
       "source": "plan rev3 mandatory-check table (unchanged in rev4)"
     },
     {
@@ -4129,6 +4161,246 @@
       "source": "tests/security/authorization/router-probes.mjs routerProbes"
     },
     {
+      "id": "router:users-list.path-dot-segment:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-dot-segment:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-dot-segment:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-dot-segment:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-double-encoded-slash:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-double-encoded-slash:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-duplicate-slash:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-duplicate-slash:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-encoded-owner:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-encoded-owner:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-encoded-owner:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-encoded-owner:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-encoded-parent:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-encoded-parent:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-encoded-parent:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-encoded-parent:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-encoded-resource:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-encoded-resource:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-encoded-slash:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-encoded-slash:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-parent-segment:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-parent-segment:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-parent-segment:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-parent-segment:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
       "id": "router:users-list.role-override-deny:anonymous",
       "kind": "live",
       "count": 1,
@@ -4442,8 +4714,7 @@
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": [
-        "u6:webchat-own-marker:userA",
-        "u6:webchat-own-marker:userB"
+        "u6:webchat-own-control:userB"
       ],
       "boundary": "U6",
       "source": "tests/security/authorization/webchat-probes.mjs runWebchatProbes"
@@ -4453,25 +4724,13 @@
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": [
-        "u6:webchat-own-marker:userA",
         "u6:webchat-own-marker:userB"
       ],
       "boundary": "U6",
       "source": "tests/security/authorization/webchat-probes.mjs runWebchatProbes"
     },
     {
-      "id": "u6:webchat-copied-ids-interaction:userB",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "u6:webchat-own-marker:userA",
-        "u6:webchat-own-marker:userB"
-      ],
-      "boundary": "U6",
-      "source": "tests/security/authorization/webchat-probes.mjs runWebchatProbes"
-    },
-    {
-      "id": "u6:webchat-credential-confinement:userA",
+      "id": "u6:webchat-credential-confinement",
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": [
@@ -4486,7 +4745,7 @@
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": [
-        "u6:webchat-own-stream:userA"
+        "u6:webchat-own-marker:userA"
       ],
       "boundary": "U6",
       "source": "tests/security/authorization/webchat-probes.mjs runWebchatProbes"
@@ -4496,7 +4755,7 @@
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": [
-        "u6:webchat-own-stream:userA"
+        "u6:webchat-own-marker:userA"
       ],
       "boundary": "U6",
       "source": "tests/security/authorization/webchat-probes.mjs runWebchatProbes"
@@ -4506,7 +4765,7 @@
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": [
-        "u6:webchat-own-stream:userA"
+        "u6:webchat-own-marker:userA"
       ],
       "boundary": "U6",
       "source": "tests/security/authorization/webchat-probes.mjs runWebchatProbes"
@@ -4516,7 +4775,7 @@
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": [
-        "u6:webchat-own-stream:userA"
+        "u6:webchat-own-marker:userA"
       ],
       "boundary": "U6",
       "source": "tests/security/authorization/webchat-probes.mjs runWebchatProbes"

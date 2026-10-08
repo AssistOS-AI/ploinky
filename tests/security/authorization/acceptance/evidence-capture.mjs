@@ -26,12 +26,13 @@ export class CaptureError extends Error {
     constructor(code, message) { super(`${code}: ${message}`); this.code = code; }
 }
 
-export function userPersistoContainer(agentsJson) {
+export function agentContainer(agentsJson, repo, agent) {
     const matches = Object.entries(agentsJson || {}).filter(([name, record]) => name !== '_config' && record?.type === 'agent'
-        && record.repoName === 'AchillesIDE' && record.agentName === 'userPersistoAgent' && !record.alias);
-    if (matches.length !== 1) throw new CaptureError('CAPTURE_USERPERSISTO_AMBIGUOUS', `expected one UserPersisto record, found ${matches.length}`);
+        && record.repoName === repo && record.agentName === agent && !record.alias);
+    if (matches.length !== 1) throw new CaptureError('CAPTURE_CONTAINER_AMBIGUOUS', `expected one ${repo}/${agent} record, found ${matches.length}`);
     return matches[0][0];
 }
+export const userPersistoContainer = agentsJson => agentContainer(agentsJson, 'AchillesIDE', 'userPersistoAgent');
 
 /**
  * The capture pipeline with injectable side effects, so the pins-first order
@@ -50,12 +51,14 @@ export async function capture({ pinsFile, pinsSha256, out, sourceRoot = SOURCE_R
     const captured = { id: box.Id, name: String(box.Name).replace(/^\//, ''), startedAt: box.State?.StartedAt, imageId: `sha256:${String(box.Image).replace(/^sha256:/, '')}` };
     verifyBox({ box, captured, pins, policy });
     steps.push('box-verified');
-    const container = userPersistoContainer(await readAgents(pins.workspace));
+    const agents = await readAgents(pins.workspace);
+    const container = userPersistoContainer(agents);
+    const dpuContainer = agentContainer(agents, 'AchillesIDE', 'dpuAgent');
     fs.mkdirSync(out, { mode: 0o700 });
     const write = (name, value) => fs.writeFileSync(path.join(out, name), JSON.stringify(value, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
     const repositories = pins.repositories.map(({ name, path: p, commit, branch, upstream }) => ({ name, path: p, commit, branch, upstream }));
     write('dependency-preflight.json', { workspace: pins.workspace, pinsSha256: sha256, policyDigest: digest, ploinky: pins.ploinky, image: { imageId: pins.box.imageId, imageDigest: pins.box.imageDigest }, repositories });
-    write('box-identity.json', { ...captured, image: captured.imageId, ports: box.NetworkSettings?.Ports, observedMounts: (box.Mounts || []).map(m => ({ destination: m.Destination, source: m.Source, type: m.Type, rw: m.RW === true })), userPersistoContainer: container, pinsSha256: sha256, capturedAt: new Date().toISOString() });
+    write('box-identity.json', { ...captured, image: captured.imageId, ports: box.NetworkSettings?.Ports, observedMounts: (box.Mounts || []).map(m => ({ destination: m.Destination, source: m.Source, type: m.Type, rw: m.RW === true })), userPersistoContainer: container, dpuContainer, imageDigest: box.ImageDigest, pinsSha256: sha256, capturedAt: new Date().toISOString() });
     steps.push('written');
     return { steps, pinsSha256: sha256, policyDigest: digest };
 }
