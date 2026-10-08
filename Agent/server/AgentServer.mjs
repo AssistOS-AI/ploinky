@@ -251,16 +251,50 @@ function getStaticMimeType(filePath) {
 
 function getStaticCacheControl(filePath) {
     const ext = path.extname(filePath).toLowerCase();
+    // HTML documents are application entry points; never store them (matches
+    // the router document policy in cli/server/static).
+    if (ext === '.html' || ext === '.htm') {
+        return 'no-store';
+    }
+    // Agent static is only reachable through the authenticated router, so a
+    // shared cache must never keep it.
     if (['.woff2', '.woff', '.ttf', '.otf'].includes(ext)) {
-        return 'public, max-age=31536000, immutable';
+        return 'private, max-age=31536000, immutable';
     }
     if (['.png', '.jpg', '.jpeg', '.gif', '.ico', '.svg', '.webp'].includes(ext)) {
-        return 'public, max-age=86400';
+        return 'private, max-age=86400';
     }
     if (['.js', '.mjs', '.css'].includes(ext)) {
-        return 'public, max-age=300';
+        return 'private, max-age=300';
     }
-    return 'public, max-age=60';
+    return 'private, max-age=60';
+}
+
+function staticEntityTag(stat) {
+    return `W/"${stat.size}-${Math.floor(stat.mtimeMs)}-${stat.ino}"`;
+}
+
+function normalizeStaticEntityTag(tag) {
+    return tag.startsWith('W/') ? tag.slice(2) : tag;
+}
+
+function staticIfNoneMatchMatches(headerValue, etag) {
+    const raw = Array.isArray(headerValue) ? headerValue.join(',') : headerValue;
+    if (typeof raw !== 'string' || !raw.trim()) return false;
+    const current = normalizeStaticEntityTag(etag);
+    return raw.split(',').map((part) => part.trim()).some((part) => (
+        part === '*' || normalizeStaticEntityTag(part) === current
+    ));
+}
+
+function staticNotModified(req, etag, stat) {
+    const ifNoneMatch = req.headers?.['if-none-match'];
+    if (typeof ifNoneMatch === 'string' || Array.isArray(ifNoneMatch)) {
+        return staticIfNoneMatchMatches(ifNoneMatch, etag);
+    }
+    const since = Date.parse(String(req.headers?.['if-modified-since'] || ''));
+    if (!Number.isFinite(since)) return false;
+    return Math.floor(stat.mtimeMs / 1000) * 1000 <= since;
 }
 
 async function serveStaticFile(req, res, pathname) {
@@ -269,10 +303,20 @@ async function serveStaticFile(req, res, pathname) {
     const filePath = await resolveStaticFile(pathname);
     if (!filePath) return false;
     const stat = await fs.promises.stat(filePath);
+    const etag = staticEntityTag(stat);
+    const lastModified = new Date(stat.mtimeMs).toUTCString();
+    const cacheControl = getStaticCacheControl(filePath);
+    if (staticNotModified(req, etag, stat)) {
+        res.writeHead(304, { 'Cache-Control': cacheControl, ETag: etag, 'Last-Modified': lastModified });
+        res.end();
+        return true;
+    }
     res.writeHead(200, {
         'Content-Type': getStaticMimeType(filePath),
         'Content-Length': stat.size,
-        'Cache-Control': getStaticCacheControl(filePath)
+        'Cache-Control': cacheControl,
+        ETag: etag,
+        'Last-Modified': lastModified
     });
     if (method === 'HEAD') {
         res.end();
