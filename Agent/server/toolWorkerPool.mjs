@@ -465,8 +465,16 @@ export class ToolWorkerPool {
         // Calls that a starting worker, or a worker the pool may still spawn,
         // will take do not occupy the bounded wait queue.
         const spawnCapacity = Math.max(0, this.size - this.workers.size);
-        const waitingForWorker = this.queue.length - this.countWorkers('starting') - spawnCapacity;
-        if (waitingForWorker >= this.maxQueue && !this.findIdleWorker()) {
+        let waitingForWorker = this.queue.length - this.countWorkers('starting') - spawnCapacity;
+        // While a walk is in flight, idle workers can take only the calls
+        // enqueued before it started (this call is not one of them), so they
+        // exempt nothing from the bound and absorb only those calls.
+        if (this.walk) {
+            const walkSeq = this.walk.seq;
+            const eligible = this.queue.reduce((count, queued) => count + (queued.enqueueSeq < walkSeq ? 1 : 0), 0);
+            waitingForWorker -= Math.min(this.countWorkers('idle'), eligible);
+        }
+        if (waitingForWorker >= this.maxQueue && (this.walk || !this.findIdleWorker())) {
             this.counters.saturated += 1;
             return failureResult(`tool worker pool '${this.name}' is saturated (maxQueue ${this.maxQueue})`);
         }

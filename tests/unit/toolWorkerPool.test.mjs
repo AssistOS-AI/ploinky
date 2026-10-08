@@ -1063,3 +1063,23 @@ test('a crashed identity thread sends the call to the spawn fallback and the nex
     assert.equal(thread.stats().spawned, 2);
     assert.equal(pool.stats().identityErrors, 1);
 });
+
+test('maxQueue: calls enqueued while a walk is in flight are bounded as if the idle worker had taken the first call', async (t) => {
+    const dir = makeDir(t);
+    const codeFile = path.join(dir, 'tool-code.txt');
+    fs.writeFileSync(codeFile, 'v1');
+    const identity = heldIdentity(codeFile);
+    const { pool } = codePool(t, dir, codeFile, { size: 1, maxQueue: 2, codeIdentity: identity.hook });
+    await warmPool(pool, 1);
+    identity.hold();
+    const calls = Array.from({ length: 10 }, () => callTool(pool, { mode: 'codeVersion', ms: 20 }));
+    assert.ok(await waitUntil(() => identity.release !== null, 2000), 'the walk to start');
+    // Synchronous walks (the base pool) dispatch the first call at once, queue
+    // two and saturate seven; a held walk must admit no more.
+    assert.equal(pool.stats().saturated, 7, JSON.stringify(pool.stats()));
+    assert.equal(pool.stats().queued, 3);
+    identity.release();
+    const results = await Promise.all(calls);
+    assert.equal(results.filter((r) => /is saturated \(maxQueue 2\)/.test(r.stderr)).length, 7);
+    for (const result of results.filter((r) => !/saturated/.test(r.stderr))) assert.equal(codeVersion(result).version, 'v1');
+});
