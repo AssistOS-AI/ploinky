@@ -2371,6 +2371,38 @@
             "anchor": "action === 'disable_agent'",
             "statement": "} else if (action === 'disable_agent') {"
           }
+        },
+        "929c7610c72c09ddf6f96105c6c4c8a31ad076a5d405e9c4f3df1c3838a14ff0": {
+          "marketplace-repos-read.get": {
+            "line": 752,
+            "anchor": "const marketplacePayload = async () =>",
+            "statement": "const marketplacePayload = async () => runPreparedRepositoryRead(res, () => (isRepos ? buildMarketplaceRepositories() : agentsMarketplace()), { catalog: isRepos });"
+          },
+          "marketplace-agents-read.get": {
+            "line": 724,
+            "anchor": "...buildMarketplaceAgents(req.user, options),",
+            "statement": "...buildMarketplaceAgents(req.user, options),"
+          },
+          "marketplace-install_repo.post": {
+            "line": 824,
+            "anchor": "action === 'install_repo'",
+            "statement": "} else if (action === 'install_repo' || action === 'uninstall_repo') {"
+          },
+          "marketplace-uninstall_repo.post": {
+            "line": 824,
+            "anchor": "action === 'uninstall_repo'",
+            "statement": "} else if (action === 'install_repo' || action === 'uninstall_repo') {"
+          },
+          "marketplace-enable_agent.post": {
+            "line": 850,
+            "anchor": "action === 'enable_agent'",
+            "statement": "} else if (action === 'enable_agent') {"
+          },
+          "marketplace-disable_agent.post": {
+            "line": 852,
+            "anchor": "action === 'disable_agent'",
+            "statement": "} else if (action === 'disable_agent') {"
+          }
         }
       },
       "candidate": "8c99918602620aa560b8dc0cf08d99c1aa69902c6e2c8a5606dc13a9965480f1"
@@ -2518,6 +2550,38 @@
           },
           "agent-static.head": {
             "line": 840,
+            "anchor": "async function serveAgentStaticRequest(req, res, {",
+            "statement": "async function serveAgentStaticRequest(req, res, {"
+          }
+        },
+        "503cc16989efd2c09abe681b38d6e15ba1b1e421e486060f08f5b1a23c13c7df": {
+          "web-libs.get": {
+            "line": 794,
+            "anchor": "async function serveWebLibRequest(req, res) {",
+            "statement": "async function serveWebLibRequest(req, res) {"
+          },
+          "web-libs.head": {
+            "line": 794,
+            "anchor": "async function serveWebLibRequest(req, res) {",
+            "statement": "async function serveWebLibRequest(req, res) {"
+          },
+          "workspace-file-read.get": {
+            "line": 757,
+            "anchor": "async function serveWorkspaceFileRequest(req, res) {",
+            "statement": "async function serveWorkspaceFileRequest(req, res) {"
+          },
+          "workspace-file-read.head": {
+            "line": 757,
+            "anchor": "async function serveWorkspaceFileRequest(req, res) {",
+            "statement": "async function serveWorkspaceFileRequest(req, res) {"
+          },
+          "agent-static.get": {
+            "line": 913,
+            "anchor": "async function serveAgentStaticRequest(req, res, {",
+            "statement": "async function serveAgentStaticRequest(req, res, {"
+          },
+          "agent-static.head": {
+            "line": 913,
             "anchor": "async function serveAgentStaticRequest(req, res, {",
             "statement": "async function serveAgentStaticRequest(req, res, {"
           }
@@ -2771,6 +2835,73 @@
             "anchor": "return handleWorkspaceDirectoriesPost(req, res, directoryContext)",
             "statement": "return handleWorkspaceDirectoriesPost(req, res, directoryContext);"
           }
+        },
+        "2c1399c1f147f93900a15562e4993fb1466b546e3e2bca2bf134cc46f18bc17f": {
+          "webchat-ui.get": {
+            "line": 183,
+            "anchor": "pathname === '/'",
+            "statement": "if (pathname === '/' || pathname === '/index.html') {"
+          },
+          "webchat-ui-no-slash.get": {
+            "line": 183,
+            "anchor": "pathname === '/'",
+            "statement": "if (pathname === '/' || pathname === '/index.html') {"
+          },
+          "webchat-index.get": {
+            "line": 183,
+            "anchor": "pathname === '/'",
+            "statement": "if (pathname === '/' || pathname === '/index.html') {"
+          },
+          "webchat-assets.get": {
+            "line": 119,
+            "anchor": "pathname.startsWith('/assets/')",
+            "statement": "if (pathname.startsWith('/assets/')) {"
+          },
+          "webchat-removed-token-auth.post": {
+            "line": 109,
+            "anchor": "pathname === '/auth'",
+            "statement": "if (pathname === '/auth' && req.method === 'POST') {"
+          },
+          "webchat-logout.post": {
+            "line": 117,
+            "anchor": "pathname === '/logout'",
+            "statement": "if (pathname === '/logout' && req.method === 'POST') return handleLogout(req, res, appState, agentQuery);"
+          },
+          "webchat-suggestions.get": {
+            "line": 150,
+            "anchor": "pathname === '/suggestions/files'",
+            "statement": "if (pathname === '/suggestions/files' && (req.method === 'GET' || req.method === 'HEAD')) {"
+          },
+          "webchat-suggestions.head": {
+            "line": 150,
+            "anchor": "pathname === '/suggestions/files'",
+            "statement": "if (pathname === '/suggestions/files' && (req.method === 'GET' || req.method === 'HEAD')) {"
+          },
+          "webchat-upload.post": {
+            "line": 154,
+            "anchor": "pathname === '/uploads'",
+            "statement": "if (pathname === '/uploads') {"
+          },
+          "webchat-upload.put": {
+            "line": 154,
+            "anchor": "pathname === '/uploads'",
+            "statement": "if (pathname === '/uploads') {"
+          },
+          "webchat-directories-list.get": {
+            "line": 167,
+            "anchor": "pathname === '/directories'",
+            "statement": "if (pathname === '/directories') {"
+          },
+          "webchat-directories-list.head": {
+            "line": 167,
+            "anchor": "pathname === '/directories'",
+            "statement": "if (pathname === '/directories') {"
+          },
+          "webchat-directories-create.post": {
+            "line": 173,
+            "anchor": "return handleWorkspaceDirectoriesPost(req, res, directoryContext)",
+            "statement": "return handleWorkspaceDirectoriesPost(req, res, directoryContext);"
+          }
         }
       },
       "candidate": "2874a4e81aec3efb6527338dec777dedd997ec7ec0c4980e6fc118161b6fd45d"
@@ -2884,6 +3015,56 @@
         }
       },
       "candidate": "4fdb5efcb5d77cffb8c28dc94b06bd243e84c58afe32f9ba79271109501d3f62"
+    },
+    "cli/server/handlers/webchat/runtimeRoutes.js": {
+      "baseline": "894d28dbcd19dc51b2393a7f34b0a06d9c4e40804cb4a81460ff65f5131ed17f",
+      "blobs": {
+        "894d28dbcd19dc51b2393a7f34b0a06d9c4e40804cb4a81460ff65f5131ed17f": {
+          "webchat-stream.get": {
+            "line": 73,
+            "anchor": null,
+            "statement": "if (pathname === '/stream') {"
+          },
+          "webchat-input.post": {
+            "line": 243,
+            "anchor": null,
+            "statement": "if (pathname === '/input' && req.method === 'POST') {"
+          },
+          "webchat-control.post": {
+            "line": 319,
+            "anchor": null,
+            "statement": "if (pathname === '/control' && req.method === 'POST') {"
+          },
+          "webchat-interaction.post": {
+            "line": 348,
+            "anchor": null,
+            "statement": "if (pathname === '/interaction' && req.method === 'POST') {"
+          }
+        },
+        "90e8d42a687352c358d032d0033576c923f704e218cd6b84115cd12687d8fbe1": {
+          "webchat-stream.get": {
+            "line": 119,
+            "anchor": null,
+            "statement": "if (pathname === '/stream') {"
+          },
+          "webchat-input.post": {
+            "line": 294,
+            "anchor": null,
+            "statement": "if (pathname === '/input' && req.method === 'POST') {"
+          },
+          "webchat-control.post": {
+            "line": 370,
+            "anchor": null,
+            "statement": "if (pathname === '/control' && req.method === 'POST') {"
+          },
+          "webchat-interaction.post": {
+            "line": 399,
+            "anchor": null,
+            "statement": "if (pathname === '/interaction' && req.method === 'POST') {"
+          }
+        }
+      },
+      "candidate": "894d28dbcd19dc51b2393a7f34b0a06d9c4e40804cb4a81460ff65f5131ed17f"
     }
   }
 }
