@@ -14,19 +14,35 @@ Run the offline harness regressions first. They exercise mock HTTP, temporary fi
 npm run test:authorization:harness
 ```
 
-From this Ploinky checkout, run the full local suite with fresh artifact directories:
+The live suite runs only against an exact, pushed and deployed candidate described by an external pin manifest. The procedure is fixed:
+
+1. Push the candidate and deploy it (Router before Explorer). Nothing in this directory contains a commit SHA.
+2. Write `pins.json` outside the source tree (schema below), have it reviewed, then freeze it: `chmod 0444 pins.json` and record `shasum -a 256 pins.json`.
+3. Capture deployment evidence, pins first. Any hash, SHA, branch/upstream, containment, cleanliness or policy-digest mismatch exits 1 before the Box is inspected or anything is written:
+
+```sh
+node tests/security/authorization/acceptance/evidence-capture.mjs --pins /abs/pins.json --pins-sha256 <hex> --out /abs/new-evidence-dir
+```
+
+4. Run the focused offline tests at the pinned commit with TAP bound to that commit (`acceptance/offline-tap.mjs`, one TAP and sidecar per file; the AchillesIDE DPU test runs from the pinned AchillesIDE checkout with `--repo-name AchillesIDE`).
+5. Run the full suite through the A7 wrapper, which captures the raw exit code itself and then evaluates the scoped gate:
 
 ```sh
 AUTHZ_RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
-export AUTHZ_DEPLOYMENT_EVIDENCE=/Users/danielsava/work/deployment-evidence/userpersisto-merge-20260913-nkg3NN
-export AUTHZ_CREDENTIAL_DIR=/Users/danielsava/work/deployment-private/userpersisto-merge-20260913-nkg3NN
+export AUTHZ_DEPLOYMENT_EVIDENCE=/abs/new-evidence-dir
+export AUTHZ_CREDENTIAL_DIR=/abs/private-credential-dir
 export AUTHZ_OUTPUT_DIR="/Users/danielsava/work/deployment-evidence/authorization-$AUTHZ_RUN_ID"
 export AUTHZ_PRIVATE_DIR="/Users/danielsava/work/deployment-private/authorization-$AUTHZ_RUN_ID"
-export AUTHZ_PLAYWRIGHT_MODULE=/Users/danielsava/work/testExplorerFresh/AssistOSExplorer/tests/smoke/node_modules/playwright/index.mjs
-npm run test:authorization
+export AUTHZ_PLAYWRIGHT_MODULE=/abs/playwright/index.mjs
+export AUTHZ_PINS=/abs/pins.json AUTHZ_PINS_SHA256=<hex>
+node tests/security/authorization/acceptance/run-acceptance.mjs --offline-dir /abs/offline-tap-dir
 ```
 
-`AUTHZ_TARGET` is optional and, if set, must equal the exact loopback origin above. Alternative hostnames, ports and origins are refused. The selected baseline is Ploinky `706d9b65dbbf39c33a403cdfecf075bf2b529855`, Explorer `f3590932f3fce75fcb8c290590b114397a9181ae`, and Box `209c0ce14c3f9ff7ef7ecddde77006408dc08c7119a2a45161adcb2f84366871`. The preflight carries all other dependency and immutable image pins. Suite-only commits can run against these unchanged application revisions.
+`npm run test:authorization` still runs the unchanged full suite with the same environment; it refuses to start without `AUTHZ_PINS` and `AUTHZ_PINS_SHA256`, and records a setup error with no registration request when the pins, the running checkout, the policy digest or the Box identity differ.
+
+`pins.json` (`authz-acceptance-pins/1`): `ploinky` `{commit, branch, upstream}`; `ploinkyCheckout` (absolute real path of the checkout mounted at `/opt/ploinky`, from which the suite must run); `workspace`; `repositories[]` `{name, path (workspace-relative), commit, branch, upstream}` for every repository in `acceptance/policy.json` `inventoryRepositories`; `policyDigest` (`node tests/security/authorization/acceptance/digest.mjs`); `box` `{id, name, startedAt, imageId, imageDigest}`; `agentlib` `{mode: image|local, sourceRelativePath?}`.
+
+`AUTHZ_TARGET` is optional and, if set, must equal the exact loopback origin above. Alternative hostnames, ports and origins are refused. Candidate, dependency and Box identities come only from the frozen pin manifest; the guard compares the captured evidence with it and applies the fixed Box confinement policy (`assertBoxConfinement`, derived from `ploinky-box/contract/container.mjs` and `constants.mjs`), so a captured snapshot can never widen what is accepted.
 
 Credential input is a private, operator-owned `admin-storage-state.json` in `AUTHZ_CREDENTIAL_DIR`, captured after a normal Google or verified-email administrator sign-in. An absent or expired administrator session stops the suite; refresh that private storage state before retrying. Do not paste codes, cookies or tokens into commands. A fresh private log capture is attached to the exact current UserPersisto container to read only development email codes for newly generated `example.test` addresses. Browser requests are restricted to the selected origin; Google sign-in is never attempted.
 
@@ -51,7 +67,26 @@ The historical member/selfRegistered storage state is never used: that account w
 
 Exit `1` means an assertion, setup, cleanup, interruption or ownership error. Exit `2` means executed assertions had no failures but explicit gaps remain. Exit `0` is reserved for an executed run without reported failures or gaps. No empty run, missing endpoint, 404, redirect, malformed request or unavailable backend can produce an authorization pass. A failing assertion is not automatically a confirmed product vulnerability: inspect its authorized control, exact request, response content and side effects first. Failures are retained, not rewritten to match deployed behavior.
 
-The inventories contain 122 Router rows and 832 agent rows across 26 manifests, including 19 enabled runtimes and 310 declared MCP tools. Rows include unresolved wildcard/image-owned families; they are not a count of all concrete endpoints. Tools/list contact never counts as a tools/call assertion. Even a row with recorded assertions does not imply complete role, resource, argument, alias or protocol coverage.
+## Scoped A6 acceptance
+
+The raw suite result is never reinterpreted: exit 2 stays `NO_FAILURES_WITH_GAPS`. `acceptance/verify-acceptance.mjs` separately returns ACCEPT or REJECT with every reason. It ACCEPTs only when the raw exit code (captured by the wrapper) matches `report.verdict` and is 2; FAIL and ERROR are 0; there is no setup error or interruption; every cleanup, `finalOwnership` and the lock release passed; the report is bound to the reviewed pins hash, policy digest, Box identity and repository commits; the four principals have their reviewed roles; the live runtime set equals `acceptance/expected-runtimes.json` exactly; every entry of `acceptance/mandatory-checks.json` occurs the expected number of times, all PASS, with a passing positive control; every offline mandatory TAP was produced at the pinned commit on a clean tree with nothing failed, skipped, cancelled or todo; and the gap list equals `acceptance/expected-gaps.json` exactly by identity and typed evidence.
+
+| File | Content |
+| --- | --- |
+| `acceptance/policy.json` | Root agent, reviewed profile (`default`, with its source), inventory repositories, Box/mount policy inputs, changed boundary rows (U3/U6/U7), boundary statuses, exit-code map, principal roles |
+| `acceptance/expected-runtimes.json` | Derived by `expected-runtime-graph.mjs` from manifests read with `git show <sha>` and the explicit profile; `--check` must equal it. An empty profile exits 1 |
+| `acceptance/expected-gaps.json` | Exact gap identities with category, cited source, reason, affected obligations, justification and a typed evidence rule. Unavailable positives, transport errors, timeouts, 503, pagination, `agent.username-admin.*`, fixture-unavailable and admin-unavailable outcomes never match |
+| `acceptance/mandatory-checks.json` | Enumerated by `mandatory-checks.mjs --check` from the probe definitions crossed with actors, never from a run report |
+
+Gap evidence is typed (`ctx.recordGap(id, reason, evidence)`): only enumerated scalars and sorted names are kept, never error text. A discovery exclusion requires an initialized administrator session, the actual stage equal to the requested method, HTTP 200 and RPC -32601; an initialization -32601 or an unavailable positive under the same ID rejects. A raw-path boundary gap requires its `routerCoverage` row to be `BOUNDARY_REJECTED_ONLY` with a reviewed status; such an entry may instead be absent only if the explicit denial check PASSed. A selfRegistered metadata-visibility exclusion requires exact equality with the reviewed visible-tool list; none is listed yet, so any such gap rejects. Raw users-list paths follow the traced D2 matrix: dot-segment, parent-segment, encoded-parent and encoded-owner must be explicit 401/403 denials for all four restricted actors; duplicate-slash, encoded-resource, encoded-slash and double-encoded-slash must be denials for anonymous and selfRegistered and exactly-404 boundary gaps for userA/userB; every denial is linked to its exact `routerCoverage` record. The comparator recomputes the mandatory list from the enumerator and re-derives the runtime graph from the pinned manifests, and verifies the Box image digest.
+
+WebChat (U6) evidence uses the real pinned DPU protocol: each visible unsupported slash command produces the generic acknowledgement `This command is not supported by DPU Research.` (AchillesIDE `dpuAgent/src/index.mjs:250-263`), attributed by stream and freshness, plus the unique Router `user-message` marker. Copied-ID operations count only when B's own runtime acknowledges them and A's DPU process (pid plus kernel start time, attributed by its router-issued `--sso-user-id`, inspected inside the pinned DPU container) is unchanged; 503, 409, 400 and missing-resource outcomes never count. No pending interaction can be created without inference, so `report.liveLimitations` records that limitation exactly and the actual-module `webchat-interaction-isolation.test.mjs` is mandatory offline evidence. Cleanup verifies runtime removal on every path.
+
+Fixture prerequisite: the task-owned test administrator must not hold the username `admin` (the username-shortcut probe renames a disposable user to `admin`); prepare it with a unique username through the normal fixture setup. Known pending decisions: liveKitServerAgent's route has no host port, so its MCP discovery and GET transport probes cannot pass; a source search found no upstream `/mcp` route in Soul Gateway (unverified), so its forwarded `tools/list`/`resources/list` positives may fail. Neither is excluded; both need a reviewed decision.
+
+New live controls: U3 protected/public template revalidation and navigation (`boundary-probes.mjs`), U7 marketplace unknown-action admission with a 400 positive, explicit denials and a normalized no-effect listing digest (`boundary-probes.mjs`), and the bounded per-user U6 WebChat probe (`webchat-probes.mjs`). The U7 positive relies on the request-path lease `commit()` being write-free, which `lease-readonly.test.mjs` proves on a real edge generation.
+
+The inventories contain 128 Router rows and 889 agent rows across 27 manifests, including the 16 runtimes enabled by the reviewed manifest graph and 336 declared MCP tools. Rows include unresolved wildcard/image-owned families; they are not a count of all concrete endpoints. Tools/list contact never counts as a tools/call assertion. Even a row with recorded assertions does not imply complete role, resource, argument, alias or protocol coverage.
 
 Generate the complete matrix without contacting the deployment:
 

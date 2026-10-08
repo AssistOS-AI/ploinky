@@ -1,0 +1,133 @@
+{
+  "schema": "authz-expected-runtimes/1",
+  "rootAgent": "AchillesIDE/explorer",
+  "profile": "default",
+  "inventoryRepositories": [
+    "AchillesIDE",
+    "AchillesCLI",
+    "copilot-agents",
+    "proxies",
+    "UmamiAgent",
+    "local-llms",
+    "OnlyOfficeAgent",
+    "container-image-builds",
+    "DocumentationSkills"
+  ],
+  "counts": {
+    "total": 27,
+    "enabled": 16,
+    "disabled": 11
+  },
+  "enabled": [
+    {
+      "repo": "AchillesCLI",
+      "agent": "roboTeamAgent"
+    },
+    {
+      "repo": "AchillesIDE",
+      "agent": "dpuAgent"
+    },
+    {
+      "repo": "AchillesIDE",
+      "agent": "emailAgent"
+    },
+    {
+      "repo": "AchillesIDE",
+      "agent": "explorer"
+    },
+    {
+      "repo": "AchillesIDE",
+      "agent": "gitAgent"
+    },
+    {
+      "repo": "AchillesIDE",
+      "agent": "liveKitServerAgent"
+    },
+    {
+      "repo": "AchillesIDE",
+      "agent": "multimedia"
+    },
+    {
+      "repo": "AchillesIDE",
+      "agent": "soplangAgent"
+    },
+    {
+      "repo": "AchillesIDE",
+      "agent": "tasksAgent"
+    },
+    {
+      "repo": "AchillesIDE",
+      "agent": "userPersistoAgent"
+    },
+    {
+      "repo": "AchillesIDE",
+      "agent": "webAssist"
+    },
+    {
+      "repo": "AchillesIDE",
+      "agent": "webmeetAgent"
+    },
+    {
+      "repo": "AchillesIDE",
+      "agent": "workspaceMonitorAgent"
+    },
+    {
+      "repo": "local-llms",
+      "agent": "local-llm"
+    },
+    {
+      "repo": "proxies",
+      "agent": "soul-gateway"
+    },
+    {
+      "repo": "UmamiAgent",
+      "agent": "umamiAgent"
+    }
+  ],
+  "disabled": [
+    {
+      "repo": "AchillesCLI",
+      "agent": "GPTResearcher"
+    },
+    {
+      "repo": "AchillesIDE",
+      "agent": "webmeetScribeAgent"
+    },
+    {
+      "repo": "AchillesIDE",
+      "agent": "webmeetStt"
+    },
+    {
+      "repo": "copilot-agents",
+      "agent": "browserUseAgent"
+    },
+    {
+      "repo": "copilot-agents",
+      "agent": "copilotProviderRelay"
+    },
+    {
+      "repo": "copilot-agents",
+      "agent": "openInterpreterAgent"
+    },
+    {
+      "repo": "copilot-agents",
+      "agent": "research-agents"
+    },
+    {
+      "repo": "copilot-agents",
+      "agent": "webSearchAgent"
+    },
+    {
+      "repo": "OnlyOfficeAgent",
+      "agent": "onlyOffice"
+    },
+    {
+      "repo": "proxies",
+      "agent": "opencode-free"
+    },
+    {
+      "repo": "proxies",
+      "agent": "searchAgent"
+    }
+  ]
+}

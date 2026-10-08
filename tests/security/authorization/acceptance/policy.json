@@ -1,0 +1,51 @@
+{
+  "schema": "authz-acceptance-policy/1",
+  "rootAgent": "AchillesIDE/explorer",
+  "profile": "default",
+  "profileSource": [
+    "ploinky/CLAUDE.md, on-demand release gate step 3: `ploinky start explorer [--branch <candidate-branch>]` is the literal deployment command and --branch is the only permitted option, so no --profile is passed",
+    "cli/commands/cli.js:376-381: start writes the workspace profile only when --profile is given",
+    "cli/utils/runtime/profileService.js:199-209: getActiveProfile() returns 'default' when .ploinky/profile is absent",
+    "cli/utils/config.js:75: PROFILE_FILE is <workspace>/.ploinky/profile; the fixture /Users/danielsava/work/testExplorerFresh/.ploinky has no profile file"
+  ],
+  "workspace": "/Users/danielsava/work/testExplorerFresh",
+  "inventoryRepositories": [
+    { "name": "AchillesIDE", "path": ".ploinky/repos/AchillesIDE", "reason": "Root agent repository (cli/utils/repos.js:146 BOOT_REPO_NAMES)" },
+    { "name": "AchillesCLI", "path": ".ploinky/repos/AchillesCLI", "reason": "Boot repository (cli/utils/repos.js:146); roboTeamAgent is enabled by the Explorer manifest" },
+    { "name": "copilot-agents", "path": ".ploinky/repos/copilot-agents", "reason": "Boot repository (cli/utils/repos.js:146); no agent is enabled by the Explorer graph" },
+    { "name": "proxies", "path": ".ploinky/repos/proxies", "reason": "Installed by the explorer enable entry proxies/soul-gateway (bootstrapManifest.js ensurePrefixedRepoInstalled)" },
+    { "name": "UmamiAgent", "path": ".ploinky/repos/UmamiAgent", "reason": "Declared in explorer/manifest.json repos" },
+    { "name": "local-llms", "path": ".ploinky/repos/local-llms", "reason": "Declared in explorer/manifest.json repos; local-llms/local-llm is enabled" },
+    { "name": "OnlyOfficeAgent", "path": ".ploinky/repos/OnlyOfficeAgent", "reason": "Declared in explorer/manifest.json repos; onlyOffice is not enabled by the graph" },
+    { "name": "container-image-builds", "path": ".ploinky/repos/container-image-builds", "reason": "Declared in explorer/manifest.json repos; image-build dependency" },
+    { "name": "DocumentationSkills", "path": ".ploinky/repos/DocumentationSkills", "reason": "Skills repository installed by the workspace (cli/utils/repos.js:142)" }
+  ],
+  "excludedAgents": [
+    { "agent": "default-local-llm", "reason": "Retired agent distinct from local-llms/local-llm; exclusion retained (r2_decisions_codex.md Q2)" }
+  ],
+  "box": {
+    "user": "podman",
+    "init": true,
+    "privileged": false,
+    "ports": { "8080/tcp": [{ "HostIp": "127.0.0.1", "HostPort": "8080" }], "udpPort": "7882/udp" },
+    "ploinkySourceDestination": "/opt/ploinky",
+    "agentLibModes": ["image", "local"],
+    "gpuWiring": false,
+    "hardwareLimitsWiring": false
+  },
+  "changedBoundaryRows": {
+    "U3": ["agent-static.get", "agent-static.head"],
+    "U6": ["webchat-stream.get", "webchat-input.post", "webchat-control.post", "webchat-interaction.post"],
+    "U7": ["marketplace-install_repo.post", "marketplace-uninstall_repo.post", "marketplace-enable_agent.post", "marketplace-disable_agent.post"]
+  },
+  "boundaryRejectionStatuses": [404],
+  "verdictExitCodes": { "PASS": 0, "NO_FAILURES_WITH_GAPS": 2, "otherwise": 1 },
+  "requiredRawVerdict": "NO_FAILURES_WITH_GAPS",
+  "requiredRawExitCode": 2,
+  "principals": {
+    "admin": ["admin"],
+    "selfRegistered": ["selfRegistered"],
+    "userA": ["user"],
+    "userB": ["user"]
+  }
+}

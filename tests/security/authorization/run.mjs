@@ -3,7 +3,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { TARGET, collectSecrets, digest, ownershipGuard, responseSummary, runVerdict, safeError, validateArtifactRoots, validateTarget, writePrivate } from './core.mjs';
+import { TARGET, assertRuntimeSet, collectSecrets, digest, ownershipGuard, responseSummary, runVerdict, safeError, sanitizeGapEvidence, validateArtifactRoots, validateTarget, writePrivate } from './core.mjs';
+import { loadPins, verifyCandidate } from './acceptance/pins.mjs';
 import { setupPrincipals } from './principals.mjs';
 import { runAccountProbes, runSessionProbes } from './account-probes.mjs';
 import { runStreamProbes } from './stream-probes.mjs';
@@ -17,7 +18,13 @@ const config = {
     output: required('AUTHZ_OUTPUT_DIR'),
     privateRoot: required('AUTHZ_PRIVATE_DIR'),
     playwrightModule: required('AUTHZ_PLAYWRIGHT_MODULE'),
+    pins: required('AUTHZ_PINS'),
+    pinsSha256: required('AUTHZ_PINS_SHA256'),
 };
+const acceptanceDir = path.join(path.dirname(fileURLToPath(import.meta.url)), 'acceptance');
+const policy = JSON.parse(await fs.readFile(path.join(acceptanceDir, 'policy.json'), 'utf8'));
+const expectedRuntimes = JSON.parse(await fs.readFile(path.join(acceptanceDir, 'expected-runtimes.json'), 'utf8'));
+let pins;
 validateTarget(process.env.AUTHZ_TARGET || TARGET);
 const sourceRoot = await fs.realpath(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..'));
 [config.output, config.privateRoot] = await validateArtifactRoots(sourceRoot, config.output, config.privateRoot);
@@ -30,12 +37,12 @@ const ctx = {
     report: { startedAt: new Date().toISOString(), target: TARGET, checks: [], requests: [], gaps: [], cleanup: [] },
     progress: message => console.log(message),
     async guard() {
-        const identity = await ownershipGuard(config.evidence);
+        const identity = await ownershipGuard(config.evidence, { pins, policy });
         mutationLock?.assertHeld(identity.instance);
         return identity;
     },
     cleanup: callback => cleanups.push(callback),
-    recordGap: (id, reason) => ctx.report.gaps.push({ id, reason: safeError(reason, ctx.secrets) }),
+    recordGap: (id, reason, evidence) => ctx.report.gaps.push({ id, reason: safeError(reason, ctx.secrets), evidence: sanitizeGapEvidence(evidence) }),
     async request(actor, options) {
         if (ctx.report.interrupted && !ctx.cleaning) throw new Error('Run interrupted; proceeding to owned cleanup');
         assert.ok(ctx.clients[actor], `Unknown principal ${actor}`);
@@ -62,6 +69,11 @@ const ctx = {
 };
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => { ctx.report.interrupted = signal; console.log('Interruption requested; finishing current bounded request and cleaning owned fixtures.'); });
 try {
+    // Frozen pins first: file hash, schema, exact pushed source and policy
+    // digest. Nothing is observed, and no request is made, before they pass.
+    const loaded = loadPins(config.pins, config.pinsSha256);
+    ctx.report.pins = { sha256: loaded.sha256, policyDigest: verifyCandidate(loaded.pins, sourceRoot) };
+    pins = loaded.pins;
     ctx.report.deployment = await ctx.guard();
     mutationLock = await createMutationLockManager({ timeoutMs: 1000 }).acquire(ctx.report.deployment.instance);
     await ctx.guard();
@@ -71,8 +83,7 @@ try {
     ctx.cleanup(() => runSessionProbes(ctx));
     const runtime = await ctx.request('admin', { path: '/status/data' });
     assert.equal(runtime.status, 200);
-    assert.equal(runtime.json.runtimes.length, 19);
-    assert.ok(runtime.json.runtimes.every(r => r.enabled && r.state?.running));
+    ctx.report.runtimeSet = assertRuntimeSet(runtime.json.runtimes, expectedRuntimes.enabled);
     ctx.report.runtimes = runtime.json.runtimes.map(r => ({ repo: r.repoName, agent: r.agentName, enabled: r.enabled, running: r.state.running }));
     const { runRouterProbes } = await import('./router-probes.mjs');
     await runRouterProbes(ctx);
@@ -82,6 +93,11 @@ try {
     await runAgentProbes(ctx);
     const { runResourceProbes } = await import('./resource-probes.mjs');
     await runResourceProbes(ctx);
+    const { runTemplateProbes, runMarketplaceAdmissionProbes } = await import('./boundary-probes.mjs');
+    await runTemplateProbes(ctx);
+    await runMarketplaceAdmissionProbes(ctx);
+    const { runWebchatProbes, dpuProcessInspector } = await import('./webchat-probes.mjs');
+    await runWebchatProbes(ctx, { inspectProcesses: dpuProcessInspector({ boxId: ctx.report.deployment.boxId, container: ctx.report.deployment.dpuContainer }) });
 } catch (error) {
     ctx.report.setupError = safeError(error, ctx.secrets);
     console.log(`ERROR: ${ctx.report.setupError}`);

@@ -4,6 +4,11 @@ import path from 'node:path';
 import http from 'node:http';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
+import { normalizeContainerRuntime } from '../../../ploinky-box/contract/container.mjs';
+import { expectedAgentLibMounts } from '../../../ploinky-box/contract/agentlib.mjs';
+import { boxWorkspaceMount } from '../../../ploinky-box/contract/workspace-root.mjs';
+import { BOX_DATA_MOUNTS, BOX_DATA_RELATIVE_NAMES, BOX_DATA_ROOT_NAME, BOX_TMPFS } from '../../../ploinky-box/constants.mjs';
+import { AGENTLIB_STABLE_MOUNT_PATH } from '../../../agentlib/contract.mjs';
 
 export const TARGET = 'http://127.0.0.1:8080';
 export const WORKSPACE = '/Users/danielsava/work/testExplorerFresh';
@@ -27,38 +32,136 @@ export async function writePrivate(filename, value) {
     await fs.chmod(filename, 0o600);
 }
 
-export async function ownershipGuard(evidenceRoot, { sources = true } = {}) {
-    const pins = JSON.parse(await fs.readFile(path.join(evidenceRoot, 'dependency-preflight.json')));
-    const expected = JSON.parse(await fs.readFile(path.join(evidenceRoot, 'box-identity.json')));
-    assert.equal(await fs.realpath(pins.workspace), WORKSPACE);
-    assert.match(expected.id, /^[a-f0-9]{64}$/);
-    const box = JSON.parse(command('podman', ['inspect', expected.id]))[0];
-    assert.equal(box.Id, expected.id);
-    assert.equal(box.Name.replace(/^\//, ''), expected.name);
-    assert.equal(box.State.Running, true);
-    assert.equal(box.State.StartedAt, expected.startedAt);
-    assert.equal(box.Image.replace(/^sha256:/, ''), expected.image.replace(/^sha256:/, ''));
-    assert.equal(box.Image.replace(/^sha256:/, ''), pins.image.imageId.replace(/^sha256:/, ''));
-    assert.equal(box.HostConfig.Privileged, false);
-    assert.equal(box.HostConfig.Init, true);
-    assert.equal(box.Config.User, 'podman');
-    assert.deepEqual(box.NetworkSettings.Ports, expected.ports);
-    assert.deepEqual(Object.keys(box.NetworkSettings.Ports).sort(), ['7882/udp', '8080/tcp']);
-    assert.deepEqual(box.NetworkSettings.Ports['8080/tcp'], [{ HostIp: '127.0.0.1', HostPort: '8080' }]);
-    // The Box mounts the workspace writable at the workspace's own absolute path.
-    assert.ok(box.Mounts.some(m => m.Destination === WORKSPACE && m.Source === WORKSPACE && m.RW === true));
-    for (const destination of ['/opt/ploinky', path.join(WORKSPACE, 'achillesAgentLib'), '/opt/ploinky-agentlib']) {
-        assert.ok(box.Mounts.some(m => m.Destination === destination && m.RW === false), 'Required source mount must remain read-only');
+const BOX_DATA_SOURCE = (workspace, key) => path.join(workspace, '.ploinky', BOX_DATA_ROOT_NAME, BOX_DATA_RELATIVE_NAMES[key]);
+
+/**
+ * Fixed Box confinement, derived from the canonical Box contract
+ * (ploinky-box/contract/container.mjs:495-567) and the reviewed pins, never
+ * from a captured snapshot: /opt/ploinky read-only from the pinned checkout,
+ * the workspace writable at its own path, the two writable data binds
+ * (BOX_DATA_MOUNTS), the AgentLib read-only binds only in local mode, the
+ * canonical /tmp tmpfs, and nothing else.
+ */
+export function assertBoxConfinement(box, { workspace, ploinkyCheckout, agentLib, policy }) {
+    const runtime = normalizeContainerRuntime(box);
+    assert.ok(runtime.complete, 'BOX_INSPECT_INCOMPLETE: Box inspect record is incomplete');
+    assert.equal(box.HostConfig.Privileged, false, 'BOX_PRIVILEGED');
+    assert.equal(box.HostConfig.Init, true, 'BOX_INIT_MISSING');
+    assert.equal(box.Config.User, policy.box.user, 'BOX_USER');
+    assert.deepEqual(Object.keys(box.NetworkSettings?.Ports || {}).sort(), ['7882/udp', '8080/tcp'], 'BOX_PUBLICATIONS');
+    assert.deepEqual(box.NetworkSettings.Ports['8080/tcp'], policy.box.ports['8080/tcp'], 'BOX_ROUTER_PUBLICATION');
+    assert.ok(!policy.box.gpuWiring && !policy.box.hardwareLimitsWiring, 'BOX_POLICY: GPU/hardware wiring requires a reviewed mount policy');
+    const expectedTmpfs = [{ destination: BOX_TMPFS.destination, options: [...BOX_TMPFS.options.filter(o => o !== 'notmpcopyup'), 'rprivate'].sort() }];
+    assert.deepEqual(runtime.tmpfs, expectedTmpfs, 'BOX_TMPFS');
+    assert.ok(policy.box.agentLibModes.includes(agentLib?.mode), 'BOX_AGENTLIB_MODE');
+    const workspaceMount = boxWorkspaceMount(workspace);
+    const contract = agentLib.mode === 'local'
+        ? { mode: 'local', stablePath: AGENTLIB_STABLE_MOUNT_PATH, sourceRelativePath: agentLib.sourceRelativePath, sourceDir: path.join(workspace, agentLib.sourceRelativePath) }
+        : { mode: 'image' };
+    const expected = {
+        [policy.box.ploinkySourceDestination]: { source: ploinkyCheckout, rw: false },
+        [workspaceMount.destination]: { source: workspaceMount.source, rw: true },
+        [BOX_DATA_MOUNTS.dependencies]: { source: BOX_DATA_SOURCE(workspace, 'dependencies'), rw: true },
+        [BOX_DATA_MOUNTS.images]: { source: BOX_DATA_SOURCE(workspace, 'images'), rw: true },
+        ...expectedAgentLibMounts(contract, workspace),
+    };
+    assert.ok(Array.isArray(runtime.mounts), 'BOX_MOUNTS_MISSING');
+    const transient = runtime.mounts.filter(m => m.destination === BOX_TMPFS.destination);
+    assert.ok(transient.length <= 1 && transient.every(m => m.type === 'tmpfs' && m.source === '' && m.name === '' && m.rw === true), 'BOX_TMPFS_MOUNT');
+    for (const mount of runtime.mounts) {
+        if (mount.destination === BOX_TMPFS.destination) continue;
+        assert.ok(Object.hasOwn(expected, mount.destination), `BOX_MOUNT_EXTRA: unexpected mount at ${mount.destination}`);
     }
+    for (const [destination, want] of Object.entries(expected)) {
+        const observed = runtime.mounts.filter(m => m.destination === destination);
+        assert.equal(observed.length, 1, `BOX_MOUNT_MISSING_OR_DUPLICATE: ${destination}`);
+        assert.equal(observed[0].type, 'bind', `BOX_MOUNT_TYPE: ${destination}`);
+        assert.equal(observed[0].rw, want.rw, `BOX_MOUNT_MODE: ${destination} must be ${want.rw ? 'writable' : 'read-only'}`);
+        assert.equal(observed[0].source, want.source, `BOX_MOUNT_SOURCE: ${destination}`);
+    }
+    assert.equal(runtime.mounts.length, Object.keys(expected).length + transient.length, 'BOX_MOUNT_COUNT');
+    return true;
+}
+
+/**
+ * Compare a fresh podman inspect record with the frozen pins, then apply the
+ * fixed confinement policy. The captured box-identity snapshot can only add
+ * agreement checks; it never widens the mount policy.
+ */
+export function verifyBoxAgainstPins({ box, captured, pins, policy }) {
+    assert.equal(box.Id, pins.box.id, 'BOX_ID');
+    assert.equal(String(box.Name).replace(/^\//, ''), pins.box.name, 'BOX_NAME');
+    assert.equal(box.State?.Running, true, 'BOX_NOT_RUNNING');
+    assert.equal(box.State.StartedAt, pins.box.startedAt, 'BOX_GENERATION');
+    assert.equal(`sha256:${String(box.Image).replace(/^sha256:/, '')}`, pins.box.imageId, 'BOX_IMAGE');
+    assert.equal(box.ImageDigest, pins.box.imageDigest, 'BOX_IMAGE_DIGEST: the running Box image digest differs from the pinned digest');
+    for (const field of ['id', 'name', 'startedAt', 'imageId']) assert.equal(captured?.[field], pins.box[field], `BOX_CAPTURE_DRIFT: ${field}`);
+    assertBoxConfinement(box, { workspace: pins.workspace, ploinkyCheckout: pins.ploinkyCheckout, agentLib: pins.agentlib, policy });
+    return true;
+}
+
+export async function ownershipGuard(evidenceRoot, { sources = true, pins, policy } = {}) {
+    assert.ok(pins && policy, 'OWNERSHIP_PINS_REQUIRED: the guard requires frozen pins and the acceptance policy');
+    assert.equal(pins.workspace, WORKSPACE, 'OWNERSHIP_WORKSPACE');
+    const preflight = JSON.parse(await fs.readFile(path.join(evidenceRoot, 'dependency-preflight.json')));
+    const captured = JSON.parse(await fs.readFile(path.join(evidenceRoot, 'box-identity.json')));
+    assert.equal(await fs.realpath(preflight.workspace), WORKSPACE);
+    assert.equal(captured.pinsSha256, preflight.pinsSha256, 'OWNERSHIP_EVIDENCE_MIXED');
+    const pinned = pins.repositories.map(({ name, path: p, commit, branch, upstream }) => ({ name, path: p, commit, branch, upstream }));
+    assert.deepEqual(preflight.repositories, pinned, 'OWNERSHIP_PREFLIGHT_DRIFT');
+    assert.match(captured.id, /^[a-f0-9]{64}$/);
+    const box = JSON.parse(command('podman', ['inspect', pins.box.id]))[0];
+    verifyBoxAgainstPins({ box, captured, pins, policy });
     if (sources) for (const repo of pins.repositories) {
         const root = path.join(WORKSPACE, repo.path);
         const git = args => command('git', ['-C', root, ...args]);
         assert.equal(git(['rev-parse', 'HEAD']), repo.commit, `Deployment revision changed: ${repo.name}`);
         assert.equal(git(['branch', '--show-current']), repo.branch);
-        assert.equal(git(['rev-parse', '--abbrev-ref', '@{upstream}']), `origin/${repo.branch}`);
+        assert.equal(git(['rev-parse', '--abbrev-ref', '@{upstream}']), repo.upstream);
         assert.equal(git(['status', '--porcelain']), '', `Deployment source is dirty: ${repo.name}`);
     }
-    return { boxId: box.Id, instance: expected.name, startedAt: box.State.StartedAt, image: pins.image, repositories: pins.repositories.map(({ name, branch, commit }) => ({ name, branch, commit })) };
+    return { boxId: box.Id, instance: pins.box.name, startedAt: box.State.StartedAt, image: { imageId: pins.box.imageId, imageDigest: pins.box.imageDigest }, repositories: pinned.map(({ name, branch, commit }) => ({ name, branch, commit })), userPersistoContainer: captured.userPersistoContainer, dpuContainer: captured.dpuContainer };
+}
+
+/** Live runtimes must equal the reviewed manifest-derived set exactly. */
+export function assertRuntimeSet(live, expected) {
+    assert.ok(Array.isArray(expected) && expected.length > 0, 'RUNTIME_SET_EXPECTED_EMPTY');
+    assert.ok(Array.isArray(live) && live.length > 0, 'RUNTIME_SET_EMPTY');
+    const key = (repo, agent) => `${repo}/${agent}`;
+    const expectedKeys = expected.map(e => key(e.repo, e.agent));
+    assert.equal(new Set(expectedKeys).size, expectedKeys.length, 'RUNTIME_SET_EXPECTED_DUPLICATE');
+    const liveKeys = live.map(r => {
+        assert.ok(typeof r?.repoName === 'string' && r.repoName && typeof r.agentName === 'string' && r.agentName, 'RUNTIME_SET_MALFORMED');
+        return key(r.repoName, r.agentName);
+    });
+    assert.equal(new Set(liveKeys).size, liveKeys.length, 'RUNTIME_SET_DUPLICATE');
+    const extra = liveKeys.filter(k => !expectedKeys.includes(k));
+    const missing = expectedKeys.filter(k => !liveKeys.includes(k));
+    assert.deepEqual(extra, [], 'RUNTIME_SET_EXTRA');
+    assert.deepEqual(missing, [], 'RUNTIME_SET_MISSING');
+    for (const r of live) assert.ok(r.enabled === true && r.state?.running === true, `RUNTIME_NOT_RUNNING: ${key(r.repoName, r.agentName)}`);
+    return liveKeys.sort();
+}
+
+const GAP_EVIDENCE_KINDS = new Set(['unsupported-transport', 'agent-disabled', 'rpc-method-unsupported', 'positive-unavailable', 'selfregistered-visible-tools', 'actor-unsupported', 'pagination', 'declared-limitation', 'negative-only-protocol', 'boundary-rejected', 'data-unavailable', 'username-reserved', 'fanout-errors']);
+const GAP_ACTORS = new Set(['anonymous', 'selfRegistered', 'userA', 'userB', 'admin']);
+const GAP_METHODS = new Set(['initialize', 'tools/list', 'resources/list', 'resources/templates/list', 'prompts/list', 'tools/call']);
+const SAFE_NAME = /^[A-Za-z0-9_.:@-]{1,120}$/;
+
+/** Typed gap evidence carries only enumerated scalars and sorted names, never error text. */
+export function sanitizeGapEvidence(evidence) {
+    if (!evidence || typeof evidence !== 'object' || !GAP_EVIDENCE_KINDS.has(evidence.kind)) return { kind: 'untyped' };
+    const out = { kind: evidence.kind };
+    if (GAP_ACTORS.has(evidence.actor)) out.actor = evidence.actor;
+    if (typeof evidence.endpoint === 'string' && /^\/[A-Za-z0-9._\/-]{1,120}$/.test(evidence.endpoint)) out.endpoint = evidence.endpoint;
+    for (const field of ['requestedMethod', 'stage']) if (GAP_METHODS.has(evidence[field])) out[field] = evidence[field];
+    for (const field of ['httpStatus', 'rpcCode']) if (Number.isInteger(evidence[field])) out[field] = evidence[field];
+    if (typeof evidence.initialized === 'boolean') out.initialized = evidence.initialized;
+    if (typeof evidence.errorCode === 'string' && /^[a-z][a-z0-9_]{1,60}$/.test(evidence.errorCode)) out.errorCode = evidence.errorCode;
+    if (typeof evidence.allow === 'string' && /^[A-Z]{3,7}(,[A-Z]{3,7}){0,6}$/.test(evidence.allow)) out.allow = evidence.allow;
+    for (const field of ['repo', 'agent', 'probeId']) if (typeof evidence[field] === 'string' && SAFE_NAME.test(evidence[field])) out[field] = evidence[field];
+    if (Array.isArray(evidence.visibleTools)) out.visibleTools = evidence.visibleTools.filter(n => typeof n === 'string' && SAFE_NAME.test(n)).sort();
+    return out;
 }
 
 export function responseSummary(response) {

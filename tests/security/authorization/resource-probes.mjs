@@ -162,7 +162,7 @@ async function confidentialProbes(ctx, mcp) {
         assert.equal(read.object.content, marker);
     });
     if (!object?.id || !otherActor) {
-        ctx.recordGap('resource.dpu.idor', 'Owner fixture did not initialize; no missing-resource denial is counted.');
+        ctx.recordGap('resource.dpu.idor', 'Owner fixture did not initialize; no missing-resource denial is counted.', { kind: 'positive-unavailable' });
         return;
     }
     for (const principal of ['anonymous', 'selfRegistered', 'userB']) {
@@ -248,7 +248,7 @@ async function workspaceProbes(ctx, mcp) {
         fixtureReady = true;
     });
     if (!fixtureReady) {
-        ctx.recordGap('resource.files-and-tasks', 'Workspace fixture unavailable; dependent assertions not attempted.');
+        ctx.recordGap('resource.files-and-tasks', 'Workspace fixture unavailable; dependent assertions not attempted.', { kind: 'positive-unavailable' });
         return;
     }
     await ctx.check('resource.files.shared-ordinary-positive', async () => {
@@ -309,7 +309,7 @@ async function workspaceProbes(ctx, mcp) {
             assert.ok(!JSON.stringify(response.value).includes(marker));
         });
     } else {
-        ctx.recordGap('resource.tasks.idor', 'Task fixture unavailable; no resource authorization conclusion.');
+        ctx.recordGap('resource.tasks.idor', 'Task fixture unavailable; no resource authorization conclusion.', { kind: 'positive-unavailable' });
     }
     let gitFixture;
     await ctx.check('resource.git.local-fixture', async () => {
@@ -342,11 +342,11 @@ async function workspaceProbes(ctx, mcp) {
             });
         }
     } else {
-        ctx.recordGap('resource.git.local-fixture', 'Disposable local Git repository unavailable; dependent authorization not asserted.');
+        ctx.recordGap('resource.git.local-fixture', 'Disposable local Git repository unavailable; dependent authorization not asserted.', { kind: 'positive-unavailable' });
     }
-    ctx.recordGap('resource.git.remote-and-commands', 'No Git fetch, push, remote provider, commit, arbitrary command or credential operations are performed. Git fixture coverage is local initialization and status only.');
-    ctx.recordGap('resource.robots.idor', 'Robot and job ownership require a disposable robot backend; optional browser/desktop image setup is unavailable and no inference or native credential use is authorized.');
-    ctx.recordGap('resource.documents.onlyoffice', 'Confidential text object ACL is exercised. OnlyOffice save/share/callback tokens and Automerge document collaboration need separate disposable sessions and are not asserted by this module.');
+    ctx.recordGap('resource.git.remote-and-commands', 'No Git fetch, push, remote provider, commit, arbitrary command or credential operations are performed. Git fixture coverage is local initialization and status only.', { kind: 'declared-limitation' });
+    ctx.recordGap('resource.robots.idor', 'Robot and job ownership require a disposable robot backend; optional browser/desktop image setup is unavailable and no inference or native credential use is authorized.', { kind: 'declared-limitation' });
+    ctx.recordGap('resource.documents.onlyoffice', 'Confidential text object ACL is exercised. OnlyOffice save/share/callback tokens and Automerge document collaboration need separate disposable sessions and are not asserted by this module.', { kind: 'declared-limitation' });
 }
 
 async function roomProbes(ctx, mcp) {
@@ -368,7 +368,7 @@ async function roomProbes(ctx, mcp) {
         }), 'administrator rename positive control');
     });
     if (!room?.roomId) {
-        ctx.recordGap('resource.webmeet.authorization', 'Disposable room creation unavailable; dependent probes cannot prove authorization.');
+        ctx.recordGap('resource.webmeet.authorization', 'Disposable room creation unavailable; dependent probes cannot prove authorization.', { kind: 'positive-unavailable' });
         return;
     }
     for (const principal of ['userA', 'userB']) {
@@ -393,7 +393,7 @@ async function roomProbes(ctx, mcp) {
             assertResourceDenied(response, `${principal} deletes existing room`);
         });
     }
-    ctx.recordGap('resource.webmeet.participant-and-room-data', 'Open team rooms are shared with authenticated ordinary users by executable policy. Participant impersonation, chat edits, media blobs, guest scope and archived-room data need joined participants; this bounded module does not start a room secretary or inference backend.');
+    ctx.recordGap('resource.webmeet.participant-and-room-data', 'Open team rooms are shared with authenticated ordinary users by executable policy. Participant impersonation, chat edits, media blobs, guest scope and archived-room data need joined participants; this bounded module does not start a room secretary or inference backend.', { kind: 'declared-limitation' });
 }
 
 export async function runResourceProbes(ctx) {

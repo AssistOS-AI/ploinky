@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { agentCatalog, agentInventory } from './agent-inventory.mjs';
+import { readFileSync } from 'node:fs';
+const expectedRuntimes = JSON.parse(readFileSync(new URL('./acceptance/expected-runtimes.json', import.meta.url), 'utf8'));
 import { assertAgentMcpDenied, decodeAgentMcp, agentReadTools, agentProbes, reconcileAgentRegistry, createAgentSessions,
     assertAgentHttpPositive, assertAgentReadPositive, discoverAgentMcp, agentDiscoveryMethods } from './agent-probes.mjs';
 
@@ -158,9 +160,17 @@ test('MCP denial requires real authorization instead of validation, transport or
     for (const value of [response(200, { result: { ok: true } }), response(404, { error: 'forbidden' }), response(302, { error: 'forbidden' }), response(403, { ok: true }), response(500, { error: 'forbidden' }), response(200, { result: { isError: true, content: [{ type: 'text', text: 'Missing argument or task not found' }] } })]) assert.throws(() => assertAgentMcpDenied(decodeAgentMcp(value)));
 });
 test('inventory preserves every recorded runtime and disabled agents without claiming coverage', () => {
-    assert.equal(agentCatalog.length, 25);
-    assert.equal(agentCatalog.filter((a) => a.enabled).length, 18);
-    assert.equal(new Set(agentCatalog.map((a) => `${a.repo}/${a.agent}`)).size, 25);
+    // Exact reviewed identity sets derived from the pinned manifest graph
+    // (acceptance/expected-runtime-graph.mjs), not minimum counts.
+    const key = (a) => `${a.repo}/${a.agent}`;
+    const catalogKeys = agentCatalog.map(key);
+    assert.equal(new Set(catalogKeys).size, catalogKeys.length, 'Catalog identities must be unique');
+    assert.deepEqual(agentCatalog.filter((a) => a.enabled).map(key).sort(), expectedRuntimes.enabled.map(key).sort());
+    assert.deepEqual(agentCatalog.filter((a) => !a.enabled).map(key).sort(), expectedRuntimes.disabled.map(key).sort());
+    assert.equal(agentCatalog.length, expectedRuntimes.counts.total);
+    for (const a of agentCatalog.filter((entry) => !entry.enabled)) assert.ok(!expectedRuntimes.enabled.some((e) => key(e) === key(a)), 'Disabled inventory entry cannot be an expected runtime');
+    // The retired agent stays excluded; the distinct local-llms/local-llm is inventoried.
+    assert.ok(agentCatalog.some((a) => a.repo === 'local-llms' && a.agent === 'local-llm' && a.enabled));
     assert.equal(agentCatalog.some((a) => a.agent === 'default-local-llm'), false);
     assert.equal(agentInventory.some((r) => r.agent === 'default-local-llm'), false);
     for (const a of agentCatalog) {
@@ -180,7 +190,7 @@ test('safe read probes reference declared tools and do not mutate or infer visib
 
 test('registry reconciliation rejects absent or incorrect runtime principals instead of silently omitting aliases', () => {
     const routes = Object.fromEntries(agentCatalog.filter((a) => a.enabled).map((a) => [a.agent, { agent: a.agent }]));
-    assert.equal(reconcileAgentRegistry({ routes }).keys.length, 18);
+    assert.equal(reconcileAgentRegistry({ routes }).keys.length, expectedRuntimes.counts.enabled);
     assert.throws(() => reconcileAgentRegistry({ routes: {} }));
     assert.throws(() => reconcileAgentRegistry({ routes: { ...routes, alien: { agent: 'unrelated-workspace-agent' } } }));
     assert.deepEqual(reconcileAgentRegistry({ routes: { ...routes, alias: { agent: 'explorer' } } }).alternateKeys, [{ key: 'alias', agent: 'explorer' }]);

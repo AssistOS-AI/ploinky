@@ -1,0 +1,5123 @@
+{
+  "schema": "authz-mandatory-checks/1",
+  "nonMandatoryRouter": [
+    {
+      "pattern": "^users-list\\.path-",
+      "reason": "Raw-path probes are mandatory only through the D2 denial matrix; their boundary outcomes are typed gaps"
+    },
+    {
+      "pattern": "^openai-agent-discovery\\.",
+      "reason": "Negative-only: no positive signed-agent control (plan rev4 edit 5)"
+    }
+  ],
+  "counts": {
+    "live": 519,
+    "offline": 10
+  },
+  "checks": [
+    {
+      "id": "agent.dpuAgent.discovery.resources.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.dpuAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.dpuAgent.discovery.resources.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.dpuAgent.discovery.resources.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.dpuAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.dpuAgent.discovery.resources.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.dpuAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.dpuAgent.discovery.resources.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.dpuAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.dpuAgent.discovery.tools.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.dpuAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.dpuAgent.discovery.tools.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.dpuAgent.discovery.tools.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.dpuAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.dpuAgent.discovery.tools.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.dpuAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.dpuAgent.discovery.tools.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.dpuAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.emailAgent.discovery.resources.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.emailAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.emailAgent.discovery.resources.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.emailAgent.discovery.resources.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.emailAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.emailAgent.discovery.resources.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.emailAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.emailAgent.discovery.resources.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.emailAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.emailAgent.discovery.tools.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.emailAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.emailAgent.discovery.tools.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.emailAgent.discovery.tools.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.emailAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.emailAgent.discovery.tools.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.emailAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.emailAgent.discovery.tools.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.emailAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.explorer.discovery.resources.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.explorer.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.explorer.discovery.resources.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.explorer.discovery.resources.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.explorer.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.explorer.discovery.resources.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.explorer.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.explorer.discovery.resources.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.explorer.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.explorer.discovery.tools.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.explorer.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.explorer.discovery.tools.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.explorer.discovery.tools.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.explorer.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.explorer.discovery.tools.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.explorer.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.explorer.discovery.tools.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.explorer.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.gitAgent.discovery.resources.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.gitAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.gitAgent.discovery.resources.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.gitAgent.discovery.resources.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.gitAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.gitAgent.discovery.resources.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.gitAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.gitAgent.discovery.resources.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.gitAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.gitAgent.discovery.tools.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.gitAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.gitAgent.discovery.tools.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.gitAgent.discovery.tools.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.gitAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.gitAgent.discovery.tools.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.gitAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.gitAgent.discovery.tools.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.gitAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.liveKitServerAgent.discovery.prompts.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.liveKitServerAgent.discovery.prompts.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.liveKitServerAgent.discovery.prompts.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.liveKitServerAgent.discovery.prompts.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.liveKitServerAgent.discovery.prompts.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.liveKitServerAgent.discovery.prompts.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.liveKitServerAgent.discovery.prompts.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.liveKitServerAgent.discovery.prompts.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.liveKitServerAgent.discovery.prompts.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.liveKitServerAgent.discovery.resources.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.liveKitServerAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.liveKitServerAgent.discovery.resources.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.liveKitServerAgent.discovery.resources.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.liveKitServerAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.liveKitServerAgent.discovery.resources.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.liveKitServerAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.liveKitServerAgent.discovery.resources.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.liveKitServerAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.liveKitServerAgent.discovery.resources.templates.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.liveKitServerAgent.discovery.resources.templates.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.liveKitServerAgent.discovery.resources.templates.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.liveKitServerAgent.discovery.resources.templates.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.liveKitServerAgent.discovery.resources.templates.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.liveKitServerAgent.discovery.resources.templates.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.liveKitServerAgent.discovery.resources.templates.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.liveKitServerAgent.discovery.resources.templates.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.liveKitServerAgent.discovery.resources.templates.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.liveKitServerAgent.discovery.tools.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.liveKitServerAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.liveKitServerAgent.discovery.tools.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.liveKitServerAgent.discovery.tools.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.liveKitServerAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.liveKitServerAgent.discovery.tools.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.liveKitServerAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.liveKitServerAgent.discovery.tools.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.liveKitServerAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.local-llm.discovery.resources.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.local-llm.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.local-llm.discovery.resources.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.local-llm.discovery.resources.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.local-llm.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.local-llm.discovery.resources.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.local-llm.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.local-llm.discovery.resources.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.local-llm.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.local-llm.discovery.tools.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.local-llm.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.local-llm.discovery.tools.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.local-llm.discovery.tools.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.local-llm.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.local-llm.discovery.tools.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.local-llm.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.local-llm.discovery.tools.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.local-llm.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.multimedia.discovery.resources.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.multimedia.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.multimedia.discovery.resources.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.multimedia.discovery.resources.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.multimedia.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.multimedia.discovery.resources.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.multimedia.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.multimedia.discovery.resources.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.multimedia.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.multimedia.discovery.tools.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.multimedia.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.multimedia.discovery.tools.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.multimedia.discovery.tools.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.multimedia.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.multimedia.discovery.tools.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.multimedia.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.multimedia.discovery.tools.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.multimedia.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.registry.reconciliation",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runAgentProbes"
+    },
+    {
+      "id": "agent.robot.list.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentProbes"
+    },
+    {
+      "id": "agent.robot.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.robot.list.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentProbes"
+    },
+    {
+      "id": "agent.robot.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.robot.list.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentProbes"
+    },
+    {
+      "id": "agent.robot.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.robot.list.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentProbes"
+    },
+    {
+      "id": "agent.robot.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.robot.list.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentProbes"
+    },
+    {
+      "id": "agent.roboTeamAgent.discovery.resources.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboTeamAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.roboTeamAgent.discovery.resources.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.roboTeamAgent.discovery.resources.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboTeamAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.roboTeamAgent.discovery.resources.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboTeamAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.roboTeamAgent.discovery.resources.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboTeamAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.roboTeamAgent.discovery.tools.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboTeamAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.roboTeamAgent.discovery.tools.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.roboTeamAgent.discovery.tools.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboTeamAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.roboTeamAgent.discovery.tools.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboTeamAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.roboTeamAgent.discovery.tools.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboTeamAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.soplangAgent.discovery.resources.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.soplangAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.soplangAgent.discovery.resources.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.soplangAgent.discovery.resources.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.soplangAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.soplangAgent.discovery.resources.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.soplangAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.soplangAgent.discovery.resources.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.soplangAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.soplangAgent.discovery.tools.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.soplangAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.soplangAgent.discovery.tools.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.soplangAgent.discovery.tools.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.soplangAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.soplangAgent.discovery.tools.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.soplangAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.soplangAgent.discovery.tools.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.soplangAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.soul-gateway.discovery.resources.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.soul-gateway.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.soul-gateway.discovery.resources.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.soul-gateway.discovery.resources.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.soul-gateway.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.soul-gateway.discovery.resources.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.soul-gateway.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.soul-gateway.discovery.resources.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.soul-gateway.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.soul-gateway.discovery.tools.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.soul-gateway.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.soul-gateway.discovery.tools.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.soul-gateway.discovery.tools.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.soul-gateway.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.soul-gateway.discovery.tools.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.soul-gateway.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.soul-gateway.discovery.tools.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.soul-gateway.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.soul.management.me.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentProbes"
+    },
+    {
+      "id": "agent.soul.management.me.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.soul.management.me.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentProbes"
+    },
+    {
+      "id": "agent.soul.management.me.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.soul.management.me.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentProbes"
+    },
+    {
+      "id": "agent.soul.management.me.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.soul.management.me.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentProbes"
+    },
+    {
+      "id": "agent.soul.management.me.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.soul.management.me.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentProbes"
+    },
+    {
+      "id": "agent.soul.management.models.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentProbes"
+    },
+    {
+      "id": "agent.soul.management.models.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.soul.management.models.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentProbes"
+    },
+    {
+      "id": "agent.soul.management.models.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.soul.management.models.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentProbes"
+    },
+    {
+      "id": "agent.soul.management.models.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.soul.management.models.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentProbes"
+    },
+    {
+      "id": "agent.soul.management.models.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.soul.management.models.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentProbes"
+    },
+    {
+      "id": "agent.soul.management.providers.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentProbes"
+    },
+    {
+      "id": "agent.soul.management.providers.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.soul.management.providers.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentProbes"
+    },
+    {
+      "id": "agent.soul.management.providers.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.soul.management.providers.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentProbes"
+    },
+    {
+      "id": "agent.soul.management.providers.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.soul.management.providers.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentProbes"
+    },
+    {
+      "id": "agent.soul.management.providers.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.soul.management.providers.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentProbes"
+    },
+    {
+      "id": "agent.tasksAgent.discovery.resources.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tasksAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.tasksAgent.discovery.resources.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.tasksAgent.discovery.resources.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tasksAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.tasksAgent.discovery.resources.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tasksAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.tasksAgent.discovery.resources.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tasksAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.tasksAgent.discovery.tools.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tasksAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.tasksAgent.discovery.tools.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.tasksAgent.discovery.tools.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tasksAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.tasksAgent.discovery.tools.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tasksAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.tasksAgent.discovery.tools.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tasksAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.tool.dpu_whoami.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.dpu_whoami.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.dpu_whoami.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.dpu_whoami.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.dpu_whoami.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.dpu_whoami.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.dpu_whoami.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.dpu_whoami.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.dpu_whoami.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.dpu_workspace_roots.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.dpu_workspace_roots.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.dpu_workspace_roots.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.dpu_workspace_roots.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.dpu_workspace_roots.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.dpu_workspace_roots.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.dpu_workspace_roots.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.dpu_workspace_roots.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.dpu_workspace_roots.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.email_config_get.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.email_config_get.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.email_config_get.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.email_config_get.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.email_config_get.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.email_config_get.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.email_config_get.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.email_config_get.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.email_config_get.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.email_provider_status.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.email_provider_status.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.email_provider_status.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.email_provider_status.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.email_provider_status.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.email_provider_status.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.email_provider_status.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.email_provider_status.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.email_provider_status.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.git_auth_status.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.git_auth_status.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.git_auth_status.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.git_auth_status.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.git_auth_status.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.git_auth_status.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.git_auth_status.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.git_auth_status.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.git_auth_status.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.userpersisto_auth_policy_get.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.userpersisto_auth_policy_get.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.userpersisto_auth_policy_get.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.userpersisto_auth_policy_get.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.userpersisto_auth_policy_get.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.userpersisto_auth_policy_get.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.userpersisto_auth_policy_get.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.userpersisto_auth_policy_get.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.userpersisto_auth_policy_get.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.userpersisto_config_get.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.userpersisto_config_get.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.userpersisto_config_get.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.userpersisto_config_get.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.userpersisto_config_get.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.userpersisto_config_get.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.userpersisto_config_get.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.userpersisto_config_get.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.userpersisto_config_get.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.userpersisto_google_status.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.userpersisto_google_status.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.userpersisto_google_status.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.userpersisto_google_status.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.userpersisto_google_status.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.userpersisto_google_status.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.userpersisto_google_status.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.userpersisto_google_status.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.userpersisto_google_status.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.userpersisto_oidc_status.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.userpersisto_oidc_status.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.userpersisto_oidc_status.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.userpersisto_oidc_status.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.userpersisto_oidc_status.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.userpersisto_oidc_status.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.userpersisto_oidc_status.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.userpersisto_oidc_status.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.userpersisto_oidc_status.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.userpersisto_profile_get.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.userpersisto_profile_get.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.userpersisto_profile_get.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.userpersisto_profile_get.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.userpersisto_profile_get.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.userpersisto_profile_get.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.userpersisto_profile_get.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.userpersisto_profile_get.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.userpersisto_profile_get.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.userpersisto_user_list.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.userpersisto_user_list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.userpersisto_user_list.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.userpersisto_user_list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.userpersisto_user_list.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.userpersisto_user_list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.userpersisto_user_list.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.userpersisto_user_list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.userpersisto_user_list.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.webmeet_room_list.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.webmeet_room_list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.webmeet_room_list.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.webmeet_room_list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.webmeet_room_list.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.webmeet_room_list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.webmeet_room_list.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.webmeet_room_list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.webmeet_room_list.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.workspace_monitor_settings_get.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.workspace_monitor_settings_get.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.workspace_monitor_settings_get.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.workspace_monitor_settings_get.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.workspace_monitor_settings_get.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.workspace_monitor_settings_get.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.workspace_monitor_settings_get.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.workspace_monitor_settings_get.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.workspace_monitor_settings_get.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.workspace_monitor_snapshot_get.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.workspace_monitor_snapshot_get.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.workspace_monitor_snapshot_get.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.workspace_monitor_snapshot_get.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.workspace_monitor_snapshot_get.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.workspace_monitor_snapshot_get.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.workspace_monitor_snapshot_get.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.workspace_monitor_snapshot_get.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.workspace_monitor_snapshot_get.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.umamiAgent.discovery.resources.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.umamiAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.umamiAgent.discovery.resources.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.umamiAgent.discovery.resources.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.umamiAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.umamiAgent.discovery.resources.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.umamiAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.umamiAgent.discovery.resources.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.umamiAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.umamiAgent.discovery.tools.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.umamiAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.umamiAgent.discovery.tools.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.umamiAgent.discovery.tools.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.umamiAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.umamiAgent.discovery.tools.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.umamiAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.umamiAgent.discovery.tools.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.umamiAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.username-admin.monitor-denial",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.username-admin.profile-positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs usernamePrivilegeProbe"
+    },
+    {
+      "id": "agent.username-admin.persisted-role",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.username-admin.profile-positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs usernamePrivilegeProbe"
+    },
+    {
+      "id": "agent.username-admin.profile-positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs usernamePrivilegeProbe"
+    },
+    {
+      "id": "agent.username-admin.webmeet-role",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.username-admin.profile-positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs usernamePrivilegeProbe"
+    },
+    {
+      "id": "agent.userPersistoAgent.discovery.resources.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.userPersistoAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.userPersistoAgent.discovery.resources.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.userPersistoAgent.discovery.resources.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.userPersistoAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.userPersistoAgent.discovery.resources.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.userPersistoAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.userPersistoAgent.discovery.resources.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.userPersistoAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.userPersistoAgent.discovery.tools.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.userPersistoAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.userPersistoAgent.discovery.tools.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.userPersistoAgent.discovery.tools.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.userPersistoAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.userPersistoAgent.discovery.tools.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.userPersistoAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.userPersistoAgent.discovery.tools.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.userPersistoAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.webAssist.discovery.resources.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.webAssist.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.webAssist.discovery.resources.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.webAssist.discovery.resources.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.webAssist.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.webAssist.discovery.resources.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.webAssist.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.webAssist.discovery.resources.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.webAssist.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.webAssist.discovery.tools.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.webAssist.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.webAssist.discovery.tools.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.webAssist.discovery.tools.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.webAssist.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.webAssist.discovery.tools.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.webAssist.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.webAssist.discovery.tools.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.webAssist.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.webmeetAgent.discovery.resources.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.webmeetAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.webmeetAgent.discovery.resources.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.webmeetAgent.discovery.resources.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.webmeetAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.webmeetAgent.discovery.resources.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.webmeetAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.webmeetAgent.discovery.resources.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.webmeetAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.webmeetAgent.discovery.tools.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.webmeetAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.webmeetAgent.discovery.tools.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.webmeetAgent.discovery.tools.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.webmeetAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.webmeetAgent.discovery.tools.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.webmeetAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.webmeetAgent.discovery.tools.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.webmeetAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.workspaceMonitorAgent.discovery.resources.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.workspaceMonitorAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.workspaceMonitorAgent.discovery.resources.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.workspaceMonitorAgent.discovery.resources.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.workspaceMonitorAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.workspaceMonitorAgent.discovery.resources.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.workspaceMonitorAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.workspaceMonitorAgent.discovery.resources.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.workspaceMonitorAgent.discovery.resources.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.workspaceMonitorAgent.discovery.tools.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.workspaceMonitorAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.workspaceMonitorAgent.discovery.tools.list.positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.workspaceMonitorAgent.discovery.tools.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.workspaceMonitorAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.workspaceMonitorAgent.discovery.tools.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.workspaceMonitorAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "agent.workspaceMonitorAgent.discovery.tools.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.workspaceMonitorAgent.discovery.tools.list.positive"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "dashboard.admin-role-escalation.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "users.admin-positive-update"
+      ],
+      "boundary": "account",
+      "source": "tests/security/authorization/account-probes.mjs"
+    },
+    {
+      "id": "dashboard.admin-role-escalation.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "users.admin-positive-update"
+      ],
+      "boundary": "account",
+      "source": "tests/security/authorization/account-probes.mjs"
+    },
+    {
+      "id": "offline:AchillesIDE:dpuAgent/tests/webchat-sso-authorization.test.mjs",
+      "kind": "offline",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "U6",
+      "repo": "AchillesIDE",
+      "file": "dpuAgent/tests/webchat-sso-authorization.test.mjs",
+      "tests": [],
+      "source": "plan rev3 mandatory-check table (unchanged in rev4)"
+    },
+    {
+      "id": "offline:ploinky:tests/security/authorization/lease-readonly.test.mjs",
+      "kind": "offline",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "U7",
+      "repo": "ploinky",
+      "file": "tests/security/authorization/lease-readonly.test.mjs",
+      "tests": [
+        "request-path lease commit() writes nothing to the workspace"
+      ],
+      "source": "plan rev3 mandatory-check table (unchanged in rev4)"
+    },
+    {
+      "id": "offline:ploinky:tests/security/authorization/webchat-interaction-isolation.test.mjs",
+      "kind": "offline",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "U6",
+      "repo": "ploinky",
+      "file": "tests/security/authorization/webchat-interaction-isolation.test.mjs",
+      "tests": [
+        "principal interaction: the owner resolves its own pending interaction with interactionId",
+        "principal interaction: another principal with copied tab, session and interaction IDs cannot resolve, inject or cancel"
+      ],
+      "source": "plan rev3 mandatory-check table (unchanged in rev4)"
+    },
+    {
+      "id": "offline:ploinky:tests/unit/agentServerStaticCache.test.mjs",
+      "kind": "offline",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "U3",
+      "repo": "ploinky",
+      "file": "tests/unit/agentServerStaticCache.test.mjs",
+      "tests": [],
+      "source": "plan rev3 mandatory-check table (unchanged in rev4)"
+    },
+    {
+      "id": "offline:ploinky:tests/unit/marketplaceRepositoryPrespawnRetry.test.mjs",
+      "kind": "offline",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "U7",
+      "repo": "ploinky",
+      "file": "tests/unit/marketplaceRepositoryPrespawnRetry.test.mjs",
+      "tests": [],
+      "source": "plan rev3 mandatory-check table (unchanged in rev4)"
+    },
+    {
+      "id": "offline:ploinky:tests/unit/marketplaceRepositoryWorkerRoutes.test.mjs",
+      "kind": "offline",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "U7",
+      "repo": "ploinky",
+      "file": "tests/unit/marketplaceRepositoryWorkerRoutes.test.mjs",
+      "tests": [],
+      "source": "plan rev3 mandatory-check table (unchanged in rev4)"
+    },
+    {
+      "id": "offline:ploinky:tests/unit/templateRevalidation.test.mjs",
+      "kind": "offline",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "U3",
+      "repo": "ploinky",
+      "file": "tests/unit/templateRevalidation.test.mjs",
+      "tests": [],
+      "source": "plan rev3 mandatory-check table (unchanged in rev4)"
+    },
+    {
+      "id": "offline:ploinky:tests/unit/webchatInteraction.test.mjs",
+      "kind": "offline",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "U6",
+      "repo": "ploinky",
+      "file": "tests/unit/webchatInteraction.test.mjs",
+      "tests": [
+        "authenticated interaction responses use the control channel and reject replay"
+      ],
+      "source": "plan rev3 mandatory-check table (unchanged in rev4)"
+    },
+    {
+      "id": "offline:ploinky:tests/unit/webchatPrincipalRuntime.test.mjs",
+      "kind": "offline",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "U6",
+      "repo": "ploinky",
+      "file": "tests/unit/webchatPrincipalRuntime.test.mjs",
+      "tests": [
+        "runtime scope principal: a delayed close of an evicted runtime never unregisters its live replacement",
+        "runtime scope principal: late task output from an evicted runtime never reaches its replacement"
+      ],
+      "source": "plan rev3 mandatory-check table (unchanged in rev4)"
+    },
+    {
+      "id": "offline:ploinky:tests/unit/webchatSlashCommandsSecurity.test.mjs",
+      "kind": "offline",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "U6",
+      "repo": "ploinky",
+      "file": "tests/unit/webchatSlashCommandsSecurity.test.mjs",
+      "tests": [],
+      "source": "plan rev3 mandatory-check table (unchanged in rev4)"
+    },
+    {
+      "id": "profile.actor-and-role-argument-binding",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "account",
+      "source": "tests/security/authorization/account-probes.mjs"
+    },
+    {
+      "id": "resource.dpu.anonymous.read",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.dpu.owner-fixture"
+      ],
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.dpu.anonymous.update",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.dpu.owner-fixture"
+      ],
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.dpu.owner-fixture",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.dpu.read-grant-and-revocation",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.dpu.selfRegistered.read",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.dpu.owner-fixture"
+      ],
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.dpu.selfRegistered.update",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.dpu.owner-fixture"
+      ],
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.dpu.userB.delete",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.dpu.owner-fixture"
+      ],
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.dpu.userB.forged-identity",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.dpu.owner-fixture"
+      ],
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.dpu.userB.read",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.dpu.owner-fixture"
+      ],
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.dpu.userB.update",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.dpu.owner-fixture"
+      ],
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.files.anonymous.read",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.files.owner-fixture"
+      ],
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.files.anonymous.write",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.files.owner-fixture"
+      ],
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.files.owner-fixture",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.files.selfRegistered.read",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.files.owner-fixture"
+      ],
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.files.selfRegistered.write",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.files.owner-fixture"
+      ],
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.files.shared-ordinary-positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.git.anonymous.status",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.git.local-fixture"
+      ],
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.git.local-fixture",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.git.selfRegistered.status",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.git.local-fixture"
+      ],
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.git.shared-ordinary-positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.tasks.anonymous.get",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.tasks.owner-fixture"
+      ],
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.tasks.anonymous.update",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.tasks.owner-fixture"
+      ],
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.tasks.argument-root-boundary",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.tasks.owner-fixture"
+      ],
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.tasks.owner-fixture",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.tasks.selfRegistered.get",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.tasks.owner-fixture"
+      ],
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.tasks.selfRegistered.update",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.tasks.owner-fixture"
+      ],
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.tasks.shared-ordinary-positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.webmeet.admin-fixture",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.webmeet.selfRegistered.delete",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin-fixture"
+      ],
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.webmeet.selfRegistered.rename",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin-fixture"
+      ],
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.webmeet.userA.delete",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin-fixture"
+      ],
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.webmeet.userA.rename",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin-fixture"
+      ],
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.webmeet.userA.shared-room-positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.webmeet.userB.delete",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin-fixture"
+      ],
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.webmeet.userB.rename",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin-fixture"
+      ],
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.webmeet.userB.shared-room-positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "router:agent-card.allow:admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:agent-card.allow:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:agent-card.allow:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:agent-card.allow:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:agent-card.allow:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:auth-logged-out.allow:admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:auth-logged-out.allow:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:auth-logged-out.allow:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:auth-logged-out.allow:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:auth-logged-out.allow:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:auth-token.allow:admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:auth-token.allow:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:auth-token.allow:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:auth-token.allow:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:auth-token.deny:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:auth-token.allow:selfRegistered",
+        "router:auth-token.allow:userA",
+        "router:auth-token.allow:userB",
+        "router:auth-token.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:health.allow:admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:health.deny:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:health.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:health.deny:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:health.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:health.deny:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:health.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:health.deny:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:health.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:health.forged-identity-deny:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:health.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:health.forged-identity-deny:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:health.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:health.forged-identity-deny:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:health.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:health.forged-identity-deny:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:health.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:marketplace-agents.allow:admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:marketplace-agents.allow:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:marketplace-agents.allow:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:marketplace-agents.allow:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:marketplace-agents.deny:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:marketplace-agents.allow:selfRegistered",
+        "router:marketplace-agents.allow:userA",
+        "router:marketplace-agents.allow:userB",
+        "router:marketplace-agents.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:marketplace-repos.allow:admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:marketplace-repos.allow:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:marketplace-repos.allow:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:marketplace-repos.allow:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:marketplace-repos.deny:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:marketplace-repos.allow:selfRegistered",
+        "router:marketplace-repos.allow:userA",
+        "router:marketplace-repos.allow:userB",
+        "router:marketplace-repos.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:marketplace-sensitive-path-metadata:admin",
+      "kind": "live",
+      "count": 2,
+      "positiveControlAnyOf": [
+        "router:marketplace-agents.allow:admin",
+        "router:marketplace-repos.allow:admin"
+      ],
+      "boundary": "U7",
+      "source": "tests/security/authorization/router-probes.mjs:204-208 (one check per marketplace read probe)"
+    },
+    {
+      "id": "router:marketplace-sensitive-path-metadata:selfRegistered",
+      "kind": "live",
+      "count": 2,
+      "positiveControlAnyOf": [
+        "router:marketplace-agents.allow:selfRegistered",
+        "router:marketplace-repos.allow:selfRegistered"
+      ],
+      "boundary": "U7",
+      "source": "tests/security/authorization/router-probes.mjs:204-208 (one check per marketplace read probe)"
+    },
+    {
+      "id": "router:marketplace-sensitive-path-metadata:userA",
+      "kind": "live",
+      "count": 2,
+      "positiveControlAnyOf": [
+        "router:marketplace-agents.allow:userA",
+        "router:marketplace-repos.allow:userA"
+      ],
+      "boundary": "U7",
+      "source": "tests/security/authorization/router-probes.mjs:204-208 (one check per marketplace read probe)"
+    },
+    {
+      "id": "router:marketplace-sensitive-path-metadata:userB",
+      "kind": "live",
+      "count": 2,
+      "positiveControlAnyOf": [
+        "router:marketplace-agents.allow:userB",
+        "router:marketplace-repos.allow:userB"
+      ],
+      "boundary": "U7",
+      "source": "tests/security/authorization/router-probes.mjs:204-208 (one check per marketplace read probe)"
+    },
+    {
+      "id": "router:mcp-browser-client.allow:admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:mcp-browser-client.allow:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:mcp-browser-client.allow:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:mcp-browser-client.allow:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:mcp-browser-client.allow:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:mcp-session-create-positive:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:mcp-session-create-positive:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:mcp-session-delete-own-positive:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:mcp-session-horizontal-delete-deny:userA-to-userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:mcp-session-delete-own-positive:userA"
+      ],
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:policy-http.route.check.allow:admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:policy-http.route.check.deny:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:policy-http.route.check.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:policy-http.route.check.deny:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:policy-http.route.check.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:policy-http.route.check.deny:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:policy-http.route.check.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:policy-http.route.check.deny:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:policy-http.route.check.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:policy-http.route.list.allow:admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:policy-http.route.list.deny:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:policy-http.route.list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:policy-http.route.list.deny:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:policy-http.route.list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:policy-http.route.list.deny:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:policy-http.route.list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:policy-http.route.list.deny:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:policy-http.route.list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:policy-http.route.list.forged-identity-deny:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:policy-http.route.list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:policy-http.route.list.forged-identity-deny:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:policy-http.route.list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:policy-http.route.list.forged-identity-deny:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:policy-http.route.list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:policy-http.route.list.forged-identity-deny:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:policy-http.route.list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:policy-mcp.policy.list.allow:admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:policy-mcp.policy.list.deny:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:policy-mcp.policy.list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:policy-mcp.policy.list.deny:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:policy-mcp.policy.list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:policy-mcp.policy.list.deny:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:policy-mcp.policy.list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:policy-mcp.policy.list.deny:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:policy-mcp.policy.list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:status.allow:admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:status.deny:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:status.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:status.deny:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:status.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:status.deny:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:status.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:status.deny:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:status.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:status.forged-identity-deny:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:status.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:status.forged-identity-deny:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:status.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:status.forged-identity-deny:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:status.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:status.forged-identity-deny:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:status.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:terminal-create-deny:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:terminal-discovery-positive:admin"
+      ],
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:terminal-create-deny:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:terminal-discovery-positive:admin"
+      ],
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:terminal-create-deny:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:terminal-discovery-positive:admin"
+      ],
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:terminal-create-deny:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:terminal-discovery-positive:admin"
+      ],
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:terminal-create-positive:admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:terminal-delete-deny:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:terminal-create-positive:admin"
+      ],
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:terminal-delete-deny:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:terminal-create-positive:admin"
+      ],
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:terminal-delete-deny:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:terminal-create-positive:admin"
+      ],
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:terminal-delete-deny:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:terminal-create-positive:admin"
+      ],
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:terminal-delete-positive:admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:terminal-discovery-cleanup:admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:terminal-discovery-deny:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:terminal-discovery-positive:admin"
+      ],
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:terminal-discovery-deny:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:terminal-discovery-positive:admin"
+      ],
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:terminal-discovery-deny:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:terminal-discovery-positive:admin"
+      ],
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:terminal-discovery-deny:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:terminal-discovery-positive:admin"
+      ],
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:terminal-discovery-positive:admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:terminal-harmless-command-positive:admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:terminal-input-deny:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:terminal-harmless-command-positive:admin"
+      ],
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:terminal-input-deny:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:terminal-harmless-command-positive:admin"
+      ],
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:terminal-input-deny:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:terminal-harmless-command-positive:admin"
+      ],
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:terminal-input-deny:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:terminal-harmless-command-positive:admin"
+      ],
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:terminal-resize-deny:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:terminal-resize-positive:admin"
+      ],
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:terminal-resize-deny:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:terminal-resize-positive:admin"
+      ],
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:terminal-resize-deny:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:terminal-resize-positive:admin"
+      ],
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:terminal-resize-deny:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:terminal-resize-positive:admin"
+      ],
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:terminal-resize-positive:admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:terminal-sse-deny:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:terminal-sse-positive:admin"
+      ],
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:terminal-sse-deny:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:terminal-sse-positive:admin"
+      ],
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:terminal-sse-deny:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:terminal-sse-positive:admin"
+      ],
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:terminal-sse-deny:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:terminal-sse-positive:admin"
+      ],
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:terminal-sse-positive:admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:users-list.allow:admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:users-list.deny:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:users-list.deny:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:users-list.deny:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:users-list.deny:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:users-list.forged-identity-deny:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:users-list.forged-identity-deny:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:users-list.forged-identity-deny:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:users-list.forged-identity-deny:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:users-list.forwarded-identity-deny:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:users-list.forwarded-identity-deny:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:users-list.forwarded-identity-deny:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:users-list.forwarded-identity-deny:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:users-list.path-dot-segment:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-dot-segment:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-dot-segment:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-dot-segment:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-double-encoded-slash:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-double-encoded-slash:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-duplicate-slash:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-duplicate-slash:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-encoded-owner:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-encoded-owner:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-encoded-owner:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-encoded-owner:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-encoded-parent:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-encoded-parent:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-encoded-parent:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-encoded-parent:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-encoded-resource:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-encoded-resource:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-encoded-slash:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-encoded-slash:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-parent-segment:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-parent-segment:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-parent-segment:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.path-parent-segment:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "router-probes.mjs raw users-list paths; D2 matrix (r2b_review_codex.md)"
+    },
+    {
+      "id": "router:users-list.role-override-deny:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:users-list.role-override-deny:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:users-list.role-override-deny:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:users-list.role-override-deny:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:users-list.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:webtty-ui.allow:admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:webtty-ui.deny:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webtty-ui.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:webtty-ui.deny:selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webtty-ui.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:webtty-ui.deny:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webtty-ui.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:webtty-ui.deny:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webtty-ui.allow:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/router-probes.mjs routerProbes"
+    },
+    {
+      "id": "router:workspace-file-fixture-positive:admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:workspace-file-fixture-positive:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:workspace-file-fixture-positive:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:workspace-file-selector-deny:anonymous:?agent=authorization-suite-nonexistent",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:workspace-file-fixture-positive:admin",
+        "router:workspace-file-fixture-positive:userA",
+        "router:workspace-file-fixture-positive:userB"
+      ],
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:workspace-file-selector-deny:anonymous:?agent=userPersistoAgent",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:workspace-file-fixture-positive:admin",
+        "router:workspace-file-fixture-positive:userA",
+        "router:workspace-file-fixture-positive:userB"
+      ],
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:workspace-file-selector-deny:anonymous:default",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:workspace-file-fixture-positive:admin",
+        "router:workspace-file-fixture-positive:userA",
+        "router:workspace-file-fixture-positive:userB"
+      ],
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:workspace-file-selector-deny:selfRegistered:?agent=authorization-suite-nonexistent",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:workspace-file-fixture-positive:admin",
+        "router:workspace-file-fixture-positive:userA",
+        "router:workspace-file-fixture-positive:userB"
+      ],
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:workspace-file-selector-deny:selfRegistered:?agent=userPersistoAgent",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:workspace-file-fixture-positive:admin",
+        "router:workspace-file-fixture-positive:userA",
+        "router:workspace-file-fixture-positive:userB"
+      ],
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:workspace-file-selector-deny:selfRegistered:default",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:workspace-file-fixture-positive:admin",
+        "router:workspace-file-fixture-positive:userA",
+        "router:workspace-file-fixture-positive:userB"
+      ],
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "sessions.logout-cookie-replay",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "account",
+      "source": "tests/security/authorization/account-probes.mjs"
+    },
+    {
+      "id": "sessions.role-demotion-current-session",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "account",
+      "source": "tests/security/authorization/account-probes.mjs"
+    },
+    {
+      "id": "u3:navigation:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "U3",
+      "source": "tests/security/authorization/boundary-probes.mjs runTemplateProbes"
+    },
+    {
+      "id": "u3:protected-template-deny:anonymous:etag",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u3:protected-template:admin",
+        "u3:protected-template:userA"
+      ],
+      "boundary": "U3",
+      "source": "tests/security/authorization/boundary-probes.mjs runTemplateProbes"
+    },
+    {
+      "id": "u3:protected-template-deny:anonymous:ims",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u3:protected-template:admin",
+        "u3:protected-template:userA"
+      ],
+      "boundary": "U3",
+      "source": "tests/security/authorization/boundary-probes.mjs runTemplateProbes"
+    },
+    {
+      "id": "u3:protected-template-deny:anonymous:star",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u3:protected-template:admin",
+        "u3:protected-template:userA"
+      ],
+      "boundary": "U3",
+      "source": "tests/security/authorization/boundary-probes.mjs runTemplateProbes"
+    },
+    {
+      "id": "u3:protected-template-deny:selfRegistered:etag",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u3:protected-template:admin",
+        "u3:protected-template:userA"
+      ],
+      "boundary": "U3",
+      "source": "tests/security/authorization/boundary-probes.mjs runTemplateProbes"
+    },
+    {
+      "id": "u3:protected-template-deny:selfRegistered:ims",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u3:protected-template:admin",
+        "u3:protected-template:userA"
+      ],
+      "boundary": "U3",
+      "source": "tests/security/authorization/boundary-probes.mjs runTemplateProbes"
+    },
+    {
+      "id": "u3:protected-template-deny:selfRegistered:star",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u3:protected-template:admin",
+        "u3:protected-template:userA"
+      ],
+      "boundary": "U3",
+      "source": "tests/security/authorization/boundary-probes.mjs runTemplateProbes"
+    },
+    {
+      "id": "u3:protected-template:admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "U3",
+      "source": "tests/security/authorization/boundary-probes.mjs runTemplateProbes"
+    },
+    {
+      "id": "u3:protected-template:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "U3",
+      "source": "tests/security/authorization/boundary-probes.mjs runTemplateProbes"
+    },
+    {
+      "id": "u3:public-template:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "U3",
+      "source": "tests/security/authorization/boundary-probes.mjs runTemplateProbes"
+    },
+    {
+      "id": "u6:webchat-cap:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u6:webchat-own-stream:userA",
+        "u6:webchat-own-stream:userB"
+      ],
+      "boundary": "U6",
+      "source": "tests/security/authorization/webchat-probes.mjs runWebchatProbes"
+    },
+    {
+      "id": "u6:webchat-copied-ids-control:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u6:webchat-own-control:userB"
+      ],
+      "boundary": "U6",
+      "source": "tests/security/authorization/webchat-probes.mjs runWebchatProbes"
+    },
+    {
+      "id": "u6:webchat-copied-ids-input:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u6:webchat-own-marker:userB"
+      ],
+      "boundary": "U6",
+      "source": "tests/security/authorization/webchat-probes.mjs runWebchatProbes"
+    },
+    {
+      "id": "u6:webchat-credential-confinement",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u6:webchat-own-stream:userA",
+        "u6:webchat-own-stream:userB"
+      ],
+      "boundary": "U6",
+      "source": "tests/security/authorization/webchat-probes.mjs runWebchatProbes"
+    },
+    {
+      "id": "u6:webchat-deny:anonymous:input",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u6:webchat-own-marker:userA"
+      ],
+      "boundary": "U6",
+      "source": "tests/security/authorization/webchat-probes.mjs runWebchatProbes"
+    },
+    {
+      "id": "u6:webchat-deny:anonymous:stream",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u6:webchat-own-marker:userA"
+      ],
+      "boundary": "U6",
+      "source": "tests/security/authorization/webchat-probes.mjs runWebchatProbes"
+    },
+    {
+      "id": "u6:webchat-deny:selfRegistered:input",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u6:webchat-own-marker:userA"
+      ],
+      "boundary": "U6",
+      "source": "tests/security/authorization/webchat-probes.mjs runWebchatProbes"
+    },
+    {
+      "id": "u6:webchat-deny:selfRegistered:stream",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u6:webchat-own-marker:userA"
+      ],
+      "boundary": "U6",
+      "source": "tests/security/authorization/webchat-probes.mjs runWebchatProbes"
+    },
+    {
+      "id": "u6:webchat-distinct-processes",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u6:webchat-own-stream:userA",
+        "u6:webchat-own-stream:userB"
+      ],
+      "boundary": "U6",
+      "source": "tests/security/authorization/webchat-probes.mjs runWebchatProbes"
+    },
+    {
+      "id": "u6:webchat-idle-replacement:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u6:webchat-cap:userA"
+      ],
+      "boundary": "U6",
+      "source": "tests/security/authorization/webchat-probes.mjs runWebchatProbes"
+    },
+    {
+      "id": "u6:webchat-marker-isolation:userA-to-userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u6:webchat-own-marker:userA",
+        "u6:webchat-own-marker:userB"
+      ],
+      "boundary": "U6",
+      "source": "tests/security/authorization/webchat-probes.mjs runWebchatProbes"
+    },
+    {
+      "id": "u6:webchat-marker-isolation:userB-to-userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u6:webchat-own-marker:userA",
+        "u6:webchat-own-marker:userB"
+      ],
+      "boundary": "U6",
+      "source": "tests/security/authorization/webchat-probes.mjs runWebchatProbes"
+    },
+    {
+      "id": "u6:webchat-own-control:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u6:webchat-own-stream:userA",
+        "u6:webchat-own-stream:userB"
+      ],
+      "boundary": "U6",
+      "source": "tests/security/authorization/webchat-probes.mjs runWebchatProbes"
+    },
+    {
+      "id": "u6:webchat-own-control:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u6:webchat-own-stream:userA",
+        "u6:webchat-own-stream:userB"
+      ],
+      "boundary": "U6",
+      "source": "tests/security/authorization/webchat-probes.mjs runWebchatProbes"
+    },
+    {
+      "id": "u6:webchat-own-marker:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u6:webchat-own-stream:userA",
+        "u6:webchat-own-stream:userB"
+      ],
+      "boundary": "U6",
+      "source": "tests/security/authorization/webchat-probes.mjs runWebchatProbes"
+    },
+    {
+      "id": "u6:webchat-own-marker:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u6:webchat-own-stream:userA",
+        "u6:webchat-own-stream:userB"
+      ],
+      "boundary": "U6",
+      "source": "tests/security/authorization/webchat-probes.mjs runWebchatProbes"
+    },
+    {
+      "id": "u6:webchat-own-stream:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "U6",
+      "source": "tests/security/authorization/webchat-probes.mjs runWebchatProbes"
+    },
+    {
+      "id": "u6:webchat-own-stream:userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "U6",
+      "source": "tests/security/authorization/webchat-probes.mjs runWebchatProbes"
+    },
+    {
+      "id": "u6:webchat-reconnect-same-process:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u6:webchat-own-stream:userA",
+        "u6:webchat-own-stream:userB"
+      ],
+      "boundary": "U6",
+      "source": "tests/security/authorization/webchat-probes.mjs runWebchatProbes"
+    },
+    {
+      "id": "u6:webchat-reserved-keys:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u6:webchat-own-stream:userA",
+        "u6:webchat-own-stream:userB"
+      ],
+      "boundary": "U6",
+      "source": "tests/security/authorization/webchat-probes.mjs runWebchatProbes"
+    },
+    {
+      "id": "u6:webchat-runtimes-removed",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u6:webchat-own-stream:userA",
+        "u6:webchat-own-stream:userB"
+      ],
+      "boundary": "U6",
+      "source": "tests/security/authorization/webchat-probes.mjs runWebchatProbes"
+    },
+    {
+      "id": "u7:marketplace-listing-baseline:admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "U7",
+      "source": "tests/security/authorization/boundary-probes.mjs runMarketplaceAdmissionProbes"
+    },
+    {
+      "id": "u7:marketplace-no-effect:admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u7:marketplace-unknown-action:admin:repos",
+        "u7:marketplace-unknown-action:admin:agents"
+      ],
+      "boundary": "U7",
+      "source": "tests/security/authorization/boundary-probes.mjs runMarketplaceAdmissionProbes"
+    },
+    {
+      "id": "u7:marketplace-unknown-action-deny:admin-no-csrf:agents",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u7:marketplace-unknown-action:admin:agents"
+      ],
+      "boundary": "U7",
+      "source": "tests/security/authorization/boundary-probes.mjs runMarketplaceAdmissionProbes"
+    },
+    {
+      "id": "u7:marketplace-unknown-action-deny:admin-no-csrf:repos",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u7:marketplace-unknown-action:admin:repos"
+      ],
+      "boundary": "U7",
+      "source": "tests/security/authorization/boundary-probes.mjs runMarketplaceAdmissionProbes"
+    },
+    {
+      "id": "u7:marketplace-unknown-action-deny:anonymous:agents",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u7:marketplace-unknown-action:admin:agents"
+      ],
+      "boundary": "U7",
+      "source": "tests/security/authorization/boundary-probes.mjs runMarketplaceAdmissionProbes"
+    },
+    {
+      "id": "u7:marketplace-unknown-action-deny:anonymous:repos",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u7:marketplace-unknown-action:admin:repos"
+      ],
+      "boundary": "U7",
+      "source": "tests/security/authorization/boundary-probes.mjs runMarketplaceAdmissionProbes"
+    },
+    {
+      "id": "u7:marketplace-unknown-action-deny:selfRegistered:agents",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u7:marketplace-unknown-action:admin:agents"
+      ],
+      "boundary": "U7",
+      "source": "tests/security/authorization/boundary-probes.mjs runMarketplaceAdmissionProbes"
+    },
+    {
+      "id": "u7:marketplace-unknown-action-deny:selfRegistered:repos",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u7:marketplace-unknown-action:admin:repos"
+      ],
+      "boundary": "U7",
+      "source": "tests/security/authorization/boundary-probes.mjs runMarketplaceAdmissionProbes"
+    },
+    {
+      "id": "u7:marketplace-unknown-action-deny:userA:agents",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u7:marketplace-unknown-action:admin:agents"
+      ],
+      "boundary": "U7",
+      "source": "tests/security/authorization/boundary-probes.mjs runMarketplaceAdmissionProbes"
+    },
+    {
+      "id": "u7:marketplace-unknown-action-deny:userA:repos",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "u7:marketplace-unknown-action:admin:repos"
+      ],
+      "boundary": "U7",
+      "source": "tests/security/authorization/boundary-probes.mjs runMarketplaceAdmissionProbes"
+    },
+    {
+      "id": "u7:marketplace-unknown-action:admin:agents",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "U7",
+      "source": "tests/security/authorization/boundary-probes.mjs runMarketplaceAdmissionProbes"
+    },
+    {
+      "id": "u7:marketplace-unknown-action:admin:repos",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "U7",
+      "source": "tests/security/authorization/boundary-probes.mjs runMarketplaceAdmissionProbes"
+    },
+    {
+      "id": "users.admin-positive-update",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "account",
+      "source": "tests/security/authorization/account-probes.mjs"
+    },
+    {
+      "id": "users.csrf.foreign-origin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "users.admin-positive-update"
+      ],
+      "boundary": "account",
+      "source": "tests/security/authorization/account-probes.mjs"
+    },
+    {
+      "id": "users.csrf.invalid-csrf",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "users.admin-positive-update"
+      ],
+      "boundary": "account",
+      "source": "tests/security/authorization/account-probes.mjs"
+    },
+    {
+      "id": "users.csrf.missing-csrf",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "users.admin-positive-update"
+      ],
+      "boundary": "account",
+      "source": "tests/security/authorization/account-probes.mjs"
+    },
+    {
+      "id": "users.csrf.missing-origin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "users.admin-positive-update"
+      ],
+      "boundary": "account",
+      "source": "tests/security/authorization/account-probes.mjs"
+    },
+    {
+      "id": "users.roles-escalation.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "users.admin-positive-update"
+      ],
+      "boundary": "account",
+      "source": "tests/security/authorization/account-probes.mjs"
+    },
+    {
+      "id": "users.roles-escalation.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "users.admin-positive-update"
+      ],
+      "boundary": "account",
+      "source": "tests/security/authorization/account-probes.mjs"
+    },
+    {
+      "id": "users.roles-escalation.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "users.admin-positive-update"
+      ],
+      "boundary": "account",
+      "source": "tests/security/authorization/account-probes.mjs"
+    },
+    {
+      "id": "users.roles-escalation.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "users.admin-positive-update"
+      ],
+      "boundary": "account",
+      "source": "tests/security/authorization/account-probes.mjs"
+    }
+  ]
+}
