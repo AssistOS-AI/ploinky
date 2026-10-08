@@ -17,6 +17,7 @@ import { fileURLToPath } from 'node:url';
 
 import { RUNNING_DIR } from '../utils/config.js';
 import { readVerifiedJsonObject } from '../utils/verifiedReadOnlyFile.js';
+import { validateHardwareOutcome } from '../sandbox/hardwareLimits/errors.mjs';
 import { proveWorkerProcessIdentity } from '../sandbox/processIdentity.js';
 import { NO_WAIT_DIR_NAME } from './noWaitPaths.js';
 import { NO_WAIT_STATE_BYTE_LIMIT, readNoWaitRunMarker } from './noWaitLogObserver.js';
@@ -64,12 +65,15 @@ function runScopedDeadlinePassed(observation, marker, timeouts, nowMs) {
 
 // The marker names the latest run of one container; its run-scoped status and
 // the worker's own process identity decide whether that worker is still live.
+// Without `validateTerminalOutcome`, a terminal `failed` status that carries a
+// hardware outcome cannot be validated and reads as unverifiable.
 export function observeMarkedWorker(containerName, {
     runningDir,
     fsApi,
     nowMs,
     timeouts,
     proveWorkerProcess,
+    validateTerminalOutcome,
 }) {
     let marker;
     let status;
@@ -105,6 +109,7 @@ export function observeMarkedWorker(containerName, {
             targetWaveIndex: marker.waveIndex,
             timeouts,
             nowMs,
+            ...(validateTerminalOutcome ? { validateTerminalOutcome } : {}),
         });
     } catch (error) {
         return { ...base, live: false, reason: `unverifiable: ${error?.message || error}` };
@@ -171,6 +176,7 @@ const ROUTING_BUSY_RANK = Object.freeze({
 function routingVerdict(worker) {
     if (worker === null) return null; // The marker was retired.
     if (worker?.live === true) return 'live-worker';
+    if (worker?.live !== false) return 'unverifiable'; // Not an observation this scan knows.
     const reason = String(worker?.reason || '');
     if (reason.startsWith('unverifiable')) return 'unverifiable';
     if (reason === 'stopped without a terminal status') {
@@ -199,6 +205,7 @@ export function inspectNoWaitRoutingActivity({
     timeouts = resolveNoWaitBarrierTimeouts(),
     proveWorkerProcess = proveWorkerProcessIdentity,
     maxMarkers = DEFAULT_MAX_ROUTING_MARKERS,
+    observeWorker = observeMarkedWorker,
 } = {}) {
     try {
         let names;
@@ -212,8 +219,9 @@ export function inspectNoWaitRoutingActivity({
         if (containers.length > maxMarkers) return busy('too-many-markers');
         let verdict = null;
         for (const containerName of containers) {
-            const next = routingVerdict(observeMarkedWorker(containerName, {
-                runningDir, fsApi, nowMs, timeouts, proveWorkerProcess,
+            // A hardware refusal or block is a terminal `failed` status.
+            const next = routingVerdict(observeWorker(containerName, {
+                runningDir, fsApi, nowMs, timeouts, proveWorkerProcess, validateTerminalOutcome: validateHardwareOutcome,
             }));
             if (next && (verdict === null || ROUTING_BUSY_RANK[next] < ROUTING_BUSY_RANK[verdict])) verdict = next;
             if (verdict === 'live-worker') break;

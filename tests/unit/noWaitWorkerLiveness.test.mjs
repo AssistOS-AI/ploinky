@@ -525,6 +525,62 @@ test('an unexpected failure is busy', (t) => {
     assert.deepEqual(inspect(runningDir, { timeouts: null }), { busy: true, reason: 'unverifiable' });
 });
 
+test('a hardware-refused failed status is settled; a malformed hardware outcome stays unverifiable', async (t) => {
+    const { refusalOutcome } = await import('./hardwareAvailabilityFixtures.mjs');
+    const outcome = refusalOutcome(CONTAINER, { ref: 'fixtures/probe' });
+    const refused = (error) => ({ ...PAYLOADS.failed(), error });
+
+    const runningDir = tempRunningDir(t);
+    writeRun(runningDir, refused({ message: 'refused', code: outcome.code, hardwareOutcome: outcome }));
+    assert.deepEqual(inspect(runningDir), { busy: false, reason: 'settled' }, 'a terminal refusal never holds routing');
+    assert.deepEqual(inspect(runningDir, { nowMs: NOW + (24 * 60 * 60 * 1000) }), { busy: false, reason: 'settled' });
+    // The settlement path passes no validator and keeps treating it as a
+    // non-live, unverifiable entry, exactly as before.
+    const settlementView = observeMarkedWorker(CONTAINER, {
+        runningDir, fsApi: fs, nowMs: NOW, timeouts: TIMEOUTS, proveWorkerProcess: forbiddenProof,
+    });
+    assert.equal(settlementView.live, false);
+    assert.match(settlementView.reason, /^unverifiable: no-wait terminal hardware outcome cannot be validated/);
+
+    for (const [label, error] of [
+        ['unknown outcome code', { message: 'refused', hardwareOutcome: { ...outcome, code: 'not_a_code' } }],
+        ['extra outcome key', { message: 'refused', code: outcome.code, hardwareOutcome: { ...outcome, extra: true } }],
+        ['outcome is not an object', { message: 'refused', hardwareOutcome: 'refused' }],
+        ['error code disagrees', { message: 'refused', code: 'hardware_other', hardwareOutcome: outcome }],
+    ]) {
+        const malformed = tempRunningDir(t);
+        writeRun(malformed, refused(error));
+        assert.deepEqual(inspect(malformed), { busy: true, reason: 'unverifiable' }, label);
+    }
+    // A plain failure without a hardware outcome is settled as before.
+    const plain = tempRunningDir(t);
+    writeRun(plain, refused({ message: 'generic failure' }));
+    assert.deepEqual(inspect(plain), { busy: false, reason: 'settled' });
+});
+
+test('an observation the routing scan does not recognise is busy', (t) => {
+    const runningDir = tempRunningDir(t);
+    writeRun(runningDir, PAYLOADS.running());
+    const calls = [];
+    const stub = (result) => (containerName, options) => {
+        calls.push({ containerName, validates: typeof options.validateTerminalOutcome === 'function' });
+        if (result instanceof Error) throw result;
+        return result;
+    };
+    assert.deepEqual(inspect(runningDir, { observeWorker: stub({ containerName: CONTAINER, live: false, reason: 'a reason added later' }) }),
+        { busy: true, reason: 'unverifiable' });
+    assert.deepEqual(calls, [{ containerName: CONTAINER, validates: true }]);
+    assert.deepEqual(inspect(runningDir, { observeWorker: stub({ containerName: CONTAINER, reason: 'failed' }) }),
+        { busy: true, reason: 'unverifiable' }, 'live must be exactly false or true');
+    assert.deepEqual(inspect(runningDir, { observeWorker: stub({ containerName: CONTAINER, live: 'yes', reason: 'running' }) }),
+        { busy: true, reason: 'unverifiable' });
+    assert.deepEqual(inspect(runningDir, { observeWorker: stub(undefined) }), { busy: true, reason: 'unverifiable' });
+    assert.deepEqual(inspect(runningDir, { observeWorker: stub(null) }), { busy: false, reason: 'settled' }, 'a retired marker');
+    assert.deepEqual(inspect(runningDir, { observeWorker: stub(new Error('observer failed')) }), { busy: true, reason: 'error' });
+    assert.deepEqual(inspect(runningDir, { observeWorker: stub({ containerName: CONTAINER, live: false, reason: 'failed' }) }),
+        { busy: false, reason: 'settled' });
+});
+
 // AC-A15: the Router-loaded liveness module must not reach the mutating worker
 // (or the edge generation module, which does) through any relative import.
 test('AC-A15: the liveness module never imports noWaitWorker.js, directly or transitively', () => {
