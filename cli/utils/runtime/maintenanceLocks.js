@@ -16,6 +16,8 @@ const MAX_WORKSPACE_MUTATION_WAIT_MS = 15 * 60 * 1000;
 const MAX_WORKSPACE_MUTATION_RETRY_INTERVAL_MS = 1_000;
 const MAINTENANCE_DIR = path.join(RUNNING_DIR, 'maintenance');
 const WORKSPACE_START_LOCK_PATH = path.join(RUNNING_DIR, 'workspace-start.json');
+// The workspace mutation lease is stored in the workspace start lock file.
+const WORKSPACE_MUTATION_LEASE_PATH = WORKSPACE_START_LOCK_PATH;
 const WORKSPACE_START_TTL_MS = 24 * 60 * 60 * 1000;
 const LOCK_STALE_GRACE_MS = 5_000;
 const OWNED_WORKSPACE_LEASES = new WeakSet();
@@ -496,6 +498,7 @@ function inspectMaintenanceLock(containerName, attempt = 0) {
 }
 
 export {
+    WORKSPACE_MUTATION_LEASE_PATH,
     WORKSPACE_START_LOCK_PATH,
     heldWorkspaceMutationLease,
     readWorkspaceOwnerIdentity,
