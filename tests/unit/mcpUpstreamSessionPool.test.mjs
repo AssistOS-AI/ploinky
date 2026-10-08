@@ -1612,6 +1612,20 @@ test('deadline: a queued request granted after its deadline sends and mints noth
 });
 
 
+async function proxyNotification(proxy, { route, routePlan, sessionId, body, pool, waitForAgentReady }) {
+    const req = Readable.from([Buffer.from(JSON.stringify(body), 'utf8')]);
+    req.method = 'POST';
+    req.url = '/echoAgent/mcp';
+    req.headers = { host: 'localhost', 'content-type': 'application/json', 'mcp-session-id': sessionId };
+    req.user = PROXY_USER;
+    let finish;
+    const done = new Promise((resolve) => { finish = resolve; });
+    const res = { statusCode: 0, body: '', writeHead(code) { this.statusCode = code; }, end(chunk = '') { this.body += String(chunk); finish(); } };
+    await proxy.handleAgentMcpRequest(req, res, route, 'echoAgent', { beforeDial: () => true, routePlan, pool, waitForAgentReady });
+    await done;
+    return { status: res.statusCode, body: res.body };
+}
+
 // Explicit readiness.protocol in the committed lease manifest (SPEC C, user decision):
 // 'tcp' probes the port only and still forwards; 'none' answers without an MCP endpoint.
 function protocolSpy(result = true) {
@@ -1628,6 +1642,7 @@ test('explicit readiness.protocol tcp: the probe is a TCP probe and the request 
         const readiness = protocolSpy(true);
         const { route, routePlan, key } = proxyRoute(forwarder.port, lease, { readiness: { protocol } });
         const sessionId = openRouterSession(proxy);
+        assert.equal(pool.isReady(key), false, 'a TCP probe alone never marks the pooled key ready');
         const result = await proxyCall(proxy, { route, routePlan, sessionId, pool, waitForAgentReady: readiness.fn, body: toolsCall('tcp') });
         assert.equal(readiness.calls, 1);
         assert.equal(readiness.options[0].protocol, 'tcp');
@@ -1707,7 +1722,7 @@ test('explicit readiness.protocol none: answers -32601 at once with no probe, se
     }
 });
 
-test('explicit readiness.protocol none: a request without an id answers id null and 50 parallel requests are fast', async (t) => {
+test('explicit readiness.protocol none: an explicit null id is echoed, a notification gets no body, and 50 parallel requests are fast', async (t) => {
     const { proxy } = await loadProxyFixture();
     const readiness = protocolSpy(true);
     const { route, routePlan } = proxyRoute(7411, 'lease-none-parallel', { readiness: { protocol: 'none' } });
@@ -1715,10 +1730,17 @@ test('explicit readiness.protocol none: a request without an id answers id null 
     const started = Date.now();
     const results = await Promise.all(Array.from({ length: 50 }, () => proxyCall(proxy, {
         route, routePlan, sessionId: openRouterSession(proxy), pool, waitForAgentReady: readiness.fn,
-        body: { jsonrpc: '2.0', method: 'tools/list' },
+        body: { jsonrpc: '2.0', id: null, method: 'tools/list' },
     })));
     assert.ok(Date.now() - started < 500);
     for (const result of results) assert.equal(result.json.id, null);
+    assert.equal(readiness.calls, 0);
+    const notification = await proxyNotification(proxy, {
+        route, routePlan, sessionId: openRouterSession(proxy), pool, waitForAgentReady: readiness.fn,
+        body: { jsonrpc: '2.0', method: 'notifications/initialized' },
+    });
+    assert.equal(notification.status, 204);
+    assert.equal(notification.body, '');
     assert.equal(readiness.calls, 0);
 });
 

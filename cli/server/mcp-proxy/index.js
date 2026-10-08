@@ -950,10 +950,17 @@ async function handleAgentMcpRequest(req, res, route, agentName, {
             }
             const detail = `Agent '${agentName}' does not provide an MCP endpoint.`;
             if (isJsonRpc) {
+                // A notification (no id) never gets a response body; acknowledge
+                // it the way handleAgentJsonRpc acknowledges notifications/initialized.
+                if (message?.id === undefined) {
+                    res.writeHead(204);
+                    res.end();
+                    return;
+                }
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({
                     jsonrpc: '2.0',
-                    id: message?.id ?? null,
+                    id: message.id,
                     error: { code: -32601, message: detail }
                 }));
                 return;
