@@ -6,7 +6,7 @@ import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { TaskQueue } from './TaskQueue.mjs';
 import { createToolWorkerPools, shutdownToolWorkerPools } from './toolWorkerPool.mjs';
-import { createAgentServerCodeIdentity } from './toolCodeIdentity.mjs';
+import { agentServerIdentityInputs, createAgentServerCodeIdentity, formatIdentityMeasures } from './toolCodeIdentity.mjs';
 import { preserveJsonSchemaToolListings } from './inputSchema.mjs';
 import { getConfiguredToolInputSchema } from './toolInputSchemaCache.mjs';
 import {
@@ -1051,13 +1051,24 @@ function resolveToolCodeIdentity() {
     const override = globalThis[TOOL_CODE_IDENTITY_OVERRIDE];
     if (typeof override === 'function') return override;
     try {
-        return createAgentServerCodeIdentity({
+        const inputs = {
             codeDir: process.env.PLOINKY_CODE_DIR || '/code',
             configPath: initialConfigResult?.source || null,
             manifestPath: getManifestResult()?.source || null,
+        };
+        const { labels } = agentServerIdentityInputs(inputs);
+        let measures = [];
+        const identity = createAgentServerCodeIdentity({
+            ...inputs,
             // Read at call time: the pools exist by then.
             poolCommand: (poolName) => toolWorkerPools.get(poolName)?.command,
+            onMeasure: (measure) => measures.push(measure),
         });
+        return (poolName) => {
+            measures = [];
+            const value = identity(poolName);
+            return { identity: value, roots: formatIdentityMeasures(measures, labels) };
+        };
     } catch (error) {
         console.warn(`[AgentServer/MCP] cannot create the tool code identity (${error?.message || error})`);
         return null;

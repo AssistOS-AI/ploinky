@@ -732,3 +732,42 @@ test('createToolWorkerPools builds declared pools and shutdownToolWorkerPools en
     assert.equal(pidAlive(workerPid), false);
     assert.equal(createToolWorkerPools({ tools: [] }, { buildCommandSpec }).size, 0);
 });
+
+test('timings: identity walk and per-call timing lines appear only when enabled and carry no payload', async (t) => {
+    const dir = makeDir(t);
+    const hook = () => ({ identity: 'v1', roots: 'code:1.0/3' });
+    const off = makePool(t, dir, { size: 1, codeIdentity: hook });
+    assert.equal(off.pool.timings, process.env.PLOINKY_TOOL_WORKER_TIMINGS === '1', 'the default follows the environment');
+    const quiet = makePool(t, dir, { size: 1, codeIdentity: hook, timings: false });
+    assert.equal((await callTool(quiet.pool, { mode: 'echo', secret: 'payload-text' })).code, 0);
+    assert.ok(!quiet.logs.some((line) => / timing | identity walk /.test(line)), JSON.stringify(quiet.logs));
+
+    const { pool, logs } = makePool(t, dir, { size: 1, codeIdentity: hook, timings: true });
+    for (let i = 0; i < 2; i += 1) assert.equal((await callTool(pool, { mode: 'echo', secret: 'payload-text' })).code, 0);
+    const walks = logs.filter((line) => line.includes(' identity walk '));
+    const timings = logs.filter((line) => line.includes(' timing '));
+    assert.equal(walks.length, pool.stats().identityWalks, JSON.stringify(logs));
+    for (const line of walks) {
+        assert.match(line, /^\[toolWorkerPool:fixture\] identity walk seq=\d+ ms=\d+\.\d blockMs=\d+\.\d ok=true roots=code:1\.0\/3$/);
+    }
+    assert.equal(timings.length, 2, JSON.stringify(logs));
+    for (const line of timings) {
+        assert.match(line, /^\[toolWorkerPool:fixture\] timing id=fixture-\d+ route=worker queueMs=\d+\.\d walkMs=\d+\.\d walkBlockMs=\d+\.\d handlerMs=\d+\.\d settleMs=\d+\.\d totalMs=\d+\.\d$/);
+    }
+    assert.ok(!logs.some((line) => line.includes('payload-text')));
+    assert.equal(pool.stats().identityErrors, 0);
+});
+
+test('timings: an identity error is counted and its call is timed on the fallback route', async (t) => {
+    const dir = makeDir(t);
+    const { pool, logs } = makePool(t, dir, {
+        size: 1,
+        timings: true,
+        codeIdentity: () => { throw new Error('racy'); },
+    });
+    const fallback = async () => ({ code: 0, signal: null, stdout: 'from-spawn-fallback', stderr: '' });
+    assert.equal((await callTool(pool, { mode: 'echo' }, { fallback })).stdout, 'from-spawn-fallback');
+    assert.equal(pool.stats().identityErrors, 1);
+    assert.ok(logs.some((line) => /identity walk seq=\d+ ms=\S+ blockMs=\S+ ok=false roots=-$/.test(line)), JSON.stringify(logs));
+    assert.ok(logs.some((line) => /timing id=fixture-\d+ route=fallback queueMs=\d+\.\d walkMs=\d+\.\d walkBlockMs=\d+\.\d handlerMs=\d+\.\d settleMs=- totalMs=\d+\.\d$/.test(line)), JSON.stringify(logs));
+});

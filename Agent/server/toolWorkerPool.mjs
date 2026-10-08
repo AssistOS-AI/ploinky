@@ -214,6 +214,24 @@ function tokensEqual(received, expected) {
     return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
+// Opt-in timing lines (PLOINKY_TOOL_WORKER_TIMINGS=1): numbers and ids only.
+function timingsEnabled(env = process.env) {
+    return String(env?.PLOINKY_TOOL_WORKER_TIMINGS ?? '').trim() === '1';
+}
+
+function fmtMs(value) {
+    return Number.isFinite(value) ? value.toFixed(1) : '-';
+}
+
+// A hook result: the identity string, or `{ identity, roots }` where `roots`
+// is a per-root measurement summary for timing lines.
+function normalizeIdentity(result) {
+    if (result && typeof result === 'object' && typeof result.identity === 'string') {
+        return { value: result.identity, roots: typeof result.roots === 'string' ? result.roots : null };
+    }
+    return { value: String(result), roots: null };
+}
+
 function failureResult(message) {
     return { code: 1, signal: null, stdout: '', stderr: `${message}\n` };
 }
@@ -337,12 +355,15 @@ export class ToolWorkerPool {
         this.log = typeof options.log === 'function' ? options.log : defaultLog;
         this.now = typeof options.now === 'function' ? options.now : Date.now;
         this.codeIdentity = typeof options.codeIdentity === 'function' ? options.codeIdentity : null;
+        this.timings = typeof options.timings === 'boolean' ? options.timings : timingsEnabled();
         this.socketDirectories = options.socketDirectories || defaultSocketDirectories;
         this.netApi = options.netApi || net;
 
         this.workers = new Set();
         this.queue = [];
         this.nextCallId = 1;
+        // One sequence for call enqueues and identity walk starts.
+        this.seq = 0;
         this.unproductiveDeaths = 0;
         this.degradedUntil = 0;
         this.shuttingDown = false;
@@ -355,6 +376,8 @@ export class ToolWorkerPool {
             completed: 0,
             saturated: 0,
             fallbacks: 0,
+            identityWalks: 0,
+            identityErrors: 0,
         };
     }
 
@@ -446,6 +469,12 @@ export class ToolWorkerPool {
                 settled: false,
                 timer: null,
                 resolve,
+                enqueueSeq: ++this.seq,
+                enqueuedAt: performance.now(),
+                walk: null,
+                route: null,
+                dispatchedAt: null,
+                resultAt: null,
             };
             // Queue wait counts toward the call timeout.
             call.timer = setTimeout(() => this.onCallTimeout(call), effectiveTimeoutMs);
@@ -471,8 +500,31 @@ export class ToolWorkerPool {
         call.settled = true;
         clearTimeout(call.timer);
         call.timer = null;
+        this.logCallTiming(call);
         call.resolve(result);
         return true;
+    }
+
+    // queueMs: enqueue to the start of the walk that dispatched the call (or
+    // sent it to the fallback); walkMs/walkBlockMs: that walk's duration and
+    // the part of it spent blocking this thread; handlerMs: dispatch to the
+    // result frame (or the fallback's run); settleMs: result frame to settle.
+    logCallTiming(call, settledAt = performance.now()) {
+        if (!this.timings) return;
+        const walk = call.walk;
+        const handlerEnd = call.resultAt ?? settledAt;
+        this.log(`[toolWorkerPool:${this.name}] timing id=${call.id} route=${call.route || 'none'}`
+            + ` queueMs=${fmtMs(walk ? walk.startedAt - call.enqueuedAt : NaN)}`
+            + ` walkMs=${fmtMs(walk?.ms)} walkBlockMs=${fmtMs(walk?.blockMs)}`
+            + ` handlerMs=${fmtMs(call.dispatchedAt === null ? NaN : handlerEnd - call.dispatchedAt)}`
+            + ` settleMs=${fmtMs(call.resultAt === null ? NaN : settledAt - call.resultAt)}`
+            + ` totalMs=${fmtMs(settledAt - call.enqueuedAt)}`);
+    }
+
+    logWalk(walk, ok, roots) {
+        if (!this.timings) return;
+        this.log(`[toolWorkerPool:${this.name}] identity walk seq=${walk.seq} ms=${fmtMs(walk.ms)}`
+            + ` blockMs=${fmtMs(walk.blockMs)} ok=${ok} roots=${roots || '-'}`);
     }
 
     countWorkers(state) {
@@ -488,12 +540,20 @@ export class ToolWorkerPool {
 
     // The current code identity, read from the hook on every use (no caching).
     readIdentity() {
-        if (!this.codeIdentity) return { ok: true, value: null };
+        if (!this.codeIdentity) return { ok: true, value: null, walk: null };
+        const walk = { seq: ++this.seq, startedAt: performance.now(), ms: NaN, blockMs: NaN };
+        this.counters.identityWalks += 1;
         try {
-            return { ok: true, value: String(this.codeIdentity()) };
+            const result = normalizeIdentity(this.codeIdentity());
+            walk.ms = walk.blockMs = performance.now() - walk.startedAt;
+            this.logWalk(walk, true, result.roots);
+            return { ok: true, value: result.value, walk };
         } catch (error) {
+            walk.ms = walk.blockMs = performance.now() - walk.startedAt;
+            this.counters.identityErrors += 1;
+            this.logWalk(walk, false, null);
             this.log(`[toolWorkerPool:${this.name}] codeIdentity failed (${error?.message || error}); using the spawn fallback`);
-            return { ok: false, value: undefined };
+            return { ok: false, value: undefined, walk };
         }
     }
 
@@ -501,7 +561,7 @@ export class ToolWorkerPool {
     // identity and pick a current one.
     takeCurrentWorker() {
         const identity = this.readIdentity();
-        if (!identity.ok) return { identityError: true, worker: null };
+        if (!identity.ok) return { identityError: true, worker: null, walk: identity.walk };
         let found = null;
         for (const worker of [...this.workers]) {
             if (worker.state !== 'idle') continue;
@@ -513,7 +573,7 @@ export class ToolWorkerPool {
             }
             if (!found) found = worker;
         }
-        return { identityError: false, worker: found };
+        return { identityError: false, worker: found, walk: identity.walk };
     }
 
     pump() {
@@ -521,11 +581,15 @@ export class ToolWorkerPool {
         while (this.queue.length) {
             const pick = this.takeCurrentWorker();
             if (pick.identityError) {
-                this.runQueuedOnFallback(this.queue.shift(), 'tool code identity could not be read');
+                const call = this.queue.shift();
+                if (call) call.walk = pick.walk;
+                this.runQueuedOnFallback(call, 'tool code identity could not be read');
                 continue;
             }
             if (!pick.worker) break;
-            this.dispatch(pick.worker, this.queue.shift());
+            const call = this.queue.shift();
+            call.walk = pick.walk;
+            this.dispatch(pick.worker, call);
         }
         // Workers being retired still count toward `size` until they exit.
         while (this.queue.length > this.countWorkers('starting') && this.workers.size < this.size) {
@@ -539,6 +603,8 @@ export class ToolWorkerPool {
         worker.state = 'busy';
         worker.call = call;
         call.worker = worker;
+        call.route = 'worker';
+        call.dispatchedAt = performance.now();
         try {
             worker.channel.write(call.encoded);
         } catch (_) {
@@ -907,6 +973,7 @@ export class ToolWorkerPool {
         if (frame.type === 'result' && worker.state === 'busy' && worker.call
             && frame.id === worker.call.id && !worker.call.resultFrame) {
             worker.call.resultFrame = frame;
+            worker.call.resultAt = performance.now();
             this.maybeCompleteCall(worker, worker.call);
             return;
         }
@@ -1019,6 +1086,8 @@ export class ToolWorkerPool {
             sent.requeued = true;
             sent.worker = null;
             sent.resultFrame = null;
+            sent.resultAt = null;
+            sent.dispatchedAt = null;
             sent.outputBytes = 0;
             for (const sink of Object.values(sent.output)) {
                 sink.chunks = [];
@@ -1118,9 +1187,16 @@ export class ToolWorkerPool {
         clearTimeout(call.timer);
         call.timer = null;
         call.settled = true;
+        call.route = 'fallback';
         Promise.resolve()
-            .then(() => this.runFallback(call.fallback, reason === 'is degraded' ? reason : `cannot run the call (${reason})`))
-            .then(call.resolve);
+            .then(() => {
+                call.dispatchedAt = performance.now();
+                return this.runFallback(call.fallback, reason === 'is degraded' ? reason : `cannot run the call (${reason})`);
+            })
+            .then((result) => {
+                this.logCallTiming(call);
+                call.resolve(result);
+            });
     }
 
     notifyExitWaiters() {

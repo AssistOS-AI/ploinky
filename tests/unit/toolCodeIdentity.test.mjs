@@ -231,6 +231,23 @@ test('I9: the racy guard, future stamps, symlink cycles and the entry limit', (t
     assert.throws(() => createCodeIdentity({ roots: [path.join(root, 'nope')], now: later })(), /ENOENT/);
 });
 
+test('onMeasure observes every root and the fixed files without changing the identity', (t) => {
+    const root = agentTree(t);
+    const other = agentTree(t);
+    const extra = path.join(root, 'mcp-config.json');
+    const measures = [];
+    const plain = createCodeIdentity({ roots: [root, other], extraFiles: [extra], now: later })();
+    const measured = createCodeIdentity({ roots: [root, other], extraFiles: [extra], now: later, onMeasure: (m) => measures.push(m) })();
+    assert.equal(measured, plain);
+    assert.deepEqual(measures.map((m) => m.index), [0, 1, -1]);
+    assert.deepEqual(measures.map((m) => m.root), [root, other, 'files']);
+    for (const m of measures) assert.ok(Number.isFinite(m.ms) && m.ms >= 0 && m.entries > 0, JSON.stringify(m));
+    assert.equal(measures[0].entries, measures[1].entries, 'two identical trees have the same entry count');
+    assert.equal(measures[2].entries, 1);
+    const throwing = createCodeIdentity({ roots: [root, other], extraFiles: [extra], now: later, onMeasure: () => { throw new Error('observer'); } });
+    assert.equal(throwing(), plain, 'a throwing observer never changes the identity');
+});
+
 // I1: a real pool with the real identity. The worker and the spawn fallback
 // both load lib/answer.mjs; the original worker stays alive (long idle
 // timeout, many calls allowed), so only the identity can retire it.
