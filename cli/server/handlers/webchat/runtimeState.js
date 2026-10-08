@@ -762,10 +762,25 @@ export function getRuntimeMap(appState) {
     return appState.runtimes;
 }
 
-export function buildRuntimeKey(workspaceDirectory, effectiveConfig, agentQuery = '') {
+export function isPrincipalScopedRuntime(effectiveConfig) {
+    return effectiveConfig?.runtimeScope === 'principal';
+}
+
+// The opaque per-user part of a principal-scoped runtime key. It is derived
+// only from the authenticated request, never from the query or body.
+export function resolveRuntimePrincipal(req) {
+    const userId = String(req?.user?.id || '');
+    if (!userId) return '';
+    return crypto.createHash('sha256')
+        .update(`${String(req?.authMode || '')}\0${userId}`)
+        .digest('hex');
+}
+
+export function buildRuntimeKey(workspaceDirectory, effectiveConfig, agentQuery = '', principal = '') {
     const agent = String(effectiveConfig?.agentName || effectiveConfig?.displayName || 'webchat').trim();
     const launchSignature = crypto.createHash('sha256').update(String(agentQuery || '')).digest('hex').slice(0, 16);
-    return `${workspaceDirectory}\0${agent}\0${launchSignature}`;
+    const sharedKey = `${workspaceDirectory}\0${agent}\0${launchSignature}`;
+    return principal ? `${sharedKey}\0${principal}` : sharedKey;
 }
 
 export function broadcastWorkspaceTaskEvent(appState, workspaceDirectory, payload, sourceRuntimeKey = null) {

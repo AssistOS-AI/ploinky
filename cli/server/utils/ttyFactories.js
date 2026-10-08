@@ -77,6 +77,7 @@ function createWebchatFactoryConfig(webchatTTYModule, resolvedWebchatCommands) {
         source: commands?.source || 'unset',
         agentName: commands?.agentName || '',
         forwardEnvelope: commands?.forwardEnvelope === true,
+        runtimeScope: commands?.runtimeScope === 'principal' ? 'principal' : 'shared',
         unsupportedReason: commands?.unsupportedReason || ''
     });
     const resolveHostWorkdir = (config) => {
@@ -110,6 +111,7 @@ function createWebchatFactoryConfig(webchatTTYModule, resolvedWebchatCommands) {
                 runtime: 'local',
                 agentName: config.agentName || '',
                 forwardEnvelope: config.forwardEnvelope === true,
+                runtimeScope: config.runtimeScope,
                 unavailableReason: ''
             };
         }
@@ -133,6 +135,7 @@ function createWebchatFactoryConfig(webchatTTYModule, resolvedWebchatCommands) {
                 runtime: 'docker',
                 agentName: config.agentName || '',
                 forwardEnvelope: config.forwardEnvelope === true,
+                runtimeScope: config.runtimeScope,
                 unavailableReason: ''
             };
         }
@@ -199,6 +202,7 @@ function createServiceConfig(getWebchatFactory) {
             containerName: factoryResult.label,
             runtime: factoryResult.runtime,
             forwardEnvelope: factoryResult.forwardEnvelope === true,
+            runtimeScope: factoryResult.runtimeScope === 'principal' ? 'principal' : 'shared',
             unavailableReason: factoryResult.unavailableReason || ''
         };
         base.getFactoryForCommands = (commands) => {

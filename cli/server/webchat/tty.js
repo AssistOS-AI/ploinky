@@ -60,6 +60,31 @@ function withoutWebchatSessionEnv(baseEnv) {
     return env;
 }
 
+// Identity arguments appended to a WebChat agent command. They carry only the
+// user's public identity; browser credentials never reach agent argv or env.
+function buildSsoCliArgs(ssoUser) {
+    const ssoCliArgs = [];
+    if (ssoUser) {
+        if (ssoUser.username) {
+            ssoCliArgs.push(`--sso-user=${shellEscape(ssoUser.username)}`);
+        }
+        if (ssoUser.id) {
+            ssoCliArgs.push(`--sso-user-id=${shellEscape(ssoUser.id)}`);
+        }
+        if (ssoUser.email) {
+            ssoCliArgs.push(`--sso-email=${shellEscape(ssoUser.email)}`);
+        }
+        if (Array.isArray(ssoUser.roles) && ssoUser.roles.length) {
+            const rolesStr = ssoUser.roles.join(',');
+            ssoCliArgs.push(`--sso-roles=${rolesStr}`);
+        }
+    }
+    if (!ssoCliArgs.length) {
+        ssoCliArgs.push('--sso-user=guest', '--sso-user-id=guest', '--sso-roles=guest');
+    }
+    return ssoCliArgs;
+}
+
 function createTTYFactory({ runtime, containerName, workdir, entry }) {
     const DEBUG = process.env.WEBCHAT_TTY_DEBUG === '1';
     const log = (...args) => { if (DEBUG) console.log('[webchat][tty]', ...args); };
@@ -67,29 +92,7 @@ function createTTYFactory({ runtime, containerName, workdir, entry }) {
         const wd = workdir || safeProcessCwd();
         const env = withoutWebchatSessionEnv({ ...process.env, TERM: 'xterm-256color' });
 
-        // Build SSO CLI arguments (no env vars)
-        const ssoCliArgs = [];
-        if (ssoUser) {
-            if (ssoUser.username) {
-                ssoCliArgs.push(`--sso-user=${shellEscape(ssoUser.username)}`);
-            }
-            if (ssoUser.id) {
-                ssoCliArgs.push(`--sso-user-id=${shellEscape(ssoUser.id)}`);
-            }
-            if (ssoUser.email) {
-                ssoCliArgs.push(`--sso-email=${shellEscape(ssoUser.email)}`);
-            }
-            if (Array.isArray(ssoUser.roles) && ssoUser.roles.length) {
-                const rolesStr = ssoUser.roles.join(',');
-                ssoCliArgs.push(`--sso-roles=${rolesStr}`);
-            }
-            if (ssoUser.sessionId) {
-                ssoCliArgs.push(`--sso-session-id=${shellEscape(ssoUser.sessionId)}`);
-            }
-        }
-        if (!ssoCliArgs.length) {
-            ssoCliArgs.push('--sso-user=guest', '--sso-user-id=guest', '--sso-roles=guest');
-        }
+        const ssoCliArgs = buildSsoCliArgs(ssoUser);
 
         // Append SSO args to entry command
         let shellCmd = entry && String(entry).trim()
@@ -207,7 +210,7 @@ function createTTYFactory({ runtime, containerName, workdir, entry }) {
     return { create: factory };
 }
 
-export { createTTYFactory, createLocalTTYFactory };
+export { buildSsoCliArgs, createTTYFactory, createLocalTTYFactory };
 
 function createLocalTTYFactory({ workdir, command, startupProtocol = false }) {
     const DEBUG = process.env.WEBCHAT_TTY_DEBUG === '1';
@@ -222,29 +225,7 @@ function createLocalTTYFactory({ workdir, command, startupProtocol = false }) {
         });
         if (startupProtocol) env.PLOINKY_WEBCHAT_STARTUP_FD = '3';
 
-        // Build SSO CLI arguments (no env vars)
-        const ssoCliArgs = [];
-        if (ssoUser) {
-            if (ssoUser.username) {
-                ssoCliArgs.push(`--sso-user=${shellEscape(ssoUser.username)}`);
-            }
-            if (ssoUser.id) {
-                ssoCliArgs.push(`--sso-user-id=${shellEscape(ssoUser.id)}`);
-            }
-            if (ssoUser.email) {
-                ssoCliArgs.push(`--sso-email=${shellEscape(ssoUser.email)}`);
-            }
-            if (Array.isArray(ssoUser.roles) && ssoUser.roles.length) {
-                const rolesStr = ssoUser.roles.join(',');
-                ssoCliArgs.push(`--sso-roles=${rolesStr}`);
-            }
-            if (ssoUser.sessionId) {
-                ssoCliArgs.push(`--sso-session-id=${shellEscape(ssoUser.sessionId)}`);
-            }
-        }
-        if (!ssoCliArgs.length) {
-            ssoCliArgs.push('--sso-user=guest', '--sso-user-id=guest', '--sso-roles=guest');
-        }
+        const ssoCliArgs = buildSsoCliArgs(ssoUser);
 
         let ptyProc = null;
         let disposed = false;

@@ -69,6 +69,24 @@ export function sanitizeWebchatReferencesForEnvelope(references = []) {
     return out;
 }
 
+// The signed `__webchat_message__` arguments. A principal-scoped runtime adds
+// `runtimeScope: "principal"`, taken only from the manifest-derived config, so
+// an agent that requires it rejects tokens from a router without per-user
+// runtimes.
+export function buildWebchatInvocationArgs({ effectiveConfig, tabId, pageInstanceId, envelope }) {
+    const args = {
+        surface: 'webchat',
+        tabId: String(tabId || ''),
+        pageInstanceId: String(pageInstanceId || ''),
+        text: typeof envelope?.text === 'string' ? envelope.text : '',
+        attachments: sanitizeWebchatAttachmentsForEnvelope(envelope?.attachments),
+        references: sanitizeWebchatReferencesForEnvelope(envelope?.references),
+        presentation: normalizeWebchatPresentation(envelope?.presentation),
+    };
+    if (effectiveConfig?.runtimeScope === 'principal') args.runtimeScope = 'principal';
+    return args;
+}
+
 function buildWebchatInvocationToken({ req, effectiveConfig, tabId, pageInstanceId, envelope }) {
     const agentName = String(effectiveConfig?.agentName || '').trim();
     if (!agentName) return '';
@@ -77,15 +95,7 @@ function buildWebchatInvocationToken({ req, effectiveConfig, tabId, pageInstance
             req,
             agentName,
             toolName: '__webchat_message__',
-            toolArgs: {
-                surface: 'webchat',
-                tabId: String(tabId || ''),
-                pageInstanceId: String(pageInstanceId || ''),
-                text: typeof envelope?.text === 'string' ? envelope.text : '',
-                attachments: sanitizeWebchatAttachmentsForEnvelope(envelope?.attachments),
-                references: sanitizeWebchatReferencesForEnvelope(envelope?.references),
-                presentation: normalizeWebchatPresentation(envelope?.presentation),
-            }
+            toolArgs: buildWebchatInvocationArgs({ effectiveConfig, tabId, pageInstanceId, envelope })
         });
         return invocation?.token || '';
     } catch (_) {

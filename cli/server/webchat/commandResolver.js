@@ -48,14 +48,35 @@ function extractManifestCli(manifest) {
     return '';
 }
 
+const warnedRuntimeScopes = new Set();
+
+// `webchat.runtimeScope` is read only from the agent manifest. "principal"
+// gives every authenticated user a separate WebChat runtime; the default
+// "shared" keeps one runtime per workspace, agent and launch query. Any other
+// value is treated as "shared" and reported once.
+function resolveManifestRuntimeScope(webchat) {
+    const raw = webchat.runtimeScope;
+    if (raw === undefined || raw === null || raw === '') return 'shared';
+    const normalized = String(raw).trim().toLowerCase();
+    if (normalized === 'principal' || normalized === 'shared') return normalized;
+    const key = String(raw).slice(0, 64);
+    if (!warnedRuntimeScopes.has(key)) {
+        warnedRuntimeScopes.add(key);
+        console.warn(`[webchat] Unsupported webchat.runtimeScope ${JSON.stringify(key)}; using "shared".`);
+    }
+    return 'shared';
+}
+
 function extractManifestWebchatOptions(manifest) {
     const webchat = manifest && typeof manifest === 'object' && manifest.webchat && typeof manifest.webchat === 'object'
         ? manifest.webchat
         : {};
-    return {
+    const options = {
         forwardEnvelope: webchat.forwardEnvelope === true || webchat.forwardEnvelope === 'true'
             || webchat.forwardEnvelope === 1 || webchat.forwardEnvelope === '1'
     };
+    if (resolveManifestRuntimeScope(webchat) === 'principal') options.runtimeScope = 'principal';
+    return options;
 }
 
 function resolveStaticAgentDetails(routingFilePath, cfg = readRoutingConfig(routingFilePath)) {
