@@ -51,6 +51,7 @@ const marketplaceAssertionReplayCache = createTokenReplayCache({ maxSize: 4096 }
 
 const SAFE_LIFECYCLE_ERRORS = new Map([
     ['PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED', { status: 503, message: 'Repository operation requires workspace recovery. Stop the exact Box from its host workspace, then start it again.' }],
+    ['PLOINKY_MARKETPLACE_REPOSITORY_RETRY', { status: 503, message: 'Repository process census was incomplete; no change was made. Retry.' }],
     ['EDGE_GENERATION_CHANGED', { status: 503, message: 'The routing generation changed. Refresh Marketplace before retrying.' }],
     ['PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED', { status: 422, message: 'The requested runtime capability is unavailable in Ploinky Box.' }],
     ['PLOINKY_MANIFEST_SECURITY_INVALID', { status: 422, message: 'The agent manifest contains invalid runtime security settings.' }],

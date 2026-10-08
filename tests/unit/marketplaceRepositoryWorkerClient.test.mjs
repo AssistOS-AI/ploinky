@@ -93,24 +93,184 @@ function harness(t, overrides = {}) {
     return { runner, run, children, signals, advance, hello, authorize, terminal, message, scans: () => scans, time, observer };
 }
 
-test('incomplete baseline retains the first cause and re-emits it on a later rejection after initial log loss', async (t) => {
+const RETRY = 'PLOINKY_MARKETPLACE_REPOSITORY_RETRY';
+const RECOVERY = 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED';
+const incompleteScan = (unknowns = [{ category: 'permission', field: 'namespace', errno: 'EACCES', count: 1 }]) =>
+    ({ complete: false, records: [], members: [], writers: [], diagnostic: { unknowns } });
+function scripted(h, results) {
+    const scan = h.observer.scan;
+    let calls = 0;
+    h.observer.scan = async (options) => {
+        const next = results[calls++];
+        if (typeof next === 'function') return next(options);
+        return next ? (await scan(options), next) : scan(options);
+    };
+    return () => calls;
+}
+function retryLogs(logs) { return logs.filter((entry) => entry.type === 'marketplace_repository_retryable'); }
+
+test('incomplete pre-spawn baseline fails only its ticket with RETRY and the next fresh baseline proceeds', async (t) => {
+    const logs = [];
+    const h = harness(t, { diagnosticSink: (type, entry) => logs.push({ type, entry }) });
+    const unknowns = [{ category: 'permission', field: 'namespace', errno: 'EACCES', count: 1 }];
+    scripted(h, [incompleteScan(unknowns)]);
+    await assert.rejects(h.run({ diagnosticContext: { caller: 'agent-assertion', routeLease: true } }),
+        (error) => error.code === RETRY && error.retryable === true && !error.recoveryRequired);
+    assert.equal(h.children.length, 0);
+    assert.equal(h.runner.diagnostics().firstCause, null, 'a retryable refusal is never a latch cause');
+    assert.deepEqual(h.runner.snapshot(), { active: false, pending: 0, chargedBytes: 0, accepting: true,
+        recoveryDebt: false, rescanRequired: true });
+    const [retry] = retryLogs(logs);
+    assert.equal(retryLogs(logs).length, 1);
+    assert.deepEqual(retry.entry.cause.unknowns, unknowns, 'operators receive the baseline unknowns');
+    assert.equal(retry.entry.cause.phase, 'baseline');
+    assert.equal(retry.entry.cause.reason, 'retryable');
+    assert.equal(retry.entry.cause.predicate, 'scan-incomplete');
+    assert.equal(retry.entry.cause.caller, 'agent-assertion');
+    assert.equal(logs.some((entry) => entry.type === 'marketplace_repository_diagnostic'), false);
+    assert.equal(h.runner.diagnostics().recent.at(-1).reason, 'retryable');
+    const scans = h.scans();
+    const pending = h.run(); await flush();
+    assert.equal(h.scans(), scans + 1, 'the next ticket takes its own fresh baseline');
+    const [child] = h.children;
+    assert.ok(child);
+    assert.equal(h.runner.snapshot().rescanRequired, false);
+    await h.hello(child); await h.authorize(child); h.terminal(child);
+    assert.equal((await pending).status, 'cloned');
+    assert.equal(h.runner.snapshot().accepting, true);
+    assert.equal(h.runner.snapshot().recoveryDebt, false);
+});
+
+test('pre-hello exit retains the first cause and re-emits it on a later rejection after initial log loss', async (t) => {
     const logs = [];
     const h = harness(t, { diagnosticSink: (_type, entry) => logs.push(entry) });
-    h.observer.scan = async () => ({ complete: false, records: [], members: [], writers: [],
-        diagnostic: { unknowns: [{ category: 'permission', field: 'namespace', errno: 'EACCES', count: 1 }] } });
-    await assert.rejects(h.run({ diagnosticContext: { caller: 'agent-assertion', routeLease: true } }), { code: 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED' });
-    assert.equal(h.children.length, 0);
+    const pending = h.run({ diagnosticContext: { caller: 'agent-assertion', routeLease: true } }); await flush();
+    const [child] = h.children;
+    child.closed = true; child.emit('close', 1, null);
+    await h.advance(2_500); // bounded cancellation finishes inside the emission throttle
+    await assert.rejects(pending, { code: RECOVERY });
     const first = h.runner.diagnostics().firstCause;
-    assert.equal(first.phase, 'baseline');
-    assert.equal(first.unknowns[0].field, 'namespace');
+    assert.equal(first.phase, 'exit');
+    assert.equal(first.reason, 'pre-hello-exit');
     assert.equal(first.caller, 'agent-assertion');
+    assert.equal(logs.length, 1);
     logs.length = 0;
-    await assert.rejects(h.run(), { code: 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED' });
+    await assert.rejects(h.run(), { code: RECOVERY });
     assert.equal(logs.length, 0);
     await h.advance(5000);
-    await assert.rejects(h.run(), { code: 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED' });
+    await assert.rejects(h.run(), { code: RECOVERY });
     assert.deepEqual(logs[0].firstCause, first);
     assert.equal(h.runner.snapshot().chargedBytes, 0);
+    assert.equal(h.children.length, 1);
+});
+
+test('consecutive incomplete baselines each return RETRY without a spawn and share one throttled emission', async (t) => {
+    const logs = [];
+    const h = harness(t, { diagnosticSink: (type, entry) => logs.push({ type, entry }) });
+    scripted(h, [incompleteScan(), incompleteScan([{ category: 'deadline', field: 'none', count: 1 }]), incompleteScan()]);
+    await assert.rejects(h.run(), { code: RETRY });
+    await assert.rejects(h.run(), { code: RETRY });
+    assert.equal(h.children.length, 0);
+    assert.equal(retryLogs(logs).length, 1);
+    await h.advance(5_000);
+    await assert.rejects(h.run(), { code: RETRY });
+    assert.equal(retryLogs(logs).length, 2);
+    assert.equal(retryLogs(logs)[1].entry.suppressed, 1);
+    assert.equal(h.children.length, 0);
+    assert.equal(h.runner.diagnostics().firstCause, null);
+    assert.equal(h.runner.snapshot().accepting, true);
+    assert.equal(h.runner.snapshot().recoveryDebt, false);
+});
+
+test('queued tickets survive a retryable baseline failure and each takes its own baseline', async (t) => {
+    const h = harness(t);
+    let release;
+    const scans = scripted(h, [() => new Promise((resolve) => { release = resolve; })]);
+    const first = h.run(); await flush();
+    const second = h.run();
+    const third = h.run();
+    await flush();
+    assert.equal(h.runner.snapshot().pending, 2);
+    release(incompleteScan());
+    await assert.rejects(first, { code: RETRY });
+    await flush();
+    assert.equal(h.runner.snapshot().accepting, true);
+    const [child] = h.children;
+    assert.ok(child, 'the queued ticket was not discarded');
+    assert.equal(h.runner.snapshot().pending, 1);
+    await h.hello(child); await h.authorize(child); h.terminal(child);
+    assert.equal((await second).status, 'cloned');
+    await flush();
+    const next = h.children[1];
+    await h.hello(next); await h.authorize(next); h.terminal(next);
+    assert.equal((await third).status, 'cloned');
+    assert.equal(scans(), 3);
+});
+
+test('synchronous spawn throw after a retryable failure still latches with debt', async (t) => {
+    const h = harness(t, { spawnProcess() { throw new Error('spawn exploded'); } });
+    scripted(h, [incompleteScan()]);
+    await assert.rejects(h.run(), { code: RETRY });
+    assert.equal(h.runner.snapshot().rescanRequired, true);
+    await expectSettledRejection(h.run(), RECOVERY);
+    assert.equal(h.runner.snapshot().accepting, false);
+    assert.equal(h.runner.snapshot().recoveryDebt, true);
+    assert.equal(h.runner.diagnostics().firstCause.reason, 'spawn-failed');
+    await assert.rejects(h.run(), { code: RECOVERY });
+});
+
+test('router-missing complete baseline still latches after a retryable failure', async (t) => {
+    const h = harness(t);
+    scripted(h, [incompleteScan(), { complete: true, records: [], members: [], writers: [] }]);
+    await assert.rejects(h.run(), { code: RETRY });
+    await expectSettledRejection(h.run(), RECOVERY);
+    assert.equal(h.children.length, 0);
+    assert.equal(h.runner.snapshot().accepting, false);
+    assert.equal(h.runner.snapshot().recoveryDebt, true);
+    assert.equal(h.runner.diagnostics().firstCause.mismatch, 'router-missing', 'the latch cause, not the retry, is first');
+    await assert.rejects(h.run(), { code: RECOVERY });
+});
+
+test('shutdown after only retryable failures is clean; shutdown during an in-flight baseline stays closed without spawning', async (t) => {
+    const clean = harness(t);
+    scripted(clean, [incompleteScan(), incompleteScan()]);
+    await assert.rejects(clean.run(), { code: RETRY });
+    await assert.rejects(clean.run(), { code: RETRY });
+    assert.deepEqual(await clean.runner.shutdown(), { ok: true });
+    await assert.rejects(clean.run(), { code: RECOVERY });
+    assert.equal(clean.children.length, 0);
+
+    for (const result of [incompleteScan(), undefined]) {
+        const h = harness(t);
+        let release;
+        const scan = h.observer.scan;
+        h.observer.scan = () => new Promise((resolve) => { release = () => resolve(result || scan()); });
+        const pending = h.run(); await flush();
+        const shutdown = h.runner.shutdown();
+        await assert.rejects(pending, { code: 'PLOINKY_MARKETPLACE_REPOSITORY_REQUEST_CLOSED' });
+        assert.deepEqual(await shutdown, { ok: true });
+        release(); await flush();
+        assert.equal(h.children.length, 0, 'a baseline that settles after shutdown cannot spawn');
+        assert.equal(h.runner.snapshot().accepting, false);
+        assert.equal(h.runner.snapshot().rescanRequired, false);
+        await assert.rejects(h.run(), { code: RECOVERY });
+    }
+});
+
+test('a retryable failure followed by a real latch reports the latch as the first cause', async (t) => {
+    const h = harness(t);
+    scripted(h, [incompleteScan()]);
+    await assert.rejects(h.run(), { code: RETRY });
+    const pending = h.run(); await flush();
+    const [child] = h.children;
+    child.closed = true; child.emit('close', 1, null);
+    await h.advance(8_000);
+    await assert.rejects(pending, { code: RECOVERY });
+    const first = h.runner.diagnostics().firstCause;
+    assert.equal(first.phase, 'exit');
+    assert.equal(first.reason, 'pre-hello-exit');
+    assert.equal(h.runner.snapshot().accepting, false);
+    assert.equal(h.runner.snapshot().recoveryDebt, true);
 });
 
 test('diagnostic faults and floods carry no authority; strict control errors still cancel under a stalled sink', async (t) => {
