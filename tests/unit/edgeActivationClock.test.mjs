@@ -21,6 +21,7 @@ import { RUNNING_DIR } from '../../cli/utils/config.js';
 import { WORKSPACE_MUTATION_LEASE_PATH, WORKSPACE_START_LOCK_PATH } from '../../cli/utils/runtime/maintenanceLocks.js';
 import { resolveEdgeGenerationPaths } from '../../cli/sandbox/edgeGeneration.js';
 import { makeWorld } from './hardwareAvailabilityResolverFixtures.mjs';
+import { resolveEdgeRoutePlan } from '../../cli/server/edgeRoutePlan.js';
 
 const TOKEN = /^[A-Za-z0-9_-]{12}\.[1-9][0-9]{0,15}$/;
 const GEN_A = `sha256:${'a'.repeat(64)}`;
@@ -133,6 +134,34 @@ test('R-A6: a real identical-sources re-apply keeps the generation id but gets a
     for (const secret of [before.activationId, after.activationId]) {
         assert.equal(JSON.stringify([first, second]).includes(secret), false, 'the activation id is never emitted');
     }
+});
+
+test('the route planner starts the clock on the first request that captures the active generation', async (t) => {
+    t.mock.method(console, 'error', () => {});
+    t.mock.method(console, 'log', () => {});
+    const world = makeWorld(t);
+    const req = { method: 'GET', url: '/alpha/public.html', headers: { host: '127.0.0.1:18080' } };
+
+    __testables.reset();
+    const plan = resolveEdgeRoutePlan({ req, listener: 'public' });
+    assert.equal(typeof plan.lease?.activationId, 'string');
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    const aged = observeEdgeActivation(world.lease());
+    assert.equal(aged.activation.split('.')[1], '1', 'the planner created the slot');
+    assert.ok(aged.activeForMs >= 30, `age counts from the planned request (${aged.activeForMs})`);
+
+    // A denied request still started the clock: the capture happened first.
+    __testables.reset();
+    resolveEdgeRoutePlan({ req: { ...req, headers: {} }, listener: 'public' });
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.ok(observeEdgeActivation(world.lease()).activeForMs >= 30);
+
+    // An authority observation lease never touches the slot.
+    __testables.reset();
+    const observed = resolveEdgeRoutePlan({ req, listener: 'public', authorityObservationGeneration: world.selection().generation });
+    assert.equal(observed.lease?.id, world.selection().generation, 'the observation lease was captured');
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.equal(observeEdgeActivation(world.lease()).activeForMs, 0);
 });
 
 test('R-A9: a fresh module instance (a Router restart) uses a different token prefix', async () => {
