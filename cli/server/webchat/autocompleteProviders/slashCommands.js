@@ -17,10 +17,29 @@ function waitForRetry(delayMs) {
     return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
-function catalogLoadError(message, { retryable = true } = {}) {
+// A catalog the agent answered but could not be understood (tool isError,
+// unparsable text) will not fix itself the way a starting agent does, so it is
+// tried at most this many times in total.
+const MALFORMED_CATALOG_MAX_ATTEMPTS = 2;
+
+function catalogLoadError(message, { retryable = true, maxAttempts = null, sessionInvalid = false } = {}) {
     const error = new Error(message);
     error.retryable = retryable;
+    if (maxAttempts) error.maxAttempts = maxAttempts;
+    if (sessionInvalid) error.sessionInvalid = true;
     return error;
+}
+
+function malformedCatalogError(message) {
+    return catalogLoadError(message, { maxAttempts: MALFORMED_CATALOG_MAX_ATTEMPTS });
+}
+
+// The MCP session is gone (agent restarted, session expired); the next attempt
+// must initialize again instead of reusing it.
+function responseIsSessionFailure(response, body = null) {
+    return response?.status === 404
+        || body?.error?.code === -32001
+        || (response?.status === 400 && /session/i.test(String(body?.error?.message || '')));
 }
 
 function responseIsAccessDenied(response, body = null) {
@@ -34,6 +53,7 @@ function responseIsAccessDenied(response, body = null) {
 function responseFailure(stage, response, body = null) {
     return catalogLoadError(`Slash command catalog ${stage} failed.`, {
         retryable: !responseIsAccessDenied(response, body),
+        sessionInvalid: responseIsSessionFailure(response, body),
     });
 }
 
@@ -434,16 +454,28 @@ async function fetchStructuredCatalog(agentName, mcpEndpoint, sessionId, tools, 
             }
         })
     });
-    if (!callRes.ok) throw responseFailure('tool call', callRes);
+    if (!callRes.ok) {
+        const failureBody = await callRes.clone().json().catch(() => null);
+        throw responseFailure('tool call', callRes, failureBody);
+    }
     const callBody = await callRes.json().catch(() => null);
     if (callBody?.error) throw responseFailure('tool call', callRes, callBody);
+    const result = callBody?.result?.result || callBody?.result;
     const content = callBody?.result?.content || callBody?.result?.result?.content;
-    if (!Array.isArray(content)) throw responseFailure('tool response', callRes, callBody);
+    if (!Array.isArray(content)) throw malformedCatalogError('Slash command catalog tool response failed.');
+    if (result?.isError === true || callBody?.result?.isError === true) {
+        throw malformedCatalogError('Slash command catalog tool reported an error.');
+    }
 
     const textPart = content.find((entry) => entry?.type === 'text' && typeof entry.text === 'string');
-    if (!textPart) throw responseFailure('tool response', callRes, callBody);
+    if (!textPart) throw malformedCatalogError('Slash command catalog tool response failed.');
 
-    const parsed = JSON.parse(textPart.text);
+    let parsed;
+    try {
+        parsed = JSON.parse(textPart.text);
+    } catch (_) {
+        throw malformedCatalogError('Slash command catalog tool response was not JSON.');
+    }
     if (!parsed || parsed.type !== 'achilles-slash-command-catalog' || !Array.isArray(parsed.commands)) {
         return [];
     }
@@ -486,17 +518,34 @@ async function fetchStructuredCatalog(agentName, mcpEndpoint, sessionId, tools, 
         .filter(Boolean);
 }
 
-async function fetchCommandsFromAgent(agentName, dlog, extraArguments = {}) {
+// `session` is owned by the caller and outlives a single attempt: an MCP
+// session that was initialized once is reused by later attempts until the
+// agent reports it invalid.
+async function fetchCommandsFromAgent(agentName, dlog, extraArguments = {}, session = { id: null }) {
     if (!agentName) return [];
     const mcpEndpoint = `/${agentName}/mcp`;
-    const sessionId = await callMcpInitialize(agentName, mcpEndpoint);
+    if (!session.id) {
+        session.id = await callMcpInitialize(agentName, mcpEndpoint);
+    }
+    const sessionId = session.id;
+    try {
+        return await fetchCommandsWithSession(agentName, dlog, extraArguments, mcpEndpoint, sessionId);
+    } catch (err) {
+        if (err?.sessionInvalid && session.id === sessionId) session.id = null;
+        throw err;
+    }
+}
 
+async function fetchCommandsWithSession(agentName, dlog, extraArguments, mcpEndpoint, sessionId) {
     const toolsRes = await fetchAgentMcp(agentName, mcpEndpoint, {
         method: 'POST',
         headers: buildMcpHeaders(sessionId),
         body: JSON.stringify({ jsonrpc: '2.0', id: 'wc-tools-1', method: 'tools/list' })
     });
-    if (!toolsRes.ok) throw responseFailure('tool listing', toolsRes);
+    if (!toolsRes.ok) {
+        const failureBody = await toolsRes.clone().json().catch(() => null);
+        throw responseFailure('tool listing', toolsRes, failureBody);
+    }
 
     const toolsBody = await toolsRes.json().catch(() => null);
     if (!toolsBody || !toolsBody.result || !Array.isArray(toolsBody.result.tools)) {
@@ -517,6 +566,7 @@ async function fetchCommandsFromAgent(agentName, dlog, extraArguments = {}) {
             return structured.sort((a, b) => a.name.localeCompare(b.name));
         }
     } catch (err) {
+        if (err?.sessionInvalid) throw err;
         structuredCatalogError = err;
         dlog?.('SlashCommandsProvider: structured catalog parse failed, falling back', err?.message || err);
     }
@@ -548,7 +598,8 @@ export async function loadSlashCommandsWithRetry(loadCommands, {
             return await loadCommands();
         } catch (error) {
             const retryable = error?.retryable !== false;
-            if (!retryable || attempt >= delays.length) {
+            const attemptLimit = Number.isInteger(error?.maxAttempts) ? error.maxAttempts : Infinity;
+            if (!retryable || attempt + 1 >= attemptLimit || attempt >= delays.length) {
                 dlog?.('SlashCommandsProvider: catalog loading stopped', error?.message || error);
                 return [];
             }
@@ -626,8 +677,10 @@ export function createSlashCommandsProvider({
         if (refreshPromise && refreshKey === key) return refreshPromise;
         refreshKey = key;
         commands = [];
+        // One MCP session per refresh, shared by all of its attempts.
+        const session = { id: null };
         const pending = loadSlashCommandsWithRetry(
-            () => fetchCommandsFromAgent(agentName, dlog, args),
+            () => fetchCommandsFromAgent(agentName, dlog, args, session),
             { retryDelays, wait, dlog },
         ).then((loadedCommands) => {
             if (refreshPromise !== pending) return commands;

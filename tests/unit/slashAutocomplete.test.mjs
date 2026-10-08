@@ -616,3 +616,135 @@ test('buildSuggestions supports commands that have both subcommands and argument
         '/update admin-flow '
     ]);
 });
+
+function mcpHarness({ onToolsCall, onToolsList } = {}) {
+    const calls = [];
+    let sessions = 0;
+    const fetchImpl = async (url, options = {}) => {
+        const parsedUrl = new URL(url, 'http://localhost');
+        if (parsedUrl.pathname === '/auth/token') {
+            return Response.json({
+                browserMutation: { csrfToken: 'proof', routeKey: 'achilles-cli', origin: 'http://localhost' },
+            });
+        }
+        const payload = JSON.parse(options.body || '{}');
+        const sessionHeader = new Headers(options.headers).get('mcp-session-id');
+        calls.push({ method: payload.method, session: sessionHeader });
+        if (payload.method === 'initialize') {
+            sessions += 1;
+            return new Response(JSON.stringify({
+                jsonrpc: '2.0', id: payload.id, result: { protocolVersion: '2024-11-05', capabilities: {} },
+            }), { status: 200, headers: { 'mcp-session-id': `session-${sessions}` } });
+        }
+        if (payload.method === 'notifications/initialized') return new Response(null, { status: 202 });
+        if (payload.method === 'tools/list') {
+            if (onToolsList) { const r = onToolsList({ sessionHeader, calls }); if (r) return r; }
+            return Response.json({ jsonrpc: '2.0', id: payload.id, result: { tools: [{ name: 'list_achilles_cli_commands' }] } });
+        }
+        if (payload.method === 'tools/call') return onToolsCall({ payload, sessionHeader, calls });
+        throw new Error(`Unexpected MCP method: ${payload.method}`);
+    };
+    return { calls, fetchImpl };
+}
+
+async function withMcp(harness, fn) {
+    const originalFetch = globalThis.fetch;
+    const originalLocation = globalThis.location;
+    globalThis.fetch = harness.fetchImpl;
+    globalThis.location = new URL('http://localhost/');
+    try {
+        return await fn();
+    } finally {
+        globalThis.fetch = originalFetch;
+        if (originalLocation === undefined) delete globalThis.location;
+        else globalThis.location = originalLocation;
+    }
+}
+
+const catalogResult = (payload) => Response.json({
+    jsonrpc: '2.0', id: payload.id,
+    result: { content: [{ type: 'text', text: JSON.stringify({
+        type: 'achilles-slash-command-catalog', commands: [{ name: '/model' }],
+    }) }] },
+});
+
+test('slash provider stops after two attempts when the catalog tool reports isError', async () => {
+    const harness = mcpHarness({
+        onToolsCall: ({ payload }) => Response.json({
+            jsonrpc: '2.0', id: payload.id,
+            result: { isError: true, content: [{ type: 'text', text: 'Error: catalog backend not ready' }] },
+        }),
+    });
+    const waits = [];
+    await withMcp(harness, async () => {
+        const provider = createSlashCommandsProvider({ agentName: 'achilles-cli', wait: async (ms) => waits.push(ms) });
+        await provider.refresh();
+    });
+    const count = (method) => harness.calls.filter((call) => call.method === method).length;
+    assert.equal(count('tools/call'), 2);
+    assert.equal(count('initialize'), 1, 'the MCP session is reused across attempts');
+    assert.equal(count('notifications/initialized'), 1);
+    assert.deepEqual(waits, [250]);
+});
+
+test('slash provider stops after two attempts on an unparsable catalog text', async () => {
+    const harness = mcpHarness({
+        onToolsCall: ({ payload }) => Response.json({
+            jsonrpc: '2.0', id: payload.id, result: { content: [{ type: 'text', text: '<html>oops' }] },
+        }),
+    });
+    await withMcp(harness, async () => {
+        const provider = createSlashCommandsProvider({ agentName: 'achilles-cli', wait: async () => {} });
+        assert.deepEqual(await provider.refresh(), []);
+    });
+    assert.equal(harness.calls.filter((call) => call.method === 'tools/call').length, 2);
+});
+
+test('slash provider recovers from one isError and keeps the session', async () => {
+    let n = 0;
+    const harness = mcpHarness({
+        onToolsCall: ({ payload }) => (++n === 1
+            ? Response.json({ jsonrpc: '2.0', id: payload.id, result: { isError: true, content: [{ type: 'text', text: 'warming up' }] } })
+            : catalogResult(payload)),
+    });
+    await withMcp(harness, async () => {
+        const provider = createSlashCommandsProvider({ agentName: 'achilles-cli', wait: async () => {} });
+        const commands = await provider.refresh();
+        assert.deepEqual(commands.map((c) => c.name), ['/model']);
+    });
+    assert.equal(harness.calls.filter((call) => call.method === 'initialize').length, 1);
+});
+
+test('slash provider keeps the full retry schedule for transport failures while reusing the session', async () => {
+    let n = 0;
+    const harness = mcpHarness({
+        onToolsCall: ({ payload }) => (++n < 4
+            ? new Response('bad gateway', { status: 502 })
+            : catalogResult(payload)),
+    });
+    const waits = [];
+    await withMcp(harness, async () => {
+        const provider = createSlashCommandsProvider({ agentName: 'achilles-cli', wait: async (ms) => waits.push(ms) });
+        const commands = await provider.refresh();
+        assert.deepEqual(commands.map((c) => c.name), ['/model']);
+    });
+    assert.deepEqual(waits, [250, 500, 1000]);
+    assert.equal(harness.calls.filter((call) => call.method === 'initialize').length, 1);
+});
+
+test('slash provider re-initializes only when the MCP session is reported invalid', async () => {
+    const harness = mcpHarness({
+        onToolsList: ({ sessionHeader }) => (sessionHeader === 'session-1'
+            ? Response.json({ jsonrpc: '2.0', id: null, error: { code: -32001, message: 'Session not found' } }, { status: 404 })
+            : null),
+        onToolsCall: ({ payload }) => catalogResult(payload),
+    });
+    await withMcp(harness, async () => {
+        const provider = createSlashCommandsProvider({ agentName: 'achilles-cli', wait: async () => {} });
+        const commands = await provider.refresh();
+        assert.deepEqual(commands.map((c) => c.name), ['/model']);
+    });
+    assert.equal(harness.calls.filter((call) => call.method === 'initialize').length, 2);
+    const toolsCall = harness.calls.find((call) => call.method === 'tools/call');
+    assert.equal(toolsCall.session, 'session-2');
+});
