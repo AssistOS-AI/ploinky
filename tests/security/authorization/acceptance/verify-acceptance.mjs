@@ -18,7 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { runVerdict } from '../core.mjs';
 import { routerProbes } from '../router-probes.mjs';
 import { routerInventory } from '../router-inventory.mjs';
-import { agentInventory } from '../agent-inventory.mjs';
+import { agentInventory, inventoryBaseline } from '../agent-inventory.mjs';
 import { agentDiscoveryMethods } from '../agent-probes.mjs';
 import { ACCEPTANCE_DIR, policyDigest } from './digest.mjs';
 import { loadPins } from './pins.mjs';
@@ -148,7 +148,7 @@ function matchGapEvidence(entry, gap, report, checks) {
     }
 }
 
-export function evaluateScopedAcceptance({ report, exitCode, mandatory, expectedGaps, expectedRuntimes, policy, offline = [], pins, pinsSha256, acceptanceDigest }) {
+export function evaluateScopedAcceptance({ report, exitCode, mandatory, expectedGaps, expectedRuntimes, policy, offline = [], pins, pinsSha256, acceptanceDigest, baseline = inventoryBaseline }) {
     const reasons = [];
     const reject = (code, detail = '') => reasons.push(`${code}${detail ? `: ${detail}` : ''}`);
     if (!report || typeof report !== 'object') return { decision: 'REJECT', reasons: ['REPORT_MISSING'] };
@@ -192,6 +192,11 @@ export function evaluateScopedAcceptance({ report, exitCode, mandatory, expected
         const want = pins.repositories.map(r => key(r.name, r.commit)).sort();
         const got = (d.repositories || []).map(r => key(r.name, r.commit)).sort();
         if (JSON.stringify(want) !== JSON.stringify(got)) reject('DEPLOYMENT_BINDING', 'repository commits differ from pins');
+        // The checked agent inventory must describe the deployed sources.
+        for (const repo of baseline.repositories.filter(r => r.name !== 'ploinky')) {
+            const pin = pins.repositories.find(r => r.name === repo.name);
+            if (!pin || pin.commit !== repo.commit) reject('INVENTORY_BASELINE_BINDING', `${repo.name} inventory revision differs from pins`);
+        }
     }
 
     // Principals.

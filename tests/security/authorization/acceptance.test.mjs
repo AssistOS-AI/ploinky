@@ -20,6 +20,7 @@ import { runMarketplaceAdmissionProbes, runTemplateProbes, marketplaceProjection
 import { runWebchatProbes } from './webchat-probes.mjs';
 import { discoverAgentMcp } from './agent-probes.mjs';
 import { BOX_DATA_MOUNTS } from '../../../ploinky-box/constants.mjs';
+import { inventoryBaseline } from './agent-inventory.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const inputs = loadAcceptanceInputs();
@@ -35,7 +36,7 @@ function makePins() {
         ploinky: { commit: SHA1, branch: 'test/authz-live-acceptance', upstream: 'origin/test/authz-live-acceptance' },
         ploinkyCheckout: '/candidate/ploinky',
         workspace: WS,
-        repositories: expectedRuntimes.inventoryRepositories.map((name, i) => ({ name, path: `.ploinky/repos/${name}`, commit: String(i).padStart(40, 'b'), branch: 'main', upstream: 'origin/main' })),
+        repositories: expectedRuntimes.inventoryRepositories.map(name => ({ name, path: `.ploinky/repos/${name}`, commit: inventoryBaseline.repositories.find(r => r.name === name).commit, branch: 'main', upstream: 'origin/main' })),
         policyDigest: inputs.acceptanceDigest,
         box: { id: 'c'.repeat(64), name: 'ploinky-box-testExplorerFresh-123456789abc', startedAt: '2026-10-09T00:00:00.000Z', imageId: `sha256:${'d'.repeat(64)}`, imageDigest: `sha256:${'e'.repeat(64)}` },
         agentlib: { mode: 'image' },
@@ -223,6 +224,7 @@ test('REJECT: run health, pins binding, principals and offline evidence', () => 
         [r => { r.pinsSha256 = '0'.repeat(64); }, 'PINS_BINDING'],
         [r => { r.acceptanceDigest = '0'.repeat(64); }, 'POLICY_DIGEST_BINDING'],
         [r => { r.report.deployment.boxId = '9'.repeat(64); }, 'DEPLOYMENT_BINDING'],
+        [r => { r.baseline = { repositories: [{ name: 'AchillesIDE', commit: '7'.repeat(40) }] }; }, 'INVENTORY_BASELINE_BINDING'],
         [r => { r.report.principals[0].roles = ['user']; }, 'PRINCIPAL_ROLE'],
         [r => { r.report.principals.pop(); }, 'PRINCIPALS_SET'],
         [r => { r.offline[0].sidecar.commit = '1'.repeat(40); }, 'OFFLINE_COMMIT'],
@@ -460,9 +462,10 @@ function fakeCtx(handler) {
     const report = { checks: [], gaps: [], requests: [] };
     return {
         report, principals: { admin: { id: 'a' }, userA: { id: 'ua' }, userB: { id: 'ub' } }, secrets: new Set(), prefix: 'authz-test',
-        clients: {}, guard: async () => ({}), cleanup: () => {},
+        clients: {}, sequence: [], cleanup: () => {},
+        async guard() { this.sequence.push('guard'); return {}; },
         recordGap: (id, reason, evidence) => report.gaps.push({ id, evidence: sanitizeGapEvidence(evidence) }),
-        request: async (actor, options) => { report.requests.push({ actor, ...options }); return handler(actor, options); },
+        async request(actor, options) { if (String(options.path).startsWith('/webchat/stream')) this.sequence.push('stream'); report.requests.push({ actor, ...options }); return handler(actor, options); },
         async check(id, fn) { try { await fn(); report.checks.push({ id, status: 'PASS' }); } catch (e) { report.checks.push({ id, status: e?.code === 'ERR_ASSERTION' ? 'FAIL' : 'ERROR' }); } },
     };
 }
@@ -536,7 +539,11 @@ test('U6 WebChat probe: no isolation credit without own streams; a marker crossi
     const shared = [];
     const stream = () => ({ status: 200, contentType: 'text/event-stream', events: () => [...shared], waitFor: async pred => shared.find(pred) || null, close() {} });
     const ctx = fakeCtx((actor, { body }) => { if (body?.text) { shared.push({ event: 'user-message', data: JSON.stringify({ text: body.text }) }, { event: 'output', data: `unknown command ${body.text.slice(1)}` }); } return { status: 204, text: '', headers: {} }; });
-    await runWebchatProbes(ctx, { timing: { waitMs: 20, settleMs: 1, removalMs: 50, pollMs: 5 }, openStream: async () => stream(), inspectProcesses: async () => [{ pid: 1, args: '', environ: 'X=1' }, { pid: 2, args: '', environ: 'X=1' }] });
+    await runWebchatProbes(ctx, { timing: { waitMs: 20, settleMs: 1, removalMs: 50, pollMs: 5 }, openStream: async () => { ctx.sequence.push('stream'); return stream(); }, inspectProcesses: async () => [{ pid: 1, args: '', environ: 'X=1' }, { pid: 2, args: '', environ: 'X=1' }] });
     assert.equal(ctx.report.checks.find(c => c.id === 'u6:webchat-marker-isolation:userA-to-userB').status, 'FAIL');
+    // Every GET /stream (owned opens and the denial probes) is immediately preceded by the ownership guard.
+    const streams = ctx.sequence.map((e, i) => [e, ctx.sequence[i - 1]]).filter(([e]) => e === 'stream');
+    assert.ok(streams.length >= 9, `expected owned and denial stream requests, saw ${streams.length}`);
+    assert.ok(streams.every(([, previous]) => previous === 'guard'), 'a GET /stream was not guarded');
     assert.equal(ctx.report.checks.find(c => c.id === 'u6:webchat-own-marker:userA').status, 'PASS');
 });

@@ -138,7 +138,9 @@ export async function runWebchatProbes(ctx, { openStream = openEventStream, insp
     const opened = new Set();
     // Armed before any runtime exists: close every stream this probe opened.
     ctx.cleanup(async () => { for (const s of streams) s.close(); });
+    // Every GET /stream creates runtime state, so each one passes the ownership guard first.
     const open = async (actor, value, extra) => {
+        await ctx.guard();
         const handle = await openStream(ctx, actor, `/webchat/stream?${query(value, extra)}`);
         streams.push(handle);
         return handle;
@@ -265,6 +267,7 @@ export async function runWebchatProbes(ctx, { openStream = openEventStream, insp
 
     for (const actor of ['anonymous', 'selfRegistered']) {
         await ctx.check(`u6:webchat-deny:${actor}:stream`, async () => {
+            await ctx.guard();
             const response = await ctx.request(actor, { path: `/webchat/stream?${query()}`, headers: { accept: 'application/json' }, stream: true });
             assert.notEqual(response.status, 409, 'A 409 is not isolation evidence');
             assertDenied(response);
