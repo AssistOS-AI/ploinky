@@ -1028,16 +1028,25 @@ export function scheduleDisconnectedTabCleanup(tab, tabId, session, graceMs = ST
     tab.cleanupTimer.unref?.();
 }
 
+// A key can be reused by a replacement runtime before the disposed runtime's
+// process reports close (for example after per-user cap eviction). Remove an
+// entry only while it still refers to the runtime being disposed.
+function deleteIfCurrent(map, key, value) {
+    if (map instanceof Map && map.get(key) === value) map.delete(key);
+}
+
+function unregisterDisposedTab(tab, tabId, session) {
+    deleteIfCurrent(session?.runtimes, tabId, tab);
+    deleteIfCurrent(session?.tabs, tabId, tab);
+}
+
 export function disposeTab(tab, tabId, session) {
     if (!tab) {
         return;
     }
     const pid = tab.tty?.pid || tab.pid;
     if (tab.disposed) {
-        if (session?.runtimes instanceof Map) session.runtimes.delete(tabId);
-        if (session?.tabs instanceof Map) {
-            session.tabs.delete(tabId);
-        }
+        unregisterDisposedTab(tab, tabId, session);
         return;
     }
     tab.disposed = true;
@@ -1085,9 +1094,6 @@ export function disposeTab(tab, tabId, session) {
     }
     tab.sseRes = null;
 
-    if (session?.runtimes instanceof Map) session.runtimes.delete(tabId);
-    if (session?.tabs instanceof Map) {
-        session.tabs.delete(tabId);
-    }
+    unregisterDisposedTab(tab, tabId, session);
 
 }
