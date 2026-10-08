@@ -22,7 +22,8 @@ function guardError(message, context = {}) {
 // master key and the stores it encrypts live under `.ploinky/data`. Agents
 // never see it, even through a broad workspace bind; the rest of the controller
 // root (`.ploinky`, including the dependency store) is pinned read-only by
-// `controllerGuardMounts`, which does not make it confidential.
+// `controllerGuardMounts`, which does not make it confidential. Existing writable
+// workspace grants retain a separate writable projection of `.ploinky/repos`.
 export function protectedControllerStateRoots(workspaceRoot = PLOINKY_WORKSPACE_ROOT) {
     const root = path.resolve(workspaceRoot);
     return Object.freeze([
@@ -108,6 +109,10 @@ function runtimeDescendant(target, relativeHostPath) {
     return normalizeRuntimeMountTarget(path.posix.join(normalizeRuntimeMountTarget(target), ...segments));
 }
 
+function runtimePathWithin(candidate, parent) {
+    return candidate === parent || candidate.startsWith(parent === '/' ? '/' : `${parent}/`);
+}
+
 function protectedRootSymlinks(target) {
     const links = [];
     let remaining = path.resolve(target).split(path.sep).filter(Boolean);
@@ -179,6 +184,47 @@ export function controllerGuardTargets(bindings, {
     return Array.from(targets.values()).sort((left, right) => left.target.localeCompare(right.target));
 }
 
+function writableRepositoryMounts(bindings, workspaceRoot) {
+    const workspace = projectedCanonicalPath(workspaceRoot);
+    const writableWorkspaces = bindings.filter(binding => (
+        !binding.readOnly && isPathWithin(workspace, binding.source)
+    ));
+    if (!writableWorkspaces.length) return [];
+
+    const repositories = path.join(projectedCanonicalPath(path.join(workspaceRoot, '.ploinky')), 'repos');
+    let stat;
+    try { stat = fs.lstatSync(repositories); } catch (error) {
+        if (error?.code === 'ENOENT') return [];
+        throw error;
+    }
+    if (stat.isSymbolicLink() || !stat.isDirectory() || !isPathWithin(repositories, workspace)) {
+        throw guardError('writable repository root must be a physical directory inside the workspace', { repositories });
+    }
+    for (const protectedRoot of protectedControllerStateRoots(workspaceRoot)) {
+        const protectedPath = projectedCanonicalPath(protectedRoot.hostPath);
+        if (isPathWithin(protectedPath, repositories) || isPathWithin(repositories, protectedPath)) {
+            throw guardError('writable repository root overlaps protected controller state', { repositories, protectedPath });
+        }
+    }
+
+    const mounts = new Map();
+    for (const binding of writableWorkspaces) {
+        const target = runtimeDescendant(binding.target, path.relative(binding.source, repositories));
+        // Never override an explicit read-only grant at this projection. Nested
+        // code/dependency grants remain separate mounts below this parent.
+        if (bindings.some(entry => entry.readOnly
+            && runtimePathWithin(target, entry.target)
+            && runtimePathWithin(entry.target, binding.target))) continue;
+        const existing = bindings.filter(entry => entry.target === target);
+        if (existing.some(entry => entry.source !== repositories)) {
+            throw guardError(`repository target '${target}' conflicts with a bind source`);
+        }
+        if (existing.length) continue;
+        mounts.set(target, { source: repositories, target, readOnly: false });
+    }
+    return Array.from(mounts.values()).sort((left, right) => left.target.localeCompare(right.target));
+}
+
 export function controllerGuardMounts(targets, options = {}) {
     const bindings = (options.bindings || []).map(binding => ({
         source: projectedCanonicalPath(binding.hostPath || binding.source),
@@ -186,6 +232,7 @@ export function controllerGuardMounts(targets, options = {}) {
         readOnly: binding.readOnly === true,
     }));
     if (!targets.length && !bindings.length) return [];
+    const repositories = writableRepositoryMounts(bindings, options.workspaceRoot || PLOINKY_WORKSPACE_ROOT);
     const sources = ensureControllerGuardSources(options);
     const parents = new Map();
     const children = [];
@@ -254,6 +301,7 @@ export function controllerGuardMounts(targets, options = {}) {
     }
     return [
         ...Array.from(parents.values()).sort((left, right) => left.target.split('/').length - right.target.split('/').length || left.target.localeCompare(right.target)),
+        ...repositories,
         ...children,
     ];
 }
