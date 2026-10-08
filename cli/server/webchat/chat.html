@@ -13,21 +13,23 @@
       data-workspace-root="__WORKSPACE_ROOT__"
       data-workspace-base="__WORKSPACE_BASE__">
 <div class="wa-header">
-    <div class="wa-header-avatar">
-        <span id="avatarInitial"></span>
+    <div class="wa-header-presence">
+        <div class="wa-header-avatar offline" id="headerAvatar" aria-hidden="true">
+            <span id="avatarInitial"></span>
+        </div>
+        <div class="wa-header-status" id="status" role="status" aria-live="polite" aria-atomic="true">
+            <span id="statusText">disconnected</span>
+        </div>
     </div>
     <div class="wa-header-info">
         <div class="wa-header-title-row">
             <div class="wa-header-title" id="titleBar"></div>
-            <span class="wa-runtime-model" id="runtimeModel" hidden></span>
-        </div>
-        <div class="wa-header-meta">
-            <div class="wa-header-status" id="status">
-                <span class="wa-status-dot offline"></span>
-                <span id="statusText">disconnected</span>
+            <div class="wa-runtime-model-row" id="runtimeModelRow" hidden>
+                <span class="wa-runtime-model-label">LLM model:</span>
+                <span class="wa-runtime-model" id="runtimeModel" hidden></span>
             </div>
-            <div class="wa-header-workdir" id="headerWorkdir"></div>
         </div>
+        <a class="wa-header-workdir" id="headerWorkdir" target="_blank" rel="noopener noreferrer"></a>
     </div>
     <div class="wa-header-actions" id="headerActions">
         <button class="wa-session-btn wa-responsive-header-action" id="sessionsBtn" type="button"

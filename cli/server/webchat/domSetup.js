@@ -1,3 +1,19 @@
+export function buildWorkspaceDirectoryUrl(workdir, workspaceRoot) {
+    if (typeof workdir !== 'string' || typeof workspaceRoot !== 'string'
+        || !workspaceRoot.startsWith('/') || workspaceRoot === '/') return null;
+    const root = workspaceRoot.replace(/\/+$/, '');
+    if (workdir !== root && !workdir.startsWith(`${root}/`)) return null;
+    if (/[\0\r\n\\]/.test(workdir)
+        || workdir.split('/').slice(1).some((segment) => !segment || segment === '.' || segment === '..')) return null;
+    const relative = workdir === root ? '' : workdir.slice(root.length + 1);
+    try {
+        // The Router redirects the workspace entrypoint to its configured UI.
+        return `/#file-exp/${relative.split('/').map(encodeURIComponent).join('/')}`;
+    } catch (_) {
+        return null;
+    }
+}
+
 function createBrowserId() {
     if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
     // Plain HTTP on a bound LAN interface has getRandomValues, but does not
@@ -17,9 +33,11 @@ export function initDom() {
 
     const titleBar = document.getElementById('titleBar');
     const runtimeModel = document.getElementById('runtimeModel');
+    const runtimeModelRow = document.getElementById('runtimeModelRow');
     const avatarInitial = document.getElementById('avatarInitial');
     const statusEl = document.getElementById('statusText');
-    const statusDot = document.querySelector('.wa-status-dot');
+    // Reuse connection-state updates to color the avatar rather than a separate dot.
+    const statusDot = document.getElementById('headerAvatar');
     const themeSelect = document.getElementById('themeSelect');
     const banner = document.getElementById('connBanner');
     const bannerText = document.getElementById('bannerText');
@@ -78,7 +96,7 @@ export function initDom() {
     const displayName = (body.dataset.title || '').trim();
     const basePath = (body.dataset.base || '').replace(/\/$/, '') || '';
     const agentQuery = (body.dataset.agentQuery || '').trim();
-    const workdir = (body.dataset.workdir || '').trim();
+    const workdir = body.dataset.workdir || '';
     // The trusted workspace root admits absolute file references beneath it.
     const workspaceRoot = body.dataset.workspaceRoot || '';
     let workspaceBase = '';
@@ -116,6 +134,12 @@ export function initDom() {
     const headerWorkdir = document.getElementById('headerWorkdir');
     if (headerWorkdir && workdir) {
         headerWorkdir.textContent = workdir;
+        const directoryUrl = buildWorkspaceDirectoryUrl(workdir, workspaceRoot);
+        headerWorkdir.title = directoryUrl ? `Open in Explorer: ${workdir}` : workdir;
+        if (directoryUrl) {
+            headerWorkdir.href = directoryUrl;
+            headerWorkdir.setAttribute('aria-label', `Open working directory in Explorer: ${workdir} (new tab)`);
+        }
     }
     document.title = `${appTitle} · WebChat`;
     if (avatarInitial) {
@@ -138,6 +162,7 @@ export function initDom() {
         runtimeModel.textContent = label;
         runtimeModel.title = model ? `Selected model: ${label}` : '';
         runtimeModel.hidden = !model;
+        if (runtimeModelRow) runtimeModelRow.hidden = !model;
     }
 
     function showBanner(text, cls) {

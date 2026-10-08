@@ -40,16 +40,26 @@ test('WebChat keeps desktop actions in the header and moves them into the mobile
     const css = read('cli/server/webchat/webchat.css');
     const header = template.slice(template.indexOf('<div class="wa-header">'), template.indexOf('</div>\n\n<div class="wa-tasks-backdrop"'));
 
-    for (const id of ['titleBar', 'runtimeModel', 'headerWorkdir', 'tasksBtn', 'sessionsBtn', 'settingsBtn', 'logoutBtn']) {
+    for (const id of ['titleBar', 'runtimeModel', 'headerWorkdir', 'sessionsBtn', 'settingsBtn', 'logoutBtn']) {
         assert.match(header, new RegExp(`id="${id}"`));
     }
     assert.match(template, /id="settingsMobileActions"[^>]*hidden/);
     assert.match(template, /id="settingsActionSlot"/);
     assert.match(template, /id="settingsBtn"[^>]*aria-controls="settingsPanel"/s);
     assert.match(client, /createHeaderMenu\(\{ button: settingsBtn, panel: settingsPanel \}\)/);
-    assert.match(client, /createResponsiveHeaderActions\(\{[\s\S]*actions: \[tasksBtn, sessionsBtn, logoutBtn\]/);
-    assert.match(css, /\.wa-header-workdir\s*\{[^}]*position:\s*absolute[^}]*top:\s*50%[^}]*left:\s*50%[^}]*transform:\s*translate\(-50%, -50%\)[^}]*text-align:\s*center/s);
-    assert.match(css, /@media \(max-width: 640px\)[\s\S]*?\.wa-header-workdir\s*\{[^}]*position:\s*static[^}]*transform:\s*none[^}]*text-align:\s*left/s);
+    assert.match(client, /createResponsiveHeaderActions\(\{[\s\S]*actions: \[sessionsBtn, logoutBtn\]/);
+    assert.match(header, /wa-header-title-row[\s\S]*?<a class="wa-header-workdir"[^>]*target="_blank"[^>]*rel="noopener noreferrer"/);
+    const presence = header.slice(header.indexOf('wa-header-presence'), header.indexOf('wa-header-info'));
+    assert.match(presence, /wa-header-avatar offline[^>]*id="headerAvatar"[\s\S]*id="status"/);
+    assert.doesNotMatch(header.slice(header.indexOf('id="headerActions"')), /id="status"/);
+    assert.match(header, /id="runtimeModelRow" hidden[\s\S]*LLM model:[\s\S]*id="runtimeModel"/);
+    assert.match(css, /\.wa-header-title-row\s*\{[^}]*flex-direction:\s*column/s);
+    assert.match(css, /\.wa-header-avatar\.online\s*\{[^}]*background-color:/s);
+    assert.match(css, /\.wa-header-avatar\.offline\s*\{[^}]*background-color:/s);
+    assert.match(header, /id="status"[^>]*role="status"[^>]*aria-live="polite"/);
+    assert.match(css, /\.wa-header-workdir\s*\{[^}]*display:\s*block[^}]*max-width:\s*100%[^}]*text-align:\s*left/s);
+    assert.doesNotMatch(css, /\.wa-header-workdir\s*\{[^}]*position:\s*absolute/s);
+    assert.match(css, /\.wa-header-workdir\[href\]:focus-visible/);
     assert.match(css, /@media \(max-width: 640px\)[\s\S]*?\.wa-settings-panel \.wa-responsive-header-action/);
 });
 
@@ -251,7 +261,7 @@ function browserDomContext(crypto) {
         localStorage: storage(),
         sessionStorage: storage(),
     });
-    vm.runInContext(read('cli/server/webchat/domSetup.js').replace('export function initDom()', 'function initDom()'), context);
+    vm.runInContext(read('cli/server/webchat/domSetup.js').replace(/^export function /gm, 'function '), context);
     return context;
 }
 
