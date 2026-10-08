@@ -271,3 +271,160 @@ test('shutdown while the socket base is being probed leaves no worker behind', a
     assert.deepEqual(loads(), []);
     assert.deepEqual(entries(usable), []);
 });
+
+// A probe-passing base where every worker process exits before it connects
+// (as with connect EACCES in toolWorker.mjs): the base must not be trusted
+// across degradation cycles.
+test('a worker that exits before connecting makes the pool re-probe, and degradation forgets the base', async (t) => {
+    const usable = base(t, 'stale');
+    const netApi = refusingNet([]);
+    const socketDirectories = createToolWorkerSocketDirectories({ bases: () => [usable], netApi });
+    let clock = Date.now();
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'twsd-work-'));
+    const logs = [];
+    const pool = new ToolWorkerPool('fixture', {
+        command: process.execPath, args: [WORKER_FIXTURE], cwd: work, size: 1,
+        env: { FIXTURE_LOADS_LOG: path.join(work, 'loads.log'), FIXTURE_DIE_BEFORE_READY: '1' },
+        log: (line) => logs.push(line), now: () => clock, socketDirectories,
+    });
+    t.after(async () => {
+        await pool.shutdown({ timeoutMs: 5000 });
+        fs.rmSync(work, { recursive: true, force: true });
+    });
+
+    assert.equal((await echo(pool, { fallback: okFallback })).stdout, 'from-spawn-fallback');
+    assert.equal(pool.isDegraded(), true);
+    assert.equal(pool.stats().spawned, 3);
+    assert.equal(netApi.counts.connects, 3, 'every spawn after a worker that never connected probed again');
+    const reprobes = logs.filter((line) => line.includes(`worker exited before connecting to its socket under ${usable}`));
+    assert.equal(reprobes.length, 3, JSON.stringify(logs));
+    assert.equal(socketDirectories.current(), null, 'degradation forgets the remembered base');
+
+    clock += 60_001;
+    assert.equal((await echo(pool, { fallback: okFallback })).stdout, 'from-spawn-fallback');
+    assert.equal(netApi.counts.connects, 6, 'the next window probes again from the start');
+    assert.equal(pool.stats().spawned, 6);
+});
+
+test('a worker that connected and later goes away never makes the pool re-probe', async (t) => {
+    const usable = base(t, 'steady');
+    const netApi = refusingNet([]);
+    const socketDirectories = createToolWorkerSocketDirectories({ bases: () => [usable], netApi });
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'twsd-work-'));
+    const logs = [];
+    const pool = new ToolWorkerPool('fixture', {
+        command: process.execPath, args: [WORKER_FIXTURE], cwd: work, size: 1, maxCallsPerWorker: 1,
+        env: { FIXTURE_LOADS_LOG: path.join(work, 'loads.log') },
+        log: (line) => logs.push(line), socketDirectories,
+    });
+    t.after(async () => {
+        await pool.shutdown({ timeoutMs: 5000 });
+        fs.rmSync(work, { recursive: true, force: true });
+    });
+    for (let index = 0; index < 3; index += 1) {
+        const result = await echo(pool);
+        assert.equal(result.code, 0, result.stderr);
+    }
+    assert.ok(pool.stats().spawned >= 3, 'each call recycled its worker');
+    assert.equal(netApi.counts.connects, 1);
+    assert.equal(socketDirectories.current(), usable);
+    assert.ok(!logs.some((line) => line.includes('probing socket directories again')), JSON.stringify(logs));
+});
+
+// A directories object that records what the pool asks of it.
+function countingDirectories(initial, good) {
+    let remembered = initial;
+    const calls = { invalidate: [], resolve: 0 };
+    return {
+        calls,
+        current: () => remembered,
+        invalidate(entry) {
+            calls.invalidate.push(entry);
+            if (remembered === entry) remembered = null;
+        },
+        resolve() {
+            calls.resolve += 1;
+            remembered = good;
+            return Promise.resolve(good);
+        },
+    };
+}
+
+test('a mkdtemp failure under the remembered base invalidates it and the next spawn re-probes', async (t) => {
+    const good = base(t, 'good');
+    const vanished = path.join(good, 'vanished');
+    const directories = countingDirectories(vanished, good);
+    const { pool, logs } = fixturePool(t, { socketDirectories: directories });
+    const result = await echo(pool);
+    assert.equal(result.code, 0, `${result.stderr} ${JSON.stringify(logs)}`);
+    assert.deepEqual(directories.calls.invalidate, [vanished]);
+    assert.equal(directories.calls.resolve, 1);
+    assert.equal(directories.current(), good);
+    assert.ok(logs.some((line) => /cannot create a worker socket: .*ENOENT/.test(line)), JSON.stringify(logs));
+});
+
+test('a listen error under the remembered base invalidates it and the next spawn re-probes', async (t) => {
+    const good = base(t, 'good');
+    const directories = countingDirectories(good, good);
+    let failures = 1;
+    const netApi = {
+        createServer: (...args) => {
+            const server = net.createServer(...args);
+            if (failures > 0) {
+                failures -= 1;
+                server.listen = () => {
+                    setImmediate(() => server.emit('error', Object.assign(new Error('listen EACCES'), { code: 'EACCES' })));
+                    return server;
+                };
+            }
+            return server;
+        },
+        createConnection: (...args) => net.createConnection(...args),
+    };
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'twsd-work-'));
+    const logs = [];
+    const pool = new ToolWorkerPool('fixture', {
+        command: process.execPath, args: [WORKER_FIXTURE], cwd: work, size: 1,
+        env: { FIXTURE_LOADS_LOG: path.join(work, 'loads.log') },
+        log: (line) => logs.push(line), socketDirectories: directories, netApi,
+    });
+    t.after(async () => {
+        await pool.shutdown({ timeoutMs: 5000 });
+        fs.rmSync(work, { recursive: true, force: true });
+    });
+    const result = await echo(pool);
+    assert.equal(result.code, 0, `${result.stderr} ${JSON.stringify(logs)}`);
+    assert.deepEqual(directories.calls.invalidate, [good]);
+    assert.equal(directories.calls.resolve, 1);
+    assert.ok(logs.some((line) => /worker socket error: listen EACCES/.test(line)), JSON.stringify(logs));
+    assert.deepEqual(entries(good), [], 'the failed socket directory is removed');
+});
+
+test('degradation by workers that connected but died before a call also forgets the remembered base', async (t) => {
+    const usable = base(t, 'connected');
+    const netApi = refusingNet([]);
+    const socketDirectories = createToolWorkerSocketDirectories({ bases: () => [usable], netApi });
+    let clock = Date.now();
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'twsd-work-'));
+    const logs = [];
+    const pool = new ToolWorkerPool('fixture', {
+        command: process.execPath, args: [WORKER_FIXTURE], cwd: work, size: 1,
+        env: { FIXTURE_LOADS_LOG: path.join(work, 'loads.log'), FIXTURE_THROW_AFTER_READY: '1' },
+        log: (line) => logs.push(line), now: () => clock, socketDirectories,
+    });
+    t.after(async () => {
+        await pool.shutdown({ timeoutMs: 5000 });
+        fs.rmSync(work, { recursive: true, force: true });
+    });
+    for (let attempt = 0; attempt < 3 && !pool.isDegraded(); attempt += 1) {
+        await echo(pool, { fallback: okFallback });
+    }
+    assert.equal(pool.isDegraded(), true, JSON.stringify(logs));
+    assert.equal(pool.stats().spawned, 3);
+    assert.equal(netApi.counts.connects, 1, 'workers that connected never forced a re-probe');
+    assert.ok(!logs.some((line) => line.includes('probing socket directories again')), JSON.stringify(logs));
+    assert.equal(socketDirectories.current(), null, 'degradation forgets the remembered base');
+    clock += 60_001;
+    await echo(pool, { fallback: okFallback });
+    assert.equal(netApi.counts.connects, 2, 'the next window probes again');
+});

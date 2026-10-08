@@ -9,6 +9,12 @@
 // worker's end of that socket is close-on-exec and fd 3 is closed after the
 // handshake, so tool children cannot reach the channel.
 //
+// Socket directory. The handshake socket lives under the first base where this
+// process can listen on and connect to a Unix socket: PLOINKY_TOOL_WORKER_SOCKET_DIR
+// (an absolute path) when set, then os.tmpdir(), /dev/shm and /tmp. The chosen
+// base is probed again after a socket there fails, after a worker exits before
+// connecting to it, and after the pool degrades.
+//
 // A call's output is what arrives on the busy worker's stdout/stderr pipes
 // (the handler's writes and those of tool children that inherit fd 1/2), up to
 // the call's random end marker on each stream; the call resolves once its
@@ -332,6 +338,7 @@ export class ToolWorkerPool {
         this.now = typeof options.now === 'function' ? options.now : Date.now;
         this.codeIdentity = typeof options.codeIdentity === 'function' ? options.codeIdentity : null;
         this.socketDirectories = options.socketDirectories || defaultSocketDirectories;
+        this.netApi = options.netApi || net;
 
         this.workers = new Set();
         this.queue = [];
@@ -586,6 +593,7 @@ export class ToolWorkerPool {
     }
 
     openWorkerSocket(worker, base) {
+        worker.socketBase = base;
         try {
             const { dir, socketPath } = createSocketPath(base);
             worker.socketDir = dir;
@@ -596,7 +604,7 @@ export class ToolWorkerPool {
             setImmediate(() => this.abandonStart(worker));
             return;
         }
-        const server = net.createServer();
+        const server = this.netApi.createServer();
         worker.server = server;
         server.on('connection', (socket) => this.onHandshakeConnection(worker, socket));
         server.on('error', (error) => {
@@ -1068,6 +1076,14 @@ export class ToolWorkerPool {
             this.counters.crashes += 1;
             this.failBusyCall(worker, `tool worker exited (code ${code}, signal ${signal}) during the call`);
         }
+        if (wasStarting && worker.child && !worker.channel && worker.socketBase
+            && !worker.retiredByPool && !this.shuttingDown) {
+            // The process never connected to its socket (e.g. connect EACCES
+            // on a filesystem that refuses Unix socket connections): probe the
+            // socket directories again before the next worker.
+            this.socketDirectories.invalidate(worker.socketBase);
+            this.log(`[toolWorkerPool:${this.name}] worker exited before connecting to its socket under ${worker.socketBase}; probing socket directories again`);
+        }
         if (!this.shuttingDown && !worker.noSocketDirectory
             && (wasStarting || (worker.calls === 0 && !worker.retiredByPool))) {
             this.recordUnproductiveDeath();
@@ -1085,6 +1101,9 @@ export class ToolWorkerPool {
         if (this.unproductiveDeaths >= UNPRODUCTIVE_DEATH_LIMIT) {
             this.unproductiveDeaths = 0;
             this.degradedUntil = this.now() + DEGRADED_MS;
+            // The next spawn after the degraded period probes the socket
+            // directories again instead of trusting the remembered one.
+            this.socketDirectories.invalidate(this.socketDirectories.current());
             this.log(`[toolWorkerPool:${this.name}] ${UNPRODUCTIVE_DEATH_LIMIT} consecutive workers exited before completing a call; degraded for ${DEGRADED_MS}ms (spawn fallback)`);
             this.drainQueueToFallback();
         }
