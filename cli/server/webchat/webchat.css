@@ -32,7 +32,7 @@ body[data-theme="dark"] {
     --wa-table-row-odd-bg: #131c22;
     --wa-table-row-even-bg: #162127;
 
-    --wa-header-height: 60px;
+    --wa-header-height: 84px;
     --wa-composer-height: 64px;
     --wa-floating-composer-space: 104px;
     --wa-shadow-sm: 0 1px 2px rgba(0, 0, 0, .16);
@@ -184,12 +184,21 @@ body {
     z-index: 100;
 }
 
+.wa-header-presence {
+    flex: 0 0 72px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    margin-right: 12px;
+}
+
 .wa-header-avatar {
+    flex-shrink: 0;
     width: 42px;
     height: 42px;
     border-radius: 50%;
-    background: linear-gradient(135deg, rgba(255,255,255,0.28), rgba(255,255,255,0.14));
-    margin-right: 14px;
+    background: #64748b;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -197,6 +206,15 @@ body {
     font-weight: 600;
     color: #ffffff;
     box-shadow: inset 0 1px 0 rgba(255,255,255,.2);
+    transition: background-color 0.18s ease;
+}
+
+.wa-header-avatar.online {
+    background-color: #28b77b;
+}
+
+.wa-header-avatar.offline {
+    background-color: #64748b;
 }
 
 .wa-header-info {
@@ -206,13 +224,15 @@ body {
 
 .wa-header-title-row {
     display: flex;
-    align-items: center;
-    gap: 8px;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
     min-width: 0;
 }
 
 .wa-header-title {
     min-width: 0;
+    max-width: 100%;
     font-size: 16px;
     font-weight: 500;
     color: #ffffff;
@@ -221,39 +241,43 @@ body {
     text-overflow: ellipsis;
 }
 
-.wa-runtime-model {
-    flex: 0 1 auto;
-    max-width: min(240px, 34vw);
-    padding: 1px 7px 2px;
-    overflow: hidden;
-    border: 1px solid rgba(255, 255, 255, 0.24);
-    border-radius: 999px;
-    background: rgba(0, 0, 0, 0.1);
+.wa-runtime-model-row {
+    display: flex;
+    align-items: baseline;
+    gap: 4px;
+    max-width: 100%;
+    min-width: 0;
     color: rgba(255, 255, 255, 0.88);
-    font-size: 11px;
+    font-size: 12px;
     line-height: 16px;
+}
+
+.wa-runtime-model-label {
+    flex-shrink: 0;
+    color: rgba(255, 255, 255, 0.68);
+}
+
+.wa-runtime-model {
+    min-width: 0;
+    overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
 }
 
+.wa-runtime-model-row[hidden],
 .wa-runtime-model[hidden] {
     display: none;
 }
 
 .wa-header-status {
-    font-size: 12px;
+    font-size: 10px;
+    line-height: 12px;
     color: rgba(255, 255, 255, 0.82);
-    margin-top: 3px;
-    display: flex;
-    align-items: center;
-    gap: 6px;
-}
-
-.wa-header-meta {
-    display: contents;
+    white-space: nowrap;
 }
 
 .wa-header-actions {
+    flex: 0 0 auto;
     display: flex;
     align-items: center;
     gap: 6px;
@@ -380,19 +404,35 @@ body {
 }
 
 .wa-header-workdir {
-    position: absolute;
-    top: 50%;
-    left: 50%;
-    max-width: 40%;
-    transform: translate(-50%, -50%);
-    font-size: 13px;
-    font-weight: 600;
-    color: #ffffff;
+    display: block;
+    width: fit-content;
+    max-width: 100%;
+    margin-top: 3px;
+    border-radius: 3px;
+    font-size: 12px;
+    font-weight: 400;
+    color: rgba(255, 255, 255, 0.86);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    text-align: center;
-    opacity: 0.95;
+    text-align: left;
+    text-decoration: none;
+}
+
+.wa-header-workdir[href] {
+    text-decoration: underline;
+    text-decoration-color: rgba(255, 255, 255, 0.35);
+    text-underline-offset: 3px;
+}
+
+.wa-header-workdir[href]:hover {
+    color: #ffffff;
+    text-decoration-color: currentColor;
+}
+
+.wa-header-workdir[href]:focus-visible {
+    outline: 2px solid #ffffff;
+    outline-offset: 2px;
 }
 
 .wa-header-workdir:empty {
@@ -563,50 +603,31 @@ body {
         padding: 0 8px 0 10px;
     }
 
+    .wa-header-presence {
+        flex-basis: 62px;
+        margin-right: 10px;
+    }
+
     .wa-header-avatar {
         width: 36px;
         height: 36px;
-        margin-right: 10px;
         font-size: 16px;
     }
 
     .wa-header-title-row {
-        gap: 5px;
+        gap: 2px;
     }
 
     .wa-header-title {
         font-size: 15px;
     }
 
-    .wa-runtime-model {
-        max-width: 42vw;
-    }
-
-    .wa-header-meta {
-        min-width: 0;
-        display: flex;
-        align-items: center;
-        gap: 8px;
-    }
-
-    .wa-header-status {
-        flex: 0 0 auto;
-        margin-top: 1px;
+    .wa-runtime-model-row {
         font-size: 11px;
     }
 
     .wa-header-workdir {
-        position: static;
-        flex: 1 1 auto;
-        min-width: 0;
-        max-width: none;
-        padding-left: 8px;
-        border-left: 1px solid rgba(255, 255, 255, 0.28);
-        transform: none;
-        color: rgba(255, 255, 255, 0.86);
         font-size: 11px;
-        font-weight: 500;
-        text-align: left;
     }
 
     .wa-header-actions {
