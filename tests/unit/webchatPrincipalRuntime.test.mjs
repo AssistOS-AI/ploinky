@@ -102,6 +102,7 @@ function createFakeFactory() {
         created,
         create(ssoUser) {
             const outputHandlers = new Set();
+            const closeHandlers = new Set();
             const proc = {
                 ssoUser,
                 writes: [],
@@ -110,8 +111,10 @@ function createFakeFactory() {
                 isAlive: () => !proc.disposed,
                 write(data) { proc.writes.push(String(data)); return true; },
                 onOutput(handler) { outputHandlers.add(handler); return () => outputHandlers.delete(handler); },
-                onClose() { return () => {}; },
+                onClose(handler) { closeHandlers.add(handler); return () => closeHandlers.delete(handler); },
                 emit(text) { for (const handler of outputHandlers) handler(text); },
+                // Like a real child, disposal only signals it; close arrives later.
+                close() { for (const handler of closeHandlers) handler(); },
                 dispose() { proc.disposed = true; },
             };
             created.push(proc);
@@ -345,6 +348,94 @@ test('runtime scope principal: a fourth resource evicts the principal\'s oldest 
     assert.equal(procB.disposed, false, 'another principal\'s runtime is never evicted');
     assert.equal(factory.created.length, 5);
     assert.equal([...appState.runtimes.values()].filter((tab) => tab.tty && !tab.disposed).length, 4);
+    cleanup(appState);
+});
+
+test('runtime scope principal: a delayed close of an evicted runtime never unregisters its live replacement', () => {
+    const factory = createFakeFactory();
+    const effectiveConfig = makeConfig(factory, 'principal');
+    const appState = makeAppState();
+    const open = (resource) => openStream({
+        appState, effectiveConfig, user: USER_A,
+        agentQuery: `agent=dpuAgent&dpu-resource-id=${resource}`,
+        tabId: `tab-${resource}`, sid: 'sid-A',
+    });
+    const a = open('a');
+    const b = open('b');
+    const c = open('c');
+    const [, oldB] = factory.created;
+    b.req.emit('close');
+    c.req.emit('close');
+    const d = open('d');
+    assert.equal(oldB.disposed, true, 'the cap evicts the oldest idle runtime B');
+    const replacementB = open('b');
+    assert.deepEqual([a, b, c, d, replacementB].map((entry) => entry.res.statusCode), [200, 200, 200, 200, 200]);
+    const replacement = factory.created.at(-1);
+    const registered = () => [...appState.runtimes.values()].some((tab) => tab.tty === replacement);
+    assert.equal(registered(), true);
+
+    oldB.close();
+    assert.equal(registered(), true, 'the evicted runtime\'s late close leaves the replacement registered');
+    assert.equal(replacement.disposed, false);
+    assert.doesNotMatch(replacementB.res.writes.join(''), /event: close/, 'the replacement stream is not told to close');
+    const live = [...appState.runtimes.values()].filter((tab) => tab.tty && !tab.disposed);
+    assert.equal(live.length, 3, 'the cap still counts every live runtime of the principal');
+
+    // A fourth resource is still refused while all three live runtimes are connected.
+    const extra = open('e');
+    assert.equal(extra.res.statusCode, 429);
+
+    // A late close of the evicted C behaves the same way.
+    const oldC = factory.created[2];
+    assert.equal(oldC.disposed, true);
+    oldC.close();
+    assert.equal(registered(), true);
+    assert.equal(appState.runtimes.size, 3);
+    cleanup(appState);
+});
+
+test('runtime scope principal: late task output from an evicted runtime never reaches its replacement', () => {
+    const factory = createFakeFactory();
+    const effectiveConfig = makeConfig(factory, 'principal');
+    const appState = makeAppState();
+    const open = (resource) => openStream({
+        appState, effectiveConfig, user: USER_A,
+        agentQuery: `agent=dpuAgent&dpu-resource-id=${resource}`,
+        tabId: `tab-${resource}`, sid: 'sid-A',
+    });
+    open('a');
+    const b = open('b');
+    const c = open('c');
+    const [, oldB] = factory.created;
+    b.req.emit('close');
+    c.req.emit('close');
+    open('d');
+    assert.equal(oldB.disposed, true, 'the cap evicts the oldest idle runtime B');
+    const replacementB = open('b');
+    const replacement = factory.created.at(-1);
+    const taskLine = (id) => `${JSON.stringify({
+        __webchatTask: 1, version: 1, event: 'started', task: { id, status: 'ongoing' },
+    })}\n`;
+
+    oldB.emit(taskLine('task_aaaaaaaaaaaaaaaaaaaaaaaa'));
+    assert.doesNotMatch(replacementB.res.writes.join(''), /task_aaaaaaaaaaaaaaaaaaaaaaaa/,
+        'the evicted process\'s late task event is dropped');
+
+    replacement.emit(taskLine('task_bbbbbbbbbbbbbbbbbbbbbbbb'));
+    assert.match(replacementB.res.writes.join(''), /event: task-update[\s\S]*task_bbbbbbbbbbbbbbbbbbbbbbbb/,
+        'positive control: the live runtime\'s own task event still arrives');
+    cleanup(appState);
+});
+
+test('runtime scope shared: live task events still reach the runtime that emitted them', () => {
+    const factory = createFakeFactory();
+    const effectiveConfig = makeConfig(factory);
+    const appState = makeAppState();
+    const a = openStream({ appState, effectiveConfig, user: USER_A, tabId: 'tab-A', sid: 'sid-A' });
+    factory.created[0].emit(`${JSON.stringify({
+        __webchatTask: 1, version: 1, event: 'started', task: { id: 'task_cccccccccccccccccccccccc', status: 'ongoing' },
+    })}\n`);
+    assert.match(a.res.writes.join(''), /event: task-update[\s\S]*task_cccccccccccccccccccccccc/);
     cleanup(appState);
 });
 
