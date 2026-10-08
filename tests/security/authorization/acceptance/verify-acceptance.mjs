@@ -25,6 +25,7 @@ import { loadPins } from './pins.mjs';
 import { enumerateMandatoryChecks } from './mandatory-checks.mjs';
 import { deriveExpectedRuntimes, gitSource, repositoriesFromPins } from './expected-runtime-graph.mjs';
 import { LIVE_INTERACTION_LIMITATION } from '../webchat-probes.mjs';
+import { nonApplicableRecord } from '../capability-probes.mjs';
 
 const sha256 = value => createHash('sha256').update(value).digest('hex');
 const key = (repo, agent) => `${repo}/${agent}`;
@@ -175,10 +176,19 @@ export function evaluateScopedAcceptance({ report, exitCode, mandatory, expected
     const mandatoryLive = (mandatory.checks || []).filter(c => c.kind === 'live');
     const mandatoryIds = new Set((mandatory.checks || []).map(c => c.id));
     for (const id of mandatoryIds) if (expected.has(id)) reject('MANDATORY_GAP_OVERLAP', id);
-    for (const { agent } of expectedRuntimes.enabled) for (const { method } of agentDiscoveryMethods) {
-        const id = `agent.${agent}.discovery.${method.replaceAll('/', '.')}`;
-        if (mandatoryIds.has(`${id}.positive`) === expected.has(id)) reject('DISCOVERY_PARTITION', `${id} must be exactly one of mandatory or excluded`);
+    // Capability partition: every enabled agent's discovery method is exactly one
+    // of mandatory, a reviewed exclusion, or reviewed capability non-applicability.
+    const capabilities = expectedRuntimes.capabilities || [];
+    for (const { repo, agent } of expectedRuntimes.enabled) {
+        const notApplicable = new Set(capabilities.find(c => c.repo === repo && c.agent === agent)?.nonApplicable || []);
+        for (const { method } of agentDiscoveryMethods) {
+            const id = `agent.${agent}.discovery.${method.replaceAll('/', '.')}`;
+            const states = [mandatoryIds.has(`${id}.positive`), expected.has(id), notApplicable.has(`mcp-discovery:${method}`)].filter(Boolean).length;
+            if (states !== 1) reject('DISCOVERY_PARTITION', `${id} must be exactly one of mandatory, excluded or non-applicable`);
+        }
+        if (notApplicable.has('mcp-get-transport') && expected.has(`agent.${agent}.mcp-get-transport`)) reject('DISCOVERY_PARTITION', `${agent} transport is both excluded and non-applicable`);
     }
+    if (JSON.stringify(capabilities.map(c => ({ id: c.id, repo: c.repo, agent: c.agent, nonApplicable: c.nonApplicable }))) !== JSON.stringify(nonApplicableRecord(policy.capabilities))) reject('CAPABILITY_POLICY_MISMATCH', 'derived capabilities differ from the reviewed policy');
 
     // Raw outcome and exit code (captured by the wrapper, checked against the verdict).
     const mapped = report.verdict === 'PASS' ? policy.verdictExitCodes.PASS : report.verdict === 'NO_FAILURES_WITH_GAPS' ? policy.verdictExitCodes.NO_FAILURES_WITH_GAPS : policy.verdictExitCodes.otherwise;
@@ -279,6 +289,12 @@ export function evaluateScopedAcceptance({ report, exitCode, mandatory, expected
         const [, probeId, actor] = entry.id.split(':');
         const rows = (report.routerCoverage || []).filter(r => r.probeId === probeId && r.actor === actor);
         if (rows.length !== 1 || rows[0].status !== 'AUTHORIZATION_DENIAL_PASSED' || ![401, 403].includes(rows[0].httpStatus)) reject('RAW_PATH_DENIAL_LINKAGE', entry.id);
+    }
+    // Non-applicable MCP surfaces are reported explicitly, never as tested authorization.
+    if (JSON.stringify(report.capabilityNonApplicable || null) !== JSON.stringify(nonApplicableRecord(policy.capabilities))) reject('CAPABILITY_RECORD', 'the reviewed non-applicable surfaces must be reported exactly');
+    for (const record of nonApplicableRecord(policy.capabilities)) {
+        const agentChecks = checksList.filter(c => c.id.startsWith(`agent.${record.agent}.discovery.`) && record.nonApplicable.includes(`mcp-discovery:${c.id.slice(`agent.${record.agent}.discovery.`.length).split('.').slice(0, -1).join('/')}`));
+        if (agentChecks.length) reject('CAPABILITY_RECORD', `${record.agent} non-applicable surfaces were executed`);
     }
     // The unexercised live interaction limitation must be recorded explicitly.
     if (JSON.stringify(report.liveLimitations || []) !== JSON.stringify([LIVE_INTERACTION_LIMITATION])) reject('LIVE_LIMITATION_RECORD', 'the WebChat interaction limitation must be reported exactly');

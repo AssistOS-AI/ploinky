@@ -247,7 +247,13 @@ export async function discoverAgentMcp(ctx, mcp, catalog = agentCatalog) {
     ctx.report.discovery ||= [];
     for (const agent of catalog) {
         if (!agent.enabled) { ctx.recordGap(`agent.${agent.agent}.disabled`, 'Manifest and tools inventoried; runtime disabled/on-demand. No functional positive control and agent was not enabled.', { kind: 'agent-disabled', repo: agent.repo, agent: agent.agent }); continue; }
+        // Reviewed capability classification (policy.json `capabilities`): skip only
+        // the exact non-applicable surfaces; the report lists them separately and
+        // retained real-service controls run in capability-probes.mjs.
+        const classified = (ctx.capabilities || []).find((c) => c.repo === agent.repo && c.agent === agent.agent);
+        const notApplicable = new Set(classified?.nonApplicable || []);
         for (const definition of agentDiscoveryMethods) {
+            if (notApplicable.has(`mcp-discovery:${definition.method}`)) continue;
             const id = `agent.${agent.agent}.discovery.${definition.method.replaceAll('/', '.')}`;
             let baseline;
             try {
@@ -305,6 +311,7 @@ export async function discoverAgentMcp(ctx, mcp, catalog = agentCatalog) {
         // contract as typed evidence from a real initialized administrator
         // session; any other outcome (200, 404, 503, transport error) is typed
         // differently and never matches the reviewed entry.
+        if (notApplicable.has('mcp-get-transport')) continue;
         const transportId = `agent.${agent.agent}.mcp-get-transport`;
         let session, stream;
         try {

@@ -17,6 +17,7 @@ import { routerProbes } from '../router-probes.mjs';
 import { agentProbes, agentReadTools, agentDiscoveryMethods } from '../agent-probes.mjs';
 import { templateCheckDefinitions, marketplaceCheckDefinitions } from '../boundary-probes.mjs';
 import { webchatCheckDefinitions } from '../webchat-probes.mjs';
+import { capabilityCheckDefinitions } from '../capability-probes.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 export const MANDATORY_FILE = path.join(here, 'mandatory-checks.json');
@@ -174,10 +175,12 @@ export function enumerateMandatoryChecks({ expectedRuntimes, expectedGaps }) {
     }
     // Discovery and SSE for every required (enabled) agent. A discovery method
     // is mandatory exactly when no reviewed -32601 exclusion exists for it.
-    for (const { agent } of expectedRuntimes.enabled) {
+    const capabilities = expectedRuntimes.capabilities || [];
+    for (const { repo, agent } of expectedRuntimes.enabled) {
+        const notApplicable = new Set(capabilities.find(c => c.repo === repo && c.agent === agent)?.nonApplicable || []);
         for (const { method } of agentDiscoveryMethods) {
             const id = `agent.${agent}.discovery.${method.replaceAll('/', '.')}`;
-            if (gapIds.has(id)) continue;
+            if (gapIds.has(id) || notApplicable.has(`mcp-discovery:${method}`)) continue;
             add(`${id}.positive`, { boundary: 'agents', source: 'agent-probes.mjs discoverAgentMcp' });
             for (const actor of nonAdmin) add(`${id}.${actor}`, { boundary: 'agents', source: 'agent-probes.mjs discoverAgentMcp', positiveControlAnyOf: [`${id}.positive`] });
         }
@@ -188,7 +191,7 @@ export function enumerateMandatoryChecks({ expectedRuntimes, expectedGaps }) {
     for (const [module, template, expansions, positives] of INLINE_TEMPLATES) {
         for (const values of expansions) add(expandTemplate(template, values), { boundary: module.replace('-probes.mjs', ''), source: `tests/security/authorization/${module}`, positiveControlAnyOf: positives });
     }
-    for (const definition of [...templateCheckDefinitions(), ...marketplaceCheckDefinitions(), ...webchatCheckDefinitions()]) add(definition.id, definition);
+    for (const definition of [...templateCheckDefinitions(), ...marketplaceCheckDefinitions(), ...webchatCheckDefinitions(), ...capabilityCheckDefinitions(capabilities)]) add(definition.id, definition);
     for (const offline of OFFLINE) add(`offline:${offline.repo}:${offline.file}`, { kind: 'offline', boundary: offline.boundary, repo: offline.repo, file: offline.file, tests: offline.tests, source: 'plan rev3 mandatory-check table (unchanged in rev4)' });
 
     const list = [...checks.values()].sort((a, b) => a.id.localeCompare(b.id));

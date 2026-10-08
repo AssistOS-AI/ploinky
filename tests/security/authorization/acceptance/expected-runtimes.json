@@ -129,5 +129,40 @@
       "repo": "proxies",
       "agent": "searchAgent"
     }
+  ],
+  "capabilities": [
+    {
+      "id": "D3-livekit-no-mcp",
+      "repo": "AchillesIDE",
+      "agent": "liveKitServerAgent",
+      "nonApplicable": [
+        "mcp-discovery:tools/list",
+        "mcp-discovery:resources/list",
+        "mcp-discovery:resources/templates/list",
+        "mcp-discovery:prompts/list",
+        "mcp-get-transport"
+      ],
+      "retainedControls": [
+        "capability:liveKitServerAgent:no-primary-port",
+        "capability:liveKitServerAgent:runtime-image",
+        "capability:liveKitServerAgent:signaling-route:anonymous",
+        "capability:liveKitServerAgent:twirp-route-deny:anonymous",
+        "capability:liveKitServerAgent:mcp-absent-corroboration:admin"
+      ],
+      "contractSha256": "410c015ccd6548750bb449ec7ca62ed2d39c22b8e40ed4a13991058ca58baf0f"
+    },
+    {
+      "id": "D4-soul-no-upstream-mcp",
+      "repo": "proxies",
+      "agent": "soul-gateway",
+      "nonApplicable": [
+        "mcp-discovery:tools/list",
+        "mcp-discovery:resources/list"
+      ],
+      "retainedControls": [
+        "capability:soul-gateway:health:anonymous"
+      ],
+      "contractSha256": "073b9f03c9d5e88f2bab4c91fba604b95554789cdd51d9b419ea35ed9fe7045b"
+    }
   ]
 }

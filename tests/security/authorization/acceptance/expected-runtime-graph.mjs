@@ -18,6 +18,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { manifestEnableEntries, parseEnableDirective } from '../../../../cli/utils/runtime/bootstrapManifest.js';
 import { resolveManifestAuthMode } from '../../../../cli/utils/manifestAuth.js';
@@ -58,6 +59,12 @@ export function gitSource(repositories) {
             return dirs.filter(dir => dir !== 'tests' && !dir.startsWith('.')).filter(dir => {
                 try { git(name, ['cat-file', '-e', `${commit}:${dir}/manifest.json`]); return true; } catch { return false; }
             }).sort();
+        },
+        readFile(name, file) {
+            const { commit } = repos.get(name) || {};
+            if (!commit) throw new GraphError('GRAPH_REPOSITORY_UNPINNED', `repository ${name} has no pin`);
+            try { return execFileSync('git', ['-C', repos.get(name).root, 'show', `${commit}:${file}`], { stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024 }); }
+            catch { return null; }
         },
         readManifest(name, agent) {
             const { commit } = repos.get(name) || {};
@@ -134,6 +141,7 @@ export function deriveExpectedRuntimes({ policy, source }) {
     const enabledList = [...enabled.values()].sort(byIdentity);
     if (!enabledList.length) throw new GraphError('GRAPH_EMPTY', 'no enabled runtime');
     const disabledList = all.filter(a => !enabled.has(identity(a.repo, a.agent))).sort(byIdentity);
+    const capabilities = deriveCapabilities({ policy, source, enabled });
     return {
         schema: 'authz-expected-runtimes/1',
         rootAgent: policy.rootAgent,
@@ -142,7 +150,60 @@ export function deriveExpectedRuntimes({ policy, source }) {
         counts: { total: all.length, enabled: enabledList.length, disabled: disabledList.length },
         enabled: enabledList,
         disabled: disabledList,
+        capabilities,
     };
+}
+
+const MCP_SURFACES = Object.freeze(['mcp-discovery:tools/list', 'mcp-discovery:resources/list', 'mcp-discovery:resources/templates/list', 'mcp-discovery:prompts/list', 'mcp-get-transport']);
+
+/**
+ * Capability partition, separate from enabled/readiness membership
+ * (r2b_remediation_decisions_codex.md D3/D4). Each reviewed classification is
+ * bound to exact pinned file bytes, manifest facts and source anchors; any
+ * drift is CAPABILITY_CONTRACT_DRIFT. The classified agent must stay enabled.
+ */
+export function deriveCapabilities({ policy, source, enabled }) {
+    const out = [];
+    const drift = (id, detail) => { throw new GraphError('CAPABILITY_CONTRACT_DRIFT', `${id}: ${detail}`); };
+    const seen = new Set();
+    for (const cap of policy.capabilities || []) {
+        const key = identity(cap.repo, cap.agent);
+        if (seen.has(key)) drift(cap.id, 'duplicate classification');
+        seen.add(key);
+        if (!enabled.has(key)) drift(cap.id, 'a classified agent must remain an enabled runtime');
+        if (!Array.isArray(cap.nonApplicable) || !cap.nonApplicable.length || cap.nonApplicable.some(x => !MCP_SURFACES.includes(x))) drift(cap.id, 'nonApplicable must list known MCP surfaces');
+        if (!Array.isArray(cap.retainedControls) || !cap.retainedControls.length) drift(cap.id, 'retained real-service controls are required');
+        const contract = cap.contract || {};
+        if (!Array.isArray(contract.files) || !contract.files.length) drift(cap.id, 'pinned contract files are required');
+        const digest = createHash('sha256');
+        for (const file of contract.files) {
+            const bytes = source.readFile(file.repo, file.path);
+            if (!bytes) drift(cap.id, `${file.repo}:${file.path} missing at the pinned commit`);
+            const actual = createHash('sha256').update(bytes).digest('hex');
+            if (actual !== file.sha256) drift(cap.id, `${file.repo}:${file.path} bytes changed`);
+            digest.update(`${file.repo}:${file.path}:${actual}\n`);
+        }
+        const manifest = source.readManifest(cap.repo, cap.agent) || {};
+        const m = contract.manifest || {};
+        const facts = {
+            start: manifest.start ?? null, agent: manifest.agent ?? null, commandsRun: manifest.commands?.run ?? null,
+            readinessProtocol: manifest.readiness?.protocol ?? null, readinessScript: manifest.health?.readiness?.script ?? null, networkMode: manifest.network?.mode ?? null,
+            routes: (manifest.routerAccess?.httpRoutes || []).map(r => ({ path: r.path, access: r.access })),
+        };
+        for (const [field, want] of Object.entries(m)) if (JSON.stringify(facts[field]) !== JSON.stringify(want)) drift(cap.id, `manifest ${field} differs`);
+        for (const anchor of contract.present || []) {
+            const bytes = source.readFile(anchor.repo, anchor.path);
+            if (!bytes || !bytes.toString('utf8').includes(anchor.text)) drift(cap.id, `${anchor.repo}:${anchor.path} lost anchor ${JSON.stringify(anchor.text)}`);
+            digest.update(`present:${anchor.repo}:${anchor.path}:${anchor.text}\n`);
+        }
+        for (const anchor of contract.absent || []) {
+            const bytes = source.readFile(anchor.repo, anchor.path);
+            if (!bytes || bytes.toString('utf8').includes(anchor.text)) drift(cap.id, `${anchor.repo}:${anchor.path} now contains ${JSON.stringify(anchor.text)}`);
+            digest.update(`absent:${anchor.repo}:${anchor.path}:${anchor.text}\n`);
+        }
+        out.push({ id: cap.id, repo: cap.repo, agent: cap.agent, nonApplicable: [...cap.nonApplicable], retainedControls: [...cap.retainedControls], contractSha256: digest.digest('hex') });
+    }
+    return out.sort((a, b) => a.id.localeCompare(b.id));
 }
 
 function cleanHead(root) {
@@ -158,7 +219,7 @@ export function repositoriesFromPins(pins, policy) {
         const pin = pins.repositories.find(r => r.name === name);
         if (!pin) throw new GraphError('GRAPH_REPOSITORY_UNPINNED', `pins have no ${name}`);
         return { name, root: path.join(pins.workspace, pin.path || rel), commit: pin.commit };
-    });
+    }).concat([{ name: 'ploinky', root: pins.ploinkyCheckout, commit: pins.ploinky.commit }]);
 }
 
 function parseArgs(argv) {
@@ -183,10 +244,14 @@ export async function main(argv = process.argv.slice(2)) {
         if (!match) throw new GraphError('GRAPH_USAGE', `--repo expects name=/abs/path@<40-hex sha>, got ${spec}`);
         return { name: match[1], root: match[2], commit: match[3] };
     });
-    else if (args.workspaceHeads) repositories = policy.inventoryRepositories.map(({ name, path: rel }) => {
-        const root = path.join(args.workspaceHeads, rel);
-        return { name, root, commit: cleanHead(root) };
-    });
+    else if (args.workspaceHeads) {
+        repositories = policy.inventoryRepositories.map(({ name, path: rel }) => {
+            const root = path.join(args.workspaceHeads, rel);
+            return { name, root, commit: cleanHead(root) };
+        });
+        const ploinkyRoot = path.resolve(here, '../../../..');
+        repositories.push({ name: 'ploinky', root: ploinkyRoot, commit: cleanHead(ploinkyRoot) });
+    }
     else throw new GraphError('GRAPH_USAGE', 'supply --pins, --repo or --workspace-heads');
     const derived = deriveExpectedRuntimes({ policy, source: gitSource(repositories) });
     console.log(`pinned commits: ${repositories.map(r => `${r.name}@${r.commit}`).join(' ')}`);

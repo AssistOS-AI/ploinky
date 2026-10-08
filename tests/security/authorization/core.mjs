@@ -120,7 +120,7 @@ export async function ownershipGuard(evidenceRoot, { sources = true, pins, polic
         assert.equal(git(['rev-parse', '--abbrev-ref', '@{upstream}']), repo.upstream);
         assert.equal(git(['status', '--porcelain']), '', `Deployment source is dirty: ${repo.name}`);
     }
-    return { boxId: box.Id, instance: pins.box.name, startedAt: box.State.StartedAt, image: { imageId: pins.box.imageId, imageDigest: pins.box.imageDigest }, repositories: pinned.map(({ name, branch, commit }) => ({ name, branch, commit })), userPersistoContainer: captured.userPersistoContainer, dpuContainer: captured.dpuContainer };
+    return { boxId: box.Id, instance: pins.box.name, startedAt: box.State.StartedAt, image: { imageId: pins.box.imageId, imageDigest: pins.box.imageDigest }, repositories: pinned.map(({ name, branch, commit }) => ({ name, branch, commit })), userPersistoContainer: captured.userPersistoContainer, dpuContainer: captured.dpuContainer, classifiedContainers: captured.classifiedContainers };
 }
 
 /** Live runtimes must equal the reviewed manifest-derived set exactly. */

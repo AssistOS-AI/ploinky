@@ -127,10 +127,23 @@ const parseData = (data) => { try { return JSON.parse(data); } catch { return un
 export const isDpuAck = event => event.event === 'message' && parseData(event.data) === DPU_UNSUPPORTED_REPLY;
 export const isUserMessage = marker => event => event.event === 'user-message' && parseData(event.data)?.message?.text === marker;
 const count = (handle, predicate) => handle.events().filter(predicate).length;
+/**
+ * Acknowledgements on one stream: occurrences of the exact DPU reply in the
+ * in-order concatenation of that stream's plain output events, so a reply split
+ * across SSE frames still counts once. Freshness compares counts before and
+ * after a request; other streams are counted independently.
+ */
+export function ackCount(handle) {
+    const text = handle.events().filter(e => e.event === 'message').map(e => parseData(e.data)).filter(v => typeof v === 'string').join('');
+    let n = 0;
+    for (let i = text.indexOf(DPU_UNSUPPORTED_REPLY); i >= 0; i = text.indexOf(DPU_UNSUPPORTED_REPLY, i + DPU_UNSUPPORTED_REPLY.length)) n++;
+    return n;
+}
 
 async function waitForCount(handle, predicate, minimum, ms) {
+    const measure = typeof predicate === 'function' && predicate.length === 0 ? predicate : () => count(handle, predicate);
     const deadline = Date.now() + ms;
-    while (count(handle, predicate) < minimum) {
+    while (measure() < minimum) {
         if (Date.now() >= deadline) return false;
         await new Promise(r => setTimeout(r, Math.min(50, ms)));
     }
@@ -244,13 +257,13 @@ export async function runWebchatProbes(ctx, { openStream = openEventStream, insp
 
     /** Run one operation and require a fresh DPU acknowledgement on `actor` only. */
     const acknowledged = async (actor, send, { marker = null } = {}) => {
-        const before = { userA: count(own.userA, isDpuAck), userB: count(own.userB, isDpuAck) };
+        const before = { userA: ackCount(own.userA), userB: ackCount(own.userB) };
         const response = await send();
         assert.equal(response.status, 204, `Operation must be accepted (HTTP ${response.status} is not evidence)`);
         if (marker) assert.ok(await waitForCount(own[actor], isUserMessage(marker), 1, waitMs), 'Router user-message event for the unique marker is required on the acting stream');
-        assert.ok(await waitForCount(own[actor], isDpuAck, before[actor] + 1, waitMs), 'A fresh DPU acknowledgement is required on the acting stream (a bare 204 is not enough)');
+        assert.ok(await waitForCount(own[actor], () => ackCount(own[actor]), before[actor] + 1, waitMs), 'A fresh DPU acknowledgement is required on the acting stream (a bare 204 is not enough)');
         await new Promise(r => setTimeout(r, settleMs));
-        assert.equal(count(own[other(actor)], isDpuAck), before[other(actor)], 'An acknowledgement appeared on the other principal\'s stream');
+        assert.equal(ackCount(own[other(actor)]), before[other(actor)], 'An acknowledgement appeared on the other principal\'s stream');
     };
 
     const markers = { userA: `/authz-A-${nonce}`, userB: `/authz-B-${nonce}` };

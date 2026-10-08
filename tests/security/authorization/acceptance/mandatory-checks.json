@@ -11,7 +11,7 @@
     }
   ],
   "counts": {
-    "live": 519,
+    "live": 495,
     "offline": 10
   },
   "checks": [
@@ -395,198 +395,6 @@
       "count": 1,
       "positiveControlAnyOf": [
         "agent.gitAgent.discovery.tools.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.liveKitServerAgent.discovery.prompts.list.anonymous",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.liveKitServerAgent.discovery.prompts.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.liveKitServerAgent.discovery.prompts.list.positive",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": null,
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.liveKitServerAgent.discovery.prompts.list.selfRegistered",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.liveKitServerAgent.discovery.prompts.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.liveKitServerAgent.discovery.prompts.list.userA",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.liveKitServerAgent.discovery.prompts.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.liveKitServerAgent.discovery.prompts.list.userB",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.liveKitServerAgent.discovery.prompts.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.liveKitServerAgent.discovery.resources.list.anonymous",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.liveKitServerAgent.discovery.resources.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.liveKitServerAgent.discovery.resources.list.positive",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": null,
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.liveKitServerAgent.discovery.resources.list.selfRegistered",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.liveKitServerAgent.discovery.resources.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.liveKitServerAgent.discovery.resources.list.userA",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.liveKitServerAgent.discovery.resources.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.liveKitServerAgent.discovery.resources.list.userB",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.liveKitServerAgent.discovery.resources.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.liveKitServerAgent.discovery.resources.templates.list.anonymous",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.liveKitServerAgent.discovery.resources.templates.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.liveKitServerAgent.discovery.resources.templates.list.positive",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": null,
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.liveKitServerAgent.discovery.resources.templates.list.selfRegistered",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.liveKitServerAgent.discovery.resources.templates.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.liveKitServerAgent.discovery.resources.templates.list.userA",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.liveKitServerAgent.discovery.resources.templates.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.liveKitServerAgent.discovery.resources.templates.list.userB",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.liveKitServerAgent.discovery.resources.templates.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.liveKitServerAgent.discovery.tools.list.anonymous",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.liveKitServerAgent.discovery.tools.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.liveKitServerAgent.discovery.tools.list.positive",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": null,
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.liveKitServerAgent.discovery.tools.list.selfRegistered",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.liveKitServerAgent.discovery.tools.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.liveKitServerAgent.discovery.tools.list.userA",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.liveKitServerAgent.discovery.tools.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.liveKitServerAgent.discovery.tools.list.userB",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.liveKitServerAgent.discovery.tools.list.positive"
       ],
       "boundary": "agents",
       "source": "agent-probes.mjs discoverAgentMcp"
@@ -1027,102 +835,6 @@
       "count": 1,
       "positiveControlAnyOf": [
         "agent.soplangAgent.discovery.tools.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.soul-gateway.discovery.resources.list.anonymous",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.soul-gateway.discovery.resources.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.soul-gateway.discovery.resources.list.positive",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": null,
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.soul-gateway.discovery.resources.list.selfRegistered",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.soul-gateway.discovery.resources.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.soul-gateway.discovery.resources.list.userA",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.soul-gateway.discovery.resources.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.soul-gateway.discovery.resources.list.userB",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.soul-gateway.discovery.resources.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.soul-gateway.discovery.tools.list.anonymous",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.soul-gateway.discovery.tools.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.soul-gateway.discovery.tools.list.positive",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": null,
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.soul-gateway.discovery.tools.list.selfRegistered",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.soul-gateway.discovery.tools.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.soul-gateway.discovery.tools.list.userA",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.soul-gateway.discovery.tools.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.soul-gateway.discovery.tools.list.userB",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.soul-gateway.discovery.tools.list.positive"
       ],
       "boundary": "agents",
       "source": "agent-probes.mjs discoverAgentMcp"
@@ -2556,6 +2268,56 @@
       ],
       "boundary": "agents",
       "source": "agent-probes.mjs discoverAgentMcp"
+    },
+    {
+      "id": "capability:liveKitServerAgent:mcp-absent-corroboration:admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "capability",
+      "source": "tests/security/authorization/capability-probes.mjs (D3-livekit-no-mcp)"
+    },
+    {
+      "id": "capability:liveKitServerAgent:no-primary-port",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "capability",
+      "source": "tests/security/authorization/capability-probes.mjs (D3-livekit-no-mcp)"
+    },
+    {
+      "id": "capability:liveKitServerAgent:runtime-image",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "capability",
+      "source": "tests/security/authorization/capability-probes.mjs (D3-livekit-no-mcp)"
+    },
+    {
+      "id": "capability:liveKitServerAgent:signaling-route:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "capability",
+      "source": "tests/security/authorization/capability-probes.mjs (D3-livekit-no-mcp)"
+    },
+    {
+      "id": "capability:liveKitServerAgent:twirp-route-deny:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "capability:liveKitServerAgent:signaling-route:anonymous"
+      ],
+      "boundary": "capability",
+      "source": "tests/security/authorization/capability-probes.mjs (D3-livekit-no-mcp)"
+    },
+    {
+      "id": "capability:soul-gateway:health:anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "capability",
+      "source": "tests/security/authorization/capability-probes.mjs (D4-soul-no-upstream-mcp)"
     },
     {
       "id": "dashboard.admin-role-escalation.selfRegistered",

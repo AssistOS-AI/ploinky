@@ -19,6 +19,9 @@ import { captureExitCode } from './acceptance/run-acceptance.mjs';
 import { runMarketplaceAdmissionProbes, runTemplateProbes, marketplaceProjection } from './boundary-probes.mjs';
 import { runWebchatProbes, dpuProcessInspector, DPU_UNSUPPORTED_REPLY, LIVE_INTERACTION_LIMITATION } from './webchat-probes.mjs';
 import { discoverAgentMcp } from './agent-probes.mjs';
+import { runCapabilityProbes, nonApplicableRecord } from './capability-probes.mjs';
+import { deriveCapabilities } from './acceptance/expected-runtime-graph.mjs';
+import { ackCount } from './webchat-probes.mjs';
 import { BOX_DATA_MOUNTS } from '../../../ploinky-box/constants.mjs';
 import { inventoryBaseline } from './agent-inventory.mjs';
 
@@ -79,6 +82,7 @@ function acceptedRun() {
         principals: Object.entries(policy.principals).map(([name, roles], i) => ({ name, roles, idHash: String(i), authoritativeRoleVerified: true })),
         runtimes: expectedRuntimes.enabled.map(({ repo, agent }) => ({ repo, agent, enabled: true, running: true })),
         liveLimitations: [{ ...LIVE_INTERACTION_LIMITATION }],
+        capabilityNonApplicable: nonApplicableRecord(policy.capabilities),
     };
     const offline = mandatory.checks.filter(c => c.kind === 'offline').map(entry => {
         const tap = tapFor(entry);
@@ -540,7 +544,9 @@ test('U3 probe: a denied principal that revalidates to 304 fails; exact bytes an
 });
 
 test('corrected discovery policy: resources/list and multimedia tools/list are mandatory positives, a -32601 for them rejects', () => {
+    const notApplicable = new Map(expectedRuntimes.capabilities.map(c => [c.agent, new Set(c.nonApplicable)]));
     for (const { agent } of expectedRuntimes.enabled) for (const method of ['tools.list', 'resources.list']) {
+        if (notApplicable.get(agent)?.has(`mcp-discovery:${method.replace('.', '/')}`)) continue;
         assert.ok(mandatory.checks.some(c => c.id === `agent.${agent}.discovery.${method}.positive`), `${agent} ${method} positive is mandatory`);
         assert.ok(!expectedGaps.gaps.some(g => g.id === `agent.${agent}.discovery.${method}`), `${agent} ${method} is not excluded`);
     }
@@ -707,4 +713,133 @@ test('DPU process inspector selects only the pinned DPU entry inside the DPU con
     const unreadable = dpuProcessInspector({ boxId: 'c'.repeat(64), container: 'ploinky_AchillesIDE_dpuAgent_x', run: args => args.includes('sh') ? listing : '' });
     await assert.rejects(unreadable('v'), /environment must be readable/);
     assert.throws(() => dpuProcessInspector({ boxId: 'c'.repeat(64), container: 'ploinky_AchillesIDE_userPersistoAgent_x', run }), /DPU container/);
+});
+
+test('capability partition: LiveKit (D3) and Soul (D4) non-applicability is exact, reported, and leaves every other agent strict', () => {
+    const caps = Object.fromEntries(expectedRuntimes.capabilities.map(c => [c.agent, c]));
+    assert.deepEqual(Object.keys(caps).sort(), ['liveKitServerAgent', 'soul-gateway']);
+    assert.ok(expectedRuntimes.enabled.some(a => a.agent === 'liveKitServerAgent') && expectedRuntimes.enabled.some(a => a.agent === 'soul-gateway'), 'classified agents stay enabled');
+    assert.equal(caps.liveKitServerAgent.nonApplicable.length, 5);
+    assert.deepEqual(caps['soul-gateway'].nonApplicable, ['mcp-discovery:tools/list', 'mcp-discovery:resources/list']);
+    assert.ok(!mandatory.checks.some(c => /^agent\.liveKitServerAgent\.discovery\./.test(c.id)), 'the 20 impossible LiveKit discovery checks are gone');
+    assert.ok(!mandatory.checks.some(c => /^agent\.soul-gateway\.discovery\.(tools|resources)\.list\./.test(c.id)), 'Soul upstream tools/resources checks are gone');
+    for (const kept of ['agent.soul-gateway.discovery.resources.templates.list', 'agent.soul-gateway.discovery.prompts.list', 'agent.soul-gateway.mcp-get-transport']) assert.ok(expectedGaps.gaps.some(g => g.id === kept), `${kept} stays asserted`);
+    for (const id of [...caps.liveKitServerAgent.retainedControls, ...caps['soul-gateway'].retainedControls, 'agent.soul.management.me.admin', 'agent.soul.management.me.userA']) assert.ok(mandatory.checks.some(c => c.id === id), `${id} retained`);
+    // Missing report record, or executing a non-applicable surface, rejects.
+    let run = acceptedRun(); delete run.report.capabilityNonApplicable;
+    expectReject(run, 'CAPABILITY_RECORD', 'record missing');
+    run = acceptedRun(); run.report.checks.push({ id: 'agent.liveKitServerAgent.discovery.tools.list.positive', status: 'PASS' }); run.report.counts.PASS += 1;
+    expectReject(run, 'CAPABILITY_RECORD', 'non-applicable surface executed');
+    // Missing classified runtime rejects; derived capabilities that differ from the policy reject.
+    run = acceptedRun(); run.report.runtimes = run.report.runtimes.filter(r => r.agent !== 'liveKitServerAgent');
+    expectReject(run, 'RUNTIME_SET_MISSING', 'LiveKit runtime missing');
+    run = acceptedRun(); run.derivedRuntimes.capabilities[0].contractSha256 = '0'.repeat(64);
+    expectReject(run, 'RUNTIME_GRAPH_DRIFT', 'pinned contract drift');
+    // A failed retained real-service control rejects.
+    for (const id of ['capability:soul-gateway:health:anonymous', 'capability:liveKitServerAgent:no-primary-port', 'capability:liveKitServerAgent:runtime-image']) {
+        run = acceptedRun();
+        run.report.checks.find(c => c.id === id).status = 'FAIL';
+        run.report.counts = { PASS: run.report.counts.PASS - 1, FAIL: 1, ERROR: 0 }; run.report.verdict = 'FAIL'; run.exitCode = 1;
+        expectReject(run, 'MANDATORY_NOT_PASS', id);
+    }
+});
+
+function contractWorld() {
+    const files = {
+        'R:agent/manifest.json': JSON.stringify({ start: 'sh /code/s.sh', health: { readiness: { script: 'h.sh' } } }),
+        'R:agent/s.sh': 'exec livekit-server\n',
+        'ploinky:cli/server/RoutingServer.js': "if (!route.hostPort) {\n",
+    };
+    const hash = v => createHash('sha256').update(Buffer.from(v)).digest('hex');
+    const policyFor = (overrides = {}) => ({ capabilities: [{ id: 'X', repo: 'R', agent: 'agent', nonApplicable: ['mcp-discovery:tools/list'], retainedControls: ['capability:x'],
+        contract: { files: [{ repo: 'R', path: 'agent/manifest.json', sha256: hash(files['R:agent/manifest.json']) }, { repo: 'R', path: 'agent/s.sh', sha256: hash(files['R:agent/s.sh']) }],
+            manifest: { start: 'sh /code/s.sh', agent: null, readinessScript: 'h.sh' }, absent: [{ repo: 'R', path: 'agent/s.sh', text: 'AgentServer' }],
+            present: [{ repo: 'ploinky', path: 'cli/server/RoutingServer.js', text: 'if (!route.hostPort) {' }] }, ...overrides }] });
+    const source = (mutate = {}) => {
+        const all = { ...files, ...mutate };
+        return { readFile: (repo, file) => all[`${repo}:${file}`] === undefined ? null : Buffer.from(all[`${repo}:${file}`]), readManifest: (repo, agent) => JSON.parse(all[`${repo}:${agent}/manifest.json`]) };
+    };
+    return { policyFor, source, enabled: new Set(['R/agent']) };
+}
+
+test('REJECT altered pinned startup/route contract: bytes, manifest facts, anchors, enablement or an unbound claim', () => {
+    const w = contractWorld();
+    assert.equal(deriveCapabilities({ policy: w.policyFor(), source: w.source(), enabled: w.enabled }).length, 1);
+    const drift = (fn, label) => assert.throws(fn, e => e instanceof GraphError && e.code === 'CAPABILITY_CONTRACT_DRIFT', label);
+    drift(() => deriveCapabilities({ policy: w.policyFor(), source: w.source({ 'R:agent/s.sh': 'exec livekit-server\nsh /Agent/server/AgentServer.sh\n' }), enabled: w.enabled }), 'start script now launches AgentServer');
+    const withAgent = JSON.stringify({ start: 'sh /code/s.sh', agent: 'node x', health: { readiness: { script: 'h.sh' } } });
+    const p = w.policyFor(); p.capabilities[0].contract.files[0].sha256 = createHash('sha256').update(withAgent).digest('hex');
+    drift(() => deriveCapabilities({ policy: p, source: w.source({ 'R:agent/manifest.json': withAgent }), enabled: w.enabled }), 'manifest gains an agent command');
+    drift(() => deriveCapabilities({ policy: w.policyFor(), source: w.source({ 'ploinky:cli/server/RoutingServer.js': 'route changed\n' }), enabled: w.enabled }), 'Router route contract changed');
+    drift(() => deriveCapabilities({ policy: w.policyFor(), source: w.source(), enabled: new Set() }), 'classified agent not enabled (missing runtime)');
+    drift(() => deriveCapabilities({ policy: w.policyFor({ contract: { files: [] } }), source: w.source(), enabled: w.enabled }), 'claim without a pinned contract');
+    drift(() => deriveCapabilities({ policy: w.policyFor({ retainedControls: [] }), source: w.source(), enabled: w.enabled }), 'claim without retained real-service controls');
+    drift(() => deriveCapabilities({ policy: w.policyFor({ nonApplicable: ['tools/call'] }), source: w.source(), enabled: w.enabled }), 'unknown surface');
+});
+
+test('REJECT: a supported DPU MCP method returning 404 or -32000 is never excluded or non-applicable', async () => {
+    for (const [label, response] of [['404', { status: 404, json: { error: 'agent_not_found' } }], ['-32000', { status: 200, json: { jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'Agent dpuAgent is still starting.' } } }]]) {
+        const gaps = [];
+        const ctx = { report: {}, capabilities: policy.capabilities, recordGap: (id, reason, evidence) => gaps.push({ id, reason: 'r', evidence: sanitizeGapEvidence(evidence) }), check: async () => {} };
+        const mcp = { async rpc(actor, agent, method) { return method === 'tools/list' ? { response, stage: 'tools/list', success: false } : { response: { status: 200, json: { result: {} } }, stage: method, success: true, value: { resources: [], resourceTemplates: [], prompts: [] } }; }, async initialize() { return { failure: response }; } };
+        await discoverAgentMcp(ctx, mcp, [{ repo: 'AchillesIDE', agent: 'dpuAgent', enabled: true, tools: [] }]);
+        const gap = gaps.find(g => g.id === 'agent.dpuAgent.discovery.tools.list');
+        assert.equal(gap.evidence.kind, 'positive-unavailable', label);
+        const run = acceptedRun();
+        run.report.checks = run.report.checks.filter(c => !c.id.startsWith('agent.dpuAgent.discovery.tools.list'));
+        run.report.counts.PASS = run.report.checks.length;
+        run.report.gaps.push(gap);
+        expectReject(run, 'GAP_UNEXPECTED', `DPU tools/list ${label}`);
+        assert.ok(evaluate(run).reasons.some(r => r.startsWith('MANDATORY_MISSING: agent.dpuAgent.discovery.tools.list.positive')));
+    }
+    // A classified agent's still-asserted Router contracts must match exactly: Soul templates 404 rejects.
+    const run = acceptedRun();
+    run.report.gaps.find(g => g.id === 'agent.soul-gateway.discovery.prompts.list').evidence = sanitizeGapEvidence({ kind: 'positive-unavailable', actor: 'admin', endpoint: '/soul-gateway/mcp', requestedMethod: 'prompts/list', stage: 'initialize', httpStatus: 404 });
+    expectReject(run, 'GAP_EVIDENCE_MISMATCH', 'Soul prompts/list 404');
+});
+
+test('capability probes: retained controls pass on the real shapes and fail on missing/failed services', async () => {
+    const lk = expectedRuntimes.capabilities.find(c => c.agent === 'liveKitServerAgent');
+    const caps = policy.capabilities;
+    const handler = ({ soulDb = true, signal = 200, mcp404 = true } = {}) => (actor, { path: p, method = 'GET' }) => {
+        if (p.endsWith('/healthz/')) return json(200, { ok: true, db: soulDb, snapshotGeneration: 1, uptimeSeconds: 5 });
+        if (p.endsWith('/7880/')) return { status: signal, text: 'OK', headers: {} };
+        if (p.includes('/twirp/')) return json(401, { ok: false, error: 'not_authenticated' });
+        if (p === '/liveKitServerAgent/mcp') return mcp404 ? json(404, { error: 'agent_not_found', agent: 'liveKitServerAgent' }) : json(200, { jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'still starting' } });
+        return json(404, {});
+    };
+    const deps = (overrides = {}) => ({ capabilities: caps,
+        readRouting: async () => ({ routes: { liveKitServerAgent: { agent: 'liveKitServerAgent', hostPort: overrides.hostPort ?? null } } }),
+        readManifest: async () => ({ container: 'docker.io/assistos/livekit-server-agent@sha256:x' }),
+        inspectContainer: async () => ({ State: { Running: overrides.running ?? true }, Config: { Image: overrides.image ?? 'docker.io/assistos/livekit-server-agent@sha256:x' } }) });
+    const good = fakeCtx(handler()); good.report.deployment = { classifiedContainers: { 'AchillesIDE/liveKitServerAgent': 'ploinky_AchillesIDE_liveKitServerAgent_testExplorerFresh_d8f88a10' } };
+    await runCapabilityProbes(good, deps());
+    assert.deepEqual(good.report.checks.map(c => c.id).sort(), [...lk.retainedControls, 'capability:soul-gateway:health:anonymous'].sort());
+    assert.ok(good.report.checks.every(c => c.status === 'PASS'), JSON.stringify(good.report.checks));
+    assert.deepEqual(good.report.capabilityNonApplicable, nonApplicableRecord(caps));
+    const cases = [
+        [handler({ soulDb: false }), {}, 'capability:soul-gateway:health:anonymous'],
+        [handler(), { hostPort: 43000 }, 'capability:liveKitServerAgent:no-primary-port'],
+        [handler(), { running: false }, 'capability:liveKitServerAgent:runtime-image'],
+        [handler(), { image: 'docker.io/other@sha256:y' }, 'capability:liveKitServerAgent:runtime-image'],
+        [handler({ mcp404: false }), {}, 'capability:liveKitServerAgent:mcp-absent-corroboration:admin'],
+    ];
+    for (const [h, o, id] of cases) {
+        const ctx = fakeCtx(h); ctx.report.deployment = good.report.deployment;
+        await runCapabilityProbes(ctx, deps(o));
+        assert.equal(ctx.report.checks.find(c => c.id === id).status, 'FAIL', id);
+    }
+    const down = fakeCtx(handler({ signal: 503 })); down.report.deployment = good.report.deployment;
+    await runCapabilityProbes(down, deps());
+    assert.equal(down.report.checks.find(c => c.id === 'capability:liveKitServerAgent:signaling-route:anonymous').status, 'FAIL');
+    assert.equal(down.report.gaps.find(g => g.id === 'capability:liveKitServerAgent:twirp-route-deny:anonymous').evidence.kind, 'positive-unavailable');
+});
+
+test('DPU acknowledgement accumulates split SSE frames per stream without crediting partial replies', () => {
+    const stream = events => ({ events: () => events });
+    const frame = text => ({ event: 'message', data: JSON.stringify(text) });
+    const half = DPU_UNSUPPORTED_REPLY.length >> 1;
+    assert.equal(ackCount(stream([frame(DPU_UNSUPPORTED_REPLY.slice(0, half)), frame(DPU_UNSUPPORTED_REPLY.slice(half))])), 1);
+    assert.equal(ackCount(stream([frame(DPU_UNSUPPORTED_REPLY.slice(0, half))])), 0, 'a partial reply is not an acknowledgement');
+    assert.equal(ackCount(stream([frame(DPU_UNSUPPORTED_REPLY), { event: 'user-message', data: JSON.stringify({ message: { text: DPU_UNSUPPORTED_REPLY } }) }, frame(DPU_UNSUPPORTED_REPLY)])), 2);
 });
