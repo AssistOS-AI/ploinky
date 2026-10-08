@@ -21,7 +21,6 @@ export const WEBCHAT_MODULE_PRELOADS = Object.freeze([
     'sessionSettings.js',
     'sessions.js',
     'sidePanel.js',
-    'startupCatalogRefresh.js',
     'taskDetails.js',
     'taskLiveSession.js',
     'taskPresentation.js',
