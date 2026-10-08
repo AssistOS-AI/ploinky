@@ -7,9 +7,6 @@ export const AGENT_STARTUP_POLL_INTERVAL_MS = 1000;
 export const AGENT_STARTUP_STABLE_WINDOW_MS = 2500;
 
 const EDGE_GENERATION_PATTERN = /^sha256:[a-f0-9]{64}$/;
-// The Router's opaque activation token: a 12-character per-process nonce and a sequence number.
-const EDGE_ACTIVATION_TOKEN_PATTERN = /^[A-Za-z0-9_-]{12}\.[1-9][0-9]{0,15}$/;
-const ROUTING_MUTATION_STATES = new Set(['idle', 'busy']);
 const AGENT_ROOT_PLAN_KINDS = new Set(['agent-root', 'agent-root-pending']);
 const NON_HTTP_SURFACES = new Set([
     'agent-mcp',
@@ -227,6 +224,10 @@ function requireOpaqueEdgeGeneration(generation) {
     }
     return value;
 }
+
+// The Router's opaque activation token: a 12-character per-process nonce and a sequence number.
+const EDGE_ACTIVATION_TOKEN_PATTERN = /^[A-Za-z0-9_-]{12}\.[1-9][0-9]{0,15}$/;
+const ROUTING_MUTATION_STATES = new Set(['idle', 'busy']);
 
 // The activation fields of a `ready` probe: all three, validated, or none.
 function readyActivationFields(activation, activeForMs, mutation) {

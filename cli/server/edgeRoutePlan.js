@@ -2,10 +2,7 @@ import crypto from 'node:crypto';
 import net from 'node:net';
 import { domainToASCII } from 'node:url';
 
-import {
-    captureEdgeRoutingLease,
-    captureEdgeRoutingObservationLease,
-} from '../sandbox/edgeGeneration.js';
+import { captureEdgeRoutingLease, captureEdgeRoutingObservationLease } from '../sandbox/edgeGeneration.js';
 import { observeEdgeActivation } from './edgeActivationClock.js';
 import { selectedRouterHostPort } from '../sandbox/routerPort.js';
 import { isTrustedPublicRouterHost } from '../utils/publicRouterHosts.mjs';
@@ -26,6 +23,8 @@ import { compileProxyLimits } from './proxy/limits.js';
 import { createRoutePlan } from './proxy/RoutePlan.js';
 import { leaseRouteHardwareAvailability } from './hardwareAvailability.mjs';
 
+// Starts the activation clock on any request that captures the active generation (memory only; never throws).
+const observedActiveLease = (lease) => { try { observeEdgeActivation(lease); } catch (_) {} return lease; };
 const LOCAL_CONTROL_HOSTS = new Set(['localhost', '127.0.0.1', '::1', 'router.localhost']);
 const MANAGED_ROUTER_HOST = 'host.containers.internal';
 const AGENT_ROOT_AUTH_SUPPORT_PATHS = new Set([
@@ -717,15 +716,9 @@ export function resolveEdgeRoutePlan({
             ? captureEdgeRoutingObservationLease({
                 expectedGeneration: authorityObservationGeneration,
             })
-            : captureEdgeRoutingLease();
+            : observedActiveLease(captureEdgeRoutingLease());
     } catch (error) {
         return deny(503, error?.code || 'EDGE_GENERATION_INACTIVE');
-    }
-    if (!authorityObservationGeneration) {
-        // Start the activation clock on the first request of any kind that
-        // captures the active generation, not on the first startup probe.
-        // Memory only; observeEdgeActivation never throws.
-        try { observeEdgeActivation(lease); } catch (_) {}
     }
     const snapshot = lease.snapshot;
     const host = normalizeExactHost(req?.headers?.host);
