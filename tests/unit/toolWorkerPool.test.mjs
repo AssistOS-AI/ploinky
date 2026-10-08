@@ -771,3 +771,273 @@ test('timings: an identity error is counted and its call is timed on the fallbac
     assert.ok(logs.some((line) => /identity walk seq=\d+ ms=\S+ blockMs=\S+ ok=false roots=-$/.test(line)), JSON.stringify(logs));
     assert.ok(logs.some((line) => /timing id=fixture-\d+ route=fallback queueMs=\d+\.\d walkMs=\d+\.\d walkBlockMs=\d+\.\d handlerMs=\d+\.\d settleMs=- totalMs=\d+\.\d$/.test(line)), JSON.stringify(logs));
 });
+
+// AC2. Counted through the hook itself so the same test runs against older
+// pools: 12 parallel calls on 3 warm workers need at most one identity walk
+// per dispatch.
+async function warmPool(pool, count) {
+    const warm = await Promise.all(Array.from({ length: count }, () => callTool(pool, { mode: 'slow', ms: 200 })));
+    for (const result of warm) assert.equal(result.code, 0, result.stderr);
+    assert.ok(await waitUntil(() => pool.stats().idle === count, 5000), JSON.stringify(pool.stats()));
+}
+
+for (const kind of ['sync', 'async']) {
+    test(`AC2 (${kind} hook): 12 calls on 3 warm workers walk the identity at most 12 times`, async (t) => {
+        const dir = makeDir(t);
+        let walks = 0;
+        const hook = kind === 'sync'
+            ? () => { walks += 1; return 'v1'; }
+            : () => { walks += 1; return new Promise((resolve) => setTimeout(() => resolve('v1'), 5)); };
+        const { pool } = makePool(t, dir, { size: 3, codeIdentity: hook });
+        await warmPool(pool, 3);
+        walks = 0;
+        const results = await Promise.all(Array.from({ length: 12 }, () => callTool(pool, { mode: 'slow', ms: 30 })));
+        for (const result of results) assert.equal(result.code, 0, result.stderr);
+        t.diagnostic(`AC2 ${kind} walks=${walks} dispatches=12`);
+        assert.equal(loads(dir).length, 3, 'no worker was replaced');
+        assert.ok(walks <= 12, `identity walks for 12 calls: ${walks}`);
+    });
+}
+
+// A code identity hook over one code file. `hold()` makes the next walk wait
+// for `release()`; the stamp is read when the walk starts, like a real walk
+// that read the tree before a later edit.
+function heldIdentity(codeFile, { delayMs = 0 } = {}) {
+    const state = { walks: 0, inFlight: 0, maxInFlight: 0, holdNext: false, release: null, failNext: 0 };
+    state.hold = () => { state.holdNext = true; };
+    state.hook = () => {
+        state.walks += 1;
+        state.inFlight += 1;
+        state.maxInFlight = Math.max(state.maxInFlight, state.inFlight);
+        const failing = state.failNext > 0;
+        if (failing) state.failNext -= 1;
+        let stamp;
+        try {
+            stamp = codeStamp(codeFile);
+        } catch (error) {
+            state.inFlight -= 1;
+            throw error;
+        }
+        const settle = (resolve, reject) => {
+            state.inFlight -= 1;
+            if (failing) reject(new Error('identity unavailable'));
+            else resolve(stamp);
+        };
+        if (state.holdNext) {
+            state.holdNext = false;
+            return new Promise((resolve, reject) => {
+                state.release = () => {
+                    state.release = null;
+                    settle(resolve, reject);
+                };
+            });
+        }
+        return new Promise((resolve, reject) => setTimeout(() => settle(resolve, reject), delayMs));
+    };
+    return state;
+}
+
+function codePool(t, dir, codeFile, options) {
+    return makePool(t, dir, { env: { FIXTURE_CODE_FILE: codeFile }, ...options });
+}
+
+test('AC3: 50 parallel calls with edits between enqueues keep one walk in flight and never serve code older than the enqueue', async (t) => {
+    const dir = makeDir(t);
+    const codeFile = path.join(dir, 'tool-code.txt');
+    const versions = ['v1', 'v2-x', 'v3-xx'];
+    fs.writeFileSync(codeFile, versions[0]);
+    const identity = heldIdentity(codeFile, { delayMs: 3 });
+    const { pool } = codePool(t, dir, codeFile, { size: 3, codeIdentity: identity.hook, timings: true });
+    const pending = [];
+    for (let index = 0; index < 50; index += 1) {
+        if (index === 20) fs.writeFileSync(codeFile, versions[1]);
+        if (index === 35) fs.writeFileSync(codeFile, versions[2]);
+        const atEnqueue = index < 20 ? 0 : index < 35 ? 1 : 2;
+        pending.push(callTool(pool, { mode: 'codeVersion', ms: 5 }).then((result) => ({ atEnqueue, result })));
+        if (index % 7 === 0) await sleep(2);
+    }
+    const settled = await Promise.all(pending);
+    for (const { atEnqueue, result } of settled) {
+        const served = versions.indexOf(codeVersion(result).version);
+        assert.ok(served >= atEnqueue, `a call enqueued under ${versions[atEnqueue]} was served ${versions[served]}`);
+    }
+    assert.equal(identity.maxInFlight, 1, 'more than one identity walk was in flight');
+    const stats = pool.stats();
+    assert.equal(stats.identityWalks, identity.walks);
+    t.diagnostic(`AC3 walks=${identity.walks} dispatches=50 recycled=${stats.recycled}`);
+});
+
+test('AC4 (D): a call enqueued after a walk started is not dispatched on that walk, even to an idle worker', async (t) => {
+    const dir = makeDir(t);
+    const codeFile = path.join(dir, 'tool-code.txt');
+    fs.writeFileSync(codeFile, 'v1');
+    const identity = heldIdentity(codeFile);
+    const { pool } = codePool(t, dir, codeFile, { size: 2, codeIdentity: identity.hook });
+    await warmPool(pool, 2);
+    const warm = loads(dir).map(Number);
+
+    identity.hold();
+    const first = callTool(pool, { mode: 'codeVersion', ms: 300 });
+    assert.ok(await waitUntil(() => identity.release !== null, 2000), 'walk W1 to start');
+    fs.writeFileSync(codeFile, 'v2-longer');
+    const second = callTool(pool, { mode: 'codeVersion' });
+    assert.equal(pool.stats().idle, 2, 'both warm workers are idle while W1 is held');
+    identity.release();
+    const [a, b] = (await Promise.all([first, second])).map(codeVersion);
+    assert.equal(a.version, 'v1', 'the call enqueued before the edit ran on the v1 worker');
+    assert.ok(warm.includes(a.pid));
+    assert.equal(b.version, 'v2-longer', 'the call enqueued after the edit was served stale code');
+    assert.ok(!warm.includes(b.pid));
+    assert.ok(pool.stats().recycled >= 1);
+});
+
+for (const kind of ['sync', 'async']) {
+    test(`AC5 (S, ${kind} hook): an edit between the walk and the worker launch recycles the worker; no stale result`, async (t) => {
+        const dir = makeDir(t);
+        const codeFile = path.join(dir, 'tool-code.txt');
+        fs.writeFileSync(codeFile, 'v1');
+        let first = true;
+        const hook = () => {
+            const stamp = codeStamp(codeFile);
+            if (first) {
+                // After the walk read the tree, before the spawned worker loads it.
+                first = false;
+                fs.writeFileSync(codeFile, 'v2-longer');
+            }
+            return kind === 'sync' ? stamp : Promise.resolve(stamp);
+        };
+        const { pool, logs } = codePool(t, dir, codeFile, { size: 1, codeIdentity: hook });
+        const result = codeVersion(await callTool(pool, { mode: 'codeVersion' }));
+        assert.equal(result.version, 'v2-longer');
+        assert.equal(loads(dir).length, 2, 'the worker labelled with the earlier walk was replaced before serving');
+        assert.equal(Number(loads(dir)[1]), result.pid);
+        assert.ok(pool.stats().recycled >= 1);
+        assert.ok(logs.some((line) => line.includes('tool code changed; replacing the worker')));
+    });
+}
+
+test('a worker that goes idle while a walk is in flight is served by that walk when its identity matches', async (t) => {
+    const dir = makeDir(t);
+    const codeFile = path.join(dir, 'tool-code.txt');
+    fs.writeFileSync(codeFile, 'v1');
+    const identity = heldIdentity(codeFile);
+    const { pool } = codePool(t, dir, codeFile, { size: 2, codeIdentity: identity.hook });
+    await warmPool(pool, 2);
+    const warm = loads(dir).map(Number);
+    const busyShort = callTool(pool, { mode: 'codeVersion', ms: 100 });
+    const busyLong = callTool(pool, { mode: 'codeVersion', ms: 500 });
+    assert.ok(await waitUntil(() => pool.stats().busy === 2, 2000));
+    identity.hold();
+    const walksBefore = identity.walks;
+    const queued = [callTool(pool, { mode: 'codeVersion' }), callTool(pool, { mode: 'codeVersion' })];
+    assert.equal(identity.walks, walksBefore, 'no walk while every worker is busy');
+    assert.ok(await waitUntil(() => identity.release !== null, 2000), 'the walk started by the first idle worker');
+    assert.ok(await waitUntil(() => pool.stats().idle === 2, 2000), 'the second worker went idle mid-walk');
+    identity.release();
+    const served = (await Promise.all(queued)).map(codeVersion);
+    await Promise.all([busyShort, busyLong]);
+    assert.equal(identity.walks, walksBefore + 1, 'one walk served both queued calls');
+    assert.deepEqual(new Set(served.map((r) => r.pid)), new Set(warm), 'both warm workers served');
+    assert.equal(pool.stats().recycled, 0);
+});
+
+test('a worker that goes idle while a walk is in flight is retired, not served, when the walk result differs', async (t) => {
+    const dir = makeDir(t);
+    const codeFile = path.join(dir, 'tool-code.txt');
+    fs.writeFileSync(codeFile, 'v1');
+    const identity = heldIdentity(codeFile);
+    const { pool } = codePool(t, dir, codeFile, { size: 2, codeIdentity: identity.hook });
+    await warmPool(pool, 2);
+    const warm = loads(dir).map(Number);
+    const busy = [callTool(pool, { mode: 'codeVersion', ms: 100 }), callTool(pool, { mode: 'codeVersion', ms: 500 })];
+    assert.ok(await waitUntil(() => pool.stats().busy === 2, 2000));
+    fs.writeFileSync(codeFile, 'v2-longer');
+    identity.hold();
+    const queued = [callTool(pool, { mode: 'codeVersion' }), callTool(pool, { mode: 'codeVersion' })];
+    assert.ok(await waitUntil(() => identity.release !== null, 2000));
+    assert.ok(await waitUntil(() => pool.stats().idle === 2, 2000), 'the second worker went idle mid-walk');
+    identity.release();
+    const served = (await Promise.all(queued)).map(codeVersion);
+    await Promise.all(busy);
+    for (const result of served) {
+        assert.equal(result.version, 'v2-longer');
+        assert.ok(!warm.includes(result.pid), `warm worker ${result.pid} served after the identity changed`);
+    }
+    assert.ok(pool.stats().recycled >= 2);
+});
+
+test('F1 (pool): a walk result that arrives after its walk timed out never completes a later batch', async (t) => {
+    const dir = makeDir(t);
+    const codeFile = path.join(dir, 'tool-code.txt');
+    fs.writeFileSync(codeFile, 'v1');
+    let mode = 'normal';
+    let lateDelivered = false;
+    let deliverStale = null;
+    // Walks that were not abandoned by the timeout.
+    let active = 0;
+    let maxActive = 0;
+    const hook = () => {
+        const stamp = codeStamp(codeFile);
+        if (mode === 'stall') {
+            // Read before the edit below; delivered only after the timeout,
+            // once the next walk is in flight.
+            mode = 'slow';
+            return new Promise((resolve) => {
+                deliverStale = () => { lateDelivered = true; resolve(staleStamp); };
+            });
+        }
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        const done = (resolve) => { active -= 1; resolve(stamp); };
+        if (mode === 'slow') {
+            mode = 'normal';
+            setImmediate(() => deliverStale());
+            return new Promise((resolve) => setTimeout(() => done(resolve), 30));
+        }
+        return new Promise((resolve) => setImmediate(() => done(resolve)));
+    };
+    const { pool, logs } = codePool(t, dir, codeFile, { size: 1, codeIdentity: hook, identityTimeoutMs: 50 });
+    const warmPid = codeVersion(await callTool(pool, { mode: 'codeVersion' })).pid;
+    const staleStamp = codeStamp(codeFile);
+    fs.writeFileSync(codeFile, 'v2-longer');
+    mode = 'stall';
+    const fallback = async () => ({ code: 0, signal: null, stdout: JSON.stringify({ version: 'fallback', pid: 0 }), stderr: '' });
+    const timedOut = codeVersion(await callTool(pool, { mode: 'codeVersion' }, { fallback }));
+    assert.equal(timedOut.version, 'fallback', 'a walk past identityTimeoutMs sends the call to the fallback');
+    assert.ok(logs.some((line) => line.includes('codeIdentity failed (identity walk did not settle within 50ms)')), JSON.stringify(logs));
+    // This call's walk is in flight when the stale result arrives.
+    const next = callTool(pool, { mode: 'codeVersion' }, { fallback });
+    const served = codeVersion(await next);
+    assert.ok(lateDelivered, `the stale result was delivered while the next walk was in flight: ${JSON.stringify(served)} ${JSON.stringify(logs)}`);
+    assert.equal(served.version, 'v2-longer');
+    assert.notEqual(served.pid, warmPid);
+    assert.equal(maxActive, 1, 'the late result let a second walk start while one was in flight');
+});
+
+test('a failing walk sends every queued call to the spawn fallback at once', async (t) => {
+    const dir = makeDir(t);
+    const codeFile = path.join(dir, 'tool-code.txt');
+    fs.writeFileSync(codeFile, 'v1');
+    const identity = heldIdentity(codeFile);
+    const { pool, logs } = codePool(t, dir, codeFile, { size: 2, codeIdentity: identity.hook });
+    await warmPool(pool, 2);
+    const busy = [callTool(pool, { mode: 'codeVersion', ms: 150 }), callTool(pool, { mode: 'codeVersion', ms: 600 })];
+    assert.ok(await waitUntil(() => pool.stats().busy === 2, 2000));
+    identity.failNext = 1;
+    const fallbackAt = [];
+    const fallback = async () => {
+        fallbackAt.push(Date.now());
+        return { code: 0, signal: null, stdout: JSON.stringify({ version: 'fallback', pid: 0 }), stderr: '' };
+    };
+    const queued = [0, 1, 2].map(() => callTool(pool, { mode: 'codeVersion' }, { fallback }));
+    const served = (await Promise.all(queued)).map(codeVersion);
+    const longDone = await busy[1];
+    assert.deepEqual(served.map((r) => r.version), ['fallback', 'fallback', 'fallback']);
+    assert.equal(fallbackAt.length, 3);
+    assert.ok(Math.max(...fallbackAt) - Math.min(...fallbackAt) < 100, `fallbacks were spread out: ${fallbackAt}`);
+    assert.equal(codeVersion(longDone).version, 'v1');
+    assert.equal(pool.stats().identityErrors, 1);
+    assert.ok(logs.some((line) => line.includes('codeIdentity failed (identity unavailable)')));
+    // A later successful walk serves workers again.
+    assert.equal(codeVersion(await callTool(pool, { mode: 'codeVersion' })).version, 'v1');
+});

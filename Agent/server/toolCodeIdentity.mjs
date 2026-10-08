@@ -1,10 +1,11 @@
 // Code identity for warm tool workers (see toolWorkerPool.mjs).
 //
 // A warm worker must never run code older than what a fresh process would
-// load at request time. The pool reads this identity before every dispatch
-// and when it spawns a worker, and retires idle workers spawned under another
-// identity; when the identity cannot be read, the call runs as a fresh
-// process. The identity is derived from the code itself, never from a marker:
+// load at request time. The pool reads this identity in batches: a call is
+// dispatched only on a read that started after the call was enqueued, and a
+// worker is labelled with the read that decided its spawn. Idle workers
+// spawned under another identity are retired; when the identity cannot be
+// read, the call runs as a fresh process. The identity is derived from the code itself, never from a marker:
 // a sha256 over the sorted (path, stat stamp) list of every entry under the
 // code roots plus a few fixed files. A stamp is dev, ino, size, mtimeNs,
 // ctimeNs and mode (bigint stat), so an in-place rewrite, an atomic replace,

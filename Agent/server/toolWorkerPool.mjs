@@ -23,11 +23,20 @@
 // is replaced.
 //
 // Fresh code. With a `codeIdentity()` hook (a stamp of the agent's code,
-// manifest and generation), every worker records the identity it was spawned
-// under, and the pool reads the hook before every dispatch: a worker whose
-// identity differs never gets another call and is replaced. Nothing is cached
-// by time. If the hook fails, the call runs through the spawn fallback, which
-// always loads current code. Pools never retry a call, never
+// manifest and generation; it returns the stamp or a promise of it), every
+// worker records the identity of the walk (one hook read) that spawned it, and
+// queued calls are dispatched in batches on walk results. At most one walk is
+// in flight; it starts only when a queued call could use its result (an idle
+// worker exists, a worker must be spawned, or the last walk failed). When it
+// completes it retires idle workers spawned under another identity, dispatches
+// to the remaining idle workers only calls enqueued before the walk started
+// (so every dispatch sees every change made before its call was enqueued),
+// and spawns workers labelled with its result. A worker whose identity
+// differs never gets another call and is replaced. Nothing is cached by time.
+// If the hook throws, rejects or does not settle within identityTimeoutMs,
+// every queued call runs through the spawn fallback, which always loads
+// current code, and later calls start walks until one succeeds again. Pools
+// never retry a call, never
 // log frames (they can carry invocation tokens) and never leave a worker
 // process group behind: timeouts, crashes, recycling and shutdown all end with
 // a SIGKILL to the worker's process group.
@@ -63,6 +72,9 @@ export const TOOL_WORKER_DEFAULTS = Object.freeze({
 // readyTimeoutMs; counting deaths after `ready` catches workers that fail
 // right after announcing it.
 const UNPRODUCTIVE_DEATH_LIMIT = 3;
+// A walk that has not settled by then is an identity error; its late result
+// is ignored.
+const DEFAULT_IDENTITY_TIMEOUT_MS = 15_000;
 const DEGRADED_MS = 60_000;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 20_000;
 // After a worker exits, frames and output it wrote just before can still be
@@ -356,6 +368,13 @@ export class ToolWorkerPool {
         this.now = typeof options.now === 'function' ? options.now : Date.now;
         this.codeIdentity = typeof options.codeIdentity === 'function' ? options.codeIdentity : null;
         this.timings = typeof options.timings === 'boolean' ? options.timings : timingsEnabled();
+        this.identityTimeoutMs = timerDelay(options.identityTimeoutMs, DEFAULT_IDENTITY_TIMEOUT_MS);
+        // The identity walk in flight (at most one), and whether the last
+        // completed walk failed.
+        this.walk = null;
+        this.identityFailing = false;
+        this.pumping = false;
+        this.pumpAgain = false;
         this.socketDirectories = options.socketDirectories || defaultSocketDirectories;
         this.netApi = options.netApi || net;
 
@@ -538,63 +557,133 @@ export class ToolWorkerPool {
         return null;
     }
 
-    // The current code identity, read from the hook on every use (no caching).
-    readIdentity() {
-        if (!this.codeIdentity) return { ok: true, value: null, walk: null };
-        const walk = { seq: ++this.seq, startedAt: performance.now(), ms: NaN, blockMs: NaN };
-        this.counters.identityWalks += 1;
-        try {
-            const result = normalizeIdentity(this.codeIdentity());
-            walk.ms = walk.blockMs = performance.now() - walk.startedAt;
-            this.logWalk(walk, true, result.roots);
-            return { ok: true, value: result.value, walk };
-        } catch (error) {
-            walk.ms = walk.blockMs = performance.now() - walk.startedAt;
-            this.counters.identityErrors += 1;
-            this.logWalk(walk, false, null);
-            this.log(`[toolWorkerPool:${this.name}] codeIdentity failed (${error?.message || error}); using the spawn fallback`);
-            return { ok: false, value: undefined, walk };
-        }
-    }
-
-    // Before every dispatch: retire idle workers spawned under another code
-    // identity and pick a current one.
-    takeCurrentWorker() {
-        const identity = this.readIdentity();
-        if (!identity.ok) return { identityError: true, worker: null, walk: identity.walk };
-        let found = null;
-        for (const worker of [...this.workers]) {
-            if (worker.state !== 'idle') continue;
-            if (worker.identity !== identity.value) {
-                this.log(`${this.prefix(worker)} tool code changed; replacing the worker`);
-                this.counters.recycled += 1;
-                this.retire(worker);
-                continue;
-            }
-            if (!found) found = worker;
-        }
-        return { identityError: false, worker: found, walk: identity.walk };
+    // A walk is worth starting only when a queued call could use its result.
+    walkNeeded() {
+        if (!this.queue.length) return false;
+        if (this.identityFailing || this.findIdleWorker()) return true;
+        // Workers being retired still count toward `size` until they exit.
+        return this.queue.length > this.countWorkers('starting') && this.workers.size < this.size;
     }
 
     pump() {
         if (this.shuttingDown) return;
-        while (this.queue.length) {
-            const pick = this.takeCurrentWorker();
-            if (pick.identityError) {
-                const call = this.queue.shift();
-                if (call) call.walk = pick.walk;
+        if (this.pumping) {
+            this.pumpAgain = true;
+            return;
+        }
+        this.pumping = true;
+        try {
+            do {
+                this.pumpAgain = false;
+                // A walk that completes synchronously runs its batch here;
+                // stop when one makes no progress (nothing else would change).
+                while (!this.walk && !this.shuttingDown && this.walkNeeded()) {
+                    if (!this.startWalk()) break;
+                }
+            } while (this.pumpAgain && !this.walk && !this.shuttingDown);
+        } finally {
+            this.pumping = false;
+        }
+    }
+
+    // Read the code identity once (no caching). A synchronous result
+    // completes the batch at once; a promise leaves the walk in flight.
+    // Returns false when a synchronous walk made no progress.
+    startWalk() {
+        const walk = { seq: ++this.seq, startedAt: performance.now(), ms: NaN, blockMs: NaN, timer: null };
+        if (!this.codeIdentity) {
+            walk.ms = walk.blockMs = 0;
+            return this.completeWalk(walk, { ok: true, value: null, roots: null, silent: true });
+        }
+        this.counters.identityWalks += 1;
+        let result;
+        try {
+            result = this.codeIdentity();
+        } catch (error) {
+            walk.ms = walk.blockMs = performance.now() - walk.startedAt;
+            return this.completeWalk(walk, { ok: false, error });
+        }
+        walk.blockMs = performance.now() - walk.startedAt;
+        if (result && (typeof result === 'object' || typeof result === 'function') && typeof result.then === 'function') {
+            this.walk = walk;
+            walk.timer = setTimeout(() => this.finishWalk(walk, {
+                ok: false, error: new Error(`identity walk did not settle within ${this.identityTimeoutMs}ms`),
+            }), this.identityTimeoutMs);
+            walk.timer.unref?.();
+            Promise.resolve(result).then(
+                (value) => this.finishWalk(walk, { ok: true, ...normalizeIdentity(value) }),
+                (error) => this.finishWalk(walk, { ok: false, error }),
+            );
+            return true;
+        }
+        walk.ms = walk.blockMs;
+        return this.completeWalk(walk, { ok: true, ...normalizeIdentity(result) });
+    }
+
+    // An asynchronous walk settled. Only the walk in flight may complete a
+    // batch: a result that arrives after the walk timed out, or after
+    // shutdown, is dropped.
+    finishWalk(walk, outcome) {
+        if (this.walk !== walk) return;
+        this.walk = null;
+        clearTimeout(walk.timer);
+        walk.timer = null;
+        walk.ms = performance.now() - walk.startedAt;
+        if (this.shuttingDown) return;
+        this.completeWalk(walk, outcome);
+        this.pump();
+    }
+
+    // Apply one walk result to the queue and the workers. Returns whether
+    // anything changed.
+    completeWalk(walk, outcome) {
+        if (!outcome.silent) this.logWalk(walk, outcome.ok, outcome.roots);
+        if (!outcome.ok) {
+            this.counters.identityErrors += 1;
+            this.identityFailing = true;
+            const error = outcome.error;
+            this.log(`[toolWorkerPool:${this.name}] codeIdentity failed (${error?.message || error}); using the spawn fallback`);
+            const calls = this.queue.splice(0);
+            for (const call of calls) {
+                call.walk = walk;
                 this.runQueuedOnFallback(call, 'tool code identity could not be read');
+            }
+            return calls.length > 0;
+        }
+        this.identityFailing = false;
+        let progress = false;
+        for (const worker of [...this.workers]) {
+            if (worker.state !== 'idle' || worker.identity === outcome.value) continue;
+            this.log(`${this.prefix(worker)} tool code changed; replacing the worker`);
+            this.counters.recycled += 1;
+            this.retire(worker);
+            progress = true;
+        }
+        // Every idle worker left carries this identity. A call enqueued after
+        // the walk started waits for a later walk.
+        for (let index = 0; index < this.queue.length;) {
+            const call = this.queue[index];
+            if (call.settled) {
+                this.queue.splice(index, 1);
                 continue;
             }
-            if (!pick.worker) break;
-            const call = this.queue.shift();
-            call.walk = pick.walk;
-            this.dispatch(pick.worker, call);
+            if (call.enqueueSeq > walk.seq) {
+                index += 1;
+                continue;
+            }
+            const worker = this.findIdleWorker();
+            if (!worker) break;
+            this.queue.splice(index, 1);
+            call.walk = walk;
+            this.dispatch(worker, call);
+            progress = true;
         }
         // Workers being retired still count toward `size` until they exit.
         while (this.queue.length > this.countWorkers('starting') && this.workers.size < this.size) {
-            if (!this.spawnWorker()) break;
+            if (!this.spawnWorker(outcome.value)) break;
+            progress = true;
         }
+        return progress;
     }
 
     dispatch(worker, call) {
@@ -613,7 +702,9 @@ export class ToolWorkerPool {
         }
     }
 
-    spawnWorker() {
+    // `identity` is the result of the walk that decided the spawn, which
+    // completed before the worker is launched.
+    spawnWorker(identity) {
         this.counters.spawned += 1;
         const worker = {
             child: null,
@@ -629,7 +720,7 @@ export class ToolWorkerPool {
             idleTimer: null,
             readyTimer: null,
             gone: false,
-            identity: this.readIdentity().value,
+            identity,
         };
         this.workers.add(worker);
         worker.readyTimer = setTimeout(() => {
@@ -1215,6 +1306,11 @@ export class ToolWorkerPool {
         if (this.shutdownPromise) return this.shutdownPromise;
         this.shuttingDown = true;
         registeredPools.delete(this);
+        // A walk in flight is ignored when it settles.
+        if (this.walk) {
+            clearTimeout(this.walk.timer);
+            this.walk = null;
+        }
         const message = `tool worker pool '${this.name}' is shutting down`;
         for (const call of this.queue.splice(0)) this.settle(call, failureResult(message));
         const pids = [];
