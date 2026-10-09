@@ -64,15 +64,20 @@ const basePlan = {
     snapshot,
     lease: { id: snapshot.generation, snapshot, commit: () => true },
 };
-const agentRootPlan = (routeKey, url) => ({
-    ...basePlan,
-    ok: true,
-    kind: 'agent-root',
-    routeKey,
-    route: routing.routes[routeKey],
-    canonicalPath: new URL(url, 'http://localhost').pathname,
-    upstreamPath: '/mcp',
-});
+// Built as edgeRoutePlan does: the path after the route segment plus the query.
+const agentRootPlan = (routeKey, url) => {
+    const parsed = new URL(url, 'http://localhost');
+    const firstSlash = parsed.pathname.indexOf('/', 1);
+    return {
+        ...basePlan,
+        ok: true,
+        kind: 'agent-root',
+        routeKey,
+        route: routing.routes[routeKey],
+        canonicalPath: parsed.pathname,
+        upstreamPath: `${firstSlash < 0 ? '/' : parsed.pathname.slice(firstSlash) || '/'}${parsed.search}`,
+    };
+};
 
 function mockResponse() {
     let finish;
@@ -113,7 +118,7 @@ async function admit(url, plan) {
 const publicOwner = (surface, target) => ({ kind: 'public-none', surface, target });
 
 test('aggregate /mcp admits only the static owner whatever ?agent= selects', async () => {
-    for (const url of ['/mcp', '/mcp?agent=other', '/mcp?agent=secure']) {
+    for (const url of ['/mcp', '/mcp/', '/mcp?agent=other', '/mcp/?agent=secure']) {
         const { req, context, result } = await admit(url, basePlan);
         assert.equal(result.ok, true, url);
         assert.equal(context.routeKey, 'owner', url);
@@ -123,7 +128,10 @@ test('aggregate /mcp admits only the static owner whatever ?agent= selects', asy
 });
 
 test('agent /<route>/mcp admits exactly the genuinely public route, never ?agent=', async () => {
-    for (const url of ['/owner/mcp', '/owner/mcp?agent=other', '/owner/mcp?agent=secure']) {
+    for (const url of [
+        '/owner/mcp', '/owner/mcp?x=1', '/owner/mcp/sub?y=2', '/owner/mcp/sub',
+        '/owner/mcp?agent=other', '/owner/mcp?agent=secure',
+    ]) {
         const { req, context, result } = await admit(url, agentRootPlan('owner', url));
         assert.equal(result.ok, true, url);
         assert.equal(context.routeKey, 'owner', url);
