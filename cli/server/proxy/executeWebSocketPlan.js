@@ -234,6 +234,9 @@ export async function executeWebSocketPlan({
                 // listener a write rejected by a terminal relay stream
                 // (END, failure or abandon) escapes as an uncaught exception.
                 upstreamSocket.once('error', fail);
+                // The upgraded client socket is also a pipe destination and has
+                // no other 'error' listener once the HTTP server hands it over.
+                socket.once('error', fail);
                 socket.on('data', resetIdleTimer);
                 upstreamSocket.on('data', resetIdleTimer);
                 socket.pipe(clientFrames).pipe(upstreamSocket);
