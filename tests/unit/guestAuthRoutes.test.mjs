@@ -2183,6 +2183,15 @@ test('static-auth DPU WebChat admits only SSO users with Explorer access (G, NX,
         routePlan.snapshot.manifests.dpuAgent = {
             webchat: { auth: 'static', forwardEnvelope: true, runtimeScope: 'principal' },
         };
+        // Router authorization resolves a WebChat selector only to an enabled
+        // route of the snapshot, so the DPU target is registered like any agent.
+        routePlan.snapshot.routing.routes.dpuAgent = { agent: 'dpuAgent', repo: 'AchillesIDE', hostPort: 55290 };
+        routePlan.snapshot.agents.dpuAgent = {
+            type: 'agent',
+            agentName: 'dpuAgent',
+            repoName: 'AchillesIDE',
+            auth: { mode: 'none' },
+        };
         return routePlan;
     };
     const attempt = async ({ url, cookie = '', accept = 'text/html', method = 'GET' }) => {
