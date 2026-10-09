@@ -28,6 +28,7 @@ import {
 } from '../noWaitAgentStartupState.js';
 import { collectAgentsSummary } from '../../utils/status.js';
 import { isAdminUser } from '../auth/localService.js';
+import { projectMarketplaceAgent, projectMarketplaceRepository, projectRepositorySource } from './marketplaceProjection.js';
 import { canonicalControlOrigin, verifyAdminMutationRequest } from '../adminControlSecurity.js';
 import { verifyBrowserMutationRequest } from '../browserMutationSecurity.js';
 import { resolveAuthContextForRouteKey } from './authContext.js';
@@ -440,7 +441,15 @@ function enabledMarketplaceAgents(agentsRegistry) {
         }));
 }
 
-function buildMarketplaceRepositories({ registry } = {}) {
+// Local filesystem locations are visible to genuine administrators (Ploinky's
+// role-based, guest-rejecting predicate) and to bound agent-assertion callers,
+// which are machine principals with no user session. Every other caller,
+// including a missing user, receives the path-free projection.
+function mayViewLocalPaths({ user = null, machine = false } = {}) {
+    return machine === true || isAdminUser(user);
+}
+
+function buildMarketplaceRepositories({ registry, user = null, machine = false } = {}) {
     const predefined = reposSvc.getPredefinedRepos();
     const sources = reposSvc.getRepoSources();
     const installed = new Set(listAgentRepositoryNames());
@@ -479,7 +488,7 @@ function buildMarketplaceRepositories({ registry } = {}) {
             activeAgentsCount: activeAgentsByRepo.get(name) || 0
         };
     });
-    return { repositories };
+    return { repositories: mayViewLocalPaths({ user, machine }) ? repositories : repositories.map(projectMarketplaceRepository) };
 }
 
 function buildMarketplaceAgents(user = null, options = {}) {
@@ -551,7 +560,8 @@ function buildMarketplaceAgents(user = null, options = {}) {
         permissions: {
             canManage: isAdminUser(user)
         },
-        agents: agents.sort((left, right) => left.ref.localeCompare(right.ref)),
+        agents: agents.sort((left, right) => left.ref.localeCompare(right.ref))
+            .map(agent => (mayViewLocalPaths({ user, machine: options.machine }) ? agent : projectMarketplaceAgent(agent))),
         enabledAgents
     };
 }
@@ -559,7 +569,7 @@ function buildMarketplaceAgents(user = null, options = {}) {
 // Combined view retained for internal tests; no HTTP route exposes it.
 function buildMarketplaceState(user = null, options = {}) {
     const registry = options.registry || workspaceSvc.loadAgents();
-    return { ...buildMarketplaceAgents(user, { ...options, registry }), ...buildMarketplaceRepositories({ registry }) };
+    return { ...buildMarketplaceAgents(user, { ...options, registry }), ...buildMarketplaceRepositories({ registry, user, machine: options.machine }) };
 }
 
 function publicMarketplaceAuthContext(routePlan) {
@@ -708,6 +718,8 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
             if (liveContainers === MARKETPLACE_INVENTORY_SKIPPED || watch.isClosed()) return MARKETPLACE_REQUEST_CLOSED;
             options = { ...agentListOptions, liveContainers };
         }
+        // Agent-assertion callers are machine principals; every session caller is judged by role.
+        options = { ...options, machine: Boolean(readAuthorizationBearer(req)) };
         return {
             ...buildMarketplaceAgents(req.user, options),
             permissions: {
@@ -727,7 +739,9 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
         if (!await authorizeRead()) return true;
         const repositories = await runPreparedRepositoryRead(res, () => reposSvc.listRepositorySources(), { catalog: true });
         if (repositories === MARKETPLACE_REQUEST_CLOSED) return true;
-        sendJson(res, 200, { ok: true, repositories });
+        const visible = mayViewLocalPaths({ user: req.user, machine: Boolean(readAuthorizationBearer(req)) })
+            ? repositories : repositories.map(projectRepositorySource);
+        sendJson(res, 200, { ok: true, repositories: visible });
         return true;
     }
 
@@ -737,7 +751,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
     }
 
     const isRepos = route.resource === 'repos';
-    const marketplacePayload = async () => runPreparedRepositoryRead(res, () => (isRepos ? buildMarketplaceRepositories() : agentsMarketplace()), { catalog: isRepos });
+    const marketplacePayload = async () => runPreparedRepositoryRead(res, () => (isRepos ? buildMarketplaceRepositories({ user: req.user, machine: Boolean(readAuthorizationBearer(req)) }) : agentsMarketplace()), { catalog: isRepos });
 
     if (method === 'GET') {
         if (!await authorizeRead()) return true;
