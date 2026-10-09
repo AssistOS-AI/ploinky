@@ -146,7 +146,8 @@ function createAgentClient(baseUrl, options = {}) {
         if (transport?.terminateSession) await transport.terminateSession();
         releasedSessionIds.add(session.sessionId);
       } catch (_) {
-        // terminateSession() sends a single bounded DELETE and does not retry.
+        // terminateSession() sends a single DELETE (the SDK gives it no timeout)
+        // and does not retry.
         // An HTTP rejection means the upstream answered; a network error means
         // it was not reached, and the DELETE is deliberately not repeated: the
         // session is marked released either way so close() stays exactly-once.

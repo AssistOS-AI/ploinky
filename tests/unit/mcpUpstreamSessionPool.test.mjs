@@ -1116,7 +1116,17 @@ async function sdkGuardRefusalRelease(t, { agentName, warm }) {
     const { route, routePlan } = proxyRoute(held.upstream.port, `sdk-guard-release-${agentName}`, undefined, agentName);
     let warmRpcs = null;
     if (warm) {
-        const warmUpstream = await startFakeUpstream(t);
+        // A valid tools/list result is required: the SDK rejects `{}`, and
+        // canonicalization swallows that error, leaving the cache cold.
+        const warmUpstream = await startFakeUpstream(t, { onRpc: async ({ res, message }) => {
+            if (message?.method !== 'tools/list') return false;
+            const data = Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: {
+                tools: [{ name: 'actor', inputSchema: { type: 'object', properties: { label: { type: 'string' } } } }],
+            } }));
+            res.writeHead(200, { 'content-type': 'application/json', 'content-length': data.length });
+            res.end(data);
+            return true;
+        } });
         const warmRoute = proxyRoute(warmUpstream.port, `schema-warm-${agentName}`, undefined, agentName);
         const warmSession = openRouterSession(proxy, { agentName });
         const warmed = await proxyCall(proxy, { route: warmRoute.route, routePlan: warmRoute.routePlan,
@@ -1140,17 +1150,25 @@ async function sdkGuardRefusalRelease(t, { agentName, warm }) {
     await new Promise(resolve => setTimeout(resolve, 100));
     assert.deepEqual(held.deletes(), [allocated]);
     assert.deepEqual(held.posts(), ['initialize']);
-    return { warmRpcs };
+    const initialize = held.upstream.log.find(row => row.rpc === 'initialize');
+    const release = held.upstream.log.find(row => row.httpMethod === 'DELETE');
+    return { warmRpcs, initializeAuthorization: initialize.authorization, releaseAuthorization: release.authorization };
 }
 
 test('proxy SDK path (cold schema cache): the shared client owns the open and its refused session is released once', { timeout: 10000 }, async (t) => {
-    const { warmRpcs } = await sdkGuardRefusalRelease(t, { agentName: 'sdkColdSchemaAgent', warm: false });
+    const { warmRpcs, initializeAuthorization, releaseAuthorization } = await sdkGuardRefusalRelease(t,
+        { agentName: 'sdkColdSchemaAgent', warm: false });
     assert.equal(warmRpcs, null, 'no tools/list was ever served for this agent name');
+    assert.equal(initializeAuthorization, '', 'the shared tools/list client sends no minted token');
+    assert.equal(releaseAuthorization, '', 'its release DELETE sends no minted token');
 });
 
 test('proxy SDK path (warm schema cache): the per-call client owns the open and its refused session is released once', { timeout: 10000 }, async (t) => {
-    const { warmRpcs } = await sdkGuardRefusalRelease(t, { agentName: 'sdkWarmSchemaAgent', warm: true });
-    assert.ok(warmRpcs.includes('tools/list'), 'the priming call populated the tool-schema cache through tools/list');
+    const { warmRpcs, initializeAuthorization, releaseAuthorization } = await sdkGuardRefusalRelease(t,
+        { agentName: 'sdkWarmSchemaAgent', warm: true });
+    assert.ok(warmRpcs.includes('tools/list'), 'the priming call served tools/list');
+    assert.match(initializeAuthorization, /^Bearer .+/, 'the per-call client owns the held initialize');
+    assert.match(releaseAuthorization, /^Bearer .+/, 'the per-call client releases with the minted token');
 });
 
 test('aggregate: a guard refusal of notifications/initialized releases the allocated session once', { timeout: 10000 }, async (t) => {
