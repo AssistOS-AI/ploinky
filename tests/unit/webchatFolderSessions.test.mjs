@@ -52,8 +52,9 @@ test('WebChat keeps desktop actions in the header and moves them into the mobile
     const presence = header.slice(header.indexOf('wa-header-presence'), header.indexOf('wa-header-info'));
     assert.match(presence, /wa-header-avatar offline[^>]*id="headerAvatar"[\s\S]*id="status"/);
     assert.doesNotMatch(header.slice(header.indexOf('id="headerActions"')), /id="status"/);
-    assert.match(header, /id="runtimeModelRow" hidden[\s\S]*LLM model:[\s\S]*id="runtimeModel"/);
-    assert.match(css, /\.wa-header-title-row\s*\{[^}]*flex-direction:\s*column/s);
+    assert.match(header, /class="wa-header-title-row">\s*<div class="wa-header-title" id="titleBar"><\/div>\s*<span class="wa-runtime-model" id="runtimeModel" hidden><\/span>\s*<\/div>/);
+    assert.doesNotMatch(header, /LLM model:|runtimeModelRow|wa-runtime-model-label/);
+    assert.match(css, /\.wa-header-title-row\s*\{[^}]*flex-direction:\s*row[^}]*align-items:\s*baseline/s);
     assert.match(css, /\.wa-header-avatar\.online\s*\{[^}]*background-color:/s);
     assert.match(css, /\.wa-header-avatar\.offline\s*\{[^}]*background-color:/s);
     assert.match(header, /id="status"[^>]*role="status"[^>]*aria-live="polite"/);
