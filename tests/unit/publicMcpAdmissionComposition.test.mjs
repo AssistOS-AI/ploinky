@@ -175,6 +175,12 @@ test('only requests the Router dispatches to an MCP handler can admit a public t
     ]) {
         await none(url, basePlan);
     }
+    // An agent route that is not the MCP mount is an ordinary agent request.
+    for (const [url, upstreamPath] of [
+        ['/owner/dashboard', '/dashboard'], ['/owner/mcpx', '/mcpx'], ['/owner/api/mcp', '/api/mcp'], ['/owner/', '/'],
+    ]) {
+        await none(url, { ...agentRootPlan('owner', url), upstreamPath });
+    }
     // A request with no route plan has no canonical classification.
     const parsedUrl = new URL('/mcp', 'http://localhost');
     const req = mcpRequest('/mcp');
