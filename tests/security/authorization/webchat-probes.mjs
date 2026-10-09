@@ -82,6 +82,17 @@ export function webchatCheckDefinitions() {
  * object with statusCode, headers, setEncoding, on and destroy, so the parser
  * is exercised offline with a fake response.
  */
+const openStreamRegistry = new Set();
+/** Close every stream this process opened, whatever state the probes ended in. */
+export function closeAllOpenStreams() {
+    for (const handle of [...openStreamRegistry]) {
+        try { handle.close(); } catch { /* already closed */ }
+        openStreamRegistry.delete(handle);
+    }
+    return openStreamRegistry.size;
+}
+export const openStreamCount = () => openStreamRegistry.size;
+
 export function createStreamHandle(res, req, { maxBytes = webchatProbe.maxEventBytes } = {}) {
     let buffer = '';
     let ended = false;
@@ -100,8 +111,9 @@ export function createStreamHandle(res, req, { maxBytes = webchatProbe.maxEventB
                 waiters.add(waiter);
             });
         },
-        close() { res.destroy(); req?.destroy?.(); },
+        close() { openStreamRegistry.delete(handle); res.destroy(); req?.destroy?.(); },
     };
+    openStreamRegistry.add(handle);
     res.setEncoding('utf8');
     res.on('data', chunk => {
         buffer += chunk;
@@ -121,8 +133,8 @@ export function createStreamHandle(res, req, { maxBytes = webchatProbe.maxEventB
         }
     });
     // A transport end or close is observable: readiness must not wait on a dead stream.
-    for (const name of ['end', 'close']) res.on(name, () => { ended = true; });
-    res.on('error', () => { ended = true; });
+    for (const name of ['end', 'close']) res.on(name, () => { ended = true; openStreamRegistry.delete(handle); });
+    res.on('error', () => { ended = true; openStreamRegistry.delete(handle); });
     return handle;
 }
 
@@ -307,6 +319,9 @@ export async function runWebchatProbes(ctx, { openStream = openEventStream, insp
         closeOwnedStreams();
         assert.equal(await waitRemoved(), 0, 'Test-owned WebChat runtimes remained after cleanup');
     });
+    // The cleanup above runs behind the ownership guard and is skipped when the guard fails; the
+    // finalizer is not guarded, so the streams are closed on every exit path.
+    (ctx.finalizers ||= []).push(async () => { closeOwnedStreams(); });
     // Every GET /stream creates runtime state, so each one passes the ownership guard first.
     // A stream that will receive input or be censused must first report
     // `startup-state: ready`; failure, close, end and the deadline all fail.
