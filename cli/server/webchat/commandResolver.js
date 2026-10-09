@@ -242,11 +242,91 @@ async function resolveWebchatCommandsForAgentAsync(agentRef, options = {}) {
     };
 }
 
+const WEBCHAT_PROVENANCE_FIELDS = ['routeKey', 'hostPath', 'container', 'alias', 'repo', 'agent', 'cliTarget'];
+
+// The executable identity of one enabled route: where its manifest lives and
+// which `ploinky cli` target it launches. Both the Router authorization
+// snapshot and the on-disk routing file are reduced with this same rule so a
+// WebChat launch can prove it runs the target its authorization admitted.
+function webchatRouteProvenance(routing, routeKey) {
+    const key = trimCommand(routeKey);
+    const routes = routing?.routes && typeof routing.routes === 'object' ? routing.routes : {};
+    const route = key && Object.hasOwn(routes, key) ? routes[key] : null;
+    if (!route || typeof route !== 'object' || route.disabled) return null;
+    const staticAgent = trimCommand(routing?.static?.agent);
+    const shortStatic = staticAgent.includes('/') ? staticAgent.split('/').pop() : staticAgent;
+    const isStatic = Boolean(staticAgent) && (
+        staticAgent === key
+        || shortStatic === key
+        || (route.repo && route.agent && `${route.repo}/${route.agent}` === staticAgent)
+    );
+    return {
+        routeKey: key,
+        hostPath: trimCommand(route.hostPath || (isStatic ? routing?.static?.hostPath : '')),
+        container: trimCommand(route.container),
+        alias: trimCommand(route.alias),
+        repo: trimCommand(route.repo),
+        agent: trimCommand(route.agent),
+        cliTarget: resolveCliTarget(route, key),
+    };
+}
+
+function manifestWebchatDeclaration(manifest) {
+    const surface = manifest && typeof manifest === 'object' ? manifest.webchat : undefined;
+    const value = typeof surface === 'string' ? surface : surface?.auth;
+    return String(value || '').trim().toLowerCase();
+}
+
+async function readManifestAsync(manifestPath) {
+    try {
+        return JSON.parse(await fs.promises.readFile(manifestPath, 'utf8'));
+    } catch (_) {
+        return null;
+    }
+}
+
+// Resolves the commands for exactly the target bound by Router authorization.
+// The caller never supplies an agent name: the target, its executable
+// provenance and its declared WebChat policy come from the authorization
+// snapshot and must still match the routing file and manifest on disk.
+async function resolveWebchatCommandsForBindingAsync(binding, options = {}) {
+    const expected = binding?.targetRoute;
+    const routeKey = trimCommand(binding?.target);
+    if (!routeKey || !expected || expected.routeKey !== routeKey || !expected.hostPath) {
+        return { changed: true };
+    }
+    const routing = await readRoutingConfigAsync(options.routingFilePath || ROUTING_FILE);
+    const actual = routing ? webchatRouteProvenance(routing, routeKey) : null;
+    if (!actual || WEBCHAT_PROVENANCE_FIELDS.some((field) => actual[field] !== expected[field])) {
+        return { changed: true };
+    }
+    const manifest = await readManifestAsync(path.join(actual.hostPath, 'manifest.json'));
+    if (!manifest || manifestWebchatDeclaration(manifest) !== String(binding.declaration || '')) {
+        return { changed: true };
+    }
+    const cliArgs = normalizeCliArgs(options.cliArgs);
+    const cacheSuffix = cliArgs.join('\u0000');
+    return {
+        host: buildHostCliCommand(actual.cliTarget, { cliArgs }),
+        container: extractManifestCli(manifest),
+        source: 'manifest',
+        agentName: routeKey,
+        cliTarget: actual.cliTarget,
+        cliArgs,
+        provenance: { ...actual, generation: String(binding.generation || '') },
+        ...extractManifestWebchatOptions(manifest),
+        cacheKey: cacheSuffix ? `webchat:${routeKey}:${cacheSuffix}` : `webchat:${routeKey}`
+    };
+}
+
 export {
     resolveWebchatCommands,
     resolveWebchatCommandsForAgent,
     resolveWebchatCommandsAsync,
     resolveWebchatCommandsForAgentAsync,
+    resolveWebchatCommandsForBindingAsync,
+    webchatRouteProvenance,
+    manifestWebchatDeclaration,
     extractManifestCli,
     extractManifestWebchatOptions,
     trimCommand

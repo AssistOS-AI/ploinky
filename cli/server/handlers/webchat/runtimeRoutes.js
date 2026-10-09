@@ -10,7 +10,10 @@ import {
     buildRuntimeKey,
     disposeTab,
     getRuntimeMap,
+    hasRuntimeBackgroundTasks,
     interactionTargetsClient,
+    isPrincipalScopedRuntime,
+    resolveRuntimePrincipal,
     scheduleDisconnectedTabCleanup,
     routeWorkspaceRuntimeOutput,
     serializeInteractionRequestSseEvent,
@@ -24,6 +27,7 @@ import {
 } from './runtimeState.js';
 
 const MAX_INTERACTION_RESPONSE_BYTES = 16 * 1024;
+const MAX_RUNTIMES_PER_PRINCIPAL = 3;
 const INTERACTION_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const PAGE_INSTANCE_RE = /^[A-Za-z0-9_-]{1,128}$/;
 
@@ -60,6 +64,41 @@ function disposeUnavailableRuntime(tab, runtimeKey, runtimes) {
     disposeTab(tab, runtimeKey, { runtimes });
 }
 
+function runtimeAgentName(effectiveConfig) {
+    return String(effectiveConfig?.agentName || effectiveConfig?.displayName || 'webchat').trim();
+}
+
+function isIdleRuntime(tab) {
+    const connected = tab.subscribers instanceof Map ? tab.subscribers.size > 0 : Boolean(tab.sseRes);
+    if (connected) return false;
+    try {
+        return !hasRuntimeBackgroundTasks(tab);
+    } catch (_) {
+        return false;
+    }
+}
+
+// A principal may hold a bounded number of runtimes per agent. At the bound,
+// that principal's oldest idle runtime (no connected stream and no running
+// background task) is disposed; with none idle, the new runtime is refused.
+// This runs synchronously between the lookup and the insertion of the new tab.
+function admitPrincipalRuntime(runtimes, principal, agent) {
+    for (;;) {
+        const owned = [...runtimes.entries()].filter(([, tab]) => tab
+            && !tab.disposed
+            && tab.runtimePrincipal === principal
+            && tab.runtimeAgent === agent);
+        if (owned.length < MAX_RUNTIMES_PER_PRINCIPAL) return true;
+        const oldestIdle = owned
+            .filter(([, tab]) => isIdleRuntime(tab))
+            .sort(([, left], [, right]) => (left.createdAt || 0) - (right.createdAt || 0))[0];
+        if (!oldestIdle) return false;
+        const [runtimeKey, tab] = oldestIdle;
+        console.log('[webchat] Evicting an idle per-user runtime to admit a new one.');
+        disposeTab(tab, runtimeKey, { runtimes });
+    }
+}
+
 export function handleRuntimeRoute({
     pathname,
     req,
@@ -70,6 +109,13 @@ export function handleRuntimeRoute({
     effectiveConfig,
     agentQuery
 }) {
+    const principalScoped = isPrincipalScopedRuntime(effectiveConfig);
+    const principal = principalScoped ? resolveRuntimePrincipal(req) : '';
+    if (principalScoped && !principal) {
+        res.writeHead(403, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
+        return res.end('This WebChat agent requires an authenticated user.');
+    }
+
     if (pathname === '/stream') {
         const sid = getSession(req, appState);
         const tabId = String(parsedUrl.searchParams.get('tabId') || '').trim();
@@ -77,7 +123,7 @@ export function handleRuntimeRoute({
         if (!sid || !tabId) { res.writeHead(400); return res.end(); }
 
         const runtimes = getRuntimeMap(appState);
-        const runtimeKey = buildRuntimeKey(workspaceDirectory, effectiveConfig, agentQuery);
+        const runtimeKey = buildRuntimeKey(workspaceDirectory, effectiveConfig, agentQuery, principal);
         let tab = runtimes.get(runtimeKey);
 
         if (tab && !isRuntimeWritable(tab)) {
@@ -85,6 +131,10 @@ export function handleRuntimeRoute({
             tab = null;
         }
 
+        if (!tab && principalScoped && !admitPrincipalRuntime(runtimes, principal, runtimeAgentName(effectiveConfig))) {
+            res.writeHead(429, { 'Content-Type': 'text/plain', 'Retry-After': '30' });
+            return res.end('Too many WebChat sessions are open for this agent. Close one and try again.');
+        }
         if (!tab && runtimes.size >= 20) {
             res.writeHead(503, { 'Content-Type': 'text/plain', 'Retry-After': '30' });
             return res.end('Server at capacity. Please try again later.');
@@ -111,6 +161,8 @@ export function handleRuntimeRoute({
                     cleanupTimer: null,
                     ttyClosed: false,
                     runtimeKey,
+                    runtimePrincipal: principal,
+                    runtimeAgent: runtimeAgentName(effectiveConfig),
                     workspaceDirectory,
                     webchatSessionSnapshot: null,
                     liveMessageCount: 0,
@@ -244,7 +296,7 @@ export function handleRuntimeRoute({
         const tabId = String(parsedUrl.searchParams.get('tabId') || '').trim();
         const pageInstanceId = pageInstanceIdFrom(parsedUrl);
         const runtimes = getRuntimeMap(appState);
-        const runtimeKey = buildRuntimeKey(workspaceDirectory, effectiveConfig, agentQuery);
+        const runtimeKey = buildRuntimeKey(workspaceDirectory, effectiveConfig, agentQuery, principal);
         const tab = runtimes.get(runtimeKey);
         if (!tabId || !isRuntimeWritable(tab)) {
             disposeUnavailableRuntime(tab, runtimeKey, runtimes);
@@ -317,7 +369,7 @@ export function handleRuntimeRoute({
     }
 
     if (pathname === '/control' && req.method === 'POST') {
-        const runtimeKey = buildRuntimeKey(workspaceDirectory, effectiveConfig, agentQuery);
+        const runtimeKey = buildRuntimeKey(workspaceDirectory, effectiveConfig, agentQuery, principal);
         const runtimes = getRuntimeMap(appState);
         const tab = runtimes.get(runtimeKey);
         if (!isRuntimeWritable(tab)) {
@@ -349,7 +401,7 @@ export function handleRuntimeRoute({
         const sid = getSession(req, appState);
         const tabId = String(parsedUrl.searchParams.get('tabId') || '').trim();
         const pageInstanceId = pageInstanceIdFrom(parsedUrl);
-        const runtimeKey = buildRuntimeKey(workspaceDirectory, effectiveConfig, agentQuery);
+        const runtimeKey = buildRuntimeKey(workspaceDirectory, effectiveConfig, agentQuery, principal);
         const runtimes = getRuntimeMap(appState);
         const tab = runtimes.get(runtimeKey);
         const ownsSubscriber = tab?.subscribers instanceof Map

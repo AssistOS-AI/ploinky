@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { assertDenied, WORKSPACE } from './core.mjs';
+import { createHash } from 'node:crypto';
+import { assertDenied, TARGET, WORKSPACE } from './core.mjs';
 
 const deniedActors = ['anonymous', 'selfRegistered', 'userA', 'userB'];
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -20,7 +21,7 @@ export function markerCommand(prefix, marker) {
   return `printf '%s\\n' '${marker}' > '${fixture.container}/marker.txt'\n`;
 }
 
-async function registerDirectory(ctx) {
+export async function registerDirectory(ctx) {
   const fixture = terminalFixtureNames(ctx.prefix);
   await ctx.guard();
   assert.equal(await fs.realpath(WORKSPACE), WORKSPACE);
@@ -65,52 +66,176 @@ async function runWorkspaceSelectorProbes(ctx, fixture) {
   });
   if (!controls.has('admin') || !controls.has('userA') || !controls.has('userB')) {
     ctx.recordGap('router:workspace-file-selector-bypass', 'Existing fixture read positive controls failed; no selector-bypass denial is credited.');
-    return;
-  }
-  const selectors = ['', '?agent=authorization-suite-nonexistent', '?agent=userPersistoAgent'];
-  const leaked = [];
-  for (const actor of ['anonymous', 'selfRegistered']) for (const selector of selectors) {
-    await ctx.check(`router:workspace-file-selector-deny:${actor}:${selector || 'default'}`, async () => {
-      const response = await ctx.request(actor, { path: resource + selector });
-      const exposed = response.status === 200 && response.text === baseline;
-      if (exposed) leaked.push({ actor, selector });
-      ctx.report.workspaceSelectorEvidence ||= [];
-      ctx.report.workspaceSelectorEvidence.push({ actor, selector: selector || 'default', status: response.status, fixtureContentDisclosed: exposed });
-      assertDenied(response);
-      assert.equal(response.text.includes(baseline), false, 'Denied response must not disclose fixture content');
-    });
-  }
-  // A confirmed read bypass justifies one bounded, unique write probe per
-  // affected principal/selector. Files stay inside the exclusively owned folder.
-  for (const [index, { actor, selector }] of leaked.entries()) {
-    const name = `bypass-write-${index}.txt`;
-    const target = path.join(fixture.host, name);
-    await ctx.guard();
-    await fs.writeFile(target, baseline, { flag: 'wx', mode: 0o644 });
-    const requestedPath = `${fixture.directory}/${name}`;
-    let positive = false;
-    await ctx.check(`router:workspace-upload-positive:${index}`, async () => {
-      const response = await ctx.request('admin', { method: 'PUT', path: `/upload?path=${encodeURIComponent(requestedPath)}`, body: baseline, headers: { 'content-type': 'text/plain' } });
-      assert.equal(response.status, 200);
-      assert.equal(response.json?.ok, true);
-      assert.equal(await fs.readFile(target, 'utf8'), baseline);
-      positive = true;
-    });
-    if (!positive) {
-      ctx.recordGap(`router:workspace-upload-selector-deny:${actor}:${index}`, 'Authorized upload to existing disposable file failed.');
-      continue;
-    }
-    await ctx.check(`router:workspace-upload-selector-deny:${actor}:${index}`, async () => {
-      const response = await ctx.request(actor, {
-        method: 'PUT', path: `/upload?path=${encodeURIComponent(requestedPath)}${selector.replace('?', '&')}`,
-        body: `${ctx.prefix}-unauthorized-upload`, proof: false, headers: { 'content-type': 'text/plain' },
+  } else {
+    const selectors = ['', '?agent=authorization-suite-nonexistent', '?agent=userPersistoAgent'];
+    for (const actor of ['anonymous', 'selfRegistered']) for (const selector of selectors) {
+      await ctx.check(`router:workspace-file-selector-deny:${actor}:${selector || 'default'}`, async () => {
+        const response = await ctx.request(actor, { path: resource + selector });
+        const exposed = response.status === 200 && response.text === baseline;
+        ctx.report.workspaceSelectorEvidence ||= [];
+        ctx.report.workspaceSelectorEvidence.push({ actor, selector: selector || 'default', status: response.status, fixtureContentDisclosed: exposed });
+        assertDenied(response);
+        assert.equal(response.text.includes(baseline), false, 'Denied response must not disclose fixture content');
       });
-      const changed = (await fs.readFile(target, 'utf8')) !== baseline;
-      ctx.report.workspaceSelectorEvidence.push({ actor, selector: selector || 'default', operation: 'upload', status: response.status, fixtureChanged: changed, originAndCsrfOmitted: true });
-      assert.equal(changed, false, 'Unprivileged selector changed an existing test-owned workspace file without Origin or CSRF');
+    }
+  }
+  // The write matrix never depends on a read leak: it runs after a positive
+  // write that changes and persists bytes, whatever the read probes found.
+  await runWorkspaceWriteMatrix(ctx, fixture, filename);
+}
+
+const SINK_SELECTORS = ['default', 'authorization-suite-nonexistent', 'userPersistoAgent', 'webAssist', 'webmeetAgent'];
+const SINK_DENIALS = [['anonymous', 'absent'], ['selfRegistered', 'absent'], ['selfRegistered', 'valid'], ['userA', 'absent'], ['userA', 'invalid']];
+const WEBCHAT_SELECTORS = ['default', 'webAssist', 'webmeetAgent'];
+const WEBCHAT_OPERATIONS = ['upload', 'directory-create', 'directory-list', 'suggestions'];
+const WEBCHAT_UNSAFE_OPERATIONS = ['upload', 'directory-create'];
+
+// The exact, fixed write-matrix identities. Denials and positives are listed
+// here so the offline harness tests can pin the counts.
+export function workspaceWriteMatrix() {
+  const positives = [
+    { id: 'router:workspace-upload-owner-positive:admin', operation: 'sink-upload', actor: 'admin', proof: 'valid', selector: 'default' },
+    ...['default', 'userPersistoAgent'].map(selector => ({ id: `router:workspace-upload-positive:userA:valid:${selector}`, operation: 'sink-upload', actor: 'userA', proof: 'valid', selector })),
+    { id: 'router:webchat-upload-positive:admin', operation: 'upload', actor: 'admin', proof: 'valid', selector: 'default' },
+    { id: 'router:webchat-directory-create-positive:admin', operation: 'directory-create', actor: 'admin', proof: 'valid', selector: 'default' },
+    { id: 'router:webchat-directory-list-positive:userA', operation: 'directory-list', actor: 'userA', proof: 'absent', selector: 'default' },
+    { id: 'router:webchat-suggestions-positive:userA', operation: 'suggestions', actor: 'userA', proof: 'absent', selector: 'default' },
+  ];
+  const denials = [];
+  for (const [actor, proof] of SINK_DENIALS) for (const selector of SINK_SELECTORS) {
+    denials.push({ id: `router:workspace-upload-deny:${actor}:${proof}:${selector}`, operation: 'sink-upload', actor, proof, selector });
+  }
+  for (const operation of WEBCHAT_OPERATIONS) for (const actor of ['anonymous', 'selfRegistered']) for (const selector of WEBCHAT_SELECTORS) {
+    // Unsafe operations send a valid-looking request; GET/HEAD reads never need proof.
+    denials.push({ id: `router:webchat-${operation}-deny:${actor}:${selector}`, operation, actor, proof: WEBCHAT_UNSAFE_OPERATIONS.includes(operation) ? 'valid' : 'absent', selector });
+  }
+  for (const operation of WEBCHAT_UNSAFE_OPERATIONS) for (const proof of ['absent', 'invalid']) for (const selector of WEBCHAT_SELECTORS) {
+    denials.push({ id: `router:webchat-${operation}-deny:userA:${proof}:${selector}`, operation, actor: 'userA', proof, selector });
+  }
+  return { positives, denials };
+}
+
+function proofOptions(proof, nonce) {
+  if (proof === 'valid') return { proof: true };
+  if (proof === 'invalid') return { proof: false, headers: { origin: TARGET, 'x-ploinky-browser-csrf-token': `v2.authorization-suite-invalid-${nonce}` } };
+  return { proof: false };
+}
+
+function selectorQuery(selector) {
+  return selector === 'default' ? '' : `agent=${encodeURIComponent(selector)}`;
+}
+
+function joinQuery(base, selector) {
+  const extra = selectorQuery(selector);
+  if (!extra) return base;
+  return `${base}${base.includes('?') ? '&' : '?'}${extra}`;
+}
+
+export function workspaceWriteRequest(row, fixture, payload) {
+  const options = proofOptions(row.proof, payload.slice(-12));
+  const headers = { ...(options.headers || {}) };
+  if (row.operation === 'sink-upload') {
+    return { method: 'PUT', path: joinQuery(`/upload?path=${encodeURIComponent(`${fixture.directory}/fixture.txt`)}`, row.selector),
+      body: payload, proof: options.proof, headers: { ...headers, 'content-type': 'text/plain' } };
+  }
+  if (row.operation === 'upload') {
+    return { method: 'POST', path: joinQuery('/webchat/uploads', row.selector), body: payload, proof: options.proof,
+      headers: { ...headers, 'content-type': 'text/plain', 'x-file-name': 'fixture.txt', 'x-destination-path': encodeURIComponent(fixture.directory), 'x-overwrite': '1' } };
+  }
+  if (row.operation === 'directory-create') {
+    return { method: 'POST', path: joinQuery('/webchat/directories', row.selector), body: { path: `${fixture.directory}/${payload}` },
+      proof: options.proof, headers };
+  }
+  if (row.operation === 'directory-list') {
+    return { method: 'GET', path: joinQuery(`/webchat/directories?path=${encodeURIComponent(fixture.directory)}`, row.selector), headers };
+  }
+  return { method: 'GET', path: joinQuery(`/webchat/suggestions/files?query=${encodeURIComponent(`${fixture.directory}/fix`)}`, row.selector), headers };
+}
+
+async function fileSha(filename) {
+  return createHash('sha256').update(await fs.readFile(filename)).digest('hex');
+}
+
+export async function runWorkspaceWriteMatrix(ctx, fixture, filename) {
+  const { positives, denials } = workspaceWriteMatrix();
+  const byId = new Map(positives.map(row => [row.id, row]));
+  let counter = 0;
+  const payload = label => `${ctx.prefix}-${label}-${++counter}`;
+  let current = null;
+  ctx.report.workspaceWriteEvidence ||= [];
+
+  async function positiveWrite(row) {
+    let passed = false;
+    await ctx.check(row.id, async () => {
+      const body = payload(row.operation === 'upload' ? 'webchat-positive' : 'sink-positive');
+      const before = await fileSha(filename);
+      const response = await ctx.request(row.actor, workspaceWriteRequest(row, fixture, body));
+      assert.ok([200, 201].includes(response.status), `Authorized write must succeed; got ${response.status}`);
+      assert.equal(response.json?.ok, true);
+      assert.equal(await fs.readFile(filename, 'utf8'), body, 'Authorized write must persist its own distinct bytes');
+      const readBack = await ctx.request('admin', { path: `/workspace-files/${fixture.directory}/fixture.txt` });
+      assert.equal(readBack.status, 200);
+      assert.equal(readBack.text, body, 'Read-back must return the bytes just written');
+      current = await fileSha(filename);
+      assert.notEqual(current, before, 'Positive control must change the fixture bytes');
+      ctx.report.workspaceWriteEvidence.push({ id: row.id, status: response.status, sha256: current });
+      passed = true;
+    });
+    return passed;
+  }
+
+  async function denial(row, dependsOn) {
+    if (!dependsOn) {
+      ctx.recordGap(row.id, 'positive-unavailable: the owning authorized write control did not change the fixture.');
+      return;
+    }
+    await ctx.check(row.id, async () => {
+      const body = payload('deny');
+      const response = await ctx.request(row.actor, workspaceWriteRequest(row, fixture, body));
+      const after = await fileSha(filename);
+      const created = row.operation === 'directory-create'
+        ? await fs.stat(path.join(fixture.host, body)).then(() => true, () => false)
+        : false;
+      const expected = current;
+      // Each denial is judged on its own distinct payload; a leaking write
+      // re-baselines the hash so later denials are not blamed for it.
+      current = after;
+      ctx.report.workspaceWriteEvidence.push({ id: row.id, status: response.status, fixtureChanged: after !== expected, directoryCreated: created });
+      assert.equal(after, expected, 'A denied request changed the owned fixture bytes');
+      assert.equal(created, false, 'A denied request created a workspace directory');
+      assert.equal(response.text.includes('fixture.txt'), false, 'A denied request disclosed a workspace listing');
       assertDenied(response);
     });
   }
+
+  const ownerPositive = await positiveWrite(byId.get('router:workspace-upload-owner-positive:admin'));
+  for (const row of denials.filter(item => item.operation === 'sink-upload')) await denial(row, ownerPositive);
+  for (const selector of ['default', 'userPersistoAgent']) {
+    await positiveWrite(byId.get(`router:workspace-upload-positive:userA:valid:${selector}`));
+  }
+  const webchatControls = new Map();
+  webchatControls.set('upload', await positiveWrite(byId.get('router:webchat-upload-positive:admin')));
+  const createRow = byId.get('router:webchat-directory-create-positive:admin');
+  webchatControls.set('directory-create', false);
+  await ctx.check(createRow.id, async () => {
+    const name = payload('directory-positive');
+    const response = await ctx.request(createRow.actor, workspaceWriteRequest(createRow, fixture, name));
+    assert.equal(response.status, 201, `Authorized directory creation must succeed; got ${response.status}`);
+    assert.equal(response.json?.ok, true);
+    assert.ok((await fs.stat(path.join(fixture.host, name))).isDirectory(), 'Authorized directory must exist');
+    webchatControls.set('directory-create', true);
+  });
+  for (const [operation, id] of [['directory-list', 'router:webchat-directory-list-positive:userA'], ['suggestions', 'router:webchat-suggestions-positive:userA']]) {
+    const row = byId.get(id);
+    webchatControls.set(operation, false);
+    await ctx.check(id, async () => {
+      const response = await ctx.request(row.actor, workspaceWriteRequest(row, fixture, ''));
+      assert.equal(response.status, 200, `Authorized read must succeed without a mutation proof; got ${response.status}`);
+      assert.ok(response.text.includes('fixture.txt'), 'Authorized read must return the fixture entry');
+      webchatControls.set(operation, true);
+    });
+  }
+  for (const row of denials.filter(item => item.operation !== 'sink-upload')) await denial(row, webchatControls.get(row.operation));
 }
 
 async function runTerminalProbes(ctx, fixture) {
@@ -342,4 +467,34 @@ export async function runStreamProbes(ctx) {
   await runWorkspaceSelectorProbes(ctx, fixture);
   await runMcpSessionOwnership(ctx);
   ctx.recordGap('router:stream-revocation-continuation', 'Terminal SSE handshake and existing-session role checks were bounded at response headers; an already-open stream was not held across provider revocation.');
+}
+
+// Bounded single-case proof used by the focused pre-fix entry: one anonymous
+// WebChat overwrite attempt through an undeclared guest selector against a
+// file this run created. It never runs the rest of the matrix.
+export async function runWebchatUploadDenialProof(ctx, { id = 'router:webchat-upload-deny:anonymous:webAssist', register = registerDirectory } = {}) {
+  const row = workspaceWriteMatrix().denials.find(item => item.id === id);
+  assert.ok(row && row.operation === 'upload', 'Focused proof must name a WebChat upload denial');
+  const fixture = await register(ctx);
+  const filename = path.join(fixture.host, 'fixture.txt');
+  const baseline = `${ctx.prefix}-prefix-baseline`;
+  await ctx.guard();
+  await fs.writeFile(filename, baseline, { flag: 'wx', mode: 0o644 });
+  const before = await fileSha(filename);
+  const payload = `${ctx.prefix}-prefix-denial-payload`;
+  await ctx.check(row.id, async () => {
+    const response = await ctx.request(row.actor, workspaceWriteRequest(row, fixture, payload));
+    const content = await fs.readFile(filename, 'utf8');
+    const after = await fileSha(filename);
+    ctx.report.focusedProof = {
+      id: row.id,
+      status: response.status,
+      beforeSha256: before,
+      afterSha256: after,
+      fixtureChanged: after !== before,
+      fixtureHoldsDenialPayload: content === payload,
+    };
+    assert.equal(after, before, 'Anonymous WebChat upload through an undeclared selector changed a test-owned file');
+    assertDenied(response);
+  });
 }

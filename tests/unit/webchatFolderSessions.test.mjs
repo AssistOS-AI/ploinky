@@ -295,7 +295,7 @@ test('WebChat delegates conversation sessions to the agent protocol', () => {
     const runtimeState = read('cli/server/handlers/webchat/runtimeState.js');
     const sessions = read('cli/server/webchat/sessions.js');
     assert.doesNotMatch(handler, /handleConversationRoute|ensureCurrentSession/);
-    assert.match(runtimeRoutes, /buildRuntimeKey\(workspaceDirectory, effectiveConfig, agentQuery\)/);
+    assert.match(runtimeRoutes, /buildRuntimeKey\(workspaceDirectory, effectiveConfig, agentQuery, principal\)/);
     assert.match(runtimeState, /WEBCHAT_SESSION_FLAG = '__webchatSession'/);
     assert.match(sessions, /sendQuickCommand\('\/session'\)/);
     assert.doesNotMatch(sessions, /sendQuickCommand\('\/sessions'\)/);

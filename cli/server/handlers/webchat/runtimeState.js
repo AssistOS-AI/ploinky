@@ -762,13 +762,31 @@ export function getRuntimeMap(appState) {
     return appState.runtimes;
 }
 
-export function buildRuntimeKey(workspaceDirectory, effectiveConfig, agentQuery = '') {
-    const agent = String(effectiveConfig?.agentName || effectiveConfig?.displayName || 'webchat').trim();
-    const launchSignature = crypto.createHash('sha256').update(String(agentQuery || '')).digest('hex').slice(0, 16);
-    return `${workspaceDirectory}\0${agent}\0${launchSignature}`;
+export function isPrincipalScopedRuntime(effectiveConfig) {
+    return effectiveConfig?.runtimeScope === 'principal';
 }
 
-export function broadcastWorkspaceTaskEvent(appState, workspaceDirectory, payload, sourceRuntimeKey = null) {
+// The opaque per-user part of a principal-scoped runtime key. It is derived
+// only from the authenticated request, never from the query or body.
+export function resolveRuntimePrincipal(req) {
+    const userId = String(req?.user?.id || '');
+    if (!userId) return '';
+    return crypto.createHash('sha256')
+        .update(`${String(req?.authMode || '')}\0${userId}`)
+        .digest('hex');
+}
+
+export function buildRuntimeKey(workspaceDirectory, effectiveConfig, agentQuery = '', principal = '') {
+    const agent = String(effectiveConfig?.agentName || effectiveConfig?.displayName || 'webchat').trim();
+    const launchSignature = crypto.createHash('sha256').update(String(agentQuery || '')).digest('hex').slice(0, 16);
+    const sharedKey = `${workspaceDirectory}\0${agent}\0${launchSignature}`;
+    return principal ? `${sharedKey}\0${principal}` : sharedKey;
+}
+
+export function broadcastWorkspaceTaskEvent(appState, workspaceDirectory, payload, sourceRuntimeKey = null, sourceTab = null) {
+    // A disposed runtime's key may already belong to its replacement; late
+    // events from the disposed process must not reach that replacement.
+    if (sourceTab?.disposed) return;
     for (const runtime of getRuntimeMap(appState).values()) {
         if (runtime.workspaceDirectory === workspaceDirectory && (!sourceRuntimeKey || runtime.runtimeKey === sourceRuntimeKey)) {
             writeOrBufferSseEvent(runtime, payload);
@@ -921,7 +939,7 @@ function routeCompleteOutputLine(appState, tab, line) {
                     ...(messageIndex !== null ? { messageIndex } : {}),
                 };
                 for (const payload of serializeTaskUpdateSseEvents(outgoing)) {
-                    broadcastWorkspaceTaskEvent(appState, tab.workspaceDirectory, payload, tab.runtimeKey);
+                    broadcastWorkspaceTaskEvent(appState, tab.workspaceDirectory, payload, tab.runtimeKey, tab);
                 }
                 return;
             }
@@ -933,6 +951,8 @@ function routeCompleteOutputLine(appState, tab, line) {
 }
 
 export function routeWorkspaceRuntimeOutput(appState, tab, data) {
+    // Output that a disposed (for example evicted) process emits late is dropped.
+    if (tab?.disposed) return;
     const text = String(data ?? '');
     if (!text) return;
     let pending = String(tab.taskProtocolBuffer || '') + text;
@@ -1013,16 +1033,25 @@ export function scheduleDisconnectedTabCleanup(tab, tabId, session, graceMs = ST
     tab.cleanupTimer.unref?.();
 }
 
+// A key can be reused by a replacement runtime before the disposed runtime's
+// process reports close (for example after per-user cap eviction). Remove an
+// entry only while it still refers to the runtime being disposed.
+function deleteIfCurrent(map, key, value) {
+    if (map instanceof Map && map.get(key) === value) map.delete(key);
+}
+
+function unregisterDisposedTab(tab, tabId, session) {
+    deleteIfCurrent(session?.runtimes, tabId, tab);
+    deleteIfCurrent(session?.tabs, tabId, tab);
+}
+
 export function disposeTab(tab, tabId, session) {
     if (!tab) {
         return;
     }
     const pid = tab.tty?.pid || tab.pid;
     if (tab.disposed) {
-        if (session?.runtimes instanceof Map) session.runtimes.delete(tabId);
-        if (session?.tabs instanceof Map) {
-            session.tabs.delete(tabId);
-        }
+        unregisterDisposedTab(tab, tabId, session);
         return;
     }
     tab.disposed = true;
@@ -1070,9 +1099,6 @@ export function disposeTab(tab, tabId, session) {
     }
     tab.sseRes = null;
 
-    if (session?.runtimes instanceof Map) session.runtimes.delete(tabId);
-    if (session?.tabs instanceof Map) {
-        session.tabs.delete(tabId);
-    }
+    unregisterDisposedTab(tab, tabId, session);
 
 }

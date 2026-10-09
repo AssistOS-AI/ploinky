@@ -5,6 +5,7 @@ import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { installWebchatBindingFixture } from '../helpers/webchatBindingFixture.mjs';
 
 const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'e5-async-')));
@@ -42,9 +43,15 @@ test.after(() => {
     fs.rmSync(root, { recursive: true, force: true });
 });
 
+// Page and runtime requests carry the binding Router auth attaches for the
+// fixture route; writeRouting() owns the exact route provenance it binds.
+const binding = installWebchatBindingFixture(root, {
+    routeKey: 'fixture', hostPath: staticRoot, repo: 'fixture-repo', agent: 'fixture', container: '',
+});
+writeRouting();
 function request(url) {
-    return { url, method: 'GET', headers: { host: '127.0.0.1' }, socket: {},
-        user: { id: 'local:admin', roles: ['admin', 'user'] }, destroyed: false };
+    return binding.bind({ url, method: 'GET', headers: { host: '127.0.0.1' }, socket: {},
+        user: { id: 'local:admin', roles: ['admin', 'user'] }, destroyed: false });
 }
 function response() {
     const res = new PassThrough();
@@ -160,7 +167,9 @@ test('WebChat page, task view and directories return complete awaited handler bo
     const listing = await get('/webchat/directories');
     assert.equal(listing.statusCode, 200);
     assert.ok(JSON.parse(listing.body).entries.some(entry => entry.name === 'project'));
-    assert.equal((await get('/webchat/?agent=unknown')).statusCode, 404);
+    // Router auth rejects an unknown selector (404) before the handler; a page
+    // request without a target binding is refused rather than launched.
+    assert.equal((await get('/webchat/?agent=unknown')).statusCode, 503);
 });
 
 test('assets, templates, commands and status handler use zero synchronous fs calls', async () => {
@@ -224,7 +233,8 @@ test('empty boot commands resolve once asynchronously per request and remain fre
                 assert.ok(result.ttyFactory, 'factory available without spawning a tty');
             });
         }
-        assert.equal(manifestReads, 2, 'one default resolution per request, no cache');
+        // Per request: one default resolution plus one bound-target check, no cache.
+        assert.equal(manifestReads, 4, 'one default and one bound-target resolution per request, no cache');
     } finally { fs.promises.readFile = original; }
 });
 

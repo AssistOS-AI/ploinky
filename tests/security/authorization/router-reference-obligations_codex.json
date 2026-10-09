@@ -2771,6 +2771,73 @@
             "anchor": "return handleWorkspaceDirectoriesPost(req, res, directoryContext)",
             "statement": "return handleWorkspaceDirectoriesPost(req, res, directoryContext);"
           }
+        },
+        "bd01ad40e6a480ac46e4a42fb79778ff223dbd04befdfea0da954f901e0b0f45": {
+          "webchat-ui.get": {
+            "line": 265,
+            "anchor": "pathname === '/'",
+            "statement": "if (pathname === '/' || pathname === '/index.html') {"
+          },
+          "webchat-ui-no-slash.get": {
+            "line": 265,
+            "anchor": "pathname === '/'",
+            "statement": "if (pathname === '/' || pathname === '/index.html') {"
+          },
+          "webchat-index.get": {
+            "line": 265,
+            "anchor": "pathname === '/'",
+            "statement": "if (pathname === '/' || pathname === '/index.html') {"
+          },
+          "webchat-assets.get": {
+            "line": 201,
+            "anchor": "pathname.startsWith('/assets/')",
+            "statement": "if (pathname.startsWith('/assets/')) {"
+          },
+          "webchat-removed-token-auth.post": {
+            "line": 191,
+            "anchor": "pathname === '/auth'",
+            "statement": "if (pathname === '/auth' && req.method === 'POST') {"
+          },
+          "webchat-logout.post": {
+            "line": 199,
+            "anchor": "pathname === '/logout'",
+            "statement": "if (pathname === '/logout' && req.method === 'POST') return handleLogout(req, res, appState, agentQuery);"
+          },
+          "webchat-suggestions.get": {
+            "line": 232,
+            "anchor": "pathname === '/suggestions/files'",
+            "statement": "if (pathname === '/suggestions/files' && (req.method === 'GET' || req.method === 'HEAD')) {"
+          },
+          "webchat-suggestions.head": {
+            "line": 232,
+            "anchor": "pathname === '/suggestions/files'",
+            "statement": "if (pathname === '/suggestions/files' && (req.method === 'GET' || req.method === 'HEAD')) {"
+          },
+          "webchat-upload.post": {
+            "line": 236,
+            "anchor": "pathname === '/uploads'",
+            "statement": "if (pathname === '/uploads') {"
+          },
+          "webchat-upload.put": {
+            "line": 236,
+            "anchor": "pathname === '/uploads'",
+            "statement": "if (pathname === '/uploads') {"
+          },
+          "webchat-directories-list.get": {
+            "line": 249,
+            "anchor": "pathname === '/directories'",
+            "statement": "if (pathname === '/directories') {"
+          },
+          "webchat-directories-list.head": {
+            "line": 249,
+            "anchor": "pathname === '/directories'",
+            "statement": "if (pathname === '/directories') {"
+          },
+          "webchat-directories-create.post": {
+            "line": 255,
+            "anchor": "return handleWorkspaceDirectoriesPost(req, res, directoryContext)",
+            "statement": "return handleWorkspaceDirectoriesPost(req, res, directoryContext);"
+          }
         }
       },
       "candidate": "2874a4e81aec3efb6527338dec777dedd997ec7ec0c4980e6fc118161b6fd45d"

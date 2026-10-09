@@ -1143,6 +1143,7 @@ function compileGeneration({ routing, policy, desired, agents, manifests }) {
     const surfaces = {};
     const agentMcpRoutes = {};
     const dependencyHttpRoutes = {};
+    const webchatTargets = {};
     for (const [hostname, entry] of Object.entries(normalizedDesired.hosts)) {
         const selectedRoute = resolveAgentRoute(entry.agent, routing);
         const dependencyRouteKeys = compileAgentMcpRouteClosure(
@@ -1159,6 +1160,10 @@ function compileGeneration({ routing, policy, desired, agents, manifests }) {
         };
         surfaces[hostname] = [...(entry.routerSurfaces || [])];
         agentMcpRoutes[hostname] = surfaces[hostname].includes('agent-mcp')
+            ? dependencyRouteKeys
+            : [];
+        // WebChat on a host may launch only the selected root's own closure.
+        webchatTargets[hostname] = surfaces[hostname].includes('webchat')
             ? dependencyRouteKeys
             : [];
         dependencyHttpRoutes[hostname] = manifestPolicyEntries
@@ -1192,6 +1197,7 @@ function compileGeneration({ routing, policy, desired, agents, manifests }) {
             surfaces,
             agentMcpRoutes,
             dependencyHttpRoutes,
+            webchatTargets,
             policy: compiledPolicy,
             security: {
                 hostNetworkCapabilities,

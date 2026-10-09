@@ -970,6 +970,50 @@ test('webchat exposes only the WebChat router mount for the selected root', (t) 
     }
 });
 
+test('webchat publishes the selected root dependency closure as its only WebChat targets', (t) => {
+    const fixture = createFixture(t, {
+        desired: {
+            hosts: {
+                'chat.example.test': {
+                    agent: 'fixtures/alpha',
+                    routerSurfaces: ['webchat'],
+                },
+                'plain.example.test': {
+                    agent: 'fixtures/alpha',
+                    routerSurfaces: [],
+                },
+            },
+            cloudflare: {
+                tunnelTokenSecret: 'publication/test-connector',
+            },
+        },
+        alphaManifest: {
+            enable: ['beta global no-wait'],
+        },
+    });
+    const applied = applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'webchat-target-closure',
+        publicationState: 'ready',
+    });
+    assert.deepEqual(applied.generation.compiled.webchatTargets?.['chat.example.test'], ['alpha', 'beta']);
+    assert.deepEqual(applied.generation.compiled.webchatTargets?.['plain.example.test'], []);
+
+    const generationFile = path.join(
+        fixture.edgeDir,
+        'generations',
+        `${applied.selector.generation.replace(/^sha256:/, '')}.json`,
+    );
+    const document = JSON.parse(fs.readFileSync(generationFile, 'utf8'));
+    delete document.compiled.webchatTargets;
+    document.compiledDigest = compiledDigest(document.compiled);
+    fs.writeFileSync(generationFile, JSON.stringify(document, null, 2));
+    assert.throws(
+        () => loadActiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace }),
+        { code: 'EDGE_GENERATION_CORRUPT' },
+    );
+});
+
 test('WebChat router mount remains closed without the webchat surface', (t) => {
     const fixture = createFixture(t, {
         desired: {

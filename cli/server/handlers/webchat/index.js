@@ -1,7 +1,10 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { resolveWebchatCommandsForAgentAsync } from '../../webchat/commandResolver.js';
+import {
+    resolveWebchatCommandsForAgentAsync,
+    resolveWebchatCommandsForBindingAsync
+} from '../../webchat/commandResolver.js';
 import * as staticSrv from '../../static/index.js';
 import {
     handleWebchatUploadPost,
@@ -55,17 +58,75 @@ async function renderTemplate(filenames, replacements) {
     ));
 }
 
+const HELPER_PATHS = new Set(['/uploads', '/directories', '/suggestions/files', '/tasks']);
+const RUNTIME_PATHS = new Set(['/', '/index.html', '/stream', '/input', '/control', '/interaction']);
+// Guests keep only protocol identifiers; no query value becomes a path or flag.
+const GUEST_QUERY_KEYS = ['agent', 'tabId', 'pageInstanceId', 'sessionId'];
+
+function webchatPathClass(pathname) {
+    if (HELPER_PATHS.has(pathname) || pathname.startsWith('/tasks/')) return 'helper';
+    if (RUNTIME_PATHS.has(pathname)) return 'runtime';
+    return 'other';
+}
+
+function guestProtocolUrl(parsedUrl) {
+    const scoped = new URL(parsedUrl.pathname, parsedUrl.origin);
+    for (const key of GUEST_QUERY_KEYS) {
+        for (const value of parsedUrl.searchParams.getAll(key)) scoped.searchParams.append(key, value);
+    }
+    return scoped;
+}
+
+// A guest reaches a runtime only for the surface owner itself, when that owner
+// declares `webchat.auth: "self"` and admitted this request as a guest.
+function admitsGuestRuntime(req, binding) {
+    const context = req.edgeAuthContext || {};
+    return Boolean(binding)
+        && binding.declaration === 'self'
+        && Boolean(binding.target)
+        && binding.target === binding.ownerRouteKey
+        && context.routeKey === binding.target
+        && context.mode === 'guest'
+        && req.authMode === 'guest';
+}
+
+function denyJson(res, status, error) {
+    res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify({ ok: false, error }));
+}
+
 export async function handleWebChat(req, res, appConfig, appState) {
     if (req.destroyed || res.destroyed) return;
-    const parsedUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    let parsedUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     const pathname = parsedUrl.pathname.substring(`/${appName}`.length) || '/';
+    const pathClass = webchatPathClass(pathname);
+    const guest = req.authMode === 'guest';
+    const binding = req.edgeAuthContext?.webchatBinding || null;
+    // These guards run before any workspace path, launch option or command is
+    // derived from the request.
+    if (guest && pathClass === 'helper') return denyJson(res, 403, 'guest_workspace_access_denied');
+    if (pathClass === 'runtime') {
+        if (guest && !admitsGuestRuntime(req, binding)) return denyJson(res, 403, 'guest_webchat_target_denied');
+        if (!binding) {
+            if (!authorized(req)) return redirectToRouterLogin(req, res, parsedUrl, '');
+            return denyJson(res, 503, 'webchat_target_binding_unavailable');
+        }
+    }
+    if (guest) parsedUrl = guestProtocolUrl(parsedUrl);
     const agentOverrideRaw = parsedUrl.searchParams.get('agent') || '';
     const agentOverride = agentOverrideRaw.trim();
+    // The binding was computed from this request's selector; a different one
+    // means the request changed after authorization.
+    if (pathClass === 'runtime' && String(binding.selector || '') !== agentOverride) {
+        return denyJson(res, 503, 'webchat_target_changed');
+    }
     let launchOptions, workspaceBase;
     try {
         workspaceBase = await resolveWebchatWorkspaceBaseAsync(parsedUrl);
         if (req.destroyed || res.destroyed) return;
-        launchOptions = await resolveWebchatLaunchOptionsAsync(parsedUrl, { workspaceBase });
+        launchOptions = guest
+            ? { cliArgs: [] }
+            : await resolveWebchatLaunchOptionsAsync(parsedUrl, { workspaceBase });
         if (req.destroyed || res.destroyed) return;
     } catch (_) {
         if (req.destroyed || res.destroyed) return;
@@ -80,7 +141,29 @@ export async function handleWebChat(req, res, appConfig, appState) {
     let effectiveConfig = appConfig;
     let agentQuery = buildWebchatQuery(parsedUrl);
 
-    if (agentOverride) {
+    if (pathClass === 'runtime') {
+        // Explicit and omitted selectors both launch the bound target. As
+        // before, only an explicit selector launch carries query launch flags.
+        const boundCommands = await resolveWebchatCommandsForBindingAsync(binding, {
+            cliArgs: agentOverride ? launchOptions.cliArgs : []
+        });
+        if (req.destroyed || res.destroyed) return;
+        if (!boundCommands || boundCommands.changed) return denyJson(res, 503, 'webchat_target_changed');
+        if (typeof appConfig?.getFactoryForCommands !== 'function') {
+            res.writeHead(503, { 'Content-Type': 'text/plain' });
+            res.end('Dynamic agent selection unavailable.');
+            return;
+        }
+        const boundConfig = appConfig.getFactoryForCommands(boundCommands);
+        if (!boundConfig || !boundConfig.ttyFactory) {
+            res.writeHead(503, { 'Content-Type': 'text/plain' });
+            res.end('Unable to start agent session.');
+            return;
+        }
+        // Every guest gets a runtime of its own session principal.
+        effectiveConfig = guest ? { ...boundConfig, runtimeScope: 'principal' } : boundConfig;
+        agentQuery = buildWebchatQuery(parsedUrl, agentOverride ? boundCommands.agentName : '');
+    } else if (agentOverride) {
         const overrideCommands = await resolveWebchatCommandsForAgentAsync(agentOverride, {
             cliArgs: launchOptions.cliArgs
         });
