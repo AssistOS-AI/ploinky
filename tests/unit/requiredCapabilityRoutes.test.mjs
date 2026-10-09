@@ -236,3 +236,84 @@ test('default inheritance and public or guest declarations cannot bypass the sta
         assert.equal(JSON.parse(res.body).requiredCapability, 'explorer.access', JSON.stringify(httpRoutes));
     }
 });
+
+function controlRoutePlan(snapshot) {
+    return {
+        ok: false,
+        code: 'ROUTE_NOT_FOUND',
+        hostSelection: { kind: 'control', host: 'localhost' },
+        lease: { id: `sha256:${'d'.repeat(64)}`, snapshot, commit: () => true },
+        snapshot,
+    };
+}
+
+async function planned(snapshot, input) {
+    const req = request(input);
+    const res = response();
+    const result = await ensureAuthenticated(req, res, new URL(req.url, 'http://localhost'), {
+        routePlan: controlRoutePlan(snapshot),
+    });
+    return { req, res, result };
+}
+
+function withSelfChatTarget(snapshot) {
+    snapshot.agents.accountChat = { type: 'agent', agentName: 'accountChat', repoName: 'fixture', auth: { mode: 'sso' } };
+    snapshot.routing.routes.accountChat = { container: 'accountChat', agent: 'accountChat', repo: 'fixture' };
+    snapshot.manifests.accountChat = {
+        webchat: { auth: 'self' },
+        routerAccess: { requiredCapability: 'account.dashboard' },
+    };
+    return snapshot;
+}
+
+test('U2 a Router sink selector cannot replace the owner capability', async (t) => {
+    const { snapshot } = fixture(t);
+    const { req, res, result } = await planned(snapshot, {
+        url: '/upload?path=f.txt&agent=accountService', method: 'PUT', headers: { accept: 'application/json' },
+    });
+    assert.equal(result.ok, false);
+    assert.equal(res.statusCode, 403);
+    assert.deepEqual(JSON.parse(res.body), {
+        ok: false, error: 'required_capability_missing', requiredCapability: 'explorer.access',
+    });
+    assert.equal(req.edgeAuthContext, undefined);
+});
+
+test('U3 a capable user on a Router sink is authenticated by the owner whatever the selector says', async (t) => {
+    const { snapshot, user } = fixture(t);
+    user.capabilities.push('explorer.access');
+    const { req, result } = await planned(snapshot, {
+        url: '/upload?path=f.txt&agent=accountService', method: 'PUT', headers: { accept: 'application/json' },
+    });
+    assert.equal(result.ok, true);
+    assert.equal(req.authMode, 'sso');
+    assert.equal(req.edgeAuthContext.routeKey, 'explorer');
+    assert.equal(req.edgeAuthContext.serviceRouteKey, undefined);
+});
+
+test('S1 an SSO-self WebChat target admits its own users to its runtime on the control host', async (t) => {
+    const { snapshot, user } = fixture(t);
+    withSelfChatTarget(snapshot);
+    assert.equal(user.capabilities.includes('explorer.access'), false);
+    const { req, result } = await planned(snapshot, {
+        url: '/webchat/stream?agent=accountChat&tabId=t1', headers: { accept: 'text/event-stream' },
+    });
+    assert.equal(result.ok, true);
+    assert.equal(req.authMode, 'sso');
+    assert.equal(req.edgeAuthContext.routeKey, 'accountChat');
+});
+
+test('S1 prime an SSO-self WebChat target grants nothing on the shared workspace helpers', async (t) => {
+    const { snapshot } = fixture(t);
+    withSelfChatTarget(snapshot);
+    for (const input of [
+        { url: '/webchat/uploads?agent=accountChat', method: 'POST', headers: { accept: 'application/json' } },
+        { url: '/webchat/directories?agent=accountChat', headers: { accept: 'application/json' } },
+        { url: '/webchat/suggestions/files?agent=accountChat&q=a', headers: { accept: 'application/json' } },
+    ]) {
+        const { res, result } = await planned(snapshot, input);
+        assert.equal(result.ok, false, input.url);
+        assert.equal(res.statusCode, 403, input.url);
+        assert.equal(JSON.parse(res.body).requiredCapability, 'explorer.access', input.url);
+    }
+});

@@ -1,11 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import fsPromises from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { routerInventory, routerInventoryBaseline } from './router-inventory.mjs';
 import { resolveRouterSourceReference, assertRouterInventoryObligations, assertRouterReferenceMaps } from './router-source-references.mjs';
 import { inspectMarketplaceAuthorization, routerProbes, runRouterProbes, validateRouterAllowedResponse, validateRouterPrincipal } from './router-probes.mjs';
-import { markerCommand, terminalFixtureNames } from './stream-probes.mjs';
+import { markerCommand, runWebchatUploadDenialProof, runWorkspaceWriteMatrix, terminalFixtureNames, workspaceWriteMatrix, workspaceWriteRequest } from './stream-probes.mjs';
 
 test('Router inventory identities are unique and every source reference is a real executable line', () => {
   assert.equal(new Set(routerInventory.map(row => row.id)).size, routerInventory.length);
@@ -176,5 +179,143 @@ test('Terminal fixture and marker command reject shell/path injection before any
   for (const value of ['../escape', 'authz-1234;id', 'authz-1234$(id)', 'authz-1234/../escape', "authz-1234'quoted", 'authz-1234\nline']) {
     assert.throws(() => terminalFixtureNames(value), /shell-safe/);
     assert.throws(() => markerCommand(prefix, value), /generated literal/);
+  }
+});
+
+test('Workspace write matrix has the exact reviewed identities and counts', () => {
+  const { positives, denials } = workspaceWriteMatrix();
+  const ids = [...positives, ...denials].map(row => row.id);
+  assert.equal(new Set(ids).size, ids.length);
+  assert.equal(positives.length, 7);
+  assert.equal(denials.length, 61);
+  assert.equal(denials.filter(row => row.operation === 'sink-upload').length, 25);
+  assert.equal(denials.filter(row => row.operation !== 'sink-upload' && ['anonymous', 'selfRegistered'].includes(row.actor)).length, 24);
+  assert.equal(denials.filter(row => row.operation !== 'sink-upload' && row.actor === 'userA').length, 12);
+  for (const selector of ['default', 'authorization-suite-nonexistent', 'userPersistoAgent', 'webAssist', 'webmeetAgent']) {
+    for (const pair of ['anonymous:absent', 'selfRegistered:absent', 'selfRegistered:valid', 'userA:absent', 'userA:invalid']) {
+      assert.ok(ids.includes(`router:workspace-upload-deny:${pair}:${selector}`), `${pair}:${selector}`);
+    }
+  }
+  // GET/HEAD reads are never denied merely for a missing or invalid proof.
+  assert.equal(denials.some(row => ['directory-list', 'suggestions'].includes(row.operation) && row.actor === 'userA'), false);
+  for (const operation of ['upload', 'directory-create']) for (const proof of ['absent', 'invalid']) for (const selector of ['default', 'webAssist', 'webmeetAgent']) {
+    assert.ok(ids.includes(`router:webchat-${operation}-deny:userA:${proof}:${selector}`));
+  }
+});
+
+test('Workspace write requests carry the declared proof, selector and a distinct payload', () => {
+  const fixture = { directory: 'authz-12345678-abcd-terminal', host: '/tmp/unused' };
+  const { denials } = workspaceWriteMatrix();
+  const absent = workspaceWriteRequest(denials.find(row => row.id === 'router:workspace-upload-deny:userA:absent:webAssist'), fixture, 'p-1');
+  assert.equal(absent.proof, false);
+  assert.equal(absent.headers.origin, undefined);
+  assert.match(absent.path, /^\/upload\?path=authz-12345678-abcd-terminal%2Ffixture\.txt&agent=webAssist$/);
+  assert.equal(absent.body, 'p-1');
+  const invalid = workspaceWriteRequest(denials.find(row => row.id === 'router:webchat-upload-deny:userA:invalid:default'), fixture, 'p-2');
+  assert.equal(invalid.proof, false);
+  assert.equal(invalid.headers.origin, 'http://127.0.0.1:8080');
+  assert.match(invalid.headers['x-ploinky-browser-csrf-token'], /^v2\.authorization-suite-invalid-/);
+  assert.equal(invalid.headers['x-overwrite'], '1');
+  assert.equal(invalid.path, '/webchat/uploads');
+  const valid = workspaceWriteRequest(denials.find(row => row.id === 'router:workspace-upload-deny:selfRegistered:valid:default'), fixture, 'p-3');
+  assert.equal(valid.proof, true);
+  const read = workspaceWriteRequest(denials.find(row => row.id === 'router:webchat-suggestions-deny:anonymous:webmeetAgent'), fixture, '');
+  assert.equal(read.method, 'GET');
+  assert.equal(read.body, undefined);
+  assert.match(read.path, /&agent=webmeetAgent$/);
+});
+
+async function writeMatrixFixture(t) {
+  const host = await fsPromises.mkdtemp(path.join(os.tmpdir(), 'authz-write-matrix-'));
+  t.after(() => fsPromises.rm(host, { recursive: true, force: true }));
+  const fixture = { directory: path.basename(host), host };
+  const filename = path.join(host, 'fixture.txt');
+  await fsPromises.writeFile(filename, 'baseline');
+  return { fixture, filename };
+}
+
+function matrixContext(handler) {
+  const ctx = { prefix: 'authz-matrix', report: { checks: [] }, gaps: [], bodies: [],
+    async request(actor, options) { if (options.body !== undefined) ctx.bodies.push(JSON.stringify(options.body)); return handler(actor, options); },
+    async check(id, fn) { try { await fn(); ctx.report.checks.push({ id, status: 'PASS' }); } catch (error) { ctx.report.checks.push({ id, status: 'FAIL', error: error.message }); } },
+    recordGap(id, reason) { ctx.gaps.push({ id, reason }); },
+  };
+  return ctx;
+}
+
+function fakeRouter(fixture, filename, { leakingId = '' } = {}) {
+  return async (actor, options) => {
+    const isWrite = options.method === 'PUT' || (options.method === 'POST' && options.path.startsWith('/webchat/uploads'));
+    const allowed = actor === 'admin' || (actor === 'userA' && (options.method === 'GET' || options.proof === true));
+    if (options.path.startsWith('/workspace-files/')) {
+      const text = await fsPromises.readFile(filename, 'utf8');
+      return { status: 200, text, headers: {} };
+    }
+    if (!allowed && !(leakingId && options.path.includes(leakingId))) {
+      return { status: 401, text: '{"ok":false,"error":"not_authenticated"}', json: { ok: false, error: 'not_authenticated' }, headers: {} };
+    }
+    if (isWrite) {
+      await fsPromises.writeFile(filename, options.body);
+      return { status: options.method === 'PUT' ? 200 : 201, text: '{"ok":true}', json: { ok: true }, headers: {} };
+    }
+    if (options.method === 'POST') {
+      await fsPromises.mkdir(path.join(fixture.host, path.basename(options.body.path)));
+      return { status: 201, text: '{"ok":true}', json: { ok: true }, headers: {} };
+    }
+    return { status: 200, text: '{"ok":true,"entries":[{"name":"fixture.txt"}]}', json: { ok: true }, headers: {} };
+  };
+}
+
+test('Write matrix passes only with changed bytes and unchanged hashes under distinct payloads', async t => {
+  const { fixture, filename } = await writeMatrixFixture(t);
+  const ctx = matrixContext(fakeRouter(fixture, filename));
+  await runWorkspaceWriteMatrix(ctx, fixture, filename);
+  const failed = ctx.report.checks.filter(check => check.status !== 'PASS');
+  assert.deepEqual(failed, []);
+  assert.equal(ctx.report.checks.length, 68);
+  assert.equal(ctx.gaps.length, 0);
+  assert.equal(new Set(ctx.bodies).size, ctx.bodies.length, 'every write and denial sends a distinct payload');
+});
+
+test('A failed positive control turns its dependents into gaps and a changed fixture fails the denial', async t => {
+  const { fixture, filename } = await writeMatrixFixture(t);
+  const broken = matrixContext(async () => ({ status: 503, text: '{}', json: { ok: false, error: 'unavailable' }, headers: {} }));
+  await runWorkspaceWriteMatrix(broken, fixture, filename);
+  assert.equal(broken.report.checks.some(check => check.status === 'PASS' && /-deny:/.test(check.id)), false);
+  assert.equal(broken.gaps.length, 61);
+  assert.ok(broken.gaps.every(gap => gap.reason.startsWith('positive-unavailable')));
+
+  const second = await writeMatrixFixture(t);
+  const leaking = matrixContext(fakeRouter(second.fixture, second.filename, { leakingId: 'agent=webAssist' }));
+  await runWorkspaceWriteMatrix(leaking, second.fixture, second.filename);
+  const leaked = leaking.report.checks.filter(check => check.status === 'FAIL').map(check => check.id);
+  assert.ok(leaked.includes('router:workspace-upload-deny:anonymous:absent:webAssist'));
+  assert.ok(leaked.includes('router:webchat-upload-deny:anonymous:webAssist'));
+  assert.ok(leaked.includes('router:webchat-directory-create-deny:selfRegistered:webAssist'));
+  assert.equal(leaked.some(id => !id.endsWith('webAssist')), false);
+});
+
+test('Focused pre-fix proof runs one WebChat upload denial and reports a changed owned file as FAIL', async t => {
+  for (const vulnerable of [true, false]) {
+    const { fixture, filename } = await writeMatrixFixture(t);
+    await fsPromises.rm(filename);
+    const ctx = matrixContext(async (actor, options) => {
+      assert.equal(actor, 'anonymous');
+      assert.equal(options.method, 'POST');
+      assert.equal(options.path, '/webchat/uploads?agent=webAssist');
+      assert.equal(options.headers['x-overwrite'], '1');
+      if (vulnerable) {
+        await fsPromises.writeFile(filename, options.body);
+        return { status: 201, text: '{"ok":true}', json: { ok: true }, headers: {} };
+      }
+      return { status: 401, text: '{"ok":false,"error":"not_authenticated"}', json: { ok: false, error: 'not_authenticated' }, headers: {} };
+    });
+    ctx.guard = async () => ({});
+    await runWebchatUploadDenialProof(ctx, { register: async () => fixture });
+    assert.equal(ctx.report.checks.length, 1);
+    assert.equal(ctx.report.checks[0].id, 'router:webchat-upload-deny:anonymous:webAssist');
+    assert.equal(ctx.report.checks[0].status, vulnerable ? 'FAIL' : 'PASS');
+    assert.equal(ctx.report.focusedProof.fixtureChanged, vulnerable);
+    assert.equal(ctx.report.focusedProof.fixtureHoldsDenialPayload, vulnerable);
   }
 });

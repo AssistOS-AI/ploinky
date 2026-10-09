@@ -308,20 +308,249 @@ test('guest routes use the guest agent policy instead of the static Explorer pol
     assert.equal(location.searchParams.get('agent'), 'explorer');
     assert.equal(location.searchParams.get('returnTo'), '/webchat?agent=webAdmin');
     assert.doesNotMatch(String(webAdminChatRes.getHeader('set-cookie') || ''), /^ploinky_guest=/);
+});
 
-    const webAssistChatReq = makeRequest({
-        url: '/webchat?agent=webAssist',
-        accept: 'text/html',
+function assertOwnerLogin(result, req, res, label) {
+    assert.equal(result.ok, false, label);
+    assert.ok([302, 401].includes(res.statusCode), `${label}: ${res.statusCode}`);
+    const login = res.statusCode === 302
+        ? String(res.getHeader('location') || '')
+        : String(JSON.parse(res.body || '{}').login || '');
+    assert.equal(new URL(login, 'http://localhost').searchParams.get('agent'), 'explorer', label);
+    assert.equal(req.user, undefined, label);
+    assert.equal(req.authMode, undefined, label);
+    assert.doesNotMatch(String(res.getHeader('set-cookie') || ''), /ploinky_guest=/, label);
+}
+
+test('R5 an undeclared guest WebChat selector requires the workspace owner login', async (t) => {
+    const { authHandlers, createRoutePlan } = await withAuthModules(t);
+    for (const options of [{}, { routePlan: createRoutePlan() }]) {
+        const req = makeRequest({ url: '/webchat?agent=webAssist', accept: 'text/html' });
+        const res = new MockResponse();
+        const result = await authHandlers.ensureAuthenticated(req, res, new URL(req.url, 'http://localhost'), options);
+        assertOwnerLogin(result, req, res, `webAssist plan=${Boolean(options.routePlan)}`);
+    }
+});
+
+for (const selector of ['missing', 'webAdmin', 'guestAgent', 'webAssist']) {
+    test(`U1 anonymous Router sinks ignore ?agent=${selector}`, async (t) => {
+        const { authHandlers, createRoutePlan } = await withAuthModules(t);
+        const cases = [
+            { method: 'PUT', url: `/upload?path=f.txt&agent=${selector}` },
+            { method: 'POST', url: `/mcp?agent=${selector}` },
+            { method: 'DELETE', url: `/mcp?agent=${selector}` },
+            { method: 'POST', url: `/blobs/explorer?agent=${selector}` },
+            { method: 'GET', url: `/workspace-files/f.txt?agent=${selector}`, accept: 'text/html' },
+            { method: 'GET', url: `/workspace-files/f.txt?agent=${selector}`, accept: 'application/json' },
+        ];
+        for (const input of cases) {
+            for (const withPlan of [false, true]) {
+                const req = makeRequest(input);
+                const res = new MockResponse();
+                const result = await authHandlers.ensureAuthenticated(
+                    req,
+                    res,
+                    new URL(req.url, 'http://localhost'),
+                    withPlan ? { routePlan: createRoutePlan() } : {},
+                );
+                assertOwnerLogin(result, req, res, `${input.method} ${input.url} ${input.accept || ''} plan=${withPlan}`);
+            }
+        }
     });
-    const webAssistChatRes = new MockResponse();
-    const webAssistChatParsedUrl = new URL(webAssistChatReq.url, 'http://localhost');
+}
 
-    const webAssistChatResult = await authHandlers.ensureAuthenticated(webAssistChatReq, webAssistChatRes, webAssistChatParsedUrl);
+// Alternate spellings of every Router sink and WebChat helper: percent-encoded
+// mount letters, an encoded separator and double encoding. Each must classify
+// as the same owner-authorized surface as its literal spelling.
+const ENCODED_SINK_SPELLINGS = [
+    { method: 'PUT', url: '/%75pload?path=f.txt' },
+    { method: 'PUT', url: '/%2575pload?path=f.txt' },
+    { method: 'POST', url: '/%62lobs/explorer' },
+    { method: 'POST', url: '/blobs%2Fexplorer' },
+    { method: 'GET', url: '/%77orkspace-files/f.txt' },
+    { method: 'GET', url: '/workspace-files%2Ff.txt' },
+    { method: 'GET', url: '/%2577orkspace-files/f.txt' },
+    { method: 'GET', url: '/%73tatus/data' },
+    { method: 'POST', url: '/%6Dcp' },
+    { method: 'POST', url: '/webchat/%75ploads' },
+    { method: 'GET', url: '/%77ebchat/directories' },
+    { method: 'GET', url: '/webchat/suggestions%2Ffiles' },
+];
 
-    assert.equal(webAssistChatResult.ok, true);
-    assert.equal(webAssistChatReq.authMode, 'guest');
-    assert.equal(webAssistChatReq.user?.username, 'visitor');
-    assert.match(String(webAssistChatRes.getHeader('set-cookie') || ''), /^ploinky_guest=/);
+for (const selector of ['', 'missing', 'webAssist']) {
+    test(`U1 encoded Router surface spellings keep the workspace owner (selector=${selector || 'none'})`, async (t) => {
+        const { authHandlers, createRoutePlan } = await withAuthModules(t);
+        for (const input of ENCODED_SINK_SPELLINGS) {
+            const url = selector ? `${input.url}${input.url.includes('?') ? '&' : '?'}agent=${selector}` : input.url;
+            const req = makeRequest({ method: input.method, url, accept: 'application/json' });
+            const res = new MockResponse();
+            const result = await authHandlers.ensureAuthenticated(req, res, new URL(req.url, 'http://localhost'), { routePlan: createRoutePlan() });
+            assertOwnerLogin(result, req, res, url);
+        }
+    });
+}
+
+test('M1 encoded sink spellings also fail closed without a resolvable owner', async (t) => {
+    const { authHandlers, createRoutePlan } = await withAuthModules(t);
+    const routingPath = path.join(process.env.PLOINKY_WORKSPACE_ROOT, '.ploinky', 'routing.json');
+    const routing = JSON.parse(readFileSync(routingPath, 'utf8'));
+    delete routing.static;
+    writeFileSync(routingPath, JSON.stringify(routing, null, 2));
+    for (const input of ENCODED_SINK_SPELLINGS) {
+        const req = makeRequest({ method: input.method, url: input.url, accept: 'application/json' });
+        const res = new MockResponse();
+        const result = await authHandlers.ensureAuthenticated(req, res, new URL(req.url, 'http://localhost'), { routePlan: createRoutePlan() });
+        assert.equal(result.ok, false, input.url);
+        assert.equal(res.statusCode, 503, input.url);
+        assert.equal(JSON.parse(res.body).error, 'router_surface_owner_unconfigured', input.url);
+        assert.equal(req.user, undefined, input.url);
+    }
+});
+
+test('an unrouted path never takes its auth owner from ?agent=', async (t) => {
+    const { authHandlers, createRoutePlan } = await withAuthModules(t);
+    for (const url of ['/unrouted/page?agent=webAssist', '/unrouted/page?agent=missing', '/Workspace-files/f.txt?agent=webAssist', '//upload?agent=missing']) {
+        for (const options of [{}, { routePlan: createRoutePlan() }]) {
+            const req = makeRequest({ method: 'GET', url, accept: 'application/json' });
+            const res = new MockResponse();
+            const result = await authHandlers.ensureAuthenticated(req, res, new URL(req.url, 'http://localhost'), options);
+            assertOwnerLogin(result, req, res, `${url} plan=${Boolean(options.routePlan)}`);
+        }
+    }
+});
+
+test('U4 WebChat selectors: unknown targets are unavailable, known undeclared targets use the owner login', async (t) => {
+    const { authHandlers, createRoutePlan } = await withAuthModules(t);
+    for (const options of [{}, { routePlan: createRoutePlan() }]) {
+        const missingReq = makeRequest({ url: '/webchat?agent=missing', accept: 'text/html' });
+        const missingRes = new MockResponse();
+        const missing = await authHandlers.ensureAuthenticated(missingReq, missingRes, new URL(missingReq.url, 'http://localhost'), options);
+        assert.equal(missing.ok, false);
+        assert.equal(missingRes.statusCode, 404);
+        assert.equal(JSON.parse(missingRes.body).error, 'webchat_target_unavailable');
+        assert.equal(missingReq.user, undefined);
+
+        const knownReq = makeRequest({ url: '/webchat?agent=guestAgent', accept: 'text/html' });
+        const knownRes = new MockResponse();
+        const known = await authHandlers.ensureAuthenticated(knownReq, knownRes, new URL(knownReq.url, 'http://localhost'), options);
+        assertOwnerLogin(known, knownReq, knownRes, `guestAgent plan=${Boolean(options.routePlan)}`);
+    }
+});
+
+test('U5 an agent path never takes its auth owner from ?agent=', async (t) => {
+    const { authHandlers } = await withAuthModules(t);
+    const req = makeRequest({ method: 'POST', url: '/webAdmin/mcp?agent=missing' });
+    const res = new MockResponse();
+    const result = await authHandlers.ensureAuthenticated(req, res, new URL(req.url, 'http://localhost'));
+    assertOwnerLogin(result, req, res, 'webAdmin mcp');
+});
+
+test('R4 the signed local CLI keeps Router sink access whatever the selector', async (t) => {
+    const { authHandlers, localService, createRoutePlan } = await withAuthModules(t);
+    const token = localService.mintSessionJwt({
+        id: 'local:admin',
+        username: 'admin',
+        name: 'Local CLI',
+        email: '',
+        roles: ['user', 'admin'],
+    }, 1, { channel: 'cli' });
+    const req = makeRequest({ method: 'PUT', url: '/upload?path=f.txt&agent=missing', cookie: `ploinky_jwt=${token}` });
+    const res = new MockResponse();
+    const result = await authHandlers.ensureAuthenticated(req, res, new URL(req.url, 'http://localhost'), { routePlan: createRoutePlan() });
+    assert.equal(result.ok, true);
+    assert.equal(req.authMode, 'local');
+    assert.equal(req.authChannel, 'cli');
+});
+
+test('U6t empty and blank selectors fall back to the workspace owner', async (t) => {
+    const { authHandlers, createRoutePlan } = await withAuthModules(t);
+    for (const suffix of ['&agent=', '&agent=%20', '']) {
+        const req = makeRequest({ method: 'PUT', url: `/upload?path=f.txt${suffix}` });
+        const res = new MockResponse();
+        const result = await authHandlers.ensureAuthenticated(req, res, new URL(req.url, 'http://localhost'), { routePlan: createRoutePlan() });
+        assertOwnerLogin(result, req, res, `upload ${suffix}`);
+    }
+});
+
+test('U6t prime malformed, oversized and repeated selectors never choose an owner', async (t) => {
+    const { authHandlers, createRoutePlan } = await withAuthModules(t);
+    const selectors = [
+        `agent=${'a'.repeat(4096)}`,
+        `agent=${encodeURIComponent('webAssist☃ă')}`,
+        'agent=a&agent=webAssist',
+        'agent=webAssist&agent=missing',
+        `agent=${encodeURIComponent('x:y/z')}`,
+    ];
+    for (const selector of selectors) {
+        const req = makeRequest({ method: 'PUT', url: `/upload?path=f.txt&${selector}` });
+        const res = new MockResponse();
+        const result = await authHandlers.ensureAuthenticated(req, res, new URL(req.url, 'http://localhost'), { routePlan: createRoutePlan() });
+        assertOwnerLogin(result, req, res, `upload ${selector.slice(0, 40)}`);
+
+        const chatReq = makeRequest({ url: `/webchat/?${selector}`, accept: 'text/html' });
+        const chatRes = new MockResponse();
+        const chat = await authHandlers.ensureAuthenticated(chatReq, chatRes, new URL(chatReq.url, 'http://localhost'), { routePlan: createRoutePlan() });
+        assert.equal(chat.ok, false, selector.slice(0, 40));
+        assert.equal(chatRes.statusCode, 404, selector.slice(0, 40));
+        assert.equal(chatReq.user, undefined, selector.slice(0, 40));
+    }
+});
+
+test('U7 anonymous WebChat workspace helpers use the workspace owner, not the selector', async (t) => {
+    const { authHandlers, createRoutePlan } = await withAuthModules(t);
+    for (const input of [
+        { method: 'POST', url: '/webchat/uploads?agent=webAssist', headers: { 'x-overwrite': '1', 'x-file-name': 'f.txt' } },
+        { method: 'GET', url: '/webchat/directories?agent=webmeetAgent' },
+        { method: 'GET', url: '/webchat/suggestions/files?agent=webAssist&q=f' },
+        { method: 'POST', url: '/webchat/directories?agent=webAssist', body: { path: 'created' } },
+    ]) {
+        for (const withPlan of [false, true]) {
+            const req = makeRequest(input);
+            const res = new MockResponse();
+            const result = await authHandlers.ensureAuthenticated(
+                req,
+                res,
+                new URL(req.url, 'http://localhost'),
+                withPlan ? { routePlan: createRoutePlan() } : {},
+            );
+            assertOwnerLogin(result, req, res, `${input.method} ${input.url} plan=${withPlan}`);
+        }
+    }
+});
+
+test('M1 a control host without a resolvable owner fails closed except for the local CLI', async (t) => {
+    const { authHandlers, localService, createRoutePlan } = await withAuthModules(t);
+    const routingPath = path.join(process.env.PLOINKY_WORKSPACE_ROOT, '.ploinky', 'routing.json');
+    const routing = JSON.parse(readFileSync(routingPath, 'utf8'));
+    delete routing.static;
+    writeFileSync(routingPath, JSON.stringify(routing, null, 2));
+
+    const anonymousReq = makeRequest({ method: 'PUT', url: '/upload?path=f.txt' });
+    const anonymousRes = new MockResponse();
+    const anonymous = await authHandlers.ensureAuthenticated(
+        anonymousReq,
+        anonymousRes,
+        new URL(anonymousReq.url, 'http://localhost'),
+        { routePlan: createRoutePlan() },
+    );
+    assert.equal(anonymous.ok, false);
+    assert.equal(anonymousRes.statusCode, 503);
+    assert.equal(JSON.parse(anonymousRes.body).error, 'router_surface_owner_unconfigured');
+    assert.equal(anonymousReq.user, undefined);
+
+    const token = localService.mintSessionJwt({
+        id: 'local:admin',
+        username: 'admin',
+        name: 'Local CLI',
+        email: '',
+        roles: ['user', 'admin'],
+    }, 1, { channel: 'cli' });
+    const cliReq = makeRequest({ method: 'PUT', url: '/upload?path=f.txt', cookie: `ploinky_jwt=${token}` });
+    const cliRes = new MockResponse();
+    const cli = await authHandlers.ensureAuthenticated(cliReq, cliRes, new URL(cliReq.url, 'http://localhost'), { routePlan: createRoutePlan() });
+    assert.equal(cli.ok, true);
+    assert.equal(cliReq.authMode, 'local');
+    assert.equal(cliReq.authChannel, 'cli');
 });
 
 test('browser auth host binding rejects selector switches and ignores raw candidate edits', async (t) => {

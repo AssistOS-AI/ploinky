@@ -4,11 +4,14 @@ import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import test from 'node:test';
+import { installWebchatBindingFixture } from '../helpers/webchatBindingFixture.mjs';
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-webchat-session-api-'));
 const project = path.join(root, 'project');
 fs.mkdirSync(project);
 process.env.PLOINKY_WORKSPACE_ROOT = root;
+// Page and runtime requests carry the target binding attached by Router auth.
+const binding = installWebchatBindingFixture(root, { manifest: { cli: 'generic-test-agent' } });
 
 const { handleWebChat } = await import(`../../cli/server/handlers/webchat/index.js?session-api=${Date.now()}`);
 
@@ -18,7 +21,10 @@ function makeRequest(url, { method = 'GET', body = '', authenticated = true, coo
     req.method = method;
     req.headers = { host: '127.0.0.1', cookie };
     req.socket = {};
-    if (authenticated) req.user = { id: 'local:test', username: 'test', roles: ['user'] };
+    if (authenticated) {
+        req.user = { id: 'local:test', username: 'test', roles: ['user'] };
+        binding.bind(req);
+    }
     return req;
 }
 
@@ -45,7 +51,7 @@ function makeResponse() {
 async function request(appState, url, options = {}) {
     const req = makeRequest(url, options);
     const res = makeResponse();
-    await handleWebChat(req, res, { agentName: 'generic-test-agent' }, appState);
+    await handleWebChat(req, res, binding.appConfig(), appState);
     await res.ended;
     return res;
 }

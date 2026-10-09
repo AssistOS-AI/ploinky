@@ -828,6 +828,10 @@ export function resolveEdgeRoutePlan({
         }
         return deny(404, 'PRIVATE_ROUTE_SURFACE_DENIED', { lease, hostSelection });
     }
+    // Before any public surface or agent selection.
+    if (isEncodedRouterSurfaceSpelling(pathname)) {
+        return deny(400, 'NONCANONICAL_ROUTER_PATH', { lease, hostSelection });
+    }
 
     if (hostSelection.kind === 'agent-root') {
         const surface = surfaceForPath(
@@ -931,6 +935,26 @@ export function resolveEdgeRoutePlan({
     });
     if (agentPlan.ok || agentPlan.matched || hostSelection.kind !== 'control') return agentPlan;
     return deny(404, 'ROUTE_NOT_FOUND', { lease, hostSelection });
+}
+
+// A Router-owned mount has exactly one accepted spelling: its literal path.
+// A path that names such a mount only after percent-decoding is rejected, so
+// authorization, surface selection and dispatch can never disagree about it.
+function isEncodedRouterSurfaceSpelling(pathname) {
+    if (isReservedRouterSurface(pathname)) return false;
+    let current = String(pathname || '/');
+    for (let pass = 0; pass < 3; pass += 1) {
+        let decoded;
+        try {
+            decoded = decodeURIComponent(current);
+        } catch (_) {
+            return false;
+        }
+        if (decoded === current) return false;
+        if (isReservedRouterSurface(decoded)) return true;
+        current = decoded;
+    }
+    return false;
 }
 
 export function commitRoutePlan(plan) {

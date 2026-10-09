@@ -1098,6 +1098,37 @@ function compileAgentMcpRouteClosure(rootRouteKey, routing, manifests, agents) {
     return [...allowed].sort();
 }
 
+const webchatTargetCache = new WeakMap();
+
+// The WebChat targets a host may launch: its selected root's manifest
+// dependency closure, only when the host exposes the webchat surface. It is
+// derived from the generation's own digest-bound sources rather than stored in
+// the compiled state, so generations written before this check load, apply and
+// verify byte for byte unchanged. Anything unresolvable yields no targets.
+export function edgeWebchatTargets(generation, host) {
+    if (!generation || typeof generation !== 'object') return [];
+    const hostname = String(host || '');
+    let byHost = webchatTargetCache.get(generation);
+    if (!byHost) {
+        byHost = new Map();
+        webchatTargetCache.set(generation, byHost);
+    }
+    if (byHost.has(hostname)) return byHost.get(hostname);
+    let targets = [];
+    const rootRouteKey = String(generation.compiled?.hosts?.[hostname]?.routeKey || '');
+    const surfaces = generation.compiled?.surfaces?.[hostname];
+    if (rootRouteKey && Array.isArray(surfaces) && surfaces.includes('webchat')) {
+        try {
+            targets = compileAgentMcpRouteClosure(rootRouteKey, generation.routing, generation.manifests, generation.agents);
+        } catch (_) {
+            targets = [];
+        }
+    }
+    const frozen = Object.freeze([...targets]);
+    byHost.set(hostname, frozen);
+    return frozen;
+}
+
 function compileGeneration({ routing, policy, desired, agents, manifests }) {
     validatePolicy(policy);
     validateRoutingShape(routing, manifests);

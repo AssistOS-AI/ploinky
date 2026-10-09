@@ -743,12 +743,19 @@ async function resolveWorkspaceFile(requestPath) {
     return { status: 'not_found', filePath: null };
 }
 
+// The mount is matched on its literal spelling, exactly as Router
+// authorization classifies it; only the file path below it is decoded.
+function workspaceFilePathname(req) {
+    const parsed = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    const rawPathname = parsed.pathname || '/';
+    if (rawPathname !== '/workspace-files' && !rawPathname.startsWith(WORKSPACE_FILES_URL_PREFIX)) return null;
+    return decodeURIComponent(rawPathname);
+}
+
 // Synchronous prefix check so the Router can decide dispatch without awaiting.
 function isWorkspaceFileRequest(req) {
     try {
-        const parsed = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
-        const pathname = decodeURIComponent(parsed.pathname || '/');
-        return pathname === '/workspace-files' || pathname.startsWith(WORKSPACE_FILES_URL_PREFIX);
+        return workspaceFilePathname(req) !== null;
     } catch (_) {
         return false;
     }
@@ -756,9 +763,8 @@ function isWorkspaceFileRequest(req) {
 
 async function serveWorkspaceFileRequest(req, res) {
     try {
-        const parsed = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
-        const pathname = decodeURIComponent(parsed.pathname || '/');
-        if (!(pathname === '/workspace-files' || pathname.startsWith(WORKSPACE_FILES_URL_PREFIX))) {
+        const pathname = workspaceFilePathname(req);
+        if (pathname === null) {
             return false;
         }
 

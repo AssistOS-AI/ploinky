@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import test from 'node:test';
+import { installWebchatBindingFixture } from '../helpers/webchatBindingFixture.mjs';
 
 // The Box workspace is the selected host path, so any directory-name character
 // can reach the rendered WebChat page and must stay inert attribute text.
@@ -13,6 +14,7 @@ fs.mkdirSync(path.join(root, '.ploinky'));
 fs.mkdirSync(path.join(root, directoryName));
 const previousRoot = process.env.PLOINKY_WORKSPACE_ROOT;
 process.env.PLOINKY_WORKSPACE_ROOT = root;
+const binding = installWebchatBindingFixture(root, { manifest: { cli: 'generic-test-agent' } });
 const { handleWebChat } = await import(`../../cli/server/handlers/webchat/index.js?workdir-attribute=${Date.now()}`);
 
 test.after(() => {
@@ -28,7 +30,7 @@ function request(url) {
     req.headers = { host: '127.0.0.1' };
     req.socket = {};
     req.user = { id: 'local:admin', username: 'admin', roles: ['user', 'admin'] };
-    return req;
+    return binding.bind(req);
 }
 
 function response() {
@@ -51,7 +53,7 @@ test('the WebChat page renders an arbitrary workspace directory as escaped attri
     await handleWebChat(
         request(`/webchat/?workspace-dir=${encodeURIComponent(directoryName)}`),
         res,
-        { agentName: 'generic-test-agent' },
+        binding.appConfig(),
         { sessions: new Map(), runtimes: new Map() },
     );
     await res.ended;

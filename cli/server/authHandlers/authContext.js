@@ -12,6 +12,9 @@ import { HttpRouteAccessPath } from '../policy/HttpRouteAccessPath.js';
 import { HttpRouteAccessPolicy } from '../policy/HttpRouteAccessPolicy.js';
 import { collectManifestHttpRouteAccess } from '../policy/HttpRouteProviders.js';
 import { evaluateRequiredCapability } from './requiredCapability.js';
+import { isRouteMount } from '../utils/routeMounts.js';
+import { manifestWebchatDeclaration, webchatRouteProvenance } from '../webchat/commandResolver.js';
+import { edgeWebchatTargets } from '../../sandbox/edgeGeneration.js';
 import {
     appendLog,
     appendSetCookie,
@@ -178,7 +181,6 @@ function resolveAuthRouteKey(parsedUrl, options = {}) {
     }
     if (parts.length >= 1 && routes[parts[0]]) {
         const pathAgent = parts[0];
-        if (explicit) return explicit;
         try {
             const pathAuthMode = resolveAuthContextForRouteKey(pathAgent, options).mode;
             if (pathAuthMode !== 'none') {
@@ -188,8 +190,220 @@ function resolveAuthRouteKey(parsedUrl, options = {}) {
         if (!staticAgent) return pathAgent;
         if (staticAgent) return staticAgent;
     }
-    if (explicit) return explicit;
+    // Only the authentication routes select the agent whose login is shown.
+    // Every other surface takes its owner from the route or the workspace.
+    if (explicit && parts[0] === 'auth') return explicit;
     return staticAgent || null;
+}
+
+const WEBCHAT_HELPER_PATHS = new Set(['/uploads', '/directories', '/suggestions/files', '/tasks']);
+const WEBCHAT_RUNTIME_PATHS = new Set(['/', '/index.html', '/stream', '/input', '/control', '/interaction']);
+
+// Every spelling a dispatcher could decode into the same mount: the raw path
+// and up to three percent-decoding passes. A path classifies by its first
+// spelling that names a Router surface, so an encoded mount never escapes it.
+function routerSurfacePathSpellings(pathname) {
+    const spellings = [String(pathname || '/')];
+    for (let pass = 0; pass < 3; pass += 1) {
+        let decoded;
+        try {
+            decoded = decodeURIComponent(spellings.at(-1));
+        } catch (_) {
+            break;
+        }
+        if (decoded === spellings.at(-1)) break;
+        spellings.push(decoded);
+    }
+    return spellings;
+}
+
+// Router-owned request classes whose authorization owner is the workspace (or
+// the selected host), never a caller-supplied `?agent=` selector.
+export function routerSurfaceRequestClass(pathname) {
+    for (const spelling of routerSurfacePathSpellings(pathname)) {
+        const requestClass = literalRouterSurfaceRequestClass(spelling);
+        if (requestClass) return requestClass;
+    }
+    return '';
+}
+
+function literalRouterSurfaceRequestClass(value) {
+    if (value === '/upload' || value === '/mcp' || value === '/mcp/'
+        || isRouteMount(value, '/blobs')
+        || isRouteMount(value, '/workspace-files')
+        || isRouteMount(value, '/status')) return 'router-sink';
+    if (!isRouteMount(value, '/webchat')) return '';
+    const subpath = value.slice('/webchat'.length) || '/';
+    if (WEBCHAT_HELPER_PATHS.has(subpath) || subpath.startsWith('/tasks/')) return 'webchat-helper';
+    if (WEBCHAT_RUNTIME_PATHS.has(subpath)) return 'webchat-runtime';
+    return '';
+}
+
+function routeMatchesAgentRecord(route, resolved) {
+    if (!route || typeof route !== 'object' || route.disabled || !resolved?.record) return false;
+    const container = String(route.container || '').trim();
+    if (container) return container === resolved.containerName;
+    return String(route.repo || '') === String(resolved.record.repoName || '')
+        && String(route.agent || '') === String(resolved.record.agentName || '');
+}
+
+// Maps a selector (route key, alias or repo/agent reference) to exactly one
+// enabled route key of the authorization snapshot. Unknown, ambiguous or
+// inconsistent selectors resolve to '' and fail closed.
+function canonicalEnabledRouteKey(selector, options = {}) {
+    const input = String(selector || '').trim();
+    if (!input) return '';
+    const routes = readRouting(options).routes || {};
+    let resolved;
+    try {
+        resolved = resolveEnabledAgentRecordForAuth(input, options);
+    } catch (_) {
+        return '';
+    }
+    if (!resolved?.record) return '';
+    const candidates = Object.hasOwn(routes, input)
+        ? [input]
+        : Object.entries(routes).filter(([, route]) => routeMatchesAgentRecord(route, resolved)).map(([key]) => key);
+    if (candidates.length !== 1 || !routeMatchesAgentRecord(routes[candidates[0]], resolved)) return '';
+    let check;
+    try {
+        check = resolveEnabledAgentRecordForAuth(candidates[0], options);
+    } catch (_) {
+        return '';
+    }
+    return check?.containerName === resolved.containerName ? candidates[0] : '';
+}
+
+function boundGenerationFor(routePlan, snapshot) {
+    return String(routePlan?.lease?.id || snapshot?.generation || '');
+}
+
+// The workspace or host owner of every Router surface request class.
+function resolveRouterSurfaceOwner(routePlan, options = {}) {
+    const snapshot = snapshotFromOptions(options);
+    if (isHostBoundRoutePlan(routePlan)) {
+        const ownerRouteKey = routePlanSelectedRouteKey(routePlan);
+        if (!ownerRouteKey) return null;
+        return {
+            scope: 'host',
+            host: String(routePlan?.hostSelection?.host || routePlan?.host || '').trim(),
+            ownerRouteKey,
+            context: {
+                ...resolveAuthenticatedRouteAuthContext(ownerRouteKey, { snapshot }),
+                boundHostRouteKey: ownerRouteKey,
+                boundGeneration: boundGenerationFor(routePlan, snapshot),
+            },
+        };
+    }
+    const ownerRouteKey = canonicalEnabledRouteKey(readRouting(options).static?.agent, options);
+    if (!ownerRouteKey) return null;
+    const context = resolveAuthContextForRouteKey(ownerRouteKey, options);
+    if (!context.record) return null;
+    return {
+        scope: 'control',
+        host: String(routePlan?.hostSelection?.host || '').trim(),
+        ownerRouteKey,
+        context,
+    };
+}
+
+function unconfiguredSurfaceOwnerContext() {
+    return {
+        routeKey: null,
+        mode: 'none',
+        policy: { mode: 'none' },
+        record: null,
+        surfaceOwnerUnconfigured: true,
+    };
+}
+
+// Adds a selected WebChat target to an owner context. The owner's admission and
+// capability are always kept; the target only adds its own capability and the
+// mutation-proof route binding used by that target's WebChat page.
+function withWebchatTarget(ownerContext, targetRouteKey) {
+    const target = String(targetRouteKey || '').trim();
+    if (!target || target === (ownerContext.serviceRouteKey || ownerContext.routeKey)) return ownerContext;
+    if (!ownerContext.serviceRouteKey) return { ...ownerContext, serviceRouteKey: target };
+    return {
+        ...ownerContext,
+        mutationRouteKey: target,
+        additionalCapabilityRouteKeys: [...(ownerContext.additionalCapabilityRouteKeys || []), target],
+    };
+}
+
+function resolveWebchatTargetSelection(parsedUrl, owner, options = {}) {
+    const values = parsedUrl.searchParams.getAll('agent').map((value) => String(value || '').trim());
+    if (values.length > 1) return { unavailable: true };
+    const selector = values[0] || '';
+    const routeKey = selector ? canonicalEnabledRouteKey(selector, options) : owner.ownerRouteKey;
+    if (!routeKey) return { unavailable: true };
+    if (owner.scope === 'host' && routeKey !== owner.ownerRouteKey) {
+        if (!edgeWebchatTargets(snapshotFromOptions(options), owner.host).includes(routeKey)) return { unavailable: true };
+    }
+    return { routeKey, selector };
+}
+
+function webchatTargetUnavailableContext(owner) {
+    return {
+        routeKey: owner.ownerRouteKey,
+        mode: 'none',
+        policy: { mode: 'none' },
+        record: null,
+        error: 'webchat_target_unavailable',
+        errorStatus: 404,
+        errorDetail: 'The requested WebChat agent is not available on this surface.',
+    };
+}
+
+function resolveRouterSurfaceAuthContext(parsedUrl, routePlan, options = {}) {
+    const requestClass = routerSurfaceRequestClass(parsedUrl?.pathname);
+    if (!requestClass) return null;
+    if (isHostBoundRoutePlan(routePlan) && routePlan?.kind !== 'router-surface') return null;
+    const owner = resolveRouterSurfaceOwner(routePlan, options);
+    if (!owner) return unconfiguredSurfaceOwnerContext();
+    if (requestClass === 'router-sink') return owner.context;
+
+    const selection = resolveWebchatTargetSelection(parsedUrl, owner, options);
+    if (requestClass === 'webchat-helper') {
+        // Helpers keep the owner's authorization. A resolvable target only adds
+        // its own capability and keeps the page's mutation-proof binding.
+        return selection.routeKey ? withWebchatTarget(owner.context, selection.routeKey) : owner.context;
+    }
+    if (selection.unavailable) return webchatTargetUnavailableContext(owner);
+
+    const target = selection.routeKey;
+    const routing = readRouting(options);
+    const declaration = manifestWebchatDeclaration(readEnabledAgentManifest(target, routing.routes || {}, options));
+    const targetContext = resolveAuthContextForRouteKey(target, options);
+    const ownTargetPolicy = declaration === 'self'
+        && targetContext.mode !== 'none'
+        && (target === owner.ownerRouteKey || (owner.scope === 'control' && targetContext.mode !== 'guest'));
+    const snapshot = snapshotFromOptions(options);
+    let context;
+    if (ownTargetPolicy && owner.scope === 'host') {
+        context = {
+            ...targetContext,
+            boundHostRouteKey: owner.ownerRouteKey,
+            boundGeneration: boundGenerationFor(routePlan, snapshot),
+        };
+    } else if (ownTargetPolicy) {
+        context = targetContext;
+    } else {
+        context = withWebchatTarget(owner.context, target);
+    }
+    return {
+        ...context,
+        webchatBinding: {
+            scope: owner.scope,
+            host: owner.host,
+            selector: selection.selector,
+            target,
+            declaration,
+            ownerRouteKey: owner.ownerRouteKey,
+            generation: boundGenerationFor(routePlan, snapshot),
+            targetRoute: webchatRouteProvenance(routing, target),
+        },
+    };
 }
 
 function bindWebchatSurfaceServiceRoute(parsedUrl, authContext, options = {}) {
@@ -213,6 +427,11 @@ function bindWebchatSurfaceServiceRoute(parsedUrl, authContext, options = {}) {
 }
 
 function resolveAuthContext(parsedUrl, options = {}) {
+    // Route-plan callers classify Router surfaces before their own fallbacks.
+    const surfaceContext = options.routerSurfaceResolved
+        ? null
+        : resolveRouterSurfaceAuthContext(parsedUrl, options.routePlan || null, options);
+    if (surfaceContext) return surfaceContext;
     const routeKey = resolveAuthRouteKey(parsedUrl, options);
     if (!routeKey) {
         return { routeKey: null, mode: 'none', policy: { mode: 'none' }, record: null };
@@ -428,6 +647,10 @@ export function resolveAuthContextForRoutePlan(parsedUrl, routePlan, { browserAu
             serviceRouteKey: 'webtty',
         };
     }
+    if (!browserAuth) {
+        const surfaceContext = resolveRouterSurfaceAuthContext(parsedUrl, routePlan, { snapshot, routePlan });
+        if (surfaceContext) return surfaceContext;
+    }
     if (browserAuth && isHostBoundRoutePlan(routePlan) && selectedRouteKey) {
         const mutationRouteKey = hostBoundMutationRouteKey(parsedUrl, routePlan, snapshot);
         if (mutationRouteKey === null) {
@@ -494,7 +717,7 @@ export function resolveAuthContextForRoutePlan(parsedUrl, routePlan, { browserAu
             );
         }
     }
-    return resolveAuthContext(parsedUrl, { snapshot });
+    return resolveAuthContext(parsedUrl, { snapshot, routerSurfaceResolved: true });
 }
 
 function resolveGuestRouteAuthContext(routeKey, options = {}, parsedUrl = null) {
@@ -693,6 +916,9 @@ function finalizeAuthenticatedRequest(req, res, parsedUrl, authContext, options,
     const capabilityRouteKeys = [...new Set([
         String(authContext?.capabilityOwnerRouteKey || authContext?.routeKey || '').trim(),
         String(authContext?.serviceRouteKey || '').trim(),
+        ...(Array.isArray(authContext?.additionalCapabilityRouteKeys)
+            ? authContext.additionalCapabilityRouteKeys.map((routeKey) => String(routeKey || '').trim())
+            : []),
     ].filter(Boolean))];
     const privilegedLocalCli = req.authMode === 'local'
         && req.authChannel === 'cli'
@@ -786,6 +1012,12 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext, 
             req.authChannel = 'cli';
             return finalizeAuthenticatedRequest(req, res, parsedUrl, authContext, options, localCliSession);
         }
+    }
+    if (authContext.surfaceOwnerUnconfigured) {
+        // A missing or unresolvable owner is never public policy. Only the
+        // separately authenticated local CLI session above may proceed.
+        sendJson(res, 503, { ok: false, error: 'router_surface_owner_unconfigured' });
+        return { ok: false, error: 'router_surface_owner_unconfigured' };
     }
     if (authContext.mode === 'none') return { ok: true };
     if (authContext.mode === 'sso' && !authService.isConfigured()) {
