@@ -230,6 +230,10 @@ export async function executeWebSocketPlan({
                 });
                 clientFrames.once('error', fail);
                 targetFrames.once('error', fail);
+                // The relay duplex is piped as a destination; without its own
+                // listener a write rejected by a terminal relay stream
+                // (END, failure or abandon) escapes as an uncaught exception.
+                upstreamSocket.once('error', fail);
                 socket.on('data', resetIdleTimer);
                 upstreamSocket.on('data', resetIdleTimer);
                 socket.pipe(clientFrames).pipe(upstreamSocket);

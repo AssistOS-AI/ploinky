@@ -835,3 +835,86 @@ test('response-header deadline includes setup time instead of restarting at the 
     assert.equal(checkoutClosed, true);
     assert.equal(released, true);
 });
+
+test('WebSocket client data after the relay stream ended fails through teardown without an uncaught exception', {
+    concurrency: false,
+}, async t => {
+    const originalRequest = http.request;
+    t.after(() => { http.request = originalRequest; });
+    const uncaught = [];
+    const onUncaught = error => { uncaught.push(error); };
+    const previousListeners = process.listeners('uncaughtException');
+    for (const listener of previousListeners) process.removeListener('uncaughtException', listener);
+    process.on('uncaughtException', onUncaught);
+    t.after(() => {
+        process.removeListener('uncaughtException', onUncaught);
+        for (const listener of previousListeners) process.on('uncaughtException', listener);
+    });
+
+    const terminalError = Object.assign(new Error('runtimeRelay: request stream is terminal'), {
+        code: 'RELAY_STREAM_TERMINAL',
+    });
+    const relayStream = new ApplicationRelayStream();
+    relayStream.write = () => { throw terminalError; };
+    let agent;
+    const upstreamRequest = new EventEmitter();
+    upstreamRequest.end = () => {
+        setImmediate(() => {
+            upstreamRequest.emit('upgrade', {
+                statusCode: 101,
+                statusMessage: 'Switching Protocols',
+                headers: {},
+            }, agent.createConnection(), Buffer.alloc(0));
+        });
+    };
+    upstreamRequest.destroy = () => {};
+    http.request = options => {
+        agent = options.agent;
+        return upstreamRequest;
+    };
+
+    const request = {
+        method: 'GET',
+        headers: {
+            host: '127.0.0.1:8080',
+            origin: 'http://127.0.0.1:8080',
+            connection: 'Upgrade',
+            upgrade: 'websocket',
+            'sec-websocket-version': '13',
+            'sec-websocket-key': Buffer.alloc(16, 9).toString('base64'),
+        },
+    };
+    const socket = new TeardownSocket();
+    const events = [];
+    let released = 0;
+    const handling = executeWebSocketPlan({
+        req: request,
+        socket,
+        plan: routePlan({ method: 'GET', transport: 'websocket' }),
+        lease: { release() { released += 1; } },
+        relayManager: {
+            checkout: async () => ({ openRequest: async () => relayStream, close() {} }),
+        },
+        authorized: true,
+        auditSink: event => events.push(event),
+    });
+
+    await new Promise(resolve => setTimeout(resolve, 20));
+    relayStream.emit('end');
+    // A complete, empty unmasked text frame reaches the relay duplex write.
+    socket.push(Buffer.from([0x81, 0x00]));
+
+    const handled = await Promise.race([
+        handling,
+        new Promise(resolve => setTimeout(() => resolve('timeout'), 1000)),
+    ]);
+    await new Promise(resolve => setTimeout(resolve, 20));
+
+    assert.deepEqual(uncaught.map(error => error.message), []);
+    assert.equal(handled, false);
+    assert.equal(socket.destroyed, true);
+    assert.equal(released, 1);
+    const failures = events.filter(event => event.outcome === 'failure');
+    assert.equal(failures.length, 1);
+    assert.equal(failures[0].errorCode, 'RELAY_STREAM_TERMINAL');
+});
