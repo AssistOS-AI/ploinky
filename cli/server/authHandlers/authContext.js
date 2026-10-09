@@ -16,6 +16,7 @@ import { isRouteMount } from '../utils/routeMounts.js';
 import { manifestWebchatDeclaration, webchatRouteProvenance } from '../webchat/commandResolver.js';
 import { edgeWebchatTargets } from '../../sandbox/edgeGeneration.js';
 import { admitPublicMcpTarget } from '../mcp-proxy/sessionOwnership.mjs';
+import { isAgentRootPlan } from '../edgeRoutePlan.js';
 import {
     appendLog,
     appendSetCookie,
@@ -1021,10 +1022,12 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext, 
         return { ok: false, error: 'router_surface_owner_unconfigured' };
     }
     if (authContext.mode === 'none') {
-        // Only the route whose own record and policy were resolved is public.
-        // A service route or WebChat binding names a caller-selected target
-        // that this context never resolved, so it admits nothing.
-        if (authContext.record && authContext.routeKey && authContext.policy?.mode === 'none'
+        // Only a request dispatched to an MCP handler can open a public MCP
+        // session, and only the route whose own record and policy were resolved
+        // is public. A service route or WebChat binding names a caller-selected
+        // target that this context never resolved, so it admits nothing.
+        if (isMcpDispatchRequest(parsedUrl, options.routePlan)
+            && authContext.record && authContext.routeKey && authContext.policy?.mode === 'none'
             && !authContext.serviceRouteKey && !authContext.webchatBinding) {
             admitPublicMcpTarget(req, authContext.routeKey);
         }
@@ -1111,6 +1114,22 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext, 
         appendSetCookie(res, cookie);
     } catch (_) { }
     return finalizeAuthenticatedRequest(req, res, parsedUrl, authContext, options, session);
+}
+
+// The MCP handlers are reached by exactly this classification in the Router
+// dispatch: an agent-root plan whose upstream path is the MCP mount, or the
+// aggregate `/mcp` mount on the canonical path. A request without a route plan
+// has no canonical classification and opens no public MCP session.
+function isMcpDispatchRequest(parsedUrl, routePlan) {
+    if (!routePlan) return false;
+    if (isAgentRootPlan(routePlan)) {
+        const upstream = String(routePlan.upstreamPath || '');
+        return upstream === '/mcp' || upstream.startsWith('/mcp?') || upstream.startsWith('/mcp/');
+    }
+    const pathname = routePlan.ok && routePlan.canonicalPath
+        ? routePlan.canonicalPath
+        : (parsedUrl?.pathname || '/');
+    return pathname === '/mcp' || pathname === '/mcp/';
 }
 
 export async function ensureAuthenticated(req, res, parsedUrl, options = {}) {

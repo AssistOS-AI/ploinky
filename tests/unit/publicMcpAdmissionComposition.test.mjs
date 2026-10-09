@@ -157,6 +157,59 @@ test('a WebChat selector under a none owner records no public target for the sel
     }
 });
 
+test('only requests the Router dispatches to an MCP handler can admit a public target', async () => {
+    const targets = ['owner', 'other', 'secure', 'bogus'];
+    const none = async (url, plan) => {
+        const { req } = await admit(url, plan);
+        for (const target of targets) {
+            assert.equal(createMcpSessionOwner(req, 'agent', target), null, `${url} agent ${target}`);
+        }
+        assert.equal(createMcpSessionOwner(req, 'aggregate'), null, `${url} aggregate`);
+    };
+    for (const url of [
+        '/auth/x?agent=other', '/auth/x?agent=bogus', '/auth/login?agent=owner',
+        '/webchat/unknown?agent=other', '/webchat/assets/app.js?agent=other',
+        '/webchat/uploads?agent=secure', '/webchat/stream', '/webchat/stream?agent=bogus',
+        '/status', '/blobs/x?agent=other', '/upload',
+        '/%6dcp', '/%6dcp?agent=other', '/mcpx', '/api/mcp',
+    ]) {
+        await none(url, basePlan);
+    }
+    // A request with no route plan has no canonical classification.
+    const parsedUrl = new URL('/mcp', 'http://localhost');
+    const req = mcpRequest('/mcp');
+    assert.equal((await authHandlers.ensureAuthenticated(req, mockResponse(), parsedUrl)).ok, true);
+    assert.equal(createMcpSessionOwner(req, 'aggregate'), null);
+});
+
+// The admission predicate is also pinned on its own: these requests are
+// classified as MCP dispatch by a plan while their auth context is the
+// WebChat or authentication context the Router builds for the URL.
+test('the admission predicate refuses selector-derived and unresolved contexts', async () => {
+    const mcpPlan = agentRootPlan('owner', '/owner/mcp');
+    const urls = [
+        '/webchat/uploads?agent=secure', // serviceRouteKey without a binding
+        '/webchat/stream', // a binding without a serviceRouteKey
+        '/auth/x?agent=bogus', // no resolved record
+        '/webchat/stream?agent=bogus', // no resolved record
+    ];
+    for (const url of urls) {
+        const { req, context } = await admit(url, mcpPlan);
+        if (url === '/webchat/uploads?agent=secure') {
+            assert.equal(context.serviceRouteKey, 'secure');
+            assert.equal(context.webchatBinding, undefined);
+        } else if (url === '/webchat/stream') {
+            assert.equal(context.serviceRouteKey, undefined);
+            assert.ok(context.webchatBinding);
+        } else {
+            assert.equal(context.record, null, url);
+        }
+        for (const target of ['owner', 'other', 'secure', 'bogus']) {
+            assert.equal(createMcpSessionOwner(req, 'agent', target), null, `${url} agent ${target}`);
+        }
+    }
+});
+
 test('a browser MCP session opens on the public route and stays bound to it', async () => {
     const url = '/owner/mcp';
     const plan = agentRootPlan('owner', url);
