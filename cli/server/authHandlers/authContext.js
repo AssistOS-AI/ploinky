@@ -12,6 +12,7 @@ import { HttpRouteAccessPath } from '../policy/HttpRouteAccessPath.js';
 import { HttpRouteAccessPolicy } from '../policy/HttpRouteAccessPolicy.js';
 import { collectManifestHttpRouteAccess } from '../policy/HttpRouteProviders.js';
 import { evaluateRequiredCapability } from './requiredCapability.js';
+import { admitPublicMcpTarget } from '../mcp-proxy/sessionOwnership.mjs';
 import {
     appendLog,
     appendSetCookie,
@@ -787,7 +788,12 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext, 
             return finalizeAuthenticatedRequest(req, res, parsedUrl, authContext, options, localCliSession);
         }
     }
-    if (authContext.mode === 'none') return { ok: true };
+    if (authContext.mode === 'none') {
+        if (authContext.record && authContext.routeKey && authContext.policy?.mode === 'none') {
+            admitPublicMcpTarget(req, authContext.serviceRouteKey || authContext.routeKey);
+        }
+        return { ok: true };
+    }
     if (authContext.mode === 'sso' && !authService.isConfigured()) {
         sendJson(res, 503, { ok: false, error: 'sso_not_configured' });
         return { ok: false, error: 'sso_not_configured' };

@@ -23,6 +23,7 @@ import { policy } from '../policy/index.js';
 import { deriveSubkey } from '../../utils/security/masterKey.js';
 import { verifyUserDelegationGrant } from './userDelegationGrant.js';
 import { MCP_SESSION_INVALID_ERROR } from './sessionErrors.js';
+import { createMcpSessionOwner, inspectMcpSession, matchesMcpSessionOwner, readMcpSessionHeader } from './sessionOwnership.mjs';
 
 const AGENT_PROXY_PROTOCOL_VERSION = '2025-06-18';
 const AGENT_PROXY_SERVER_INFO = { name: 'ploinky-router-proxy', version: '1.0.0' };
@@ -48,9 +49,7 @@ const IDEMPOTENT_UPSTREAM_METHODS = new Set(['tools/list', 'resources/list', 'pi
  * Read MCP session ID from request headers
  */
 function readAgentSessionId(req) {
-    const value = req.headers['mcp-session-id'];
-    if (Array.isArray(value)) return value[0];
-    return typeof value === 'string' ? value : null;
+    return readMcpSessionHeader(req).id;
 }
 
 /**
@@ -646,8 +645,11 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, {
     const message = messages[0];
     const baseUrl = `http://127.0.0.1:${route.hostPort}/mcp`;
 
-    const sessionIdHeader = readAgentSessionId(req);
-    const sessionEntry = sessionIdHeader ? agentSessionStore.get(sessionIdHeader) : null;
+    const owner = createMcpSessionOwner(req, 'agent', agentName);
+    const admission = inspectMcpSession(agentSessionStore, req, owner);
+    const sessionIdHeader = admission.id;
+    const sessionEntry = admission.entry;
+    const isOwned = () => matchesMcpSessionOwner(agentSessionStore.get(sessionIdHeader), owner);
 
     const headersForSession = (sessionId) => {
         const headers = { 'mcp-protocol-version': AGENT_PROXY_PROTOCOL_VERSION };
@@ -656,13 +658,24 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, {
     };
 
     const sendResponse = (statusCode, body, sessionId) => {
+        if (sessionId && !matchesMcpSessionOwner(agentSessionStore.get(sessionId), owner)) {
+            body = { jsonrpc: '2.0', id: message.id ?? null, error: { ...MCP_SESSION_INVALID_ERROR } };
+            sessionId = null;
+        }
         res.writeHead(statusCode, { 'Content-Type': 'application/json', ...headersForSession(sessionId) });
         res.end(JSON.stringify(body));
     };
 
+    const stateless = req.delegatedAgentVerified && message.method === 'tools/call' && !admission.supplied;
+    if (admission.refused || (!owner && !stateless)) {
+        if (!Object.hasOwn(message, 'id')) sendJson(res, 403, { error: MCP_SESSION_INVALID_ERROR.message });
+        else sendResponse(200, { jsonrpc: '2.0', id: message.id ?? null, error: { ...MCP_SESSION_INVALID_ERROR } }, null);
+        return;
+    }
+
     if (message.method === 'initialize') {
         const newSessionId = randomUUID();
-        agentSessionStore.set(newSessionId, { agentName, baseUrl });
+        agentSessionStore.set(newSessionId, { agentName, baseUrl, owner });
         sendResponse(200, {
             jsonrpc: '2.0',
             id: message.id ?? null,
@@ -685,7 +698,7 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, {
         return;
     }
 
-    const isVerifiedDelegatedToolCall = Boolean(req.delegatedAgentVerified && message.method === 'tools/call');
+    const isVerifiedDelegatedToolCall = Boolean(stateless);
     if ((!sessionEntry || sessionEntry.agentName !== agentName) && !isVerifiedDelegatedToolCall) {
         sendResponse(200, {
             jsonrpc: '2.0',
@@ -755,6 +768,10 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, {
                     ? { ...argPayload }
                     : {};
                 const canonicalArgs = await canonicalizeToolArguments(agentName, upstream, name, args);
+                if (!stateless && !isOwned()) {
+                    sendResponse(200, { jsonrpc: '2.0', id: message.id ?? null, error: { ...MCP_SESSION_INVALID_ERROR } }, null);
+                    break;
+                }
 
                 // Mint a router-signed invocation token scoped to this tool call,
                 // once per upstream attempt, and send it only in that request.
@@ -838,10 +855,17 @@ async function handleAgentMcpRequest(req, res, route, agentName, {
     }
 
     if (method === 'DELETE') {
-        const sessionId = readAgentSessionId(req);
-        if (sessionId) {
-            agentSessionStore.delete(sessionId);
+        if (!isDelegatedAgentRequest && !req.user && !req.agent) {
+            const auth = await ensureAuthenticated(req, res, new URL(req.url || '/', 'http://localhost'), { routePlan });
+            if (!auth.ok) return;
         }
+        const owner = isDelegatedAgentRequest ? null : createMcpSessionOwner(req, 'agent', agentName);
+        const admission = inspectMcpSession(agentSessionStore, req, owner);
+        if (admission.refused) {
+            sendJson(res, 403, { error: MCP_SESSION_INVALID_ERROR.message });
+            return;
+        }
+        if (admission.entry) agentSessionStore.delete(admission.id);
         res.writeHead(204);
         res.end();
         return;
@@ -867,6 +891,12 @@ async function handleAgentMcpRequest(req, res, route, agentName, {
         const message = Array.isArray(payload) ? payload[0] : payload;
         const parsedUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
 
+        if (isDelegatedAgentRequest && readMcpSessionHeader(req).supplied) {
+            if (isJsonRpc && Object.hasOwn(message || {}, 'id')) {
+                sendJson(res, 200, { jsonrpc: '2.0', id: message.id ?? null, error: { ...MCP_SESSION_INVALID_ERROR } });
+            } else sendJson(res, 403, { error: MCP_SESSION_INVALID_ERROR.message });
+            return;
+        }
         if (isDelegatedAgentRequest) {
             if (!isJsonRpc || message?.method !== 'tools/call') {
                 const errorMessage = 'Delegated agent calls must use a direct tools/call request.';
@@ -940,6 +970,17 @@ async function handleAgentMcpRequest(req, res, route, agentName, {
             }
         }
 
+        // Refuse foreign or malformed browser handles before readiness work or
+        // any other branch can acknowledge them. Delegated calls are stateless.
+        const admission = inspectMcpSession(agentSessionStore, req,
+            createMcpSessionOwner(req, 'agent', agentName));
+        if (admission.refused || (req.delegatedAgentVerified && admission.supplied)) {
+            if (isJsonRpc && Object.hasOwn(message || {}, 'id')) {
+                sendJson(res, 200, { jsonrpc: '2.0', id: message.id ?? null, error: { ...MCP_SESSION_INVALID_ERROR } });
+            } else sendJson(res, 403, { error: MCP_SESSION_INVALID_ERROR.message });
+            return;
+        }
+
         // Readiness cache (fails closed): a pooled key that answered within the
         // last 10 s skips the probe; every pooled POST still runs beforeDial,
         // and any pooled transport or session error clears the cache.
@@ -988,6 +1029,12 @@ async function handleAgentMcpRequest(req, res, route, agentName, {
             ...(declaredProtocol === 'tcp' ? { protocol: 'tcp' } : {}),
         });
         const isReady = Boolean(poolKey && pool.isReady(poolKey)) || await probeReadiness();
+        if (admission.entry && agentSessionStore.get(admission.id) !== admission.entry) {
+            if (isJsonRpc && Object.hasOwn(message || {}, 'id')) {
+                sendJson(res, 200, { jsonrpc: '2.0', id: message.id ?? null, error: { ...MCP_SESSION_INVALID_ERROR } });
+            } else sendJson(res, 403, { error: MCP_SESSION_INVALID_ERROR.message });
+            return;
+        }
         if (!isReady) {
             sendAgentNotReady(res, { isJsonRpc, message, agentName });
             return;

@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { createMcpSessionOwner } from '../../cli/server/mcp-proxy/sessionOwnership.mjs';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import { EventEmitter, once } from 'node:events';
@@ -810,7 +811,8 @@ function proxyRoute(port, lease, manifest) {
 
 function openRouterSession(proxy) {
     const sessionId = crypto.randomUUID();
-    proxy.agentSessionStore.set(sessionId, { agentName: 'echoAgent', baseUrl: 'http://127.0.0.1/mcp' });
+    const owner = createMcpSessionOwner({ user: PROXY_USER, authMode: 'sso', sessionId: 'pool-browser-login' }, 'agent', 'echoAgent');
+    proxy.agentSessionStore.set(sessionId, { agentName: 'echoAgent', baseUrl: 'http://127.0.0.1/mcp', owner });
     return sessionId;
 }
 
@@ -832,6 +834,8 @@ async function proxyCall(proxy, { route, routePlan, sessionId, body, pool, waitF
     req.url = '/echoAgent/mcp';
     req.headers = { host: 'localhost', 'content-type': 'application/json', 'mcp-session-id': sessionId };
     req.user = PROXY_USER;
+    req.authMode = 'sso';
+    req.sessionId = 'pool-browser-login';
     if (agent) req.agent = agent;
     let finish;
     const done = new Promise((resolve) => { finish = resolve; });
@@ -1618,6 +1622,8 @@ async function proxyNotification(proxy, { route, routePlan, sessionId, body, poo
     req.url = '/echoAgent/mcp';
     req.headers = { host: 'localhost', 'content-type': 'application/json', 'mcp-session-id': sessionId };
     req.user = PROXY_USER;
+    req.authMode = 'sso';
+    req.sessionId = 'pool-browser-login';
     let finish;
     const done = new Promise((resolve) => { finish = resolve; });
     const res = { statusCode: 0, body: '', writeHead(code) { this.statusCode = code; }, end(chunk = '') { this.body += String(chunk); finish(); } };
