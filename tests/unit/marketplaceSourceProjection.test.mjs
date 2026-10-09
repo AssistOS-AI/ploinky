@@ -126,9 +126,69 @@ test('the combined state builder is path-free unless the caller is a genuine adm
     assert.equal(JSON.stringify(buildMarketplaceState(principals.realAdmin.user, { liveContainers: [] })).includes(skillsRoot), true);
 });
 
-test('only remote Git origins survive URL projection', () => {
-    for (const url of ['https://github.com/o/r.git', 'http://host/r.git', 'ssh://git@host/o/r.git', 'git://host/r.git', 'git@github.com:o/r.git']) assert.equal(remoteUrlOrEmpty(url), url);
-    for (const url of ['/Users/x/work/repo', 'file:///Users/x/repo', './repo', '../repo', '~/repo', 'C:\\repo', '', undefined, null, 5]) assert.equal(remoteUrlOrEmpty(url), '', String(url));
+// Shared URL vectors: [input, expected non-admin display value]. Sentinels mark
+// credential material that must never survive in any form.
+const URL_PROJECTION_VECTORS = [
+    ['https://github.com/o/r.git', 'https://github.com/o/r.git'],
+    ['http://host.example/r.git', 'http://host.example/r.git'],
+    ['git://host.example/r.git', 'git://host.example/r.git'],
+    ['https://git.example:8443/group/sub/r.git', 'https://git.example:8443/group/sub/r.git'],
+    ['HTTPS://GitHub.com/o/r.git', 'https://github.com/o/r.git'],
+    ['https://github.com', 'https://github.com/'],
+    // Userinfo is removed whatever it holds, including a token used as the username.
+    ['https://user:SENTINELPW@github.com/o/r.git', 'https://github.com/o/r.git'],
+    ['https://SENTINELTOKEN@github.com/o/r.git', 'https://github.com/o/r.git'],
+    ['https://x-access-token:SENTINELTOKEN@github.com/o/r.git', 'https://github.com/o/r.git'],
+    ['https://SENTINEL%40TOKEN:SENTINEL%3APW@github.com/o/r.git', 'https://github.com/o/r.git'],
+    ['https://:SENTINELPW@github.com/o/r.git', 'https://github.com/o/r.git'],
+    ['ssh://git@host.example/o/r.git', 'ssh://host.example/o/r.git'],
+    ['ssh://SENTINELTOKEN@host.example:2222/o/r.git', 'ssh://host.example:2222/o/r.git'],
+    // Query and fragment data are dropped rather than guessed at.
+    ['https://github.com/o/r.git?access_token=SENTINELQUERY', 'https://github.com/o/r.git'],
+    ['https://github.com/o/r.git#SENTINELFRAGMENT', 'https://github.com/o/r.git'],
+    ['https://SENTINELTOKEN@github.com/o/r.git?private_token=SENTINELQUERY#SENTINELFRAGMENT', 'https://github.com/o/r.git'],
+    // scp-style: the user part is removed whatever it holds.
+    ['git@github.com:o/r.git', 'github.com:o/r.git'],
+    ['SENTINELTOKEN@github.com:o/r.git', 'github.com:o/r.git'],
+    ['SENTINELUSER:SENTINELPW@github.com:o/r.git', ''],
+    // Ambiguous forms fail closed.
+    ['https://host.example/user:SENTINELPW@evil.example/r.git', ''],
+    ['https://host.example/SENTINEL%40TOKEN/r.git', ''],
+    ['https://host.example/%2e%2e/SENTINELPATH', 'https://host.example/SENTINELPATH'],
+    ['https://user:SENTINELPW@host.example\\@evil.example/r', ''],
+    ['https://host.example/r .git', ''],
+    ['https://host.example/r\n.git', ''],
+    ['https://[::1]/r.git', ''],
+    ['git+ssh://git@host.example/r.git', ''],
+    ['ftp://host.example/r.git', ''],
+    ['https://', ''],
+    ['git@host:/', ''],
+    ['git@C:/Users/x/repo', ''],
+    ['git@host.example://r.git', ''],
+    ['user@localhost:repo', ''],
+    // Local locations never reappear through a URL.
+    ['/Users/x/work/repo', ''],
+    ['file:///Users/x/repo', ''],
+    ['file://host.example/r.git', ''],
+    ['./repo', ''],
+    ['../repo', ''],
+    ['~/repo', ''],
+    ['C:\\repo', ''],
+    ['repo', ''],
+    ['', ''],
+    [undefined, ''],
+    [null, ''],
+    [5, ''],
+    [{ toString: () => 'https://github.com/o/r.git' }, ''],
+];
+
+test('URL projection emits only credential-free remote origins', () => {
+    for (const [input, expected] of URL_PROJECTION_VECTORS) {
+        const actual = remoteUrlOrEmpty(input);
+        assert.equal(actual, expected, `projection of ${JSON.stringify(String(input))}`);
+        assert.equal(/SENTINEL(?!PATH)|%40|@[^:/]*:/.test(actual), false, `credential material survived for ${String(input)}`);
+        assert.equal(actual.includes('?') || actual.includes('#'), false, `query or fragment survived for ${String(input)}`);
+    }
 });
 
 test('free-text startup failure detail is withheld from non-administrators', () => {
@@ -253,4 +313,61 @@ test('concurrent machine, admin and non-admin reads through the awaited inventor
         else assertNoLocalPaths(res.body, `${label} ${resource}`);
     }
     assert.ok(calls >= 6, 'the awaited inventory path was exercised');
+});
+
+test('credential-bearing repository URLs are redacted for non-administrators and kept for admins and machines', async t => {
+    const sourcesFile = path.join(workspace, '.ploinky', 'repo_sources.json');
+    const sources = {
+        CredUserinfoSkills: { url: 'https://x-access-token:SENTINELTOKEN@github.com/acme/cred-userinfo.git', branch: 'main', kind: 'skills' },
+        CredUsernameSkills: { url: 'https://SENTINELTOKEN@git.example/acme/cred-username.git', kind: 'skills' },
+        CredEncodedSkills: { url: 'https://SENTINEL%40TOKEN:SENTINEL%3APW@git.example/acme/cred-encoded.git', kind: 'skills' },
+        CredQuerySkills: { url: 'https://git.example/acme/cred-query.git?access_token=SENTINELQUERY#SENTINELFRAGMENT', kind: 'skills' },
+        CredScpSkills: { url: 'SENTINELTOKEN@github.com:acme/cred-scp.git', kind: 'skills' },
+        CredFileSkills: { url: `file://${workspace}/SENTINELFILE`, kind: 'skills' },
+        CredPathSkills: { url: `${workspace}/SENTINELLOCAL`, kind: 'skills' },
+    };
+    const bytes = JSON.stringify(sources, null, 2);
+    fs.writeFileSync(sourcesFile, bytes);
+    t.after(() => fs.rmSync(sourcesFile, { force: true }));
+    const expected = {
+        CredUserinfoSkills: 'https://github.com/acme/cred-userinfo.git',
+        CredUsernameSkills: 'https://git.example/acme/cred-username.git',
+        CredEncodedSkills: 'https://git.example/acme/cred-encoded.git',
+        CredQuerySkills: 'https://git.example/acme/cred-query.git',
+        CredScpSkills: 'github.com:acme/cred-scp.git',
+        CredFileSkills: '',
+        CredPathSkills: '',
+    };
+    const assertRedacted = (body, label) => {
+        const text = JSON.stringify(body);
+        assert.equal(/SENTINEL/.test(text), false, `${label}: credential or local sentinel leaked`);
+        assertNoLocalPaths(body, label);
+    };
+    for (const [label, who] of Object.entries(principals)) {
+        if (label === 'realAdmin') continue;
+        const repos = await get('repos', who);
+        assertRedacted(repos, `${label} repos`);
+        const listed = await get('list-repos', who);
+        assertRedacted(listed, `${label} list-repos`);
+        for (const [name, url] of Object.entries(expected)) {
+            // Stable identity and branch survive; only the display URL changes.
+            assert.equal(repo(repos, name).url, url, `${label} ${name} repos url`);
+            assert.equal(repo(repos, name).repositorySource.url, url, `${label} ${name} repositorySource url`);
+            assert.equal(listed.repositories.find(item => item.name === name).url, url, `${label} ${name} list-repos url`);
+        }
+        assert.equal(repo(repos, 'CredUserinfoSkills').branch, 'main');
+    }
+    // Administrators and verified machine readers keep the configured values.
+    const adminRepos = await get('repos', principals.realAdmin);
+    const adminListed = await get('list-repos', principals.realAdmin);
+    const machineRepos = await rawGet('repos', bearer(sign('repos')));
+    const machineListed = await rawGet('list-repos', bearer(sign('list-repos')));
+    for (const [name, value] of Object.entries(sources)) {
+        assert.equal(repo(adminRepos, name).url, value.url, `admin ${name}`);
+        assert.equal(adminListed.repositories.find(item => item.name === name).url, value.url, `admin list ${name}`);
+        assert.equal(machineRepos.body.marketplace.repositories.find(item => item.name === name).url, value.url, `machine ${name}`);
+        assert.equal(machineListed.body.repositories.find(item => item.name === name).url, value.url, `machine list ${name}`);
+    }
+    // Presentation never rewrites the stored configuration.
+    assert.equal(fs.readFileSync(sourcesFile, 'utf8'), bytes);
 });

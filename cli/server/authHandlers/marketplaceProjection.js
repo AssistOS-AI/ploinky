@@ -3,13 +3,47 @@
 // principal receives the same records without them. Projections never mutate
 // their input, so a payload object can never carry one caller's view to another.
 
-// A URL that names a remote Git origin. Anything else (absolute or relative
-// paths, file: URLs, home-relative paths) is a local location.
-const REMOTE_GIT_URL = /^(?:(?:https?|ssh|git):\/\/[^\s/]|[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:(?!\/\/)[^\s])/i;
+// Display value for a repository URL shown to a caller without administrator
+// access. The result is rebuilt from validated parts and is never the raw input:
+// only a remote Git origin (scheme, host, optional port and a plain path) is
+// emitted. Userinfo of any kind (passwords, tokens used as usernames,
+// percent-encoded forms, ordinary "git@" users), query strings and fragments are
+// always dropped. Local locations (absolute or relative paths, file: URLs,
+// home-relative paths) and every malformed or ambiguous form yield ''.
+const REMOTE_URL_PROTOCOLS = new Set(['https:', 'http:', 'ssh:', 'git:']);
+const SAFE_HOSTNAME = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*$/;
+const DOTTED_HOSTNAME = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/;
+// A plain repository path: no percent-encoding, userinfo-like or query characters.
+const SAFE_PATH = /^[A-Za-z0-9._~/+-]*$/;
+const SCP_LIKE = /^[^@\s/:\\]+@([^@\s/:\\]+):(.+)$/;
+
+function safePath(value) {
+    return SAFE_PATH.test(value) && !value.split('/').some(segment => segment === '..');
+}
 
 export function remoteUrlOrEmpty(value) {
-    const text = typeof value === 'string' ? value.trim() : '';
-    return REMOTE_GIT_URL.test(text) ? text : '';
+    if (typeof value !== 'string') return '';
+    const text = value.trim();
+    // eslint-disable-next-line no-control-regex
+    if (!text || /[\s\u0000-\u001f\u007f\\]/.test(text)) return '';
+    if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(text)) {
+        let parsed;
+        try {
+            parsed = new URL(text);
+        } catch {
+            return '';
+        }
+        if (!REMOTE_URL_PROTOCOLS.has(parsed.protocol) || !SAFE_HOSTNAME.test(parsed.hostname)) return '';
+        const pathname = parsed.pathname || '/';
+        if (!safePath(pathname)) return '';
+        return `${parsed.protocol}//${parsed.hostname}${parsed.port ? `:${parsed.port}` : ''}${pathname}`;
+    }
+    const scp = text.match(SCP_LIKE);
+    if (!scp) return '';
+    const host = scp[1].toLowerCase();
+    const repoPath = scp[2];
+    if (!DOTTED_HOSTNAME.test(host) || repoPath.startsWith('//') || !/[^/]/.test(repoPath) || !safePath(repoPath)) return '';
+    return `${host}:${repoPath}`;
 }
 
 export function projectSkillSource(skillSource) {
