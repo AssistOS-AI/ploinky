@@ -858,15 +858,7 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext, 
         appendLog('auth_missing_cookie', { path: parsedUrl.pathname });
         return respondUnauthenticated(req, res, parsedUrl, authContext, options);
     }
-    let session = await authService.validateSession(sessionId);
-    if (authContext.mode === 'sso' && (!session || (session.expiresAt && Date.now() > session.expiresAt))) {
-        try {
-            await authService.refreshSession(sessionId);
-        } catch (err) {
-            appendLog('auth_refresh_failed', { error: err?.message || String(err) });
-        }
-        session = authService.getSession(sessionId);
-    }
+    const session = await authService.validateSession(sessionId);
     if (!session) {
         appendLog('auth_session_invalid', { sessionId: '[redacted]', mode: authContext.mode });
         return respondUnauthenticated(req, res, parsedUrl, authContext, options);

@@ -116,12 +116,8 @@ async function resolveProviderConfig(mod) {
 
 export function createGenericAuthBridge(options = {}) {
     const sessionStore = createSessionStore(options.sessionOptions);
-    const remoteValidationIntervalMs = Number.isFinite(options.ssoValidationIntervalMs)
-        ? Math.max(0, Number(options.ssoValidationIntervalMs))
-        : 30_000;
     const clock = typeof options.now === 'function' ? options.now : () => Date.now();
-    const remotelyValidatedAt = new Map();
-    const validationInFlight = new Map();
+    const validationLanes = new Map();
     let validationEpoch = 0;
     // Pending browser-auth state stays in core, keyed by the random `state`
     // the browser will present on the callback. Per the plan, core holds:
@@ -302,89 +298,118 @@ export function createGenericAuthBridge(options = {}) {
     }
 
     async function refreshSession(sessionId) {
-        const session = sessionStore.getSession(sessionId);
-        if (!session) throw new Error('Session not found');
-        const { provider } = await ensureProvider();
-        const { user, providerSession } = await provider.sso_refresh_session({
-            providerSession: session.providerSession || { tokens: session.tokens }
-        });
-        const now = Date.now();
-        const expiresAt = providerSession?.expiresAt || (now + sessionStore.sessionTtlMs);
-        const refreshExpiresAt = providerSession?.refreshExpiresAt || session.refreshExpiresAt || null;
-        sessionStore.updateSession(sessionId, {
-            tokens: providerSession?.tokens || session.tokens,
-            providerSession,
-            user: user || session.user,
-            expiresAt,
-            refreshExpiresAt
-        });
-        remotelyValidatedAt.set(sessionId, clock());
+        const epoch = validationEpoch;
+        const original = sessionStore.getSession(sessionId);
+        const session = await validateSession(sessionId);
+        if (!session || epoch !== validationEpoch || sessionStore.getSession(sessionId) !== original) {
+            throw new Error('Session validation failed');
+        }
         const typeKey = 'token' + 'Type';
         return {
-            accessToken: providerSession?.tokens?.accessToken || session.tokens?.accessToken || null,
-            expiresAt,
-            scope: providerSession?.tokens?.scope || session.tokens?.scope || null,
-            [typeKey]: providerSession?.tokens?.[typeKey] || session.tokens?.[typeKey] || null,
-            user
+            accessToken: session.tokens?.accessToken || null,
+            expiresAt: session.expiresAt,
+            scope: session.tokens?.scope || null,
+            [typeKey]: session.tokens?.[typeKey] || null,
+            user: session.user,
         };
     }
 
     async function performRemoteValidation(sessionId, session, epoch) {
+        const current = () => epoch === validationEpoch && sessionStore.getSession(sessionId) === session;
         try {
-            const { provider } = await ensureProvider();
+            const context = await ensureProvider();
+            if (!current()) return null;
+            const { provider } = context;
+            const fingerprint = fingerprintFor(context.config, context.providerAgent);
+            const userId = session.user?.id;
             const operation = typeof provider.sso_refresh_session === 'function'
                 ? provider.sso_refresh_session.bind(provider)
                 : provider.sso_validate_session?.bind(provider);
             if (!operation) throw new Error('provider has no response-free session validation operation');
             const outcome = await operation({
-                providerSession: session.providerSession || { tokens: session.tokens },
+                providerSession: structuredClone(session.providerSession || { tokens: session.tokens }),
             });
-            if (epoch !== validationEpoch || !sessionStore.getSession(sessionId)) return null;
-            if (!outcome || !outcome.user) {
-                sessionStore.deleteSession(sessionId);
-                emitAuthenticationSessionInvalidated({ mode: 'sso', sessionId, reason: 'invalid' });
-                return null;
+            if (!current()) return null;
+            const latest = await ensureProvider();
+            if (!current() || latest.provider !== provider
+                || fingerprintFor(latest.config, latest.providerAgent) !== fingerprint) return null;
+            if (typeof userId !== 'string' || !userId || outcome?.user?.id !== userId
+                || !outcome.providerSession || typeof outcome.providerSession !== 'object'
+                || Array.isArray(outcome.providerSession)) {
+                throw new Error('invalid provider session outcome');
             }
-            const providerSession = outcome.providerSession || session.providerSession;
+            const { user, providerSession } = structuredClone(outcome);
+            const tokens = providerSession.tokens || {};
+            if (typeof tokens !== 'object' || Array.isArray(tokens)) throw new Error('invalid provider tokens');
             const updated = sessionStore.updateSession(sessionId, {
-                user: outcome.user,
+                user,
                 providerSession,
-                tokens: providerSession?.tokens || session.tokens,
+                tokens,
                 expiresAt: providerSession?.expiresAt || session.expiresAt,
                 refreshExpiresAt: providerSession?.refreshExpiresAt ?? session.refreshExpiresAt,
             });
             if (!updated) return null;
-            remotelyValidatedAt.set(sessionId, clock());
-            return updated;
+            // The general store merges tokens; an admission replaces the entire
+            // provider projection so removed metadata cannot survive refresh.
+            updated.tokens = tokens;
+            return structuredClone(updated);
         } catch (_) {
-            if (epoch !== validationEpoch || !sessionStore.getSession(sessionId)) return null;
+            if (!current()) return null;
             sessionStore.deleteSession(sessionId);
-            remotelyValidatedAt.delete(sessionId);
+            cancelValidation(sessionId);
             emitAuthenticationSessionInvalidated({ mode: 'sso', sessionId, reason: 'validation_failed' });
             return null;
         }
     }
 
-    async function validateSession(sessionId, { forceRemote = false } = {}) {
+    function cancelValidation(sessionId) {
+        const lane = validationLanes.get(sessionId);
+        if (!lane) return;
+        for (const caller of [...lane.active, ...lane.queued]) caller.resolve(null);
+        lane.queued = [];
+    }
+
+    async function drainValidationLane(sessionId, lane) {
+        try {
+            while (lane.queued.length) {
+                // Close the cohort before dispatch. Later admissions wait for a
+                // new provider operation, serialized to preserve token rotation.
+                const cohort = lane.queued.splice(0);
+                lane.active = cohort;
+                const { session, epoch } = cohort[0];
+                const result = epoch === validationEpoch && sessionStore.getSession(sessionId) === session
+                    ? await performRemoteValidation(sessionId, session, epoch)
+                    : null;
+                for (const caller of cohort) caller.resolve(result);
+                lane.active = [];
+            }
+        } finally {
+            for (const caller of [...lane.active, ...lane.queued]) caller.resolve(null);
+            if (validationLanes.get(sessionId) === lane) validationLanes.delete(sessionId);
+        }
+    }
+
+    async function validateSession(sessionId) {
         const session = sessionStore.getSession(sessionId);
         if (!session) return null;
-        const lastValidatedAt = remotelyValidatedAt.get(sessionId) || 0;
-        if (!forceRemote && lastValidatedAt
-            && clock() - lastValidatedAt < remoteValidationIntervalMs) return session;
-        const existing = validationInFlight.get(sessionId);
-        if (existing) return existing;
         const epoch = validationEpoch;
-        const pending = performRemoteValidation(sessionId, session, epoch);
-        validationInFlight.set(sessionId, pending);
-        try {
-            return await pending;
-        } finally {
-            if (validationInFlight.get(sessionId) === pending) validationInFlight.delete(sessionId);
+        let lane = validationLanes.get(sessionId);
+        if (!lane) {
+            lane = { queued: [], active: [] };
+            validationLanes.set(sessionId, lane);
+            queueMicrotask(() => { void drainValidationLane(sessionId, lane); });
         }
+        const result = await new Promise(resolve => lane.queued.push({ session, epoch, resolve }));
+        return epoch === validationEpoch && sessionStore.getSession(sessionId) === session ? result : null;
     }
 
     async function logout(sessionId, { baseUrl, postLogoutRedirectUri } = {}) {
         const session = sessionStore.getSession(sessionId);
+        if (session) {
+            sessionStore.deleteSession(sessionId);
+            cancelValidation(sessionId);
+            emitAuthenticationSessionInvalidated({ mode: 'sso', sessionId, reason: 'logout' });
+        }
         let redirect;
         try {
             const { provider, config } = await ensureProvider();
@@ -399,19 +424,12 @@ export function createGenericAuthBridge(options = {}) {
         } catch (err) {
             redirect = postLogoutRedirectUri;
         }
-        if (session) {
-            sessionStore.deleteSession(sessionId);
-            remotelyValidatedAt.delete(sessionId);
-            validationInFlight.delete(sessionId);
-            emitAuthenticationSessionInvalidated({ mode: 'sso', sessionId, reason: 'logout' });
-        }
         return { redirect };
     }
 
     function revokeSession(sessionId) {
         sessionStore.deleteSession(sessionId);
-        remotelyValidatedAt.delete(sessionId);
-        validationInFlight.delete(sessionId);
+        cancelValidation(sessionId);
         emitAuthenticationSessionInvalidated({ mode: 'sso', sessionId, reason: 'revoked' });
     }
 
@@ -429,8 +447,7 @@ export function createGenericAuthBridge(options = {}) {
         configFingerprint = null;
         validationEpoch += 1;
         pendingAuth.clear();
-        remotelyValidatedAt.clear();
-        validationInFlight.clear();
+        for (const sessionId of validationLanes.keys()) cancelValidation(sessionId);
     }
 
     async function authenticateAgent(clientId, clientSecret) {
