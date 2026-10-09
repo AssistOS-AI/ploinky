@@ -25,7 +25,9 @@ export const agentReadTools = [
     { agent: 'workspaceMonitorAgent', tool: 'workspace_monitor_snapshot_get', policy: 'admin' },
     { agent: 'dpuAgent', tool: 'dpu_whoami', policy: 'workspace' },
     { agent: 'dpuAgent', tool: 'dpu_workspace_roots', policy: 'workspace' },
-    { agent: 'webmeetAgent', tool: 'webmeet_room_list', policy: 'workspace' },
+    // Lesser authenticated users receive an exactly empty room list, not an error.
+    { agent: 'webmeetAgent', tool: 'webmeet_room_list', policy: 'workspace', lesserUserFilteredField: 'rooms' },
+    { agent: 'webmeetAgent', tool: 'webmeet_room_events_list', args: { roomId: 'rooms' }, policy: 'workspace' },
     { agent: 'gitAgent', tool: 'git_auth_status', policy: 'workspace' },
 ];
 export const agentDiscoveryMethods = [
@@ -160,6 +162,10 @@ export function assertAgentReadPositive(probe, result, principal) {
             assert.equal(typeof value.canManageRooms, 'boolean');
             if (principal) assert.equal(value.canManageRooms, principal.roles.includes('admin'), 'Room management must follow persisted role');
             break;
+        case 'webmeet_room_events_list':
+            assert.ok(Array.isArray(value.events), 'Workspace room feed requires an events array');
+            for (const event of value.events) assert.ok(typeof event === 'string' && event.length, 'Feed entries must be encoded events');
+            break;
         case 'git_auth_status':
             assert.equal(value.ok, true);
             requireFields(value, ['configured', 'connected', 'tokenStored'], 'boolean');
@@ -170,6 +176,19 @@ export function assertAgentReadPositive(probe, result, principal) {
             break;
         default: assert.fail('No source-derived read-tool response validator exists');
     }
+}
+
+// A filtered listing claim is meaningful only when the administrator control
+// on the same deployment listed at least one entry.
+export function hasNonEmptyListingControl(probe, positive) {
+    const entries = positive?.value?.[probe.lesserUserFilteredField];
+    return Array.isArray(entries) && entries.length > 0;
+}
+
+export function assertAgentFilteredEmpty(probe, result, principal) {
+    assertAgentReadPositive(probe, result, principal);
+    assert.deepEqual(result.value[probe.lesserUserFilteredField], [], 'Lesser user must receive an exactly empty filtered listing');
+    if (probe.tool === 'webmeet_room_list') assert.equal(result.value.canManageRooms, false, 'Lesser user must not receive room management');
 }
 
 export function decodeAgentMcp(response) {
@@ -310,7 +329,7 @@ export async function discoverAgentMcp(ctx, mcp, catalog = agentCatalog) {
     }
 }
 
-async function readTools(ctx, mcp) {
+export async function readTools(ctx, mcp) {
     ctx.report.agentReadResults ||= [];
     for (const probe of agentReadTools) {
         let positive;
@@ -323,13 +342,21 @@ async function readTools(ctx, mcp) {
         }
         await ctx.check(`agent.tool.${probe.tool}.admin`, async () => assertAgentReadPositive(probe, positive, ctx.principals.admin));
         if (probe.tool === 'workspace_monitor_snapshot_get' && !positive.value.available) ctx.recordGap('agent.tool.workspace_monitor_snapshot_get.data', 'Snapshot status works but no actual snapshot data is available; data-disclosure coverage remains incomplete.');
-        for (const actor of ['anonymous', 'selfRegistered', 'userA', 'userB']) await ctx.check(`agent.tool.${probe.tool}.${actor}`, async () => {
-            const result = await mcp.rpc(actor, probe.agent, 'tools/call', { name: probe.tool, arguments: probe.args || {} });
-            ctx.report.agentReadResults.push({ agent: probe.agent, tool: probe.tool, actor, stage: result.stage, status: result.response.status });
-            const denied = actor === 'anonymous' || probe.policy === 'admin' || (actor === 'selfRegistered' && probe.policy === 'workspace');
-            if (denied) assertAgentMcpDenied(result);
-            else assertAgentReadPositive(probe, result, ctx.principals[actor]);
-        });
+        for (const actor of ['anonymous', 'selfRegistered', 'userA', 'userB']) {
+            const filtered = actor === 'selfRegistered' && Boolean(probe.lesserUserFilteredField);
+            if (filtered && !hasNonEmptyListingControl(probe, positive)) {
+                ctx.recordGap(`agent.tool.${probe.tool}.selfRegistered`, 'Administrator control listed no entries; an exactly empty filtered result cannot be distinguished from an empty store. No filtered-listing claim is made.');
+                continue;
+            }
+            await ctx.check(`agent.tool.${probe.tool}.${actor}`, async () => {
+                const result = await mcp.rpc(actor, probe.agent, 'tools/call', { name: probe.tool, arguments: probe.args || {} });
+                ctx.report.agentReadResults.push({ agent: probe.agent, tool: probe.tool, actor, stage: result.stage, status: result.response.status });
+                const denied = !filtered && (actor === 'anonymous' || probe.policy === 'admin' || (actor === 'selfRegistered' && probe.policy === 'workspace'));
+                if (denied) assertAgentMcpDenied(result);
+                else if (filtered) assertAgentFilteredEmpty(probe, result, ctx.principals[actor]);
+                else assertAgentReadPositive(probe, result, ctx.principals[actor]);
+            });
+        }
     }
 }
 

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { agentCatalog, agentInventory } from './agent-inventory.mjs';
 import { assertAgentMcpDenied, decodeAgentMcp, agentReadTools, agentProbes, reconcileAgentRegistry, createAgentSessions,
-    assertAgentHttpPositive, assertAgentReadPositive, discoverAgentMcp, agentDiscoveryMethods } from './agent-probes.mjs';
+    assertAgentHttpPositive, assertAgentReadPositive, discoverAgentMcp, agentDiscoveryMethods, readTools } from './agent-probes.mjs';
 
 const response = (status, json) => ({ status, json, headers: {}, text: JSON.stringify(json) });
 test('MCP decoder rejects redirects, missing endpoints, malformed success and structured tool failures', () => {
@@ -120,6 +120,7 @@ test('every read tool has a meaningful success schema and account/role identity 
         dpu_whoami: { ok: true, authenticated: true, actor: { id: principal.id, principalId: `user:${principal.id}`, roles: ['admin'] }, userSpace: { privateId: 'private', mySpaceRootId: 'root' } },
         dpu_workspace_roots: { ok: true, roots: { confidential: { path: '/Confidential' }, mySpace: { id: 'root', path: '/Confidential/My Space' }, ...Object.fromEntries(['sharedFiles', 'secrets', 'researchData', 'jobs'].map((name) => [name, { scope: name, path: '/Confidential/example', type: 'virtual-list' }])) } },
         webmeet_room_list: { rooms: [], canManageRooms: true },
+        webmeet_room_events_list: { events: ['encoded-room-event'] },
         git_auth_status: { ok: true, configured: false, connected: false, tokenStored: false, setup: { configured: false, scope: 'repo' }, connection: null, pending: null },
     };
     for (const probe of agentReadTools) {
@@ -184,4 +185,50 @@ test('registry reconciliation rejects absent or incorrect runtime principals ins
     assert.throws(() => reconcileAgentRegistry({ routes: {} }));
     assert.throws(() => reconcileAgentRegistry({ routes: { ...routes, alien: { agent: 'unrelated-workspace-agent' } } }));
     assert.deepEqual(reconcileAgentRegistry({ routes: { ...routes, alias: { agent: 'explorer' } } }).alternateKeys, [{ key: 'alias', agent: 'explorer' }]);
+});
+
+async function runRoomListReadTools({ adminRooms, selfRegistered }) {
+    const gaps = [], failures = [], passed = [];
+    const principals = { admin: { id: 'a', roles: ['admin'] }, selfRegistered: { id: 's', roles: ['selfRegistered'] }, userA: { id: 'ua', roles: ['user'] }, userB: { id: 'ub', roles: ['user'] } };
+    const ctx = { report: {}, principals, recordGap: (id, reason) => gaps.push({ id, reason }),
+        async check(id, fn) { try { await fn(); passed.push(id); } catch (error) { failures.push({ id, error }); } } };
+    const success = (value) => decodeAgentMcp(response(200, { result: { content: [{ type: 'text', text: JSON.stringify(value) }] } }));
+    const mcp = { async rpc(actor, agent, method, params) {
+        if (params.name !== 'webmeet_room_list') throw new Error('control unavailable in this fixture');
+        if (actor === 'anonymous') return { ...decodeAgentMcp(response(401, { error: 'authentication required' })), stage: method };
+        if (actor === 'admin') return { ...success({ rooms: adminRooms, canManageRooms: true }), stage: method };
+        if (actor === 'selfRegistered') return { ...selfRegistered, stage: method };
+        return { ...success({ rooms: [{ id: 'room_1' }], canManageRooms: false }), stage: method };
+    } };
+    await readTools(ctx, mcp);
+    return { gaps, failures: failures.map((f) => f.id), passed };
+}
+
+test('room list expects an exactly empty filtered result for selfRegistered only against a non-empty administrator control', async () => {
+    const success = (value) => decodeAgentMcp(response(200, { result: { content: [{ type: 'text', text: JSON.stringify(value) }] } }));
+    const id = 'agent.tool.webmeet_room_list.selfRegistered';
+    const filtered = await runRoomListReadTools({ adminRooms: [{ id: 'room_1' }], selfRegistered: success({ rooms: [], canManageRooms: false }) });
+    assert.ok(filtered.passed.includes(id));
+    assert.deepEqual(filtered.failures, []);
+    for (const selfRegistered of [
+        success({ rooms: [{ id: 'room_1' }], canManageRooms: false }),
+        success({ rooms: [], canManageRooms: true }),
+        decodeAgentMcp(response(403, { error: 'forbidden' })),
+        success({ rooms: [], canManageRooms: false, error: 'unavailable' }),
+    ]) {
+        const result = await runRoomListReadTools({ adminRooms: [{ id: 'room_1' }], selfRegistered });
+        assert.deepEqual(result.failures, [id]);
+    }
+    const emptyControl = await runRoomListReadTools({ adminRooms: [], selfRegistered: success({ rooms: [], canManageRooms: false }) });
+    assert.ok(emptyControl.gaps.some((gap) => gap.id === id && /cannot be distinguished from an empty store/.test(gap.reason)));
+    assert.equal(emptyControl.passed.includes(id), false, 'no filtered-listing claim without a non-empty control');
+    for (const actor of ['anonymous', 'userA', 'userB']) assert.ok(emptyControl.passed.includes(`agent.tool.webmeet_room_list.${actor}`));
+});
+
+test('the workspace room feed keeps selfRegistered denied and is a declared non-mutating read', () => {
+    const probe = agentReadTools.find((entry) => entry.tool === 'webmeet_room_events_list');
+    assert.deepEqual(probe, { agent: 'webmeetAgent', tool: 'webmeet_room_events_list', args: { roomId: 'rooms' }, policy: 'workspace' });
+    const row = agentInventory.find((entry) => entry.tool === 'webmeet_room_events_list');
+    assert.equal(row.expected.selfRegistered, 'deny');
+    assert.equal(agentInventory.find((entry) => entry.tool === 'webmeet_room_list').expected.selfRegistered, 'allow-filtered-empty');
 });
