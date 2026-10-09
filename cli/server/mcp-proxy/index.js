@@ -170,10 +170,11 @@ function createUpstreamMcpCaller({ baseUrl, hostPort, beforeDial, beforeDispatch
                     method,
                     params,
                     headers,
-                    beforeDial: () => {
-                        beforeDispatch?.();
-                        return beforeDial ? beforeDial() : true;
-                    },
+                    // beforeDial guards the shared session open and every
+                    // POST; the browser owner guard is per request only, so a
+                    // deleted owner never fails another caller's shared open.
+                    beforeDial: () => (beforeDial ? beforeDial() : true),
+                    beforeDispatch,
                     timeoutMs: upstreamTimeoutForMethod(method),
                     ensureReady,
                 });

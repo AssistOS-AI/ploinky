@@ -10,6 +10,13 @@
 // Fail-closed rules:
 // - `beforeDial()` runs synchronously immediately before every POST; anything
 //   other than `true` raises EDGE_GENERATION_CHANGED and nothing is sent.
+// - An optional per-request `beforeDispatch()` runs synchronously after the
+//   request's own generation check and before its mint and POST. It never runs
+//   while a shared session is opened; what it throws is the caller's error,
+//   which neither evicts nor retries the session.
+// - A session is served only after a successful notifications/initialized.
+//   Any failure of the open, including an error thrown by the caller's
+//   `beforeDial()`, evicts the entry and DELETEs a session id it allocated.
 // - At most one retry, and only for failures that happened before the agent
 //   dispatched the request (HTTP 400 "Missing session", HTTP 404, or
 //   ECONNREFUSED before any response byte). Before retrying, the entry is
@@ -226,6 +233,7 @@ export function createUpstreamSessionPool({
             slot: slotForKey(key),
             hostPort,
             sessionId: '',
+            acknowledged: false,
             protocolVersion: DEFAULT_PROTOCOL_VERSION,
             nextId: 1,
             inflight: 0,
@@ -290,6 +298,7 @@ export function createUpstreamSessionPool({
         entry.cleanupStarted = true;
         const sessionId = entry.sessionId;
         entry.sessionId = '';
+        entry.acknowledged = false;
         const done = () => {
             try { entry.agent.destroy(); } catch (_) { }
             pendingCloses.delete(entry.retirement);
@@ -546,6 +555,7 @@ export function createUpstreamSessionPool({
                 status: ack.statusCode,
             });
         }
+        entry.acknowledged = true;
         counters.sessionsOpened += 1;
     }
 
@@ -576,6 +586,12 @@ export function createUpstreamSessionPool({
                 evict(entry);
                 entry = null;
             }
+            // Never reopen over an allocated but unacknowledged session: that
+            // would overwrite (and leak) its id. Retire it and start afresh.
+            if (entry && !entry.opening && entry.sessionId && !entry.acknowledged) {
+                evict(entry);
+                entry = null;
+            }
             if (!entry) {
                 entry = createEntry(key, hostPort);
                 entries.set(key, entry);
@@ -587,12 +603,17 @@ export function createUpstreamSessionPool({
                 entries.delete(key);
                 entries.set(key, entry);
             }
-            if (!entry.sessionId || entry.opening) {
+            if (!entry.acknowledged || entry.opening) {
                 if (!entry.opening) {
                     const target = entry;
                     target.opening = openSession(target, beforeDial, timeoutMs)
                         .catch((error) => {
                             handleFailure(target, error);
+                            // A failed open is never served, whatever raised
+                            // it (a caller beforeDial error included): retire
+                            // the entry so finishClose DELETEs any session id
+                            // it already allocated.
+                            evict(target);
                             throw error;
                         })
                         .finally(() => {
@@ -603,12 +624,12 @@ export function createUpstreamSessionPool({
                 await entry.opening;
             }
             assertOpen();
-            if (!entry.closed && entry.sessionId) return entry;
+            if (!entry.closed && entry.sessionId && entry.acknowledged) return entry;
         }
         throw poolError(UPSTREAM_SESSION_LOST, 'upstream MCP session could not be established', { retryable: false });
     }
 
-    async function attempt({ key, hostPort, method, params, headers, beforeDial, timeoutMs }) {
+    async function attempt({ key, hostPort, method, params, headers, beforeDial, beforeDispatch, refusal, timeoutMs }) {
         const deadline = Date.now() + timeoutMs;
         const entry = await acquire(key, hostPort, beforeDial, Math.min(timeoutMs, DEFAULT_REQUEST_TIMEOUT_MS));
         assertOpen();
@@ -623,13 +644,22 @@ export function createUpstreamSessionPool({
             // event-loop stall), can use up the deadline: fail before the
             // generation check, the mint and the POST.
             if (Date.now() >= deadline) throw deadlineExpired();
-            if (entry.closed || !entry.sessionId) {
+            if (entry.closed || !entry.sessionId || !entry.acknowledged) {
                 throw poolError(UPSTREAM_SESSION_LOST, 'upstream MCP session closed before dispatch', { retryable: true });
             }
             // From here to http.request everything is synchronous: generation
-            // check, per-attempt mint, timer start and socket binding.
+            // check, caller dispatch guard, per-attempt mint, timer start and
+            // socket binding.
             if (beforeDial() !== true) throw generationChanged();
             assertOpen();
+            if (beforeDispatch) {
+                try {
+                    beforeDispatch();
+                } catch (error) {
+                    refusal.byCaller = true;
+                    throw error;
+                }
+            }
             const supplied = typeof headers === 'function' ? headers() : headers;
             const authorization = typeof supplied?.authorization === 'string' ? supplied.authorization : '';
             const id = entry.nextId++;
@@ -644,6 +674,9 @@ export function createUpstreamSessionPool({
             if (!entry.closed) readyUntil.set(key, now() + readyTtlMs);
             return message;
         } catch (error) {
+            // The caller's dispatch guard refused this request only; the
+            // session stays healthy whatever the error looks like.
+            if (refusal.byCaller) throw error;
             handleFailure(entry, error);
             throw error;
         } finally {
@@ -655,8 +688,11 @@ export function createUpstreamSessionPool({
     /**
      * Send one JSON-RPC request on the pooled session for `key`.
      * `headers` is an object or a function called once per attempt; only its
-     * `authorization` value is forwarded. `ensureReady` is awaited before the
-     * single permitted retry and must resolve `true`.
+     * `authorization` value is forwarded. `beforeDispatch`, when given, runs
+     * synchronously in each attempt after `beforeDial()` and before the mint
+     * and POST (never during a session open); a throw refuses this request
+     * only. `ensureReady` is awaited before the single permitted retry and must
+     * resolve `true`.
      * Resolves `{ result }` or `{ error }` (the upstream JSON-RPC answer).
      */
     async function request({
@@ -666,12 +702,16 @@ export function createUpstreamSessionPool({
         params = {},
         headers = null,
         beforeDial,
+        beforeDispatch = null,
         timeoutMs,
         ensureReady = null,
     } = {}) {
         assertOpen();
         if (typeof key !== 'string' || !key) throw new TypeError('upstream pool request requires a key');
         if (typeof beforeDial !== 'function') throw new TypeError('upstream pool request requires beforeDial');
+        if (beforeDispatch !== null && beforeDispatch !== undefined && typeof beforeDispatch !== 'function') {
+            throw new TypeError('upstream pool request beforeDispatch must be a function');
+        }
         const port = Number(hostPort);
         if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
             throw new TypeError('upstream pool request requires a valid hostPort');
@@ -680,6 +720,7 @@ export function createUpstreamSessionPool({
         claimSlot(key);
         for (let attemptIndex = 0; ; attemptIndex += 1) {
             assertOpen();
+            const refusal = { byCaller: false };
             try {
                 return await attempt({
                     key,
@@ -688,9 +729,12 @@ export function createUpstreamSessionPool({
                     params,
                     headers,
                     beforeDial,
+                    beforeDispatch: beforeDispatch || null,
+                    refusal,
                     timeoutMs: effectiveTimeoutMs,
                 });
             } catch (error) {
+                if (refusal.byCaller) throw error;
                 assertOpen();
                 if (!error?.retryable || attemptIndex >= 1) throw error;
                 counters.retries += 1;
@@ -717,7 +761,8 @@ export function createUpstreamSessionPool({
         if (typeof key !== 'string' || !key) return false;
         const until = readyUntil.get(key);
         const entry = entries.get(key);
-        return Boolean(until !== undefined && now() < until && entry && !entry.closed && entry.sessionId);
+        return Boolean(until !== undefined && now() < until && entry && !entry.closed && entry.sessionId
+            && entry.acknowledged);
     }
 
     function usesFallback(key) {

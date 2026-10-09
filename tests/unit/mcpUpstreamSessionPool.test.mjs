@@ -809,9 +809,9 @@ function proxyRoute(port, lease, manifest) {
     return { route, routePlan, key: poolKeyForRoutePlan(routePlan) };
 }
 
-function openRouterSession(proxy) {
+function openRouterSession(proxy, { user = PROXY_USER, login = 'pool-browser-login' } = {}) {
     const sessionId = crypto.randomUUID();
-    const owner = createMcpSessionOwner({ user: PROXY_USER, authMode: 'sso', sessionId: 'pool-browser-login' }, 'agent', 'echoAgent');
+    const owner = createMcpSessionOwner({ user, authMode: 'sso', sessionId: login }, 'agent', 'echoAgent');
     proxy.agentSessionStore.set(sessionId, { agentName: 'echoAgent', baseUrl: 'http://127.0.0.1/mcp', owner });
     return sessionId;
 }
@@ -828,14 +828,15 @@ function toolsCall(label) {
     return { jsonrpc: '2.0', id: proxyRpcId, method: 'tools/call', params: { name: 'actor', arguments: { label } } };
 }
 
-async function proxyCall(proxy, { route, routePlan, sessionId, body, pool, waitForAgentReady, beforeDial = () => true, agent = null }) {
+async function proxyCall(proxy, { route, routePlan, sessionId, body, pool, waitForAgentReady, beforeDial = () => true, agent = null,
+    user = PROXY_USER, login = 'pool-browser-login' }) {
     const req = Readable.from([Buffer.from(typeof body === 'string' ? body : JSON.stringify(body), 'utf8')]);
     req.method = 'POST';
     req.url = '/echoAgent/mcp';
     req.headers = { host: 'localhost', 'content-type': 'application/json', 'mcp-session-id': sessionId };
-    req.user = PROXY_USER;
+    req.user = user;
     req.authMode = 'sso';
-    req.sessionId = 'pool-browser-login';
+    req.sessionId = login;
     if (agent) req.agent = agent;
     let finish;
     const done = new Promise((resolve) => { finish = resolve; });
@@ -947,6 +948,200 @@ test('browser session deletion while a pool slot is pending prevents mint and di
     assert.equal(refused.json.error.message, 'Missing or invalid MCP session');
     assert.equal(mints, 0);
     assert.equal(count(upstream.log, row => row.rpc === 'tools/call'), 9, 'only the owned control and eight admitted calls dispatched');
+});
+
+const PROXY_USER_B = { id: 'bob', username: 'bob', roles: ['user'] };
+
+// Fake upstream whose first initialize is held until release(); every
+// tools/call label and every DELETE session id is recorded.
+async function startHeldInitializeUpstream(t) {
+    let entered;
+    const initializeEntered = new Promise(resolve => { entered = resolve; });
+    let release;
+    const released = new Promise(resolve => { release = resolve; });
+    t.after(() => release());
+    const toolLabels = [];
+    let initializes = 0;
+    const upstream = await startFakeUpstream(t, { onRpc: async ({ message }) => {
+        if (message?.method === 'tools/call') toolLabels.push(message.params?.arguments?.label);
+        if (message?.method === 'initialize' && ++initializes === 1) {
+            entered();
+            await released;
+        }
+        return false;
+    } });
+    const deletes = () => upstream.log.filter(row => row.httpMethod === 'DELETE').map(row => row.sessionId);
+    const posts = () => upstream.log.filter(row => row.httpMethod === 'POST').map(row => row.rpc);
+    return { upstream, initializeEntered, release: () => release(), toolLabels, deletes, posts };
+}
+
+async function warmEchoAgentToolSchemas(t, proxy) {
+    // A tools/call canonicalizes its arguments through a cached tools/list; warm
+    // that cache on a separate upstream and pool so the cold key under test
+    // sees only its own session open and the admitted call.
+    const warm = await startFakeUpstream(t);
+    const warmPool = newPool(t);
+    const { route, routePlan } = proxyRoute(warm.port, `schema-warm-${crypto.randomUUID()}`);
+    const sessionId = openRouterSession(proxy);
+    const warmed = await proxyCall(proxy, { route, routePlan, sessionId, pool: warmPool,
+        waitForAgentReady: async () => true, body: toolsCall('warm') });
+    assert.equal(warmed.json.result.content[0].text, 'fake-ok');
+    proxy.agentSessionStore.delete(sessionId);
+}
+
+test('cold pooled key: a deleted owner during the shared open fails alone and the other owner dispatches', { timeout: 10000 }, async (t) => {
+    const { proxy } = await loadProxyFixture();
+    await warmEchoAgentToolSchemas(t, proxy);
+    const held = await startHeldInitializeUpstream(t);
+    const pool = newPool(t);
+    const { route, routePlan } = proxyRoute(held.upstream.port, 'cold-key-two-owner');
+    const sessionA = openRouterSession(proxy);
+    const sessionB = openRouterSession(proxy, { user: PROXY_USER_B, login: 'pool-browser-login-b' });
+    const mints = new Map();
+    const request = pool.request.bind(pool);
+    let requests = 0;
+    let bothWaiting;
+    const waiting = new Promise(resolve => { bothWaiting = resolve; });
+    pool.request = (options) => {
+        const label = options.params?.arguments?.label;
+        const headers = options.headers;
+        const result = request({ ...options, headers: () => {
+            mints.set(label, (mints.get(label) || 0) + 1);
+            return typeof headers === 'function' ? headers() : headers;
+        } });
+        if (++requests === 2) bothWaiting();
+        return result;
+    };
+    const ready = async () => true;
+    const pendingA = proxyCall(proxy, { route, routePlan, sessionId: sessionA, pool, waitForAgentReady: ready,
+        body: toolsCall('owner-a') });
+    await held.initializeEntered;
+    const pendingB = proxyCall(proxy, { route, routePlan, sessionId: sessionB, pool, waitForAgentReady: ready,
+        body: toolsCall('owner-b'), user: PROXY_USER_B, login: 'pool-browser-login-b' });
+    await waiting;
+    const handle = (req, res) => proxy.handleAgentMcpRequest(req, res, route, 'echoAgent', { routePlan });
+    assert.equal((await browserStoreRequest(handle, sessionA, null, 'DELETE')).status, 204);
+    held.release();
+    const [refused, admitted] = await Promise.all([pendingA, pendingB]);
+    assert.equal(admitted.json.error, undefined, JSON.stringify(admitted.json));
+    assert.equal(admitted.json.result.content[0].text, 'fake-ok');
+    assert.equal(refused.json.error.message, 'Missing or invalid MCP session');
+    assert.equal(mints.get('owner-a') || 0, 0, 'the deleted owner minted nothing');
+    assert.equal(mints.get('owner-b'), 1);
+    assert.deepEqual(held.posts(), ['initialize', 'notifications/initialized', 'tools/call']);
+    assert.deepEqual(held.toolLabels, ['owner-b']);
+    assert.deepEqual(held.deletes(), [], 'the shared upstream session stays open');
+    assert.equal(pool.snapshot().counters.sessionsOpened, 1);
+    proxy.agentSessionStore.delete(sessionB);
+});
+
+test('pool: a caller beforeDial error after initialize evicts and DELETEs the allocated session', { timeout: 10000 }, async (t) => {
+    const upstream = await startFakeUpstream(t);
+    const pool = newPool(t);
+    const key = keyFor({ port: upstream.port, lease: 'caller-dial-error' });
+    let mints = 0;
+    let dials = 0;
+    const call = (beforeDial) => pool.request({ key, hostPort: upstream.port, method: 'tools/call',
+        params: { name: 'x', arguments: {} }, headers: () => { mints += 1; return { authorization: 'Bearer test-token' }; },
+        beforeDial });
+    await assert.rejects(call(() => {
+        dials += 1;
+        if (dials === 2) throw new Error('caller refused after initialize');
+        return true;
+    }), /caller refused after initialize/);
+    const first = `${upstream.sessionId}-1`;
+    const second = `${upstream.sessionId}-2`;
+    assert.ok(await waitFor(() => upstream.log.some(row => row.httpMethod === 'DELETE' && row.sessionId === first)),
+        'the allocated upstream session is released');
+    assert.equal(pool.snapshot().entries.some(entry => entry.sessionId === first), false);
+    assert.equal(mints, 0);
+    const message = await call(() => true);
+    assert.equal(message.result.content[0].text, 'fake-ok');
+    assert.deepEqual(upstream.log.filter(row => row.httpMethod === 'POST').map(row => [row.rpc, row.sessionId]), [
+        ['initialize', ''],
+        ['initialize', ''],
+        ['notifications/initialized', second],
+        ['tools/call', second],
+    ]);
+    assert.equal(count(upstream.log, row => row.httpMethod === 'DELETE'), 1);
+    assert.equal(pool.snapshot().counters.sessionsOpened, 1);
+});
+
+test('pool: a per-request dispatch guard refusal sends and mints nothing and keeps the session', { timeout: 10000 }, async (t) => {
+    const upstream = await startFakeUpstream(t);
+    const pool = newPool(t);
+    const key = keyFor({ port: upstream.port, lease: 'dispatch-guard' });
+    let mints = 0;
+    let guards = 0;
+    const order = [];
+    const call = (beforeDispatch) => pool.request({ key, hostPort: upstream.port, method: 'tools/call',
+        params: { name: 'x', arguments: {} },
+        headers: () => { mints += 1; order.push('mint'); return { authorization: 'Bearer test-token' }; },
+        beforeDial: () => { order.push('dial'); return true; },
+        beforeDispatch, ensureReady: async () => true });
+    await call(() => { guards += 1; order.push('guard'); });
+    const session = `${upstream.sessionId}-1`;
+    assert.deepEqual(order, ['dial', 'dial', 'dial', 'guard', 'mint'], 'the guard never runs during the open');
+    // Even an error shaped like a retryable pool failure is the caller's own:
+    // no eviction, no retry, no mint, no POST.
+    await assert.rejects(call(() => {
+        guards += 1;
+        throw Object.assign(new Error('owner session ended'), { code: 'UPSTREAM_SESSION_LOST', retryable: true });
+    }), /owner session ended/);
+    assert.equal(mints, 1);
+    assert.equal(guards, 2);
+    assert.equal(count(upstream.log, row => row.rpc === 'tools/call'), 1);
+    assert.equal(count(upstream.log, row => row.httpMethod === 'DELETE'), 0);
+    assert.equal(pool.snapshot().counters.retries, 0);
+    assert.equal(pool.snapshot().counters.evictions, 0);
+    assert.equal(pool.snapshot().entries[0].sessionId, session);
+    assert.equal(pool.isReady(key), true);
+    await call(() => { guards += 1; });
+    assert.equal(count(upstream.log, row => row.rpc === 'initialize'), 1);
+    assert.equal(count(upstream.log, row => row.rpc === 'tools/call' && row.sessionId === session), 2);
+});
+
+test('proxy SDK path: a guard refusal of notifications/initialized releases the allocated session once', { timeout: 10000 }, async (t) => {
+    const { proxy } = await loadProxyFixture();
+    const held = await startHeldInitializeUpstream(t);
+    const { route, routePlan } = proxyRoute(held.upstream.port, 'sdk-guard-release');
+    const sessionId = openRouterSession(proxy);
+    const pending = proxyCall(proxy, { route, routePlan, sessionId, pool: null, waitForAgentReady: async () => true,
+        body: toolsCall('sdk-deleted') });
+    await held.initializeEntered;
+    const handle = (req, res) => proxy.handleAgentMcpRequest(req, res, route, 'echoAgent', { routePlan });
+    assert.equal((await browserStoreRequest(handle, sessionId, null, 'DELETE')).status, 204);
+    held.release();
+    const refused = await pending;
+    assert.equal(refused.json.error.message, 'Missing or invalid MCP session');
+    const allocated = `${held.upstream.sessionId}-1`;
+    assert.ok(await waitFor(() => held.deletes().length > 0), 'the allocated upstream session is released');
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.deepEqual(held.deletes(), [allocated]);
+    assert.deepEqual(held.posts(), ['initialize']);
+});
+
+test('aggregate: a guard refusal of notifications/initialized releases the allocated session once', { timeout: 10000 }, async (t) => {
+    await loadProxyFixture();
+    const { handleRouterMcp } = await import('../../cli/server/routerHandlers.js');
+    const held = await startHeldInitializeUpstream(t);
+    const { routePlan } = proxyRoute(held.upstream.port, 'aggregate-guard-release');
+    routePlan.lease.commit = () => true;
+    const handle = (req, res) => handleRouterMcp(req, res, routePlan);
+    const session = (await browserStoreRequest(handle, null, { jsonrpc: '2.0', id: 1, method: 'initialize' }))
+        .headers['mcp-session-id'];
+    assert.ok(session);
+    const pending = browserStoreRequest(handle, session, toolsCall('aggregate-deleted'));
+    await held.initializeEntered;
+    assert.equal((await browserStoreRequest(handle, session, null, 'DELETE')).status, 204);
+    held.release();
+    const refused = await pending;
+    assert.equal(refused.json.result, undefined, JSON.stringify(refused.json));
+    const allocated = `${held.upstream.sessionId}-1`;
+    assert.ok(await waitFor(() => held.deletes().length > 0), 'the allocated upstream session is released');
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.deepEqual(held.deletes(), [allocated]);
+    assert.deepEqual(held.posts(), ['initialize']);
 });
 
 test('B5-8: the readiness cache skips the probe while pooled calls succeed and is cleared by ECONNREFUSED', async (t) => {
