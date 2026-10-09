@@ -29,10 +29,6 @@ function allocatedSession(transport) {
   return { sessionId, protocolVersion: typeof protocolVersion === 'string' ? protocolVersion : '' };
 }
 
-function isAbortError(error) {
-  return error?.name === 'AbortError' || error?.cause?.name === 'AbortError';
-}
-
 function createAgentClient(baseUrl, options = {}) {
   let client = null;
   let transport = null;
@@ -149,11 +145,12 @@ function createAgentClient(baseUrl, options = {}) {
       try {
         if (transport?.terminateSession) await transport.terminateSession();
         releasedSessionIds.add(session.sessionId);
-      } catch (error) {
-        // An aborted transport never sent its DELETE; release directly. Any
-        // other failure means the DELETE was already sent, so do not repeat it.
-        if (isAbortError(error)) await releaseSession(session);
-        else releasedSessionIds.add(session.sessionId);
+      } catch (_) {
+        // terminateSession() sends a single bounded DELETE and does not retry.
+        // An HTTP rejection means the upstream answered; a network error means
+        // it was not reached, and the DELETE is deliberately not repeated: the
+        // session is marked released either way so close() stays exactly-once.
+        releasedSessionIds.add(session.sessionId);
       }
     }
     try { if (client) await client.close(); } catch (_) {}

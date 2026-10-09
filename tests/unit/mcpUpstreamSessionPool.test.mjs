@@ -768,7 +768,8 @@ function loadProxyFixture() {
         fsSync.writeFileSync(path.join(ploinkyDir, 'data', 'router-security', 'policy-state.json'), JSON.stringify({
             schema: 'router-policy',
             httpRoutes: [],
-            mcpTools: [{ agent: 'echoAgent', tool: 'actor', access: 'authenticated', enabled: true }],
+            mcpTools: ['echoAgent', 'sdkColdSchemaAgent', 'sdkWarmSchemaAgent']
+                .map(agent => ({ agent, tool: 'actor', access: 'authenticated', enabled: true })),
         }));
         process.chdir(workspace);
         process.env.PLOINKY_MASTER_KEY = '7'.repeat(64);
@@ -787,20 +788,20 @@ function loadProxyFixture() {
     return proxyFixturePromise;
 }
 
-function proxyRoute(port, lease, manifest) {
-    const route = { repo: 'PoolTest', agent: 'echoAgent', container: PROXY_CONTAINER, hostPort: port };
+function proxyRoute(port, lease, manifest, agentName = 'echoAgent') {
+    const route = { repo: 'PoolTest', agent: agentName, container: PROXY_CONTAINER, hostPort: port };
     const snapshot = {
-        routing: { routes: { echoAgent: route } },
+        routing: { routes: { [agentName]: route } },
         agents: { [PROXY_CONTAINER]: {
-            type: 'agent', repoName: 'PoolTest', agentName: 'echoAgent',
+            type: 'agent', repoName: 'PoolTest', agentName,
             containerId: 'd'.repeat(64), instanceId: 'proxy-instance', enableGeneration: 'proxy-enable',
         } },
-        ...(manifest === undefined ? {} : { manifests: { echoAgent: manifest } }),
+        ...(manifest === undefined ? {} : { manifests: { [agentName]: manifest } }),
     };
     const routePlan = {
         ok: true,
         kind: 'agent-root',
-        routeKey: 'echoAgent',
+        routeKey: agentName,
         lease: { id: lease, snapshot },
         target: { hostname: '127.0.0.1', hostPort: port },
         route,
@@ -809,10 +810,10 @@ function proxyRoute(port, lease, manifest) {
     return { route, routePlan, key: poolKeyForRoutePlan(routePlan) };
 }
 
-function openRouterSession(proxy, { user = PROXY_USER, login = 'pool-browser-login' } = {}) {
+function openRouterSession(proxy, { user = PROXY_USER, login = 'pool-browser-login', agentName = 'echoAgent' } = {}) {
     const sessionId = crypto.randomUUID();
-    const owner = createMcpSessionOwner({ user, authMode: 'sso', sessionId: login }, 'agent', 'echoAgent');
-    proxy.agentSessionStore.set(sessionId, { agentName: 'echoAgent', baseUrl: 'http://127.0.0.1/mcp', owner });
+    const owner = createMcpSessionOwner({ user, authMode: 'sso', sessionId: login }, 'agent', agentName);
+    proxy.agentSessionStore.set(sessionId, { agentName, baseUrl: 'http://127.0.0.1/mcp', owner });
     return sessionId;
 }
 
@@ -829,10 +830,10 @@ function toolsCall(label) {
 }
 
 async function proxyCall(proxy, { route, routePlan, sessionId, body, pool, waitForAgentReady, beforeDial = () => true, agent = null,
-    user = PROXY_USER, login = 'pool-browser-login' }) {
+    user = PROXY_USER, login = 'pool-browser-login', agentName = 'echoAgent' }) {
     const req = Readable.from([Buffer.from(typeof body === 'string' ? body : JSON.stringify(body), 'utf8')]);
     req.method = 'POST';
-    req.url = '/echoAgent/mcp';
+    req.url = `/${agentName}/mcp`;
     req.headers = { host: 'localhost', 'content-type': 'application/json', 'mcp-session-id': sessionId };
     req.user = user;
     req.authMode = 'sso';
@@ -846,7 +847,7 @@ async function proxyCall(proxy, { route, routePlan, sessionId, body, pool, waitF
         writeHead(statusCode) { this.statusCode = statusCode; },
         end(chunk = '') { this.body += String(chunk); finish(); },
     };
-    await proxy.handleAgentMcpRequest(req, res, route, 'echoAgent', { beforeDial, routePlan, pool, waitForAgentReady });
+    await proxy.handleAgentMcpRequest(req, res, route, agentName, { beforeDial, routePlan, pool, waitForAgentReady });
     await done;
     return { status: res.statusCode, json: JSON.parse(res.body), sessionStoreSize: proxy.agentSessionStore.size };
 }
@@ -1101,15 +1102,35 @@ test('pool: a per-request dispatch guard refusal sends and mints nothing and kee
     assert.equal(count(upstream.log, row => row.rpc === 'tools/call' && row.sessionId === session), 2);
 });
 
-test('proxy SDK path: a guard refusal of notifications/initialized releases the allocated session once', { timeout: 10000 }, async (t) => {
+// The tools/call argument canonicalization reads a module-level tool-schema
+// cache keyed by agent name. A distinct agent name per variant makes the cache
+// state deterministic. Cold: no tools/list was ever served for the name, so the
+// shared client's listTools owns the held initialize. Warm: a priming call
+// first makes the upstream serve tools/list for the name (observed in its
+// request log), so the canonicalization skips tools/list and the per-call
+// client owns the held initialize. In both, the held upstream sees only the
+// one initialize and the one DELETE.
+async function sdkGuardRefusalRelease(t, { agentName, warm }) {
     const { proxy } = await loadProxyFixture();
     const held = await startHeldInitializeUpstream(t);
-    const { route, routePlan } = proxyRoute(held.upstream.port, 'sdk-guard-release');
-    const sessionId = openRouterSession(proxy);
+    const { route, routePlan } = proxyRoute(held.upstream.port, `sdk-guard-release-${agentName}`, undefined, agentName);
+    let warmRpcs = null;
+    if (warm) {
+        const warmUpstream = await startFakeUpstream(t);
+        const warmRoute = proxyRoute(warmUpstream.port, `schema-warm-${agentName}`, undefined, agentName);
+        const warmSession = openRouterSession(proxy, { agentName });
+        const warmed = await proxyCall(proxy, { route: warmRoute.route, routePlan: warmRoute.routePlan,
+            sessionId: warmSession, pool: null, waitForAgentReady: async () => true, agentName,
+            body: toolsCall('warm') });
+        assert.equal(warmed.json.result?.content?.[0]?.text, 'fake-ok', JSON.stringify(warmed.json));
+        proxy.agentSessionStore.delete(warmSession);
+        warmRpcs = warmUpstream.log.filter(row => row.httpMethod === 'POST').map(row => row.rpc);
+    }
+    const sessionId = openRouterSession(proxy, { agentName });
     const pending = proxyCall(proxy, { route, routePlan, sessionId, pool: null, waitForAgentReady: async () => true,
-        body: toolsCall('sdk-deleted') });
+        agentName, body: toolsCall('sdk-deleted') });
     await held.initializeEntered;
-    const handle = (req, res) => proxy.handleAgentMcpRequest(req, res, route, 'echoAgent', { routePlan });
+    const handle = (req, res) => proxy.handleAgentMcpRequest(req, res, route, agentName, { routePlan });
     assert.equal((await browserStoreRequest(handle, sessionId, null, 'DELETE')).status, 204);
     held.release();
     const refused = await pending;
@@ -1119,6 +1140,17 @@ test('proxy SDK path: a guard refusal of notifications/initialized releases the 
     await new Promise(resolve => setTimeout(resolve, 100));
     assert.deepEqual(held.deletes(), [allocated]);
     assert.deepEqual(held.posts(), ['initialize']);
+    return { warmRpcs };
+}
+
+test('proxy SDK path (cold schema cache): the shared client owns the open and its refused session is released once', { timeout: 10000 }, async (t) => {
+    const { warmRpcs } = await sdkGuardRefusalRelease(t, { agentName: 'sdkColdSchemaAgent', warm: false });
+    assert.equal(warmRpcs, null, 'no tools/list was ever served for this agent name');
+});
+
+test('proxy SDK path (warm schema cache): the per-call client owns the open and its refused session is released once', { timeout: 10000 }, async (t) => {
+    const { warmRpcs } = await sdkGuardRefusalRelease(t, { agentName: 'sdkWarmSchemaAgent', warm: true });
+    assert.ok(warmRpcs.includes('tools/list'), 'the priming call populated the tool-schema cache through tools/list');
 });
 
 test('aggregate: a guard refusal of notifications/initialized releases the allocated session once', { timeout: 10000 }, async (t) => {
