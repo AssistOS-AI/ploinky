@@ -15,6 +15,7 @@ import {
     commitAdditiveEdgeRoutingGeneration,
     createRouterAttestationGenerationLease,
     currentEnabledAgentIdentity,
+    edgeWebchatTargets,
     initializeFreshEdgeRoutingSources,
     inactivateEdgeRoutingGeneration,
     loadActiveEdgeRoutingGeneration,
@@ -970,48 +971,102 @@ test('webchat exposes only the WebChat router mount for the selected root', (t) 
     }
 });
 
-test('webchat publishes the selected root dependency closure as its only WebChat targets', (t) => {
-    const fixture = createFixture(t, {
+// The compiled generation keys produced by 7cc1991c. Generations written by
+// that code must load and apply unchanged, so this candidate adds none.
+const BASE_COMPILED_KEYS = ['agentMcpRoutes', 'dependencyHttpRoutes', 'hosts', 'policy', 'publication', 'security', 'surfaces'];
+
+function webchatClosureFixture(t) {
+    return createFixture(t, {
         desired: {
             hosts: {
-                'chat.example.test': {
-                    agent: 'fixtures/alpha',
-                    routerSurfaces: ['webchat'],
-                },
-                'plain.example.test': {
-                    agent: 'fixtures/alpha',
-                    routerSurfaces: [],
-                },
+                'chat.example.test': { agent: 'fixtures/alpha', routerSurfaces: ['webchat'] },
+                'plain.example.test': { agent: 'fixtures/alpha', routerSurfaces: [] },
             },
-            cloudflare: {
-                tunnelTokenSecret: 'publication/test-connector',
-            },
+            cloudflare: { tunnelTokenSecret: 'publication/test-connector' },
         },
-        alphaManifest: {
-            enable: ['beta global no-wait'],
-        },
+        alphaManifest: { enable: ['beta global no-wait'], webchat: { auth: 'self' } },
     });
+}
+
+test('webchat targets derive from the selected root closure without changing the compiled generation', (t) => {
+    const fixture = webchatClosureFixture(t);
     const applied = applyEdgeRoutingGeneration({
         workspaceRoot: fixture.workspace,
         reason: 'webchat-target-closure',
         publicationState: 'ready',
     });
-    assert.deepEqual(applied.generation.compiled.webchatTargets?.['chat.example.test'], ['alpha', 'beta']);
-    assert.deepEqual(applied.generation.compiled.webchatTargets?.['plain.example.test'], []);
+    assert.deepEqual(Object.keys(applied.generation.compiled).sort(), BASE_COMPILED_KEYS);
+    const loaded = loadActiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace }).generation;
+    for (const generation of [applied.generation, loaded]) {
+        assert.deepEqual([...edgeWebchatTargets(generation, 'chat.example.test')], ['alpha', 'beta']);
+        assert.deepEqual([...edgeWebchatTargets(generation, 'plain.example.test')], []);
+        assert.deepEqual([...edgeWebchatTargets(generation, 'unknown.example.test')], []);
+    }
+    assert.deepEqual([...edgeWebchatTargets(null, 'chat.example.test')], []);
+});
 
+test('a generation already written for unchanged sources loads and re-applies across lifecycle changes', (t) => {
+    const fixture = webchatClosureFixture(t);
+    const first = applyEdgeRoutingGeneration({ workspaceRoot: fixture.workspace, reason: 'upgrade-baseline', publicationState: 'ready' });
     const generationFile = path.join(
         fixture.edgeDir,
         'generations',
-        `${applied.selector.generation.replace(/^sha256:/, '')}.json`,
+        `${first.selector.generation.replace(/^sha256:/, '')}.json`,
     );
-    const document = JSON.parse(fs.readFileSync(generationFile, 'utf8'));
-    delete document.compiled.webchatTargets;
-    document.compiledDigest = compiledDigest(document.compiled);
-    fs.writeFileSync(generationFile, JSON.stringify(document, null, 2));
-    assert.throws(
-        () => loadActiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace }),
-        { code: 'EDGE_GENERATION_CORRUPT' },
-    );
+    const stored = fs.readFileSync(generationFile, 'utf8');
+    assert.deepEqual(Object.keys(JSON.parse(stored).compiled).sort(), BASE_COMPILED_KEYS);
+    const apply = (reason) => applyEdgeRoutingGeneration({ workspaceRoot: fixture.workspace, reason, publicationState: 'ready' });
+    assert.equal(loadActiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace }).selector.generation, first.selector.generation);
+    // Unchanged sources reuse the immutable document byte for byte.
+    assert.equal(apply('upgrade-unchanged').selector.generation, first.selector.generation);
+    assert.equal(fs.readFileSync(generationFile, 'utf8'), stored);
+    // Changed routing compiles a new generation after loading the previous one.
+    const routingFile = path.join(fixture.ploinkyDir, 'routing.json');
+    const routing = JSON.parse(fs.readFileSync(routingFile, 'utf8'));
+    routing.routes.beta.hostPort = 43199;
+    fs.writeFileSync(routingFile, JSON.stringify(routing, null, 2));
+    const changed = apply('upgrade-routing-change');
+    assert.notEqual(changed.selector.generation, first.selector.generation);
+    // Inactivation followed by apply.
+    inactivateEdgeRoutingGeneration('upgrade-inactivate', { workspaceRoot: fixture.workspace });
+    assert.equal(apply('upgrade-after-inactivate').selector.generation, changed.selector.generation);
+    // An empty host set.
+    const desiredFile = path.join(fixture.edgeDir, 'desired.json');
+    fs.writeFileSync(desiredFile, JSON.stringify({ hosts: {} }, null, 2));
+    const empty = apply('upgrade-no-hosts');
+    assert.deepEqual([...edgeWebchatTargets(empty.generation, 'chat.example.test')], []);
+    assert.ok(loadActiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace }).generation);
+});
+
+test('encoded spellings of Router-owned mounts are rejected before surface or agent selection', (t) => {
+    const fixture = createFixture(t, {
+        desired: {
+            hosts: {
+                'explorer.example.test': { agent: 'fixtures/alpha', routerSurfaces: ['webchat'] },
+                'public.example.test': { agent: 'fixtures/alpha', routerSurfaces: [] },
+            },
+            cloudflare: { tunnelTokenSecret: 'publication/test-connector' },
+        },
+    });
+    applyEdgeRoutingGeneration({ workspaceRoot: fixture.workspace, reason: 'encoded-router-paths', publicationState: 'ready' });
+    const plan = (host, url) => resolveEdgeRoutePlan({ req: { method: 'GET', url, headers: { host } }, listener: 'public' });
+    // Literal spelling on a host without workspace-assets is a surface denial.
+    assert.equal(plan('public.example.test', '/workspace-files/x').code, 'ROUTE_SURFACE_DENIED');
+    for (const host of ['public.example.test', 'explorer.example.test', '127.0.0.1:18080']) {
+        for (const url of [
+            '/%77orkspace-files/x', '/workspace-files%2Fx', '/%2577orkspace-files/x', '/%6Dcp/', '/%6dcp',
+            '/%75pload', '/%62lobs/x', '/%73tatus', '/%6Dcp', '/%77ebchat/stream', '/webchat%2Fstream', '/%61uth/login',
+        ]) {
+            const result = plan(host, url);
+            assert.equal(result.ok, false, `${host} ${url}`);
+            assert.equal(result.code, 'NONCANONICAL_ROUTER_PATH', `${host} ${url}`);
+            assert.equal(result.status, 400, `${host} ${url}`);
+        }
+    }
+    // Ordinary encoded agent paths and literal Router paths keep their plans.
+    assert.equal(plan('public.example.test', '/a%20b.html').kind, 'agent-root');
+    assert.equal(plan('explorer.example.test', '/webchat/stream').surface, 'webchat');
+    assert.equal(plan('explorer.example.test', '/webchat/a%20b').surface, 'webchat');
 });
 
 test('WebChat router mount remains closed without the webchat surface', (t) => {

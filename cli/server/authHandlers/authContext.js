@@ -14,6 +14,7 @@ import { collectManifestHttpRouteAccess } from '../policy/HttpRouteProviders.js'
 import { evaluateRequiredCapability } from './requiredCapability.js';
 import { isRouteMount } from '../utils/routeMounts.js';
 import { manifestWebchatDeclaration, webchatRouteProvenance } from '../webchat/commandResolver.js';
+import { edgeWebchatTargets } from '../../sandbox/edgeGeneration.js';
 import {
     appendLog,
     appendSetCookie,
@@ -198,10 +199,35 @@ function resolveAuthRouteKey(parsedUrl, options = {}) {
 const WEBCHAT_HELPER_PATHS = new Set(['/uploads', '/directories', '/suggestions/files', '/tasks']);
 const WEBCHAT_RUNTIME_PATHS = new Set(['/', '/index.html', '/stream', '/input', '/control', '/interaction']);
 
+// Every spelling a dispatcher could decode into the same mount: the raw path
+// and up to three percent-decoding passes. A path classifies by its first
+// spelling that names a Router surface, so an encoded mount never escapes it.
+function routerSurfacePathSpellings(pathname) {
+    const spellings = [String(pathname || '/')];
+    for (let pass = 0; pass < 3; pass += 1) {
+        let decoded;
+        try {
+            decoded = decodeURIComponent(spellings.at(-1));
+        } catch (_) {
+            break;
+        }
+        if (decoded === spellings.at(-1)) break;
+        spellings.push(decoded);
+    }
+    return spellings;
+}
+
 // Router-owned request classes whose authorization owner is the workspace (or
 // the selected host), never a caller-supplied `?agent=` selector.
 export function routerSurfaceRequestClass(pathname) {
-    const value = String(pathname || '/');
+    for (const spelling of routerSurfacePathSpellings(pathname)) {
+        const requestClass = literalRouterSurfaceRequestClass(spelling);
+        if (requestClass) return requestClass;
+    }
+    return '';
+}
+
+function literalRouterSurfaceRequestClass(value) {
     if (value === '/upload' || value === '/mcp' || value === '/mcp/'
         || isRouteMount(value, '/blobs')
         || isRouteMount(value, '/workspace-files')
@@ -312,8 +338,7 @@ function resolveWebchatTargetSelection(parsedUrl, owner, options = {}) {
     const routeKey = selector ? canonicalEnabledRouteKey(selector, options) : owner.ownerRouteKey;
     if (!routeKey) return { unavailable: true };
     if (owner.scope === 'host' && routeKey !== owner.ownerRouteKey) {
-        const targets = snapshotFromOptions(options)?.compiled?.webchatTargets?.[owner.host];
-        if (!Array.isArray(targets) || !targets.includes(routeKey)) return { unavailable: true };
+        if (!edgeWebchatTargets(snapshotFromOptions(options), owner.host).includes(routeKey)) return { unavailable: true };
     }
     return { routeKey, selector };
 }

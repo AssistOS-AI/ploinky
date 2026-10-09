@@ -359,6 +359,66 @@ for (const selector of ['missing', 'webAdmin', 'guestAgent', 'webAssist']) {
     });
 }
 
+// Alternate spellings of every Router sink and WebChat helper: percent-encoded
+// mount letters, an encoded separator and double encoding. Each must classify
+// as the same owner-authorized surface as its literal spelling.
+const ENCODED_SINK_SPELLINGS = [
+    { method: 'PUT', url: '/%75pload?path=f.txt' },
+    { method: 'PUT', url: '/%2575pload?path=f.txt' },
+    { method: 'POST', url: '/%62lobs/explorer' },
+    { method: 'POST', url: '/blobs%2Fexplorer' },
+    { method: 'GET', url: '/%77orkspace-files/f.txt' },
+    { method: 'GET', url: '/workspace-files%2Ff.txt' },
+    { method: 'GET', url: '/%2577orkspace-files/f.txt' },
+    { method: 'GET', url: '/%73tatus/data' },
+    { method: 'POST', url: '/%6Dcp' },
+    { method: 'POST', url: '/webchat/%75ploads' },
+    { method: 'GET', url: '/%77ebchat/directories' },
+    { method: 'GET', url: '/webchat/suggestions%2Ffiles' },
+];
+
+for (const selector of ['', 'missing', 'webAssist']) {
+    test(`U1 encoded Router surface spellings keep the workspace owner (selector=${selector || 'none'})`, async (t) => {
+        const { authHandlers, createRoutePlan } = await withAuthModules(t);
+        for (const input of ENCODED_SINK_SPELLINGS) {
+            const url = selector ? `${input.url}${input.url.includes('?') ? '&' : '?'}agent=${selector}` : input.url;
+            const req = makeRequest({ method: input.method, url, accept: 'application/json' });
+            const res = new MockResponse();
+            const result = await authHandlers.ensureAuthenticated(req, res, new URL(req.url, 'http://localhost'), { routePlan: createRoutePlan() });
+            assertOwnerLogin(result, req, res, url);
+        }
+    });
+}
+
+test('M1 encoded sink spellings also fail closed without a resolvable owner', async (t) => {
+    const { authHandlers, createRoutePlan } = await withAuthModules(t);
+    const routingPath = path.join(process.env.PLOINKY_WORKSPACE_ROOT, '.ploinky', 'routing.json');
+    const routing = JSON.parse(readFileSync(routingPath, 'utf8'));
+    delete routing.static;
+    writeFileSync(routingPath, JSON.stringify(routing, null, 2));
+    for (const input of ENCODED_SINK_SPELLINGS) {
+        const req = makeRequest({ method: input.method, url: input.url, accept: 'application/json' });
+        const res = new MockResponse();
+        const result = await authHandlers.ensureAuthenticated(req, res, new URL(req.url, 'http://localhost'), { routePlan: createRoutePlan() });
+        assert.equal(result.ok, false, input.url);
+        assert.equal(res.statusCode, 503, input.url);
+        assert.equal(JSON.parse(res.body).error, 'router_surface_owner_unconfigured', input.url);
+        assert.equal(req.user, undefined, input.url);
+    }
+});
+
+test('an unrouted path never takes its auth owner from ?agent=', async (t) => {
+    const { authHandlers, createRoutePlan } = await withAuthModules(t);
+    for (const url of ['/unrouted/page?agent=webAssist', '/unrouted/page?agent=missing', '/Workspace-files/f.txt?agent=webAssist', '//upload?agent=missing']) {
+        for (const options of [{}, { routePlan: createRoutePlan() }]) {
+            const req = makeRequest({ method: 'GET', url, accept: 'application/json' });
+            const res = new MockResponse();
+            const result = await authHandlers.ensureAuthenticated(req, res, new URL(req.url, 'http://localhost'), options);
+            assertOwnerLogin(result, req, res, `${url} plan=${Boolean(options.routePlan)}`);
+        }
+    }
+});
+
 test('U4 WebChat selectors: unknown targets are unavailable, known undeclared targets use the owner login', async (t) => {
     const { authHandlers, createRoutePlan } = await withAuthModules(t);
     for (const options of [{}, { routePlan: createRoutePlan() }]) {

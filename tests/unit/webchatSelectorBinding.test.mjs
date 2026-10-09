@@ -21,7 +21,9 @@ const previous = {
 process.chdir(root);
 process.env.PLOINKY_WORKSPACE_ROOT = root;
 process.env.PLOINKY_MASTER_KEY = '9'.repeat(64);
+process.env.PLOINKY_ROUTER_HOST_PORT = '18080';
 
+const { applyEdgeRoutingGeneration, loadActiveEdgeRoutingGeneration } = await import('../../cli/sandbox/edgeGeneration.js');
 const { ensureAuthenticated } = await import('../../cli/server/authHandlers/authContext.js');
 const { authService } = await import('../../cli/server/authHandlers/shared.js');
 const { verifyBrowserMutationRequest } = await import('../../cli/server/browserMutationSecurity.js');
@@ -44,8 +46,8 @@ const GUEST_HOST = 'guest.example.test';
 const INHERIT_HOST = 'inherit.example.test';
 const AGENTS = {
     explorer: { mode: 'sso', manifest: { routerAccess: { requiredCapability: 'explorer.access' } } },
-    hostRoot: { mode: 'sso', manifest: { routerAccess: { requiredCapability: 'root.access' } } },
-    inheritRoot: { mode: 'none', manifest: { routerAccess: { requiredCapability: 'root.access' } } },
+    hostRoot: { mode: 'sso', manifest: { enable: ['dependency', 'guestDependency', 'selfDependency'], routerAccess: { requiredCapability: 'root.access' } } },
+    inheritRoot: { mode: 'none', manifest: { enable: ['selfDependency'], routerAccess: { requiredCapability: 'root.access' } } },
     dependency: { mode: 'sso', manifest: { webchat: { auth: 'static' } } },
     selfDependency: { mode: 'sso', manifest: { webchat: { auth: 'self' }, routerAccess: { requiredCapability: 'dep.access' } } },
     outsider: { mode: 'sso', manifest: { webchat: { auth: 'self' } } },
@@ -64,10 +66,12 @@ const SSO_USERS = {
     'sso-explorer': ['explorer.access'],
 };
 
-function writeWorkspace({ staticAgent = 'explorer', mutateDisk = null } = {}) {
+// Builds the workspace sources, applies a real edge generation from them and
+// returns the generation as the Router loads it, so every host-scope case runs
+// on a reconstructable snapshot (WebChat targets are derived from it).
+function writeWorkspace({ staticAgent = 'explorer', mutateDisk = null, webchatHosts = [HOST, GUEST_HOST, INHERIT_HOST] } = {}) {
     const routes = {};
     const agents = {};
-    const manifests = {};
     Object.entries(AGENTS).forEach(([name, spec], index) => {
         const hostPath = path.join(root, 'agent-src', name);
         fs.mkdirSync(hostPath, { recursive: true });
@@ -85,29 +89,38 @@ function writeWorkspace({ staticAgent = 'explorer', mutateDisk = null } = {}) {
             type: 'agent',
             agentName: name,
             repoName: 'fixtures',
+            instanceId: `${name}-instance`,
+            enableGeneration: `${name}-enable-generation`,
             ...(spec.alias ? { alias: spec.alias } : {}),
             auth: { mode: spec.mode },
         };
-        manifests[name] = manifest;
     });
     const routing = { routes, static: { agent: staticAgent, hostPath: routes[staticAgent].hostPath } };
-    const disk = structuredClone(routing);
-    if (mutateDisk) mutateDisk(disk);
-    fs.writeFileSync(path.join(root, '.ploinky', 'routing.json'), JSON.stringify(disk, null, 2));
-    fs.writeFileSync(path.join(root, '.ploinky', 'agents.json'), JSON.stringify(agents, null, 2));
-    return {
-        generation: `sha256:${'b'.repeat(64)}`,
-        routing,
-        agents,
-        manifests,
-        compiled: {
-            webchatTargets: {
-                [HOST]: ['dependency', 'guestDependency', 'hostRoot', 'selfDependency'],
-                [GUEST_HOST]: ['guestRoot'],
-                [INHERIT_HOST]: ['inheritRoot', 'selfDependency'],
-            },
-        },
+    const hostRoots = { [HOST]: 'hostRoot', [GUEST_HOST]: 'guestRoot', [INHERIT_HOST]: 'inheritRoot' };
+    const desired = {
+        hosts: Object.fromEntries(Object.entries(hostRoots).map(([host, routeKey]) => [host, {
+            agent: `fixtures/${routeKey}`,
+            routerSurfaces: webchatHosts.includes(host) ? ['webchat'] : [],
+        }])),
+        cloudflare: { tunnelTokenSecret: 'publication/test-connector' },
     };
+    const edgeDir = path.join(root, '.ploinky', 'data', 'edge-routing');
+    const policyDir = path.join(root, '.ploinky', 'data', 'router-security');
+    fs.rmSync(edgeDir, { recursive: true, force: true });
+    fs.mkdirSync(edgeDir, { recursive: true });
+    fs.mkdirSync(policyDir, { recursive: true });
+    fs.writeFileSync(path.join(edgeDir, 'desired.json'), JSON.stringify(desired, null, 2));
+    fs.writeFileSync(path.join(policyDir, 'policy-state.json'), JSON.stringify({ schema: 'router-policy', httpRoutes: [], mcpTools: [] }, null, 2));
+    fs.writeFileSync(path.join(root, '.ploinky', 'routing.json'), JSON.stringify(routing, null, 2));
+    fs.writeFileSync(path.join(root, '.ploinky', 'agents.json'), JSON.stringify(agents, null, 2));
+    applyEdgeRoutingGeneration({ workspaceRoot: root, reason: 'webchat-binding-fixture', publicationState: 'ready' });
+    const snapshot = loadActiveEdgeRoutingGeneration({ workspaceRoot: root }).generation;
+    if (mutateDisk) {
+        const disk = structuredClone(routing);
+        mutateDisk(disk);
+        fs.writeFileSync(path.join(root, '.ploinky', 'routing.json'), JSON.stringify(disk, null, 2));
+    }
+    return snapshot;
 }
 
 function lease(snapshot, commit = () => true) {
@@ -363,10 +376,10 @@ test('H3 prime a guest-self host owner reaches its own runtime while helpers sta
     assert.equal(fs.existsSync(path.join(root, 'guest-upload')), false);
 });
 
-test('H4 a generation without WebChat targets admits only the host root', async (t) => {
+test('H4 a host without the webchat surface derives no WebChat target beyond its root', async (t) => {
     mockSso(t);
-    const snapshot = writeWorkspace();
-    delete snapshot.compiled.webchatTargets;
+    const snapshot = writeWorkspace({ webchatHosts: [GUEST_HOST] });
+    assert.equal(Object.hasOwn(snapshot.compiled, 'webchatTargets'), false, 'the compiled generation shape is unchanged');
     const denied = await authenticate('/webchat/?agent=dependency', { plan: hostPlan(snapshot), cookie: 'ploinky_sso=sso-all' });
     assert.equal(denied.result.ok, false);
     assert.equal(denied.res.statusCode, 404);
@@ -794,4 +807,28 @@ test("another guest replaying tab, session and interaction IDs cannot answer a g
     assert.equal(post(GUEST_A, 'sid-A', { interactionId: 'approval_12345678', optionId: 'allow' }), 204, 'positive control: the owner answers');
     assert.equal(factory.created[0].writes.length, 1);
     disposeAll(appState);
+});
+
+test('workspace-file dispatch matches only the literal mount that authorization classifies', async () => {
+    const staticSrv = await import('../../cli/server/static/index.js');
+    fs.writeFileSync(path.join(root, 'served.txt'), 'served-bytes');
+    fs.writeFileSync(path.join(root, 'with space.txt'), 'spaced-bytes');
+    const request = (url) => ({ url, method: 'GET', headers: { host: '127.0.0.1' }, socket: {} });
+    for (const url of ['/%77orkspace-files/served.txt', '/workspace-files%2Fserved.txt', '/%2577orkspace-files/served.txt']) {
+        assert.equal(staticSrv.isWorkspaceFileRequest(request(url)), false, url);
+        const res = makeRes();
+        assert.equal(await staticSrv.serveWorkspaceFileRequest(request(url), res), false, url);
+        assert.equal(res.body.includes('served-bytes'), false, url);
+    }
+    for (const [url, expected] of [['/workspace-files/served.txt', 'served-bytes'], ['/workspace-files/with%20space.txt', 'spaced-bytes']]) {
+        assert.equal(staticSrv.isWorkspaceFileRequest(request(url)), true, url);
+        const chunks = [];
+        const res = new (await import('node:stream')).PassThrough();
+        Object.assign(res, { statusCode: 0, headers: {}, writeHead(status, headers = {}) { this.statusCode = status; Object.assign(this.headers, headers); }, setHeader(k, v) { this.headers[k] = v; }, getHeader(k) { return this.headers[k]; } });
+        res.on('data', (chunk) => chunks.push(chunk));
+        const ended = new Promise((resolve) => res.on('end', resolve));
+        assert.equal(await staticSrv.serveWorkspaceFileRequest(request(url), res), true, url);
+        await ended;
+        assert.equal(Buffer.concat(chunks).toString(), expected, url);
+    }
 });
