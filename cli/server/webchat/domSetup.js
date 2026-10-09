@@ -33,7 +33,6 @@ export function initDom() {
 
     const titleBar = document.getElementById('titleBar');
     const runtimeModel = document.getElementById('runtimeModel');
-    const runtimeModelRow = document.getElementById('runtimeModelRow');
     const avatarInitial = document.getElementById('avatarInitial');
     const statusEl = document.getElementById('statusText');
     // Reuse connection-state updates to color the avatar rather than a separate dot.
@@ -162,7 +161,6 @@ export function initDom() {
         runtimeModel.textContent = label;
         runtimeModel.title = model ? `Selected model: ${label}` : '';
         runtimeModel.hidden = !model;
-        if (runtimeModelRow) runtimeModelRow.hidden = !model;
     }
 
     function showBanner(text, cls) {
