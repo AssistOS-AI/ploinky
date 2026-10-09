@@ -16,6 +16,9 @@
  * created without inference in the pinned DPU flow, so live interaction
  * isolation is recorded as an explicit limitation and proven by the
  * actual-module offline fixture (webchat-interaction-isolation.test.mjs).
+ * Every stream that receives input or is censused first waits (bounded) for the
+ * Router's `event: startup-state` `{"state":"ready"}`; `failed`, a close, a
+ * transport end or the deadline fails the check and nothing is sent to it.
  * Process identity is the DPU node process inside the pinned DPU container,
  * attributed to a principal by its router-issued --sso-user-id and identified
  * by pid plus kernel start time; raw argv/environment stay private.
@@ -34,6 +37,7 @@ export const webchatProbe = Object.freeze({
     launchKey: 'authz-probe',
     cap: 3,
     waitMs: 15000,
+    readyMs: 60000, // bounded wait for the Router's `startup-state: ready` before any input or process census
     maxEventBytes: 256 * 1024,
     dpuEntry: Object.freeze(['node', '/code/src/index.mjs']), // AchillesIDE dpuAgent/manifest.json:25 "cli"
 });
@@ -70,6 +74,58 @@ export function webchatCheckDefinitions() {
     ];
 }
 
+/**
+ * Turn one SSE response into the probe's stream handle. The Router writes
+ * `event: startup-state` with the current state on every connect and on each
+ * transition, and `event: close` when the runtime ends
+ * (cli/server/handlers/webchat/runtimeRoutes.js:178-189, :245). `res` is any
+ * object with statusCode, headers, setEncoding, on and destroy, so the parser
+ * is exercised offline with a fake response.
+ */
+export function createStreamHandle(res, req, { maxBytes = webchatProbe.maxEventBytes } = {}) {
+    let buffer = '';
+    let ended = false;
+    const events = [];
+    const waiters = new Set();
+    const handle = {
+        status: res.statusCode,
+        contentType: String(res.headers?.['content-type'] || ''),
+        events: () => [...events],
+        ended: () => ended,
+        waitFor(predicate, ms = webchatProbe.waitMs) {
+            const found = events.find(predicate);
+            if (found) return Promise.resolve(found);
+            return new Promise(done => {
+                const waiter = { predicate, done, timer: setTimeout(() => { waiters.delete(waiter); done(null); }, ms) };
+                waiters.add(waiter);
+            });
+        },
+        close() { res.destroy(); req?.destroy?.(); },
+    };
+    res.setEncoding('utf8');
+    res.on('data', chunk => {
+        buffer += chunk;
+        if (buffer.length > maxBytes) { handle.close(); return; }
+        let index;
+        while ((index = buffer.indexOf('\n\n')) >= 0) {
+            const block = buffer.slice(0, index);
+            buffer = buffer.slice(index + 2);
+            const event = { event: 'message', data: '' };
+            for (const line of block.split('\n')) {
+                if (line.startsWith('event:')) event.event = line.slice(6).trim();
+                else if (line.startsWith('data:')) event.data += line.slice(5).trimStart();
+            }
+            if (!event.data && event.event === 'message') continue;
+            events.push(event);
+            for (const waiter of [...waiters]) if (waiter.predicate(event)) { clearTimeout(waiter.timer); waiters.delete(waiter); waiter.done(event); }
+        }
+    });
+    // A transport end or close is observable: readiness must not wait on a dead stream.
+    for (const name of ['end', 'close']) res.on(name, () => { ended = true; });
+    res.on('error', () => { ended = true; });
+    return handle;
+}
+
 /** Default stream opener: raw SSE over the selected loopback Router with the actor's cookies. */
 export async function openEventStream(ctx, actor, requestPath, { maxBytes = webchatProbe.maxEventBytes } = {}) {
     await ctx.guard(); // GET /stream creates runtime state.
@@ -77,45 +133,9 @@ export async function openEventStream(ctx, actor, requestPath, { maxBytes = webc
     assert.ok(client, `Unknown principal ${actor}`);
     const cookie = client.cookies.map(c => `${c.name}=${c.value}`).join('; ');
     return await new Promise((resolve, reject) => {
-        let buffer = '';
-        const events = [];
-        const waiters = new Set();
         const req = http.request({ hostname: '127.0.0.1', port: 8080, path: requestPath, method: 'GET', headers: { accept: 'text/event-stream', ...(cookie ? { cookie } : {}) } }, res => {
             ctx.report.requests.push({ actor, method: 'GET', path: requestPath.split('?')[0], status: res.statusCode, stream: true });
-            const handle = {
-                status: res.statusCode,
-                contentType: String(res.headers['content-type'] || ''),
-                events: () => [...events],
-                waitFor(predicate, ms = webchatProbe.waitMs) {
-                    const found = events.find(predicate);
-                    if (found) return Promise.resolve(found);
-                    return new Promise(done => {
-                        const waiter = { predicate, done, timer: setTimeout(() => { waiters.delete(waiter); done(null); }, ms) };
-                        waiters.add(waiter);
-                    });
-                },
-                close() { res.destroy(); req.destroy(); },
-            };
-            res.setEncoding('utf8');
-            res.on('data', chunk => {
-                buffer += chunk;
-                if (buffer.length > maxBytes) { handle.close(); return; }
-                let index;
-                while ((index = buffer.indexOf('\n\n')) >= 0) {
-                    const block = buffer.slice(0, index);
-                    buffer = buffer.slice(index + 2);
-                    const event = { event: 'message', data: '' };
-                    for (const line of block.split('\n')) {
-                        if (line.startsWith('event:')) event.event = line.slice(6).trim();
-                        else if (line.startsWith('data:')) event.data += line.slice(5).trimStart();
-                    }
-                    if (!event.data && event.event === 'message') continue;
-                    events.push(event);
-                    for (const waiter of [...waiters]) if (waiter.predicate(event)) { clearTimeout(waiter.timer); waiters.delete(waiter); waiter.done(event); }
-                }
-            });
-            res.on('error', () => {});
-            resolve(handle);
+            resolve(createStreamHandle(res, req, { maxBytes }));
         });
         req.setTimeout(webchatProbe.waitMs, () => req.destroy(new Error('Bounded WebChat stream connect timeout')));
         req.on('error', reject);
@@ -124,6 +144,29 @@ export async function openEventStream(ctx, actor, requestPath, { maxBytes = webc
 }
 
 const parseData = (data) => { try { return JSON.parse(data); } catch { return undefined; } };
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+/**
+ * Wait for the Router's `event: startup-state` `{"state":"ready"}` on one
+ * stream. Input is refused with 409 while the runtime is `starting`
+ * (runtimeRoutes.js:304-306), and the DPU process is not attributable yet.
+ * Fails on `failed`, an SSE `close`, a transport end, or the bounded deadline;
+ * it never infers readiness from elapsed time or from a successful request.
+ */
+export async function waitForStartupReady(handle, { ms = webchatProbe.readyMs, pollMs = 25 } = {}) {
+    const deadline = Date.now() + ms;
+    for (;;) {
+        const events = handle.events();
+        const states = events.filter(e => e.event === 'startup-state').map(e => parseData(e.data)?.state);
+        if (states.includes('failed')) return { ok: false, reason: 'failed' };
+        if (events.some(e => e.event === 'close')) return { ok: false, reason: 'closed' };
+        if (states.at(-1) === 'ready') return { ok: true };
+        if (handle.ended?.()) return { ok: false, reason: 'stream-ended' };
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) return { ok: false, reason: 'timeout' };
+        await sleep(Math.min(pollMs, remaining));
+    }
+}
 export const isDpuAck = event => event.event === 'message' && parseData(event.data) === DPU_UNSUPPORTED_REPLY;
 export const isUserMessage = marker => event => event.event === 'user-message' && parseData(event.data)?.message?.text === marker;
 const count = (handle, predicate) => handle.events().filter(predicate).length;
@@ -160,24 +203,48 @@ function argvOf(dump) { return String(dump).split('\x1f').filter(Boolean); }
  * matches the launch value on the --authz-probe flag exactly (or by prefix for
  * removal), and returns pid, kernel start time (/proc/<pid>/stat field 22) and
  * the router-issued --sso-user-id. An unreadable environment is an error.
+ *
+ * One narrow exception exists for owned cleanup: with `tolerateOwnedExit` and a
+ * prefix match (the caller's own nonce), a process listed moments earlier may
+ * exit before its environment is read. That is accepted only when the read
+ * failed with the kernel's missing-entry error for that exact pid AND a fresh
+ * listing shows the same pid@start is gone. The vanished identities are
+ * returned on `result.vanished`; any other failure, a still-present process, a
+ * non-prefix lookup or a census (no tolerance flag) stays an error.
  */
 export function dpuProcessInspector({ boxId, container, run = (args) => execFileSync('podman', args, { encoding: 'utf8', timeout: 30000, maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }) }) {
     assert.match(String(boxId), /^[a-f0-9]{64}$/, 'Pinned Box id required');
     assert.match(String(container), /^ploinky_AchillesIDE_dpuAgent_[A-Za-z0-9_.-]+$/, 'Captured DPU container name required');
     const inContainer = (...cmd) => run(['exec', boxId, 'podman', 'exec', container, ...cmd]);
     const listing = 'for d in /proc/[0-9]*; do [ -r "$d/cmdline" ] || continue; printf "%s\\t%s\\t" "${d#/proc/}" "$(cut -d" " -f22 "$d/stat" 2>/dev/null)"; tr "\\000" "\\037" < "$d/cmdline"; printf "\\n"; done';
-    return async (value, { prefix = false } = {}) => {
-        const rows = inContainer('sh', '-c', listing).split('\n').map(line => line.split('\t')).filter(parts => parts.length === 3);
+    const listRows = () => inContainer('sh', '-c', listing).split('\n').map(line => line.split('\t')).filter(parts => parts.length === 3);
+    const isMissingEntry = (error, pid) => {
+        const text = `${error?.stderr || ''}\n${error?.message || ''}`;
+        return new RegExp(`/proc/${pid}/environ: No such file or directory`).test(text);
+    };
+    return async (value, { prefix = false, tolerateOwnedExit = false } = {}) => {
+        const rows = listRows();
         const flag = `--${webchatProbe.launchKey}=`;
-        return rows.map(([pid, start, dump]) => ({ pid: Number(pid), start: String(start).trim(), argv: argvOf(dump) }))
+        const vanished = [];
+        const found = rows.map(([pid, start, dump]) => ({ pid: Number(pid), start: String(start).trim(), argv: argvOf(dump) }))
             .filter(p => Number.isInteger(p.pid) && p.start && p.argv[0]?.split('/').pop() === webchatProbe.dpuEntry[0] && p.argv[1] === webchatProbe.dpuEntry[1])
             .filter(p => p.argv.some(a => a.startsWith(flag) && (prefix ? a.slice(flag.length).startsWith(value) : a.slice(flag.length) === value)))
-            .map(p => {
-                const environ = inContainer('cat', `/proc/${p.pid}/environ`);
+            .flatMap(p => {
+                let environ;
+                try { environ = inContainer('cat', `/proc/${p.pid}/environ`); }
+                catch (error) {
+                    if (!(tolerateOwnedExit && prefix) || !isMissingEntry(error, p.pid)) throw error;
+                    const stillThere = listRows().some(([pid, start]) => Number(pid) === p.pid && String(start).trim() === p.start);
+                    assert.equal(stillThere, false, `Process ${p.pid} environment is unreadable but the process is still present`);
+                    vanished.push(`${p.pid}@${p.start}`);
+                    return [];
+                }
                 assert.ok(environ.length > 0, 'Process environment must be readable for confinement checks');
                 const ids = p.argv.filter(a => a.startsWith('--sso-user-id=')).map(a => a.slice('--sso-user-id='.length));
-                return { pid: p.pid, start: p.start, ssoUserId: ids.length === 1 ? ids[0] : null, args: p.argv.join(' '), environ };
+                return [{ pid: p.pid, start: p.start, ssoUserId: ids.length === 1 ? ids[0] : null, args: p.argv.join(' '), environ }];
             });
+        found.vanished = vanished;
+        return found;
     };
 }
 
@@ -185,7 +252,7 @@ const identity = p => `${p.pid}@${p.start}`;
 
 export async function runWebchatProbes(ctx, { openStream = openEventStream, inspectProcesses = null, nonce = ctx.prefix, timing = {} } = {}) {
     const { agent, launchKey, cap } = webchatProbe;
-    const { waitMs = webchatProbe.waitMs, settleMs = 1000, removalMs = 120000, pollMs = 2000 } = timing;
+    const { waitMs = webchatProbe.waitMs, settleMs = 1000, removalMs = 120000, pollMs = 2000, readyMs = webchatProbe.readyMs, readyPollMs = 25 } = timing;
     const shared = `${nonce}-shared`;
     const tabId = `${nonce}-tab`;
     const query = (value = shared, extra = '') => `agent=${agent}&${launchKey}=${encodeURIComponent(value)}&tabId=${encodeURIComponent(tabId)}${extra}`;
@@ -208,11 +275,18 @@ export async function runWebchatProbes(ctx, { openStream = openEventStream, insp
         }
         return byPrincipal;
     };
+    // Owned cleanup begins when the probe closes its own streams. Only after that
+    // may removal polling accept a nonce-owned process exiting under inspection.
+    let cleanupBegan = false;
+    const closeOwnedStreams = () => { cleanupBegan = true; for (const s of streams) s.close(); };
     const waitRemoved = async () => {
+        assert.ok(cleanupBegan, 'Removal polling starts only after the owned streams were closed');
         const deadline = Date.now() + removalMs;
         let remaining;
         do {
-            remaining = (await processes(nonce, { prefix: true })).length;
+            const list = await processes(nonce, { prefix: true, tolerateOwnedExit: true });
+            for (const identity of list.vanished || []) observe({ step: 'removal', exitedDuringInspection: identity });
+            remaining = list.length;
             if (!remaining) return 0;
             await new Promise(r => setTimeout(r, pollMs));
         } while (Date.now() < deadline);
@@ -221,14 +295,21 @@ export async function runWebchatProbes(ctx, { openStream = openEventStream, insp
     // Armed before any runtime exists, so failure paths are verified too:
     // close every owned stream, then require every test-owned runtime gone.
     ctx.cleanup(async () => {
-        for (const s of streams) s.close();
+        closeOwnedStreams();
         assert.equal(await waitRemoved(), 0, 'Test-owned WebChat runtimes remained after cleanup');
     });
     // Every GET /stream creates runtime state, so each one passes the ownership guard first.
-    const open = async (actor, value, extra) => {
+    // A stream that will receive input or be censused must first report
+    // `startup-state: ready`; failure, close, end and the deadline all fail.
+    const open = async (actor, value, extra, { ready = true } = {}) => {
         await ctx.guard();
         const handle = await openStream(ctx, actor, `/webchat/stream?${query(value, extra)}`);
         streams.push(handle);
+        if (ready && handle.status === 200) {
+            const outcome = await waitForStartupReady(handle, { ms: readyMs, pollMs: readyPollMs });
+            observe({ step: 'startup', actor, ready: outcome.ok, ...(outcome.ok ? {} : { reason: outcome.reason }) });
+            assert.ok(outcome.ok, `WebChat runtime did not become ready (${outcome.reason})`);
+        }
         return handle;
     };
     const envelope = text => ({ text, presentation: { visible: true } });
@@ -365,11 +446,11 @@ export async function runWebchatProbes(ctx, { openStream = openEventStream, insp
     await ctx.check('u6:webchat-cap:userA', async () => {
         // The shared runtime is one of A's three; two more connected runtimes reach the bound.
         for (let i = 1; i < cap; i++) {
-            const handle = await open('userA', `${nonce}-slot-${i}`);
+            const handle = await open('userA', `${nonce}-slot-${i}`, '', { ready: false });
             assert.equal(handle.status, 200, `Owned runtime ${i + 1} must open`);
             slots.push(handle);
         }
-        const fourth = await open('userA', `${nonce}-slot-${cap}`);
+        const fourth = await open('userA', `${nonce}-slot-${cap}`, '', { ready: false });
         assert.equal(fourth.status, 429, 'The fourth connected runtime must be refused with 429');
         fourth.close();
         capped = true;
@@ -378,7 +459,7 @@ export async function runWebchatProbes(ctx, { openStream = openEventStream, insp
         assert.ok(capped && identities.userB, 'Cap control and B identity are required');
         slots[0].close();
         await new Promise(r => setTimeout(r, settleMs));
-        const replacement = await open('userA', `${nonce}-slot-replacement`);
+        const replacement = await open('userA', `${nonce}-slot-replacement`, '', { ready: false });
         assert.equal(replacement.status, 200, 'An idle runtime must be replaced');
         slots.push(replacement);
         const now = await owned();
@@ -387,7 +468,7 @@ export async function runWebchatProbes(ctx, { openStream = openEventStream, insp
     });
 
     await ctx.check('u6:webchat-runtimes-removed', async () => {
-        for (const s of streams) s.close();
+        closeOwnedStreams();
         assert.equal(await waitRemoved(), 0, 'Every test-owned WebChat runtime must be removed');
     });
 }
