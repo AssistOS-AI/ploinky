@@ -15,6 +15,7 @@ import { evaluateRequiredCapability } from './requiredCapability.js';
 import { isRouteMount } from '../utils/routeMounts.js';
 import { manifestWebchatDeclaration, webchatRouteProvenance } from '../webchat/commandResolver.js';
 import { edgeWebchatTargets } from '../../sandbox/edgeGeneration.js';
+import { admitPublicMcpTarget } from '../mcp-proxy/sessionOwnership.mjs';
 import {
     appendLog,
     appendSetCookie,
@@ -1019,7 +1020,12 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext, 
         sendJson(res, 503, { ok: false, error: 'router_surface_owner_unconfigured' });
         return { ok: false, error: 'router_surface_owner_unconfigured' };
     }
-    if (authContext.mode === 'none') return { ok: true };
+    if (authContext.mode === 'none') {
+        if (authContext.record && authContext.routeKey && authContext.policy?.mode === 'none') {
+            admitPublicMcpTarget(req, authContext.serviceRouteKey || authContext.routeKey);
+        }
+        return { ok: true };
+    }
     if (authContext.mode === 'sso' && !authService.isConfigured()) {
         sendJson(res, 503, { ok: false, error: 'sso_not_configured' });
         return { ok: false, error: 'sso_not_configured' };
@@ -1084,15 +1090,7 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext, 
         appendLog('auth_missing_cookie', { path: parsedUrl.pathname });
         return respondUnauthenticated(req, res, parsedUrl, authContext, options);
     }
-    let session = await authService.validateSession(sessionId);
-    if (authContext.mode === 'sso' && (!session || (session.expiresAt && Date.now() > session.expiresAt))) {
-        try {
-            await authService.refreshSession(sessionId);
-        } catch (err) {
-            appendLog('auth_refresh_failed', { error: err?.message || String(err) });
-        }
-        session = authService.getSession(sessionId);
-    }
+    const session = await authService.validateSession(sessionId);
     if (!session) {
         appendLog('auth_session_invalid', { sessionId: '[redacted]', mode: authContext.mode });
         return respondUnauthenticated(req, res, parsedUrl, authContext, options);

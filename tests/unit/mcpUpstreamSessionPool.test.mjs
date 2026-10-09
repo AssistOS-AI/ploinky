@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { createMcpSessionOwner } from '../../cli/server/mcp-proxy/sessionOwnership.mjs';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import { EventEmitter, once } from 'node:events';
@@ -767,7 +768,8 @@ function loadProxyFixture() {
         fsSync.writeFileSync(path.join(ploinkyDir, 'data', 'router-security', 'policy-state.json'), JSON.stringify({
             schema: 'router-policy',
             httpRoutes: [],
-            mcpTools: [{ agent: 'echoAgent', tool: 'actor', access: 'authenticated', enabled: true }],
+            mcpTools: ['echoAgent', 'sdkColdSchemaAgent', 'sdkWarmSchemaAgent']
+                .map(agent => ({ agent, tool: 'actor', access: 'authenticated', enabled: true })),
         }));
         process.chdir(workspace);
         process.env.PLOINKY_MASTER_KEY = '7'.repeat(64);
@@ -786,20 +788,20 @@ function loadProxyFixture() {
     return proxyFixturePromise;
 }
 
-function proxyRoute(port, lease, manifest) {
-    const route = { repo: 'PoolTest', agent: 'echoAgent', container: PROXY_CONTAINER, hostPort: port };
+function proxyRoute(port, lease, manifest, agentName = 'echoAgent') {
+    const route = { repo: 'PoolTest', agent: agentName, container: PROXY_CONTAINER, hostPort: port };
     const snapshot = {
-        routing: { routes: { echoAgent: route } },
+        routing: { routes: { [agentName]: route } },
         agents: { [PROXY_CONTAINER]: {
-            type: 'agent', repoName: 'PoolTest', agentName: 'echoAgent',
+            type: 'agent', repoName: 'PoolTest', agentName,
             containerId: 'd'.repeat(64), instanceId: 'proxy-instance', enableGeneration: 'proxy-enable',
         } },
-        ...(manifest === undefined ? {} : { manifests: { echoAgent: manifest } }),
+        ...(manifest === undefined ? {} : { manifests: { [agentName]: manifest } }),
     };
     const routePlan = {
         ok: true,
         kind: 'agent-root',
-        routeKey: 'echoAgent',
+        routeKey: agentName,
         lease: { id: lease, snapshot },
         target: { hostname: '127.0.0.1', hostPort: port },
         route,
@@ -808,9 +810,10 @@ function proxyRoute(port, lease, manifest) {
     return { route, routePlan, key: poolKeyForRoutePlan(routePlan) };
 }
 
-function openRouterSession(proxy) {
+function openRouterSession(proxy, { user = PROXY_USER, login = 'pool-browser-login', agentName = 'echoAgent' } = {}) {
     const sessionId = crypto.randomUUID();
-    proxy.agentSessionStore.set(sessionId, { agentName: 'echoAgent', baseUrl: 'http://127.0.0.1/mcp' });
+    const owner = createMcpSessionOwner({ user, authMode: 'sso', sessionId: login }, 'agent', agentName);
+    proxy.agentSessionStore.set(sessionId, { agentName, baseUrl: 'http://127.0.0.1/mcp', owner });
     return sessionId;
 }
 
@@ -826,12 +829,15 @@ function toolsCall(label) {
     return { jsonrpc: '2.0', id: proxyRpcId, method: 'tools/call', params: { name: 'actor', arguments: { label } } };
 }
 
-async function proxyCall(proxy, { route, routePlan, sessionId, body, pool, waitForAgentReady, beforeDial = () => true, agent = null }) {
+async function proxyCall(proxy, { route, routePlan, sessionId, body, pool, waitForAgentReady, beforeDial = () => true, agent = null,
+    user = PROXY_USER, login = 'pool-browser-login', agentName = 'echoAgent' }) {
     const req = Readable.from([Buffer.from(typeof body === 'string' ? body : JSON.stringify(body), 'utf8')]);
     req.method = 'POST';
-    req.url = '/echoAgent/mcp';
+    req.url = `/${agentName}/mcp`;
     req.headers = { host: 'localhost', 'content-type': 'application/json', 'mcp-session-id': sessionId };
-    req.user = PROXY_USER;
+    req.user = user;
+    req.authMode = 'sso';
+    req.sessionId = login;
     if (agent) req.agent = agent;
     let finish;
     const done = new Promise((resolve) => { finish = resolve; });
@@ -841,7 +847,7 @@ async function proxyCall(proxy, { route, routePlan, sessionId, body, pool, waitF
         writeHead(statusCode) { this.statusCode = statusCode; },
         end(chunk = '') { this.body += String(chunk); finish(); },
     };
-    await proxy.handleAgentMcpRequest(req, res, route, 'echoAgent', { beforeDial, routePlan, pool, waitForAgentReady });
+    await proxy.handleAgentMcpRequest(req, res, route, agentName, { beforeDial, routePlan, pool, waitForAgentReady });
     await done;
     return { status: res.statusCode, json: JSON.parse(res.body), sessionStoreSize: proxy.agentSessionStore.size };
 }
@@ -851,6 +857,342 @@ function proxyToolPayload(json) {
     assert.equal(json.result?.isError, undefined, JSON.stringify(json));
     return JSON.parse(json.result.content[0].text);
 }
+
+async function browserStoreRequest(handler, sessionId, body, method = 'POST') {
+    const req = Readable.from([Buffer.from(JSON.stringify(body || {}))]);
+    Object.assign(req, { method, url: '/mcp', user: PROXY_USER, authMode: 'sso', sessionId: 'pool-browser-login',
+        headers: { host: 'localhost', ...(sessionId ? { 'mcp-session-id': sessionId } : {}) } });
+    let finish;
+    const done = new Promise(resolve => { finish = resolve; });
+    const res = { status: 0, headers: {}, body: '', writeHead(status, headers = {}) { this.status = status; this.headers = headers; },
+        end(body = '') { this.body = String(body); finish(); } };
+    await handler(req, res);
+    await done;
+    return { ...res, json: res.body ? JSON.parse(res.body) : null };
+}
+
+test('browser session deletion during aggregate discovery prevents the later tool dispatch', async (t) => {
+    await loadProxyFixture();
+    const { handleRouterMcp } = await import('../../cli/server/routerHandlers.js');
+    let hold = false;
+    let started;
+    const entered = new Promise(resolve => { started = resolve; });
+    let release;
+    const held = new Promise(resolve => { release = resolve; });
+    t.after(() => release());
+    const upstream = await startFakeUpstream(t, { onRpc: async ({ res, message }) => {
+        if (message?.method !== 'tools/list') return false;
+        if (hold) { started(); await held; }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { tools: [{ name: 'actor', inputSchema: { type: 'object' } }] } }));
+        return true;
+    } });
+    const { routePlan } = proxyRoute(upstream.port, 'aggregate-delete');
+    routePlan.lease.commit = () => true;
+    const handle = (req, res) => handleRouterMcp(req, res, routePlan);
+    const initialize = () => browserStoreRequest(handle, null, { jsonrpc: '2.0', id: 1, method: 'initialize' });
+    const session = (await initialize()).headers['mcp-session-id'];
+    assert.ok(session);
+    assert.equal((await browserStoreRequest(handle, session, toolsCall('owned'))).json.result.content[0].text, 'fake-ok');
+    hold = true;
+    const pending = browserStoreRequest(handle, session, toolsCall('deleted'));
+    await entered;
+    assert.equal((await browserStoreRequest(handle, session, null, 'DELETE')).status, 204);
+    release();
+    const refused = await pending;
+    assert.equal(refused.json.error.message, 'Missing or invalid MCP session');
+    assert.equal(refused.headers['mcp-session-id'], undefined);
+    assert.equal(count(upstream.log, row => row.rpc === 'tools/call'), 1, 'only the owned control dispatched');
+});
+
+test('browser session deletion while a pool slot is pending prevents mint and dispatch', async (t) => {
+    const { proxy } = await loadProxyFixture();
+    const held = [];
+    let allHeld;
+    const entered = new Promise(resolve => { allHeld = resolve; });
+    const upstream = await startFakeUpstream(t, { onRpc: async ({ res, message }) => {
+        if (message?.method !== 'tools/call' || message.params?.name !== 'hold') return false;
+        held.push(() => {
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: {} }));
+        });
+        if (held.length === 8) allHeld();
+        return true;
+    } });
+    t.after(() => held.forEach(release => release()));
+    const pool = newPool(t);
+    const { route, routePlan, key } = proxyRoute(upstream.port, 'browser-delete-queue');
+    const sessionId = openRouterSession(proxy);
+    const call = (label) => proxyCall(proxy, { route, routePlan, sessionId, pool, waitForAgentReady: async () => true, body: toolsCall(label) });
+    assert.equal((await call('owned')).json.result.content[0].text, 'fake-ok');
+    const busy = Array.from({ length: 8 }, () => pool.request({ key, hostPort: upstream.port, method: 'tools/call',
+        params: { name: 'hold' }, beforeDial: () => true, headers: null }));
+    await entered;
+    const request = pool.request.bind(pool);
+    let queued;
+    const waiting = new Promise(resolve => { queued = resolve; });
+    let mints = 0;
+    pool.request = options => {
+        const headers = options.headers;
+        const result = request({ ...options, headers: () => { mints += 1; return typeof headers === 'function' ? headers() : headers; } });
+        queued();
+        return result;
+    };
+    const pending = call('deleted');
+    await waiting;
+    await new Promise(resolve => setImmediate(resolve));
+    const handle = (req, res) => proxy.handleAgentMcpRequest(req, res, route, 'echoAgent', { routePlan });
+    assert.equal((await browserStoreRequest(handle, sessionId, null, 'DELETE')).status, 204);
+    for (const release of held.splice(0)) release();
+    const refused = await pending;
+    await Promise.all(busy);
+    assert.equal(refused.json.error.message, 'Missing or invalid MCP session');
+    assert.equal(mints, 0);
+    assert.equal(count(upstream.log, row => row.rpc === 'tools/call'), 9, 'only the owned control and eight admitted calls dispatched');
+});
+
+const PROXY_USER_B = { id: 'bob', username: 'bob', roles: ['user'] };
+
+// Fake upstream whose first initialize is held until release(); every
+// tools/call label and every DELETE session id is recorded.
+async function startHeldInitializeUpstream(t) {
+    let entered;
+    const initializeEntered = new Promise(resolve => { entered = resolve; });
+    let release;
+    const released = new Promise(resolve => { release = resolve; });
+    t.after(() => release());
+    const toolLabels = [];
+    let initializes = 0;
+    const upstream = await startFakeUpstream(t, { onRpc: async ({ message }) => {
+        if (message?.method === 'tools/call') toolLabels.push(message.params?.arguments?.label);
+        if (message?.method === 'initialize' && ++initializes === 1) {
+            entered();
+            await released;
+        }
+        return false;
+    } });
+    const deletes = () => upstream.log.filter(row => row.httpMethod === 'DELETE').map(row => row.sessionId);
+    const posts = () => upstream.log.filter(row => row.httpMethod === 'POST').map(row => row.rpc);
+    return { upstream, initializeEntered, release: () => release(), toolLabels, deletes, posts };
+}
+
+async function warmEchoAgentToolSchemas(t, proxy) {
+    // A tools/call canonicalizes its arguments through a cached tools/list; warm
+    // that cache on a separate upstream and pool so the cold key under test
+    // sees only its own session open and the admitted call.
+    const warm = await startFakeUpstream(t);
+    const warmPool = newPool(t);
+    const { route, routePlan } = proxyRoute(warm.port, `schema-warm-${crypto.randomUUID()}`);
+    const sessionId = openRouterSession(proxy);
+    const warmed = await proxyCall(proxy, { route, routePlan, sessionId, pool: warmPool,
+        waitForAgentReady: async () => true, body: toolsCall('warm') });
+    assert.equal(warmed.json.result.content[0].text, 'fake-ok');
+    proxy.agentSessionStore.delete(sessionId);
+}
+
+test('cold pooled key: a deleted owner during the shared open fails alone and the other owner dispatches', { timeout: 10000 }, async (t) => {
+    const { proxy } = await loadProxyFixture();
+    await warmEchoAgentToolSchemas(t, proxy);
+    const held = await startHeldInitializeUpstream(t);
+    const pool = newPool(t);
+    const { route, routePlan } = proxyRoute(held.upstream.port, 'cold-key-two-owner');
+    const sessionA = openRouterSession(proxy);
+    const sessionB = openRouterSession(proxy, { user: PROXY_USER_B, login: 'pool-browser-login-b' });
+    const mints = new Map();
+    const request = pool.request.bind(pool);
+    let requests = 0;
+    let bothWaiting;
+    const waiting = new Promise(resolve => { bothWaiting = resolve; });
+    pool.request = (options) => {
+        const label = options.params?.arguments?.label;
+        const headers = options.headers;
+        const result = request({ ...options, headers: () => {
+            mints.set(label, (mints.get(label) || 0) + 1);
+            return typeof headers === 'function' ? headers() : headers;
+        } });
+        if (++requests === 2) bothWaiting();
+        return result;
+    };
+    const ready = async () => true;
+    const pendingA = proxyCall(proxy, { route, routePlan, sessionId: sessionA, pool, waitForAgentReady: ready,
+        body: toolsCall('owner-a') });
+    await held.initializeEntered;
+    const pendingB = proxyCall(proxy, { route, routePlan, sessionId: sessionB, pool, waitForAgentReady: ready,
+        body: toolsCall('owner-b'), user: PROXY_USER_B, login: 'pool-browser-login-b' });
+    await waiting;
+    const handle = (req, res) => proxy.handleAgentMcpRequest(req, res, route, 'echoAgent', { routePlan });
+    assert.equal((await browserStoreRequest(handle, sessionA, null, 'DELETE')).status, 204);
+    held.release();
+    const [refused, admitted] = await Promise.all([pendingA, pendingB]);
+    assert.equal(admitted.json.error, undefined, JSON.stringify(admitted.json));
+    assert.equal(admitted.json.result.content[0].text, 'fake-ok');
+    assert.equal(refused.json.error.message, 'Missing or invalid MCP session');
+    assert.equal(mints.get('owner-a') || 0, 0, 'the deleted owner minted nothing');
+    assert.equal(mints.get('owner-b'), 1);
+    assert.deepEqual(held.posts(), ['initialize', 'notifications/initialized', 'tools/call']);
+    assert.deepEqual(held.toolLabels, ['owner-b']);
+    assert.deepEqual(held.deletes(), [], 'the shared upstream session stays open');
+    assert.equal(pool.snapshot().counters.sessionsOpened, 1);
+    proxy.agentSessionStore.delete(sessionB);
+});
+
+test('pool: a caller beforeDial error after initialize evicts and DELETEs the allocated session', { timeout: 10000 }, async (t) => {
+    const upstream = await startFakeUpstream(t);
+    const pool = newPool(t);
+    const key = keyFor({ port: upstream.port, lease: 'caller-dial-error' });
+    let mints = 0;
+    let dials = 0;
+    const call = (beforeDial) => pool.request({ key, hostPort: upstream.port, method: 'tools/call',
+        params: { name: 'x', arguments: {} }, headers: () => { mints += 1; return { authorization: 'Bearer test-token' }; },
+        beforeDial });
+    await assert.rejects(call(() => {
+        dials += 1;
+        if (dials === 2) throw new Error('caller refused after initialize');
+        return true;
+    }), /caller refused after initialize/);
+    const first = `${upstream.sessionId}-1`;
+    const second = `${upstream.sessionId}-2`;
+    assert.ok(await waitFor(() => upstream.log.some(row => row.httpMethod === 'DELETE' && row.sessionId === first)),
+        'the allocated upstream session is released');
+    assert.equal(pool.snapshot().entries.some(entry => entry.sessionId === first), false);
+    assert.equal(mints, 0);
+    const message = await call(() => true);
+    assert.equal(message.result.content[0].text, 'fake-ok');
+    assert.deepEqual(upstream.log.filter(row => row.httpMethod === 'POST').map(row => [row.rpc, row.sessionId]), [
+        ['initialize', ''],
+        ['initialize', ''],
+        ['notifications/initialized', second],
+        ['tools/call', second],
+    ]);
+    assert.equal(count(upstream.log, row => row.httpMethod === 'DELETE'), 1);
+    assert.equal(pool.snapshot().counters.sessionsOpened, 1);
+});
+
+test('pool: a per-request dispatch guard refusal sends and mints nothing and keeps the session', { timeout: 10000 }, async (t) => {
+    const upstream = await startFakeUpstream(t);
+    const pool = newPool(t);
+    const key = keyFor({ port: upstream.port, lease: 'dispatch-guard' });
+    let mints = 0;
+    let guards = 0;
+    const order = [];
+    const call = (beforeDispatch) => pool.request({ key, hostPort: upstream.port, method: 'tools/call',
+        params: { name: 'x', arguments: {} },
+        headers: () => { mints += 1; order.push('mint'); return { authorization: 'Bearer test-token' }; },
+        beforeDial: () => { order.push('dial'); return true; },
+        beforeDispatch, ensureReady: async () => true });
+    await call(() => { guards += 1; order.push('guard'); });
+    const session = `${upstream.sessionId}-1`;
+    assert.deepEqual(order, ['dial', 'dial', 'dial', 'guard', 'mint'], 'the guard never runs during the open');
+    // Even an error shaped like a retryable pool failure is the caller's own:
+    // no eviction, no retry, no mint, no POST.
+    await assert.rejects(call(() => {
+        guards += 1;
+        throw Object.assign(new Error('owner session ended'), { code: 'UPSTREAM_SESSION_LOST', retryable: true });
+    }), /owner session ended/);
+    assert.equal(mints, 1);
+    assert.equal(guards, 2);
+    assert.equal(count(upstream.log, row => row.rpc === 'tools/call'), 1);
+    assert.equal(count(upstream.log, row => row.httpMethod === 'DELETE'), 0);
+    assert.equal(pool.snapshot().counters.retries, 0);
+    assert.equal(pool.snapshot().counters.evictions, 0);
+    assert.equal(pool.snapshot().entries[0].sessionId, session);
+    assert.equal(pool.isReady(key), true);
+    await call(() => { guards += 1; });
+    assert.equal(count(upstream.log, row => row.rpc === 'initialize'), 1);
+    assert.equal(count(upstream.log, row => row.rpc === 'tools/call' && row.sessionId === session), 2);
+});
+
+// The tools/call argument canonicalization reads a module-level tool-schema
+// cache keyed by agent name. A distinct agent name per variant makes the cache
+// state deterministic. Cold: no tools/list was ever served for the name, so the
+// shared client's listTools owns the held initialize. Warm: a priming call
+// first makes the upstream serve tools/list for the name (observed in its
+// request log), so the canonicalization skips tools/list and the per-call
+// client owns the held initialize. In both, the held upstream sees only the
+// one initialize and the one DELETE.
+async function sdkGuardRefusalRelease(t, { agentName, warm }) {
+    const { proxy } = await loadProxyFixture();
+    const held = await startHeldInitializeUpstream(t);
+    const { route, routePlan } = proxyRoute(held.upstream.port, `sdk-guard-release-${agentName}`, undefined, agentName);
+    let warmRpcs = null;
+    if (warm) {
+        // A valid tools/list result is required: the SDK rejects `{}`, and
+        // canonicalization swallows that error, leaving the cache cold.
+        const warmUpstream = await startFakeUpstream(t, { onRpc: async ({ res, message }) => {
+            if (message?.method !== 'tools/list') return false;
+            const data = Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: {
+                tools: [{ name: 'actor', inputSchema: { type: 'object', properties: { label: { type: 'string' } } } }],
+            } }));
+            res.writeHead(200, { 'content-type': 'application/json', 'content-length': data.length });
+            res.end(data);
+            return true;
+        } });
+        const warmRoute = proxyRoute(warmUpstream.port, `schema-warm-${agentName}`, undefined, agentName);
+        const warmSession = openRouterSession(proxy, { agentName });
+        const warmed = await proxyCall(proxy, { route: warmRoute.route, routePlan: warmRoute.routePlan,
+            sessionId: warmSession, pool: null, waitForAgentReady: async () => true, agentName,
+            body: toolsCall('warm') });
+        assert.equal(warmed.json.result?.content?.[0]?.text, 'fake-ok', JSON.stringify(warmed.json));
+        proxy.agentSessionStore.delete(warmSession);
+        warmRpcs = warmUpstream.log.filter(row => row.httpMethod === 'POST').map(row => row.rpc);
+    }
+    const sessionId = openRouterSession(proxy, { agentName });
+    const pending = proxyCall(proxy, { route, routePlan, sessionId, pool: null, waitForAgentReady: async () => true,
+        agentName, body: toolsCall('sdk-deleted') });
+    await held.initializeEntered;
+    const handle = (req, res) => proxy.handleAgentMcpRequest(req, res, route, agentName, { routePlan });
+    assert.equal((await browserStoreRequest(handle, sessionId, null, 'DELETE')).status, 204);
+    held.release();
+    const refused = await pending;
+    assert.equal(refused.json.error.message, 'Missing or invalid MCP session');
+    const allocated = `${held.upstream.sessionId}-1`;
+    assert.ok(await waitFor(() => held.deletes().length > 0), 'the allocated upstream session is released');
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.deepEqual(held.deletes(), [allocated]);
+    assert.deepEqual(held.posts(), ['initialize']);
+    const initialize = held.upstream.log.find(row => row.rpc === 'initialize');
+    const release = held.upstream.log.find(row => row.httpMethod === 'DELETE');
+    return { warmRpcs, initializeAuthorization: initialize.authorization, releaseAuthorization: release.authorization };
+}
+
+test('proxy SDK path (cold schema cache): the shared client owns the open and its refused session is released once', { timeout: 10000 }, async (t) => {
+    const { warmRpcs, initializeAuthorization, releaseAuthorization } = await sdkGuardRefusalRelease(t,
+        { agentName: 'sdkColdSchemaAgent', warm: false });
+    assert.equal(warmRpcs, null, 'no tools/list was ever served for this agent name');
+    assert.equal(initializeAuthorization, '', 'the shared tools/list client sends no minted token');
+    assert.equal(releaseAuthorization, '', 'its release DELETE sends no minted token');
+});
+
+test('proxy SDK path (warm schema cache): the per-call client owns the open and its refused session is released once', { timeout: 10000 }, async (t) => {
+    const { warmRpcs, initializeAuthorization, releaseAuthorization } = await sdkGuardRefusalRelease(t,
+        { agentName: 'sdkWarmSchemaAgent', warm: true });
+    assert.ok(warmRpcs.includes('tools/list'), 'the priming call served tools/list');
+    assert.match(initializeAuthorization, /^Bearer .+/, 'the per-call client owns the held initialize');
+    assert.match(releaseAuthorization, /^Bearer .+/, 'the per-call client releases with the minted token');
+});
+
+test('aggregate: a guard refusal of notifications/initialized releases the allocated session once', { timeout: 10000 }, async (t) => {
+    await loadProxyFixture();
+    const { handleRouterMcp } = await import('../../cli/server/routerHandlers.js');
+    const held = await startHeldInitializeUpstream(t);
+    const { routePlan } = proxyRoute(held.upstream.port, 'aggregate-guard-release');
+    routePlan.lease.commit = () => true;
+    const handle = (req, res) => handleRouterMcp(req, res, routePlan);
+    const session = (await browserStoreRequest(handle, null, { jsonrpc: '2.0', id: 1, method: 'initialize' }))
+        .headers['mcp-session-id'];
+    assert.ok(session);
+    const pending = browserStoreRequest(handle, session, toolsCall('aggregate-deleted'));
+    await held.initializeEntered;
+    assert.equal((await browserStoreRequest(handle, session, null, 'DELETE')).status, 204);
+    held.release();
+    const refused = await pending;
+    assert.equal(refused.json.result, undefined, JSON.stringify(refused.json));
+    const allocated = `${held.upstream.sessionId}-1`;
+    assert.ok(await waitFor(() => held.deletes().length > 0), 'the allocated upstream session is released');
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.deepEqual(held.deletes(), [allocated]);
+    assert.deepEqual(held.posts(), ['initialize']);
+});
 
 test('B5-8: the readiness cache skips the probe while pooled calls succeed and is cleared by ECONNREFUSED', async (t) => {
     const { proxy, audience, secret } = await loadProxyFixture();
@@ -1618,6 +1960,8 @@ async function proxyNotification(proxy, { route, routePlan, sessionId, body, poo
     req.url = '/echoAgent/mcp';
     req.headers = { host: 'localhost', 'content-type': 'application/json', 'mcp-session-id': sessionId };
     req.user = PROXY_USER;
+    req.authMode = 'sso';
+    req.sessionId = 'pool-browser-login';
     let finish;
     const done = new Promise((resolve) => { finish = resolve; });
     const res = { statusCode: 0, body: '', writeHead(code) { this.statusCode = code; }, end(chunk = '') { this.body += String(chunk); finish(); } };

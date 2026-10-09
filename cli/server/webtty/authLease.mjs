@@ -58,9 +58,7 @@ export async function validateBrowserSessionLease(lease) {
             session = await sessionTokenService.getUserSession(lease.sessionId);
         } else if (typeof authService.validateSession === 'function') {
             session = await authService.validateSession(lease.sessionId);
-        } else {
-            session = authService.getSession(lease.sessionId);
-        }
+        } else return { ok: false, reason: 'validation_unavailable' };
     } catch (_) {
         return { ok: false, reason: 'validation_failed' };
     }

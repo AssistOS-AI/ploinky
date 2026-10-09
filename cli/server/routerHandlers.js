@@ -15,6 +15,7 @@ import { deriveAgentPrincipalId } from '../utils/security/agentIdentity.js';
 import { ROUTING_FILE } from '../utils/config.js';
 import { deriveSubkey } from '../utils/security/masterKey.js';
 import { mintUserDelegationGrant } from './mcp-proxy/userDelegationGrant.js';
+import { createMcpSessionOwner, inspectMcpSession, matchesMcpSessionOwner } from './mcp-proxy/sessionOwnership.mjs';
 
 const ROUTER_PROTOCOL_VERSION = '2025-06-18';
 const ROUTER_SERVER_INFO = { name: 'ploinky-router', version: '1.0.0' };
@@ -593,7 +594,7 @@ function commitAggregateLease(routePlan) {
     return routePlan?.lease?.commit?.() === true;
 }
 
-export function createAgentRouteEntries(routePlan) {
+export function createAgentRouteEntries(routePlan, { beforeDispatch = null } = {}) {
     const routes = routePlan?.lease?.snapshot?.routing?.routes;
     if (!routes || typeof routes !== 'object') {
         const error = new Error('active edge routing generation lease is required for aggregate MCP');
@@ -613,7 +614,8 @@ export function createAgentRouteEntries(routePlan) {
             port,
             baseUrl,
             beforeConnect,
-            client: createAgentClient(baseUrl, { beforeConnect }),
+            beforeDispatch,
+            client: createAgentClient(baseUrl, { beforeConnect, beforeDispatch }),
         });
     }
     return entries;
@@ -728,23 +730,17 @@ async function collectResources(entries) {
     return { resourcesByAgent, errors, failures };
 }
 
-function readSessionHeader(req) {
-    const value = req.headers['mcp-session-id'];
-    if (Array.isArray(value)) return value[0];
-    return typeof value === 'string' ? value : null;
-}
-
-function getSession(sessionId) {
+function getSession(sessionId, owner) {
     if (!sessionId) return null;
     const entry = routerSessions.get(sessionId);
-    if (!entry) return null;
+    if (!matchesMcpSessionOwner(entry, owner)) return null;
     entry.lastSeen = Date.now();
     return entry;
 }
 
-function startSession() {
+function startSession(owner) {
     const sessionId = randomUUID();
-    routerSessions.set(sessionId, { createdAt: Date.now(), lastSeen: Date.now() });
+    routerSessions.set(sessionId, { owner, createdAt: Date.now(), lastSeen: Date.now() });
     return sessionId;
 }
 
@@ -794,6 +790,7 @@ function buildToolRequestHeaders(req, agentName, toolName, toolArgs) {
 }
 
 async function callEntryTool(entry, toolName, args, req) {
+    entry.beforeDispatch?.();
     const requestHeaders = buildToolRequestHeaders(req, entry.agentName, toolName, args);
     if (!requestHeaders) {
         return await entry.client.callTool(toolName, args);
@@ -801,6 +798,7 @@ async function callEntryTool(entry, toolName, args, req) {
     const client = createAgentClient(entry.baseUrl, {
         requestHeaders,
         beforeConnect: entry.beforeConnect,
+        beforeDispatch: entry.beforeDispatch,
     });
     try {
         return await client.callTool(toolName, args);
@@ -810,6 +808,7 @@ async function callEntryTool(entry, toolName, args, req) {
 }
 
 async function readEntryResource(entry, uri, req) {
+    entry.beforeDispatch?.();
     const requestHeaders = buildToolRequestHeaders(req, entry.agentName, 'resources/read', { uri });
     if (!requestHeaders) {
         return await entry.client.readResource(uri);
@@ -817,6 +816,7 @@ async function readEntryResource(entry, uri, req) {
     const client = createAgentClient(entry.baseUrl, {
         requestHeaders,
         beforeConnect: entry.beforeConnect,
+        beforeDispatch: entry.beforeDispatch,
     });
     try {
         return await client.readResource(uri);
@@ -825,11 +825,11 @@ async function readEntryResource(entry, uri, req) {
     }
 }
 
-async function executeRouterCommand(command, payload = {}, req = null, routePlan = null) {
+async function executeRouterCommand(command, payload = {}, req = null, routePlan = null, beforeDispatch = null) {
     const normalized = canonicalCommand(command);
     let entries;
     try {
-        entries = createAgentRouteEntries(routePlan);
+        entries = createAgentRouteEntries(routePlan, { beforeDispatch });
     } catch (error) {
         return {
             statusCode: error?.statusCode || 503,
@@ -1050,20 +1050,37 @@ async function handleRouterJsonRpc(req, res, payload, routePlan) {
         return;
     }
 
-    const headerSessionId = readSessionHeader(req);
-    const hasValidSession = headerSessionId && getSession(headerSessionId);
+    const owner = createMcpSessionOwner(req, 'aggregate');
+    const admission = inspectMcpSession(routerSessions, req, owner);
+    const headerSessionId = admission.id;
+    if (admission.refused || !owner) {
+        const errors = messages.filter(message => Object.hasOwn(message || {}, 'id')).map(message => ({
+            jsonrpc: '2.0', id: message.id ?? null,
+            error: { code: -32000, message: 'Missing or invalid MCP session' },
+        }));
+        res.writeHead(errors.length ? 200 : 403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(errors.length ? (isBatch ? errors : errors[0]) : { error: 'Missing or invalid MCP session' }));
+        return;
+    }
+    const hasValidSession = headerSessionId && getSession(headerSessionId, owner);
     let sessionIdForResponse = hasValidSession ? headerSessionId : null;
 
     const responses = [];
 
     for (const message of messages) {
+        if (admission.entry && !getSession(headerSessionId, owner)) {
+            sessionIdForResponse = null;
+            responses.push({ jsonrpc: '2.0', id: message?.id ?? null,
+                error: { code: -32000, message: 'Missing or invalid MCP session' } });
+            continue;
+        }
         if (!message || typeof message !== 'object' || message.jsonrpc !== '2.0') {
             responses.push({ jsonrpc: '2.0', id: message?.id ?? null, error: { code: -32600, message: 'Invalid Request' } });
             continue;
         }
 
         if (message.method === 'initialize') {
-            const newSessionId = startSession();
+            const newSessionId = startSession(owner);
             sessionIdForResponse = newSessionId;
             responses.push({
                 jsonrpc: '2.0',
@@ -1083,12 +1100,12 @@ async function handleRouterJsonRpc(req, res, payload, routePlan) {
 
         if (message.method === 'notifications/initialized') {
             if (sessionIdForResponse) {
-                getSession(sessionIdForResponse);
+                getSession(sessionIdForResponse, owner);
             }
             continue;
         }
 
-        const activeSessionId = sessionIdForResponse && getSession(sessionIdForResponse) ? sessionIdForResponse : null;
+        const activeSessionId = sessionIdForResponse && getSession(sessionIdForResponse, owner) ? sessionIdForResponse : null;
         if (!activeSessionId) {
             responses.push({
                 jsonrpc: '2.0',
@@ -1098,21 +1115,26 @@ async function handleRouterJsonRpc(req, res, payload, routePlan) {
             continue;
         }
 
-        getSession(activeSessionId);
+        getSession(activeSessionId, owner);
+        const beforeDispatch = () => {
+            if (!getSession(activeSessionId, owner)) {
+                throw Object.assign(new Error('Missing or invalid MCP session'), { code: 'MCP_SESSION_INVALID' });
+            }
+        };
 
         try {
             let result;
             let rpcResultPayload = null;
             switch (message.method) {
                 case 'tools/list':
-                    result = await executeRouterCommand('list_tools', {}, req, routePlan);
+                    result = await executeRouterCommand('list_tools', {}, req, routePlan, beforeDispatch);
                     if (result.statusCode < 400) {
                         const tools = Array.isArray(result.body?.tools) ? result.body.tools : [];
                         rpcResultPayload = { tools };
                     }
                     break;
                 case 'resources/list':
-                    result = await executeRouterCommand('list_resources', {}, req, routePlan);
+                    result = await executeRouterCommand('list_resources', {}, req, routePlan, beforeDispatch);
                     if (result.statusCode < 400) {
                         const resources = Array.isArray(result.body?.resources) ? result.body.resources : [];
                         rpcResultPayload = { resources };
@@ -1141,7 +1163,7 @@ async function handleRouterJsonRpc(req, res, payload, routePlan) {
                     if (metaAgent && !commandPayload.agent) {
                         commandPayload.agent = metaAgent;
                     }
-                    result = await executeRouterCommand('tool', commandPayload, req, routePlan);
+                    result = await executeRouterCommand('tool', commandPayload, req, routePlan, beforeDispatch);
                     if (result.statusCode < 400) {
                         rpcResultPayload = result.body?.result;
                     }
@@ -1152,7 +1174,7 @@ async function handleRouterJsonRpc(req, res, payload, routePlan) {
                     if (params._meta && params._meta.router && typeof params._meta.router.agent === 'string' && params.agent === undefined) {
                         params.agent = params._meta.router.agent;
                     }
-                    result = await executeRouterCommand('resources/read', params, req, routePlan);
+                    result = await executeRouterCommand('resources/read', params, req, routePlan, beforeDispatch);
                     if (result.statusCode < 400) {
                         rpcResultPayload = result.body?.resource;
                     }
@@ -1163,7 +1185,7 @@ async function handleRouterJsonRpc(req, res, payload, routePlan) {
                     if (params._meta && params._meta.router && typeof params._meta.router.agent === 'string' && params.agent === undefined) {
                         params.agent = params._meta.router.agent;
                     }
-                    result = await executeRouterCommand('ping', params, req, routePlan);
+                    result = await executeRouterCommand('ping', params, req, routePlan, beforeDispatch);
                     if (result.statusCode < 400) {
                         rpcResultPayload = result.body?.result ?? {};
                     }
@@ -1174,7 +1196,11 @@ async function handleRouterJsonRpc(req, res, payload, routePlan) {
                     continue;
             }
 
-            if (result.statusCode >= 400) {
+            if (!getSession(activeSessionId, owner)) {
+                sessionIdForResponse = null;
+                responses.push({ jsonrpc: '2.0', id: message.id ?? null,
+                    error: { code: -32000, message: 'Missing or invalid MCP session' } });
+            } else if (result.statusCode >= 400) {
                 const messageText = result.body?.error || 'Router error';
                 responses.push({ jsonrpc: '2.0', id: message.id ?? null, error: { code: -32000, message: messageText } });
             } else {
@@ -1187,7 +1213,7 @@ async function handleRouterJsonRpc(req, res, payload, routePlan) {
     }
 
     const headers = { 'mcp-protocol-version': ROUTER_PROTOCOL_VERSION };
-    if (sessionIdForResponse) {
+    if (sessionIdForResponse && getSession(sessionIdForResponse, owner)) {
         headers['mcp-session-id'] = sessionIdForResponse;
     }
 
@@ -1211,8 +1237,12 @@ export async function handleRouterMcp(req, res, routePlan) {
     }
 
     if (method === 'DELETE') {
-        const sessionId = readSessionHeader(req);
-        endSession(sessionId);
+        const admission = inspectMcpSession(routerSessions, req, createMcpSessionOwner(req, 'aggregate'));
+        if (admission.refused) {
+            sendJson(res, 403, { error: 'Missing or invalid MCP session', code: 'MCP_SESSION_FORBIDDEN' });
+            return;
+        }
+        if (admission.entry) endSession(admission.id);
         res.writeHead(204);
         res.end();
         return;
@@ -1243,7 +1273,17 @@ export async function handleRouterMcp(req, res, routePlan) {
             }
 
             const command = payload && typeof payload.command === 'string' ? payload.command : '';
-            const { statusCode, body } = await executeRouterCommand(command, payload, req, routePlan);
+            const admission = inspectMcpSession(routerSessions, req, createMcpSessionOwner(req, 'aggregate'));
+            if (admission.supplied && (!admission.entry || admission.refused)) {
+                sendJson(res, 403, { error: 'Missing or invalid MCP session' });
+                return;
+            }
+            const beforeDispatch = admission.entry ? () => {
+                if (!matchesMcpSessionOwner(routerSessions.get(admission.id), admission.entry.owner)) {
+                    throw Object.assign(new Error('Missing or invalid MCP session'), { code: 'MCP_SESSION_INVALID' });
+                }
+            } : null;
+            const { statusCode, body } = await executeRouterCommand(command, payload, req, routePlan, beforeDispatch);
             res.writeHead(statusCode, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify(body));
         } catch (err) {

@@ -673,8 +673,8 @@ test('host-bound browser token mints only an admitted service mutation proof', a
     const { authHandlers, authService, createRoutePlan } = await withAuthModules(t, {
         staticAuthMode: 'sso',
     });
-    const originalGetSession = authService.getSession;
-    authService.getSession = (sessionId) => sessionId === 'sso-session'
+    const originalGetSession = authService.validateSession;
+    authService.validateSession = async (sessionId) => sessionId === 'sso-session'
         ? {
             user: {
                 id: 'sso:admin',
@@ -688,7 +688,7 @@ test('host-bound browser token mints only an admitted service mutation proof', a
         }
         : null;
     t.after(() => {
-        authService.getSession = originalGetSession;
+        authService.validateSession = originalGetSession;
     });
 
     const base = createRoutePlan();
@@ -777,7 +777,7 @@ test('browser token GET denies a generation change during session resolution bef
     let resolveSession;
     let sessionLookupStarted;
     const started = new Promise((resolve) => { sessionLookupStarted = resolve; });
-    t.mock.method(authService, 'getSession', async () => {
+    t.mock.method(authService, 'validateSession', async () => {
         sessionLookupStarted();
         return new Promise((resolve) => { resolveSession = resolve; });
     });
@@ -799,6 +799,62 @@ test('browser token GET denies a generation change during session resolution bef
     assert.equal(res.getHeader('set-cookie'), undefined);
     assert.equal(Object.hasOwn(JSON.parse(res.body), 'browserMutation'), false);
     assert.equal(Object.hasOwn(JSON.parse(res.body), 'adminControl'), false);
+});
+
+for (const staticAuthMode of ['sso', 'guest']) {
+    test(`browser token ${staticAuthMode} admission uses current SSO authority for identity and admin proofs`, async (t) => {
+        const { authHandlers, authService, createRoutePlan } = await withAuthModules(t, { staticAuthMode });
+        const cached = { user: { id: 'member-1', roles: ['admin'], capabilities: ['admin.users.manage'] },
+            tokens: {}, expiresAt: Date.now() + 60_000 };
+        let current = cached;
+        let validations = 0;
+        t.mock.method(authService, 'isConfigured', () => true);
+        t.mock.method(authService, 'getSession', () => cached);
+        t.mock.method(authService, 'validateSession', async () => { validations += 1; return current; });
+        const token = async () => {
+            const req = makeRequest({ url: '/auth/token', cookie: 'ploinky_sso=current-session' });
+            const res = new MockResponse();
+            await authHandlers.handleAuthRoutes(req, res, new URL(req.url, 'http://localhost'), { routePlan: createRoutePlan() });
+            return { status: res.statusCode, body: JSON.parse(res.body), cookies: res.getHeader('set-cookie') };
+        };
+        const warm = await token();
+        assert.equal(warm.status, 200);
+        assert.ok(warm.body.adminControl);
+        current = { ...cached, user: { id: 'member-1', roles: ['selfRegistered'], capabilities: [] } };
+        const demoted = await token();
+        assert.equal(demoted.status, 200);
+        assert.deepEqual(demoted.body.user.roles, ['selfRegistered']);
+        assert.equal(demoted.body.adminControl, undefined);
+        current = null;
+        const revoked = await token();
+        assert.equal(revoked.status, 401);
+        assert.equal(revoked.body.adminControl, undefined);
+        assert.equal(revoked.body.browserMutation, undefined);
+        assert.equal(validations, 3);
+    });
+}
+
+test('browser token explicit refresh validates once and preserves CSRF checks', async (t) => {
+    const { authHandlers, authService, createRoutePlan } = await withAuthModules(t, { staticAuthMode: 'sso' });
+    const session = { user: { id: 'member-1', roles: ['user'] }, tokens: {}, expiresAt: Date.now() + 60_000 };
+    t.mock.method(authService, 'validateSession', async () => session);
+    t.mock.method(authService, 'refreshSession', async () => { throw new Error('duplicate refresh'); });
+    const routePlan = createRoutePlan();
+    const initial = makeRequest({ url: '/auth/token', cookie: 'ploinky_sso=current-session' });
+    const initialRes = new MockResponse();
+    await authHandlers.handleAuthRoutes(initial, initialRes, new URL(initial.url, 'http://localhost'), { routePlan });
+    const proof = JSON.parse(initialRes.body).browserMutation.csrfToken;
+    assert.ok(proof);
+    for (const valid of [true, false]) {
+        const req = makeRequest({ method: 'POST', url: '/auth/token', cookie: 'ploinky_sso=current-session',
+            headers: { origin: 'http://localhost' }, body: { refresh: true, csrfToken: valid ? proof : 'invalid' } });
+        const res = new MockResponse();
+        const before = authService.validateSession.mock.callCount();
+        await authHandlers.handleAuthRoutes(req, res, new URL(req.url, 'http://localhost'), { routePlan });
+        assert.equal(res.statusCode, valid ? 200 : 403);
+        assert.equal(authService.validateSession.mock.callCount() - before, 1);
+    }
+    assert.equal(authService.refreshSession.mock.callCount(), 0);
 });
 
 test('SSO login and callback keep every return target inside the normalized same-origin boundary', async (t) => {
@@ -919,8 +975,8 @@ test('browser token for an auth-none target uses static auth and binds proof to 
     const { authHandlers, authService, createRoutePlan } = await withAuthModules(t, {
         staticAuthMode: 'sso',
     });
-    const originalGetSession = authService.getSession;
-    authService.getSession = (sessionId) => sessionId === 'sso-session'
+    const originalGetSession = authService.validateSession;
+    authService.validateSession = async (sessionId) => sessionId === 'sso-session'
         ? {
             user: {
                 id: 'sso:admin',
@@ -934,7 +990,7 @@ test('browser token for an auth-none target uses static auth and binds proof to 
         }
         : null;
     t.after(() => {
-        authService.getSession = originalGetSession;
+        authService.validateSession = originalGetSession;
     });
 
     const req = makeRequest({
@@ -965,10 +1021,10 @@ test('static-auth webchat input preserves the target mutation route binding', as
     const { authHandlers, authService, createRoutePlan } = await withAuthModules(t, {
         staticAuthMode: 'sso',
     });
-    const originalGetSession = authService.getSession;
+    const originalGetSession = authService.validateSession;
     const originalIsConfigured = authService.isConfigured;
     authService.isConfigured = () => true;
-    authService.getSession = (sessionId) => sessionId === 'sso-session'
+    authService.validateSession = async (sessionId) => sessionId === 'sso-session'
         ? {
             user: {
                 id: 'sso:admin',
@@ -982,7 +1038,7 @@ test('static-auth webchat input preserves the target mutation route binding', as
         }
         : null;
     t.after(() => {
-        authService.getSession = originalGetSession;
+        authService.validateSession = originalGetSession;
         authService.isConfigured = originalIsConfigured;
     });
     const req = makeRequest({
@@ -1627,16 +1683,16 @@ test('startup dispatch preserves the real access and host matrix before lifecycl
     });
     const liveSsoSessions = new Set(['sso-valid', 'sso-expiring']);
     const originalIsConfigured = authService.isConfigured;
-    const originalGetSession = authService.getSession;
+    const originalGetSession = authService.validateSession;
     const originalRefreshSession = authService.refreshSession;
     authService.isConfigured = () => true;
-    authService.getSession = (sessionId) => liveSsoSessions.has(sessionId)
+    authService.validateSession = async (sessionId) => liveSsoSessions.has(sessionId)
         ? { user, expiresAt: Date.now() + 60_000 }
         : null;
     authService.refreshSession = async () => null;
     t.after(() => {
         authService.isConfigured = originalIsConfigured;
-        authService.getSession = originalGetSession;
+        authService.validateSession = originalGetSession;
         authService.refreshSession = originalRefreshSession;
     });
 

@@ -78,6 +78,7 @@ export function createProvider({ getConfig }) {
         },
         async sso_refresh_session({ providerSession }) {
             recordCall('sso_refresh_session', { providerSession });
+            if (globalThis.__bridgeValidationFixture) return globalThis.__bridgeValidationFixture(providerSession);
             if (process.env.__FAKE_PROVIDER_REFRESH_DELAY === '1') {
                 await new Promise((resolve) => setTimeout(resolve, 20));
             }
@@ -359,7 +360,7 @@ test('response-free validation refreshes and persists current SSO identity, then
     assert.ok(refreshCalls.length >= 2);
 });
 
-test('response-free SSO validation is single-flight per auth session', async (t) => {
+test('response-free SSO validation coalesces callers admitted before provider dispatch', async (t) => {
     writeWorkspaceSsoConfig({
         enabled: true,
         providerAgent: 'fake/fakeProvider',
@@ -390,6 +391,192 @@ test('response-free SSO validation is single-flight per auth session', async (t)
     assert.equal(second, first);
     assert.equal(third, first);
 });
+
+function deferred() {
+    let resolve;
+    const promise = new Promise(done => { resolve = done; });
+    return { promise, resolve };
+}
+
+async function freshFixture(t, options = {}) {
+    writeWorkspaceSsoConfig({ enabled: true, providerAgent: 'fake/fakeProvider', providerConfig: {} });
+    const bridge = createGenericAuthBridge(options);
+    const { state, browserBinding } = await bridge.beginLogin({ baseUrl: 'http://localhost:8080' });
+    const { sessionId } = await bridge.handleCallback({ state, browserBinding, code: 'fixture', baseUrl: 'http://localhost:8080' });
+    t.after(() => { delete globalThis.__bridgeValidationFixture; });
+    return { bridge, sessionId };
+}
+
+function described(providerSession, roles = ['admin'], id = 'u1') {
+    return { user: { id, roles, capabilities: roles.includes('admin') ? ['admin.control'] : [] },
+        providerSession: { ...providerSession, tokens: { accessToken: 'current-fixture' } } };
+}
+
+test('freshness workload records provider calls and admission latency without a TTL exception', async (t) => {
+    for (const [label, sessions, width, rounds] of [['serial-one', 1, 1, 50], ['concurrent-one', 1, 10, 5], ['concurrent-four', 4, 8, 5]]) {
+        const { bridge, sessionId } = await freshFixture(t);
+        const ids = [sessionId];
+        for (let i = 1; i < sessions; i += 1) {
+            const pending = await bridge.beginLogin({ baseUrl: 'http://localhost:8080' });
+            ids.push((await bridge.handleCallback({ ...pending, code: 'fixture', baseUrl: 'http://localhost:8080' })).sessionId);
+        }
+        let calls = 0;
+        globalThis.__bridgeValidationFixture = async providerSession => {
+            calls += 1;
+            await new Promise(resolve => setImmediate(resolve));
+            return described(providerSession);
+        };
+        const durations = [];
+        for (let round = 0; round < rounds; round += 1) {
+            await Promise.all(Array.from({ length: width }, async (_, i) => {
+                const start = performance.now();
+                const result = await bridge.validateSession(ids[i % ids.length]);
+                assert.equal(result.user.id, 'u1');
+                durations.push(performance.now() - start);
+            }));
+        }
+        durations.sort((a, b) => a - b);
+        t.diagnostic(JSON.stringify({ workload: label, admissions: width * rounds, providerCalls: calls,
+            settled: durations.length, p50Ms: +durations[Math.floor(durations.length * 0.5)].toFixed(3),
+            p95Ms: +durations[Math.floor(durations.length * 0.95)].toFixed(3) }));
+    }
+});
+
+test('every admission sees completed demotion despite a positive configured TTL', async (t) => {
+    const { bridge, sessionId } = await freshFixture(t, { ssoValidationIntervalMs: 60_000 });
+    let roles = ['admin'];
+    let calls = 0;
+    globalThis.__bridgeValidationFixture = providerSession => { calls += 1; return described(providerSession, roles); };
+    const previous = await bridge.validateSession(sessionId);
+    roles = ['user'];
+    const current = await bridge.validateSession(sessionId);
+    assert.deepEqual(current.user.roles, ['user']);
+    assert.deepEqual(previous.user.roles, ['admin'], 'the previous request keeps its own coherent snapshot');
+    assert.equal(calls, 2);
+});
+
+test('late arrivals queue a fresh cohort and never share a pre-demotion dispatch', async (t) => {
+    const { bridge, sessionId } = await freshFixture(t);
+    const entered = deferred();
+    const release = deferred();
+    let calls = 0;
+    let roles = ['admin'];
+    let active = 0;
+    let maximum = 0;
+    globalThis.__bridgeValidationFixture = async providerSession => {
+        calls += 1;
+        maximum = Math.max(maximum, ++active);
+        const result = described(providerSession, [...roles]);
+        if (calls === 1) { entered.resolve(); await release.promise; }
+        active -= 1;
+        return result;
+    };
+    const first = bridge.validateSession(sessionId);
+    await entered.promise;
+    roles = ['user'];
+    const late = Array.from({ length: 8 }, () => bridge.validateSession(sessionId));
+    release.resolve();
+    assert.deepEqual((await first).user.roles, ['admin']);
+    for (const result of await Promise.all(late)) assert.deepEqual(result.user.roles, ['user']);
+    assert.equal(calls, 2);
+    assert.equal(maximum, 1);
+});
+
+test('explicit refresh shares the lane, preserves rotation order and returns its own token metadata', async (t) => {
+    const { bridge, sessionId } = await freshFixture(t);
+    const entered = deferred();
+    const release = deferred();
+    let calls = 0;
+    globalThis.__bridgeValidationFixture = async providerSession => {
+        const sequence = ++calls;
+        if (sequence === 1) { entered.resolve(); await release.promise; }
+        else assert.equal(providerSession.tokens.accessToken, 'rotation-1');
+        return { user: { id: 'u1', roles: [sequence === 1 ? 'admin' : 'user'] },
+            providerSession: { expiresAt: Date.now() + 60_000, tokens: { accessToken: `rotation-${sequence}` } } };
+    };
+    const first = bridge.validateSession(sessionId);
+    await entered.promise;
+    const second = bridge.refreshSession(sessionId);
+    release.resolve();
+    const [previous, refreshed] = await Promise.all([first, second]);
+    assert.equal(calls, 2);
+    assert.deepEqual(previous.user.roles, ['admin']);
+    assert.deepEqual(refreshed.user.roles, ['user']);
+    assert.equal(previous.tokens.accessToken, 'rotation-1');
+    assert.equal(refreshed.accessToken, 'rotation-2');
+    assert.equal(refreshed.scope, null);
+    assert.equal(bridge.getSession(sessionId).tokens.idToken, undefined);
+});
+
+test('a changed provider configuration refuses in-flight authority without requiring a TTL expiry', async (t) => {
+    const { bridge, sessionId } = await freshFixture(t);
+    const entered = deferred();
+    const release = deferred();
+    globalThis.__bridgeValidationFixture = async providerSession => {
+        entered.resolve(); await release.promise; return described(providerSession);
+    };
+    const pending = bridge.validateSession(sessionId);
+    await entered.promise;
+    writeWorkspaceSsoConfig({ enabled: true, providerAgent: 'fake/fakeProvider', providerConfig: { clientId: 'changed-client' } });
+    release.resolve();
+    assert.equal(await pending, null);
+    assert.deepEqual(bridge.getSession(sessionId).user.roles, ['dev']);
+    globalThis.__bridgeValidationFixture = providerSession => described(providerSession, ['user']);
+    assert.deepEqual((await bridge.validateSession(sessionId)).user.roles, ['user']);
+});
+
+test('provider refusal settles both an active and a later queued cohort', async (t) => {
+    const { bridge, sessionId } = await freshFixture(t);
+    const entered = deferred();
+    const release = deferred();
+    let calls = 0;
+    globalThis.__bridgeValidationFixture = async () => {
+        calls += 1; entered.resolve(); await release.promise; throw new Error('fixture refusal');
+    };
+    const first = bridge.validateSession(sessionId);
+    await entered.promise;
+    const queued = bridge.validateSession(sessionId);
+    release.resolve();
+    assert.deepEqual(await Promise.all([first, queued]), [null, null]);
+    assert.equal(calls, 1);
+});
+
+for (const invalidate of ['revokeSession', 'logout', 'reloadConfig']) {
+    test(`${invalidate} fences pending refresh and queued validation without resurrection`, async (t) => {
+        const { bridge, sessionId } = await freshFixture(t);
+        const entered = deferred();
+        const release = deferred();
+        globalThis.__bridgeValidationFixture = async providerSession => {
+            entered.resolve(); await release.promise; return described(providerSession);
+        };
+        const refresh = bridge.refreshSession(sessionId).then(() => 'accepted', () => 'refused');
+        await entered.promise;
+        const queued = bridge.validateSession(sessionId);
+        await bridge[invalidate](sessionId);
+        release.resolve();
+        assert.equal(await refresh, 'refused');
+        assert.equal(await queued, null);
+        if (invalidate !== 'reloadConfig') assert.equal(bridge.getSession(sessionId), null);
+        else assert.deepEqual(bridge.getSession(sessionId).user.roles, ['dev']);
+    });
+}
+
+for (const outcome of ['failure', 'null', 'missing-user', 'changed-user']) {
+    test(`provider ${outcome} settles every caller without cached authority`, async (t) => {
+        const { bridge, sessionId } = await freshFixture(t);
+        globalThis.__bridgeValidationFixture = providerSession => described(providerSession);
+        await bridge.validateSession(sessionId);
+        globalThis.__bridgeValidationFixture = providerSession => {
+            if (outcome === 'failure') throw new Error('fixture provider refused');
+            if (outcome === 'null') return null;
+            if (outcome === 'missing-user') return { providerSession };
+            return described(providerSession, ['admin'], 'different-account');
+        };
+        const results = await Promise.all(Array.from({ length: 6 }, () => bridge.validateSession(sessionId)));
+        assert.ok(results.every(result => result === null));
+        assert.equal(bridge.getSession(sessionId), null);
+    });
+}
 
 test('provider-neutral admin operations are delegated without interpreting provider payloads', async () => {
     writeWorkspaceSsoConfig({ enabled: true, providerAgent: 'fake/fakeProvider', providerConfig: {} });

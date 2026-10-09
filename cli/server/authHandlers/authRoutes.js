@@ -122,7 +122,7 @@ async function resolveBrowserTokenSession(cookies, authContext) {
                 mode: 'sso',
                 cookieName: SSO_AUTH_COOKIE_NAME,
                 getSession: (sessionId) => authService.isConfigured()
-                    ? authService.getSession(sessionId)
+                    ? authService.validateSession(sessionId)
                     : null,
             },
             {
@@ -136,7 +136,7 @@ async function resolveBrowserTokenSession(cookies, authContext) {
         : [{
             mode: authContext.mode,
             cookieName: getCookieNameForMode(authContext.mode),
-            getSession: (sessionId) => authService.getSession(sessionId),
+            getSession: (sessionId) => authService.validateSession(sessionId),
         }];
 
     let invalidCookie = null;
@@ -482,12 +482,10 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
                 session,
             } = tokenSession;
             setAuthenticatedRequest(req, { session, sessionId, mode: sessionMode });
-            let refreshRequested = false;
             if (method === 'POST') {
                 let body = {};
                 try {
                     body = await readJsonBody(req);
-                    refreshRequested = Boolean(body?.refresh);
                 } catch (_) {
                     sendJson(res, 400, { ok: false, error: 'invalid_json' });
                     return true;
@@ -504,18 +502,14 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
                 }
                 if (!requireCurrentGeneration(res, routePlan)) return true;
             }
-            let tokenInfo;
-            if (sessionMode === 'sso' && refreshRequested) {
-                tokenInfo = await authService.refreshSession(sessionId);
-                if (!requireCurrentGeneration(res, routePlan)) return true;
-            } else {
-                tokenInfo = {
-                    accessToken: session.tokens?.accessToken || null,
-                    expiresAt: session.expiresAt,
-                    scope: session.tokens?.scope || null,
-                    tokenType: session.tokens?.tokenType || null
-                };
-            }
+            // Fresh SSO admission already performs provider refresh. Identity,
+            // token metadata and proofs must all use that one accepted snapshot.
+            const tokenInfo = {
+                accessToken: session.tokens?.accessToken || null,
+                expiresAt: session.expiresAt,
+                scope: session.tokens?.scope || null,
+                tokenType: session.tokens?.tokenType || null,
+            };
             if (!requireCurrentGeneration(res, routePlan)) return true;
             const cookieMaxAge = sessionMode === 'guest'
                 ? GUEST_SESSION_TTL_SECONDS
