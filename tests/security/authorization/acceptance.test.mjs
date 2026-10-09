@@ -18,7 +18,7 @@ import { capture } from './acceptance/evidence-capture.mjs';
 import { policyDigest } from './acceptance/digest.mjs';
 import { captureExitCode } from './acceptance/run-acceptance.mjs';
 import { runMarketplaceAdmissionProbes, runTemplateProbes, marketplaceProjection } from './boundary-probes.mjs';
-import { runWebchatProbes, dpuProcessInspector, createStreamHandle, waitForStartupReady, DPU_UNSUPPORTED_REPLY, LIVE_INTERACTION_LIMITATION } from './webchat-probes.mjs';
+import { runWebchatProbes, dpuProcessInspector, createStreamHandle, waitForStartupReady, openEventStream, DPU_UNSUPPORTED_REPLY, LIVE_INTERACTION_LIMITATION } from './webchat-probes.mjs';
 import { discoverAgentMcp } from './agent-probes.mjs';
 import { workspaceWriteMatrix, workspaceWriteCheckDefinitions } from './stream-probes.mjs';
 import { runCapabilityProbes, nonApplicableRecord } from './capability-probes.mjs';
@@ -1179,4 +1179,39 @@ test('the profile_get and username-admin mandatory chain follows the corrected p
     run.report.verdict = 'FAIL'; run.exitCode = 1;
     const result = evaluate(run);
     for (const id of ['agent.username-admin.monitor-denial', 'agent.username-admin.webmeet-role']) assert.ok(result.reasons.includes(`MANDATORY_POSITIVE_CONTROL_FAILED: ${id}`), id);
+});
+
+test('the SSE opener bounds connect-to-headers only and never installs a socket idle timeout', async () => {
+    const ctx = { report: { requests: [] }, clients: { userA: { cookies: [{ name: 'ploinky_sso', value: 'cookie-value' }] } }, async guard() {} };
+    const fakeRequest = ({ respond }) => {
+        const calls = { idleTimeouts: [], destroyed: [], options: null };
+        const request = (options, onResponse) => {
+            calls.options = options;
+            const req = new EventEmitter();
+            req.setTimeout = (...args) => calls.idleTimeouts.push(args);
+            req.destroy = error => { calls.destroyed.push(String(error?.message || error)); req.emit('error', error); };
+            req.end = () => { if (respond) setTimeout(() => {
+                const res = new EventEmitter();
+                Object.assign(res, { statusCode: 200, headers: { 'content-type': 'text/event-stream' }, setEncoding() {}, destroy() { res.emit('close'); } });
+                onResponse(res);
+            }, 5); };
+            return req;
+        };
+        return { request, calls };
+    };
+    // The connection answers: no deadline fires later, even after the connect bound has long passed.
+    const answered = fakeRequest({ respond: true });
+    const handle = await openEventStream(ctx, 'userA', '/webchat/stream?agent=dpuAgent', { request: answered.request, connectMs: 40 });
+    await new Promise(r => setTimeout(r, 120));
+    assert.equal(handle.status, 200);
+    assert.deepEqual(answered.calls.destroyed, [], 'a silent open stream is never torn down by the opener');
+    assert.deepEqual(answered.calls.idleTimeouts, [], 'no socket idle timeout is installed');
+    assert.equal(answered.calls.options.hostname, '127.0.0.1');
+    assert.equal(answered.calls.options.port, 8080);
+    assert.equal(answered.calls.options.headers.cookie, 'ploinky_sso=cookie-value');
+    // No response within the bound: the connect deadline still fires and the open fails.
+    const silent = fakeRequest({ respond: false });
+    await assert.rejects(openEventStream(ctx, 'userA', '/webchat/stream?agent=dpuAgent', { request: silent.request, connectMs: 30 }), /connect timeout/);
+    assert.deepEqual(silent.calls.destroyed, ['Bounded WebChat stream connect timeout']);
+    handle.close();
 });

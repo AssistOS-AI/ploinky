@@ -126,19 +126,28 @@ export function createStreamHandle(res, req, { maxBytes = webchatProbe.maxEventB
     return handle;
 }
 
-/** Default stream opener: raw SSE over the selected loopback Router with the actor's cookies. */
-export async function openEventStream(ctx, actor, requestPath, { maxBytes = webchatProbe.maxEventBytes } = {}) {
+/**
+ * Default stream opener: raw SSE over the selected loopback Router with the actor's cookies.
+ * Only the request function is injectable (offline tests observe the wiring); the
+ * loopback host and port are fixed. The deadline bounds connect-to-headers only.
+ * It must not become a socket idle timeout: a stream is silent between the
+ * Router's 15 s keepalives and while another principal's acknowledgement is
+ * awaited, and an idle timeout would end it mid-readiness.
+ */
+export async function openEventStream(ctx, actor, requestPath, { maxBytes = webchatProbe.maxEventBytes, request = http.request, connectMs = webchatProbe.waitMs } = {}) {
     await ctx.guard(); // GET /stream creates runtime state.
     const client = ctx.clients[actor];
     assert.ok(client, `Unknown principal ${actor}`);
     const cookie = client.cookies.map(c => `${c.name}=${c.value}`).join('; ');
     return await new Promise((resolve, reject) => {
-        const req = http.request({ hostname: '127.0.0.1', port: 8080, path: requestPath, method: 'GET', headers: { accept: 'text/event-stream', ...(cookie ? { cookie } : {}) } }, res => {
+        let connectTimer;
+        const req = request({ hostname: '127.0.0.1', port: 8080, path: requestPath, method: 'GET', headers: { accept: 'text/event-stream', ...(cookie ? { cookie } : {}) } }, res => {
+            clearTimeout(connectTimer);
             ctx.report.requests.push({ actor, method: 'GET', path: requestPath.split('?')[0], status: res.statusCode, stream: true });
             resolve(createStreamHandle(res, req, { maxBytes }));
         });
-        req.setTimeout(webchatProbe.waitMs, () => req.destroy(new Error('Bounded WebChat stream connect timeout')));
-        req.on('error', reject);
+        connectTimer = setTimeout(() => req.destroy(new Error('Bounded WebChat stream connect timeout')), connectMs);
+        req.on('error', error => { clearTimeout(connectTimer); reject(error); });
         req.end();
     });
 }

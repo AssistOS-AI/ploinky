@@ -304,10 +304,12 @@ export function assertAgentMcpDenied(result) {
  * `guestAgents`, derived from the pinned manifests). The Router answers an
  * anonymous visitor on such a route with a minted guest session
  * (cli/server/authHandlers/authContext.js:1028-1078), so a successful list is the
- * declared contract, not a denial bypass. Three things keep it from being a bare
- * HTTP 200: the visitor must hold a guest-session cookie (a mode-none route mints
- * none), the list must be a valid named list, and it must equal the
- * administrator-visible list exactly. Tool calls stay denied by their own checks.
+ * declared contract, not a denial bypass. Two things carry the contract: the agent
+ * must be in the manifest-derived guest set (the caller only reaches this
+ * assertion for such an agent) and the list must be a valid named list that
+ * equals the administrator-visible list exactly. The guest-session cookie is
+ * supporting evidence only: it comes from the shared anonymous jar, so an earlier
+ * guest route could have supplied it. Tool calls stay denied by their own checks.
  */
 export function assertGuestDiscovery(result, { field, adminNames, guestCookie }) {
     assert.equal(result.response.status, 200, 'Guest discovery must be answered with HTTP 200');
@@ -444,8 +446,9 @@ export async function discoverAgentMcp(ctx, mcp, catalog = agentCatalog) {
                     ctx.report.discovery.push({ agent: agent.agent, actor, method: definition.method, stage: result.stage,
                         [definition.field]: visible, status: result.response.status });
                     if (actor === 'anonymous' && guestAgent) {
-                        const session = await mcp.initialize('anonymous', agent.agent);
-                        assertGuestDiscovery(result, { field: definition.field, adminNames: names, guestCookie: hasGuestCookie(ctx.clients?.anonymous, session.init) });
+                        // The cached session of this very result; a failed initialize is not retried.
+                        const session = result.stage === 'initialize' ? null : await mcp.initialize('anonymous', agent.agent);
+                        assertGuestDiscovery(result, { field: definition.field, adminNames: names, guestCookie: hasGuestCookie(ctx.clients?.anonymous, session?.init) });
                     } else if (actor === 'anonymous' || (actor === 'selfRegistered' && agent.agent === 'explorer')) assertAgentMcpDenied(result);
                     else if (!result.success) {
                         if (result.response.json?.error?.code === -32601) {
