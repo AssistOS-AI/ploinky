@@ -1,6 +1,6 @@
 {
   "schema": "authz-expected-gaps/1",
-  "note": "Exact gap identities with typed evidence rules. Unavailable positives, transport errors, timeouts, 503s, pagination, username-admin and admin-unavailable outcomes are never accepted. selfRegistered metadata-visibility gaps are not listed (no source-derived visible-tool list yet); any such gap rejects. liveKitServerAgent has no MCP exclusion: its route has no host port, so its discovery and GET transport outcomes are not excluded.",
+  "note": "Exact gap identities with typed evidence rules. Unavailable positives, transport errors, timeouts, 503s, pagination, username-admin and admin-unavailable outcomes are never accepted. selfRegistered metadata-visibility gaps are listed only for the two enabled guest-authentication agents (webAssist, webmeetAgent), each with its exact reviewed tool names; any other such gap, or a different list, rejects. liveKitServerAgent has no MCP exclusion: its route has no host port, so its discovery and GET transport outcomes are not excluded.",
   "gaps": [
     {
       "id": "agent.GPTResearcher.disabled",
@@ -830,6 +830,94 @@
       "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
     },
     {
+      "id": "agent.webAssist.discovery.tools.list.selfRegistered.scope",
+      "category": "protocol-combination-outside-changed-paths",
+      "presence": "required",
+      "source": "tests/security/authorization/agent-probes.mjs:460 (selfRegistered discovery on a guest-authentication agent); cli/utils/manifestAuth.js:21 (manifest guest:true selects guest authentication); cli/server/authHandlers/authContext.js:1028-1066 (guest-mode route admits an SSO or anonymous visitor)",
+      "reason": "AchillesIDE/webAssist declares guest authentication, so its MCP tools/list is visible to every visitor including selfRegistered. The exact runtime tool names are reviewed here; tool calls, resource reads and room data stay behind their own mandatory authorization checks.",
+      "affectedObligations": [
+        "router/agent-mcp.post"
+      ],
+      "outsideChangedBehavior": "Guest authentication is declared by the agent manifest and is unchanged by the U3/U6/U7 candidate.",
+      "evidence": {
+        "kind": "selfregistered-visible-tools",
+        "actor": "selfRegistered",
+        "endpoint": "/webAssist/mcp",
+        "requestedMethod": "tools/list",
+        "stage": "tools/list",
+        "httpStatus": 200,
+        "visibleTools": [
+          "list-sites",
+          "register-events",
+          "web_cli_chat",
+          "web_cli_history"
+        ]
+      },
+      "reviewedBy": "pending: independent review of the four acceptance files"
+    },
+    {
+      "id": "agent.webmeetAgent.discovery.tools.list.selfRegistered.scope",
+      "category": "protocol-combination-outside-changed-paths",
+      "presence": "required",
+      "source": "tests/security/authorization/agent-probes.mjs:460 (selfRegistered discovery on a guest-authentication agent); cli/utils/manifestAuth.js:21 (manifest guest:true selects guest authentication); cli/server/authHandlers/authContext.js:1028-1066 (guest-mode route admits an SSO or anonymous visitor)",
+      "reason": "AchillesIDE/webmeetAgent declares guest authentication, so its MCP tools/list is visible to every visitor including selfRegistered. The exact runtime tool names are reviewed here; tool calls, resource reads and room data stay behind their own mandatory authorization checks.",
+      "affectedObligations": [
+        "router/agent-mcp.post"
+      ],
+      "outsideChangedBehavior": "Guest authentication is declared by the agent manifest and is unchanged by the U3/U6/U7 candidate.",
+      "evidence": {
+        "kind": "selfregistered-visible-tools",
+        "actor": "selfRegistered",
+        "endpoint": "/webmeetAgent/mcp",
+        "requestedMethod": "tools/list",
+        "stage": "tools/list",
+        "httpStatus": 200,
+        "visibleTools": [
+          "webmeet_agent_attach",
+          "webmeet_agent_detach",
+          "webmeet_agent_list",
+          "webmeet_attachment_publish",
+          "webmeet_blackboard_get",
+          "webmeet_blackboard_workspace_get",
+          "webmeet_chat_list",
+          "webmeet_chat_send",
+          "webmeet_chat_send_guest",
+          "webmeet_event_command",
+          "webmeet_media_commit",
+          "webmeet_participant_avatar_update",
+          "webmeet_participant_list",
+          "webmeet_participant_remove",
+          "webmeet_participant_update_role",
+          "webmeet_presence_heartbeat",
+          "webmeet_resource_authorize_download",
+          "webmeet_resource_authorize_upload",
+          "webmeet_resource_commit_upload",
+          "webmeet_resource_list",
+          "webmeet_resource_remove",
+          "webmeet_robo_team_get",
+          "webmeet_robo_team_update",
+          "webmeet_room_archive",
+          "webmeet_room_create",
+          "webmeet_room_delete",
+          "webmeet_room_events_list",
+          "webmeet_room_get",
+          "webmeet_room_guest_get",
+          "webmeet_room_join",
+          "webmeet_room_join_guest",
+          "webmeet_room_leave",
+          "webmeet_room_list",
+          "webmeet_room_public_get",
+          "webmeet_room_rename",
+          "webmeet_scripta_sync_apply",
+          "webmeet_scripta_sync_close",
+          "webmeet_scripta_sync_open",
+          "webmeet_scripta_sync_pull",
+          "webmeet_scripta_workspace_list"
+        ]
+      },
+      "reviewedBy": "pending: independent review of the four acceptance files"
+    },
+    {
       "id": "agent.workspaceMonitorAgent.discovery.resources.templates.list",
       "category": "static-unsupported-protocol",
       "presence": "required",
@@ -1283,7 +1371,7 @@
       "id": "router:stream-revocation-continuation",
       "category": "protocol-combination-outside-changed-paths",
       "presence": "required",
-      "source": "tests/security/authorization/stream-probes.mjs:344",
+      "source": "tests/security/authorization/stream-probes.mjs:518",
       "reason": "Unconditional declared coverage limitation recorded on every run by the cited line.",
       "affectedObligations": [
         "router/webtty-stream.get",

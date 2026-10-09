@@ -255,7 +255,7 @@ export async function runWorkspaceWriteMatrix(ctx, fixture, filename) {
   for (const row of denials.filter(item => item.operation !== 'sink-upload')) await denial(row);
 }
 
-async function runTerminalProbes(ctx, fixture) {
+export async function runTerminalProbes(ctx, fixture) {
   let discoveryId;
   let terminalId;
   let discoveryClosed = false;
@@ -317,10 +317,13 @@ async function runTerminalProbes(ctx, fixture) {
     assertDenied(response);
   });
   let terminalReady = false;
+  let launchConsumed = false;
   await ctx.check('router:terminal-create-positive:admin', async () => {
     const response = await ctx.request('admin', { method: 'POST', path: '/webtty/sessions', body: { launch, cols: 80, rows: 24 }, timeout: 30000 });
     if (response.status === 503) ctx.recordGap('router:terminal-backend', 'Administrator session creation returned 503; native runtime is unavailable.', { kind: 'positive-unavailable' });
     assert.equal(response.status, 201, 'Administrator must create the exact box terminal target');
+    // Consuming a launch removes its whole discovery batch (cli/server/webtty/launchRecords.mjs, consume -> removeBatch).
+    launchConsumed = true;
     assert.equal(response.json?.ok, true);
     assert.equal(response.json?.session?.target?.kind, 'box');
     terminalId = response.json?.session?.id;
@@ -401,9 +404,38 @@ async function runTerminalProbes(ctx, fixture) {
     assert.equal(response.json?.ok, true);
     terminalClosed = true;
   });
+  // Positive control for discovery deletion: a second discovery whose launch is never consumed is
+  // removed with 200, so the 404 below is the consumed-batch contract and not a broken DELETE.
+  let freshDiscoveryId;
+  let freshClosed = false;
+  await ctx.check('router:terminal-discovery-delete-positive:admin', async () => {
+    const created = await ctx.request('admin', { method: 'POST', path: '/webtty/target-discoveries', body: { dir: fixture.directory }, timeout: 30000 });
+    assert.equal(created.status, 201, 'Administrator must create a second, unconsumed discovery');
+    freshDiscoveryId = created.json?.discovery?.id;
+    assert.match(freshDiscoveryId || '', /^[A-Za-z0-9_-]{16,128}$/);
+    ctx.secrets.add(freshDiscoveryId);
+    ctx.cleanup(async () => {
+      if (freshClosed) return;
+      const result = await ctx.request('admin', { method: 'DELETE', path: `/webtty/target-discoveries/${freshDiscoveryId}` });
+      assert.ok([200, 404].includes(result.status), 'Only a disposable discovery may be absent during cleanup');
+      freshClosed = true;
+    });
+    const removed = await ctx.request('admin', { method: 'DELETE', path: `/webtty/target-discoveries/${freshDiscoveryId}` });
+    assert.equal(removed.status, 200, 'An unconsumed discovery must be removable');
+    assert.equal(removed.json?.ok, true);
+    freshClosed = true;
+    const again = await ctx.request('admin', { method: 'DELETE', path: `/webtty/target-discoveries/${freshDiscoveryId}` });
+    assert.equal(again.status, 404, 'A removed discovery is gone');
+  });
   await ctx.check('router:terminal-discovery-cleanup:admin', async () => {
     const response = await ctx.request('admin', { method: 'DELETE', path: `/webtty/target-discoveries/${discoveryId}` });
-    assert.equal(response.status, 200);
+    if (launchConsumed) {
+      // cli/server/handlers/webtty.js: a cancelled-or-missing discovery is 404 {ok:false,error:'not_found'}.
+      assert.equal(response.status, 404, 'The created session consumed the launch and removed its whole discovery batch');
+      assert.deepEqual(response.json, { ok: false, error: 'not_found' });
+    } else {
+      assert.equal(response.status, 200);
+    }
     discoveryClosed = true;
   });
 }

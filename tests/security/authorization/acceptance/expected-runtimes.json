@@ -164,5 +164,15 @@
       ],
       "contractSha256": "073b9f03c9d5e88f2bab4c91fba604b95554789cdd51d9b419ea35ed9fe7045b"
     }
+  ],
+  "guestAgents": [
+    {
+      "repo": "AchillesIDE",
+      "agent": "webAssist"
+    },
+    {
+      "repo": "AchillesIDE",
+      "agent": "webmeetAgent"
+    }
   ]
 }

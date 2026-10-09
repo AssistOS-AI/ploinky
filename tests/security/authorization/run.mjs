@@ -33,7 +33,7 @@ const cleanups = [];
 let mutationLock;
 const ctx = {
     prefix: `authz-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`,
-    clients: {}, principals: {}, secrets: new Set(), hash: digest, finalizers: [], capabilities: policy.capabilities || [],
+    clients: {}, principals: {}, secrets: new Set(), hash: digest, finalizers: [], capabilities: policy.capabilities || [], guestAgents: expectedRuntimes.guestAgents || [],
     report: { startedAt: new Date().toISOString(), target: TARGET, checks: [], requests: [], gaps: [], cleanup: [] },
     progress: message => console.log(message),
     async guard() {

@@ -11,7 +11,7 @@
     }
   ],
   "counts": {
-    "live": 569,
+    "live": 570,
     "offline": 10
   },
   "checks": [
@@ -1912,7 +1912,7 @@
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": [
-        "agent.username-admin.profile-positive"
+        "agent.username-admin.persisted-role"
       ],
       "boundary": "agents",
       "source": "agent-probes.mjs usernamePrivilegeProbe"
@@ -1940,7 +1940,7 @@
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": [
-        "agent.username-admin.profile-positive"
+        "agent.username-admin.persisted-role"
       ],
       "boundary": "agents",
       "source": "agent-probes.mjs usernamePrivilegeProbe"
@@ -2333,7 +2333,9 @@
       "id": "capability:liveKitServerAgent:mcp-absent-corroboration:admin",
       "kind": "live",
       "count": 1,
-      "positiveControlAnyOf": null,
+      "positiveControlAnyOf": [
+        "capability:liveKitServerAgent:no-primary-port"
+      ],
       "boundary": "capability",
       "source": "tests/security/authorization/capability-probes.mjs (D3-livekit-no-mcp)"
     },
@@ -3656,6 +3658,16 @@
     },
     {
       "id": "router:terminal-discovery-cleanup:admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:terminal-discovery-delete-positive:admin"
+      ],
+      "boundary": "stream",
+      "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:terminal-discovery-delete-positive:admin",
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": null,

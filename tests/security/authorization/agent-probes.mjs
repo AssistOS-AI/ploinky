@@ -36,6 +36,7 @@ export const agentDiscoveryMethods = [
     { method: 'resources/templates/list', field: 'resourceTemplates' },
     { method: 'prompts/list', field: 'prompts' },
 ];
+const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const explicitFailure = (value) => isObject(value) && (value.ok === false || value.success === false || value.isError === true || Boolean(value.error));
 function requireObject(value) {
@@ -113,9 +114,14 @@ export function assertAgentReadPositive(probe, result, principal) {
             assert.equal(value.registrationRole, 'selfRegistered');
             break;
         case 'userpersisto_google_status':
-            requireFields(value, ['enabled', 'configured', 'available', 'secretPresent'], 'boolean');
-            requireFields(value, ['redirectUri', 'clientId', 'reason'], 'string');
-            assert.ok(Array.isArray(value.missing));
+            // userPersistoAgent/lib/auth/google.mjs getGoogleStatus: readiness and the
+            // exact callback, never a secret. `secretRequired` is a constant false (the
+            // GIS flow has no client secret) and `secretPresent` must not exist.
+            requireFields(value, ['enabled', 'configured', 'available', 'secretRequired'], 'boolean');
+            requireFields(value, ['mode', 'redirectUri', 'clientId', 'configurationSource', 'policySource', 'reason'], 'string');
+            assert.equal(value.secretRequired, false, 'The Google GIS status never requires a client secret');
+            assert.equal(Object.hasOwn(value, 'secretPresent'), false, 'Google status must not report secret presence');
+            assert.ok(Array.isArray(value.missing) && value.missing.every(name => typeof name === 'string'));
             break;
         case 'userpersisto_oidc_status':
             requireFields(value, ['enabled'], 'boolean');
@@ -292,6 +298,54 @@ export function assertAgentMcpDenied(result) {
     assert.match(result.error, /access.denied|forbidden|unauthori[sz]ed|authentication.{0,30}required|admin.{0,35}required|only.{0,20}admin|requires.{0,20}administrator|permission.denied|capability|agent.invocation.required|not.allowed/i, 'MCP failure must identify authorization, not validation or missing resource');
 }
 
+/**
+ * Anonymous discovery on an agent whose own manifest selects guest
+ * authentication (cli/utils/manifestAuth.js:20-21; expected-runtimes.json
+ * `guestAgents`, derived from the pinned manifests). The Router answers an
+ * anonymous visitor on such a route with a minted guest session
+ * (cli/server/authHandlers/authContext.js:1028-1066), so a successful list is the
+ * declared contract, not a denial bypass. Three things keep it from being a bare
+ * HTTP 200: the visitor must hold a guest-session cookie (a mode-none route mints
+ * none), the list must be a valid named list, and it must equal the
+ * administrator-visible list exactly. Tool calls stay denied by their own checks.
+ */
+export function assertGuestDiscovery(result, { field, adminNames, guestCookie }) {
+    assert.equal(result.response.status, 200, 'Guest discovery must be answered with HTTP 200');
+    assert.ok(result.success, 'A guest-authentication agent must answer an anonymous visitor\'s discovery');
+    requireNamedList(result.value, field);
+    assert.deepEqual(result.value[field].map((item) => item.name).sort(), adminNames, 'Guest discovery must expose exactly the administrator-visible names');
+    assert.equal(guestCookie, true, 'Anonymous access must come from a minted guest session, not from an unauthenticated route');
+}
+export function hasGuestCookie(client, init) {
+    const jar = (client?.cookies || []).some((cookie) => cookie.name === 'ploinky_guest' && cookie.value);
+    const header = [].concat(init?.headers?.['set-cookie'] || []).some((line) => /^ploinky_guest=[^;]+/.test(line));
+    return jar || header;
+}
+
+/**
+ * userPersistoAgent's MCP route inherits the workspace agent's required
+ * capability: a default (non-owned) route needs both owners' capabilities
+ * (cli/server/authHandlers/authContext.js, resolveAuthenticatedRouteAuthContext),
+ * and the Explorer manifest requires `explorer.access`
+ * (explorer/manifest.json routerAccess.requiredCapability). A selfRegistered
+ * account has no such capability, so the MCP initialize is refused with that exact
+ * 403 before any tool runs, while the account's own profile stays reachable on the
+ * owned authenticated dashboard route. The own-profile read is the positive
+ * control for the account-scoped operation; the exact refusal is the denial.
+ */
+export async function assertOwnAccountRouteGate(ctx, probe, result, actor) {
+    const own = await ctx.request(actor, { path: profilePath });
+    assert.equal(own.status, 200, 'The account\'s own profile must be readable on the owned dashboard route');
+    requireObject(own.json);
+    assert.equal(own.json.ok, true);
+    assertAgentReadPositive(probe, { success: true, value: own.json.profile }, ctx.principals[actor]);
+    assert.equal(result.stage, 'initialize', 'The route refuses the session before any tool call');
+    assert.equal(result.response.status, 403);
+    assert.equal(result.response.json?.ok, false);
+    assert.equal(result.response.json?.error, 'required_capability_missing');
+    assert.equal(result.response.json?.requiredCapability, 'explorer.access');
+}
+
 export function createAgentSessions(ctx) {
     const sessions = new Map();
     let id = 0;
@@ -351,6 +405,7 @@ export async function discoverAgentMcp(ctx, mcp, catalog = agentCatalog) {
         // retained real-service controls run in capability-probes.mjs.
         const classified = (ctx.capabilities || []).find((c) => c.repo === agent.repo && c.agent === agent.agent);
         const notApplicable = new Set(classified?.nonApplicable || []);
+        const guestAgent = (ctx.guestAgents || []).some((g) => g.repo === agent.repo && g.agent === agent.agent);
         for (const definition of agentDiscoveryMethods) {
             if (notApplicable.has(`mcp-discovery:${definition.method}`)) continue;
             const id = `agent.${agent.agent}.discovery.${definition.method.replaceAll('/', '.')}`;
@@ -388,7 +443,10 @@ export async function discoverAgentMcp(ctx, mcp, catalog = agentCatalog) {
                     const visible = Array.isArray(result.value?.[definition.field]) ? result.value[definition.field].map((item) => item.name).sort() : [];
                     ctx.report.discovery.push({ agent: agent.agent, actor, method: definition.method, stage: result.stage,
                         [definition.field]: visible, status: result.response.status });
-                    if (actor === 'anonymous' || (actor === 'selfRegistered' && agent.agent === 'explorer')) assertAgentMcpDenied(result);
+                    if (actor === 'anonymous' && guestAgent) {
+                        const session = await mcp.initialize('anonymous', agent.agent);
+                        assertGuestDiscovery(result, { field: definition.field, adminNames: names, guestCookie: hasGuestCookie(ctx.clients?.anonymous, session.init) });
+                    } else if (actor === 'anonymous' || (actor === 'selfRegistered' && agent.agent === 'explorer')) assertAgentMcpDenied(result);
                     else if (!result.success) {
                         if (result.response.json?.error?.code === -32601) {
                             ctx.recordGap(`${id}.${actor}.unsupported`, 'This principal received unsupported-method response despite a working administrator control. This is not an authorization denial.', { kind: 'actor-unsupported', actor, requestedMethod: definition.method, stage: result.stage, httpStatus: result.response.status, rpcCode: -32601 });
@@ -458,15 +516,17 @@ export async function readTools(ctx, mcp, roomFixture) {
             const result = await mcp.rpc(actor, probe.agent, 'tools/call', { name: probe.tool, arguments: probe.args || {} });
             ctx.report.agentReadResults.push({ agent: probe.agent, tool: probe.tool, actor, stage: result.stage, status: result.response.status });
             const filtered = actor === 'selfRegistered' && filteredListing;
+            const ownAccountGate = actor === 'selfRegistered' && probe.policy === 'own-account';
             const denied = !filtered && (actor === 'anonymous' || probe.policy === 'admin' || (actor === 'selfRegistered' && probe.policy === 'workspace'));
-            if (denied) assertAgentMcpDenied(result);
+            if (ownAccountGate) await assertOwnAccountRouteGate(ctx, probe, result, actor);
+            else if (denied) assertAgentMcpDenied(result);
             else if (filtered) assertAgentFilteredEmpty(probe, result, ctx.principals[actor]);
             else assertAgentReadPositive(probe, result, ctx.principals[actor]);
         });
     }
 }
 
-export async function usernamePrivilegeProbe(ctx, mcp, roomFixture) {
+export async function usernamePrivilegeProbe(ctx, mcp, roomFixture, { revalidationMs = 45000, pollMs = 2000 } = {}) {
     let original;
     let changed = false;
     await ctx.check('agent.username-admin.profile-positive', async () => {
@@ -510,13 +570,33 @@ export async function usernamePrivilegeProbe(ctx, mcp, roomFixture) {
         requireObject(update.json);
         assert.equal(update.json.ok, true);
         assert.equal(update.json.profile?.user?.username, 'admin', 'Username mutation requires a persisted profile control');
-        const current = await ctx.request('userA', { path: '/auth/token?agent=workspaceMonitorAgent' });
+        // The Router principal is a session snapshot that is refreshed from the
+        // provider at most every ssoValidationIntervalMs (30 s by default,
+        // cli/server/auth/genericAuthBridge.js, createGenericAuthBridge and
+        // validateSession), and the provider's refresh returns the stored username
+        // (userPersistoAgent/runtime/index.mjs, sso_refresh_session and
+        // normalizeUser). The denial probes below prove nothing unless the Router
+        // principal really carries the changed username, so wait, boundedly, for it.
+        let persistedRole = false;
         await ctx.check('agent.username-admin.persisted-role', async () => {
+            const deadline = Date.now() + revalidationMs;
+            let current;
+            for (;;) {
+                current = await ctx.request('userA', { path: '/auth/token?agent=workspaceMonitorAgent' });
+                if (current.status === 200 && current.json?.user?.username === 'admin') break;
+                if (Date.now() >= deadline) break;
+                await pause(pollMs);
+            }
             assert.deepEqual(current.json?.user?.roles, ['user'], 'Disposable actor must remain real ordinary user');
             assert.equal(current.json?.user?.username, 'admin', 'Changed username must be in verified Router principal');
+            persistedRole = true;
         });
-        await ctx.check('agent.username-admin.monitor-denial', async () => assertAgentMcpDenied(await mcp.rpc('userA', 'workspaceMonitorAgent', 'tools/call', { name: 'workspace_monitor_settings_get', arguments: {} })));
+        await ctx.check('agent.username-admin.monitor-denial', async () => {
+            assert.ok(persistedRole, 'The username shortcut was not exercised: the Router principal never carried the changed username');
+            assertAgentMcpDenied(await mcp.rpc('userA', 'workspaceMonitorAgent', 'tools/call', { name: 'workspace_monitor_settings_get', arguments: {} }));
+        });
         await ctx.check('agent.username-admin.webmeet-role', async () => {
+            assert.ok(persistedRole, 'The username shortcut was not exercised: the Router principal never carried the changed username');
             assert.ok(roomFixture?.roomId, 'Username room-role control requires the task-owned fixture');
             const result = await mcp.rpc('userA', 'webmeetAgent', 'tools/call', { name: 'webmeet_room_list', arguments: {} });
             assertAgentReadPositive({ tool: 'webmeet_room_list', requiredRoomId: roomFixture?.roomId }, result, ctx.principals.userA);

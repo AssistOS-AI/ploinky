@@ -97,7 +97,8 @@ export const INLINE_TEMPLATES = Object.freeze([
     ['stream-probes.mjs', 'router:terminal-resize-deny:${actor}', nonAdmin.map(a => [a]), ['router:terminal-resize-positive:admin']],
     ['stream-probes.mjs', 'router:terminal-delete-deny:${actor}', nonAdmin.map(a => [a]), ['router:terminal-create-positive:admin']],
     ['stream-probes.mjs', 'router:terminal-delete-positive:admin', [[]], null],
-    ['stream-probes.mjs', 'router:terminal-discovery-cleanup:admin', [[]], null],
+    ['stream-probes.mjs', 'router:terminal-discovery-delete-positive:admin', [[]], null],
+    ['stream-probes.mjs', 'router:terminal-discovery-cleanup:admin', [[]], ['router:terminal-discovery-delete-positive:admin']],
     ['stream-probes.mjs', 'router:mcp-session-create-positive:${actor}', ['userA', 'userB'].map(a => [a]), null],
     ['stream-probes.mjs', 'router:mcp-session-delete-own-positive:userA', [[]], null],
     ['stream-probes.mjs', 'router:mcp-session-horizontal-delete-deny:userA-to-userB', [[]], ['router:mcp-session-delete-own-positive:userA']],
@@ -191,7 +192,9 @@ export function enumerateMandatoryChecks({ expectedRuntimes, expectedGaps }) {
         }
     }
     add('agent.username-admin.profile-positive', { boundary: 'agents', source: 'agent-probes.mjs usernamePrivilegeProbe' });
-    for (const id of ['persisted-role', 'monitor-denial', 'webmeet-role']) add(`agent.username-admin.${id}`, { boundary: 'agents', source: 'agent-probes.mjs usernamePrivilegeProbe', positiveControlAnyOf: ['agent.username-admin.profile-positive'] });
+    // The two denial probes mean nothing unless the Router principal carried the changed username.
+    add('agent.username-admin.persisted-role', { boundary: 'agents', source: 'agent-probes.mjs usernamePrivilegeProbe', positiveControlAnyOf: ['agent.username-admin.profile-positive'] });
+    for (const id of ['monitor-denial', 'webmeet-role']) add(`agent.username-admin.${id}`, { boundary: 'agents', source: 'agent-probes.mjs usernamePrivilegeProbe', positiveControlAnyOf: ['agent.username-admin.persisted-role'] });
 
     for (const [module, template, expansions, positives] of INLINE_TEMPLATES) {
         for (const values of expansions) add(expandTemplate(template, values), { boundary: module.replace('-probes.mjs', ''), source: `tests/security/authorization/${module}`, positiveControlAnyOf: positives });

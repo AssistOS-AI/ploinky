@@ -863,11 +863,19 @@ test('REJECT: a supported DPU MCP method returning 404 or -32000 is never exclud
 test('capability probes: retained controls pass on the real shapes and fail on missing/failed services', async () => {
     const lk = expectedRuntimes.capabilities.find(c => c.agent === 'liveKitServerAgent');
     const caps = policy.capabilities;
-    const handler = ({ soulDb = true, signal = 200, mcp404 = true } = {}) => (actor, { path: p, method = 'GET' }) => {
+    const handler = ({ soulDb = true, signal = 200, mcp = 'inactive' } = {}) => (actor, { path: p, method = 'GET' }) => {
         if (p.endsWith('/healthz/')) return json(200, { ok: true, db: soulDb, snapshotGeneration: 1, uptimeSeconds: 5 });
         if (p.endsWith('/7880/')) return { status: signal, text: 'OK', headers: {} };
         if (p.includes('/twirp/')) return json(401, { ok: false, error: 'not_authenticated' });
-        if (p === '/liveKitServerAgent/mcp') return mcp404 ? json(404, { error: 'agent_not_found', agent: 'liveKitServerAgent' }) : json(200, { jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'still starting' } });
+        if (p === '/liveKitServerAgent/mcp') {
+            // Real shape: a route without a primary port is answered with the exact inactive-target 503.
+            if (mcp === 'inactive') return json(503, { error: 'TARGET_INACTIVE' });
+            if (mcp === 'agent_not_found') return json(404, { error: 'agent_not_found', agent: 'liveKitServerAgent' });
+            if (mcp === 'other-503') return json(503, { error: 'edge_generation_changed' });
+            if (mcp === 'inactive-with-detail') return json(503, { error: 'TARGET_INACTIVE', detail: 'x' });
+            if (mcp === 'inactive-with-session') return { ...json(503, { error: 'TARGET_INACTIVE' }), headers: { 'mcp-session-id': 'created' } };
+            return json(200, { jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'still starting' } });
+        }
         return json(404, {});
     };
     const deps = (overrides = {}) => ({ capabilities: caps,
@@ -884,13 +892,26 @@ test('capability probes: retained controls pass on the real shapes and fail on m
         [handler(), { hostPort: 43000 }, 'capability:liveKitServerAgent:no-primary-port'],
         [handler(), { running: false }, 'capability:liveKitServerAgent:runtime-image'],
         [handler(), { image: 'docker.io/other@sha256:y' }, 'capability:liveKitServerAgent:runtime-image'],
-        [handler({ mcp404: false }), {}, 'capability:liveKitServerAgent:mcp-absent-corroboration:admin'],
+        [handler({ mcp: 'agent_not_found' }), {}, 'capability:liveKitServerAgent:mcp-absent-corroboration:admin'],
+        [handler({ mcp: 'other-503' }), {}, 'capability:liveKitServerAgent:mcp-absent-corroboration:admin'],
+        [handler({ mcp: 'inactive-with-detail' }), {}, 'capability:liveKitServerAgent:mcp-absent-corroboration:admin'],
+        [handler({ mcp: 'inactive-with-session' }), {}, 'capability:liveKitServerAgent:mcp-absent-corroboration:admin'],
+        [handler({ mcp: 'still-starting' }), {}, 'capability:liveKitServerAgent:mcp-absent-corroboration:admin'],
     ];
     for (const [h, o, id] of cases) {
         const ctx = fakeCtx(h); ctx.report.deployment = good.report.deployment;
         await runCapabilityProbes(ctx, deps(o));
         assert.equal(ctx.report.checks.find(c => c.id === id).status, 'FAIL', id);
     }
+    // The inactive-target corroboration is mandatory only with its no-primary-port control.
+    const corroboration = mandatory.checks.find(c => c.id === 'capability:liveKitServerAgent:mcp-absent-corroboration:admin');
+    assert.deepEqual(corroboration.positiveControlAnyOf, ['capability:liveKitServerAgent:no-primary-port']);
+    const failedControl = acceptedRun();
+    failedControl.report.checks.find(c => c.id === 'capability:liveKitServerAgent:no-primary-port').status = 'FAIL';
+    failedControl.report.counts = { PASS: failedControl.report.counts.PASS - 1, FAIL: 1, ERROR: 0 };
+    failedControl.report.verdict = 'FAIL'; failedControl.exitCode = 1;
+    const rejected = evaluate(failedControl);
+    assert.ok(rejected.reasons.includes('MANDATORY_POSITIVE_CONTROL_FAILED: capability:liveKitServerAgent:mcp-absent-corroboration:admin'), rejected.reasons.join(' | '));
     const down = fakeCtx(handler({ signal: 503 })); down.report.deployment = good.report.deployment;
     await runCapabilityProbes(down, deps());
     assert.equal(down.report.checks.find(c => c.id === 'capability:liveKitServerAgent:signaling-route:anonymous').status, 'FAIL');
@@ -924,7 +945,7 @@ test('Router workspace-write matrix: all 68 checks are mandatory, counted once a
         assert.ok(['admin', 'userA'].includes(positive.actor), 'the positive is an entitled actor');
     }
     assert.equal(denials.filter(r => r.operation === 'sink-upload').every(r => r.positiveControl === 'router:workspace-upload-owner-positive:admin'), true);
-    assert.deepEqual({ live: mandatory.counts.live, offline: mandatory.counts.offline }, { live: 569, offline: 10 });
+    assert.deepEqual({ live: mandatory.counts.live, offline: mandatory.counts.offline }, { live: 570, offline: 10 });
 });
 
 test('Router workspace-write matrix: no row can be satisfied as an expected gap, and an unavailable denial rejects twice', () => {
@@ -1117,4 +1138,45 @@ test('U6 removal polling tolerates an owned process exiting under inspection but
     const failing = async (value, options = {}) => { if (!options.prefix) throw new Error('cat: /proc/573/environ: No such file or directory'); return strict.inspectProcesses(value, options); };
     await runWebchatProbes(strict.ctx, { ...strict, inspectProcesses: failing, timing: fast });
     assert.notEqual(status(strict.ctx, 'u6:webchat-distinct-processes'), 'PASS');
+});
+
+test('guest-agent selfRegistered tool visibility is accepted only as the two exact reviewed lists', () => {
+    for (const agent of ['webAssist', 'webmeetAgent']) {
+        const id = `agent.${agent}.discovery.tools.list.selfRegistered.scope`;
+        const entry = expectedGaps.gaps.find(g => g.id === id);
+        assert.ok(entry && entry.evidence.kind === 'selfregistered-visible-tools' && entry.evidence.visibleTools.length > 0, id);
+        assert.deepEqual(validateExpectedGaps(expectedGaps, inputs), []);
+        let run = acceptedRun();
+        assert.equal(evaluate(run).decision, 'ACCEPT');
+        run = acceptedRun();
+        run.report.gaps.find(g => g.id === id).evidence.visibleTools = [...entry.evidence.visibleTools, 'a_new_tool'].sort();
+        expectReject(run, 'GAP_EVIDENCE_MISMATCH', `${agent} exposes an extra tool`);
+        run = acceptedRun();
+        run.report.gaps.find(g => g.id === id).evidence.visibleTools = entry.evidence.visibleTools.slice(1);
+        expectReject(run, 'GAP_EVIDENCE_MISMATCH', `${agent} exposes fewer tools than reviewed`);
+        run = acceptedRun();
+        run.report.gaps = run.report.gaps.filter(g => g.id !== id);
+        expectReject(run, 'GAP_MISSING', `${agent} gap must be present once reviewed`);
+    }
+    // Any other agent or method stays unexpected, and anonymous never becomes a gap.
+    for (const id of ['agent.webAssist.discovery.resources.list.selfRegistered.scope', 'agent.dpuAgent.discovery.tools.list.selfRegistered.scope', 'agent.webAssist.discovery.tools.list.anonymous.scope']) {
+        const run = acceptedRun();
+        run.report.gaps.push({ id, reason: 'r', evidence: { kind: 'selfregistered-visible-tools', actor: 'selfRegistered', visibleTools: ['x'] } });
+        expectReject(run, 'GAP_UNEXPECTED', id);
+    }
+});
+
+test('the profile_get and username-admin mandatory chain follows the corrected probes', () => {
+    const entry = id => mandatory.checks.find(c => c.id === id);
+    assert.deepEqual(entry('agent.username-admin.persisted-role').positiveControlAnyOf, ['agent.username-admin.profile-positive']);
+    for (const id of ['agent.username-admin.monitor-denial', 'agent.username-admin.webmeet-role']) assert.deepEqual(entry(id).positiveControlAnyOf, ['agent.username-admin.persisted-role'], id);
+    assert.deepEqual(entry('router:terminal-discovery-cleanup:admin').positiveControlAnyOf, ['router:terminal-discovery-delete-positive:admin']);
+    assert.ok(entry('router:terminal-discovery-delete-positive:admin'));
+    // A failed persisted-role leaves the two denial probes without a passing positive control.
+    const run = acceptedRun();
+    run.report.checks.find(c => c.id === 'agent.username-admin.persisted-role').status = 'FAIL';
+    run.report.counts = { PASS: run.report.counts.PASS - 1, FAIL: 1, ERROR: 0 };
+    run.report.verdict = 'FAIL'; run.exitCode = 1;
+    const result = evaluate(run);
+    for (const id of ['agent.username-admin.monitor-denial', 'agent.username-admin.webmeet-role']) assert.ok(result.reasons.includes(`MANDATORY_POSITIVE_CONTROL_FAILED: ${id}`), id);
 });
