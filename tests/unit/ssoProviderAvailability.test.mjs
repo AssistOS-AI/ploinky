@@ -62,8 +62,11 @@ const { authService } = await import('../../cli/server/authHandlers/shared.js');
 const { resolveAuthContextForRoutePlan } = await import('../../cli/server/authHandlers/authContext.js');
 const { mintBrowserCsrfToken } = await import('../../cli/server/browserMutationSecurity.js');
 const { handleWebtty } = await import('../../cli/server/handlers/webtty.js');
-const { WebttySessionManager } = await import('../../cli/server/webtty/sessionManager.mjs');
+const { WebttySessionManager, WEBTTY_SESSION_LIMITS } = await import('../../cli/server/webtty/sessionManager.mjs');
 const { createBrowserSessionLease } = await import('../../cli/server/webtty/authLease.mjs');
+const { handleUserAdminRoutes } = await import('../../cli/server/authHandlers/userAdminRoutes.js');
+const { handleMarketplaceRoutes } = await import('../../cli/server/authHandlers/marketplaceRoutes.js');
+const { policy } = await import('../../cli/server/policy/index.js');
 
 test.after(() => {
     process.chdir(previous.cwd);
@@ -349,6 +352,24 @@ test('a WebTTY request does not reuse an admission after logout and keeps fresh 
     assert.equal(providerCalls - periodicBefore, 1);
 });
 
+test('a WebTTY request does not reuse its admission after a configuration reload', async () => {
+    const sessionId = await login();
+    provider((providerSession) => described(providerSession));
+    const routePlan = webttyPlan();
+    const manager = webttyManager();
+    const owner = await admitWebtty({ method: 'GET', url: '/webtty', sessionId, routePlan });
+    const terminal = registerTerminal(manager, owner.req, routePlan);
+    const { req, admitted } = await admitWebtty({ method: 'GET', url: `/webtty/sessions/${terminal.id}/stream`, sessionId, routePlan });
+    assert.equal(admitted.ok, true);
+    const reused = providerCalls;
+    assert.equal(await manager.validateOwnership(req, routePlan, terminal.id), terminal);
+    assert.equal(providerCalls - reused, 0, 'the same request reuses its own admission');
+    authService.reloadConfig();
+    const before = providerCalls;
+    assert.equal(await manager.validateOwnership(req, routePlan, terminal.id), terminal);
+    assert.equal(providerCalls - before, 1, 'a reload makes the request admission stale');
+});
+
 test('a WebTTY request during a provider outage is a retryable 503 and keeps the terminal', async () => {
     const sessionId = await login();
     provider((providerSession) => described(providerSession));
@@ -368,6 +389,89 @@ test('a WebTTY request during a provider outage is a retryable 503 and keeps the
     assert.equal(admitted.ok, false);
     assert.equal(res.statusCode, 503);
     assert.ok(authService.getSession(sessionId));
+});
+
+function clockedWebttyManager(clock) {
+    const manager = new WebttySessionManager({
+        workspaceRoot: workspace,
+        recordStore: { recover: async () => ({ ok: true }) },
+        launchStore: {},
+        targetResolver: {},
+        now: () => clock.now,
+    });
+    manager.ready = true;
+    return manager;
+}
+
+async function clockedTerminal(sessionId, clock) {
+    provider((providerSession) => described(providerSession));
+    const routePlan = webttyPlan();
+    const manager = clockedWebttyManager(clock);
+    const owner = await admitWebtty({ method: 'GET', url: '/webtty', sessionId, routePlan });
+    const terminal = registerTerminal(manager, owner.req, routePlan);
+    terminal.createdAt = clock.now;
+    terminal.lastActivityAt = clock.now;
+    const closed = [];
+    manager.closeSession = async (session, reason) => { closed.push(reason); session.closed = true; manager.sessions.delete(session.id); return true; };
+    return { manager, closed };
+}
+
+async function periodicChecksUntil(manager, clock, untilMs, stepMs = WEBTTY_SESSION_LIMITS.authenticationIntervalMs) {
+    while (clock.now < untilMs) {
+        clock.now += stepMs;
+        await manager.validateLiveSessions();
+    }
+}
+
+test('the WebTTY outage bound is a named 60 s limit above the restart window', () => {
+    assert.equal(WEBTTY_SESSION_LIMITS.authenticationOutageLimitMs, 60_000);
+    assert.ok(WEBTTY_SESSION_LIMITS.authenticationOutageLimitMs < WEBTTY_SESSION_LIMITS.idleLifetimeMs);
+});
+
+test('a provider outage shorter than the bound keeps the terminal, and a decided check restarts the bound', async () => {
+    const clock = { now: 1_000_000 };
+    const sessionId = await login();
+    const { manager, closed } = await clockedTerminal(sessionId, clock);
+    const start = clock.now;
+    provider(() => { throw unavailable(); });
+    // Undecided checks from start + 5 s through start + 60 s: 55 s of outage.
+    await periodicChecksUntil(manager, clock, start + 60_000);
+    assert.deepEqual(closed, [], 'an outage shorter than the bound keeps the terminal');
+    provider((providerSession) => described(providerSession));
+    await periodicChecksUntil(manager, clock, start + 65_000);
+    provider(() => { throw unavailable(); });
+    // A new outage is measured from its own first undecided check (start + 70 s).
+    await periodicChecksUntil(manager, clock, start + 125_000);
+    assert.deepEqual(closed, [], 'the bound restarted at the decided check');
+    await periodicChecksUntil(manager, clock, start + 130_000);
+    assert.deepEqual(closed, ['auth_provider_unavailable']);
+    assert.ok(authService.getSession(sessionId), 'closing the terminal does not end the login');
+});
+
+test('a provider outage longer than the bound closes the terminal; a refusal still closes at once', async () => {
+    const clock = { now: 2_000_000 };
+    const sessionId = await login();
+    const { manager, closed } = await clockedTerminal(sessionId, clock);
+    const start = clock.now;
+    provider(() => { throw unavailable(); });
+    await periodicChecksUntil(manager, clock, start + 60_000);
+    assert.deepEqual(closed, [], 'first undecided check at +5 s; +60 s is 55 s of outage');
+    await periodicChecksUntil(manager, clock, start + 65_000);
+    assert.deepEqual(closed, ['auth_provider_unavailable'], '60 s of continuous outage closes the terminal');
+
+    const refused = await login();
+    const second = await clockedTerminal(refused, clock);
+    provider(() => { throw Object.assign(new Error('session_revoked'), { code: 'session_revoked', statusCode: 401 }); });
+    await periodicChecksUntil(second.manager, clock, clock.now + 5_000);
+    assert.deepEqual(second.closed, ['auth_missing_or_expired'], 'a refusal closes on the first check');
+
+    const loggedOut = await login();
+    const third = await clockedTerminal(loggedOut, clock);
+    provider(() => { throw unavailable(); });
+    await periodicChecksUntil(third.manager, clock, clock.now + 5_000);
+    await authService.logout(loggedOut, {});
+    await periodicChecksUntil(third.manager, clock, clock.now + 5_000);
+    assert.deepEqual(third.closed, ['auth_missing_or_expired'], 'logout closes during an outage without waiting for the bound');
 });
 
 test('WebTTY target discovery reuses its admission and revalidates once after discovery', async () => {
@@ -392,3 +496,75 @@ test('WebTTY target discovery reuses its admission and revalidates once after di
     assert.equal(discovery.id, 'discovery-abcdefghijklmnop');
     assert.equal(providerCalls - before, 1, 'only the post-discovery revalidation asks the provider');
 });
+
+function marketplacePublicPlan() {
+    const snapshot = { generation: 'availability-generation', routing, agents, manifests: {} };
+    return {
+        ok: true,
+        kind: 'router-surface',
+        surface: 'marketplace-ui',
+        listener: 'public',
+        host: 'explorer.example.test',
+        forwarding: { protocol: 'https', authority: 'explorer.example.test' },
+        hostSelection: { kind: 'agent-root', host: 'explorer.example.test', record: { routeKey: 'explorer' } },
+        snapshot,
+        lease: { id: snapshot.generation, snapshot, commit: () => true },
+    };
+}
+
+// Every Router surface that admits an SSO session answers an undecided
+// admission with a retryable 503 and keeps the session; a refusal keeps its
+// existing status.
+const adminSurfaces = [
+    ['user administration', 401, async (sessionId) => {
+        const req = request({ url: '/api/agents/explorer/users', cookie: `ploinky_sso=${sessionId}` });
+        const res = new MockResponse();
+        await handleUserAdminRoutes(req, res, new URL(req.url, 'http://localhost'), { routePlan: controlPlan() });
+        return { res, code: JSON.parse(res.body).error };
+    }],
+    ['public marketplace', 401, async (sessionId) => {
+        const req = request({ url: '/api/marketplace/agents', cookie: `ploinky_sso=${sessionId}`, host: 'explorer.example.test' });
+        const res = new MockResponse();
+        await handleMarketplaceRoutes(req, res, new URL(req.url, 'https://explorer.example.test'),
+            { routePlan: marketplacePublicPlan(), agentListOptions: { liveContainers: [] } });
+        return { res, code: JSON.parse(res.body).error };
+    }],
+    ['control marketplace', 401, async (sessionId) => {
+        const req = request({ url: '/api/marketplace/agents', cookie: `ploinky_sso=${sessionId}` });
+        const res = new MockResponse();
+        await handleMarketplaceRoutes(req, res, new URL(req.url, 'http://localhost'),
+            { routePlan: null, agentListOptions: { liveContainers: [] } });
+        return { res, code: JSON.parse(res.body).error };
+    }],
+    ['policy command', 401, async (sessionId) => {
+        const req = request({ method: 'POST', url: '/policy/command', cookie: `ploinky_sso=${sessionId}`, body: { command: 'http.route.list' } });
+        const res = new MockResponse();
+        await policy.commandInvoker.handle(req, res, { routePlan: controlPlan() });
+        return { res, code: JSON.parse(res.body).error?.code };
+    }],
+];
+
+for (const [surface, refusalStatus, call] of adminSurfaces) {
+    test(`${surface} answers a provider outage with a retryable 503 and keeps the session`, async () => {
+        const sessionId = await login();
+        provider(() => { throw unavailable(); });
+        const before = providerCalls;
+        const { res, code } = await call(sessionId);
+        assert.equal(res.statusCode, 503, res.body);
+        assert.match(String(code), /^authentication_unavailable$/i);
+        assert.equal(res.getHeader('retry-after'), '5');
+        assert.equal(res.getHeader('cache-control'), 'no-store');
+        assert.equal(clearsSsoCookie(res), false, 'the browser keeps its session cookie');
+        assert.ok(authService.getSession(sessionId), 'the Router keeps the session');
+        assert.equal(providerCalls - before, 1);
+    });
+
+    test(`${surface} still answers a definitive refusal with ${refusalStatus} and ends the session`, async () => {
+        const sessionId = await login();
+        provider(() => { throw Object.assign(new Error('session_revoked'), { code: 'session_revoked', statusCode: 401 }); });
+        const { res } = await call(sessionId);
+        assert.equal(res.statusCode, refusalStatus, res.body);
+        assert.equal(res.getHeader('retry-after'), undefined);
+        assert.equal(authService.getSession(sessionId), null);
+    });
+}

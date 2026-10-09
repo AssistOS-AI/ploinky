@@ -32,6 +32,11 @@ import { projectMarketplaceAgent, projectMarketplaceRepository, projectRepositor
 import { canonicalControlOrigin, verifyAdminMutationRequest } from '../adminControlSecurity.js';
 import { verifyBrowserMutationRequest } from '../browserMutationSecurity.js';
 import { resolveAuthContextForRouteKey } from './authContext.js';
+import {
+    AUTHENTICATION_UNAVAILABLE_MESSAGE,
+    authenticationUnavailableHeaders,
+    isSsoProviderUnavailable,
+} from '../auth/ssoAdmission.js';
 import { computeRchHttp, sha256RawBodyHash } from '../../../Agent/lib/requestHash.mjs';
 import { verifyAgentAssertion } from '../mcp-proxy/invocationMinter.js';
 import { createTokenReplayCache } from '../security/tokens/JwsCodec.js';
@@ -625,14 +630,30 @@ async function ensureMarketplaceAdmin(req, res, parsedUrl, { routePlan = null } 
     return true;
 }
 
+// An undecided provider admission keeps the browser session: the client retries.
+async function admitMarketplaceSsoSession(res, ssoSessionId) {
+    try {
+        return { ok: true, session: await authService.validateSession(ssoSessionId, { reportUnavailable: true }) };
+    } catch (error) {
+        if (!isSsoProviderUnavailable(error)) throw error;
+        for (const [name, value] of Object.entries(authenticationUnavailableHeaders())) res.setHeader(name, value);
+        sendMarketplaceError(res, 503, 'authentication_unavailable', AUTHENTICATION_UNAVAILABLE_MESSAGE);
+        return { ok: false };
+    }
+}
+
 async function ensureMarketplaceUser(req, res, { routePlan = null } = {}) {
     const cookies = parseCookies(req);
     const localSessionId = cookies.get(LOCAL_AUTH_COOKIE_NAME);
     if (routePlan?.hostSelection?.kind === 'agent-root') {
         const context = publicMarketplaceAuthContext(routePlan);
         const ssoSessionId = cookies.get(SSO_AUTH_COOKIE_NAME);
-        const session = context && ssoSessionId && authService.isConfigured()
-            ? await authService.validateSession(ssoSessionId) : null;
+        let session = null;
+        if (context && ssoSessionId && authService.isConfigured()) {
+            const admission = await admitMarketplaceSsoSession(res, ssoSessionId);
+            if (!admission.ok) return { ok: false };
+            session = admission.session;
+        }
         if (!session?.user || (session.expiresAt && Date.now() > session.expiresAt)) {
             sendMarketplaceError(res, 401, 'not_authenticated', 'Authentication is required for this workspace.');
             return { ok: false };
@@ -656,7 +677,9 @@ async function ensureMarketplaceUser(req, res, { routePlan = null } = {}) {
 
     const ssoSessionId = cookies.get(SSO_AUTH_COOKIE_NAME);
     if (ssoSessionId && authService.isConfigured()) {
-        const session = await authService.validateSession(ssoSessionId);
+        const admission = await admitMarketplaceSsoSession(res, ssoSessionId);
+        if (!admission.ok) return { ok: false };
+        const { session } = admission;
         if (session?.user && (!session.expiresAt || Date.now() <= session.expiresAt)) {
             req.user = session.user;
             req.session = session;

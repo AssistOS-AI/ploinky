@@ -53,7 +53,7 @@ const commandInvoker = new PolicyCommandInvoker({
     registry, auditLog, getSession, isAdminUser,
     allowLocalSession: localSessionAllowedForRoutePlan,
     getProviderSession: (id) => authService.isConfigured()
-        ? authService.validateSession(id, { forceRemote: true })
+        ? authService.validateSession(id, { reportUnavailable: true })
         : null,
 });
 

@@ -72,6 +72,14 @@ export const WEBTTY_SESSION_LIMITS = Object.freeze({
     idleLifetimeMs: 10 * 60_000,
     absoluteLifetimeMs: 60 * 60_000,
     authenticationIntervalMs: 5_000,
+    // Longest continuous stretch of undecided periodic checks (provider
+    // unavailable) an open terminal survives. A provider restart is normally
+    // decided again within a few 5 s checks (the Router answers fast 503s
+    // for a few seconds while an agent restarts, and each check is bounded by
+    // the 5 s validation deadline); a longer outage closes the terminal rather
+    // than streaming output for up to the absolute lifetime without a decided
+    // admission.
+    authenticationOutageLimitMs: 60_000,
     streamDetachGraceMs: 15_000,
     tombstoneLifetimeMs: 5 * 60_000,
     maxTombstones: 256,
@@ -1246,10 +1254,28 @@ export class WebttySessionManager {
                 }
             }
             const auth = await this.auth.validateLease(session.lease);
-            // A provider outage keeps the terminal; every request on it still
-            // needs a decided admission, and logout or revocation closes it at once.
-            if (!auth.ok && auth.reason !== 'provider_unavailable') {
+            // Every request on the terminal still needs a decided admission,
+            // and logout, revocation or refusal closes it at once.
+            if (auth.ok) {
+                // Results are ordered by the start of their check: an older
+                // decided check does not end an outage a newer check observed.
+                session.authDecidedAt = Math.max(Number(session.authDecidedAt) || 0, now);
+                if (!Number.isFinite(session.authUndecidedSince) || now >= session.authUndecidedSince) {
+                    session.authUndecidedSince = null;
+                }
+                return;
+            }
+            if (auth.reason !== 'provider_unavailable') {
                 await this.closeSession(session, `auth_${auth.reason}`);
+                return;
+            }
+            // A provider outage keeps the terminal only for a bounded time,
+            // measured from the first undecided check after the last decided
+            // one. A check that started before a later decided check is stale.
+            if (now < (Number(session.authDecidedAt) || 0)) return;
+            if (!Number.isFinite(session.authUndecidedSince)) session.authUndecidedSince = now;
+            if (now - session.authUndecidedSince >= this.limits.authenticationOutageLimitMs) {
+                await this.closeSession(session, 'auth_provider_unavailable');
             }
         }));
     }

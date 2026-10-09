@@ -356,7 +356,7 @@ test('response-free validation refreshes and persists current SSO identity, then
     assert.deepEqual(bridge.getSession(callback.sessionId).user.roles, ['user', 'admin']);
 
     process.env.__FAKE_PROVIDER_REFRESH_FAIL = '1';
-    assert.equal(await bridge.validateSession(callback.sessionId, { forceRemote: true }), null);
+    assert.equal(await bridge.validateSession(callback.sessionId), null);
     assert.equal(bridge.getSession(callback.sessionId), null);
     const refreshCalls = readCalls().filter((call) => call.op === 'sso_refresh_session');
     assert.ok(refreshCalls.length >= 2);
@@ -719,6 +719,52 @@ test('a configuration reload releases a hung provider call so new admissions do 
     assert.equal(await stale, null);
     const fresh = await Promise.race([bridge.validateSession(sessionId), sleep(1000).then(() => 'still pending')]);
     assert.deepEqual(fresh?.user?.roles, ['user']);
+    assert.equal(calls, 2);
+});
+
+test('a configuration reload during validation reports unavailability and keeps the session', async (t) => {
+    const { bridge, sessionId } = await freshFixture(t);
+    const invalidations = recordInvalidations(t);
+    const entered = deferred();
+    const release = deferred();
+    t.after(() => release.resolve());
+    let calls = 0;
+    globalThis.__bridgeValidationFixture = async providerSession => {
+        if (++calls === 1) { entered.resolve(); await release.promise; }
+        return described(providerSession, ['user']);
+    };
+    const inFlight = bridge.validateSession(sessionId, { reportUnavailable: true })
+        .then(() => 'granted', error => error.code);
+    await entered.promise;
+    bridge.reloadConfig();
+    release.resolve();
+    assert.equal(await inFlight, 'SSO_PROVIDER_UNAVAILABLE', 'a reload is retryable, not a refusal');
+    assert.deepEqual(bridge.getSession(sessionId)?.user?.roles, ['dev'], 'the session survives unchanged');
+    assert.equal(invalidations.length, 0);
+    assert.deepEqual((await bridge.validateSession(sessionId, { reportUnavailable: true })).user.roles, ['user']);
+    assert.equal(calls, 2);
+});
+
+test('a provider configuration change during validation reports unavailability and keeps the session', async (t) => {
+    const { bridge, sessionId } = await freshFixture(t);
+    const invalidations = recordInvalidations(t);
+    const entered = deferred();
+    const release = deferred();
+    t.after(() => release.resolve());
+    let calls = 0;
+    globalThis.__bridgeValidationFixture = async providerSession => {
+        if (++calls === 1) { entered.resolve(); await release.promise; }
+        return described(providerSession, ['user']);
+    };
+    const inFlight = bridge.validateSession(sessionId, { reportUnavailable: true })
+        .then(() => 'granted', error => error.code);
+    await entered.promise;
+    writeWorkspaceSsoConfig({ enabled: true, providerAgent: 'fake/fakeProvider', providerConfig: { clientId: 'rotated-client' } });
+    release.resolve();
+    assert.equal(await inFlight, 'SSO_PROVIDER_UNAVAILABLE', 'an answer for the old configuration is retryable');
+    assert.deepEqual(bridge.getSession(sessionId)?.user?.roles, ['dev'], 'the answer was not published');
+    assert.equal(invalidations.length, 0);
+    assert.deepEqual((await bridge.validateSession(sessionId, { reportUnavailable: true })).user.roles, ['user']);
     assert.equal(calls, 2);
 });
 
