@@ -6,7 +6,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { SESSION_SECRET_REQUIRED, decodeAgentMcp, historyResultOf, sessionSecretDeclared, webAssistGuestCheckDefinitions, webAssistGuestProbes } from './agent-probes.mjs';
-import { WEBASSIST_SESSION_SECRET_TOOLS } from './guest-agent-policy.mjs';
+import { GUEST_COOKIE_NAMES, WEBASSIST_SESSION_SECRET_TOOLS } from './guest-agent-policy.mjs';
 import { assertAgentMcpDenied } from './agent-probes.mjs';
 
 const text = value => ({ status: 200, headers: {}, json: { result: { content: [{ type: 'text', text: JSON.stringify(value) }] } } });
@@ -85,7 +85,7 @@ function world(options = {}, { clients, factory = true } = {}) {
   const checks = [];
   const ctx = {
     secrets: new Set(), cleanups: [], checks, webAssistSessionFactory: factory ? model.factory : undefined,
-    clients: clients || { anonymous: { cookies: [{ name: 'ploinky_guest', value: 'guest-A' }] }, anonymousB: { cookies: [{ name: 'ploinky_guest', value: 'guest-B' }] } },
+    clients: clients || { anonymous: { cookies: [{ name: GUEST_COOKIE_NAMES.webAssist, value: 'guest-A' }] }, anonymousB: { cookies: [{ name: GUEST_COOKIE_NAMES.webAssist, value: 'guest-B' }] } },
     cleanup(fn) { this.cleanups.push(fn); },
     async check(id, fn) { try { await fn(); checks.push({ id, status: 'PASS' }); } catch (error) { checks.push({ id, status: 'FAIL', error: String(error?.message || error) }); } },
     request: model.request,
@@ -197,7 +197,7 @@ test('without a session fixture, or with a fixture that cannot be seeded, everyt
 });
 
 test('two jars that hold the same guest session, or none, are not two visitors', async () => {
-  const same = await run({}, { clients: { anonymous: { cookies: [{ name: 'ploinky_guest', value: 'guest-A' }] }, anonymousB: { cookies: [{ name: 'ploinky_guest', value: 'guest-A' }] } } });
+  const same = await run({}, { clients: { anonymous: { cookies: [{ name: GUEST_COOKIE_NAMES.webAssist, value: 'guest-A' }] }, anonymousB: { cookies: [{ name: GUEST_COOKIE_NAMES.webAssist, value: 'guest-A' }] } } });
   assert.match(same.checks.find(check => check.id === IDS['anonymous.session-fixture']).error, /distinct guest sessions/);
   assert.equal(statuses(same)[IDS['anonymous.session-history-cross-read']], 'FAIL');
   const none = await run({}, { clients: { anonymous: { cookies: [] }, anonymousB: { cookies: [] } } });

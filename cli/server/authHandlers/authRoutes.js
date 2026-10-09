@@ -1,5 +1,5 @@
 import { getSession as getLocalSession, isAdminUser, verifySessionJwt, revokeSession as revokeLocalSession } from '../auth/localService.js';
-import { revokeSessionId } from '../auth/sessionRevocations.js';
+import { revokeSessionIds } from '../auth/sessionRevocations.js';
 import { isSsoProviderUnavailable } from '../auth/ssoAdmission.js';
 import { canonicalControlOrigin, mintAdminCsrfToken } from '../adminControlSecurity.js';
 import {
@@ -14,8 +14,12 @@ import {
     authService,
     buildCookie,
     getCookieNameForMode,
-    GUEST_AUTH_COOKIE_NAME,
     GUEST_SESSION_TTL_SECONDS,
+    guestCookieNameForAuthContext,
+    guestCookieNameForRouteKey,
+    isGuestCookieName,
+    isGuestCookieRouteRequiredError,
+    LEGACY_GUEST_AUTH_COOKIE_NAME,
     normalizeRelativePath,
     parseCookies,
     readJsonBody,
@@ -128,7 +132,7 @@ async function resolveBrowserTokenSession(cookies, authContext) {
             },
             {
                 mode: 'guest',
-                cookieName: GUEST_AUTH_COOKIE_NAME,
+                cookieName: guestCookieNameForAuthContext(authContext),
                 getSession: (sessionId) => sessionTokenService.getGuestSession(sessionId, {
                     policy: authContext.policy,
                 }),
@@ -136,7 +140,7 @@ async function resolveBrowserTokenSession(cookies, authContext) {
         ]
         : [{
             mode: authContext.mode,
-            cookieName: getCookieNameForMode(authContext.mode),
+            cookieName: getCookieNameForMode(authContext.mode, authContext),
             getSession: (sessionId) => authService.validateSession(sessionId, { reportUnavailable: true }),
         }];
 
@@ -164,6 +168,63 @@ async function resolveBrowserTokenSession(cookies, authContext) {
         }
     }
     return { invalidCookie };
+}
+
+function respondGuestRouteUnresolved(res) {
+    sendJson(res, 503, { ok: false, error: 'guest_route_unresolved' });
+    return true;
+}
+
+function verifiedGuestPayload(token) {
+    try {
+        const payload = verifySessionJwt(token);
+        return payload?.typ === 'guest-session' ? payload : null;
+    } catch {
+        return null;
+    }
+}
+
+// The other guest identities a guest logout retires. Only Router-known names
+// qualify: the legacy name, and a derived name that equals the name of the
+// cookie's own verified guest route. Client-chosen names are neither revoked
+// nor echoed back.
+function presentedGuestLogoutCookies(cookies, primaryCookieName) {
+    const clearNames = [];
+    const payloads = [];
+    for (const [name, value] of cookies) {
+        if (name === primaryCookieName || !isGuestCookieName(name)) continue;
+        if (name === LEGACY_GUEST_AUTH_COOKIE_NAME) {
+            clearNames.push(name);
+            const payload = verifiedGuestPayload(value);
+            if (payload) payloads.push(payload);
+            continue;
+        }
+        const payload = verifiedGuestPayload(value);
+        if (!payload) continue;
+        let routeCookieName;
+        try {
+            routeCookieName = guestCookieNameForRouteKey(payload.groute);
+        } catch (error) {
+            if (isGuestCookieRouteRequiredError(error)) continue;
+            throw error;
+        }
+        if (routeCookieName !== name) continue;
+        clearNames.push(name);
+        payloads.push(payload);
+    }
+    return { clearNames, payloads };
+}
+
+function uniqueRevocations(payloads, reason) {
+    const seen = new Set();
+    const revocations = [];
+    for (const payload of payloads) {
+        const key = payload?.sid ? `sid:${payload.sid}` : (payload?.jti ? `jti:${payload.jti}` : '');
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        revocations.push({ sid: payload.sid, jti: payload.jti, reason });
+    }
+    return revocations;
 }
 
 function denyBrowserMutation(res, decision) {
@@ -360,7 +421,13 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
                 res.writeHead(405); res.end(); return true;
             }
             const cookies = parseCookies(req);
-            const cookieName = getCookieNameForMode(authContext.mode);
+            let cookieName;
+            try {
+                cookieName = getCookieNameForMode(authContext.mode, authContext);
+            } catch (error) {
+                if (!isGuestCookieRouteRequiredError(error)) throw error;
+                return respondGuestRouteUnresolved(res);
+            }
             const sessionId = cookies.get(cookieName) || '';
             const session = sessionId
                 ? (authContext.mode === 'guest'
@@ -419,13 +486,21 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
                 return true;
             }
             if (!requireCurrentGeneration(res, routePlan)) return true;
-            // For guest JWT sessions, add the session's sid to
-            // the persistent revocation list so the cookie cannot be replayed.
+            // For guest JWT sessions, add the session's sid to the persistent
+            // revocation list so the cookie cannot be replayed. A guest logout
+            // also retires the visitor's other guest-route identities, in one
+            // write of the revocation list.
+            const guestClearNames = [];
             if (sessionId && authContext.mode === 'guest') {
+                const payloads = [];
                 try {
                     const payload = verifySessionJwt(sessionId);
-                    revokeSessionId({ sid: payload.sid, jti: payload.jti, reason: 'logout' });
+                    payloads.push(payload);
                 } catch { /* already invalid/expired — nothing to revoke */ }
+                const others = presentedGuestLogoutCookies(cookies, cookieName);
+                guestClearNames.push(...others.clearNames);
+                payloads.push(...others.payloads);
+                revokeSessionIds(uniqueRevocations(payloads, 'logout'));
             }
             const outcome = authContext.mode === 'guest'
                 ? (revokeLocalSession(sessionId), { redirect: requestedReturnTo || '/' })
@@ -437,6 +512,9 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
             const clearCsrfCookie = buildCookie(BROWSER_CSRF_COOKIE_NAME, '', req, '/', { maxAge: 0, sameSite: 'Strict' });
             const redirectTarget = outcome.redirect || requestedReturnTo || '/';
             appendSetCookie(res, clearCookie);
+            for (const name of guestClearNames) {
+                appendSetCookie(res, buildCookie(name, '', req, '/', { maxAge: 0, sameSite: 'Lax' }));
+            }
             appendSetCookie(res, clearCsrfCookie);
             const wantsJson = !outcome.redirect
                 && String(req.headers?.accept || '').toLowerCase().includes('application/json');
@@ -467,7 +545,13 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
                 res.writeHead(405); res.end(); return true;
             }
             const cookies = parseCookies(req);
-            const tokenSession = await resolveBrowserTokenSession(cookies, authContext);
+            let tokenSession;
+            try {
+                tokenSession = await resolveBrowserTokenSession(cookies, authContext);
+            } catch (error) {
+                if (!isGuestCookieRouteRequiredError(error)) throw error;
+                return respondGuestRouteUnresolved(res);
+            }
             if (tokenSession.unavailable) {
                 appendLog('auth_provider_unavailable', { path: pathname });
                 res.writeHead(503, {

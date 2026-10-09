@@ -4,12 +4,25 @@ import { createAuthService } from '../auth/service.js';
 import { GUEST_SESSION_TTL_SECONDS, getSessionCookieMaxAge as getLocalSessionCookieMaxAge, mintGuestSessionJwt, mintSessionJwt, revokeSession as revokeLocalSession, verifySessionJwt } from '../auth/localService.js';
 import { isSessionRevoked } from '../auth/sessionRevocations.js';
 import { SessionTokenService } from '../security/tokens/SessionTokenService.js';
+import {
+    LEGACY_GUEST_AUTH_COOKIE_NAME,
+    guestCookieNameForAuthContext,
+    guestCookieNameForRouteKey,
+    isGuestCookieName,
+    isGuestCookieRouteRequiredError,
+} from '../auth/guestCookieNames.js';
 
 export { appendLog, parseCookies, buildCookie, readJsonBody, appendSetCookie, GUEST_SESSION_TTL_SECONDS, getLocalSessionCookieMaxAge, verifySessionJwt };
+export {
+    LEGACY_GUEST_AUTH_COOKIE_NAME,
+    guestCookieNameForAuthContext,
+    guestCookieNameForRouteKey,
+    isGuestCookieName,
+    isGuestCookieRouteRequiredError,
+};
 
 export const SSO_AUTH_COOKIE_NAME = 'ploinky_sso';
 export const LOCAL_AUTH_COOKIE_NAME = 'ploinky_jwt';
-export const GUEST_AUTH_COOKIE_NAME = 'ploinky_guest';
 export const AUTH_COOKIE_NAME = SSO_AUTH_COOKIE_NAME;
 export const authService = createAuthService();
 export const sessionTokenService = new SessionTokenService({
@@ -200,9 +213,11 @@ async function readLoginBody(req) {
     return Object.fromEntries(params.entries());
 }
 
-function getCookieNameForMode(mode) {
+// Guest cookies are per guest route: the name derives from the auth context and
+// throws GUEST_COOKIE_ROUTE_REQUIRED when the context names no route.
+function getCookieNameForMode(mode, authContext = null) {
     if (mode === 'local') return LOCAL_AUTH_COOKIE_NAME;
-    if (mode === 'guest') return GUEST_AUTH_COOKIE_NAME;
+    if (mode === 'guest') return guestCookieNameForAuthContext(authContext);
     return SSO_AUTH_COOKIE_NAME;
 }
 

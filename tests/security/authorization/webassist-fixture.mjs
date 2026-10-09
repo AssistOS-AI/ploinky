@@ -3,7 +3,7 @@
  *
  * A webAssist chat session can be created only by web_cli_chat, which performs
  * inference. The suite seeds one instead: for each anonymous jar it decodes the guest
- * identity from that jar's own `ploinky_guest` JWT, then writes, under a run-owned site
+ * identity from that jar's own webAssist guest-session JWT, then writes, under a run-owned site
  * in the fixture workspace's webAssist data root, the session knowledge unit with a
  * marker turn (through the AgenticKnowledgeUnits library, which takes its own root and
  * per-unit locks) and the session-owner record.
@@ -32,8 +32,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { guestCookieNameFor } from './guest-agent-policy.mjs';
 
-export const GUEST_COOKIE = 'ploinky_guest';
+/** The webAssist route's guest session cookie (guest cookies are per guest route). */
+export const GUEST_COOKIE = guestCookieNameFor('webAssist');
 const GUEST_SUBJECT = /^user:guest:[A-Za-z0-9-]{1,128}$/;
 const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const SITE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -58,8 +60,9 @@ export function webAssistPersistentRoot(workspace) {
 }
 
 /** The guest identity a jar presents: the `sub` of its own guest-session JWT (no signature check; the Router verifies it). */
-export function guestSubjectFromJar(cookies, { now = () => Date.now() } = {}) {
-  const cookie = (cookies || []).find(entry => entry?.name === GUEST_COOKIE && entry.value);
+export function guestSubjectFromJar(cookies, { now = () => Date.now(), routeKey = 'webAssist' } = {}) {
+  const name = guestCookieNameFor(routeKey);
+  const cookie = (cookies || []).find(entry => entry?.name === name && entry.value);
   assert.ok(cookie, 'The jar holds no guest session cookie; initialize the webAssist route first');
   const parts = String(cookie.value).split('.');
   assert.equal(parts.length, 3, 'The guest cookie is not a compact JWT');

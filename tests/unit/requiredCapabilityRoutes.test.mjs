@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import { guestCookieNameForRouteKey } from '../../cli/server/auth/guestCookieNames.js';
+
 const previousCwd = process.cwd();
 const previousKey = process.env.PLOINKY_MASTER_KEY;
 const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-capability-routes-'));
@@ -209,7 +211,12 @@ test('an explicitly authenticated service dashboard uses its own capability and 
 
 test('the dashboard requires a verified user session even though its agent auth mode is none', async (t) => {
     const { snapshot } = fixture(t);
-    for (const cookie of ['', 'ploinky_sso=forged', 'ploinky_guest=guest-session']) {
+    for (const cookie of [
+        '',
+        'ploinky_sso=forged',
+        `${guestCookieNameForRouteKey('accountService')}=guest-session`,
+        'ploinky_guest=guest-session', // legacy-guest-cookie-case
+    ]) {
         const { res, result } = await access(snapshot, {
             url: DASHBOARD, headers: { cookie, accept: 'application/json' },
         }, SERVICE_DECISION);

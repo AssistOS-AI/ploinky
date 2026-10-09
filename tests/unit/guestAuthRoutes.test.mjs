@@ -7,6 +7,8 @@ import { Readable } from 'node:stream';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { signBrowserSessionFixture } from '../helpers/routerSessionFixture.mjs';
+import { ANY_GUEST_SET_COOKIE } from '../helpers/guestCookies.mjs';
+import { guestCookieNameForRouteKey } from '../../cli/server/auth/guestCookieNames.js';
 
 import { dispatchAgentStartupRequest } from '../../cli/server/agentStartupDispatch.js';
 
@@ -14,6 +16,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, '../..');
 const MASTER_KEY = '4'.repeat(64);
+const WEBASSIST_GUEST_COOKIE = guestCookieNameForRouteKey('webAssist');
 
 class MockResponse {
     constructor() {
@@ -232,14 +235,14 @@ test('guest routes use the guest agent policy instead of the static Explorer pol
     assert.equal(mcpReq.authMode, 'guest');
     assert.equal(mcpReq.user?.username, 'visitor');
     assert.deepEqual(mcpReq.user?.roles, ['guest']);
-    assert.match(String(mcpRes.getHeader('set-cookie') || ''), /^ploinky_guest=/);
+    const guestJwt = String(mcpReq.sessionId || '');
+    assert.ok(String(mcpRes.getHeader('set-cookie') || '').startsWith(`${WEBASSIST_GUEST_COOKIE}=${guestJwt};`));
     assert.doesNotMatch(String(mcpRes.getHeader('set-cookie') || ''), /^ploinky_jwt=/);
 
-    const guestJwt = String(mcpReq.sessionId || '');
     const tokenReq = makeRequest({
         method: 'GET',
         url: '/auth/token?agent=webAssist',
-        cookie: `ploinky_jwt=invalid-local-session; ploinky_guest=${guestJwt}`,
+        cookie: `ploinky_jwt=invalid-local-session; ${WEBASSIST_GUEST_COOKIE}=${guestJwt}`,
     });
     const tokenRes = new MockResponse();
     const tokenParsedUrl = new URL(tokenReq.url, 'http://localhost');
@@ -271,7 +274,7 @@ test('guest routes use the guest agent policy instead of the static Explorer pol
     assert.equal(manifestGuestRes.statusCode, 401);
     assert.equal(manifestGuestReq.authMode, undefined);
     assert.equal(manifestGuestReq.user, undefined);
-    assert.doesNotMatch(String(manifestGuestRes.getHeader('set-cookie') || ''), /^ploinky_guest=/);
+    assert.doesNotMatch(String(manifestGuestRes.getHeader('set-cookie') || ''), ANY_GUEST_SET_COOKIE);
     const staleManifestBody = JSON.parse(manifestGuestRes.body || '{}');
     assert.equal(staleManifestBody.error, 'not_authenticated');
     assert.match(staleManifestBody.login, /agent=explorer/);
@@ -307,7 +310,7 @@ test('guest routes use the guest agent policy instead of the static Explorer pol
     assert.equal(location.pathname, '/auth/login');
     assert.equal(location.searchParams.get('agent'), 'explorer');
     assert.equal(location.searchParams.get('returnTo'), '/webchat?agent=webAdmin');
-    assert.doesNotMatch(String(webAdminChatRes.getHeader('set-cookie') || ''), /^ploinky_guest=/);
+    assert.doesNotMatch(String(webAdminChatRes.getHeader('set-cookie') || ''), ANY_GUEST_SET_COOKIE);
 });
 
 function assertOwnerLogin(result, req, res, label) {
@@ -319,7 +322,7 @@ function assertOwnerLogin(result, req, res, label) {
     assert.equal(new URL(login, 'http://localhost').searchParams.get('agent'), 'explorer', label);
     assert.equal(req.user, undefined, label);
     assert.equal(req.authMode, undefined, label);
-    assert.doesNotMatch(String(res.getHeader('set-cookie') || ''), /ploinky_guest=/, label);
+    assert.doesNotMatch(String(res.getHeader('set-cookie') || ''), ANY_GUEST_SET_COOKIE, label);
 }
 
 test('R5 an undeclared guest WebChat selector requires the workspace owner login', async (t) => {
@@ -1195,7 +1198,7 @@ test('browser token accepts an exact manifest guest path without widening depend
         method: 'GET',
         url: `/auth/token?mutationRoute=webAssist&mutationPath=%2FwebAssist%2FroomLoader.html&roomId=${roomId}`,
         host: 'explorer.localhost',
-        cookie: `ploinky_guest=${guestToken}`,
+        cookie: `${WEBASSIST_GUEST_COOKIE}=${guestToken}`,
     });
     const allowedRes = new MockResponse();
     await authHandlers.handleAuthRoutes(
@@ -1220,7 +1223,7 @@ test('browser token accepts an exact manifest guest path without widening depend
             method: 'GET',
             url: `/auth/token?mutationRoute=webAssist&mutationPath=%2FwebAssist%2FroomLoader.html${suffix}`,
             host: 'explorer.localhost',
-            cookie: `ploinky_guest=${guestToken}`,
+            cookie: `${WEBASSIST_GUEST_COOKIE}=${guestToken}`,
         });
         const deniedScopeRes = new MockResponse();
         await authHandlers.handleAuthRoutes(
@@ -1244,7 +1247,7 @@ test('browser token accepts an exact manifest guest path without widening depend
         method: 'POST',
         url: '/webAssist/mcp',
         host: 'explorer.localhost',
-        cookie: `ploinky_guest=${guestToken}`,
+        cookie: `${WEBASSIST_GUEST_COOKIE}=${guestToken}`,
     });
     const mcpRes = new MockResponse();
     const mcpResult = await authHandlers.ensureAuthenticated(
@@ -1267,7 +1270,7 @@ test('browser token accepts an exact manifest guest path without widening depend
             method: 'GET',
             url: `/auth/token?mutationRoute=webAssist&mutationPath=${encodeURIComponent(mutationPath)}`,
             host: 'explorer.localhost',
-            cookie: `ploinky_guest=${guestToken}`,
+            cookie: `${WEBASSIST_GUEST_COOKIE}=${guestToken}`,
         });
         const deniedRes = new MockResponse();
         await authHandlers.handleAuthRoutes(
@@ -1305,7 +1308,7 @@ test('browser token accepts an exact manifest guest path without widening depend
         method: 'GET',
         url: '/auth/token?mutationRoute=webAssist&mutationPath=%2FwebAssist%2FroomLoader.html',
         host: 'explorer.localhost',
-        cookie: `ploinky_guest=${guestToken}`,
+        cookie: `${WEBASSIST_GUEST_COOKIE}=${guestToken}`,
     });
     const outsideRes = new MockResponse();
     await authHandlers.handleAuthRoutes(
@@ -1414,7 +1417,7 @@ test('ensureHttpRouteAccess denies none, deny, missing, and unknown decisions', 
         const result = await authHandlers.ensureHttpRouteAccess(req, res, new URL(req.url, 'http://localhost'), decision);
         assert.equal(result.ok, false, JSON.stringify(decision));
         assert.equal(res.statusCode >= 400, true, JSON.stringify(decision));
-        assert.doesNotMatch(String(res.getHeader('set-cookie') || ''), /^ploinky_guest=/);
+        assert.doesNotMatch(String(res.getHeader('set-cookie') || ''), ANY_GUEST_SET_COOKIE);
     }
 });
 
@@ -1461,7 +1464,7 @@ test('parameterized guest routes mint an exact scope and reject unbound guest en
         assert.equal(denied.ok, false, url);
         assert.equal(deniedRes.statusCode, 403, url);
         assert.equal(JSON.parse(deniedRes.body).error, 'guest_scope_parameter_invalid', url);
-        assert.doesNotMatch(String(deniedRes.getHeader('set-cookie') || ''), /^ploinky_guest=/);
+        assert.doesNotMatch(String(deniedRes.getHeader('set-cookie') || ''), ANY_GUEST_SET_COOKIE);
     }
 
     const admin = {
@@ -1484,7 +1487,7 @@ test('parameterized guest routes mint an exact scope and reject unbound guest en
     );
     assert.equal(adminResult.ok, true);
     assert.equal(adminReq.authMode, 'local');
-    assert.doesNotMatch(String(adminRes.getHeader('set-cookie') || ''), /^ploinky_guest=/);
+    assert.doesNotMatch(String(adminRes.getHeader('set-cookie') || ''), ANY_GUEST_SET_COOKIE);
 });
 
 test('a guest-session JWT in the ploinky_jwt cookie never satisfies an authenticated route', async (t) => {
@@ -1537,7 +1540,7 @@ test('an SSO user session takes precedence over guest minting on guest routes', 
     assert.equal(result.ok, true);
     assert.equal(req.authMode, 'sso');
     assert.equal(req.user.username, 'alice');
-    assert.doesNotMatch(String(res.getHeader('set-cookie') || ''), /^ploinky_guest=/);
+    assert.doesNotMatch(String(res.getHeader('set-cookie') || ''), ANY_GUEST_SET_COOKIE);
 });
 
 test('an authenticated route enforces its manifest capability against the live SSO identity', async (t) => {
@@ -1618,7 +1621,7 @@ test('authenticated route key with guest auth falls back to static route auth in
     assert.equal(res.statusCode, 401);
     assert.equal(body.error, 'not_authenticated');
     assert.match(String(body.login || ''), /agent=explorer/);
-    assert.doesNotMatch(String(res.getHeader('set-cookie') || ''), /^ploinky_guest=/);
+    assert.doesNotMatch(String(res.getHeader('set-cookie') || ''), ANY_GUEST_SET_COOKIE);
 });
 
 test('authenticated route key without configured auth uses route-specific detail', async (t) => {
@@ -1663,7 +1666,7 @@ test('authenticated guest route key without static user auth fails closed', asyn
     assert.equal(res.statusCode, 503);
     assert.equal(body.error, 'authenticated_http_route_auth_not_configured');
     assert.equal(body.detail, 'Authenticated HTTP routes require a user-authenticated route or static-agent auth policy.');
-    assert.doesNotMatch(String(res.getHeader('set-cookie') || ''), /^ploinky_guest=/);
+    assert.doesNotMatch(String(res.getHeader('set-cookie') || ''), ANY_GUEST_SET_COOKIE);
 });
 
 test('startup dispatch preserves the real access and host matrix before lifecycle observation', async (t) => {
@@ -1858,7 +1861,7 @@ test('startup dispatch preserves the real access and host matrix before lifecycl
             routeKey: 'webAssist',
             decision: guestDecision,
             query: `?roomId=${roomId}`,
-            cookie: `ploinky_guest=${guestToken}`,
+            cookie: `${WEBASSIST_GUEST_COOKIE}=${guestToken}`,
         });
         assert.equal(guestAllowed.req.authMode, 'guest');
         assert.equal(guestAllowed.req.session?._jwtPayload?.gscope, `webmeet:room:${roomId}`);
@@ -1873,7 +1876,7 @@ test('startup dispatch preserves the real access and host matrix before lifecycl
                     routeKey: 'webAssist',
                     decision: guestDecision,
                     query,
-                    cookie: `ploinky_guest=${guestToken}`,
+                    cookie: `${WEBASSIST_GUEST_COOKIE}=${guestToken}`,
                     result,
                 });
                 assert.equal(denied.lifecycleReads, 0);
@@ -2207,9 +2210,12 @@ test('static-auth DPU WebChat admits only SSO users with Explorer access (G, NX,
 
     // G: an anonymous visitor or a WebMeet guest is sent to the Explorer login.
     const guestMint = makeRequest({ method: 'POST', url: '/webAssist/mcp' });
-    await authHandlers.ensureAuthenticated(guestMint, new MockResponse(), new URL(guestMint.url, 'http://localhost'));
+    const guestMintRes = new MockResponse();
+    await authHandlers.ensureAuthenticated(guestMint, guestMintRes, new URL(guestMint.url, 'http://localhost'));
     assert.equal(guestMint.authMode, 'guest');
-    for (const cookie of ['', `ploinky_guest=${guestMint.sessionId}`]) {
+    // Positive control: the presented cookie is the one the guest route set.
+    assert.ok(String(guestMintRes.getHeader('set-cookie') || '').startsWith(`${WEBASSIST_GUEST_COOKIE}=${guestMint.sessionId};`));
+    for (const cookie of ['', `${WEBASSIST_GUEST_COOKIE}=${guestMint.sessionId}`]) {
         const pageAttempt = await attempt({ url: page, cookie });
         assert.equal(pageAttempt.result.ok, false);
         assert.equal(pageAttempt.res.statusCode, 302);
@@ -2217,7 +2223,7 @@ test('static-auth DPU WebChat admits only SSO users with Explorer access (G, NX,
         assert.equal(location.pathname, '/auth/login');
         assert.equal(location.searchParams.get('agent'), 'explorer');
         assert.equal(pageAttempt.req.user, undefined);
-        assert.doesNotMatch(String(pageAttempt.res.getHeader('set-cookie') || ''), /ploinky_guest=/);
+        assert.doesNotMatch(String(pageAttempt.res.getHeader('set-cookie') || ''), ANY_GUEST_SET_COOKIE);
         const streamAttempt = await attempt({ url: stream, cookie, accept: 'text/event-stream' });
         assert.equal(streamAttempt.result.ok, false);
         assert.equal(streamAttempt.req.user, undefined);
