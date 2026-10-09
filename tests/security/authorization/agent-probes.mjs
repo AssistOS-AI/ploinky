@@ -161,6 +161,9 @@ export function assertAgentReadPositive(probe, result, principal) {
             assert.ok(Array.isArray(value.rooms));
             assert.equal(typeof value.canManageRooms, 'boolean');
             if (principal) assert.equal(value.canManageRooms, principal.roles.includes('admin'), 'Room management must follow persisted role');
+            // With a task-owned open room, an entitled listing that omits it
+            // (including an empty list) is not a working positive control.
+            if (probe.requiredRoomId) assert.ok(value.rooms.some((room) => room?.id === probe.requiredRoomId || room?.roomId === probe.requiredRoomId), 'Entitled room listing must include the task-owned open team room');
             break;
         case 'webmeet_room_events_list':
             assert.ok(Array.isArray(value.events), 'Workspace room feed requires an events array');
@@ -178,15 +181,37 @@ export function assertAgentReadPositive(probe, result, principal) {
     }
 }
 
-// A filtered listing claim is meaningful only when the administrator control
-// on the same deployment listed at least one entry.
-export function hasNonEmptyListingControl(probe, positive) {
-    const entries = positive?.value?.[probe.lesserUserFilteredField];
-    return Array.isArray(entries) && entries.length > 0;
+// A filtered (exactly empty) listing proves nothing against an empty store.
+// The suite therefore creates its own open team room before the read probes,
+// requires every entitled listing to contain it, and fails rather than records
+// a gap when that fixture cannot be created.
+export async function createRoomListingFixture(ctx, mcp) {
+    let fixture;
+    await ctx.check('agent.tool.webmeet_room_list.fixture', async () => {
+        await ctx.guard();
+        const name = `${ctx.prefix}-listing-room`;
+        const created = await mcp.rpc('admin', 'webmeetAgent', 'tools/call', { name: 'webmeet_room_create', arguments: { name, roomType: 'team' } });
+        assert.equal(created.success, true, 'Administrator could not create the task-owned listing room');
+        const roomId = created.value?.roomId || created.value?.id;
+        assert.ok(typeof roomId === 'string' && /^room_[0-9a-f-]{36}$/i.test(roomId), 'Room creation returned no room ID');
+        ctx.cleanup(async () => {
+            await ctx.guard();
+            // Delete only the exact room this run created, identified by ID and run-scoped name.
+            const current = await mcp.rpc('admin', 'webmeetAgent', 'tools/call', { name: 'webmeet_room_get', arguments: { roomId } });
+            assert.equal(current.success, true, 'Listing room cleanup could not read the owned room');
+            const view = current.value?.meeting || current.value?.room || current.value;
+            assert.equal(view?.id || view?.roomId, roomId, 'Listing room cleanup identity mismatch');
+            assert.equal(view?.name || view?.title, name, 'Listing room cleanup name mismatch');
+            const deleted = await mcp.rpc('admin', 'webmeetAgent', 'tools/call', { name: 'webmeet_room_delete', arguments: { roomId, confirmed: true } });
+            assert.equal(deleted.success, true, 'Listing room cleanup delete failed');
+        });
+        fixture = { roomId, name };
+    });
+    return fixture;
 }
 
 export function assertAgentFilteredEmpty(probe, result, principal) {
-    assertAgentReadPositive(probe, result, principal);
+    assertAgentReadPositive({ ...probe, requiredRoomId: undefined }, result, principal);
     assert.deepEqual(result.value[probe.lesserUserFilteredField], [], 'Lesser user must receive an exactly empty filtered listing');
     if (probe.tool === 'webmeet_room_list') assert.equal(result.value.canManageRooms, false, 'Lesser user must not receive room management');
 }
@@ -329,9 +354,15 @@ export async function discoverAgentMcp(ctx, mcp, catalog = agentCatalog) {
     }
 }
 
-export async function readTools(ctx, mcp) {
+export async function readTools(ctx, mcp, roomFixture) {
     ctx.report.agentReadResults ||= [];
-    for (const probe of agentReadTools) {
+    for (const listedProbe of agentReadTools) {
+        const filteredListing = Boolean(listedProbe.lesserUserFilteredField);
+        if (filteredListing && !roomFixture) {
+            await ctx.check(`agent.tool.${listedProbe.tool}.fixture-required`, async () => assert.fail('Task-owned room fixture unavailable; no room listing claim can be made'));
+            continue;
+        }
+        const probe = filteredListing ? { ...listedProbe, requiredRoomId: roomFixture.roomId } : listedProbe;
         let positive;
         try {
             positive = await mcp.rpc('admin', probe.agent, 'tools/call', { name: probe.tool, arguments: probe.args || {} });
@@ -343,11 +374,7 @@ export async function readTools(ctx, mcp) {
         await ctx.check(`agent.tool.${probe.tool}.admin`, async () => assertAgentReadPositive(probe, positive, ctx.principals.admin));
         if (probe.tool === 'workspace_monitor_snapshot_get' && !positive.value.available) ctx.recordGap('agent.tool.workspace_monitor_snapshot_get.data', 'Snapshot status works but no actual snapshot data is available; data-disclosure coverage remains incomplete.');
         for (const actor of ['anonymous', 'selfRegistered', 'userA', 'userB']) {
-            const filtered = actor === 'selfRegistered' && Boolean(probe.lesserUserFilteredField);
-            if (filtered && !hasNonEmptyListingControl(probe, positive)) {
-                ctx.recordGap(`agent.tool.${probe.tool}.selfRegistered`, 'Administrator control listed no entries; an exactly empty filtered result cannot be distinguished from an empty store. No filtered-listing claim is made.');
-                continue;
-            }
+            const filtered = actor === 'selfRegistered' && filteredListing;
             await ctx.check(`agent.tool.${probe.tool}.${actor}`, async () => {
                 const result = await mcp.rpc(actor, probe.agent, 'tools/call', { name: probe.tool, arguments: probe.args || {} });
                 ctx.report.agentReadResults.push({ agent: probe.agent, tool: probe.tool, actor, stage: result.stage, status: result.response.status });
@@ -360,7 +387,7 @@ export async function readTools(ctx, mcp) {
     }
 }
 
-async function usernamePrivilegeProbe(ctx, mcp) {
+async function usernamePrivilegeProbe(ctx, mcp, roomFixture) {
     let original;
     let changed = false;
     await ctx.check('agent.username-admin.profile-positive', async () => {
@@ -411,7 +438,7 @@ async function usernamePrivilegeProbe(ctx, mcp) {
         await ctx.check('agent.username-admin.monitor-denial', async () => assertAgentMcpDenied(await mcp.rpc('userA', 'workspaceMonitorAgent', 'tools/call', { name: 'workspace_monitor_settings_get', arguments: {} })));
         await ctx.check('agent.username-admin.webmeet-role', async () => {
             const result = await mcp.rpc('userA', 'webmeetAgent', 'tools/call', { name: 'webmeet_room_list', arguments: {} });
-            assertAgentReadPositive({ tool: 'webmeet_room_list' }, result, ctx.principals.userA);
+            assertAgentReadPositive({ tool: 'webmeet_room_list', requiredRoomId: roomFixture?.roomId }, result, ctx.principals.userA);
             assert.equal(result.value?.canManageRooms, false, 'Ordinary user acquired administrator room-management projection through username');
         });
     } finally { await restore(); }
@@ -445,8 +472,9 @@ export async function runAgentProbes(ctx) {
         });
     }
     await discoverAgentMcp(ctx, mcp);
-    await readTools(ctx, mcp);
-    await usernamePrivilegeProbe(ctx, mcp);
+    const roomFixture = await createRoomListingFixture(ctx, mcp);
+    await readTools(ctx, mcp, roomFixture);
+    await usernamePrivilegeProbe(ctx, mcp, roomFixture);
     for (const gap of [
         ['agent.websocket', 'LiveKit public WebSocket requires scoped room token; robot/browser requires unavailable optional backend. No missing-token or failed-upgrade response proves resource authorization.'],
         ['agent.image-routes', 'OnlyOffice DocumentServer, LiveKit, Umami and disabled GPTResearcher expose image-owned dynamic route families. Wildcards remain explicit unresolved endpoint-inventory gaps.'],

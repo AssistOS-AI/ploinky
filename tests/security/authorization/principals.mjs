@@ -161,6 +161,10 @@ export async function setupPrincipals(ctx, config) {
         assert.ok(profile.json?.ok && profile.json?.profile, 'Signed profile must be readable');
         assert.equal(profile.json.profile.user?.id, p.id, 'UserPersisto profile must match the Router principal');
         assert.deepEqual(profile.json.profile.roles.map(role => typeof role === 'string' ? role : role.name).sort(), [...p.roles].sort(), 'Profile and Router roles must agree');
+        // Room/robot listing and the workspace room feed expect ordinary users to
+        // hold explorer.access and selfRegistered not to; verify, don't assume.
+        const capabilities = Array.isArray(profile.json.profile.capabilities) ? profile.json.profile.capabilities : [];
+        assert.equal(capabilities.includes('explorer.access'), name !== 'selfRegistered', `${name} explorer.access capability does not match the listing expectations`);
     }
     ctx.report.principals = Object.entries(ctx.principals).map(([name, p]) => ({ name, idHash: ctx.hash(p.id), roles: p.roles, source: name === 'admin' ? 'configured administrator session' : 'fresh verified public development email registration', authoritativeRoleVerified: true }));
     await writePrivate(path.join(config.privateRoot, 'principals.json'), ctx.principals);
