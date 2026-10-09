@@ -20,7 +20,7 @@
  * Router's `event: startup-state` `{"state":"ready"}`; `failed`, a close, a
  * transport end or the deadline fails the check and nothing is sent to it.
  * Process identity is the DPU node process inside the pinned DPU container,
- * attributed to a principal by its router-issued --sso-user-id and identified
+ * attributed to a principal by its router-issued SSO_USER_ID (or --sso-user-id) and identified
  * by pid plus kernel start time; raw argv/environment stay private.
  *
  * Collaborators are injectable so the decision logic is unit-tested offline:
@@ -38,6 +38,12 @@ export const webchatProbe = Object.freeze({
     cap: 3,
     waitMs: 15000,
     readyMs: 60000, // bounded wait for the Router's `startup-state: ready` before any input or process census
+    // Bounded wait for a closed stream's runtime to disappear. The Router keeps a runtime whose last stream
+    // closed for STREAM_RECONNECT_GRACE_MS = 120000 (cli/server/handlers/webchat/runtimeState.js:6, armed by
+    // scheduleDisconnectedTabCleanup at :1013-1032), and only then disposes the TTY and the DPU process exits.
+    // A deadline equal to the grace expires before the dispose can happen, so it carries a margin for the
+    // disposal and the in-container exit.
+    removalMs: 180000,
     maxEventBytes: 256 * 1024,
     dpuEntry: Object.freeze(['node', '/code/src/index.mjs']), // AchillesIDE dpuAgent/manifest.json:25 "cli"
 });
@@ -217,13 +223,30 @@ async function waitForCount(handle, predicate, minimum, ms) {
 /** Split a NUL-free argv dump (unit-separator joined) into tokens. */
 function argvOf(dump) { return String(dump).split('\x1f').filter(Boolean); }
 
+const SSO_ARGUMENT = '--sso-user-id=';
+const SSO_ENVIRONMENT = 'SSO_USER_ID=';
+/**
+ * The Router appends `--sso-user-id=<id>` to the WebChat command (cli/server/webchat/tty.js buildSsoCliArgs), but
+ * the in-Box CLI start removes every `--sso-*` argument and exports it instead as `SSO_USER_ID=<id>` before it
+ * runs the agent (cli/commands/workspaceUtil.js:3848-3858, "SSO context is passed as env vars, not CLI flags"). The
+ * agent process therefore carries the router-issued identity in its environment and normally not in its argv.
+ * Both carriers are read; the identity is the single value they agree on. A repeated carrier or two different
+ * values leave the process unattributed (null), and nothing is ever inferred from the launch query.
+ */
+export function routerIssuedUserId(argv, environ) {
+    const fromArgv = argv.filter(a => a.startsWith(SSO_ARGUMENT)).map(a => a.slice(SSO_ARGUMENT.length));
+    const fromEnviron = String(environ).split('\0').filter(entry => entry.startsWith(SSO_ENVIRONMENT)).map(entry => entry.slice(SSO_ENVIRONMENT.length));
+    const all = [...fromArgv, ...fromEnviron];
+    return fromArgv.length <= 1 && fromEnviron.length <= 1 && new Set(all).size === 1 ? all[0] : null;
+}
+
 /**
  * In-Box inspector for the pinned DPU runtime: lists processes inside the DPU
  * agent container only, selects exactly the DPU entry (argv[0] node,
  * argv[1] /code/src/index.mjs) so shell and podman-exec wrappers never count,
  * matches the launch value on the --authz-probe flag exactly (or by prefix for
  * removal), and returns pid, kernel start time (/proc/<pid>/stat field 22) and
- * the router-issued --sso-user-id. An unreadable environment is an error.
+ * the router-issued identity (environment SSO_USER_ID, or argv --sso-user-id). An unreadable environment is an error.
  *
  * One narrow exception exists for owned cleanup: with `tolerateOwnedExit` and a
  * prefix match (the caller's own nonce), a process listed moments earlier may
@@ -261,8 +284,7 @@ export function dpuProcessInspector({ boxId, container, run = (args) => execFile
                     return [];
                 }
                 assert.ok(environ.length > 0, 'Process environment must be readable for confinement checks');
-                const ids = p.argv.filter(a => a.startsWith('--sso-user-id=')).map(a => a.slice('--sso-user-id='.length));
-                return [{ pid: p.pid, start: p.start, ssoUserId: ids.length === 1 ? ids[0] : null, args: p.argv.join(' '), environ }];
+                return [{ pid: p.pid, start: p.start, ssoUserId: routerIssuedUserId(p.argv, environ), args: p.argv.join(' '), environ }];
             });
         found.vanished = vanished;
         return found;
@@ -272,22 +294,24 @@ export function dpuProcessInspector({ boxId, container, run = (args) => execFile
 const identity = p => `${p.pid}@${p.start}`;
 
 /**
- * Redacted diagnosis of a process whose router-issued --sso-user-id matches no test principal:
- * the class (absent, repeated, the Router's guest fallback, or a foreign value) and, for a foreign
- * value, only a short prefix of its hash, comparable with the report's principal idHash values.
+ * Redacted diagnosis of a process whose router-issued identity matches no test principal: the class (absent,
+ * repeated or conflicting carriers, the Router's guest fallback, or a foreign value) and, for a foreign value,
+ * only a short prefix of its hash, comparable with the report's principal idHash values.
  */
 export function describeIdentityArgument(p, hash) {
-    const flags = String(p.args || '').split(' ').filter(a => a.startsWith('--sso-user-id='));
-    if (!flags.length) return 'absent';
-    if (flags.length > 1) return `repeated x${flags.length}`;
-    const value = flags[0].slice('--sso-user-id='.length);
-    if (value === 'guest') return 'guest fallback';
-    return `foreign value, hash ${typeof hash === 'function' ? String(hash(value)).slice(0, 12) : 'unavailable'}`;
+    const fromArgv = String(p.args || '').split(' ').filter(a => a.startsWith(SSO_ARGUMENT)).map(a => a.slice(SSO_ARGUMENT.length));
+    const fromEnviron = String(p.environ || '').split('\0').filter(entry => entry.startsWith(SSO_ENVIRONMENT)).map(entry => entry.slice(SSO_ENVIRONMENT.length));
+    const all = [...fromArgv, ...fromEnviron];
+    if (!all.length) return 'absent from argv and environment';
+    if (fromArgv.length > 1 || fromEnviron.length > 1) return `repeated (argv x${fromArgv.length}, environment x${fromEnviron.length})`;
+    if (new Set(all).size > 1) return 'argv and environment disagree';
+    if (all[0] === 'guest') return 'guest fallback';
+    return `foreign value, hash ${typeof hash === 'function' ? String(hash(all[0])).slice(0, 12) : 'unavailable'}`;
 }
 
 export async function runWebchatProbes(ctx, { openStream = openEventStream, inspectProcesses = null, nonce = ctx.prefix, timing = {} } = {}) {
     const { agent, launchKey, cap } = webchatProbe;
-    const { waitMs = webchatProbe.waitMs, settleMs = 1000, removalMs = 120000, pollMs = 2000, readyMs = webchatProbe.readyMs, readyPollMs = 25 } = timing;
+    const { waitMs = webchatProbe.waitMs, settleMs = 1000, removalMs = webchatProbe.removalMs, pollMs = 2000, readyMs = webchatProbe.readyMs, readyPollMs = 25 } = timing;
     const shared = `${nonce}-shared`;
     const tabId = `${nonce}-tab`;
     const query = (value = shared, extra = '') => `agent=${agent}&${launchKey}=${encodeURIComponent(value)}&tabId=${encodeURIComponent(tabId)}${extra}`;
@@ -304,7 +328,7 @@ export async function runWebchatProbes(ctx, { openStream = openEventStream, insp
         const byPrincipal = {};
         for (const p of list) {
             const who = principalOf(p);
-            assert.ok(who === 'userA' || who === 'userB', `A matching DPU process is not attributed to a test principal (--sso-user-id: ${describeIdentityArgument(p, ctx.hash)})`);
+            assert.ok(who === 'userA' || who === 'userB', `A matching DPU process is not attributed to a test principal (router-issued identity: ${describeIdentityArgument(p, ctx.hash)})`);
             assert.ok(!byPrincipal[who], `More than one DPU process for ${who}`);
             byPrincipal[who] = p;
         }

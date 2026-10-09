@@ -18,7 +18,7 @@ import { capture } from './acceptance/evidence-capture.mjs';
 import { policyDigest } from './acceptance/digest.mjs';
 import { captureExitCode } from './acceptance/run-acceptance.mjs';
 import { runMarketplaceAdmissionProbes, runTemplateProbes, marketplaceProjection } from './boundary-probes.mjs';
-import { runWebchatProbes, describeIdentityArgument, dpuProcessInspector, createStreamHandle, waitForStartupReady, openEventStream, DPU_UNSUPPORTED_REPLY, LIVE_INTERACTION_LIMITATION } from './webchat-probes.mjs';
+import { runWebchatProbes, describeIdentityArgument, routerIssuedUserId, webchatProbe, dpuProcessInspector, createStreamHandle, waitForStartupReady, openEventStream, DPU_UNSUPPORTED_REPLY, LIVE_INTERACTION_LIMITATION } from './webchat-probes.mjs';
 import { discoverAgentMcp, webAssistGuestCheckDefinitions } from './agent-probes.mjs';
 import { workspaceWriteMatrix, workspaceWriteCheckDefinitions } from './stream-probes.mjs';
 import { webmeetAdminToolCheckDefinitions, WEBMEET_POSITIVE_FOR_OP } from './webmeet-admin-tools.mjs';
@@ -774,23 +774,51 @@ test('U6 negative controls: an invented marker echo, a forged B identity, empty 
     assert.ok(closed.ctx.report.gaps.length > 10 && closed.ctx.report.gaps.every(g => g.evidence.kind === 'positive-unavailable'));
 });
 
+test('the removal deadline outlasts the Router\'s reconnect grace, after which a closed stream\'s runtime is disposed', () => {
+    // A runtime whose last stream closed is kept for the grace period before disposal (runtimeState.js scheduleDisconnectedTabCleanup).
+    const source = fs.readFileSync(path.join(here, '../../../cli/server/handlers/webchat/runtimeState.js'), 'utf8');
+    const grace = Number(/^const STREAM_RECONNECT_GRACE_MS = (\d+);/m.exec(source)?.[1]);
+    assert.ok(Number.isInteger(grace) && grace >= 1000, 'the Router reconnect grace constant is readable');
+    assert.ok(webchatProbe.removalMs >= grace + 30000, `removalMs ${webchatProbe.removalMs} must exceed the ${grace} ms grace with a margin for disposal and process exit`);
+});
+
 test('an unattributed DPU process is diagnosed by redacted class and never credited', async () => {
     const hash = value => createHash('sha256').update(value).digest('hex');
-    const base = 'node /code/src/index.mjs --authz-probe=v --sso-user=u';
-    assert.equal(describeIdentityArgument({ args: `${base} --sso-roles=user` }, hash), 'absent');
-    assert.equal(describeIdentityArgument({ args: `${base} --sso-user-id=guest --sso-roles=guest` }, hash), 'guest fallback');
-    assert.equal(describeIdentityArgument({ args: `${base} --sso-user-id=a --sso-user-id=b` }, hash), 'repeated x2');
-    const foreign = describeIdentityArgument({ args: `${base} --sso-user-id=secret-looking-id` }, hash);
+    const args = 'node /code/src/index.mjs --authz-probe=v --sso-user=u';
+    const env = (...entries) => ['HOME=/root', ...entries].join('\0');
+    assert.equal(describeIdentityArgument({ args: `${args} --sso-roles=user`, environ: env() }, hash), 'absent from argv and environment');
+    assert.equal(describeIdentityArgument({ args, environ: env('SSO_USER_ID=guest') }, hash), 'guest fallback');
+    assert.equal(describeIdentityArgument({ args: `${args} --sso-user-id=guest`, environ: env() }, hash), 'guest fallback');
+    assert.equal(describeIdentityArgument({ args: `${args} --sso-user-id=a --sso-user-id=b`, environ: env() }, hash), 'repeated (argv x2, environment x0)');
+    assert.equal(describeIdentityArgument({ args, environ: env('SSO_USER_ID=a', 'SSO_USER_ID=a') }, hash), 'repeated (argv x0, environment x2)');
+    assert.equal(describeIdentityArgument({ args: `${args} --sso-user-id=a`, environ: env('SSO_USER_ID=b') }, hash), 'argv and environment disagree');
+    const foreign = describeIdentityArgument({ args, environ: env('SSO_USER_ID=secret-looking-id') }, hash);
     assert.equal(foreign, `foreign value, hash ${hash('secret-looking-id').slice(0, 12)}`);
     assert.ok(!foreign.includes('secret-looking-id'), 'the raw identity never appears in the diagnosis');
     // Each class leaves the attribution checks failed rather than credited.
-    for (const args of ['--sso-roles=user', '--sso-user-id=guest', '--sso-user-id=somebody-else']) {
+    for (const ssoUserId of [null, 'guest', 'somebody-else']) {
         const world = webchatWorld();
-        const inspectProcesses = async (...a) => (await world.inspectProcesses(...a)).map(p => ({ ...p, ssoUserId: /guest|somebody/.test(args) ? args.split('=')[1] : null, args: `node /code/src/index.mjs ${args}` }));
+        const inspectProcesses = async (...a) => (await world.inspectProcesses(...a)).map(p => ({ ...p, ssoUserId }));
         await runWebchatProbes(world.ctx, { ...world, inspectProcesses, timing: fast });
-        assert.equal(status(world.ctx, 'u6:webchat-distinct-processes'), 'FAIL', args);
-        assert.equal(status(world.ctx, 'u6:webchat-credential-confinement'), 'FAIL', args);
+        assert.equal(status(world.ctx, 'u6:webchat-distinct-processes'), 'FAIL', String(ssoUserId));
+        assert.equal(status(world.ctx, 'u6:webchat-credential-confinement'), 'FAIL', String(ssoUserId));
     }
+});
+
+test('the router-issued identity is the single value the environment SSO_USER_ID and argv agree on', () => {
+    // The in-Box CLI start strips --sso-* from the agent argv and exports them as SSO_* (workspaceUtil.js:3850-3858).
+    const env = (...entries) => ['HOME=/root', ...entries, 'PATH=/usr/bin'].join('\0');
+    const argv = ['node', '/code/src/index.mjs', '--authz-probe=v'];
+    assert.equal(routerIssuedUserId(argv, env('SSO_USER_ID=principal-A')), 'principal-A', 'the real shape: identity only in the environment');
+    assert.equal(routerIssuedUserId([...argv, '--sso-user-id=principal-A'], env()), 'principal-A', 'argv only');
+    assert.equal(routerIssuedUserId([...argv, '--sso-user-id=principal-A'], env('SSO_USER_ID=principal-A')), 'principal-A', 'both carriers agree');
+    for (const [label, a, e] of [
+        ['none', argv, env()],
+        ['a prefix lookalike is not the variable', argv, env('XSSO_USER_ID=principal-A', 'SSO_USER_IDX=principal-A')],
+        ['two environment entries', argv, env('SSO_USER_ID=principal-A', 'SSO_USER_ID=principal-A')],
+        ['two argv flags', [...argv, '--sso-user-id=principal-A', '--sso-user-id=principal-A'], env()],
+        ['the carriers disagree', [...argv, '--sso-user-id=principal-B'], env('SSO_USER_ID=principal-A')],
+    ]) assert.equal(routerIssuedUserId(a, e), null, label);
 });
 
 test('DPU process inspector selects only the pinned DPU entry inside the DPU container, with start identity and principal', async () => {
@@ -799,13 +827,16 @@ test('DPU process inspector selects only the pinned DPU entry inside the DPU con
         `102\t556\tpodman\x1fexec\x1f-i\x1fdpu\x1fnode\x1f/code/src/index.mjs\x1f--authz-probe=v`,
         `103\t557\tnode\x1f/code/src/index.mjs\x1f--authz-probe=v\x1f--sso-user-id=principal-A`,
         `104\t558\tnode\x1f/code/src/index.mjs\x1f--authz-probe=v2\x1f--sso-user-id=principal-B`,
+        `105\t559\tnode\x1f/code/src/index.mjs\x1f--authz-probe=v3`,
     ].join('\n') + '\n';
     const calls = [];
-    const run = args => { calls.push(args); return args.includes('sh') ? listing : 'HOME=/root\0'; };
+    // Process 105 is the real shape: the in-Box CLI start moved --sso-user-id into the environment.
+    const run = args => { calls.push(args); return args.includes('sh') ? listing : (args.includes('/proc/105/environ') ? 'HOME=/root\0SSO_USER_ID=principal-C\0' : 'HOME=/root\0'); };
     const inspect = dpuProcessInspector({ boxId: 'c'.repeat(64), container: 'ploinky_AchillesIDE_dpuAgent_testExplorerFresh_d8f88a10', run });
     const found = await inspect('v');
     assert.deepEqual(found.map(p => [p.pid, p.start, p.ssoUserId]), [[103, '557', 'principal-A']]);
-    assert.deepEqual((await inspect('v', { prefix: true })).map(p => p.pid), [103, 104]);
+    assert.deepEqual((await inspect('v', { prefix: true })).map(p => p.pid), [103, 104, 105]);
+    assert.deepEqual((await inspect('v3')).map(p => [p.pid, p.ssoUserId]), [[105, 'principal-C']], 'an identity carried only by SSO_USER_ID attributes the process');
     assert.ok(calls.every(a => a[0] === 'exec' && a[2] === 'podman' && a[3] === 'exec' && a[4] === 'ploinky_AchillesIDE_dpuAgent_testExplorerFresh_d8f88a10'), 'only inside the DPU container');
     const unreadable = dpuProcessInspector({ boxId: 'c'.repeat(64), container: 'ploinky_AchillesIDE_dpuAgent_x', run: args => args.includes('sh') ? listing : '' });
     await assert.rejects(unreadable('v'), /environment must be readable/);
