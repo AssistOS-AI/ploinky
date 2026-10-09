@@ -76,6 +76,10 @@ try {
     const loaded = loadPins(config.pins, config.pinsSha256);
     ctx.report.pins = { sha256: loaded.sha256, policyDigest: verifyCandidate(loaded.pins, sourceRoot) };
     pins = loaded.pins;
+    // Seeds the webAssist sessions of the history-isolation checks without inference. It runs under the
+    // workspace mutation lock taken below and arms its own cleanup before it creates anything.
+    const { createWebAssistSessionFactory } = await import('./webassist-fixture.mjs');
+    ctx.webAssistSessionFactory = createWebAssistSessionFactory(ctx, { workspace: () => pins.workspace });
     ctx.report.deployment = await ctx.guard();
     mutationLock = await createMutationLockManager({ timeoutMs: 1000 }).acquire(ctx.report.deployment.instance);
     await ctx.guard();

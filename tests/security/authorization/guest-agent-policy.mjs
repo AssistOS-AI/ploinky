@@ -66,9 +66,18 @@ const WEBMEET_TOOLS = Object.freeze([
  *   list-sites       deny      exercised live (agent-probes.mjs, webAssistAnonymousProbes)
  *   web_cli_chat     allow     not invoked: it performs inference, which this suite never runs
  *   register-events  allow     not invoked: it appends to a site event log that has no removal path
- *   web_cli_history  allow     own session only; cross-session isolation is a mandatory check
- *                              that needs a session, which only web_cli_chat can create
+ *   web_cli_history  allow     own session, or the client-held sessionSecret, or an administrator;
+ *                              isolation is exercised with sessions seeded by webassist-fixture.mjs
+ *                              because only web_cli_chat (inference) can create one
  */
+/**
+ * Tools whose input schema must declare an optional string `sessionSecret`
+ * (webAssist/mcp-config.json). The exact name matters twice: an undeclared argument is
+ * dropped by the AgentServer schema and the Router canonicalization before the tool
+ * runs, and AgentServer redacts argument keys matching /secret/i from its debug output.
+ */
+export const WEBASSIST_SESSION_SECRET_TOOLS = Object.freeze(['web_cli_chat', 'web_cli_history']);
+
 export const GUEST_AGENT_POLICY = Object.freeze({
   webAssist: Object.freeze({
     repo: 'AchillesIDE',
@@ -78,7 +87,7 @@ export const GUEST_AGENT_POLICY = Object.freeze({
       'list-sites': 'deny',
       'register-events': 'allow-not-invoked',
       web_cli_chat: 'allow-not-invoked',
-      web_cli_history: 'allow-own-session',
+      web_cli_history: 'allow-own-session-or-secret',
     }),
   }),
   webmeetAgent: Object.freeze({

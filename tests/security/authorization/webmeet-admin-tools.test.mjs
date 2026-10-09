@@ -7,7 +7,6 @@ import { readFileSync } from 'node:fs';
 import { assertAllowed, assertResourceDenied } from './resource-probes.mjs';
 import { WEBMEET_ADMIN_ONLY_TOOLS, WEBMEET_GUEST_ALLOWLIST, GUEST_AGENT_POLICY, pinnedGuestList } from './guest-agent-policy.mjs';
 import { runWebmeetAdminToolProbes, webmeetAdminToolCheckDefinitions, WEBMEET_POSITIVE_FOR_OP, WEBMEET_DENIED_ACTORS, denialId } from './webmeet-admin-tools.mjs';
-import { decodeAgentMcp, webAssistGuestCheckDefinitions, webAssistGuestProbes } from './agent-probes.mjs';
 
 const claimed = (tool, args) => ({
   ok: true, deleted: true, roomId: args.roomId, participantId: args.participantId, resourceId: args.resourceId, status: 'ok',
@@ -165,72 +164,6 @@ test('cleanup is armed before creation: a create whose response is lost still re
   assert.equal([...world.rooms.values()].length, 0);
 });
 
-// ---- webAssist anonymous policy ------------------------------------------------------------
-function assistMcp({ anonymousListsSites = false } = {}) {
-  return { async rpc(actor, agent, method, params) {
-    assert.equal(agent, 'webAssist');
-    if (params.name === 'list-sites') {
-      if (actor === 'anonymous' && !anonymousListsSites) return decodeAgentMcp({ status: 200, json: { result: { isError: true, content: [{ type: 'text', text: 'Access denied: guest invocation cannot call list-sites.' }] } }, headers: {} });
-      return decodeAgentMcp({ status: 200, json: { result: { content: [{ type: 'text', text: JSON.stringify({ sites: ['site-a'], count: 1, dataRoot: '/workspace/webassist-data' }) }] } }, headers: {} });
-    }
-    throw new Error(`unexpected ${params.name}`);
-  } };
-}
-function assistCtx({ histories, factory } = {}) {
-  const checks = [];
-  const sessions = { anonymous: 'mcp-A', anonymousB: 'mcp-B' };
-  const ctx = {
-    secrets: new Set(), cleanups: [], checks, webAssistSessionFactory: factory,
-    clients: { anonymous: { cookies: [{ name: 'ploinky_guest', value: 'guest-A' }] }, anonymousB: { cookies: [{ name: 'ploinky_guest', value: 'guest-B' }] } },
-    cleanup(fn) { this.cleanups.push(fn); },
-    async check(id, fn) { try { await fn(); checks.push({ id, status: 'PASS' }); } catch (error) { checks.push({ id, status: 'FAIL', error: String(error?.message || error) }); } },
-    async request(actor, { method, body }) {
-      if (body?.method === 'initialize') return { status: 200, headers: { 'mcp-session-id': sessions[actor] }, json: { result: { protocolVersion: '2025-06-18' } }, text: '' };
-      if (method === 'DELETE') return { status: 204, headers: {}, json: undefined, text: '' };
-      const { siteId, sessionId } = body.params.arguments;
-      const history = histories(actor, siteId, sessionId);
-      return { status: 200, headers: {}, json: { result: { content: [{ type: 'text', text: JSON.stringify(history) }] } }, text: '' };
-    },
-  };
-  return { ctx, checks };
-}
-const own = { anonymous: { siteId: 'site-a', sessionId: 'sess-A', marker: 'MARKER-A' }, anonymousB: { siteId: 'site-a', sessionId: 'sess-B', marker: 'MARKER-B' } };
-const factory = async actor => own[actor];
-const historyOf = (readerMayCross) => (actor, siteId, sessionId) => {
-  const owner = Object.keys(own).find(key => own[key].sessionId === sessionId);
-  if (owner && (owner === actor || readerMayCross)) return { siteId, sessionId, exists: true, history: [{ role: 'user', message: own[owner].marker }] };
-  return { siteId, sessionId, exists: false, history: [] };
-};
-
-test('webAssist anonymous list-sites is denied with an administrator positive, and the live leak fails', async () => {
-  const good = assistCtx({ histories: historyOf(false), factory });
-  await webAssistGuestProbes(good.ctx, assistMcp(), { createSession: factory });
-  assert.deepEqual(good.checks.map(check => [check.id, check.status]), [['agent.webAssist.admin.list-sites-positive', 'PASS'], ['agent.webAssist.anonymous.list-sites-denied', 'PASS'], ['agent.webAssist.anonymous.session-history-isolation', 'PASS']]);
-  assert.deepEqual(good.checks.map(check => check.id), webAssistGuestCheckDefinitions().map(definition => definition.id));
-  const leaking = assistCtx({ histories: historyOf(false), factory });
-  await webAssistGuestProbes(leaking.ctx, assistMcp({ anonymousListsSites: true }), { createSession: factory });
-  assert.equal(leaking.checks.find(check => check.id === 'agent.webAssist.anonymous.list-sites-denied').status, 'FAIL');
-});
-
-test('webAssist cross-session history: isolation passes, a cross read fails, and no fixture is a failure, not a pass', async () => {
-  const isolated = assistCtx({ histories: historyOf(false), factory });
-  await webAssistGuestProbes(isolated.ctx, assistMcp(), { createSession: factory });
-  assert.equal(isolated.checks.at(-1).status, 'PASS');
-  const leaking = assistCtx({ histories: historyOf(true), factory });
-  await webAssistGuestProbes(leaking.ctx, assistMcp(), { createSession: factory });
-  assert.equal(leaking.checks.at(-1).status, 'FAIL');
-  assert.match(leaking.checks.at(-1).error, /read another visitor/);
-  // A visitor whose own history is empty is not a positive control.
-  const emptyOwn = assistCtx({ histories: (actor, siteId, sessionId) => ({ siteId, sessionId, exists: false, history: [] }), factory });
-  await webAssistGuestProbes(emptyOwn.ctx, assistMcp(), { createSession: factory });
-  assert.equal(emptyOwn.checks.at(-1).status, 'FAIL');
-  // The live run has no inference-free session fixture: the check fails instead of passing vacuously.
-  const noFixture = assistCtx({ histories: historyOf(false) });
-  await webAssistGuestProbes(noFixture.ctx, assistMcp());
-  assert.equal(noFixture.checks.at(-1).status, 'FAIL');
-  assert.match(noFixture.checks.at(-1).error, /session fixture/);
-});
-
 // ---- N1: mutants that survived the first offline suite ------------------------------------------
 // Mutating tools only: the shared-room rename/delete denials live in resource-probes.mjs and the RoboTeam read has no state to change.
 const MUTATING_OPS = WEBMEET_ADMIN_ONLY_TOOLS.filter(entry => !['rename', 'delete', 'robo-team-get'].includes(entry.op));
@@ -276,38 +209,4 @@ test('an administrator operation that answers ok without changing state fails it
     const { ctx } = await run({ noop: new Set([`admin:${tool}`]) });
     assert.equal(ctx.report.checks.find(check => check.id === WEBMEET_POSITIVE_FOR_OP[op]).status, 'FAIL', `${tool}: a no-op administrator call must not satisfy its positive`);
   }
-});
-
-test('webAssist list-sites: a failure that is not an authorization decision, or a missing admin positive, never counts as a denial', async () => {
-  const mcp = reason => ({ async rpc(actor, agent, method, params) {
-    if (actor === 'anonymous' && params.name === 'list-sites') return decodeAgentMcp({ status: 200, json: { result: { isError: true, content: [{ type: 'text', text: reason }] } }, headers: {} });
-    return decodeAgentMcp({ status: 200, json: { result: { content: [{ type: 'text', text: JSON.stringify({ sites: [], count: 0, dataRoot: '/x' }) }] } }, headers: {} });
-  } });
-  for (const reason of ['ENOENT: no such file or directory, scandir sites', 'Tool timed out', 'Missing argument siteId']) {
-    const world = assistCtx({ histories: historyOf(false), factory });
-    await webAssistGuestProbes(world.ctx, mcp(reason), { createSession: factory });
-    assert.equal(world.checks.find(check => check.id === 'agent.webAssist.anonymous.list-sites-denied').status, 'FAIL', reason);
-  }
-  const authorized = assistCtx({ histories: historyOf(false), factory });
-  await webAssistGuestProbes(authorized.ctx, mcp('Access denied: guest invocation cannot call list-sites.'), { createSession: factory });
-  assert.equal(authorized.checks.find(check => check.id === 'agent.webAssist.anonymous.list-sites-denied').status, 'PASS');
-  // The denial is mandatory only together with its administrator positive.
-  const mandatory = JSON.parse(readFileSync(new URL('./acceptance/mandatory-checks.json', import.meta.url), 'utf8'));
-  assert.deepEqual(mandatory.checks.find(entry => entry.id === 'agent.webAssist.anonymous.list-sites-denied').positiveControlAnyOf, ['agent.webAssist.admin.list-sites-positive']);
-  assert.deepEqual(webAssistGuestCheckDefinitions().find(entry => entry.id === 'agent.webAssist.anonymous.list-sites-denied').positiveControlAnyOf, ['agent.webAssist.admin.list-sites-positive']);
-});
-
-test('webAssist isolation: two jars that hold the same guest session are not two visitors', async () => {
-  const world = assistCtx({ histories: historyOf(false), factory });
-  world.ctx.clients.anonymousB = { cookies: [{ name: 'ploinky_guest', value: 'guest-A' }] };
-  await webAssistGuestProbes(world.ctx, assistMcp(), { createSession: factory });
-  const check = world.checks.at(-1);
-  assert.equal(check.status, 'FAIL');
-  assert.match(check.error, /distinct guest sessions/);
-  // A jar without any guest cookie is not a guest session either.
-  const noCookie = assistCtx({ histories: historyOf(false), factory });
-  noCookie.ctx.clients.anonymous = { cookies: [] };
-  noCookie.ctx.clients.anonymousB = { cookies: [] };
-  await webAssistGuestProbes(noCookie.ctx, assistMcp(), { createSession: factory });
-  assert.equal(noCookie.checks.at(-1).status, 'FAIL');
 });

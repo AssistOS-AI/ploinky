@@ -11,7 +11,7 @@
     }
   ],
   "counts": {
-    "live": 607,
+    "live": 612,
     "offline": 10
   },
   "checks": [
@@ -2050,6 +2050,14 @@
       "source": "tests/security/authorization/agent-probes.mjs webAssistGuestProbes"
     },
     {
+      "id": "agent.webAssist.admin.session-secret-schema",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs webAssistGuestProbes"
+    },
+    {
       "id": "agent.webAssist.anonymous.list-sites-denied",
       "kind": "live",
       "count": 1,
@@ -2060,10 +2068,50 @@
       "source": "tests/security/authorization/agent-probes.mjs webAssistGuestProbes"
     },
     {
-      "id": "agent.webAssist.anonymous.session-history-isolation",
+      "id": "agent.webAssist.anonymous.session-fixture",
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs webAssistGuestProbes"
+    },
+    {
+      "id": "agent.webAssist.anonymous.session-history-cross-read",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.webAssist.anonymous.session-history-own-positive"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs webAssistGuestProbes"
+    },
+    {
+      "id": "agent.webAssist.anonymous.session-history-own-positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.webAssist.anonymous.session-fixture"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs webAssistGuestProbes"
+    },
+    {
+      "id": "agent.webAssist.anonymous.session-history-secret-positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.webAssist.anonymous.session-history-own-positive"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs webAssistGuestProbes"
+    },
+    {
+      "id": "agent.webAssist.anonymous.session-history-wrong-secret",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.webAssist.anonymous.session-history-own-positive"
+      ],
       "boundary": "agents",
       "source": "tests/security/authorization/agent-probes.mjs webAssistGuestProbes"
     },

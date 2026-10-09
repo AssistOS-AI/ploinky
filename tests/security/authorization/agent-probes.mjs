@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { agentCatalog, agentInventory } from './agent-inventory.mjs';
 import { assertDenied, Client, WORKSPACE } from './core.mjs';
-import { GUEST_AGENT_POLICY, pinnedGuestList } from './guest-agent-policy.mjs';
+import { GUEST_AGENT_POLICY, WEBASSIST_SESSION_SECRET_TOOLS, pinnedGuestList } from './guest-agent-policy.mjs';
 
 const actors = ['anonymous', 'selfRegistered', 'userA', 'userB', 'admin'];
 const profilePath = '/base-agent-additional-server/userPersistoAgent/7000/service/dashboard/api/profile';
@@ -612,40 +612,86 @@ export async function usernamePrivilegeProbe(ctx, mcp, roomFixture, { revalidati
     } finally { await restore(); }
 }
 
+const WEBASSIST_SOURCE = 'tests/security/authorization/agent-probes.mjs webAssistGuestProbes';
+const WEBASSIST_IDS = Object.freeze({
+    adminList: 'agent.webAssist.admin.list-sites-positive',
+    anonymousList: 'agent.webAssist.anonymous.list-sites-denied',
+    schema: 'agent.webAssist.admin.session-secret-schema',
+    fixture: 'agent.webAssist.anonymous.session-fixture',
+    own: 'agent.webAssist.anonymous.session-history-own-positive',
+    cross: 'agent.webAssist.anonymous.session-history-cross-read',
+    wrongSecret: 'agent.webAssist.anonymous.session-history-wrong-secret',
+    correctSecret: 'agent.webAssist.anonymous.session-history-secret-positive',
+});
 export function webAssistGuestCheckDefinitions() {
-    const source = 'tests/security/authorization/agent-probes.mjs webAssistGuestProbes';
+    const def = (id, positiveControlAnyOf = null) => ({ id, kind: 'live', boundary: 'agents', source: WEBASSIST_SOURCE, positiveControlAnyOf });
     return [
-        { id: 'agent.webAssist.admin.list-sites-positive', kind: 'live', boundary: 'agents', source, positiveControlAnyOf: null },
-        { id: 'agent.webAssist.anonymous.list-sites-denied', kind: 'live', boundary: 'agents', source, positiveControlAnyOf: ['agent.webAssist.admin.list-sites-positive'] },
-        { id: 'agent.webAssist.anonymous.session-history-isolation', kind: 'live', boundary: 'agents', source, positiveControlAnyOf: null },
+        def(WEBASSIST_IDS.adminList),
+        def(WEBASSIST_IDS.anonymousList, [WEBASSIST_IDS.adminList]),
+        def(WEBASSIST_IDS.schema),
+        def(WEBASSIST_IDS.fixture),
+        def(WEBASSIST_IDS.own, [WEBASSIST_IDS.fixture]),
+        def(WEBASSIST_IDS.cross, [WEBASSIST_IDS.own]),
+        def(WEBASSIST_IDS.wrongSecret, [WEBASSIST_IDS.own]),
+        def(WEBASSIST_IDS.correctSecret, [WEBASSIST_IDS.own]),
     ];
 }
 
 /**
+ * The tool input schemas that carry the session secret: sessionSecret is declared,
+ * optional and a string on web_cli_chat and web_cli_history. If it were undeclared,
+ * the AgentServer and Router argument canonicalization would drop it (the secret
+ * would never arrive), so the declaration is pinned from the live tools/list.
+ */
+export function sessionSecretDeclared(inputSchema) {
+    const property = inputSchema?.properties?.sessionSecret ?? inputSchema?.sessionSecret;
+    if (!property || property.type !== 'string') return false;
+    const required = Array.isArray(inputSchema?.required) && inputSchema.required.includes('sessionSecret');
+    return !required && property.optional !== false;
+}
+
+/**
  * webAssist anonymous policy (guest-agent-policy.mjs). list-sites is denied to an
- * anonymous visitor; the administrator read is its positive control. A visitor's
- * chat history must not be readable by another anonymous visitor. web_cli_history
- * (webAssist/src/mcp/get-session-history.mjs) keys history by siteId and sessionId only
- * and reads no caller identity, so isolation can hold only if the session id is an
- * unguessable capability; whether it does is exactly what this check measures. A session
- * can be created only through web_cli_chat (inference), which this suite never runs, so
- * the fixture is injected (`createSession`) and its absence fails the check instead of
- * being treated as a pass.
+ * anonymous visitor; the administrator read is its positive control. A chat session is
+ * bound to the guest principal that created it, or to the client-held sessionSecret:
+ * history is readable by the owner, by anyone presenting the secret, and by an
+ * administrator, and by nobody else. web_cli_history keys history by siteId and sessionId
+ * (get-session-history.mjs); a session can only be created by web_cli_chat (inference),
+ * so the suite seeds one per jar through the injected `createSession` fixture
+ * (webassist-fixture.mjs). Without the fixture every dependent check FAILs; nothing is
+ * ever recorded as a gap or a pass.
+ *
+ * Contract used for the history reads (webAssist DS004/AM3): arguments
+ * { siteId, sessionId, sessionSecret? }; a caller that is neither owner, secret holder
+ * nor admin gets { siteId, sessionId, exists: false, sessionKuId, history: [] }.
  */
 export async function webAssistGuestProbes(ctx, mcp, { createSession = ctx.webAssistSessionFactory } = {}) {
-    await ctx.check('agent.webAssist.admin.list-sites-positive', async () => {
+    await ctx.check(WEBASSIST_IDS.adminList, async () => {
         const result = await mcp.rpc('admin', 'webAssist', 'tools/call', { name: 'list-sites', arguments: {} });
         assert.ok(result.success, 'The administrator list-sites read must succeed');
         requireObject(result.value);
-        assert.ok(Array.isArray(result.value.sites) && Number.isInteger(result.value.count), 'list-sites returns { sites, count, dataRoot }');
+        assert.ok(Array.isArray(result.value.sites) && Number.isInteger(result.value.count), 'list-sites returns { sites, count }');
+        assert.equal(Object.hasOwn(result.value, 'dataRoot'), false, 'list-sites must not disclose the absolute data root');
     });
-    await ctx.check('agent.webAssist.anonymous.list-sites-denied', async () => {
+    await ctx.check(WEBASSIST_IDS.anonymousList, async () => {
         const result = await mcp.rpc('anonymous', 'webAssist', 'tools/call', { name: 'list-sites', arguments: {} });
-        assert.ok(!result.success || !Array.isArray(result.value?.sites), 'An anonymous visitor listed every site id and the data root');
+        assert.ok(!result.success || !Array.isArray(result.value?.sites), 'An anonymous visitor listed every site id');
         assertAgentMcpDenied(result);
     });
-    await ctx.check('agent.webAssist.anonymous.session-history-isolation', async () => {
-        assert.equal(typeof createSession, 'function', 'No inference-free webAssist session fixture exists: a session can only be created by web_cli_chat, so cross-session history isolation is unproven');
+    await ctx.check(WEBASSIST_IDS.schema, async () => {
+        const listed = await mcp.rpc('admin', 'webAssist', 'tools/list');
+        assert.ok(listed.success, 'The administrator tools/list must succeed');
+        for (const name of WEBASSIST_SESSION_SECRET_TOOLS) {
+            const tool = (listed.value?.tools || []).find((entry) => entry.name === name);
+            assert.ok(tool, `${name} is listed`);
+            assert.ok(sessionSecretDeclared(tool.inputSchema), `${name} must declare an optional string sessionSecret (an undeclared argument is dropped before the tool runs)`);
+        }
+    });
+
+    let sessions;
+    let readers;
+    await ctx.check(WEBASSIST_IDS.fixture, async () => {
+        assert.equal(typeof createSession, 'function', 'No webAssist session fixture is configured: a session can only be created by web_cli_chat (inference) or seeded by webassist-fixture.mjs');
         if (!ctx.clients.anonymousB) ctx.clients.anonymousB = new Client([], { onSecret: (value) => ctx.secrets.add(value) });
         const guest = async (actor) => {
             const headers = { accept: 'application/json, text/event-stream' };
@@ -656,23 +702,57 @@ export async function webAssistGuestProbes(ctx, mcp, { createSession = ctx.webAs
             ctx.secrets.add(sessionId);
             const sessionHeaders = { ...headers, 'mcp-session-id': sessionId, 'mcp-protocol-version': init.json?.result?.protocolVersion || '2025-06-18' };
             ctx.cleanup(async () => { await ctx.request(actor, { method: 'DELETE', path: '/webAssist/mcp', headers: sessionHeaders }); });
-            return (siteId, session) => ctx.request(actor, { method: 'POST', path: '/webAssist/mcp', headers: sessionHeaders, body: { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'web_cli_history', arguments: { siteId, sessionId: session } } } }).then(decodeAgentMcp);
+            return (args) => ctx.request(actor, { method: 'POST', path: '/webAssist/mcp', headers: sessionHeaders, body: { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'web_cli_history', arguments: args } } }).then(decodeAgentMcp);
         };
-        const readA = await guest('anonymous');
-        const readB = await guest('anonymousB');
-        assert.notEqual(ctx.clients.anonymous.cookies.find((c) => c.name === 'ploinky_guest')?.value, ctx.clients.anonymousB.cookies.find((c) => c.name === 'ploinky_guest')?.value, 'The two anonymous jars must hold distinct guest sessions');
+        readers = { anonymous: await guest('anonymous'), anonymousB: await guest('anonymousB') };
+        const jarSession = (actor) => ctx.clients[actor].cookies.find((c) => c.name === 'ploinky_guest')?.value;
+        assert.ok(jarSession('anonymous') && jarSession('anonymousB'), 'Each jar holds a guest session cookie');
+        assert.notEqual(jarSession('anonymous'), jarSession('anonymousB'), 'The two anonymous jars must hold distinct guest sessions');
         const a = await createSession('anonymous');
         const b = await createSession('anonymousB');
         assert.notEqual(a.sessionId, b.sessionId);
-        const own = async (read, fixture) => { const result = await read(fixture.siteId, fixture.sessionId); assert.ok(result.success && result.value?.exists === true && result.value.history.length > 0, 'Each visitor reads its own non-empty history'); return result.value; };
-        await own(readA, a); await own(readB, b);
-        const crossed = await readB(a.siteId, a.sessionId);
-        const crossedBack = await readA(b.siteId, b.sessionId);
-        for (const [result, victim] of [[crossed, a], [crossedBack, b]]) {
-            const text = JSON.stringify([result.value, result.response.json]);
-            assert.ok(!text.includes(victim.marker), 'One anonymous visitor read another visitor\'s chat history');
-            assert.ok(!result.success || result.value?.exists !== true || (result.value.history || []).length === 0, 'Another visitor\'s session history was returned');
+        assert.notEqual(a.secret, b.secret);
+        for (const fixture of [a, b]) for (const field of ['siteId', 'sessionId', 'marker', 'secret']) assert.ok(typeof fixture[field] === 'string' && fixture[field], `The session fixture provides ${field}`);
+        sessions = { anonymous: a, anonymousB: b };
+    });
+    const needFixture = () => assert.ok(sessions && readers, 'The seeded session fixture is unavailable; no history conclusion is possible');
+    const history = (reader, fixture, extra = {}) => readers[reader]({ siteId: fixture.siteId, sessionId: fixture.sessionId, ...extra });
+    const wholeResponse = (result) => JSON.stringify([result.value, result.response.json, result.response.text]);
+    const assertMissing = (result, victim) => {
+        assert.ok(!wholeResponse(result).includes(victim.marker), 'One anonymous visitor read another visitor\'s chat history');
+        assert.ok(result.success, 'A non-owner receives the missing-session shape, not an error');
+        assert.equal(result.value?.exists, false, 'Another visitor\'s session must read as missing');
+        assert.deepEqual(result.value?.history, [], 'Another visitor\'s history must be empty');
+    };
+    await ctx.check(WEBASSIST_IDS.own, async () => {
+        needFixture();
+        for (const [reader, fixture] of [['anonymous', sessions.anonymous], ['anonymousB', sessions.anonymousB]]) {
+            const result = await history(reader, fixture);
+            assert.ok(result.success && result.value?.exists === true, 'Each visitor reads its own seeded session');
+            assert.ok(Array.isArray(result.value.history) && JSON.stringify(result.value.history).includes(fixture.marker), 'Each visitor\'s own history carries its marker');
+            assert.equal(JSON.stringify(result.value).includes(fixture.secret), false, 'The session secret is never returned by a history read');
         }
+    });
+    await ctx.check(WEBASSIST_IDS.cross, async () => {
+        needFixture();
+        assertMissing(await history('anonymousB', sessions.anonymous), sessions.anonymous);
+        assertMissing(await history('anonymous', sessions.anonymousB), sessions.anonymousB);
+    });
+    await ctx.check(WEBASSIST_IDS.wrongSecret, async () => {
+        needFixture();
+        const wrong = `${sessions.anonymous.secret.slice(0, -1)}${sessions.anonymous.secret.endsWith('A') ? 'B' : 'A'}`;
+        assert.notEqual(wrong, sessions.anonymous.secret);
+        assertMissing(await history('anonymousB', sessions.anonymous, { sessionSecret: wrong }), sessions.anonymous);
+        // The other visitor's secret does not open this session either.
+        assertMissing(await history('anonymousB', sessions.anonymous, { sessionSecret: sessions.anonymousB.secret }), sessions.anonymous);
+    });
+    await ctx.check(WEBASSIST_IDS.correctSecret, async () => {
+        needFixture();
+        // The secret travels Router -> AgentServer schema -> webAssist: only then can a different principal read.
+        const result = await history('anonymousB', sessions.anonymous, { sessionSecret: sessions.anonymous.secret });
+        assert.ok(result.success && result.value?.exists === true, 'A different principal presenting the correct secret reads the session');
+        assert.ok(JSON.stringify(result.value.history).includes(sessions.anonymous.marker), 'The correct secret returns the marker turn');
+        assert.equal(JSON.stringify(result.value).includes(sessions.anonymous.secret), false, 'The secret is not echoed');
     });
 }
 
