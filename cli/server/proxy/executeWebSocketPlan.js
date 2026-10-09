@@ -133,6 +133,10 @@ export async function executeWebSocketPlan({
     let clientFrames;
     let targetFrames;
     let leaseOutcome = 'uncommitted';
+    // Node leaves an upgraded socket flowing with no 'error' listener, so a
+    // client reset during any await below would be uncaught. This listener
+    // only absorbs the event; teardown is owned by the paths below.
+    socket.on('error', () => {});
     try {
         if (authorized !== true) {
             throw Object.assign(new Error('proxy: request not authorized'), { code: 'AUTH_REQUIRED' });
@@ -209,6 +213,10 @@ export async function executeWebSocketPlan({
             upstream.once('upgrade', (response, selectedUpstreamSocket, upstreamHead) => {
                 clearTimeout(headerTimer);
                 upstreamSocket = selectedUpstreamSocket;
+                if (socket.destroyed || !socket.writable) {
+                    fail(new Error('proxy: client socket closed before WebSocket upgrade'));
+                    return;
+                }
                 const responseHeaders = {
                     ...sanitizeResponseHeaders(response.headers, finalized),
                     connection: 'Upgrade',
