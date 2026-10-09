@@ -197,9 +197,19 @@ test('secrets: hits revalidate the file stamp and the master-seed identity on ev
     seed = SEED_A;
     assert.deepEqual(inputs.readSecrets(), { NAME: 'value-3' }, 'restoring the seed recovers');
 
-    // A seed resolution failure is a decryption failure, as in readSecretsFile().
-    const failing = createProviderConfigInputs({ secretsFile: file, resolveSeed: () => { throw new Error('retired secret present'); } });
-    assert.throws(() => failing.readSecrets(), /Unable to decrypt .*retired secret present/);
+    // A seed resolution failure is a decryption failure, as in readSecretsFile(),
+    // even when the file is unchanged and a decrypted map is memoized.
+    let seedFailure = null;
+    const guarded = createProviderConfigInputs({
+        secretsFile: file,
+        resolveSeed: () => { if (seedFailure) throw seedFailure; return SEED_A; },
+    });
+    assert.deepEqual(guarded.readSecrets(), { NAME: 'value-3' });
+    seedFailure = new Error('retired secret present');
+    assert.throws(() => guarded.readSecrets(), /Unable to decrypt .*retired secret present/);
+    assert.throws(() => guarded.readSecrets(), /Unable to decrypt .*retired secret present/, 'never served from the memo');
+    seedFailure = null;
+    assert.deepEqual(guarded.readSecrets(), { NAME: 'value-3' });
 
     fs.rmSync(file);
     assert.deepEqual(inputs.readSecrets(), {}, 'a missing file reads as empty, like readSecretsFile()');
