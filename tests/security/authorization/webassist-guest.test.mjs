@@ -40,13 +40,22 @@ function productModel({ defect = '', listSites = 'denied', schema = 'declared', 
     const missing = { siteId, sessionId, exists: false, sessionKuId: `ku_sess_${sessionId}`, history: [] };
     if (!record) return missing;
     const owner = defect === 'ownerBlind' ? false : record.owner === actor;
-    const secret = defect === 'ignoreSecret' ? false : defect === 'anySecret' ? Boolean(sessionSecret) : (sessionSecret !== undefined && sessionSecret === record.secret);
-    if (!(owner || secret || defect === 'ignoreOwner')) {
+    const known = [...records.values()].some(entry => entry.secret === sessionSecret);
+    const secret = defect === 'ignoreSecret' ? false
+      : defect === 'anySecret' ? Boolean(sessionSecret)
+      : defect === 'prefixSecret' ? (typeof sessionSecret === 'string' && sessionSecret.slice(0, 8) === record.secret.slice(0, 8))
+      : defect === 'anyKnownSecret' ? known
+      : (sessionSecret !== undefined && sessionSecret === record.secret);
+    const turns = [{ role: 'user', message: `${record.marker} user` }];
+    if (owner && defect === 'ownEmptyHistory') return { siteId, sessionId, exists: true, sessionKuId: `ku_sess_${sessionId}`, history: [] };
+    if (!owner && secret && defect === 'secretEmptyHistory') return { siteId, sessionId, exists: true, sessionKuId: `ku_sess_${sessionId}`, history: [] };
+    if (!owner && secret && defect === 'secretExistsFalse') return { siteId, sessionId, exists: false, sessionKuId: `ku_sess_${sessionId}`, history: turns };
+    if (!(owner || secret || defect === 'ignoreOwner' || (defect === 'leakToFirstJar' && actor === 'anonymous'))) {
       if (defect === 'foreignError') return { error: 'Internal storage error for this session' };
       if (defect === 'foreignEmptyExists') return { ...missing, exists: true };
       return missing;
     }
-    return { siteId, sessionId, exists: true, sessionKuId: `ku_sess_${sessionId}`, history: [{ role: 'user', message: `${record.marker} user` }], ...(defect === 'echoSecret' ? { echoed: record.secret } : {}) };
+    return { siteId, sessionId, exists: true, sessionKuId: `ku_sess_${sessionId}`, history: turns, ...(defect === 'echoSecret' ? { echoed: record.secret } : {}) };
   };
   const request = async (actor, { method, body }) => {
     if (body?.method === 'initialize') return { status: 200, headers: { 'mcp-session-id': `mcp-${actor}` }, json: { result: { protocolVersion: '2025-06-18' } }, text: '' };
@@ -165,4 +174,26 @@ test('two jars that hold the same guest session, or none, are not two visitors',
   assert.equal(statuses(same)[IDS['anonymous.session-history-cross-read']], 'FAIL');
   const none = await run({}, { clients: { anonymous: { cookies: [] }, anonymousB: { cookies: [] } } });
   assert.equal(statuses(none)[IDS['anonymous.session-fixture']], 'FAIL');
+});
+
+test('each way a product can get the secret or owner contract wrong fails exactly the check that measures it', async () => {
+  const cases = [
+    ['prefixSecret', ['wrong-secret']],
+    ['anyKnownSecret', ['wrong-secret']],
+    ['secretEmptyHistory', ['secret-positive']],
+    ['secretExistsFalse', ['secret-positive']],
+    ['ownEmptyHistory', ['own-positive']],
+    ['leakToFirstJar', ['cross-read']],
+  ];
+  for (const [defect, expected] of cases) {
+    const got = failed(await run({ defect }));
+    for (const key of expected) assert.ok(got.includes(`agent.webAssist.anonymous.session-history-${key}`), `${defect}: ${key} must fail (failed: ${got.join(', ') || 'none'})`);
+  }
+});
+
+test('run.mjs wires the session fixture to the pinned workspace', () => {
+  const source = readFileSync(new URL('./run.mjs', import.meta.url), 'utf8');
+  assert.match(source, /createWebAssistSessionFactory\(ctx, \{ workspace: \(\) => pins\.workspace \}\)/);
+  assert.match(source, /ctx\.webAssistSessionFactory = /);
+  assert.ok(source.indexOf('ctx.webAssistSessionFactory') > source.indexOf('pins = loaded.pins'), 'the factory is wired after the pins are loaded');
 });
