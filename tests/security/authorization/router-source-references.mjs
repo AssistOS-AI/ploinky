@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 
 // This reviewed fixture retains both prior inventories' obligations. Source
 // variants name exact statements; no first-match route discovery is performed.
-const obligations = JSON.parse(fs.readFileSync(new URL('./router-reference-obligations_codex.json', import.meta.url)));
+const obligations = JSON.parse(fs.readFileSync(new URL('./router-reference-obligations.json', import.meta.url)));
 const stable = value => Array.isArray(value) ? value.map(stable) : value && typeof value === 'object'
     ? Object.fromEntries(Object.keys(value).sort().filter(key => value[key] !== undefined).map(key => [key, stable(value[key])])) : value;
 function contractDigest(row) {

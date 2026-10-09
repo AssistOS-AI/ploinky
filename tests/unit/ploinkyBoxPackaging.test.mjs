@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
-import { historicalGitFixture } from '../helpers/historicalGitFixture_codex.mjs';
+import { historicalGitFixture } from '../helpers/historicalGitFixture.mjs';
 
 const BASE_SHA = 'c8f38927dd2741da9635debe61c64c39358aa8f9';
 const repositoryRoot = path.resolve(import.meta.dirname, '../..');

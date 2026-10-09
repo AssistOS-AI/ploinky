@@ -16,7 +16,7 @@ if (( $# > 0 )); then
         echo '[test] Refused: use --acceptance /absolute/manifest_codex.json.' >&2
         exit 64
     fi
-    exec node "$TESTS_DIR/e2e/liveUpdateCache/run_codex.mjs" --acceptance "$2"
+    exec node "$TESTS_DIR/e2e/liveUpdateCache/run.mjs" --acceptance "$2"
 fi
 echo '[test] Coverage scope: component-only; live update/cache and release acceptance are UNRUN.'
 

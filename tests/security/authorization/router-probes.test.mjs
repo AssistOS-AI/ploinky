@@ -32,7 +32,7 @@ test('Router source references reject stale metadata, wrong anchors, unknown blo
   }
   // The controls run for every row of every registered file family, so a family
   // added to the reviewed registry cannot be left without them.
-  const registry = JSON.parse(fs.readFileSync(new URL('./router-reference-obligations_codex.json', import.meta.url)));
+  const registry = JSON.parse(fs.readFileSync(new URL('./router-reference-obligations.json', import.meta.url)));
   const covered = new Set();
   for (const row of routerInventoryBaseline) {
     const [file, line] = row.source.split(':');
@@ -63,7 +63,7 @@ test('Router source references reject stale metadata, wrong anchors, unknown blo
   assert.deepEqual([...covered].sort(), Object.keys(registry.files).sort(), 'every registered file family is exercised');
   // Ratchet: reviewed entries whose statement is blank cannot prove that the
   // dispatch line is the reviewed one. Two such entries predate the 2026-10-08
-  // additions (see router-reference-review-2026-10-08_claude.md); no new one may appear.
+  // additions (see router-reference-review-2026-10-08.md); no new one may appear.
   const blankStatements = Object.entries(registry.files).flatMap(([file, family]) => Object.entries(family.blobs)
     .flatMap(([hash, rows]) => Object.entries(rows).filter(([, reference]) => !reference.statement.trim())
       .map(([id]) => `${file} ${hash.slice(0, 8)} ${id}`)));
@@ -74,7 +74,7 @@ test('Router source references reject stale metadata, wrong anchors, unknown blo
 });
 
 test('Router inventory retains the complete union of both prior inventories and refuses lost candidate anchors', () => {
-  const snapshot = JSON.parse(fs.readFileSync(new URL('./router-reference-obligations_codex.json', import.meta.url)));
+  const snapshot = JSON.parse(fs.readFileSync(new URL('./router-reference-obligations.json', import.meta.url)));
   assert.equal(snapshot.priorInventories.baseline.rows.length, 128);
   assert.equal(snapshot.priorInventories.candidate.rows.length, 128);
   assert.equal(snapshot.priorInventories.candidate.rows.filter(row => row.anchor).length, 43);
