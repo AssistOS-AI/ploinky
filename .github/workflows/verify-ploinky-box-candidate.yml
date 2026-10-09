@@ -8,12 +8,12 @@ on:
         required: true
         type: string
       smoke_graph_revisions_json:
-        description: Exact five-repository revision map as JSON
+        description: Exact four-repository revision map as JSON
         required: true
         type: string
     secrets:
       PLOINKY_CANDIDATE_REPOSITORY_TOKEN:
-        description: Read-only token for the five smoke-graph repositories
+        description: Read-only token for the four smoke-graph repositories
         required: true
   workflow_dispatch:
     inputs:
@@ -22,7 +22,7 @@ on:
         required: true
         type: string
       smoke_graph_revisions_json:
-        description: Exact five-repository revision map as JSON
+        description: Exact four-repository revision map as JSON
         required: true
         type: string
 
@@ -48,7 +48,7 @@ jobs:
       SMOKE_GRAPH_ARGS_JSON: '["start","AchillesIDE/explorer","19090"]'
       SMOKE_GRAPH_REVISIONS_JSON: ${{ inputs.smoke_graph_revisions_json }}
       SMOKE_GRAPH_REPOSITORIES_JSON: >-
-        {"AssistOSExplorer":"${{ github.workspace }}/candidate-repositories/AssistOSExplorer","UmamiAgent":"${{ github.workspace }}/candidate-repositories/UmamiAgent","AchillesCLI":"${{ github.workspace }}/candidate-repositories/AchillesCLI","proxies":"${{ github.workspace }}/candidate-repositories/proxies","container-image-builds":"${{ github.workspace }}/candidate-repositories/container-image-builds"}
+        {"AssistOSExplorer":"${{ github.workspace }}/candidate-repositories/AssistOSExplorer","UmamiAgent":"${{ github.workspace }}/candidate-repositories/UmamiAgent","AchillesCLI":"${{ github.workspace }}/candidate-repositories/AchillesCLI","proxies":"${{ github.workspace }}/candidate-repositories/proxies"}
     steps:
       - name: Set candidate artifact paths
         shell: bash
@@ -100,15 +100,6 @@ jobs:
           repository: AssistOS-AI/proxies
           ref: ${{ fromJSON(inputs.smoke_graph_revisions_json).proxies }}
           path: candidate-repositories/proxies
-          token: ${{ secrets.PLOINKY_CANDIDATE_REPOSITORY_TOKEN }}
-          persist-credentials: false
-
-      - name: Check out container-image-builds
-        uses: actions/checkout@v4
-        with:
-          repository: AssistOS-AI/container-image-builds
-          ref: ${{ fromJSON(inputs.smoke_graph_revisions_json)['container-image-builds'] }}
-          path: candidate-repositories/container-image-builds
           token: ${{ secrets.PLOINKY_CANDIDATE_REPOSITORY_TOKEN }}
           persist-credentials: false
 

@@ -14,7 +14,6 @@ export const SMOKE_GRAPH_REPOSITORIES = Object.freeze([
     'UmamiAgent',
     'AchillesCLI',
     'proxies',
-    'container-image-builds',
 ]);
 
 const SMOKE_GRAPH_DESTINATIONS = Object.freeze({

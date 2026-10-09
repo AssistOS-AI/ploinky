@@ -19,7 +19,7 @@ on:
         required: true
         type: string
       smoke_graph_revisions_json:
-        description: 'Exact five-repository revision map as JSON'
+        description: 'Exact four-repository revision map as JSON'
         required: true
         type: string
 

@@ -19,7 +19,7 @@ import {
 
 test('smoke graph pins only the required Explorer repositories and stages their exact SHAs', (t) => {
     assert.deepEqual(SMOKE_GRAPH_REPOSITORIES, [
-        'AssistOSExplorer', 'UmamiAgent', 'AchillesCLI', 'proxies', 'container-image-builds',
+        'AssistOSExplorer', 'UmamiAgent', 'AchillesCLI', 'proxies',
     ]);
     const createdRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-smoke-inputs-'));
     const root = fs.realpathSync(createdRoot);
@@ -58,7 +58,7 @@ test('smoke graph pins only the required Explorer repositories and stages their 
         SMOKE_GRAPH_EDGE_DESIRED_FILE: desiredCandidate,
     };
     const graph = readSmokeGraphInputs(baseEnvironment, { runner });
-    assert.equal(Object.keys(graph.repositories).length, 5);
+    assert.equal(Object.keys(graph.repositories).length, 4);
     assert.deepEqual(graph.args, ['start', 'AchillesIDE/explorer', '19090']);
 
     const containerId = 'b'.repeat(64);
@@ -71,7 +71,7 @@ test('smoke graph pins only the required Explorer repositories and stages their 
     assert.ok(copyCalls.every((call) => !call.at(-1).endsWith('/AssistOSExplorer')));
     assert.deepEqual(copyCalls.filter((call) => call.at(-1).includes('/repos/'))
         .map((call) => call.at(-1)), [
-        'AchillesIDE', 'UmamiAgent', 'AchillesCLI', 'proxies', 'container-image-builds',
+        'AchillesIDE', 'UmamiAgent', 'AchillesCLI', 'proxies',
     ].map((name) => `${containerId}:${workspaceRoot}/.ploinky/repos/${name}`));
     assert.ok(copyCalls.some((call) => call.at(-1).endsWith('/desired.json.smoke-candidate')));
     const initializeIndex = calls.findIndex((call) => (
@@ -106,9 +106,9 @@ test('smoke graph pins only the required Explorer repositories and stages their 
     assert.throws(() => readSmokeGraphInputs({
         ...baseEnvironment,
         SMOKE_GRAPH_REPOSITORIES_JSON: JSON.stringify(missing),
-    }, { runner }), /exactly the 5 pinned graph repositories/);
+    }, { runner }), /exactly the 4 pinned graph repositories/);
 
-    for (const retired of ['basic', 'webmeetInfra']) {
+    for (const retired of ['basic', 'webmeetInfra', 'container-image-builds']) {
         for (const [key, value] of [
             ['SMOKE_GRAPH_REPOSITORIES_JSON', { ...repositories, [retired]: root }],
             ['SMOKE_GRAPH_REVISIONS_JSON', { ...revisions, [retired]: sha }],
@@ -116,7 +116,7 @@ test('smoke graph pins only the required Explorer repositories and stages their 
             assert.throws(() => readSmokeGraphInputs({
                 ...baseEnvironment,
                 [key]: JSON.stringify(value),
-            }, { runner }), /exactly the 5 pinned graph repositories/);
+            }, { runner }), /exactly the 4 pinned graph repositories/);
         }
     }
 
@@ -172,7 +172,7 @@ test('candidate workflow stages the same Explorer graph and rejects retired repo
     });
     const accepted = validate(revisions);
     assert.equal(accepted.status, 0, accepted.stderr);
-    for (const retired of ['basic', 'webmeetInfra']) {
+    for (const retired of ['basic', 'webmeetInfra', 'container-image-builds']) {
         const rejected = validate({ ...revisions, [retired]: 'a'.repeat(40) });
         assert.equal(rejected.status, 3, rejected.stderr);
     }
