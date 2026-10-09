@@ -59,6 +59,7 @@ function productModel({ defect = '', listSites = 'denied', schema = 'declared', 
     if (!(owner || secret || defect === 'ignoreOwner' || (defect === 'leakToFirstJar' && actor === 'anonymous'))) {
       if (defect === 'foreignError') return { error: 'Internal storage error for this session' };
       if (defect === 'foreignEmptyExists') return { ...missing, exists: true };
+      if (defect === 'foreignWrongSessionId') return { ...missing, sessionId: 'someone-elses' };
       return missing;
     }
     return { siteId, sessionId, exists: true, sessionKuId: `ku_sess_${sessionId}`, history: turns, ...(defect === 'echoSecret' ? { echoed: record.secret } : {}), ...(defect === 'extraKey' ? { success: true } : {}) };
@@ -212,6 +213,7 @@ test('each way a product can get the secret or owner contract wrong fails exactl
     ['ownEmptyHistory', ['own-positive']],
     ['leakToFirstJar', ['cross-read']],
     ['extraKey', ['own-positive']],
+    ['foreignWrongSessionId', ['cross-read']],
   ];
   for (const [defect, expected] of cases) {
     const got = failed(await run({ defect }));
