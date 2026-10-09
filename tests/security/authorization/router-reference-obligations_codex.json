@@ -2403,6 +2403,102 @@
             "anchor": "action === 'disable_agent'",
             "statement": "} else if (action === 'disable_agent') {"
           }
+        },
+        "a845f14c25ae19a558e8902ee174867d74e069e44a1e71d79541c47eb5c69b68": {
+          "marketplace-repos-read.get": {
+            "line": 754,
+            "anchor": "const marketplacePayload = async () =>",
+            "statement": "const marketplacePayload = async () => runPreparedRepositoryRead(res, () => (isRepos ? buildMarketplaceRepositories({ user: req.user, machine: Boolean(readAuthorizationBearer(req)) }) : agentsMarketplace()), { catalog: isRepos });"
+          },
+          "marketplace-agents-read.get": {
+            "line": 724,
+            "anchor": "...buildMarketplaceAgents(req.user, options),",
+            "statement": "...buildMarketplaceAgents(req.user, options),"
+          },
+          "marketplace-install_repo.post": {
+            "line": 826,
+            "anchor": "action === 'install_repo'",
+            "statement": "} else if (action === 'install_repo' || action === 'uninstall_repo') {"
+          },
+          "marketplace-uninstall_repo.post": {
+            "line": 826,
+            "anchor": "action === 'uninstall_repo'",
+            "statement": "} else if (action === 'install_repo' || action === 'uninstall_repo') {"
+          },
+          "marketplace-enable_agent.post": {
+            "line": 852,
+            "anchor": "action === 'enable_agent'",
+            "statement": "} else if (action === 'enable_agent') {"
+          },
+          "marketplace-disable_agent.post": {
+            "line": 854,
+            "anchor": "action === 'disable_agent'",
+            "statement": "} else if (action === 'disable_agent') {"
+          }
+        },
+        "00f563d385705cb168a3576835214f86785d06f81f2c2f49643603432e1b42ec": {
+          "marketplace-repos-read.get": {
+            "line": 759,
+            "anchor": "const marketplacePayload = async () =>",
+            "statement": "const marketplacePayload = async () => runPreparedRepositoryRead(res, () => (isRepos ? buildMarketplaceRepositories({ user: req.user, machine: verifiedAgentCaller(req) }) : agentsMarketplace()), { catalog: isRepos });"
+          },
+          "marketplace-agents-read.get": {
+            "line": 729,
+            "anchor": "...buildMarketplaceAgents(req.user, options),",
+            "statement": "...buildMarketplaceAgents(req.user, options),"
+          },
+          "marketplace-install_repo.post": {
+            "line": 831,
+            "anchor": "action === 'install_repo'",
+            "statement": "} else if (action === 'install_repo' || action === 'uninstall_repo') {"
+          },
+          "marketplace-uninstall_repo.post": {
+            "line": 831,
+            "anchor": "action === 'uninstall_repo'",
+            "statement": "} else if (action === 'install_repo' || action === 'uninstall_repo') {"
+          },
+          "marketplace-enable_agent.post": {
+            "line": 857,
+            "anchor": "action === 'enable_agent'",
+            "statement": "} else if (action === 'enable_agent') {"
+          },
+          "marketplace-disable_agent.post": {
+            "line": 859,
+            "anchor": "action === 'disable_agent'",
+            "statement": "} else if (action === 'disable_agent') {"
+          }
+        },
+        "35821bc97941a7c72d59f967796c27a946ad16b960c25cccafb84f7045163673": {
+          "marketplace-repos-read.get": {
+            "line": 773,
+            "anchor": "const marketplacePayload = async () =>",
+            "statement": "const marketplacePayload = async () => runPreparedRepositoryRead(res, () => (isRepos ? buildMarketplaceRepositories({ user: req.user, machine: verifiedAgentCaller(req) }) : agentsMarketplace()), { catalog: isRepos });"
+          },
+          "marketplace-agents-read.get": {
+            "line": 743,
+            "anchor": "...buildMarketplaceAgents(req.user, options),",
+            "statement": "...buildMarketplaceAgents(req.user, options),"
+          },
+          "marketplace-install_repo.post": {
+            "line": 845,
+            "anchor": "action === 'install_repo'",
+            "statement": "} else if (action === 'install_repo' || action === 'uninstall_repo') {"
+          },
+          "marketplace-uninstall_repo.post": {
+            "line": 845,
+            "anchor": "action === 'uninstall_repo'",
+            "statement": "} else if (action === 'install_repo' || action === 'uninstall_repo') {"
+          },
+          "marketplace-enable_agent.post": {
+            "line": 871,
+            "anchor": "action === 'enable_agent'",
+            "statement": "} else if (action === 'enable_agent') {"
+          },
+          "marketplace-disable_agent.post": {
+            "line": 873,
+            "anchor": "action === 'disable_agent'",
+            "statement": "} else if (action === 'disable_agent') {"
+          }
         }
       },
       "candidate": "8c99918602620aa560b8dc0cf08d99c1aa69902c6e2c8a5606dc13a9965480f1"

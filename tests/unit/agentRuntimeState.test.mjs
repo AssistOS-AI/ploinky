@@ -268,7 +268,8 @@ test('Marketplace reports an enabled bwrap agent as running from generic runtime
             runMode: 'global',
         },
     };
-    const marketplace = marketplaceTestables.buildMarketplaceState(null, {
+    // An administrator's view includes the manifest path; other callers' views omit it.
+    const marketplace = marketplaceTestables.buildMarketplaceState({ id: 'ops', roles: ['admin'] }, {
         registry,
         runtimeEntries: [{
             containerName: 'bwrapKey',
@@ -401,7 +402,7 @@ test('Marketplace state exposes starting and disabled agents as distinct lifecyc
             { repo: 'proxies', name: 'otherAgent', about: 'Other', manifestPath: '/other/manifest.json' },
         ],
     }];
-    const marketplace = marketplaceTestables.buildMarketplaceState(null, {
+    const marketplace = marketplaceTestables.buildMarketplaceState({ id: 'ops', roles: ['admin'] }, {
         registry,
         runtimeEntries: [{
             containerName: 'searchKey',
