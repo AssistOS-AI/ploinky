@@ -9,12 +9,16 @@ import { WEBMEET_ADMIN_ONLY_TOOLS, WEBMEET_GUEST_ALLOWLIST, GUEST_AGENT_POLICY, 
 import { runWebmeetAdminToolProbes, webmeetAdminToolCheckDefinitions, WEBMEET_POSITIVE_FOR_OP, WEBMEET_DENIED_ACTORS, denialId } from './webmeet-admin-tools.mjs';
 import { decodeAgentMcp, webAssistGuestCheckDefinitions, webAssistGuestProbes } from './agent-probes.mjs';
 
+const claimed = (tool, args) => ({
+  ok: true, deleted: true, roomId: args.roomId, participantId: args.participantId, resourceId: args.resourceId, status: 'ok',
+  participant: { id: args.participantId, role: args.role }, settings: args.settings, name: args.name, meeting: { id: args.roomId, name: args.name }, id: args.roomId,
+});
 const ADMIN_TOOLS = new Set(WEBMEET_ADMIN_ONLY_TOOLS.map(entry => entry.tool));
 const ok = value => ({ failed: false, value, error: '', response: { status: 200, json: {}, text: '' } });
 const fail = error => ({ failed: true, value: { ok: false, error }, error, response: { status: 200, json: {}, text: '' } });
 
 /** Model of webmeetAgent@bdf0f96f: guest allowlist at dispatch, assertAdminAuthInfo in the eleven handlers. */
-function webmeetWorld({ leak = new Set(), failTool = new Set(), persistThenFailCreate = '' } = {}) {
+function webmeetWorld({ leak = new Set(), failTool = new Set(), persistThenFailCreate = '', silent = new Set(), disclose = new Set(), noop = new Set() } = {}) {
   const rooms = new Map();
   let counter = 0;
   const id = prefix => `${prefix}_${String(++counter).padStart(8, '0')}`;
@@ -50,6 +54,12 @@ function webmeetWorld({ leak = new Set(), failTool = new Set(), persistThenFailC
   const mcp = async (principal, agent, tool, args = {}) => {
     seen.push({ principal, tool });
     assert.equal(agent, 'webmeetAgent');
+    const denial = principal === 'anonymous' ? `Access denied: guest invocation cannot call "${tool}".` : 'Access denied: only admin can manage rooms.';
+    // Hostile models of a broken product: the state changes (or data is returned) and the call still answers "access denied".
+    if (silent.has(`${principal}:${tool}`)) { try { handlers[tool](args); } catch { /* the attempt may fail after persisting */ } return fail(denial); }
+    if (disclose.has(`${principal}:${tool}`)) { try { return { ...fail(denial), value: { ok: false, error: denial, ...handlers[tool](args) } }; } catch { return fail(denial); } }
+    // An administrator operation that claims success without changing anything.
+    if (noop.has(`${principal}:${tool}`)) return ok(claimed(tool, args));
     const leaked = leak.has(`${principal}:${tool}`);
     if (principal === 'anonymous' && !leaked && !WEBMEET_GUEST_ALLOWLIST.includes(tool)) return fail(`Access denied: guest invocation cannot call "${tool}".`);
     if (principal !== 'admin' && !leaked && ADMIN_TOOLS.has(tool)) return fail('Access denied: only admin can manage rooms.');
@@ -219,4 +229,85 @@ test('webAssist cross-session history: isolation passes, a cross read fails, and
   await webAssistGuestProbes(noFixture.ctx, assistMcp());
   assert.equal(noFixture.checks.at(-1).status, 'FAIL');
   assert.match(noFixture.checks.at(-1).error, /session fixture/);
+});
+
+// ---- N1: mutants that survived the first offline suite ------------------------------------------
+// Mutating tools only: the shared-room rename/delete denials live in resource-probes.mjs and the RoboTeam read has no state to change.
+const MUTATING_OPS = WEBMEET_ADMIN_ONLY_TOOLS.filter(entry => !['rename', 'delete', 'robo-team-get'].includes(entry.op));
+
+test('a denied call that changes state yet answers "access denied" fails that denial (admin-side re-check)', async () => {
+  for (const { tool, op } of MUTATING_OPS) {
+    for (const actor of WEBMEET_DENIED_ACTORS) {
+      const { world, ctx } = await run({ silent: new Set([`${actor}:${tool}`]) });
+      const failed = ctx.report.checks.filter(check => check.status !== 'PASS').map(check => check.id);
+      assert.ok(failed.includes(denialId(actor, op)), `${actor} ${tool}: the silent state change was not detected (failed: ${failed.join(', ') || 'none'})`);
+      const related = new Set([...WEBMEET_DENIED_ACTORS.map(other => denialId(other, op)), WEBMEET_POSITIVE_FOR_OP[op]]);
+      assert.ok(failed.every(id => related.has(id)), `${actor} ${tool}: unrelated failures ${failed.join(', ')}`);
+      for (const cleanup of ctx.cleanups.reverse()) await cleanup();
+      assert.deepEqual([...world.rooms.values()], [], 'cleanup removed whatever the silent change created');
+    }
+  }
+});
+
+test('a denied room creation that persisted a room is detected and the room is cleaned up', async () => {
+  for (const actor of WEBMEET_DENIED_ACTORS) {
+    const { world, ctx } = await run({ silent: new Set([`${actor}:webmeet_room_create`]) });
+    assert.deepEqual(ctx.report.checks.filter(check => check.status !== 'PASS').map(check => check.id), [denialId(actor, 'create')]);
+    assert.equal([...world.rooms.values()].filter(room => room.name === `authz-test-denied-create-${actor}`).length, 1, 'the room really persisted');
+    for (const cleanup of ctx.cleanups.reverse()) await cleanup();
+    assert.deepEqual([...world.rooms.values()], []);
+  }
+});
+
+test('a denied RoboTeam read that discloses the settings inside its failure payload fails the marker check', async () => {
+  for (const actor of WEBMEET_DENIED_ACTORS) {
+    const { ctx } = await run({ disclose: new Set([`${actor}:webmeet_robo_team_get`]) });
+    assert.deepEqual(ctx.report.checks.filter(check => check.status !== 'PASS').map(check => check.id), [denialId(actor, 'robo-team-get')]);
+    assert.match(ctx.report.checks.find(check => check.id === denialId(actor, 'robo-team-get')).error, /leaked/);
+  }
+});
+
+test('an administrator operation that answers ok without changing state fails its positive and nothing else passes silently', async () => {
+  const positives = [
+    ['webmeet_room_rename', 'rename'], ['webmeet_room_archive', 'archive'], ['webmeet_room_delete', 'delete'], ['webmeet_agent_attach', 'attach'], ['webmeet_agent_detach', 'detach'],
+    ['webmeet_resource_remove', 'resource-remove'], ['webmeet_participant_update_role', 'participant-role'], ['webmeet_participant_remove', 'participant-remove'], ['webmeet_robo_team_update', 'robo-team-update'],
+  ];
+  for (const [tool, op] of positives) {
+    const { ctx } = await run({ noop: new Set([`admin:${tool}`]) });
+    assert.equal(ctx.report.checks.find(check => check.id === WEBMEET_POSITIVE_FOR_OP[op]).status, 'FAIL', `${tool}: a no-op administrator call must not satisfy its positive`);
+  }
+});
+
+test('webAssist list-sites: a failure that is not an authorization decision, or a missing admin positive, never counts as a denial', async () => {
+  const mcp = reason => ({ async rpc(actor, agent, method, params) {
+    if (actor === 'anonymous' && params.name === 'list-sites') return decodeAgentMcp({ status: 200, json: { result: { isError: true, content: [{ type: 'text', text: reason }] } }, headers: {} });
+    return decodeAgentMcp({ status: 200, json: { result: { content: [{ type: 'text', text: JSON.stringify({ sites: [], count: 0, dataRoot: '/x' }) }] } }, headers: {} });
+  } });
+  for (const reason of ['ENOENT: no such file or directory, scandir sites', 'Tool timed out', 'Missing argument siteId']) {
+    const world = assistCtx({ histories: historyOf(false), factory });
+    await webAssistGuestProbes(world.ctx, mcp(reason), { createSession: factory });
+    assert.equal(world.checks.find(check => check.id === 'agent.webAssist.anonymous.list-sites-denied').status, 'FAIL', reason);
+  }
+  const authorized = assistCtx({ histories: historyOf(false), factory });
+  await webAssistGuestProbes(authorized.ctx, mcp('Access denied: guest invocation cannot call list-sites.'), { createSession: factory });
+  assert.equal(authorized.checks.find(check => check.id === 'agent.webAssist.anonymous.list-sites-denied').status, 'PASS');
+  // The denial is mandatory only together with its administrator positive.
+  const mandatory = JSON.parse(readFileSync(new URL('./acceptance/mandatory-checks.json', import.meta.url), 'utf8'));
+  assert.deepEqual(mandatory.checks.find(entry => entry.id === 'agent.webAssist.anonymous.list-sites-denied').positiveControlAnyOf, ['agent.webAssist.admin.list-sites-positive']);
+  assert.deepEqual(webAssistGuestCheckDefinitions().find(entry => entry.id === 'agent.webAssist.anonymous.list-sites-denied').positiveControlAnyOf, ['agent.webAssist.admin.list-sites-positive']);
+});
+
+test('webAssist isolation: two jars that hold the same guest session are not two visitors', async () => {
+  const world = assistCtx({ histories: historyOf(false), factory });
+  world.ctx.clients.anonymousB = { cookies: [{ name: 'ploinky_guest', value: 'guest-A' }] };
+  await webAssistGuestProbes(world.ctx, assistMcp(), { createSession: factory });
+  const check = world.checks.at(-1);
+  assert.equal(check.status, 'FAIL');
+  assert.match(check.error, /distinct guest sessions/);
+  // A jar without any guest cookie is not a guest session either.
+  const noCookie = assistCtx({ histories: historyOf(false), factory });
+  noCookie.ctx.clients.anonymous = { cookies: [] };
+  noCookie.ctx.clients.anonymousB = { cookies: [] };
+  await webAssistGuestProbes(noCookie.ctx, assistMcp(), { createSession: factory });
+  assert.equal(noCookie.checks.at(-1).status, 'FAIL');
 });
