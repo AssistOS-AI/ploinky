@@ -27,7 +27,7 @@ test('guest cookie names are the pinned per-route names', () => {
         assert.equal(guestCookieNameForRouteKey(` ${routeKey}\t`), name, `${routeKey} trimmed`);
         assert.equal(guestCookieNameForRouteKey(routeKey), guestCookieNameForRouteKey(routeKey), `${routeKey} deterministic`);
     }
-    assert.equal(LEGACY_GUEST_AUTH_COOKIE_NAME, 'ploinky_guest');
+    assert.equal(LEGACY_GUEST_AUTH_COOKIE_NAME, 'ploinky_guest'); // legacy-guest-cookie-case
     assert.equal(GUEST_AUTH_COOKIE_PREFIX, 'ploinky_guest_');
 });
 
@@ -93,10 +93,10 @@ test('different route keys give different names', () => {
 });
 
 test('guest cookie recognition covers the legacy and every derived name only', () => {
-    for (const name of ['ploinky_guest', ...Object.values(EXPECTED), 'ploinky_guest_x', 'ploinky_guestx']) {
+    for (const name of ['ploinky_guest', ...Object.values(EXPECTED), 'ploinky_guest_x', 'ploinky_guestx']) { // legacy-guest-cookie-case
         assert.equal(isGuestCookieName(name), true, name);
     }
-    for (const name of ['', null, undefined, 'ploinky_sso', 'ploinky_jwt', 'guest', 'xploinky_guest', 'ploinky_gues']) {
+    for (const name of ['', null, undefined, 'ploinky_sso', 'ploinky_jwt', 'guest', 'xploinky_guest', 'ploinky_gues']) { // legacy-guest-cookie-case
         assert.equal(isGuestCookieName(name), false, String(name));
     }
 });
@@ -120,7 +120,7 @@ test('the dormant mutation matcher treats a guest-only jar as carrying Router co
     const plan = { method: 'POST', origin: 'https://app.example' };
     for (const cookie of [
         `${EXPECTED.webAssist}=token`,
-        'ploinky_guest=token',
+        'ploinky_guest=token', // legacy-guest-cookie-case
         `theme=dark; ${EXPECTED.webmeetAgent}=token`,
     ]) {
         assert.throws(
@@ -130,4 +130,13 @@ test('the dormant mutation matcher treats a guest-only jar as carrying Router co
         );
     }
     assert.equal(assertMutationAllowed({ method: 'POST', headers: { cookie: 'theme=dark' } }, plan), true);
+});
+
+test('the authorization harness pins the Router guest cookie names of its reviewed guest routes', async () => {
+    const { GUEST_COOKIE_NAMES } = await import('../security/authorization/guest-agent-policy.mjs');
+    assert.deepEqual(Object.keys(GUEST_COOKIE_NAMES).sort(), ['webAssist', 'webmeetAgent']);
+    for (const [routeKey, name] of Object.entries(GUEST_COOKIE_NAMES)) {
+        assert.equal(name, guestCookieNameForRouteKey(routeKey), routeKey);
+        assert.equal(name, EXPECTED[routeKey], routeKey);
+    }
 });

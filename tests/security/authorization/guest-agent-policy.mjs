@@ -15,6 +15,24 @@
  * Basis lines are Explorer bdf0f96f unless stated otherwise.
  */
 
+/**
+ * The Router's per-route guest session cookie names for the reviewed guest agents.
+ * Pinned literally so the harness does not derive them from the product code; the
+ * unit test tests/unit/guestCookieNames.test.mjs checks them against the Router
+ * helper (cli/server/auth/guestCookieNames.js).
+ */
+export const GUEST_COOKIE_NAMES = Object.freeze({
+  webAssist: 'ploinky_guest_ncGyyzpdIxmPjORN_wQfqv',
+  webmeetAgent: 'ploinky_guest_iw2P_FBNZBzQ_b5bTDMOLe',
+});
+
+/** The guest cookie name of one reviewed guest route; any other route key is an error. */
+export function guestCookieNameFor(routeKey) {
+  const name = Object.hasOwn(GUEST_COOKIE_NAMES, String(routeKey || '')) ? GUEST_COOKIE_NAMES[routeKey] : '';
+  if (!name) throw new Error(`No reviewed guest cookie name for route '${routeKey}'`);
+  return name;
+}
+
 export const WEBMEET_GUEST_ALLOWLIST = Object.freeze([
   'webmeet_room_public_get',
   'webmeet_room_join_guest',

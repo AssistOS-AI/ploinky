@@ -5,6 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 
+import { ANY_GUEST_SET_COOKIE } from '../helpers/guestCookies.mjs';
+
 // Real SSO bridge, real admission and route code, fixture provider agent.
 const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'sso-availability-'));
 const ploinkyDir = path.join(workspace, '.ploinky');
@@ -236,7 +238,7 @@ test('a guest route with an SSO cookie answers 503 during an outage instead of d
     assert.equal(result.ok, false);
     assert.equal(res.statusCode, 503);
     assert.equal(req.authMode, undefined);
-    assert.doesNotMatch(String(res.getHeader('set-cookie') || ''), /ploinky_guest=/);
+    assert.doesNotMatch(String(res.getHeader('set-cookie') || ''), ANY_GUEST_SET_COOKIE);
     assert.ok(authService.getSession(sessionId));
 });
 

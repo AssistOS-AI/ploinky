@@ -52,6 +52,12 @@ test('guest identity is decoded from the jar\'s own guest JWT and nothing else i
   for (const [name, value] of Object.entries(bad)) assert.throws(() => guestSubjectFromJar(jar(value).cookies), undefined, name);
   assert.throws(() => guestSubjectFromJar([{ name: 'ploinky_sso', value: jwt() }]), /no guest session cookie/);
   assert.equal(guestSubjectFromJar([{ name: 'ploinky_sso', value: 'x' }, { name: GUEST_COOKIE, value: jwt({ sub: SUB_A }) }]), SUB_A);
+  // Guest cookies are per route: only the webAssist route's cookie is that jar's webAssist identity.
+  assert.equal(GUEST_COOKIE, 'ploinky_guest_ncGyyzpdIxmPjORN_wQfqv');
+  assert.throws(() => guestSubjectFromJar([{ name: 'ploinky_guest_iw2P_FBNZBzQ_b5bTDMOLe', value: jwt() }]), /no guest session cookie/);
+  assert.throws(() => guestSubjectFromJar([{ name: 'ploinky_guest', value: jwt() }]), /no guest session cookie/); // legacy-guest-cookie-case
+  assert.equal(guestSubjectFromJar([{ name: 'ploinky_guest_iw2P_FBNZBzQ_b5bTDMOLe', value: jwt({ sub: SUB_B }) }], { routeKey: 'webmeetAgent' }), SUB_B);
+  assert.throws(() => guestSubjectFromJar(jar(jwt()).cookies, { routeKey: 'unreviewedGuestAgent' }), /No reviewed guest cookie name/);
 });
 
 test('seeding writes the session, its marker turns and a schema-2 owner record, then cleans up exactly what it created', async t => {

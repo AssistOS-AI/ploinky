@@ -76,10 +76,26 @@ export function isSessionRevoked({ sid, jti } = {}) {
     return false;
 }
 
-export function revokeSessionId({ sid, jti, reason = '', at } = {}) {
+function revocationEntry({ sid, jti, reason = '', at } = {}) {
     const normSid = sid ? String(sid) : '';
     const normJti = jti ? String(jti) : '';
-    if (!normSid && !normJti) return false;
+    if (!normSid && !normJti) return null;
+    const entry = { ts: at || new Date().toISOString() };
+    if (normSid) entry.sid = normSid;
+    if (normJti) entry.jti = normJti;
+    if (reason) entry.reason = String(reason);
+    return entry;
+}
+
+/**
+ * Revokes several sessions with one read and one atomic write of the list.
+ * Entries without a sid or jti are ignored; returns the number appended.
+ */
+export function revokeSessionIds(revocations = []) {
+    const entries = (Array.isArray(revocations) ? revocations : [])
+        .map(revocationEntry)
+        .filter(Boolean);
+    if (!entries.length) return 0;
     const dir = revocationsDir();
     fs.mkdirSync(dir, { recursive: true });
     const file = revocationsFile();
@@ -92,20 +108,21 @@ export function revokeSessionId({ sid, jti, reason = '', at } = {}) {
     } catch {
         // Missing or corrupt: start a fresh list rather than failing the logout.
     }
-    const entry = { ts: at || new Date().toISOString() };
-    if (normSid) entry.sid = normSid;
-    if (normJti) entry.jti = normJti;
-    if (reason) entry.reason = String(reason);
-    data.revoked.push(entry);
+    data.revoked.push(...entries);
     // Atomic write: temp file in the same dir, then rename over the active file.
     const tmp = path.join(dir, `.sessions-revocations.${process.pid}.${data.revoked.length}.tmp`);
     fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
     fs.renameSync(tmp, file);
     cacheKey = '';
-    return true;
+    return entries.length;
+}
+
+export function revokeSessionId(revocation = {}) {
+    return revokeSessionIds([revocation]) === 1;
 }
 
 export default {
     isSessionRevoked,
     revokeSessionId,
+    revokeSessionIds,
 };

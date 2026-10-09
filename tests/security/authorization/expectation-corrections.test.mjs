@@ -8,7 +8,7 @@ import fsPromises from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { assertSessionExpired } from './account-probes.mjs';
-import { pinnedGuestList } from './guest-agent-policy.mjs';
+import { GUEST_COOKIE_NAMES, pinnedGuestList } from './guest-agent-policy.mjs';
 import { assertAgentReadPositive, assertGuestDiscovery, assertOwnAccountRouteGate, createAgentSessions, discoverAgentMcp, hasGuestCookie, usernamePrivilegeProbe } from './agent-probes.mjs';
 import { classifyAgentCardFanout, runRouterProbes, routerProbes } from './router-probes.mjs';
 import { runTerminalProbes } from './stream-probes.mjs';
@@ -149,10 +149,21 @@ test('guest discovery: a minted guest session and the exact reviewed list pass; 
     assert.throws(() => assertGuestDiscovery({ ...ok, value: named('tools', drifted) }, { ...args, adminNames: drifted }), /differ from the reviewed/);
     assert.throws(() => assertGuestDiscovery({ ...ok, success: false }, args));
     assert.throws(() => assertGuestDiscovery({ ...ok, response: response(401, {}) }, args));
-    assert.equal(hasGuestCookie({ cookies: [{ name: 'ploinky_guest', value: 'x' }] }, undefined), true);
-    assert.equal(hasGuestCookie({ cookies: [{ name: 'ploinky_guest', value: '' }] }, undefined), false);
-    assert.equal(hasGuestCookie({ cookies: [] }, { headers: { 'set-cookie': ['ploinky_guest=abc; Path=/'] } }), true);
-    assert.equal(hasGuestCookie({ cookies: [{ name: 'ploinky_sso', value: 'x' }] }, { headers: {} }), false);
+    const webAssistCookie = GUEST_COOKIE_NAMES.webAssist;
+    const webmeetCookie = GUEST_COOKIE_NAMES.webmeetAgent;
+    assert.equal(hasGuestCookie({ cookies: [{ name: webAssistCookie, value: 'x' }] }, undefined, 'webAssist'), true);
+    assert.equal(hasGuestCookie({ cookies: [{ name: webAssistCookie, value: '' }] }, undefined, 'webAssist'), false);
+    assert.equal(hasGuestCookie({ cookies: [] }, { headers: { 'set-cookie': [`${webAssistCookie}=abc; Path=/`] } }, 'webAssist'), true);
+    assert.equal(hasGuestCookie({ cookies: [] }, { headers: { 'set-cookie': [`${webAssistCookie}=; Path=/; Max-Age=0`] } }, 'webAssist'), false);
+    assert.equal(hasGuestCookie({ cookies: [{ name: 'ploinky_sso', value: 'x' }] }, { headers: {} }, 'webAssist'), false);
+    // Another guest route's cookie, or the retired shared name, is not this route's guest session.
+    assert.equal(hasGuestCookie({ cookies: [{ name: webmeetCookie, value: 'x' }] }, undefined, 'webAssist'), false);
+    assert.equal(hasGuestCookie({ cookies: [] }, { headers: { 'set-cookie': [`${webmeetCookie}=abc; Path=/`] } }, 'webAssist'), false);
+    assert.equal(hasGuestCookie({ cookies: [{ name: webmeetCookie, value: 'x' }] }, undefined, 'webmeetAgent'), true);
+    assert.equal(hasGuestCookie({ cookies: [{ name: 'ploinky_guest', value: 'x' }] }, undefined, 'webAssist'), false); // legacy-guest-cookie-case
+    // A route without a reviewed guest cookie name is an error, never "any guest cookie".
+    assert.throws(() => hasGuestCookie({ cookies: [{ name: webAssistCookie, value: 'x' }] }, undefined), /No reviewed guest cookie name/);
+    assert.throws(() => hasGuestCookie({ cookies: [{ name: webAssistCookie, value: 'x' }] }, undefined, 'unreviewedGuestAgent'), /No reviewed guest cookie name/);
     assert.throws(() => pinnedGuestList('unreviewedGuestAgent', 'tools'), /no reviewed policy/);
 });
 
@@ -160,7 +171,7 @@ function discoveryWorld({ guest = true, anonymousTools, anonymousStatus = 200, c
     const admin = pinnedGuestList('webAssist', 'tools');
     const checks = [];
     const ctx = {
-        report: {}, secrets: new Set(), guestAgents: guest ? [{ repo: 'AchillesIDE', agent: 'webAssist' }] : [], clients: { anonymous: { cookies: cookie ? [{ name: 'ploinky_guest', value: 'g' }] : [] } },
+        report: {}, secrets: new Set(), guestAgents: guest ? [{ repo: 'AchillesIDE', agent: 'webAssist' }] : [], clients: { anonymous: { cookies: cookie ? [{ name: GUEST_COOKIE_NAMES.webAssist, value: 'g' }] : [] } },
         recordGap: () => {},
         async check(id, fn) { try { await fn(); checks.push({ id, status: 'PASS' }); } catch (error) { checks.push({ id, status: 'FAIL', error: String(error?.message || error) }); } },
     };

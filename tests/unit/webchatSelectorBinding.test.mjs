@@ -7,6 +7,8 @@ import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
 
+import { guestSetCookies } from '../helpers/guestCookies.mjs';
+
 // WebChat page and runtime requests launch exactly the target admitted by the
 // Router's authorization snapshot. These cases drive the real auth entrypoint
 // and then the real WebChat handler, as the Router does.
@@ -189,10 +191,11 @@ function makeRes() {
     };
 }
 
+// The name=value of any minted guest cookie (every guest cookie name), or ''.
 function guestCookieFrom(res) {
-    const values = [res.getHeader('set-cookie')].flat().filter(Boolean).map(String);
-    const match = values.map((value) => /^ploinky_guest=([^;]+)/.exec(value)).find(Boolean);
-    return match ? `ploinky_guest=${match[1]}` : '';
+    const minted = guestSetCookies(res).filter((cookie) => cookie.value && cookie.maxAge !== 0);
+    assert.ok(minted.length <= 1, 'one guest cookie per response');
+    return minted.length ? `${minted[0].name}=${minted[0].value}` : '';
 }
 
 function fakeTty(label) {

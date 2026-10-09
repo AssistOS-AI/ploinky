@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { agentCatalog, agentInventory } from './agent-inventory.mjs';
 import { assertDenied, Client, WORKSPACE } from './core.mjs';
-import { GUEST_AGENT_POLICY, WEBASSIST_SESSION_SECRET_TOOLS, pinnedGuestList } from './guest-agent-policy.mjs';
+import { GUEST_AGENT_POLICY, WEBASSIST_SESSION_SECRET_TOOLS, guestCookieNameFor, pinnedGuestList } from './guest-agent-policy.mjs';
 
 const actors = ['anonymous', 'selfRegistered', 'userA', 'userB', 'admin'];
 const profilePath = '/base-agent-additional-server/userPersistoAgent/7000/service/dashboard/api/profile';
@@ -341,9 +341,12 @@ export function assertGuestDiscovery(result, { field, adminNames, guestCookie, p
     assert.deepEqual(result.value[field].map((item) => item.name).sort(), pinned, 'Guest discovery must expose exactly the reviewed names');
     assert.equal(guestCookie, true, 'Anonymous access must come from a minted guest session, not from an unauthenticated route');
 }
-export function hasGuestCookie(client, init) {
-    const jar = (client?.cookies || []).some((cookie) => cookie.name === 'ploinky_guest' && cookie.value);
-    const header = [].concat(init?.headers?.['set-cookie'] || []).some((line) => /^ploinky_guest=[^;]+/.test(line));
+// Guest cookies are per guest route: only the probed route's own cookie counts.
+export function hasGuestCookie(client, init, routeKey) {
+    const name = guestCookieNameFor(routeKey);
+    const jar = (client?.cookies || []).some((cookie) => cookie.name === name && cookie.value);
+    const header = [].concat(init?.headers?.['set-cookie'] || []).map(String)
+        .some((line) => line.startsWith(`${name}=`) && line.slice(name.length + 1).split(';')[0].trim() !== '');
     return jar || header;
 }
 
@@ -471,7 +474,7 @@ export async function discoverAgentMcp(ctx, mcp, catalog = agentCatalog) {
                     if (actor === 'anonymous' && guestAgent) {
                         // The cached session of this very result; a failed initialize is not retried.
                         const session = result.stage === 'initialize' ? null : await mcp.initialize('anonymous', agent.agent);
-                        assertGuestDiscovery(result, { field: definition.field, adminNames: names, guestCookie: hasGuestCookie(ctx.clients?.anonymous, session?.init), pinned: pinnedGuestList(agent.agent, definition.field) });
+                        assertGuestDiscovery(result, { field: definition.field, adminNames: names, guestCookie: hasGuestCookie(ctx.clients?.anonymous, session?.init, agent.agent), pinned: pinnedGuestList(agent.agent, definition.field) });
                     } else if (actor === 'anonymous' || (actor === 'selfRegistered' && agent.agent === 'explorer')) assertAgentMcpDenied(result);
                     else if (!result.success) {
                         if (result.response.json?.error?.code === -32601) {
@@ -745,7 +748,7 @@ export async function webAssistGuestProbes(ctx, mcp, { createSession = ctx.webAs
             return (args) => ctx.request(actor, { method: 'POST', path: '/webAssist/mcp', headers: sessionHeaders, body: { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'web_cli_history', arguments: args } } }).then(decodeAgentMcp);
         };
         readers = { anonymous: await guest('anonymous'), anonymousB: await guest('anonymousB') };
-        const jarSession = (actor) => ctx.clients[actor].cookies.find((c) => c.name === 'ploinky_guest')?.value;
+        const jarSession = (actor) => ctx.clients[actor].cookies.find((c) => c.name === guestCookieNameFor('webAssist'))?.value;
         assert.ok(jarSession('anonymous') && jarSession('anonymousB'), 'Each jar holds a guest session cookie');
         assert.notEqual(jarSession('anonymous'), jarSession('anonymousB'), 'The two anonymous jars must hold distinct guest sessions');
         const a = await createSession('anonymous');

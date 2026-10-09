@@ -24,7 +24,9 @@ import {
     authService,
     buildCookie,
     getCookieNameForMode,
-    GUEST_AUTH_COOKIE_NAME,
+    guestCookieNameForAuthContext,
+    isGuestCookieRouteRequiredError,
+    LEGACY_GUEST_AUTH_COOKIE_NAME,
     LOCAL_AUTH_COOKIE_NAME,
     normalizeRelativePath,
     parseCookies,
@@ -844,20 +846,27 @@ function respondUnauthenticated(req, res, parsedUrl, authContext = resolveAuthCo
     const query = new URLSearchParams({ returnTo });
     if (authContext?.routeKey && !isHostBoundRoutePlan(options.routePlan)) query.set('agent', authContext.routeKey);
     const loginUrl = `/auth/login?${query.toString()}`;
-    const cookieName = getCookieNameForMode(authContext?.mode);
-    const clearCookie = buildCookie(cookieName, '', req, '/', { maxAge: 0, sameSite: 'Lax' });
+    // A guest context without a route key has no cookie name; clear nothing.
+    let clearCookie = '';
+    try {
+        const cookieName = getCookieNameForMode(authContext?.mode, authContext);
+        clearCookie = buildCookie(cookieName, '', req, '/', { maxAge: 0, sameSite: 'Lax' });
+    } catch (error) {
+        if (!isGuestCookieRouteRequiredError(error)) throw error;
+    }
+    const clearHeaders = clearCookie ? { 'Set-Cookie': clearCookie } : {};
     const method = (req.method || 'GET').toUpperCase();
     const wantsJson = wantsJsonResponse(req, pathname) || method !== 'GET';
     if (wantsJson) {
         res.writeHead(401, {
             'Content-Type': 'application/json',
-            'Set-Cookie': clearCookie
+            ...clearHeaders,
         });
         res.end(JSON.stringify({ ok: false, error: 'not_authenticated', login: loginUrl }));
     } else {
         res.writeHead(302, {
             Location: loginUrl,
-            'Set-Cookie': clearCookie
+            ...clearHeaders,
         });
         res.end('Authentication required');
     }
@@ -1095,7 +1104,17 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext, 
             });
             return { ok: false, error: authContext.policy.guestScopeError };
         }
-        const guestCookie = cookies.get(GUEST_AUTH_COOKIE_NAME);
+        // One guest cookie per guest route key. Cookies of other guest routes
+        // are never read, overwritten or cleared here.
+        let guestCookieName;
+        try {
+            guestCookieName = guestCookieNameForAuthContext(authContext);
+        } catch (error) {
+            if (!isGuestCookieRouteRequiredError(error)) throw error;
+            sendJson(res, 503, { ok: false, error: 'guest_route_unresolved' });
+            return { ok: false, error: 'guest_route_unresolved' };
+        }
+        const guestCookie = cookies.get(guestCookieName);
         if (guestCookie) {
             const guestSession = await resolveRouteBoundGuestMcpSession(
                 guestCookie,
@@ -1113,11 +1132,15 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext, 
         }
         const guestJwt = mintGuestSessionJwt({ policy: authContext.policy });
         const guestSession = await sessionTokenService.getGuestSession(guestJwt, { policy: authContext.policy });
-        const cookie = buildCookie(GUEST_AUTH_COOKIE_NAME, guestJwt, req, '/', {
+        const cookie = buildCookie(guestCookieName, guestJwt, req, '/', {
             maxAge: GUEST_SESSION_TTL_SECONDS,
             sameSite: 'Lax'
         });
         appendSetCookie(res, cookie);
+        // The legacy shared guest cookie is never read; a mint retires it.
+        if (cookies.has(LEGACY_GUEST_AUTH_COOKIE_NAME)) {
+            appendSetCookie(res, buildCookie(LEGACY_GUEST_AUTH_COOKIE_NAME, '', req, '/', { maxAge: 0, sameSite: 'Lax' }));
+        }
         req.user = guestSession?.user || { id: 'guest', username: 'visitor', roles: ['guest'] };
         req.session = guestSession;
         req.sessionId = guestJwt;
@@ -1126,7 +1149,7 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext, 
         return finalizeAuthenticatedRequest(req, res, parsedUrl, authContext, options, guestSession);
     }
 
-    const cookieName = getCookieNameForMode(authContext.mode);
+    const cookieName = getCookieNameForMode(authContext.mode, authContext);
     const sessionId = cookies.get(cookieName);
     if (!sessionId) {
         appendLog('auth_missing_cookie', { path: parsedUrl.pathname });
