@@ -234,7 +234,8 @@ test('room list requires the task-owned room for entitled users and an exactly e
     }
     const adminWithoutFixture = await runRoomListReadTools({ admin: mcpSuccess({ rooms: [{ id: 'room_archived' }], canManageRooms: true }), ordinary: listed, selfRegistered: mcpSuccess({ rooms: [], canManageRooms: false }) });
     assert.equal(adminWithoutFixture.passed.includes(id), false, 'no filtered claim without the fixture in the administrator control');
-    assert.ok(adminWithoutFixture.gaps.some((gap) => gap.id === 'agent.tool.webmeet_room_list'));
+    assert.ok(adminWithoutFixture.failures.includes('agent.tool.webmeet_room_list.admin'), 'an admin listing without the owned room fails');
+    assert.equal(adminWithoutFixture.gaps.some((gap) => gap.id.startsWith('agent.tool.webmeet_room_list')), false);
 });
 
 test('a missing room fixture fails the listing probe instead of recording a gap', async () => {

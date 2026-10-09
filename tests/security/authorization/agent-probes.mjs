@@ -367,7 +367,13 @@ export async function readTools(ctx, mcp, roomFixture) {
         try {
             positive = await mcp.rpc('admin', probe.agent, 'tools/call', { name: probe.tool, arguments: probe.args || {} });
             assertAgentReadPositive(probe, positive, ctx.principals.admin);
-        } catch {
+        } catch (error) {
+            // With a task-owned room, the administrator listing is a fixture
+            // invariant: omitting that room fails instead of becoming a gap.
+            if (filteredListing) {
+                await ctx.check(`agent.tool.${probe.tool}.admin`, async () => { throw error; });
+                continue;
+            }
             ctx.recordGap(`agent.tool.${probe.tool}`, 'Administrator read control unavailable or returned an unexpected response shape; inspect the private response artifact. No denial is counted.');
             continue;
         }
