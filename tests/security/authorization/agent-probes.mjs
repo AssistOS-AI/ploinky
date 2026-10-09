@@ -203,23 +203,63 @@ function decodeWorkspaceRoomEvent(encoded) {
 export async function createRoomListingFixture(ctx, mcp) {
     let fixture;
     await ctx.check('agent.tool.webmeet_room_list.fixture', async () => {
-        await ctx.guard();
         const name = `${ctx.prefix}-listing-room`;
-        const created = await mcp.rpc('admin', 'webmeetAgent', 'tools/call', { name: 'webmeet_room_create', arguments: { name, roomType: 'team' } });
-        assert.equal(created.success, true, 'Administrator could not create the task-owned listing room');
-        const roomId = created.value?.roomId || created.value?.id;
-        assert.ok(typeof roomId === 'string' && /^room_[0-9a-f-]{36}$/i.test(roomId), 'Room creation returned no room ID');
-        ctx.cleanup(async () => {
+        const rpc = async (tool, args = {}) => {
             await ctx.guard();
-            // Delete only the exact room this run created, identified by ID and run-scoped name.
-            const current = await mcp.rpc('admin', 'webmeetAgent', 'tools/call', { name: 'webmeet_room_get', arguments: { roomId } });
+            return mcp.rpc('admin', 'webmeetAgent', 'tools/call', { name: tool, arguments: args });
+        };
+        const identity = view => {
+            const id = view?.id || view?.roomId;
+            assert.ok(typeof id === 'string' && /^room_[0-9a-f-]{36}$/i.test(id), 'Room response returned no authoritative room ID');
+            return id;
+        };
+        const roomName = view => view?.name || view?.title;
+        const list = async () => {
+            const result = await rpc('webmeet_room_list');
+            assertAgentReadPositive({ tool: 'webmeet_room_list' }, result);
+            assert.equal(result.value.canManageRooms, true, 'Room cleanup requires an authoritative administrator listing');
+            for (const room of result.value.rooms) identity(room);
+            return result.value.rooms;
+        };
+        const baseline = await list();
+        assert.equal(baseline.some(room => roomName(room) === name), false, 'Fixture run name already belongs to a preexisting room');
+        const baselineIds = new Set(baseline.map(identity));
+        assert.equal(baselineIds.size, baseline.length, 'Baseline room listing contains duplicate identities');
+        let roomId, cleaned = false;
+        // The create RPC can persist before its response or private artifact
+        // fails. Arm reconciliation before dispatch, while ownership is known.
+        ctx.cleanup(async () => {
+            if (cleaned) return;
+            const matches = (await list()).filter(room => roomName(room) === name);
+            assert.equal(matches.length, 1, 'Room cleanup ownership unresolved: expected one exact run-name match');
+            const reconciledId = identity(matches[0]);
+            assert.equal(baselineIds.has(reconciledId), false, 'Room cleanup cannot delete a preexisting identity');
+            if (roomId) assert.equal(reconciledId, roomId, 'Listing room cleanup identity mismatch');
+            else roomId = reconciledId;
+            const current = await rpc('webmeet_room_get', { roomId });
             assert.equal(current.success, true, 'Listing room cleanup could not read the owned room');
             const view = current.value?.meeting || current.value?.room || current.value;
-            assert.equal(view?.id || view?.roomId, roomId, 'Listing room cleanup identity mismatch');
-            assert.equal(view?.name || view?.title, name, 'Listing room cleanup name mismatch');
-            const deleted = await mcp.rpc('admin', 'webmeetAgent', 'tools/call', { name: 'webmeet_room_delete', arguments: { roomId, confirmed: true } });
+            assert.equal(identity(view), roomId, 'Listing room cleanup identity mismatch');
+            assert.equal(roomName(view), name, 'Listing room cleanup name mismatch');
+            const deleted = await rpc('webmeet_room_delete', { roomId, confirmed: true });
             assert.equal(deleted.success, true, 'Listing room cleanup delete failed');
+            assert.equal(deleted.value?.ok, true, 'Listing room cleanup delete must report ok');
+            assert.equal(deleted.value?.deleted, true, 'Listing room cleanup delete must report removal');
+            assert.equal(deleted.value?.roomId, roomId, 'Listing room cleanup delete identity mismatch');
+            const absent = await rpc('webmeet_room_get', { roomId });
+            assert.equal(absent.stage, 'tools/call', 'Listing room cleanup absence must come from the get tool');
+            assert.equal(absent.response?.status, 200, 'Listing room cleanup absence cannot be an HTTP failure');
+            assert.equal(absent.success, false, 'Listing room cleanup absence failed: owned room remains readable');
+            // AgentServer wraps a failed tool subprocess in SDK InternalError;
+            // registerTool preserves its exact prefixed message as isError text.
+            assert.ok(['Meeting not found.', 'MCP error -32603: Meeting not found.'].includes(absent.error?.trim()),
+                'Listing room cleanup absence requires the exact missing-meeting contract');
+            cleaned = true;
         });
+        const created = await rpc('webmeet_room_create', { name, roomType: 'team' });
+        assert.equal(created.success, true, 'Administrator could not create the task-owned listing room');
+        roomId = identity(created.value);
+        assert.equal(baselineIds.has(roomId), false, 'Room creation returned a preexisting identity');
         fixture = { roomId, name };
     });
     return fixture;

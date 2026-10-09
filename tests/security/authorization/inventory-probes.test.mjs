@@ -266,24 +266,35 @@ test('a missing room fixture fails the listing probe instead of recording a gap'
 
 test('the room fixture is created by the administrator and cleaned up only by exact run-owned identity', async () => {
     const calls = [];
-    let current = { meeting: { id: FIXTURE_ROOM, name: 'authz-test-listing-room' } };
+    let current;
     const mcp = { async rpc(actor, agent, method, params) {
         calls.push({ actor, agent, name: params.name, arguments: params.arguments });
-        if (params.name === 'webmeet_room_create') return mcpSuccess({ roomId: FIXTURE_ROOM, name: params.arguments.name });
-        if (params.name === 'webmeet_room_get') return mcpSuccess(current);
-        if (params.name === 'webmeet_room_delete') return mcpSuccess({ ok: true, deleted: true, roomId: FIXTURE_ROOM });
+        if (params.name === 'webmeet_room_list') return mcpSuccess({ rooms: current ? [current.meeting] : [], canManageRooms: true });
+        if (params.name === 'webmeet_room_create') {
+            assert.equal(state.cleanups.length, 1, 'cleanup must already be armed');
+            current = { meeting: { id: FIXTURE_ROOM, name: params.arguments.name } };
+            return mcpSuccess({ roomId: FIXTURE_ROOM, name: params.arguments.name });
+        }
+        if (params.name === 'webmeet_room_get') return current ? mcpSuccess(current)
+            : { ...decodeAgentMcp(response(200, { result: { isError: true, content: [{ type: 'text', text: 'Meeting not found.' }] } })), stage: 'tools/call' };
+        if (params.name === 'webmeet_room_delete') {
+            current = undefined;
+            return mcpSuccess({ ok: true, deleted: true, roomId: FIXTURE_ROOM });
+        }
         throw new Error('unexpected');
     } };
     const state = fixtureCtx();
     assert.deepEqual(await createRoomListingFixture(state.ctx, mcp), { roomId: FIXTURE_ROOM, name: 'authz-test-listing-room' });
-    assert.deepEqual(calls[0], { actor: 'admin', agent: 'webmeetAgent', name: 'webmeet_room_create', arguments: { name: 'authz-test-listing-room', roomType: 'team' } });
+    assert.deepEqual(calls.find(call => call.name === 'webmeet_room_create'), { actor: 'admin', agent: 'webmeetAgent', name: 'webmeet_room_create', arguments: { name: 'authz-test-listing-room', roomType: 'team' } });
     assert.equal(state.cleanups.length, 1);
     current = { meeting: { id: FIXTURE_ROOM, name: 'someone-else' } };
-    await assert.rejects(state.cleanups[0](), /name mismatch/);
+    await assert.rejects(state.cleanups[0](), /ownership unresolved/);
     assert.equal(calls.some((call) => call.name === 'webmeet_room_delete'), false, 'never deletes a room it cannot prove it owns');
     current = { meeting: { id: FIXTURE_ROOM, name: 'authz-test-listing-room' } };
     await state.cleanups[0]();
-    assert.deepEqual(calls.at(-1), { actor: 'admin', agent: 'webmeetAgent', name: 'webmeet_room_delete', arguments: { roomId: FIXTURE_ROOM, confirmed: true } });
+    assert.deepEqual(calls.find(call => call.name === 'webmeet_room_delete'), { actor: 'admin', agent: 'webmeetAgent', name: 'webmeet_room_delete', arguments: { roomId: FIXTURE_ROOM, confirmed: true } });
+    assert.deepEqual(calls.at(-1), { actor: 'admin', agent: 'webmeetAgent', name: 'webmeet_room_get', arguments: { roomId: FIXTURE_ROOM } });
+    assert.equal(current, undefined, 'the fake models actual removal before proving absence');
 
     const failing = fixtureCtx();
     const denied = { async rpc() { return decodeAgentMcp(response(403, { error: 'forbidden' })); } };
