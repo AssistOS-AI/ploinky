@@ -28,7 +28,7 @@ function normalizeSecretsMap(input = {}) {
     return normalized;
 }
 
-function decryptPacked(packedText, key = getStorageKey()) {
+function decryptPacked(packedText, key) {
     const buf = Buffer.from(String(packedText || '').trim(), 'base64');
     if (buf.length < IV_BYTES + TAG_BYTES + 1) {
         throw new Error('Encrypted .secrets envelope is incomplete.');
@@ -36,7 +36,8 @@ function decryptPacked(packedText, key = getStorageKey()) {
     const iv = buf.subarray(0, IV_BYTES);
     const tag = buf.subarray(IV_BYTES, IV_BYTES + TAG_BYTES);
     const ciphertext = buf.subarray(IV_BYTES + TAG_BYTES);
-    const decipher = crypto.createDecipheriv(ALGORITHM, key, iv);
+    // The storage key is resolved only for a complete envelope, as before.
+    const decipher = crypto.createDecipheriv(ALGORITHM, key === undefined ? getStorageKey() : key, iv);
     decipher.setAuthTag(tag);
     return Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf8');
 }
@@ -76,7 +77,7 @@ function secretsDecryptionError(error) {
 function decryptSecretsText(raw, storageKey) {
     let payload;
     try {
-        payload = JSON.parse(storageKey === undefined ? decryptPacked(raw) : decryptPacked(raw, storageKey));
+        payload = JSON.parse(decryptPacked(raw, storageKey));
     } catch (error) {
         throw secretsDecryptionError(error);
     }
