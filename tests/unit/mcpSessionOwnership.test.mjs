@@ -34,7 +34,9 @@ for (const surface of ['router', 'agent']) {
         const opened = await request(surface);
         const session = opened.headers['mcp-session-id'];
         assert.ok(session);
-        assert.equal((await request(surface, { actor: identity('bob', 'login-b'), session, method: 'DELETE' })).status, 403);
+        const refused = await request(surface, { actor: identity('bob', 'login-b'), session, method: 'DELETE' });
+        assert.equal(refused.status, 403);
+        assert.equal(refused.json.code, 'MCP_SESSION_FORBIDDEN');
         assert.equal((await request(surface, { session, rpc: 'unknown' })).json.error.code, -32601);
     });
     test(`${surface}: another principal cannot use or delete an owned browser session`, async () => {

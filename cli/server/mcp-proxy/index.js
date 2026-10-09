@@ -148,11 +148,12 @@ function upstreamRpcError(error) {
  * key exists, otherwise (or after a pool mismatch) today's per-call SDK client.
  * `mintHeaders` is called once per attempt so every attempt carries a new token.
  */
-function createUpstreamMcpCaller({ baseUrl, hostPort, beforeDial, pool, poolKey, ensureReady }) {
+function createUpstreamMcpCaller({ baseUrl, hostPort, beforeDial, beforeDispatch = null, pool, poolKey, ensureReady }) {
     let sharedClient = null;
     const sdkClientOptions = (headers) => ({
         ...(headers ? { requestHeaders: headers } : {}),
         ...(beforeDial ? { beforeConnect: beforeDial } : {}),
+        ...(beforeDispatch ? { beforeDispatch } : {}),
     });
     const shared = () => {
         if (!sharedClient) sharedClient = createAgentClient(baseUrl, sdkClientOptions(null));
@@ -169,7 +170,10 @@ function createUpstreamMcpCaller({ baseUrl, hostPort, beforeDial, pool, poolKey,
                     method,
                     params,
                     headers,
-                    beforeDial,
+                    beforeDial: () => {
+                        beforeDispatch?.();
+                        return beforeDial ? beforeDial() : true;
+                    },
                     timeoutMs: upstreamTimeoutForMethod(method),
                     ensureReady,
                 });
@@ -185,6 +189,7 @@ function createUpstreamMcpCaller({ baseUrl, hostPort, beforeDial, pool, poolKey,
     }
 
     async function withToolClient(mintHeaders, run) {
+        beforeDispatch?.();
         const client = createAgentClient(baseUrl, sdkClientOptions(mintHeaders()));
         try {
             return await run(client);
@@ -726,6 +731,9 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, {
         baseUrl,
         hostPort: route.hostPort,
         beforeDial,
+        beforeDispatch: stateless ? null : () => {
+            if (!isOwned()) throw Object.assign(new Error(MCP_SESSION_INVALID_ERROR.message), { code: 'MCP_SESSION_INVALID' });
+        },
         pool,
         poolKey,
         ensureReady,
@@ -862,7 +870,7 @@ async function handleAgentMcpRequest(req, res, route, agentName, {
         const owner = isDelegatedAgentRequest ? null : createMcpSessionOwner(req, 'agent', agentName);
         const admission = inspectMcpSession(agentSessionStore, req, owner);
         if (admission.refused) {
-            sendJson(res, 403, { error: MCP_SESSION_INVALID_ERROR.message });
+            sendJson(res, 403, { error: MCP_SESSION_INVALID_ERROR.message, code: 'MCP_SESSION_FORBIDDEN' });
             return;
         }
         if (admission.entry) agentSessionStore.delete(admission.id);

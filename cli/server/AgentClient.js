@@ -26,6 +26,7 @@ function createAgentClient(baseUrl, options = {}) {
     ? options.requestHeaders
     : null;
   const beforeConnect = typeof options?.beforeConnect === 'function' ? options.beforeConnect : null;
+  const beforeDispatch = typeof options?.beforeDispatch === 'function' ? options.beforeDispatch : null;
   const requestTimeoutMs = parsePositiveInt(options?.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS);
 
   async function connect() {
@@ -35,9 +36,15 @@ function createAgentClient(baseUrl, options = {}) {
       error.code = 'EDGE_GENERATION_CHANGED';
       throw error;
     }
-    transport = new StreamableHTTPClientTransport(new URL(baseUrl), requestHeaders
-      ? { requestInit: { headers: requestHeaders } }
-      : undefined);
+    transport = new StreamableHTTPClientTransport(new URL(baseUrl), {
+      ...(requestHeaders ? { requestInit: { headers: requestHeaders } } : {}),
+      ...(beforeDispatch ? { fetch: (url, init) => {
+        // Run after SDK connection/header awaits, immediately before transport
+        // dispatch. DELETE only releases this client's private upstream session.
+        if (init?.method !== 'DELETE') beforeDispatch();
+        return fetch(url, init);
+      } } : {}),
+    });
     client = new Client({ name: 'ploinky-router', version: '1.0.0' });
     await client.connect(transport, { timeout: requestTimeoutMs });
     connected = true;

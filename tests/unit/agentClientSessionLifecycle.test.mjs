@@ -4,6 +4,47 @@ import http from 'node:http';
 
 import { createAgentClient } from '../../cli/server/AgentClient.js';
 
+test('the request guard blocks later dispatch after an awaited SDK initialization', async (t) => {
+    let held;
+    let entered;
+    const waiting = new Promise(resolve => { entered = resolve; });
+    const seen = [];
+    const server = http.createServer((req, res) => {
+        if (req.method === 'DELETE') { seen.push('DELETE'); res.writeHead(204); res.end(); return; }
+        if (req.method === 'GET') { res.writeHead(405); res.end(); return; }
+        const chunks = [];
+        req.on('data', chunk => chunks.push(chunk));
+        req.on('end', () => {
+            const message = JSON.parse(Buffer.concat(chunks));
+            seen.push(message.method);
+            if (message.method === 'initialize') {
+                held = () => {
+                    res.writeHead(200, { 'content-type': 'application/json', 'mcp-session-id': 'fixture-upstream-session' });
+                    res.end(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: {
+                        protocolVersion: '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'fixture', version: '1' },
+                    } }));
+                };
+                entered();
+            } else { res.writeHead(202); res.end(); }
+        });
+    });
+    const port = await listen(server);
+    let live = true;
+    const client = createAgentClient(`http://127.0.0.1:${port}/mcp`, { beforeDispatch: () => {
+        if (!live) throw new Error('browser session ended');
+    } });
+    t.after(async () => { held?.(); await client.close(); await closeServer(server); });
+    const pending = client.listTools();
+    await waiting;
+    live = false;
+    held();
+    held = null;
+    await assert.rejects(pending, /browser session ended/);
+    await client.close();
+    assert.equal(seen.includes('tools/list'), false);
+    assert.equal(seen.includes('notifications/initialized'), false);
+});
+
 async function listen(server) {
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
     return server.address().port;

@@ -856,6 +856,99 @@ function proxyToolPayload(json) {
     return JSON.parse(json.result.content[0].text);
 }
 
+async function browserStoreRequest(handler, sessionId, body, method = 'POST') {
+    const req = Readable.from([Buffer.from(JSON.stringify(body || {}))]);
+    Object.assign(req, { method, url: '/mcp', user: PROXY_USER, authMode: 'sso', sessionId: 'pool-browser-login',
+        headers: { host: 'localhost', ...(sessionId ? { 'mcp-session-id': sessionId } : {}) } });
+    let finish;
+    const done = new Promise(resolve => { finish = resolve; });
+    const res = { status: 0, headers: {}, body: '', writeHead(status, headers = {}) { this.status = status; this.headers = headers; },
+        end(body = '') { this.body = String(body); finish(); } };
+    await handler(req, res);
+    await done;
+    return { ...res, json: res.body ? JSON.parse(res.body) : null };
+}
+
+test('browser session deletion during aggregate discovery prevents the later tool dispatch', async (t) => {
+    await loadProxyFixture();
+    const { handleRouterMcp } = await import('../../cli/server/routerHandlers.js');
+    let hold = false;
+    let started;
+    const entered = new Promise(resolve => { started = resolve; });
+    let release;
+    const held = new Promise(resolve => { release = resolve; });
+    t.after(() => release());
+    const upstream = await startFakeUpstream(t, { onRpc: async ({ res, message }) => {
+        if (message?.method !== 'tools/list') return false;
+        if (hold) { started(); await held; }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { tools: [{ name: 'actor', inputSchema: { type: 'object' } }] } }));
+        return true;
+    } });
+    const { routePlan } = proxyRoute(upstream.port, 'aggregate-delete');
+    routePlan.lease.commit = () => true;
+    const handle = (req, res) => handleRouterMcp(req, res, routePlan);
+    const initialize = () => browserStoreRequest(handle, null, { jsonrpc: '2.0', id: 1, method: 'initialize' });
+    const session = (await initialize()).headers['mcp-session-id'];
+    assert.ok(session);
+    assert.equal((await browserStoreRequest(handle, session, toolsCall('owned'))).json.result.content[0].text, 'fake-ok');
+    hold = true;
+    const pending = browserStoreRequest(handle, session, toolsCall('deleted'));
+    await entered;
+    assert.equal((await browserStoreRequest(handle, session, null, 'DELETE')).status, 204);
+    release();
+    const refused = await pending;
+    assert.equal(refused.json.error.message, 'Missing or invalid MCP session');
+    assert.equal(refused.headers['mcp-session-id'], undefined);
+    assert.equal(count(upstream.log, row => row.rpc === 'tools/call'), 1, 'only the owned control dispatched');
+});
+
+test('browser session deletion while a pool slot is pending prevents mint and dispatch', async (t) => {
+    const { proxy } = await loadProxyFixture();
+    const held = [];
+    let allHeld;
+    const entered = new Promise(resolve => { allHeld = resolve; });
+    const upstream = await startFakeUpstream(t, { onRpc: async ({ res, message }) => {
+        if (message?.method !== 'tools/call' || message.params?.name !== 'hold') return false;
+        held.push(() => {
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: {} }));
+        });
+        if (held.length === 8) allHeld();
+        return true;
+    } });
+    t.after(() => held.forEach(release => release()));
+    const pool = newPool(t);
+    const { route, routePlan, key } = proxyRoute(upstream.port, 'browser-delete-queue');
+    const sessionId = openRouterSession(proxy);
+    const call = (label) => proxyCall(proxy, { route, routePlan, sessionId, pool, waitForAgentReady: async () => true, body: toolsCall(label) });
+    assert.equal((await call('owned')).json.result.content[0].text, 'fake-ok');
+    const busy = Array.from({ length: 8 }, () => pool.request({ key, hostPort: upstream.port, method: 'tools/call',
+        params: { name: 'hold' }, beforeDial: () => true, headers: null }));
+    await entered;
+    const request = pool.request.bind(pool);
+    let queued;
+    const waiting = new Promise(resolve => { queued = resolve; });
+    let mints = 0;
+    pool.request = options => {
+        const headers = options.headers;
+        const result = request({ ...options, headers: () => { mints += 1; return typeof headers === 'function' ? headers() : headers; } });
+        queued();
+        return result;
+    };
+    const pending = call('deleted');
+    await waiting;
+    await new Promise(resolve => setImmediate(resolve));
+    const handle = (req, res) => proxy.handleAgentMcpRequest(req, res, route, 'echoAgent', { routePlan });
+    assert.equal((await browserStoreRequest(handle, sessionId, null, 'DELETE')).status, 204);
+    for (const release of held.splice(0)) release();
+    const refused = await pending;
+    await Promise.all(busy);
+    assert.equal(refused.json.error.message, 'Missing or invalid MCP session');
+    assert.equal(mints, 0);
+    assert.equal(count(upstream.log, row => row.rpc === 'tools/call'), 9, 'only the owned control and eight admitted calls dispatched');
+});
+
 test('B5-8: the readiness cache skips the probe while pooled calls succeed and is cleared by ECONNREFUSED', async (t) => {
     const { proxy, audience, secret } = await loadProxyFixture();
     const { forwarder } = await startEchoAgentBehindForwarder(t, { secret, audience });
