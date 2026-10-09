@@ -506,6 +506,9 @@ export function buildHttpRouteAuthInfoHeader(req, parsedUrl, definition, { bodyH
                 kind: resolveHttpRouteActorKind(authInfo),
                 id: sub,
                 roles: Array.isArray(authInfo.user?.roles) ? authInfo.user.roles : [],
+                // Only the session user's capabilities feed the signed claim;
+                // the unsigned auth-info body never carries them.
+                capabilities: req.user.capabilities,
             },
             method: invocationBody.method,
             path: invocationBody.path,

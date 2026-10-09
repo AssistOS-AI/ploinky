@@ -1,11 +1,27 @@
 import crypto from 'node:crypto';
 
 import { JwsCodec } from './JwsCodec.js';
+import { REQUIRED_CAPABILITY_PATTERN } from '../../authHandlers/requiredCapability.js';
 
 export const ROUTER_REQUEST_TTL_SECONDS = 30;
+export const MAX_ACTOR_CAPABILITIES = 64;
 
 function isPromiseLike(value) {
     return value && typeof value.then === 'function';
+}
+
+// Capabilities are signed only for a direct user actor without a guest role.
+// Entries are kept only when they are strings that already match the
+// capability pattern exactly; nothing is trimmed or coerced. An empty result or
+// more than MAX_ACTOR_CAPABILITIES valid entries omits the claim entirely.
+export function normalizeActorCapabilities(kind, roles, capabilities) {
+    if (kind !== 'user' || !Array.isArray(capabilities)) return undefined;
+    if (roles.some((role) => role.trim().toLowerCase() === 'guest')) return undefined;
+    const valid = [...new Set(capabilities.filter((entry) => (
+        typeof entry === 'string' && REQUIRED_CAPABILITY_PATTERN.test(entry)
+    )))];
+    if (!valid.length || valid.length > MAX_ACTOR_CAPABILITIES) return undefined;
+    return valid;
 }
 
 export function normalizeActor(actor) {
@@ -13,11 +29,15 @@ export function normalizeActor(actor) {
         return { kind: 'user', id: '', roles: [] };
     }
     const kind = actor.kind === 'agent' || actor.kind === 'guest' ? actor.kind : 'user';
-    return {
+    const roles = Array.isArray(actor.roles) ? actor.roles.map((r) => String(r || '')).filter(Boolean) : [];
+    const normalized = {
         kind,
         id: String(actor.id || ''),
-        roles: Array.isArray(actor.roles) ? actor.roles.map((r) => String(r || '')).filter(Boolean) : [],
+        roles,
     };
+    const capabilities = normalizeActorCapabilities(kind, roles, actor.capabilities);
+    if (capabilities) normalized.capabilities = capabilities;
+    return normalized;
 }
 
 export function normalizeCaller(caller) {

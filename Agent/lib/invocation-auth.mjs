@@ -20,6 +20,12 @@ function normalizeRoles(value) {
   return Array.isArray(value) ? value.map((role) => String(role || '').trim()).filter(Boolean) : [];
 }
 
+// Copies the router-signed actor capabilities without widening them: only
+// string entries are kept. They are never read from or added to user claims.
+function normalizeCapabilities(value) {
+  return Array.isArray(value) ? value.filter((entry) => typeof entry === 'string') : [];
+}
+
 function extractCallerPrincipal(grant) {
   const caller = grant?.caller;
   if (caller && typeof caller === 'object') {
@@ -126,7 +132,8 @@ export function authInfoFromInvocation(grant, { invocationToken = '' } = {}) {
       ? {
           kind: String(actor.kind || ''),
           id: String(actor.id || ''),
-          roles: normalizeRoles(actor.roles)
+          roles: normalizeRoles(actor.roles),
+          capabilities: normalizeCapabilities(actor.capabilities)
         }
       : null,
     scope: Array.isArray(grant.scope) ? [...grant.scope] : [],
