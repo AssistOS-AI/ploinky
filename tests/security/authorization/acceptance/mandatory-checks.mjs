@@ -169,8 +169,12 @@ export function enumerateMandatoryChecks({ expectedRuntimes, expectedGaps }) {
         add(`${probe.id}.admin`, { boundary: 'agents', source: 'agent-probes.mjs agentProbes' });
         for (const actor of nonAdmin) add(`${probe.id}.${actor}`, { boundary: 'agents', source: 'agent-probes.mjs agentProbes', positiveControlAnyOf: [`${probe.id}.admin`] });
     }
+    const roomFixtureId = 'agent.tool.webmeet_room_list.fixture';
+    add(roomFixtureId, { boundary: 'agents', source: 'agent-probes.mjs createRoomListingFixture' });
     for (const probe of agentReadTools) {
-        add(`agent.tool.${probe.tool}.admin`, { boundary: 'agents', source: 'agent-probes.mjs agentReadTools' });
+        const needsFixture = Boolean(probe.lesserUserFilteredField) || probe.tool === 'webmeet_room_events_list';
+        add(`agent.tool.${probe.tool}.admin`, { boundary: 'agents', source: 'agent-probes.mjs agentReadTools',
+            ...(needsFixture ? { positiveControlAnyOf: [roomFixtureId] } : {}) });
         for (const actor of nonAdmin) add(`agent.tool.${probe.tool}.${actor}`, { boundary: 'agents', source: 'agent-probes.mjs agentReadTools', positiveControlAnyOf: [`agent.tool.${probe.tool}.admin`] });
     }
     // Discovery and SSE for every required (enabled) agent. A discovery method

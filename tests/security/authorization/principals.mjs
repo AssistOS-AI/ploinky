@@ -62,6 +62,11 @@ export function preferHostCookies(cookies, hostname) {
 
 export const AUTH_SETUP = '/base-agent-additional-server/userPersistoAgent/7000/service/auth/setup';
 
+export function assertListingCapability(profile, name) {
+    assert.ok(Array.isArray(profile?.capabilities), 'Authoritative profile must expose capabilities');
+    assert.equal(profile.capabilities.includes('explorer.access'), name !== 'selfRegistered', `${name} explorer.access capability does not match the listing expectations`);
+}
+
 /**
  * Choose the disposable-principal registration path from UserPersisto's public
  * wizard configuration (userPersistoAgent/lib/auth/wizardConfig.mjs). Password
@@ -244,6 +249,7 @@ export async function setupPrincipals(ctx, config) {
         assert.ok(profile.json?.ok && profile.json?.profile, 'Signed profile must be readable');
         assert.equal(profile.json.profile.user?.id, p.id, 'UserPersisto profile must match the Router principal');
         assert.deepEqual(profile.json.profile.roles.map(role => typeof role === 'string' ? role : role.name).sort(), [...p.roles].sort(), 'Profile and Router roles must agree');
+        assertListingCapability(profile.json.profile, name);
     }
     ctx.report.principals = Object.entries(ctx.principals).map(([name, p]) => ({ name, idHash: ctx.hash(p.id), roles: p.roles, source: name === 'admin' ? 'configured administrator session' : registration.mode === 'password' ? 'fresh public password registration' : 'fresh verified public development email registration', authoritativeRoleVerified: true }));
     await writePrivate(path.join(config.privateRoot, 'principals.json'), ctx.principals);

@@ -2,9 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { agentCatalog, agentInventory } from './agent-inventory.mjs';
 import { readFileSync } from 'node:fs';
+import { expectedTool } from './inventory-generate.mjs';
 const expectedRuntimes = JSON.parse(readFileSync(new URL('./acceptance/expected-runtimes.json', import.meta.url), 'utf8'));
 import { assertAgentMcpDenied, decodeAgentMcp, agentReadTools, agentProbes, reconcileAgentRegistry, createAgentSessions,
-    assertAgentHttpPositive, assertAgentReadPositive, discoverAgentMcp, agentDiscoveryMethods } from './agent-probes.mjs';
+    assertAgentHttpPositive, assertAgentReadPositive, discoverAgentMcp, agentDiscoveryMethods, readTools, createRoomListingFixture, usernamePrivilegeProbe } from './agent-probes.mjs';
 
 const response = (status, json) => ({ status, json, headers: {}, text: JSON.stringify(json) });
 test('MCP decoder rejects redirects, missing endpoints, malformed success and structured tool failures', () => {
@@ -122,13 +123,15 @@ test('every read tool has a meaningful success schema and account/role identity 
         dpu_whoami: { ok: true, authenticated: true, actor: { id: principal.id, principalId: `user:${principal.id}`, roles: ['admin'] }, userSpace: { privateId: 'private', mySpaceRootId: 'root' } },
         dpu_workspace_roots: { ok: true, roots: { confidential: { path: '/Confidential' }, mySpace: { id: 'root', path: '/Confidential/My Space' }, ...Object.fromEntries(['sharedFiles', 'secrets', 'researchData', 'jobs'].map((name) => [name, { scope: name, path: '/Confidential/example', type: 'virtual-list' }])) } },
         webmeet_room_list: { rooms: [], canManageRooms: true },
+        webmeet_room_events_list: { events: [fixtureEvent()] },
         git_auth_status: { ok: true, configured: false, connected: false, tokenStored: false, setup: { configured: false, scope: 'repo' }, connection: null, pending: null },
     };
     for (const probe of agentReadTools) {
         const success = (value) => decodeAgentMcp(response(200, { result: { content: [{ type: 'text', text: JSON.stringify(value) }] } }));
-        assert.doesNotThrow(() => assertAgentReadPositive(probe, success(payloads[probe.tool]), principal));
+        const checkedProbe = probe.tool === 'webmeet_room_events_list' ? { ...probe, requiredRoomId: FIXTURE_ROOM } : probe;
+        assert.doesNotThrow(() => assertAgentReadPositive(checkedProbe, success(payloads[probe.tool]), principal));
         for (const payload of [{}, { ok: true }, { ...payloads[probe.tool], ok: false }, { ...payloads[probe.tool], error: 'unavailable' }]) {
-            assert.throws(() => assertAgentReadPositive(probe, success(payload), principal));
+            assert.throws(() => assertAgentReadPositive(checkedProbe, success(payload), principal));
         }
     }
     assert.throws(() => assertAgentReadPositive({ tool: 'userpersisto_profile_get' }, { success: true, value: payloads.userpersisto_profile_get }, { id: 'different', roles: ['user'] }));
@@ -194,4 +197,176 @@ test('registry reconciliation rejects absent or incorrect runtime principals ins
     assert.throws(() => reconcileAgentRegistry({ routes: {} }));
     assert.throws(() => reconcileAgentRegistry({ routes: { ...routes, alien: { agent: 'unrelated-workspace-agent' } } }));
     assert.deepEqual(reconcileAgentRegistry({ routes: { ...routes, alias: { agent: 'explorer' } } }).alternateKeys, [{ key: 'alias', agent: 'explorer' }]);
+});
+
+const FIXTURE_ROOM = 'room_11111111-1111-4111-8111-111111111111';
+function fixtureEvent(roomId = FIXTURE_ROOM) {
+    return `rooms:meeting.created:${Buffer.from(JSON.stringify({ id: 'event_fixture', createdAt: '2026-10-09T00:00:00.000Z', workspaceId: 'rooms', meetingId: roomId, roomId, meeting: { id: roomId, name: 'authz-test-listing-room' } })).toString('base64url')}`;
+}
+const mcpSuccess = (value) => decodeAgentMcp(response(200, { result: { content: [{ type: 'text', text: JSON.stringify(value) }] } }));
+
+function fixtureCtx() {
+    const gaps = [], failures = [], passed = [], cleanups = [];
+    const principals = { admin: { id: 'a', roles: ['admin'] }, selfRegistered: { id: 's', roles: ['selfRegistered'] }, userA: { id: 'ua', roles: ['user'] }, userB: { id: 'ub', roles: ['user'] } };
+    return { gaps, failures, passed, cleanups, ctx: { report: {}, principals, prefix: 'authz-test', async guard() {},
+        recordGap: (id, reason) => gaps.push({ id, reason }), cleanup: (fn) => cleanups.push(fn),
+        async check(id, fn) { try { await fn(); passed.push(id); } catch (error) { failures.push(id); } } } };
+}
+
+async function runRoomListReadTools({ fixture = { roomId: FIXTURE_ROOM }, admin, selfRegistered, ordinary }) {
+    const state = fixtureCtx();
+    const mcp = { async rpc(actor, agent, method, params) {
+        if (params.name === 'webmeet_room_events_list') return actor === 'anonymous' || actor === 'selfRegistered'
+            ? { ...decodeAgentMcp(response(403, { error: 'forbidden' })), stage: method }
+            : { ...mcpSuccess({ events: [fixtureEvent()] }), stage: method };
+        if (params.name !== 'webmeet_room_list') throw new Error('control unavailable in this fixture');
+        if (actor === 'anonymous') return { ...decodeAgentMcp(response(401, { error: 'authentication required' })), stage: method };
+        if (actor === 'admin') return { ...admin, stage: method };
+        if (actor === 'selfRegistered') return { ...selfRegistered, stage: method };
+        return { ...ordinary, stage: method };
+    } };
+    await readTools(state.ctx, mcp, fixture);
+    return state;
+}
+
+test('room list requires the task-owned room for entitled users and an exactly empty list for selfRegistered', async () => {
+    const id = 'agent.tool.webmeet_room_list.selfRegistered';
+    const listed = mcpSuccess({ rooms: [{ id: FIXTURE_ROOM }], canManageRooms: false });
+    const admin = mcpSuccess({ rooms: [{ id: 'room_archived' }, { id: FIXTURE_ROOM }], canManageRooms: true });
+    const good = await runRoomListReadTools({ admin, ordinary: listed, selfRegistered: mcpSuccess({ rooms: [], canManageRooms: false }) });
+    assert.deepEqual(good.failures, []);
+    assert.deepEqual(good.gaps.filter((gap) => gap.id.startsWith('agent.tool.webmeet_room_list')), []);
+    for (const actor of ['admin', 'anonymous', 'selfRegistered', 'userA', 'userB']) assert.ok(good.passed.includes(`agent.tool.webmeet_room_list.${actor}`), actor);
+    for (const selfRegistered of [
+        listed, // base behaviour: any authenticated non-guest saw open rooms
+        mcpSuccess({ rooms: [], canManageRooms: true }),
+        decodeAgentMcp(response(403, { error: 'forbidden' })),
+        mcpSuccess({ rooms: [], canManageRooms: false, error: 'unavailable' }),
+    ]) {
+        assert.deepEqual((await runRoomListReadTools({ admin, ordinary: listed, selfRegistered })).failures, [id]);
+    }
+    // An entitled listing that is empty or omits the fixture is not a positive control.
+    for (const ordinary of [mcpSuccess({ rooms: [], canManageRooms: false }), mcpSuccess({ rooms: [{ id: 'room_other' }], canManageRooms: false })]) {
+        const result = await runRoomListReadTools({ admin, ordinary, selfRegistered: mcpSuccess({ rooms: [], canManageRooms: false }) });
+        assert.deepEqual(result.failures.sort(), ['agent.tool.webmeet_room_list.userA', 'agent.tool.webmeet_room_list.userB']);
+    }
+    const adminWithoutFixture = await runRoomListReadTools({ admin: mcpSuccess({ rooms: [{ id: 'room_archived' }], canManageRooms: true }), ordinary: listed, selfRegistered: mcpSuccess({ rooms: [], canManageRooms: false }) });
+    assert.equal(adminWithoutFixture.passed.includes(id), false, 'no filtered claim without the fixture in the administrator control');
+    assert.ok(adminWithoutFixture.failures.includes('agent.tool.webmeet_room_list.admin'), 'an admin listing without the owned room fails');
+    assert.equal(adminWithoutFixture.gaps.some((gap) => gap.id.startsWith('agent.tool.webmeet_room_list')), false);
+});
+
+test('a missing room fixture fails the listing probe instead of recording a gap', async () => {
+    const result = await runRoomListReadTools({ fixture: null, admin: mcpSuccess({ rooms: [{ id: 'room_archived' }], canManageRooms: true }),
+        ordinary: mcpSuccess({ rooms: [], canManageRooms: false }), selfRegistered: mcpSuccess({ rooms: [], canManageRooms: false }) });
+    assert.ok(result.failures.includes('agent.tool.webmeet_room_list.fixture-required'));
+    assert.equal(result.passed.some((id) => id.startsWith('agent.tool.webmeet_room_list.')), false);
+    assert.equal(result.gaps.some((gap) => gap.id.startsWith('agent.tool.webmeet_room_list')), false);
+});
+
+test('the room fixture is created by the administrator and cleaned up only by exact run-owned identity', async () => {
+    const calls = [];
+    let current = { meeting: { id: FIXTURE_ROOM, name: 'authz-test-listing-room' } };
+    const mcp = { async rpc(actor, agent, method, params) {
+        calls.push({ actor, agent, name: params.name, arguments: params.arguments });
+        if (params.name === 'webmeet_room_create') return mcpSuccess({ roomId: FIXTURE_ROOM, name: params.arguments.name });
+        if (params.name === 'webmeet_room_get') return mcpSuccess(current);
+        if (params.name === 'webmeet_room_delete') return mcpSuccess({ ok: true, deleted: true, roomId: FIXTURE_ROOM });
+        throw new Error('unexpected');
+    } };
+    const state = fixtureCtx();
+    assert.deepEqual(await createRoomListingFixture(state.ctx, mcp), { roomId: FIXTURE_ROOM, name: 'authz-test-listing-room' });
+    assert.deepEqual(calls[0], { actor: 'admin', agent: 'webmeetAgent', name: 'webmeet_room_create', arguments: { name: 'authz-test-listing-room', roomType: 'team' } });
+    assert.equal(state.cleanups.length, 1);
+    current = { meeting: { id: FIXTURE_ROOM, name: 'someone-else' } };
+    await assert.rejects(state.cleanups[0](), /name mismatch/);
+    assert.equal(calls.some((call) => call.name === 'webmeet_room_delete'), false, 'never deletes a room it cannot prove it owns');
+    current = { meeting: { id: FIXTURE_ROOM, name: 'authz-test-listing-room' } };
+    await state.cleanups[0]();
+    assert.deepEqual(calls.at(-1), { actor: 'admin', agent: 'webmeetAgent', name: 'webmeet_room_delete', arguments: { roomId: FIXTURE_ROOM, confirmed: true } });
+
+    const failing = fixtureCtx();
+    const denied = { async rpc() { return decodeAgentMcp(response(403, { error: 'forbidden' })); } };
+    assert.equal(await createRoomListingFixture(failing.ctx, denied), undefined);
+    assert.deepEqual(failing.failures, ['agent.tool.webmeet_room_list.fixture']);
+    assert.equal(failing.cleanups.length, 0);
+    assert.deepEqual(failing.gaps, []);
+});
+
+test('the workspace room feed keeps selfRegistered denied and is a declared non-mutating read', () => {
+    const probe = agentReadTools.find((entry) => entry.tool === 'webmeet_room_events_list');
+    assert.deepEqual(probe, { agent: 'webmeetAgent', tool: 'webmeet_room_events_list', args: { roomId: 'rooms' }, policy: 'workspace' });
+    assert.equal(expectedTool('webmeetAgent', 'webmeet_room_events_list').selfRegistered, 'deny');
+    assert.equal(expectedTool('webmeetAgent', 'webmeet_room_list').selfRegistered, 'allow-filtered-empty');
+    assert.equal(expectedTool('webmeetAgent', 'webmeet_room_create').selfRegistered, 'deny');
+});
+
+test('username privilege probe retains its owned room positive and restores the disposable profile', async () => {
+    for (const roomFixture of [{ roomId: FIXTURE_ROOM }, null]) {
+        const state = fixtureCtx();
+        let username = 'fixture';
+        state.ctx.request = async (actor, request) => {
+            if (request.path.startsWith('/auth/token')) return response(200, { user: { roles: ['user'], username } });
+            if (request.body) username = request.body.username;
+            return response(200, { ok: true, profile: { user: { id: 'ua', username }, roles: ['user'], capabilities: ['explorer.access'], authMethods: [], emailVerified: true } });
+        };
+        const mcp = { async rpc(actor, agent, method, params) {
+            if (params.name === 'workspace_monitor_settings_get') return decodeAgentMcp(response(403, { error: 'admin required' }));
+            if (params.name === 'webmeet_room_list') return mcpSuccess({ rooms: [{ id: FIXTURE_ROOM }], canManageRooms: false });
+            throw new Error('unexpected call');
+        } };
+        await usernamePrivilegeProbe(state.ctx, mcp, roomFixture);
+        assert.equal(username, 'fixture', 'disposable username restored');
+        assert.deepEqual(state.gaps, []);
+        assert.deepEqual(state.failures, roomFixture ? [] : ['agent.username-admin.webmeet-role']);
+        assert.equal(state.passed.includes('agent.username-admin.webmeet-role'), Boolean(roomFixture));
+    }
+});
+
+test('workspace feed positives reject empty, malformed, unrelated and mismatched fixture events', () => {
+    const probe = { tool: 'webmeet_room_events_list', requiredRoomId: FIXTURE_ROOM, requiredRoomName: 'authz-test-listing-room' };
+    assert.doesNotThrow(() => assertAgentReadPositive(probe, mcpSuccess({ events: [fixtureEvent()] })));
+    const encode = payload => `rooms:meeting.created:${Buffer.from(JSON.stringify(payload)).toString('base64url')}`;
+    const owned = JSON.parse(Buffer.from(fixtureEvent().split(':')[2], 'base64url').toString('utf8'));
+    for (const events of [[], ['encoded-room-event'], ['rooms:meeting.created:e30'], [fixtureEvent('room_other')],
+        [encode({ ...owned, meeting: { id: FIXTURE_ROOM, name: 'foreign-run' } })],
+        [encode({ ...owned, meetingId: 'room_other' })], [encode({ ...owned, roomId: 'room_other' })],
+        [encode({ ...owned, workspaceId: 'foreign' })], [encode({ ...owned, id: '' })],
+        [encode({ ...owned, createdAt: 'invalid' })], [fixtureEvent().replace('meeting.created', 'meeting.archived')]]) {
+        assert.throws(() => assertAgentReadPositive(probe, mcpSuccess({ events })));
+    }
+    assert.throws(() => assertAgentReadPositive(probe, mcpSuccess({ events: [fixtureEvent()], error: 'unavailable' })));
+    assert.throws(() => assertAgentReadPositive({ tool: probe.tool }, mcpSuccess({ events: [fixtureEvent()] })));
+});
+
+test('workspace feed checks all five actors and fails an unavailable or empty admin control without a gap', async () => {
+    const run = async (values, fixture = { roomId: FIXTURE_ROOM, name: 'authz-test-listing-room' }) => {
+        const state = fixtureCtx();
+        await readTools(state.ctx, { async rpc(actor, agent, method, params) {
+            if (params.name !== 'webmeet_room_events_list') throw new Error('unrelated control unavailable');
+            const value = values[actor];
+            if (value instanceof Error) throw value;
+            return { ...value, stage: method };
+        } }, fixture);
+        return { ...state, feedFailures: state.failures.filter(id => id.startsWith('agent.tool.webmeet_room_events_list.')) };
+    };
+    const positive = mcpSuccess({ events: [fixtureEvent()] });
+    const denied = decodeAgentMcp(response(403, { error: 'forbidden' }));
+    const values = { admin: positive, userA: positive, userB: positive, anonymous: denied, selfRegistered: denied };
+    const good = await run(values);
+    assert.deepEqual(good.feedFailures, []);
+    for (const actor of Object.keys(values)) assert.ok(good.passed.includes(`agent.tool.webmeet_room_events_list.${actor}`), actor);
+    for (const actor of ['admin', 'userA', 'userB']) {
+        const empty = await run({ ...values, [actor]: mcpSuccess({ events: [] }) });
+        assert.deepEqual(empty.feedFailures, [`agent.tool.webmeet_room_events_list.${actor}`]);
+        assert.equal(empty.gaps.some(gap => gap.id.startsWith('agent.tool.webmeet_room_events_list')), false);
+    }
+    const failed = await run({ ...values, admin: new Error('transport failure') });
+    assert.deepEqual(failed.feedFailures, ['agent.tool.webmeet_room_events_list.admin']);
+    const missing = await run(values, null);
+    assert.deepEqual(missing.feedFailures, ['agent.tool.webmeet_room_events_list.fixture-required']);
+    for (const result of [failed, missing]) {
+        assert.equal(result.passed.some(id => id.startsWith('agent.tool.webmeet_room_events_list.')), false);
+        assert.equal(result.gaps.some(gap => gap.id.startsWith('agent.tool.webmeet_room_events_list')), false);
+    }
 });

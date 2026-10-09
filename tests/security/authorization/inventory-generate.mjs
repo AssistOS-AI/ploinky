@@ -13,6 +13,10 @@ const adminRole = roles('deny', 'deny', 'deny', 'allow');
 const authenticatedRole = roles('deny', 'allow-own-account', 'allow-own-account', 'allow');
 const publicRole = roles('allow', 'allow', 'allow', 'allow');
 const serviceRole = roles('deny-without-service-proof', 'deny-without-service-proof', 'deny-without-service-proof', 'deny-without-service-proof');
+// Directory listings answer an authenticated lesser user with an exactly empty
+// result rather than an error; the verified listing helper owns this policy.
+const filteredListingRole = roles('deny', 'allow-filtered-empty', 'allow-subject-to-resource-policy', 'allow-subject-to-resource-policy');
+const WEBMEET_LISTING_BASIS = 'webmeetAgent/lib/store/accessPolicy.mjs isVerifiedListingEntitled: only a verified direct non-guest user with admin or signed explorer.access lists rooms or reads the workspace feed; other authenticated users get rooms:[] and feed denial; archived rooms and canManageRooms require verified admin';
 const lineAt = (s, index) => s.slice(0, index).split('\n').length;
 const readJson = (p) => JSON.parse(fs.readFileSync(p, 'utf8'));
 
@@ -30,7 +34,7 @@ function location(root, file, text, needle) {
     const at = text.indexOf(needle);
     return `${path.relative(root, file)}:${at < 0 ? 1 : lineAt(text, at)}`;
 }
-function expectedTool(agent, name) {
+export function expectedTool(agent, name) {
     if (agent === 'workspaceMonitorAgent') return adminRole;
     if (agent === 'emailAgent') return ['email_config_get', 'email_config_set', 'email_provider_status', 'email_send_test'].includes(name) ? adminRole : serviceRole;
     if (agent === 'userPersistoAgent') {
@@ -39,6 +43,7 @@ function expectedTool(agent, name) {
         return adminRole;
     }
     if (agent === 'webmeetAgent' && /^webmeet_room_(create|delete|archive|restore|update)/.test(name)) return adminRole;
+    if (agent === 'webmeetAgent' && name === 'webmeet_room_list') return filteredListingRole;
     if (agent === 'dpuAgent' && /^dpu_(agent_policy_get|agent_policy_set|audit_list|audit_get|audit_search)$/.test(name)) return adminRole;
     if (agent === 'roboTeamAgent' && /^(robot_create|robot_delete|robot_skillset_)/.test(name)) return adminRole;
     return workspaceRole;
@@ -47,6 +52,7 @@ function authorizationBasis(agent, name) {
     if (agent === 'userPersistoAgent') return 'userPersistoAgent/tools/registry.mjs: requireActiveActor, capability checks and own-user binding; callback/capability internal boundaries require separate verification';
     if (agent === 'emailAgent') return 'emailAgent/tools/invocation-context.mjs: admin role or verified agent invocation';
     if (agent === 'workspaceMonitorAgent') return 'workspaceMonitorAgent/tools/workspace_monitor_tool.mjs:31 and lib/admin.mjs:5; intended persisted admin role (legacy username shortcut is a candidate vulnerability)';
+    if (agent === 'webmeetAgent' && ['webmeet_room_list', 'webmeet_room_events_list'].includes(name)) return WEBMEET_LISTING_BASIS;
     if (agent === 'webmeetAgent') return 'webmeetAgent/tools/webmeet_tool.mjs and lib/store/accessPolicy.mjs: room visibility, guest scope, participant identity, admin room lifecycle; non-guest rooms are workspace-shared';
     if (agent === 'dpuAgent') return 'dpuAgent/tools/dpu_tool.mjs -> lib/dpu-store.mjs and lib/dpu-store-internal/identity-acl.mjs: verified invocation, owner/grants, private roots';
     if (agent === 'explorer') return 'explorer/manifest.json:44 requires explorer.access; tool-handlers.mjs validates workspace path and private-data-boundary.mjs';
