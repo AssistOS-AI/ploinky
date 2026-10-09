@@ -11,7 +11,7 @@
     }
   ],
   "counts": {
-    "live": 495,
+    "live": 501,
     "offline": 10
   },
   "checks": [
@@ -1608,10 +1608,62 @@
       "source": "agent-probes.mjs agentReadTools"
     },
     {
+      "id": "agent.tool.webmeet_room_events_list.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.webmeet_room_list.fixture"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.webmeet_room_events_list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.webmeet_room_events_list.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.webmeet_room_events_list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.webmeet_room_events_list.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.webmeet_room_events_list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.webmeet_room_events_list.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.webmeet_room_events_list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.tool.webmeet_room_events_list.admin"
+      ],
+      "boundary": "agents",
+      "source": "agent-probes.mjs agentReadTools"
+    },
+    {
       "id": "agent.tool.webmeet_room_list.admin",
       "kind": "live",
       "count": 1,
-      "positiveControlAnyOf": null,
+      "positiveControlAnyOf": [
+        "agent.tool.webmeet_room_list.fixture"
+      ],
       "boundary": "agents",
       "source": "agent-probes.mjs agentReadTools"
     },
@@ -1624,6 +1676,14 @@
       ],
       "boundary": "agents",
       "source": "agent-probes.mjs agentReadTools"
+    },
+    {
+      "id": "agent.tool.webmeet_room_list.fixture",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "agent-probes.mjs createRoomListingFixture"
     },
     {
       "id": "agent.tool.webmeet_room_list.selfRegistered",

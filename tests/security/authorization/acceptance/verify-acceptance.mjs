@@ -219,6 +219,9 @@ export function evaluateScopedAcceptance({ report, exitCode, mandatory, expected
         const got = (d.repositories || []).map(r => key(r.name, r.commit)).sort();
         if (JSON.stringify(want) !== JSON.stringify(got)) reject('DEPLOYMENT_BINDING', 'repository commits differ from pins');
         // The checked agent inventory must describe the deployed sources.
+        const inventoryNames = baseline.repositories.filter(r => r.name !== 'ploinky').map(r => r.name).sort();
+        const pinnedNames = pins.repositories.map(r => r.name).sort();
+        if (JSON.stringify(inventoryNames) !== JSON.stringify(pinnedNames)) reject('INVENTORY_BASELINE_BINDING', 'inventory repository set differs from pins');
         for (const repo of baseline.repositories.filter(r => r.name !== 'ploinky')) {
             const pin = pins.repositories.find(r => r.name === repo.name);
             if (!pin || pin.commit !== repo.commit) reject('INVENTORY_BASELINE_BINDING', `${repo.name} inventory revision differs from pins`);

@@ -208,6 +208,47 @@ test('REJECT: a mandatory check that is missing, FAIL, duplicated, or whose posi
     expectReject(run, 'MANDATORY_POSITIVE_CONTROL_FAILED', 'deny without positive');
 });
 
+test('C4 acceptance requires the fixture, its positive dependencies and all five feed actors', () => {
+    const fixture = 'agent.tool.webmeet_room_list.fixture';
+    const feed = 'agent.tool.webmeet_room_events_list';
+    for (const tool of ['webmeet_room_list', 'webmeet_room_events_list']) {
+        const admin = mandatory.checks.find(c => c.id === `agent.tool.${tool}.admin`);
+        assert.deepEqual(admin.positiveControlAnyOf, [fixture]);
+    }
+    for (const actor of ['admin', 'anonymous', 'selfRegistered', 'userA', 'userB']) assert.ok(mandatory.checks.some(c => c.id === `${feed}.${actor}`));
+    for (const id of [fixture, ...['admin', 'anonymous', 'selfRegistered', 'userA', 'userB'].map(actor => `${feed}.${actor}`)]) {
+        const missing = acceptedRun();
+        missing.report.checks = missing.report.checks.filter(c => c.id !== id);
+        missing.report.counts.PASS = missing.report.checks.length;
+        expectReject(missing, 'MANDATORY_MISSING', id);
+        const failed = acceptedRun();
+        failed.report.checks.find(c => c.id === id).status = 'FAIL';
+        failed.report.counts = { PASS: failed.report.counts.PASS - 1, FAIL: 1, ERROR: 0 };
+        failed.report.verdict = 'FAIL';
+        failed.exitCode = 1;
+        expectReject(failed, 'MANDATORY_NOT_PASS', id);
+        if (id === fixture) assert.ok(evaluate(failed).reasons.some(r => r.startsWith('MANDATORY_POSITIVE_CONTROL_FAILED: agent.tool.webmeet_room_events_list.admin')));
+    }
+    const stale = acceptedRun();
+    stale.mandatory = clone(mandatory);
+    stale.mandatory.checks = stale.mandatory.checks.filter(c => c.id !== fixture && !c.id.startsWith(`${feed}.`));
+    expectReject(stale, 'MANDATORY_FILE_DRIFT', 'stale pre-C4 mandatory inventory');
+});
+
+test('C4 acceptance rejects missing, duplicate and stale inventory repository pins', () => {
+    for (const mutate of [
+        repositories => repositories.slice(1),
+        repositories => [],
+        repositories => [...repositories, repositories[0]],
+        repositories => repositories.map((r, i) => i ? r : { ...r, commit: '0'.repeat(40) }),
+    ]) {
+        const run = acceptedRun();
+        const repositories = inventoryBaseline.repositories.filter(r => r.name !== 'ploinky');
+        run.baseline = { ...clone(inventoryBaseline), repositories: mutate(repositories) };
+        expectReject(run, 'INVENTORY_BASELINE_BINDING', 'inventory candidate mismatch');
+    }
+});
+
 test('REJECT: an exit code that disagrees with the verdict, or a non-gap raw outcome', () => {
     for (const exitCode of [0, 1, 3, undefined]) {
         const run = acceptedRun();

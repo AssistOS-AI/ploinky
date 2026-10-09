@@ -6,7 +6,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { TARGET, assertLoopbackPage, browserRequestDecision, isLoopbackTargetOrigin, validateTarget } from './core.mjs';
-import { preferHostCookies, selectRegistrationMethod } from './principals.mjs';
+import { assertListingCapability, preferHostCookies, selectRegistrationMethod } from './principals.mjs';
+
+test('listing principals require authoritative explorer.access grants and reject missing or inverted capabilities', () => {
+    assert.doesNotThrow(() => assertListingCapability({ capabilities: [] }, 'selfRegistered'));
+    for (const actor of ['userA', 'userB']) assert.doesNotThrow(() => assertListingCapability({ capabilities: ['explorer.access'] }, actor));
+    for (const actor of ['selfRegistered', 'userA', 'userB']) {
+        assert.throws(() => assertListingCapability({}, actor));
+        assert.throws(() => assertListingCapability({ capabilities: actor === 'selfRegistered' ? ['explorer.access'] : [] }, actor));
+    }
+});
 
 test('both loopback names of the selected Router are the same browser target', () => {
     for (const url of ['http://127.0.0.1:8080/auth/login?agent=explorer', 'http://localhost:8080/base-agent-additional-server/userPersistoAgent/7000/service/auth/', 'http://localhost:8080/explorer/index.html']) {
