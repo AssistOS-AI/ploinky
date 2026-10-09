@@ -46,11 +46,6 @@
       "reason": "Declared in explorer/manifest.json repos; onlyOffice is not enabled by the graph"
     },
     {
-      "name": "container-image-builds",
-      "path": ".ploinky/repos/container-image-builds",
-      "reason": "Declared in explorer/manifest.json repos; image-build dependency"
-    },
-    {
       "name": "DocumentationSkills",
       "path": ".ploinky/repos/DocumentationSkills",
       "reason": "Skills repository installed by the workspace (cli/utils/repos.js:142)"

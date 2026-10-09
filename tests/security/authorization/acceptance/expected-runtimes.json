@@ -10,7 +10,6 @@
     "UmamiAgent",
     "local-llms",
     "OnlyOfficeAgent",
-    "container-image-builds",
     "DocumentationSkills"
   ],
   "counts": {
