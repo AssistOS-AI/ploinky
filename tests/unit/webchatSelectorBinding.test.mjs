@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
 
 // WebChat page and runtime requests launch exactly the target admitted by the
@@ -25,6 +26,8 @@ const { ensureAuthenticated } = await import('../../cli/server/authHandlers/auth
 const { authService } = await import('../../cli/server/authHandlers/shared.js');
 const { verifyBrowserMutationRequest } = await import('../../cli/server/browserMutationSecurity.js');
 const { handleWebChat } = await import('../../cli/server/handlers/webchat/index.js');
+const { handleRuntimeRoute } = await import('../../cli/server/handlers/webchat/runtimeRoutes.js');
+const runtimeState = await import('../../cli/server/handlers/webchat/runtimeState.js');
 const { DIRECT_CLI_PATH } = await import('../../cli/utils/directCli.js');
 
 test.after(() => {
@@ -655,4 +658,140 @@ test('R1 an admitted guest-self owner keeps its runtime while the workspace help
     await settle(res);
     assert.equal(res.statusCode, 200);
     assert.deepEqual(created.map((entry) => entry.label), ['guestOwner']);
+});
+
+// Guest runtimes reuse the principal-scoped runtime lifecycle: a bounded number
+// of runtimes per guest session, eviction of only that guest's oldest idle
+// runtime, and no late event from a disposed runtime reaching its replacement.
+const GUEST_A = { id: 'guest:aaaaaaaa-0000-4000-8000-000000000001', username: 'visitor', roles: ['guest'] };
+const GUEST_B = { id: 'guest:bbbbbbbb-0000-4000-8000-000000000002', username: 'visitor', roles: ['guest'] };
+
+function lifecycleFactory() {
+    const created = [];
+    return {
+        created,
+        create() {
+            const outputs = new Set();
+            const closes = new Set();
+            const proc = {
+                writes: [],
+                disposed: false,
+                isAlive: () => !proc.disposed,
+                write(data) { proc.writes.push(String(data)); return true; },
+                onOutput(handler) { outputs.add(handler); },
+                onClose(handler) { closes.add(handler); },
+                emit(text) { for (const handler of outputs) handler(text); },
+                close() { for (const handler of closes) handler(); },
+                dispose() { proc.disposed = true; },
+            };
+            created.push(proc);
+            return proc;
+        },
+    };
+}
+
+function guestRuntimeConfig(factory) {
+    return { agentName: 'guestOwner', forwardEnvelope: false, ttyFactory: factory, runtimeScope: 'principal' };
+}
+
+function runtimeRequest(user, sid, method = 'GET') {
+    const req = new EventEmitter();
+    Object.assign(req, { method, headers: { cookie: `webchat_sid=${sid}` }, user, authMode: 'guest', sessionId: `${user.id}-jwt` });
+    return req;
+}
+
+function openGuestStream({ appState, config, user, sid = 'sid-shared', tabId = 'tab-shared', agentQuery = 'agent=guestOwner' }) {
+    if (!appState.sessions.has(sid)) appState.sessions.set(sid, { tabs: new Map() });
+    const req = runtimeRequest(user, sid);
+    const res = { statusCode: null, writes: [], writeHead(status) { this.statusCode = status; }, write(value) { this.writes.push(String(value)); return true; }, end() {} };
+    handleRuntimeRoute({
+        pathname: '/stream', req, res,
+        parsedUrl: new URL(`http://localhost/stream?tabId=${tabId}&pageInstanceId=page-shared`),
+        appState, workspaceDirectory: root, effectiveConfig: config, agentQuery,
+    });
+    return { req, res };
+}
+
+function disposeAll(appState) {
+    for (const [key, tab] of appState.runtimes.entries()) runtimeState.disposeTab(tab, key, { runtimes: appState.runtimes });
+}
+
+test('a guest session holds at most three runtimes and only its own oldest idle runtime is evicted', () => {
+    const factory = lifecycleFactory();
+    const config = guestRuntimeConfig(factory);
+    const appState = newState();
+    const open = (resource, user = GUEST_A) => openGuestStream({ appState, config, user, agentQuery: `agent=guestOwner&r=${resource}`, tabId: `tab-${resource}` });
+    const streams = ['r1', 'r2', 'r3'].map((resource) => open(resource));
+    const other = open('r1', GUEST_B);
+    assert.deepEqual([...streams, other].map((entry) => entry.res.statusCode), [200, 200, 200, 200]);
+    assert.equal(open('r4').res.statusCode, 429, 'every runtime of the guest is connected');
+    const [first, second, third, otherProc] = factory.created;
+    other.req.emit('close');
+    streams[1].req.emit('close');
+    assert.equal(open('r5').res.statusCode, 200);
+    assert.equal(second.disposed, true, "the guest's idle runtime is evicted");
+    assert.equal(first.disposed || third.disposed, false, 'connected runtimes stay');
+    assert.equal(otherProc.disposed, false, "another guest's idle runtime is never evicted");
+    disposeAll(appState);
+});
+
+test('a disposed guest runtime cannot unregister or write into its replacement', () => {
+    const factory = lifecycleFactory();
+    const config = guestRuntimeConfig(factory);
+    const appState = newState();
+    const open = (resource) => openGuestStream({ appState, config, user: GUEST_A, agentQuery: `agent=guestOwner&r=${resource}`, tabId: `tab-${resource}` });
+    open('a');
+    const b = open('b');
+    const c = open('c');
+    const oldB = factory.created[1];
+    b.req.emit('close');
+    c.req.emit('close');
+    assert.equal(open('d').res.statusCode, 200);
+    assert.equal(oldB.disposed, true);
+    const replacementStream = open('b');
+    assert.equal(replacementStream.res.statusCode, 200);
+    const replacement = factory.created.at(-1);
+    assert.notEqual(replacement, oldB);
+    oldB.emit('late-output-of-evicted-runtime\n');
+    oldB.close();
+    assert.ok([...appState.runtimes.values()].some((tab) => tab.tty === replacement), 'the replacement stays registered');
+    assert.doesNotMatch(replacementStream.res.writes.join(''), /late-output-of-evicted-runtime|event: close/);
+    replacement.emit('replacement-own-output\n');
+    assert.match(replacementStream.res.writes.join(''), /replacement-own-output/);
+    disposeAll(appState);
+});
+
+test("another guest replaying tab, session and interaction IDs cannot answer a guest's interaction", () => {
+    const factory = lifecycleFactory();
+    const config = guestRuntimeConfig(factory);
+    const appState = newState();
+    const stream = openGuestStream({ appState, config, user: GUEST_A, sid: 'sid-A', tabId: 'tab-1' });
+    assert.equal(stream.res.statusCode, 200);
+    const [tab] = appState.runtimes.values();
+    const interaction = runtimeState.parseWebchatInteraction({
+        __webchatInteraction: 1, version: 1, id: 'approval_12345678', kind: 'approval', title: 'Approval', message: 'Approve?',
+        options: [{ id: 'allow', label: 'Allow' }, { id: 'deny', label: 'Deny' }], defaultOptionId: 'allow',
+    });
+    tab.pendingInteractions = new Map([[interaction.id, interaction]]);
+    appState.sessions.set('sid-B', { tabs: new Map() });
+    const post = (user, sid, body) => {
+        const req = runtimeRequest(user, sid, 'POST');
+        const result = { status: null, writeHead(status) { this.status = status; }, end() {} };
+        handleRuntimeRoute({
+            pathname: '/interaction', req, res: result,
+            parsedUrl: new URL('http://localhost/interaction?tabId=tab-1&pageInstanceId=page-shared'),
+            appState, workspaceDirectory: root, effectiveConfig: config, agentQuery: 'agent=guestOwner',
+        });
+        req.emit('data', JSON.stringify(body));
+        req.emit('end');
+        return result.status;
+    };
+    for (const sid of ['sid-B', 'sid-A']) {
+        assert.equal(post(GUEST_B, sid, { interactionId: 'approval_12345678', optionId: 'deny' }), 409, sid);
+    }
+    assert.equal(tab.pendingInteractions.has('approval_12345678'), true);
+    assert.deepEqual(factory.created[0].writes, []);
+    assert.equal(post(GUEST_A, 'sid-A', { interactionId: 'approval_12345678', optionId: 'allow' }), 204, 'positive control: the owner answers');
+    assert.equal(factory.created[0].writes.length, 1);
+    disposeAll(appState);
 });
