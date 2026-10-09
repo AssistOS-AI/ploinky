@@ -72,7 +72,7 @@ Before testing, prove all of the following:
 
 Any fallback other than a repository without the `--branch` candidate branch staying on its default branch, and any detached/mixed revision, stale generation, unclean checkout, missing agent, or readiness exception, invalidates the deployment.
 
-### 4. Run the three separate headless Playwright gates
+### 4. Run the four separate headless Playwright gates
 
 Run the authoritative suite from `AssistOSExplorer/tests/smoke` against the fresh local origin (normally `http://127.0.0.1:8080`). Use a new `SMOKE_RUN_ID` and artifact directory for each gate, Chromium headless mode, `--workers=1`, and `--retries=0`.
 
@@ -81,6 +81,7 @@ Run the authoritative suite from `AssistOSExplorer/tests/smoke` against the fres
 | Confidential document in OnlyOffice | Run `specs/50-onlyoffice-dpu.spec.mjs` with `SMOKE_ONLYOFFICE=1`, filtered to `Explorer-created Confidential document saves through callback, drains, and reopens after targeted restart`. Create a `.doc` or `.docx` under `/Confidential/My Space`, edit it in OnlyOffice, prove the save/callback completed, reopen it, and prove the marker persisted. Either extension satisfies this gate. |
 | Copilot | Run `specs/05-copilot-folder-launch.spec.mjs` with `SMOKE_RELEASE_MANIFEST` and exact Box/image/repository pins. It must pass the release-bundle verifier and prove the approved folder-launch flow against the current generation. |
 | WebMeet | Run `specs/30-webmeet-room-chat.spec.mjs` filtered to `two Explorer accounts can join one room and exchange chat`, with `SMOKE_WEBMEET_HEADLESS=1`, `SMOKE_WEBMEET_MEDIA=1`, and the strict media timeout. Prove both accounts, chat/DataChannel exchange, ICE/RTP media, and cleanup. |
+| WebMeet public room | Run `specs/30-webmeet-room-chat.spec.mjs` filtered to `standalone loader serves the authenticated dashboard and a guest invitation`, with the same `SMOKE_RELEASE_MANIFEST` and exact Box/image/repository pins and the primary administrator sign-in inputs; it needs no secondary account, `SMOKE_WEBMEET_*` flag or media. Prove that anyone with the URL of a public room can join that room: a guest in a fresh cookie-less, never-signed-in browser context opens exactly the public room URL published by the WebMeet UI, joins under a unique name, appears in the owner's participant list, and exchanges chat with the owner in both directions. Also prove that the URL of a team room is refused: the visitor sees the "not available as a public room" denial, WebMeet reports `Public room not found.`, and no name field or chat input appears. Both rooms must be deleted. |
 
 Each command must discover exactly one intended test and finish `1 passed`, with zero skips, retries, ignored browser/page errors, or softened assertions. A command that reports no matching tests, a skipped test, or only setup success has failed the gate.
 
@@ -88,4 +89,4 @@ Each command must discover exactly one intended test and finish `1 passed`, with
 
 Save the candidate commit map, image identity, generation, deployment/readiness proof, Playwright output, traces, screenshots, and cleanup result. Do not store credentials in evidence.
 
-If a requested deployment or gate fails, do not waive, retry around, or narrow the invariant. Preserve the failed attempt's evidence, diagnose and fix the root cause, commit and push a new candidate, delete the failed fixture, redeploy from scratch, and rerun all three gates. Continue this fresh-generation cycle autonomously until every required gate passes or progress is genuinely blocked by unavailable external state, ambiguous resource ownership, or information only the user can provide. Passing results from an earlier generation or revision cannot be carried forward.
+If a requested deployment or gate fails, do not waive, retry around, or narrow the invariant. Preserve the failed attempt's evidence, diagnose and fix the root cause, commit and push a new candidate, delete the failed fixture, redeploy from scratch, and rerun all four gates. Continue this fresh-generation cycle autonomously until every required gate passes or progress is genuinely blocked by unavailable external state, ambiguous resource ownership, or information only the user can provide. Passing results from an earlier generation or revision cannot be carried forward.
