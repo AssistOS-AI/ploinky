@@ -133,6 +133,10 @@ export async function executeWebSocketPlan({
     let clientFrames;
     let targetFrames;
     let leaseOutcome = 'uncommitted';
+    // Node leaves an upgraded socket flowing with no 'error' listener, so a
+    // client reset during any await below would be uncaught. This listener
+    // only absorbs the event; teardown is owned by the paths below.
+    socket.on('error', () => {});
     try {
         if (authorized !== true) {
             throw Object.assign(new Error('proxy: request not authorized'), { code: 'AUTH_REQUIRED' });
@@ -209,6 +213,10 @@ export async function executeWebSocketPlan({
             upstream.once('upgrade', (response, selectedUpstreamSocket, upstreamHead) => {
                 clearTimeout(headerTimer);
                 upstreamSocket = selectedUpstreamSocket;
+                if (socket.destroyed || !socket.writable) {
+                    fail(new Error('proxy: client socket closed before WebSocket upgrade'));
+                    return;
+                }
                 const responseHeaders = {
                     ...sanitizeResponseHeaders(response.headers, finalized),
                     connection: 'Upgrade',
@@ -230,6 +238,13 @@ export async function executeWebSocketPlan({
                 });
                 clientFrames.once('error', fail);
                 targetFrames.once('error', fail);
+                // The relay duplex is piped as a destination; without its own
+                // listener a write rejected by a terminal relay stream
+                // (END, failure or abandon) escapes as an uncaught exception.
+                upstreamSocket.once('error', fail);
+                // The upgraded client socket is also a pipe destination and has
+                // no other 'error' listener once the HTTP server hands it over.
+                socket.once('error', fail);
                 socket.on('data', resetIdleTimer);
                 upstreamSocket.on('data', resetIdleTimer);
                 socket.pipe(clientFrames).pipe(upstreamSocket);

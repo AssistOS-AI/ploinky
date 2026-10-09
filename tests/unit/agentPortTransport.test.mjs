@@ -5,6 +5,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import net from 'node:net';
 import { Duplex, Readable, Writable } from 'node:stream';
 
 import { executeHttpPlan } from '../../cli/server/proxy/executeHttpPlan.js';
@@ -834,4 +835,282 @@ test('response-header deadline includes setup time instead of restarting at the 
     assert.equal(response.statusCode, 504);
     assert.equal(checkoutClosed, true);
     assert.equal(released, true);
+});
+
+test('WebSocket client data after the relay stream ended fails through teardown without an uncaught exception', {
+    concurrency: false,
+}, async t => {
+    const originalRequest = http.request;
+    t.after(() => { http.request = originalRequest; });
+    const uncaught = [];
+    const onUncaught = error => { uncaught.push(error); };
+    const previousListeners = process.listeners('uncaughtException');
+    for (const listener of previousListeners) process.removeListener('uncaughtException', listener);
+    process.on('uncaughtException', onUncaught);
+    t.after(() => {
+        process.removeListener('uncaughtException', onUncaught);
+        for (const listener of previousListeners) process.on('uncaughtException', listener);
+    });
+
+    const terminalError = new Error('runtimeRelay: request stream is terminal');
+    const relayStream = new ApplicationRelayStream();
+    relayStream.write = () => { throw terminalError; };
+    let agent;
+    const upstreamRequest = new EventEmitter();
+    upstreamRequest.end = () => {
+        setImmediate(() => {
+            upstreamRequest.emit('upgrade', {
+                statusCode: 101,
+                statusMessage: 'Switching Protocols',
+                headers: {},
+            }, agent.createConnection(), Buffer.alloc(0));
+        });
+    };
+    upstreamRequest.destroy = () => {};
+    http.request = options => {
+        agent = options.agent;
+        return upstreamRequest;
+    };
+
+    const request = {
+        method: 'GET',
+        headers: {
+            host: '127.0.0.1:8080',
+            origin: 'http://127.0.0.1:8080',
+            connection: 'Upgrade',
+            upgrade: 'websocket',
+            'sec-websocket-version': '13',
+            'sec-websocket-key': Buffer.alloc(16, 9).toString('base64'),
+        },
+    };
+    const socket = new TeardownSocket();
+    const events = [];
+    let released = 0;
+    const handling = executeWebSocketPlan({
+        req: request,
+        socket,
+        plan: routePlan({ method: 'GET', transport: 'websocket' }),
+        lease: { release() { released += 1; } },
+        relayManager: {
+            checkout: async () => ({ openRequest: async () => relayStream, close() {} }),
+        },
+        authorized: true,
+        auditSink: event => events.push(event),
+    });
+
+    await new Promise(resolve => setTimeout(resolve, 20));
+    relayStream.emit('end');
+    // A complete, empty unmasked text frame reaches the relay duplex write.
+    socket.push(Buffer.from([0x81, 0x00]));
+
+    const handled = await Promise.race([
+        handling,
+        new Promise(resolve => setTimeout(() => resolve('timeout'), 1000)),
+    ]);
+    await new Promise(resolve => setTimeout(resolve, 20));
+
+    assert.deepEqual(uncaught.map(error => error.message), []);
+    assert.equal(handled, false);
+    assert.equal(socket.destroyed, true);
+    assert.equal(released, 1);
+    const failures = events.filter(event => event.outcome === 'failure');
+    assert.equal(failures.length, 1);
+    assert.equal(failures[0].errorCode, 'PROXY_FAILURE');
+});
+
+test('WebSocket client socket error while the target pipes into it fails through teardown without an uncaught exception', {
+    concurrency: false,
+}, async t => {
+    const originalRequest = http.request;
+    t.after(() => { http.request = originalRequest; });
+    const uncaught = [];
+    const onUncaught = error => { uncaught.push(error); };
+    const previousListeners = process.listeners('uncaughtException');
+    for (const listener of previousListeners) process.removeListener('uncaughtException', listener);
+    process.on('uncaughtException', onUncaught);
+    t.after(() => {
+        process.removeListener('uncaughtException', onUncaught);
+        for (const listener of previousListeners) process.on('uncaughtException', listener);
+    });
+
+    const targetSocket = new TeardownSocket();
+    const upstreamRequest = new EventEmitter();
+    upstreamRequest.end = () => {
+        setImmediate(() => {
+            upstreamRequest.emit('upgrade', {
+                statusCode: 101,
+                statusMessage: 'Switching Protocols',
+                headers: {},
+            }, targetSocket, Buffer.alloc(0));
+        });
+    };
+    upstreamRequest.destroy = () => {};
+    http.request = () => upstreamRequest;
+
+    const request = {
+        method: 'GET',
+        headers: {
+            host: '127.0.0.1:8080',
+            origin: 'http://127.0.0.1:8080',
+            connection: 'Upgrade',
+            upgrade: 'websocket',
+            'sec-websocket-version': '13',
+            'sec-websocket-key': Buffer.alloc(16, 10).toString('base64'),
+        },
+    };
+    const socket = new TeardownSocket();
+    const events = [];
+    let released = 0;
+    const handling = executeWebSocketPlan({
+        req: request,
+        socket,
+        plan: routePlan({ method: 'GET', transport: 'websocket' }),
+        lease: { release() { released += 1; } },
+        relayManager: {
+            checkout: async () => ({ openRequest: async () => new ApplicationRelayStream(), close() {} }),
+        },
+        authorized: true,
+        auditSink: event => events.push(event),
+    });
+
+    await new Promise(resolve => setTimeout(resolve, 20));
+    targetSocket.push(Buffer.from([0x81, 0x00]));
+    await new Promise(resolve => setTimeout(resolve, 10));
+    Duplex.prototype.destroy.call(socket, Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }));
+
+    const handled = await Promise.race([
+        handling,
+        new Promise(resolve => setTimeout(() => resolve('timeout'), 1000)),
+    ]);
+    await new Promise(resolve => setTimeout(resolve, 20));
+
+    assert.deepEqual(uncaught.map(error => error.message), []);
+    assert.equal(handled, false);
+    assert.equal(socket.destroyed, true);
+    assert.equal(targetSocket.destroyed, true);
+    assert.equal(released, 1);
+    const failures = events.filter(event => event.outcome === 'failure');
+    assert.equal(failures.length, 1);
+    assert.equal(failures[0].errorCode, 'ECONNRESET');
+});
+
+function noUncaught(t) {
+    const uncaught = [];
+    const onUncaught = error => { uncaught.push(error); };
+    const previousListeners = process.listeners('uncaughtException');
+    for (const listener of previousListeners) process.removeListener('uncaughtException', listener);
+    process.on('uncaughtException', onUncaught);
+    t.after(() => {
+        process.removeListener('uncaughtException', onUncaught);
+        for (const listener of previousListeners) process.on('uncaughtException', listener);
+    });
+    return uncaught;
+}
+
+test('client reset while the upgrade handler awaits before the upstream upgrade is not uncaught', {
+    concurrency: false,
+}, async t => {
+    const uncaught = noUncaught(t);
+    const events = [];
+    let released = 0;
+    const server = http.createServer();
+    const settled = deferred();
+    server.on('upgrade', async (req, socket, head) => {
+        // Mirrors the Router handler: no client-socket listener of its own.
+        const handled = await executeWebSocketPlan({
+            req,
+            socket,
+            head,
+            plan: routePlan({ method: 'GET', transport: 'websocket' }),
+            lease: { release() { released += 1; } },
+            relayManager: {
+                checkout: async () => {
+                    await new Promise(resolve => setTimeout(resolve, 150));
+                    throw new Error('relay unavailable');
+                },
+            },
+            authorized: true,
+            auditSink: event => events.push(event),
+        });
+        settled.resolve(handled);
+    });
+    t.after(() => server.close());
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    const client = net.connect(server.address().port, '127.0.0.1');
+    await new Promise(resolve => client.once('connect', resolve));
+    client.write([
+        'GET /x HTTP/1.1',
+        `Host: 127.0.0.1:${server.address().port}`,
+        `Origin: http://127.0.0.1:${server.address().port}`,
+        'Connection: Upgrade',
+        'Upgrade: websocket',
+        'Sec-WebSocket-Version: 13',
+        `Sec-WebSocket-Key: ${Buffer.alloc(16, 11).toString('base64')}`,
+        '',
+        '',
+    ].join('\r\n'));
+    await new Promise(resolve => setTimeout(resolve, 50));
+    client.resetAndDestroy();
+    assert.equal(await Promise.race([settled.promise, new Promise(resolve => setTimeout(() => resolve('timeout'), 1500))]), false);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.deepEqual(uncaught.map(error => error.message), []);
+    assert.equal(released, 1);
+});
+
+test('client socket destroyed before the upstream upgrade fails teardown and writes no 101', {
+    concurrency: false,
+}, async t => {
+    const originalRequest = http.request;
+    t.after(() => { http.request = originalRequest; });
+    const uncaught = noUncaught(t);
+    const targetSocket = new TeardownSocket();
+    const upstreamRequest = new EventEmitter();
+    const upgrade = deferred();
+    upstreamRequest.end = () => { upgrade.resolve(); };
+    upstreamRequest.destroy = () => {};
+    http.request = () => upstreamRequest;
+    const request = {
+        method: 'GET',
+        headers: {
+            host: '127.0.0.1:8080',
+            origin: 'http://127.0.0.1:8080',
+            connection: 'Upgrade',
+            upgrade: 'websocket',
+            'sec-websocket-version': '13',
+            'sec-websocket-key': Buffer.alloc(16, 12).toString('base64'),
+        },
+    };
+    const socket = new TeardownSocket();
+    const events = [];
+    let released = 0;
+    const handling = executeWebSocketPlan({
+        req: request,
+        socket,
+        plan: routePlan({ method: 'GET', transport: 'websocket' }),
+        lease: { release() { released += 1; } },
+        relayManager: {
+            checkout: async () => ({ openRequest: async () => new ApplicationRelayStream(), close() {} }),
+        },
+        authorized: true,
+        auditSink: event => events.push(event),
+    });
+    await upgrade.promise;
+    Duplex.prototype.destroy.call(socket, Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }));
+    await new Promise(resolve => setTimeout(resolve, 10));
+    upstreamRequest.emit('upgrade', {
+        statusCode: 101,
+        statusMessage: 'Switching Protocols',
+        headers: {},
+    }, targetSocket, Buffer.alloc(0));
+
+    const handled = await Promise.race([handling, new Promise(resolve => setTimeout(() => resolve('timeout'), 1000))]);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.deepEqual(uncaught.map(error => error.message), []);
+    assert.equal(handled, false);
+    assert.equal(socket.body.toString('utf8').includes('101'), false);
+    assert.equal(targetSocket.destroyed, true);
+    assert.equal(released, 1);
+    const failures = events.filter(event => event.outcome === 'failure');
+    assert.equal(failures.length, 1);
+    assert.equal(events.filter(event => event.outcome === 'success').length, 0);
 });

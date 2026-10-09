@@ -61,6 +61,10 @@ export async function handleAgentRootUpgrade({
     listener = 'public',
     routePlan = null,
 }) {
+    // Node leaves an upgraded socket flowing with no 'error' listener, so a
+    // client reset during the access check or upstream handshake would be
+    // uncaught. This listener only absorbs the event; teardown is owned below.
+    socket.on('error', () => {});
     const plan = routePlan?.kind === 'agent-root'
         ? routePlan
         : resolveEdgeRoutePlan({ req, parsedUrl, listener, transport: 'websocket' });
@@ -122,6 +126,11 @@ export async function handleAgentRootUpgrade({
         }
         settled = true;
         clearTimeout(timer);
+        if (socket.destroyed || !socket.writable) {
+            try { upstreamSocket.destroy(); } catch (_) {}
+            try { upstream.destroy(); } catch (_) {}
+            return;
+        }
         socket.write(statusLine(
             upstreamResponse.statusCode || 101,
             upstreamResponse.statusMessage || 'Switching Protocols',
