@@ -170,6 +170,51 @@ export function workspaceWriteRequest(row, fixture, payload) {
   return { method: 'GET', path: joinQuery(`/webchat/suggestions/files?query=${encodeURIComponent(`${fixture.directory}/fix`)}`, row.selector), headers };
 }
 
+// Keys under which a workspace read returns directory entries or file contents.
+const LISTING_KEY = /^(entries|files|items|children|listing|directories|dirs|suggestions|results|contents?)$/i;
+const ENTRY_KEY = /^(name|path|filename|type|isDirectory|size)$/;
+
+/**
+ * A denied request must not disclose the workspace. The Router's generic 401
+ * (authContext.js respondUnauthenticated) legitimately carries
+ * `login: /auth/login?returnTo=<this request's own path>&agent=<route>`, so the
+ * caller's own request target echoed there is not a disclosure and a substring
+ * test for the fixture name cannot tell it from a leaked listing. The decision is
+ * structural instead: the parsed body may not contain a listing-shaped key or an
+ * array of entry-shaped objects, the fixture name or the fixture's bytes in any
+ * value, and its `login` value must be the login page whose `returnTo` is exactly
+ * `requestPath`. A body that is not JSON is judged on its whole text.
+ */
+export function assertNoWorkspaceDisclosure(response, { requestPath, fixtureName = 'fixture.txt', fixtureText = '' }) {
+  const message = 'A denied request disclosed a workspace listing';
+  const leaks = value => { const text = String(value); return text.includes(fixtureName) || (fixtureText.length >= 8 && text.includes(fixtureText)); };
+  let body;
+  try { body = JSON.parse(response.text); } catch { body = response.json; }
+  if (body === null || typeof body !== 'object') {
+    assert.equal(leaks(response.text ?? ''), false, message);
+    return;
+  }
+  const walk = (node, key) => {
+    if (Array.isArray(node)) {
+      assert.equal(LISTING_KEY.test(key), false, `${message} (listing-shaped field ${key})`);
+      assert.equal(node.some(item => item && typeof item === 'object' && Object.keys(item).some(name => ENTRY_KEY.test(name))), false, `${message} (directory-entry array)`);
+      node.forEach(item => walk(item, key));
+    } else if (node && typeof node === 'object') {
+      assert.equal(LISTING_KEY.test(key), false, `${message} (listing-shaped field ${key})`);
+      for (const [name, value] of Object.entries(node)) walk(value, name);
+    } else if (typeof node === 'string' && key === 'login') {
+      const url = new URL(node, 'http://router.invalid');
+      assert.ok(url.origin === 'http://router.invalid' && url.pathname === '/auth/login', `${message} (login field is not the login page)`);
+      assert.equal(url.searchParams.get('returnTo'), requestPath, `${message} (login returnTo is not this request's own path)`);
+      url.searchParams.delete('returnTo');
+      assert.equal(leaks(url.searchParams.toString()), false, message);
+    } else {
+      assert.equal(leaks(node ?? ''), false, message);
+    }
+  };
+  walk(body, '');
+}
+
 async function fileSha(filename) {
   return createHash('sha256').update(await fs.readFile(filename)).digest('hex');
 }
@@ -211,7 +256,9 @@ export async function runWorkspaceWriteMatrix(ctx, fixture, filename) {
     }
     await ctx.check(row.id, async () => {
       const body = payload('deny');
-      const response = await ctx.request(row.actor, workspaceWriteRequest(row, fixture, body));
+      const request = workspaceWriteRequest(row, fixture, body);
+      const fixtureText = await fs.readFile(filename, 'utf8');
+      const response = await ctx.request(row.actor, request);
       const after = await fileSha(filename);
       const created = row.operation === 'directory-create'
         ? await fs.stat(path.join(fixture.host, body)).then(() => true, () => false)
@@ -223,7 +270,7 @@ export async function runWorkspaceWriteMatrix(ctx, fixture, filename) {
       ctx.report.workspaceWriteEvidence.push({ id: row.id, status: response.status, fixtureChanged: after !== expected, directoryCreated: created });
       assert.equal(after, expected, 'A denied request changed the owned fixture bytes');
       assert.equal(created, false, 'A denied request created a workspace directory');
-      assert.equal(response.text.includes('fixture.txt'), false, 'A denied request disclosed a workspace listing');
+      assertNoWorkspaceDisclosure(response, { requestPath: request.path, fixtureText });
       assertDenied(response);
     });
   }

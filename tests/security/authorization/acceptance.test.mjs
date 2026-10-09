@@ -18,7 +18,7 @@ import { capture } from './acceptance/evidence-capture.mjs';
 import { policyDigest } from './acceptance/digest.mjs';
 import { captureExitCode } from './acceptance/run-acceptance.mjs';
 import { runMarketplaceAdmissionProbes, runTemplateProbes, marketplaceProjection } from './boundary-probes.mjs';
-import { runWebchatProbes, dpuProcessInspector, createStreamHandle, waitForStartupReady, openEventStream, DPU_UNSUPPORTED_REPLY, LIVE_INTERACTION_LIMITATION } from './webchat-probes.mjs';
+import { runWebchatProbes, describeIdentityArgument, dpuProcessInspector, createStreamHandle, waitForStartupReady, openEventStream, DPU_UNSUPPORTED_REPLY, LIVE_INTERACTION_LIMITATION } from './webchat-probes.mjs';
 import { discoverAgentMcp, webAssistGuestCheckDefinitions } from './agent-probes.mjs';
 import { workspaceWriteMatrix, workspaceWriteCheckDefinitions } from './stream-probes.mjs';
 import { webmeetAdminToolCheckDefinitions, WEBMEET_POSITIVE_FOR_OP } from './webmeet-admin-tools.mjs';
@@ -28,6 +28,7 @@ import { deriveCapabilities } from './acceptance/expected-runtime-graph.mjs';
 import { ackCount } from './webchat-probes.mjs';
 import { BOX_DATA_MOUNTS } from '../../../ploinky-box/constants.mjs';
 import { inventoryBaseline } from './agent-inventory.mjs';
+import { parseInputEnvelope } from '../../../cli/server/handlers/webchat/messageEnvelope.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const inputs = loadAcceptanceInputs();
@@ -652,6 +653,13 @@ function webchatWorld({ copiedInputStatus = 204, copiedControlStatus = 204, repl
     const startupEvent = state => ({ event: 'startup-state', data: JSON.stringify({ state }) });
     const valueOf = p => new URLSearchParams(String(p).split('?')[1] || '').get('authz-probe');
     const deliver = (actor, value, events) => { const list = (handles.get(`${actor}|${value}`) || []).filter(h => !h.closed); for (const e of events) list.at(-1)?.push(e); };
+    // The pinned DPU (dpuAgent/src/index.mjs runWebChat) answers a visible slash command with the generic reply;
+    // any other message starts a research turn that is awaited serially, so nothing queued behind it is answered.
+    const dpuTurn = (runtime, message) => {
+        if (!runtime || runtime.researching) return [];
+        if (!message.startsWith('/')) { runtime.researching = true; return []; }
+        return [{ event: 'message', data: reply }];
+    };
     const ctx = fakeCtx((actor, { path: p, body }) => {
         const route = p.split('?')[0];
         if (['anonymous', 'selfRegistered'].includes(actor)) return json(actor === 'anonymous' ? 401 : 403, { ok: false, error: 'authentication required' });
@@ -663,13 +671,19 @@ function webchatWorld({ copiedInputStatus = 204, copiedControlStatus = 204, repl
             if (runtime?.state !== 'ready') { world.inputsBeforeReady++; return { status: 409, text: 'Agent startup is still in progress.', headers: {} }; }
         }
         if (route === '/webchat/input') {
-            if (body.text.includes('B-copied') && copiedInputStatus !== 204) return { status: copiedInputStatus, text: 'Service Unavailable', headers: {} };
-            deliver(actor, value, [{ event: 'user-message', data: JSON.stringify({ sourceTabId: 't', message: { role: 'user', text: body.text } }) }, { event: 'message', data: reply }]);
+            // The real Router parser decides what the message text is: a body without `__webchatMessage`
+            // is forwarded whole as plain text (messageEnvelope.js:7-26).
+            const parsed = parseInputEnvelope(typeof body === 'string' ? body : JSON.stringify(body));
+            if (parsed.text.includes('B-copied') && copiedInputStatus !== 204) return { status: copiedInputStatus, text: 'Service Unavailable', headers: {} };
+            deliver(actor, value, [{ event: 'user-message', data: JSON.stringify({ sourceTabId: 't', message: { role: 'user', text: parsed.text } }) }, ...dpuTurn(runtimes.get(`${actor}|${value}`), parsed.text)]);
             return { status: 204, text: '', headers: {} };
         }
         if (route === '/webchat/control') {
             if (body.includes('B-copied') && copiedControlStatus !== 204) return { status: copiedControlStatus, text: '', headers: {} };
-            deliver(actor, value, [{ event: 'message', data: reply }]);
+            // The control line reaches the DPU verbatim; the DPU reads `.text` of a JSON line (dpuAgent parseEnvelope).
+            let message = body.trim();
+            try { const line = JSON.parse(message); if (line && typeof line === 'object') message = String(line.text ?? ''); } catch { /* plain line */ }
+            deliver(actor, value, dpuTurn(runtimes.get(`${actor}|${value}`), message));
             return { status: 204, text: '', headers: {} };
         }
         return json(404, { error: 'not_found' });
@@ -758,6 +772,25 @@ test('U6 negative controls: an invented marker echo, a forged B identity, empty 
     const closed = webchatWorld();
     await runWebchatProbes(closed.ctx, { openStream: async () => ({ status: 409, contentType: 'text/plain', events: () => [], close() {} }), inspectProcesses: closed.inspectProcesses, timing: fast });
     assert.ok(closed.ctx.report.gaps.length > 10 && closed.ctx.report.gaps.every(g => g.evidence.kind === 'positive-unavailable'));
+});
+
+test('an unattributed DPU process is diagnosed by redacted class and never credited', async () => {
+    const hash = value => createHash('sha256').update(value).digest('hex');
+    const base = 'node /code/src/index.mjs --authz-probe=v --sso-user=u';
+    assert.equal(describeIdentityArgument({ args: `${base} --sso-roles=user` }, hash), 'absent');
+    assert.equal(describeIdentityArgument({ args: `${base} --sso-user-id=guest --sso-roles=guest` }, hash), 'guest fallback');
+    assert.equal(describeIdentityArgument({ args: `${base} --sso-user-id=a --sso-user-id=b` }, hash), 'repeated x2');
+    const foreign = describeIdentityArgument({ args: `${base} --sso-user-id=secret-looking-id` }, hash);
+    assert.equal(foreign, `foreign value, hash ${hash('secret-looking-id').slice(0, 12)}`);
+    assert.ok(!foreign.includes('secret-looking-id'), 'the raw identity never appears in the diagnosis');
+    // Each class leaves the attribution checks failed rather than credited.
+    for (const args of ['--sso-roles=user', '--sso-user-id=guest', '--sso-user-id=somebody-else']) {
+        const world = webchatWorld();
+        const inspectProcesses = async (...a) => (await world.inspectProcesses(...a)).map(p => ({ ...p, ssoUserId: /guest|somebody/.test(args) ? args.split('=')[1] : null, args: `node /code/src/index.mjs ${args}` }));
+        await runWebchatProbes(world.ctx, { ...world, inspectProcesses, timing: fast });
+        assert.equal(status(world.ctx, 'u6:webchat-distinct-processes'), 'FAIL', args);
+        assert.equal(status(world.ctx, 'u6:webchat-credential-confinement'), 'FAIL', args);
+    }
 });
 
 test('DPU process inspector selects only the pinned DPU entry inside the DPU container, with start identity and principal', async () => {

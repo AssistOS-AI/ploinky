@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { routerInventory, routerInventoryBaseline } from './router-inventory.mjs';
 import { resolveRouterSourceReference, assertRouterInventoryObligations, assertRouterReferenceMaps } from './router-source-references.mjs';
 import { inspectMarketplaceAuthorization, routerProbes, runRouterProbes, validateRouterAllowedResponse, validateRouterPrincipal } from './router-probes.mjs';
-import { markerCommand, runWebchatUploadDenialProof, runWorkspaceWriteMatrix, terminalFixtureNames, workspaceWriteCheckDefinitions, workspaceWriteMatrix, workspaceWriteRequest } from './stream-probes.mjs';
+import { assertNoWorkspaceDisclosure, markerCommand, runWebchatUploadDenialProof, runWorkspaceWriteMatrix, terminalFixtureNames, workspaceWriteCheckDefinitions, workspaceWriteMatrix, workspaceWriteRequest } from './stream-probes.mjs';
 
 test('Router inventory identities are unique and every source reference is a real executable line', () => {
   assert.equal(new Set(routerInventory.map(row => row.id)).size, routerInventory.length);
@@ -252,7 +252,9 @@ function fakeRouter(fixture, filename, { leakingId = '' } = {}) {
       return { status: 200, text, headers: {} };
     }
     if (!allowed && !(leakingId && options.path.includes(leakingId))) {
-      return { status: 401, text: '{"ok":false,"error":"not_authenticated"}', json: { ok: false, error: 'not_authenticated' }, headers: {} };
+      // The Router's generic 401 (authContext.js respondUnauthenticated): the login URL echoes the caller's own request path.
+      const body = { ok: false, error: 'not_authenticated', login: `/auth/login?${new URLSearchParams({ returnTo: options.path, agent: 'explorer' })}` };
+      return { status: 401, text: JSON.stringify(body), json: body, headers: {} };
     }
     if (isWrite) {
       await fsPromises.writeFile(filename, options.body);
@@ -276,6 +278,34 @@ test('Write matrix passes only with changed bytes and unchanged hashes under dis
   assert.deepEqual(ctx.report.checks.map(check => check.id).sort(), workspaceWriteCheckDefinitions().map(definition => definition.id).sort(), 'the run records exactly the mandatory identities, once each');
   assert.equal(ctx.gaps.length, 0);
   assert.equal(new Set(ctx.bodies).size, ctx.bodies.length, 'every write and denial sends a distinct payload');
+});
+
+// The Router's generic 401 echoes the caller's own request path in `login`; that echo is not a listing.
+const ownPath = '/upload?path=authz-x-terminal%2Ffixture.txt&agent=webAssist';
+const routerLogin = (returnTo, extra = {}) => {
+  const body = { ok: false, error: 'not_authenticated', login: `/auth/login?${new URLSearchParams({ returnTo, agent: 'explorer' })}`, ...extra };
+  return { status: 401, text: JSON.stringify(body), json: body, headers: {} };
+};
+
+test('disclosure predicate: the Router login echo of the caller\'s own path passes, a listing or fixture content fails', () => {
+  const opts = { requestPath: ownPath, fixtureText: 'authz-x-sink-positive-3' };
+  assert.doesNotThrow(() => assertNoWorkspaceDisclosure(routerLogin(ownPath), opts), 'the exact Router 401 body');
+  assert.doesNotThrow(() => assertNoWorkspaceDisclosure({ status: 403, text: '{"ok":false,"error":"admin_required"}' }, opts));
+  assert.doesNotThrow(() => assertNoWorkspaceDisclosure({ status: 403, json: { ok: false, error: 'forbidden' } }, opts), 'json-only response');
+  for (const [label, response] of [
+    ['entries array', routerLogin(ownPath, { entries: [{ name: 'fixture.txt', type: 'file' }] })],
+    ['listing key with names', routerLogin(ownPath, { files: ['a', 'b'] })],
+    ['nested listing key', routerLogin(ownPath, { data: { items: [] } })],
+    ['entry objects under an arbitrary key', routerLogin(ownPath, { data: [{ name: 'x' }] })],
+    ['fixture name in a message', routerLogin(ownPath, { message: 'found fixture.txt' })],
+    ['fixture bytes', routerLogin(ownPath, { detail: 'authz-x-sink-positive-3' })],
+    ['returnTo naming another path', routerLogin('/webchat/directories?path=authz-x-terminal%2Ffixture.txt')],
+    ['returnTo naming no path of this request', routerLogin('/upload')],
+    ['login that is not the login page', { status: 401, text: '{"ok":false,"login":"https://evil.invalid/auth/login"}' }],
+    ['fixture name leaking through another login parameter', { status: 401, text: JSON.stringify({ ok: false, login: `/auth/login?${new URLSearchParams({ returnTo: ownPath, hint: 'fixture.txt' })}` }) }],
+    ['text listing without a JSON body', { status: 403, text: 'fixture.txt' }],
+    ['listing only in text while json is stripped', { status: 403, json: { ok: false }, text: '{"ok":false,"entries":[{"name":"fixture.txt"}]}' }],
+  ]) assert.throws(() => assertNoWorkspaceDisclosure(response, opts), /disclosed a workspace listing/, label);
 });
 
 test('A failed positive control turns its dependents into gaps and a changed fixture fails the denial', async t => {

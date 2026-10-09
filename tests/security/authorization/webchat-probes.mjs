@@ -271,6 +271,20 @@ export function dpuProcessInspector({ boxId, container, run = (args) => execFile
 
 const identity = p => `${p.pid}@${p.start}`;
 
+/**
+ * Redacted diagnosis of a process whose router-issued --sso-user-id matches no test principal:
+ * the class (absent, repeated, the Router's guest fallback, or a foreign value) and, for a foreign
+ * value, only a short prefix of its hash, comparable with the report's principal idHash values.
+ */
+export function describeIdentityArgument(p, hash) {
+    const flags = String(p.args || '').split(' ').filter(a => a.startsWith('--sso-user-id='));
+    if (!flags.length) return 'absent';
+    if (flags.length > 1) return `repeated x${flags.length}`;
+    const value = flags[0].slice('--sso-user-id='.length);
+    if (value === 'guest') return 'guest fallback';
+    return `foreign value, hash ${typeof hash === 'function' ? String(hash(value)).slice(0, 12) : 'unavailable'}`;
+}
+
 export async function runWebchatProbes(ctx, { openStream = openEventStream, inspectProcesses = null, nonce = ctx.prefix, timing = {} } = {}) {
     const { agent, launchKey, cap } = webchatProbe;
     const { waitMs = webchatProbe.waitMs, settleMs = 1000, removalMs = 120000, pollMs = 2000, readyMs = webchatProbe.readyMs, readyPollMs = 25 } = timing;
@@ -290,7 +304,7 @@ export async function runWebchatProbes(ctx, { openStream = openEventStream, insp
         const byPrincipal = {};
         for (const p of list) {
             const who = principalOf(p);
-            assert.ok(who === 'userA' || who === 'userB', 'A matching DPU process is not attributed to a test principal');
+            assert.ok(who === 'userA' || who === 'userB', `A matching DPU process is not attributed to a test principal (--sso-user-id: ${describeIdentityArgument(p, ctx.hash)})`);
             assert.ok(!byPrincipal[who], `More than one DPU process for ${who}`);
             byPrincipal[who] = p;
         }
@@ -336,7 +350,12 @@ export async function runWebchatProbes(ctx, { openStream = openEventStream, insp
         }
         return handle;
     };
-    const envelope = text => ({ text, presentation: { visible: true } });
+    // The exact body the browser client sends (cli/server/webchat/network.js:206-211). The Router
+    // treats a body as an envelope only when it carries `__webchatMessage`
+    // (cli/server/handlers/webchat/messageEnvelope.js:11); without it the whole JSON is forwarded
+    // as the message text, the user-message event never equals the marker and the DPU starts a
+    // research turn instead of answering the slash command.
+    const envelope = text => ({ __webchatMessage: 1, version: 1, text, attachments: [], presentation: { visible: true } });
     const post = (actor, route, body, value = shared) => ctx.request(actor, { method: 'POST', path: `/webchat/${route}?${query(value)}`, body, headers: { 'content-type': 'application/json' } });
 
     const own = {};

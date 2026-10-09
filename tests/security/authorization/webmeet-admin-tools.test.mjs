@@ -16,18 +16,49 @@ const ADMIN_TOOLS = new Set(WEBMEET_ADMIN_ONLY_TOOLS.map(entry => entry.tool));
 const ok = value => ({ failed: false, value, error: '', response: { status: 200, json: {}, text: '' } });
 const fail = error => ({ failed: true, value: { ok: false, error }, error, response: { status: 200, json: {}, text: '' } });
 
+/**
+ * The webmeet_robo_team_update `settings` argument as the live tool schema declares it (tools/list inputSchema; source
+ * webmeetAgent/mcp-config.json): seven sections, every leaf required, no extra keys. 'string[]' is an array of strings.
+ */
+const ROBO_SETTINGS_SCHEMA = Object.freeze({
+  assistant: { name: 'string', mode: 'string', instructions: 'string', scenarioOrObjective: 'string' },
+  meetingNotes: { enabled: 'boolean', structurePrompt: 'string', timeZone: 'string' },
+  blackboard: { enabled: 'boolean', visibility: 'string', autoUpdateFromConversation: 'boolean', participantRequestsEnabled: 'boolean' },
+  documentBuilder: { enabled: 'boolean', purpose: 'string', structureInstructions: 'string', toneInstructions: 'string', participantCorrectionsEnabled: 'boolean', exportRequiresApproval: 'boolean' },
+  moderation: { enabled: 'boolean', rules: 'string', speakingOrderEnabled: 'boolean', speakingTimeLimitEnabled: 'boolean', speakingTimeLimitMinutes: 'number', microphoneControlAllowed: 'boolean', sensitiveActionsRequireApproval: 'boolean' },
+  bots: { enabled: 'boolean', allowedRoles: 'string[]', roleInstructions: 'string', personalityAndObjectives: 'string', organizerApprovalRequired: 'boolean' },
+  adaptation: { enabled: 'boolean', participantRequestsEnabled: 'boolean', silenceAsAcceptanceForMinorChanges: 'boolean', explicitApprovalForSensitiveActions: 'boolean' },
+});
+const SEED = Object.freeze({ string: 'seed', boolean: false, number: 0, 'string[]': [] });
+const seedRoboSettings = () => Object.fromEntries(Object.entries(ROBO_SETTINGS_SCHEMA).map(([section, leaves]) => [section, Object.fromEntries(Object.entries(leaves).map(([leaf, type]) => [leaf, structuredClone(SEED[type])]))]));
+const isType = (value, type) => type === 'string[]' ? Array.isArray(value) && value.every(item => typeof item === 'string') : typeof value === type;
+/** Issues the MCP SDK would report for a settings value (invalid_type for a missing leaf, unrecognized_keys for an extra key). */
+function roboSettingsIssues(settings) {
+  const issues = [];
+  const isObject = value => value && typeof value === 'object' && !Array.isArray(value);
+  if (!isObject(settings)) return ['settings: expected object'];
+  for (const key of Object.keys(settings)) if (!(key in ROBO_SETTINGS_SCHEMA)) issues.push(`settings.${key}: unrecognized key`);
+  for (const [section, leaves] of Object.entries(ROBO_SETTINGS_SCHEMA)) {
+    if (!isObject(settings[section])) { issues.push(`settings.${section}: Required`); continue; }
+    for (const key of Object.keys(settings[section])) if (!(key in leaves)) issues.push(`settings.${section}.${key}: unrecognized key`);
+    for (const [leaf, type] of Object.entries(leaves)) if (!isType(settings[section][leaf], type)) issues.push(`settings.${section}.${leaf}: Required ${type}`);
+  }
+  return issues;
+}
+
 /** Model of webmeetAgent@bdf0f96f: guest allowlist at dispatch, assertAdminAuthInfo in the eleven handlers. */
 function webmeetWorld({ leak = new Set(), failTool = new Set(), persistThenFailCreate = '', silent = new Set(), disclose = new Set(), noop = new Set() } = {}) {
   const rooms = new Map();
   let counter = 0;
   const id = prefix => `${prefix}_${String(++counter).padStart(8, '0')}`;
   const seen = [];
+  const schemaRejections = [];
   const view = room => ({ id: room.id, roomId: room.id, name: room.name, title: room.name, status: room.status, archivedAt: room.archivedAt });
   const requireRoom = roomId => { const room = rooms.get(roomId); if (!room) throw new Error('Meeting not found.'); return room; };
   const handlers = {
     webmeet_room_list: () => ({ rooms: [...rooms.values()].map(view), canManageRooms: true }),
     webmeet_room_create: args => {
-      const room = { id: id('room'), name: args.name, status: 'open', archivedAt: null, members: [], settings: { assistant: { name: 'Robo Team' } }, resources: [],
+      const room = { id: id('room'), name: args.name, status: 'open', archivedAt: null, members: [], settings: { ...seedRoboSettings(), assistant: { ...seedRoboSettings().assistant, name: 'Robo Team' } }, resources: [],
         agent: { id: 'agent_robo_team', agentType: 'robo_team', status: 'active', deletedAt: null } };
       rooms.set(room.id, room);
       if (persistThenFailCreate && args.name === persistThenFailCreate) throw new Error('response lost');
@@ -41,7 +72,7 @@ function webmeetWorld({ leak = new Set(), failTool = new Set(), persistThenFailC
     webmeet_participant_update_role: args => { const member = requireRoom(args.roomId).members.find(entry => entry.id === args.participantId); if (!member) throw new Error('Participant is not joined.'); member.role = args.role; return { ok: true, participant: member }; },
     webmeet_participant_remove: args => { const room = requireRoom(args.roomId); const before = room.members.length; room.members = room.members.filter(entry => entry.id !== args.participantId); return { ok: room.members.length < before, participantId: args.participantId }; },
     webmeet_robo_team_get: args => ({ roomId: args.roomId, settings: requireRoom(args.roomId).settings }),
-    webmeet_robo_team_update: args => { const room = requireRoom(args.roomId); room.settings = { assistant: { name: args.settings.assistant.name } }; return { roomId: args.roomId, settings: room.settings }; },
+    webmeet_robo_team_update: args => { const room = requireRoom(args.roomId); room.settings = structuredClone(args.settings); return { roomId: args.roomId, settings: room.settings }; },
     webmeet_agent_list: args => ({ agents: [{ ...requireRoom(args.roomId).agent }] }),
     webmeet_agent_attach: args => { const room = requireRoom(args.roomId); Object.assign(room.agent, { status: 'active', deletedAt: null }); return room.agent; },
     webmeet_agent_detach: args => { const room = requireRoom(args.roomId); Object.assign(room.agent, { status: 'detached', deletedAt: 'now' }); return room.agent; },
@@ -53,6 +84,12 @@ function webmeetWorld({ leak = new Set(), failTool = new Set(), persistThenFailC
   const mcp = async (principal, agent, tool, args = {}) => {
     seen.push({ principal, tool });
     assert.equal(agent, 'webmeetAgent');
+    // Ploinky validates the arguments against the tool schema before authorization or the handler (live: a partial
+    // settings payload is rejected as invalid arguments for every actor, which masked the denied actors' refusals).
+    if (tool === 'webmeet_robo_team_update') {
+      const issues = roboSettingsIssues(args.settings);
+      if (issues.length) { schemaRejections.push({ principal, issues }); return fail(`MCP error -32602: Invalid arguments for tool ${tool}: ${issues.join('; ')}`); }
+    }
     const denial = principal === 'anonymous' ? `Access denied: guest invocation cannot call "${tool}".` : 'Access denied: only admin can manage rooms.';
     // Hostile models of a broken product: the state changes (or data is returned) and the call still answers "access denied".
     if (silent.has(`${principal}:${tool}`)) { try { handlers[tool](args); } catch { /* the attempt may fail after persisting */ } return fail(denial); }
@@ -65,7 +102,7 @@ function webmeetWorld({ leak = new Set(), failTool = new Set(), persistThenFailC
     if (failTool.has(`${principal}:${tool}`)) return fail('backend unavailable');
     try { return ok(handlers[tool](args)); } catch (error) { return fail(error.message); }
   };
-  return { mcp, rooms, seen };
+  return { mcp, rooms, seen, schemaRejections };
 }
 function checkCtx() {
   return { prefix: 'authz-test', cleanups: [], report: { checks: [] }, async guard() {}, cleanup(fn) { this.cleanups.push(fn); },
@@ -208,5 +245,43 @@ test('an administrator operation that answers ok without changing state fails it
   for (const [tool, op] of positives) {
     const { ctx } = await run({ noop: new Set([`admin:${tool}`]) });
     assert.equal(ctx.report.checks.find(check => check.id === WEBMEET_POSITIVE_FOR_OP[op]).status, 'FAIL', `${tool}: a no-op administrator call must not satisfy its positive`);
+  }
+});
+
+// ---- the RoboTeam payload must satisfy the tool schema, or authorization is masked --------------------------------
+test('the live tool schema rejects the old partial RoboTeam payload for every actor, so it can never evidence a denial', () => {
+  assert.equal(roboSettingsIssues({ assistant: { name: 'x' } }).length, 9, 'a name-only payload misses three assistant leaves and six sections (the live rejection listed nine paths)');
+  assert.deepEqual(roboSettingsIssues(seedRoboSettings()), []);
+  assert.deepEqual(roboSettingsIssues({ ...seedRoboSettings(), extra: {} }), ['settings.extra: unrecognized key']);
+  const missingLeaf = seedRoboSettings(); delete missingLeaf.moderation.speakingTimeLimitMinutes;
+  assert.equal(roboSettingsIssues(missingLeaf).length, 1);
+});
+
+test('every RoboTeam update attempt is a schema-valid full-settings payload that changes only assistant.name', async () => {
+  const { world, ctx } = await run();
+  assert.deepEqual(world.schemaRejections, [], 'no attempt, denied or positive, was rejected as invalid arguments');
+  const attempts = world.seen.filter(call => call.tool === 'webmeet_robo_team_update');
+  assert.deepEqual(attempts.map(call => call.principal), ['anonymous', 'selfRegistered', 'admin']);
+  assert.deepEqual(ctx.report.checks.filter(check => check.status !== 'PASS'), []);
+  const [room] = [...world.rooms.values()];
+  const expected = seedRoboSettings();
+  assert.equal(room.settings.assistant.name, 'authz-test-robo-marker');
+  assert.deepEqual({ ...room.settings, assistant: { ...room.settings.assistant, name: 'Robo Team' } }, { ...expected, assistant: { ...expected.assistant, name: 'Robo Team' } }, 'every other leaf of the administrator snapshot is preserved');
+  for (const cleanup of ctx.cleanups.reverse()) await cleanup();
+});
+
+test('without a RoboTeam settings snapshot no update is sent and neither denial nor the positive passes', async () => {
+  const { world, ctx } = await run({ failTool: new Set(['admin:webmeet_robo_team_get']) });
+  assert.equal(world.seen.filter(call => call.tool === 'webmeet_robo_team_update').length, 0, 'no unvalidated partial payload is substituted');
+  for (const id of [denialId('anonymous', 'robo-team-update'), denialId('selfRegistered', 'robo-team-update'), WEBMEET_POSITIVE_FOR_OP['robo-team-update']]) assert.equal(status(ctx, id)[0], 'FAIL', id);
+  for (const cleanup of ctx.cleanups.reverse()) await cleanup();
+});
+
+test('a denied RoboTeam update that changes any section, not only the name, fails that denial', async () => {
+  for (const actor of WEBMEET_DENIED_ACTORS) {
+    const { world, ctx } = await run({ silent: new Set([`${actor}:webmeet_robo_team_update`]) });
+    assert.ok(status(ctx, denialId(actor, 'robo-team-update'))[0] !== 'PASS', actor);
+    for (const cleanup of ctx.cleanups.reverse()) await cleanup();
+    assert.deepEqual([...world.rooms.values()], []);
   }
 });

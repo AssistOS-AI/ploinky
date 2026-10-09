@@ -61,6 +61,25 @@ function requireNamedList(value, field) {
 
 // Shapes come from the pinned handlers listed in agent-inventory. A status code
 // or an empty object cannot establish a functioning authorized control.
+/**
+ * An explicit capability refusal by the agent itself, asserted exactly per probe instead of
+ * widening assertDenied (whose content rule serves hundreds of authorization denials). The
+ * RoboTeam listing refuses a verified non-admin user without the Explorer capability with
+ * 403 {"ok":false,"error":"Explorer access is required to list robots"}
+ * (AchillesCLI roboTeamAgent/server/listing-access.mjs authorizeRobotListing).
+ */
+export const AGENT_HTTP_CAPABILITY_REFUSALS = Object.freeze({
+    'agent.robot.list': Object.freeze({ status: 403, error: 'Explorer access is required to list robots' }),
+});
+export function assertAgentHttpDenied(probe, response) {
+    const refusal = AGENT_HTTP_CAPABILITY_REFUSALS[probe.id];
+    if (refusal && response.status === refusal.status && response.json?.error === refusal.error) {
+        assert.equal(response.json.ok, false, 'A capability refusal must be an explicit failure');
+        return;
+    }
+    assertDenied(response);
+}
+
 export function assertAgentHttpPositive(probe, response, principal) {
     assert.equal(response.status, 200, 'Authorized HTTP control requires success');
     const value = response.json;
@@ -803,7 +822,7 @@ export async function runAgentProbes(ctx) {
         await ctx.check(`${probe.id}.admin`, async () => assertAgentHttpPositive(probe, positive, ctx.principals.admin));
         for (const actor of ['anonymous', 'selfRegistered', 'userA', 'userB']) await ctx.check(`${probe.id}.${actor}`, async () => {
             const response = await ctx.request(actor, probe);
-            if (probe.policy === 'admin' || actor === 'anonymous' || actor === 'selfRegistered') assertDenied(response);
+            if (probe.policy === 'admin' || actor === 'anonymous' || actor === 'selfRegistered') assertAgentHttpDenied(probe, response);
             else assertAgentHttpPositive(probe, response, ctx.principals[actor]);
         });
     }

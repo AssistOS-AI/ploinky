@@ -202,12 +202,37 @@ export async function runWebmeetAdminToolProbes(ctx, mcp, { assertAllowed, asser
   }
 
   // ---- RoboTeam settings -------------------------------------------------------------
-  const roboName = async () => (await admin('webmeet_robo_team_get', { roomId: room }, 'administrator reads RoboTeam settings')).settings?.assistant?.name;
+  // The tool's input schema requires every leaf of every settings section and forbids extra keys
+  // (AssistOSExplorer webmeetAgent/mcp-config.json webmeet_robo_team_update), and Ploinky validates the
+  // arguments before authorization or the handler run. A partial payload would therefore be rejected as
+  // invalid arguments for every actor: a denied actor's refusal would be masked and the administrator
+  // positive would fail. Both the denied attempts and the positive therefore send the administrator's full
+  // current settings, read once before the first denied attempt, with only assistant.name changed.
+  let roboSnapshot;
+  let roboSnapshotFailure;
+  try {
+    await ctx.guard();
+    const current = await admin('webmeet_robo_team_get', { roomId: room }, 'administrator snapshots RoboTeam settings');
+    assert.ok(current.settings && typeof current.settings === 'object' && !Array.isArray(current.settings), 'The RoboTeam settings snapshot is an object');
+    assert.equal(typeof current.settings.assistant?.name, 'string', 'The RoboTeam settings snapshot carries assistant.name');
+    roboSnapshot = structuredClone(current.settings);
+  } catch (error) { roboSnapshotFailure = error; }
+  const roboSettingsNamed = name => {
+    if (!roboSnapshot) assert.fail(`The RoboTeam settings snapshot is unavailable, so no valid update payload can be built: ${roboSnapshotFailure?.message || 'unknown failure'}`);
+    const settings = structuredClone(roboSnapshot);
+    settings.assistant.name = name;
+    return settings;
+  };
+  const roboSettings = async () => (await admin('webmeet_robo_team_get', { roomId: room }, 'administrator reads RoboTeam settings')).settings;
+  const roboName = async () => (await roboSettings())?.assistant?.name;
   await deniedBoth('robo-team-update',
-    actor => call(actor, 'webmeet_robo_team_update', { roomId: room, settings: { assistant: { name: `${ctx.prefix}-forbidden-robo` } } }),
-    async () => assert.notEqual(await roboName(), `${ctx.prefix}-forbidden-robo`, 'A denied RoboTeam update changed the settings'));
+    actor => call(actor, 'webmeet_robo_team_update', { roomId: room, settings: roboSettingsNamed(`${ctx.prefix}-forbidden-robo`) }),
+    async () => {
+      if (!roboSnapshot) assert.fail('The RoboTeam settings snapshot is unavailable, so unchanged settings cannot be shown');
+      assert.deepEqual(await roboSettings(), roboSnapshot, 'A denied RoboTeam update changed the settings');
+    });
   await positive(WEBMEET_POSITIVE_FOR_OP['robo-team-update'], async () => {
-    const updated = await admin('webmeet_robo_team_update', { roomId: room, settings: { assistant: { name: names.marker } } }, 'administrator updates RoboTeam settings');
+    const updated = await admin('webmeet_robo_team_update', { roomId: room, settings: roboSettingsNamed(names.marker) }, 'administrator updates RoboTeam settings');
     assert.equal(updated.settings?.assistant?.name, names.marker);
     assert.equal(await roboName(), names.marker, 'The administrator observes the new settings');
   });

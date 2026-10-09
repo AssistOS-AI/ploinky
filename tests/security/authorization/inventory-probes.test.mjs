@@ -3,9 +3,10 @@ import assert from 'node:assert/strict';
 import { agentCatalog, agentInventory } from './agent-inventory.mjs';
 import { readFileSync } from 'node:fs';
 import { expectedTool } from './inventory-generate.mjs';
+import { assertDenied } from './core.mjs';
 const expectedRuntimes = JSON.parse(readFileSync(new URL('./acceptance/expected-runtimes.json', import.meta.url), 'utf8'));
 import { assertAgentMcpDenied, decodeAgentMcp, agentReadTools, agentProbes, reconcileAgentRegistry, createAgentSessions,
-    assertAgentHttpPositive, assertAgentReadPositive, discoverAgentMcp, agentDiscoveryMethods, readTools, createRoomListingFixture, usernamePrivilegeProbe } from './agent-probes.mjs';
+    assertAgentHttpPositive, assertAgentHttpDenied, assertAgentReadPositive, discoverAgentMcp, agentDiscoveryMethods, readTools, createRoomListingFixture, usernamePrivilegeProbe } from './agent-probes.mjs';
 
 const response = (status, json) => ({ status, json, headers: {}, text: JSON.stringify(json) });
 test('MCP decoder rejects redirects, missing endpoints, malformed success and structured tool failures', () => {
@@ -104,6 +105,23 @@ test('HTTP positive controls require handler payloads and reject JSON error page
         }
     }
     assert.throws(() => assertAgentHttpPositive(agentProbes[3], response(200, payloads['agent.robot.list']), { id: 'ordinary', roles: ['user'] }));
+});
+
+test('the RoboTeam listing capability refusal is accepted exactly, and nothing else widens the shared denial rule', () => {
+    const robot = agentProbes.find(probe => probe.id === 'agent.robot.list');
+    const refusal = { ok: false, error: 'Explorer access is required to list robots' };
+    assert.doesNotThrow(() => assertAgentHttpDenied(robot, response(403, refusal)), 'the product\'s explicit refusal');
+    assert.doesNotThrow(() => assertAgentHttpDenied(robot, response(401, { ok: false, error: 'authenticated Ploinky user is required' })), 'the shared rule still serves other denials');
+    // Only that probe, only that status, only that exact error, only as a failure.
+    assert.throws(() => assertAgentHttpDenied(agentProbes.find(probe => probe.id === 'agent.soul.management.me'), response(403, refusal)), 'another probe');
+    for (const bad of [
+        response(401, refusal), response(500, refusal), response(200, refusal), response(403, { ...refusal, ok: true }),
+        response(403, { ok: false, error: 'Explorer access is required' }), response(403, { ok: false, error: 'explorer access is required to list robots' }),
+        response(403, { ok: false, error: 'Explorer access is required to list robots.' }), response(403, { ok: false, message: refusal.error }),
+        response(403, { ok: false, error: 'access is required' }), response(403, { ok: false, error: 'storage_full' }), response(403, { ok: false, error: 'access log unavailable' }),
+    ]) assert.throws(() => assertAgentHttpDenied(robot, bad), JSON.stringify(bad.json));
+    // The shared rule itself is unchanged: a bare capability-like sentence is not an authorization denial.
+    assert.throws(() => assertDenied(response(403, refusal)));
 });
 
 test('every read tool has a meaningful success schema and account/role identity is checked', () => {
