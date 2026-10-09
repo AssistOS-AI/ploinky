@@ -7,14 +7,14 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { LIMITS, parseStrictJson, validateManifest } from '../liveUpdateCache/manifest_codex.mjs';
-import { PHASE_CAPS_MS, assertOptionalFailureActivation, assertDeferredFailure } from '../liveUpdateCache/contracts_codex.mjs';
-import { createOwnedCustody, createStopLatch } from '../liveUpdateCache/execution_codex.mjs';
-import { runOwnedCommand, buildCommandEnvironment, monotonicNow, defaultDelay } from '../liveUpdateCache/host_command_codex.mjs';
-import { createLinuxProcessObserver } from '../liveUpdateCache/linux_observer_codex.mjs';
-import { createLiveObserver } from '../liveUpdateCache/live_admission_codex.mjs';
-import { createWorkerHost, } from '../liveUpdateCache/worker_host_codex.mjs';
-import { readBoundedRegularFile } from '../liveUpdateCache/worker_codex.mjs';
+import { LIMITS, parseStrictJson, validateManifest } from '../liveUpdateCache/manifest.mjs';
+import { PHASE_CAPS_MS, assertOptionalFailureActivation, assertDeferredFailure } from '../liveUpdateCache/contracts.mjs';
+import { createOwnedCustody, createStopLatch } from '../liveUpdateCache/execution.mjs';
+import { runOwnedCommand, buildCommandEnvironment, monotonicNow, defaultDelay } from '../liveUpdateCache/host_command.mjs';
+import { createLinuxProcessObserver } from '../liveUpdateCache/linux_observer.mjs';
+import { createLiveObserver } from '../liveUpdateCache/live_admission.mjs';
+import { createWorkerHost, } from '../liveUpdateCache/worker_host.mjs';
+import { readBoundedRegularFile } from '../liveUpdateCache/worker.mjs';
 
 const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const expectedWorkspace = path.join(os.homedir(), 'work', 'testExplorerFresh');

@@ -98,7 +98,7 @@ npm run authorization:inventory -- --out /Users/danielsava/work/deployment-evide
 
 Use a new export directory if those output files already exist; exports refuse to overwrite prior evidence or follow output-file symlinks.
 
-The written per-row review of the 2026-10-08 router source reference additions is [router-reference-review-2026-10-08_claude.md](router-reference-review-2026-10-08_claude.md).
+The written per-row review of the 2026-10-08 router source reference additions is [router-reference-review-2026-10-08.md](router-reference-review-2026-10-08.md).
 
 See [inventory-notes.md](inventory-notes.md) for repository totals, source regeneration and detailed unresolved families. The checked [Router inventory](router-inventory.mjs) records dispatch order, top-level administrative APIs, proxy paths, static serving, callbacks, SSE/WS and private listener boundaries. The [agent inventory](agent-inventory.mjs) records manifests, actual dispatch references, tool arguments, disabled agents and custom additional servers. Live registry and tools/resources/prompts discovery are reconciled separately.
 
