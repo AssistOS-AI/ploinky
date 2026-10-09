@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { routerInventory, routerInventoryBaseline } from './router-inventory.mjs';
 import { resolveRouterSourceReference, assertRouterInventoryObligations, assertRouterReferenceMaps } from './router-source-references.mjs';
 import { inspectMarketplaceAuthorization, routerProbes, runRouterProbes, validateRouterAllowedResponse, validateRouterPrincipal } from './router-probes.mjs';
-import { markerCommand, runWebchatUploadDenialProof, runWorkspaceWriteMatrix, terminalFixtureNames, workspaceWriteMatrix, workspaceWriteRequest } from './stream-probes.mjs';
+import { markerCommand, runWebchatUploadDenialProof, runWorkspaceWriteMatrix, terminalFixtureNames, workspaceWriteCheckDefinitions, workspaceWriteMatrix, workspaceWriteRequest } from './stream-probes.mjs';
 
 test('Router inventory identities are unique and every source reference is a real executable line', () => {
   assert.equal(new Set(routerInventory.map(row => row.id)).size, routerInventory.length);
@@ -273,6 +273,7 @@ test('Write matrix passes only with changed bytes and unchanged hashes under dis
   const failed = ctx.report.checks.filter(check => check.status !== 'PASS');
   assert.deepEqual(failed, []);
   assert.equal(ctx.report.checks.length, 68);
+  assert.deepEqual(ctx.report.checks.map(check => check.id).sort(), workspaceWriteCheckDefinitions().map(definition => definition.id).sort(), 'the run records exactly the mandatory identities, once each');
   assert.equal(ctx.gaps.length, 0);
   assert.equal(new Set(ctx.bodies).size, ctx.bodies.length, 'every write and denial sends a distinct payload');
 });
@@ -283,6 +284,7 @@ test('A failed positive control turns its dependents into gaps and a changed fix
   await runWorkspaceWriteMatrix(broken, fixture, filename);
   assert.equal(broken.report.checks.some(check => check.status === 'PASS' && /-deny:/.test(check.id)), false);
   assert.equal(broken.gaps.length, 61);
+  assert.deepEqual(broken.gaps.map(gap => gap.id).sort(), workspaceWriteMatrix().denials.map(row => row.id).sort(), 'every unavailable denial is reported under its own mandatory identity');
   assert.ok(broken.gaps.every(gap => gap.reason.startsWith('positive-unavailable')));
 
   const second = await writeMatrixFixture(t);

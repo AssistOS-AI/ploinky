@@ -37,6 +37,8 @@ export const FORBIDDEN_GAP_IDS = Object.freeze([
     /\*/, /\.pagination$/, /\.unsupported$/, /\.sse$/, /:fanout$/, /^agent\.username-admin/, /^agent\.tool\./,
     /^agent\.(soul|robot)\./, /^resource\.(dpu\.idor|files-and-tasks|tasks\.idor|git\.local-fixture|webmeet\.authorization)$/,
     /^router:(workspace-file-selector-bypass|workspace-upload-selector-deny|terminal-|mcp-session-horizontal-delete)/, /^u[367]:/,
+    // The Router workspace-write matrix and its read/selector controls: a denial that cannot run is a missing mandatory check, never a gap.
+    /^router:(workspace-file-|workspace-upload-|webchat-)/,
 ]);
 const FIELDS = ['id', 'category', 'presence', 'source', 'reason', 'affectedObligations', 'outsideChangedBehavior', 'evidence', 'reviewedBy'];
 const CITATION = /[A-Za-z0-9_./-]+\.(mjs|js|json|sh|md):\d+/;

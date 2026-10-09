@@ -91,7 +91,18 @@ const WEBCHAT_OPERATIONS = ['upload', 'directory-create', 'directory-list', 'sug
 const WEBCHAT_UNSAFE_OPERATIONS = ['upload', 'directory-create'];
 
 // The exact, fixed write-matrix identities. Denials and positives are listed
-// here so the offline harness tests can pin the counts.
+// here so the offline harness tests can pin the counts. Every denial names the
+// one positive control that proves the same sink works for an entitled actor;
+// the runtime gate and the mandatory-check enumerator both read this field, so
+// they cannot drift apart. Every positive is itself a mandatory check.
+export const WORKSPACE_WRITE_POSITIVE_FOR_OPERATION = Object.freeze({
+  'sink-upload': 'router:workspace-upload-owner-positive:admin',
+  upload: 'router:webchat-upload-positive:admin',
+  'directory-create': 'router:webchat-directory-create-positive:admin',
+  'directory-list': 'router:webchat-directory-list-positive:userA',
+  suggestions: 'router:webchat-suggestions-positive:userA',
+});
+
 export function workspaceWriteMatrix() {
   const positives = [
     { id: 'router:workspace-upload-owner-positive:admin', operation: 'sink-upload', actor: 'admin', proof: 'valid', selector: 'default' },
@@ -100,7 +111,7 @@ export function workspaceWriteMatrix() {
     { id: 'router:webchat-directory-create-positive:admin', operation: 'directory-create', actor: 'admin', proof: 'valid', selector: 'default' },
     { id: 'router:webchat-directory-list-positive:userA', operation: 'directory-list', actor: 'userA', proof: 'absent', selector: 'default' },
     { id: 'router:webchat-suggestions-positive:userA', operation: 'suggestions', actor: 'userA', proof: 'absent', selector: 'default' },
-  ];
+  ].map(row => ({ ...row, positiveControl: null }));
   const denials = [];
   for (const [actor, proof] of SINK_DENIALS) for (const selector of SINK_SELECTORS) {
     denials.push({ id: `router:workspace-upload-deny:${actor}:${proof}:${selector}`, operation: 'sink-upload', actor, proof, selector });
@@ -112,7 +123,14 @@ export function workspaceWriteMatrix() {
   for (const operation of WEBCHAT_UNSAFE_OPERATIONS) for (const proof of ['absent', 'invalid']) for (const selector of WEBCHAT_SELECTORS) {
     denials.push({ id: `router:webchat-${operation}-deny:userA:${proof}:${selector}`, operation, actor: 'userA', proof, selector });
   }
-  return { positives, denials };
+  return { positives, denials: denials.map(row => ({ ...row, positiveControl: WORKSPACE_WRITE_POSITIVE_FOR_OPERATION[row.operation] })) };
+}
+
+/** Mandatory-check definitions for the whole write matrix (68 checks, each recorded exactly once per run). */
+export function workspaceWriteCheckDefinitions() {
+  const { positives, denials } = workspaceWriteMatrix();
+  const source = 'tests/security/authorization/stream-probes.mjs workspaceWriteMatrix';
+  return [...positives, ...denials].map(row => ({ id: row.id, kind: 'live', boundary: 'router', source, positiveControlAnyOf: row.positiveControl ? [row.positiveControl] : null }));
 }
 
 function proofOptions(proof, nonce) {
@@ -162,6 +180,7 @@ export async function runWorkspaceWriteMatrix(ctx, fixture, filename) {
   let counter = 0;
   const payload = label => `${ctx.prefix}-${label}-${++counter}`;
   let current = null;
+  const passedPositives = new Set();
   ctx.report.workspaceWriteEvidence ||= [];
 
   async function positiveWrite(row) {
@@ -180,12 +199,13 @@ export async function runWorkspaceWriteMatrix(ctx, fixture, filename) {
       assert.notEqual(current, before, 'Positive control must change the fixture bytes');
       ctx.report.workspaceWriteEvidence.push({ id: row.id, status: response.status, sha256: current });
       passed = true;
+      passedPositives.add(row.id);
     });
     return passed;
   }
 
-  async function denial(row, dependsOn) {
-    if (!dependsOn) {
+  async function denial(row) {
+    if (!passedPositives.has(row.positiveControl)) {
       ctx.recordGap(row.id, 'positive-unavailable: the owning authorized write control did not change the fixture.', { kind: 'positive-unavailable' });
       return;
     }
@@ -208,34 +228,31 @@ export async function runWorkspaceWriteMatrix(ctx, fixture, filename) {
     });
   }
 
-  const ownerPositive = await positiveWrite(byId.get('router:workspace-upload-owner-positive:admin'));
-  for (const row of denials.filter(item => item.operation === 'sink-upload')) await denial(row, ownerPositive);
+  await positiveWrite(byId.get('router:workspace-upload-owner-positive:admin'));
+  for (const row of denials.filter(item => item.operation === 'sink-upload')) await denial(row);
   for (const selector of ['default', 'userPersistoAgent']) {
     await positiveWrite(byId.get(`router:workspace-upload-positive:userA:valid:${selector}`));
   }
-  const webchatControls = new Map();
-  webchatControls.set('upload', await positiveWrite(byId.get('router:webchat-upload-positive:admin')));
+  await positiveWrite(byId.get('router:webchat-upload-positive:admin'));
   const createRow = byId.get('router:webchat-directory-create-positive:admin');
-  webchatControls.set('directory-create', false);
   await ctx.check(createRow.id, async () => {
     const name = payload('directory-positive');
     const response = await ctx.request(createRow.actor, workspaceWriteRequest(createRow, fixture, name));
     assert.equal(response.status, 201, `Authorized directory creation must succeed; got ${response.status}`);
     assert.equal(response.json?.ok, true);
     assert.ok((await fs.stat(path.join(fixture.host, name))).isDirectory(), 'Authorized directory must exist');
-    webchatControls.set('directory-create', true);
+    passedPositives.add(createRow.id);
   });
-  for (const [operation, id] of [['directory-list', 'router:webchat-directory-list-positive:userA'], ['suggestions', 'router:webchat-suggestions-positive:userA']]) {
+  for (const id of ['router:webchat-directory-list-positive:userA', 'router:webchat-suggestions-positive:userA']) {
     const row = byId.get(id);
-    webchatControls.set(operation, false);
     await ctx.check(id, async () => {
       const response = await ctx.request(row.actor, workspaceWriteRequest(row, fixture, ''));
       assert.equal(response.status, 200, `Authorized read must succeed without a mutation proof; got ${response.status}`);
       assert.ok(response.text.includes('fixture.txt'), 'Authorized read must return the fixture entry');
-      webchatControls.set(operation, true);
+      passedPositives.add(id);
     });
   }
-  for (const row of denials.filter(item => item.operation !== 'sink-upload')) await denial(row, webchatControls.get(row.operation));
+  for (const row of denials.filter(item => item.operation !== 'sink-upload')) await denial(row);
 }
 
 async function runTerminalProbes(ctx, fixture) {

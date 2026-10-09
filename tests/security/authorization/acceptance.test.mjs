@@ -19,6 +19,7 @@ import { captureExitCode } from './acceptance/run-acceptance.mjs';
 import { runMarketplaceAdmissionProbes, runTemplateProbes, marketplaceProjection } from './boundary-probes.mjs';
 import { runWebchatProbes, dpuProcessInspector, DPU_UNSUPPORTED_REPLY, LIVE_INTERACTION_LIMITATION } from './webchat-probes.mjs';
 import { discoverAgentMcp } from './agent-probes.mjs';
+import { workspaceWriteMatrix, workspaceWriteCheckDefinitions } from './stream-probes.mjs';
 import { runCapabilityProbes, nonApplicableRecord } from './capability-probes.mjs';
 import { deriveCapabilities } from './acceptance/expected-runtime-graph.mjs';
 import { ackCount } from './webchat-probes.mjs';
@@ -883,4 +884,81 @@ test('DPU acknowledgement accumulates split SSE frames per stream without credit
     assert.equal(ackCount(stream([frame(DPU_UNSUPPORTED_REPLY.slice(0, half)), frame(DPU_UNSUPPORTED_REPLY.slice(half))])), 1);
     assert.equal(ackCount(stream([frame(DPU_UNSUPPORTED_REPLY.slice(0, half))])), 0, 'a partial reply is not an acknowledgement');
     assert.equal(ackCount(stream([frame(DPU_UNSUPPORTED_REPLY), { event: 'user-message', data: JSON.stringify({ message: { text: DPU_UNSUPPORTED_REPLY } }) }, frame(DPU_UNSUPPORTED_REPLY)])), 2);
+});
+
+test('Router workspace-write matrix: all 68 checks are mandatory, counted once and gated on the positive the runtime uses', () => {
+    const { positives, denials } = workspaceWriteMatrix();
+    const rows = [...positives, ...denials];
+    assert.equal(rows.length, 68);
+    assert.deepEqual(workspaceWriteCheckDefinitions().map(d => d.id), rows.map(r => r.id));
+    for (const row of rows) {
+        const entries = mandatory.checks.filter(c => c.id === row.id);
+        assert.equal(entries.length, 1, row.id);
+        assert.equal(entries[0].kind, 'live');
+        assert.equal(entries[0].count, 1, `${row.id} is recorded once per run`);
+        if (!row.positiveControl) { assert.equal(entries[0].positiveControlAnyOf, null, row.id); continue; }
+        assert.deepEqual(entries[0].positiveControlAnyOf, [row.positiveControl], row.id);
+        const positive = positives.find(p => p.id === row.positiveControl);
+        assert.ok(positive, `${row.id} names a real positive`);
+        assert.equal(positive.operation, row.operation, `${row.id}: the positive proves the same sink`);
+        assert.ok(['admin', 'userA'].includes(positive.actor), 'the positive is an entitled actor');
+    }
+    assert.equal(denials.filter(r => r.operation === 'sink-upload').every(r => r.positiveControl === 'router:workspace-upload-owner-positive:admin'), true);
+    assert.deepEqual({ live: mandatory.counts.live, offline: mandatory.counts.offline }, { live: 569, offline: 10 });
+});
+
+test('Router workspace-write matrix: no row can be satisfied as an expected gap, and an unavailable denial rejects twice', () => {
+    const { positives, denials } = workspaceWriteMatrix();
+    const rows = [...positives, ...denials];
+    for (const row of rows) {
+        const file = clone(expectedGaps);
+        file.gaps.find(g => g.id === 'agent.inference').id = row.id;
+        assert.ok(validateExpectedGaps(file, inputs).some(e => e.startsWith('GAP_FORBIDDEN_ID')), `${row.id} must be a forbidden gap identity`);
+    }
+    // The same identities stay forbidden for the legacy selector and fixture controls.
+    for (const id of ['router:workspace-file-selector-deny:anonymous:?agent=userPersistoAgent', 'router:workspace-file-fixture-positive:admin', 'router:workspace-upload-selector-deny:anonymous:0']) {
+        const file = clone(expectedGaps);
+        file.gaps.find(g => g.id === 'agent.inference').id = id;
+        assert.ok(validateExpectedGaps(file, inputs).some(e => e.startsWith('GAP_FORBIDDEN_ID')), id);
+    }
+    // A denial recorded as a positive-unavailable gap instead of a check is missing and unexpected.
+    const id = denials[0].id;
+    const run = acceptedRun();
+    run.report.checks = run.report.checks.filter(c => c.id !== id);
+    run.report.counts.PASS = run.report.checks.length;
+    run.report.gaps.push({ id, reason: 'positive-unavailable', evidence: { kind: 'positive-unavailable' } });
+    const result = evaluate(run);
+    assert.equal(result.decision, 'REJECT');
+    assert.ok(result.reasons.includes(`MANDATORY_MISSING: ${id}`));
+    assert.ok(result.reasons.includes(`GAP_UNEXPECTED: ${id}`));
+});
+
+test('Router workspace-write matrix: a failed or missing positive rejects the run and each dependent denial', () => {
+    const { denials } = workspaceWriteMatrix();
+    for (const positiveId of ['router:workspace-upload-owner-positive:admin', 'router:webchat-upload-positive:admin', 'router:webchat-directory-create-positive:admin', 'router:webchat-directory-list-positive:userA', 'router:webchat-suggestions-positive:userA']) {
+        const run = acceptedRun();
+        run.report.checks = run.report.checks.filter(c => c.id !== positiveId);
+        run.report.counts.PASS = run.report.checks.length;
+        const result = evaluate(run);
+        assert.equal(result.decision, 'REJECT', positiveId);
+        assert.ok(result.reasons.includes(`MANDATORY_MISSING: ${positiveId}`), positiveId);
+        for (const denial of denials.filter(d => d.positiveControl === positiveId)) {
+            assert.ok(result.reasons.includes(`MANDATORY_POSITIVE_CONTROL_FAILED: ${denial.id}`), `${denial.id} depends on ${positiveId}`);
+        }
+        const failed = acceptedRun();
+        failed.report.checks.find(c => c.id === positiveId).status = 'FAIL';
+        failed.report.counts = { PASS: failed.report.counts.PASS - 1, FAIL: 1, ERROR: 0 };
+        failed.report.verdict = 'FAIL'; failed.exitCode = 1;
+        expectReject(failed, 'MANDATORY_NOT_PASS', positiveId);
+    }
+    // One denial that FAILs rejects even when every positive control passed.
+    const run = acceptedRun();
+    run.report.checks.find(c => c.id === denials[7].id).status = 'FAIL';
+    run.report.counts = { PASS: run.report.counts.PASS - 1, FAIL: 1, ERROR: 0 };
+    run.report.verdict = 'FAIL'; run.exitCode = 1;
+    expectReject(run, 'MANDATORY_NOT_PASS', 'denied write that FAILed');
+    const duplicated = acceptedRun();
+    duplicated.report.checks.push({ id: denials[8].id, status: 'PASS' });
+    duplicated.report.counts.PASS += 1;
+    expectReject(duplicated, 'MANDATORY_DUPLICATE', 'denial recorded twice');
 });

@@ -18,6 +18,7 @@ import { agentProbes, agentReadTools, agentDiscoveryMethods } from '../agent-pro
 import { templateCheckDefinitions, marketplaceCheckDefinitions } from '../boundary-probes.mjs';
 import { webchatCheckDefinitions } from '../webchat-probes.mjs';
 import { capabilityCheckDefinitions } from '../capability-probes.mjs';
+import { workspaceWriteCheckDefinitions } from '../stream-probes.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 export const MANDATORY_FILE = path.join(here, 'mandatory-checks.json');
@@ -195,7 +196,7 @@ export function enumerateMandatoryChecks({ expectedRuntimes, expectedGaps }) {
     for (const [module, template, expansions, positives] of INLINE_TEMPLATES) {
         for (const values of expansions) add(expandTemplate(template, values), { boundary: module.replace('-probes.mjs', ''), source: `tests/security/authorization/${module}`, positiveControlAnyOf: positives });
     }
-    for (const definition of [...templateCheckDefinitions(), ...marketplaceCheckDefinitions(), ...webchatCheckDefinitions(), ...capabilityCheckDefinitions(capabilities)]) add(definition.id, definition);
+    for (const definition of [...templateCheckDefinitions(), ...marketplaceCheckDefinitions(), ...webchatCheckDefinitions(), ...capabilityCheckDefinitions(capabilities), ...workspaceWriteCheckDefinitions()]) add(definition.id, definition);
     for (const offline of OFFLINE) add(`offline:${offline.repo}:${offline.file}`, { kind: 'offline', boundary: offline.boundary, repo: offline.repo, file: offline.file, tests: offline.tests, source: 'plan rev3 mandatory-check table (unchanged in rev4)' });
 
     const list = [...checks.values()].sort((a, b) => a.id.localeCompare(b.id));

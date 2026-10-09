@@ -11,7 +11,7 @@
     }
   ],
   "counts": {
-    "live": 501,
+    "live": 569,
     "offline": 10
   },
   "checks": [
@@ -4263,6 +4263,398 @@
       "source": "tests/security/authorization/router-probes.mjs routerProbes"
     },
     {
+      "id": "router:webchat-directory-create-deny:anonymous:default",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-directory-create-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-directory-create-deny:anonymous:webAssist",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-directory-create-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-directory-create-deny:anonymous:webmeetAgent",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-directory-create-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-directory-create-deny:selfRegistered:default",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-directory-create-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-directory-create-deny:selfRegistered:webAssist",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-directory-create-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-directory-create-deny:selfRegistered:webmeetAgent",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-directory-create-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-directory-create-deny:userA:absent:default",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-directory-create-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-directory-create-deny:userA:absent:webAssist",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-directory-create-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-directory-create-deny:userA:absent:webmeetAgent",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-directory-create-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-directory-create-deny:userA:invalid:default",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-directory-create-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-directory-create-deny:userA:invalid:webAssist",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-directory-create-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-directory-create-deny:userA:invalid:webmeetAgent",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-directory-create-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-directory-create-positive:admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-directory-list-deny:anonymous:default",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-directory-list-positive:userA"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-directory-list-deny:anonymous:webAssist",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-directory-list-positive:userA"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-directory-list-deny:anonymous:webmeetAgent",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-directory-list-positive:userA"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-directory-list-deny:selfRegistered:default",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-directory-list-positive:userA"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-directory-list-deny:selfRegistered:webAssist",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-directory-list-positive:userA"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-directory-list-deny:selfRegistered:webmeetAgent",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-directory-list-positive:userA"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-directory-list-positive:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-suggestions-deny:anonymous:default",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-suggestions-positive:userA"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-suggestions-deny:anonymous:webAssist",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-suggestions-positive:userA"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-suggestions-deny:anonymous:webmeetAgent",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-suggestions-positive:userA"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-suggestions-deny:selfRegistered:default",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-suggestions-positive:userA"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-suggestions-deny:selfRegistered:webAssist",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-suggestions-positive:userA"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-suggestions-deny:selfRegistered:webmeetAgent",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-suggestions-positive:userA"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-suggestions-positive:userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-upload-deny:anonymous:default",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-upload-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-upload-deny:anonymous:webAssist",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-upload-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-upload-deny:anonymous:webmeetAgent",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-upload-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-upload-deny:selfRegistered:default",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-upload-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-upload-deny:selfRegistered:webAssist",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-upload-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-upload-deny:selfRegistered:webmeetAgent",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-upload-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-upload-deny:userA:absent:default",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-upload-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-upload-deny:userA:absent:webAssist",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-upload-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-upload-deny:userA:absent:webmeetAgent",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-upload-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-upload-deny:userA:invalid:default",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-upload-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-upload-deny:userA:invalid:webAssist",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-upload-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-upload-deny:userA:invalid:webmeetAgent",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:webchat-upload-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:webchat-upload-positive:admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
       "id": "router:webtty-ui.allow:admin",
       "kind": "live",
       "count": 1,
@@ -4405,6 +4797,280 @@
       ],
       "boundary": "stream",
       "source": "tests/security/authorization/stream-probes.mjs"
+    },
+    {
+      "id": "router:workspace-upload-deny:anonymous:absent:authorization-suite-nonexistent",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:workspace-upload-owner-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:workspace-upload-deny:anonymous:absent:default",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:workspace-upload-owner-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:workspace-upload-deny:anonymous:absent:userPersistoAgent",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:workspace-upload-owner-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:workspace-upload-deny:anonymous:absent:webAssist",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:workspace-upload-owner-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:workspace-upload-deny:anonymous:absent:webmeetAgent",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:workspace-upload-owner-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:workspace-upload-deny:selfRegistered:absent:authorization-suite-nonexistent",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:workspace-upload-owner-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:workspace-upload-deny:selfRegistered:absent:default",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:workspace-upload-owner-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:workspace-upload-deny:selfRegistered:absent:userPersistoAgent",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:workspace-upload-owner-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:workspace-upload-deny:selfRegistered:absent:webAssist",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:workspace-upload-owner-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:workspace-upload-deny:selfRegistered:absent:webmeetAgent",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:workspace-upload-owner-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:workspace-upload-deny:selfRegistered:valid:authorization-suite-nonexistent",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:workspace-upload-owner-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:workspace-upload-deny:selfRegistered:valid:default",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:workspace-upload-owner-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:workspace-upload-deny:selfRegistered:valid:userPersistoAgent",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:workspace-upload-owner-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:workspace-upload-deny:selfRegistered:valid:webAssist",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:workspace-upload-owner-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:workspace-upload-deny:selfRegistered:valid:webmeetAgent",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:workspace-upload-owner-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:workspace-upload-deny:userA:absent:authorization-suite-nonexistent",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:workspace-upload-owner-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:workspace-upload-deny:userA:absent:default",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:workspace-upload-owner-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:workspace-upload-deny:userA:absent:userPersistoAgent",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:workspace-upload-owner-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:workspace-upload-deny:userA:absent:webAssist",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:workspace-upload-owner-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:workspace-upload-deny:userA:absent:webmeetAgent",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:workspace-upload-owner-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:workspace-upload-deny:userA:invalid:authorization-suite-nonexistent",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:workspace-upload-owner-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:workspace-upload-deny:userA:invalid:default",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:workspace-upload-owner-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:workspace-upload-deny:userA:invalid:userPersistoAgent",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:workspace-upload-owner-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:workspace-upload-deny:userA:invalid:webAssist",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:workspace-upload-owner-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:workspace-upload-deny:userA:invalid:webmeetAgent",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "router:workspace-upload-owner-positive:admin"
+      ],
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:workspace-upload-owner-positive:admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:workspace-upload-positive:userA:valid:default",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
+    },
+    {
+      "id": "router:workspace-upload-positive:userA:valid:userPersistoAgent",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "source": "tests/security/authorization/stream-probes.mjs workspaceWriteMatrix"
     },
     {
       "id": "sessions.logout-cookie-replay",
