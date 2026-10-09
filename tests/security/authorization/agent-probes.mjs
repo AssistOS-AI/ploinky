@@ -638,16 +638,37 @@ export function webAssistGuestCheckDefinitions() {
 }
 
 /**
- * The tool input schemas that carry the session secret: sessionSecret is declared,
- * optional and a string on web_cli_chat and web_cli_history. If it were undeclared,
- * the AgentServer and Router argument canonicalization would drop it (the secret
- * would never arrive), so the declaration is pinned from the live tools/list.
+ * The tool input schemas that carry the session secret, in exactly the encoding the
+ * live tools/list shows: JSON Schema with properties.sessionSecret { type: 'string' },
+ * the secret absent from `required`, `required` equal to the listed names, and
+ * additionalProperties false. If sessionSecret were undeclared, the AgentServer schema
+ * and the Router argument canonicalization would drop it (the secret would never arrive).
  */
-export function sessionSecretDeclared(inputSchema) {
-    const property = inputSchema?.properties?.sessionSecret ?? inputSchema?.sessionSecret;
+export const SESSION_SECRET_REQUIRED = Object.freeze({ web_cli_chat: ['siteId', 'message'], web_cli_history: ['siteId', 'sessionId'] });
+export function sessionSecretDeclared(inputSchema, requiredNames) {
+    if (!inputSchema || typeof inputSchema !== 'object' || inputSchema.additionalProperties !== false) return false;
+    const property = inputSchema.properties?.sessionSecret;
     if (!property || property.type !== 'string') return false;
-    const required = Array.isArray(inputSchema?.required) && inputSchema.required.includes('sessionSecret');
-    return !required && property.optional !== false;
+    const required = Array.isArray(inputSchema.required) ? inputSchema.required : [];
+    if (required.includes('sessionSecret')) return false;
+    return JSON.stringify([...required].sort()) === JSON.stringify([...requiredNames].sort());
+}
+
+/** A history read is a normal (non-error) MCP result whose first text block is the JSON result. */
+export function historyResultOf(result) {
+    assert.equal(result.response.status, 200, 'history read answers HTTP 200');
+    assert.equal(result.response.json?.error, undefined, 'history read is not a JSON-RPC error');
+    const rpcResult = result.response.json?.result;
+    assert.ok(rpcResult && rpcResult.isError !== true, 'history read is not an MCP error result (errors are for a missing grant, invalid input or storage failure)');
+    const block = (rpcResult.content || []).find((entry) => entry?.type === 'text');
+    assert.ok(block, 'history read carries a text block');
+    let value;
+    try { value = JSON.parse(block.text); } catch { assert.fail('history read text is not JSON'); }
+    requireObject(value);
+    assert.deepEqual(Object.keys(value).sort(), ['exists', 'history', 'sessionId', 'sessionKuId', 'siteId'], 'history result has exactly the contract keys');
+    assert.equal(typeof value.exists, 'boolean');
+    assert.ok(Array.isArray(value.history));
+    return value;
 }
 
 /**
@@ -684,7 +705,7 @@ export async function webAssistGuestProbes(ctx, mcp, { createSession = ctx.webAs
         for (const name of WEBASSIST_SESSION_SECRET_TOOLS) {
             const tool = (listed.value?.tools || []).find((entry) => entry.name === name);
             assert.ok(tool, `${name} is listed`);
-            assert.ok(sessionSecretDeclared(tool.inputSchema), `${name} must declare an optional string sessionSecret (an undeclared argument is dropped before the tool runs)`);
+            assert.ok(sessionSecretDeclared(tool.inputSchema, SESSION_SECRET_REQUIRED[name]), `${name} must declare an optional string sessionSecret in the live encoding (an undeclared argument is dropped before the tool runs)`);
         }
     });
 
@@ -720,17 +741,19 @@ export async function webAssistGuestProbes(ctx, mcp, { createSession = ctx.webAs
     const wholeResponse = (result) => JSON.stringify([result.value, result.response.json, result.response.text]);
     const assertMissing = (result, victim) => {
         assert.ok(!wholeResponse(result).includes(victim.marker), 'One anonymous visitor read another visitor\'s chat history');
-        assert.ok(result.success, 'A non-owner receives the missing-session shape, not an error');
-        assert.equal(result.value?.exists, false, 'Another visitor\'s session must read as missing');
-        assert.deepEqual(result.value?.history, [], 'Another visitor\'s history must be empty');
+        const value = historyResultOf(result);
+        assert.equal(value.exists, false, 'Another visitor\'s session must read as missing');
+        assert.deepEqual(value.history, [], 'Another visitor\'s history must be empty');
+        assert.equal(value.sessionId, victim.sessionId);
     };
     await ctx.check(WEBASSIST_IDS.own, async () => {
         needFixture();
         for (const [reader, fixture] of [['anonymous', sessions.anonymous], ['anonymousB', sessions.anonymousB]]) {
             const result = await history(reader, fixture);
-            assert.ok(result.success && result.value?.exists === true, 'Each visitor reads its own seeded session');
-            assert.ok(Array.isArray(result.value.history) && JSON.stringify(result.value.history).includes(fixture.marker), 'Each visitor\'s own history carries its marker');
-            assert.equal(JSON.stringify(result.value).includes(fixture.secret), false, 'The session secret is never returned by a history read');
+            const value = historyResultOf(result);
+            assert.equal(value.exists, true, 'Each visitor reads its own seeded session');
+            assert.ok(JSON.stringify(value.history).includes(fixture.marker), 'Each visitor\'s own history carries its marker');
+            assert.equal(wholeResponse(result).includes(fixture.secret), false, 'The session secret is never returned by a history read');
         }
     });
     await ctx.check(WEBASSIST_IDS.cross, async () => {
@@ -750,9 +773,10 @@ export async function webAssistGuestProbes(ctx, mcp, { createSession = ctx.webAs
         needFixture();
         // The secret travels Router -> AgentServer schema -> webAssist: only then can a different principal read.
         const result = await history('anonymousB', sessions.anonymous, { sessionSecret: sessions.anonymous.secret });
-        assert.ok(result.success && result.value?.exists === true, 'A different principal presenting the correct secret reads the session');
-        assert.ok(JSON.stringify(result.value.history).includes(sessions.anonymous.marker), 'The correct secret returns the marker turn');
-        assert.equal(JSON.stringify(result.value).includes(sessions.anonymous.secret), false, 'The secret is not echoed');
+        const value = historyResultOf(result);
+        assert.equal(value.exists, true, 'A different principal presenting the correct secret reads the session');
+        assert.ok(JSON.stringify(value.history).includes(sessions.anonymous.marker), 'The correct secret returns the marker turn');
+        assert.equal(wholeResponse(result).includes(sessions.anonymous.secret), false, 'The secret is not echoed');
     });
 }
 

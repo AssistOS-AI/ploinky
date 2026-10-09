@@ -8,6 +8,12 @@
  * marker turn (through the AgenticKnowledgeUnits library, which takes its own root and
  * per-unit locks) and the session-owner record.
  *
+ * Locking: the knowledge-unit writes go through the library, which takes its own AKU
+ * root and per-unit locks. The owner record is a plain exclusive file write, as in the
+ * product (no AKU lock). The site is run-owned and history-only: the fixture creates
+ * `session-owners` as the host user, so a chat that tried to add a session to this site
+ * from a container with another uid could not write there; nothing chats into it.
+ *
  * The owner record is written from the data-structure contract, independently of the
  * product code, so format drift is caught by the live read:
  *
@@ -31,6 +37,19 @@ export const GUEST_COOKIE = 'ploinky_guest';
 const GUEST_SUBJECT = /^user:guest:[A-Za-z0-9-]{1,128}$/;
 const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const SITE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+/** The site-id normalization the product applies (webAssist normalizeSiteId), restated so the run-owned id can be proven stable under it. */
+export const normalizeSiteIdLike = value => String(value).trim().replace(/[^A-Za-z0-9._-]/g, '-').replace(/-+/g, '-').replace(/^[-.]+|[-.]+$/g, '');
+
+/** Run-owned site id derived from the run id; it must survive the product's normalization unchanged. */
+export function runOwnedSiteId(runId) {
+  const tail = String(runId).replace(/^authz-/, '').replace(/[^A-Za-z0-9._-]/g, '-').replace(/-+/g, '-').replace(/^[-.]+|[-.]+$/g, '');
+  const siteId = `a7-webassist-${tail}`;
+  assert.match(siteId, SITE_ID, 'The run-owned site id is valid');
+  assert.equal(normalizeSiteIdLike(siteId), siteId, 'The run-owned site id must be unchanged by site-id normalization');
+  assert.ok(!siteId.includes('--') && !/[-.]$/.test(siteId) && !siteId.includes(':'), 'The run-owned site id has no doubled, trailing or illegal separator');
+  return siteId;
+}
 
 /** The persistent storage root of the webAssist agent: <workspace>/.data/<persistentStorage.key>. */
 export function webAssistPersistentRoot(workspace) {
@@ -72,8 +91,7 @@ export function createWebAssistSessionFactory(ctx, {
   async function armAndPrepare() {
     if (state.armed) return;
     const root = webAssistPersistentRoot(String(await workspace()));
-    state.siteId = `a7-webassist-${String(runId).replace(/^authz-/, '').replace(/[^A-Za-z0-9._-]/g, '-')}`;
-    assert.match(state.siteId, SITE_ID, 'The run-owned site id is valid');
+    state.siteId = runOwnedSiteId(runId);
     state.dataDir = path.join(root, 'data');
     state.sitesDir = path.join(state.dataDir, 'sites');
     state.siteDir = path.join(state.sitesDir, state.siteId);

@@ -7,7 +7,7 @@ import { existsSync, readdirSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { GUEST_COOKIE, createWebAssistSessionFactory, guestSubjectFromJar, secretHashOf, webAssistPersistentRoot } from './webassist-fixture.mjs';
+import { GUEST_COOKIE, createWebAssistSessionFactory, guestSubjectFromJar, normalizeSiteIdLike, runOwnedSiteId, secretHashOf, webAssistPersistentRoot } from './webassist-fixture.mjs';
 
 const b64 = value => Buffer.from(JSON.stringify(value)).toString('base64url');
 const SUB_A = 'user:guest:11111111-1111-4111-8111-111111111111';
@@ -215,4 +215,16 @@ test('writes go through the library in lock-taking order and cleanup refuses a s
   await fs.symlink(outside, site(root));
   await assert.rejects(runCleanups(ctx), /changed identity/);
   assert.equal(await fs.readFile(path.join(outside, 'x'), 'utf8'), 'x');
+});
+
+test('the run-owned site id is unchanged by the product\'s site-id normalization', () => {
+  assert.equal(runOwnedSiteId('authz-mv06vyr0-d5edb7b7'), 'a7-webassist-mv06vyr0-d5edb7b7');
+  for (const runId of ['authz-a:b--c-', 'authz--x--', 'authz-.hidden.', 'plain run id']) {
+    const id = runOwnedSiteId(runId);
+    assert.equal(normalizeSiteIdLike(id), id, runId);
+    assert.ok(!id.includes('--') && !id.includes(':') && !/[-.]$/.test(id), runId);
+  }
+  assert.equal(normalizeSiteIdLike('A--b:c-.'), 'A-b-c');
+  // A run id with nothing usable would end the id in a separator that normalization strips: refused, never silently changed.
+  assert.throws(() => runOwnedSiteId('authz-ü-é'), /unchanged by site-id normalization/);
 });

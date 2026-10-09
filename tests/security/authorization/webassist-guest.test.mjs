@@ -5,18 +5,24 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { decodeAgentMcp, sessionSecretDeclared, webAssistGuestCheckDefinitions, webAssistGuestProbes } from './agent-probes.mjs';
+import { SESSION_SECRET_REQUIRED, decodeAgentMcp, historyResultOf, sessionSecretDeclared, webAssistGuestCheckDefinitions, webAssistGuestProbes } from './agent-probes.mjs';
 import { WEBASSIST_SESSION_SECRET_TOOLS } from './guest-agent-policy.mjs';
+import { assertAgentMcpDenied } from './agent-probes.mjs';
 
 const text = value => ({ status: 200, headers: {}, json: { result: { content: [{ type: 'text', text: JSON.stringify(value) }] } } });
 const denied = message => decodeAgentMcp({ status: 200, headers: {}, json: { result: { isError: true, content: [{ type: 'text', text: message }] } } });
-const schemaFor = mode => {
-  const base = { type: 'object', properties: { siteId: { type: 'string' }, sessionId: { type: 'string' } }, required: ['siteId', 'sessionId'] };
+// The live encoding: JSON Schema, sessionSecret { type: 'string' }, required = the listed names, additionalProperties false.
+const schemaFor = (mode, tool = 'web_cli_history') => {
+  const required = [...SESSION_SECRET_REQUIRED[tool]];
+  const base = { type: 'object', properties: Object.fromEntries([...required, ...(tool === 'web_cli_chat' ? ['sessionId'] : [])].map(name => [name, { type: 'string' }])), required, additionalProperties: false };
   if (mode === 'declared') base.properties.sessionSecret = { type: 'string' };
   if (mode === 'required') { base.properties.sessionSecret = { type: 'string' }; base.required.push('sessionSecret'); }
   if (mode === 'number') base.properties.sessionSecret = { type: 'number' };
+  if (mode === 'open') { base.properties.sessionSecret = { type: 'string' }; base.additionalProperties = true; }
+  if (mode === 'wrongRequired') { base.properties.sessionSecret = { type: 'string' }; base.required = ['siteId']; }
   return base;
 };
+const DENIAL = 'MCP error -32603: Access denied: Explorer access is required to list webAssist sites.';
 
 /** Contract model of webAssist behind the guest route. `defect` selects one deviation. */
 function productModel({ defect = '', listSites = 'denied', schema = 'declared', schemaTool = '' } = {}) {
@@ -25,12 +31,12 @@ function productModel({ defect = '', listSites = 'denied', schema = 'declared', 
     assert.equal(agent, 'webAssist');
     if (method === 'tools/list') {
       const tools = ['list-sites', 'register-events', 'web_cli_chat', 'web_cli_history']
-        .map(name => ({ name, inputSchema: WEBASSIST_SESSION_SECRET_TOOLS.includes(name) && name !== schemaTool ? schemaFor(schema) : schemaFor('declared') }));
+        .map(name => ({ name, inputSchema: WEBASSIST_SESSION_SECRET_TOOLS.includes(name) ? schemaFor(name === schemaTool || !schemaTool ? schema : 'declared', name) : { type: 'object', properties: {}, additionalProperties: false } }));
       return decodeAgentMcp({ status: 200, headers: {}, json: { result: { tools } } });
     }
     assert.equal(params.name, 'list-sites');
     if (actor === 'anonymous') {
-      if (listSites === 'denied') return denied('Access denied: Explorer access is required to list webAssist sites.');
+      if (listSites === 'denied') return denied(DENIAL);
       if (listSites === 'broken') return denied('ENOENT: no such file or directory, scandir sites');
     }
     return decodeAgentMcp({ status: 200, headers: {}, json: { result: { content: [{ type: 'text', text: JSON.stringify(actor === 'admin' && defect === 'dataRoot' ? { sites: [], count: 0, dataRoot: '/workspace/webassist-data/data' } : { sites: ['site-a'], count: 1 }) }] } } });
@@ -55,7 +61,7 @@ function productModel({ defect = '', listSites = 'denied', schema = 'declared', 
       if (defect === 'foreignEmptyExists') return { ...missing, exists: true };
       return missing;
     }
-    return { siteId, sessionId, exists: true, sessionKuId: `ku_sess_${sessionId}`, history: turns, ...(defect === 'echoSecret' ? { echoed: record.secret } : {}) };
+    return { siteId, sessionId, exists: true, sessionKuId: `ku_sess_${sessionId}`, history: turns, ...(defect === 'echoSecret' ? { echoed: record.secret } : {}), ...(defect === 'extraKey' ? { success: true } : {}) };
   };
   const request = async (actor, { method, body }) => {
     if (body?.method === 'initialize') return { status: 200, headers: { 'mcp-session-id': `mcp-${actor}` }, json: { result: { protocolVersion: '2025-06-18' } }, text: '' };
@@ -118,15 +124,36 @@ test('list-sites: a leak, a non-authorization failure, a disclosed data root or 
   assert.deepEqual(failed(await run({ defect: 'dataRoot' })), ['agent.webAssist.admin.list-sites-positive']);
 });
 
-test('sessionSecret must be a declared, optional string on both tools', async () => {
-  assert.equal(sessionSecretDeclared(schemaFor('declared')), true);
-  for (const mode of ['missing', 'required', 'number']) assert.equal(sessionSecretDeclared(schemaFor(mode)), false, mode);
-  assert.equal(sessionSecretDeclared({ sessionSecret: { type: 'string', optional: true } }), true);
-  assert.equal(sessionSecretDeclared({ sessionSecret: { type: 'string', optional: false } }), false);
-  assert.equal(sessionSecretDeclared(undefined), false);
-  for (const schema of ['missing', 'required', 'number']) assert.deepEqual(failed(await run({ schema })), ['agent.webAssist.admin.session-secret-schema'], schema);
+test('sessionSecret must be a declared, optional string in exactly the live encoding on both tools', async () => {
+  for (const tool of WEBASSIST_SESSION_SECRET_TOOLS) {
+    assert.equal(sessionSecretDeclared(schemaFor('declared', tool), SESSION_SECRET_REQUIRED[tool]), true, tool);
+    for (const mode of ['missing', 'required', 'number', 'open', 'wrongRequired']) assert.equal(sessionSecretDeclared(schemaFor(mode, tool), SESSION_SECRET_REQUIRED[tool]), false, `${tool} ${mode}`);
+  }
+  assert.deepEqual(SESSION_SECRET_REQUIRED, { web_cli_chat: ['siteId', 'message'], web_cli_history: ['siteId', 'sessionId'] });
+  assert.equal(sessionSecretDeclared({ sessionSecret: { type: 'string' } }, []), false, 'the old flat encoding is not the live one');
+  assert.equal(sessionSecretDeclared(undefined, []), false);
+  for (const schema of ['missing', 'required', 'number', 'open', 'wrongRequired']) assert.deepEqual(failed(await run({ schema })), ['agent.webAssist.admin.session-secret-schema'], schema);
   // One tool without the declaration is enough to fail.
   for (const schemaTool of WEBASSIST_SESSION_SECRET_TOOLS) assert.deepEqual(failed(await run({ schema: 'missing', schemaTool })), ['agent.webAssist.admin.session-secret-schema'], schemaTool);
+});
+
+test('the guest list-sites refusal text the AgentServer produces satisfies the denial matcher', () => {
+  assert.doesNotThrow(() => assertAgentMcpDenied(denied(DENIAL)));
+  assert.throws(() => assertAgentMcpDenied(denied('MCP error -32603: ENOENT: no such file or directory')));
+});
+
+test('a history read is a non-error MCP result with exactly the contract keys', () => {
+  const result = value => ({ response: { status: 200, json: { result: { content: [{ type: 'text', text: JSON.stringify(value) }] } } } });
+  const shape = { siteId: 's', sessionId: 'x', exists: false, sessionKuId: 'ku_sess_x', history: [] };
+  assert.deepEqual(historyResultOf(result(shape)), shape);
+  assert.throws(() => historyResultOf(result({ ...shape, success: true })), /exactly the contract keys/);
+  const { sessionKuId, ...partial } = shape;
+  assert.throws(() => historyResultOf(result(partial)), /exactly the contract keys/);
+  assert.throws(() => historyResultOf({ response: { status: 200, json: { result: { isError: true, content: [{ type: 'text', text: JSON.stringify(shape) }] } } } }), /not an MCP error result/);
+  assert.throws(() => historyResultOf({ response: { status: 200, json: { error: { message: 'x' } } } }), /JSON-RPC error/);
+  assert.throws(() => historyResultOf({ response: { status: 500, json: {} } }), /HTTP 200/);
+  assert.throws(() => historyResultOf({ response: { status: 200, json: { result: { content: [{ type: 'text', text: 'not json' }] } } } }), /not JSON/);
+  assert.throws(() => historyResultOf(result({ ...shape, exists: 'no' })));
 });
 
 test('a session secret that never reaches webAssist fails the correct-secret positive only', async () => {
@@ -184,6 +211,7 @@ test('each way a product can get the secret or owner contract wrong fails exactl
     ['secretExistsFalse', ['secret-positive']],
     ['ownEmptyHistory', ['own-positive']],
     ['leakToFirstJar', ['cross-read']],
+    ['extraKey', ['own-positive']],
   ];
   for (const [defect, expected] of cases) {
     const got = failed(await run({ defect }));
