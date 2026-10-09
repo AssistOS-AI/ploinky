@@ -300,10 +300,10 @@ export function assertAgentMcpDenied(result) {
 
 /**
  * Anonymous discovery on an agent whose own manifest selects guest
- * authentication (cli/utils/manifestAuth.js:20-21; expected-runtimes.json
+ * authentication (cli/utils/manifestAuth.js:21; expected-runtimes.json
  * `guestAgents`, derived from the pinned manifests). The Router answers an
  * anonymous visitor on such a route with a minted guest session
- * (cli/server/authHandlers/authContext.js:1028-1066), so a successful list is the
+ * (cli/server/authHandlers/authContext.js:1028-1078), so a successful list is the
  * declared contract, not a denial bypass. Three things keep it from being a bare
  * HTTP 200: the visitor must hold a guest-session cookie (a mode-none route mints
  * none), the list must be a valid named list, and it must equal the

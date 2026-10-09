@@ -143,9 +143,9 @@ export function deriveExpectedRuntimes({ policy, source }) {
     const disabledList = all.filter(a => !enabled.has(identity(a.repo, a.agent))).sort(byIdentity);
     const capabilities = deriveCapabilities({ policy, source, enabled });
     // Enabled agents whose own manifest selects guest authentication
-    // (cli/utils/manifestAuth.js:20-21): the Router mints a guest session for
+    // (cli/utils/manifestAuth.js:21): the Router mints a guest session for
     // an anonymous visitor on their routes instead of refusing it
-    // (cli/server/authHandlers/authContext.js:1028-1066). The set is derived
+    // (cli/server/authHandlers/authContext.js:1028-1078). The set is derived
     // from the pinned manifests, never listed by hand.
     const guestAgents = enabledList.filter(a => resolveManifestAuthMode(source.readManifest(a.repo, a.agent)) === 'guest').map(({ repo, agent }) => ({ repo, agent }));
     return {

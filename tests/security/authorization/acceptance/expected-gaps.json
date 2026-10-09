@@ -833,7 +833,7 @@
       "id": "agent.webAssist.discovery.tools.list.selfRegistered.scope",
       "category": "protocol-combination-outside-changed-paths",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:460 (selfRegistered discovery on a guest-authentication agent); cli/utils/manifestAuth.js:21 (manifest guest:true selects guest authentication); cli/server/authHandlers/authContext.js:1028-1066 (guest-mode route admits an SSO or anonymous visitor)",
+      "source": "tests/security/authorization/agent-probes.mjs:460 (selfRegistered discovery on a guest-authentication agent); cli/utils/manifestAuth.js:21 (manifest guest:true selects guest authentication); cli/server/authHandlers/authContext.js:1028-1078 (guest-mode route admits an SSO or anonymous visitor)",
       "reason": "AchillesIDE/webAssist declares guest authentication, so its MCP tools/list is visible to every visitor including selfRegistered. The exact runtime tool names are reviewed here; tool calls, resource reads and room data stay behind their own mandatory authorization checks.",
       "affectedObligations": [
         "router/agent-mcp.post"
@@ -859,7 +859,7 @@
       "id": "agent.webmeetAgent.discovery.tools.list.selfRegistered.scope",
       "category": "protocol-combination-outside-changed-paths",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:460 (selfRegistered discovery on a guest-authentication agent); cli/utils/manifestAuth.js:21 (manifest guest:true selects guest authentication); cli/server/authHandlers/authContext.js:1028-1066 (guest-mode route admits an SSO or anonymous visitor)",
+      "source": "tests/security/authorization/agent-probes.mjs:460 (selfRegistered discovery on a guest-authentication agent); cli/utils/manifestAuth.js:21 (manifest guest:true selects guest authentication); cli/server/authHandlers/authContext.js:1028-1078 (guest-mode route admits an SSO or anonymous visitor)",
       "reason": "AchillesIDE/webmeetAgent declares guest authentication, so its MCP tools/list is visible to every visitor including selfRegistered. The exact runtime tool names are reviewed here; tool calls, resource reads and room data stay behind their own mandatory authorization checks.",
       "affectedObligations": [
         "router/agent-mcp.post"
