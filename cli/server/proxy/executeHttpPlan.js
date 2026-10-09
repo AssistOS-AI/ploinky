@@ -99,7 +99,7 @@ function cookieValue(cookieHeader, name) {
 export function assertMutationAllowed(req, plan) {
     const method = String(req.method || plan.method || 'GET').toUpperCase();
     if (READ_ONLY.has(method)) return true;
-    const hasRouterCookie = /(?:^|;\s*)ploinky_(?:sso|jwt|guest)=/.test(String(req.headers?.cookie || ''));
+    const hasRouterCookie = /(?:^|;\s*)ploinky_(?:sso|jwt|guest[A-Za-z0-9_-]*)=/.test(String(req.headers?.cookie || ''));
     if (!hasRouterCookie) return true;
     if (String(req.headers?.origin || '') !== String(plan.origin)) {
         const error = new Error('proxy: mutation origin rejected');

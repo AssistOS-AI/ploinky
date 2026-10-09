@@ -1,3 +1,5 @@
+import { isGuestCookieName } from '../auth/guestCookieNames.js';
+
 const HOP_BY_HOP = new Set([
     'connection',
     'keep-alive',
@@ -62,7 +64,9 @@ function sanitizeCookie(value) {
 
 export function isRouterCookie(name) {
     const unprefixed = String(name || '').replace(/^__Host-/, '');
-    return ROUTER_COOKIES.has(unprefixed) || unprefixed.startsWith('ploinky_sso_login_');
+    return ROUTER_COOKIES.has(unprefixed)
+        || unprefixed.startsWith('ploinky_sso_login_')
+        || isGuestCookieName(unprefixed);
 }
 
 export function sanitizeRequestHeaders(headers, plan, trusted = {}) {

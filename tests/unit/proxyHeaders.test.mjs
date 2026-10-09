@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { stripRouterIdentityHeaders } from '../../cli/server/routerHandlers.js';
-import { sanitizeRequestHeaders } from '../../cli/server/proxy/sanitizeRequestHeaders.js';
+import { isRouterCookie, sanitizeRequestHeaders } from '../../cli/server/proxy/sanitizeRequestHeaders.js';
 import { sanitizeResponseHeaders } from '../../cli/server/proxy/sanitizeResponseHeaders.js';
 
 const plan = {
@@ -24,7 +24,7 @@ test('request headers preserve permitted app credentials but remove Router prove
     const headers = sanitizeRequestHeaders({
         host: 'attacker.example',
         authorization: 'Bearer app-token',
-        cookie: 'theme=dark; ploinky_sso=router; ploinky_csrf=secret; app=ok',
+        cookie: 'theme=dark; ploinky_sso=router; ploinky_csrf=secret; ploinky_guest_ncGyyzpdIxmPjORN_wQfqv=guest; ploinky_guest=legacy; app=ok',
         forwarded: 'for=attacker',
         'x-forwarded-host': 'attacker.example',
         'x-ploinky-machine-assertion': 'spoof',
@@ -41,6 +41,32 @@ test('request headers preserve permitted app credentials but remove Router prove
     assert.equal(headers['x-ploinky-machine-assertion'], undefined);
     assert.equal(headers['x-ploinky-agent-startup-probe'], undefined);
     assert.equal(headers['x-remove-me'], undefined);
+});
+
+test('request and response sanitizing removes every guest session cookie name', () => {
+    const headers = sanitizeRequestHeaders({
+        cookie: 'theme=dark; ploinky_guest_ncGyyzpdIxmPjORN_wQfqv=a; ploinky_guest=b; __Host-ploinky_guest_x=c; app=ok',
+    }, plan, {});
+    assert.equal(headers.cookie, 'theme=dark; app=ok');
+    const guestOnly = sanitizeRequestHeaders({
+        cookie: 'ploinky_guest_iw2P_FBNZBzQ_b5bTDMOLe=a; ploinky_guest=b',
+    }, plan, {});
+    assert.equal(guestOnly.cookie, undefined);
+    const response = sanitizeResponseHeaders({
+        'set-cookie': [
+            'app=ok; Path=/',
+            'ploinky_guest_iw2P_FBNZBzQ_b5bTDMOLe=x; Path=/',
+            'ploinky_guest=y; Path=/',
+            '__Host-ploinky_guest_ncGyyzpdIxmPjORN_wQfqv=z; Path=/; Secure',
+        ],
+    }, plan);
+    assert.deepEqual(response['set-cookie'], ['app=ok; Path=/']);
+    for (const name of ['ploinky_guest', 'ploinky_guest_ncGyyzpdIxmPjORN_wQfqv', '__Host-ploinky_guest_ab', 'ploinky_guestanything']) {
+        assert.equal(isRouterCookie(name), true, name);
+    }
+    for (const name of ['app', 'ploinky', 'xploinky_guest', 'guest']) {
+        assert.equal(isRouterCookie(name), false, name);
+    }
 });
 
 test('ordinary agent-root forwarding strips the reserved startup probe header', () => {
@@ -61,7 +87,7 @@ test('ordinary agent-root forwarding strips the reserved startup probe header', 
 test('response headers suppress private topology, Router cookies, unsolicited CORS, and caching', () => {
     const headers = sanitizeResponseHeaders({
         location: 'http://127.0.0.1:7000/private',
-        'set-cookie': ['app=ok; Path=/', 'ploinky_jwt=bad; Path=/'],
+        'set-cookie': ['app=ok; Path=/', 'ploinky_jwt=bad; Path=/', 'ploinky_guest_iw2P_FBNZBzQ_b5bTDMOLe=x; Path=/', 'ploinky_guest=y; Path=/'],
         'access-control-allow-origin': '*',
         'x-ploinky-machine-assertion': 'must-not-escape',
         connection: 'keep-alive',
