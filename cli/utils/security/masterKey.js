@@ -392,6 +392,24 @@ function createSubkeyDeriver({
 
 const defaultSubkeyDeriver = createSubkeyDeriver();
 
+// The subkey deriveSubkey() returns for `purpose` when the master seed is
+// `seed`: the same IKM (SHA-256 of the seed), empty salt and info. Callers that
+// resolved the seed themselves (for example to key a memo on its identity)
+// derive from exactly that seed instead of resolving it a second time.
+function deriveSubkeyFromSeed(seed, purpose, length = 32) {
+    const trimmedPurpose = String(purpose || '').trim();
+    if (!trimmedPurpose) {
+        throw new Error('deriveSubkeyFromSeed: purpose is required');
+    }
+    const ikm = crypto.createHash('sha256').update(seed, 'utf8').digest();
+    try {
+        const info = Buffer.from(`ploinky/${trimmedPurpose}/v1`, 'utf8');
+        return Buffer.from(crypto.hkdfSync('sha256', ikm, Buffer.alloc(0), info, length));
+    } finally {
+        ikm.fill(0);
+    }
+}
+
 function deriveSubkey(purpose, length = 32) {
     return defaultSubkeyDeriver.derive(purpose, length);
 }
@@ -479,11 +497,15 @@ function deriveAgentSecret({
     return raw.toString('hex');
 }
 
+// `derivedMasterSecret` lets a caller that resolved the master seed itself
+// pass deriveSubkeyFromSeed(seed, 'derived-master'); by default the current
+// derived master key is used.
 function deriveWorkspaceSecret({
     name,
     purpose,
     length = 32,
     encoding = 'hex',
+    derivedMasterSecret: suppliedDerivedMasterSecret,
 } = {}) {
     const secretName = normalizeDerivationPart(name || purpose, '');
     if (!secretName) {
@@ -492,7 +514,7 @@ function deriveWorkspaceSecret({
     const byteLength = Number.isFinite(Number(length)) && Number(length) > 0
         ? Math.floor(Number(length))
         : 32;
-    const derivedMasterSecret = deriveDerivedMasterKey();
+    const derivedMasterSecret = suppliedDerivedMasterSecret || deriveDerivedMasterKey();
     const info = Buffer.from([
         'ploinky/workspace-secret',
         secretName,
@@ -514,6 +536,7 @@ export {
     derivePrivateAgentRequestSecret,
     deriveAgentSecret,
     deriveSubkey,
+    deriveSubkeyFromSeed,
     deriveDerivedMasterKey,
     deriveWorkspaceSecret,
     findEnvFile,

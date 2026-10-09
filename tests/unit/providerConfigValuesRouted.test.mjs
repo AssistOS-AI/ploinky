@@ -182,6 +182,9 @@ test('T6: ensureProvider (beginLogin) uses the routed provider with no scan', as
     assert.equal(gitSpawns.count() - spawnsBefore, 0);
     assert.equal(callsNamed(calls, 'readdirSync'), 0);
     assert.match(result.redirectUrl, /^https:\/\/identity\.test\/routed/, 'the routed provider module ran');
-    assert.ok(readsOf(calls, routedManifestPath) >= 1);
-    assert.equal(readsOf(calls, checkoutManifestPath), 0);
+    // The bridge reads the manifest through its validated memo: open, then
+    // fstat and read the handle. Either way only the routed manifest is used.
+    const opensOf = (file) => calls.filter((call) => call.name === 'openSync' && path.resolve(call.target) === path.resolve(file)).length;
+    assert.ok(readsOf(calls, routedManifestPath) + opensOf(routedManifestPath) >= 1);
+    assert.equal(readsOf(calls, checkoutManifestPath) + opensOf(checkoutManifestPath), 0);
 });

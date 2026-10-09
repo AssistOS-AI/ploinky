@@ -13,6 +13,11 @@ import {
     SSO_AUTH_COOKIE_NAME,
 } from './shared.js';
 import { resolveAuthContextForRouteKey } from './authContext.js';
+import {
+    AUTHENTICATION_UNAVAILABLE_MESSAGE,
+    authenticationUnavailableHeaders,
+    isSsoProviderUnavailable,
+} from '../auth/ssoAdmission.js';
 
 export const USER_ADMIN_CSRF_COOKIE_NAME = 'ploinky_user_admin_csrf';
 
@@ -24,6 +29,7 @@ function getUserAdminErrorStatus(code = '') {
         case 'admin_required':
             return 403;
         case 'sso_not_configured':
+        case 'authentication_unavailable':
             return 503;
         case 'local_auth_disabled':
         case 'provider_user_admin_unsupported':
@@ -67,6 +73,8 @@ function getUserAdminErrorMessage(code = '') {
             return 'Admin access is required.';
         case 'sso_not_configured':
             return 'The configured SSO provider is not available.';
+        case 'authentication_unavailable':
+            return AUTHENTICATION_UNAVAILABLE_MESSAGE;
         case 'local_auth_disabled':
             return 'Local auth is not enabled for this agent.';
         case 'provider_user_admin_unsupported':
@@ -129,6 +137,10 @@ function parseUserAdminPath(pathname = '') {
 
 function sendUserAdminError(res, code, detail = '') {
     const status = getUserAdminErrorStatus(code);
+    if (code === 'authentication_unavailable') {
+        // An undecided admission keeps the session: the client retries.
+        for (const [name, value] of Object.entries(authenticationUnavailableHeaders())) res.setHeader(name, value);
+    }
     sendJson(res, status, {
         ok: false,
         error: code,
@@ -191,7 +203,14 @@ export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = n
     const cookies = parseCookies(req);
     const cookieName = SSO_AUTH_COOKIE_NAME;
     const sessionId = cookies.get(cookieName) || '';
-    const session = await authService.validateSession(sessionId, { forceRemote: true });
+    let session;
+    try {
+        session = await authService.validateSession(sessionId, { reportUnavailable: true });
+    } catch (error) {
+        if (!isSsoProviderUnavailable(error)) throw error;
+        sendUserAdminError(res, 'authentication_unavailable');
+        return true;
+    }
     if (!session) {
         sendUserAdminError(res, 'authentication_required');
         return true;

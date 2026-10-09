@@ -4,6 +4,7 @@ import { isAdminUser } from '../auth/localService.js';
 import { onAuthenticationSessionInvalidated } from '../auth/sessionEvents.js';
 import { authService, sessionTokenService } from '../authHandlers/shared.js';
 import { resolveSessionBindingId } from '../sessionBinding.js';
+import { currentSsoAdmission, isSsoProviderUnavailable } from '../auth/ssoAdmission.js';
 
 function fingerprint(mode, value) {
     return crypto.createHash('sha256')
@@ -48,7 +49,10 @@ export function requestMatchesBrowserSessionLease(req, lease) {
         && fingerprint(lease.mode, requestBindingId) === lease.sessionFingerprint;
 }
 
-export async function validateBrowserSessionLease(lease) {
+// `req` is the request whose own admission may be reused: the same SSO login,
+// still held by the bridge under the same configuration epoch. Without it, or
+// once the admission is no longer current, the provider is asked again.
+export async function validateBrowserSessionLease(lease, { req = null } = {}) {
     if (!lease || !['local', 'sso'].includes(lease.mode)) {
         return { ok: false, reason: 'invalid_lease' };
     }
@@ -56,10 +60,15 @@ export async function validateBrowserSessionLease(lease) {
     try {
         if (lease.mode === 'local') {
             session = await sessionTokenService.getUserSession(lease.sessionId);
-        } else if (typeof authService.validateSession === 'function') {
-            session = await authService.validateSession(lease.sessionId);
-        } else return { ok: false, reason: 'validation_unavailable' };
-    } catch (_) {
+        } else {
+            const admitted = currentSsoAdmission(req, lease.sessionId);
+            if (admitted) session = admitted;
+            else if (typeof authService.validateSession === 'function') {
+                session = await authService.validateSession(lease.sessionId, { reportUnavailable: true });
+            } else return { ok: false, reason: 'validation_unavailable' };
+        }
+    } catch (error) {
+        if (isSsoProviderUnavailable(error)) return { ok: false, reason: 'provider_unavailable' };
         return { ok: false, reason: 'validation_failed' };
     }
     if (!session) return { ok: false, reason: 'missing_or_expired' };

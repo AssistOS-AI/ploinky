@@ -136,7 +136,7 @@ test('providers can mutate nested configuration during beginLogin and remote val
         code: 'fixture-code', state: login.state, browserBinding: login.browserBinding,
         baseUrl: 'http://localhost:8080',
     });
-    const validated = await bridge.validateSession(callback.sessionId, { forceRemote: true });
+    const validated = await bridge.validateSession(callback.sessionId);
     assert.ok(validated);
     assert.equal(validated.user.mutations, 2);
     assert.deepEqual(snapshot.sso.providerConfig.nested.items, []);

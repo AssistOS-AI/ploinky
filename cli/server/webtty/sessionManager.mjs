@@ -37,6 +37,7 @@ const AUTH_LEASE_AUDIT_REASONS = new Set([
     'user_changed',
     'session_changed',
     'administrator_revoked',
+    'provider_unavailable',
 ]);
 const RECLAMATION_PROC_REASONS = new Set(['proc-scan-timeout', 'proc-scan-limit', 'proc-file-limit']);
 const RECLAMATION_IO_REASONS = new Set(['EACCES', 'EPERM', 'EIO', 'EMFILE', 'ENFILE']);
@@ -71,6 +72,14 @@ export const WEBTTY_SESSION_LIMITS = Object.freeze({
     idleLifetimeMs: 10 * 60_000,
     absoluteLifetimeMs: 60 * 60_000,
     authenticationIntervalMs: 5_000,
+    // Longest continuous stretch of undecided periodic checks (provider
+    // unavailable) an open terminal survives. A provider restart is normally
+    // decided again within a few 5 s checks (the Router answers fast 503s
+    // for a few seconds while an agent restarts, and each check is bounded by
+    // the 5 s validation deadline); a longer outage closes the terminal rather
+    // than streaming output for up to the absolute lifetime without a decided
+    // admission.
+    authenticationOutageLimitMs: 60_000,
     streamDetachGraceMs: 15_000,
     tombstoneLifetimeMs: 5 * 60_000,
     maxTombstones: 256,
@@ -307,14 +316,16 @@ export class WebttySessionManager {
         };
     }
 
+    // The lease comes from this request, so its own completed admission is
+    // reused; later revalidations after asynchronous work ask again.
     async validatedLease(req) {
         const lease = this.auth.createLease(req);
-        await this.revalidateLease(lease);
+        await this.revalidateLease(lease, undefined, { req });
         return lease;
     }
 
-    async revalidateLease(lease, auditPhase) {
-        const currentAuth = await this.auth.validateLease(lease);
+    async revalidateLease(lease, auditPhase, { req = null } = {}) {
+        const currentAuth = await this.auth.validateLease(lease, { req });
         if (!currentAuth.ok) {
             const reason = currentAuth.reason;
             if (AUTH_LEASE_AUDIT_PHASES.has(auditPhase)) {
@@ -329,6 +340,9 @@ export class WebttySessionManager {
             throw errorWithCode(
                 reason === 'administrator_revoked'
                     ? 'WEBTTY_ADMIN_REQUIRED'
+                // An undecided provider maps to the handler's retryable 503.
+                : reason === 'provider_unavailable'
+                    ? 'WEBTTY_UNAVAILABLE'
                 : 'WEBTTY_AUTH_INVALID',
             );
         }
@@ -812,7 +826,12 @@ export class WebttySessionManager {
             return null;
         }
         if (validateAuth) {
-            const result = await this.auth.validateLease(session.lease);
+            // The request's own admission is reused; no second provider call.
+            const result = await this.auth.validateLease(session.lease, { req });
+            // An undecided provider denies this request but leaves the terminal.
+            if (!result.ok && result.reason === 'provider_unavailable') {
+                throw errorWithCode('WEBTTY_UNAVAILABLE');
+            }
             if (!result.ok) {
                 await this.closeSession(session, `auth_${result.reason}`);
                 return null;
@@ -1235,7 +1254,29 @@ export class WebttySessionManager {
                 }
             }
             const auth = await this.auth.validateLease(session.lease);
-            if (!auth.ok) await this.closeSession(session, `auth_${auth.reason}`);
+            // Every request on the terminal still needs a decided admission,
+            // and logout, revocation or refusal closes it at once.
+            if (auth.ok) {
+                // Results are ordered by the start of their check: an older
+                // decided check does not end an outage a newer check observed.
+                session.authDecidedAt = Math.max(Number(session.authDecidedAt) || 0, now);
+                if (!Number.isFinite(session.authUndecidedSince) || now >= session.authUndecidedSince) {
+                    session.authUndecidedSince = null;
+                }
+                return;
+            }
+            if (auth.reason !== 'provider_unavailable') {
+                await this.closeSession(session, `auth_${auth.reason}`);
+                return;
+            }
+            // A provider outage keeps the terminal only for a bounded time,
+            // measured from the first undecided check after the last decided
+            // one. A check that started before a later decided check is stale.
+            if (now < (Number(session.authDecidedAt) || 0)) return;
+            if (!Number.isFinite(session.authUndecidedSince)) session.authUndecidedSince = now;
+            if (now - session.authUndecidedSince >= this.limits.authenticationOutageLimitMs) {
+                await this.closeSession(session, 'auth_provider_unavailable');
+            }
         }));
     }
 

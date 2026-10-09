@@ -33,8 +33,9 @@ function resolveAlias(value, secrets, seen = new Set()) {
     return resolveAlias(next, secrets, seen);
 }
 
-export function resolveVarValue(name) {
-    const secrets = parseSecrets();
+// `secrets` lets a caller that already holds the current decrypted map (for
+// example a validated memo) resolve against it instead of decrypting again.
+export function resolveVarValue(name, secrets = parseSecrets()) {
     const raw = secrets[name];
     if (raw === undefined) return '';
     return resolveAlias(raw, secrets);
@@ -553,7 +554,7 @@ function resolveManifestEnv(manifest, secrets, options = {}) {
                 resolvedValue = explicitValue;
                 valueSource = 'explicit';
             } else if (spec.generated.scope === 'workspace') {
-                resolvedValue = deriveWorkspaceSecret({
+                resolvedValue = (options.deriveWorkspaceSecret || deriveWorkspaceSecret)({
                     name: spec.generated.name || spec.sourceName || spec.insideName,
                 });
                 valueSource = 'generated';
@@ -710,13 +711,16 @@ export function buildEnvFlags(manifest, profileConfig, options = {}) {
 }
 
 export function buildEnvMap(manifest, profileConfig, options = {}) {
-    const secrets = parseSecrets();
+    // options.secrets: the caller's current decrypted map, never mutated here.
+    const secrets = options.secrets || parseSecrets();
     const out = {};
     const envEntries = resolveManifestEnv(manifest, secrets, {
         enforceRequired: false,
         profileConfig,
         agentName: options.agentName,
         repoName: options.repoName,
+        // A caller holding its own master-seed resolution derives with it.
+        deriveWorkspaceSecret: options.deriveWorkspaceSecret,
     }).resolved;
     const runtimeExcludedNames = options.forRuntime === true
         ? new Set(envEntries.filter(entry => entry.runtime === false).map(entry => entry.insideName))

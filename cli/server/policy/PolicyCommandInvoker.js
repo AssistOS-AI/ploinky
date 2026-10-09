@@ -1,12 +1,17 @@
 import { parseCookies, readJsonBody } from '../handlers/common.js';
 import { verifyAdminMutationRequest } from '../adminControlSecurity.js';
 import { Caller } from './Caller.js';
+import {
+    AUTHENTICATION_UNAVAILABLE_MESSAGE,
+    authenticationUnavailableHeaders,
+    isSsoProviderUnavailable,
+} from '../auth/ssoAdmission.js';
 
 // Inlined (matching authHandlers.sendJson) so the policy layer does not pull in
 // the heavy authHandlers module just for a 3-line response helper.
-function sendJson(res, statusCode, body) {
+function sendJson(res, statusCode, body, headers = {}) {
     const payload = JSON.stringify(body || {});
-    res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+    res.writeHead(statusCode, { ...headers, 'Content-Type': 'application/json' });
     res.end(payload);
 }
 
@@ -45,7 +50,17 @@ export class PolicyCommandInvoker {
         let session = cookie ? this._getSession(cookie) : null;
         if (!session?.user || !this._allowLocalSession(session, routePlan)) {
             cookie = cookies.get('ploinky_sso') || '';
-            session = cookie ? await this._getProviderSession(cookie) : null;
+            try {
+                session = cookie ? await this._getProviderSession(cookie) : null;
+            } catch (error) {
+                if (!isSsoProviderUnavailable(error)) throw error;
+                // An undecided provider admission keeps the session: the client retries.
+                sendJson(res, 503, {
+                    ok: false,
+                    error: { code: 'AUTHENTICATION_UNAVAILABLE', message: AUTHENTICATION_UNAVAILABLE_MESSAGE },
+                }, authenticationUnavailableHeaders());
+                return true;
+            }
         }
         if (!session?.user) {
             sendJson(res, 401, { ok: false, error: { code: 'AUTH_REQUIRED', message: 'Authentication is required.' } });

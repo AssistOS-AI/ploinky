@@ -19,13 +19,22 @@ export function tryLoadActiveSnapshot() {
 // profile/override contract so neither process needs to persist a second copy.
 // The provider's one manifest is located through the active route (no
 // installed-repository scan) and read once, fresh, per reader.
-export function createProviderConfigReader(providerAgentRef, readExplicitValue, { snapshot } = {}) {
+//
+// `inputs` (optional, one scope from providerConfigInputs.js) supplies the
+// manifest and the decrypted secrets through a validate-on-every-hit memo and
+// derives generated workspace secrets from the scope's master-seed
+// resolution; without it everything is read and derived directly.
+export function createProviderConfigReader(providerAgentRef, readExplicitValue, { snapshot, inputs = null } = {}) {
     const located = resolveAgentManifestLocation(providerAgentRef, {
         snapshot: snapshot === undefined ? tryLoadActiveSnapshot() : snapshot,
     });
     if (!located) throw new Error(`Agent '${providerAgentRef}' not found.`);
     const resolved = { manifestPath: located.manifestPath, repo: located.repo, shortAgentName: located.agent };
-    const manifest = JSON.parse(fs.readFileSync(resolved.manifestPath, 'utf8'));
+    // Profile and env-spec resolution only read the manifest; a memoized
+    // (frozen) manifest is copied anyway so no caller can observe another's edits.
+    const manifest = inputs
+        ? structuredClone(inputs.readJson(resolved.manifestPath))
+        : JSON.parse(fs.readFileSync(resolved.manifestPath, 'utf8'));
     const record = Object.values(readAgentsSnapshot()).find((entry) => entry?.type === 'agent'
         && entry.repoName === resolved.repo && entry.agentName === resolved.shortAgentName && !entry.alias);
     const { profileConfig } = resolveManifestRuntimeProfile(manifest, {
@@ -59,7 +68,12 @@ export function createProviderConfigReader(providerAgentRef, readExplicitValue, 
                     sharedGeneratedSecret: true,
                     explicitOverride: spec.generated.explicitOverride,
                     explicitOverrideRequires: spec.generated.explicitOverrideRequires,
-                })) }, { repoName: resolved.repo, agentName: resolved.shortAgentName, forRuntime: true });
+                })) }, {
+                    repoName: resolved.repo,
+                    agentName: resolved.shortAgentName,
+                    forRuntime: true,
+                    ...(inputs ? { secrets: inputs.readSecrets(), deriveWorkspaceSecret: inputs.deriveWorkspaceSecret } : {}),
+                });
             }
             return String(sharedValues[name] || '').trim();
         }

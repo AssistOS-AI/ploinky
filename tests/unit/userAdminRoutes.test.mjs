@@ -228,7 +228,7 @@ test('provider user administration enforces capabilities, CRUD, pagination, and 
         assert.equal(providerCalls.filter((call) => call.operation === 'validateSession').length, 3);
         assert.ok(providerCalls
             .filter((call) => call.operation === 'validateSession')
-            .every((call) => call.options?.forceRemote === true));
+            .every((call) => call.options?.reportUnavailable === true && !('forceRemote' in call.options)));
         assert.equal(providerCalls.find((call) => call.operation === 'createUser').payload.actorUserId, 'persisto-admin');
         // Providers whose accounts come only from sign-in refuse these as client errors.
         for (const [operation, code] of [

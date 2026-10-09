@@ -6,12 +6,14 @@ import { fileURLToPath, pathToFileURL } from 'url';
 import { createSessionStore } from './sessionStore.js';
 import { randomId } from './utils.js';
 import { resolveVarValue } from '../../utils/security/secretVars.js';
-import { getConfig as getWorkspaceConfig, getConfigSnapshot } from '../../utils/workspace.js';
-import { resolveAgentDescriptor } from '../../utils/agentRegistry.js';
+import { getConfigSnapshot } from '../../utils/workspace.js';
+import { resolveAgentManifestLocation } from '../../utils/agentRegistry.js';
 import { findAgent } from '../../utils/utils.js';
 import { emitAuthenticationSessionInvalidated } from './sessionEvents.js';
 import { createProviderConfigReader, tryLoadActiveSnapshot } from './providerConfigValues.js';
+import { createProviderConfigInputs } from './providerConfigInputs.js';
 import { validateCanonicalLoginOrigin } from './canonicalLoginOrigin.mjs';
+import { ssoProviderUnavailableError } from './ssoAdmission.js';
 
 /**
  * genericAuthBridge.js
@@ -27,15 +29,33 @@ import { validateCanonicalLoginOrigin } from './canonicalLoginOrigin.mjs';
  * as opaque.
  */
 
+// Upper bound for one provider validation dispatch. It matches the Router's
+// existing 5 s bound for control-plane agent requests (MCP request timeout,
+// agent redirect readiness) and exceeds the Router's fast 503 replies while a
+// provider agent restarts, so an outage is reported instead of awaited.
+export const SSO_VALIDATION_DEADLINE_MS = 5000;
+
+const DENIED = Object.freeze({ session: null, unavailable: false });
+const UNAVAILABLE = Object.freeze({ session: null, unavailable: true });
+
 function __dirname() {
     return path.dirname(fileURLToPath(import.meta.url));
 }
 
-function readConfigValue(names, fallback) {
+// Explicit provider values: workspace secrets, then the process environment
+// (read live on every call), then the caller's fallback. `inputs` supplies the
+// current decrypted secrets through its validated memo.
+function createConfigValueReader(inputs) {
+    return (names, fallback) => readConfigValue(names, fallback, inputs);
+}
+
+function readConfigValue(names, fallback, inputs) {
     const candidates = Array.isArray(names) ? names : [names].filter(Boolean);
+    let secrets;
     for (const name of candidates) {
         if (!name) continue;
-        const secret = resolveVarValue(name);
+        if (inputs && secrets === undefined) secrets = inputs.readSecrets();
+        const secret = inputs ? resolveVarValue(name, secrets) : resolveVarValue(name);
         if (secret && String(secret).trim()) return String(secret).trim();
     }
     for (const name of candidates) {
@@ -47,12 +67,13 @@ function readConfigValue(names, fallback) {
     return '';
 }
 
-function resolveProviderAgentPath(providerAgentRef) {
+function resolveProviderAgentPath(providerAgentRef, snapshot) {
     // One provider manifest, under the active route's hostPath when the
-    // generation routes the provider; no installed-repository scan.
-    const descriptor = resolveAgentDescriptor(providerAgentRef, { snapshot: tryLoadActiveSnapshot() });
-    if (descriptor?.manifestPath) {
-        return path.dirname(descriptor.manifestPath);
+    // generation routes the provider; no installed-repository scan. Only its
+    // location is needed here; the config reader parses it.
+    const located = resolveAgentManifestLocation(providerAgentRef, { snapshot });
+    if (located?.manifestPath) {
+        return path.dirname(located.manifestPath);
     }
     try {
         const resolved = findAgent(providerAgentRef);
@@ -61,8 +82,11 @@ function resolveProviderAgentPath(providerAgentRef) {
     return null;
 }
 
-async function loadProviderModule(providerAgentRef) {
-    const agentDir = resolveProviderAgentPath(providerAgentRef);
+// `modules` maps an entry URL to its namespace. import() never re-evaluates a
+// URL it has loaded, so this returns the namespace import() would return,
+// while the entry file's existence is still checked on every call.
+async function loadProviderModule(providerAgentRef, { snapshot, modules } = {}) {
+    const agentDir = resolveProviderAgentPath(providerAgentRef, snapshot);
     if (!agentDir) {
         throw new Error(`genericAuthBridge: could not locate provider agent '${providerAgentRef}'`);
     }
@@ -71,10 +95,11 @@ async function loadProviderModule(providerAgentRef) {
         throw new Error(`genericAuthBridge: provider '${providerAgentRef}' missing runtime/index.mjs at ${entryPath}`);
     }
     const moduleUrl = pathToFileURL(entryPath).href;
-    const mod = await import(moduleUrl);
+    const mod = modules?.get(moduleUrl) || await import(moduleUrl);
     if (typeof mod.createProvider !== 'function') {
         throw new Error(`genericAuthBridge: provider '${providerAgentRef}' does not export createProvider()`);
     }
+    modules?.set(moduleUrl, mod);
     return mod;
 }
 
@@ -92,9 +117,16 @@ function resolveConfiguredSsoProvider() {
         : '';
 }
 
-async function resolveProviderConfig(mod) {
+// Resolves the provider configuration from the current workspace inputs. The
+// provider's own resolveProviderConfig() runs on every call (it may read
+// anything, including the process environment); only file inputs are memoized,
+// by `inputs`, and each is revalidated on every read.
+async function resolveProviderConfig(mod, { inputs: memo, snapshot } = {}) {
+    // One scope per resolution: a single master-seed resolution for its reads.
+    const inputs = memo ? memo.scope() : null;
     const workspaceConfig = (() => {
-        try { return getWorkspaceConfig(); } catch (_) { return {}; }
+        // A private copy: providers may mutate what they receive.
+        try { return structuredClone(getConfigSnapshot()); } catch (_) { return {}; }
     })();
     const sso = workspaceConfig?.sso && typeof workspaceConfig.sso === 'object' ? workspaceConfig.sso : {};
     if (sso.enabled !== true) return null;
@@ -107,7 +139,10 @@ async function resolveProviderConfig(mod) {
         return await mod.resolveProviderConfig({
             workspaceConfig,
             providerConfig,
-            readValue: createProviderConfigReader(sso.providerAgent, readConfigValue)
+            readValue: createProviderConfigReader(sso.providerAgent, createConfigValueReader(inputs), {
+                snapshot: snapshot === undefined ? tryLoadActiveSnapshot() : snapshot,
+                inputs,
+            }),
         });
     }
 
@@ -119,6 +154,9 @@ export function createGenericAuthBridge(options = {}) {
     const clock = typeof options.now === 'function' ? options.now : () => Date.now();
     const validationLanes = new Map();
     let validationEpoch = 0;
+    const validationDeadlineMs = Number.isSafeInteger(options.validationDeadlineMs) && options.validationDeadlineMs > 0
+        ? options.validationDeadlineMs
+        : SSO_VALIDATION_DEADLINE_MS;
     // Pending browser-auth state stays in core, keyed by the random `state`
     // the browser will present on the callback. Per the plan, core holds:
     //   - provider agent name
@@ -131,6 +169,10 @@ export function createGenericAuthBridge(options = {}) {
     let providerInstance = null;
     let providerFingerprint = null;
     let configFingerprint = null;
+    // Validated memo of configuration inputs (files and key material), never
+    // of provider answers. Cleared with the provider on reloadConfig().
+    const configInputs = options.configInputs || createProviderConfigInputs();
+    const providerModules = new Map();
 
     function fingerprintFor(config, providerAgent) {
         return JSON.stringify({
@@ -142,15 +184,17 @@ export function createGenericAuthBridge(options = {}) {
     async function ensureProvider() {
         const providerAgent = resolveConfiguredSsoProvider();
         if (!providerAgent) throw new Error('SSO is not configured (no provider agent configured)');
-        const mod = await loadProviderModule(providerAgent);
-        const config = await resolveProviderConfig(mod);
+        // One active-generation read serves both the module and the config reader.
+        const snapshot = tryLoadActiveSnapshot();
+        const mod = await loadProviderModule(providerAgent, { snapshot, modules: providerModules });
+        const config = await resolveProviderConfig(mod, { inputs: configInputs, snapshot });
         if (!config) throw new Error('SSO is not configured (incomplete config values)');
         const nextFingerprint = fingerprintFor(config, providerAgent);
         if (providerInstance && providerFingerprint === providerAgent && configFingerprint === nextFingerprint) {
             return { provider: providerInstance, providerAgent, config };
         }
         const provider = mod.createProvider({
-            getConfig: async () => resolveProviderConfig(mod)
+            getConfig: async () => resolveProviderConfig(mod, { inputs: configInputs })
         });
         providerInstance = provider;
         providerFingerprint = providerAgent;
@@ -314,25 +358,58 @@ export function createGenericAuthBridge(options = {}) {
         };
     }
 
-    async function performRemoteValidation(sessionId, session, epoch) {
-        const current = () => epoch === validationEpoch && sessionStore.getSession(sessionId) === session;
+    // One provider attempt. `isAbandoned` turns true once the deadline settled
+    // the cohort; every later continuation then neither publishes nor deletes.
+    async function attemptRemoteValidation(sessionId, session, epoch, { signal, isAbandoned }) {
+        const current = () => !isAbandoned() && epoch === validationEpoch && sessionStore.getSession(sessionId) === session;
+        const refuse = () => {
+            if (!current()) return DENIED;
+            sessionStore.deleteSession(sessionId);
+            cancelValidation(sessionId);
+            emitAuthenticationSessionInvalidated({ mode: 'sso', sessionId, reason: 'validation_failed' });
+            return DENIED;
+        };
+        let context;
         try {
-            const context = await ensureProvider();
-            if (!current()) return null;
-            const { provider } = context;
-            const fingerprint = fingerprintFor(context.config, context.providerAgent);
-            const userId = session.user?.id;
+            context = await ensureProvider();
+        } catch (_) {
+            // Provider resolution or configuration read failed: no decision.
+            return UNAVAILABLE;
+        }
+        if (!current()) return DENIED;
+        let outcome;
+        let provider;
+        let fingerprint;
+        let userId;
+        try {
+            provider = context.provider;
+            fingerprint = fingerprintFor(context.config, context.providerAgent);
+            userId = session.user?.id;
             const operation = typeof provider.sso_refresh_session === 'function'
                 ? provider.sso_refresh_session.bind(provider)
                 : provider.sso_validate_session?.bind(provider);
             if (!operation) throw new Error('provider has no response-free session validation operation');
-            const outcome = await operation({
+            outcome = await operation({
                 providerSession: structuredClone(session.providerSession || { tokens: session.tokens }),
+                signal,
             });
-            if (!current()) return null;
-            const latest = await ensureProvider();
-            if (!current() || latest.provider !== provider
-                || fingerprintFor(latest.config, latest.providerAgent) !== fingerprint) return null;
+        } catch (error) {
+            if (!current()) return DENIED;
+            return error?.providerUnavailable === true ? UNAVAILABLE : refuse();
+        }
+        if (!current()) return DENIED;
+        let latest;
+        try {
+            latest = await ensureProvider();
+        } catch (_) {
+            return UNAVAILABLE;
+        }
+        if (!current()) return DENIED;
+        // The configuration changed while the provider answered: the answer
+        // belongs to the old configuration, but the session itself was not refused.
+        if (latest.provider !== provider
+            || fingerprintFor(latest.config, latest.providerAgent) !== fingerprint) return UNAVAILABLE;
+        try {
             if (typeof userId !== 'string' || !userId || outcome?.user?.id !== userId
                 || !outcome.providerSession || typeof outcome.providerSession !== 'object'
                 || Array.isArray(outcome.providerSession)) {
@@ -348,25 +425,57 @@ export function createGenericAuthBridge(options = {}) {
                 expiresAt: providerSession?.expiresAt || session.expiresAt,
                 refreshExpiresAt: providerSession?.refreshExpiresAt ?? session.refreshExpiresAt,
             });
-            if (!updated) return null;
+            if (!updated) return DENIED;
             // The general store merges tokens; an admission replaces the entire
             // provider projection so removed metadata cannot survive refresh.
             updated.tokens = tokens;
-            return structuredClone(updated);
+            return Object.freeze({ session: structuredClone(updated), unavailable: false });
         } catch (_) {
-            if (!current()) return null;
-            sessionStore.deleteSession(sessionId);
-            cancelValidation(sessionId);
-            emitAuthenticationSessionInvalidated({ mode: 'sso', sessionId, reason: 'validation_failed' });
-            return null;
+            return refuse();
+        }
+    }
+
+    // Bounds one provider dispatch. On expiry the cohort is denied without
+    // deleting the session, the provider signal is aborted, and the lane moves
+    // on so later callers dispatch a fresh operation.
+    async function performRemoteValidation(sessionId, session, epoch, lane) {
+        const controller = new AbortController();
+        let abandoned = false;
+        let timer = null;
+        const deadline = new Promise((resolve) => {
+            timer = setTimeout(() => {
+                abandoned = true;
+                resolve(UNAVAILABLE);
+                try { controller.abort(new Error('SSO provider validation deadline exceeded')); } catch (_) { }
+            }, validationDeadlineMs);
+            timer.unref?.();
+        });
+        lane.abort = () => {
+            try { controller.abort(new Error('SSO validation cancelled')); } catch (_) { }
+        };
+        try {
+            return await Promise.race([
+                attemptRemoteValidation(sessionId, session, epoch, {
+                    signal: controller.signal,
+                    isAbandoned: () => abandoned,
+                }),
+                deadline,
+            ]);
+        } finally {
+            abandoned = true;
+            clearTimeout(timer);
+            lane.abort = null;
         }
     }
 
     function cancelValidation(sessionId) {
         const lane = validationLanes.get(sessionId);
         if (!lane) return;
-        for (const caller of [...lane.active, ...lane.queued]) caller.resolve(null);
+        for (const caller of [...lane.active, ...lane.queued]) caller.resolve(DENIED);
         lane.queued = [];
+        // Release a provider call nobody is waiting for; the deadline still
+        // bounds providers that ignore the signal.
+        lane.abort?.();
     }
 
     async function drainValidationLane(sessionId, lane) {
@@ -378,29 +487,50 @@ export function createGenericAuthBridge(options = {}) {
                 lane.active = cohort;
                 const { session, epoch } = cohort[0];
                 const result = epoch === validationEpoch && sessionStore.getSession(sessionId) === session
-                    ? await performRemoteValidation(sessionId, session, epoch)
-                    : null;
+                    ? await performRemoteValidation(sessionId, session, epoch, lane)
+                    : DENIED;
                 for (const caller of cohort) caller.resolve(result);
                 lane.active = [];
             }
         } finally {
-            for (const caller of [...lane.active, ...lane.queued]) caller.resolve(null);
+            for (const caller of [...lane.active, ...lane.queued]) caller.resolve(DENIED);
             if (validationLanes.get(sessionId) === lane) validationLanes.delete(sessionId);
         }
     }
 
-    async function validateSession(sessionId) {
+    async function admitSession(sessionId) {
         const session = sessionStore.getSession(sessionId);
-        if (!session) return null;
+        if (!session) return DENIED;
         const epoch = validationEpoch;
         let lane = validationLanes.get(sessionId);
         if (!lane) {
-            lane = { queued: [], active: [] };
+            lane = { queued: [], active: [], abort: null };
             validationLanes.set(sessionId, lane);
             queueMicrotask(() => { void drainValidationLane(sessionId, lane); });
         }
         const result = await new Promise(resolve => lane.queued.push({ session, epoch, resolve }));
-        return epoch === validationEpoch && sessionStore.getSession(sessionId) === session ? result : null;
+        // A deleted or replaced record is a refusal; a configuration change
+        // while the session record survives is retryable.
+        if (sessionStore.getSession(sessionId) !== session) return DENIED;
+        if (epoch !== validationEpoch) return UNAVAILABLE;
+        return result;
+    }
+
+    async function validateSession(sessionId, { reportUnavailable = false } = {}) {
+        const outcome = await admitSession(sessionId);
+        if (outcome.session) return outcome.session;
+        if (reportUnavailable === true && outcome.unavailable) throw ssoProviderUnavailableError();
+        return null;
+    }
+
+    // Captures the live record and epoch at the moment of a completed
+    // admission. Logout, revocation, refusal or a configuration reload turns it
+    // false; it never extends authority beyond the record the bridge still holds.
+    function admissionFence(sessionId) {
+        const epoch = validationEpoch;
+        const record = sessionStore.getSession(sessionId);
+        if (!record) return () => false;
+        return () => epoch === validationEpoch && sessionStore.getSession(sessionId) === record;
     }
 
     async function logout(sessionId, { baseUrl, postLogoutRedirectUri } = {}) {
@@ -446,6 +576,8 @@ export function createGenericAuthBridge(options = {}) {
         providerFingerprint = null;
         configFingerprint = null;
         validationEpoch += 1;
+        configInputs.clear();
+        providerModules.clear();
         pendingAuth.clear();
         for (const sessionId of validationLanes.keys()) cancelValidation(sessionId);
     }
@@ -488,6 +620,7 @@ export function createGenericAuthBridge(options = {}) {
         handleCallback,
         getSession,
         validateSession,
+        admissionFence,
         refreshSession,
         logout,
         revokeSession,
