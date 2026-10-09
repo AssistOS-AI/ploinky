@@ -13,6 +13,8 @@ process.env.PLOINKY_MASTER_KEY = '5'.repeat(64);
 fs.mkdirSync('.ploinky');
 const { handleMarketplaceRoutes, __testables } = await import('../../cli/server/authHandlers/marketplaceRoutes.js');
 const { authService, SSO_AUTH_COOKIE_NAME } = await import('../../cli/server/authHandlers/shared.js');
+const { signAgentHttpAssertion } = await import('../../Agent/lib/agentAssertion.mjs');
+const { deriveAgentRequestSecret } = await import('../../cli/utils/security/masterKey.js');
 const { remoteUrlOrEmpty } = await import('../../cli/server/authHandlers/marketplaceProjection.js');
 
 const principals = {
@@ -143,5 +145,42 @@ test('free-text startup failure detail is withheld from non-administrators', () 
         assert.equal(agent.status, 'failed');
         assert.equal('statusDetail' in agent, false, label);
         assertNoLocalPaths(agent, label);
+    }
+});
+
+const callerPrincipal = 'agent:repo/caller';
+const agentEnv = { PLOINKY_AGENT_ID: callerPrincipal, PLOINKY_AGENT_SECRET: deriveAgentRequestSecret(callerPrincipal) };
+async function rawGet(resource, headers) {
+    const req = Readable.from([]);
+    req.method = 'GET';
+    req.headers = { host: 'explorer.example.test', ...headers };
+    const res = { status: 200, setHeader() {}, writeHead(code) { this.status = code; }, end(body) { this.body = JSON.parse(body); } };
+    await handleMarketplaceRoutes(req, res, new URL(`https://explorer.example.test/api/marketplace/${resource}`), { routePlan: plan(), agentListOptions: { liveContainers: [] } });
+    return res;
+}
+test('a verified agent assertion keeps local paths for repository clients', async () => {
+    const { MARKETPLACE_AGENT_TARGET } = await import('../../cli/server/authHandlers/marketplaceRoutes.js');
+    const sign = resource => signAgentHttpAssertion({ method: 'GET', path: `/api/marketplace/${resource}`, query: '',
+        targetAgent: MARKETPLACE_AGENT_TARGET, tool: 'marketplace.read', env: agentEnv });
+    for (const [resource, needle] of [['repos', skillsRoot], ['agents', agentsRoot], ['list-repos', localOnlyRoot]]) {
+        const res = await rawGet(resource, { authorization: `Bearer ${sign(resource)}` });
+        assert.equal(res.status, 200, JSON.stringify(res.body));
+        assert.equal(JSON.stringify(res.body).includes(needle), true, `${resource} lost machine data`);
+    }
+});
+
+test('a browser session with an unverified Bearer is rejected and receives no paths', async () => {
+    const { MARKETPLACE_AGENT_TARGET } = await import('../../cli/server/authHandlers/marketplaceRoutes.js');
+    const wrongTool = resource => signAgentHttpAssertion({ method: 'GET', path: `/api/marketplace/${resource}`, query: '',
+        targetAgent: MARKETPLACE_AGENT_TARGET, tool: 'repositories.install', env: agentEnv });
+    for (const who of [principals.realAdmin, principals.ordinary]) {
+        for (const resource of ['repos', 'agents', 'list-repos']) {
+            for (const token of ['bogus', wrongTool(resource)]) {
+                const res = await rawGet(resource, { authorization: `Bearer ${token}`, cookie: `${SSO_AUTH_COOKIE_NAME}=${who.sessionId}` });
+                assert.equal(res.status, 401, `${resource} ${who.user.id}`);
+                assert.equal(res.body.ok, false);
+                assertNoLocalPaths(res.body, `${resource} rejected`);
+            }
+        }
     }
 });

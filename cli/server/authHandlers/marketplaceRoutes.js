@@ -247,6 +247,11 @@ function verifyMarketplaceAgentRequest({ req, method, query = '', tool, requestP
     });
 }
 
+// Set only by a successful assertion verification; a Bearer header alone never qualifies.
+function verifiedAgentCaller(req) {
+    return Boolean(req?.marketplaceAgent);
+}
+
 function ensureMarketplaceAgentRequest(req, res, details) {
     try {
         req.marketplaceAgent = verifyMarketplaceAgentRequest({ req, ...details });
@@ -719,7 +724,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
             options = { ...agentListOptions, liveContainers };
         }
         // Agent-assertion callers are machine principals; every session caller is judged by role.
-        options = { ...options, machine: Boolean(readAuthorizationBearer(req)) };
+        options = { ...options, machine: verifiedAgentCaller(req) };
         return {
             ...buildMarketplaceAgents(req.user, options),
             permissions: {
@@ -739,7 +744,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
         if (!await authorizeRead()) return true;
         const repositories = await runPreparedRepositoryRead(res, () => reposSvc.listRepositorySources(), { catalog: true });
         if (repositories === MARKETPLACE_REQUEST_CLOSED) return true;
-        const visible = mayViewLocalPaths({ user: req.user, machine: Boolean(readAuthorizationBearer(req)) })
+        const visible = mayViewLocalPaths({ user: req.user, machine: verifiedAgentCaller(req) })
             ? repositories : repositories.map(projectRepositorySource);
         sendJson(res, 200, { ok: true, repositories: visible });
         return true;
@@ -751,7 +756,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
     }
 
     const isRepos = route.resource === 'repos';
-    const marketplacePayload = async () => runPreparedRepositoryRead(res, () => (isRepos ? buildMarketplaceRepositories({ user: req.user, machine: Boolean(readAuthorizationBearer(req)) }) : agentsMarketplace()), { catalog: isRepos });
+    const marketplacePayload = async () => runPreparedRepositoryRead(res, () => (isRepos ? buildMarketplaceRepositories({ user: req.user, machine: verifiedAgentCaller(req) }) : agentsMarketplace()), { catalog: isRepos });
 
     if (method === 'GET') {
         if (!await authorizeRead()) return true;
