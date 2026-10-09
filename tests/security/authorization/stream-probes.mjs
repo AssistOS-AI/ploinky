@@ -201,7 +201,11 @@ export function assertNoWorkspaceDisclosure(response, { requestPath, fixtureName
       node.forEach(item => walk(item, key));
     } else if (node && typeof node === 'object') {
       assert.equal(LISTING_KEY.test(key), false, `${message} (listing-shaped field ${key})`);
-      for (const [name, value] of Object.entries(node)) walk(value, name);
+      for (const [name, value] of Object.entries(node)) {
+        // A filename or fixture bytes used as a key discloses as much as the same text used as a value.
+        assert.equal(leaks(name), false, `${message} (fixture name or bytes used as a key)`);
+        walk(value, name);
+      }
     } else if (typeof node === 'string' && key === 'login') {
       const url = new URL(node, 'http://router.invalid');
       assert.ok(url.origin === 'http://router.invalid' && url.pathname === '/auth/login', `${message} (login field is not the login page)`);

@@ -303,6 +303,9 @@ test('disclosure predicate: the Router login echo of the caller\'s own path pass
     ['returnTo naming no path of this request', routerLogin('/upload')],
     ['login that is not the login page', { status: 401, text: '{"ok":false,"login":"https://evil.invalid/auth/login"}' }],
     ['fixture name leaking through another login parameter', { status: 401, text: JSON.stringify({ ok: false, login: `/auth/login?${new URLSearchParams({ returnTo: ownPath, hint: 'fixture.txt' })}` }) }],
+    ['fixture name as an object key', routerLogin(ownPath, { tree: { 'fixture.txt': { bytes: 23 } } })],
+    ['fixture path as a top-level key', { status: 401, text: JSON.stringify({ 'authz-x-terminal/fixture.txt': 'file' }) }],
+    ['fixture bytes as an object key', routerLogin(ownPath, { seen: { 'authz-x-sink-positive-3': true } })],
     ['text listing without a JSON body', { status: 403, text: 'fixture.txt' }],
     ['listing only in text while json is stripped', { status: 403, json: { ok: false }, text: '{"ok":false,"entries":[{"name":"fixture.txt"}]}' }],
   ]) assert.throws(() => assertNoWorkspaceDisclosure(response, opts), /disclosed a workspace listing/, label);
