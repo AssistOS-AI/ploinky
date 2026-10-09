@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import path from 'node:path';
+import { runWebmeetAdminToolProbes } from './webmeet-admin-tools.mjs';
 
 // References are relative to the pinned AssistOSExplorer source checkout.
 export const resourceProbeSources = Object.freeze({
@@ -45,7 +46,7 @@ export function decodeResourceMcp(response) {
     };
 }
 
-function assertAllowed(result, label) {
+export function assertAllowed(result, label) {
     assert.equal(result.failed, false, `${label}: authorized positive control failed (HTTP ${result.response.status})`);
     assert.ok(result.value !== undefined, `${label}: successful HTTP response lacks an MCP result`);
     return result.value;
@@ -377,7 +378,7 @@ async function roomProbes(ctx, mcp) {
             assert.ok(JSON.stringify(result).includes(room.roomId));
         });
     }
-    for (const principal of ['selfRegistered', 'userA', 'userB']) {
+    for (const principal of ['anonymous', 'selfRegistered', 'userA', 'userB']) {
         await ctx.check(`resource.webmeet.${principal}.rename`, async () => {
             await ctx.guard();
             const response = await mcp(principal, 'webmeetAgent', 'webmeet_room_rename', { roomId: room.roomId, name: `${ctx.prefix}-forbidden` });
@@ -393,6 +394,8 @@ async function roomProbes(ctx, mcp) {
             assertResourceDenied(response, `${principal} deletes existing room`);
         });
     }
+    // The other nine admin-only tools, with admin-side state verification and administrator positives.
+    await runWebmeetAdminToolProbes(ctx, mcp, { assertAllowed, assertResourceDenied });
     ctx.recordGap('resource.webmeet.participant-and-room-data', 'Open team rooms are shared with authenticated ordinary users by executable policy. Participant impersonation, chat edits, media blobs, guest scope and archived-room data need joined participants; this bounded module does not start a room secretary or inference backend.', { kind: 'declared-limitation' });
 }
 

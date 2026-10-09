@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { agentCatalog, agentInventory } from './agent-inventory.mjs';
-import { assertDenied, WORKSPACE } from './core.mjs';
+import { assertDenied, Client, WORKSPACE } from './core.mjs';
+import { GUEST_AGENT_POLICY, pinnedGuestList } from './guest-agent-policy.mjs';
 
 const actors = ['anonymous', 'selfRegistered', 'userA', 'userB', 'admin'];
 const profilePath = '/base-agent-additional-server/userPersistoAgent/7000/service/dashboard/api/profile';
@@ -311,11 +312,14 @@ export function assertAgentMcpDenied(result) {
  * supporting evidence only: it comes from the shared anonymous jar, so an earlier
  * guest route could have supplied it. Tool calls stay denied by their own checks.
  */
-export function assertGuestDiscovery(result, { field, adminNames, guestCookie }) {
+export function assertGuestDiscovery(result, { field, adminNames, guestCookie, pinned }) {
     assert.equal(result.response.status, 200, 'Guest discovery must be answered with HTTP 200');
     assert.ok(result.success, 'A guest-authentication agent must answer an anonymous visitor\'s discovery');
     requireNamedList(result.value, field);
-    assert.deepEqual(result.value[field].map((item) => item.name).sort(), adminNames, 'Guest discovery must expose exactly the administrator-visible names');
+    // The reviewed list, not only the live administrator list: a changed tool surface needs a new review.
+    assert.deepEqual(pinned, [...pinned].sort(), 'The reviewed list must be sorted');
+    assert.deepEqual(adminNames, pinned, 'The administrator-visible names differ from the reviewed guest-agent list');
+    assert.deepEqual(result.value[field].map((item) => item.name).sort(), pinned, 'Guest discovery must expose exactly the reviewed names');
     assert.equal(guestCookie, true, 'Anonymous access must come from a minted guest session, not from an unauthenticated route');
 }
 export function hasGuestCookie(client, init) {
@@ -448,7 +452,7 @@ export async function discoverAgentMcp(ctx, mcp, catalog = agentCatalog) {
                     if (actor === 'anonymous' && guestAgent) {
                         // The cached session of this very result; a failed initialize is not retried.
                         const session = result.stage === 'initialize' ? null : await mcp.initialize('anonymous', agent.agent);
-                        assertGuestDiscovery(result, { field: definition.field, adminNames: names, guestCookie: hasGuestCookie(ctx.clients?.anonymous, session?.init) });
+                        assertGuestDiscovery(result, { field: definition.field, adminNames: names, guestCookie: hasGuestCookie(ctx.clients?.anonymous, session?.init), pinned: pinnedGuestList(agent.agent, definition.field) });
                     } else if (actor === 'anonymous' || (actor === 'selfRegistered' && agent.agent === 'explorer')) assertAgentMcpDenied(result);
                     else if (!result.success) {
                         if (result.response.json?.error?.code === -32601) {
@@ -608,6 +612,70 @@ export async function usernamePrivilegeProbe(ctx, mcp, roomFixture, { revalidati
     } finally { await restore(); }
 }
 
+export function webAssistGuestCheckDefinitions() {
+    const source = 'tests/security/authorization/agent-probes.mjs webAssistGuestProbes';
+    return [
+        { id: 'agent.webAssist.admin.list-sites-positive', kind: 'live', boundary: 'agents', source, positiveControlAnyOf: null },
+        { id: 'agent.webAssist.anonymous.list-sites-denied', kind: 'live', boundary: 'agents', source, positiveControlAnyOf: ['agent.webAssist.admin.list-sites-positive'] },
+        { id: 'agent.webAssist.anonymous.session-history-isolation', kind: 'live', boundary: 'agents', source, positiveControlAnyOf: null },
+    ];
+}
+
+/**
+ * webAssist anonymous policy (guest-agent-policy.mjs). list-sites is denied to an
+ * anonymous visitor; the administrator read is its positive control. A visitor's
+ * chat history must not be readable by another anonymous visitor. web_cli_history
+ * (webAssist/src/mcp/get-session-history.mjs) keys history by siteId and sessionId only
+ * and reads no caller identity, so isolation can hold only if the session id is an
+ * unguessable capability; whether it does is exactly what this check measures. A session
+ * can be created only through web_cli_chat (inference), which this suite never runs, so
+ * the fixture is injected (`createSession`) and its absence fails the check instead of
+ * being treated as a pass.
+ */
+export async function webAssistGuestProbes(ctx, mcp, { createSession = ctx.webAssistSessionFactory } = {}) {
+    await ctx.check('agent.webAssist.admin.list-sites-positive', async () => {
+        const result = await mcp.rpc('admin', 'webAssist', 'tools/call', { name: 'list-sites', arguments: {} });
+        assert.ok(result.success, 'The administrator list-sites read must succeed');
+        requireObject(result.value);
+        assert.ok(Array.isArray(result.value.sites) && Number.isInteger(result.value.count), 'list-sites returns { sites, count, dataRoot }');
+    });
+    await ctx.check('agent.webAssist.anonymous.list-sites-denied', async () => {
+        const result = await mcp.rpc('anonymous', 'webAssist', 'tools/call', { name: 'list-sites', arguments: {} });
+        assert.ok(!result.success || !Array.isArray(result.value?.sites), 'An anonymous visitor listed every site id and the data root');
+        assertAgentMcpDenied(result);
+    });
+    await ctx.check('agent.webAssist.anonymous.session-history-isolation', async () => {
+        assert.equal(typeof createSession, 'function', 'No inference-free webAssist session fixture exists: a session can only be created by web_cli_chat, so cross-session history isolation is unproven');
+        if (!ctx.clients.anonymousB) ctx.clients.anonymousB = new Client([], { onSecret: (value) => ctx.secrets.add(value) });
+        const guest = async (actor) => {
+            const headers = { accept: 'application/json, text/event-stream' };
+            const init = await ctx.request(actor, { method: 'POST', path: '/webAssist/mcp', headers, body: { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'authorization-regression', version: '1' } } } });
+            const sessionId = init.headers['mcp-session-id'];
+            assert.equal(init.status, 200);
+            assert.ok(typeof sessionId === 'string' && sessionId, 'Each anonymous jar needs its own MCP session');
+            ctx.secrets.add(sessionId);
+            const sessionHeaders = { ...headers, 'mcp-session-id': sessionId, 'mcp-protocol-version': init.json?.result?.protocolVersion || '2025-06-18' };
+            ctx.cleanup(async () => { await ctx.request(actor, { method: 'DELETE', path: '/webAssist/mcp', headers: sessionHeaders }); });
+            return (siteId, session) => ctx.request(actor, { method: 'POST', path: '/webAssist/mcp', headers: sessionHeaders, body: { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'web_cli_history', arguments: { siteId, sessionId: session } } } }).then(decodeAgentMcp);
+        };
+        const readA = await guest('anonymous');
+        const readB = await guest('anonymousB');
+        assert.notEqual(ctx.clients.anonymous.cookies.find((c) => c.name === 'ploinky_guest')?.value, ctx.clients.anonymousB.cookies.find((c) => c.name === 'ploinky_guest')?.value, 'The two anonymous jars must hold distinct guest sessions');
+        const a = await createSession('anonymous');
+        const b = await createSession('anonymousB');
+        assert.notEqual(a.sessionId, b.sessionId);
+        const own = async (read, fixture) => { const result = await read(fixture.siteId, fixture.sessionId); assert.ok(result.success && result.value?.exists === true && result.value.history.length > 0, 'Each visitor reads its own non-empty history'); return result.value; };
+        await own(readA, a); await own(readB, b);
+        const crossed = await readB(a.siteId, a.sessionId);
+        const crossedBack = await readA(b.siteId, b.sessionId);
+        for (const [result, victim] of [[crossed, a], [crossedBack, b]]) {
+            const text = JSON.stringify([result.value, result.response.json]);
+            assert.ok(!text.includes(victim.marker), 'One anonymous visitor read another visitor\'s chat history');
+            assert.ok(!result.success || result.value?.exists !== true || (result.value.history || []).length === 0, 'Another visitor\'s session history was returned');
+        }
+    });
+}
+
 export function reconcileAgentRegistry(registry) {
     assert.ok(registry?.routes && typeof registry.routes === 'object', 'Live route registry is missing');
     const known = new Map(agentCatalog.filter((a) => a.enabled).map((a) => [a.agent, a]));
@@ -636,6 +704,7 @@ export async function runAgentProbes(ctx) {
         });
     }
     await discoverAgentMcp(ctx, mcp);
+    if ((ctx.guestAgents || []).some((g) => g.agent === 'webAssist')) await webAssistGuestProbes(ctx, mcp);
     const roomFixture = await createRoomListingFixture(ctx, mcp);
     await readTools(ctx, mcp, roomFixture);
     await usernamePrivilegeProbe(ctx, mcp, roomFixture);

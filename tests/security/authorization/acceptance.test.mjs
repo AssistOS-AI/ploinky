@@ -19,8 +19,10 @@ import { policyDigest } from './acceptance/digest.mjs';
 import { captureExitCode } from './acceptance/run-acceptance.mjs';
 import { runMarketplaceAdmissionProbes, runTemplateProbes, marketplaceProjection } from './boundary-probes.mjs';
 import { runWebchatProbes, dpuProcessInspector, createStreamHandle, waitForStartupReady, openEventStream, DPU_UNSUPPORTED_REPLY, LIVE_INTERACTION_LIMITATION } from './webchat-probes.mjs';
-import { discoverAgentMcp } from './agent-probes.mjs';
+import { discoverAgentMcp, webAssistGuestCheckDefinitions } from './agent-probes.mjs';
 import { workspaceWriteMatrix, workspaceWriteCheckDefinitions } from './stream-probes.mjs';
+import { webmeetAdminToolCheckDefinitions, WEBMEET_POSITIVE_FOR_OP } from './webmeet-admin-tools.mjs';
+import { WEBMEET_ADMIN_ONLY_TOOLS } from './guest-agent-policy.mjs';
 import { runCapabilityProbes, nonApplicableRecord } from './capability-probes.mjs';
 import { deriveCapabilities } from './acceptance/expected-runtime-graph.mjs';
 import { ackCount } from './webchat-probes.mjs';
@@ -945,7 +947,7 @@ test('Router workspace-write matrix: all 68 checks are mandatory, counted once a
         assert.ok(['admin', 'userA'].includes(positive.actor), 'the positive is an entitled actor');
     }
     assert.equal(denials.filter(r => r.operation === 'sink-upload').every(r => r.positiveControl === 'router:workspace-upload-owner-positive:admin'), true);
-    assert.deepEqual({ live: mandatory.counts.live, offline: mandatory.counts.offline }, { live: 570, offline: 10 });
+    assert.deepEqual({ live: mandatory.counts.live, offline: mandatory.counts.offline }, { live: 607, offline: 10 });
 });
 
 test('Router workspace-write matrix: no row can be satisfied as an expected gap, and an unavailable denial rejects twice', () => {
@@ -1214,4 +1216,54 @@ test('the SSE opener bounds connect-to-headers only and never installs a socket 
     await assert.rejects(openEventStream(ctx, 'userA', '/webchat/stream?agent=dpuAgent', { request: silent.request, connectMs: 30 }), /connect timeout/);
     assert.deepEqual(silent.calls.destroyed, ['Bounded WebChat stream connect timeout']);
     handle.close();
+});
+
+test('the guest-agent call coverage is mandatory: every WebMeet admin tool denial, its positive, and the webAssist checks', () => {
+    const ids = new Set(mandatory.checks.map(c => c.id));
+    for (const definition of [...webmeetAdminToolCheckDefinitions(), ...webAssistGuestCheckDefinitions()]) {
+        const entry = mandatory.checks.find(c => c.id === definition.id);
+        assert.ok(entry, definition.id);
+        assert.deepEqual(entry.positiveControlAnyOf, definition.positiveControlAnyOf, definition.id);
+        assert.equal(entry.count, 1, definition.id);
+    }
+    for (const { op } of WEBMEET_ADMIN_ONLY_TOOLS) for (const actor of ['anonymous', 'selfRegistered']) {
+        assert.ok(ids.has(`resource.webmeet.${actor}.${op}`), `${actor} ${op}`);
+        assert.ok(ids.has(WEBMEET_POSITIVE_FOR_OP[op]), `positive for ${op}`);
+    }
+    // Anything the guest-agent lists accept must be impossible to accept as an expected gap.
+    for (const id of [...ids].filter(id => /^resource\.webmeet\./.test(id) || /^agent\.webAssist\.(anonymous|admin)\./.test(id))) assert.ok(!expectedGaps.gaps.some(g => g.id === id), id);
+    // Dropping a denial, or failing its positive, rejects.
+    let run = acceptedRun();
+    run.report.checks = run.report.checks.filter(c => c.id !== 'resource.webmeet.anonymous.archive');
+    run.report.counts.PASS = run.report.checks.length;
+    expectReject(run, 'MANDATORY_MISSING', 'anonymous archive denial missing');
+    run = acceptedRun();
+    run.report.checks = run.report.checks.filter(c => c.id !== WEBMEET_POSITIVE_FOR_OP['participant-remove']);
+    run.report.counts.PASS = run.report.checks.length;
+    const result = evaluate(run);
+    assert.ok(result.reasons.includes('MANDATORY_POSITIVE_CONTROL_FAILED: resource.webmeet.selfRegistered.participant-remove'), result.reasons.join(' | '));
+    run = acceptedRun();
+    run.report.checks.find(c => c.id === 'agent.webAssist.anonymous.list-sites-denied').status = 'FAIL';
+    run.report.counts = { PASS: run.report.counts.PASS - 1, FAIL: 1, ERROR: 0 };
+    run.report.verdict = 'FAIL'; run.exitCode = 1;
+    expectReject(run, 'MANDATORY_NOT_PASS', 'webAssist list-sites leak');
+    run = acceptedRun();
+    run.report.checks.find(c => c.id === 'agent.webAssist.anonymous.session-history-isolation').status = 'FAIL';
+    run.report.counts = { PASS: run.report.counts.PASS - 1, FAIL: 1, ERROR: 0 };
+    run.report.verdict = 'FAIL'; run.exitCode = 1;
+    expectReject(run, 'MANDATORY_NOT_PASS', 'webAssist cross-session isolation unproven');
+});
+
+test('policy.json D3 anchors the real answering path of a route without a primary port', () => {
+    const d3 = policy.capabilities.find(c => c.id === 'D3-livekit-no-mcp');
+    const anchors = d3.contract.present.map(a => `${a.path} :: ${a.text}`);
+    for (const wanted of [
+        "cli/server/edgeRoutePlan.js :: kind: 'agent-root-pending',",
+        "cli/server/edgeRoutePlan.js :: diagnosticCategory: 'TARGET_INACTIVE',",
+        "cli/server/agentStartupPage.js :: if (req?.method !== 'GET') return null;",
+        "cli/server/agentStartupDispatch.js :: writeJson(res, 503, { error: 'TARGET_INACTIVE' });",
+        'cli/server/agentStartupDispatch.js :: else writeInactive(res);',
+    ]) assert.ok(anchors.includes(wanted), wanted);
+    assert.ok(!anchors.some(a => a.includes("sendJsonResponse(res, 404, { error: 'agent_not_found'")), 'the unreachable 404 branch is no longer anchored');
+    assert.match(d3.summary, /TARGET_INACTIVE/);
 });

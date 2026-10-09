@@ -8,6 +8,7 @@ import fsPromises from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { assertSessionExpired } from './account-probes.mjs';
+import { pinnedGuestList } from './guest-agent-policy.mjs';
 import { assertAgentReadPositive, assertGuestDiscovery, assertOwnAccountRouteGate, createAgentSessions, discoverAgentMcp, hasGuestCookie, usernamePrivilegeProbe } from './agent-probes.mjs';
 import { classifyAgentCardFanout, runRouterProbes, routerProbes } from './router-probes.mjs';
 import { runTerminalProbes } from './stream-probes.mjs';
@@ -135,22 +136,28 @@ test('agent-card fan-out: the allow probe records an observation for declared ab
 
 // ---- guest-authentication discovery ---------------------------------------------------
 const named = (field, names) => ({ [field]: names.map(name => field === 'resources' ? { name, uri: `file:///${name}` } : { name }) });
-test('guest discovery: a minted guest session and the exact administrator-visible list pass; a bare 200 does not', () => {
-    const ok = { response: response(200, {}), success: true, value: named('tools', ['a', 'b']) };
-    assert.doesNotThrow(() => assertGuestDiscovery(ok, { field: 'tools', adminNames: ['a', 'b'], guestCookie: true }));
-    assert.throws(() => assertGuestDiscovery(ok, { field: 'tools', adminNames: ['a', 'b'], guestCookie: false }), /minted guest session/);
-    assert.throws(() => assertGuestDiscovery({ ...ok, value: named('tools', ['a', 'b', 'c']) }, { field: 'tools', adminNames: ['a', 'b'], guestCookie: true }), /exactly the administrator-visible/);
-    assert.throws(() => assertGuestDiscovery({ ...ok, value: named('tools', ['a']) }, { field: 'tools', adminNames: ['a', 'b'], guestCookie: true }), /exactly/);
-    assert.throws(() => assertGuestDiscovery({ ...ok, success: false }, { field: 'tools', adminNames: ['a', 'b'], guestCookie: true }));
-    assert.throws(() => assertGuestDiscovery({ ...ok, response: response(401, {}) }, { field: 'tools', adminNames: ['a', 'b'], guestCookie: true }));
+test('guest discovery: a minted guest session and the exact reviewed list pass; a bare 200 or an unreviewed list does not', () => {
+    const reviewed = pinnedGuestList('webAssist', 'tools');
+    const ok = { response: response(200, {}), success: true, value: named('tools', reviewed) };
+    const args = { field: 'tools', adminNames: reviewed, guestCookie: true, pinned: reviewed };
+    assert.doesNotThrow(() => assertGuestDiscovery(ok, args));
+    assert.throws(() => assertGuestDiscovery(ok, { ...args, guestCookie: false }), /minted guest session/);
+    assert.throws(() => assertGuestDiscovery({ ...ok, value: named('tools', [...reviewed, 'extra_admin_tool']) }, args), /exactly the reviewed names/);
+    assert.throws(() => assertGuestDiscovery({ ...ok, value: named('tools', reviewed.slice(1)) }, args), /exactly/);
+    // Anonymous equals the live administrator list but both differ from the reviewed list: still a failure.
+    const drifted = [...reviewed, 'a_new_tool'].sort();
+    assert.throws(() => assertGuestDiscovery({ ...ok, value: named('tools', drifted) }, { ...args, adminNames: drifted }), /differ from the reviewed/);
+    assert.throws(() => assertGuestDiscovery({ ...ok, success: false }, args));
+    assert.throws(() => assertGuestDiscovery({ ...ok, response: response(401, {}) }, args));
     assert.equal(hasGuestCookie({ cookies: [{ name: 'ploinky_guest', value: 'x' }] }, undefined), true);
     assert.equal(hasGuestCookie({ cookies: [{ name: 'ploinky_guest', value: '' }] }, undefined), false);
     assert.equal(hasGuestCookie({ cookies: [] }, { headers: { 'set-cookie': ['ploinky_guest=abc; Path=/'] } }), true);
     assert.equal(hasGuestCookie({ cookies: [{ name: 'ploinky_sso', value: 'x' }] }, { headers: {} }), false);
+    assert.throws(() => pinnedGuestList('unreviewedGuestAgent', 'tools'), /no reviewed policy/);
 });
 
 function discoveryWorld({ guest = true, anonymousTools, anonymousStatus = 200, cookie = true } = {}) {
-    const admin = ['list-sites', 'web_cli_chat'];
+    const admin = pinnedGuestList('webAssist', 'tools');
     const checks = [];
     const ctx = {
         report: {}, secrets: new Set(), guestAgents: guest ? [{ repo: 'AchillesIDE', agent: 'webAssist' }] : [], clients: { anonymous: { cookies: cookie ? [{ name: 'ploinky_guest', value: 'g' }] : [] } },
@@ -180,7 +187,7 @@ test('guest discovery flow: only a declared guest agent may answer anonymous dis
     assert.equal((await outcome({ guest: false })).status, 'FAIL');
     // A declared guest agent still fails without a guest session (mode-none route) and on extra names.
     assert.equal((await outcome({ cookie: false })).status, 'FAIL');
-    assert.equal((await outcome({ anonymousTools: ['list-sites', 'web_cli_chat', 'extra_admin_tool'] })).status, 'FAIL');
+    assert.equal((await outcome({ anonymousTools: [...pinnedGuestList('webAssist', 'tools'), 'extra_admin_tool'] })).status, 'FAIL');
     assert.equal((await outcome({ anonymousStatus: 401 })).status, 'FAIL');
 });
 

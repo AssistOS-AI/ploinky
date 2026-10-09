@@ -14,11 +14,12 @@ import path from 'node:path';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
 import { routerProbes } from '../router-probes.mjs';
-import { agentProbes, agentReadTools, agentDiscoveryMethods } from '../agent-probes.mjs';
+import { agentProbes, agentReadTools, agentDiscoveryMethods, webAssistGuestCheckDefinitions } from '../agent-probes.mjs';
 import { templateCheckDefinitions, marketplaceCheckDefinitions } from '../boundary-probes.mjs';
 import { webchatCheckDefinitions } from '../webchat-probes.mjs';
 import { capabilityCheckDefinitions } from '../capability-probes.mjs';
 import { workspaceWriteCheckDefinitions } from '../stream-probes.mjs';
+import { webmeetAdminToolCheckDefinitions, WEBMEET_POSITIVE_FOR_OP } from '../webmeet-admin-tools.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 export const MANDATORY_FILE = path.join(here, 'mandatory-checks.json');
@@ -81,8 +82,8 @@ export const INLINE_TEMPLATES = Object.freeze([
     ['resource-probes.mjs', 'resource.git.${principal}.status', ['anonymous', 'selfRegistered'].map(a => [a]), ['resource.git.local-fixture']],
     ['resource-probes.mjs', 'resource.webmeet.admin-fixture', [[]], null],
     ['resource-probes.mjs', 'resource.webmeet.${principal}.shared-room-positive', ['userA', 'userB'].map(a => [a]), null],
-    ['resource-probes.mjs', 'resource.webmeet.${principal}.rename', ['selfRegistered', 'userA', 'userB'].map(a => [a]), ['resource.webmeet.admin-fixture']],
-    ['resource-probes.mjs', 'resource.webmeet.${principal}.delete', ['selfRegistered', 'userA', 'userB'].map(a => [a]), ['resource.webmeet.admin-fixture']],
+    ['resource-probes.mjs', 'resource.webmeet.${principal}.rename', ['anonymous', 'selfRegistered', 'userA', 'userB'].map(a => [a]), [WEBMEET_POSITIVE_FOR_OP.rename]],
+    ['resource-probes.mjs', 'resource.webmeet.${principal}.delete', ['anonymous', 'selfRegistered', 'userA', 'userB'].map(a => [a]), [WEBMEET_POSITIVE_FOR_OP.delete]],
     ['stream-probes.mjs', 'router:workspace-file-fixture-positive:${actor}', ['admin', 'userA', 'userB'].map(a => [a]), null],
     ['stream-probes.mjs', "router:workspace-file-selector-deny:${actor}:${selector || 'default'}", ['anonymous', 'selfRegistered'].flatMap(a => ['default', '?agent=authorization-suite-nonexistent', '?agent=userPersistoAgent'].map(s => [a, s])), ['router:workspace-file-fixture-positive:admin', 'router:workspace-file-fixture-positive:userA', 'router:workspace-file-fixture-positive:userB']],
     ['stream-probes.mjs', 'router:terminal-discovery-positive:admin', [[]], null],
@@ -199,7 +200,7 @@ export function enumerateMandatoryChecks({ expectedRuntimes, expectedGaps }) {
     for (const [module, template, expansions, positives] of INLINE_TEMPLATES) {
         for (const values of expansions) add(expandTemplate(template, values), { boundary: module.replace('-probes.mjs', ''), source: `tests/security/authorization/${module}`, positiveControlAnyOf: positives });
     }
-    for (const definition of [...templateCheckDefinitions(), ...marketplaceCheckDefinitions(), ...webchatCheckDefinitions(), ...capabilityCheckDefinitions(capabilities), ...workspaceWriteCheckDefinitions()]) add(definition.id, definition);
+    for (const definition of [...templateCheckDefinitions(), ...marketplaceCheckDefinitions(), ...webchatCheckDefinitions(), ...capabilityCheckDefinitions(capabilities), ...workspaceWriteCheckDefinitions(), ...webmeetAdminToolCheckDefinitions(), ...webAssistGuestCheckDefinitions()]) add(definition.id, definition);
     for (const offline of OFFLINE) add(`offline:${offline.repo}:${offline.file}`, { kind: 'offline', boundary: offline.boundary, repo: offline.repo, file: offline.file, tests: offline.tests, source: 'plan rev3 mandatory-check table (unchanged in rev4)' });
 
     const list = [...checks.values()].sort((a, b) => a.id.localeCompare(b.id));

@@ -11,7 +11,7 @@
     }
   ],
   "counts": {
-    "live": 570,
+    "live": 607,
     "offline": 10
   },
   "checks": [
@@ -2042,6 +2042,32 @@
       "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
+      "id": "agent.webAssist.admin.list-sites-positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs webAssistGuestProbes"
+    },
+    {
+      "id": "agent.webAssist.anonymous.list-sites-denied",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.webAssist.admin.list-sites-positive"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs webAssistGuestProbes"
+    },
+    {
+      "id": "agent.webAssist.anonymous.session-history-isolation",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs webAssistGuestProbes"
+    },
+    {
       "id": "agent.webAssist.discovery.resources.list.anonymous",
       "kind": "live",
       "count": 1,
@@ -2792,31 +2818,367 @@
       "source": "tests/security/authorization/resource-probes.mjs"
     },
     {
+      "id": "resource.webmeet.admin-lifecycle-fixture",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "resources",
+      "source": "tests/security/authorization/webmeet-admin-tools.mjs runWebmeetAdminToolProbes"
+    },
+    {
+      "id": "resource.webmeet.admin-tools-fixture",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "resources",
+      "source": "tests/security/authorization/webmeet-admin-tools.mjs runWebmeetAdminToolProbes"
+    },
+    {
+      "id": "resource.webmeet.admin.archive-positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin-lifecycle-fixture"
+      ],
+      "boundary": "resources",
+      "source": "tests/security/authorization/webmeet-admin-tools.mjs runWebmeetAdminToolProbes"
+    },
+    {
+      "id": "resource.webmeet.admin.attach-positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin-tools-fixture"
+      ],
+      "boundary": "resources",
+      "source": "tests/security/authorization/webmeet-admin-tools.mjs runWebmeetAdminToolProbes"
+    },
+    {
+      "id": "resource.webmeet.admin.delete-positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin-lifecycle-fixture"
+      ],
+      "boundary": "resources",
+      "source": "tests/security/authorization/webmeet-admin-tools.mjs runWebmeetAdminToolProbes"
+    },
+    {
+      "id": "resource.webmeet.admin.detach-positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin-tools-fixture"
+      ],
+      "boundary": "resources",
+      "source": "tests/security/authorization/webmeet-admin-tools.mjs runWebmeetAdminToolProbes"
+    },
+    {
+      "id": "resource.webmeet.admin.participant-fixture",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin-tools-fixture"
+      ],
+      "boundary": "resources",
+      "source": "tests/security/authorization/webmeet-admin-tools.mjs runWebmeetAdminToolProbes"
+    },
+    {
+      "id": "resource.webmeet.admin.participant-remove-positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin.participant-fixture"
+      ],
+      "boundary": "resources",
+      "source": "tests/security/authorization/webmeet-admin-tools.mjs runWebmeetAdminToolProbes"
+    },
+    {
+      "id": "resource.webmeet.admin.participant-role-positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin.participant-fixture"
+      ],
+      "boundary": "resources",
+      "source": "tests/security/authorization/webmeet-admin-tools.mjs runWebmeetAdminToolProbes"
+    },
+    {
+      "id": "resource.webmeet.admin.rename-positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin-tools-fixture"
+      ],
+      "boundary": "resources",
+      "source": "tests/security/authorization/webmeet-admin-tools.mjs runWebmeetAdminToolProbes"
+    },
+    {
+      "id": "resource.webmeet.admin.resource-fixture",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin-tools-fixture"
+      ],
+      "boundary": "resources",
+      "source": "tests/security/authorization/webmeet-admin-tools.mjs runWebmeetAdminToolProbes"
+    },
+    {
+      "id": "resource.webmeet.admin.resource-remove-positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin.resource-fixture"
+      ],
+      "boundary": "resources",
+      "source": "tests/security/authorization/webmeet-admin-tools.mjs runWebmeetAdminToolProbes"
+    },
+    {
+      "id": "resource.webmeet.admin.robo-team-get-positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin-tools-fixture"
+      ],
+      "boundary": "resources",
+      "source": "tests/security/authorization/webmeet-admin-tools.mjs runWebmeetAdminToolProbes"
+    },
+    {
+      "id": "resource.webmeet.admin.robo-team-update-positive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin-tools-fixture"
+      ],
+      "boundary": "resources",
+      "source": "tests/security/authorization/webmeet-admin-tools.mjs runWebmeetAdminToolProbes"
+    },
+    {
+      "id": "resource.webmeet.anonymous.archive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin.archive-positive"
+      ],
+      "boundary": "resources",
+      "source": "tests/security/authorization/webmeet-admin-tools.mjs runWebmeetAdminToolProbes"
+    },
+    {
+      "id": "resource.webmeet.anonymous.attach",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin.attach-positive"
+      ],
+      "boundary": "resources",
+      "source": "tests/security/authorization/webmeet-admin-tools.mjs runWebmeetAdminToolProbes"
+    },
+    {
+      "id": "resource.webmeet.anonymous.create",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin-tools-fixture"
+      ],
+      "boundary": "resources",
+      "source": "tests/security/authorization/webmeet-admin-tools.mjs runWebmeetAdminToolProbes"
+    },
+    {
+      "id": "resource.webmeet.anonymous.delete",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin.delete-positive"
+      ],
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.webmeet.anonymous.detach",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin.detach-positive"
+      ],
+      "boundary": "resources",
+      "source": "tests/security/authorization/webmeet-admin-tools.mjs runWebmeetAdminToolProbes"
+    },
+    {
+      "id": "resource.webmeet.anonymous.participant-remove",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin.participant-remove-positive"
+      ],
+      "boundary": "resources",
+      "source": "tests/security/authorization/webmeet-admin-tools.mjs runWebmeetAdminToolProbes"
+    },
+    {
+      "id": "resource.webmeet.anonymous.participant-role",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin.participant-role-positive"
+      ],
+      "boundary": "resources",
+      "source": "tests/security/authorization/webmeet-admin-tools.mjs runWebmeetAdminToolProbes"
+    },
+    {
+      "id": "resource.webmeet.anonymous.rename",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin.rename-positive"
+      ],
+      "boundary": "resource",
+      "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.webmeet.anonymous.resource-remove",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin.resource-remove-positive"
+      ],
+      "boundary": "resources",
+      "source": "tests/security/authorization/webmeet-admin-tools.mjs runWebmeetAdminToolProbes"
+    },
+    {
+      "id": "resource.webmeet.anonymous.robo-team-get",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin.robo-team-get-positive"
+      ],
+      "boundary": "resources",
+      "source": "tests/security/authorization/webmeet-admin-tools.mjs runWebmeetAdminToolProbes"
+    },
+    {
+      "id": "resource.webmeet.anonymous.robo-team-update",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin.robo-team-update-positive"
+      ],
+      "boundary": "resources",
+      "source": "tests/security/authorization/webmeet-admin-tools.mjs runWebmeetAdminToolProbes"
+    },
+    {
+      "id": "resource.webmeet.selfRegistered.archive",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin.archive-positive"
+      ],
+      "boundary": "resources",
+      "source": "tests/security/authorization/webmeet-admin-tools.mjs runWebmeetAdminToolProbes"
+    },
+    {
+      "id": "resource.webmeet.selfRegistered.attach",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin.attach-positive"
+      ],
+      "boundary": "resources",
+      "source": "tests/security/authorization/webmeet-admin-tools.mjs runWebmeetAdminToolProbes"
+    },
+    {
+      "id": "resource.webmeet.selfRegistered.create",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin-tools-fixture"
+      ],
+      "boundary": "resources",
+      "source": "tests/security/authorization/webmeet-admin-tools.mjs runWebmeetAdminToolProbes"
+    },
+    {
       "id": "resource.webmeet.selfRegistered.delete",
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": [
-        "resource.webmeet.admin-fixture"
+        "resource.webmeet.admin.delete-positive"
       ],
       "boundary": "resource",
       "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.webmeet.selfRegistered.detach",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin.detach-positive"
+      ],
+      "boundary": "resources",
+      "source": "tests/security/authorization/webmeet-admin-tools.mjs runWebmeetAdminToolProbes"
+    },
+    {
+      "id": "resource.webmeet.selfRegistered.participant-remove",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin.participant-remove-positive"
+      ],
+      "boundary": "resources",
+      "source": "tests/security/authorization/webmeet-admin-tools.mjs runWebmeetAdminToolProbes"
+    },
+    {
+      "id": "resource.webmeet.selfRegistered.participant-role",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin.participant-role-positive"
+      ],
+      "boundary": "resources",
+      "source": "tests/security/authorization/webmeet-admin-tools.mjs runWebmeetAdminToolProbes"
     },
     {
       "id": "resource.webmeet.selfRegistered.rename",
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": [
-        "resource.webmeet.admin-fixture"
+        "resource.webmeet.admin.rename-positive"
       ],
       "boundary": "resource",
       "source": "tests/security/authorization/resource-probes.mjs"
+    },
+    {
+      "id": "resource.webmeet.selfRegistered.resource-remove",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin.resource-remove-positive"
+      ],
+      "boundary": "resources",
+      "source": "tests/security/authorization/webmeet-admin-tools.mjs runWebmeetAdminToolProbes"
+    },
+    {
+      "id": "resource.webmeet.selfRegistered.robo-team-get",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin.robo-team-get-positive"
+      ],
+      "boundary": "resources",
+      "source": "tests/security/authorization/webmeet-admin-tools.mjs runWebmeetAdminToolProbes"
+    },
+    {
+      "id": "resource.webmeet.selfRegistered.robo-team-update",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "resource.webmeet.admin.robo-team-update-positive"
+      ],
+      "boundary": "resources",
+      "source": "tests/security/authorization/webmeet-admin-tools.mjs runWebmeetAdminToolProbes"
     },
     {
       "id": "resource.webmeet.userA.delete",
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": [
-        "resource.webmeet.admin-fixture"
+        "resource.webmeet.admin.delete-positive"
       ],
       "boundary": "resource",
       "source": "tests/security/authorization/resource-probes.mjs"
@@ -2826,7 +3188,7 @@
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": [
-        "resource.webmeet.admin-fixture"
+        "resource.webmeet.admin.rename-positive"
       ],
       "boundary": "resource",
       "source": "tests/security/authorization/resource-probes.mjs"
@@ -2844,7 +3206,7 @@
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": [
-        "resource.webmeet.admin-fixture"
+        "resource.webmeet.admin.delete-positive"
       ],
       "boundary": "resource",
       "source": "tests/security/authorization/resource-probes.mjs"
@@ -2854,7 +3216,7 @@
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": [
-        "resource.webmeet.admin-fixture"
+        "resource.webmeet.admin.rename-positive"
       ],
       "boundary": "resource",
       "source": "tests/security/authorization/resource-probes.mjs"

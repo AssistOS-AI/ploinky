@@ -149,7 +149,7 @@
         "capability:liveKitServerAgent:twirp-route-deny:anonymous",
         "capability:liveKitServerAgent:mcp-absent-corroboration:admin"
       ],
-      "contractSha256": "410c015ccd6548750bb449ec7ca62ed2d39c22b8e40ed4a13991058ca58baf0f"
+      "contractSha256": "eaef7ae82bae115ed66ef7cb45f30f3f6012eff7296ab7834468b564d30be1d0"
     },
     {
       "id": "D4-soul-no-upstream-mcp",
