@@ -13,6 +13,7 @@ import { HttpRouteAccessPolicy } from '../policy/HttpRouteAccessPolicy.js';
 import { collectManifestHttpRouteAccess } from '../policy/HttpRouteProviders.js';
 import { evaluateRequiredCapability } from './requiredCapability.js';
 import { admitPublicMcpTarget } from '../mcp-proxy/sessionOwnership.mjs';
+import { isSsoProviderUnavailable, recordSsoAdmission } from '../auth/ssoAdmission.js';
 import {
     appendLog,
     appendSetCookie,
@@ -639,6 +640,39 @@ function respondUnauthenticated(req, res, parsedUrl, authContext = resolveAuthCo
     return { ok: false };
 }
 
+// The provider could not decide this admission. The stored session and the
+// browser cookie stay intact; the client retries instead of logging in again.
+function respondAuthenticationUnavailable(req, res, parsedUrl) {
+    appendLog('auth_provider_unavailable', { path: parsedUrl.pathname });
+    const headers = { 'Cache-Control': 'no-store', 'Retry-After': '5' };
+    if (wantsJsonResponse(req, parsedUrl.pathname || '/') || (req.method || 'GET').toUpperCase() !== 'GET') {
+        res.writeHead(503, { ...headers, 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'authentication_unavailable' }));
+    } else {
+        res.writeHead(503, { ...headers, 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Authentication is temporarily unavailable. Retry shortly.');
+    }
+    return { ok: false, error: 'authentication_unavailable' };
+}
+
+async function admitSsoRequest(req, sessionId) {
+    try {
+        const session = await authService.validateSession(sessionId, { reportUnavailable: true });
+        if (!session || (session.expiresAt && Date.now() > session.expiresAt)) return { session: null };
+        recordSsoAdmission(req, {
+            sessionId,
+            session,
+            isCurrent: typeof authService.admissionFence === 'function'
+                ? authService.admissionFence(sessionId)
+                : () => false,
+        });
+        return { session };
+    } catch (error) {
+        if (isSsoProviderUnavailable(error)) return { session: null, unavailable: true };
+        throw error;
+    }
+}
+
 export function buildIdentityHeaders(req) {
     if (!req || !req.user) return {};
     const headers = {};
@@ -802,8 +836,9 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext, 
     if (authContext.mode === 'guest') {
         const ssoCookie = cookies.get(SSO_AUTH_COOKIE_NAME);
         if (ssoCookie && authService.isConfigured()) {
-            const ssoSession = await authService.validateSession(ssoCookie);
-            if (ssoSession && (!ssoSession.expiresAt || Date.now() <= ssoSession.expiresAt)) {
+            const { session: ssoSession, unavailable } = await admitSsoRequest(req, ssoCookie);
+            if (unavailable) return respondAuthenticationUnavailable(req, res, parsedUrl);
+            if (ssoSession) {
                 req.user = ssoSession.user;
                 req.session = ssoSession;
                 req.sessionId = ssoCookie;
@@ -858,7 +893,8 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext, 
         appendLog('auth_missing_cookie', { path: parsedUrl.pathname });
         return respondUnauthenticated(req, res, parsedUrl, authContext, options);
     }
-    const session = await authService.validateSession(sessionId);
+    const { session, unavailable } = await admitSsoRequest(req, sessionId);
+    if (unavailable) return respondAuthenticationUnavailable(req, res, parsedUrl);
     if (!session) {
         appendLog('auth_session_invalid', { sessionId: '[redacted]', mode: authContext.mode });
         return respondUnauthenticated(req, res, parsedUrl, authContext, options);

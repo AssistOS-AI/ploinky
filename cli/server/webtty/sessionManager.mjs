@@ -37,6 +37,7 @@ const AUTH_LEASE_AUDIT_REASONS = new Set([
     'user_changed',
     'session_changed',
     'administrator_revoked',
+    'provider_unavailable',
 ]);
 const RECLAMATION_PROC_REASONS = new Set(['proc-scan-timeout', 'proc-scan-limit', 'proc-file-limit']);
 const RECLAMATION_IO_REASONS = new Set(['EACCES', 'EPERM', 'EIO', 'EMFILE', 'ENFILE']);
@@ -307,14 +308,16 @@ export class WebttySessionManager {
         };
     }
 
+    // The lease comes from this request, so its own completed admission is
+    // reused; later revalidations after asynchronous work ask again.
     async validatedLease(req) {
         const lease = this.auth.createLease(req);
-        await this.revalidateLease(lease);
+        await this.revalidateLease(lease, undefined, { req });
         return lease;
     }
 
-    async revalidateLease(lease, auditPhase) {
-        const currentAuth = await this.auth.validateLease(lease);
+    async revalidateLease(lease, auditPhase, { req = null } = {}) {
+        const currentAuth = await this.auth.validateLease(lease, { req });
         if (!currentAuth.ok) {
             const reason = currentAuth.reason;
             if (AUTH_LEASE_AUDIT_PHASES.has(auditPhase)) {
@@ -329,6 +332,9 @@ export class WebttySessionManager {
             throw errorWithCode(
                 reason === 'administrator_revoked'
                     ? 'WEBTTY_ADMIN_REQUIRED'
+                // An undecided provider maps to the handler's retryable 503.
+                : reason === 'provider_unavailable'
+                    ? 'WEBTTY_UNAVAILABLE'
                 : 'WEBTTY_AUTH_INVALID',
             );
         }
@@ -812,7 +818,12 @@ export class WebttySessionManager {
             return null;
         }
         if (validateAuth) {
-            const result = await this.auth.validateLease(session.lease);
+            // The request's own admission is reused; no second provider call.
+            const result = await this.auth.validateLease(session.lease, { req });
+            // An undecided provider denies this request but leaves the terminal.
+            if (!result.ok && result.reason === 'provider_unavailable') {
+                throw errorWithCode('WEBTTY_UNAVAILABLE');
+            }
             if (!result.ok) {
                 await this.closeSession(session, `auth_${result.reason}`);
                 return null;
@@ -1235,7 +1246,11 @@ export class WebttySessionManager {
                 }
             }
             const auth = await this.auth.validateLease(session.lease);
-            if (!auth.ok) await this.closeSession(session, `auth_${auth.reason}`);
+            // A provider outage keeps the terminal; every request on it still
+            // needs a decided admission, and logout or revocation closes it at once.
+            if (!auth.ok && auth.reason !== 'provider_unavailable') {
+                await this.closeSession(session, `auth_${auth.reason}`);
+            }
         }));
     }
 

@@ -1,5 +1,6 @@
 import { getSession as getLocalSession, isAdminUser, verifySessionJwt, revokeSession as revokeLocalSession } from '../auth/localService.js';
 import { revokeSessionId } from '../auth/sessionRevocations.js';
+import { isSsoProviderUnavailable } from '../auth/ssoAdmission.js';
 import { canonicalControlOrigin, mintAdminCsrfToken } from '../adminControlSecurity.js';
 import {
     BROWSER_CSRF_COOKIE_NAME,
@@ -122,7 +123,7 @@ async function resolveBrowserTokenSession(cookies, authContext) {
                 mode: 'sso',
                 cookieName: SSO_AUTH_COOKIE_NAME,
                 getSession: (sessionId) => authService.isConfigured()
-                    ? authService.validateSession(sessionId)
+                    ? authService.validateSession(sessionId, { reportUnavailable: true })
                     : null,
             },
             {
@@ -136,15 +137,23 @@ async function resolveBrowserTokenSession(cookies, authContext) {
         : [{
             mode: authContext.mode,
             cookieName: getCookieNameForMode(authContext.mode),
-            getSession: (sessionId) => authService.validateSession(sessionId),
+            getSession: (sessionId) => authService.validateSession(sessionId, { reportUnavailable: true }),
         }];
 
     let invalidCookie = null;
     for (const candidate of candidates) {
         const sessionId = cookies.get(candidate.cookieName);
         if (!sessionId) continue;
+        let session;
+        try {
+            session = await candidate.getSession(sessionId);
+        } catch (error) {
+            // An undecided SSO admission neither falls back to another identity
+            // nor clears the cookie.
+            if (isSsoProviderUnavailable(error)) return { unavailable: true };
+            throw error;
+        }
         invalidCookie ||= candidate.cookieName;
-        const session = await candidate.getSession(sessionId);
         if (session && (!session.expiresAt || Date.now() <= session.expiresAt)) {
             return {
                 mode: candidate.mode,
@@ -459,6 +468,16 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
             }
             const cookies = parseCookies(req);
             const tokenSession = await resolveBrowserTokenSession(cookies, authContext);
+            if (tokenSession.unavailable) {
+                appendLog('auth_provider_unavailable', { path: pathname });
+                res.writeHead(503, {
+                    'Content-Type': 'application/json',
+                    'Cache-Control': 'no-store',
+                    'Retry-After': '5',
+                });
+                res.end(JSON.stringify({ ok: false, error: 'authentication_unavailable' }));
+                return true;
+            }
             if (!tokenSession.session) {
                 if (tokenSession.invalidCookie) {
                     const clearCookie = buildCookie(tokenSession.invalidCookie, '', req, '/', {

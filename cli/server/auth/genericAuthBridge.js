@@ -12,6 +12,7 @@ import { findAgent } from '../../utils/utils.js';
 import { emitAuthenticationSessionInvalidated } from './sessionEvents.js';
 import { createProviderConfigReader, tryLoadActiveSnapshot } from './providerConfigValues.js';
 import { validateCanonicalLoginOrigin } from './canonicalLoginOrigin.mjs';
+import { ssoProviderUnavailableError } from './ssoAdmission.js';
 
 /**
  * genericAuthBridge.js
@@ -26,6 +27,15 @@ import { validateCanonicalLoginOrigin } from './canonicalLoginOrigin.mjs';
  * returns a `providerSession` blob and a normalized `user` — core treats both
  * as opaque.
  */
+
+// Upper bound for one provider validation dispatch. It matches the Router's
+// existing 5 s bound for control-plane agent requests (MCP request timeout,
+// agent redirect readiness) and exceeds the Router's fast 503 replies while a
+// provider agent restarts, so an outage is reported instead of awaited.
+export const SSO_VALIDATION_DEADLINE_MS = 5000;
+
+const DENIED = Object.freeze({ session: null, unavailable: false });
+const UNAVAILABLE = Object.freeze({ session: null, unavailable: true });
 
 function __dirname() {
     return path.dirname(fileURLToPath(import.meta.url));
@@ -119,6 +129,9 @@ export function createGenericAuthBridge(options = {}) {
     const clock = typeof options.now === 'function' ? options.now : () => Date.now();
     const validationLanes = new Map();
     let validationEpoch = 0;
+    const validationDeadlineMs = Number.isSafeInteger(options.validationDeadlineMs) && options.validationDeadlineMs > 0
+        ? options.validationDeadlineMs
+        : SSO_VALIDATION_DEADLINE_MS;
     // Pending browser-auth state stays in core, keyed by the random `state`
     // the browser will present on the callback. Per the plan, core holds:
     //   - provider agent name
@@ -314,25 +327,58 @@ export function createGenericAuthBridge(options = {}) {
         };
     }
 
-    async function performRemoteValidation(sessionId, session, epoch) {
-        const current = () => epoch === validationEpoch && sessionStore.getSession(sessionId) === session;
+    // One provider attempt. `isAbandoned` turns true once the deadline settled
+    // the cohort; every later continuation then neither publishes nor deletes.
+    async function attemptRemoteValidation(sessionId, session, epoch, { signal, isAbandoned }) {
+        const current = () => !isAbandoned() && epoch === validationEpoch && sessionStore.getSession(sessionId) === session;
+        const refuse = () => {
+            if (!current()) return DENIED;
+            sessionStore.deleteSession(sessionId);
+            cancelValidation(sessionId);
+            emitAuthenticationSessionInvalidated({ mode: 'sso', sessionId, reason: 'validation_failed' });
+            return DENIED;
+        };
+        let context;
         try {
-            const context = await ensureProvider();
-            if (!current()) return null;
-            const { provider } = context;
-            const fingerprint = fingerprintFor(context.config, context.providerAgent);
-            const userId = session.user?.id;
+            context = await ensureProvider();
+        } catch (_) {
+            // Provider resolution or configuration read failed: no decision.
+            return UNAVAILABLE;
+        }
+        if (!current()) return DENIED;
+        let outcome;
+        let provider;
+        let fingerprint;
+        let userId;
+        try {
+            provider = context.provider;
+            fingerprint = fingerprintFor(context.config, context.providerAgent);
+            userId = session.user?.id;
             const operation = typeof provider.sso_refresh_session === 'function'
                 ? provider.sso_refresh_session.bind(provider)
                 : provider.sso_validate_session?.bind(provider);
             if (!operation) throw new Error('provider has no response-free session validation operation');
-            const outcome = await operation({
+            outcome = await operation({
                 providerSession: structuredClone(session.providerSession || { tokens: session.tokens }),
+                signal,
             });
-            if (!current()) return null;
-            const latest = await ensureProvider();
-            if (!current() || latest.provider !== provider
-                || fingerprintFor(latest.config, latest.providerAgent) !== fingerprint) return null;
+        } catch (error) {
+            if (!current()) return DENIED;
+            return error?.providerUnavailable === true ? UNAVAILABLE : refuse();
+        }
+        if (!current()) return DENIED;
+        let latest;
+        try {
+            latest = await ensureProvider();
+        } catch (_) {
+            return UNAVAILABLE;
+        }
+        if (!current()) return DENIED;
+        // The configuration changed while the provider answered: the answer
+        // belongs to the old configuration, but the session itself was not refused.
+        if (latest.provider !== provider
+            || fingerprintFor(latest.config, latest.providerAgent) !== fingerprint) return UNAVAILABLE;
+        try {
             if (typeof userId !== 'string' || !userId || outcome?.user?.id !== userId
                 || !outcome.providerSession || typeof outcome.providerSession !== 'object'
                 || Array.isArray(outcome.providerSession)) {
@@ -348,25 +394,57 @@ export function createGenericAuthBridge(options = {}) {
                 expiresAt: providerSession?.expiresAt || session.expiresAt,
                 refreshExpiresAt: providerSession?.refreshExpiresAt ?? session.refreshExpiresAt,
             });
-            if (!updated) return null;
+            if (!updated) return DENIED;
             // The general store merges tokens; an admission replaces the entire
             // provider projection so removed metadata cannot survive refresh.
             updated.tokens = tokens;
-            return structuredClone(updated);
+            return Object.freeze({ session: structuredClone(updated), unavailable: false });
         } catch (_) {
-            if (!current()) return null;
-            sessionStore.deleteSession(sessionId);
-            cancelValidation(sessionId);
-            emitAuthenticationSessionInvalidated({ mode: 'sso', sessionId, reason: 'validation_failed' });
-            return null;
+            return refuse();
+        }
+    }
+
+    // Bounds one provider dispatch. On expiry the cohort is denied without
+    // deleting the session, the provider signal is aborted, and the lane moves
+    // on so later callers dispatch a fresh operation.
+    async function performRemoteValidation(sessionId, session, epoch, lane) {
+        const controller = new AbortController();
+        let abandoned = false;
+        let timer = null;
+        const deadline = new Promise((resolve) => {
+            timer = setTimeout(() => {
+                abandoned = true;
+                resolve(UNAVAILABLE);
+                try { controller.abort(new Error('SSO provider validation deadline exceeded')); } catch (_) { }
+            }, validationDeadlineMs);
+            timer.unref?.();
+        });
+        lane.abort = () => {
+            try { controller.abort(new Error('SSO validation cancelled')); } catch (_) { }
+        };
+        try {
+            return await Promise.race([
+                attemptRemoteValidation(sessionId, session, epoch, {
+                    signal: controller.signal,
+                    isAbandoned: () => abandoned,
+                }),
+                deadline,
+            ]);
+        } finally {
+            abandoned = true;
+            clearTimeout(timer);
+            lane.abort = null;
         }
     }
 
     function cancelValidation(sessionId) {
         const lane = validationLanes.get(sessionId);
         if (!lane) return;
-        for (const caller of [...lane.active, ...lane.queued]) caller.resolve(null);
+        for (const caller of [...lane.active, ...lane.queued]) caller.resolve(DENIED);
         lane.queued = [];
+        // Release a provider call nobody is waiting for; the deadline still
+        // bounds providers that ignore the signal.
+        lane.abort?.();
     }
 
     async function drainValidationLane(sessionId, lane) {
@@ -378,29 +456,50 @@ export function createGenericAuthBridge(options = {}) {
                 lane.active = cohort;
                 const { session, epoch } = cohort[0];
                 const result = epoch === validationEpoch && sessionStore.getSession(sessionId) === session
-                    ? await performRemoteValidation(sessionId, session, epoch)
-                    : null;
+                    ? await performRemoteValidation(sessionId, session, epoch, lane)
+                    : DENIED;
                 for (const caller of cohort) caller.resolve(result);
                 lane.active = [];
             }
         } finally {
-            for (const caller of [...lane.active, ...lane.queued]) caller.resolve(null);
+            for (const caller of [...lane.active, ...lane.queued]) caller.resolve(DENIED);
             if (validationLanes.get(sessionId) === lane) validationLanes.delete(sessionId);
         }
     }
 
-    async function validateSession(sessionId) {
+    async function admitSession(sessionId) {
         const session = sessionStore.getSession(sessionId);
-        if (!session) return null;
+        if (!session) return DENIED;
         const epoch = validationEpoch;
         let lane = validationLanes.get(sessionId);
         if (!lane) {
-            lane = { queued: [], active: [] };
+            lane = { queued: [], active: [], abort: null };
             validationLanes.set(sessionId, lane);
             queueMicrotask(() => { void drainValidationLane(sessionId, lane); });
         }
         const result = await new Promise(resolve => lane.queued.push({ session, epoch, resolve }));
-        return epoch === validationEpoch && sessionStore.getSession(sessionId) === session ? result : null;
+        // A deleted or replaced record is a refusal; a configuration change
+        // while the session record survives is retryable.
+        if (sessionStore.getSession(sessionId) !== session) return DENIED;
+        if (epoch !== validationEpoch) return UNAVAILABLE;
+        return result;
+    }
+
+    async function validateSession(sessionId, { reportUnavailable = false } = {}) {
+        const outcome = await admitSession(sessionId);
+        if (outcome.session) return outcome.session;
+        if (reportUnavailable === true && outcome.unavailable) throw ssoProviderUnavailableError();
+        return null;
+    }
+
+    // Captures the live record and epoch at the moment of a completed
+    // admission. Logout, revocation, refusal or a configuration reload turns it
+    // false; it never extends authority beyond the record the bridge still holds.
+    function admissionFence(sessionId) {
+        const epoch = validationEpoch;
+        const record = sessionStore.getSession(sessionId);
+        if (!record) return () => false;
+        return () => epoch === validationEpoch && sessionStore.getSession(sessionId) === record;
     }
 
     async function logout(sessionId, { baseUrl, postLogoutRedirectUri } = {}) {
@@ -488,6 +587,7 @@ export function createGenericAuthBridge(options = {}) {
         handleCallback,
         getSession,
         validateSession,
+        admissionFence,
         refreshSession,
         logout,
         revokeSession,

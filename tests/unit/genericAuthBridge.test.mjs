@@ -31,6 +31,7 @@ function recordCall(op, payload) {
     } catch {}
 }
 export function resolveProviderConfig({ providerConfig = {} } = {}) {
+    if (process.env.__FAKE_PROVIDER_CONFIG_FAIL === '1') throw new Error('fixture configuration unreadable');
     return {
         issuerBaseUrl: providerConfig.issuerBaseUrl || 'https://fake.test',
         clientId: providerConfig.clientId || 'fake-client',
@@ -76,9 +77,9 @@ export function createProvider({ getConfig }) {
             recordCall('sso_validate_session', { providerSession });
             return { user: { id: 'u1', sub: 'u1', username: 'alice' }, providerSession };
         },
-        async sso_refresh_session({ providerSession }) {
+        async sso_refresh_session({ providerSession, signal }) {
             recordCall('sso_refresh_session', { providerSession });
-            if (globalThis.__bridgeValidationFixture) return globalThis.__bridgeValidationFixture(providerSession);
+            if (globalThis.__bridgeValidationFixture) return globalThis.__bridgeValidationFixture(providerSession, { signal });
             if (process.env.__FAKE_PROVIDER_REFRESH_DELAY === '1') {
                 await new Promise((resolve) => setTimeout(resolve, 20));
             }
@@ -139,6 +140,7 @@ function writeWorkspaceSsoConfig(nextSso) {
     fs.writeFileSync(agentsPath, JSON.stringify(existing, null, 2));
 }
 
+const { onAuthenticationSessionInvalidated } = await import('../../cli/server/auth/sessionEvents.js');
 const moduleSuffix = `?test=${Date.now()}`;
 const bridgeModule = await import(`../../cli/server/auth/genericAuthBridge.js${moduleSuffix}`);
 const { createGenericAuthBridge } = bridgeModule;
@@ -577,6 +579,148 @@ for (const outcome of ['failure', 'null', 'missing-user', 'changed-user']) {
         assert.equal(bridge.getSession(sessionId), null);
     });
 }
+
+function providerUnavailable() {
+    return Object.assign(new Error('fixture provider unreachable'), { providerUnavailable: true });
+}
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function recordInvalidations(t) {
+    const events = [];
+    t.after(onAuthenticationSessionInvalidated(event => events.push(event)));
+    return events;
+}
+
+test('an unavailable provider denies the admission retryably, keeps the session and recovers with one call', async (t) => {
+    const { bridge, sessionId } = await freshFixture(t);
+    const invalidations = recordInvalidations(t);
+    let calls = 0;
+    let down = true;
+    globalThis.__bridgeValidationFixture = async providerSession => {
+        calls += 1;
+        if (down) throw providerUnavailable();
+        return described(providerSession, ['user']);
+    };
+    await assert.rejects(bridge.validateSession(sessionId, { reportUnavailable: true }),
+        { code: 'SSO_PROVIDER_UNAVAILABLE' });
+    assert.equal(await bridge.validateSession(sessionId), null, 'plain callers still receive a denial');
+    assert.ok(bridge.getSession(sessionId), 'an undecided validation does not end the session');
+    assert.equal(invalidations.length, 0);
+    down = false;
+    const before = calls;
+    const recovered = await bridge.validateSession(sessionId, { reportUnavailable: true });
+    assert.deepEqual(recovered.user.roles, ['user']);
+    assert.equal(calls - before, 1);
+});
+
+test('a provider configuration read failure denies without ending the session', async (t) => {
+    const { bridge, sessionId } = await freshFixture(t);
+    t.after(() => { delete process.env.__FAKE_PROVIDER_CONFIG_FAIL; });
+    globalThis.__bridgeValidationFixture = providerSession => described(providerSession, ['user']);
+    process.env.__FAKE_PROVIDER_CONFIG_FAIL = '1';
+    await assert.rejects(bridge.validateSession(sessionId, { reportUnavailable: true }),
+        { code: 'SSO_PROVIDER_UNAVAILABLE' });
+    assert.ok(bridge.getSession(sessionId));
+    delete process.env.__FAKE_PROVIDER_CONFIG_FAIL;
+    assert.deepEqual((await bridge.validateSession(sessionId)).user.roles, ['user']);
+});
+
+test('a definitive provider refusal still ends the session and reports a plain denial', async (t) => {
+    const { bridge, sessionId } = await freshFixture(t);
+    const invalidations = recordInvalidations(t);
+    globalThis.__bridgeValidationFixture = async () => {
+        throw Object.assign(new Error('session_revoked'), { code: 'session_revoked', statusCode: 401 });
+    };
+    assert.equal(await bridge.validateSession(sessionId, { reportUnavailable: true }), null);
+    assert.equal(bridge.getSession(sessionId), null);
+    assert.deepEqual(invalidations.map(event => [event.sessionId, event.reason]), [[sessionId, 'validation_failed']]);
+});
+
+test('a hung provider is bounded: the cohort is denied, later callers dispatch afresh and the late result is discarded', async (t) => {
+    const { bridge, sessionId } = await freshFixture(t, { validationDeadlineMs: 50 });
+    const invalidations = recordInvalidations(t);
+    const entered = deferred();
+    const release = deferred();
+    t.after(() => release.resolve());
+    let calls = 0;
+    let hungSignal = null;
+    globalThis.__bridgeValidationFixture = async (providerSession, { signal } = {}) => {
+        const sequence = ++calls;
+        if (sequence === 1) {
+            hungSignal = signal;
+            entered.resolve();
+            await release.promise;
+            return described(providerSession, ['stale-admin']);
+        }
+        return described(providerSession, ['user']);
+    };
+    const hung = bridge.validateSession(sessionId, { reportUnavailable: true })
+        .then(() => 'granted', error => error.code);
+    await entered.promise;
+    const queued = bridge.validateSession(sessionId);
+    assert.equal(await Promise.race([hung, sleep(1000).then(() => 'still pending')]), 'SSO_PROVIDER_UNAVAILABLE');
+    assert.ok(bridge.getSession(sessionId), 'the deadline does not end the session');
+    assert.equal(hungSignal?.aborted, true, 'the provider is told to stop');
+    const queuedResult = await Promise.race([queued, sleep(1000).then(() => 'still pending')]);
+    assert.deepEqual(queuedResult?.user?.roles, ['user'], 'a caller queued behind the hung call gets a fresh dispatch');
+    assert.deepEqual((await bridge.validateSession(sessionId)).user.roles, ['user']);
+    assert.equal(calls, 3);
+    release.resolve();
+    await sleep(20);
+    assert.deepEqual(bridge.getSession(sessionId).user.roles, ['user'], 'the late result is never published');
+    assert.deepEqual((await bridge.validateSession(sessionId)).user.roles, ['user']);
+    assert.equal(invalidations.length, 0);
+});
+
+test('a late refusal from an abandoned provider call cannot end the session', async (t) => {
+    const { bridge, sessionId } = await freshFixture(t, { validationDeadlineMs: 50 });
+    const entered = deferred();
+    const release = deferred();
+    t.after(() => release.resolve());
+    let calls = 0;
+    globalThis.__bridgeValidationFixture = async providerSession => {
+        if (++calls === 1) {
+            entered.resolve();
+            await release.promise;
+            throw new Error('late fixture refusal');
+        }
+        return described(providerSession, ['user']);
+    };
+    const hung = bridge.validateSession(sessionId);
+    await entered.promise;
+    assert.equal(await Promise.race([hung, sleep(1000).then(() => 'still pending')]), null);
+    release.resolve();
+    await sleep(20);
+    assert.ok(bridge.getSession(sessionId), 'the abandoned call deleted nothing');
+    assert.deepEqual((await bridge.validateSession(sessionId)).user.roles, ['user']);
+});
+
+test('a configuration reload releases a hung provider call so new admissions do not wait for it', async (t) => {
+    const { bridge, sessionId } = await freshFixture(t);
+    const entered = deferred();
+    let calls = 0;
+    globalThis.__bridgeValidationFixture = async (providerSession, { signal } = {}) => {
+        if (++calls === 1) {
+            entered.resolve();
+            await new Promise((resolve, reject) => {
+                if (!signal) return;
+                signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { providerUnavailable: true })),
+                    { once: true });
+            });
+        }
+        return described(providerSession, ['user']);
+    };
+    const stale = bridge.validateSession(sessionId);
+    await entered.promise;
+    bridge.reloadConfig();
+    assert.equal(await stale, null);
+    const fresh = await Promise.race([bridge.validateSession(sessionId), sleep(1000).then(() => 'still pending')]);
+    assert.deepEqual(fresh?.user?.roles, ['user']);
+    assert.equal(calls, 2);
+});
 
 test('provider-neutral admin operations are delegated without interpreting provider payloads', async () => {
     writeWorkspaceSsoConfig({ enabled: true, providerAgent: 'fake/fakeProvider', providerConfig: {} });
