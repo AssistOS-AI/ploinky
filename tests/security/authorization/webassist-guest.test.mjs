@@ -66,7 +66,7 @@ function productModel({ defect = '', listSites = 'denied', schema = 'declared', 
     return { status: 200, headers: {}, json: { result: { content: [{ type: 'text', text: JSON.stringify(result) }] } }, text: '' };
   };
   const factory = async actor => {
-    const fixture = { siteId: 'a7-webassist-test', sessionId: `a7-sess-${actor.toLowerCase()}`, marker: `a7-marker-${actor}`, secret: `secret-${actor}-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789` };
+    const fixture = { siteId: 'a7-webassist-test', sessionId: `a7-sess-${actor.toLowerCase()}`, marker: `a7-marker-${actor}`, secret: `${actor === 'anonymous' ? 'AAAAAAAA' : 'BBBBBBBB'}-${actor}-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789` };
     records.set(`${fixture.siteId}/${fixture.sessionId}`, { owner: actor, marker: fixture.marker, secret: fixture.secret });
     return fixture;
   };
