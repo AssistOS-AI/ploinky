@@ -252,14 +252,28 @@ function verifiedAgentCaller(req) {
     return Boolean(req?.marketplaceAgent);
 }
 
+function hasUserDelegation(req) {
+    const raw = req?.headers?.['x-ploinky-user-delegation'];
+    return (Array.isArray(raw) ? raw : [raw]).some(value => value !== undefined && value !== null && String(value).trim() !== '');
+}
+
 function ensureMarketplaceAgentRequest(req, res, details) {
+    let verified;
     try {
-        req.marketplaceAgent = verifyMarketplaceAgentRequest({ req, ...details });
-        return true;
+        verified = verifyMarketplaceAgentRequest({ req, ...details });
     } catch (_) {
         sendMarketplaceError(res, 401, 'agent_assertion_rejected', 'Agent authentication failed.');
         return false;
     }
+    // Marketplace defines no delegated-user projection: an explicitly delegated
+    // request is refused rather than served as a machine request, and its
+    // unverified delegation data is never read as roles.
+    if (hasUserDelegation(req)) {
+        sendMarketplaceError(res, 403, 'user_delegation_unsupported', 'Delegated user context is not supported for Marketplace requests.');
+        return false;
+    }
+    req.marketplaceAgent = verified;
+    return true;
 }
 
 function normalizeMarketplaceRepoName(value) {

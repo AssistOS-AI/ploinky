@@ -23,6 +23,7 @@ const principals = {
     ordinary: { sessionId: 's-ordinary', user: { id: 'u1', username: 'ordinary', roles: ['user'] } },
     selfRegistered: { sessionId: 's-self', user: { id: 'u2', username: 'newcomer', roles: ['selfRegistered'] } },
     noRoles: { sessionId: 's-noroles', user: { id: 'u3', username: 'plain' } },
+    guest: { sessionId: 's-guest', user: { id: 'g0', username: 'visitor', roles: ['guest'] } },
     guestAdmin: { sessionId: 's-guest-admin', user: { id: 'g1', username: 'ops', roles: ['admin', 'guest'] } },
     // Genuine administrator whose username is not "admin".
     realAdmin: { sessionId: 's-real-admin', user: { id: 'ops-1', username: 'operations', roles: ['admin'] } },
@@ -150,37 +151,106 @@ test('free-text startup failure detail is withheld from non-administrators', () 
 
 const callerPrincipal = 'agent:repo/caller';
 const agentEnv = { PLOINKY_AGENT_ID: callerPrincipal, PLOINKY_AGENT_SECRET: deriveAgentRequestSecret(callerPrincipal) };
-async function rawGet(resource, headers) {
+const { MARKETPLACE_AGENT_TARGET } = await import('../../cli/server/authHandlers/marketplaceRoutes.js');
+const cookieOf = who => ({ cookie: `${SSO_AUTH_COOKIE_NAME}=${who.sessionId}` });
+async function rawGet(resource, headers, { search = '', agentListOptions = { liveContainers: [] }, collectContainers } = {}) {
     const req = Readable.from([]);
     req.method = 'GET';
     req.headers = { host: 'explorer.example.test', ...headers };
     const res = { status: 200, setHeader() {}, writeHead(code) { this.status = code; }, end(body) { this.body = JSON.parse(body); } };
-    await handleMarketplaceRoutes(req, res, new URL(`https://explorer.example.test/api/marketplace/${resource}`), { routePlan: plan(), agentListOptions: { liveContainers: [] } });
+    await handleMarketplaceRoutes(req, res, new URL(`https://explorer.example.test/api/marketplace/${resource}${search}`),
+        { routePlan: plan(), agentListOptions, ...(collectContainers ? { collectContainers } : {}) });
     return res;
 }
-test('a verified agent assertion keeps local paths for repository clients', async () => {
-    const { MARKETPLACE_AGENT_TARGET } = await import('../../cli/server/authHandlers/marketplaceRoutes.js');
-    const sign = resource => signAgentHttpAssertion({ method: 'GET', path: `/api/marketplace/${resource}`, query: '',
-        targetAgent: MARKETPLACE_AGENT_TARGET, tool: 'marketplace.read', env: agentEnv });
-    for (const [resource, needle] of [['repos', skillsRoot], ['agents', agentsRoot], ['list-repos', localOnlyRoot]]) {
-        const res = await rawGet(resource, { authorization: `Bearer ${sign(resource)}` });
-        assert.equal(res.status, 200, JSON.stringify(res.body));
-        assert.equal(JSON.stringify(res.body).includes(needle), true, `${resource} lost machine data`);
+const sign = (resource, { tool = 'marketplace.read', targetAgent = MARKETPLACE_AGENT_TARGET, path: signedPath = `/api/marketplace/${resource}`, query = '' } = {}) =>
+    signAgentHttpAssertion({ method: 'GET', path: signedPath, query, targetAgent, tool, env: agentEnv });
+const bearer = token => ({ authorization: `Bearer ${token}` });
+const machineNeedle = { repos: skillsRoot, agents: agentsRoot, 'list-repos': localOnlyRoot };
+const RESOURCES = Object.keys(machineNeedle);
+
+test('a verified agent assertion keeps local paths on every read, with or without a session cookie', async () => {
+    for (const resource of RESOURCES) {
+        for (const cookie of [{}, cookieOf(principals.ordinary), cookieOf(principals.guest)]) {
+            const res = await rawGet(resource, { ...bearer(sign(resource)), ...cookie });
+            assert.equal(res.status, 200, `${resource}: ${JSON.stringify(res.body)}`);
+            assert.equal(JSON.stringify(res.body).includes(machineNeedle[resource]), true, `${resource} lost machine data`);
+        }
     }
 });
 
-test('a browser session with an unverified Bearer is rejected and receives no paths', async () => {
-    const { MARKETPLACE_AGENT_TARGET } = await import('../../cli/server/authHandlers/marketplaceRoutes.js');
-    const wrongTool = resource => signAgentHttpAssertion({ method: 'GET', path: `/api/marketplace/${resource}`, query: '',
-        targetAgent: MARKETPLACE_AGENT_TARGET, tool: 'repositories.install', env: agentEnv });
-    for (const who of [principals.realAdmin, principals.ordinary]) {
-        for (const resource of ['repos', 'agents', 'list-repos']) {
-            for (const token of ['bogus', wrongTool(resource)]) {
-                const res = await rawGet(resource, { authorization: `Bearer ${token}`, cookie: `${SSO_AUTH_COOKIE_NAME}=${who.sessionId}` });
-                assert.equal(res.status, 401, `${resource} ${who.user.id}`);
+test('an unverified Bearer is rejected before any session fallback and never receives paths', async () => {
+    const tamper = token => token.slice(0, -2) + (token.endsWith('AA') ? 'BB' : 'AA');
+    const bad = {
+        'forged signature': resource => tamper(sign(resource)),
+        'wrong target': resource => sign(resource, { targetAgent: 'other-agent' }),
+        'wrong path': resource => sign(resource, { path: '/api/marketplace/unrelated' }),
+        'wrong tool': resource => sign(resource, { tool: 'repositories.install' }),
+        'wrong query': resource => sign(resource, { query: 'x=1' }),
+        'garbage': () => 'bogus',
+    };
+    for (const [label, make] of Object.entries(bad)) {
+        for (const resource of RESOURCES) {
+            for (const who of [principals.realAdmin, principals.ordinary, principals.guest]) {
+                const res = await rawGet(resource, { ...bearer(make(resource)), ...cookieOf(who) });
+                assert.equal(res.status, 401, `${label} ${resource} ${who.user.id}`);
                 assert.equal(res.body.ok, false);
-                assertNoLocalPaths(res.body, `${resource} rejected`);
+                assertNoLocalPaths(res.body, `${label} ${resource}`);
             }
         }
     }
+    // Wrong request: a token signed without a query is refused for a request that carries one.
+    const res = await rawGet('repos', { ...bearer(sign('repos')), ...cookieOf(principals.realAdmin) }, { search: '?x=1' });
+    assert.equal(res.status, 401);
+});
+
+test('a replayed assertion is rejected on the second use', async () => {
+    for (const resource of RESOURCES) {
+        const headers = { ...bearer(sign(resource)), ...cookieOf(principals.ordinary) };
+        assert.equal((await rawGet(resource, headers)).status, 200, resource);
+        const replay = await rawGet(resource, headers);
+        assert.equal(replay.status, 401, resource);
+        assertNoLocalPaths(replay.body, `replayed ${resource}`);
+    }
+});
+
+test('an explicitly delegated Marketplace read is rejected even with a valid assertion', async () => {
+    for (const resource of RESOURCES) {
+        for (const cookie of [{}, cookieOf(principals.realAdmin), cookieOf(principals.ordinary)]) {
+            for (const delegation of ['any-token', 'Bearer eyJhbGciOiJub25lIn0.eyJyb2xlcyI6WyJhZG1pbiJdfQ.']) {
+                const res = await rawGet(resource, { ...bearer(sign(resource)), ...cookie, 'x-ploinky-user-delegation': delegation });
+                assert.equal(res.status, 403, `${resource} ${delegation.slice(0, 8)}`);
+                assert.equal(res.body.error, 'user_delegation_unsupported');
+                assertNoLocalPaths(res.body, `delegated ${resource}`);
+            }
+        }
+    }
+});
+
+test('concurrent machine, admin and non-admin reads through the awaited inventory each get their own projection', async () => {
+    const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+    let calls = 0;
+    // Staggered, reordered inventory completion makes interleaving the norm.
+    const collectContainers = async () => { await delay([15, 1, 8, 3, 12][calls++ % 5]); return []; };
+    const callers = {
+        machine: () => bearer(sign('agents')),
+        admin: () => cookieOf(principals.realAdmin),
+        namedAdmin: () => cookieOf(principals.namedAdmin),
+        guestAdmin: () => cookieOf(principals.guestAdmin),
+        ordinary: () => cookieOf(principals.ordinary),
+    };
+    const jobs = [];
+    for (let round = 0; round < 6; round++) {
+        for (const [label, headers] of Object.entries(callers)) {
+            for (const resource of RESOURCES) {
+                const resourceHeaders = label === 'machine' ? bearer(sign(resource)) : headers();
+                jobs.push(rawGet(resource, resourceHeaders, { agentListOptions: {}, collectContainers }).then(res => ({ label, resource, res })));
+            }
+        }
+    }
+    for (const { label, resource, res } of await Promise.all(jobs)) {
+        assert.equal(res.status, 200, `${label} ${resource}: ${JSON.stringify(res.body)}`);
+        if (label === 'machine' || label === 'admin') assert.equal(JSON.stringify(res.body).includes(machineNeedle[resource]), true, `${label} ${resource} lost data`);
+        else assertNoLocalPaths(res.body, `${label} ${resource}`);
+    }
+    assert.ok(calls >= 6, 'the awaited inventory path was exercised');
 });
