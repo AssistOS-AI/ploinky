@@ -3,7 +3,8 @@
  * Q3, r2b_review_codex.md).
  *
  * userA and userB open the per-user DPU WebChat with identical launch query and
- * tab values. Each user's own stream, unique Router user-message marker and a
+ * tab values; the query carries `webchatProbe.launchArgs` (forward-envelope=1, workspace-dir=.) because the DPU
+ * answers WebChat envelopes only in WebChat mode, which only those launch arguments select. Each user's own stream, unique Router user-message marker and a
  * fresh real DPU acknowledgement are the positive controls. The pinned DPU
  * answers every visible unsupported slash command with the generic line
  * DPU_UNSUPPORTED_REPLY (AchillesIDE dpuAgent/src/index.mjs:250-263) and never
@@ -45,6 +46,13 @@ export const webchatProbe = Object.freeze({
     // disposal and the in-container exit.
     removalMs: 180000,
     maxEventBytes: 256 * 1024,
+    // The DPU only enters WebChat mode (readline envelope loop, handleWebChatCommand) when started with
+    // --forward-envelope=1 or --pageInstanceId= (AssistOSExplorer dpuAgent/src/index.mjs webChatMode). Without them
+    // `--authz-probe=...` becomes a positional research request and the DPU never writes the acknowledgement. These are
+    // the launch parameters the product's only Explorer DPU WebChat entry always sends (explorer file-exp.js, with
+    // dpu-resource-id): the Router turns them into --forward-envelope=1 and --dir=<workspace root>. The manifest's
+    // webchat.forwardEnvelope only governs the Router's stdin envelope forwarding, not the DPU's mode.
+    launchArgs: 'forward-envelope=1&workspace-dir=.',
     dpuEntry: Object.freeze(['node', '/code/src/index.mjs']), // AchillesIDE dpuAgent/manifest.json:25 "cli"
 });
 export const DPU_UNSUPPORTED_REPLY = 'This command is not supported by DPU Research.\n';
@@ -314,7 +322,7 @@ export async function runWebchatProbes(ctx, { openStream = openEventStream, insp
     const { waitMs = webchatProbe.waitMs, settleMs = 1000, removalMs = webchatProbe.removalMs, pollMs = 2000, readyMs = webchatProbe.readyMs, readyPollMs = 25 } = timing;
     const shared = `${nonce}-shared`;
     const tabId = `${nonce}-tab`;
-    const query = (value = shared, extra = '') => `agent=${agent}&${launchKey}=${encodeURIComponent(value)}&tabId=${encodeURIComponent(tabId)}${extra}`;
+    const query = (value = shared, extra = '') => `agent=${agent}&${launchKey}=${encodeURIComponent(value)}&tabId=${encodeURIComponent(tabId)}&${webchatProbe.launchArgs}${extra}`;
     const streams = [];
     const observe = (entry) => { (ctx.report.webchatObservations ||= []).push(entry); };
     (ctx.report.liveLimitations ||= []).push({ ...LIVE_INTERACTION_LIMITATION });

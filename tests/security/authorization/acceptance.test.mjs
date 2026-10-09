@@ -29,6 +29,7 @@ import { ackCount } from './webchat-probes.mjs';
 import { BOX_DATA_MOUNTS } from '../../../ploinky-box/constants.mjs';
 import { inventoryBaseline } from './agent-inventory.mjs';
 import { parseInputEnvelope } from '../../../cli/server/handlers/webchat/messageEnvelope.js';
+import { resolveWebchatLaunchOptions } from '../../../cli/server/handlers/webchat/launchOptions.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const inputs = loadAcceptanceInputs();
@@ -644,19 +645,22 @@ test('the comparator recomputes the mandatory list and the runtime graph instead
 
 const DPU_REPLY_DATA = JSON.stringify(DPU_UNSUPPORTED_REPLY);
 /** Fake Router + pinned DPU with the real protocol shapes: input emits a user-message plus the generic reply; control emits the reply only. */
-function webchatWorld({ copiedInputStatus = 204, copiedControlStatus = 204, reply = DPU_REPLY_DATA, forgedArgs = '', emptyProcesses = false, keepProcesses = false, startup = 'delayed-ready', startupMs = 15 } = {}) {
+function webchatWorld({ copiedInputStatus = 204, copiedControlStatus = 204, reply = DPU_REPLY_DATA, forgedArgs = '', emptyProcesses = false, keepProcesses = false, startup = 'delayed-ready', startupMs = 15, stripForwardEnvelope = false } = {}) {
     const runtimes = new Map();
     let next = 100;
     const handles = new Map();
     const ids = { userA: 'principal-A', userB: 'principal-B' };
-    const world = { inputsBeforeReady: 0, inputsSent: 0 };
+    const world = { inputsBeforeReady: 0, inputsSent: 0, streamPaths: [] };
     const startupEvent = state => ({ event: 'startup-state', data: JSON.stringify({ state }) });
     const valueOf = p => new URLSearchParams(String(p).split('?')[1] || '').get('authz-probe');
     const deliver = (actor, value, events) => { const list = (handles.get(`${actor}|${value}`) || []).filter(h => !h.closed); for (const e of events) list.at(-1)?.push(e); };
     // The pinned DPU (dpuAgent/src/index.mjs runWebChat) answers a visible slash command with the generic reply;
     // any other message starts a research turn that is awaited serially, so nothing queued behind it is answered.
+    // The pinned DPU enters WebChat mode only with --forward-envelope=1 or --pageInstanceId= (index.mjs webChatMode).
+    // Otherwise it is a terminal: the launch flags become a research request and slash lines are never acknowledged.
     const dpuTurn = (runtime, message) => {
         if (!runtime || runtime.researching) return [];
+        if (!runtime.webChatMode) { runtime.researching = true; return []; }
         if (!message.startsWith('/')) { runtime.researching = true; return []; }
         return [{ event: 'message', data: reply }];
     };
@@ -692,11 +696,17 @@ function webchatWorld({ copiedInputStatus = 204, copiedControlStatus = 204, repl
     ctx.secrets.add('browser-session-cookie-value');
     const openStream = async (_ctx, actor, p) => {
         ctx.sequence.push('stream');
+        world.streamPaths.push({ actor, path: p });
         const value = valueOf(p);
         if (value.endsWith(`slot-3`)) return { status: 429, contentType: 'text/plain', events: () => [], close() {} };
         const key = `${actor}|${value}`;
         const created = !runtimes.has(key);
-        if (created) runtimes.set(key, { pid: next++, start: String(5000 + next), actor, value, state: startup === 'ready' ? 'ready' : 'starting' });
+        // The Router's own launch-argument resolution decides the DPU argv.
+        const launchUrl = new URL(p, 'http://localhost');
+        if (stripForwardEnvelope) launchUrl.searchParams.delete('forward-envelope');
+        const cliArgs = resolveWebchatLaunchOptions(launchUrl).cliArgs;
+        const webChatMode = cliArgs.includes('--forward-envelope=1') || cliArgs.some(a => a.startsWith('--pageInstanceId='));
+        if (created) runtimes.set(key, { pid: next++, start: String(5000 + next), actor, value, cliArgs, webChatMode, state: startup === 'ready' ? 'ready' : 'starting' });
         const runtime = runtimes.get(key);
         const events = [startupEvent(runtime.state)];
         let ended = false;
@@ -718,7 +728,7 @@ function webchatWorld({ copiedInputStatus = 204, copiedControlStatus = 204, repl
     const inspectProcesses = async (value, { prefix = false } = {}) => { if (prefix) purge(); return emptyProcesses ? [] : [...runtimes.values()]
         .filter(r => r.state === 'ready')
         .filter(r => prefix ? r.value.startsWith(value) : r.value === value)
-        .map(r => ({ pid: r.pid, start: r.start, ssoUserId: ids[r.actor], args: `node /code/src/index.mjs --authz-probe=${r.value} --sso-user=${r.actor} --sso-user-id=${ids[r.actor]} --sso-roles=user${r.value.endsWith('-forged') ? forgedArgs : ''}`, environ: 'NODE_ENV=production' })); };
+        .map(r => ({ pid: r.pid, start: r.start, ssoUserId: ids[r.actor], args: `node /code/src/index.mjs ${r.cliArgs.join(' ')} --sso-user=${r.actor} --sso-user-id=${ids[r.actor]} --sso-roles=user${r.value.endsWith('-forged') ? forgedArgs : ''}`, environ: 'NODE_ENV=production' })); };
     return { ctx, openStream, inspectProcesses, world };
 }
 const fast = { waitMs: 30, settleMs: 1, removalMs: 30, pollMs: 5, readyMs: 2000, readyPollMs: 2 };
@@ -749,6 +759,29 @@ test('REJECT (real shapes): copied-ID input 503 and copied-ID control 409 are ne
     run.report.counts = { PASS: run.report.checks.filter(c => c.status === 'PASS').length, FAIL: run.report.checks.filter(c => c.status === 'FAIL').length, ERROR: run.report.checks.filter(c => c.status === 'ERROR').length };
     run.report.verdict = 'FAIL'; run.exitCode = 1;
     expectReject(run, 'MANDATORY_NOT_PASS', 'copied-ID failures');
+});
+
+test('U6 launches the DPU in WebChat mode with identical per-user launch queries, and fails when the DPU would run as a terminal', async () => {
+    assert.match(webchatProbe.launchArgs, /(^|&)forward-envelope=1(&|$)/);
+    const world = webchatWorld();
+    await runWebchatProbes(world.ctx, { ...world, timing: fast });
+    assert.deepEqual(u6Statuses(world.ctx).filter(c => c.status !== 'PASS'), []);
+    const shared = world.world.streamPaths.filter(r => /authz-probe=[^&]*-shared&/.test(r.path) && !/webchat-runtime-scope/.test(r.path));
+    const launchOf = actor => shared.filter(r => r.actor === actor).map(r => r.path);
+    for (const actor of ['userA', 'userB']) {
+        assert.ok(launchOf(actor).length > 0 && launchOf(actor).every(q => new URL(q, 'http://x').searchParams.get('forward-envelope') === '1'), `${actor} stream launch carries forward-envelope=1`);
+    }
+    assert.deepEqual(launchOf('userA')[0], launchOf('userB')[0], 'identical launch query for both users');
+    for (const r of world.ctx.report.requests.filter(r => String(r.path).startsWith('/webchat/input?') || String(r.path).startsWith('/webchat/control?'))) assert.ok(new URL(r.path, 'http://x').searchParams.get('forward-envelope') === '1', 'post carries the launch query');
+    // Router argv for the shared launch: the --authz-probe flag survives next to the extra flags in any order.
+    const argv = resolveWebchatLaunchOptions(new URL(`/webchat/stream?${launchOf('userA')[0].split('?')[1]}`, 'http://x')).cliArgs;
+    assert.ok(argv.includes('--forward-envelope=1') && argv.some(a => a.startsWith('--authz-probe=')) && argv.some(a => a.startsWith('--dir=')));
+    for (const fn of world.ctx.cleanups) await fn();
+    const terminal = webchatWorld({ stripForwardEnvelope: true });
+    await runWebchatProbes(terminal.ctx, { ...terminal, timing: fast });
+    assert.equal(status(terminal.ctx, 'u6:webchat-own-marker:userA'), 'FAIL', 'a DPU launched without forward-envelope never acknowledges');
+    assert.equal(status(terminal.ctx, 'u6:webchat-own-control:userA'), 'FAIL');
+    for (const fn of terminal.ctx.cleanups) await fn();
 });
 
 test('U6 negative controls: an invented marker echo, a forged B identity, empty or unattributed process lists and leftover runtimes fail', async () => {
