@@ -131,7 +131,7 @@
       "repo": "AchillesIDE",
       "agent": "liveKitServerAgent",
       "decision": "r2b_remediation_decisions_codex.md D3",
-      "summary": "Custom start, script readiness, host networking: Ploinky resolves start_only without an implicit AgentServer, the sidecar needs an explicit agent command, the start script never launches AgentServer, and the Router rejects a route without a primary port before MCP dispatch.",
+      "summary": "Custom start, script readiness, host networking: Ploinky resolves start_only without an implicit AgentServer, the sidecar needs an explicit agent command, the start script never launches AgentServer, and a route without a primary port is planned as agent-root-pending (cli/server/edgeRoutePlan.js) and answered by the startup dispatcher with 503 TARGET_INACTIVE for any non-GET request, before MCP dispatch.",
       "nonApplicable": [
         "mcp-discovery:tools/list",
         "mcp-discovery:resources/list",
@@ -206,13 +206,33 @@
           },
           {
             "repo": "ploinky",
-            "path": "cli/server/RoutingServer.js",
-            "text": "if (!route.hostPort) {"
+            "path": "cli/server/edgeRoutePlan.js",
+            "text": "kind: 'agent-root-pending',"
+          },
+          {
+            "repo": "ploinky",
+            "path": "cli/server/edgeRoutePlan.js",
+            "text": "diagnosticCategory: 'TARGET_INACTIVE',"
+          },
+          {
+            "repo": "ploinky",
+            "path": "cli/server/agentStartupPage.js",
+            "text": "if (req?.method !== 'GET') return null;"
+          },
+          {
+            "repo": "ploinky",
+            "path": "cli/server/agentStartupDispatch.js",
+            "text": "writeJson(res, 503, { error: 'TARGET_INACTIVE' });"
+          },
+          {
+            "repo": "ploinky",
+            "path": "cli/server/agentStartupDispatch.js",
+            "text": "else writeInactive(res);"
           },
           {
             "repo": "ploinky",
             "path": "cli/server/RoutingServer.js",
-            "text": "sendJsonResponse(res, 404, { error: 'agent_not_found', agent: agentName });"
+            "text": "const startupHandled = await dispatchAgentStartupAfterRouterSurfaces({"
           }
         ]
       }

@@ -142,6 +142,12 @@ export function deriveExpectedRuntimes({ policy, source }) {
     if (!enabledList.length) throw new GraphError('GRAPH_EMPTY', 'no enabled runtime');
     const disabledList = all.filter(a => !enabled.has(identity(a.repo, a.agent))).sort(byIdentity);
     const capabilities = deriveCapabilities({ policy, source, enabled });
+    // Enabled agents whose own manifest selects guest authentication
+    // (cli/utils/manifestAuth.js:21): the Router mints a guest session for
+    // an anonymous visitor on their routes instead of refusing it
+    // (cli/server/authHandlers/authContext.js:1028-1078). The set is derived
+    // from the pinned manifests, never listed by hand.
+    const guestAgents = enabledList.filter(a => resolveManifestAuthMode(source.readManifest(a.repo, a.agent)) === 'guest').map(({ repo, agent }) => ({ repo, agent }));
     return {
         schema: 'authz-expected-runtimes/1',
         rootAgent: policy.rootAgent,
@@ -151,6 +157,7 @@ export function deriveExpectedRuntimes({ policy, source }) {
         enabled: enabledList,
         disabled: disabledList,
         capabilities,
+        guestAgents,
     };
 }
 

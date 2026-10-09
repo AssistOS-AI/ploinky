@@ -2,6 +2,21 @@ import assert from 'node:assert/strict';
 import { Client, assertDenied, assertPrincipal } from './core.mjs';
 import { DASHBOARD } from './principals.mjs';
 
+/**
+ * A replayed cookie whose session no longer exists is answered by the token route
+ * with 401 {"ok":false,"error":"session_expired"} and a Set-Cookie that clears the
+ * cookie (cli/server/authHandlers/authRoutes.js, GET|POST /auth/token: the
+ * `invalidCookie` branch). That is the explicit session-invalidation denial for
+ * this route, so it is asserted exactly here instead of widening assertDenied,
+ * whose content rule serves hundreds of authorization denials.
+ */
+export function assertSessionExpired(response) {
+    assert.equal(response.status, 401, 'A replayed logged-out cookie must be refused with 401');
+    assert.deepEqual(response.json, { ok: false, error: 'session_expired' });
+    const cleared = [].concat(response.headers?.['set-cookie'] || []).some(line => /^ploinky_sso=;/.test(line) && /(^|;\s*)Max-Age=0(;|$)/i.test(line));
+    assert.ok(cleared, 'The refusal must clear the stale session cookie');
+}
+
 export async function runAccountProbes(ctx) {
     const target = ctx.principals.userB;
     const endpoint = `/api/agents/explorer/users/${encodeURIComponent(target.id)}`;
@@ -72,8 +87,13 @@ export async function runSessionProbes(ctx) {
         const token = await ctx.request('userA', { path: '/auth/token?agent=explorer' });
         assert.equal(token.status, 200);
         const clone = new Client(ctx.clients.userA.cookies, { onSecret: value => ctx.secrets.add(value) });
+        // Positive control: before logout the copied cookie is a live session for this principal.
+        const live = await clone.request({ path: '/auth/token?agent=explorer' });
+        assert.equal(live.status, 200, 'The copied session cookie must work before logout');
+        assert.equal(live.json?.ok, true);
+        assert.equal(live.json?.user?.id, ctx.principals.userA.id);
         const response = await ctx.request('userA', { method: 'POST', path: '/auth/logout?agent=explorer', body: { csrfToken: token.json.browserMutation.csrfToken, returnTo: '/' } });
         assert.ok([200, 302, 303].includes(response.status), 'Logout positive control must succeed');
-        assertDenied(await clone.request({ path: '/auth/token?agent=explorer' }));
+        assertSessionExpired(await clone.request({ path: '/auth/token?agent=explorer' }));
     });
 }

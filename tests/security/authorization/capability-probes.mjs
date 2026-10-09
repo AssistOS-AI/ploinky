@@ -17,6 +17,8 @@ const SOUL_HEALTH = '/base-agent-additional-server/soul-gateway/7000/healthz/';
 
 const POSITIVE_CONTROLS = Object.freeze({
     'capability:liveKitServerAgent:twirp-route-deny:anonymous': ['capability:liveKitServerAgent:signaling-route:anonymous'],
+    // The inactive-target answer below is only meaningful for a route that exists without a primary port.
+    'capability:liveKitServerAgent:mcp-absent-corroboration:admin': ['capability:liveKitServerAgent:no-primary-port'],
 });
 
 export function capabilityCheckDefinitions(capabilities = []) {
@@ -70,10 +72,15 @@ export async function runCapabilityProbes(ctx, {
     }
     if (ids.has('capability:liveKitServerAgent:mcp-absent-corroboration:admin')) await ctx.check('capability:liveKitServerAgent:mcp-absent-corroboration:admin', async () => {
         // Corroboration of the classified absent surface only; not an authorization or health result.
+        // The route exists without a primary port (the no-primary-port control), so its plan is
+        // `agent-root-pending` (cli/server/edgeRoutePlan.js, no valid hostPort) and a non-GET
+        // request is answered by the startup dispatcher with exactly
+        // 503 {"error":"TARGET_INACTIVE"} (cli/server/agentStartupDispatch.js, writeInactive)
+        // before any MCP dispatch. No other 503, 404 or timeout is this contract.
         const response = await ctx.request('admin', { method: 'POST', path: '/liveKitServerAgent/mcp', headers: { accept: 'application/json, text/event-stream' },
             body: { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'authorization-regression', version: '1' } } } });
-        assert.equal(response.status, 404, 'The classified LiveKit MCP surface must be absent (404), not unavailable or timing out');
-        assert.equal(response.json?.error, 'agent_not_found');
+        assert.equal(response.status, 503, 'The classified LiveKit MCP surface must be refused as an inactive target');
+        assert.deepEqual(response.json, { error: 'TARGET_INACTIVE' }, 'Only the exact inactive-target body corroborates the absent surface');
         assert.ok(!response.headers?.['mcp-session-id'], 'No MCP session may be created');
     });
     if (ids.has('capability:soul-gateway:health:anonymous')) await ctx.check('capability:soul-gateway:health:anonymous', async () => {

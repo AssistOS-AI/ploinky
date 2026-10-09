@@ -1,5 +1,6 @@
 /** Safe Router probes. The runner supplies credentials and never follows redirects. */
 import assert from 'node:assert/strict';
+import { agentCatalog } from './agent-inventory.mjs';
 const roles = ['anonymous', 'selfRegistered', 'user', 'admin'];
 const nonAdmins = roles.filter(role => role !== 'admin');
 const probes = [];
@@ -129,6 +130,45 @@ export function validateRouterAllowedResponse(probe, response) {
   return { ok: errors.length === 0, errors };
 }
 
+/**
+ * The aggregate /agent-card route asks every routed agent for its card and
+ * returns { agents, errors } (cli/server/RoutingServer.js, handleRoutedAggregateAgentCard;
+ * cli/server/agentCardFanout.js turns a non-2xx upstream answer into
+ * { name, statusCode, error: <raw body> }). An agent whose manifest declares no
+ * `endpoints.agent-card` answers 404 with exactly {"error":"agent-card not configured"}
+ * (Agent/server/AgentServer.mjs, AGENT_CARD_PATH branch); the Soul Gateway is not an
+ * AgentServer and answers its generic unknown-route 404
+ * (proxies soul-gateway/src/core/http-server.mjs:41-43). Such an entry is a
+ * declared absence, not an incomplete fan-out, but only when the catalog confirms the
+ * agent is an enabled runtime that declares no card and every field is exactly the
+ * reviewed answer. Anything else (a timeout, a 5xx, a different body, an unknown name,
+ * a card from an agent that declares none, or a 404 from an agent that does declare one)
+ * stays unexplained and is still recorded as a fan-out gap.
+ */
+const AGENT_SERVER_CARD_ABSENT = JSON.stringify({ error: 'agent-card not configured' });
+const CARD_ABSENT_BODY_BY_AGENT = new Map([['soul-gateway', JSON.stringify({ error: { message: 'Not found', type: 'not_found' } })]]);
+
+export function classifyAgentCardFanout(json, catalog = agentCatalog) {
+  const enabled = name => catalog.find(agent => agent.enabled && agent.agent === name);
+  const declaresCard = name => enabled(name)?.endpointDeclarations?.includes('agent-card') === true;
+  const absent = [];
+  const unexplained = [];
+  for (const entry of json?.errors ?? []) {
+    const name = typeof entry?.name === 'string' ? entry.name : '';
+    const exactShape = JSON.stringify(Object.keys(entry ?? {}).sort()) === JSON.stringify(['error', 'name', 'statusCode']);
+    const expectedBody = CARD_ABSENT_BODY_BY_AGENT.get(name) ?? AGENT_SERVER_CARD_ABSENT;
+    if (exactShape && enabled(name) && !declaresCard(name) && entry.statusCode === 404 && entry.error === expectedBody) absent.push(name);
+    else unexplained.push(name || 'unnamed');
+  }
+  for (const entry of json?.agents ?? []) {
+    const name = typeof entry?.name === 'string' ? entry.name : '';
+    if (!(enabled(name) && declaresCard(name) && entry.statusCode === 200)) unexplained.push(name || 'unnamed');
+  }
+  const names = [...absent, ...unexplained];
+  if (new Set(names).size !== names.length) unexplained.push('duplicate-entry');
+  return { absent: absent.sort(), unexplained: [...new Set(unexplained)].sort() };
+}
+
 /** Never include path values, identity values, or credential-bearing data in findings. */
 export function inspectMarketplaceAuthorization(json, principal) {
   const issues = [];
@@ -225,7 +265,13 @@ export async function runRouterProbes(ctx, { probes: selectedProbes = routerProb
       }
     }
     if (passed && probe.id === 'agent-card.allow' && response.json.errors.length) {
-      ctx.recordGap(`router:${probe.id}:${actor}:fanout`, 'Aggregate card returned per-agent errors; this response is not full agent-card coverage.', { kind: 'fanout-errors', probeId: probe.id, actor });
+      const { absent, unexplained } = classifyAgentCardFanout(response.json);
+      if (unexplained.length) {
+        ctx.recordGap(`router:${probe.id}:${actor}:fanout`, `Aggregate card returned unexplained per-agent errors (${unexplained.join(', ')}); this response is not full agent-card coverage.`, { kind: 'fanout-errors', probeId: probe.id, actor });
+      } else {
+        ctx.report.routerObservations ||= [];
+        ctx.report.routerObservations.push({ actor, id: 'agent-card-declared-absence', agents: absent, source: 'Agent/server/AgentServer.mjs agent-card branch; manifests declare no endpoints.agent-card', note: 'Per-agent 404 answers match the reviewed absence contract exactly; they are not an incomplete fan-out.' });
+      }
     }
   }
 

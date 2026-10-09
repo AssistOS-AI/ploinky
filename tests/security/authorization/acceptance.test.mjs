@@ -5,6 +5,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
+import { EventEmitter } from 'node:events';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -17,8 +18,11 @@ import { capture } from './acceptance/evidence-capture.mjs';
 import { policyDigest } from './acceptance/digest.mjs';
 import { captureExitCode } from './acceptance/run-acceptance.mjs';
 import { runMarketplaceAdmissionProbes, runTemplateProbes, marketplaceProjection } from './boundary-probes.mjs';
-import { runWebchatProbes, dpuProcessInspector, DPU_UNSUPPORTED_REPLY, LIVE_INTERACTION_LIMITATION } from './webchat-probes.mjs';
-import { discoverAgentMcp } from './agent-probes.mjs';
+import { runWebchatProbes, dpuProcessInspector, createStreamHandle, waitForStartupReady, openEventStream, DPU_UNSUPPORTED_REPLY, LIVE_INTERACTION_LIMITATION } from './webchat-probes.mjs';
+import { discoverAgentMcp, webAssistGuestCheckDefinitions } from './agent-probes.mjs';
+import { workspaceWriteMatrix, workspaceWriteCheckDefinitions } from './stream-probes.mjs';
+import { webmeetAdminToolCheckDefinitions, WEBMEET_POSITIVE_FOR_OP } from './webmeet-admin-tools.mjs';
+import { WEBMEET_ADMIN_ONLY_TOOLS } from './guest-agent-policy.mjs';
 import { runCapabilityProbes, nonApplicableRecord } from './capability-probes.mjs';
 import { deriveCapabilities } from './acceptance/expected-runtime-graph.mjs';
 import { ackCount } from './webchat-probes.mjs';
@@ -639,17 +643,25 @@ test('the comparator recomputes the mandatory list and the runtime graph instead
 
 const DPU_REPLY_DATA = JSON.stringify(DPU_UNSUPPORTED_REPLY);
 /** Fake Router + pinned DPU with the real protocol shapes: input emits a user-message plus the generic reply; control emits the reply only. */
-function webchatWorld({ copiedInputStatus = 204, copiedControlStatus = 204, reply = DPU_REPLY_DATA, forgedArgs = '', emptyProcesses = false, keepProcesses = false } = {}) {
+function webchatWorld({ copiedInputStatus = 204, copiedControlStatus = 204, reply = DPU_REPLY_DATA, forgedArgs = '', emptyProcesses = false, keepProcesses = false, startup = 'delayed-ready', startupMs = 15 } = {}) {
     const runtimes = new Map();
     let next = 100;
     const handles = new Map();
     const ids = { userA: 'principal-A', userB: 'principal-B' };
+    const world = { inputsBeforeReady: 0, inputsSent: 0 };
+    const startupEvent = state => ({ event: 'startup-state', data: JSON.stringify({ state }) });
     const valueOf = p => new URLSearchParams(String(p).split('?')[1] || '').get('authz-probe');
     const deliver = (actor, value, events) => { const list = (handles.get(`${actor}|${value}`) || []).filter(h => !h.closed); for (const e of events) list.at(-1)?.push(e); };
     const ctx = fakeCtx((actor, { path: p, body }) => {
         const route = p.split('?')[0];
         if (['anonymous', 'selfRegistered'].includes(actor)) return json(actor === 'anonymous' ? 401 : 403, { ok: false, error: 'authentication required' });
         const value = valueOf(p);
+        // Like the Router (runtimeRoutes.js:304-306): no input while the runtime is starting.
+        if (['/webchat/input', '/webchat/control'].includes(route)) {
+            world.inputsSent++;
+            const runtime = runtimes.get(`${actor}|${value}`);
+            if (runtime?.state !== 'ready') { world.inputsBeforeReady++; return { status: 409, text: 'Agent startup is still in progress.', headers: {} }; }
+        }
         if (route === '/webchat/input') {
             if (body.text.includes('B-copied') && copiedInputStatus !== 204) return { status: copiedInputStatus, text: 'Service Unavailable', headers: {} };
             deliver(actor, value, [{ event: 'user-message', data: JSON.stringify({ sourceTabId: 't', message: { role: 'user', text: body.text } }) }, { event: 'message', data: reply }]);
@@ -669,22 +681,33 @@ function webchatWorld({ copiedInputStatus = 204, copiedControlStatus = 204, repl
         const value = valueOf(p);
         if (value.endsWith(`slot-3`)) return { status: 429, contentType: 'text/plain', events: () => [], close() {} };
         const key = `${actor}|${value}`;
-        if (!runtimes.has(key)) runtimes.set(key, { pid: next++, start: String(5000 + next), actor, value });
-        const events = [];
-        const handle = { status: 200, contentType: 'text/event-stream', events: () => [...events], push: e => events.push(e), closed: false,
+        const created = !runtimes.has(key);
+        if (created) runtimes.set(key, { pid: next++, start: String(5000 + next), actor, value, state: startup === 'ready' ? 'ready' : 'starting' });
+        const runtime = runtimes.get(key);
+        const events = [startupEvent(runtime.state)];
+        let ended = false;
+        const handle = { status: 200, contentType: 'text/event-stream', events: () => [...events], push: e => events.push(e), closed: false, ended: () => ended,
             close() { handle.closed = true; } };
         handles.set(key, [...(handles.get(key) || []), handle]);
+        if (created && runtime.state === 'starting' && startup !== 'never') setTimeout(() => {
+            if (startup === 'delayed-ready') { runtime.state = 'ready'; for (const h of handles.get(key)) h.push(startupEvent('ready')); }
+            else if (startup === 'failed') { runtime.state = 'failed'; for (const h of handles.get(key)) h.push(startupEvent('failed')); }
+            else if (startup === 'close') for (const h of handles.get(key)) h.push({ event: 'close', data: JSON.stringify({ state: 'failed' }) });
+            else if (startup === 'end') ended = true;
+        }, startupMs);
         return handle;
     };
     // Like the Router's delayed disconnect cleanup: a runtime whose streams are all
     // closed survives a reconnect and disappears by the time removal is polled.
     const purge = () => { if (keepProcesses) return; for (const [key] of runtimes) if ((handles.get(key) || []).every(h => h.closed)) runtimes.delete(key); };
+    // A runtime that is not ready yet has no attributable DPU process.
     const inspectProcesses = async (value, { prefix = false } = {}) => { if (prefix) purge(); return emptyProcesses ? [] : [...runtimes.values()]
+        .filter(r => r.state === 'ready')
         .filter(r => prefix ? r.value.startsWith(value) : r.value === value)
         .map(r => ({ pid: r.pid, start: r.start, ssoUserId: ids[r.actor], args: `node /code/src/index.mjs --authz-probe=${r.value} --sso-user=${r.actor} --sso-user-id=${ids[r.actor]} --sso-roles=user${r.value.endsWith('-forged') ? forgedArgs : ''}`, environ: 'NODE_ENV=production' })); };
-    return { ctx, openStream, inspectProcesses };
+    return { ctx, openStream, inspectProcesses, world };
 }
-const fast = { waitMs: 30, settleMs: 1, removalMs: 30, pollMs: 5 };
+const fast = { waitMs: 30, settleMs: 1, removalMs: 30, pollMs: 5, readyMs: 2000, readyPollMs: 2 };
 const status = (ctx, id) => ctx.report.checks.find(c => c.id === id)?.status;
 
 test('U6 WebChat probe passes on the real DPU acknowledgement shape, guards every stream and records the interaction limitation', async () => {
@@ -842,11 +865,19 @@ test('REJECT: a supported DPU MCP method returning 404 or -32000 is never exclud
 test('capability probes: retained controls pass on the real shapes and fail on missing/failed services', async () => {
     const lk = expectedRuntimes.capabilities.find(c => c.agent === 'liveKitServerAgent');
     const caps = policy.capabilities;
-    const handler = ({ soulDb = true, signal = 200, mcp404 = true } = {}) => (actor, { path: p, method = 'GET' }) => {
+    const handler = ({ soulDb = true, signal = 200, mcp = 'inactive' } = {}) => (actor, { path: p, method = 'GET' }) => {
         if (p.endsWith('/healthz/')) return json(200, { ok: true, db: soulDb, snapshotGeneration: 1, uptimeSeconds: 5 });
         if (p.endsWith('/7880/')) return { status: signal, text: 'OK', headers: {} };
         if (p.includes('/twirp/')) return json(401, { ok: false, error: 'not_authenticated' });
-        if (p === '/liveKitServerAgent/mcp') return mcp404 ? json(404, { error: 'agent_not_found', agent: 'liveKitServerAgent' }) : json(200, { jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'still starting' } });
+        if (p === '/liveKitServerAgent/mcp') {
+            // Real shape: a route without a primary port is answered with the exact inactive-target 503.
+            if (mcp === 'inactive') return json(503, { error: 'TARGET_INACTIVE' });
+            if (mcp === 'agent_not_found') return json(404, { error: 'agent_not_found', agent: 'liveKitServerAgent' });
+            if (mcp === 'other-503') return json(503, { error: 'edge_generation_changed' });
+            if (mcp === 'inactive-with-detail') return json(503, { error: 'TARGET_INACTIVE', detail: 'x' });
+            if (mcp === 'inactive-with-session') return { ...json(503, { error: 'TARGET_INACTIVE' }), headers: { 'mcp-session-id': 'created' } };
+            return json(200, { jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'still starting' } });
+        }
         return json(404, {});
     };
     const deps = (overrides = {}) => ({ capabilities: caps,
@@ -863,13 +894,26 @@ test('capability probes: retained controls pass on the real shapes and fail on m
         [handler(), { hostPort: 43000 }, 'capability:liveKitServerAgent:no-primary-port'],
         [handler(), { running: false }, 'capability:liveKitServerAgent:runtime-image'],
         [handler(), { image: 'docker.io/other@sha256:y' }, 'capability:liveKitServerAgent:runtime-image'],
-        [handler({ mcp404: false }), {}, 'capability:liveKitServerAgent:mcp-absent-corroboration:admin'],
+        [handler({ mcp: 'agent_not_found' }), {}, 'capability:liveKitServerAgent:mcp-absent-corroboration:admin'],
+        [handler({ mcp: 'other-503' }), {}, 'capability:liveKitServerAgent:mcp-absent-corroboration:admin'],
+        [handler({ mcp: 'inactive-with-detail' }), {}, 'capability:liveKitServerAgent:mcp-absent-corroboration:admin'],
+        [handler({ mcp: 'inactive-with-session' }), {}, 'capability:liveKitServerAgent:mcp-absent-corroboration:admin'],
+        [handler({ mcp: 'still-starting' }), {}, 'capability:liveKitServerAgent:mcp-absent-corroboration:admin'],
     ];
     for (const [h, o, id] of cases) {
         const ctx = fakeCtx(h); ctx.report.deployment = good.report.deployment;
         await runCapabilityProbes(ctx, deps(o));
         assert.equal(ctx.report.checks.find(c => c.id === id).status, 'FAIL', id);
     }
+    // The inactive-target corroboration is mandatory only with its no-primary-port control.
+    const corroboration = mandatory.checks.find(c => c.id === 'capability:liveKitServerAgent:mcp-absent-corroboration:admin');
+    assert.deepEqual(corroboration.positiveControlAnyOf, ['capability:liveKitServerAgent:no-primary-port']);
+    const failedControl = acceptedRun();
+    failedControl.report.checks.find(c => c.id === 'capability:liveKitServerAgent:no-primary-port').status = 'FAIL';
+    failedControl.report.counts = { PASS: failedControl.report.counts.PASS - 1, FAIL: 1, ERROR: 0 };
+    failedControl.report.verdict = 'FAIL'; failedControl.exitCode = 1;
+    const rejected = evaluate(failedControl);
+    assert.ok(rejected.reasons.includes('MANDATORY_POSITIVE_CONTROL_FAILED: capability:liveKitServerAgent:mcp-absent-corroboration:admin'), rejected.reasons.join(' | '));
     const down = fakeCtx(handler({ signal: 503 })); down.report.deployment = good.report.deployment;
     await runCapabilityProbes(down, deps());
     assert.equal(down.report.checks.find(c => c.id === 'capability:liveKitServerAgent:signaling-route:anonymous').status, 'FAIL');
@@ -883,4 +927,353 @@ test('DPU acknowledgement accumulates split SSE frames per stream without credit
     assert.equal(ackCount(stream([frame(DPU_UNSUPPORTED_REPLY.slice(0, half)), frame(DPU_UNSUPPORTED_REPLY.slice(half))])), 1);
     assert.equal(ackCount(stream([frame(DPU_UNSUPPORTED_REPLY.slice(0, half))])), 0, 'a partial reply is not an acknowledgement');
     assert.equal(ackCount(stream([frame(DPU_UNSUPPORTED_REPLY), { event: 'user-message', data: JSON.stringify({ message: { text: DPU_UNSUPPORTED_REPLY } }) }, frame(DPU_UNSUPPORTED_REPLY)])), 2);
+});
+
+test('Router workspace-write matrix: all 68 checks are mandatory, counted once and gated on the positive the runtime uses', () => {
+    const { positives, denials } = workspaceWriteMatrix();
+    const rows = [...positives, ...denials];
+    assert.equal(rows.length, 68);
+    assert.deepEqual(workspaceWriteCheckDefinitions().map(d => d.id), rows.map(r => r.id));
+    for (const row of rows) {
+        const entries = mandatory.checks.filter(c => c.id === row.id);
+        assert.equal(entries.length, 1, row.id);
+        assert.equal(entries[0].kind, 'live');
+        assert.equal(entries[0].count, 1, `${row.id} is recorded once per run`);
+        if (!row.positiveControl) { assert.equal(entries[0].positiveControlAnyOf, null, row.id); continue; }
+        assert.deepEqual(entries[0].positiveControlAnyOf, [row.positiveControl], row.id);
+        const positive = positives.find(p => p.id === row.positiveControl);
+        assert.ok(positive, `${row.id} names a real positive`);
+        assert.equal(positive.operation, row.operation, `${row.id}: the positive proves the same sink`);
+        assert.ok(['admin', 'userA'].includes(positive.actor), 'the positive is an entitled actor');
+    }
+    assert.equal(denials.filter(r => r.operation === 'sink-upload').every(r => r.positiveControl === 'router:workspace-upload-owner-positive:admin'), true);
+    assert.deepEqual({ live: mandatory.counts.live, offline: mandatory.counts.offline }, { live: 612, offline: 10 });
+});
+
+test('Router workspace-write matrix: no row can be satisfied as an expected gap, and an unavailable denial rejects twice', () => {
+    const { positives, denials } = workspaceWriteMatrix();
+    const rows = [...positives, ...denials];
+    for (const row of rows) {
+        const file = clone(expectedGaps);
+        file.gaps.find(g => g.id === 'agent.inference').id = row.id;
+        assert.ok(validateExpectedGaps(file, inputs).some(e => e.startsWith('GAP_FORBIDDEN_ID')), `${row.id} must be a forbidden gap identity`);
+    }
+    // The same identities stay forbidden for the legacy selector and fixture controls.
+    for (const id of ['router:workspace-file-selector-deny:anonymous:?agent=userPersistoAgent', 'router:workspace-file-fixture-positive:admin', 'router:workspace-upload-selector-deny:anonymous:0']) {
+        const file = clone(expectedGaps);
+        file.gaps.find(g => g.id === 'agent.inference').id = id;
+        assert.ok(validateExpectedGaps(file, inputs).some(e => e.startsWith('GAP_FORBIDDEN_ID')), id);
+    }
+    // A denial recorded as a positive-unavailable gap instead of a check is missing and unexpected.
+    const id = denials[0].id;
+    const run = acceptedRun();
+    run.report.checks = run.report.checks.filter(c => c.id !== id);
+    run.report.counts.PASS = run.report.checks.length;
+    run.report.gaps.push({ id, reason: 'positive-unavailable', evidence: { kind: 'positive-unavailable' } });
+    const result = evaluate(run);
+    assert.equal(result.decision, 'REJECT');
+    assert.ok(result.reasons.includes(`MANDATORY_MISSING: ${id}`));
+    assert.ok(result.reasons.includes(`GAP_UNEXPECTED: ${id}`));
+});
+
+test('Router workspace-write matrix: a failed or missing positive rejects the run and each dependent denial', () => {
+    const { denials } = workspaceWriteMatrix();
+    for (const positiveId of ['router:workspace-upload-owner-positive:admin', 'router:webchat-upload-positive:admin', 'router:webchat-directory-create-positive:admin', 'router:webchat-directory-list-positive:userA', 'router:webchat-suggestions-positive:userA']) {
+        const run = acceptedRun();
+        run.report.checks = run.report.checks.filter(c => c.id !== positiveId);
+        run.report.counts.PASS = run.report.checks.length;
+        const result = evaluate(run);
+        assert.equal(result.decision, 'REJECT', positiveId);
+        assert.ok(result.reasons.includes(`MANDATORY_MISSING: ${positiveId}`), positiveId);
+        for (const denial of denials.filter(d => d.positiveControl === positiveId)) {
+            assert.ok(result.reasons.includes(`MANDATORY_POSITIVE_CONTROL_FAILED: ${denial.id}`), `${denial.id} depends on ${positiveId}`);
+        }
+        const failed = acceptedRun();
+        failed.report.checks.find(c => c.id === positiveId).status = 'FAIL';
+        failed.report.counts = { PASS: failed.report.counts.PASS - 1, FAIL: 1, ERROR: 0 };
+        failed.report.verdict = 'FAIL'; failed.exitCode = 1;
+        expectReject(failed, 'MANDATORY_NOT_PASS', positiveId);
+    }
+    // One denial that FAILs rejects even when every positive control passed.
+    const run = acceptedRun();
+    run.report.checks.find(c => c.id === denials[7].id).status = 'FAIL';
+    run.report.counts = { PASS: run.report.counts.PASS - 1, FAIL: 1, ERROR: 0 };
+    run.report.verdict = 'FAIL'; run.exitCode = 1;
+    expectReject(run, 'MANDATORY_NOT_PASS', 'denied write that FAILed');
+    const duplicated = acceptedRun();
+    duplicated.report.checks.push({ id: denials[8].id, status: 'PASS' });
+    duplicated.report.counts.PASS += 1;
+    expectReject(duplicated, 'MANDATORY_DUPLICATE', 'denial recorded twice');
+});
+
+// U6 readiness: input and the process census wait for the Router's startup-state.
+const u6Statuses = ctx => ctx.report.checks.filter(c => c.id.startsWith('u6:'));
+const startupObservations = ctx => (ctx.report.webchatObservations || []).filter(o => o.step === 'startup');
+
+test('U6 waits for startup-state ready before any input or process census, and a 409 is never retried around', async () => {
+    const world = webchatWorld({ startup: 'delayed-ready', startupMs: 60 });
+    // The model refuses input while starting, exactly like the Router.
+    const early = await world.openStream(world.ctx, 'userA', '/webchat/stream?agent=dpuAgent&authz-probe=early');
+    assert.deepEqual(early.events().map(e => e.event), ['startup-state']);
+    assert.equal((await world.ctx.request('userA', { method: 'POST', path: '/webchat/input?authz-probe=early', body: { text: 'x' } })).status, 409);
+    world.world.inputsBeforeReady = 0; world.world.inputsSent = 0;
+    await runWebchatProbes(world.ctx, { ...world, timing: fast });
+    assert.deepEqual(u6Statuses(world.ctx).filter(c => c.status !== 'PASS'), []);
+    assert.equal(world.world.inputsBeforeReady, 0, 'no input was sent before the runtime reported ready');
+    assert.ok(world.world.inputsSent >= 8, 'inputs were actually sent after readiness');
+    const own = startupObservations(world.ctx);
+    assert.ok(own.length >= 4 && own.every(o => o.ready === true), 'every waited stream observed ready');
+    for (const fn of world.ctx.cleanups) await fn();
+});
+
+for (const [startup, reason] of [['failed', 'failed'], ['close', 'closed'], ['end', 'stream-ended'], ['never', 'timeout']]) {
+    test(`U6 fails closed when the runtime ${startup === 'never' ? 'never reports ready' : `reports ${startup}`}: no input, no census, no credit`, async () => {
+        const world = webchatWorld({ startup, startupMs: 5 });
+        await runWebchatProbes(world.ctx, { ...world, timing: { ...fast, readyMs: startup === 'never' ? 80 : 2000 } });
+        assert.equal(status(world.ctx, 'u6:webchat-own-stream:userA'), 'FAIL');
+        assert.ok(startupObservations(world.ctx).some(o => o.ready === false && o.reason === reason), `observed ${reason}`);
+        assert.equal(world.world.inputsSent, 0, 'nothing was sent to a runtime that never became ready');
+        assert.deepEqual(u6Statuses(world.ctx).filter(c => c.status === 'PASS'), [], 'no U6 credit at all');
+        assert.ok(world.ctx.report.gaps.length > 10 && world.ctx.report.gaps.every(g => g.evidence.kind === 'positive-unavailable'));
+        const run = acceptedRun();
+        run.report.checks = run.report.checks.filter(c => !c.id.startsWith('u6:')).concat(u6Statuses(world.ctx));
+        run.report.counts = { PASS: run.report.checks.filter(c => c.status === 'PASS').length, FAIL: run.report.checks.filter(c => c.status === 'FAIL').length, ERROR: 0 };
+        run.report.verdict = 'FAIL'; run.exitCode = 1;
+        expectReject(run, 'MANDATORY_NOT_PASS', 'unready runtime');
+        for (const fn of world.ctx.cleanups) await fn().catch(() => {});
+    });
+}
+
+test('waitForStartupReady: latest state wins, failure and close are final, unknown states are ignored, the deadline is bounded', async () => {
+    const handle = (events, ended = false) => ({ events: () => events, ended: () => ended });
+    const ev = (event, state) => ({ event, data: JSON.stringify({ state }) });
+    assert.deepEqual(await waitForStartupReady(handle([ev('startup-state', 'starting'), ev('startup-state', 'ready')]), { ms: 50, pollMs: 2 }), { ok: true });
+    assert.deepEqual(await waitForStartupReady(handle([ev('startup-state', 'starting')]), { ms: 30, pollMs: 2 }), { ok: false, reason: 'timeout' });
+    assert.deepEqual(await waitForStartupReady(handle([ev('startup-state', 'starting')], true), { ms: 50, pollMs: 2 }), { ok: false, reason: 'stream-ended' });
+    assert.deepEqual(await waitForStartupReady(handle([ev('startup-state', 'ready'), ev('startup-state', 'failed')]), { ms: 50, pollMs: 2 }), { ok: false, reason: 'failed' });
+    assert.deepEqual(await waitForStartupReady(handle([ev('startup-state', 'ready'), ev('close', 'closed')]), { ms: 50, pollMs: 2 }), { ok: false, reason: 'closed' });
+    assert.equal((await waitForStartupReady(handle([ev('startup-state', 'warming'), { event: 'message', data: '"ready"' }, { event: 'startup-state', data: 'not json' }]), { ms: 20, pollMs: 2 })).ok, false, 'only a parsed {"state":"ready"} startup-state counts');
+    // A ready event that arrives later is observed while polling.
+    const live = []; const pending = waitForStartupReady(handle(live), { ms: 500, pollMs: 2 });
+    setTimeout(() => live.push(ev('startup-state', 'ready')), 20);
+    assert.deepEqual(await pending, { ok: true });
+});
+
+test('SSE stream handle parses frames split across chunks, ignores comments, and reports transport end', async () => {
+    const res = new EventEmitter();
+    Object.assign(res, { statusCode: 200, headers: { 'content-type': 'text/event-stream' }, setEncoding() {}, destroy() { res.emit('close'); } });
+    const handle = createStreamHandle(res, null);
+    assert.equal(handle.status, 200);
+    res.emit('data', ': connected\n\nevent: startup-st');
+    res.emit('data', 'ate\ndata: {"state":"starting"}\n\nevent: startup-state\ndata: {"state":"re');
+    assert.deepEqual(handle.events().map(e => [e.event, e.data]), [['startup-state', '{"state":"starting"}']]);
+    assert.equal(handle.ended(), false);
+    assert.deepEqual(await Promise.race([waitForStartupReady(handle, { ms: 20, pollMs: 2 }), new Promise(r => setTimeout(() => r('slow'), 200))]), { ok: false, reason: 'timeout' });
+    res.emit('data', 'ady"}\n\n');
+    assert.deepEqual(await waitForStartupReady(handle, { ms: 50, pollMs: 2 }), { ok: true });
+    res.emit('data', 'event: close\ndata: {"state":"closed"}\n\n');
+    assert.deepEqual(await waitForStartupReady(handle, { ms: 50, pollMs: 2 }), { ok: false, reason: 'closed' });
+    res.emit('end');
+    assert.equal(handle.ended(), true);
+    const dead = new EventEmitter();
+    Object.assign(dead, { statusCode: 200, headers: {}, setEncoding() {}, destroy() {} });
+    const deadHandle = createStreamHandle(dead, null);
+    dead.emit('end');
+    assert.deepEqual(await waitForStartupReady(deadHandle, { ms: 50, pollMs: 2 }), { ok: false, reason: 'stream-ended' });
+});
+
+test('DPU inspector accepts a /proc entry vanishing only for an owned pid during owned removal polling', async () => {
+    const box = 'c'.repeat(64);
+    const container = 'ploinky_AchillesIDE_dpuAgent_testExplorerFresh_d8f88a10';
+    const row = (pid, start, value) => `${pid}\t${start}\tnode\x1f/code/src/index.mjs\x1f--authz-probe=${value}\x1f--sso-user-id=principal-A`;
+    const missing = pid => Object.assign(new Error(`Command failed: podman exec cat /proc/${pid}/environ\ncat: /proc/${pid}/environ: No such file or directory\n`), { stderr: `cat: /proc/${pid}/environ: No such file or directory\n` });
+    const make = ({ lists, environ }) => {
+        let call = 0;
+        return dpuProcessInspector({ boxId: box, container, run: args => {
+            if (args.includes('sh')) return lists[Math.min(call++, lists.length - 1)];
+            return environ(args.at(-1));
+        } });
+    };
+    const owned = `${row(573, '9001', 'authz-run-1')}\n`;
+    // Owned cleanup, prefix lookup, the pid is gone in a fresh listing: accepted and reported.
+    const ok = await make({ lists: [owned, ''], environ: () => { throw missing(573); } })('authz-run', { prefix: true, tolerateOwnedExit: true });
+    assert.equal(ok.length, 0);
+    assert.deepEqual(ok.vanished, ['573@9001']);
+    // No tolerance flag (a census) -> failure.
+    await assert.rejects(make({ lists: [owned, ''], environ: () => { throw missing(573); } })('authz-run-1'), /No such file or directory/);
+    await assert.rejects(make({ lists: [owned, ''], environ: () => { throw missing(573); } })('authz-run', { prefix: true }), /No such file or directory/);
+    // Tolerance is for prefix removal polling only, never an exact lookup.
+    await assert.rejects(make({ lists: [owned, ''], environ: () => { throw missing(573); } })('authz-run-1', { tolerateOwnedExit: true }), /No such file or directory/);
+    // The process is still listed after the failed read -> failure, never "gone".
+    await assert.rejects(make({ lists: [owned, owned], environ: () => { throw missing(573); } })('authz-run', { prefix: true, tolerateOwnedExit: true }), /still present/);
+    // Any other failure (permission, empty environment, a different pid) is never tolerated.
+    await assert.rejects(make({ lists: [owned, ''], environ: () => { throw Object.assign(new Error('Command failed: cat /proc/573/environ\ncat: /proc/573/environ: Permission denied'), { stderr: 'cat: /proc/573/environ: Permission denied' }); } })('authz-run', { prefix: true, tolerateOwnedExit: true }), /Permission denied/);
+    await assert.rejects(make({ lists: [owned, ''], environ: () => { throw missing(999); } })('authz-run', { prefix: true, tolerateOwnedExit: true }), /No such file or directory/);
+    await assert.rejects(make({ lists: [owned, ''], environ: () => '' })('authz-run', { prefix: true, tolerateOwnedExit: true }), /environment must be readable/);
+    // A reused pid (same number, other start time) still counts the original as gone.
+    const reused = await make({ lists: [owned, `${row(573, '9777', 'authz-other')}\n`], environ: () => { throw missing(573); } })('authz-run', { prefix: true, tolerateOwnedExit: true });
+    assert.deepEqual(reused.vanished, ['573@9001']);
+    // Other principals' or foreign processes are never matched, so never tolerated.
+    const foreign = await make({ lists: [`${row(700, '1', 'someone-else')}\n`], environ: () => { throw missing(700); } })('authz-run', { prefix: true, tolerateOwnedExit: true });
+    assert.equal(foreign.length, 0);
+    assert.deepEqual(foreign.vanished, []);
+});
+
+test('U6 removal polling tolerates an owned process exiting under inspection but the census does not', async () => {
+    const world = webchatWorld();
+    let exiting = true;
+    const inspect = world.inspectProcesses;
+    const guarded = async (value, options = {}) => {
+        if (options.prefix && exiting) {
+            exiting = false;
+            await inspect(value, options);
+            return Object.assign([], { vanished: ['573@9001'] });
+        }
+        return inspect(value, options);
+    };
+    await runWebchatProbes(world.ctx, { ...world, inspectProcesses: guarded, timing: fast });
+    assert.equal(status(world.ctx, 'u6:webchat-runtimes-removed'), 'PASS');
+    assert.ok((world.ctx.report.webchatObservations || []).some(o => o.step === 'removal' && /^\d+@\d+$/.test(o.exitedDuringInspection)));
+    for (const fn of world.ctx.cleanups) await fn();
+    // A census (exact lookup) that throws is a FAIL, not a tolerated exit.
+    const strict = webchatWorld();
+    const failing = async (value, options = {}) => { if (!options.prefix) throw new Error('cat: /proc/573/environ: No such file or directory'); return strict.inspectProcesses(value, options); };
+    await runWebchatProbes(strict.ctx, { ...strict, inspectProcesses: failing, timing: fast });
+    assert.notEqual(status(strict.ctx, 'u6:webchat-distinct-processes'), 'PASS');
+});
+
+test('guest-agent selfRegistered tool visibility is accepted only as the two exact reviewed lists', () => {
+    for (const agent of ['webAssist', 'webmeetAgent']) {
+        const id = `agent.${agent}.discovery.tools.list.selfRegistered.scope`;
+        const entry = expectedGaps.gaps.find(g => g.id === id);
+        assert.ok(entry && entry.evidence.kind === 'selfregistered-visible-tools' && entry.evidence.visibleTools.length > 0, id);
+        assert.deepEqual(validateExpectedGaps(expectedGaps, inputs), []);
+        let run = acceptedRun();
+        assert.equal(evaluate(run).decision, 'ACCEPT');
+        run = acceptedRun();
+        run.report.gaps.find(g => g.id === id).evidence.visibleTools = [...entry.evidence.visibleTools, 'a_new_tool'].sort();
+        expectReject(run, 'GAP_EVIDENCE_MISMATCH', `${agent} exposes an extra tool`);
+        run = acceptedRun();
+        run.report.gaps.find(g => g.id === id).evidence.visibleTools = entry.evidence.visibleTools.slice(1);
+        expectReject(run, 'GAP_EVIDENCE_MISMATCH', `${agent} exposes fewer tools than reviewed`);
+        run = acceptedRun();
+        run.report.gaps = run.report.gaps.filter(g => g.id !== id);
+        expectReject(run, 'GAP_MISSING', `${agent} gap must be present once reviewed`);
+    }
+    // Any other agent or method stays unexpected, and anonymous never becomes a gap.
+    for (const id of ['agent.webAssist.discovery.resources.list.selfRegistered.scope', 'agent.dpuAgent.discovery.tools.list.selfRegistered.scope', 'agent.webAssist.discovery.tools.list.anonymous.scope']) {
+        const run = acceptedRun();
+        run.report.gaps.push({ id, reason: 'r', evidence: { kind: 'selfregistered-visible-tools', actor: 'selfRegistered', visibleTools: ['x'] } });
+        expectReject(run, 'GAP_UNEXPECTED', id);
+    }
+});
+
+test('the profile_get and username-admin mandatory chain follows the corrected probes', () => {
+    const entry = id => mandatory.checks.find(c => c.id === id);
+    assert.deepEqual(entry('agent.username-admin.persisted-role').positiveControlAnyOf, ['agent.username-admin.profile-positive']);
+    for (const id of ['agent.username-admin.monitor-denial', 'agent.username-admin.webmeet-role']) assert.deepEqual(entry(id).positiveControlAnyOf, ['agent.username-admin.persisted-role'], id);
+    assert.deepEqual(entry('router:terminal-discovery-cleanup:admin').positiveControlAnyOf, ['router:terminal-discovery-delete-positive:admin']);
+    assert.ok(entry('router:terminal-discovery-delete-positive:admin'));
+    // A failed persisted-role leaves the two denial probes without a passing positive control.
+    const run = acceptedRun();
+    run.report.checks.find(c => c.id === 'agent.username-admin.persisted-role').status = 'FAIL';
+    run.report.counts = { PASS: run.report.counts.PASS - 1, FAIL: 1, ERROR: 0 };
+    run.report.verdict = 'FAIL'; run.exitCode = 1;
+    const result = evaluate(run);
+    for (const id of ['agent.username-admin.monitor-denial', 'agent.username-admin.webmeet-role']) assert.ok(result.reasons.includes(`MANDATORY_POSITIVE_CONTROL_FAILED: ${id}`), id);
+});
+
+test('the SSE opener bounds connect-to-headers only and never installs a socket idle timeout', async () => {
+    const ctx = { report: { requests: [] }, clients: { userA: { cookies: [{ name: 'ploinky_sso', value: 'cookie-value' }] } }, async guard() {} };
+    const fakeRequest = ({ respond }) => {
+        const calls = { idleTimeouts: [], destroyed: [], options: null };
+        const request = (options, onResponse) => {
+            calls.options = options;
+            const req = new EventEmitter();
+            req.setTimeout = (...args) => calls.idleTimeouts.push(args);
+            req.destroy = error => { calls.destroyed.push(String(error?.message || error)); req.emit('error', error); };
+            req.end = () => { if (respond) setTimeout(() => {
+                const res = new EventEmitter();
+                Object.assign(res, { statusCode: 200, headers: { 'content-type': 'text/event-stream' }, setEncoding() {}, destroy() { res.emit('close'); } });
+                onResponse(res);
+            }, 5); };
+            return req;
+        };
+        return { request, calls };
+    };
+    // The connection answers: no deadline fires later, even after the connect bound has long passed.
+    const answered = fakeRequest({ respond: true });
+    const handle = await openEventStream(ctx, 'userA', '/webchat/stream?agent=dpuAgent', { request: answered.request, connectMs: 40 });
+    await new Promise(r => setTimeout(r, 120));
+    assert.equal(handle.status, 200);
+    assert.deepEqual(answered.calls.destroyed, [], 'a silent open stream is never torn down by the opener');
+    assert.deepEqual(answered.calls.idleTimeouts, [], 'no socket idle timeout is installed');
+    assert.equal(answered.calls.options.hostname, '127.0.0.1');
+    assert.equal(answered.calls.options.port, 8080);
+    assert.equal(answered.calls.options.headers.cookie, 'ploinky_sso=cookie-value');
+    // No response within the bound: the connect deadline still fires and the open fails.
+    const silent = fakeRequest({ respond: false });
+    await assert.rejects(openEventStream(ctx, 'userA', '/webchat/stream?agent=dpuAgent', { request: silent.request, connectMs: 30 }), /connect timeout/);
+    assert.deepEqual(silent.calls.destroyed, ['Bounded WebChat stream connect timeout']);
+    handle.close();
+});
+
+test('the guest-agent call coverage is mandatory: every WebMeet admin tool denial, its positive, and the webAssist checks', () => {
+    const ids = new Set(mandatory.checks.map(c => c.id));
+    for (const definition of [...webmeetAdminToolCheckDefinitions(), ...webAssistGuestCheckDefinitions()]) {
+        const entry = mandatory.checks.find(c => c.id === definition.id);
+        assert.ok(entry, definition.id);
+        assert.deepEqual(entry.positiveControlAnyOf, definition.positiveControlAnyOf, definition.id);
+        assert.equal(entry.count, 1, definition.id);
+    }
+    for (const { op } of WEBMEET_ADMIN_ONLY_TOOLS) for (const actor of ['anonymous', 'selfRegistered']) {
+        assert.ok(ids.has(`resource.webmeet.${actor}.${op}`), `${actor} ${op}`);
+        assert.ok(ids.has(WEBMEET_POSITIVE_FOR_OP[op]), `positive for ${op}`);
+    }
+    // Anything the guest-agent lists accept must be impossible to accept as an expected gap.
+    for (const id of [...ids].filter(id => /^resource\.webmeet\./.test(id) || /^agent\.webAssist\.(anonymous|admin)\./.test(id))) assert.ok(!expectedGaps.gaps.some(g => g.id === id), id);
+    // Dropping a denial, or failing its positive, rejects.
+    let run = acceptedRun();
+    run.report.checks = run.report.checks.filter(c => c.id !== 'resource.webmeet.anonymous.archive');
+    run.report.counts.PASS = run.report.checks.length;
+    expectReject(run, 'MANDATORY_MISSING', 'anonymous archive denial missing');
+    run = acceptedRun();
+    run.report.checks = run.report.checks.filter(c => c.id !== WEBMEET_POSITIVE_FOR_OP['participant-remove']);
+    run.report.counts.PASS = run.report.checks.length;
+    const result = evaluate(run);
+    assert.ok(result.reasons.includes('MANDATORY_POSITIVE_CONTROL_FAILED: resource.webmeet.selfRegistered.participant-remove'), result.reasons.join(' | '));
+    run = acceptedRun();
+    run.report.checks.find(c => c.id === 'agent.webAssist.anonymous.list-sites-denied').status = 'FAIL';
+    run.report.counts = { PASS: run.report.counts.PASS - 1, FAIL: 1, ERROR: 0 };
+    run.report.verdict = 'FAIL'; run.exitCode = 1;
+    expectReject(run, 'MANDATORY_NOT_PASS', 'webAssist list-sites leak');
+    run = acceptedRun();
+    for (const key of ['session-fixture', 'session-history-own-positive', 'session-history-cross-read', 'session-history-wrong-secret', 'session-history-secret-positive']) {
+        const id = `agent.webAssist.anonymous.${key}`;
+        run = acceptedRun();
+        run.report.checks.find(c => c.id === id).status = 'FAIL';
+        run.report.counts = { PASS: run.report.counts.PASS - 1, FAIL: 1, ERROR: 0 };
+        run.report.verdict = 'FAIL'; run.exitCode = 1;
+        expectReject(run, 'MANDATORY_NOT_PASS', `webAssist ${key}`);
+    }
+    // The negatives and the secret positive depend on the own-read positive.
+    run = acceptedRun();
+    run.report.checks = run.report.checks.filter(c => c.id !== 'agent.webAssist.anonymous.session-history-own-positive');
+    run.report.counts.PASS = run.report.checks.length;
+    const lost = evaluate(run);
+    for (const key of ['cross-read', 'wrong-secret', 'secret-positive']) assert.ok(lost.reasons.includes(`MANDATORY_POSITIVE_CONTROL_FAILED: agent.webAssist.anonymous.session-history-${key}`), key);
+});
+
+test('policy.json D3 anchors the real answering path of a route without a primary port', () => {
+    const d3 = policy.capabilities.find(c => c.id === 'D3-livekit-no-mcp');
+    const anchors = d3.contract.present.map(a => `${a.path} :: ${a.text}`);
+    for (const wanted of [
+        "cli/server/edgeRoutePlan.js :: kind: 'agent-root-pending',",
+        "cli/server/edgeRoutePlan.js :: diagnosticCategory: 'TARGET_INACTIVE',",
+        "cli/server/agentStartupPage.js :: if (req?.method !== 'GET') return null;",
+        "cli/server/agentStartupDispatch.js :: writeJson(res, 503, { error: 'TARGET_INACTIVE' });",
+        'cli/server/agentStartupDispatch.js :: else writeInactive(res);',
+    ]) assert.ok(anchors.includes(wanted), wanted);
+    assert.ok(!anchors.some(a => a.includes("sendJsonResponse(res, 404, { error: 'agent_not_found'")), 'the unreachable 404 branch is no longer anchored');
+    assert.match(d3.summary, /TARGET_INACTIVE/);
 });

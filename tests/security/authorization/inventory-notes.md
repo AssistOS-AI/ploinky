@@ -67,3 +67,20 @@ Every forbidden call requires a working administrator positive control. HTTP and
 The source review found legacy username-based administrator shortcuts in Workspace Monitor (`lib/admin.mjs:10`), WebMeet (`lib/store/accessPolicy.mjs:30`) and DPU audit (`lib/dpu-store.mjs:207`). The live suite attempts the bounded disposable username change through UserPersisto, verifies the current persisted ordinary role, checks admin projections, then restores the original username. Username uniqueness can make this unreachable in an already-claimed deployment. A rejected name is recorded honestly as a coverage limitation; a source shortcut alone is not reported as a confirmed live exploit.
 
 Raw responses, session IDs, request proofs and profiles stay in private run artifacts. Checked source and sanitized reports contain no account credentials, email codes, cookies, JWTs or provider secrets. Run the top-level suite command documented alongside the harness for ownership guards, fixture setup/cleanup and the combined endpoint coverage report.
+
+## Regeneration inputs (not regenerated while the candidate revisions are unsettled)
+
+`inventory-generate.mjs` takes exactly six named arguments and writes `agent-inventory.mjs`; it reads JSON and source text only.
+
+| Flag | Meaning |
+| --- | --- |
+| `--preflight` | JSON object whose `repositories` array lists `{ name, path, commit }` for `ploinky` (path `.`) and every repository in `acceptance/policy.json` `inventoryRepositories`. The generator refuses a non-Ploinky repository whose clean `HEAD` differs from `commit` (`inventory-generate.mjs:77`). |
+| `--workspace` | The deployment workspace; repositories other than `ploinky` and `AchillesIDE` are read from `<workspace>/<path>`. |
+| `--explorer-source` | The clean Explorer checkout that supplies the `AchillesIDE` repository. |
+| `--ploinky-source` | This checkout (`"$PWD"`). |
+| `--runtime-summary` | JSON `{ "runtimes": [{ "repo", "agent", "enabled": true, "state": "expected-enabled-manifest-graph" }] }` built from `acceptance/expected-runtimes.json` `enabled`; `state` becomes each catalog entry's `runtimeState`. |
+| `--out` | Output module path. |
+
+The revision `d9929a6c` in `agent-inventory.mjs` (`inventoryBaseline.repositories[ploinky]` and `nonAgentRepositories[ploinky]`) is the `ploinky` entry that the preflight handed to the generator when commit `be94cb39` regenerated the inventory; it is the integration Ploinky commit of that moment (`git log -1 d9929a6c`: the merge of `test/authz-harness-registry`). Nothing verifies it: the generator skips the revision check for `ploinky`, and the comparator drops `ploinky` from the inventory-to-pins binding (`acceptance/verify-acceptance.mjs`, `INVENTORY_BASELINE_BINDING` filters `r.name !== 'ploinky'`). The preflight written by `acceptance/evidence-capture.mjs` carries Ploinky separately (`ploinky: { commit }`) and not in `repositories`, so regenerating from a captured preflight needs the `ploinky` row added by hand or the baseline loses it.
+
+Generator rules that disagree with the corrected probes and must change when the inventory is regenerated: MCP tools of `userPersistoAgent` that the generator classes as account-scoped (`userpersisto_profile_*` and the like) list `selfRegistered` as `allow-own-account`, but the agent's MCP route inherits the Explorer's `explorer.access` requirement, so a selfRegistered account is refused at initialize and reads its own profile on the dashboard route instead; and the MCP rows of the guest-authentication agents (`webAssist`, `webmeetAgent`) list `anonymous` as `deny`, but their manifests select guest authentication, so anonymous and selfRegistered visitors may list tools while calls stay protected.

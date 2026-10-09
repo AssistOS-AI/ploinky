@@ -114,7 +114,7 @@ test('every read tool has a meaningful success schema and account/role identity 
         userpersisto_user_list: { users: [{ id: principal.id }], totalCount: 4 },
         userpersisto_config_get: settings(['STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET', 'STRIPE_PUBLISHABLE_KEY', 'STRIPE_PRICE_CREDITS', 'STRIPE_PRICE_SUBSCRIPTION', 'USERPERSISTO_CREDITS_PER_UNIT', 'USERPERSISTO_BILLING_SUCCESS_URL', 'USERPERSISTO_BILLING_CANCEL_URL']),
         userpersisto_auth_policy_get: { enabledAuthMethods: ['emailCode'], allowedRedirectOrigins: [], environmentOverrides: [], selfRegistrationEnabled: true, registrationRole: 'selfRegistered' },
-        userpersisto_google_status: { enabled: false, configured: false, available: false, secretPresent: false, redirectUri: '', clientId: '', reason: 'disabled', missing: [] },
+        userpersisto_google_status: { enabled: false, configured: true, available: false, mode: 'gis', missing: [], redirectUri: 'http://127.0.0.1:8080/base-agent-additional-server/userPersistoAgent/7000/service/auth/google/callback', clientId: 'client', secretRequired: false, configurationSource: 'local-default', policySource: 'stored-or-default', reason: 'disabled' },
         userpersisto_oidc_status: { enabled: false, issuer: '', discoveryUrl: '' },
         email_config_get: settings(['MAILJET_API_KEY', 'MAILJET_API_SECRET', 'MAILJET_FROM_EMAIL', 'MAILJET_FROM_NAME', 'EMAIL_AUTH_CODE_TEMPLATE_ID']),
         email_provider_status: { configured: false, fromEmail: '' },

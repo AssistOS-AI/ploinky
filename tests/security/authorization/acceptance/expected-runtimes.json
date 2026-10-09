@@ -149,7 +149,7 @@
         "capability:liveKitServerAgent:twirp-route-deny:anonymous",
         "capability:liveKitServerAgent:mcp-absent-corroboration:admin"
       ],
-      "contractSha256": "410c015ccd6548750bb449ec7ca62ed2d39c22b8e40ed4a13991058ca58baf0f"
+      "contractSha256": "eaef7ae82bae115ed66ef7cb45f30f3f6012eff7296ab7834468b564d30be1d0"
     },
     {
       "id": "D4-soul-no-upstream-mcp",
@@ -163,6 +163,16 @@
         "capability:soul-gateway:health:anonymous"
       ],
       "contractSha256": "073b9f03c9d5e88f2bab4c91fba604b95554789cdd51d9b419ea35ed9fe7045b"
+    }
+  ],
+  "guestAgents": [
+    {
+      "repo": "AchillesIDE",
+      "agent": "webAssist"
+    },
+    {
+      "repo": "AchillesIDE",
+      "agent": "webmeetAgent"
     }
   ]
 }

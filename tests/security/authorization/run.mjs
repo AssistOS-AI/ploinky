@@ -10,6 +10,8 @@ import { runAccountProbes, runSessionProbes } from './account-probes.mjs';
 import { runStreamProbes } from './stream-probes.mjs';
 import { writeCoverage } from './coverage.mjs';
 import { createMutationLockManager } from '../../../ploinky-box/locks.mjs';
+import { armExitDeadline, installInterruptHandlers, runOwnedCleanup } from './run-cleanup.mjs';
+import { closeAllOpenStreams } from './webchat-probes.mjs';
 
 const required = name => { assert.ok(process.env[name], `Set ${name}`); return process.env[name]; };
 const config = {
@@ -33,7 +35,7 @@ const cleanups = [];
 let mutationLock;
 const ctx = {
     prefix: `authz-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`,
-    clients: {}, principals: {}, secrets: new Set(), hash: digest, finalizers: [], capabilities: policy.capabilities || [],
+    clients: {}, principals: {}, secrets: new Set(), hash: digest, finalizers: [], capabilities: policy.capabilities || [], guestAgents: expectedRuntimes.guestAgents || [],
     report: { startedAt: new Date().toISOString(), target: TARGET, checks: [], requests: [], gaps: [], cleanup: [] },
     progress: message => console.log(message),
     async guard() {
@@ -67,13 +69,17 @@ const ctx = {
         if (ctx.report.checks.length % 25 === 0) console.log(`Progress: ${ctx.report.checks.length} assertions recorded; ${ctx.report.gaps.length} explicit gaps`);
     },
 };
-for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => { ctx.report.interrupted = signal; console.log('Interruption requested; finishing current bounded request and cleaning owned fixtures.'); });
+installInterruptHandlers(ctx);
 try {
     // Frozen pins first: file hash, schema, exact pushed source and policy
     // digest. Nothing is observed, and no request is made, before they pass.
     const loaded = loadPins(config.pins, config.pinsSha256);
     ctx.report.pins = { sha256: loaded.sha256, policyDigest: verifyCandidate(loaded.pins, sourceRoot) };
     pins = loaded.pins;
+    // Seeds the webAssist sessions of the history-isolation checks without inference. It runs under the
+    // workspace mutation lock taken below and arms its own cleanup before it creates anything.
+    const { createWebAssistSessionFactory } = await import('./webassist-fixture.mjs');
+    ctx.webAssistSessionFactory = createWebAssistSessionFactory(ctx, { workspace: () => pins.workspace });
     ctx.report.deployment = await ctx.guard();
     mutationLock = await createMutationLockManager({ timeoutMs: 1000 }).acquire(ctx.report.deployment.instance);
     await ctx.guard();
@@ -104,14 +110,8 @@ try {
     ctx.report.setupError = safeError(error, ctx.secrets);
     console.log(`ERROR: ${ctx.report.setupError}`);
 } finally {
-    ctx.cleaning = true;
-    for (let index = cleanups.length - 1; index >= 0; index--) {
-        try { await ctx.guard(); await cleanups[index](); ctx.report.cleanup.push({ index, status: 'PASS' }); }
-        catch (error) { ctx.report.cleanup.push({ index, status: 'FAIL', error: safeError(error, ctx.secrets) }); }
-    }
-    for (const finalize of ctx.finalizers) {
-        try { await finalize(); } catch (error) { ctx.report.cleanup.push({ status: 'FAIL', error: safeError(error, ctx.secrets) }); }
-    }
+  try {
+    await runOwnedCleanup(ctx, cleanups);
     try { await ctx.guard(); ctx.report.finalOwnership = 'PASS'; }
     catch (error) { ctx.report.finalOwnership = safeError(error, ctx.secrets); }
     if (mutationLock) {
@@ -128,4 +128,9 @@ try {
     await writeCoverage(config.output, JSON.parse(serialized));
     console.log(JSON.stringify({ verdict: ctx.report.verdict, ...ctx.report.counts, gaps: ctx.report.gaps.length, cleanup: ctx.report.cleanup.map(item => item.status) }));
     process.exitCode = ctx.report.verdict === 'PASS' ? 0 : ctx.report.verdict === 'NO_FAILURES_WITH_GAPS' ? 2 : 1;
+  } finally {
+    // Whatever failed above, no stream stays open and the process cannot outlive the report.
+    closeAllOpenStreams();
+    armExitDeadline(() => process.exitCode ?? 1);
+  }
 }
