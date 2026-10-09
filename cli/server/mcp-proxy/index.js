@@ -104,7 +104,7 @@ function extractDelegatedUser(req) {
 
 function actorKindForRequestUser(user) {
     const roles = Array.isArray(user?.roles)
-        ? user.roles.map((role) => String(role || '').toLowerCase())
+        ? user.roles.map((role) => String(role || '').trim().toLowerCase())
         : [];
     return roles.includes('guest') ? 'guest' : 'user';
 }
@@ -442,7 +442,14 @@ export function buildInvocationContextForProviderCall({
         const targetAgentId = resolveProviderPrincipal({ providerAgentRef: agentName, snapshot });
         const user = extractDelegatedUser(req);
         sub = user?.id ? `user:${user.id}` : '';
-        actor = { kind: actorKindForRequestUser(req.user), id: sub, roles: user?.roles || [] };
+        actor = {
+            kind: actorKindForRequestUser(req.user),
+            id: sub,
+            roles: user?.roles || [],
+            // The direct session user is the only capability source; the
+            // delegated branch above never signs capabilities.
+            capabilities: req.user?.capabilities,
+        };
         const delegations = buildMcpDelegationsForUserCall({ req, routeKey: agentName, toolName });
         const { token, payload } = buildRouterRequest({
             targetAgentId,
