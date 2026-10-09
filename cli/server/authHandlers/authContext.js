@@ -1021,8 +1021,12 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext, 
         return { ok: false, error: 'router_surface_owner_unconfigured' };
     }
     if (authContext.mode === 'none') {
-        if (authContext.record && authContext.routeKey && authContext.policy?.mode === 'none') {
-            admitPublicMcpTarget(req, authContext.serviceRouteKey || authContext.routeKey);
+        // Only the route whose own record and policy were resolved is public.
+        // A service route or WebChat binding names a caller-selected target
+        // that this context never resolved, so it admits nothing.
+        if (authContext.record && authContext.routeKey && authContext.policy?.mode === 'none'
+            && !authContext.serviceRouteKey && !authContext.webchatBinding) {
+            admitPublicMcpTarget(req, authContext.routeKey);
         }
         return { ok: true };
     }
