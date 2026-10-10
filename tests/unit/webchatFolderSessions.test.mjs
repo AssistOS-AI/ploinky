@@ -68,9 +68,13 @@ test('WebChat exposes a task overlay backed by AchillesCLI commands', () => {
     const template = read('cli/server/webchat/chat.html');
     const network = read('cli/server/webchat/network.js');
     const taskRoutes = read('cli/server/handlers/webchat/taskRoutes.js');
-    for (const id of ['tasksBtn', 'tasksBadge', 'tasksDialog', 'tasksList', 'taskDetail']) {
+    const webchatIndex = read('cli/server/webchat/index.js');
+    for (const id of ['tasksDialog', 'tasksList', 'taskDetail']) {
         assert.match(template, new RegExp(`id="${id}"`));
     }
+    assert.doesNotMatch(template, /id="tasksBtn"|id="tasksBadge"/);
+    // The visible /tasks command is the remaining opener of the task dialog.
+    assert.match(webchatIndex, /payload\?\.event === 'list' && \/\^\\\/tasks\(\?:\\s\|\$\)\/\.test\(visibleCommand\)\) \{\s*taskController\?\.open\(\{ refresh: false \}\);/);
     assert.match(network, /addEventListener\('task-update'/);
     assert.doesNotMatch(taskRoutes, /pathname === '\/tasks'/);
     const messages = read('cli/server/webchat/messages.js');
