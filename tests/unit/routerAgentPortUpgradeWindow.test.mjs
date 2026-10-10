@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -124,7 +125,7 @@ async function waitFor(predicate, what, timeoutMs = 5000) {
     }
 }
 
-test('real router: client reset while the agent-port upgrade access check is pending does not kill the router', async (t) => {
+test('real router: client reset while the agent-port upgrade access check is pending raises no uncaught exception and the router keeps answering', async (t) => {
     const { child, port, messages, getOutput } = await startRouter(t);
     const client = net.connect(port, '127.0.0.1');
     client.on('error', () => {});
@@ -147,6 +148,16 @@ test('real router: client reset while the agent-port upgrade access check is pen
     await new Promise((resolve) => setTimeout(resolve, 200));
     child.send({ type: 'release' });
     await new Promise((resolve) => setTimeout(resolve, 500));
+
+    const health = await new Promise((resolve, reject) => {
+        const req = http.get({ host: '127.0.0.1', port, path: '/health', headers: { host: `127.0.0.1:${port}` } }, (res) => {
+            res.resume();
+            res.on('end', () => resolve(res.statusCode));
+        });
+        req.setTimeout(3000, () => req.destroy(new Error('router did not answer /health')));
+        req.on('error', reject);
+    });
+    assert.ok(health >= 100 && health < 600, `router answered with status ${health}`);
 
     assert.equal(child.exitCode, null, `router exited (code ${child.exitCode}, signal ${child.signalCode}):\n${getOutput()}`);
     assert.equal(child.signalCode, null);
